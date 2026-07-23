@@ -64,6 +64,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::Mutex;
 
+use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
+
 /// Poll cadence for the `action/nebula/<verb>` topics. Control
 /// surface (not on a human's interactive path), so 400 ms keeps
 /// index-read churn low while staying well under the 30 s RPC
@@ -80,6 +82,10 @@ pub const ACTION_VERBS: [&str; 5] = [
     "regen-certs",
     "published-services",
 ];
+
+/// Stable consumer scope for the CA-rotation mutation. The capability binds
+/// both the local node and the mesh whose CA epoch will change.
+const NEBULA_ACTION_NODE_SCOPE: &str = "nebula";
 
 /// Bus event topic the signal dispatcher publishes to (E0.3.1.b).
 /// The retired `dev.mackes.MDE.Nebula.Status` D-Bus interface +
@@ -258,6 +264,7 @@ pub struct NebulaStatusService {
     ca_crt_path: std::path::PathBuf,
     ca_key_path: std::path::PathBuf,
     peer_cert_dir: std::path::PathBuf,
+    authorizer: Arc<ActionAuthorizer>,
 }
 
 impl NebulaStatusService {
@@ -281,7 +288,17 @@ impl NebulaStatusService {
             ca_crt_path: std::path::PathBuf::from(crate::ca::DEFAULT_CA_CERT_PATH),
             ca_key_path: std::path::PathBuf::from(crate::ca::DEFAULT_CA_KEY_PATH),
             peer_cert_dir: std::path::PathBuf::from(crate::ca::epoch::DEFAULT_PEER_CERT_DIR),
+            authorizer: Arc::new(ActionAuthorizer::production()),
         }
+    }
+
+    /// Inject an isolated verifier and replay ledger for hostile responder
+    /// tests. Production always uses [`ActionAuthorizer::production`].
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
+        self.authorizer = authorizer;
+        self
     }
 
     /// Redirect the CA cert/key + peer-cert dir under one directory —
@@ -675,6 +692,33 @@ pub async fn build_reply(svc: &NebulaStatusService, verb: &str, body: Option<&st
     }
 }
 
+/// Authenticate the only mutating Nebula Bus verb before it can read the
+/// passphrase gate or rotate any CA state. Read-only projections remain open.
+async fn build_bus_reply(svc: &NebulaStatusService, verb: &str, body: Option<&str>) -> String {
+    if verb != "regen-certs" {
+        return build_reply(svc, verb, body).await;
+    }
+    let Some(body) = body else {
+        return json!({ "error": "regen-certs: missing request body" }).to_string();
+    };
+    let target = format!("ca:{}", svc.mesh_id);
+    let context = MutationContext {
+        verb: "nebula-regen-certs",
+        node: NEBULA_ACTION_NODE_SCOPE,
+        target: &target,
+    };
+    if let Err(error) = svc.authorizer.authorize(body, context) {
+        tracing::warn!(
+            target: "mackesd::action_auth",
+            verb,
+            %error,
+            "refused unauthorized Nebula CA mutation"
+        );
+        return json!({ "error": format!("{verb}: authorization refused: {error}") }).to_string();
+    }
+    build_reply(svc, verb, Some(body)).await
+}
+
 /// The canonical Nebula-published fabric services:
 /// `(id, display, default-port, proto)`.
 /// Mirrors the v1.x `mackes.mesh_nebula.CANONICAL_SERVICES` tuple.
@@ -781,7 +825,7 @@ pub fn poll_once(
         };
         for msg in msgs {
             cursors.insert(topic.clone(), msg.ulid.clone());
-            let reply = rt.block_on(build_reply(svc, verb, msg.body.as_deref()));
+            let reply = rt.block_on(build_bus_reply(svc, verb, msg.body.as_deref()));
             if let Err(e) = persist.write(
                 &reply_topic(&msg.ulid),
                 Priority::Default,
@@ -859,6 +903,10 @@ pub fn fingerprint(cert_pem: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::action_auth::authorize_test_body;
+
+    const AUTH_KEY: &[u8] = b"nebula-action-auth-test-key";
+    const AUTH_NOW: i64 = 1_700_000_000_000;
 
     fn fresh_store() -> Arc<Mutex<rusqlite::Connection>> {
         let conn = rusqlite::Connection::open_in_memory().expect("memory db");
@@ -1063,6 +1111,51 @@ mod tests {
         assert!(
             msg.contains("nebula-cert not on PATH") || msg.contains("CA rotated"),
             "gate must open on the right phrase: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn regen_certs_bus_requires_exact_single_use_authority() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let authorizer = Arc::new(ActionAuthorizer::for_test(
+            AUTH_KEY,
+            tmp.path().join("auth"),
+            AUTH_NOW,
+        ));
+        let svc = NebulaStatusService::new(fresh_store(), "peer:local", "host")
+            .with_workgroup_root(tmp.path().to_path_buf())
+            .with_ca_dir(tmp.path())
+            .with_mesh_id("mesh-prod")
+            .with_authorizer(authorizer);
+        let unsigned =
+            serde_json::json!({"schema_version": 1, "passphrase": "correct horse"}).to_string();
+        let refused = build_bus_reply(&svc, "regen-certs", Some(&unsigned)).await;
+        assert!(refused.contains("authorization refused"), "{refused}");
+        assert!(!tmp.path().join("ca.key").exists());
+        crate::ca::rotation_gate::set_passphrase(tmp.path(), "correct horse").unwrap();
+        let armed = authorize_test_body(
+            AUTH_KEY,
+            &unsigned,
+            MutationContext {
+                verb: "nebula-regen-certs",
+                node: NEBULA_ACTION_NODE_SCOPE,
+                target: "ca:mesh-prod",
+            },
+            "nebula-replay",
+            AUTH_NOW + 30_000,
+        );
+        let first = build_bus_reply(&svc, "regen-certs", Some(&armed)).await;
+        assert!(
+            first.contains("nebula-cert not on PATH") || first.contains("CA rotated"),
+            "{first}"
+        );
+        let replay = build_bus_reply(&svc, "regen-certs", Some(&armed)).await;
+        assert!(replay.contains("already used"), "{replay}");
+        let tampered = armed.replace("correct horse", "wrong horse");
+        let tampered_reply = build_bus_reply(&svc, "regen-certs", Some(&tampered)).await;
+        assert!(
+            tampered_reply.contains("authorization refused"),
+            "{tampered_reply}"
         );
     }
 

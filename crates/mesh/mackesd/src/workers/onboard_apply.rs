@@ -504,10 +504,10 @@ mod tests {
             actions: vec![
                 Action::PinRole {
                     role: "lighthouse".into(),
-                    media: true,
+                    media: false,
                 },
                 Action::SealSecret {
-                    name: "media-spaces".into(),
+                    name: "node-config".into(),
                     secret: "s3-creds".into(),
                 },
             ],
@@ -626,7 +626,7 @@ mod tests {
             "authorized+valid bundle applies: {ev:?}"
         );
         assert_eq!(ev.applied.len(), 2);
-        assert!(ev.applied[0].contains("pin-role lighthouse +media"));
+        assert!(ev.applied[0].contains("pin-role lighthouse"));
         // The secret material never appears in the observed-state echo (§8).
         assert!(!ev.applied.iter().any(|a| a.contains("s3-creds")));
     }

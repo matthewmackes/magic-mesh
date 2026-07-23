@@ -71,6 +71,45 @@ impl Action {
     }
 }
 
+/// Secret scopes that would turn a lighthouse into a media/fileshare host.
+/// They are retained as typed legacy action names so old signed bundles fail
+/// closed instead of silently reviving the retired lighthouse subclasses.
+fn is_lighthouse_forbidden_secret(name: &str) -> bool {
+    let name = name.trim().to_ascii_lowercase();
+    name == "media"
+        || name == "media-spaces"
+        || name.starts_with("media-")
+        || name == "fileshare"
+        || name == "file-share"
+        || name == "filesharing"
+        || name.starts_with("fileshare-")
+        || name.starts_with("file-share-")
+}
+
+/// Reject a signed action set that combines a lighthouse role with a retired
+/// media/fileshare secret scope before the first local effect is applied.
+fn validate_thin_lighthouse_actions(actions: &[Action]) -> Result<(), RemotePushError> {
+    let requests_lighthouse = actions.iter().any(|action| {
+        matches!(
+            action,
+            Action::PinRole { role, .. } if matches!(role.parse::<Role>(), Ok(Role::Lighthouse))
+        )
+    });
+    if requests_lighthouse {
+        if let Some(name) = actions.iter().find_map(|action| match action {
+            Action::SealSecret { name, .. } if is_lighthouse_forbidden_secret(name) => Some(name),
+            _ => None,
+        }) {
+            return Err(RemotePushError::BundleRejected {
+                why: format!(
+                    "thin lighthouse cannot receive retired media/fileshare secret scope `{name}`"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// A typed failure from the executor. Every variant leaves the target
 /// **unchanged** (no partial state) — an action either fully applies or is a
 /// no-op that surfaces the reason.
@@ -302,6 +341,16 @@ impl Applier for LocalApplier {
                     })
             }
             Action::SealSecret { name, secret } => {
+                if matches!(mde_role::load_from(&self.role_path), Ok(Role::Lighthouse))
+                    && is_lighthouse_forbidden_secret(name)
+                {
+                    return Err(RemotePushError::ActionFailed {
+                        action: action.redacted(),
+                        why: format!(
+                            "thin lighthouse cannot receive retired media/fileshare secret scope `{name}`"
+                        ),
+                    });
+                }
                 self.store
                     .put(name, secret)
                     .map_err(|why| RemotePushError::ActionFailed {
@@ -398,6 +447,7 @@ pub fn process_apply(
     applier: &dyn Applier,
 ) -> Result<AppliedOutcome, RemotePushError> {
     bundle.verify(sig, signer, now)?;
+    validate_thin_lighthouse_actions(&bundle.actions)?;
     if !nonce_guard.check_and_record(&bundle.nonce, bundle.issued_at, now) {
         return Err(RemotePushError::BundleRejected {
             why: format!("nonce {} already applied (replay)", bundle.nonce),
@@ -481,6 +531,7 @@ pub struct BusApply;
 
 impl RemotePush for BusApply {
     fn apply(&self, target: &Target, actions: &[Action]) -> Result<(), RemotePushError> {
+        validate_thin_lighthouse_actions(actions)?;
         match target {
             Target::Bootstrap { host } => {
                 return Err(RemotePushError::BundleRejected {
@@ -597,7 +648,7 @@ mod tests {
                     media: false,
                 },
                 Action::SealSecret {
-                    name: "media-spaces".into(),
+                    name: "node-config".into(),
                     secret: "s3-creds".into(),
                 },
             ],
@@ -766,14 +817,14 @@ mod tests {
         let mut guard = NonceGuard::new();
         let k = key();
         let now = 1_800_000_000;
-        let b = bundle(now); // plain thin lighthouse pin + SealSecret media-spaces
+        let b = bundle(now); // plain thin lighthouse pin + a non-media secret
         let sig = b.sign(&k);
         let outcome =
             process_apply(&b, &sig, &k.verifying_key(), now, &mut guard, &applier).unwrap();
         assert_eq!(outcome.node, "peer:lh-media");
         assert_eq!(outcome.applied.len(), 2);
         assert!(outcome.applied[0].contains("pin-role lighthouse"));
-        // end-to-end: the role.toml + the sealed secret both landed
+        // end-to-end: the role.toml + the sealed non-media secret both landed
         assert!(
             mde_role::load_class_from(&tmp.path().join("role.toml"))
                 .unwrap()
@@ -781,9 +832,58 @@ mod tests {
                 == "lighthouse"
         );
         assert_eq!(
-            applier.store.get("media-spaces").unwrap().as_deref(),
+            applier.store.get("node-config").unwrap().as_deref(),
             Some("s3-creds")
         );
+    }
+
+    #[test]
+    fn process_apply_refuses_media_secret_for_thin_lighthouse_before_apply() {
+        let (tmp, applier) = local_applier();
+        let k = key();
+        let now = 1_800_000_000;
+        let bundle = JobBundle {
+            target_node: "peer:lh".into(),
+            actions: vec![
+                Action::PinRole {
+                    role: "lighthouse".into(),
+                    media: false,
+                },
+                Action::SealSecret {
+                    name: "media-spaces".into(),
+                    secret: "s3-creds".into(),
+                },
+            ],
+            issued_at: now,
+            nonce: "thin-media-secret".into(),
+        };
+        let mut guard = NonceGuard::new();
+        let err = process_apply(
+            &bundle,
+            &bundle.sign(&k),
+            &k.verifying_key(),
+            now,
+            &mut guard,
+            &applier,
+        )
+        .expect_err("media secret placement must be retired");
+        assert!(err.to_string().contains("thin lighthouse"), "{err}");
+        assert!(!tmp.path().join("role.toml").exists());
+        assert!(applier.store.get("media-spaces").unwrap().is_none());
+    }
+
+    #[test]
+    fn local_applier_refuses_retired_media_secret_on_pinned_lighthouse() {
+        let (tmp, applier) = local_applier();
+        std::fs::write(tmp.path().join("role.toml"), "role = \"lighthouse\"\n").unwrap();
+        let err = applier
+            .apply_one(&Action::SealSecret {
+                name: "media-spaces".into(),
+                secret: "s3-creds".into(),
+            })
+            .expect_err("pinned thin lighthouse must reject media scope");
+        assert!(err.to_string().contains("thin lighthouse"), "{err}");
+        assert!(applier.store.get("media-spaces").unwrap().is_none());
     }
 
     #[test]
@@ -918,10 +1018,9 @@ mod tests {
     }
 
     #[test]
-    fn bus_apply_gates_the_live_round_trip_honestly() {
-        // The OW-11 day-2 bundle (pin Media role + seal media-spaces): no live
-        // cross-node round-trip ⇒ a typed NotWired, never a fake success. The
-        // target is untouched.
+    fn bus_apply_refuses_the_retired_media_lighthouse_bundle() {
+        // The old OW-11 day-2 bundle is rejected before the live transport gate;
+        // no media role or media secret may be sent to a lighthouse.
         let err = BusApply
             .apply(
                 &Target::Enrolled {
@@ -939,6 +1038,6 @@ mod tests {
                 ],
             )
             .unwrap_err();
-        assert!(matches!(err, RemotePushError::NotWired { .. }));
+        assert!(matches!(err, RemotePushError::BundleRejected { .. }));
     }
 }

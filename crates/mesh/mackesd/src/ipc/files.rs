@@ -23,11 +23,14 @@
 #![cfg(feature = "async-services")]
 
 use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_bus::rpc::reply_topic;
 use serde_json::json;
+
+use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
 
 /// Responder poll interval (shared across the file surfaces).
 pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
@@ -186,6 +189,97 @@ pub const FILE_OPS_VERBS: [&str; 3] = ["send-to", "rollback", "audit-log"];
 // own record is appended to `<qnm>/outbox/<self>.jsonl`. (Closes the §7
 // "send not configured" stub + the AF-5 empty-inbox producer.)
 
+/// Parse a privileged file mutation into its stable capability target and the
+/// body consumed by the legacy handler. Authentication metadata is removed
+/// only after the exact original body is verified by [`ActionAuthorizer`].
+/// This function performs no filesystem or outbox/inbox I/O.
+fn mutation_request(
+    verb: &str,
+    req_body: Option<&str>,
+) -> Result<Option<(String, String)>, String> {
+    if !matches!(verb, "send-to" | "rollback" | "mark-opened" | "cancel") {
+        return Ok(None);
+    }
+    let body = req_body.ok_or_else(|| format!("{verb}: missing request body"))?;
+    let mut request: serde_json::Value = serde_json::from_str(body)
+        .map_err(|_| format!("{verb}: request body must be a JSON object"))?;
+    let object = request
+        .as_object_mut()
+        .ok_or_else(|| format!("{verb}: request body must be a JSON object"))?;
+    object.remove("schema_version");
+    object.remove("armed_token");
+
+    let string_field = |field: &str| -> Result<String, String> {
+        request
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| format!("{verb}: missing `{field}`"))
+    };
+    let op_id = || {
+        request
+            .get("op_id")
+            .or_else(|| request.get("id"))
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| format!("{verb}: missing `op_id`"))
+    };
+
+    let target = match verb {
+        "send-to" => {
+            let selector = request
+                .get("selector")
+                .or_else(|| request.get("destination"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .unwrap_or_default();
+            let peer = selector
+                .strip_prefix("peer:")
+                .filter(|peer| is_clean_component(peer))
+                .ok_or_else(|| {
+                    format!(
+                        "send-to: destination must be peer:<name> with a clean name (got '{selector}')"
+                    )
+                })?;
+            format!("peer:{peer}")
+        }
+        "rollback" => format!("op:{}", op_id()?),
+        "mark-opened" => {
+            let peer = string_field("peer").or_else(|_| string_field("sender"))?;
+            if !is_clean_component(&peer) {
+                return Err(format!("mark-opened: invalid peer '{peer}'"));
+            }
+            let file = string_field("name")
+                .or_else(|_| string_field("file"))
+                .or_else(|_| string_field("id"))?;
+            if !is_clean_component(&file) {
+                return Err(format!("mark-opened: invalid file '{file}'"));
+            }
+            format!("peer:{peer}:file:{file}")
+        }
+        "cancel" => {
+            let op = op_id()?;
+            if let Some(peer) = request
+                .get("peer")
+                .or_else(|| request.get("target"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|peer| !peer.is_empty())
+            {
+                if !is_clean_component(peer) {
+                    return Err(format!("cancel: invalid peer '{peer}'"));
+                }
+                format!("peer:{peer}:op:{op}")
+            } else {
+                format!("op:{op}")
+            }
+        }
+        _ => unreachable!("the privileged file verb set must stay closed"),
+    };
+    Ok(Some((target, request.to_string())))
+}
+
 /// The replicated-volume file transport backing the file-ops / inbox /
 /// outbox Bus surfaces. Holds the QNM-Shared root + this node's host id.
 pub struct FileXfer {
@@ -198,6 +292,18 @@ pub struct FileXfer {
     /// at construction so the per-source `starts_with` check compares
     /// real paths (symlinks resolved).
     share_root: std::path::PathBuf,
+    /// Shared verifier for all file surfaces in this daemon. Spawn wires one
+    /// `FileXfer` per surface, so these instances must still share a replay
+    /// ledger/verifier or a capability could be replayed across surfaces.
+    authorizer: Arc<ActionAuthorizer>,
+}
+
+/// One production verifier for every `FileXfer` responder in this process.
+fn production_authorizer() -> Arc<ActionAuthorizer> {
+    static AUTHORIZER: OnceLock<Arc<ActionAuthorizer>> = OnceLock::new();
+    AUTHORIZER
+        .get_or_init(|| Arc::new(ActionAuthorizer::production()))
+        .clone()
 }
 
 impl FileXfer {
@@ -212,7 +318,17 @@ impl FileXfer {
             qnm_root,
             host,
             share_root,
+            authorizer: production_authorizer(),
         }
+    }
+
+    /// Inject an isolated verifier and replay ledger for hostile responder
+    /// tests. Production always uses [`ActionAuthorizer::production`].
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
+        self.authorizer = authorizer;
+        self
     }
 
     /// Override the send-to source allowlist root (EFF-2). The root is
@@ -251,6 +367,27 @@ impl FileXfer {
     /// `action/file-ops/<verb>` — `send-to` / `rollback` / `audit-log`.
     #[must_use]
     pub fn file_ops_reply(&self, verb: &str, body: Option<&str>) -> String {
+        let prepared = match mutation_request(verb, body) {
+            Ok(prepared) => prepared,
+            Err(error) => return err(error),
+        };
+        let Some((target, handler_body)) = prepared else {
+            return self.file_ops_reply_unchecked(verb, body);
+        };
+        let auth_verb = format!("file-ops-{verb}");
+        if let Err(error) = self.authorize(&auth_verb, target, body) {
+            tracing::warn!(
+                target: "mackesd::action_auth",
+                verb,
+                %error,
+                "refused unauthorized file operation"
+            );
+            return err(format!("{verb}: authorization refused: {error}"));
+        }
+        self.file_ops_reply_unchecked(verb, Some(&handler_body))
+    }
+
+    fn file_ops_reply_unchecked(&self, verb: &str, body: Option<&str>) -> String {
         match verb {
             "send-to" => self.send_to(body),
             "rollback" => self.rollback(body),
@@ -261,7 +398,28 @@ impl FileXfer {
 
     /// `action/files-inbox/<verb>` — `list` reads this node's replicated inbox.
     #[must_use]
-    pub fn inbox_reply(&self, verb: &str, _body: Option<&str>) -> String {
+    pub fn inbox_reply(&self, verb: &str, body: Option<&str>) -> String {
+        let prepared = match mutation_request(verb, body) {
+            Ok(prepared) => prepared,
+            Err(error) => return err(error),
+        };
+        let Some((target, handler_body)) = prepared else {
+            return self.inbox_reply_unchecked(verb, body);
+        };
+        let auth_verb = format!("files-inbox-{verb}");
+        if let Err(error) = self.authorize(&auth_verb, target, body) {
+            tracing::warn!(
+                target: "mackesd::action_auth",
+                verb,
+                %error,
+                "refused unauthorized inbox mutation"
+            );
+            return err(format!("{verb}: authorization refused: {error}"));
+        }
+        self.inbox_reply_unchecked(verb, Some(&handler_body))
+    }
+
+    fn inbox_reply_unchecked(&self, verb: &str, _body: Option<&str>) -> String {
         match verb {
             "list" => self.inbox_list(),
             "mark-opened" => json!({ "ok": true }).to_string(),
@@ -271,12 +429,46 @@ impl FileXfer {
 
     /// `action/files-outbox/<verb>` — `list` reads this node's send record.
     #[must_use]
-    pub fn outbox_reply(&self, verb: &str, _body: Option<&str>) -> String {
+    pub fn outbox_reply(&self, verb: &str, body: Option<&str>) -> String {
+        let prepared = match mutation_request(verb, body) {
+            Ok(prepared) => prepared,
+            Err(error) => return err(error),
+        };
+        let Some((target, handler_body)) = prepared else {
+            return self.outbox_reply_unchecked(verb, body);
+        };
+        let auth_verb = format!("files-outbox-{verb}");
+        if let Err(error) = self.authorize(&auth_verb, target, body) {
+            tracing::warn!(
+                target: "mackesd::action_auth",
+                verb,
+                %error,
+                "refused unauthorized outbox mutation"
+            );
+            return err(format!("{verb}: authorization refused: {error}"));
+        }
+        self.outbox_reply_unchecked(verb, Some(&handler_body))
+    }
+
+    fn outbox_reply_unchecked(&self, verb: &str, _body: Option<&str>) -> String {
         match verb {
             "list" => self.read_outbox_rows(),
             "cancel" => json!({ "ok": true }).to_string(),
             other => err(format!("unknown outbox verb: {other}")),
         }
+    }
+
+    /// Verify a capability for one file-surface mutation. The node scope is
+    /// this host and the target is derived before file, inbox, or outbox I/O.
+    fn authorize(&self, verb: &str, target: String, body: Option<&str>) -> Result<(), String> {
+        self.authorizer.authorize(
+            body.expect("a file mutation requires a request body"),
+            MutationContext {
+                verb,
+                node: &self.host,
+                target: &target,
+            },
+        )
     }
 
     /// Copy each source into the target peer's replicated inbox.
@@ -689,6 +881,52 @@ struct WireSelfNode<'a> {
 mod tests {
     use super::*;
 
+    use crate::ipc::action_auth::{authorize_test_body, ActionAuthorizer};
+
+    const AUTH_KEY: &[u8] = b"files-action-auth-test-key";
+    const AUTH_NOW: i64 = 1_700_000_000_000;
+
+    fn test_xfer(tmp: &tempfile::TempDir, host: &str) -> FileXfer {
+        test_xfer_root(tmp, tmp.path().to_path_buf(), host)
+    }
+
+    fn test_xfer_root(tmp: &tempfile::TempDir, root: std::path::PathBuf, host: &str) -> FileXfer {
+        FileXfer::new(root, host.to_string()).with_authorizer(Arc::new(ActionAuthorizer::for_test(
+            AUTH_KEY,
+            tmp.path().join("auth"),
+            AUTH_NOW,
+        )))
+    }
+
+    fn arm(xfer: &FileXfer, surface: &str, verb: &str, body: &str, nonce: &str) -> String {
+        let mut request: serde_json::Value = serde_json::from_str(body).unwrap();
+        request
+            .as_object_mut()
+            .expect("test mutation body is an object")
+            .insert("schema_version".to_string(), json!(1));
+        let body = request.to_string();
+        let target = mutation_request(verb, Some(&body))
+            .unwrap()
+            .expect("mutation target")
+            .0;
+        let auth_verb = format!("{surface}-{verb}");
+        authorize_test_body(
+            AUTH_KEY,
+            &body,
+            MutationContext {
+                verb: &auth_verb,
+                node: &xfer.host,
+                target: &target,
+            },
+            nonce,
+            AUTH_NOW + 30_000,
+        )
+    }
+
+    fn arm_file_ops(xfer: &FileXfer, verb: &str, body: &str, nonce: &str) -> String {
+        arm(xfer, "file-ops", verb, body, nonce)
+    }
+
     #[test]
     fn topic_prefixes_and_verbs_lock() {
         assert_eq!(INBOX_PREFIX, "files-inbox");
@@ -727,7 +965,7 @@ mod tests {
         let src = tmp.path().join("notes.md");
         std::fs::write(&src, b"hello mesh").unwrap();
 
-        let pine = FileXfer::new(qnm.clone(), "pine".to_string()).with_share_root(qnm.clone());
+        let pine = test_xfer(&tmp, "pine").with_share_root(qnm.clone());
         let body = json!({
             "sources": [src.to_string_lossy()],
             "selector": "peer:oak",
@@ -735,8 +973,9 @@ mod tests {
             "conflict": "rename",
         })
         .to_string();
+        let armed = arm_file_ops(&pine, "send-to", &body, "send-deliver");
         let reply: serde_json::Value =
-            serde_json::from_str(&pine.file_ops_reply("send-to", Some(&body))).unwrap();
+            serde_json::from_str(&pine.file_ops_reply("send-to", Some(&armed))).unwrap();
         assert_eq!(reply["ok"], true);
         assert_eq!(reply["count"], 1);
         assert_eq!(reply["bytes"], 10);
@@ -760,19 +999,20 @@ mod tests {
         let qnm = tmp.path().to_path_buf();
         let src = tmp.path().join("doc.txt");
         std::fs::write(&src, b"abc").unwrap();
-        let pine = FileXfer::new(qnm.clone(), "pine".to_string()).with_share_root(qnm.clone());
+        let pine = test_xfer(&tmp, "pine").with_share_root(qnm.clone());
         let body = json!({"sources":[src.to_string_lossy()],"selector":"peer:oak","mode":"move"})
             .to_string();
+        let armed = arm_file_ops(&pine, "send-to", &body, "send-move");
         let reply: serde_json::Value =
-            serde_json::from_str(&pine.file_ops_reply("send-to", Some(&body))).unwrap();
+            serde_json::from_str(&pine.file_ops_reply("send-to", Some(&armed))).unwrap();
         let op_id = reply["op_id"].as_i64().unwrap();
         assert!(!src.exists(), "move removes the source");
         assert!(qnm.join("inbox/oak/pine/doc.txt").exists());
         // Rollback removes the delivered copy.
-        let rb: serde_json::Value = serde_json::from_str(
-            &pine.file_ops_reply("rollback", Some(&json!({ "op_id": op_id }).to_string())),
-        )
-        .unwrap();
+        let rollback_body = json!({ "op_id": op_id }).to_string();
+        let rollback_armed = arm_file_ops(&pine, "rollback", &rollback_body, "rollback");
+        let rb: serde_json::Value =
+            serde_json::from_str(&pine.file_ops_reply("rollback", Some(&rollback_armed))).unwrap();
         assert_eq!(rb["removed"], 1);
         assert!(!qnm.join("inbox/oak/pine/doc.txt").exists());
     }
@@ -780,15 +1020,17 @@ mod tests {
     #[test]
     fn send_to_rejects_non_peer_selector_and_empty_sources() {
         let tmp = tempfile::tempdir().unwrap();
-        let x = FileXfer::new(tmp.path().to_path_buf(), "pine".to_string());
+        let x = test_xfer(&tmp, "pine");
         assert!(x
             .file_ops_reply(
                 "send-to",
                 Some(r#"{"sources":["/x"],"selector":"group:crew"}"#)
             )
             .contains("peer:"));
+        let body = r#"{"sources":[],"selector":"peer:oak"}"#;
+        let armed = arm_file_ops(&x, "send-to", body, "empty-sources");
         assert!(x
-            .file_ops_reply("send-to", Some(r#"{"sources":[],"selector":"peer:oak"}"#))
+            .file_ops_reply("send-to", Some(&armed))
             .contains("no sources"));
     }
 
@@ -800,7 +1042,7 @@ mod tests {
         let qnm = tmp.path().to_path_buf();
         let src = tmp.path().join("x.txt");
         std::fs::write(&src, b"x").unwrap();
-        let x = FileXfer::new(qnm.clone(), "pine".to_string());
+        let x = test_xfer(&tmp, "pine");
         for evil in ["peer:../../etc", "peer:..", "peer:a/b", "peer:"] {
             let body = json!({ "sources": [src.to_string_lossy()], "selector": evil }).to_string();
             let reply: serde_json::Value =
@@ -814,6 +1056,126 @@ mod tests {
         assert!(!qnm.parent().unwrap().join("etc").exists());
         assert!(is_clean_component("oak"));
         assert!(!is_clean_component("../oak"));
+    }
+
+    #[test]
+    fn hostile_unsigned_file_mutations_are_refused_before_file_io() {
+        let tmp = tempfile::tempdir().unwrap();
+        let qnm = tmp.path().join("qnm");
+        std::fs::create_dir_all(&qnm).unwrap();
+        let src = tmp.path().join("source.txt");
+        std::fs::write(&src, b"do not move").unwrap();
+        let delivered = qnm.join("inbox/oak/pine/existing.txt");
+        std::fs::create_dir_all(delivered.parent().unwrap()).unwrap();
+        std::fs::write(&delivered, b"keep").unwrap();
+        let xfer = test_xfer_root(&tmp, qnm.clone(), "pine").with_share_root(tmp.path().into());
+        xfer.append_outbox(7, "oak", "copy", 4, &["existing.txt".to_string()]);
+        let before_log = std::fs::read_to_string(qnm.join("outbox/pine.jsonl")).unwrap();
+
+        let send = json!({
+            "sources": [src.to_string_lossy()],
+            "selector": "peer:oak",
+            "mode": "copy",
+        })
+        .to_string();
+        let rollback = json!({"op_id": 7}).to_string();
+        let opened = json!({"peer":"oak","name":"existing.txt"}).to_string();
+        let cancel = json!({"op_id": 7,"peer":"oak"}).to_string();
+        for (surface, verb, body) in [
+            ("file-ops", "send-to", send.as_str()),
+            ("file-ops", "rollback", rollback.as_str()),
+            ("files-inbox", "mark-opened", opened.as_str()),
+            ("files-outbox", "cancel", cancel.as_str()),
+        ] {
+            let reply = match surface {
+                "file-ops" => xfer.file_ops_reply(verb, Some(body)),
+                "files-inbox" => xfer.inbox_reply(verb, Some(body)),
+                "files-outbox" => xfer.outbox_reply(verb, Some(body)),
+                _ => unreachable!(),
+            };
+            assert!(
+                reply.contains("authorization refused"),
+                "unsigned {surface}/{verb} reached its handler: {reply}"
+            );
+        }
+        assert!(src.exists(), "unsigned send-to must not touch source");
+        assert!(
+            !qnm.join("inbox/oak/pine/source.txt").exists(),
+            "unsigned send-to must not create a delivery"
+        );
+        assert!(
+            delivered.exists(),
+            "unsigned rollback must not remove files"
+        );
+        assert_eq!(
+            std::fs::read_to_string(qnm.join("outbox/pine.jsonl")).unwrap(),
+            before_log,
+            "unsigned file mutations must not alter the outbox"
+        );
+    }
+
+    #[test]
+    fn authorized_send_to_is_exact_body_bound_and_single_use() {
+        let tmp = tempfile::tempdir().unwrap();
+        let qnm = tmp.path().join("qnm");
+        std::fs::create_dir_all(&qnm).unwrap();
+        let src = tmp.path().join("authorized.txt");
+        std::fs::write(&src, b"authorized").unwrap();
+        let xfer = test_xfer_root(&tmp, qnm.clone(), "pine").with_share_root(tmp.path().into());
+        let body = json!({
+            "sources": [src.to_string_lossy()],
+            "selector": "peer:oak",
+            "mode": "copy",
+            "conflict": "rename",
+        })
+        .to_string();
+        let armed = arm_file_ops(&xfer, "send-to", &body, "authorized-send");
+
+        let first: serde_json::Value =
+            serde_json::from_str(&xfer.file_ops_reply("send-to", Some(&armed))).unwrap();
+        assert_eq!(first["ok"], true, "authorized send failed: {first}");
+        assert!(qnm.join("inbox/oak/pine/authorized.txt").exists());
+
+        let replay = xfer.file_ops_reply("send-to", Some(&armed));
+        assert!(
+            replay.contains("already used"),
+            "replay was accepted: {replay}"
+        );
+
+        let tampered = armed.replace("peer:oak", "peer:birch");
+        let tampered_reply = xfer.file_ops_reply("send-to", Some(&tampered));
+        assert!(
+            tampered_reply.contains("authorization refused"),
+            "exact-body tamper was accepted: {tampered_reply}"
+        );
+        assert!(!qnm.join("inbox/birch/pine/authorized.txt").exists());
+        assert_eq!(xfer.outbox_rows().len(), 1);
+    }
+
+    #[test]
+    fn inbox_and_outbox_mutations_accept_only_bound_capabilities() {
+        let tmp = tempfile::tempdir().unwrap();
+        let xfer = test_xfer(&tmp, "pine");
+        let opened = json!({"peer":"oak","name":"note.txt"}).to_string();
+        let opened_armed = arm(&xfer, "files-inbox", "mark-opened", &opened, "opened-once");
+        assert_eq!(
+            xfer.inbox_reply("mark-opened", Some(&opened_armed)),
+            r#"{"ok":true}"#
+        );
+        assert!(xfer
+            .inbox_reply("mark-opened", Some(&opened_armed))
+            .contains("already used"));
+
+        let cancel = json!({"op_id": 91, "peer":"oak"}).to_string();
+        let cancel_armed = arm(&xfer, "files-outbox", "cancel", &cancel, "cancel-once");
+        assert_eq!(
+            xfer.outbox_reply("cancel", Some(&cancel_armed)),
+            r#"{"ok":true}"#
+        );
+        let tampered = cancel_armed.replace("\"op_id\":91", "\"op_id\":92");
+        assert!(xfer
+            .outbox_reply("cancel", Some(&tampered))
+            .contains("authorization refused"));
     }
 
     #[test]
@@ -892,15 +1254,16 @@ mod tests {
         let ok = share.join("ok.txt");
         std::fs::write(&ok, b"fine").unwrap();
 
-        let pine = FileXfer::new(qnm.clone(), "pine".to_string()).with_share_root(share.clone());
+        let pine = test_xfer_root(&tmp, qnm.clone(), "pine").with_share_root(share.clone());
         let body = json!({
             "sources": [secret.to_string_lossy(), ok.to_string_lossy()],
             "selector": "peer:oak",
             "mode": "copy",
         })
         .to_string();
+        let armed = arm_file_ops(&pine, "send-to", &body, "outside-root");
         let reply: serde_json::Value =
-            serde_json::from_str(&pine.file_ops_reply("send-to", Some(&body))).unwrap();
+            serde_json::from_str(&pine.file_ops_reply("send-to", Some(&armed))).unwrap();
         assert_eq!(reply["ok"], true);
         // Only the in-root file was delivered; the secret was refused.
         assert_eq!(reply["count"], 1);
@@ -924,14 +1287,15 @@ mod tests {
         let link = share.join("link-to-secret.txt");
         std::os::unix::fs::symlink(&secret, &link).unwrap();
 
-        let pine = FileXfer::new(qnm.clone(), "pine".to_string()).with_share_root(share.clone());
+        let pine = test_xfer_root(&tmp, qnm.clone(), "pine").with_share_root(share.clone());
         let body = json!({
             "sources": [link.to_string_lossy()],
             "selector": "peer:oak",
         })
         .to_string();
+        let armed = arm_file_ops(&pine, "send-to", &body, "symlink-root");
         let reply: serde_json::Value =
-            serde_json::from_str(&pine.file_ops_reply("send-to", Some(&body))).unwrap();
+            serde_json::from_str(&pine.file_ops_reply("send-to", Some(&armed))).unwrap();
         assert_eq!(reply["count"], 0);
         assert_eq!(reply["refused"], 1);
         assert!(!qnm.join("inbox/oak/pine/link-to-secret.txt").exists());
@@ -943,12 +1307,14 @@ mod tests {
         let qnm = tmp.path().to_path_buf();
         let src = tmp.path().join("a.txt");
         std::fs::write(&src, b"v1").unwrap();
-        let pine = FileXfer::new(qnm.clone(), "pine".to_string()).with_share_root(qnm.clone());
+        let pine = test_xfer(&tmp, "pine").with_share_root(qnm.clone());
         let body =
             json!({"sources":[src.to_string_lossy()],"selector":"peer:oak","conflict":"rename"})
                 .to_string();
-        let _ = pine.file_ops_reply("send-to", Some(&body));
-        let _ = pine.file_ops_reply("send-to", Some(&body));
+        let armed_one = arm_file_ops(&pine, "send-to", &body, "rename-one");
+        let armed_two = arm_file_ops(&pine, "send-to", &body, "rename-two");
+        let _ = pine.file_ops_reply("send-to", Some(&armed_one));
+        let _ = pine.file_ops_reply("send-to", Some(&armed_two));
         let dir = qnm.join("inbox/oak/pine");
         assert!(dir.join("a.txt").exists());
         assert!(

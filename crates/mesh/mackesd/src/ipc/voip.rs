@@ -13,7 +13,8 @@
 //!   * `set-gateway`   — body `{"host","port"?,"username","password"?,
 //!     "display_name"?,"expires"?}`; writes gateway.toml. Empty `host` clears it.
 //!   * `get-gateway`   — no body; reply `{"present":bool, ...fields}` for the panel.
-//!   * `clear-gateway` — no body; removes gateway.toml (reverts every node to P2P).
+//!   * `clear-gateway` — an authenticated JSON envelope (payload ignored);
+//!     removes gateway.toml (reverts every node to P2P).
 //!
 //! The password travels only over the per-node tmpfs Bus + lands in a 0600 file;
 //! it is never passed on a command line (absent from `ps`). At-rest age-encryption
@@ -23,16 +24,20 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_bus::rpc::reply_topic;
 use serde_json::json;
 
+use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
+
 /// Responder handle — carries the QNM-Shared root the gateway file lives under.
 #[derive(Debug, Clone)]
 pub struct VoipService {
     workgroup_root: PathBuf,
+    authorizer: Arc<ActionAuthorizer>,
 }
 
 impl VoipService {
@@ -41,7 +46,17 @@ impl VoipService {
     pub fn new(workgroup_root: &Path) -> Self {
         Self {
             workgroup_root: workgroup_root.to_path_buf(),
+            authorizer: Arc::new(ActionAuthorizer::production()),
         }
+    }
+
+    /// Inject an isolated verifier and replay ledger for hostile responder
+    /// tests. Production always uses [`ActionAuthorizer::production`].
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
+        self.authorizer = authorizer;
+        self
     }
 }
 
@@ -169,6 +184,77 @@ pub fn build_reply(svc: &VoipService, verb: &str, req_body: Option<&str>) -> Str
     }
 }
 
+/// Stable consumer scope for VoIP gateway mutations. The gateway is one
+/// replicated workgroup setting, so callers cannot select a different node or
+/// path through the capability target.
+const VOIP_ACTION_NODE_SCOPE: &str = "voip";
+
+/// Parse a privileged VoIP mutation into its stable capability target and the
+/// legacy body consumed by [`build_reply`]. Authentication metadata is removed
+/// only after the exact original body has been verified; this helper performs
+/// no filesystem reads or writes.
+fn mutation_request(
+    verb: &str,
+    req_body: Option<&str>,
+) -> Result<Option<(String, String)>, String> {
+    if !matches!(verb, "set-gateway" | "clear-gateway") {
+        return Ok(None);
+    }
+    let body = req_body.ok_or_else(|| format!("{verb}: missing request body"))?;
+    let mut request: serde_json::Value =
+        serde_json::from_str(body).map_err(|_| format!("{verb}: request body must be JSON"))?;
+    let object = request
+        .as_object_mut()
+        .ok_or_else(|| format!("{verb}: request body must be a JSON object"))?;
+    object.remove("schema_version");
+    object.remove("armed_token");
+
+    // Both mutations operate on the same singleton gateway record. Keeping a
+    // closed target prevents a caller from minting a capability for an
+    // arbitrary host or path.
+    let handler_body = if verb == "clear-gateway" {
+        // `build_reply` ignores the clear body, but retain a valid JSON object
+        // so the authenticated request shape is deterministic.
+        serde_json::Value::Object(object.clone()).to_string()
+    } else {
+        request.to_string()
+    };
+    Ok(Some(("gateway".to_string(), handler_body)))
+}
+
+/// Apply the shared-Bus authorization boundary before a VoIP mutation can
+/// touch the replicated gateway file. `get-gateway` remains read-only and
+/// unauthenticated.
+fn build_bus_reply(svc: &VoipService, verb: &str, req_body: Option<&str>) -> String {
+    let prepared = match mutation_request(verb, req_body) {
+        Ok(prepared) => prepared,
+        Err(error) => return json!({ "error": error }).to_string(),
+    };
+    let Some((target, handler_body)) = prepared else {
+        return build_reply(svc, verb, req_body);
+    };
+
+    let auth_verb = format!("voip-{verb}");
+    let context = MutationContext {
+        verb: &auth_verb,
+        node: VOIP_ACTION_NODE_SCOPE,
+        target: &target,
+    };
+    if let Err(error) = svc
+        .authorizer
+        .authorize(req_body.expect("a mutation requires a body"), context)
+    {
+        tracing::warn!(
+            target: "mackesd::voip",
+            verb,
+            %error,
+            "refused unauthorized VoIP mutation"
+        );
+        return json!({ "error": format!("{verb}: authorization refused: {error}") }).to_string();
+    }
+    build_reply(svc, verb, Some(&handler_body))
+}
+
 /// Write the gateway file atomically with 0600 perms (the password is in it).
 fn write_gateway(path: &Path, rec: &GatewayFile) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
@@ -231,7 +317,7 @@ pub fn poll_once(persist: &Persist, svc: &VoipService, cursors: &mut HashMap<Str
         for msg in msgs {
             cursors.insert(topic.clone(), msg.ulid.clone());
             let reply = if crate::ipc::body_within_cap(msg.body.as_deref()) {
-                build_reply(svc, verb, msg.body.as_deref())
+                build_bus_reply(svc, verb, msg.body.as_deref())
             } else {
                 crate::ipc::body_too_large_reply(verb)
             };
@@ -250,6 +336,10 @@ pub fn poll_once(persist: &Persist, svc: &VoipService, cursors: &mut HashMap<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::action_auth::authorize_test_body;
+
+    const AUTH_KEY: &[u8] = b"voip-action-auth-test-key";
+    const AUTH_NOW: i64 = 1_700_000_000_000;
 
     #[test]
     fn set_then_get_round_trips_and_writes_account_shape() {
@@ -311,5 +401,93 @@ mod tests {
         );
         let written = std::fs::read_to_string(gateway_path(tmp.path())).unwrap();
         assert!(written.contains("server = \"h\""), "{written}");
+    }
+
+    #[test]
+    fn hostile_unsigned_mutations_are_refused_before_gateway_io() {
+        let (tmp, svc) = {
+            let tmp = tempfile::tempdir().unwrap();
+            let svc = VoipService::new(tmp.path()).with_authorizer(Arc::new(
+                ActionAuthorizer::for_test(AUTH_KEY, tmp.path().join("auth"), AUTH_NOW),
+            ));
+            (tmp, svc)
+        };
+        let set = json!({
+            "schema_version": 1,
+            "host": "pbx.example.com",
+            "username": "unsigned"
+        })
+        .to_string();
+        let clear = json!({ "schema_version": 1 }).to_string();
+
+        for (verb, body) in [("set-gateway", set), ("clear-gateway", clear)] {
+            let reply = build_bus_reply(&svc, verb, Some(&body));
+            assert!(
+                reply.contains("authorization refused"),
+                "unsigned {verb} reached its handler: {reply}"
+            );
+        }
+        assert!(!gateway_path(tmp.path()).exists());
+    }
+
+    #[test]
+    fn authorized_gateway_mutation_is_exact_body_bound_and_single_use() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = VoipService::new(tmp.path()).with_authorizer(Arc::new(
+            ActionAuthorizer::for_test(AUTH_KEY, tmp.path().join("auth"), AUTH_NOW),
+        ));
+        let unsigned = json!({
+            "schema_version": 1,
+            "host": "pbx.example.com",
+            "port": 5062,
+            "username": "authorized",
+            "password": "s3cret",
+            "display_name": "Authorized"
+        })
+        .to_string();
+        let context = MutationContext {
+            verb: "voip-set-gateway",
+            node: VOIP_ACTION_NODE_SCOPE,
+            target: "gateway",
+        };
+        let armed = authorize_test_body(
+            AUTH_KEY,
+            &unsigned,
+            context,
+            "voip-replay",
+            AUTH_NOW + 30_000,
+        );
+
+        let first = build_bus_reply(&svc, "set-gateway", Some(&armed));
+        assert!(first.contains("\"ok\":true"), "{first}");
+        let replay = build_bus_reply(&svc, "set-gateway", Some(&armed));
+        assert!(replay.contains("already used"), "{replay}");
+
+        let tampered = armed.replace(
+            "\"host\":\"pbx.example.com\"",
+            "\"host\":\"evil.example.com\"",
+        );
+        assert!(
+            build_bus_reply(&svc, "set-gateway", Some(&tampered)).contains("authorization refused")
+        );
+        let written = std::fs::read_to_string(gateway_path(tmp.path())).unwrap();
+        assert!(written.contains("server = \"pbx.example.com:5062\""));
+
+        let clear_unsigned = json!({ "schema_version": 1 }).to_string();
+        let clear_context = MutationContext {
+            verb: "voip-clear-gateway",
+            node: VOIP_ACTION_NODE_SCOPE,
+            target: "gateway",
+        };
+        let clear_armed = authorize_test_body(
+            AUTH_KEY,
+            &clear_unsigned,
+            clear_context,
+            "voip-clear",
+            AUTH_NOW + 30_000,
+        );
+        let cleared = build_bus_reply(&svc, "clear-gateway", Some(&clear_armed));
+        assert!(cleared.contains("\"ok\":true"), "{cleared}");
+        assert!(!gateway_path(tmp.path()).exists());
     }
 }

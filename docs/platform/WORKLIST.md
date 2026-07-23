@@ -298,7 +298,8 @@ These decisions refine acceptance and sequencing for the active items below.
   refusal before backend execution).
   The Datacenter responder now gates its full VM/IaC/storage mutation set before
   op-lock or backend calls; its focused farm suite is 75/75, including signed
-  one-shot replay refusal. VPN mutation gating is in flight on the farm.
+  one-shot replay refusal. VPN mutation gating is also farm-green at 26/26,
+  including unsigned and replay refusal.
   Publisher tracing found no legitimate Podman or remote host-control shell path;
   the scheduler's old unsigned actuator emission was retired rather than granted
   autonomous mint authority (32/32 farm-green). The reachability audit then found
@@ -335,9 +336,24 @@ These decisions refine acceptance and sequencing for the active items below.
   coverage is 12/12. DDNS config/record mutations use the same gate while
   record-status/config reads remain open; focused farm coverage is 9/9. The
   full inventory and shared-spool cross-UID negative fixture remain open. A
-  current-tree full `mackesd` library run completed 3,729/3,731 with
+  An earlier current-tree full `mackesd` library run completed 3,729/3,731 with
   one ignored test and one environment-sensitive caffeine round-trip failure;
-  that failure passed in an isolated farm rerun.
+  that failure passed in an isolated farm rerun. The follow-up full gate below
+  is the current result.
+  The next privileged-responder tranche is now wired and farm-proven: Nebula
+  `regen-certs` is gated before the passphrase/CA path (20/20 focused), Settings
+  `set`/`restore` are gated before settings I/O (7/7), VoIP `set-gateway` /
+  `clear-gateway` are gated before gateway-file I/O (5/5), and every FileXfer
+  mutation (`send-to`, `rollback`, inbox `mark-opened`, outbox `cancel`) is
+  gated before file/inbox/outbox I/O (19/19). Production responders share the
+  verifier/replay ledger where multiple surfaces run in one daemon. The
+  integrated current-tree farm library gate is now 3,744/3,745 (one ignored,
+  zero failures), and farm format check is clean. The complete runtime inventory
+  and shared-spool cross-UID negative fixture remain the closure gates.
+  Thin-lighthouse onboarding is also fail-closed now: signed role/secret bundles
+  cannot promote a lighthouse or place `media`/`fileshare` secret scopes, with
+  no-partial-apply proofs in `onboard::remote_push` 22/22 and
+  `workers::onboard_apply` 10/10 focused farm suites.
 - Priority: P0
 - Complexity: Epic
 - Problem: The production Bus spool is intentionally cross-UID writable, but
