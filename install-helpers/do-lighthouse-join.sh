@@ -27,7 +27,8 @@ TEMPLATE="$HERE/do-lighthouse-join-cloudinit.sh"
 [ -f "$TEMPLATE" ] || { echo "missing $TEMPLATE" >&2; exit 1; }
 
 # ---- defaults -------------------------------------------------------------
-REGION="nyc3"; SIZE="s-1vcpu-512mb-10gb"; IMAGE="fedora-43-x64"
+THIN_SIZE="s-1vcpu-512mb-10gb"
+REGION="nyc3"; SIZE="$THIN_SIZE"; IMAGE="fedora-43-x64"
 REPO_BASEURL="https://matthewmackes.github.io/magic-mesh"; RPM_URL=""
 TAG="magic-lighthouse"; SSH_KEYS=(); KEEP_ON_FAIL=0
 
@@ -46,6 +47,12 @@ while [ $# -gt 0 ]; do
         *) echo "unknown option: $1" >&2; exit 1;;
     esac
 done
+
+if [ "$SIZE" != "$THIN_SIZE" ]; then
+    echo "lighthouse provisioning only supports the thin $THIN_SIZE profile;" >&2
+    echo "media, fileshare, and larger lighthouse sizes are retired." >&2
+    exit 1
+fi
 
 command -v doctl >/dev/null || { echo "doctl not found — install + 'doctl auth init'" >&2; exit 1; }
 

@@ -395,7 +395,7 @@ pub fn plan_spawn(req: &SpawnRequest, facts: &SpawnFacts) -> SpawnPlan {
 #[must_use]
 pub fn render_spec(target: &SpawnTarget) -> ProvisionSpec {
     match target {
-        SpawnTarget::Cloud { region, size } => {
+        SpawnTarget::Cloud { region, .. } => {
             let mut user_data = String::new();
             let _ = writeln!(user_data, "#cloud-config");
             let _ = writeln!(
@@ -421,7 +421,10 @@ pub fn render_spec(target: &SpawnTarget) -> ProvisionSpec {
             );
             ProvisionSpec::CloudInit {
                 region: region.clone(),
-                size: size.clone(),
+                // The request shape retains `size` for wire compatibility, but
+                // every provision is normalized to the only supported thin
+                // lighthouse profile.
+                size: DEFAULT_CLOUD_SIZE.to_string(),
                 image: DEFAULT_CLOUD_IMAGE.to_string(),
                 user_data,
             }
@@ -848,11 +851,25 @@ mod tests {
     }
 
     #[test]
+    fn render_spec_rejects_larger_wire_size_by_normalizing_to_thin_profile() {
+        let spec = render_spec(&SpawnTarget::Cloud {
+            region: "sfo3".to_string(),
+            size: "s-2vcpu-2gb".to_string(),
+        });
+        match spec {
+            ProvisionSpec::CloudInit { size, .. } => assert_eq!(size, DEFAULT_CLOUD_SIZE),
+        }
+    }
+
+    #[test]
     fn spawn_request_round_trips_through_serde() {
         let req = SpawnRequest {
             target: SpawnTarget::Cloud {
                 region: "sfo3".to_string(),
-                size: "s-2vcpu-2gb".to_string(),
+                // Requests may carry the explicit canonical size, but the
+                // renderer still fail-closes every provision to the thin
+                // lighthouse profile.
+                size: DEFAULT_CLOUD_SIZE.to_string(),
             },
             pair: true,
         };

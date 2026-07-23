@@ -6,6 +6,11 @@
 //! of `add-peer` + `lighthouse add`, kept private to this module.
 use crate::*;
 
+/// The only DigitalOcean lighthouse shape. Keep the CLI gate aligned with the
+/// join helper, Datacenter HCL writer, and Tofu variable validation so an
+/// invalid override cannot mint a bearer before the provisioner rejects it.
+const THIN_LIGHTHOUSE_SIZE: &str = "s-1vcpu-512mb-10gb";
+
 /// SETUP-4/5 — mint a single-use v3 join token for a new peer/lighthouse on
 /// THIS lighthouse. Reads the mesh-id from the local founding bundle and the
 /// `?fp=` from the on-disk `/enroll` endpoint cert, mints a fresh bearer, and
@@ -166,6 +171,12 @@ pub fn lighthouse_add(
     size: Option<String>,
     image: Option<String>,
 ) -> anyhow::Result<()> {
+    if let Some(requested) = size.as_deref() {
+        anyhow::ensure!(
+            requested == THIN_LIGHTHOUSE_SIZE,
+            "lighthouse provisioning only supports the thin {THIN_LIGHTHOUSE_SIZE} profile; media, fileshare, and larger variants are retired"
+        );
+    }
     let token = mint_join_token(
         mde_role::Role::Lighthouse,
         "lighthouse via `lighthouse add`",

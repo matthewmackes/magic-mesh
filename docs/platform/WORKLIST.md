@@ -335,8 +335,8 @@ These decisions refine acceptance and sequencing for the active items below.
   apply-template), with read-only candidate/list verbs left open; focused farm
   coverage is 12/12. DDNS config/record mutations use the same gate while
   record-status/config reads remain open; focused farm coverage is 9/9. The
-  full inventory and shared-spool cross-UID negative fixture remain open. A
-  An earlier current-tree full `mackesd` library run completed 3,729/3,731 with
+  full inventory and shared-spool cross-UID negative fixture remain open. An
+  earlier current-tree full `mackesd` library run completed 3,729/3,731 with
   one ignored test and one environment-sensitive caffeine round-trip failure;
   that failure passed in an isolated farm rerun. The follow-up full gate below
   is the current result.
@@ -347,9 +347,14 @@ These decisions refine acceptance and sequencing for the active items below.
   mutation (`send-to`, `rollback`, inbox `mark-opened`, outbox `cancel`) is
   gated before file/inbox/outbox I/O (19/19). Production responders share the
   verifier/replay ledger where multiple surfaces run in one daemon. The
-  integrated current-tree farm library gate is now 3,750/3,751 (one ignored,
-  zero failures), and farm format check is clean. The complete runtime inventory
-  and shared-spool cross-UID negative fixture remain the closure gates.
+  integrated current-tree farm library gate is now 3,758/3,759 (one ignored,
+  zero failures). The cross-UID fixture also passes on BigBoy: a `nobody` child
+  writes four bodies through real `mde_bus::Persist` into a 0777 topic/SQLite
+  spool, the parent verifies a different owner, and only one authorized effect
+  is recorded across unsigned, tampered, authorized, and replay bodies. Peer app
+  launch is 8/8 and desktop-source mutations are 23/23. The remaining inventory
+  work is the older private-root/compute and other mutable-lane review; these
+  routing defects are not treated as authorization.
   Thin-lighthouse onboarding is also fail-closed now: signed role/secret bundles
   cannot promote a lighthouse or place `media`/`fileshare` secret scopes, with
   no-partial-apply proofs in `onboard::remote_push` 22/22 and
@@ -361,6 +366,11 @@ These decisions refine acceptance and sequencing for the active items below.
   consumer inventory now has no Open/typed-only rows in this shared-spool
   tranche; the final WL-SEC-007 closure gates are the integrated current-tree
   library run and a cross-UID shared-spool negative fixture.
+  All DigitalOcean lighthouse writers now force the canonical thin
+  `s-1vcpu-512mb-10gb` profile: the Datacenter/genesis HCL writer rejects larger
+  sizes, the onboarding renderer normalizes legacy wire sizes, the promotion
+  and `do-lighthouse-{up,join}.sh` helpers refuse overrides, and
+  `infra/tofu/zone1-do` validates the same slug.
 - Priority: P0
 - Complexity: Epic
 - Problem: The production Bus spool is intentionally cross-UID writable, but
@@ -952,7 +962,13 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-007 - Car interface (CarPlay-principled vehicle mode)
 
 - Status: Remaining
-- Progress (2026-07-22): retained MG90 telemetry now expires after five seconds;
+- Progress (2026-07-23): the production map model now exposes a
+  `refresh_from_persist` seam and a deterministic live/stale vehicle Bus fixture
+  covering MG90 speed, battery, GNSS, WAN, and dashboard fold (including a six
+  second-old stale row); the focused fixture passed 1/1 and the full Maps suite
+  passed 145/145 on BigBoy. Live `.25` SSH remains credential-blocked; the
+  existing non-production `.15` DRM capture remains the available visual
+  evidence. Retained MG90 telemetry now expires after five seconds;
   stale/simulated readings re-dash, cannot drive motion policy, and keep their
   provenance/age honest. Vehicle Fuel/Odometer now share the same live gate.
   Farm `mde-maps-location-egui` suite passed 97/97. Settings now consumes

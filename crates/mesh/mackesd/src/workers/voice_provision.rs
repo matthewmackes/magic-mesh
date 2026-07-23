@@ -1940,7 +1940,7 @@ impl Worker for VoiceProvisionWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipc::action_auth::{ActionAuthorizer, authorize_test_body};
+    use crate::ipc::action_auth::{authorize_test_body, ActionAuthorizer};
     use crate::vitelity::FakeVitelityClient;
 
     const ACTION_KEY: &[u8] = b"voice-action-auth-test-key";

@@ -741,37 +741,48 @@ impl MapsLocationSurface {
             return;
         };
 
-        if let Some(mirror) = read_vehicle_mirror(&persist, node) {
+        self.refresh_from_persist(&persist, node);
+    }
+
+    /// Fold one already-open Bus spool into the cockpit.
+    ///
+    /// This is kept separate from [`Self::refresh_from_bus`] so the live
+    /// mirror contract can be exercised against a deterministic SQLite spool
+    /// without mutating process-global `MDE_BUS_ROOT` or depending on a
+    /// workstation's real daemon. Production still reaches this seam through
+    /// the fail-soft, cadence-gated method above.
+    fn refresh_from_persist(&mut self, persist: &mde_bus::persist::Persist, node: &str) {
+        if let Some(mirror) = read_vehicle_mirror(persist, node) {
             self.refresh_from_vehicle(&mirror);
         }
-        if let Some(snapshot) = read_earthquake_mirror(&persist, node) {
+        if let Some(snapshot) = read_earthquake_mirror(persist, node) {
             self.refresh_from_earthquakes(snapshot);
         }
-        if let Some(snapshot) = read_nws_alert_mirror(&persist, node) {
+        if let Some(snapshot) = read_nws_alert_mirror(persist, node) {
             self.refresh_from_nws_alerts(snapshot);
         }
-        if let Some(snapshot) = read_aircraft_mirror(&persist, node) {
+        if let Some(snapshot) = read_aircraft_mirror(persist, node) {
             self.refresh_from_aircraft(snapshot);
         }
-        if let Some(snapshot) = read_transit_mirror(&persist, node) {
+        if let Some(snapshot) = read_transit_mirror(persist, node) {
             self.refresh_from_transit(snapshot);
         }
-        if let Some(snapshot) = read_nws_forecast_mirror(&persist, node) {
+        if let Some(snapshot) = read_nws_forecast_mirror(persist, node) {
             self.refresh_from_nws_forecast(snapshot);
         }
-        if let Some(snapshot) = read_caltrans_camera_mirror(&persist, node) {
+        if let Some(snapshot) = read_caltrans_camera_mirror(persist, node) {
             self.refresh_from_caltrans_cameras(snapshot);
         }
-        if let Some(snapshot) = read_iem_radar_mirror(&persist, node) {
+        if let Some(snapshot) = read_iem_radar_mirror(persist, node) {
             self.refresh_from_iem_radar(snapshot);
         }
-        if let Some(snapshot) = read_wildfire_mirror(&persist, node) {
+        if let Some(snapshot) = read_wildfire_mirror(persist, node) {
             self.refresh_from_wildfire(snapshot);
         }
-        if let Some(snapshot) = read_traffic_mirror(&persist, node) {
+        if let Some(snapshot) = read_traffic_mirror(persist, node) {
             self.refresh_from_traffic(snapshot);
         }
-        if let Some(snapshot) = read_air_quality_mirror(&persist, node) {
+        if let Some(snapshot) = read_air_quality_mirror(persist, node) {
             self.refresh_from_air_quality(snapshot);
         }
     }
@@ -4242,6 +4253,115 @@ mod tests {
             .real_hardware_gaps
             .iter()
             .any(|g| g == SIMULATED_MG90_GAP_NOTE));
+    }
+
+    #[test]
+    fn live_bus_vehicle_mirror_drives_car_readouts_and_glance() {
+        use crate::car_status::{live_speed_mph, CarStatusItem};
+        use mackes_mesh_types::vehicle::{
+            CellLink, GpsFix, VehicleState as WireVehicleState, VehicleTelem, WanStatus,
+        };
+
+        // Exercise the same retained SQLite row that production reads, rather
+        // than calling the typed fold directly. This is temp-spool backed so
+        // it never mutates a developer Bus or relies on MDE_BUS_ROOT.
+        let dir = tempfile::tempdir().expect("bus dir");
+        let persist = mde_bus::persist::Persist::open(dir.path().to_path_buf()).expect("bus");
+        let now = test_now_ms();
+        let mut mirror = WireVehicleState {
+            host: "mg90-live".to_string(),
+            model: "MG90".to_string(),
+            esn: "ESN-LIVE".to_string(),
+            mgos_version: "4.3.0.1".to_string(),
+            online: true,
+            gps: GpsFix {
+                fix_type: "3D".to_string(),
+                latitude: 40.4406,
+                longitude: -79.9959,
+                satellites: 11,
+                hdop: 0.8,
+                ..GpsFix::default()
+            },
+            imu: None,
+            wan: WanStatus {
+                active_wan: "Cellular A".to_string(),
+                cellular_a: CellLink {
+                    sim_state: "ready".to_string(),
+                    carrier: "FirstNet".to_string(),
+                    signal_dbm: -68,
+                    technology: "5G/LTE-A".to_string(),
+                    wan_ip: "100.64.0.9".to_string(),
+                    healthy: true,
+                },
+                latency_ms: 31,
+                link_quality: "excellent".to_string(),
+                ..WanStatus::default()
+            },
+            telem: VehicleTelem {
+                speed_mph: 48.0,
+                battery_v: 13.7,
+                moving: true,
+                obd_present: true,
+                ..VehicleTelem::default()
+            },
+            gaps: Vec::new(),
+            published_at_ms: now,
+        };
+        let topic = mackes_mesh_types::vehicle::vehicle_state_topic("mg90-live");
+        persist
+            .write(
+                &topic,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&serde_json::to_string(&mirror).expect("mirror json")),
+            )
+            .expect("retained vehicle mirror");
+
+        let mut state = MapsLocationSurface::live();
+        state.refresh_from_persist(&persist, "mg90-live");
+        assert!(state.vehicle.telemetry.is_live());
+        assert_eq!(live_speed_mph(&state), Some(48.0));
+        assert_eq!(state.vehicle_glance().as_deref(), Some("48 mph"));
+        assert_eq!(
+            CarStatusItem::SpeedMph.value(&state),
+            "48 mph",
+            "the driver strip must consume the retained MG90 mirror"
+        );
+        assert_eq!(
+            CarStatusItem::BatteryV.value(&state),
+            "13.7 V",
+            "telemetry tiles share the live mirror gate"
+        );
+        assert_eq!(
+            state
+                .locations
+                .primary_source()
+                .expect("MG90 source")
+                .kind
+                .label(),
+            "MG90 GNSS"
+        );
+        assert_eq!(
+            state.mg90.status.active_wan, "Cellular A",
+            "dashboard connectivity data comes from the same retained row"
+        );
+
+        // A retained row that ages beyond the five-second safety window stays
+        // provenance-visible but can no longer drive motion, instruments, or
+        // the Car home glance.
+        mirror.published_at_ms = now - 6_000;
+        persist
+            .write(
+                &topic,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&serde_json::to_string(&mirror).expect("stale mirror json")),
+            )
+            .expect("stale retained vehicle mirror");
+        state.refresh_from_persist(&persist, "mg90-live");
+        assert!(!state.vehicle.telemetry.is_live());
+        assert_eq!(live_speed_mph(&state), None);
+        assert_eq!(state.vehicle_glance(), None);
     }
 
     #[test]

@@ -45,6 +45,7 @@ use std::time::Duration;
 
 use mde_bus::persist::Persist;
 
+use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
 use crate::ipc::apps::{default_app_dirs, scan_local_apps, AppEntry};
 
 use super::{ShutdownToken, Worker};
@@ -56,6 +57,11 @@ pub const ACTION_TOPIC: &str = "action/apps/launch";
 /// Action-drain cadence. The bus read is a cheap local log scan; a launch is a
 /// rare, operator-initiated event, so a 1 s poll is responsive without spinning.
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Shared-Bus capability context for the remote app-launch mutation. The
+/// worker binds the capability to this node (the only node whose catalog it
+/// may resolve) and the requested catalog id.
+const PEER_APP_LAUNCH_AUTH_VERB: &str = "peer-app-launch";
 
 // ───────────────────────────── request model ─────────────────────────────
 
@@ -169,7 +175,7 @@ impl AppLauncher for SpawnLauncher {
 
 /// Read new [`ACTION_TOPIC`] messages since `cursor`, advancing it. A short sync
 /// open-read-drop (never crosses an `.await`), mirroring [`crate::workers::container`].
-fn read_new_requests(bus_root: &Path, cursor: &mut Option<String>) -> Vec<LaunchRequest> {
+fn read_new_requests(bus_root: &Path, cursor: &mut Option<String>) -> Vec<String> {
     let Ok(persist) = Persist::open(bus_root.to_path_buf()) else {
         return vec![];
     };
@@ -179,15 +185,7 @@ fn read_new_requests(bus_root: &Path, cursor: &mut Option<String>) -> Vec<Launch
     let mut out = Vec::new();
     for msg in msgs {
         *cursor = Some(msg.ulid.clone());
-        let body = msg.body.as_deref().unwrap_or("");
-        match parse_launch_request(body) {
-            Some(req) => out.push(req),
-            None => tracing::warn!(
-                target: "mackesd::peer_app_launch",
-                ulid = %msg.ulid,
-                "peer_app_launch: malformed launch request refused (no node/app_id)",
-            ),
-        }
+        out.push(msg.body.unwrap_or_default());
     }
     out
 }
@@ -224,6 +222,8 @@ pub struct PeerAppLaunchWorker {
     poll: Duration,
     /// Bus root override (tests). `None` ⇒ [`default_bus_root`].
     bus_root_override: Option<PathBuf>,
+    /// Shared, fail-closed authorization gate for the remote launch mutation.
+    authorizer: Arc<ActionAuthorizer>,
 }
 
 impl PeerAppLaunchWorker {
@@ -238,6 +238,7 @@ impl PeerAppLaunchWorker {
             launcher: Arc::new(SpawnLauncher),
             poll: DEFAULT_POLL_INTERVAL,
             bus_root_override: None,
+            authorizer: Arc::new(ActionAuthorizer::production()),
         }
     }
 
@@ -266,6 +267,15 @@ impl PeerAppLaunchWorker {
     #[must_use]
     pub fn with_bus_root(mut self, root: PathBuf) -> Self {
         self.bus_root_override = Some(root);
+        self
+    }
+
+    /// Inject an isolated verifier and replay ledger for hostile action tests.
+    /// Production always uses the systemd-credential-backed authorizer.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
+        self.authorizer = authorizer;
         self
     }
 
@@ -341,12 +351,43 @@ impl PeerAppLaunchWorker {
         }
     }
 
+    /// Authenticate and handle one raw Bus body. Authorization intentionally
+    /// precedes catalog resolution and the launcher seam: a shared-spool
+    /// publisher cannot turn a transport write into a process spawn.
+    fn handle_body(&self, body: &str) -> bool {
+        let Some(req) = parse_launch_request(body) else {
+            tracing::warn!(
+                target: "mackesd::peer_app_launch",
+                "peer_app_launch: malformed launch request refused (no node/app_id)",
+            );
+            return false;
+        };
+        if let Err(error) = self.authorizer.authorize(
+            body,
+            MutationContext {
+                verb: PEER_APP_LAUNCH_AUTH_VERB,
+                node: &self.node_id,
+                target: &req.app_id,
+            },
+        ) {
+            tracing::warn!(
+                target: "mackesd::peer_app_launch",
+                node = %self.node_id,
+                app_id = %req.app_id,
+                %error,
+                "peer_app_launch: refused unauthorized launch request",
+            );
+            return false;
+        }
+        self.handle_request(&req)
+    }
+
     /// Drain + handle new requests addressed to this node. Returns whether any app
     /// launched (for the caller's own bookkeeping / tests).
     fn drain_and_launch(&self, bus_root: &Path, cursor: &mut Option<String>) -> bool {
         let mut launched = false;
-        for req in read_new_requests(bus_root, cursor) {
-            launched |= self.handle_request(&req);
+        for body in read_new_requests(bus_root, cursor) {
+            launched |= self.handle_body(&body);
         }
         launched
     }
@@ -381,7 +422,11 @@ impl Worker for PeerAppLaunchWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::action_auth::{authorize_test_body, ActionAuthorizer};
     use std::sync::Mutex;
+
+    const AUTH_KEY: &[u8] = b"peer-app-launch-action-auth-key";
+    const AUTH_NOW: i64 = 1_700_000_000_000;
 
     /// A recording launcher: never spawns a real process, just captures the argv
     /// each launch would have run so the resolve/allowlist decision is asserted.
@@ -413,6 +458,36 @@ mod tests {
         PeerAppLaunchWorker::new("node-a".to_string())
             .with_home(home)
             .with_launcher(launcher)
+    }
+
+    fn launch_body(app_id: &str, nonce: &str) -> (String, tempfile::TempDir) {
+        let auth_root = tempfile::tempdir().unwrap();
+        let unsigned =
+            format!(r#"{{"node":"node-a","app_id":"{app_id}","name":"Test","schema_version":1}}"#);
+        let armed = authorize_test_body(
+            AUTH_KEY,
+            &unsigned,
+            MutationContext {
+                verb: PEER_APP_LAUNCH_AUTH_VERB,
+                node: "node-a",
+                target: app_id,
+            },
+            nonce,
+            AUTH_NOW + 30_000,
+        );
+        (armed, auth_root)
+    }
+
+    fn worker_with_auth(
+        home: PathBuf,
+        launcher: Arc<RecordingLauncher>,
+        auth_root: &Path,
+    ) -> PeerAppLaunchWorker {
+        worker_with(home, launcher).with_authorizer(Arc::new(ActionAuthorizer::for_test(
+            AUTH_KEY,
+            auth_root.to_path_buf(),
+            AUTH_NOW,
+        )))
     }
 
     #[test]
@@ -529,5 +604,45 @@ mod tests {
             vec!["/usr/bin/safe-app".to_string(), "--managed".to_string()],
             "the argv comes ONLY from the resolved catalog entry, never the request",
         );
+    }
+
+    #[test]
+    fn unsigned_launch_is_refused_before_spawn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        seed_desktop_app(&home, "firefox", "firefox %U");
+        let launcher = Arc::new(RecordingLauncher::default());
+        let auth_root = tempfile::tempdir().unwrap();
+        let worker = worker_with_auth(home, Arc::clone(&launcher), auth_root.path());
+
+        assert!(!worker.handle_body(
+            r#"{"node":"node-a","app_id":"firefox","name":"Firefox","schema_version":1}"#
+        ));
+        assert!(launcher.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn exact_body_launch_is_single_use_and_tamper_does_not_consume_nonce() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        seed_desktop_app(&home, "firefox", "firefox %U");
+        let launcher = Arc::new(RecordingLauncher::default());
+        let (armed, auth_root) = launch_body("firefox", "launch-once");
+        let worker = worker_with_auth(home, Arc::clone(&launcher), auth_root.path());
+
+        let tampered = armed.replace("Test", "Tampered");
+        assert!(
+            !worker.handle_body(&tampered),
+            "body tampering must be refused"
+        );
+        assert!(
+            worker.handle_body(&armed),
+            "the untouched capability remains valid"
+        );
+        assert!(
+            !worker.handle_body(&armed),
+            "the capability nonce is single-use"
+        );
+        assert_eq!(launcher.calls.lock().unwrap().len(), 1);
     }
 }

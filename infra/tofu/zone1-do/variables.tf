@@ -5,9 +5,14 @@ variable "region" {
 }
 
 variable "lighthouse_size" {
-  description = "Droplet size slug for a lighthouse (2GB/2vCPU = s-2vcpu-2gb)."
+  description = "The only supported thin lighthouse size (1 shared vCPU, 512 MiB RAM, 10 GiB SSD)."
   type        = string
-  default     = "s-2vcpu-2gb"
+  default     = "s-1vcpu-512mb-10gb"
+
+  validation {
+    condition     = var.lighthouse_size == "s-1vcpu-512mb-10gb"
+    error_message = "Lighthouses must use the thin s-1vcpu-512mb-10gb profile; media/fileshare and larger variants are retired."
+  }
 }
 
 variable "lighthouse_image" {

@@ -15,7 +15,8 @@ RPM="${MCNF_RPM:-}"
 DO_DOMAIN="${MCNF_DO_DOMAIN:-matthewmackes.com}"
 DO_TAG="${MCNF_DO_TAG:-magic-lighthouse}"
 DO_REGION="${MCNF_DO_REGION:-nyc3}"
-DO_SIZE="${MCNF_DO_SIZE:-s-2vcpu-2gb}"
+DO_THIN_SIZE="s-1vcpu-512mb-10gb"
+DO_SIZE="${MCNF_DO_SIZE:-$DO_THIN_SIZE}"
 DO_MAX_ACTIVE="${MCNF_DO_MAX_ACTIVE:-8}"
 DO_MIN_FREE="${MCNF_DO_MIN_FREE:-2}"
 EAGLE="${MCNF_EAGLE_HOST:-172.20.146.13}"
@@ -24,6 +25,12 @@ EAGLE_PASS_FILE="${MCNF_EAGLE_PASS_FILE:-/root/.mcnf-xapi-cred}"
 SSH_KEY="${MCNF_SSH_KEY:-/root/.ssh/id_ed25519}"
 DECLARATION_FILE="${MCNF_RELEASE_DECLARATION:-$ROOT/docs/ops/production-release-declaration.md}"
 WORKLIST="${MCNF_WORKLIST:-$ROOT/docs/platform/WORKLIST.md}"
+
+if [ "$DO_SIZE" != "$DO_THIN_SIZE" ]; then
+  printf 'ERROR: lighthouses only support the thin %s profile; refusing %s\n' \
+    "$DO_THIN_SIZE" "$DO_SIZE" >&2
+  exit 1
+fi
 
 log() { printf '==> %s\n' "$*" >&2; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }

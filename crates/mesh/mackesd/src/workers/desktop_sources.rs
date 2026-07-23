@@ -51,6 +51,7 @@ use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 
 use super::vm_lifecycle::{vm_state_from_str, Instance, LibvirtBackend, VirshCli, VmState};
 use super::{ShutdownToken, Worker};
+use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
 
 /// The retained-latest state topic the merged source roster is published to.
 /// The Chooser surface (CHOOSER-2) reads the newest record off this topic.
@@ -64,6 +65,12 @@ pub const REMOVE_SOURCE_TOPIC: &str = "action/desktops/remove-source";
 
 /// Typed verb: force a re-enumerate + republish (the operator's refresh).
 pub const REFRESH_TOPIC: &str = "action/desktops/refresh";
+
+/// Shared-Bus capability verbs for the two manual-source mutations. Refresh is
+/// intentionally not listed: it only re-enumerates read-only discovery lanes
+/// and republishes the derived roster, so it remains an open harmless nudge.
+const DESKTOP_ADD_SOURCE_AUTH_VERB: &str = "desktop-add-source";
+const DESKTOP_REMOVE_SOURCE_AUTH_VERB: &str = "desktop-remove-source";
 
 /// Action-drain cadence. Discovery is human-paced; a 2 s poll keeps verb
 /// latency imperceptible without spinning virsh or the peers plane.
@@ -825,6 +832,8 @@ pub struct DesktopSourcesWorker {
     cursors: HashMap<&'static str, String>,
     /// Fingerprint of the last published fold (publish-on-change gate).
     last_fingerprint: Option<String>,
+    /// Shared, fail-closed authorization gate for manual-source mutations.
+    authorizer: Arc<ActionAuthorizer>,
 }
 
 impl DesktopSourcesWorker {
@@ -847,6 +856,7 @@ impl DesktopSourcesWorker {
             vm_lane: "idle".to_string(),
             cursors: HashMap::new(),
             last_fingerprint: None,
+            authorizer: Arc::new(ActionAuthorizer::production()),
         }
     }
 
@@ -868,6 +878,15 @@ impl DesktopSourcesWorker {
     #[must_use]
     pub const fn with_tick(mut self, d: Duration) -> Self {
         self.tick = d;
+        self
+    }
+
+    /// Inject an isolated verifier and replay ledger for hostile action tests.
+    /// Production always uses the systemd-credential-backed authorizer.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
+        self.authorizer = authorizer;
         self
     }
 
@@ -911,6 +930,37 @@ impl DesktopSourcesWorker {
         }
     }
 
+    /// Authenticate one raw manual-source mutation before parsing it into a
+    /// typed request or touching the node-local store. Targets are the stable
+    /// manual-source id, so a capability cannot be replayed for another
+    /// endpoint. The refresh verb deliberately stays outside this helper: it
+    /// performs no mutation, only read-only discovery and a derived publish.
+    fn authorize_mutation(&self, topic: &'static str, body: &str) -> Result<(), String> {
+        let (verb, target) = match topic {
+            ADD_SOURCE_TOPIC => {
+                let target = parse_add_source(body)
+                    .map(|request| request.id())
+                    .unwrap_or_default();
+                (DESKTOP_ADD_SOURCE_AUTH_VERB, target)
+            }
+            REMOVE_SOURCE_TOPIC => {
+                let target = parse_remove_source(body)
+                    .map(|request| request.id)
+                    .unwrap_or_default();
+                (DESKTOP_REMOVE_SOURCE_AUTH_VERB, target)
+            }
+            other => return Err(format!("unknown desktop mutation topic: {other}")),
+        };
+        self.authorizer.authorize(
+            body,
+            MutationContext {
+                verb,
+                node: &self.node_id,
+                target: &target,
+            },
+        )
+    }
+
     /// Drain one action topic since its cursor, returning the new bodies.
     fn drain_topic(
         persist: &Persist,
@@ -933,6 +983,14 @@ impl DesktopSourcesWorker {
     fn drain_actions(&mut self, persist: &Persist) -> (bool, bool) {
         let mut changed = false;
         for body in Self::drain_topic(persist, ADD_SOURCE_TOPIC, &mut self.cursors) {
+            if let Err(error) = self.authorize_mutation(ADD_SOURCE_TOPIC, &body) {
+                tracing::warn!(
+                    target: "mackesd::desktop_sources",
+                    error = %error,
+                    "refused unauthorized add-source mutation"
+                );
+                continue;
+            }
             match parse_add_source(&body) {
                 Ok(req) => changed |= self.handle_add(req),
                 Err(e) => {
@@ -941,6 +999,14 @@ impl DesktopSourcesWorker {
             }
         }
         for body in Self::drain_topic(persist, REMOVE_SOURCE_TOPIC, &mut self.cursors) {
+            if let Err(error) = self.authorize_mutation(REMOVE_SOURCE_TOPIC, &body) {
+                tracing::warn!(
+                    target: "mackesd::desktop_sources",
+                    error = %error,
+                    "refused unauthorized remove-source mutation"
+                );
+                continue;
+            }
             match parse_remove_source(&body) {
                 Ok(req) => changed |= self.handle_remove(&req.id),
                 Err(e) => {
@@ -948,6 +1014,9 @@ impl DesktopSourcesWorker {
                 }
             }
         }
+        // Refresh is an open, harmless read/nudge: it only re-enumerates
+        // discovery and republishes the derived state; it never updates the
+        // manual store or invokes a privileged mutator.
         let refresh = !Self::drain_topic(persist, REFRESH_TOPIC, &mut self.cursors).is_empty();
         (changed, refresh)
     }
@@ -1171,7 +1240,11 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::action_auth::{authorize_test_body, ActionAuthorizer};
     use mackes_mesh_types::peers::{RemoteAccess, ServiceDescriptors, VmInfo};
+
+    const AUTH_KEY: &[u8] = b"desktop-sources-action-auth-key";
+    const AUTH_NOW: i64 = 1_700_000_000_000;
 
     fn peer(
         hostname: &str,
@@ -1660,7 +1733,36 @@ mod tests {
             workgroup.to_path_buf(),
             store.to_path_buf(),
         )
+        .with_authorizer(Arc::new(ActionAuthorizer::for_test(
+            AUTH_KEY,
+            store.join(".auth"),
+            AUTH_NOW,
+        )))
         .with_enumerator(Arc::new(FakeVms(Ok(vec![]))))
+    }
+
+    fn authorized_body(unsigned: &str, verb: &str, target: &str, nonce: &str) -> String {
+        authorize_test_body(
+            AUTH_KEY,
+            unsigned,
+            MutationContext {
+                verb,
+                node: "elm",
+                target,
+            },
+            nonce,
+            AUTH_NOW + 30_000,
+        )
+    }
+
+    fn authorized_add_body(unsigned: &str, nonce: &str) -> String {
+        let target = parse_add_source(unsigned).unwrap().id();
+        authorized_body(unsigned, DESKTOP_ADD_SOURCE_AUTH_VERB, &target, nonce)
+    }
+
+    fn authorized_remove_body(unsigned: &str, nonce: &str) -> String {
+        let target = parse_remove_source(unsigned).unwrap().id;
+        authorized_body(unsigned, DESKTOP_REMOVE_SOURCE_AUTH_VERB, &target, nonce)
     }
 
     fn temp_persist() -> (tempfile::TempDir, Persist) {
@@ -1686,7 +1788,10 @@ mod tests {
                 ADD_SOURCE_TOPIC,
                 Priority::Default,
                 None,
-                Some(r#"{"host":"192.168.1.50","port":3389,"protocol":"rdp"}"#),
+                Some(&authorized_add_body(
+                    r#"{"host":"192.168.1.50","port":3389,"protocol":"rdp","schema_version":1}"#,
+                    "add-one",
+                )),
             )
             .unwrap();
         let (changed, refresh) = w.drain_actions(&persist);
@@ -1708,7 +1813,10 @@ mod tests {
                 ADD_SOURCE_TOPIC,
                 Priority::Default,
                 None,
-                Some(r#"{"host":"192.168.1.50","port":3389,"protocol":"rdp"}"#),
+                Some(&authorized_add_body(
+                    r#"{"host":"192.168.1.50","port":3389,"protocol":"rdp","schema_version":1}"#,
+                    "add-two",
+                )),
             )
             .unwrap();
         let (changed, _) = w.drain_actions(&persist);
@@ -1727,7 +1835,10 @@ mod tests {
                 ADD_SOURCE_TOPIC,
                 Priority::Default,
                 None,
-                Some(r#"{"host":"h","port":5900,"protocol":"vnc"}"#),
+                Some(&authorized_add_body(
+                    r#"{"host":"h","port":5900,"protocol":"vnc","schema_version":1}"#,
+                    "add-three",
+                )),
             )
             .unwrap();
         let (changed, _) = w.drain_actions(&persist);
@@ -1737,7 +1848,10 @@ mod tests {
                 REMOVE_SOURCE_TOPIC,
                 Priority::Default,
                 None,
-                Some(r#"{"id":"manual:h:5900:vnc"}"#),
+                Some(&authorized_remove_body(
+                    r#"{"id":"manual:h:5900:vnc","schema_version":1}"#,
+                    "remove-one",
+                )),
             )
             .unwrap();
         let (changed, _) = w.drain_actions(&persist);
@@ -1750,7 +1864,10 @@ mod tests {
                 REMOVE_SOURCE_TOPIC,
                 Priority::Default,
                 None,
-                Some(r#"{"id":"peer:oak"}"#),
+                Some(&authorized_remove_body(
+                    r#"{"id":"peer:oak","schema_version":1}"#,
+                    "remove-two",
+                )),
             )
             .unwrap();
         let (changed, _) = w.drain_actions(&persist);
@@ -1775,6 +1892,105 @@ mod tests {
         assert!(w.publish(&persist, sources.clone(), false));
         assert!(!w.publish(&persist, sources.clone(), false));
         assert!(w.publish(&persist, sources, true));
+    }
+
+    #[test]
+    fn add_source_requires_exact_single_use_capability_before_store_write() {
+        let (_bus, persist) = temp_persist();
+        let wg = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let mut w = worker_at(wg.path(), store.path());
+        let unsigned = r#"{"host":"10.0.0.4","port":3389,"protocol":"rdp","schema_version":1}"#;
+
+        persist
+            .write(ADD_SOURCE_TOPIC, Priority::Default, None, Some(unsigned))
+            .unwrap();
+        let (changed, _) = w.drain_actions(&persist);
+        assert!(!changed, "unsigned add must not touch the manual store");
+        assert!(w.manual.is_empty());
+        assert!(load_manual_sources(store.path()).is_empty());
+
+        let armed = authorized_add_body(unsigned, "add-hostile");
+        let tampered = armed.replace("3389", "3390");
+        persist
+            .write(ADD_SOURCE_TOPIC, Priority::Default, None, Some(&tampered))
+            .unwrap();
+        let (changed, _) = w.drain_actions(&persist);
+        assert!(!changed, "tampered add must be refused before persistence");
+        assert!(w.manual.is_empty());
+
+        persist
+            .write(ADD_SOURCE_TOPIC, Priority::Default, None, Some(&armed))
+            .unwrap();
+        let (changed, _) = w.drain_actions(&persist);
+        assert!(changed);
+        assert_eq!(w.manual.len(), 1);
+
+        persist
+            .write(ADD_SOURCE_TOPIC, Priority::Default, None, Some(&armed))
+            .unwrap();
+        let (changed, _) = w.drain_actions(&persist);
+        assert!(!changed, "replaying an add capability must be refused");
+        assert_eq!(w.manual.len(), 1);
+    }
+
+    #[test]
+    fn remove_source_requires_exact_single_use_capability_before_store_write() {
+        let (_bus, persist) = temp_persist();
+        let wg = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let mut w = worker_at(wg.path(), store.path());
+        let add = ManualSource {
+            name: None,
+            host: "10.0.0.5".into(),
+            port: 5900,
+            protocol: DesktopProtocol::Vnc,
+        };
+        assert!(w.handle_add(add.clone()));
+        let unsigned = format!(r#"{{"id":"{}","schema_version":1}}"#, add.id());
+
+        persist
+            .write(
+                REMOVE_SOURCE_TOPIC,
+                Priority::Default,
+                None,
+                Some(&unsigned),
+            )
+            .unwrap();
+        let (changed, _) = w.drain_actions(&persist);
+        assert!(!changed, "unsigned remove must not touch the manual store");
+        assert_eq!(w.manual, vec![add.clone()]);
+
+        let armed = authorized_remove_body(&unsigned, "remove-hostile");
+        let tampered = armed.replace("10.0.0.5", "10.0.0.6");
+        persist
+            .write(
+                REMOVE_SOURCE_TOPIC,
+                Priority::Default,
+                None,
+                Some(&tampered),
+            )
+            .unwrap();
+        let (changed, _) = w.drain_actions(&persist);
+        assert!(
+            !changed,
+            "tampered remove must be refused before persistence"
+        );
+        assert_eq!(w.manual, vec![add.clone()]);
+
+        persist
+            .write(REMOVE_SOURCE_TOPIC, Priority::Default, None, Some(&armed))
+            .unwrap();
+        let (changed, _) = w.drain_actions(&persist);
+        assert!(changed);
+        assert!(w.manual.is_empty());
+
+        persist
+            .write(REMOVE_SOURCE_TOPIC, Priority::Default, None, Some(&armed))
+            .unwrap();
+        let (changed, _) = w.drain_actions(&persist);
+        assert!(!changed, "replaying a remove capability must be refused");
+        assert!(w.manual.is_empty());
     }
 
     #[test]

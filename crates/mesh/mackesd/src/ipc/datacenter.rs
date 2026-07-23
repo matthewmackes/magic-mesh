@@ -138,6 +138,11 @@ use serde_json::json;
 
 use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
 
+/// The only supported DigitalOcean lighthouse shape. Lighthouses are thin
+/// relay/control-plane appliances; callers cannot opt them into a larger or
+/// media/fileshare-capable droplet.
+pub const THIN_LIGHTHOUSE_SIZE: &str = "s-1vcpu-512mb-10gb";
+
 /// Authorization node scope for the Xen/datacenter responder. Mutation
 /// targets are the existing resource lock keys, so a capability cannot be
 /// replayed against a different VM, storage object, or generated IaC resource.
@@ -1732,6 +1737,11 @@ pub fn lighthouse_create_resource(
     if !is_slug(region) {
         return Err("region is not a valid slug".into());
     }
+    if size != THIN_LIGHTHOUSE_SIZE {
+        return Err(format!(
+            "lighthouse size must be the thin profile ({THIN_LIGHTHOUSE_SIZE})"
+        ));
+    }
     if !is_slug(size) {
         return Err("size is not a valid slug".into());
     }
@@ -1794,12 +1804,14 @@ fn lighthouse_create_reply(svc: &DatacenterService, req_body: Option<&str>) -> S
         .unwrap_or("");
     // `size`/`image` default to the standard lighthouse slugs (the `zone1-do`
     // workspace's `lighthouse_size`/`lighthouse_image` variable defaults), so the
-    // guided flow only requires name + region.
+    // guided flow only requires name + region. The size is deliberately fail
+    // closed in `lighthouse_create_resource`: larger and media/fileshare
+    // lighthouse variants are retired.
     let size = req
         .get("size")
         .and_then(serde_json::Value::as_str)
         .filter(|s| !s.is_empty())
-        .unwrap_or("s-2vcpu-2gb");
+        .unwrap_or(THIN_LIGHTHOUSE_SIZE);
     let image = req
         .get("image")
         .and_then(serde_json::Value::as_str)
@@ -1933,7 +1945,7 @@ pub fn genesis_lighthouse_resource(
     let droplet_name = format!("lh-{mesh_id}-01");
     // REUSE DC-19's droplet HCL (standard lighthouse size/image defaults).
     let (addr, droplet_hcl) =
-        lighthouse_create_resource(&droplet_name, region, "s-2vcpu-2gb", "fedora-43-x64")?;
+        lighthouse_create_resource(&droplet_name, region, THIN_LIGHTHOUSE_SIZE, "fedora-43-x64")?;
     // The block label DC-19 minted (`lighthouse_<ident>`) — reuse it for the record.
     let ident = droplet_addr_label(&addr)
         .strip_prefix("lighthouse_")
@@ -2535,9 +2547,13 @@ mod tests {
     fn genesis_lighthouse_resource_reuses_dc19_droplet_adds_dns_no_secret() {
         let (addr, hcl) = genesis_lighthouse_resource("home-mesh", "nyc3").unwrap();
         // The droplet half is exactly DC-19's lighthouse resource for lh-<id>-01.
-        let (dc19_addr, _) =
-            lighthouse_create_resource("lh-home-mesh-01", "nyc3", "s-2vcpu-2gb", "fedora-43-x64")
-                .unwrap();
+        let (dc19_addr, _) = lighthouse_create_resource(
+            "lh-home-mesh-01",
+            "nyc3",
+            THIN_LIGHTHOUSE_SIZE,
+            "fedora-43-x64",
+        )
+        .unwrap();
         assert_eq!(addr, dc19_addr);
         assert!(hcl.contains("resource \"digitalocean_droplet\" \"lighthouse_lh_home_mesh_01\""));
         assert!(hcl.contains("name     = \"lh-home-mesh-01\""));
@@ -3355,14 +3371,18 @@ mod tests {
 
     #[test]
     fn lighthouse_create_resource_emits_valid_hcl() {
-        let (addr, hcl) =
-            lighthouse_create_resource("lighthouse-04", "sfo3", "s-2vcpu-2gb", "fedora-43-x64")
-                .unwrap();
+        let (addr, hcl) = lighthouse_create_resource(
+            "lighthouse-04",
+            "sfo3",
+            THIN_LIGHTHOUSE_SIZE,
+            "fedora-43-x64",
+        )
+        .unwrap();
         assert_eq!(addr, "digitalocean_droplet.lighthouse_lighthouse_04");
         assert!(hcl.contains("resource \"digitalocean_droplet\" \"lighthouse_lighthouse_04\""));
         assert!(hcl.contains("name     = \"lighthouse-04\""));
         assert!(hcl.contains("region   = \"sfo3\""));
-        assert!(hcl.contains("size     = \"s-2vcpu-2gb\""));
+        assert!(hcl.contains("size     = \"s-1vcpu-512mb-10gb\""));
         assert!(hcl.contains("image    = \"fedora-43-x64\""));
         assert!(hcl.contains("tags     = [\"magic-lighthouse\"]"));
         assert!(hcl.contains("digitalocean_ssh_key.mackes_mesh_claude.id"));
@@ -3380,6 +3400,14 @@ mod tests {
         assert!(lighthouse_create_resource("ok", "", "s", "f").is_err());
         assert!(lighthouse_create_resource("ok", "sfo3", "s 1", "f").is_err());
         assert!(lighthouse_create_resource("ok", "sfo3", "s", "F").is_err());
+    }
+
+    #[test]
+    fn lighthouse_create_resource_rejects_a_larger_profile() {
+        let error =
+            lighthouse_create_resource("lighthouse-04", "sfo3", "s-2vcpu-2gb", "fedora-43-x64")
+                .unwrap_err();
+        assert!(error.contains(THIN_LIGHTHOUSE_SIZE), "{error}");
     }
 
     #[test]
@@ -3402,7 +3430,7 @@ mod tests {
         assert!(tf.contains("DATACENTER-19"));
         assert!(tf.contains("resource \"digitalocean_droplet\" \"lighthouse_lighthouse_04\""));
         assert!(tf.contains("region   = \"sfo3\""));
-        assert!(tf.contains("size     = \"s-2vcpu-2gb\""));
+        assert!(tf.contains("size     = \"s-1vcpu-512mb-10gb\""));
         assert!(tf.contains("image    = \"fedora-43-x64\""));
 
         // A second create of the SAME name is rejected (no silent overwrite).
