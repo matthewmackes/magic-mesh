@@ -1204,7 +1204,10 @@ assets = [
     { source = "install-helpers/setup-caddy.sh", dest = "/usr/libexec/mackesd/setup-caddy", mode = "755" },
     { source = "install-helpers/do-lighthouse-join.sh", dest = "/usr/libexec/mackesd/do-lighthouse-join", mode = "755" },
     { source = "install-helpers/do-lighthouse-join-cloudinit.sh", dest = "/usr/libexec/mackesd/do-lighthouse-join-cloudinit.sh", mode = "755" },
-    { source = "install-helpers/selinux/*.cil", dest = "/usr/share/magic-mesh/selinux/", mode = "644" },
+    # Keep the smallest appliance's SELinux surface to the required base
+    # policy.  The Podman/libvirt modules belong to compute tiers and would
+    # make a thin lighthouse advertise/support virtualization it cannot run.
+    { source = "install-helpers/selinux/magicmesh-base.cil", dest = "/usr/share/magic-mesh/selinux/magicmesh-base.cil", mode = "644" },
     { source = "install-helpers/setup-selinux-policy.sh", dest = "/usr/libexec/mackesd/setup-selinux-policy", mode = "755" },
     { source = "packaging/repo/magic-mesh.repo", dest = "/etc/yum.repos.d/magic-mesh.repo", mode = "644" },
     { source = "packaging/repo/RPM-GPG-KEY-magic-mesh", dest = "/etc/pki/rpm-gpg/RPM-GPG-KEY-magic-mesh", mode = "644" },

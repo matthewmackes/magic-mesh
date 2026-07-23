@@ -576,13 +576,18 @@ fn validate_nebula_cert_print(
         ));
     }
     let expected_ip = format!("{overlay_ip}/{}", crate::ca::sign::DEFAULT_CIDR_PREFIX);
-    let has_ip = details
-        .get("ips")
-        .and_then(|value| value.as_array())
-        .is_some_and(|ips| {
-            ips.iter()
-                .any(|ip| ip.as_str() == Some(expected_ip.as_str()))
-        });
+    // `nebula-cert print -json` calls this array `networks`; older test and
+    // pre-1.10 fixtures used `ips`. Accept both names, but require the exact
+    // address/prefix in either shape before materializing the returned cert.
+    let has_ip = ["networks", "ips"].into_iter().any(|field| {
+        details
+            .get(field)
+            .and_then(|value| value.as_array())
+            .is_some_and(|ips| {
+                ips.iter()
+                    .any(|ip| ip.as_str() == Some(expected_ip.as_str()))
+            })
+    });
     if !has_ip {
         return Err(NetEnrollError::BadBundle(
             "signed cert overlay IP does not match bundle".into(),
@@ -928,6 +933,19 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n\
         );
         validate_nebula_cert_print(&exact, "peer:anvil", "10.42.0.2", requester)
             .expect("exact requester identity");
+    }
+
+    #[test]
+    fn real_nebula_cert_print_networks_field_is_accepted() {
+        let requester = "-----BEGIN NEBULA X25519 PUBLIC KEY-----\n\
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n\
+-----END NEBULA X25519 PUBLIC KEY-----\n";
+        let exact = format!(
+            "{{\"details\":{{\"name\":\"peer:anvil\",\"networks\":[\"10.42.0.2/17\"],\"publicKey\":\"{}\"}}}}",
+            "00".repeat(32)
+        );
+        validate_nebula_cert_print(&exact, "peer:anvil", "10.42.0.2", requester)
+            .expect("real nebula-cert networks field");
     }
 
     #[test]

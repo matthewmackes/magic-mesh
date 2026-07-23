@@ -259,7 +259,11 @@ impl NebulaSupervisor {
             role,
             &blocklist,
             &self.workgroup_root,
-            Some(b"key-pem"),
+            // Refreshes come from replicated public state. Keep the
+            // fingerprint-pinned enrollment identity already activated on
+            // this host; a placeholder/requester key here would overwrite
+            // the live Nebula key and make the service fail to reload.
+            None,
         )?;
         // GF-1.3.a — publish the overlay IP so downstream
         // services (notably mackes-glusterd-nebula-bind in

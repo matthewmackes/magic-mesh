@@ -18,15 +18,14 @@ instead of leaving closed work in this file.
 
 ## Current Snapshot - 2026-07-22 takeover
 
-- **10 active epics:** 7 `Remaining`, 3 `Blocked`; no `Needs clarification`.
+- **9 active epics:** 7 `Remaining`, 2 `Blocked`; no `Needs clarification`.
 - **P0:** WL-SEC-005 (final integrated gate), WL-SEC-006 (stop replicating
   Nebula private keys), WL-SEC-007 (authenticate privileged shared-Bus
   mutations), WL-ARCH-007 (authorization mint + direct lifecycle proof), and
   WL-FUNC-011 (blocked on real media/LLM resources).
 - **In flight:** WL-BUILD-004 current-workspace coverage proof, WL-FUNC-012 live
   map feeds, WL-UX-006 Construct, and WL-UX-007 Car.
-- **Externally blocked:** WL-RUN-003 needs a second lighthouse plus the operator's
-  DigitalOcean credential; WL-FUNC-011 needs a real second media peer/SIP path
+- **Externally blocked:** WL-FUNC-011 needs a real second media peer/SIP path
   plus an operator-sealed DigitalOcean model key; WL-SEC-006 needs a controlled
   live Nebula identity rotation/reconnect/prune drill.
 - **Archived by this takeover:** WL-DOC-004, WL-FUNC-013, and WL-RUN-008 in
@@ -491,45 +490,6 @@ These decisions refine acceptance and sequencing for the active items below.
   2026-07-22 Codex platform takeover audit.
 
 ## Runtime Reliability
-
-### WL-RUN-003 - Lighthouse full/equal join and push-button add/retire
-
-- Status: Blocked
-- Progress (2026-07-23): CODE-COMPLETE per `docs/platform/DRAIN-RECONCILIATION-2026-07-19.md`,
-  plus the locked smallest-DigitalOcean lighthouse profile in
-  `docs/design/digitalocean-lighthouse-small.md`. Both DO cloud-init paths and
-  `onboard spawn-lighthouse` now default to `s-1vcpu-512mb-10gb` and apply
-  bounded service memory, emergency swap, journal caps, and a control-plane-only
-  optional-service set. The media-lighthouse class remains explicitly separate.
-  typed `lighthouse_add`/`lighthouse_retire` (`cli/node_admin.rs:164`/`:205`), etcd voter
-  membership (`cli/join.rs` `add_self_as_voter_blocking`, no manual etcdctl), CA
-  inheritance, quorum-preserving `drain_gate` (`lighthouse_lifecycle.rs`), and the
-  `spawn_lighthouse_onboard` worker + shell flow all landed. BLOCKED-on: the live
-  multi-lighthouse fleet add-retire-add cycle drill + DO provisioning creds — operator/
-  live-infra gated, not autonomously drainable. NB (2026-07-22): the operator's
-  "remove live-seat blocks" directive does NOT reach this epic — its gate is a live
-  cloud lighthouse fleet + a DigitalOcean API token (a secret only the operator holds),
-  not a live seat, and there is no build-time validation analog (unlike WL-ARCH-001's
-  `tofu validate`) that could substantiate a real add/retire against live etcd. Stays
-  Blocked on a rebuilt DO fleet: the operator has torn down all DigitalOcean
-  lighthouses, and the add-retire-add drill still requires a valid DO
-  credential plus a second live lighthouse.
-- Priority: P1
-- Complexity: Large
-- Problem: Lighthouse management still has manual parts around CA custody,
-  etcd voter membership, equal/full promotion, and add/retire operations.
-- Required outcome: Joining a lighthouse makes it a full/equal participant, and
-  add/retire is a single typed operation without manual `etcdctl` or `scp`.
-- Scope: Lighthouse role worker, CA custody, etcd voter changes, operator UI,
-  audit, and rollback.
-- Relevant files/components: lighthouse workers, `docs/ops/do-lighthouses.md`,
-  `docs/ops/lighthouse-eagle-migration-recon.md`.
-- Dependencies: Live multi-lighthouse fleet.
-- Acceptance criteria: A new lighthouse joins with CA/enroll ability and etcd
-  voter status; retirement removes it cleanly and preserves quorum.
-- Verification method: Live add/retire drill and etcd health proof.
-- Origin or merged source IDs: LIGHTHOUSE-TURNKEY, old worklist lines 6223 and
-  6224.
 
 ## Functional Completeness
 
