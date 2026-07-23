@@ -46,6 +46,7 @@ mde-files = { path = "../../services/mde-files", default-features = false, featu
 # local `Persist` read/write only (no tokio, no rpc round-trip), so an offline
 # peer can never hang the UI.
 mde-bus = { path = "../../platform/mde-bus" }
+mackes-mesh-types = { path = "../../mesh/mackes-mesh-types" }
 # FILEMGR-9 — the `state/mesh-mount/*` record + the `action/mesh-mount/<host>`
 # verb are a JSON boundary; the surface owns local serde mirrors of the FILEMGR-5
 # worker's wire shapes (never a dep on `mackesd`), exactly as `mde-shell-egui`
@@ -78,6 +79,7 @@ symphonia  = { version = "0.5", default-features = false, features = ["flac", "m
 # (winit/eframe pull it), so enabling its `process` feature is fetch-free on the
 # airgapped farm — no new crate, no `libc`.
 rustix     = { version = "1", features = ["process"] }
+rand       = "0.8"
 
 [dev-dependencies]
 # TRANSFERS-8 — the transfers file-store round-trip test writes an inbox verb +

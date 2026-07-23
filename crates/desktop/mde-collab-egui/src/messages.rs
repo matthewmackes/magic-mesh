@@ -201,9 +201,9 @@ impl CommunicationsSurface {
                     }
                 }
                 AmendAffordance::DeniedExpired => {
-                    icons::icon(ui, icons::EDIT, Style::SP_M, Style::BORDER)
+                    icons::icon(ui, icons::EDIT, Style::SP_M, Style::DISABLED)
                         .comms_hover_text("Edit window passed (5 min)");
-                    icons::icon(ui, icons::DELETE, Style::SP_M, Style::BORDER)
+                    icons::icon(ui, icons::DELETE, Style::SP_M, Style::DISABLED)
                         .comms_hover_text("Delete window passed (5 min)");
                 }
                 AmendAffordance::Hidden => {}

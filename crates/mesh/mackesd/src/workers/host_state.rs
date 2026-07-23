@@ -37,12 +37,17 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use serde::{Deserialize, Serialize};
 
+use super::cloud::{
+    claim_nonce, verify_token, HmacTokenSigner, NullSigner, TokenSigner, TokenVerdict,
+    DEFAULT_AUTH_ROOT,
+};
 use super::{ShutdownToken, Worker};
 use crate::leader::read_current_lease;
 
@@ -62,6 +67,17 @@ const LEADER_LOCK: &str = ".mackesd-leader.lock";
 /// Two-phase confirm TTL: a `propose` for a destructive verb must be followed by a
 /// matching `confirm` within this window, else it lapses (interlock 3).
 pub const CONFIRM_TTL: Duration = Duration::from_secs(30);
+
+/// Maximum remaining lifetime accepted for a remote host-control capability.
+/// Capabilities are deliberately short-lived even if a compromised publisher
+/// tries to mint a token with a longer expiry.
+pub const CAPABILITY_TTL: Duration = Duration::from_secs(30);
+
+/// Exact schema accepted on the public host-control Bus lane.
+pub const ACTION_SCHEMA_VERSION: u16 = 1;
+
+/// Stable capability verb shared by the host-control signer and verifier.
+const AUTH_VERB: &str = "host-state";
 
 /// Poll cadence — responsive to a remote control action without hammering the Bus.
 pub const POLL: Duration = Duration::from_secs(2);
@@ -222,6 +238,9 @@ impl HostVerb {
 /// two-phase phase and the requester's identity (for the result lane + audit).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerbRequest {
+    /// Exact public-Bus schema. Unknown/future schemas fail closed before the
+    /// nonce is consumed or any verb reaches the shell apply lane.
+    pub schema_version: u16,
     /// The typed verb.
     #[serde(flatten)]
     pub verb: HostVerb,
@@ -232,6 +251,9 @@ pub struct VerbRequest {
     /// The requesting peer (echoed on the result lane).
     #[serde(default)]
     pub requester: String,
+    /// Exact-body, single-use HMAC capability minted by the privileged shell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub armed_token: Option<String>,
 }
 
 const fn default_phase() -> Phase {
@@ -259,6 +281,17 @@ pub enum Refusal {
     NotAllowlisted {
         /// The offending detail.
         detail: String,
+    },
+    /// The request used an absent, invalid, expired, over-long, or replayed
+    /// exact-body capability. Public Bus write access is never authority.
+    Unauthorized {
+        /// Stable verifier reason safe to return to an untrusted requester.
+        reason: String,
+    },
+    /// Only schema v1 is accepted; future shapes require an explicit upgrade.
+    UnsupportedSchema {
+        /// Schema number carried by the refused request.
+        schema_version: u16,
     },
     /// Disabling this output would leave no lit console (interlock 1).
     WouldBlackLastConsole {
@@ -389,6 +422,69 @@ pub fn parse_request(body: &str) -> Result<VerbRequest, Refusal> {
     })
 }
 
+/// Verify and durably consume the short-lived capability for one exact request
+/// body. The token is bound to the target node, typed verb target, and canonical
+/// JSON body (with only `armed_token` removed by the shared digest helper).
+fn authorize_capability(
+    body: &str,
+    request: &VerbRequest,
+    node_id: &str,
+    signer: &dyn TokenSigner,
+    auth_root: &std::path::Path,
+    now_ms: i64,
+) -> Result<(), Refusal> {
+    if request.schema_version != ACTION_SCHEMA_VERSION {
+        return Err(Refusal::UnsupportedSchema {
+            schema_version: request.schema_version,
+        });
+    }
+    let Some(token_raw) = request
+        .armed_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    else {
+        return Err(Refusal::Unauthorized {
+            reason: TokenVerdict::Missing.reason().to_string(),
+        });
+    };
+    let Some(token) = mackes_mesh_types::cloud::CloudArmedToken::parse(token_raw) else {
+        return Err(Refusal::Unauthorized {
+            reason: TokenVerdict::Malformed.reason().to_string(),
+        });
+    };
+    let max_expiry =
+        now_ms.saturating_add(i64::try_from(CAPABILITY_TTL.as_millis()).unwrap_or(i64::MAX));
+    if token.expires_at_ms > max_expiry {
+        return Err(Refusal::Unauthorized {
+            reason: "host-control capability exceeds the 30-second TTL".to_string(),
+        });
+    }
+    let verdict = verify_token(
+        Some(token_raw),
+        AUTH_VERB,
+        node_id,
+        &request.verb.kind_key(),
+        body,
+        now_ms,
+        signer,
+    );
+    if !verdict.is_valid() {
+        return Err(Refusal::Unauthorized {
+            reason: verdict.reason().to_string(),
+        });
+    }
+    match claim_nonce(auth_root, &token.nonce, token.expires_at_ms, now_ms) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(Refusal::Unauthorized {
+            reason: TokenVerdict::Replayed.reason().to_string(),
+        }),
+        Err(_) => Err(Refusal::Unauthorized {
+            reason: TokenVerdict::ReplayStoreUnavailable.reason().to_string(),
+        }),
+    }
+}
+
 // ─────────────────────────── the worker (Bus I/O over the fold) ──────────────
 
 /// The `host_state` worker handle. Runs on every node; mirrors this node's seat
@@ -398,6 +494,11 @@ pub struct HostStateWorker {
     lock_path: PathBuf,
     bus_root: Option<PathBuf>,
     poll: Duration,
+    /// Root-credential HMAC verifier. Missing production credentials install a
+    /// null verifier, so remote mutations fail closed while mirroring continues.
+    signer: Arc<dyn TokenSigner>,
+    /// Shared host-local durable replay ledger used by all privileged lanes.
+    auth_root: PathBuf,
     gate: ConfirmGate,
     /// Cursor into the local snapshot topic (mirror only fresh snapshots).
     snapshot_cursor: Option<String>,
@@ -413,11 +514,24 @@ impl HostStateWorker {
         // Consume `workgroup_root` into the lease path (mirrors `leader_election`).
         let mut lock_path = workgroup_root;
         lock_path.push(LEADER_LOCK);
+        let signer: Arc<dyn TokenSigner> = match HmacTokenSigner::from_systemd_credential() {
+            Ok(signer) => Arc::new(signer),
+            Err(error) => {
+                tracing::error!(
+                    target: "mackesd::host_state",
+                    %error,
+                    "remote host-control authorization unavailable; mutations are disabled"
+                );
+                Arc::new(NullSigner)
+            }
+        };
         Self {
             lock_path,
             node_id,
             bus_root: default_bus_root(),
             poll: POLL,
+            signer,
+            auth_root: PathBuf::from(DEFAULT_AUTH_ROOT),
             gate: ConfirmGate::default(),
             snapshot_cursor: None,
             action_cursor: None,
@@ -442,6 +556,15 @@ impl HostStateWorker {
     #[must_use]
     pub const fn with_poll(mut self, poll: Duration) -> Self {
         self.poll = poll;
+        self
+    }
+
+    /// Inject deterministic authorization state for hostile Bus tests.
+    #[cfg(test)]
+    #[must_use]
+    fn with_authorization(mut self, signer: Arc<dyn TokenSigner>, auth_root: PathBuf) -> Self {
+        self.signer = signer;
+        self.auth_root = auth_root;
         self
     }
 
@@ -519,6 +642,18 @@ impl HostStateWorker {
             };
             match parse_request(body) {
                 Ok(req) => {
+                    let now_i64 = i64::try_from(now).unwrap_or(i64::MAX);
+                    if let Err(refusal) = authorize_capability(
+                        body,
+                        &req,
+                        &self.node_id,
+                        self.signer.as_ref(),
+                        &self.auth_root,
+                        now_i64,
+                    ) {
+                        self.emit_refusal(persist, &req.requester, &refusal);
+                        continue;
+                    }
                     let decision = authorize(&req, &mirror, leader, &mut self.gate, now);
                     self.emit_decision(persist, &req, decision);
                 }
@@ -638,17 +773,46 @@ mod tests {
 
     fn req(verb: HostVerb, phase: Phase) -> VerbRequest {
         VerbRequest {
+            schema_version: ACTION_SCHEMA_VERSION,
             verb,
             phase,
             requester: "peer".into(),
+            armed_token: None,
         }
+    }
+
+    fn armed_body(
+        request: &VerbRequest,
+        node: &str,
+        nonce: &str,
+        expires_at_ms: i64,
+        signer: &HmacTokenSigner,
+    ) -> String {
+        let unsigned = serde_json::to_string(request).expect("unsigned host request");
+        let token = mackes_mesh_types::cloud::CloudArmedToken::mint(
+            signer,
+            nonce,
+            expires_at_ms,
+            AUTH_VERB,
+            node,
+            &request.verb.kind_key(),
+            &mackes_mesh_types::cloud::cloud_request_digest(&unsigned)
+                .expect("host request digest"),
+        )
+        .encode();
+        let mut value: serde_json::Value =
+            serde_json::from_str(&unsigned).expect("host request json");
+        value["armed_token"] = serde_json::Value::String(token);
+        value.to_string()
     }
 
     // ── allowlist (§9) ────────────────────────────────────────────────────────
 
     #[test]
     fn parse_accepts_typed_verbs_and_refuses_anything_else() {
-        let ok = parse_request(r#"{"verb":"volume","strip":"master","level":40}"#).unwrap();
+        let ok =
+            parse_request(r#"{"schema_version":1,"verb":"volume","strip":"master","level":40}"#)
+                .unwrap();
         assert_eq!(
             ok.verb,
             HostVerb::Volume {
@@ -657,7 +821,8 @@ mod tests {
             }
         );
         // A non-verb body — the allowlist refuses it typed, never runs it.
-        let err = parse_request(r#"{"verb":"exec","cmd":"rm -rf /"}"#).unwrap_err();
+        let err =
+            parse_request(r#"{"schema_version":1,"verb":"exec","cmd":"rm -rf /"}"#).unwrap_err();
         assert!(matches!(err, Refusal::NotAllowlisted { .. }), "{err:?}");
     }
 
@@ -862,22 +1027,37 @@ mod tests {
     fn poll_once_mirrors_the_snapshot_and_forwards_an_approved_verb() {
         let dir = std::env::temp_dir().join(format!("host_state_test_{}", now_ms()));
         let persist = Persist::open(dir.clone()).expect("open temp bus");
+        let signer = Arc::new(HmacTokenSigner::new(b"host-state-test-key".to_vec()));
 
         // The shell publishes a local snapshot; a peer requests a volume change.
         let snap = serde_json::to_string(&mirror_two_lit()).unwrap();
         persist
             .write(LOCAL_SNAPSHOT_TOPIC, Priority::Default, None, Some(&snap))
             .unwrap();
-        persist
-            .write(
-                &action_topic("nodeA"),
-                Priority::Default,
-                None,
-                Some(r#"{"verb":"volume","strip":"master","level":20,"requester":"peerB"}"#),
+        let request = VerbRequest {
+            requester: "peerB".into(),
+            ..req(
+                HostVerb::Volume {
+                    strip: "master".into(),
+                    level: 20,
+                },
+                Phase::Confirm,
             )
+        };
+        let body = armed_body(
+            &request,
+            "nodeA",
+            "host-mirror-authorized-nonce",
+            i64::try_from(now_ms()).unwrap().saturating_add(30_000),
+            signer.as_ref(),
+        );
+        persist
+            .write(&action_topic("nodeA"), Priority::Default, None, Some(&body))
             .unwrap();
 
-        let mut w = HostStateWorker::new(std::env::temp_dir(), "nodeA".into()).with_bus_root(dir);
+        let mut w = HostStateWorker::new(std::env::temp_dir(), "nodeA".into())
+            .with_bus_root(dir.clone())
+            .with_authorization(signer, dir.join("auth"));
         w.poll_once(&persist);
 
         // The snapshot was mirrored to the replicated per-node topic…
@@ -897,6 +1077,206 @@ mod tests {
     }
 
     #[test]
+    fn unsigned_host_control_has_no_apply_side_effect() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bus = temp.path().join("bus");
+        let persist = Persist::open(bus.clone()).expect("open temp bus");
+        let signer = Arc::new(HmacTokenSigner::new(b"host-state-test-key".to_vec()));
+        let request = req(
+            HostVerb::Volume {
+                strip: "master".into(),
+                level: 20,
+            },
+            Phase::Confirm,
+        );
+        let unsigned = serde_json::to_string(&request).expect("request");
+        persist
+            .write(
+                &action_topic("nodeA"),
+                Priority::Default,
+                None,
+                Some(&unsigned),
+            )
+            .expect("publish unsigned request");
+
+        let mut worker = HostStateWorker::new(temp.path().to_path_buf(), "nodeA".into())
+            .with_bus_root(bus)
+            .with_authorization(signer, temp.path().join("auth"));
+        worker.poll_once(&persist);
+
+        assert!(persist.list_since(APPLY_TOPIC, None).unwrap().is_empty());
+        let results = persist.list_since(&result_topic("nodeA"), None).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0]
+            .body
+            .as_deref()
+            .is_some_and(|body| body.contains("no armed token supplied")));
+    }
+
+    #[test]
+    fn tampered_exact_body_has_no_apply_side_effect() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bus = temp.path().join("bus");
+        let persist = Persist::open(bus.clone()).expect("open temp bus");
+        let signer = Arc::new(HmacTokenSigner::new(b"host-state-test-key".to_vec()));
+        let request = req(
+            HostVerb::Volume {
+                strip: "master".into(),
+                level: 20,
+            },
+            Phase::Confirm,
+        );
+        let armed = armed_body(
+            &request,
+            "nodeA",
+            "host-tamper-single-use-nonce",
+            i64::try_from(now_ms()).unwrap().saturating_add(30_000),
+            signer.as_ref(),
+        );
+        let mut tampered: serde_json::Value = serde_json::from_str(&armed).unwrap();
+        tampered["level"] = serde_json::json!(99);
+        persist
+            .write(
+                &action_topic("nodeA"),
+                Priority::Default,
+                None,
+                Some(&tampered.to_string()),
+            )
+            .expect("publish tampered request");
+
+        let mut worker = HostStateWorker::new(temp.path().to_path_buf(), "nodeA".into())
+            .with_bus_root(bus)
+            .with_authorization(signer, temp.path().join("auth"));
+        worker.poll_once(&persist);
+
+        assert!(persist.list_since(APPLY_TOPIC, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn authorized_host_control_applies_exactly_once_and_replay_is_refused() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bus = temp.path().join("bus");
+        let persist = Persist::open(bus.clone()).expect("open temp bus");
+        let signer = Arc::new(HmacTokenSigner::new(b"host-state-test-key".to_vec()));
+        let request = req(
+            HostVerb::Display {
+                monitor: "HDMI-A-1".into(),
+                enable: true,
+            },
+            Phase::Confirm,
+        );
+        let armed = armed_body(
+            &request,
+            "nodeA",
+            "host-replay-single-use-nonce",
+            i64::try_from(now_ms()).unwrap().saturating_add(30_000),
+            signer.as_ref(),
+        );
+        for _ in 0..2 {
+            persist
+                .write(
+                    &action_topic("nodeA"),
+                    Priority::Default,
+                    None,
+                    Some(&armed),
+                )
+                .expect("publish request");
+        }
+
+        let mut worker = HostStateWorker::new(temp.path().to_path_buf(), "nodeA".into())
+            .with_bus_root(bus)
+            .with_authorization(signer, temp.path().join("auth"));
+        worker.poll_once(&persist);
+
+        let applied = persist.list_since(APPLY_TOPIC, None).unwrap();
+        assert_eq!(
+            applied.len(),
+            1,
+            "the durable nonce can authorize one apply"
+        );
+        assert!(applied[0]
+            .body
+            .as_deref()
+            .is_some_and(|body| body.contains("HDMI-A-1")));
+        let results = persist.list_since(&result_topic("nodeA"), None).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().any(|message| message
+            .body
+            .as_deref()
+            .is_some_and(|body| body.contains("already used"))));
+    }
+
+    #[test]
+    fn signed_future_schema_has_no_apply_side_effect() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bus = temp.path().join("bus");
+        let persist = Persist::open(bus.clone()).expect("open temp bus");
+        let signer = Arc::new(HmacTokenSigner::new(b"host-state-test-key".to_vec()));
+        let mut request = req(
+            HostVerb::Power {
+                action: PowerAction::Lock,
+                confirm: false,
+            },
+            Phase::Confirm,
+        );
+        request.schema_version = ACTION_SCHEMA_VERSION + 1;
+        let armed = armed_body(
+            &request,
+            "nodeA",
+            "host-future-schema-nonce",
+            i64::try_from(now_ms()).unwrap().saturating_add(30_000),
+            signer.as_ref(),
+        );
+        persist
+            .write(
+                &action_topic("nodeA"),
+                Priority::Default,
+                None,
+                Some(&armed),
+            )
+            .expect("publish future request");
+
+        let mut worker = HostStateWorker::new(temp.path().to_path_buf(), "nodeA".into())
+            .with_bus_root(bus)
+            .with_authorization(signer, temp.path().join("auth"));
+        worker.poll_once(&persist);
+
+        assert!(persist.list_since(APPLY_TOPIC, None).unwrap().is_empty());
+        let results = persist.list_since(&result_topic("nodeA"), None).unwrap();
+        assert!(results[0]
+            .body
+            .as_deref()
+            .is_some_and(|body| body.contains("unsupported-schema")));
+    }
+
+    #[test]
+    fn capability_longer_than_thirty_seconds_is_refused_without_claiming_nonce() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let signer = HmacTokenSigner::new(b"host-state-test-key".to_vec());
+        let request = req(
+            HostVerb::Mute {
+                strip: "master".into(),
+                muted: true,
+            },
+            Phase::Confirm,
+        );
+        let now = 10_000_i64;
+        let armed = armed_body(
+            &request,
+            "nodeA",
+            "host-overlong-ttl-nonce",
+            now + 60_000,
+            &signer,
+        );
+        let parsed = parse_request(&armed).expect("parse armed request");
+
+        let error = authorize_capability(&armed, &parsed, "nodeA", &signer, temp.path(), now)
+            .expect_err("over-long capability must fail closed");
+        assert!(matches!(error, Refusal::Unauthorized { .. }));
+        assert!(!temp.path().join("spent-nonces").exists());
+    }
+
+    #[test]
     fn poll_once_echoes_a_typed_refusal_for_a_non_allowlisted_body() {
         let dir = std::env::temp_dir().join(format!("host_state_refuse_{}", now_ms()));
         let persist = Persist::open(dir.clone()).expect("open temp bus");
@@ -905,7 +1285,7 @@ mod tests {
                 &action_topic("nodeA"),
                 Priority::Default,
                 None,
-                Some(r#"{"verb":"exec","cmd":"reboot"}"#),
+                Some(r#"{"schema_version":1,"verb":"exec","cmd":"reboot"}"#),
             )
             .unwrap();
         let mut w = HostStateWorker::new(std::env::temp_dir(), "nodeA".into()).with_bus_root(dir);

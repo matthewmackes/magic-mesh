@@ -3,7 +3,7 @@
 //! The authoritative shared session directory still lives behind the broker's
 //! integration-gated `SessionStore`. Until that lands, the shell can still read the
 //! same public Bus wire the broker drains (`action/vdi/session`) and render this
-//! seat's non-closed sessions as taskbar-style rail entries. It deserialises the
+//! seat's non-closed sessions as compact rail entries. It deserialises the
 //! shared [`mackes_mesh_types::vdi_session::SessionRequest`] (arch-2) off the JSON
 //! boundary — a lightweight shared-types dependency, never a dependency on
 //! `mackesd`.
@@ -19,7 +19,7 @@ use mde_bus::persist::Persist;
 
 use crate::bus_reader::BusReader;
 
-use crate::dock::SessionRailEntry;
+use crate::surfaces::SessionRailEntry;
 
 const ACTION_TOPIC: &str = "action/vdi/session";
 
@@ -88,7 +88,7 @@ impl SessionRailState {
     }
 
     /// Focus a broker-visible session locally. This mirrors the broker lifecycle
-    /// state for the shell's taskbar selection without publishing a fake broker
+    /// state for the shell's session selection without publishing a fake broker
     /// `Active` transition; the shared `SessionStore` remains the live multi-seat
     /// authority when it lands.
     pub(crate) fn focus_session(&mut self, id: &str) -> bool {

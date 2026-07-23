@@ -41,6 +41,7 @@ pub fn run(
             std::path::Path::new("/var/lib/mackesd/nebula-ca/ca.crt"),
             std::path::Path::new("/var/lib/mackesd/nebula-ca/ca.key"),
             std::path::Path::new("/var/lib/mackesd/nebula-ca/scratch"),
+            std::path::Path::new("/etc/nebula"),
             parsed,
         )?;
         // Best-effort unit starts — the supervisor (next serve)

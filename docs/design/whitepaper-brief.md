@@ -1,5 +1,9 @@
 # Instructions for AI: Create a Graphical One-Page Whitepaper for Magic Mesh (MCNF)
 
+> **HISTORICAL / SUPERSEDED (2026-07-22):** this brief mixes retired desktop and
+> OpenStack architecture. Use `README.md`, `docs/architecture.md`, and
+> `AI_GOVERNANCE.md` for the current platform.
+
 Use the following project understanding as your source material. **Do not fabricate details beyond what is provided below.** Produce a single-page, visually structured, graphical whitepaper suitable as a PDF or poster (infographic/architectural poster style).
 
 ---
@@ -90,7 +94,8 @@ Key fact: **One signed RPM serves both roles.** A headless machine is a Workstat
 - Music: Airsonic/Subsonic client + daemon (FLAC/MP3/Vorbis/AAC/Opus, MPRIS, internet radio)
 - Device sync: native KDE Connect host (pair, ring, clipboard, SMS, notifications) — RSA-4096, AES-256-GCM sessions
 - Remote access: unified SSH + RDP + VNC status/launcher per peer
-- Compute: Podman + libvirt/QEMU-KVM via OpenStack (Nova), Glance image catalog + Cloud-plane wizard
+- Compute: provider-neutral Workloads over OpenTofu + Ansible, local
+  libvirt/QEMU-KVM, Podman/Quadlet, and bootc/osbuild images
 - Name discovery: `.mesh` DNS domain, cross-segment mDNS relay, peer service directory
 
 **SECURITY** (icon: shield/lock)

@@ -22,8 +22,8 @@
 //!
 //! ## Snapshots: what is real today
 //!
-//! * The **Desktop card** shows the live VDI frame texture the taskbar preview
-//!   already holds (`vdi::taskbar_preview_frame` — a real decoded frame).
+//! * The **Desktop card** shows the live VDI frame texture the session preview
+//!   already holds (`vdi::session_preview_frame` — a real decoded frame).
 //! * Every other card shows the **fallback plate** — the Q22 tile treatment
 //!   ([`Style::tile_plate_fill`] over the launcher-group accent + the white
 //!   surface glyph) — which the Q16 lock names as the legitimate no-snapshot
@@ -53,7 +53,7 @@ use mde_egui::motion::Spring;
 use mde_egui::{egui, Motion, MotionPreset, Style};
 
 use crate::construct::{ChromeIntent, ConstructChrome};
-use crate::dock::{icon_texture, Surface, LAUNCHER_GROUPS};
+use crate::surfaces::{icon_texture, Surface, LAUNCHER_GROUPS};
 
 /// Stable id of the switcher's foreground overlay layer.
 const SWITCHER_AREA: &str = "construct-switcher-area";
@@ -644,7 +644,7 @@ fn card(ui: &mut egui::Ui, paint: CardPaint<'_>, state: &mut SwitcherState) -> O
         }
     }
 
-    // The foreground surface's card wears the taskbar's accent underline.
+    // The foreground surface's card wears its group accent underline.
     if paint.is_current {
         let underline = egui::Rect::from_min_size(
             egui::pos2(rect.left(), rect.bottom() - CURRENT_BAR_H),

@@ -45,13 +45,34 @@ pub struct LifecycleResult {
     pub error: String,
 }
 
-/// The per-target request directory.
-#[must_use]
-pub fn lifecycle_dir(workgroup_root: &Path, target_host: &str) -> PathBuf {
-    workgroup_root
+/// Validate one request-controlled filename component before it reaches the
+/// replicated root. Lifecycle ids, hosts, and offered service names are keys,
+/// never paths.
+fn safe_component<'a>(field: &str, value: &'a str) -> io::Result<&'a str> {
+    if value.is_empty()
+        || value.trim() != value
+        || value == "."
+        || value == ".."
+        || value.len() > 255
+        || !value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')
+        })
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("`{field}` must be one path-safe [A-Za-z0-9._-] segment"),
+        ));
+    }
+    Ok(value)
+}
+
+/// Resolve the per-target request directory after validating the target as one
+/// ordinary component. An absolute/traversing host can never replace the root.
+fn lifecycle_dir(workgroup_root: &Path, target_host: &str) -> io::Result<PathBuf> {
+    Ok(workgroup_root
         .join("fleet")
         .join("lifecycle")
-        .join(target_host)
+        .join(safe_component("target host", target_host)?))
 }
 
 /// `true` for the op vocabulary the executor accepts.
@@ -81,7 +102,9 @@ pub fn write_request(
             format!("invalid kind/op: {}/{}", req.kind, req.op),
         ));
     }
-    let dir = lifecycle_dir(workgroup_root, target_host);
+    safe_component("request id", &req.id)?;
+    safe_component("service name", &req.name)?;
+    let dir = lifecycle_dir(workgroup_root, target_host)?;
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{}.json", req.id));
     let tmp = dir.join(format!(".{}.json.tmp", req.id));
@@ -94,7 +117,9 @@ pub fn write_request(
 /// `self_host`. Result files (`*.result.json`) are skipped.
 #[must_use]
 pub fn take_requests(workgroup_root: &Path, self_host: &str) -> Vec<LifecycleRequest> {
-    let dir = lifecycle_dir(workgroup_root, self_host);
+    let Ok(dir) = lifecycle_dir(workgroup_root, self_host) else {
+        return Vec::new();
+    };
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Vec::new();
     };
@@ -108,7 +133,13 @@ pub fn take_requests(workgroup_root: &Path, self_host: &str) -> Vec<LifecycleReq
         if let Ok(raw) = std::fs::read_to_string(&p) {
             if let Ok(req) = serde_json::from_str::<LifecycleRequest>(&raw) {
                 let _ = std::fs::remove_file(&p);
-                out.push(req);
+                if valid_kind(&req.kind)
+                    && valid_op(&req.op)
+                    && safe_component("request id", &req.id).is_ok()
+                    && safe_component("service name", &req.name).is_ok()
+                {
+                    out.push(req);
+                }
             }
         }
     }
@@ -124,7 +155,8 @@ pub fn write_result(
     target_host: &str,
     result: &LifecycleResult,
 ) -> io::Result<PathBuf> {
-    let dir = lifecycle_dir(workgroup_root, target_host);
+    safe_component("request id", &result.id)?;
+    let dir = lifecycle_dir(workgroup_root, target_host)?;
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{}.result.json", result.id));
     let tmp = dir.join(format!(".{}.result.tmp", result.id));
@@ -136,7 +168,10 @@ pub fn write_result(
 /// Read (and consume) the result for `id`, if present yet.
 #[must_use]
 pub fn take_result(workgroup_root: &Path, target_host: &str, id: &str) -> Option<LifecycleResult> {
-    let path = lifecycle_dir(workgroup_root, target_host).join(format!("{id}.result.json"));
+    safe_component("request id", id).ok()?;
+    let path = lifecycle_dir(workgroup_root, target_host)
+        .ok()?
+        .join(format!("{id}.result.json"));
     let raw = std::fs::read_to_string(&path).ok()?;
     let result = serde_json::from_str(&raw).ok()?;
     let _ = std::fs::remove_file(&path);
@@ -193,6 +228,56 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         assert!(write_request(tmp.path(), "oak", &req("r", "container", "x", "explode")).is_err());
         assert!(write_request(tmp.path(), "oak", &req("r", "kernel", "x", "stop")).is_err());
+    }
+
+    #[test]
+    fn request_and_result_paths_reject_every_escape_before_io() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let absolute = outside.to_string_lossy();
+
+        for host in [absolute.as_ref(), "../outside", "a/b", "", ".", ".."] {
+            assert!(write_request(
+                tmp.path(),
+                host,
+                &req("01SAFE", "container", "nginx", "start")
+            )
+            .is_err());
+            assert!(write_result(
+                tmp.path(),
+                host,
+                &LifecycleResult {
+                    id: "01SAFE".into(),
+                    ok: true,
+                    error: String::new(),
+                }
+            )
+            .is_err());
+        }
+        for id in ["../escape", "a/b", "", ".", ".."] {
+            assert!(
+                write_request(tmp.path(), "oak", &req(id, "container", "nginx", "start")).is_err()
+            );
+            assert!(write_result(
+                tmp.path(),
+                "oak",
+                &LifecycleResult {
+                    id: id.into(),
+                    ok: true,
+                    error: String::new(),
+                }
+            )
+            .is_err());
+            assert!(take_result(tmp.path(), "oak", id).is_none());
+        }
+        assert!(write_request(
+            tmp.path(),
+            "oak",
+            &req("01SAFE", "container", "../nginx", "start")
+        )
+        .is_err());
+        assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
     }
 
     #[test]

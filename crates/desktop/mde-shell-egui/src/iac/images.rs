@@ -10,8 +10,8 @@
 //!
 //! This lens emits the [`VERB_IMAGE_BUILD`] verb through the cockpit's preserved
 //! emit path (the same `issue` seam the provision lens uses) for `build` /
-//! `promote`; a live build/promote is armed-token gated on the placement node, so
-//! an un-armed request stages / plans honestly rather than performing.
+//! `promote`; a live build/promote requires exact typed confirmation and a
+//! target/body-bound token minted by the root DRM shell.
 //!
 //! The roster itself is sourced from the `image-build` `list` reply. Because the
 //! shell's lean mutation mirror (this crate's own `CloudReply`) deliberately
@@ -94,6 +94,7 @@ fn build_request_body(
     node: &str,
 ) -> String {
     serde_json::json!({
+        "schema_version": mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION,
         "action": action,
         "delivery_type": dtype,
         "name": name.trim(),
@@ -128,10 +129,16 @@ pub(super) fn images_panel(ui: &mut egui::Ui, state: &mut WorkloadsState) {
         } else {
             // Snapshot the request inputs (owned) so the immutable field borrows
             // end before the mutable emit seam runs.
-            let node = state
+            let Some(node) = state
                 .selected_node()
+                .map(str::trim)
+                .filter(|node| !node.is_empty())
                 .map(str::to_string)
-                .unwrap_or_default();
+            else {
+                state.images.status =
+                    Some("Select a placement node before changing an image.".to_string());
+                return;
+            };
             let dtype = state.images.dtype;
             let body = build_request_body(
                 action,
@@ -145,7 +152,34 @@ pub(super) fn images_panel(ui: &mut egui::Ui, state: &mut WorkloadsState) {
             } else {
                 format!("golden image build for {}", dtype.label())
             };
-            state.issue(VERB_IMAGE_BUILD, Some(&body), &label);
+            let name = state
+                .images
+                .name
+                .trim()
+                .is_empty()
+                .then(|| format!("{}-golden", dtype.as_str()))
+                .unwrap_or_else(|| state.images.name.trim().to_string());
+            let version = if state.images.version.trim().is_empty() {
+                "latest".to_string()
+            } else {
+                state.images.version.trim().to_string()
+            };
+            let target = format!("{action}:{name}@{version}");
+            let word = if action == "promote" {
+                "Promote"
+            } else {
+                "Build"
+            };
+            state.arm_prepared(
+                VERB_IMAGE_BUILD,
+                node,
+                target.clone(),
+                body,
+                label,
+                target.clone(),
+                word,
+                format!("golden image {target}"),
+            );
         }
     }
 
@@ -157,10 +191,15 @@ pub(super) fn images_panel(ui: &mut egui::Ui, state: &mut WorkloadsState) {
 /// its reply — an honest resolve (never fabricated rows). A missing Bus degrades
 /// to an honest status, never a panic (§7).
 fn resolve(state: &mut WorkloadsState) {
-    let node = state
+    let Some(node) = state
         .selected_node()
+        .map(str::trim)
+        .filter(|node| !node.is_empty())
         .map(str::to_string)
-        .unwrap_or_default();
+    else {
+        state.images.status = Some("Select a placement node before resolving images.".to_string());
+        return;
+    };
     let body = build_request_body("list", state.images.dtype, "", "", &node);
     match state.publish(VERB_IMAGE_BUILD, Some(&body)) {
         Ok(pending) => {
@@ -224,7 +263,7 @@ fn header(ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.scope(|ui| {
                 ui.visuals_mut().override_text_color = Some(Style::ACCENT_WORKLOADS);
-                carbon_icon(ui, "camera-photo", Style::BODY + 2.0);
+                carbon_icon(ui, "camera-photo", Style::ICON_S);
             });
             ui.add_space(Style::SP_XS);
             ui.label(
@@ -332,8 +371,8 @@ fn build_controls(ui: &mut egui::Ui, state: &mut WorkloadsState) -> Option<&'sta
         });
         mde_egui::muted_note(
             ui,
-            "Build and promote are armed-token gated on the placement node — an un-armed \
-             request stages / plans honestly and installs nothing.",
+            "Build and promote open exact typed confirmation. The root DRM shell then mints \
+             a single-use capability bound to the selected node and frozen request.",
         );
     });
     action
@@ -421,6 +460,7 @@ mod tests {
     fn build_body_carries_the_action_delivery_type_and_node() {
         let body = build_request_body("build", DeliveryType::AppVm, "  ", "", "eagle");
         assert!(body.contains(r#""action":"build""#), "{body}");
+        assert!(body.contains(r#""schema_version":1"#), "{body}");
         // DeliveryType serializes as its snake_case token.
         assert!(body.contains(r#""delivery_type":"app_vm""#), "{body}");
         assert!(body.contains(r#""node":"eagle""#), "{body}");

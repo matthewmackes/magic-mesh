@@ -30,6 +30,9 @@ TERMS=(
   '\bcloud-hypervisor\b'
   '\bmde-kvm\b'
   '\biced\b'
+  '\bKolla\b'
+  'Keystone absorbs'
+  'Nova \+ Placement'
 )
 
 # A banner is any of these words in the head of the file. The SUPERSE stem
@@ -53,7 +56,6 @@ allowlisted() {
     */docs/platform/DRAIN-RECONCILIATION-*.md) return 0 ;;    # drain meta
     */docs/platform/WORKLIST-RECONCILIATION-*.md) return 0 ;; # reconcile meta
     */docs/platform/WL-ARCH-001-openstack-deletion-blueprint.md) return 0 ;; # current delete blueprint; retired crates named only in the audit ban-list
-    */docs/design/quasar-cloud.md) return 0 ;;                # current replacement epic (supersedes cloud-hypervisor)
     */docs/design/e12-9-10-libvirt-rescope.md) return 0 ;;    # current rescope off cloud-hypervisor
     */docs/design/qc23-virtio-gpu-zerocopy-rescope.md) return 0 ;; # current rescope
     */docs/design/onboarding-wizard.md) return 0 ;;           # self-caveated: cloud-hypervisor/mde-kvm path deleted
@@ -65,8 +67,6 @@ allowlisted() {
     */docs/design/xcp-ng-integration.md) return 0 ;;          # self-caveated post-SUBSTRATE-6 inline
     */docs/design/whitepaper-brief.md) return 0 ;;            # current; LizardFS-to-etcd is a noted internal detail
     */docs/design/build-platform.md) return 0 ;;              # current build doc; mde-workbench is an incidental example
-    */docs/ops/quasar-cloud-cutover-map.md) return 0 ;;       # current cutover map
-    */docs/ops/quasar-cloud-runbook.md) return 0 ;;           # current runbook
     */docs/ops/promotion-pipeline.md) return 0 ;;             # current; asserts LizardFS is NOT enabled
     *) return 1 ;;
   esac

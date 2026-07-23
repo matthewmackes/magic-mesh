@@ -31,7 +31,7 @@ pub(super) fn view(ui: &mut egui::Ui, state: &mut WorkloadsState) {
         .cloned()
         .collect();
     if rows.is_empty() {
-        crate::session::empty_state(
+        crate::empty_state::show(
             ui,
             "No containers yet",
             "A container appears here once a placement node reports a service_container workload in \
@@ -161,7 +161,7 @@ fn heading(ui: &mut egui::Ui, title: &str, blurb: &str) {
     ui.horizontal(|ui| {
         ui.scope(|ui| {
             ui.visuals_mut().override_text_color = Some(Style::ACCENT_WORKLOADS);
-            carbon_icon(ui, DeliveryView::ServiceContainer.icon(), Style::BODY + 2.0);
+            carbon_icon(ui, DeliveryView::ServiceContainer.icon(), Style::ICON_S);
         });
         ui.add_space(Style::SP_XS);
         ui.label(

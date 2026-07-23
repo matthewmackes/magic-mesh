@@ -43,6 +43,10 @@ Environment=MDE_BUS_ROOT=/run/mde-bus
 # replicated directory, no FUSE) lets both uids read the one shared dir. The
 # user session gets the same value via environment.d/90-mde-workgroup.conf.
 Environment=MDE_WORKGROUP_ROOT=/mnt/mesh-storage
+# WL-ARCH-007 — the optional root-only live-mutation verifier is loaded by a
+# drop-in installed only after provision-cloud-arm-credential has materialized
+# the host-bound ciphertext. Before provisioning, mackesd starts but stages all
+# mutations; there is no env-secret fallback.
 ExecStart=/usr/bin/mackesd serve
 # ENT-2: serve fails closed without a pinned role — that's a
 # configuration error, not a crash loop; on-failure still retries

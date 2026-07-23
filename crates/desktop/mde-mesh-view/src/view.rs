@@ -369,19 +369,22 @@ impl<'a> MeshView<'a> {
             Stroke::new(NODE_STROKE_W, Style::TEXT_DIM),
         );
 
-        // Title + dim subtitle, centre-top-anchored beneath the glyph.
+        // Title + dim subtitle, centre-top-anchored beneath the glyph. Both are
+        // human-sentence prose, so they paint in the proportional Construct face
+        // (Inter) per the platform type lock. The node hostname/version labels
+        // above remain monospace because those are code-like identifiers.
         let title = painter.text(
             Pos2::new(cx, glyph_c.y + EMPTY_GLYPH_R + Style::SP_M),
             Align2::CENTER_TOP,
             "Waiting for mesh",
-            FontId::new(Style::HEADING, FontFamily::Monospace),
+            FontId::new(Style::HEADING, FontFamily::Proportional),
             Style::TEXT,
         );
         painter.text(
             Pos2::new(cx, title.bottom() + Style::SP_XS),
             Align2::CENTER_TOP,
             "Peers and links appear here as nodes join.",
-            FontId::new(Style::BODY, FontFamily::Monospace),
+            FontId::new(Style::BODY, FontFamily::Proportional),
             Style::TEXT_DIM,
         );
     }

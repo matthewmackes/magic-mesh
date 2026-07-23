@@ -5,8 +5,9 @@
 # product name. This gate prevents the two superseded legacy spellings from
 # returning to current source, generated-user-facing metadata, install helpers,
 # and current docs.
-# Historical archives and lower-case asset paths such as
-# assets/brand/construct are intentionally outside this check.
+# The governed `Quazar-dark` palette identifier, historical archives, and
+# lower-case asset paths such as assets/brand/construct are intentionally
+# outside this check.
 #
 # Run with `--self-test` to verify. Exit 0 = clean, 1 = a violation.
 set -euo pipefail
@@ -31,6 +32,9 @@ default_paths() {
 
 allowed_hit() {
   local path="$1" text="$2"
+  # `Quazar-dark` is the canonical palette identifier in every governed file;
+  # it is not a visible-product-name exception tied to one documentation path.
+  [[ "$text" == *'Quazar-dark'* ]] && return 0
   case "$path" in
     */install-helpers/lint-brand-identity.sh)
       # The guard itself must name the token it rejects and plant it in
@@ -43,9 +47,7 @@ allowed_hit() {
     */docs/NEEDS-OPERATOR.md)
       [[ "$text" == *'superseded legacy naming'* ]]
       ;;
-    *)
-      return 1
-      ;;
+    *) return 1 ;;
   esac
 }
 
@@ -57,7 +59,10 @@ search_hits() {
       --glob '!target-f43/**' \
       --glob '!target-f44/**' \
       --glob '!worklist-archive/**' \
+      --glob '!design-archive/**' \
+      --glob '!**/design-archive/**' \
       --glob '!docs/worklist-archive/**' \
+      --glob '!docs/design-archive/**' \
       --glob '!docs/review/**' \
       --glob '!.git/**' \
       "$SUPERSEDED" "${roots[@]}" 2>/dev/null || true
@@ -70,6 +75,7 @@ search_hits() {
       --exclude-dir='target-f43' \
       --exclude-dir='target-f44' \
       --exclude-dir='worklist-archive' \
+      --exclude-dir='design-archive' \
       --exclude-dir='review' \
       "$SUPERSEDED" "${roots[@]}" 2>/dev/null || true
     return 0
@@ -104,9 +110,9 @@ self_test() {
   local td fails=0
   td="$(mktemp -d "${TMPDIR:-/tmp}/lint-brand-identity.XXXXXX")"
   trap "rm -rf '$td'" EXIT
-  mkdir -p "$td/crates/demo/src" "$td/docs/design" "$td/docs"
+  mkdir -p "$td/crates/demo/src" "$td/docs/design" "$td/docs/design-archive"
 
-  printf 'const NAME: &str = "Construct";\n' >"$td/crates/demo/src/lib.rs"
+  printf 'const NAME: &str = "Construct"; // Quazar-dark palette\n' >"$td/crates/demo/src/lib.rs"
   if scan "$td/crates" >/dev/null 2>/dev/null; then
     echo "  ok: clean source passes"
   else
@@ -133,6 +139,15 @@ self_test() {
     echo "  ok: documented old-spelling decision is allowed"
   else
     echo "  FAIL: old-spelling decision lines should be allowed" >&2
+    fails=$((fails + 1))
+  fi
+
+  printf 'Historical Quasar Workstation terminology.\n' \
+    >"$td/docs/design-archive/retired.md"
+  if scan "$td/docs" >/dev/null 2>/dev/null; then
+    echo "  ok: historical design archive is ignored"
+  else
+    echo "  FAIL: historical design archive should be ignored" >&2
     fails=$((fails + 1))
   fi
 

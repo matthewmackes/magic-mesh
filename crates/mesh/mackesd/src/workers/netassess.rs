@@ -1273,6 +1273,7 @@ mod tests {
             node_id: node_id.into(),
             overlay_ip: overlay_ip.into(),
             external_addr: "203.0.113.7:4242".into(),
+            relay_tls: None,
         }
     }
 

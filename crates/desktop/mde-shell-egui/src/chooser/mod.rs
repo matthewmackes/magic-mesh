@@ -65,7 +65,7 @@ use crate::auth::{
     SealOutcome,
 };
 use crate::bus_reader::BusReader;
-use crate::dock::DesktopRailSource;
+use crate::surfaces::DesktopRailSource;
 use crate::vdi::{
     BrokerSessionLifecycle, ConnectRequest, DesktopEndpoint, DisplayMode, MonitorSpan,
     RequestedTarget, VdiProtocol,
@@ -520,7 +520,25 @@ impl VmPowerRequest {
     /// cannot realistically fail; an empty body (never produced here) is simply
     /// rejected by the worker's parser.
     fn to_body(&self) -> String {
-        serde_json::to_string(self).unwrap_or_default()
+        let mut body = serde_json::to_value(self).unwrap_or_default();
+        if let Some(object) = body.as_object_mut() {
+            object.insert(
+                "schema_version".to_string(),
+                serde_json::Value::from(mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION),
+            );
+        }
+        body.to_string()
+    }
+
+    /// Capability binding shared with `vm_lifecycle`. The body digest also
+    /// binds `force` and every other request field.
+    fn authorization_context(&self) -> (&'static str, &str, &str) {
+        match self {
+            Self::Start { host, name } => ("vm-start", host, name),
+            Self::Stop { host, name, .. } => ("vm-stop", host, name),
+            Self::Pause { host, name } => ("vm-pause", host, name),
+            Self::Resume { host, name } => ("vm-resume", host, name),
+        }
     }
 }
 
@@ -533,6 +551,15 @@ fn publish_power(bus_root: Option<&Path>, last_error: &mut Option<String>, req: 
         *last_error = Some("No mesh Bus directory — VM power actions unavailable.".to_string());
         return;
     };
+    let unsigned = req.to_body();
+    let (verb, node, target) = req.authorization_context();
+    let body = match crate::iac::authorize_root_mutation_body(&unsigned, verb, node, target) {
+        Ok(body) => body,
+        Err(error) => {
+            *last_error = Some(format!("VM power authorization unavailable: {error}"));
+            return;
+        }
+    };
     // arch-11: writer — the shared BusReader seam is read-only; this publish keeps
     // Persist::open because it needs the write Result to set `last_error`.
     match mde_bus::persist::Persist::open(root.to_path_buf()).and_then(|p| {
@@ -540,7 +567,7 @@ fn publish_power(bus_root: Option<&Path>, last_error: &mut Option<String>, req: 
             LIFECYCLE_TOPIC,
             mde_bus::hooks::config::Priority::Default,
             None,
-            Some(&req.to_body()),
+            Some(&body),
         )
     }) {
         Ok(_) => *last_error = None,

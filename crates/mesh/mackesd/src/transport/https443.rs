@@ -13,10 +13,9 @@
 //!   * Real TLS handshake (`tokio_rustls`) — not a synthetic
 //!     UDP-in-TCP encapsulation.
 //!   * SNI matches the configured fallback host's domain.
-//!   * System trust store (`rustls-native-certs`) — the fallback
-//!     host MUST present a Let's Encrypt-signed cert chain.
-//!     There is NO custom verifier / fingerprint pinning here;
-//!     that's KDC's identity model, not the fallback's.
+//!   * Exact leaf-certificate pin from the authenticated enrollment bundle.
+//!     Legacy bundles without a relay identity remain unavailable; there is no
+//!     TOFU, disabled verification, or system-root fallback.
 //!
 //! ## Configuration
 //!
@@ -48,6 +47,7 @@
 
 #![cfg(feature = "async-services")]
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -57,11 +57,13 @@ use mackes_transport::{
     TransportKind,
 };
 use rustls::pki_types::ServerName;
-use rustls::RootCertStore;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_rustls::client::TlsStream;
 use tracing::warn;
+
+use crate::nebula_enroll_client::PinnedCertVerifier;
 
 /// Env var the operator sets to enable the HTTPS fallback. The
 /// value is `host:port` (port defaults to 443) or just `host`.
@@ -144,36 +146,54 @@ impl FallbackHostConfig {
     }
 }
 
-/// Build a rustls `ClientConfig` rooted in the system trust
-/// store (via `rustls-native-certs`). Unlike the KDC pinned
-/// verifier, this validates the fallback host's cert chain
-/// against the same roots a browser would trust — Q10's "real
-/// HTTPS" requirement.
-///
-/// # Errors
-///
-/// Returns `Misconfigured { code: "no_trust_store" }` when the
-/// system trust store can't be loaded (no `ca-certificates`
-/// package installed, broken `/etc/ssl/certs`, etc.).
-pub fn build_system_client_config() -> Result<rustls::ClientConfig, TransportError> {
-    let mut roots = RootCertStore::empty();
-    let certs = rustls_native_certs::load_native_certs();
-    // The 0.8 API returns a struct with `certs` + `errors` —
-    // we accept partial loads (typical for a system that's
-    // missing one obscure CA) but require at least one root.
-    for cert in certs.certs {
-        let _ = roots.add(cert);
-    }
-    if roots.is_empty() {
-        return Err(TransportError::Misconfigured {
-            code: "no_trust_store",
-        });
-    }
+fn build_pinned_client_config(fingerprint: &str) -> Arc<rustls::ClientConfig> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let builder = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .expect("rustls default protocol versions installed");
-    Ok(builder.with_root_certificates(roots).with_no_client_auth())
+    let verifier = Arc::new(PinnedCertVerifier::new(fingerprint, provider.clone()));
+    let mut config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("ring provider supports TLS 1.3")
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Arc::new(config)
+}
+
+fn advertised_identity_for_host<'a>(
+    lighthouses: &'a [crate::ca::bundle::LighthouseEntry],
+    fallback: &FallbackHostConfig,
+    authority_public_key: Option<&str>,
+) -> Option<&'a crate::ca::bundle::RelayTlsIdentity> {
+    advertised_entry_for_host(lighthouses, fallback, authority_public_key)?
+        .relay_tls
+        .as_ref()
+}
+
+fn advertised_entry_for_host<'a>(
+    lighthouses: &'a [crate::ca::bundle::LighthouseEntry],
+    fallback: &FallbackHostConfig,
+    authority_public_key: Option<&str>,
+) -> Option<&'a crate::ca::bundle::LighthouseEntry> {
+    let authority_public_key = authority_public_key?;
+    lighthouses.iter().find_map(|entry| {
+        let advertised = FallbackHostConfig::parse(&entry.external_addr)?;
+        if advertised.host != fallback.host {
+            return None;
+        }
+        entry
+            .relay_tls
+            .as_ref()
+            .filter(|identity| {
+                crate::ca::bundle::verify_relay_tls_identity(
+                    identity,
+                    &entry.node_id,
+                    &entry.overlay_ip,
+                    &entry.external_addr,
+                    authority_public_key,
+                )
+            })
+            .map(|_| entry)
+    })
 }
 
 /// Concrete `Transport` impl for the HTTPS-tunneled fallback.
@@ -185,20 +205,17 @@ pub fn build_system_client_config() -> Result<rustls::ClientConfig, TransportErr
 pub struct NebulaHttps443Transport {
     /// Decoded fallback host, or `None` when no env var was set.
     config: Option<FallbackHostConfig>,
-    /// Cached rustls config. Built once + reused across opens
-    /// so the trust store isn't re-loaded per handshake.
-    /// `None` when [`build_system_client_config`] failed.
+    /// Cached rustls config pinned to the selected lighthouse's advertised leaf.
     tls_config: Option<Arc<rustls::ClientConfig>>,
+    /// Node id of the exact signed lighthouse selected by the configured host.
+    relay_peer_id: Option<String>,
 }
 
 impl NebulaHttps443Transport {
     /// Construct the transport from the current environment.
-    /// Reads `MDE_HTTPS_FALLBACK_HOST` + loads the system trust
-    /// store; both are cached for the transport's lifetime.
-    ///
-    /// On a host that's missing the trust store, the transport
-    /// still constructs (so the daemon doesn't refuse to start)
-    /// but every `open()` will return `Misconfigured`.
+    /// Reads `MDE_HTTPS_FALLBACK_HOST` but deliberately installs no trust.
+    /// Daemon wiring uses [`Self::from_bundle`]; this constructor remains a
+    /// fail-closed default for callers that have not supplied persisted trust.
     #[must_use]
     pub fn new() -> Self {
         let config = FallbackHostConfig::from_env();
@@ -208,17 +225,61 @@ impl NebulaHttps443Transport {
                 "NebulaHttps443: no fallback host configured; transport will return Misconfigured on every open"
             );
         }
-        let tls_config = match build_system_client_config() {
-            Ok(c) => Some(Arc::new(c)),
-            Err(e) => {
-                warn!(
-                    error = %e.code(),
-                    "NebulaHttps443: system trust store unavailable; transport will return Misconfigured on every open"
-                );
-                None
+        let tls_config = None;
+        Self {
+            config,
+            tls_config,
+            relay_peer_id: None,
+        }
+    }
+
+    /// Construct from the local signed/enrollment bundle. The configured host
+    /// must exactly match one lighthouse's advertised external host and that
+    /// entry must contain a certificate/fingerprint pair which agrees.
+    #[must_use]
+    pub fn from_bundle(bundle_path: &Path) -> Self {
+        Self::from_bundle_with_authority_pin(
+            bundle_path,
+            Path::new(crate::ca::bundle::RELAY_TRUST_AUTHORITY_PIN_PATH),
+        )
+    }
+
+    fn from_bundle_with_authority_pin(bundle_path: &Path, authority_pin: &Path) -> Self {
+        let config = FallbackHostConfig::from_env();
+        let selection = config.as_ref().and_then(|fallback| {
+            let bundle = crate::ca::bundle::read_bundle(bundle_path).ok()?;
+            if !crate::ca::bundle::relay_trust_authority_matches_pin(&bundle, authority_pin) {
+                return None;
             }
-        };
-        Self { config, tls_config }
+            let entry = advertised_entry_for_host(
+                &bundle.lighthouses,
+                fallback,
+                bundle.relay_trust_authority.as_deref(),
+            )?;
+            let identity = entry.relay_tls.as_ref()?;
+            Some((
+                entry.node_id.clone(),
+                build_pinned_client_config(&identity.fingerprint_sha256),
+            ))
+        });
+        let relay_peer_id = selection.as_ref().map(|(peer_id, _)| peer_id.clone());
+        let tls_config = selection.map(|(_, tls_config)| tls_config);
+        if config.is_none() {
+            warn!(
+                env = FALLBACK_HOST_ENV,
+                "NebulaHttps443: no fallback host configured; transport unavailable"
+            );
+        } else if tls_config.is_none() {
+            warn!(
+                path = %bundle_path.display(),
+                "NebulaHttps443: configured relay has no exact advertised TLS identity; transport unavailable"
+            );
+        }
+        Self {
+            config,
+            tls_config,
+            relay_peer_id,
+        }
     }
 
     /// Construct with explicit config + cached TLS config —
@@ -229,7 +290,11 @@ impl NebulaHttps443Transport {
         config: Option<FallbackHostConfig>,
         tls_config: Option<Arc<rustls::ClientConfig>>,
     ) -> Self {
-        Self { config, tls_config }
+        Self {
+            config,
+            tls_config,
+            relay_peer_id: None,
+        }
     }
 
     /// Borrow the decoded fallback config. `None` when unset.
@@ -238,7 +303,13 @@ impl NebulaHttps443Transport {
         self.config.as_ref()
     }
 
-    /// Pre-flight: both config + TLS roots loaded. The router
+    /// Signed lighthouse node selected for the live UDP bridge.
+    #[must_use]
+    pub fn relay_peer_id(&self) -> Option<&str> {
+        self.relay_peer_id.as_deref()
+    }
+
+    /// Pre-flight: both config + exact advertised TLS pin loaded. The router
     /// can call this to check whether opens have any chance of
     /// succeeding before driving a peer into `Activating`.
     #[must_use]
@@ -258,29 +329,76 @@ impl Default for NebulaHttps443Transport {
 /// produced by the system-trust-rooted handshake.
 pub struct NebulaHttps443Connection {
     id: String,
-    stream: AsyncMutex<TlsStream<TcpStream>>,
+    reader: AsyncMutex<ReadHalf<TlsStream<TcpStream>>>,
+    writer: AsyncMutex<WriteHalf<TlsStream<TcpStream>>>,
 }
 
 impl std::fmt::Debug for NebulaHttps443Connection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NebulaHttps443Connection")
             .field("id", &self.id)
-            .field("stream", &"<TlsStream<TcpStream>>")
+            .field("stream", &"<split TlsStream<TcpStream>>")
             .finish()
     }
 }
 
-impl NebulaHttps443Connection {
-    /// Take an exclusive lock on the TLS stream. The future
-    /// frame-codec writer (D.3) writes through this.
-    pub async fn lock_stream(&self) -> tokio::sync::MutexGuard<'_, TlsStream<TcpStream>> {
-        self.stream.lock().await
-    }
-}
-
+#[async_trait]
 impl Connection for NebulaHttps443Connection {
     fn id(&self) -> &str {
         &self.id
+    }
+
+    fn supports_framed_io(&self) -> bool {
+        true
+    }
+
+    async fn send_frame(&self, payload: &[u8]) -> Result<(), TransportError> {
+        if payload.len() > mackes_nebula_https_tunnel::MAX_FRAME_SIZE {
+            return Err(TransportError::Io {
+                code: "frame_oversized",
+            });
+        }
+        let mut writer = self.writer.lock().await;
+        writer
+            .write_all(&(payload.len() as u32).to_be_bytes())
+            .await
+            .map_err(|_| TransportError::Io {
+                code: "tls_write_failed",
+            })?;
+        writer
+            .write_all(payload)
+            .await
+            .map_err(|_| TransportError::Io {
+                code: "tls_write_failed",
+            })?;
+        writer.flush().await.map_err(|_| TransportError::Io {
+            code: "tls_write_failed",
+        })
+    }
+
+    async fn recv_frame(&self) -> Result<Vec<u8>, TransportError> {
+        let mut reader = self.reader.lock().await;
+        let mut header = [0_u8; mackes_nebula_https_tunnel::HEADER_LEN];
+        reader
+            .read_exact(&mut header)
+            .await
+            .map_err(|_| TransportError::Io {
+                code: "stream_closed",
+            })?;
+        let len = u32::from_be_bytes(header) as usize;
+        if len > mackes_nebula_https_tunnel::MAX_FRAME_SIZE {
+            return Err(TransportError::Io {
+                code: "frame_oversized",
+            });
+        }
+        let mut payload = vec![0_u8; len];
+        reader
+            .read_exact(&mut payload)
+            .await
+            .map_err(|_| TransportError::Io {
+                code: "stream_closed",
+            })?;
+        Ok(payload)
     }
 }
 
@@ -292,11 +410,9 @@ impl Transport for NebulaHttps443Transport {
 
     fn capabilities(&self) -> Capabilities {
         Capabilities {
-            // 60 KiB matches KDC's framing; the fallback uses
-            // the same wire-frame codec so a peer's de-frame
-            // path is identical whether traffic arrived via
-            // KDC TLS or the HTTPS fallback.
-            max_frame_bytes: Some(64 * 1024),
+            // The covert-tunnel protocol carries intact Nebula
+            // datagrams and therefore uses Nebula's 1408-byte MTU.
+            max_frame_bytes: Some(mackes_nebula_https_tunnel::MAX_FRAME_SIZE as u64),
             // 30 s — the TLS handshake is expensive; we
             // re-probe less aggressively than the UDP path.
             health_window: Duration::from_secs(30),
@@ -329,7 +445,7 @@ impl Transport for NebulaHttps443Transport {
             .tls_config
             .clone()
             .ok_or(TransportError::Misconfigured {
-                code: "no_trust_store",
+                code: "no_relay_trust",
             })?;
         let sni = config.sni().ok_or(TransportError::Misconfigured {
             code: "bad_fallback_host",
@@ -345,9 +461,11 @@ impl Transport for NebulaHttps443Transport {
             .connect(sni, tcp)
             .await
             .map_err(|_e| TransportError::HandshakeFailed { code: "tls_failed" })?;
+        let (reader, writer) = tokio::io::split(stream);
         Ok(Box::new(NebulaHttps443Connection {
             id: format!("https443:{peer_id}"),
-            stream: AsyncMutex::new(stream),
+            reader: AsyncMutex::new(reader),
+            writer: AsyncMutex::new(writer),
         }))
     }
 
@@ -361,9 +479,9 @@ mod tests {
     use super::*;
     use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use rustls::RootCertStore;
     use std::net::SocketAddr;
-    use tokio::io::AsyncWriteExt;
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, UdpSocket};
 
     #[test]
     fn parse_host_only_uses_default_port() {
@@ -395,6 +513,90 @@ mod tests {
         // raw value as the host.
         assert_eq!(c.host, "badhost:notaport");
         assert_eq!(c.port, 443);
+    }
+
+    #[test]
+    fn multi_lighthouse_trust_selects_only_the_configured_host() {
+        let authority = ed25519_dalek::SigningKey::from_bytes(&[7_u8; 32]);
+        let identity_a = crate::ca::bundle::sign_relay_tls_identity(
+            crate::ca::bundle::RelayTlsIdentity::from_certificate_pem(
+                "-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n",
+            )
+            .expect("identity A"),
+            "lh-a",
+            "10.42.0.1",
+            "a.example:4242",
+            &authority,
+        );
+        let identity_b = crate::ca::bundle::sign_relay_tls_identity(
+            crate::ca::bundle::RelayTlsIdentity::from_certificate_pem(
+                "-----BEGIN CERTIFICATE-----\nBAUG\n-----END CERTIFICATE-----\n",
+            )
+            .expect("identity B"),
+            "lh-b",
+            "10.42.0.2",
+            "b.example:4242",
+            &authority,
+        );
+        let lighthouses = vec![
+            crate::ca::bundle::LighthouseEntry {
+                node_id: "lh-a".into(),
+                overlay_ip: "10.42.0.1".into(),
+                external_addr: "a.example:4242".into(),
+                relay_tls: Some(identity_a),
+            },
+            crate::ca::bundle::LighthouseEntry {
+                node_id: "lh-b".into(),
+                overlay_ip: "10.42.0.2".into(),
+                external_addr: "b.example:4242".into(),
+                relay_tls: Some(identity_b.clone()),
+            },
+        ];
+        let selected = advertised_identity_for_host(
+            &lighthouses,
+            &FallbackHostConfig {
+                host: "b.example".into(),
+                port: 443,
+            },
+            Some(&crate::ca::bundle::relay_trust_authority_public_key(
+                &authority,
+            )),
+        )
+        .expect("matching relay identity");
+        assert_eq!(selected, &identity_b);
+    }
+
+    #[test]
+    fn mismatched_advertised_certificate_and_fingerprint_is_unavailable() {
+        let authority = ed25519_dalek::SigningKey::from_bytes(&[7_u8; 32]);
+        let mut identity = crate::ca::bundle::sign_relay_tls_identity(
+            crate::ca::bundle::RelayTlsIdentity::from_certificate_pem(
+                "-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n",
+            )
+            .expect("identity"),
+            "lh-a",
+            "10.42.0.1",
+            "a.example:4242",
+            &authority,
+        );
+        identity.fingerprint_sha256 = "00".repeat(32);
+        let lighthouses = vec![crate::ca::bundle::LighthouseEntry {
+            node_id: "lh-a".into(),
+            overlay_ip: "10.42.0.1".into(),
+            external_addr: "a.example:4242".into(),
+            relay_tls: Some(identity),
+        }];
+        assert!(advertised_identity_for_host(
+            &lighthouses,
+            &FallbackHostConfig {
+                host: "a.example".into(),
+                port: 443,
+            },
+            Some(&crate::ca::bundle::relay_trust_authority_public_key(
+                &authority,
+            )),
+        )
+        .is_none());
     }
 
     #[test]
@@ -430,7 +632,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn open_with_config_but_no_tls_returns_misconfigured_no_trust_store() {
+    async fn open_with_config_but_no_tls_returns_misconfigured_no_relay_trust() {
         let t = NebulaHttps443Transport::with_config_and_tls(
             Some(FallbackHostConfig {
                 host: "example.com".into(),
@@ -441,9 +643,9 @@ mod tests {
         let err = t.open("alice").await.expect_err("must fail");
         match err {
             TransportError::Misconfigured { code } => {
-                assert_eq!(code, "no_trust_store");
+                assert_eq!(code, "no_relay_trust");
             }
-            other => panic!("expected Misconfigured(no_trust_store), got {other:?}"),
+            other => panic!("expected Misconfigured(no_relay_trust), got {other:?}"),
         }
     }
 
@@ -540,6 +742,331 @@ mod tests {
             .with_root_certificates(roots)
             .with_no_client_auth();
         Arc::new(builder)
+    }
+
+    fn loopback_pinned_tls_config(server_cert_der: &[u8]) -> Arc<rustls::ClientConfig> {
+        build_pinned_client_config(&crate::nebula_enroll_endpoint::fingerprint(server_cert_der))
+    }
+
+    fn loopback_server_config(cert_der: Vec<u8>, key_der: Vec<u8>) -> rustls::ServerConfig {
+        let cert_chain = vec![CertificateDer::from(cert_der)];
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der));
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("server protocol")
+            .with_no_client_auth()
+            .with_single_cert(cert_chain, key)
+            .expect("server config")
+    }
+
+    async fn spawn_loopback_frame_echo(
+        cert_der: Vec<u8>,
+        key_der: Vec<u8>,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let acceptor =
+            tokio_rustls::TlsAcceptor::from(Arc::new(loopback_server_config(cert_der, key_der)));
+        let task = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("accept");
+            let mut tls = acceptor.accept(tcp).await.expect("trusted handshake");
+            let mut header = [0_u8; mackes_nebula_https_tunnel::HEADER_LEN];
+            tls.read_exact(&mut header).await.expect("frame header");
+            let len = u32::from_be_bytes(header) as usize;
+            let mut payload = vec![0_u8; len];
+            tls.read_exact(&mut payload).await.expect("frame payload");
+            assert_eq!(payload, b"client nebula packet");
+
+            let reply = b"lighthouse nebula packet";
+            tls.write_all(&(reply.len() as u32).to_be_bytes())
+                .await
+                .expect("reply header");
+            tls.write_all(reply).await.expect("reply payload");
+            tls.flush().await.expect("reply flush");
+        });
+        (addr, task)
+    }
+
+    async fn spawn_reconnecting_demux(
+        cert_der: Vec<u8>,
+        key_der: Vec<u8>,
+        connections: usize,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let acceptor =
+            tokio_rustls::TlsAcceptor::from(Arc::new(loopback_server_config(cert_der, key_der)));
+        let nebula = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock lighthouse Nebula");
+        let nebula_addr = nebula.local_addr().expect("mock Nebula addr");
+        let task = tokio::spawn(async move {
+            let echo = tokio::spawn(async move {
+                let mut payload = vec![0_u8; mackes_nebula_https_tunnel::MAX_FRAME_SIZE];
+                let attacker = UdpSocket::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind hostile local sender");
+                for _ in 0..connections {
+                    let (length, source) = nebula
+                        .recv_from(&mut payload)
+                        .await
+                        .expect("mock Nebula receive");
+                    attacker
+                        .send_to(b"forged local return", source)
+                        .await
+                        .expect("inject hostile local return");
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    nebula
+                        .send_to(&payload[..length], source)
+                        .await
+                        .expect("mock Nebula reply");
+                }
+            });
+            for _ in 0..connections {
+                let (tcp, _) = listener.accept().await.expect("accept");
+                let tls = acceptor.accept(tcp).await.expect("trusted handshake");
+                let result = mackes_nebula_https_tunnel::pump_one_stream(
+                    tls,
+                    mackes_nebula_https_tunnel::DemuxConfig::default()
+                        .with_nebula_addr(nebula_addr)
+                        .with_idle_timeout(Duration::from_millis(50)),
+                )
+                .await;
+                match result {
+                    Ok(stats) => {
+                        assert_eq!(stats.frames_in, 1);
+                        assert_eq!(stats.frames_out, 1);
+                    }
+                    Err(mackes_nebula_https_tunnel::DemuxError::IdleTimeout(_)) => {}
+                    Err(mackes_nebula_https_tunnel::DemuxError::TlsIo(error))
+                        if error.contains("close_notify") => {}
+                    Err(error) => panic!("production demux failed: {error}"),
+                }
+            }
+            echo.await.expect("mock Nebula echo task");
+        });
+        (addr, task)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn trusted_tls_connection_exchanges_bidirectional_framed_payloads() {
+        let host = "localhost";
+        let (cert, key) = issue_loopback_cert(host);
+        let (addr, server) = spawn_loopback_frame_echo(cert.clone(), key).await;
+        let transport = NebulaHttps443Transport::with_config_and_tls(
+            Some(FallbackHostConfig {
+                host: host.into(),
+                port: addr.port(),
+            }),
+            Some(loopback_pinned_tls_config(&cert)),
+        );
+
+        let connection = transport.open("alice").await.expect("trusted open");
+        assert!(connection.supports_framed_io());
+        connection
+            .send_frame(b"client nebula packet")
+            .await
+            .expect("send frame");
+        let reply = connection.recv_frame().await.expect("receive frame");
+        assert_eq!(reply, b"lighthouse nebula packet");
+        server.await.expect("server task");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn forced_udp_fallback_bridges_bidirectionally_and_reconnects() {
+        use crate::workers::mesh_router::{MeshRouterWorker, RouterState, TransportRegistry};
+        use std::collections::HashMap;
+        use tokio::sync::RwLock;
+
+        let (cert, key) = issue_loopback_cert("localhost");
+        let (relay_addr, relay) = spawn_reconnecting_demux(cert.clone(), key, 2).await;
+        let transport: Arc<dyn mackes_transport::Transport> =
+            Arc::new(NebulaHttps443Transport::with_config_and_tls(
+                Some(FallbackHostConfig {
+                    host: "127.0.0.1".into(),
+                    port: relay_addr.port(),
+                }),
+                Some(loopback_pinned_tls_config(&cert)),
+            ));
+        let state: RouterState = Arc::new(RwLock::new(HashMap::new()));
+        let registry: TransportRegistry = Arc::new(vec![transport]);
+        let router = MeshRouterWorker::new(state, registry);
+        let bridge = UdpSocket::bind("127.0.0.1:0").await.expect("bridge bind");
+        let bridge_addr = bridge.local_addr().expect("bridge addr");
+        let nebula = UdpSocket::bind("127.0.0.1:0").await.expect("nebula bind");
+        let nebula_addr = nebula.local_addr().expect("nebula addr");
+        let attacker = UdpSocket::bind("127.0.0.1:0").await.expect("attacker bind");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let shutdown = crate::workers::ShutdownToken::from_receiver(shutdown_rx);
+        let router_for_exercise = &router;
+
+        let bridge_run = router.run_https_udp_bridge(
+            bridge,
+            "relay".into(),
+            nebula_addr,
+            shutdown,
+            tokio::time::interval(Duration::from_secs(60)),
+        );
+        let exercise = async move {
+            attacker
+                .send_to(b"local source hijack", bridge_addr)
+                .await
+                .expect("send untrusted local packet");
+            let mut attacker_reply = [0_u8; 64];
+            assert!(tokio::time::timeout(
+                Duration::from_millis(100),
+                attacker.recv_from(&mut attacker_reply),
+            )
+            .await
+            .is_err());
+            for (index, payload) in [
+                b"first nebula packet".as_slice(),
+                b"after reconnect".as_slice(),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                nebula
+                    .send_to(payload, bridge_addr)
+                    .await
+                    .expect("send to bridge");
+                let mut received = [0_u8; 128];
+                let (length, _) =
+                    tokio::time::timeout(Duration::from_secs(2), nebula.recv_from(&mut received))
+                        .await
+                        .expect("fallback reply timeout")
+                        .expect("fallback reply");
+                assert_eq!(&received[..length], payload);
+                if index == 0 {
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        loop {
+                            if router_for_exercise.active_https_connection_count().await == 0 {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                    })
+                    .await
+                    .expect("router observes first relay stream loss");
+                }
+            }
+            shutdown_tx.send(true).expect("shutdown bridge");
+        };
+
+        let (bridge_result, (), relay_result) = tokio::join!(bridge_run, exercise, relay);
+        bridge_result.expect("bridge exits cleanly");
+        relay_result.expect("relay task");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn untrusted_relay_certificate_is_rejected() {
+        let host = "localhost";
+        let (server_cert, server_key) = issue_loopback_cert(host);
+        let (wrong_cert, _) = issue_loopback_cert(host);
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(loopback_server_config(
+            server_cert,
+            server_key,
+        )));
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("accept");
+            assert!(acceptor.accept(tcp).await.is_err());
+        });
+        let transport = NebulaHttps443Transport::with_config_and_tls(
+            Some(FallbackHostConfig {
+                host: host.into(),
+                port: addr.port(),
+            }),
+            Some(loopback_pinned_tls_config(&wrong_cert)),
+        );
+
+        let error = transport
+            .open("alice")
+            .await
+            .expect_err("unadvertised relay certificate must fail closed");
+        assert!(matches!(
+            error,
+            TransportError::HandshakeFailed { code: "tls_failed" }
+        ));
+        server.await.expect("server task");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn forced_udp_fallback_with_wrong_relay_identity_stays_fail_closed() {
+        use crate::workers::mesh_router::{MeshRouterWorker, RouterState, TransportRegistry};
+        use std::collections::HashMap;
+        use tokio::sync::RwLock;
+
+        let (server_cert, server_key) = issue_loopback_cert("localhost");
+        let (wrong_cert, _) = issue_loopback_cert("localhost");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let relay_addr = listener.local_addr().expect("local addr");
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(loopback_server_config(
+            server_cert,
+            server_key,
+        )));
+        let relay = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("accept");
+            assert!(acceptor.accept(tcp).await.is_err());
+        });
+        let transport: Arc<dyn mackes_transport::Transport> =
+            Arc::new(NebulaHttps443Transport::with_config_and_tls(
+                Some(FallbackHostConfig {
+                    host: "127.0.0.1".into(),
+                    port: relay_addr.port(),
+                }),
+                Some(loopback_pinned_tls_config(&wrong_cert)),
+            ));
+        let state: RouterState = Arc::new(RwLock::new(HashMap::new()));
+        let registry: TransportRegistry = Arc::new(vec![transport]);
+        let router = MeshRouterWorker::new(Arc::clone(&state), registry);
+        let bridge = UdpSocket::bind("127.0.0.1:0").await.expect("bridge bind");
+        let bridge_addr = bridge.local_addr().expect("bridge addr");
+        let nebula = UdpSocket::bind("127.0.0.1:0").await.expect("nebula bind");
+        let nebula_addr = nebula.local_addr().expect("nebula addr");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let shutdown = crate::workers::ShutdownToken::from_receiver(shutdown_rx);
+
+        let bridge_run = router.run_https_udp_bridge(
+            bridge,
+            "relay".into(),
+            nebula_addr,
+            shutdown,
+            tokio::time::interval(Duration::from_secs(60)),
+        );
+        let exercise = async move {
+            nebula
+                .send_to(b"must not escape", bridge_addr)
+                .await
+                .expect("send to bridge");
+            let mut received = [0_u8; 64];
+            assert!(tokio::time::timeout(
+                Duration::from_millis(250),
+                nebula.recv_from(&mut received),
+            )
+            .await
+            .is_err());
+            let path = state.read().await;
+            assert_eq!(
+                path.get("relay").expect("relay path").https_state,
+                mackes_transport::peer_path::HttpsFallbackState::Failing,
+            );
+            shutdown_tx.send(true).expect("shutdown bridge");
+        };
+
+        let (bridge_result, (), relay_result) = tokio::join!(bridge_run, exercise, relay);
+        bridge_result.expect("bridge exits cleanly");
+        relay_result.expect("relay task");
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -1,38 +1,17 @@
-//! The session view — what the central panel shows when the chrome bar is
-//! collapsed.
-//!
-//! A real session is a fullscreen VM desktop rendered as an egui texture by
-//! `mde-vdi` (a later unit). Until one is connected this is an honest EmptyState
-//! — not a placeholder render of a fake desktop (governance §7). The monitor
-//! glyph is line-drawn (no version-sensitive corner-radius type) and themed
-//! entirely through the shared `Style`.
+//! Shared honest-empty presentation primitives.
 
 use mde_egui::egui::{self, Rect, RichText, Sense, Stroke};
 use mde_egui::Style;
 
-/// Render the no-session EmptyState, vertically centred in the available space.
-pub(crate) fn show(ui: &mut egui::Ui) {
-    empty_state(
-        ui,
-        "No active session",
-        "Connect a desktop — your session appears here.",
-    );
-}
-
-/// A centred EmptyState: a drawn monitor glyph over a title and a dim subtitle.
-/// Shared with the Desktop surface (`vdi`), which paints the same honest
-/// "no desktop yet" story before a session is brokered in.
-pub(crate) fn empty_state(ui: &mut egui::Ui, title: &str, subtitle: &str) {
-    // Push the block toward the vertical middle of the panel. The block is the
-    // glyph + title + subtitle stack — roughly four XL steps tall.
+/// Paint a centered empty-state story without inventing runtime content.
+pub(crate) fn show(ui: &mut egui::Ui, title: &str, subtitle: &str) {
     let lead = (ui.available_height() - Style::SP_XL * 4.0).max(Style::SP_XL) * 0.5;
     ui.add_space(lead);
 
     ui.vertical_centered(|ui| {
         let glyph = egui::vec2(Style::SP_XL * 2.5, Style::SP_XL * 2.0);
         let (area, _) = ui.allocate_exact_size(glyph, Sense::hover());
-        let painter = ui.painter().clone();
-        draw_monitor(&painter, area);
+        draw_monitor(&ui.painter().clone(), area);
 
         ui.add_space(Style::SP_M);
         ui.label(
@@ -50,10 +29,7 @@ pub(crate) fn empty_state(ui: &mut egui::Ui, title: &str, subtitle: &str) {
     });
 }
 
-/// Draw a simple monitor outline within `area` using line segments only — no
-/// rect/corner-radius API, so it is robust across egui point releases. Also
-/// the Chooser card's thumbnail-well icon fallback (CHOOSER-2) until the
-/// CHOOSER-3 preview pipeline fills the well with a live snapshot.
+/// Draw the shared monitor placeholder used by chooser and empty-state views.
 pub(crate) fn draw_monitor(painter: &egui::Painter, area: Rect) {
     let stroke = Stroke::new(2.0, Style::TEXT_DIM);
     let inset = Style::SP_XS;
@@ -62,7 +38,6 @@ pub(crate) fn draw_monitor(painter: &egui::Painter, area: Rect) {
         egui::pos2(area.right() - inset, area.top() + area.height() * 0.64),
     );
 
-    // Screen outline (four edges).
     let tl = screen.left_top();
     let tr = screen.right_top();
     let bl = screen.left_bottom();
@@ -72,7 +47,6 @@ pub(crate) fn draw_monitor(painter: &egui::Painter, area: Rect) {
     painter.line_segment([br, bl], stroke);
     painter.line_segment([bl, tl], stroke);
 
-    // Neck + base stand.
     let cx = screen.center().x;
     painter.line_segment(
         [

@@ -30,19 +30,18 @@
 //! * **Construct↔Car** — the SAME `layout_mode_primary_toggle` +
 //!   `SystemState::set_layout_profile` seam the floating mode button drives
 //!   (never a second toggle path); entering Car lands on the Auto-Mode home,
-//!   mirroring `apply_layout_profile` (the vdock density mirror self-heals on
-//!   the next `mount_dock_chrome` frame).
+//!   mirroring `apply_layout_profile`.
 //! * **VDI sessions** — the `SessionRailState` projection of the broker's
-//!   public session log, with a **focus** action per row (the taskbar's
+//!   public session log, with a **focus** action per row (the session rail's
 //!   `focus_session` seam + the Desktop route). A **disconnect** action is
 //!   deliberately NOT shipped: the shell has no honest disconnect seam — the
 //!   rail is a read-projection and publishing a fake broker `Disconnect`
 //!   transition would lie about lifecycle the integration-gated `SessionStore`
 //!   owns. No sessions → a Remote-Sessions deep-link tile.
 //! * **File operations** — the same Files/Browser `OperationProgressSummary`
-//!   fold the taskbar status cell mirrors (`shell_file_operation_progress`'s
+//!   fold the Files/Browser operation summaries
 //!   Files-first precedence); the row exists only while jobs are active and
-//!   routes through the SAME `route_file_operation_progress_request` seam.
+//!   routes through the SAME `route_file_operation_request` seam.
 //!
 //! Deep-links need no U29 wiring: the mount slot forwards `nav` + the System
 //! state directly, so navigation lands through the same fields every other
@@ -59,9 +58,9 @@ use mde_theme::brand::icons::IconId;
 
 use crate::chrome::MeshSummary;
 use crate::construct::{ChromeIntent, ConstructChrome};
-use crate::dock::{icon_texture, SessionRailEntry, Surface};
 use crate::session_rail::SessionRailState;
 use crate::status::{severity_color, StatusSegments};
+use crate::surfaces::{icon_texture, SessionRailEntry, Surface};
 use crate::system::{SettingsSection, SystemState};
 use crate::web::WebState;
 use crate::Nav;
@@ -88,7 +87,7 @@ const GRID_GAP: f32 = Style::SP_S;
 /// Gap between the card's sections.
 const SECTION_GAP: f32 = Style::SP_M;
 /// Sessions shown before the header's total count carries the rest — keeps the
-/// overlay glanceable (the taskbar rail remains the full list).
+/// overlay glanceable (the owning surface remains the full list).
 const MAX_SESSION_ROWS: usize = 4;
 /// Below this reveal fraction a closing panel stops painting entirely.
 const REVEAL_EPSILON: f32 = 0.01;
@@ -210,7 +209,7 @@ struct FileOpModel {
 }
 
 /// Files-first, Browser-fallback — the SAME precedence
-/// `shell_file_operation_progress` feeds the taskbar status cell — gated on
+/// The shell model pump feeds this file-operation summary — gated on
 /// `active > 0` so an idle summary never paints a dead row.
 fn file_ops_model(
     files: Option<OperationProgressSummary>,
@@ -259,7 +258,7 @@ enum CcAction {
     OpenDesktop,
     /// Focus a broker-visible VDI session and show the Desktop surface.
     FocusSession(String),
-    /// Route to Files → Transfers (the taskbar's file-operations jump).
+    /// Route to Files → Transfers.
     OpenFileOperations,
 }
 
@@ -523,7 +522,7 @@ pub(crate) fn mount(ctx: &egui::Context, mut deps: ControlCenterDeps<'_>) {
 
     // Live inputs for this frame's fold. The dock chrome already pumped these
     // in Construct mode; re-pumping drains nothing new and keeps the overlay
-    // live in Car mode, where the taskbar (and its pump) is hidden.
+    // live in Car mode, where the surface is not rendered.
     deps.files.pump_transfers();
     deps.web.pump_downloads_for_shell_chrome();
     let entries = deps.session_rail.entries(deps.local_host);
@@ -610,8 +609,7 @@ fn apply(action: &CcAction, ctx: &egui::Context, deps: &mut ControlCenterDeps<'_
         }
         CcAction::LayoutToggle => {
             // The SAME primary-toggle + set-profile seam the floating mode
-            // button drives (`apply_layout_profile`); the vdock density mirror
-            // self-heals next frame in `mount_dock_chrome`.
+            // button drives (`apply_layout_profile`).
             let next = crate::layout_mode_primary_toggle(deps.system.layout_profile());
             deps.system.set_layout_profile(next, ctx);
             if next == LayoutProfile::Car {
@@ -638,7 +636,7 @@ fn apply(action: &CcAction, ctx: &egui::Context, deps: &mut ControlCenterDeps<'_
             deps.construct.control_center_open = false;
         }
         CcAction::OpenFileOperations => {
-            crate::route_file_operation_progress_request(deps.files, deps.nav);
+            crate::route_file_operation_request(deps.files, deps.nav);
             deps.construct.control_center_open = false;
         }
     }
@@ -1657,7 +1655,7 @@ mod tests {
                 label: "oak win11".to_owned(),
                 badge: "VDI",
             }],
-            "the list is the taskbar rail's exact projection"
+            "the list is the session rail's exact projection"
         );
 
         apply(
@@ -1672,7 +1670,7 @@ mod tests {
         assert_eq!(
             refreshed[0].protocol(),
             "LIVE",
-            "the focus action drives the SAME focus_session seam the taskbar uses"
+            "the focus action drives the shared focus_session seam"
         );
         let _ = std::fs::remove_dir_all(root);
     }

@@ -16,6 +16,26 @@ review ledgers, and operator queues are evidence sources, not parallel trackers.
 When an item is completed or retired, move it to the archive with a disposition
 instead of leaving closed work in this file.
 
+## Current Snapshot - 2026-07-22 takeover
+
+- **10 active epics:** 7 `Remaining`, 3 `Blocked`; no `Needs clarification`.
+- **P0:** WL-SEC-005 (final integrated gate), WL-SEC-006 (stop replicating
+  Nebula private keys), WL-SEC-007 (authenticate privileged shared-Bus
+  mutations), WL-ARCH-007 (authorization mint + direct lifecycle proof), and
+  WL-FUNC-011 (blocked on real media/LLM resources).
+- **In flight:** WL-BUILD-004 current-workspace coverage proof, WL-FUNC-012 live
+  map feeds, WL-UX-006 Construct, and WL-UX-007 Car.
+- **Externally blocked:** WL-RUN-003 needs a second lighthouse plus the operator's
+  DigitalOcean credential; WL-FUNC-011 needs a real second media peer/SIP path
+  plus an operator-sealed DigitalOcean model key; WL-SEC-006 needs a controlled
+  live Nebula identity rotation/reconnect/prune drill.
+- **Archived by this takeover:** WL-DOC-004, WL-FUNC-013, and WL-RUN-008 in
+  `docs/worklist-archive/2026-07-22-platform-takeover.md`.
+
+The reconciliation and operator-decision sections below are dated historical
+context. Their old counts and execution suggestions do not supersede this
+snapshot or the live epic records.
+
 ## Fold-in - 2026-07-20 (master planning-line reconciliation)
 
 The diverged `origin/master` planning line (5 worklist-only commits, forked at
@@ -206,7 +226,213 @@ These decisions refine acceptance and sequencing for the active items below.
 
 ## Security
 
+### WL-SEC-005 - Constrain root cloud-worker filesystem keys to owned state roots
+
+- Status: Remaining
+- Progress (2026-07-22): strict single-component validation now guards desired,
+  image, version, container, placement, and lifecycle target sinks; outside-file
+  hostile regressions are green. The focused cloud suite passed 95/95 on farm
+  `.50`. Closure is waiting only on the final integrated format/diff gate while
+  the adjacent transport and overlay edits settle.
+- Priority: P0
+- Complexity: Medium
+- Problem: Unauthenticated local Bus callers can supply absolute or traversing
+  node, workload, image, version, and container identifiers to a root daemon,
+  allowing cloud verbs to write or remove JSON outside the cloud state root.
+- Required outcome: Every identifier used as a filesystem component is
+  validated at the storage sink, and hostile requests cannot create, replace,
+  or remove files outside daemon-owned state roots.
+- Scope: `mackesd` desired-state, image, and container cloud verbs; strict
+  component validation and hostile handler regressions. Bus-wide authentication
+  and capability policy remain outside this focused containment item.
+- Relevant files/components: `crates/mesh/mackesd/src/workers/cloud/path_key.rs`,
+  `reconcile.rs`, `verbs/desired.rs`, `verbs/image.rs`, `verbs/container.rs`.
+- Acceptance criteria: Absolute paths, separators, dot components, blank keys,
+  and oversized keys fail before I/O; outside-sentinel write/delete regressions
+  pass; ordinary hostnames and workload names continue to round-trip.
+- Verification method: Focused `mackesd` cloud-worker tests on the build farm,
+  plus `cargo fmt --all -- --check` and `git diff --check`.
+- Origin or merged source IDs: 2026-07-22 Codex platform takeover security audit.
+
+### WL-SEC-006 - Keep Nebula private keys local to their owning node
+
+- Status: Blocked
+- Progress (2026-07-22): code and hostile fixtures now meet the local-key design.
+  Joining nodes generate their key locally; the signer consumes only the strict
+  requester public key and verifies the returned certificate identity before an
+  atomic swap. Public replicated bundles deny secret fields; legacy secret-bearing
+  bundles fail closed; lighthouse secret enrollment is TLS-only, redacted, and
+  persisted mode 0600 with symlink-hostile atomic replacement. Epoch rotation
+  preflights/stages exact peer identities and transactionally rolls back. BigBoy
+  farm proof is green: `mackesd` and `mde-enroll` all-target checks plus 204 focused
+  CA/enrollment/client/endpoint/supervisor tests. The farm and available live seat
+  have neither `nebula` nor `nebula-cert`, so only the controlled live
+  rotation/reconnect/old-root-prune acceptance drill remains blocked.
+- Priority: P0
+- Complexity: Epic
+- Problem: Any node able to read replicated enrollment bundles can obtain other
+  nodes' Nebula private keys and impersonate them. A compromised shared tree can
+  also replace a relay trust authority and its signatures together unless the
+  enrollment-pinned authority is held outside that mutable bundle.
+- Required outcome: Each joining node generates and retains its own Nebula private
+  key, the CA signs only the submitted public key, and no peer, CA, or relay private
+  key is written to replicated state. Authenticated enrollment pins the relay
+  authority in a root-owned local trust file; steady-state bundle updates must
+  match that pin. Every remaining secret-bearing local write is atomic, durable,
+  and explicitly mode `0600`.
+- Scope: Nebula CSR/sign backend and wire contract, network/file enrollment
+  delivery, steady-state bundle schema, local trust/key persistence, migration,
+  revocation, and rotation of already-issued fleet identities. Public
+  certificates, lighthouse rosters, and signed relay advertisements may remain
+  replicated.
+- Relevant files/components: `crates/mesh/mackesd/src/nebula_enroll.rs`,
+  `nebula_enroll_client.rs`, `ca/sign.rs`, `ca/bundle.rs`,
+  `workers/nebula_supervisor.rs`, and the `NebulaCertBackend` implementations.
+- Acceptance criteria: The signer consumes the requester's exact public key and
+  never receives/creates its private half; serialized steady-state bundles contain
+  no private-key fields or PEM; a hostile peer reading every replicated file
+  cannot authenticate as another node; mutable authority substitution fails
+  against the local pin; migrated nodes rotate and revoke the former shared
+  identities without losing overlay reachability.
+- Verification method: Hostile serialization/permission tests, requester-key
+  certificate match proof, two-node enrollment fixture with filesystem inspection,
+  authority-substitution negative tests, farm suites, and a controlled live
+  rotation/reconnect drill.
+- Origin or merged source IDs: 2026-07-22 Codex takeover review of WL-RUN-008 trust
+  bootstrap and pre-existing enrollment persistence.
+
+### WL-SEC-007 - Authenticate privileged shared-Bus mutation consumers
+
+- Status: Remaining
+- Progress (2026-07-22): the typed action worker now requires schema v1 and an
+  exact-body, 30-second, durably single-use HMAC capability before service
+  lifecycle or code-edit dispatch; its legacy directory bypass only refuses.
+  Code-edit writes are descriptor-relative and reject in-root symlink escapes.
+  Cloud, direct Podman/libvirt lifecycle, and remote host-control consumers now
+  use the same fail-closed gate; consumer-side expiry is capped at 30 seconds and
+  direct libvirt rejects future schemas. Farm evidence is green for action
+  28/28, cloud 109/109, direct libvirt 51/51 (including the latest future-schema
+  and overlong-capability regressions), Podman 30/30, and host-state 13/13
+  hostile/functional tests; the shared `host_ops` partition is 47/47 and
+  `dc_power` is 30/30 (including unsigned, tampered, replayed, and future-schema
+  refusal before backend execution).
+  Publisher tracing found no legitimate Podman or remote host-control shell path;
+  the scheduler's old unsigned actuator emission was retired rather than granted
+  autonomous mint authority (32/32 farm-green). The reachability audit then found
+  the higher-risk production `/run/mde-bus` tranche: registered IPC responders
+  still accept unauthenticated Tofu apply/destroy, Datacenter and host power/
+  network/secret operations, package uninstall, job launch, fleet revision,
+  Connect/firewall, VPN, and DDNS mutations. It also found several async workers
+  defaulting to a root-private data directory instead of the production spool.
+  Common IPC gating, the complete reachability inventory, legitimate publisher
+  wiring, and the shared-spool cross-UID negative fixture remain open. Tofu
+  apply/destroy is now capability-gated (14/14 farm tests), Fleet
+  push/rollback/nudge is capability-gated (8/8), and Jobs launch is
+  capability-gated (4/4); their read verbs remain open. The shared seam's PTY,
+  mesh-mount, physical-storage, and virtual-storage hostile/replay tests are
+  individually green across isolated farm runs; mde-files is 162/162 and shell
+  storage is 25/25. The dead
+  `action/apps/uninstall` root package-removal channel had no production
+  publisher and has been deleted rather than grandfathered; the remaining apps
+  responder suite is 18/18 farm-green, including the retired-uninstall
+  no-dispatch regression.
+- Priority: P0
+- Complexity: Epic
+- Problem: The production Bus spool is intentionally cross-UID writable, but
+  several root-daemon consumers still treat possession of an `action/*` topic as
+  authority. A local process can therefore forge administrative requests; the
+  takeover reproduced unauthenticated service-lifecycle and code-edit dispatch,
+  and found the direct Podman lifecycle worker accepting forged run/stop/remove
+  requests including host bind mounts.
+- Required outcome: Every runtime-reachable privileged Bus mutation verifies a
+  versioned, exact-body, short-lived capability and durably consumes its nonce
+  before any side effect, or retains an existing cryptographic authorization
+  protocol proved equivalent. Missing credentials fail closed. Retired mutation
+  consumers are deleted instead of preserved as unauthenticated compatibility
+  paths; read-only queries and harmless refresh nudges remain usable without an
+  arm token.
+- Scope: Inventory all root `mackesd` mutation consumers and their shell/CLI or
+  worker publishers, including `action/*` and older mutable `compute/*` lanes;
+  first close code edit, service lifecycle, direct Podman/libvirt, host
+  power/control, provisioning/migration, onboarding, federation, firewall, and
+  CA or secret-changing paths. Reuse the Workloads HMAC credential, exact-body
+  digest, 30-second expiry, and host-local spent-nonce ledger. Message transport
+  secrecy and per-user RBAC remain out of scope.
+- Relevant files/components: `crates/platform/mde-bus/src/persist.rs`,
+  `packaging/systemd/mackesd.service`, `crates/mesh/mackesd/src/workers/action.rs`,
+  `container.rs`, `vm_lifecycle.rs`, `host_state.rs`, `xcp_provision.rs`,
+  `compute_provision.rs`, `compute_expose.rs`, `compute_migrate.rs`,
+  `onboard_apply.rs`, `federation_enforcer.rs`, `cert_authority.rs`, the
+  production responder registrations in `src/bin/mackesd/spawn.rs`, privileged
+  responders under `src/ipc/` (`tofu`, `datacenter`, `host_ops`, `dc_power`,
+  `apps`, `jobs`, `fleet`, `connect`, `vpn_gw`, and `ddns`), and the corresponding
+  publishers under
+  `crates/desktop/mde-shell-egui/src/`.
+- Acceptance criteria: A checked inventory classifies every production
+  shared-Bus consumer with privileged effects as read-only/nudge, independently
+  authenticated, newly
+  capability-gated, or deleted; unsigned, expired, body-tampered, replayed, and
+  future-schema mutations produce no side effect; an authorized request executes
+  exactly once; no legacy topic bypass reaches the same sink; authorization
+  refusal audit records never copy attacker-controlled code or secret payloads.
+- Verification method: Hostile per-consumer fixtures on the build farm, a shared
+  `0777` Bus-spool integration test that writes as an unprivileged publisher,
+  focused shell-to-daemon wire tests, workspace gates, and a live credentialed
+  mutation plus unsigned negative probe when hardware is available.
+- Origin or merged source IDs: 2026-07-22 Codex takeover review of the production
+  shared-Bus trust boundary; corrective successor to WL-SEC-005's explicitly
+  out-of-scope Bus-wide authentication policy.
+
 ## Build, Installation, And Deployment
+
+### WL-BUILD-004 - Make the mandatory gate cover the governed repository
+
+- Status: Remaining
+- Progress (2026-07-23): the canonical gate now runs one hard policy suite shared
+  with GitHub Actions, exercises planted-failure self-tests, and propagates policy
+  failures. The stale preview job and deleted coverage exclusions were removed.
+  Takeover re-audit rejected the earlier closure, however: it had proved only
+  `cargo metadata`, never the newly broadened 80% denominator. A clean detached
+  `d52258e4` BigBoy run measured the actual all-library denominator at **84.69%
+  lines** after repairing only its scratch lockfile, establishing useful margin.
+  It also reproduced two test-target failures and proved the checked-in/current
+  `--locked` command was not reproducible before the in-flight dependency lock
+  reconciliation. The farm gate now runs workspace clippy and every test lane
+  with `--locked`, and its serial `mackesd` lane enables the same
+  `async-services` superset as GitHub Actions. A fresh BigBoy run of the exact
+  integrated-tree coverage command passed at **84.97% lines** (80% floor), with
+  the serial `mackesd` lane green at 3,703 tests and `mde-term-egui` green at
+  391 tests. Workspace clippy and format checks are green. The earlier full-gate
+  red was farm disk exhaustion during linking, not a test failure; disposable
+  BigBoy slots were cleaned and the affected lanes rerun successfully. A
+  clean-checkout release replay remains the final closure proof.
+- Priority: P1
+- Complexity: Medium
+- Problem: CI previously referenced retired packages and split policy checks
+  across incomplete runners. Its replacement now names current packages, but the
+  new all-library coverage denominator was closed without ever being measured or
+  shown to satisfy the advertised hard 80% floor.
+- Required outcome: One maintained policy suite runs identically in the farm gate
+  and GitHub Actions, all commands are reproducible with the committed lockfile,
+  and a fresh current-workspace `cargo llvm-cov` run establishes and passes the
+  hard 80% line floor on an explicitly documented denominator.
+- Scope: `.github/workflows/ci.yml`, `install-helpers/ci-gate.sh`, lockfile
+  reproducibility, current-package coverage configuration, and honest baseline
+  evidence. This item does not waive the hard coverage policy or hide live
+  packages merely to recover the historical percentage.
+- Relevant files/components: `.github/workflows/ci.yml`,
+  `install-helpers/ci-gate.sh`, `Cargo.lock`, and the build-farm coverage lane.
+- Acceptance criteria: CI references no retired packages; policy self-tests and
+  real-tree lints fail the aggregate gate when planted failures fire; the exact
+  checked-in coverage command runs from a clean checkout with `--locked` and
+  reports at least 80% lines over its documented current-package denominator.
+- Verification method: Farm policy suite plus a clean BigBoy
+  `cargo llvm-cov --workspace --locked --features mackesd/async-services ...
+  --fail-under-lines 80 --summary-only` run matching GitHub Actions, followed by
+  YAML parse, ShellCheck, format, and diff checks.
+- Origin or merged source IDs: 2026-07-22 Codex platform takeover build audit;
+  reopened after the closure evidence was found not to measure the new coverage
+  denominator.
 
 ## Core Architecture
 
@@ -216,12 +442,53 @@ These decisions refine acceptance and sequencing for the active items below.
 > remove the live-seat / OpenStack-removal live-apply blocks; both code-complete +
 > IaC-validated).
 
+### WL-ARCH-007 - Repair Workloads cockpit E2E wire, placement, and authorization
+
+- Status: Remaining
+- Progress (2026-07-22): UI contract slice landed in the takeover tree. Set
+  desired now publishes the worker's `{node,spec}` envelope; provision,
+  configure, plan, destroy, lifecycle, and console requests carry explicit
+  placement; blank placement emits nothing. The request envelope is explicitly
+  schema-v1 and future versions fail closed. Daemon routing now refuses blank
+  placement, armed-token nonces are durably single-use across restart, the global
+  destroy path is retired, and target delete independently checks the typed name
+  before retracting only that workload's desired doc. Farm proofs before the
+  latest version/replay additions: 36/36 focused `iac::` and 95/95 focused cloud
+  tests; an integrated rerun is pending while adjacent files settle. Remaining:
+  a production authorization/minting path and direct libvirt lifecycle drill.
+- Priority: P0
+- Complexity: Epic
+- Problem: The archived WL-ARCH-006 surface is mounted, but its Set desired UI
+  publishes a bare workload spec while the worker expects an envelope; mutation
+  flows omit reliable node placement and authorization, blank placement fans
+  out to every node, and destroy is workspace-wide instead of target-scoped.
+- Required outcome: Every Workloads action has a versioned request contract,
+  explicit single-node placement, production-minted replay-resistant authority,
+  and target-scoped lifecycle semantics from UI through worker and runner.
+- Scope: Workloads shell UI, cloud Bus request/reply contracts, placement,
+  mutation authorization, replay protection, and targeted destroy. The already
+  removed OpenStack backend stays out of scope.
+- Relevant files/components: `crates/desktop/mde-shell-egui/src/iac/`,
+  `crates/mesh/mackesd/src/workers/cloud/`, `infra/tofu/cloud/`.
+- Acceptance criteria: UI-to-worker contract tests cover set, provision,
+  configure, console, and destroy; no blank-placement broadcast occurs; tokens
+  are mintable and single-use; destroying one workload leaves peers intact.
+- Verification method: Cross-crate contract fixtures, hostile/replay tests,
+  focused farm suites, and a direct libvirt-host lifecycle drill when available.
+- Origin or merged source IDs: corrective successor to archived WL-ARCH-006;
+  2026-07-22 Codex platform takeover audit.
+
 ## Runtime Reliability
 
 ### WL-RUN-003 - Lighthouse full/equal join and push-button add/retire
 
 - Status: Blocked
-- Progress (2026-07-20): CODE-COMPLETE per `docs/platform/DRAIN-RECONCILIATION-2026-07-19.md` —
+- Progress (2026-07-22): CODE-COMPLETE per `docs/platform/DRAIN-RECONCILIATION-2026-07-19.md`,
+  plus the locked smallest-DigitalOcean lighthouse profile in
+  `docs/design/digitalocean-lighthouse-small.md`. Both DO cloud-init paths and
+  `onboard spawn-lighthouse` now default to `s-1vcpu-512mb-10gb` and apply
+  bounded service memory, emergency swap, journal caps, and a control-plane-only
+  optional-service set. The media-lighthouse class remains explicitly separate.
   typed `lighthouse_add`/`lighthouse_retire` (`cli/node_admin.rs:164`/`:205`), etcd voter
   membership (`cli/join.rs` `add_self_as_voter_blocking`, no manual etcdctl), CA
   inheritance, quorum-preserving `drain_gate` (`lighthouse_lifecycle.rs`), and the
@@ -328,7 +595,8 @@ These decisions refine acceptance and sequencing for the active items below.
 3. Develop on one integration branch with reviewable commits and internal phase
    gates, but do not release a partial suite, retain a user-facing old/new switch,
    or land dead placeholders on the release branch. The cutover is one immutable
-   image release after full parity and operator signoff.
+   image release after full parity and reproducible farm/live workflow evidence;
+   human review is informative only.
 4. Apply `AI_GOVERNANCE.md` section 7 literally: no `todo!()`,
    `unimplemented!()`, stub match arms, mock data presented as functionality,
    unreachable modules, dead controls, or deferred acceptance rows.
@@ -577,8 +845,10 @@ These decisions refine acceptance and sequencing for the active items below.
   11. Migration fixtures are repeatable and rollback-safe, the old/new parity
       ledger has no open rows, forbidden dependencies and private D-Bus names are
       absent, and all superseded runtime code is removed after cutover.
-  12. The operator completes live visual and workflow signoff with every feature
-      present; no incomplete, disabled, placeholder, or deferred behavior remains.
+  12. Deterministic rendered screenshots and workflow fixtures cover every
+      feature at supported desktop and narrow/tablet sizes; no incomplete,
+      disabled, placeholder, or deferred behavior remains. Human visual review
+      is informative only and is not a release gate.
 - Verification method: Unit and property tests cover event serialization,
   signatures, ordering, deduplication, permissions, message windows, tombstones,
   blob collection, CRDT convergence, three-way merge, file identity, transfer
@@ -592,8 +862,8 @@ These decisions refine acceptance and sequencing for the active items below.
   P2P, SFU failover, SIP/PSTN, DigitalOcean inference with a sealed key, real file
   backfill, RPM/bootc install and OSTree rollback, plus rendered screenshot and
   canvas-pixel inspection on the production DRM seat at desktop and narrow sizes.
-  Final closure requires a reviewed parity ledger and explicit operator visual
-  signoff.
+  Final closure requires the parity ledger and reproducible render/workflow
+  evidence; human visual review is informative only.
 - Origin or merged source IDs: `NOTIFY-CHAT`, `EDITOR-1..12`,
   `EDITOR-LSP-1..3`, `EDITOR-COLLAB-1..3`, `EDTB-1..7`, `FILEMGR-*`,
   `TRANSFERS-*`, `E12-11`, `VOIP-GW-*`, Clipboard and alert-relay workstreams,
@@ -603,6 +873,16 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-012 - Maps live-data overlays (zero-cost external feeds)
 
 - Status: Remaining
+- Progress (2026-07-22): nine of the ten catalog feeds are implemented through
+  typed latest-wins Bus snapshots and the Maps painter: USGS earthquakes, NWS
+  alerts, NWS hourly route forecast, adsb.lol aircraft, GTFS-Realtime transit,
+  Caltrans cameras, IEM NEXRAD radar, NCDOT TIMS state-511 traffic, and NIFC/FIRMS
+  wildfire. The new overlays close their typed schemas, registered worker/spawn
+  census, off-by-default layer toggles, attribution, projected pins, bounded
+  payloads, and paused/fix-loss behavior. Farm evidence is green for traffic
+  worker 6/6, wildfire worker 7/7, worker-role 19/19, and full Maps 136/136;
+  remaining catalog is AirNow AQI. Keyed feeds must idle honestly until
+  operator-sealed free credentials exist.
 - Priority: P2
 - Complexity: Epic
 - Problem: The Maps & Location cockpit's map is a synthetic perspective scene with
@@ -647,60 +927,19 @@ These decisions refine acceptance and sequencing for the active items below.
   (plan help-me-plan-new-hazy-muffin.md; research workflow wf_6731d411-455;
   operator rulings: external-feeds emphasis, vehicle lens, zero-cost only).
 
-### WL-FUNC-013 - Maps & Location world-class + built-for-purpose (offline basemap, geocoding, sparse-data honesty, mode-button)
-
-- Status: Remaining
-- Priority: P1
-- Complexity: Epic
-- Problem: The Maps & Location cockpit reads as FAKE DATA - the simulator fixture
-  (a hard-coded Pittsburgh fix + fabricated turn-by-turn to "patrol staging") renders
-  as real with no "simulated" marker in Car Mode; unfixed-GPS/absent-signal tiles show
-  `0.0000` coords + fabricated accuracy + a `bars(0)==5` full-signal bug; the map is a
-  synthetic procedural scene with no real tiles ("do not look real"); there is no
-  free-text address entry (only preset destinations + a dead geocoder abstraction);
-  and the shell layout-mode button does not visibly switch modes (single-tap only opens
-  a menu, misleading MapsLocation glyph, corner-collision with the maps FABs).
-- Required outcome: The cockpit reads as a real automotive nav head-unit - sparse-but-real
-  MG90 data presented honestly ("Acquiring GPS" / "-", never fabricated zeros); a real
-  OFFLINE raster basemap (MBTiles -> egui texture, per the egui_glow/GLES seat constraint
-  = raster, NEVER wgpu-vector); free-text address entry + an OFFLINE FTS5 gazetteer
-  geocoder; and a labeled single-tap Car<->Desktop mode toggle.
-- Plan: docs/design/maps-worldclass-plan.md (2026-07-22 scope report: root-cause analysis,
-  GLES raster constraint, P0-P3 units, in-tree reusable seams rusqlite/image/carbon_texture).
-- Progress (2026-07-22): ALL CORE UNITS LANDED + DEPLOYED + LIVE-VERIFIED. Advanced-menu
-  progressive-disclosure nav + floating action cluster (`08086639`); P0 sparse-data honesty
-  (`8b91003c` - has_fix gating, bars() fix, idle Drive HUD, un-hideable "SIMULATED" badge,
-  primary source "acquiring" not fake-Pittsburgh); P0 mode-button one-tap Car<->Desktop toggle
-  (`4bc193d7`); **P1 address entry (real TextEdit) + P1 offline FTS5 geocoder + P2 real
-  Web-Mercator MBTiles basemap (`a49818ba`, +1307 LOC basemap.rs/geocode.rs, 83 tests)**.
-  P3 offline DATA build DONE (East-TX: `east-texas.mbtiles` 3396 tiles z8-14 + `gazetteer.sqlite`
-  10,654 FTS5 rows, free OSM on the internet-connected control host). DEPLOYED to seat `.15`
-  (F44 release shell, `drm,live-helper,live-vdi,media-mpv`, v12.1.0, `drm:true`, NRestarts=0);
-  bundle staged at persistent `/var/lib/mde-maps/east-texas/` via an `MDE_MAPS_DIR` drop-in;
-  deployed data proven queryable (basemap 3396 tiles; geocoder returns Athens/Lake Athens).
-  REMAINING = operator visual signoff on the dash (live-seat, per operator 2026-07-22 no longer
-  a gate) + the deferred "Later" real offline routing (Valhalla) as a future enhancement.
-- Relevant files: `crates/desktop/mde-maps-location-egui/` (car_status.rs, view.rs
-  paint_map_scene/show_map, model.rs), `crates/desktop/mde-shell-egui/src/main.rs`
-  (layout-mode control), a new `basemap` module + the seat's `client_data_dir/maps/<region>/`
-  data pack.
-- Dependencies: `state/vehicle/<node>` (Rolling Node MG90) for the live fix; the
-  coordinator's outbound internet to BUILD the offline pack (seats airgapped - build here,
-  bundle to seat); operator "zero cost" rule (2026-07-22) = free OSM only, no paid map/geocode APIs.
-- Coordinates with WL-FUNC-012 (Maps live-data overlays, same surface): the overlays' radar-tile
-  unit shares this epic's P2 raster-tile lane; overlay paint hooks serialize behind this
-  P0/P1 view.rs/model.rs pipeline per the serialize-same-file rule.
-- Verification: farm-green per-crate gates + subset-of-base for the shell tests; live `.15`
-  deploy (shell + data pack) + operator visual signoff (Advanced menu, floating buttons,
-  honest sparse data, real basemap, working address search, working mode toggle).
-- Origin: operator goal "Maps and Location should match world class interfaces, and be
-  built for purpose" + operator directives (Advanced menu; floating buttons; "solve all") 2026-07-22.
-
 ## User Interface And Experience
 
 ### WL-UX-006 - Construct interface (Apple-HIG-principled workstation shell)
 
 - Status: Remaining
+- Progress (2026-07-22): interrupted U10/U11/U23 work was recovered into the main
+  tree: the persistent eight-page Springboard base, slim top status bar, shared
+  Workbench `NavigationBar`, and shared Console/Workloads style tokens. Farm
+  evidence: status bar 8/8, Workbench 16/16, Console 47/47; the repaired
+  integrated shell run passed **1,706/1,706** tests with zero failures. The three
+  salvaged dirty Claude worktrees were removed after zero-unique-commit
+  verification. Remaining acceptance is deterministic render/pixel capture and
+  live VDI behavior; human visual review is informative, not a gate.
 - Priority: P1
 - Complexity: Epic
 - Problem: The workstation chrome is Win10-shaped (48px bottom taskbar + tray
@@ -728,11 +967,11 @@ These decisions refine acceptance and sequencing for the active items below.
 - Dependencies: WL-FUNC-012 shell-side hooks land before the cutover unit
   (same-crate serialization); curtain lock security behavior and the VDI
   full-native-resolution guarantee are sacred (zero logic diffs).
-- Acceptance criteria: screenshot/pixel proof on the `.15` DRM seat -
+- Acceptance criteria: machine-captured screenshot/pixel proof on the `.15` DRM seat -
   springboard pages (all 8), status bar, Control Center, Notification Center,
   Spotlight, switcher with real snapshots, zoom transitions, VDI full-res with
   auto-hidden bar; post-cutover grep gate (zero taskbar identifiers in
-  production code); operator visual signoff.
+  production code). Human visual review is informative only.
 - Verification method: per-unit farm builds + targeted tests; two integration
   slots (`cargo build --workspace` + `cargo test --workspace --no-run` + full
   run + lint-style-leaks/doc-supersession/worklist) after the shared-API units
@@ -745,6 +984,16 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-007 - Car interface (CarPlay-principled vehicle mode)
 
 - Status: Remaining
+- Progress (2026-07-22): retained MG90 telemetry now expires after five seconds;
+  stale/simulated readings re-dash, cannot drive motion policy, and keep their
+  provenance/age honest. Vehicle Fuel/Odometer now share the same live gate.
+  Farm `mde-maps-location-egui` suite passed 97/97. Settings now consumes
+  `glance_clamp` to shorten the moving-car rail without hiding destinations from
+  search/menus, while host-down power prompts consume `deferred_notice` and emit
+  no action until stopped (Lock stays available). The focused Car policy suite
+  passed 8/8 and the moving Settings paint/defer regression passed 1/1 on farm
+  `.130`. Remaining is live MG90 + DRM-seat proof; human review is informative
+  only.
 - Priority: P1
 - Complexity: Epic
 - Problem: Car mode is a SYNC 3-styled 2x3 tile grid whose 7th tile wraps, with
@@ -768,24 +1017,16 @@ These decisions refine acceptance and sequencing for the active items below.
 - Dependencies: `state/vehicle/<node>` MG90 mirror (Rolling Node epic) for the
   live drive proof and the in-motion speed signal; Music surface split from
   Media in the car roster.
-- Acceptance criteria: live proof with the MG90 mirror online - dashboard cards
+- Acceptance criteria: deterministic live-test proof with the MG90 mirror online - dashboard cards
   live, instrument strip fresh on every Car screen, soft limits engage above
   threshold, one-tap toggle; honest sparse data (never fabricated readings);
-  operator signoff.
+  no human signoff gate.
 - Verification method: per-unit farm builds + targeted tests (car_home,
   car_status, keymap); live MG90 drive verification
   (`ssh -p2222 root@172.20.0.25` publishes the mirror).
 - Origin or merged source IDs: operator 50-Q survey 2026-07-22 (ADR-0006);
   supersedes auto-mode-sync3.md as Car design authority (palette tokens
   survive); stale-telemetry fix hoisted per survey Q33.
-- Honesty follow-ups (noted by the U27 strip unit, 2026-07-22): the speedometer
-  and SPEED tiles are now live-gated (dash unless the mirror's confidence label
-  is the live vehicle-gateway one), but the other seeded telemetry tiles (RPM,
-  coolant, battery, ...) still present the simulated Interceptor profile
-  ungated (the TELEMETRY tile does label it "simulated CAN/OBD profile"); and a
-  live mirror going quiet is surfaced by TELEM AGE but does not re-dash the
-  speed. If Q33 honesty is to be absolute per-tile, that is a follow-up unit
-  touching the cockpit Vehicle-tab expectations too.
 
 ## Performance
 

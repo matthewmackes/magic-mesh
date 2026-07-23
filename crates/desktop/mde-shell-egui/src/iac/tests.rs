@@ -5,6 +5,8 @@ use mackes_mesh_types::cloud::{
 };
 use mde_egui::egui::{pos2, vec2, Rect};
 
+const TEST_ARM_KEY: &[u8] = b"0123456789abcdef0123456789abcdef";
+
 /// One backend-tool health row in a fixture mirror.
 fn health(tool: &str, state: HealthState) -> ServiceHealth {
     ServiceHealth {
@@ -89,11 +91,46 @@ fn run_panel(state: &mut WorkloadsState) -> bool {
     !prims.is_empty()
 }
 
+/// A Workloads state backed by an isolated fixture Bus, with one explicit
+/// placement selected.
+fn placed_bus_state() -> (tempfile::TempDir, WorkloadsState) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut state = WorkloadsState::default();
+    state.bus_root = Some(tmp.path().join("bus"));
+    state.selected_node = Some("eagle".to_string());
+    state.arm_key_override = Some(TEST_ARM_KEY.to_vec());
+    (tmp, state)
+}
+
+/// Decode the only UI request emitted for `verb` from a fixture Bus.
+fn emitted_request(state: &WorkloadsState, verb: &str) -> serde_json::Value {
+    let persist =
+        Persist::open(state.bus_root.clone().expect("fixture bus root")).expect("open fixture bus");
+    let topic = format!("{}{verb}", mackes_mesh_types::cloud::CLOUD_ACTION_PREFIX);
+    let messages = persist
+        .list_since(&topic, None)
+        .expect("read request topic");
+    assert_eq!(messages.len(), 1, "expected one request on {topic}");
+    serde_json::from_str(
+        messages[0]
+            .body
+            .as_deref()
+            .expect("the cloud request carries a JSON body"),
+    )
+    .expect("request body is JSON")
+}
+
+fn confirm_pending(state: &mut WorkloadsState) {
+    let arming = state.arming.take().expect("typed confirmation is pending");
+    let echo = arming.action.echo();
+    state.perform(arming.action, &echo);
+}
+
 #[test]
 fn the_surface_is_reachable_in_the_dock() {
     // §7 reachability: the surface stays in Surface::ALL and wears the server /
     // infrastructure brand glyph (the dock mount is unchanged by the reshape).
-    use crate::dock::Surface;
+    use crate::surfaces::Surface;
     assert!(Surface::ALL.contains(&Surface::InfraCode));
     assert_eq!(
         Surface::InfraCode.icon_id(),
@@ -212,9 +249,11 @@ fn provision_apply_is_typed_confirm_gated_and_emits_provision_only_after_confirm
         "empty does not arm"
     );
 
-    // Past the gate, perform reaches the publish seam (no Bus in the test → an
-    // honest error note naming the provision verb; the request was attempted).
-    state.perform(ArmAction::Provision);
+    // Past the gate, perform reaches the publish seam once placement is explicit
+    // (no Bus in the test → an honest error note naming the provision verb).
+    state.selected_node = Some("eagle".to_string());
+    state.arm_key_override = Some(TEST_ARM_KEY.to_vec());
+    state.perform(ArmAction::Provision, "apply");
     assert!(
         state
             .note
@@ -226,24 +265,152 @@ fn provision_apply_is_typed_confirm_gated_and_emits_provision_only_after_confirm
 }
 
 #[test]
-fn destroy_and_lifecycle_reboot_delete_are_typed_confirm_gated() {
-    let mut state = state_on(DeliveryView::DesktopVm, Panel::Roster);
-    // Destroy opens the confirm on the DESTROY echo, publishes nothing yet.
-    state.arm_destroy();
-    let arming = state.arming.take().expect("destroy opens the confirm");
-    assert_eq!(arming.action, ArmAction::Destroy);
-    assert_eq!(arming.action.verb(), "destroy");
-    assert!(armed("destroy", &arming.action.echo()));
-    assert!(state.mutation_pending.is_none());
+fn set_desired_emits_the_worker_envelope_instead_of_a_bare_spec() {
+    let (_tmp, mut state) = placed_bus_state();
+    let spec = WorkloadSpec {
+        name: "seat-1".to_string(),
+        delivery_type: DeliveryType::DesktopVm,
+        node: "eagle".to_string(),
+        vcpu: 4,
+        memory_mb: 8192,
+        disk_gb: 60,
+        image: Some("construct-desktop".to_string()),
+        network_isolation: true,
+        raw_hcl: None,
+    };
 
+    state.set_desired(&spec);
+    assert!(
+        state.mutation_pending.is_none(),
+        "unconfirmed desired write is not published"
+    );
+    confirm_pending(&mut state);
+
+    let body = emitted_request(&state, mackes_mesh_types::cloud::VERB_SET_DESIRED);
+    assert_eq!(
+        body["schema_version"],
+        mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION
+    );
+    assert_eq!(body["node"], "eagle");
+    assert_eq!(body["spec"], serde_json::to_value(&spec).unwrap());
+    let token = CloudArmedToken::parse(body["armed_token"].as_str().unwrap()).unwrap();
+    assert_eq!(token.target, "desired:seat-1");
+    assert!(body.get("name").is_none(), "spec leaked to request root");
+}
+
+#[test]
+fn ui_mutation_requests_carry_their_explicit_placement_node() {
+    let (_tmp, mut state) = placed_bus_state();
+
+    state.perform(ArmAction::Provision, "apply");
+    let provision = emitted_request(&state, "provision");
+    assert_eq!(provision["schema_version"], 1);
+    assert_eq!(provision["node"], "eagle");
+    let provision_token = CloudArmedToken::parse(provision["armed_token"].as_str().unwrap())
+        .expect("root shell minted provision token");
+    assert_eq!(provision_token.verb, "provision");
+    assert_eq!(provision_token.node, "eagle");
+    assert_eq!(provision_token.target, CLOUD_ARM_NODE_SCOPE);
+    assert_eq!(
+        provision_token.request_sha256,
+        mackes_mesh_types::cloud::cloud_request_digest(&provision.to_string()).unwrap()
+    );
+
+    state.perform(ArmAction::Configure, "apply");
+    let configure = emitted_request(&state, "configure");
+    assert_eq!(configure["schema_version"], 1);
+    assert_eq!(configure["node"], "eagle");
+    assert_eq!(configure["playbook"], "site.yml");
+    assert_eq!(configure["group"], "cloud_vm");
+    assert!(CloudArmedToken::parse(configure["armed_token"].as_str().unwrap()).is_some());
+
+    state.perform(
+        ArmAction::Lifecycle {
+            verb: "instance-start",
+            node: "otter".to_string(),
+            instance_id: "seat-1".to_string(),
+            name: "seat-1".to_string(),
+        },
+        "seat-1",
+    );
+    let start = emitted_request(&state, "instance-start");
+    assert_eq!(start["node"], "otter");
+    assert_eq!(start["instance"], "seat-1");
+    let start_token = CloudArmedToken::parse(start["armed_token"].as_str().unwrap()).unwrap();
+    assert_eq!(start_token.target, "seat-1");
+
+    state.issue_console_attach("otter", "seat-1", "seat-1");
+    assert!(
+        state.mutation_pending.is_some(),
+        "prior start remains pending"
+    );
+    // Resolve the fixture's single-pending limitation before confirming console.
+    state.mutation_pending = None;
+    confirm_pending(&mut state);
+    let console = emitted_request(&state, "console-attach");
+    assert_eq!(console["schema_version"], 1);
+    assert_eq!(console["node"], "otter");
+    assert_eq!(console["instance"], "seat-1");
+    let console_token = CloudArmedToken::parse(console["armed_token"].as_str().unwrap()).unwrap();
+    assert_eq!(console_token.target, "seat-1");
+}
+
+#[test]
+fn selected_node_forms_do_not_emit_node_agnostic_requests() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut state = WorkloadsState::default();
+    state.bus_root = Some(tmp.path().join("bus"));
+
+    state.plan_provision();
+
+    assert!(state.mutation_pending.is_none());
+    assert!(state
+        .note
+        .as_deref()
+        .is_some_and(|note| note.contains("Select a placement node")));
+}
+
+#[test]
+fn lifecycle_reboot_and_delete_are_typed_confirm_gated() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut state = state_on(DeliveryView::DesktopVm, Panel::Roster);
+    state.bus_root = Some(tmp.path().join("bus"));
     // A destructive lifecycle op arms on the workload name (the roster row seam).
-    state.arm_lifecycle("instance-delete", "seat-1", "seat-1");
+    state.arm_lifecycle("instance-delete", "eagle", "seat-1", "seat-1");
     let arming = state.arming.as_ref().expect("delete opens the confirm");
     assert_eq!(arming.action.verb(), "instance-delete");
     assert_eq!(arming.action.echo(), "seat-1");
     assert!(state.mutation_pending.is_none() && state.note.is_none());
     // The armed confirm panel still tessellates.
     assert!(run_panel(&mut state), "the arming confirm drew nothing");
+
+    state.arm_key_override = Some(TEST_ARM_KEY.to_vec());
+    state.perform(
+        ArmAction::Lifecycle {
+            verb: "instance-delete",
+            node: "eagle".to_string(),
+            instance_id: "seat-1".to_string(),
+            name: "seat-1".to_string(),
+        },
+        "seat-1",
+    );
+    let delete = emitted_request(&state, "instance-delete");
+    assert_eq!(delete["schema_version"], 1);
+    assert_eq!(delete["node"], "eagle");
+    assert_eq!(delete["instance"], "seat-1");
+    assert_eq!(delete["typed_name"], "seat-1");
+    assert!(CloudArmedToken::parse(delete["armed_token"].as_str().unwrap()).is_some());
+}
+
+#[test]
+fn perform_rechecks_confirmation_and_mints_nothing_on_mismatch() {
+    let (_tmp, mut state) = placed_bus_state();
+    state.perform(ArmAction::Provision, "appl");
+    assert!(state.mutation_pending.is_none());
+    assert!(state
+        .note
+        .as_deref()
+        .is_some_and(|note| note.contains("did not match")));
 }
 
 #[test]
@@ -350,9 +517,15 @@ fn console_attach_decodes_the_endpoint_and_renders_it_honestly() {
     let bus_root = tmp.path().join("bus");
     let mut state = WorkloadsState::default();
     state.bus_root = Some(bus_root.clone());
+    state.arm_key_override = Some(TEST_ARM_KEY.to_vec());
 
     // Dispatch console-attach the way the roster's Console button does.
-    state.issue_console_attach("seat-1", "seat-1");
+    state.issue_console_attach("eagle", "seat-1", "seat-1");
+    assert!(
+        state.mutation_pending.is_none(),
+        "unconfirmed console request is not published"
+    );
+    confirm_pending(&mut state);
     let ulid = state
         .mutation_pending
         .as_ref()

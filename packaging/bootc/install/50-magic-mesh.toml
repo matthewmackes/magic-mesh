@@ -1,4 +1,4 @@
-# Drive geometry for a Quasar Workstation = a KVM/libvirt VM host + VDI node
+# Drive geometry for a Construct Workstation = a KVM/libvirt VM host + VDI node
 # (operator 2026-07-21: "a drive geometry suited for these use cases").
 #
 # ── Why a single whole-disk XFS root (and NOT a fragmented /var) ──────────────

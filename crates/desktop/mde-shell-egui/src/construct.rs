@@ -96,8 +96,7 @@ pub struct EdgeSwipe {
 /// `Super+Tab` chord) so the dispatcher stays pure and headless-testable.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChromeInput {
-    /// A clean Super tap this frame (`HotkeyRouter::take_dock_toggle`, the
-    /// VDOCK-1 press+release-with-no-chord latch).
+    /// A clean Super tap this frame (`HotkeyRouter::take_super_tap`).
     pub super_tap: bool,
     /// The `Super+Tab` chord fired this frame (the fixed table's
     /// `SessionSwitch` chord — §2.3 makes it the Switcher's keyboard row).
@@ -225,9 +224,8 @@ pub fn intents_from_input(
 }
 
 /// The touch column of the contract table: which intent an edge swipe means.
-/// `Left`/`Right` carry no §2.3 row — `Left` keeps its legacy dock-reveal leg
-/// inline at the drain site until the U29 cutover retires it; `Right` stays
-/// unbound. Every (edge × hold × x) profile maps to AT MOST ONE intent — the
+/// `Left`/`Right` carry no §2.3 row and remain unbound. Every
+/// (edge × hold × x) profile maps to AT MOST ONE intent — the
 /// exclusivity the dispatcher tests pin table-driven.
 fn edge_intent(edge: Edge, x_frac: Option<f32>, hold: bool) -> Option<ChromeIntent> {
     match edge {
@@ -434,8 +432,7 @@ mod tests {
 
     #[test]
     fn left_and_right_edges_carry_no_contract_intent() {
-        // Left keeps its legacy dock-reveal leg inline at the drain site
-        // until U29; Right is unbound. Neither reaches the intent queue.
+        // Side edges are unbound. Neither reaches the intent queue.
         let mut guard = EdgeGuard::default();
         let intents = intents_from_input(
             &ChromeInput {

@@ -15,6 +15,10 @@
 //! carries a `host` — the worker acts only on requests addressed to *its* node id
 //! ([`ContainerAction::targets`]) and advances past the rest, so one `run` request
 //! doesn't fan out to every node.
+//! Every request carries wire schema v1. Mutations additionally require the
+//! shared short-lived, exact-body-bound HMAC capability and atomically consume
+//! its nonce in the host-local durable replay ledger before Podman is reached.
+//! `Refresh` remains read-only and therefore needs no capability.
 //!
 //! ## Shape (mirrors `vm_lifecycle` + `kvm_health`)
 //!
@@ -71,6 +75,9 @@ use thiserror::Error;
 
 use crate::workers::proc::{output_with_timeout, status_with_timeout, DEFAULT_CMD_TIMEOUT};
 
+use super::cloud::{
+    claim_nonce, verify_token, HmacTokenSigner, NullSigner, TokenSigner, DEFAULT_AUTH_ROOT,
+};
 use super::{ShutdownToken, Worker};
 
 /// Bus topic the worker drains for lifecycle requests (flat; per-node targeting
@@ -91,6 +98,12 @@ pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// subscriber still finds a recent roster. Keeps the `podman ps` snapshot off the
 /// hot path (queried on-action or every 30 s, never every 2 s tick).
 pub const PUBLISH_HEARTBEAT: Duration = Duration::from_secs(30);
+
+/// Current container lifecycle request schema.
+pub const ACTION_SCHEMA_VERSION: u64 = 1;
+
+/// Maximum remaining lifetime accepted for a container mutation capability.
+const MAX_AUTH_TTL_MS: i64 = 30_000;
 
 // ───────────────────────────── data model ─────────────────────────────
 
@@ -227,6 +240,18 @@ impl ContainerAction {
     #[must_use]
     pub fn targets(&self, node_id: &str) -> bool {
         !self.host().is_empty() && self.host() == node_id
+    }
+
+    /// Exact capability verb and target for every Podman mutation. `Refresh`
+    /// is read-only and intentionally has no capability context.
+    #[must_use]
+    pub fn authorization_context(&self) -> Option<(&'static str, &str)> {
+        match self {
+            Self::Run { spec, .. } => Some(("container-run", &spec.name)),
+            Self::Stop { name, .. } => Some(("container-stop", name)),
+            Self::Remove { name, .. } => Some(("container-rm", name)),
+            Self::Refresh { .. } => None,
+        }
     }
 }
 
@@ -736,9 +761,25 @@ fn publish_containers(bus_root: Option<&Path>, report: &ContainerReport) {
     }
 }
 
+#[derive(serde::Deserialize)]
+struct AuthorizationEnvelope {
+    #[serde(default)]
+    schema_version: Option<u64>,
+    #[serde(default)]
+    armed_token: Option<String>,
+}
+
+struct QueuedAction {
+    action: ContainerAction,
+    raw: String,
+    schema_version: Option<u64>,
+    armed_token: Option<String>,
+}
+
 /// Read new [`ACTION_TOPIC`] messages since `cursor`, advancing it. A short sync
-/// open-read-drop (never crosses an `.await`), mirroring `vm_lifecycle`.
-fn read_new_actions(bus_root: &Path, cursor: &mut Option<String>) -> Vec<ContainerAction> {
+/// open-read-drop (never crosses an `.await`), mirroring `vm_lifecycle`. The
+/// exact raw body is retained because the capability binds every field.
+fn read_new_actions(bus_root: &Path, cursor: &mut Option<String>) -> Vec<QueuedAction> {
     let Ok(persist) = Persist::open(bus_root.to_path_buf()) else {
         return vec![];
     };
@@ -749,11 +790,24 @@ fn read_new_actions(bus_root: &Path, cursor: &mut Option<String>) -> Vec<Contain
     for msg in msgs {
         *cursor = Some(msg.ulid.clone());
         let body = msg.body.as_deref().unwrap_or("");
-        match parse_action(body) {
-            Ok(a) => out.push(a),
-            Err(e) => {
+        match (
+            parse_action(body),
+            serde_json::from_str::<AuthorizationEnvelope>(body),
+        ) {
+            (Ok(action), Ok(envelope)) => out.push(QueuedAction {
+                action,
+                raw: body.to_string(),
+                schema_version: envelope.schema_version,
+                armed_token: envelope.armed_token,
+            }),
+            (Err(e), _) => {
                 tracing::warn!(ulid = %msg.ulid, error = %e, "container: bad container action")
             }
+            (_, Err(e)) => tracing::warn!(
+                ulid = %msg.ulid,
+                error = %e,
+                "container: bad authorization envelope"
+            ),
         }
     }
     out
@@ -787,6 +841,11 @@ pub struct ContainerWorker {
     /// The injectable podman seam (production: [`PodmanCli`]). `Arc` so each action
     /// runs on a `spawn_blocking` thread without borrowing `self`.
     backend: Arc<dyn PodmanBackend + Send + Sync>,
+    /// Shared verifier authority. Missing production credential means every
+    /// Podman mutation fails closed.
+    signer: Arc<dyn TokenSigner>,
+    /// Shared host-local nonce ledger used by all privileged mutation lanes.
+    auth_root: PathBuf,
     /// Action-drain cadence.
     poll: Duration,
     /// Roster-publish heartbeat.
@@ -801,9 +860,22 @@ impl ContainerWorker {
     /// (the action target + event stamp).
     #[must_use]
     pub fn new(host: String) -> Self {
+        let signer: Arc<dyn TokenSigner> = match HmacTokenSigner::from_systemd_credential() {
+            Ok(signer) => Arc::new(signer),
+            Err(error) => {
+                tracing::error!(
+                    target: "mackesd::container",
+                    %error,
+                    "direct-Podman authorization unavailable; mutations are disabled"
+                );
+                Arc::new(NullSigner)
+            }
+        };
         Self {
             host,
             backend: Arc::new(PodmanCli::new()),
+            signer,
+            auth_root: PathBuf::from(DEFAULT_AUTH_ROOT),
             poll: DEFAULT_POLL_INTERVAL,
             heartbeat: PUBLISH_HEARTBEAT,
             bus_root_override: None,
@@ -831,6 +903,15 @@ impl ContainerWorker {
         self
     }
 
+    /// Inject the shared verifier and durable ledger root (tests).
+    #[cfg(test)]
+    #[must_use]
+    fn with_authorization(mut self, signer: Arc<dyn TokenSigner>, root: PathBuf) -> Self {
+        self.signer = signer;
+        self.auth_root = root;
+        self
+    }
+
     fn bus_root(&self) -> Option<PathBuf> {
         self.bus_root_override.clone().or_else(default_bus_root)
     }
@@ -847,21 +928,81 @@ impl ContainerWorker {
             .or_else(crate::bus_publish::default_bus_root)
     }
 
+    /// Verify schema, exact-body HMAC authority, the 30-second TTL ceiling, and
+    /// durably consume the capability nonce before a queued action can proceed.
+    fn authorize(&self, queued: &QueuedAction) -> Result<(), String> {
+        if queued.schema_version != Some(ACTION_SCHEMA_VERSION) {
+            return Err(format!(
+                "container action requires schema_version {ACTION_SCHEMA_VERSION}"
+            ));
+        }
+        let Some((verb, target)) = queued.action.authorization_context() else {
+            return Ok(());
+        };
+        for (label, value) in [
+            ("verb", verb),
+            ("host", queued.action.host()),
+            ("target", target),
+        ] {
+            if value.trim().is_empty() || value.len() > 255 || value.contains('|') {
+                return Err(format!("container action {label} is not capability-safe"));
+            }
+        }
+        let now = i64::try_from(now_ms()).unwrap_or(i64::MAX);
+        let verdict = verify_token(
+            queued.armed_token.as_deref(),
+            verb,
+            queued.action.host(),
+            target,
+            &queued.raw,
+            now,
+            self.signer.as_ref(),
+        );
+        if !verdict.is_valid() {
+            return Err(verdict.reason().to_string());
+        }
+        let Some(token) = queued
+            .armed_token
+            .as_deref()
+            .and_then(mackes_mesh_types::cloud::CloudArmedToken::parse)
+        else {
+            return Err("armed token is malformed".to_string());
+        };
+        if token.expires_at_ms > now.saturating_add(MAX_AUTH_TTL_MS) {
+            return Err("armed token exceeds the 30-second lifetime".to_string());
+        }
+        match claim_nonce(&self.auth_root, &token.nonce, token.expires_at_ms, now) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err("armed token was already used".to_string()),
+            Err(error) => Err(format!("armed-token replay store is unavailable: {error}")),
+        }
+    }
+
     /// Drain + apply new actions addressed to this node. Returns `true` when any
     /// action ran (so the caller force-publishes the fresh roster).
     async fn drain_and_apply(&self, bus_root: &Path, cursor: &mut Option<String>) -> bool {
         let actions = read_new_actions(bus_root, cursor);
         let mut acted = false;
-        for action in actions {
-            if !action.targets(&self.host) {
+        for queued in actions {
+            if !queued.action.targets(&self.host) {
+                continue;
+            }
+            if let Err(error) = self.authorize(&queued) {
+                tracing::warn!(
+                    target: "mackesd::alert",
+                    host = %queued.action.host(),
+                    %error,
+                    "container: refused unauthorized direct-Podman request"
+                );
                 continue;
             }
             // Refresh is a pure publish nudge — no backend work.
-            if matches!(action, ContainerAction::Refresh { .. }) {
+            if matches!(&queued.action, ContainerAction::Refresh { .. }) {
                 acted = true;
                 continue;
             }
             let backend = Arc::clone(&self.backend);
+            let action = queued.action;
             match tokio::task::spawn_blocking(move || apply_action(&*backend, &action)).await {
                 Ok(Ok(())) => acted = true,
                 Ok(Err(e)) => {
@@ -1450,6 +1591,182 @@ mod tests {
         assert_eq!(CONTAINERS_TOPIC, "event/podman/containers");
         assert!(ACTION_TOPIC.starts_with("action/"));
         assert!(CONTAINERS_TOPIC.starts_with("event/"));
+    }
+
+    fn armed_container_body(
+        unsigned: &str,
+        nonce: &str,
+        verb: &str,
+        host: &str,
+        target: &str,
+        ttl_ms: i64,
+        signer: &HmacTokenSigner,
+    ) -> String {
+        let token = mackes_mesh_types::cloud::CloudArmedToken::mint(
+            signer,
+            nonce,
+            i64::try_from(now_ms()).unwrap_or(i64::MAX) + ttl_ms,
+            verb,
+            host,
+            target,
+            &mackes_mesh_types::cloud::cloud_request_digest(unsigned).unwrap(),
+        )
+        .encode();
+        let mut body: serde_json::Value = serde_json::from_str(unsigned).unwrap();
+        body["armed_token"] = serde_json::Value::String(token);
+        body.to_string()
+    }
+
+    fn write_action(root: &Path, body: &str) {
+        Persist::open(root.to_path_buf())
+            .unwrap()
+            .write(
+                ACTION_TOPIC,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(body),
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn unsigned_container_run_with_host_mount_reaches_no_backend_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakePodman::new());
+        let signer = Arc::new(HmacTokenSigner::new(b"container-gate-test-key".to_vec()));
+        let worker = ContainerWorker::new("node-a".to_string())
+            .with_backend(fake.clone())
+            .with_bus_root(dir.path().to_path_buf())
+            .with_authorization(signer, dir.path().join("auth"));
+        write_action(
+            dir.path(),
+            r#"{"schema_version":1,"op":"run","host":"node-a","spec":{"name":"host-reader","image":"busybox","volumes":[{"host_path":"/","container_path":"/host"}]}}"#,
+        );
+
+        let mut cursor = None;
+        assert!(!worker.drain_and_apply(dir.path(), &mut cursor).await);
+        assert!(fake.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn signed_legacy_schema_container_action_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakePodman::new());
+        let signer = Arc::new(HmacTokenSigner::new(b"container-gate-test-key".to_vec()));
+        let worker = ContainerWorker::new("node-a".to_string())
+            .with_backend(fake.clone())
+            .with_bus_root(dir.path().to_path_buf())
+            .with_authorization(signer.clone(), dir.path().join("auth"));
+        let unsigned = r#"{"op":"run","host":"node-a","spec":{"name":"web1","image":"nginx"}}"#;
+        let armed = armed_container_body(
+            unsigned,
+            "container-legacy-schema-nonce",
+            "container-run",
+            "node-a",
+            "web1",
+            MAX_AUTH_TTL_MS,
+            signer.as_ref(),
+        );
+        write_action(dir.path(), &armed);
+
+        let mut cursor = None;
+        assert!(!worker.drain_and_apply(dir.path(), &mut cursor).await);
+        assert!(fake.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn container_token_cannot_authorize_body_tampering() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakePodman::with_container("web1", ContainerState::Running));
+        let signer = Arc::new(HmacTokenSigner::new(b"container-gate-test-key".to_vec()));
+        let worker = ContainerWorker::new("node-a".to_string())
+            .with_backend(fake.clone())
+            .with_bus_root(dir.path().to_path_buf())
+            .with_authorization(signer.clone(), dir.path().join("auth"));
+        let unsigned =
+            r#"{"schema_version":1,"op":"stop","host":"node-a","name":"web1","force":false}"#;
+        let armed = armed_container_body(
+            unsigned,
+            "container-body-tamper-nonce",
+            "container-stop",
+            "node-a",
+            "web1",
+            MAX_AUTH_TTL_MS,
+            signer.as_ref(),
+        );
+        let mut altered: serde_json::Value = serde_json::from_str(&armed).unwrap();
+        altered["force"] = serde_json::Value::Bool(true);
+        write_action(dir.path(), &altered.to_string());
+
+        let mut cursor = None;
+        assert!(!worker.drain_and_apply(dir.path(), &mut cursor).await);
+        assert!(fake.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn container_nonce_replay_is_refused_across_worker_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth_root = dir.path().join("auth");
+        let signer = Arc::new(HmacTokenSigner::new(b"container-gate-test-key".to_vec()));
+        let unsigned = r#"{"schema_version":1,"op":"run","host":"node-a","spec":{"name":"web1","image":"nginx"}}"#;
+        let armed = armed_container_body(
+            unsigned,
+            "container-restart-replay-nonce",
+            "container-run",
+            "node-a",
+            "web1",
+            MAX_AUTH_TTL_MS,
+            signer.as_ref(),
+        );
+        write_action(dir.path(), &armed);
+
+        let first = Arc::new(FakePodman::new());
+        let worker = ContainerWorker::new("node-a".to_string())
+            .with_backend(first.clone())
+            .with_bus_root(dir.path().to_path_buf())
+            .with_authorization(signer.clone(), auth_root.clone());
+        let mut cursor = None;
+        assert!(worker.drain_and_apply(dir.path(), &mut cursor).await);
+        assert_eq!(first.calls(), vec!["run:web1".to_string()]);
+
+        let after_restart = Arc::new(FakePodman::new());
+        let restarted = ContainerWorker::new("node-a".to_string())
+            .with_backend(after_restart.clone())
+            .with_bus_root(dir.path().to_path_buf())
+            .with_authorization(signer, auth_root);
+        let mut replay_cursor = None;
+        assert!(
+            !restarted
+                .drain_and_apply(dir.path(), &mut replay_cursor)
+                .await
+        );
+        assert!(after_restart.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn container_capability_lifetime_is_capped_at_thirty_seconds() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakePodman::new());
+        let signer = Arc::new(HmacTokenSigner::new(b"container-gate-test-key".to_vec()));
+        let worker = ContainerWorker::new("node-a".to_string())
+            .with_backend(fake.clone())
+            .with_bus_root(dir.path().to_path_buf())
+            .with_authorization(signer.clone(), dir.path().join("auth"));
+        let unsigned = r#"{"schema_version":1,"op":"run","host":"node-a","spec":{"name":"web1","image":"nginx"}}"#;
+        let armed = armed_container_body(
+            unsigned,
+            "container-overlong-token-nonce",
+            "container-run",
+            "node-a",
+            "web1",
+            MAX_AUTH_TTL_MS + 30_000,
+            signer.as_ref(),
+        );
+        write_action(dir.path(), &armed);
+
+        let mut cursor = None;
+        assert!(!worker.drain_and_apply(dir.path(), &mut cursor).await);
+        assert!(fake.calls().is_empty());
     }
 
     #[test]

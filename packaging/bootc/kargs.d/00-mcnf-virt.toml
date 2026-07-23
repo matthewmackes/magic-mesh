@@ -1,5 +1,5 @@
 # BOOTC-COMPLETENESS (2026-07-21, operator: "a drive geometry suited for these
-# use cases") — kernel args that make a Quasar Workstation a first-class KVM/libvirt
+# use cases") — kernel args that make a Construct Workstation a first-class KVM/libvirt
 # VM host + VDI node. bootc bakes these into the image via kargs.d; the installed
 # system (and the anaconda ISO install) picks them up. All are inert on hardware
 # that lacks the feature, so ONE image serves every node (the lock-10 doctrine).

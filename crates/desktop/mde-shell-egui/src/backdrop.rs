@@ -10,7 +10,7 @@
 //! NAVBAR-W10-3 (`docs/design/workbench-navbar.md` lock W12) rides this same layer:
 //! a Windows-10-activation-style **ghost watermark** — the product mark, the brand
 //! version line, and the node identity — right-aligned in the field's bottom-right
-//! corner, a margin above where the taskbar mounts. Faded [`Style::TEXT_DIM`] ink
+//! corner, inset by the shared large spacing token. Faded [`Style::TEXT_DIM`] ink
 //! with no backing, so it reads like the Win10 "Activate Windows" text: visible,
 //! never competing. It paints wherever the backdrop paints; the role is honestly
 //! omitted when no `role.toml` is pinned (§7).
@@ -45,7 +45,7 @@ use serde::{Deserialize, Serialize};
 use mackes_mesh_types::peers::default_workgroup_root;
 
 use crate::chooser::decode_png_rgba;
-use crate::dock::Surface;
+use crate::surfaces::Surface;
 
 /// The installed wallpaper directory — QBRAND drops the Construct wallpapers
 /// here in the RPM. The selected one is loaded from disk at runtime.
@@ -253,7 +253,7 @@ fn show_with_status_anchor(
     }
 
     // NAVBAR-W10-3 (lock W12) — the brand watermark: three ghost lines in the
-    // bottom-right, clear of the taskbar. Painted over the scrim so its ghost
+    // bottom-right, clear of the canvas edge. Painted over the scrim so its ghost
     // weight holds on empty and covered displays alike. NAVBAR-W10-6 (lock W12b):
     // it's a live About link — `ui` carries the hover/click interaction.
     paint_watermark(ui, &painter, free, ui.ctx().screen_rect());
@@ -348,7 +348,7 @@ fn paint_status(
 
 /// NAVBAR-W10-3 (lock W12) — paint the brand watermark: the Win10-activation-style
 /// ghost block, three right-aligned lines stacked in the field's bottom-right
-/// corner, a margin above where the taskbar mounts. The product mark sits slightly
+/// corner, inset by the shared large spacing token. The product mark sits slightly
 /// larger over the version + node lines; all three in faded [`Style::TEXT_DIM`]
 /// ink with no backing, so the mark reads over the artwork without competing.
 ///
@@ -379,13 +379,10 @@ fn paint_watermark(ui: &egui::Ui, painter: &egui::Painter, free: Rect, screen: R
         ),
     ];
 
-    // The taskbar mounts at the screen's bottom edge, so in the mounted shell the
-    // backdrop's own rect already ends at the bar's top (the bottom panel is
-    // reserved first); on a bar-less display (a headless frame) the screen-based
-    // bound still keeps the watermark clear of where the bar sits. `min` takes
-    // whichever bound is higher on screen — the mark is always above the bar.
+    // Springboard owns the entire central canvas. Keep the watermark inside the
+    // free paint rect while allowing it to use the native bottom edge.
     let right = free.right() - Style::SP_L;
-    let mut bottom = free.bottom().min(screen.bottom() - crate::dock::TASKBAR_H) - Style::SP_L;
+    let mut bottom = free.bottom().min(screen.bottom()) - Style::SP_L;
 
     // Place each line bottom-up (node at the anchor, version above it, product on
     // top), recording its paint position — the layout is byte-for-byte the W10-3
@@ -1126,7 +1123,7 @@ mod tests {
         // A headless 960×640 frame with no status block: the only text on the
         // backdrop is the watermark itself. All three live lines must reach the
         // paint list, anchored in the bottom-right quadrant and wholly above where
-        // the taskbar mounts — and the frame must still tessellate non-empty.
+        // the canvas ends — and the frame must still tessellate non-empty.
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let input = egui::RawInput {
@@ -1146,10 +1143,7 @@ mod tests {
                     pos.x > 480.0 && pos.y > 320.0,
                     "line {line:?} must anchor bottom-right, painted at {pos:?}"
                 );
-                assert!(
-                    pos.y < 640.0 - crate::dock::TASKBAR_H,
-                    "line {line:?} must sit above the taskbar, painted at {pos:?}"
-                );
+                assert!(pos.y < 640.0, "line {line:?} escaped the canvas at {pos:?}");
             }
         }
 

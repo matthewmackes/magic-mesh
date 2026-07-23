@@ -28,7 +28,7 @@ pub(super) fn view(ui: &mut egui::Ui, state: &mut WorkloadsState) {
         .cloned()
         .collect();
     if rows.is_empty() {
-        crate::session::empty_state(
+        crate::empty_state::show(
             ui,
             "No service VMs yet",
             "A service VM appears here once a placement node reports a service_vm workload in its \
@@ -55,16 +55,16 @@ fn service_card(ui: &mut egui::Ui, state: &mut WorkloadsState, row: &WorkloadRow
         ui.add_space(Style::SP_XS);
         ui.horizontal(|ui| {
             if row_button(ui, "Start", false).clicked() {
-                state.issue_lifecycle_direct("instance-start", &row.name, &row.name);
+                state.issue_lifecycle_direct("instance-start", &row.node, &row.name, &row.name);
             }
             if row_button(ui, "Stop", false).clicked() {
-                state.issue_lifecycle_direct("instance-stop", &row.name, &row.name);
+                state.issue_lifecycle_direct("instance-stop", &row.node, &row.name, &row.name);
             }
             if row_button(ui, "Reboot\u{2026}", true).clicked() {
-                state.arm_lifecycle("instance-reboot", &row.name, &row.name);
+                state.arm_lifecycle("instance-reboot", &row.node, &row.name, &row.name);
             }
             if row_button(ui, "Destroy\u{2026}", true).clicked() {
-                state.arm_lifecycle("instance-delete", &row.name, &row.name);
+                state.arm_lifecycle("instance-delete", &row.node, &row.name, &row.name);
             }
         });
     });
@@ -139,7 +139,7 @@ fn heading(ui: &mut egui::Ui, title: &str, blurb: &str) {
     ui.horizontal(|ui| {
         ui.scope(|ui| {
             ui.visuals_mut().override_text_color = Some(Style::ACCENT_WORKLOADS);
-            carbon_icon(ui, DeliveryView::ServiceVm.icon(), Style::BODY + 2.0);
+            carbon_icon(ui, DeliveryView::ServiceVm.icon(), Style::ICON_S);
         });
         ui.add_space(Style::SP_XS);
         ui.label(

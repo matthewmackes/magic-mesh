@@ -9,10 +9,10 @@ use mde_egui::{paint_carbon, Style, StyleColorScheme};
 use crate::model::{
     BackupRecord, CheckState, DeadZoneSeverity, DeadZoneState, Destination, DeviceIoState,
     EncryptedVaultState, FirmwareWorkflow, LocationManager, LocationSample, LocationSource,
-    MapViewState, Mg90ManagementMethod, Mg90SettingCategory, Mg90SettingDescriptor, Mg90State,
-    OfflineMapManagerState, OfflineNavigationReadiness, OfflineNavigationStatus, ProviderContract,
-    RouteOption, RoutePlan, RouteTraffic, SettingValueType, SetupStep, SourceStatus,
-    TripRecorderState, VehicleState, WorkspaceTab,
+    LocationSourceKind, MapViewState, Mg90ManagementMethod, Mg90SettingCategory,
+    Mg90SettingDescriptor, Mg90State, OfflineMapManagerState, OfflineNavigationReadiness,
+    OfflineNavigationStatus, ProviderContract, RouteOption, RoutePlan, RouteTraffic,
+    SettingValueType, SetupStep, SourceStatus, TripRecorderState, VehicleState, WorkspaceTab,
 };
 use crate::MapsLocationSurface;
 
@@ -25,7 +25,7 @@ const ROUTE_BLUE: Color32 = Color32::from_rgb(0x4C, 0xA3, 0xFF); // style-leak-o
 const ROUTE_ALT: Color32 = Color32::from_rgb(0x7D, 0xD9, 0xA3); // style-leak-ok: map-content-color
 const WEATHER: Color32 = Color32::from_rgb(0x67, 0xD6, 0xE8); // style-leak-ok: map-content-color
 const TRAFFIC: Color32 = Color32::from_rgb(0xFF, 0xB4, 0x54); // style-leak-ok: map-content-color
-                                                              // --- Driving HUD (Google Maps / Waze vocabulary, keyed to the Quasar-dark route palette) ---
+                                                              // --- Driving HUD (Google Maps / Waze vocabulary, keyed to the Quazar-dark route palette) ---
                                                               // A premium GMaps-navigation blue, painted as a top-lit vertical gradient
                                                               // (HI at the top edge → BASE → DEEP at the bottom) so the banner reads with
                                                               // depth instead of a single flat fill.
@@ -729,6 +729,7 @@ fn drive_hud(
         &state.dead_zones,
         primary,
         has_fix,
+        live_nws_vehicle_point(&state.locations),
         has_fix && !off_route,
         state.local_navigation.active_route.is_planned(),
         state
@@ -990,6 +991,7 @@ fn show_route_preview(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
         &state.dead_zones,
         primary,
         has_fix,
+        live_nws_vehicle_point(&state.locations),
         has_fix,
         state.local_navigation.active_route.is_planned(),
         state
@@ -1514,6 +1516,7 @@ fn show_destination_search(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
         &state.dead_zones,
         primary,
         has_fix,
+        live_nws_vehicle_point(&state.locations),
         false,
         false,
         state
@@ -2042,6 +2045,7 @@ fn show_arrival(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
         &state.dead_zones,
         primary,
         has_fix,
+        live_nws_vehicle_point(&state.locations),
         false,
         false,
         state
@@ -2228,7 +2232,7 @@ fn paint_check_glyph(painter: &Painter, center: Pos2, s: f32, color: Color32) {
 // ===========================================================================
 
 /// The amber "Recalculating…" banner that replaces the maneuver banner when off
-/// route: a rotating spinner chip + status text, keyed to the Quasar-dark skin.
+/// route: a rotating spinner chip + status text, keyed to the Quazar-dark skin.
 fn paint_recalculating_banner(painter: &Painter, rect: Rect, route: &RoutePlan, time: f64) {
     painter.rect_filled(rect, HUD_RADIUS, HUD_CARD_BG);
     paint_card_sheen(
@@ -2417,6 +2421,7 @@ fn paint_map_scene(
     dead_zones: &DeadZoneState,
     primary: Option<&LocationSample>,
     has_fix: bool,
+    nws_vehicle: Option<mackes_mesh_types::nws_alert::GeoPoint>,
     route_live: bool,
     route_planned: bool,
     destination: Option<(f64, f64)>,
@@ -2439,8 +2444,129 @@ fn paint_map_scene(
         None
     };
     let projection = crate::basemap::paint_basemap(painter, rect, map, center);
+
+    // WL-FUNC-012 / OVERLAY-2 — producer-timed IEM/NWS NEXRAD raster animation.
+    // This paints through egui textures on both GLES and wgpu, beneath every
+    // vector overlay. Without an installed basemap the honest badge remains.
+    if map.iem_radar_overlay {
+        let projection_ref = projection.as_ref();
+        let _ = crate::iem_radar::paint_layer(
+            painter,
+            rect,
+            &map.iem_radar,
+            crate::earthquake::now_ms(),
+            |lat, lon| projection_ref.map(|projection| projection.project(lat, lon)),
+        );
+    }
     // Edge vignette on top of the tiles keeps the driver's focus centred.
     paint_vignette(painter, rect);
+
+    // WL-FUNC-012 / OVERLAY-10 — real USGS events normalized by the workstation
+    // adapter. The basemap owns the geographic projection; without an installed
+    // region no marker position is invented, but the layer still paints its
+    // honest no-data/stale badge.
+    if map.earthquake_overlay {
+        let projection_ref = projection.as_ref();
+        let _ = crate::earthquake::paint_layer(
+            painter,
+            rect,
+            &map.earthquakes,
+            crate::earthquake::now_ms(),
+            |lat, lon| projection_ref.map(|projection| projection.project(lat, lon)),
+        );
+    }
+
+    // WL-FUNC-012 / OVERLAY-6 — keyless current NIFC WFIGS wildfire
+    // perimeters. FIRMS hotspots remain explicitly unconfigured until an
+    // operator supplies the separate free key; no synthetic heat dots appear.
+    if map.wildfire_overlay {
+        let projection_ref = projection.as_ref();
+        let _ = crate::wildfire::paint_layer(
+            painter,
+            rect,
+            &map.wildfire,
+            crate::earthquake::now_ms(),
+            |lat, lon| projection_ref.map(|projection| projection.project(lat, lon)),
+        );
+    }
+
+    // WL-FUNC-012 / OVERLAY-1 — point-scoped NWS active warnings. The same
+    // basemap projection drives polygon geometry; the safety layer still shows
+    // an honest no-data/stale badge when no offline region is installed.
+    if map.nws_alert_overlay {
+        let projection_ref = projection.as_ref();
+        let _ = crate::nws_alert::paint_layer(
+            painter,
+            rect,
+            &map.nws_alerts,
+            crate::earthquake::now_ms(),
+            nws_vehicle,
+            |lat, lon| projection_ref.map(|projection| projection.project(lat, lon)),
+        );
+    }
+
+    // WL-FUNC-012 / OVERLAY-3 — current keyless NCDOT TIMS road events.
+    if map.traffic_event_overlay {
+        let projection_ref = projection.as_ref();
+        let _ = crate::traffic::paint_layer(
+            painter,
+            rect,
+            &map.traffic_events,
+            crate::earthquake::now_ms(),
+            |lat, lon| projection_ref.map(|projection| projection.project(lat, lon)),
+        );
+    }
+
+    // WL-FUNC-012 / OVERLAY-8 — low-altitude, vehicle-scoped adsb.lol tracks.
+    // Positions dead-reckon only inside the bounded 60-second retention window;
+    // without basemap projection the honest badge remains but no location is
+    // invented.
+    if map.aircraft_overlay {
+        let projection_ref = projection.as_ref();
+        let _ = crate::aircraft::paint_layer(
+            painter,
+            rect,
+            &map.aircraft,
+            crate::earthquake::now_ms(),
+            |lat, lon| projection_ref.map(|projection| projection.project(lat, lon)),
+        );
+    }
+
+    // WL-FUNC-012 / OVERLAY-9 — MBTA GTFS-Realtime nearby vehicles.
+    if map.transit_overlay {
+        let projection_ref = projection.as_ref();
+        let _ = crate::transit::paint_layer(
+            painter,
+            rect,
+            &map.transit,
+            crate::earthquake::now_ms(),
+            |lat, lon| projection_ref.map(|projection| projection.project(lat, lon)),
+        );
+    }
+
+    // WL-FUNC-012 / OVERLAY-4 — NWS hourly current/drive-ahead guidance.
+    if map.nws_forecast_overlay {
+        let projection_ref = projection.as_ref();
+        let _ = crate::nws_forecast::paint_layer(
+            painter,
+            rect,
+            &map.nws_forecast,
+            crate::earthquake::now_ms(),
+            |lat, lon| projection_ref.map(|projection| projection.project(lat, lon)),
+        );
+    }
+
+    // WL-FUNC-012 / OVERLAY-5 — official Caltrans current traffic-camera stills.
+    if map.caltrans_camera_overlay {
+        let projection_ref = projection.as_ref();
+        let _ = crate::caltrans_camera::paint_layer(
+            painter,
+            rect,
+            &map.caltrans_cameras,
+            crate::earthquake::now_ms(),
+            |lat, lon| projection_ref.map(|projection| projection.project(lat, lon)),
+        );
+    }
 
     // Recorded dead-zone overlay (real recorder data; empty list paints nothing).
     if map.dead_zone_overlay {
@@ -2451,9 +2577,9 @@ fn paint_map_scene(
         }
     }
     // The former procedural weather rectangle / traffic segment / location-health
-    // crumbs were removed (WL-UX-007/S1): no provider or projection backs them,
-    // so painting them was fabricated map content (P8/Q33). Real overlays return
-    // with the live-feed epic (WL-FUNC-012).
+    // crumbs were removed (WL-UX-007/S1). Weather warnings now come only from
+    // the real NWS layer above; no provider backs a generic weather or traffic
+    // visualization, so none is fabricated (P8/Q33).
 
     // Route — the layered GMaps look (casing + bright core, rounded joints).
     // A dimmed grey line when not live (no fix, or off-route recalculating), and
@@ -2493,6 +2619,39 @@ fn paint_map_scene(
             paint_destination_pin(painter, pin);
         }
     }
+}
+
+/// Only a fresh, connected, provenance-stamped MG90 mirror may drive the
+/// safety-critical "vehicle is inside this warning" banner. Other location
+/// sources can center the map, but never claim the vehicle is in an NWS alert.
+fn live_nws_vehicle_point(
+    locations: &LocationManager,
+) -> Option<mackes_mesh_types::nws_alert::GeoPoint> {
+    if locations.primary != LocationSourceKind::Mg90Gnss {
+        return None;
+    }
+    let source = locations.primary_source()?;
+    let sample = &source.sample;
+    let live_provenance = source
+        .diagnostics
+        .get("mode")
+        .is_some_and(|mode| mode.starts_with("live vehicle-gateway mirror ("));
+    if source.kind != LocationSourceKind::Mg90Gnss
+        || source.status != SourceStatus::Connected
+        || !live_provenance
+        || !sample.has_fix()
+        || !sample.update_age_s.is_finite()
+        || sample.update_age_s < 0.0
+        || sample.stale()
+        || !(-90.0..=90.0).contains(&sample.latitude)
+        || !(-180.0..=180.0).contains(&sample.longitude)
+    {
+        return None;
+    }
+    Some(mackes_mesh_types::nws_alert::GeoPoint {
+        latitude: sample.latitude,
+        longitude: sample.longitude,
+    })
 }
 
 /// A map pin for a chosen geocoder destination: a teardrop head on a short stem
@@ -3223,14 +3382,31 @@ fn show_map(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
         state.open_destination_search();
     }
     ui.add_space(Style::SP_S);
-    // Traffic/Weather toggles removed with the production simulators
-    // (WL-UX-007/S1): no provider exists, so there is nothing honest for them
-    // to reveal. They return with the live-feed epic (WL-FUNC-012).
+    // Generic Traffic/Weather toggles remain retired with the production
+    // simulators. The explicit NWS toggle below controls the real safety feed.
     ui.horizontal_wrapped(|ui| {
         ui.checkbox(&mut state.map.dark_mode, "Dark mode");
         ui.checkbox(&mut state.map.route_visible, "Route");
         ui.checkbox(&mut state.map.dead_zone_overlay, "Dead zones");
         ui.checkbox(&mut state.map.gnss_overlay, "GNSS quality");
+        ui.checkbox(&mut state.map.earthquake_overlay, "Earthquakes");
+        ui.checkbox(&mut state.map.nws_alert_overlay, "Weather alerts");
+        ui.checkbox(&mut state.map.iem_radar_overlay, "NEXRAD radar");
+        if state.map.iem_radar_overlay {
+            ui.checkbox(&mut state.map.iem_radar.animate, "Animate radar");
+        }
+        ui.checkbox(&mut state.map.wildfire_overlay, "Wildfire perimeters");
+        ui.checkbox(&mut state.map.traffic_event_overlay, "NCDOT traffic");
+        ui.checkbox(&mut state.map.aircraft_overlay, "Aircraft");
+        if state.map.aircraft_overlay {
+            ui.checkbox(&mut state.map.aircraft.show_callsigns, "Callsigns");
+        }
+        ui.checkbox(&mut state.map.transit_overlay, "MBTA transit");
+        if state.map.transit_overlay {
+            ui.checkbox(&mut state.map.transit.show_labels, "Transit labels");
+        }
+        ui.checkbox(&mut state.map.nws_forecast_overlay, "Hourly forecast");
+        ui.checkbox(&mut state.map.caltrans_camera_overlay, "Caltrans cameras");
     });
     ui.add_space(Style::SP_S);
     ui.horizontal(|ui| {
@@ -3447,34 +3623,37 @@ fn show_vehicle(ui: &mut egui::Ui, vehicle: &VehicleState) {
                 ("—", Style::TEXT_DIM)
             };
             readout(ui, "Motion", v, tone);
-            readout(
-                ui,
-                "Fuel",
-                &telem
-                    .fuel_percent
-                    .map_or_else(|| "unavailable".to_string(), |fuel| format!("{fuel:.0}%")),
-                telem.fuel_percent.map_or(Style::TEXT_DIM, |fuel| {
-                    if fuel < 15.0 {
-                        Style::WARN
-                    } else {
-                        Style::OK
-                    }
-                }),
-            );
+            let (v, tone) = if live {
+                (
+                    telem
+                        .fuel_percent
+                        .map_or_else(|| "unavailable".to_string(), |fuel| format!("{fuel:.0}%")),
+                    telem.fuel_percent.map_or(Style::TEXT_DIM, |fuel| {
+                        if fuel < 15.0 {
+                            Style::WARN
+                        } else {
+                            Style::OK
+                        }
+                    }),
+                )
+            } else {
+                ("—".to_string(), Style::TEXT_DIM)
+            };
+            readout(ui, "Fuel", &v, tone);
             let (v, tone) = if live {
                 (telem.dtc_count.to_string(), count_tone(telem.dtc_count))
             } else {
                 ("—".to_string(), Style::TEXT_DIM)
             };
             readout(ui, "Diagnostic codes", &v, tone);
-            readout(
-                ui,
-                "Odometer",
-                &telem
+            let v = if live {
+                telem
                     .odometer_mi
-                    .map_or_else(|| "unavailable".to_string(), |odo| format!("{odo} mi")),
-                Style::TEXT,
-            );
+                    .map_or_else(|| "unavailable".to_string(), |odo| format!("{odo} mi"))
+            } else {
+                "—".to_string()
+            };
+            readout(ui, "Odometer", &v, Style::TEXT);
             let v = if live {
                 format!("{} min", telem.runtime_min)
             } else {
@@ -3487,14 +3666,13 @@ fn show_vehicle(ui: &mut egui::Ui, vehicle: &VehicleState) {
                 dash_if_empty(&telem.confidence),
                 Style::TEXT_DIM,
             );
-            let (v, tone) = if live {
+            // Provenance stays explicit after freshness expires: the stale
+            // mirror's values dash, while its age remains visible in warning
+            // tone so the operator can see exactly why it is no longer live.
+            let (v, tone) = if telem.has_live_gateway_source() {
                 (
                     format!("{:.1} s ago", telem.last_update_age_s),
-                    if telem.last_update_age_s <= 5.0 {
-                        Style::TEXT_DIM
-                    } else {
-                        Style::WARN
-                    },
+                    if live { Style::TEXT_DIM } else { Style::WARN },
                 )
             } else {
                 ("—".to_string(), Style::TEXT_DIM)
@@ -3510,9 +3688,9 @@ fn show_vehicle(ui: &mut egui::Ui, vehicle: &VehicleState) {
         Style::ACCENT,
         |ui| {
             bullet(
-            ui,
-            "Map events, trip history, route alerts, diagnostic bundles, and motion detection read this profile layer.",
-        );
+                ui,
+                "Map events, trip history, route alerts, diagnostic bundles, and motion detection read this profile layer.",
+            );
             for note in &vehicle.profile_notes {
                 bullet(ui, note);
             }
@@ -4257,9 +4435,9 @@ fn show_mg90_settings(ui: &mut egui::Ui, state: &MapsLocationSurface) {
                 },
             );
             mde_egui::widgets::muted_note(
-            ui,
-            "Every category maps to a native MG90 setting group read over the direct-Ethernet local API.",
-        );
+                ui,
+                "Every category maps to a native MG90 setting group read over the direct-Ethernet local API.",
+            );
         },
     );
     ui.add_space(Style::SP_S);
@@ -4441,6 +4619,7 @@ fn map_canvas(
         dead_zones,
         primary,
         has_fix,
+        live_nws_vehicle_point(locations),
         has_fix,
         route_planned,
         None,
@@ -4469,7 +4648,7 @@ fn map_canvas(
     painter.text(
         rect.right_bottom() - egui::vec2(Style::SP_S, Style::SP_S),
         Align2::RIGHT_BOTTOM,
-        &map.attribution,
+        map.attribution_line(),
         FontId::proportional(Style::SMALL),
         chrome,
     );
@@ -5341,6 +5520,14 @@ fn severity_tone(severity: DeadZoneSeverity) -> Color32 {
 mod tests {
     use super::*;
 
+    fn test_now_ms() -> i64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+            .unwrap_or_default()
+    }
+
     fn tessellate(surface: &mut MapsLocationSurface) -> usize {
         let ctx = egui::Context::default();
         Style::install(&ctx);
@@ -5382,6 +5569,45 @@ mod tests {
     fn maps_location_panel_renders_simulated_vertical_slice() {
         let mut surface = MapsLocationSurface::simulated();
         assert!(tessellate(&mut surface) > 0);
+    }
+
+    #[test]
+    fn nws_inside_banner_requires_a_fresh_provenance_stamped_mg90_fix() {
+        let mut surface = MapsLocationSurface::simulated();
+        {
+            let source = surface
+                .locations
+                .sources
+                .iter_mut()
+                .find(|source| source.kind == LocationSourceKind::Mg90Gnss)
+                .expect("MG90 source");
+            source.status = SourceStatus::Connected;
+            source.sample.fix_type = "3D".to_string();
+            source.sample.latitude = 32.2;
+            source.sample.longitude = -95.0;
+            source.sample.update_age_s = 0.0;
+        }
+        assert!(
+            live_nws_vehicle_point(&surface.locations).is_none(),
+            "simulated provenance cannot raise the safety banner"
+        );
+
+        surface.locations.sources[0].diagnostics.insert(
+            "mode".to_string(),
+            "live vehicle-gateway mirror (MG90 4.3.0.1)".to_string(),
+        );
+        assert!(live_nws_vehicle_point(&surface.locations).is_some());
+        surface.locations.sources[0].sample.update_age_s = 6.0;
+        assert!(
+            live_nws_vehicle_point(&surface.locations).is_none(),
+            "stale MG90 position cannot raise the safety banner"
+        );
+        surface.locations.sources[0].sample.update_age_s = 0.0;
+        surface.locations.primary = LocationSourceKind::Simulator;
+        assert!(
+            live_nws_vehicle_point(&surface.locations).is_none(),
+            "non-MG90 primary cannot raise the safety banner"
+        );
     }
 
     #[test]
@@ -5466,6 +5692,95 @@ mod tests {
             collect_shape_text(&clipped.shape, &mut texts);
         }
         texts
+    }
+
+    /// Every string painted by the Vehicle tab body without workspace scrolling.
+    fn vehicle_texts(vehicle: &VehicleState) -> Vec<String> {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1280.0, 1200.0),
+            )),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| show_vehicle(ui, vehicle));
+        });
+        let mut texts = Vec::new();
+        for clipped in &out.shapes {
+            collect_shape_text(&clipped.shape, &mut texts);
+        }
+        texts
+    }
+
+    #[test]
+    fn vehicle_view_dashes_simulated_and_stale_readings_but_keeps_provenance() {
+        use mackes_mesh_types::vehicle::{VehicleState as WireVehicleState, VehicleTelem};
+
+        // The fixture profile remains explicitly identified, but none of its
+        // numeric CAN/OBD seed values may look like live instruments.
+        let simulated = MapsLocationSurface::simulated();
+        let simulated_texts = vehicle_texts(&simulated.vehicle);
+        assert!(simulated_texts
+            .iter()
+            .any(|text| text == "simulated CAN/OBD profile"));
+        for fabricated in ["27", "1840", "91", "13.9", "64%", "78214 mi", "42 min"] {
+            assert!(
+                !simulated_texts.iter().any(|text| text == fabricated),
+                "simulated reading {fabricated:?} must be dashed: {simulated_texts:?}"
+            );
+        }
+
+        // A fresh online OBD mirror is allowed even with no GNSS fix; position
+        // readiness and telemetry freshness are deliberately independent.
+        let mut mirror = WireVehicleState::offline("eagle");
+        mirror.online = true;
+        mirror.model = "MG90".to_string();
+        mirror.mgos_version = "4.3.0.1".to_string();
+        mirror.gaps.clear();
+        mirror.telem = VehicleTelem {
+            speed_mph: 62.0,
+            rpm: 2_100,
+            coolant_c: Some(91.0),
+            battery_v: 13.9,
+            fuel_percent: Some(64.0),
+            odometer_mi: Some(78_214),
+            runtime_min: 42,
+            moving: true,
+            ignition_on: true,
+            obd_present: true,
+            ..VehicleTelem::default()
+        };
+        mirror.published_at_ms = test_now_ms();
+        let mut live = MapsLocationSurface::live();
+        live.refresh_from_vehicle(&mirror);
+        let fresh_texts = vehicle_texts(&live.vehicle);
+        for reading in ["62", "2100", "91", "13.9", "64%", "78214 mi", "42 min"] {
+            assert!(
+                fresh_texts.iter().any(|text| text == reading),
+                "fresh reading {reading:?} paints: {fresh_texts:?}"
+            );
+        }
+
+        // The retained payload crosses the freshness window. Its values all
+        // disappear, but confidence + a warning-age remain diagnostic evidence.
+        mirror.published_at_ms = test_now_ms() - 6_000;
+        live.refresh_from_vehicle(&mirror);
+        let stale_texts = vehicle_texts(&live.vehicle);
+        assert!(stale_texts
+            .iter()
+            .any(|text| text.starts_with("live vehicle-gateway mirror")));
+        assert!(stale_texts
+            .iter()
+            .any(|text| text.ends_with(" s ago") && text != "0.0 s ago"));
+        for stale in ["62", "2100", "91", "13.9", "64%", "78214 mi", "42 min"] {
+            assert!(
+                !stale_texts.iter().any(|text| text == stale),
+                "stale reading {stale:?} must be dashed: {stale_texts:?}"
+            );
+        }
     }
 
     #[test]

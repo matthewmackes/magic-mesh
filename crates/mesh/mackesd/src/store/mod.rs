@@ -45,6 +45,12 @@ const MIGRATIONS: &[Migration] = &[
         version: 12,
         sql: include_str!("../../migrations/0012_peer_version.sql"),
     },
+    // SEC-006 — public-key-only peer signing and epoch rotation. The matching
+    // private key remains requester-local and never enters SQLite or QNM-Shared.
+    Migration {
+        version: 13,
+        sql: include_str!("../../migrations/0013_nebula_peer_public_key.sql"),
+    },
 ];
 
 /// Open the store at `path`, creating its parent directory if needed

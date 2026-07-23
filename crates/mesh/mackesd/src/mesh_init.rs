@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::ca::bundle::{bundle_path, LighthouseEntry, NebulaBundle};
-use crate::ca::sign::{sign_peer_cert, PeerRole};
+use crate::ca::sign::{sign_peer_cert_with_public_key, PeerRole};
 use crate::ca::NebulaCertBackend;
 
 /// What `mesh_init` accomplished — printed by the CLI.
@@ -52,6 +52,7 @@ pub fn mesh_init<B: NebulaCertBackend>(
     ca_crt: &Path,
     ca_key: &Path,
     scratch_dir: &Path,
+    config_dir: &Path,
     pin_role: mde_role::Role,
 ) -> anyhow::Result<MeshInitReport> {
     // 1. Role pin — only when unpinned (ENT-2 owns the semantics).
@@ -89,7 +90,17 @@ pub fn mesh_init<B: NebulaCertBackend>(
         .map_err(|e| anyhow::anyhow!("mesh-init step 3 (scratch dir): {e}"))?;
     let crt_out = scratch_dir.join("self.crt");
     let key_out = scratch_dir.join("self.key");
-    let signed = sign_peer_cert(
+    let public_out = scratch_dir.join("self.pub");
+    let _ = std::fs::remove_file(&key_out);
+    let _ = std::fs::remove_file(&public_out);
+    backend
+        .generate_keypair(&key_out, &public_out)
+        .map_err(|e| anyhow::anyhow!("mesh-init step 3 (requester keygen): {e}"))?;
+    let requester_private_key = crate::ca::seal::read_sealed(&key_out)
+        .map_err(|e| anyhow::anyhow!("mesh-init step 3 (read requester key): {e}"))?;
+    let requester_public_key = std::fs::read_to_string(&public_out)
+        .map_err(|e| anyhow::anyhow!("mesh-init step 3 (read requester public key): {e}"))?;
+    let signed = sign_peer_cert_with_public_key(
         backend,
         conn,
         mesh_id,
@@ -98,7 +109,8 @@ pub fn mesh_init<B: NebulaCertBackend>(
         ca_crt,
         ca_key,
         &crt_out,
-        &key_out,
+        &public_out,
+        &requester_public_key,
         // Founding self-sign: this IS the first node; its store is empty and it
         // correctly takes 10.42.0.1. No global directory yet — empty guard.
         &std::collections::HashSet::new(),
@@ -111,27 +123,58 @@ pub fn mesh_init<B: NebulaCertBackend>(
         .map_err(|e| anyhow::anyhow!("mesh-init step 3 (read CA cert): {e}"))?;
     let peer_cert_pem = std::fs::read_to_string(&crt_out)
         .map_err(|e| anyhow::anyhow!("mesh-init step 3 (read signed cert): {e}"))?;
-    let peer_key_pem = std::fs::read_to_string(&key_out)
-        .map_err(|e| anyhow::anyhow!("mesh-init step 3 (read signed key): {e}"))?;
     let now_s = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs()) as i64;
+    let mackes_state_dir = ca_key
+        .parent()
+        .and_then(std::path::Path::parent)
+        .unwrap_or_else(|| std::path::Path::new("/var/lib/mackesd"));
+    let relay_authority_key_path = mackes_state_dir.join("relay-trust-authority.ed25519");
+    let relay_authority_pin_path = mackes_state_dir.join("relay-trust-authority.pub");
+    let relay_authority = crate::node_key::load_or_create(&relay_authority_key_path)
+        .map_err(|e| anyhow::anyhow!("mesh-init relay trust authority: {e}"))?;
+    let relay_authority_public =
+        crate::ca::bundle::relay_trust_authority_public_key(&relay_authority);
+    crate::ca::seal::write_sealed(&relay_authority_pin_path, relay_authority_public.as_bytes())
+        .map_err(|e| anyhow::anyhow!("mesh-init relay trust authority pin: {e}"))?;
+    let relay_tls = std::fs::read_to_string("/etc/nebula/enroll-endpoint.crt")
+        .ok()
+        .and_then(crate::ca::bundle::RelayTlsIdentity::from_certificate_pem)
+        .map(|identity| {
+            crate::ca::bundle::sign_relay_tls_identity(
+                identity,
+                node_id,
+                &signed.overlay_ip,
+                external_addr,
+                &relay_authority,
+            )
+        });
     let bundle = NebulaBundle {
         mesh_id: mesh_id.to_string(),
         epoch,
         ca_cert_pem,
         peer_cert_pem,
-        peer_key_pem,
         overlay_ip: signed.overlay_ip.clone(),
         mesh_cidr: format!("{}/16", crate::ca::sign::DEFAULT_MESH_CIDR_BASE),
         lighthouses: vec![LighthouseEntry {
             node_id: node_id.to_string(),
             overlay_ip: signed.overlay_ip.clone(),
             external_addr: external_addr.to_string(),
+            relay_tls,
         }],
-        ca_key_pem: None,
+        relay_trust_authority: Some(relay_authority_public),
         created_at: now_s,
     };
+    crate::workers::nebula_supervisor::materialize_config(
+        config_dir,
+        &bundle,
+        crate::workers::nebula_supervisor::ConfigRole::Host,
+        &[],
+        workgroup_root,
+        Some(&requester_private_key),
+    )
+    .map_err(|e| anyhow::anyhow!("mesh-init step 3 (activate requester identity): {e}"))?;
     let bpath = bundle_path(workgroup_root, node_id);
     crate::ca::bundle::write_bundle(&bpath, &bundle)
         .map_err(|e| anyhow::anyhow!("mesh-init step 3 (bundle write): {e}"))?;
@@ -190,6 +233,7 @@ mod tests {
             &ca_crt,
             &ca_key,
             &tmp.path().join("scratch"),
+            &tmp.path().join("etc-nebula"),
             mde_role::Role::Lighthouse,
         )
         .expect("mesh init");
@@ -238,6 +282,7 @@ mod tests {
             &ca_dir.join("ca.crt"),
             &ca_dir.join("ca.key"),
             &tmp.path().join("scratch"),
+            &tmp.path().join("etc-nebula"),
             mde_role::Role::Lighthouse,
         )
         .expect("mesh init creates the CA dir");

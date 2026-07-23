@@ -85,7 +85,7 @@ use serde_json::{json, Value};
 use tracing::{debug, error, info, warn};
 
 use super::{ShutdownToken, Worker};
-// KDC-MESH-8 — drive fleet instance lifecycle from the phone over the neutral
+// KDC-MESH-8 — drive placement-local instance lifecycle from the phone over the neutral
 // `action/cloud/*` Bus verb namespace (design #12). This is a read-only producer
 // of typed cloud requests + reader of the typed reply; the cloud backend that
 // answers them is provided by a later local-first worker. The neutral wire shapes
@@ -1447,7 +1447,15 @@ async fn run_host(
                     // a paired device (the auth, #16).
                     if packet.kind == "kdeconnect.runcommand.request" {
                         let paired = pairing.is_paired(peer.as_str());
-                        handle_runcommand(&transport, &config_dir, peer, &packet.body, paired).await;
+                        handle_runcommand(
+                            &transport,
+                            &config_dir,
+                            peer,
+                            &packet.body,
+                            paired,
+                            &shunt_host,
+                        )
+                        .await;
                     }
                     // KDC-PLUGINS / KDC-MESH-8 — Battery request: the peer polls THIS
                     // host's battery. Answer with a `kdeconnect.battery` snapshot read
@@ -1966,6 +1974,7 @@ async fn handle_runcommand(
     peer: &PeerId,
     body: &Value,
     paired: bool,
+    local_node: &str,
 ) {
     let shell_cmds = load_runcommands(config_dir);
     if body.get("requestCommandList").and_then(Value::as_bool) == Some(true) {
@@ -1991,7 +2000,7 @@ async fn handle_runcommand(
                 let _ = transport.send_to(peer, pkt).await;
                 return;
             }
-            handle_cloud_command(transport, peer, cmd).await;
+            handle_cloud_command(transport, peer, cmd, local_node).await;
             return;
         }
         let key = key.to_string();
@@ -2212,9 +2221,9 @@ fn advertised_services() -> Vec<String> {
         // honest-gates when `sshfs` is absent (it's a capability, not a promise
         // the tool is installed).
         service_directory::service::SFTP.to_string(),
-        // KDC-MESH-8 — fleet cloud lifecycle (drives the QC `action/cloud/*`
-        // verbs) + telephony (call/SMS) alerts.
-        service_directory::service::OPENSTACK.to_string(),
+        // KDC-MESH-8 — placement-local Workloads lifecycle (drives the neutral
+        // `action/cloud/*` verbs) + telephony (call/SMS) alerts.
+        service_directory::service::WORKLOADS.to_string(),
         service_directory::service::TELEPHONY.to_string(),
     ]
 }
@@ -2330,7 +2339,7 @@ fn serve_browse(config_dir: &std::path::Path, body: &Value) -> String {
 
 // ── KDC-MESH-8: run-commands (cloud lifecycle) + telephony + connectivity ──
 //
-// The phone triggers fleet cloud lifecycle commands (design #12) that drive
+// The phone triggers placement-local cloud lifecycle commands (design #12) that drive
 // the QC `action/cloud/*` typed verbs over the Bus — the neutral cloud verb
 // namespace answered by the cloud backend, never a direct worker dependency. Battery + connectivity
 // report on desktops, telephony alerts surface, find-my-device works both ways;

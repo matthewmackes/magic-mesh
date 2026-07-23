@@ -88,6 +88,8 @@ use base64::Engine as _;
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 
+use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
+
 use super::mesh_mount::{self, KeyProvider, MountError};
 use super::{ShutdownToken, Worker};
 
@@ -916,6 +918,8 @@ pub struct PtyBrokerWorker {
     backend: Arc<dyn PtyBackend>,
     /// The shared-key seam (FILEMGR-6, reused from `mesh_mount` — §6 glue).
     keys: Arc<dyn KeyProvider>,
+    /// Exact-body capability verifier for privileged session mutations.
+    authorizer: Arc<ActionAuthorizer>,
     /// Bounded ssh connect timeout.
     connect_timeout: Duration,
     /// Idle-reap window for a live session.
@@ -958,6 +962,7 @@ impl PtyBrokerWorker {
             mesh_user: mesh_mount::DEFAULT_MESH_USER.to_string(),
             backend: Arc::new(SshPtyBackend::new()),
             keys,
+            authorizer: Arc::new(ActionAuthorizer::production()),
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             closed_linger: DEFAULT_CLOSED_LINGER,
@@ -982,6 +987,14 @@ impl PtyBrokerWorker {
     #[must_use]
     pub fn with_key_provider(mut self, keys: Arc<dyn KeyProvider>) -> Self {
         self.keys = keys;
+        self
+    }
+
+    /// Inject an isolated verifier and replay ledger (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
+        self.authorizer = authorizer;
         self
     }
 
@@ -1328,13 +1341,40 @@ impl PtyBrokerWorker {
             };
             for msg in msgs {
                 self.cursors.insert(topic.clone(), msg.ulid.clone());
-                let verb = match parse_verb(msg.body.as_deref().unwrap_or_default()) {
+                let body = msg.body.as_deref().unwrap_or_default();
+                let verb = match parse_verb(body) {
                     Ok(v) => v,
                     Err(e) => {
                         tracing::warn!(target: "mackesd::pty_broker", peer = %peer, error = %e, "bad request");
                         continue;
                     }
                 };
+                let auth_verb = match &verb {
+                    PtyVerb::Open { .. } => Some("pty-open"),
+                    PtyVerb::Write { .. } => Some("pty-write"),
+                    PtyVerb::Resize { .. } => Some("pty-resize"),
+                    PtyVerb::Close { .. } => Some("pty-close"),
+                    PtyVerb::Detach { .. } => Some("pty-detach"),
+                    PtyVerb::Reattach { .. } => Some("pty-reattach"),
+                    PtyVerb::Heartbeat { .. } | PtyVerb::List => None,
+                };
+                if let Some(auth_verb) = auth_verb {
+                    let context = MutationContext {
+                        verb: auth_verb,
+                        node: &peer,
+                        target: verb.id(),
+                    };
+                    if let Err(error) = self.authorizer.authorize(body, context) {
+                        tracing::warn!(
+                            target: "mackesd::pty_broker",
+                            peer = %peer,
+                            verb = verb.tag(),
+                            error = %error,
+                            "refused unauthorized privileged request"
+                        );
+                        continue;
+                    }
+                }
                 self.handle_verb(persist, &peer, verb);
             }
         }
@@ -1530,7 +1570,11 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::action_auth::authorize_test_body;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const AUTH_KEY: &[u8] = b"pty-action-auth-test-key";
+    const AUTH_NOW: i64 = 1_700_000_000_000;
 
     // ── pure plan fold (§9 — a typed argv, never a shell string) ─────────
 
@@ -1893,6 +1937,25 @@ mod tests {
         }
     }
 
+    fn signed_open_body(id: &str, nonce: &str, expires_at_ms: i64) -> String {
+        let mut unsigned = serde_json::to_value(open_verb(id)).unwrap();
+        unsigned
+            .as_object_mut()
+            .unwrap()
+            .insert("schema_version".to_string(), serde_json::Value::from(1_u64));
+        authorize_test_body(
+            AUTH_KEY,
+            &unsigned.to_string(),
+            MutationContext {
+                verb: "pty-open",
+                node: "oak",
+                target: id,
+            },
+            nonce,
+            expires_at_ms,
+        )
+    }
+
     #[test]
     fn open_request_reaches_open_over_the_fake_backend() {
         let (_d, persist) = temp_persist();
@@ -2097,17 +2160,58 @@ mod tests {
 
     #[test]
     fn drain_requests_dispatches_from_the_action_topic() {
-        let (_d, persist) = temp_persist();
+        let (d, persist) = temp_persist();
         let backend = FakeBackend::ok();
-        let mut w = worker_with(backend.clone());
+        let authorizer = Arc::new(ActionAuthorizer::for_test(
+            AUTH_KEY,
+            d.path().join("auth"),
+            AUTH_NOW,
+        ));
+        let mut w = worker_with(backend.clone()).with_authorizer(authorizer);
         // enqueue a real open request on the action topic.
-        let body = serde_json::to_string(&open_verb("s1")).unwrap();
+        let body = signed_open_body("s1", "valid-open", AUTH_NOW + 30_000);
         persist
             .write("action/pty/oak", Priority::Default, None, Some(&body))
             .unwrap();
         w.sweep(&persist);
         assert_eq!(w.sessions["s1"].phase, PtyPhase::Open);
         assert_eq!(w.sessions["s1"].peer, "oak");
+        assert_eq!(backend.opens.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn hostile_privileged_requests_never_reach_the_pty_backend() {
+        let (d, persist) = temp_persist();
+        let backend = FakeBackend::ok();
+        let authorizer = Arc::new(ActionAuthorizer::for_test(
+            AUTH_KEY,
+            d.path().join("auth"),
+            AUTH_NOW,
+        ));
+        let mut w = worker_with(backend.clone()).with_authorizer(authorizer);
+
+        let unsigned = serde_json::to_string(&open_verb("unsigned")).unwrap();
+        let future = signed_open_body("future", "future", AUTH_NOW + 30_000)
+            .replace("\"schema_version\":1", "\"schema_version\":2");
+        let overlong = signed_open_body("overlong", "overlong", AUTH_NOW + 30_001);
+        let tampered = signed_open_body("original", "tampered", AUTH_NOW + 30_000)
+            .replace("original", "changed");
+        for body in [&unsigned, &future, &overlong, &tampered] {
+            persist
+                .write("action/pty/oak", Priority::Default, None, Some(body))
+                .unwrap();
+        }
+        w.sweep(&persist);
+        assert_eq!(backend.opens.load(Ordering::SeqCst), 0);
+        assert!(w.sessions.is_empty());
+
+        let replay = signed_open_body("replay", "replay", AUTH_NOW + 30_000);
+        for _ in 0..2 {
+            persist
+                .write("action/pty/oak", Priority::Default, None, Some(&replay))
+                .unwrap();
+        }
+        w.sweep(&persist);
         assert_eq!(backend.opens.load(Ordering::SeqCst), 1);
     }
 

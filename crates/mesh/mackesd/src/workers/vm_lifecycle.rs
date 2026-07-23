@@ -11,8 +11,11 @@
 //! It runs on **every** mesh node (like `kvm_health`): the KVM stack is universal,
 //! so any node can host datacenter VMs. Because the action topic is flat (shared
 //! by the whole mesh), each [`LifecycleAction`] carries a `host` — the worker acts
-//! only on requests addressed to *its* node id ([`LifecycleAction::targets`]) and
-//! advances past the rest, so one create request doesn't fan out to every node.
+//! only on requests addressed to *its* node id ([`LifecycleAction::targets`]).
+//! Every mutating request must also carry the same short-lived, exact-body-bound
+//! HMAC capability used by Workloads and claim its nonce in the shared durable
+//! replay ledger before any backend call. `Refresh` remains a read-only roster
+//! nudge and needs no capability.
 //!
 //! ## Shape (mirrors `mackes-xcp::Hypervisor` + `kvm_health`)
 //!
@@ -81,6 +84,10 @@ use thiserror::Error;
 
 use crate::workers::proc::{output_with_timeout, status_with_timeout, DEFAULT_CMD_TIMEOUT};
 
+use super::cloud::{
+    claim_nonce, verify_token, HmacTokenSigner, NullSigner, TokenSigner, TokenVerdict,
+    DEFAULT_AUTH_ROOT,
+};
 use super::{ShutdownToken, Worker};
 
 /// Bus topic the worker drains for lifecycle requests (flat; per-node targeting
@@ -89,6 +96,9 @@ pub const ACTION_TOPIC: &str = "action/vm/lifecycle";
 
 /// Bus topic the worker publishes this node's VM instance roster to.
 pub const INSTANCES_TOPIC: &str = "event/vm/instances";
+
+/// Current direct-libvirt mutation envelope schema.
+pub const ACTION_SCHEMA_VERSION: u64 = 1;
 
 /// Canonical dir storage pool VM disks live in (the sm/SR equivalent). Matches
 /// `compute_provision`'s `mde-vms` pool so the two create paths share storage.
@@ -111,6 +121,10 @@ pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// subscriber still finds a recent roster. Keeps the `virsh list` snapshot off
 /// the hot path (queried on-action or every 30 s, never every 2 s tick).
 pub const PUBLISH_HEARTBEAT: Duration = Duration::from_secs(30);
+
+/// Maximum remaining lifetime accepted for a direct-libvirt mutation
+/// capability. A valid signature must not become a long-lived bearer token.
+const MAX_AUTH_TTL_MS: i64 = 30_000;
 
 // ───────────────────────────── data model ─────────────────────────────
 
@@ -287,6 +301,23 @@ impl LifecycleAction {
     #[must_use]
     pub fn targets(&self, node_id: &str) -> bool {
         !self.host().is_empty() && self.host() == node_id
+    }
+
+    /// Exact capability verb and domain target for every libvirt mutation.
+    /// `Refresh` is read-only and therefore intentionally returns `None`.
+    #[must_use]
+    pub fn authorization_context(&self) -> Option<(&'static str, &str)> {
+        match self {
+            Self::Create { spec, .. } => Some(("vm-create", &spec.name)),
+            Self::Start { name, .. } => Some(("vm-start", name)),
+            Self::Stop { name, .. } => Some(("vm-stop", name)),
+            Self::Pause { name, .. } => Some(("vm-pause", name)),
+            Self::Resume { name, .. } => Some(("vm-resume", name)),
+            Self::Destroy { name, .. } => Some(("vm-destroy", name)),
+            Self::AttachUsb { name, .. } => Some(("vm-attach-usb", name)),
+            Self::DetachUsb { name, .. } => Some(("vm-detach-usb", name)),
+            Self::Refresh { .. } => None,
+        }
     }
 }
 
@@ -1370,9 +1401,25 @@ fn publish_instances(bus_root: Option<&Path>, report: &InstanceReport) {
     }
 }
 
-/// Read new [`ACTION_TOPIC`] messages since `cursor`, advancing it. A short sync
-/// open-read-drop (never crosses an `.await`), mirroring `compute_provision`.
-fn read_new_actions(bus_root: &Path, cursor: &mut Option<String>) -> Vec<LifecycleAction> {
+#[derive(serde::Deserialize)]
+struct AuthorizationEnvelope {
+    #[serde(default)]
+    schema_version: Option<u64>,
+    #[serde(default)]
+    armed_token: Option<String>,
+}
+
+struct QueuedAction {
+    action: LifecycleAction,
+    raw: String,
+    schema_version: Option<u64>,
+    armed_token: Option<String>,
+}
+
+/// Read new [`ACTION_TOPIC`] messages since `cursor`, advancing it. The exact
+/// raw body is retained because the capability authenticates every request
+/// field, not merely its parsed semantic target.
+fn read_new_actions(bus_root: &Path, cursor: &mut Option<String>) -> Vec<QueuedAction> {
     let Ok(persist) = Persist::open(bus_root.to_path_buf()) else {
         return vec![];
     };
@@ -1383,10 +1430,21 @@ fn read_new_actions(bus_root: &Path, cursor: &mut Option<String>) -> Vec<Lifecyc
     for msg in msgs {
         *cursor = Some(msg.ulid.clone());
         let body = msg.body.as_deref().unwrap_or("");
-        match parse_action(body) {
-            Ok(a) => out.push(a),
-            Err(e) => {
+        match (
+            parse_action(body),
+            serde_json::from_str::<AuthorizationEnvelope>(body),
+        ) {
+            (Ok(action), Ok(envelope)) => out.push(QueuedAction {
+                action,
+                raw: body.to_string(),
+                schema_version: envelope.schema_version,
+                armed_token: envelope.armed_token,
+            }),
+            (Err(e), _) => {
                 tracing::warn!(ulid = %msg.ulid, error = %e, "vm_lifecycle: bad lifecycle action")
+            }
+            (_, Err(e)) => {
+                tracing::warn!(ulid = %msg.ulid, error = %e, "vm_lifecycle: bad authorization envelope")
             }
         }
     }
@@ -1421,6 +1479,11 @@ pub struct VmLifecycleWorker {
     /// The injectable libvirt seam (production: [`VirshCli`]). `Arc` so each
     /// action runs on a `spawn_blocking` thread without borrowing `self`.
     backend: Arc<dyn LibvirtBackend + Send + Sync>,
+    /// Shared verifier authority used by the Workloads cloud lane. Missing
+    /// credential means every direct-libvirt mutation fails closed.
+    signer: Arc<dyn TokenSigner>,
+    /// Shared host-local nonce ledger used by all token-gated mutation lanes.
+    auth_root: PathBuf,
     /// Action-drain cadence.
     poll: Duration,
     /// Roster-publish heartbeat.
@@ -1435,9 +1498,22 @@ impl VmLifecycleWorker {
     /// id (the action target + event stamp).
     #[must_use]
     pub fn new(host: String) -> Self {
+        let signer: Arc<dyn TokenSigner> = match HmacTokenSigner::from_systemd_credential() {
+            Ok(signer) => Arc::new(signer),
+            Err(error) => {
+                tracing::error!(
+                    target: "mackesd::vm_lifecycle",
+                    %error,
+                    "direct-libvirt authorization unavailable; mutations are disabled"
+                );
+                Arc::new(NullSigner)
+            }
+        };
         Self {
             host,
             backend: Arc::new(VirshCli::new()),
+            signer,
+            auth_root: PathBuf::from(DEFAULT_AUTH_ROOT),
             poll: DEFAULT_POLL_INTERVAL,
             heartbeat: PUBLISH_HEARTBEAT,
             bus_root_override: None,
@@ -1465,6 +1541,15 @@ impl VmLifecycleWorker {
         self
     }
 
+    /// Inject the shared verifier and durable ledger root (tests).
+    #[cfg(test)]
+    #[must_use]
+    fn with_authorization(mut self, signer: Arc<dyn TokenSigner>, root: PathBuf) -> Self {
+        self.signer = signer;
+        self.auth_root = root;
+        self
+    }
+
     fn bus_root(&self) -> Option<PathBuf> {
         self.bus_root_override.clone().or_else(default_bus_root)
     }
@@ -1481,21 +1566,69 @@ impl VmLifecycleWorker {
             .or_else(crate::bus_publish::default_bus_root)
     }
 
+    fn authorize(&self, queued: &QueuedAction) -> TokenVerdict {
+        let Some((verb, target)) = queued.action.authorization_context() else {
+            return TokenVerdict::Valid;
+        };
+        if queued.schema_version != Some(ACTION_SCHEMA_VERSION) {
+            return TokenVerdict::UnsupportedSchema;
+        }
+        let now = i64::try_from(now_ms()).unwrap_or(i64::MAX);
+        let verdict = verify_token(
+            queued.armed_token.as_deref(),
+            verb,
+            queued.action.host(),
+            target,
+            &queued.raw,
+            now,
+            self.signer.as_ref(),
+        );
+        if !verdict.is_valid() {
+            return verdict;
+        }
+        let Some(token) = queued
+            .armed_token
+            .as_deref()
+            .and_then(mackes_mesh_types::cloud::CloudArmedToken::parse)
+        else {
+            return TokenVerdict::Malformed;
+        };
+        if token.expires_at_ms > now.saturating_add(MAX_AUTH_TTL_MS) {
+            return TokenVerdict::LifetimeTooLong;
+        }
+        match claim_nonce(&self.auth_root, &token.nonce, token.expires_at_ms, now) {
+            Ok(true) => TokenVerdict::Valid,
+            Ok(false) => TokenVerdict::Replayed,
+            Err(_) => TokenVerdict::ReplayStoreUnavailable,
+        }
+    }
+
     /// Drain + apply new actions addressed to this node. Returns `true` when any
     /// action ran (so the caller force-publishes the fresh roster).
     async fn drain_and_apply(&self, bus_root: &Path, cursor: &mut Option<String>) -> bool {
         let actions = read_new_actions(bus_root, cursor);
         let mut acted = false;
-        for action in actions {
-            if !action.targets(&self.host) {
+        for queued in actions {
+            if !queued.action.targets(&self.host) {
                 continue;
             }
             // Refresh is a pure publish nudge — no backend work.
-            if matches!(action, LifecycleAction::Refresh { .. }) {
+            if matches!(&queued.action, LifecycleAction::Refresh { .. }) {
                 acted = true;
                 continue;
             }
+            let verdict = self.authorize(&queued);
+            if !verdict.is_valid() {
+                tracing::warn!(
+                    target: "mackesd::alert",
+                    reason = verdict.reason(),
+                    host = %queued.action.host(),
+                    "vm_lifecycle: refused unauthorized direct-libvirt mutation"
+                );
+                continue;
+            }
             let backend = Arc::clone(&self.backend);
+            let action = queued.action;
             match tokio::task::spawn_blocking(move || apply_action(&*backend, &action)).await {
                 Ok(Ok(())) => acted = true,
                 Ok(Err(e)) => {
@@ -2610,6 +2743,292 @@ mod tests {
         assert_eq!(INSTANCES_TOPIC, "event/vm/instances");
         assert!(ACTION_TOPIC.starts_with("action/"));
         assert!(INSTANCES_TOPIC.starts_with("event/"));
+    }
+
+    fn armed_vm_body(
+        unsigned: &str,
+        nonce: &str,
+        verb: &str,
+        host: &str,
+        target: &str,
+        signer: &HmacTokenSigner,
+    ) -> String {
+        armed_vm_body_with_ttl(unsigned, nonce, verb, host, target, signer, MAX_AUTH_TTL_MS)
+    }
+
+    fn armed_vm_body_with_ttl(
+        unsigned: &str,
+        nonce: &str,
+        verb: &str,
+        host: &str,
+        target: &str,
+        signer: &HmacTokenSigner,
+        ttl_ms: i64,
+    ) -> String {
+        armed_vm_body_with_schema_and_ttl(
+            unsigned,
+            nonce,
+            verb,
+            host,
+            target,
+            signer,
+            ACTION_SCHEMA_VERSION,
+            ttl_ms,
+        )
+    }
+
+    fn armed_vm_body_with_schema_and_ttl(
+        unsigned: &str,
+        nonce: &str,
+        verb: &str,
+        host: &str,
+        target: &str,
+        signer: &HmacTokenSigner,
+        schema_version: u64,
+        ttl_ms: i64,
+    ) -> String {
+        let mut body: serde_json::Value = serde_json::from_str(unsigned).unwrap();
+        body["schema_version"] = serde_json::Value::from(schema_version);
+        let unsigned = body.to_string();
+        let token = mackes_mesh_types::cloud::CloudArmedToken::mint(
+            signer,
+            nonce,
+            i64::try_from(now_ms())
+                .unwrap_or(i64::MAX)
+                .saturating_add(ttl_ms),
+            verb,
+            host,
+            target,
+            &mackes_mesh_types::cloud::cloud_request_digest(&unsigned).unwrap(),
+        )
+        .encode();
+        body["armed_token"] = serde_json::Value::String(token);
+        body.to_string()
+    }
+
+    fn write_action(root: &Path, body: &str) {
+        Persist::open(root.to_path_buf())
+            .unwrap()
+            .write(
+                ACTION_TOPIC,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(body),
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_direct_libvirt_mutation_reaches_no_backend_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeLibvirt::with_domain("web1", VmState::ShutOff));
+        let signer = Arc::new(HmacTokenSigner::new(b"vm-gate-test-key".to_vec()));
+        let worker = VmLifecycleWorker::new("node-a".to_string())
+            .with_backend(fake.clone())
+            .with_bus_root(dir.path().to_path_buf())
+            .with_authorization(signer, dir.path().join("auth"));
+        write_action(
+            dir.path(),
+            r#"{"op":"start","host":"node-a","name":"web1"}"#,
+        );
+
+        let mut cursor = None;
+        assert!(!worker.drain_and_apply(dir.path(), &mut cursor).await);
+        assert!(fake.calls().iter().all(|call| call != "start:web1"));
+    }
+
+    #[tokio::test]
+    async fn direct_libvirt_token_cannot_authorize_body_substitution() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeLibvirt::with_domain("web1", VmState::Running));
+        let signer = Arc::new(HmacTokenSigner::new(b"vm-gate-test-key".to_vec()));
+        let worker = VmLifecycleWorker::new("node-a".to_string())
+            .with_backend(fake.clone())
+            .with_bus_root(dir.path().to_path_buf())
+            .with_authorization(signer.clone(), dir.path().join("auth"));
+        let unsigned = r#"{"op":"stop","host":"node-a","name":"web1","force":false}"#;
+        let armed = armed_vm_body(
+            unsigned,
+            "body-substitution-nonce",
+            "vm-stop",
+            "node-a",
+            "web1",
+            signer.as_ref(),
+        );
+        let mut altered: serde_json::Value = serde_json::from_str(&armed).unwrap();
+        altered["force"] = serde_json::Value::Bool(true);
+        write_action(dir.path(), &altered.to_string());
+
+        let mut cursor = None;
+        assert!(!worker.drain_and_apply(dir.path(), &mut cursor).await);
+        assert!(fake
+            .calls()
+            .iter()
+            .all(|call| !call.starts_with("stop:web1")));
+    }
+
+    #[tokio::test]
+    async fn overlong_direct_libvirt_capability_reaches_no_backend_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeLibvirt::with_domain("web1", VmState::ShutOff));
+        let signer = Arc::new(HmacTokenSigner::new(b"vm-gate-test-key".to_vec()));
+        let worker = VmLifecycleWorker::new("node-a".to_string())
+            .with_backend(fake.clone())
+            .with_bus_root(dir.path().to_path_buf())
+            .with_authorization(signer.clone(), dir.path().join("auth"));
+        let unsigned = r#"{"op":"start","host":"node-a","name":"web1"}"#;
+        let armed = armed_vm_body_with_ttl(
+            unsigned,
+            "vm-overlong-capability-nonce",
+            "vm-start",
+            "node-a",
+            "web1",
+            signer.as_ref(),
+            MAX_AUTH_TTL_MS + 30_000,
+        );
+        write_action(dir.path(), &armed);
+
+        let mut cursor = None;
+        assert!(!worker.drain_and_apply(dir.path(), &mut cursor).await);
+        assert!(fake.calls().iter().all(|call| call != "start:web1"));
+    }
+
+    #[tokio::test]
+    async fn future_schema_direct_libvirt_capability_reaches_no_backend_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeLibvirt::with_domain("web1", VmState::ShutOff));
+        let signer = Arc::new(HmacTokenSigner::new(b"vm-gate-test-key".to_vec()));
+        let worker = VmLifecycleWorker::new("node-a".to_string())
+            .with_backend(fake.clone())
+            .with_bus_root(dir.path().to_path_buf())
+            .with_authorization(signer.clone(), dir.path().join("auth"));
+        let unsigned = r#"{"op":"start","host":"node-a","name":"web1"}"#;
+        let armed = armed_vm_body_with_schema_and_ttl(
+            unsigned,
+            "vm-future-schema-capability-nonce",
+            "vm-start",
+            "node-a",
+            "web1",
+            signer.as_ref(),
+            ACTION_SCHEMA_VERSION + 1,
+            MAX_AUTH_TTL_MS,
+        );
+        write_action(dir.path(), &armed);
+
+        let mut cursor = None;
+        assert!(!worker.drain_and_apply(dir.path(), &mut cursor).await);
+        assert!(fake.calls().iter().all(|call| call != "start:web1"));
+    }
+
+    #[tokio::test]
+    async fn direct_libvirt_nonce_replay_is_refused_across_worker_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth_root = dir.path().join("auth");
+        let signer = Arc::new(HmacTokenSigner::new(b"vm-gate-test-key".to_vec()));
+        let unsigned = r#"{"op":"start","host":"node-a","name":"web1"}"#;
+        let armed = armed_vm_body(
+            unsigned,
+            "restart-replay-nonce",
+            "vm-start",
+            "node-a",
+            "web1",
+            signer.as_ref(),
+        );
+        write_action(dir.path(), &armed);
+
+        let first = Arc::new(FakeLibvirt::with_domain("web1", VmState::ShutOff));
+        let worker = VmLifecycleWorker::new("node-a".to_string())
+            .with_backend(first.clone())
+            .with_bus_root(dir.path().to_path_buf())
+            .with_authorization(signer.clone(), auth_root.clone());
+        let mut cursor = None;
+        assert!(worker.drain_and_apply(dir.path(), &mut cursor).await);
+        assert!(first.calls().iter().any(|call| call == "start:web1"));
+
+        let after_restart = Arc::new(FakeLibvirt::with_domain("web1", VmState::ShutOff));
+        let restarted = VmLifecycleWorker::new("node-a".to_string())
+            .with_backend(after_restart.clone())
+            .with_bus_root(dir.path().to_path_buf())
+            .with_authorization(signer, auth_root);
+        let mut replay_cursor = None;
+        assert!(
+            !restarted
+                .drain_and_apply(dir.path(), &mut replay_cursor)
+                .await
+        );
+        assert!(after_restart
+            .calls()
+            .iter()
+            .all(|call| call != "start:web1"));
+    }
+
+    #[test]
+    fn vm_replay_ledger_cleans_expired_rows_and_seals_new_claims() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let auth_root = dir.path().join("auth");
+        let ledger = auth_root.join("spent-nonces");
+        std::fs::create_dir_all(&ledger).unwrap();
+
+        let expired_path = ledger.join(crate::workers::cloud::nonce_digest("expired-vm-nonce"));
+        std::fs::write(&expired_path, "99").unwrap();
+        let unrelated = ledger.join("operator-note");
+        std::fs::write(&unrelated, "do not delete").unwrap();
+
+        let nonce = "fresh-vm-ledger-nonce";
+        let expires_at_ms = 9_999;
+        assert_eq!(claim_nonce(&auth_root, nonce, expires_at_ms, 100), Ok(true));
+
+        assert!(!expired_path.exists(), "expired ledger row must be cleaned");
+        assert!(unrelated.exists(), "cleanup must ignore unknown entries");
+        let claim_path = ledger.join(crate::workers::cloud::nonce_digest(nonce));
+        assert_eq!(std::fs::read_to_string(&claim_path).unwrap(), "9999");
+        assert_eq!(
+            std::fs::metadata(&claim_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(&ledger).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[tokio::test]
+    async fn cloud_nonce_claim_blocks_same_nonce_on_direct_libvirt_plane() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth_root = dir.path().join("shared-auth");
+        let nonce = "cross-plane-replay-nonce";
+        let now = i64::try_from(now_ms()).unwrap_or(i64::MAX);
+        let cloud = crate::workers::cloud::CloudWorker::new(
+            "node-a".to_string(),
+            "peer:node-a".to_string(),
+            dir.path().join("state"),
+        )
+        .with_auth_root(auth_root.clone())
+        .with_bus_root(None);
+        assert_eq!(cloud.claim_armed_nonce(nonce, now + 60_000, now), Ok(true));
+
+        let fake = Arc::new(FakeLibvirt::with_domain("web1", VmState::ShutOff));
+        let signer = Arc::new(HmacTokenSigner::new(b"vm-gate-test-key".to_vec()));
+        let worker = VmLifecycleWorker::new("node-a".to_string())
+            .with_backend(fake.clone())
+            .with_bus_root(dir.path().to_path_buf())
+            .with_authorization(signer.clone(), auth_root);
+        let unsigned = r#"{"op":"start","host":"node-a","name":"web1"}"#;
+        let armed = armed_vm_body(
+            unsigned,
+            nonce,
+            "vm-start",
+            "node-a",
+            "web1",
+            signer.as_ref(),
+        );
+        write_action(dir.path(), &armed);
+
+        let mut cursor = None;
+        assert!(!worker.drain_and_apply(dir.path(), &mut cursor).await);
+        assert!(fake.calls().iter().all(|call| call != "start:web1"));
     }
 
     #[test]

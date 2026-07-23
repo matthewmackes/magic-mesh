@@ -2347,7 +2347,7 @@ mod tests {
     #[test]
     fn parse_regions_parses_doctl_json() {
         let json = r#"[
-            {"slug":"nyc3","name":"New York 3","available":true,"sizes":["s-1vcpu-1gb"]},
+            {"slug":"nyc3","name":"New York 3","available":true,"sizes":["s-1vcpu-512mb-10gb","s-1vcpu-1gb"]},
             {"slug":"ams2","name":"Amsterdam 2","available":false}
         ]"#;
         let regions = parse_regions(json);

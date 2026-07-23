@@ -56,10 +56,10 @@ use mde_seat::{
 };
 
 use crate::bt_pairing::{pairing_dialog, PairingBridge};
-use crate::dock::icon_texture;
 use crate::power_honor::PowerHonorConfig;
 use crate::power_settings;
 use crate::seat_pump::{connector_key, SnapshotPump};
+use crate::surfaces::icon_texture;
 
 const SYSTEM_READING_SEAT_COPY: &str = "Reading the seat...";
 const SYSTEM_SCANNING_COPY: &str = "Scanning...";
@@ -474,13 +474,6 @@ impl SystemState {
         self.snapshot.as_ref()
     }
 
-    /// Persisted Win10-hybrid taskbar auto-hide preference. The shell mirrors
-    /// this into [`crate::dock::DockState`] each frame, keeping Settings as the
-    /// source of truth while the dock owns the animation and strut behavior.
-    pub(crate) const fn taskbar_autohide(&self) -> bool {
-        self.appearance.taskbar_autohide
-    }
-
     /// The persisted shell layout profile. Main owns layout-specific chrome and reads
     /// this every frame after [`Self::poll`] reapplies the matching shared density.
     pub(crate) const fn layout_profile(&self) -> LayoutProfile {
@@ -493,7 +486,7 @@ impl SystemState {
         &self.car_keys
     }
 
-    /// The live density mirrored into the taskbar and other shell chrome: the
+    /// The live density mirrored into shell chrome: the
     /// profile's anchor density, refined by the seat's hardware formfactor.
     /// PLATFORM-INTERFACES Q42: a hardware Tablet↔Laptop flip keeps adjusting
     /// density WITHIN Construct (formfactor ≠ profile); Car pins Touch.
@@ -2555,7 +2548,7 @@ const APPEARANCE_CONFIG_FILE: &str = "settings-appearance.json";
 /// actually applies at runtime. Loaded on start and restored on open, saved on a pick
 /// — the [`SettingsNav`] client-data-dir JSON idiom, reused. All fields drive a real
 /// live effect through [`SystemState::apply_appearance`] or the shell's
-/// `DockState` mirror (§7 — no dead toggle).
+/// live shell placement (§7 — no dead toggle).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 struct AppearanceConfig {
     /// The platform colour mode.
@@ -2576,10 +2569,6 @@ struct AppearanceConfig {
     /// outside Normal.
     #[serde(default)]
     motion_mode: AppearanceMotionMode,
-    /// WIN10-HYBRID taskbar auto-hide: when enabled, the bottom bar reserves no
-    /// strut and reveals from the bottom hot edge.
-    #[serde(default)]
-    taskbar_autohide: bool,
 }
 
 impl<'de> Deserialize<'de> for AppearanceConfig {
@@ -2600,8 +2589,6 @@ impl<'de> Deserialize<'de> for AppearanceConfig {
             #[serde(default)]
             motion_mode: Option<AppearanceMotionMode>,
             #[serde(default)]
-            taskbar_autohide: bool,
-            #[serde(default)]
             reduce_motion: bool,
         }
 
@@ -2616,7 +2603,6 @@ impl<'de> Deserialize<'de> for AppearanceConfig {
             } else {
                 AppearanceMotionMode::Normal
             }),
-            taskbar_autohide: wire.taskbar_autohide,
         })
     }
 }
@@ -2698,6 +2684,23 @@ fn sidebar_rows(filter: &str) -> Vec<(SettingsGroup, Vec<SettingsSection>)> {
         .collect()
 }
 
+/// Keep at most `limit` sidebar rows while preserving taxonomy order and group
+/// boundaries. The Car motion policy uses this for Q35's glance-length list;
+/// search and the menubar remain available, so shortening the default rail is a
+/// soft presentation limit rather than a navigation lockout.
+fn limit_sidebar_rows(
+    mut groups: Vec<(SettingsGroup, Vec<SettingsSection>)>,
+    limit: usize,
+) -> Vec<(SettingsGroup, Vec<SettingsSection>)> {
+    let mut remaining = limit;
+    for (_, sections) in &mut groups {
+        sections.truncate(remaining);
+        remaining = remaining.saturating_sub(sections.len());
+    }
+    groups.retain(|(_, sections)| !sections.is_empty());
+    groups
+}
+
 /// The Settings sidebar (PLATFORM-INTERFACES Q27): an inline search field over
 /// the shared Q19 [`Sidebar`] — the domain groups as dim section headers, their
 /// sections as selectable rows wearing the existing YAMIS glyphs
@@ -2715,7 +2718,14 @@ fn settings_rail(ui: &mut egui::Ui, nav: &mut SettingsNav, filter: &mut String) 
             .hint_text("Search settings"),
     );
     ui.add_space(Style::SP_S);
-    let groups = sidebar_rows(filter);
+    let all_groups = sidebar_rows(filter);
+    let full_len = all_groups.iter().map(|(_, sections)| sections.len()).sum();
+    let visible_len = crate::car_motion_policy::glance_clamp(ui.ctx(), full_len);
+    let groups = limit_sidebar_rows(all_groups, visible_len);
+    if visible_len < full_len {
+        muted_note(ui, "Essential settings while moving · search for more");
+        ui.add_space(Style::SP_XS);
+    }
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -3969,6 +3979,11 @@ fn power_section(
                          confirm: Option<PowerVerb>,
                          cfg: &mut PowerHonorConfig,
                          actions: &mut Vec<SysAction>| {
+        let defer_destructive = crate::car_motion_policy::in_motion(ui.ctx());
+        if defer_destructive {
+            crate::car_motion_policy::deferred_notice(ui);
+            ui.add_space(Style::SP_S);
+        }
         // Host power verbs — Lock is always offered; the host-down verbs (Suspend,
         // Hibernate, Reboot, PowerOff) are gated by logind's CanX and a two-click
         // confirm (lock 12). Hibernate (POWER-4) rides the same row + gate as Suspend.
@@ -3977,11 +3992,46 @@ fn power_section(
             snap,
             |s| &s.power,
             |ui, caps: &PowerCaps| {
-                power_verb_row(ui, PowerVerb::Lock, Avail::Yes, confirm, actions);
-                power_verb_row(ui, PowerVerb::Suspend, caps.suspend, confirm, actions);
-                power_verb_row(ui, PowerVerb::Hibernate, caps.hibernate, confirm, actions);
-                power_verb_row(ui, PowerVerb::Reboot, caps.reboot, confirm, actions);
-                power_verb_row(ui, PowerVerb::PowerOff, caps.poweroff, confirm, actions);
+                power_verb_row(
+                    ui,
+                    PowerVerb::Lock,
+                    Avail::Yes,
+                    confirm,
+                    defer_destructive,
+                    actions,
+                );
+                power_verb_row(
+                    ui,
+                    PowerVerb::Suspend,
+                    caps.suspend,
+                    confirm,
+                    defer_destructive,
+                    actions,
+                );
+                power_verb_row(
+                    ui,
+                    PowerVerb::Hibernate,
+                    caps.hibernate,
+                    confirm,
+                    defer_destructive,
+                    actions,
+                );
+                power_verb_row(
+                    ui,
+                    PowerVerb::Reboot,
+                    caps.reboot,
+                    confirm,
+                    defer_destructive,
+                    actions,
+                );
+                power_verb_row(
+                    ui,
+                    PowerVerb::PowerOff,
+                    caps.poweroff,
+                    confirm,
+                    defer_destructive,
+                    actions,
+                );
             },
         );
         // Idle-suspend + lid-close policy (POWER-5) — the honorer reads this config
@@ -4079,6 +4129,7 @@ fn power_verb_row(
     verb: PowerVerb,
     avail: Avail,
     confirm: Option<PowerVerb>,
+    defer_destructive: bool,
     actions: &mut Vec<SysAction>,
 ) {
     ui.horizontal(|ui| {
@@ -4108,6 +4159,13 @@ fn power_verb_row(
             }
             return;
         }
+        if power_verb_deferred(verb, defer_destructive) {
+            ui.colored_label(
+                Style::TEXT_DIM,
+                RichText::new("Available when stopped").size(Style::SMALL),
+            );
+            return;
+        }
         // A host-down verb: two-click confirm (lock 12).
         if confirm == Some(verb) {
             if ui
@@ -4133,6 +4191,13 @@ fn power_verb_row(
             actions.push(SysAction::ArmConfirm(verb));
         }
     });
+}
+
+/// Q35 defers only host-down verbs while moving. Lock stays immediately
+/// available, which keeps the policy soft and preserves the driver's physical
+/// keyboard escape hatch.
+const fn power_verb_deferred(verb: PowerVerb, in_motion: bool) -> bool {
+    in_motion && verb.needs_confirm()
 }
 
 /// The Wallpaper section: policy for the chromeless desktop page and Bing
@@ -4339,7 +4404,6 @@ fn key_mapping_section(ui: &mut egui::Ui, car_keys: &mut crate::car_keymap::CarK
 /// the shell **genuinely applies at runtime**: the **colour mode** (dark status quo
 /// or Windows 2000 basic light), the interactive **accent**, the **text-scale**,
 /// the **motion mode** (MOTION-DRM-5 normal/reduced/disabled runtime policy), and
-/// the Win10-hybrid taskbar auto-hide preference mirrored into `DockState`.
 /// Each pick mutates the persisted [`AppearanceConfig`] in place; the change is
 /// saved after the render borrow and applied live by [`SystemState::apply_appearance`]
 /// / `main.rs` on the next frame. Laid **across** the wide pane (SETTINGS-3) as
@@ -4473,38 +4537,12 @@ fn theme_section(ui: &mut egui::Ui, appearance: &mut AppearanceConfig) {
             appearance.motion_mode = mode;
         }
     });
-    ui.add_space(Style::SP_M);
-    ui.label(
-        RichText::new("Taskbar")
-            .color(Style::TEXT_DIM)
-            .size(Style::SMALL)
-            .strong(),
-    );
-    ui.add_space(Style::SP_XS);
-    tile(ui, |ui| {
-        let mut taskbar_autohide = appearance.taskbar_autohide;
-        if ui
-            .checkbox(
-                &mut taskbar_autohide,
-                RichText::new("Auto-hide taskbar").size(Style::BODY),
-            )
-            .changed()
-        {
-            appearance.taskbar_autohide = taskbar_autohide;
-        }
-        ui.label(
-            RichText::new("Reveal from the bottom edge")
-                .color(Style::TEXT_DIM)
-                .size(Style::SMALL),
-        );
-    });
     ui.add_space(Style::SP_S);
     muted_note(
         ui,
         "Accent re-tints every surface's highlights; layout changes placement and \
          control density; text size scales the whole interface. Motion mode applies \
-         normal, reduced, or endpoint-only movement. Taskbar auto-hide floats the \
-         bottom bar from the edge.",
+         normal, reduced, or endpoint-only movement.",
     );
 }
 

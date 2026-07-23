@@ -114,6 +114,9 @@ pub struct PeerCertRow {
     pub cert_pem: String,
     /// Overlay IP allocated to the peer.
     pub overlay_ip: String,
+    /// Requester-owned Nebula public key used for public-key-only rotation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key_pem: Option<String>,
     /// Unix-epoch seconds when the cert was signed.
     pub created_at: i64,
     /// Unix-epoch seconds when the cert expires.
@@ -267,7 +270,7 @@ pub fn assemble_from_store(
     {
         let mut stmt = conn
             .prepare(
-                "SELECT node_id, epoch, cert_pem, overlay_ip, created_at, expires_at \
+                "SELECT node_id, epoch, cert_pem, overlay_ip, public_key_pem, created_at, expires_at \
                  FROM nebula_peer_certs \
                  WHERE revoked_at IS NULL \
                  ORDER BY node_id ASC, epoch DESC",
@@ -280,8 +283,9 @@ pub fn assemble_from_store(
                     epoch: r.get(1)?,
                     cert_pem: r.get(2)?,
                     overlay_ip: r.get(3)?,
-                    created_at: r.get(4)?,
-                    expires_at: r.get(5)?,
+                    public_key_pem: r.get(4)?,
+                    created_at: r.get(5)?,
+                    expires_at: r.get(6)?,
                 })
             })
             .map_err(|e| CaError::Sql(e.to_string()))?;
@@ -336,13 +340,14 @@ pub fn restore_to_store(
     for p in &bundle.peer_certs {
         conn.execute(
             "INSERT OR REPLACE INTO nebula_peer_certs \
-             (node_id, epoch, cert_pem, overlay_ip, created_at, expires_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             (node_id, epoch, cert_pem, overlay_ip, public_key_pem, created_at, expires_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             rusqlite::params![
                 p.node_id,
                 p.epoch,
                 p.cert_pem,
                 p.overlay_ip,
+                p.public_key_pem,
                 p.created_at,
                 p.expires_at,
             ],
@@ -373,6 +378,7 @@ mod tests {
                 epoch: 0,
                 cert_pem: "-----BEGIN CERT-----\nPEER\n-----END CERT-----\n".into(),
                 overlay_ip: "10.42.0.5".into(),
+                public_key_pem: Some("-----BEGIN NEBULA X25519 PUBLIC KEY-----\nPUB\n-----END NEBULA X25519 PUBLIC KEY-----\n".into()),
                 created_at: 1716000000,
                 expires_at: 1747536000,
             }],

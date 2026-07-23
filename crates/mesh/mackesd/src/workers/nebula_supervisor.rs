@@ -259,6 +259,7 @@ impl NebulaSupervisor {
             role,
             &blocklist,
             &self.workgroup_root,
+            Some(b"key-pem"),
         )?;
         // GF-1.3.a — publish the overlay IP so downstream
         // services (notably mackes-glusterd-nebula-bind in
@@ -299,14 +300,24 @@ impl NebulaSupervisor {
     /// The non-empty guard is load-bearing: a transient empty/failed directory read
     /// must NEVER wipe a peer's lighthouse set and strand it off the overlay.
     fn reconcile_lighthouse_roster(&self) {
+        let mut bundle = match crate::ca::bundle::read_bundle(&self.bundle_path) {
+            Ok(b) => b,
+            // No bundle yet (pre-enroll) — nothing to reconcile.
+            Err(_) => return,
+        };
         let peers = crate::substrate::peers::read_directory(&self.workgroup_root);
+        let authority = bundle.relay_trust_authority.clone();
         let mut roster: Vec<crate::ca::bundle::LighthouseEntry> =
             mackes_mesh_types::lighthouse::roster_from_directory(&peers)
                 .into_iter()
-                .map(|a| crate::ca::bundle::LighthouseEntry {
-                    node_id: a.node_id,
-                    overlay_ip: a.overlay_ip,
-                    external_addr: a.external_addr,
+                .map(|a| {
+                    crate::ca::bundle::lighthouse_entry_with_relay_trust(
+                        &self.workgroup_root,
+                        a.node_id,
+                        a.overlay_ip,
+                        a.external_addr,
+                        authority.as_deref(),
+                    )
                 })
                 .collect();
         if roster.is_empty() {
@@ -314,11 +325,29 @@ impl NebulaSupervisor {
             // bundle's existing roster untouched.
             return;
         }
-        let mut bundle = match crate::ca::bundle::read_bundle(&self.bundle_path) {
-            Ok(b) => b,
-            // No bundle yet (pre-enroll) — nothing to reconcile.
-            Err(_) => return,
-        };
+        // Replication of a directory row and that lighthouse's self-bundle is
+        // not atomic. Preserve already authenticated trust during that window;
+        // a missing advertisement must never erase a usable pin.
+        for entry in &mut roster {
+            if entry.relay_tls.is_none() {
+                entry.relay_tls = bundle
+                    .lighthouses
+                    .iter()
+                    .find(|current| current.node_id == entry.node_id)
+                    .and_then(|current| current.relay_tls.clone())
+                    .filter(|identity| {
+                        authority.as_deref().is_some_and(|public_key| {
+                            crate::ca::bundle::verify_relay_tls_identity(
+                                identity,
+                                &entry.node_id,
+                                &entry.overlay_ip,
+                                &entry.external_addr,
+                                public_key,
+                            )
+                        })
+                    });
+            }
+        }
         // Compare as sets (sorted by node_id) so render-order differences alone
         // don't trigger a rewrite/reload every tick.
         roster.sort_by(|a, b| a.node_id.cmp(&b.node_id));
@@ -377,6 +406,154 @@ pub enum ConfigRole {
     Peer,
 }
 
+fn install_identity_generation(
+    config_dir: &Path,
+    bundle: &crate::ca::bundle::NebulaBundle,
+    requester_private_key: Option<&[u8]>,
+) -> Result<(), String> {
+    use std::os::unix::fs::{symlink, DirBuilderExt};
+
+    let identity_dir = config_dir.join("identity");
+    let mut identity_builder = std::fs::DirBuilder::new();
+    identity_builder.mode(0o700).recursive(true);
+    identity_builder
+        .create(&identity_dir)
+        .map_err(|e| format!("create identity dir {}: {e}", identity_dir.display()))?;
+
+    // Replicated steady-state refreshes may update topology/config, but cannot
+    // replace an already-active identity. Only the fingerprint-pinned network
+    // enrollment path supplies `requester_private_key` and is authorized to
+    // activate a new cert/key generation.
+    let current_cert = identity_dir.join("current/host.crt");
+    if requester_private_key.is_none() && current_cert.exists() {
+        let active_cert = std::fs::read(&current_cert)
+            .map_err(|e| format!("read active identity cert {}: {e}", current_cert.display()))?;
+        if active_cert != bundle.peer_cert_pem.as_bytes() {
+            return Err(
+                "replicated bundle attempted to replace the active Nebula identity; authenticated enrollment is required"
+                    .into(),
+            );
+        }
+        replace_symlink(
+            &config_dir.join("host.crt"),
+            Path::new("identity/current/host.crt"),
+        )?;
+        replace_symlink(
+            &config_dir.join("host.key"),
+            Path::new("identity/current/host.key"),
+        )?;
+        return Ok(());
+    }
+
+    let owned_key;
+    let key_bytes = if let Some(key) = requester_private_key {
+        key
+    } else {
+        let current_key = identity_dir.join("current/host.key");
+        let legacy_key = config_dir.join("host.key");
+        owned_key = crate::ca::seal::read_sealed(if current_key.exists() {
+            &current_key
+        } else {
+            &legacy_key
+        })
+        .map_err(|e| format!("local requester-owned Nebula key unavailable: {e}"))?;
+        &owned_key
+    };
+
+    let generation_dir = (0..16)
+        .find_map(|_| {
+            let candidate = identity_dir.join(format!(
+                "generation-{}-{:016x}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            match builder.create(&candidate) {
+                Ok(()) => Some(Ok(candidate)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+                Err(error) => Some(Err(format!(
+                    "create identity generation {}: {error}",
+                    candidate.display()
+                ))),
+            }
+        })
+        .unwrap_or_else(|| Err("identity generation tempfile collisions".into()))?;
+    let stage_result = (|| {
+        crate::ca::seal::write_atomic_sealed(
+            &generation_dir.join("host.crt"),
+            bundle.peer_cert_pem.as_bytes(),
+        )
+        .map_err(|e| e.to_string())?;
+        crate::ca::seal::write_atomic_sealed(&generation_dir.join("host.key"), key_bytes)
+            .map_err(|e| e.to_string())?;
+        std::fs::File::open(&generation_dir)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| {
+                format!(
+                    "fsync identity generation {}: {e}",
+                    generation_dir.display()
+                )
+            })
+    })();
+    if let Err(error) = stage_result {
+        let _ = std::fs::remove_dir_all(&generation_dir);
+        return Err(error);
+    }
+
+    let generation_leaf = generation_dir
+        .file_name()
+        .ok_or_else(|| "identity generation has no filename".to_string())?;
+    let temp_link = identity_dir.join(format!(
+        ".current.tmp.{}.{:016x}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    symlink(generation_leaf, &temp_link)
+        .map_err(|e| format!("create identity switch {}: {e}", temp_link.display()))?;
+    if let Err(error) = std::fs::rename(&temp_link, identity_dir.join("current")) {
+        let _ = std::fs::remove_file(&temp_link);
+        let _ = std::fs::remove_dir_all(&generation_dir);
+        return Err(format!("activate identity generation: {error}"));
+    }
+    std::fs::File::open(&identity_dir)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|e| format!("fsync identity dir {}: {e}", identity_dir.display()))?;
+
+    // Compatibility paths point through the single atomic `current` switch;
+    // replacing either link cannot expose a mismatched pair to Nebula because
+    // the generated config reads the identity/current paths directly.
+    replace_symlink(
+        &config_dir.join("host.crt"),
+        Path::new("identity/current/host.crt"),
+    )?;
+    replace_symlink(
+        &config_dir.join("host.key"),
+        Path::new("identity/current/host.key"),
+    )?;
+    Ok(())
+}
+
+fn replace_symlink(path: &Path, target: &Path) -> Result<(), String> {
+    use std::os::unix::fs::symlink;
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent", path.display()))?;
+    let temp = parent.join(format!(
+        ".link.tmp.{}.{:016x}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    symlink(target, &temp).map_err(|e| format!("create symlink {}: {e}", temp.display()))?;
+    std::fs::rename(&temp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&temp);
+        format!("activate symlink {}: {e}", path.display())
+    })?;
+    std::fs::File::open(parent)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|e| format!("fsync symlink parent {}: {e}", parent.display()))
+}
+
 /// NF-3.5 — write the four canonical Nebula config files
 /// atomically (temp + rename per file). Caller is the
 /// supervisor's `refresh_config` path; tests pass a tempdir
@@ -387,16 +564,13 @@ pub fn materialize_config(
     role: ConfigRole,
     blocklist: &[String],
     workgroup_root: &Path,
+    requester_private_key: Option<&[u8]>,
 ) -> Result<(), String> {
     std::fs::create_dir_all(config_dir)
         .map_err(|e| format!("mkdir {}: {e}", config_dir.display()))?;
 
     write_atomic(&config_dir.join("ca.crt"), bundle.ca_cert_pem.as_bytes())?;
-    write_atomic(
-        &config_dir.join("host.crt"),
-        bundle.peer_cert_pem.as_bytes(),
-    )?;
-    write_atomic(&config_dir.join("host.key"), bundle.peer_key_pem.as_bytes())?;
+    install_identity_generation(config_dir, bundle, requester_private_key)?;
     // PLANES-17 — fold the fleet's hop/exit routes into this node's
     // unsafe_routes. Exits ride only behind a passing validation verdict.
     let routes = crate::nebula_topology::derive_routes(
@@ -532,6 +706,56 @@ fn unique_lighthouse_static_maps<'a>(
     entries
 }
 
+fn address_host(address: &str) -> &str {
+    address
+        .rsplit_once(':')
+        .map_or(address, |(host, port)| {
+            if port.parse::<u16>().is_ok() {
+                host
+            } else {
+                address
+            }
+        })
+        .trim_matches(['[', ']'])
+}
+
+fn https_proxy_endpoint_for(
+    bundle: &crate::ca::bundle::NebulaBundle,
+    lighthouse: &crate::ca::bundle::LighthouseEntry,
+    fallback_host: Option<&str>,
+    bridge_bind: Option<&str>,
+) -> Option<String> {
+    let fallback_host = address_host(fallback_host?);
+    if address_host(&lighthouse.external_addr) != fallback_host {
+        return None;
+    }
+    let authority = bundle.relay_trust_authority.as_deref()?;
+    let identity = lighthouse.relay_tls.as_ref()?;
+    if !crate::ca::bundle::verify_relay_tls_identity(
+        identity,
+        &lighthouse.node_id,
+        &lighthouse.overlay_ip,
+        &lighthouse.external_addr,
+        authority,
+    ) {
+        return None;
+    }
+    let bind: std::net::SocketAddr = bridge_bind
+        .unwrap_or(crate::workers::mesh_router::DEFAULT_HTTPS_UDP_BRIDGE_BIND)
+        .parse()
+        .ok()?;
+    let dial_ip = if bind.ip().is_unspecified() {
+        if bind.is_ipv4() {
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        } else {
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+        }
+    } else {
+        bind.ip()
+    };
+    Some(std::net::SocketAddr::new(dial_ip, bind.port()).to_string())
+}
+
 fn render_config_yaml_inner(
     bundle: &crate::ca::bundle::NebulaBundle,
     role: ConfigRole,
@@ -545,8 +769,8 @@ fn render_config_yaml_inner(
     out.push_str("# on every bundle refresh.\n\n");
     out.push_str("pki:\n");
     out.push_str("  ca: /etc/nebula/ca.crt\n");
-    out.push_str("  cert: /etc/nebula/host.crt\n");
-    out.push_str("  key: /etc/nebula/host.key\n");
+    out.push_str("  cert: /etc/nebula/identity/current/host.crt\n");
+    out.push_str("  key: /etc/nebula/identity/current/host.key\n");
     // ENT-3 (C2) — revoked-cert fingerprints: nebula refuses tunnels
     // with these certs immediately, fleet-wide, instead of trusting
     // them until expiry.
@@ -561,10 +785,26 @@ fn render_config_yaml_inner(
     }
     out.push_str("static_host_map:\n");
     for lh in unique_lighthouse_static_maps(bundle) {
-        out.push_str(&format!(
-            "  \"{}\": [\"{}\"]\n",
-            lh.overlay_ip, lh.external_addr,
-        ));
+        let proxy = https_proxy_endpoint_for(
+            bundle,
+            lh,
+            std::env::var(crate::transport::https443::FALLBACK_HOST_ENV)
+                .ok()
+                .as_deref(),
+            std::env::var(crate::workers::mesh_router::HTTPS_UDP_BRIDGE_BIND_ENV)
+                .ok()
+                .as_deref(),
+        );
+        match proxy {
+            Some(proxy) => out.push_str(&format!(
+                "  \"{}\": [\"{}\", \"{}\"]\n",
+                lh.overlay_ip, lh.external_addr, proxy,
+            )),
+            None => out.push_str(&format!(
+                "  \"{}\": [\"{}\"]\n",
+                lh.overlay_ip, lh.external_addr,
+            )),
+        }
     }
     out.push_str("\nlighthouse:\n");
     match role {
@@ -657,13 +897,7 @@ pub fn render_lighthouse_config_yaml_with_routes(
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let tmp = path.with_extension(format!(
-        "{}.tmp",
-        path.extension().and_then(|s| s.to_str()).unwrap_or("")
-    ));
-    std::fs::write(&tmp, bytes).map_err(|e| format!("write tmp {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path)
-        .map_err(|e| format!("rename {} → {}: {e}", tmp.display(), path.display()))
+    crate::ca::seal::write_atomic_sealed(path, bytes).map_err(|e| e.to_string())
 }
 
 /// GF-1.3.a — atomic-write the plain-text overlay IP file.
@@ -751,15 +985,15 @@ mod tests {
             epoch: 0,
             ca_cert_pem: "ca-pem".into(),
             peer_cert_pem: "peer-pem".into(),
-            peer_key_pem: "key-pem".into(),
             overlay_ip: "10.42.0.5".into(),
             mesh_cidr: "10.42.0.0/16".into(),
             lighthouses: vec![LighthouseEntry {
                 node_id: "peer:lh1".into(),
                 overlay_ip: "10.42.0.1".into(),
                 external_addr: "lh1.example.com:4242".into(),
+                relay_tls: None,
             }],
-            ca_key_pem: None,
+            relay_trust_authority: None,
             created_at: 1,
         }
     }
@@ -773,6 +1007,7 @@ mod tests {
             ConfigRole::Peer,
             &[],
             tmp.path(),
+            Some(b"key-pem"),
         )
         .expect("write");
         assert!(tmp.path().join("ca.crt").exists());
@@ -780,6 +1015,75 @@ mod tests {
         assert!(tmp.path().join("host.key").exists());
         assert!(tmp.path().join("config.yaml").exists());
         assert!(!tmp.path().join("lighthouse-config.yaml").exists());
+    }
+
+    #[test]
+    fn authenticated_identity_rotation_switches_cert_and_key_as_one_generation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let first = sample_bundle();
+        materialize_config(
+            tmp.path(),
+            &first,
+            ConfigRole::Peer,
+            &[],
+            tmp.path(),
+            Some(b"key-generation-a"),
+        )
+        .expect("first identity");
+        let mut second = first.clone();
+        second.peer_cert_pem = "cert-generation-b".into();
+        materialize_config(
+            tmp.path(),
+            &second,
+            ConfigRole::Peer,
+            &[],
+            tmp.path(),
+            Some(b"key-generation-b"),
+        )
+        .expect("authenticated rotation");
+        assert_eq!(
+            std::fs::read(tmp.path().join("identity/current/host.crt")).unwrap(),
+            b"cert-generation-b"
+        );
+        assert_eq!(
+            crate::ca::seal::read_sealed(&tmp.path().join("identity/current/host.key")).unwrap(),
+            b"key-generation-b"
+        );
+    }
+
+    #[test]
+    fn replicated_bundle_cannot_replace_active_identity() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let first = sample_bundle();
+        materialize_config(
+            tmp.path(),
+            &first,
+            ConfigRole::Peer,
+            &[],
+            tmp.path(),
+            Some(b"local-requester-key"),
+        )
+        .expect("first identity");
+        let mut hostile = first;
+        hostile.peer_cert_pem = "hostile-replicated-cert".into();
+        let error = materialize_config(
+            tmp.path(),
+            &hostile,
+            ConfigRole::Peer,
+            &[],
+            tmp.path(),
+            None,
+        )
+        .expect_err("replicated identity replacement must fail closed");
+        assert!(error.contains("authenticated enrollment is required"));
+        assert_eq!(
+            std::fs::read(tmp.path().join("identity/current/host.crt")).unwrap(),
+            b"peer-pem"
+        );
+        assert_eq!(
+            crate::ca::seal::read_sealed(&tmp.path().join("identity/current/host.key")).unwrap(),
+            b"local-requester-key"
+        );
     }
 
     #[test]
@@ -796,6 +1100,7 @@ mod tests {
             ConfigRole::Host,
             &[],
             tmp.path(),
+            Some(b"key-pem"),
         )
         .expect("write");
         assert!(
@@ -814,6 +1119,7 @@ mod tests {
             ConfigRole::Host,
             &[],
             tmp.path(),
+            Some(b"key-pem"),
         )
         .expect("write");
         assert!(tmp.path().join("lighthouse-config.yaml").exists());
@@ -839,6 +1145,7 @@ mod tests {
             ConfigRole::Peer,
             &[],
             tmp.path(),
+            Some(b"key-pem"),
         )
         .expect("write");
         let cfg = std::fs::read_to_string(tmp.path().join("config.yaml")).unwrap();
@@ -858,12 +1165,55 @@ mod tests {
     }
 
     #[test]
+    fn signed_configured_lighthouse_gets_local_https_proxy_endpoint() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[9_u8; 32]);
+        let mut bundle = sample_bundle();
+        bundle.relay_trust_authority =
+            Some(crate::ca::bundle::relay_trust_authority_public_key(&key));
+        let lighthouse = &mut bundle.lighthouses[0];
+        let identity = crate::ca::bundle::RelayTlsIdentity::from_certificate_pem(
+            "-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n",
+        )
+        .expect("identity");
+        lighthouse.relay_tls = Some(crate::ca::bundle::sign_relay_tls_identity(
+            identity,
+            &lighthouse.node_id,
+            &lighthouse.overlay_ip,
+            &lighthouse.external_addr,
+            &key,
+        ));
+        assert_eq!(
+            https_proxy_endpoint_for(
+                &bundle,
+                &bundle.lighthouses[0],
+                Some("lh1.example.com:443"),
+                Some("0.0.0.0:4244"),
+            )
+            .as_deref(),
+            Some("127.0.0.1:4244"),
+        );
+    }
+
+    #[test]
+    fn unsigned_lighthouse_never_gets_local_https_proxy_endpoint() {
+        let bundle = sample_bundle();
+        assert!(https_proxy_endpoint_for(
+            &bundle,
+            &bundle.lighthouses[0],
+            Some("lh1.example.com"),
+            Some("127.0.0.1:4244"),
+        )
+        .is_none());
+    }
+
+    #[test]
     fn duplicate_lighthouse_rows_render_one_static_map_preferring_numeric_addr() {
         let mut b = sample_bundle();
         b.lighthouses.push(LighthouseEntry {
             node_id: "peer:lh1".into(),
             overlay_ip: "10.42.0.1".into(),
             external_addr: "203.0.113.7:4242".into(),
+            relay_tls: None,
         });
 
         let yaml = render_config_yaml(&b, ConfigRole::Peer);
@@ -938,6 +1288,7 @@ mod tests {
             node_id: "peer:lh2".into(),
             overlay_ip: "10.42.0.2".into(),
             external_addr: "lh2.example.com:4242".into(),
+            relay_tls: None,
         });
         let yaml = render_config_yaml(&b, ConfigRole::Host);
         assert!(!yaml.contains("lh1.example.com:4242"), "self excluded");
@@ -1103,6 +1454,7 @@ mod tests {
             node_id: "lh-01".into(),
             overlay_ip: "10.42.0.1".into(),
             external_addr: "203.0.113.1:4242".into(),
+            relay_tls: None,
         }];
         crate::ca::bundle::write_bundle(&bundle_path, &b).expect("seed bundle");
 
@@ -1162,11 +1514,20 @@ mod tests {
 
     #[test]
     fn write_atomic_does_not_leave_tempfile_on_success() {
+        use std::os::unix::fs::PermissionsExt as _;
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("config.yaml");
         write_atomic(&path, b"body").expect("write");
         let tmp_path = path.with_extension("yaml.tmp");
         assert!(!tmp_path.exists());
+        assert_eq!(
+            std::fs::metadata(path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+        );
     }
 
     // GF-1.3.a — overlay-ip publisher.

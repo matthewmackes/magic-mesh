@@ -23,10 +23,11 @@
 # crate must not silently pull the whole GUI stack), so it ranks at the
 # desktop-shell tier ("gui") — see tier_of below.
 #
-# Tier is a crate's directory, with ONE curated exception: mackesd, magic-fleet
-# and mde-enroll physically live under crates/mesh/ but ARE the platform-services
-# daemon / fleet / enrollment (§6), so they rank as services — which is exactly
-# why a pure-directory split would wrongly red-flag e.g. `mackesd → mde-bus`.
+# Tier is a crate's directory, with curated exceptions: mackesd, magic-fleet,
+# mde-enroll, and the factored mde-browser-workers physically live under
+# crates/mesh/ but ARE platform services (§6), so they rank as services — which
+# is exactly why a pure-directory split would wrongly red-flag e.g.
+# `mackesd → mde-bus`.
 #
 # Run `lint-layered-tiers.sh --self-test` to verify the gate logic (the current
 # tree passes; a planted outward edge is caught; an inward edge is NOT flagged).
@@ -40,7 +41,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # < desktop-shell(3). The GUI harness shares the outermost rank (3, label "gui")
 # even though it lives under crates/shared/, so a headless tier that pulls it
 # points outward and fails. An edge whose TARGET rank exceeds its SOURCE rank
-# points outward and fails. The three platform-services crates that live under
+# points outward and fails. The platform-services crates that live under
 # crates/mesh/, and the GUI harness under crates/shared/, are matched FIRST so
 # the generic crates/mesh/* and crates/shared/* rules can't claim them.
 tier_of() {
@@ -58,7 +59,8 @@ tier_of() {
             echo "0|shared" ;;
         crates/mesh/mackesd|crates/mesh/mackesd/*|\
         crates/mesh/magic-fleet|crates/mesh/magic-fleet/*|\
-        crates/mesh/mde-enroll|crates/mesh/mde-enroll/*)
+        crates/mesh/mde-enroll|crates/mesh/mde-enroll/*|\
+        crates/mesh/mde-browser-workers|crates/mesh/mde-browser-workers/*)
             echo "2|platform-services" ;;
         crates/mesh/*|crates/kdc/*)
             echo "1|mesh-substrate" ;;

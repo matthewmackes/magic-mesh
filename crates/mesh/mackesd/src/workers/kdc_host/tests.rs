@@ -1,4 +1,7 @@
 use super::*;
+use mackes_mesh_types::cloud::{
+    cloud_request_digest, CloudArmSigner, CloudArmedToken, CLOUD_ARM_NODE_SCOPE,
+};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Mutex as StdMutex;
@@ -1666,6 +1669,8 @@ fn kdc_mesh7_service_directory_and_node_targeted_browse() {
     let snap = node_services_snapshot(&cfg, "nodeA", "id-a", None);
     assert!(snap.offers(service_directory::service::FILES));
     assert!(snap.offers(service_directory::service::SFTP));
+    assert!(snap.offers(service_directory::service::WORKLOADS));
+    assert!(!snap.services.iter().any(|service| service == "openstack"));
     assert_eq!(snap.shared_roots.len(), 1);
     assert!(snap.shared_roots[0]
         .entries
@@ -1784,38 +1789,55 @@ fn cloud_command_keys_map_and_the_list_includes_them() {
 }
 
 #[test]
-fn plan_cloud_lifecycle_filters_by_provider_status() {
-    let fleet = [
-        instance("web", "ACTIVE"),
-        instance("db", "SHUTOFF"),
-        instance("cache", "ACTIVE"),
-        instance("broken", "ERROR"),
-    ];
-    // start-all acts on the SHUTOFF instance only.
+fn lifecycle_bulk_bus_verb_maps_to_the_worker_selected_action() {
     assert_eq!(
-        plan_cloud_lifecycle(LifecycleAction::Start, &fleet),
-        vec!["db".to_string()]
-    );
-    // stop-all / reboot-all act on the ACTIVE instances only.
-    assert_eq!(
-        plan_cloud_lifecycle(LifecycleAction::Stop, &fleet),
-        vec!["web".to_string(), "cache".to_string()]
+        lifecycle_bulk_bus_verb(LifecycleAction::Start),
+        "instance-start-all"
     );
     assert_eq!(
-        plan_cloud_lifecycle(LifecycleAction::Reboot, &fleet),
-        vec!["web".to_string(), "cache".to_string()]
+        lifecycle_bulk_bus_verb(LifecycleAction::Reboot),
+        "instance-reboot-all"
     );
-    // Delete targets nothing (never phone-exposed).
-    assert!(plan_cloud_lifecycle(LifecycleAction::Delete, &fleet).is_empty());
 }
 
 #[test]
-fn lifecycle_bus_verb_maps_to_the_cloud_action_verb() {
-    assert_eq!(lifecycle_bus_verb(LifecycleAction::Start), "instance-start");
+fn phone_bulk_authorization_is_placement_body_and_request_bound() {
+    let signer = CloudArmSigner::new(b"0123456789abcdef0123456789abcdef".to_vec()).unwrap();
+    let body = authorize_bulk_body_with_signer(
+        &signer,
+        "eagle",
+        "instance-stop-all",
+        1_000,
+        "0123456789abcdef",
+    )
+    .unwrap();
+    let value: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(value["node"], "eagle");
     assert_eq!(
-        lifecycle_bus_verb(LifecycleAction::Reboot),
-        "instance-reboot"
+        value["schema_version"],
+        mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION
     );
+    let token = CloudArmedToken::parse(value["armed_token"].as_str().unwrap()).unwrap();
+    assert_eq!(token.verb, "instance-stop-all");
+    assert_eq!(token.node, "eagle");
+    assert_eq!(token.target, CLOUD_ARM_NODE_SCOPE);
+    assert_eq!(token.expires_at_ms, 31_000);
+    assert_eq!(token.request_sha256, cloud_request_digest(&body).unwrap());
+    assert!(signer.verify_payload(&token.signing_payload(), &token.signature));
+
+    let altered = body.replace("eagle", "badger");
+    assert_ne!(
+        token.request_sha256,
+        cloud_request_digest(&altered).unwrap()
+    );
+    assert!(authorize_bulk_body_with_signer(
+        &signer,
+        "bad|node",
+        "instance-stop-all",
+        1_000,
+        "0123456789abcdef",
+    )
+    .is_err());
 }
 
 #[test]

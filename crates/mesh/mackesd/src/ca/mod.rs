@@ -79,44 +79,23 @@ pub const DEFAULT_MESH_CIDR: &str = "10.42.0.0/16";
 /// uses [`SubprocessBackend`]; unit tests use
 /// [`MockBackend`].
 pub trait NebulaCertBackend: Send + Sync {
+    /// Generate a Nebula X25519 keypair on the requester, writing the private
+    /// and public PEM files to caller-owned local paths.
+    fn generate_keypair(&self, key_out: &Path, public_out: &Path) -> Result<(), CaError> {
+        let _ = (key_out, public_out);
+        Err(CaError::Subprocess(
+            "backend does not support requester-side key generation".into(),
+        ))
+    }
+
     /// Equivalent of `nebula-cert ca -name <mesh_id> -out-crt <crt_out> -out-key <key_out>`.
     /// Implementations write the CA cert + key to the given
     /// paths.
     fn mint_ca(&self, mesh_id: &str, crt_out: &Path, key_out: &Path) -> Result<(), CaError>;
 
-    /// Equivalent of `nebula-cert sign -ca-crt <ca_crt> -ca-key <ca_key>
-    /// -name <node_id> -ip <overlay_ip>/<cidr_prefix> -groups <groups>
-    /// -out-crt <crt_out> -out-key <key_out>` (the prefix defaults to the
-    /// lower /17 peer subnet — see [`crate::ca::sign::DEFAULT_CIDR_PREFIX`]).
-    fn sign_peer(
-        &self,
-        ca_crt: &Path,
-        ca_key: &Path,
-        node_id: &str,
-        overlay_ip: &str,
-        cidr_prefix: u8,
-        groups: &[&str],
-        crt_out: &Path,
-        key_out: &Path,
-    ) -> Result<(), CaError>;
-}
-
-/// Production backend that shells out to `nebula-cert`.
-pub struct SubprocessBackend;
-
-impl NebulaCertBackend for SubprocessBackend {
-    fn mint_ca(&self, mesh_id: &str, crt_out: &Path, key_out: &Path) -> Result<(), CaError> {
-        run_nebula_cert(&[
-            "ca",
-            "-name",
-            mesh_id,
-            "-out-crt",
-            &crt_out.display().to_string(),
-            "-out-key",
-            &key_out.display().to_string(),
-        ])
-    }
-
+    /// Legacy test fixture for modeling the retired CA-generated peer-key path.
+    /// Production builds expose only requester-public-key signing.
+    #[cfg(test)]
     fn sign_peer(
         &self,
         ca_crt: &Path,
@@ -128,12 +107,98 @@ impl NebulaCertBackend for SubprocessBackend {
         crt_out: &Path,
         key_out: &Path,
     ) -> Result<(), CaError> {
+        let _ = (
+            ca_crt,
+            ca_key,
+            node_id,
+            overlay_ip,
+            cidr_prefix,
+            groups,
+            crt_out,
+            key_out,
+        );
+        Err(CaError::Subprocess(
+            "central peer-private-key generation is retired".into(),
+        ))
+    }
+
+    /// Sign a requester-generated Nebula public key. Equivalent to
+    /// `nebula-cert sign ... -in-pub <public_key> -out-crt <crt_out>` and
+    /// deliberately has no private-key output path.
+    fn sign_peer_with_public_key(
+        &self,
+        ca_crt: &Path,
+        ca_key: &Path,
+        node_id: &str,
+        overlay_ip: &str,
+        cidr_prefix: u8,
+        groups: &[&str],
+        public_key: &Path,
+        crt_out: &Path,
+    ) -> Result<(), CaError> {
+        let _ = (
+            ca_crt,
+            ca_key,
+            node_id,
+            overlay_ip,
+            cidr_prefix,
+            groups,
+            public_key,
+            crt_out,
+        );
+        Err(CaError::Subprocess(
+            "backend does not support requester-owned public-key signing".into(),
+        ))
+    }
+}
+
+/// Production backend that shells out to `nebula-cert`.
+pub struct SubprocessBackend;
+
+impl NebulaCertBackend for SubprocessBackend {
+    fn generate_keypair(&self, key_out: &Path, public_out: &Path) -> Result<(), CaError> {
+        generate_pair_in_private_staging("requester-keygen", public_out, key_out, |public, key| {
+            run_nebula_cert(&[
+                "keygen",
+                "-out-key",
+                &key.display().to_string(),
+                "-out-pub",
+                &public.display().to_string(),
+            ])
+        })
+    }
+
+    fn mint_ca(&self, mesh_id: &str, crt_out: &Path, key_out: &Path) -> Result<(), CaError> {
+        generate_pair_in_private_staging("ca-mint", crt_out, key_out, |crt, key| {
+            run_nebula_cert(&[
+                "ca",
+                "-name",
+                mesh_id,
+                "-out-crt",
+                &crt.display().to_string(),
+                "-out-key",
+                &key.display().to_string(),
+            ])
+        })
+    }
+
+    fn sign_peer_with_public_key(
+        &self,
+        ca_crt: &Path,
+        ca_key: &Path,
+        node_id: &str,
+        overlay_ip: &str,
+        cidr_prefix: u8,
+        groups: &[&str],
+        public_key: &Path,
+        crt_out: &Path,
+    ) -> Result<(), CaError> {
         let ip_with_mask = format!("{overlay_ip}/{cidr_prefix}");
         let groups_joined = groups.join(",");
         let ca_crt_s = ca_crt.display().to_string();
         let ca_key_s = ca_key.display().to_string();
+        let public_key_s = public_key.display().to_string();
         let crt_out_s = crt_out.display().to_string();
-        let key_out_s = key_out.display().to_string();
         let mut args: Vec<&str> = vec![
             "sign",
             "-ca-crt",
@@ -146,8 +211,8 @@ impl NebulaCertBackend for SubprocessBackend {
             ip_with_mask.as_str(),
             "-out-crt",
             crt_out_s.as_str(),
-            "-out-key",
-            key_out_s.as_str(),
+            "-in-pub",
+            public_key_s.as_str(),
         ];
         if !groups.is_empty() {
             args.push("-groups");
@@ -157,23 +222,102 @@ impl NebulaCertBackend for SubprocessBackend {
     }
 }
 
-fn run_nebula_cert(args: &[&str]) -> Result<(), CaError> {
-    let output = std::process::Command::new("nebula-cert")
-        .args(args)
-        .output()
-        .map_err(|e| {
-            // Missing binary is the dominant failure mode on
-            // dev boxes without the Fedora `nebula` package.
-            // Surface it cleanly so the caller can decide
-            // whether to skip CA ops or hard-fail.
-            if e.kind() == std::io::ErrorKind::NotFound {
-                CaError::BinaryMissing
-            } else {
-                CaError::Subprocess(format!("nebula-cert: {e}"))
+fn generate_pair_in_private_staging<F>(
+    label: &str,
+    public_out: &Path,
+    secret_out: &Path,
+    generate: F,
+) -> Result<(), CaError>
+where
+    F: FnOnce(&Path, &Path) -> Result<(), CaError>,
+{
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    let parent = public_out.parent().ok_or_else(|| {
+        CaError::Io(format!(
+            "generated output has no parent: {}",
+            public_out.display()
+        ))
+    })?;
+    if secret_out.parent() != Some(parent) {
+        return Err(CaError::Io(
+            "generated certificate/key outputs must share one directory".into(),
+        ));
+    }
+    std::fs::create_dir_all(parent)
+        .map_err(|e| CaError::Io(format!("mkdir {}: {e}", parent.display())))?;
+    let staging = (0..16)
+        .find_map(|_| {
+            let candidate = parent.join(format!(
+                ".{label}-{}-{:016x}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            match builder.create(&candidate) {
+                Ok(()) => Some(Ok(candidate)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+                Err(error) => Some(Err(CaError::Io(format!(
+                    "create private staging {}: {error}",
+                    candidate.display()
+                )))),
             }
+        })
+        .unwrap_or_else(|| Err(CaError::Io(format!("{label} staging collisions"))))?;
+    let result = (|| {
+        let staged_public = staging.join("public.pem");
+        let staged_secret = staging.join("private.key");
+        generate(&staged_public, &staged_secret)?;
+        let public = std::fs::read(&staged_public).map_err(|e| {
+            CaError::Io(format!(
+                "read generated public {}: {e}",
+                staged_public.display()
+            ))
         })?;
+        let secret = std::fs::read(&staged_secret).map_err(|e| {
+            CaError::Io(format!(
+                "read generated secret {}: {e}",
+                staged_secret.display()
+            ))
+        })?;
+        if public.is_empty() || secret.is_empty() {
+            return Err(CaError::Io(format!("{label} emitted an empty output")));
+        }
+        seal::write_atomic_pair(public_out, &public, secret_out, &secret)
+    })();
+    let _ = std::fs::remove_dir_all(&staging);
+    result
+}
+
+fn run_nebula_cert(args: &[&str]) -> Result<(), CaError> {
+    // Keep the umask child-local without `pre_exec` (this crate forbids unsafe
+    // code). The script is constant and caller arguments are forwarded only as
+    // positional parameters, so no path or identity value is shell-evaluated.
+    let mut command = std::process::Command::new("sh");
+    command.args(["-c", "umask 077; exec nebula-cert \"$@\"", "nebula-cert"]);
+    command.args(args);
+    let output = command.output().map_err(|e| {
+        // Missing binary is the dominant failure mode on
+        // dev boxes without the Fedora `nebula` package.
+        // Surface it cleanly so the caller can decide
+        // whether to skip CA ops or hard-fail.
+        if e.kind() == std::io::ErrorKind::NotFound {
+            CaError::BinaryMissing
+        } else {
+            CaError::Subprocess(format!("nebula-cert: {e}"))
+        }
+    })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        // The shell wrapper above keeps the child-local umask without unsafe
+        // `pre_exec`, but it also means a missing `nebula-cert` is reported by
+        // `sh` as exit 127 rather than `Command::output` returning NotFound.
+        // Preserve the typed error contract for that common dev/CI case.
+        if output.status.code() == Some(127) && stderr.to_ascii_lowercase().contains("nebula-cert")
+        {
+            return Err(CaError::BinaryMissing);
+        }
         return Err(CaError::Subprocess(format!(
             "nebula-cert exit {:?}: {stderr}",
             output.status.code()
@@ -227,21 +371,20 @@ pub struct MockBackend;
 
 #[cfg(test)]
 impl NebulaCertBackend for MockBackend {
-    fn mint_ca(&self, mesh_id: &str, crt_out: &Path, key_out: &Path) -> Result<(), CaError> {
-        if let Some(parent) = crt_out.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| CaError::Io(e.to_string()))?;
-        }
-        std::fs::write(
-            crt_out,
-            format!("-----BEGIN NEBULA CA-----\nmesh={mesh_id}\n-----END NEBULA CA-----\n"),
-        )
-        .map_err(|e| CaError::Io(e.to_string()))?;
-        std::fs::write(
+    fn generate_keypair(&self, key_out: &Path, public_out: &Path) -> Result<(), CaError> {
+        seal::write_atomic_pair(
+            public_out,
+            b"-----BEGIN NEBULA X25519 PUBLIC KEY-----\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n-----END NEBULA X25519 PUBLIC KEY-----\n",
             key_out,
-            format!("-----BEGIN NEBULA CA KEY-----\nmesh={mesh_id}\n-----END NEBULA CA KEY-----\n"),
+            b"-----BEGIN NEBULA X25519 PRIVATE KEY-----\nmock\n-----END NEBULA X25519 PRIVATE KEY-----\n",
         )
-        .map_err(|e| CaError::Io(e.to_string()))?;
-        Ok(())
+    }
+
+    fn mint_ca(&self, mesh_id: &str, crt_out: &Path, key_out: &Path) -> Result<(), CaError> {
+        let cert = format!("-----BEGIN NEBULA CA-----\nmesh={mesh_id}\n-----END NEBULA CA-----\n");
+        let key =
+            format!("-----BEGIN NEBULA CA KEY-----\nmesh={mesh_id}\n-----END NEBULA CA KEY-----\n");
+        seal::write_atomic_pair(crt_out, cert.as_bytes(), key_out, key.as_bytes())
     }
 
     fn sign_peer(
@@ -271,6 +414,37 @@ impl NebulaCertBackend for MockBackend {
         std::fs::write(
             key_out,
             format!("-----BEGIN NEBULA KEY-----\nname={node_id}\n-----END NEBULA KEY-----\n"),
+        )
+        .map_err(|e| CaError::Io(e.to_string()))?;
+        Ok(())
+    }
+
+    fn sign_peer_with_public_key(
+        &self,
+        _ca_crt: &Path,
+        _ca_key: &Path,
+        node_id: &str,
+        overlay_ip: &str,
+        cidr_prefix: u8,
+        groups: &[&str],
+        public_key: &Path,
+        crt_out: &Path,
+    ) -> Result<(), CaError> {
+        let public_key_pem = std::fs::read_to_string(public_key)
+            .map_err(|e| CaError::Io(format!("read public key {}: {e}", public_key.display())))?;
+        if public_key_pem.trim().is_empty() {
+            return Err(CaError::Io("requester public key is empty".into()));
+        }
+        if let Some(parent) = crt_out.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| CaError::Io(e.to_string()))?;
+        }
+        std::fs::write(
+            crt_out,
+            format!(
+                "-----BEGIN NEBULA CERT-----\nname={node_id}\nip={overlay_ip}/{cidr_prefix}\n\
+                 groups={}\nrequester_public_key=true\n-----END NEBULA CERT-----\n",
+                groups.join(",")
+            ),
         )
         .map_err(|e| CaError::Io(e.to_string()))?;
         Ok(())

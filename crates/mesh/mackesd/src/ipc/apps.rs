@@ -541,114 +541,6 @@ pub fn set_app_groups(workgroup_root: &Path, user: &str, groups: &[AppGroup]) ->
     groups.to_vec()
 }
 
-// ───────────────────────── uninstall (APPLAUNCH-6) ─────────────────────────
-
-/// APPLAUNCH-6 — the launch binary of a local app's `Exec` line (what `rpm -qf`
-/// maps to an owning package). Strips XDG field codes + a leading `env`/`VAR=val`
-/// wrapper, mirroring [`crate::workers::apps_running::exec_basename`] but keeping
-/// the full path (`rpm -qf` wants a path on disk, not a bare basename). `None`
-/// for an empty/blank exec.
-#[must_use]
-pub fn exec_binary(exec: &str) -> Option<String> {
-    exec.split_whitespace()
-        .find(|t| !t.starts_with('%') && *t != "env" && !t.contains('='))
-        .map(str::to_string)
-}
-
-/// APPLAUNCH-6 — resolve the typed uninstall argv for a local app entry (no
-/// shell interpolation — a real `Command` argv, §9). A Flatpak app (its
-/// desktop-file id is the Flatpak app-id, e.g. `org.gimp.GIMP`) → `flatpak
-/// uninstall -y <id>`. An XDG app → `dnf remove -y <package>`, where `package`
-/// is the entry's owning RPM resolved by the caller (via `rpm -qf` on the exec
-/// binary) and passed in here. `None` for a non-app / empty entry, or an XDG app
-/// whose package couldn't be resolved (mesh apps, workloads, services are never
-/// "uninstalled" from here — out of scope).
-#[must_use]
-pub fn uninstall_argv(source: &str, id: &str, package: Option<&str>) -> Option<Vec<String>> {
-    if id.is_empty() {
-        return None;
-    }
-    match source {
-        "flatpak" => Some(vec![
-            "flatpak".into(),
-            "uninstall".into(),
-            "-y".into(),
-            id.into(),
-        ]),
-        "xdg" => {
-            let pkg = package.map(str::trim).filter(|p| !p.is_empty())?;
-            Some(vec!["dnf".into(), "remove".into(), "-y".into(), pkg.into()])
-        }
-        _ => None,
-    }
-}
-
-/// APPLAUNCH-6 — resolve the owning RPM package of an XDG app's exec binary via
-/// `rpm -qf`. Returns the package NAME (e.g. `firefox`), or `None` when `rpm`
-/// isn't present / the binary isn't owned by a package / the query fails. Runs a
-/// real subprocess (the responder's effect); the argv is fixed (no shell), so
-/// it's a typed call, not a shell channel (§9).
-#[must_use]
-pub fn resolve_owning_package(exec: &str) -> Option<String> {
-    let bin = exec_binary(exec)?;
-    let out = std::process::Command::new("rpm")
-        .args(["-qf", "--queryformat", "%{NAME}", &bin])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if name.is_empty() || name.contains("not owned") {
-        None
-    } else {
-        Some(name)
-    }
-}
-
-/// APPLAUNCH-6 — perform an app uninstall and return the `action/apps/uninstall`
-/// reply. Resolves the typed argv ([`uninstall_argv`], with the owning package
-/// resolved server-side for XDG apps) and spawns it as a real `Command` (no
-/// shell). Always returns an `{ok, …}` envelope. The Front Door gates this behind
-/// the operator's typed confirm before it ever publishes the request (§9 —
-/// destructive, confirm-gated).
-#[must_use]
-pub fn build_uninstall(body: Option<&str>) -> String {
-    let v: serde_json::Value = body
-        .and_then(|b| serde_json::from_str(b).ok())
-        .unwrap_or(json!({}));
-    let source = v.get("source").and_then(|s| s.as_str()).unwrap_or("");
-    let id = v.get("id").and_then(|i| i.as_str()).unwrap_or("");
-    let exec = v.get("exec").and_then(|e| e.as_str()).unwrap_or("");
-    let package = if source == "xdg" {
-        resolve_owning_package(exec)
-    } else {
-        None
-    };
-    let Some(argv) = uninstall_argv(source, id, package.as_deref()) else {
-        return json!({
-            "ok": false,
-            "error": format!("cannot uninstall '{id}' (unresolved package or unsupported source '{source}')")
-        })
-        .to_string();
-    };
-    let Some((cmd, args)) = argv.split_first() else {
-        // uninstall_argv never yields an empty vec, but degrade rather than panic.
-        return json!({ "ok": false, "error": "empty uninstall command" }).to_string();
-    };
-    match std::process::Command::new(cmd).args(args).output() {
-        Ok(out) if out.status.success() => {
-            json!({ "ok": true, "detail": format!("uninstalled {id}") }).to_string()
-        }
-        Ok(out) => json!({
-            "ok": false,
-            "error": String::from_utf8_lossy(&out.stderr).trim().to_string()
-        })
-        .to_string(),
-        Err(e) => json!({ "ok": false, "error": format!("spawn {cmd} failed: {e}") }).to_string(),
-    }
-}
-
 // ───────────────────────── favorites (APPS-4) ─────────────────────────
 
 /// Sanitize a username into a safe single filename component.
@@ -741,9 +633,11 @@ impl AppsService {
 
 /// Action verbs served on `action/apps/<verb>`. APPLAUNCH adds `peer-list`
 /// (APPLAUNCH-5 — a focused peer's installed `.desktop` set), `groups` +
-/// `set-groups` (APPLAUNCH-4 — per-user operator-curated buckets), and
-/// `uninstall` (APPLAUNCH-6 — confirm-gated dnf/flatpak removal).
-pub const ACTION_VERBS: [&str; 8] = [
+/// `set-groups` (APPLAUNCH-4 — per-user operator-curated buckets). The retired
+/// `uninstall` verb is deliberately absent: no production publisher remained,
+/// and a shared-Bus request must never be sufficient authority for root package
+/// removal.
+pub const ACTION_VERBS: [&str; 7] = [
     "list",
     "favorites",
     "set-favorite",
@@ -751,7 +645,6 @@ pub const ACTION_VERBS: [&str; 8] = [
     "peer-list",
     "groups",
     "set-groups",
-    "uninstall",
 ];
 
 /// Responder poll interval.
@@ -894,9 +787,6 @@ where
             let saved = set_app_groups(&svc.workgroup_root, user, &groups);
             json!({ "ok": true, "groups": saved }).to_string()
         }
-        // APPLAUNCH-6 — confirm-gated uninstall (dnf|flatpak). The Front Door
-        // arms this only after the operator's typed confirm (§9 — destructive).
-        "uninstall" => build_uninstall(body),
         other => json!({ "ok": false, "error": format!("unknown apps verb: {other}") }).to_string(),
     }
 }
@@ -1580,52 +1470,20 @@ mod tests {
         assert!(read_app_groups(root, "mm").is_empty());
     }
 
-    // ───────────────────── APPLAUNCH-6 — uninstall ─────────────────────
-
     #[test]
-    fn uninstall_argv_flatpak_and_xdg_and_unsupported() {
-        // Flatpak → flatpak uninstall -y <app-id>.
-        assert_eq!(
-            uninstall_argv("flatpak", "org.gimp.GIMP", None).unwrap(),
-            ["flatpak", "uninstall", "-y", "org.gimp.GIMP"]
-        );
-        // XDG with a resolved package → dnf remove -y <pkg>.
-        assert_eq!(
-            uninstall_argv("xdg", "firefox", Some("firefox")).unwrap(),
-            ["dnf", "remove", "-y", "firefox"]
-        );
-        // XDG with no resolved package → None (nothing to remove).
-        assert!(uninstall_argv("xdg", "firefox", None).is_none());
-        assert!(uninstall_argv("xdg", "firefox", Some("   ")).is_none());
-        // Non-app sources are never uninstalled here.
-        assert!(uninstall_argv("peer", "mesh-app:anvil", None).is_none());
-        assert!(uninstall_argv("service", "service:x:y", None).is_none());
-        // Empty id → None.
-        assert!(uninstall_argv("flatpak", "", None).is_none());
-    }
-
-    #[test]
-    fn exec_binary_strips_field_codes_and_env() {
-        assert_eq!(exec_binary("firefox %u").as_deref(), Some("firefox"));
-        assert_eq!(
-            exec_binary("/usr/bin/firefox %U").as_deref(),
-            Some("/usr/bin/firefox")
-        );
-        assert_eq!(
-            exec_binary("env GTK_THEME=x gimp %f").as_deref(),
-            Some("gimp")
-        );
-        assert_eq!(exec_binary("%U").as_deref(), None);
-        assert_eq!(exec_binary("   ").as_deref(), None);
-    }
-
-    #[test]
-    fn build_uninstall_rejects_unresolvable() {
-        // A workload/service kind has no uninstall path → ok:false, never a panic.
-        let reply: serde_json::Value = serde_json::from_str(&build_uninstall(Some(
-            r#"{"source":"podman","id":"workload:podman:c1"}"#,
-        )))
+    fn retired_uninstall_topic_has_no_root_package_removal_dispatch() {
+        assert!(!ACTION_VERBS.contains(&"uninstall"));
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = AppsService::new(tmp.path(), "me", tmp.path());
+        let reply: serde_json::Value = serde_json::from_str(&build_reply(
+            &svc,
+            "uninstall",
+            Some(r#"{"source":"xdg","id":"bash","exec":"/usr/bin/bash"}"#),
+            || json!({}),
+            || json!({}),
+        ))
         .unwrap();
         assert_eq!(reply["ok"], false);
+        assert_eq!(reply["error"], "unknown apps verb: uninstall");
     }
 }

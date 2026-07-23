@@ -6,10 +6,11 @@
 # has been dead ~26 days (it can't build this workspace without the farm). That
 # left NO always-on gate for the ~41 crates / ~8,400 tests — the root of the
 # recurring "green-tests-but-shipped-broken" pattern. This script is that gate:
-# it runs fmt + clippy + the full test pyramid ON THE FARM (routed to BigBoy, the
-# long-pole node), captures a structured pass/fail, and publishes the result to
-# the Bus so a RED gate raises a KIRON operator toast and a GREEN gate is a
-# healthy heartbeat with a last-run timestamp (staleness is detectable).
+# it runs the repository policy lints locally, then fmt + clippy + the full test
+# pyramid ON THE FARM (routed to BigBoy, the long-pole node), captures a
+# structured pass/fail, and publishes the result to the Bus so a RED gate raises
+# a KIRON operator toast and a GREEN gate is a healthy heartbeat with a last-run
+# timestamp (staleness is detectable).
 #
 # It deliberately mirrors automation/testbed/nightly.sh (BUILD-PLATFORM-7): same
 # best-effort `bus_publish` (local `mde-bus` → else sshpass to the live shell
@@ -18,6 +19,8 @@
 #
 # Usage:
 #   ci-gate.sh [run]     run the full gate on the CURRENT checkout, publish result
+#   ci-gate.sh policy    run the maintained policy-lint suite only (no farm I/O)
+#   ci-gate.sh --self-test  prove policy-stage failures propagate (no farm I/O)
 #   ci-gate.sh poll      run only if origin/master advanced past the last-gated SHA
 #                        (the master-push trigger — cheap no-op when unchanged)
 #   ci-gate.sh liveness  alert if the gate hasn't produced a result within N days
@@ -65,9 +68,31 @@ MAX_STALE_DAYS="${MCNF_CI_MAX_STALE_DAYS:-2}"
 # full parallelism.
 CRATES_SERIAL=(mackesd mde-term-egui)
 
+# One maintained policy suite for both the farm gate and GitHub Actions. Keep
+# repository-structure checks here rather than duplicating an incomplete list in
+# each runner. Every lint with a planted-failure self-test is exercised before it
+# scans the real tree; lints without a self-test still run as hard checks.
+POLICY_LINTS=(
+  lint-bus-names.sh
+  lint-layered-tiers.sh
+  lint-style-leaks.sh
+  lint-brand-identity.sh
+  lint-shared-substrate.sh
+  lint-doc-supersession.sh
+  lint-worklist.sh
+)
+POLICY_SELF_TESTS=(
+  lint-bus-names.sh
+  lint-layered-tiers.sh
+  lint-brand-identity.sh
+  lint-doc-supersession.sh
+  lint-worklist.sh
+)
+POLICY_ROOT="$HERE"
+
 # ── result state (globals; filled by cmd_run, read by finish) ────────────────
 SHA="" ; SHORT="" ; STARTED="" ; FINISHED=""
-STAGE_FMT="skipped" ; STAGE_CLIPPY="skipped" ; STAGE_TEST="skipped"
+STAGE_POLICY="skipped" ; STAGE_FMT="skipped" ; STAGE_CLIPPY="skipped" ; STAGE_TEST="skipped"
 FAILED_STAGE="" ; OVERALL="green"
 TESTS_PASSED=0 ; TESTS_FAILED=0
 
@@ -114,6 +139,29 @@ run_cargo() {
   return "${PIPESTATUS[0]}"
 }
 
+# run_policy_check <label> <lint> [args...] — run one local repository policy
+# check and append all output to the same authoritative gate log.
+run_policy_check() {
+  local label="$1" lint="$2"; shift 2
+  { echo; echo "─────────── stage: $label ───────────  ($(ts))  $lint $*"; } | tee -a "$LOG"
+  "$POLICY_ROOT/$lint" "$@" 2>&1 | tee -a "$LOG"
+  return "${PIPESTATUS[0]}"
+}
+
+# run_policy_stage — run every planted-failure self-test and every real-tree
+# policy lint. Do not short-circuit within the stage: one invocation reports the
+# complete policy state, but any failed check makes the stage (and gate) fail.
+run_policy_stage() {
+  local rc=0 lint
+  for lint in "${POLICY_SELF_TESTS[@]}"; do
+    run_policy_check "policy-self-test-$lint" "$lint" --self-test || rc=1
+  done
+  for lint in "${POLICY_LINTS[@]}"; do
+    run_policy_check "policy-$lint" "$lint" || rc=1
+  done
+  return "$rc"
+}
+
 # parse_test_counts — sum passed/failed across every "test result:" line in the
 # accumulated log (anchored to that phrase so clippy/build noise never counts).
 parse_test_counts() {
@@ -134,9 +182,14 @@ parse_test_counts() {
 run_test_stage() {
   local rc=0 c exclude=()
   for c in "${CRATES_SERIAL[@]}"; do exclude+=(--exclude "$c"); done
-  run_cargo test-bulk +1.94.0 test --workspace "${exclude[@]}" || rc=1
+  run_cargo test-bulk +1.94.0 test --workspace "${exclude[@]}" --locked || rc=1
   for c in "${CRATES_SERIAL[@]}"; do
-    run_cargo "test-$c" +1.94.0 test -p "$c" -- --test-threads=1 || rc=1
+    if [ "$c" = "mackesd" ]; then
+      run_cargo "test-$c" +1.94.0 test -p "$c" \
+        --features async-services --locked -- --test-threads=1 || rc=1
+    else
+      run_cargo "test-$c" +1.94.0 test -p "$c" --locked -- --test-threads=1 || rc=1
+    fi
   done
   parse_test_counts
   return "$rc"
@@ -153,7 +206,7 @@ finish() {
   "overall": "$OVERALL",
   "alert": $alert,
   "failed_stage": "$(json_escape "$FAILED_STAGE")",
-  "stages": { "fmt": "$STAGE_FMT", "clippy": "$STAGE_CLIPPY", "test": "$STAGE_TEST" },
+  "stages": { "policy": "$STAGE_POLICY", "fmt": "$STAGE_FMT", "clippy": "$STAGE_CLIPPY", "test": "$STAGE_TEST" },
   "tests_passed": $TESTS_PASSED,
   "tests_failed": $TESTS_FAILED,
   "sha": "$SHA",
@@ -171,6 +224,7 @@ JSON
   {
     echo
     echo "=== CI GATE SUMMARY $FINISHED → $OVERALL ==="
+    printf '  %-8s %s\n' policy "$STAGE_POLICY"
     printf '  %-8s %s\n' fmt "$STAGE_FMT"
     printf '  %-8s %s\n' clippy "$STAGE_CLIPPY"
     printf '  %-8s %s  (%s passed, %s failed)\n' test "$STAGE_TEST" "$TESTS_PASSED" "$TESTS_FAILED"
@@ -179,7 +233,7 @@ JSON
 
   # Machine-readable result lane (mirrors event/test/nightly): every run, green or red.
   bus_publish event/ci/gate \
-    "{\"overall\":\"$OVERALL\",\"fmt\":\"$STAGE_FMT\",\"clippy\":\"$STAGE_CLIPPY\",\"test\":\"$STAGE_TEST\",\"tests_passed\":$TESTS_PASSED,\"tests_failed\":$TESTS_FAILED,\"sha\":\"$SHORT\",\"finished\":\"$FINISHED\",\"source\":\"ci-gate\",\"alert\":$alert}"
+    "{\"overall\":\"$OVERALL\",\"policy\":\"$STAGE_POLICY\",\"fmt\":\"$STAGE_FMT\",\"clippy\":\"$STAGE_CLIPPY\",\"test\":\"$STAGE_TEST\",\"tests_passed\":$TESTS_PASSED,\"tests_failed\":$TESTS_FAILED,\"sha\":\"$SHORT\",\"finished\":\"$FINISHED\",\"source\":\"ci-gate\",\"alert\":$alert}"
 
   # RED → KIRON operator toast (critical breaks through suppression); GREEN is a
   # quiet heartbeat (the result lane above), no toast spam.
@@ -188,8 +242,8 @@ JSON
   fi
 }
 
-# cmd_run — gate the current checkout. Fail-fast across stages (mirrors the shipped
-# `xcp-build.sh gates` && chain) so a fmt typo doesn't burn an hour of farm test time.
+# cmd_run — gate the current checkout. Fail-fast across stages so a policy or
+# formatting failure does not burn an hour of farm test time.
 cmd_run() {
   SHA="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
   SHORT="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)"
@@ -200,20 +254,52 @@ cmd_run() {
     echo "  sha=$SHORT  host=$MCNF_BUILD_HOST (slot=$MCNF_BUILD_SLOT)"
   } | tee "$LOG"
 
-  if run_cargo fmt +1.94.0 fmt --all --check; then
-    STAGE_FMT="pass"
-    if run_cargo clippy +1.94.0 clippy --all-targets; then
-      STAGE_CLIPPY="pass"
-      if run_test_stage; then STAGE_TEST="pass"; else STAGE_TEST="fail"; FAILED_STAGE="test"; fi
+  if run_policy_stage; then
+    STAGE_POLICY="pass"
+    if run_cargo fmt +1.94.0 fmt --all --check; then
+      STAGE_FMT="pass"
+      if run_cargo clippy +1.94.0 clippy --workspace --all-targets --locked; then
+        STAGE_CLIPPY="pass"
+        if run_test_stage; then STAGE_TEST="pass"; else STAGE_TEST="fail"; FAILED_STAGE="test"; fi
+      else
+        STAGE_CLIPPY="fail"; FAILED_STAGE="clippy"
+      fi
     else
-      STAGE_CLIPPY="fail"; FAILED_STAGE="clippy"
+      STAGE_FMT="fail"; FAILED_STAGE="fmt"
     fi
   else
-    STAGE_FMT="fail"; FAILED_STAGE="fmt"
+    STAGE_POLICY="fail"; FAILED_STAGE="policy"
   fi
 
   finish
   [ "$OVERALL" = green ]   # rc reflects the gate result for CLI/manual use
+}
+
+# cmd_policy — expose the exact maintained lint suite to GitHub Actions and
+# focused local verification without contacting the build farm.
+cmd_policy() {
+  : > "$LOG"
+  run_policy_stage
+}
+
+# cmd_self_test — prove the policy-stage aggregator returns failure when any
+# constituent check fails and success only when all checks pass. Coreutils
+# true/false make this deterministic without modifying the checkout.
+cmd_self_test() {
+  : > "$LOG"
+  POLICY_ROOT=/bin
+  POLICY_SELF_TESTS=()
+  POLICY_LINTS=(true false true)
+  if run_policy_stage; then
+    echo "ci-gate.sh: SELF-TEST FAILED — a failed policy check was swallowed" >&2
+    return 1
+  fi
+  POLICY_LINTS=(true)
+  if ! run_policy_stage; then
+    echo "ci-gate.sh: SELF-TEST FAILED — an all-green policy stage failed" >&2
+    return 1
+  fi
+  echo "ci-gate.sh: self-test passed — policy failures propagate"
 }
 
 # cmd_poll — the master-push trigger. Run the gate only when origin/master has
@@ -269,6 +355,8 @@ usage() { sed -n '/^# Usage:/,/^# Env overrides:/p' "$0" | sed 's/^# \{0,1\}//';
 
 case "${1:-run}" in
   run)      cmd_run ;;
+  policy)   cmd_policy ;;
+  --self-test) cmd_self_test ;;
   poll)     cmd_poll ;;
   liveness) cmd_liveness ;;
   -h | --help | help) usage ;;

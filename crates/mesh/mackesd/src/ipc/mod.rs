@@ -24,6 +24,8 @@
 // APPS-1 — the apps_aggregator: action/apps/list for the Applications Panel
 // launcher (docs/design/apps-launcher.md). Thin applet; this worker is the
 // single source of truth (local XDG+flatpak, mesh peers, workloads, services).
+/// Shared fail-closed authorization gate for privileged local-Bus mutations.
+pub mod action_auth;
 pub mod apps;
 // CLIP-SYNC-1 — action/clipboard/* responder (list/pin/unpin/delete/clear)
 // for the mesh-global clipboard history the clipboard_sync worker maintains.

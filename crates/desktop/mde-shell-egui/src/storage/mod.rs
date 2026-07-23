@@ -9,10 +9,10 @@
 //! partition table and **submits** a typed [`StorageOp`] queue back onto the Bus —
 //! for this node and, with full parity, any mesh peer (§9 renderers-not-authorities).
 //!
-//! ## Placement — a dock [`Surface`](crate::dock::Surface), not a sixth Workbench plane
+//! ## Placement — a shell [`Surface`](crate::surfaces::Surface), not a sixth Workbench plane
 //!
 //! Design lock 3 names a sixth Workbench plane; the design doc explicitly permits a
-//! dock Surface "if the Workbench plane wiring is heavier". It is: a `GParted` view
+//! shell Surface "if the Workbench plane wiring is heavier". It is: a `GParted` view
 //! wants the full shell body (segment bars, the pending-op queue, the peer picker,
 //! the per-op progress lane), which is cramped in the Workbench rail's content
 //! pane; and a Workbench plane would force a new `&mut` parameter through
@@ -70,7 +70,7 @@ use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 
 use crate::bus_reader::BusReader;
-use crate::dock::icon_texture;
+use crate::surfaces::icon_texture;
 
 use crate::toast_bridge::TOAST_TOPIC;
 
@@ -676,6 +676,24 @@ impl StorageRequest {
     /// can't realistically fail; an empty body (never produced) the worker rejects.
     fn to_body(&self) -> String {
         serde_json::to_string(self).unwrap_or_default()
+    }
+}
+
+/// Freeze the current envelope schema and bind Apply to the root shell's
+/// short-lived, exact-body HMAC capability. Refresh is intentionally open.
+fn request_body_for_publish(node: &str, request: &StorageRequest) -> Result<String, String> {
+    let mut document = serde_json::to_value(request)
+        .map_err(|error| format!("Could not serialize storage action: {error}"))?;
+    document
+        .as_object_mut()
+        .ok_or_else(|| "Storage action did not serialize as an object.".to_string())?
+        .insert("schema_version".to_string(), serde_json::Value::from(1_u64));
+    let unsigned = document.to_string();
+    match request {
+        StorageRequest::Apply { armed_device, .. } => {
+            crate::iac::authorize_root_mutation_body(&unsigned, "storage-apply", node, armed_device)
+        }
+        StorageRequest::Refresh => Ok(unsigned),
     }
 }
 
@@ -1560,7 +1578,13 @@ impl StorageState {
                 Some("No mesh Bus directory — storage actions unavailable.".to_string());
             return;
         };
-        let body = req.to_body();
+        let body = match request_body_for_publish(node, req) {
+            Ok(body) => body,
+            Err(error) => {
+                self.last_error = Some(error);
+                return;
+            }
+        };
         // arch-11: writer — the shared BusReader seam is read-only; this publish
         // keeps Persist::open because it needs the write Result to set `last_error`.
         match Persist::open(root.clone())

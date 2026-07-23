@@ -55,8 +55,10 @@ pub const REPO_BASEURL: &str = "https://matthewmackes.github.io/magic-mesh";
 
 /// Default cloud region for a spawned lighthouse (matches `do-lighthouse-join.sh`).
 pub const DEFAULT_CLOUD_REGION: &str = "nyc3";
-/// Default cloud droplet size (matches `do-lighthouse-join.sh`; a 1-vCPU/1GB box).
-pub const DEFAULT_CLOUD_SIZE: &str = "s-1vcpu-1gb";
+/// Default cloud droplet size (the smallest DO Basic Droplet: 1 shared vCPU,
+/// 512 MiB RAM and 10 GiB SSD).  The cloud-init profile keeps this box to the
+/// relay/control plane; media lighthouses remain a separately sized class.
+pub const DEFAULT_CLOUD_SIZE: &str = "s-1vcpu-512mb-10gb";
 /// Default cloud image (matches `do-lighthouse-join.sh`).
 pub const DEFAULT_CLOUD_IMAGE: &str = "fedora-43-x64";
 /// The join-token placeholder the rendered provision spec carries.
@@ -73,7 +75,7 @@ pub enum SpawnTarget {
     Cloud {
         /// DO region slug (e.g. `nyc3`).
         region: String,
-        /// DO droplet size slug (e.g. `s-1vcpu-1gb`).
+        /// DO droplet size slug (e.g. `s-1vcpu-512mb-10gb`).
         size: String,
     },
 }
@@ -407,6 +409,10 @@ pub fn render_spec(target: &SpawnTarget) -> ProvisionSpec {
             let _ = writeln!(
                 user_data,
                 "  - mackesd join --role lighthouse {JOIN_TOKEN_PLACEHOLDER}"
+            );
+            let _ = writeln!(
+                user_data,
+                "  - /usr/libexec/mackesd/configure-small-lighthouse small"
             );
             let _ = writeln!(
                 user_data,
@@ -828,6 +834,7 @@ mod tests {
         // Installs the RPM off the shared channel + runs the lighthouse join.
         assert!(doc.contains(REPO_BASEURL));
         assert!(doc.contains("mackesd join --role lighthouse"));
+        assert!(doc.contains("configure-small-lighthouse small"));
         // The secret is a placeholder the enroll step substitutes — never embedded.
         assert!(doc.contains(JOIN_TOKEN_PLACEHOLDER));
     }

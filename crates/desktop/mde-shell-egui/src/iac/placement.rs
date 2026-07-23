@@ -81,7 +81,7 @@ pub(super) fn placement_picker(ui: &mut egui::Ui, state: &mut WorkloadsState) ->
     let selected = state.selected_node().map(str::to_string);
 
     if state.states().is_empty() {
-        crate::session::empty_state(
+        crate::empty_state::show(
             ui,
             "No mesh nodes reporting",
             "A node appears here once its state/cloud mirror lands on the Bus with its capacity. \

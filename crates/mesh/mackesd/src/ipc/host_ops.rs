@@ -35,11 +35,17 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_bus::rpc::reply_topic;
 use serde_json::json;
+
+use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
+
+/// Authorization node scope for cluster-wide Datacenter actions.
+pub const DC_ACTION_NODE_SCOPE: &str = "fleet-control";
 
 /// The host power-control responder — rooted at the shared workgroup root (carried
 /// for parity with the other action services; the allowed-dom0 set + ssh key come
@@ -50,13 +56,25 @@ pub struct HostOpsService {
     // the `.mackesd-leader.lock` for the fs-lockfile leader path. (The dom0 SSH
     // key + allowed-dom0 set come from the orchestrator's env config, not here.)
     workgroup_root: PathBuf,
+    authorizer: Arc<ActionAuthorizer>,
 }
 
 impl HostOpsService {
     /// Build the service rooted at the shared workgroup root.
     #[must_use]
     pub fn new(workgroup_root: PathBuf) -> Self {
-        Self { workgroup_root }
+        Self {
+            workgroup_root,
+            authorizer: Arc::new(ActionAuthorizer::production()),
+        }
+    }
+
+    /// Inject an isolated verifier and replay ledger (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
+        self.authorizer = authorizer;
+        self
     }
 }
 
@@ -94,6 +112,102 @@ pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(
 #[must_use]
 pub fn action_topic(verb: &str) -> String {
     format!("action/dc/{verb}")
+}
+
+/// Return the stable capability target for a mutating host-ops verb. Read-only
+/// inventory/status/impact verbs return `None` and remain available without a
+/// root-shell capability.
+fn mutation_target(verb: &str, req_body: Option<&str>) -> Result<Option<String>, String> {
+    let mutating = matches!(
+        verb,
+        "host-power"
+            | "gateway-reboot"
+            | "dr-backup"
+            | "lighthouse-restart"
+            | "lighthouse-promote"
+            | "host-vlan-create"
+            | "router-seal-cred"
+            | "farm-scale"
+            | "testbed-up"
+            | "testbed-down"
+    );
+    if !mutating {
+        return Ok(None);
+    }
+    let body = req_body.ok_or_else(|| format!("{verb}: missing request body"))?;
+    let request: serde_json::Value =
+        serde_json::from_str(body).map_err(|_| format!("{verb}: bad json"))?;
+    let string_field = |field: &str| -> Result<&str, String> {
+        request
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("{verb}: missing `{field}`"))
+    };
+    let target = match verb {
+        "host-power" => format!("host:{}", string_field("dom0")?),
+        "gateway-reboot" => format!("gateway:{}", string_field("host")?),
+        "dr-backup" => "disaster-recovery".to_string(),
+        "lighthouse-restart" => format!("lighthouse:{}", string_field("overlay_ip")?),
+        "lighthouse-promote" => {
+            let node = string_field("node")?;
+            format!("lighthouse:{}", node.strip_prefix("peer:").unwrap_or(node))
+        }
+        "host-vlan-create" => {
+            let dom0 = string_field("dom0")?;
+            let vlan = request
+                .get("vlan")
+                .and_then(serde_json::Value::as_i64)
+                .ok_or_else(|| format!("{verb}: missing `vlan`"))?;
+            format!("host:{dom0}:vlan:{vlan}")
+        }
+        "router-seal-cred" => {
+            let mac = string_field("mac")?.to_ascii_lowercase();
+            if !valid_mac(&mac) {
+                return Err(format!("{verb}: invalid MAC"));
+            }
+            format!("router:{mac}")
+        }
+        "farm-scale" => "build-farm".to_string(),
+        "testbed-up" | "testbed-down" => "testbed-pool".to_string(),
+        _ => unreachable!("the mutation list and target map must stay closed"),
+    };
+    Ok(Some(target))
+}
+
+/// Gate a host-side mutation before [`build_reply`] can invoke SSH, helper
+/// scripts, the leader lease, or the secret store. This function is pure apart
+/// from verifier/replay-ledger access.
+fn authorize_mutation(
+    svc: &HostOpsService,
+    verb: &str,
+    req_body: Option<&str>,
+) -> Result<(), String> {
+    let Some(target) = mutation_target(verb, req_body)? else {
+        return Ok(());
+    };
+    svc.authorizer.authorize(
+        req_body.expect("a mutation target requires a body"),
+        MutationContext {
+            verb,
+            node: DC_ACTION_NODE_SCOPE,
+            target: &target,
+        },
+    )
+}
+
+fn build_authorized_reply(svc: &HostOpsService, verb: &str, req_body: Option<&str>) -> String {
+    if let Err(error) = authorize_mutation(svc, verb, req_body) {
+        tracing::warn!(
+            target: "mackesd::action_auth",
+            verb,
+            %error,
+            "refused unauthorized Datacenter host mutation"
+        );
+        return json!({ "error": format!("{verb}: authorization refused: {error}") }).to_string();
+    }
+    build_reply(svc, verb, req_body)
 }
 
 /// Map a host power `op` to the ordered list of `xe` host verbs it runs. PURE.
@@ -1545,7 +1659,7 @@ pub fn poll_once(persist: &Persist, svc: &HostOpsService, cursors: &mut HashMap<
         for msg in msgs {
             cursors.insert(topic.clone(), msg.ulid.clone());
             let reply = if crate::ipc::body_within_cap(msg.body.as_deref()) {
-                build_reply(svc, verb, msg.body.as_deref())
+                build_authorized_reply(svc, verb, msg.body.as_deref())
             } else {
                 crate::ipc::body_too_large_reply(verb)
             };
@@ -1564,6 +1678,24 @@ pub fn poll_once(persist: &Persist, svc: &HostOpsService, cursors: &mut HashMap<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::action_auth::authorize_test_body;
+
+    const AUTH_KEY: &[u8] = b"host-ops-action-auth-test-key";
+    const AUTH_NOW: i64 = 1_700_000_000_000;
+
+    fn authorized_service(root: &std::path::Path) -> HostOpsService {
+        HostOpsService::new(root.to_path_buf()).with_authorizer(Arc::new(
+            ActionAuthorizer::for_test(AUTH_KEY, root.join("auth"), AUTH_NOW),
+        ))
+    }
+
+    fn host_context(verb: &'static str, target: &'static str) -> MutationContext<'static> {
+        MutationContext {
+            verb,
+            node: DC_ACTION_NODE_SCOPE,
+            target,
+        }
+    }
 
     #[test]
     fn topic_and_verbs_lock() {
@@ -1596,6 +1728,117 @@ mod tests {
         assert!(ACTION_VERBS.contains(&"lighthouse-promote"));
         assert!(ACTION_VERBS.contains(&"host-net"));
         assert!(ACTION_VERBS.contains(&"host-vlan-create"));
+    }
+
+    #[test]
+    fn host_ops_read_and_mutation_classification_is_closed() {
+        for verb in [
+            "host-impact",
+            "host-pool",
+            "gateway-status",
+            "host-net",
+            "gateway-dhcp",
+            "testbed-list",
+        ] {
+            assert_eq!(mutation_target(verb, None), Ok(None), "{verb}");
+        }
+
+        let cases = [
+            (
+                "host-power",
+                json!({ "dom0": "172.20.0.9", "op": "maintenance-on" }),
+                "host:172.20.0.9",
+            ),
+            (
+                "gateway-reboot",
+                json!({ "host": "172.20.0.1", "confirm": true }),
+                "gateway:172.20.0.1",
+            ),
+            (
+                "lighthouse-restart",
+                json!({ "overlay_ip": "10.42.0.5", "confirm": true }),
+                "lighthouse:10.42.0.5",
+            ),
+            (
+                "lighthouse-promote",
+                json!({ "node": "peer:anvil", "confirm": true }),
+                "lighthouse:anvil",
+            ),
+            (
+                "host-vlan-create",
+                json!({ "dom0": "172.20.0.9", "vlan": 100 }),
+                "host:172.20.0.9:vlan:100",
+            ),
+            (
+                "router-seal-cred",
+                json!({ "mac": "46:6A:7C:96:E8:AA", "cred": "u:p" }),
+                "router:46:6a:7c:96:e8:aa",
+            ),
+        ];
+        for (verb, body, expected) in cases {
+            assert_eq!(
+                mutation_target(verb, Some(&body.to_string())),
+                Ok(Some(expected.to_string())),
+                "{verb}"
+            );
+        }
+        for (verb, expected) in [
+            ("dr-backup", "disaster-recovery"),
+            ("farm-scale", "build-farm"),
+            ("testbed-up", "testbed-pool"),
+            ("testbed-down", "testbed-pool"),
+        ] {
+            let body = json!({ "schema_version": 1 });
+            assert_eq!(
+                mutation_target(verb, Some(&body.to_string())),
+                Ok(Some(expected.to_string())),
+                "{verb}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsigned_tampered_replayed_and_future_schema_host_mutations_never_reach_backend() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = authorized_service(tmp.path());
+        let unsigned = json!({
+            "schema_version": 1,
+            "dom0": "172.20.0.9",
+            "op": "maintenance-on",
+        })
+        .to_string();
+        assert!(authorize_mutation(&svc, "host-power", Some(&unsigned)).is_err());
+        assert!(
+            build_authorized_reply(&svc, "host-power", Some(&unsigned))
+                .contains("authorization refused"),
+            "an unsigned request must return before build_reply can resolve SSH"
+        );
+
+        let armed = authorize_test_body(
+            AUTH_KEY,
+            &unsigned,
+            host_context("host-power", "host:172.20.0.9"),
+            "host-once",
+            AUTH_NOW + 30_000,
+        );
+        let tampered = armed.replace("maintenance-on", "maintenance-off");
+        assert!(authorize_mutation(&svc, "host-power", Some(&tampered)).is_err());
+        assert!(authorize_mutation(&svc, "host-power", Some(&armed)).is_ok());
+        assert!(authorize_mutation(&svc, "host-power", Some(&armed))
+            .unwrap_err()
+            .contains("already used"));
+
+        let future = json!({ "schema_version": 2 }).to_string();
+        let future = authorize_test_body(
+            AUTH_KEY,
+            &future,
+            host_context("farm-scale", "build-farm"),
+            "farm-future",
+            AUTH_NOW + 30_000,
+        );
+        assert!(authorize_mutation(&svc, "farm-scale", Some(&future))
+            .unwrap_err()
+            .contains("schema_version 1"));
     }
 
     #[test]

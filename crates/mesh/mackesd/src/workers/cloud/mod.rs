@@ -18,11 +18,12 @@
 //! ## The two U2 gates (this module's drain wires them)
 //!
 //! - **Armed-token gate** ([`gate`]) — replaces the retired `MDE_CLOUD_APPLY=1`
-//!   env wall. A live mutation is authorized by a mesh-identity-signed **armed
-//!   token** (nonce + expiry, bound to the verb + placement node). `CloudState.
+//!   env wall. A live mutation is authorized by a root-shell-minted HMAC **armed
+//!   token** (nonce + expiry, bound to verb + placement + target). `CloudState.
 //!   apply_armed` is reinterpreted as *token-arming available on this node* (a
-//!   capability, not a wall). `destroy` additionally requires a `typed_name`
-//!   confirmation (== the destroy target).
+//!   capability, not a wall). Destructive per-workload lifecycle operations also
+//!   require a `typed_name` matching the exact target; legacy workspace-wide
+//!   `destroy` is refused.
 //! - **Placement gate** ([`gate::placement_match`]) — replaces the leader gate.
 //!   Every node drains `action/cloud/*`, but performs a MUTATION iff `body.node ==
 //!   self.host`; a mutation for another node is that node's to perform, and a
@@ -35,6 +36,7 @@
 #![cfg(feature = "async-services")]
 
 mod gate;
+mod path_key;
 mod reconcile;
 mod render;
 mod runner;
@@ -55,12 +57,22 @@ use mde_bus::rpc::reply_topic;
 
 use super::{ShutdownToken, Worker};
 
-use gate::{placement_match, HmacTokenSigner, NullSigner, Placement, TokenSigner};
+#[cfg(test)]
+pub(crate) use gate::nonce_digest;
+pub(crate) use gate::{
+    claim_nonce, placement_match, verify_token, HmacTokenSigner, NullSigner, Placement,
+    TokenSigner, TokenVerdict, DEFAULT_AUTH_ROOT,
+};
 use runner::{
     default_iac_root, default_libvirt_uri, instances_table, CloudRunOutcome, CloudRunner,
     ShellCloudRunner, BACKEND_TOOLS,
 };
 use verbs::{CloudActionBody, CloudVerb};
+
+/// Maximum remaining lifetime accepted for any cloud mutation capability.
+/// Consumers enforce this independently of the root shell's minting policy so
+/// a signed token can never become a long-lived bearer credential.
+pub(crate) const MAX_AUTH_TTL_MS: i64 = 30_000;
 
 // The armed-token capability the Workloads surface (a later unit) mints — exported
 // so the module path stays stable across the split. `CloudRunner` + `TokenSigner`
@@ -105,6 +117,9 @@ pub struct CloudWorker {
     /// `CloudState.apply_armed`). `false` ⇒ this node has no arming key and stages
     /// every mutation honestly.
     arm_capable: bool,
+    /// Host-local spent-nonce ledger. This must never live in the
+    /// Syncthing-replicated workgroup tree in production.
+    auth_root: PathBuf,
     /// The workgroup / desired-state root — the per-node desired store
     /// (`<state_root>/mcnf/cloud/desired/<node>/…`) U4's `set-desired` writes and
     /// U5's reconcile/drift tick reads.
@@ -131,8 +146,7 @@ pub struct CloudWorker {
 
 impl CloudWorker {
     /// Construct with production defaults: the [`ShellCloudRunner`] over the
-    /// deployed IaC tree + local libvirt, the armed-token signer from the mesh
-    /// arming key seam ([`gate::ARM_KEY_ENV`]; absent ⇒ arming unavailable), the
+    /// deployed IaC tree + local libvirt, a placement-node-local arming authority,
     /// honest reconcile skeleton, the canonical audit DB, and the persisted Bus
     /// tree. `host` is this node's id; `node_id` is the audit actor;
     /// `workgroup_root` is the desired-state / tfvars root (reserved for the
@@ -143,12 +157,29 @@ impl CloudWorker {
             &default_iac_root(),
             default_libvirt_uri(),
         ));
-        // The arming key seam: a node holding the mesh arming key can verify tokens
-        // (arm-capable); a node without one stages every mutation honestly.
-        let (signer, arm_capable): (Arc<dyn TokenSigner>, bool) = match HmacTokenSigner::from_env()
-        {
-            Some(s) => (Arc::new(s), true),
-            None => (Arc::new(NullSigner), false),
+        // Unit tests and offline callers pass isolated roots and inject a signer.
+        // Production has a host-local replay ledger and obtains verification
+        // authority only from a root-only systemd credential.
+        let production = workgroup_root == mackes_mesh_types::peers::default_workgroup_root();
+        let auth_root = if production {
+            PathBuf::from(gate::DEFAULT_AUTH_ROOT)
+        } else {
+            workgroup_root.join("mcnf/cloud/test-auth")
+        };
+        let (signer, arm_capable): (Arc<dyn TokenSigner>, bool) = if production {
+            match HmacTokenSigner::from_systemd_credential() {
+                Ok(signer) => (Arc::new(signer), true),
+                Err(error) => {
+                    tracing::error!(
+                        target: "mackesd::cloud",
+                        %error,
+                        "cloud live authorization unavailable; mutations remain staged"
+                    );
+                    (Arc::new(NullSigner), false)
+                }
+            }
+        } else {
+            (Arc::new(NullSigner), false)
         };
         Self {
             host,
@@ -156,6 +187,7 @@ impl CloudWorker {
             runner,
             signer,
             arm_capable,
+            auth_root,
             state_root: workgroup_root,
             db_path: crate::default_db_path(),
             bus_root: default_bus_root(),
@@ -180,6 +212,13 @@ impl CloudWorker {
     pub fn with_signer(mut self, signer: Arc<dyn TokenSigner>) -> Self {
         self.signer = signer;
         self.arm_capable = true;
+        self
+    }
+
+    /// Override the durable replay root (tests avoid touching `/var/lib`).
+    #[must_use]
+    pub fn with_auth_root(mut self, root: PathBuf) -> Self {
+        self.auth_root = root;
         self
     }
 
@@ -227,6 +266,56 @@ impl CloudWorker {
     pub fn with_reachable_nodes(mut self, nodes: Option<HashSet<String>>) -> Self {
         self.reachable_override = nodes;
         self
+    }
+
+    /// Atomically consume an authenticated token nonce in a durable ledger below
+    /// the daemon-owned cloud state root. `create_new` is the cross-thread and
+    /// cross-process compare-and-set: exactly one request can claim a nonce, and
+    /// a daemon restart cannot make a spent capability valid again.
+    pub(crate) fn claim_armed_nonce(
+        &self,
+        nonce: &str,
+        expires_at_ms: i64,
+        now_ms: i64,
+    ) -> Result<bool, String> {
+        gate::claim_nonce(&self.auth_root, nonce, expires_at_ms, now_ms)
+    }
+
+    /// Verify and atomically consume one capability. Every live handler uses this
+    /// seam so image/container paths cannot accidentally skip durable replay.
+    pub(crate) fn consume_armed_token(
+        &self,
+        raw: Option<&str>,
+        verb: &str,
+        node: &str,
+        target: &str,
+        request_body: &str,
+    ) -> TokenVerdict {
+        let now = now_ms();
+        let mut verdict = gate::verify_token(
+            raw,
+            verb,
+            node,
+            target,
+            request_body,
+            now,
+            self.signer.as_ref(),
+        );
+        if verdict.is_valid() {
+            let Some(token) = raw.and_then(ArmedToken::parse) else {
+                return TokenVerdict::Malformed;
+            };
+            if token.expires_at_ms > now.saturating_add(MAX_AUTH_TTL_MS) {
+                return TokenVerdict::LifetimeTooLong;
+            }
+            let claim = self.claim_armed_nonce(&token.nonce, token.expires_at_ms, now);
+            verdict = match claim {
+                Ok(true) => TokenVerdict::Valid,
+                Ok(false) => TokenVerdict::Replayed,
+                Err(_) => TokenVerdict::ReplayStoreUnavailable,
+            };
+        }
+        verdict
     }
 
     /// Write one hash-chain audit row for a performed destructive cloud op through
@@ -287,10 +376,11 @@ impl CloudWorker {
     /// Drain every new `action/cloud/*` request, advance the per-topic cursors, and
     /// route each by PLACEMENT (not leadership):
     ///
-    /// - a READ is served locally on every node (each answers its own roster);
-    /// - a MUTATION is performed iff its `body.node` is this host (or is empty —
-    ///   the legacy node-agnostic path);
-    /// - a MUTATION for another node is skipped when that node is reachable (it
+    /// - list/status reads are served locally; node-local inventory/output/plan
+    ///   reads and every mutation require explicit placement;
+    /// - a placement-scoped action is handled iff `body.node` is this host;
+    /// - a scoped action without placement is refused (never fanned out);
+    /// - an action for another node is skipped when that node is reachable (it
     ///   performs + replies), and honestly gated (`placement node <N> not
     ///   reachable`) when it is not — never a silent swallow.
     ///
@@ -312,7 +402,8 @@ impl CloudWorker {
                 continue;
             };
             let verb_name = verb_name.to_string();
-            let is_mutation = CloudVerb::from_verb(&verb_name).is_some_and(CloudVerb::is_mutation);
+            let placement_scoped =
+                CloudVerb::from_verb(&verb_name).is_some_and(CloudVerb::requires_placement);
             let cursor = cursors.get(&topic).cloned();
             let Ok(msgs) = persist.list_since(&topic, cursor.as_deref()) else {
                 continue;
@@ -321,10 +412,11 @@ impl CloudWorker {
                 cursors.insert(topic.clone(), msg.ulid.clone());
                 let body = msg.body.as_deref().unwrap_or("{}");
                 // Placement routing: reads stay local; a mutation goes to its node.
-                let route = if is_mutation {
+                let route = if placement_scoped {
                     let parsed = CloudActionBody::parse(body);
                     match placement_match(&parsed.node, &self.host) {
                         Placement::Local => Route::Handle,
+                        Placement::Missing => Route::GateMissing,
                         Placement::Remote(n) => {
                             if self.node_reachable(&persist, &n) {
                                 Route::Skip
@@ -349,6 +441,18 @@ impl CloudWorker {
                         acted = true;
                     }
                     Route::Skip => {}
+                    Route::GateMissing => {
+                        let reply = CloudReply {
+                            ok: false,
+                            verb: verb_name.clone(),
+                            gated: Some(
+                                "cloud action requires an explicit placement node".to_string(),
+                            ),
+                            ..Default::default()
+                        };
+                        self.write_reply(&persist, &msg.ulid, &reply);
+                        acted = true;
+                    }
                     Route::GateUnreachable(n) => {
                         let reply = CloudReply {
                             ok: false,
@@ -458,6 +562,8 @@ enum Route {
     Handle,
     /// Another (reachable) node performs it — do nothing.
     Skip,
+    /// A mutation omitted placement; refuse it without touching any backend.
+    GateMissing,
     /// The placement target is unreachable — reply honest-gated (no silent swallow).
     GateUnreachable(String),
 }
@@ -524,13 +630,29 @@ mod tests {
         HmacTokenSigner::new(KEY.to_vec())
     }
 
-    fn far_future() -> i64 {
-        now_ms() + 3_600_000
+    fn valid_expiry() -> i64 {
+        now_ms().saturating_add(MAX_AUTH_TTL_MS)
     }
 
     /// A valid armed token for `(verb, node)` signed with the shared test key.
-    fn valid_token(verb: &str, node: &str) -> String {
-        ArmedToken::mint(&signer(), "nonce-12345678", far_future(), verb, node).encode()
+    fn valid_token(verb: &str, node: &str, target: &str, request_body: &str) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_NONCE: AtomicU64 = AtomicU64::new(1);
+        let nonce = format!(
+            "nonce-{}-{}",
+            std::process::id(),
+            NEXT_NONCE.fetch_add(1, Ordering::Relaxed)
+        );
+        ArmedToken::mint(
+            &signer(),
+            &nonce,
+            valid_expiry(),
+            verb,
+            node,
+            target,
+            &mackes_mesh_types::cloud::cloud_request_digest(request_body).unwrap(),
+        )
+        .encode()
     }
 
     /// A worker whose signer holds the test key (arm-capable) — armed mutations apply.
@@ -563,6 +685,17 @@ mod tests {
             assert_eq!(instances.len(), 2);
             assert_eq!(instances[0].name, "web");
         }
+    }
+
+    #[test]
+    fn placement_local_list_returns_only_the_handling_workers_roster() {
+        let runner = Arc::new(FakeRunner {
+            roster: vec![instance("web", "ACTIVE")],
+            ..Default::default()
+        });
+        let reply = staged_worker(runner).handle("list-instances-local", r#"{"node":"me"}"#);
+        assert!(reply.ok);
+        assert_eq!(reply.instances.unwrap()[0].name, "web");
     }
 
     #[test]
@@ -599,9 +732,15 @@ mod tests {
     fn an_armed_mutation_applies_and_is_not_audited_when_non_destructive() {
         let runner = Arc::new(FakeRunner::default());
         let w = armed_worker(runner.clone());
+        let base = r#"{"node":"me"}"#;
         let body = format!(
             r#"{{"node":"me","armed_token":"{}"}}"#,
-            valid_token("provision", "me")
+            valid_token(
+                "provision",
+                "me",
+                mackes_mesh_types::cloud::CLOUD_ARM_NODE_SCOPE,
+                base,
+            )
         );
         let reply = w.handle("provision", &body);
         assert!(reply.ok, "gated: {:?}", reply.gated);
@@ -613,6 +752,48 @@ mod tests {
     }
 
     #[test]
+    fn an_armed_token_is_single_use_even_across_worker_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = r#"{"node":"me"}"#;
+        let token = valid_token(
+            "provision",
+            "me",
+            mackes_mesh_types::cloud::CLOUD_ARM_NODE_SCOPE,
+            base,
+        );
+        let body = format!(r#"{{"node":"me","armed_token":"{token}"}}"#);
+
+        let first_runner = Arc::new(FakeRunner::default());
+        let first = CloudWorker::new("me".into(), "peer:me".into(), tmp.path().to_path_buf())
+            .with_runner(first_runner.clone())
+            .with_signer(Arc::new(signer()))
+            .with_bus_root(None);
+        assert!(first.handle("provision", &body).ok);
+        assert_eq!(
+            first_runner.calls.lock().unwrap().as_slice(),
+            &[("provision".into(), true)]
+        );
+        drop(first);
+
+        let restarted_runner = Arc::new(FakeRunner::default());
+        let restarted = CloudWorker::new("me".into(), "peer:me".into(), tmp.path().to_path_buf())
+            .with_runner(restarted_runner.clone())
+            .with_signer(Arc::new(signer()))
+            .with_bus_root(None);
+        let replay = restarted.handle("provision", &body);
+        assert!(!replay.ok);
+        assert!(replay
+            .gated
+            .as_deref()
+            .is_some_and(|reason| reason.contains("already used")));
+        assert_eq!(
+            restarted_runner.calls.lock().unwrap().as_slice(),
+            &[("provision".into(), false)],
+            "a replay may stage a plan but never applies"
+        );
+    }
+
+    #[test]
     fn an_expired_or_forged_token_stages_and_never_applies() {
         let runner = Arc::new(FakeRunner::default());
         let w = armed_worker(runner.clone());
@@ -620,9 +801,11 @@ mod tests {
         let forged = ArmedToken::mint(
             &HmacTokenSigner::new(b"other".to_vec()),
             "nonce-12345678",
-            far_future(),
+            valid_expiry(),
             "provision",
             "me",
+            mackes_mesh_types::cloud::CLOUD_ARM_NODE_SCOPE,
+            &mackes_mesh_types::cloud::cloud_request_digest(r#"{"node":"me"}"#).unwrap(),
         )
         .encode();
         let body = format!(r#"{{"node":"me","armed_token":"{forged}"}}"#);
@@ -636,40 +819,118 @@ mod tests {
         );
     }
 
-    // ── destroy: armed + typed-arming confirmation ──
     #[test]
-    fn an_armed_destroy_with_typed_name_applies_audits_and_reports_audited() {
-        let tmp = tempfile::tempdir().unwrap();
+    fn an_overlong_token_stages_and_never_applies() {
         let runner = Arc::new(FakeRunner::default());
-        let w = armed_worker(runner.clone()).with_db_path(tmp.path().join("events.sqlite"));
-        let body = format!(
-            r#"{{"node":"me","name":"me","typed_name":"me","armed_token":"{}"}}"#,
-            valid_token("destroy", "me")
-        );
-        let reply = w.handle("destroy", &body);
-        assert!(reply.ok, "gated: {:?} err: {:?}", reply.gated, reply.error);
-        assert!(reply.audited, "a performed destroy is audited");
+        let w = armed_worker(runner.clone());
+        let base = r#"{"node":"me"}"#;
+        let token = ArmedToken::mint(
+            &signer(),
+            "nonce-overlong-cloud-capability",
+            now_ms().saturating_add(MAX_AUTH_TTL_MS + 30_000),
+            "provision",
+            "me",
+            mackes_mesh_types::cloud::CLOUD_ARM_NODE_SCOPE,
+            &mackes_mesh_types::cloud::cloud_request_digest(base).unwrap(),
+        )
+        .encode();
+        let body = format!(r#"{{"node":"me","armed_token":"{token}"}}"#);
+
+        let reply = w.handle("provision", &body);
+        assert!(!reply.ok);
+        assert!(reply
+            .gated
+            .as_deref()
+            .is_some_and(|reason| reason.contains("exceeds the 30-second lifetime")));
         assert_eq!(
             runner.calls.lock().unwrap().as_slice(),
-            &[("destroy".into(), true)]
+            &[("provision".into(), false)],
+            "an overlong token may stage a plan but never applies"
         );
     }
 
+    // ── destructive lifecycle: target-scoped + typed confirmation ──
     #[test]
-    fn an_armed_destroy_without_the_typed_name_confirmation_is_blocked() {
+    fn workspace_wide_destroy_is_retired_and_never_reaches_the_runner() {
         let runner = Arc::new(FakeRunner::default());
         let w = armed_worker(runner.clone());
-        // Armed, but the typed_name confirmation is missing → blocked, nothing applied.
+        let reply = w.handle("destroy", r#"{"node":"me"}"#);
+        assert!(!reply.ok);
+        assert!(reply
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("workspace-wide destroy is retired")));
+        assert!(runner.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn armed_target_delete_retracts_only_that_workload_and_is_audited() {
+        use mackes_mesh_types::cloud::{DeliveryType, WorkloadSpec};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let runner = Arc::new(FakeRunner::default());
+        for name in ["web", "peer"] {
+            reconcile::write_desired_doc(
+                tmp.path(),
+                &WorkloadSpec {
+                    name: name.to_string(),
+                    delivery_type: DeliveryType::ServiceVm,
+                    node: "me".to_string(),
+                    vcpu: 2,
+                    memory_mb: 2048,
+                    disk_gb: 20,
+                    image: None,
+                    network_isolation: false,
+                    raw_hcl: None,
+                },
+            )
+            .unwrap();
+        }
+        let w = CloudWorker::new("me".into(), "peer:me".into(), tmp.path().to_path_buf())
+            .with_runner(runner.clone())
+            .with_signer(Arc::new(signer()))
+            .with_db_path(tmp.path().join("events.sqlite"))
+            .with_bus_root(None);
         let body = format!(
-            r#"{{"node":"me","name":"me","armed_token":"{}"}}"#,
-            valid_token("destroy", "me")
+            r#"{{"node":"me","instance":"web","typed_name":"web","armed_token":"{}"}}"#,
+            valid_token(
+                "instance-delete",
+                "me",
+                "web",
+                r#"{"node":"me","instance":"web","typed_name":"web"}"#,
+            )
         );
-        let reply = w.handle("destroy", &body);
+        let reply = w.handle("instance-delete", &body);
+        assert!(reply.ok, "gated: {:?} err: {:?}", reply.gated, reply.error);
+        assert!(reply.audited, "a performed target delete is audited");
+        assert_eq!(
+            runner.calls.lock().unwrap().as_slice(),
+            &[("lifecycle-delete".into(), true)]
+        );
+        let remaining = reconcile::read_desired_slice(tmp.path(), "me");
+        assert_eq!(remaining.len(), 1, "the peer desired doc remains");
+        assert_eq!(remaining[0].name, "peer");
+    }
+
+    #[test]
+    fn an_armed_target_delete_without_typed_confirmation_is_blocked() {
+        let runner = Arc::new(FakeRunner::default());
+        let w = armed_worker(runner.clone());
+        let body = format!(
+            r#"{{"node":"me","instance":"web","armed_token":"{}"}}"#,
+            valid_token(
+                "instance-delete",
+                "me",
+                "web",
+                r#"{"node":"me","instance":"web"}"#,
+            )
+        );
+        let reply = w.handle("instance-delete", &body);
         assert!(!reply.ok);
         assert!(reply.error.unwrap().contains("typed_name"));
         assert!(
             runner.calls.lock().unwrap().is_empty(),
-            "a blocked destroy never runs the backend"
+            "a blocked delete never runs the backend"
         );
     }
 
@@ -684,7 +945,12 @@ mod tests {
         // With an instance + a valid token → the start action applies.
         let body = format!(
             r#"{{"node":"me","instance":"web","armed_token":"{}"}}"#,
-            valid_token("instance-start", "me")
+            valid_token(
+                "instance-start",
+                "me",
+                "web",
+                r#"{"node":"me","instance":"web"}"#,
+            )
         );
         let good = w.handle("instance-start", &body);
         assert!(good.ok, "gated: {:?}", good.gated);
@@ -695,11 +961,147 @@ mod tests {
     }
 
     #[test]
+    fn armed_bulk_lifecycle_selects_targets_from_the_workers_live_roster() {
+        let runner = Arc::new(FakeRunner {
+            roster: vec![
+                instance("web", "ACTIVE"),
+                instance("db", "SHUTOFF"),
+                instance("cache", "ACTIVE"),
+                instance("web", "ACTIVE"),
+                instance("broken", "ERROR"),
+            ],
+            ..Default::default()
+        });
+        let w = armed_worker(runner.clone());
+        let base = r#"{"schema_version":1,"node":"me"}"#;
+        let body = format!(
+            r#"{{"schema_version":1,"node":"me","armed_token":"{}"}}"#,
+            valid_token(
+                "instance-stop-all",
+                "me",
+                mackes_mesh_types::cloud::CLOUD_ARM_NODE_SCOPE,
+                base,
+            )
+        );
+        let reply = w.handle("instance-stop-all", &body);
+        assert!(
+            reply.ok,
+            "gated: {:?}, error: {:?}",
+            reply.gated, reply.error
+        );
+        assert_eq!(
+            reply.raw_log.as_deref(),
+            Some("2 succeeded, 0 failed (of 2)")
+        );
+        assert_eq!(
+            runner.calls.lock().unwrap().as_slice(),
+            &[
+                ("lifecycle-stop".into(), true),
+                ("lifecycle-stop".into(), true),
+            ],
+            "only the two unique ACTIVE domains are selected inside the worker"
+        );
+    }
+
+    #[test]
+    fn unarmed_bulk_lifecycle_never_reads_targets_or_calls_the_runner() {
+        let runner = Arc::new(FakeRunner {
+            roster: vec![instance("web", "ACTIVE")],
+            ..Default::default()
+        });
+        let reply = armed_worker(runner.clone())
+            .handle("instance-reboot-all", r#"{"schema_version":1,"node":"me"}"#);
+        assert!(!reply.ok);
+        assert!(reply
+            .gated
+            .as_deref()
+            .is_some_and(|reason| reason.contains("not authorized")));
+        assert!(runner.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn an_unknown_verb_is_an_honest_error() {
         let w = staged_worker(Arc::new(FakeRunner::default()));
         let reply = w.handle("frobnicate", "{}");
         assert!(!reply.ok);
         assert!(reply.error.unwrap().contains("unknown cloud verb"));
+    }
+
+    #[test]
+    fn unauthenticated_desired_android_and_console_actions_change_or_disclose_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let worker = CloudWorker::new("me".into(), "peer:me".into(), tmp.path().to_path_buf())
+            .with_signer(Arc::new(signer()))
+            .with_bus_root(None);
+
+        let desired = worker.handle(
+            "set-desired",
+            r#"{"node":"me","spec":{"name":"poison","delivery_type":"service_vm","node":"me","vcpu":64,"memory_mb":65536,"disk_gb":999}}"#,
+        );
+        assert!(!desired.ok);
+        assert!(desired
+            .gated
+            .as_deref()
+            .is_some_and(|reason| reason.contains("not authorized")));
+        assert!(reconcile::read_desired_slice(tmp.path(), "me").is_empty());
+
+        let android = worker.handle(
+            "android-provision",
+            r#"{"node":"me","name":"poison-android"}"#,
+        );
+        assert!(!android.ok);
+        assert!(android
+            .gated
+            .as_deref()
+            .is_some_and(|reason| reason.contains("not authorized")));
+        assert!(reconcile::read_desired_slice(tmp.path(), "me").is_empty());
+
+        let console = worker.handle("console-attach", r#"{"node":"me","instance":"secret-vm"}"#);
+        assert!(!console.ok);
+        assert!(console.console.is_none());
+        assert!(console
+            .gated
+            .as_deref()
+            .is_some_and(|reason| reason.contains("not authorized")));
+    }
+
+    #[test]
+    fn configure_token_cannot_authorize_a_substituted_playbook() {
+        let runner = Arc::new(FakeRunner::default());
+        let worker = armed_worker(runner.clone());
+        let authorized = r#"{"node":"me","playbook":"site.yml","group":"cloud_vm"}"#;
+        let token = valid_token(
+            "configure",
+            "me",
+            mackes_mesh_types::cloud::CLOUD_ARM_NODE_SCOPE,
+            authorized,
+        );
+        let altered = format!(
+            r#"{{"node":"me","playbook":"attacker.yml","group":"cloud_vm","armed_token":"{token}"}}"#
+        );
+        let reply = worker.handle("configure", &altered);
+        assert!(!reply.ok);
+        assert!(reply
+            .gated
+            .as_deref()
+            .is_some_and(|reason| reason.contains("request body")));
+        assert_eq!(
+            runner.calls.lock().unwrap().as_slice(),
+            &[("configure".into(), false)]
+        );
+    }
+
+    #[test]
+    fn an_unknown_future_request_schema_is_rejected_before_any_backend_call() {
+        let runner = Arc::new(FakeRunner::default());
+        let w = staged_worker(runner.clone());
+        let reply = w.handle("provision", r#"{"schema_version":99,"node":"me"}"#);
+        assert!(!reply.ok);
+        assert!(reply
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("unsupported cloud request schema version 99")));
+        assert!(runner.calls.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -805,6 +1207,41 @@ mod tests {
 
     // ── placement-routed drain ──
     #[tokio::test]
+    async fn an_unprivileged_bus_writer_cannot_request_mint_authority() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bus = tmp.path().to_path_buf();
+        let persist = Persist::open(bus.clone()).unwrap();
+        // Any local uid can write this public spool. `authorize` must remain an
+        // unknown verb and no response schema may carry a minted token.
+        let req = persist
+            .write(
+                "action/cloud/authorize",
+                Priority::Default,
+                None,
+                Some(r#"{"node":"me","verb":"provision","confirmation":"apply"}"#),
+            )
+            .unwrap();
+        let worker = CloudWorker::new("me".into(), "peer:me".into(), tmp.path().to_path_buf())
+            .with_signer(Arc::new(signer()))
+            .with_bus_root(Some(bus));
+
+        assert!(worker.drain_actions(&mut HashMap::new()));
+        let replies = persist.list_since(&reply_topic(&req.ulid), None).unwrap();
+        assert_eq!(replies.len(), 1);
+        let raw = replies[0].body.as_deref().unwrap();
+        let reply: CloudReply = serde_json::from_str(raw).unwrap();
+        assert!(!reply.ok);
+        assert!(reply
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("unknown cloud verb")));
+        assert!(
+            !raw.contains("armed_token"),
+            "public replies expose no mint field"
+        );
+    }
+
+    #[tokio::test]
     async fn drain_performs_a_mutation_only_on_its_placement_node() {
         let tmp = tempfile::tempdir().unwrap();
         let bus = tmp.path().to_path_buf();
@@ -812,7 +1249,12 @@ mod tests {
         // A mutation placed on node "l", armed for "l".
         let body = format!(
             r#"{{"node":"l","armed_token":"{}"}}"#,
-            valid_token("provision", "l")
+            valid_token(
+                "provision",
+                "l",
+                mackes_mesh_types::cloud::CLOUD_ARM_NODE_SCOPE,
+                r#"{"node":"l"}"#,
+            )
         );
         let req = persist
             .write(
@@ -859,6 +1301,41 @@ mod tests {
             &[("provision".into(), true)],
             "the placement node applied the armed mutation"
         );
+    }
+
+    #[tokio::test]
+    async fn drain_refuses_a_mutation_without_explicit_placement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bus = tmp.path().to_path_buf();
+        let persist = Persist::open(bus.clone()).unwrap();
+        let req = persist
+            .write(
+                "action/cloud/provision",
+                Priority::Default,
+                None,
+                Some("{}"),
+            )
+            .unwrap();
+        let runner = Arc::new(FakeRunner::default());
+        let worker = CloudWorker::new("me".into(), "peer:me".into(), tmp.path().to_path_buf())
+            .with_runner(runner.clone())
+            .with_bus_root(Some(bus));
+
+        assert!(worker.drain_actions(&mut HashMap::new()));
+        let replies = persist.list_since(&reply_topic(&req.ulid), None).unwrap();
+        assert_eq!(replies.len(), 1);
+        let reply: CloudReply = serde_json::from_str(
+            replies[0]
+                .body
+                .as_deref()
+                .expect("placement refusal carries a body"),
+        )
+        .unwrap();
+        assert!(reply
+            .gated
+            .as_deref()
+            .is_some_and(|reason| reason.contains("explicit placement")));
+        assert!(runner.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

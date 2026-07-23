@@ -1,11 +1,10 @@
 # Mesh virtualization management + same-stack — design lock
 
-> **PARTIALLY SUPERSEDED 2026-07-03 by `docs/design/quasar-cloud.md` (CONSTRUCT-CLOUD,
-> 90-Q survey).** Pillar 1's **cloud-hypervisor** choice and the §"management
-> layer" **mesh-native #5 scheduler** lock are superseded: the VM plane is now
-> **Nova + Placement on libvirt/QEMU-KVM** (Kolla containers, mackesd-supervised),
-> and **Cockpit's interim console retires at cutover**. Still standing from this
-> doc: the **two-role model**, **same stack on every machine / role is
+> **PARTIALLY HISTORICAL / SUPERSEDED (2026-07-22):** Pillar 1's
+> `cloud-hypervisor` choice, the mesh-native scheduler, and the later
+> Nova/Kolla replacement are all retired. The VM plane is provider-neutral
+> Workloads over OpenTofu + Ansible + local libvirt/QEMU-KVM. Still standing
+> from this doc: the **two-role model**, **same stack on every machine / role is
 > configuration**, the XCP-ng demotion to day-2 adoption, and the Podman
 > container plane.
 

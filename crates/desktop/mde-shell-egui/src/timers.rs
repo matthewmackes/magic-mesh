@@ -1,7 +1,7 @@
-//! `Surface::Timers` — the **Timers & Alarms** surface (VDOCK-5, design
+//! `Surface::Timers` — the **Timers & Alarms** surface (design
 //! `docs/design/vertical-dock.md` locks #5/#16/#20).
 //!
-//! The vertical dock removed the taskbar clock; its replacement is a clock-glyph
+//! Timers is reached from the Construct status clock, whose replacement is a clock-glyph
 //! status cell (`dock::clock_cell` — the live HH:MM *is* the glyph, lock #20)
 //! that opens this surface: create + run **countdown timers** and set daily
 //! **alarms**. The store lives on the [`Shell`](crate) and is ticked from the
@@ -825,7 +825,7 @@ mod tests {
     impl Scratch {
         fn new(tag: &str) -> Self {
             let dir = std::env::temp_dir().join(format!(
-                "mde-vdock5-{tag}-{}-{:?}",
+                "mde-timers-{tag}-{}-{:?}",
                 std::process::id(),
                 std::thread::current().id()
             ));

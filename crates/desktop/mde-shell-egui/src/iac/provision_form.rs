@@ -104,7 +104,7 @@ pub(super) fn provision_form(ui: &mut egui::Ui, state: &mut WorkloadsState) {
     });
 
     let Some(node) = node else {
-        crate::session::empty_state(
+        crate::empty_state::show(
             ui,
             "No placement node selected",
             "Pick a node in the placement picker above; the provision form targets it.",
@@ -219,14 +219,7 @@ pub(super) fn provision_form(ui: &mut egui::Ui, state: &mut WorkloadsState) {
     // two mutations race the single in-flight reply slot.
     if set_desired {
         let spec = state.form.build_spec(view, &node);
-        match serde_json::to_string(&spec) {
-            Ok(body) => state.issue(
-                mackes_mesh_types::cloud::VERB_SET_DESIRED,
-                Some(&body),
-                &format!("set desired for {}", spec.name),
-            ),
-            Err(e) => state.note = Some(format!("Could not encode the workload spec: {e}")),
-        }
+        state.set_desired(&spec);
     }
     if plan {
         state.plan_provision();
@@ -319,15 +312,21 @@ mod tests {
     }
 
     #[test]
-    fn the_authored_spec_serializes_for_set_desired() {
+    fn set_desired_serializes_the_worker_envelope() {
         let form = State {
             name: "seat".to_string(),
             ..State::default()
         };
         let spec = form.build_spec(DeliveryView::DesktopVm, "eagle");
-        let body = serde_json::to_string(&spec).expect("the spec encodes");
-        assert!(body.contains("\"delivery_type\":\"desktop_vm\""));
-        assert!(body.contains("\"node\":\"eagle\""));
-        assert!(body.contains("\"name\":\"seat\""));
+        let body: serde_json::Value =
+            serde_json::from_str(&super::super::set_desired_request_body(&spec))
+                .expect("the set-desired envelope encodes");
+        assert_eq!(body["node"], "eagle");
+        assert_eq!(body["schema_version"], 1);
+        assert_eq!(body["spec"], serde_json::to_value(&spec).unwrap());
+        assert!(
+            body.get("name").is_none(),
+            "the workload spec must not be published bare at the JSON root"
+        );
     }
 }

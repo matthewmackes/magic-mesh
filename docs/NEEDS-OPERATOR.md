@@ -100,12 +100,12 @@ under the WL-\* epic named in the re-key map above, not as an independent ID.
   mints 31 light-Material `CHROME_*` constants ("Chromium/Chrome Refresh light roles,
   mirrored as local egui tokens so every Browser surface can stay on the stock Chrome
   palette instead of inheriting the darker shell chrome"). This is a DELIBERATE
-  Chrome-fidelity choice for the CEF browser, but it conflicts with Quasar design
+  Chrome-fidelity choice for the CEF browser, but it conflicts with Construct design
   **lock #1 (dark only)** and is the sole source of the 31 shell style-leak-grep hits.
   Ruling needed — pick one, then `/polish` can act:
   (a) KEEP stock-Chrome-light → add `web/chrome_ui/` to the style-leak grep's
       exclusion list (same category as the VDI decoders / term palette = deliberate
       data/fidelity, not look-to-drain); or
-  (b) CONFORM to dark → recolor the browser chrome to the `mde-egui` Quasar-dark
+  (b) CONFORM to dark → recolor the browser chrome to the `mde-egui` Construct-dark
       tokens (a real visual change to the browser surface).
   Until ruled, `/polish` holds the shell — it is NOT a blind drain.

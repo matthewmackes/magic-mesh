@@ -27,11 +27,17 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_bus::rpc::reply_topic;
 use serde_json::json;
+
+use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
+
+/// Authorization node scope for cluster-wide Datacenter actions.
+pub const DC_ACTION_NODE_SCOPE: &str = "fleet-control";
 
 /// The energy-aware power responder — rooted at the shared workgroup root (the
 /// repo root, carried for parity with the other action services; the dom0 SSH
@@ -43,13 +49,25 @@ pub struct DcPowerService {
     // per-host rooted state.
     #[allow(dead_code)]
     workgroup_root: PathBuf,
+    authorizer: Arc<ActionAuthorizer>,
 }
 
 impl DcPowerService {
     /// Build the service rooted at the shared workgroup root.
     #[must_use]
     pub fn new(workgroup_root: PathBuf) -> Self {
-        Self { workgroup_root }
+        Self {
+            workgroup_root,
+            authorizer: Arc::new(ActionAuthorizer::production()),
+        }
+    }
+
+    /// Inject an isolated verifier and replay ledger (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
+        self.authorizer = authorizer;
+        self
     }
 }
 
@@ -63,6 +81,81 @@ pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(
 #[must_use]
 pub fn action_topic(verb: &str) -> String {
     format!("action/dc/{verb}")
+}
+
+/// Return the stable capability target for a privileged dc-power verb.
+/// `wake-eta` is pure arithmetic and intentionally remains available without a
+/// root-shell capability. `idle-policy` is non-destructive, but it still opens
+/// a root SSH control-plane read and is therefore privileged.
+fn mutation_target(verb: &str, req_body: Option<&str>) -> Result<Option<String>, String> {
+    if verb == "wake-eta" || !ACTION_VERBS.contains(&verb) {
+        return Ok(None);
+    }
+    let body = req_body.ok_or_else(|| format!("{verb}: missing request body"))?;
+    let request: serde_json::Value =
+        serde_json::from_str(body).map_err(|_| format!("{verb}: bad json"))?;
+    let string_field = |field: &str| -> Result<&str, String> {
+        request
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("{verb}: missing `{field}`"))
+    };
+    let target = match verb {
+        "wol" => {
+            let mac = string_field("mac")?;
+            let packet = build_magic_packet(mac)?;
+            let octets = &packet[6..12];
+            format!(
+                "host-mac:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                octets[0], octets[1], octets[2], octets[3], octets[4], octets[5]
+            )
+        }
+        "ipmi-power" => {
+            let bmc = string_field("bmc")?;
+            if !valid_bmc_host(bmc) {
+                return Err(format!("{verb}: invalid BMC host"));
+            }
+            format!("bmc:{}", bmc.to_ascii_lowercase())
+        }
+        "idle-policy" => format!("host:{}", string_field("dom0")?),
+        _ => unreachable!("the privileged verb list and target map must stay closed"),
+    };
+    Ok(Some(target))
+}
+
+/// Gate a privileged power request before [`build_reply`] can broadcast a
+/// packet, invoke `ipmitool`, or open root SSH.
+fn authorize_mutation(
+    svc: &DcPowerService,
+    verb: &str,
+    req_body: Option<&str>,
+) -> Result<(), String> {
+    let Some(target) = mutation_target(verb, req_body)? else {
+        return Ok(());
+    };
+    svc.authorizer.authorize(
+        req_body.expect("a mutation target requires a body"),
+        MutationContext {
+            verb,
+            node: DC_ACTION_NODE_SCOPE,
+            target: &target,
+        },
+    )
+}
+
+fn build_authorized_reply(svc: &DcPowerService, verb: &str, req_body: Option<&str>) -> String {
+    if let Err(error) = authorize_mutation(svc, verb, req_body) {
+        tracing::warn!(
+            target: "mackesd::action_auth",
+            verb,
+            %error,
+            "refused unauthorized Datacenter power action"
+        );
+        return json!({ "error": format!("{verb}: authorization refused: {error}") }).to_string();
+    }
+    build_reply(svc, verb, req_body)
 }
 
 // ───────────────────────── Wake-on-LAN (fallback wake) ──────────────────────
@@ -599,7 +692,7 @@ pub fn poll_once(persist: &Persist, svc: &DcPowerService, cursors: &mut HashMap<
         for msg in msgs {
             cursors.insert(topic.clone(), msg.ulid.clone());
             let reply = if crate::ipc::body_within_cap(msg.body.as_deref()) {
-                build_reply(svc, verb, msg.body.as_deref())
+                build_authorized_reply(svc, verb, msg.body.as_deref())
             } else {
                 crate::ipc::body_too_large_reply(verb)
             };
@@ -618,6 +711,24 @@ pub fn poll_once(persist: &Persist, svc: &DcPowerService, cursors: &mut HashMap<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::action_auth::authorize_test_body;
+
+    const AUTH_KEY: &[u8] = b"dc-power-action-auth-test-key";
+    const AUTH_NOW: i64 = 1_700_000_000_000;
+
+    fn authorized_service(root: &std::path::Path) -> DcPowerService {
+        DcPowerService::new(root.to_path_buf()).with_authorizer(Arc::new(
+            ActionAuthorizer::for_test(AUTH_KEY, root.join("auth"), AUTH_NOW),
+        ))
+    }
+
+    fn power_context(verb: &'static str, target: &'static str) -> MutationContext<'static> {
+        MutationContext {
+            verb,
+            node: DC_ACTION_NODE_SCOPE,
+            target,
+        }
+    }
 
     #[test]
     fn topic_and_verbs_lock() {
@@ -628,6 +739,100 @@ mod tests {
         for v in ["wol", "ipmi-power", "idle-policy", "wake-eta"] {
             assert!(ACTION_VERBS.contains(&v), "missing verb {v}");
         }
+    }
+
+    #[test]
+    fn wake_eta_is_open_but_every_privileged_power_verb_is_classified() {
+        assert_eq!(mutation_target("wake-eta", None), Ok(None));
+        assert_eq!(
+            mutation_target(
+                "wol",
+                Some(&json!({ "mac": "AA-BB-CC-DD-EE-FF" }).to_string())
+            ),
+            Ok(Some("host-mac:aa:bb:cc:dd:ee:ff".to_string()))
+        );
+        assert_eq!(
+            mutation_target(
+                "ipmi-power",
+                Some(&json!({ "bmc": "BMC-01.Local" }).to_string())
+            ),
+            Ok(Some("bmc:bmc-01.local".to_string()))
+        );
+        assert_eq!(
+            mutation_target(
+                "idle-policy",
+                Some(&json!({ "dom0": "172.20.0.9" }).to_string())
+            ),
+            Ok(Some("host:172.20.0.9".to_string()))
+        );
+    }
+
+    #[test]
+    fn unsigned_tampered_replayed_and_future_schema_power_actions_never_reach_backend() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = authorized_service(tmp.path());
+        let unsigned_requests = [
+            (
+                "wol",
+                json!({ "schema_version": 1, "mac": "aa:bb:cc:dd:ee:ff" }).to_string(),
+            ),
+            (
+                "ipmi-power",
+                json!({
+                    "schema_version": 1,
+                    "bmc": "bmc-01.local",
+                    "user": "ADMIN",
+                    "pass": "secret",
+                    "op": "on",
+                })
+                .to_string(),
+            ),
+            (
+                "idle-policy",
+                json!({ "schema_version": 1, "dom0": "172.20.0.9" }).to_string(),
+            ),
+        ];
+        for (verb, body) in &unsigned_requests {
+            assert!(
+                authorize_mutation(&svc, verb, Some(body)).is_err(),
+                "{verb}"
+            );
+            assert!(
+                build_authorized_reply(&svc, verb, Some(body)).contains("authorization refused"),
+                "{verb} must return before its backend"
+            );
+        }
+
+        let unsigned_wol = &unsigned_requests[0].1;
+        let armed = authorize_test_body(
+            AUTH_KEY,
+            unsigned_wol,
+            power_context("wol", "host-mac:aa:bb:cc:dd:ee:ff"),
+            "power-once",
+            AUTH_NOW + 30_000,
+        );
+        let tampered = armed.replace("aa:bb:cc:dd:ee:ff", "aa:bb:cc:dd:ee:00");
+        assert!(authorize_mutation(&svc, "wol", Some(&tampered)).is_err());
+        assert!(authorize_mutation(&svc, "wol", Some(&armed)).is_ok());
+        assert!(authorize_mutation(&svc, "wol", Some(&armed))
+            .unwrap_err()
+            .contains("already used"));
+
+        let future = json!({
+            "schema_version": 2,
+            "dom0": "172.20.0.9",
+        })
+        .to_string();
+        let future = authorize_test_body(
+            AUTH_KEY,
+            &future,
+            power_context("idle-policy", "host:172.20.0.9"),
+            "power-future",
+            AUTH_NOW + 30_000,
+        );
+        assert!(authorize_mutation(&svc, "idle-policy", Some(&future))
+            .unwrap_err()
+            .contains("schema_version 1"));
     }
 
     // ── WoL ──────────────────────────────────────────────────────────────────

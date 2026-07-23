@@ -427,6 +427,7 @@ dependencies = [
  "num-traits",
  "rusticata-macros",
  "thiserror 2.0.18",
+ "time",
 ]
 
 [[package]]
@@ -862,7 +863,7 @@ version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "08807e080ed7f9d5433fa9b275196cfc35414f66a0c79d864dc51a0d825231a3"
 dependencies = [
- "bit-vec",
+ "bit-vec 0.8.0",
 ]
 
 [[package]]
@@ -870,6 +871,15 @@ name = "bit-vec"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
+
+[[package]]
+name = "bit-vec"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b71798fca2c1fe1086445a7258a4bc81e6e49dcd24c8d0dd9a1e57395b603f51"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "bit_field"
@@ -1816,6 +1826,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c87e182de0887fd5361989c677c4e8f5000cd9491d6d563161a8f3a5519fc7f"
 
 [[package]]
+name = "data-encoding"
+version = "2.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
+
+[[package]]
 name = "data-url"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1854,6 +1870,7 @@ dependencies = [
  "asn1-rs",
  "displaydoc",
  "nom",
+ "num-bigint 0.4.8",
  "num-traits",
  "rusticata-macros",
 ]
@@ -3090,7 +3107,16 @@ version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4aaa26c720c68b866f2c96ef5c1264b3e6f473fe5d4ce61cd44bbe913e553018"
 dependencies = [
- "hmac",
+ "hmac 0.13.0",
+]
+
+[[package]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+dependencies = [
+ "digest 0.10.7",
 ]
 
 [[package]]
@@ -4132,8 +4158,10 @@ name = "mackes-mesh-types"
 version = "12.1.0"
 dependencies = [
  "dirs",
+ "hmac 0.12.1",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "toml",
 ]
@@ -4144,7 +4172,9 @@ version = "12.1.0"
 dependencies = [
  "bytes",
  "mackes-transport",
+ "rcgen 0.14.8",
  "rustls",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tokio-rustls",
@@ -4201,12 +4231,12 @@ dependencies = [
  "mde-role",
  "mde-seal",
  "mde-theme",
- "mde-voice-config",
  "mde-worker-core",
  "mdns-sd",
  "p256",
+ "prost",
  "rand 0.8.6",
- "rcgen",
+ "rcgen 0.13.2",
  "reqwest",
  "roxmltree",
  "rusqlite",
@@ -4491,9 +4521,11 @@ dependencies = [
  "egui_glow",
  "gbm",
  "glow",
+ "image",
  "input",
  "khronos-egl",
  "libc",
+ "pollster",
  "resvg",
  "serde",
  "udev",
@@ -4537,11 +4569,13 @@ name = "mde-files-egui"
 version = "12.1.0"
 dependencies = [
  "image",
+ "mackes-mesh-types",
  "mde-bus",
  "mde-chat",
  "mde-egui",
  "mde-files",
  "mde-theme",
+ "rand 0.8.6",
  "rustix 1.1.4",
  "serde",
  "serde_json",
@@ -4569,7 +4603,7 @@ dependencies = [
  "mde-kdc-proto",
  "pkcs8 0.10.2",
  "rand 0.8.6",
- "rcgen",
+ "rcgen 0.13.2",
  "ring",
  "rsa 0.9.10",
  "rustls",
@@ -4609,6 +4643,7 @@ dependencies = [
 name = "mde-maps-location-egui"
 version = "12.1.0"
 dependencies = [
+ "base64",
  "image",
  "mackes-mesh-types",
  "mde-bus",
@@ -4753,11 +4788,12 @@ dependencies = [
  "mde-vdi-rdp",
  "mde-vdi-spice",
  "mde-vdi-vnc",
- "mde-voice-egui",
  "mde-web-preview-client",
  "png 0.18.1",
  "qrcode",
+ "rand 0.8.6",
  "reqwest",
+ "rustix 0.38.44",
  "serde",
  "serde_json",
  "tempfile",
@@ -4778,6 +4814,7 @@ dependencies = [
  "mde-bus",
  "mde-chat",
  "mde-egui",
+ "rand 0.8.6",
  "regex",
  "rustix 0.38.44",
  "serde",
@@ -4836,27 +4873,6 @@ version = "12.1.0"
 dependencies = [
  "mde-egui",
  "mde-vdi-core",
-]
-
-[[package]]
-name = "mde-voice-config"
-version = "12.1.0"
-dependencies = [
- "insta",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "mde-voice-egui"
-version = "12.1.0"
-dependencies = [
- "mde-bus",
- "mde-egui",
- "mde-voice-hud",
- "serde",
- "serde_json",
- "tempfile",
 ]
 
 [[package]]
@@ -5558,6 +5574,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "oid-registry"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12f40cff3dde1b6087cc5d5f5d4d65712f34016a03ed60e9c08dcc392736b5b7"
+dependencies = [
+ "asn1-rs",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5734,7 +5759,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f24f3eb2f4471b1730d59e4b730b747939960a8c7eb0c33c5a9076f2d3dddea"
 dependencies = [
  "digest 0.11.3",
- "hmac",
+ "hmac 0.13.0",
 ]
 
 [[package]]
@@ -5849,7 +5874,7 @@ dependencies = [
  "ff",
  "group",
  "hex",
- "hmac",
+ "hmac 0.13.0",
  "http",
  "inout 0.2.2",
  "md-5 0.11.0",
@@ -5936,7 +5961,7 @@ dependencies = [
  "cipher 0.5.2",
  "crypto-bigint",
  "des",
- "hmac",
+ "hmac 0.13.0",
  "inout 0.2.2",
  "oid",
  "pbkdf2",
@@ -6225,7 +6250,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4b45fcc2344c680f5025fe57779faef368840d0bd1f42f216291f0dc4ace4744"
 dependencies = [
  "bit-set",
- "bit-vec",
+ "bit-vec 0.8.0",
  "bitflags 2.13.0",
  "num-traits",
  "rand 0.9.4",
@@ -6596,7 +6621,21 @@ dependencies = [
  "ring",
  "rustls-pki-types",
  "time",
- "yasna",
+ "yasna 0.5.2",
+]
+
+[[package]]
+name = "rcgen"
+version = "0.14.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57f6d249aad744e274e682777a50283a225a32705394ee6d5fcc01efa25e4055"
+dependencies = [
+ "pem",
+ "ring",
+ "rustls-pki-types",
+ "time",
+ "x509-parser",
+ "yasna 0.6.0",
 ]
 
 [[package]]
@@ -6738,7 +6777,7 @@ version = "0.5.0-rc.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23a3127ee32baec36af75b4107082d9bd823501ec14a4e016be4b6b37faa74ae"
 dependencies = [
- "hmac",
+ "hmac 0.13.0",
  "subtle",
 ]
 
@@ -7648,7 +7687,7 @@ dependencies = [
  "futures",
  "getrandom 0.3.4",
  "group",
- "hmac",
+ "hmac 0.13.0",
  "md-5 0.11.0",
  "md4",
  "num-derive",
@@ -9223,7 +9262,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f0aa306497a238d169b9dc70659105b4a096859a34894544ca81719242e1499"
 dependencies = [
  "arrayvec",
- "bit-vec",
+ "bit-vec 0.8.0",
  "bitflags 2.13.0",
  "cfg_aliases",
  "document-features",
@@ -9964,6 +10003,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "x509-parser"
+version = "0.18.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d43b0f71ce057da06bc0851b23ee24f3f86190b07203dd8f567d0b706a185202"
+dependencies = [
+ "asn1-rs",
+ "data-encoding",
+ "der-parser",
+ "lazy_static",
+ "nom",
+ "oid-registry",
+ "ring",
+ "rusticata-macros",
+ "thiserror 2.0.18",
+ "time",
+]
+
+[[package]]
 name = "xattr"
 version = "1.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10026,6 +10083,16 @@ version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e17bb3549cc1321ae1296b9cdc2698e2b6cb1992adfa19a8c72e5b7a738f44cd"
 dependencies = [
+ "time",
+]
+
+[[package]]
+name = "yasna"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5f6765e852b9b4dc8e2a76843e4d64d1cea8e79bcde0b6901aea8e7c7f08282"
+dependencies = [
+ "bit-vec 0.9.1",
  "time",
 ]
 

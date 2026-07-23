@@ -278,7 +278,18 @@ fn outputs_section(ui: &mut egui::Ui, state: &WorkloadsState) {
 /// resolve (never fabricated rows). A missing Bus degrades to an honest status,
 /// never a panic (§7).
 fn resolve(state: &mut WorkloadsState) {
-    match state.publish(VERB_INVENTORY, None) {
+    let Some(node) = state
+        .selected_node()
+        .map(str::trim)
+        .filter(|node| !node.is_empty())
+        .map(str::to_string)
+    else {
+        state.configure.status =
+            Some("Select a placement node before resolving inventory.".to_string());
+        return;
+    };
+    let body = super::node_request_body(&node);
+    match state.publish(VERB_INVENTORY, Some(&body)) {
         Ok(pending) => {
             state.configure.inventory_req = Some(pending);
             state.configure.status = Some("Resolving the live mesh inventory\u{2026}".to_string());
@@ -287,7 +298,7 @@ fn resolve(state: &mut WorkloadsState) {
             state.configure.status = Some(format!("Could not request the inventory: {e}"));
         }
     }
-    state.configure.output_req = state.publish(VERB_OUTPUT, None).ok();
+    state.configure.output_req = state.publish(VERB_OUTPUT, Some(&body)).ok();
 }
 
 /// Advance any in-flight inventory / output READ into its resolved rows + honest

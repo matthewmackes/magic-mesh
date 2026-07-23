@@ -1,5 +1,9 @@
 # EXPLORER — the Hero unit explorer
 
+> **HISTORICAL / SUPERSEDED (2026-07-22):** the OpenStack object model below was
+> removed. Current provider-neutral workload operations live in the Workloads
+> surface; this file remains only as interface history.
+
 Operator-locked 2026-07-04 (25-Q `/plan` survey). A focused, cinematic interface
 that presents **every discovered unit** — inside the mesh, outside the mesh, and
 **every object created in OpenStack on any node** — one at a time as a large "Hero"
@@ -91,7 +95,7 @@ Two halves, split on the mesh/desktop boundary (§6):
   else honestly summary/unknown (§7), never synthesized.
 
 ## Out of scope
-- Editing OpenStack objects beyond lifecycle (create flows stay in the Cloud plane).
+- Editing Workloads beyond lifecycle (create flows stay in the Workloads surface).
 - Historical/time-travel views; alerting.
 - Cross-mesh (federated) unit discovery beyond the local mesh + local LAN.
 

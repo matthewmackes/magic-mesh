@@ -1,7 +1,8 @@
 //! KDC-MESH-7 — the mesh-wide **service directory** (design #7).
 //!
 //! Each node publishes the KDC service set it offers — files, run-commands,
-//! OpenStack lifecycle, media, battery, telephony, find-my-device — plus a
+//! placement-local Workloads lifecycle, media, battery, telephony,
+//! find-my-device — plus a
 //! shallow snapshot of its **shared roots** to a replicated substrate directory
 //! (`<root>/kdc-services/<host>.json`, own-row authority, the same mesh-shunt
 //! pattern the phone roster + notification relay ride). The phone (via the mesh
@@ -35,8 +36,8 @@ pub mod service {
     pub const FILES: &str = "files";
     /// Curated run-commands (design #12).
     pub const RUN_COMMANDS: &str = "run-commands";
-    /// OpenStack instance lifecycle across the fleet (design #12).
-    pub const OPENSTACK: &str = "openstack";
+    /// Construct Workloads lifecycle on the selected node (design #12).
+    pub const WORKLOADS: &str = "workloads";
     /// Battery + connectivity report (design #12).
     pub const BATTERY: &str = "battery";
     /// Telephony (call/SMS) alerts (design #12).
@@ -181,7 +182,7 @@ mod tests {
         let root = tmp.path();
         publish_services(
             root,
-            &node("nodeA", "id-a", &[service::FILES, service::OPENSTACK]),
+            &node("nodeA", "id-a", &[service::FILES, service::WORKLOADS]),
         )
         .unwrap();
         publish_services(root, &node("nodeB", "id-b", &[service::FILES])).unwrap();
@@ -205,9 +206,9 @@ mod tests {
 
     #[test]
     fn offers_reflects_the_published_service_set() {
-        let n = node("nodeA", "id-a", &[service::FILES, service::OPENSTACK]);
+        let n = node("nodeA", "id-a", &[service::FILES, service::WORKLOADS]);
         assert!(n.offers(service::FILES));
-        assert!(n.offers(service::OPENSTACK));
+        assert!(n.offers(service::WORKLOADS));
         assert!(!n.offers(service::TELEPHONY));
     }
 

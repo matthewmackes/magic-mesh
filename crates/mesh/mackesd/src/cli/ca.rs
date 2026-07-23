@@ -281,10 +281,28 @@ pub fn run(sub: CaCmd, db_path: PathBuf) -> anyhow::Result<()> {
                 //      for the peer — the old default that broke joins).
                 let local_id = default_node_id();
                 let lighthouses = if let Some(addr) = lighthouse_addr {
+                    let self_bundle = mackesd_core::ca::bundle::read_bundle(
+                        &mackesd_core::ca::bundle::bundle_path(&workgroup_root, &local_id),
+                    );
+                    let relay_tls = self_bundle.as_ref().ok().and_then(|bundle| {
+                        bundle
+                            .relay_trust_authority
+                            .as_deref()
+                            .and_then(|authority| {
+                                mackesd_core::ca::bundle::advertised_relay_tls_identity(
+                                    &workgroup_root,
+                                    &local_id,
+                                    "10.42.0.1",
+                                    &addr,
+                                    authority,
+                                )
+                            })
+                    });
                     vec![mackesd_core::ca::bundle::LighthouseEntry {
                         node_id: local_id.clone(),
                         overlay_ip: "10.42.0.1".to_string(),
                         external_addr: addr,
+                        relay_tls,
                     }]
                 } else {
                     // LIGHTHOUSE-10 — no explicit --lighthouse-addr: build the
@@ -326,6 +344,10 @@ pub fn run(sub: CaCmd, db_path: PathBuf) -> anyhow::Result<()> {
                             format!("{host}:4242")
                         });
                     let directory = mackesd_core::substrate::peers::read_directory(&workgroup_root);
+                    let relay_authority = self_bundle
+                        .as_ref()
+                        .ok()
+                        .and_then(|bundle| bundle.relay_trust_authority.as_deref());
                     mackes_mesh_types::lighthouse::roster_with_self(
                         &directory,
                         &local_id,
@@ -333,10 +355,14 @@ pub fn run(sub: CaCmd, db_path: PathBuf) -> anyhow::Result<()> {
                         &self_external,
                     )
                     .into_iter()
-                    .map(|a| mackesd_core::ca::bundle::LighthouseEntry {
-                        node_id: a.node_id,
-                        overlay_ip: a.overlay_ip,
-                        external_addr: a.external_addr,
+                    .map(|a| {
+                        mackesd_core::ca::bundle::lighthouse_entry_with_relay_trust(
+                            &workgroup_root,
+                            a.node_id,
+                            a.overlay_ip,
+                            a.external_addr,
+                            relay_authority,
+                        )
                     })
                     .collect()
                 };

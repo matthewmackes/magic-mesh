@@ -46,6 +46,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 
+use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
+
 use super::{ShutdownToken, Worker};
 
 /// The `action/mesh-mount/` RPC domain prefix this worker drains.
@@ -753,6 +755,8 @@ pub struct MeshMountWorker {
     backend: std::sync::Arc<dyn MountBackend>,
     /// The shared-key seam.
     keys: std::sync::Arc<dyn KeyProvider>,
+    /// Exact-body capability verifier for mount lifecycle mutations.
+    authorizer: std::sync::Arc<ActionAuthorizer>,
     /// Mount tuning (connect timeout + cache).
     tuning: MountTuning,
     /// Idle-unmount window.
@@ -786,6 +790,7 @@ impl MeshMountWorker {
             mesh_user: DEFAULT_MESH_USER.to_string(),
             backend: std::sync::Arc::new(SshfsBackend::new()),
             keys,
+            authorizer: std::sync::Arc::new(ActionAuthorizer::production()),
             tuning: MountTuning::default(),
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             stale_after: DEFAULT_STALE_AFTER,
@@ -807,6 +812,14 @@ impl MeshMountWorker {
     #[must_use]
     pub fn with_key_provider(mut self, keys: std::sync::Arc<dyn KeyProvider>) -> Self {
         self.keys = keys;
+        self
+    }
+
+    /// Inject an isolated verifier and replay ledger (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_authorizer(mut self, authorizer: std::sync::Arc<ActionAuthorizer>) -> Self {
+        self.authorizer = authorizer;
         self
     }
 
@@ -988,13 +1001,33 @@ impl MeshMountWorker {
             };
             for msg in msgs {
                 self.cursors.insert(topic.clone(), msg.ulid.clone());
-                let verb = match parse_verb(msg.body.as_deref().unwrap_or_default()) {
+                let body = msg.body.as_deref().unwrap_or_default();
+                let verb = match parse_verb(body) {
                     Ok(v) => v,
                     Err(e) => {
                         tracing::warn!(target: "mackesd::mesh_mount", host = %host, error = %e, "bad request");
                         continue;
                     }
                 };
+                let context = MutationContext {
+                    verb: match verb {
+                        MeshMountVerb::Mount => "mesh-mount-mount",
+                        MeshMountVerb::Escalate => "mesh-mount-escalate",
+                        MeshMountVerb::Unmount => "mesh-mount-unmount",
+                    },
+                    node: &host,
+                    target: &host,
+                };
+                if let Err(error) = self.authorizer.authorize(body, context) {
+                    tracing::warn!(
+                        target: "mackesd::mesh_mount",
+                        host = %host,
+                        verb = verb.tag(),
+                        error = %error,
+                        "refused unauthorized privileged request"
+                    );
+                    continue;
+                }
                 self.handle_verb(persist, &host, verb);
             }
         }
@@ -1170,8 +1203,12 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::action_auth::authorize_test_body;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+
+    const AUTH_KEY: &[u8] = b"mesh-mount-action-auth-test-key";
+    const AUTH_NOW: i64 = 1_700_000_000_000;
 
     // ── pure plan folds ─────────────────────────────────────────────────
 
@@ -1460,6 +1497,34 @@ mod tests {
         (dir, persist)
     }
 
+    fn signed_mount_body(
+        verb: MeshMountVerb,
+        host: &str,
+        nonce: &str,
+        expires_at_ms: i64,
+    ) -> String {
+        let mut unsigned = serde_json::to_value(verb).unwrap();
+        unsigned
+            .as_object_mut()
+            .unwrap()
+            .insert("schema_version".to_string(), serde_json::Value::from(1_u64));
+        authorize_test_body(
+            AUTH_KEY,
+            &unsigned.to_string(),
+            MutationContext {
+                verb: match verb {
+                    MeshMountVerb::Mount => "mesh-mount-mount",
+                    MeshMountVerb::Escalate => "mesh-mount-escalate",
+                    MeshMountVerb::Unmount => "mesh-mount-unmount",
+                },
+                node: host,
+                target: host,
+            },
+            nonce,
+            expires_at_ms,
+        )
+    }
+
     #[test]
     fn request_mount_reaches_mounted_over_the_fake_backend() {
         let (_d, persist) = temp_persist();
@@ -1548,5 +1613,48 @@ mod tests {
         w.handle_verb(&persist, "oak", MeshMountVerb::Mount);
         w.handle_verb(&persist, "oak", MeshMountVerb::Unmount);
         assert!(!w.entries.contains_key("oak"));
+    }
+
+    #[test]
+    fn hostile_mount_requests_never_reach_the_backend() {
+        let (d, persist) = temp_persist();
+        let backend = FakeBackend::new(vec![Ok(())]);
+        let authorizer = Arc::new(ActionAuthorizer::for_test(
+            AUTH_KEY,
+            d.path().join("auth"),
+            AUTH_NOW,
+        ));
+        let mut w = worker_with(backend.clone()).with_authorizer(authorizer);
+
+        let unsigned = serde_json::to_string(&MeshMountVerb::Mount).unwrap();
+        let future = signed_mount_body(MeshMountVerb::Mount, "oak", "future", AUTH_NOW + 30_000)
+            .replace("\"schema_version\":1", "\"schema_version\":2");
+        let overlong =
+            signed_mount_body(MeshMountVerb::Mount, "oak", "overlong", AUTH_NOW + 30_001);
+        let tampered =
+            signed_mount_body(MeshMountVerb::Mount, "oak", "tampered", AUTH_NOW + 30_000)
+                .replace("\"mount\"", "\"escalate\"");
+        for body in [&unsigned, &future, &overlong, &tampered] {
+            persist
+                .write("action/mesh-mount/oak", Priority::Default, None, Some(body))
+                .unwrap();
+        }
+        w.sweep(&persist);
+        assert_eq!(backend.mounts.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.unmounts.load(Ordering::SeqCst), 0);
+
+        let replay = signed_mount_body(MeshMountVerb::Mount, "oak", "replay", AUTH_NOW + 30_000);
+        for _ in 0..2 {
+            persist
+                .write(
+                    "action/mesh-mount/oak",
+                    Priority::Default,
+                    None,
+                    Some(&replay),
+                )
+                .unwrap();
+        }
+        w.sweep(&persist);
+        assert_eq!(backend.mounts.load(Ordering::SeqCst), 1);
     }
 }

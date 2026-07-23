@@ -30,7 +30,9 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::ca::bundle::{bundle_path, read_bundle};
-use crate::enrollment::{build_identity, EnrolledIdentity};
+#[cfg(test)]
+use crate::enrollment::build_identity;
+use crate::enrollment::EnrolledIdentity;
 
 /// QR-friendly upper bound on the wire-form join token.
 ///
@@ -200,6 +202,11 @@ pub struct PendingEnrollment {
     /// The lighthouse signs a Nebula cert binding this key to the
     /// allocated overlay IP.
     pub public_key_hex: String,
+    /// Requester-generated Nebula X25519 public key PEM. This is distinct
+    /// from [`Self::public_key_hex`], which is the application Ed25519
+    /// identity. The CA signs this key with `nebula-cert sign -in-pub` and
+    /// never receives or generates the matching private key.
+    pub nebula_public_key_pem: String,
     /// Unix-epoch seconds when the CSR was written. Used by the
     /// lighthouse to expire stale CSRs.
     pub created_at: i64,
@@ -381,19 +388,9 @@ pub fn enroll_with_token(
     let token = parse_join_token(raw_token).ok_or(EnrollError::InvalidToken {
         raw_len: raw_token.len(),
     })?;
-    let identity = build_identity();
-    let pending = build_pending(&identity, node_id, display_name, token);
-    publish_enrollment_request(workgroup_root, node_id, &pending)?;
-    let (bundle, waited) = wait_for_signed_bundle(
-        workgroup_root,
-        node_id,
-        ENROLL_POLL_INTERVAL,
-        ENROLL_WAIT_TIMEOUT,
-    )?;
-    Ok(EnrollOutcome {
-        overlay_ip: bundle.overlay_ip,
-        mesh_id: bundle.mesh_id,
-        waited,
+    let _ = (workgroup_root, node_id, display_name, token);
+    Err(EnrollError::PublishFailed {
+        reason: "replicated-file enrollment is retired because it cannot authenticate certificate or trust-pin delivery; use a join token with a TLS fingerprint".into(),
     })
 }
 
@@ -401,11 +398,12 @@ pub fn enroll_with_token(
 /// freshly-minted identity + the parsed token. Split out so tests
 /// can exercise the shape without spinning the filesystem.
 #[must_use]
-pub fn build_pending(
+pub fn build_pending_with_nebula_key(
     identity: &EnrolledIdentity,
     node_id: &str,
     display_name: &str,
     token: JoinToken,
+    nebula_public_key_pem: impl Into<String>,
 ) -> PendingEnrollment {
     let public_key_hex = hex_bytes(identity.key.verifying_key().as_bytes());
     let created_at = std::time::SystemTime::now()
@@ -418,6 +416,7 @@ pub fn build_pending(
         display_name: display_name.to_string(),
         hw_fingerprint: identity.hw_fingerprint.clone(),
         public_key_hex,
+        nebula_public_key_pem: nebula_public_key_pem.into(),
         created_at,
     }
 }
@@ -505,12 +504,6 @@ pub enum SignCsrError {
         /// Underlying I/O error.
         reason: String,
     },
-    /// Reading the peer key bytes back from the sealed file
-    /// failed (uid mismatch, mode drift, etc.).
-    KeyReadFailed {
-        /// Underlying CaError message.
-        reason: String,
-    },
     /// TUNE-11 — the active-peer count already meets or exceeds
     /// the [`crate::ca::sign::MAX_PEER_CAP`] lock and the caller
     /// did not pass `allow_override = true`.
@@ -528,6 +521,13 @@ pub enum SignCsrError {
     /// flag — a ban is deliberate).
     NodeBanned {
         /// The banned node-id the CSR carried.
+        node_id: String,
+    },
+    /// A lighthouse bearer was presented to the replicated-file signer. CA
+    /// secrets may be delivered only over the fingerprint-pinned TLS endpoint,
+    /// so the file path rejects before signing or consuming the bearer.
+    LighthouseRequiresAuthenticatedTransport {
+        /// Node whose lighthouse request was refused.
         node_id: String,
     },
 }
@@ -564,11 +564,6 @@ impl std::fmt::Display for SignCsrError {
                 "bundle write to QNM-Shared failed: {reason}. \
                  Confirm the QNM-Shared mount is writable.",
             ),
-            Self::KeyReadFailed { reason } => write!(
-                f,
-                "could not read signed peer key for bundle: \
-                 {reason}. Check ownership on the scratch dir.",
-            ),
             Self::PeerCapReached { current, cap } => write!(
                 f,
                 "MackesDE for Workgroups is sized for up to {cap} peers \
@@ -584,7 +579,11 @@ impl std::fmt::Display for SignCsrError {
                  cannot re-join, even with a valid passcode. A ban is \
                  deliberate — there is no override flag. To lift it, run \
                  `mackesd ca unban {node_id}` on the peer that set it (or \
-                 edit ban-list.json under that peer's QNM-Shared dir).",
+                edit ban-list.json under that peer's QNM-Shared dir).",
+            ),
+            Self::LighthouseRequiresAuthenticatedTransport { node_id } => write!(
+                f,
+                "lighthouse enrollment of {node_id} requires the fingerprint-pinned HTTPS endpoint; the replicated file flow cannot deliver CA secrets"
             ),
         }
     }
@@ -597,17 +596,15 @@ impl std::error::Error for SignCsrError {}
 ///
 ///   1. Read PendingEnrollment from
 ///      `workgroup_root/<peer_id>/mackesd/pending-enroll.json`.
-///   2. Call `ca::sign::sign_peer_cert` with `PeerRole::Peer`
-///      under the active CA epoch (allocates overlay IP).
-///   3. Read the unsealed peer key bytes back from the sealed
-///      file (seal just enforces 0600 + uid match — the bytes
-///      are the raw PEM).
-///   4. Build a [`crate::ca::bundle::NebulaBundle`] containing
-///      the signed cert + key + CA cert + lighthouse roster.
-///   5. Write the bundle to
+///   2. Validate the requester-owned public key and call
+///      `ca::sign::sign_peer_cert_with_public_key` under the active CA epoch
+///      (allocates the overlay IP without creating a private key).
+///   3. Build a public [`crate::ca::bundle::NebulaBundle`] containing only the
+///      signed cert, CA cert, overlay allocation, and lighthouse roster.
+///   4. Write the bundle to
 ///      `workgroup_root/<peer_id>/mackesd/nebula-bundle.json` via
 ///      [`crate::ca::bundle::write_bundle`].
-///   6. Return [`SignOutcome`] for the CLI to display.
+///   5. Return [`SignOutcome`] for the CLI to display.
 ///
 /// The lighthouse roster passed via `lighthouses` is whatever
 /// the caller decides — typically the single self-lighthouse +
@@ -646,6 +643,11 @@ pub fn sign_pending_csr<B: crate::ca::NebulaCertBackend + ?Sized>(
         serde_json::from_slice(&csr_bytes).map_err(|e| SignCsrError::CsrCorrupt {
             reason: e.to_string(),
         })?;
+    if crate::bearer_ledger::is_lighthouse_bearer(workgroup_root, &csr.token.bearer) {
+        return Err(SignCsrError::LighthouseRequiresAuthenticatedTransport {
+            node_id: csr.node_id.clone(),
+        });
+    }
     // Delegate to the transport-independent signing core (the same
     // core the ONBOARD-2 network `/enroll` endpoint calls), then
     // ATOMICALLY consume the single-use bearer and write the bundle
@@ -653,7 +655,7 @@ pub fn sign_pending_csr<B: crate::ca::NebulaCertBackend + ?Sized>(
     // two concurrent requests presenting the SAME bearer can never
     // both be honored).
     let signed_node_id = csr.node_id.clone();
-    let bundle = sign_csr_into_bundle(
+    let response = sign_csr_into_bundle(
         backend,
         conn,
         workgroup_root,
@@ -678,22 +680,22 @@ pub fn sign_pending_csr<B: crate::ca::NebulaCertBackend + ?Sized>(
         });
     }
     let bundle_path = crate::ca::bundle::bundle_path(workgroup_root, peer_id);
-    crate::ca::bundle::write_bundle(&bundle_path, &bundle).map_err(|e| {
+    crate::ca::bundle::write_bundle(&bundle_path, &response.bundle).map_err(|e| {
         SignCsrError::BundleWriteFailed {
             reason: e.to_string(),
         }
     })?;
     Ok(SignOutcome {
         peer_id: signed_node_id,
-        overlay_ip: bundle.overlay_ip,
-        epoch: bundle.epoch,
+        overlay_ip: response.bundle.overlay_ip,
+        epoch: response.bundle.epoch,
         bundle_path,
     })
 }
 
 /// Transport-independent signing core (ONBOARD-2). Takes an
 /// already-parsed [`PendingEnrollment`] and returns the signed
-/// [`crate::ca::bundle::NebulaBundle`] **without** reading the CSR
+/// [`crate::ca::bundle::AuthenticatedEnrollmentResponse`] **without** reading the CSR
 /// from disk, consuming the bearer, or delivering the bundle — those
 /// steps belong to the caller, because they differ between the
 /// QNM-Shared file flow ([`sign_pending_csr`], which atomically
@@ -722,7 +724,7 @@ pub fn sign_csr_into_bundle<B: crate::ca::NebulaCertBackend + ?Sized>(
     paths: &SignCsrPaths,
     lighthouses: Vec<crate::ca::bundle::LighthouseEntry>,
     allow_override: bool,
-) -> Result<crate::ca::bundle::NebulaBundle, SignCsrError> {
+) -> Result<crate::ca::bundle::AuthenticatedEnrollmentResponse, SignCsrError> {
     // The mesh the peer is actually joining (authoritative — bed fix #5).
     let mesh_id: &str = &csr.token.mesh_id;
     // EPIC-SEC-BANLIST (Q53) — refuse a banned node-id BEFORE the
@@ -805,7 +807,7 @@ pub fn sign_csr_into_bundle<B: crate::ca::NebulaCertBackend + ?Sized>(
         reason: format!("mkdir {}: {e}", paths.scratch_dir.display()),
     })?;
     let crt_out = paths.scratch_dir.join(format!("{}.crt", csr.node_id));
-    let key_out = paths.scratch_dir.join(format!("{}.key", csr.node_id));
+    let public_key_in = paths.scratch_dir.join(format!("{}.pub", csr.node_id));
     // Bed fix #7: a stale scratch cert from a PRIOR sign of this node would
     // make nebula-cert refuse to overwrite. That clearing now lives inside
     // sign_peer_cert (the single signer funnel — covers this path AND the
@@ -839,7 +841,7 @@ pub fn sign_csr_into_bundle<B: crate::ca::NebulaCertBackend + ?Sized>(
             &etcd_eps,
         ));
     }
-    let signed = crate::ca::sign::sign_peer_cert(
+    let signed = crate::ca::sign::sign_peer_cert_with_public_key(
         backend,
         conn,
         mesh_id,
@@ -852,7 +854,8 @@ pub fn sign_csr_into_bundle<B: crate::ca::NebulaCertBackend + ?Sized>(
         &paths.ca_crt,
         &paths.ca_key,
         &crt_out,
-        &key_out,
+        &public_key_in,
+        &csr.nebula_public_key_pem,
         &directory_taken,
     )
     .map_err(|e| SignCsrError::SignFailed {
@@ -868,16 +871,6 @@ pub fn sign_csr_into_bundle<B: crate::ca::NebulaCertBackend + ?Sized>(
             &csr.node_id,
         );
     }
-    // Read the unsealed key bytes for the bundle. seal::read_sealed
-    // only enforces 0600 + uid match; the bytes are the raw PEM.
-    let peer_key_pem_bytes =
-        crate::ca::seal::read_sealed(&key_out).map_err(|e| SignCsrError::KeyReadFailed {
-            reason: e.to_string(),
-        })?;
-    let peer_key_pem =
-        String::from_utf8(peer_key_pem_bytes).map_err(|e| SignCsrError::KeyReadFailed {
-            reason: format!("peer key isn't UTF-8: {e}"),
-        })?;
     // Read the CA cert PEM for the bundle.
     let ca_cert_pem =
         std::fs::read_to_string(&paths.ca_crt).map_err(|e| SignCsrError::SignFailed {
@@ -888,8 +881,13 @@ pub fn sign_csr_into_bundle<B: crate::ca::NebulaCertBackend + ?Sized>(
     // ordinary peers — they never carry the CA key.
     let ca_key_pem = if lighthouse_authorized {
         Some(
-            std::fs::read_to_string(&paths.ca_key).map_err(|e| SignCsrError::SignFailed {
-                reason: format!("read CA key {}: {e}", paths.ca_key.display()),
+            String::from_utf8(crate::ca::seal::read_sealed(&paths.ca_key).map_err(|e| {
+                SignCsrError::SignFailed {
+                    reason: format!("read sealed CA key {}: {e}", paths.ca_key.display()),
+                }
+            })?)
+            .map_err(|e| SignCsrError::SignFailed {
+                reason: format!("CA key is not UTF-8: {e}"),
             })?,
         )
     } else {
@@ -905,17 +903,41 @@ pub fn sign_csr_into_bundle<B: crate::ca::NebulaCertBackend + ?Sized>(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    Ok(crate::ca::bundle::NebulaBundle {
+    let relay_authority_key = std::fs::read(crate::ca::bundle::RELAY_TRUST_AUTHORITY_KEY_PATH)
+        .ok()
+        .and_then(|raw| <[u8; 32]>::try_from(raw).ok())
+        .map(|seed| ed25519_dalek::SigningKey::from_bytes(&seed));
+    let relay_trust_authority = relay_authority_key
+        .as_ref()
+        .map(crate::ca::bundle::relay_trust_authority_public_key);
+    let relay_trust_authority_key = if lighthouse_authorized {
+        relay_authority_key
+            .as_ref()
+            .map(crate::ca::bundle::relay_trust_authority_private_key)
+    } else {
+        None
+    };
+    let bundle = crate::ca::bundle::NebulaBundle {
         mesh_id: mesh_id.to_string(),
         epoch: active_epoch,
         ca_cert_pem,
         peer_cert_pem: signed.cert_pem,
-        peer_key_pem,
         overlay_ip: signed.overlay_ip,
         mesh_cidr: format!("{}/16", crate::ca::sign::DEFAULT_MESH_CIDR_BASE),
         lighthouses,
-        ca_key_pem,
+        relay_trust_authority,
         created_at,
+    };
+    let lighthouse_secrets =
+        ca_key_pem.map(
+            |ca_key_pem| crate::ca::bundle::LighthouseEnrollmentSecrets {
+                ca_key_pem,
+                relay_trust_authority_key,
+            },
+        );
+    Ok(crate::ca::bundle::AuthenticatedEnrollmentResponse {
+        bundle,
+        lighthouse_secrets,
     })
 }
 
@@ -932,6 +954,9 @@ fn hex_bytes(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    const TEST_NEBULA_PUBLIC_KEY: &str = "-----BEGIN NEBULA X25519 PUBLIC KEY-----\n\
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n-----END NEBULA X25519 PUBLIC KEY-----\n";
 
     // ---- parse_join_token coverage --------------------------
 
@@ -1082,7 +1107,13 @@ mod tests {
         let tmp = tempdir().expect("tempdir");
         let identity = build_identity();
         let token = parse_join_token("mesh:m@10.0.0.5:4242#bearer").unwrap();
-        let pending = build_pending(&identity, "peer:anvil", "anvil", token);
+        let pending = build_pending_with_nebula_key(
+            &identity,
+            "peer:anvil",
+            "anvil",
+            token,
+            TEST_NEBULA_PUBLIC_KEY,
+        );
         let written =
             publish_enrollment_request(tmp.path(), "peer:anvil", &pending).expect("publish");
         assert!(written.exists());
@@ -1098,7 +1129,13 @@ mod tests {
         let tmp = tempdir().expect("tempdir");
         let identity = build_identity();
         let token = parse_join_token("mesh:m@10.0.0.5:4242#bearer").unwrap();
-        let pending = build_pending(&identity, "peer:anvil", "anvil", token);
+        let pending = build_pending_with_nebula_key(
+            &identity,
+            "peer:anvil",
+            "anvil",
+            token,
+            TEST_NEBULA_PUBLIC_KEY,
+        );
         let p1 = publish_enrollment_request(tmp.path(), "peer:anvil", &pending).unwrap();
         let p2 = publish_enrollment_request(tmp.path(), "peer:anvil", &pending).unwrap();
         assert_eq!(p1, p2);
@@ -1134,15 +1171,15 @@ mod tests {
             epoch: 0,
             ca_cert_pem: "CA".into(),
             peer_cert_pem: "CERT".into(),
-            peer_key_pem: "KEY".into(),
             overlay_ip: "10.42.0.5".into(),
             mesh_cidr: "10.42.0.0/16".into(),
             lighthouses: vec![LighthouseEntry {
                 node_id: "peer:lh".into(),
                 overlay_ip: "10.42.0.1".into(),
                 external_addr: "203.0.113.5:4242".into(),
+                relay_tls: None,
             }],
-            ca_key_pem: None,
+            relay_trust_authority: None,
             created_at: 1716000000,
         };
         write_bundle(&bundle_path(tmp.path(), "peer:anvil"), &bundle).expect("write");
@@ -1231,6 +1268,35 @@ mod tests {
                 key_out,
             )
         }
+
+        fn sign_peer_with_public_key(
+            &self,
+            ca_crt: &Path,
+            ca_key: &Path,
+            node_id: &str,
+            overlay_ip: &str,
+            cidr_prefix: u8,
+            groups: &[&str],
+            public_key: &Path,
+            crt_out: &Path,
+        ) -> Result<(), crate::ca::CaError> {
+            if crt_out.exists() {
+                return Err(crate::ca::CaError::Io(format!(
+                    "refusing to overwrite existing cert: {}",
+                    crt_out.display()
+                )));
+            }
+            MockBackend.sign_peer_with_public_key(
+                ca_crt,
+                ca_key,
+                node_id,
+                overlay_ip,
+                cidr_prefix,
+                groups,
+                public_key,
+                crt_out,
+            )
+        }
     }
 
     #[test]
@@ -1298,7 +1364,13 @@ mod tests {
         let identity = build_identity();
         let token = parse_join_token("mesh:test-mesh@10.0.0.5:4242#bearer").unwrap();
         crate::bearer_ledger::record_issued(workgroup_root, &token.bearer).expect("seed bearer");
-        let pending = build_pending(&identity, peer_id, "anvil", token);
+        let pending = build_pending_with_nebula_key(
+            &identity,
+            peer_id,
+            "anvil",
+            token,
+            TEST_NEBULA_PUBLIC_KEY,
+        );
         publish_enrollment_request(workgroup_root, peer_id, &pending).expect("publish");
         pending
     }
@@ -1308,7 +1380,13 @@ mod tests {
     fn place_csr_unissued(workgroup_root: &Path, peer_id: &str) -> PendingEnrollment {
         let identity = build_identity();
         let token = parse_join_token("mesh:test-mesh@10.0.0.5:4242#forged").unwrap();
-        let pending = build_pending(&identity, peer_id, "anvil", token);
+        let pending = build_pending_with_nebula_key(
+            &identity,
+            peer_id,
+            "anvil",
+            token,
+            TEST_NEBULA_PUBLIC_KEY,
+        );
         publish_enrollment_request(workgroup_root, peer_id, &pending).expect("publish");
         pending
     }
@@ -1321,7 +1399,13 @@ mod tests {
             crate::bearer_ledger::issue(workgroup_root, crate::bearer_ledger::LIGHTHOUSE_ROLE_NOTE)
                 .expect("issue lighthouse-scoped bearer");
         let token = parse_join_token(&format!("mesh:test-mesh@10.0.0.5:4242#{lh_bearer}")).unwrap();
-        let pending = build_pending(&identity, peer_id, "anvil", token);
+        let pending = build_pending_with_nebula_key(
+            &identity,
+            peer_id,
+            "anvil",
+            token,
+            TEST_NEBULA_PUBLIC_KEY,
+        );
         publish_enrollment_request(workgroup_root, peer_id, &pending).expect("publish");
         pending
     }
@@ -1337,7 +1421,7 @@ mod tests {
             ca_key,
             scratch_dir: tmp.path().join("scratch"),
         };
-        let bundle = sign_csr_into_bundle(
+        let response = sign_csr_into_bundle(
             &MockBackend,
             &conn,
             tmp.path(),
@@ -1347,11 +1431,61 @@ mod tests {
             false,
         )
         .expect("sign");
-        let key = bundle
-            .ca_key_pem
-            .as_deref()
+        let key = response
+            .lighthouse_secrets
+            .as_ref()
+            .map(|secrets| secrets.ca_key_pem.as_str())
             .expect("a lighthouse-scoped bearer must deliver the CA key");
         assert!(!key.is_empty(), "the delivered CA key must be non-empty");
+    }
+
+    #[test]
+    fn file_signer_rejects_lighthouse_before_signing_or_consuming_bearer() {
+        let tmp = tempdir().expect("tempdir");
+        let conn = fresh_store();
+        let (ca_crt, ca_key) = make_test_ca(tmp.path(), &conn);
+        let pending = place_csr_lighthouse(tmp.path(), "peer:file-lighthouse");
+        let paths = SignCsrPaths {
+            ca_crt,
+            ca_key,
+            scratch_dir: tmp.path().join("scratch"),
+        };
+
+        let error = sign_pending_csr(
+            &MockBackend,
+            &conn,
+            tmp.path(),
+            &pending.node_id,
+            "test-mesh",
+            &paths,
+            Vec::new(),
+            false,
+        )
+        .expect_err("replicated file enrollment must never deliver lighthouse secrets");
+        assert!(matches!(
+            error,
+            SignCsrError::LighthouseRequiresAuthenticatedTransport { ref node_id }
+                if node_id == &pending.node_id
+        ));
+        assert!(
+            crate::bearer_ledger::is_pending(tmp.path(), &pending.token.bearer),
+            "transport refusal must happen before the bearer is consumed"
+        );
+        let signed_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nebula_peer_certs WHERE node_id = ?1",
+                [&pending.node_id],
+                |row| row.get(0),
+            )
+            .expect("count signed certificates");
+        assert_eq!(
+            signed_rows, 0,
+            "transport refusal must happen before signing"
+        );
+        assert!(
+            !crate::ca::bundle::bundle_path(tmp.path(), &pending.node_id).exists(),
+            "transport refusal must not write a replicated bundle"
+        );
     }
 
     #[test]
@@ -1365,7 +1499,7 @@ mod tests {
             ca_key,
             scratch_dir: tmp.path().join("scratch"),
         };
-        let bundle = sign_csr_into_bundle(
+        let response = sign_csr_into_bundle(
             &MockBackend,
             &conn,
             tmp.path(),
@@ -1376,7 +1510,7 @@ mod tests {
         )
         .expect("sign");
         assert!(
-            bundle.ca_key_pem.is_none(),
+            response.lighthouse_secrets.is_none(),
             "an ordinary peer must NEVER receive the CA key (ENT-12 containment)"
         );
     }
@@ -1424,6 +1558,7 @@ mod tests {
             node_id: "peer:lh".into(),
             overlay_ip: "10.42.0.1".into(),
             external_addr: "lh.example:4242".into(),
+            relay_tls: None,
         }];
         let outcome = sign_pending_csr(
             &MockBackend,
@@ -1448,7 +1583,9 @@ mod tests {
         assert_eq!(bundle.lighthouses, lighthouses);
         assert!(bundle.peer_cert_pem.contains("NEBULA"));
         assert!(bundle.ca_cert_pem.contains("NEBULA CA"));
-        assert!(!bundle.peer_key_pem.is_empty());
+        let raw = std::fs::read_to_string(&outcome.bundle_path).unwrap();
+        assert!(!raw.contains("peer_key_pem"));
+        assert!(!raw.contains("lighthouse_secrets"));
         // Confirms the dropped CSR data round-tripped to the
         // bundle: same node_id is in nebula_peer_certs after
         // sign_peer_cert ran.
@@ -1552,7 +1689,13 @@ mod tests {
         // CSR without re-seeding the ledger.
         let identity = build_identity();
         let token = parse_join_token("mesh:test-mesh@10.0.0.5:4242#bearer").unwrap();
-        let pending = build_pending(&identity, "peer:replayer", "replayer", token);
+        let pending = build_pending_with_nebula_key(
+            &identity,
+            "peer:replayer",
+            "replayer",
+            token,
+            TEST_NEBULA_PUBLIC_KEY,
+        );
         publish_enrollment_request(tmp.path(), "peer:replayer", &pending).expect("publish");
         let r = sign_pending_csr(
             &MockBackend,

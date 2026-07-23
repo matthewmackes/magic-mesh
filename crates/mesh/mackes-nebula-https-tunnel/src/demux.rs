@@ -190,7 +190,15 @@ pub async fn pump_one_stream(
                 udp.recv_from(&mut udp_buf),
             ) => {
                 let udp_read = udp_read.map_err(|_| DemuxError::IdleTimeout(config.idle_timeout))?;
-                let (n, _from) = udp_read.map_err(|e| DemuxError::UdpIo(e.to_string()))?;
+                let (n, from) = udp_read.map_err(|e| DemuxError::UdpIo(e.to_string()))?;
+                if from != config.nebula_addr {
+                    tracing::warn!(
+                        source = %from,
+                        expected = %config.nebula_addr,
+                        "nebula-https-demux: dropping untrusted local UDP source",
+                    );
+                    continue;
+                }
                 let payload = &udp_buf[..n];
                 let mut out = BytesMut::new();
                 encode_frame(payload, &mut out)?;

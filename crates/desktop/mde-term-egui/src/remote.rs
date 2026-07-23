@@ -59,6 +59,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
+use mackes_mesh_types::cloud::{
+    cloud_request_digest, CloudArmSigner, CloudArmedToken, CLOUD_ACTION_SCHEMA_VERSION,
+};
+#[cfg(not(test))]
+use mackes_mesh_types::cloud::{decode_cloud_arm_credential, CLOUD_ARM_CREDENTIAL};
 use serde::{Deserialize, Serialize};
 
 use crate::engine::{Terminal, DEFAULT_SCROLLBACK};
@@ -107,6 +112,9 @@ const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(40);
 /// isn't flagged detached and reaped. Well under the broker's client grace.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Match the daemon's fail-closed maximum capability lifetime.
+const ACTION_TOKEN_TTL_MS: i64 = 30_000;
+
 // ── the typed request verb (mirror of the worker's `PtyVerb`) ────────────────
 
 /// The typed body of an `action/pty/<peer>` request — a local mirror of the
@@ -141,6 +149,111 @@ impl ClientVerb {
     fn body(&self) -> String {
         serde_json::to_string(self).unwrap_or_default()
     }
+}
+
+fn action_signer() -> Result<CloudArmSigner, String> {
+    #[cfg(test)]
+    {
+        return CloudArmSigner::new(b"0123456789abcdef0123456789abcdef".to_vec())
+            .map_err(str::to_string);
+    }
+    #[cfg(not(test))]
+    {
+        if !rustix::process::geteuid().is_root() {
+            return Err(
+                "Remote-shell mutation authorization is available only in the root DRM shell."
+                    .to_string(),
+            );
+        }
+        let directory = std::env::var_os("CREDENTIALS_DIRECTORY")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .ok_or_else(|| {
+                "The root shell has no systemd action credential; remote-shell mutations are disabled."
+                    .to_string()
+            })?;
+        let raw = std::fs::read(directory.join(CLOUD_ARM_CREDENTIAL))
+            .map_err(|e| format!("Could not read systemd action credential: {e}"))?;
+        let key = decode_cloud_arm_credential(&raw).map_err(str::to_string)?;
+        CloudArmSigner::new(key).map_err(str::to_string)
+    }
+}
+
+/// Freeze schema v1 into every request and mint exact-body authority for the
+/// session mutations. Heartbeats remain an unauthenticated, harmless liveness
+/// nudge, while still carrying the current schema.
+fn authorize_publish_body(peer: &str, body: &str) -> Result<String, String> {
+    let mut document: serde_json::Value = serde_json::from_str(body)
+        .map_err(|e| format!("Invalid remote-terminal request body: {e}"))?;
+    let object = document
+        .as_object_mut()
+        .ok_or_else(|| "Remote-terminal request body is not a JSON object.".to_string())?;
+    let verb = object
+        .get("verb")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "Remote-terminal request has no typed verb.".to_string())?;
+    let auth_verb = match verb {
+        "open" => Some("pty-open"),
+        "write" => Some("pty-write"),
+        "resize" => Some("pty-resize"),
+        "close" => Some("pty-close"),
+        "detach" => Some("pty-detach"),
+        "reattach" => Some("pty-reattach"),
+        "heartbeat" | "list" => None,
+        _ => return Err(format!("Unsupported remote-terminal verb `{verb}`.")),
+    };
+    let target = object
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    object.insert(
+        "schema_version".to_string(),
+        serde_json::Value::from(CLOUD_ACTION_SCHEMA_VERSION),
+    );
+    let unsigned = document.to_string();
+    let Some(auth_verb) = auth_verb else {
+        return Ok(unsigned);
+    };
+    for (label, value) in [
+        ("verb", auth_verb),
+        ("node", peer),
+        ("target", target.as_str()),
+    ] {
+        if value.contains('|') || value.len() > 255 || value.trim().is_empty() {
+            return Err(format!(
+                "Remote-terminal mutation {label} is not capability-safe."
+            ));
+        }
+    }
+    use rand::RngCore as _;
+    let mut nonce_bytes = [0_u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = nonce_bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .map_err(|_| "The system clock is before the Unix epoch.".to_string())?;
+    let token = CloudArmedToken::mint(
+        &action_signer()?,
+        &nonce,
+        now.saturating_add(ACTION_TOKEN_TTL_MS),
+        auth_verb,
+        peer,
+        &target,
+        &cloud_request_digest(&unsigned).map_err(str::to_string)?,
+    )
+    .encode();
+    let mut armed: serde_json::Value = serde_json::from_str(&unsigned)
+        .map_err(|e| format!("Invalid remote-terminal request body: {e}"))?;
+    armed
+        .as_object_mut()
+        .expect("validated object")
+        .insert("armed_token".to_string(), serde_json::Value::String(token));
+    Ok(armed.to_string())
 }
 
 // ── verb builders for the TMUX-FC-6 control-mode-over-broker transport ────────
@@ -441,6 +554,7 @@ impl PtyBus for BusPtyClient {
                     .to_string(),
             );
         };
+        let body = authorize_publish_body(peer, body)?;
         let topic = action_topic(peer);
         mde_bus::persist::Persist::open(root.clone())
             .and_then(|p| {
@@ -448,7 +562,7 @@ impl PtyBus for BusPtyClient {
                     &topic,
                     mde_bus::hooks::config::Priority::Default,
                     None,
-                    Some(body),
+                    Some(&body),
                 )
             })
             .map(|_| ())
@@ -1109,6 +1223,44 @@ mod tests {
         );
         let close = ClientVerb::Close { id: "s1".into() };
         assert_eq!(close.body(), r#"{"verb":"close","id":"s1"}"#);
+    }
+
+    #[test]
+    fn live_bus_publisher_adds_schema_and_scoped_capability() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = BusPtyClient::with_root(Some(dir.path().to_path_buf()));
+        let body = ClientVerb::Open {
+            id: "s1".into(),
+            cols: 80,
+            rows: 24,
+        }
+        .body();
+        client.publish("oak", &body).unwrap();
+        let persist = mde_bus::persist::Persist::open(dir.path().to_path_buf()).unwrap();
+        let body = persist
+            .list_since(&action_topic("oak"), None)
+            .unwrap()
+            .pop()
+            .and_then(|message| message.body)
+            .expect("published body");
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["schema_version"], CLOUD_ACTION_SCHEMA_VERSION);
+        let token = CloudArmedToken::parse(value["armed_token"].as_str().unwrap()).unwrap();
+        assert_eq!(token.verb, "pty-open");
+        assert_eq!(token.node, "oak");
+        assert_eq!(token.target, "s1");
+
+        let heartbeat = ClientVerb::Heartbeat { id: "s1".into() }.body();
+        client.publish("oak", &heartbeat).unwrap();
+        let latest = persist
+            .list_since(&action_topic("oak"), None)
+            .unwrap()
+            .pop()
+            .and_then(|message| message.body)
+            .unwrap();
+        let latest: serde_json::Value = serde_json::from_str(&latest).unwrap();
+        assert_eq!(latest["schema_version"], CLOUD_ACTION_SCHEMA_VERSION);
+        assert!(latest.get("armed_token").is_none());
     }
 
     #[test]

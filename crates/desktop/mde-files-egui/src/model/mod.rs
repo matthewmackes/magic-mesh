@@ -2266,6 +2266,10 @@ impl FileBrowser {
     /// op (§6). Callers pre-check for an empty source list.
     fn submit_transfer(&mut self, sources: Vec<PathBuf>, dest_dir: PathBuf, copy: bool) -> OpId {
         let count = sources.len();
+        let single_source = (count == 1)
+            .then(|| sources[0].file_name())
+            .flatten()
+            .map(|name| name.to_string_lossy().into_owned());
         let dest = dest_dir.file_name().map_or_else(
             || dest_dir.display().to_string(),
             |s| s.to_string_lossy().into_owned(),
@@ -2273,9 +2277,11 @@ impl FileBrowser {
         let kind = plan_transfer(sources, dest_dir, copy);
         let verb = if copy { "Copying" } else { "Moving" };
         let noun = if count == 1 { "item" } else { "items" };
-        let id = self
-            .ops
-            .submit(kind, format!("{verb} {count} {noun} \u{2192} {dest}"));
+        let label = single_source.map_or_else(
+            || format!("{verb} {count} {noun} \u{2192} {dest}"),
+            |name| format!("{verb} {name} \u{2192} {dest}"),
+        );
+        let id = self.ops.submit(kind, label);
         self.last_note = None;
         id
     }

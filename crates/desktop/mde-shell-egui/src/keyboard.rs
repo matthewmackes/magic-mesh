@@ -33,7 +33,7 @@ use mde_egui::egui::{self, RichText};
 use mde_egui::{Formfactor, Motion, Style};
 use mde_theme::brand::icons::IconId;
 
-use crate::dock::icon_texture;
+use crate::surfaces::icon_texture;
 
 /// Which layer the OSK is currently showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

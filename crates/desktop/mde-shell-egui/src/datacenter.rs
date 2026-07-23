@@ -570,7 +570,25 @@ impl Lifecycle {
     /// cannot realistically fail; an empty body (never produced here) would simply
     /// be rejected by the worker's parser rather than acted on.
     fn to_body(&self) -> String {
-        serde_json::to_string(self).unwrap_or_default()
+        let mut body = serde_json::to_value(self).unwrap_or_default();
+        if let Some(object) = body.as_object_mut() {
+            object.insert(
+                "schema_version".to_string(),
+                serde_json::Value::from(mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION),
+            );
+        }
+        body.to_string()
+    }
+
+    /// Capability binding shared with `vm_lifecycle`: exact operation, host,
+    /// and domain. The complete serialized body is bound separately by its
+    /// canonical SHA-256 digest.
+    fn authorization_context(&self) -> (&'static str, &str, &str) {
+        match self {
+            Self::Create { host, spec } => ("vm-create", host, &spec.name),
+            Self::Start { host, name } => ("vm-start", host, name),
+            Self::Stop { host, name, .. } => ("vm-stop", host, name),
+        }
     }
 }
 
@@ -583,7 +601,15 @@ fn publish(bus_root: Option<&Path>, last_error: &mut Option<String>, action: &Li
         *last_error = Some("No mesh Bus directory — VM actions unavailable.".to_string());
         return;
     };
-    let body = action.to_body();
+    let unsigned = action.to_body();
+    let (verb, node, target) = action.authorization_context();
+    let body = match crate::iac::authorize_root_mutation_body(&unsigned, verb, node, target) {
+        Ok(body) => body,
+        Err(error) => {
+            *last_error = Some(format!("VM action authorization unavailable: {error}"));
+            return;
+        }
+    };
     // arch-11: writer — the shared BusReader seam is read-only; this publish keeps
     // Persist::open because it needs the write Result to set `last_error`.
     match Persist::open(root.to_path_buf())
@@ -1292,8 +1318,8 @@ enum StopButton {
 }
 
 /// Apply a Stop-control click for `(host, name)` to the shared single-row `arm`
-/// slot. Mirrors the dock power-row's arm-then-confirm gate
-/// ([`crate::dock`]'s `power_arming_stage`) scaled to a per-row Stop: the first
+/// slot. Mirrors the shell power control's arm-then-confirm gate, scaled to a
+/// per-row Stop: the first
 /// `Stop` arms this row, a second (`Confirm`) disarms and returns the Stop action
 /// to dispatch, `Cancel` disarms. Returns `Some` ONLY on a confirmed click, so a
 /// running VM — plausibly a live brokered desktop — is never stopped on one click.
@@ -2233,6 +2259,7 @@ mod tests {
         }
         .to_body();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+        assert_eq!(v["schema_version"], 1);
         assert_eq!(v["op"], "create");
         assert_eq!(v["host"], "node-a");
         assert_eq!(v["spec"]["name"], "web1");
@@ -2249,6 +2276,7 @@ mod tests {
         }
         .to_body();
         let v: serde_json::Value = serde_json::from_str(&start).unwrap_or_default();
+        assert_eq!(v["schema_version"], 1);
         assert_eq!(v["op"], "start");
         assert_eq!(v["host"], "node-a");
         assert_eq!(v["name"], "web1");
@@ -2260,6 +2288,7 @@ mod tests {
         }
         .to_body();
         let v: serde_json::Value = serde_json::from_str(&stop).unwrap_or_default();
+        assert_eq!(v["schema_version"], 1);
         assert_eq!(v["op"], "stop");
         assert_eq!(v["host"], "node-b");
         assert_eq!(v["name"], "db1");
@@ -2308,5 +2337,37 @@ mod tests {
             },
         );
         assert!(err.is_some(), "a missing bus dir is surfaced, not panicked");
+    }
+
+    #[test]
+    fn publish_mints_an_exact_body_bound_direct_libvirt_capability() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut error = None;
+        publish(
+            Some(tmp.path()),
+            &mut error,
+            &Lifecycle::Stop {
+                host: "node-a".to_string(),
+                name: "web1".to_string(),
+                force: false,
+            },
+        );
+        assert!(error.is_none(), "{error:?}");
+        let persist = Persist::open(tmp.path().to_path_buf()).unwrap();
+        let messages = persist.list_since(ACTION_TOPIC, None).unwrap();
+        assert_eq!(messages.len(), 1);
+        let body = messages[0].body.as_deref().unwrap();
+        let value: serde_json::Value = serde_json::from_str(body).unwrap();
+        let token = mackes_mesh_types::cloud::CloudArmedToken::parse(
+            value["armed_token"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(token.verb, "vm-stop");
+        assert_eq!(token.node, "node-a");
+        assert_eq!(token.target, "web1");
+        assert_eq!(
+            token.request_sha256,
+            mackes_mesh_types::cloud::cloud_request_digest(body).unwrap()
+        );
     }
 }

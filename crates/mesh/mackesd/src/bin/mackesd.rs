@@ -1346,7 +1346,7 @@ enum LighthouseCmd {
         /// DigitalOcean region slug (e.g. `nyc3`, `sfo3`, `fra1`).
         #[arg(long)]
         region: String,
-        /// DO droplet size slug (default: the provisioner's `s-1vcpu-1gb`).
+        /// DO droplet size slug (default: the provisioner's `s-1vcpu-512mb-10gb`).
         #[arg(long)]
         size: Option<String>,
         /// DO image slug (default: the provisioner's `fedora-43-x64`).
@@ -2695,8 +2695,34 @@ fn run_serve(
         // running without the env var still boot clean.
         let router_state: mackesd_core::workers::mesh_router::RouterState =
             Arc::new(RwLock::new(HashMap::new()));
-        let https443: Arc<dyn mackes_transport::Transport> =
-            Arc::new(mackesd_core::transport::https443::NebulaHttps443Transport::new());
+        let https_transport =
+            mackesd_core::transport::https443::NebulaHttps443Transport::from_bundle(
+                &mackesd_core::ca::bundle::bundle_path(&workgroup_root, &node_id),
+            );
+        let https_udp_bridge = https_transport.relay_peer_id().and_then(|peer_id| {
+            let raw = std::env::var(
+                mackesd_core::workers::mesh_router::HTTPS_UDP_BRIDGE_BIND_ENV,
+            )
+            .unwrap_or_else(|_| {
+                mackesd_core::workers::mesh_router::DEFAULT_HTTPS_UDP_BRIDGE_BIND.to_string()
+            });
+            match raw.parse() {
+                Ok(bind_addr) => Some(
+                    mackesd_core::workers::mesh_router::HttpsUdpBridgeConfig {
+                        bind_addr,
+                        nebula_source: mackesd_core::workers::mesh_router::DEFAULT_NEBULA_UDP_SOURCE
+                            .parse()
+                            .expect("default Nebula UDP source is a socket address"),
+                        peer_id: peer_id.to_string(),
+                    },
+                ),
+                Err(error) => {
+                    tracing::warn!(value = %raw, error = %error, "mesh-router: invalid HTTPS UDP bridge bind");
+                    None
+                }
+            }
+        });
+        let https443: Arc<dyn mackes_transport::Transport> = Arc::new(https_transport);
         let router_registry: mackesd_core::workers::mesh_router::TransportRegistry =
             Arc::new(vec![https443]);
         // KDC2-1.9 (AUD3 S-2) — load the routing policy (system +
@@ -2718,10 +2744,14 @@ fn run_serve(
             // router's per-tick observe() lands in the exporter's scrape.
             // AUD3 S-2/S-5 — scorer policy + the audit sink (path flips
             // land in the hash-chained events table + alert hooks).
-            MeshRouterWorker::new(Arc::clone(&router_state), router_registry)
+            let worker = MeshRouterWorker::new(Arc::clone(&router_state), router_registry)
                 .with_metrics(Arc::clone(&router_metrics))
                 .with_policy(router_policy)
-                .with_audit_sink(db_path.clone(), node_id.clone())
+                .with_audit_sink(db_path.clone(), node_id.clone());
+            match https_udp_bridge.clone() {
+                Some(config) => worker.with_https_udp_bridge(config),
+                None => worker,
+            }
         });
         // v4.0.1 Phase 12.17 wire (2026-05-23) — STUN candidate
         // gatherer. Shares router_state with the router so

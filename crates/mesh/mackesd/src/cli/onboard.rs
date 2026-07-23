@@ -94,6 +94,7 @@ pub fn run(verb: OnboardCmd, db_path: PathBuf) -> anyhow::Result<()> {
                 std::path::Path::new("/var/lib/mackesd/nebula-ca/ca.crt"),
                 std::path::Path::new("/var/lib/mackesd/nebula-ca/ca.key"),
                 std::path::Path::new("/var/lib/mackesd/nebula-ca/scratch"),
+                std::path::Path::new("/etc/nebula"),
                 &external_addr,
                 label.as_deref(),
             )?;

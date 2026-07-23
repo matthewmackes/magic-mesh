@@ -1,5 +1,9 @@
 # IAC — the "Infra as Code (IaC)" workspace (OpenStack IaaS control plane)
 
+> **HISTORICAL / SUPERSEDED (2026-07-22):** the Heat/Keystone workspace below
+> was deleted. The live Workloads surface uses provider-neutral typed verbs,
+> OpenTofu provisioning, Ansible configuration, and local libvirt/KVM.
+
 Operator-locked 2026-07-04 (25-Q survey). A new **Workloads-group** surface named
 **"Infra as Code (IaC)"**: a comprehensive **OpenStack IaaS control plane** built on
 OpenStack's own **standard APIs** — the **Keystone service catalog** is the service

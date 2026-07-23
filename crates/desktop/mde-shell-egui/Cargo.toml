@@ -70,6 +70,8 @@ mde-bus = { path = "../../platform/mde-bus" }
 # crate (keeps the shell in the desktop-shell tier).
 serde      = { workspace = true }
 serde_json = { workspace = true }
+rand = "0.8"
+rustix = { version = "0.38", features = ["process"] }
 
 # CHOOSER-9 — the Desktop Chooser's mesh-synced favorites/recents/manual sources
 # (`chooser/chooser_prefs.rs`) roam per mesh identity over the Syncthing-replicated

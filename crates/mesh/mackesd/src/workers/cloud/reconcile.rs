@@ -27,6 +27,7 @@ use mackes_mesh_types::cloud::{
     CloudInstance, DriftFlag, DriftSummary, PlanCounts, WorkloadRow, WorkloadSpec,
 };
 
+use super::path_key;
 use super::render;
 use super::runner::CloudRunner;
 
@@ -37,14 +38,20 @@ const DESIRED_SUBTREE: &str = "mcnf/cloud/desired";
 /// The directory holding node `node`'s desired-state docs (`<state_root>/mcnf/cloud/
 /// desired/<node>/`).
 #[must_use]
-pub(crate) fn desired_dir(state_root: &Path, node: &str) -> PathBuf {
-    state_root.join(DESIRED_SUBTREE).join(node.trim())
+pub(crate) fn desired_dir(state_root: &Path, node: &str) -> Result<PathBuf, String> {
+    Ok(state_root
+        .join(DESIRED_SUBTREE)
+        .join(path_key::segment("node", node)?))
 }
 
 /// The path of workload `name`'s desired-state doc on node `node`.
 #[must_use]
-pub(crate) fn desired_doc_path(state_root: &Path, node: &str, name: &str) -> PathBuf {
-    desired_dir(state_root, node).join(format!("{}.json", name.trim()))
+pub(crate) fn desired_doc_path(
+    state_root: &Path,
+    node: &str,
+    name: &str,
+) -> Result<PathBuf, String> {
+    Ok(desired_dir(state_root, node)?.join(format!("{}.json", path_key::segment("name", name)?)))
 }
 
 /// Read node `node`'s desired-state slice — every `*.json` doc under its desired
@@ -55,7 +62,9 @@ pub(crate) fn desired_doc_path(state_root: &Path, node: &str, name: &str) -> Pat
 /// declared, well-formed workloads still converge.
 #[must_use]
 pub(crate) fn read_desired_slice(state_root: &Path, node: &str) -> Vec<WorkloadSpec> {
-    let dir = desired_dir(state_root, node);
+    let Ok(dir) = desired_dir(state_root, node) else {
+        return Vec::new();
+    };
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Vec::new();
     };
@@ -83,20 +92,14 @@ pub(crate) fn read_desired_slice(state_root: &Path, node: &str) -> Vec<WorkloadS
 /// An I/O failure creating the tree or writing the doc (surfaced honestly to the
 /// caller — never a silent success).
 pub(crate) fn write_desired_doc(state_root: &Path, spec: &WorkloadSpec) -> Result<(), String> {
-    let node = spec.node.trim();
-    let name = spec.name.trim();
-    if node.is_empty() {
-        return Err("workload spec is missing its placement `node`".to_string());
-    }
-    if name.is_empty() {
-        return Err("workload spec is missing its `name`".to_string());
-    }
-    let dir = desired_dir(state_root, node);
+    let node = path_key::segment("node", &spec.node)?;
+    let name = path_key::segment("name", &spec.name)?;
+    let dir = desired_dir(state_root, node)?;
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("create desired dir {}: {e}", dir.display()))?;
     let body =
         serde_json::to_string_pretty(spec).map_err(|e| format!("serialize desired doc: {e}"))?;
-    let path = desired_doc_path(state_root, node, name);
+    let path = desired_doc_path(state_root, node, name)?;
     std::fs::write(&path, body).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
@@ -111,7 +114,7 @@ pub(crate) fn remove_desired_doc(
     node: &str,
     name: &str,
 ) -> Result<bool, String> {
-    let path = desired_doc_path(state_root, node, name);
+    let path = desired_doc_path(state_root, node, name)?;
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -131,6 +134,7 @@ pub(crate) fn plan_counts_for_node(
     node: &str,
     libvirt_uri: &str,
 ) -> Result<PlanCounts, String> {
+    path_key::segment("node", node)?;
     let specs = read_desired_slice(state_root, node);
     let tfvars = render::render_tfvars(node, &specs, libvirt_uri);
     let ndjson = runner.plan_json(&tfvars)?;
@@ -283,6 +287,50 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         assert!(write_desired_doc(tmp.path(), &spec("x", "  ")).is_err());
         assert!(write_desired_doc(tmp.path(), &spec("  ", "n")).is_err());
+    }
+
+    #[test]
+    fn desired_store_rejects_absolute_parent_and_separator_segments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("state");
+        let outside = tmp.path().join("outside");
+        let absolute_node = outside.to_string_lossy().into_owned();
+        let absolute_name = outside.join("victim").to_string_lossy().into_owned();
+
+        for bad_node in [&absolute_node, "../escape", "node/child", ".", ".."] {
+            let err = write_desired_doc(&root, &spec("proof", bad_node)).unwrap_err();
+            assert!(err.contains("path-safe"), "unexpected error: {err}");
+        }
+        for bad_name in [&absolute_name, "../escape", "name/child", ".", ".."] {
+            let err = write_desired_doc(&root, &spec(bad_name, "eagle")).unwrap_err();
+            assert!(err.contains("path-safe"), "unexpected error: {err}");
+        }
+        assert!(
+            !outside.exists(),
+            "an untrusted absolute node/name must not create an outside path"
+        );
+    }
+
+    #[test]
+    fn desired_remove_rejects_escape_and_preserves_the_outside_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("state");
+        let outside = tmp.path().join("victim.json");
+        std::fs::write(&outside, "keep").unwrap();
+        let attack_name = tmp.path().join("victim").to_string_lossy().into_owned();
+
+        assert!(remove_desired_doc(&root, "eagle", &attack_name).is_err());
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep");
+        assert!(remove_desired_doc(&root, "../escape", "victim").is_err());
+    }
+
+    #[test]
+    fn desired_store_accepts_hostname_and_workload_tokens() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_desired_doc(tmp.path(), &spec("web_api.v2", "node-1.example_lab")).unwrap();
+        let slice = read_desired_slice(tmp.path(), "node-1.example_lab");
+        assert_eq!(slice.len(), 1);
+        assert_eq!(slice[0].name, "web_api.v2");
     }
 
     #[test]

@@ -1,5 +1,9 @@
 # CONSTRUCT-CLOUD operator runbook — standing up and running the mesh cloud
 
+> **HISTORICAL / SUPERSEDED (2026-07-22):** do not operate from this runbook.
+> The OpenStack/Kolla backend was removed; current Workloads operations use
+> OpenTofu + Ansible + local libvirt/KVM and Podman/Quadlet.
+
 > **Status: tracks the LOCKED design** (`docs/design/quasar-cloud.md`,
 > 2026-07-03) and is written as the QC-21 docs deliverable while the build-out
 > (QC-1..QC-20) lands. Steps that depend on an unshipped task carry that task

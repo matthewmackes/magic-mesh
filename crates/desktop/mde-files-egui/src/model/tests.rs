@@ -401,6 +401,12 @@ fn drop_transfer_submits_a_queued_op_for_a_local_selection() {
         .drop_transfer(0, PathBuf::from("/dst"), true)
         .expect("a local selection is transferable");
     assert!(b.ops().active().iter().any(|o| o.op_id == id));
+    assert_eq!(
+        b.operation_progress_summary()
+            .expect("the queued copy has a shell summary")
+            .label,
+        "Copying f0.txt → dst"
+    );
     assert!(b.last_note().is_none());
 }
 

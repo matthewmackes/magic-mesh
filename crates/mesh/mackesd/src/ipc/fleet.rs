@@ -37,6 +37,8 @@ use mde_bus::persist::Persist;
 use mde_bus::rpc::reply_topic;
 use serde_json::json;
 
+use super::action_auth::{ActionAuthorizer, MutationContext};
+
 /// Fleet control service — owns the revision-log location + the
 /// author identity stamped on mints from this node.
 #[derive(Debug, Default, Clone)]
@@ -238,6 +240,49 @@ pub fn build_reply(svc: &FleetService, verb: &str, body: Option<&str>) -> String
     }
 }
 
+fn build_bus_reply(
+    svc: &FleetService,
+    verb: &str,
+    body: Option<&str>,
+    authorizer: &ActionAuthorizer,
+) -> String {
+    if matches!(verb, "push-revision" | "rollback" | "nudge") {
+        let raw = body.unwrap_or_default();
+        let request = serde_json::from_str::<serde_json::Value>(raw).ok();
+        let target = match verb {
+            "push-revision" => "baseline".to_string(),
+            "rollback" => request
+                .as_ref()
+                .and_then(|value| value.get("target"))
+                .and_then(serde_json::Value::as_u64)
+                .map_or_else(String::new, |target| target.to_string()),
+            "nudge" => request
+                .as_ref()
+                .and_then(|value| value.get("peer"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            _ => unreachable!("closed mutation verb set"),
+        };
+        let auth_verb = format!("fleet-{verb}");
+        let context = MutationContext {
+            verb: &auth_verb,
+            node: &svc.node_id,
+            target: &target,
+        };
+        if let Err(error) = authorizer.authorize(raw, context) {
+            tracing::warn!(
+                target: "mackesd::fleet",
+                %error,
+                verb,
+                "refused unauthorized fleet mutation"
+            );
+            return err(format!("{verb} authorization refused: {error}"));
+        }
+    }
+    build_reply(svc, verb, body)
+}
+
 /// Run the Fleet Bus responder loop on the current thread until
 /// `should_stop()`. No tokio runtime needed (the verb handlers are
 /// synchronous filesystem reads/writes; `Persist`/rusqlite isn't
@@ -251,8 +296,9 @@ pub fn serve_bus<F: Fn() -> bool>(persist: &Persist, svc: &FleetService, should_
     let mut seen_acks: std::collections::HashSet<(u64, String, String)> =
         std::collections::HashSet::new();
     let mut first_sweep = true;
+    let authorizer = ActionAuthorizer::production();
     while !should_stop() {
-        poll_once(persist, svc, &mut cursors);
+        poll_once(persist, svc, &mut cursors, &authorizer);
         emit_new_acks(persist, svc, &mut seen_acks, first_sweep);
         first_sweep = false;
         std::thread::sleep(POLL_INTERVAL);
@@ -292,7 +338,12 @@ pub fn emit_new_acks(
 /// One poll sweep across the action verbs (split out so a test can
 /// drive it without the sleep loop). For each new request on
 /// `action/fleet/<verb>`, writes [`build_reply`] to `reply/<ulid>`.
-pub fn poll_once(persist: &Persist, svc: &FleetService, cursors: &mut HashMap<String, String>) {
+pub fn poll_once(
+    persist: &Persist,
+    svc: &FleetService,
+    cursors: &mut HashMap<String, String>,
+    authorizer: &ActionAuthorizer,
+) {
     for verb in ACTION_VERBS {
         let topic = action_topic(verb);
         let since = cursors.get(&topic).map(String::as_str);
@@ -307,7 +358,7 @@ pub fn poll_once(persist: &Persist, svc: &FleetService, cursors: &mut HashMap<St
             cursors.insert(topic.clone(), msg.ulid.clone());
             // EFF-23 — refuse an oversized body before build_reply parses it.
             let reply = if crate::ipc::body_within_cap(msg.body.as_deref()) {
-                build_reply(svc, verb, msg.body.as_deref())
+                build_bus_reply(svc, verb, msg.body.as_deref(), authorizer)
             } else {
                 tracing::warn!(
                     topic = %topic,
@@ -332,6 +383,10 @@ pub fn poll_once(persist: &Persist, svc: &FleetService, cursors: &mut HashMap<St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::action_auth::authorize_test_body;
+
+    const AUTH_KEY: &[u8] = b"fleet-action-auth-test-key";
+    const AUTH_NOW: i64 = 1_700_000_000_000;
 
     #[test]
     fn action_verbs_and_topic_lock() {
@@ -353,6 +408,89 @@ mod tests {
 
     fn svc_in(dir: &std::path::Path) -> FleetService {
         FleetService::new(dir, "peer:test".into())
+    }
+
+    fn signed_push_body(nonce: &str, expires_at_ms: i64) -> String {
+        let unsigned = json!({
+            "schema_version": 1,
+            "spec": "packages: []\n",
+        })
+        .to_string();
+        authorize_test_body(
+            AUTH_KEY,
+            &unsigned,
+            MutationContext {
+                verb: "fleet-push-revision",
+                node: "peer:test",
+                target: "baseline",
+            },
+            nonce,
+            expires_at_ms,
+        )
+    }
+
+    #[test]
+    fn hostile_bus_mutations_are_refused_and_authorized_push_is_single_use() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = svc_in(tmp.path());
+        let authorizer = ActionAuthorizer::for_test(AUTH_KEY, tmp.path().join("auth"), AUTH_NOW);
+
+        for (verb, body) in [
+            ("push-revision", r#"{"spec":"packages: []\n"}"#),
+            ("rollback", r#"{"target":1}"#),
+            ("nudge", r#"{"peer":"oak"}"#),
+        ] {
+            let reply: serde_json::Value =
+                serde_json::from_str(&build_bus_reply(&svc, verb, Some(body), &authorizer))
+                    .unwrap();
+            assert_eq!(reply["ok"], false, "unsigned {verb} must fail closed");
+        }
+        assert!(store::read_revisions(&svc.revisions_dir).is_empty());
+        assert!(!magic_fleet::store::take_nudge(tmp.path(), "oak"));
+
+        let future = signed_push_body("future", AUTH_NOW + 30_000)
+            .replace("\"schema_version\":1", "\"schema_version\":2");
+        let overlong = signed_push_body("overlong", AUTH_NOW + 30_001);
+        let tampered = signed_push_body("tampered", AUTH_NOW + 30_000)
+            .replace("packages: []", "packages: [vim]");
+        for body in [&future, &overlong, &tampered] {
+            let reply: serde_json::Value = serde_json::from_str(&build_bus_reply(
+                &svc,
+                "push-revision",
+                Some(body),
+                &authorizer,
+            ))
+            .unwrap();
+            assert_eq!(reply["ok"], false);
+        }
+        assert!(store::read_revisions(&svc.revisions_dir).is_empty());
+
+        let replay = signed_push_body("replay", AUTH_NOW + 30_000);
+        let first: serde_json::Value = serde_json::from_str(&build_bus_reply(
+            &svc,
+            "push-revision",
+            Some(&replay),
+            &authorizer,
+        ))
+        .unwrap();
+        assert_eq!(first["ok"], true);
+        let second: serde_json::Value = serde_json::from_str(&build_bus_reply(
+            &svc,
+            "push-revision",
+            Some(&replay),
+            &authorizer,
+        ))
+        .unwrap();
+        assert_eq!(second["ok"], false);
+        assert_eq!(store::read_revisions(&svc.revisions_dir).len(), 1);
+
+        for verb in ["list-revisions", "diff-revisions"] {
+            let reply = build_bus_reply(&svc, verb, None, &authorizer);
+            assert!(
+                !reply.contains("authorization refused"),
+                "{verb} remains an open read"
+            );
+        }
     }
 
     #[test]

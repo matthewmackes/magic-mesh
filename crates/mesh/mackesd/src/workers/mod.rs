@@ -410,6 +410,24 @@ pub mod cloud;
 // genuine no-op on the nodes with no gateway configured (`MDE_VEHICLE_GATEWAY`
 // unset). Mirrors `cloud`'s injectable-transport + bus-mirror lifecycle.
 pub mod vehicle;
+// WL-FUNC-012 / OVERLAY-10 — opt-in workstation-side, keyless USGS earthquake
+// adapter. Polls the all-hour GeoJSON feed over rustls and publishes normalized
+// latest-wins `state/overlay/usgs-earthquakes/<node>` snapshots. Unconfigured is
+// an idle no-op; fetch failures retain the honestly aging last-good snapshot.
+pub mod earthquake_overlay;
+// WL-FUNC-012 / OVERLAY-1 — opt-in workstation-side NWS active-alert adapter;
+// resolves null alert geometry through affectedZones and publishes normalized
+// latest-wins `state/overlay/nws-alerts/<node>` snapshots.
+pub mod nws_alert_overlay;
+pub mod nws_forecast_overlay;
+// WL-FUNC-012 / OVERLAY-8 — opt-in, vehicle-scoped adsb.lol point adapter;
+// retains only fresh direct/rebroadcast low-altitude positions and publishes a
+// bounded latest-wins `state/overlay/adsb-aircraft/<node>` snapshot.
+pub mod aircraft_overlay;
+pub mod caltrans_camera_overlay;
+// WL-FUNC-012 / OVERLAY-9 — opt-in MBTA GTFS-Realtime vehicle positions,
+// filtered against a fresh local vehicle point before latest-wins publication.
+pub mod transit_overlay;
 // VIRT-7 (v5.0.0) — per-network firewalld port forwarding. Each
 // peer subscribes to `compute/{expose,unexpose}/<own-peer-addr>`
 // and writes firewalld rich rules per selected network
@@ -504,6 +522,11 @@ pub mod device_inventory;
 // display/power) behind the allowlist + safety interlocks. Runs on every
 // node; spawned in run_serve.
 pub mod host_state;
+// WL-FUNC-012 / OVERLAY-2 — keyless IEM/NWS animated NEXRAD tiles.
+#[cfg(feature = "async-services")]
+pub mod iem_radar_overlay;
+pub mod traffic_overlay;
+pub mod wildfire_overlay;
 // notification_relay retired in BUS-4.2 (2026-05-26). Cross-peer
 // notification routing is now handled by the BUS-4.4 FDO bridge:
 // every Notify call publishes to `fdo/<app>` on the Mackes Bus,

@@ -14,12 +14,21 @@
 //! (`MapsLocationSurface::simulated`, `#[cfg(any(test, feature = "sim-fixture"))]`);
 //! no production build compiles it, so no production path can show dummy data.
 
+pub mod aircraft;
 pub mod airspace;
 pub mod basemap;
+pub mod caltrans_camera;
 pub mod car_status;
+pub mod earthquake;
 pub mod geocode;
+pub mod iem_radar;
 pub mod model;
+pub mod nws_alert;
+pub mod nws_forecast;
+pub mod traffic;
+pub mod transit;
 pub mod view;
+pub mod wildfire;
 
 use mde_egui::{eframe, egui, run_client};
 

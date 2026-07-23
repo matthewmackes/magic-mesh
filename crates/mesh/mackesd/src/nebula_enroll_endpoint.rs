@@ -27,7 +27,7 @@ use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
-use crate::ca::bundle::{LighthouseEntry, NebulaBundle};
+use crate::ca::bundle::LighthouseEntry;
 use crate::nebula_enroll::{sign_csr_into_bundle, PendingEnrollment, SignCsrError, SignCsrPaths};
 
 /// Default TCP port for the `/enroll` HTTPS endpoint. Distinct from
@@ -132,6 +132,13 @@ pub fn ensure_self_signed_cert(
     if cert_path.exists() && key_path.exists() {
         return Ok(true);
     }
+    if cert_path.exists() != key_path.exists() {
+        return Err(format!(
+            "refusing to replace incomplete enroll TLS identity (cert_exists={}, key_exists={})",
+            cert_path.exists(),
+            key_path.exists()
+        ));
+    }
     let identity = generate_endpoint_identity(sans)?;
     if let Some(dir) = cert_path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
@@ -139,15 +146,15 @@ pub fn ensure_self_signed_cert(
     if let Some(dir) = key_path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     }
-    std::fs::write(cert_path, identity.cert_pem.as_bytes())
-        .map_err(|e| format!("write {}: {e}", cert_path.display()))?;
-    std::fs::write(key_path, identity.key_pem.as_bytes())
-        .map_err(|e| format!("write {}: {e}", key_path.display()))?;
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(key_path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("chmod 600 {}: {e}", key_path.display()))?;
-    }
+    // rcgen validated the pair together in memory; expose it through the same
+    // single-generation switch used for Nebula identities and CA roots.
+    crate::ca::seal::write_atomic_pair(
+        cert_path,
+        identity.cert_pem.as_bytes(),
+        key_path,
+        identity.key_pem.as_bytes(),
+    )
+    .map_err(|e| format!("install enroll TLS identity: {e}"))?;
     Ok(true)
 }
 
@@ -310,7 +317,7 @@ fn sign_error_status(err: &SignCsrError) -> u16 {
 
 /// The pure `POST /enroll` handler. Parses the request body as a
 /// [`PendingEnrollment`], signs it via the shared core, redeems the
-/// bearer on success, and returns the [`NebulaBundle`] as JSON.
+/// bearer on success, and returns the authenticated enrollment envelope as JSON.
 ///
 /// Routing + transport (method/path dispatch, TLS) are the listener's
 /// job; this function is deliberately I/O-light (it opens a fresh
@@ -356,7 +363,7 @@ pub fn handle_enroll<B: crate::ca::NebulaCertBackend + ?Sized>(
         lighthouses,
         false,
     ) {
-        Ok(bundle) => {
+        Ok(response) => {
             // ENT-1 single-use (security-5): the core's `is_pending`
             // gate was only a pre-check — ATOMICALLY consume the bearer
             // HERE and deliver the bundle only if we won. Two concurrent
@@ -378,11 +385,11 @@ pub fn handle_enroll<B: crate::ca::NebulaCertBackend + ?Sized>(
             }
             tracing::info!(
                 peer_id = %csr.node_id,
-                mesh_id = %bundle.mesh_id,
-                overlay_ip = %bundle.overlay_ip,
+                mesh_id = %response.bundle.mesh_id,
+                overlay_ip = %response.bundle.overlay_ip,
                 "enroll-endpoint: signed peer over the network",
             );
-            encode_bundle(&bundle)
+            encode_bundle(&response)
         }
         Err(e) => {
             let status = sign_error_status(&e);
@@ -397,8 +404,8 @@ pub fn handle_enroll<B: crate::ca::NebulaCertBackend + ?Sized>(
     }
 }
 
-fn encode_bundle(bundle: &NebulaBundle) -> HttpResponse {
-    match serde_json::to_vec(bundle) {
+fn encode_bundle(bundle: &crate::ca::bundle::AuthenticatedEnrollmentResponse) -> HttpResponse {
+    match bundle.encode_for_authenticated_tls() {
         Ok(body) => HttpResponse { status: 200, body },
         Err(e) => HttpResponse::json_error(500, &format!("bundle encode failed: {e}")),
     }
@@ -409,7 +416,7 @@ mod tests {
     use super::*;
     use crate::ca::{mint, MockBackend};
     use crate::enrollment::build_identity;
-    use crate::nebula_enroll::{build_pending, parse_join_token};
+    use crate::nebula_enroll::{build_pending_with_nebula_key, parse_join_token};
 
     // ---- endpoint identity / fingerprint --------------------
 
@@ -570,8 +577,31 @@ mod tests {
             crate::bearer_ledger::record_issued(workgroup_root, &token.bearer)
                 .expect("seed bearer");
         }
-        let pending = build_pending(&identity, peer_id, "anvil", token);
+        let pending = build_pending_with_nebula_key(
+            &identity,
+            peer_id,
+            "anvil",
+            token,
+            "-----BEGIN NEBULA X25519 PUBLIC KEY-----\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n-----END NEBULA X25519 PUBLIC KEY-----\n",
+        );
         serde_json::to_vec(&pending).expect("encode")
+    }
+
+    fn lighthouse_enroll_body(workgroup_root: &Path, peer_id: &str) -> (String, Vec<u8>) {
+        let identity = build_identity();
+        let bearer =
+            crate::bearer_ledger::issue(workgroup_root, crate::bearer_ledger::LIGHTHOUSE_ROLE_NOTE)
+                .expect("issue lighthouse bearer");
+        let token =
+            parse_join_token(&format!("mesh:test-mesh@10.0.0.5:4243#{bearer}")).expect("token");
+        let pending = build_pending_with_nebula_key(
+            &identity,
+            peer_id,
+            "lighthouse",
+            token,
+            "-----BEGIN NEBULA X25519 PUBLIC KEY-----\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n-----END NEBULA X25519 PUBLIC KEY-----\n",
+        );
+        (bearer, serde_json::to_vec(&pending).expect("encode"))
     }
 
     fn roster() -> Vec<LighthouseEntry> {
@@ -579,6 +609,7 @@ mod tests {
             node_id: "peer:lighthouse-1".into(),
             overlay_ip: "10.42.0.1".into(),
             external_addr: "203.0.113.7:4242".into(),
+            relay_tls: None,
         }]
     }
 
@@ -593,10 +624,12 @@ mod tests {
         let resp = handle_enroll(&MockBackend, &db_path, root, &paths, roster(), &body);
         assert_eq!(resp.status, 200, "issued bearer signs");
 
-        let bundle: NebulaBundle = serde_json::from_slice(&resp.body).expect("bundle json");
+        let response: crate::ca::bundle::AuthenticatedEnrollmentResponse =
+            serde_json::from_slice(&resp.body).expect("enrollment response json");
+        let bundle = &response.bundle;
         assert_eq!(bundle.mesh_id, "test-mesh");
         assert!(!bundle.peer_cert_pem.is_empty());
-        assert!(!bundle.peer_key_pem.is_empty());
+        assert!(!String::from_utf8_lossy(&resp.body).contains("peer_key_pem"));
         assert!(!bundle.ca_cert_pem.is_empty());
         assert_eq!(bundle.lighthouses.len(), 1);
         // The bundle advertises the lighthouse's PUBLIC addr — the
@@ -606,6 +639,39 @@ mod tests {
         // Single-use: a replay of the same body is now refused 401.
         let replay = handle_enroll(&MockBackend, &db_path, root, &paths, roster(), &body);
         assert_eq!(replay.status, 401, "bearer is single-use");
+    }
+
+    #[test]
+    fn handle_enroll_delivers_lighthouse_secrets_only_in_authenticated_envelope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let paths = lighthouse_fixture(root);
+        let db_path = root.join("mackesd.db");
+        let (bearer, body) = lighthouse_enroll_body(root, "peer:new-lighthouse");
+
+        let response = handle_enroll(&MockBackend, &db_path, root, &paths, roster(), &body);
+        assert_eq!(
+            response.status, 200,
+            "lighthouse bearer signs over TLS path"
+        );
+        let raw = String::from_utf8(response.body.clone()).expect("utf8 response");
+        assert!(raw.contains("lighthouse_secrets"));
+        assert!(raw.contains("ca_key_pem"));
+        assert!(!raw.contains("peer_key_pem"));
+
+        let parsed: crate::ca::bundle::AuthenticatedEnrollmentResponse =
+            serde_json::from_slice(&response.body).expect("authenticated envelope");
+        assert!(
+            parsed.lighthouse_secrets.is_some(),
+            "only the authenticated response envelope carries lighthouse secrets"
+        );
+        let public_wire = serde_json::to_string(&parsed.bundle).expect("public bundle");
+        assert!(!public_wire.contains("lighthouse_secrets"));
+        assert!(!public_wire.contains("ca_key_pem"));
+        assert!(
+            !crate::bearer_ledger::is_pending(root, &bearer),
+            "successful authenticated delivery consumes the bearer"
+        );
     }
 
     #[test]

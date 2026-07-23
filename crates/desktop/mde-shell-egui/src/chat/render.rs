@@ -19,7 +19,7 @@
 //! parent) because the shell chrome + integration tests reach them by name.
 
 use super::*;
-use crate::dock::icon_texture;
+use crate::surfaces::icon_texture;
 use mde_theme::brand::icons::IconId;
 
 pub(super) const CHAT_UNMUTE_ICON: IconId = IconId::Notifications;

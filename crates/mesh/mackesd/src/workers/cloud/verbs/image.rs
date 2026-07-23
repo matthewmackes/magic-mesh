@@ -30,7 +30,7 @@ use mackes_mesh_types::cloud::{CloudReply, DeliveryType, ImageRow};
 
 use crate::image_catalog::{images_dir, load_manifests, record_manifest, ImageKind, ImageManifest};
 
-use super::super::{gate, CloudWorker};
+use super::super::{path_key, CloudWorker};
 
 /// The disk builder binary — bootc image-mode → osbuild bridge. Produces the golden
 /// qcow2 from a bootc container image (the same tool `packaging/bootc/build-image.sh`
@@ -109,8 +109,8 @@ pub(crate) fn handle(w: &CloudWorker, verb_name: &str, raw: &str) -> CloudReply 
         .unwrap_or("build")
     {
         "list" => list(w, verb_name),
-        "build" => build(w, verb_name, &body),
-        "promote" => promote(w, verb_name, &body),
+        "build" => build(w, verb_name, &body, raw),
+        "promote" => promote(w, verb_name, &body, raw),
         other => reject(
             verb_name,
             format!("unknown image-build action `{other}` (expected build|list|promote)"),
@@ -131,7 +131,7 @@ fn list(w: &CloudWorker, verb_name: &str) -> CloudReply {
 
 /// `build` — shell the disk builder, verify + hash the artifact, and record it into
 /// the Syncthing image store (manifest + SHA256 sidecar). Armed-gated.
-fn build(w: &CloudWorker, verb_name: &str, body: &ImageBuildBody) -> CloudReply {
+fn build(w: &CloudWorker, verb_name: &str, body: &ImageBuildBody, raw: &str) -> CloudReply {
     // A container workload has no golden VM disk — it ships via container-deploy (U7).
     if matches!(body.delivery_type, Some(DeliveryType::ServiceContainer)) {
         return gated(
@@ -147,9 +147,22 @@ fn build(w: &CloudWorker, verb_name: &str, body: &ImageBuildBody) -> CloudReply 
         );
     };
     let version = body.resolved_version();
+    if let Err(e) = path_key::segment("image name", &name) {
+        return reject(verb_name, e);
+    }
+    if let Err(e) = path_key::segment("image version", &version) {
+        return reject(verb_name, e);
+    }
 
     // The armed-token gate — a build without a valid capability stages nothing.
-    let verdict = verify(w, verb_name, &body.node, body.armed_token.as_deref());
+    let target = format!("build:{name}@{version}");
+    let verdict = w.consume_armed_token(
+        body.armed_token.as_deref(),
+        verb_name,
+        body.node.trim(),
+        &target,
+        raw,
+    );
     if !verdict.is_valid() {
         return gated(
             verb_name,
@@ -246,7 +259,7 @@ fn build(w: &CloudWorker, verb_name: &str, body: &ImageBuildBody) -> CloudReply 
 /// `promote` — re-verify a version's SHA256 against its recorded sidecar, then mark
 /// it the active base. Armed-gated; a mismatch (a corrupted/tampered replicated
 /// image) refuses the promotion.
-fn promote(w: &CloudWorker, verb_name: &str, body: &ImageBuildBody) -> CloudReply {
+fn promote(w: &CloudWorker, verb_name: &str, body: &ImageBuildBody, raw: &str) -> CloudReply {
     let Some(name) = body.resolved_name() else {
         return reject(
             verb_name,
@@ -264,8 +277,21 @@ fn promote(w: &CloudWorker, verb_name: &str, body: &ImageBuildBody) -> CloudRepl
             "image-build `promote` requires a `version`".to_string(),
         );
     };
+    if let Err(e) = path_key::segment("image name", &name) {
+        return reject(verb_name, e);
+    }
+    if let Err(e) = path_key::segment("image version", version) {
+        return reject(verb_name, e);
+    }
 
-    let verdict = verify(w, verb_name, &body.node, body.armed_token.as_deref());
+    let target = format!("promote:{name}@{version}");
+    let verdict = w.consume_armed_token(
+        body.armed_token.as_deref(),
+        verb_name,
+        body.node.trim(),
+        &target,
+        raw,
+    );
     if !verdict.is_valid() {
         return gated(
             verb_name,
@@ -363,6 +389,7 @@ fn load_rows(root: &Path) -> Vec<ImageRow> {
 
 /// Read the promotion marker for `name` (the active-base version), if set.
 fn read_promoted(root: &Path, name: &str) -> Option<String> {
+    path_key::segment("image name", name).ok()?;
     std::fs::read_to_string(images_dir(root).join(name).join(PROMOTED_MARKER))
         .ok()
         .map(|s| s.trim().to_string())
@@ -371,6 +398,8 @@ fn read_promoted(root: &Path, name: &str) -> Option<String> {
 
 /// Read the recorded SHA256 sidecar for `name@version`, if present.
 fn read_sha(root: &Path, name: &str, version: &str) -> Option<String> {
+    path_key::segment("image name", name).ok()?;
+    path_key::segment("image version", version).ok()?;
     std::fs::read_to_string(images_dir(root).join(name).join(version).join(SHA_SIDECAR))
         .ok()
         .map(|s| s.trim().to_string())
@@ -440,17 +469,6 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 // ─────────────────────────── small shared helpers ───────────────────────────
-
-/// The armed-token verdict for `(verb, node)` under this worker's signer.
-fn verify(w: &CloudWorker, verb_name: &str, node: &str, token: Option<&str>) -> gate::TokenVerdict {
-    gate::verify_token(
-        token,
-        verb_name,
-        node.trim(),
-        super::super::now_ms(),
-        w.signer.as_ref(),
-    )
-}
 
 fn now_ms_u64() -> u64 {
     u64::try_from(super::super::now_ms()).unwrap_or(0)
@@ -536,15 +554,46 @@ mod tests {
             .with_bus_root(None)
     }
 
-    fn token(verb: &str) -> String {
+    fn token(body: &str, action: &str, name: &str, version: &str) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_NONCE: AtomicU64 = AtomicU64::new(1);
+        let nonce = format!(
+            "nonce-image-{}-{}",
+            std::process::id(),
+            NEXT_NONCE.fetch_add(1, Ordering::Relaxed)
+        );
         ArmedToken::mint(
             &signer(),
-            "nonce-12345678",
-            now_ms() + 3_600_000,
-            verb,
+            &nonce,
+            now_ms().saturating_add(super::super::super::MAX_AUTH_TTL_MS),
+            "image-build",
             "me",
+            &format!("{action}:{name}@{version}"),
+            &mackes_mesh_types::cloud::cloud_request_digest(body).unwrap(),
         )
         .encode()
+    }
+
+    fn armed_request(mut body: serde_json::Value) -> String {
+        let action = body["action"].as_str().unwrap_or("build").to_string();
+        let name = body["name"]
+            .as_str()
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                body["delivery_type"]
+                    .as_str()
+                    .map(|dtype| format!("{dtype}-golden"))
+            })
+            .unwrap_or_default();
+        let version = body["version"]
+            .as_str()
+            .filter(|version| !version.is_empty())
+            .unwrap_or("latest")
+            .to_string();
+        let raw = body.to_string();
+        body["armed_token"] = serde_json::Value::String(token(&raw, &action, &name, &version));
+        body.to_string()
     }
 
     #[test]
@@ -552,10 +601,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let runner = Arc::new(FakeRunner::default());
         let w = armed_worker(tmp.path(), runner.clone());
-        let raw = format!(
-            r#"{{"node":"me","action":"build","delivery_type":"desktop_vm","version":"1.0","armed_token":"{}"}}"#,
-            token("image-build")
-        );
+        let raw = armed_request(serde_json::json!({
+            "node": "me", "action": "build", "delivery_type": "desktop_vm", "version": "1.0"
+        }));
         let reply = w.handle("image-build", &raw);
         assert!(reply.ok, "gated:{:?} err:{:?}", reply.gated, reply.error);
         let rows = reply.images.expect("images");
@@ -603,10 +651,9 @@ mod tests {
             ..Default::default()
         });
         let w = armed_worker(tmp.path(), runner);
-        let raw = format!(
-            r#"{{"node":"me","action":"build","name":"gold","version":"1","armed_token":"{}"}}"#,
-            token("image-build")
-        );
+        let raw = armed_request(serde_json::json!({
+            "node": "me", "action": "build", "name": "gold", "version": "1"
+        }));
         let reply = w.handle("image-build", &raw);
         assert!(!reply.ok);
         assert!(reply.gated.unwrap().contains("unavailable"));
@@ -621,10 +668,9 @@ mod tests {
             ..Default::default()
         });
         let w = armed_worker(tmp.path(), runner);
-        let raw = format!(
-            r#"{{"node":"me","action":"build","name":"gold","version":"1","armed_token":"{}"}}"#,
-            token("image-build")
-        );
+        let raw = armed_request(serde_json::json!({
+            "node": "me", "action": "build", "name": "gold", "version": "1"
+        }));
         let reply = w.handle("image-build", &raw);
         assert!(!reply.ok);
         assert!(reply.error.unwrap().contains("failed"));
@@ -639,10 +685,9 @@ mod tests {
             ..Default::default()
         });
         let w = armed_worker(tmp.path(), runner);
-        let raw = format!(
-            r#"{{"node":"me","action":"build","name":"gold","version":"1","armed_token":"{}"}}"#,
-            token("image-build")
-        );
+        let raw = armed_request(serde_json::json!({
+            "node": "me", "action": "build", "name": "gold", "version": "1"
+        }));
         let reply = w.handle("image-build", &raw);
         assert!(!reply.ok);
         assert!(reply.error.unwrap().contains("no image artifact"));
@@ -652,13 +697,37 @@ mod tests {
     fn service_container_build_is_routed_to_container_deploy() {
         let tmp = tempfile::tempdir().unwrap();
         let w = armed_worker(tmp.path(), Arc::new(FakeRunner::default()));
-        let raw = format!(
-            r#"{{"node":"me","action":"build","delivery_type":"service_container","armed_token":"{}"}}"#,
-            token("image-build")
-        );
+        let raw = armed_request(serde_json::json!({
+            "node": "me", "action": "build", "delivery_type": "service_container"
+        }));
         let reply = w.handle("image-build", &raw);
         assert!(!reply.ok);
         assert!(reply.gated.unwrap().contains("container-deploy"));
+    }
+
+    #[test]
+    fn build_and_promote_reject_path_keys_before_touching_the_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        let absolute = outside.to_string_lossy();
+        let w = armed_worker(tmp.path(), Arc::new(FakeRunner::default()));
+
+        for raw in [
+            armed_request(serde_json::json!({
+                "node": "me", "action": "build", "name": absolute.as_ref(), "version": "1"
+            })),
+            armed_request(serde_json::json!({
+                "node": "me", "action": "build", "name": "gold", "version": "../escape"
+            })),
+            armed_request(serde_json::json!({
+                "node": "me", "action": "promote", "name": "gold", "version": "/tmp/escape"
+            })),
+        ] {
+            let reply = w.handle("image-build", &raw);
+            assert!(!reply.ok);
+            assert!(reply.error.unwrap().contains("path-safe"));
+        }
+        assert!(!outside.exists());
     }
 
     #[test]
@@ -668,29 +737,28 @@ mod tests {
         let w = armed_worker(tmp.path(), runner);
         // Build two versions of the same golden image.
         for v in ["1.0", "2.0"] {
-            let raw = format!(
-                r#"{{"node":"me","action":"build","name":"gold","version":"{v}","armed_token":"{}"}}"#,
-                token("image-build")
-            );
+            let raw = armed_request(serde_json::json!({
+                "node": "me", "action": "build", "name": "gold", "version": v
+            }));
             assert!(w.handle("image-build", &raw).ok);
         }
-        // list (a read) needs no token.
+        // list needs no token, but it is still scoped to the selected node so
+        // only that node's replicated image store answers.
         let rows = w
-            .handle("image-build", r#"{"action":"list"}"#)
+            .handle("image-build", r#"{"node":"me","action":"list"}"#)
             .images
             .expect("roster");
         assert_eq!(rows.len(), 1, "one row per image name");
         assert!(!rows[0].promoted, "nothing promoted yet");
 
         // Promote 1.0 → list now reflects that version + the promoted flag.
-        let raw = format!(
-            r#"{{"node":"me","action":"promote","name":"gold","version":"1.0","armed_token":"{}"}}"#,
-            token("image-build")
-        );
+        let raw = armed_request(serde_json::json!({
+            "node": "me", "action": "promote", "name": "gold", "version": "1.0"
+        }));
         let pr = w.handle("image-build", &raw);
         assert!(pr.ok, "gated:{:?} err:{:?}", pr.gated, pr.error);
         let rows = w
-            .handle("image-build", r#"{"action":"list"}"#)
+            .handle("image-build", r#"{"node":"me","action":"list"}"#)
             .images
             .unwrap();
         assert!(rows[0].promoted, "the promoted version is flagged");
@@ -700,19 +768,17 @@ mod tests {
     fn promote_refuses_on_a_sha256_mismatch() {
         let tmp = tempfile::tempdir().unwrap();
         let w = armed_worker(tmp.path(), Arc::new(FakeRunner::default()));
-        let raw = format!(
-            r#"{{"node":"me","action":"build","name":"gold","version":"1.0","armed_token":"{}"}}"#,
-            token("image-build")
-        );
+        let raw = armed_request(serde_json::json!({
+            "node": "me", "action": "build", "name": "gold", "version": "1.0"
+        }));
         assert!(w.handle("image-build", &raw).ok);
         // Corrupt the replicated artifact after the recorded hash.
         let artifact =
             find_artifact(&images_dir(tmp.path()).join("gold").join("1.0")).expect("artifact");
         std::fs::write(&artifact, b"tampered-bytes").unwrap();
-        let raw = format!(
-            r#"{{"node":"me","action":"promote","name":"gold","version":"1.0","armed_token":"{}"}}"#,
-            token("image-build")
-        );
+        let raw = armed_request(serde_json::json!({
+            "node": "me", "action": "promote", "name": "gold", "version": "1.0"
+        }));
         let reply = w.handle("image-build", &raw);
         assert!(!reply.ok, "a mismatched image must not promote");
         assert!(reply.error.unwrap().contains("mismatch"));
@@ -722,7 +788,7 @@ mod tests {
     fn an_unknown_action_is_an_honest_rejection() {
         let tmp = tempfile::tempdir().unwrap();
         let w = armed_worker(tmp.path(), Arc::new(FakeRunner::default()));
-        let reply = w.handle("image-build", r#"{"action":"frobnicate"}"#);
+        let reply = w.handle("image-build", r#"{"node":"me","action":"frobnicate"}"#);
         assert!(!reply.ok);
         assert!(reply.error.unwrap().contains("unknown image-build action"));
     }

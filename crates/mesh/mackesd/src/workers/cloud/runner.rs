@@ -123,9 +123,6 @@ pub trait CloudRunner: Send + Sync {
     /// Configure via Ansible. `apply` ⇒ `ansible-playbook`; else `--check` (staged).
     fn configure(&self, apply: bool) -> CloudRunOutcome;
 
-    /// Destroy via OpenTofu. `apply` ⇒ `tofu destroy`; else `tofu plan -destroy`.
-    fn destroy(&self, apply: bool) -> CloudRunOutcome;
-
     /// A per-instance lifecycle op via `virsh`. `apply` ⇒ the real op; else staged.
     fn lifecycle(&self, action: LifecycleAction, instance: &str, apply: bool) -> CloudRunOutcome;
 
@@ -379,30 +376,6 @@ impl CloudRunner for ShellCloudRunner {
         )
     }
 
-    fn destroy(&self, apply: bool) -> CloudRunOutcome {
-        let chdir = self.tofu_chdir();
-        let args: Vec<&str> = if apply {
-            vec![
-                &chdir,
-                "destroy",
-                "-auto-approve",
-                "-input=false",
-                "-no-color",
-            ]
-        } else {
-            vec![&chdir, "plan", "-destroy", "-input=false", "-no-color"]
-        };
-        Self::outcome(
-            Self::run("tofu", &args),
-            apply,
-            if apply {
-                "tofu destroy"
-            } else {
-                "tofu plan -destroy (staged)"
-            },
-        )
-    }
-
     fn configure(&self, apply: bool) -> CloudRunOutcome {
         let playbook = self.ansible_dir.join("playbooks").join("site.yml");
         let playbook_str = playbook.display().to_string();
@@ -621,10 +594,6 @@ pub(crate) mod fake {
         fn configure(&self, apply: bool) -> CloudRunOutcome {
             self.record("configure", apply);
             CloudRunOutcome::ok("ok=3 changed=1", apply)
-        }
-        fn destroy(&self, apply: bool) -> CloudRunOutcome {
-            self.record("destroy", apply);
-            CloudRunOutcome::ok("1 to destroy", apply)
         }
         fn lifecycle(
             &self,

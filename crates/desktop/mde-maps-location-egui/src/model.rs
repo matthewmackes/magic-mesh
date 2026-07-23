@@ -3,12 +3,17 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-/// Poll cadence for the live `state/vehicle` mirror (PERF-5). The shell calls
+/// Poll cadence for retained live Bus mirrors (PERF-5). The shell calls
 /// [`MapsLocationSurface::refresh_from_bus`] every frame (~60 Hz); re-reading the
-/// Bus spool off disk that often is pure waste for a latest-wins mirror the
-/// gateway only updates ~1 Hz. Gating to 2 Hz keeps the fold live while cutting
-/// ~60 disk reads/sec to ~2 — the cockpit keeps drawing the cached fold between.
-const VEHICLE_REFRESH: Duration = Duration::from_millis(500);
+/// Bus spool off disk that often is pure waste for latest-wins mirrors. Gating
+/// to 2 Hz keeps the vehicle fold live and cheaply picks up slower overlay feeds.
+const BUS_REFRESH: Duration = Duration::from_millis(500);
+
+/// Maximum age of a vehicle-gateway mirror that may still drive instrument or
+/// safety state. The MG90 adapter normally publishes at ~1 Hz; five missed
+/// updates is long enough to tolerate jitter without letting a retained Bus
+/// snapshot impersonate a live vehicle indefinitely.
+const VEHICLE_TELEMETRY_STALE_AFTER_S: f32 = 5.0;
 
 /// The simulator-active gap note seeded by [`MapsLocationSurface::simulated`].
 ///
@@ -23,8 +28,7 @@ const SIMULATED_MG90_GAP_NOTE: &str =
 /// Seeded by [`MapsLocationSurface::live`] and retracted by
 /// [`MapsLocationSurface::refresh_from_vehicle`] the moment a real
 /// `state/vehicle/<node>` mirror folds in.
-const AWAITING_MIRROR_GAP_NOTE: &str =
-    "Awaiting live `state/vehicle` mirror — no MG90 vehicle-gateway adapter has published for this node yet.";
+const AWAITING_MIRROR_GAP_NOTE: &str = "Awaiting live `state/vehicle` mirror — no MG90 vehicle-gateway adapter has published for this node yet.";
 
 /// Workspace tabs in the order requested by the product directive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -191,10 +195,9 @@ pub struct MapsLocationSurface {
     pub vault: EncryptedVaultState,
     /// Known real-hardware gaps for this vertical slice.
     pub real_hardware_gaps: Vec<String>,
-    /// Throttle stamp for the per-frame `refresh_from_bus` Bus read (PERF-5). `None`
-    /// until the first poll; then the wall-clock of the last mirror read. Not part
-    /// of the surface's visible state.
-    last_vehicle_poll: Option<Instant>,
+    /// Throttle stamp for the per-frame `refresh_from_bus` Bus reads (PERF-5).
+    /// Covers both the vehicle and overlay latest-wins mirrors.
+    last_bus_poll: Option<Instant>,
 }
 
 impl MapsLocationSurface {
@@ -256,7 +259,7 @@ impl MapsLocationSurface {
                 "CAN/OBD, GPIO, serial, firmware upload, and factory reset workflows are UI/model complete but not wired to hardware."
                     .to_string(),
             ],
-            last_vehicle_poll: None,
+            last_bus_poll: None,
         }
     }
 
@@ -304,7 +307,7 @@ impl MapsLocationSurface {
                 "Traffic, weather, and satellite providers expose graceful unavailable states until configured."
                     .to_string(),
             ],
-            last_vehicle_poll: None,
+            last_bus_poll: None,
         }
     }
 
@@ -551,8 +554,8 @@ impl MapsLocationSurface {
     pub fn moving(&self) -> bool {
         self.locations
             .primary_sample()
-            .is_some_and(LocationSample::moving)
-            || self.vehicle.telemetry.moving
+            .is_some_and(|sample| !sample.stale() && sample.moving())
+            || (self.vehicle.telemetry.is_live() && self.vehicle.telemetry.moving)
             || self.mg90.ignition_on
     }
 
@@ -584,6 +587,8 @@ impl MapsLocationSurface {
     /// `has_fix` is respected (no lock still shows the HUD's "Acquiring GPS"
     /// state), but the source LABEL is MG90 the moment a live gateway exists.
     pub fn refresh_from_vehicle(&mut self, v: &mackes_mesh_types::vehicle::VehicleState) {
+        let mirror_age_s = mirror_age_s(v.published_at_ms);
+
         // WanStatus -> Mg90Status.
         let status = &mut self.mg90.status;
         status.active_wan = v.wan.active_wan.clone();
@@ -628,7 +633,10 @@ impl MapsLocationSurface {
                 altitude_m: gps.altitude_m,
                 satellites: Some(gps.satellites),
                 update_rate_hz: gps.update_rate_hz,
-                update_age_s: gps.age_s,
+                // A retained mirror cannot make an old GNSS sample look young:
+                // the effective sample age is at least the mirror's wall-clock
+                // age, even when the gateway's last payload said `age_s = 0`.
+                update_age_s: gps.age_s.max(mirror_age_s),
             };
             if v.online {
                 source.status = SourceStatus::Connected;
@@ -672,7 +680,7 @@ impl MapsLocationSurface {
         } else {
             "vehicle-gateway mirror reports the adapter offline".to_string()
         };
-        telemetry.last_update_age_s = mirror_age_s(v.published_at_ms);
+        telemetry.last_update_age_s = mirror_age_s;
 
         // Retract the seed's "no mirror yet" / "simulator is active" gaps now a
         // live mirror exists and fold the adapter's own honest gap report in
@@ -697,8 +705,8 @@ impl MapsLocationSurface {
         }
     }
 
-    /// Read the retained `state/vehicle/<node>` mirror off the Bus (fail-soft,
-    /// honest off-mesh no-op) and fold it in via [`Self::refresh_from_vehicle`].
+    /// Read retained vehicle + overlay mirrors off the Bus (fail-soft, honest
+    /// off-mesh no-op) and fold them into the cockpit.
     ///
     /// When no mirror is retained yet — no spool, no adapter worker running, or
     /// the topic is simply empty — this leaves the simulated seed exactly as it
@@ -712,15 +720,109 @@ impl MapsLocationSurface {
         // frequent read is pure waste — the cockpit keeps drawing the last fold
         // between polls (latest-wins, byte-identical result).
         if self
-            .last_vehicle_poll
-            .is_some_and(|t| t.elapsed() < VEHICLE_REFRESH)
+            .last_bus_poll
+            .is_some_and(|t| t.elapsed() < BUS_REFRESH)
         {
             return;
         }
-        self.last_vehicle_poll = Some(Instant::now());
+        self.last_bus_poll = Some(Instant::now());
         if let Some(mirror) = read_vehicle_mirror(node) {
             self.refresh_from_vehicle(&mirror);
         }
+        if let Some(snapshot) = read_earthquake_mirror(node) {
+            self.refresh_from_earthquakes(snapshot);
+        }
+        if let Some(snapshot) = read_nws_alert_mirror(node) {
+            self.refresh_from_nws_alerts(snapshot);
+        }
+        if let Some(snapshot) = read_aircraft_mirror(node) {
+            self.refresh_from_aircraft(snapshot);
+        }
+        if let Some(snapshot) = read_transit_mirror(node) {
+            self.refresh_from_transit(snapshot);
+        }
+        if let Some(snapshot) = read_nws_forecast_mirror(node) {
+            self.refresh_from_nws_forecast(snapshot);
+        }
+        if let Some(snapshot) = read_caltrans_camera_mirror(node) {
+            self.refresh_from_caltrans_cameras(snapshot);
+        }
+        if let Some(snapshot) = read_iem_radar_mirror(node) {
+            self.refresh_from_iem_radar(snapshot);
+        }
+        if let Some(snapshot) = read_wildfire_mirror(node) {
+            self.refresh_from_wildfire(snapshot);
+        }
+        if let Some(snapshot) = read_traffic_mirror(node) {
+            self.refresh_from_traffic(snapshot);
+        }
+    }
+
+    /// Fold a complete USGS snapshot. Whole-snapshot replacement is deliberate:
+    /// it retracts upstream-deleted events and applies revisions by id/update.
+    pub fn refresh_from_earthquakes(
+        &mut self,
+        snapshot: mackes_mesh_types::earthquake::EarthquakeSnapshot,
+    ) {
+        self.map.earthquakes.fold(snapshot);
+    }
+
+    /// Fold a complete point-scoped NWS active-alert set.
+    pub fn refresh_from_nws_alerts(
+        &mut self,
+        snapshot: mackes_mesh_types::nws_alert::NwsAlertSnapshot,
+    ) {
+        self.map.nws_alerts.fold(snapshot);
+    }
+
+    /// Fold a complete vehicle-scoped adsb.lol low-altitude aircraft set.
+    pub fn refresh_from_aircraft(
+        &mut self,
+        snapshot: mackes_mesh_types::aircraft::AircraftSnapshot,
+    ) {
+        self.map.aircraft.fold(snapshot);
+    }
+
+    /// Fold a complete vehicle-scoped MBTA GTFS-Realtime set.
+    pub fn refresh_from_transit(&mut self, snapshot: mackes_mesh_types::transit::TransitSnapshot) {
+        self.map.transit.fold(snapshot);
+    }
+
+    /// Fold a complete vehicle-scoped NWS hourly drive-ahead forecast.
+    pub fn refresh_from_nws_forecast(
+        &mut self,
+        snapshot: mackes_mesh_types::nws_forecast::NwsForecastSnapshot,
+    ) {
+        self.map.nws_forecast.fold(snapshot);
+    }
+
+    /// Fold a complete vehicle-scoped Caltrans CWWP2 camera set.
+    pub fn refresh_from_caltrans_cameras(
+        &mut self,
+        snapshot: mackes_mesh_types::caltrans_camera::CaltransCameraSnapshot,
+    ) {
+        self.map.caltrans_cameras.fold(snapshot);
+    }
+
+    /// Fold a complete local-tile IEM/NWS NEXRAD animation.
+    pub fn refresh_from_iem_radar(
+        &mut self,
+        snapshot: mackes_mesh_types::iem_radar::IemRadarSnapshot,
+    ) {
+        self.map.iem_radar.fold(snapshot);
+    }
+
+    /// Fold a complete vehicle-centred NIFC WFIGS perimeter set.
+    pub fn refresh_from_wildfire(
+        &mut self,
+        snapshot: mackes_mesh_types::wildfire::WildfireSnapshot,
+    ) {
+        self.map.wildfire.fold(snapshot);
+    }
+
+    /// Fold a complete vehicle-centred NCDOT current-event set.
+    pub fn refresh_from_traffic(&mut self, snapshot: mackes_mesh_types::traffic::TrafficSnapshot) {
+        self.map.traffic_events.fold(snapshot);
     }
 
     /// The Auto Mode home's **Vehicle**-tile glance line: a live telematics
@@ -730,7 +832,9 @@ impl MapsLocationSurface {
     /// a driver glances for.
     #[must_use]
     pub fn vehicle_glance(&self) -> Option<String> {
-        if self.locations.primary != LocationSourceKind::Mg90Gnss {
+        if self.locations.primary != LocationSourceKind::Mg90Gnss
+            || !self.vehicle.telemetry.is_live()
+        {
             return None;
         }
         let t = &self.vehicle.telemetry;
@@ -791,6 +895,96 @@ fn read_vehicle_mirror(node: &str) -> Option<mackes_mesh_types::vehicle::Vehicle
     let root = mde_bus::client_data_dir()?;
     let persist = mde_bus::persist::Persist::open(root).ok()?;
     let topic = mackes_mesh_types::vehicle::vehicle_state_topic(node);
+    let body = persist.read_latest(&topic).ok().flatten()?.body?;
+    serde_json::from_str(&body).ok()
+}
+
+/// Decode the retained keyless-USGS overlay snapshot, fail-soft when the adapter
+/// is disabled, the Bus is absent, or the latest payload is malformed.
+fn read_earthquake_mirror(node: &str) -> Option<mackes_mesh_types::earthquake::EarthquakeSnapshot> {
+    let root = mde_bus::client_data_dir()?;
+    let persist = mde_bus::persist::Persist::open(root).ok()?;
+    let topic = mackes_mesh_types::earthquake::earthquake_state_topic(node);
+    let body = persist.read_latest(&topic).ok().flatten()?.body?;
+    serde_json::from_str(&body).ok()
+}
+
+/// Decode the retained NWS active-alert snapshot, fail-soft when the opt-in
+/// adapter has no fresh vehicle fix or has not published yet.
+fn read_nws_alert_mirror(node: &str) -> Option<mackes_mesh_types::nws_alert::NwsAlertSnapshot> {
+    let root = mde_bus::client_data_dir()?;
+    let persist = mde_bus::persist::Persist::open(root).ok()?;
+    let topic = mackes_mesh_types::nws_alert::nws_alert_state_topic(node);
+    let body = persist.read_latest(&topic).ok().flatten()?.body?;
+    serde_json::from_str(&body).ok()
+}
+
+/// Decode the retained adsb.lol aircraft snapshot, fail-soft when the adapter
+/// is disabled, lacks a qualified vehicle fix, or has not published yet.
+fn read_aircraft_mirror(node: &str) -> Option<mackes_mesh_types::aircraft::AircraftSnapshot> {
+    let root = mde_bus::client_data_dir()?;
+    let persist = mde_bus::persist::Persist::open(root).ok()?;
+    let topic = mackes_mesh_types::aircraft::aircraft_state_topic(node);
+    let body = persist.read_latest(&topic).ok().flatten()?.body?;
+    serde_json::from_str(&body).ok()
+}
+
+/// Decode the retained MBTA transit snapshot, fail-soft when disabled/absent.
+fn read_transit_mirror(node: &str) -> Option<mackes_mesh_types::transit::TransitSnapshot> {
+    let root = mde_bus::client_data_dir()?;
+    let persist = mde_bus::persist::Persist::open(root).ok()?;
+    let topic = mackes_mesh_types::transit::transit_state_topic(node);
+    let body = persist.read_latest(&topic).ok().flatten()?.body?;
+    serde_json::from_str(&body).ok()
+}
+
+/// Decode the retained NWS hourly snapshot, including explicit no-fix state.
+fn read_nws_forecast_mirror(
+    node: &str,
+) -> Option<mackes_mesh_types::nws_forecast::NwsForecastSnapshot> {
+    let root = mde_bus::client_data_dir()?;
+    let persist = mde_bus::persist::Persist::open(root).ok()?;
+    let topic = mackes_mesh_types::nws_forecast::nws_forecast_state_topic(node);
+    let body = persist.read_latest(&topic).ok().flatten()?.body?;
+    serde_json::from_str(&body).ok()
+}
+
+/// Decode the retained Caltrans camera snapshot, fail-soft when disabled/absent.
+fn read_caltrans_camera_mirror(
+    node: &str,
+) -> Option<mackes_mesh_types::caltrans_camera::CaltransCameraSnapshot> {
+    let root = mde_bus::client_data_dir()?;
+    let persist = mde_bus::persist::Persist::open(root).ok()?;
+    let topic = mackes_mesh_types::caltrans_camera::caltrans_camera_state_topic(node);
+    let body = persist.read_latest(&topic).ok().flatten()?.body?;
+    serde_json::from_str(&body).ok()
+}
+
+/// Decode the retained IEM/NWS NEXRAD snapshot, fail-soft when disabled/absent.
+fn read_iem_radar_mirror(node: &str) -> Option<mackes_mesh_types::iem_radar::IemRadarSnapshot> {
+    let root = mde_bus::client_data_dir()?;
+    let persist = mde_bus::persist::Persist::open(root).ok()?;
+    let topic = mackes_mesh_types::iem_radar::iem_radar_state_topic(node);
+    let body = persist.read_latest(&topic).ok().flatten()?.body?;
+    serde_json::from_str(&body).ok()
+}
+
+/// Decode the retained keyless NIFC WFIGS perimeter snapshot, fail-soft when
+/// the opt-in adapter is disabled, has no fresh fix, or has not published yet.
+fn read_wildfire_mirror(node: &str) -> Option<mackes_mesh_types::wildfire::WildfireSnapshot> {
+    let root = mde_bus::client_data_dir()?;
+    let persist = mde_bus::persist::Persist::open(root).ok()?;
+    let topic = mackes_mesh_types::wildfire::wildfire_state_topic(node);
+    let body = persist.read_latest(&topic).ok().flatten()?.body?;
+    serde_json::from_str(&body).ok()
+}
+
+/// Decode the retained keyless NCDOT traffic snapshot, fail-soft outside North
+/// Carolina, while disabled, or before the first publish.
+fn read_traffic_mirror(node: &str) -> Option<mackes_mesh_types::traffic::TrafficSnapshot> {
+    let root = mde_bus::client_data_dir()?;
+    let persist = mde_bus::persist::Persist::open(root).ok()?;
+    let topic = mackes_mesh_types::traffic::traffic_state_topic(node);
     let body = persist.read_latest(&topic).ok().flatten()?.body?;
     serde_json::from_str(&body).ok()
 }
@@ -1020,6 +1214,42 @@ pub struct MapViewState {
     pub dead_zone_overlay: bool,
     /// Whether GNSS quality overlay is visible.
     pub gnss_overlay: bool,
+    /// Whether the ambient USGS earthquake layer is visible. Off by default.
+    pub earthquake_overlay: bool,
+    /// Latest normalized USGS earthquake snapshot.
+    pub earthquakes: crate::earthquake::EarthquakeLayerState,
+    /// Whether the safety-relevant NWS active-alert layer is visible.
+    pub nws_alert_overlay: bool,
+    /// Latest point-scoped NWS active-alert snapshot.
+    pub nws_alerts: crate::nws_alert::NwsAlertLayerState,
+    /// Whether the driver-relevant low-altitude aircraft layer is visible.
+    pub aircraft_overlay: bool,
+    /// Latest point-scoped adsb.lol aircraft snapshot and label preference.
+    pub aircraft: crate::aircraft::AircraftLayerState,
+    /// Whether nearby MBTA GTFS-Realtime vehicles are visible.
+    pub transit_overlay: bool,
+    /// Latest point-filtered MBTA vehicle set and label preference.
+    pub transit: crate::transit::TransitLayerState,
+    /// Whether NWS hourly current/drive-ahead guidance is visible.
+    pub nws_forecast_overlay: bool,
+    /// Latest current/drive-ahead NWS hourly samples.
+    pub nws_forecast: crate::nws_forecast::NwsForecastLayerState,
+    /// Whether nearby Caltrans CWWP2 traffic cameras are visible.
+    pub caltrans_camera_overlay: bool,
+    /// Latest vehicle-scoped Caltrans camera set and bounded current stills.
+    pub caltrans_cameras: crate::caltrans_camera::CaltransCameraLayerState,
+    /// Whether the safety-relevant IEM/NWS NEXRAD layer is visible.
+    pub iem_radar_overlay: bool,
+    /// Latest exact producer-timed local radar animation.
+    pub iem_radar: crate::iem_radar::IemRadarLayerState,
+    /// Whether the safety-relevant NIFC WFIGS wildfire perimeters are visible.
+    pub wildfire_overlay: bool,
+    /// Latest vehicle-centred current wildfire perimeter set.
+    pub wildfire: crate::wildfire::WildfireLayerState,
+    /// Whether the regional NCDOT TIMS traffic-event layer is visible.
+    pub traffic_event_overlay: bool,
+    /// Latest vehicle-centred current NCDOT event set.
+    pub traffic_events: crate::traffic::TrafficLayerState,
     /// Attribution string shown on every map view.
     pub attribution: String,
 }
@@ -1044,6 +1274,25 @@ impl MapViewState {
             weather_overlay: false,
             dead_zone_overlay: true,
             gnss_overlay: true,
+            earthquake_overlay: false,
+            earthquakes: crate::earthquake::EarthquakeLayerState::default(),
+            // Safety layers default on in Drive; no-data remains explicitly badged.
+            nws_alert_overlay: true,
+            nws_alerts: crate::nws_alert::NwsAlertLayerState::default(),
+            aircraft_overlay: false,
+            aircraft: crate::aircraft::AircraftLayerState::default(),
+            transit_overlay: false,
+            transit: crate::transit::TransitLayerState::default(),
+            nws_forecast_overlay: false,
+            nws_forecast: crate::nws_forecast::NwsForecastLayerState::default(),
+            caltrans_camera_overlay: false,
+            caltrans_cameras: crate::caltrans_camera::CaltransCameraLayerState::default(),
+            iem_radar_overlay: true,
+            iem_radar: crate::iem_radar::IemRadarLayerState::default(),
+            wildfire_overlay: true,
+            wildfire: crate::wildfire::WildfireLayerState::default(),
+            traffic_event_overlay: false,
+            traffic_events: crate::traffic::TrafficLayerState::default(),
             attribution: if region_installed {
                 "OpenStreetMap contributors | local offline package".to_string()
             } else {
@@ -1068,9 +1317,72 @@ impl MapViewState {
             weather_overlay: true,
             dead_zone_overlay: true,
             gnss_overlay: true,
+            earthquake_overlay: false,
+            earthquakes: crate::earthquake::EarthquakeLayerState::default(),
+            nws_alert_overlay: true,
+            nws_alerts: crate::nws_alert::NwsAlertLayerState::default(),
+            aircraft_overlay: false,
+            aircraft: crate::aircraft::AircraftLayerState::default(),
+            transit_overlay: false,
+            transit: crate::transit::TransitLayerState::default(),
+            nws_forecast_overlay: false,
+            nws_forecast: crate::nws_forecast::NwsForecastLayerState::default(),
+            caltrans_camera_overlay: false,
+            caltrans_cameras: crate::caltrans_camera::CaltransCameraLayerState::default(),
+            iem_radar_overlay: true,
+            iem_radar: crate::iem_radar::IemRadarLayerState::default(),
+            wildfire_overlay: true,
+            wildfire: crate::wildfire::WildfireLayerState::default(),
+            traffic_event_overlay: false,
+            traffic_events: crate::traffic::TrafficLayerState::default(),
             attribution: "OpenStreetMap contributors | local offline package | simulated route"
                 .to_string(),
         }
+    }
+
+    /// Attribution with active live overlays appended. Each provider credit is
+    /// tied to its layer toggle even before data arrives, so a no-data/stale
+    /// state is never mistaken for an unattributed alternate source.
+    #[must_use]
+    pub fn attribution_line(&self) -> String {
+        let mut attribution = self.attribution.clone();
+        if self.earthquake_overlay {
+            attribution.push_str(" | ");
+            attribution.push_str(crate::earthquake::EarthquakeLayerState::attribution());
+        }
+        if self.nws_alert_overlay {
+            attribution.push_str(" | ");
+            attribution.push_str(crate::nws_alert::NwsAlertLayerState::attribution());
+        }
+        if self.aircraft_overlay {
+            attribution.push_str(" | ");
+            attribution.push_str(crate::aircraft::AircraftLayerState::attribution());
+        }
+        if self.transit_overlay {
+            attribution.push_str(" | ");
+            attribution.push_str(crate::transit::TransitLayerState::attribution());
+        }
+        if self.nws_forecast_overlay {
+            attribution.push_str(" | ");
+            attribution.push_str(crate::nws_forecast::NwsForecastLayerState::attribution());
+        }
+        if self.caltrans_camera_overlay {
+            attribution.push_str(" | ");
+            attribution.push_str(crate::caltrans_camera::CaltransCameraLayerState::attribution());
+        }
+        if self.iem_radar_overlay {
+            attribution.push_str(" | ");
+            attribution.push_str(crate::iem_radar::IemRadarLayerState::attribution());
+        }
+        if self.wildfire_overlay {
+            attribution.push_str(" | ");
+            attribution.push_str(crate::wildfire::WildfireLayerState::attribution());
+        }
+        if self.traffic_event_overlay {
+            attribution.push_str(" | ");
+            attribution.push_str(crate::traffic::TrafficLayerState::attribution());
+        }
+        attribution
     }
 }
 
@@ -3005,16 +3317,29 @@ pub struct VehicleTelemetry {
 }
 
 impl VehicleTelemetry {
-    /// Whether this telemetry is a LIVE gateway reading.
+    /// Whether an online vehicle-gateway mirror supplied this telemetry.
+    ///
+    /// This is deliberately source-only. Diagnostic surfaces may still show a
+    /// stale mirror's age and provenance after [`Self::is_live`] turns false.
+    #[must_use]
+    pub fn has_live_gateway_source(&self) -> bool {
+        self.confidence.starts_with("live vehicle-gateway mirror")
+    }
+
+    /// Whether this telemetry is a fresh LIVE gateway reading.
     /// [`MapsLocationSurface::refresh_from_vehicle`] stamps the confidence
     /// label `"live vehicle-gateway mirror (…)"` only when a real
     /// `state/vehicle/<node>` mirror folded in with the adapter ONLINE; every
     /// other label (awaiting-mirror seed, offline adapter, test fixture) reads
-    /// not-live. Gauges and readouts ride this so they can never present a
-    /// non-live number as a reading. PLATFORM-INTERFACES Q33.
+    /// not-live. The retained mirror must also be at most five seconds old, so
+    /// a quiet adapter cannot hold the speedometer or in-motion safety policy
+    /// active indefinitely. Gauges and readouts ride this so they can never
+    /// present a non-live number as a reading. PLATFORM-INTERFACES Q33.
     #[must_use]
     pub fn is_live(&self) -> bool {
-        self.confidence.starts_with("live vehicle-gateway mirror")
+        self.has_live_gateway_source()
+            && self.last_update_age_s.is_finite()
+            && (0.0..=VEHICLE_TELEMETRY_STALE_AFTER_S).contains(&self.last_update_age_s)
     }
 }
 
@@ -3257,6 +3582,14 @@ impl EncryptedVaultState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_now_ms() -> i64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+            .unwrap_or_default()
+    }
 
     #[test]
     fn gps_health_rule_matches_product_lock() {
@@ -3791,7 +4124,7 @@ mod tests {
             },
             telem: VehicleTelem::default(),
             gaps: Vec::new(),
-            published_at_ms: 0,
+            published_at_ms: test_now_ms(),
         };
 
         let mut state = MapsLocationSurface::simulated();
@@ -3844,6 +4177,213 @@ mod tests {
             .real_hardware_gaps
             .iter()
             .any(|g| g == SIMULATED_MG90_GAP_NOTE));
+    }
+
+    #[test]
+    fn earthquake_fold_replaces_snapshot_and_toggle_adds_attribution() {
+        use mackes_mesh_types::earthquake::{EarthquakeEvent, EarthquakeSnapshot};
+
+        let mut snapshot = EarthquakeSnapshot::empty("rig-1", test_now_ms());
+        snapshot.events.push(EarthquakeEvent {
+            id: "ci40659474".to_string(),
+            occurred_at_ms: test_now_ms() - 60_000,
+            updated_at_ms: test_now_ms(),
+            latitude: 35.956,
+            longitude: -117.95,
+            depth_km: 2.98,
+            magnitude: Some(0.53),
+            place: "4 km WNW of Little Lake, CA".to_string(),
+            pager_alert: None,
+            detail_url: None,
+        });
+
+        let mut state = MapsLocationSurface::live();
+        state.refresh_from_earthquakes(snapshot);
+        assert_eq!(
+            state
+                .map
+                .earthquakes
+                .snapshot
+                .as_ref()
+                .expect("snapshot")
+                .events
+                .len(),
+            1
+        );
+        assert!(!state.map.attribution_line().contains("USGS"));
+        state.map.earthquake_overlay = true;
+        assert!(state.map.attribution_line().contains("USGS"));
+    }
+
+    #[test]
+    fn nws_fold_replaces_snapshot_and_toggle_controls_attribution() {
+        use mackes_mesh_types::nws_alert::{NwsAlert, NwsAlertSnapshot, NwsSeverity};
+
+        let mut snapshot = NwsAlertSnapshot::empty("rig-1", test_now_ms());
+        snapshot.alerts.push(NwsAlert {
+            id: "urn:oid:warning".to_string(),
+            event: "Tornado Warning".to_string(),
+            headline: "Tornado Warning issued".to_string(),
+            area_desc: "Test County".to_string(),
+            severity: NwsSeverity::Extreme,
+            urgency: "Immediate".to_string(),
+            certainty: "Observed".to_string(),
+            sent_at_ms: Some(test_now_ms() - 60_000),
+            expires_at_ms: Some(test_now_ms() + 60_000),
+            polygons: Vec::new(),
+            geometry_source: None,
+        });
+
+        let mut state = MapsLocationSurface::live();
+        state.refresh_from_nws_alerts(snapshot);
+        assert_eq!(
+            state
+                .map
+                .nws_alerts
+                .snapshot
+                .as_ref()
+                .expect("snapshot")
+                .alerts
+                .len(),
+            1
+        );
+        // Isolate this layer's attribution from the safety-default NEXRAD layer,
+        // whose courtesy line also names NWS.
+        state.map.iem_radar_overlay = false;
+        assert!(state.map.nws_alert_overlay);
+        assert!(state.map.attribution_line().contains("NWS"));
+        state.map.nws_alert_overlay = false;
+        assert!(!state.map.attribution_line().contains("NWS"));
+    }
+
+    #[test]
+    fn aircraft_fold_replaces_snapshot_and_toggle_controls_odbl_attribution() {
+        use mackes_mesh_types::aircraft::{
+            AircraftPositionSource, AircraftSnapshot, AircraftTrack,
+        };
+
+        let now = test_now_ms();
+        let mut snapshot = AircraftSnapshot::empty("rig-1", now, 40.7128, -74.006, 0.0);
+        snapshot.aircraft.push(AircraftTrack {
+            id: "aaacc3".to_string(),
+            callsign: Some("N123AB".to_string()),
+            observed_at_ms: now,
+            latitude: 40.70,
+            longitude: -74.01,
+            altitude_msl_ft: 425.0,
+            estimated_agl_ft: 425.0,
+            ground_speed_kt: Some(157.9),
+            track_deg: Some(206.73),
+            position_source: AircraftPositionSource::Adsb,
+        });
+
+        let mut state = MapsLocationSurface::live();
+        state.refresh_from_aircraft(snapshot);
+        assert_eq!(
+            state
+                .map
+                .aircraft
+                .snapshot
+                .as_ref()
+                .expect("snapshot")
+                .aircraft
+                .len(),
+            1
+        );
+        assert!(!state.map.aircraft_overlay);
+        assert!(!state.map.attribution_line().contains("adsb.lol"));
+        state.map.aircraft_overlay = true;
+        assert!(state.map.attribution_line().contains("adsb.lol"));
+        assert!(state.map.attribution_line().contains("ODbL"));
+    }
+
+    #[test]
+    fn transit_fold_and_toggle_control_massdot_attribution() {
+        let now = test_now_ms();
+        let snapshot = mackes_mesh_types::transit::TransitSnapshot::empty(
+            "rig-1", now, now, "2.0", 42.36, -71.06,
+        );
+        let mut state = MapsLocationSurface::live();
+        state.refresh_from_transit(snapshot);
+        assert!(state.map.transit.snapshot.is_some());
+        assert!(!state.map.transit_overlay);
+        assert!(!state.map.attribution_line().contains("MassDOT"));
+        state.map.transit_overlay = true;
+        assert!(state.map.attribution_line().contains("MassDOT"));
+    }
+
+    #[test]
+    fn nws_forecast_fold_and_toggle_control_noaa_attribution() {
+        let snapshot = mackes_mesh_types::nws_forecast::NwsForecastSnapshot::unavailable(
+            "rig-1",
+            "no fresh fix",
+        );
+        let mut state = MapsLocationSurface::live();
+        state.refresh_from_nws_forecast(snapshot);
+        // Isolate this layer's attribution from the safety-default NEXRAD layer,
+        // whose courtesy line also names NOAA.
+        state.map.iem_radar_overlay = false;
+        assert!(state.map.nws_forecast.snapshot.is_some());
+        assert!(!state.map.nws_forecast_overlay);
+        assert!(!state.map.attribution_line().contains("NOAA"));
+        state.map.nws_forecast_overlay = true;
+        assert!(state.map.attribution_line().contains("NOAA"));
+    }
+
+    #[test]
+    fn caltrans_camera_fold_and_toggle_control_attribution() {
+        let snapshot = mackes_mesh_types::caltrans_camera::CaltransCameraSnapshot::empty(
+            "rig-1", 3, 1, 38.481, -121.511,
+        );
+        let mut state = MapsLocationSurface::live();
+        state.refresh_from_caltrans_cameras(snapshot);
+        assert!(state.map.caltrans_cameras.snapshot.is_some());
+        assert!(!state.map.caltrans_camera_overlay);
+        assert!(!state.map.attribution_line().contains("Caltrans"));
+        state.map.caltrans_camera_overlay = true;
+        assert!(state.map.attribution_line().contains("Caltrans CWWP2"));
+    }
+
+    #[test]
+    fn iem_radar_fold_and_safety_default_control_attribution() {
+        let snapshot =
+            mackes_mesh_types::iem_radar::IemRadarSnapshot::empty("rig-1", 1, 42.36, -71.06);
+        let mut state = MapsLocationSurface::live();
+        state.refresh_from_iem_radar(snapshot);
+        assert!(state.map.iem_radar.snapshot.is_some());
+        assert!(state.map.iem_radar_overlay);
+        assert!(state.map.attribution_line().contains("IEM"));
+        state.map.iem_radar_overlay = false;
+        assert!(!state.map.attribution_line().contains("NEXRAD"));
+    }
+
+    #[test]
+    fn wildfire_fold_and_safety_default_control_attribution() {
+        let snapshot =
+            mackes_mesh_types::wildfire::WildfireSnapshot::empty("rig-1", 1, 44.0, -120.0, 200);
+        let mut state = MapsLocationSurface::live();
+        state.refresh_from_wildfire(snapshot);
+        assert!(state.map.wildfire.snapshot.is_some());
+        assert!(state.map.wildfire_overlay);
+        assert!(state.map.attribution_line().contains("NIFC WFIGS"));
+        state.map.wildfire_overlay = false;
+        assert!(!state.map.attribution_line().contains("NIFC WFIGS"));
+    }
+
+    #[test]
+    fn traffic_fold_and_regional_toggle_control_attribution() {
+        let snapshot =
+            mackes_mesh_types::traffic::TrafficSnapshot::empty("rig-1", 1, 35.7, -78.65, 100);
+        let mut state = MapsLocationSurface::live();
+        state.refresh_from_traffic(snapshot);
+        assert!(state.map.traffic_events.snapshot.is_some());
+        assert!(!state.map.traffic_event_overlay);
+        assert!(!state.map.attribution_line().contains("NCDOT"));
+        state.map.traffic_event_overlay = true;
+        assert!(state
+            .map
+            .attribution_line()
+            .contains("NCDOT DriveNC / TIMS"));
     }
 
     // ── WL-UX-007/S1 — production simulator removal ─────────────────────────
@@ -3969,7 +4509,7 @@ mod tests {
                 ..VehicleTelem::default()
             },
             gaps: Vec::new(),
-            published_at_ms: 0,
+            published_at_ms: test_now_ms(),
         };
         s.refresh_from_vehicle(&mirror);
 
@@ -3985,6 +4525,56 @@ mod tests {
             .real_hardware_gaps
             .iter()
             .any(|g| g == AWAITING_MIRROR_GAP_NOTE));
+    }
+
+    #[test]
+    fn stale_vehicle_telemetry_cannot_drive_motion_or_glance_state() {
+        use mackes_mesh_types::vehicle::{VehicleState as WireVehicleState, VehicleTelem};
+
+        // A fresh online OBD sample remains usable even while GNSS has no fix:
+        // telemetry freshness and position-lock readiness are independent.
+        let mut mirror = WireVehicleState::offline("eagle");
+        mirror.online = true;
+        mirror.model = "MG90".to_string();
+        mirror.mgos_version = "4.3.0.1".to_string();
+        mirror.gaps.clear();
+        mirror.telem = VehicleTelem {
+            speed_mph: 42.0,
+            battery_v: 13.8,
+            moving: true,
+            obd_present: true,
+            ..VehicleTelem::default()
+        };
+        mirror.published_at_ms = test_now_ms();
+
+        let mut state = MapsLocationSurface::live();
+        state.refresh_from_vehicle(&mirror);
+        assert!(!state
+            .locations
+            .primary_sample()
+            .expect("MG90 source")
+            .has_fix());
+        assert!(state.vehicle.telemetry.is_live());
+        assert!(
+            state.moving(),
+            "fresh live motion may drive the safety guard"
+        );
+        assert_eq!(state.vehicle_glance().as_deref(), Some("42 mph"));
+
+        // Re-folding the same retained payload after its timestamp expires must
+        // age both telemetry and GNSS. A last-known `moving=true` can no longer
+        // hold motion/safety state active or keep the glance card populated.
+        mirror.published_at_ms = test_now_ms() - 6_000;
+        state.refresh_from_vehicle(&mirror);
+        assert!(state.vehicle.telemetry.has_live_gateway_source());
+        assert!(!state.vehicle.telemetry.is_live());
+        assert!(state
+            .locations
+            .primary_sample()
+            .expect("MG90 source")
+            .stale());
+        assert!(!state.moving(), "stale motion must fail safe to parked");
+        assert_eq!(state.vehicle_glance(), None);
     }
 
     #[test]

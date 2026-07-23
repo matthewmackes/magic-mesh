@@ -1,100 +1,117 @@
-# Cloud Self-Service — your instances from the Cloud plane
+# Workloads self-service — local VMs, services, and images
 
-Every mesh member can run their own virtual machines on the mesh cloud. Your
-mesh account **is** your cloud account — there is no separate login, no token
-to paste, nothing to configure (invisible SSO). Everything happens in the
-Workbench's **Cloud plane** (it replaced the old Controller plane), and it is
-**mesh-only**: there is no web portal, and nothing is exposed to the internet.
-For access from outside the mesh, use a VDI desktop.
+Construct's **Workloads** surface is the provider-neutral control point for
+machines and services on the mesh. It drives local libvirt/QEMU-KVM through
+OpenTofu, configures targets with Ansible, stages Podman/Quadlet services, and
+manages bootc/osbuild images. There is no separate cloud login or web portal.
 
-> **Status:** this guide tracks the locked CONSTRUCT-CLOUD design
-> (`docs/design/quasar-cloud.md`). The Cloud plane ships with QC-12/QC-13;
-> exact widget layout is decided at implementation. One plane serves everyone —
-> operators and members alike; there is no separate "My Cloud".
+## Safety model
 
-## "Instance" vs "VM": which panel owns your machine
+The shipped root DRM shell collects exact typed confirmation and mints one
+30-second, single-use HMAC capability. It publishes that capability with a typed
+`action/cloud/<verb>` request; `mackesd` validates the exact verb, placement node,
+workload/image target, expiry, signature, and durable replay claim. The HMAC key
+is never published on the world-readable Bus. A mutation without valid authority
+is staged or reported as gated—it must never be shown as applied.
 
-The shell has two VM surfaces over the same libvirt/QEMU-KVM hosts, and they use
-different nouns on purpose:
+Fleet's Datacenter controls and the local-VM Chooser use the same credential,
+full-request digest, and durable nonce ledger for their direct-libvirt actions.
+Their read-only roster refresh remains available without a capability; every
+request that can reach `virsh` or `qemu-img` is authorized first.
 
-- **Cloud plane → *instances*.** This is the self-service cloud (Nova/OpenStack).
-  If you launched it here, manage it here — boot/stop/rebuild/delete, volumes,
-  snapshots, and Heat stacks. This is the surface for your own machines.
-- **Fleet ▸ Datacenter → *VMs*.** This is the raw per-node libvirt view (an
-  operator/infrastructure lens onto every domain each host runs). It exists for
-  local, unmanaged domains and for seeing what physically runs where.
+Windowed/user-session shell launches cannot mint. This is intentional: live
+mutation and desired-state publication are restricted to the root-owned
+physical-seat service. Read, status, and dry-run plan/check operations remain
+available without mint authority; a draft can be edited elsewhere, but it is
+not published as desired state until an authorized seat confirms it.
 
-**Ownership rule:** a Nova-launched instance is also a libvirt domain, so it can
-appear in **both** panels. The Cloud plane owns its lifecycle; treat such
-Nova-managed domains as **read-only in Fleet ▸ Datacenter** and drive them from
-the Cloud plane. Datacenter directly owns only unmanaged/local domains.
+### Provision live-mutation authority (operators)
 
-> The engineering unification of the two code paths and any UI-string / badging
-> cleanup (marking Nova-managed rows in Datacenter, cross-linking the two panels)
-> is tracked as a follow-up — see the naming/UI note in
-> [`docs/NEEDS-OPERATOR.md`](../NEEDS-OPERATOR.md).
+The RPM ships `/usr/libexec/mackesd/provision-cloud-arm-credential`. On one
+already enrolled node, initialize the whole-mesh sealed secret and install its
+host-bound credential:
 
-## Launch an instance
+```console
+sudo /usr/libexec/mackesd/provision-cloud-arm-credential --init --restart
+```
 
-Open the Cloud plane and start the launch picker. It walks four choices:
+After every new node has run `mcnf-secret.sh init-self`, an existing secret holder
+must reseal the store to the new recipient. Then run this on the new node:
 
-1. **Image** — the base OS, from the mesh's Glance catalog.
-2. **Flavor** — the size. Flavors are generated from the real shapes of the
-   mesh's nodes, so what you see is what the hardware can actually give.
-3. **Network** — instances land on the one flat mesh network (see below).
-4. **Volume** — optionally attach a data volume at launch.
+```console
+sudo /usr/libexec/mackesd/provision-cloud-arm-credential --restart
+```
 
-Saved **templates** appear as launch presets — they are fleet-state records any
-node can author, so a preset made anywhere shows up everywhere.
+The helper decrypts the existing `cloud-arm-key` only into a root-only temporary
+directory, encrypts it with `systemd-creds`, and installs
+`/etc/credstore.encrypted/cloud-arm-key` mode 0600, then installs
+`LoadCredentialEncrypted` drop-ins for `mackesd.service` and
+`mde-shell-egui.service`. systemd exposes the plaintext only in each unit's
+private read-only `$CREDENTIALS_DIRECTORY`. Missing, malformed, unsealed, or
+non-root access fails closed; it never falls back to an environment variable.
 
-## Get into your instance
+Always check the operation result:
 
-- **Console:** the instance row requests Nova's SPICE console descriptor. Direct
-  `spice://host:port` descriptors open in the native Desktop viewer; Nova HTML5
-  proxy URLs are shown as gated because they are not raw SPICE sockets.
-- **SSH:** launches use the mesh-derived Nova keypair `mcnf-mesh`; the daemon
-  ensures that keypair exists before Heat creates the server.
+- **Applied** means the daemon completed the requested backend operation.
+- **Staged** means desired state or a plan exists, but no live mutation ran.
+- **Gated** names a missing tool, authority, placement node, or backend.
+- **Error** is a real failure; retry only after addressing the reported cause.
 
-## What you can manage
+## Provision a VM
 
-All five resource kinds, from the same plane:
+1. Open **Workloads** and choose **Provision**.
+2. Select an explicit mesh node. Blank placement is invalid.
+3. Choose the VM delivery type and enter its name, CPU, memory, disk, image,
+   and network settings.
+4. Review the OpenTofu plan.
+5. Arm the request and apply it. Unarmed requests remain dry runs.
 
-- **Instances** — boot, stop, rebuild, delete.
-- **Volumes + snapshots** — create, attach, detach, snapshot.
-- **Images** — the catalog you launch from.
-- **Networks + stacks** — stacks arrive with the wave-2 services (Heat).
+The daemon stores one desired document per workload and placement node. OpenTofu
+renders only that node's slice and provisions against its local libvirt URI.
 
-The plane also shows **your usage** against your quota.
+## Configure a workload
 
-## Keep your data safe
+Use **Configure** after the workload exists. Ansible inventory is derived from
+the live mesh roster rather than a static host list. Configuration requests use
+the same explicit placement and mutation-authority rules as provisioning.
+Secrets resolve through `mde-seal`; do not paste credentials into forms, command
+arguments, or repository files.
 
-**Root disks are ephemeral by default** — a rebuild or delete loses whatever is
-on them. Put anything that must survive on a **volume** and attach it; volumes
-outlive instances. Snapshot volumes for point-in-time copies. Volume backups
-land in the mesh's object store (arrives with QC-18).
+## Containers and service workloads
 
-## Networking: your instance is "inside"
+The **Containers** view stages a Quadlet unit for a named placement node. The
+container name and node must be ordinary path-safe identifiers. Rootless units
+are the default; rootful deployment must be an explicit choice. The daemon
+reports whether the unit was merely staged or installed by Ansible.
 
-Your instance joins the mesh's flat network as a peer-equivalent: **every mesh
-peer can reach it, and it can reach every peer** — the default inside the mesh
-is open. There is no per-instance firewall configuration to fight, and also
-none protecting your instance from other mesh machines (or them from it). Boot
-only images you trust, keep it updated, and see the "Blast radius" section of
-`DISCLAIMER.md` for what this trade-off means. IPv4 only.
+## Images
 
-## Quotas
+The **Images** view builds bootc/osbuild artifacts, verifies the produced hash,
+and records promoted versions in the mesh image store. Build and promotion are
+authorized mutations. Image names and versions are path-safe identifiers, not
+filesystem paths.
 
-Your quota is a **hard per-user limit**, derived from the mesh's real capacity.
-Exceeding it is rejected outright and shown in the UI. If you need more, free
-resources you are not using — or ask the operator.
+## Networks and status
 
-## Idle instances
+Nebula remains the mesh transport. Workload networks are local libvirt networks
+managed through NetworkManager/nmstate; they do not replace the overlay or
+automatically make a guest a trusted mesh peer. The **Status** view reports the
+real provider roster, drift, plans, and backend/tool availability.
 
-Nothing you leave running is auto-deleted. An idle instance sends you a **chat
-nudge** so you can decide: keep it, snapshot it, or delete it.
+## Console and lifecycle
 
-## CLI
+Console attach returns a typed SPICE, VNC, or RDP endpoint only for a workload
+that actually exposes one. Start, stop, reboot, and destroy requests must target
+one named workload on one selected node. A response that reports no endpoint or
+an unavailable backend is an honest gate, not a successful attachment.
 
-Prefer a terminal? `openstack` (python-openstackclient) is on every node and
-shows exactly the same state as the plane — every Cloud-plane action goes
-through the same typed mesh verbs.
+## Current hardening status
+
+`WL-ARCH-007` tracks end-to-end request-contract, placement, replay protection,
+and target-scoped destroy verification. Until that item is archived with live
+evidence, operators should treat Workloads mutation paths as pre-release and
+confirm the daemon reply plus the real libvirt/Podman state after each action.
+
+The former OpenStack-based Cloud plane was removed on 2026-07-22. Historical
+OpenStack runbooks are retained only as superseded design records and are not
+valid operating instructions.

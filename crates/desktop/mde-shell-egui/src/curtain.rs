@@ -53,7 +53,7 @@ use mde_seat::{Battery, BatteryState, MixerClient, PwGraph, SeatError, SeatSnaps
 use mde_theme::brand::icons::IconId;
 
 use crate::chrome::MeshSummary;
-use crate::dock::icon_texture;
+use crate::surfaces::icon_texture;
 
 // ───────────────────────────── the verify seam ─────────────────────────────
 
@@ -1289,7 +1289,7 @@ const fn mesh_glance(mesh: &MeshSummary) -> (Color32, &'static str) {
 mod tests {
     use super::*;
     use crate::chrome::MeshSummary;
-    use crate::dock::{self, Surface};
+    use crate::surfaces::Surface;
     use mde_seat::{Backend, BatteryKind, MixerStatus, MixerStrip, Probe, StripOrigin};
     use std::collections::VecDeque;
 
@@ -1898,11 +1898,11 @@ mod tests {
 
     // ── input exclusivity (lock 10) ──
 
-    /// Mount a generic bottom **chrome strip** standing in for the shell's dock —
+    /// Mount a generic bottom **chrome strip** standing in for shell controls —
     /// one full-width clickable band that routes to the Workbench on a click — plus
     /// (optionally) the engaged curtain drawn after it (the render order in
-    /// `main.rs`), for one headless frame. The real chrome is the left vertical dock
-    /// (VDOCK); this input-exclusivity test only needs an interactive region under
+    /// `main.rs`), for one headless frame. This input-exclusivity test only needs
+    /// an interactive region under
     /// the curtain to prove the whole-screen grab (lock 10) swallows a click meant
     /// for the chrome beneath.
     fn shell_frame(
@@ -1921,7 +1921,7 @@ mod tests {
         };
         let _ = ctx.run(input, |ctx| {
             egui::TopBottomPanel::bottom("shell-chrome")
-                .exact_height(dock::TASKBAR_H)
+                .exact_height(crate::status_bar::STATUS_BAR_H)
                 .frame(egui::Frame::default().fill(Style::SURFACE))
                 .show(ctx, |ui| {
                     let (_rect, resp) =
@@ -1938,11 +1938,11 @@ mod tests {
     }
 
     #[test]
-    fn the_engaged_curtain_swallows_clicks_before_the_dock() {
+    fn the_engaged_curtain_swallows_clicks_before_underlying_chrome() {
         // A point inside the bottom chrome band (any x in the band works; the y is
         // the band's vertical centre). With no curtain the click routes to Workbench;
         // under the engaged curtain the whole-screen grab swallows it.
-        let click = egui::pos2(32.0, 600.0 - dock::TASKBAR_H / 2.0);
+        let click = egui::pos2(32.0, 600.0 - crate::status_bar::STATUS_BAR_H / 2.0);
         let press = egui::Event::PointerButton {
             pos: click,
             button: egui::PointerButton::Primary,
@@ -1976,8 +1976,8 @@ mod tests {
             "control: with no curtain the click must select Workbench"
         );
 
-        // The engaged curtain claims the whole screen (taskbar included):
-        // the identical click never reaches the dock (lock 10).
+        // The engaged curtain claims the whole screen (chrome included):
+        // the identical click never reaches the control beneath (lock 10).
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let mut curtain = Curtain::default();

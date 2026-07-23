@@ -8,9 +8,12 @@
 
 use std::path::{Path, PathBuf};
 
+use base64::Engine as _;
 use rusqlite::Connection;
 
-use super::{seal, CaError, NebulaCertBackend};
+#[cfg(test)]
+use super::seal;
+use super::{CaError, NebulaCertBackend};
 
 /// Default CIDR prefix length on a node's overlay cert.
 ///
@@ -55,8 +58,6 @@ pub struct SignedPeer {
     pub cert_pem: String,
     /// Path the cert was written to on disk.
     pub cert_path: PathBuf,
-    /// Path the matching private key was written to.
-    pub key_path: PathBuf,
 }
 
 /// Sign a peer certificate under the active CA. Side effects:
@@ -77,6 +78,7 @@ pub struct SignedPeer {
 /// - [`CaError::BinaryMissing`] / [`CaError::Subprocess`] on
 ///   `nebula-cert` failures.
 /// - [`CaError::Io`] on file IO failures.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn sign_peer_cert<B: NebulaCertBackend + ?Sized>(
     backend: &B,
@@ -176,8 +178,205 @@ pub fn sign_peer_cert<B: NebulaCertBackend + ?Sized>(
         overlay_ip: allocated_ip,
         cert_pem,
         cert_path: crt_out.to_path_buf(),
-        key_path: key_out.to_path_buf(),
     })
+}
+
+/// Sign a certificate for a requester-generated Nebula public key. This is the
+/// only signing path used by peer enrollment and CA epoch rotation: the CA
+/// receives a public PEM, invokes `nebula-cert sign -in-pub`, stores that public
+/// key for future rotations, and never creates or receives a peer private key.
+///
+/// # Errors
+///
+/// The same allocation, subprocess, filesystem, and database failures as
+/// [`sign_peer_cert`]. Empty or implausibly large public-key PEM is rejected
+/// before invoking the backend.
+#[allow(clippy::too_many_arguments)]
+pub fn sign_peer_cert_with_public_key<B: NebulaCertBackend + ?Sized>(
+    backend: &B,
+    conn: &Connection,
+    mesh_id: &str,
+    node_id: &str,
+    role: PeerRole,
+    ca_crt_path: &Path,
+    ca_key_path: &Path,
+    crt_out: &Path,
+    public_key_path: &Path,
+    public_key_pem: &str,
+    extra_taken: &std::collections::HashSet<String>,
+) -> Result<SignedPeer, CaError> {
+    validate_nebula_public_key_pem(public_key_pem)?;
+    let active_epoch = active_epoch(conn, mesh_id)?
+        .ok_or_else(|| CaError::Sql(format!("no active CA for mesh {mesh_id}")))?;
+    let allocated_ip = match existing_overlay_ip(conn, node_id, active_epoch)? {
+        Some(ip) => ip,
+        None => allocate_overlay_ip_excluding(conn, active_epoch, extra_taken)?,
+    };
+    let cert_pem = sign_peer_material_with_public_key(
+        backend,
+        node_id,
+        role,
+        &allocated_ip,
+        ca_crt_path,
+        ca_key_path,
+        crt_out,
+        public_key_path,
+        public_key_pem,
+    )?;
+    let expires_at: i64 = 0;
+    conn.execute(
+        "INSERT INTO nebula_peer_certs \
+         (node_id, epoch, cert_pem, overlay_ip, expires_at, public_key_pem) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+         ON CONFLICT(node_id, epoch) DO UPDATE SET \
+           cert_pem = excluded.cert_pem, \
+           overlay_ip = excluded.overlay_ip, \
+           expires_at = excluded.expires_at, \
+           public_key_pem = excluded.public_key_pem, \
+           revoked_at = NULL",
+        rusqlite::params![
+            node_id,
+            active_epoch,
+            cert_pem,
+            allocated_ip,
+            expires_at,
+            public_key_pem
+        ],
+    )
+    .map_err(|e| CaError::Sql(e.to_string()))?;
+    tracing::info!(
+        node_id,
+        overlay_ip = %allocated_ip,
+        epoch = active_epoch,
+        "nebula peer cert signed from requester-owned public key"
+    );
+    Ok(SignedPeer {
+        node_id: node_id.to_string(),
+        overlay_ip: allocated_ip,
+        cert_pem,
+        cert_path: crt_out.to_path_buf(),
+    })
+}
+
+/// Validate the canonical Nebula X25519 public-key PEM shape and require the
+/// decoded key to be exactly 32 bytes. Rotation calls this for the complete
+/// roster before minting or changing any persistent state.
+pub fn validate_nebula_public_key_pem(public_key_pem: &str) -> Result<(), CaError> {
+    const BEGIN: &str = "-----BEGIN NEBULA X25519 PUBLIC KEY-----";
+    const END: &str = "-----END NEBULA X25519 PUBLIC KEY-----";
+    if public_key_pem.len() > 4096 {
+        return Err(CaError::Io(
+            "requester Nebula public key exceeds 4096 bytes".into(),
+        ));
+    }
+    let mut lines = public_key_pem.lines();
+    if lines.next() != Some(BEGIN) {
+        return Err(CaError::Io(
+            "requester Nebula public key has an invalid PEM header".into(),
+        ));
+    }
+    let mut encoded = String::new();
+    let mut found_end = false;
+    for line in lines {
+        if line == END {
+            found_end = true;
+            break;
+        }
+        encoded.push_str(line.trim());
+    }
+    if !found_end {
+        return Err(CaError::Io(
+            "requester Nebula public key has no PEM footer".into(),
+        ));
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| CaError::Io("requester Nebula public key is not base64".into()))?;
+    if decoded.len() != 32 {
+        return Err(CaError::Io(format!(
+            "requester Nebula public key must decode to 32 bytes, got {}",
+            decoded.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Sign one already-planned node/IP/public-key tuple without touching SQLite.
+/// The backend receives only a public key in a unique mode-0700 staging
+/// directory. The caller-visible certificate changes only after the subprocess
+/// succeeds and the staged certificate has been read completely.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sign_peer_material_with_public_key<B: NebulaCertBackend + ?Sized>(
+    backend: &B,
+    node_id: &str,
+    role: PeerRole,
+    overlay_ip: &str,
+    ca_crt_path: &Path,
+    ca_key_path: &Path,
+    crt_out: &Path,
+    public_key_path: &Path,
+    public_key_pem: &str,
+) -> Result<String, CaError> {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    validate_nebula_public_key_pem(public_key_pem)?;
+    let public_parent = public_key_path.parent().ok_or_else(|| {
+        CaError::Io(format!(
+            "public-key scratch path has no parent: {}",
+            public_key_path.display()
+        ))
+    })?;
+    std::fs::create_dir_all(public_parent)
+        .map_err(|e| CaError::Io(format!("mkdir {}: {e}", public_parent.display())))?;
+    let staging_dir = (0..16)
+        .find_map(|_| {
+            let candidate = public_parent.join(format!(
+                ".sign-public-{}-{:016x}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            match builder.create(&candidate) {
+                Ok(()) => Some(Ok(candidate)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+                Err(error) => Some(Err(CaError::Io(format!(
+                    "create public-key staging {}: {error}",
+                    candidate.display()
+                )))),
+            }
+        })
+        .unwrap_or_else(|| Err(CaError::Io("public-key staging collisions".into())))?;
+    let result = (|| {
+        let staged_public_key = staging_dir.join("requester.pub");
+        let staged_cert = staging_dir.join("signed.crt");
+        super::seal::write_atomic_sealed(&staged_public_key, public_key_pem.as_bytes())?;
+        let groups: &[&str] = match role {
+            PeerRole::Host => &["role:host"],
+            PeerRole::Peer => &["role:peer"],
+        };
+        backend.sign_peer_with_public_key(
+            ca_crt_path,
+            ca_key_path,
+            node_id,
+            overlay_ip,
+            DEFAULT_CIDR_PREFIX,
+            groups,
+            &staged_public_key,
+            &staged_cert,
+        )?;
+        let cert_pem = std::fs::read_to_string(&staged_cert)
+            .map_err(|e| CaError::Io(format!("read peer cert {}: {e}", staged_cert.display())))?;
+        if cert_pem.trim().is_empty() {
+            return Err(CaError::Io(
+                "nebula-cert emitted an empty peer certificate".into(),
+            ));
+        }
+        super::seal::write_atomic_sealed(crt_out, cert_pem.as_bytes())?;
+        Ok(cert_pem)
+    })();
+    let _ = std::fs::remove_dir_all(&staging_dir);
+    result
 }
 
 /// Per-cert role group. The open-mesh directive flattens
@@ -336,6 +535,72 @@ mod tests {
         let key = tmp.path().join("ca.key");
         mint::mint_ca(&MockBackend, conn, "m1", Some(&crt), Some(&key)).expect("mint");
         tmp
+    }
+
+    const PUBLIC_KEY: &str = "-----BEGIN NEBULA X25519 PUBLIC KEY-----\n\
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n-----END NEBULA X25519 PUBLIC KEY-----\n";
+
+    #[test]
+    fn requester_public_key_path_never_generates_or_stores_a_private_key() {
+        let conn = fresh_conn();
+        let tmp = mint_one(&conn);
+        let cert = tmp.path().join("peer.crt");
+        let public_hint = tmp.path().join("peer.pub");
+        sign_peer_cert_with_public_key(
+            &MockBackend,
+            &conn,
+            "m1",
+            "peer:anvil",
+            PeerRole::Peer,
+            &tmp.path().join("ca.crt"),
+            &tmp.path().join("ca.key"),
+            &cert,
+            &public_hint,
+            PUBLIC_KEY,
+            &std::collections::HashSet::new(),
+        )
+        .expect("public-only sign");
+        assert!(!public_hint.exists(), "public staging must be cleaned");
+        assert!(!tmp.path().join("peer.key").exists());
+        let (stored_public, stored_ip): (String, String) = conn
+            .query_row(
+                "SELECT public_key_pem, overlay_ip FROM nebula_peer_certs \
+                 WHERE node_id='peer:anvil' AND epoch=0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored_public, PUBLIC_KEY);
+        assert_eq!(stored_ip, "10.42.0.1");
+    }
+
+    #[test]
+    fn malformed_requester_public_key_fails_before_output_or_store() {
+        let conn = fresh_conn();
+        let tmp = mint_one(&conn);
+        let cert = tmp.path().join("peer.crt");
+        let error = sign_peer_cert_with_public_key(
+            &MockBackend,
+            &conn,
+            "m1",
+            "peer:anvil",
+            PeerRole::Peer,
+            &tmp.path().join("ca.crt"),
+            &tmp.path().join("ca.key"),
+            &cert,
+            &tmp.path().join("peer.pub"),
+            "-----BEGIN NEBULA X25519 PUBLIC KEY-----\nshort\n-----END NEBULA X25519 PUBLIC KEY-----\n",
+            &std::collections::HashSet::new(),
+        )
+        .expect_err("invalid key");
+        assert!(error.to_string().contains("base64") || error.to_string().contains("32 bytes"));
+        assert!(!cert.exists());
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM nebula_peer_certs", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 0);
     }
 
     /// Backend that models real nebula-cert's refusal to overwrite an
@@ -628,7 +893,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let conn = fresh_conn();
         let tmp = mint_one(&conn);
-        let signed = sign_peer_cert(
+        let key = tmp.path().join("peer.key");
+        sign_peer_cert(
             &MockBackend,
             &conn,
             "m1",
@@ -637,15 +903,11 @@ mod tests {
             &tmp.path().join("ca.crt"),
             &tmp.path().join("ca.key"),
             &tmp.path().join("peer.crt"),
-            &tmp.path().join("peer.key"),
+            &key,
             &std::collections::HashSet::new(),
         )
         .expect("sign");
-        let mode = std::fs::metadata(&signed.key_path)
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
+        let mode = std::fs::metadata(&key).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
     }
 }

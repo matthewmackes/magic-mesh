@@ -64,12 +64,9 @@ pub fn mint_ca<B: NebulaCertBackend>(
 
     backend.mint_ca(mesh_id, crt, key)?;
 
-    // Re-write the key through the sealing helper so the
-    // mode bits land at exactly 0600 regardless of the
-    // subprocess's umask.
-    let key_bytes = std::fs::read(key)
-        .map_err(|e| CaError::Io(format!("read CA key {}: {e}", key.display())))?;
-    seal::write_sealed(key, &key_bytes)?;
+    // Backends must install the generated pair through the atomic-pair helper.
+    // Validate the private half before publishing the database row.
+    seal::read_sealed(key)?;
 
     let cert_pem = std::fs::read_to_string(crt)
         .map_err(|e| CaError::Io(format!("read CA cert {}: {e}", crt.display())))?;

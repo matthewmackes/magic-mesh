@@ -23,7 +23,7 @@ substrate stays headless-capable (§6).
 │                  mde-theme (the brand module — QBRAND); shared Style (§4)      │
 ├─ Platform-services tier ───────────────────────────────────────────────────────┤
 │  mackesd: SQLite store · worker supervisor (ENT-6 breaker) · reconcile loop ·  │
-│    Nebula CA · enrollment · the session-broker / vm-lifecycle / openstack /     │
+│    Nebula CA · enrollment · the session-broker / vm-lifecycle / cloud /         │
 │    container / chat workers · healthz/metrics/alerts                           │
 │  mde-bus: file-backed pub/sub + RPC (action/<p>/<verb> → reply/<ulid>);        │
 │           D-Bus only for FDO interop (notifications, MPRIS) — §2               │
@@ -46,7 +46,7 @@ controller — losing it is a recoverable event
 The host is an **egui thin client, not a general desktop**. There are no native
 host apps: a browser / office suite / game runs **inside a VM guest**. A
 Workstation **brokers and displays full OS desktops** that run locally on
-**libvirt/QEMU-KVM through Nova (OpenStack)** or **remotely on any mesh peer**,
+**libvirt/QEMU-KVM through the Workloads plane** or **remotely on any mesh peer**,
 rendered egui-native (ironrdp/VNC/Spice → an egui texture) over Nebula. A
 "session" is a fullscreen VM desktop; sessions **roam** per-peer via
 etcd/Syncthing. VM desktop guests are **first-class, dual-homed mesh members**.
@@ -67,17 +67,15 @@ the **Peers directory as the Front Door** (§9; source doc
 (`crates/desktop/mde-shell-egui/src/workbench.rs`):
 
 - **This Node** — this host's hardware, seat, node-local services + health.
-- **Cloud** — the mesh cloud: OpenStack self-service (instances · volumes+snapshots
-  · images · networks · stacks). *The Q70 lock renamed the old Controller plane —
-  OpenStack IS the control brain it described.*
+- **Cloud** — provider-neutral Workloads: local libvirt VMs, Podman/Quadlet
+  services, images, networks, configuration, and lifecycle through typed verbs.
 - **Network** — the Nebula overlay, lighthouses, routes, reachability, nmstate.
 - **Fleet** — every peer and the VM desktops they serve (a rollup lens + per-node
   KVM reality off the Bus).
 - **Provisioning** — golden images, enrollment, bringing new peers online.
 
-Doctrine (§9): **no RBAC** (a valid mesh cert is the authorization; the one
-exception is hard per-user Keystone quotas in the Cloud plane) · GUIs **render**,
-they are never authorities · **one-state doctrine** (etcd + TOML/YAML on
+Doctrine (§9): **no RBAC** (a valid mesh cert is the authorization) · GUIs
+**render**, they are never authorities · **one-state doctrine** (etcd + TOML/YAML on
 Syncthing + typed `mackesd` Bus verbs; CLI parity).
 
 ## Crates
@@ -110,10 +108,10 @@ and fed through the same path (EFF-4). A live `WorkerStatusMap` feeds the `ready
 verdict on healthz and the exporter's gauges (EFF-24/26).
 
 **VM desktops & the cloud.** The `session_broker` + `vm_lifecycle` workers drive
-VM desktops over libvirt/QEMU-KVM; the `openstack` worker renders Kolla config
-from fleet state and wraps the OpenStack APIs behind typed `action/cloud/*` verbs
-(Nova/Placement/Glance/Cinder/Keystone/Neutron-OVN/Heat), so the shell never
-speaks raw OpenStack and creation is **stacks-as-code** (fleet renders Heat).
+VM desktops over libvirt/QEMU-KVM. The `cloud` worker owns typed
+`action/cloud/*` verbs, renders OpenTofu for provisioning, and runs Ansible for
+configuration against local libvirt, NetworkManager/nmstate, Podman/Quadlet,
+and bootc/osbuild. The shell never speaks a provider API directly.
 
 **Mesh routing.** `mesh_router` ticks 10 s: HTTPS-fallback activation
 (UDP-failure threshold → TCP/443 TLS tunnel), then the scorer picks

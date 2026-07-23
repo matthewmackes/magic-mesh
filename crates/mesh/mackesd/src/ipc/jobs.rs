@@ -19,6 +19,8 @@ use mde_bus::persist::Persist;
 use mde_bus::rpc::reply_topic;
 use serde_json::json;
 
+use super::action_auth::{ActionAuthorizer, MutationContext};
+
 /// Action verbs served on `action/jobs/<verb>`.
 pub const ACTION_VERBS: [&str; 4] = ["list-templates", "launch", "runs", "run-results"];
 
@@ -180,9 +182,48 @@ pub fn build_reply(svc: &JobsService, verb: &str, body: Option<&str>, ulid: &str
     }
 }
 
+/// Apply the shared-Bus authorization boundary before a jobs mutation reaches
+/// the replicated run store. Query verbs remain available without a token.
+fn build_bus_reply(
+    svc: &JobsService,
+    verb: &str,
+    body: Option<&str>,
+    ulid: &str,
+    authorizer: &ActionAuthorizer,
+) -> String {
+    if verb == "launch" {
+        let raw = body.unwrap_or_default();
+        let target = serde_json::from_str::<serde_json::Value>(raw)
+            .ok()
+            .and_then(|request| {
+                request
+                    .get("playbook")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_default();
+        let context = MutationContext {
+            verb: "jobs-launch",
+            node: "jobs",
+            target: &target,
+        };
+        if let Err(error) = authorizer.authorize(raw, context) {
+            tracing::warn!(
+                target: "mackesd::jobs",
+                %error,
+                "refused unauthorized jobs launch"
+            );
+            return json!({ "ok": false, "error": format!("launch authorization refused: {error}") })
+                .to_string();
+        }
+    }
+    build_reply(svc, verb, body, ulid)
+}
+
 /// Run the jobs Bus responder until `should_stop()`.
 pub fn serve_bus<F: Fn() -> bool>(persist: &Persist, svc: &JobsService, should_stop: F) {
     let mut cursors: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let authorizer = ActionAuthorizer::production();
     while !should_stop() {
         for verb in ACTION_VERBS {
             let topic = format!("action/jobs/{verb}");
@@ -194,7 +235,7 @@ pub fn serve_bus<F: Fn() -> bool>(persist: &Persist, svc: &JobsService, should_s
                 cursors.insert(topic.clone(), msg.ulid.clone());
                 // EFF-23 — refuse an oversized body before build_reply parses it.
                 let reply = if crate::ipc::body_within_cap(msg.body.as_deref()) {
-                    build_reply(svc, verb, msg.body.as_deref(), &msg.ulid)
+                    build_bus_reply(svc, verb, msg.body.as_deref(), &msg.ulid, &authorizer)
                 } else {
                     tracing::warn!(
                         topic = %topic,
@@ -219,7 +260,11 @@ pub fn serve_bus<F: Fn() -> bool>(persist: &Persist, svc: &JobsService, should_s
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::action_auth::authorize_test_body;
     use mackes_mesh_types::peers::{write_peer_record, PeerRecord};
+
+    const AUTH_KEY: &[u8] = b"jobs-action-auth-test-key";
+    const AUTH_NOW: i64 = 1_700_000_000_000;
 
     fn svc_with_peer(root: &Path, host: &str, tags: &[mackes_mesh_types::cap_tags::CapabilityTag]) {
         let pdir = mackes_mesh_types::peers::peers_dir(root);
@@ -244,6 +289,102 @@ mod tests {
             t.tags.insert(*tag);
         }
         mackes_mesh_types::cap_tags::write_tags(root, host, &t).unwrap();
+    }
+
+    fn signed_launch_body(playbook: &str, nonce: &str, expires_at_ms: i64) -> String {
+        let unsigned = json!({
+            "schema_version": 1,
+            "playbook": playbook,
+            "targets": { "peers": ["oak"] }
+        })
+        .to_string();
+        authorize_test_body(
+            AUTH_KEY,
+            &unsigned,
+            MutationContext {
+                verb: "jobs-launch",
+                node: "jobs",
+                target: playbook,
+            },
+            nonce,
+            expires_at_ms,
+        )
+    }
+
+    #[test]
+    fn hostile_bus_launches_never_write_a_run_and_replay_executes_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = JobsService::new(tmp.path(), None);
+        svc_with_peer(
+            tmp.path(),
+            "oak",
+            &[mackes_mesh_types::cap_tags::CapabilityTag::Execution],
+        );
+        let authorizer = ActionAuthorizer::for_test(AUTH_KEY, tmp.path().join("auth"), AUTH_NOW);
+
+        let unsigned = json!({
+            "playbook": "unsigned.yml",
+            "targets": { "peers": ["oak"] }
+        })
+        .to_string();
+        let future = signed_launch_body("future.yml", "future", AUTH_NOW + 30_000)
+            .replace("\"schema_version\":1", "\"schema_version\":2");
+        let overlong = signed_launch_body("overlong.yml", "overlong", AUTH_NOW + 30_001);
+        let tampered = signed_launch_body("before.yml", "tampered", AUTH_NOW + 30_000)
+            .replace("before.yml", "after.yml");
+        for (index, body) in [&unsigned, &future, &overlong, &tampered]
+            .into_iter()
+            .enumerate()
+        {
+            let reply: serde_json::Value = serde_json::from_str(&build_bus_reply(
+                &svc,
+                "launch",
+                Some(body),
+                &format!("hostile-{index}"),
+                &authorizer,
+            ))
+            .unwrap();
+            assert_eq!(reply["ok"], false);
+        }
+        assert!(read_run(tmp.path(), "hostile-0").is_none());
+        assert!(read_run(tmp.path(), "hostile-1").is_none());
+        assert!(read_run(tmp.path(), "hostile-2").is_none());
+        assert!(read_run(tmp.path(), "hostile-3").is_none());
+
+        let replay = signed_launch_body("once.yml", "replay", AUTH_NOW + 30_000);
+        let first: serde_json::Value = serde_json::from_str(&build_bus_reply(
+            &svc,
+            "launch",
+            Some(&replay),
+            "authorized-once",
+            &authorizer,
+        ))
+        .unwrap();
+        assert_eq!(first["ok"], true);
+        let second: serde_json::Value = serde_json::from_str(&build_bus_reply(
+            &svc,
+            "launch",
+            Some(&replay),
+            "authorized-replay",
+            &authorizer,
+        ))
+        .unwrap();
+        assert_eq!(second["ok"], false);
+        assert!(read_run(tmp.path(), "authorized-once").is_some());
+        assert!(read_run(tmp.path(), "authorized-replay").is_none());
+
+        let reads = ["list-templates", "runs", "run-results"];
+        for verb in reads {
+            let reply: serde_json::Value = serde_json::from_str(&build_bus_reply(
+                &svc,
+                verb,
+                Some(r#"{"run_id":"missing"}"#),
+                "read",
+                &authorizer,
+            ))
+            .unwrap();
+            assert_eq!(reply["ok"], true, "{verb} must remain an open read");
+        }
     }
 
     #[test]

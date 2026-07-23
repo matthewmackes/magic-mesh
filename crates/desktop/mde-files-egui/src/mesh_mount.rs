@@ -33,6 +33,11 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use mackes_mesh_types::cloud::{
+    cloud_request_digest, CloudArmSigner, CloudArmedToken, CLOUD_ACTION_SCHEMA_VERSION,
+};
+#[cfg(not(test))]
+use mackes_mesh_types::cloud::{decode_cloud_arm_credential, CLOUD_ARM_CREDENTIAL};
 use serde::{Deserialize, Serialize};
 
 /// The `action/mesh-mount/` request domain prefix. MUST equal the worker's
@@ -92,6 +97,86 @@ impl MeshMountVerb {
             Self::Unmount => "unmount",
         }
     }
+}
+
+const ACTION_TOKEN_TTL_MS: i64 = 30_000;
+
+fn action_signer() -> Result<CloudArmSigner, String> {
+    #[cfg(test)]
+    {
+        return CloudArmSigner::new(b"0123456789abcdef0123456789abcdef".to_vec())
+            .map_err(str::to_string);
+    }
+    #[cfg(not(test))]
+    {
+        if !rustix::process::geteuid().is_root() {
+            return Err(
+                "Mesh-mount authorization is available only in the root DRM shell.".to_string(),
+            );
+        }
+        let directory = std::env::var_os("CREDENTIALS_DIRECTORY")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .ok_or_else(|| {
+                "The root shell has no systemd action credential; mesh mounts are disabled."
+                    .to_string()
+            })?;
+        let raw = std::fs::read(directory.join(CLOUD_ARM_CREDENTIAL))
+            .map_err(|e| format!("Could not read systemd action credential: {e}"))?;
+        let key = decode_cloud_arm_credential(&raw).map_err(str::to_string)?;
+        CloudArmSigner::new(key).map_err(str::to_string)
+    }
+}
+
+fn authorize_request_body(host: &str, verb: MeshMountVerb) -> Result<String, String> {
+    for (label, value) in [("verb", verb.tag()), ("node", host), ("target", host)] {
+        if value.contains('|') || value.len() > 255 || value.trim().is_empty() {
+            return Err(format!(
+                "Mesh-mount mutation {label} is not capability-safe."
+            ));
+        }
+    }
+    let mut document: serde_json::Value = serde_json::from_str(&verb.body())
+        .map_err(|e| format!("Invalid mesh-mount request body: {e}"))?;
+    document
+        .as_object_mut()
+        .expect("closed enum is an object")
+        .insert(
+            "schema_version".to_string(),
+            serde_json::Value::from(CLOUD_ACTION_SCHEMA_VERSION),
+        );
+    let unsigned = document.to_string();
+    use rand::RngCore as _;
+    let mut nonce_bytes = [0_u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = nonce_bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .map_err(|_| "The system clock is before the Unix epoch.".to_string())?;
+    let auth_verb = match verb {
+        MeshMountVerb::Mount => "mesh-mount-mount",
+        MeshMountVerb::Escalate => "mesh-mount-escalate",
+        MeshMountVerb::Unmount => "mesh-mount-unmount",
+    };
+    let token = CloudArmedToken::mint(
+        &action_signer()?,
+        &nonce,
+        now.saturating_add(ACTION_TOKEN_TTL_MS),
+        auth_verb,
+        host,
+        host,
+        &cloud_request_digest(&unsigned).map_err(str::to_string)?,
+    )
+    .encode();
+    document
+        .as_object_mut()
+        .expect("validated object")
+        .insert("armed_token".to_string(), serde_json::Value::String(token));
+    Ok(document.to_string())
 }
 
 // ── the mount scope (mirror of the worker's `MountScope` tag) ───────────────────
@@ -343,7 +428,7 @@ impl MeshMountClient for BusMeshMount {
             return Err("No mesh Bus directory — mesh mounts are unavailable on this node.".into());
         };
         let topic = action_topic(host);
-        let body = verb.body();
+        let body = authorize_request_body(host, verb)?;
         mde_bus::persist::Persist::open(root.clone())
             .and_then(|p| {
                 p.write(
@@ -450,6 +535,26 @@ mod tests {
         let v: MeshMountVerb =
             serde_json::from_str(&MeshMountVerb::Escalate.body()).expect("round-trips");
         assert_eq!(v, MeshMountVerb::Escalate);
+    }
+
+    #[test]
+    fn live_bus_publisher_adds_schema_and_scoped_capability() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = BusMeshMount::with_root(Some(dir.path().to_path_buf()));
+        client.request("oak", MeshMountVerb::Escalate).unwrap();
+        let persist = mde_bus::persist::Persist::open(dir.path().to_path_buf()).unwrap();
+        let body = persist
+            .list_since(&action_topic("oak"), None)
+            .unwrap()
+            .pop()
+            .and_then(|message| message.body)
+            .expect("published body");
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["schema_version"], CLOUD_ACTION_SCHEMA_VERSION);
+        let token = CloudArmedToken::parse(value["armed_token"].as_str().unwrap()).unwrap();
+        assert_eq!(token.verb, "mesh-mount-escalate");
+        assert_eq!(token.node, "oak");
+        assert_eq!(token.target, "oak");
     }
 
     #[test]

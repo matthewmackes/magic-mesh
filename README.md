@@ -51,7 +51,7 @@ headless-capable (`AI_GOVERNANCE.md` §6).
 ┌───────────────▼──────────────────────────────────────────────────────────────┐
 │  PLATFORM-SERVICES TIER                                                         │
 │     mackesd      — the supervised control-plane daemon: role-gated workers      │
-│                    (session-broker · vm-lifecycle · openstack · container ·      │
+│                    (session-broker · vm-lifecycle · cloud · container ·          │
 │                     reconcile · Nebula CA · enrollment · chat · healthz/metrics) │
 │     mde-bus      — file-backed pub/sub + RPC (action/<prefix>/<verb> → reply/<ulid>)│
 │     magic-fleet  — the no-fixed-center desired-state engine (ansible-backed)     │
@@ -105,13 +105,12 @@ from the local host outward, with the **Peers directory as the Front Door**
 | Plane | What it hosts |
 |---|---|
 | **This Node** | This host — hardware, the local desktop seat, node-local services + health |
-| **Cloud** | The mesh cloud — `OpenStack` self-service (instances · volumes+snapshots · images · networks · stacks), self-served by every member *(the Q70 lock renamed the old Controller plane: OpenStack IS the control brain it described)* |
+| **Cloud** | Provider-neutral Workloads for local libvirt VMs, Podman/Quadlet services, images, networks, configuration, and lifecycle through typed mesh verbs |
 | **Network** | The Nebula overlay — lighthouses, routes, reachability, nmstate desired-state |
 | **Fleet** | Every peer and the VM desktops they serve — a live rollup + per-node KVM reality |
 | **Provisioning** | Golden images, node enrollment, and bringing new peers online |
 
-Locks: **no RBAC** (a valid mesh cert is the authorization) — the one documented
-exception is **hard per-user Keystone quotas** in the Cloud plane · **the elected
+Locks: **no RBAC** (a valid mesh cert is the authorization) · **the elected
 leader only coordinates** (etcd + Syncthing; the control plane is a plane, not a
 place) · **remote execution is typed Bus verbs + signed job bundles only** (no
 raw shell) · **one-state doctrine** (etcd + TOML/YAML on Syncthing + typed
@@ -119,22 +118,20 @@ raw shell) · **one-state doctrine** (etcd + TOML/YAML on Syncthing + typed
 
 ### The cloud (Cloud plane)
 
-The mesh cloud is **OpenStack**, self-served by every member with invisible SSO
-(a Keystone identity bridge; Keystone absorbs human identity, the CA/KDC narrows
-to machine certs). Nova + Placement schedule VMs onto **libvirt/QEMU-KVM**;
-Glance + DIB serve images, Cinder (LVM) serves volumes, Neutron/OVN the one flat
-provider network, Heat the stacks. The services run as **Kolla containers under
-Podman**, supervised by a `mackesd` **`openstack`** worker that renders config
-from fleet state — control plane **distributed, APIs on every node, no controller
-box**. Surfaces never speak raw OpenStack: typed `mackesd` verbs
-(`action/cloud/*`) wrap the APIs, and creation is **stacks-as-code** (fleet
-renders Heat). See [`docs/help/cloud-self-service.md`](docs/help/cloud-self-service.md).
+Construct Cloud is a provider-neutral **Workloads** plane. The shell emits typed
+`action/cloud/*` requests; `mackesd` validates placement and authority, renders
+OpenTofu for provisioning, and runs Ansible for configuration. The current local
+backend is **libvirt/QEMU-KVM** for VMs, NetworkManager/nmstate for networks,
+Podman + Quadlet for service containers, and bootc + osbuild/image-builder for
+images. Desired state and Tofu state remain mesh-coordinated through etcd, while
+secrets resolve through `mde-seal`. The retired OpenStack control plane is not a
+supported adapter. See [`docs/help/cloud-self-service.md`](docs/help/cloud-self-service.md).
 
 ### VM desktops (VDI)
 
 A Workstation **brokers and displays full OS desktops** that run either **locally
-on libvirt/QEMU-KVM through Nova** or **remotely on any mesh peer** (a headless
-Workstation serving desktops over the same stack), rendered egui-native over
+on libvirt/QEMU-KVM through the Workloads plane** or **remotely on any mesh
+peer** (a headless Workstation serving desktops over the same stack), rendered egui-native over
 Nebula. A "session" is a fullscreen VM desktop; sessions **roam** per-peer via
 etcd/Syncthing. **VM desktop guests are first-class mesh members** — each
 dual-homed (its own Nebula cert + a LAN NIC), default-deny inbound.
@@ -187,9 +184,9 @@ within a small workgroup, an accepted, documented trade-off (see
 - **Crypto floor** — AES-256-GCM / ChaCha20-Poly1305 session, RSA-4096 KDC
   identity, rustls everywhere; **no OpenSSL** (cargo-deny-banned).
 - **Blast radius** — flat trust means a valid cert reaches every peer + service,
-  and VM guests (incl. Windows) are full peers; that radius is documented for
-  operators. Cloud instances live on one flat OVN provider network with
-  default-open security groups, tempered by hard per-user Keystone quotas.
+  and enrolled VM guests (including Windows) are full peers; that radius is
+  documented for operators. Local libvirt and Podman workloads are not silently
+  enrolled or granted flat-mesh trust.
 
 ### Reporting & observability
 

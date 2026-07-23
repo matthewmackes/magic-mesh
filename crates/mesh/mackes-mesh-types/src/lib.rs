@@ -15,6 +15,12 @@
 
 #![forbid(unsafe_code)]
 
+/// WL-FUNC-012 / OVERLAY-8 — point-scoped adsb.lol aircraft snapshots shared
+/// by the workstation adapter and Maps & Location.
+pub mod aircraft;
+/// WL-FUNC-012 / OVERLAY-5 — Caltrans CWWP2 camera snapshots shared by the
+/// workstation adapter and Maps & Location.
+pub mod caltrans_camera;
 pub mod cap_tags;
 // WL-ARCH-001 (2026-07-18) — provider-neutral Construct Cloud shared contracts.
 // The SOLE definition site for the mesh cloud's catalog/resource/health/stack
@@ -33,7 +39,14 @@ pub mod device_inventory;
 // dispatches a typed privileged-op request, mackesd's `device_control` worker
 // executes it on the target node. Lands here so neither side depends on the other.
 pub mod device_control;
+/// WL-FUNC-012 / OVERLAY-10 — keyless USGS earthquake latest-wins snapshot
+/// shared by the workstation-side adapter and the Maps & Location surface.
+pub mod earthquake;
 pub mod exposure;
+/// WL-FUNC-012 / OVERLAY-2 — keyless IEM/NWS animated radar tiles.
+pub mod iem_radar;
+pub mod traffic;
+pub mod wildfire;
 // LIGHTHOUSE-2 (2026-06-18) — shared lighthouse discovery + binary health
 // (beacon) derivation from the replicated peer directory. One pure source for
 // the Hub footer, the Workbench Lighthouses tab, and the panel applet so the
@@ -53,6 +66,10 @@ pub mod lighthouse_probe;
 pub mod mesh_storage;
 // NF-11.1 (v2.5) — Nebula facts surface for the peer card.
 pub mod nebula;
+/// WL-FUNC-012 / OVERLAY-1 — keyless NWS active-alert snapshot shared by the
+/// workstation adapter and Maps & Location.
+pub mod nws_alert;
+pub mod nws_forecast;
 pub mod peer_probe;
 // PEERVER-1 (v2.7, 2026-05-29) — peer-data convergence records.
 // Shared home so mackesd (writer, heartbeat tick) + mde-installer
@@ -79,6 +96,9 @@ pub mod service_record;
 // consumer of tags (Peer / Workspace / Container members reference
 // mesh-domain identifiers).
 pub mod tags;
+/// WL-FUNC-012 / OVERLAY-9 — MBTA GTFS-Realtime vehicle snapshots shared by
+/// the workstation adapter and Maps & Location.
+pub mod transit;
 // arch-2 (2026-07-11) — the VDI session-lifecycle wire verb (`action/vdi/session`
 // `SessionRequest`), hoisted out of the `mackesd` session broker so the shell's
 // `discovery` / `session_rail` mirrors reuse the one type instead of maintaining

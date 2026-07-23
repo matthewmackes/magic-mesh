@@ -295,19 +295,32 @@ mod tests {
     #[test]
     fn topics_are_namespaced() {
         assert_eq!(vehicle_state_topic("eagle"), "state/vehicle/eagle");
-        assert_eq!(vehicle_action_topic("set-failover"), "action/vehicle/set-failover");
+        assert_eq!(
+            vehicle_action_topic("set-failover"),
+            "action/vehicle/set-failover"
+        );
     }
 
     #[test]
     fn parse_real_gpgga_no_lock_sample() {
         // The exact sentence captured from the bench MG90's omgtime.g.info.
-        let fix = parse_gpgga("$GPGGA,111504.000,3210.07993,N,09550.95445,W,0,00,99.0,081.94,M,-24.2,M,,*66")
-            .expect("valid GGA");
+        let fix = parse_gpgga(
+            "$GPGGA,111504.000,3210.07993,N,09550.95445,W,0,00,99.0,081.94,M,-24.2,M,,*66",
+        )
+        .expect("valid GGA");
         assert_eq!(fix.fix_type, "no-fix");
         assert_eq!(fix.satellites, 0);
         assert!(!fix.has_fix(), "quality 0 / 0 sats ⇒ no lock");
-        assert!((fix.latitude - 32.167_998).abs() < 1e-4, "lat {}", fix.latitude);
-        assert!((fix.longitude + 95.849_240).abs() < 1e-4, "lon {}", fix.longitude);
+        assert!(
+            (fix.latitude - 32.167_998).abs() < 1e-4,
+            "lat {}",
+            fix.latitude
+        );
+        assert!(
+            (fix.longitude + 95.849_240).abs() < 1e-4,
+            "lon {}",
+            fix.longitude
+        );
         assert!((fix.altitude_m - 81.94).abs() < 0.01);
         assert!((fix.hdop - 99.0).abs() < 0.01);
     }

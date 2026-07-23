@@ -1,12 +1,16 @@
 //! MV-5a — `scheduler`: the **placement slice** of the no-center scheduler.
 //!
 //! Where MV-3 ([`super::vm_lifecycle`]) and MV-4 ([`super::container`]) are the
-//! per-node *actuators* (they turn a host-addressed `action/{vm,container}/
-//! lifecycle` request into `virsh`/`podman` calls) and MV-2
-//! ([`super::kvm_health`]) is the per-node *capacity signal*
-//! (`event/kvm/services`), MV-5a is the *chooser*: it turns a host-agnostic
-//! `action/schedule/place` request into a host-*targeted* create/run on the
-//! matching lifecycle topic, picking the node from the live capacity map.
+//! capability-gated per-node *actuators* and MV-2 ([`super::kvm_health`]) is the
+//! per-node *capacity signal* (`event/kvm/services`), MV-5a is only the
+//! *chooser*: it turns a host-agnostic `action/schedule/place` request into an
+//! auditable placement proposal and desired-state record.
+//!
+//! The scheduler deliberately never publishes to either privileged lifecycle
+//! topic and never receives or mints an arming capability. Execution must come
+//! later through an operator-authorized typed lane. This keeps an unsigned
+//! request on the mesh-writable placement topic from becoming root
+//! `virsh`/`podman` execution.
 //!
 //! ## Shape (mirrors `vm_lifecycle`)
 //!
@@ -16,13 +20,12 @@
 //!   [`plan_placement`] (what to publish) never touch the bus or a clock
 //!   (`now_ms` is passed in).
 //! - The sole outward seam is an injectable [`Publisher`] (production
-//!   [`BusPublisher`] fires the `mde-bus` CLI through
-//!   [`crate::proc_reap::fire_and_reap`], the same fire-and-reap path
-//!   `vm_lifecycle` / `kvm_health` publish on; a `RecordingPublisher` drives the
-//!   tests). The action-topic drain + capacity read are the same short sync
+//!   [`BusPublisher`] writes only the non-privileged placement and desired-state
+//!   event topics; a `RecordingPublisher` drives the tests). The action-topic
+//!   drain + capacity read are the same short sync
 //!   `Persist` open-read-drop `vm_lifecycle` uses (never crosses an `.await`),
 //!   and the cursor is primed to the newest message on start so a restart
-//!   doesn't re-fire a queued placement.
+//!   doesn't re-propose a queued placement.
 //! - Rank-0-default like `vm_lifecycle` / `container` (runs on every node). An
 //!   **interim** lowest-node-id single-actor election ([`is_leader`]) keeps N
 //!   nodes each running this worker from emitting N duplicate placements — it's
@@ -30,7 +33,8 @@
 //!
 //! ## Scope — placement (MV-5a) + failover (MV-5b)
 //!
-//! MV-5a is *place-on-request*: choose a node and forward one create/run.
+//! MV-5a is *place-on-request*: choose a node and record a proposal. It does not
+//! execute that proposal.
 //!
 //! **MV-5b** adds the *survives-node-loss* half on the SAME seams — no new
 //! worker, no new consensus:
@@ -44,8 +48,9 @@
 //!   node has left the mesh — never the dead node, skipped when nothing is live.
 //! - **Failover tick + HA re-election:** the leader (now the lowest *live* node —
 //!   [`is_failover_leader`], the re-election MV-5a's stale-capacity [`is_leader`]
-//!   deferred) re-emits the host-targeted create/run for the new node and updates
-//!   the persisted desired-state, in the existing worker loop.
+//!   deferred) records a new proposal for the replacement node and updates the
+//!   persisted desired-state, in the existing worker loop. It still does not
+//!   bypass operator authorization to execute the workload.
 //!
 //! The live-node set is the etcd-lease-backed peer directory
 //! ([`crate::substrate::peers::read_directory`], seam [`LiveDirectory`]): liveness
@@ -86,49 +91,23 @@ pub type NodeId = String;
 
 // ───────────────────────────── data model ─────────────────────────────
 
-/// The kind of workload to place — selects which lifecycle actuator (and thus
-/// which action topic + birth verb) the placement is forwarded to.
+/// The kind of workload represented by a placement proposal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlaceKind {
-    /// A libvirt/KVM VM — forwarded to [`super::vm_lifecycle`] as `op:"create"`.
+    /// A libvirt/KVM VM proposal.
     Vm,
-    /// A Podman container — forwarded to [`super::container`] as `op:"run"`.
+    /// A Podman container proposal.
     Container,
 }
 
-impl PlaceKind {
-    /// The lifecycle action topic a chosen placement of this kind is published
-    /// to — the real actuator consts, so the topics can't drift.
-    #[must_use]
-    pub fn action_topic(self) -> &'static str {
-        match self {
-            PlaceKind::Vm => super::vm_lifecycle::ACTION_TOPIC,
-            PlaceKind::Container => super::container::ACTION_TOPIC,
-        }
-    }
-
-    /// The lifecycle `op` verb that *creates* a workload of this kind — the tag
-    /// the downstream actuator's action enum expects. A VM is `create`
-    /// ([`super::vm_lifecycle`]'s `Create`), a container is `run`
-    /// ([`super::container`]'s `Run` — there's no define/start split).
-    #[must_use]
-    pub fn birth_op(self) -> &'static str {
-        match self {
-            PlaceKind::Vm => "create",
-            PlaceKind::Container => "run",
-        }
-    }
-}
-
-/// One placement request drained off [`ACTION_TOPIC`]. The `spec` is opaque —
-/// the scheduler forwards it verbatim to the actuator (which owns its shape), so
-/// this worker never has to know a `VmSpec` from a `ContainerSpec`.
+/// One placement request drained off [`ACTION_TOPIC`]. The `spec` is opaque and
+/// retained in the proposal; the scheduler never interprets or executes it.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PlaceRequest {
     /// Whether to place a VM or a container.
     pub kind: PlaceKind,
-    /// The actuator spec, forwarded downstream untouched.
+    /// The proposed workload spec, retained untouched.
     pub spec: serde_json::Value,
     /// An optional node *pin* — honored iff that node is a healthy candidate,
     /// otherwise the scheduler falls back to the healthiest node.
@@ -147,8 +126,8 @@ pub fn parse_request(body: &str) -> Result<PlaceRequest, String> {
     serde_json::from_str(body).map_err(|e| format!("malformed place request: {e}"))
 }
 
-/// The decision published to [`PLACEMENTS_TOPIC`] — an audit trail of *what went
-/// where* (the actuator request itself carries the forwarded spec).
+/// The decision published to [`PLACEMENTS_TOPIC`] — an audit trail of the node
+/// the scheduler recommends. The full spec lives in [`DESIRED_TOPIC`].
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PlacementDecision {
     /// The caller's correlation id, if the request carried one.
@@ -164,17 +143,15 @@ pub struct PlacementDecision {
     pub published_at_ms: u64,
 }
 
-/// The concrete outcome of a placement decision — everything the worker's I/O
-/// shell publishes. Returned by the pure [`plan_placement`] so the request →
-/// publish wiring is testable without a bus.
+/// The concrete, non-executing outcome of a placement decision. Returned by the
+/// pure [`plan_placement`] so the request → event wiring is testable without a
+/// bus.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Placement {
     /// The chosen node.
     pub chosen_host: NodeId,
-    /// The lifecycle action topic to publish the create/run on.
-    pub action_topic: &'static str,
-    /// The host-targeted create/run body (`{"op":…,"host":…,"spec":…}`).
-    pub action_body: String,
+    /// The complete desired-state proposal. This is data, not actuator input.
+    pub desired: DesiredPlacement,
     /// The decision to publish to [`PLACEMENTS_TOPIC`].
     pub decision: PlacementDecision,
 }
@@ -185,11 +162,11 @@ pub struct Placement {
 /// [`DESIRED_TOPIC`] and folded latest-wins-by-key ([`fold_desired`]); it is a
 /// lossless projection of a `Placement` (the audit-only `candidates` /
 /// `published_at_ms` are recomputed, not stored).
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DesiredPlacement {
     /// Whether a VM or a container was placed.
     pub kind: PlaceKind,
-    /// The actuator spec, forwarded downstream untouched (opaque).
+    /// The proposed workload spec, retained untouched (opaque).
     pub spec: serde_json::Value,
     /// The node the workload is currently desired to run on.
     pub chosen_host: NodeId,
@@ -199,23 +176,13 @@ pub struct DesiredPlacement {
 }
 
 impl DesiredPlacement {
-    /// Build the full [`Placement`] envelope (action topic + host-targeted
-    /// create/run body + audit decision) for this desired-state. `candidates` /
-    /// `now_ms` seed the [`PlacementDecision`]. This is the **single source of
-    /// truth** for the create/run wire shape — [`plan_placement`] and the failover
-    /// re-placement both build through it, so the envelope can't drift.
+    /// Build a non-executing [`Placement`] proposal for this desired-state.
+    /// `candidates` / `now_ms` seed the audit decision.
     #[must_use]
     pub fn to_placement(&self, candidates: usize, now_ms: u64) -> Placement {
-        let action_body = serde_json::json!({
-            "op": self.kind.birth_op(),
-            "host": self.chosen_host,
-            "spec": self.spec,
-        })
-        .to_string();
         Placement {
             chosen_host: self.chosen_host.clone(),
-            action_topic: self.kind.action_topic(),
-            action_body,
+            desired: self.clone(),
             decision: PlacementDecision {
                 request_id: self.request_id.clone(),
                 kind: self.kind,
@@ -224,21 +191,6 @@ impl DesiredPlacement {
                 published_at_ms: now_ms,
             },
         }
-    }
-
-    /// Recover the desired-state from a planned / re-placed [`Placement`] (the
-    /// inverse of [`to_placement`]): `kind` + `request_id` come off the decision,
-    /// the opaque `spec` is read back out of the host-targeted body. `None` iff the
-    /// body is not the `{op,host,spec}` envelope this module writes.
-    #[must_use]
-    pub fn from_placement(p: &Placement) -> Option<Self> {
-        let body: serde_json::Value = serde_json::from_str(&p.action_body).ok()?;
-        Some(Self {
-            kind: p.decision.kind,
-            spec: body.get("spec").cloned().unwrap_or(serde_json::Value::Null),
-            chosen_host: p.chosen_host.clone(),
-            request_id: p.decision.request_id.clone(),
-        })
     }
 }
 
@@ -292,8 +244,8 @@ pub fn choose_node(candidates: &[(NodeId, KvmHealth)], req: &PlaceRequest) -> Op
 }
 
 /// Compose the full placement outcome for `req` over the folded `capacity`:
-/// choose the node ([`choose_node`]) then build the host-targeted create/run
-/// body + the decision record. `None` when there is no candidate to place onto.
+/// choose the node ([`choose_node`]) then build the desired-state proposal and
+/// decision record. `None` when there is no candidate to place onto.
 /// Pure — driven directly by tests without a bus.
 #[must_use]
 pub fn plan_placement(
@@ -306,9 +258,8 @@ pub fn plan_placement(
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     let chosen = choose_node(&candidates, req)?;
-    // Forward the opaque spec host-targeted at the chosen node via the shared
-    // envelope builder (the same shape vm_lifecycle/container drain), and carry
-    // the intent as the persistable desired-state.
+    // Retain the opaque spec with the chosen node as persistable desired state.
+    // No privileged lifecycle request is synthesized here.
     let desired = DesiredPlacement {
         kind: req.kind,
         spec: req.spec.clone(),
@@ -405,11 +356,12 @@ pub fn fold_desired<'a>(
 
 /// The pure re-placement decision: for each persisted [`Placement`] whose
 /// `chosen_host` is **not** in `live`, re-pick a target from the surviving live
-/// capacity ([`choose_node`] over `capacity ∩ live`) and rebuild a host-targeted
-/// [`Placement`] for the new node. A placement whose node is still live is left
-/// alone; one with no live candidate to move to is skipped. The dead node is never
-/// a candidate (it is absent from `live`, hence from the filtered capacity), so a
-/// workload is never re-placed back onto the node it is failing away from.
+/// capacity ([`choose_node`] over `capacity ∩ live`) and rebuild a non-executing
+/// [`Placement`] proposal for the new node. A placement whose node is still live
+/// is left alone; one with no live candidate to move to is skipped. The dead node
+/// is never a candidate (it is absent from `live`, hence from the filtered
+/// capacity), so a workload is never re-placed back onto the node it is failing
+/// away from.
 /// Deterministic (input order preserved, [`choose_node`] tie-break) and clock-free
 /// — the failover tick stamps the fresh audit time on the returned decisions.
 #[must_use]
@@ -430,11 +382,9 @@ pub fn replace_decisions(
         if live.contains(&p.chosen_host) {
             continue; // node still alive — the workload keeps running, nothing to do
         }
-        // Recover the desired workload, then re-choose over the LIVE capacity. A
+        // Clone the desired workload, then re-choose over the LIVE capacity. A
         // pin-less request: the original pin, if any, was the node we're leaving.
-        let Some(desired) = DesiredPlacement::from_placement(p) else {
-            continue;
-        };
+        let desired = p.desired.clone();
         let req = PlaceRequest {
             kind: desired.kind,
             spec: serde_json::Value::Null, // choose_node reads only the (absent) pin
@@ -655,8 +605,8 @@ impl SchedulerWorker {
     }
 
     /// Drain new placement requests (advancing the cursor) and, when this node
-    /// is the elected scheduler, choose a node for each + publish the create/run
-    /// and the decision.
+    /// is the elected scheduler, choose a node for each and publish only the
+    /// non-privileged decision + desired-state proposal.
     async fn drain_and_place(&self, bus_root: &Path, cursor: &mut Option<String>) {
         let requests = read_new_requests(bus_root, cursor);
         if requests.is_empty() {
@@ -675,19 +625,17 @@ impl SchedulerWorker {
                     let Ok(decision_body) = serde_json::to_string(&p.decision) else {
                         continue;
                     };
-                    self.publisher.publish(p.action_topic, &p.action_body);
                     self.publisher.publish(PLACEMENTS_TOPIC, &decision_body);
                     // MV-5b — persist the desired-state so the intent survives a
                     // restart / leader change and the failover tick can re-place
-                    // this workload if its node is later lost.
-                    if let Some(desired) = DesiredPlacement::from_placement(&p) {
-                        if let Ok(desired_body) = serde_json::to_string(&desired) {
-                            self.publisher.publish(DESIRED_TOPIC, &desired_body);
-                        }
+                    // this workload if its node is later lost. This is an event,
+                    // never input to a privileged actuator.
+                    if let Ok(desired_body) = serde_json::to_string(&p.desired) {
+                        self.publisher.publish(DESIRED_TOPIC, &desired_body);
                     }
                     tracing::info!(
                         kind = ?req.kind, chosen = %p.chosen_host,
-                        "scheduler: placed workload",
+                        "scheduler: placement proposed; privileged execution requires an operator-authorized typed request",
                     );
                 }
                 None => tracing::warn!(
@@ -702,10 +650,11 @@ impl SchedulerWorker {
     /// the leader acts, and leadership here re-elects over the **live** set
     /// ([`is_failover_leader`]) so a lost leader is taken over. Reads the persisted
     /// desired-state + the live-node directory, computes [`replace_decisions`], and
-    /// for each re-placement re-emits the host-targeted create/run for the new node
-    /// AND updates the persisted desired-state (so the next tick sees the workload
-    /// as running on its new home — idempotent). Runs in the existing loop; no new
-    /// worker, no new consensus. Best-effort like every tick-publisher.
+    /// for each re-placement publishes a new proposal and updates the persisted
+    /// desired-state. It never emits an unsigned privileged lifecycle command;
+    /// execution requires a separate operator-authorized typed request. Runs in
+    /// the existing loop; no new worker, no new consensus. Best-effort like every
+    /// tick-publisher.
     async fn failover_once(&self, bus_root: &Path) {
         // Cheap local-bus read first: no persisted intent ⇒ nothing to fail over
         // (and we skip the directory read entirely).
@@ -727,22 +676,18 @@ impl SchedulerWorker {
             let Ok(decision_body) = serde_json::to_string(&p.decision) else {
                 continue;
             };
-            // 1. Re-emit the host-targeted create/run for the NEW node.
-            self.publisher.publish(p.action_topic, &p.action_body);
-            // 2. Audit the re-placement.
+            // 1. Audit the proposed re-placement.
             self.publisher.publish(PLACEMENTS_TOPIC, &decision_body);
-            // 3. Update the persisted desired-state to the new home (idempotent —
+            // 2. Update the persisted desired-state to the new home (idempotent —
             //    next fold sees the workload as live there, so it isn't re-placed
             //    again).
-            if let Some(updated) = DesiredPlacement::from_placement(&p) {
-                if let Ok(body) = serde_json::to_string(&updated) {
-                    self.publisher.publish(DESIRED_TOPIC, &body);
-                }
+            if let Ok(body) = serde_json::to_string(&p.desired) {
+                self.publisher.publish(DESIRED_TOPIC, &body);
             }
             tracing::warn!(
                 target: "mackesd::alert",
                 chosen = %p.chosen_host,
-                "ALERT (warn): scheduler re-placed a workload after node loss (MV-5b failover)",
+                "ALERT (warn): scheduler proposed re-placement after node loss; privileged execution still requires operator authorization",
             );
         }
     }
@@ -885,10 +830,10 @@ mod tests {
         assert_eq!(map["node-b"].active, 3);
     }
 
-    // ── plan_placement (the published envelopes) ──
+    // ── plan_placement (the non-executing proposal) ──
 
     #[test]
-    fn plan_placement_builds_a_host_targeted_vm_create() {
+    fn plan_placement_builds_a_vm_proposal() {
         let cap = fold_capacity([
             serde_json::to_string(&health("node-a", 2, true))
                 .unwrap()
@@ -905,31 +850,25 @@ mod tests {
         };
         let p = plan_placement(&cap, &r, 1234).expect("a placement");
         assert_eq!(p.chosen_host, "node-b"); // healthiest
-        assert_eq!(p.action_topic, super::super::vm_lifecycle::ACTION_TOPIC);
-        // The forwarded body is a host-targeted create the vm_lifecycle actuator
-        // deserializes, carrying the opaque spec verbatim.
-        let body: serde_json::Value = serde_json::from_str(&p.action_body).unwrap();
-        assert_eq!(body["op"], "create");
-        assert_eq!(body["host"], "node-b");
-        assert_eq!(body["spec"]["name"], "web1");
-        assert_eq!(body["spec"]["vcpus"], 2);
+        assert_eq!(p.desired.kind, PlaceKind::Vm);
+        assert_eq!(p.desired.chosen_host, "node-b");
+        assert_eq!(p.desired.spec["name"], "web1");
+        assert_eq!(p.desired.spec["vcpus"], 2);
         assert_eq!(p.decision.request_id.as_deref(), Some("req-42"));
         assert_eq!(p.decision.candidates, 2);
         assert_eq!(p.decision.published_at_ms, 1234);
     }
 
     #[test]
-    fn plan_placement_container_uses_run_op_and_topic() {
+    fn plan_placement_builds_a_container_proposal() {
         let cap = fold_capacity([serde_json::to_string(&health("n1", 3, true))
             .unwrap()
             .as_str()]);
         let r = req(PlaceKind::Container, None);
         let p = plan_placement(&cap, &r, 0).expect("a placement");
-        assert_eq!(p.action_topic, super::super::container::ACTION_TOPIC);
-        let body: serde_json::Value = serde_json::from_str(&p.action_body).unwrap();
-        // A container's birth verb is `run`, not `create`.
-        assert_eq!(body["op"], "run");
-        assert_eq!(body["host"], "n1");
+        assert_eq!(p.desired.kind, PlaceKind::Container);
+        assert_eq!(p.desired.chosen_host, "n1");
+        assert_eq!(p.desired.spec["name"], "w1");
     }
 
     #[test]
@@ -982,15 +921,8 @@ mod tests {
         assert!(ACTION_TOPIC.starts_with("action/"));
         assert_eq!(PLACEMENTS_TOPIC, "event/schedule/placements");
         assert!(PLACEMENTS_TOPIC.starts_with("event/"));
-        // The forward topics are the real actuator consts (no drift).
-        assert_eq!(
-            PlaceKind::Vm.action_topic(),
-            super::super::vm_lifecycle::ACTION_TOPIC
-        );
-        assert_eq!(
-            PlaceKind::Container.action_topic(),
-            super::super::container::ACTION_TOPIC
-        );
+        assert_eq!(DESIRED_TOPIC, "event/schedule/desired");
+        assert!(DESIRED_TOPIC.starts_with("event/"));
     }
 
     #[test]
@@ -1073,21 +1005,18 @@ mod tests {
     }
 
     #[test]
-    fn replace_decisions_retargets_the_action_to_the_new_node() {
-        // A container re-places as a container (run op + container topic), the
-        // opaque spec + request_id are preserved, and the action is host-targeted
-        // at the NEW node.
+    fn replace_decisions_retargets_the_proposal_to_the_new_node() {
+        // A container remains a container, its opaque spec + request_id are
+        // preserved, and the proposal names the NEW node.
         let persisted =
             vec![dp(PlaceKind::Container, "peer:b", "svc1", Some("r7")).to_placement(0, 100)];
         let capacity = cap(&[("peer:a", 3, true)]);
         let out = replace_decisions(&persisted, &live_set(&["peer:a"]), &capacity);
         assert_eq!(out.len(), 1);
         let p = &out[0];
-        assert_eq!(p.action_topic, super::super::container::ACTION_TOPIC);
-        let body: serde_json::Value = serde_json::from_str(&p.action_body).unwrap();
-        assert_eq!(body["op"], "run");
-        assert_eq!(body["host"], "peer:a");
-        assert_eq!(body["spec"]["name"], "svc1");
+        assert_eq!(p.desired.kind, PlaceKind::Container);
+        assert_eq!(p.desired.chosen_host, "peer:a");
+        assert_eq!(p.desired.spec["name"], "svc1");
         assert_eq!(p.chosen_host, "peer:a");
         assert_eq!(p.decision.chosen_host, "peer:a");
         assert_eq!(p.decision.kind, PlaceKind::Container);
@@ -1185,14 +1114,14 @@ mod tests {
     }
 
     #[test]
-    fn desired_placement_round_trips_through_a_placement() {
+    fn desired_placement_is_retained_in_the_proposal() {
         let d = dp(PlaceKind::Container, "peer:a", "svc", Some("rid"));
         let p = d.to_placement(3, 42);
         // The audit envelope carried the seeds…
         assert_eq!(p.decision.candidates, 3);
         assert_eq!(p.decision.published_at_ms, 42);
-        // …and the intent recovers losslessly.
-        assert_eq!(DesiredPlacement::from_placement(&p).expect("recover"), d);
+        // …and the intent is retained losslessly as data, not an action body.
+        assert_eq!(p.desired, d);
     }
 
     #[test]
@@ -1222,7 +1151,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failover_tick_re_emits_and_repersists_on_node_loss() {
+    async fn failover_tick_proposes_and_repersists_on_node_loss() {
         use mde_bus::hooks::config::Priority;
         // Seed a temp bus: capacity for two live nodes + one desired placement on a
         // node whose lease has since lapsed (peer:b).
@@ -1262,25 +1191,22 @@ mod tests {
         w.failover_once(&dir).await;
 
         let sent = log.lock().expect("recorder mutex");
-        // 1. Re-emitted a host-targeted VM create for the healthiest live node.
-        let action = sent
-            .iter()
-            .find(|(t, _)| t == super::super::vm_lifecycle::ACTION_TOPIC)
-            .expect("re-emitted create");
-        let body: serde_json::Value = serde_json::from_str(&action.1).unwrap();
-        assert_eq!(body["op"], "create");
-        assert_eq!(body["host"], "peer:c");
-        assert_eq!(body["spec"]["name"], "w1");
-        // 2. Persisted desired-state updated to the new home.
+        assert!(
+            sent.iter().all(|(topic, _)| !topic.starts_with("action/")),
+            "failover must never bypass the privileged actuator gates: {sent:?}"
+        );
+        // 1. Persisted desired-state was proposed for the new home.
         let updated = sent
             .iter()
             .find(|(t, _)| t == DESIRED_TOPIC)
             .expect("re-persisted desired-state");
         let ud: DesiredPlacement = serde_json::from_str(&updated.1).unwrap();
         assert_eq!(ud.chosen_host, "peer:c");
+        assert_eq!(ud.spec["name"], "w1");
         assert_eq!(ud.request_id.as_deref(), Some("r1"));
-        // 3. Audit trail emitted.
+        // 2. Audit trail emitted; these are the only two outward events.
         assert!(sent.iter().any(|(t, _)| t == PLACEMENTS_TOPIC));
+        assert_eq!(sent.len(), 2);
         drop(sent);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1328,9 +1254,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn placement_persists_desired_state() {
+    async fn placement_requests_publish_only_non_privileged_proposal_events() {
         use mde_bus::hooks::config::Priority;
-        // A place request + a single healthy node (⇒ leader + only candidate).
+        // VM + container requests and one healthy node (leader + only candidate).
         let dir = std::env::temp_dir().join(format!("mde-sched-persist-{}", now_ms()));
         {
             let persist = Persist::open(dir.clone()).expect("open bus");
@@ -1342,20 +1268,25 @@ mod tests {
                     Some(&serde_json::to_string(&health("peer:a", 3, true)).unwrap()),
                 )
                 .expect("write capacity");
-            let request = PlaceRequest {
-                kind: PlaceKind::Vm,
-                spec: serde_json::json!({ "name": "web1" }),
-                host: None,
-                request_id: Some("r1".into()),
-            };
-            persist
-                .write(
-                    ACTION_TOPIC,
-                    Priority::Default,
-                    None,
-                    Some(&serde_json::to_string(&request).unwrap()),
-                )
-                .expect("write request");
+            for (kind, name, request_id) in [
+                (PlaceKind::Vm, "web1", "r1"),
+                (PlaceKind::Container, "api1", "r2"),
+            ] {
+                let request = PlaceRequest {
+                    kind,
+                    spec: serde_json::json!({ "name": name }),
+                    host: None,
+                    request_id: Some(request_id.into()),
+                };
+                persist
+                    .write(
+                        ACTION_TOPIC,
+                        Priority::Default,
+                        None,
+                        Some(&serde_json::to_string(&request).unwrap()),
+                    )
+                    .expect("write request");
+            }
         }
         let rec = RecordingPublisher::default();
         let log = rec.sent.clone();
@@ -1364,21 +1295,32 @@ mod tests {
         w.drain_and_place(&dir, &mut cursor).await;
 
         let sent = log.lock().expect("recorder mutex");
-        // The desired-state is persisted alongside the create + audit, carrying the
-        // full intent so a later failover can re-place it.
-        let desired = sent
+        assert!(
+            sent.iter().all(|(topic, _)| topic.starts_with("event/")),
+            "an unsigned placement must never publish a privileged action: {sent:?}"
+        );
+        assert_eq!(
+            sent.iter()
+                .filter(|(topic, _)| topic == PLACEMENTS_TOPIC)
+                .count(),
+            2
+        );
+        let desired: Vec<DesiredPlacement> = sent
             .iter()
-            .find(|(t, _)| t == DESIRED_TOPIC)
-            .expect("persisted desired-state");
-        let d: DesiredPlacement = serde_json::from_str(&desired.1).unwrap();
-        assert_eq!(d.kind, PlaceKind::Vm);
-        assert_eq!(d.chosen_host, "peer:a");
-        assert_eq!(d.spec["name"], "web1");
-        assert_eq!(d.request_id.as_deref(), Some("r1"));
-        // …and the host-targeted create was emitted too.
-        assert!(sent
+            .filter(|(topic, _)| topic == DESIRED_TOPIC)
+            .map(|(_, body)| serde_json::from_str(body).expect("desired proposal"))
+            .collect();
+        assert_eq!(desired.len(), 2);
+        assert!(desired
             .iter()
-            .any(|(t, _)| t == super::super::vm_lifecycle::ACTION_TOPIC));
+            .any(|proposal| proposal.kind == PlaceKind::Vm && proposal.spec["name"] == "web1"));
+        assert!(desired.iter().any(|proposal| {
+            proposal.kind == PlaceKind::Container && proposal.spec["name"] == "api1"
+        }));
+        assert!(desired
+            .iter()
+            .all(|proposal| proposal.chosen_host == "peer:a"));
+        assert_eq!(sent.len(), 4, "two audit + two desired events only");
         drop(sent);
         let _ = std::fs::remove_dir_all(&dir);
     }

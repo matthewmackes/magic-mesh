@@ -403,21 +403,6 @@ pub(crate) struct ConnectRequest {
     pub preferred_size: Option<(u16, u16)>,
 }
 
-/// Log-safe taskbar thumbnail source for the currently requested Desktop
-/// session. The GPU handle is an egui ref-counted texture clone, not a framebuffer
-/// copy.
-#[derive(Clone)]
-pub(crate) struct DesktopPreviewFrame {
-    /// Broker roster key when this desktop came from `action/vdi/session`.
-    pub(crate) broker_session_id: Option<String>,
-    /// Human target label.
-    pub(crate) label: String,
-    /// Short protocol badge.
-    pub(crate) protocol: &'static str,
-    /// Live desktop texture.
-    pub(crate) texture: TextureHandle,
-}
-
 impl ConnectRequest {
     /// Assemble a request from the picked target + the three display choices + the
     /// resolved auth (CHOOSER-6).
@@ -1208,18 +1193,21 @@ impl VdiState {
             .map(|r| (r.target.name.as_str(), r.protocol.label()))
     }
 
-    /// Return a live taskbar thumbnail source for the current Desktop session.
-    /// No texture means no frame has landed yet, so the dock keeps its static
+    /// Return a live thumbnail source for the current Desktop session.
+    /// No texture means no frame has landed yet, so callers keep their static
     /// protocol-card fallback.
-    pub(crate) fn taskbar_preview_frame(&self) -> Option<DesktopPreviewFrame> {
+    pub(crate) fn session_preview_frame(&self) -> Option<crate::surfaces::SessionPreviewTexture> {
         let request = self.requested.as_ref()?;
         let texture = self.texture.clone()?;
-        Some(DesktopPreviewFrame {
-            broker_session_id: request.broker_session.as_ref().map(|b| b.id.clone()),
-            label: request.target.name.clone(),
-            protocol: request.protocol.label(),
+        Some(crate::surfaces::SessionPreviewTexture::new(
+            request
+                .broker_session
+                .as_ref()
+                .map(|broker| broker.id.clone()),
+            &request.target.name,
+            request.protocol.label(),
             texture,
-        })
+        ))
     }
 
     /// Record the connect the Chooser's picker chose (CHOOSER-4). The surface then

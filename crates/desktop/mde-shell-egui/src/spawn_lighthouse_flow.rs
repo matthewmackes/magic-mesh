@@ -321,7 +321,7 @@ impl SpawnLighthouseFlowState {
 
         // No Bus on this box ⇒ the shared honest EmptyState, not a dead form.
         if self.bus_root.is_none() {
-            crate::session::empty_state(
+            crate::empty_state::show(
                 ui,
                 "No mesh Bus",
                 "A lighthouse is spawned over the Bus \u{2014} join this node to a mesh first.",

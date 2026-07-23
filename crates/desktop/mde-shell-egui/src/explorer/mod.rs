@@ -53,9 +53,10 @@
 //! - **Cloud instance** — `Console` (routes to the Desktop/VDI surface when the
 //!   instance reports an address, else honestly disabled), and
 //!   `Start` / `Stop` / `Reboot` / `Delete` — each publishes an [`InstanceReq`]
-//!   on `action/cloud/<verb>`, the **QC-11** typed cloud bus the openstack worker
-//!   drains (§6 — a wire mirror, not a daemon-crate link, over the SAME Bus this
-//!   surface reads `state/units` from). A volume/image/network hero offers
+//!   on `action/cloud/<verb>`, the provider-neutral typed cloud bus the
+//!   **Workloads cloud worker** drains (§6 — a wire mirror, not a daemon-crate
+//!   link, over the SAME Bus this surface reads `state/units` from). A
+//!   volume/image/network hero offers
 //!   `Inspect` (routes to the Cloud surface); its `Delete` is honestly disabled
 //!   (the QC-11 verb set is instance-only).
 //! - **Peer** — `Open in Fleet` (routes to the Mesh view), a live `Health-check`
@@ -612,10 +613,11 @@ impl UnitsClient for BusUnits {
 
 // ─────────────────────── the action-dispatch seam (EXPLORER-5) ───────────────────────
 
-/// The `action/cloud/` namespace prefix every QC-11 cloud verb request rides —
-/// a **local mirror** of `mackes_mesh_types::cloud::CLOUD_ACTION_PREFIX`
-/// (§6: the shell mirrors the wire contract, never links the daemon crate). A
-/// byte-pinned test keeps it equal to the shared prefix.
+/// The `action/cloud/` namespace prefix every provider-neutral Workloads cloud
+/// worker request rides — a **local mirror** of
+/// `mackes_mesh_types::cloud::CLOUD_ACTION_PREFIX` (§6: the shell mirrors the
+/// wire contract, never links the daemon crate). A byte-pinned test keeps it
+/// equal to the shared prefix.
 const CLOUD_ACTION_PREFIX: &str = "action/cloud/";
 
 /// The aggregator's E9 pull verb — a mirror of
@@ -628,13 +630,18 @@ fn cloud_topic(verb: &str) -> String {
     format!("{CLOUD_ACTION_PREFIX}{verb}")
 }
 
-/// The shell's mirror of the openstack worker's `InstanceRequest` — the typed
-/// body a lifecycle verb takes (§6: serialises to the identical `{"instance":…}`
-/// body `verbs::parse_instance_request` decodes, never a daemon-crate link).
+/// Exact cloud lifecycle request before its short-lived capability is inserted.
 #[derive(Debug, Serialize)]
 struct InstanceReq {
-    /// The Nova server id (or name) to act on.
+    /// Current typed cloud-action wire schema.
+    schema_version: u16,
+    /// Placement node that reported the cloud object.
+    node: String,
+    /// Cloud server id (or name) to act on.
     instance: String,
+    /// Destructive delete confirmation, bound to the exact target.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    typed_name: Option<String>,
 }
 
 /// The injectable publish seam over the Bus — production writes each request
@@ -794,12 +801,14 @@ const fn verbs_for(kind: UnitKind) -> &'static [Verb] {
 /// A resolved real seam a verb dispatches through.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum HeroAction {
-    /// Publish an [`InstanceReq`] on `action/cloud/<verb>` (QC-11).
+    /// Publish an [`InstanceReq`] on the provider-neutral Workloads cloud bus.
     Cloud {
         /// The `instance-*` verb stem.
         verb: &'static str,
         /// The target Nova object id.
         instance: String,
+        /// The real placement node carried by the unit mirror.
+        node: String,
     },
     /// Publish the units get-stream request (a live health refresh).
     Refresh,
@@ -812,12 +821,38 @@ enum HeroAction {
     },
 }
 
+fn authorized_instance_request_with(
+    verb: &str,
+    instance: &str,
+    node: &str,
+    authorize: impl FnOnce(&str, &str, &str, &str) -> Result<String, String>,
+) -> Result<String, String> {
+    let body = serde_json::to_string(&InstanceReq {
+        schema_version: mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION,
+        node: node.to_string(),
+        instance: instance.to_string(),
+        typed_name: (verb == "instance-delete").then(|| instance.to_string()),
+    })
+    .map_err(|error| error.to_string())?;
+    authorize(&body, verb, node, instance)
+}
+
 /// Resolve a verb on `unit` to its real seam, or an honest reason it is disabled
 /// (§7 — a verb with no reachable seam is never a live no-op button).
 fn verb_seam(verb: Verb, unit: &Unit) -> Result<HeroAction, String> {
-    let cloud = |stem: &'static str| HeroAction::Cloud {
-        verb: stem,
-        instance: cloud_object_id(unit),
+    let cloud = |stem: &'static str| {
+        let Reachability::CloudObject { node } = &unit.reachability else {
+            return Err("Cloud lifecycle requires an explicit placement node.".to_string());
+        };
+        let node = node.trim();
+        if node.is_empty() {
+            return Err("Cloud lifecycle requires an explicit placement node.".to_string());
+        }
+        Ok(HeroAction::Cloud {
+            verb: stem,
+            instance: cloud_object_id(unit),
+            node: node.to_string(),
+        })
     };
     match verb {
         Verb::Console => match unit.address.as_deref() {
@@ -827,10 +862,10 @@ fn verb_seam(verb: Verb, unit: &Unit) -> Result<HeroAction, String> {
             }),
             _ => Err("No console endpoint reported yet.".to_string()),
         },
-        Verb::Start => Ok(cloud("instance-start")),
-        Verb::Stop => Ok(cloud("instance-stop")),
-        Verb::Reboot => Ok(cloud("instance-reboot")),
-        Verb::Delete => Ok(cloud("instance-delete")),
+        Verb::Start => cloud("instance-start"),
+        Verb::Stop => cloud("instance-stop"),
+        Verb::Reboot => cloud("instance-reboot"),
+        Verb::Delete => cloud("instance-delete"),
         Verb::Inspect => Ok(HeroAction::Goto {
             verb: "shell/goto/instances".to_string(),
             headline: format!("Open the Cloud surface to inspect {}.", unit.name),
@@ -2111,6 +2146,22 @@ impl ExplorerState {
         items
     }
 
+    /// Real placement node reported for one cloud unit. Front Door uses this
+    /// lookup at publish time so a stale/search-only id can never broadcast a
+    /// lifecycle mutation or guess a host.
+    pub(crate) fn cloud_placement_node(&self, unit_id: &str) -> Option<&str> {
+        self.units
+            .iter()
+            .find(|unit| unit.id == unit_id)
+            .and_then(|unit| match &unit.reachability {
+                Reachability::CloudObject { node } => {
+                    let node = node.trim();
+                    (!node.is_empty()).then_some(node)
+                }
+                Reachability::InMesh | Reachability::OnLan => None,
+            })
+    }
+
     /// Whether the Front Door can safely advertise mesh search as backed by a
     /// configured local source. This is metadata only; it does not poll the Bus.
     pub(crate) fn search_omnibox_source_configured(&self) -> bool {
@@ -2705,11 +2756,17 @@ impl ExplorerState {
     /// Publish one resolved seam over the injected sink.
     fn dispatch(&self, action: &HeroAction) -> Result<(), String> {
         match action {
-            HeroAction::Cloud { verb, instance } => {
-                let body = serde_json::to_string(&InstanceReq {
-                    instance: instance.clone(),
-                })
-                .map_err(|e| e.to_string())?;
+            HeroAction::Cloud {
+                verb,
+                instance,
+                node,
+            } => {
+                let body = authorized_instance_request_with(
+                    verb,
+                    instance,
+                    node,
+                    crate::iac::authorize_root_mutation_body,
+                )?;
                 self.action_sink.publish(&cloud_topic(verb), &body)
             }
             HeroAction::Refresh => self.action_sink.publish(UNITS_REQUEST_TOPIC, "{}"),

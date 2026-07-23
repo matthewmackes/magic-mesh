@@ -66,11 +66,11 @@ master rule.)*
 - **Public boundary — 3 tiers (CONNECT):** Public (Nebula/4242 + SSH/22 +
   enroll/4243) · Mesh · Ingress-exposed (lighthouse reverse-proxy). Posture is
   **mesh-allow / public-deny**, drift-corrected firewalld on every node.
-- **CONSTRUCT-CLOUD additions (2026-07-03, `docs/design/quasar-cloud.md`):** the
-  mesh etcd also serves **tooz** coordination for the OpenStack services;
-  **Designate becomes the mesh name service**, fed (and re-seedable) by the
-  etcd peer directory. Nebula remains the substrate — Neutron/OVN rides on top
-  and never replaces it.
+- **CONSTRUCT-CLOUD cutover (newest lock 2026-07-22):** cloud desired state and
+  OpenTofu state remain mesh-coordinated through etcd; Ansible inventory derives
+  from the live mesh roster. Nebula remains the substrate. Libvirt networks use
+  NetworkManager/nmstate and never replace the overlay. The retired OpenStack
+  coordination and name-service stack is not part of production architecture.
 
 ## §2 — The Bus (not D-Bus)
 
@@ -88,11 +88,10 @@ values, asserted by config tests: **Ed25519** node identity · **AES-256-GCM** /
 **ChaCha20-Poly1305** · **XChaCha20-Poly1305** CA backup · **RSA-4096** KDC device
 identity. No OpenSSL — **rustls** throughout. The loopback debug-SSH
 (NET-INTROSPECT) and documented MD5 interop exceptions (thumbnail cache, Subsonic
-auth, SIP digest) stand as recorded. **Clarified 2026-07-03 (CONSTRUCT-CLOUD Q13):
-the no-OpenSSL/rustls lock governs MCNF's own code; hosted workloads (e.g. the
-Kolla OpenStack containers) bring their own crypto stacks.** The OpenStack APIs
-bind **plaintext to the Nebula interface only** — the overlay is their transport
-security (Q23).
+auth, SIP digest) stand as recorded. The no-OpenSSL/rustls lock governs MCNF's
+own code; independently hosted workloads may bring their own crypto stacks.
+Typed platform control traffic remains authenticated and confined to the mesh;
+workload-provider APIs are never exposed as a second public control plane.
 
 ## §4 — Look & toolkit: egui-native, Apple-HIG-principled (2026-07-22 — replaces the Win10-hybrid chrome direction)
 
@@ -143,30 +142,16 @@ security (Q23).
 > The forked-`cosmic-comp` desktop is **retired** before any code landed; MCNF does
 > **not** fork or ship a Wayland compositor.
 
-> **REVISED 2026-07-03 — CONSTRUCT-CLOUD (90-Q `/plan` survey →
-> `docs/design/quasar-cloud.md`). The VM plane is now OpenStack.**
-> **Nova + Placement replace the mesh-native VM scheduler** (the
-> `mesh-virt-management.md` "mesh-native #5" lock is superseded); the hypervisor
-> is **libvirt/QEMU-KVM** — **cloud-hypervisor is retired** wherever older
-> sections name it. OpenStack services run as **Kolla containers under
-> Podman**, supervised by a **mackesd `openstack` worker** rendering config from
-> fleet state (one-state doctrine) — control plane **distributed, APIs on every
-> node, no controller box**; role stays configuration (services are pure
-> workloads — the 2-role lock stands). VDI desktops become **Nova instances +
-> a broker overlay** (display path / roaming / seat binding). Glance+DIB replace
-> the golden-image script; Cinder (LVM) adds volumes; **Cockpit's interim
-> console retires at cutover**; the Podman container plane, ISO installer, and
-> build farm are unchanged. Old-stack code is **deleted on per-node hard
-> cutover** (§7).
-
-> **NEWER LOCK 2026-07-18 — CONSTRUCT-CLOUD provider-neutral runway.** The
-> OpenStack/Kolla/Nova/Heat implementation above remains a valid installed
-> backend while replacement work is underway, but it is no longer the product
-> architecture target. New Construct Cloud work must move shell surfaces, Bus
-> verbs, persisted mirrors, docs, and operator copy toward provider-neutral
-> contracts where OpenStack is only one adapter. Do not delete or disable the
-> current backend before a provider-neutral seam, compatibility tests, and a
-> replacement-provider proof can carry list/launch/lifecycle behavior.
+> **NEWEST LOCK 2026-07-22 — zero-OpenStack local-first cloud cutover.** The
+> transitional OpenStack/Kolla/Nova/Heat/Keystone architecture is retired and
+> its production code has been deleted. Do not reintroduce it as a backend or
+> compatibility shim. Construct Cloud exposes provider-neutral Workloads
+> contracts through typed `mackesd` Bus verbs. **OpenTofu provisions** local
+> **libvirt/QEMU-KVM** VMs and networks; **Ansible configures** nodes and
+> workloads from mesh-derived inventory; **Podman + Quadlet** delivers service
+> containers; bootc + osbuild/image-builder owns images. Tofu state is
+> etcd-backed, secrets come only through mde-seal, and Nebula remains the mesh
+> network. `cloud-hypervisor` and the OpenStack control plane are retired.
 
 - **The host is an egui thin client, not a general desktop.** The whole UI is a
   single **egui shell that owns the DRM/KMS seat directly** (the §4 `mde-egui` smithay
@@ -176,8 +161,8 @@ security (Q23).
   desktop and **expands into the full Workbench**.
 - **The desktop you use is a VM.** A Workstation **brokers and displays full OS
   desktops** (Windows/Ubuntu/…) that run either **locally on libvirt/QEMU-KVM
-  through Nova** or **remotely on any mesh peer** (a **headless Workstation**
-  serving VM desktops over the same libvirt/QEMU-KVM stack), rendered
+  through the typed Workloads plane** or **remotely on any mesh peer** (a
+  **headless Workstation** serving VM desktops over the same libvirt/QEMU-KVM stack), rendered
   **egui-native** (ironrdp/vnc → an egui texture) over Nebula. A "session" is a
   fullscreen VM desktop; sessions **roam** per-peer via etcd/Syncthing. The
   mesh-control surfaces (Workbench/Files/Music/Voice) are **panels inside the one
@@ -251,7 +236,7 @@ runtime-reachability bar is unchanged — `/preview` stays optional/best-effort.
 ## §8 — Positioning & trust envelope
 
 **Production workgroup-grade, not hyperscale.** Infrastructure envelope: a single
-workgroup of up to **3 lighthouses + 9 peers** of the Lighthouse/XCP-NG/Workstation
+workgroup of up to **3 lighthouses + 9 peers** of the Lighthouse/Workstation
 roles. Trust stays **flat / open-mesh** (any enrolled cert reaches every peer +
 service; no per-service ACL) — the §0 "Simple" lever, accepted because the envelope
 is a small trusted workgroup; the blast radius is documented for operators. Security
@@ -267,15 +252,12 @@ revocation evicts the data plane; unpinned node fails closed; hash-chain audit).
 > operators** (extends ENT-12), guests stay **default-deny inbound**, and
 > per-service ACLs are revisited if the envelope grows materially.
 
-> **CONSTRUCT-CLOUD revision (2026-07-03 — `docs/design/quasar-cloud.md`).**
-> **Cloud instances are "inside" without certs:** they live on one flat
-> Neutron/OVN provider network bridged into the mesh, with **default-open
-> security groups** — no per-instance Nebula certs (the VDI dual-homing
-> precedent does not extend to cloud instances). The **§8 envelope is raised
-> for compute nodes** (control plane stays workgroup-small; compute scales to
-> dozens). Two guardrails temper the flat trust: **hard per-user Keystone
-> quotas** (the mesh's first hard authorization boundary — a documented
-> departure from §9 no-RBAC) and the extended ENT-12 blast-radius doc.
+> **CONSTRUCT-CLOUD revision (newest lock 2026-07-22).** Local libvirt VMs and
+> Podman workloads are not silently treated as enrolled mesh peers. Network and
+> exposure are declared through the provider-neutral Workloads contract;
+> Nebula enrollment remains the boundary for full flat-mesh trust. The compute
+> envelope may grow beyond the infrastructure-peer cap, but doing so does not
+> create a second identity, quota, or authorization authority.
 
 ## §9 — The five planes
 
@@ -283,7 +265,7 @@ revocation evicts the data plane; unpinned node fails closed; hash-chain audit).
 planes**: **This Node** · **Controller** · **Network** · **Fleet** ·
 **Provisioning** — with the **Peers directory as the Front Door** and
 desktop-personal panels grouped below. Locks: **no RBAC** (access to the mesh IS
-the control plane) · **3 roles + capability tags** (hop/execution/headless) ·
+the control plane) · **2 roles + capability tags** (hop/execution/headless) ·
 **the Controller is a plane, not a place** (etcd + Syncthing; the elected leader
 only coordinates) · **remote execution is typed verbs + signed job bundles only**
 (no raw shell) · **one state doctrine** (etcd + TOML/YAML on Syncthing + typed
@@ -293,24 +275,15 @@ the renderers-not-authorities doctrine are unchanged. **E12 adds** the desktop
 plane's per-peer workspace + mesh-overlay state to the one-state doctrine
 (etcd/Syncthing-backed).
 
-> **CONSTRUCT-CLOUD revision (2026-07-03).** **The Controller plane BECOMES the
-> Cloud plane** — OpenStack is now the control brain this plane described:
-> instances · volumes+snapshots · images · networks+stacks, self-served by
-> **every mesh member** (invisible SSO via the Keystone identity bridge;
-> **Keystone absorbs human identity**, the CA/KDC narrows to machine certs).
-> The doctrines hold: GUIs stay renderers, **typed mackesd verbs wrap the
-> OpenStack APIs** (surfaces never speak raw OpenStack), fleet state stays
-> authoritative and *renders* Heat. **mde-bus remains THE platform bus** —
-> RabbitMQ is OpenStack-internal RPC only (§2 untouched). One amendment:
-> **hard per-user quotas** are enforced in the cloud plane (see §8) — the
-> documented exception to "no RBAC".
-
-> **CONSTRUCT-CLOUD provider-neutral amendment (2026-07-18).** The Cloud plane
-> remains the Controller plane, but product-facing architecture must be Construct
-> Cloud contracts first and provider adapters second. OpenStack-specific API,
-> identity, orchestration, notification, and mirror names are backend details;
-> user-facing surfaces and new contracts should not require those names except
-> in explicit diagnostics for the installed OpenStack adapter.
+> **CONSTRUCT-CLOUD amendment (newest lock 2026-07-22).** The Controller plane's
+> workload functions are exposed as provider-neutral Construct Cloud contracts:
+> workloads, images, networks, containers, configuration, lifecycle, and status.
+> GUIs remain renderers; typed `mackesd` verbs own validation, placement,
+> authorization, and audit. The current adapter renders OpenTofu for provisioning
+> and runs Ansible for configuration against local libvirt/KVM, NetworkManager,
+> Podman/Quadlet, and bootc/osbuild. `mde-bus` remains the only platform bus;
+> etcd plus declared files remain the one-state authority. No provider-specific
+> identity or control plane may become a second platform authority.
 
 ## §10 — Build & development environment (canonical — do not rediscover)
 
@@ -332,15 +305,15 @@ building.** Load-bearing facts: two build surfaces (local dev
 host + the Fedora farm VMs); Rust pin `1.94.0` / MSRV `1.85`; the
 `opus-devel`-in-CRB EL9 trap; the farm is IaC (`infra/tofu/` + `infra/ansible/`);
 the **GitOps reconciler on a timer** is the canonical build lane (no AI in the
-build loop). **E12 note:** the GUI build is now an **egui/eframe** compile
-(winit + wgpu) plus the forked-compositor crates; update the farm's GUI build
-expectations accordingly (libcosmic is gone).
+build loop). **E12 note:** the GUI build is now an **egui/eframe** compile over
+the direct DRM/GBM runner; update the farm's GUI build expectations accordingly
+(libcosmic and the forked compositor are gone).
 
 **§10.0.1 — BigBoy takes the longest / most-complex build (standing rule, operator
 2026-06-30).** The single heaviest job always routes to **XEN-BIGBOY**
 (`172.20.0.130`, 12 vCPU / ~20 GiB — the high-capacity build VM): a full
 `cargo --workspace` build/test/clippy, the biggest egui crates
-(`mde-shell-egui` / `mde-workbench`), a cold cosmic/iced/wgpu compile, or the RPM
+(`mde-shell-egui`), a cold egui/eframe/wgpu compile, or the RPM
 release build. The 4-vCPU nodes (`.50` / `.90` / `.170`) take the shorter/simpler
 jobs (single small crates, per-crate tests/clippy). This composes with the ≤-cap
 spread (`docs/BUILD-ENVIRONMENT.md`): spread the *count* to honor per-node caps,

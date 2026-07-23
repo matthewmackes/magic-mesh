@@ -24,8 +24,6 @@ pub(super) enum MenuAction {
     ProvisionPlan,
     /// Open the typed-confirm for a live provision apply (`Provision → Apply`).
     ProvisionApply,
-    /// Open the typed-confirm for an infrastructure destroy (`Provision → Destroy`).
-    Destroy,
     /// Emit a configuration check (dry-run) — direct (`Configure → Check`).
     ConfigureCheck,
     /// Open the typed-confirm for a live configuration apply (`Configure → Apply`).
@@ -66,11 +64,6 @@ fn build_menus() -> Vec<Menu<MenuAction>> {
                 Entry::Item(Item::new(
                     MenuAction::ProvisionApply,
                     "Apply infrastructure\u{2026}",
-                )),
-                Entry::Separator,
-                Entry::Item(Item::new(
-                    MenuAction::Destroy,
-                    "Destroy infrastructure\u{2026}",
                 )),
             ],
         ),
@@ -183,10 +176,6 @@ pub(super) fn apply(state: &mut WorkloadsState, action: MenuAction) {
             state.set_panel(Panel::Provision);
             state.arm_provision();
         }
-        MenuAction::Destroy => {
-            state.set_panel(Panel::Provision);
-            state.arm_destroy();
-        }
         MenuAction::ConfigureCheck => {
             state.set_panel(Panel::Configure);
             state.check_configure();
@@ -228,11 +217,7 @@ mod tests {
         let menus = build_menus();
         // The plan/apply gate lives in the Provision menu.
         let provision = menu(&menus, "Provision").expect("Provision menu");
-        for want in [
-            MenuAction::ProvisionPlan,
-            MenuAction::ProvisionApply,
-            MenuAction::Destroy,
-        ] {
+        for want in [MenuAction::ProvisionPlan, MenuAction::ProvisionApply] {
             assert!(ids(provision).contains(&want), "missing {want:?}");
         }
         // Configure carries check + apply.
@@ -267,9 +252,6 @@ mod tests {
         apply(&mut state, MenuAction::ProvisionApply);
         assert_eq!(state.panel(), Panel::Provision);
         assert!(state.has_arming(), "Apply opens the typed-confirm");
-        // Destroy also opens the confirm.
-        apply(&mut state, MenuAction::Destroy);
-        assert!(state.has_arming());
         // Help surfaces the honest posture note.
         apply(&mut state, MenuAction::HelpAbout);
         assert!(state.note_text().is_some_and(|n| n.contains("apply")));

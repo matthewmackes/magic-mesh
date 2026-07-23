@@ -538,7 +538,7 @@ pub(super) fn thumbnail_well(
             rect.center(),
             egui::vec2(Style::SP_XL * 2.0, Style::SP_XL * 1.6),
         );
-        crate::session::draw_monitor(&ui.painter().clone(), glyph);
+        crate::empty_state::draw_monitor(&ui.painter().clone(), glyph);
     }
 }
 

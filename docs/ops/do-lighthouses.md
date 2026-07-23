@@ -23,7 +23,7 @@ for one mesh (that needs the out-of-scope multi-lighthouse roster work).
 ```sh
 doctl auth init                       # once
 ./install-helpers/do-lighthouse-up.sh acme-mesh \
-    --region nyc3 --size s-1vcpu-1gb --image fedora-42-x64
+    --region nyc3 --size s-1vcpu-512mb-10gb --image fedora-43-x64
 ```
 
 Output ends with a ready-to-paste line:
@@ -36,6 +36,12 @@ Run that on any joining box (with the new build), or `mde-enroll` and paste it.
 
 Options: `--region --size --image --ssh-key --repo-baseurl --rpm-url
 --enroll-port --role --tag --keep-on-fail` (see `--help`).
+
+The default is the small control-plane profile documented in
+[`docs/design/digitalocean-lighthouse-small.md`](../design/digitalocean-lighthouse-small.md).
+Provisioning applies its cgroup, swap, journal, and optional-service guardrails
+automatically. Choose a larger size explicitly for media or other workloads;
+the smallest profile is not a `Lighthouse_Media` host.
 
 ## The glibc / image prerequisite (important)
 

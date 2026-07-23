@@ -14,7 +14,7 @@ use mde_theme::brand::icons::IconId;
 
 use crate::console::ConsoleSearchHit;
 use crate::datacenter::{FrontDoorLifecycleCandidate, FrontDoorLifecycleKind};
-use crate::dock::{icon_texture, launcher_group_label, Surface};
+use crate::surfaces::{icon_texture, launcher_group_label, Surface};
 use crate::workbench::Plane;
 
 const AREA_ID: &str = "shell-front-door-omnibox";
@@ -260,11 +260,6 @@ pub(crate) enum FrontDoorRequest {
         op: FrontDoorServiceLifecycleOp,
     },
     OpenWorkbenchPlane(Plane),
-    TogglePin(Surface),
-    MovePin {
-        surface: Surface,
-        direction: FrontDoorPinMoveDirection,
-    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -347,6 +342,7 @@ pub(crate) enum FrontDoorInstanceLifecycleOp {
     Start,
     Stop,
     Reboot,
+    Delete,
 }
 
 impl FrontDoorInstanceLifecycleOp {
@@ -355,6 +351,7 @@ impl FrontDoorInstanceLifecycleOp {
             Self::Start => "Start",
             Self::Stop => "Stop",
             Self::Reboot => "Reboot",
+            Self::Delete => "Delete",
         }
     }
 
@@ -363,6 +360,7 @@ impl FrontDoorInstanceLifecycleOp {
             Self::Start => "instance-start",
             Self::Stop => "instance-stop",
             Self::Reboot => "instance-reboot",
+            Self::Delete => "instance-delete",
         }
     }
 
@@ -371,18 +369,13 @@ impl FrontDoorInstanceLifecycleOp {
             Self::Start => IconId::Play,
             Self::Stop => IconId::MediaStop,
             Self::Reboot => IconId::Reload,
+            Self::Delete => IconId::Remove,
         }
     }
 
     const fn destructive(self) -> bool {
-        matches!(self, Self::Stop | Self::Reboot)
+        matches!(self, Self::Stop | Self::Reboot | Self::Delete)
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum FrontDoorPinMoveDirection {
-    Up,
-    Down,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -571,26 +564,10 @@ impl FrontDoorState {
 }
 
 pub(crate) fn app_search_items() -> Vec<SearchItem<FrontDoorTarget>> {
-    app_search_items_with_pins(&[])
-}
-
-pub(crate) fn app_search_items_with_pins(pinned: &[Surface]) -> Vec<SearchItem<FrontDoorTarget>> {
-    let mut ordered = Vec::with_capacity(Surface::ALL.len());
-    for &surface in pinned {
-        if Surface::ALL.contains(&surface) && !ordered.contains(&surface) {
-            ordered.push(surface);
-        }
-    }
-    for surface in Surface::ALL {
-        if !ordered.contains(&surface) {
-            ordered.push(surface);
-        }
-    }
-
-    ordered
-        .into_iter()
+    (0..Surface::ALL.len())
+        .filter_map(crate::surfaces::springboard_surface)
         .enumerate()
-        .map(|(idx, surface)| app_search_item(surface, idx))
+        .map(|(index, surface)| app_search_item(surface, index))
         .collect()
 }
 
@@ -918,16 +895,14 @@ pub(crate) fn front_door_panel(
     ctx: &egui::Context,
     state: &mut FrontDoorState,
     items: Vec<SearchItem<FrontDoorTarget>>,
-    pinned: &[Surface],
 ) -> Option<FrontDoorRequest> {
-    front_door_panel_with_sources(ctx, state, items, pinned, FrontDoorSourceStatus::default())
+    front_door_panel_with_sources(ctx, state, items, FrontDoorSourceStatus::default())
 }
 
 pub(crate) fn front_door_panel_with_sources(
     ctx: &egui::Context,
     state: &mut FrontDoorState,
     items: Vec<SearchItem<FrontDoorTarget>>,
-    pinned: &[Surface],
     sources: FrontDoorSourceStatus,
 ) -> Option<FrontDoorRequest> {
     // Ticked every frame (open or closed) so the summon carrier re-arms at 0
@@ -1124,14 +1099,12 @@ pub(crate) fn front_door_panel_with_sources(
                                         state.selected = idx;
                                     }
                                     if let Some(request) =
-                                        result_context_menu_request(&response, hit, pinned)
+                                        result_context_menu_request(&response, hit)
                                     {
                                         action = Some(request);
                                     }
                                     if selected {
-                                        if let Some(request) =
-                                            result_action_panel(ui, state, hit, pinned)
-                                        {
+                                        if let Some(request) = result_action_panel(ui, state, hit) {
                                             action = Some(request);
                                         }
                                     }
@@ -1488,7 +1461,7 @@ fn filter_chip_row(ui: &mut egui::Ui, active: &mut FrontDoorFilter) -> (egui::Re
             egui::vec2(chip_w, FILTER_CHIP_H),
         );
         let response = ui.interact(rect, filter_chip_id(filter), egui::Sense::click());
-        if crate::dock::response_activated(ui, &response) && *active != filter {
+        if crate::surfaces::response_activated(ui, &response) && *active != filter {
             *active = filter;
             changed = true;
         }
@@ -1929,26 +1902,98 @@ fn service_lifecycle_ops_for_target(
 
 pub(crate) fn cloud_instance_lifecycle_wire(
     unit_id: &str,
+    node: &str,
     op: FrontDoorInstanceLifecycleOp,
-) -> Option<(String, String)> {
-    let instance = cloud_instance_id(unit_id)?;
+) -> Result<(String, String), String> {
+    cloud_instance_lifecycle_wire_with(unit_id, node, op, |body, verb, node, target| {
+        crate::iac::authorize_root_mutation_body(body, verb, node, target)
+    })
+}
+
+fn cloud_instance_lifecycle_wire_with(
+    unit_id: &str,
+    node: &str,
+    op: FrontDoorInstanceLifecycleOp,
+    authorize: impl FnOnce(&str, &str, &str, &str) -> Result<String, String>,
+) -> Result<(String, String), String> {
+    let instance = cloud_instance_id(unit_id)
+        .ok_or_else(|| "Cloud lifecycle target is not an instance.".to_string())?;
+    let node = node.trim();
+    if node.is_empty() {
+        return Err("Cloud lifecycle requires an explicit placement node.".to_string());
+    }
     let topic = format!("action/cloud/{}", op.cloud_verb());
-    let body = serde_json::json!({ "instance": instance }).to_string();
-    Some((topic, body))
+    let mut body = serde_json::json!({
+        "schema_version": mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION,
+        "node": node,
+        "instance": instance,
+    });
+    if op == FrontDoorInstanceLifecycleOp::Delete {
+        body["typed_name"] = serde_json::Value::String(instance.to_string());
+    }
+    let body = body.to_string();
+    let body = authorize(&body, op.cloud_verb(), node, instance)?;
+    Ok((topic, body))
+}
+
+const EXEC_ACTION_TOPIC: &str = "action/exec/request";
+const EXEC_ACTION_SCHEMA_VERSION: u32 = 1;
+const EXEC_AUTH_VERB: &str = "exec-request";
+const EXEC_AUTH_NODE: &str = "fleet-control";
+
+fn service_lifecycle_component<'a>(label: &str, raw: &'a str) -> Result<&'a str, String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err(format!("Service lifecycle {label} is blank."));
+    }
+    if value.len() > 255 {
+        return Err(format!("Service lifecycle {label} is too long."));
+    }
+    if value.contains('|') {
+        return Err(format!(
+            "Service lifecycle {label} contains the reserved '|' character."
+        ));
+    }
+    Ok(value)
+}
+
+fn unsigned_service_lifecycle_request(
+    target: &FrontDoorServiceLifecycleTarget,
+    op: FrontDoorServiceLifecycleOp,
+) -> Result<(String, String), String> {
+    let host = service_lifecycle_component("target host", &target.host)?;
+    let service_kind = service_lifecycle_component("service kind", target.kind.label())?;
+    let name = service_lifecycle_component("service name", &target.name)?;
+    let operation = service_lifecycle_component("operation", op.wire())?;
+    let capability_target = format!("service:{host}:{service_kind}:{name}:{operation}");
+    service_lifecycle_component("capability target", &capability_target)?;
+    let body = serde_json::json!({
+        "schema_version": EXEC_ACTION_SCHEMA_VERSION,
+        "kind": "service_lifecycle",
+        "target_host": host,
+        "service_kind": service_kind,
+        "name": name,
+        "op": operation,
+    })
+    .to_string();
+    Ok((body, capability_target))
 }
 
 pub(crate) fn service_lifecycle_wire(
     target: &FrontDoorServiceLifecycleTarget,
     op: FrontDoorServiceLifecycleOp,
-) -> (String, String) {
-    let body = serde_json::json!({
-        "peer": target.host.as_str(),
-        "kind": target.kind.label(),
-        "name": target.name.as_str(),
-        "op": op.wire(),
-    })
-    .to_string();
-    ("action/services/lifecycle".to_owned(), body)
+) -> Result<(String, String), String> {
+    service_lifecycle_wire_with(target, op, crate::iac::authorize_root_mutation_body)
+}
+
+fn service_lifecycle_wire_with(
+    target: &FrontDoorServiceLifecycleTarget,
+    op: FrontDoorServiceLifecycleOp,
+    authorize: impl FnOnce(&str, &str, &str, &str) -> Result<String, String>,
+) -> Result<(String, String), String> {
+    let (body, capability_target) = unsigned_service_lifecycle_request(target, op)?;
+    let body = authorize(&body, EXEC_AUTH_VERB, EXEC_AUTH_NODE, &capability_target)?;
+    Ok((EXEC_ACTION_TOPIC.to_owned(), body))
 }
 
 pub(crate) fn peer_app_launch_wire(target: &FrontDoorPeerAppTarget) -> Option<(String, String)> {
@@ -2068,7 +2113,7 @@ fn install_instance_lifecycle_action_accessibility(
         } else {
             format!("{} instance {}", op.label(), hit.item.title)
         });
-        let (topic, _) = cloud_instance_lifecycle_wire(&target.unit_id, op).unwrap_or_default();
+        let topic = format!("action/cloud/{}", op.cloud_verb());
         node.set_value(format!(
             "Cloud lifecycle: {topic}; instance {}",
             target.instance
@@ -2131,8 +2176,11 @@ fn install_service_lifecycle_action_accessibility(
         } else {
             format!("{} service {}", op.label(), hit.item.title)
         });
-        let (topic, body) = service_lifecycle_wire(target, op);
-        node.set_value(format!("Service lifecycle: {topic}; {body}"));
+        let value = unsigned_service_lifecycle_request(target, op).map_or_else(
+            |error| format!("Service lifecycle unavailable: {error}"),
+            |(body, _)| format!("Service lifecycle: {EXEC_ACTION_TOPIC}; {body}"),
+        );
+        node.set_value(value);
         node.set_bounds(accesskit_rect(rect));
         node.add_action(egui::accesskit::Action::Click);
         if armed {
@@ -2267,88 +2315,6 @@ fn install_workflow_quick_action_accessibility(
     });
 }
 
-fn pin_surface_for_hit(hit: &SearchHit<FrontDoorTarget>) -> Option<Surface> {
-    match hit.item.payload {
-        FrontDoorTarget::App(surface) => Some(surface),
-        _ => None,
-    }
-}
-
-fn pin_action_label(surface: Surface, pinned: bool) -> String {
-    if pinned {
-        format!("Unpin {}", surface.label())
-    } else {
-        format!("Pin {}", surface.label())
-    }
-}
-
-fn pin_action_value(surface: Surface, pinned: bool) -> String {
-    let state = if pinned { "Pinned" } else { "Not pinned" };
-    format!("Favorite action: {}, {state}", surface.label())
-}
-
-fn pin_action_accesskit_id(surface: Surface) -> egui::Id {
-    egui::Id::new(("shell-front-door-pin-action", surface))
-}
-
-fn move_pin_action_accesskit_id(
-    surface: Surface,
-    direction: FrontDoorPinMoveDirection,
-) -> egui::Id {
-    egui::Id::new(("shell-front-door-move-pin-action", surface, direction))
-}
-
-fn move_pin_action_label(surface: Surface, direction: FrontDoorPinMoveDirection) -> String {
-    let direction = match direction {
-        FrontDoorPinMoveDirection::Up => "up",
-        FrontDoorPinMoveDirection::Down => "down",
-    };
-    format!("Move {} {direction}", surface.label())
-}
-
-fn move_pin_action_value(surface: Surface, index: usize, total: usize) -> String {
-    format!(
-        "Favorite order: {} of {total}, {}",
-        index + 1,
-        surface.label()
-    )
-}
-
-fn install_pin_action_accessibility(
-    ctx: &egui::Context,
-    surface: Surface,
-    rect: egui::Rect,
-    pinned: bool,
-) {
-    let _ = ctx.accesskit_node_builder(pin_action_accesskit_id(surface), |node| {
-        node.set_role(egui::accesskit::Role::Button);
-        node.set_label(pin_action_label(surface, pinned));
-        node.set_value(pin_action_value(surface, pinned));
-        node.set_bounds(accesskit_rect(rect));
-        node.add_action(egui::accesskit::Action::Click);
-        if pinned {
-            node.set_selected(true);
-        }
-    });
-}
-
-fn install_move_pin_action_accessibility(
-    ctx: &egui::Context,
-    surface: Surface,
-    direction: FrontDoorPinMoveDirection,
-    rect: egui::Rect,
-    index: usize,
-    total: usize,
-) {
-    let _ = ctx.accesskit_node_builder(move_pin_action_accesskit_id(surface, direction), |node| {
-        node.set_role(egui::accesskit::Role::Button);
-        node.set_label(move_pin_action_label(surface, direction));
-        node.set_value(move_pin_action_value(surface, index, total));
-        node.set_bounds(accesskit_rect(rect));
-        node.add_action(egui::accesskit::Action::Click);
-    });
-}
-
 fn action_button(
     ui: &mut egui::Ui,
     rect: egui::Rect,
@@ -2407,40 +2373,10 @@ fn action_button(
     }
 }
 
-fn icon_action_button(
-    ui: &mut egui::Ui,
-    rect: egui::Rect,
-    id: egui::Id,
-    icon: IconId,
-) -> egui::Response {
-    let response = ui.interact(rect, id, egui::Sense::click());
-    let button_fill = if response.hovered() {
-        Style::ACCENT.linear_multiply(0.28)
-    } else {
-        Style::ACCENT.linear_multiply(0.18)
-    };
-    ui.painter().rect_filled(rect, 5.0, button_fill);
-    ui.painter().rect_stroke(
-        rect,
-        5.0,
-        egui::Stroke::new(1.0, Style::ACCENT),
-        egui::StrokeKind::Inside,
-    );
-    let icon_size = 14.0;
-    let icon_rect = egui::Rect::from_center_size(rect.center(), egui::vec2(icon_size, icon_size));
-    if let Some(tex) = icon_texture(ui.ctx(), icon, icon_size, Style::TEXT) {
-        let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
-        ui.painter()
-            .image(tex.id(), icon_rect, uv, egui::Color32::WHITE);
-    }
-    response
-}
-
 fn result_action_panel(
     ui: &mut egui::Ui,
     state: &mut FrontDoorState,
     hit: &SearchHit<FrontDoorTarget>,
-    pinned: &[Surface],
 ) -> Option<FrontDoorRequest> {
     let width = bounded_available_width(ui).max(1.0);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, ACTION_PANEL_H), egui::Sense::hover());
@@ -2454,18 +2390,7 @@ fn result_action_panel(
         egui::StrokeKind::Inside,
     );
 
-    let pin_surface = pin_surface_for_hit(hit);
-    let pin_index = pin_surface.and_then(|surface| {
-        pinned
-            .iter()
-            .position(|&pinned_surface| pinned_surface == surface)
-    });
-    let pin_visible = pin_surface.is_some() && panel_rect.width() >= 176.0;
-    let primary_budget = if pin_visible {
-        panel_rect.width() * 0.32
-    } else {
-        panel_rect.width() * 0.36
-    };
+    let primary_budget = panel_rect.width() * 0.36;
     let button_w = result_action_button_width(primary_budget);
     let primary_rect = egui::Rect::from_min_size(
         egui::pos2(
@@ -2483,9 +2408,6 @@ fn result_action_panel(
         false,
     );
 
-    let mut pin_response = None;
-    let mut move_up_response = None;
-    let mut move_down_response = None;
     let mut connect_response = None;
     let mut lifecycle_responses = Vec::new();
     let mut service_lifecycle_responses = Vec::new();
@@ -2528,6 +2450,7 @@ fn result_action_panel(
     }
     if let Some(lifecycle_target) = instance_lifecycle_target_for_hit(hit) {
         for op in [
+            FrontDoorInstanceLifecycleOp::Delete,
             FrontDoorInstanceLifecycleOp::Reboot,
             FrontDoorInstanceLifecycleOp::Stop,
             FrontDoorInstanceLifecycleOp::Start,
@@ -2613,90 +2536,6 @@ fn result_action_panel(
             first_button_left = quick_rect.left();
         }
     }
-    if let Some(surface) = pin_surface {
-        let is_pinned = pinned.contains(&surface);
-        if pin_visible {
-            let pin_w =
-                74.0_f32.min((first_button_left - panel_rect.left() - Style::SP_S * 2.0).max(0.0));
-            if pin_w > 0.0 {
-                let pin_rect = egui::Rect::from_min_size(
-                    egui::pos2(
-                        first_button_left - Style::SP_XS - pin_w,
-                        panel_rect.center().y - 13.0,
-                    ),
-                    egui::vec2(pin_w, 26.0),
-                );
-                let response = action_button(
-                    ui,
-                    pin_rect,
-                    pin_action_accesskit_id(surface),
-                    if is_pinned { "Unpin" } else { "Pin" },
-                    IconId::Pin,
-                    is_pinned,
-                );
-                install_pin_action_accessibility(ui.ctx(), surface, pin_rect, is_pinned);
-                pin_response = Some((surface, response));
-                let mut left = pin_rect.left();
-                if let Some(index) = pin_index {
-                    let total = pinned.len();
-                    if index > 0 && left - Style::SP_XS - 28.0 >= panel_rect.left() {
-                        let move_rect = egui::Rect::from_min_size(
-                            egui::pos2(left - Style::SP_XS - 28.0, panel_rect.center().y - 13.0),
-                            egui::vec2(28.0, 26.0),
-                        );
-                        let direction = FrontDoorPinMoveDirection::Up;
-                        let response = icon_action_button(
-                            ui,
-                            move_rect,
-                            move_pin_action_accesskit_id(surface, direction),
-                            IconId::ChevronUp,
-                        );
-                        install_move_pin_action_accessibility(
-                            ui.ctx(),
-                            surface,
-                            direction,
-                            move_rect,
-                            index,
-                            total,
-                        );
-                        move_up_response = Some((surface, direction, response));
-                        left = move_rect.left();
-                    }
-                    if index + 1 < total && left - Style::SP_XS - 28.0 >= panel_rect.left() {
-                        let move_rect = egui::Rect::from_min_size(
-                            egui::pos2(left - Style::SP_XS - 28.0, panel_rect.center().y - 13.0),
-                            egui::vec2(28.0, 26.0),
-                        );
-                        let direction = FrontDoorPinMoveDirection::Down;
-                        let response = icon_action_button(
-                            ui,
-                            move_rect,
-                            move_pin_action_accesskit_id(surface, direction),
-                            IconId::ArrowDown,
-                        );
-                        install_move_pin_action_accessibility(
-                            ui.ctx(),
-                            surface,
-                            direction,
-                            move_rect,
-                            index,
-                            total,
-                        );
-                        move_down_response = Some((surface, direction, response));
-                        left = move_rect.left();
-                    }
-                }
-                left
-            } else {
-                first_button_left
-            }
-        } else {
-            first_button_left
-        }
-    } else {
-        first_button_left
-    };
-
     let text_left = panel_rect.left() + Style::SP_S;
     let text_right = first_button_left - Style::SP_S;
     if text_left < text_right {
@@ -2761,21 +2600,6 @@ fn result_action_panel(
             }
         }
     }
-    if let Some((surface, response)) = pin_response {
-        if response.clicked() {
-            return Some(FrontDoorRequest::TogglePin(surface));
-        }
-    }
-    if let Some((surface, direction, response)) = move_up_response {
-        if response.clicked() {
-            return Some(FrontDoorRequest::MovePin { surface, direction });
-        }
-    }
-    if let Some((surface, direction, response)) = move_down_response {
-        if response.clicked() {
-            return Some(FrontDoorRequest::MovePin { surface, direction });
-        }
-    }
     if let Some((source_id, response)) = connect_response {
         if response.clicked() {
             return Some(FrontDoorRequest::ConnectDesktopSource(source_id));
@@ -2796,9 +2620,6 @@ enum ResultContextItem {
     Open,
     WorkflowPlane,
     ConnectDesktop,
-    Pin,
-    MoveUp,
-    MoveDown,
 }
 
 fn result_context_item_id(hit: &SearchHit<FrontDoorTarget>, item: ResultContextItem) -> egui::Id {
@@ -2826,7 +2647,7 @@ fn context_menu_row(ui: &mut egui::Ui, id: egui::Id, label: &str) -> bool {
     );
     mde_egui::focus::paint_focus_ring(ui.painter(), rect, response.has_focus());
     install_context_menu_row_accessibility(ui.ctx(), id, rect, label);
-    crate::dock::response_activated(ui, &response)
+    crate::surfaces::response_activated(ui, &response)
 }
 
 fn install_context_menu_row_accessibility(
@@ -2846,9 +2667,7 @@ fn install_context_menu_row_accessibility(
 fn result_context_menu_request(
     response: &egui::Response,
     hit: &SearchHit<FrontDoorTarget>,
-    pinned: &[Surface],
 ) -> Option<FrontDoorRequest> {
-    let pin_surface = pin_surface_for_hit(hit);
     let mut request = None;
     let _ = front_door_context_menu(response, |ui| {
         if context_menu_row(
@@ -2878,49 +2697,6 @@ fn result_context_menu_request(
             ) {
                 request = Some(FrontDoorRequest::ConnectDesktopSource(source_id.to_owned()));
                 ui.close_menu();
-            }
-        }
-        if let Some(surface) = pin_surface {
-            let label = if pinned.contains(&surface) {
-                "Unpin from top"
-            } else {
-                "Pin to top"
-            };
-            if context_menu_row(
-                ui,
-                result_context_item_id(hit, ResultContextItem::Pin),
-                label,
-            ) {
-                request = Some(FrontDoorRequest::TogglePin(surface));
-                ui.close_menu();
-            }
-            if let Some(index) = pinned.iter().position(|&candidate| candidate == surface) {
-                if index > 0
-                    && context_menu_row(
-                        ui,
-                        result_context_item_id(hit, ResultContextItem::MoveUp),
-                        "Move up",
-                    )
-                {
-                    request = Some(FrontDoorRequest::MovePin {
-                        surface,
-                        direction: FrontDoorPinMoveDirection::Up,
-                    });
-                    ui.close_menu();
-                }
-                if index + 1 < pinned.len()
-                    && context_menu_row(
-                        ui,
-                        result_context_item_id(hit, ResultContextItem::MoveDown),
-                        "Move down",
-                    )
-                {
-                    request = Some(FrontDoorRequest::MovePin {
-                        surface,
-                        direction: FrontDoorPinMoveDirection::Down,
-                    });
-                    ui.close_menu();
-                }
             }
         }
     });
@@ -3276,8 +3052,8 @@ fn result_domain_label(hit: &SearchHit<FrontDoorTarget>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dock::Surface;
     use crate::screenshot::Capture;
+    use crate::surfaces::Surface;
     use std::path::Path;
 
     fn fixture_front_door_items() -> Vec<SearchItem<FrontDoorTarget>> {
@@ -3579,28 +3355,6 @@ mod tests {
         filter: FrontDoorFilter,
         expanded: bool,
     ) -> egui::FullOutput {
-        render_front_door_accesskit_frame_with_layout_and_pins(
-            ctx,
-            query,
-            selected,
-            screen_size,
-            items,
-            filter,
-            expanded,
-            &[],
-        )
-    }
-
-    fn render_front_door_accesskit_frame_with_layout_and_pins(
-        ctx: &egui::Context,
-        query: &str,
-        selected: usize,
-        screen_size: egui::Vec2,
-        items: Vec<SearchItem<FrontDoorTarget>>,
-        filter: FrontDoorFilter,
-        expanded: bool,
-        pinned: &[Surface],
-    ) -> egui::FullOutput {
         render_front_door_accesskit_frame_with_sources(
             ctx,
             query,
@@ -3609,7 +3363,6 @@ mod tests {
             items,
             filter,
             expanded,
-            pinned,
             FrontDoorSourceStatus::default(),
         )
     }
@@ -3622,7 +3375,6 @@ mod tests {
         items: Vec<SearchItem<FrontDoorTarget>>,
         filter: FrontDoorFilter,
         expanded: bool,
-        pinned: &[Surface],
         sources: FrontDoorSourceStatus,
     ) -> egui::FullOutput {
         let mut state = FrontDoorState::default();
@@ -3631,7 +3383,6 @@ mod tests {
         state.selected = selected;
         state.filter = filter;
         state.expanded = expanded;
-        let pinned = pinned.to_vec();
         ctx.run(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen_size)),
@@ -3639,8 +3390,7 @@ mod tests {
                 ..Default::default()
             },
             move |ctx| {
-                let _ =
-                    front_door_panel_with_sources(ctx, &mut state, items.clone(), &pinned, sources);
+                let _ = front_door_panel_with_sources(ctx, &mut state, items.clone(), sources);
             },
         )
     }
@@ -3678,10 +3428,10 @@ mod tests {
         };
         let mut cap = Capture::new();
         let _settle = cap.frame(ctx, input(), |ctx| {
-            let _ = front_door_panel_with_sources(ctx, &mut state, items.clone(), &[], sources);
+            let _ = front_door_panel_with_sources(ctx, &mut state, items.clone(), sources);
         });
         cap.frame(ctx, input(), |ctx| {
-            let _ = front_door_panel_with_sources(ctx, &mut state, items.clone(), &[], sources);
+            let _ = front_door_panel_with_sources(ctx, &mut state, items.clone(), sources);
         })
     }
 
@@ -3707,10 +3457,10 @@ mod tests {
             ..Default::default()
         };
         let _settle = ctx.run(input(), |ctx| {
-            let _ = front_door_panel_with_sources(ctx, &mut state, items.clone(), &[], sources);
+            let _ = front_door_panel_with_sources(ctx, &mut state, items.clone(), sources);
         });
         ctx.run(input(), |ctx| {
-            let _ = front_door_panel_with_sources(ctx, &mut state, items.clone(), &[], sources);
+            let _ = front_door_panel_with_sources(ctx, &mut state, items.clone(), sources);
         })
     }
 
@@ -3843,7 +3593,7 @@ mod tests {
                 ..Default::default()
             },
             |ctx| {
-                action = front_door_panel(ctx, &mut state, fixture_front_door_items(), &[]);
+                action = front_door_panel(ctx, &mut state, fixture_front_door_items());
             },
         );
         action.and_then(|request| match request {
@@ -3852,9 +3602,7 @@ mod tests {
             | FrontDoorRequest::ConnectDesktopSource(_)
             | FrontDoorRequest::InstanceLifecycle { .. }
             | FrontDoorRequest::ServiceLifecycle { .. }
-            | FrontDoorRequest::OpenWorkbenchPlane(_)
-            | FrontDoorRequest::TogglePin(_)
-            | FrontDoorRequest::MovePin { .. } => None,
+            | FrontDoorRequest::OpenWorkbenchPlane(_) => None,
         })
     }
 
@@ -3886,12 +3634,7 @@ mod tests {
                 ..Default::default()
             },
             |ctx| {
-                let _ = front_door_panel(
-                    ctx,
-                    &mut state,
-                    fixture_front_door_items_with_command(),
-                    &[],
-                );
+                let _ = front_door_panel(ctx, &mut state, fixture_front_door_items_with_command());
             },
         );
         state.filter
@@ -3919,30 +3662,18 @@ mod tests {
     }
 
     #[test]
-    fn app_search_items_with_pins_places_favorites_first_once() {
-        let items = app_search_items_with_pins(&[
-            Surface::Browser,
-            Surface::Files,
-            Surface::Browser,
-            Surface::Timers,
-        ]);
-        assert_eq!(items.len(), Surface::ALL.len());
-        assert_eq!(items[0].payload, FrontDoorTarget::App(Surface::Browser));
-        assert_eq!(items[1].payload, FrontDoorTarget::App(Surface::Files));
-        assert_eq!(
-            items
-                .iter()
-                .filter(|item| item.payload == FrontDoorTarget::App(Surface::Browser))
-                .count(),
-            1,
-            "pinned app rows should not duplicate their normal launcher row"
-        );
-        assert!(
-            !items
-                .iter()
-                .any(|item| item.payload == FrontDoorTarget::App(Surface::Timers)),
-            "Timers remains taskbar-clock owned, not a Front Door app row"
-        );
+    fn app_search_items_follow_fixed_springboard_order() {
+        let actual = app_search_items()
+            .into_iter()
+            .map(|item| item.payload)
+            .collect::<Vec<_>>();
+        let expected = (0..Surface::ALL.len())
+            .filter_map(crate::surfaces::springboard_surface)
+            .map(FrontDoorTarget::App)
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+        assert_eq!(actual[0], FrontDoorTarget::App(Surface::Workbench));
+        assert_eq!(actual[1], FrontDoorTarget::App(Surface::MeshView));
     }
 
     #[test]
@@ -3984,15 +3715,21 @@ mod tests {
 
     #[test]
     fn blank_front_door_hits_show_initial_shortcuts_in_source_order() {
-        let hits = visible_front_door_hits(
-            "  ",
-            app_search_items_with_pins(&[Surface::Browser, Surface::Files]),
-        );
+        let hits = visible_front_door_hits("  ", app_search_items());
         assert_eq!(hits.len(), MAX_HITS);
-        assert_eq!(hits[0].item.payload, FrontDoorTarget::App(Surface::Browser));
-        assert_eq!(hits[0].item.target, launcher_group_label(Surface::Browser));
-        assert_eq!(hits[1].item.payload, FrontDoorTarget::App(Surface::Files));
-        assert_eq!(hits[1].item.target, "Files & Data");
+        assert_eq!(
+            hits[0].item.payload,
+            FrontDoorTarget::App(Surface::Workbench)
+        );
+        assert_eq!(
+            hits[0].item.target,
+            launcher_group_label(Surface::Workbench)
+        );
+        assert_eq!(
+            hits[1].item.payload,
+            FrontDoorTarget::App(Surface::MeshView)
+        );
+        assert_eq!(hits[1].item.target, "Mesh Control");
     }
 
     #[test]
@@ -4202,7 +3939,6 @@ mod tests {
             fixture_front_door_items(),
             FrontDoorFilter::Mesh,
             false,
-            &[],
             FrontDoorSourceStatus::new(FrontDoorMeshSourceStatus::Unavailable),
         );
         let nodes = accesskit_nodes(&out);
@@ -4395,17 +4131,77 @@ mod tests {
     fn front_door_cloud_instance_lifecycle_uses_the_explorer_cloud_contract() {
         let (topic, body) = cloud_instance_lifecycle_wire(
             "cloud:instance:i-9",
+            "bigboy",
             FrontDoorInstanceLifecycleOp::Reboot,
         )
         .expect("cloud instance lifecycle wire");
 
         assert_eq!(topic, "action/cloud/instance-reboot");
-        assert_eq!(body, r#"{"instance":"i-9"}"#);
+        let body: serde_json::Value = serde_json::from_str(&body).expect("authorized JSON body");
+        assert_eq!(
+            body["schema_version"],
+            mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION
+        );
+        assert_eq!(body["node"], "bigboy");
+        assert_eq!(body["instance"], "i-9");
+        assert!(mackes_mesh_types::cloud::CloudArmedToken::parse(
+            body["armed_token"].as_str().expect("armed token")
+        )
+        .is_some());
+
+        let (_, delete) = cloud_instance_lifecycle_wire(
+            "cloud:instance:i-9",
+            "bigboy",
+            FrontDoorInstanceLifecycleOp::Delete,
+        )
+        .expect("authorized delete wire");
+        let delete: serde_json::Value = serde_json::from_str(&delete).expect("delete JSON");
+        assert_eq!(delete["typed_name"], "i-9");
+        let token = mackes_mesh_types::cloud::CloudArmedToken::parse(
+            delete["armed_token"].as_str().expect("delete armed token"),
+        )
+        .expect("parsed delete capability");
+        assert_eq!(token.verb, "instance-delete");
+        assert_eq!(token.node, "bigboy");
+        assert_eq!(token.target, "i-9");
+        assert_eq!(
+            token.request_sha256,
+            mackes_mesh_types::cloud::cloud_request_digest(&delete.to_string())
+                .expect("delete request digest"),
+            "typed_name and schema_version must be inside the signed request digest",
+        );
+        let signer = mackes_mesh_types::cloud::CloudArmSigner::new(
+            b"0123456789abcdef0123456789abcdef".to_vec(),
+        )
+        .expect("test signer");
+        assert!(signer.verify_payload(&token.signing_payload(), &token.signature));
         assert!(
-            cloud_instance_lifecycle_wire("peer:browser-node", FrontDoorInstanceLifecycleOp::Start)
-                .is_none(),
+            cloud_instance_lifecycle_wire(
+                "peer:browser-node",
+                "bigboy",
+                FrontDoorInstanceLifecycleOp::Start
+            )
+            .is_err(),
             "Front Door must not mint lifecycle actions for non-instance mesh ids"
         );
+    }
+
+    #[test]
+    fn front_door_cloud_instance_lifecycle_fails_closed_without_placement_or_authority() {
+        assert!(cloud_instance_lifecycle_wire(
+            "cloud:instance:i-9",
+            "   ",
+            FrontDoorInstanceLifecycleOp::Start,
+        )
+        .is_err());
+        let error = cloud_instance_lifecycle_wire_with(
+            "cloud:instance:i-9",
+            "bigboy",
+            FrontDoorInstanceLifecycleOp::Start,
+            |_body, _verb, _node, _target| Err("credential unavailable".to_string()),
+        )
+        .expect_err("missing authority must suppress publication");
+        assert!(error.contains("credential unavailable"));
     }
 
     #[test]
@@ -4448,7 +4244,7 @@ mod tests {
     }
 
     #[test]
-    fn front_door_service_lifecycle_uses_the_directory_contract() {
+    fn front_door_service_lifecycle_uses_the_typed_audited_exec_contract() {
         let item = fixture_service_lifecycle_item(
             "mesh-api",
             FrontDoorLifecycleKind::Container,
@@ -4458,14 +4254,58 @@ mod tests {
             panic!("expected service lifecycle payload");
         };
 
-        let (topic, body) = service_lifecycle_wire(&target, FrontDoorServiceLifecycleOp::Restart);
+        let (topic, body) = service_lifecycle_wire(&target, FrontDoorServiceLifecycleOp::Restart)
+            .expect("authorized service lifecycle wire");
         let body: serde_json::Value = serde_json::from_str(&body).expect("json lifecycle body");
 
-        assert_eq!(topic, "action/services/lifecycle");
-        assert_eq!(body["peer"], "oak");
-        assert_eq!(body["kind"], "container");
+        assert_eq!(topic, "action/exec/request");
+        assert_eq!(body["schema_version"], 1);
+        assert_eq!(body["kind"], "service_lifecycle");
+        assert_eq!(body["target_host"], "oak");
+        assert_eq!(body["service_kind"], "container");
         assert_eq!(body["name"], "mesh-api");
         assert_eq!(body["op"], "restart");
+        let token = mackes_mesh_types::cloud::CloudArmedToken::parse(
+            body["armed_token"].as_str().expect("armed capability"),
+        )
+        .expect("parsed capability");
+        assert_eq!(token.verb, "exec-request");
+        assert_eq!(token.node, "fleet-control");
+        assert_eq!(token.target, "service:oak:container:mesh-api:restart");
+        assert_eq!(
+            token.request_sha256,
+            mackes_mesh_types::cloud::cloud_request_digest(&body.to_string())
+                .expect("request digest")
+        );
+        let signer = mackes_mesh_types::cloud::CloudArmSigner::new(
+            b"0123456789abcdef0123456789abcdef".to_vec(),
+        )
+        .expect("test signer");
+        assert!(signer.verify_payload(&token.signing_payload(), &token.signature));
+    }
+
+    #[test]
+    fn front_door_service_lifecycle_rejects_unsafe_targets_and_missing_authority() {
+        let mut target = FrontDoorServiceLifecycleTarget {
+            host: "oak|peer".to_owned(),
+            kind: FrontDoorLifecycleKind::Container,
+            name: "mesh-api".to_owned(),
+            state: "running".to_owned(),
+        };
+        assert!(service_lifecycle_wire(&target, FrontDoorServiceLifecycleOp::Restart).is_err());
+        target.host = "oak".to_owned();
+        target.name = " ".to_owned();
+        assert!(service_lifecycle_wire(&target, FrontDoorServiceLifecycleOp::Restart).is_err());
+        target.name = "x".repeat(256);
+        assert!(service_lifecycle_wire(&target, FrontDoorServiceLifecycleOp::Restart).is_err());
+        target.name = "mesh-api".to_owned();
+        let error = service_lifecycle_wire_with(
+            &target,
+            FrontDoorServiceLifecycleOp::Restart,
+            |_body, _verb, _node, _target| Err("credential unavailable".to_string()),
+        )
+        .expect_err("missing authority must suppress publication");
+        assert!(error.contains("credential unavailable"));
     }
 
     #[test]
@@ -4750,7 +4590,7 @@ mod tests {
                 ..Default::default()
             },
             |ctx| {
-                let _ = front_door_panel(ctx, &mut state, items.clone(), &[]);
+                let _ = front_door_panel(ctx, &mut state, items.clone());
             },
         );
         let area = ctx
@@ -4938,7 +4778,7 @@ mod tests {
         let run = |state: &mut FrontDoorState, events: Vec<egui::Event>| {
             let mut out = None;
             let _ = ctx.run(input(events), |ctx| {
-                out = front_door_panel(ctx, state, fixture_front_door_items(), &[]);
+                out = front_door_panel(ctx, state, fixture_front_door_items());
             });
             out
         };
@@ -5170,14 +5010,14 @@ mod tests {
             "",
             0,
             egui::vec2(900.0, 640.0),
-            app_search_items_with_pins(&[Surface::Browser, Surface::Files]),
+            app_search_items(),
         );
         let nodes = accesskit_nodes(&out);
         let browser = nodes
             .iter()
             .map(|(_, node)| node)
             .find(|node| node.label() == Some("Browser"))
-            .expect("blank Front Door should expose pinned Browser shortcut row");
+            .expect("blank Front Door should expose the Browser shortcut row");
         assert_eq!(browser.role(), egui::accesskit::Role::Button);
         assert!(
             browser
@@ -5193,7 +5033,7 @@ mod tests {
             .expect("blank Front Door search results status");
         let value = results.value().expect("blank Front Door status value");
         assert!(
-            value.contains("local shortcut") && value.contains("Browser highlighted"),
+            value.contains("local shortcut") && value.contains("Workbench highlighted"),
             "blank Front Door should announce available shortcuts: {value}"
         );
     }
@@ -5790,6 +5630,7 @@ mod tests {
             ("Start instance web", "action/cloud/instance-start"),
             ("Stop instance web", "action/cloud/instance-stop"),
             ("Reboot instance web", "action/cloud/instance-reboot"),
+            ("Delete instance web", "action/cloud/instance-delete"),
         ] {
             let action = nodes
                 .iter()
@@ -5836,9 +5677,11 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing {label} lifecycle action: {nodes:?}"));
             let value = action.value().unwrap_or_default();
             assert_eq!(action.role(), egui::accesskit::Role::Button);
-            assert!(value.contains("Service lifecycle: action/services/lifecycle"));
-            assert!(value.contains(r#""peer":"oak""#), "{value}");
-            assert!(value.contains(r#""kind":"container""#), "{value}");
+            assert!(value.contains("Service lifecycle: action/exec/request"));
+            assert!(value.contains(r#""schema_version":1"#), "{value}");
+            assert!(value.contains(r#""kind":"service_lifecycle""#), "{value}");
+            assert!(value.contains(r#""target_host":"oak""#), "{value}");
+            assert!(value.contains(r#""service_kind":"container""#), "{value}");
             assert!(value.contains(r#""name":"mesh-api""#), "{value}");
             assert!(
                 action.supports_action(egui::accesskit::Action::Click),
@@ -5848,67 +5691,31 @@ mod tests {
     }
 
     #[test]
-    fn front_door_selected_app_result_exports_pin_action_button() {
+    fn front_door_selected_app_result_has_no_retired_favorite_actions() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         mde_egui::fonts::install(&ctx);
 
-        let unpinned_out = render_front_door_accesskit_frame_with(
+        let out = render_front_door_accesskit_frame_with(
             &ctx,
             "browser",
             0,
             egui::vec2(900.0, 640.0),
             fixture_front_door_items(),
         );
-        let unpinned_nodes = accesskit_nodes(&unpinned_out);
-        let pin = unpinned_nodes
+        let labels = accesskit_nodes(&out)
             .iter()
             .map(|(_, node)| node)
-            .find(|node| node.label() == Some("Pin Browser"))
-            .expect("selected app result should expose Pin action");
-        assert_eq!(pin.role(), egui::accesskit::Role::Button);
-        assert_eq!(pin.value(), Some("Favorite action: Browser, Not pinned"));
-        assert!(pin.supports_action(egui::accesskit::Action::Click));
-
-        let pinned_out = render_front_door_accesskit_frame_with_layout_and_pins(
-            &ctx,
-            "browser",
-            0,
-            egui::vec2(900.0, 640.0),
-            fixture_front_door_items(),
-            FrontDoorFilter::All,
-            false,
-            &[Surface::Browser],
+            .filter_map(|node| node.label().map(str::to_owned))
+            .collect::<Vec<_>>();
+        assert!(labels.iter().any(|label| label == "Launch Browser"));
+        assert!(
+            labels.iter().all(|label| {
+                !label.starts_with("Pin ")
+                    && !label.starts_with("Unpin ")
+                    && !label.starts_with("Move ")
+            }),
+            "fixed Springboard taxonomy must not expose retired favorite actions: {labels:?}"
         );
-        let pinned_nodes = accesskit_nodes(&pinned_out);
-        let unpin = pinned_nodes
-            .iter()
-            .map(|(_, node)| node)
-            .find(|node| node.label() == Some("Unpin Browser"))
-            .expect("selected pinned app result should expose Unpin action");
-        assert_eq!(unpin.role(), egui::accesskit::Role::Button);
-        assert_eq!(unpin.value(), Some("Favorite action: Browser, Pinned"));
-        assert_eq!(unpin.is_selected(), Some(true));
-
-        let ordered_pins = [Surface::Browser, Surface::Files];
-        let reorder_out = render_front_door_accesskit_frame_with_layout_and_pins(
-            &ctx,
-            "",
-            1,
-            egui::vec2(900.0, 640.0),
-            app_search_items_with_pins(&ordered_pins),
-            FrontDoorFilter::All,
-            false,
-            &ordered_pins,
-        );
-        let reorder_nodes = accesskit_nodes(&reorder_out);
-        let move_up = reorder_nodes
-            .iter()
-            .map(|(_, node)| node)
-            .find(|node| node.label() == Some("Move Files up"))
-            .expect("selected pinned app result should expose Move up action");
-        assert_eq!(move_up.role(), egui::accesskit::Role::Button);
-        assert_eq!(move_up.value(), Some("Favorite order: 2 of 2, Files"));
-        assert!(move_up.supports_action(egui::accesskit::Action::Click));
     }
 }

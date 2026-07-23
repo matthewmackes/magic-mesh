@@ -84,6 +84,31 @@ fn focused(s: &ExplorerState) -> Unit {
     s.units[idx].clone()
 }
 
+fn assert_armed_cloud_call(
+    call: &(String, String),
+    topic: &str,
+    node: &str,
+    instance: &str,
+    typed_name: Option<&str>,
+) {
+    assert_eq!(call.0, topic);
+    let body: serde_json::Value = serde_json::from_str(&call.1).expect("authorized cloud body");
+    assert_eq!(
+        body["schema_version"],
+        mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION
+    );
+    assert_eq!(body["node"], node);
+    assert_eq!(body["instance"], instance);
+    match typed_name {
+        Some(name) => assert_eq!(body["typed_name"], name),
+        None => assert!(body.get("typed_name").is_none()),
+    }
+    assert!(mackes_mesh_types::cloud::CloudArmedToken::parse(
+        body["armed_token"].as_str().expect("armed token")
+    )
+    .is_some());
+}
+
 /// Render one headless frame of `s` and return every vertex colour the
 /// tessellator actually emitted — the token-application probe (EXPLORER-15/
 /// EXPLORER-18): a §4 token is *applied* iff its exact colour reaches the
@@ -763,13 +788,12 @@ fn instance_lifecycle_verbs_dispatch_over_the_cloud_bus() {
 
     // Start is non-destructive → fires immediately.
     s.fire(Verb::Start, &u);
-    assert_eq!(
-        fake.calls.borrow().as_slice(),
-        &[(
-            "action/cloud/instance-start".to_string(),
-            r#"{"instance":"i-9"}"#.to_string()
-        )],
-        "Start publishes the QC-11 InstanceReq on action/cloud/instance-start"
+    assert_armed_cloud_call(
+        &fake.calls.borrow()[0],
+        "action/cloud/instance-start",
+        "node-a",
+        "i-9",
+        None,
     );
 
     // The three destructive verbs each publish their own topic once armed.
@@ -782,10 +806,12 @@ fn instance_lifecycle_verbs_dispatch_over_the_cloud_bus() {
         s.arm_verb(verb, &u.id);
         s.arm.as_mut().expect("armed").echo = "web".to_string();
         assert!(s.confirm_armed(&u), "the typed-name confirm fires the verb");
-        assert_eq!(
-            fake.calls.borrow().as_slice(),
-            &[(topic.to_string(), r#"{"instance":"i-9"}"#.to_string())],
-            "{verb:?} publishes on {topic}"
+        assert_armed_cloud_call(
+            &fake.calls.borrow()[0],
+            topic,
+            "node-a",
+            "i-9",
+            (verb == Verb::Delete).then_some("i-9"),
         );
         assert!(s.arm.is_none(), "arming clears after the confirm");
     }
@@ -909,6 +935,26 @@ fn verbs_without_a_seam_are_honestly_disabled() {
         &unit("cloud:network:n", UnitKind::Network, "net", 1)
     )
     .is_ok());
+}
+
+#[test]
+fn cloud_lifecycle_fails_closed_without_placement_or_authority() {
+    let mut missing_placement = instance_unit("cloud:instance:i", "web");
+    missing_placement.reachability = Reachability::InMesh;
+    assert!(verb_seam(Verb::Start, &missing_placement).is_err());
+    missing_placement.reachability = Reachability::CloudObject {
+        node: "   ".to_string(),
+    };
+    assert!(verb_seam(Verb::Start, &missing_placement).is_err());
+
+    let error = authorized_instance_request_with(
+        "instance-start",
+        "i",
+        "bigboy",
+        |_body, _verb, _node, _target| Err("credential unavailable".to_string()),
+    )
+    .expect_err("a missing credential must suppress the request body");
+    assert!(error.contains("credential unavailable"));
 }
 
 #[test]
@@ -2496,20 +2542,23 @@ fn bulk_destructive_is_gated_on_the_typed_count_phrase() {
     s.bulk_arm.as_mut().expect("armed").echo = " delete 2 ".to_string();
     assert!(s.bulk_ready(), "the trimmed exact phrase arms");
     assert!(s.confirm_bulk());
-    assert_eq!(
-        fake.calls.borrow().as_slice(),
-        &[
-            (
-                "action/cloud/instance-delete".to_string(),
-                r#"{"instance":"i2"}"#.to_string() // db sorts before web
-            ),
-            (
-                "action/cloud/instance-delete".to_string(),
-                r#"{"instance":"i1"}"#.to_string()
-            ),
-        ],
-        "one QC-11 request per marked instance"
+    let calls = fake.calls.borrow();
+    assert_eq!(calls.len(), 2, "one QC-11 request per marked instance");
+    assert_armed_cloud_call(
+        &calls[0],
+        "action/cloud/instance-delete",
+        "node-a",
+        "i2",
+        Some("i2"),
     );
+    assert_armed_cloud_call(
+        &calls[1],
+        "action/cloud/instance-delete",
+        "node-a",
+        "i1",
+        Some("i1"),
+    );
+    drop(calls);
     assert!(s.bulk_arm.is_none(), "the arm clears after the run");
     let rollup = s.bulk_rollup.as_ref().expect("a rollup landed");
     assert_eq!((rollup.ok, rollup.total), (2, 2));

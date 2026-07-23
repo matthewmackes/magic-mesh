@@ -32,19 +32,23 @@ pub fn load_or_create(path: &Path) -> io::Result<SigningKey> {
         )),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             use rand::RngCore;
+            use std::io::Write as _;
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
             let mut seed = [0_u8; 32];
             rand::rngs::OsRng.fill_bytes(&mut seed);
             if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir)?;
             }
-            std::fs::write(path, seed)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mut perms = std::fs::metadata(path)?.permissions();
-                perms.set_mode(0o600);
-                std::fs::set_permissions(path, perms)?;
-            }
+            let mut file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(path)?;
+            let mut permissions = file.metadata()?.permissions();
+            permissions.set_mode(0o600);
+            file.set_permissions(permissions)?;
+            file.write_all(&seed)?;
+            file.sync_all()?;
             Ok(SigningKey::from_bytes(&seed))
         }
         Err(e) => Err(e),

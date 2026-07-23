@@ -21,16 +21,19 @@
 
 #![cfg(feature = "async-services")]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use mackes_transport::peer_path::{PeerPath, SwitchReason};
 use mackes_transport::scorer::Policy;
-use mackes_transport::{MessageClass, Transport, TransportKind};
+use mackes_transport::{Connection, MessageClass, Transport, TransportError, TransportKind};
+use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tokio::task::JoinHandle;
+use tracing::{debug, info, warn};
 
 use crate::metrics::Histogram;
 use crate::transport::audit::PathSwitchEvent;
@@ -48,6 +51,32 @@ use super::{ShutdownToken, Worker};
 /// noticed within one cadence interval.
 const DEFAULT_TICK: Duration = Duration::from_secs(10);
 
+/// Bound each peer's received fallback frames so a stalled consumer cannot
+/// turn an otherwise healthy TLS stream into unbounded daemon memory.
+const HTTPS_INBOX_CAPACITY: usize = 256;
+
+/// Stable loopback underlay endpoint rendered into Nebula's static host map for
+/// the configured HTTPS relay. Nebula sends encrypted UDP packets here after
+/// the public UDP endpoint is unavailable; the router moves them over TLS.
+pub const DEFAULT_HTTPS_UDP_BRIDGE_BIND: &str = "127.0.0.1:4244";
+/// Optional override for [`DEFAULT_HTTPS_UDP_BRIDGE_BIND`].
+pub const HTTPS_UDP_BRIDGE_BIND_ENV: &str = "MDE_HTTPS_FALLBACK_UDP_BIND";
+/// Nebula's local underlay socket. Only datagrams from this exact loopback
+/// source may enter the authenticated fallback carrier.
+pub const DEFAULT_NEBULA_UDP_SOURCE: &str = "127.0.0.1:4242";
+
+/// Runtime binding between one configured lighthouse and Nebula's local UDP
+/// underlay socket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpsUdpBridgeConfig {
+    /// Local UDP address advertised to Nebula.
+    pub bind_addr: SocketAddr,
+    /// Exact local Nebula socket allowed to source and receive packets.
+    pub nebula_source: SocketAddr,
+    /// Lighthouse node id whose retained TLS channel carries the datagrams.
+    pub peer_id: PeerId,
+}
+
 /// Identifier for one peer in the mesh.
 pub type PeerId = String;
 
@@ -61,6 +90,10 @@ pub type RouterState = Arc<RwLock<HashMap<PeerId, PeerPath>>>;
 /// the tick loop) without giving up ownership of the slice.
 pub type TransportRegistry = Arc<Vec<Arc<dyn Transport>>>;
 
+type HttpsConnections = Arc<RwLock<HashMap<PeerId, Arc<dyn Connection>>>>;
+type HttpsInboxes = Arc<RwLock<HashMap<PeerId, VecDeque<Vec<u8>>>>>;
+type HttpsReaders = Arc<RwLock<HashMap<PeerId, JoinHandle<()>>>>;
+
 /// Async worker that ticks the mesh router on a fixed cadence.
 ///
 /// State + registry are passed in at construction so the
@@ -71,6 +104,17 @@ pub type TransportRegistry = Arc<Vec<Arc<dyn Transport>>>;
 pub struct MeshRouterWorker {
     state: RouterState,
     registry: TransportRegistry,
+    /// Live, payload-capable HTTPS fallback channels. A peer may only be in
+    /// `HttpsFallbackState::Active` while it has an entry here.
+    https_connections: HttpsConnections,
+    /// Frames received by the connection reader, waiting for the mesh packet
+    /// dispatcher to consume them.
+    https_inboxes: HttpsInboxes,
+    /// Per-peer reader tasks. Kept so recovery, replacement, and worker
+    /// shutdown can terminate the old stream deterministically.
+    https_readers: HttpsReaders,
+    /// Optional live Nebula UDP source/sink for the selected relay.
+    https_udp_bridge: Option<HttpsUdpBridgeConfig>,
     tick: Duration,
     /// KDC2-1.12.b — optional handle to the
     /// `kdc2_router_decision_us` histogram. When `Some`, every
@@ -97,11 +141,22 @@ impl MeshRouterWorker {
         Self {
             state,
             registry,
+            https_connections: Arc::new(RwLock::new(HashMap::new())),
+            https_inboxes: Arc::new(RwLock::new(HashMap::new())),
+            https_readers: Arc::new(RwLock::new(HashMap::new())),
+            https_udp_bridge: None,
             tick: DEFAULT_TICK,
             metrics: None,
             policy: Policy::baseline(),
             audit_sink: None,
         }
+    }
+
+    /// Bind the router's selected HTTPS channel to a local Nebula UDP endpoint.
+    #[must_use]
+    pub fn with_https_udp_bridge(mut self, config: HttpsUdpBridgeConfig) -> Self {
+        self.https_udp_bridge = Some(config);
+        self
     }
 
     /// KDC2-1.9 (AUD3 S-2) — override the routing policy (loaded
@@ -167,16 +222,41 @@ impl Worker for MeshRouterWorker {
             "mesh-router: starting",
         );
 
+        let bridge = match self.https_udp_bridge.clone() {
+            Some(config) => Some((
+                UdpSocket::bind(config.bind_addr).await.map_err(|e| {
+                    anyhow::anyhow!("HTTPS UDP bridge bind {}: {e}", config.bind_addr)
+                })?,
+                config.peer_id,
+            )),
+            None => None,
+        };
         let mut interval = tokio::time::interval(self.tick);
         // First tick fires immediately; skip it so the first
         // observation isn't done before any transport has had a
         // chance to settle after worker startup.
         interval.tick().await;
 
+        if let Some((socket, peer_id)) = bridge {
+            return self
+                .run_https_udp_bridge(
+                    socket,
+                    peer_id,
+                    self.https_udp_bridge
+                        .as_ref()
+                        .expect("bridge config exists")
+                        .nebula_source,
+                    shutdown,
+                    interval,
+                )
+                .await;
+        }
+
         loop {
             tokio::select! {
                 _ = shutdown.wait() => {
                     info!("mesh-router: shutdown requested; exiting");
+                    self.shutdown_https_connections().await;
                     return Ok(());
                 }
                 _ = interval.tick() => {
@@ -188,6 +268,91 @@ impl Worker for MeshRouterWorker {
 }
 
 impl MeshRouterWorker {
+    pub(crate) async fn run_https_udp_bridge(
+        &self,
+        socket: UdpSocket,
+        peer_id: PeerId,
+        nebula_source: SocketAddr,
+        mut shutdown: ShutdownToken,
+        mut router_tick: tokio::time::Interval,
+    ) -> anyhow::Result<()> {
+        if !nebula_source.ip().is_loopback() {
+            anyhow::bail!("HTTPS UDP bridge source must be loopback: {nebula_source}");
+        }
+        let mut udp_buf = vec![0_u8; mackes_nebula_https_tunnel::MAX_FRAME_SIZE];
+        let mut inbound_tick = tokio::time::interval(Duration::from_millis(5));
+        inbound_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        info!(bind = %socket.local_addr()?, source = %nebula_source, peer = %peer_id, "mesh-router: HTTPS UDP bridge active");
+
+        loop {
+            tokio::select! {
+                _ = shutdown.wait() => {
+                    self.shutdown_https_connections().await;
+                    return Ok(());
+                }
+                _ = router_tick.tick() => self.tick_once().await,
+                received = socket.recv_from(&mut udp_buf) => {
+                    let (length, source) = received?;
+                    if source != nebula_source {
+                        warn!(source = %source, expected = %nebula_source, "mesh-router: dropping untrusted local HTTPS UDP source");
+                        continue;
+                    }
+                    if let Err(error) = self
+                        .send_https_payload_with_reconnect(&peer_id, &udp_buf[..length])
+                        .await
+                    {
+                        info!(peer = %peer_id, code = error.code(), "mesh-router: HTTPS UDP packet unavailable");
+                    }
+                }
+                _ = inbound_tick.tick() => {
+                    while let Some(payload) = self.try_recv_https_payload(&peer_id).await {
+                        socket.send_to(&payload, nebula_source).await?;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn send_https_payload_with_reconnect(
+        &self,
+        peer_id: &str,
+        payload: &[u8],
+    ) -> Result<(), TransportError> {
+        if self.send_https_payload(peer_id, payload).await.is_ok() {
+            return Ok(());
+        }
+        self.force_https_activation(peer_id).await;
+        self.drive_https_fallback_activations().await;
+        self.send_https_payload(peer_id, payload).await
+    }
+
+    async fn force_https_activation(&self, peer_id: &str) {
+        let has_connection = self.https_connections.read().await.contains_key(peer_id);
+        let mut state = self.state.write().await;
+        let path = state
+            .entry(peer_id.to_string())
+            .or_insert_with(|| PeerPath::initial(peer_id.to_string(), TransportKind::NebulaDirect));
+        if path.https_state == mackes_transport::peer_path::HttpsFallbackState::Active
+            && !has_connection
+        {
+            crate::https_fallback::observe_peer(
+                path,
+                crate::https_fallback::TransitionInput::TunnelLost,
+            );
+        }
+        for _ in 0..mackes_nebula_https_tunnel::activation::FAILURE_THRESHOLD {
+            if path.https_state == mackes_transport::peer_path::HttpsFallbackState::Activating {
+                break;
+            }
+            crate::https_fallback::observe_peer(
+                path,
+                crate::https_fallback::TransitionInput::Probe(
+                    crate::https_fallback::ProbePairOutcome::BothUdpFailed,
+                ),
+            );
+        }
+    }
+
     /// One iteration of the router's main loop. Pure-async — no
     /// shared mutable state outside the locked `state` map.
     ///
@@ -234,9 +399,8 @@ impl MeshRouterWorker {
         }
     }
 
-    /// Phase 12.18 D.3 — for every peer in `Activating`, open
-    /// the registered `NebulaHttps443` transport + feed the result
-    /// back into the state machine.
+    /// For every peer in `Activating`, open and retain a payload-capable
+    /// `NebulaHttps443` connection, then feed the result into the state machine.
     ///
     /// Behavior:
     ///   * Snapshots the `Activating` peer-id list under a read
@@ -245,8 +409,10 @@ impl MeshRouterWorker {
     ///     registry (today there's at most one; the registry
     ///     intentionally allows multiple impls for future
     ///     experimentation).
-    ///   * For each Activating peer, calls `transport.open(
-    ///     peer_id)` + `observe_handshake_outcome(peer_id, ok)`.
+    ///   * For each Activating peer, calls `transport.open(peer_id)` and rejects
+    ///     handles that do not implement framed I/O.
+    ///   * Stores the channel before marking the peer Active, then starts a
+    ///     reader that clears Active immediately on EOF or framing failure.
     ///   * Logs `Active` / `Failing` transitions at info level
     ///     so operators see the activation cycle in the
     ///     `mackesd serve` log.
@@ -279,31 +445,192 @@ impl MeshRouterWorker {
         };
         let attempts = activating.len();
         for peer_id in activating {
-            let result = https443.open(&peer_id).await;
-            let ok = result.is_ok();
-            if let Err(ref e) = result {
-                info!(
-                    peer = %peer_id,
-                    code = e.code(),
-                    "mesh-router: NebulaHttps443::open failed; marking peer Failing",
-                );
-            } else {
-                info!(
-                    peer = %peer_id,
-                    "mesh-router: NebulaHttps443::open succeeded; peer Active",
-                );
+            match https443.open(&peer_id).await {
+                Ok(connection) if connection.supports_framed_io() => {
+                    let connection: Arc<dyn Connection> = Arc::from(connection);
+                    self.install_https_connection(peer_id.clone(), Arc::clone(&connection))
+                        .await;
+                    let state = self.observe_handshake_outcome(&peer_id, true).await;
+                    if state.is_some_and(crate::https_fallback::HttpsFallbackState::is_active) {
+                        self.spawn_https_reader(peer_id.clone(), connection).await;
+                        info!(
+                            peer = %peer_id,
+                            "mesh-router: HTTPS fallback channel owned and Active",
+                        );
+                    } else {
+                        self.remove_https_connection(&peer_id).await;
+                    }
+                }
+                Ok(connection) => {
+                    info!(
+                        peer = %peer_id,
+                        connection = %connection.id(),
+                        "mesh-router: HTTPS handshake returned no framed channel; marking peer Failing",
+                    );
+                    let _ = self.observe_handshake_outcome(&peer_id, false).await;
+                }
+                Err(e) => {
+                    info!(
+                        peer = %peer_id,
+                        code = e.code(),
+                        "mesh-router: NebulaHttps443::open failed; marking peer Failing",
+                    );
+                    let _ = self.observe_handshake_outcome(&peer_id, false).await;
+                }
             }
-            // Drop the live Connection — D.3 closes the
-            // activation acceptance loop. The connection-keeping
-            // slice (D.4: hold the conn across sends, drive
-            // packet writes through it) lands separately.
-            drop(result);
-            // Feed the outcome back into the state machine.
-            // `None` when the peer was concurrently removed
-            // from the state map; that's a benign race.
-            let _ = self.observe_handshake_outcome(&peer_id, ok).await;
         }
         attempts
+    }
+
+    async fn install_https_connection(&self, peer_id: PeerId, connection: Arc<dyn Connection>) {
+        self.remove_https_connection(&peer_id).await;
+        self.https_connections
+            .write()
+            .await
+            .insert(peer_id, connection);
+    }
+
+    async fn spawn_https_reader(&self, peer_id: PeerId, connection: Arc<dyn Connection>) {
+        let state = Arc::clone(&self.state);
+        let connections = Arc::clone(&self.https_connections);
+        let inboxes = Arc::clone(&self.https_inboxes);
+        let task_peer = peer_id.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                match connection.recv_frame().await {
+                    Ok(payload) => {
+                        let mut inboxes = inboxes.write().await;
+                        let inbox = inboxes.entry(task_peer.clone()).or_default();
+                        if inbox.len() == HTTPS_INBOX_CAPACITY {
+                            inbox.pop_front();
+                        }
+                        inbox.push_back(payload);
+                    }
+                    Err(e) => {
+                        info!(
+                            peer = %task_peer,
+                            code = e.code(),
+                            "mesh-router: HTTPS fallback stream lost; clearing Active",
+                        );
+                        Self::clear_lost_https_connection(
+                            &state,
+                            &connections,
+                            &task_peer,
+                            &connection,
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            }
+        });
+        if let Some(old) = self.https_readers.write().await.insert(peer_id, task) {
+            old.abort();
+        }
+    }
+
+    async fn clear_lost_https_connection(
+        state: &RouterState,
+        connections: &HttpsConnections,
+        peer_id: &str,
+        lost: &Arc<dyn Connection>,
+    ) {
+        let removed = {
+            let mut connections = connections.write().await;
+            if connections
+                .get(peer_id)
+                .is_some_and(|current| Arc::ptr_eq(current, lost))
+            {
+                connections.remove(peer_id);
+                true
+            } else {
+                false
+            }
+        };
+        if removed {
+            // Keep already authenticated complete frames queued. The peer may
+            // close immediately after its reply, and discarding that inbox here
+            // races the UDP bridge's next drain tick.
+            if let Some(path) = state.write().await.get_mut(peer_id) {
+                crate::https_fallback::observe_peer(
+                    path,
+                    crate::https_fallback::TransitionInput::TunnelLost,
+                );
+            }
+        }
+    }
+
+    async fn remove_https_connection(&self, peer_id: &str) {
+        self.https_connections.write().await.remove(peer_id);
+        self.https_inboxes.write().await.remove(peer_id);
+        if let Some(reader) = self.https_readers.write().await.remove(peer_id) {
+            reader.abort();
+        }
+    }
+
+    async fn shutdown_https_connections(&self) {
+        let peers: Vec<_> = self
+            .https_connections
+            .read()
+            .await
+            .keys()
+            .cloned()
+            .collect();
+        for peer_id in peers {
+            self.remove_https_connection(&peer_id).await;
+            if let Some(path) = self.state.write().await.get_mut(&peer_id) {
+                crate::https_fallback::observe_peer(
+                    path,
+                    crate::https_fallback::TransitionInput::TunnelLost,
+                );
+            }
+        }
+    }
+
+    /// Send one intact Nebula packet through the retained HTTPS channel.
+    /// Stream errors atomically evict the channel and clear `Active`.
+    pub async fn send_https_payload(
+        &self,
+        peer_id: &str,
+        payload: &[u8],
+    ) -> Result<(), TransportError> {
+        let connection = self
+            .https_connections
+            .read()
+            .await
+            .get(peer_id)
+            .cloned()
+            .ok_or(TransportError::Unreachable {
+                code: "no_active_https_channel",
+            })?;
+        if let Err(e) = connection.send_frame(payload).await {
+            Self::clear_lost_https_connection(
+                &self.state,
+                &self.https_connections,
+                peer_id,
+                &connection,
+            )
+            .await;
+            if let Some(reader) = self.https_readers.write().await.remove(peer_id) {
+                reader.abort();
+            }
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Take the next inbound Nebula packet received over HTTPS, if one is ready.
+    pub async fn try_recv_https_payload(&self, peer_id: &str) -> Option<Vec<u8>> {
+        self.https_inboxes
+            .write()
+            .await
+            .get_mut(peer_id)
+            .and_then(VecDeque::pop_front)
+    }
+
+    /// Number of peers with an owned, payload-capable fallback channel.
+    pub async fn active_https_connection_count(&self) -> usize {
+        self.https_connections.read().await.len()
     }
 
     /// Locate the first registered transport whose `kind()`
@@ -357,27 +684,32 @@ impl MeshRouterWorker {
         peer_id: &str,
         outcome: crate::https_fallback::ProbePairOutcome,
     ) -> Option<crate::https_fallback::HttpsFallbackState> {
-        let mut state = self.state.write().await;
-        let path = state.get_mut(peer_id)?;
-        let new_state = crate::https_fallback::observe_peer(
-            path,
-            crate::https_fallback::TransitionInput::Probe(outcome),
-        );
+        let new_state = {
+            let mut state = self.state.write().await;
+            let path = state.get_mut(peer_id)?;
+            crate::https_fallback::observe_peer(
+                path,
+                crate::https_fallback::TransitionInput::Probe(outcome),
+            )
+        };
+        if !new_state.is_active() {
+            self.remove_https_connection(peer_id).await;
+        }
         Some(new_state)
     }
 
-    /// Phase 12.18 wire — feed a TLS-handshake-completion signal
-    /// into the per-peer HTTPS-fallback machine. The NebulaHttps443
-    /// transport's open() result wires here once the v3.0.3
-    /// 12.18 closure ships the transport (D.2 follow-up).
+    /// Feed a TLS-handshake-completion signal into the per-peer fallback
+    /// machine. A successful handshake is accepted only when the router already
+    /// owns a payload-capable connection for the peer.
     pub async fn observe_handshake_outcome(
         &self,
         peer_id: &str,
         ok: bool,
     ) -> Option<crate::https_fallback::HttpsFallbackState> {
+        let owns_channel = ok && self.https_connections.read().await.contains_key(peer_id);
         let mut state = self.state.write().await;
         let path = state.get_mut(peer_id)?;
-        let input = if ok {
+        let input = if owns_channel {
             crate::https_fallback::TransitionInput::HandshakeOk
         } else {
             crate::https_fallback::TransitionInput::HandshakeFailed
@@ -484,7 +816,7 @@ impl MeshRouterWorker {
 mod tests {
     use super::*;
     use mackes_transport::conformance::MockTransport;
-    use mackes_transport::TransportKind;
+    use mackes_transport::{Capabilities, HealthState, MessageClassSet, TransportKind};
 
     fn new_state() -> RouterState {
         Arc::new(RwLock::new(HashMap::new()))
@@ -741,7 +1073,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn observe_handshake_outcome_walks_active_or_failing() {
+    async fn handshake_success_without_owned_channel_fails_closed() {
         let state = new_state();
         {
             let mut g = state.write().await;
@@ -757,28 +1089,97 @@ mod tests {
             w.observe_probe_outcome("alice", ProbePairOutcome::BothUdpFailed)
                 .await;
         }
-        // HandshakeOk → Active.
+        // A bare handshake result can no longer create Active; the router must
+        // already own the payload channel installed by the activation driver.
         let s = w.observe_handshake_outcome("alice", true).await.unwrap();
-        assert_eq!(s, HttpsFallbackState::Active);
-        // Subsequent fail → Failing.
-        let s = w.observe_handshake_outcome("alice", false).await.unwrap();
-        // From Active, handshake outcomes are no-ops per the
-        // transition table — only TunnelLost/Probe transitions
-        // out of Active. So the state stays Active.
-        assert_eq!(s, HttpsFallbackState::Active);
+        assert_eq!(s, HttpsFallbackState::Failing);
     }
 
     // --- Phase 12.18 D.3 — drive_https_fallback_activations ------------
 
-    /// Build a router whose registry holds a MockTransport
-    /// pretending to be NebulaHttps443. MockTransport's `open` returns
-    /// Ok for `peer_id == "paired"` and Err otherwise — which
-    /// matches the activation drive's call shape: feed the
-    /// per-peer peer_id, get a result back.
+    #[derive(Debug)]
+    struct FramedMockConnection {
+        id: String,
+        lose_immediately: bool,
+        first_payload: tokio::sync::Mutex<Option<Vec<u8>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Connection for FramedMockConnection {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        fn supports_framed_io(&self) -> bool {
+            true
+        }
+
+        async fn send_frame(&self, _payload: &[u8]) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        async fn recv_frame(&self) -> Result<Vec<u8>, TransportError> {
+            if self.lose_immediately {
+                return Err(TransportError::Io {
+                    code: "mock_stream_lost",
+                });
+            }
+            if let Some(payload) = self.first_payload.lock().await.take() {
+                return Ok(payload);
+            }
+            std::future::pending().await
+        }
+    }
+
+    #[derive(Debug)]
+    struct FramedMockTransport;
+
+    #[async_trait::async_trait]
+    impl Transport for FramedMockTransport {
+        fn kind(&self) -> TransportKind {
+            TransportKind::NebulaHttps443
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                max_frame_bytes: Some(1408),
+                health_window: Duration::from_secs(30),
+                carries: MessageClassSet::all(),
+                label: "framed-mock-https443".into(),
+            }
+        }
+
+        async fn probe(&self, peer_id: &str) -> HealthState {
+            if matches!(peer_id, "paired" | "lost" | "payload") {
+                HealthState::Healthy
+            } else {
+                HealthState::Down
+            }
+        }
+
+        async fn open(&self, peer_id: &str) -> Result<Box<dyn Connection>, TransportError> {
+            if matches!(peer_id, "paired" | "lost" | "payload") {
+                Ok(Box::new(FramedMockConnection {
+                    id: format!("framed-mock:{peer_id}"),
+                    lose_immediately: peer_id == "lost",
+                    first_payload: tokio::sync::Mutex::new(
+                        (peer_id == "payload").then(|| b"inbound nebula packet".to_vec()),
+                    ),
+                }))
+            } else {
+                Err(TransportError::Unreachable {
+                    code: "mock_unpaired",
+                })
+            }
+        }
+
+        async fn health(&self, peer_id: &str) -> HealthState {
+            self.probe(peer_id).await
+        }
+    }
+
     fn https443_registry() -> TransportRegistry {
-        Arc::new(vec![
-            Arc::new(MockTransport::new(TransportKind::NebulaHttps443)) as Arc<dyn Transport>,
-        ])
+        Arc::new(vec![Arc::new(FramedMockTransport) as Arc<dyn Transport>])
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -843,6 +1244,10 @@ mod tests {
         let w = MeshRouterWorker::new(Arc::clone(&state), https443_registry());
         let attempts = w.drive_https_fallback_activations().await;
         assert_eq!(attempts, 1);
+        assert_eq!(w.active_https_connection_count().await, 1);
+        w.send_https_payload("paired", b"nebula packet")
+            .await
+            .expect("owned channel sends");
         let g = state.read().await;
         assert_eq!(
             g.get("paired").unwrap().https_state,
@@ -870,6 +1275,88 @@ mod tests {
             g.get("ghost").unwrap().https_state,
             mackes_transport::peer_path::HttpsFallbackState::Failing,
         );
+        assert_eq!(w.active_https_connection_count().await, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn drive_rejects_handshake_only_connection_without_framed_io() {
+        let state = new_state();
+        {
+            let mut g = state.write().await;
+            let mut path = PeerPath::initial("paired".into(), TransportKind::NebulaDirect);
+            path.https_state = mackes_transport::peer_path::HttpsFallbackState::Activating;
+            g.insert("paired".into(), path);
+        }
+        let registry = Arc::new(vec![
+            Arc::new(MockTransport::new(TransportKind::NebulaHttps443)) as Arc<dyn Transport>,
+        ]);
+        let worker = MeshRouterWorker::new(Arc::clone(&state), registry);
+
+        assert_eq!(worker.drive_https_fallback_activations().await, 1);
+        assert_eq!(worker.active_https_connection_count().await, 0);
+        assert_eq!(
+            state.read().await.get("paired").unwrap().https_state,
+            mackes_transport::peer_path::HttpsFallbackState::Failing,
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reader_stream_loss_evicts_channel_and_clears_active() {
+        let state = new_state();
+        {
+            let mut g = state.write().await;
+            let mut path = PeerPath::initial("lost".into(), TransportKind::NebulaDirect);
+            path.https_state = mackes_transport::peer_path::HttpsFallbackState::Activating;
+            g.insert("lost".into(), path);
+        }
+        let worker = MeshRouterWorker::new(Arc::clone(&state), https443_registry());
+        assert_eq!(worker.drive_https_fallback_activations().await, 1);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if state.read().await.get("lost").unwrap().https_state
+                    == mackes_transport::peer_path::HttpsFallbackState::Failing
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reader detects stream loss");
+        assert_eq!(worker.active_https_connection_count().await, 0);
+        assert!(matches!(
+            worker.send_https_payload("lost", b"packet").await,
+            Err(TransportError::Unreachable {
+                code: "no_active_https_channel"
+            })
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reader_delivers_inbound_payload_from_owned_channel() {
+        let state = new_state();
+        {
+            let mut g = state.write().await;
+            let mut path = PeerPath::initial("payload".into(), TransportKind::NebulaDirect);
+            path.https_state = mackes_transport::peer_path::HttpsFallbackState::Activating;
+            g.insert("payload".into(), path);
+        }
+        let worker = MeshRouterWorker::new(Arc::clone(&state), https443_registry());
+        assert_eq!(worker.drive_https_fallback_activations().await, 1);
+
+        let payload = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(payload) = worker.try_recv_https_payload("payload").await {
+                    break payload;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reader queues inbound frame");
+        assert_eq!(payload, b"inbound nebula packet");
+        assert_eq!(worker.active_https_connection_count().await, 1);
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -171,7 +171,7 @@ fn rect_fills(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Color32> {
 }
 
 /// The Communications hover hints route through the themed [`comms_tooltip`] rather
-/// than egui's raw default popup: it paints its own Quasar-dark surface plate and
+/// than egui's raw default popup: it paints its own Quazar-dark surface plate and
 /// renders the hint in the themed text colour, leaking no black-on-light default.
 /// Mirrors `mde-files-egui`'s `files_hover_tooltip_uses_themed_text_and_surface`.
 ///

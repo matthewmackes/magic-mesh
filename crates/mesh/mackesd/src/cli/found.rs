@@ -89,6 +89,7 @@ pub fn run(
         std::path::Path::new("/var/lib/mackesd/nebula-ca/ca.crt"),
         std::path::Path::new("/var/lib/mackesd/nebula-ca/ca.key"),
         std::path::Path::new("/var/lib/mackesd/nebula-ca/scratch"),
+        std::path::Path::new("/etc/nebula"),
         parsed,
     )?;
 
@@ -129,6 +130,7 @@ pub fn run(
         mackesd_core::workers::nebula_supervisor::ConfigRole::Host,
         &[],
         &root,
+        None,
     )
     .map_err(|e| anyhow::anyhow!("materializing /etc/nebula for the founding lighthouse: {e}"))?;
 

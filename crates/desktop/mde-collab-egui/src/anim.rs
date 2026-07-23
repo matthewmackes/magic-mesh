@@ -1,4 +1,4 @@
-//! Shared **motion glue** for the Communications surface (Quasar-dark lock #4 —
+//! Shared **motion glue** for the Communications surface (Quazar-dark lock #4 —
 //! "macOS-level motion: all of it, all shared"; lock #2 — subtle, not floaty).
 //!
 //! This crate mints **no** bespoke duration or easing of its own: every timing,

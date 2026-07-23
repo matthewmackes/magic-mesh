@@ -15,7 +15,7 @@
 #   do-lighthouse-up.sh <mesh-id> [options]
 # Options (defaults in []):
 #   --region <r>        DO region            [nyc3]
-#   --size <s>          droplet size slug    [s-1vcpu-1gb]
+#   --size <s>          droplet size slug    [s-1vcpu-512mb-10gb]
 #   --image <img>       DO image slug        [fedora-43-x64] (must have a live
 #                       dnf channel for its releasever — fedora-42 has none)
 #   --ssh-key <id>      DO ssh-key id/fingerprint (repeatable; default: all)
@@ -32,7 +32,7 @@ TEMPLATE="$HERE/do-lighthouse-cloudinit.sh"
 [ -f "$TEMPLATE" ] || { echo "missing $TEMPLATE" >&2; exit 1; }
 
 # ---- defaults -------------------------------------------------------------
-REGION="nyc3"; SIZE="s-1vcpu-1gb"; IMAGE="fedora-43-x64"
+REGION="nyc3"; SIZE="s-1vcpu-512mb-10gb"; IMAGE="fedora-43-x64"
 REPO_BASEURL="https://matthewmackes.github.io/magic-mesh"; RPM_URL=""
 ENROLL_PORT="4243"; ROLE="lighthouse"; TAG="magic-lighthouse"
 SSH_KEYS=(); KEEP_ON_FAIL=0

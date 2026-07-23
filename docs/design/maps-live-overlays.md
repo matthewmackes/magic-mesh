@@ -5,7 +5,7 @@ a 14-candidate live-verification workflow (`wf_6731d411-455`; every keyless API 
 actually fetched from the control host and sample payloads inspected). Operator
 rulings this session: **external public feeds emphasized**, **vehicle/MG90 rolling-node
 lens first**, **zero-cost only** ("remove items that incur a cost" — no paid tiers, no
-non-commercial license locks that become pay-or-rip-out items if Quazar ships).
+non-commercial license locks that become pay-or-rip-out items if Construct ships).
 
 This is the design catalog for `WL-FUNC-012` (Maps live-data overlays). No overlay
 code lands with this doc.
@@ -296,7 +296,7 @@ describe what actually came back.
 | Feed | Why removed | What replaces it | What would re-enable it |
 |---|---|---|---|
 | TomTom / HERE traffic flow + incidents | Paid product; free tier capped 2,500 req/day and pricing revision effective July 2026 | State-511 events/closures (§3.3) — accepting the loss of probe-derived flow coloring | A paid TomTom/HERE contract at shipping time |
-| Open-Meteo route forecast | Free tier is explicitly NON-COMMERCIAL (verified on terms page) → forced paid plan if Quazar ships | NWS gridpoint hourly forecast (§3.4), public domain | Paying Open-Meteo, or accepting non-commercial status |
+| Open-Meteo route forecast | Free tier is explicitly NON-COMMERCIAL (verified on terms page) → forced paid plan if Construct ships | NWS gridpoint hourly forecast (§3.4), public domain | Paying Open-Meteo, or accepting non-commercial status |
 | Blitzortung lightning | Free of charge but non-commercial community lock + reverse-engineered protocol → pay-Vaisala-or-rip-out on shipping | No direct replacement in the 10; radar (§3.2) + NWS alerts (§3.1) carry the storm story. Future free lane: NOAA GOES-GLM gridded lightning (public domain) if we render it ourselves | Vaisala/ENTLN contract, or a self-rendered GLM lane |
 | RainViewer radar (as primary) | Free tier personal/educational-only + announced API sunset (nowcast already dead on live fetch) | IEM NEXRAD tiles (§3.2), public domain | n/a — IEM is strictly better for US operation |
 

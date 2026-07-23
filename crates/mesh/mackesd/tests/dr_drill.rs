@@ -44,6 +44,7 @@ fn surviving_bundle() -> BundlePlaintext {
                 epoch: 3,
                 cert_pem: "-----BEGIN CERT-----\nOAK\n-----END CERT-----\n".into(),
                 overlay_ip: "10.42.0.5".into(),
+                public_key_pem: Some("oak-public".into()),
                 created_at: 1_749_100_000,
                 expires_at: 0, // epoch-lifetime sentinel (SEC-1/Q19)
             },
@@ -52,6 +53,7 @@ fn surviving_bundle() -> BundlePlaintext {
                 epoch: 3,
                 cert_pem: "-----BEGIN CERT-----\nPINE\n-----END CERT-----\n".into(),
                 overlay_ip: "10.42.0.6".into(),
+                public_key_pem: Some("pine-public".into()),
                 created_at: 1_749_200_000,
                 expires_at: 0,
             },

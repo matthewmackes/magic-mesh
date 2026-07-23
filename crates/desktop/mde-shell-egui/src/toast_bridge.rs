@@ -31,8 +31,8 @@ use mde_egui::egui;
 use mde_egui::{OsdLevel, Severity, Tier, Toast, ToastHost};
 use serde::Deserialize;
 
-use crate::dock::Surface;
 use crate::notification_center::NotificationRing;
+use crate::surfaces::Surface;
 use crate::workbench::Plane;
 
 /// The typed Bus lane any node / worker raises an alert on (lock 7). Flat — the
@@ -249,7 +249,7 @@ fn surface_by_name(name: &str) -> Option<Surface> {
         }
         "system" => Some(Surface::System),
         "storage" => Some(Surface::Storage),
-        // The Timers & Alarms surface (VDOCK-5) — the clock's replacement; the
+        // The Timers & Alarms surface — the clock's replacement; the
         // `clock` alias keeps a "where did the clock go?" verb landing somewhere
         // honest (lock #5: the clock is now Timers & Alarms).
         "timers" | "alarms" | "clock" => Some(Surface::Timers),
@@ -499,7 +499,7 @@ mod tests {
         alert_severity, decode, plane_by_name, resolve_action, surface_by_name, Chime, Navigate,
         Severity, Suppress, ToastBridge,
     };
-    use crate::dock::Surface;
+    use crate::surfaces::Surface;
     use crate::workbench::Plane;
 
     /// A recording chime — counts each ring so a test can assert "fires once /

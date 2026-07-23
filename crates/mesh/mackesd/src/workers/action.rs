@@ -31,15 +31,16 @@
 //! * [`ActionRequest::CodeEdit`] (FRONTDOOR-12) → a typed, **path-bounded** file
 //!   write + a FIXED-ARG `git commit`. This is the most sensitive AI capability
 //!   (the AI editing code/config), so the safety model is non-negotiable and
-//!   matches the others: it APPLIES **only** on an explicit operator-approved
-//!   apply request reaching this worker (never auto-applied from a Copilot
-//!   proposal — the Copilot emits a `CodeEdit` *proposal* on a DISTINCT topic and
-//!   never publishes to [`ACTION_TOPIC`]). The target path is validated to be a
-//!   **relative, traversal-free path inside the allowed root** (the workgroup/repo
-//!   dir) BEFORE any side effect — an absolute path, a `..` escape, or any path
-//!   that resolves outside the root is a typed rejection (audited), bounding the
-//!   blast radius. The apply is TYPED, not shell: a `std::fs::write` of the
-//!   reviewed content, then `Command::new("git")` with a CLOSED, FIXED arg vector
+//!   matches the others: it APPLIES **only** when an explicit operator-approved
+//!   request carries a valid, exact-body, single-use capability (never
+//!   auto-applied from a Copilot proposal — the Copilot emits a `CodeEdit`
+//!   *proposal* on a DISTINCT topic and never publishes to [`ACTION_TOPIC`]). The
+//!   target path is validated to be relative and traversal-free, then every
+//!   parent is resolved beneath an anchored directory descriptor without
+//!   following symlinks. An absolute path, `..` escape, or in-root symlink escape
+//!   is a typed rejection (audited), bounding the blast radius. The apply is
+//!   TYPED, not shell: a descriptor-relative atomic write of the reviewed
+//!   content, then `Command::new("git")` with a CLOSED, FIXED arg vector
 //!   (`add -- <validated-relpath>` then `commit -m <fixed-prefix+kind> -- <relpath>`)
 //!   — the binary is a literal and the path is the validated in-root relpath, NOT
 //!   a free-form command string (§9: no `Command::new(<user string>)`, no shell).
@@ -73,6 +74,7 @@
 #![cfg(feature = "async-services")]
 
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use mde_bus::hooks::config::Priority;
@@ -81,6 +83,10 @@ use mde_bus::rpc::reply_topic;
 
 use crate::lifecycle::{self, LifecycleRequest};
 
+use super::cloud::{
+    claim_nonce, verify_token, HmacTokenSigner, NullSigner, TokenSigner, TokenVerdict,
+    DEFAULT_AUTH_ROOT,
+};
 use super::{ShutdownToken, Worker};
 
 /// Bus action topic this worker drains.
@@ -89,6 +95,15 @@ use super::{ShutdownToken, Worker};
 /// which rejects any topic outside `action/`) so the workbench publishes via the
 /// standard RPC caller. `exec` is the domain, `request` the verb.
 pub const ACTION_TOPIC: &str = "action/exec/request";
+
+/// Exact capability verb for every typed administrative execution request.
+pub const EXEC_AUTH_VERB: &str = "exec-request";
+/// Stable placement value for the leader-coordinated action plane.
+pub const EXEC_AUTH_NODE: &str = "fleet-control";
+
+/// Maximum remaining lifetime accepted for an administrative execution
+/// capability. A valid signature must not turn into a long-lived bearer token.
+const MAX_AUTH_TTL_MS: i64 = 30_000;
 
 /// Poll cadence on the request topic. An action dispatch is local file I/O +
 /// one audit insert (sub-millisecond), so a 400 ms poll keeps latency
@@ -126,10 +141,11 @@ pub enum ActionRequest {
 
     /// FRONTDOOR-12 — apply a reviewed **code/config edit** to a single file
     /// inside the allowed root, then commit it with FIXED git args. This is the
-    /// AI-editing-code capability: it lands ONLY on an explicit operator-approved
-    /// apply request (exactly like `ServiceLifecycle` — never auto-applied from a
-    /// Copilot proposal). The `path` is validated to be a relative, traversal-free
-    /// path that resolves INSIDE the allowed root before any write; `content` is
+    /// AI-editing-code capability: it lands ONLY on an exact-body, single-use
+    /// operator capability (exactly like `ServiceLifecycle` — never auto-applied
+    /// from a Copilot proposal). The `path` is validated to be a relative,
+    /// traversal-free path and resolved beneath the allowed root without following
+    /// symlinks before any write; `content` is
     /// the full reviewed file body the operator approved (the proposal carries it
     /// in full so the change is reviewable). There is deliberately no shell / diff
     /// / patch-program escape hatch — the worker writes the typed content and runs
@@ -177,9 +193,9 @@ const CODE_EDIT_COMMIT_PREFIX: &str = "mackesd code-edit (FD-12, operator-approv
 /// * composed only of plain `Normal` components (no bare `.` cur-dir, no root).
 ///
 /// On success it returns `root.join(rel)` — guaranteed lexically within `root`.
-/// On any violation it returns a typed rejection reason. We reject on the LEXICAL
-/// path (before touching the filesystem) so a symlink race can't widen the bound;
-/// the join of a root + a components-only relative path cannot escape the root.
+/// On any violation it returns a typed rejection reason. This is the pure lexical
+/// half; [`write_code_edit_beneath`] separately walks every parent through
+/// `openat(O_NOFOLLOW)` so an in-root symlink cannot escape the boundary.
 ///
 /// # Errors
 ///
@@ -222,6 +238,109 @@ pub fn validate_edit_path(root: &Path, path: &str) -> Result<PathBuf, String> {
         ));
     }
     Ok(joined)
+}
+
+/// Atomically write one relative code-edit path beneath an already-existing
+/// root without following symlinks in any component. Directory file descriptors
+/// keep resolution anchored even if a replicated peer races a rename; the final
+/// temp file is `O_EXCL|O_NOFOLLOW`, synced, renamed within the same parent, and
+/// the parent directory is synced before success returns.
+fn write_code_edit_beneath(root: &Path, path: &str, content: &str) -> Result<(), String> {
+    use rand::RngCore as _;
+    use rustix::fs::{AtFlags, Mode, OFlags};
+    use std::ffi::OsString;
+    use std::io::Write as _;
+
+    validate_edit_path(root, path)?;
+    let mut components: Vec<OsString> = Path::new(path)
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => Some(value.to_os_string()),
+            _ => None,
+        })
+        .collect();
+    let file_name = components
+        .pop()
+        .ok_or_else(|| "code_edit: empty path".to_string())?;
+    let directory_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut directory = rustix::fs::open(root, directory_flags, Mode::empty())
+        .map_err(|error| format!("code_edit: open allowed root failed: {error}"))?;
+    for component in components {
+        directory =
+            match rustix::fs::openat(&directory, &component, directory_flags, Mode::empty()) {
+                Ok(next) => next,
+                Err(rustix::io::Errno::NOENT) => {
+                    match rustix::fs::mkdirat(
+                        &directory,
+                        &component,
+                        Mode::RUSR | Mode::WUSR | Mode::XUSR,
+                    ) {
+                        Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                        Err(error) => {
+                            return Err(format!(
+                                "code_edit: create path component {:?} failed: {error}",
+                                component
+                            ));
+                        }
+                    }
+                    rustix::fs::openat(&directory, &component, directory_flags, Mode::empty())
+                        .map_err(|error| {
+                            format!(
+                                "code_edit: secure path component {:?} failed: {error}",
+                                component
+                            )
+                        })?
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "code_edit: path component {:?} is not a safe directory: {error}",
+                        component
+                    ));
+                }
+            };
+    }
+
+    let mut random = [0_u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut random);
+    let temp_name = format!(
+        ".mde-codeedit-{}.tmp",
+        random
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    let file_flags =
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let temp = rustix::fs::openat(
+        &directory,
+        temp_name.as_str(),
+        file_flags,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .map_err(|error| format!("code_edit: create secure temporary file failed: {error}"))?;
+    let mut temp_file: std::fs::File = temp.into();
+    if let Err(error) = temp_file
+        .write_all(content.as_bytes())
+        .and_then(|()| temp_file.sync_all())
+    {
+        drop(temp_file);
+        let _ = rustix::fs::unlinkat(&directory, temp_name.as_str(), AtFlags::empty());
+        return Err(format!("code_edit: persist temporary file failed: {error}"));
+    }
+    drop(temp_file);
+    if let Err(error) = rustix::fs::renameat(
+        &directory,
+        temp_name.as_str(),
+        &directory,
+        file_name.as_os_str(),
+    ) {
+        let _ = rustix::fs::unlinkat(&directory, temp_name.as_str(), AtFlags::empty());
+        return Err(format!("code_edit: finalize `{path}` failed: {error}"));
+    }
+    let directory_file: std::fs::File = directory.into();
+    directory_file
+        .sync_all()
+        .map_err(|error| format!("code_edit: sync parent of `{path}` failed: {error}"))
 }
 
 /// The typed reply published to `reply/<request-ulid>`.
@@ -336,6 +455,27 @@ pub fn plan_lifecycle(
     })
 }
 
+/// Stable semantic target for one administrative capability. The capability's
+/// request digest independently binds every byte-significant JSON field.
+fn action_authorization_target(req: &ActionRequest) -> String {
+    match req {
+        ActionRequest::ServiceLifecycle {
+            target_host,
+            service_kind,
+            name,
+            op,
+        } => format!("service:{target_host}:{service_kind}:{name}:{op}"),
+        ActionRequest::CodeEdit { path, .. } => format!("code:{path}"),
+    }
+}
+
+fn wall_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
 /// The leader-only typed action worker. Drains [`ACTION_TOPIC`], dispatches each
 /// allowlisted typed action through the existing verb mechanism, audits it on the
 /// hash-chain plane, and replies. Best-effort + graceful degrade.
@@ -348,6 +488,11 @@ pub struct ActionWorker {
     workgroup_root: PathBuf,
     /// This node's id (the lease holder + the `from`/actor on audit records).
     node_id: String,
+    /// Root-credential verifier. Missing credentials install [`NullSigner`] and
+    /// make every administrative mutation fail closed.
+    signer: Arc<dyn TokenSigner>,
+    /// Shared host-local spent-nonce ledger used by every privileged action lane.
+    auth_root: PathBuf,
     /// The hash-chained audit DB (the `events` table). Defaults to
     /// [`crate::default_db_path`]; tests point it at a tempdir.
     db_path: PathBuf,
@@ -362,10 +507,23 @@ impl ActionWorker {
     /// `workgroup_root`, the canonical audit DB path, the default Bus root.
     #[must_use]
     pub fn new(workgroup_root: PathBuf, node_id: String) -> Self {
+        let signer: Arc<dyn TokenSigner> = match HmacTokenSigner::from_systemd_credential() {
+            Ok(signer) => Arc::new(signer),
+            Err(error) => {
+                tracing::error!(
+                    target: "mackesd::action",
+                    %error,
+                    "typed administrative authorization unavailable; actions are disabled"
+                );
+                Arc::new(NullSigner)
+            }
+        };
         Self {
             leader_lock: workgroup_root.join(".mackesd-leader.lock"),
             workgroup_root,
             node_id,
+            signer,
+            auth_root: PathBuf::from(DEFAULT_AUTH_ROOT),
             db_path: crate::default_db_path(),
             poll_interval: DEFAULT_POLL_INTERVAL,
             bus_root_override: None,
@@ -391,6 +549,15 @@ impl ActionWorker {
     #[must_use]
     pub const fn with_poll_interval(mut self, d: Duration) -> Self {
         self.poll_interval = d;
+        self
+    }
+
+    /// Inject deterministic verifier/ledger state for hostile request tests.
+    #[cfg(test)]
+    #[must_use]
+    fn with_authorization(mut self, signer: Arc<dyn TokenSigner>, root: PathBuf) -> Self {
+        self.signer = signer;
+        self.auth_root = root;
         self
     }
 
@@ -450,11 +617,98 @@ impl ActionWorker {
         }
     }
 
-    /// Handle one typed action request end-to-end (synchronous): parse → validate
-    /// against the existing allowlist → dispatch via the existing verb mechanism →
-    /// audit on the hash-chain plane → typed reply. Every branch yields a reply
-    /// (success or typed rejection) and audits the executed/attempted action, so
-    /// the requester never hangs and the trail is never skipped.
+    /// Verify and durably consume the exact-body capability before a typed action
+    /// can reach its dispatcher. This is the public-Bus security boundary; UI
+    /// confirmation alone is never treated as authority.
+    fn authorize_wire_request(&self, body: &str, req: &ActionRequest) -> TokenVerdict {
+        let token = serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|value| value.get("armed_token")?.as_str().map(str::to_string));
+        let target = action_authorization_target(req);
+        let now = wall_now_ms();
+        let verdict = verify_token(
+            token.as_deref(),
+            EXEC_AUTH_VERB,
+            EXEC_AUTH_NODE,
+            &target,
+            body,
+            now,
+            self.signer.as_ref(),
+        );
+        if !verdict.is_valid() {
+            return verdict;
+        }
+        let Some(token) = token
+            .as_deref()
+            .and_then(mackes_mesh_types::cloud::CloudArmedToken::parse)
+        else {
+            return TokenVerdict::Malformed;
+        };
+        if token.expires_at_ms > now.saturating_add(MAX_AUTH_TTL_MS) {
+            return TokenVerdict::LifetimeTooLong;
+        }
+        match claim_nonce(&self.auth_root, &token.nonce, token.expires_at_ms, now) {
+            Ok(true) => TokenVerdict::Valid,
+            Ok(false) => TokenVerdict::Replayed,
+            Err(_) => TokenVerdict::ReplayStoreUnavailable,
+        }
+    }
+
+    /// Public wire entry: bound body cap → typed parse → capability consume →
+    /// allowlisted dispatcher. Unauthorized bodies are audited without copying a
+    /// caller-controlled code payload into the audit database.
+    fn handle_wire_action(&self, ulid: &str, body: &str) -> ActionReply {
+        if !crate::ipc::body_within_cap(Some(body)) {
+            let reply = ActionReply::rejected("typed action request body exceeds the 64 KiB cap");
+            self.audit(
+                "unknown",
+                serde_json::json!({ "authorization": "refused" }),
+                &reply,
+            );
+            return reply;
+        }
+        let envelope = match serde_json::from_str::<serde_json::Value>(body) {
+            Ok(value) => value,
+            Err(_) => return self.handle_action(ulid, body),
+        };
+        if envelope
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            != Some(1)
+        {
+            let reply =
+                ActionReply::rejected("typed action requires schema_version 1 — nothing changed");
+            self.audit(
+                "unknown",
+                serde_json::json!({ "authorization": "refused" }),
+                &reply,
+            );
+            return reply;
+        }
+        let req = match parse_action_request(body) {
+            Ok(req) => req,
+            Err(_) => return self.handle_action(ulid, body),
+        };
+        let verdict = self.authorize_wire_request(body, &req);
+        if !verdict.is_valid() {
+            let reply = ActionReply::rejected(format!(
+                "typed action is not authorized ({}) — nothing changed",
+                verdict.reason()
+            ));
+            self.audit(
+                req.kind_tag(),
+                serde_json::json!({ "authorization": "refused" }),
+                &reply,
+            );
+            return reply;
+        }
+        self.handle_action(ulid, body)
+    }
+
+    /// Post-authorization typed action handler: parse → validate against the
+    /// existing allowlist → dispatch via the existing verb mechanism → audit.
+    /// Direct calls exist only in focused pure/dispatcher tests; production Bus
+    /// traffic always enters through [`Self::handle_wire_action`].
     fn handle_action(&self, ulid: &str, body: &str) -> ActionReply {
         let req = match parse_action_request(body) {
             Ok(r) => r,
@@ -506,9 +760,9 @@ impl ActionWorker {
 
     /// Apply an operator-approved [`ActionRequest::CodeEdit`] (FRONTDOOR-12): a
     /// path-bounded, TYPED file write of the reviewed content, then a FIXED-ARG
-    /// `git` commit. Reaching here means the explicit apply request already
-    /// arrived on [`ACTION_TOPIC`] (the gate) — a Copilot *proposal* never lands
-    /// here. Every failure (out-of-bounds path, traversal, write fault, commit
+    /// `git` commit. Reaching here means the wire entry already consumed the
+    /// exact-body operator capability — a Copilot *proposal* never lands here.
+    /// Every failure (out-of-bounds path, traversal, symlink, write fault, commit
     /// fault) is a typed rejection; `handle_action` audits whatever this returns,
     /// so an apply AND a rejection both write a hash-chain row.
     ///
@@ -517,28 +771,12 @@ impl ActionWorker {
     /// validated in-root relpath; the commit message is the fixed
     /// [`CODE_EDIT_COMMIT_PREFIX`] plus the kind tag.
     fn apply_code_edit(&self, path: &str, content: &str) -> ActionReply {
-        // 1. PATH BOUND — reject absolute/traversal/out-of-root BEFORE any write.
-        let abs = match validate_edit_path(&self.workgroup_root, path) {
-            Ok(p) => p,
-            Err(reason) => return ActionReply::rejected(reason),
-        };
-        // 2. TYPED WRITE — create parent dirs inside the root, then write the
-        //    reviewed content. Atomic-ish via a sibling tmp + rename so a partial
-        //    write never leaves a truncated file under git.
-        if let Some(parent) = abs.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                return ActionReply::rejected(format!(
-                    "code_edit: could not create parent dir for `{path}`: {e}"
-                ));
-            }
-        }
-        let tmp = abs.with_extension("mackesd-codeedit.tmp");
-        if let Err(e) = std::fs::write(&tmp, content) {
-            return ActionReply::rejected(format!("code_edit: write `{path}` failed: {e}"));
-        }
-        if let Err(e) = std::fs::rename(&tmp, &abs) {
-            let _ = std::fs::remove_file(&tmp);
-            return ActionReply::rejected(format!("code_edit: finalize `{path}` failed: {e}"));
+        // 1–2. PATH BOUND + TYPED WRITE — validate lexically, then walk/create
+        // parents relative to the allowed-root descriptor with O_NOFOLLOW. The
+        // sibling temporary is exclusive, synced, atomically renamed, and the
+        // parent is synced before returning.
+        if let Err(reason) = write_code_edit_beneath(&self.workgroup_root, path, content) {
+            return ActionReply::rejected(reason);
         }
         // 3. FIXED-ARG GIT COMMIT — stage the one validated relpath, then commit it
         //    with a fixed message. The binary is the literal "git"; the only
@@ -655,7 +893,7 @@ impl ActionWorker {
                 continue;
             }
             let body = msg.body.unwrap_or_default();
-            let reply = self.handle_action(&msg.ulid, &body);
+            let reply = self.handle_wire_action(&msg.ulid, &body);
             // PERF-8: one INFO line per drained action scales with every user
             // interaction and is redundant telemetry — the reply body is durably
             // persisted to the reply topic immediately below. DEBUG keeps it opt-in;
@@ -689,6 +927,7 @@ mod tests {
 
     fn lifecycle_req(target: &str, kind: &str, name: &str, op: &str) -> String {
         serde_json::json!({
+            "schema_version": 1,
             "kind": "service_lifecycle",
             "target_host": target,
             "service_kind": kind,
@@ -698,6 +937,32 @@ mod tests {
         .to_string()
     }
 
+    fn armed_wire_with_ttl(
+        body: &str,
+        nonce: &str,
+        signer: &HmacTokenSigner,
+        ttl_ms: i64,
+    ) -> String {
+        let request = parse_action_request(body).expect("typed request");
+        let token = mackes_mesh_types::cloud::CloudArmedToken::mint(
+            signer,
+            nonce,
+            wall_now_ms().saturating_add(ttl_ms),
+            EXEC_AUTH_VERB,
+            EXEC_AUTH_NODE,
+            &action_authorization_target(&request),
+            &mackes_mesh_types::cloud::cloud_request_digest(body).expect("request digest"),
+        )
+        .encode();
+        let mut value: serde_json::Value = serde_json::from_str(body).expect("request json");
+        value["armed_token"] = serde_json::Value::String(token);
+        value.to_string()
+    }
+
+    fn armed_wire(body: &str, nonce: &str, signer: &HmacTokenSigner) -> String {
+        armed_wire_with_ttl(body, nonce, signer, MAX_AUTH_TTL_MS)
+    }
+
     #[test]
     fn action_topic_is_canonical_three_segments() {
         // Locks the action/<domain>/<verb> shape so the workbench RPC caller
@@ -705,6 +970,86 @@ mod tests {
         assert!(ACTION_TOPIC.starts_with("action/"));
         let parts: Vec<&str> = ACTION_TOPIC.split('/').collect();
         assert_eq!(parts, vec!["action", "exec", "request"]);
+    }
+
+    #[test]
+    fn public_bus_action_requires_an_exact_single_use_capability() {
+        let tmp = tempfile::tempdir().unwrap();
+        let signer = Arc::new(HmacTokenSigner::new(b"action-auth-test-key".to_vec()));
+        let worker = ActionWorker::new(tmp.path().to_path_buf(), "peer:self".into())
+            .with_db_path(tmp.path().join("audit.db"))
+            .with_authorization(signer.clone(), tmp.path().join("auth"));
+        let unsigned = lifecycle_req("oak", "container", "nginx", "restart");
+
+        let refused = worker.handle_wire_action("01NOAUTH", &unsigned);
+        assert!(!refused.ok);
+        assert!(refused.error.unwrap().contains("not authorized"));
+        assert!(lifecycle::take_requests(tmp.path(), "oak").is_empty());
+
+        let mut legacy: serde_json::Value = serde_json::from_str(&unsigned).unwrap();
+        legacy.as_object_mut().unwrap().remove("schema_version");
+        let legacy = armed_wire(
+            &legacy.to_string(),
+            "action-legacy-schema-nonce",
+            signer.as_ref(),
+        );
+        let refused = worker.handle_wire_action("01LEGACY", &legacy);
+        assert!(!refused.ok);
+        assert!(refused.error.unwrap().contains("schema_version 1"));
+        assert!(lifecycle::take_requests(tmp.path(), "oak").is_empty());
+
+        let armed = armed_wire(&unsigned, "action-single-use-nonce", signer.as_ref());
+        let accepted = worker.handle_wire_action("01ARMED", &armed);
+        assert!(accepted.ok, "{accepted:?}");
+        let requests = lifecycle::take_requests(tmp.path(), "oak");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].id, "01ARMED");
+
+        let replay = worker.handle_wire_action("01REPLAY", &armed);
+        assert!(!replay.ok);
+        assert!(replay.error.unwrap().contains("already used"));
+        assert!(lifecycle::take_requests(tmp.path(), "oak").is_empty());
+    }
+
+    #[test]
+    fn action_capability_is_bound_to_the_complete_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        let signer = Arc::new(HmacTokenSigner::new(b"action-auth-test-key".to_vec()));
+        let worker = ActionWorker::new(tmp.path().to_path_buf(), "peer:self".into())
+            .with_db_path(tmp.path().join("audit.db"))
+            .with_authorization(signer.clone(), tmp.path().join("auth"));
+        let unsigned = lifecycle_req("oak", "container", "nginx", "start");
+        let armed = armed_wire(&unsigned, "action-body-bound-nonce", signer.as_ref());
+        let mut altered: serde_json::Value = serde_json::from_str(&armed).unwrap();
+        altered["op"] = serde_json::Value::String("stop".to_string());
+
+        let refused = worker.handle_wire_action("01ALTERED", &altered.to_string());
+        assert!(!refused.ok);
+        assert!(lifecycle::take_requests(tmp.path(), "oak").is_empty());
+    }
+
+    #[test]
+    fn overlong_action_capability_reaches_no_dispatcher() {
+        let tmp = tempfile::tempdir().unwrap();
+        let signer = Arc::new(HmacTokenSigner::new(b"action-auth-test-key".to_vec()));
+        let worker = ActionWorker::new(tmp.path().to_path_buf(), "peer:self".into())
+            .with_db_path(tmp.path().join("audit.db"))
+            .with_authorization(signer.clone(), tmp.path().join("auth"));
+        let unsigned = lifecycle_req("oak", "container", "nginx", "restart");
+        let armed = armed_wire_with_ttl(
+            &unsigned,
+            "action-overlong-capability-nonce",
+            signer.as_ref(),
+            MAX_AUTH_TTL_MS + 30_000,
+        );
+
+        let refused = worker.handle_wire_action("01OVERLONG", &armed);
+        assert!(!refused.ok);
+        assert!(refused
+            .error
+            .unwrap()
+            .contains("exceeds the 30-second lifetime"));
+        assert!(lifecycle::take_requests(tmp.path(), "oak").is_empty());
     }
 
     #[test]
@@ -878,6 +1223,7 @@ mod tests {
 
     fn code_edit_req(path: &str, content: &str) -> String {
         serde_json::json!({
+            "schema_version": 1,
             "kind": "code_edit",
             "path": path,
             "content": content,
@@ -968,10 +1314,10 @@ mod tests {
 
     #[test]
     fn apply_in_bounds_writes_commits_and_audits() {
-        // The full operator-approved path: an explicit code_edit apply request
-        // (reaching the worker = the gate) writes the reviewed content to an
+        // The post-authorization dispatcher writes the reviewed content to an
         // in-root path, commits it with FIXED git args, and audits the apply on
-        // the hash-chain plane. No shell, no command string anywhere.
+        // the hash-chain plane. The wire-level capability gate is covered above;
+        // no shell or command string exists anywhere in this path.
         let tmp = tempfile::tempdir().unwrap();
         git_init(tmp.path());
         let db = tmp.path().join("audit.db");
@@ -1067,6 +1413,33 @@ mod tests {
         let conn = crate::store::open(&db).expect("open audit db");
         let rows = crate::store::load_audit_rows(&conn).expect("rows");
         assert_eq!(rows.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_rejects_an_in_root_symlink_escape_without_touching_the_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        git_init(root.path());
+        symlink(outside.path(), root.path().join("linked")).unwrap();
+        let db = root.path().join("audit.db");
+        let worker = ActionWorker::new(root.path().to_path_buf(), "peer:self".into())
+            .with_db_path(db.clone());
+
+        let reply = worker.handle_action(
+            "01SYMLINK",
+            &code_edit_req("linked/escape.txt", "must not escape\n"),
+        );
+        assert!(!reply.ok, "{reply:?}");
+        assert!(
+            !outside.path().join("escape.txt").exists(),
+            "descriptor-relative path resolution must never follow the symlink"
+        );
+        let conn = crate::store::open(&db).expect("open audit db");
+        let rows = crate::store::load_audit_rows(&conn).expect("rows");
+        assert_eq!(rows.len(), 1, "the refusal remains hash-chain audited");
     }
 
     #[test]

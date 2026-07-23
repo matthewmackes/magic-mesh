@@ -710,6 +710,35 @@ fn apply_request_serializes_to_the_worker_verb_shape() {
 }
 
 #[test]
+fn apply_publish_body_is_schema_v1_and_exactly_scoped() {
+    let nodes = project(&[state_body("node-a", 1, true)]);
+    let req = StorageRequest::Apply {
+        armed_device: "/dev/sdb".to_string(),
+        staged: nodes[0].topology.clone(),
+        queue: StorageQueue {
+            ops: vec![StorageOp::DeletePartition {
+                partition: "/dev/sdb1".to_string(),
+            }],
+        },
+    };
+    let body = request_body_for_publish("node-a", &req).expect("test signer mints");
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(value["schema_version"], 1);
+    let token = mackes_mesh_types::cloud::CloudArmedToken::parse(
+        value["armed_token"].as_str().expect("capability"),
+    )
+    .expect("well-formed capability");
+    assert_eq!(token.verb, "storage-apply");
+    assert_eq!(token.node, "node-a");
+    assert_eq!(token.target, "/dev/sdb");
+
+    let refresh = request_body_for_publish("node-a", &StorageRequest::Refresh).unwrap();
+    let refresh: serde_json::Value = serde_json::from_str(&refresh).unwrap();
+    assert_eq!(refresh["schema_version"], 1);
+    assert!(refresh.get("armed_token").is_none());
+}
+
+#[test]
 fn project_progress_keeps_latest_per_op_ordered() {
     let host = "node-a";
     let lane = vec![
@@ -792,7 +821,7 @@ fn cloud_compat_deep_link_resolves_through_the_shell_nav_grammar() {
     assert!(matches!(
         crate::toast_bridge::resolve_action(&format!("shell/goto/{CLOUD_COMPAT_SURFACE}")),
         Some(crate::toast_bridge::Navigate::Surface(
-            crate::dock::Surface::InfraCode
+            crate::surfaces::Surface::InfraCode
         ))
     ));
 }
@@ -844,7 +873,7 @@ fn disk_card_wears_the_raised_elevation_token() {
 
 /// MENU-6 — the **menubar coverage backstop**: no workspace ships bare again.
 ///
-/// Every routed [`Surface`](crate::dock::Surface) is enumerated against ONE
+/// Every routed [`Surface`](crate::surfaces::Surface) is enumerated against ONE
 /// recorded register: it either fronts the shared `MenuBarModel` (with its
 /// recorded, non-empty bar title) or sits on the explicit exemption list with the
 /// reason + its MENUBAR-SWEEP follow-on. The register's `match` is deliberately
@@ -864,7 +893,7 @@ fn disk_card_wears_the_raised_elevation_token() {
 #[cfg(test)]
 #[allow(clippy::panic)]
 mod menubar_coverage {
-    use crate::dock::Surface;
+    use crate::surfaces::Surface;
 
     /// The recorded menubar posture of one routed surface.
     enum Coverage {
@@ -952,7 +981,7 @@ mod menubar_coverage {
                          follow-on",
             },
             Surface::Timers => Coverage::Exempt {
-                reason: "bare — the clock-cell Timers & Alarms surface (VDOCK-5) is \
+                reason: "bare — the clock-owned Timers & Alarms surface is \
                          deliberately chrome-light; a bar is a MENUBAR-SWEEP \
                          follow-on",
             },

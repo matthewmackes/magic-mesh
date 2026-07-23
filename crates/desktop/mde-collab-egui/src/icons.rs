@@ -334,7 +334,7 @@ pub fn icon_button(
 /// stretching the popup across the surface (mirrors the Files surface's cap).
 const COMMS_TOOLTIP_MAX_W: f32 = mde_egui::Style::SP_XL * 12.0;
 
-/// Paint a themed Communications hover tooltip: a framed Quasar-dark surface with a
+/// Paint a themed Communications hover tooltip: a framed Quazar-dark surface with a
 /// hairline stroke and themed text, so hover labels stay readable instead of falling
 /// back to egui's raw black-on-light default popup. The single tooltip primitive
 /// this surface's hover hints route through (mirrors `mde-files-egui`'s

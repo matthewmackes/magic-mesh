@@ -58,6 +58,10 @@ fn workload_name(body: &CloudActionBody) -> Option<&str> {
     }
 }
 
+pub(super) fn authorization_target(body: &CloudActionBody) -> Option<&str> {
+    workload_name(body)
+}
+
 /// Resolve `workload`'s live console through the injected `relay` and shape the
 /// reply. Pure over the [`ConsoleRelay`] seam (tests inject a fake), so the whole
 /// resolve → map → reply path runs without a live hypervisor.

@@ -42,7 +42,9 @@ use mde_egui::egui::{self, Color32, RichText, Sense};
 use mde_egui::{carbon_icon, Style};
 
 use mackes_mesh_types::cloud::{
+    cloud_request_digest, decode_cloud_arm_credential, CloudArmSigner, CloudArmedToken,
     CloudReply as WireCloudReply, CloudState, ConsoleEndpoint, DeliveryType, WorkloadRow,
+    WorkloadSpec, CLOUD_ACTION_SCHEMA_VERSION, CLOUD_ARM_CREDENTIAL, CLOUD_ARM_NODE_SCOPE,
     CLOUD_STATE_PREFIX,
 };
 
@@ -63,8 +65,94 @@ pub(super) const WORKSPACE_TITLE: &str = "Workloads";
 /// The typed-confirm echo an apply intent must match before the verb publishes
 /// (RUN-006's typed-arming idiom — the destructive-op hard wall).
 const APPLY_ECHO: &str = "apply";
-/// The typed-confirm echo an infrastructure destroy must match.
-const DESTROY_ECHO: &str = "destroy";
+
+/// Capability lifetime: enough for one local publish and mesh drain, while
+/// limiting interception value on the deliberately public Bus.
+const ARM_TOKEN_TTL_MS: i64 = 30_000;
+
+/// Load the production mint authority. Only the root DRM-shell service with its
+/// private systemd credential can mint; ad-hoc user sessions fail closed.
+fn production_cloud_arm_signer() -> Result<CloudArmSigner, String> {
+    if !rustix::process::geteuid().is_root() {
+        return Err(
+            "Live mutation authorization is available only in the root DRM shell.".to_string(),
+        );
+    }
+    let directory = std::env::var_os("CREDENTIALS_DIRECTORY")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| {
+            "The root shell has no systemd cloud-arming credential; live mutation is disabled."
+                .to_string()
+        })?;
+    let path = directory.join(CLOUD_ARM_CREDENTIAL);
+    let raw = std::fs::read(&path)
+        .map_err(|e| format!("Could not read systemd cloud-arming credential: {e}"))?;
+    let key = decode_cloud_arm_credential(&raw).map_err(str::to_string)?;
+    CloudArmSigner::new(key).map_err(str::to_string)
+}
+
+/// Insert a short-lived, request-body-bound capability into a frozen JSON body.
+fn authorize_body_with_signer(
+    signer: &CloudArmSigner,
+    body: &str,
+    verb: &str,
+    node: &str,
+    target: &str,
+) -> Result<String, String> {
+    for (label, value) in [("verb", verb), ("node", node), ("target", target)] {
+        if value.contains('|') || value.len() > 255 || value.trim().is_empty() {
+            return Err(format!(
+                "Mutation authorization {label} is not capability-safe."
+            ));
+        }
+    }
+    use rand::RngCore as _;
+    let mut nonce_bytes = [0_u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = nonce_bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .map_err(|_| "The system clock is before the Unix epoch.".to_string())?;
+    let token = CloudArmedToken::mint(
+        signer,
+        &nonce,
+        now.saturating_add(ARM_TOKEN_TTL_MS),
+        verb,
+        node,
+        target,
+        &cloud_request_digest(body).map_err(str::to_string)?,
+    )
+    .encode();
+    let mut document: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("Invalid mutation request body: {e}"))?;
+    let object = document
+        .as_object_mut()
+        .ok_or_else(|| "Mutation request body is not a JSON object.".to_string())?;
+    object.insert("armed_token".to_string(), serde_json::Value::String(token));
+    Ok(document.to_string())
+}
+
+/// Mint authority for the shell's older direct-libvirt publisher surfaces.
+/// Tests use a deterministic key so their isolated Bus contracts remain
+/// executable; production always goes through the root/systemd loader above.
+pub(crate) fn authorize_root_mutation_body(
+    body: &str,
+    verb: &str,
+    node: &str,
+    target: &str,
+) -> Result<String, String> {
+    #[cfg(test)]
+    let signer = CloudArmSigner::new(b"0123456789abcdef0123456789abcdef".to_vec())
+        .expect("test arming key is non-empty");
+    #[cfg(not(test))]
+    let signer = production_cloud_arm_signer()?;
+    authorize_body_with_signer(&signer, body, verb, node, target)
+}
 
 /// How often the folded `state/cloud` mirror is re-read while the surface is in
 /// view (a cheap bounded per-topic index probe).
@@ -81,6 +169,53 @@ const POLL_REPAINT: Duration = Duration::from_secs(1);
 /// The most session-audit rows retained (the workspace's own record of the ops
 /// it requested this session — the newest are kept).
 const MAX_AUDIT: usize = 24;
+
+/// Serialize the worker's `set-desired` envelope. The worker accepts one `spec`
+/// only under this wrapper; publishing the [`WorkloadSpec`] at the JSON root is
+/// malformed even though the nested spec itself has a placement node.
+fn set_desired_request_body(spec: &WorkloadSpec) -> String {
+    serde_json::json!({
+        "schema_version": CLOUD_ACTION_SCHEMA_VERSION,
+        "node": spec.node,
+        "spec": spec,
+    })
+    .to_string()
+}
+
+/// Serialize a node-placed cloud request with no verb-specific fields.
+fn node_request_body(node: &str) -> String {
+    serde_json::json!({
+        "schema_version": CLOUD_ACTION_SCHEMA_VERSION,
+        "node": node,
+    })
+    .to_string()
+}
+
+/// Serialize an Ansible mutation for one explicitly selected placement node.
+fn configure_request_body(node: &str, playbook: &str, group: &str) -> String {
+    serde_json::json!({
+        "schema_version": CLOUD_ACTION_SCHEMA_VERSION,
+        "node": node,
+        "playbook": playbook.trim(),
+        "group": group.trim(),
+    })
+    .to_string()
+}
+
+/// Serialize a workload lifecycle request for the node that reported its row.
+/// Destructive calls carry the operator's already-validated typed echo so the
+/// daemon independently enforces the same target confirmation.
+fn lifecycle_request_body(node: &str, instance: &str, typed_name: Option<&str>) -> String {
+    let mut body = serde_json::json!({
+        "schema_version": CLOUD_ACTION_SCHEMA_VERSION,
+        "node": node,
+        "instance": instance,
+    });
+    if let Some(typed_name) = typed_name {
+        body["typed_name"] = serde_json::Value::String(typed_name.to_string());
+    }
+    body.to_string()
+}
 
 // ───────────────────────────── the delivery-type axis ───────────────────────
 
@@ -262,17 +397,29 @@ pub(super) enum ArmAction {
     Provision,
     /// A live `configure` (Ansible apply) — echo [`APPLY_ECHO`].
     Configure,
-    /// An infrastructure `destroy` — echo [`DESTROY_ECHO`].
-    Destroy,
     /// A destructive per-workload lifecycle op (`instance-reboot` /
     /// `instance-delete`) — echo the workload name.
     Lifecycle {
         /// The lifecycle verb.
         verb: &'static str,
+        /// The placement node that reported the workload row.
+        node: String,
         /// The target workload/instance id.
         instance_id: String,
         /// The workload's display name — the required echo.
         name: String,
+    },
+    /// A panel-specific live mutation whose complete body is frozen before the
+    /// typed-confirm dialog opens (image build/promote or container deploy).
+    Prepared {
+        verb: &'static str,
+        node: String,
+        target: String,
+        body: String,
+        label: String,
+        echo: String,
+        word: &'static str,
+        subject: String,
     },
 }
 
@@ -284,8 +431,8 @@ impl ArmAction {
         match self {
             Self::Provision => "provision",
             Self::Configure => "configure",
-            Self::Destroy => "destroy",
             Self::Lifecycle { verb, .. } => verb,
+            Self::Prepared { verb, .. } => verb,
         }
     }
 
@@ -293,8 +440,8 @@ impl ArmAction {
     fn echo(&self) -> String {
         match self {
             Self::Provision | Self::Configure => APPLY_ECHO.to_string(),
-            Self::Destroy => DESTROY_ECHO.to_string(),
             Self::Lifecycle { name, .. } => name.clone(),
+            Self::Prepared { echo, .. } => echo.clone(),
         }
     }
 
@@ -302,8 +449,8 @@ impl ArmAction {
     fn confirm_word(&self) -> &'static str {
         match self {
             Self::Provision | Self::Configure => "Apply",
-            Self::Destroy => "Destroy",
             Self::Lifecycle { verb, .. } => verb_label(verb),
+            Self::Prepared { word, .. } => word,
         }
     }
 
@@ -312,8 +459,8 @@ impl ArmAction {
         match self {
             Self::Provision => "the OpenTofu-managed infrastructure (live apply)".to_string(),
             Self::Configure => "the Ansible convergence (live apply)".to_string(),
-            Self::Destroy => "ALL OpenTofu-managed infrastructure".to_string(),
             Self::Lifecycle { name, .. } => format!("workload {name}"),
+            Self::Prepared { subject, .. } => subject.clone(),
         }
     }
 }
@@ -424,6 +571,11 @@ pub struct WorkloadsState {
     /// decodes one — an honest "not resolved yet", never fabricated (§7).
     console: Option<ResolvedConsole>,
 
+    /// Test-only signer injection. Production has no programmatic key seam and
+    /// must obtain the credential from systemd in a root process.
+    #[cfg(test)]
+    arm_key_override: Option<Vec<u8>>,
+
     // ── the cockpit nav ──
     /// The active delivery-type view (the primary axis).
     view: DeliveryView,
@@ -488,6 +640,8 @@ impl Default for WorkloadsState {
             audit: Vec::new(),
             console_target: None,
             console: None,
+            #[cfg(test)]
+            arm_key_override: None,
             view: DeliveryView::default(),
             panel: Panel::default(),
             selected_node: None,
@@ -660,6 +814,46 @@ impl WorkloadsState {
         }
     }
 
+    /// Resolve the placement picker into a non-blank node for an emitted
+    /// request. Forms and menubar actions can be reached before a node is
+    /// selected; that state must not become a node-agnostic mutation that every
+    /// worker is eligible to drain.
+    fn require_selected_node(&mut self, label: &str) -> Option<String> {
+        if let Some(node) = self
+            .selected_node
+            .as_deref()
+            .map(str::trim)
+            .filter(|node| !node.is_empty())
+        {
+            return Some(node.to_string());
+        }
+        self.note = Some(format!(
+            "Select a placement node before requesting {label}."
+        ));
+        None
+    }
+
+    /// Emit one declarative desired-state write using the worker's required
+    /// `{ node, spec }` envelope.
+    pub(super) fn set_desired(&mut self, spec: &WorkloadSpec) {
+        if spec.node.trim().is_empty() {
+            self.note =
+                Some("Select a placement node before setting the workload desired.".to_string());
+            return;
+        }
+        let body = set_desired_request_body(spec);
+        self.arm_prepared(
+            mackes_mesh_types::cloud::VERB_SET_DESIRED,
+            spec.node.trim().to_string(),
+            format!("desired:{}", spec.name.trim()),
+            body,
+            format!("set desired for {}", spec.name),
+            spec.name.trim().to_string(),
+            "Save",
+            format!("desired state for workload {}", spec.name),
+        );
+    }
+
     /// Record one session-audit row, trimming to [`MAX_AUDIT`] newest.
     fn record_audit(&mut self, entry: AuditEntry) {
         self.audit.push(entry);
@@ -673,36 +867,103 @@ impl WorkloadsState {
     /// (The worker converges `cloud_vm` on `site.yml`; the selection is honest
     /// operator context the reply echoes.) The inputs live in [`configure::State`]
     /// so the U17 worker owns them without touching this struct.
-    fn configure_body(&self) -> String {
-        serde_json::json!({
-            "playbook": self.configure.playbook.trim(),
-            "group": self.configure.group.trim(),
-        })
-        .to_string()
+    fn configure_body(&mut self) -> Option<String> {
+        let node = self.require_selected_node("configuration")?;
+        Some(configure_request_body(
+            &node,
+            &self.configure.playbook,
+            &self.configure.group,
+        ))
+    }
+
+    /// Load the mint authority. Production accepts only the root DRM shell with
+    /// a systemd credential; a windowed/session launch and a missing credential
+    /// fail closed before any live request reaches the Bus.
+    fn cloud_arm_signer(&self) -> Result<CloudArmSigner, String> {
+        #[cfg(test)]
+        if let Some(key) = &self.arm_key_override {
+            return CloudArmSigner::new(key.clone()).map_err(str::to_string);
+        }
+
+        production_cloud_arm_signer()
+    }
+
+    /// Insert a locally minted, short-lived, target-bound token into an already
+    /// frozen JSON mutation body. The HMAC key itself never enters the Bus.
+    fn authorize_body(
+        &self,
+        body: &str,
+        verb: &str,
+        node: &str,
+        target: &str,
+    ) -> Result<String, String> {
+        let signer = self.cloud_arm_signer()?;
+        authorize_body_with_signer(&signer, body, verb, node, target)
     }
 
     /// Perform a confirmed armed action — called only past the typed-arming gate
     /// ([`armed`]).
-    fn perform(&mut self, action: ArmAction) {
-        match action {
-            ArmAction::Provision => self.issue("provision", None, "live provision (apply)"),
-            ArmAction::Configure => {
-                let body = self.configure_body();
-                self.issue("configure", Some(&body), "live configuration (apply)");
+    fn perform(&mut self, action: ArmAction, typed: &str) {
+        let expected = action.echo();
+        if !armed(typed, &expected) {
+            self.note = Some("Typed confirmation did not match; nothing was sent.".to_string());
+            return;
+        }
+        let (verb, node, target, body, label) = match action {
+            ArmAction::Provision => {
+                let Some(node) = self.require_selected_node("live provision") else {
+                    return;
+                };
+                let body = node_request_body(&node);
+                (
+                    "provision",
+                    node,
+                    CLOUD_ARM_NODE_SCOPE.to_string(),
+                    body,
+                    "live provision (apply)".to_string(),
+                )
             }
-            ArmAction::Destroy => self.issue("destroy", None, "infrastructure destroy"),
+            ArmAction::Configure => {
+                let Some(node) = self.require_selected_node("live configuration") else {
+                    return;
+                };
+                let body =
+                    configure_request_body(&node, &self.configure.playbook, &self.configure.group);
+                (
+                    "configure",
+                    node,
+                    CLOUD_ARM_NODE_SCOPE.to_string(),
+                    body,
+                    "live configuration (apply)".to_string(),
+                )
+            }
             ArmAction::Lifecycle {
                 verb,
+                node,
                 instance_id,
                 name,
             } => {
-                let body = serde_json::json!({ "instance": instance_id }).to_string();
-                self.issue(
+                let body = lifecycle_request_body(&node, &instance_id, Some(&name));
+                (
                     verb,
-                    Some(&body),
-                    &format!("{} on {name}", verb_label(verb)),
-                );
+                    node,
+                    instance_id,
+                    body,
+                    format!("{} on {name}", verb_label(verb)),
+                )
             }
+            ArmAction::Prepared {
+                verb,
+                node,
+                target,
+                body,
+                label,
+                ..
+            } => (verb, node, target, body, label),
+        };
+        match self.authorize_body(&body, verb, &node, &target) {
+            Ok(body) => self.issue(verb, Some(&body), &label),
+            Err(error) => self.note = Some(format!("{error} Nothing was sent.")),
         }
     }
 
@@ -711,7 +972,11 @@ impl WorkloadsState {
     /// Emit a provision **plan** (dry-run) — direct, no confirm. On a plan-only
     /// node the worker stages a `tofu plan` and returns it in the reply.
     pub(super) fn plan_provision(&mut self) {
-        self.issue("provision", None, "provision plan (dry-run)");
+        let Some(node) = self.require_selected_node("a provision plan") else {
+            return;
+        };
+        let body = node_request_body(&node);
+        self.issue("provision", Some(&body), "provision plan (dry-run)");
     }
 
     /// Open the typed-arming confirm for a live provision **apply** (#RUN-006 —
@@ -725,8 +990,9 @@ impl WorkloadsState {
 
     /// Emit a configuration **check** (dry-run `--check`) — direct.
     pub(super) fn check_configure(&mut self) {
-        let body = self.configure_body();
-        self.issue("configure", Some(&body), "configuration check (dry-run)");
+        if let Some(body) = self.configure_body() {
+            self.issue("configure", Some(&body), "configuration check (dry-run)");
+        }
     }
 
     /// Open the typed-arming confirm for a live configuration **apply**.
@@ -737,49 +1003,104 @@ impl WorkloadsState {
         });
     }
 
-    /// Open the typed-arming confirm for an infrastructure **destroy**.
-    pub(super) fn arm_destroy(&mut self) {
-        self.arming = Some(Arming {
-            action: ArmAction::Destroy,
-            typed: String::new(),
-        });
-    }
-
-    /// Emit a non-destructive lifecycle op (`instance-start` / `instance-stop`)
-    /// directly — armed to the backend, no typed confirm (never destructive). The
-    /// roster rows drive this seam.
+    /// Open typed confirmation for a lifecycle mutation. Even start/stop require
+    /// confirmation because minting authority, not destructiveness, is the
+    /// security boundary.
     pub(super) fn issue_lifecycle_direct(
         &mut self,
         verb: &'static str,
+        node: &str,
         instance_id: &str,
         name: &str,
     ) {
-        let body = serde_json::json!({ "instance": instance_id }).to_string();
-        self.issue(
-            verb,
-            Some(&body),
-            &format!("{} on {name}", verb_label(verb)),
-        );
+        let node = node.trim();
+        if node.is_empty() {
+            self.note = Some(format!(
+                "Could not request {} on {name}: the workload has no placement node.",
+                verb_label(verb)
+            ));
+            return;
+        }
+        self.arm_lifecycle(verb, node, instance_id, name);
     }
 
     /// Issue the `console-attach` lifecycle verb, tracking the target workload
     /// name ([`Self::console_target`]) so the resolved [`ConsoleEndpoint`] is
     /// attributed honestly rather than guessed. The roster rows' Console button
     /// calls this instead of the generic direct-issue seam.
-    pub(super) fn issue_console_attach(&mut self, instance_id: &str, name: &str) {
+    pub(super) fn issue_console_attach(&mut self, node: &str, instance_id: &str, name: &str) {
+        if node.trim().is_empty() {
+            self.note = Some(format!(
+                "Could not request console on {name}: the workload has no placement node."
+            ));
+            return;
+        }
         self.console_target = Some(name.to_string());
-        self.issue_lifecycle_direct("console-attach", instance_id, name);
+        let body = lifecycle_request_body(node.trim(), instance_id, None);
+        self.arm_prepared(
+            "console-attach",
+            node.trim().to_string(),
+            instance_id.to_string(),
+            body,
+            format!("console on {name}"),
+            name.to_string(),
+            "Attach",
+            format!("console for workload {name}"),
+        );
     }
 
     /// Open the typed-arming confirm for a destructive lifecycle op
     /// (`instance-reboot` / `instance-delete`) — nothing publishes until the
     /// workload name is typed (RUN-006). The roster rows drive this seam.
-    pub(super) fn arm_lifecycle(&mut self, verb: &'static str, instance_id: &str, name: &str) {
+    pub(super) fn arm_lifecycle(
+        &mut self,
+        verb: &'static str,
+        node: &str,
+        instance_id: &str,
+        name: &str,
+    ) {
+        let node = node.trim();
+        if node.is_empty() {
+            self.note = Some(format!(
+                "Could not arm {} on {name}: the workload has no placement node.",
+                verb_label(verb)
+            ));
+            return;
+        }
         self.arming = Some(Arming {
             action: ArmAction::Lifecycle {
                 verb,
+                node: node.to_string(),
                 instance_id: instance_id.to_string(),
                 name: name.to_string(),
+            },
+            typed: String::new(),
+        });
+    }
+
+    /// Open typed confirmation for a fully prepared panel mutation. The body is
+    /// frozen now, preventing form edits from changing what the later token binds.
+    pub(super) fn arm_prepared(
+        &mut self,
+        verb: &'static str,
+        node: String,
+        target: String,
+        body: String,
+        label: String,
+        echo: String,
+        word: &'static str,
+        subject: String,
+    ) {
+        self.arming = Some(Arming {
+            action: ArmAction::Prepared {
+                verb,
+                node,
+                target,
+                body,
+                label,
+                echo,
+                word,
+                subject,
             },
             typed: String::new(),
         });
@@ -841,9 +1162,9 @@ impl WorkloadsState {
     /// Surface the honest apply-gate + audit posture in the action note (Help).
     pub(super) fn set_help_note(&mut self) {
         self.note = Some(
-            "Live apply is capability-gated per node (armed token); provision, configure, and \
-             destroy stage as dry-runs otherwise. Every destructive op passes a typed-confirm; \
-             performed ops land in the Status audit trail."
+            "Live apply is capability-gated per node (armed token); provision and configure \
+             stage as dry-runs otherwise. Workload deletion is target-scoped and every \
+             destructive op passes a typed-confirm; performed ops land in the Status audit trail."
                 .to_string(),
         );
     }
@@ -1021,7 +1342,7 @@ fn nav_tab(
         .horizontal(|ui| {
             ui.scope(|ui| {
                 ui.visuals_mut().override_text_color = Some(color);
-                carbon_icon(ui, icon, Style::BODY + 2.0);
+                carbon_icon(ui, icon, Style::ICON_S);
             });
             ui.add_space(Style::SP_XS);
             ui.label(RichText::new(label).size(Style::BODY).color(color).strong());
@@ -1072,7 +1393,7 @@ fn render_arming(ui: &mut egui::Ui, state: &mut WorkloadsState) {
 
     egui::Frame::group(ui.style())
         .fill(Style::SURFACE_HI)
-        .stroke(egui::Stroke::new(1.0, Style::DANGER))
+        .stroke(egui::Stroke::new(Style::STROKE_HAIRLINE, Style::DANGER))
         .corner_radius(Style::RADIUS_S)
         .show(ui, |ui| {
             ui.label(
@@ -1118,7 +1439,7 @@ fn render_arming(ui: &mut egui::Ui, state: &mut WorkloadsState) {
 
     if confirm {
         if let Some(arming) = state.arming.take() {
-            state.perform(arming.action);
+            state.perform(arming.action, &arming.typed);
         }
     } else if cancel {
         state.arming = None;
@@ -1134,14 +1455,14 @@ fn render_arming(ui: &mut egui::Ui, state: &mut WorkloadsState) {
 pub(super) fn workloads_pending(ui: &mut egui::Ui, unit: &str, what: &str) {
     egui::Frame::group(ui.style())
         .fill(Style::SURFACE_HI)
-        .stroke(egui::Stroke::new(1.0, Style::BORDER))
+        .stroke(egui::Stroke::new(Style::STROKE_HAIRLINE, Style::BORDER))
         .corner_radius(Style::RADIUS_S)
         .shadow(card_shadow())
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.scope(|ui| {
                     ui.visuals_mut().override_text_color = Some(Style::ACCENT_WORKLOADS);
-                    carbon_icon(ui, "view-grid", Style::BODY + 2.0);
+                    carbon_icon(ui, "view-grid", Style::ICON_S);
                 });
                 ui.add_space(Style::SP_XS);
                 ui.label(
@@ -1279,7 +1600,7 @@ pub(super) fn roster(ui: &mut egui::Ui, state: &mut WorkloadsState, view: Delive
     // lifecycle verbs take `&mut state`.
     let rows: Vec<WorkloadRow> = state.workloads_of(view).cloned().collect();
     if rows.is_empty() {
-        crate::session::empty_state(
+        crate::empty_state::show(
             ui,
             "No workloads of this type yet",
             "This delivery-type roster fills once a placement node reports a matching workload in \
@@ -1303,7 +1624,7 @@ fn view_heading(ui: &mut egui::Ui, view: DeliveryView) {
     ui.horizontal(|ui| {
         ui.scope(|ui| {
             ui.visuals_mut().override_text_color = Some(Style::ACCENT_WORKLOADS);
-            carbon_icon(ui, view.icon(), Style::BODY + 2.0);
+            carbon_icon(ui, view.icon(), Style::ICON_S);
         });
         ui.add_space(Style::SP_XS);
         ui.label(
@@ -1347,16 +1668,16 @@ fn workload_row(ui: &mut egui::Ui, state: &mut WorkloadsState, row: &WorkloadRow
             ui.add_space(Style::SP_XS);
             ui.horizontal(|ui| {
                 if row_button(ui, "Start", false).clicked() {
-                    state.issue_lifecycle_direct("instance-start", &row.name, &row.name);
+                    state.issue_lifecycle_direct("instance-start", &row.node, &row.name, &row.name);
                 }
                 if row_button(ui, "Stop", false).clicked() {
-                    state.issue_lifecycle_direct("instance-stop", &row.name, &row.name);
+                    state.issue_lifecycle_direct("instance-stop", &row.node, &row.name, &row.name);
                 }
                 if row_button(ui, "Reboot\u{2026}", true).clicked() {
-                    state.arm_lifecycle("instance-reboot", &row.name, &row.name);
+                    state.arm_lifecycle("instance-reboot", &row.node, &row.name, &row.name);
                 }
                 if row_button(ui, "Delete\u{2026}", true).clicked() {
-                    state.arm_lifecycle("instance-delete", &row.name, &row.name);
+                    state.arm_lifecycle("instance-delete", &row.node, &row.name, &row.name);
                 }
             });
         });

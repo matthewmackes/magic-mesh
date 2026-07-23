@@ -5,10 +5,9 @@
 //! registry is allowed (no allowlist).
 //!
 //! The lens emits [`VERB_CONTAINER_DEPLOY`] through the cockpit's preserved emit
-//! path (the same `issue` seam the provision lens uses). A live install is
-//! armed-token gated on the placement node; an un-armed request still renders and
-//! stages the unit for review but installs nothing — so a deploy is never faked
-//! (§7). The unit is previewed live below the form (a faithful mirror of the
+//! path (the same `issue` seam the provision lens uses). A live install requires
+//! exact typed confirmation and a target/body-bound token minted by the root DRM
+//! shell. The unit is previewed live below the form (a faithful mirror of the
 //! backend's render) so the operator reviews exactly what would be installed before
 //! requesting it.
 
@@ -105,9 +104,8 @@ fn render_quadlet(
     s
 }
 
-/// Build the JSON `container-deploy` request body from the form (rootless by
-/// default). No armed token is sent from the shell, so the backend stages the unit
-/// and installs nothing until a placement-node capability arms it (honest, §7).
+/// Build the JSON `container-deploy` request body from the frozen form. The root
+/// shell inserts a target-bound token only after typed confirmation.
 fn deploy_request_body(
     node: &str,
     name: &str,
@@ -118,6 +116,7 @@ fn deploy_request_body(
     volumes: &[String],
 ) -> String {
     serde_json::json!({
+        "schema_version": mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION,
         "node": node,
         "name": name,
         "image": image,
@@ -146,13 +145,15 @@ pub(super) fn containers_panel(ui: &mut egui::Ui, state: &mut WorkloadsState) {
     let volumes = split_lines(&state.containers.volumes);
     let node = state
         .selected_node()
+        .map(str::trim)
+        .filter(|node| !node.is_empty())
         .map(str::to_string)
         .unwrap_or_default();
 
     preview(ui, &name, &image, rootful, &ports, &env, &volumes);
     ui.add_space(Style::SP_S);
 
-    let ready = is_unit_safe(&name) && !image.is_empty();
+    let ready = is_unit_safe(&name) && !image.is_empty() && !node.is_empty();
     let deploy = ui
         .add_enabled(
             ready,
@@ -165,17 +166,21 @@ pub(super) fn containers_panel(ui: &mut egui::Ui, state: &mut WorkloadsState) {
         .clicked();
     mde_egui::muted_note(
         ui,
-        "Deploy stages the unit for review; a live install needs an armed capability on the \
-         placement node \u{2014} without it the backend renders the unit and installs nothing \
-         (never a fake deploy).",
+        "Deploy opens exact typed confirmation. The root DRM shell then mints a single-use \
+         capability bound to this placement node and the complete frozen unit request.",
     );
 
     if deploy {
         let body = deploy_request_body(&node, &name, &image, rootful, &ports, &env, &volumes);
-        state.issue(
+        state.arm_prepared(
             VERB_CONTAINER_DEPLOY,
-            Some(&body),
-            &format!("container deploy ({name})"),
+            node,
+            name.clone(),
+            body,
+            format!("container deploy ({name})"),
+            name.clone(),
+            "Deploy",
+            format!("container {name}"),
         );
     }
 }
@@ -187,7 +192,7 @@ fn header(ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.scope(|ui| {
                 ui.visuals_mut().override_text_color = Some(Style::ACCENT_WORKLOADS);
-                carbon_icon(ui, "overlay", Style::BODY + 2.0);
+                carbon_icon(ui, "overlay", Style::ICON_S);
             });
             ui.add_space(Style::SP_XS);
             ui.label(
@@ -383,6 +388,7 @@ mod tests {
             &[],
         );
         assert!(body.contains(r#""rootful":false"#), "{body}");
+        assert!(body.contains(r#""schema_version":1"#), "{body}");
         assert!(body.contains(r#""ports":["8080:80"]"#), "{body}");
         assert!(body.contains(r#""node":"eagle""#), "{body}");
         assert!(body.contains(r#""name":"web""#), "{body}");

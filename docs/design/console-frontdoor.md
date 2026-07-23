@@ -1,5 +1,9 @@
 # CONSOLE — the Terminal's Start-Menu front door
 
+> **HISTORICAL / SUPERSEDED (2026-07-22):** the Start-menu/bottom-rail design is
+> retired by `docs/design/platform-interfaces.md`; its OpenStack command entries
+> are also retired by the zero-OpenStack cutover.
+
 Operator-locked 2026-07-04 (50-Q `/plan` survey). A Carbon-styled **Start Menu that is
 the Front Door for the Terminal**: the bottom rail's far-left Start/Advanced icon opens a
 Win10-style panel of **operational entries**, each of which launches a TUI/CLI op as a

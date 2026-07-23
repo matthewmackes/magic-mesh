@@ -1305,6 +1305,113 @@ pub(crate) fn spawn_compute_lifecycle_workers(
                 .to_string(),
         )
     });
+    // WL-FUNC-012 / OVERLAY-10 — the keyless USGS earthquake adapter. This is
+    // Workstation-tier because external overlay bandwidth lives on the seated
+    // adapter host, never on the MG90 cellular gateway or a Lighthouse. It is an
+    // explicit-opt-in no-op unless `MDE_OVERLAY_USGS_EARTHQUAKES=1` and publishes
+    // normalized latest-wins `state/overlay/usgs-earthquakes/<node>` snapshots.
+    spawn_tiered(sup, worker_names, role_rank, "earthquake_overlay", || {
+        mackesd_core::workers::earthquake_overlay::EarthquakeOverlayWorker::new(
+            node_id
+                .strip_prefix("peer:")
+                .unwrap_or(&node_id)
+                .to_string(),
+        )
+    });
+    // WL-FUNC-012 / OVERLAY-1 — point-scoped NWS active weather alerts, with
+    // affected-zone geometry fallback. Workstation-tier and explicit opt-in;
+    // it consumes only a fresh local vehicle mirror and otherwise idles.
+    spawn_tiered(sup, worker_names, role_rank, "nws_alert_overlay", || {
+        mackesd_core::workers::nws_alert_overlay::NwsAlertOverlayWorker::new(
+            node_id
+                .strip_prefix("peer:")
+                .unwrap_or(&node_id)
+                .to_string(),
+        )
+    });
+    // WL-FUNC-012 / OVERLAY-2 — producer-timed IEM/NWS NEXRAD tile animation.
+    // Workstation-tier, keyless, explicit opt-in, and scoped from a fresh
+    // same-host US vehicle fix.
+    spawn_tiered(sup, worker_names, role_rank, "iem_radar_overlay", || {
+        mackesd_core::workers::iem_radar_overlay::IemRadarOverlayWorker::new(
+            node_id
+                .strip_prefix("peer:")
+                .unwrap_or(&node_id)
+                .to_string(),
+        )
+    });
+    // WL-FUNC-012 / OVERLAY-6 — official current NIFC WFIGS wildfire
+    // perimeters. Workstation-tier, keyless, explicit opt-in, bounded to a
+    // fresh same-host US vehicle fix, and 429-aware with last-good retention.
+    spawn_tiered(sup, worker_names, role_rank, "wildfire_overlay", || {
+        mackesd_core::workers::wildfire_overlay::WildfireOverlayWorker::new(
+            node_id
+                .strip_prefix("peer:")
+                .unwrap_or(&node_id)
+                .to_string(),
+        )
+    });
+    // WL-FUNC-012 / OVERLAY-3 — current NCDOT TIMS incident points. This first
+    // keyless state adapter is Workstation-tier, explicit opt-in, and requires
+    // a fresh same-host North Carolina vehicle fix.
+    spawn_tiered(sup, worker_names, role_rank, "traffic_overlay", || {
+        mackesd_core::workers::traffic_overlay::TrafficOverlayWorker::new(
+            node_id
+                .strip_prefix("peer:")
+                .unwrap_or(&node_id)
+                .to_string(),
+        )
+    });
+    // WL-FUNC-012 / OVERLAY-4 — official NWS points→forecastHourly guidance.
+    // Workstation-tier, keyless, strict official-host allowlist, explicit
+    // opt-in, and scoped only from a fresh same-host MG90 fix.
+    spawn_tiered(sup, worker_names, role_rank, "nws_forecast_overlay", || {
+        mackesd_core::workers::nws_forecast_overlay::NwsForecastOverlayWorker::new(
+            node_id
+                .strip_prefix("peer:")
+                .unwrap_or(&node_id)
+                .to_string(),
+        )
+    });
+    // WL-FUNC-012 / OVERLAY-8 — vehicle-scoped adsb.lol aircraft. The
+    // Workstation-tier worker is an idle no-op unless explicitly opted in, and
+    // publishes only from a fresh finite local MG90 fix.
+    spawn_tiered(sup, worker_names, role_rank, "aircraft_overlay", || {
+        mackesd_core::workers::aircraft_overlay::AircraftOverlayWorker::new(
+            node_id
+                .strip_prefix("peer:")
+                .unwrap_or(&node_id)
+                .to_string(),
+        )
+    });
+    // WL-FUNC-012 / OVERLAY-9 — keyless MBTA GTFS-Realtime vehicle positions.
+    // Workstation-tier, explicit opt-in, and relevance-filtered only from a
+    // fresh local MG90 position.
+    spawn_tiered(sup, worker_names, role_rank, "transit_overlay", || {
+        mackesd_core::workers::transit_overlay::TransitOverlayWorker::new(
+            node_id
+                .strip_prefix("peer:")
+                .unwrap_or(&node_id)
+                .to_string(),
+        )
+    });
+    // WL-FUNC-012 / OVERLAY-5 — official Caltrans CWWP2 camera catalogs and
+    // bounded current JPEG stills. Workstation-tier, explicit opt-in, and
+    // scoped to a fresh same-host California MG90 fix.
+    spawn_tiered(
+        sup,
+        worker_names,
+        role_rank,
+        "caltrans_camera_overlay",
+        || {
+            mackesd_core::workers::caltrans_camera_overlay::CaltransCameraOverlayWorker::new(
+                node_id
+                    .strip_prefix("peer:")
+                    .unwrap_or(&node_id)
+                    .to_string(),
+            )
+        },
+    );
     // MV-5a — the scheduler worker: the placement slice of the no-center
     // scheduler. Drains `action/schedule/place`, folds each node's latest
     // `event/kvm/services` capacity, chooses the target node (healthy pin →
@@ -2829,7 +2936,8 @@ pub(crate) fn spawn_probe_observability_workers(
     // TLS 1.3 listener on :443 (default; env-overrideable),
     // spawns the per-stream demux pump per accepted peer
     // tunnel. Cert + key paths default to
-    // /etc/nebula/lighthouse.{crt,key}; overridable via
+    // the same fingerprint-pinned identity as /enroll by default;
+    // overridable via
     // MDE_HTTPS_TUNNEL_{CERT,KEY} env vars so operators
     // running Let's-Encrypt-issued certs can point to the
     // existing PEM chain. On peer-role boxes (no cert
@@ -2893,6 +3001,55 @@ pub(crate) fn spawn_probe_observability_workers(
                         error = %e,
                         "nebula-https-listener: relay cert bootstrap failed; relay stays down",
                     ),
+                }
+            }
+            // WL-RUN-008 — publish the exact relay leaf identity into this
+            // lighthouse's own replicated bundle. Enrollment roster builders
+            // merge every lighthouse's self-advertisement, preserving HA while
+            // keeping legacy/missing identities honestly unavailable.
+            if relay_eligible && std::path::Path::new(&https_cert).exists() {
+                let advertised = std::fs::read_to_string(&https_cert)
+                    .ok()
+                    .and_then(mackesd_core::ca::bundle::RelayTlsIdentity::from_certificate_pem);
+                if let Some(identity) = advertised {
+                    let own_bundle = mackesd_core::ca::bundle::read_bundle(
+                        &mackesd_core::ca::bundle::bundle_path(workgroup_root, node_id),
+                    );
+                    let overlay = mackesd_core::voip_rtt::own_nebula_ip()
+                        .or_else(|| own_bundle.as_ref().ok().map(|b| b.overlay_ip.clone()));
+                    let external =
+                        mackesd_core::lighthouse_addr::read_external_addr().or_else(|| {
+                            own_bundle.as_ref().ok().and_then(|bundle| {
+                                bundle
+                                    .lighthouses
+                                    .iter()
+                                    .find(|entry| entry.node_id == node_id.as_str())
+                                    .map(|entry| entry.external_addr.clone())
+                            })
+                        });
+                    if let (Some(overlay), Some(external)) = (overlay, external) {
+                        if let Err(e) = mackesd_core::ca::bundle::advertise_local_relay_tls_identity(
+                            workgroup_root,
+                            node_id,
+                            &overlay,
+                            &external,
+                            identity,
+                        ) {
+                            tracing::warn!(
+                                error = %e,
+                                "nebula-https-listener: relay identity advertisement failed"
+                            );
+                        }
+                    } else {
+                        tracing::warn!(
+                            "nebula-https-listener: relay identity exists but overlay/external address is unavailable"
+                        );
+                    }
+                } else {
+                    tracing::warn!(
+                        cert = %https_cert,
+                        "nebula-https-listener: relay certificate is not valid PEM; trust advertisement skipped"
+                    );
                 }
             }
             if std::path::Path::new(&https_cert).exists() {

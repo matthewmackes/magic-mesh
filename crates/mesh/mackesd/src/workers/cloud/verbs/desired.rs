@@ -5,9 +5,9 @@
 //! - **`set-desired`** ([`handle_set_desired`]) — persists a placement node's
 //!   desired-state workload doc(s) under `<state_root>/mcnf/cloud/desired/<node>/…`
 //!   (the local realization of the `/mcnf/cloud/desired/<node>/<name>` key), via the
-//!   [`super::super::reconcile`] per-node store. A mutation in classification (so the
-//!   drain places it on its node), but declarative — it changes no live infra, so it
-//!   carries no armed token; the armed apply is the separate `provision` verb.
+//!   [`super::super::reconcile`] per-node store. It is an authenticated declarative
+//!   mutation: changing desired state does not apply live infrastructure immediately,
+//!   but it still requires an exact-body-bound, single-use capability.
 //! - **`plan`** ([`handle_plan`]) — renders the node's desired slice into tfvars
 //!   ([`super::super::render`]) and shells `tofu plan -json` through the injectable
 //!   [`CloudRunner`] seam, returning the pending-change [`PlanCounts`] the surface
@@ -44,10 +44,36 @@ struct SetDesiredBody {
     remove: Vec<String>,
 }
 
+/// Stable semantic target for a desired-state request. The capability also binds
+/// the complete canonical request digest, so this label is operator context, not
+/// the only anti-substitution control.
+pub(super) fn authorization_target(body_str: &str) -> Result<String, String> {
+    let body: SetDesiredBody = serde_json::from_str(body_str.trim())
+        .map_err(|e| format!("malformed set-desired request: {e}"))?;
+    let mut names = Vec::new();
+    if let Some(spec) = body.spec {
+        names.push(spec.name.trim().to_string());
+    }
+    names.extend(
+        body.specs
+            .into_iter()
+            .map(|spec| spec.name.trim().to_string()),
+    );
+    names.extend(body.remove.into_iter().map(|name| name.trim().to_string()));
+    names.retain(|name| !name.is_empty());
+    names.sort();
+    names.dedup();
+    Ok(if names.len() == 1 {
+        format!("desired:{}", names[0])
+    } else {
+        "desired-state".to_string()
+    })
+}
+
 /// The `plan` request body — the placement node whose slice to plan.
 #[derive(Debug, Default, Deserialize)]
 struct PlanBody {
-    /// The placement node to plan (empty ⇒ this node).
+    /// The explicit placement node whose local desired slice is planned.
     #[serde(default)]
     node: String,
 }
@@ -88,16 +114,31 @@ pub(crate) fn handle_set_desired(w: &CloudWorker, verb_name: &str, body_str: &st
         );
     }
 
-    // The removal target node: the request node, else the (shared) node of the
-    // written specs — honest error if neither resolves.
-    let remove_node = if !request_node.is_empty() {
-        request_node.to_string()
-    } else {
-        to_write
-            .first()
-            .map(|s| s.node.trim().to_string())
-            .unwrap_or_default()
-    };
+    // Validate the complete batch before the first write. The outer placement is
+    // the sole routing authority: a nested spec may omit its node and inherit it,
+    // but it may never smuggle a second node into one authorized request.
+    if let Err(e) = super::super::path_key::segment("node", request_node) {
+        return reject(verb_name, e);
+    }
+    for spec in &to_write {
+        if spec.node != request_node {
+            return reject(
+                verb_name,
+                format!(
+                    "workload `{}` targets node `{}` but request placement is `{request_node}`",
+                    spec.name, spec.node
+                ),
+            );
+        }
+        if let Err(e) = super::super::path_key::segment("name", &spec.name) {
+            return reject(verb_name, e);
+        }
+    }
+    for name in &body.remove {
+        if let Err(e) = super::super::path_key::segment("name", name) {
+            return reject(verb_name, e);
+        }
+    }
 
     // Write each declared spec.
     let mut accepted: Vec<WorkloadSpec> = Vec::new();
@@ -110,17 +151,7 @@ pub(crate) fn handle_set_desired(w: &CloudWorker, verb_name: &str, body_str: &st
 
     // Retract each removal (idempotent — an absent workload is not an error).
     for name in &body.remove {
-        let name = name.trim();
-        if name.is_empty() {
-            continue;
-        }
-        if remove_node.is_empty() {
-            return reject(
-                verb_name,
-                format!("cannot remove `{name}`: no placement `node` given"),
-            );
-        }
-        if let Err(e) = reconcile::remove_desired_doc(&w.state_root, &remove_node, name) {
+        if let Err(e) = reconcile::remove_desired_doc(&w.state_root, request_node, name) {
             return fail(verb_name, format!("retract desired doc failed: {e}"));
         }
     }
@@ -273,6 +304,46 @@ mod tests {
     }
 
     #[test]
+    fn set_desired_rejects_a_nested_second_node_before_writing_the_batch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let w = worker(
+            "eagle",
+            tmp.path().to_path_buf(),
+            Arc::new(FakeRunner::default()),
+        );
+        let body = r#"{"node":"eagle","specs":[
+            {"name":"first","delivery_type":"service_vm","node":"eagle",
+             "vcpu":1,"memory_mb":512,"disk_gb":4},
+            {"name":"smuggled","delivery_type":"service_vm","node":"otter",
+             "vcpu":1,"memory_mb":512,"disk_gb":4}
+        ]}"#;
+
+        let reply = handle_set_desired(&w, "set-desired", body);
+        assert!(!reply.ok);
+        assert!(reply.error.unwrap().contains("request placement"));
+        assert!(reconcile::read_desired_slice(tmp.path(), "eagle").is_empty());
+        assert!(reconcile::read_desired_slice(tmp.path(), "otter").is_empty());
+    }
+
+    #[test]
+    fn set_desired_rejects_blank_removal_before_any_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let w = worker(
+            "eagle",
+            tmp.path().to_path_buf(),
+            Arc::new(FakeRunner::default()),
+        );
+        let body = r#"{"node":"eagle","spec":{
+            "name":"first","delivery_type":"service_vm","node":"eagle",
+            "vcpu":1,"memory_mb":512,"disk_gb":4},"remove":[" "]}"#;
+
+        let reply = handle_set_desired(&w, "set-desired", body);
+        assert!(!reply.ok);
+        assert!(reply.error.unwrap().contains("path-safe"));
+        assert!(reconcile::read_desired_slice(tmp.path(), "eagle").is_empty());
+    }
+
+    #[test]
     fn set_desired_without_a_spec_or_removal_is_an_honest_error() {
         let tmp = tempfile::tempdir().unwrap();
         let w = worker(
@@ -283,6 +354,48 @@ mod tests {
         let reply = handle_set_desired(&w, "set-desired", r#"{"node":"eagle"}"#);
         assert!(!reply.ok);
         assert!(reply.error.unwrap().contains("requires"));
+    }
+
+    #[test]
+    fn set_desired_rejects_an_absolute_node_before_any_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        let node = outside.to_string_lossy();
+        let w = worker(
+            "eagle",
+            tmp.path().join("state"),
+            Arc::new(FakeRunner::default()),
+        );
+        let body = format!(
+            r#"{{"node":"{node}","spec":{{
+                "name":"proof","delivery_type":"service_vm","node":"{node}",
+                "vcpu":1,"memory_mb":1,"disk_gb":1}}}}"#
+        );
+
+        let reply = handle_set_desired(&w, "set-desired", &body);
+        assert!(!reply.ok);
+        assert!(reply.error.unwrap().contains("path-safe"));
+        assert!(!outside.exists());
+    }
+
+    #[test]
+    fn set_desired_rejects_an_absolute_removal_and_preserves_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("victim.json");
+        std::fs::write(&outside, "keep").unwrap();
+        let attack_path = tmp.path().join("victim");
+        let attack_name = attack_path.to_string_lossy();
+        let w = worker(
+            "eagle",
+            tmp.path().join("state"),
+            Arc::new(FakeRunner::default()),
+        );
+        let body = format!(r#"{{"node":"eagle","remove":["{attack_name}"]}}"#);
+
+        let reply = handle_set_desired(&w, "set-desired", &body);
+        assert!(!reply.ok);
+        assert!(reply.error.unwrap().contains("path-safe"));
+        assert_eq!(std::fs::read_to_string(outside).unwrap(), "keep");
     }
 
     #[test]

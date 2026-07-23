@@ -62,6 +62,7 @@ use std::time::{Duration, Instant};
 use mde_bus::persist::Persist;
 use thiserror::Error;
 
+use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
 use crate::workers::proc::{output_with_timeout, DEFAULT_CMD_TIMEOUT};
 
 use super::fs_tools::{
@@ -2388,6 +2389,8 @@ fn read_new_requests(
     bus_root: &Path,
     topic: &str,
     cursor: &mut Option<String>,
+    authorizer: &ActionAuthorizer,
+    node: &str,
 ) -> Vec<StorageRequest> {
     let Ok(persist) = Persist::open(bus_root.to_path_buf()) else {
         return vec![];
@@ -2400,7 +2403,29 @@ fn read_new_requests(
         *cursor = Some(msg.ulid.clone());
         let body = msg.body.as_deref().unwrap_or("");
         match parse_request(body) {
-            Ok(r) => out.push(r),
+            Ok(request) => {
+                let authorized = match &request {
+                    StorageRequest::Refresh => Ok(()),
+                    StorageRequest::Apply { armed_device, .. } => authorizer.authorize(
+                        body,
+                        MutationContext {
+                            verb: "storage-apply",
+                            node,
+                            target: armed_device,
+                        },
+                    ),
+                };
+                match authorized {
+                    Ok(()) => out.push(request),
+                    Err(error) => tracing::warn!(
+                        target: "mackesd::storage",
+                        ulid = %msg.ulid,
+                        node,
+                        error = %error,
+                        "refused unauthorized privileged request"
+                    ),
+                }
+            }
             Err(e) => tracing::warn!(ulid = %msg.ulid, error = %e, "storage: bad storage request"),
         }
     }
@@ -2428,6 +2453,8 @@ pub struct StorageWorker {
     executor: Arc<dyn StorageExecutor>,
     /// The hard-wall interlocks (production: [`Interlocks::production`]).
     interlocks: Arc<Interlocks>,
+    /// Exact-body capability verifier for destructive physical/virtual applies.
+    authorizer: Arc<ActionAuthorizer>,
     /// Action-drain cadence.
     poll: Duration,
     /// Topology-mirror republish heartbeat.
@@ -2452,6 +2479,7 @@ impl StorageWorker {
             udisks: Arc::new(ZbusUDisks2Client::new()),
             executor: Arc::new(UDisks2Executor::new()),
             interlocks: Arc::new(Interlocks::production()),
+            authorizer: Arc::new(ActionAuthorizer::production()),
             poll: DEFAULT_POLL_INTERVAL,
             heartbeat: PUBLISH_HEARTBEAT,
             bus_root_override: None,
@@ -2483,6 +2511,14 @@ impl StorageWorker {
     #[must_use]
     pub fn with_interlocks(mut self, interlocks: Arc<Interlocks>) -> Self {
         self.interlocks = interlocks;
+        self
+    }
+
+    /// Inject an isolated verifier and replay ledger (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
+        self.authorizer = authorizer;
         self
     }
 
@@ -2614,7 +2650,13 @@ impl StorageWorker {
     /// when the topology likely changed (so the caller republishes the mirror).
     async fn drain_and_apply(&self, bus_root: &Path, cursor: &mut Option<String>) -> bool {
         let topic = action_topic(&self.node_id);
-        let requests = read_new_requests(bus_root, &topic, cursor);
+        let requests = read_new_requests(
+            bus_root,
+            &topic,
+            cursor,
+            self.authorizer.as_ref(),
+            &self.node_id,
+        );
         let mut changed = false;
         for req in requests {
             match req {
@@ -2700,9 +2742,12 @@ impl Worker for StorageWorker {
                     // by EFF-20), so run its tick off the runtime thread.
                     if let Some(root) = &bus_root {
                         let vs = self.virtual_storage.clone();
+                        let authorizer = Arc::clone(&self.authorizer);
                         let root = root.clone();
                         let cur = virtual_cursor.clone();
-                        virtual_cursor = tokio::task::spawn_blocking(move || vs.tick(&root, cur))
+                        virtual_cursor = tokio::task::spawn_blocking(move || {
+                            vs.tick(&root, cur, authorizer.as_ref())
+                        })
                             .await
                             .unwrap_or(virtual_cursor);
                     }
@@ -2717,7 +2762,11 @@ impl Worker for StorageWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::action_auth::authorize_test_body;
     use std::sync::Mutex;
+
+    const AUTH_KEY: &[u8] = b"storage-action-auth-test-key";
+    const AUTH_NOW: i64 = 1_700_000_000_000;
 
     // ── fixtures ──
 
@@ -3748,6 +3797,87 @@ mod tests {
             StorageRequest::Refresh
         );
         assert!(parse_request("nope").is_err());
+    }
+
+    fn storage_apply_request(label: &str) -> StorageRequest {
+        StorageRequest::Apply {
+            armed_device: "/dev/sdb".into(),
+            staged: sample_topo(),
+            queue: StorageQueue::new(vec![StorageOp::SetLabel {
+                partition: "/dev/sdb1".into(),
+                label: label.into(),
+            }]),
+        }
+    }
+
+    fn signed_storage_body(label: &str, nonce: &str, expires_at_ms: i64) -> String {
+        let mut unsigned = serde_json::to_value(storage_apply_request(label)).unwrap();
+        unsigned
+            .as_object_mut()
+            .unwrap()
+            .insert("schema_version".to_string(), serde_json::Value::from(1_u64));
+        authorize_test_body(
+            AUTH_KEY,
+            &unsigned.to_string(),
+            MutationContext {
+                verb: "storage-apply",
+                node: "node",
+                target: "/dev/sdb",
+            },
+            nonce,
+            expires_at_ms,
+        )
+    }
+
+    #[tokio::test]
+    async fn hostile_storage_applies_never_reach_the_executor() {
+        let dir = tempfile::tempdir().unwrap();
+        let persist = Persist::open(dir.path().to_path_buf()).unwrap();
+        let executor = Arc::new(FakeExecutor::ok());
+        let authorizer = Arc::new(ActionAuthorizer::for_test(
+            AUTH_KEY,
+            dir.path().join("auth"),
+            AUTH_NOW,
+        ));
+        let worker = StorageWorker::new("node".into())
+            .with_udisks(Arc::new(FakeUDisks(Ok(sample_topo()))))
+            .with_executor(executor.clone())
+            .with_interlocks(Arc::new(free_interlocks()))
+            .with_authorizer(authorizer);
+
+        let unsigned = serde_json::to_string(&storage_apply_request("unsigned")).unwrap();
+        let future = signed_storage_body("future", "future", AUTH_NOW + 30_000)
+            .replace("\"schema_version\":1", "\"schema_version\":2");
+        let overlong = signed_storage_body("overlong", "overlong", AUTH_NOW + 30_001);
+        let tampered = signed_storage_body("before", "tampered", AUTH_NOW + 30_000)
+            .replace("\"before\"", "\"after\"");
+        for body in [&unsigned, &future, &overlong, &tampered] {
+            persist
+                .write(
+                    &action_topic("node"),
+                    mde_bus::hooks::config::Priority::Default,
+                    None,
+                    Some(body),
+                )
+                .unwrap();
+        }
+        let mut cursor = None;
+        worker.drain_and_apply(dir.path(), &mut cursor).await;
+        assert_eq!(*executor.seen.lock().unwrap(), 0);
+
+        let replay = signed_storage_body("once", "replay", AUTH_NOW + 30_000);
+        for _ in 0..2 {
+            persist
+                .write(
+                    &action_topic("node"),
+                    mde_bus::hooks::config::Priority::Default,
+                    None,
+                    Some(&replay),
+                )
+                .unwrap();
+        }
+        worker.drain_and_apply(dir.path(), &mut cursor).await;
+        assert_eq!(*executor.seen.lock().unwrap(), 1);
     }
 
     #[test]

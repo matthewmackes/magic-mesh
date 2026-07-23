@@ -5,14 +5,14 @@ use super::{
     total_rows, ConsoleRequest, ConsoleState, CustomEntry, EntryKind, GateReason, PowerAction,
     Provenance, CUSTOM_GROUP_LABEL, GROUPS, PANEL_H, PANEL_W, PINNED, POWER_H, RAIL_SECTION_GAP,
 };
-use crate::dock::Surface;
+use crate::surfaces::Surface;
 use mde_egui::egui;
 use mde_egui::Style;
 use mde_seat::PowerVerb;
 
 /// Drive ONE headless frame of the console content over a stand-in surface
-/// (the dock tests' `drive_vdock` idiom — the same `Context::run` path the
-/// DRM runner drives, minus the GPU). Mounts [`console_content`] at the
+/// (the same `Context::run` path the DRM runner drives, minus the GPU). Mounts
+/// [`console_content`] at the
 /// SAME rect the old standalone `console_panel` used to settle at
 /// (bottom-left, `PANEL_W` × `PANEL_H`) so every existing coordinate-based
 /// row/rail assertion below still lands on the same pixels — this helper
@@ -37,7 +37,7 @@ fn drive(
         if state.is_open() {
             egui::Area::new(egui::Id::new("test-console-content-area"))
                 .order(egui::Order::Foreground)
-                .fixed_pos(egui::pos2(crate::dock::DOCK_W, size.y - PANEL_H))
+                .fixed_pos(egui::pos2(Style::SP_XL + Style::SP_M, size.y - PANEL_H))
                 .show(ctx, |ui| {
                     let (rect, _) =
                         ui.allocate_exact_size(egui::vec2(PANEL_W, PANEL_H), egui::Sense::hover());

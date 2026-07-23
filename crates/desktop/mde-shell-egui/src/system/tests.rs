@@ -1,4 +1,5 @@
 use super::*;
+use crate::car_motion_policy;
 use mde_egui::egui::{pos2, vec2, Rect};
 use mde_seat::{Battery, BatteryKind, BatteryState, ProfileState};
 use mde_theme::brand::icons::IconId;
@@ -1075,6 +1076,72 @@ fn the_sidebar_search_narrows_by_label_and_clearing_restores_the_taxonomy() {
 }
 
 #[test]
+fn the_car_motion_limit_shortens_the_settings_rail_without_losing_group_order() {
+    let limited = limit_sidebar_rows(sidebar_rows(""), car_motion_policy::CAR_GLANCE_LIST_MAX);
+    assert_eq!(
+        limited
+            .iter()
+            .flat_map(|(_, sections)| sections.iter().copied())
+            .collect::<Vec<_>>(),
+        vec![
+            SettingsSection::Displays,
+            SettingsSection::Mouse,
+            SettingsSection::Audio,
+            SettingsSection::Bluetooth,
+            SettingsSection::Power,
+            SettingsSection::Wallpaper,
+        ],
+        "the glance rail keeps the first six taxonomy rows across its group boundary"
+    );
+    assert_eq!(limited.len(), 2, "empty trailing groups are removed");
+}
+
+#[test]
+fn moving_car_settings_paint_the_short_rail_and_defer_host_down_prompts() {
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    car_motion_policy::publish(&ctx, car_motion_policy::CarMotionPolicy { in_motion: true });
+    let mut st = SystemState {
+        nav: SettingsNav::at(SettingsSection::Power),
+        ..SystemState::default()
+    };
+    let out = ctx.run(
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(960.0, 1600.0))),
+            ..Default::default()
+        },
+        |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| st.show(ui));
+        },
+    );
+    let text = painted_text(&out.shapes)
+        .into_iter()
+        .map(|(text, _)| text)
+        .collect::<Vec<_>>();
+    assert!(
+        text.iter()
+            .any(|line| line == "Essential settings while moving · search for more"),
+        "the shortened rail explains the soft limit"
+    );
+    assert!(
+        !text.iter().any(|line| line == "Remote Proofing"),
+        "rows beyond the glance budget do not paint"
+    );
+    assert!(
+        text.iter()
+            .any(|line| line == car_motion_policy::DEFERRED_NOTICE_TITLE),
+        "the Power pane defers its host-down confirmation while moving"
+    );
+    assert!(power_verb_deferred(PowerVerb::PowerOff, true));
+    assert!(power_verb_deferred(PowerVerb::Reboot, true));
+    assert!(
+        !power_verb_deferred(PowerVerb::Lock, true),
+        "the benign Lock action remains reachable while moving"
+    );
+    assert!(!power_verb_deferred(PowerVerb::PowerOff, false));
+}
+
+#[test]
 fn a_narrowed_sidebar_paints_only_matches_and_keeps_the_selection_pane() {
     // A live filtered frame: only the matching row paints, and the (narrowed-
     // out) selection keeps its detail pane — its title survives exactly once,
@@ -1542,18 +1609,12 @@ fn the_theme_appearance_round_trips_through_disk_persistence() {
         AppearanceMotionMode::Normal,
         "motion defaults to the full normal mode"
     );
-    assert!(
-        !AppearanceConfig::default().taskbar_autohide,
-        "taskbar auto-hide defaults off so the bottom strut remains reserved"
-    );
-
     let cfg = AppearanceConfig {
         color_scheme: AppearanceColorScheme::Light,
         accent: AccentChoice::Green,
         layout_profile: LayoutProfile::Car,
         text_scale: TextScale::Larger,
         motion_mode: AppearanceMotionMode::Disabled,
-        taskbar_autohide: true,
     };
     cfg.save_to(&path).expect("save");
     let back = AppearanceConfig::load_from(&path);
@@ -1575,10 +1636,6 @@ fn the_theme_appearance_round_trips_through_disk_persistence() {
         AppearanceColorScheme::Light,
         "the color-mode pick round-trips through disk"
     );
-    assert!(
-        back.taskbar_autohide,
-        "the taskbar auto-hide pick round-trips"
-    );
     let json = std::fs::read_to_string(&path).expect("appearance json");
     assert!(
         json.contains("\"color_scheme\": \"light\""),
@@ -1591,10 +1648,6 @@ fn the_theme_appearance_round_trips_through_disk_persistence() {
     assert!(
         json.contains("\"layout_profile\": \"car\""),
         "the layout profile is persisted explicitly: {json}"
-    );
-    assert!(
-        json.contains("\"taskbar_autohide\": true"),
-        "the taskbar auto-hide setting is persisted explicitly: {json}"
     );
     assert!(
         !json.contains("reduce_motion"),
@@ -1639,10 +1692,6 @@ fn a_partial_appearance_file_folds_missing_fields_to_their_defaults() {
         AppearanceMotionMode::Normal,
         "the absent motion-mode field folds to Normal"
     );
-    assert!(
-        !cfg.taskbar_autohide,
-        "the absent taskbar auto-hide field folds to the docked default"
-    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1670,13 +1719,8 @@ fn legacy_reduce_motion_json_migrates_to_the_reduced_motion_mode() {
         LayoutProfile::Construct,
         "legacy appearance configs keep the Construct workstation layout"
     );
-    assert!(
-        !cfg.taskbar_autohide,
-        "legacy configs keep the taskbar docked unless explicitly opted in"
-    );
-
     let cfg: AppearanceConfig = serde_json::from_str(
-        r#"{"motion_mode":"disabled","taskbar_autohide":true,"reduce_motion":false}"#,
+        r#"{"motion_mode":"disabled","retired_bottom_bar":true,"reduce_motion":false}"#,
     )
     .expect("explicit appearance config");
     assert_eq!(
@@ -1688,10 +1732,6 @@ fn legacy_reduce_motion_json_migrates_to_the_reduced_motion_mode() {
         cfg.color_scheme,
         AppearanceColorScheme::Dark,
         "configs without color_scheme keep the dark status-quo palette"
-    );
-    assert!(
-        cfg.taskbar_autohide,
-        "an explicit taskbar auto-hide field is honoured"
     );
 }
 
@@ -1782,21 +1822,6 @@ fn hardware_formfactor_flips_adjust_density_within_construct() {
 }
 
 #[test]
-fn appearance_taskbar_autohide_preference_is_exposed_to_shell_chrome() {
-    let st = SystemState {
-        appearance: AppearanceConfig {
-            taskbar_autohide: true,
-            ..AppearanceConfig::default()
-        },
-        ..SystemState::default()
-    };
-    assert!(
-        st.taskbar_autohide(),
-        "main.rs mirrors this persisted preference into DockState each frame"
-    );
-}
-
-#[test]
 fn appearance_layout_profile_drives_live_density() {
     let ctx = egui::Context::default();
     Style::install(&ctx);
@@ -1851,7 +1876,6 @@ fn the_theme_accent_choice_retints_the_live_context_on_poll() {
             layout_profile: LayoutProfile::Construct,
             text_scale: TextScale::Default,
             motion_mode: AppearanceMotionMode::Normal,
-            taskbar_autohide: false,
         },
         ..SystemState::default()
     };
@@ -1938,7 +1962,6 @@ fn the_theme_text_scale_zooms_the_live_context_atop_the_dpi_base() {
             layout_profile: LayoutProfile::Construct,
             text_scale: TextScale::Larger,
             motion_mode: AppearanceMotionMode::Normal,
-            taskbar_autohide: false,
         },
         ..SystemState::default()
     };

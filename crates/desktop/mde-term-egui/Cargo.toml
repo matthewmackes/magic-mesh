@@ -52,7 +52,7 @@ alacritty_terminal = "0.24"
 # (§6) and makes exactly one direct rustix call — `fs::fcntl_setfl`, `fs`
 # feature — to flip the master fd back to blocking for its pump threads
 # (alacritty's `tty::new` force-sets O_NONBLOCK for its own poll loop).
-rustix = { version = "0.38", features = ["std", "termios", "pty", "fs"] }
+rustix = { version = "0.38", features = ["std", "termios", "pty", "fs", "process"] }
 # TERM-8 — the desktop half of the TERM-7 mesh PTY-broker contract. The remote
 # terminal drives the broker's typed verbs over the Bus (`action/pty/<peer>`)
 # and streams its append-log state back (`state/pty/<id>`); the peer picker
@@ -82,6 +82,7 @@ base64 = "0.22"
 # module). Already in the workspace graph (`mde-files`), so it adds no new lock
 # entry; the same `1.x` line resolves.
 regex = "1"
+rand = "0.8"
 
 [dev-dependencies]
 # TERM-10 layout-store tests write layouts into a throwaway "synced" root — the

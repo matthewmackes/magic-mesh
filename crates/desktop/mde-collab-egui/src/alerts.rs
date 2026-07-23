@@ -145,7 +145,7 @@ impl CommunicationsSurface {
             }
             ui.horizontal(|ui| {
                 let glyph_tint = if hushed {
-                    Style::BORDER
+                    Style::DISABLED
                 } else {
                     severity_color(sev)
                 };

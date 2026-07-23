@@ -7,11 +7,9 @@
 //! bidirectionally between the TLS stream and the local Nebula
 //! process at `127.0.0.1:4242`.
 //!
-//! Cert source: the lighthouse's existing public cert/key —
-//! defaults to `/etc/nebula/lighthouse.crt` +
-//! `/etc/nebula/lighthouse.key` (the same files
-//! `mackes-nebula-https-tunnel.service` uses). Operators on a
-//! Let's-Encrypt-issued cert can override via env vars
+//! Cert source: the lighthouse's fingerprint-pinned enrollment identity —
+//! defaults to `/etc/nebula/enroll-endpoint.crt` +
+//! `/etc/nebula/enroll-endpoint.key`. Operators can override via env vars
 //! `MDE_HTTPS_TUNNEL_CERT` / `MDE_HTTPS_TUNNEL_KEY` baked into
 //! the systemd unit's `Environment=` lines.
 //!
@@ -32,6 +30,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use mackes_nebula_https_tunnel::{listen, pump_one_stream, DemuxConfig, TunnelListener};
@@ -43,19 +42,22 @@ use super::{ShutdownToken, Worker};
 /// permit 443 on lighthouses so the wire shape blends in.
 pub const DEFAULT_BIND_ADDR: &str = "0.0.0.0:443";
 
-/// Default cert path the lighthouse already serves under
-/// `lighthouse.<mesh>.example`. Mirrors the NF-1.2 doc
-/// comment's "reuse the same PEM chain + private key" lock.
-pub const DEFAULT_CERT_PATH: &str = "/etc/nebula/lighthouse.crt";
+/// Default certificate is the already fingerprint-pinned enrollment identity.
+/// Reusing it lets authenticated enrollment advertise the exact TCP/443 leaf
+/// without a second bootstrap trust channel.
+pub const DEFAULT_CERT_PATH: &str = "/etc/nebula/enroll-endpoint.crt";
 
 /// Default key path paired with [`DEFAULT_CERT_PATH`].
-pub const DEFAULT_KEY_PATH: &str = "/etc/nebula/lighthouse.key";
+pub const DEFAULT_KEY_PATH: &str = "/etc/nebula/enroll-endpoint.key";
 
 /// Accept-loop back-off when a single accept fails (operator-
 /// terminated connection, malformed TLS hello, etc.). Keeps
 /// the listener from spinning when an attacker hammers TCP/443
 /// with garbage.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(500);
+/// Bound live demux pumps so authenticated or unauthenticated clients cannot
+/// grow detached session tasks without limit.
+const MAX_CONCURRENT_SESSIONS: usize = 64;
 
 /// Worker handle. Cheap to construct; the heavy lifting (TLS
 /// listener bind + per-stream pump tasks) happens in `run()`.
@@ -147,8 +149,18 @@ impl Worker for NebulaHttpsListener {
             cert = %self.cert_path.display(),
             "nebula-https-listener: accepting peer tunnels",
         );
+        let sessions = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SESSIONS));
 
         loop {
+            let permit = tokio::select! {
+                _ = shutdown.wait() => {
+                    tracing::info!("nebula-https-listener: shutdown requested");
+                    return Ok(());
+                }
+                permit = Arc::clone(&sessions).acquire_owned() => {
+                    permit.map_err(|_| anyhow::anyhow!("session semaphore closed"))?
+                }
+            };
             tokio::select! {
                 _ = shutdown.wait() => {
                     tracing::info!("nebula-https-listener: shutdown requested");
@@ -166,6 +178,7 @@ impl Worker for NebulaHttpsListener {
                             // blocking on a stuck peer.
                             let cfg = self.demux_config.clone();
                             tokio::spawn(async move {
+                                let _permit = permit;
                                 match pump_one_stream(stream, cfg).await {
                                     Ok(stats) => {
                                         tracing::info!(
@@ -184,6 +197,7 @@ impl Worker for NebulaHttpsListener {
                             });
                         }
                         Err(e) => {
+                            drop(permit);
                             // Single-accept failure shouldn't
                             // take down the listener. Back off
                             // briefly + try again. If the
@@ -225,8 +239,11 @@ mod tests {
     #[test]
     fn default_cert_paths_lock_etc_nebula() {
         let w = NebulaHttpsListener::new().expect("new");
-        assert_eq!(w.cert_path, PathBuf::from("/etc/nebula/lighthouse.crt"));
-        assert_eq!(w.key_path, PathBuf::from("/etc/nebula/lighthouse.key"));
+        assert_eq!(
+            w.cert_path,
+            PathBuf::from("/etc/nebula/enroll-endpoint.crt")
+        );
+        assert_eq!(w.key_path, PathBuf::from("/etc/nebula/enroll-endpoint.key"));
     }
 
     #[test]

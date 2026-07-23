@@ -40,6 +40,10 @@ pub(super) fn handle(w: &CloudWorker, verb_name: &str, body: &CloudActionBody) -
     build_reply(&w.state_root, verb_name, body)
 }
 
+pub(super) fn authorization_target(body: &CloudActionBody) -> String {
+    workload_name(body, body.node.trim())
+}
+
 /// Construct the Cuttlefish [`WorkloadSpec`] and route it through the normal
 /// set-desired seam (`reconcile::write_desired_doc`), exactly as `set-desired`
 /// does. Pure over the desired-doc `state_root` so it is tested without a live
@@ -150,7 +154,11 @@ mod tests {
     #[test]
     fn android_provision_persists_and_echoes_the_cuttlefish_desired_slice() {
         let tmp = tempdir().unwrap();
-        let reply = build_reply(tmp.path(), "android-provision", &body("eagle", Some("droid")));
+        let reply = build_reply(
+            tmp.path(),
+            "android-provision",
+            &body("eagle", Some("droid")),
+        );
         assert!(reply.ok, "err: {:?}", reply.error);
         // The constructed AndroidVm spec is echoed …
         let desired = reply.desired.expect("echoed spec");

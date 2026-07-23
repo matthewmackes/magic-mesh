@@ -26,6 +26,8 @@ toml = "0.8"
 # Portal-18.a — XDG resolution for the default tag-store path
 # (`<XDG_DATA_HOME>/mde/tags.json`).
 dirs = "5"
+hmac = "0.12"
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

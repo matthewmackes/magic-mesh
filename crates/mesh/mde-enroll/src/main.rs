@@ -151,9 +151,22 @@ fn spawn_enroll(token: JoinToken) -> mpsc::Receiver<EnrollMsg> {
         let lighthouse = token.lighthouse.clone();
         let port = token.port;
 
+        let requester_key =
+            match mackesd_core::nebula_enroll_client::generate_requester_nebula_key(&config_dir) {
+                Ok(key) => key,
+                Err(e) => {
+                    let _ = tx.send(EnrollMsg::Failed(e.to_string()));
+                    return;
+                }
+            };
         let identity = mackesd_core::enrollment::build_identity();
-        let pending =
-            mackesd_core::nebula_enroll::build_pending(&identity, &node_id, &display_name, token);
+        let pending = mackesd_core::nebula_enroll::build_pending_with_nebula_key(
+            &identity,
+            &node_id,
+            &display_name,
+            token,
+            requester_key.public_key_pem(),
+        );
         let csr_json = match serde_json::to_vec(&pending) {
             Ok(b) => b,
             Err(e) => {
@@ -174,7 +187,7 @@ fn spawn_enroll(token: JoinToken) -> mpsc::Receiver<EnrollMsg> {
         };
 
         let _ = tx.send(EnrollMsg::Step(Step::Connect));
-        let bundle =
+        let response =
             match runtime.block_on(mackesd_core::nebula_enroll_client::enroll_over_network(
                 &lighthouse,
                 port,
@@ -189,11 +202,22 @@ fn spawn_enroll(token: JoinToken) -> mpsc::Receiver<EnrollMsg> {
             };
         let _ = tx.send(EnrollMsg::Step(Step::Receive));
 
-        if let Err(e) = mackesd_core::nebula_enroll_client::persist_bundle(
+        if let Err(e) = mackesd_core::nebula_enroll_client::verify_authenticated_enrollment_bundle(
+            &response.bundle,
+            &node_id,
+            &requester_key,
+        ) {
+            let _ = tx.send(EnrollMsg::Failed(e.to_string()));
+            return;
+        }
+
+        if let Err(e) = mackesd_core::nebula_enroll_client::persist_authenticated_bundle(
             &root,
             &config_dir,
             &node_id,
-            &bundle,
+            &response.bundle,
+            response.lighthouse_secrets.as_ref(),
+            requester_key.private_key_path(),
         ) {
             let _ = tx.send(EnrollMsg::Failed(e.to_string()));
             return;
@@ -208,7 +232,7 @@ fn spawn_enroll(token: JoinToken) -> mpsc::Receiver<EnrollMsg> {
 
         let _ = tx.send(EnrollMsg::Done(format!(
             "joined `{}` as {} (overlay {})",
-            bundle.mesh_id, node_id, bundle.overlay_ip
+            response.bundle.mesh_id, node_id, response.bundle.overlay_ip
         )));
     });
     rx

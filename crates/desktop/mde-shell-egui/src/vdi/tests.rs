@@ -681,11 +681,11 @@ fn requested_summary_names_the_pending_desktop_and_protocol() {
 }
 
 #[test]
-fn taskbar_session_preview_frame_requires_a_real_texture_and_carries_the_broker_id() {
+fn session_preview_frame_requires_a_real_texture_and_carries_the_broker_id() {
     let mut state = VdiState::default();
     assert!(
-        state.taskbar_preview_frame().is_none(),
-        "no requested desktop means no taskbar thumbnail"
+        state.session_preview_frame().is_none(),
+        "no requested desktop means no session thumbnail"
     );
 
     state.request_connect(
@@ -699,13 +699,13 @@ fn taskbar_session_preview_frame_requires_a_real_texture_and_carries_the_broker_
         .with_broker_session(BrokerSessionLifecycle::new("session-1", None)),
     );
     assert!(
-        state.taskbar_preview_frame().is_none(),
-        "a requested desktop still has no taskbar thumbnail until a frame lands"
+        state.session_preview_frame().is_none(),
+        "a requested desktop still has no session thumbnail until a frame lands"
     );
 
     let ctx = egui::Context::default();
     state.texture = Some(ctx.load_texture(
-        "vdi-taskbar-preview-test",
+        "vdi-session-preview-test",
         egui::ColorImage {
             size: [4, 3],
             pixels: vec![egui::Color32::WHITE; 12],
@@ -713,9 +713,9 @@ fn taskbar_session_preview_frame_requires_a_real_texture_and_carries_the_broker_
         egui::TextureOptions::LINEAR,
     ));
     let preview = state
-        .taskbar_preview_frame()
-        .expect("a requested desktop with a texture publishes a taskbar thumbnail");
-    assert_eq!(preview.broker_session_id.as_deref(), Some("session-1"));
+        .session_preview_frame()
+        .expect("a requested desktop with a texture publishes a session thumbnail");
+    assert_eq!(preview.id.as_deref(), Some("session-1"));
     assert_eq!(preview.label, "web1");
     assert_eq!(preview.protocol, "RDP");
     assert_eq!(preview.texture.size(), [4, 3]);

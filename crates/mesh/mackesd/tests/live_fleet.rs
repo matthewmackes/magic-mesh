@@ -176,9 +176,13 @@ async fn live_fleet_etcd_quorum_and_nebula_overlay() {
     let lh_addr = normalize_lh(&lh_raw);
     let target = lh_addr
         .to_socket_addrs()
-        .unwrap_or_else(|e| panic!("{SENTINEL}: FAIL MCNF_LIVE_LH {lh_addr:?} did not resolve: {e}"))
+        .unwrap_or_else(|e| {
+            panic!("{SENTINEL}: FAIL MCNF_LIVE_LH {lh_addr:?} did not resolve: {e}")
+        })
         .next()
-        .unwrap_or_else(|| panic!("{SENTINEL}: FAIL MCNF_LIVE_LH {lh_addr:?} resolved to no address"));
+        .unwrap_or_else(|| {
+            panic!("{SENTINEL}: FAIL MCNF_LIVE_LH {lh_addr:?} resolved to no address")
+        });
     let sock = UdpSocket::bind("0.0.0.0:0").expect("bind ephemeral udp socket");
     sock.set_read_timeout(Some(Duration::from_millis(1500)))
         .expect("set udp read timeout");

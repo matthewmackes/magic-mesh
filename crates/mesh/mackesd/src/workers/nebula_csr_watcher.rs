@@ -201,6 +201,12 @@ impl NebulaCsrWatcher {
         let self_overlay =
             crate::voip_rtt::own_nebula_ip().unwrap_or_else(|| "10.42.0.1".to_string());
         let directory = crate::substrate::peers::read_directory(&self.workgroup_root);
+        let authority = crate::ca::bundle::read_bundle(&crate::ca::bundle::bundle_path(
+            &self.workgroup_root,
+            &self.local_node_id,
+        ))
+        .ok()
+        .and_then(|bundle| bundle.relay_trust_authority);
         let lighthouses: Vec<crate::ca::bundle::LighthouseEntry> =
             mackes_mesh_types::lighthouse::roster_with_self(
                 &directory,
@@ -209,10 +215,14 @@ impl NebulaCsrWatcher {
                 &self.lighthouse_addr,
             )
             .into_iter()
-            .map(|a| crate::ca::bundle::LighthouseEntry {
-                node_id: a.node_id,
-                overlay_ip: a.overlay_ip,
-                external_addr: a.external_addr,
+            .map(|a| {
+                crate::ca::bundle::lighthouse_entry_with_relay_trust(
+                    &self.workgroup_root,
+                    a.node_id,
+                    a.overlay_ip,
+                    a.external_addr,
+                    authority.as_deref(),
+                )
             })
             .collect();
         for peer_id in peers {
@@ -330,7 +340,9 @@ pub fn needs_signing(workgroup_root: &Path, peer_id: &str) -> std::io::Result<bo
 mod tests {
     use super::*;
     use crate::ca::{mint, MockBackend};
-    use crate::nebula_enroll::{build_pending, parse_join_token, publish_enrollment_request};
+    use crate::nebula_enroll::{
+        build_pending_with_nebula_key, parse_join_token, publish_enrollment_request,
+    };
     use tempfile::tempdir;
 
     fn fresh_store() -> rusqlite::Connection {
@@ -358,7 +370,13 @@ mod tests {
         let token = parse_join_token("mesh:test-mesh@10.0.0.5:4242#bearer").unwrap();
         // ENT-1 — the watcher signs only issued bearers now.
         crate::bearer_ledger::record_issued(workgroup_root, &token.bearer).expect("seed bearer");
-        let pending = build_pending(&identity, peer_id, "anvil", token);
+        let pending = build_pending_with_nebula_key(
+            &identity,
+            peer_id,
+            "anvil",
+            token,
+            "-----BEGIN NEBULA X25519 PUBLIC KEY-----\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n-----END NEBULA X25519 PUBLIC KEY-----\n",
+        );
         publish_enrollment_request(workgroup_root, peer_id, &pending).expect("publish");
     }
 

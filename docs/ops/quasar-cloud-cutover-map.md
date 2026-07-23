@@ -1,5 +1,9 @@
 # CONSTRUCT-CLOUD cutover map — what dies, what replaces it, what stays
 
+> **HISTORICAL / SUPERSEDED (2026-07-22):** this records an earlier OpenStack
+> cutover. The subsequent zero-OpenStack cutover is authoritative in
+> `AI_GOVERNANCE.md` and `docs/worklist-archive/2026-07-22-live-block-removal.md`.
+
 > **Status: tracks the LOCKED design** (`docs/design/quasar-cloud.md`,
 > 2026-07-03). This is the operator-facing version of the design's
 > replaced-vs-kept map: what to expect at cutover, in migration terms. The

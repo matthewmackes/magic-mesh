@@ -17,7 +17,8 @@
 //! reached directly from the dock. The Workbench is now node/network/fleet
 //! control only.
 
-use mde_egui::egui::{self, RichText};
+use mde_egui::egui;
+use mde_egui::nav_chrome::NavigationBar;
 use mde_egui::Style;
 
 /// One of the four top-level control planes of the Workbench, ordered by blast
@@ -161,12 +162,12 @@ pub fn show(
 
         // ── Content pane for the selected plane ──────────────────────────────
         ui.vertical(|ui| {
-            ui.label(
-                RichText::new(selected.label())
-                    .color(Style::TEXT)
-                    .size(Style::BODY)
-                    .strong(),
-            );
+            // PLATFORM-INTERFACES Q19/Q20 — the pane title rides the shared
+            // NavigationBar (the Title3 rung) instead of the old hand-rolled
+            // BODY-strong title row; the Settings detail-pane idiom. No back
+            // affordance: the rail is fixed beside the pane — the two never
+            // collapse to one, so there is nothing to go back FROM.
+            let _ = NavigationBar::new(selected.label()).show(ui);
             ui.add_space(Style::SP_XS);
             ui.colored_label(Style::TEXT_DIM, selected.blurb());
             ui.add_space(Style::SP_M);
@@ -557,5 +558,83 @@ mod tests {
     #[test]
     fn this_node_is_the_default_plane() {
         assert_eq!(Plane::default(), Plane::ThisNode);
+    }
+
+    /// PLATFORM-INTERFACES Q19/Q20 adoption — the content pane's title renders
+    /// through the shared [`mde_egui::nav_chrome::NavigationBar`], i.e. on the
+    /// [`Style::TYPE_TITLE3`] rung, not the old hand-rolled BODY-strong row.
+    #[test]
+    fn the_content_pane_title_rides_the_shared_navigation_bar() {
+        use mde_egui::egui::{self, pos2, vec2, Rect};
+        use mde_egui::Style;
+
+        /// Collect every painted text run (string + font size) from a frame
+        /// (the nav_chrome test helper, restated).
+        fn painted_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, f32)> {
+            fn walk(shape: &egui::Shape, out: &mut Vec<(String, f32)>) {
+                match shape {
+                    egui::Shape::Text(text) => {
+                        let size = text
+                            .galley
+                            .job
+                            .sections
+                            .first()
+                            .map_or(0.0, |s| s.format.font_id.size);
+                        out.push((text.galley.text().to_owned(), size));
+                    }
+                    egui::Shape::Vec(shapes) => {
+                        for shape in shapes {
+                            walk(shape, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut out = Vec::new();
+            for clipped in shapes {
+                walk(&clipped.shape, &mut out);
+            }
+            out
+        }
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut selected = Plane::ThisNode;
+        let mut datacenter = crate::datacenter::DatacenterState::default();
+        let thisnode = crate::thisnode::ThisNodeState::default();
+        let mut surface_card = crate::surface_card::SurfaceCardState::default();
+        let network = crate::network::NetworkState::default();
+        let controller = crate::controller::ControllerState::default();
+        let provisioning = crate::provisioning::ProvisioningState::default();
+        let mut services = crate::services_flow::ServicesFlowState::default();
+        let mut spawn_lighthouse =
+            crate::spawn_lighthouse_flow::SpawnLighthouseFlowState::default();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1024.0, 768.0))),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                super::show(
+                    ui,
+                    &mut selected,
+                    &mut datacenter,
+                    &thisnode,
+                    &mut surface_card,
+                    &network,
+                    &controller,
+                    &provisioning,
+                    &mut services,
+                    &mut spawn_lighthouse,
+                );
+            });
+        });
+        let runs = painted_text(&out.shapes);
+        assert!(
+            runs.iter().any(|(text, size)| text == "This Node"
+                && (size - Style::TYPE_TITLE3).abs() < f32::EPSILON),
+            "the pane title must paint on the shared NavigationBar Title3 rung; \
+             painted runs: {runs:?}"
+        );
     }
 }

@@ -457,7 +457,10 @@ fn tree_folder(
         } else {
             ui.add_space(Style::SP_M);
         }
-        mde_egui::status_dot(ui, Style::WARN);
+        // A folder-kind marker, not a health cue: key it off the neutral dim tone so
+        // the OK/WARN/DANGER status palette stays reserved for link health (a folder
+        // has no health of its own). One categorical tone across both folder views.
+        mde_egui::status_dot(ui, Style::TEXT_DIM);
         let selected = m.current() == Some(folder.id);
         let resp = ui.selectable_label(selected, folder.name.as_str());
         if resp.clicked() {
@@ -818,10 +821,13 @@ fn list_row(ui: &mut egui::Ui, m: &Manager, item: &Item, actions: &mut Vec<Actio
         if handle.dragged() {
             egui::DragAndDrop::set_payload(ui.ctx(), DragItem(id));
         }
+        // The kind dot is categorical, not a health cue: a folder takes the neutral
+        // dim tone, a bookmark the interactive accent, so OK/WARN/DANGER stay
+        // reserved for link health (mirrors the tree's folder marker above).
         mde_egui::status_dot(
             ui,
             if is_folder {
-                Style::WARN
+                Style::TEXT_DIM
             } else {
                 Style::ACCENT
             },

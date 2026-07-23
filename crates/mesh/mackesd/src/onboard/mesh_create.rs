@@ -276,6 +276,7 @@ pub fn create<B: NebulaCertBackend>(
     ca_crt: &Path,
     ca_key: &Path,
     scratch_dir: &Path,
+    config_dir: &Path,
     external_addr: &str,
     label: Option<&str>,
 ) -> anyhow::Result<MeshCreateReport> {
@@ -302,6 +303,7 @@ pub fn create<B: NebulaCertBackend>(
                 ca_crt,
                 ca_key,
                 scratch_dir,
+                config_dir,
                 Role::Workstation,
             )?;
             Ok(MeshCreateReport::founded(init, label))
@@ -460,6 +462,7 @@ mod tests {
             &ca_dir.join("ca.crt"),
             &ca_dir.join("ca.key"),
             &ca_dir.join("scratch"),
+            &tmp.path().join("etc-nebula"),
             "192.168.1.50:4242",
             Some("home"),
         )
@@ -484,6 +487,7 @@ mod tests {
             &ca_dir.join("ca.crt"),
             &ca_dir.join("ca.key"),
             &ca_dir.join("scratch"),
+            &tmp.path().join("etc-nebula"),
             "192.168.1.50:4242",
             Some("relabel-ignored"),
         )

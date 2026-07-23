@@ -3,7 +3,7 @@
 # Enforces the AI_GOVERNANCE §7 Definition-of-Done gates on every push/PR:
 # build · test (incl. the async-services worker suite) · clippy --all-targets ·
 # fmt --check · the layered-tiers boundary lint (§6) · the no-private-D-Bus-name
-# lint (§2) · the Quazar brand-identity lint · and a hard 80% line-coverage floor
+# lint (§2) · the repository policy suite · and a hard 80% line-coverage floor
 # (Q90/Q93). The crypto +
 # boundary gates are deny-level: a violation fails the build, it doesn't warn.
 name: ci
@@ -44,7 +44,7 @@ jobs:
           sudo docker image prune --all --force || true
           df -h /
 
-      # The audio chain links ALSA; the iced GUIs link GTK; the vendored Opus
+      # The audio chain links ALSA; the egui shell links GTK; the vendored Opus
       # build needs CMake. pkg-config resolves them.
       - name: System dev libraries
         run: |
@@ -66,10 +66,11 @@ jobs:
       - name: Build (workspace)
         run: cargo build --workspace --locked
 
-      # Everything except mackesd runs PARALLEL (fast — e.g. mde-kdc-host's
-      # deliberate sleeps/RSA-4096 keygen tests overlap).
-      - name: Test (workspace, excl. mackesd)
-        run: cargo test --workspace --exclude mackesd --locked
+      # Everything except the two process-global/PTY-sensitive crates runs in
+      # the default parallel harness (fast — e.g. mde-kdc-host's deliberate
+      # sleeps/RSA-4096 keygen tests overlap).
+      - name: Test (workspace, excl. serial crates)
+        run: cargo test --workspace --exclude mackesd --exclude mde-term-egui --locked
 
       # mackesd is run SINGLE-THREADED. Several of its tests mutate
       # process-global env (`std::env::set_var` for MDE_ROLE_PATH /
@@ -83,91 +84,29 @@ jobs:
       - name: Test (mackesd, serial — env-race safe)
         run: cargo test -p mackesd --features async-services --locked -- --test-threads=1
 
-      # Carbon tokens are the one place a palette/metric change is allowed.
-      - name: Carbon token tests (§4)
+      - name: Test (terminal, serial — PTY safe)
+        run: cargo test -p mde-term-egui --locked -- --test-threads=1
+
+      - name: Product identity tests
         run: cargo test -p mde-theme --locked
 
       - name: Clippy (--all-targets, deny on crypto/unwrap per workspace lints)
         run: cargo clippy --workspace --all-targets --locked
 
-      - name: Layered-tiers boundary lint (§6)
-        run: ./install-helpers/lint-layered-tiers.sh
-
-      - name: No-private-D-Bus-name lint (§2)
-        run: ./install-helpers/lint-bus-names.sh
-
-      - name: Quazar brand identity lint
-        run: ./install-helpers/lint-brand-identity.sh
-
-      # NOTE on §1–§4 deeper checks: the Carbon single-source rule (§4) is
-      # enforced by the mde-theme token tests above (a palette/metric value
-      # changes only with a backing assertion); the substrate locks (§1–§3)
-      # and "shipped-but-dead" reachability are swept by the /audit skill,
-      # which is a richer judgement than a blunt grep can make in CI without
-      # false-positiving on tests, parse-examples, and computed grays.
-
-  screenshots:
-    name: preview gallery (visual artifact)
-    runs-on: ubuntu-latest
-    # OBS-4 (Q92) — a scripted /preview capture of the Workbench surfaces,
-    # uploaded as a build artifact for human visual review. Advisory: the
-    # on-session visual-confirmation gate is lifted (2026-06-11), and a flaky
-    # headless render must never red master — the job RUNS, captures whatever
-    # it can, and always uploads. `continue-on-error` keeps a capture miss
-    # off the required-checks path.
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Free disk space
+      # This is the same maintained suite that the always-on farm gate runs:
+      # governance, architecture, style, brand, substrate, documentation, and
+      # active-worklist checks. The command returns non-zero if any check fails.
+      - name: Repository policy lints (with self-tests)
         run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
-            /usr/local/lib/android /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force || true
-          df -h /
-
-      # The iced GUI links GTK; the vendored Opus build needs CMake. sway
-      # (headless wlroots) + grim (wlr-screencopy) drive the capture; the
-      # software-render path needs no GPU.
-      - name: System dev libraries + headless capture stack
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libasound2-dev libgtk-3-dev cmake pkg-config protobuf-compiler mold sway grim
-
-      - name: Rust toolchain (pinned)
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: "1.85"
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build the Workbench
-        run: cargo build -p mde-workbench --locked
-
-      - name: Capture the preview gallery
-        run: ./install-helpers/preview-gallery.sh "$GITHUB_WORKSPACE/preview-gallery"
-
-      - name: Upload the gallery artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: workbench-preview-gallery
-          path: preview-gallery/
-          if-no-files-found: warn
+          ./install-helpers/ci-gate.sh --self-test
+          ./install-helpers/ci-gate.sh policy
 
   coverage:
     name: coverage floor (80%, library logic)
     runs-on: ubuntu-latest
     # EFF-31 — HARD gate (was advisory). The denominator is the
-    # **library logic**, which is what line-coverage meaningfully
-    # measures here:
-    #   * the 7 iced/libcosmic GUI crates are --excluded — their bulk
-    #     is `view()` render code whose correctness rests on the
-    #     mde-theme Carbon tokens + component tests, not on headless
-    #     per-line coverage (the visual-confirmation gate was lifted
-    #     2026-06-11);
-    #   * the binary ENTRYPOINTS (src/bin/*.rs, src/main.rs) are
+    # **library logic**, which is what line-coverage meaningfully measures here.
+    # The binary ENTRYPOINTS (src/bin/*.rs, src/main.rs) are
     #     --ignore-filename-regex'd — they're CLI-dispatch + daemon
     #     bootstrap glue (mackesd.rs alone is ~5.7k lines of `Cmd::`
     #     arms + run_serve wiring) that needs a live daemon/store/bus,
@@ -205,17 +144,15 @@ jobs:
         uses: taiki-e/install-action@cargo-llvm-cov
 
       # Q90/Q93 / EFF-31 — hard 80% line floor over the library-logic
-      # denominator (GUI crates excluded, binary entrypoints ignored —
-      # see the job comment). async-services on so the worker suites
+      # denominator (binary entrypoints ignored — see the job comment).
+      # All current workspace libraries are measured; async-services is on so
+      # the worker suites
       # count; mackesd runs --test-threads=1 (its tests mutate process
       # env — EFF-18 — and race under the parallel harness).
       - name: Coverage (--fail-under-lines 80, library logic)
         run: |
           cargo llvm-cov --workspace --locked \
             --features mackesd/async-services \
-            --exclude mde-workbench --exclude mde-files --exclude mde-voice-hud \
-            --exclude mde-music --exclude mde-iced-components \
-            --exclude mde-lighthouse-health --exclude mde-role-chooser \
             --ignore-filename-regex '(/bin/[^/]+\.rs|/main\.rs)$' \
             --fail-under-lines 80 \
             --summary-only \
@@ -330,8 +267,11 @@ jobs:
       - name: Build (workspace, Fedora rustc)
         run: cargo build --workspace --locked
 
-      - name: Test (workspace, excl. mackesd)
-        run: cargo test --workspace --exclude mackesd --locked
+      - name: Test (workspace, excl. serial crates)
+        run: cargo test --workspace --exclude mackesd --exclude mde-term-egui --locked
 
       - name: Test (mackesd, serial)
         run: cargo test -p mackesd --features async-services --locked -- --test-threads=1
+
+      - name: Test (terminal, serial)
+        run: cargo test -p mde-term-egui --locked -- --test-threads=1

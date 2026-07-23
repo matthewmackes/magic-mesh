@@ -226,12 +226,22 @@ impl CarStatusItem {
             Self::CoolantC => lt(format!("{:.0} °C", t.coolant_c)),
             Self::CoolantF => lt(format!("{:.0} °F", t.coolant_c * 9.0 / 5.0 + 32.0)),
             Self::BatteryV => lt(format!("{:.1} V", t.battery_v)),
-            Self::FuelPercent => t
-                .fuel_percent
-                .map_or_else(|| "—".to_string(), |f| format!("{f:.0}%")),
-            Self::OdometerMi => t
-                .odometer_mi
-                .map_or_else(|| "—".to_string(), |o| format!("{o} mi")),
+            Self::FuelPercent => {
+                if live_t {
+                    t.fuel_percent
+                        .map_or_else(|| "—".to_string(), |f| format!("{f:.0}%"))
+                } else {
+                    "—".to_string()
+                }
+            }
+            Self::OdometerMi => {
+                if live_t {
+                    t.odometer_mi
+                        .map_or_else(|| "—".to_string(), |o| format!("{o} mi"))
+                } else {
+                    "—".to_string()
+                }
+            }
             Self::RuntimeMin => lt(format!("{} min", t.runtime_min)),
             Self::Ignition => lt(on_off(t.ignition_on)),
             Self::Moving => lt(if t.moving {
@@ -306,21 +316,32 @@ impl CarStatusItem {
             }
             Self::DataUsed => empty_dash(&w.data_transferred),
             Self::TelemetrySource => empty_dash(&t.confidence),
-            Self::TelemetryAge => lt(format!("{:.0} s", t.last_update_age_s)),
+            // Keep a stale gateway's age visible even after all instrument
+            // values re-dash; that is the diagnostic evidence explaining why
+            // the retained snapshot is no longer considered live.
+            Self::TelemetryAge => {
+                if t.has_live_gateway_source() {
+                    format!("{:.0} s", t.last_update_age_s)
+                } else {
+                    "—".to_string()
+                }
+            }
             Self::NavEta => s.vehicle_glance().unwrap_or_else(|| "—".to_string()),
             Self::NavSummary => s.vehicle_glance().unwrap_or_else(|| "—".to_string()),
         }
     }
 }
 
-/// Whether vehicle telemetry is a LIVE gateway reading. `refresh_from_vehicle`
-/// stamps the confidence label `"live vehicle-gateway mirror (…)"` only when a
-/// real `state/vehicle/<node>` mirror folded in with the adapter ONLINE; the
-/// simulated seed reads `"simulated CAN/OBD profile"` and an offline adapter
-/// reads `"vehicle-gateway mirror reports the adapter offline"`. This is the
-/// exact truth the TELEMETRY tile ([`CarStatusItem::TelemetrySource`]) already
-/// surfaces — the speed gauge and tiles ride the same condition, so the strip
-/// can never claim a live speed the TELEMETRY tile calls simulated.
+/// Whether vehicle telemetry is a fresh LIVE gateway reading.
+/// `refresh_from_vehicle` stamps the confidence label
+/// `"live vehicle-gateway mirror (…)"` only when a real
+/// `state/vehicle/<node>` mirror folded in with the adapter ONLINE, and
+/// [`VehicleTelemetry::is_live`](crate::model::VehicleTelemetry::is_live) also
+/// rejects a mirror older than the freshness window. The simulated seed reads
+/// `"simulated CAN/OBD profile"` and an offline adapter reads
+/// `"vehicle-gateway mirror reports the adapter offline"`. This is the exact
+/// truth the TELEMETRY/TELEM AGE tiles surface — the speed gauge and tiles ride
+/// the same condition, so a quiet retained snapshot cannot remain a live speed.
 /// (The seed's `locations.primary` is ALREADY `Mg90Gnss`-acquiring and its
 /// source status `Connected`, so neither is a usable liveness gate.)
 /// PLATFORM-INTERFACES Q33: absent reads absent, never fabricated.
@@ -488,6 +509,14 @@ impl CarStatusSelection {
 mod tests {
     use super::*;
 
+    fn test_now_ms() -> i64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+            .unwrap_or_default()
+    }
+
     #[test]
     fn catalog_is_broad_and_every_item_resolves_without_panic() {
         let s = MapsLocationSurface::simulated();
@@ -588,7 +617,7 @@ mod tests {
     }
 
     #[test]
-    fn speed_is_live_gated_never_the_simulated_seed() {
+    fn telemetry_requires_a_fresh_live_mirror_not_a_simulated_or_stale_source() {
         use mackes_mesh_types::vehicle::{
             GpsFix, VehicleState as WireVehicleState, VehicleTelem, WanStatus,
         };
@@ -599,15 +628,22 @@ mod tests {
         // The gauge feed and both SPEED tiles must read absent, never "27 mph".
         let mut s = MapsLocationSurface::simulated();
         assert!(!telemetry_is_live(&s), "the seed profile is not live");
+        assert_eq!(
+            CarStatusItem::TelemetrySource.value(&s),
+            "simulated CAN/OBD profile",
+            "the fixture remains explicitly and honestly labeled"
+        );
         assert_eq!(live_speed_mph(&s), None);
         assert_eq!(CarStatusItem::SpeedMph.value(&s), "—");
         assert_eq!(CarStatusItem::SpeedKph.value(&s), "—");
+        assert_eq!(CarStatusItem::FuelPercent.value(&s), "—");
+        assert_eq!(CarStatusItem::OdometerMi.value(&s), "—");
 
         // Folding a real ONLINE gateway mirror (the producer that stamps the
         // "live vehicle-gateway mirror (…)" label) goes live end-to-end — if the
         // producer's label ever drifts, this breaks loudly instead of silently
         // dashing a real reading.
-        let mirror = WireVehicleState {
+        let mut mirror = WireVehicleState {
             host: "eagle".to_string(),
             model: "MG90".to_string(),
             esn: "ESN-TEST".to_string(),
@@ -618,20 +654,52 @@ mod tests {
             wan: WanStatus::default(),
             telem: VehicleTelem {
                 speed_mph: 62.0,
+                rpm: 2_100,
+                fuel_percent: Some(64.0),
+                odometer_mi: Some(78_214),
+                moving: true,
                 ..VehicleTelem::default()
             },
             gaps: Vec::new(),
-            published_at_ms: 0,
+            published_at_ms: test_now_ms(),
         };
         s.refresh_from_vehicle(&mirror);
+        assert!(
+            !s.locations.primary_sample().expect("MG90 source").has_fix(),
+            "a fresh OBD speed does not require a GNSS position fix"
+        );
         assert!(telemetry_is_live(&s));
         assert_eq!(live_speed_mph(&s), Some(62.0));
         assert_eq!(CarStatusItem::SpeedMph.value(&s), "62 mph");
         assert_eq!(CarStatusItem::SpeedKph.value(&s), "100 kph");
+        assert_eq!(CarStatusItem::Rpm.value(&s), "2100");
+        assert_eq!(CarStatusItem::FuelPercent.value(&s), "64%");
+        assert_eq!(CarStatusItem::OdometerMi.value(&s), "78214 mi");
+
+        // The Bus retains its last payload. Once that payload's wall-clock
+        // stamp is old, every instrument value must re-dash while TELEM AGE
+        // remains visible to explain the loss of freshness.
+        mirror.published_at_ms = test_now_ms() - 6_000;
+        s.refresh_from_vehicle(&mirror);
+        assert!(s.vehicle.telemetry.has_live_gateway_source());
+        assert!(!telemetry_is_live(&s));
+        assert_eq!(live_speed_mph(&s), None);
+        for item in [
+            CarStatusItem::SpeedMph,
+            CarStatusItem::SpeedKph,
+            CarStatusItem::Rpm,
+            CarStatusItem::FuelPercent,
+            CarStatusItem::OdometerMi,
+            CarStatusItem::Moving,
+        ] {
+            assert_eq!(item.value(&s), "—", "{item:?} must re-dash when stale");
+        }
+        assert_ne!(CarStatusItem::TelemetryAge.value(&s), "—");
 
         // An adapter-offline mirror is NOT a live reading either.
         let offline = WireVehicleState {
             online: false,
+            published_at_ms: test_now_ms(),
             ..mirror
         };
         s.refresh_from_vehicle(&offline);

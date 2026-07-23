@@ -1,5 +1,9 @@
 # CONSTRUCT-CLOUD — the mesh becomes an OpenStack cloud (universal node)
 
+> **HISTORICAL / SUPERSEDED (2026-07-22):** this records the retired OpenStack
+> architecture. The live lock is `AI_GOVERNANCE.md` §5/§9: provider-neutral
+> Workloads over OpenTofu + Ansible + local libvirt/KVM and Podman/Quadlet.
+
 **Status:** LOCKED 2026-07-03 (90-Q `/plan` survey, operator).
 **Prompt:** *"What would it take to make this platform into a universal OpenStack
 node, based on Red Hat standards"* — redirected mid-survey by the operator:

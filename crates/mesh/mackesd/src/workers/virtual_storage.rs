@@ -45,6 +45,8 @@ use std::time::{Duration, Instant};
 use mde_bus::persist::Persist;
 use thiserror::Error;
 
+use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
+
 use super::proc::{output_with_timeout, DEFAULT_CMD_TIMEOUT};
 use super::storage::ProgressState;
 
@@ -1915,11 +1917,16 @@ impl VirtualStorage {
     /// the advanced cursor. **Blocking** (shells `qemu-img`/podman) — the worker runs
     /// it in `spawn_blocking`.
     #[must_use]
-    pub fn tick(&self, bus_root: &Path, cursor: Option<String>) -> Option<String> {
+    pub fn tick(
+        &self,
+        bus_root: &Path,
+        cursor: Option<String>,
+        authorizer: &ActionAuthorizer,
+    ) -> Option<String> {
         let mut cursor = cursor;
         let mut changed = false;
         let topic = action_topic(&self.node_id);
-        for req in read_new_requests(bus_root, &topic, &mut cursor) {
+        for req in read_new_requests(bus_root, &topic, &mut cursor, authorizer, &self.node_id) {
             match req {
                 VirtualStorageRequest::Apply {
                     armed_target,
@@ -1962,6 +1969,8 @@ fn read_new_requests(
     bus_root: &Path,
     topic: &str,
     cursor: &mut Option<String>,
+    authorizer: &ActionAuthorizer,
+    node: &str,
 ) -> Vec<VirtualStorageRequest> {
     let Ok(persist) = Persist::open(bus_root.to_path_buf()) else {
         return vec![];
@@ -1974,7 +1983,29 @@ fn read_new_requests(
         *cursor = Some(msg.ulid.clone());
         let body = msg.body.as_deref().unwrap_or("");
         match parse_request(body) {
-            Ok(r) => out.push(r),
+            Ok(request) => {
+                let authorized = match &request {
+                    VirtualStorageRequest::Refresh => Ok(()),
+                    VirtualStorageRequest::Apply { armed_target, .. } => authorizer.authorize(
+                        body,
+                        MutationContext {
+                            verb: "virtual-storage-apply",
+                            node,
+                            target: armed_target,
+                        },
+                    ),
+                };
+                match authorized {
+                    Ok(()) => out.push(request),
+                    Err(error) => tracing::warn!(
+                        target: "mackesd::virtual_storage",
+                        ulid = %msg.ulid,
+                        node,
+                        error = %error,
+                        "refused unauthorized privileged request"
+                    ),
+                }
+            }
             Err(e) => {
                 tracing::warn!(ulid = %msg.ulid, error = %e, "virtual-storage: bad request");
             }
@@ -1986,7 +2017,11 @@ fn read_new_requests(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::action_auth::authorize_test_body;
     use std::sync::Mutex as StdMutex;
+
+    const AUTH_KEY: &[u8] = b"virtual-storage-action-auth-key";
+    const AUTH_NOW: i64 = 1_700_000_000_000;
 
     // ── fixtures ──
 
@@ -2472,6 +2507,89 @@ mod tests {
         assert!(parse_request("nope").is_err());
     }
 
+    fn virtual_apply_request(name: &str) -> VirtualStorageRequest {
+        VirtualStorageRequest::Apply {
+            armed_target: format!("volume:{name}"),
+            queue: VirtualStorageQueue::new(vec![VirtualStorageOp::VolumeCreate {
+                name: name.into(),
+            }]),
+        }
+    }
+
+    fn signed_virtual_body(name: &str, nonce: &str, expires_at_ms: i64) -> String {
+        let mut unsigned = serde_json::to_value(virtual_apply_request(name)).unwrap();
+        unsigned
+            .as_object_mut()
+            .unwrap()
+            .insert("schema_version".to_string(), serde_json::Value::from(1_u64));
+        authorize_test_body(
+            AUTH_KEY,
+            &unsigned.to_string(),
+            MutationContext {
+                verb: "virtual-storage-apply",
+                node: "node",
+                target: &format!("volume:{name}"),
+            },
+            nonce,
+            expires_at_ms,
+        )
+    }
+
+    #[test]
+    fn hostile_virtual_applies_never_reach_the_executor() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = tempfile::tempdir().unwrap();
+        let persist = Persist::open(dir.path().to_path_buf()).unwrap();
+        let executor = Arc::new(FakeExec::ok());
+        let vs = VirtualStorage::with_seams(
+            "node".into(),
+            Arc::new(FakeQemu {
+                infos: BTreeMap::new(),
+            }),
+            Arc::new(FakePodman {
+                volumes_json: "[]".into(),
+                df_json: "[]".into(),
+            }),
+            Arc::new(FixedInUse(VirtualInUseSnapshot::default())),
+            executor.clone(),
+            local.path().to_path_buf(),
+        );
+        let authorizer = ActionAuthorizer::for_test(AUTH_KEY, dir.path().join("auth"), AUTH_NOW);
+
+        let unsigned = serde_json::to_string(&virtual_apply_request("unsigned")).unwrap();
+        let future = signed_virtual_body("future", "future", AUTH_NOW + 30_000)
+            .replace("\"schema_version\":1", "\"schema_version\":2");
+        let overlong = signed_virtual_body("overlong", "overlong", AUTH_NOW + 30_001);
+        let tampered = signed_virtual_body("before", "tampered", AUTH_NOW + 30_000)
+            .replace("\"before\"", "\"after\"");
+        for body in [&unsigned, &future, &overlong, &tampered] {
+            persist
+                .write(
+                    &action_topic("node"),
+                    mde_bus::hooks::config::Priority::Default,
+                    None,
+                    Some(body),
+                )
+                .unwrap();
+        }
+        let cursor = vs.tick(dir.path(), None, &authorizer);
+        assert_eq!(*executor.seen.lock().unwrap(), 0);
+
+        let replay = signed_virtual_body("once", "replay", AUTH_NOW + 30_000);
+        for _ in 0..2 {
+            persist
+                .write(
+                    &action_topic("node"),
+                    mde_bus::hooks::config::Priority::Default,
+                    None,
+                    Some(&replay),
+                )
+                .unwrap();
+        }
+        let _ = vs.tick(dir.path(), cursor, &authorizer);
+        assert_eq!(*executor.seen.lock().unwrap(), 1);
+    }
+
     #[test]
     fn state_round_trips_available_and_unavailable() {
         let st = VirtualStorageState {
@@ -2632,7 +2750,12 @@ mod tests {
         );
         // No bus messages → cursor stays None, publish is best-effort (no mde-bus
         // binary on the farm — fire_and_reap swallows it), tick must not panic.
-        let cursor = vs.tick(dir.path(), None);
+        let authorizer = ActionAuthorizer::for_test(
+            b"virtual-storage-test-key",
+            dir.path().join("auth"),
+            1_700_000_000_000,
+        );
+        let cursor = vs.tick(dir.path(), None, &authorizer);
         assert!(cursor.is_none());
     }
 }

@@ -54,6 +54,8 @@ EOF
     dnf install -y magic-mesh || fail "dnf install magic-mesh failed (is there a fedora-$RELEASEVER channel dir? else pass --rpm-url a portable build)"
 fi
 command -v mackesd >/dev/null || fail "mackesd not on PATH after install"
+ [ -x /usr/libexec/mackesd/configure-small-lighthouse ] \
+    || fail "small lighthouse profile helper not on PATH after install"
 
 # 3. Found the mesh — mint the CA, self-sign, generate the /enroll endpoint
 #    identity, and print the v3 join token (with the embedded cert fp).
@@ -86,23 +88,16 @@ systemctl enable --now nebula.service mackesd.service mesh-health.timer \
     || fail "could not start mesh services"
 log "services up (boot-durable) — /enroll endpoint live on $PUBLIC_IP:$ENROLL_PORT"
 
-# 5b. First-boot helper-binary fetches (#17 — turn-key broker). The RPM
-#     post_install only `enable`s mesh-broker-setup (the ntfy notification
-#     broker), mesh-netdata-setup, and mesh-shell-setup — NOT `--now`, so the
-#     dnf transaction never blocks on network-online.target. On a freshly
-#     provisioned lighthouse that never reboots, that leaves no ntfy broker (the
-#     mesh-wide notification distribution the health watchdog feeds) until the
-#     first reboot. Start them now (post-boot, the network is up). ntfy is
-#     bundled in the RPM vendor dir (offline, near-instant); the others self-skip
-#     once their binary exists. --no-block so a slow upstream fetch never stalls
-#     cloud-init, and each oneshot is idempotent.
-for unit in mesh-broker-setup.service mesh-netdata-setup.service mesh-shell-setup.service; do
-    if systemctl start --no-block "$unit" 2>/dev/null; then
-        log "kicked $unit (first-boot provisioning)"
-    else
-        log "$unit stays enabled — will run at next boot"
-    fi
-done
+# The smallest DO Basic Droplet is the supported stock lighthouse target.  Apply
+# its resource/optional-service profile after found has pinned the role and
+# started the control plane; the helper is idempotent and restart-safe.
+/usr/libexec/mackesd/configure-small-lighthouse small \
+    || fail "could not apply the small lighthouse resource profile"
+
+# 5b. Optional broker/Netdata/shell setup is intentionally NOT started here:
+#     configure-small-lighthouse applied the control-plane-only profile and
+#     disabled these memory-heavy first-boot fetches.
+log "small profile: optional broker, Netdata and shell setup remain disabled"
 
 echo "OK $PUBLIC_IP $ENROLL_PORT" >"$STATUS_FILE"
 log "lighthouse ready. Add a peer with:  mackesd join '$JOIN_TOKEN'"

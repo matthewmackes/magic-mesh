@@ -22,7 +22,7 @@ use serde::Deserialize;
 
 use mackes_mesh_types::cloud::{AnsibleSummary, CloudReply};
 
-use super::super::{gate, CloudWorker};
+use super::super::{path_key, CloudWorker};
 
 /// The parsed `container-deploy` request body.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -61,12 +61,17 @@ pub(crate) fn handle(w: &CloudWorker, verb_name: &str, raw: &str) -> CloudReply 
     let Some(name) = clean(body.name.as_deref()) else {
         return reject(verb_name, "container-deploy requires a `name`");
     };
-    if !is_unit_safe(&name) {
-        return reject(
-            verb_name,
-            &format!("invalid container name `{name}` (need a [A-Za-z0-9._-] token)"),
-        );
+    if let Err(e) = path_key::segment("container name", &name) {
+        return reject(verb_name, &format!("invalid container name `{name}`: {e}"));
     }
+    let stage_node = if body.node.trim().is_empty() {
+        "local"
+    } else {
+        match path_key::segment("placement node", &body.node) {
+            Ok(node) => node,
+            Err(e) => return reject(verb_name, &e),
+        }
+    };
     let Some(image) = clean(body.image.as_deref()) else {
         return reject(verb_name, "container-deploy requires an `image` reference");
     };
@@ -77,12 +82,12 @@ pub(crate) fn handle(w: &CloudWorker, verb_name: &str, raw: &str) -> CloudReply 
 
     // The armed-token gate — a request without a valid capability installs nothing,
     // but honestly returns the rendered unit so the operator can review it.
-    let verdict = gate::verify_token(
+    let verdict = w.consume_armed_token(
         body.armed_token.as_deref(),
         verb_name,
         body.node.trim(),
-        super::super::now_ms(),
-        w.signer.as_ref(),
+        &name,
+        raw,
     );
     if !verdict.is_valid() {
         return CloudReply {
@@ -99,7 +104,7 @@ pub(crate) fn handle(w: &CloudWorker, verb_name: &str, raw: &str) -> CloudReply 
 
     // Stage the unit into the Syncthing-replicated tree so the placement node's
     // container-host role picks it up.
-    let staged = match stage_unit(&w.state_root, &body.node, &name, &unit) {
+    let staged = match stage_unit(&w.state_root, stage_node, &name, &unit) {
         Ok(p) => p,
         Err(e) => return reject(verb_name, &format!("stage quadlet unit: {e}")),
     };
@@ -218,12 +223,15 @@ fn stage_unit(
     node: &str,
     name: &str,
     unit: &str,
-) -> std::io::Result<std::path::PathBuf> {
-    let node_dir = sanitize_node(node);
-    let dir = root.join("quadlets").join(node_dir);
-    std::fs::create_dir_all(&dir)?;
+) -> Result<std::path::PathBuf, String> {
+    let node = path_key::segment("placement node", node)?;
+    let name = path_key::segment("container name", name)?;
+    let dir = root.join("quadlets").join(node);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("create quadlet stage dir {}: {e}", dir.display()))?;
     let path = dir.join(format!("{name}.container"));
-    std::fs::write(&path, unit)?;
+    std::fs::write(&path, unit)
+        .map_err(|e| format!("write quadlet stage {}: {e}", path.display()))?;
     Ok(path)
 }
 
@@ -283,34 +291,6 @@ fn clean(v: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
-/// A container/unit name is a path-safe `[A-Za-z0-9._-]+` token (a unit filename +
-/// a ContainerName).
-fn is_unit_safe(s: &str) -> bool {
-    !s.is_empty()
-        && s != "."
-        && s != ".."
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
-}
-
-/// A path-safe node dir segment (empty / unsafe → sanitized), so the staged tree is
-/// never escaped.
-fn sanitize_node(node: &str) -> String {
-    let node = node.trim();
-    if node.is_empty() {
-        return "local".to_string();
-    }
-    node.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
 fn pick_log(stdout: &str, stderr: &str) -> String {
     if stderr.trim().is_empty() {
         stdout.trim().to_string()
@@ -356,15 +336,24 @@ mod tests {
             .with_bus_root(None)
     }
 
-    fn token() -> String {
+    fn token(body: &str, target: &str) -> String {
         ArmedToken::mint(
             &signer(),
             "nonce-12345678",
-            now_ms() + 3_600_000,
+            now_ms().saturating_add(super::super::super::MAX_AUTH_TTL_MS),
             "container-deploy",
             "me",
+            target,
+            &mackes_mesh_types::cloud::cloud_request_digest(body).unwrap(),
         )
         .encode()
+    }
+
+    fn armed_request(mut body: serde_json::Value) -> String {
+        let raw = body.to_string();
+        let target = body["name"].as_str().unwrap();
+        body["armed_token"] = serde_json::Value::String(token(&raw, target));
+        body.to_string()
     }
 
     #[test]
@@ -418,10 +407,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let runner = Arc::new(FakeRunner::default());
         let w = armed_worker(tmp.path(), runner.clone());
-        let raw = format!(
-            r#"{{"node":"me","name":"web","image":"nginx:1","ports":["8080:80"],"armed_token":"{}"}}"#,
-            token()
-        );
+        let raw = armed_request(serde_json::json!({
+            "node": "me",
+            "name": "web",
+            "image": "nginx:1",
+            "ports": ["8080:80"],
+        }));
         let reply = w.handle("container-deploy", &raw);
         assert!(reply.ok, "gated:{:?} err:{:?}", reply.gated, reply.error);
         let ansible = reply.ansible.expect("ansible summary");
@@ -445,10 +436,11 @@ mod tests {
             ..Default::default()
         });
         let w = armed_worker(tmp.path(), runner);
-        let raw = format!(
-            r#"{{"node":"me","name":"web","image":"nginx:1","armed_token":"{}"}}"#,
-            token()
-        );
+        let raw = armed_request(serde_json::json!({
+            "node": "me",
+            "name": "web",
+            "image": "nginx:1",
+        }));
         let reply = w.handle("container-deploy", &raw);
         assert!(!reply.ok);
         assert!(reply.gated.unwrap().contains("ansible unavailable"));
@@ -468,13 +460,40 @@ mod tests {
             ..Default::default()
         });
         let w = armed_worker(tmp.path(), runner);
-        let raw = format!(
-            r#"{{"node":"me","name":"web","image":"nginx:1","armed_token":"{}"}}"#,
-            token()
-        );
+        let raw = armed_request(serde_json::json!({
+            "node": "me",
+            "name": "web",
+            "image": "nginx:1",
+        }));
         let reply = w.handle("container-deploy", &raw);
         assert!(!reply.ok);
         assert!(reply.error.unwrap().contains("failed"));
+    }
+
+    #[test]
+    fn a_token_cannot_be_reused_after_image_or_rootful_substitution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runner = Arc::new(FakeRunner::default());
+        let w = armed_worker(tmp.path(), runner.clone());
+        let authorized = serde_json::json!({
+            "node": "me",
+            "name": "web",
+            "image": "nginx:1",
+            "rootful": false,
+        });
+        let token = token(&authorized.to_string(), "web");
+        let mut altered = authorized;
+        altered["image"] = serde_json::Value::String("attacker/image:latest".to_string());
+        altered["rootful"] = serde_json::Value::Bool(true);
+        altered["armed_token"] = serde_json::Value::String(token);
+
+        let reply = w.handle("container-deploy", &altered.to_string());
+        assert!(!reply.ok);
+        assert!(reply
+            .gated
+            .as_deref()
+            .is_some_and(|reason| reason.contains("request body")));
+        assert!(runner.tool_calls.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -491,6 +510,19 @@ mod tests {
             r#"{"node":"me","name":"../evil","image":"nginx:1"}"#,
         );
         assert!(!bad.ok && bad.error.unwrap().contains("invalid container name"));
+    }
+
+    #[test]
+    fn a_path_like_placement_node_is_rejected_before_staging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let w = armed_worker(tmp.path(), Arc::new(FakeRunner::default()));
+        for node in ["..", "../escape", "/tmp/escape", "node/child"] {
+            let raw = format!(r#"{{"node":"{node}","name":"web","image":"nginx:1"}}"#);
+            let reply = w.handle("container-deploy", &raw);
+            assert!(!reply.ok);
+            assert!(reply.error.unwrap().contains("path-safe"));
+        }
+        assert!(!tmp.path().join("quadlets").exists());
     }
 
     #[test]

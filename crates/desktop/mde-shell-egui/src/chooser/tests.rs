@@ -1392,12 +1392,37 @@ fn the_lifecycle_topic_matches_the_worker_contract() {
 }
 
 #[test]
+fn power_publish_mints_an_exact_body_bound_direct_libvirt_capability() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut error = None;
+    let request = PowerOp::Pause.to_request("elm", "dev");
+    publish_power(Some(tmp.path()), &mut error, &request);
+    assert!(error.is_none(), "{error:?}");
+    let persist = mde_bus::persist::Persist::open(tmp.path().to_path_buf()).unwrap();
+    let messages = persist.list_since(LIFECYCLE_TOPIC, None).unwrap();
+    assert_eq!(messages.len(), 1);
+    let body = messages[0].body.as_deref().unwrap();
+    let value: serde_json::Value = serde_json::from_str(body).unwrap();
+    let token =
+        mackes_mesh_types::cloud::CloudArmedToken::parse(value["armed_token"].as_str().unwrap())
+            .unwrap();
+    assert_eq!(token.verb, "vm-pause");
+    assert_eq!(token.node, "elm");
+    assert_eq!(token.target, "dev");
+    assert_eq!(
+        token.request_sha256,
+        mackes_mesh_types::cloud::cloud_request_digest(body).unwrap()
+    );
+}
+
+#[test]
 fn power_ops_map_to_the_host_targeted_vm_lifecycle_verbs() {
     // Action dispatch (wire): each op serialises to the worker's LifecycleAction
     // shape, host-targeted so it can only act on the named node.
     let body = |op: PowerOp| op.to_request("elm", "dev").to_body();
     let start: serde_json::Value = serde_json::from_str(&body(PowerOp::Start)).unwrap();
     assert_eq!(start["op"], "start");
+    assert_eq!(start["schema_version"], 1);
     let stop: serde_json::Value = serde_json::from_str(&body(PowerOp::Stop)).unwrap();
     assert_eq!(stop["op"], "stop");
     assert_eq!(stop["force"], false, "the card issues a graceful stop");
@@ -1412,6 +1437,7 @@ fn power_ops_map_to_the_host_targeted_vm_lifecycle_verbs() {
         PowerOp::Resume,
     ] {
         let v: serde_json::Value = serde_json::from_str(&body(op)).unwrap();
+        assert_eq!(v["schema_version"], 1, "versioned action contract");
         assert_eq!(v["host"], "elm", "host-targeted");
         assert_eq!(v["name"], "dev");
     }

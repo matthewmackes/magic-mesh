@@ -35,9 +35,9 @@ pub const ACTION_TOPIC: &str = "action/mesh/directory";
 /// packet from THIS box (the segment-sharing relay is a follow-up).
 pub const WAKE_TOPIC: &str = "action/mesh/wake";
 
-/// PD-11 — the lifecycle verb: `{peer, kind, name, op}` → a request
-/// file on the replicated volume; the target's executor validates
-/// against its own inventory (the L9 rail) + runs it.
+/// Retired PD-11 direct lifecycle topic. It is still drained so old clients get
+/// an explicit refusal, but it never writes a request. Mutations must use the
+/// authenticated, typed, audited `action/exec/request` worker.
 pub const LIFECYCLE_TOPIC: &str = "action/services/lifecycle";
 
 /// PD-11 — result retrieval: `{peer, id}` → the consumed result file
@@ -562,8 +562,9 @@ pub fn poll_lifecycle_result_once(
     }
 }
 
-/// PD-11 — accept lifecycle requests + write the replicated request
-/// file. The reply carries the request id the GUI polls results by.
+/// Drain the retired direct lifecycle topic and reply with an explicit refusal.
+/// Keeping the responder during cutover prevents old clients from mistaking a
+/// timeout for success while closing the public-Bus mutation bypass.
 pub fn poll_lifecycle_once(persist: &Persist, svc: &DirectoryService, cursor: &mut Option<String>) {
     let msgs = match persist.list_since(LIFECYCLE_TOPIC, cursor.as_deref()) {
         Ok(m) => m,
@@ -591,29 +592,15 @@ pub fn poll_lifecycle_once(persist: &Persist, svc: &DirectoryService, cursor: &m
     }
 }
 
-/// Build the lifecycle-verb reply (the request file write is the
-/// side effect; the message ulid doubles as the request id).
+/// Refuse the retired unauthenticated lifecycle verb. The typed action worker is
+/// the sole writer of replicated lifecycle requests.
 #[must_use]
-pub fn lifecycle_reply(svc: &DirectoryService, body: Option<&str>, id: &str) -> String {
-    let req: serde_json::Value =
-        serde_json::from_str(body.unwrap_or("{}")).unwrap_or(serde_json::Value::Null);
-    let get = |k: &str| req.get(k).and_then(|v| v.as_str()).map(str::to_string);
-    let (Some(peer), Some(kind), Some(name), Some(op)) =
-        (get("peer"), get("kind"), get("name"), get("op"))
-    else {
-        return json!({ "ok": false, "error": "lifecycle: need peer/kind/name/op" }).to_string();
-    };
-    let request = crate::lifecycle::LifecycleRequest {
-        id: id.to_string(),
-        kind,
-        name,
-        op,
-        from: "local-workbench".into(),
-    };
-    match crate::lifecycle::write_request(&svc.workgroup_root, &peer, &request) {
-        Ok(_) => json!({ "ok": true, "id": id, "peer": peer }).to_string(),
-        Err(e) => json!({ "ok": false, "error": format!("lifecycle: {e}") }).to_string(),
-    }
+pub fn lifecycle_reply(_svc: &DirectoryService, _body: Option<&str>, _id: &str) -> String {
+    json!({
+        "ok": false,
+        "error": "direct service lifecycle is retired; use authenticated action/exec/request"
+    })
+    .to_string()
 }
 
 /// PD-12 — answer wake requests: validate the MAC, fire the magic
@@ -917,7 +904,6 @@ mod tests {
                 epoch: 1,
                 ca_cert_pem: "-----BEGIN NEBULA CA-----\n-----END NEBULA CA-----\n".into(),
                 peer_cert_pem: "-----BEGIN NEBULA CERT-----\n-----END NEBULA CERT-----\n".into(),
-                peer_key_pem: "-----BEGIN NEBULA KEY-----\n-----END NEBULA KEY-----\n".into(),
                 overlay_ip: mesh_overlay.into(),
                 mesh_cidr: "10.42.0.0/16".into(),
                 lighthouses: lhs
@@ -926,9 +912,10 @@ mod tests {
                         node_id: node_id.into(),
                         overlay_ip: ip.into(),
                         external_addr: ext.into(),
+                        relay_tls: None,
                     })
                     .collect(),
-                ca_key_pem: None,
+                relay_trust_authority: None,
                 created_at: 1,
             };
         // Skinny: only lh-1 (the signer's hardcoded conventional first host).
@@ -1063,26 +1050,18 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_verb_writes_the_request_file_and_refuses_bad_vocab() {
+    fn retired_lifecycle_verb_never_writes_a_request_file() {
         let tmp = tempfile::tempdir().unwrap();
         let svc = DirectoryService::new(tmp.path(), None);
-        let ok: serde_json::Value = serde_json::from_str(&lifecycle_reply(
+        let reply: serde_json::Value = serde_json::from_str(&lifecycle_reply(
             &svc,
             Some(r#"{"peer":"oak","kind":"container","name":"nginx","op":"start"}"#),
             "ulid-1",
         ))
         .unwrap();
-        assert_eq!(ok["ok"], true);
-        let pending = crate::lifecycle::take_requests(tmp.path(), "oak");
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].id, "ulid-1");
-        let bad: serde_json::Value = serde_json::from_str(&lifecycle_reply(
-            &svc,
-            Some(r#"{"peer":"oak","kind":"container","name":"x","op":"explode"}"#),
-            "ulid-2",
-        ))
-        .unwrap();
-        assert_eq!(bad["ok"], false);
+        assert_eq!(reply["ok"], false);
+        assert!(reply["error"].as_str().unwrap().contains("authenticated"));
+        assert!(crate::lifecycle::take_requests(tmp.path(), "oak").is_empty());
     }
 
     #[test]

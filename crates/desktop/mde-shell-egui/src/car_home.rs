@@ -17,7 +17,7 @@ use mde_egui::egui::{self, Color32, Rect, Sense, Ui, Vec2};
 use mde_egui::{Density, Style};
 use mde_theme::brand::icons::IconId;
 
-use crate::dock::{self, Surface};
+use crate::surfaces::{self, Surface};
 
 /// One Auto Mode app — a curated vehicle app on the home's app strip.
 ///
@@ -334,7 +334,7 @@ fn card_plate(
 /// A card's icon + app-name header row, top-left, SYNC3-accent tinted glyph.
 fn card_header(ui: &Ui, p: &egui::Painter, rect: Rect, icon: IconId, title: &str) {
     let edge = (rect.height() * 0.2).clamp(20.0, 48.0);
-    if let Some(tex) = dock::icon_texture(ui.ctx(), icon, edge, Style::SYNC3_ACCENT) {
+    if let Some(tex) = surfaces::icon_texture(ui.ctx(), icon, edge, Style::SYNC3_ACCENT) {
         let icon_rect = Rect::from_min_size(
             egui::pos2(rect.left() + Style::SP_M, rect.top() + Style::SP_M),
             egui::vec2(edge, edge),
@@ -421,7 +421,7 @@ fn glance_row(
         return;
     }
     let edge = (rect.height() * 0.6).clamp(16.0, 32.0);
-    if let Some(tex) = dock::icon_texture(ui.ctx(), icon, edge, tint) {
+    if let Some(tex) = surfaces::icon_texture(ui.ctx(), icon, edge, tint) {
         let icon_rect = Rect::from_center_size(
             egui::pos2(rect.left() + edge / 2.0, rect.center().y),
             egui::vec2(edge, edge),
@@ -518,7 +518,7 @@ fn paint_app_tile(ui: &mut Ui, painter: &egui::Painter, rect: Rect, tile: CarTil
 
     // Glyph centered in the upper portion, per-app accent tint.
     let icon_edge = (rect.height() * 0.32).clamp(18.0, 44.0);
-    if let Some(tex) = dock::icon_texture(ui.ctx(), tile.icon(), icon_edge, tile.accent()) {
+    if let Some(tex) = surfaces::icon_texture(ui.ctx(), tile.icon(), icon_edge, tile.accent()) {
         let icon_center = egui::pos2(rect.center().x, rect.top() + rect.height() * 0.38);
         let icon_rect = Rect::from_center_size(icon_center, egui::vec2(icon_edge, icon_edge));
         painter.image(

@@ -28,7 +28,7 @@ use mde_egui::hostkeys::HostScan;
 use mde_seat::hotkeys::{action_for, HotkeyAction};
 
 /// A Super+number navigation target. Slot `0` is the first visible launcher
-/// surface; `9` is the tenth (`Super+0`, the Win10 taskbar convention).
+/// surface; `9` is the tenth (`Super+0`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NavSlot(usize);
 
@@ -148,12 +148,10 @@ const fn leader_chord(key: egui::Key) -> Option<&'static str> {
 /// actions, applying lock 8. Pure + headless-testable — the shell owns the actual
 /// seat / nav effects each action drives.
 ///
-/// **VDOCK-1 (design lock 13):** Super doubles as the vertical dock's toggle. A
-/// clean Super **tap** (press then release with no leader chord used in between)
-/// toggles the dock; a Super **hold** used as a leader chord (Super+Tab, Super+L,
-/// …) never does. The router disambiguates tap-vs-hold with [`Self::leader_used`]
-/// and latches the tap in [`Self::dock_toggle`] for [`Self::take_dock_toggle`], so
-/// the two Super roles don't collide (the design's reconciliation note).
+/// A clean Super **tap** (press then release with no leader chord used in between)
+/// returns to Springboard/Spotlight; a Super **hold** used as a leader chord
+/// (Super+Tab, Super+L, …) never does. The router disambiguates tap-vs-hold with
+/// [`Self::leader_used`] and latches the tap for [`Self::take_super_tap`].
 #[derive(Debug, Default)]
 pub(crate) struct HotkeyRouter {
     /// Whether the leader (Super) is currently held — arms the leader chords.
@@ -161,11 +159,11 @@ pub(crate) struct HotkeyRouter {
     /// Whether a leader chord actually fired during the current Super hold — set
     /// when a named leader key resolves, cleared on the rising edge of a fresh
     /// Super press. Distinguishes a Super *hold* (a leader) from a clean *tap*
-    /// (the VDOCK dock toggle, lock 13).
+    /// (the Springboard tap action).
     leader_used: bool,
     /// Latched `true` on a clean Super-tap release; drained by
-    /// [`Self::take_dock_toggle`]. A leader-chord hold never sets it.
-    dock_toggle: bool,
+    /// [`Self::take_super_tap`]. A leader-chord hold never sets it.
+    super_tap: bool,
     /// Latched Super+number navigation request. Drained by the shell after normal
     /// hotkey actions so the existing typed host-action table stays closed.
     nav_slot: Option<NavSlot>,
@@ -178,12 +176,9 @@ impl HotkeyRouter {
         self.leader
     }
 
-    /// Drain the **dock-toggle** latch (VDOCK-1, lock 13): `true` exactly once per
-    /// clean Super tap (press+release with no leader chord used in between). The
-    /// shell flips the vertical dock on a `true` — a Super *hold* used as a leader
-    /// never sets it, so the tap-toggle and the leader chord don't collide.
-    pub(crate) fn take_dock_toggle(&mut self) -> bool {
-        std::mem::take(&mut self.dock_toggle)
+    /// Drain the clean-Super-tap latch exactly once. A leader hold never sets it.
+    pub(crate) fn take_super_tap(&mut self) -> bool {
+        std::mem::take(&mut self.super_tap)
     }
 
     /// Drain a Super+number navigation request, if one fired this frame.
@@ -194,7 +189,7 @@ impl HotkeyRouter {
     /// Fold one forwarded host-key scan: a media key is host-first (always yields
     /// its action, lock 8); a leader transition updates the latch and yields
     /// nothing itself — but a clean Super **tap** (a release with no leader chord
-    /// used) latches the VDOCK dock toggle (lock 13).
+    /// used) latches the Springboard tap action.
     fn on_host_key(&mut self, scan: HostScan) -> Option<HotkeyAction> {
         match decode_scan(scan)? {
             HostKey::Media(m) => Some(m.action()),
@@ -210,11 +205,11 @@ impl HotkeyRouter {
                 None
             }
             HostKey::Leader(false) => {
-                // Release: a clean tap (no leader chord used) toggles the dock
-                // (lock 13); a hold used as a leader just disarms.
+                // Release: a clean tap returns to the shell launcher; a hold used
+                // as a leader just disarms.
                 self.leader = false;
                 if !self.leader_used {
-                    self.dock_toggle = true;
+                    self.super_tap = true;
                 }
                 None
             }
@@ -224,7 +219,7 @@ impl HotkeyRouter {
     /// Fold one egui key press: a leader-chord named key fires its action **only**
     /// while the leader is held (lock 8 — otherwise it reaches the focused guest).
     /// A firing chord also marks the current Super hold as *used* so its release
-    /// is a hold, not a dock-toggling tap (lock 13). A number key resolves to a
+    /// is a hold, not a shell-launcher tap. A number key resolves to a
     /// nav slot through [`nav_slot_for`], which reads the press's Shift bit to
     /// pick the tier (REACH-2).
     fn on_egui_key(&mut self, press: KeyPress) -> Option<HotkeyAction> {
@@ -271,8 +266,8 @@ impl HotkeyRouter {
 /// Map a leader-held number key (+ its Shift state) to the surface slot it
 /// selects. Two tiers cover **all 20** `Surface::ALL` entries (REACH-2):
 ///
-/// * plain **`Super`+`1`…`9`/`0`** → `Surface::ALL[0..=9]` (the Win10 taskbar
-///   convention, `Super+0` = the tenth slot);
+/// * plain **`Super`+`1`…`9`/`0`** → Springboard slots 0…=9
+///   (`Super+0` = the tenth slot);
 /// * **`Super`+`Shift`+`1`…`9`/`0`** → `Surface::ALL[10..=19]` — the ten surfaces
 ///   beyond the first ten (`Super+Shift+0` = the twentieth slot, `ALL[19]`, the
 ///   Communications hub that WL-FUNC-011 landed in the slot the prior 19-surface
@@ -450,7 +445,7 @@ mod tests {
     }
 
     #[test]
-    fn super_numbers_latch_taskbar_navigation_slots_without_toggling_the_dock() {
+    fn super_numbers_latch_springboard_navigation_slots_without_triggering_home() {
         let mut r = HotkeyRouter::default();
 
         let acts = r.dispatch(&[scan(125, true)], &[press(egui::Key::Num1)]);
@@ -462,7 +457,7 @@ mod tests {
         );
         let _ = r.dispatch(&[scan(125, false)], &[]);
         assert!(
-            !r.take_dock_toggle(),
+            !r.take_super_tap(),
             "a Super+number hold is not a clean Super tap"
         );
 
@@ -475,44 +470,43 @@ mod tests {
     }
 
     #[test]
-    fn a_clean_super_tap_toggles_the_dock_but_a_leader_hold_does_not() {
-        // VDOCK-1 (lock 13) — Super doubles as the vertical dock toggle. A clean
-        // tap (press+release, no chord) toggles it; a Super hold used as a leader
-        // never does, so the two Super roles coexist.
+    fn a_clean_super_tap_latches_shell_home_but_a_leader_hold_does_not() {
+        // A clean tap returns to shell home; a Super hold used as a leader never
+        // does, so the two Super roles coexist.
         let mut r = HotkeyRouter::default();
 
         // Press then release Super with nothing in between → a clean tap → toggle.
         let _ = r.dispatch(&[scan(125, true)], &[]);
-        assert!(!r.take_dock_toggle(), "no toggle until the tap completes");
+        assert!(!r.take_super_tap(), "no action until the tap completes");
         let _ = r.dispatch(&[scan(125, false)], &[]);
-        assert!(r.take_dock_toggle(), "a clean Super tap toggles the dock");
+        assert!(r.take_super_tap(), "a clean Super tap latches shell home");
         assert!(
-            !r.take_dock_toggle(),
-            "the toggle latch drains exactly once"
+            !r.take_super_tap(),
+            "the Super-tap latch drains exactly once"
         );
 
         // A Super *hold* used as a leader (Super+Tab) fires the chord and must NOT
-        // toggle the dock on release.
+        // trigger shell home on release.
         let acts = r.dispatch(&[scan(125, true)], &[press(egui::Key::Tab)]);
         assert_eq!(acts, vec![HotkeyAction::SessionSwitch]);
         let _ = r.dispatch(&[scan(125, false)], &[]);
         assert!(
-            !r.take_dock_toggle(),
-            "a leader-chord hold never toggles the dock"
+            !r.take_super_tap(),
+            "a leader-chord hold never triggers shell home"
         );
 
         // A fresh clean tap after a hold re-arms (the rising edge clears the
         // used-flag) and toggles again.
         let _ = r.dispatch(&[scan(125, true)], &[]);
         let _ = r.dispatch(&[scan(125, false)], &[]);
-        assert!(
-            r.take_dock_toggle(),
-            "a fresh Super tap re-arms and toggles"
-        );
+        assert!(r.take_super_tap(), "a fresh Super tap re-arms");
 
         // A same-frame press+release (a very quick tap) still toggles.
         let _ = r.dispatch(&[scan(125, true), scan(125, false)], &[]);
-        assert!(r.take_dock_toggle(), "a same-frame Super tap toggles");
+        assert!(
+            r.take_super_tap(),
+            "a same-frame Super tap latches shell home"
+        );
     }
 
     #[test]
@@ -642,8 +636,8 @@ mod tests {
         // every surface index stays keyboard-reachable; the three overshoot chords
         // (slots 17..=19) latch a slot that resolves to no surface — a safe no-op
         // (see `a_slot_past_the_last_surface_is_a_safe_no_op`).
-        let all: BTreeSet<usize> = (0..crate::dock::Surface::ALL.len()).collect();
-        assert_eq!(all.len(), 17, "Surface::ALL is the 17-surface set");
+        let all: BTreeSet<usize> = (0..crate::surfaces::Surface::ALL.len()).collect();
+        assert_eq!(all.len(), 17, "Springboard has 17 surface tiles");
         assert!(
             all.is_subset(&reached),
             "every Surface::ALL index has a Super-number chord"
@@ -662,20 +656,20 @@ mod tests {
         let slot = r.take_nav_slot().expect("Super+Shift+0 latches a slot");
         assert_eq!(slot.index(), 19, "Super+Shift+0 → slot 19");
         assert!(
-            crate::dock::Surface::ALL.get(slot.index()).is_none(),
+            crate::surfaces::springboard_surface(slot.index()).is_none(),
             "slot 19 overshoots the 17-surface set — resolves to no surface",
         );
-        // It consumed the hold, so releasing does not toggle the dock.
+        // It consumed the hold, so releasing does not trigger shell home.
         let _ = r.dispatch(&[scan(125, false)], &[]);
         assert!(
-            !r.take_dock_toggle(),
+            !r.take_super_tap(),
             "a Super+Shift+0 chord is a hold, not a clean Super tap"
         );
         // The consumer stays bounds-safe for any slot past the last surface: the
         // `apply_nav_slot` `.get` indexing yields nothing — a no-op, never a panic.
-        let past_end = NavSlot(crate::dock::Surface::ALL.len());
+        let past_end = NavSlot(crate::surfaces::Surface::ALL.len());
         assert!(
-            crate::dock::Surface::ALL.get(past_end.index()).is_none(),
+            crate::surfaces::springboard_surface(past_end.index()).is_none(),
             "a slot past the last surface resolves to no surface",
         );
     }

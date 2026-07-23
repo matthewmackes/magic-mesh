@@ -1175,6 +1175,267 @@ fn yaml_scalar(value: &str) -> String {
 /// The Bus topic prefix every cloud action verb rides: `action/cloud/`.
 pub const CLOUD_ACTION_PREFIX: &str = "action/cloud/";
 
+/// Current version of every `action/cloud/*` JSON request envelope.
+///
+/// Producers include it explicitly; consumers reject unknown future versions
+/// while an omitted field decodes as the legacy v1 shape during the cutover.
+pub const CLOUD_ACTION_SCHEMA_VERSION: u16 = 1;
+
+/// systemd credential name used by the root Workloads shell and `mackesd`.
+/// The credential contains exactly 64 lowercase hexadecimal characters (32 bytes).
+pub const CLOUD_ARM_CREDENTIAL: &str = "cloud-arm-key";
+
+/// HMAC-SHA256 key size accepted by the production credential loader.
+pub const CLOUD_ARM_KEY_BYTES: usize = 32;
+
+/// Stable capability target for node-wide provision/configure mutations.
+pub const CLOUD_ARM_NODE_SCOPE: &str = "node-wide";
+
+/// One live-mutation capability. The authenticated wire form is
+/// `v2|nonce|expires_ms|verb|node|target|request_sha256|signature`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloudArmedToken {
+    /// CSPRNG single-use nonce consumed by the daemon's durable replay ledger.
+    pub nonce: String,
+    /// Wall-clock expiration in milliseconds since the Unix epoch.
+    pub expires_at_ms: i64,
+    /// Exact live mutation verb authorized by this capability.
+    pub verb: String,
+    /// Exact mesh placement node authorized by this capability.
+    pub node: String,
+    /// Exact workload/image target, or [`CLOUD_ARM_NODE_SCOPE`].
+    pub target: String,
+    /// SHA-256 of canonical request JSON after removing `armed_token`.
+    pub request_sha256: String,
+    /// Lowercase hexadecimal HMAC-SHA256 over the preceding fields.
+    pub signature: String,
+}
+
+impl CloudArmedToken {
+    /// Serialize the authenticated portion of the token.
+    #[must_use]
+    pub fn signing_payload(&self) -> String {
+        format!(
+            "v2|{}|{}|{}|{}|{}|{}",
+            self.nonce, self.expires_at_ms, self.verb, self.node, self.target, self.request_sha256
+        )
+    }
+
+    /// Serialize the complete token for the `armed_token` request field.
+    #[must_use]
+    pub fn encode(&self) -> String {
+        format!("{}|{}", self.signing_payload(), self.signature)
+    }
+
+    /// Create and HMAC-sign one capability for an already validated context.
+    #[must_use]
+    pub fn mint(
+        signer: &dyn CloudTokenSigner,
+        nonce: &str,
+        expires_at_ms: i64,
+        verb: &str,
+        node: &str,
+        target: &str,
+        request_sha256: &str,
+    ) -> Self {
+        let mut token = Self {
+            nonce: nonce.to_string(),
+            expires_at_ms,
+            verb: verb.to_string(),
+            node: node.to_string(),
+            target: target.to_string(),
+            request_sha256: request_sha256.to_string(),
+            signature: String::new(),
+        };
+        token.signature = signer.sign_payload(&token.signing_payload());
+        token
+    }
+
+    /// Parse the strict v2 wire format, returning `None` for malformed input.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        let parts: Vec<&str> = raw.trim().split('|').collect();
+        if parts.len() != 8 || parts[0] != "v2" {
+            return None;
+        }
+        Some(Self {
+            nonce: parts[1].to_string(),
+            expires_at_ms: parts[2].parse().ok()?,
+            verb: parts[3].to_string(),
+            node: parts[4].to_string(),
+            target: parts[5].to_string(),
+            request_sha256: parts[6].to_string(),
+            signature: parts[7].to_string(),
+        })
+    }
+}
+
+/// Minimal signing interface shared by token producers and verifier adapters.
+pub trait CloudTokenSigner {
+    /// Return the lowercase hexadecimal signature for `payload`.
+    fn sign_payload(&self, payload: &str) -> String;
+}
+
+/// Shared, dependency-light HMAC implementation used on both sides of the Bus.
+/// Credential loading remains in the privileged binaries, not this wire crate.
+#[derive(Clone)]
+pub struct CloudArmSigner {
+    key: Vec<u8>,
+}
+
+impl CloudArmSigner {
+    /// Construct a signer from non-empty raw key bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `key` is empty.
+    pub fn new(key: impl Into<Vec<u8>>) -> Result<Self, &'static str> {
+        let key = key.into();
+        if key.is_empty() {
+            return Err("cloud arming key is empty");
+        }
+        Ok(Self { key })
+    }
+
+    /// Return the lowercase hexadecimal HMAC-SHA256 for `payload`.
+    #[must_use]
+    pub fn sign_payload(&self, payload: &str) -> String {
+        use hmac::{Hmac, Mac as _};
+        use sha2::Sha256;
+
+        let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(&self.key) else {
+            return String::new();
+        };
+        mac.update(payload.as_bytes());
+        hex_encode(&mac.finalize().into_bytes())
+    }
+
+    /// Verify a hexadecimal HMAC-SHA256 without timing-sensitive equality.
+    #[must_use]
+    pub fn verify_payload(&self, payload: &str, signature: &str) -> bool {
+        use hmac::{Hmac, Mac as _};
+        use sha2::Sha256;
+
+        let Ok(signature) = hex_decode(signature) else {
+            return false;
+        };
+        let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(&self.key) else {
+            return false;
+        };
+        mac.update(payload.as_bytes());
+        mac.verify_slice(&signature).is_ok()
+    }
+}
+
+impl CloudTokenSigner for CloudArmSigner {
+    fn sign_payload(&self, payload: &str) -> String {
+        Self::sign_payload(self, payload)
+    }
+}
+
+/// Decode the text stored in the sealed/systemd credential.
+///
+/// # Errors
+///
+/// Returns an error unless the credential is UTF-8 containing exactly 32
+/// lowercase or uppercase hexadecimal bytes after surrounding whitespace.
+pub fn decode_cloud_arm_credential(raw: &[u8]) -> Result<Vec<u8>, &'static str> {
+    let text = std::str::from_utf8(raw)
+        .map_err(|_| "cloud arming credential is not UTF-8")?
+        .trim();
+    let key = hex_decode(text)?;
+    if key.len() != CLOUD_ARM_KEY_BYTES {
+        return Err("cloud arming credential must encode exactly 32 bytes");
+    }
+    Ok(key)
+}
+
+/// Hash a request object after removing its top-level `armed_token`.
+///
+/// Object keys are recursively sorted and array order is preserved.
+///
+/// # Errors
+///
+/// Returns an error for malformed JSON, a non-object root, or data that cannot
+/// be serialized into the canonical representation.
+pub fn cloud_request_digest(raw: &str) -> Result<String, &'static str> {
+    use sha2::{Digest as _, Sha256};
+
+    let mut value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|_| "cloud request is not valid JSON")?;
+    let object = value
+        .as_object_mut()
+        .ok_or("cloud request JSON root is not an object")?;
+    object.remove("armed_token");
+    let mut canonical = String::new();
+    write_canonical_json(&value, &mut canonical)?;
+    Ok(hex_encode(&Sha256::digest(canonical.as_bytes())))
+}
+
+fn write_canonical_json(
+    value: &serde_json::Value,
+    output: &mut String,
+) -> Result<(), &'static str> {
+    match value {
+        serde_json::Value::Null => output.push_str("null"),
+        serde_json::Value::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
+        serde_json::Value::Number(value) => output.push_str(&value.to_string()),
+        serde_json::Value::String(value) => output.push_str(
+            &serde_json::to_string(value).map_err(|_| "cloud request string cannot serialize")?,
+        ),
+        serde_json::Value::Array(values) => {
+            output.push('[');
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    output.push(',');
+                }
+                write_canonical_json(value, output)?;
+            }
+            output.push(']');
+        }
+        serde_json::Value::Object(values) => {
+            output.push('{');
+            let mut keys: Vec<&str> = values.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            for (index, key) in keys.into_iter().enumerate() {
+                if index > 0 {
+                    output.push(',');
+                }
+                output.push_str(
+                    &serde_json::to_string(key)
+                        .map_err(|_| "cloud request key cannot serialize")?,
+                );
+                output.push(':');
+                write_canonical_json(&values[key], output)?;
+            }
+            output.push('}');
+        }
+    }
+    Ok(())
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
+}
+
+fn hex_decode(text: &str) -> Result<Vec<u8>, &'static str> {
+    if text.len() % 2 != 0 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("cloud arming credential/signature is not hexadecimal");
+    }
+    text.as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let pair = std::str::from_utf8(pair).map_err(|_| "invalid hexadecimal")?;
+            u8::from_str_radix(pair, 16).map_err(|_| "invalid hexadecimal")
+        })
+        .collect()
+}
+
 /// The Bus topic for cloud verb `verb`: `action/cloud/<verb>`.
 #[must_use]
 pub fn cloud_action_topic(verb: &str) -> String {
@@ -1799,6 +2060,34 @@ pub struct NodeCapacity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cloud_request_digest_is_canonical_and_excludes_only_the_token() {
+        let a = r#"{"node":"eagle","form":{"image":"nginx:1","rootful":false}}"#;
+        let b = r#"{"form":{"rootful":false,"image":"nginx:1"},"armed_token":"ignored","node":"eagle"}"#;
+        assert_eq!(cloud_request_digest(a), cloud_request_digest(b));
+        let altered = r#"{"node":"eagle","form":{"image":"nginx:1","rootful":true}}"#;
+        assert_ne!(cloud_request_digest(a), cloud_request_digest(altered));
+        assert!(cloud_request_digest("[]").is_err());
+    }
+
+    #[test]
+    fn cloud_armed_token_signs_the_request_digest() {
+        let signer = CloudArmSigner::new(b"0123456789abcdef0123456789abcdef".to_vec()).unwrap();
+        let digest = cloud_request_digest(r#"{"node":"eagle"}"#).unwrap();
+        let token = CloudArmedToken::mint(
+            &signer,
+            "nonce-12345678",
+            42,
+            "provision",
+            "eagle",
+            CLOUD_ARM_NODE_SCOPE,
+            &digest,
+        );
+        let parsed = CloudArmedToken::parse(&token.encode()).unwrap();
+        assert_eq!(parsed, token);
+        assert!(signer.verify_payload(&parsed.signing_payload(), &parsed.signature));
+    }
 
     /// A trimmed but realistic Keystone v3 token response — the shape
     /// `POST /v3/auth/tokens` returns, with a three-interface compute service, a

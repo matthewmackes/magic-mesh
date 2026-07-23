@@ -1120,12 +1120,19 @@ mod tests {
         // wrapper is thin.
         use crate::enrollment::build_identity;
         use crate::nebula_enroll::{
-            build_pending, parse_join_token, pending_enroll_path, publish_enrollment_request,
+            build_pending_with_nebula_key, parse_join_token, pending_enroll_path,
+            publish_enrollment_request,
         };
         let tmp = tempfile::tempdir().expect("tempdir");
         let identity = build_identity();
         let token = parse_join_token("mesh:test@10.0.0.5:4242#bearer").unwrap();
-        let pending = build_pending(&identity, "peer:local", "anvil", token);
+        let pending = build_pending_with_nebula_key(
+            &identity,
+            "peer:local",
+            "anvil",
+            token,
+            "-----BEGIN NEBULA X25519 PUBLIC KEY-----\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n-----END NEBULA X25519 PUBLIC KEY-----\n",
+        );
         let p = publish_enrollment_request(tmp.path(), "peer:local", &pending).expect("publish");
         assert_eq!(p, pending_enroll_path(tmp.path(), "peer:local"));
         assert!(p.exists());

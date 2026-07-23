@@ -380,19 +380,45 @@ pub enum MessageClass {
 
 /// Connection handle returned by `Transport::open()`.
 ///
-/// The trait is intentionally minimal — implementations hold the actual socket /
-/// TLS session / queue inside their own `Connection` type and erase
-/// it behind this boxed handle.
-///
-/// The router never calls back into the connection — sends are
-/// driven by `Transport::send_through` per-message. The handle
-/// exists so the router can hold a `Connection` alive across sends
-/// without re-opening the transport every time.
+/// Implementations hold the actual socket / TLS session / queue inside their
+/// own `Connection` type and erase it behind this boxed handle. Framed I/O is
+/// optional because not every transport exposes a stream at this layer; the
+/// HTTPS fallback does, and the router refuses to mark that fallback active
+/// unless [`Connection::supports_framed_io`] is true.
+#[async_trait]
 pub trait Connection: Send + Sync + std::fmt::Debug {
     /// Stable identifier for this connection — used in audit log
     /// entries so the operator can correlate router decisions
     /// with the actual long-lived connection that carried them.
     fn id(&self) -> &str;
+
+    /// Whether this handle owns a usable bidirectional framed channel.
+    ///
+    /// The default is deliberately false: a successful handshake alone is not
+    /// evidence that a transport can carry payloads. Stream transports override
+    /// this together with [`Connection::send_frame`] and
+    /// [`Connection::recv_frame`].
+    fn supports_framed_io(&self) -> bool {
+        false
+    }
+
+    /// Send one authenticated transport payload through this connection.
+    ///
+    /// Payload authentication belongs to the inner protocol (Nebula for the
+    /// HTTPS fallback); this method preserves those bytes and only applies the
+    /// carrier's framing.
+    async fn send_frame(&self, _payload: &[u8]) -> Result<(), TransportError> {
+        Err(TransportError::Misconfigured {
+            code: "framed_io_unsupported",
+        })
+    }
+
+    /// Receive one complete authenticated transport payload.
+    async fn recv_frame(&self) -> Result<Vec<u8>, TransportError> {
+        Err(TransportError::Misconfigured {
+            code: "framed_io_unsupported",
+        })
+    }
 }
 
 /// The core router-facing trait. Object-safe via `async-trait`.

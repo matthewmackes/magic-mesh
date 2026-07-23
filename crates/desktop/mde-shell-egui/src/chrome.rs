@@ -48,7 +48,7 @@ const REFRESH: Duration = Duration::from_secs(5);
 /// source behind the tray's Peers / Status / Signal dots. Pure data — parsed
 /// without egui/IO/GPU, so it's unit-tested directly. (`pub`, not `pub(crate)`,
 /// is the `clippy::redundant_pub_crate` form for crate-visible items in a
-/// private module, like `dock::TASKBAR_H`.)
+/// private module.)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeshSummary {
     /// Peers in the directory (every node the snapshot names).

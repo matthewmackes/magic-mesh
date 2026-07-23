@@ -93,7 +93,7 @@
 //! Confirm/Cancel) already had its own `install_row_accessibility` call from
 //! this unit; the crate-wide sweep found no residual gap HERE and changed
 //! nothing in this file. The real gaps it closed were in `dock.rs` (the
-//! bottom taskbar had NO accesskit at all before WIN7-7) and `start_menu.rs`
+//! retired launcher chrome had no accesskit before WIN7-7) and `start_menu.rs`
 //! (the panel's own open/close transition had no live announcement).
 //!
 //! **The launch (CONSOLE-5, §6/§7):** activating a command entry opens a
@@ -110,7 +110,7 @@
 //! dead entries" rule, §7).
 //!
 //! **CONSOLE-4** adds the rail's **Power section** (lock #28: Lock → the shell
-//! curtain, Suspend at once, Reboot / Shut Down behind the VDOCK-4 typed-arming
+//! curtain, Suspend at once, Reboot / Shut Down behind the typed-arming
 //! echo — every verb drives the REAL seam via [`ConsoleRequest`]: the curtain /
 //! `system.honor_power`, never a raw `systemctl`) and the **Custom group**
 //! (lock #35): operator-registered named command entries, added in-UI and
@@ -126,9 +126,9 @@
 //! wall of identical terminal icons. The Containers & VMs group's Cloud-plane
 //! row is the Workbench Cloud-plane link (the combined-group decision, Q41/Q50).
 //!
-//! Like the dock, this module is pure chrome + state: it records a typed
+//! This module is pure chrome + state: it records a typed
 //! [`ConsoleRequest`] the shell drains after the frame (`main.rs`), and never
-//! reaches the nav / curtain / seat itself (§6, the VDOCK deferred-wire idiom).
+//! reaches the nav / curtain / seat itself (§6, the deferred-wire idiom).
 //!
 //! **WIN7-8 update:** the Custom group's entries (lock #35) now ALSO sync
 //! mesh-wide per operator identity (lock #21), over
@@ -156,7 +156,7 @@ use mde_theme::brand::icons::IconId;
 use serde::{Deserialize, Serialize};
 
 use crate::chooser::chooser_prefs::unix_millis;
-use crate::dock::{icon_texture, Surface};
+use crate::surfaces::{icon_texture, Surface};
 
 // ── geometry (all §4 token math, the dock's 8px grid) ───────────────────────
 
@@ -249,8 +249,10 @@ const FOCUS_RING_W: f32 = mde_egui::focus::FOCUS_RING_W;
 /// glyph, the row-scale icon.
 const ENTRY_ICON: f32 = Style::SP_M;
 
-/// A 1px hairline rule (the dock's `HAIRLINE_W` restated — module-private there).
-const HAIRLINE_W: f32 = 1.0;
+/// The hairline rule width — the shared [`Style::STROKE_HAIRLINE`] stroke token
+/// (the dock's module-private `HAIRLINE_W` restated; value-identical, no longer
+/// a mirrored raw literal — PLATFORM-INTERFACES Q19/Q20 token hygiene).
+const HAIRLINE_W: f32 = Style::STROKE_HAIRLINE;
 
 /// CONSOLE-4 — the rail Power section's height (lock #28): a heading + the four
 /// action rows; the typed-arming stage renders within the same box, so the rail
@@ -786,13 +788,11 @@ pub enum ConsoleRequest {
     Power(PowerVerb),
 }
 
-// ── CONSOLE-4: the Power section (lock #28, the VDOCK-4 arming idiom) ───────
+// ── CONSOLE-4: the Power section (lock #28, the shell arming idiom) ─────────
 
 /// One rail Power action (lock #28). `Lock` drops the curtain; the rest drive
 /// their real [`PowerVerb`]. Reboot + Shut Down are typed-armed (lock #36);
-/// Lock + Suspend act on a single click. (The VDOCK-4 `PowerItem` idiom
-/// restated — that enum is dock-private and its menu closes with the dock,
-/// while these rows live in the Console rail.)
+/// Lock + Suspend act on a single click; these rows live in the Console rail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PowerAction {
     /// Drop the shell curtain (the in-process lock).
@@ -844,7 +844,7 @@ impl PowerAction {
 }
 
 /// A host-down verb mid typed-arming: the action + the echo the operator types
-/// to arm it (the storage / VDOCK-4 arming-echo idiom).
+/// to arm it (the shared storage/power arming-echo idiom).
 #[derive(Debug)]
 struct Arming {
     /// The action this stage fires once its echo matches.
@@ -1193,7 +1193,7 @@ impl ConsoleState {
 
     /// Whether the in-flight arming's echo matches its action's label — the
     /// gate a Reboot / Shut Down confirm must pass (§7 — a blank / mistyped
-    /// echo never fires). The VDOCK-4 `PowerMenu::armed` rule.
+    /// echo never fires).
     fn armed(&self) -> bool {
         self.arming
             .as_ref()
@@ -1568,7 +1568,7 @@ fn jump_caption(count: usize) -> String {
 
 /// CONSOLE-4 — the rail's **Power section** (lock #28): a micro-heading over
 /// the four action rows — or, while a host-down verb arms, the typed-arming
-/// stage in the same box (the VDOCK-4 popup idiom laid into the rail). Lock +
+/// stage in the same box. Lock +
 /// Suspend fire at once; Reboot + Shut Down read in DANGER and demand the echo
 /// (lock #36). Every verb drives the REAL seam through [`ConsoleRequest`].
 #[allow(

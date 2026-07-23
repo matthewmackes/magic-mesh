@@ -156,7 +156,8 @@ serde_json  = "1"
 # reqwest (blocking, no-TLS — mesh services are reached over the plaintext Nebula
 # overlay, the overlay IS the transport security) backs the HTTP consumers
 # (music_autoconfig + transfers/lane/browser_media). Gated behind async-services.
-reqwest     = { version = "0.12", default-features = false, features = ["json", "blocking"], optional = true }
+reqwest     = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"], optional = true }
+prost       = { version = "0.14", optional = true }
 
 # EPIC-MESH-PROBE (MESH-PROBE-2) — read-only DOM parser for nmap's
 # `-oX` output. Already vendored in the workspace lockfile; the
@@ -213,7 +214,7 @@ fs2 = "0.4"
 # NF-2.4 seal — safe running-uid lookup (rustix avoids the
 # `unsafe { libc::getuid() }` path that the workspace's
 # `unsafe_code = "forbid"` lint rejects).
-rustix = { version = "0.38", features = ["process"] }
+rustix = { version = "0.38", features = ["fs", "process"] }
 
 # NF-2 CA module — error-derive macro used across the
 # ca::{mint,sign,seal,bundle} modules. tokio-rustls already
@@ -365,6 +366,7 @@ async-services = [
     # reqwest backs the async-services HTTP consumers (music_autoconfig,
     # transfers/lane/browser_media).
     "dep:reqwest",
+    "dep:prost",
 ]
 
 [package.metadata.docs.rs]
@@ -470,6 +472,9 @@ assets = [
     { source = "packaging/systemd/nebula.service.d/10-mesh-recovery.conf", dest = "/usr/lib/systemd/system/nebula.service.d/10-mesh-recovery.conf", mode = "644" },
     { source = "install-helpers/mesh-health-check.sh",   dest = "/usr/libexec/mackesd/mesh-health-check",       mode = "755" },
     { source = "install-helpers/mesh-alert.sh",          dest = "/usr/libexec/mackesd/mesh-alert",              mode = "755" },
+    { source = "install-helpers/configure-small-lighthouse.sh", dest = "/usr/libexec/mackesd/configure-small-lighthouse", mode = "755" },
+    { source = "install-helpers/provision-cloud-arm-credential.sh", dest = "/usr/libexec/mackesd/provision-cloud-arm-credential", mode = "755" },
+    { source = "packaging/systemd/cloud-arm-credential.conf", dest = "/usr/libexec/mackesd/cloud-arm-credential.conf", mode = "644" },
     # SUBSTRATE-1 (SUBSTRATE-V2) — the etcd coordination cluster: overlay-bound
     # leader/directory/health. Run per-node with --init/--join/--client-only.
     # The unit only starts where setup-etcd.sh wrote /etc/etcd/etcd.env (members).
@@ -1201,6 +1206,7 @@ assets = [
     { source = "packaging/systemd/nebula.service.d/10-mesh-recovery.conf", dest = "/usr/lib/systemd/system/nebula.service.d/10-mesh-recovery.conf", mode = "644" },
     { source = "install-helpers/mesh-health-check.sh",   dest = "/usr/libexec/mackesd/mesh-health-check",       mode = "755" },
     { source = "install-helpers/mesh-alert.sh",          dest = "/usr/libexec/mackesd/mesh-alert",              mode = "755" },
+    { source = "install-helpers/configure-small-lighthouse.sh", dest = "/usr/libexec/mackesd/configure-small-lighthouse", mode = "755" },
     # SUBSTRATE — the etcd + Syncthing coordination/file substrate.
     { source = "install-helpers/setup-etcd.sh",          dest = "/usr/libexec/mackesd/setup-etcd",              mode = "755" },
     # #13 — the turn-key lighthouse JOIN provisioner (`mackesd lighthouse add`): a

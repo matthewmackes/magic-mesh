@@ -23,11 +23,14 @@
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::task::JoinHandle;
 use tokio_rustls::client::TlsStream as ClientTlsStream;
 use tokio_rustls::server::TlsStream as ServerTlsStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
@@ -37,12 +40,21 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 /// h2 first so the observed wire shape is HTTP/2.
 const ALPN_PROTOCOLS: &[&[u8]] = &[b"h2", b"http/1.1"];
 
+/// Maximum time one accepted TCP socket may spend completing TLS.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bounded number of handshakes in flight. Excess raw TCP sockets are dropped
+/// immediately so a slow-client flood cannot grow tasks without limit.
+pub const MAX_CONCURRENT_HANDSHAKES: usize = 16;
+const READY_CHANNEL_CAPACITY: usize = MAX_CONCURRENT_HANDSHAKES;
+const TLS13_ONLY: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS13];
+
 /// Listener wrapping a [`TcpListener`] + a [`TlsAcceptor`].
 /// Each `accept()` yields one inbound TLS session ready for
 /// the framing layer ([`crate::framing`]) to drive.
 pub struct TunnelListener {
-    inner: TcpListener,
-    acceptor: TlsAcceptor,
+    local_addr: SocketAddr,
+    ready: Mutex<mpsc::Receiver<Result<TunnelStream, TunnelError>>>,
+    accept_task: JoinHandle<()>,
 }
 
 /// One inbound TLS session. The framing layer reads + writes
@@ -108,7 +120,10 @@ fn build_server_config(
     let key: PrivateKeyDer<'static> = PrivateKeyDer::from_pem_slice(&key_pem)
         .map_err(|e| TunnelError::CertIo(format!("parse key pem {}: {e}", server_key.display())))?;
 
-    let mut config = ServerConfig::builder()
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut config = ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(TLS13_ONLY)
+        .map_err(|e| TunnelError::Config(format!("TLS 1.3: {e}")))?
         .with_no_client_auth()
         .with_single_cert(cert_chain, key)
         .map_err(|e| TunnelError::Config(e.to_string()))?;
@@ -146,7 +161,10 @@ fn build_client_config(ca_bundle: Option<&Path>) -> Result<Arc<ClientConfig>, Tu
         )));
     }
 
-    let mut config = ClientConfig::builder()
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut config = ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(TLS13_ONLY)
+        .map_err(|e| TunnelError::Config(format!("TLS 1.3: {e}")))?
         .with_root_certificates(roots)
         .with_no_client_auth();
     config.alpn_protocols = ALPN_PROTOCOLS.iter().map(|p| p.to_vec()).collect();
@@ -169,10 +187,54 @@ pub async fn listen(
     let inner = TcpListener::bind(addr)
         .await
         .map_err(|e| TunnelError::Tcp(format!("bind {addr}: {e}")))?;
-    tracing::info!(addr = %addr, "nebula-https-tunnel listener bound");
+    let local_addr = inner
+        .local_addr()
+        .map_err(|e| TunnelError::Tcp(format!("local addr: {e}")))?;
+    let acceptor = TlsAcceptor::from(config);
+    let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_HANDSHAKES));
+    let (ready_tx, ready_rx) = mpsc::channel(READY_CHANNEL_CAPACITY);
+    let accept_task = tokio::spawn(async move {
+        loop {
+            let (tcp, peer) = match inner.accept().await {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    if ready_tx
+                        .send(Err(TunnelError::Tcp(format!("accept: {error}"))))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+            };
+            let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+                tracing::warn!(peer = %peer, "nebula-https-tunnel: handshake capacity exhausted; dropping TCP client");
+                continue;
+            };
+            let acceptor = acceptor.clone();
+            let ready_tx = ready_tx.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                let result =
+                    match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await {
+                        Ok(Ok(stream)) => Ok(stream),
+                        Ok(Err(error)) => Err(TunnelError::Handshake(format!("server: {error}"))),
+                        Err(_) => Err(TunnelError::Handshake(format!(
+                            "server timeout after {}s",
+                            HANDSHAKE_TIMEOUT.as_secs()
+                        ))),
+                    };
+                let _ = ready_tx.send(result).await;
+            });
+        }
+    });
+    tracing::info!(addr = %local_addr, "nebula-https-tunnel listener bound");
     Ok(TunnelListener {
-        inner,
-        acceptor: TlsAcceptor::from(config),
+        local_addr,
+        ready: Mutex::new(ready_rx),
+        accept_task,
     })
 }
 
@@ -185,23 +247,25 @@ impl TunnelListener {
     /// Returns [`TunnelError::Tcp`] on accept failure,
     /// [`TunnelError::Handshake`] on TLS rejection.
     pub async fn accept(&self) -> Result<TunnelStream, TunnelError> {
-        let (tcp, peer) = self
-            .inner
-            .accept()
+        self.ready
+            .lock()
             .await
-            .map_err(|e| TunnelError::Tcp(format!("accept: {e}")))?;
-        tracing::debug!(peer = %peer, "nebula-https-tunnel inbound");
-        self.acceptor
-            .accept(tcp)
+            .recv()
             .await
-            .map_err(|e| TunnelError::Handshake(format!("server: {e}")))
+            .unwrap_or_else(|| Err(TunnelError::Tcp("listener stopped".into())))
     }
 
     /// Local socket the listener bound to. Useful for tests
     /// that bind port 0 and need to discover the assigned
     /// port.
     pub fn local_addr(&self) -> Option<SocketAddr> {
-        self.inner.local_addr().ok()
+        Some(self.local_addr)
+    }
+}
+
+impl Drop for TunnelListener {
+    fn drop(&mut self) {
+        self.accept_task.abort();
     }
 }
 
@@ -236,6 +300,19 @@ pub async fn dial(
 mod tests {
     use super::*;
 
+    fn loopback_identity(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf, Vec<u8>) {
+        let key = rcgen::KeyPair::generate().expect("generate key");
+        let mut params =
+            rcgen::CertificateParams::new(vec!["localhost".into()]).expect("certificate params");
+        params.is_ca = rcgen::IsCa::NoCa;
+        let cert = params.self_signed(&key).expect("self-sign");
+        let cert_path = dir.join("relay.crt");
+        let key_path = dir.join("relay.key");
+        std::fs::write(&cert_path, cert.pem()).expect("write test cert");
+        std::fs::write(&key_path, key.serialize_pem()).expect("write test key");
+        (cert_path, key_path, cert.der().to_vec())
+    }
+
     #[test]
     fn alpn_protocols_lock_h2_first() {
         // The cover-traffic story breaks if http/1.1 is
@@ -269,6 +346,52 @@ mod tests {
         // self-signed pair (CI sandbox).
         // The full handshake is exercised by the bench
         // acceptance test (NF-9.4).
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stalled_tcp_client_does_not_starve_a_good_tls_peer() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (cert_path, key_path, cert_der) = loopback_identity(temp.path());
+        let listener = listen(
+            "127.0.0.1:0".parse().expect("listen addr"),
+            &cert_path,
+            &key_path,
+        )
+        .await
+        .expect("listen");
+        let addr = listener.local_addr().expect("local addr");
+
+        // This socket sends no ClientHello and occupies one bounded handshake
+        // lane until timeout. A later valid client must still complete.
+        let stalled = TcpStream::connect(addr).await.expect("stalled TCP connect");
+
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(CertificateDer::from(cert_der))
+            .expect("install test root");
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut client = ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(TLS13_ONLY)
+            .expect("TLS 1.3")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        client.alpn_protocols = ALPN_PROTOCOLS.iter().map(|p| p.to_vec()).collect();
+        let good = tokio::spawn(async move {
+            let tcp = TcpStream::connect(addr).await.expect("good TCP connect");
+            TlsConnector::from(Arc::new(client))
+                .connect(ServerName::try_from("localhost").expect("server name"), tcp)
+                .await
+                .expect("good TLS handshake")
+        });
+
+        let accepted = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .expect("good client must not wait for stalled handshake")
+            .expect("accepted good TLS client");
+        let good = good.await.expect("good client task");
+        drop(accepted);
+        drop(good);
+        drop(stalled);
     }
 
     #[tokio::test]

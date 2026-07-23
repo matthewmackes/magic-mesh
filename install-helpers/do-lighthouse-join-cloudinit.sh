@@ -47,6 +47,8 @@ EOF
     dnf install -y magic-mesh || fail "dnf install magic-mesh failed (is there a fedora-$RELEASEVER channel dir? else pass --rpm-url a portable build)"
 fi
 command -v mackesd >/dev/null || fail "mackesd not on PATH after install"
+ [ -x /usr/libexec/mackesd/configure-small-lighthouse ] \
+    || fail "small lighthouse profile helper not on PATH after install"
 
 # 2. JOIN the existing mesh as a lighthouse (NOT found). `join --role lighthouse`
 #    pins the role, network-enrolls, brings up nebula + mackesd, auto-joins the
@@ -55,6 +57,11 @@ log "joining the existing mesh as a lighthouse"
 JOIN_OUT="$(mackesd join "$JOIN_TOKEN" --role lighthouse 2>&1)" \
     || fail "mackesd join failed: $JOIN_OUT"
 echo "$JOIN_OUT"
+
+# Keep the join path on the same 512 MiB control-plane profile as the founding
+# path.  This runs after join because join pins the role and starts the units.
+/usr/libexec/mackesd/configure-small-lighthouse small \
+    || fail "could not apply the small lighthouse resource profile"
 
 # 3. Open the lighthouse ports (DO Cloud Firewall is the real gate, applied by
 #    the join-script; firewalld is the host-local belt-and-braces).
@@ -65,23 +72,10 @@ if systemctl is-active --quiet firewalld 2>/dev/null; then
     log "firewalld: opened 4242/udp, 443/tcp"
 fi
 
-# 4. First-boot helper-binary fetches (#17 — turn-key broker). The RPM
-#    post_install only `enable`s mesh-broker-setup (the ntfy notification
-#    broker), mesh-netdata-setup, and mesh-shell-setup — NOT `--now`, so the dnf
-#    transaction never blocks on network-online.target. On a freshly provisioned
-#    lighthouse that never reboots, that leaves no ntfy broker (the mesh-wide
-#    notification distribution the health watchdog feeds) until the first reboot.
-#    Start them now (post-boot, the network is up). ntfy is bundled in the RPM
-#    vendor dir (offline, near-instant); the others self-skip once their binary
-#    exists. --no-block so a slow upstream fetch never stalls cloud-init, and
-#    each oneshot is idempotent.
-for unit in mesh-broker-setup.service mesh-netdata-setup.service mesh-shell-setup.service; do
-    if systemctl start --no-block "$unit" 2>/dev/null; then
-        log "kicked $unit (first-boot provisioning)"
-    else
-        log "$unit stays enabled — will run at next boot"
-    fi
-done
+# 4. Optional broker/Netdata/shell setup is intentionally NOT started here:
+#    configure-small-lighthouse applied the control-plane-only profile and
+#    disabled these memory-heavy first-boot fetches.
+log "small profile: optional broker, Netdata and shell setup remain disabled"
 
 echo "OK" >"$STATUS_FILE"
 log "lighthouse joined the mesh — the roster reconcile will propagate it fleet-wide."

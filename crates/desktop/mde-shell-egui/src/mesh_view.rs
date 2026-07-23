@@ -718,7 +718,7 @@ impl SelfTestWatch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dock::Surface;
+    use crate::surfaces::Surface;
     use crate::toast_bridge::{resolve_action, Navigate};
     use mde_egui::egui::{pos2, vec2, Rect};
     use mde_egui::Style;

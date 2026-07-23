@@ -971,7 +971,7 @@ impl ChatState {
                 });
                 ui.separator();
                 if recent.is_empty() {
-                    crate::session::empty_state(
+                    crate::empty_state::show(
                         ui,
                         "No messages",
                         "Select a contact or room on the left when mesh chat activity arrives.",
@@ -1449,7 +1449,7 @@ impl ChatState {
                         .filter(|m| self.feed_shows(&m.kind))
                         .collect();
                     if shown.is_empty() {
-                        crate::session::empty_state(
+                        crate::empty_state::show(
                             ui,
                             "All messages filtered",
                             "Everything in this timeline is hidden by the View feed filters — \
@@ -1465,7 +1465,7 @@ impl ChatState {
                     } else {
                         "No messages yet — say hello, or wait for this host's alerts to arrive."
                     };
-                    crate::session::empty_state(ui, "No messages", subtitle);
+                    crate::empty_state::show(ui, "No messages", subtitle);
                 }
             });
     }
@@ -1502,7 +1502,7 @@ impl ChatState {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 if items.is_empty() {
-                    crate::session::empty_state(
+                    crate::empty_state::show(
                         ui,
                         "No notifications",
                         "Folded system alerts from mesh hosts appear here as messages from their contacts.",
@@ -1783,7 +1783,7 @@ impl ChatState {
                         .filter(|m| self.feed_shows(&m.kind))
                         .collect();
                     if shown.is_empty() {
-                        crate::session::empty_state(
+                        crate::empty_state::show(
                             ui,
                             "All messages filtered",
                             "Everything in this room's log is hidden by the View feed filters — \
@@ -1794,7 +1794,7 @@ impl ChatState {
                     }
                 }
                 _ => {
-                    crate::session::empty_state(
+                    crate::empty_state::show(
                         ui,
                         "No messages",
                         "This room's shared log is empty — say hello, or wait for a fleet alert to \

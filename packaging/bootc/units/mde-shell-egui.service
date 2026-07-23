@@ -53,6 +53,9 @@ TTYVHangup=yes
 # the SAME bus spool + workgroup dir as the root daemon (the SETUP-fix split-brain).
 Environment=MDE_BUS_ROOT=/run/mde-bus
 Environment=MDE_WORKGROUP_ROOT=/mnt/mesh-storage
+# The shipped root DRM shell is the only production token minter. A provisioning
+# helper installs its LoadCredentialEncrypted drop-in only after host ciphertext
+# exists; without it every live action fails closed before publishing.
 # root is intentional for now: DRM master + /dev/input/* need seat ownership and
 # there is no logind/seatd integration yet (follow-up noted in
 # packaging/bootc/README.md). Containment doctrine follows mackesd.service.

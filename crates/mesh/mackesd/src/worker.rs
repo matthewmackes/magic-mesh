@@ -1342,11 +1342,10 @@ mod tests {
             epoch: 1,
             ca_cert_pem: String::new(),
             peer_cert_pem: String::new(),
-            peer_key_pem: String::new(),
             overlay_ip: overlay_ip.to_owned(),
             mesh_cidr: "10.42.0.0/16".into(),
             lighthouses: vec![],
-            ca_key_pem: None,
+            relay_trust_authority: None,
             created_at: 0,
         };
         let path = crate::ca::bundle::bundle_path(workgroup_root, peer);
