@@ -17,6 +17,8 @@ use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use serde::{Deserialize, Serialize};
 
+use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
+
 use super::proc::status_with_timeout;
 use super::{ShutdownToken, Worker};
 
@@ -39,6 +41,11 @@ pub const INDICATOR_PREFIX: &str = "state/seat/remote-input/";
 
 /// Per-event injection result / audit topic prefix for this node.
 pub const RESULT_PREFIX: &str = "event/seat-remote-input/";
+
+/// Capability verb bound to every phone-originated seat handoff. The producer
+/// and consumer must agree on this exact string; it is deliberately distinct
+/// from the arm/disarm consent control, which cannot itself inject input.
+pub const REMOTE_INPUT_AUTH_VERB: &str = "seat-remote-input";
 
 /// Default poll cadence. Phone touchpad input is interactive, so stay below the
 /// control-poller cadence while still using the Bus as the handoff contract.
@@ -161,9 +168,10 @@ pub struct RemoteInputStatus {
     pub injected: u64,
     /// Requests rejected as malformed.
     pub rejected: u64,
-    /// Well-formed requests refused by the arm/consent gate (security-7):
-    /// the seat was un-armed, the arm had expired, or the injection's phone
-    /// did not match the armed phone.
+    /// Well-formed requests refused by an authorization or arm/consent gate
+    /// (security-7): the capability was missing/expired/replayed/tampered, the
+    /// seat was un-armed, the arm had expired, or the injection's phone did not
+    /// match the armed phone.
     pub dropped: u64,
     /// Valid requests whose injector failed or was unavailable.
     pub failed: u64,
@@ -324,6 +332,9 @@ pub struct SeatRemoteInputWorker {
     now_fn: NowFn,
     bus_root_override: Option<PathBuf>,
     injector: Arc<dyn SeatInputInjector>,
+    /// Exact-body capability verifier for the privileged uinput handoff.
+    /// Missing production credentials install a fail-closed verifier.
+    authorizer: Arc<ActionAuthorizer>,
     status: RemoteInputStatus,
     /// Current arm/consent grant, if the seat is armed for remote input.
     arm: Option<ArmState>,
@@ -357,6 +368,7 @@ impl SeatRemoteInputWorker {
             now_fn,
             bus_root_override: None,
             injector,
+            authorizer: Arc::new(ActionAuthorizer::production()),
             status: RemoteInputStatus {
                 node,
                 state: "idle".to_owned(),
@@ -401,6 +413,14 @@ impl SeatRemoteInputWorker {
         self
     }
 
+    /// Override the capability verifier for deterministic hostile-wire tests.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
+        self.authorizer = authorizer;
+        self
+    }
+
     fn now_ms(&self) -> u64 {
         (self.now_fn)()
     }
@@ -416,8 +436,16 @@ impl SeatRemoteInputWorker {
         for msg in msgs {
             self.cursor = Some(msg.ulid.clone());
             let body = msg.body.unwrap_or_default();
+            if !crate::ipc::body_within_cap(Some(&body)) {
+                self.status.rejected = self.status.rejected.saturating_add(1);
+                self.status.state = "error".to_owned();
+                self.status.last_error = Some("remote-input request body too large".to_owned());
+                self.status.updated_ms = self.now_ms();
+                self.publish_status(persist);
+                continue;
+            }
             match parse_request(&body, &msg.ulid) {
-                Ok(request) => self.apply_request(persist, request),
+                Ok(request) => self.apply_request(persist, request, &body),
                 Err(e) => {
                     self.status.rejected = self.status.rejected.saturating_add(1);
                     self.status.state = "error".to_owned();
@@ -429,7 +457,7 @@ impl SeatRemoteInputWorker {
         }
     }
 
-    fn apply_request(&mut self, persist: &Persist, request: RemoteInputRequest) {
+    fn apply_request(&mut self, persist: &Persist, request: RemoteInputRequest, body: &str) {
         let now = self.now_ms();
 
         // security-7 consent gate: injection is refused unless the seated user
@@ -465,6 +493,23 @@ impl SeatRemoteInputWorker {
                 );
                 return;
             }
+        }
+
+        // The Bus spool is intentionally writable across UIDs. Pairing and the
+        // seated-user arm are useful safety signals, but neither is an
+        // administrative identity. Require the root-only, exact-body capability
+        // before the request reaches the root/uinput injector. The request's
+        // phone is part of the semantic target as well as the canonical body
+        // digest, so a token for one paired device cannot authorize another.
+        let context = MutationContext {
+            verb: REMOTE_INPUT_AUTH_VERB,
+            node: &self.node,
+            target: &request.phone,
+        };
+        if let Err(reason) = self.authorizer.authorize(body, context) {
+            let reason = format!("remote-input authorization refused: {reason}");
+            self.record_drop(persist, &request, now, "dropped_unauthorized", &reason);
+            return;
         }
 
         self.status.accepted = self.status.accepted.saturating_add(1);
@@ -948,7 +993,12 @@ mod tests {
     use mde_bus::hooks::config::Priority;
     use mde_bus::persist::Persist;
 
+    use crate::ipc::action_auth::{authorize_test_body, MutationContext};
+
     use super::*;
+
+    const AUTH_KEY: &[u8] = b"seat-remote-input-test-key";
+    const AUTH_NOW: i64 = 1_000;
 
     #[derive(Default)]
     struct RecordingInjector {
@@ -1015,6 +1065,35 @@ mod tests {
             "ts_unix_ms": 12345_u64,
         })
         .to_string()
+    }
+
+    fn test_authorizer(root: &std::path::Path) -> Arc<ActionAuthorizer> {
+        Arc::new(ActionAuthorizer::for_test(
+            AUTH_KEY,
+            root.join("auth"),
+            AUTH_NOW,
+        ))
+    }
+
+    fn signed_body(node: &str, raw: &str, nonce: &str, expires_at_ms: i64) -> String {
+        let mut value: serde_json::Value = serde_json::from_str(raw).expect("request JSON");
+        value["schema_version"] = serde_json::json!(crate::ipc::action_auth::ACTION_SCHEMA_VERSION);
+        let unsigned = value.to_string();
+        authorize_test_body(
+            AUTH_KEY,
+            &unsigned,
+            MutationContext {
+                verb: REMOTE_INPUT_AUTH_VERB,
+                node,
+                target: "phone-1",
+            },
+            nonce,
+            expires_at_ms,
+        )
+    }
+
+    fn signed_move_body(node: &str, nonce: &str) -> String {
+        signed_body(node, &move_body(), nonce, AUTH_NOW + 30_000)
     }
 
     #[test]
@@ -1102,11 +1181,13 @@ mod tests {
         let persist = Persist::open(bus.path().to_path_buf()).expect("persist");
         let injector = Arc::new(RecordingInjector::default());
         let mut worker = SeatRemoteInputWorker::with_injector("node-a".into(), injector.clone())
-            .with_now_fn(Arc::new(|| 777));
+            .with_now_fn(Arc::new(|| 777))
+            .with_authorizer(test_authorizer(bus.path()));
         worker.arm = live_arm();
-        let request = parse_request(&move_body(), "req-1").expect("request");
+        let body = signed_move_body("node-a", "apply-request-1");
+        let request = parse_request(&body, "req-1").expect("request");
 
-        worker.apply_request(&persist, request);
+        worker.apply_request(&persist, request, &body);
 
         assert_eq!(
             *injector.calls.lock().unwrap(),
@@ -1146,11 +1227,13 @@ mod tests {
             error: Some(InputInjectError::Unavailable("no helper".into())),
         });
         let mut worker = SeatRemoteInputWorker::with_injector("node-a".into(), injector)
-            .with_now_fn(Arc::new(|| 888));
+            .with_now_fn(Arc::new(|| 888))
+            .with_authorizer(test_authorizer(bus.path()));
         worker.arm = live_arm();
-        let request = parse_request(&move_body(), "req-1").expect("request");
+        let body = signed_move_body("node-a", "unavailable-1");
+        let request = parse_request(&body, "req-1").expect("request");
 
-        worker.apply_request(&persist, request);
+        worker.apply_request(&persist, request, &body);
 
         assert_eq!(worker.status.state, "unavailable");
         assert_eq!(worker.status.failed, 1);
@@ -1178,12 +1261,14 @@ mod tests {
                 Some(r#"{"op":"wrong"}"#),
             )
             .expect("write bad");
+        let body = signed_move_body("node-a", "drain-1");
         persist
-            .write(ACTION_TOPIC, Priority::Default, None, Some(&move_body()))
+            .write(ACTION_TOPIC, Priority::Default, None, Some(&body))
             .expect("write good");
         let injector = Arc::new(RecordingInjector::default());
         let mut worker = SeatRemoteInputWorker::with_injector("node-a".into(), injector)
-            .with_now_fn(Arc::new(|| 999));
+            .with_now_fn(Arc::new(|| 999))
+            .with_authorizer(test_authorizer(bus.path()));
         // Armed so the well-formed request is dispatched (not consent-dropped),
         // keeping this test focused on malformed-rejection + no-replay.
         worker.arm = live_arm();
@@ -1239,12 +1324,14 @@ mod tests {
         persist
             .write(ARM_TOPIC, Priority::Default, None, Some(&arm_body(60_000)))
             .expect("write arm");
+        let body = signed_move_body("node-a", "armed-1");
         persist
-            .write(ACTION_TOPIC, Priority::Default, None, Some(&move_body()))
+            .write(ACTION_TOPIC, Priority::Default, None, Some(&body))
             .expect("write injection");
         let injector = Arc::new(RecordingInjector::default());
         let mut worker = SeatRemoteInputWorker::with_injector("node-a".into(), injector.clone())
-            .with_now_fn(Arc::new(|| 1000));
+            .with_now_fn(Arc::new(|| 1000))
+            .with_authorizer(test_authorizer(bus.path()));
 
         worker.tick_once(&mut persist);
 
@@ -1258,20 +1345,98 @@ mod tests {
     }
 
     #[test]
+    fn hostile_handoffs_never_reach_uinput() {
+        let bus = tempfile::tempdir().expect("bus");
+        let mut persist = Persist::open(bus.path().to_path_buf()).expect("persist");
+        let unsigned = {
+            let mut value: serde_json::Value = serde_json::from_str(&move_body()).unwrap();
+            value["schema_version"] =
+                serde_json::json!(crate::ipc::action_auth::ACTION_SCHEMA_VERSION);
+            value.to_string()
+        };
+        let expired = signed_body("node-a", &move_body(), "expired-1", AUTH_NOW - 1);
+        let valid = signed_move_body("node-a", "replay-1");
+        let mut tampered_value: serde_json::Value = serde_json::from_str(&valid).unwrap();
+        tampered_value["dx"] = serde_json::json!(99.0);
+        let tampered = tampered_value.to_string();
+
+        for body in [&unsigned, &expired, &valid, &valid, &tampered] {
+            persist
+                .write(ACTION_TOPIC, Priority::Default, None, Some(body))
+                .expect("write hostile handoff");
+        }
+
+        let injector = Arc::new(RecordingInjector::default());
+        let mut worker = SeatRemoteInputWorker::with_injector("node-a".into(), injector.clone())
+            .with_now_fn(Arc::new(|| AUTH_NOW as u64))
+            .with_authorizer(test_authorizer(bus.path()));
+        worker.arm = live_arm();
+        worker.tick_once(&mut persist);
+
+        assert_eq!(
+            worker.status.accepted, 1,
+            "only the first valid handoff applies"
+        );
+        assert_eq!(worker.status.injected, 1);
+        assert_eq!(worker.status.dropped, 4);
+        assert_eq!(
+            injector.calls.lock().unwrap().len(),
+            1,
+            "unsigned, expired, replayed, and body-tampered rows never reach uinput"
+        );
+        let events = persist
+            .list_since("event/seat-remote-input/node-a", None)
+            .expect("audit events");
+        let errors: Vec<String> = events
+            .iter()
+            .filter_map(|row| row.body.as_deref())
+            .filter_map(|body| serde_json::from_str::<serde_json::Value>(body).ok())
+            .filter_map(|body| body["error"].as_str().map(str::to_owned))
+            .collect();
+        assert!(errors.iter().any(|e| e.contains("no armed token")));
+        assert!(errors.iter().any(|e| e.contains("expired")));
+        assert!(errors.iter().any(|e| e.contains("already used")));
+        assert!(errors.iter().any(|e| e.contains("request body")));
+    }
+
+    #[test]
+    fn oversized_handoff_is_rejected_before_json_parse() {
+        let bus = tempfile::tempdir().expect("bus");
+        let mut persist = Persist::open(bus.path().to_path_buf()).expect("persist");
+        let body = format!(
+            r#"{{"op":"kdc_remote_input","padding":"{}"}}"#,
+            "x".repeat(65_537)
+        );
+        persist
+            .write(ACTION_TOPIC, Priority::Default, None, Some(&body))
+            .expect("write oversized handoff");
+        let injector = Arc::new(RecordingInjector::default());
+        let mut worker = SeatRemoteInputWorker::with_injector("node-a".into(), injector.clone())
+            .with_now_fn(Arc::new(|| AUTH_NOW as u64))
+            .with_authorizer(test_authorizer(bus.path()));
+        worker.tick_once(&mut persist);
+        assert_eq!(worker.status.rejected, 1);
+        assert_eq!(worker.status.dropped, 0);
+        assert!(injector.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn arm_auto_disarms_after_ttl() {
         let bus = tempfile::tempdir().expect("bus");
         let mut persist = Persist::open(bus.path().to_path_buf()).expect("persist");
         let (clk, now_fn) = clock(1_000);
         let injector = Arc::new(RecordingInjector::default());
         let mut worker = SeatRemoteInputWorker::with_injector("node-a".into(), injector.clone())
-            .with_now_fn(now_fn);
+            .with_now_fn(now_fn)
+            .with_authorizer(test_authorizer(bus.path()));
 
         // Arm for 5s, then inject once inside the window -> delivered.
         persist
             .write(ARM_TOPIC, Priority::Default, None, Some(&arm_body(5_000)))
             .expect("write arm");
+        let body = signed_move_body("node-a", "ttl-1");
         persist
-            .write(ACTION_TOPIC, Priority::Default, None, Some(&move_body()))
+            .write(ACTION_TOPIC, Priority::Default, None, Some(&body))
             .expect("write injection 1");
         worker.tick_once(&mut persist);
         assert_eq!(worker.status.injected, 1);
@@ -1279,8 +1444,9 @@ mod tests {
 
         // Advance past the TTL, inject again -> auto-disarmed, dropped.
         clk.store(1_000 + 5_000 + 1, Ordering::SeqCst);
+        let body = signed_move_body("node-a", "ttl-2");
         persist
-            .write(ACTION_TOPIC, Priority::Default, None, Some(&move_body()))
+            .write(ACTION_TOPIC, Priority::Default, None, Some(&body))
             .expect("write injection 2");
         worker.tick_once(&mut persist);
 

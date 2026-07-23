@@ -220,9 +220,22 @@ _validate_scope() { # <selector>
 # Empty when neither env is set — an untagged node only takes part in whole-mesh
 # seals. Public data only (role + capability names), never a secret.
 _node_tags() {
-  local out="" s
-  if [ -n "${MCNF_NODE_ROLE:-}" ]; then
-    out="role:$(printf %s "$MCNF_NODE_ROLE" | tr '[:upper:]' '[:lower:]')"
+  local out="" s role scope
+  role="$(printf %s "${MCNF_NODE_ROLE:-}" | tr '[:upper:]' '[:lower:]')"
+  if [ "$role" = lighthouse ] && [ -n "${MCNF_NODE_SCOPES:-}" ]; then
+    for s in $(printf '%s' "$MCNF_NODE_SCOPES" | tr ',' ' '); do
+      [ -n "$s" ] || continue
+      scope="$(printf %s "$s" | tr '[:upper:]' '[:lower:]')"
+      case "$scope" in
+        media|fileshare|file_share|file-sharing|filesharing)
+          echo "mcnf-secret: thin lighthouse cannot advertise media/fileshare scope '$s'" >&2
+          return 2
+          ;;
+      esac
+    done
+  fi
+  if [ -n "$role" ]; then
+    out="role:$role"
   fi
   if [ -n "${MCNF_NODE_SCOPES:-}" ]; then
     for s in $(printf '%s' "$MCNF_NODE_SCOPES" | tr ',' ' '); do
@@ -284,6 +297,10 @@ case "$cmd" in
     _resolve_etcd
     NODE_ID="${MCNF_NODE_ID:-$(hostname -s 2>/dev/null || hostname)}"
     [ -n "$NODE_ID" ] || { echo "init-self: could not determine node-id (set MCNF_NODE_ID)" >&2; exit 2; }
+    # Validate the thin-lighthouse role/scope policy before minting or
+    # publishing any identity material, so a rejected configuration leaves no
+    # partially registered node behind.
+    TAGS="$(_node_tags)"
     if [ ! -f "$KEY" ]; then
       (umask 077; age-keygen -o "$KEY" 2>/dev/null)
       echo "init-self: minted a fresh age identity at $KEY (0600)"
@@ -301,7 +318,6 @@ case "$cmd" in
     # capability names), never secret; an untagged node only receives whole-mesh
     # seals. Re-publishes on every idempotent re-run (drops the key if the envs
     # are now unset).
-    TAGS="$(_node_tags)"
     if [ -n "$TAGS" ]; then
       _put "/mcnf/node-tags/$NODE_ID" "$(printf %s "$TAGS" | b64)"
       echo "init-self: published tags for '$NODE_ID': $(printf %s "$TAGS" | tr '\n' ',' | sed 's/,$//')"
@@ -637,20 +653,34 @@ case "$cmd" in
     op_key="$work/op-key"
     run env MCNF_AGE_KEY="$op_key" bash "$0" init
 
-    # Three nodes, each minting its OWN identity + publishing role/scope tags:
-    #   lh1  role:lighthouse            med  role:lighthouse + scope:media
-    #   ws1  role:workstation
+    # Four nodes, each minting its OWN identity + publishing role/scope tags:
+    #   lh1/lh2  role:lighthouse         med  role:workstation + scope:media
+    #   ws1      role:workstation
     lh_key="$work/lh-key"
     run env MCNF_AGE_KEY="$lh_key" MCNF_NODE_ID=lh1 MCNF_NODE_ROLE=lighthouse bash "$0" init-self
+    lh2_key="$work/lh2-key"
+    run env MCNF_AGE_KEY="$lh2_key" MCNF_NODE_ID=lh2 MCNF_NODE_ROLE=lighthouse bash "$0" init-self
     med_key="$work/med-key"
-    run env MCNF_AGE_KEY="$med_key" MCNF_NODE_ID=med MCNF_NODE_ROLE=lighthouse MCNF_NODE_SCOPES=media bash "$0" init-self
+    run env MCNF_AGE_KEY="$med_key" MCNF_NODE_ID=med MCNF_NODE_ROLE=workstation MCNF_NODE_SCOPES=media bash "$0" init-self
     ws_key="$work/ws-key"
     run env MCNF_AGE_KEY="$ws_key" MCNF_NODE_ID=ws1 MCNF_NODE_ROLE=workstation bash "$0" init-self
+
+    # Thin-lighthouse policy — a lighthouse may not publish media/fileshare
+    # capability tags, and rejection happens before any identity is registered.
+    bad_lh_key="$work/bad-lh-key"
+    for forbidden_scope in media fileshare file_share file-sharing filesharing; do
+      rc=0
+      run env MCNF_AGE_KEY="$bad_lh_key" MCNF_NODE_ID="bad-lh-$forbidden_scope" \
+        MCNF_NODE_ROLE=lighthouse MCNF_NODE_SCOPES="$forbidden_scope" bash "$0" init-self || rc=$?
+      [ "$rc" -ne 0 ] \
+        && pass "lighthouse + $forbidden_scope scope is refused before registration" \
+        || bad "lighthouse + $forbidden_scope scope was accepted"
+    done
 
     # (1)+(2) role:lighthouse — seal, then LH keys decrypt, the WS key FAILS.
     printf %s "$SECRET_VALUE" | run env MCNF_AGE_KEY="$op_key" bash "$0" put do-token-lh --scope role:lighthouse
     [ "$(dec "$lh_key" do-token-lh)" = "$SECRET_VALUE" ] && pass "role:lighthouse secret decrypts with a lighthouse key (role-match-decrypts)" || bad "lighthouse key could not decrypt a role:lighthouse secret"
-    [ "$(dec "$med_key" do-token-lh)" = "$SECRET_VALUE" ] && pass "role:lighthouse secret also decrypts with the media-lighthouse key" || bad "media-lighthouse key could not decrypt a role:lighthouse secret"
+    [ "$(dec "$lh2_key" do-token-lh)" = "$SECRET_VALUE" ] && pass "role:lighthouse secret also decrypts with a second thin-lighthouse key" || bad "second lighthouse key could not decrypt a role:lighthouse secret"
     if [ -n "$(dec "$ws_key" do-token-lh)" ]; then bad "workstation-only key COULD decrypt a role:lighthouse secret (role-mismatch-fails)"; else pass "workstation-only key CANNOT decrypt a role:lighthouse secret (role-mismatch-fails)"; fi
 
     # (3) whole-mesh default — unscoped put reaches BOTH a lighthouse and the ws.
@@ -661,24 +691,23 @@ case "$cmd" in
       bad "whole-mesh default did not reach all nodes"
     fi
 
-    # (4) scope:media — only the media-tagged node decrypts; a plain lighthouse does not.
-    printf %s "$SECRET_VALUE" | run env MCNF_AGE_KEY="$op_key" bash "$0" put do-token-media --scope scope:media
-    [ "$(dec "$med_key" do-token-media)" = "$SECRET_VALUE" ] && pass "scope:media secret decrypts with the media-tagged node" || bad "media node could not decrypt a scope:media secret"
-    if [ -n "$(dec "$lh_key" do-token-media)" ]; then bad "plain lighthouse COULD decrypt a scope:media secret (should not)"; else pass "plain-lighthouse key CANNOT decrypt a scope:media secret (scope excludes it)"; fi
-
-    # (5) scope-preserving rotate + reseal — the do-token-lh secret stays
-    #     lighthouse-only (never silently widened to the workstation). The reseal
-    #     runs as `med` (role:lighthouse + scope:media): the one node that is a
-    #     recipient of ALL three secrets, so it can decrypt+re-seal each (a scoped
-    #     bulk reseal requires the resealer to be a recipient of every secret — the
-    #     live 2-node reseal tail is parked).
+    # (4) scope-preserving rotate + reseal — the do-token-lh secret stays
+    #     lighthouse-only (never silently widened to the workstation). Run the
+    #     reseal before creating the separate scope:media secret: no one node
+    #     should need both role roots and a media capability root.
     NEW_VALUE="do-token-lh-ROTATED-$RANDOM"
     printf %s "$NEW_VALUE" | run env MCNF_AGE_KEY="$lh_key" bash "$0" rotate do-token-lh
     [ "$(dec "$lh_key" do-token-lh)" = "$NEW_VALUE" ] && pass "rotate (no --scope) preserved the value + lighthouse scope" || bad "rotate did not preserve the scoped secret for the lighthouse key"
     if [ -n "$(dec "$ws_key" do-token-lh)" ]; then bad "rotate silently WIDENED a scoped secret to the workstation"; else pass "rotate kept the scoped secret out of the workstation's reach"; fi
-    run env MCNF_AGE_KEY="$med_key" bash "$0" reseal-all
+    run env MCNF_AGE_KEY="$lh2_key" bash "$0" reseal-all
     [ "$(dec "$lh_key" do-token-lh)" = "$NEW_VALUE" ] && pass "bulk reseal-all kept the scoped secret readable by its lighthouse recipients" || bad "bulk reseal-all lost the scoped secret for the lighthouse key"
     if [ -n "$(dec "$ws_key" do-token-lh)" ]; then bad "bulk reseal-all WIDENED a scoped secret to the workstation"; else pass "bulk reseal-all preserved the scoped secret's blast radius"; fi
+
+    # (5) scope:media — only the explicitly tagged non-lighthouse media host
+    # decrypts; thin lighthouses cannot carry this capability.
+    printf %s "$SECRET_VALUE" | run env MCNF_AGE_KEY="$op_key" bash "$0" put do-token-media --scope scope:media
+    [ "$(dec "$med_key" do-token-media)" = "$SECRET_VALUE" ] && pass "scope:media secret decrypts with the media-tagged host" || bad "media host could not decrypt a scope:media secret"
+    if [ -n "$(dec "$lh_key" do-token-media)" ]; then bad "plain lighthouse COULD decrypt a scope:media secret (should not)"; else pass "plain-lighthouse key CANNOT decrypt a scope:media secret (scope excludes it)"; fi
 
     # (6) --scope matching no node is refused, and writes nothing.
     rc=0; printf %s "$SECRET_VALUE" | run env MCNF_AGE_KEY="$op_key" bash "$0" put do-token-none --scope role:relay || rc=$?

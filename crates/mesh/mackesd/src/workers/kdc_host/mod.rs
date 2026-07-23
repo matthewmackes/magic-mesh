@@ -90,7 +90,10 @@ use super::{ShutdownToken, Worker};
 // of typed cloud requests + reader of the typed reply; the cloud backend that
 // answers them is provided by a later local-first worker. The neutral wire shapes
 // live in `mackes_mesh_types::cloud` (§6 — neither side depends on the other).
-use mackes_mesh_types::cloud::{cloud_action_topic, CloudInstance, CloudReply, LifecycleAction};
+use mackes_mesh_types::cloud::{
+    cloud_action_topic, cloud_request_digest, CloudArmSigner, CloudArmedToken, CloudInstance,
+    CloudReply, LifecycleAction,
+};
 
 // ARCH: this worker was split out of a 5.3K-line god-file into a directory
 // module (behavior-preserving relocation). The `Worker` impl + the public entry
@@ -133,6 +136,13 @@ const DEVICES_TOPIC: &str = "action/connect/devices";
 /// KDC-MESH-6 — handoff lane for phone-originated remote input. The KDC worker
 /// parses/authorizes KDE Connect packets; a later seat worker owns evdev/uinput.
 const REMOTE_INPUT_TOPIC: &str = "action/seat/remote-input";
+
+/// The exact capability verb bound to each phone-originated seat handoff.
+/// `seat_remote_input` verifies this before invoking the root/uinput helper.
+const REMOTE_INPUT_AUTH_VERB: &str = crate::workers::seat_remote_input::REMOTE_INPUT_AUTH_VERB;
+
+/// A phone handoff capability is intentionally short-lived and single-use.
+const REMOTE_INPUT_AUTH_TTL_MS: i64 = 30_000;
 
 /// Per-packet event cap so one buggy phone packet cannot flood the local Bus lane
 /// before the seat injector has its own backpressure.
@@ -550,9 +560,26 @@ fn publish_kdc_alert(summary: &str, severity: &str) {
 }
 
 fn publish_kdc_remote_input_events(peer: &PeerId, events: &[MousepadEvent]) -> usize {
+    use rand::RngCore as _;
+
     if events.is_empty() {
         return 0;
     }
+    // The mackesd service is the only production producer: it can mint a
+    // short-lived capability from the root-only systemd credential. If that
+    // credential is unavailable, publish nothing rather than creating a Bus
+    // row that the seat consumer must (correctly) reject.
+    let signer = match production_cloud_arm_signer() {
+        Ok(signer) => signer,
+        Err(error) => {
+            warn!(
+                target: "mackesd::kdc_host",
+                %error,
+                "remote-input authorization unavailable; dropping phone handoff"
+            );
+            return 0;
+        }
+    };
     let Some(dir) = mde_bus::default_data_dir() else {
         return 0;
     };
@@ -560,9 +587,37 @@ fn publish_kdc_remote_input_events(peer: &PeerId, events: &[MousepadEvent]) -> u
         return 0;
     };
     let ts_ms = now_ms();
+    let node = remote_input_node_id();
     let mut published = 0;
     for event in events.iter().take(REMOTE_INPUT_EVENT_CAP) {
-        let body = kdc_remote_input_body(peer, event, ts_ms).to_string();
+        // A distinct nonce per event prevents one copied Bus row from being
+        // replayed after the legitimate consumer has accepted a sibling event.
+        let mut nonce = [0_u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        let nonce = nonce
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let unsigned = kdc_remote_input_body(peer, event, ts_ms).to_string();
+        let body = match authorize_remote_input_body_with_signer(
+            &signer,
+            &node,
+            peer.as_str(),
+            &unsigned,
+            ts_ms,
+            &nonce,
+        ) {
+            Ok(body) => body,
+            Err(error) => {
+                warn!(
+                    target: "mackesd::kdc_host",
+                    phone = %peer.as_str(),
+                    %error,
+                    "remote-input handoff authorization failed"
+                );
+                break;
+            }
+        };
         if persist
             .write(REMOTE_INPUT_TOPIC, Priority::Default, None, Some(&body))
             .is_ok()
@@ -571,6 +626,52 @@ fn publish_kdc_remote_input_events(peer: &PeerId, events: &[MousepadEvent]) -> u
         }
     }
     published
+}
+
+/// Add the schema and exact-body HMAC capability to one already-sanitized
+/// phone handoff. This pure signing seam mirrors the shared
+/// [`ActionAuthorizer`] verifier and is intentionally testable without a live
+/// systemd credential.
+fn authorize_remote_input_body_with_signer(
+    signer: &CloudArmSigner,
+    node: &str,
+    phone: &str,
+    body: &str,
+    now_ms: i64,
+    nonce: &str,
+) -> Result<String, String> {
+    for (label, value) in [("node", node), ("phone", phone), ("nonce", nonce)] {
+        if value.is_empty() || value.len() > 255 || value.contains('|') {
+            return Err(format!(
+                "remote-input authorization {label} is not capability-safe"
+            ));
+        }
+    }
+    let mut document: Value = serde_json::from_str(body)
+        .map_err(|error| format!("build remote-input request: {error}"))?;
+    let object = document
+        .as_object_mut()
+        .ok_or_else(|| "remote-input request must be a JSON object".to_string())?;
+    if object.contains_key("armed_token") {
+        return Err("remote-input request already contains an armed token".to_string());
+    }
+    object.insert(
+        "schema_version".to_string(),
+        json!(crate::ipc::action_auth::ACTION_SCHEMA_VERSION),
+    );
+    let unsigned = document.to_string();
+    let token = CloudArmedToken::mint(
+        signer,
+        nonce,
+        now_ms.saturating_add(REMOTE_INPUT_AUTH_TTL_MS),
+        REMOTE_INPUT_AUTH_VERB,
+        node,
+        phone,
+        &cloud_request_digest(&unsigned).map_err(str::to_string)?,
+    )
+    .encode();
+    document["armed_token"] = Value::String(token);
+    Ok(document.to_string())
 }
 
 fn kdc_remote_input_body(peer: &PeerId, event: &MousepadEvent, ts_ms: i64) -> Value {
@@ -2138,6 +2239,19 @@ fn hostname_for_shunt() -> String {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// The node identity used by `mackesd` worker registration and the seat
+/// consumer. Keep the `peer:` prefix (and the operator override) in the
+/// capability context; the shunt's bare filename host is not the Bus node id.
+fn remote_input_node_id() -> String {
+    if let Ok(value) = std::env::var("MACKESD_NODE_ID") {
+        let value = value.trim();
+        if !value.is_empty() {
+            return value.to_owned();
+        }
+    }
+    format!("peer:{}", hostname_for_shunt())
 }
 
 /// Wall-clock milliseconds since the epoch (roster freshness stamps +

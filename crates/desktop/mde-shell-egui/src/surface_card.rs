@@ -337,6 +337,7 @@ struct ApplyResult {
 /// only on the reboot-arming call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct EnableRequest {
+    schema_version: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     arm_token: Option<String>,
 }
@@ -344,6 +345,7 @@ struct EnableRequest {
 /// Mirror of the worker's `FwApplyRequest`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct FwApplyRequest {
+    schema_version: u64,
     device_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     arm_token: Option<String>,
@@ -644,6 +646,33 @@ impl SurfaceCardState {
 
     // ─────────────────────────── Install tab ───────────────────────────
 
+    /// Publish a schema-v1, exact-body-authorized `surface-enable` request.
+    /// The daemon still enforces the typed MOK token separately; this HMAC
+    /// capability only proves that the root shell minted this exact action.
+    fn publish_enable_action(&mut self, arm_token: Option<String>, note: &str) {
+        let unsigned = serde_json::to_string(&EnableRequest {
+            schema_version: 1,
+            arm_token,
+        })
+        .unwrap_or_default();
+        let Some(node) = self.node.as_deref().filter(|node| !node.trim().is_empty()) else {
+            self.last_error = Some("Surface enable authorization has no target node.".to_string());
+            return;
+        };
+        let body =
+            match crate::iac::authorize_root_mutation_body(&unsigned, "surface-enable", node, node)
+            {
+                Ok(body) => body,
+                Err(error) => {
+                    self.last_error =
+                        Some(format!("Surface enable authorization unavailable: {error}"));
+                    return;
+                }
+            };
+        let topic = self.action_topic(enable_action_topic);
+        self.publish(&topic, &body, note);
+    }
+
     fn show_install(&mut self, ui: &mut egui::Ui) {
         // Activate / enable — the surface_enable verb (no arm token).
         ui.horizontal(|ui| {
@@ -651,12 +680,8 @@ impl SurfaceCardState {
                 .button(RichText::new("Activate / enable").size(Style::BODY))
                 .clicked()
             {
-                let body =
-                    serde_json::to_string(&EnableRequest { arm_token: None }).unwrap_or_default();
-                let topic = self.action_topic(enable_action_topic);
-                self.publish(
-                    &topic,
-                    &body,
+                self.publish_enable_action(
+                    None,
                     "Enable requested \u{2014} the node is running it\u{2026}",
                 );
             }
@@ -816,14 +841,8 @@ impl SurfaceCardState {
                 )
                 .clicked()
             {
-                let body = serde_json::to_string(&EnableRequest {
-                    arm_token: Some(arm_token.to_string()),
-                })
-                .unwrap_or_default();
-                let topic = self.action_topic(enable_action_topic);
-                self.publish(
-                    &topic,
-                    &body,
+                self.publish_enable_action(
+                    Some(arm_token.to_string()),
                     "Reboot armed \u{2014} the node will reboot to enroll.",
                 );
                 self.mok_arm_input.clear();
@@ -942,11 +961,26 @@ impl SurfaceCardState {
                 )
                 .clicked()
             {
-                let body = serde_json::to_string(&FwApplyRequest {
+                let unsigned = serde_json::to_string(&FwApplyRequest {
+                    schema_version: 1,
                     device_id: device_id.to_string(),
                     arm_token: Some(FW_ARM_TOKEN.to_string()),
                 })
                 .unwrap_or_default();
+                let node = self.node.as_deref().unwrap_or_default();
+                let body = match crate::iac::authorize_root_mutation_body(
+                    &unsigned,
+                    "surface-firmware-apply",
+                    node,
+                    device_id.trim(),
+                ) {
+                    Ok(body) => body,
+                    Err(error) => {
+                        self.last_error =
+                            Some(format!("Firmware apply authorization unavailable: {error}"));
+                        return;
+                    }
+                };
                 let topic = self.action_topic(fw_apply_action_topic);
                 self.publish(
                     &topic,
@@ -1444,25 +1478,51 @@ mod tests {
     fn enable_request_serialises_to_the_worker_wire_shape() {
         // Activate (no arm) omits arm_token; the reboot-arming call carries it.
         assert_eq!(
-            serde_json::to_string(&EnableRequest { arm_token: None }).unwrap(),
-            "{}"
+            serde_json::to_string(&EnableRequest {
+                schema_version: 1,
+                arm_token: None,
+            })
+            .unwrap(),
+            r#"{"schema_version":1}"#
         );
         assert_eq!(
             serde_json::to_string(&EnableRequest {
+                schema_version: 1,
                 arm_token: Some(MOK_ARM_TOKEN.to_string())
             })
             .unwrap(),
-            r#"{"arm_token":"REBOOT-TO-ENROLL-MOK"}"#
+            r#"{"schema_version":1,"arm_token":"REBOOT-TO-ENROLL-MOK"}"#
         );
         // fw-apply carries the device id + the firmware arm token.
         assert_eq!(
             serde_json::to_string(&FwApplyRequest {
+                schema_version: 1,
                 device_id: "dev-uefi".to_string(),
                 arm_token: Some(FW_ARM_TOKEN.to_string())
             })
             .unwrap(),
-            r#"{"device_id":"dev-uefi","arm_token":"APPLY-SURFACE-FIRMWARE"}"#
+            r#"{"schema_version":1,"device_id":"dev-uefi","arm_token":"APPLY-SURFACE-FIRMWARE"}"#
         );
+    }
+
+    #[test]
+    fn enable_publisher_mints_exact_body_capability() {
+        let unsigned = serde_json::to_string(&EnableRequest {
+            schema_version: 1,
+            arm_token: None,
+        })
+        .unwrap();
+        let signed = crate::iac::authorize_root_mutation_body(
+            &unsigned,
+            "surface-enable",
+            "this-node",
+            "this-node",
+        )
+        .expect("test mint seam");
+        let body: serde_json::Value = serde_json::from_str(&signed).unwrap();
+        assert_eq!(body["schema_version"], serde_json::json!(1));
+        assert!(body["armed_token"].as_str().is_some());
+        assert_eq!(body["arm_token"], serde_json::Value::Null);
     }
 
     #[test]

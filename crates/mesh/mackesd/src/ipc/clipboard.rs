@@ -6,11 +6,12 @@
 //!
 //! Verbs (design `docs/design/notify-hub-redesign.md` O5/O7):
 //!   * `list`   — no body; reply `{ "ok": true, "entries": [ClipEntry] }`.
-//!   * `pin`    — body is an entry id (plain); O7 mark it pinned (exempt
+//!   * `pin`    — body is an authorized JSON envelope carrying an entry id;
+//!     O7 mark it pinned (exempt
 //!     from the 50-cap + a clear, unlimited).
-//!   * `unpin`  — body is an entry id; clear the pin (re-subject to the cap).
-//!   * `delete` — body is an entry id; drop that one entry mesh-wide.
-//!   * `clear`  — no body; O5 mesh-wide clear — drop every UNPINNED entry,
+//!   * `unpin`  — authorized JSON entry id; clear the pin (re-subject to the cap).
+//!   * `delete` — authorized JSON entry id; drop that one entry mesh-wide.
+//!   * `clear`  — authorized JSON body; O5 mesh-wide clear — drop every UNPINNED entry,
 //!     pinned survive everywhere.
 //!
 //! Same dedicated-OS-thread responder shape as Connect/Route (the history
@@ -18,11 +19,14 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_bus::rpc::reply_topic;
 use serde_json::json;
+
+use super::action_auth::{ActionAuthorizer, MutationContext};
 
 use crate::workers::clipboard_sync::{
     history_path, read_history, trim_unpinned, write_history, History, HISTORY_CAP,
@@ -33,13 +37,25 @@ use crate::workers::clipboard_sync::{
 #[derive(Debug, Clone)]
 pub struct ClipboardService {
     workgroup_root: PathBuf,
+    authorizer: Arc<ActionAuthorizer>,
 }
 
 impl ClipboardService {
     /// Build the service rooted at the shared workgroup root.
     #[must_use]
     pub fn new(workgroup_root: PathBuf) -> Self {
-        Self { workgroup_root }
+        Self {
+            workgroup_root,
+            authorizer: Arc::new(ActionAuthorizer::production()),
+        }
+    }
+
+    /// Inject an isolated verifier and replay ledger for hostile responder tests.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
+        self.authorizer = authorizer;
+        self
     }
 }
 
@@ -140,6 +156,61 @@ pub fn build_reply(svc: &ClipboardService, verb: &str, req_body: Option<&str>) -
     }
 }
 
+/// Prepare a mutating clipboard request for the legacy pure handler. The
+/// original JSON body remains the exact-body authorization input; only the
+/// handler-facing entry id is returned after authorization succeeds.
+fn mutation_request(
+    verb: &str,
+    req_body: Option<&str>,
+) -> Result<(String, Option<String>), String> {
+    if !matches!(verb, "pin" | "unpin" | "delete" | "clear") {
+        return Err(format!("{verb}: not a clipboard mutation"));
+    }
+    let body = req_body.ok_or_else(|| format!("{verb}: missing request body"))?;
+    let request: serde_json::Value =
+        serde_json::from_str(body).map_err(|_| format!("{verb}: request body must be JSON"))?;
+    let object = request
+        .as_object()
+        .ok_or_else(|| format!("{verb}: request body must be an object"))?;
+    if matches!(verb, "pin" | "unpin" | "delete") {
+        let id = object
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| format!("{verb}: missing `id`"))?;
+        Ok((format!("entry:{id}"), Some(id.to_string())))
+    } else {
+        Ok(("all-unpinned".to_string(), None))
+    }
+}
+
+/// Gate a clipboard mutation before it can load or write the shared history.
+/// The read-only `list` verb intentionally remains unauthenticated.
+fn build_authorized_reply(svc: &ClipboardService, verb: &str, req_body: Option<&str>) -> String {
+    if !matches!(verb, "pin" | "unpin" | "delete" | "clear") {
+        return build_reply(svc, verb, req_body);
+    }
+    let (target, handler_body) = match mutation_request(verb, req_body) {
+        Ok(prepared) => prepared,
+        Err(error) => return json!({ "error": error }).to_string(),
+    };
+    let auth_verb = format!("clipboard-{verb}");
+    let context = MutationContext {
+        verb: &auth_verb,
+        node: "clipboard",
+        target: &target,
+    };
+    if let Err(error) = svc
+        .authorizer
+        .authorize(req_body.expect("mutation request has a body"), context)
+    {
+        tracing::warn!(target: "mackesd::clipboard", verb, %error, "refused unauthorized clipboard mutation");
+        return json!({ "error": format!("{verb}: authorization refused: {error}") }).to_string();
+    }
+    build_reply(svc, verb, handler_body.as_deref())
+}
+
 /// Run the clipboard Bus responder loop on the current thread until `should_stop`.
 pub fn serve_bus<F: Fn() -> bool>(persist: &Persist, svc: &ClipboardService, should_stop: F) {
     let mut cursors: HashMap<String, String> = HashMap::new();
@@ -164,7 +235,7 @@ pub fn poll_once(persist: &Persist, svc: &ClipboardService, cursors: &mut HashMa
         for msg in msgs {
             cursors.insert(topic.clone(), msg.ulid.clone());
             let reply = if crate::ipc::body_within_cap(msg.body.as_deref()) {
-                build_reply(svc, verb, msg.body.as_deref())
+                build_authorized_reply(svc, verb, msg.body.as_deref())
             } else {
                 crate::ipc::body_too_large_reply(verb)
             };
@@ -183,7 +254,11 @@ pub fn poll_once(persist: &Persist, svc: &ClipboardService, cursors: &mut HashMa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::action_auth::{authorize_test_body, ActionAuthorizer};
     use crate::workers::clipboard_sync::{apply_clip, clip_id};
+
+    const AUTH_KEY: &[u8] = b"clipboard-action-auth-test-key";
+    const AUTH_NOW: i64 = 1_700_000_000_000;
 
     fn svc() -> (tempfile::TempDir, ClipboardService) {
         let tmp = tempfile::tempdir().unwrap();
@@ -305,6 +380,64 @@ mod tests {
     fn unknown_verb_errors() {
         let (_t, s) = svc();
         assert!(build_reply(&s, "bogus", None).contains("unknown clipboard verb"));
+    }
+
+    fn authorized_service(root: &std::path::Path) -> ClipboardService {
+        ClipboardService::new(root.to_path_buf()).with_authorizer(Arc::new(
+            ActionAuthorizer::for_test(AUTH_KEY, root.join("auth"), AUTH_NOW),
+        ))
+    }
+
+    fn authorized_body(verb: &str, id: Option<&str>, nonce: &str) -> String {
+        let target = id.map_or_else(|| "all-unpinned".to_string(), |id| format!("entry:{id}"));
+        let auth_verb = format!("clipboard-{verb}");
+        let unsigned = match id {
+            Some(id) => format!(r#"{{"id":"{id}","schema_version":1}}"#),
+            None => r#"{"schema_version":1}"#.to_string(),
+        };
+        authorize_test_body(
+            AUTH_KEY,
+            &unsigned,
+            MutationContext {
+                verb: &auth_verb,
+                node: "clipboard",
+                target: &target,
+            },
+            nonce,
+            AUTH_NOW + 30_000,
+        )
+    }
+
+    #[test]
+    fn unsigned_clipboard_mutations_are_refused_before_history_io() {
+        let (tmp, s) = svc();
+        seed(&s, &["keep"]);
+        let id = clip_id("keep");
+        let gated = authorized_service(tmp.path());
+        let reply = build_authorized_reply(
+            &gated,
+            "delete",
+            Some(&format!(r#"{{"id":"{id}","schema_version":1}}"#)),
+        );
+        assert!(reply.contains("authorization refused"), "{reply}");
+        assert_eq!(read_history(&history_path(tmp.path())).entries.len(), 1);
+    }
+
+    #[test]
+    fn authorized_mutation_is_single_use_and_exact_body_bound() {
+        let (tmp, s) = svc();
+        seed(&s, &["drop"]);
+        let id = clip_id("drop");
+        let gated = authorized_service(tmp.path());
+        let body = authorized_body("delete", Some(&id), "clipboard-delete-once");
+        let first = build_authorized_reply(&gated, "delete", Some(&body));
+        assert!(first.contains("\"changed\":true"), "{first}");
+        assert!(read_history(&history_path(tmp.path())).entries.is_empty());
+        let replay = build_authorized_reply(&gated, "delete", Some(&body));
+        assert!(replay.contains("already used"), "{replay}");
+        let tampered = body.replace(&id, "other-entry");
+        assert!(build_authorized_reply(&gated, "delete", Some(&tampered))
+            .contains("authorization refused"));
     }
 
     /// CLIP-VIEW-1 producer↔consumer contract lock. The Hub's

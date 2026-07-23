@@ -25,8 +25,9 @@ instead of leaving closed work in this file.
   WL-FUNC-011 (blocked on real media/LLM resources).
 - **In flight:** WL-FUNC-012 live map feeds, WL-UX-006 Construct, and WL-UX-007
   Car. The 2026-07-23 thin-lighthouse policy is enforced in role pinning,
-  onboarding, install profiles, directory discovery, DNS, workers, and the
-  media helper guard; no new lighthouse may carry media or file-sharing duties.
+  onboarding, install profiles, directory discovery, DNS, workers, secret
+  scope minting, and both media helpers; no new lighthouse may carry media or
+  file-sharing duties.
 - **Externally blocked:** WL-FUNC-011 needs a real second media peer/SIP path
   plus an operator-sealed DigitalOcean model key; WL-SEC-006 needs a controlled
   live Nebula identity rotation/reconnect/prune drill.
@@ -317,7 +318,21 @@ These decisions refine acceptance and sequencing for the active items below.
   `action/apps/uninstall` root package-removal channel had no production
   publisher and has been deleted rather than grandfathered; the remaining apps
   responder suite is 18/18 farm-green, including the retired-uninstall
-  no-dispatch regression.
+  no-dispatch regression. The remaining privileged action inventory now also
+  covers the clipboard responder and phone-to-seat remote-input handoff:
+  clipboard mutations require a per-verb, exact-body capability before history
+  I/O, while the seat consumer verifies a node/phone-bound capability before
+  uinput and the KDC producer mints one nonce per event from the root-only
+  credential. Surface firmware apply now has the same gate before fwupd and the
+  root shell mints its matching capability while retaining the typed firmware
+  interlock. Surface enable/MOK activation now has the same exact-body gate
+  before any activation or reboot seam, and its shell publisher mints the
+  matching capability. Farm evidence is green for clipboard 2/2, seat
+  remote-input 16/16, KDC handoff 1/1, firmware 23/23, and surface enable
+  23/23; the full inventory and shared-spool cross-UID negative fixture remain
+  open. A current-tree full `mackesd` library run completed 3,729/3,731 with
+  one ignored test and one environment-sensitive caffeine round-trip failure;
+  that failure passed in an isolated farm rerun.
 - Priority: P0
 - Complexity: Epic
 - Problem: The production Bus spool is intentionally cross-UID writable, but
@@ -841,6 +856,24 @@ These decisions refine acceptance and sequencing for the active items below.
   salvaged dirty Claude worktrees were removed after zero-unique-commit
   verification. Remaining acceptance is deterministic render/pixel capture and
   live VDI behavior; human visual review is informative, not a gate.
+  On 2026-07-23 the verified `magic-mesh-12.1.0-1` shell binary was staged on
+  non-production seat `.15` (RPM dependency resolution is incomplete there, so
+  the shell binary was installed transactionally from the RPM payload while the
+  existing unit was retained): `mde-shell-egui.service` is active with
+  `NRestarts=0`, Construct reports `12.1.0 ... 2026-07-23`, and it owns
+  `/dev/dri/card1` + `/dev/tty1` with HDMI-A-1 connected at 1920x1080. The
+  fresh shell binary SHA256 is
+  `6096087b436f9c72c5707822a6c0f6590aae751058a07d2ad075fd97a17bea9a`. A
+  reversible non-production boot-policy override produced a live DRM
+  Springboard frame (1920x1080 XR30, detiled PNG SHA256
+  `ae0f05f63e0a7e1a6361994fe1e90543ca8833f802c85c6313844b855feef05b`):
+  top status bar, Workbench/Mesh Map/Infra as Code tiles, and eight page dots;
+  no legacy bottom taskbar. The override was removed and the secure curtain
+  restored (detiled PNG SHA256
+  `b8971f07a000357c3edf645420df14462a697f024aabd5a9bec754ba981da34c`), with
+  the service still active and `NRestarts=0`. Pixel capture and all-pages/VDI
+  behavior remain open. The surface-card wire/auth regression suite is
+  farm-green at 7/7.
 - Priority: P1
 - Complexity: Epic
 - Problem: The workstation chrome is Win10-shaped (48px bottom taskbar + tray

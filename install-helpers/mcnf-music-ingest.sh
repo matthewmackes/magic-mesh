@@ -58,6 +58,14 @@ esac; done
 [ $# -ge 1 ] || usage
 CMD="$1"; shift
 
+# Thin-lighthouse policy: music ingest remains available on explicitly
+# provisioned non-lighthouse media hosts, but a lighthouse must never become a
+# media/file-sharing node through this legacy operator helper.
+if [ -r /var/lib/mde/role.toml ] && grep -Eq '^[[:space:]]*role[[:space:]]*=[[:space:]]*"?lighthouse"?[[:space:]]*$' /var/lib/mde/role.toml; then
+  echo "mcnf-music-ingest: media/file-sharing lighthouse support is retired; use a non-lighthouse media host" >&2
+  exit 1
+fi
+
 log() { echo "==> music-ingest: $*"; }
 
 load_creds() {

@@ -30,9 +30,9 @@ use std::str::FromStr;
 /// without a local display.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Role {
-    /// Relay + control plane — Nebula overlay, the `mackesd` control plane,
-    /// the media server, and the CA/signer. Always-on, no desktop. Rank 0.
-    /// VPS-friendly.
+    /// Thin relay + control plane — Nebula overlay, `mackesd`, etcd, and the
+    /// CA/signer. Media and file-sharing duties stay on non-lighthouse hosts.
+    /// Always-on, no desktop. Rank 0. VPS-friendly.
     Lighthouse,
     /// Full workstation — the Construct stack: the egui-DRM shell + VDI +
     /// libvirt/QEMU-KVM + Podman. A headless box is a `Workstation` with no

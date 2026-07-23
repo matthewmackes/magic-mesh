@@ -483,6 +483,7 @@ pub fn run_apply(
 #[cfg(feature = "async-services")]
 pub use worker::{
     fw_apply_topic, fw_result_topic, inventory_topic, FwApplyRequest, SurfaceFirmwareWorker,
+    FW_ACTION_AUTH_VERB,
 };
 
 #[cfg(feature = "async-services")]
@@ -498,13 +499,15 @@ mod worker {
     //! summary. On a non-Surface node it idles (never touches the Bus).
 
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::time::Duration;
 
     use mde_bus::hooks::config::Priority;
     use mde_bus::persist::Persist;
     use serde::{Deserialize, Serialize};
 
-    use super::{run_apply, run_inventory, ApplyResult, LiveFwupd};
+    use super::{run_apply, run_inventory, ApplyResult, LiveFwupd, SurfaceModel};
+    use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
     use crate::surface::verify::{
         board_topic, run_verify, summarize, summary_topic, LiveSurfaceProbes,
     };
@@ -514,6 +517,13 @@ mod worker {
     /// Poll cadence — firmware is operator-driven + slow-moving, so a modest
     /// tick keeps the panel fresh without churn.
     pub const POLL: Duration = Duration::from_secs(30);
+
+    /// Closed semantic verb bound into every firmware apply capability.
+    ///
+    /// This is part of the `fw-apply` wire contract: a publisher must mint an
+    /// HMAC v1 capability for this verb, the target node, and the fwupd device
+    /// id before it writes the request to the action topic.
+    pub const FW_ACTION_AUTH_VERB: &str = "surface-firmware-apply";
 
     /// The per-node lane the fwupd inventory lands on (the Install tab panel).
     #[must_use]
@@ -536,6 +546,13 @@ mod worker {
     /// The fw-apply request envelope. `device_id` names the fwupd device;
     /// `arm_token` carries the operator-typed [`super::FW_ARM_TOKEN`] that
     /// arms the apply (absent = a refused dry request).
+    ///
+    /// The raw JSON body must additionally carry `schema_version: 1` and an
+    /// `armed_token` minted by the shared [`ActionAuthorizer`] for
+    /// [`FW_ACTION_AUTH_VERB`], this node id, and `device_id`. The shared gate
+    /// authenticates the exact raw body before this typed payload reaches
+    /// [`run_apply`]; `armed_token` is intentionally not copied into this
+    /// struct so it cannot be confused with the human typed interlock.
     #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
     pub struct FwApplyRequest {
         /// The fwupd device id to update.
@@ -552,6 +569,7 @@ mod worker {
         bus_root: Option<PathBuf>,
         poll: Duration,
         action_cursor: Option<String>,
+        authorizer: Arc<ActionAuthorizer>,
     }
 
     impl SurfaceFirmwareWorker {
@@ -565,16 +583,36 @@ mod worker {
                 bus_root: default_bus_root(),
                 poll: POLL,
                 action_cursor: None,
+                authorizer: Arc::new(ActionAuthorizer::production()),
             }
         }
 
         /// Test constructor: an explicit detection + bus root, no real fwupd.
         #[cfg(test)]
         #[must_use]
-        pub(crate) const fn with_parts(
+        pub(crate) fn with_parts(
             node_id: String,
             detection: SurfaceDetection,
             bus_root: PathBuf,
+        ) -> Self {
+            Self::with_parts_and_authorizer(
+                node_id,
+                detection,
+                bus_root,
+                Arc::new(ActionAuthorizer::production()),
+            )
+        }
+
+        /// Test constructor with an injectable shared action authorizer. This
+        /// is the mint/verify seam for focused tests; production always uses
+        /// [`ActionAuthorizer::production`].
+        #[cfg(test)]
+        #[must_use]
+        pub(crate) fn with_parts_and_authorizer(
+            node_id: String,
+            detection: SurfaceDetection,
+            bus_root: PathBuf,
+            authorizer: Arc<ActionAuthorizer>,
         ) -> Self {
             Self {
                 node_id,
@@ -582,6 +620,7 @@ mod worker {
                 bus_root: Some(bus_root),
                 poll: POLL,
                 action_cursor: None,
+                authorizer,
             }
         }
 
@@ -602,22 +641,75 @@ mod worker {
             };
             for msg in msgs {
                 self.action_cursor = Some(msg.ulid.clone());
-                let req: FwApplyRequest = msg
-                    .body
-                    .as_deref()
-                    .and_then(|b| serde_json::from_str(b).ok())
-                    .unwrap_or_default();
-                let result = run_apply(
-                    &LiveFwupd,
-                    &self.detection,
-                    &req.device_id,
-                    req.arm_token.as_deref(),
-                );
+                let result = self.apply_request(msg.body.as_deref());
                 self.publish_result(persist, &result);
                 // Verify re-runs after a successful firmware change (lock #8).
                 if result.reverify {
                     self.reverify(persist);
                 }
+            }
+        }
+
+        /// Authenticate and decode one raw Bus request, then hand the typed
+        /// human-arm token to the firmware verb. Parsing is deliberately
+        /// side-effect free; the shared exact-body gate runs before
+        /// [`run_apply`] or any fwupd/backend seam is reached.
+        fn apply_request(&self, body: Option<&str>) -> ApplyResult {
+            let Some(body) = body else {
+                return self.refused_result("", "firmware apply request body is missing");
+            };
+            let req = match serde_json::from_str::<FwApplyRequest>(body) {
+                Ok(req) => req,
+                Err(_) => {
+                    return self
+                        .refused_result("", "firmware apply request is not a valid JSON object")
+                }
+            };
+            let device_id = req.device_id.trim();
+            if device_id.is_empty() {
+                return self
+                    .refused_result(device_id, "firmware apply request is missing device_id");
+            }
+            let context = MutationContext {
+                verb: FW_ACTION_AUTH_VERB,
+                node: &self.node_id,
+                target: device_id,
+            };
+            if let Err(error) = self.authorizer.authorize(body, context) {
+                tracing::warn!(
+                    target: "mackesd::surface_firmware",
+                    node = %self.node_id,
+                    device = %device_id,
+                    %error,
+                    "refused unauthorized firmware apply"
+                );
+                return self.refused_result(
+                    device_id,
+                    &format!("firmware apply authorization refused: {error}"),
+                );
+            }
+            run_apply(
+                &LiveFwupd,
+                &self.detection,
+                device_id,
+                req.arm_token.as_deref(),
+            )
+        }
+
+        fn refused_result(&self, device_id: &str, reason: &str) -> ApplyResult {
+            let model = match &self.detection.model {
+                SurfaceModel::Known(device) => device.product.clone(),
+                SurfaceModel::UnknownSurface { product } => product.clone(),
+                SurfaceModel::NotASurface => String::new(),
+            };
+            ApplyResult {
+                model,
+                skipped: None,
+                device_id: device_id.to_string(),
+                outcome: super::ApplyOutcome::Refused {
+                    reason: reason.to_string(),
+                },
+                reverify: false,
             }
         }
 
@@ -697,10 +789,16 @@ mod worker {
 
     #[cfg(test)]
     mod tests {
+        use std::sync::Arc;
+
         use super::*;
-        use crate::surface::firmware::FirmwareInventory;
+        use crate::ipc::action_auth::{authorize_test_body, ActionAuthorizer, MutationContext};
+        use crate::surface::firmware::{ApplyOutcome, FirmwareInventory};
         use crate::surface::verify::VerifyBoard;
         use crate::surface::{identify, DmiInfo, MS_VENDOR};
+
+        const AUTH_KEY: &[u8] = b"surface-firmware-action-auth-test-key";
+        const AUTH_NOW: i64 = 1_700_000_000_000;
 
         fn detection(product: &str) -> SurfaceDetection {
             let dmi = DmiInfo {
@@ -712,6 +810,49 @@ mod worker {
                 model: identify(&dmi),
                 dmi,
             }
+        }
+
+        fn authorized_worker(
+            node: &str,
+            detection: SurfaceDetection,
+            root: &std::path::Path,
+        ) -> SurfaceFirmwareWorker {
+            let authorizer = Arc::new(ActionAuthorizer::for_test(
+                AUTH_KEY,
+                root.join("auth"),
+                AUTH_NOW,
+            ));
+            SurfaceFirmwareWorker::with_parts_and_authorizer(
+                node.to_string(),
+                detection,
+                root.to_path_buf(),
+                authorizer,
+            )
+        }
+
+        fn signed_request(
+            node: &str,
+            device_id: &str,
+            arm_token: Option<&str>,
+            nonce: &str,
+        ) -> String {
+            let unsigned = serde_json::json!({
+                "schema_version": 1,
+                "device_id": device_id,
+                "arm_token": arm_token,
+            })
+            .to_string();
+            authorize_test_body(
+                AUTH_KEY,
+                &unsigned,
+                MutationContext {
+                    verb: FW_ACTION_AUTH_VERB,
+                    node,
+                    target: device_id,
+                },
+                nonce,
+                AUTH_NOW + 30_000,
+            )
         }
 
         #[test]
@@ -783,6 +924,144 @@ mod worker {
                 .list_since(&board_topic("node-a"), None)
                 .expect("list boards");
             assert!(boards.is_empty(), "no re-verify on a refused apply");
+        }
+
+        #[test]
+        fn typed_arm_without_hmac_capability_is_refused_before_fwupd() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let persist = Persist::open(dir.path().to_path_buf()).expect("open bus");
+            let mut w = SurfaceFirmwareWorker::with_parts(
+                "node-a".into(),
+                detection("Surface Pro 8"),
+                dir.path().to_path_buf(),
+            );
+            let request = serde_json::json!({
+                "schema_version": 1,
+                "device_id": "uefi-1",
+                "arm_token": super::super::FW_ARM_TOKEN,
+            })
+            .to_string();
+            persist
+                .write(
+                    &fw_apply_topic("node-a"),
+                    Priority::Default,
+                    None,
+                    Some(&request),
+                )
+                .expect("write request");
+
+            w.poll_once(&persist);
+
+            let out = persist
+                .list_since(&fw_result_topic("node-a"), None)
+                .expect("list results");
+            let result: ApplyResult =
+                serde_json::from_str(out[0].body.as_deref().unwrap()).unwrap();
+            let ApplyOutcome::Refused { reason } = result.outcome else {
+                panic!("missing authorization refusal");
+            };
+            assert!(reason.contains("authorization refused"));
+            assert!(!result.reverify);
+        }
+
+        #[test]
+        fn valid_hmac_then_typed_arm_reaches_live_fwupd_seam() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let persist = Persist::open(dir.path().to_path_buf()).expect("open bus");
+            let mut w = authorized_worker("node-auth", detection("Surface Pro 8"), dir.path());
+            let request = signed_request(
+                "node-auth",
+                "uefi-1",
+                Some(super::super::FW_ARM_TOKEN),
+                "surface-fw-valid",
+            );
+            persist
+                .write(
+                    &fw_apply_topic("node-auth"),
+                    Priority::Default,
+                    None,
+                    Some(&request),
+                )
+                .expect("write request");
+
+            w.poll_once(&persist);
+
+            let out = persist
+                .list_since(&fw_result_topic("node-auth"), None)
+                .expect("list results");
+            let result: ApplyResult =
+                serde_json::from_str(out[0].body.as_deref().unwrap()).unwrap();
+            assert!(matches!(result.outcome, ApplyOutcome::Gated { .. }));
+            assert!(!result.reverify, "headless LiveFwupd remains gated");
+        }
+
+        #[test]
+        fn hmac_success_does_not_replace_the_typed_arm_interlock() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let persist = Persist::open(dir.path().to_path_buf()).expect("open bus");
+            let mut w = authorized_worker("node-arm", detection("Surface Pro 8"), dir.path());
+            let request = signed_request("node-arm", "uefi-1", None, "surface-fw-unarmed");
+            persist
+                .write(
+                    &fw_apply_topic("node-arm"),
+                    Priority::Default,
+                    None,
+                    Some(&request),
+                )
+                .expect("write request");
+
+            w.poll_once(&persist);
+
+            let out = persist
+                .list_since(&fw_result_topic("node-arm"), None)
+                .expect("list results");
+            let result: ApplyResult =
+                serde_json::from_str(out[0].body.as_deref().unwrap()).unwrap();
+            let ApplyOutcome::Refused { reason } = result.outcome else {
+                panic!("missing typed-arm refusal");
+            };
+            assert!(reason.contains("not armed"));
+        }
+
+        #[test]
+        fn body_tampering_and_capability_replay_are_refused() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let persist = Persist::open(dir.path().to_path_buf()).expect("open bus");
+            let mut w = authorized_worker("node-replay", detection("Surface Pro 8"), dir.path());
+            let original = signed_request(
+                "node-replay",
+                "uefi-1",
+                Some(super::super::FW_ARM_TOKEN),
+                "surface-fw-replay",
+            );
+            let tampered = original.replace("uefi-1", "uefi-2");
+            for request in [&tampered, &original, &original] {
+                persist
+                    .write(
+                        &fw_apply_topic("node-replay"),
+                        Priority::Default,
+                        None,
+                        Some(request),
+                    )
+                    .expect("write request");
+            }
+
+            w.poll_once(&persist);
+
+            let out = persist
+                .list_since(&fw_result_topic("node-replay"), None)
+                .expect("list results");
+            assert_eq!(out.len(), 3);
+            let results: Vec<ApplyResult> = out
+                .iter()
+                .map(|item| serde_json::from_str(item.body.as_deref().unwrap()).unwrap())
+                .collect();
+            assert!(matches!(results[0].outcome, ApplyOutcome::Refused { .. }));
+            assert!(matches!(results[1].outcome, ApplyOutcome::Gated { .. }));
+            let ApplyOutcome::Refused { reason } = &results[2].outcome else {
+                panic!("replay was not refused");
+            };
+            assert!(reason.contains("already used"));
         }
 
         #[test]

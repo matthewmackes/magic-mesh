@@ -1,4 +1,5 @@
 use super::*;
+use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
 use mackes_mesh_types::cloud::{
     cloud_request_digest, CloudArmSigner, CloudArmedToken, CLOUD_ARM_NODE_SCOPE,
 };
@@ -163,6 +164,104 @@ fn kdc_remote_input_body_maps_motion_click_and_text() {
             "super": false,
         })
     );
+}
+
+#[test]
+fn remote_input_handoff_is_exact_body_bound_and_single_use() {
+    let key = b"0123456789abcdef0123456789abcdef";
+    let signer = CloudArmSigner::new(key.to_vec()).expect("signer");
+    let peer = PeerId::from("moto");
+    let unsigned =
+        kdc_remote_input_body(&peer, &MousepadEvent::Move { dx: 7.5, dy: -2.0 }, 123).to_string();
+    let signed = authorize_remote_input_body_with_signer(
+        &signer,
+        "node-a",
+        peer.as_str(),
+        &unsigned,
+        1_000,
+        "remote-input-once-0123456789abcdef",
+    )
+    .expect("signed handoff");
+    let context = MutationContext {
+        verb: REMOTE_INPUT_AUTH_VERB,
+        node: "node-a",
+        target: peer.as_str(),
+    };
+    let gate_root = tempdir().expect("auth root");
+    let gate = ActionAuthorizer::for_test(key, gate_root.path().to_path_buf(), 1_000);
+    assert!(gate.authorize(&signed, context).is_ok());
+    assert!(gate
+        .authorize(&signed, context)
+        .expect_err("replayed handoff")
+        .contains("already used"));
+
+    let mut tampered_value: Value = serde_json::from_str(&signed).expect("signed JSON");
+    tampered_value["dx"] = json!(99.0);
+    let tampered = tampered_value.to_string();
+    let tamper_gate = ActionAuthorizer::for_test(
+        key,
+        tempdir().expect("tamper auth root").path().to_path_buf(),
+        1_000,
+    );
+    assert!(tamper_gate
+        .authorize(&tampered, context)
+        .expect_err("body tamper")
+        .contains("request body"));
+
+    let mut missing_value: Value = serde_json::from_str(&unsigned).expect("unsigned JSON");
+    missing_value["schema_version"] = json!(crate::ipc::action_auth::ACTION_SCHEMA_VERSION);
+    let missing_gate = ActionAuthorizer::for_test(
+        key,
+        tempdir().expect("missing auth root").path().to_path_buf(),
+        1_000,
+    );
+    assert!(missing_gate
+        .authorize(&missing_value.to_string(), context)
+        .expect_err("missing token")
+        .contains("no armed token"));
+
+    let expired = authorize_remote_input_body_with_signer(
+        &signer,
+        "node-a",
+        peer.as_str(),
+        &unsigned,
+        1_000,
+        "remote-input-expired-0123456789abcdef",
+    )
+    .expect("expired signed handoff");
+    // The producer helper's fixed 30s TTL is intentionally tested by using a
+    // direct token with an expiry in the past, matching the hostile consumer
+    // fixture; no production path can mint this value.
+    let mut expired_value: Value = serde_json::from_str(&expired).expect("expired JSON");
+    let raw =
+        CloudArmedToken::parse(expired_value["armed_token"].as_str().unwrap()).expect("token");
+    let expired_token = CloudArmedToken::mint(
+        &signer,
+        &raw.nonce,
+        999,
+        REMOTE_INPUT_AUTH_VERB,
+        "node-a",
+        peer.as_str(),
+        &cloud_request_digest(&{
+            expired_value["armed_token"] = Value::Null;
+            expired_value.to_string()
+        })
+        .expect("digest"),
+    )
+    .encode();
+    // Rebuild the body with the past-expiry token while retaining the exact
+    // signed fields, then prove the consumer refuses it before any sink.
+    let mut expired_wire: Value = serde_json::from_str(&expired).expect("expired wire");
+    expired_wire["armed_token"] = Value::String(expired_token);
+    let expired_gate = ActionAuthorizer::for_test(
+        key,
+        tempdir().expect("expired auth root").path().to_path_buf(),
+        1_000,
+    );
+    assert!(expired_gate
+        .authorize(&expired_wire.to_string(), context)
+        .expect_err("expired token")
+        .contains("expired"));
 }
 
 #[test]

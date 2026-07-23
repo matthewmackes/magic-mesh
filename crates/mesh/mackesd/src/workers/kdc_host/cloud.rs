@@ -226,7 +226,7 @@ pub(super) fn authorize_bulk_body_with_signer(
 
 /// Load the mint authority only from mackesd's root-only systemd credential.
 /// There is no environment-secret or generated-key fallback.
-fn production_cloud_arm_signer() -> Result<CloudArmSigner, String> {
+pub(super) fn production_cloud_arm_signer() -> Result<CloudArmSigner, String> {
     if !rustix::process::geteuid().is_root() {
         return Err("cloud authorization requires the root mackesd service".to_string());
     }

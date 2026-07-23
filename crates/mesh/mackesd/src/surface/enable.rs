@@ -623,7 +623,9 @@ fn run_mok(actions: &impl SurfaceActions, arm: Option<&str>) -> MokEnrollment {
 // ─────────────────────────── the Bus worker (per-node) ──────────────────────
 
 #[cfg(feature = "async-services")]
-pub use worker::{enable_topic, result_topic, EnableRequest, SurfaceEnableWorker};
+pub use worker::{
+    enable_topic, result_topic, EnableRequest, SurfaceEnableWorker, ENABLE_ACTION_AUTH_VERB,
+};
 
 #[cfg(feature = "async-services")]
 mod worker {
@@ -635,18 +637,25 @@ mod worker {
     //! that into the fleet enablement summary.
 
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::time::Duration;
 
     use mde_bus::hooks::config::Priority;
     use mde_bus::persist::Persist;
     use serde::{Deserialize, Serialize};
 
-    use super::{run_enable, EnableResult, LiveSurfaceActions};
+    use super::{run_enable, EnableResult, LiveSurfaceActions, SurfaceModel};
+    use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
     use crate::surface::{detect, SurfaceDetection};
     use crate::workers::{ShutdownToken, Worker};
 
     /// Poll cadence — enable is operator-driven, so a modest tick is plenty.
     pub const POLL: Duration = Duration::from_secs(2);
+
+    /// Closed semantic verb bound into every surface enable capability.
+    /// Publishers must mint schema-v1 HMAC authority for this verb, the target
+    /// node, and that same node as the mutation target.
+    pub const ENABLE_ACTION_AUTH_VERB: &str = "surface-enable";
 
     /// The per-node request lane the Install tab publishes enable requests on.
     #[must_use]
@@ -662,6 +671,13 @@ mod worker {
 
     /// The enable request envelope. `arm_token` carries the operator-typed
     /// [`super::MOK_ARM_TOKEN`] on the second (reboot-arming) call.
+    ///
+    /// The raw JSON body must additionally carry `schema_version: 1` and an
+    /// `armed_token` minted by the shared [`ActionAuthorizer`] for
+    /// [`ENABLE_ACTION_AUTH_VERB`], this node id, and the same node id as the
+    /// target. The authorizer verifies the exact raw body before this typed
+    /// request reaches [`run_enable`]; `armed_token` is intentionally not
+    /// copied into this struct so it cannot be confused with the human token.
     #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
     pub struct EnableRequest {
         /// The typed arming token (present only to arm the MOK reboot).
@@ -676,6 +692,7 @@ mod worker {
         bus_root: Option<PathBuf>,
         poll: Duration,
         action_cursor: Option<String>,
+        authorizer: Arc<ActionAuthorizer>,
     }
 
     impl SurfaceEnableWorker {
@@ -689,6 +706,7 @@ mod worker {
                 bus_root: default_bus_root(),
                 poll: POLL,
                 action_cursor: None,
+                authorizer: Arc::new(ActionAuthorizer::production()),
             }
         }
 
@@ -706,6 +724,26 @@ mod worker {
                 bus_root: Some(bus_root),
                 poll: POLL,
                 action_cursor: None,
+                authorizer: Arc::new(ActionAuthorizer::production()),
+            }
+        }
+
+        /// Test constructor with an injectable shared action authorizer.
+        #[cfg(test)]
+        #[must_use]
+        pub(crate) fn with_parts_and_authorizer(
+            node_id: String,
+            detection: SurfaceDetection,
+            bus_root: PathBuf,
+            authorizer: Arc<ActionAuthorizer>,
+        ) -> Self {
+            Self {
+                node_id,
+                detection,
+                bus_root: Some(bus_root),
+                poll: POLL,
+                action_cursor: None,
+                authorizer,
             }
         }
 
@@ -719,18 +757,51 @@ mod worker {
             };
             for msg in msgs {
                 self.action_cursor = Some(msg.ulid.clone());
-                let req: EnableRequest = msg
-                    .body
-                    .as_deref()
-                    .and_then(|b| serde_json::from_str(b).ok())
-                    .unwrap_or_default();
-                let result = run_enable(
-                    &LiveSurfaceActions,
-                    &self.detection,
-                    req.arm_token.as_deref(),
-                );
+                let result = self.apply_request(msg.body.as_deref());
                 self.publish(persist, &result);
             }
+        }
+
+        /// Authenticate and decode one raw Bus request, then run the typed
+        /// enable verb. Parsing is side-effect free; the shared exact-body
+        /// gate runs before [`run_enable`] or any privileged seam call.
+        fn apply_request(&self, body: Option<&str>) -> EnableResult {
+            let Some(body) = body else {
+                return self.refused_result("enable request body is missing");
+            };
+            let req = match serde_json::from_str::<EnableRequest>(body) {
+                Ok(req) => req,
+                Err(_) => return self.refused_result("enable request is not a valid JSON object"),
+            };
+            let context = MutationContext {
+                verb: ENABLE_ACTION_AUTH_VERB,
+                node: &self.node_id,
+                target: &self.node_id,
+            };
+            if let Err(error) = self.authorizer.authorize(body, context) {
+                tracing::warn!(
+                    target: "mackesd::surface_enable",
+                    node = %self.node_id,
+                    %error,
+                    "refused unauthorized surface enable"
+                );
+                return self
+                    .refused_result(&format!("surface enable authorization refused: {error}"));
+            }
+            run_enable(
+                &LiveSurfaceActions,
+                &self.detection,
+                req.arm_token.as_deref(),
+            )
+        }
+
+        fn refused_result(&self, reason: &str) -> EnableResult {
+            let model = match &self.detection.model {
+                SurfaceModel::Known(device) => device.product.clone(),
+                SurfaceModel::UnknownSurface { product } => product.clone(),
+                SurfaceModel::NotASurface => String::new(),
+            };
+            EnableResult::skipped(model, reason)
         }
 
         /// Publish the typed result to the per-node result lane.
@@ -793,8 +864,14 @@ mod worker {
 
     #[cfg(test)]
     mod tests {
+        use std::sync::Arc;
+
         use super::*;
+        use crate::ipc::action_auth::{authorize_test_body, ActionAuthorizer, MutationContext};
         use crate::surface::{identify, DmiInfo, MS_VENDOR};
+
+        const AUTH_KEY: &[u8] = b"surface-enable-action-auth-test-key";
+        const AUTH_NOW: i64 = 1_700_000_000_000;
 
         fn detection(product: &str) -> SurfaceDetection {
             let dmi = DmiInfo {
@@ -808,18 +885,51 @@ mod worker {
             }
         }
 
+        fn authorized_worker(
+            node: &str,
+            detection: SurfaceDetection,
+            root: &std::path::Path,
+        ) -> SurfaceEnableWorker {
+            let authorizer = Arc::new(ActionAuthorizer::for_test(
+                AUTH_KEY,
+                root.join("auth"),
+                AUTH_NOW,
+            ));
+            SurfaceEnableWorker::with_parts_and_authorizer(
+                node.to_string(),
+                detection,
+                root.to_path_buf(),
+                authorizer,
+            )
+        }
+
+        fn signed_request(node: &str, arm_token: Option<&str>, nonce: &str) -> String {
+            let unsigned = serde_json::json!({
+                "schema_version": 1,
+                "arm_token": arm_token,
+            })
+            .to_string();
+            authorize_test_body(
+                AUTH_KEY,
+                &unsigned,
+                MutationContext {
+                    verb: ENABLE_ACTION_AUTH_VERB,
+                    node,
+                    target: node,
+                },
+                nonce,
+                AUTH_NOW + 30_000,
+            )
+        }
+
         #[test]
         fn drains_a_request_and_publishes_a_result() {
             let dir = tempfile::tempdir().expect("tempdir");
             let persist = Persist::open(dir.path().to_path_buf()).expect("open bus");
-            let mut w = SurfaceEnableWorker::with_parts(
-                "node-a".into(),
-                detection("Surface Pro 8"),
-                dir.path().to_path_buf(),
-            );
+            let mut w = authorized_worker("node-a", detection("Surface Pro 8"), dir.path());
 
             // The Install tab requests enable (no arm token).
-            let req = serde_json::to_string(&EnableRequest::default()).unwrap();
+            let req = signed_request("node-a", None, "surface-enable-valid");
             persist
                 .write(&enable_topic("node-a"), Priority::Default, None, Some(&req))
                 .expect("write request");
@@ -846,12 +956,8 @@ mod worker {
         fn cursor_advances_so_a_request_is_processed_once() {
             let dir = tempfile::tempdir().expect("tempdir");
             let persist = Persist::open(dir.path().to_path_buf()).expect("open bus");
-            let mut w = SurfaceEnableWorker::with_parts(
-                "n".into(),
-                detection("Surface Pro 8"),
-                dir.path().to_path_buf(),
-            );
-            let req = serde_json::to_string(&EnableRequest::default()).unwrap();
+            let mut w = authorized_worker("n", detection("Surface Pro 8"), dir.path());
+            let req = signed_request("n", None, "surface-enable-cursor");
             persist
                 .write(&enable_topic("n"), Priority::Default, None, Some(&req))
                 .expect("write");
@@ -859,6 +965,85 @@ mod worker {
             w.poll_once(&persist); // second drain: nothing new
             let out = persist.list_since(&result_topic("n"), None).expect("list");
             assert_eq!(out.len(), 1, "request processed exactly once");
+        }
+
+        #[test]
+        fn typed_enable_without_hmac_capability_is_refused_before_actions() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let persist = Persist::open(dir.path().to_path_buf()).expect("open bus");
+            let mut w = SurfaceEnableWorker::with_parts(
+                "node-a".into(),
+                detection("Surface Pro 8"),
+                dir.path().to_path_buf(),
+            );
+            let request = serde_json::json!({
+                "schema_version": 1,
+                "arm_token": super::super::MOK_ARM_TOKEN,
+            })
+            .to_string();
+            persist
+                .write(
+                    &enable_topic("node-a"),
+                    Priority::Default,
+                    None,
+                    Some(&request),
+                )
+                .expect("write request");
+
+            w.poll_once(&persist);
+
+            let out = persist
+                .list_since(&result_topic("node-a"), None)
+                .expect("list results");
+            let result: EnableResult =
+                serde_json::from_str(out[0].body.as_deref().unwrap()).unwrap();
+            assert!(result
+                .skipped
+                .as_deref()
+                .is_some_and(|reason| reason.contains("authorization refused")));
+            assert!(result.activation.units.is_empty());
+        }
+
+        #[test]
+        fn body_binding_and_single_use_are_enforced_for_enable() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let persist = Persist::open(dir.path().to_path_buf()).expect("open bus");
+            let mut w = authorized_worker("node-replay", detection("Surface Pro 8"), dir.path());
+            let original = signed_request("node-replay", None, "surface-enable-replay");
+            let tampered = original.replace(
+                "\"arm_token\":null",
+                "\"arm_token\":\"REBOOT-TO-ENROLL-MOK\"",
+            );
+            for request in [&tampered, &original, &original] {
+                persist
+                    .write(
+                        &enable_topic("node-replay"),
+                        Priority::Default,
+                        None,
+                        Some(request),
+                    )
+                    .expect("write request");
+            }
+
+            w.poll_once(&persist);
+
+            let out = persist
+                .list_since(&result_topic("node-replay"), None)
+                .expect("list results");
+            assert_eq!(out.len(), 3);
+            let results: Vec<EnableResult> = out
+                .iter()
+                .map(|item| serde_json::from_str(item.body.as_deref().unwrap()).unwrap())
+                .collect();
+            assert!(results[0]
+                .skipped
+                .as_deref()
+                .is_some_and(|reason| reason.contains("authorization refused")));
+            assert!(results[1].skipped.is_none());
+            assert!(results[2]
+                .skipped
+                .as_deref()
+                .is_some_and(|reason| reason.contains("already used")));
         }
     }
 }
