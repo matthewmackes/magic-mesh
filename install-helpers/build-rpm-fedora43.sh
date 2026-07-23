@@ -12,7 +12,8 @@
 # rustup toolchain (rust-toolchain.toml → 1.94.0), builds the full workspace
 # release, and runs cargo-generate-rpm. Reuses the host's ~/.cargo crate caches.
 # Output for the default full mode: target-f43/generate-rpm/magic-mesh-*.rpm plus
-# magic-mesh-browser-*.rpm (host-owned, rootless).
+# magic-mesh-browser-*.rpm and magic-mesh-lighthouse-*.rpm (host-owned,
+# rootless).
 #
 # XPA-6 — the GUI-less headless package. With `--server` this builds ONLY the
 # daemon + mesh-substrate crates (mackesd/magic-fleet/mde-enroll/mde-bus — none
@@ -21,14 +22,17 @@
 # (`cargo generate-rpm --variant server`) → a small `magic-mesh-server-*.rpm`
 # with no GUI bins and no gtk3/libcosmic ELF Requires. The default (no flag)
 # builds the full workspace and emits the base `magic-mesh` RPM plus the
-# co-installable `magic-mesh-browser` RPM.
+# co-installable `magic-mesh-browser` RPM. `--lighthouse` is the thin DO lane:
+# it compiles only mackesd/meshctl and emits `magic-mesh-lighthouse`, whose
+# manifest intentionally excludes media and Syncthing file-sharing assets.
 #
-# Usage: install-helpers/build-rpm-fedora43.sh [--server] [fedora_version]
+# Usage: install-helpers/build-rpm-fedora43.sh [--server|--lighthouse] [fedora_version]
 #        install-helpers/build-rpm-fedora43.sh            # full GUI RPM, F43
 #        install-helpers/build-rpm-fedora43.sh --server   # headless RPM, F43
+#        install-helpers/build-rpm-fedora43.sh --lighthouse # thin DO RPM, F43
 set -euo pipefail
 
-# XPA-6 — parse the optional --server flag (position-independent) so the
+# XPA-6/DO-LIGHTHOUSE-THIN — parse the optional mode flag (position-independent) so the
 # remaining positional arg stays the Fedora version (back-compat with the
 # original `[fedora_version]` calling convention).
 MODE="full"
@@ -36,6 +40,7 @@ ARGS=()
 for a in "$@"; do
   case "$a" in
     --server) MODE="server" ;;
+    --lighthouse) MODE="lighthouse" ;;
     --full)   MODE="full" ;;
     *)        ARGS+=("$a") ;;
   esac
@@ -151,8 +156,15 @@ export CMAKE_POLICY_VERSION_MINIMUM=3.5
 # from ONE canonical fragment, shared with xcp-build.sh, so the two RPM cut paths
 # cannot drift. The repo is bind-mounted at /src, so it is present in-container.
 source /src/install-helpers/rpm-features.sh
-# XPA-6 — MODE (full|server) is passed in via `podman run -e MODE=…`.
-if [ "${MODE:-full}" = "server" ]; then
+# XPA-6/DO-LIGHTHOUSE-THIN — MODE (full|server|lighthouse) is passed in via
+# `podman run -e MODE=…`.
+if [ "${MODE:-full}" = "lighthouse" ]; then
+  echo "[f43] building THIN DigitalOcean lighthouse RPM (control plane only)"
+  cargo build --release $MDE_RPM_LOCKED -p mackesd
+  echo "[f43] generating thin lighthouse RPM (--variant lighthouse)"
+  cargo generate-rpm -p crates/mesh/mackesd --variant lighthouse
+  /src/install-helpers/verify-rpm-payload.sh size /src/target-f43/generate-rpm/magic-mesh-lighthouse-*.rpm
+elif [ "${MODE:-full}" = "server" ]; then
   echo "[f43] building HEADLESS crates only (release) — no libcosmic GUIs"
   # Just the daemon + mesh-substrate crates. mde-enroll yields BOTH the
   # mde-enroll + magic-setup bins; mde-bus is the shared-bus daemon. None pull
@@ -161,7 +173,10 @@ if [ "${MODE:-full}" = "server" ]; then
       -p mackesd -p magic-fleet -p mde-enroll -p mde-bus
   echo "[f43] generating headless RPM (--variant server)"
   cargo generate-rpm -p crates/mesh/mackesd --variant server
+  echo "[f43] generating thin lighthouse RPM (--variant lighthouse)"
+  cargo generate-rpm -p crates/mesh/mackesd --variant lighthouse
   /src/install-helpers/verify-rpm-payload.sh size /src/target-f43/generate-rpm/magic-mesh-server-*.rpm
+  /src/install-helpers/verify-rpm-payload.sh size /src/target-f43/generate-rpm/magic-mesh-lighthouse-*.rpm
 else
   echo "[f43] building workspace (release) — this is the long part"
   cargo build --workspace --release $MDE_RPM_LOCKED
@@ -222,8 +237,11 @@ else
   cargo generate-rpm -p crates/mesh/mackesd
   echo "[f43] generating browser RPM (--variant browser)"
   cargo generate-rpm -p crates/mesh/mackesd --variant browser
+  echo "[f43] generating thin lighthouse RPM (--variant lighthouse)"
+  cargo generate-rpm -p crates/mesh/mackesd --variant lighthouse
   /src/install-helpers/verify-rpm-payload.sh size /src/target-f43/generate-rpm/magic-mesh-[0-9]*.rpm
   /src/install-helpers/verify-rpm-payload.sh size /src/target-f43/generate-rpm/magic-mesh-browser-*.rpm
+  /src/install-helpers/verify-rpm-payload.sh size /src/target-f43/generate-rpm/magic-mesh-lighthouse-*.rpm
 fi
 
 echo "[f43] DONE — artifact(s):"
@@ -246,10 +264,19 @@ podman run --rm \
     -w /src \
     "$IMAGE" bash -c "$IN_CONTAINER"
 
-# XPA-6 / BROWSER-SPLIT — pick the artifacts for THIS mode. `magic-mesh-server-*`
-# and `magic-mesh-browser-*` sort beside `magic-mesh-*`, so glob on exact name
-# prefixes instead of taking the first *.rpm.
-if [ "$MODE" = "server" ]; then
+# XPA-6 / BROWSER-SPLIT / DO-LIGHTHOUSE-THIN — pick the artifacts for THIS
+# mode. Exact prefixes avoid `magic-mesh-*` catching a sibling variant.
+if [ "$MODE" = "lighthouse" ]; then
+  GLOB="$REPO/target-f43/generate-rpm/magic-mesh-lighthouse-*.rpm"
+  # shellcheck disable=SC2086,SC2012
+  RPM="$(ls -1t $GLOB 2>/dev/null | head -1 || true)"
+  [ -n "$RPM" ] || { echo "!! no thin lighthouse RPM produced (mode=$MODE)" >&2; exit 1; }
+  "$REPO/install-helpers/verify-rpm-payload.sh" size "$RPM"
+  echo
+  echo "✅ Fedora $FEDORA RPM (mode=$MODE): $RPM"
+  echo "   install on F$FEDORA:  sudo dnf install $RPM"
+  echo "   use with DO:          do-lighthouse-up.sh <mesh> --rpm-url <served-thin-rpm>"
+elif [ "$MODE" = "server" ]; then
   GLOB="$REPO/target-f43/generate-rpm/magic-mesh-server-*.rpm"
   # shellcheck disable=SC2086,SC2012  # $GLOB MUST stay unquoted to expand.
   RPM="$(ls -1t $GLOB 2>/dev/null | head -1 || true)"
@@ -258,21 +285,26 @@ if [ "$MODE" = "server" ]; then
   echo
   echo "✅ Fedora $FEDORA RPM (mode=$MODE): $RPM"
   echo "   install on F$FEDORA:  sudo dnf install $RPM"
-  echo "   or via Option A:      do-lighthouse-up.sh <mesh> --rpm-url <served-url-of-this-rpm>"
+  echo "   (DO lighthouses use --lighthouse, not this server variant)"
 else
   BASE_GLOB="$REPO/target-f43/generate-rpm/magic-mesh-[0-9]*.rpm"
   BROWSER_GLOB="$REPO/target-f43/generate-rpm/magic-mesh-browser-*.rpm"
+  LIGHTHOUSE_GLOB="$REPO/target-f43/generate-rpm/magic-mesh-lighthouse-*.rpm"
   # shellcheck disable=SC2086,SC2012
   BASE_RPM="$(ls -1t $BASE_GLOB 2>/dev/null | head -1 || true)"
   # shellcheck disable=SC2086,SC2012
   BROWSER_RPM="$(ls -1t $BROWSER_GLOB 2>/dev/null | head -1 || true)"
+  LIGHTHOUSE_RPM="$(ls -1t $LIGHTHOUSE_GLOB 2>/dev/null | head -1 || true)"
   [ -n "$BASE_RPM" ] || { echo "!! no base RPM produced (mode=$MODE)" >&2; exit 1; }
   [ -n "$BROWSER_RPM" ] || { echo "!! no browser RPM produced (mode=$MODE)" >&2; exit 1; }
+  [ -n "$LIGHTHOUSE_RPM" ] || { echo "!! no thin lighthouse RPM produced (mode=$MODE)" >&2; exit 1; }
   "$REPO/install-helpers/verify-rpm-payload.sh" size "$BASE_RPM"
   "$REPO/install-helpers/verify-rpm-payload.sh" size "$BROWSER_RPM"
+  "$REPO/install-helpers/verify-rpm-payload.sh" size "$LIGHTHOUSE_RPM"
   echo
   echo "✅ Fedora $FEDORA RPMs (mode=$MODE):"
   echo "   base:    $BASE_RPM"
   echo "   browser: $BROWSER_RPM"
+  echo "   lighthouse: $LIGHTHOUSE_RPM"
   echo "   install on F$FEDORA:  sudo dnf install $BASE_RPM $BROWSER_RPM"
 fi

@@ -12,6 +12,14 @@ GiB SSD). The provisioning scripts and the `mackesd onboard spawn-lighthouse`
 planner use this slug and reject role promotion or sizing that would create a
 media, file-sharing, or general-purpose lighthouse.
 
+DO cloud-init installs the dedicated `magic-mesh-lighthouse` RPM variant (or a
+direct URL to that artifact). It is a control-plane-only package: `mackesd`,
+Nebula, etcd bootstrap, bounded Caddy ingress, health recovery, and the base
+SELinux policy. The variant deliberately omits Navidrome/music ingestion,
+Syncthing/file-sharing helpers and unit files, browser/desktop, virtualization,
+and birthright/optional first-boot payloads. The full `magic-mesh` and
+`magic-mesh-server` packages are not valid DO lighthouse inputs.
+
 The 512 MiB node is a relay/control-plane appliance. It runs Nebula, the local
 etcd voter when it is a full lighthouse, `mackesd`, bounded Caddy ingress, and
 `mesh-health` recovery.

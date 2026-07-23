@@ -20,8 +20,9 @@
 #
 # Neither regression has an automated gate today. This one is STATIC (no build,
 # no cargo, no network): it parses the RPM asset manifest out of
-# `crates/mesh/mackesd/Cargo.toml` ([package.metadata.generate-rpm].assets) and
-# greps the shell's dock. It is fast enough to run on every push.
+# `crates/mesh/mackesd/Cargo.toml` ([package.metadata.generate-rpm].assets plus
+# the thin lighthouse variant) and greps the shell's dock. It is fast enough to
+# run on every push.
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # HOW TO RUN
@@ -46,7 +47,8 @@
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # DRY-RUN semantics (no RPM):
-#   payload  : lists the expected asset set; for every asset SOURCE it asserts —
+#   payload  : lists the expected base + Browser + thin-lighthouse asset sets;
+#              for every asset SOURCE it asserts —
 #              * target/…            → some workspace crate builds a bin of that
 #                                      name (the static proxy for "the build will
 #                                      produce it"); a name nothing builds FAILs.
@@ -115,6 +117,7 @@ EXEMPT_SURFACES=("mde-panel-egui")
 readonly BASE_KEY_BINS=("mde-shell-egui" "mackesd")
 readonly BROWSER_KEY_BINS=("mde-web-preview" "mde-web-cef" "cef-verify")
 readonly SERVER_KEY_BINS=("mackesd")
+readonly LIGHTHOUSE_KEY_BINS=("mackesd")
 
 # build-deploy-12 — the RPM-size ceiling. The gh-pages dnf channel is a git branch,
 # so the pushed .rpm file hits GitHub's ~100 MiB hard per-file block. Fail a cut with
@@ -148,13 +151,16 @@ parse_assets_for() {
   ' section="$2" "$1"
 }
 
-# Main/base, browser subpackage, and server variant asset readers.
+# Main/base, browser subpackage, server variant, and thin lighthouse variant
+# asset readers.
 parse_assets() { parse_assets_for "$1" "package.metadata.generate-rpm"; }
 parse_browser_assets() { parse_assets_for "$1" "package.metadata.generate-rpm.variants.browser"; }
 parse_server_assets() { parse_assets_for "$1" "package.metadata.generate-rpm.variants.server"; }
+parse_lighthouse_assets() { parse_assets_for "$1" "package.metadata.generate-rpm.variants.lighthouse"; }
 parse_all_shipped_assets() {
   parse_assets "$1"
   parse_browser_assets "$1"
+  parse_lighthouse_assets "$1"
 }
 
 # Does a path contain a glob metacharacter?
@@ -230,7 +236,7 @@ check_payload_dryrun() {
     esac
   done < <(parse_all_shipped_assets "$CARGO_TOML")
 
-  info "parsed $total asset entries from the base + browser generate-rpm arrays"
+  info "parsed $total asset entries from the base + browser + thin lighthouse generate-rpm arrays"
 
   hdr "key replacement binaries (must be shipped)"
   local kb
@@ -291,6 +297,7 @@ check_payload_rpm() {
   case "${rpm##*/}" in
     magic-mesh-browser-*) shape="browser" ;;
     magic-mesh-server-*) shape="server" ;;
+    magic-mesh-lighthouse-*) shape="lighthouse" ;;
   esac
 
   # Key bins: exact install-path assertions (the DoD line for a strip/replace).
@@ -300,6 +307,7 @@ check_payload_rpm() {
   case "$shape" in
     browser) key_bins=("${BROWSER_KEY_BINS[@]}") ;;
     server)  key_bins=("${SERVER_KEY_BINS[@]}") ;;
+    lighthouse) key_bins=("${LIGHTHOUSE_KEY_BINS[@]}") ;;
     *)       key_bins=("${BASE_KEY_BINS[@]}") ;;
   esac
   for kb in "${key_bins[@]}"; do
@@ -320,6 +328,7 @@ check_payload_rpm() {
   case "$shape" in
     browser) asset_stream="parse_browser_assets" ;;
     server)  asset_stream="parse_server_assets" ;;
+    lighthouse) asset_stream="parse_lighthouse_assets" ;;
     *)       asset_stream="parse_assets" ;;
   esac
   while IFS=$'\t' read -r src dst; do

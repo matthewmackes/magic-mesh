@@ -382,12 +382,15 @@ workspace = true
 # all common app/daemon binaries (incl. the ENT-15 meshctl facade) + the
 # packaging/ assets into the base
 # `magic-mesh` RPM; `cargo generate-rpm --variant browser` emits the
-# co-installable `magic-mesh-browser` RPM for the heavy browser engines. The
+# co-installable `magic-mesh-browser` RPM for the heavy browser engines, and
+# `cargo generate-rpm --variant lighthouse` emits the thin DO control-plane RPM.
+# The
 # install-time role chooser (PKG-5) + the
-# self-gating mackesd.service (PKG-3) decide what actually runs per node,
-# so there is no per-role package split (§5: Lighthouse ⊂ Server ⊂
-# Workstation); Browser is split by payload lifecycle, not by role. RPM GPG
-# signing + the ISO stay operator-gated.
+# self-gating mackesd.service (PKG-3) decide what actually runs per node.
+# Workstations use the base + optional Browser package; compute nodes use the
+# GUI-less Server variant; DigitalOcean lighthouses use the dedicated
+# control-plane-only Lighthouse variant. RPM GPG signing + the ISO stay
+# operator-gated.
 [package.metadata.generate-rpm]
 name = "magic-mesh"
 # PKG — payload codec. The Browser engines now ship as a separate
@@ -1162,6 +1165,78 @@ libxkbcommon = "*"
 # domains after the loader units start.
 selinux-policy-devel = "*"
 checkpolicy = "*"
+
+# DO-LIGHTHOUSE-THIN — the only RPM a DigitalOcean lighthouse may install.
+# This is deliberately a separate variant rather than a role flag on the full
+# package: cargo-generate-rpm replaces the asset/dependency tables for a
+# variant, so a fresh `dnf install magic-mesh-lighthouse` cannot accidentally
+# inherit the Workstation/Server media, file-sync, browser, virtualization, or
+# birthright payload.  Keep this list control-plane-only.  In particular, do
+# NOT add setup-media-navidrome, mcnf-music-ingest, setup-syncthing,
+# syncthing-reconcile, syncthing.service, or cutover-substrate-v2 here.  A
+# lighthouse has etcd coordination but no media or file-sharing duty class.
+[package.metadata.generate-rpm.variants.lighthouse]
+name = "magic-mesh-lighthouse"
+summary = "MCNF thin DigitalOcean lighthouse — Nebula relay, etcd quorum, and mackesd control plane"
+payload_compress = "xz"
+release = "1"
+license = "GPL-3.0-or-later AND MPL-2.0"
+# The thin variant must replace (not co-install with) any role package that
+# owns the same daemon/unit paths.  An operator can use `dnf swap` for an
+# existing node, while a fresh DO cloud-init install is thin from first boot.
+conflicts = { magic-mesh = "*", magic-mesh-server = "*" }
+assets = [
+    { source = "target/release/mackesd", dest = "/usr/bin/mackesd", mode = "755" },
+    { source = "target/release/meshctl", dest = "/usr/bin/meshctl", mode = "755" },
+    { source = "packaging/systemd/mackesd.service", dest = "/usr/lib/systemd/system/mackesd.service", mode = "644" },
+    { source = "packaging/systemd/mackesd.service.d/90-stop-policy.conf", dest = "/usr/lib/systemd/system/mackesd.service.d/90-stop-policy.conf", mode = "644" },
+    { source = "packaging/systemd/mesh-health.service", dest = "/usr/lib/systemd/system/mesh-health.service", mode = "644" },
+    { source = "packaging/systemd/mesh-health.timer", dest = "/usr/lib/systemd/system/mesh-health.timer", mode = "644" },
+    { source = "packaging/systemd/mesh-alert@.service", dest = "/usr/lib/systemd/system/mesh-alert@.service", mode = "644" },
+    { source = "packaging/systemd/nebula.service.d/10-mesh-recovery.conf", dest = "/usr/lib/systemd/system/nebula.service.d/10-mesh-recovery.conf", mode = "644" },
+    { source = "packaging/systemd/etcd.service", dest = "/etc/systemd/system/etcd.service", mode = "644" },
+    { source = "packaging/systemd/magic-mesh-selinux-policy.service", dest = "/usr/lib/systemd/system/magic-mesh-selinux-policy.service", mode = "644" },
+    { source = "packaging/tmpfiles/magic-mesh.conf", dest = "/usr/lib/tmpfiles.d/magic-mesh.conf", mode = "644" },
+    { source = "install-helpers/mesh-health-check.sh", dest = "/usr/libexec/mackesd/mesh-health-check", mode = "755" },
+    { source = "install-helpers/mesh-alert.sh", dest = "/usr/libexec/mackesd/mesh-alert", mode = "755" },
+    { source = "install-helpers/configure-small-lighthouse.sh", dest = "/usr/libexec/mackesd/configure-small-lighthouse", mode = "755" },
+    { source = "install-helpers/setup-etcd.sh", dest = "/usr/libexec/mackesd/setup-etcd", mode = "755" },
+    { source = "install-helpers/setup-caddy.sh", dest = "/usr/libexec/mackesd/setup-caddy", mode = "755" },
+    { source = "install-helpers/do-lighthouse-join.sh", dest = "/usr/libexec/mackesd/do-lighthouse-join", mode = "755" },
+    { source = "install-helpers/do-lighthouse-join-cloudinit.sh", dest = "/usr/libexec/mackesd/do-lighthouse-join-cloudinit.sh", mode = "755" },
+    { source = "install-helpers/selinux/*.cil", dest = "/usr/share/magic-mesh/selinux/", mode = "644" },
+    { source = "install-helpers/setup-selinux-policy.sh", dest = "/usr/libexec/mackesd/setup-selinux-policy", mode = "755" },
+    { source = "packaging/repo/magic-mesh.repo", dest = "/etc/yum.repos.d/magic-mesh.repo", mode = "644" },
+    { source = "packaging/repo/RPM-GPG-KEY-magic-mesh", dest = "/etc/pki/rpm-gpg/RPM-GPG-KEY-magic-mesh", mode = "644" },
+    { source = "DISCLAIMER.md", dest = "/usr/share/magic-mesh/DISCLAIMER.md", mode = "644" },
+    { source = "LICENSE", dest = "/usr/share/licenses/magic-mesh-lighthouse/LICENSE", mode = "644" },
+    { source = "NOTICE", dest = "/usr/share/licenses/magic-mesh-lighthouse/NOTICE", mode = "644" },
+]
+post_install_script = """
+systemctl daemon-reload >/dev/null 2>&1 || :
+systemctl enable mackesd.service nebula.service mesh-health.timer >/dev/null 2>&1 || :
+systemctl enable magic-mesh-selinux-policy.service >/dev/null 2>&1 || :
+timeout 60 systemd-tmpfiles --create /usr/lib/tmpfiles.d/magic-mesh.conf >/dev/null 2>&1 || :
+install -d -m 0700 /etc/mackesd >/dev/null 2>&1 || :
+"""
+pre_uninstall_script = """
+if [ "$1" = 0 ]; then
+  systemctl --no-reload disable --now mackesd.service mesh-health.timer etcd.service >/dev/null 2>&1 || :
+fi
+"""
+post_uninstall_script = """
+systemctl daemon-reload >/dev/null 2>&1 || :
+if [ "$1" = 0 ]; then
+  semodule -r magicmesh-base magicmesh-podman magicmesh-libvirt >/dev/null 2>&1 || :
+fi
+"""
+
+[package.metadata.generate-rpm.variants.lighthouse.requires]
+# The only package-level hard dependency for the thin appliance.  etcd and
+# Caddy are installed by their bounded, idempotent setup helpers after the
+# overlay has an address; making either a transaction dependency would make a
+# 512 MiB first boot less reliable and would pull optional stacks.
+nebula = "*"
 
 # XPA-6 — the GUI-less `magic-mesh-server` subpackage (a cargo-generate-rpm
 # *variant*). Built with `cargo generate-rpm -p crates/mesh/mackesd --variant

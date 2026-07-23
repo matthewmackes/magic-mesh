@@ -17,7 +17,7 @@
 #   --image <img>       DO image slug        [fedora-43-x64]
 #   --ssh-key <id>      DO ssh-key id/fingerprint (repeatable; default: all)
 #   --repo-baseurl <u>  dnf channel base     [https://matthewmackes.github.io/magic-mesh]
-#   --rpm-url <u>       direct RPM URL (overrides the channel)
+#   --rpm-url <u>       direct thin lighthouse RPM URL (overrides the channel)
 #   --tag <t>           droplet+firewall tag [magic-lighthouse]
 #   --keep-on-fail      don't destroy the droplet if the join fails
 set -euo pipefail

@@ -8,7 +8,7 @@
 # and passes the result as the droplet's --user-data. DO runs it as root once.
 #
 # Steps: detect the droplet's public IP from the DO metadata service →
-# install magic-mesh (+ nebula) → `mackesd found` the mesh → open the
+# install magic-mesh-lighthouse (+ nebula) → `mackesd found` the mesh → open the
 # lighthouse ports → start the daemon (which activates the /enroll listener) →
 # drop the v3 join token at a well-known path the up-script fetches.
 #
@@ -34,16 +34,18 @@ PUBLIC_IP="$(curl -fsS --max-time 10 "$META/interfaces/public/0/ipv4/address" ||
 [ -n "$PUBLIC_IP" ] || fail "could not read the droplet public IP from DO metadata"
 log "public IP: $PUBLIC_IP"
 
-# 2. Install magic-mesh (+ the nebula control plane it Requires).
+# 2. Install the dedicated thin lighthouse package. Do not substitute the
+#    full `magic-mesh` or `magic-mesh-server` package: those variants carry
+#    desktop/compute and media/file-sync payloads outside the DO role.
 if [ -n "$RPM_URL" ] && [ "$RPM_URL" != "@RPM_URL@" ]; then
     # Direct RPM (e.g. the portable build for an older-glibc DO image).
-    log "installing magic-mesh from $RPM_URL"
+    log "installing thin lighthouse RPM from $RPM_URL"
     dnf install -y --setopt=install_weak_deps=False --setopt=tsflags=nodocs \
-        "$RPM_URL" || fail "dnf install of $RPM_URL failed"
+        "$RPM_URL" || fail "dnf install of thin lighthouse RPM $RPM_URL failed"
 else
     # The gh-pages dnf channel, keyed to THIS droplet's Fedora releasever.
     RELEASEVER="$(rpm -E %fedora)"
-    log "installing magic-mesh from $REPO_BASEURL (fedora-$RELEASEVER)"
+    log "installing magic-mesh-lighthouse from $REPO_BASEURL (fedora-$RELEASEVER)"
     cat >/etc/yum.repos.d/magic-mesh.repo <<EOF
 [magic-mesh]
 name=MCNF
@@ -52,12 +54,10 @@ enabled=1
 gpgcheck=1
 gpgkey=$REPO_BASEURL/RPM-GPG-KEY-magic-mesh
 EOF
-    # A 512 MiB lighthouse cannot afford Fedora weak dependencies (libvirt,
-    # desktop/media helpers, and file-sharing tooling). The package contains
-    # the control-plane payload; optional capabilities remain disabled by the
-    # small profile below.
+    # The dedicated variant is control-plane-only; keep weak dependencies
+    # disabled as a second guard against future optional additions.
     dnf install -y --setopt=install_weak_deps=False --setopt=tsflags=nodocs \
-        magic-mesh || fail "dnf install magic-mesh failed (is there a fedora-$RELEASEVER channel dir? else pass --rpm-url a portable build)"
+        magic-mesh-lighthouse || fail "dnf install magic-mesh-lighthouse failed (publish the thin variant for fedora-$RELEASEVER or pass --rpm-url a thin RPM)"
 fi
 command -v mackesd >/dev/null || fail "mackesd not on PATH after install"
 PROFILE_HELPER=/usr/libexec/mackesd/configure-small-lighthouse

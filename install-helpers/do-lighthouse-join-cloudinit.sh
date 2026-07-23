@@ -28,15 +28,16 @@ STATUS_FILE="/root/mesh-join-status.txt"
 log() { echo "[magic-lighthouse-join] $*"; }
 fail() { echo "FAILED: $*" >"$STATUS_FILE"; log "FATAL: $*"; exit 1; }
 
-# 1. Install magic-mesh (+ the nebula control plane it Requires) — same as the
-#    found path (do-lighthouse-cloudinit.sh step 2).
+# 1. Install the dedicated thin lighthouse package — this path must not fall
+#    back to `magic-mesh`/`magic-mesh-server`, which carry media and file-sync
+#    payloads outside the lighthouse role.
 if [ -n "$RPM_URL" ] && [ "$RPM_URL" != "@RPM_URL@" ]; then
-    log "installing magic-mesh from $RPM_URL"
+    log "installing thin lighthouse RPM from $RPM_URL"
     dnf install -y --setopt=install_weak_deps=False --setopt=tsflags=nodocs \
-        "$RPM_URL" || fail "dnf install of $RPM_URL failed"
+        "$RPM_URL" || fail "dnf install of thin lighthouse RPM $RPM_URL failed"
 else
     RELEASEVER="$(rpm -E %fedora)"
-    log "installing magic-mesh from $REPO_BASEURL (fedora-$RELEASEVER)"
+    log "installing magic-mesh-lighthouse from $REPO_BASEURL (fedora-$RELEASEVER)"
     cat >/etc/yum.repos.d/magic-mesh.repo <<EOF
 [magic-mesh]
 name=MCNF
@@ -45,10 +46,10 @@ enabled=1
 gpgcheck=1
 gpgkey=$REPO_BASEURL/RPM-GPG-KEY-magic-mesh
 EOF
-    # Keep the smallest lighthouse genuinely small: weak dependencies pull in
-    # libvirt/desktop/media/file-sharing stacks that are not lighthouse duties.
+    # The dedicated variant is already control-plane-only; keep weak
+    # dependencies disabled as a second guard against future additions.
     dnf install -y --setopt=install_weak_deps=False --setopt=tsflags=nodocs \
-        magic-mesh || fail "dnf install magic-mesh failed (is there a fedora-$RELEASEVER channel dir? else pass --rpm-url a portable build)"
+        magic-mesh-lighthouse || fail "dnf install magic-mesh-lighthouse failed (publish the thin variant for fedora-$RELEASEVER or pass --rpm-url a thin RPM)"
 fi
 command -v mackesd >/dev/null || fail "mackesd not on PATH after install"
 PROFILE_HELPER=/usr/libexec/mackesd/configure-small-lighthouse

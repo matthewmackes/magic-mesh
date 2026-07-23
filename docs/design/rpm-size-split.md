@@ -16,6 +16,13 @@ Both artifacts passed the 90 MiB cut limit and payload inspection.
 **Finding:** `build-deploy-12` (PLATFORM-REVIEW-2026-07-10) — *Monolithic ~186 MiB RPM is
 one growth step from breaking the public channel (GitHub 100 MB file limit).*
 
+The same metadata now emits a third, intentionally smaller artifact:
+`magic-mesh-lighthouse`. It is the only package accepted by the DigitalOcean
+lighthouse cloud-init path and contains the Nebula/etcd/mackesd control plane
+only. It has no browser, desktop, virtualization, media, Navidrome, or
+Syncthing/file-sharing assets or dependencies; the full and `server` variants
+remain unchanged for their existing roles.
+
 ---
 
 ## 1. The cliff

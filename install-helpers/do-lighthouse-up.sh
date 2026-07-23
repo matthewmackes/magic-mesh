@@ -8,8 +8,9 @@
 #   * doctl, authenticated  (doctl auth init)
 #   * an SSH key registered with DO  (doctl compute ssh-key list) whose private
 #     half is on this box (used to fetch the token after boot)
-#   * a published dnf channel for the droplet's Fedora releasever, OR a portable
-#     RPM URL via --rpm-url (older DO Fedora images need this — see ONBOARD-7)
+#   * a published dnf channel containing `magic-mesh-lighthouse` for the
+#     droplet's Fedora releasever, OR a portable thin RPM URL via --rpm-url
+#     (older DO Fedora images need this — see ONBOARD-7)
 #
 # Usage:
 #   do-lighthouse-up.sh <mesh-id> [options]
@@ -20,7 +21,7 @@
 #                       dnf channel for its releasever — fedora-42 has none)
 #   --ssh-key <id>      DO ssh-key id/fingerprint (repeatable; default: all)
 #   --repo-baseurl <u>  dnf channel base     [https://matthewmackes.github.io/magic-mesh]
-#   --rpm-url <u>       direct RPM URL (overrides the channel)
+#   --rpm-url <u>       direct thin lighthouse RPM URL (overrides the channel)
 #   --enroll-port <p>   /enroll HTTPS port   [4243]
 #   --role <r>          role to pin (must remain lighthouse) [lighthouse]
 #   --tag <t>           droplet+firewall tag [magic-lighthouse]

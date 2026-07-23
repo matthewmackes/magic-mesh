@@ -10,7 +10,7 @@ for one mesh (that needs the out-of-scope multi-lighthouse roster work).
 
 - **`install-helpers/do-lighthouse-cloudinit.sh`** — the cloud-init user-data DO
   runs as root on first boot: read the droplet's public IP from the DO metadata
-  service → install `magic-mesh` (+ `nebula`) → `mackesd found <mesh>
+  service → install `magic-mesh-lighthouse` (+ `nebula`) → `mackesd found <mesh>
   --external-addr <public-ip>` → open `4242/udp` + `<enroll-port>/tcp` +
   `443/tcp` → `systemctl enable --now mackesd` (activates the `/enroll`
   listener) → write the v3 join token to `/root/mesh-join-token.txt`.
@@ -52,9 +52,10 @@ image is the RPM's auto-generated `Requires` pinning a newer glibc symbol
 version, not a real runtime incompatibility. So:
 
 - If the dnf channel has a `fedora-<releasever>-x86_64/` dir matching the DO
-  image, `dnf install magic-mesh` just works.
-- For an older DO image without a matching channel dir, pass a **portable RPM**
-  (ONBOARD-7) via `--rpm-url <url>`; the cloud-init installs it directly.
+  image, `dnf install magic-mesh-lighthouse` just works.
+- For an older DO image without a matching channel dir, pass a **portable thin
+  lighthouse RPM** (ONBOARD-7) via `--rpm-url <url>`; the cloud-init installs it
+  directly. Do not pass a base or server RPM URL.
 
 Pick a `--image` whose Fedora version you publish a channel for, or finish
 ONBOARD-7 and point `--rpm-url` at the portable build.

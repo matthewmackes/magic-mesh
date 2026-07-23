@@ -358,6 +358,52 @@ mod tests {
     }
 
     #[test]
+    fn thin_lighthouse_rpm_is_control_plane_only() {
+        let manifest = rpm_manifest();
+        let rpm = &manifest["package"]["metadata"]["generate-rpm"];
+        let lighthouse = &rpm["variants"]["lighthouse"];
+        assert_eq!(
+            lighthouse["name"].as_str(),
+            Some("magic-mesh-lighthouse"),
+            "DO provisioning must target the dedicated thin package"
+        );
+        let assets = lighthouse["assets"]
+            .as_array()
+            .expect("thin lighthouse asset array");
+        assert!(
+            asset_exists(assets, "target/release/mackesd", "/usr/bin/mackesd", "755"),
+            "thin lighthouse RPM must carry the daemon"
+        );
+        for forbidden in [
+            "install-helpers/setup-media-navidrome.sh",
+            "install-helpers/mcnf-music-ingest.sh",
+            "install-helpers/setup-syncthing.sh",
+            "install-helpers/syncthing-reconcile.sh",
+            "install-helpers/cutover-substrate-v2.sh",
+            "packaging/systemd/syncthing.service",
+        ] {
+            assert!(
+                !assets
+                    .iter()
+                    .any(|asset| asset["source"].as_str() == Some(forbidden)),
+                "thin lighthouse RPM must not ship forbidden asset {forbidden}"
+            );
+        }
+        let requires = lighthouse["requires"].as_table().expect("thin requires");
+        assert_eq!(requires.get("nebula").and_then(|v| v.as_str()), Some("*"));
+        for forbidden in ["podman", "rclone", "syncthing", "libvirt", "qemu-img"] {
+            assert!(
+                !requires.contains_key(forbidden),
+                "thin lighthouse RPM must not hard-require {forbidden}"
+            );
+        }
+        assert!(
+            lighthouse.get("recommends").is_none(),
+            "thin lighthouse RPM must not weak-pull optional media/fileshare stacks"
+        );
+    }
+
+    #[test]
     fn base_rpm_recommends_workstation_media_helpers() {
         let manifest: toml::Value =
             toml::from_str(include_str!("../../Cargo.toml")).expect("mackesd Cargo.toml parses");
@@ -1296,6 +1342,12 @@ mod tests {
             "full Fedora RPM builder must emit the split Browser RPM"
         );
         assert!(
+            script.contains("cargo generate-rpm -p crates/mesh/mackesd --variant lighthouse")
+                && farm_script
+                    .contains("cargo generate-rpm -p crates/mesh/mackesd --variant lighthouse"),
+            "both RPM builders must emit the dedicated thin lighthouse RPM"
+        );
+        assert!(
             farm_script.contains("cargo generate-rpm -p crates/mesh/mackesd --variant browser"),
             "farm RPM builder must emit the split Browser RPM"
         );
@@ -1342,6 +1394,29 @@ mod tests {
             cli.contains(".args([\"360\", \"/usr/libexec/mackesd/setup-caddy\"])"),
             "mackesd found/join must bound setup-caddy as a best-effort ingress step"
         );
+    }
+
+    #[test]
+    fn do_lighthouse_cloudinit_requires_the_thin_rpm_variant() {
+        for (name, script) in [
+            (
+                "found",
+                include_str!("../../../../../install-helpers/do-lighthouse-cloudinit.sh"),
+            ),
+            (
+                "join",
+                include_str!("../../../../../install-helpers/do-lighthouse-join-cloudinit.sh"),
+            ),
+        ] {
+            assert!(
+                script.contains("magic-mesh-lighthouse || fail"),
+                "{name} cloud-init must install the dedicated magic-mesh-lighthouse package"
+            );
+            assert!(
+                script.contains("thin lighthouse RPM"),
+                "{name} cloud-init must label direct RPM installs as thin-only"
+            );
+        }
     }
 
     #[test]
