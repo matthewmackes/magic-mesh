@@ -243,7 +243,10 @@ These decisions refine acceptance and sequencing for the active items below.
   have neither `nebula` nor `nebula-cert`, so only the controlled live
   rotation/reconnect/old-root-prune acceptance drill remains blocked; the
   operator has now torn down all DigitalOcean lighthouses, so there is no live
-  Nebula peer on which to run that drill.
+  Nebula peer on which to run that drill. A post-policy attempt to provision a
+  fresh smallest-size DO lighthouse was refused by the API with HTTP 401, so no
+  cloud state changed; repeat the live drill after a valid operator token is
+  supplied.
 - Priority: P0
 - Complexity: Epic
 - Problem: Any node able to read replicated enrollment bundles can obtain other
