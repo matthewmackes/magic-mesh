@@ -347,13 +347,20 @@ These decisions refine acceptance and sequencing for the active items below.
   mutation (`send-to`, `rollback`, inbox `mark-opened`, outbox `cancel`) is
   gated before file/inbox/outbox I/O (19/19). Production responders share the
   verifier/replay ledger where multiple surfaces run in one daemon. The
-  integrated current-tree farm library gate is now 3,744/3,745 (one ignored,
+  integrated current-tree farm library gate is now 3,750/3,751 (one ignored,
   zero failures), and farm format check is clean. The complete runtime inventory
   and shared-spool cross-UID negative fixture remain the closure gates.
   Thin-lighthouse onboarding is also fail-closed now: signed role/secret bundles
   cannot promote a lighthouse or place `media`/`fileshare` secret scopes, with
   no-partial-apply proofs in `onboard::remote_push` 22/22 and
   `workers::onboard_apply` 10/10 focused farm suites.
+  The remaining shared-spool responders are now capability-gated as well:
+  federation accept/revoke/refuse-mint 6/6, Voice provision/did-route/failover/
+  shared-config 40/40 with an owner-only restart-safe intent journal, and
+  vehicle reboot 19/19 (HMAC before the typed ESN probe/SSH). The privileged
+  consumer inventory now has no Open/typed-only rows in this shared-spool
+  tranche; the final WL-SEC-007 closure gates are the integrated current-tree
+  library run and a cross-UID shared-spool negative fixture.
 - Priority: P0
 - Complexity: Epic
 - Problem: The production Bus spool is intentionally cross-UID writable, but

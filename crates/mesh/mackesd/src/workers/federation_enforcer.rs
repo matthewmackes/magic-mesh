@@ -28,6 +28,7 @@
 //! enforce the boundary; a Workstation enforces its own ingress too. Runs everywhere.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use mde_bus::federation::{
@@ -36,6 +37,8 @@ use mde_bus::federation::{
 };
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
+
+use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
 
 use super::{ShutdownToken, Worker};
 
@@ -52,6 +55,11 @@ const REFUSED_PREFIX: &str = "federation/refused/";
 /// The audit lane an accepted (forwarded) cross-mesh ingress message lands on.
 const INGRESS_OK_PREFIX: &str = "federation/ingress-accepted/";
 
+/// Closed capability scope for the federation action consumer. The caller
+/// cannot select a node; this worker always mutates this node's federation
+/// state and trust directory.
+const FEDERATION_ACTION_NODE_SCOPE: &str = "federation";
+
 /// Default enforcement cadence — the ingress spool + action lanes are drained this
 /// often. Cheap local reads, so a tight cadence keeps a foreign-mesh message from
 /// lingering unenforced.
@@ -60,6 +68,7 @@ const DEFAULT_POLL: Duration = Duration::from_secs(2);
 /// The WL-SEC-002 federation runtime-enforcement worker.
 pub struct FederationEnforcerWorker {
     node_id: String,
+    authorizer: Arc<ActionAuthorizer>,
     bus_root_override: Option<PathBuf>,
     trust_dir_override: Option<PathBuf>,
     poll_interval: Duration,
@@ -76,6 +85,7 @@ impl FederationEnforcerWorker {
     pub fn new(node_id: String) -> Self {
         Self {
             node_id,
+            authorizer: Arc::new(ActionAuthorizer::production()),
             bus_root_override: None,
             trust_dir_override: None,
             poll_interval: DEFAULT_POLL,
@@ -97,6 +107,15 @@ impl FederationEnforcerWorker {
     #[must_use]
     pub fn with_trust_dir(mut self, p: PathBuf) -> Self {
         self.trust_dir_override = Some(p);
+        self
+    }
+
+    /// Inject an isolated verifier and replay ledger for hostile action tests.
+    /// Production always uses the systemd-credential-backed authorizer.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
+        self.authorizer = authorizer;
         self
     }
 
@@ -135,6 +154,18 @@ impl FederationEnforcerWorker {
         for msg in accepts {
             self.accept_cursor = Some(msg.ulid.clone());
             if let Some(body) = msg.body.as_deref() {
+                if let Err(error) = self.authorize_action("accept", body) {
+                    audit(
+                        persist,
+                        "federation/accept-error",
+                        &serde_json::json!({
+                            "event": "authorization-refused",
+                            "action": "accept",
+                            "error": error,
+                        }),
+                    );
+                    continue;
+                }
                 self.handle_accept(body, persist, bus_root, trust);
             }
         }
@@ -145,6 +176,18 @@ impl FederationEnforcerWorker {
         for msg in revokes {
             self.revoke_cursor = Some(msg.ulid.clone());
             if let Some(body) = msg.body.as_deref() {
+                if let Err(error) = self.authorize_action("revoke", body) {
+                    audit(
+                        persist,
+                        "federation/revoke-error",
+                        &serde_json::json!({
+                            "event": "authorization-refused",
+                            "action": "revoke",
+                            "error": error,
+                        }),
+                    );
+                    continue;
+                }
                 self.handle_revoke(body, persist, bus_root, trust);
             }
         }
@@ -155,9 +198,40 @@ impl FederationEnforcerWorker {
         for msg in refuses {
             self.refuse_mint_cursor = Some(msg.ulid.clone());
             if let Some(body) = msg.body.as_deref() {
+                if let Err(error) = self.authorize_action("refuse-mint", body) {
+                    audit(
+                        persist,
+                        "federation/mint-revoke-error",
+                        &serde_json::json!({
+                            "event": "authorization-refused",
+                            "action": "refuse-mint",
+                            "error": error,
+                        }),
+                    );
+                    continue;
+                }
                 self.handle_refuse_mint(body, persist, bus_root);
             }
         }
+    }
+
+    /// Authenticate a federation mutation before any grant, mint, or trust
+    /// certificate helper is reached. Targets are deterministic and bound to
+    /// the requested peer/mint where the body carries one.
+    fn authorize_action(&self, action: &str, body: &str) -> Result<(), String> {
+        if !crate::ipc::body_within_cap(Some(body)) {
+            return Err("request body exceeds the 64 KiB cap".to_string());
+        }
+        let target = mutation_target(action, body)?;
+        let auth_verb = format!("federation-{action}");
+        self.authorizer.authorize(
+            body,
+            MutationContext {
+                verb: &auth_verb,
+                node: FEDERATION_ACTION_NODE_SCOPE,
+                target: &target,
+            },
+        )
     }
 
     fn handle_accept(&self, body: &str, persist: &Persist, bus_root: &Path, trust: &Path) {
@@ -371,6 +445,33 @@ impl FederationEnforcerWorker {
 
 // ── free helpers ────────────────────────────────────────────────────────────────
 
+/// Derive the closed capability target for a federation mutation without
+/// touching grants, mints, or the trust-cert directory.
+fn mutation_target(action: &str, body: &str) -> Result<String, String> {
+    let value: serde_json::Value = serde_json::from_str(body)
+        .map_err(|_| format!("federation-{action}: request body must be JSON"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("federation-{action}: request body must be an object"))?;
+    match action {
+        // The passcode is a secret and must not become a capability target.
+        "accept" => Ok("pair".to_string()),
+        "revoke" => object
+            .get("peer-mesh-id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|peer| is_safe_id(peer))
+            .map(|peer| format!("peer:{peer}"))
+            .ok_or_else(|| "federation-revoke: missing safe peer-mesh-id".to_string()),
+        "refuse-mint" => object
+            .get("ulid")
+            .and_then(serde_json::Value::as_str)
+            .filter(|ulid| is_safe_id(ulid))
+            .map(|ulid| format!("mint:{ulid}"))
+            .ok_or_else(|| "federation-refuse-mint: missing safe ulid".to_string()),
+        _ => Err(format!("unknown federation mutation: {action}")),
+    }
+}
+
 /// Publish a best-effort audit event; a validation/write failure is a silent no-op
 /// (the hash-chained persist index is the source of truth, this is a courtesy lane).
 fn audit(persist: &Persist, topic: &str, payload: &serde_json::Value) {
@@ -466,9 +567,14 @@ impl Worker for FederationEnforcerWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::action_auth::{authorize_test_body, ActionAuthorizer};
     use mde_bus::federation::{
         read_grants, write_mint_envelope, CrossMeshEnvelope, FederationGrants,
     };
+    use std::sync::Arc;
+
+    const AUTH_KEY: &[u8] = b"federation-action-auth-test-key";
+    const AUTH_NOW: i64 = 1_700_000_000_000;
 
     fn persist_at(dir: &Path) -> Persist {
         Persist::open(dir.to_path_buf()).expect("open persist")
@@ -525,6 +631,29 @@ mod tests {
         FederationEnforcerWorker::new("peer:test".into())
             .with_bus_root(bus_root.to_path_buf())
             .with_trust_dir(trusts(bus_root))
+            .with_authorizer(Arc::new(ActionAuthorizer::for_test(
+                AUTH_KEY,
+                bus_root.join("auth"),
+                AUTH_NOW,
+            )))
+    }
+
+    /// Arm an action body exactly as the root shell does. The worker's test
+    /// authorizer uses the same semantic context and durable replay directory.
+    fn signed_action(action: &str, unsigned_body: &str) -> String {
+        let target = mutation_target(action, unsigned_body).unwrap();
+        let verb = format!("federation-{action}");
+        authorize_test_body(
+            AUTH_KEY,
+            unsigned_body,
+            MutationContext {
+                verb: &verb,
+                node: FEDERATION_ACTION_NODE_SCOPE,
+                target: &target,
+            },
+            &format!("federation-{}", uniq()),
+            AUTH_NOW + 30_000,
+        )
     }
 
     // ── the DEFINING two-identity acceptance: unaccepted-deny / granted-allow /
@@ -560,13 +689,17 @@ mod tests {
 
         // (b) ACCEPT via the shell action lane — establishes the pair + installs cert.
         let mnemonic = mint(bus);
+        let accept_body = signed_action(
+            "accept",
+            &serde_json::json!({
+                "schema_version": 1,
+                "passcode": mnemonic,
+                "label": "Mesh A"
+            })
+            .to_string(),
+        );
         persist
-            .write(
-                ACCEPT_TOPIC,
-                Priority::Default,
-                None,
-                Some(&serde_json::json!({ "passcode": mnemonic, "label": "Mesh A" }).to_string()),
-            )
+            .write(ACCEPT_TOPIC, Priority::Default, None, Some(&accept_body))
             .unwrap();
         w.tick_once(&persist, bus, &trust);
         let grants = read_grants(bus).unwrap();
@@ -604,13 +737,16 @@ mod tests {
         );
 
         // (d) REVOKE via the shell action lane — removes the pair + deletes the cert.
+        let revoke_body = signed_action(
+            "revoke",
+            &serde_json::json!({
+                "schema_version": 1,
+                "peer-mesh-id": peer_id
+            })
+            .to_string(),
+        );
         persist
-            .write(
-                REVOKE_TOPIC,
-                Priority::Default,
-                None,
-                Some(&serde_json::json!({ "peer-mesh-id": peer_id }).to_string()),
-            )
+            .write(REVOKE_TOPIC, Priority::Default, None, Some(&revoke_body))
             .unwrap();
         w.tick_once(&persist, bus, &trust);
         assert!(
@@ -631,6 +767,129 @@ mod tests {
             before,
             "a revoked mesh must be refused again — no new message routes"
         );
+    }
+
+    #[test]
+    fn hostile_unsigned_federation_actions_are_refused_before_state_or_cert_io() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = dir.path();
+        let trust = trusts(bus);
+        let persist = persist_at(bus);
+        let mut w = worker(bus);
+
+        // An unsigned accept must not consume the mint, write grants, or install
+        // a trust certificate before the shared authorizer has passed.
+        let mnemonic = mint(bus);
+        let unsigned_accept = serde_json::json!({
+            "schema_version": 1,
+            "passcode": mnemonic,
+            "label": "Unsigned mesh"
+        })
+        .to_string();
+        persist
+            .write(
+                ACCEPT_TOPIC,
+                Priority::Default,
+                None,
+                Some(&unsigned_accept),
+            )
+            .unwrap();
+        w.tick_once(&persist, bus, &trust);
+        assert!(read_grants(bus).unwrap().pairs.is_empty());
+        assert!(
+            pending_mints(bus).len() == 1,
+            "unsigned accept consumed a mint"
+        );
+        assert!(
+            std::fs::read_dir(&trust)
+                .map(|mut entries| entries.next().is_none())
+                .unwrap_or(true),
+            "unsigned accept installed a trust certificate"
+        );
+
+        // Establish a real pair so an unsigned revoke can prove it leaves both
+        // the grant and installed trust certificate untouched.
+        let accept_body = signed_action(
+            "accept",
+            &serde_json::json!({
+                "schema_version": 1,
+                "passcode": mint(bus),
+                "label": "Mesh A"
+            })
+            .to_string(),
+        );
+        persist
+            .write(ACCEPT_TOPIC, Priority::Default, None, Some(&accept_body))
+            .unwrap();
+        w.tick_once(&persist, bus, &trust);
+        let peer_id = read_grants(bus).unwrap().pairs[0].peer_mesh_id.clone();
+        let cert = mde_bus::federation::trust_cert_path(&trust, &peer_id);
+        assert!(cert.exists());
+
+        let unsigned_revoke = serde_json::json!({
+            "schema_version": 1,
+            "peer-mesh-id": peer_id
+        })
+        .to_string();
+        persist
+            .write(
+                REVOKE_TOPIC,
+                Priority::Default,
+                None,
+                Some(&unsigned_revoke),
+            )
+            .unwrap();
+        w.tick_once(&persist, bus, &trust);
+        assert_eq!(read_grants(bus).unwrap().pairs.len(), 1);
+        assert!(cert.exists(), "unsigned revoke removed the trust cert");
+
+        // The pending mint cancel lane is also a mutation and remains intact.
+        let pending_id = pending_mints(bus).last().unwrap().ulid.clone();
+        let unsigned_refuse = serde_json::json!({
+            "schema_version": 1,
+            "ulid": pending_id
+        })
+        .to_string();
+        persist
+            .write(
+                REFUSE_MINT_TOPIC,
+                Priority::Default,
+                None,
+                Some(&unsigned_refuse),
+            )
+            .unwrap();
+        w.tick_once(&persist, bus, &trust);
+        assert!(
+            mint_path(bus, &pending_mints(bus).last().unwrap().ulid).exists(),
+            "unsigned refuse-mint removed the pending offer"
+        );
+    }
+
+    #[test]
+    fn federation_authority_is_exact_body_bound_and_single_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = dir.path();
+        let w = worker(bus);
+        let unsigned = serde_json::json!({
+            "schema_version": 1,
+            "passcode": "mesh node link mint mode myth",
+            "label": "Mesh A"
+        })
+        .to_string();
+        let armed = signed_action("accept", &unsigned);
+        assert!(w.authorize_action("accept", &armed).is_ok());
+        assert!(w
+            .authorize_action("accept", &armed)
+            .unwrap_err()
+            .contains("already used"));
+
+        let tampered = armed.replace("Mesh A", "Mesh B");
+        assert!(w.authorize_action("accept", &tampered).is_err());
+        assert!(mutation_target(
+            "revoke",
+            r#"{"schema_version":1,"peer-mesh-id":"../../outside"}"#
+        )
+        .is_err());
     }
 
     #[test]
@@ -657,13 +916,17 @@ mod tests {
 
         // Accept a pair → the mirror changes → a new row is published listing it.
         let mnemonic = mint(bus);
+        let accept_body = signed_action(
+            "accept",
+            &serde_json::json!({
+                "schema_version": 1,
+                "passcode": mnemonic,
+                "label": "Mesh A"
+            })
+            .to_string(),
+        );
         persist
-            .write(
-                ACCEPT_TOPIC,
-                Priority::Default,
-                None,
-                Some(&serde_json::json!({ "passcode": mnemonic, "label": "Mesh A" }).to_string()),
-            )
+            .write(ACCEPT_TOPIC, Priority::Default, None, Some(&accept_body))
             .unwrap();
         w.tick_once(&persist, bus, &trust);
         let rows = persist.list_since(&topic, None).unwrap();

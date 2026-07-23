@@ -52,14 +52,18 @@
 
 #![cfg(feature = "async-services")]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 
 use super::{ShutdownToken, Worker};
+use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
 use crate::ipc::secret_store::{self, SecretStore};
 use crate::vitelity::model::VitelityCredentials;
 use crate::vitelity::{
@@ -128,6 +132,30 @@ pub const CUTOVER_TOPIC: &str = "state/voice-cutover";
 /// a lifted legacy caller-ID, lock 13). A single fleet-wide row alongside
 /// [`CUTOVER_TOPIC`]. Body: [`SharedOutboundConfig`].
 pub const SHARED_STATE_TOPIC: &str = "state/voice-shared";
+
+/// Stable authorization scope for fleet-wide Voice mutations. Capabilities
+/// bind to this scope rather than the currently elected leader so failover
+/// does not require re-minting an operator request.
+pub const VOICE_AUTH_NODE: &str = "voice";
+/// Closed semantic verb for the immediate provision/reconcile action.
+pub const VOICE_PROVISION_AUTH_VERB: &str = "voice-provision";
+/// Closed semantic verb for existing-DID routing intents.
+pub const VOICE_DID_ROUTE_AUTH_VERB: &str = "voice-did-route";
+/// Closed semantic verb for offline-inbound failover intents.
+pub const VOICE_FAILOVER_AUTH_VERB: &str = "voice-failover";
+/// Closed semantic verb for fleet shared-outbound configuration.
+pub const VOICE_SHARED_CONFIG_AUTH_VERB: &str = "voice-shared-config";
+
+/// Version of the small, token-free accepted-intent journal. Armed tokens
+/// never enter this file; the shared authorizer's replay ledger owns nonce
+/// consumption and remains the only capability secret.
+const AUTHORIZED_INTENTS_SCHEMA_VERSION: u64 = 1;
+/// Bounded state file size / per-key intent limits. A malformed or oversized
+/// journal fails closed and leaves the worker with no desired mutations.
+const MAX_AUTHORIZED_INTENTS_BYTES: usize = 64 * 1024;
+const MAX_AUTHORIZED_DID_ROUTES: usize = 512;
+const MAX_AUTHORIZED_FAILOVER: usize = 512;
+const AUTHORIZED_INTENTS_FILE: &str = ".mackesd-voice-authorized-intents.json";
 
 /// Fallback SIP realm used to render a node's `<user>@<realm>` address when
 /// Vitelity hasn't reported the sub-account's realm yet. The live client
@@ -836,6 +864,20 @@ pub struct SharedOutboundConfig {
     pub outbound_trunk: String,
 }
 
+/// Durable, token-free projection of Voice intents that already passed the
+/// action gate. It lets a worker restart without re-authorizing spent nonces;
+/// the raw armed request is intentionally never persisted.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct AuthorizedVoiceIntents {
+    schema_version: u64,
+    #[serde(default)]
+    did_routes: BTreeMap<String, Option<String>>,
+    #[serde(default)]
+    failover: BTreeMap<String, FailoverPolicy>,
+    #[serde(default)]
+    shared_config: Option<SharedOutboundConfig>,
+}
+
 /// The `action/voice/shared-config` body the panel publishes (lock 13).
 #[derive(Debug, serde::Deserialize)]
 struct SharedConfigRequest {
@@ -983,6 +1025,7 @@ pub fn no_node_left_dual_model(status: &CutoverStatus) -> bool {
 /// Fold the retained `action/voice/shared-config` messages into the desired
 /// fleet shared-outbound config (lock 13), latest-wins (ULID order is
 /// oldest→newest). `None` when the operator hasn't applied one yet.
+#[cfg(test)]
 fn read_desired_shared_config(persist: &Persist) -> Option<SharedOutboundConfig> {
     let mut latest: Option<SharedOutboundConfig> = None;
     if let Ok(msgs) = persist.list_since(SHARED_CONFIG_TOPIC, None) {
@@ -1013,8 +1056,17 @@ fn shared_outbound_is_lifted(store: &SecretStore) -> bool {
 /// persists it to the leader-held store — the real "Apply to fleet" effect GW-5
 /// left as an observable-only verb. Returns whether the fleet is now lifted off
 /// the single-account model (the shared-outbound is present).
+#[cfg(test)]
 fn apply_shared_config(store: &SecretStore, persist: &Persist) -> bool {
-    if let Some(cfg) = read_desired_shared_config(persist) {
+    let desired = read_desired_shared_config(persist);
+    apply_shared_config_value(store, desired.as_ref())
+}
+
+/// Apply an already-authorized shared-outbound intent. Production uses the
+/// worker's authorized in-memory intent; the retained-reader wrapper above is
+/// kept for the pure persistence tests and legacy callers.
+fn apply_shared_config_value(store: &SecretStore, desired: Option<&SharedOutboundConfig>) -> bool {
+    if let Some(cfg) = desired {
         match serde_json::to_string(&cfg) {
             Ok(body) => {
                 if let Err(e) = store.put(&shared_outbound_ref(), &body) {
@@ -1119,6 +1171,14 @@ pub struct VoiceProvisionWorker {
     client_override: Option<Box<dyn VitelityClient + Send>>,
     /// Test seam: an injected secret store. Production resolves per pass.
     store_override: Option<SecretStore>,
+    /// Shared verifier for every privileged Voice action topic.
+    authorizer: Arc<ActionAuthorizer>,
+    /// Authorized desired intents. They are updated only after exact-body
+    /// verification, persisted locally, then replayed idempotently on each
+    /// reconcile pass.
+    desired_did_routes: HashMap<String, Option<String>>,
+    desired_failover: HashMap<String, FailoverPolicy>,
+    desired_shared_config: Option<SharedOutboundConfig>,
     /// Last time a full reconcile ran, for the rate-limit.
     last_reconcile: Option<Instant>,
 }
@@ -1141,6 +1201,10 @@ impl VoiceProvisionWorker {
             bus_root_override: None,
             client_override: None,
             store_override: None,
+            authorizer: Arc::new(ActionAuthorizer::production()),
+            desired_did_routes: HashMap::new(),
+            desired_failover: HashMap::new(),
+            desired_shared_config: None,
             last_reconcile: None,
         }
     }
@@ -1194,6 +1258,196 @@ impl VoiceProvisionWorker {
         self
     }
 
+    /// Test-only verifier injection; production always uses the systemd
+    /// credential loaded by [`ActionAuthorizer::production`].
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
+        self.authorizer = authorizer;
+        self
+    }
+
+    /// Path for the token-free accepted-intent projection. It sits beside the
+    /// daemon's SQLite state (the production default is root-owned local
+    /// state), never on the replicated workgroup volume.
+    fn authorized_intents_path(&self) -> PathBuf {
+        self.db_path.with_file_name(AUTHORIZED_INTENTS_FILE)
+    }
+
+    /// Load accepted intents without attempting to re-authorize their spent
+    /// capabilities. Invalid, future, or oversized state fails closed.
+    fn load_authorized_intents(&mut self) {
+        let path = self.authorized_intents_path();
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            return;
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.uid() != rustix::process::geteuid().as_raw() || metadata.mode() & 0o077 != 0
+            {
+                tracing::warn!(
+                    target: "mackesd::voice_provision",
+                    path = %path.display(),
+                    "authorized Voice intent journal is not owner-only; ignoring it"
+                );
+                return;
+            }
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            return;
+        };
+        if bytes.len() > MAX_AUTHORIZED_INTENTS_BYTES {
+            tracing::warn!(
+                target: "mackesd::voice_provision",
+                path = %path.display(),
+                cap = MAX_AUTHORIZED_INTENTS_BYTES,
+                "authorized Voice intent journal exceeds its size cap; ignoring it"
+            );
+            return;
+        }
+        let Ok(state) = serde_json::from_slice::<AuthorizedVoiceIntents>(&bytes) else {
+            tracing::warn!(
+                target: "mackesd::voice_provision",
+                path = %path.display(),
+                "authorized Voice intent journal is invalid; ignoring it"
+            );
+            return;
+        };
+        if state.schema_version != AUTHORIZED_INTENTS_SCHEMA_VERSION
+            || state.did_routes.len() > MAX_AUTHORIZED_DID_ROUTES
+            || state.failover.len() > MAX_AUTHORIZED_FAILOVER
+        {
+            tracing::warn!(
+                target: "mackesd::voice_provision",
+                path = %path.display(),
+                "authorized Voice intent journal has an unsupported schema or cardinality; ignoring it"
+            );
+            return;
+        }
+        self.desired_did_routes = state.did_routes.into_iter().collect();
+        self.desired_failover = state.failover.into_iter().collect();
+        self.desired_shared_config = state.shared_config;
+    }
+
+    /// Persist the accepted desired projection atomically after authorization.
+    /// The file contains only typed intents, never an armed token or request
+    /// body. A bounded journal keeps hostile target churn from exhausting disk.
+    fn persist_authorized_intents(&self) -> Result<(), String> {
+        if self.desired_did_routes.len() > MAX_AUTHORIZED_DID_ROUTES
+            || self.desired_failover.len() > MAX_AUTHORIZED_FAILOVER
+        {
+            return Err("authorized Voice intent journal is full".to_string());
+        }
+        let state = AuthorizedVoiceIntents {
+            schema_version: AUTHORIZED_INTENTS_SCHEMA_VERSION,
+            did_routes: self
+                .desired_did_routes
+                .iter()
+                .map(|(did, node_id)| (did.clone(), node_id.clone()))
+                .collect(),
+            failover: self
+                .desired_failover
+                .iter()
+                .map(|(node_id, policy)| (node_id.clone(), policy.clone()))
+                .collect(),
+            shared_config: self.desired_shared_config.clone(),
+        };
+        let bytes = serde_json::to_vec(&state)
+            .map_err(|_| "authorized Voice intent journal serialization failed".to_string())?;
+        if bytes.len() > MAX_AUTHORIZED_INTENTS_BYTES {
+            return Err("authorized Voice intent journal exceeds its size cap".to_string());
+        }
+        let path = self.authorized_intents_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|_| "authorized Voice intent state directory unavailable".to_string())?;
+        }
+        let tmp = path.with_extension("json.tmp");
+        let mut options = OpenOptions::new();
+        options.create(true).truncate(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&tmp)
+            .map_err(|_| "authorized Voice intent journal is not writable".to_string())?;
+        file.write_all(&bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|_| "authorized Voice intent journal write failed".to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+                .map_err(|_| "authorized Voice intent journal permissions failed".to_string())?;
+        }
+        drop(file);
+        std::fs::rename(&tmp, &path)
+            .map_err(|_| "authorized Voice intent journal commit failed".to_string())
+    }
+
+    /// Admit one Bus action into the desired state only after authorization.
+    /// Returns `true` when the action is valid and should trigger a reconcile.
+    fn accept_action(&mut self, topic: &str, body: Option<&str>) -> Result<bool, String> {
+        match authorize_voice_action(&self.authorizer, topic, body)? {
+            AuthorizedVoiceAction::Provision => Ok(true),
+            AuthorizedVoiceAction::DidRoute(route) => {
+                if !self.desired_did_routes.contains_key(&route.did)
+                    && self.desired_did_routes.len() >= MAX_AUTHORIZED_DID_ROUTES
+                {
+                    return Err("authorized Voice intent journal is full".to_string());
+                }
+                let did = route.did;
+                let previous = self.desired_did_routes.insert(did.clone(), route.node_id);
+                if let Err(error) = self.persist_authorized_intents() {
+                    match previous {
+                        Some(value) => {
+                            self.desired_did_routes.insert(did, value);
+                        }
+                        None => {
+                            self.desired_did_routes.remove(&did);
+                        }
+                    }
+                    return Err(error);
+                }
+                Ok(true)
+            }
+            AuthorizedVoiceAction::Failover(failover) => {
+                if !self.desired_failover.contains_key(&failover.node_id)
+                    && self.desired_failover.len() >= MAX_AUTHORIZED_FAILOVER
+                {
+                    return Err("authorized Voice intent journal is full".to_string());
+                }
+                let node_id = failover.node_id;
+                let previous = self
+                    .desired_failover
+                    .insert(node_id.clone(), failover.policy);
+                if let Err(error) = self.persist_authorized_intents() {
+                    match previous {
+                        Some(value) => {
+                            self.desired_failover.insert(node_id, value);
+                        }
+                        None => {
+                            self.desired_failover.remove(&node_id);
+                        }
+                    }
+                    return Err(error);
+                }
+                Ok(true)
+            }
+            AuthorizedVoiceAction::SharedConfig(config) => {
+                let previous = self.desired_shared_config.replace(config);
+                if let Err(error) = self.persist_authorized_intents() {
+                    self.desired_shared_config = previous;
+                    return Err(error);
+                }
+                Ok(true)
+            }
+        }
+    }
+
     /// Only the elected leader provisions + holds the master key (lock 7).
     /// Reuses the shared leader lock — a cheap synchronous check per pass.
     fn is_leader(&self) -> bool {
@@ -1239,7 +1493,7 @@ impl VoiceProvisionWorker {
         // VOIP-GW-7 — apply + mirror the leader-held shared-outbound config first
         // (lock 13), so the cutover phase below reflects the current lift state
         // even when no node is enrolled yet.
-        let lifted = apply_shared_config(&store, persist);
+        let lifted = apply_shared_config_value(&store, self.desired_shared_config.as_ref());
         publish_shared_state(persist, &store);
 
         let desired = self.read_desired();
@@ -1249,11 +1503,25 @@ impl VoiceProvisionWorker {
             publish_cutover(persist, &derive_cutover_status(&[], lifted));
             return None;
         }
-        // Fold the operator's retained DID-route + failover intents off the Bus
-        // (latest-wins per key) so the reconcile drives them idempotently every
-        // pass — the desired side of lock 10 + 11 + 19.
-        let did_routes = read_desired_did_routes(persist);
-        let failover = read_desired_failover(persist);
+        // Re-apply the operator's already-authorized DID-route + failover
+        // intents (latest-wins per key) so the reconcile remains idempotent
+        // every pass — the desired side of lock 10 + 11 + 19.
+        let did_routes: Vec<DesiredDidRoute> = self
+            .desired_did_routes
+            .iter()
+            .map(|(did, node_id)| DesiredDidRoute {
+                did: did.clone(),
+                node_id: node_id.clone(),
+            })
+            .collect();
+        let failover: Vec<DesiredFailover> = self
+            .desired_failover
+            .iter()
+            .map(|(node_id, policy)| DesiredFailover {
+                node_id: node_id.clone(),
+                policy: policy.clone(),
+            })
+            .collect();
         // Resolve the client: the injected test client, else the live client
         // built from the sealed master creds. No master creds → publish a
         // Provisioning state for every node (honest "awaiting the master key")
@@ -1312,8 +1580,98 @@ struct FailoverRequest {
     policy: FailoverPolicy,
 }
 
+/// A Voice action that has passed the shared privileged-action boundary and
+/// may therefore update the worker's in-memory desired state.
+#[derive(Debug)]
+enum AuthorizedVoiceAction {
+    Provision,
+    DidRoute(DesiredDidRoute),
+    Failover(DesiredFailover),
+    SharedConfig(SharedOutboundConfig),
+}
+
+/// Verify one raw Voice action body before it can influence a reconcile pass.
+/// The exact body (including schema and armed token) is authenticated first;
+/// typed decoding happens only after authorization succeeds. This keeps an
+/// untrusted Bus message from reaching provider, routing, failover, or config
+/// side effects.
+fn authorize_voice_action(
+    authorizer: &ActionAuthorizer,
+    topic: &str,
+    body: Option<&str>,
+) -> Result<AuthorizedVoiceAction, String> {
+    let raw = body.unwrap_or_default();
+    let (verb, target) = match topic {
+        PROVISION_TOPIC => (VOICE_PROVISION_AUTH_VERB, "fleet".to_string()),
+        DID_ROUTE_TOPIC => {
+            let target = serde_json::from_str::<serde_json::Value>(raw)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("did")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .unwrap_or_default();
+            (VOICE_DID_ROUTE_AUTH_VERB, target)
+        }
+        FAILOVER_TOPIC => {
+            let target = serde_json::from_str::<serde_json::Value>(raw)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("node_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .unwrap_or_default();
+            (VOICE_FAILOVER_AUTH_VERB, target)
+        }
+        SHARED_CONFIG_TOPIC => (VOICE_SHARED_CONFIG_AUTH_VERB, "fleet".to_string()),
+        other => return Err(format!("unknown Voice action topic: {other}")),
+    };
+    authorizer.authorize(
+        raw,
+        MutationContext {
+            verb,
+            node: VOICE_AUTH_NODE,
+            target: &target,
+        },
+    )?;
+
+    match topic {
+        PROVISION_TOPIC => Ok(AuthorizedVoiceAction::Provision),
+        DID_ROUTE_TOPIC => {
+            let request: DidRouteRequest = serde_json::from_str(raw)
+                .map_err(|_| "did-route: request body is invalid".to_string())?;
+            Ok(AuthorizedVoiceAction::DidRoute(DesiredDidRoute {
+                did: request.did,
+                node_id: request.node_id,
+            }))
+        }
+        FAILOVER_TOPIC => {
+            let request: FailoverRequest = serde_json::from_str(raw)
+                .map_err(|_| "failover: request body is invalid".to_string())?;
+            Ok(AuthorizedVoiceAction::Failover(DesiredFailover {
+                node_id: request.node_id,
+                policy: request.policy,
+            }))
+        }
+        SHARED_CONFIG_TOPIC => {
+            let request: SharedConfigRequest = serde_json::from_str(raw)
+                .map_err(|_| "shared-config: request body is invalid".to_string())?;
+            Ok(AuthorizedVoiceAction::SharedConfig(SharedOutboundConfig {
+                caller_id: request.caller_id,
+                outbound_trunk: request.outbound_trunk,
+            }))
+        }
+        _ => unreachable!("topic was matched above"),
+    }
+}
+
 /// Fold the retained `action/voice/did-route` messages into the desired route
 /// set (lock 11), latest-wins per DID (ULID order is oldest→newest).
+#[cfg(test)]
 fn read_desired_did_routes(persist: &Persist) -> Vec<DesiredDidRoute> {
     let mut latest: HashMap<String, Option<String>> = HashMap::new();
     if let Ok(msgs) = persist.list_since(DID_ROUTE_TOPIC, None) {
@@ -1333,6 +1691,7 @@ fn read_desired_did_routes(persist: &Persist) -> Vec<DesiredDidRoute> {
 
 /// Fold the retained `action/voice/failover` messages into the desired policy
 /// set (lock 10), latest-wins per node.
+#[cfg(test)]
 fn read_desired_failover(persist: &Persist) -> Vec<DesiredFailover> {
     let mut latest: HashMap<String, FailoverPolicy> = HashMap::new();
     if let Ok(msgs) = persist.list_since(FAILOVER_TOPIC, None) {
@@ -1447,6 +1806,10 @@ impl Worker for VoiceProvisionWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
+        // Restore only the typed, already-authorized projection. The armed
+        // request bodies and spent nonces remain in the shared authorizer's
+        // durable replay ledger; restart never re-authorizes a Bus backlog.
+        self.load_authorized_intents();
         let Some(bus_root) = self.bus_root_override.clone().or_else(default_bus_root) else {
             tracing::warn!(
                 target: "mackesd::voice_provision",
@@ -1487,25 +1850,57 @@ impl Worker for VoiceProvisionWorker {
             if let Ok(msgs) = persist.list_since(PROVISION_TOPIC, cursor.as_deref()) {
                 for msg in msgs {
                     cursor = Some(msg.ulid);
-                    button_pressed = true;
+                    match self.accept_action(PROVISION_TOPIC, msg.body.as_deref()) {
+                        Ok(true) => button_pressed = true,
+                        Ok(false) => {}
+                        Err(error) => tracing::warn!(
+                            target: "mackesd::voice_provision",
+                            %error,
+                            "refused unauthorized Voice provision action"
+                        ),
+                    }
                 }
             }
             if let Ok(msgs) = persist.list_since(DID_ROUTE_TOPIC, did_cursor.as_deref()) {
                 for msg in msgs {
                     did_cursor = Some(msg.ulid);
-                    button_pressed = true;
+                    match self.accept_action(DID_ROUTE_TOPIC, msg.body.as_deref()) {
+                        Ok(true) => button_pressed = true,
+                        Ok(false) => {}
+                        Err(error) => tracing::warn!(
+                            target: "mackesd::voice_provision",
+                            %error,
+                            "refused unauthorized Voice DID-route action"
+                        ),
+                    }
                 }
             }
             if let Ok(msgs) = persist.list_since(SHARED_CONFIG_TOPIC, shared_cursor.as_deref()) {
                 for msg in msgs {
                     shared_cursor = Some(msg.ulid);
-                    button_pressed = true;
+                    match self.accept_action(SHARED_CONFIG_TOPIC, msg.body.as_deref()) {
+                        Ok(true) => button_pressed = true,
+                        Ok(false) => {}
+                        Err(error) => tracing::warn!(
+                            target: "mackesd::voice_provision",
+                            %error,
+                            "refused unauthorized Voice shared-config action"
+                        ),
+                    }
                 }
             }
             if let Ok(msgs) = persist.list_since(FAILOVER_TOPIC, failover_cursor.as_deref()) {
                 for msg in msgs {
                     failover_cursor = Some(msg.ulid);
-                    button_pressed = true;
+                    match self.accept_action(FAILOVER_TOPIC, msg.body.as_deref()) {
+                        Ok(true) => button_pressed = true,
+                        Ok(false) => {}
+                        Err(error) => tracing::warn!(
+                            target: "mackesd::voice_provision",
+                            %error,
+                            "refused unauthorized Voice failover action"
+                        ),
+                    }
                 }
             }
 
@@ -1545,7 +1940,11 @@ impl Worker for VoiceProvisionWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::action_auth::{ActionAuthorizer, authorize_test_body};
     use crate::vitelity::FakeVitelityClient;
+
+    const ACTION_KEY: &[u8] = b"voice-action-auth-test-key";
+    const ACTION_NOW: i64 = 1_700_000_000_000;
 
     /// A `LocalAead` store with a real mesh age identity (the same round-trip
     /// path production uses), so seal/unseal actually exercises the envelope.
@@ -1781,6 +2180,205 @@ mod tests {
     fn worker_name_is_voice_provision() {
         let w = VoiceProvisionWorker::new(std::env::temp_dir(), "peer:test".into());
         assert_eq!(w.name(), "voice_provision");
+    }
+
+    #[test]
+    fn voice_mutations_require_exact_single_use_authority_before_routing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let auth_root = tmp.path().join("action-auth");
+        let authorizer = Arc::new(ActionAuthorizer::for_test(
+            ACTION_KEY, auth_root, ACTION_NOW,
+        ));
+        let unsigned = serde_json::json!({
+            "schema_version": 1,
+            "did": "15551234567",
+            "node_id": "peer:eagle"
+        })
+        .to_string();
+
+        let mut worker = VoiceProvisionWorker::new(tmp.path().to_path_buf(), "peer:leader".into())
+            .with_db_path(tmp.path().join("voice.sqlite"))
+            .with_authorizer(Arc::clone(&authorizer));
+        // A hostile unsigned message is refused before it can enter the
+        // desired set that drives provider/routing effects.
+        assert!(worker
+            .accept_action(DID_ROUTE_TOPIC, Some(&unsigned))
+            .is_err());
+        assert!(worker.desired_did_routes.is_empty());
+
+        let context = MutationContext {
+            verb: VOICE_DID_ROUTE_AUTH_VERB,
+            node: VOICE_AUTH_NODE,
+            target: "15551234567",
+        };
+        let armed = authorize_test_body(
+            ACTION_KEY,
+            &unsigned,
+            context,
+            "voice-route-once",
+            ACTION_NOW + 30_000,
+        );
+        // Body tampering is rejected without claiming the valid nonce.
+        let tampered = armed.replace("peer:eagle", "peer:pine");
+        assert!(worker
+            .accept_action(DID_ROUTE_TOPIC, Some(&tampered))
+            .is_err());
+        assert!(worker.accept_action(DID_ROUTE_TOPIC, Some(&armed)).unwrap());
+        // A capability is durable single-use; replay cannot re-assert the
+        // intent or trigger another provider call.
+        assert!(worker
+            .accept_action(DID_ROUTE_TOPIC, Some(&armed))
+            .unwrap_err()
+            .contains("already used"));
+        let journal = std::fs::read_to_string(tmp.path().join(AUTHORIZED_INTENTS_FILE)).unwrap();
+        assert!(journal.contains("15551234567"));
+        assert!(!journal.contains("armed_token"));
+
+        // Restart restores the typed intent without attempting to spend the
+        // already-consumed capability again.
+        let mut restarted =
+            VoiceProvisionWorker::new(tmp.path().to_path_buf(), "peer:leader".into())
+                .with_db_path(tmp.path().join("voice.sqlite"))
+                .with_authorizer(authorizer);
+        restarted.load_authorized_intents();
+        assert_eq!(
+            restarted.desired_did_routes.get("15551234567"),
+            Some(&Some("peer:eagle".to_string()))
+        );
+
+        let store = seeded_store(tmp.path());
+        let db = tmp.path().join("nodes.sqlite");
+        let conn = crate::store::open(&db).unwrap();
+        crate::store::upsert_node(&conn, "peer:eagle", "eagle", "pk", None).unwrap();
+        drop(conn);
+        let bus = tempfile::tempdir().unwrap();
+        let client = FakeVitelityClient::new(DEFAULT_REALM).with_did("15551234567", None);
+        worker = restarted
+            .with_db_path(db)
+            .with_bus_root(bus.path().to_path_buf())
+            .with_store(store)
+            .with_client(Box::new(client));
+        let persist = Persist::open(bus.path().to_path_buf()).unwrap();
+        // The authorized route is the only intent admitted to reconcile, so
+        // the fake provider records the route only after that boundary.
+        let _ = worker.reconcile_and_publish(&persist);
+        let routed = worker
+            .client_override
+            .as_deref()
+            .unwrap()
+            .list_dids()
+            .unwrap();
+        assert_eq!(routed[0].routed_to, Some("eagle".to_string()));
+    }
+
+    #[test]
+    fn voice_config_and_failover_actions_are_authorized_before_state_update() {
+        let tmp = tempfile::tempdir().unwrap();
+        let authorizer = Arc::new(ActionAuthorizer::for_test(
+            ACTION_KEY,
+            tmp.path().join("action-auth"),
+            ACTION_NOW,
+        ));
+        let mut worker = VoiceProvisionWorker::new(tmp.path().to_path_buf(), "peer:leader".into())
+            .with_db_path(tmp.path().join("voice.sqlite"))
+            .with_authorizer(Arc::clone(&authorizer));
+
+        let config_unsigned = serde_json::json!({
+            "schema_version": 1,
+            "caller_id": "15551110000",
+            "outbound_trunk": "shared"
+        })
+        .to_string();
+        assert!(worker
+            .accept_action(SHARED_CONFIG_TOPIC, Some(&config_unsigned))
+            .is_err());
+        assert!(worker.desired_shared_config.is_none());
+        let config_armed = authorize_test_body(
+            ACTION_KEY,
+            &config_unsigned,
+            MutationContext {
+                verb: VOICE_SHARED_CONFIG_AUTH_VERB,
+                node: VOICE_AUTH_NODE,
+                target: "fleet",
+            },
+            "voice-config-once",
+            ACTION_NOW + 30_000,
+        );
+        assert!(worker
+            .accept_action(SHARED_CONFIG_TOPIC, Some(&config_armed))
+            .unwrap());
+        assert_eq!(
+            worker.desired_shared_config.as_ref().unwrap().caller_id,
+            "15551110000"
+        );
+
+        let failover_unsigned = serde_json::json!({
+            "schema_version": 1,
+            "node_id": "peer:eagle",
+            "policy": "Voicemail"
+        })
+        .to_string();
+        assert!(worker
+            .accept_action(FAILOVER_TOPIC, Some(&failover_unsigned))
+            .is_err());
+        assert!(worker.desired_failover.is_empty());
+        let failover_armed = authorize_test_body(
+            ACTION_KEY,
+            &failover_unsigned,
+            MutationContext {
+                verb: VOICE_FAILOVER_AUTH_VERB,
+                node: VOICE_AUTH_NODE,
+                target: "peer:eagle",
+            },
+            "voice-failover-once",
+            ACTION_NOW + 30_000,
+        );
+        assert!(worker
+            .accept_action(FAILOVER_TOPIC, Some(&failover_armed))
+            .unwrap());
+        assert_eq!(
+            worker.desired_failover.get("peer:eagle"),
+            Some(&FailoverPolicy::Voicemail)
+        );
+        let mut restarted =
+            VoiceProvisionWorker::new(tmp.path().to_path_buf(), "peer:leader".into())
+                .with_db_path(tmp.path().join("voice.sqlite"))
+                .with_authorizer(authorizer);
+        restarted.load_authorized_intents();
+        assert_eq!(
+            restarted
+                .desired_shared_config
+                .as_ref()
+                .unwrap()
+                .outbound_trunk,
+            "shared"
+        );
+        assert_eq!(
+            restarted.desired_failover.get("peer:eagle"),
+            Some(&FailoverPolicy::Voicemail)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_ignores_group_readable_state() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("voice.sqlite");
+        let path = db.with_file_name(AUTHORIZED_INTENTS_FILE);
+        let state = AuthorizedVoiceIntents {
+            schema_version: AUTHORIZED_INTENTS_SCHEMA_VERSION,
+            did_routes: BTreeMap::from([("15551234567".to_string(), Some("peer:eagle".into()))]),
+            ..AuthorizedVoiceIntents::default()
+        };
+        std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let mut worker = VoiceProvisionWorker::new(tmp.path().to_path_buf(), "peer:leader".into())
+            .with_db_path(db);
+        worker.load_authorized_intents();
+        assert!(worker.desired_did_routes.is_empty());
     }
 
     #[test]

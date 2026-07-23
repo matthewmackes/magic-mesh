@@ -57,12 +57,17 @@ use mde_bus::rpc::reply_topic;
 use serde::Deserialize;
 
 use super::{ShutdownToken, Worker};
+use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
 
 /// Env: the gateway endpoint (an IP or `ip:sshport`). Unset ⇒ the worker is a no-op.
 pub const GATEWAY_ENV: &str = "MDE_VEHICLE_GATEWAY";
 
 /// Env: the gateway `root` SSH password (later mde-seal; env is fine for now).
 pub const ROOT_PW_ENV: &str = "MDE_VEHICLE_ROOT_PW";
+
+/// Shared-Bus capability context for the destructive gateway reboot verb.
+const VEHICLE_REBOOT_AUTH_VERB: &str = "vehicle-reboot";
+const VEHICLE_REBOOT_AUTH_TARGET: &str = "gateway";
 
 /// Poll cadence — build + publish a fresh mirror every ~5 s. Doubles as the
 /// latest-wins heartbeat (a stale consumer always sees a recent stamp).
@@ -299,6 +304,8 @@ pub struct VehicleWorker {
     db_path: PathBuf,
     /// Poll + heartbeat cadence.
     poll: Duration,
+    /// Shared, fail-closed authorization gate for destructive Bus mutations.
+    authorizer: Arc<ActionAuthorizer>,
 }
 
 impl VehicleWorker {
@@ -317,6 +324,7 @@ impl VehicleWorker {
             bus_root: crate::bus_publish::default_bus_root(),
             db_path: crate::default_db_path(),
             poll: POLL,
+            authorizer: Arc::new(ActionAuthorizer::production()),
         }
     }
 
@@ -346,6 +354,14 @@ impl VehicleWorker {
     #[must_use]
     pub const fn with_poll(mut self, poll: Duration) -> Self {
         self.poll = poll;
+        self
+    }
+
+    /// Inject an isolated verifier and replay ledger for hostile action tests.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
+        self.authorizer = authorizer;
         self
     }
 
@@ -477,6 +493,30 @@ impl VehicleWorker {
                 ..Default::default()
             };
         };
+        if verb == VehicleVerb::Reboot {
+            if let Err(error) = self.authorizer.authorize(
+                body,
+                MutationContext {
+                    verb: VEHICLE_REBOOT_AUTH_VERB,
+                    node: &self.host,
+                    target: VEHICLE_REBOOT_AUTH_TARGET,
+                },
+            ) {
+                tracing::warn!(
+                    target: "mackesd::action_auth",
+                    host = %self.host,
+                    verb = verb_name,
+                    %error,
+                    "refused unauthorized vehicle reboot"
+                );
+                return VehicleReply {
+                    ok: false,
+                    verb: verb_name.to_string(),
+                    gated: Some(format!("privileged action refused: {error}")),
+                    ..Default::default()
+                };
+            }
+        }
         let body = VehicleActionBody::parse(body);
         match verb {
             VehicleVerb::GetConfig => self.handle_get_config(probe.as_ref(), verb_name, &body),
@@ -1094,6 +1134,7 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         wan: Result<String, String>,
         ssh_out: Result<String, String>,
         ssh_calls: Arc<std::sync::Mutex<Vec<String>>>,
+        general_calls: Arc<std::sync::Mutex<u32>>,
     }
 
     impl FakeProbe {
@@ -1125,12 +1166,17 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
                 wan: Ok(wan),
                 ssh_out: Ok(FAKE_YAML.to_string()),
                 ssh_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+                general_calls: Arc::new(std::sync::Mutex::new(0)),
             }
         }
 
         /// The commands `run_ssh` has been asked to run (a shared, clone-stable log).
         fn ssh_calls(&self) -> Vec<String> {
             self.ssh_calls.lock().unwrap().clone()
+        }
+
+        fn general_calls(&self) -> u32 {
+            *self.general_calls.lock().unwrap()
         }
     }
 
@@ -1144,6 +1190,7 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
             to_io(&self.nmea)
         }
         fn read_lci_general(&self) -> io::Result<String> {
+            *self.general_calls.lock().unwrap() += 1;
             to_io(&self.general)
         }
         fn read_lci_wan(&self) -> io::Result<String> {
@@ -1157,6 +1204,35 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
 
     fn worker() -> VehicleWorker {
         VehicleWorker::new("rig-1".to_string()).with_bus_root(None)
+    }
+
+    const ACTION_KEY: &[u8] = b"vehicle-action-auth-test-key";
+    const ACTION_NOW: i64 = 1_700_000_000_000;
+
+    fn reboot_context() -> MutationContext<'static> {
+        MutationContext {
+            verb: VEHICLE_REBOOT_AUTH_VERB,
+            node: "rig-1",
+            target: VEHICLE_REBOOT_AUTH_TARGET,
+        }
+    }
+
+    fn authorized_reboot_body(nonce: &str, typed_name: &str) -> String {
+        crate::ipc::action_auth::authorize_test_body(
+            ACTION_KEY,
+            &format!(r#"{{"schema_version":1,"typed_name":"{typed_name}"}}"#),
+            reboot_context(),
+            nonce,
+            ACTION_NOW + 30_000,
+        )
+    }
+
+    fn test_authorizer(root: &std::path::Path) -> Arc<ActionAuthorizer> {
+        Arc::new(ActionAuthorizer::for_test(
+            ACTION_KEY,
+            root.to_path_buf(),
+            ACTION_NOW,
+        ))
     }
 
     #[test]
@@ -1412,36 +1488,88 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         let reply = w.handle("reboot", "{}");
         assert!(!reply.ok);
         assert!(
-            reply.gated.unwrap().contains("typed-arm"),
-            "a bare reboot is typed-arm gated"
+            reply.gated.unwrap().contains("privileged action refused"),
+            "an unsigned reboot is authorization gated"
         );
         assert!(!reply.audited);
         assert!(fake.ssh_calls().is_empty(), "a gated reboot never runs ssh");
+        assert_eq!(
+            fake.general_calls(),
+            0,
+            "authorization runs before the ESN probe"
+        );
     }
 
     #[test]
-    fn reboot_with_the_wrong_typed_name_is_gated() {
+    fn reboot_with_the_wrong_typed_name_is_gated_after_authorization() {
+        let auth_tmp = tempfile::tempdir().unwrap();
         let fake = FakeProbe::real();
-        let w = worker().with_probe(Arc::new(fake.clone()));
-        // A typed_name that is NOT the gateway ESN does not arm.
-        let reply = w.handle("reboot", r#"{"typed_name":"reboot"}"#);
+        let body = authorized_reboot_body("vehicle-wrong-name", "reboot");
+        let w = worker()
+            .with_probe(Arc::new(fake.clone()))
+            .with_authorizer(test_authorizer(auth_tmp.path()));
+        let reply = w.handle("reboot", &body);
         assert!(!reply.ok);
         assert!(reply.gated.unwrap().contains("typed-arm"));
         assert!(fake.ssh_calls().is_empty());
+        assert_eq!(
+            fake.general_calls(),
+            1,
+            "typed arming follows authorization"
+        );
     }
 
     #[test]
     fn reboot_with_the_correct_esn_performs_and_audits() {
         let tmp = tempfile::tempdir().unwrap();
+        let auth_tmp = tempfile::tempdir().unwrap();
         let fake = FakeProbe::real();
         let w = worker()
             .with_probe(Arc::new(fake.clone()))
-            .with_db_path(tmp.path().join("events.sqlite"));
+            .with_db_path(tmp.path().join("events.sqlite"))
+            .with_authorizer(test_authorizer(auth_tmp.path()));
+        let body = authorized_reboot_body("vehicle-correct-name", "ND84720078011035");
         // The FakeProbe general.html reports ESN ND84720078011035.
-        let reply = w.handle("reboot", r#"{"typed_name":"ND84720078011035"}"#);
+        let reply = w.handle("reboot", &body);
         assert!(reply.ok, "gated: {:?} err: {:?}", reply.gated, reply.error);
         assert!(reply.audited, "a performed reboot is audited");
         assert_eq!(reply.applied.as_deref(), Some("reboot issued"));
+        assert_eq!(fake.ssh_calls().as_slice(), &["reboot"]);
+    }
+
+    #[test]
+    fn reboot_rejects_tamper_and_replay_before_second_ssh() {
+        let auth_tmp = tempfile::tempdir().unwrap();
+        let fake = FakeProbe::real();
+        let w = worker()
+            .with_probe(Arc::new(fake.clone()))
+            .with_authorizer(test_authorizer(auth_tmp.path()));
+        let body = authorized_reboot_body("vehicle-replay", "ND84720078011035");
+        let tampered = body.replace("ND84720078011035", "ND84720078011036");
+
+        let refusal = w.handle("reboot", &tampered);
+        assert!(!refusal.ok);
+        assert!(refusal.gated.unwrap().contains("refused"));
+        assert_eq!(
+            fake.general_calls(),
+            0,
+            "tamper is refused before the ESN probe"
+        );
+        assert!(fake.ssh_calls().is_empty());
+
+        let first = w.handle("reboot", &body);
+        assert!(first.ok);
+        assert_eq!(fake.general_calls(), 1);
+        assert_eq!(fake.ssh_calls().as_slice(), &["reboot"]);
+
+        let replay = w.handle("reboot", &body);
+        assert!(!replay.ok);
+        assert!(replay.gated.unwrap().contains("already used"));
+        assert_eq!(
+            fake.general_calls(),
+            1,
+            "replay is refused before the ESN probe"
+        );
         assert_eq!(fake.ssh_calls().as_slice(), &["reboot"]);
     }
 
