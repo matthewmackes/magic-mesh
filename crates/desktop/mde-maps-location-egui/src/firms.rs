@@ -12,6 +12,12 @@ use mde_egui::Style;
 /// Three missed fifteen-minute polls make retained FIRMS hotspots stale.
 pub const SNAPSHOT_STALE_AFTER_MS: i64 = 45 * 60 * 1_000;
 
+/// Keep an untrusted retained hotspot set bounded before projection and paint.
+const MAX_PAINTABLE_HOTSPOTS: usize = 256;
+/// A producer clock may be a few seconds ahead, but not enough to make a
+/// retained future snapshot look like a current successful fetch.
+const MAX_TIMESTAMP_FUTURE_SKEW_MS: i64 = 5_000;
+
 const HOTSPOT_FILL: Color32 = Color32::from_rgb(0xFF, 0xA0, 0x00); // style-leak-ok: map-content-color
 const HOTSPOT_CORE: Color32 = Color32::from_rgb(0xFF, 0xE0, 0x57); // style-leak-ok: map-content-color
 
@@ -35,6 +41,19 @@ impl FirmsLayerState {
             .as_ref()?
             .fetched_at_ms
             .map(|fetched| now_ms.saturating_sub(fetched).max(0))
+    }
+
+    /// Whether the retained producer timestamps are too far ahead of the
+    /// consumer clock to be trusted as current data.
+    #[must_use]
+    pub fn future_dated(&self, now_ms: i64) -> bool {
+        self.snapshot.as_ref().is_some_and(|snapshot| {
+            let latest_credible = now_ms.saturating_add(MAX_TIMESTAMP_FUTURE_SKEW_MS);
+            snapshot.published_at_ms > latest_credible
+                || snapshot
+                    .fetched_at_ms
+                    .is_some_and(|fetched| fetched > latest_credible)
+        })
     }
 
     /// Whether the retained successful fetch is older than three poll periods.
@@ -103,16 +122,21 @@ where
     }
 
     let mut stats = PaintStats::default();
-    let dimmed = layer.stale(now_ms) || layer.paused();
+    let dimmed = layer.stale(now_ms) || layer.paused() || layer.future_dated(now_ms);
     if let Some(snapshot) = &layer.snapshot {
         // A retained body with unconfigured/secret-error availability is not
         // evidence of a successful query.  Do not trust any malformed hotspot
         // rows that may have been carried alongside that status.
         let ready =
             snapshot.availability == FirmsAvailability::Ready && snapshot.fetched_at_ms.is_some();
-        if ready {
+        if ready && !layer.future_dated(now_ms) {
             let hotspot_painter = painter.with_clip_rect(rect.intersect(painter.clip_rect()));
-            for hotspot in &snapshot.hotspots {
+            for hotspot in snapshot
+                .hotspots
+                .iter()
+                .take(MAX_PAINTABLE_HOTSPOTS)
+                .filter(|hotspot| hotspot_is_paintable(hotspot, snapshot, now_ms))
+            {
                 let Some(point) = project(hotspot.latitude, hotspot.longitude) else {
                     continue;
                 };
@@ -127,6 +151,17 @@ where
     paint_status_badge(painter, rect, layer, now_ms);
     stats.badge = true;
     stats
+}
+
+fn hotspot_is_paintable(hotspot: &FirmsHotspot, snapshot: &FirmsSnapshot, now_ms: i64) -> bool {
+    hotspot.latitude.is_finite()
+        && (-90.0..=90.0).contains(&hotspot.latitude)
+        && hotspot.longitude.is_finite()
+        && (-180.0..=180.0).contains(&hotspot.longitude)
+        && hotspot.observed_at_ms <= now_ms.saturating_add(MAX_TIMESTAMP_FUTURE_SKEW_MS)
+        && snapshot.fetched_at_ms.is_none_or(|fetched| {
+            hotspot.observed_at_ms <= fetched.saturating_add(MAX_TIMESTAMP_FUTURE_SKEW_MS)
+        })
 }
 
 fn paint_hotspot(painter: &Painter, point: Pos2, hotspot: &FirmsHotspot, dimmed: bool) {
@@ -166,6 +201,13 @@ fn paint_status_badge(painter: &Painter, rect: Rect, layer: &FirmsLayerState, no
             "Wildfire · FIRMS secret store unavailable".to_string(),
             Style::DANGER,
         ),
+        (Some(snapshot), _) if layer.future_dated(now_ms) => (
+            format!(
+                "Wildfire · FIRMS FUTURE · {} hotspots",
+                hotspot_count_label(snapshot)
+            ),
+            Style::WARN,
+        ),
         (Some(_), age) if layer.paused() => (
             format!(
                 "Wildfire · FIRMS PAUSED · {}",
@@ -181,7 +223,7 @@ fn paint_status_badge(painter: &Painter, rect: Rect, layer: &FirmsLayerState, no
             format!(
                 "Wildfire · FIRMS {} · {} hotspots · degraded",
                 age_label(age),
-                snapshot.hotspots.len()
+                hotspot_count_label(snapshot)
             ),
             Style::WARN,
         ),
@@ -189,7 +231,7 @@ fn paint_status_badge(painter: &Painter, rect: Rect, layer: &FirmsLayerState, no
             format!(
                 "Wildfire · FIRMS {} · {} hotspots",
                 age_label(age),
-                snapshot.hotspots.len()
+                hotspot_count_label(snapshot)
             ),
             Style::TEXT,
         ),
@@ -216,6 +258,14 @@ fn paint_status_badge(painter: &Painter, rect: Rect, layer: &FirmsLayerState, no
         egui::StrokeKind::Inside,
     );
     painter.galley(badge.left_top() + pad, galley, tone);
+}
+
+fn hotspot_count_label(snapshot: &FirmsSnapshot) -> String {
+    if snapshot.hotspots.len() > MAX_PAINTABLE_HOTSPOTS {
+        format!("{}+", MAX_PAINTABLE_HOTSPOTS)
+    } else {
+        snapshot.hotspots.len().to_string()
+    }
 }
 
 fn age_label(age_ms: i64) -> String {
@@ -316,5 +366,87 @@ mod tests {
         assert_eq!(stats.hotspots, 1);
         assert!(stats.badge);
         assert!(ctx.tessellate(output.shapes, output.pixels_per_point).len() >= 3);
+    }
+
+    #[test]
+    fn malformed_and_future_hotspots_are_not_projected() {
+        let now_ms = 10_000_000;
+        let mut retained = snapshot(now_ms);
+        retained.hotspots.push(FirmsHotspot {
+            latitude: f64::NAN,
+            ..retained.hotspots[0].clone()
+        });
+        retained.hotspots.push(FirmsHotspot {
+            longitude: 181.0,
+            ..retained.hotspots[0].clone()
+        });
+        retained.hotspots.push(FirmsHotspot {
+            observed_at_ms: now_ms + MAX_TIMESTAMP_FUTURE_SKEW_MS + 1,
+            ..retained.hotspots[0].clone()
+        });
+        let mut layer = FirmsLayerState::default();
+        layer.fold(retained);
+        let ctx = egui::Context::default();
+        let mut projected = 0;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = ui.max_rect();
+                let _ = paint_layer(ui.painter(), rect, &layer, now_ms, |_lat, _lon| {
+                    projected += 1;
+                    Some(rect.center())
+                });
+            });
+        });
+        assert_eq!(projected, 1);
+    }
+
+    #[test]
+    fn oversized_retained_snapshot_is_bounded_at_the_paint_boundary() {
+        let now_ms = 10_000_000;
+        let base = snapshot(now_ms).hotspots[0].clone();
+        let mut retained = snapshot(now_ms);
+        retained.hotspots = (0..(MAX_PAINTABLE_HOTSPOTS + 32))
+            .map(|index| FirmsHotspot {
+                id: format!("hot-{index}"),
+                latitude: base.latitude,
+                longitude: base.longitude,
+                ..base.clone()
+            })
+            .collect();
+        let mut layer = FirmsLayerState::default();
+        layer.fold(retained);
+        let ctx = egui::Context::default();
+        let mut stats = PaintStats::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = ui.max_rect();
+                stats = paint_layer(ui.painter(), rect, &layer, now_ms, |_lat, _lon| {
+                    Some(rect.center())
+                });
+            });
+        });
+        assert_eq!(stats.hotspots, MAX_PAINTABLE_HOTSPOTS);
+    }
+
+    #[test]
+    fn future_snapshot_is_not_painted_as_current() {
+        let now_ms = 10_000_000;
+        let mut retained = snapshot(now_ms);
+        retained.published_at_ms = now_ms + MAX_TIMESTAMP_FUTURE_SKEW_MS + 1;
+        retained.fetched_at_ms = Some(now_ms + MAX_TIMESTAMP_FUTURE_SKEW_MS + 1);
+        let mut layer = FirmsLayerState::default();
+        layer.fold(retained);
+        assert!(layer.future_dated(now_ms));
+        let ctx = egui::Context::default();
+        let mut stats = PaintStats::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                stats = paint_layer(ui.painter(), ui.max_rect(), &layer, now_ms, |_lat, _lon| {
+                    Some(ui.max_rect().center())
+                });
+            });
+        });
+        assert_eq!(stats.hotspots, 0);
+        assert!(stats.badge);
     }
 }

@@ -158,6 +158,142 @@ pub struct CarHomeGlance {
     pub vehicle: Option<String>,
 }
 
+/// Keep untrusted gateway strings from creating huge galleys on a moving Car
+/// dashboard. This is a render-side budget; the source value remains intact so
+/// the shell's live model does not silently lose information.
+const MAX_CARD_TEXT_CHARS: usize = 128;
+const MAX_EXACT_ALERT_COUNT: usize = 999;
+
+/// Normalize a gateway value to one bounded, single-line render source.
+///
+/// Returning the truncation bit separately lets the width fitter distinguish a
+/// source that was already capped from one that merely happens to end at the
+/// character budget. Iteration stops at the budget plus one character, so a
+/// pathological payload never gets scanned or copied in full by the painter.
+fn bounded_single_line(text: &str) -> (String, bool) {
+    let mut out = String::with_capacity(text.len().min(MAX_CARD_TEXT_CHARS));
+    let mut last_was_space = false;
+    let mut chars = text.chars();
+    for ch in chars.by_ref().take(MAX_CARD_TEXT_CHARS) {
+        if ch.is_whitespace() || ch.is_control() {
+            if !out.is_empty() && !last_was_space {
+                out.push(' ');
+                last_was_space = true;
+            }
+        } else {
+            out.push(ch);
+            last_was_space = false;
+        }
+    }
+    let truncated = chars.next().is_some();
+    while out.ends_with(' ') {
+        out.pop();
+    }
+    (out, truncated)
+}
+
+/// Width-fit one card value before handing it to egui's text layout.
+///
+/// The source is bounded first, then binary-searched by Unicode scalar value
+/// count. That keeps the expensive layout work logarithmic and never splits a
+/// UTF-8 code point; the final ellipsis makes the loss visible to the driver.
+fn fit_card_text(
+    painter: &egui::Painter,
+    text: &str,
+    font: &egui::FontId,
+    max_width: f32,
+) -> String {
+    let (source, truncated) = bounded_single_line(text);
+    if source.is_empty() {
+        return source;
+    }
+    let max_width = if max_width.is_finite() {
+        max_width.max(1.0)
+    } else {
+        1.0
+    };
+    let candidate = if truncated {
+        format!("{source}…")
+    } else {
+        source.clone()
+    };
+    if painter
+        .layout_no_wrap(candidate.clone(), font.clone(), Color32::WHITE)
+        .size()
+        .x
+        <= max_width
+    {
+        return candidate;
+    }
+
+    let chars: Vec<char> = source.chars().collect();
+    let mut low = 0;
+    let mut high = chars.len();
+    while low < high {
+        let mid = (low + high).div_ceil(2);
+        let prefix: String = chars.iter().take(mid).collect();
+        let candidate = format!("{prefix}…");
+        if painter
+            .layout_no_wrap(candidate, font.clone(), Color32::WHITE)
+            .size()
+            .x
+            <= max_width
+        {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    if low == 0 {
+        "…".to_string()
+    } else {
+        let prefix: String = chars.into_iter().take(low).collect();
+        format!("{prefix}…")
+    }
+}
+
+/// Paint a left-anchored value at the bottom of a card without allowing its
+/// galley to escape the card's inner width.
+fn paint_card_bottom_line(
+    painter: &egui::Painter,
+    rect: Rect,
+    text: &str,
+    font: egui::FontId,
+    color: Color32,
+) {
+    let max_width = (rect.width() - Style::SP_M * 2.0).max(1.0);
+    let line = fit_card_text(painter, text, &font, max_width);
+    let galley = painter.layout_no_wrap(line, font, color);
+    painter.galley(
+        egui::pos2(
+            rect.left() + Style::SP_M,
+            rect.bottom() - Style::SP_M - galley.size().y,
+        ),
+        galley,
+        color,
+    );
+}
+
+/// Paint a left-anchored value centered in a glance row, reserving the row's
+/// right inset so a live value cannot touch the card edge.
+fn paint_glance_line(
+    painter: &egui::Painter,
+    rect: Rect,
+    left: f32,
+    text: &str,
+    font: egui::FontId,
+    color: Color32,
+) {
+    let max_width = (rect.right() - left - Style::SP_S).max(1.0);
+    let line = fit_card_text(painter, text, &font, max_width);
+    let galley = painter.layout_no_wrap(line, font, color);
+    painter.galley(
+        egui::pos2(left, rect.center().y - galley.size().y / 2.0),
+        galley,
+        color,
+    );
+}
+
 impl CarHomeGlance {
     /// A gateway can publish an optional field with an empty payload while its
     /// feed is present but sparse. Treat that exactly like absent data: an
@@ -194,7 +330,13 @@ impl CarHomeGlance {
     #[must_use]
     pub fn comms_line(&self) -> String {
         match self.comms {
-            Some(n) if n > 0 => format!("{n} alert{}", if n == 1 { "" } else { "s" }),
+            Some(n) if n > 0 => {
+                if n > MAX_EXACT_ALERT_COUNT {
+                    "999+ alerts".to_string()
+                } else {
+                    format!("{n} alert{}", if n == 1 { "" } else { "s" })
+                }
+            }
             _ => "Alerts & messages".to_string(),
         }
     }
@@ -464,10 +606,10 @@ fn paint_nav_card(ui: &mut Ui, painter: &egui::Painter, rect: Rect, g: &CarHomeG
     // The glance line — live values read strong, the absent-data prompt reads
     // dim (the honesty cue: a fallback never masquerades as a reading).
     let live = g.nav_value().is_some();
-    p.text(
-        egui::pos2(rect.left() + Style::SP_M, rect.bottom() - Style::SP_M),
-        egui::Align2::LEFT_BOTTOM,
-        g.nav_line(),
+    paint_card_bottom_line(
+        &p,
+        rect,
+        &g.nav_line(),
         Style::typography_font(TypographyRole::Title),
         if live {
             Style::SYNC3_TEXT_STRONG
@@ -486,10 +628,10 @@ fn paint_media_card(ui: &mut Ui, painter: &egui::Painter, rect: Rect, g: &CarHom
     };
     card_header(ui, &p, rect, IconId::Media, "Media");
     let live = g.media_value().is_some();
-    p.text(
-        egui::pos2(rect.left() + Style::SP_M, rect.bottom() - Style::SP_M),
-        egui::Align2::LEFT_BOTTOM,
-        g.media_line(),
+    paint_card_bottom_line(
+        &p,
+        rect,
+        &g.media_line(),
         Style::typography_font(TypographyRole::Body),
         if live {
             Style::SYNC3_TEXT_STRONG
@@ -526,9 +668,10 @@ fn glance_row(
             Color32::WHITE,
         );
     }
-    p.text(
-        egui::pos2(rect.left() + edge + Style::SP_S, rect.center().y),
-        egui::Align2::LEFT_CENTER,
+    paint_glance_line(
+        p,
+        rect,
+        rect.left() + edge + Style::SP_S,
         line,
         Style::typography_font(TypographyRole::Body),
         if live {
@@ -724,6 +867,46 @@ mod tests {
             .comms_line(),
             "Alerts & messages"
         );
+        assert_eq!(
+            CarHomeGlance {
+                comms: Some(MAX_EXACT_ALERT_COUNT + 1),
+                ..Default::default()
+            }
+            .comms_line(),
+            "999+ alerts"
+        );
+    }
+
+    #[test]
+    fn dashboard_bounds_hostile_live_text_before_painting() {
+        let hostile = format!("Destination\n{}", "🚗".repeat(MAX_CARD_TEXT_CHARS * 16));
+        let glance = CarHomeGlance {
+            nav: Some(hostile.clone()),
+            media: Some(hostile.clone()),
+            comms: Some(usize::MAX),
+            vehicle: Some(hostile),
+        };
+        let (_, shapes) = drive_with_screen(&glance, vec![vec![]], vec2(512.0, 640.0));
+        let texts = painted_text(&shapes);
+        let truncated = texts
+            .iter()
+            .filter(|text| text.ends_with('…'))
+            .collect::<Vec<_>>();
+
+        // Nav, Media, and Vehicle each receive a bounded, visible truncation
+        // marker; no newline can turn a moving-card value into a second line.
+        assert_eq!(truncated.len(), 3, "bounded live values in {texts:?}");
+        assert!(texts.iter().all(|text| !text.contains('\n')));
+        assert!(
+            truncated
+                .iter()
+                .all(|text| text.chars().count() <= MAX_CARD_TEXT_CHARS + 1),
+            "painted values remain within the scalar budget: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text == "999+ alerts"),
+            "large counts use an honest bounded indicator: {texts:?}"
+        );
     }
 
     /// Q31 — the split-card band owns the vertical majority, the Nav card is the
@@ -908,12 +1091,13 @@ mod tests {
 
     #[test]
     fn dashboard_renders_an_honest_notice_when_touch_layout_does_not_fit() {
-        let (picks, shapes) = drive_with_screen(
-            &CarHomeGlance::default(),
-            vec![vec![]],
-            vec2(420.0, 220.0),
+        let (picks, shapes) =
+            drive_with_screen(&CarHomeGlance::default(), vec![vec![]], vec2(420.0, 220.0));
+        assert_eq!(
+            picks,
+            vec![None],
+            "a too-small workspace has no active target"
         );
-        assert_eq!(picks, vec![None], "a too-small workspace has no active target");
         let texts = painted_text(&shapes);
         assert!(
             texts

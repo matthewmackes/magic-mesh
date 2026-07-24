@@ -396,6 +396,12 @@ These decisions refine acceptance and sequencing for the active items below.
   before CA, certificate, or private-key materialization. Four hostile
   symlink/non-directory regressions are included in the BigBoy supervisor gate
   at 39/39; live Nebula rotation remains external.
+- Progress (2026-07-25 identity-generation retention boundary): after an
+  authenticated atomic identity switch, the supervisor now removes only
+  owner-controlled, mode-0700 prior generation directories matching its
+  generated name grammar; unexpected names, symlinks, and unsafe metadata are
+  preserved. The focused BigBoy supervisor gate is green at 42/42, including
+  prior-generation pruning; live rotation/reconnect evidence remains external.
 - Priority: P0
 - Complexity: Epic
 - Problem: Any node able to read replicated enrollment bundles can obtain other
@@ -1171,6 +1177,20 @@ These decisions refine acceptance and sequencing for the active items below.
   retained tracks before dead reckoning, projection, label layout, or painting,
   preserving valid aircraft within the typed 256-track budget. The focused
   aircraft gate is green at 1/1; live ADS-B acceptance remains external.
+- Progress (2026-07-25 FIRMS consumer bound): the thermal-hotspot layer now
+  caps retained rows before projection and painting, rejects malformed or
+  future-dated coordinates/timestamps, and reports a capped `256+` badge
+  honestly. The focused FIRMS gate is green at 8/8 and the integrated Maps
+  library gate at 205/205; live FIRMS credentials/fix acceptance remains
+  external.
+- Progress (2026-07-25 transit consumer bound): the MBTA layer now caps retained
+  vehicles before projection and label layout, validates feed/observation time
+  and geographic coordinates, and marks future snapshots non-current. The
+  focused transit gate is green at 7/7; live MBTA acceptance remains external.
+- Progress (2026-07-25 radar consumer bound): the IEM/NEXRAD layer now caps the
+  animation history at six frames and four tiles per frame, bounds cached
+  textures and decoded RGBA output, and validates tile geometry before decode.
+  The focused radar gate is green at 6/6; live radar acceptance remains external.
 - Progress (2026-07-24 live-mirror proof-tool no-follow hardening): the
   read-only verifier now rejects traversal, symlinked parents/leaves, and
   non-regular indexed files, then performs the final read with `O_NOFOLLOW` and
@@ -1722,6 +1742,12 @@ These decisions refine acceptance and sequencing for the active items below.
   while retaining full WidgetInfo route names and 44pt touch targets. The focused
   BigBoy narrow-strip gate is green at 1/1; live MG90 and physical Car evidence
   remains external.
+- Progress (2026-07-25 Car glance text boundary): route, media, and telematics
+  card values are normalized to bounded single-line render text, width-fit with
+  visible ellipses, and large alert counts use the honest `999+ alerts` form.
+  Existing 44pt targets and no-data fallbacks remain intact; the integrated shell
+  Car Home gate is green at 11/11. Live MG90 and physical Car evidence remains
+  external.
 - Progress (2026-07-23 live mirror proof): the MG90 gateway at `172.20.0.25`
   is reachable from the network (ping and TCP/2222), and `.15`'s active
   `mackesd` is publishing a fresh `state/vehicle/Basement-Test-Workstation`

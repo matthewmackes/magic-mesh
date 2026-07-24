@@ -678,7 +678,99 @@ fn install_identity_generation(
         &config_dir.join("host.key"),
         Path::new("identity/current/host.key"),
     )?;
+    // A rotation leaves the previous generation holding the old private key.
+    // Once the atomic switch and compatibility links are installed, only the
+    // active generation is useful; retaining every historical key would make
+    // local identity storage grow without bound.
+    if let Err(error) = prune_identity_generations(&identity_dir, generation_leaf) {
+        tracing::warn!(
+            error = %error,
+            path = %identity_dir.display(),
+            "nebula-supervisor: stale identity generation cleanup failed"
+        );
+    }
     Ok(())
+}
+
+fn is_identity_generation_name(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let Some(suffix) = name.strip_prefix("generation-") else {
+        return false;
+    };
+    let Some((pid, nonce)) = suffix.split_once('-') else {
+        return false;
+    };
+    !pid.is_empty()
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+        && nonce.len() == 16
+        && nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Remove only supervisor-created, owner-controlled generation directories
+/// other than the active one. Unexpected names, symlinks, and unsafe metadata
+/// are left untouched rather than turning cleanup into a destructive sweep.
+fn prune_identity_generations(
+    identity_dir: &Path,
+    active_generation: &std::ffi::OsStr,
+) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let entries = std::fs::read_dir(identity_dir).map_err(|error| {
+        format!(
+            "scan identity generations {}: {error}",
+            identity_dir.display()
+        )
+    })?;
+    let mut first_error = None;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                first_error.get_or_insert_with(|| {
+                    format!(
+                        "read identity generation entry {}: {error}",
+                        identity_dir.display()
+                    )
+                });
+                continue;
+            }
+        };
+        let name = entry.file_name();
+        if name.as_os_str() == active_generation || !is_identity_generation_name(name.as_os_str()) {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                first_error.get_or_insert_with(|| {
+                    format!(
+                        "inspect stale identity generation {}: {error}",
+                        path.display()
+                    )
+                });
+                continue;
+            }
+        };
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || metadata.uid() != rustix::process::getuid().as_raw()
+            || metadata.permissions().mode() & 0o777 != 0o700
+        {
+            continue;
+        }
+        if let Err(error) = std::fs::remove_dir_all(&path) {
+            first_error.get_or_insert_with(|| {
+                format!(
+                    "remove stale identity generation {}: {error}",
+                    path.display()
+                )
+            });
+        }
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
 fn replace_symlink(path: &Path, target: &Path) -> Result<(), String> {
@@ -1370,6 +1462,59 @@ mod tests {
         assert_eq!(
             crate::ca::seal::read_sealed(&tmp.path().join("identity/current/host.key")).unwrap(),
             b"key-generation-b"
+        );
+    }
+
+    #[test]
+    fn authenticated_identity_rotation_prunes_previous_generation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let first = sample_bundle();
+        materialize_config(
+            tmp.path(),
+            &first,
+            ConfigRole::Peer,
+            &[],
+            tmp.path(),
+            Some(b"key-generation-a"),
+        )
+        .expect("first identity");
+        let first_generation = std::fs::read_link(tmp.path().join("identity/current"))
+            .expect("first identity switch")
+            .file_name()
+            .expect("first generation name")
+            .to_os_string();
+
+        let mut second = first;
+        second.peer_cert_pem = "cert-generation-b".into();
+        materialize_config(
+            tmp.path(),
+            &second,
+            ConfigRole::Peer,
+            &[],
+            tmp.path(),
+            Some(b"key-generation-b"),
+        )
+        .expect("authenticated rotation");
+        let second_generation = std::fs::read_link(tmp.path().join("identity/current"))
+            .expect("second identity switch")
+            .file_name()
+            .expect("second generation name")
+            .to_os_string();
+
+        assert_ne!(first_generation, second_generation);
+        let generations: Vec<_> = std::fs::read_dir(tmp.path().join("identity"))
+            .expect("identity directory")
+            .map(|entry| entry.expect("identity entry").file_name())
+            .filter(|name| is_identity_generation_name(name.as_os_str()))
+            .collect();
+        assert_eq!(
+            generations,
+            vec![second_generation],
+            "rotation must not retain prior private-key generations"
+        );
+        assert!(
+            !tmp.path().join("identity").join(first_generation).exists(),
+            "the previous generation must be removed after the atomic switch"
         );
     }
 
