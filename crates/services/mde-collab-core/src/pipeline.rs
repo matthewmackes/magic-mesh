@@ -304,6 +304,9 @@ pub fn apply_command<S: EventSigner, I: IdSource>(
             body,
         } => {
             require_active_space(state, *space)?;
+            // Authorship is not a standing capability: a departed author may
+            // not mint another message mutation after leaving the space.
+            require_member(state, *space, &ctx.actor)?;
             let msg = require_message(state, *space, *target)?;
             if msg.author != ctx.actor {
                 return Err(CollabError::NotAuthor(*target));
@@ -322,6 +325,9 @@ pub fn apply_command<S: EventSigner, I: IdSource>(
         }
         CollabCommand::DeleteMessage { space, target } => {
             require_active_space(state, *space)?;
+            // Keep deletion under the same current-membership boundary as
+            // editing; the author check below alone is historical identity.
+            require_member(state, *space, &ctx.actor)?;
             let msg = require_message(state, *space, *target)?;
             if msg.author != ctx.actor {
                 return Err(CollabError::NotAuthor(*target));
@@ -1117,6 +1123,80 @@ mod tests {
                     space: denied_space,
                     actor
                 }) if denied_space == space && actor == ActorId::new("mallory")
+            ));
+        }
+    }
+
+    #[test]
+    fn message_mutations_require_current_space_membership_after_author_leaves() {
+        let signer = Ed25519Signer::from_seed([10; 32]);
+        let mut ids = SeqIds(60);
+        let mut alice = ApplyCtx::new(ActorId::new("alice"), 1_000, &signer, &mut ids);
+
+        let created = apply_command(
+            &DomainState::default(),
+            &CollabCommand::CreateSpace {
+                kind: SpaceKind::Team,
+                name: "ops".into(),
+            },
+            &mut alice,
+        )
+        .expect("create space");
+        let space = created[0].space_id;
+        let mut events = created;
+
+        let added = apply_command(
+            &DomainState::from_events(&events),
+            &CollabCommand::AddMember {
+                space,
+                actor: ActorId::new("bob"),
+                role: SpaceRole::Member,
+            },
+            &mut alice,
+        )
+        .expect("add bob");
+        events.extend(added);
+
+        let mut bob = ApplyCtx::new(ActorId::new("bob"), 1_100, &signer, &mut ids);
+        let posted = apply_command(
+            &DomainState::from_events(&events),
+            &CollabCommand::SendMessage {
+                space,
+                thread: None,
+                body: MessageBody::new("before departure"),
+            },
+            &mut bob,
+        )
+        .expect("post message");
+        let target = posted[0].event_id;
+        events.extend(posted);
+
+        let left = apply_command(
+            &DomainState::from_events(&events),
+            &CollabCommand::LeaveSpace { space },
+            &mut bob,
+        )
+        .expect("bob leaves");
+        events.extend(left);
+        let state = DomainState::from_events(&events);
+        assert!(!state.is_member(space, &ActorId::new("bob")));
+
+        let mut departed_bob = ApplyCtx::new(ActorId::new("bob"), 1_200, &signer, &mut ids);
+        for command in [
+            CollabCommand::EditMessage {
+                space,
+                target,
+                body: MessageBody::new("stale edit"),
+            },
+            CollabCommand::DeleteMessage { space, target },
+        ] {
+            let denied = apply_command(&state, &command, &mut departed_bob);
+            assert!(matches!(
+                denied,
+                Err(CollabError::NotMember {
+                    space: denied_space,
+                    actor
+                }) if denied_space == space && actor == ActorId::new("bob")
             ));
         }
     }
