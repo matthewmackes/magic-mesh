@@ -28,6 +28,10 @@ pub const POLL: Duration = Duration::from_secs(5);
 /// that is implausibly newer than the local publication. A future-dated
 /// observation can make stale cached contacts appear to be the newest scan.
 const MAX_SCAN_FUTURE_SKEW_MS: i64 = 5_000;
+/// Do not republish contacts from a source observation older than the worker's
+/// bounded freshness window. The publication timestamp is local and therefore
+/// cannot by itself prove that the scanner data is current.
+const MAX_SCAN_AGE_MS: i64 = 30_000;
 
 /// Injectable typed MG90 survey seam.
 ///
@@ -101,14 +105,23 @@ impl AirspaceWorker {
             Ok(survey) => {
                 let mut snapshot =
                     AirspaceSnapshot::from_survey(&self.host, published_at_ms, survey);
-                if snapshot.scanned_at_ms.is_some_and(|scanned_at_ms| {
-                    scanned_at_ms > published_at_ms.saturating_add(MAX_SCAN_FUTURE_SKEW_MS)
-                }) {
-                    snapshot.scanned_at_ms = None;
-                    if snapshot.gaps.len() < mackes_mesh_types::airspace::MAX_GAPS {
-                        snapshot
-                            .gaps
-                            .push("MG90 scan timestamp exceeded the allowed future skew".into());
+                if let Some(scanned_at_ms) = snapshot.scanned_at_ms {
+                    if scanned_at_ms > published_at_ms.saturating_add(MAX_SCAN_FUTURE_SKEW_MS) {
+                        snapshot.scanned_at_ms = None;
+                        if snapshot.gaps.len() < mackes_mesh_types::airspace::MAX_GAPS {
+                            snapshot.gaps.push(
+                                "MG90 scan timestamp exceeded the allowed future skew".into(),
+                            );
+                        }
+                    } else if published_at_ms.saturating_sub(scanned_at_ms) > MAX_SCAN_AGE_MS {
+                        // Keep the stale source from looking live merely because this
+                        // worker just published a fresh envelope. Emptying the
+                        // snapshot retracts stale contacts at the latest-wins seam.
+                        snapshot = AirspaceSnapshot::offline(
+                            &self.host,
+                            published_at_ms,
+                            "MG90 scan timestamp exceeded the allowed freshness window",
+                        );
                     }
                 }
                 snapshot
@@ -273,7 +286,7 @@ mod tests {
         let mut worker = AirspaceWorker::new("rig-1".to_string())
             .with_probe(Arc::new(FakeProbe {
                 result: Ok(AirspaceSurvey {
-                    scanned_at_ms: Some(123),
+                    scanned_at_ms: Some(now_ms()),
                     contacts: vec![contact("aa:bb:cc")],
                     gaps: Vec::new(),
                 }),
@@ -359,9 +372,27 @@ mod tests {
         assert_eq!(snapshot.availability, AirspaceAvailability::Ready);
         assert_eq!(snapshot.contacts.len(), 1);
         assert!(snapshot.scanned_at_ms.is_none());
+        assert!(snapshot.gaps.iter().any(|gap| gap.contains("future skew")));
+    }
+
+    #[test]
+    fn stale_scan_is_offline_and_retracts_old_contacts() {
+        let worker = AirspaceWorker::new("rig-1".to_string()).with_bus_root(None);
+        let snapshot = worker.build_snapshot(
+            Ok(AirspaceSurvey {
+                scanned_at_ms: Some(5_000),
+                contacts: vec![contact("aa:bb:cc")],
+                gaps: Vec::new(),
+            }),
+            5_000 + MAX_SCAN_AGE_MS + 1,
+        );
+
+        assert_eq!(snapshot.availability, AirspaceAvailability::Offline);
+        assert!(snapshot.contacts.is_empty());
+        assert!(snapshot.scanned_at_ms.is_none());
         assert!(snapshot
             .gaps
             .iter()
-            .any(|gap| gap.contains("future skew")));
+            .any(|gap| gap.contains("freshness window")));
     }
 }

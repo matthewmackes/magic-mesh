@@ -15,13 +15,21 @@
 //! survives as a cfg-gated test fixture only.
 
 use std::f32::consts::TAU;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mde_egui::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 use mde_egui::Style;
 
 /// Cadence for the active radar sweep and typed mirror refresh heartbeat.
 const AIRSPACE_REPAINT_INTERVAL: Duration = Duration::from_millis(33);
+/// Retained Bus snapshots are not a history store. Once a scanner heartbeat
+/// is older than three poll intervals, the UI must retract its contacts rather
+/// than presenting them as a current RF picture.
+pub const AIRSPACE_SNAPSHOT_MAX_AGE_MS: i64 = 15_000;
+/// A persisted snapshot from materially ahead of the seat clock is not safe to
+/// display either; the daemon rejects future scan times, and this consumer
+/// closes the separate publication-time boundary.
+const AIRSPACE_SNAPSHOT_MAX_FUTURE_SKEW_MS: i64 = 5_000;
 
 /// A discovered wireless emitter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -535,11 +543,36 @@ impl AirspaceState {
     /// state and local filter preferences remain seat-owned. Re-validate the
     /// contacts here because a persisted mirror can bypass the daemon's
     /// `from_survey` constructor before reaching this consumer boundary.
-    pub fn refresh_from_wire(
+    pub fn refresh_from_wire(&mut self, snapshot: &mackes_mesh_types::airspace::AirspaceSnapshot) {
+        self.refresh_from_wire_at(snapshot, Self::unix_now_ms());
+    }
+
+    /// Fold a mirror with an injected clock for deterministic tests and live
+    /// freshness enforcement. A retained Ready record is useful only while its
+    /// publication time is within the scanner heartbeat window. Invalid,
+    /// ancient, or future-dated publication times become an offline empty
+    /// picture, so persisted Bus state cannot masquerade as a live scan.
+    pub fn refresh_from_wire_at(
         &mut self,
         snapshot: &mackes_mesh_types::airspace::AirspaceSnapshot,
+        now_ms: i64,
     ) {
+        let age_invalid = snapshot.published_at_ms <= 0;
+        let too_old =
+            now_ms.saturating_sub(snapshot.published_at_ms) > AIRSPACE_SNAPSHOT_MAX_AGE_MS;
+        let too_far_ahead =
+            snapshot.published_at_ms > now_ms.saturating_add(AIRSPACE_SNAPSHOT_MAX_FUTURE_SKEW_MS);
+        let expired = age_invalid || too_old || too_far_ahead;
+
         self.source_status = snapshot.availability;
+        if expired
+            && snapshot.availability == mackes_mesh_types::airspace::AirspaceAvailability::Ready
+        {
+            self.source_status = mackes_mesh_types::airspace::AirspaceAvailability::Offline;
+            self.signals.clear();
+            self.selected = None;
+            return;
+        }
         // A source-less/offline status is not allowed to smuggle retained or
         // malformed contacts into the live-only surface. The typed contract
         // normally emits an empty list for these states, but keep this UI
@@ -584,6 +617,14 @@ impl AirspaceState {
         {
             self.selected = None;
         }
+    }
+
+    fn unix_now_ms() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+            .unwrap_or(0)
     }
 
     fn shows(&self, k: SignalKind) -> bool {
@@ -804,9 +845,7 @@ fn paint_radar_scope(ui: &mut Ui, rect: Rect, state: &mut AirspaceState, t: f32)
             mackes_mesh_types::airspace::AirspaceAvailability::NoSource => {
                 "MG90 scanner source not configured"
             }
-            mackes_mesh_types::airspace::AirspaceAvailability::Offline => {
-                "MG90 scanner is offline"
-            }
+            mackes_mesh_types::airspace::AirspaceAvailability::Offline => "MG90 scanner is offline",
             mackes_mesh_types::airspace::AirspaceAvailability::Ready => {
                 "MG90 scanner returned no contacts"
             }
@@ -1069,9 +1108,12 @@ mod tests {
                 gaps: Vec::new(),
             },
         );
-        state.refresh_from_wire(&snapshot);
+        state.refresh_from_wire_at(&snapshot, 43);
         state.selected = Some("aa:bb".to_string());
-        assert_eq!(state.source_status, mackes_mesh_types::airspace::AirspaceAvailability::Ready);
+        assert_eq!(
+            state.source_status,
+            mackes_mesh_types::airspace::AirspaceAvailability::Ready
+        );
         assert_eq!(state.signals.len(), 1);
         assert_eq!(state.signals[0].kind, SignalKind::Wifi);
 
@@ -1080,10 +1122,68 @@ mod tests {
             43,
             "scanner timeout",
         );
-        state.refresh_from_wire(&empty);
-        assert_eq!(state.source_status, mackes_mesh_types::airspace::AirspaceAvailability::Offline);
+        state.refresh_from_wire_at(&empty, 44);
+        assert_eq!(
+            state.source_status,
+            mackes_mesh_types::airspace::AirspaceAvailability::Offline
+        );
         assert!(state.signals.is_empty());
         assert!(state.selected.is_none());
+    }
+
+    #[test]
+    fn retained_ready_mirror_expires_without_painting_old_contacts() {
+        let mut state = AirspaceState::live();
+        let snapshot = mackes_mesh_types::airspace::AirspaceSnapshot::from_survey(
+            "mg90-live",
+            10_000,
+            mackes_mesh_types::airspace::AirspaceSurvey {
+                scanned_at_ms: Some(9_999),
+                contacts: vec![mackes_mesh_types::airspace::AirspaceContact {
+                    id: "aa:bb".to_string(),
+                    kind: mackes_mesh_types::airspace::AirspaceContactKind::Wifi,
+                    name: "old-ap".to_string(),
+                    signal_dbm: -55,
+                    bearing_deg: 12.0,
+                    channel: None,
+                    encryption: None,
+                    notable: false,
+                    watchlist: false,
+                    own: false,
+                }],
+                gaps: Vec::new(),
+            },
+        );
+
+        state.refresh_from_wire_at(&snapshot, 10_000 + AIRSPACE_SNAPSHOT_MAX_AGE_MS + 1);
+
+        assert_eq!(
+            state.source_status,
+            mackes_mesh_types::airspace::AirspaceAvailability::Offline
+        );
+        assert!(state.signals.is_empty());
+        assert!(state.selected.is_none());
+    }
+
+    #[test]
+    fn future_publication_is_not_treated_as_a_live_scan() {
+        let mut state = AirspaceState::live();
+        let snapshot = mackes_mesh_types::airspace::AirspaceSnapshot::from_survey(
+            "mg90-live",
+            20_000,
+            mackes_mesh_types::airspace::AirspaceSurvey {
+                scanned_at_ms: Some(20_000),
+                contacts: Vec::new(),
+                gaps: Vec::new(),
+            },
+        );
+
+        state.refresh_from_wire_at(&snapshot, 20_000 - AIRSPACE_SNAPSHOT_MAX_FUTURE_SKEW_MS - 1);
+
+        assert_eq!(
+            state.source_status,
+            mackes_mesh_types::airspace::AirspaceAvailability::Offline
+        );
     }
 
     #[test]
@@ -1109,7 +1209,7 @@ mod tests {
                 gaps: Vec::new(),
             },
         );
-        state.refresh_from_wire(&ready);
+        state.refresh_from_wire_at(&ready, 43);
         state.selected = Some("aa:bb".to_string());
 
         // A persisted Ready body can be deserialized without passing through
@@ -1135,7 +1235,7 @@ mod tests {
             omitted_contacts: 0,
             gaps: Vec::new(),
         };
-        state.refresh_from_wire(&malformed);
+        state.refresh_from_wire_at(&malformed, 44);
 
         assert!(state.signals.is_empty());
         assert!(state.selected.is_none());
@@ -1153,36 +1253,36 @@ mod tests {
                 "MG90 scanner is offline",
             ),
         ] {
-            let mut snapshot = mackes_mesh_types::airspace::AirspaceSnapshot::no_source(
-                "mg90-ui-test",
-                42,
-            );
+            let mut snapshot =
+                mackes_mesh_types::airspace::AirspaceSnapshot::no_source("mg90-ui-test", 42);
             snapshot.availability = availability;
-            snapshot.contacts.push(mackes_mesh_types::airspace::AirspaceContact {
-                id: "must-not-render".to_string(),
-                kind: mackes_mesh_types::airspace::AirspaceContactKind::Wifi,
-                name: "forged-contact".to_string(),
-                signal_dbm: -45,
-                bearing_deg: 0.0,
-                channel: None,
-                encryption: None,
-                notable: false,
-                watchlist: false,
-                own: false,
-            });
+            snapshot
+                .contacts
+                .push(mackes_mesh_types::airspace::AirspaceContact {
+                    id: "must-not-render".to_string(),
+                    kind: mackes_mesh_types::airspace::AirspaceContactKind::Wifi,
+                    name: "forged-contact".to_string(),
+                    signal_dbm: -45,
+                    bearing_deg: 0.0,
+                    channel: None,
+                    encryption: None,
+                    notable: false,
+                    watchlist: false,
+                    own: false,
+                });
 
             let mut state = AirspaceState::live();
-            state.refresh_from_wire(&snapshot);
-            assert!(state.signals.is_empty(), "{availability:?} must have no contacts");
+            state.refresh_from_wire_at(&snapshot, 43);
+            assert!(
+                state.signals.is_empty(),
+                "{availability:?} must have no contacts"
+            );
 
             let ctx = egui::Context::default();
             Style::install(&ctx);
             let out = ctx.run(
                 egui::RawInput {
-                    screen_rect: Some(Rect::from_min_size(
-                        Pos2::ZERO,
-                        Vec2::new(1280.0, 820.0),
-                    )),
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 820.0))),
                     events: Vec::new(),
                     time: Some(1.0),
                     ..Default::default()
@@ -1208,10 +1308,7 @@ mod tests {
         let frame = |ctx: &egui::Context, state: &mut AirspaceState, time: f64| {
             ctx.run(
                 egui::RawInput {
-                    screen_rect: Some(Rect::from_min_size(
-                        Pos2::ZERO,
-                        Vec2::new(1280.0, 820.0),
-                    )),
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 820.0))),
                     events: Vec::new(),
                     time: Some(time),
                     ..Default::default()

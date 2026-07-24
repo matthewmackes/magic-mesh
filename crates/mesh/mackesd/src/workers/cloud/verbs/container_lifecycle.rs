@@ -41,11 +41,7 @@ pub(crate) fn handle_restart(
             w,
             verb_name,
             instance,
-            CloudRunOutcome::failed(bounded_message(
-                "systemctl unavailable: ",
-                &error,
-                "",
-            )),
+            CloudRunOutcome::failed(bounded_message("systemctl unavailable: ", &error, "")),
             true,
         ),
         Ok(run) => finish_mutation(
@@ -147,11 +143,7 @@ pub(crate) fn handle_destroy(
                 w,
                 verb_name,
                 instance,
-                CloudRunOutcome::failed(bounded_message(
-                    "systemctl unavailable: ",
-                    &error,
-                    "",
-                )),
+                CloudRunOutcome::failed(bounded_message("systemctl unavailable: ", &error, "")),
                 true,
             )
         }
@@ -186,7 +178,20 @@ fn validated_instance<'a>(body: &'a CloudActionBody, suffix: &str) -> Option<&'a
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())?;
-    super::super::path_key::file_stem("instance", instance, suffix).ok()
+    validated_instance_name(instance, suffix).ok()
+}
+
+/// Validate a lifecycle target before it becomes a systemd/journalctl argv
+/// value. The shared path-key grammar intentionally permits `-`, but an
+/// option-shaped unit such as `--help.service` is parsed as a systemctl option
+/// unless the caller adds an end-of-options boundary. Reject it here so every
+/// lifecycle verb fails closed before auth/replay consumption or backend work.
+fn validated_instance_name<'a>(instance: &'a str, suffix: &str) -> Result<&'a str, String> {
+    if instance.starts_with('-') {
+        return Err("`instance` must not begin with `-` for lifecycle commands".to_string());
+    }
+    super::super::path_key::file_stem("instance", instance, suffix)
+        .map_err(|error| error.to_string())
 }
 
 fn invalid_instance_reply(verb_name: &str, body: &CloudActionBody, suffix: &str) -> CloudReply {
@@ -201,7 +206,7 @@ fn invalid_instance_reply(verb_name: &str, body: &CloudActionBody, suffix: &str)
             format!("`{verb_name}` requires an `instance` field in the request body"),
         );
     };
-    let error = super::super::path_key::file_stem("instance", instance, suffix)
+    let error = validated_instance_name(instance, suffix)
         .expect_err("invalid_instance_reply is only called for invalid names");
     reject(verb_name, error)
 }
@@ -312,8 +317,8 @@ mod tests {
     };
 
     use super::super::super::gate::{ArmedToken, HmacTokenSigner};
-    use super::super::super::runner::{CloudRunOutcome, CloudRunner, ToolRun};
     use super::super::super::runner::fake::FakeRunner;
+    use super::super::super::runner::{CloudRunOutcome, CloudRunner, ToolRun};
     use super::super::super::{now_ms, CloudWorker};
 
     const KEY: &[u8] = b"test-mesh-arming-key";
@@ -417,6 +422,30 @@ mod tests {
     }
 
     #[test]
+    fn option_like_instance_is_rejected_before_auth_or_runner() {
+        let runner = Arc::new(FakeRunner::default());
+        let tmp = tempfile::tempdir().unwrap();
+        let w = worker(tmp.path(), runner.clone());
+        for (verb, typed_name) in [
+            ("container-restart", None),
+            ("container-logs", None),
+            ("container-destroy", Some("--help")),
+        ] {
+            let typed = typed_name
+                .map(|name| format!(r#","typed_name":"{name}""#))
+                .unwrap_or_default();
+            let body = format!(r#"{{"schema_version":1,"node":"me","instance":"--help"{typed}}}"#);
+            let reply = w.handle(verb, &body);
+            assert!(!reply.ok, "{verb} must reject option-shaped targets");
+            assert!(reply
+                .error
+                .as_deref()
+                .is_some_and(|error| { error.contains("must not begin with `-`") }));
+        }
+        assert!(runner.tool_calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn restart_requires_auth_and_then_invokes_systemctl_with_literal_argv() {
         let runner = Arc::new(FakeRunner::default());
         let tmp = tempfile::tempdir().unwrap();
@@ -489,7 +518,9 @@ mod tests {
             .with_bus_root(None);
 
         let reply = w.handle("container-logs", r#"{"node":"me","instance":"web"}"#);
-        let output = reply.raw_log.expect("successful log reply must include output");
+        let output = reply
+            .raw_log
+            .expect("successful log reply must include output");
         assert!(reply.ok);
         assert!(output.len() <= super::MAX_OUTPUT_BYTES);
         assert!(output.ends_with(super::OUTPUT_TRUNCATION_MARKER));

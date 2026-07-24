@@ -1442,7 +1442,7 @@ fn rail(ui: &mut egui::Ui, rect: egui::Rect, state: &mut ConsoleState) {
         egui::pos2(rail.left() + Style::SP_S, rail.top() + Style::SP_XS),
         egui::Align2::LEFT_TOP,
         &state.identity,
-        egui::FontId::proportional(Style::BODY),
+        Style::typography_font(TypographyRole::Body),
         Style::TEXT_STRONG,
     );
     painter.text(
@@ -1452,7 +1452,7 @@ fn rail(ui: &mut egui::Ui, rect: egui::Rect, state: &mut ConsoleState) {
         ),
         egui::Align2::LEFT_TOP,
         &state.version,
-        egui::FontId::proportional(Style::SMALL),
+        Style::typography_font(TypographyRole::Caption),
         Style::TEXT_DIM,
     );
 
@@ -1519,7 +1519,7 @@ fn rail(ui: &mut egui::Ui, rect: egui::Rect, state: &mut ConsoleState) {
             egui::pos2(text_left, row.top() + Style::SP_XS),
             egui::Align2::LEFT_TOP,
             label,
-            egui::FontId::proportional(Style::BODY),
+            Style::typography_font(TypographyRole::Body),
             label_color,
         );
         let caption = jump_caption(count);
@@ -1527,7 +1527,7 @@ fn rail(ui: &mut egui::Ui, rect: egui::Rect, state: &mut ConsoleState) {
             egui::pos2(text_left, row.bottom() - Style::SP_XS),
             egui::Align2::LEFT_BOTTOM,
             &caption,
-            egui::FontId::proportional(Style::SMALL),
+            Style::typography_font(TypographyRole::Caption),
             Style::TEXT_DIM,
         );
         install_row_accessibility(
@@ -1586,7 +1586,7 @@ fn power_section(ui: &mut egui::Ui, rail: &egui::Rect, top: f32, state: &mut Con
         egui::pos2(rail.left() + Style::SP_S, top + Style::SP_L / 2.0),
         egui::Align2::LEFT_CENTER,
         "POWER",
-        egui::FontId::proportional(Style::SMALL),
+        Style::typography_font(TypographyRole::Caption),
         Style::TEXT_DIM,
     );
     let rows_top = top + Style::SP_L;
@@ -1618,7 +1618,7 @@ fn power_section(ui: &mut egui::Ui, rail: &egui::Rect, top: f32, state: &mut Con
             egui::pos2(row.left() + Style::SP_S, row.center().y),
             egui::Align2::LEFT_CENTER,
             action.label(),
-            egui::FontId::proportional(Style::SMALL),
+            Style::typography_font(TypographyRole::Caption),
             color,
         );
         // WIN7-5, lock #14 — a screen-reader user needs to know a Reboot/
@@ -1692,7 +1692,7 @@ fn power_arming_stage(ui: &mut egui::Ui, rail: &egui::Rect, top: f32, state: &mu
         egui::pos2(confirm.left() + Style::SP_XS, confirm.center().y),
         egui::Align2::LEFT_CENTER,
         format!("Confirm {}", action.label()),
-        egui::FontId::proportional(Style::SMALL),
+        Style::typography_font(TypographyRole::Caption),
         if armed {
             Style::DANGER
         } else {
@@ -1719,7 +1719,7 @@ fn power_arming_stage(ui: &mut egui::Ui, rail: &egui::Rect, top: f32, state: &mu
         egui::pos2(cancel.left() + Style::SP_XS, cancel.center().y),
         egui::Align2::LEFT_CENTER,
         "Cancel",
-        egui::FontId::proportional(Style::SMALL),
+        Style::typography_font(TypographyRole::Caption),
         Style::TEXT,
     );
     install_row_accessibility(
@@ -1833,7 +1833,7 @@ fn list_pane(ui: &mut egui::Ui, rect: egui::Rect, state: &mut ConsoleState) {
             egui::pos2(strip.left() + Style::SP_S, strip.center().y),
             egui::Align2::LEFT_CENTER,
             gate.text(),
-            egui::FontId::proportional(Style::SMALL),
+            Style::typography_font(TypographyRole::Caption),
             Style::WARN,
         );
         let _ = ui
@@ -1861,7 +1861,7 @@ fn heading(ui: &mut egui::Ui, label: &str) -> egui::Rect {
         egui::pos2(rect.left() + Style::SP_XS, rect.center().y),
         egui::Align2::LEFT_CENTER,
         label.to_uppercase(),
-        egui::FontId::proportional(Style::SMALL),
+        Style::typography_font(TypographyRole::Caption),
         Style::TEXT_DIM,
     );
     rect
@@ -2035,21 +2035,21 @@ fn custom_row(
         egui::pos2(text_left, rect.top() + Style::SP_XS),
         egui::Align2::LEFT_TOP,
         &entry.name,
-        egui::FontId::proportional(Style::BODY),
+        Style::typography_font(TypographyRole::Body),
         Style::TEXT,
     );
     painter.text(
         egui::pos2(text_left, rect.bottom() - Style::SP_XS),
         egui::Align2::LEFT_BOTTOM,
         &entry.command,
-        egui::FontId::proportional(Style::SMALL),
+        Style::typography_font(TypographyRole::Caption),
         Style::TEXT_DIM,
     );
     painter.text(
         egui::pos2(rect.right() - Style::SP_S, rect.top() + Style::SP_XS),
         egui::Align2::RIGHT_TOP,
         Provenance::Construct.label(),
-        egui::FontId::proportional(Style::SMALL),
+        Style::typography_font(TypographyRole::Caption),
         Provenance::Construct.color(),
     );
     // WIN7-5, lock #14 — reuses the SAME flat-index accesskit id space
@@ -2075,7 +2075,7 @@ fn custom_row(
         cross.center(),
         egui::Align2::CENTER_CENTER,
         "\u{2715}",
-        egui::FontId::proportional(Style::SMALL),
+        Style::typography_font(TypographyRole::Caption),
         if cross_resp.hovered() {
             Style::DANGER
         } else {
@@ -2124,7 +2124,7 @@ fn custom_add_form(ui: &mut egui::Ui, state: &mut ConsoleState) -> bool {
         egui::pos2(add_rect.left() + Style::SP_XS, add_rect.center().y),
         egui::Align2::LEFT_CENTER,
         "+ Add entry",
-        egui::FontId::proportional(Style::SMALL),
+        Style::typography_font(TypographyRole::Caption),
         if can_add {
             Style::ACCENT
         } else {

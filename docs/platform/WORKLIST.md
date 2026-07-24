@@ -540,6 +540,12 @@ These decisions refine acceptance and sequencing for the active items below.
   it into `{}`, preventing roster disclosure while preserving literal `{}` reads.
   The focused `.90` cloud gate is green at 139/139; live libvirt/Podman evidence
   remains external.
+- Progress (2026-07-24 container option-boundary hardening): rootless container
+  restart, logs, and destroy now reject leading-dash instance names before
+  capability replay consumption or backend execution, preventing a workload
+  target from becoming a `systemctl`/`journalctl` option. The focused `.90`
+  lifecycle gate is green at 9/9; live Podman/systemd evidence remains
+  external.
 - Progress (2026-07-24 desired-reconcile fail-closed boundary): the per-node
   reconciliation planner now rejects malformed, foreign, or non-regular desired
   JSON documents before rendering tfvars or invoking the backend, while the
@@ -684,6 +690,11 @@ These decisions refine acceptance and sequencing for the active items below.
   started a call. The full BigBoy `mde-collab-core` suite is green at 47/47,
   including the new impersonation regression; live media/SIP evidence remains
   external.
+- Progress (2026-07-24 departed-author mutation hardening): message edit and
+  delete commands now require current membership in the target space before
+  checking historical authorship, so a departed author cannot mutate an old
+  message. The full `.50` `mde-collab-core` suite is green at 48/48; live
+  media/SIP evidence remains external.
 - Priority: P0
 - Complexity: Epic
 - Problem: VoIP, Messaging, Alerting, Clipboard, Editor, Files, and Transfers are
@@ -1172,6 +1183,12 @@ These decisions refine acceptance and sequencing for the active items below.
   untouched, preventing a stale UI index from reopening an old route. The
   focused BigBoy Maps model suite is green at 57/57; live visual proof remains
   external.
+- Progress (2026-07-24 Airspace freshness hardening): daemon scans older than
+  30 seconds now publish an empty Offline snapshot, while the Maps consumer
+  retracts retained Ready contacts older than 15 seconds or materially
+  future-dated. The daemon `.90` gate is green at 5/5 and the BigBoy Maps
+  Airspace gate at 11/11; no undocumented MG90 scanner protocol was added and
+  live scanner configuration remains external.
 - Progress (2026-07-24 route-preview typography adoption): the Maps route
   preview title, destination summary, route cards, and Start control now use
   shared semantic typography roles instead of direct font literals, preserving
@@ -1524,6 +1541,10 @@ These decisions refine acceptance and sequencing for the active items below.
   studio, and release labels now use shared Display/Headline/Caption roles,
   keeping release identity and geometry unchanged. The focused `.50` splash
   gate is green at 6/6; no live seat change was made.
+- Progress (2026-07-24 console typography adoption): all 15 remaining direct
+  canonical font literals in the Console surface now resolve through shared
+  `TypographyRole` helpers, preserving geometry and hit targets. The focused
+  BigBoy Console gate is green at 48/48; no live seat change was made.
 - Priority: P1
 - Complexity: Epic
 - Problem: The workstation chrome is Win10-shaped (48px bottom taskbar + tray
