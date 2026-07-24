@@ -19,7 +19,12 @@ const MAX_PNG_BYTES: usize = 96 * 1024;
 const MAX_PNG_BASE64_BYTES: usize = 4 * MAX_PNG_BYTES.div_ceil(3);
 const TILE_EDGE: u32 = 256;
 const MAX_DECODE_ALLOC: u64 = 2 * 1024 * 1024;
-const MAX_TEXTURES: usize = 24;
+const MAX_DECODED_RGBA_BYTES: usize = TILE_EDGE as usize * TILE_EDGE as usize * 4;
+/// Match the adapter's six-frame history at the untrusted UI boundary.
+const MAX_PAINTABLE_FRAMES: usize = 6;
+/// Leave room for a small local tile subset while bounding per-frame paint work.
+const MAX_PAINTABLE_TILES_PER_FRAME: usize = 4;
+const MAX_TEXTURES: usize = MAX_PAINTABLE_FRAMES * MAX_PAINTABLE_TILES_PER_FRAME;
 
 /// Retained complete radar animation and local animation preference.
 #[derive(Debug, Clone)]
@@ -86,6 +91,10 @@ pub struct PaintStats {
     pub tiles: usize,
     /// Selected newest-to-oldest frame index.
     pub frame_index: usize,
+    /// Retained frames admitted to the bounded animation pass.
+    pub frames_considered: usize,
+    /// Retained tiles admitted to the bounded selected-frame pass.
+    pub tiles_considered: usize,
     /// Whether the honest age badge painted.
     pub badge: bool,
     /// Whether every tile was forced to non-live opacity.
@@ -128,17 +137,19 @@ where
     if let Some(snapshot) = &layer.snapshot {
         if let Some((frame_index, frame)) = selected_frame(snapshot, layer.animate, now_ms) {
             stats.frame_index = frame_index;
+            stats.frames_considered = paintable_frame_count(snapshot);
+            stats.tiles_considered = frame.tiles.len().min(MAX_PAINTABLE_TILES_PER_FRAME);
             let tile_painter = painter.with_clip_rect(rect.intersect(painter.clip_rect()));
-            for tile in &frame.tiles {
-                let Some(texture) = cached_texture(painter.ctx(), frame, tile) else {
-                    continue;
-                };
+            for tile in frame.tiles.iter().take(MAX_PAINTABLE_TILES_PER_FRAME) {
                 let Some(tile_rect) = projected_tile_rect(tile, &mut project) else {
                     continue;
                 };
                 if !tile_rect.is_finite() || !tile_rect.intersects(rect) {
                     continue;
                 }
+                let Some(texture) = cached_texture(painter.ctx(), frame, tile) else {
+                    continue;
+                };
                 tile_painter.image(
                     texture.id(),
                     tile_rect,
@@ -154,17 +165,22 @@ where
     stats
 }
 
+fn paintable_frame_count(snapshot: &IemRadarSnapshot) -> usize {
+    snapshot.frames.len().min(MAX_PAINTABLE_FRAMES)
+}
+
 fn selected_frame(
     snapshot: &IemRadarSnapshot,
     animate: bool,
     now_ms: i64,
 ) -> Option<(usize, &IemRadarFrame)> {
-    if snapshot.frames.is_empty() {
+    let frame_count = paintable_frame_count(snapshot);
+    if frame_count == 0 {
         return None;
     }
-    let index = if animate && snapshot.frames.len() > 1 {
+    let index = if animate && frame_count > 1 {
         let step = usize::try_from(now_ms.max(0) / FRAME_DWELL_MS).unwrap_or(0);
-        snapshot.frames.len() - 1 - step % snapshot.frames.len()
+        frame_count - 1 - step % frame_count
     } else {
         0
     };
@@ -179,10 +195,12 @@ where
     if tile.x >= n as u32 || tile.y >= n as u32 {
         return None;
     }
+    let east_x = tile.x.checked_add(1)?;
+    let south_y = tile.y.checked_add(1)?;
     let west = f64::from(tile.x) / n * 360.0 - 180.0;
-    let east = f64::from(tile.x + 1) / n * 360.0 - 180.0;
+    let east = f64::from(east_x) / n * 360.0 - 180.0;
     let north = tile_y_lat(f64::from(tile.y), n);
-    let south = tile_y_lat(f64::from(tile.y + 1), n);
+    let south = tile_y_lat(f64::from(south_y), n);
     let northwest = project(north, west)?;
     let southeast = project(south, east)?;
     if northwest.any_nan() || southeast.any_nan() {
@@ -261,8 +279,12 @@ fn decode_tile(value: &str) -> Option<egui::ColorImage> {
     limits.max_image_height = Some(TILE_EDGE);
     limits.max_alloc = Some(MAX_DECODE_ALLOC);
     reader.limits(limits);
-    let decoded = reader.decode().ok()?.to_rgba8();
+    let decoded = reader.decode().ok()?;
     if decoded.width() != TILE_EDGE || decoded.height() != TILE_EDGE {
+        return None;
+    }
+    let decoded = decoded.to_rgba8();
+    if decoded.as_raw().len() > MAX_DECODED_RGBA_BYTES {
         return None;
     }
     Some(egui::ColorImage::from_rgba_unmultiplied(
@@ -284,7 +306,7 @@ fn paint_age_badge(painter: &Painter, rect: Rect, layer: &IemRadarLayerState, no
             format!(
                 "NEXRAD · {} · {} frames · degraded",
                 age_label(age),
-                snapshot.frames.len()
+                frame_count_label(snapshot)
             ),
             Style::WARN,
         ),
@@ -298,7 +320,7 @@ fn paint_age_badge(painter: &Painter, rect: Rect, layer: &IemRadarLayerState, no
                 format!(
                     "NEXRAD · {} · {} frames{quorum}",
                     age_label(age),
-                    snapshot.frames.len()
+                    frame_count_label(snapshot)
                 ),
                 Style::TEXT,
             )
@@ -323,6 +345,14 @@ fn paint_age_badge(painter: &Painter, rect: Rect, layer: &IemRadarLayerState, no
         egui::StrokeKind::Inside,
     );
     painter.galley(badge.left_top() + pad, galley, tone);
+}
+
+fn frame_count_label(snapshot: &IemRadarSnapshot) -> String {
+    if snapshot.frames.len() > MAX_PAINTABLE_FRAMES {
+        format!("{}+", MAX_PAINTABLE_FRAMES)
+    } else {
+        snapshot.frames.len().to_string()
+    }
 }
 
 fn age_label(age_ms: i64) -> String {
@@ -384,6 +414,88 @@ mod tests {
                 .0,
             1
         );
+    }
+
+    #[test]
+    fn oversized_retained_history_is_bounded_without_changing_animation_window() {
+        let now_ms = 1_000_000;
+        let mut retained = snapshot(now_ms);
+        let base_tile = retained.frames[0].tiles[0].clone();
+        retained
+            .frames
+            .extend((3..MAX_PAINTABLE_FRAMES + 2).map(|index| IemRadarFrame {
+                valid_at_ms: now_ms - i64::try_from(index).expect("index") * 300_000,
+                nominal_minutes_ago: u8::try_from(index * 5).expect("minutes"),
+                radar_quorum: Some("143/147".to_string()),
+                tiles: vec![base_tile.clone()],
+            }));
+        assert_eq!(retained.frames.len(), MAX_PAINTABLE_FRAMES + 2);
+        assert_eq!(paintable_frame_count(&retained), MAX_PAINTABLE_FRAMES);
+        assert_eq!(
+            selected_frame(&retained, true, 0).expect("frame").0,
+            MAX_PAINTABLE_FRAMES - 1
+        );
+        assert_eq!(
+            selected_frame(&retained, true, FRAME_DWELL_MS)
+                .expect("frame")
+                .0,
+            MAX_PAINTABLE_FRAMES - 2
+        );
+        assert_eq!(selected_frame(&retained, false, 0).expect("frame").0, 0);
+    }
+
+    #[test]
+    fn oversized_tiles_are_bounded_before_projection_and_texture_decode() {
+        let now_ms = 1_000_000;
+        let png = png_base64();
+        let mut retained = snapshot(now_ms);
+        retained.frames = (0..(MAX_PAINTABLE_FRAMES + 2))
+            .map(|frame_index| IemRadarFrame {
+                valid_at_ms: now_ms - i64::try_from(frame_index).expect("index") * 300_000,
+                nominal_minutes_ago: u8::try_from(frame_index * 5).expect("minutes"),
+                radar_quorum: Some("143/147".to_string()),
+                tiles: (0..(MAX_PAINTABLE_TILES_PER_FRAME + 2))
+                    .map(|tile_index| IemRadarTile {
+                        z: 6,
+                        // The first tile in the selected oldest frame is an
+                        // invalid coordinate with otherwise valid PNG data.
+                        x: if frame_index == MAX_PAINTABLE_FRAMES - 1 && tile_index == 0 {
+                            u32::MAX
+                        } else {
+                            19 + u32::try_from(tile_index).expect("tile index")
+                        },
+                        y: 23,
+                        png_base64: png.clone(),
+                    })
+                    .collect(),
+            })
+            .collect();
+        let mut layer = IemRadarLayerState::default();
+        layer.fold(retained);
+        let context = egui::Context::default();
+        let mut projected = 0;
+        let mut stats = PaintStats::default();
+        let _ = context.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = ui.max_rect();
+                stats = paint_layer(ui.painter(), rect, &layer, 0, |_lat, _lon| {
+                    projected += 1;
+                    Some(if projected % 2 == 1 {
+                        rect.left_top()
+                    } else {
+                        rect.right_bottom()
+                    })
+                });
+            });
+        });
+        assert_eq!(stats.frames_considered, MAX_PAINTABLE_FRAMES);
+        assert_eq!(stats.tiles_considered, MAX_PAINTABLE_TILES_PER_FRAME);
+        assert_eq!(projected, 2 * (MAX_PAINTABLE_TILES_PER_FRAME - 1));
+        assert_eq!(stats.tiles, MAX_PAINTABLE_TILES_PER_FRAME - 1);
+        let cached_entries = context
+            .data(|data| data.get_temp::<TextureCache>(egui::Id::new("iem-radar-texture-cache")))
+            .map_or(0, |cache| cache.entries.len());
+        assert_eq!(cached_entries, MAX_PAINTABLE_TILES_PER_FRAME - 1);
     }
 
     #[test]
