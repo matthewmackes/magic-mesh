@@ -25,6 +25,14 @@ use crate::signer::{EventSigner, IdSource};
 /// The author edit/delete window: 5 minutes, in milliseconds.
 pub const EDIT_WINDOW_MS: i64 = 5 * 60 * 1000;
 
+/// The maximum number of tombstones one `ClearClipboard` command may author.
+///
+/// The mesh clipboard history already retains at most 50 unpinned entries, so
+/// this keeps the command boundary aligned with the existing history contract
+/// while preventing a malformed or legacy aggregate from creating an
+/// unbounded event batch.
+const MAX_CLEAR_CLIPBOARD_EVENTS: usize = 50;
+
 /// The injected authoring context for [`apply_command`]. Carries the local
 /// actor, the injected wall time, the actor's running HLC (advanced per emitted
 /// event), and the signer + id source. Generic (not `dyn`) so a hot path stays
@@ -506,7 +514,16 @@ pub fn apply_command<S: EventSigner, I: IdSource>(
                 .iter()
                 .filter(|(_, c)| c.space == *space && !c.deleted && !c.pinned)
                 .map(|(id, _)| *id)
+                // Collect only one item over the permitted batch size. This
+                // makes the refusal itself bounded even if a hostile aggregate
+                // contains an arbitrarily large number of eligible clips.
+                .take(MAX_CLEAR_CLIPBOARD_EVENTS + 1)
                 .collect();
+            if targets.len() > MAX_CLEAR_CLIPBOARD_EVENTS {
+                return Err(CollabError::Serde(format!(
+                    "clear_clipboard fan-out exceeds {MAX_CLEAR_CLIPBOARD_EVENTS} events"
+                )));
+            }
             targets.sort();
             Ok(targets
                 .into_iter()
@@ -930,7 +947,9 @@ mod tests {
     use super::*;
     use crate::signer::{Ed25519Signer, IdSource};
     use mde_collab_types::ids::{CallId, EventId, FileRefId, TransferId};
-    use mde_collab_types::value::{CallKind, FileRef, TransferDirection, TransferMethod};
+    use mde_collab_types::value::{
+        CallKind, ClipItemKind, ClipboardItem, FileRef, TransferDirection, TransferMethod,
+    };
     use mde_collab_types::{ActorClock, ActorId, CollabEventEnvelope, SpaceKind};
     use uuid::Uuid;
 
@@ -1199,5 +1218,84 @@ mod tests {
                 }) if denied_space == space && actor == ActorId::new("bob")
             ));
         }
+    }
+
+    fn state_with_unpinned_clips(
+        count: usize,
+        alice: &mut ApplyCtx<'_, Ed25519Signer, SeqIds>,
+    ) -> (SpaceId, DomainState) {
+        let created = apply_command(
+            &DomainState::default(),
+            &CollabCommand::CreateSpace {
+                kind: SpaceKind::Team,
+                name: "ops".into(),
+            },
+            alice,
+        )
+        .expect("create space");
+        let space = created[0].space_id;
+        let mut events = created;
+        for index in 0..count {
+            let state = DomainState::from_events(&events);
+            let published = apply_command(
+                &state,
+                &CollabCommand::PublishClipboard {
+                    space,
+                    item: ClipboardItem {
+                        kind: ClipItemKind::Text,
+                        preview: format!("clip-{index}"),
+                        sha256_hex: "0".repeat(64),
+                        len: index as u64,
+                        source: "alice".into(),
+                    },
+                },
+                alice,
+            )
+            .expect("publish clip");
+            events.extend(published);
+        }
+        (space, DomainState::from_events(&events))
+    }
+
+    #[test]
+    fn clear_clipboard_rejects_overlarge_fan_out_without_emitting() {
+        let signer = Ed25519Signer::from_seed([11; 32]);
+        let mut ids = SeqIds(80);
+        let mut alice = ApplyCtx::new(ActorId::new("alice"), 1_000, &signer, &mut ids);
+        let (space, state) = state_with_unpinned_clips(MAX_CLEAR_CLIPBOARD_EVENTS + 1, &mut alice);
+        let before_clock = alice.clock;
+        let before_next_id = alice.ids.0;
+
+        let denied = apply_command(&state, &CollabCommand::ClearClipboard { space }, &mut alice);
+
+        assert!(matches!(
+            denied,
+            Err(CollabError::Serde(message))
+                if message.contains("clear_clipboard fan-out exceeds")
+        ));
+        assert_eq!(
+            alice.clock, before_clock,
+            "refusal must not mint an HLC tick"
+        );
+        assert_eq!(
+            alice.ids.0, before_next_id,
+            "refusal must not consume an id"
+        );
+    }
+
+    #[test]
+    fn clear_clipboard_allows_the_bounded_fan_out() {
+        let signer = Ed25519Signer::from_seed([12; 32]);
+        let mut ids = SeqIds(140);
+        let mut alice = ApplyCtx::new(ActorId::new("alice"), 1_000, &signer, &mut ids);
+        let (space, state) = state_with_unpinned_clips(MAX_CLEAR_CLIPBOARD_EVENTS, &mut alice);
+
+        let cleared = apply_command(&state, &CollabCommand::ClearClipboard { space }, &mut alice)
+            .expect("the existing 50-entry history remains clearable");
+
+        assert_eq!(cleared.len(), MAX_CLEAR_CLIPBOARD_EVENTS);
+        assert!(cleared
+            .iter()
+            .all(|event| matches!(event.kind, CollabEventKind::ClipboardDeleted { .. })));
     }
 }

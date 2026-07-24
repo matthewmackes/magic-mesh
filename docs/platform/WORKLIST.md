@@ -463,6 +463,11 @@ These decisions refine acceptance and sequencing for the active items below.
   Status, placement, menu, and workload-metric surfaces label the retained data
   honestly. The focused IAC farm gate is green at 44/44 plus an isolated stale-
   capability regression at 1/1; live Podman/libvirt evidence remains external.
+- Progress (2026-07-25 desired-body framing hardening): `set-desired` and its
+  capability-target parser now reject caller bodies above the shared 64 KiB RPC
+  limit before JSON materialization or filesystem mutation, while the valid
+  legacy `{}` plan/read shape remains accepted. The focused BigBoy desired gate
+  is green at 42/42; live Podman/libvirt evidence remains external.
 - Progress (2026-07-23): UI contract slice landed in the takeover tree. Set
   desired now publishes the worker's `{node,spec}` envelope; provision,
   configure, plan, destroy, lifecycle, and console requests carry explicit
@@ -631,6 +636,10 @@ These decisions refine acceptance and sequencing for the active items below.
   before opening its SQLite transaction, preserving atomic replay behavior for
   hostile inline payloads. The focused BigBoy projection gate is green at 10/10;
   live media/LLM evidence remains external.
+- Progress (2026-07-25 clipboard fan-out hardening): `ClearClipboard` now caps
+  authored tombstones at the existing 50-entry history budget and rejects an
+  oversized aggregate before consuming an event ID or HLC tick. The focused
+  BigBoy pipeline gate is green at 6/6; live media/LLM evidence remains external.
 - Progress (2026-07-24 replay ownership hardening): replayed `SpaceDeleted`
   events now require a currently present owner in the folded membership state,
   preventing a signed non-owner event from deleting a space read model. The
@@ -1149,6 +1158,19 @@ These decisions refine acceptance and sequencing for the active items below.
   snapshot while preserving valid contacts. The focused `.90` consumer gate is
   green at 1/1 and the full Airspace module at 12/12; live scanner feed remains
   external.
+- Progress (2026-07-25 NWS alert consumer bound): the Maps warning layer now caps
+  retained alerts, polygon rings, and ring vertices before point-in-polygon,
+  projection, or triangulation work, validates geographic points, and labels a
+  capped mirror honestly. The focused `.90` alert gate is green at 6/6; live
+  NWS feed acceptance remains external.
+- Progress (2026-07-25 NWS forecast consumer bound): the hourly layer now caps
+  retained samples and periods, rejects malformed coordinates/times/ranges, and
+  treats future producer timestamps as non-live before projection. The focused
+  `.90` forecast gate is green at 7/7; live NWS feed acceptance remains external.
+- Progress (2026-07-25 aircraft consumer bound): the adsb.lol layer now caps
+  retained tracks before dead reckoning, projection, label layout, or painting,
+  preserving valid aircraft within the typed 256-track budget. The focused
+  aircraft gate is green at 1/1; live ADS-B acceptance remains external.
 - Progress (2026-07-24 live-mirror proof-tool no-follow hardening): the
   read-only verifier now rejects traversal, symlinked parents/leaves, and
   non-regular indexed files, then performs the final read with `O_NOFOLLOW` and

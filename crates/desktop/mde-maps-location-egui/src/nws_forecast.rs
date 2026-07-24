@@ -8,6 +8,15 @@ use mde_egui::Style;
 
 /// Hourly guidance is visibly stale after ninety minutes.
 pub const SNAPSHOT_STALE_AFTER_MS: i64 = 90 * 60 * 1_000;
+/// A retained mirror materially ahead of the seat clock is not current data.
+const MAX_TIMESTAMP_FUTURE_SKEW_MS: i64 = 5_000;
+/// Consumer-side bounds are independent of the producer's wire validation:
+/// another node can write the retained mirror directly.
+const MAX_PAINTABLE_SAMPLES: usize = 8;
+const MAX_PAINTABLE_PERIODS_PER_SAMPLE: usize = 24;
+const MAX_SAMPLE_ETA_FUTURE_MS: i64 = 6 * 60 * 60 * 1_000;
+const MAX_PERIOD_DURATION_MS: i64 = 3 * 60 * 60 * 1_000;
+const MAX_PERIOD_FUTURE_MS: i64 = 24 * 60 * 60 * 1_000;
 
 /// Retained complete NWS hourly snapshot.
 #[derive(Debug, Clone, Default)]
@@ -28,14 +37,28 @@ impl NwsForecastLayerState {
         self.snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.feed_generated_at_ms)
+            .filter(|generated| *generated <= now_ms.saturating_add(MAX_TIMESTAMP_FUTURE_SKEW_MS))
             .map(|generated| now_ms.saturating_sub(generated).max(0))
+    }
+
+    /// Whether the retained producer time is too far ahead to be trusted.
+    #[must_use]
+    pub fn future_dated(&self, now_ms: i64) -> bool {
+        self.snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.feed_generated_at_ms)
+            .is_some_and(|generated| {
+                generated > now_ms.saturating_add(MAX_TIMESTAMP_FUTURE_SKEW_MS)
+            })
     }
 
     /// Whether the producer has missed the honest hourly freshness window.
     #[must_use]
     pub fn stale(&self, now_ms: i64) -> bool {
-        self.age_ms(now_ms)
-            .is_some_and(|age| age > SNAPSHOT_STALE_AFTER_MS)
+        self.future_dated(now_ms)
+            || self
+                .age_ms(now_ms)
+                .is_some_and(|age| age > SNAPSHOT_STALE_AFTER_MS)
     }
 
     /// Whether the worker retained an older snapshot after losing its fresh fix
@@ -62,6 +85,10 @@ impl NwsForecastLayerState {
 pub struct PaintStats {
     /// Current/drive-ahead sample glyphs painted.
     pub markers: usize,
+    /// Retained samples admitted to the bounded paint pass.
+    pub samples_considered: usize,
+    /// Retained periods inspected by the bounded selection pass.
+    pub periods_considered: usize,
     /// Whether the honest state badge painted.
     pub badge: bool,
     /// Whether every painted marker was forced to the non-live tone.
@@ -86,14 +113,22 @@ where
     let marker_painter = painter.with_clip_rect(rect.intersect(painter.clip_rect()));
     let mut stats = PaintStats::default();
     if let Some(snapshot) = &layer.snapshot {
-        for sample in &snapshot.samples {
-            let Some(period) = period_for_eta(sample, now_ms) else {
+        for sample in snapshot.samples.iter().take(MAX_PAINTABLE_SAMPLES) {
+            stats.samples_considered += 1;
+            if !sample_is_paintable(sample, now_ms) {
+                continue;
+            }
+            let Some(period) = period_for_eta(sample, now_ms, &mut stats.periods_considered) else {
                 continue;
             };
             let Some(point) = project(sample.latitude, sample.longitude) else {
                 continue;
             };
-            if point.any_nan() || !rect.expand(20.0).contains(point) {
+            if point.any_nan()
+                || !point.x.is_finite()
+                || !point.y.is_finite()
+                || !rect.expand(20.0).contains(point)
+            {
                 continue;
             }
             paint_marker(&marker_painter, point, sample, period, non_live);
@@ -106,21 +141,46 @@ where
     stats
 }
 
-fn period_for_eta(sample: &ForecastSample, now_ms: i64) -> Option<&ForecastPeriod> {
-    sample
-        .periods
-        .iter()
-        .find(|period| {
-            period.end_at_ms > now_ms
-                && period.start_at_ms <= sample.eta_at_ms
-                && sample.eta_at_ms < period.end_at_ms
-        })
-        .or_else(|| {
-            sample
-                .periods
-                .iter()
-                .find(|period| period.end_at_ms > now_ms && period.start_at_ms > sample.eta_at_ms)
-        })
+fn sample_is_paintable(sample: &ForecastSample, now_ms: i64) -> bool {
+    sample.latitude.is_finite()
+        && (-90.0..=90.0).contains(&sample.latitude)
+        && sample.longitude.is_finite()
+        && (-180.0..=180.0).contains(&sample.longitude)
+        && sample.distance_ahead_km.is_finite()
+        && (0.0..=250.0).contains(&sample.distance_ahead_km)
+        && sample.eta_at_ms <= now_ms.saturating_add(MAX_SAMPLE_ETA_FUTURE_MS)
+}
+
+fn period_for_eta<'a>(
+    sample: &'a ForecastSample,
+    now_ms: i64,
+    periods_considered: &mut usize,
+) -> Option<&'a ForecastPeriod> {
+    let mut next_after_eta = None;
+    for period in sample.periods.iter().take(MAX_PAINTABLE_PERIODS_PER_SAMPLE) {
+        *periods_considered = periods_considered.saturating_add(1);
+        if !period_is_paintable(period, now_ms) || period.end_at_ms <= now_ms {
+            continue;
+        }
+        if period.start_at_ms <= sample.eta_at_ms && sample.eta_at_ms < period.end_at_ms {
+            return Some(period);
+        }
+        if period.start_at_ms > sample.eta_at_ms && next_after_eta.is_none() {
+            next_after_eta = Some(period);
+        }
+    }
+    next_after_eta
+}
+
+fn period_is_paintable(period: &ForecastPeriod, now_ms: i64) -> bool {
+    period.end_at_ms > period.start_at_ms
+        && period.end_at_ms.saturating_sub(period.start_at_ms) <= MAX_PERIOD_DURATION_MS
+        && period.end_at_ms <= now_ms.saturating_add(MAX_PERIOD_FUTURE_MS)
+        && matches!(period.temperature_unit.as_str(), "F" | "C")
+        && period
+            .precipitation_percent
+            .is_none_or(|percent| percent <= 100)
+        && period.humidity_percent.is_none_or(|percent| percent <= 100)
 }
 
 fn paint_marker(
@@ -187,6 +247,9 @@ fn forecast_label(kind: ForecastKind) -> &'static str {
 fn paint_age_badge(painter: &Painter, rect: Rect, layer: &NwsForecastLayerState, now_ms: i64) {
     let (label, tone) = match (&layer.snapshot, layer.age_ms(now_ms)) {
         (None, _) => ("NWS hourly · no data".to_string(), Style::TEXT_DIM),
+        (Some(_), _) if layer.future_dated(now_ms) => {
+            ("NWS hourly · FUTURE producer time".to_string(), Style::WARN)
+        }
         (Some(snapshot), None) if snapshot.fetched_at_ms == 0 => {
             ("NWS hourly · no fresh vehicle fix".to_string(), Style::WARN)
         }
@@ -279,8 +342,12 @@ mod tests {
         let now = 1_000_000;
         let snapshot = snapshot(now);
         let sample = &snapshot.samples[0];
-        assert!(period_for_eta(sample, now).is_some());
-        assert!(period_for_eta(sample, now + 60 * 60_000 + 1).is_none());
+        let mut periods_considered = 0;
+        assert!(period_for_eta(sample, now, &mut periods_considered).is_some());
+        assert_eq!(periods_considered, 1);
+        periods_considered = 0;
+        assert!(period_for_eta(sample, now + 60 * 60_000 + 1, &mut periods_considered).is_none());
+        assert_eq!(periods_considered, 1);
     }
 
     #[test]
@@ -341,5 +408,91 @@ mod tests {
         });
         assert_eq!(stats.markers, 1);
         assert!(stats.non_live, "paused route markers must dim immediately");
+    }
+
+    #[test]
+    fn oversized_malformed_snapshot_is_bounded_and_valid_samples_still_render() {
+        let now = 1_000_000;
+        let mut retained = snapshot(now);
+        let invalid_period = ForecastPeriod {
+            start_at_ms: now + 1,
+            end_at_ms: now,
+            ..retained.samples[0].periods[0].clone()
+        };
+        let malformed_periods = vec![invalid_period; MAX_PAINTABLE_PERIODS_PER_SAMPLE + 32];
+        let base = retained.samples[0].clone();
+        retained.samples = (0..MAX_PAINTABLE_SAMPLES + 32)
+            .map(|index| ForecastSample {
+                grid_id: format!("BOX-{index}"),
+                periods: malformed_periods.clone(),
+                ..base.clone()
+            })
+            .collect();
+
+        let mut layer = NwsForecastLayerState::default();
+        layer.fold(retained);
+        let ctx = egui::Context::default();
+        let mut projected = 0;
+        let mut bounded = PaintStats::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = ui.max_rect();
+                bounded = paint_layer(ui.painter(), rect, &layer, now, |_lat, _lon| {
+                    projected += 1;
+                    Some(rect.center())
+                });
+            });
+        });
+        assert_eq!(bounded.samples_considered, MAX_PAINTABLE_SAMPLES);
+        assert_eq!(
+            bounded.periods_considered,
+            MAX_PAINTABLE_SAMPLES * MAX_PAINTABLE_PERIODS_PER_SAMPLE
+        );
+        assert_eq!(bounded.markers, 0);
+        assert_eq!(projected, 0, "malformed periods must not reach projection");
+        assert!(bounded.badge, "malformed mirror still gets a state badge");
+
+        layer.fold(snapshot(now));
+        projected = 0;
+        let mut valid = PaintStats::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = ui.max_rect();
+                valid = paint_layer(ui.painter(), rect, &layer, now, |_lat, _lon| {
+                    projected += 1;
+                    Some(rect.center())
+                });
+            });
+        });
+        assert_eq!(valid.samples_considered, 1);
+        assert_eq!(valid.periods_considered, 1);
+        assert_eq!(valid.markers, 1, "valid forecast samples must still render");
+        assert_eq!(projected, 1);
+    }
+
+    #[test]
+    fn malformed_coordinates_and_future_feed_time_are_non_live() {
+        let now = 1_000_000;
+        let mut retained = snapshot(now);
+        retained.samples[0].latitude = f64::NAN;
+        retained.feed_generated_at_ms = Some(now + MAX_TIMESTAMP_FUTURE_SKEW_MS + 1);
+        let mut layer = NwsForecastLayerState::default();
+        layer.fold(retained);
+        assert!(layer.future_dated(now));
+        assert!(layer.stale(now));
+
+        let ctx = egui::Context::default();
+        let mut stats = PaintStats::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                stats = paint_layer(ui.painter(), ui.max_rect(), &layer, now, |_lat, _lon| {
+                    panic!("invalid coordinates must not reach projection")
+                });
+            });
+        });
+        assert_eq!(stats.markers, 0);
+        assert_eq!(stats.samples_considered, 1);
+        assert_eq!(stats.periods_considered, 0);
+        assert!(stats.non_live);
     }
 }

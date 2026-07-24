@@ -13,6 +13,9 @@ pub const TRACK_DROP_AFTER_MS: i64 = 60_000;
 /// Allow a small amount of clock skew, but never present a future retained
 /// fetch as live data.
 pub const MAX_TIMESTAMP_FUTURE_SKEW_MS: i64 = 5_000;
+/// Keep an untrusted retained aircraft set bounded before any per-aircraft
+/// dead reckoning, projection, label layout, or tessellation work.
+const MAX_PAINTABLE_AIRCRAFT: usize = 256;
 
 const LOW_ALTITUDE: Color32 = Color32::from_rgb(0xF0, 0x66, 0x3A); // style-leak-ok: map-content-color
 const HIGH_ALTITUDE: Color32 = Color32::from_rgb(0x47, 0xB6, 0xE8); // style-leak-ok: map-content-color
@@ -98,7 +101,7 @@ where
     if !layer.future_dated(now_ms) {
         if let Some(snapshot) = &layer.snapshot {
             let marker_painter = painter.with_clip_rect(rect.intersect(painter.clip_rect()));
-            for aircraft in &snapshot.aircraft {
+            for aircraft in snapshot.aircraft.iter().take(MAX_PAINTABLE_AIRCRAFT) {
                 if !aircraft.latitude.is_finite()
                     || !aircraft.longitude.is_finite()
                     || !(-90.0..=90.0).contains(&aircraft.latitude)
@@ -422,5 +425,39 @@ mod tests {
         });
         assert_eq!(observed.markers, 0);
         assert!(observed.badge);
+    }
+
+    #[test]
+    fn oversized_retained_snapshot_is_bounded_before_aircraft_paint_work() {
+        let now = 1_000_000;
+        let base = snapshot(now).aircraft[0].clone();
+        let mut oversized = snapshot(now);
+        oversized.aircraft = (0..(MAX_PAINTABLE_AIRCRAFT + 32))
+            .map(|index| AircraftTrack {
+                id: format!("aircraft-{index}"),
+                callsign: Some(format!("N{index:05}")),
+                ..base.clone()
+            })
+            .collect();
+        let mut layer = AircraftLayerState::default();
+        layer.show_callsigns = true;
+        layer.fold(oversized);
+
+        let ctx = egui::Context::default();
+        let mut projected = 0;
+        let mut stats = PaintStats::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = ui.max_rect();
+                stats = paint_layer(ui.painter(), rect, &layer, now, |_lat, _lon| {
+                    projected += 1;
+                    Some(rect.center())
+                });
+            });
+        });
+        assert_eq!(projected, MAX_PAINTABLE_AIRCRAFT);
+        assert_eq!(stats.markers, MAX_PAINTABLE_AIRCRAFT);
+        assert_eq!(stats.labels, MAX_PAINTABLE_AIRCRAFT);
+        assert!(stats.badge);
     }
 }

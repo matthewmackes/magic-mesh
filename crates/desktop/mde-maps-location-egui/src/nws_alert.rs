@@ -12,6 +12,15 @@ pub const SNAPSHOT_STALE_AFTER_MS: i64 = 3 * 60 * 1_000;
 /// Keep this allowance aligned with the other map consumers so clock skew does
 /// not turn a hostile or misconfigured publication into a false alert.
 const MAX_TIMESTAMP_FUTURE_SKEW_MS: i64 = 5_000;
+/// Keep an untrusted retained warning snapshot from monopolizing one map frame.
+/// The worker normally publishes a small active set, but the consumer must keep
+/// its own bound because Bus mirrors can be written by another node.
+const MAX_PAINTABLE_ALERTS: usize = 256;
+/// Bound polygon/ring work as well as the top-level alert count. A malformed
+/// alert with thousands of rings or vertices must fail soft before projection
+/// or triangulation can amplify it.
+const MAX_PAINTABLE_RINGS: usize = 64;
+const MAX_PAINTABLE_POINTS_PER_RING: usize = 1_024;
 
 const SEVERITY_EXTREME: Color32 = Color32::from_rgb(0xD4, 0x2A, 0x2A); // style-leak-ok: map-content-color
 const SEVERITY_SEVERE: Color32 = Color32::from_rgb(0xF2, 0x82, 0x22); // style-leak-ok: map-content-color
@@ -100,6 +109,7 @@ where
                 .alerts
                 .iter()
                 .filter(|alert| !expired(alert, now_ms))
+                .take(MAX_PAINTABLE_ALERTS)
             {
                 if vehicle.is_some_and(|point| alert_contains(alert, point))
                     && inside.is_none_or(|current| {
@@ -120,7 +130,16 @@ where
         paint_warning_banner(painter, rect, alert, stale);
         stats.inside_alert = true;
     }
-    paint_age_badge(painter, rect, layer, now_ms);
+    paint_age_badge(
+        painter,
+        rect,
+        layer,
+        now_ms,
+        layer
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.alerts.len() > MAX_PAINTABLE_ALERTS),
+    );
     stats.badge = true;
     stats
 }
@@ -140,10 +159,11 @@ fn paint_polygon<F>(
 where
     F: FnMut(f64, f64) -> Option<Pos2>,
 {
-    let mut projected_rings = Vec::new();
-    for ring in &polygon.rings {
+    let mut projected_rings = Vec::with_capacity(polygon.rings.len().min(MAX_PAINTABLE_RINGS));
+    for ring in polygon.rings.iter().take(MAX_PAINTABLE_RINGS) {
         let points: Vec<Pos2> = ring
             .iter()
+            .take(MAX_PAINTABLE_POINTS_PER_RING)
             .filter_map(|point| project(point.latitude, point.longitude))
             .filter(|point| !point.any_nan())
             .collect();
@@ -278,30 +298,46 @@ fn point_in_triangle(point: Pos2, a: Pos2, b: Pos2, c: Pos2) -> bool {
 }
 
 fn alert_contains(alert: &NwsAlert, point: GeoPoint) -> bool {
-    alert.polygons.iter().any(|polygon| {
-        let Some(outer) = polygon.rings.first() else {
-            return false;
-        };
-        point_in_geo_ring(point, outer)
-            && !polygon
-                .rings
-                .iter()
-                .skip(1)
-                .any(|hole| point_in_geo_ring(point, hole))
-    })
+    alert
+        .polygons
+        .iter()
+        .take(MAX_PAINTABLE_RINGS)
+        .any(|polygon| {
+            let Some(outer) = polygon.rings.first() else {
+                return false;
+            };
+            point_in_geo_ring(point, outer)
+                && !polygon
+                    .rings
+                    .iter()
+                    .skip(1)
+                    .take(MAX_PAINTABLE_RINGS.saturating_sub(1))
+                    .any(|hole| point_in_geo_ring(point, hole))
+        })
 }
 
 fn point_in_geo_ring(point: GeoPoint, ring: &[GeoPoint]) -> bool {
-    if ring.len() < 3 {
+    let points: Vec<GeoPoint> = ring
+        .iter()
+        .copied()
+        .take(MAX_PAINTABLE_POINTS_PER_RING)
+        .filter(|point| {
+            point.latitude.is_finite()
+                && point.longitude.is_finite()
+                && (-90.0..=90.0).contains(&point.latitude)
+                && (-180.0..=180.0).contains(&point.longitude)
+        })
+        .collect();
+    if points.len() < 3 {
         return false;
     }
     let mut inside = false;
-    let mut j = ring.len() - 1;
-    for i in 0..ring.len() {
-        let yi = ring[i].latitude;
-        let yj = ring[j].latitude;
-        let xi = ring[i].longitude;
-        let xj = ring[j].longitude;
+    let mut j = points.len() - 1;
+    for i in 0..points.len() {
+        let yi = points[i].latitude;
+        let yj = points[j].latitude;
+        let xi = points[i].longitude;
+        let xj = points[j].longitude;
         if ((yi > point.latitude) != (yj > point.latitude))
             && point.longitude < (xj - xi) * (point.latitude - yi) / (yj - yi) + xi
         {
@@ -372,7 +408,13 @@ fn paint_warning_banner(painter: &Painter, rect: Rect, alert: &NwsAlert, stale: 
     );
 }
 
-fn paint_age_badge(painter: &Painter, rect: Rect, layer: &NwsAlertLayerState, now_ms: i64) {
+fn paint_age_badge(
+    painter: &Painter,
+    rect: Rect,
+    layer: &NwsAlertLayerState,
+    now_ms: i64,
+    alerts_capped: bool,
+) {
     let (label, tone) = match (&layer.snapshot, layer.age_ms(now_ms)) {
         (None, _) => ("NWS alerts · no data".to_string(), Style::TEXT_DIM),
         (Some(_), Some(age)) if age > SNAPSHOT_STALE_AFTER_MS => (
@@ -383,14 +425,19 @@ fn paint_age_badge(painter: &Painter, rect: Rect, layer: &NwsAlertLayerState, no
             format!("NWS alerts · {} · degraded", age_label(age)),
             Style::WARN,
         ),
-        (Some(snapshot), Some(age)) => (
-            format!(
-                "NWS alerts · {} · {} active",
-                age_label(age),
-                snapshot.alerts.len()
-            ),
-            Style::TEXT,
-        ),
+        (Some(snapshot), Some(age)) => {
+            let count = snapshot.alerts.len().min(MAX_PAINTABLE_ALERTS);
+            let suffix = if alerts_capped { "+" } else { "" };
+            (
+                format!(
+                    "NWS alerts · {} · {}{} active",
+                    age_label(age),
+                    count,
+                    suffix
+                ),
+                Style::TEXT,
+            )
+        }
         (Some(_), None) => ("NWS alerts · no timestamp".to_string(), Style::WARN),
     };
     let galley = painter.layout_no_wrap(label, FontId::proportional(Style::SMALL), tone);
@@ -586,6 +633,47 @@ mod tests {
         });
         assert_eq!(stats.polygons, 0);
         assert!(!stats.inside_alert);
+        assert!(stats.badge);
+    }
+
+    #[test]
+    fn oversized_retained_snapshot_is_bounded_before_polygon_paint() {
+        let now = 1_000_000;
+        let mut snapshot = NwsAlertSnapshot::empty("rig-1", now);
+        snapshot
+            .alerts
+            .extend((0..(MAX_PAINTABLE_ALERTS + 12)).map(|i| {
+                let mut warning = alert(now);
+                warning.id = format!("warning-{i}");
+                warning
+            }));
+        let mut layer = NwsAlertLayerState::default();
+        layer.fold(snapshot);
+
+        let ctx = egui::Context::default();
+        let mut stats = PaintStats::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = ui.max_rect();
+                stats = paint_layer(
+                    ui.painter(),
+                    rect,
+                    &layer,
+                    now,
+                    Some(GeoPoint {
+                        latitude: 1.0,
+                        longitude: 0.5,
+                    }),
+                    |_lat, _lon| Some(rect.center()),
+                );
+            });
+        });
+
+        assert_eq!(
+            stats.polygons, MAX_PAINTABLE_ALERTS,
+            "the retained mirror cannot amplify polygon paint work"
+        );
+        assert!(stats.inside_alert, "a valid warning survives the cap");
         assert!(stats.badge);
     }
 

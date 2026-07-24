@@ -26,6 +26,11 @@ use super::super::reconcile;
 use super::super::runner::default_libvirt_uri;
 use super::super::CloudWorker;
 
+/// Maximum wire body accepted by the desired-state mutation and authorization
+/// boundary. Check this before asking `serde_json` to materialize caller-owned
+/// arrays and strings; the shared IPC cap keeps the mutation surface bounded.
+const MAX_SET_DESIRED_BODY_BYTES: usize = crate::ipc::MAX_RPC_BODY_BYTES;
+
 /// The `set-desired` request body: one `spec`, a `specs` batch, and/or a `remove`
 /// list of workload names. Every field is optional so the handler enforces what it
 /// requires (at least one writable spec or one removal).
@@ -49,8 +54,7 @@ struct SetDesiredBody {
 /// the complete canonical request digest, so this label is operator context, not
 /// the only anti-substitution control.
 pub(super) fn authorization_target(body_str: &str) -> Result<String, String> {
-    let body: SetDesiredBody = serde_json::from_str(body_str.trim())
-        .map_err(|e| format!("malformed set-desired request: {e}"))?;
+    let body = parse_set_desired_body(body_str)?;
     let mut names = Vec::new();
     if let Some(spec) = body.spec {
         names.push(spec.name.trim().to_string());
@@ -88,9 +92,9 @@ struct PlanBody {
 /// silent no-op success.
 #[must_use]
 pub(crate) fn handle_set_desired(w: &CloudWorker, verb_name: &str, body_str: &str) -> CloudReply {
-    let body: SetDesiredBody = match serde_json::from_str(body_str.trim()) {
-        Ok(b) => b,
-        Err(e) => return reject(verb_name, format!("malformed set-desired request: {e}")),
+    let body = match parse_set_desired_body(body_str) {
+        Ok(body) => body,
+        Err(error) => return reject(verb_name, error),
     };
 
     // Collect the specs to write (single + batch), resolving each spec's placement
@@ -192,6 +196,18 @@ pub(crate) fn handle_set_desired(w: &CloudWorker, verb_name: &str, body_str: &st
         desired: Some(accepted),
         ..Default::default()
     }
+}
+
+/// Parse a desired-state mutation only after enforcing its byte budget. This is
+/// deliberately not used by [`handle_plan`]: plan is a read and must preserve
+/// the valid legacy `{}` request shape.
+fn parse_set_desired_body(body_str: &str) -> Result<SetDesiredBody, String> {
+    if body_str.len() > MAX_SET_DESIRED_BODY_BYTES {
+        return Err(format!(
+            "set-desired request body exceeds {MAX_SET_DESIRED_BODY_BYTES}-byte limit"
+        ));
+    }
+    serde_json::from_str(body_str.trim()).map_err(|e| format!("malformed set-desired request: {e}"))
 }
 
 /// Render this node's desired slice and return the pending-change [`PlanCounts`].
@@ -426,6 +442,32 @@ mod tests {
         let reply = handle_set_desired(&w, "set-desired", r#"{"node":"eagle"}"#);
         assert!(!reply.ok);
         assert!(reply.error.unwrap().contains("requires"));
+    }
+
+    #[test]
+    fn oversized_set_desired_is_rejected_before_authorization_or_filesystem_mutation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let w = worker(
+            "eagle",
+            tmp.path().to_path_buf(),
+            Arc::new(FakeRunner::default()),
+        );
+        // The padding is an otherwise harmless unknown JSON field. Without the
+        // boundary check it would still be parsed and the valid spec would land.
+        let body = format!(
+            r#"{{"node":"eagle","spec":{{
+                "name":"web","delivery_type":"service_vm","node":"eagle",
+                "vcpu":1,"memory_mb":512,"disk_gb":4}},"padding":"{}"}}"#,
+            "x".repeat(MAX_SET_DESIRED_BODY_BYTES)
+        );
+
+        let authorization_error = authorization_target(&body).unwrap_err();
+        assert!(authorization_error.contains("exceeds"));
+
+        let reply = handle_set_desired(&w, "set-desired", &body);
+        assert!(!reply.ok);
+        assert!(reply.error.unwrap().contains("exceeds"));
+        assert!(!tmp.path().join("mcnf").exists());
     }
 
     #[test]
