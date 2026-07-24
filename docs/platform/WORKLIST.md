@@ -354,6 +354,12 @@ These decisions refine acceptance and sequencing for the active items below.
   rejects an incomplete export without its exact END delimiter, while the
   existing validated transactional restore remains covered. The focused `.50`
   CA backup gate is green at 29/29; live CA restore evidence remains external.
+- Progress (2026-07-24 enrollment client response framing): the pinned TLS
+  enrollment client now validates the HTTP/1.1 status line, header names, exact
+  `Content-Length`, duplicate-length ambiguity, and unsupported transfer
+  coding before JSON parsing. Four hostile framing regressions are covered; the
+  focused BigBoy client gate is green at 17/17. Live Nebula/lighthouse evidence
+  remains external.
 - Priority: P0
 - Complexity: Epic
 - Problem: Any node able to read replicated enrollment bundles can obtain other
@@ -504,6 +510,11 @@ These decisions refine acceptance and sequencing for the active items below.
   last-operation semantics and partial accepted batches. The focused BigBoy
   desired-state suite is green at 13/13; live libvirt/Podman evidence remains
   external.
+- Progress (2026-07-24 container backend-error bounding): direct restart, logs,
+  and destroy handlers now UTF-8-safely bound unavailable-backend error text
+  before it enters cloud replies, including the selected instance context. The
+  focused `.90` container lifecycle gate is green at 7/7; live libvirt/Podman
+  evidence remains external.
 - Priority: P0
 - Complexity: Epic
 - Problem: The archived WL-ARCH-006 surface is mounted, but its Set desired UI
@@ -1413,6 +1424,11 @@ These decisions refine acceptance and sequencing for the active items below.
   value and the dependency-free welcome self-test plus shell syntax checks are
   green. RPM installation/reflection and live seat visual comparison remain
   external release evidence; no live seat change was made.
+- Progress (2026-07-24 chooser typography adoption): the protocol badge now
+  resolves its caption font through the shared `TypographyRole` contract,
+  removing the remaining canonical ad-hoc font literal in that chooser surface
+  while preserving badge geometry. The focused `.50` chooser gate is green at
+  98/98; no live seat change was made.
 - Priority: P1
 - Complexity: Epic
 - Problem: The workstation chrome is Win10-shaped (48px bottom taskbar + tray
@@ -1568,6 +1584,12 @@ These decisions refine acceptance and sequencing for the active items below.
   gap and retain authenticated LCI values. The focused worker suite is green at
   25/25 and the mesh-type vehicle suite at 8/8; no undocumented `:11532`
   application response schema was guessed or promoted into telemetry.
+- Progress (2026-07-24 MG90 adapter request boundary): the canonical adapter now
+  validates local absolute paths, rejects scheme-relative URLs, traversal,
+  fragments, whitespace, and control characters, bounds login redirects, and
+  never follows redirects for the authenticated status fetch. The dependency-
+  free adapter syntax and self-test pass; the live `:11532` application schema
+  remains credential-gated and is not promoted into telemetry.
 - Progress (2026-07-24 Car sparse-data and touch-boundary hardening): empty or
   whitespace telemetry now falls back to honest descriptors, undersized viewports
   fail closed before producing off-body targets, and all six Car strip routes

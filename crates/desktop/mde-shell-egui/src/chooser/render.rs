@@ -14,6 +14,7 @@
 //! (and the tests) call back into are `pub(super)`.
 
 use super::*;
+use mde_egui::TypographyRole;
 
 const CHOOSER_TOOLTIP_MAX_W: f32 = Style::SP_XL * 12.0;
 
@@ -725,7 +726,7 @@ pub(super) fn card_tooltip(source: &DesktopSource) -> String {
 pub(super) fn protocol_badge(ui: &mut egui::Ui, offer: ProtocolOffer) {
     let galley = ui.painter().layout_no_wrap(
         offer.protocol.badge().to_string(),
-        FontId::proportional(Style::SMALL),
+        Style::typography_font(TypographyRole::Caption),
         Style::ACCENT_HI,
     );
     let pad = egui::vec2(Style::SP_XS * 2.0, Style::SP_XS);

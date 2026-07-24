@@ -439,22 +439,66 @@ fn validate_response_size(raw: &[u8]) -> Result<(), NetEnrollError> {
 }
 
 /// Parse a minimal HTTP/1.1 response into (status, body). Accepts the
-/// `Connection: close` framing the endpoint always uses (read to EOF).
+/// `Connection: close` framing the endpoint always uses (read to EOF), but
+/// validates `Content-Length` when present and rejects transfer coding so a
+/// hostile peer cannot make the caller parse bytes outside the framed body.
 fn parse_http_response(raw: &[u8]) -> Result<(u16, Vec<u8>), String> {
     let split = raw
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .ok_or("no header/body separator")?;
     let head = std::str::from_utf8(&raw[..split]).map_err(|_| "non-utf8 headers")?;
-    let status_line = head.lines().next().ok_or("empty response")?;
-    // "HTTP/1.1 200 OK"
-    let status: u16 = status_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or("no status code")?
-        .parse()
-        .map_err(|_| "bad status code")?;
-    Ok((status, raw[split + 4..].to_vec()))
+    let mut lines = head.split("\r\n");
+    let status_line = lines.next().ok_or("empty response")?;
+    let status_tail = status_line
+        .strip_prefix("HTTP/1.1 ")
+        .ok_or("bad HTTP status line")?;
+    let status_code = status_tail
+        .split_once(' ')
+        .map_or(status_tail, |(code, _)| code);
+    if status_code.len() != 3 || !status_code.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("bad status code".into());
+    }
+    let status: u16 = status_code.parse().map_err(|_| "bad status code")?;
+
+    let mut content_length = None;
+    for line in lines {
+        let (name, value) = line.split_once(':').ok_or("malformed header")?;
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
+        {
+            return Err("malformed header name".into());
+        }
+        let value = value.trim_matches([' ', '\t']);
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            return Err("transfer-encoding is unsupported".into());
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            if content_length.is_some() {
+                return Err("duplicate content-length".into());
+            }
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err("bad content-length".into());
+            }
+            let length = value
+                .parse::<usize>()
+                .map_err(|_| "bad content-length")?;
+            content_length = Some(length);
+        }
+    }
+
+    let body = &raw[split + 4..];
+    if let Some(expected) = content_length {
+        if body.len() != expected {
+            return Err(format!(
+                "content-length says {expected} bytes, received {}",
+                body.len()
+            ));
+        }
+    }
+    Ok((status, body.to_vec()))
 }
 
 /// End-to-end peer-side network enroll: build the identity + CSR from
@@ -1066,6 +1110,45 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n\
         let (status, body) = parse_http_response(raw).unwrap();
         assert_eq!(status, 401);
         assert!(body.starts_with(b"{\"error\""));
+    }
+
+    #[test]
+    fn hostile_response_with_trailing_bytes_after_content_length_is_rejected() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}extra";
+        let error = parse_http_response(raw).expect_err("trailing bytes must not escape framing");
+        assert!(error.contains("content-length"));
+    }
+
+    #[test]
+    fn hostile_response_truncated_before_content_length_is_rejected() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n{}";
+        let error = parse_http_response(raw).expect_err("truncated body must fail closed");
+        assert!(error.contains("content-length"));
+    }
+
+    #[test]
+    fn hostile_response_with_ambiguous_framing_is_rejected() {
+        let duplicate = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 4\r\n\r\n{}";
+        let duplicate_error =
+            parse_http_response(duplicate).expect_err("duplicate lengths are ambiguous");
+        assert!(duplicate_error.contains("duplicate content-length"));
+
+        let transfer_encoded =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n";
+        let transfer_error =
+            parse_http_response(transfer_encoded).expect_err("transfer coding is unsupported");
+        assert!(transfer_error.contains("transfer-encoding"));
+    }
+
+    #[test]
+    fn hostile_response_with_malformed_status_or_header_is_rejected() {
+        let bad_status = b"HTTP/1.1 20 OK\r\nContent-Length: 2\r\n\r\n{}";
+        let status_error = parse_http_response(bad_status).expect_err("bad status must fail");
+        assert!(status_error.contains("status code"));
+
+        let bad_header = b"HTTP/1.1 200 OK\r\nContent-Length 2\r\n\r\n{}";
+        let header_error = parse_http_response(bad_header).expect_err("bad header must fail");
+        assert!(header_error.contains("malformed header"));
     }
 
     #[test]

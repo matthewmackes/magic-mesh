@@ -87,6 +87,30 @@ password_file() {
     [[ -n "$(head -n 1 -- "$file")" ]] || die "$label is empty: $file"
 }
 
+# Keep authenticated GETs on the pinned MG90 origin and make the request target
+# unambiguous. A raw URL, scheme-relative path, fragment, control character, or
+# traversal segment must never reach curl's redirect/parser surface.
+safe_http_path() {
+    local path="$1" path_without_query segment
+    [[ "$path" == /* && "$path" != //* ]] || return 1
+    [[ "$path" != *[[:space:]]* ]] || return 1
+    [[ "$path" != *$'\n'* && "$path" != *$'\r'* && "$path" != *$'\t'* ]] || return 1
+    [[ "$path" != *'\\'* && "$path" != *'#'* ]] || return 1
+    path_without_query="${path%%\?*}"
+    local -a segments=()
+    IFS='/' read -r -a segments <<< "$path_without_query"
+    for segment in "${segments[@]}"; do
+        case "$segment" in
+            .|..) return 1 ;;
+        esac
+    done
+}
+
+validate_http_path() {
+    local path="$1"
+    safe_http_path "$path" || die "HTTP path must be an absolute, local, non-traversing path: $path"
+}
+
 known_hosts() {
     [[ -r "$MG90_KNOWN_HOSTS_FILE" ]] || die "pinned known-hosts file is missing: $MG90_KNOWN_HOSTS_FILE"
     ssh-keygen -F "[$MG90_HOST]:$MG90_SSH_PORT" -f "$MG90_KNOWN_HOSTS_FILE" >/dev/null 2>&1 \
@@ -134,13 +158,15 @@ http_get() {
     need python3
     password_file "$MG90_HTTP_PASSWORD_FILE" "MG90 HTTP password file"
     [[ "$path" == /* ]] || path="/$path"
+    validate_http_path "$path"
     jar="$(mktemp)"
     post="$(mktemp)"
     chmod 600 -- "$post"
     trap 'rm -f -- "$jar" "$post"' RETURN
     base="http://$MG90_HOST:$port"
     login="$base/j_security_check"
-    curl --silent --show-error --fail --max-time 12 -c "$jar" -b "$jar" -L "$base/" >/dev/null
+    curl --silent --show-error --fail --max-time 12 --max-redirs 3 \
+        -c "$jar" -b "$jar" -L "$base/" >/dev/null
     # Build the form from the password file so the password is neither in argv
     # nor sent with a trailing newline from the credential file.
     python3 - "$MG90_HTTP_USER" "$MG90_HTTP_PASSWORD_FILE" "$post" <<'PY'
@@ -153,9 +179,13 @@ password = pathlib.Path(password_file).read_text().splitlines()[0]
 payload = urllib.parse.urlencode({"j_username": user, "j_password": password})
 pathlib.Path(output_file).write_text(payload)
 PY
-    curl --silent --show-error --fail --max-time 12 -c "$jar" -b "$jar" -L \
+    curl --silent --show-error --fail --max-time 12 --max-redirs 3 \
+        -c "$jar" -b "$jar" -L \
         --data-binary "@$post" \
         "$login" >/dev/null
+    # The target itself is not followed: login redirects are expected, but a
+    # device-specific status page must not turn into an arbitrary cross-origin
+    # fetch after authentication.
     curl --silent --show-error --fail --max-time 12 -b "$jar" "$base$path"
     rm -f -- "$jar"
     rm -f -- "$post"
@@ -222,6 +252,12 @@ self_test() {
     need bash
     need stat
     need ssh-keygen
+    safe_http_path "/MG-LCI/status/general.html"
+    safe_http_path "/MG-LCI/wan/status/status.html?displayExtended=true"
+    ! safe_http_path "http://example.invalid/redirect"
+    ! safe_http_path "//example.invalid/redirect"
+    ! safe_http_path "/MG-LCI/../secret"
+    ! safe_http_path $'/MG-LCI/status\n'
     echo "mg90-access: self-test passed (no network operation performed)"
 }
 

@@ -41,7 +41,11 @@ pub(crate) fn handle_restart(
             w,
             verb_name,
             instance,
-            CloudRunOutcome::failed(format!("systemctl unavailable: {error}")),
+            CloudRunOutcome::failed(bounded_message(
+                "systemctl unavailable: ",
+                &error,
+                "",
+            )),
             true,
         ),
         Ok(run) => finish_mutation(
@@ -74,8 +78,10 @@ pub(crate) fn handle_logs(w: &CloudWorker, verb_name: &str, body: &CloudActionBo
         Err(error) => CloudReply {
             ok: false,
             verb: verb_name.to_string(),
-            gated: Some(format!(
-                "journal backend unavailable: {error} — recent logs were not retrieved"
+            gated: Some(bounded_message(
+                "journal backend unavailable: ",
+                &error,
+                " — recent logs were not retrieved",
             )),
             ..Default::default()
         },
@@ -141,7 +147,11 @@ pub(crate) fn handle_destroy(
                 w,
                 verb_name,
                 instance,
-                CloudRunOutcome::failed(format!("systemctl unavailable: {error}")),
+                CloudRunOutcome::failed(bounded_message(
+                    "systemctl unavailable: ",
+                    &error,
+                    "",
+                )),
                 true,
             )
         }
@@ -258,6 +268,11 @@ fn bounded_output(value: &str) -> String {
     bounded
 }
 
+fn bounded_message(prefix: &str, value: &str, suffix: &str) -> String {
+    let bounded_value = bounded_output(value);
+    bounded_output(&format!("{prefix}{bounded_value}{suffix}"))
+}
+
 fn finish_mutation(
     w: &CloudWorker,
     verb_name: &str,
@@ -316,7 +331,9 @@ mod tests {
             .with_bus_root(None)
     }
 
-    struct OversizedLogRunner;
+    struct OversizedLogRunner {
+        fail: bool,
+    }
 
     impl CloudRunner for OversizedLogRunner {
         fn probe_tool(&self, tool: &str) -> ServiceHealth {
@@ -353,6 +370,9 @@ mod tests {
         }
 
         fn run_tool(&self, _bin: &str, _args: &[&str]) -> Result<ToolRun, String> {
+            if self.fail {
+                return Err(format!("é{}", "x".repeat(super::MAX_OUTPUT_BYTES + 1)));
+            }
             Ok(ToolRun {
                 ok: true,
                 stdout: format!("é{}", "x".repeat(super::MAX_OUTPUT_BYTES + 1)),
@@ -462,7 +482,7 @@ mod tests {
     fn logs_bound_oversized_utf8_backend_output() {
         let tmp = tempfile::tempdir().unwrap();
         let w = CloudWorker::new("me".into(), "peer:me".into(), tmp.path().to_path_buf())
-            .with_runner(Arc::new(OversizedLogRunner))
+            .with_runner(Arc::new(OversizedLogRunner { fail: false }))
             .with_signer(Arc::new(signer()))
             .with_auth_root(tmp.path().join("auth"))
             .with_db_path(tmp.path().join("events.sqlite"))
@@ -474,6 +494,25 @@ mod tests {
         assert!(output.len() <= super::MAX_OUTPUT_BYTES);
         assert!(output.ends_with(super::OUTPUT_TRUNCATION_MARKER));
         assert!(output.is_char_boundary(output.len()));
+    }
+
+    #[test]
+    fn unavailable_backend_error_is_bounded_before_reply() {
+        let tmp = tempfile::tempdir().unwrap();
+        let w = CloudWorker::new("me".into(), "peer:me".into(), tmp.path().to_path_buf())
+            .with_runner(Arc::new(OversizedLogRunner { fail: true }))
+            .with_signer(Arc::new(signer()))
+            .with_auth_root(tmp.path().join("auth"))
+            .with_db_path(tmp.path().join("events.sqlite"))
+            .with_bus_root(None);
+
+        let reply = w.handle("container-logs", r#"{"node":"me","instance":"web"}"#);
+        let detail = reply
+            .gated
+            .expect("unavailable backend must explain the failed read");
+        assert!(!reply.ok);
+        assert!(detail.len() <= super::MAX_OUTPUT_BYTES);
+        assert!(detail.ends_with(super::OUTPUT_TRUNCATION_MARKER));
     }
 
     #[test]
