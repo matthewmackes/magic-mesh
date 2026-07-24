@@ -457,7 +457,17 @@ impl CloudWorker {
             };
             for msg in msgs {
                 cursors.insert(topic.clone(), msg.ulid.clone());
-                let body = msg.body.as_deref().unwrap_or("{}");
+                let Some(body) = msg.body.as_deref() else {
+                    let reply = CloudReply {
+                        ok: false,
+                        verb: verb_name.clone(),
+                        error: Some("cloud action body is missing".to_string()),
+                        ..Default::default()
+                    };
+                    self.write_reply(&persist, &msg.ulid, &reply);
+                    acted = true;
+                    continue;
+                };
                 let parsed = CloudActionBody::parse(body);
                 if let Some(verb) = classified {
                     if let Some(error) = parsed.schema_error_for(verb) {
@@ -1600,6 +1610,34 @@ mod tests {
         let reply: CloudReply = serde_json::from_str(replies[0].body.as_deref().unwrap()).unwrap();
         assert!(reply.ok);
         assert_eq!(reply.instances.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn drain_refuses_a_missing_body_before_legacy_read_compatibility() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bus = tmp.path().to_path_buf();
+        let persist = Persist::open(bus.clone()).unwrap();
+        let req = persist
+            .write("action/cloud/list-instances", Priority::Default, None, None)
+            .unwrap();
+        let worker = CloudWorker::new("f".into(), "peer:f".into(), tmp.path().to_path_buf())
+            .with_runner(Arc::new(FakeRunner {
+                roster: vec![instance("secret-vm", "ACTIVE")],
+                ..Default::default()
+            }))
+            .with_bus_root(Some(bus));
+
+        assert!(worker.drain_actions(&mut HashMap::new()));
+        let replies = persist.list_since(&reply_topic(&req.ulid), None).unwrap();
+        assert_eq!(replies.len(), 1);
+        let reply: CloudReply = serde_json::from_str(replies[0].body.as_deref().unwrap()).unwrap();
+        assert!(!reply.ok);
+        assert!(reply
+            .error
+            .as_deref()
+            .is_some_and(|error| error == "cloud action body is missing"));
+        assert!(reply.instances.is_none(), "missing bodies must not disclose reads");
+        assert!(reply.gated.is_none());
     }
 
     #[tokio::test]

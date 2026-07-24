@@ -360,6 +360,11 @@ These decisions refine acceptance and sequencing for the active items below.
   coding before JSON parsing. Four hostile framing regressions are covered; the
   focused BigBoy client gate is green at 17/17. Live Nebula/lighthouse evidence
   remains external.
+- Progress (2026-07-24 pending-CSR key-boundary hardening): peer enrollment now
+  validates the submitted Nebula X25519 public-key PEM before bearer
+  authorization, signer scratch creation, certificate-row insertion, or bundle
+  writes. The hostile malformed-key regression is included in the focused
+  BigBoy enrollment gate at 93/93; live Nebula evidence remains external.
 - Priority: P0
 - Complexity: Epic
 - Problem: Any node able to read replicated enrollment bundles can obtain other
@@ -519,6 +524,11 @@ These decisions refine acceptance and sequencing for the active items below.
   truncates backend summary lines at a UTF-8 boundary, preventing localized or
   hostile diagnostics from panicking the error path. The focused `.90` runner
   gate is green at 4/4; live libvirt/Podman evidence remains external.
+- Progress (2026-07-24 cloud missing-body boundary): a Bus action with no body
+  now receives a bounded error reply before legacy read compatibility can turn
+  it into `{}`, preventing roster disclosure while preserving literal `{}` reads.
+  The focused `.90` cloud gate is green at 139/139; live libvirt/Podman evidence
+  remains external.
 - Priority: P0
 - Complexity: Epic
 - Problem: The archived WL-ARCH-006 surface is mounted, but its Set desired UI
@@ -1033,6 +1043,11 @@ These decisions refine acceptance and sequencing for the active items below.
   cross-node/FIRMS isolation regression is included. External feed credentials,
   fresh MG90 fix, and NCDOT acceptance remain optional live-data evidence
   follow-ups, not blockers to the autonomous implementation drain.
+- Progress (2026-07-24 live-mirror proof-tool no-follow hardening): the
+  read-only verifier now rejects traversal, symlinked parents/leaves, and
+  non-regular indexed files, then performs the final read with `O_NOFOLLOW` and
+  `fstat` to close the check-then-read race. Its Python syntax and hostile
+  symlink self-tests pass; it still contacts no gateway or external feed.
 - Progress (2026-07-24 NCDOT contract hardening): malformed GeoJSON features are
   now isolated instead of poisoning valid incidents, point coordinate arrays
   are streaming-bounded to two or three values, and only `gps`/`dgps` fixes
@@ -1114,6 +1129,11 @@ These decisions refine acceptance and sequencing for the active items below.
   expanded, preventing a primary-tab selection from reusing stale scroll or
   hit-test state. The focused BigBoy Maps view gate is green at 49/49; live
   visual proof remains external.
+- Progress (2026-07-24 Airspace consumer-boundary hardening): persisted Ready
+  snapshots are revalidated at the Maps consumer boundary and malformed
+  contacts are dropped before selection or painting, preserving the honest
+  `NO SCANNER FEED` state without inventing an MG90 protocol. The focused `.50`
+  Airspace gate is green at 9/9; live scanner configuration remains external.
 - Progress (2026-07-24 transit stale-location hardening): when a refresh fails
   after the vehicle moves, the GTFS worker now discards the old nearby-vehicle
   snapshot and publishes an empty degraded snapshot for the new point instead
@@ -1448,6 +1468,10 @@ These decisions refine acceptance and sequencing for the active items below.
   glyphs now use the shared Caption role instead of direct font sizes. Focused
   farm gates are green at Console 48/48 and Storage 34/34; no live seat change
   was made.
+- Progress (2026-07-24 System typography adoption): Settings choice tiles and
+  mixer status rows now resolve their body/caption fonts through the shared
+  `TypographyRole` contract, preserving existing geometry and interaction. The
+  focused BigBoy System gate is green at 74/74; no live seat change was made.
 - Priority: P1
 - Complexity: Epic
 - Problem: The workstation chrome is Win10-shaped (48px bottom taskbar + tray

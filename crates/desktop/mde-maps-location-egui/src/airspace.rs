@@ -528,11 +528,13 @@ impl AirspaceState {
         }
     }
 
-    /// Replace the live picture from one validated daemon mirror snapshot.
+    /// Replace the live picture from one daemon mirror snapshot.
     ///
     /// This is a whole-snapshot fold: a later empty/offline snapshot retracts
     /// old contacts instead of leaving stale RF blips on screen. The animation
-    /// state and local filter preferences remain seat-owned.
+    /// state and local filter preferences remain seat-owned. Re-validate the
+    /// contacts here because a persisted mirror can bypass the daemon's
+    /// `from_survey` constructor before reaching this consumer boundary.
     pub fn refresh_from_wire(
         &mut self,
         snapshot: &mackes_mesh_types::airspace::AirspaceSnapshot,
@@ -542,11 +544,16 @@ impl AirspaceState {
         // malformed contacts into the live-only surface. The typed contract
         // normally emits an empty list for these states, but keep this UI
         // boundary defensive so "NO SCANNER FEED" remains truthful.
-        let contacts: &[mackes_mesh_types::airspace::AirspaceContact] = match snapshot.availability {
-            mackes_mesh_types::airspace::AirspaceAvailability::Ready => snapshot.contacts.as_slice(),
-            mackes_mesh_types::airspace::AirspaceAvailability::NoSource
-            | mackes_mesh_types::airspace::AirspaceAvailability::Offline => &[],
-        };
+        let contacts: Vec<mackes_mesh_types::airspace::AirspaceContact> =
+            match snapshot.availability {
+                mackes_mesh_types::airspace::AirspaceAvailability::Ready => snapshot
+                    .contacts
+                    .iter()
+                    .filter_map(|contact| contact.clone().bounded().ok())
+                    .collect(),
+                mackes_mesh_types::airspace::AirspaceAvailability::NoSource
+                | mackes_mesh_types::airspace::AirspaceAvailability::Offline => Vec::new(),
+            };
         self.signals = contacts
             .iter()
             .enumerate()
@@ -1075,6 +1082,61 @@ mod tests {
         );
         state.refresh_from_wire(&empty);
         assert_eq!(state.source_status, mackes_mesh_types::airspace::AirspaceAvailability::Offline);
+        assert!(state.signals.is_empty());
+        assert!(state.selected.is_none());
+    }
+
+    #[test]
+    fn malformed_ready_contacts_are_dropped_before_selection_can_stay_stale() {
+        let mut state = AirspaceState::live();
+        let ready = mackes_mesh_types::airspace::AirspaceSnapshot::from_survey(
+            "mg90-live",
+            42,
+            mackes_mesh_types::airspace::AirspaceSurvey {
+                scanned_at_ms: Some(41),
+                contacts: vec![mackes_mesh_types::airspace::AirspaceContact {
+                    id: "aa:bb".to_string(),
+                    kind: mackes_mesh_types::airspace::AirspaceContactKind::Wifi,
+                    name: "mesh-ap".to_string(),
+                    signal_dbm: -55,
+                    bearing_deg: 12.0,
+                    channel: Some(36),
+                    encryption: Some("WPA3".to_string()),
+                    notable: false,
+                    watchlist: false,
+                    own: true,
+                }],
+                gaps: Vec::new(),
+            },
+        );
+        state.refresh_from_wire(&ready);
+        state.selected = Some("aa:bb".to_string());
+
+        // A persisted Ready body can be deserialized without passing through
+        // AirspaceSnapshot::from_survey. Do not let its invalid values keep a
+        // previously selected contact alive in the UI.
+        let malformed = mackes_mesh_types::airspace::AirspaceSnapshot {
+            host: "mg90-live".to_string(),
+            published_at_ms: 43,
+            scanned_at_ms: Some(42),
+            availability: mackes_mesh_types::airspace::AirspaceAvailability::Ready,
+            contacts: vec![mackes_mesh_types::airspace::AirspaceContact {
+                id: "aa:bb".to_string(),
+                kind: mackes_mesh_types::airspace::AirspaceContactKind::Wifi,
+                name: "malformed".to_string(),
+                signal_dbm: 1,
+                bearing_deg: 400.0,
+                channel: None,
+                encryption: None,
+                notable: false,
+                watchlist: false,
+                own: false,
+            }],
+            omitted_contacts: 0,
+            gaps: Vec::new(),
+        };
+        state.refresh_from_wire(&malformed);
+
         assert!(state.signals.is_empty());
         assert!(state.selected.is_none());
     }

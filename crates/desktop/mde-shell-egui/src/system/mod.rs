@@ -42,7 +42,7 @@ use mde_egui::nav_chrome::{NavigationBar, Sidebar, SidebarRow, SidebarSection};
 use mde_egui::style::Elevation;
 use mde_egui::{
     field, muted_note, Density, Formfactor, InputPolicy, LayoutProfile, Motion, MotionMode,
-    OsdKind, OsdLevel, Severity, Style, StyleColorScheme, Toast,
+    OsdKind, OsdLevel, Severity, Style, StyleColorScheme, Toast, TypographyRole,
 };
 use mde_theme::brand::icons::IconId;
 use serde::{Deserialize, Serialize};
@@ -2943,7 +2943,7 @@ fn settings_choice_button(
                 text_rect.center(),
                 egui::Align2::CENTER_CENTER,
                 label,
-                egui::FontId::proportional(Style::BODY),
+                Style::typography_font(TypographyRole::Body),
                 colors.text,
             );
         }
@@ -2972,7 +2972,7 @@ fn settings_choice_tile(
             ui.label(
                 RichText::new(description)
                     .color(Style::TEXT_DIM)
-                    .size(Style::SMALL),
+                    .font(Style::typography_font(TypographyRole::Caption)),
             );
         }
     });
@@ -3376,7 +3376,11 @@ fn mixer_section(ui: &mut egui::Ui, snap: Option<&SeatSnapshot>) {
 fn strip_channel(ui: &mut egui::Ui, strip: &MixerStrip, master: bool) {
     let tone = if strip.muted { Style::WARN } else { Style::OK };
     ui.horizontal(|ui| {
-        ui.label(RichText::new(DOT).color(tone).size(Style::SMALL));
+        ui.label(
+            RichText::new(DOT)
+                .color(tone)
+                .font(Style::typography_font(TypographyRole::Caption)),
+        );
         ui.add_space(Style::SP_XS);
         let name = if master {
             "Master"
@@ -3386,7 +3390,7 @@ fn strip_channel(ui: &mut egui::Ui, strip: &MixerStrip, master: bool) {
         ui.label(
             RichText::new(name)
                 .color(Style::TEXT)
-                .size(Style::SMALL)
+                .font(Style::typography_font(TypographyRole::Caption))
                 .strong(),
         );
     });
@@ -3395,11 +3399,15 @@ fn strip_channel(ui: &mut egui::Ui, strip: &MixerStrip, master: bool) {
     } else {
         Style::TEXT
     };
-    let size = if master { Style::BODY } else { Style::SMALL };
+    let role = if master {
+        TypographyRole::Body
+    } else {
+        TypographyRole::Caption
+    };
     ui.label(
         RichText::new(format!("{}%", strip.volume))
             .color(level_tone)
-            .size(size),
+            .font(Style::typography_font(role)),
     );
     if strip.muted {
         muted_note(ui, "muted");

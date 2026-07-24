@@ -27,6 +27,7 @@ import json
 import math
 import os
 import sqlite3
+import stat
 import sys
 import tempfile
 import time
@@ -77,16 +78,47 @@ def _read_latest(bus_root: Path, topic: str) -> tuple[dict[str, Any], dict[str, 
         raise MirrorError(f"no indexed message for {topic}")
 
     ulid, indexed_topic, ts_unix_ms, file_path, body = row
-    if not isinstance(file_path, str) or Path(file_path).is_absolute():
+    if not isinstance(file_path, str):
+        raise MirrorError(f"indexed file path is not a relative path: {file_path!r}")
+    relative_path = Path(file_path)
+    if (
+        relative_path.is_absolute()
+        or not relative_path.parts
+        or any(part in {"", ".", ".."} for part in relative_path.parts)
+        or any("\x00" in part for part in relative_path.parts)
+    ):
         raise MirrorError(f"indexed file path is not relative: {file_path!r}")
-    message_path = (root / file_path).resolve()
-    if message_path != root / file_path or not message_path.is_file():
-        raise MirrorError(f"indexed message file is missing or escapes Bus root: {file_path!r}")
+    message_path = root.joinpath(*relative_path.parts)
+    current = root
+    for index, part in enumerate(relative_path.parts):
+        current /= part
+        try:
+            metadata = current.lstat()
+        except OSError as exc:
+            raise MirrorError(f"indexed message file is missing: {file_path!r}") from exc
+        if stat.S_ISLNK(metadata.st_mode):
+            raise MirrorError(f"indexed message path contains a symlink: {file_path!r}")
+        if index < len(relative_path.parts) - 1 and not stat.S_ISDIR(metadata.st_mode):
+            raise MirrorError(f"indexed message parent is not a directory: {file_path!r}")
+    if not message_path.is_file():
+        raise MirrorError(f"indexed message file is not a regular file: {file_path!r}")
+    fd: int | None = None
     try:
-        raw = message_path.read_bytes()
+        open_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(message_path, open_flags)
+        with os.fdopen(fd, "rb") as handle:
+            fd = None
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                raise MirrorError(f"indexed message file is not a regular file: {file_path!r}")
+            raw = handle.read()
         envelope = json.loads(raw)
+    except MirrorError:
+        raise
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise MirrorError(f"cannot read indexed message {file_path}: {exc}") from exc
+    finally:
+        if fd is not None:
+            os.close(fd)
     if not isinstance(envelope, dict):
         raise MirrorError(f"indexed message {file_path} is not a JSON object")
     if envelope.get("ulid") != ulid or envelope.get("topic") != indexed_topic:
@@ -474,6 +506,44 @@ def _self_test() -> None:
         assert any("vehicle host" in error for error in mismatched["errors"]), mismatched
         stale = validate_overlay(root, "state/overlay/test-feed/test-node", now_ms, 1_000, True)
         assert stale["errors"], stale
+
+        symlink_topic = "state/overlay/symlink/test-node"
+        outside = root.parent / f"{root.name}-outside.json"
+        outside.write_text("{}")
+        symlink_path = root / f"{symlink_topic}/message.json"
+        symlink_path.parent.mkdir(parents=True, exist_ok=True)
+        symlink_path.symlink_to(outside)
+        symlink_body = json.dumps(
+            {
+                "host": "test-node",
+                "fetched_at_ms": now_ms - 1_000,
+                "events": [],
+                "license_tier": "fixture",
+                "attribution": "fixture",
+            },
+            separators=(",", ":"),
+        )
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "01J00000000000000000000003",
+                symlink_topic,
+                "default",
+                None,
+                symlink_body,
+                now_ms - 1_000,
+                f"{symlink_topic}/message.json",
+            ),
+        )
+        conn.commit()
+        conn.close()
+        try:
+            _read_latest(root, symlink_topic)
+        except MirrorError as exc:
+            assert "symlink" in str(exc), exc
+        else:
+            raise AssertionError("indexed symlink path was accepted")
     print("verify-live-mirrors: self-test passed")
 
 

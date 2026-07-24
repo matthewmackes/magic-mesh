@@ -223,6 +223,9 @@ fn validate_pending_csr(csr: &PendingEnrollment) -> Result<(), String> {
     if csr.public_key_hex.len() != 64 || !is_lower_hex(&csr.public_key_hex) {
         return Err("pending enrollment carries an invalid Ed25519 identity key".into());
     }
+    crate::ca::sign::validate_nebula_public_key_pem(&csr.nebula_public_key_pem).map_err(
+        |error| format!("pending enrollment carries an invalid Nebula public key: {error}"),
+    )?;
     if csr.display_name.len() > 256 || csr.hw_fingerprint.len() > 256 {
         return Err("pending enrollment identity metadata is too large".into());
     }
@@ -1690,6 +1693,61 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n-----END NEBULA X25519 PUBLIC KEY-
             )
             .unwrap();
         assert_eq!(count, 0, "stale CSR must not create a cert row");
+    }
+
+    #[test]
+    fn sign_csr_rejects_malformed_nebula_key_before_authorization_or_writes() {
+        let tmp = tempdir().expect("tempdir");
+        let conn = fresh_store();
+        let (ca_crt, ca_key) = make_test_ca(tmp.path(), &conn);
+        let mut pending = place_csr(tmp.path(), "peer:bad-nebula-key");
+        pending.nebula_public_key_pem =
+            "-----BEGIN NEBULA X25519 PUBLIC KEY-----\nnot-base64\n-----END NEBULA X25519 PUBLIC KEY-----\n"
+                .into();
+        let csr_path = pending_enroll_path(tmp.path(), &pending.node_id);
+        std::fs::write(&csr_path, serde_json::to_vec(&pending).unwrap())
+            .expect("rewrite hostile CSR");
+        let paths = SignCsrPaths {
+            ca_crt,
+            ca_key,
+            scratch_dir: tmp.path().join("scratch"),
+        };
+
+        let error = sign_pending_csr(
+            &MockBackend,
+            &conn,
+            tmp.path(),
+            &pending.node_id,
+            "test-mesh",
+            &paths,
+            Vec::new(),
+            false,
+        )
+        .expect_err("malformed requester key must fail at CSR validation");
+        assert!(
+            matches!(error, SignCsrError::CsrCorrupt { ref reason } if reason.contains("invalid Nebula public key")),
+            "unexpected error: {error:?}"
+        );
+        assert!(
+            crate::bearer_ledger::is_pending(tmp.path(), &pending.token.bearer),
+            "malformed CSR must not consume the bearer"
+        );
+        assert!(
+            !paths.scratch_dir.exists(),
+            "malformed CSR must fail before creating signer scratch state"
+        );
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nebula_peer_certs WHERE node_id = ?1",
+                [&pending.node_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "malformed CSR must not create a cert row");
+        assert!(
+            !crate::ca::bundle::bundle_path(tmp.path(), &pending.node_id).exists(),
+            "malformed CSR must not write a bundle"
+        );
     }
 
     #[test]
