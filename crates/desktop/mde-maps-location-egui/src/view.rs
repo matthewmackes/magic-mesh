@@ -279,10 +279,10 @@ fn tab_rail(ui: &mut egui::Ui, state: &mut MapsLocationSurface) -> Rect {
     let inner_height = (available.y - 2.0 * RAIL_INNER_MARGIN).max(1.0);
 
     // A reveal is a one-shot entry aid, not a permanent scroll lock. Clear it
-    // after the Advanced group closes so reopening the same page gets a fresh
-    // bounded anchor without fighting manual scrolling while the group stays
-    // open.
-    if !state.advanced_open() {
+    // whenever selection leaves Advanced, even if the disclosure remains
+    // latched open: otherwise returning to the same page can reuse a stale
+    // marker after the rail was manually scrolled or resized.
+    if !state.active.is_advanced() {
         ui.ctx().data_mut(|data| {
             data.remove_temp::<WorkspaceTab>(egui::Id::new(ADVANCED_REVEAL_ID));
         });
@@ -5919,6 +5919,43 @@ mod tests {
         assert!(viewport.contains_rect(child.rect));
         click_rail_row(&ctx, &mut surface, screen, child.rect.center());
         assert_eq!(surface.active, WorkspaceTab::Mg90Settings);
+    }
+
+    #[test]
+    fn advanced_reveal_marker_clears_when_primary_selection_keeps_menu_open() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        ctx.style_mut(|style| style.animation_time = 0.0);
+
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(360.0, 260.0));
+        let mut surface = MapsLocationSurface::simulated();
+        surface.active = WorkspaceTab::FirmwareRecovery;
+        surface.advanced_expanded = true;
+
+        // Entering an Advanced page records the one-shot reveal marker.
+        for _ in 0..3 {
+            let _ = render_rail_frame(&ctx, &mut surface, screen, Vec::new(), false);
+        }
+        assert_eq!(
+            ctx.data(|data| {
+                data.get_temp::<WorkspaceTab>(egui::Id::new(ADVANCED_REVEAL_ID))
+            }),
+            Some(WorkspaceTab::FirmwareRecovery)
+        );
+
+        // The disclosure stays expanded when a primary page is selected, so
+        // advanced_open() alone cannot identify that this marker is stale.
+        surface.active = WorkspaceTab::Drive;
+        assert!(surface.advanced_open());
+        let _ = render_rail_frame(&ctx, &mut surface, screen, Vec::new(), false);
+
+        assert_eq!(
+            ctx.data(|data| {
+                data.get_temp::<WorkspaceTab>(egui::Id::new(ADVANCED_REVEAL_ID))
+            }),
+            None,
+            "a primary selection must invalidate the prior Advanced reveal"
+        );
     }
 
     #[test]

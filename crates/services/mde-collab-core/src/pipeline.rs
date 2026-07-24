@@ -673,6 +673,10 @@ pub fn apply_command<S: EventSigner, I: IdSource>(
         }
         CollabCommand::AnswerCall { call } => {
             let space = require_call(state, *call)?;
+            // A call id is discoverable replicated state, not authority to
+            // mint a participant lifecycle event.  Only current members of
+            // the call's space may answer it.
+            require_member(state, space, &ctx.actor)?;
             Ok(vec![ctx.emit(
                 space,
                 CollabEventKind::CallParticipantChanged {
@@ -684,6 +688,9 @@ pub fn apply_command<S: EventSigner, I: IdSource>(
         }
         CollabCommand::DeclineCall { call } => {
             let space = require_call(state, *call)?;
+            // Declining changes the shared participant read model just like
+            // answering; apply the same space-membership boundary.
+            require_member(state, space, &ctx.actor)?;
             Ok(vec![ctx.emit(
                 space,
                 CollabEventKind::CallParticipantChanged {
@@ -1065,5 +1072,52 @@ mod tests {
                 actor
             }) if denied_space == space && actor == ActorId::new("mallory")
         ));
+    }
+
+    #[test]
+    fn answering_or_declining_requires_call_space_membership() {
+        let signer = Ed25519Signer::from_seed([9; 32]);
+        let mut ids = SeqIds(40);
+        let mut alice = ApplyCtx::new(ActorId::new("alice"), 1_000, &signer, &mut ids);
+
+        let created = apply_command(
+            &DomainState::default(),
+            &CollabCommand::CreateSpace {
+                kind: SpaceKind::Team,
+                name: "ops".into(),
+            },
+            &mut alice,
+        )
+        .expect("create space");
+        let space = created[0].space_id;
+        let call = CallId::from_uuid(Uuid::from_u128(41));
+        let started = apply_command(
+            &DomainState::from_events(&created),
+            &CollabCommand::StartCall {
+                space,
+                call,
+                kind: CallKind::Audio,
+            },
+            &mut alice,
+        )
+        .expect("start call");
+        let mut events = created;
+        events.extend(started);
+        let state = DomainState::from_events(&events);
+
+        let mut mallory = ApplyCtx::new(ActorId::new("mallory"), 1_100, &signer, &mut ids);
+        for command in [
+            CollabCommand::AnswerCall { call },
+            CollabCommand::DeclineCall { call },
+        ] {
+            let denied = apply_command(&state, &command, &mut mallory);
+            assert!(matches!(
+                denied,
+                Err(CollabError::NotMember {
+                    space: denied_space,
+                    actor
+                }) if denied_space == space && actor == ActorId::new("mallory")
+            ));
+        }
     }
 }

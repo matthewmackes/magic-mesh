@@ -62,7 +62,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use mde_egui::egui::{self, Color32, RichText, Sense};
-use mde_egui::Style;
+use mde_egui::{Style, TypographyRole};
 use mde_theme::brand::icons::IconId;
 use serde::{Deserialize, Serialize};
 
@@ -108,7 +108,12 @@ fn storage_tooltip(ui: &mut egui::Ui, text: &str) {
         .show(ui, |ui| {
             ui.set_max_width(Style::SP_XL * 12.0);
             ui.add(
-                egui::Label::new(RichText::new(text).size(Style::SMALL).color(Style::TEXT)).wrap(),
+                egui::Label::new(
+                    RichText::new(text)
+                        .font(Style::typography_font(TypographyRole::Caption))
+                        .color(Style::TEXT),
+                )
+                .wrap(),
             );
         });
 }
@@ -154,7 +159,10 @@ fn storage_icon_label_button(ui: &mut egui::Ui, icon: IconId, label: &str) -> eg
             egui::vec2(Style::SP_M, Style::SP_M),
         ));
         ui.add(
-            egui::Button::image_and_text(image, RichText::new(label).size(Style::SMALL))
+            egui::Button::image_and_text(
+                image,
+                RichText::new(label).font(Style::typography_font(TypographyRole::Caption)),
+            )
                 .min_size(egui::vec2(0.0, STORAGE_ACTION_BUTTON_H)),
         )
     });
@@ -193,7 +201,7 @@ fn storage_icon_button(
             response.rect.center(),
             egui::Align2::CENTER_CENTER,
             label,
-            egui::FontId::proportional(Style::SMALL),
+            Style::typography_font(TypographyRole::Caption),
             tint,
         );
     }

@@ -515,6 +515,10 @@ These decisions refine acceptance and sequencing for the active items below.
   before it enters cloud replies, including the selected instance context. The
   focused `.90` container lifecycle gate is green at 7/7; live libvirt/Podman
   evidence remains external.
+- Progress (2026-07-24 cloud diagnostic boundary): the shared cloud runner now
+  truncates backend summary lines at a UTF-8 boundary, preventing localized or
+  hostile diagnostics from panicking the error path. The focused `.90` runner
+  gate is green at 4/4; live libvirt/Podman evidence remains external.
 - Priority: P0
 - Complexity: Epic
 - Problem: The archived WL-ARCH-006 surface is mounted, but its Set desired UI
@@ -637,6 +641,11 @@ These decisions refine acceptance and sequencing for the active items below.
   non-regular sources, caps each source at 8 MiB, and refuses chat rings above
   500 entries. The focused BigBoy import gate is green at 13/13; live legacy
   filesystem migration evidence remains external.
+- Progress (2026-07-24 call-answer membership hardening): `AnswerCall` and
+  `DeclineCall` now require the caller to remain a member of the call's space
+  before minting participant lifecycle events, closing a stale-call-id
+  authorization path. The focused BigBoy pipeline regression is green at 3/3;
+  `.170` farm rsync was ENOSPC, so the fallback gate is recorded explicitly.
 - Priority: P0
 - Complexity: Epic
 - Problem: VoIP, Messaging, Alerting, Clipboard, Editor, Files, and Transfers are
@@ -1100,6 +1109,11 @@ These decisions refine acceptance and sequencing for the active items below.
   rail hit targets. The focused Maps view suite is green at 44/44, including
   the narrow-card and reset-action regressions; live visual proof remains
   external.
+- Progress (2026-07-24 Advanced reveal-state hardening): leaving Advanced now
+  clears its one-shot rail reveal marker even when the disclosure remains
+  expanded, preventing a primary-tab selection from reusing stale scroll or
+  hit-test state. The focused BigBoy Maps view gate is green at 49/49; live
+  visual proof remains external.
 - Progress (2026-07-24 transit stale-location hardening): when a refresh fails
   after the vehicle moves, the GTFS worker now discards the old nearby-vehicle
   snapshot and publishes an empty degraded snapshot for the new point instead
@@ -1429,6 +1443,11 @@ These decisions refine acceptance and sequencing for the active items below.
   removing the remaining canonical ad-hoc font literal in that chooser surface
   while preserving badge geometry. The focused `.50` chooser gate is green at
   98/98; no live seat change was made.
+- Progress (2026-07-24 shell typography adoption): Console entry rows now use
+  shared Body/Caption roles, and Storage tooltips, action labels, and fallback
+  glyphs now use the shared Caption role instead of direct font sizes. Focused
+  farm gates are green at Console 48/48 and Storage 34/34; no live seat change
+  was made.
 - Priority: P1
 - Complexity: Epic
 - Problem: The workstation chrome is Win10-shaped (48px bottom taskbar + tray

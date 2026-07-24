@@ -468,7 +468,16 @@ pub(crate) fn summary_line(s: &str) -> String {
         .unwrap_or("")
         .to_string();
     if line.len() > 200 {
-        format!("{}…", &line[..200])
+        // Keep the existing byte bound without slicing through a UTF-8 code
+        // point. Backend diagnostics are external input; a hostile or merely
+        // localized message must not panic the runner while being summarized.
+        let end = line
+            .char_indices()
+            .map(|(index, _)| index)
+            .take_while(|&index| index <= 200)
+            .last()
+            .unwrap_or(0);
+        format!("{}…", &line[..end])
     } else {
         line
     }
@@ -681,5 +690,15 @@ mod tests {
         assert!(!f.ok && !f.applied);
         let ok = CloudRunOutcome::ok("done", true);
         assert!(ok.ok && ok.applied);
+    }
+
+    #[test]
+    fn summary_line_truncates_at_a_utf8_boundary() {
+        let diagnostic = format!("{}é", "x".repeat(199));
+
+        let summary = summary_line(&diagnostic);
+
+        assert_eq!(summary, format!("{}…", "x".repeat(199)));
+        assert!(summary.is_char_boundary(summary.len()));
     }
 }

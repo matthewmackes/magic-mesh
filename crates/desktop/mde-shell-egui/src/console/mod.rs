@@ -149,7 +149,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use mde_egui::egui;
-use mde_egui::Style;
+use mde_egui::{Style, TypographyRole};
 use mde_seat::PowerVerb;
 use mde_term_egui::sudo_argv;
 use mde_theme::brand::icons::IconId;
@@ -1935,7 +1935,7 @@ fn entry_row(ui: &mut egui::Ui, flat: usize, entry: &ConsoleEntry, state: &Conso
         egui::pos2(text_left, rect.top() + Style::SP_XS),
         egui::Align2::LEFT_TOP,
         entry.label,
-        egui::FontId::proportional(Style::BODY),
+        Style::typography_font(TypographyRole::Body),
         label_color,
     );
     let desc = if present {
@@ -1960,7 +1960,7 @@ fn entry_row(ui: &mut egui::Ui, flat: usize, entry: &ConsoleEntry, state: &Conso
         egui::pos2(text_left, rect.bottom() - Style::SP_XS),
         egui::Align2::LEFT_BOTTOM,
         desc,
-        egui::FontId::proportional(Style::SMALL),
+        Style::typography_font(TypographyRole::Caption),
         Style::TEXT_DIM,
     );
 
@@ -1969,7 +1969,7 @@ fn entry_row(ui: &mut egui::Ui, flat: usize, entry: &ConsoleEntry, state: &Conso
         egui::pos2(rect.right() - Style::SP_S, rect.top() + Style::SP_XS),
         egui::Align2::RIGHT_TOP,
         entry.provenance.label(),
-        egui::FontId::proportional(Style::SMALL),
+        Style::typography_font(TypographyRole::Caption),
         entry.provenance.color(),
     );
 
