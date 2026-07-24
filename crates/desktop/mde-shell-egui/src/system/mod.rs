@@ -3515,22 +3515,32 @@ fn adapter_row(ui: &mut egui::Ui, adapter: &BtAdapter, actions: &mut Vec<SysActi
         ("off", Style::TEXT_DIM)
     };
     ui.horizontal(|ui| {
-        ui.label(RichText::new(DOT).color(tone).size(Style::SMALL));
+        ui.label(
+            RichText::new(DOT)
+                .color(tone)
+                .font(Style::typography_font(TypographyRole::Caption)),
+        );
         ui.add_space(Style::SP_XS);
         ui.label(
             RichText::new(&adapter.name)
                 .color(Style::TEXT)
-                .size(Style::SMALL)
+                .font(Style::typography_font(TypographyRole::Caption))
                 .strong(),
         );
         ui.add_space(Style::SP_S);
-        ui.colored_label(tone, RichText::new(word).size(Style::SMALL));
+        ui.colored_label(
+            tone,
+            RichText::new(word).font(Style::typography_font(TypographyRole::Caption)),
+        );
     });
 
     ui.indent((adapter.path.as_str(), "bt-adapter"), |ui| {
         let mut powered = adapter.powered;
         if ui
-            .checkbox(&mut powered, RichText::new("Powered").size(Style::SMALL))
+            .checkbox(
+                &mut powered,
+                RichText::new("Powered").font(Style::typography_font(TypographyRole::Caption)),
+            )
             .changed()
         {
             actions.push(SysAction::BtPower(adapter.path.clone(), powered));
@@ -3544,7 +3554,8 @@ fn adapter_row(ui: &mut egui::Ui, adapter: &BtAdapter, actions: &mut Vec<SysActi
         if ui
             .checkbox(
                 &mut discoverable,
-                RichText::new("Discoverable").size(Style::SMALL),
+                RichText::new("Discoverable")
+                    .font(Style::typography_font(TypographyRole::Caption)),
             )
             .changed()
         {
@@ -3555,7 +3566,10 @@ fn adapter_row(ui: &mut egui::Ui, adapter: &BtAdapter, actions: &mut Vec<SysActi
         }
         let mut pairable = adapter.pairable;
         if ui
-            .checkbox(&mut pairable, RichText::new("Pairable").size(Style::SMALL))
+            .checkbox(
+                &mut pairable,
+                RichText::new("Pairable").font(Style::typography_font(TypographyRole::Caption)),
+            )
             .changed()
         {
             actions.push(SysAction::BtPairable(adapter.path.clone(), pairable));
@@ -3563,7 +3577,10 @@ fn adapter_row(ui: &mut egui::Ui, adapter: &BtAdapter, actions: &mut Vec<SysActi
         ui.horizontal(|ui| {
             if adapter.discovering {
                 if ui
-                    .button(RichText::new("Stop scan").size(Style::SMALL))
+                    .button(
+                        RichText::new("Stop scan")
+                            .font(Style::typography_font(TypographyRole::Caption)),
+                    )
                     .clicked()
                 {
                     actions.push(SysAction::BtScan(adapter.path.clone(), false));
@@ -3572,10 +3589,13 @@ fn adapter_row(ui: &mut egui::Ui, adapter: &BtAdapter, actions: &mut Vec<SysActi
                 ui.spinner();
                 ui.colored_label(
                     Style::TEXT_DIM,
-                    RichText::new(SYSTEM_SCANNING_COPY).size(Style::SMALL),
+                    RichText::new(SYSTEM_SCANNING_COPY)
+                        .font(Style::typography_font(TypographyRole::Caption)),
                 );
             } else if ui
-                .button(RichText::new("Scan").size(Style::SMALL))
+                .button(
+                    RichText::new("Scan").font(Style::typography_font(TypographyRole::Caption)),
+                )
                 .clicked()
             {
                 actions.push(SysAction::BtScan(adapter.path.clone(), true));
@@ -3603,16 +3623,23 @@ fn device_row(
         ("available", Style::TEXT_DIM)
     };
     ui.horizontal(|ui| {
-        ui.label(RichText::new(DOT).color(tone).size(Style::SMALL));
+        ui.label(
+            RichText::new(DOT)
+                .color(tone)
+                .font(Style::typography_font(TypographyRole::Caption)),
+        );
         ui.add_space(Style::SP_XS);
         ui.label(
             RichText::new(&device.alias)
                 .color(Style::TEXT)
-                .size(Style::SMALL)
+                .font(Style::typography_font(TypographyRole::Caption))
                 .strong(),
         );
         ui.add_space(Style::SP_S);
-        ui.colored_label(tone, RichText::new(word).size(Style::SMALL));
+        ui.colored_label(
+            tone,
+            RichText::new(word).font(Style::typography_font(TypographyRole::Caption)),
+        );
     });
 
     ui.indent((device.path.as_str(), "bt-dev"), |ui| {
@@ -3633,7 +3660,8 @@ fn device_row(
         if !meta.is_empty() {
             ui.colored_label(
                 Style::TEXT_DIM,
-                RichText::new(meta.join("  \u{00B7}  ")).size(Style::SMALL),
+                RichText::new(meta.join("  \u{00B7}  "))
+                    .font(Style::typography_font(TypographyRole::Caption)),
             );
         }
 
@@ -3641,14 +3669,20 @@ fn device_row(
         ui.horizontal(|ui| {
             if acts.disconnect {
                 if ui
-                    .button(RichText::new("Disconnect").size(Style::SMALL))
+                    .button(
+                        RichText::new("Disconnect")
+                            .font(Style::typography_font(TypographyRole::Caption)),
+                    )
                     .clicked()
                 {
                     actions.push(SysAction::BtDisconnect(device.path.clone()));
                 }
             } else if acts.connect
                 && ui
-                    .button(RichText::new("Connect").size(Style::SMALL))
+                    .button(
+                        RichText::new("Connect")
+                            .font(Style::typography_font(TypographyRole::Caption)),
+                    )
                     .clicked()
             {
                 actions.push(SysAction::BtConnect(device.path.clone()));
@@ -3656,7 +3690,10 @@ fn device_row(
 
             if acts.pair {
                 if ui
-                    .button(RichText::new("Pair").size(Style::SMALL))
+                    .button(
+                        RichText::new("Pair")
+                            .font(Style::typography_font(TypographyRole::Caption)),
+                    )
                     .clicked()
                 {
                     actions.push(SysAction::BtPair(device.path.clone()));
@@ -3665,7 +3702,10 @@ fn device_row(
                 // Forget needs the owning adapter path; disabled honestly if unknown.
                 .add_enabled(
                     acts.forget,
-                    egui::Button::new(RichText::new("Forget").size(Style::SMALL)),
+                    egui::Button::new(
+                        RichText::new("Forget")
+                            .font(Style::typography_font(TypographyRole::Caption)),
+                    ),
                 )
                 .clicked()
             {
@@ -3679,7 +3719,10 @@ fn device_row(
 
             let mut trusted = device.trusted;
             if ui
-                .checkbox(&mut trusted, RichText::new("Trust").size(Style::SMALL))
+                .checkbox(
+                    &mut trusted,
+                    RichText::new("Trust").font(Style::typography_font(TypographyRole::Caption)),
+                )
                 .changed()
             {
                 actions.push(SysAction::BtTrust(device.path.clone(), trusted));

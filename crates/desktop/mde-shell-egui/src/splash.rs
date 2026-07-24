@@ -34,8 +34,8 @@
               (ChromeState, ChooserState, …); the boot driver in main.rs consumes them"
 )]
 
-use mde_egui::egui::{self, Align2, Color32, FontId, Rect, TextureHandle, TextureOptions};
-use mde_egui::{Motion, MotionPreset, Style};
+use mde_egui::egui::{self, Align2, Color32, Rect, TextureHandle, TextureOptions};
+use mde_egui::{Motion, MotionPreset, Style, TypographyRole};
 
 use crate::chooser::decode_png_rgba;
 
@@ -223,21 +223,21 @@ impl Splash {
                 egui::pos2(center.x, title_y),
                 Align2::CENTER_CENTER,
                 mde_theme::brand::logo::PRODUCT_NAME,
-                FontId::proportional(Style::DISPLAY * 2.0),
+                Style::typography_font(TypographyRole::Display),
                 Style::TEXT,
             );
             painter.text(
                 egui::pos2(center.x, title_y + Style::SP_XL),
                 Align2::CENTER_CENTER,
                 mde_theme::brand::logo::SOFTWARE_STUDIO,
-                FontId::proportional(Style::TITLE),
+                Style::typography_font(TypographyRole::Headline),
                 Style::TEXT_DIM,
             );
             painter.text(
                 egui::pos2(center.x, title_y + Style::SP_XL * 2.05),
                 Align2::CENTER_CENTER,
                 mde_theme::brand::logo::PRODUCT_RELEASE,
-                FontId::proportional(Style::SMALL),
+                Style::typography_font(TypographyRole::Caption),
                 Style::TEXT_DIM,
             );
 

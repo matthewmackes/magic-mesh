@@ -1461,18 +1461,11 @@ fn start_call_flows_into_the_call_state_projection() {
 
     let mut dave = engine("dave");
     dave.merge(a.all_events()).expect("dave syncs");
-    dave.apply(
+    let denied = dave.apply(
         &CollabCommand::AnswerCall { call },
         &sig(4),
         &mut SeqIds::new(3_000),
         1265,
-    )
-    .expect("test participant injection");
-    let denied = dave.apply(
-        &CollabCommand::SetCallMuted { call, muted: true },
-        &sig(4),
-        &mut SeqIds::new(3_100),
-        1270,
     );
     assert!(matches!(denied, Err(CollabError::NotMember { space: s, .. }) if s == space));
 

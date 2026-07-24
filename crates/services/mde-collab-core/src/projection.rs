@@ -1128,6 +1128,12 @@ impl SpaceFold {
                 }
             }
             CollabEventKind::CallParticipantMuted { call, actor, muted } => {
+                // Mute changes are self-authored too.  Keep a signed event
+                // from one actor from changing another participant's media
+                // state during replay.
+                if actor != &env.actor {
+                    return;
+                }
                 if let Some(c) = self.calls.get_mut(call) {
                     c.muted.insert(actor.0.clone(), *muted);
                     if let Some(participant) = c.participants.get_mut(&actor.0) {
@@ -1441,10 +1447,20 @@ mod tests {
     }
 
     fn event(id: u128, space: SpaceId, clock: u64, kind: CollabEventKind) -> CollabEventEnvelope {
+        event_as(id, space, "alice", clock, kind)
+    }
+
+    fn event_as(
+        id: u128,
+        space: SpaceId,
+        actor: &str,
+        clock: u64,
+        kind: CollabEventKind,
+    ) -> CollabEventEnvelope {
         let mut event = CollabEventEnvelope::new(
             event_id(id),
             space,
-            ActorId::new("alice"),
+            ActorId::new(actor),
             ActorClock::at(clock, 0),
             i64::try_from(clock).expect("test clock fits"),
             kind,
@@ -1718,5 +1734,61 @@ mod tests {
             calls.active[0].participants[0].state,
             CallParticipantState::Connected
         );
+    }
+
+    #[test]
+    fn replay_does_not_let_a_mute_event_impersonate_another_actor() {
+        use mde_collab_types::ids::CallId;
+        use mde_collab_types::value::{CallKind, CallParticipantState};
+
+        let space = space_id(30);
+        let call = CallId::from_uuid(Uuid::from_u128(31));
+        let mut events = space_setup(space, "ops", 60);
+        events.extend([
+            event(
+                62,
+                space,
+                3,
+                CollabEventKind::CallStarted {
+                    call,
+                    kind: CallKind::Audio,
+                    initiator: ActorId::new("alice"),
+                },
+            ),
+            event_as(
+                63,
+                space,
+                "bob",
+                4,
+                CollabEventKind::CallParticipantChanged {
+                    call,
+                    actor: ActorId::new("bob"),
+                    state: CallParticipantState::Connected,
+                },
+            ),
+            event(
+                64,
+                space,
+                5,
+                CollabEventKind::CallParticipantMuted {
+                    call,
+                    actor: ActorId::new("bob"),
+                    muted: true,
+                },
+            ),
+        ]);
+
+        let mut projection = Projection::open_in_memory().expect("open projection");
+        projection
+            .project(&events)
+            .expect("project call mute replay");
+
+        let calls = projection.call_state(Some(space)).expect("call state");
+        let bob = calls.active[0]
+            .participants
+            .iter()
+            .find(|participant| participant.actor == ActorId::new("bob"))
+            .expect("bob participant");
+        assert!(!bob.muted, "alice must not be able to mute bob by replay");
     }
 }

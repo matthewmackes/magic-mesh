@@ -229,6 +229,63 @@ pub(crate) fn read_desired_slice(state_root: &Path, node: &str) -> Vec<WorkloadS
     specs
 }
 
+/// Read a node's desired-state slice for reconciliation, refusing to turn a
+/// malformed or foreign JSON document into an empty/no-op plan. The public
+/// inspection helper above remains best-effort for state mirrors, but the plan
+/// path must fail closed because it drives the desired-state verdict.
+fn read_desired_slice_strict(
+    state_root: &Path,
+    node: &str,
+) -> Result<Vec<WorkloadSpec>, String> {
+    let Some(dir) = checked_desired_dir(state_root, node, false)? else {
+        return Ok(Vec::new());
+    };
+    let entries = std::fs::read_dir(&dir)
+        .map_err(|e| format!("read desired directory {}: {e}", dir.display()))?;
+    let mut specs = Vec::new();
+    for entry in entries {
+        let path = entry
+            .map_err(|e| format!("read desired directory {}: {e}", dir.display()))?
+            .path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let file_stem = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .ok_or_else(|| format!("desired document has no valid filename: {}", path.display()))?;
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|e| format!("inspect desired document {}: {e}", path.display()))?;
+        if !metadata.file_type().is_file() {
+            return Err(format!(
+                "refusing non-regular desired document {}",
+                path.display()
+            ));
+        }
+        let body = std::fs::read_to_string(&path)
+            .map_err(|e| format!("read desired document {}: {e}", path.display()))?;
+        let spec = serde_json::from_str::<WorkloadSpec>(&body)
+            .map_err(|e| format!("malformed desired document {}: {e}", path.display()))?;
+        let expected_stem = path_key::file_stem("name", &spec.name, DESIRED_DOC_SUFFIX)
+            .map_err(|e| format!("invalid desired document {}: {e}", path.display()))?;
+        if spec.node != node {
+            return Err(format!(
+                "desired document {} targets node `{}` instead of `{node}`",
+                path.display(), spec.node
+            ));
+        }
+        if file_stem != expected_stem {
+            return Err(format!(
+                "desired document {} does not match workload name `{}`",
+                path.display(), spec.name
+            ));
+        }
+        specs.push(spec);
+    }
+    specs.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(specs)
+}
+
 /// Persist workload `spec`'s desired-state doc under its placement node's desired
 /// dir (creating the tree). The stable key is `spec.node` / `spec.name`.
 ///
@@ -289,7 +346,7 @@ pub(crate) fn plan_counts_for_node(
     libvirt_uri: &str,
 ) -> Result<PlanCounts, String> {
     path_key::segment("node", node)?;
-    let specs = read_desired_slice(state_root, node);
+    let specs = read_desired_slice_strict(state_root, node)?;
     let tfvars = render::render_tfvars(node, &specs, libvirt_uri);
     let ndjson = runner.plan_json(&tfvars)?;
     render::parse_plan_counts(&ndjson)
@@ -571,6 +628,24 @@ mod tests {
         assert!(slice.is_empty(), "mismatched desired doc was reconciled");
         assert!(!remove_desired_doc(root, "eagle", "web").unwrap());
         assert!(forged.is_file(), "the rejected record must remain inspectable");
+    }
+
+    #[test]
+    fn plan_rejects_a_malformed_canonical_doc_before_backend_io() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_desired_doc(root, &spec("web", "eagle")).unwrap();
+        let canonical = desired_doc_path(root, "eagle", "web").unwrap();
+        std::fs::write(&canonical, br#"{"name":"web","node":"eagle"}"#).unwrap();
+        let runner = FakeRunner::default();
+
+        let err = plan_counts_for_node(&runner, root, "eagle", "qemu:///system")
+            .expect_err("a malformed desired document must gate reconciliation");
+        assert!(err.contains("malformed desired document"), "unexpected error: {err}");
+        assert!(
+            runner.tfvars_written.lock().unwrap().is_empty(),
+            "malformed desired state must not reach the plan backend"
+        );
     }
 
     #[test]

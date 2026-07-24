@@ -383,9 +383,13 @@ impl MapsLocationSurface {
 
     /// Choose a destination from the search screen and advance to route preview.
     ///
-    /// Out-of-range indices leave the selected destination unchanged but still
-    /// advance to preview, so the call is always crash-safe.
+    /// An out-of-range index is a stale/malformed UI selection and must leave
+    /// the whole navigation flow untouched; otherwise the old destination could
+    /// be rendered as the newly selected route.
     pub fn choose_destination(&mut self, idx: usize) {
+        if idx >= self.local_navigation.destinations.len() {
+            return;
+        }
         self.local_navigation.select_destination(idx);
         self.destination_search = false;
         self.arrived = false;
@@ -4274,6 +4278,20 @@ mod tests {
                 .get(3)
                 .map(|d| d.label.as_str())
         );
+    }
+
+    #[test]
+    fn stale_destination_selection_does_not_open_preview_for_old_route() {
+        let mut state = MapsLocationSurface::simulated();
+        state.open_destination_search();
+        state.local_navigation.selected_destination = 2;
+        state.route_preview = false;
+
+        state.choose_destination(usize::MAX);
+
+        assert!(state.destination_search, "stale selection leaves search open");
+        assert!(!state.route_preview, "stale selection cannot open route preview");
+        assert_eq!(state.local_navigation.selected_destination, 2);
     }
 
     #[test]

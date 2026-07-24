@@ -529,6 +529,11 @@ These decisions refine acceptance and sequencing for the active items below.
   it into `{}`, preventing roster disclosure while preserving literal `{}` reads.
   The focused `.90` cloud gate is green at 139/139; live libvirt/Podman evidence
   remains external.
+- Progress (2026-07-24 desired-reconcile fail-closed boundary): the per-node
+  reconciliation planner now rejects malformed, foreign, or non-regular desired
+  JSON documents before rendering tfvars or invoking the backend, while the
+  best-effort mirror reader remains unchanged. The focused BigBoy reconcile
+  suite is green at 14/14; live libvirt/Podman evidence remains external.
 - Priority: P0
 - Complexity: Epic
 - Problem: The archived WL-ARCH-006 surface is mounted, but its Set desired UI
@@ -656,6 +661,12 @@ These decisions refine acceptance and sequencing for the active items below.
   before minting participant lifecycle events, closing a stale-call-id
   authorization path. The focused BigBoy pipeline regression is green at 3/3;
   `.170` farm rsync was ENOSPC, so the fallback gate is recorded explicitly.
+- Progress (2026-07-24 call-mute replay identity hardening): replay now requires
+  a `CallParticipantMuted` payload actor to match the signed envelope actor,
+  preventing a validly signed malformed event from mutating another
+  participant's mute state. The corrected full BigBoy `mde-collab-core` suite
+  is green at 46/46, including the non-member answer regression and the new
+  impersonation test; live media/SIP evidence remains external.
 - Priority: P0
 - Complexity: Epic
 - Problem: VoIP, Messaging, Alerting, Clipboard, Editor, Files, and Transfers are
@@ -1139,6 +1150,11 @@ These decisions refine acceptance and sequencing for the active items below.
   snapshot and publishes an empty degraded snapshot for the new point instead
   of repainting stale vehicles at the wrong location. The focused `.90` transit
   suite is green at 12/12; live MBTA/MG90 evidence remains external.
+- Progress (2026-07-24 Maps stale-selection hardening): choosing an out-of-range
+  destination index now leaves search, preview, and the prior route selection
+  untouched, preventing a stale UI index from reopening an old route. The
+  focused BigBoy Maps model suite is green at 57/57; live visual proof remains
+  external.
 - Priority: P2
 - Complexity: Epic
 - Problem: The Maps & Location cockpit's map is a synthetic perspective scene with
@@ -1472,6 +1488,15 @@ These decisions refine acceptance and sequencing for the active items below.
   mixer status rows now resolve their body/caption fonts through the shared
   `TypographyRole` contract, preserving existing geometry and interaction. The
   focused BigBoy System gate is green at 74/74; no live seat change was made.
+- Progress (2026-07-24 System Bluetooth typography adoption): Bluetooth adapter
+  and device rows, scan controls, metadata, trust controls, and status copy now
+  resolve through shared caption/body roles instead of ad-hoc font literals.
+  The focused BigBoy shell System gate is green at 74/74; no live seat change
+  was made.
+- Progress (2026-07-24 splash typography adoption): the boot splash product,
+  studio, and release labels now use shared Display/Headline/Caption roles,
+  keeping release identity and geometry unchanged. The focused `.50` splash
+  gate is green at 6/6; no live seat change was made.
 - Priority: P1
 - Complexity: Epic
 - Problem: The workstation chrome is Win10-shaped (48px bottom taskbar + tray
