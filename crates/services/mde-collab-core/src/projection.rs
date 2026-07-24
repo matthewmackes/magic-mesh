@@ -43,6 +43,11 @@ use crate::error::{CollabError, Result};
 
 const SCHEMA: &str = include_str!("../migrations/0001_init.sql");
 
+// Inline event kinds are metadata and should stay bounded; large document/file
+// substance belongs in the signed, content-addressed `PayloadRef` instead.
+// Keep the projection boundary finite even when a peer signs a hostile event.
+const MAX_ENVELOPE_JSON_BYTES: usize = 256 * 1024;
+
 /// The materialized read tables, in a fixed order — used by [`dump_tables`] and
 /// the per-space rebuild.
 const SPACE_TABLES: &[&str] = &[
@@ -101,7 +106,10 @@ impl Projection {
         // Validate the complete batch before opening the transaction so a bad
         // event cannot leave a partially projected offline replay behind.
         for env in events {
-            if env.schema_version != SCHEMA_VERSION || !env.verify() {
+            if env.schema_version != SCHEMA_VERSION {
+                return Err(CollabError::InvalidEvent(env.event_id));
+            }
+            if serde_json::to_vec(env)?.len() > MAX_ENVELOPE_JSON_BYTES || !env.verify() {
                 return Err(CollabError::InvalidEvent(env.event_id));
             }
         }
@@ -1445,7 +1453,7 @@ fn summarize(kind_tag: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::Projection;
+    use super::{MAX_ENVELOPE_JSON_BYTES, Projection};
     use crate::error::CollabError;
     use crate::signer::{Ed25519Signer, EventSigner};
     use mde_collab_types::envelope::SCHEMA_VERSION;
@@ -1709,6 +1717,32 @@ mod tests {
             projection.project(std::slice::from_ref(&future_schema)),
             Err(CollabError::InvalidEvent(id)) if id == event_id(28)
         ));
+    }
+
+    #[test]
+    fn projection_rejects_oversized_signed_event_before_persisting() {
+        let space = space_id(270);
+        let oversized = event(
+            271,
+            space,
+            1,
+            CollabEventKind::MessagePosted {
+                body: MessageBody::new("x".repeat(MAX_ENVELOPE_JSON_BYTES)),
+                thread: None,
+            },
+        );
+        let mut projection = Projection::open_in_memory().expect("open projection");
+        let before = projection.dump_tables().expect("empty dump");
+
+        assert!(matches!(
+            projection.project(std::slice::from_ref(&oversized)),
+            Err(CollabError::InvalidEvent(id)) if id == event_id(271)
+        ));
+        assert_eq!(
+            projection.dump_tables().expect("unchanged dump"),
+            before,
+            "oversized signed events must not enter the projection"
+        );
     }
 
     #[test]

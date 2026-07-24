@@ -30,6 +30,11 @@ pub const AIRSPACE_SNAPSHOT_MAX_AGE_MS: i64 = 15_000;
 /// display either; the daemon rejects future scan times, and this consumer
 /// closes the separate publication-time boundary.
 const AIRSPACE_SNAPSHOT_MAX_FUTURE_SKEW_MS: i64 = 5_000;
+/// The typed producer normally enforces this bound, but a persisted snapshot
+/// can be deserialized without passing through its constructor. Keep the UI's
+/// validation work bounded at this consumer boundary as well.
+const AIRSPACE_MAX_CONSUMER_CONTACTS: usize =
+    mackes_mesh_types::airspace::MAX_RETAINED_CONTACTS;
 
 /// A discovered wireless emitter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -582,6 +587,7 @@ impl AirspaceState {
                 mackes_mesh_types::airspace::AirspaceAvailability::Ready => snapshot
                     .contacts
                     .iter()
+                    .take(AIRSPACE_MAX_CONSUMER_CONTACTS)
                     .filter_map(|contact| contact.clone().bounded().ok())
                     .collect(),
                 mackes_mesh_types::airspace::AirspaceAvailability::NoSource
@@ -1239,6 +1245,40 @@ mod tests {
 
         assert!(state.signals.is_empty());
         assert!(state.selected.is_none());
+    }
+
+    #[test]
+    fn oversized_ready_mirror_is_bounded_at_the_ui_consumer() {
+        let contacts = (0..AIRSPACE_MAX_CONSUMER_CONTACTS + 24)
+            .map(|index| mackes_mesh_types::airspace::AirspaceContact {
+                id: format!("aa:bb:{index:02x}"),
+                kind: mackes_mesh_types::airspace::AirspaceContactKind::Wifi,
+                name: format!("mesh-ap-{index}"),
+                signal_dbm: -55,
+                bearing_deg: (index % 360) as f32,
+                channel: None,
+                encryption: None,
+                notable: false,
+                watchlist: false,
+                own: false,
+            })
+            .collect();
+        let snapshot = mackes_mesh_types::airspace::AirspaceSnapshot {
+            host: "mg90-live".to_string(),
+            published_at_ms: 42,
+            scanned_at_ms: Some(41),
+            availability: mackes_mesh_types::airspace::AirspaceAvailability::Ready,
+            contacts,
+            omitted_contacts: 0,
+            gaps: Vec::new(),
+        };
+
+        let mut state = AirspaceState::live();
+        state.refresh_from_wire_at(&snapshot, 43);
+
+        assert_eq!(state.signals.len(), AIRSPACE_MAX_CONSUMER_CONTACTS);
+        assert_eq!(state.signals[0].id, "aa:bb:00");
+        assert_eq!(state.signals.last().map(|signal| signal.name.as_str()), Some("mesh-ap-255"));
     }
 
     #[test]

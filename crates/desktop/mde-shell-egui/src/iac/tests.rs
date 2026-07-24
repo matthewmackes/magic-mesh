@@ -7,6 +7,13 @@ use mde_egui::egui::{pos2, vec2, Rect};
 
 const TEST_ARM_KEY: &[u8] = b"0123456789abcdef0123456789abcdef";
 
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("test clock is after the Unix epoch")
+        .as_millis() as i64
+}
+
 /// One backend-tool health row in a fixture mirror.
 fn health(tool: &str, state: HealthState) -> ServiceHealth {
     ServiceHealth {
@@ -51,7 +58,7 @@ fn fixture_state() -> CloudState {
         ],
         resources: Vec::new(),
         apply_armed: false,
-        published_at_ms: 42,
+        published_at_ms: now_ms(),
         workloads: vec![
             workload("seat-1", DeliveryType::DesktopVm, "running"),
             workload("svc-1", DeliveryType::ServiceVm, "running"),
@@ -102,6 +109,41 @@ fn placed_bus_state() -> (tempfile::TempDir, WorkloadsState) {
     state.states[0].apply_armed = true;
     state.arm_key_override = Some(TEST_ARM_KEY.to_vec());
     (tmp, state)
+}
+
+#[test]
+fn cloud_mirror_freshness_rejects_missing_stale_and_far_future_stamps() {
+    let now = now_ms();
+    let state = fixture_state();
+    assert!(cloud_state_is_fresh_at(&state, now));
+
+    let mut stale = state.clone();
+    stale.published_at_ms = now - CLOUD_MIRROR_STALE_AFTER_MS - 1;
+    assert!(!cloud_state_is_fresh_at(&stale, now));
+
+    let mut missing = state.clone();
+    missing.published_at_ms = 0;
+    assert!(!cloud_state_is_fresh_at(&missing, now));
+
+    let mut future = state;
+    future.published_at_ms = now + 30 * 1000 + 1;
+    assert!(!cloud_state_is_fresh_at(&future, now));
+}
+
+#[test]
+fn stale_armed_node_cannot_open_live_provision_confirmation() {
+    let (_tmp, mut state) = placed_bus_state();
+    state.states[0].published_at_ms = now_ms() - CLOUD_MIRROR_STALE_AFTER_MS - 1;
+
+    state.arm_provision();
+
+    assert!(
+        !state.has_arming(),
+        "stale capability must not arm live apply"
+    );
+    assert!(state
+        .note_text()
+        .is_some_and(|note| note.contains("unavailable")));
 }
 
 /// Decode the only UI request emitted for `verb` from a fixture Bus.

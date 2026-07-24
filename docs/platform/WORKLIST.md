@@ -255,6 +255,12 @@ These decisions refine acceptance and sequencing for the active items below.
   now caps the response header block at 16 KiB before scanning or allocating the
   enrollment body, rejecting oversized hostile headers fail-closed. The focused
   BigBoy endpoint gate is green at 21/21; live enrollment remains external.
+- Progress (2026-07-24 Nebula refresh retry hardening): a failed bundle or
+  blocklist refresh no longer advances the supervisor's watch markers, so a
+  transiently partial or hostile update is retried on the next tick and then
+  acknowledged only after successful materialization. The focused retry gate is
+  green at 1/1 and the full supervisor module at 41/41; live rotation remains
+  external.
 - Progress (2026-07-23): code and hostile fixtures now meet the local-key design.
   Joining nodes generate their key locally; the signer consumes only the strict
   requester public key and verifies the returned certificate identity before an
@@ -451,6 +457,12 @@ These decisions refine acceptance and sequencing for the active items below.
   requests whose `name` and lifecycle `instance` identify different workloads,
   before dispatching to console resolution. The focused cloud-console farm gate
   is green at 11/11; live backend evidence remains external.
+- Progress (2026-07-24 Workloads mirror freshness hardening): the shell now
+  treats a missing, stale-after-three-heartbeats, or far-future `state/cloud`
+  timestamp as non-current; stale nodes cannot advertise live apply, and the
+  Status, placement, menu, and workload-metric surfaces label the retained data
+  honestly. The focused IAC farm gate is green at 44/44 plus an isolated stale-
+  capability regression at 1/1; live Podman/libvirt evidence remains external.
 - Progress (2026-07-23): UI contract slice landed in the takeover tree. Set
   desired now publishes the worker's `{node,spec}` envelope; provision,
   configure, plan, destroy, lifecycle, and console requests carry explicit
@@ -614,6 +626,11 @@ These decisions refine acceptance and sequencing for the active items below.
   replay or save, preventing a future map from silently changing idempotency
   semantics. The focused `.50` importer gate is green at 14/14; live media/LLM
   evidence remains external.
+- Progress (2026-07-24 projection envelope hardening): the public collaboration
+  projection boundary now rejects serialized signed envelopes above 256 KiB
+  before opening its SQLite transaction, preserving atomic replay behavior for
+  hostile inline payloads. The focused BigBoy projection gate is green at 10/10;
+  live media/LLM evidence remains external.
 - Progress (2026-07-24 replay ownership hardening): replayed `SpaceDeleted`
   events now require a currently present owner in the folded membership state,
   preventing a signed non-owner event from deleting a space read model. The
@@ -1126,6 +1143,12 @@ These decisions refine acceptance and sequencing for the active items below.
   caps retained camera rows at 128, so hostile or oversized Bus snapshots cannot
   monopolize the map frame. The focused Caltrans farm gate is green at 5/5;
   live feed acceptance remains external.
+- Progress (2026-07-24 Airspace consumer bound): the Maps Airspace reader now
+  caps retained ready-mirror contacts at the typed 256-contact limit before
+  conversion and painting, protecting the frame from an oversized persisted
+  snapshot while preserving valid contacts. The focused `.90` consumer gate is
+  green at 1/1 and the full Airspace module at 12/12; live scanner feed remains
+  external.
 - Progress (2026-07-24 live-mirror proof-tool no-follow hardening): the
   read-only verifier now rejects traversal, symlinked parents/leaves, and
   non-regular indexed files, then performs the final read with `O_NOFOLLOW` and
@@ -1672,6 +1695,11 @@ These decisions refine acceptance and sequencing for the active items below.
   non-Car views retain the full roster. The focused Car slice is green at 4/4
   and the full Communications crate at 53/53 on `.50`; live MG90 and physical
   Car evidence remains external.
+- Progress (2026-07-24 Car strip typography hardening): the six app-strip tiles
+  now clip their painted content and shorten only visual labels at narrow widths
+  while retaining full WidgetInfo route names and 44pt touch targets. The focused
+  BigBoy narrow-strip gate is green at 1/1; live MG90 and physical Car evidence
+  remains external.
 - Progress (2026-07-23 live mirror proof): the MG90 gateway at `172.20.0.25`
   is reachable from the network (ping and TCP/2222), and `.15`'s active
   `mackesd` is publishing a fresh `state/vehicle/Basement-Test-Workstation`

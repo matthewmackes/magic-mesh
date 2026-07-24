@@ -132,8 +132,13 @@ fn build_status(state: &WorkloadsState) -> Vec<StatusChip> {
         return vec![StatusChip::new("no cloud mirror", ChipTone::Warn)];
     }
     let total = states.len();
-    let ready = states.iter().filter(|s| s.backend_ready()).count();
-    let armed = states.iter().any(|s| s.apply_armed);
+    let ready = states
+        .iter()
+        .filter(|s| super::cloud_state_is_fresh(s) && s.backend_ready())
+        .count();
+    let armed = states
+        .iter()
+        .any(|s| super::cloud_state_is_fresh(s) && s.apply_armed);
     vec![
         StatusChip::new(
             format!("{total} node{}", if total == 1 { "" } else { "s" }),

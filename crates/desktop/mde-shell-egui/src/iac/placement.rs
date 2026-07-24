@@ -114,10 +114,11 @@ fn node_card(
     cs: &mackes_mesh_types::cloud::CloudState,
     is_selected: bool,
 ) -> bool {
+    let fresh = super::cloud_state_is_fresh(cs);
     ui.horizontal(|ui| {
         status_dot(
             ui,
-            if cs.apply_armed {
+            if cs.apply_armed && fresh {
                 Style::OK
             } else {
                 Style::TEXT_DIM
@@ -131,7 +132,9 @@ fn node_card(
                 .color(Style::TEXT),
         );
         ui.add_space(Style::SP_S);
-        let (badge, tone) = if cs.apply_armed {
+        let (badge, tone) = if !fresh {
+            ("stale mirror", Style::WARN)
+        } else if cs.apply_armed {
             ("live apply", Style::OK)
         } else {
             ("plan-only", Style::WARN)

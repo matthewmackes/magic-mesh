@@ -50,8 +50,9 @@ pub(super) fn status_panel(ui: &mut egui::Ui, state: &mut WorkloadsState) {
     lens_heading(ui, "view-grid", "Workloads \u{2014} live metrics");
     let mut any = false;
     for node in nodes {
+        let stale = !super::cloud_state_is_fresh(node);
         for workload in &node.workloads {
-            workload_metric_row(ui, workload);
+            workload_metric_row(ui, workload, stale);
             any = true;
         }
     }
@@ -72,6 +73,7 @@ pub(super) fn status_panel(ui: &mut egui::Ui, state: &mut WorkloadsState) {
 /// verdict, the plan-only vs apply-armed mode, and the three tool rows.
 fn node_health_card(ui: &mut egui::Ui, node: &CloudState) {
     mde_egui::card().show(ui, |ui| {
+        let fresh = super::cloud_state_is_fresh(node);
         ui.horizontal_wrapped(|ui| {
             ui.label(
                 RichText::new(&node.host)
@@ -80,14 +82,18 @@ fn node_health_card(ui: &mut egui::Ui, node: &CloudState) {
                     .color(Style::TEXT),
             );
             ui.add_space(Style::SP_S);
-            let (word, tone) = if node.backend_ready() {
+            let (word, tone) = if !fresh {
+                ("mirror stale", Style::SUPPORT_ERROR)
+            } else if node.backend_ready() {
                 ("backend ready", Style::SUPPORT_SUCCESS)
             } else {
                 ("backend not ready", Style::SUPPORT_WARNING)
             };
             ui.label(RichText::new(word).size(Style::SMALL).color(tone).strong());
             ui.add_space(Style::SP_S);
-            let (mode, mode_tone) = if node.apply_armed {
+            let (mode, mode_tone) = if !fresh {
+                ("stale — live apply disabled", Style::SUPPORT_ERROR)
+            } else if node.apply_armed {
                 ("apply armed", Style::ACCENT)
             } else {
                 ("plan-only", Style::TEXT_DIM)
@@ -180,7 +186,7 @@ fn drift_rollup(ui: &mut egui::Ui, nodes: &[CloudState]) {
 
 /// One workload's live-metric row — a reachability dot, its identity, status, the
 /// CPU / mem / disk figures, and its drift badge.
-fn workload_metric_row(ui: &mut egui::Ui, workload: &WorkloadRow) {
+fn workload_metric_row(ui: &mut egui::Ui, workload: &WorkloadRow, stale: bool) {
     mde_egui::inset().show(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
             mde_egui::status_dot(
@@ -211,15 +217,21 @@ fn workload_metric_row(ui: &mut egui::Ui, workload: &WorkloadRow) {
                     .color(Style::TEXT_DIM),
             );
             ui.add_space(Style::SP_S);
-            let status_tone = if workload.status.eq_ignore_ascii_case("running") {
+            let status_tone = if stale {
+                Style::SUPPORT_ERROR
+            } else if workload.status.eq_ignore_ascii_case("running") {
                 Style::SUPPORT_SUCCESS
             } else {
                 Style::TEXT_DIM
             };
             ui.label(
-                RichText::new(&workload.status)
-                    .size(Style::SMALL)
-                    .color(status_tone),
+                RichText::new(if stale {
+                    "stale snapshot"
+                } else {
+                    workload.status.as_str()
+                })
+                .size(Style::SMALL)
+                .color(status_tone),
             );
         });
         ui.add_space(Style::SP_XS);

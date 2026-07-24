@@ -220,11 +220,20 @@ impl NebulaSupervisor {
         if let Ok(meta) = std::fs::metadata(&self.bundle_path) {
             if let Ok(mtime) = meta.modified() {
                 if self.last_bundle_mtime.map_or(true, |t| t != mtime) || blocklist_changed {
-                    if let Err(e) = self.refresh_config().await {
-                        tracing::warn!(error = %e, "nebula-supervisor: config refresh failed");
+                    match self.refresh_config().await {
+                        Ok(()) => {
+                            // A watch marker is an acknowledgement, not an
+                            // observation.  Do not advance it after a failed
+                            // refresh: a transiently partial or hostile
+                            // bundle must be retried on the next tick instead
+                            // of being recorded as applied.
+                            self.last_bundle_mtime = Some(mtime);
+                            self.last_blocklist = blocklist_now;
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "nebula-supervisor: config refresh failed; will retry");
+                        }
                     }
-                    self.last_bundle_mtime = Some(mtime);
-                    self.last_blocklist = blocklist_now;
                 }
             }
         }
@@ -1779,6 +1788,64 @@ mod tests {
             supervisor.last_is_leader,
             "a failed demotion must remain pending so the next tick retries it"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_refresh_remains_pending_for_a_later_retry() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let bundle_path = root.join("nebula-bundle.json");
+        crate::ca::bundle::write_bundle(&bundle_path, &sample_bundle()).expect("seed bundle");
+        let fingerprint = "a".repeat(64);
+        crate::ca::blocklist::record_revoked(root, "peer:test", &[fingerprint.clone()])
+            .expect("seed blocklist");
+
+        let config_dir = root.join("nebula");
+        let outside = tempfile::tempdir().expect("outside");
+        symlink(outside.path(), &config_dir).expect("config symlink");
+        let conn = crate::store::open(&root.join("store.sqlite")).expect("open");
+        let mut supervisor = NebulaSupervisor::new(
+            Arc::new(Mutex::new(conn)),
+            "peer:test".into(),
+            "m1".into(),
+            bundle_path,
+        )
+        .with_workgroup_root(root.to_path_buf())
+        .with_role_marker(root.join("role.host"))
+        .with_config_dir(config_dir.clone())
+        .with_overlay_ip_path(root.join("overlay-ip"))
+        .with_leadership_endpoints(Vec::new());
+
+        supervisor.tick().await;
+        assert!(
+            supervisor.last_bundle_mtime.is_none(),
+            "a failed refresh must not acknowledge the bundle mtime"
+        );
+        assert!(
+            supervisor.last_blocklist.is_empty(),
+            "a failed refresh must not acknowledge the blocklist"
+        );
+
+        std::fs::remove_file(&config_dir).expect("remove hostile symlink");
+        materialize_config(
+            &config_dir,
+            &sample_bundle(),
+            ConfigRole::Peer,
+            &[],
+            root,
+            Some(b"local-key"),
+        )
+        .expect("seed valid identity");
+        supervisor.tick().await;
+
+        assert!(
+            supervisor.last_bundle_mtime.is_some(),
+            "the unchanged bundle must be retried and acknowledged after recovery"
+        );
+        assert_eq!(supervisor.last_blocklist, vec![fingerprint]);
     }
 
     #[tokio::test]

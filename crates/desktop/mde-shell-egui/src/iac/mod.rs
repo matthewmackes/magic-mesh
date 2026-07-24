@@ -158,6 +158,15 @@ pub(crate) fn authorize_root_mutation_body(
 /// view (a cheap bounded per-topic index probe).
 const REFRESH: Duration = Duration::from_secs(15);
 
+/// A cloud mirror is publish-heartbeat based, so three missed heartbeats make
+/// its capability and live rows unsafe to present as current. This matches the
+/// cloud worker's placement gate without importing the daemon crate into the
+/// shell.
+pub(super) const CLOUD_MIRROR_STALE_AFTER_MS: i64 = 3 * 60 * 1000;
+/// Small forward-clock tolerance for a peer whose wall clock is just ahead of
+/// the reader. A far-future stamp is not accepted as fresh.
+const CLOUD_MIRROR_FUTURE_SKEW_MS: i64 = 30 * 1000;
+
 /// How long an emitted `action/cloud/*` request waits for its reply before it
 /// reads as unanswered — an honest "the cloud backend didn't respond" (§7),
 /// distinct from the worker's own gated/failed replies.
@@ -169,6 +178,29 @@ const POLL_REPAINT: Duration = Duration::from_secs(1);
 /// The most session-audit rows retained (the workspace's own record of the ops
 /// it requested this session — the newest are kept).
 const MAX_AUDIT: usize = 24;
+
+fn unix_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0)
+}
+
+/// Classify a mirror at a supplied clock for deterministic tests and for every
+/// UI gate that must agree on freshness. Missing, zero, stale, or implausibly
+/// future publication stamps fail closed.
+pub(super) fn cloud_state_is_fresh_at(state: &CloudState, now_ms: i64) -> bool {
+    let published = state.published_at_ms;
+    published > 0
+        && published <= now_ms.saturating_add(CLOUD_MIRROR_FUTURE_SKEW_MS)
+        && now_ms.saturating_sub(published) <= CLOUD_MIRROR_STALE_AFTER_MS
+}
+
+/// Whether a cloud mirror is safe to treat as current at the live wall clock.
+pub(super) fn cloud_state_is_fresh(state: &CloudState) -> bool {
+    cloud_state_is_fresh_at(state, unix_now_ms())
+}
 
 /// Serialize the worker's `set-desired` envelope. The worker accepts one `spec`
 /// only under this wrapper; publishing the [`WorkloadSpec`] at the JSON root is
@@ -1211,7 +1243,7 @@ impl WorkloadsState {
         self.states
             .iter()
             .find(|state| state.host == selected)
-            .is_some_and(|state| state.apply_armed)
+            .is_some_and(|state| state.apply_armed && cloud_state_is_fresh(state))
     }
 
     /// Queue an immediate re-fold of the `state/cloud` mirror.
@@ -1514,9 +1546,21 @@ fn render_arming(ui: &mut egui::Ui, state: &mut WorkloadsState) {
 pub(super) fn mirror_summary(ui: &mut egui::Ui, state: &WorkloadsState) {
     let nodes = state.states.len();
     let workloads: usize = state.states.iter().map(|s| s.workloads.len()).sum();
+    let stale = state
+        .states
+        .iter()
+        .filter(|state| !cloud_state_is_fresh(state))
+        .count();
+    let freshness = if stale == 0 {
+        String::new()
+    } else {
+        format!(" · {stale} stale")
+    };
     mde_egui::muted_note(
         ui,
-        format!("state/cloud mirror: {nodes} node(s) \u{00B7} {workloads} workload(s) folded."),
+        format!(
+            "state/cloud mirror: {nodes} node(s) \u{00B7} {workloads} workload(s) folded{freshness}."
+        ),
     );
 }
 

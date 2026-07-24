@@ -42,6 +42,42 @@ pub enum CarTile {
 }
 
 impl CarTile {
+    /// The narrowest safe visual labels for a 44pt Car strip tile.
+    ///
+    /// These are presentation labels only: [`Self::label`] remains the full
+    /// accessible/widget label, so shortening the painted text never makes a
+    /// route ambiguous to keyboard or assistive navigation.
+    #[must_use]
+    pub(crate) const fn compact_label(self) -> &'static str {
+        match self {
+            Self::Nav => "Nav",
+            Self::Media => "Med",
+            Self::Music => "Mus",
+            Self::Comms => "Com",
+            Self::Vehicle => "Veh",
+            Self::Settings => "Set",
+        }
+    }
+
+    /// Pick a strip label that fits without weakening the 44pt hit target.
+    ///
+    /// The strip is allowed to remain interactive at its exact minimum width;
+    /// only its visual copy compresses. The intermediate threshold shortens
+    /// the longest label before it can touch an adjacent tile.
+    #[must_use]
+    pub(crate) const fn strip_label(self, tile_width: f32) -> &'static str {
+        if tile_width < Density::Touch.min_hit_target() + Style::SP_S * 2.0 {
+            self.compact_label()
+        } else if tile_width < Density::Touch.min_hit_target() + Style::SP_XL {
+            match self {
+                Self::Nav => "Nav",
+                _ => self.label(),
+            }
+        } else {
+            self.label()
+        }
+    }
+
     /// The six apps in strip order (PLATFORM-INTERFACES Q32).
     pub const ALL: [Self; 6] = [
         Self::Nav,
@@ -576,12 +612,16 @@ fn paint_app_tile(ui: &mut Ui, painter: &egui::Painter, rect: Rect, tile: CarTil
         egui::StrokeKind::Inside,
     );
 
+    // Clip all tile content so a future label or icon change cannot paint over
+    // a neighboring touch target.
+    let content_painter = painter.with_clip_rect(rect);
+
     // Glyph centered in the upper portion, per-app accent tint.
     let icon_edge = (rect.height() * 0.32).clamp(18.0, 44.0);
     if let Some(tex) = surfaces::icon_texture(ui.ctx(), tile.icon(), icon_edge, tile.accent()) {
         let icon_center = egui::pos2(rect.center().x, rect.top() + rect.height() * 0.38);
         let icon_rect = Rect::from_center_size(icon_center, egui::vec2(icon_edge, icon_edge));
-        painter.image(
+        content_painter.image(
             tex.id(),
             icon_rect,
             Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
@@ -589,11 +629,12 @@ fn paint_app_tile(ui: &mut Ui, painter: &egui::Painter, rect: Rect, tile: CarTil
         );
     }
 
-    // Label — compact, SYNC3 white.
-    painter.text(
+    // Label — compact, SYNC3 white. The full `tile.label()` remains in
+    // WidgetInfo above for accessibility.
+    content_painter.text(
         egui::pos2(rect.center().x, rect.bottom() - Style::SP_S),
         egui::Align2::CENTER_BOTTOM,
-        tile.label(),
+        tile.strip_label(rect.width()),
         Style::typography_font(TypographyRole::Label),
         Style::SYNC3_TEXT_STRONG,
     );
@@ -880,6 +921,32 @@ mod tests {
                 .any(|text| text == "Resize workspace to use Auto Mode"),
             "small workspaces explain their degraded state: {texts:?}"
         );
+    }
+
+    #[test]
+    fn narrow_strip_labels_stay_inside_tiles_without_losing_accessible_names() {
+        let minimum = Density::Touch.min_hit_target();
+        assert_eq!(CarTile::Nav.strip_label(minimum), "Nav");
+        assert_eq!(CarTile::Settings.strip_label(minimum), "Set");
+        assert_eq!(CarTile::Nav.label(), "Navigation");
+        assert_eq!(CarTile::Settings.label(), "Settings");
+
+        // 512px remains large enough for six 44pt targets, but is narrow
+        // enough to exercise the intermediate visual-label branch.
+        let (_, shapes) =
+            drive_with_screen(&CarHomeGlance::default(), vec![vec![]], vec2(512.0, 640.0));
+        let texts = painted_text(&shapes);
+        assert!(
+            texts.iter().any(|text| text == "Nav"),
+            "compact Nav label in {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text == "Settings"),
+            "unshortened Settings label in {texts:?}"
+        );
+        // The card still exposes its full title; only the strip copy is
+        // shortened, preserving an accessible route name in WidgetInfo.
+        assert_eq!(texts.iter().filter(|text| *text == "Navigation").count(), 1);
     }
 
     #[test]
