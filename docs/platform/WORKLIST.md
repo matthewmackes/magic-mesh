@@ -365,6 +365,17 @@ These decisions refine acceptance and sequencing for the active items below.
   authorization, signer scratch creation, certificate-row insertion, or bundle
   writes. The hostile malformed-key regression is included in the focused
   BigBoy enrollment gate at 93/93; live Nebula evidence remains external.
+- Progress (2026-07-24 requester-key staging boundary): network enrollment now
+  validates every config-root component as a real directory before creating the
+  requester staging tree, and revalidates the fresh staging directory before
+  invoking `nebula-cert`; symlinked, non-directory, and parent-component paths
+  fail before any key write. The focused BigBoy enrollment-client gate is green
+  at 20/20; live Nebula/lighthouse evidence remains external.
+- Progress (2026-07-24 identity-materialization path boundary): Nebula config and
+  identity roots now use no-follow, component-by-component directory creation
+  before CA, certificate, or private-key materialization. Four hostile
+  symlink/non-directory regressions are included in the BigBoy supervisor gate
+  at 39/39; live Nebula rotation remains external.
 - Priority: P0
 - Complexity: Epic
 - Problem: Any node able to read replicated enrollment bundles can obtain other
@@ -667,6 +678,12 @@ These decisions refine acceptance and sequencing for the active items below.
   participant's mute state. The corrected full BigBoy `mde-collab-core` suite
   is green at 46/46, including the non-member answer regression and the new
   impersonation test; live media/SIP evidence remains external.
+- Progress (2026-07-24 call-start replay identity hardening): replay now requires
+  the `CallStarted` initiator to match the signed envelope actor, preventing a
+  validly signed malformed event from making another actor appear to have
+  started a call. The full BigBoy `mde-collab-core` suite is green at 47/47,
+  including the new impersonation regression; live media/SIP evidence remains
+  external.
 - Priority: P0
 - Complexity: Epic
 - Problem: VoIP, Messaging, Alerting, Clipboard, Editor, Files, and Transfers are
@@ -1155,6 +1172,11 @@ These decisions refine acceptance and sequencing for the active items below.
   untouched, preventing a stale UI index from reopening an old route. The
   focused BigBoy Maps model suite is green at 57/57; live visual proof remains
   external.
+- Progress (2026-07-24 route-preview typography adoption): the Maps route
+  preview title, destination summary, route cards, and Start control now use
+  shared semantic typography roles instead of direct font literals, preserving
+  existing geometry and hit targets. The focused `.50` route-preview gate is
+  green at 4/4; live visual proof remains external.
 - Priority: P2
 - Complexity: Epic
 - Problem: The Maps & Location cockpit's map is a synthetic perspective scene with
@@ -1462,6 +1484,11 @@ These decisions refine acceptance and sequencing for the active items below.
   thresholds use each card's actual height. The focused `.90` switcher suite is
   green at 17/17; live physical-pointer and full-resolution VDI proof remain
   external evidence.
+- Progress (2026-07-24 switcher invalid-texture boundary): zero-sized retained
+  snapshot handles now fall back to the honest accent plate instead of painting
+  a blank preview surface after a failed or empty capture. The focused BigBoy
+  switcher gate is green at 21/21; live physical-pointer and full-resolution
+  VDI proof remain external evidence.
 - Progress (2026-07-24 status-rail geometry hardening): the Volume, Network, and
   Brightness hit targets retain their normal macOS-sized geometry on workstation
   rails while compressing safely inside narrow headless/windowed rails. The

@@ -556,6 +556,20 @@ struct CardPaint<'a> {
     preview: Option<&'a egui::TextureHandle>,
 }
 
+/// Return dimensions only for a texture that can actually contribute pixels.
+///
+/// `TextureHandle::size()` reports `[0, 0]` when its metadata is missing. That
+/// can happen after a capture failure leaves a retained handle around, or when
+/// an empty capture was uploaded. Treating that handle as a real preview would
+/// paint the dark preview ground and skip the honest fallback plate entirely.
+fn usable_preview_size(texture: &egui::TextureHandle) -> Option<(f32, f32)> {
+    let [width, height] = texture.size();
+    (width > 0 && height > 0).then(|| {
+        let size = texture.size_vec2();
+        (size.x, size.y)
+    })
+}
+
 /// Interact + paint one switcher card. Returns the surface on a click.
 fn card(ui: &mut egui::Ui, paint: CardPaint<'_>, state: &mut SwitcherState) -> Option<Surface> {
     let ctx = ui.ctx().clone();
@@ -635,24 +649,22 @@ fn card(ui: &mut egui::Ui, paint: CardPaint<'_>, state: &mut SwitcherState) -> O
         egui::pos2(rect.right() - Style::SP_S, rect.bottom() - Style::SP_S),
     );
     let preview_radius = egui::CornerRadius::same(Style::RADIUS_M as u8);
-    if let Some(tex) = paint.preview {
+    if let Some((tex, (tw, th))) = paint
+        .preview
+        .and_then(|tex| usable_preview_size(tex).map(|size| (tex, size)))
+    {
         // Letterbox the live frame on the honest dark ground.
         painter.rect_filled(
             preview_rect,
             preview_radius,
             Style::resolve_color(&ctx, Style::BG),
         );
-        let size = tex.size();
-        #[allow(clippy::cast_precision_loss)] // texture edges are small ints
-        let (tw, th) = (size[0] as f32, size[1] as f32);
-        if tw > 0.0 && th > 0.0 {
-            let scale = (preview_rect.width() / tw).min(preview_rect.height() / th);
-            let draw = egui::Rect::from_center_size(
-                preview_rect.center(),
-                egui::vec2(tw * scale, th * scale),
-            );
-            painter.image(tex.id(), draw, uv, egui::Color32::WHITE);
-        }
+        let scale = (preview_rect.width() / tw).min(preview_rect.height() / th);
+        let draw = egui::Rect::from_center_size(
+            preview_rect.center(),
+            egui::vec2(tw * scale, th * scale),
+        );
+        painter.image(tex.id(), draw, uv, egui::Color32::WHITE);
     } else {
         // PLATFORM-INTERFACES Q16/Q22 — the locked fallback plate: the group
         // accent composited by the ONE shared derivation + the white surface
@@ -992,6 +1004,35 @@ mod tests {
                 group_accent(Surface::Files).unwrap_or(Style::ACCENT)
             )),
             "Files should paint the supplied real snapshot instead of its plate: {fills:?}"
+        );
+    }
+
+    #[test]
+    fn an_invalid_zero_sized_snapshot_uses_the_honest_plate_fallback() {
+        let (ctx, mut construct) = open_switcher();
+        let mut snapshots = SurfaceSnapshots::default();
+        let invalid = ctx.load_texture(
+            "switcher-invalid-snapshot",
+            egui::ColorImage::new([0, 0], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        assert_eq!(invalid.size(), [0, 0], "fixture must model an invalid handle");
+        snapshots.insert(Surface::Files, invalid);
+
+        let (_, out) = frame_with_snapshots(
+            &ctx,
+            &mut construct,
+            Surface::Files,
+            true,
+            &snapshots,
+            Vec::new(),
+        );
+        let fills = painted_fills(&out.shapes);
+        assert!(
+            fills.contains(&Style::tile_plate_fill(
+                group_accent(Surface::Files).unwrap_or(Style::ACCENT)
+            )),
+            "an invalid snapshot must fall back to the Files plate: {fills:?}"
         );
     }
 

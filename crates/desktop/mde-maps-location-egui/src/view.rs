@@ -4,7 +4,7 @@ use mde_egui::egui::{
     self, Align, Align2, Color32, FontId, Mesh, Painter, Pos2, Rect, RichText, Sense, Shape,
     Stroke, StrokeKind, Vec2,
 };
-use mde_egui::{paint_carbon, Style, StyleColorScheme};
+use mde_egui::{paint_carbon, Style, StyleColorScheme, TypographyRole};
 
 use crate::model::{
     BackupRecord, CheckState, DeadZoneSeverity, DeadZoneState, Destination, DeviceIoState,
@@ -1079,7 +1079,7 @@ fn show_route_preview(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
         egui::pos2(layout.back.right() + Style::SP_M, layout.back.center().y),
         Align2::LEFT_CENTER,
         "Route preview",
-        FontId::proportional(Style::TITLE),
+        Style::typography_font(TypographyRole::Headline),
         Style::TEXT_STRONG,
     );
 
@@ -1124,7 +1124,7 @@ fn show_route_preview(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
             ),
             Align2::CENTER_CENTER,
             "No offline routing engine — route options unavailable",
-            FontId::proportional(Style::BODY),
+            Style::typography_font(TypographyRole::Body),
             Style::TEXT_DIM,
         );
     }
@@ -1189,20 +1189,25 @@ fn paint_destination_summary(painter: &Painter, rect: Rect, destination: Option<
     let (name, addr) = destination.map_or(("Destination", "Select a place"), |destination| {
         (destination.label.as_str(), destination.address.as_str())
     });
-    let name_s = elide(painter, name, FontId::proportional(Style::TITLE), max_w);
+    let name_s = elide(
+        painter,
+        name,
+        Style::typography_font(TypographyRole::Headline),
+        max_w,
+    );
     painter.text(
         egui::pos2(tx, rect.center().y - Style::SP_S),
         Align2::LEFT_CENTER,
         &name_s,
-        FontId::proportional(Style::TITLE),
+        Style::typography_font(TypographyRole::Headline),
         Style::TEXT_STRONG,
     );
-    let addr_s = elide(painter, addr, FontId::proportional(Style::BODY), max_w);
+    let addr_s = elide(painter, addr, Style::typography_font(TypographyRole::Body), max_w);
     painter.text(
         egui::pos2(tx, rect.center().y + Style::SP_M - 2.0),
         Align2::LEFT_CENTER,
         &addr_s,
-        FontId::proportional(Style::BODY),
+        Style::typography_font(TypographyRole::Body),
         Style::TEXT_DIM,
     );
 }
@@ -1255,7 +1260,7 @@ fn paint_route_option_card(
         egui::pos2(rect.left() + pad, rect.top() + 9.0),
         Align2::LEFT_TOP,
         &option.label,
-        FontId::proportional(Style::SMALL),
+        Style::typography_font(TypographyRole::Caption),
         if selected {
             Style::ACCENT_HI
         } else {
@@ -1265,7 +1270,11 @@ fn paint_route_option_card(
 
     // Hero: total minutes for this option, coloured by traffic.
     let minutes = option.remaining_time_min.to_string();
-    let num_g = painter.layout_no_wrap(minutes, FontId::proportional(27.0), tone);
+    let num_g = painter.layout_no_wrap(
+        minutes,
+        Style::typography_font(TypographyRole::Display),
+        tone,
+    );
     let num_size = num_g.size();
     painter.galley(
         egui::pos2(rect.left() + pad, rect.top() + 24.0),
@@ -1279,7 +1288,7 @@ fn paint_route_option_card(
         ),
         Align2::LEFT_BOTTOM,
         "min",
-        FontId::proportional(Style::BODY),
+        Style::typography_font(TypographyRole::Body),
         tone.gamma_multiply(0.92),
     );
 
@@ -1290,19 +1299,24 @@ fn paint_route_option_card(
         option.via
     );
     let sub_max = (rect.right() - (rect.left() + pad) - 96.0).max(1.0);
-    let sub_s = elide(painter, &sub, FontId::proportional(Style::SMALL), sub_max);
+    let sub_s = elide(
+        painter,
+        &sub,
+        Style::typography_font(TypographyRole::Caption),
+        sub_max,
+    );
     painter.text(
         egui::pos2(rect.left() + pad, rect.bottom() - 9.0),
         Align2::LEFT_BOTTOM,
         &sub_s,
-        FontId::proportional(Style::SMALL),
+        Style::typography_font(TypographyRole::Caption),
         Style::TEXT_DIM,
     );
 
     // Traffic dot + label (right, vertically centered).
     let label_g = painter.layout_no_wrap(
         option.traffic.label().to_string(),
-        FontId::proportional(Style::BODY),
+        Style::typography_font(TypographyRole::Body),
         tone,
     );
     let label_size = label_g.size();
@@ -1350,7 +1364,7 @@ fn paint_start_button(painter: &Painter, rect: Rect, hovered: bool, pressed: boo
     let label = "Start";
     let g = painter.layout_no_wrap(
         label.to_string(),
-        FontId::proportional(Style::HEADING),
+        Style::typography_font(TypographyRole::Headline),
         Color32::WHITE,
     );
     let gw = g.size().x;

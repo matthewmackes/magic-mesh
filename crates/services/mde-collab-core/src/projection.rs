@@ -1096,6 +1096,13 @@ impl SpaceFold {
                 kind,
                 initiator,
             } => {
+                // The initiator is a self-authored fact: StartCall always
+                // copies the command actor into this payload.  Do not let a
+                // validly signed envelope claim that another actor started
+                // the call during replay.
+                if initiator != &env.actor {
+                    return;
+                }
                 let mut participants = BTreeMap::new();
                 participants.insert(
                     initiator.0.clone(),
@@ -1733,6 +1740,38 @@ mod tests {
         assert_eq!(
             calls.active[0].participants[0].state,
             CallParticipantState::Connected
+        );
+    }
+
+    #[test]
+    fn replay_does_not_let_a_call_start_impersonate_another_actor() {
+        use mde_collab_types::ids::CallId;
+        use mde_collab_types::value::CallKind;
+
+        let space = space_id(35);
+        let call = CallId::from_uuid(Uuid::from_u128(36));
+        let mut events = space_setup(space, "ops", 70);
+        events.push(event_as(
+            72,
+            space,
+            "alice",
+            3,
+            CollabEventKind::CallStarted {
+                call,
+                kind: CallKind::Audio,
+                initiator: ActorId::new("bob"),
+            },
+        ));
+
+        let mut projection = Projection::open_in_memory().expect("open projection");
+        projection
+            .project(&events)
+            .expect("project forged call start replay");
+
+        let calls = projection.call_state(Some(space)).expect("call state");
+        assert!(
+            calls.active.is_empty(),
+            "alice must not be able to make bob appear to have started the call"
         );
     }
 

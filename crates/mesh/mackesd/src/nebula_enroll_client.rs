@@ -140,14 +140,82 @@ pub fn generate_requester_nebula_key(
     generate_requester_nebula_key_with_binary(config_dir, std::ffi::OsStr::new("nebula-cert"))
 }
 
+/// Ensure a directory tree contains only real directories. `create_dir_all`
+/// follows an existing symlinked component, which would let a hostile local
+/// path redirect requester key staging outside the intended config root.
+/// Create missing components one at a time and inspect the inode after every
+/// creation so the secret-bearing child never starts under an unverified path.
+fn ensure_real_directory(path: &Path) -> Result<(), String> {
+    if path.as_os_str().is_empty() {
+        return Err("directory path is empty".into());
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(format!(
+            "refusing directory path with parent component {}",
+            path.display()
+        ));
+    }
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!(
+                    "refusing symlinked directory component {}",
+                    current.display()
+                ));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(format!(
+                    "directory component {} is not a directory",
+                    current.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if let Err(create_error) = std::fs::create_dir(&current) {
+                    if create_error.kind() != std::io::ErrorKind::AlreadyExists {
+                        return Err(format!(
+                            "create directory component {}: {create_error}",
+                            current.display()
+                        ));
+                    }
+                }
+                let metadata = std::fs::symlink_metadata(&current).map_err(|inspect_error| {
+                    format!(
+                        "inspect directory component {}: {inspect_error}",
+                        current.display()
+                    )
+                })?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(format!(
+                        "created directory component {} is not a real directory",
+                        current.display()
+                    ));
+                }
+            }
+            Err(error) => {
+                return Err(format!(
+                    "inspect directory component {}: {error}",
+                    current.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn generate_requester_nebula_key_with_binary(
     config_dir: &Path,
     nebula_cert: &std::ffi::OsStr,
 ) -> Result<RequesterNebulaKey, NetEnrollError> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
-    std::fs::create_dir_all(config_dir).map_err(|e| {
-        NetEnrollError::Materialize(format!("create {}: {e}", config_dir.display()))
+    ensure_real_directory(config_dir).map_err(|e| {
+        NetEnrollError::Materialize(format!("prepare {}: {e}", config_dir.display()))
     })?;
     let staging_dir = config_dir.join(format!(
         ".enroll-key-{}-{:016x}",
@@ -158,6 +226,12 @@ fn generate_requester_nebula_key_with_binary(
     builder.mode(0o700);
     builder.create(&staging_dir).map_err(|e| {
         NetEnrollError::Materialize(format!("create key staging {}: {e}", staging_dir.display()))
+    })?;
+    ensure_real_directory(&staging_dir).map_err(|e| {
+        NetEnrollError::Materialize(format!(
+            "validate key staging {}: {e}",
+            staging_dir.display()
+        ))
     })?;
     let mut cleanup = RequesterStagingCleanup::new(staging_dir.clone());
     let private_key_path = staging_dir.join("host.key");
@@ -955,6 +1029,56 @@ printf '%s\\n' '-----BEGIN NEBULA X25519 PUBLIC KEY-----' 'AAAAAAAAAAAAAAAAAAAAA
                 .file_name()
                 .to_string_lossy()
                 .starts_with(".enroll-key-")));
+    }
+
+    #[test]
+    fn requester_key_generation_rejects_a_symlinked_config_component() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let victim = temp.path().join("victim");
+        std::fs::create_dir(&victim).expect("victim directory");
+        let config = temp.path().join("config");
+        symlink(&victim, &config).expect("config symlink");
+
+        let error = generate_requester_nebula_key_with_binary(
+            &config,
+            std::ffi::OsStr::new("missing-nebula-cert"),
+        )
+        .expect_err("symlinked config roots must fail before keygen");
+        assert!(error.to_string().contains("symlinked directory component"));
+        assert!(victim
+            .read_dir()
+            .expect("victim remains readable")
+            .next()
+            .is_none());
+    }
+
+    #[test]
+    fn requester_key_generation_rejects_a_non_directory_config_component() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = temp.path().join("config");
+        std::fs::write(&config, b"not a directory").expect("config file");
+
+        let error = generate_requester_nebula_key_with_binary(
+            &config,
+            std::ffi::OsStr::new("missing-nebula-cert"),
+        )
+        .expect_err("file config roots must fail before keygen");
+        assert!(error.to_string().contains("not a directory"));
+    }
+
+    #[test]
+    fn requester_key_generation_rejects_parent_components() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = temp.path().join("safe").join("..").join("config");
+
+        let error = generate_requester_nebula_key_with_binary(
+            &config,
+            std::ffi::OsStr::new("missing-nebula-cert"),
+        )
+        .expect_err("parent components must fail before keygen");
+        assert!(error.to_string().contains("parent component"));
     }
 
     // ---- the pinning verifier (security-critical) -----------

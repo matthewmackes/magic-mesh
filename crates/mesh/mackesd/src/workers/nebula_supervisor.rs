@@ -445,6 +445,69 @@ pub enum ConfigRole {
     Peer,
 }
 
+/// Create or validate a directory path without ever resolving a symlinked or
+/// non-directory component.  The sealed writer performs the same check for
+/// each file write, but identity installation must validate the roots before
+/// it creates a generation directory: otherwise `create_dir_all` could first
+/// follow an attacker-controlled `config` or `identity` link.
+fn ensure_directory_tree(path: &Path, mode: u32, label: &str) -> Result<(), String> {
+    use std::os::unix::fs::DirBuilderExt;
+    use std::path::Component;
+
+    if path.as_os_str().is_empty() {
+        return Err(format!("{label} path is empty"));
+    }
+
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        if matches!(component, Component::ParentDir) {
+            return Err(format!(
+                "refusing {label} path with parent component {}",
+                path.display()
+            ));
+        }
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!(
+                    "refusing symlinked {label} directory component {}",
+                    current.display()
+                ));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(format!(
+                    "{label} path component is not a directory: {}",
+                    current.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let mut builder = std::fs::DirBuilder::new();
+                builder.mode(mode);
+                builder.create(&current).map_err(|error| {
+                    format!("create {label} directory {}: {error}", current.display())
+                })?;
+                let metadata = std::fs::symlink_metadata(&current).map_err(|error| {
+                    format!("inspect {label} directory {}: {error}", current.display())
+                })?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(format!(
+                        "created {label} path component is not a directory: {}",
+                        current.display()
+                    ));
+                }
+            }
+            Err(error) => {
+                return Err(format!(
+                    "inspect {label} directory component {}: {error}",
+                    current.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn install_identity_generation(
     config_dir: &Path,
     bundle: &crate::ca::bundle::NebulaBundle,
@@ -453,11 +516,7 @@ fn install_identity_generation(
     use std::os::unix::fs::{symlink, DirBuilderExt};
 
     let identity_dir = config_dir.join("identity");
-    let mut identity_builder = std::fs::DirBuilder::new();
-    identity_builder.mode(0o700).recursive(true);
-    identity_builder
-        .create(&identity_dir)
-        .map_err(|e| format!("create identity dir {}: {e}", identity_dir.display()))?;
+    ensure_directory_tree(&identity_dir, 0o700, "Nebula identity")?;
 
     // Replicated steady-state refreshes may update topology/config, but cannot
     // replace an already-active identity. Only the fingerprint-pinned network
@@ -605,8 +664,11 @@ pub fn materialize_config(
     workgroup_root: &Path,
     requester_private_key: Option<&[u8]>,
 ) -> Result<(), String> {
-    std::fs::create_dir_all(config_dir)
-        .map_err(|e| format!("mkdir {}: {e}", config_dir.display()))?;
+    ensure_directory_tree(config_dir, 0o777, "Nebula config")?;
+    // Validate the identity root before writing even the public CA file.  The
+    // identity installer repeats this check immediately before generation
+    // staging, while the sealed writer checks every secret-bearing leaf.
+    ensure_directory_tree(&config_dir.join("identity"), 0o700, "Nebula identity")?;
 
     write_atomic(&config_dir.join("ca.crt"), bundle.ca_cert_pem.as_bytes())?;
     install_identity_generation(config_dir, bundle, requester_private_key)?;
@@ -1112,6 +1174,121 @@ mod tests {
         assert!(tmp.path().join("host.key").exists());
         assert!(tmp.path().join("config.yaml").exists());
         assert!(!tmp.path().join("lighthouse-config.yaml").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_rejects_symlinked_config_root_before_secret_write() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let outside = tempfile::tempdir().expect("outside");
+        let config_dir = tmp.path().join("nebula");
+        symlink(outside.path(), &config_dir).expect("config symlink");
+
+        let error = materialize_config(
+            &config_dir,
+            &sample_bundle(),
+            ConfigRole::Peer,
+            &[],
+            tmp.path(),
+            Some(b"must-not-escape"),
+        )
+        .expect_err("a symlinked config root must fail closed");
+        assert!(error.contains("symlinked Nebula config directory component"));
+        assert!(
+            std::fs::read_dir(outside.path())
+                .expect("outside directory")
+                .next()
+                .is_none(),
+            "no secret-bearing file or generation may be created through config symlink"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_rejects_non_directory_config_component_before_secret_write() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let outside = tempfile::tempdir().expect("outside");
+        let component = tmp.path().join("config-component");
+        std::fs::write(&component, b"not a directory").expect("component file");
+        let config_dir = component.join("nebula");
+
+        let error = materialize_config(
+            &config_dir,
+            &sample_bundle(),
+            ConfigRole::Peer,
+            &[],
+            tmp.path(),
+            Some(b"must-not-escape"),
+        )
+        .expect_err("a non-directory config component must fail closed");
+        assert!(error.contains("Nebula config path component is not a directory"));
+        assert!(
+            std::fs::read_dir(outside.path())
+                .expect("outside directory")
+                .next()
+                .is_none(),
+            "no secret-bearing file may be created after a non-directory component"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_rejects_symlinked_identity_root_before_secret_write() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let outside = tempfile::tempdir().expect("outside");
+        let config_dir = tmp.path().join("nebula");
+        std::fs::create_dir(&config_dir).expect("config directory");
+        symlink(outside.path(), config_dir.join("identity")).expect("identity symlink");
+
+        let error = materialize_config(
+            &config_dir,
+            &sample_bundle(),
+            ConfigRole::Peer,
+            &[],
+            tmp.path(),
+            Some(b"must-not-escape"),
+        )
+        .expect_err("a symlinked identity root must fail closed");
+        assert!(error.contains("symlinked Nebula identity directory component"));
+        assert!(
+            std::fs::read_dir(outside.path())
+                .expect("outside directory")
+                .next()
+                .is_none(),
+            "no secret-bearing file or generation may be created through identity symlink"
+        );
+        assert!(
+            !config_dir.join("host.key").exists(),
+            "compatibility key link must not be published after identity validation fails"
+        );
+    }
+
+    #[test]
+    fn materialize_rejects_non_directory_identity_root_before_secret_write() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let config_dir = tmp.path().join("nebula");
+        std::fs::create_dir(&config_dir).expect("config directory");
+        std::fs::write(config_dir.join("identity"), b"not a directory")
+            .expect("identity file");
+
+        let error = materialize_config(
+            &config_dir,
+            &sample_bundle(),
+            ConfigRole::Peer,
+            &[],
+            tmp.path(),
+            Some(b"must-not-write"),
+        )
+        .expect_err("a non-directory identity root must fail closed");
+        assert!(error.contains("Nebula identity path component is not a directory"));
+        assert!(
+            !config_dir.join("host.key").exists(),
+            "no compatibility key may be published after identity validation fails"
+        );
     }
 
     #[test]
