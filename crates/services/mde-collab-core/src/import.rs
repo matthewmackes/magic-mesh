@@ -59,7 +59,7 @@ use mde_collab_types::ids::{DocumentId, EventId, SpaceId};
 use mde_collab_types::value::{sha256_hex, MessageBody};
 use mde_collab_types::{ActorClock, ActorId, CollabEventEnvelope, SpaceKind, SpaceRole};
 
-use crate::error::Result;
+use crate::error::{CollabError, Result};
 use crate::log::{ActorLog, FileActorLog};
 use crate::signer::EventSigner;
 
@@ -123,10 +123,15 @@ impl ImportMap {
     /// silently discarding a map would risk re-importing duplicates.
     ///
     /// # Errors
-    /// Returns an error if the file exists but cannot be read or parsed.
+    /// Returns an error if the file exists but cannot be read, parsed, or is
+    /// from an unsupported schema version.
     pub fn load(path: &Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
-            Ok(s) => Ok(serde_json::from_str(&s)?),
+            Ok(s) => {
+                let map: Self = serde_json::from_str(&s)?;
+                map.validate_version()?;
+                Ok(map)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::new()),
             Err(e) => Err(e.into()),
         }
@@ -136,8 +141,10 @@ impl ImportMap {
     /// a crash mid-write never leaves a torn map that would re-import duplicates.
     ///
     /// # Errors
-    /// Returns an error if the directory cannot be created or the write fails.
+    /// Returns an error if the map schema is unsupported, the directory cannot
+    /// be created, or the write fails.
     pub fn save(&self, path: &Path) -> Result<()> {
+        self.validate_version()?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -148,6 +155,18 @@ impl ImportMap {
         std::fs::write(&tmp, body.as_bytes())?;
         std::fs::rename(&tmp, path)?;
         Ok(())
+    }
+
+    /// Reject a map whose source-id semantics may not match this importer.
+    fn validate_version(&self) -> Result<()> {
+        if self.version == IMPORT_MAP_VERSION {
+            Ok(())
+        } else {
+            Err(CollabError::Serde(format!(
+                "unsupported import map version {} (expected {})",
+                self.version, IMPORT_MAP_VERSION
+            )))
+        }
     }
 
     /// Whether `source_id` has already been imported.
@@ -1142,6 +1161,34 @@ mod tests {
         // A missing map file loads as empty (the first import).
         let fresh = ImportMap::load(&tmp.path().join("absent.json")).expect("load-absent");
         assert!(fresh.imported.is_empty());
+    }
+
+    #[test]
+    fn import_map_rejects_unsupported_versions_before_use_or_save() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let unsupported = IMPORT_MAP_VERSION + 1;
+        let path = tmp.path().join("state").join("future-map.json");
+        std::fs::create_dir_all(path.parent().expect("state parent")).expect("mkdir state");
+        std::fs::write(
+            &path,
+            format!(r#"{{"version":{unsupported},"imported":{{}},"editor_scanned":false}}"#),
+        )
+        .expect("write future map");
+
+        let error = ImportMap::load(&path).expect_err("future map must fail closed");
+        assert!(
+            error.to_string().contains("unsupported import map version"),
+            "unexpected error: {error}"
+        );
+
+        let mut map = ImportMap::new();
+        map.version = unsupported;
+        let save_path = tmp.path().join("state").join("should-not-save.json");
+        assert!(
+            map.save(&save_path).is_err(),
+            "unsupported map must not be persisted"
+        );
+        assert!(!save_path.exists(), "rejected map left a replacement file");
     }
 
     #[test]

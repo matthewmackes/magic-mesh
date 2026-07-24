@@ -887,6 +887,76 @@ mod tests {
     }
 
     #[test]
+    fn non_zero_screen_pointer_hits_each_base_control() {
+        // An egui Area's content UI, painter, and widget rectangles all use
+        // screen coordinates. Keep the viewport origin non-zero so a local-
+        // coordinate regression cannot pass by accident.
+        let screen = egui::Rect::from_min_size(egui::pos2(73.0, 41.0), egui::vec2(1280.0, 800.0));
+
+        for mode in [DockMode::Floating, DockMode::Docked] {
+            let ctx = egui::Context::default();
+            let mut state = State::with_mode(mode);
+            let geometry = match mode {
+                DockMode::Floating => floating_geometry(screen),
+                DockMode::Docked => docked_geometry(screen),
+            };
+
+            let input = |events| egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            };
+            for _ in 0..3 {
+                let _ = ctx.run(input(Vec::new()), |ctx| {
+                    assert_eq!(state.mount(ctx, &[]), None);
+                });
+            }
+
+            for (kind, expected) in [
+                (ControlKind::Back, Action::Back),
+                (ControlKind::Home, Action::Home),
+                (ControlKind::Pin, Action::ToggleDock),
+            ] {
+                let control = geometry
+                    .controls
+                    .iter()
+                    .find(|control| control.kind == kind)
+                    .copied()
+                    .expect("base control must be present in both dock modes");
+                let target = control.rect.center();
+                let _ = ctx.run(
+                    input(vec![
+                        egui::Event::PointerMoved(target),
+                        egui::Event::PointerButton {
+                            pos: target,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ]),
+                    |ctx| {
+                        assert_eq!(state.mount(ctx, &[]), None);
+                    },
+                );
+                let mut action = None;
+                let _ = ctx.run(
+                    input(vec![
+                        egui::Event::PointerMoved(target),
+                        egui::Event::PointerButton {
+                            pos: target,
+                            button: egui::PointerButton::Primary,
+                            pressed: false,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ]),
+                    |ctx| action = state.mount(ctx, &[]),
+                );
+                assert_eq!(action, Some(expected), "{mode:?} {kind:?} target");
+            }
+        }
+    }
+
+    #[test]
     fn chooser_pins_extend_the_reserved_springboard_dock_and_emit_source_action() {
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
         let sources = vec![crate::surfaces::DesktopRailSource::new(

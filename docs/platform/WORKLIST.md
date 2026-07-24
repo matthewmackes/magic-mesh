@@ -241,6 +241,11 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-SEC-006 - Keep Nebula private keys local to their owning node
 
 - Status: Remaining
+- Progress (2026-07-24 relay-authority refresh hardening): the Nebula supervisor
+  now refuses replicated bundle refresh and lighthouse-roster reconciliation
+  when the public relay authority does not match the root-local enrollment pin.
+  The foreign-authority regression is covered by the focused BigBoy supervisor
+  gate at 40/40; live rotation/reconnect evidence remains external.
 - Progress (2026-07-23): code and hostile fixtures now meet the local-key design.
   Joining nodes generate their key locally; the signer consumes only the strict
   requester public key and verifies the returned certificate identity before an
@@ -422,6 +427,12 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-ARCH-007 - Repair Workloads cockpit E2E wire, placement, and authorization
 
 - Status: Remaining
+- Progress (2026-07-24 image-reference boundary hardening): image-build now
+  validates caller-controlled OCI references before capability replay or builder
+  dispatch, rejecting option-shaped, malformed, whitespace/control, path, and
+  invalid-digest values while retaining the literal `--` argv boundary. The
+  focused BigBoy image suite is green at 36/36; live backend evidence remains
+  external.
 - Progress (2026-07-23): UI contract slice landed in the takeover tree. Set
   desired now publishes the worker's `{node,spec}` envelope; provision,
   configure, plan, destroy, lifecycle, and console requests carry explicit
@@ -580,6 +591,11 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-011 - Communications collaboration suite full replacement
 
 - Status: Remaining
+- Progress (2026-07-24 import-map version hardening): the legacy collaboration
+  importer now rejects unsupported persisted ImportMap schema versions before
+  replay or save, preventing a future map from silently changing idempotency
+  semantics. The focused `.50` importer gate is green at 14/14; live media/LLM
+  evidence remains external.
 - Progress (2026-07-21): CUTOVER LANDED (origin/master a84017f1) — at the AUTONOMOUS
   CEILING. Phase-1 (56 parity Qs ruled 78408f3b, migration importer 4e0d5df0, retire the
   dead Kamailio/RTPengine VV stack aad4d511) + Phase-2 shell surface cutover (a84017f1)
@@ -1189,6 +1205,11 @@ These decisions refine acceptance and sequencing for the active items below.
   future-dated. The daemon `.90` gate is green at 5/5 and the BigBoy Maps
   Airspace gate at 11/11; no undocumented MG90 scanner protocol was added and
   live scanner configuration remains external.
+- Progress (2026-07-24 NWS alert timestamp hardening): the Maps alert consumer
+  now treats a retained fetch timestamp more than five seconds ahead of the
+  seat clock as stale, withholds its polygons and in-warning banner, and
+  exposes no fabricated age. The focused BigBoy NWS alert gate is green at
+  5/5; live NWS fetch credentials/configuration remain external.
 - Progress (2026-07-24 route-preview typography adoption): the Maps route
   preview title, destination summary, route cards, and Start control now use
   shared semantic typography roles instead of direct font literals, preserving
@@ -1243,6 +1264,11 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-006 - Construct interface (Apple-HIG-principled workstation shell)
 
 - Status: Remaining
+- Progress (2026-07-24 Springboard input proof): a non-zero-origin headless
+  pointer regression now exercises Back, Home, and Pin in both floating and
+  docked modes and proves the foreground dock remains non-interactive outside
+  its controls. The focused `.50` nav-bar gate is green at 1/1; live physical
+  pointer/pixel evidence remains external.
 - Progress (2026-07-23): the home contract was reconciled to the operator's
   single-desktop directive: one untitled all-icons Desktop now flattens the
   canonical surface catalog, uses launcher-group accents for color coding, and
@@ -1591,6 +1617,11 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-007 - Car interface (CarPlay-principled vehicle mode)
 
 - Status: Remaining
+- Progress (2026-07-24 Car keymap persistence hardening): persisted Car bindings
+  now stream-discard unknown/non-bindable keys and malformed actions, preserving
+  valid bindings and the legacy `go_phone` alias without allowing an unbounded
+  active map. The focused shell Car keymap gate is green at 7/7; live MG90 and
+  physical Car evidence remains external.
 - Progress (2026-07-23 live mirror proof): the MG90 gateway at `172.20.0.25`
   is reachable from the network (ping and TCP/2222), and `.15`'s active
   `mackesd` is publishing a fresh `state/vehicle/Basement-Test-Workstation`

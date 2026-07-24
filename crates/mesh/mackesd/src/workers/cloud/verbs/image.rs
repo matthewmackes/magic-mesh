@@ -41,6 +41,14 @@ const IMAGE_BUILDER_BIN: &str = "bootc-image-builder";
 /// request via the `image` field). Matches the local bootc build tag.
 const DEFAULT_BOOTC_IMAGE: &str = "localhost/magic-mesh-bootc:latest";
 
+/// Bound an untrusted image reference before it becomes a builder argv value.
+///
+/// This is deliberately a lexical OCI-reference check, not a registry lookup:
+/// the mesh may use private, air-gapped, or local registries. It accepts the
+/// normal `name[:tag][@algorithm:hex-digest]` forms while refusing shell/control
+/// characters, path-shaped names, and option-shaped values before auth/replay.
+const MAX_IMAGE_REFERENCE_BYTES: usize = 4096;
+
 /// The SHA256 sidecar written next to `manifest.toml` in each versioned dir — the
 /// verified content hash the Syncthing lane checks + the [`ImageRow`] surfaces.
 const SHA_SIDECAR: &str = "image.sha256";
@@ -98,6 +106,128 @@ impl ImageBuildBody {
     }
 }
 
+/// Validate the caller-controlled positional image passed to
+/// `bootc-image-builder`.
+fn validate_image_reference(reference: &str) -> Result<&str, String> {
+    if reference.is_empty() {
+        return Err("image reference must not be empty".to_string());
+    }
+    if reference.len() > MAX_IMAGE_REFERENCE_BYTES {
+        return Err(format!(
+            "image reference exceeds {MAX_IMAGE_REFERENCE_BYTES} bytes"
+        ));
+    }
+    if reference.starts_with('-') {
+        return Err("image reference must not begin with `-`".to_string());
+    }
+    if !reference.is_ascii()
+        || reference
+            .chars()
+            .any(|c| c.is_ascii_control() || c.is_ascii_whitespace())
+    {
+        return Err("image reference contains whitespace or control characters".to_string());
+    }
+
+    let (name, digest) = match reference.split_once('@') {
+        Some((name, digest)) => (name, Some(digest)),
+        None => (reference, None),
+    };
+    if name.is_empty() || name.contains('@') {
+        return Err("image reference has an invalid name".to_string());
+    }
+
+    if let Some(digest) = digest {
+        let Some((algorithm, encoded)) = digest.split_once(':') else {
+            return Err("image reference has an invalid digest".to_string());
+        };
+        if algorithm.is_empty()
+            || !algorithm
+                .chars()
+                .enumerate()
+                .all(|(i, c)| c.is_ascii_lowercase() || (i > 0 && c.is_ascii_digit()))
+            || encoded.len() < 32
+            || !encoded.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            return Err("image reference has an invalid digest".to_string());
+        }
+    }
+
+    // A colon after the final slash is the optional tag. A colon before the
+    // slash belongs to a registry port and is checked below.
+    let tag_start = name
+        .rfind(':')
+        .filter(|colon| name.rfind('/').is_none_or(|slash| *colon > slash));
+    let (name, tag) = match tag_start {
+        Some(colon) => (&name[..colon], Some(&name[colon + 1..])),
+        None => (name, None),
+    };
+    if let Some(tag) = tag {
+        if tag.is_empty()
+            || tag.len() > 128
+            || !tag
+                .chars()
+                .enumerate()
+                .all(|(i, c)| c.is_ascii_alphanumeric() || (i > 0 && matches!(c, '_' | '.' | '-')))
+        {
+            return Err("image reference has an invalid tag".to_string());
+        }
+    }
+
+    let components: Vec<&str> = name.split('/').collect();
+    if components.iter().any(|component| component.is_empty()) {
+        return Err("image reference has an empty path component".to_string());
+    }
+    if components
+        .iter()
+        .skip(1)
+        .any(|component| !valid_image_name_component(component))
+    {
+        return Err("image reference has an invalid repository path".to_string());
+    }
+    if !valid_registry_component(components[0]) {
+        return Err("image reference has an invalid registry or repository name".to_string());
+    }
+
+    Ok(reference)
+}
+
+fn valid_image_name_component(component: &str) -> bool {
+    let bytes = component.as_bytes();
+    !bytes.is_empty()
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes[bytes.len() - 1].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn valid_registry_component(component: &str) -> bool {
+    if let Some(close) = component.strip_prefix('[').and_then(|rest| rest.find(']')) {
+        let close = close + 1;
+        let host = &component[1..close];
+        let port = &component[close + 1..];
+        return !host.is_empty()
+            && host
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.')
+            && (port.is_empty() || (port.starts_with(':') && valid_registry_port(&port[1..])));
+    }
+
+    let Some(colon) = component.rfind(':') else {
+        return valid_image_name_component(component);
+    };
+    component[..colon].contains(':') == false
+        && valid_image_name_component(&component[..colon])
+        && valid_registry_port(&component[colon + 1..])
+}
+
+fn valid_registry_port(port: &str) -> bool {
+    !port.is_empty()
+        && port.len() <= 5
+        && port.chars().all(|c| c.is_ascii_digit())
+        && port.parse::<u16>().is_ok_and(|port| port != 0)
+}
+
 /// Route an `image-build` request to its sub-action handler.
 pub(crate) fn handle(w: &CloudWorker, verb_name: &str, raw: &str) -> CloudReply {
     let body: ImageBuildBody = serde_json::from_str(raw.trim()).unwrap_or_default();
@@ -153,6 +283,15 @@ fn build(w: &CloudWorker, verb_name: &str, body: &ImageBuildBody, raw: &str) -> 
     if let Err(e) = path_key::segment("image version", &version) {
         return reject(verb_name, e);
     }
+    let image_ref = body
+        .image
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_BOOTC_IMAGE);
+    if let Err(e) = validate_image_reference(image_ref) {
+        return reject(verb_name, e);
+    }
 
     // The armed-token gate — a build without a valid capability stages nothing.
     let target = format!("build:{name}@{version}");
@@ -184,12 +323,6 @@ fn build(w: &CloudWorker, verb_name: &str, body: &ImageBuildBody, raw: &str) -> 
     // The bootc image-mode → osbuild disk build. `bootc-image-builder` writes the
     // qcow2 under `--output`; a spawn failure means the tool is absent (honest gate).
     let out_str = out_dir.to_string_lossy().into_owned();
-    let image_ref = body
-        .image
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or(DEFAULT_BOOTC_IMAGE);
     // Keep the caller-controlled image reference positional. Without `--`, a
     // reference beginning with `-` could be reinterpreted by the builder as a
     // second option (for example a second `--output`), despite using literal
@@ -626,7 +759,10 @@ mod tests {
             .iter()
             .position(|a| a == "--")
             .expect("image reference is after the end-of-options separator");
-        assert_eq!(calls[0].1.get(separator + 1).map(String::as_str), Some(DEFAULT_BOOTC_IMAGE));
+        assert_eq!(
+            calls[0].1.get(separator + 1).map(String::as_str),
+            Some(DEFAULT_BOOTC_IMAGE)
+        );
         // The manifest landed in the SAME image_catalog store the existing lane uses.
         let manifests = load_manifests(tmp.path());
         assert_eq!(manifests.len(), 1);
@@ -637,7 +773,7 @@ mod tests {
     }
 
     #[test]
-    fn caller_image_reference_cannot_be_reinterpreted_as_a_builder_option() {
+    fn option_shaped_image_reference_is_rejected_before_auth_replay_or_runner() {
         let tmp = tempfile::tempdir().unwrap();
         let runner = Arc::new(FakeRunner::default());
         let w = armed_worker(tmp.path(), runner.clone());
@@ -650,16 +786,20 @@ mod tests {
             "image": "--output=/tmp/should-not-be-an-output"
         }));
 
-        let reply = w.handle("image-build", &raw);
-        assert!(reply.ok, "gated:{:?} err:{:?}", reply.gated, reply.error);
-        let calls = runner.tool_calls.lock().unwrap();
-        let args = &calls[0].1;
-        let separator = args
-            .iter()
-            .position(|arg| arg == "--")
-            .expect("end-of-options separator");
-        assert_eq!(args.get(separator + 1).map(String::as_str), Some("--output=/tmp/should-not-be-an-output"));
-        assert_eq!(args[..separator].iter().filter(|arg| arg.as_str() == "--output").count(), 1);
+        let first = w.handle("image-build", &raw);
+        assert!(!first.ok);
+        assert!(first.gated.is_none(), "invalid input must not reach auth");
+        assert!(first
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("must not begin with `-`")));
+
+        // Replaying the exact request reaches the same pre-auth rejection: the
+        // armed nonce was never claimed, and the runner was never dispatched.
+        let second = w.handle("image-build", &raw);
+        assert_eq!(second.error, first.error);
+        assert!(second.gated.is_none());
+        assert!(runner.tool_calls.lock().unwrap().is_empty());
     }
 
     #[test]

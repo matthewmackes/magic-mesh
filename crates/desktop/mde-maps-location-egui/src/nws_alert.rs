@@ -8,6 +8,10 @@ use mde_egui::Style;
 
 /// Three missed minute polls make a safety layer visibly stale.
 pub const SNAPSHOT_STALE_AFTER_MS: i64 = 3 * 60 * 1_000;
+/// A retained mirror materially ahead of the seat clock is not a live warning.
+/// Keep this allowance aligned with the other map consumers so clock skew does
+/// not turn a hostile or misconfigured publication into a false alert.
+const MAX_TIMESTAMP_FUTURE_SKEW_MS: i64 = 5_000;
 
 const SEVERITY_EXTREME: Color32 = Color32::from_rgb(0xD4, 0x2A, 0x2A); // style-leak-ok: map-content-color
 const SEVERITY_SEVERE: Color32 = Color32::from_rgb(0xF2, 0x82, 0x22); // style-leak-ok: map-content-color
@@ -29,16 +33,28 @@ impl NwsAlertLayerState {
     /// Snapshot age in milliseconds.
     #[must_use]
     pub fn age_ms(&self, now_ms: i64) -> Option<i64> {
-        self.snapshot
-            .as_ref()
-            .map(|snapshot| now_ms.saturating_sub(snapshot.fetched_at_ms).max(0))
+        self.snapshot.as_ref().and_then(|snapshot| {
+            (!self.future_dated(now_ms))
+                .then(|| now_ms.saturating_sub(snapshot.fetched_at_ms).max(0))
+        })
+    }
+
+    /// Whether the retained fetch timestamp is too far ahead of the consumer
+    /// clock to be trusted as a current safety feed.
+    #[must_use]
+    pub fn future_dated(&self, now_ms: i64) -> bool {
+        self.snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot.fetched_at_ms > now_ms.saturating_add(MAX_TIMESTAMP_FUTURE_SKEW_MS)
+        })
     }
 
     /// Whether the safety feed has missed three expected polls.
     #[must_use]
     pub fn stale(&self, now_ms: i64) -> bool {
-        self.age_ms(now_ms)
-            .is_some_and(|age| age > SNAPSHOT_STALE_AFTER_MS)
+        self.future_dated(now_ms)
+            || self
+                .age_ms(now_ms)
+                .is_some_and(|age| age > SNAPSHOT_STALE_AFTER_MS)
     }
 
     /// Required active-layer attribution.
@@ -74,25 +90,28 @@ where
     if !rect.is_finite() || rect.width() <= 0.0 || rect.height() <= 0.0 {
         return PaintStats::default();
     }
+    let future_dated = layer.future_dated(now_ms);
     let stale = layer.stale(now_ms);
     let mut stats = PaintStats::default();
     let mut inside: Option<&NwsAlert> = None;
-    if let Some(snapshot) = &layer.snapshot {
-        for alert in snapshot
-            .alerts
-            .iter()
-            .filter(|alert| !expired(alert, now_ms))
-        {
-            if vehicle.is_some_and(|point| alert_contains(alert, point))
-                && inside.is_none_or(|current| {
-                    severity_rank(alert.severity) > severity_rank(current.severity)
-                })
+    if !future_dated {
+        if let Some(snapshot) = &layer.snapshot {
+            for alert in snapshot
+                .alerts
+                .iter()
+                .filter(|alert| !expired(alert, now_ms))
             {
-                inside = Some(alert);
-            }
-            for polygon in &alert.polygons {
-                if paint_polygon(painter, rect, polygon, alert.severity, stale, &mut project) {
-                    stats.polygons += 1;
+                if vehicle.is_some_and(|point| alert_contains(alert, point))
+                    && inside.is_none_or(|current| {
+                        severity_rank(alert.severity) > severity_rank(current.severity)
+                    })
+                {
+                    inside = Some(alert);
+                }
+                for polygon in &alert.polygons {
+                    if paint_polygon(painter, rect, polygon, alert.severity, stale, &mut project) {
+                        stats.polygons += 1;
+                    }
                 }
             }
         }
@@ -563,6 +582,41 @@ mod tests {
                 stats = paint_layer(ui.painter(), rect, &layer, now, None, |_lat, _lon| {
                     Some(rect.center())
                 });
+            });
+        });
+        assert_eq!(stats.polygons, 0);
+        assert!(!stats.inside_alert);
+        assert!(stats.badge);
+    }
+
+    #[test]
+    fn future_snapshot_is_stale_and_does_not_paint_a_warning() {
+        let now = 1_000_000;
+        let mut snapshot = NwsAlertSnapshot::empty("rig-1", now + MAX_TIMESTAMP_FUTURE_SKEW_MS + 1);
+        snapshot.alerts.push(alert(now));
+        let mut layer = NwsAlertLayerState::default();
+        layer.fold(snapshot);
+
+        assert!(layer.future_dated(now));
+        assert!(layer.stale(now));
+        assert_eq!(layer.age_ms(now), None);
+
+        let ctx = egui::Context::default();
+        let mut stats = PaintStats::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = ui.max_rect();
+                stats = paint_layer(
+                    ui.painter(),
+                    rect,
+                    &layer,
+                    now,
+                    Some(GeoPoint {
+                        latitude: 1.0,
+                        longitude: 0.5,
+                    }),
+                    |_lat, _lon| Some(rect.center()),
+                );
             });
         });
         assert_eq!(stats.polygons, 0);

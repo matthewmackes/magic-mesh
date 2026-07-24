@@ -15,10 +15,12 @@
 //! the single source of truth the on-disk map round-trips through.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use mde_egui::egui;
-use serde::{Deserialize, Serialize};
+use serde::de::{self, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// The file (under the client data dir) the Car key bindings persist to.
 const CAR_KEYS_CONFIG_FILE: &str = "settings-car-keys.json";
@@ -236,10 +238,56 @@ pub fn key_from_label(label: &str) -> Option<egui::Key> {
 /// The operator-editable Car-Mode key→action map, persisted to
 /// `settings-car-keys.json`. Keyed by the stable key label so it round-trips
 /// through JSON without depending on `egui::Key`'s (absent) `serde`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct CarKeyBindings {
     bindings: BTreeMap<String, CarAction>,
+}
+
+impl<'de> Deserialize<'de> for CarKeyBindings {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct CarKeyBindingsVisitor;
+
+        impl<'de> Visitor<'de> for CarKeyBindingsVisitor {
+            type Value = CarKeyBindings;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a JSON object of bindable Car key labels to actions")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut bindings = BTreeMap::new();
+
+                while let Some(label) = map.next_key::<String>()? {
+                    // Consume unknown/non-bindable values without materializing
+                    // them. Only the finite `bindable_keys()` vocabulary can ever
+                    // enter the active map, regardless of persisted input size.
+                    if key_from_label(&label).is_none() {
+                        map.next_value::<de::IgnoredAny>()?;
+                        continue;
+                    }
+
+                    // Decode known-key values independently so one malformed or
+                    // retired action cannot discard valid sibling bindings. The
+                    // `CarAction` alias keeps legacy `go_phone` compatible.
+                    let value = map.next_value::<serde_json::Value>()?;
+                    if let Ok(action) = serde_json::from_value::<CarAction>(value) {
+                        bindings.insert(label, action);
+                    }
+                }
+
+                Ok(CarKeyBindings { bindings })
+            }
+        }
+
+        deserializer.deserialize_map(CarKeyBindingsVisitor)
+    }
 }
 
 impl Default for CarKeyBindings {
@@ -456,6 +504,35 @@ mod tests {
         let json = serde_json::to_string(&legacy).expect("serialize");
         assert!(json.contains("\"3\":\"go_comms\""));
         assert!(!json.contains("go_phone"));
+    }
+
+    #[test]
+    fn persisted_bindings_sanitize_keys_actions_and_map_size() {
+        let mut entries = serde_json::Map::new();
+        entries.insert("A".to_string(), serde_json::json!("go_nav"));
+        entries.insert("Space".to_string(), serde_json::json!("go_home"));
+        entries.insert("F13".to_string(), serde_json::json!("go_home"));
+        entries.insert("".to_string(), serde_json::json!("go_home"));
+        entries.insert("B".to_string(), serde_json::json!("not_an_action"));
+        entries.insert("C".to_string(), serde_json::json!({"action": "go_home"}));
+        for index in 0..4096 {
+            entries.insert(format!("unknown-{index}"), serde_json::json!("go_home"));
+        }
+
+        let loaded: CarKeyBindings =
+            serde_json::from_value(serde_json::Value::Object(entries)).expect("map parses");
+
+        assert_eq!(loaded.action_for(egui::Key::A), Some(CarAction::GoNav));
+        assert_eq!(loaded.action_for(egui::Key::B), None);
+        assert_eq!(loaded.action_for(egui::Key::C), None);
+        assert_eq!(loaded.action_for(egui::Key::Space), None);
+
+        let persisted = serde_json::to_value(&loaded).expect("sanitize serializes");
+        let object = persisted.as_object().expect("transparent map");
+        assert_eq!(object.len(), 1);
+        assert_eq!(object.get("A"), Some(&serde_json::json!("go_nav")));
+        assert!(object.keys().all(|label| key_from_label(label).is_some()));
+        assert!(object.len() <= bindable_keys().len());
     }
 
     #[test]

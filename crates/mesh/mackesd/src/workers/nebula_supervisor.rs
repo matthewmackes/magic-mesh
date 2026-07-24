@@ -60,6 +60,7 @@ pub struct NebulaSupervisor {
     bundle_path: PathBuf,
     role_marker_path: PathBuf,
     config_dir: PathBuf,
+    relay_trust_authority_pin_path: PathBuf,
     overlay_ip_path: PathBuf,
     tick_interval: Duration,
     /// Cached bundle mtime so a change triggers a re-write.
@@ -98,6 +99,9 @@ impl NebulaSupervisor {
             bundle_path,
             role_marker_path: PathBuf::from(DEFAULT_ROLE_HOST_MARKER),
             config_dir: PathBuf::from("/etc/nebula"),
+            relay_trust_authority_pin_path: PathBuf::from(
+                crate::ca::bundle::RELAY_TRUST_AUTHORITY_PIN_PATH,
+            ),
             overlay_ip_path: PathBuf::from(DEFAULT_OVERLAY_IP_PATH),
             tick_interval: DEFAULT_TICK_INTERVAL,
             last_bundle_mtime: None,
@@ -127,6 +131,13 @@ impl NebulaSupervisor {
     #[must_use]
     pub fn with_config_dir(mut self, path: PathBuf) -> Self {
         self.config_dir = path;
+        self
+    }
+
+    /// Override the root-local relay authority pin — used by tests.
+    #[must_use]
+    pub(crate) fn with_relay_trust_authority_pin(mut self, path: PathBuf) -> Self {
+        self.relay_trust_authority_pin_path = path;
         self
     }
 
@@ -270,6 +281,12 @@ impl NebulaSupervisor {
     async fn refresh_config(&self) -> Result<(), String> {
         let bundle =
             crate::ca::bundle::read_bundle(&self.bundle_path).map_err(|e| e.to_string())?;
+        if !relay_authority_is_trusted(&bundle, &self.relay_trust_authority_pin_path) {
+            return Err(
+                "replicated Nebula bundle relay trust authority does not match the local enrollment pin"
+                    .into(),
+            );
+        }
         // Bug #3 (operator decision 2026-06-10): a node's nebula lighthouse
         // role is STATIC — it's a lighthouse iff its own overlay IP is in
         // the bundle's lighthouse set — NOT a function of FPG leadership.
@@ -344,6 +361,12 @@ impl NebulaSupervisor {
             // No bundle yet (pre-enroll) — nothing to reconcile.
             Err(_) => return,
         };
+        if !relay_authority_is_trusted(&bundle, &self.relay_trust_authority_pin_path) {
+            tracing::warn!(
+                "nebula-supervisor: refusing lighthouse roster reconcile with an unpinned relay trust authority"
+            );
+            return;
+        }
         let peers = crate::substrate::peers::read_directory(&self.workgroup_root);
         let authority = bundle.relay_trust_authority.clone();
         let mut roster: Vec<crate::ca::bundle::LighthouseEntry> =
@@ -408,6 +431,23 @@ impl NebulaSupervisor {
                 "nebula-supervisor: lighthouse roster reconcile write failed"
             ),
         }
+    }
+}
+
+/// Replicated bundles may carry the public relay authority, but that value is
+/// usable only when it matches the root-local pin created during authenticated
+/// enrollment. A relay identity without an authority is likewise invalid: it
+/// has no trust context and must not survive a supervisor refresh.
+fn relay_authority_is_trusted(
+    bundle: &crate::ca::bundle::NebulaBundle,
+    authority_pin_path: &Path,
+) -> bool {
+    match bundle.relay_trust_authority.as_deref() {
+        Some(_) => crate::ca::bundle::relay_trust_authority_matches_pin(bundle, authority_pin_path),
+        None => bundle
+            .lighthouses
+            .iter()
+            .all(|entry| entry.relay_tls.is_none()),
     }
 }
 
@@ -1272,8 +1312,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmp");
         let config_dir = tmp.path().join("nebula");
         std::fs::create_dir(&config_dir).expect("config directory");
-        std::fs::write(config_dir.join("identity"), b"not a directory")
-            .expect("identity file");
+        std::fs::write(config_dir.join("identity"), b"not a directory").expect("identity file");
 
         let error = materialize_config(
             &config_dir,
@@ -1852,6 +1891,72 @@ mod tests {
             after.lighthouses.len(),
             1,
             "an empty directory read must NOT wipe the existing roster (anti-strand guard)"
+        );
+    }
+
+    #[tokio::test]
+    async fn foreign_relay_authority_cannot_reconcile_or_refresh() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        seed_lighthouse(&root, "lh-01", "10.42.0.1", "203.0.113.1:4242");
+
+        let trusted_key = ed25519_dalek::SigningKey::from_bytes(&[7_u8; 32]);
+        let foreign_key = ed25519_dalek::SigningKey::from_bytes(&[8_u8; 32]);
+        let pin_path = root.join("relay-authority.pub");
+        let mut pinned_bundle = sample_bundle();
+        pinned_bundle.relay_trust_authority = Some(
+            crate::ca::bundle::relay_trust_authority_public_key(&trusted_key),
+        );
+        crate::ca::bundle::write_relay_trust_authority_pin(&pinned_bundle, &pin_path)
+            .expect("write local relay authority pin");
+
+        let mut bundle = sample_bundle();
+        bundle.lighthouses[0].node_id = "lh-01".into();
+        bundle.lighthouses[0].overlay_ip = "10.42.0.1".into();
+        bundle.lighthouses[0].external_addr = "203.0.113.1:4242".into();
+        bundle.relay_trust_authority = Some(crate::ca::bundle::relay_trust_authority_public_key(
+            &foreign_key,
+        ));
+        let identity = crate::ca::bundle::RelayTlsIdentity::from_certificate_pem(
+            "-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n",
+        )
+        .expect("relay identity");
+        bundle.lighthouses[0].relay_tls = Some(crate::ca::bundle::sign_relay_tls_identity(
+            identity,
+            &bundle.lighthouses[0].node_id,
+            &bundle.lighthouses[0].overlay_ip,
+            &bundle.lighthouses[0].external_addr,
+            &foreign_key,
+        ));
+        let bundle_path = root.join("nebula-bundle.json");
+        crate::ca::bundle::write_bundle(&bundle_path, &bundle).expect("seed foreign bundle");
+
+        let conn = crate::store::open(&root.join("store.sqlite")).expect("open");
+        let config_dir = root.join("nebula");
+        let supervisor = NebulaSupervisor::new(
+            Arc::new(Mutex::new(conn)),
+            "peer:test".into(),
+            "m1".into(),
+            bundle_path.clone(),
+        )
+        .with_workgroup_root(root.clone())
+        .with_config_dir(config_dir.clone())
+        .with_relay_trust_authority_pin(pin_path);
+
+        supervisor.reconcile_lighthouse_roster();
+        assert_eq!(
+            crate::ca::bundle::read_bundle(&bundle_path).expect("read bundle"),
+            bundle,
+            "roster reconciliation must not adopt state under a foreign authority"
+        );
+        let error = supervisor
+            .refresh_config()
+            .await
+            .expect_err("a foreign relay authority must block config refresh");
+        assert!(error.contains("does not match the local enrollment pin"));
+        assert!(
+            !config_dir.exists(),
+            "blocked refresh must not materialize config from foreign relay state"
         );
     }
 
