@@ -246,6 +246,11 @@ These decisions refine acceptance and sequencing for the active items below.
   when the public relay authority does not match the root-local enrollment pin.
   The foreign-authority regression is covered by the focused BigBoy supervisor
   gate at 40/40; live rotation/reconnect evidence remains external.
+- Progress (2026-07-24 enrollment framing hardening): the TLS enrollment parser
+  now rejects unsupported `Transfer-Encoding` and ambiguous
+  `Transfer-Encoding`/`Content-Length` combinations before request dispatch.
+  The focused BigBoy endpoint gate is green at 18/18; live enrollment remains
+  external.
 - Progress (2026-07-23): code and hostile fixtures now meet the local-key design.
   Joining nodes generate their key locally; the signer consumes only the strict
   requester public key and verifies the returned certificate identity before an
@@ -433,6 +438,11 @@ These decisions refine acceptance and sequencing for the active items below.
   invalid-digest values while retaining the literal `--` argv boundary. The
   focused BigBoy image suite is green at 36/36; live backend evidence remains
   external.
+- Progress (2026-07-24 container lifecycle ownership hardening): Restart, Logs,
+  and Destroy now require the target to be a declared `service_container` on
+  the requested placement before authorization/replay or systemd execution.
+  The focused BigBoy lifecycle gate is green at 10/10; live Podman/systemd
+  success evidence remains external.
 - Progress (2026-07-23): UI contract slice landed in the takeover tree. Set
   desired now publishes the worker's `{node,spec}` envelope; provision,
   configure, plan, destroy, lifecycle, and console requests carry explicit
@@ -596,6 +606,11 @@ These decisions refine acceptance and sequencing for the active items below.
   replay or save, preventing a future map from silently changing idempotency
   semantics. The focused `.50` importer gate is green at 14/14; live media/LLM
   evidence remains external.
+- Progress (2026-07-24 replay ownership hardening): replayed `SpaceDeleted`
+  events now require a currently present owner in the folded membership state,
+  preventing a signed non-owner event from deleting a space read model. The
+  focused projection gate is green at 9/9 and the full collaboration core gate
+  at 50/50; live media/LLM evidence remains external.
 - Progress (2026-07-21): CUTOVER LANDED (origin/master a84017f1) — at the AUTONOMOUS
   CEILING. Phase-1 (56 parity Qs ruled 78408f3b, migration importer 4e0d5df0, retire the
   dead Kamailio/RTPengine VV stack aad4d511) + Phase-2 shell surface cutover (a84017f1)
@@ -1210,6 +1225,11 @@ These decisions refine acceptance and sequencing for the active items below.
   seat clock as stale, withholds its polygons and in-warning banner, and
   exposes no fabricated age. The focused BigBoy NWS alert gate is green at
   5/5; live NWS fetch credentials/configuration remain external.
+- Progress (2026-07-24 overlay timestamp/paint-boundary hardening): retained
+  aircraft and USGS earthquake snapshots now reject future timestamps, malformed
+  coordinates, and unbounded event paint work; future data is withheld with an
+  honest warning badge. The integrated BigBoy Maps library gate is green at
+  190/190; live feed credentials/configuration remain external.
 - Progress (2026-07-24 route-preview typography adoption): the Maps route
   preview title, destination summary, route cards, and Start control now use
   shared semantic typography roles instead of direct font literals, preserving
@@ -1269,6 +1289,11 @@ These decisions refine acceptance and sequencing for the active items below.
   docked modes and proves the foreground dock remains non-interactive outside
   its controls. The focused `.50` nav-bar gate is green at 1/1; live physical
   pointer/pixel evidence remains external.
+- Progress (2026-07-24 status-bar boundary hardening): the status rail now clips
+  paint/input to its reserved band and bounds the rollup cluster between the
+  centered clock and right controls on narrow screens. A non-zero-origin,
+  narrow-rail geometry/click regression is green at 16/16 on `.50`; live pixel
+  comparison remains external.
 - Progress (2026-07-23): the home contract was reconciled to the operator's
   single-desktop directive: one untitled all-icons Desktop now flattens the
   canonical surface catalog, uses launcher-group accents for color coding, and

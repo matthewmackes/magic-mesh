@@ -252,6 +252,14 @@ pub fn parse_request(buf: &[u8]) -> ParseOutcome {
     let mut content_length: Option<usize> = None;
     for line in lines {
         if let Some((name, value)) = line.split_once(':') {
+            // This endpoint has one request per TLS connection and only
+            // implements Content-Length framing. Never silently ignore
+            // transfer coding: accepting it while framing from a conflicting
+            // Content-Length would leave an intermediary and this parser with
+            // different request boundaries.
+            if name.trim().eq_ignore_ascii_case("transfer-encoding") {
+                return ParseOutcome::Invalid("unsupported transfer-encoding");
+            }
             if name.trim().eq_ignore_ascii_case("content-length") {
                 let parsed = match value.trim().parse::<usize>() {
                     Ok(n) => n,
@@ -624,6 +632,16 @@ mod tests {
         assert_eq!(
             parse_request(raw),
             ParseOutcome::Invalid("duplicate content-length")
+        );
+    }
+
+    #[test]
+    fn parse_rejects_ambiguous_transfer_coding() {
+        let raw =
+            b"POST /enroll HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n";
+        assert_eq!(
+            parse_request(raw),
+            ParseOutcome::Invalid("unsupported transfer-encoding")
         );
     }
 

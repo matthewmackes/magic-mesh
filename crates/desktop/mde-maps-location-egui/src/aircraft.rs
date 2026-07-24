@@ -10,6 +10,9 @@ pub const SNAPSHOT_STALE_AFTER_MS: i64 = 15_000;
 pub const TRACK_FADE_AFTER_MS: i64 = 30_000;
 /// Stop projecting and remove the marker after this age.
 pub const TRACK_DROP_AFTER_MS: i64 = 60_000;
+/// Allow a small amount of clock skew, but never present a future retained
+/// fetch as live data.
+pub const MAX_TIMESTAMP_FUTURE_SKEW_MS: i64 = 5_000;
 
 const LOW_ALTITUDE: Color32 = Color32::from_rgb(0xF0, 0x66, 0x3A); // style-leak-ok: map-content-color
 const HIGH_ALTITUDE: Color32 = Color32::from_rgb(0x47, 0xB6, 0xE8); // style-leak-ok: map-content-color
@@ -33,16 +36,29 @@ impl AircraftLayerState {
     /// Snapshot age in milliseconds.
     #[must_use]
     pub fn age_ms(&self, now_ms: i64) -> Option<i64> {
-        self.snapshot
-            .as_ref()
-            .map(|snapshot| now_ms.saturating_sub(snapshot.fetched_at_ms).max(0))
+        self.snapshot.as_ref().and_then(|snapshot| {
+            (!self.future_dated(now_ms))
+                .then(|| now_ms.saturating_sub(snapshot.fetched_at_ms).max(0))
+        })
+    }
+
+    /// Whether the retained snapshot timestamp is implausibly ahead of the
+    /// consumer clock. A retained peer snapshot must not become a fresh-data
+    /// claim merely because subtraction would otherwise clamp its age to zero.
+    #[must_use]
+    pub fn future_dated(&self, now_ms: i64) -> bool {
+        self.snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot.fetched_at_ms > now_ms.saturating_add(MAX_TIMESTAMP_FUTURE_SKEW_MS)
+        })
     }
 
     /// Whether the adapter has missed five visible-layer polls.
     #[must_use]
     pub fn stale(&self, now_ms: i64) -> bool {
-        self.age_ms(now_ms)
-            .is_some_and(|age| age > SNAPSHOT_STALE_AFTER_MS)
+        self.future_dated(now_ms)
+            || self
+                .age_ms(now_ms)
+                .is_some_and(|age| age > SNAPSHOT_STALE_AFTER_MS)
     }
 
     /// Required attribution whenever the toggle is active.
@@ -79,46 +95,51 @@ where
     }
     let mut stats = PaintStats::default();
     let stale = layer.stale(now_ms);
-    if let Some(snapshot) = &layer.snapshot {
-        let marker_painter = painter.with_clip_rect(rect.intersect(painter.clip_rect()));
-        for aircraft in &snapshot.aircraft {
-            if !aircraft.latitude.is_finite()
-                || !aircraft.longitude.is_finite()
-                || !(-90.0..=90.0).contains(&aircraft.latitude)
-                || !(-180.0..=180.0).contains(&aircraft.longitude)
-            {
-                continue;
-            }
-            let age_ms = now_ms.saturating_sub(aircraft.observed_at_ms).max(0);
-            if age_ms > TRACK_DROP_AFTER_MS {
-                continue;
-            }
-            let (latitude, longitude) = dead_reckoned_position(aircraft, age_ms);
-            let Some(point) = project(latitude, longitude) else {
-                continue;
-            };
-            if point.any_nan() || !rect.expand(18.0).contains(point) {
-                continue;
-            }
-            let alpha = track_alpha(age_ms);
-            let tone = if stale {
-                Style::TEXT_DIM
-            } else {
-                altitude_color(aircraft.estimated_agl_ft)
-            }
-            .gamma_multiply(alpha);
-            paint_marker(&marker_painter, point, aircraft.track_deg, tone);
-            stats.markers += 1;
-            if layer.show_callsigns {
-                if let Some(callsign) = aircraft.callsign.as_deref() {
-                    marker_painter.text(
-                        point + egui::vec2(10.0, 0.0),
-                        Align2::LEFT_CENTER,
-                        callsign,
-                        FontId::proportional(Style::SMALL),
-                        tone,
-                    );
-                    stats.labels += 1;
+    if !layer.future_dated(now_ms) {
+        if let Some(snapshot) = &layer.snapshot {
+            let marker_painter = painter.with_clip_rect(rect.intersect(painter.clip_rect()));
+            for aircraft in &snapshot.aircraft {
+                if !aircraft.latitude.is_finite()
+                    || !aircraft.longitude.is_finite()
+                    || !(-90.0..=90.0).contains(&aircraft.latitude)
+                    || !(-180.0..=180.0).contains(&aircraft.longitude)
+                {
+                    continue;
+                }
+                if aircraft.observed_at_ms > now_ms.saturating_add(MAX_TIMESTAMP_FUTURE_SKEW_MS) {
+                    continue;
+                }
+                let age_ms = now_ms.saturating_sub(aircraft.observed_at_ms).max(0);
+                if age_ms > TRACK_DROP_AFTER_MS {
+                    continue;
+                }
+                let (latitude, longitude) = dead_reckoned_position(aircraft, age_ms);
+                let Some(point) = project(latitude, longitude) else {
+                    continue;
+                };
+                if point.any_nan() || !rect.expand(18.0).contains(point) {
+                    continue;
+                }
+                let alpha = track_alpha(age_ms);
+                let tone = if stale {
+                    Style::TEXT_DIM
+                } else {
+                    altitude_color(aircraft.estimated_agl_ft)
+                }
+                .gamma_multiply(alpha);
+                paint_marker(&marker_painter, point, aircraft.track_deg, tone);
+                stats.markers += 1;
+                if layer.show_callsigns {
+                    if let Some(callsign) = aircraft.callsign.as_deref() {
+                        marker_painter.text(
+                            point + egui::vec2(10.0, 0.0),
+                            Align2::LEFT_CENTER,
+                            callsign,
+                            FontId::proportional(Style::SMALL),
+                            tone,
+                        );
+                        stats.labels += 1;
+                    }
                 }
             }
         }
@@ -212,6 +233,10 @@ fn dead_reckoned_position(aircraft: &AircraftTrack, age_ms: i64) -> (f64, f64) {
 fn paint_age_badge(painter: &Painter, rect: Rect, layer: &AircraftLayerState, now_ms: i64) {
     let (label, tone) = match (&layer.snapshot, layer.age_ms(now_ms)) {
         (None, _) => ("Aircraft · no data".to_string(), Style::TEXT_DIM),
+        (Some(_), _) if layer.future_dated(now_ms) => (
+            "Aircraft · invalid future timestamp".to_string(),
+            Style::WARN,
+        ),
         (Some(_), Some(age)) if age > SNAPSHOT_STALE_AFTER_MS => {
             (format!("Aircraft · STALE {}", age_label(age)), Style::WARN)
         }
@@ -348,5 +373,54 @@ mod tests {
             .is_empty());
         assert!(AircraftLayerState::attribution().contains("ODbL"));
         assert!(layer.stale(2_000 + SNAPSHOT_STALE_AFTER_MS + 1));
+    }
+
+    #[test]
+    fn future_snapshot_is_stale_and_does_not_paint_as_live() {
+        let now = 1_000_000;
+        let future = now + MAX_TIMESTAMP_FUTURE_SKEW_MS + 1;
+        let mut retained = snapshot(now);
+        retained.fetched_at_ms = future;
+        let mut layer = AircraftLayerState::default();
+        layer.fold(retained);
+
+        assert!(layer.future_dated(now));
+        assert!(layer.stale(now));
+        assert_eq!(layer.age_ms(now), None);
+
+        let ctx = egui::Context::default();
+        let mut observed = PaintStats::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = ui.max_rect();
+                observed = paint_layer(ui.painter(), rect, &layer, now, |_lat, _lon| {
+                    Some(rect.center())
+                });
+            });
+        });
+        assert_eq!(observed.markers, 0);
+        assert!(observed.badge);
+    }
+
+    #[test]
+    fn future_track_timestamp_is_not_projected_as_current() {
+        let now = 1_000_000;
+        let mut retained = snapshot(now);
+        retained.aircraft[0].observed_at_ms = now + MAX_TIMESTAMP_FUTURE_SKEW_MS + 1;
+        let mut layer = AircraftLayerState::default();
+        layer.fold(retained);
+
+        let ctx = egui::Context::default();
+        let mut observed = PaintStats::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = ui.max_rect();
+                observed = paint_layer(ui.painter(), rect, &layer, now, |_lat, _lon| {
+                    Some(rect.center())
+                });
+            });
+        });
+        assert_eq!(observed.markers, 0);
+        assert!(observed.badge);
     }
 }

@@ -12,6 +12,10 @@ use mde_egui::Style;
 pub const SNAPSHOT_STALE_AFTER_MS: i64 = 5 * 60 * 1_000;
 /// Quake marker fade window required by the overlay catalog.
 pub const EVENT_FADE_AFTER_MS: i64 = 24 * 60 * 60 * 1_000;
+/// Allow a small amount of clock skew, but never present future data as live.
+const MAX_TIMESTAMP_FUTURE_SKEW_MS: i64 = 5_000;
+/// Keep one untrusted retained snapshot bounded at the paint boundary.
+const MAX_PAINTABLE_EVENTS: usize = 256;
 
 const PAGER_YELLOW: Color32 = Color32::from_rgb(0xF1, 0xC2, 0x32); // style-leak-ok: map-content-color
 const PAGER_ORANGE: Color32 = Color32::from_rgb(0xF2, 0x82, 0x22); // style-leak-ok: map-content-color
@@ -33,16 +37,29 @@ impl EarthquakeLayerState {
     /// Age since the last successful fetch or conditional validation.
     #[must_use]
     pub fn age_ms(&self, now_ms: i64) -> Option<i64> {
-        self.snapshot
-            .as_ref()
-            .map(|snapshot| (now_ms - snapshot.fetched_at_ms).max(0))
+        self.snapshot.as_ref().and_then(|snapshot| {
+            (!self.future_dated(now_ms))
+                .then(|| now_ms.saturating_sub(snapshot.fetched_at_ms).max(0))
+        })
+    }
+
+    /// Whether the retained snapshot timestamp is implausibly ahead of the
+    /// consumer clock. Clamping a future timestamp to age zero would make a
+    /// malformed or hostile mirror look indefinitely fresh.
+    #[must_use]
+    pub fn future_dated(&self, now_ms: i64) -> bool {
+        self.snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot.fetched_at_ms > now_ms.saturating_add(MAX_TIMESTAMP_FUTURE_SKEW_MS)
+        })
     }
 
     /// Whether the retained snapshot has missed five expected polls.
     #[must_use]
     pub fn stale(&self, now_ms: i64) -> bool {
-        self.age_ms(now_ms)
-            .is_some_and(|age| age > SNAPSHOT_STALE_AFTER_MS)
+        self.future_dated(now_ms)
+            || self
+                .age_ms(now_ms)
+                .is_some_and(|age| age > SNAPSHOT_STALE_AFTER_MS)
     }
 
     /// Attribution appended whenever the layer toggle is active.
@@ -81,27 +98,43 @@ where
 
     let mut stats = PaintStats::default();
     let stale = layer.stale(now_ms);
-    if let Some(snapshot) = &layer.snapshot {
-        let clip = rect.intersect(painter.clip_rect());
-        let marker_painter = painter.with_clip_rect(clip);
-        for event in &snapshot.events {
-            let event_age = (now_ms - event.occurred_at_ms).max(0);
-            if event_age > EVENT_FADE_AFTER_MS {
-                continue;
+    if !layer.future_dated(now_ms) {
+        if let Some(snapshot) = &layer.snapshot {
+            let clip = rect.intersect(painter.clip_rect());
+            let marker_painter = painter.with_clip_rect(clip);
+            for event in snapshot.events.iter().take(MAX_PAINTABLE_EVENTS) {
+                if !event_is_paintable(event, now_ms) {
+                    continue;
+                }
+                let event_age = now_ms.saturating_sub(event.occurred_at_ms).max(0);
+                if event_age > EVENT_FADE_AFTER_MS {
+                    continue;
+                }
+                let Some(point) = project(event.latitude, event.longitude) else {
+                    continue;
+                };
+                if !point.x.is_finite()
+                    || !point.y.is_finite()
+                    || !rect.expand(18.0).contains(point)
+                {
+                    continue;
+                }
+                paint_marker(&marker_painter, point, event, event_age, stale);
+                stats.markers += 1;
             }
-            let Some(point) = project(event.latitude, event.longitude) else {
-                continue;
-            };
-            if point.any_nan() || !rect.expand(18.0).contains(point) {
-                continue;
-            }
-            paint_marker(&marker_painter, point, event, event_age, stale);
-            stats.markers += 1;
         }
     }
     paint_age_badge(painter, rect, layer, now_ms);
     stats.badge = true;
     stats
+}
+
+fn event_is_paintable(event: &EarthquakeEvent, now_ms: i64) -> bool {
+    event.latitude.is_finite()
+        && (-90.0..=90.0).contains(&event.latitude)
+        && event.longitude.is_finite()
+        && (-180.0..=180.0).contains(&event.longitude)
+        && event.occurred_at_ms <= now_ms.saturating_add(MAX_TIMESTAMP_FUTURE_SKEW_MS)
 }
 
 fn paint_marker(
@@ -146,6 +179,10 @@ fn pager_color(alert: Option<PagerAlert>) -> Color32 {
 fn paint_age_badge(painter: &Painter, rect: Rect, layer: &EarthquakeLayerState, now_ms: i64) {
     let (label, tone) = match (&layer.snapshot, layer.age_ms(now_ms)) {
         (None, _) => ("USGS earthquakes · no data".to_string(), Style::TEXT_DIM),
+        (Some(_), _) if layer.future_dated(now_ms) => (
+            "USGS earthquakes · invalid future timestamp".to_string(),
+            Style::WARN,
+        ),
         (Some(snapshot), Some(age)) if age > SNAPSHOT_STALE_AFTER_MS => (
             format!("USGS earthquakes · STALE {}", age_label(age)),
             Style::WARN,
@@ -247,6 +284,32 @@ mod tests {
     }
 
     #[test]
+    fn future_snapshot_is_stale_and_does_not_paint_as_live() {
+        let now = 1_000_000;
+        let mut retained = snapshot(now);
+        retained.fetched_at_ms = now + MAX_TIMESTAMP_FUTURE_SKEW_MS + 1;
+        let mut layer = EarthquakeLayerState::default();
+        layer.fold(retained);
+
+        assert!(layer.future_dated(now));
+        assert!(layer.stale(now));
+        assert_eq!(layer.age_ms(now), None);
+
+        let ctx = egui::Context::default();
+        let mut observed = PaintStats::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = ui.max_rect();
+                observed = paint_layer(ui.painter(), rect, &layer, now, |_lat, _lon| {
+                    Some(rect.center())
+                });
+            });
+        });
+        assert_eq!(observed.markers, 0);
+        assert!(observed.badge);
+    }
+
+    #[test]
     fn painter_emits_real_marker_and_age_badge_without_basemap_fixture() {
         let now = 1_060_000;
         let mut layer = EarthquakeLayerState::default();
@@ -286,5 +349,101 @@ mod tests {
         assert_eq!(observed.markers, 0);
         assert!(observed.badge);
         assert!(layer.stale(now));
+    }
+
+    #[test]
+    fn malformed_coordinates_and_future_events_are_not_projected() {
+        let now = 1_000_000;
+        let mut retained = snapshot(now);
+        retained.events[0].latitude = f64::NAN;
+        retained.events.push(EarthquakeEvent {
+            latitude: 91.0,
+            ..retained.events[0].clone()
+        });
+        retained.events.push(EarthquakeEvent {
+            longitude: f64::INFINITY,
+            ..retained.events[0].clone()
+        });
+        retained.events.push(EarthquakeEvent {
+            occurred_at_ms: now + MAX_TIMESTAMP_FUTURE_SKEW_MS + 1,
+            latitude: 35.956,
+            longitude: -117.95,
+            ..retained.events[0].clone()
+        });
+        retained.events.push(EarthquakeEvent {
+            latitude: 35.956,
+            longitude: -117.95,
+            ..snapshot(now).events[0].clone()
+        });
+        let mut layer = EarthquakeLayerState::default();
+        layer.fold(retained);
+
+        let ctx = egui::Context::default();
+        let mut projected = 0;
+        let mut observed = PaintStats::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = ui.max_rect();
+                observed = paint_layer(ui.painter(), rect, &layer, now, |_lat, _lon| {
+                    projected += 1;
+                    Some(rect.center())
+                });
+            });
+        });
+        assert_eq!(projected, 1);
+        assert_eq!(observed.markers, 1);
+    }
+
+    #[test]
+    fn oversized_retained_snapshot_is_bounded_at_the_paint_boundary() {
+        let now = 1_000_000;
+        let base = snapshot(now).events[0].clone();
+        let mut oversized = snapshot(now);
+        oversized.events = (0..(MAX_PAINTABLE_EVENTS + 32))
+            .map(|index| EarthquakeEvent {
+                id: format!("event-{index}"),
+                ..base.clone()
+            })
+            .collect();
+        let mut layer = EarthquakeLayerState::default();
+        layer.fold(oversized);
+
+        let ctx = egui::Context::default();
+        let mut projected = 0;
+        let mut observed = PaintStats::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = ui.max_rect();
+                observed = paint_layer(ui.painter(), rect, &layer, now, |_lat, _lon| {
+                    projected += 1;
+                    Some(rect.center())
+                });
+            });
+        });
+        assert_eq!(projected, MAX_PAINTABLE_EVENTS);
+        assert_eq!(observed.markers, MAX_PAINTABLE_EVENTS);
+    }
+
+    #[test]
+    fn stale_snapshot_keeps_recent_marker_visible_for_honest_degraded_rendering() {
+        let now = 10_000_000;
+        let mut retained = snapshot(now - SNAPSHOT_STALE_AFTER_MS - 1);
+        retained.events[0].occurred_at_ms = now - 60_000;
+        let mut layer = EarthquakeLayerState::default();
+        layer.fold(retained);
+
+        let ctx = egui::Context::default();
+        let mut observed = PaintStats::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = ui.max_rect();
+                observed = paint_layer(ui.painter(), rect, &layer, now, |_lat, _lon| {
+                    Some(rect.center())
+                });
+            });
+        });
+        assert!(layer.stale(now));
+        assert_eq!(observed.markers, 1);
+        assert!(observed.badge);
     }
 }

@@ -1406,9 +1406,9 @@ mod tests {
         // WL-FUNC-012 OVERLAY-6 +1 rank-1 wildfire_overlay => ws 84.
         // WL-FUNC-012 OVERLAY-3 +1 rank-1 traffic_overlay => ws 85.
         // WL-FUNC-012 OVERLAY-7 +1 rank-1 air_quality_overlay => ws 86.
-        // WL-FUNC-012 OVERLAY-6 +1 rank-1 firms_overlay => ws 87.
+        // WL-FUNC-012 OVERLAY-6 +1 rank-1 firms_overlay => ws 88.
         assert_eq!(lh.len(), 49);
-        assert_eq!(ws.len(), 87);
+        assert_eq!(ws.len(), 88);
         // The universal storage mirror is now a listed census entry on BOTH roles
         // (it previously ran but was omitted from this diagnostic listing).
         assert!(

@@ -891,8 +891,16 @@ impl SpaceFold {
                 }
             }
             CollabEventKind::SpaceDeleted => {
-                if let Some(s) = self.space.as_mut() {
-                    s.deleted = true;
+                // Deletion is owner-gated on the command path.  Keep the same
+                // authorization boundary during replay: a well-formed signed
+                // event from a non-owner must not turn a space into a deleted
+                // read-model row.  This is deliberately checked against the
+                // canonical membership state already folded before this event,
+                // so a departed or demoted owner cannot delete later.
+                if self.is_present_owner(&env.actor) {
+                    if let Some(s) = self.space.as_mut() {
+                        s.deleted = true;
+                    }
                 }
             }
             CollabEventKind::SpaceArchived => {}
@@ -1156,6 +1164,12 @@ impl SpaceFold {
             CollabEventKind::AiSuggestionOffered { .. }
             | CollabEventKind::AiSuggestionResolved { .. } => {}
         }
+    }
+
+    fn is_present_owner(&self, actor: &ActorId) -> bool {
+        self.members
+            .get(actor.as_str())
+            .is_some_and(|(role, present)| *present && matches!(*role, SpaceRole::Owner))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1695,6 +1709,55 @@ mod tests {
             projection.project(std::slice::from_ref(&future_schema)),
             Err(CollabError::InvalidEvent(id)) if id == event_id(28)
         ));
+    }
+
+    #[test]
+    fn replay_does_not_let_a_non_owner_delete_a_space() {
+        let space = space_id(37);
+        let mut events = space_setup(space, "ops", 38);
+        events.push(event_as(
+            40,
+            space,
+            "alice",
+            3,
+            CollabEventKind::MemberJoined {
+                actor: ActorId::new("bob"),
+                role: SpaceRole::Member,
+            },
+        ));
+        events.push(event_as(41, space, "bob", 4, CollabEventKind::SpaceDeleted));
+
+        let mut projection = Projection::open_in_memory().expect("open projection");
+        projection
+            .project(&events)
+            .expect("project forged deletion");
+        let deleted: i64 = projection
+            .connection()
+            .query_row(
+                "SELECT deleted FROM spaces WHERE space_id = ?1",
+                [space.to_string()],
+                |row| row.get(0),
+            )
+            .expect("space row");
+        assert_eq!(deleted, 0, "a non-owner deletion must not materialize");
+
+        projection
+            .project(std::slice::from_ref(&event(
+                42,
+                space,
+                5,
+                CollabEventKind::SpaceDeleted,
+            )))
+            .expect("project owner deletion");
+        let deleted: i64 = projection
+            .connection()
+            .query_row(
+                "SELECT deleted FROM spaces WHERE space_id = ?1",
+                [space.to_string()],
+                |row| row.get(0),
+            )
+            .expect("space row after owner deletion");
+        assert_eq!(deleted, 1, "an owner deletion must still materialize");
     }
 
     #[test]

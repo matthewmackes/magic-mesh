@@ -5,7 +5,7 @@
 //! through [`CloudRunner::run_tool`] so production shells and tests share the
 //! exact same no-shell-interpolation path.
 
-use mackes_mesh_types::cloud::CloudReply;
+use mackes_mesh_types::cloud::{CloudReply, DeliveryType};
 
 use super::super::reconcile;
 use super::super::runner::{CloudRunOutcome, ToolRun};
@@ -30,6 +30,9 @@ pub(crate) fn handle_restart(
     let Some(instance) = validated_instance(body, SERVICE_SUFFIX) else {
         return invalid_instance_reply(verb_name, body, SERVICE_SUFFIX);
     };
+    if let Some(reply) = unmanaged_instance_reply(w, verb_name, body, instance) {
+        return reply;
+    }
     if let Some(reply) = authorization_refusal(w, verb_name, body, instance, raw) {
         return reply;
     }
@@ -61,6 +64,9 @@ pub(crate) fn handle_logs(w: &CloudWorker, verb_name: &str, body: &CloudActionBo
     let Some(instance) = validated_instance(body, SERVICE_SUFFIX) else {
         return invalid_instance_reply(verb_name, body, SERVICE_SUFFIX);
     };
+    if let Some(reply) = unmanaged_instance_reply(w, verb_name, body, instance) {
+        return reply;
+    }
     let unit = format!("{instance}{SERVICE_SUFFIX}");
     let args = [
         "--user",
@@ -117,6 +123,9 @@ pub(crate) fn handle_destroy(
     let Some(instance) = validated_instance(body, SERVICE_SUFFIX) else {
         return invalid_instance_reply(verb_name, body, SERVICE_SUFFIX);
     };
+    if let Some(reply) = unmanaged_instance_reply(w, verb_name, body, instance) {
+        return reply;
+    }
     if let Err(error) = super::super::path_key::file_stem("instance", instance, ".json") {
         return reject(verb_name, error);
     }
@@ -209,6 +218,32 @@ fn invalid_instance_reply(verb_name: &str, body: &CloudActionBody, suffix: &str)
     let error = validated_instance_name(instance, suffix)
         .expect_err("invalid_instance_reply is only called for invalid names");
     reject(verb_name, error)
+}
+
+/// Keep lifecycle verbs scoped to workloads the cloud worker actually manages.
+/// Name syntax alone is not ownership: without this check, a caller could ask
+/// `systemctl`/`journalctl` to operate on any valid-looking local unit. The
+/// desired-state slice is the worker's authoritative placement-scoped roster;
+/// malformed, foreign, or absent documents fail closed before auth/replay or
+/// backend execution.
+fn unmanaged_instance_reply(
+    w: &CloudWorker,
+    verb_name: &str,
+    body: &CloudActionBody,
+    instance: &str,
+) -> Option<CloudReply> {
+    let node = body.node.trim();
+    let managed = reconcile::read_desired_slice(&w.state_root, node)
+        .into_iter()
+        .any(|spec| spec.name == instance && spec.delivery_type == DeliveryType::ServiceContainer);
+    (!managed).then(|| {
+        reject(
+            verb_name,
+            format!(
+                "`{verb_name}` target `{instance}` is not a declared service_container on placement `{node}`"
+            ),
+        )
+    })
 }
 
 fn authorization_refusal(
@@ -313,10 +348,12 @@ mod tests {
     use std::sync::Arc;
 
     use mackes_mesh_types::cloud::{
-        CloudInstance, EndpointInterface, HealthState, LifecycleAction, ServiceHealth,
+        CloudInstance, DeliveryType, EndpointInterface, HealthState, LifecycleAction,
+        ServiceHealth, WorkloadSpec,
     };
 
     use super::super::super::gate::{ArmedToken, HmacTokenSigner};
+    use super::super::super::reconcile;
     use super::super::super::runner::fake::FakeRunner;
     use super::super::super::runner::{CloudRunOutcome, CloudRunner, ToolRun};
     use super::super::super::{now_ms, CloudWorker};
@@ -334,6 +371,24 @@ mod tests {
             .with_auth_root(root.join("auth"))
             .with_db_path(root.join("events.sqlite"))
             .with_bus_root(None)
+    }
+
+    fn declare_workload(root: &Path, node: &str, name: &str, delivery_type: DeliveryType) {
+        reconcile::write_desired_doc(
+            root,
+            &WorkloadSpec {
+                name: name.to_string(),
+                delivery_type,
+                node: node.to_string(),
+                vcpu: 0,
+                memory_mb: 0,
+                disk_gb: 0,
+                image: None,
+                network_isolation: false,
+                raw_hcl: None,
+            },
+        )
+        .unwrap();
     }
 
     struct OversizedLogRunner {
@@ -449,6 +504,7 @@ mod tests {
     fn restart_requires_auth_and_then_invokes_systemctl_with_literal_argv() {
         let runner = Arc::new(FakeRunner::default());
         let tmp = tempfile::tempdir().unwrap();
+        declare_workload(tmp.path(), "me", "web", DeliveryType::ServiceContainer);
         let w = worker(tmp.path(), runner.clone());
         let unsigned = serde_json::json!({
             "schema_version": 1,
@@ -484,6 +540,7 @@ mod tests {
             ..Default::default()
         });
         let tmp = tempfile::tempdir().unwrap();
+        declare_workload(tmp.path(), "me", "web", DeliveryType::ServiceContainer);
         let w = worker(tmp.path(), runner.clone());
         let reply = w.handle("container-logs", r#"{"node":"me","instance":"web"}"#);
         assert!(!reply.ok);
@@ -510,6 +567,7 @@ mod tests {
     #[test]
     fn logs_bound_oversized_utf8_backend_output() {
         let tmp = tempfile::tempdir().unwrap();
+        declare_workload(tmp.path(), "me", "web", DeliveryType::ServiceContainer);
         let w = CloudWorker::new("me".into(), "peer:me".into(), tmp.path().to_path_buf())
             .with_runner(Arc::new(OversizedLogRunner { fail: false }))
             .with_signer(Arc::new(signer()))
@@ -530,6 +588,7 @@ mod tests {
     #[test]
     fn unavailable_backend_error_is_bounded_before_reply() {
         let tmp = tempfile::tempdir().unwrap();
+        declare_workload(tmp.path(), "me", "web", DeliveryType::ServiceContainer);
         let w = CloudWorker::new("me".into(), "peer:me".into(), tmp.path().to_path_buf())
             .with_runner(Arc::new(OversizedLogRunner { fail: true }))
             .with_signer(Arc::new(signer()))
@@ -550,9 +609,8 @@ mod tests {
     fn destroy_requires_typed_confirmation_and_retracts_desired_entry_after_stop() {
         let runner = Arc::new(FakeRunner::default());
         let tmp = tempfile::tempdir().unwrap();
+        declare_workload(tmp.path(), "me", "web", DeliveryType::ServiceContainer);
         let desired = tmp.path().join("mcnf/cloud/desired/me");
-        std::fs::create_dir_all(&desired).unwrap();
-        std::fs::write(desired.join("web.json"), b"{}\n").unwrap();
         let w = worker(tmp.path(), runner.clone());
         let unsigned = serde_json::json!({
             "schema_version": 1,
@@ -590,9 +648,8 @@ mod tests {
             ..Default::default()
         });
         let tmp = tempfile::tempdir().unwrap();
+        declare_workload(tmp.path(), "me", "web", DeliveryType::ServiceContainer);
         let desired = tmp.path().join("mcnf/cloud/desired/me");
-        std::fs::create_dir_all(&desired).unwrap();
-        std::fs::write(desired.join("web.json"), b"{}\n").unwrap();
         let w = worker(tmp.path(), runner);
         let raw = armed_body(
             "container-destroy",
@@ -608,5 +665,37 @@ mod tests {
         assert!(!reply.ok);
         assert!(reply.error.is_some());
         assert!(desired.join("web.json").exists());
+    }
+
+    #[test]
+    fn undeclared_target_is_rejected_before_auth_and_does_not_burn_nonce() {
+        let runner = Arc::new(FakeRunner::default());
+        let tmp = tempfile::tempdir().unwrap();
+        declare_workload(tmp.path(), "me", "web", DeliveryType::ServiceVm);
+        let w = worker(tmp.path(), runner.clone());
+        let raw = armed_body(
+            "container-restart",
+            serde_json::json!({
+                "schema_version": 1,
+                "node": "me",
+                "instance": "web",
+            }),
+            "web",
+        );
+
+        let refused = w.handle("container-restart", &raw);
+        assert!(!refused.ok);
+        assert!(refused
+            .error
+            .as_deref()
+            .is_some_and(|error| { error.contains("not a declared service_container") }));
+        assert!(runner.tool_calls.lock().unwrap().is_empty());
+
+        // Once the same name is declared as a managed container, the exact same
+        // capability remains usable: the target gate ran before replay claim.
+        declare_workload(tmp.path(), "me", "web", DeliveryType::ServiceContainer);
+        let accepted = w.handle("container-restart", &raw);
+        assert!(accepted.ok, "error: {:?}", accepted.error);
+        assert_eq!(runner.tool_calls.lock().unwrap().len(), 1);
     }
 }

@@ -130,8 +130,7 @@ fn status_controls_metrics(bar: egui::Rect) -> (f32, f32) {
     let normal_width = STATUS_CONTROL_W;
     let normal_gap = STATUS_CONTROL_GAP;
     let min_gap = normal_gap.min((available / (count * 4.0)).max(0.0));
-    let control_width = normal_width
-        .min(((available - min_gap * (count - 1.0)) / count).max(1.0));
+    let control_width = normal_width.min(((available - min_gap * (count - 1.0)) / count).max(1.0));
     (control_width, min_gap)
 }
 
@@ -177,6 +176,27 @@ fn centered_clock_rect(bar: egui::Rect, time_width: f32) -> egui::Rect {
             (time_width + Style::SP_S * 2.0).min(bar.width()),
             bar.height(),
         ),
+    )
+}
+
+/// Keep the rollup cluster in the lane between the centered clock and the
+/// right-hand controls. On a normal workstation this returns the same
+/// right-aligned geometry as the Mac-like rail. On a narrow/headless surface,
+/// the lower-priority rollups are clipped to the remaining lane instead of
+/// stealing the clock's target or escaping the status bar.
+fn bounded_cluster_rect(
+    bar: egui::Rect,
+    clock: egui::Rect,
+    controls: egui::Rect,
+    cluster_width: f32,
+) -> egui::Rect {
+    let right = (controls.left() - Style::SP_XS).clamp(bar.left(), bar.right());
+    let left = (clock.right() + Style::SP_XS).clamp(bar.left(), right);
+    let available = (right - left).max(0.0);
+    let width = cluster_width.max(0.0).min(available);
+    egui::Rect::from_min_max(
+        egui::pos2(right - width, bar.top()),
+        egui::pos2(right, bar.bottom()),
     )
 }
 
@@ -312,6 +332,10 @@ pub fn mount(
         .sense(egui::Sense::hover())
         .show(ctx, |ui| {
             ui.set_min_size(bar.size());
+            // Area clips default to the full screen. The status bar is
+            // persistent chrome, so its children must not paint or advertise
+            // hit regions outside the reserved 24px band on narrow surfaces.
+            ui.set_clip_rect(bar);
             ui.set_opacity(t);
             strip(ui, bar, construct, segments, grades);
         });
@@ -398,11 +422,7 @@ fn strip(
             w
         })
         .collect();
-    let cluster_right = controls_rect.left() - Style::SP_XS;
-    let cluster_rect = egui::Rect::from_min_max(
-        egui::pos2(cluster_right - cluster_w, bar.top()),
-        egui::pos2(cluster_right, bar.bottom()),
-    );
+    let cluster_rect = bounded_cluster_rect(bar, clock_rect, controls_rect, cluster_w);
     let cluster = ui.interact(
         cluster_rect,
         status_bar_right_cluster_id(),
@@ -422,12 +442,13 @@ fn strip(
     if cluster.hovered() {
         painter.rect_filled(cluster_rect.shrink(2.0), Style::RADIUS_S, Style::SURFACE_HI);
     }
+    let cluster_painter = painter.with_clip_rect(cluster_rect);
     let mut x = cluster_rect.left();
     // The grade glyph — the letter over its band-coloured pip (the dock's
     // local-grade idiom, shrunk to the strip).
     let grade_center = egui::pos2(x + Style::SP_S, cy);
-    painter.circle_filled(grade_center, Style::SP_S, grade_color);
-    painter.text(
+    cluster_painter.circle_filled(grade_center, Style::SP_S, grade_color);
+    cluster_painter.text(
         grade_center,
         egui::Align2::CENTER_CENTER,
         &grade_text,
@@ -437,8 +458,8 @@ fn strip(
     x += grade_w;
     for (cell, w) in cells.iter().zip(cell_widths) {
         x += Style::SP_S;
-        painter.circle_filled(egui::pos2(x + dot_r, cy), dot_r, cell.dot);
-        let cell_galley = painter.layout_job(Style::typography_job(
+        cluster_painter.circle_filled(egui::pos2(x + dot_r, cy), dot_r, cell.dot);
+        let cell_galley = cluster_painter.layout_job(Style::typography_job(
             cell.text.clone(),
             time_role,
             if cell.present {
@@ -448,7 +469,7 @@ fn strip(
             },
             f32::INFINITY,
         ));
-        painter.galley(
+        cluster_painter.galley(
             egui::pos2(
                 x + dot_r * 2.0 + Style::SP_XS,
                 cy - cell_galley.size().y / 2.0,
@@ -562,11 +583,28 @@ mod tests {
         env: StatusBarEnv,
         events: Vec<egui::Event>,
     ) -> egui::FullOutput {
+        drive_at(
+            ctx,
+            construct,
+            segments,
+            grades,
+            env,
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0)),
+            events,
+        )
+    }
+
+    fn drive_at(
+        ctx: &egui::Context,
+        construct: &mut ConstructChrome,
+        segments: &StatusSegments,
+        grades: &NodeGrades,
+        env: StatusBarEnv,
+        screen: egui::Rect,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
         let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(1280.0, 800.0),
-            )),
+            screen_rect: Some(screen),
             events,
             ..Default::default()
         };
@@ -602,6 +640,24 @@ mod tests {
         grades: &NodeGrades,
         pos: egui::Pos2,
     ) {
+        click_at(
+            ctx,
+            construct,
+            segments,
+            grades,
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0)),
+            pos,
+        );
+    }
+
+    fn click_at(
+        ctx: &egui::Context,
+        construct: &mut ConstructChrome,
+        segments: &StatusSegments,
+        grades: &NodeGrades,
+        screen: egui::Rect,
+        pos: egui::Pos2,
+    ) {
         let press = egui::Event::PointerButton {
             pos,
             button: egui::PointerButton::Primary,
@@ -614,20 +670,22 @@ mod tests {
             pressed: false,
             modifiers: egui::Modifiers::default(),
         };
-        let _ = drive(
+        let _ = drive_at(
             ctx,
             construct,
             segments,
             grades,
             visible_env(),
+            screen,
             vec![egui::Event::PointerMoved(pos), press],
         );
-        let _ = drive(
+        let _ = drive_at(
             ctx,
             construct,
             segments,
             grades,
             visible_env(),
+            screen,
             vec![egui::Event::PointerMoved(pos), release],
         );
     }
@@ -870,7 +928,10 @@ mod tests {
 
         let controls = status_controls_rect(bar);
         assert!((controls.right() - (bar.right() - Style::SP_S)).abs() < f32::EPSILON);
-        assert!((status_controls_width() - (STATUS_CONTROL_W * 3.0 + STATUS_CONTROL_GAP * 2.0)).abs() < f32::EPSILON);
+        assert!(
+            (status_controls_width() - (STATUS_CONTROL_W * 3.0 + STATUS_CONTROL_GAP * 2.0)).abs()
+                < f32::EPSILON
+        );
         for (index, control) in StatusControl::ALL.into_iter().enumerate() {
             let rect = status_control_rect(bar, control);
             assert_eq!(rect.top(), bar.top());
@@ -891,13 +952,77 @@ mod tests {
     fn right_controls_remain_inside_a_narrow_top_bar() {
         let bar = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(72.0, STATUS_BAR_H));
         let controls = status_controls_rect(bar);
-        assert!(bar.contains_rect(controls), "cluster escaped narrow bar: {controls:?}");
+        assert!(
+            bar.contains_rect(controls),
+            "cluster escaped narrow bar: {controls:?}"
+        );
         let rects: Vec<_> = StatusControl::ALL
             .into_iter()
             .map(|control| status_control_rect(bar, control))
             .collect();
         assert!(rects.iter().all(|rect| bar.contains_rect(*rect)));
-        assert!(rects.windows(2).all(|pair| pair[0].right() <= pair[1].left()));
+        assert!(rects
+            .windows(2)
+            .all(|pair| pair[0].right() <= pair[1].left()));
+    }
+
+    #[test]
+    fn narrow_non_zero_origin_bounds_rollups_and_keeps_a_control_clickable() {
+        let screen = egui::Rect::from_min_size(egui::pos2(73.0, 41.0), egui::vec2(72.0, 120.0));
+        let bar =
+            egui::Rect::from_min_size(screen.left_top(), egui::vec2(screen.width(), STATUS_BAR_H));
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut construct = ConstructChrome::default();
+        let segments = StatusSegments::default();
+        let grades = NodeGrades::default();
+
+        for _ in 0..3 {
+            let _ = drive_at(
+                &ctx,
+                &mut construct,
+                &segments,
+                &grades,
+                visible_env(),
+                screen,
+                Vec::new(),
+            );
+        }
+
+        for (label, id) in [
+            ("clock", status_bar_clock_id()),
+            ("rollups", status_bar_right_cluster_id()),
+        ] {
+            let response = ctx
+                .read_response(id)
+                .unwrap_or_else(|| panic!("{label} target was not registered"));
+            assert!(
+                bar.contains_rect(response.rect),
+                "{label} target escaped the narrow status bar: {:?} vs {bar:?}",
+                response.rect
+            );
+        }
+        for control in StatusControl::ALL {
+            let response = ctx
+                .read_response(status_control_id(control))
+                .unwrap_or_else(|| panic!("{control:?} target was not registered"));
+            assert!(
+                bar.contains_rect(response.rect),
+                "{control:?} target escaped the narrow status bar: {:?} vs {bar:?}",
+                response.rect
+            );
+        }
+
+        let brightness = ctx
+            .read_response(status_control_id(StatusControl::Brightness))
+            .expect("brightness control registered")
+            .rect
+            .center();
+        click_at(&ctx, &mut construct, &segments, &grades, screen, brightness);
+        assert!(
+            construct.control_center_open,
+            "a non-zero-origin control target must remain clickable"
+        );
     }
 
     #[test]
