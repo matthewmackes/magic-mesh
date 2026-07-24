@@ -154,8 +154,8 @@ pub enum TagMember {
         /// Activity ULID per Portal-33.
         ulid: String,
     },
-    /// Zone within the platform (e.g. `taskbar-pinned`, `dock-tray`).
-    /// One designated tag drives the Dock pinned-zone per R3-Q88.
+    /// Zone within the platform (e.g. `navigation-pinned`, `navigation-tray`).
+    /// One designated tag drives the navigation pinned zone per R3-Q88.
     Zone {
         /// Zone identifier.
         name: String,

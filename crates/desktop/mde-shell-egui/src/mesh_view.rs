@@ -732,15 +732,16 @@ mod tests {
           "self": "ws-1",
           "online": 2,
           "total": 3,
-          "latest_version": "12.0.0",
+          "platform_version": "__PLATFORM_VERSION__",
+          "latest_version": "__PLATFORM_VERSION__",
           "nodes": [
-            {"hostname":"lh-01","overlay_ip":"10.42.0.1","presence":"online","role":"lighthouse","version":"12.0.0","update":false},
-            {"hostname":"ws-1","overlay_ip":"10.42.0.7","presence":"online","role":"workstation","version":"12.0.0","update":false},
+            {"hostname":"lh-01","overlay_ip":"10.42.0.1","presence":"online","role":"lighthouse","version":"__PLATFORM_VERSION__","update":false},
+            {"hostname":"ws-1","overlay_ip":"10.42.0.7","presence":"online","role":"workstation","version":"__PLATFORM_VERSION__","update":false},
             {"hostname":"ws-2","overlay_ip":"10.42.0.9","presence":"offline","role":"workstation","version":"11.4.1","update":true}
           ],
           "network": {"leader":"lh-01","lighthouse_ips":["10.42.0.1"],"cipher":"AES-256-GCM"}
         }"#
-        .to_string()
+        .replace("__PLATFORM_VERSION__", env!("CARGO_PKG_VERSION"))
     }
 
     /// A green (`ok:true`) self-test report body — the `SelfTestReport` JSON shape.
@@ -794,7 +795,10 @@ mod tests {
 
         // Per-node versions surface from the snapshot; the node the fleet has moved
         // past (`update:true`) is flagged stale so it's distinguishable (QBRAND-8).
-        assert_eq!(node("lh-01").version.as_deref(), Some("12.0.0"));
+        assert_eq!(
+            node("lh-01").version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
         assert_eq!(node("ws-2").version.as_deref(), Some("11.4.1"));
         assert!(node("ws-2").stale, "an older-build node is flagged stale");
         assert!(!node("ws-1").stale, "a current-build node is not stale");
@@ -841,7 +845,7 @@ mod tests {
             {"hostname":"b","presence":"online","role":"workstation"},
             {"hostname":"c","presence":"idle","role":"workstation"}
           ],"network":{"leader":"a"}}"#;
-        let state = project(snap);
+        let state = project(&snap);
         assert_eq!(state.nodes.len(), 3);
         assert!(state.nodes.iter().all(|n| n.role == Role::Workstation));
         // b and c link to the leader a (idle presence → Warn, still connected).
@@ -858,17 +862,18 @@ mod tests {
         // A `server`-tier node that isn't a lighthouse anchor folds to Role::Server;
         // a node with no version stays None (drawn as an honest "—", not fabricated).
         let snap = r#"{"nodes":[
-            {"hostname":"srv","overlay_ip":"10.42.0.20","presence":"online","role":"server","version":"12.0.0"},
+            {"hostname":"srv","overlay_ip":"10.42.0.20","presence":"online","role":"server","version":"__PLATFORM_VERSION__"},
             {"hostname":"ws","overlay_ip":"10.42.0.21","presence":"idle","role":"workstation"}
-          ],"network":{"leader":"srv"}}"#;
-        let state = project(snap);
+          ],"network":{"leader":"srv"}}"#
+            .replace("__PLATFORM_VERSION__", env!("CARGO_PKG_VERSION"));
+        let state = project(&snap);
         let srv = state
             .nodes
             .iter()
             .find(|n| n.id == "srv")
             .expect("server node");
         assert_eq!(srv.role, Role::Server);
-        assert_eq!(srv.version.as_deref(), Some("12.0.0"));
+        assert_eq!(srv.version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
         let ws = state
             .nodes
             .iter()

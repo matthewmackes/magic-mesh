@@ -40,11 +40,15 @@ pub mod device_inventory;
 // DEVMGR-8 — the device-control request/result §6 contract: the desktop shell
 // dispatches a typed privileged-op request, mackesd's `device_control` worker
 // executes it on the target node. Lands here so neither side depends on the other.
+/// WL-FUNC-012 / MG90 airspace survey snapshot shared by mackesd and Maps.
+pub mod airspace;
 pub mod device_control;
 /// WL-FUNC-012 / OVERLAY-10 — keyless USGS earthquake latest-wins snapshot
 /// shared by the workstation-side adapter and the Maps & Location surface.
 pub mod earthquake;
 pub mod exposure;
+/// WL-FUNC-012 / OVERLAY-6 — credential-gated NASA FIRMS hotspot snapshots.
+pub mod firms;
 /// WL-FUNC-012 / OVERLAY-2 — keyless IEM/NWS animated radar tiles.
 pub mod iem_radar;
 pub mod traffic;

@@ -11,6 +11,129 @@ use std::path::Path;
 
 use super::CaError;
 
+/// Open a regular file without following a symlink in the final path
+/// component. Nonblocking open prevents a hostile FIFO from stalling an
+/// authority read. Callers read from the returned descriptor so the inode
+/// checked is the inode consumed, closing the metadata/read replacement
+/// window.
+fn open_read_no_follow(path: &Path) -> Result<std::fs::File, CaError> {
+    use rustix::fs::{Mode, OFlags};
+
+    reject_symlinked_parents(path)?;
+    let fd = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| CaError::Io(format!("open {}: {e}", path.display())))?;
+    Ok(fd.into())
+}
+
+/// Open a sealed file exposed through the Nebula identity `current` switch.
+/// The switch is intentionally a symlink, but only to one owner-controlled,
+/// mode-0700 generation directory beneath the same identity root is allowed.
+fn open_generation_read(path: &Path) -> Result<Option<std::fs::File>, CaError> {
+    use rustix::fs::{Mode, OFlags};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::path::Component;
+
+    let Some(parent) = path.parent() else {
+        return Ok(None);
+    };
+    let parent_meta = std::fs::symlink_metadata(parent)
+        .map_err(|e| CaError::Io(format!("inspect {}: {e}", parent.display())))?;
+    if !parent_meta.file_type().is_symlink() {
+        return Ok(None);
+    }
+    if parent.file_name() != Some(std::ffi::OsStr::new("current")) {
+        return Err(CaError::Io(format!(
+            "refusing symlinked parent {}",
+            parent.display()
+        )));
+    }
+    let identity_root = parent
+        .parent()
+        .ok_or_else(|| CaError::Io(format!("{} has no identity root", path.display())))?;
+    reject_symlinked_parents(&identity_root.join(".sealed-leaf"))?;
+    let identity_meta = std::fs::symlink_metadata(identity_root).map_err(|e| {
+        CaError::Io(format!(
+            "inspect identity root {}: {e}",
+            identity_root.display()
+        ))
+    })?;
+    if !identity_meta.is_dir()
+        || identity_meta.uid() != rustix::process::getuid().as_raw()
+        || identity_meta.permissions().mode() & 0o777 != 0o700
+    {
+        return Err(CaError::Io(format!(
+            "unsafe identity root {}",
+            identity_root.display()
+        )));
+    }
+    let target = std::fs::read_link(parent)
+        .map_err(|e| CaError::Io(format!("read identity switch {}: {e}", parent.display())))?;
+    let target_components: Vec<_> = target.components().collect();
+    let [Component::Normal(generation_name)] = target_components.as_slice() else {
+        return Err(CaError::Io(format!(
+            "refusing untrusted identity switch {}",
+            parent.display()
+        )));
+    };
+    let generation_dir = identity_root.join(generation_name);
+    let generation_meta = std::fs::symlink_metadata(&generation_dir).map_err(|e| {
+        CaError::Io(format!(
+            "inspect identity generation {}: {e}",
+            generation_dir.display()
+        ))
+    })?;
+    if generation_meta.file_type().is_symlink()
+        || !generation_meta.is_dir()
+        || generation_meta.uid() != rustix::process::getuid().as_raw()
+        || generation_meta.permissions().mode() & 0o777 != 0o700
+    {
+        return Err(CaError::Io(format!(
+            "unsafe identity generation {}",
+            generation_dir.display()
+        )));
+    }
+    let leaf = path
+        .file_name()
+        .ok_or_else(|| CaError::Io(format!("{} has no filename", path.display())))?;
+    let resolved = generation_dir.join(leaf);
+    let fd = rustix::fs::open(
+        &resolved,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| CaError::Io(format!("open {}: {e}", path.display())))?;
+    Ok(Some(fd.into()))
+}
+
+/// Read a non-secret file without following an untrusted symlink at its leaf.
+///
+/// Canonical CA-pair and Nebula-identity generation links are accepted because
+/// [`open_sealed_read`] validates their complete owner-controlled shape. Other
+/// attacker-controlled links remain refused; this reader intentionally does
+/// not apply the private-key mode-0600 check.
+pub fn read_no_follow(path: &Path) -> Result<Vec<u8>, CaError> {
+    use std::io::Read as _;
+
+    let mut file = open_sealed_read(path)?;
+    let meta = file
+        .metadata()
+        .map_err(|e| CaError::Io(format!("metadata {}: {e}", path.display())))?;
+    if !meta.file_type().is_file() {
+        return Err(CaError::Io(format!(
+            "read {}: not a regular file",
+            path.display()
+        )));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|e| CaError::Io(format!("read {}: {e}", path.display())))?;
+    Ok(bytes)
+}
+
 /// Read a sealed file, enforcing mode-0600 + owner-matches-
 /// running-uid invariants. Returns the file content as bytes
 /// on success.
@@ -25,10 +148,120 @@ use super::CaError;
 ///     - the file's owner uid doesn't match the running
 ///       process's effective uid.
 pub fn read_sealed(path: &Path) -> Result<Vec<u8>, CaError> {
-    let meta = std::fs::metadata(path)
+    use std::io::Read as _;
+
+    let mut file = open_sealed_read(path)?;
+    let meta = file
+        .metadata()
         .map_err(|e| CaError::Io(format!("metadata {}: {e}", path.display())))?;
     enforce_seal(path, &meta)?;
-    std::fs::read(path).map_err(|e| CaError::Io(format!("read {}: {e}", path.display())))
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|e| CaError::Io(format!("read {}: {e}", path.display())))?;
+    Ok(bytes)
+}
+
+/// Open a sealed file directly, allowing only the generation-link shape owned
+/// by [`write_atomic_pair`]. A canonical `ca.key`/`ca.crt` view is a symlink by
+/// design; arbitrary symlinks remain refused. The pair and generation
+/// directories are checked before the final no-follow open, and every link
+/// target is a single relative name, so the resolver cannot leave the pair
+/// root or traverse `..`.
+fn open_sealed_read(path: &Path) -> Result<std::fs::File, CaError> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|e| CaError::Io(format!("inspect {}: {e}", path.display())))?;
+    if !metadata.file_type().is_symlink() {
+        if let Some(file) = open_generation_read(path)? {
+            return Ok(file);
+        }
+        return open_read_no_follow(path);
+    }
+    // Canonical pair views are symlinks at the leaf, but their containing
+    // directory must still be resolved without following a hostile parent.
+    reject_symlinked_parents(path)?;
+
+    use rustix::fs::{Mode, OFlags};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::path::Component;
+
+    let target = std::fs::read_link(path)
+        .map_err(|e| CaError::Io(format!("read sealed link {}: {e}", path.display())))?;
+    let components: Vec<_> = target.components().collect();
+    let [Component::Normal(pair_name), Component::Normal(current_name), Component::Normal(leaf)] =
+        components.as_slice()
+    else {
+        return Err(CaError::Io(format!(
+            "refusing untrusted sealed link {}",
+            path.display()
+        )));
+    };
+    let expected_leaf = path
+        .file_name()
+        .ok_or_else(|| CaError::Io(format!("{} has no filename", path.display())))?;
+    if *leaf != expected_leaf
+        || !pair_name.to_string_lossy().starts_with('.')
+        || !pair_name.to_string_lossy().ends_with(".pair")
+        || *current_name != std::ffi::OsStr::new("current")
+    {
+        return Err(CaError::Io(format!(
+            "refusing untrusted sealed link {}",
+            path.display()
+        )));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| CaError::Io(format!("{} has no parent", path.display())))?;
+    let pair_root = parent.join(pair_name);
+    let pair_meta = std::fs::symlink_metadata(&pair_root)
+        .map_err(|e| CaError::Io(format!("inspect sealed pair {}: {e}", pair_root.display())))?;
+    if pair_meta.file_type().is_symlink()
+        || !pair_meta.is_dir()
+        || pair_meta.uid() != rustix::process::getuid().as_raw()
+        || pair_meta.permissions().mode() & 0o777 != 0o700
+    {
+        return Err(CaError::Io(format!(
+            "unsafe sealed pair directory {}",
+            pair_root.display()
+        )));
+    }
+    let current = pair_root.join("current");
+    let generation = std::fs::read_link(&current)
+        .map_err(|e| CaError::Io(format!("read sealed generation {}: {e}", current.display())))?;
+    let generation_components: Vec<_> = generation.components().collect();
+    let [Component::Normal(generation_name)] = generation_components.as_slice() else {
+        return Err(CaError::Io(format!(
+            "refusing untrusted sealed generation {}",
+            current.display()
+        )));
+    };
+    let generation_dir = pair_root.join(generation_name);
+    let generation_meta = std::fs::symlink_metadata(&generation_dir).map_err(|e| {
+        CaError::Io(format!(
+            "inspect sealed generation {}: {e}",
+            generation_dir.display()
+        ))
+    })?;
+    if generation_meta.file_type().is_symlink()
+        || !generation_meta.is_dir()
+        || generation_meta.uid() != rustix::process::getuid().as_raw()
+        || generation_meta.permissions().mode() & 0o777 != 0o700
+    {
+        return Err(CaError::Io(format!(
+            "unsafe sealed generation directory {}",
+            generation_dir.display()
+        )));
+    }
+    // Open the generation that was validated above, rather than resolving the
+    // mutable `current` switch a second time after the check; this closes the
+    // switch-replacement window for the descriptor that is actually consumed.
+    let resolved = generation_dir.join(leaf);
+    let fd = rustix::fs::open(
+        &resolved,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| CaError::Io(format!("open {}: {e}", path.display())))?;
+    Ok(fd.into())
 }
 
 /// Write a sealed file with mode 0600. Creates the parent
@@ -42,6 +275,83 @@ pub fn write_sealed(path: &Path, bytes: &[u8]) -> Result<(), CaError> {
     write_atomic_sealed(path, bytes)
 }
 
+/// Create a sealed file without replacing an existing leaf.
+///
+/// The staged inode is written and synced before an atomic same-directory hard
+/// link creates `path`. A hard link (rather than `rename`) is intentional: a
+/// concurrent writer cannot replace an authority pin after this function has
+/// observed it as absent. Returns `true` when this call created the file and
+/// `false` when the destination already existed. The caller must inspect an
+/// existing file before treating it as equivalent.
+pub fn write_sealed_if_absent(path: &Path, bytes: &[u8]) -> Result<bool, CaError> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| CaError::Io(format!("{} has no parent directory", path.display())))?;
+    reject_symlinked_parents(path)?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| CaError::Io(format!("mkdir {}: {e}", parent.display())))?;
+    reject_symlinked_parents(path)?;
+    let leaf = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| CaError::Io(format!("invalid output filename {}", path.display())))?;
+    let (tmp, mut file) = (0..16)
+        .find_map(|_| {
+            let candidate = parent.join(format!(
+                ".{leaf}.create.{}.{:016x}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            match std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(&candidate)
+            {
+                Ok(file) => Some(Ok((candidate, file))),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+                Err(error) => Some(Err(CaError::Io(format!(
+                    "create temp {}: {error}",
+                    candidate.display()
+                )))),
+            }
+        })
+        .unwrap_or_else(|| Err(CaError::Io(format!("tempfile collisions for {}", path.display()))))?;
+
+    let result = (|| {
+        file.write_all(bytes)
+            .map_err(|e| CaError::Io(format!("write temp {}: {e}", tmp.display())))?;
+        file.sync_all()
+            .map_err(|e| CaError::Io(format!("fsync temp {}: {e}", tmp.display())))?;
+        drop(file);
+        match std::fs::hard_link(&tmp, path) {
+            Ok(()) => {
+                std::fs::remove_file(&tmp).map_err(|e| {
+                    CaError::Io(format!("remove staged sealed file {}: {e}", tmp.display()))
+                })?;
+                let parent_handle = std::fs::File::open(parent)
+                    .map_err(|e| CaError::Io(format!("open parent {}: {e}", parent.display())))?;
+                parent_handle
+                    .sync_all()
+                    .map_err(|e| CaError::Io(format!("fsync parent {}: {e}", parent.display())))?;
+                Ok(true)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(error) => Err(CaError::Io(format!(
+                "create sealed file {}: {error}",
+                path.display()
+            ))),
+        }
+    })();
+    if result.as_ref().map_or(true, |created| !created) {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
 /// Crash-durable same-directory replacement at mode 0600. A unique
 /// `create_new` tempfile avoids symlink-following and writer collisions; after
 /// the file is synced and renamed, the parent directory is synced so the rename
@@ -53,8 +363,10 @@ pub fn write_atomic_sealed(path: &Path, bytes: &[u8]) -> Result<(), CaError> {
     let parent = path
         .parent()
         .ok_or_else(|| CaError::Io(format!("{} has no parent directory", path.display())))?;
+    reject_symlinked_parents(path)?;
     std::fs::create_dir_all(parent)
         .map_err(|e| CaError::Io(format!("mkdir {}: {e}", parent.display())))?;
+    reject_symlinked_parents(path)?;
     let leaf = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -111,6 +423,43 @@ pub fn write_atomic_sealed(path: &Path, bytes: &[u8]) -> Result<(), CaError> {
     result
 }
 
+/// Refuse to resolve a CA/sealed-file path through a symlinked directory. The
+/// final file itself is intentionally handled by no-follow-open or atomic
+/// rename; only its parent components are checked here because `create_dir_all`
+/// otherwise follows a replicated directory link before those protections run.
+fn reject_symlinked_parents(path: &Path) -> Result<(), CaError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| CaError::Io(format!("{} has no parent directory", path.display())))?;
+    let mut current = std::path::PathBuf::new();
+    for component in parent.components() {
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(CaError::Io(format!(
+                    "refusing symlinked parent {}",
+                    current.display()
+                )));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(CaError::Io(format!(
+                    "sealed-file parent is not a directory: {}",
+                    current.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(CaError::Io(format!(
+                    "inspect sealed-file parent {}: {error}",
+                    current.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Install a public certificate and its private key behind one atomic
 /// generation switch. Once the two canonical symlinks have been initialized,
 /// readers can observe only the complete old generation or the complete new
@@ -135,8 +484,10 @@ pub fn write_atomic_pair(
             "atomic certificate/key pair paths must share one directory".into(),
         ));
     }
+    reject_symlinked_parents(public_path)?;
     std::fs::create_dir_all(parent)
         .map_err(|e| CaError::Io(format!("mkdir {}: {e}", parent.display())))?;
+    reject_symlinked_parents(public_path)?;
     let public_leaf = public_path
         .file_name()
         .and_then(|v| v.to_str())
@@ -310,6 +661,12 @@ fn install_pair_symlink(path: &Path, target: &Path) -> Result<(), CaError> {
 /// file is sealed (mode 0600 + owner matches current uid).
 fn enforce_seal(path: &Path, meta: &std::fs::Metadata) -> Result<(), CaError> {
     use std::os::unix::fs::MetadataExt;
+    if !meta.file_type().is_file() {
+        return Err(CaError::Io(format!(
+            "read {}: not a regular file",
+            path.display()
+        )));
+    }
     let mode = meta.mode() & 0o777;
     // Allow exactly 0o600 — reject anything else (including
     // 0o400 which would lock writes; the CA workflow needs
@@ -426,6 +783,67 @@ mod tests {
     }
 
     #[test]
+    fn read_rejects_a_hostile_symlink_without_reading_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let victim = tmp.path().join("victim");
+        let link = tmp.path().join("ca.crt");
+        std::fs::write(&victim, b"victim").expect("victim");
+        symlink(&victim, &link).expect("hostile symlink");
+
+        let error = read_no_follow(&link).expect_err("symlink must be refused");
+        assert!(error.to_string().contains("ca.crt"));
+        assert_eq!(std::fs::read(&victim).unwrap(), b"victim");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sealed_file_helpers_reject_a_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside");
+        let parent = tmp.path().join("ca");
+        symlink(outside.path(), &parent).expect("hostile parent");
+        let path = parent.join("ca.key");
+
+        assert!(write_atomic_sealed(&path, b"must-not-write").is_err());
+        assert!(read_no_follow(&path).is_err());
+        assert!(!outside.path().join("ca.key").exists());
+    }
+
+    #[test]
+    fn read_sealed_rejects_a_symlink_even_when_target_is_sealed() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let target = tmp.path().join("target.key");
+        let link = tmp.path().join("ca.key");
+        write_sealed(&target, b"secret").expect("sealed target");
+        symlink(&target, &link).expect("hostile symlink");
+
+        assert!(
+            read_sealed(&link).is_err(),
+            "sealed reads must not follow links"
+        );
+    }
+
+    #[test]
+    fn reads_reject_non_regular_authority_inputs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        assert!(
+            read_no_follow(tmp.path()).is_err(),
+            "directories are not inputs"
+        );
+        assert!(
+            read_sealed(tmp.path()).is_err(),
+            "directories are not secrets"
+        );
+    }
+
+    #[test]
     fn atomic_pair_switch_never_exposes_mixed_generations() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cert = tmp.path().join("ca.crt");
@@ -455,5 +873,45 @@ mod tests {
         assert!(error.to_string().contains("incomplete atomic pair"));
         assert_eq!(std::fs::read(&cert).unwrap(), b"legacy-cert");
         assert!(!key.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_pair_rejects_a_symlinked_parent_without_writing_outside() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let outside = tempfile::tempdir().expect("outside");
+        let parent = tmp.path().join("ca");
+        symlink(outside.path(), &parent).expect("hostile parent");
+        let cert = parent.join("ca.crt");
+        let key = parent.join("ca.key");
+
+        let error = write_atomic_pair(&cert, b"cert", &key, b"key")
+            .expect_err("pair writes must reject symlinked parents");
+        assert!(error.to_string().contains("refusing symlinked parent"));
+        assert!(!outside.path().join("ca.crt").exists());
+        assert!(!outside.path().join("ca.key").exists());
+        assert!(!outside.path().join(".ca.crt-ca.key.pair").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_pair_reads_reject_a_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let outside = tempfile::tempdir().expect("outside");
+        let real_cert = outside.path().join("ca.crt");
+        let real_key = outside.path().join("ca.key");
+        write_atomic_pair(&real_cert, b"cert", &real_key, b"key").expect("pair");
+
+        let alias = tmp.path().join("alias");
+        symlink(outside.path(), &alias).expect("hostile parent");
+        let cert = alias.join("ca.crt");
+        let key = alias.join("ca.key");
+
+        assert!(read_no_follow(&cert).is_err());
+        assert!(read_sealed(&key).is_err());
     }
 }

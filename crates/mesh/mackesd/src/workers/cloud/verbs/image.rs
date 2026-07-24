@@ -190,8 +190,12 @@ fn build(w: &CloudWorker, verb_name: &str, body: &ImageBuildBody, raw: &str) -> 
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or(DEFAULT_BOOTC_IMAGE);
+    // Keep the caller-controlled image reference positional. Without `--`, a
+    // reference beginning with `-` could be reinterpreted by the builder as a
+    // second option (for example a second `--output`), despite using literal
+    // argv rather than a shell.
     let args = [
-        "--type", "qcow2", "--rootfs", "xfs", "--output", &out_str, image_ref,
+        "--type", "qcow2", "--rootfs", "xfs", "--output", &out_str, "--", image_ref,
     ];
     match w.runner.run_tool(IMAGE_BUILDER_BIN, &args) {
         Err(spawn) => {
@@ -602,6 +606,7 @@ mod tests {
         let runner = Arc::new(FakeRunner::default());
         let w = armed_worker(tmp.path(), runner.clone());
         let raw = armed_request(serde_json::json!({
+            "schema_version": 1,
             "node": "me", "action": "build", "delivery_type": "desktop_vm", "version": "1.0"
         }));
         let reply = w.handle("image-build", &raw);
@@ -616,6 +621,12 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "bootc-image-builder");
         assert!(calls[0].1.iter().any(|a| a == "qcow2"));
+        let separator = calls[0]
+            .1
+            .iter()
+            .position(|a| a == "--")
+            .expect("image reference is after the end-of-options separator");
+        assert_eq!(calls[0].1.get(separator + 1).map(String::as_str), Some(DEFAULT_BOOTC_IMAGE));
         // The manifest landed in the SAME image_catalog store the existing lane uses.
         let manifests = load_manifests(tmp.path());
         assert_eq!(manifests.len(), 1);
@@ -626,13 +637,39 @@ mod tests {
     }
 
     #[test]
+    fn caller_image_reference_cannot_be_reinterpreted_as_a_builder_option() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runner = Arc::new(FakeRunner::default());
+        let w = armed_worker(tmp.path(), runner.clone());
+        let raw = armed_request(serde_json::json!({
+            "schema_version": 1,
+            "node": "me",
+            "action": "build",
+            "name": "gold",
+            "version": "1",
+            "image": "--output=/tmp/should-not-be-an-output"
+        }));
+
+        let reply = w.handle("image-build", &raw);
+        assert!(reply.ok, "gated:{:?} err:{:?}", reply.gated, reply.error);
+        let calls = runner.tool_calls.lock().unwrap();
+        let args = &calls[0].1;
+        let separator = args
+            .iter()
+            .position(|arg| arg == "--")
+            .expect("end-of-options separator");
+        assert_eq!(args.get(separator + 1).map(String::as_str), Some("--output=/tmp/should-not-be-an-output"));
+        assert_eq!(args[..separator].iter().filter(|arg| arg.as_str() == "--output").count(), 1);
+    }
+
+    #[test]
     fn build_without_a_token_stages_and_builds_nothing() {
         let tmp = tempfile::tempdir().unwrap();
         let runner = Arc::new(FakeRunner::default());
         let w = staged_worker(tmp.path(), runner.clone());
         let reply = w.handle(
             "image-build",
-            r#"{"node":"me","action":"build","name":"gold","version":"1"}"#,
+            r#"{"schema_version":1,"node":"me","action":"build","name":"gold","version":"1"}"#,
         );
         assert!(!reply.ok);
         assert!(reply.gated.unwrap().contains("gated"));
@@ -652,6 +689,7 @@ mod tests {
         });
         let w = armed_worker(tmp.path(), runner);
         let raw = armed_request(serde_json::json!({
+            "schema_version": 1,
             "node": "me", "action": "build", "name": "gold", "version": "1"
         }));
         let reply = w.handle("image-build", &raw);
@@ -669,6 +707,7 @@ mod tests {
         });
         let w = armed_worker(tmp.path(), runner);
         let raw = armed_request(serde_json::json!({
+            "schema_version": 1,
             "node": "me", "action": "build", "name": "gold", "version": "1"
         }));
         let reply = w.handle("image-build", &raw);
@@ -686,6 +725,7 @@ mod tests {
         });
         let w = armed_worker(tmp.path(), runner);
         let raw = armed_request(serde_json::json!({
+            "schema_version": 1,
             "node": "me", "action": "build", "name": "gold", "version": "1"
         }));
         let reply = w.handle("image-build", &raw);
@@ -698,6 +738,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let w = armed_worker(tmp.path(), Arc::new(FakeRunner::default()));
         let raw = armed_request(serde_json::json!({
+            "schema_version": 1,
             "node": "me", "action": "build", "delivery_type": "service_container"
         }));
         let reply = w.handle("image-build", &raw);
@@ -714,12 +755,15 @@ mod tests {
 
         for raw in [
             armed_request(serde_json::json!({
+                "schema_version": 1,
                 "node": "me", "action": "build", "name": absolute.as_ref(), "version": "1"
             })),
             armed_request(serde_json::json!({
+                "schema_version": 1,
                 "node": "me", "action": "build", "name": "gold", "version": "../escape"
             })),
             armed_request(serde_json::json!({
+                "schema_version": 1,
                 "node": "me", "action": "promote", "name": "gold", "version": "/tmp/escape"
             })),
         ] {
@@ -738,6 +782,7 @@ mod tests {
         // Build two versions of the same golden image.
         for v in ["1.0", "2.0"] {
             let raw = armed_request(serde_json::json!({
+                "schema_version": 1,
                 "node": "me", "action": "build", "name": "gold", "version": v
             }));
             assert!(w.handle("image-build", &raw).ok);
@@ -745,7 +790,10 @@ mod tests {
         // list needs no token, but it is still scoped to the selected node so
         // only that node's replicated image store answers.
         let rows = w
-            .handle("image-build", r#"{"node":"me","action":"list"}"#)
+            .handle(
+                "image-build",
+                r#"{"schema_version":1,"node":"me","action":"list"}"#,
+            )
             .images
             .expect("roster");
         assert_eq!(rows.len(), 1, "one row per image name");
@@ -753,12 +801,16 @@ mod tests {
 
         // Promote 1.0 → list now reflects that version + the promoted flag.
         let raw = armed_request(serde_json::json!({
+            "schema_version": 1,
             "node": "me", "action": "promote", "name": "gold", "version": "1.0"
         }));
         let pr = w.handle("image-build", &raw);
         assert!(pr.ok, "gated:{:?} err:{:?}", pr.gated, pr.error);
         let rows = w
-            .handle("image-build", r#"{"node":"me","action":"list"}"#)
+            .handle(
+                "image-build",
+                r#"{"schema_version":1,"node":"me","action":"list"}"#,
+            )
             .images
             .unwrap();
         assert!(rows[0].promoted, "the promoted version is flagged");
@@ -769,6 +821,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let w = armed_worker(tmp.path(), Arc::new(FakeRunner::default()));
         let raw = armed_request(serde_json::json!({
+            "schema_version": 1,
             "node": "me", "action": "build", "name": "gold", "version": "1.0"
         }));
         assert!(w.handle("image-build", &raw).ok);
@@ -777,6 +830,7 @@ mod tests {
             find_artifact(&images_dir(tmp.path()).join("gold").join("1.0")).expect("artifact");
         std::fs::write(&artifact, b"tampered-bytes").unwrap();
         let raw = armed_request(serde_json::json!({
+            "schema_version": 1,
             "node": "me", "action": "promote", "name": "gold", "version": "1.0"
         }));
         let reply = w.handle("image-build", &raw);
@@ -788,7 +842,10 @@ mod tests {
     fn an_unknown_action_is_an_honest_rejection() {
         let tmp = tempfile::tempdir().unwrap();
         let w = armed_worker(tmp.path(), Arc::new(FakeRunner::default()));
-        let reply = w.handle("image-build", r#"{"node":"me","action":"frobnicate"}"#);
+        let reply = w.handle(
+            "image-build",
+            r#"{"schema_version":1,"node":"me","action":"frobnicate"}"#,
+        );
         assert!(!reply.ok);
         assert!(reply.error.unwrap().contains("unknown image-build action"));
     }

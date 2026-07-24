@@ -32,13 +32,14 @@
 
 #![cfg(feature = "async-services")]
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 // The shared contract.
 use mackes_mesh_types::router_action::{
-    audit_log_path, clamp_confirm_min, read_audit, take_requests, write_result, AuditRecord,
-    RouterActionRequest, RouterActionResult,
+    action_dir, audit_log_path, clamp_confirm_min, read_audit, AuditRecord, RouterActionRequest,
+    RouterActionResult,
 };
 
 use super::{ShutdownToken, Worker};
@@ -178,6 +179,214 @@ fn decode_hex32(hex: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
+/// Request ids, target hosts, and result paths are all single replicated-file
+/// components. Keep the worker's drain/result side fail-closed even if a
+/// hand-built or relocated request bypassed the normal publisher.
+fn is_safe_path_component(value: &str) -> bool {
+    if value.is_empty()
+        || value == "."
+        || value == ".."
+        || value.trim() != value
+        || value
+            .chars()
+            .any(|ch| ch == '/' || ch == '\\' || ch.is_control())
+    {
+        return false;
+    }
+    let mut components = Path::new(value).components();
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+}
+
+/// Refuse symlinked/non-directory parent components before a replicated write
+/// or drain. The second check after mkdir closes the common pre-existing-root
+/// escape; the no-follow reader below covers the leaf read itself.
+fn reject_symlinked_parents(path: &Path) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
+    })?;
+    let mut current = PathBuf::new();
+    for component in parent.components() {
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "refusing symlinked replicated directory {}",
+                        current.display()
+                    ),
+                ));
+            }
+            Ok(meta) if !meta.is_dir() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotADirectory,
+                    format!(
+                        "replicated path component is not a directory: {}",
+                        current.display()
+                    ),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Crash-durable public replicated-file replacement. `create_new` makes a
+/// hostile pre-created temp symlink harmless; the final rename replaces a leaf
+/// symlink rather than following it.
+fn write_atomic_public(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
+    })?;
+    reject_symlinked_parents(path)?;
+    std::fs::create_dir_all(parent)?;
+    reject_symlinked_parents(path)?;
+    let leaf = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid filename"))?;
+
+    let mut created = None;
+    for _ in 0..16 {
+        let nonce = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp = parent.join(format!(".{leaf}.tmp.{}.{}", std::process::id(), nonce));
+        match std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o644)
+            .open(&tmp)
+        {
+            Ok(file) => {
+                created = Some((tmp, file));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let (tmp, mut file) = created.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "could not allocate a unique temp file for {}",
+                path.display()
+            ),
+        )
+    })?;
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)?;
+        std::fs::File::open(parent)?.sync_all()
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Unlike the shared display reader, the append path must not silently discard
+/// malformed rows: doing so would let the next append rewrite the chain and
+/// erase evidence of a damaged replicated audit file.
+fn read_audit_strict(path: &Path) -> std::io::Result<Vec<AuditRecord>> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut records = Vec::new();
+    for (line, raw_line) in raw.lines().enumerate() {
+        if raw_line.trim().is_empty() {
+            continue;
+        }
+        records.push(serde_json::from_str(raw_line).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("malformed router audit row {}: {error}", line + 1),
+            )
+        })?);
+    }
+    Ok(records)
+}
+
+fn write_result_checked(
+    workgroup_root: &Path,
+    target_host: &str,
+    result: &RouterActionResult,
+) -> std::io::Result<PathBuf> {
+    if !is_safe_path_component(target_host) || !is_safe_path_component(&result.id) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "unsafe router result target or id",
+        ));
+    }
+    let dir = action_dir(workgroup_root, target_host);
+    let path = dir.join(format!("{}.result.json", result.id));
+    let body = serde_json::to_vec_pretty(result)?;
+    write_atomic_public(&path, &body)?;
+    Ok(path)
+}
+
+/// Drain only regular, non-symlink request leaves from this node's directory.
+/// The shared reader is intentionally tolerant for UI display, but a privileged
+/// worker must not follow a replicated symlink into a local file.
+fn take_pending_requests(workgroup_root: &Path, self_host: &str) -> Vec<RouterActionRequest> {
+    if !is_safe_path_component(self_host) {
+        return Vec::new();
+    }
+    let dir = action_dir(workgroup_root, self_host);
+    if reject_symlinked_parents(&dir.join("placeholder")).is_err() {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if !name.ends_with(".json") || name.ends_with(".result.json") || name.starts_with('.') {
+            continue;
+        }
+        let Some(file_id) = name.strip_suffix(".json") else {
+            continue;
+        };
+        if !is_safe_path_component(file_id) {
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() || meta.file_type().is_symlink() {
+            continue;
+        }
+        let Ok(raw) = crate::ca::seal::read_no_follow(&path) else {
+            continue;
+        };
+        let Ok(raw) = String::from_utf8(raw) else {
+            continue;
+        };
+        let Ok(req) = serde_json::from_str::<RouterActionRequest>(&raw) else {
+            continue;
+        };
+        let _ = std::fs::remove_file(&path);
+        out.push(req);
+    }
+    out
+}
+
 /// SAFETY 3 — append one tamper-evident row to the router audit chain at
 /// `<root>/<host>/router-audit.jsonl` and return it. Reads the current head to
 /// chain on it (genesis = 32 zero bytes) via [`crate::audit::next_hash`], the same
@@ -199,7 +408,7 @@ pub fn append_audit(
     timestamp_ms: i64,
 ) -> std::io::Result<AuditRecord> {
     let path = audit_log_path(root, host);
-    let existing = read_audit(&path);
+    let existing = read_audit_strict(&path)?;
     let prev_hash = existing
         .last()
         .and_then(|r| decode_hex32(&r.hash))
@@ -232,9 +441,7 @@ pub fn append_audit(
     }
     body.push_str(&serde_json::to_string(&rec).map_err(std::io::Error::other)?);
     body.push('\n');
-    let tmp = path.with_extension("jsonl.tmp");
-    std::fs::write(&tmp, body.as_bytes())?;
-    std::fs::rename(&tmp, &path)?;
+    write_atomic_public(&path, body.as_bytes())?;
     Ok(rec)
 }
 
@@ -243,13 +450,32 @@ pub fn append_audit(
 /// each line's canonical payload — a rewritten field breaks the chain from there.
 #[must_use]
 pub fn verify_audit(path: &Path) -> VerifyOutcome {
-    let records = read_audit(path);
+    let records = match read_audit_strict(path) {
+        Ok(records) => records,
+        Err(_) => {
+            return VerifyOutcome::Break {
+                at_event: 0,
+                expected: [0u8; 32],
+                actual: [u8::MAX; 32],
+            };
+        }
+    };
     let mut rows = Vec::with_capacity(records.len());
     for rec in &records {
         let Ok(payload) = rec.hash_payload() else {
-            continue;
+            return VerifyOutcome::Break {
+                at_event: rec.seq,
+                expected: [0u8; 32],
+                actual: [u8::MAX; 32],
+            };
         };
-        let hash = decode_hex32(&rec.hash).unwrap_or([0u8; 32]);
+        let Some(hash) = decode_hex32(&rec.hash) else {
+            return VerifyOutcome::Break {
+                at_event: rec.seq,
+                expected: [0u8; 32],
+                actual: [0u8; 32],
+            };
+        };
         rows.push(AuditRow {
             event_id: rec.seq,
             payload,
@@ -371,6 +597,33 @@ impl RouterActionWorker {
     /// commit-confirm apply) → audit → typed result. Never panics; every path is
     /// audited.
     fn process(&self, req: &RouterActionRequest) -> RouterActionResult {
+        // The replicated directory is the transport, not the authority binding:
+        // a request copied into another node's directory must not be allowed to
+        // target that node's gateway. Also reject path-shaped ids before they can
+        // reach result publication.
+        if !is_safe_path_component(&self.self_hostname) {
+            return RouterActionResult::failed(
+                &req.id,
+                "local router-action hostname is not a safe path component",
+            );
+        }
+        if !is_safe_path_component(&req.id) {
+            self.audit(req, "refused-invalid");
+            return RouterActionResult::failed(
+                &req.id,
+                "router-action request id is not a safe path component — refused",
+            );
+        }
+        if req.target_host != self.self_hostname {
+            self.audit(req, "refused-target");
+            return RouterActionResult::failed(
+                &req.id,
+                format!(
+                    "request target `{}` does not match local router host `{}` — refused",
+                    req.target_host, self.self_hostname
+                ),
+            );
+        }
         match pre_apply_decision(req, self.live_enabled) {
             PreApply::Refused { reason, outcome } => {
                 self.audit(req, outcome);
@@ -428,7 +681,7 @@ impl RouterActionWorker {
 
     /// Drain + handle every request addressed to this host, writing each result back.
     fn execute_pending(&self) {
-        for req in take_requests(&self.workgroup_root, &self.self_hostname) {
+        for req in take_pending_requests(&self.workgroup_root, &self.self_hostname) {
             let result = self.process(&req);
             tracing::info!(
                 target: "mackesd::router_action",
@@ -436,7 +689,15 @@ impl RouterActionWorker {
                 ok = result.ok, staged = result.staged, reverted = result.reverted,
                 "router-action request handled (WL-RUN-006)"
             );
-            let _ = write_result(&self.workgroup_root, &self.self_hostname, &result);
+            if is_safe_path_component(&req.id) {
+                let _ = write_result_checked(&self.workgroup_root, &self.self_hostname, &result);
+            } else {
+                tracing::warn!(
+                    target: "mackesd::router_action",
+                    id = %req.id,
+                    "router-action result suppressed for unsafe request id"
+                );
+            }
         }
     }
 }

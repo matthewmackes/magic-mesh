@@ -52,9 +52,16 @@ pub const SOFTWARE_STUDIO: &str = "Software Studio: MDE";
 /// visible surfaces should prefer [`SOFTWARE_STUDIO`] and [`PRODUCT_RELEASE`].
 pub const PRODUCT_TAGLINE: &str = SOFTWARE_STUDIO;
 
-/// The visible release label. Internal Cargo/package versioning intentionally
-/// remains independent and continues to come from [`crate::brand::build`].
-pub const PRODUCT_RELEASE: &str = "Release 1.0 BETA";
+/// The platform release version, sourced from the workspace package version.
+///
+/// `Cargo.toml`'s `[workspace.package].version` is the only release-version
+/// literal in the repository. Cargo propagates it to this crate as
+/// `CARGO_PKG_VERSION`, so every visible surface gets the same value without a
+/// second hand-maintained copy.
+pub const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The visible release label derived from [`PRODUCT_VERSION`].
+pub const PRODUCT_RELEASE: &str = concat!("Release ", env!("CARGO_PKG_VERSION"));
 
 /// The workspace-relative path to the centered boot-splash lockup
 /// (`CONSTRUCT-WALLPAPER1.png`, design lock #11).
@@ -126,7 +133,7 @@ pub fn mark_rgba(size_px: u32, tint: [u8; 4]) -> Result<IconImage, IconError> {
 mod tests {
     use super::{
         lockup_horizontal, mark_rgba, mark_svg, wordmark_svg, IconId, PNG_MAGIC, PRODUCT_NAME,
-        PRODUCT_RELEASE, PRODUCT_TAGLINE, SOFTWARE_STUDIO, SPLASH_LOCKUP_ASSET,
+        PRODUCT_RELEASE, PRODUCT_TAGLINE, PRODUCT_VERSION, SOFTWARE_STUDIO, SPLASH_LOCKUP_ASSET,
     };
 
     #[test]
@@ -172,7 +179,11 @@ mod tests {
         assert_eq!(PRODUCT_NAME, "Construct");
         assert_eq!(SOFTWARE_STUDIO, "Software Studio: MDE");
         assert_eq!(PRODUCT_TAGLINE, SOFTWARE_STUDIO);
-        assert_eq!(PRODUCT_RELEASE, "Release 1.0 BETA");
+        assert_eq!(PRODUCT_VERSION, env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            PRODUCT_RELEASE,
+            concat!("Release ", env!("CARGO_PKG_VERSION"))
+        );
     }
 
     #[test]

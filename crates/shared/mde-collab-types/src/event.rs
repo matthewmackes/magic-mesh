@@ -254,6 +254,17 @@ pub enum CollabEventKind {
         /// Their new state.
         state: CallParticipantState,
     },
+    /// A participant's microphone mute state changed. This is separate from
+    /// [`CallParticipantChanged`] so the existing lifecycle event wire shape
+    /// remains stable while peers gain an explicit convergent mute fact.
+    CallParticipantMuted {
+        /// The call id.
+        call: CallId,
+        /// The participant whose media state changed.
+        actor: ActorId,
+        /// `true` when the participant is muted.
+        muted: bool,
+    },
     /// A call ended.
     CallEnded {
         /// The call id.
@@ -315,6 +326,7 @@ impl CollabEventKind {
             Self::TransferStateChanged { .. } => "transfer_state_changed",
             Self::CallStarted { .. } => "call_started",
             Self::CallParticipantChanged { .. } => "call_participant_changed",
+            Self::CallParticipantMuted { .. } => "call_participant_muted",
             Self::CallEnded { .. } => "call_ended",
             Self::AiSuggestionOffered { .. } => "ai_suggestion_offered",
             Self::AiSuggestionResolved { .. } => "ai_suggestion_resolved",

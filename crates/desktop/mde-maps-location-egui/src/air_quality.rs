@@ -10,6 +10,17 @@ use mde_egui::Style;
 pub const SNAPSHOT_STALE_AFTER_MS: i64 = 2 * 60 * 60 * 1_000;
 /// Observations older than six hours are removed instead of painted as current.
 pub const SNAPSHOT_DROP_AFTER_MS: i64 = 6 * 60 * 60 * 1_000;
+/// Maximum amount of retained Bus data the UI will inspect or paint per frame.
+/// This mirrors the adapter's retained-station cap, but is still required at
+/// this untrusted consumer boundary because a peer can publish malformed data.
+const MAX_PAINTABLE_STATIONS: usize = 256;
+/// Small clock skew tolerated when checking externally supplied timestamps.
+const MAX_TIMESTAMP_FUTURE_SKEW_MS: i64 = 5_000;
+/// AirNow permits an observation to lead its fetch by at most one hour.
+const MAX_OBSERVATION_FUTURE_SKEW_MS: i64 = 60 * 60 * 1_000;
+/// Keep the UI's station timestamp contract aligned with the adapter.
+const MAX_OBSERVATION_AGE_MS: i64 = SNAPSHOT_DROP_AFTER_MS;
+const MAX_PARAMETER_LABEL_CHARS: usize = 32;
 
 const AQI_GOOD: Color32 = Color32::from_rgb(0x00, 0xE4, 0x00); // style-leak-ok: map-content-color
 const AQI_MODERATE: Color32 = Color32::from_rgb(0xFF, 0xFF, 0x00); // style-leak-ok: map-content-color
@@ -38,6 +49,25 @@ impl AirQualityLayerState {
             .as_ref()?
             .fetched_at_ms
             .map(|fetched| now_ms.saturating_sub(fetched).max(0))
+    }
+
+    /// Whether a retained snapshot carries a timestamp too far in the future
+    /// to be presented as current.  A future timestamp otherwise becomes age
+    /// zero and can create a false-success overlay indefinitely.
+    #[must_use]
+    pub fn future_dated(&self, now_ms: i64) -> bool {
+        let Some(snapshot) = &self.snapshot else {
+            return false;
+        };
+        let latest_credible = now_ms.saturating_add(MAX_TIMESTAMP_FUTURE_SKEW_MS);
+        snapshot.published_at_ms > latest_credible
+            || snapshot.fetched_at_ms.is_some_and(|fetched| {
+                fetched > latest_credible
+                    || fetched
+                        > snapshot
+                            .published_at_ms
+                            .saturating_add(MAX_TIMESTAMP_FUTURE_SKEW_MS)
+            })
     }
 
     /// Whether observations are older than two hours.
@@ -100,17 +130,44 @@ where
     }
     let age = layer.age_ms(now_ms);
     let expired = age.is_some_and(|age| age > SNAPSHOT_DROP_AFTER_MS);
-    let dimmed = layer.stale(now_ms) || layer.paused();
+    let future_dated = layer.future_dated(now_ms);
+    let dimmed = layer.stale(now_ms) || layer.paused() || future_dated;
     let mut stats = PaintStats::default();
     let mut highest = None::<&AirQualityStation>;
-    if !expired {
+    if !expired && !future_dated {
         if let Some(snapshot) = &layer.snapshot {
+            // A station list is only paintable after a keyed AirNow fetch.  In
+            // particular, do not trust a malformed retained payload that
+            // carries stations alongside an explicit unconfigured or secret
+            // store error state.
+            let ready = snapshot.availability == AirNowAvailability::Ready
+                && snapshot.fetched_at_ms.is_some();
+            if !ready {
+                paint_status_badge(painter, rect, layer, now_ms, expired);
+                return PaintStats {
+                    badge: true,
+                    ..stats
+                };
+            }
+            let fetched_at_ms = snapshot
+                .fetched_at_ms
+                .expect("ready AirNow snapshot has a fetch timestamp");
             let marker_painter = painter.with_clip_rect(rect.intersect(painter.clip_rect()));
-            for station in &snapshot.stations {
+            for station in snapshot.stations.iter().take(MAX_PAINTABLE_STATIONS) {
+                // The worker rejects these values, but the shared Bus is an
+                // untrusted boundary.  Keep a malformed Ready envelope from
+                // feeding invalid coordinates or an out-of-contract AQI into
+                // the projection and painter.
+                if !station_is_paintable(station, fetched_at_ms, now_ms) {
+                    continue;
+                }
                 let Some(point) = project(station.latitude, station.longitude) else {
                     continue;
                 };
-                if point.any_nan() || !rect.expand(18.0).contains(point) {
+                if !point.x.is_finite()
+                    || !point.y.is_finite()
+                    || !rect.expand(18.0).contains(point)
+                {
                     continue;
                 }
                 paint_marker(&marker_painter, point, station, dimmed);
@@ -130,6 +187,48 @@ where
     paint_status_badge(painter, rect, layer, now_ms, expired);
     stats.badge = true;
     stats
+}
+
+fn station_is_paintable(station: &AirQualityStation, fetched_at_ms: i64, now_ms: i64) -> bool {
+    let latest_credible = now_ms.saturating_add(MAX_TIMESTAMP_FUTURE_SKEW_MS);
+    station.aqi <= 500
+        && station.latitude.is_finite()
+        && (-90.0..=90.0).contains(&station.latitude)
+        && station.longitude.is_finite()
+        && (-180.0..=180.0).contains(&station.longitude)
+        && station.distance_km.is_finite()
+        && station.distance_km >= 0.0
+        && station.observed_at_ms <= latest_credible
+        && station.observed_at_ms <= fetched_at_ms.saturating_add(MAX_OBSERVATION_FUTURE_SKEW_MS)
+        && fetched_at_ms.saturating_sub(station.observed_at_ms) <= MAX_OBSERVATION_AGE_MS
+}
+
+fn station_count_label(snapshot: &AirQualitySnapshot, now_ms: i64) -> String {
+    let count = snapshot.fetched_at_ms.map_or(0, |fetched_at_ms| {
+        snapshot
+            .stations
+            .iter()
+            .take(MAX_PAINTABLE_STATIONS)
+            .filter(|station| station_is_paintable(station, fetched_at_ms, now_ms))
+            .count()
+    });
+    if snapshot.stations.len() > MAX_PAINTABLE_STATIONS {
+        format!("{count}+ stations · capped")
+    } else {
+        format!("{count} stations")
+    }
+}
+
+fn bounded_parameter_label(parameter: &str) -> String {
+    let mut chars = parameter.chars();
+    let mut label = chars
+        .by_ref()
+        .take(MAX_PARAMETER_LABEL_CHARS)
+        .collect::<String>();
+    if chars.next().is_some() {
+        label.push('…');
+    }
+    label
 }
 
 fn paint_marker(painter: &Painter, point: Pos2, station: &AirQualityStation, dimmed: bool) {
@@ -158,7 +257,8 @@ fn paint_marker(painter: &Painter, point: Pos2, station: &AirQualityStation, dim
 fn paint_alert_banner(painter: &Painter, rect: Rect, station: &AirQualityStation) {
     let label = format!(
         "AirNow air quality alert · AQI {} · {}",
-        station.aqi, station.parameter
+        station.aqi,
+        bounded_parameter_label(&station.parameter)
     );
     let galley = painter.layout_no_wrap(label, FontId::proportional(Style::BODY), Color32::WHITE);
     let pad = egui::vec2(Style::SP_M, Style::SP_S);
@@ -194,6 +294,10 @@ fn paint_status_badge(
 ) {
     let (label, tone) = match (&layer.snapshot, layer.age_ms(now_ms)) {
         (None, _) => ("AirNow AQI · no data".to_string(), Style::TEXT_DIM),
+        (Some(_), _) if layer.future_dated(now_ms) => (
+            "AirNow AQI · invalid future timestamp".to_string(),
+            Style::DANGER,
+        ),
         (Some(snapshot), _) if snapshot.availability == AirNowAvailability::Unconfigured => (
             "AirNow AQI · API key not configured".to_string(),
             Style::WARN,
@@ -216,17 +320,17 @@ fn paint_status_badge(
         ),
         (Some(snapshot), Some(age)) if !snapshot.gaps.is_empty() => (
             format!(
-                "AirNow AQI · {} · {} stations · degraded",
+                "AirNow AQI · {} · {} · degraded",
                 age_label(age),
-                snapshot.stations.len()
+                station_count_label(snapshot, now_ms)
             ),
             Style::WARN,
         ),
         (Some(snapshot), Some(age)) => (
             format!(
-                "AirNow AQI · {} · {} stations",
+                "AirNow AQI · {} · {}",
                 age_label(age),
-                snapshot.stations.len()
+                station_count_label(snapshot, now_ms)
             ),
             Style::TEXT,
         ),
@@ -343,13 +447,217 @@ mod tests {
     #[test]
     fn unconfigured_state_is_explicit_and_never_paints_markers() {
         let mut layer = AirQualityLayerState::default();
-        layer.fold(AirQualitySnapshot::unconfigured("rig-1", 1));
+        let mut snapshot = AirQualitySnapshot::unconfigured("rig-1", 1);
+        // A malformed or stale retained body must not turn an explicit missing
+        // key state into painted AQI observations.
+        snapshot.stations.push(AirQualityStation {
+            id: "unexpected".to_string(),
+            name: None,
+            parameter: "PM2.5".to_string(),
+            aqi: 180,
+            latitude: 35.78,
+            longitude: -78.64,
+            distance_km: 1.0,
+            observed_at_ms: 1,
+        });
+        layer.fold(snapshot);
         assert!(layer.unconfigured());
         let ctx = egui::Context::default();
         let mut stats = PaintStats::default();
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 stats = paint_layer(ui.painter(), ui.max_rect(), &layer, 2, |_lat, _lon| None);
+            });
+        });
+        assert_eq!(stats.markers, 0);
+        assert!(!stats.alert_banner);
+        assert!(stats.badge);
+        let retained = layer.snapshot.as_ref().expect("unconfigured snapshot");
+        assert_eq!(retained.fetched_at_ms, None);
+        assert!(retained.query_latitude.is_none());
+        assert!(retained.query_longitude.is_none());
+    }
+
+    #[test]
+    fn secret_store_error_never_paints_retained_stations() {
+        let now = 1_000_000_000;
+        let mut snapshot = snapshot(now, 180);
+        snapshot.availability = AirNowAvailability::SecretStoreError;
+        snapshot
+            .gaps
+            .push("AirNow secret store unavailable".to_string());
+        let mut layer = AirQualityLayerState::default();
+        layer.fold(snapshot);
+        let ctx = egui::Context::default();
+        let mut stats = PaintStats::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = ui.max_rect();
+                stats = paint_layer(ui.painter(), rect, &layer, now, |_lat, _lon| {
+                    Some(rect.center())
+                });
+            });
+        });
+        assert_eq!(stats.markers, 0);
+        assert!(!stats.alert_banner);
+        assert!(stats.badge);
+    }
+
+    #[test]
+    fn malformed_ready_stations_are_not_projected_or_painted() {
+        let now = 1_000_000_000;
+        let mut snapshot = snapshot(now, 80);
+        snapshot.stations.extend([
+            AirQualityStation {
+                id: "nan-latitude".to_string(),
+                name: None,
+                parameter: "PM2.5".to_string(),
+                aqi: 500,
+                latitude: f64::NAN,
+                longitude: -78.64,
+                distance_km: 1.0,
+                observed_at_ms: now,
+            },
+            AirQualityStation {
+                id: "out-of-range-longitude".to_string(),
+                name: None,
+                parameter: "PM2.5".to_string(),
+                aqi: 500,
+                latitude: 35.78,
+                longitude: 181.0,
+                distance_km: 1.0,
+                observed_at_ms: now,
+            },
+            AirQualityStation {
+                id: "non-finite-distance".to_string(),
+                name: None,
+                parameter: "PM2.5".to_string(),
+                aqi: 500,
+                latitude: 35.78,
+                longitude: -78.64,
+                distance_km: f32::INFINITY,
+                observed_at_ms: now,
+            },
+            AirQualityStation {
+                id: "out-of-contract-aqi".to_string(),
+                name: None,
+                parameter: "PM2.5".to_string(),
+                aqi: 501,
+                latitude: 35.78,
+                longitude: -78.64,
+                distance_km: 1.0,
+                observed_at_ms: now,
+            },
+        ]);
+        let mut layer = AirQualityLayerState::default();
+        layer.fold(snapshot);
+        let ctx = egui::Context::default();
+        let mut projected = 0;
+        let mut stats = PaintStats::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = ui.max_rect();
+                stats = paint_layer(ui.painter(), rect, &layer, now, |_lat, _lon| {
+                    projected += 1;
+                    Some(rect.center())
+                });
+            });
+        });
+        assert_eq!(
+            projected, 1,
+            "only the validated station reaches projection"
+        );
+        assert_eq!(stats.markers, 1);
+        assert!(
+            !stats.alert_banner,
+            "rejected AQI must not drive the banner"
+        );
+        assert!(stats.badge);
+    }
+
+    #[test]
+    fn station_iteration_is_bounded_at_the_consumer_boundary() {
+        let now = 1_000_000_000;
+        let mut snapshot = AirQualitySnapshot::empty("rig-1", now, now, 35.78, -78.64, 100);
+        snapshot.stations = (0..MAX_PAINTABLE_STATIONS + 64)
+            .map(|index| AirQualityStation {
+                id: format!("station-{index}"),
+                name: None,
+                parameter: "PM2.5".to_string(),
+                aqi: 40,
+                latitude: 35.0 + index as f64 * 0.0001,
+                longitude: -78.0,
+                distance_km: 1.0,
+                observed_at_ms: now - 20 * 60_000,
+            })
+            .collect();
+        assert_eq!(
+            station_count_label(&snapshot, now),
+            "256+ stations · capped"
+        );
+
+        let mut layer = AirQualityLayerState::default();
+        layer.fold(snapshot);
+        let ctx = egui::Context::default();
+        let mut projected = 0;
+        let mut stats = PaintStats::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = ui.max_rect();
+                stats = paint_layer(ui.painter(), rect, &layer, now, |_lat, _lon| {
+                    projected += 1;
+                    Some(rect.center())
+                });
+            });
+        });
+        assert_eq!(projected, MAX_PAINTABLE_STATIONS);
+        assert_eq!(stats.markers, MAX_PAINTABLE_STATIONS);
+        assert!(!stats.alert_banner);
+    }
+
+    #[test]
+    fn future_dated_observation_is_not_presented_as_current() {
+        let now = 1_000_000_000;
+        let mut snapshot = snapshot(now, 200);
+        snapshot.stations[0].observed_at_ms = now + MAX_TIMESTAMP_FUTURE_SKEW_MS + 1;
+        let mut layer = AirQualityLayerState::default();
+        layer.fold(snapshot);
+        let ctx = egui::Context::default();
+        let mut projected = 0;
+        let mut stats = PaintStats::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = ui.max_rect();
+                stats = paint_layer(ui.painter(), rect, &layer, now, |_lat, _lon| {
+                    projected += 1;
+                    Some(rect.center())
+                });
+            });
+        });
+        assert_eq!(projected, 0);
+        assert_eq!(stats.markers, 0);
+        assert!(!stats.alert_banner);
+        assert!(stats.badge);
+    }
+
+    #[test]
+    fn future_dated_snapshot_is_not_presented_as_fresh() {
+        let now = 1_000_000_000;
+        let future = now + MAX_TIMESTAMP_FUTURE_SKEW_MS + 1;
+        let mut snapshot = snapshot(now, 200);
+        snapshot.published_at_ms = future;
+        snapshot.fetched_at_ms = Some(future);
+        let mut layer = AirQualityLayerState::default();
+        layer.fold(snapshot);
+        assert!(layer.future_dated(now));
+        let ctx = egui::Context::default();
+        let mut stats = PaintStats::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = ui.max_rect();
+                stats = paint_layer(ui.painter(), rect, &layer, now, |_lat, _lon| {
+                    Some(rect.center())
+                });
             });
         });
         assert_eq!(stats.markers, 0);

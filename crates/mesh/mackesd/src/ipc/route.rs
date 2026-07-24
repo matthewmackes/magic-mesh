@@ -26,6 +26,8 @@ use mackes_mesh_types::{exposure, peers, route_trace};
 /// black-holed target can't pin the responder thread (the bounded subprocess
 /// helper kills the child at this deadline). 20 hops × ~2 s wait fits inside it.
 const TRACEROUTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+/// Maximum DNS name length accepted by the best-effort traceroute seam.
+const MAX_TRACE_TARGET_CHARS: usize = 253;
 
 /// The route-trace responder — rooted at the shared workgroup root (where the
 /// exposure policy + peer directory live).
@@ -179,6 +181,43 @@ fn from_is_local(from: &str) -> bool {
     !from.is_empty() && !me.is_empty() && from.eq_ignore_ascii_case(&me)
 }
 
+/// Accept only an IP literal or a conventional DNS hostname as a traceroute
+/// target. The route responder is intentionally an open observation seam, but
+/// it still executes a root-owned helper on behalf of a shared-spool writer;
+/// rejecting control/whitespace, path-shaped, and overlong targets keeps that
+/// helper's positional argument a network destination rather than an
+/// accidental command/configuration channel.
+fn valid_trace_target(target: &str) -> bool {
+    if target.is_empty()
+        || target.len() > MAX_TRACE_TARGET_CHARS
+        || target.starts_with('-')
+        || target.ends_with('.')
+        || target
+            .chars()
+            .any(|character| character.is_ascii_control() || character.is_ascii_whitespace())
+    {
+        return false;
+    }
+    if target.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    target.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .as_bytes()
+                .first()
+                .is_some_and(|byte| byte.is_ascii_alphanumeric())
+            && label
+                .as_bytes()
+                .last()
+                .is_some_and(|byte| byte.is_ascii_alphanumeric())
+            && label
+                .bytes()
+                .all(|character| character.is_ascii_alphanumeric() || character == b'-')
+    })
+}
+
 /// Run a best-effort public `traceroute` from THIS node to `target` and return
 /// the typed hop list. `traceroute -n -w 2 -q 1 -m 20` (numeric, 2 s/hop, one
 /// query, 20-hop cap) — bounded by [`TRACEROUTE_TIMEOUT`] so a wedged tool can't
@@ -188,11 +227,11 @@ fn from_is_local(from: &str) -> bool {
 /// shapes match the rest of the daemon.
 fn run_public_traceroute(target: &str) -> route_trace::PublicTrace {
     let tool = "traceroute";
-    // Reject a malformed target up front: empty, or a flag-looking string
-    // (leading `-`) that traceroute would parse as an option, not a host. The
-    // body is mesh-cert-gated, but we never feed an arbitrary `-…` to the tool;
-    // an unusable target degrades to modeled, never errors (§2).
-    if target.is_empty() || target.starts_with('-') {
+    // Reject a malformed target up front. The body is a shared-spool
+    // observation request, so never feed an arbitrary path/control string to
+    // the root-owned helper; an unusable target degrades to modeled, never
+    // errors (§2).
+    if !valid_trace_target(target) {
         return route_trace::PublicTrace::unavailable(target, tool);
     }
     let mut cmd = std::process::Command::new(tool);
@@ -547,6 +586,29 @@ mod tests {
         assert!(build_reply(&s, "traceroute", Some("{ not json")).contains("bad json"));
         assert!(build_reply(&s, "traceroute", Some(&json!({}).to_string()))
             .contains("needs a 'target'"));
+    }
+
+    #[test]
+    fn traceroute_target_accepts_ip_and_dns_but_rejects_command_shaped_input() {
+        assert!(valid_trace_target("1.1.1.1"));
+        assert!(valid_trace_target("route.example.com"));
+        assert!(valid_trace_target("2001:db8::1"));
+        assert!(!valid_trace_target("-n"));
+        assert!(!valid_trace_target("route.example.com/path"));
+        assert!(!valid_trace_target("route.example.com\n"));
+        assert!(!valid_trace_target("-bad.example"));
+        assert!(!valid_trace_target(&format!(
+            "{}.example.com",
+            "a".repeat(64)
+        )));
+    }
+
+    #[test]
+    fn invalid_traceroute_target_degrades_to_unavailable_typed_result() {
+        let trace = run_public_traceroute("route.example.com/path");
+        assert!(!trace.available);
+        assert_eq!(trace.target, "route.example.com/path");
+        assert!(trace.hops.is_empty());
     }
 
     #[test]

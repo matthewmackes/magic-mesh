@@ -66,7 +66,7 @@ fn now_ms() -> i64 {
 
 /// The default Bus root (the persisted message tree), matching every mackesd worker.
 fn default_bus_root() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join("mde").join("bus"))
+    mde_bus::default_data_dir()
 }
 
 /// Publish a JSON state-mirror body in-process (no fork+exec of the `mde-bus` CLI),

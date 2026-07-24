@@ -183,7 +183,7 @@ impl ComputeEventToastWorker {
 }
 
 fn default_bus_root() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join("mde").join("bus"))
+    mde_bus::default_data_dir()
 }
 
 #[async_trait::async_trait]
@@ -261,5 +261,10 @@ mod tests {
         let argv = toast_argv("notify-send", &e);
         assert!(argv.iter().any(|a| a == "on 10.42.0.5"));
         assert!(argv.contains(&"--urgency=normal".to_string()));
+    }
+
+    #[test]
+    fn default_bus_root_uses_the_shared_mde_bus_resolver() {
+        assert_eq!(default_bus_root(), mde_bus::default_data_dir());
     }
 }

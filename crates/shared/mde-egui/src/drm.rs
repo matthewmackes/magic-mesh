@@ -1189,14 +1189,35 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
         .ok_or_else(|| DrmError::Egl("no EGL config with a recognized GBM format".into()))?;
 
     // GBM scanout surface — format chosen to match the selected EGL config.
-    let gbm_surface = gbm
-        .create_surface::<()>(
+    //
+    // A physical DRM capture must be able to consume the scanout bytes as a
+    // linear image. Intel's primary plane advertises both tiled and linear
+    // modifiers, but the default GBM allocation is allowed to choose a tiled
+    // modifier (which ordinary `kmsgrab` downloads do not detile). Keep the
+    // production default unchanged and expose an explicit proof switch that
+    // asks GBM for linear buffers. If a particular seat cannot allocate that
+    // combination, degrade to the normal allocation with a visible warning —
+    // the shell must still boot, but the caller must not mistake that fallback
+    // for a valid linear-pixel proof.
+    let base_surface_flags = gbm::BufferObjectFlags::SCANOUT | gbm::BufferObjectFlags::RENDERING;
+    let gbm_surface = if std::env::var_os("MDE_DRM_LINEAR_SCANOUT").is_some() {
+        match gbm.create_surface::<()>(
             wp,
             hp,
             gbm_format,
-            gbm::BufferObjectFlags::SCANOUT | gbm::BufferObjectFlags::RENDERING,
-        )
-        .map_err(|e| DrmError::Gbm(format!("gbm surface {wp}x{hp}: {e}")))?;
+            base_surface_flags | gbm::BufferObjectFlags::LINEAR,
+        ) {
+            Ok(surface) => surface,
+            Err(linear_error) => {
+                eprintln!("mde-egui: linear DRM proof allocation failed ({linear_error}); falling back to the driver's normal scanout modifier");
+                gbm.create_surface::<()>(wp, hp, gbm_format, base_surface_flags)
+                    .map_err(|e| DrmError::Gbm(format!("gbm surface {wp}x{hp}: {e}")))?
+            }
+        }
+    } else {
+        gbm.create_surface::<()>(wp, hp, gbm_format, base_surface_flags)
+            .map_err(|e| DrmError::Gbm(format!("gbm surface {wp}x{hp}: {e}")))?
+    };
 
     let context = egl
         .create_context(

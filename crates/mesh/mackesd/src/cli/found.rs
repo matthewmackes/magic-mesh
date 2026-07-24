@@ -4,6 +4,11 @@
 //! only the location moved.
 use crate::*;
 
+fn write_endpoint_key(path: &std::path::Path, key_pem: &[u8]) -> anyhow::Result<()> {
+    mackesd_core::ca::seal::write_atomic_sealed(path, key_pem)
+        .map_err(|e| anyhow::anyhow!("writing {}: {e}", path.display()))
+}
+
 /// ONBOARD-4 — the `found` verb. One-command founding lighthouse:
 /// mesh-init + `/enroll` endpoint identity + a v3 join line.
 pub fn run(
@@ -56,13 +61,14 @@ pub fn run(
     }
     std::fs::write(cert_path, identity.cert_pem.as_bytes())
         .with_context(|| format!("writing {DEFAULT_CERT_PATH}"))?;
-    std::fs::write(DEFAULT_KEY_PATH, identity.key_pem.as_bytes())
-        .with_context(|| format!("writing {DEFAULT_KEY_PATH}"))?;
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(DEFAULT_KEY_PATH, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("chmod 600 {DEFAULT_KEY_PATH}"))?;
-    }
+    // The endpoint private key is a root authority input. Install it with the
+    // same no-follow, create-at-0600, fsync-and-rename writer used by the CA
+    // and secret stores; plain `fs::write` would follow a planted symlink and
+    // expose the key briefly under the process umask before chmod.
+    write_endpoint_key(
+        std::path::Path::new(DEFAULT_KEY_PATH),
+        identity.key_pem.as_bytes(),
+    )?;
 
     // LIGHTHOUSE-10 — persist this lighthouse's PUBLIC underlay address so the
     // telemetry heartbeat can stamp it into the replicated peer directory; the
@@ -267,7 +273,7 @@ mod found_backoffice_tests {
     //! a bogus tier is caught by [`normalize_backoffice_tier`]) and that the flag
     //! is purely ADDITIVE — `found` without it parses byte-for-byte the same
     //! (the regression that found is unchanged when the flag is absent).
-    use super::normalize_backoffice_tier;
+    use super::{normalize_backoffice_tier, write_endpoint_key};
     use crate::{Cli, Cmd};
     use clap::Parser;
 
@@ -283,6 +289,33 @@ mod found_backoffice_tests {
                 "expected Cmd::Found, got something else: {:?}",
                 std::mem::discriminant(&other)
             ),
+        }
+    }
+
+    #[test]
+    fn endpoint_key_writer_replaces_a_leaf_without_following_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("enroll-endpoint.key");
+        let outside = tmp.path().join("outside");
+        std::fs::write(&outside, b"keep").expect("outside");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &path).expect("symlink");
+
+        write_endpoint_key(&path, b"new-private-key").expect("atomic key write");
+
+        assert_eq!(std::fs::read(&outside).expect("outside read"), b"keep");
+        assert_eq!(std::fs::read(&path).expect("key read"), b"new-private-key");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path)
+                    .expect("key metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
         }
     }
 

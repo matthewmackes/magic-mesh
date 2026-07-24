@@ -82,21 +82,27 @@ pub struct MbtaHttpProbe {
 
 impl MbtaHttpProbe {
     fn new(endpoint: String) -> io::Result<Self> {
+        let endpoint = validate_endpoint(&endpoint)?.to_string();
+        Self::from_endpoint(endpoint)
+    }
+
+    fn from_endpoint(endpoint: String) -> io::Result<Self> {
         let client = Client::builder()
             .timeout(HTTP_TIMEOUT)
             .user_agent(USER_AGENT)
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(io_other)?;
-        let url = reqwest::Url::parse(&endpoint).map_err(io_other)?;
-        if !matches!(url.scheme(), "http" | "https") {
-            return Err(io::Error::other("MBTA endpoint must use HTTP(S)"));
-        }
         Ok(Self {
             client,
             endpoint,
             validators: Mutex::new(Validators::default()),
         })
+    }
+
+    #[cfg(test)]
+    fn new_for_test(endpoint: String) -> io::Result<Self> {
+        Self::from_endpoint(endpoint)
     }
 }
 
@@ -203,6 +209,24 @@ fn read_bounded_body(response: &mut impl Read) -> io::Result<Vec<u8>> {
 
 fn io_other(error: impl std::fmt::Display) -> io::Error {
     io::Error::other(error.to_string())
+}
+
+fn validate_endpoint(value: &str) -> io::Result<reqwest::Url> {
+    let url = reqwest::Url::parse(value).map_err(io_other)?;
+    if url.scheme() != "https"
+        || url.host_str() != Some("cdn.mbta.com")
+        || url.port().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.path() != "/realtime/VehiclePositions.pb"
+    {
+        return Err(io::Error::other(
+            "MBTA endpoint is outside the strict official-feed allowlist",
+        ));
+    }
+    Ok(url)
 }
 
 // Minimal official GTFS-Realtime proto2 subset. Unknown fields are deliberately
@@ -712,7 +736,11 @@ impl TransitOverlayWorker {
                         },
                         point,
                     ) {
-                        self.publish_failure(last_good, "MBTA 304 point does not match last-good");
+                        self.publish_failure(
+                            last_good,
+                            point,
+                            "MBTA 304 point does not match last-good",
+                        );
                         return false;
                     }
                     snapshot.fetched_at_ms = now_ms();
@@ -726,13 +754,51 @@ impl TransitOverlayWorker {
                 }
             }
             Err(error) => {
-                self.publish_failure(last_good, &format!("MBTA refresh failed: {error}"));
+                self.publish_failure(
+                    last_good,
+                    point,
+                    &format!("MBTA refresh failed: {error}"),
+                );
                 false
             }
         }
     }
 
-    fn publish_failure(&self, last_good: &mut Option<TransitSnapshot>, gap: &str) {
+    fn publish_failure(
+        &self,
+        last_good: &mut Option<TransitSnapshot>,
+        point: TransitPoint,
+        gap: &str,
+    ) {
+        // A failed refresh after the vehicle has moved must not republish the
+        // old nearby set under the new query context. Publish an empty,
+        // degraded shell to retract the retained markers from the Bus, then
+        // drop the in-memory last-good so a later 304 cannot revive it.
+        if last_good.as_ref().is_some_and(|snapshot| {
+            !point_near(
+                TransitPoint {
+                    latitude: snapshot.query_latitude,
+                    longitude: snapshot.query_longitude,
+                },
+                point,
+            )
+        }) {
+            let previous = last_good.take().expect("last-good checked above");
+            let mut cleared = TransitSnapshot::empty(
+                &self.host,
+                now_ms(),
+                previous.feed_generated_at_ms,
+                &previous.feed_version,
+                point.latitude,
+                point.longitude,
+            );
+            push_gap(
+                &mut cleared.gaps,
+                format!("MBTA retained snapshot cleared after query point changed: {gap}"),
+            );
+            self.publish(&cleared);
+            return;
+        }
         if let Some(snapshot) = last_good {
             snapshot
                 .gaps
@@ -1062,6 +1128,21 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_requires_the_canonical_https_mbta_feed() {
+        assert!(validate_endpoint(DEFAULT_ENDPOINT).is_ok());
+        for hostile in [
+            "http://cdn.mbta.com/realtime/VehiclePositions.pb",
+            "https://cdn.mbta.com.evil.test/realtime/VehiclePositions.pb",
+            "https://user:password@cdn.mbta.com/realtime/VehiclePositions.pb",
+            "https://cdn.mbta.com:8443/realtime/VehiclePositions.pb",
+            "https://cdn.mbta.com/realtime/Other.pb",
+            "https://cdn.mbta.com/realtime/VehiclePositions.pb?token=secret",
+        ] {
+            assert!(validate_endpoint(hostile).is_err(), "accepted {hostile}");
+        }
+    }
+
+    #[test]
     fn http_client_refuses_redirects_before_contacting_target() {
         let target = TcpListener::bind("127.0.0.1:0").expect("target");
         target.set_nonblocking(true).expect("nonblocking");
@@ -1095,8 +1176,8 @@ mod tests {
             )
             .expect("response");
         });
-        let probe =
-            MbtaHttpProbe::new(format!("http://{redirect_addr}/vehicles.pb")).expect("client");
+        let probe = MbtaHttpProbe::new_for_test(format!("http://{redirect_addr}/vehicles.pb"))
+            .expect("client");
         let error = probe.fetch(point()).expect_err("redirect rejected");
         assert!(error.to_string().contains("redirects are disabled"));
         redirect_thread.join().expect("redirect join");
@@ -1138,10 +1219,45 @@ mod tests {
             longitude: point().longitude,
         };
         assert!(!worker.apply_result(Ok(PreparedResponse::NotModified), moved, &mut last));
-        let retained = last.expect("last-good retained");
-        assert_eq!(retained.query_latitude, point().latitude);
-        assert_eq!(retained.fetched_at_ms, NOW_MS);
-        assert!(retained.gaps.iter().any(|gap| gap.contains("304 point")));
+        assert!(last.is_none(), "moved query must clear the retained snapshot");
+    }
+
+    #[test]
+    fn failed_refresh_retracts_retained_vehicles_after_query_point_moves() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().to_path_buf();
+        let worker =
+            TransitOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+        let original = build_snapshot("rig-1", point(), &captured_feed(), NOW_MS).expect("parse");
+        let mut last = None;
+        assert!(worker.apply_result(Ok(PreparedResponse::Modified(original)), point(), &mut last));
+        let moved = TransitPoint {
+            latitude: point().latitude + 1.0,
+            longitude: point().longitude,
+        };
+
+        assert!(!worker.apply_result(
+            Err(io::Error::other("timeout")),
+            moved,
+            &mut last,
+        ));
+        assert!(last.is_none(), "the old snapshot must not remain in memory");
+
+        let row = Persist::open(root)
+            .expect("bus")
+            .read_latest(&transit_state_topic("rig-1"))
+            .expect("read")
+            .expect("clearing snapshot");
+        let body = row.body.expect("snapshot body");
+        let cleared: TransitSnapshot = serde_json::from_str(&body).expect("decode snapshot");
+        assert!(cleared.vehicles.is_empty());
+        assert_eq!(cleared.query_latitude, moved.latitude);
+        assert_eq!(cleared.query_longitude, moved.longitude);
+        assert_eq!(cleared.feed_generated_at_ms, NOW_MS);
+        assert!(cleared
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("retained snapshot cleared") && gap.contains("timeout")));
     }
 
     struct SlowProbe;

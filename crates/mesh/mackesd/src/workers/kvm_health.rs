@@ -7,7 +7,8 @@
 //! unlike `xcpng_health` (pinned to the dead `Xcpng` role) it is gated at the
 //! `run_serve` spawn site through the rank-0-default worker resolver, i.e. it
 //! runs everywhere. Each tick it probes every service in the canonical
-//! [`crate::kvm::KVM_SERVICES`] catalog (`systemctl is-active <unit>`) and
+//! [`crate::kvm::KVM_SERVICES`] catalog (`systemctl is-active <unit>`, with
+//! Fedora modular-unit alternatives) and
 //! publishes a whole-host health summary to the [`SERVICES_TOPIC`]
 //! (`event/kvm/services`) Mackes-Bus topic, so the Workbench Datacenter view +
 //! the alert lane see the live stack state without each consumer re-probing.
@@ -73,9 +74,11 @@ impl ServiceProbe for SystemctlProbe {
 pub struct ServiceHealth {
     /// Canonical service id ([`KvmService::id`]).
     pub id: String,
-    /// The systemd unit probed ([`KvmService::unit`]).
+    /// The active systemd unit selected from the catalog's probe candidates, or
+    /// the primary unit when all candidates are inactive.
     pub unit: String,
-    /// `true` when `systemctl is-active` reported the unit active.
+    /// `true` when `systemctl is-active` reported a primary or alternative unit
+    /// active.
     pub active: bool,
 }
 
@@ -126,10 +129,11 @@ impl KvmHealth {
     }
 }
 
-/// Pure health decision: probe each catalog service via the injected
-/// [`ServiceProbe`] and fold the results into a [`KvmHealth`] summary. The probe
-/// is the only seam to the outside, so this is fully unit-testable with a fake
-/// probe — no systemd, no bus, no clock (`now_ms` is passed in).
+/// Pure health decision: probe each catalog service's primary unit, then its
+/// Fedora modular alternatives when needed, via the injected [`ServiceProbe`]
+/// and fold the results into a [`KvmHealth`] summary. The probe is the only seam
+/// to the outside, so this is fully unit-testable with a fake probe — no
+/// systemd, no bus, no clock (`now_ms` is passed in).
 #[must_use]
 pub fn decide(
     host: &str,
@@ -139,10 +143,15 @@ pub fn decide(
 ) -> KvmHealth {
     let services: Vec<ServiceHealth> = catalog
         .iter()
-        .map(|s| ServiceHealth {
-            id: s.id.to_string(),
-            unit: s.unit.to_string(),
-            active: probe.is_active(s.unit),
+        .map(|s| {
+            let active_unit = s.probe_units().find(|unit| probe.is_active(unit));
+            ServiceHealth {
+                // `id` is the stable published identity. The selected systemd
+                // unit may vary by libvirt packaging layout.
+                id: s.id.to_string(),
+                unit: active_unit.unwrap_or(s.unit).to_string(),
+                active: active_unit.is_some(),
+            }
         })
         .collect();
     let total = services.len();
@@ -303,6 +312,7 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::collections::BTreeSet;
 
     /// Fake probe: a unit is active iff it's in the `active` set. Lets the pure
@@ -333,6 +343,29 @@ mod tests {
 
     impl ServiceProbe for FakeProbe {
         fn is_active(&self, unit: &str) -> bool {
+            self.active.contains(unit)
+        }
+    }
+
+    /// Probe fake that records candidate order, proving fallback stops at the
+    /// first active unit instead of probing every alias unconditionally.
+    struct RecordingProbe {
+        active: BTreeSet<String>,
+        calls: RefCell<Vec<String>>,
+    }
+
+    impl RecordingProbe {
+        fn with(units: &[&str]) -> Self {
+            Self {
+                active: units.iter().map(|u| (*u).to_string()).collect(),
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ServiceProbe for RecordingProbe {
+        fn is_active(&self, unit: &str) -> bool {
+            self.calls.borrow_mut().push(unit.to_string());
             self.active.contains(unit)
         }
     }
@@ -406,6 +439,94 @@ mod tests {
             assert_eq!(got.unit, want.unit);
             assert!(got.active);
         }
+    }
+
+    #[test]
+    fn decide_falls_back_to_modular_units_and_keeps_canonical_ids() {
+        let probe = RecordingProbe::with(&[
+            "virtqemud.service",
+            "podman.socket",
+            "NetworkManager.service",
+            "virtnetworkd.service",
+            "virtstoraged.service",
+        ]);
+        let h = decide("fedora-modular", KVM_SERVICES, &probe, 8);
+
+        assert!(h.all_healthy);
+        assert_eq!(
+            h.services.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            vec![
+                "libvirtd",
+                "podman",
+                "network-manager",
+                "libvirt-network",
+                "libvirt-storage",
+            ]
+        );
+        assert_eq!(
+            h.services
+                .iter()
+                .map(|s| s.unit.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "virtqemud.service",
+                "podman.socket",
+                "NetworkManager.service",
+                "virtnetworkd.service",
+                "virtstoraged.service",
+            ]
+        );
+        assert_eq!(
+            probe.calls.into_inner(),
+            vec![
+                "libvirtd.service",
+                "virtqemud.service",
+                "podman.socket",
+                "NetworkManager.service",
+                "libvirtd.service",
+                "virtnetworkd.service",
+                "libvirtd.service",
+                "virtstoraged.service",
+            ]
+        );
+    }
+
+    #[test]
+    fn decide_accepts_socket_activated_modular_libvirt() {
+        let probe = RecordingProbe::with(&[
+            "virtqemud.socket",
+            "virtnetworkd.socket",
+            "virtstoraged.socket",
+        ]);
+        let health = decide("fedora-socket-activated", KVM_SERVICES, &probe, 9);
+
+        assert_eq!(health.active, 3);
+        assert_eq!(
+            health
+                .services
+                .iter()
+                .map(|service| (service.id.as_str(), service.unit.as_str(), service.active))
+                .collect::<Vec<_>>(),
+            vec![
+                ("libvirtd", "virtqemud.socket", true),
+                ("podman", "podman.socket", false),
+                ("network-manager", "NetworkManager.service", false),
+                ("libvirt-network", "virtnetworkd.socket", true),
+                ("libvirt-storage", "virtstoraged.socket", true),
+            ]
+        );
+    }
+
+    #[test]
+    fn decide_prefers_legacy_unit_when_both_layouts_are_active() {
+        let probe = RecordingProbe::with(&["libvirtd.service", "virtqemud.service"]);
+        let service = crate::kvm::find_by_id("libvirtd").expect("present in catalog");
+        let h = decide("legacy-preferred", std::slice::from_ref(service), &probe, 9);
+
+        assert!(h.all_healthy);
+        assert_eq!(h.services[0].id, "libvirtd");
+        assert_eq!(h.services[0].unit, "libvirtd.service");
+        assert_eq!(probe.calls.into_inner(), vec!["libvirtd.service"]);
     }
 
     #[test]

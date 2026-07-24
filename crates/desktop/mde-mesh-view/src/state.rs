@@ -48,7 +48,7 @@ pub struct MeshNode {
     pub role: Role,
     /// Current health (node colour).
     pub health: Health,
-    /// The node's running build version (e.g. `"12.0.0"`), drawn as a sub-label
+    /// The node's running build version, drawn as a sub-label
     /// beneath the hostname. `None` ⇒ the source carries no version for this node
     /// and the widget draws an honest `—` placeholder rather than a fabricated
     /// build string.

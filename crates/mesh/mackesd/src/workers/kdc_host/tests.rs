@@ -557,6 +557,41 @@ fn browser_targeted_mpris_request_publishes_browser_media_control() {
 }
 
 #[test]
+fn browser_mpris_handoff_requires_an_active_browser_projection() {
+    let bus = tempdir().expect("temp bus");
+    let command = MprisBody {
+        player: "mde-browser".into(),
+        action: "Pause".into(),
+        ..Default::default()
+    };
+    assert_eq!(
+        apply_browser_mpris_media_command_if_active(Some(bus.path()), "node-a", &command, None,),
+        None,
+        "Browser-targeted phone commands must not fall back to an arbitrary tab"
+    );
+
+    let request = MprisRequestBody {
+        player: "browser".into(),
+        action: "Play".into(),
+        ..Default::default()
+    };
+    assert_eq!(
+        apply_browser_mpris_request_command_if_active(Some(bus.path()), "node-a", &request, None,),
+        None,
+        "Browser-targeted request commands must also fail closed"
+    );
+
+    let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+    assert!(
+        persist
+            .list_since("action/browser/media-control/node-a", None)
+            .expect("list media controls")
+            .is_empty(),
+        "no Browser projection means no control handoff"
+    );
+}
+
+#[test]
 fn mpris_request_command_reuses_the_transport_allowlist() {
     let control = RecordingMediaControl::default();
     assert_eq!(
@@ -828,6 +863,46 @@ fn connect_verb_version_and_empty_list() {
     ))
     .unwrap();
     assert_eq!(l["devices"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn connect_mutations_require_exact_body_capabilities_before_effects() {
+    let tmp = tempdir().unwrap();
+    let store = test_store(tmp.path());
+    let outbound = PendingSends::new();
+    let node = "testhost";
+    let unsigned = json!({
+        "schema_version": mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION,
+        "id": "d1",
+        "name": "Pixel",
+        "fingerprint": "AB:CD",
+        "paired_at": 123,
+    })
+    .to_string();
+    let auth_root = tmp.path().join("auth");
+    let authorizer =
+        ActionAuthorizer::for_test(b"connect-kdc-test-key", auth_root, 1_700_000_000_000);
+    let refused = authorize_connect_body(&unsigned, "pair", node, &authorizer);
+    assert!(refused.is_err(), "unsigned Connect mutation must refuse");
+    assert!(!store.is_paired("d1"));
+
+    let body = crate::ipc::action_auth::authorize_test_body(
+        b"connect-kdc-test-key",
+        &unsigned,
+        MutationContext {
+            verb: "connect-pair",
+            node,
+            target: "device:d1",
+        },
+        "connect-pair-once",
+        1_700_000_030_000,
+    );
+    let parsed = authorize_connect_body(&body, "pair", node, &authorizer).unwrap();
+    let reply: Value =
+        serde_json::from_str(&handle_connect_verb(&store, &outbound, "pair", &parsed)).unwrap();
+    assert_eq!(reply["ok"], true);
+    assert!(store.is_paired("d1"));
+    assert!(authorize_connect_body(&body, "pair", node, &authorizer).is_err());
 }
 
 #[test]

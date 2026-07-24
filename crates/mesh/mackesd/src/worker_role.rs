@@ -221,6 +221,10 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
     // A deliberate rank-0 census entry (the BUG-STORAGE-1 lesson), spawned via
     // spawn_tiered.
     WorkerSpec::tier("vehicle", 0, RestartPolicy::OnFailure),
+    // WL-FUNC-012 / MG90 airspace — workstation-side typed scanner mirror.
+    // The default worker publishes an explicit no-source state until a proven
+    // MG90 survey probe is configured; it never invents a scanner endpoint.
+    WorkerSpec::tier("airspace", 1, RestartPolicy::OnFailure),
     // WL-FUNC-012 / OVERLAY-10 — keyless USGS earthquake feed adapter.
     // Workstation-tier: external overlay bandwidth stays on the seated adapter
     // host; unconfigured nodes idle and publish nothing.
@@ -237,6 +241,9 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
     // WL-FUNC-012 / OVERLAY-7 — credential-gated US EPA AirNow AQI stations.
     // Workstation-tier; a missing sealed key publishes honest unconfigured state.
     WorkerSpec::tier("air_quality_overlay", 1, RestartPolicy::OnFailure),
+    // WL-FUNC-012 / OVERLAY-6 — credential-gated NASA FIRMS hotspot feed.
+    // Workstation-tier; a missing sealed key or fresh vehicle fix is explicit.
+    WorkerSpec::tier("firms_overlay", 1, RestartPolicy::OnFailure),
     // WL-FUNC-012 / OVERLAY-4 — keyless NWS hourly current/drive-ahead forecast.
     WorkerSpec::tier("nws_forecast_overlay", 1, RestartPolicy::OnFailure),
     // WL-FUNC-012 / OVERLAY-8 — point-scoped keyless adsb.lol aircraft feed.
@@ -1117,7 +1124,7 @@ mod tests {
         // traffic cameras => 82; OVERLAY-2 adds IEM NEXRAD radar => 83;
         // OVERLAY-6 adds keyless NIFC WFIGS perimeters => 84; OVERLAY-3 adds
         // keyless NCDOT TIMS events => 85; AirNow AQI => 86.
-        assert_eq!(WORKER_REGISTRY.len(), 86);
+        assert_eq!(WORKER_REGISTRY.len(), 88);
     }
 
     #[test]
@@ -1150,8 +1157,8 @@ mod tests {
         );
         assert_eq!(
             count(1),
-            37,
-            "Workstation = fleet (ansible-pull/app-sync/job_exec) + peer_app_launch (WL-UX-005) + clipboard_sync/remmina + music_autoconfig (MEDIA-8) + mesh_mount (FILEMGR-5) + bookmarks (BOOKMARKS-2) + adfilter (BOOKMARKS-7) + browser_policy (BOOKMARKS-8) + browser_passkeys (BROWSER-DD-6) + browser_session_sync (BROWSER-DD-7) + browser_read_aloud/browser_voice_command (BROWSER-DD-11) + browser_protocol/browser_share/browser_translate/browser_offline_cache/browser_security_update/browser_tab_suspend (BROWSER-DD-12) + seat_remote_input (KDC-MESH-6) + desktop_sources (CHOOSER-1) + media_sources (MEDIA-14) + media_server (MEDIA-15) + pty_broker (TERM-7) + transfers (TRANSFERS-1) + earthquake_overlay + nws_alert_overlay + nws_forecast_overlay + iem_radar_overlay + wildfire_overlay + traffic_overlay + air_quality_overlay + aircraft_overlay + transit_overlay + caltrans_camera_overlay (WL-FUNC-012 adapters) — kdc moved to rank 0 (KDC-MESH-3); peer_app_launch reconciled into this census (was an uncounted rank-1 entry)"
+            39,
+            "Workstation = fleet (ansible-pull/app-sync/job_exec) + peer_app_launch (WL-UX-005) + clipboard_sync/remmina + music_autoconfig (MEDIA-8) + mesh_mount (FILEMGR-5) + bookmarks (BOOKMARKS-2) + adfilter (BOOKMARKS-7) + browser_policy (BOOKMARKS-8) + browser_passkeys (BROWSER-DD-6) + browser_session_sync (BROWSER-DD-7) + browser_read_aloud/browser_voice_command (BROWSER-DD-11) + browser_protocol/browser_share/browser_translate/browser_offline_cache/browser_security_update/browser_tab_suspend (BROWSER-DD-12) + seat_remote_input (KDC-MESH-6) + desktop_sources (CHOOSER-1) + media_sources (MEDIA-14) + media_server (MEDIA-15) + pty_broker (TERM-7) + transfers (TRANSFERS-1) + airspace + earthquake_overlay + nws_alert_overlay + nws_forecast_overlay + iem_radar_overlay + wildfire_overlay + traffic_overlay + air_quality_overlay + firms_overlay + aircraft_overlay + transit_overlay + caltrans_camera_overlay (WL-FUNC-012 adapters) — kdc moved to rank 0 (KDC-MESH-3); peer_app_launch reconciled into this census (was an uncounted rank-1 entry)"
         );
         // No middle tier in the 2-role model — Workstation is the top rank.
         assert_eq!(
@@ -1399,8 +1406,9 @@ mod tests {
         // WL-FUNC-012 OVERLAY-6 +1 rank-1 wildfire_overlay => ws 84.
         // WL-FUNC-012 OVERLAY-3 +1 rank-1 traffic_overlay => ws 85.
         // WL-FUNC-012 OVERLAY-7 +1 rank-1 air_quality_overlay => ws 86.
+        // WL-FUNC-012 OVERLAY-6 +1 rank-1 firms_overlay => ws 87.
         assert_eq!(lh.len(), 49);
-        assert_eq!(ws.len(), 86);
+        assert_eq!(ws.len(), 87);
         // The universal storage mirror is now a listed census entry on BOTH roles
         // (it previously ran but was omitted from this diagnostic listing).
         assert!(

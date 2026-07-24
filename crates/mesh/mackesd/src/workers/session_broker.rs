@@ -41,7 +41,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use etcd_client::{GetOptions, PutOptions};
@@ -49,6 +49,7 @@ use mde_bus::persist::Persist;
 
 use super::scheduler::NodeId;
 use super::{ShutdownToken, Worker};
+use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
 use crate::substrate::etcd::{connect, session_key, SESSIONS_PREFIX, SESSION_LEASE_TTL_S};
 use crate::substrate::peers::block_on;
 
@@ -856,8 +857,15 @@ impl SessionLeaseOps for LiveSessionLeaseOps {
 // ─────────────────────────── bus + worker ───────────────────────────
 
 /// Read new [`ACTION_TOPIC`] messages since `cursor`, advancing it. A short sync
-/// open-read-drop (never crosses an `.await`), mirroring `scheduler`.
-fn read_new_actions(bus_root: &Path, cursor: &mut Option<String>) -> Vec<SessionRequest> {
+/// open-read-drop (never crosses an `.await`), mirroring `scheduler`. Every
+/// request is authenticated against the exact wire body before it is returned
+/// to the in-memory fold; malformed or unsigned bodies never reach
+/// [`apply_request`].
+fn read_new_actions(
+    bus_root: &Path,
+    cursor: &mut Option<String>,
+    authorizer: &ActionAuthorizer,
+) -> Vec<SessionRequest> {
     let Ok(persist) = Persist::open(bus_root.to_path_buf()) else {
         return vec![];
     };
@@ -868,14 +876,64 @@ fn read_new_actions(bus_root: &Path, cursor: &mut Option<String>) -> Vec<Session
     for msg in msgs {
         *cursor = Some(msg.ulid.clone());
         let body = msg.body.as_deref().unwrap_or("");
+        if !crate::ipc::body_within_cap(Some(body)) {
+            tracing::warn!(
+                ulid = %msg.ulid,
+                cap = crate::ipc::MAX_RPC_BODY_BYTES,
+                "session_broker: oversized session request refused"
+            );
+            continue;
+        }
         match parse_request(body) {
-            Ok(r) => out.push(r),
+            Ok(r) => {
+                if let Err(e) = authorize_session_request(authorizer, body, &r) {
+                    tracing::warn!(
+                        ulid = %msg.ulid,
+                        error = %e,
+                        "session_broker: unauthorized session request refused"
+                    );
+                    continue;
+                }
+                out.push(r);
+            }
             Err(e) => {
                 tracing::warn!(ulid = %msg.ulid, error = %e, "session_broker: bad session request");
             }
         }
     }
     out
+}
+
+/// Return the closed capability verb and stable session target for one typed
+/// request. The raw body is separately HMAC-bound, so this target prevents a
+/// valid capability for one session/op from being retargeted semantically.
+fn session_auth_target(request: &SessionRequest) -> (&'static str, String) {
+    match request {
+        SessionRequest::Open { id, .. } => ("vdi-session-open", format!("session:{id}")),
+        SessionRequest::Active { id } => ("vdi-session-active", format!("session:{id}")),
+        SessionRequest::Disconnect { id } => ("vdi-session-disconnect", format!("session:{id}")),
+        SessionRequest::Close { id } => ("vdi-session-close", format!("session:{id}")),
+    }
+}
+
+/// Verify a session action's exact body before any roster or shared-store
+/// mutation. Parsing the typed request is pure and happens only to derive the
+/// closed semantic target; the original body (including schema/token) is what
+/// the verifier authenticates.
+fn authorize_session_request(
+    authorizer: &ActionAuthorizer,
+    body: &str,
+    request: &SessionRequest,
+) -> Result<(), String> {
+    let (verb, target) = session_auth_target(request);
+    authorizer.authorize(
+        body,
+        MutationContext {
+            verb,
+            node: "vdi-session",
+            target: &target,
+        },
+    )
 }
 
 /// Fold new `action/vdi/session` messages (advancing `cursor`) into `roster`.
@@ -885,8 +943,9 @@ fn drain(
     bus_root: &Path,
     cursor: &mut Option<String>,
     roster: &mut BTreeMap<SessionId, VdiSession>,
+    authorizer: &ActionAuthorizer,
 ) {
-    for req in read_new_actions(bus_root, cursor) {
+    for req in read_new_actions(bus_root, cursor, authorizer) {
         if let Err(e) = apply_request(roster, req, now_ms()) {
             tracing::warn!(error = %e, "session_broker: dropping unresolvable session op");
         }
@@ -894,7 +953,7 @@ fn drain(
 }
 
 fn default_bus_root() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join("mde").join("bus"))
+    mde_bus::default_data_dir()
 }
 
 fn now_ms() -> u64 {
@@ -914,6 +973,9 @@ pub struct SessionBrokerWorker {
     leader_lock: PathBuf,
     /// Convergence cadence.
     poll: Duration,
+    /// Exact-body capability verifier for the privileged session-action lane.
+    /// Missing production credentials install a fail-closed verifier.
+    authorizer: Arc<ActionAuthorizer>,
     /// Bus root override (tests). `None` ⇒ [`default_bus_root`].
     bus_root_override: Option<PathBuf>,
 }
@@ -932,6 +994,7 @@ impl SessionBrokerWorker {
             node_id,
             leader_lock,
             poll: DEFAULT_POLL_INTERVAL,
+            authorizer: Arc::new(ActionAuthorizer::production()),
             bus_root_override: None,
         }
     }
@@ -955,6 +1018,15 @@ impl SessionBrokerWorker {
     #[must_use]
     pub fn with_store(mut self, store: Box<dyn SessionStore + Send + Sync>) -> Self {
         self.store = store;
+        self
+    }
+
+    /// Inject an isolated verifier and replay ledger for hostile action tests.
+    /// Production always uses the systemd-credential-backed authorizer.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
+        self.authorizer = authorizer;
         self
     }
 
@@ -1044,7 +1116,7 @@ impl Worker for SessionBrokerWorker {
             tokio::select! {
                 _ = tick.tick() => {
                     // Fold the whole session log into the roster, then converge.
-                    drain(&bus_root, &mut cursor, &mut roster);
+                    drain(&bus_root, &mut cursor, &mut roster, self.authorizer.as_ref());
                     self.converge(&mut roster);
                 }
                 () = shutdown.wait() => break,
@@ -1057,7 +1129,11 @@ impl Worker for SessionBrokerWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::action_auth::authorize_test_body;
     use std::sync::{Arc, Mutex};
+
+    const AUTH_KEY: &[u8] = b"vdi-session-action-auth-test-key";
+    const AUTH_NOW: i64 = 1_700_000_000_000;
 
     fn sess(id: &str, state: SessionState) -> VdiSession {
         VdiSession {
@@ -1323,6 +1399,65 @@ mod tests {
     fn topic_is_namespaced() {
         assert_eq!(ACTION_TOPIC, "action/vdi/session");
         assert!(ACTION_TOPIC.starts_with("action/"));
+    }
+
+    #[test]
+    fn unsigned_session_action_is_refused_before_roster_mutation() {
+        use mde_bus::hooks::config::Priority;
+
+        let bus = tempfile::tempdir().expect("temp bus");
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let unsigned = serde_json::json!({
+            "schema_version": 1,
+            "op": "open",
+            "id": "unsigned",
+            "serving_peer": "peer:a",
+            "vm_id": "vm-unsigned",
+            "client_peer": "peer:b"
+        })
+        .to_string();
+        persist
+            .write(ACTION_TOPIC, Priority::Default, None, Some(&unsigned))
+            .expect("write unsigned action");
+        let authorizer = ActionAuthorizer::for_test(AUTH_KEY, bus.path().join("auth"), AUTH_NOW);
+        let mut cursor = None;
+        let mut roster = BTreeMap::new();
+        drain(bus.path(), &mut cursor, &mut roster, &authorizer);
+        assert!(roster.is_empty(), "unsigned action mutated the roster");
+    }
+
+    #[test]
+    fn authorized_session_action_is_exact_body_bound_and_single_use() {
+        use mde_bus::hooks::config::Priority;
+
+        let bus = tempfile::tempdir().expect("temp bus");
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let req = SessionRequest::Open {
+            id: "authorized".into(),
+            serving_peer: "peer:a".into(),
+            vm_id: "vm-1".into(),
+            client_peer: "peer:b".into(),
+        };
+        let armed = signed_body(&req, "session-replay");
+        let tampered = armed.replace("vm-1", "vm-2");
+        // A body tamper must not consume the original capability. The original
+        // then succeeds once; publishing it again exercises the replay ledger.
+        for body in [&tampered, &armed, &armed] {
+            persist
+                .write(ACTION_TOPIC, Priority::Default, None, Some(body))
+                .expect("write session action");
+        }
+        let authorizer = ActionAuthorizer::for_test(AUTH_KEY, bus.path().join("auth"), AUTH_NOW);
+        let mut cursor = None;
+        let mut roster = BTreeMap::new();
+        drain(bus.path(), &mut cursor, &mut roster, &authorizer);
+        assert_eq!(roster.len(), 1);
+        assert_eq!(roster["authorized"].vm_id, "vm-1");
+    }
+
+    #[test]
+    fn default_bus_root_uses_the_shared_mde_bus_resolver() {
+        assert_eq!(default_bus_root(), mde_bus::default_data_dir());
     }
 
     // ── the store seam ──
@@ -1632,22 +1767,50 @@ mod tests {
 
     // ── worker wiring (seeded temp bus + injected fake store) ──
 
-    /// Seed a temp bus with `action/vdi/session` bodies and return its root.
-    fn seed_bus(reqs: &[SessionRequest]) -> PathBuf {
+    /// Sign one session request body for the isolated test authorizer.
+    fn signed_body(req: &SessionRequest, nonce: &str) -> String {
+        let mut unsigned = serde_json::to_value(req).expect("request value");
+        unsigned
+            .as_object_mut()
+            .expect("session request object")
+            .insert("schema_version".into(), serde_json::json!(1));
+        let unsigned = unsigned.to_string();
+        let (verb, target) = session_auth_target(req);
+        authorize_test_body(
+            AUTH_KEY,
+            &unsigned,
+            MutationContext {
+                verb,
+                node: "vdi-session",
+                target: &target,
+            },
+            nonce,
+            AUTH_NOW + 30_000,
+        )
+    }
+
+    /// Seed a temp bus with authorized `action/vdi/session` bodies and return
+    /// its root plus the matching isolated verifier.
+    fn seed_bus(reqs: &[SessionRequest]) -> (PathBuf, Arc<ActionAuthorizer>) {
         use mde_bus::hooks::config::Priority;
         let dir = std::env::temp_dir().join(format!("mde-sb-{}-{}", now_ms(), reqs.len()));
         let persist = Persist::open(dir.clone()).expect("open bus");
-        for r in reqs {
+        let authorizer = Arc::new(ActionAuthorizer::for_test(
+            AUTH_KEY,
+            dir.join("auth"),
+            AUTH_NOW,
+        ));
+        for (index, r) in reqs.iter().enumerate() {
             persist
                 .write(
                     ACTION_TOPIC,
                     Priority::Default,
                     None,
-                    Some(&serde_json::to_string(r).unwrap()),
+                    Some(&signed_body(r, &format!("seed-{index}"))),
                 )
                 .expect("write action");
         }
-        dir
+        (dir, authorizer)
     }
 
     #[tokio::test]
@@ -1655,7 +1818,7 @@ mod tests {
         // A session that opened + went active, drained off the bus and converged
         // into the injected store by the leader (a fresh temp workgroup ⇒ this
         // node wins the lock).
-        let bus = seed_bus(&[
+        let (bus, authorizer) = seed_bus(&[
             SessionRequest::Open {
                 id: "s1".into(),
                 serving_peer: "peer:a".into(),
@@ -1670,11 +1833,12 @@ mod tests {
         let rows = store.rows.clone();
         let w = SessionBrokerWorker::new(wg.clone(), "peer:a".to_string())
             .with_store(Box::new(store))
-            .with_bus_root(bus.clone());
+            .with_bus_root(bus.clone())
+            .with_authorizer(Arc::clone(&authorizer));
 
         let mut cursor = None;
         let mut roster = BTreeMap::new();
-        drain(&bus, &mut cursor, &mut roster);
+        drain(&bus, &mut cursor, &mut roster, authorizer.as_ref());
         assert_eq!(roster["s1"].state, SessionState::Active, "folded to Active");
         w.converge(&mut roster);
 
@@ -1699,13 +1863,14 @@ mod tests {
                     ACTION_TOPIC,
                     Priority::Default,
                     None,
-                    Some(
-                        &serde_json::to_string(&SessionRequest::Close { id: "s1".into() }).unwrap(),
-                    ),
+                    Some(&signed_body(
+                        &SessionRequest::Close { id: "s1".into() },
+                        "close-1",
+                    )),
                 )
                 .expect("write close");
         }
-        drain(&bus, &mut cursor2, &mut roster);
+        drain(&bus, &mut cursor2, &mut roster, authorizer.as_ref());
         w.converge(&mut roster);
         assert!(
             rows.lock().expect("rows mutex").is_empty(),

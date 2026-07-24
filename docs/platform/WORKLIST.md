@@ -16,24 +16,26 @@ review ledgers, and operator queues are evidence sources, not parallel trackers.
 When an item is completed or retired, move it to the archive with a disposition
 instead of leaving closed work in this file.
 
-## Current Snapshot - 2026-07-23 thin-lighthouse drain
+## Current Snapshot - 2026-07-24 security closure
 
-- **7 active epics:** 5 `Remaining`, 2 `Blocked`; no `Needs clarification`.
-- **P0:** WL-SEC-006 (stop replicating Nebula private keys), WL-SEC-007
-  (authenticate privileged shared-Bus mutations), WL-ARCH-007 (authorization
-  mint + direct lifecycle proof), and
-  WL-FUNC-011 (blocked on real media/LLM resources).
+- **6 active epics:** 6 `Remaining`, 0 `Blocked`; no `Needs clarification`.
+- **P0:** WL-SEC-006 (stop replicating Nebula private keys), WL-ARCH-007
+  (authorization mint + direct lifecycle proof), and
+  WL-FUNC-011 (optional real media/LLM evidence remains).
 - **In flight:** WL-FUNC-012 live map feeds, WL-UX-006 Construct, and WL-UX-007
   Car. The 2026-07-23 thin-lighthouse policy is enforced in role pinning,
   onboarding, install profiles, directory discovery, DNS, workers, secret
   scope minting, and both media helpers; no new lighthouse may carry media or
   file-sharing duties.
-- **Externally blocked:** WL-FUNC-011 needs a real second media peer/SIP path
-  plus an operator-sealed DigitalOcean model key; WL-SEC-006 needs a controlled
-  live Nebula identity rotation/reconnect/prune drill.
+- **Non-blocking external evidence:** WL-FUNC-011 still has optional real
+  second-peer/SIP and sealed DigitalOcean model demonstrations; WL-SEC-006
+  still has an optional controlled Nebula identity rotation/reconnect/prune
+  demonstration. These proofs no longer block autonomous implementation or
+  the active drain; missing resources remain explicitly recorded below.
 - **Archived by this takeover:** WL-DOC-004, WL-FUNC-013, and WL-RUN-008 in
   `docs/worklist-archive/2026-07-22-platform-takeover.md`; WL-SEC-005 and
-  WL-BUILD-004 are archived in `docs/worklist-archive/2026-07-23-thin-drain.md`.
+  WL-BUILD-004 are archived in `docs/worklist-archive/2026-07-23-thin-drain.md`;
+  WL-SEC-007 is archived in `docs/worklist-archive/2026-07-24-sec007-closure.md`.
 
 The reconciliation and operator-decision sections below are dated historical
 context. Their old counts and execution suggestions do not supersede this
@@ -166,6 +168,13 @@ Active count: 6 → adds **WL-UX-006** (Remaining), **WL-UX-007** (Remaining).
 - `Needs clarification` - valid concern, but the next implementation cannot be
   safely specified from current repo evidence alone.
 
+Proof classification (operator decision 2026-07-24): rendered screenshots,
+physical input round-trips, live peer demonstrations, and sealed external-feed
+exercises are evidence follow-ups, not blockers to autonomous implementation.
+They may remain listed in an epic's acceptance/evidence section, but they must
+not be the sole reason an epic carries `Blocked`; missing resources are named
+honestly without stopping the drain.
+
 ## Operator Decisions - 2026-07-16
 
 These decisions refine acceptance and sequencing for the active items below.
@@ -231,7 +240,7 @@ These decisions refine acceptance and sequencing for the active items below.
 
 ### WL-SEC-006 - Keep Nebula private keys local to their owning node
 
-- Status: Blocked
+- Status: Remaining
 - Progress (2026-07-23): code and hostile fixtures now meet the local-key design.
   Joining nodes generate their key locally; the signer consumes only the strict
   requester public key and verifies the returned certificate identity before an
@@ -241,13 +250,110 @@ These decisions refine acceptance and sequencing for the active items below.
   preflights/stages exact peer identities and transactionally rolls back. BigBoy
   farm proof is green: `mackesd` and `mde-enroll` all-target checks plus 204 focused
   CA/enrollment/client/endpoint/supervisor tests. The farm and available live seat
-  have neither `nebula` nor `nebula-cert`, so only the controlled live
-  rotation/reconnect/old-root-prune acceptance drill remains blocked; the
+  have neither `nebula` nor `nebula-cert`, so the controlled live
+  rotation/reconnect/old-root-prune demonstration remains unperformed; the
   operator has now torn down all DigitalOcean lighthouses, so there is no live
-  Nebula peer on which to run that drill. A post-policy attempt to provision a
-  fresh smallest-size DO lighthouse was refused by the API with HTTP 401, so no
-  cloud state changed; repeat the live drill after a valid operator token is
-  supplied.
+  Nebula peer on which to run it. A post-policy attempt to provision a fresh
+  smallest-size DO lighthouse was refused by the API with HTTP 401, so no cloud
+  state changed. This is a non-blocking evidence follow-up, not a reason to stop
+  autonomous implementation.
+- Progress (2026-07-24 DO access recheck): the configured `doctl` context still
+  returns HTTP 401, and the node-local secret store has no `do-token`; no
+  droplet or cloud state was created. A fresh operator token is still required
+  before the optional live Nebula demonstration can run.
+- Progress (2026-07-24 Eagle/.15 mesh recheck): Eagle is enrolled at
+  `10.42.0.3` and `.15` at `10.42.0.8`; both `nebula` and `mackesd` are active,
+  but handshakes to the existing lighthouse endpoints and between the two
+  seats time out. The supplied DigitalOcean token was tested directly and
+  remains rejected with HTTP 401, so the requested two new cloud lighthouses
+  cannot be created yet and no cloud state was changed.
+- Progress (2026-07-24 enrollment identity hardening): reusing an existing
+  enrollment identity now validates both files with no-follow semantics and
+  rejects arbitrary symlinks or private keys that are not owner-only `0600`.
+  Hostile symlink/permission fixtures are included; the focused farm endpoint
+  suite passes 16/16. Live Nebula rotation remains optional evidence.
+- Progress (2026-07-24 DOM0 lighthouse recovery): the hermetic four-node
+  `test-lighthouse-replace.sh` drill ran on XEN-HOME-SERVICES with the thin
+  lighthouse RPM and passed 33/33. It proved found/join, Nebula overlay
+  reachability, three-member etcd health, survivor behavior after lighthouse
+  loss, stale-member removal, replacement-lighthouse enrollment, replacement
+  quorum health, and the absence of FUSE/LizardFS mounts. This clears the
+  lighthouse lifecycle proof in the controlled environment; production
+  DigitalOcean provisioning remains optional external evidence pending a valid
+  operator token.
+- Progress (2026-07-24 supervisor stale-state hardening): leadership state now
+  advances only after a successful promote/demote transition, so a failed role
+  change remains pending for the next retry instead of being recorded as applied.
+  The role marker is owner-checked, schema-bound, node-bound, and lease-checked;
+  the focused supervisor farm suite is green at 34/34.
+- Progress (2026-07-24 sealed-file race hardening): CA and Nebula sealed-file
+  reads now consume the descriptor opened after no-follow validation, canonical
+  generation switches are validated as owner-controlled, and atomic writes
+  reject symlinked parent components before and after directory creation. The
+  hostile sealed-file farm suite is green at 14/14; the optional live Nebula
+  rotation/reconnect/prune demonstration remains external evidence.
+- Progress (2026-07-24 CSR freshness hardening): Nebula enrollment now rejects
+  CSRs older than five minutes or future-dated beyond five minutes before bearer
+  consumption or signing. Stale and future-dated regressions are covered; the
+  focused BigBoy enrollment gate is green at 45/45.
+- Progress (2026-07-24 supervisor bootstrap hardening): lighthouse promotion now
+  follows the authoritative non-expired lease even when the local role marker
+  is missing, then creates or repairs that marker. The mirror puller retains the
+  stricter marker-plus-lease contract. The focused BigBoy supervisor suite is
+  green at 35/35, including clean-marker promotion and failed-demotion retry.
+- Progress (2026-07-24 public-lighthouse installer onboarding): `mde-enroll` now
+  carries the closed public roster `lighthouse1.ephemeral.team` through
+  `lighthouse3.ephemeral.team`, keeps the pasted mesh token and its CA pin
+  immutable, and permits only those roster names or an explicitly entered pinned
+  IPv4 override. Unknown hostnames and missing pins fail closed before network
+  access. The focused roster suite is green at 6/6 and the installer binaries
+  pass the farm compile check; live DNS/DO provisioning remains external.
+- Progress (2026-07-24 Nebula roster export hardening): public roster export now
+  fails closed above 4,096 rows while retaining deterministic ordering, epoch
+  de-duplication, and revoked-certificate filtering. The focused BigBoy roster
+  suite is green at 7/7.
+- Progress (2026-07-24 federation UI capability hardening): federation accept,
+  revoke, and refuse-mint mutations now publish schema-versioned, root-scoped
+  armed capability envelopes with validated action targets; pending offers
+  visibly report remaining lifetime and fail closed to an expired/degraded state
+  when the expiry or clock is unavailable. The focused BigBoy shell federation
+  suite is green at 9/9.
+- Progress (2026-07-24 federation status-boundary hardening): the runtime
+  federation status mirror now bounds display fields and row counts and enforces
+  the shared 64 KiB Bus body limit while retaining total counts and explicit
+  truncation indicators. The focused BigBoy federation-enforcer suite is green
+  at 7/7.
+- Progress (2026-07-24 enrollment response-boundary hardening): the
+  fingerprint-pinned enrollment client now caps complete HTTP responses at
+  256 KiB before bundle parsing, using a one-byte-over-cap read to fail closed
+  without unbounded buffering. The focused `.170` `nebula_enroll_client` suite
+  is green at 12/12.
+- Progress (2026-07-24 relay-authority pin hardening): root-local authority pins
+  now require canonical lowercase hexadecimal, are created once with atomic
+  no-overwrite semantics, and reject hostile symlink targets; replicated bundle
+  reads use the no-follow sealed-file path. The focused BigBoy CA/authority
+  suite is green at 16/16. Live Nebula rotation remains optional external
+  evidence.
+- Progress (2026-07-24 enrollment authority-binding hardening): when a
+  lighthouse response carries a relay-authority private seed, the enrollment
+  client now derives and verifies its public key against the authenticated
+  bundle before persisting the local trust anchor. The focused BigBoy client
+  suite is green at 13/13; live Nebula/credential proof remains external.
+- Progress (2026-07-24 enrollment HTTP framing hardening): the TLS enrollment
+  parser now rejects repeated `Content-Length` headers instead of allowing an
+  ambiguous framing choice to reach the JSON handler, and enrollment responses
+  carry `Cache-Control: no-store` because authenticated lighthouse responses can
+  contain sensitive CA material. The focused BigBoy endpoint suite is green at
+  17/17; live Nebula/lighthouse evidence remains external.
+- Progress (2026-07-24 bearer grammar hardening): Nebula join-token validation
+  now rejects nonterminal `=` padding inside bearer values and accepts padding
+  only at the terminal boundary, preventing malformed bearer text from reaching
+  enrollment. The focused `.50` enrollment suite is green at 46/46; live
+  Nebula/lighthouse evidence remains external.
+- Progress (2026-07-24 backup-armor boundary hardening): CA backup dearmor now
+  rejects an incomplete export without its exact END delimiter, while the
+  existing validated transactional restore remains covered. The focused `.50`
+  CA backup gate is green at 29/29; live CA restore evidence remains external.
 - Priority: P0
 - Complexity: Epic
 - Problem: Any node able to read replicated enrollment bundles can obtain other
@@ -281,143 +387,6 @@ These decisions refine acceptance and sequencing for the active items below.
 - Origin or merged source IDs: 2026-07-22 Codex takeover review of WL-RUN-008 trust
   bootstrap and pre-existing enrollment persistence.
 
-### WL-SEC-007 - Authenticate privileged shared-Bus mutation consumers
-
-- Status: Remaining
-- Progress (2026-07-23): the typed action worker now requires schema v1 and an
-  exact-body, 30-second, durably single-use HMAC capability before service
-  lifecycle or code-edit dispatch; its legacy directory bypass only refuses.
-  Code-edit writes are descriptor-relative and reject in-root symlink escapes.
-  Cloud, direct Podman/libvirt lifecycle, and remote host-control consumers now
-  use the same fail-closed gate; consumer-side expiry is capped at 30 seconds and
-  direct libvirt rejects future schemas. Farm evidence is green for action
-  28/28, cloud 109/109, direct libvirt 51/51 (including the latest future-schema
-  and overlong-capability regressions), Podman 30/30, and host-state 13/13
-  hostile/functional tests; the shared `host_ops` partition is 47/47 and
-  `dc_power` is 30/30 (including unsigned, tampered, replayed, and future-schema
-  refusal before backend execution).
-  The Datacenter responder now gates its full VM/IaC/storage mutation set before
-  op-lock or backend calls; its focused farm suite is 75/75, including signed
-  one-shot replay refusal. VPN mutation gating is also farm-green at 26/26,
-  including unsigned and replay refusal.
-  Publisher tracing found no legitimate Podman or remote host-control shell path;
-  the scheduler's old unsigned actuator emission was retired rather than granted
-  autonomous mint authority (32/32 farm-green). The reachability audit then found
-  the higher-risk production `/run/mde-bus` tranche: registered IPC responders
-  still accept unauthenticated Tofu apply/destroy, host power/
-  network/secret operations, package uninstall, job launch, fleet revision,
-  Connect/firewall, VPN, and DDNS mutations. It also found several async workers
-  defaulting to a root-private data directory instead of the production spool.
-  Common IPC gating, the complete reachability inventory, legitimate publisher
-  wiring, and the shared-spool cross-UID negative fixture remain open. Tofu
-  apply/destroy is now capability-gated (14/14 farm tests), Fleet
-  push/rollback/nudge is capability-gated (8/8), and Jobs launch is
-  capability-gated (4/4); their read verbs remain open. The shared seam's PTY,
-  mesh-mount, physical-storage, and virtual-storage hostile/replay tests are
-  individually green across isolated farm runs; mde-files is 162/162 and shell
-  storage is 25/25. The dead
-  `action/apps/uninstall` root package-removal channel had no production
-  publisher and has been deleted rather than grandfathered; the remaining apps
-  responder suite is 18/18 farm-green, including the retired-uninstall
-  no-dispatch regression. The remaining privileged action inventory now also
-  covers the clipboard responder and phone-to-seat remote-input handoff:
-  clipboard mutations require a per-verb, exact-body capability before history
-  I/O, while the seat consumer verifies a node/phone-bound capability before
-  uinput and the KDC producer mints one nonce per event from the root-only
-  credential. Surface firmware apply now has the same gate before fwupd and the
-  root shell mints its matching capability while retaining the typed firmware
-  interlock. Surface enable/MOK activation now has the same exact-body gate
-  before any activation or reboot seam, and its shell publisher mints the
-  matching capability. Farm evidence is green for clipboard 2/2, seat
-  remote-input 16/16, KDC handoff 1/1, firmware 23/23, and surface enable
-  23/23; Connect exposure mutations now fail closed behind exact-body
-  `connect-*` capabilities (set-policy, expose, unexpose, set-template, and
-  apply-template), with read-only candidate/list verbs left open; focused farm
-  coverage is 12/12. DDNS config/record mutations use the same gate while
-  record-status/config reads remain open; focused farm coverage is 9/9. The
-  full inventory and shared-spool cross-UID negative fixture remain open. An
-  earlier current-tree full `mackesd` library run completed 3,729/3,731 with
-  one ignored test and one environment-sensitive caffeine round-trip failure;
-  that failure passed in an isolated farm rerun. The follow-up full gate below
-  is the current result.
-  The next privileged-responder tranche is now wired and farm-proven: Nebula
-  `regen-certs` is gated before the passphrase/CA path (20/20 focused), Settings
-  `set`/`restore` are gated before settings I/O (7/7), VoIP `set-gateway` /
-  `clear-gateway` are gated before gateway-file I/O (5/5), and every FileXfer
-  mutation (`send-to`, `rollback`, inbox `mark-opened`, outbox `cancel`) is
-  gated before file/inbox/outbox I/O (19/19). Production responders share the
-  verifier/replay ledger where multiple surfaces run in one daemon. The
-  integrated current-tree farm library gate is now 3,758/3,759 (one ignored,
-  zero failures). The cross-UID fixture also passes on BigBoy: a `nobody` child
-  writes four bodies through real `mde_bus::Persist` into a 0777 topic/SQLite
-  spool, the parent verifies a different owner, and only one authorized effect
-  is recorded across unsigned, tampered, authorized, and replay bodies. Peer app
-  launch is 8/8 and desktop-source mutations are 23/23. The remaining inventory
-  work is the older private-root/compute and other mutable-lane review; these
-  routing defects are not treated as authorization.
-  Thin-lighthouse onboarding is also fail-closed now: signed role/secret bundles
-  cannot promote a lighthouse or place `media`/`fileshare` secret scopes, with
-  no-partial-apply proofs in `onboard::remote_push` 22/22 and
-  `workers::onboard_apply` 10/10 focused farm suites.
-  The remaining shared-spool responders are now capability-gated as well:
-  federation accept/revoke/refuse-mint 6/6, Voice provision/did-route/failover/
-  shared-config 40/40 with an owner-only restart-safe intent journal, and
-  vehicle reboot 19/19 (HMAC before the typed ESN probe/SSH). The privileged
-  consumer inventory now has no Open/typed-only rows in this shared-spool
-  tranche; the final WL-SEC-007 closure gates are the integrated current-tree
-  library run and a cross-UID shared-spool negative fixture.
-  All DigitalOcean lighthouse writers now force the canonical thin
-  `s-1vcpu-512mb-10gb` profile: the Datacenter/genesis HCL writer rejects larger
-  sizes, the onboarding renderer normalizes legacy wire sizes, the promotion
-  and `do-lighthouse-{up,join}.sh` helpers refuse overrides, and
-  `infra/tofu/zone1-do` validates the same slug.
-- Priority: P0
-- Complexity: Epic
-- Problem: The production Bus spool is intentionally cross-UID writable, but
-  several root-daemon consumers still treat possession of an `action/*` topic as
-  authority. A local process can therefore forge administrative requests; the
-  takeover reproduced unauthenticated service-lifecycle and code-edit dispatch,
-  and found the direct Podman lifecycle worker accepting forged run/stop/remove
-  requests including host bind mounts.
-- Required outcome: Every runtime-reachable privileged Bus mutation verifies a
-  versioned, exact-body, short-lived capability and durably consumes its nonce
-  before any side effect, or retains an existing cryptographic authorization
-  protocol proved equivalent. Missing credentials fail closed. Retired mutation
-  consumers are deleted instead of preserved as unauthenticated compatibility
-  paths; read-only queries and harmless refresh nudges remain usable without an
-  arm token.
-- Scope: Inventory all root `mackesd` mutation consumers and their shell/CLI or
-  worker publishers, including `action/*` and older mutable `compute/*` lanes;
-  first close code edit, service lifecycle, direct Podman/libvirt, host
-  power/control, provisioning/migration, onboarding, federation, firewall, and
-  CA or secret-changing paths. Reuse the Workloads HMAC credential, exact-body
-  digest, 30-second expiry, and host-local spent-nonce ledger. Message transport
-  secrecy and per-user RBAC remain out of scope.
-- Relevant files/components: `crates/platform/mde-bus/src/persist.rs`,
-  `packaging/systemd/mackesd.service`, `crates/mesh/mackesd/src/workers/action.rs`,
-  `container.rs`, `vm_lifecycle.rs`, `host_state.rs`, `xcp_provision.rs`,
-  `compute_provision.rs`, `compute_expose.rs`, `compute_migrate.rs`,
-  `onboard_apply.rs`, `federation_enforcer.rs`, `cert_authority.rs`, the
-  production responder registrations in `src/bin/mackesd/spawn.rs`, privileged
-  responders under `src/ipc/` (`tofu`, `datacenter`, `host_ops`, `dc_power`,
-  `apps`, `jobs`, `fleet`, `connect`, `vpn_gw`, and `ddns`), and the corresponding
-  publishers under
-  `crates/desktop/mde-shell-egui/src/`.
-- Acceptance criteria: A checked inventory classifies every production
-  shared-Bus consumer with privileged effects as read-only/nudge, independently
-  authenticated, newly
-  capability-gated, or deleted; unsigned, expired, body-tampered, replayed, and
-  future-schema mutations produce no side effect; an authorized request executes
-  exactly once; no legacy topic bypass reaches the same sink; authorization
-  refusal audit records never copy attacker-controlled code or secret payloads.
-- Verification method: Hostile per-consumer fixtures on the build farm, a shared
-  `0777` Bus-spool integration test that writes as an unprivileged publisher,
-  focused shell-to-daemon wire tests, workspace gates, and a live credentialed
-  mutation plus unsigned negative probe when hardware is available.
-- Origin or merged source IDs: 2026-07-22 Codex takeover review of the production
-  shared-Bus trust boundary; corrective successor to WL-SEC-005's explicitly
-  out-of-scope Bus-wide authentication policy.
-
 ## Build, Installation, And Deployment
 
 ## Core Architecture
@@ -438,14 +407,103 @@ These decisions refine acceptance and sequencing for the active items below.
   schema-v1 and future versions fail closed. Daemon routing now refuses blank
   placement, armed-token nonces are durably single-use across restart, the global
   destroy path is retired, and target delete independently checks the typed name
-  before retracting only that workload's desired doc. The current-tree BigBoy
-  integrated `mackesd` library gate passed 3,719/3,719; focused cloud security
-  and direct lifecycle suites passed 112/112 and 51/51 respectively. The
+  before retracting only that workload's desired doc. The final integrated
+  BigBoy `mackesd --lib` gate passed 3,872 with 0 failures and 1 ignored;
+  focused cloud security and direct lifecycle suites passed 112/112 and 53/53
+  respectively. The
   production root/systemd request path now wraps Datacenter VM/IaC/storage
   mutations in the shared HMAC capability gate. Remaining: a direct libvirt
   lifecycle drill against an available backend; the farm currently has no
   `virsh`/libvirt backend, so the 51-test seam proof is recorded but not
-  promoted to live-host evidence.
+  promoted to live-host evidence. The lifecycle seam now also has a complete
+  deterministic create/start/pause/resume/stop/destroy round-trip with asserted
+  state and call order; the focused farm proof is 53/53. This strengthens the
+  headless contract but does not change the direct-libvirt blocker. Chooser
+  lifecycle controls now fail closed when `local-kvm` capability evidence is
+  missing or unknown, including the right-click VM power menu; the focused
+  no-libvirt/context-menu proof is 1/1. The Workloads state and Provision UI
+  now also refuse to arm or publish live apply for a missing, stale, plan-only,
+  or otherwise unarmed selected node; focused IAC coverage is 39/39 locally,
+  including the plan-only negative path. The current selected-node arm and
+  pre-authorization recheck tranche is farm-green at 20/20. The `.15` host now
+  has the Fedora modular libvirt/QEMU stack, active default network,
+  active/autostart `mde-vms` pool, and active Podman socket. A real exact-body
+  HMAC `vm-create` request crossed the Bus and reached `virsh define`; the
+  request failed honestly because firmware has VMX disabled and `/dev/kvm` is
+  absent. Thus the host plumbing and authorized backend path are live; the
+  direct KVM lifecycle demonstration is a non-blocking firmware/physical-host
+  evidence follow-up rather than a code or routing blocker.
+  The latest cloud contract rerun is green at 116/116 after adding explicit
+  schema-v1 fixtures for the container/image mutation subverbs; missing and
+  future mutation schemas fail before placement/backend dispatch. The direct
+  lifecycle seam remains 53/53 and the live KVM blocker is unchanged. KVM
+  health now recognizes socket-activated Fedora modular libvirt providers
+  (`virtqemud.socket`, `virtnetworkd.socket`, `virtstoraged.socket`) without
+  changing the stable service IDs or conflating service availability with
+  `/dev/kvm`; the focused catalog/health proof is 19/19. The datacenter
+  responder's structural mutation boundary now has a farm-green 119/119
+  selected-test gate proving unsigned `vm-create`, `lighthouse-create`, and
+  `genesis-write` requests are refused before any Tofu file is written. The
+  lifecycle seam also has a target-scoped destroy regression: the selected
+  domain and its storage flag are removed without touching unrelated domains;
+  the focused farm proof is 54/54. Cloud dispatch now retains malformed-body
+  state and refuses invalid JSON before both read and mutation handlers while
+  preserving valid legacy `{}` reads; its focused farm suite is 57/57.
+  The per-node desired-state store now rejects symlinked directory components,
+  ignores symlinked documents on read, refuses symlink removal, and atomically
+  replaces document leaves without following a planted link. Its corrected
+  focused hostile-filesystem suite is green at 12/12, including preservation of
+  the pre-existing invalid-name error contract. The latest integrated BigBoy
+  `mackesd --lib --features async-services` gate is green at 3,896 passed,
+  0 failed, and 1 ignored. Container workloads now have a complete bounded
+  lifecycle path: the UI's Restart, Logs, and Destroy controls emit the real
+  `container-restart`, `container-logs`, and `container-destroy` verbs with the
+  row's placement and identity; Destroy remains typed-confirmation gated. The
+  worker validates path-safe unit stems, enforces placement/schema/auth/replay
+  boundaries, invokes literal-argv `systemctl`/`journalctl` commands through the
+  runner, retracts only the selected desired entry after a successful destroy,
+  and reports unavailable or failed backends honestly. Focused farm evidence is
+  UI IAC 43/43 and cloud verbs 62/62, both with zero failures. Remaining live
+  evidence is limited to exercising a real Podman/systemd unit on an available
+  placement host; no live success is claimed by the fixtures.
+- Progress (2026-07-24 console boundary hardening): the console verb now rejects
+  path-like, whitespace, overlong, or leading-dash workload targets before
+  authorization or `virsh`; malformed hosts and port zero cannot become console
+  URIs; loopback and wildcard bindings are gated until a retained VDI broker can
+  relay them. The focused BigBoy console suite is green at 10/10.
+- Progress (2026-07-24 image-builder argv hardening): image-build now places an
+  end-of-options separator before the caller-controlled image reference, so a
+  leading-dash reference cannot inject another builder flag. The focused BigBoy
+  async-services image suite is green at 11/11.
+- Progress (2026-07-24 container lifecycle output hardening): rootless Quadlet
+  restart/log/destroy handling now bounds backend output to 64 KiB with
+  UTF-8-safe truncation before it enters Bus replies or audit records. The
+  focused `.90` container lifecycle suite is green at 6/6.
+- Progress (2026-07-24 direct-handler placement hardening): the cloud worker now
+  re-checks placement at its direct handler boundary before capability replay
+  consumption or backend execution. Hostile VM-start and container-restart
+  regressions prove remote requests make no runner calls and consume no nonce.
+- Progress (2026-07-24 capability-deadline hardening): armed cloud capabilities
+  now treat `expires_at_ms` as an exclusive deadline, refusing a token at exact
+  equality with the verifier clock rather than granting a boundary millisecond.
+  The hostile BigBoy gate is green at 7/7; live libvirt/Podman evidence remains
+  an external follow-up.
+- Progress (2026-07-24 desired-state identity hardening): cloud reconciliation
+  now accepts only regular JSON documents whose payload node/name match the
+  canonical directory and filename, preventing a renamed or forged document
+  from becoming an unretractable phantom workload. The hostile BigBoy reconcile
+  suite is green at 13/13; live libvirt/Podman evidence remains external.
+- Progress (2026-07-24 container staging filesystem hardening): Quadlet staging
+  and rollback now reject symlinked directories/leaves and use atomic,
+  non-following temporary writes, preventing a hostile stage tree from writing
+  through to an outside victim. The focused `.90` container suite is green at
+  20/20; live Podman/systemd evidence remains external.
+- Progress (2026-07-24 desired-batch determinism hardening): `set-desired` now
+  rejects duplicate declarations, duplicate removals, and declare/remove name
+  collisions before the first filesystem mutation, eliminating ambiguous
+  last-operation semantics and partial accepted batches. The focused BigBoy
+  desired-state suite is green at 13/13; live libvirt/Podman evidence remains
+  external.
 - Priority: P0
 - Complexity: Epic
 - Problem: The archived WL-ARCH-006 surface is mounted, but its Set desired UI
@@ -474,7 +532,7 @@ These decisions refine acceptance and sequencing for the active items below.
 
 ### WL-FUNC-011 - Communications collaboration suite full replacement
 
-- Status: Blocked
+- Status: Remaining
 - Progress (2026-07-21): CUTOVER LANDED (origin/master a84017f1) — at the AUTONOMOUS
   CEILING. Phase-1 (56 parity Qs ruled 78408f3b, migration importer 4e0d5df0, retire the
   dead Kamailio/RTPengine VV stack aad4d511) + Phase-2 shell surface cutover (a84017f1)
@@ -489,12 +547,85 @@ These decisions refine acceptance and sequencing for the active items below.
   (519 rows, all 56 open-Qs resolved). REMAINING = Phase-3 live-acceptance gates that are
   NOT live-seat (per operator 2026-07-22 the live-seat blocks are removed): criterion 8
   (real WebRTC/SIP call frames — needs live call infra + a 2nd peer), criterion 9 (DO LLM
-  with a sealed key — needs an operator-provisioned key via mde-seal). Criterion 12 (live
+  with a sealed key — needs an operator-provisioned key via mde-seal). These are
+  non-blocking external evidence follow-ups. Criterion 12 (live
   visual signoff) is NO LONGER a block: the cutover shell is already deployed live on .15
   (boots drm:true, 12.1.0, stable, NRestarts=0), so its functional half is closed and the
   aesthetic signoff is now an optional operator glance, not a gate. 4 PRE-EXISTING
   (non-cutover) shell-test reds documented in docs/NEEDS-OPERATOR.md. Phase-3c follow-ups
   (editor CRDT/three-way-merge/review; call media plane) remain co-edit/hardware-gated.
+- Progress (2026-07-24 projection identity hardening): signed presence events
+  now require the payload actor to match the envelope actor before entering the
+  global presence board, preventing a validly signed malformed event from
+  impersonating another member. The focused projection regression is 1/1 and
+  the full `mde-collab-core` library suite is 34/34.
+- Progress (2026-07-24 call replay identity hardening): participant lifecycle
+  events now require the payload actor to match the envelope actor during replay,
+  preventing a signed malformed event from mutating another participant's call
+  state. The focused farm projection gate is green at 5/5; the change is scoped
+  to `mde-collab-core` and does not alter the live media-plane claim.
+- Progress (2026-07-24 transfer authorization hardening): file-transfer control
+  commands now require an active space and current membership before minting
+  signed events. The focused regression and full collaboration-core farm suite
+  pass at 1/1 and 38/38.
+- Progress (2026-07-24 Files bridge authorization hardening): file-to-chat
+  offers now use the daemon's authoritative node actor and reject malformed,
+  cross-space, whitespace, or path-like peer targets before signing or writing
+  an action. The focused bridge farm suite is green at 6/6; live multi-node
+  chat/Bus round-trip evidence remains external.
+- Progress (2026-07-24 live projection fold): the shell Communications mount now
+  folds retained thread timelines/root lookups, alert inbox, file references,
+  transfer jobs, clipboard lanes, and document sessions into the pure UI
+  `CollabData` seam, with fail-soft clearing when the Bus is unavailable. The
+  focused shell fold suite is green at 4/4. Core thread reads now scope roots,
+  replies, and thread IDs to their requested space; the focused projection suite
+  is green at 36/36, including deleted-root and cross-space leakage regressions.
+- Progress (2026-07-24 convergent call state and seat-local read position):
+  `SetCallMuted` now emits a signed `call_participant_muted` event for an active,
+  connected, space-member participant; `SendDtmf` remains an explicitly
+  ephemeral media-plane signal. Domain and SQLite folds retain the mute bit and
+  replay it in arrival-order-independent read models. The focused type suite is
+  green at 37/37 and the focused core suite is green at 36/36, including
+  authorization, event round-trip, malformed-presence, and shuffled-replay
+  regressions. The shell mount now derives each space's unread badge from the
+  activity HLC after a durable seat-local cursor, persists that cursor under
+  `local/collab/read-cursors` outside the replicated `state/collab/*` namespace,
+  and advances it after the selected space renders. Its focused shell suite is
+  green at 5/5, including reload persistence and post-cursor counting. This
+  deliberately does not claim replicated read receipts.
+- Progress (2026-07-24 call-space authorization hardening): call participant,
+  mute, and end mutations now require the event `space_id` to match the active
+  space before altering call state, preventing a valid member from mutating a
+  different space's call. The focused BigBoy domain regression is green at 1/1.
+- Progress (2026-07-24 projection ingress hardening): the public projection
+  boundary now validates every event's schema version and signature before
+  opening a transaction, so unsigned or future-schema replay batches cannot
+  partially persist. Thread/root lookups are space-scoped, and replay rejects
+  participant/presence payloads that impersonate another actor. The focused
+  BigBoy `mde-collab-core` suite is green at 40/40; live media/SIP and sealed
+  LLM evidence remain external follow-ups.
+- Progress (2026-07-24 Communications stale-selection hardening): the call bar
+  now revalidates its retained space selection against the current directory
+  before offering `StartCall`, so a membership removal cannot leave an invalid
+  actionable target. The focused Communications UI farm gate is green at
+  52/52; live multi-node membership and media evidence remain external.
+- Progress (2026-07-24 Communications stale-editor hardening): switching spaces
+  now resets the embedded Markdown editor with the per-space selection, so a
+  retained document view cannot continue rendering the previous space's
+  content after membership loss or while the new projection arrives. The
+  focused regression is green at 1/1 and the full `mde-collab-egui` suite is
+  green at 52/52; live multi-node document evidence remains external.
+- Progress (2026-07-24 call hang-up authorization hardening): `HangUpCall` now
+  requires an active connected participant who is still a member of the target
+  space, preventing a forged or stale command from ending another participant's
+  call state. The focused pipeline gate is green at 2/2 and the full
+  `mde-collab-core` suite is green at 41/41; live media evidence remains
+  external.
+- Progress (2026-07-24 legacy-import boundary hardening): the Communications
+  migration reader now accepts only bounded regular files, rejects symlinked or
+  non-regular sources, caps each source at 8 MiB, and refuses chat rings above
+  500 entries. The focused BigBoy import gate is green at 13/13; live legacy
+  filesystem migration evidence remains external.
 - Priority: P0
 - Complexity: Epic
 - Problem: VoIP, Messaging, Alerting, Clipboard, Editor, Files, and Transfers are
@@ -842,7 +973,127 @@ These decisions refine acceptance and sequencing for the active items below.
   mesh types 2/2, Maps/model 5/5, worker 7/7, worker-role census 19/19, and
   full Maps 136/136; its missing sealed key remains an honest unconfigured
   state with no network request or fabricated fetch time. Keyed feeds must idle
-  honestly until operator-sealed free credentials exist.
+  honestly until operator-sealed free credentials exist. The follow-up overlay
+  acceptance gate is green at 148/148: malformed retained AirNow snapshots and
+  secret-store errors no longer paint stale markers, and idle traffic/wildfire
+  layers render an explicit no-data state. The Map tab now presents all ten
+  feed toggles in a grouped `Layers (N)` popover (Safety, Road & transit,
+  Ambient), with its focused regression green at 1/1 (148 tests filtered).
+  Provider attribution now wraps inside the map clip on narrow viewports rather
+  than overflowing the left edge; the focused attribution proof is 1/1.
+  FIRMS/AirNow live credentials and MG90-backed NCDOT/511 acceptance remain
+  external evidence follow-ups, not blockers.
+  The FIRMS lane is now a real credential-gated workstation worker rather than
+  a schema-only placeholder: it resolves `secret:firms-api-key` through the
+  sealed store, requires an explicit opt-in and fresh same-host vehicle fix,
+  validates the strict NASA FIRMS HTTPS path, bounds the CSV response, filters
+  finite in-radius rows, and publishes explicit unconfigured/secret-error/
+  paused states. Its focused farm parser/contract suite is green at 8/8;
+  The 2026-07-24 FIRMS parser hardening caps each CSV header/row at 64 fields,
+  rejects empty or duplicate normalized headers before row parsing, and keeps
+  over-wide hostile rows fail-soft by omitting them while retaining later valid
+  hotspots. The official HTTPS probe response remains byte-bounded before CSV
+  parsing; FIRMS has no UDP-equivalent payload path in this worker. These
+  hostile-input regressions are included in the 8/8 farm suite.
+  live hotspot acceptance remains correctly external until the operator seals
+  a key and the MG90 reports a fresh fix. The Maps consumer now folds the
+  retained FIRMS snapshot independently from NIFC and paints distinct
+  orange/yellow hotspot markers with honest paused/stale/unconfigured/error
+  badges; the shared Persist isolation proof is 1/1 and the focused FIRMS
+  painter suite is 4/4. The stale NIFC badge no longer claims that a FIRMS key
+  is required when that optional feed is simply unconfigured. A new
+  read-only `install-helpers/verify-live-mirrors.py` proof tool validates the
+  indexed Bus envelope, host identity, freshness, schema readiness, and
+  envelope SHA-256 without contacting a gateway or feed; its deterministic
+  self-test passes. It improves the external acceptance handoff but does not
+  manufacture live feed credentials or MG90 fix evidence.
+  The latest Maps reader pass now requires every retained overlay body to carry
+  the selected node's exact `host` provenance, while FIRMS and NIFC remain
+  independently folded; the full Maps suite is farm-green at 156/156 and the
+  cross-node/FIRMS isolation regression is included. External feed credentials,
+  fresh MG90 fix, and NCDOT acceptance remain optional live-data evidence
+  follow-ups, not blockers to the autonomous implementation drain.
+- Progress (2026-07-24 NCDOT contract hardening): malformed GeoJSON features are
+  now isolated instead of poisoning valid incidents, point coordinate arrays
+  are streaming-bounded to two or three values, and only `gps`/`dgps` fixes
+  satisfy the fresh same-host context gate. The focused farm worker suite is
+  green at 8/8; live MG90/NCDOT acceptance remains non-blocking evidence.
+- Progress (2026-07-24 traffic provenance hardening): non-`Feature` GeoJSON
+  members are now omitted with an explicit gap instead of being treated as
+  incidents, preserving valid-event isolation. The focused BigBoy traffic
+  worker gate is green at 9/9.
+- Progress (2026-07-24 traffic stale-cache hardening): fetch/fix failures now
+  publish an empty degraded projection instead of replaying incidents from a
+  prior location; restart handling also scrubs an already-persisted stale
+  snapshot while retaining the private last-good cache for a later 304. The
+  focused BigBoy traffic worker gate is green at 9/9; live MG90/NCDOT evidence
+  remains external.
+- Progress (2026-07-24 forecast stale-cache hardening): NWS hourly forecast
+  fetch/fix failures now publish an empty degraded projection instead of
+  replaying samples from a prior location; restart handling also scrubs a
+  persisted stale forecast while retaining the private last-good cache for a
+  later 304. The focused BigBoy forecast worker gate is green at 9/9; live
+  NWS/MG90 evidence remains external.
+- Progress (2026-07-24 AirNow stale-cache hardening): refresh failures and
+  missing fresh fixes now publish an empty degraded projection instead of
+  replaying prior-location stations; restart handling also retracts a
+  persisted stale AirNow record while retaining the private last-good cache.
+  The focused `.50` AirNow worker gate is green at 9/9; live AirNow
+  credentials/MG90 evidence remains external.
+- Progress (2026-07-24 NWS-alert stale-cache hardening): failed refreshes,
+  mismatched 304 responses, and missing fresh fixes now publish empty degraded
+  projections instead of replaying prior-location alerts; restart handling
+  also clears persisted stale alerts while retaining private conditional state.
+  The focused `.90` NWS-alert worker gate is green at 13/13; live NWS/MG90
+  evidence remains external.
+- Progress (2026-07-24 ADS-B stale-cache hardening): failed refreshes,
+  mismatched 304 responses, and missing fresh vehicle fixes now publish empty
+  degraded projections instead of replaying prior-location aircraft; restart
+  handling also clears persisted stale aircraft while retaining private
+  conditional state. The focused BigBoy aircraft worker gate is green at
+  11/11; live ADS-B/MG90 evidence remains external.
+- Progress (2026-07-24 transit endpoint hardening): the production MBTA
+  VehiclePositions feed is now restricted to the canonical HTTPS host, path,
+  and no-query/no-credential URL shape; redirect coverage remains test-only so
+  production cannot be pointed at an arbitrary endpoint. The focused transit
+  farm suite is green at 11/11; live CDN fetch evidence remains external.
+- Progress (2026-07-24 AirNow consumer-boundary hardening): the Maps AirNow
+  painter now caps retained station iteration, rejects malformed coordinates,
+  distance, AQI, and future/expired timestamps, refuses to paint retained
+  stations under secret-store error states, and bounds provider labels. The
+  focused BigBoy map suite is green at 10/10.
+- Progress (2026-07-24 traffic consumer-boundary hardening): retained NCDOT
+  snapshots now reject timestamps more than five seconds in the future, render
+  an explicit invalid-timestamp state, and cap painting at the worker's 256
+  event contract. The focused BigBoy traffic suite is green at 6/6.
+- Progress (2026-07-24 Airspace repaint and mirror-boundary hardening): the
+  visible Airspace panel now schedules a 33 ms repaint heartbeat independent of
+  pointer movement, folds typed `state/airspace/<node>` snapshots as whole
+  replacements, retracts stale selections, and refuses contacts from NoSource
+  or Offline mirrors. The focused `.50` Airspace suite is green at 8/8; the
+  alternate `.170` attempt was skipped after its farm filesystem reported
+  ENOSPC. No MG90 scanner protocol or synthetic contacts were introduced.
+- Progress (2026-07-24 home-destination display hardening): a validated US
+  offline-gazetteer hit now always produces a visible Home destination label,
+  falling back to the result title when a locality row has no subtitle. The
+  focused `.90` Maps model proof is green at 1/1; no address is guessed when
+  the opt-in local setting or gazetteer is absent.
+- Progress (2026-07-24 destination-search viewport hardening): the Maps search
+  surface now bounds its height by the remaining clipped viewport instead of
+  forcing a 320 px minimum, keeping lower rows and controls inside short seats.
+  The focused Maps view suite is green at 42/42; live seat visual proof remains
+  external.
+- Progress (2026-07-24 Advanced Maps viewport hardening): narrow Advanced pages
+  now stack device cards at their actual clipped width, keep the destructive
+  MG90 confirmation control inside the viewport, and retain bounded/revealed
+  rail hit targets. The focused Maps view suite is green at 44/44, including
+  the narrow-card and reset-action regressions; live visual proof remains
+  external.
+- Progress (2026-07-24 transit stale-location hardening): when a refresh fails
+  after the vehicle moves, the GTFS worker now discards the old nearby-vehicle
+  snapshot and publishes an empty degraded snapshot for the new point instead
+  of repainting stale vehicles at the wrong location. The focused `.90` transit
+  suite is green at 12/12; live MBTA/MG90 evidence remains external.
 - Priority: P2
 - Complexity: Epic
 - Problem: The Maps & Location cockpit's map is a synthetic perspective scene with
@@ -892,32 +1143,276 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-006 - Construct interface (Apple-HIG-principled workstation shell)
 
 - Status: Remaining
+- Progress (2026-07-23): the home contract was reconciled to the operator's
+  single-desktop directive: one untitled all-icons Desktop now flattens the
+  canonical surface catalog, uses launcher-group accents for color coding, and
+  has no title or page dots. Fleet & Mesh unifies Workbench, Mesh Map, and
+  Explorer. The shell reserves top status-bar space for every workspace. A
+  persistent black 240x56 floating navigation pill now provides Back, Home,
+  Auto, and pin/dock actions; docked mode reserves a 56px left rail and uses a
+  smooth slide-then-melt morph. Its headless render/accessibility proof passed
+  6/6 on the farm.
+  The cutover cleanup then replaced the stale RPM reachability check's deleted
+  `dock.rs` input with the live `surfaces.rs` catalog; all eight embedded
+  `mde-*-egui` crates pass the static shipped-and-reachable check, and the
+  script self-test is green. Shared style/shell proof is farm-green at 245/245
+  for `mde-egui`, 4/4 for the current shell surface-catalog tests, and
+  1,715/1,715 for the preceding full `mde-shell-egui` run; the production Rust
+  `taskbar` grep is empty.
+  A follow-up headless layout proof now drives the real `central_view` and
+  asserts that every workspace begins exactly below the 24px status bar; the
+  focused farm test is 1/1. Live Car/MG90 acceptance, live switcher/physical
+  acceptance, and physical VDI proof remain open as non-blocking evidence
+  follow-ups. A read-only recheck of `.15` found the live shell still active
+  with `NRestarts=0`, owning `/dev/dri/card1` and `/dev/tty1`, with
+  HDMI-A-1 connected. The seat has `/usr/bin/ffmpeg`'s KMS grabber. Root KMS
+  access can now open the XR30/10-bit framebuffer; the explicit
+  `x2rgb10le -> hwdownload -> rgb24` path emits a 1920x1080 PNG, but the
+  Intel X-tiled modifier is preserved as visible striping, so that file is not
+  a valid visual proof. The VAAPI detile alternatives were also exercised and
+  either reject the 10-bit RT format or preserve the same invalid pixels.
+  Sunshine is configured for `capture = kms` but its user service is inactive
+  and no live Moonlight client is connected, so this audit records no new
+  screenshot or physical-pixel claim. The obsolete headless preview helper was
+  updated to launch the live `mde-shell-egui` binary and its gallery now
+  captures the current Construct home view; this repairs the proof tool but does
+  not satisfy the physical-pixel gate. The read-only
+  `verify-live-mirrors.py` helper also records exact Bus envelope identity,
+  age, readiness, and provenance hashes for live Car/overlay handoff; its
+  deterministic self-test passes. It is evidence tooling only and does not
+  replace the unavailable valid DRM pixel capture.
+  The PhonesHub mutation publisher now mints the same root-only capability as
+  the KDC responder for pairing, phone actions, and enrollment-token issuance,
+  while roster/browser reads remain open; its current focused shell farm suite
+  passes 23/23.
+  The live pixel proof was then repaired on `.15` with an opt-in linear GBM
+  scanout allocation: the active XR30 framebuffer switched from Intel X-tiled
+  to modifier `0`, and the resulting 1920x1080 RGB PNG was visually intact
+  (SHA256 `48f43a115f55acf99fb3c85859cb86e30a1ced5454035280b7b49b92657e10f3`).
+  The runtime override and test binary were removed; the packaged shell is
+  active again with its normal service configuration and `NRestarts=0`.
 - Progress (2026-07-22): interrupted U10/U11/U23 work was recovered into the main
-  tree: the persistent eight-page Springboard base, slim top status bar, shared
+  tree: the persistent Springboard base, slim top status bar, shared
   Workbench `NavigationBar`, and shared Console/Workloads style tokens. Farm
   evidence: status bar 8/8, Workbench 16/16, Console 47/47; the repaired
   integrated shell run passed **1,706/1,706** tests with zero failures. The three
   salvaged dirty Claude worktrees were removed after zero-unique-commit
   verification. Remaining acceptance is deterministic render/pixel capture and
   live VDI behavior; human visual review is informative, not a gate.
-  On 2026-07-23 the verified `magic-mesh-12.1.0-1` shell binary was staged on
-  non-production seat `.15` (RPM dependency resolution is incomplete there, so
-  the shell binary was installed transactionally from the RPM payload while the
-  existing unit was retained): `mde-shell-egui.service` is active with
-  `NRestarts=0`, Construct reports `12.1.0 ... 2026-07-23`, and it owns
+  On 2026-07-24 the refreshed Fedora 44 `magic-mesh-12.1.0-1` and
+  `magic-mesh-browser-12.1.0-1` RPMs were deployed to non-production seat `.15`
+  with complete declared dependency resolution. `rpm -V` is clean;
+  `mackesd.service`, `mde-shell-egui.service`, `nebula.service`,
+  `virtqemud.service`, and `virtnetworkd.service` are active, with zero
+  restarts for the two primary services. Construct reports `12.1.0 ...
+  2026-07-23`, and the shell owns
   `/dev/dri/card1` + `/dev/tty1` with HDMI-A-1 connected at 1920x1080. The
-  fresh shell binary SHA256 is
-  `6096087b436f9c72c5707822a6c0f6590aae751058a07d2ad075fd97a17bea9a`. A
+  deployed shell binary SHA256 is
+  `5d7ff4467c3698923a3fa7e254c428ec918b60c97f0921d431498dc6753429d8` and
+  the daemon SHA256 is
+  `e08a46dc72735bfbd54ecf720ae6e2b2d1dd1137ab80c4865cda840ba46613e4`.
+  Root-owned rollback copies of both pre-12.1.0 binaries remain in `/var/tmp`. A
   reversible non-production boot-policy override produced a live DRM
   Springboard frame (1920x1080 XR30, detiled PNG SHA256
   `ae0f05f63e0a7e1a6361994fe1e90543ca8833f802c85c6313844b855feef05b`):
-  top status bar, Workbench/Mesh Map/Infra as Code tiles, and eight page dots;
-  no legacy bottom taskbar. The override was removed and the secure curtain
+  top status bar and Workbench/Mesh Map/Infra as Code tiles; the page dots
+  visible in that capture belong to the pre-cleanup paged implementation and
+  are not current acceptance evidence. No legacy bottom taskbar was present.
+  The override was removed and the secure curtain
   restored (detiled PNG SHA256
   `b8971f07a000357c3edf645420df14462a697f024aabd5a9bec754ba981da34c`), with
   the service still active and `NRestarts=0`. Pixel capture and all-pages/VDI
   behavior remain open. The surface-card wire/auth regression suite is
   farm-green at 7/7.
+- Progress (2026-07-24 live DRM pixel proof): the packaged shell was exercised on
+  `.15` with a reversible root-only proof override: `require_login_at_boot` was
+  temporarily disabled in the isolated Bus preference and
+  `MDE_DRM_LINEAR_SCANOUT=1` was supplied through a temporary systemd drop-in.
+  After the boot sequence settled, the native KMS grab produced a 1920x1080
+  8-bit RGB PNG with SHA256
+  `4773c06a2dd7d2391a92839bd78d2bff205f645d608200b8f82875a595a9f22a`.
+  Pixel inspection shows the current post-cleanup untitled all-icons Desktop,
+  Fleet & Mesh tile, separated 24px top status bar, and black floating navigation
+  pill; no legacy taskbar or Desktop title is present. The temporary preference
+  and drop-in were removed, the secure boot curtain is restored, and
+  `mackesd`, `mde-shell-egui`, Nebula, and modular libvirt services are active
+  with shell `NRestarts=0`. This closes the fresh Construct Desktop pixel proof;
+  live VDI full-resolution behavior and live switcher/physical acceptance remain
+  open. A fresh Car frame was also captured under the same reversible proof
+  path (SHA256 `abccf68e14102674626ed4c95e5ef9b31d66be59aa5f381d4f2e14860170d175`);
+  MG90 direct-control and driving-data acceptance remain open.
+- Progress (2026-07-24 single-desktop cleanup): `springboard.rs` now projects
+  `Surface::ALL` directly into one canonical desktop and no longer carries
+  page index, offset, settle spring, page dots, horizontal page-swipe, or page
+  navigation state. Horizontal drags are inert; keyboard selection remains
+  lock-step across the complete icon catalog, and the upper pull-down keeps its
+  Spotlight seam. The current production-shaped Springboard suite is farm-green
+  at 20/20, including a real pointer click on the canonical Fleet & Mesh tile;
+  full integration, switcher-snapshot, and VDI proof remain open.
+- Progress (2026-07-24 VDI chrome seam): focused Desktop requests are now an
+  explicit immersive layout state. The central workspace no longer reserves
+  the docked 56px rail, and the navigation pill is not painted over a focused
+  guest; the existing Escape/return chord remains the exit path. A focused
+  `central_view` integration assertion is in the farm gate; live VDI
+  full-resolution behavior for a live guest and the `.15` VDI pixel proof remain open.
+- Progress (2026-07-24 navigation hit-test repair): the floating navigation
+  `egui::Area` had a full-screen interactive rectangle while painting only the
+  visible pill/rail, so its transparent foreground widget intercepted home and
+  workspace clicks. `nav_bar.rs` now bounds the Area to the animated bar
+  footprint, translates control rectangles into Area-local coordinates, and
+  retains screen-space painting/accessibility geometry. The regression first
+  caught egui's persisted default `600x400` Area size, then passed after the
+  explicit size was fixed: the focused farm nav suite is now 8/8, including a
+  real workspace-underlay click regression, and the Fedora 44 release build is
+  green. The verified shell artifact
+  (`712d33e3b922535c71a6403634ed636513e581f41f08a879805cf4c6a5a9c463`) is
+  now deployed to `.15` with a root-owned rollback copy; the DRM service is
+  active, owns `/dev/dri/card1` and `/dev/tty1`, and has `NRestarts=0`. Direct
+  pointer click-through on the physical seat remains unclaimed; the earlier
+  surfaceless `egui_glow` startup panic is retained as separate runtime
+  evidence rather than being confused with this hit-test defect.
+- Progress (2026-07-24 switcher snapshot slice): the production switcher now
+  caches the real rendered body of each expanded surface as it is left, using
+  the shared offscreen egui PNG backend and the shell's existing texture upload
+  path. Cards use those captured textures when available and retain the honest
+  accent plate only when capture is unavailable; Desktop continues to prefer a
+  live VDI decoder frame. The focused BigBoy switcher suite is green at 16/16,
+  including a regression proving that one real snapshot replaces only its own
+  card plate. The package-wide BigBoy shell suite is now green at 1,728/1,728;
+  live VDI full-resolution proof remains open.
+- Progress (2026-07-24 switcher snapshot F44 cutover): the current source was
+  packaged in the Fedora 44 builder with base/browser/lighthouse payload gates
+  green, and the matching base/browser RPMs passed `.15`'s separate
+  `rpm -Uvh --test` transaction before installation without `--nodeps`. After
+  the expected transient post-install systemd transport failure, explicit
+  service recovery brought `mackesd`, `mde-shell-egui`, Nebula, `virtqemud`,
+  and `virtnetworkd` to `active`, with zero restarts for the two primary units;
+  `rpm -V` and executable `ldd` checks are clean. The deployed current shell
+  SHA256 is `889d12e594e3d012592cfc4d723e7375b4e092b8b7c276f27702b89ccb407662`
+  and the daemon remains `e08a46dc72735bfbd54ecf720ae6e2b2d1dd1137ab80c4865cda840ba46613e4`.
+  Real switcher snapshot code is now on `.15`; live VDI full-resolution proof
+  remains open.
+- Progress (2026-07-24 switcher crash repair): live `.15` journal evidence traced
+  the nav-triggered `egui_glow` texture panic to the offscreen switcher capture
+  creating a second wgpu GL/surfaceless context in the live DRM process. The
+  shared capture backend now requests Vulkan only, preserving the live EGL/GL
+  context and retaining the honest fallback plate when Vulkan is unavailable.
+  The focused capture farm gate passes 2/2 (the no-adapter host takes the
+  documented skip path), and the Fedora 44 base/browser RPM payload gates pass.
+  The matching RPMs were transaction-tested and installed on `.15`; the
+  deployed shell hash is `9e5bf98d51869bfef43ec1f32138c07bff7df0ce025f2055ca77bc65a103aa4c`,
+  startup reports `drm=true`, `NRestarts=0`, and no repeat `surfaceless`, texture,
+  or panic log has appeared. A physical browse/nav replay remains the final
+  live interaction proof.
+- Progress (2026-07-24 crash repair + physical switcher proof): `.15` briefly
+  exited to getty/bash because the shell painted `FontFamily::Name("heading")`
+  while that transient named family was unbound during an appearance handoff.
+  The known-good shell was restored immediately, then the Car heading paints
+  were changed to the always-bound proportional family and the corrected F44
+  RPM was built on BigBoy (`926ec547...` base, `1e9a70b6...` browser; payload
+  gates green). The corrected shell is deployed at `.15` with SHA256
+  `d2c323662be2d3a702ac19248dd0ca70c2b2e73dc61ef4a5de39faff795f5888`;
+  `rpm -V`, `ldd`, and post-deploy journal checks are clean, the shell is
+  active with `NRestarts=0`, and no repeat panic is present. A fresh reversible
+  linear-GBM DRM run then emitted `before.png`
+  (`48628a0f...`) and `after.png` (`68e16fd7...`); a physical uinput
+  split-frame Super-release/Tab sequence produced the actual switcher overlay
+  with a live `Car Home` card instead of Spotlight. The proof power override
+  and systemd drop-in were removed and the persisted profile restored to
+  Construct. Live VDI full-resolution proof remains open.
+- Progress (2026-07-24 farm gates): the post-cleanup Springboard suite passes
+  19/19 on BigBoy, and the current-source workspace/VDI layout suite passes
+  9/9 on `.90`, including the immersive full-screen assertion. Farm formatting,
+  worklist lint, and documentation-supersession lint are green. The later F44
+  cutover entry records the completed `.15` service deployment; fresh live
+  pixel and physical VDI proof remain open.
+- Progress (2026-07-24 ABI gate): the native Fedora 42 farm RPM was deliberately
+  rejected by `.15`'s dry-run because its FFmpeg/FLAC/graphics sonames are older
+  than the live Fedora 44 seat. The documented Fedora 44 container RPM cut was
+  dispatched on farm `.90`; no `--nodeps` install was attempted. The live seat
+  remains on its known-good package until the matching artifact passes
+  `rpm -Uvh --test`.
+- Progress (2026-07-24 F44 deployment): the matching Fedora 44 base and browser
+  RPMs passed `.15`'s strict dry-run and were installed without `--nodeps`.
+  Package hashes are base `0bde12022c8c106cd0aac245ae9458492e7b4733a77b1daae12c58aed96cff8c`
+  and browser `7b1a96fdbe1631d2af8abfa3e5238d518349167e306e9cfe5ace77a26e353c83`.
+  `rpm -V` is clean; explicit post-install recovery restarted `mackesd` and
+  `mde-shell-egui` after their normal graceful stop, with both primary services
+  at `NRestarts=0` and Nebula/libvirt services active. Deployed shell and daemon
+  hashes are `d27e19339b01a2d77ec8efc68d25b5978cf39f18e8e9f349a7936fb87a8badb2`
+  and `e08a46dc72735bfbd54ecf720ae6e2b2d1dd1137ab80c4865cda840ba46613e4`.
+  No reboot was performed; fresh VDI proof remained open at that stage and is
+  tracked by the later live-DRM evidence below.
+- Font depth follow-up (2026-07-24): add the five typography improvements to
+  the shared Construct/Car design-token work instead of tuning individual
+  screens in isolation:
+  1. establish a stronger type hierarchy with explicit display, headline,
+     title, body, label, and caption sizes plus deliberate weight changes;
+  2. use a more expressive font treatment by selecting the embedded face's
+     appropriate weights/optical sizes and reserving the mono face for data,
+     code, and telemetry rather than using one flat weight everywhere;
+  3. tune tracking, kerning, and line-height per token and per size so labels
+     do not look cramped while headings retain a clean, intentional shape;
+  4. improve text/surface contrast and add restrained text depth only where it
+     supports hierarchy on elevated or translucent materials, with no glow or
+     shadow that harms legibility;
+  5. make rasterization and responsive scaling part of the font contract,
+     covering DPI/font-scale changes, fallback glyphs, and the `.15` DRM
+     capture path at the supported display sizes.
+  Acceptance is shared-token implementation in `mde-egui`, no ad-hoc
+  per-surface font literals for canonical chrome, WCAG AA contrast checks for
+  interactive text, headless layout/render regressions at 100/125/150/200%,
+  and a fresh `.15` pixel review confirming crisp glyphs without clipping or
+  fallback-family surprises.
+- Progress (2026-07-24 shared typography implementation): `mde-egui` now
+  exposes a shared `TypographyRole` contract with semantic family/size tokens,
+  optical tracking, explicit line heights, and painter-compatible layout jobs.
+  Construct Desktop tile labels, switcher headers, and the top status bar now
+  use that contract instead of flat painter font literals. The focused shared
+  farm suite is green at 246/246, and the full shell binary gate is green at
+  1,735/1,735 with zero failures.
+- Progress (2026-07-24 navigation typography adoption): the shared NavigationBar,
+  Toolbar, and Sidebar now resolve all canonical chrome labels through semantic
+  typography roles, with no direct font literals remaining in `nav_chrome.rs`.
+  The focused shared navigation suite is green at 5/5; geometry and interaction
+  behavior are unchanged.
+- Progress (2026-07-24 Construct/Car typography adoption): Car Home and Control
+  Center now resolve their canonical display, headline, title, body, label, and
+  caption paints through the shared `TypographyRole` contract. Existing anchor
+  coordinates and hit-target geometry are preserved, while sparse Car values
+  remain honest rather than rendering blank live-looking labels. Direct canonical
+  `FontId` literals are absent from both surfaces. Focused farm gates are green:
+  Control Center 16/16 and Car Home 7/7, with no failures.
+- Progress (2026-07-24 live container probe): `.15` had only about 324 MiB free
+  on its 15 GiB root filesystem before the proof. A bounded Podman
+  `busybox:1.36.1` pull failed honestly with `no space left on device`, I/O
+  errors under `/var/lib/containers/storage`, and a Podman `storage.lock`
+  panic; SSH then began resetting during key exchange and the remote Sunshine
+  ports were no longer listening. No broad cleanup or reboot was attempted;
+  recovery now needs the physical console or a separately available management
+  path before the live container proof can resume.
+- Progress (2026-07-24 container safety hardening): the Workloads container
+  path now refuses deployment below a 512 MiB free-space floor before staging
+  or pulling, rolls back newly staged Quadlets after a failed operation, and no
+  longer passes an ineffective `container` role tag. The focused farm suite is
+  green at 18/18; live `.15` success remains correctly unclaimed until recovery.
+- Progress (2026-07-24 switcher viewport hardening): the complete 15-card recent
+  ring now compresses card previews to remain inside short viewports, and swipe
+  thresholds use each card's actual height. The focused `.90` switcher suite is
+  green at 17/17; live physical-pointer and full-resolution VDI proof remain
+  external evidence.
+- Progress (2026-07-24 status-rail geometry hardening): the Volume, Network, and
+  Brightness hit targets retain their normal macOS-sized geometry on workstation
+  rails while compressing safely inside narrow headless/windowed rails. The
+  focused `.50` status-bar gate is green at 13/13; no live seat change was made.
+- Progress (2026-07-24 release-identity hardening): the root Cargo workspace
+  version is now the single platform release authority; the shared theme derives
+  About, watermark, and splash release text from `CARGO_PKG_VERSION`, while the
+  Bash welcome, status snapshot, and `mesh-help` reflect installed RPM metadata.
+  The isolated browser workspace manifests are synchronized to the same release
+  value and the dependency-free welcome self-test plus shell syntax checks are
+  green. RPM installation/reflection and live seat visual comparison remain
+  external release evidence; no live seat change was made.
 - Priority: P1
 - Complexity: Epic
 - Problem: The workstation chrome is Win10-shaped (48px bottom taskbar + tray
@@ -927,12 +1422,13 @@ These decisions refine acceptance and sequencing for the active items below.
   as principles, iPadOS structure + macOS pointer manners) has no
   implementation.
 - Required outcome: Construct per `docs/design/platform-interfaces.md` Part I -
-  persistent springboard home (pages = the 8 LAUNCHER_GROUPS, no dock, no
-  widgets), slim top status bar, Control Center, Notification Center,
+  persistent untitled all-icons Desktop (one canonical grid with
+  `LAUNCHER_GROUPS` color accents, no title, no page dots, no dock, no widgets),
+  slim top status bar, Control Center, Notification Center,
   Spotlight (Front Door engine, keyboard flow byte-identical), card app
   switcher with snapshot previews, shared
-  NavigationBar/Toolbar/Sidebar/Sheet/Popover components adopted by all 17
-  surfaces, scrim materials + HIG radii + zoom-from-tile motion, two-profile
+  NavigationBar/Toolbar/Sidebar/Sheet/Popover components adopted by all
+  canonical surfaces, scrim materials + HIG radii + zoom-from-tile motion, two-profile
   LayoutProfile (Construct + Car, Tablet folded via serde aliases), and the
   Win10 chrome DELETED at cutover (no legacy flag).
 - Plan: `/root/.claude/plans/the-workstation-interface-should-cozy-minsky.md`
@@ -946,10 +1442,11 @@ These decisions refine acceptance and sequencing for the active items below.
   (same-crate serialization); curtain lock security behavior and the VDI
   full-native-resolution guarantee are sacred (zero logic diffs).
 - Acceptance criteria: machine-captured screenshot/pixel proof on the `.15` DRM seat -
-  springboard pages (all 8), status bar, Control Center, Notification Center,
-  Spotlight, switcher with real snapshots, zoom transitions, VDI full-res with
-  auto-hidden bar; post-cutover grep gate (zero taskbar identifiers in
-  production code). Human visual review is informative only.
+  the untitled all-icons Desktop, status bar, Control Center, Notification
+  Center, Spotlight, switcher with real snapshots, zoom/navigation-bar
+  transitions, VDI full-res with auto-hidden bar; post-cutover grep gate (zero
+  taskbar identifiers in production code). Human visual review is informative
+  only.
 - Verification method: per-unit farm builds + targeted tests; two integration
   slots (`cargo build --workspace` + `cargo test --workspace --no-run` + full
   run + lint-style-leaks/doc-supersession/worklist) after the shared-API units
@@ -962,6 +1459,23 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-007 - Car interface (CarPlay-principled vehicle mode)
 
 - Status: Remaining
+- Progress (2026-07-23 live mirror proof): the MG90 gateway at `172.20.0.25`
+  is reachable from the network (ping and TCP/2222), and `.15`'s active
+  `mackesd` is publishing a fresh `state/vehicle/Basement-Test-Workstation`
+  mirror from that gateway. A direct read-only Bus sample is `online=true`,
+  MGOS `4.3.0.1`, battery `13.0V`, cellular `-96dBm`, with an honest
+  `fix_type=no-fix`, zero satellites, and zero speed; no stale or fabricated
+  motion claim is being promoted. `.15` has both `mackesd` and the DRM shell
+  active (`NRestarts=0` for the shell). The direct MG90 SSH service accepts
+  connections on port 2222 but the available key is not authorized, so the
+  remaining live proof is a read-only `.15` DRM capture with the fresh mirror;
+  no credential was guessed.
+  The newest read-only Bus payload sampled from `.15` remains fresh and online:
+  MGOS `4.3.0.1`, battery `13.0V`, cellular `-93dBm`, `fix_type=no-fix`, zero
+  satellites, and zero speed. The live mirror remains present and honest; the
+  prior KMS capture limitation was repaired by the later linear scanout proof
+  below, while direct `.25` SSH credentials and real driving/fix data remain
+  external gates.
 - Progress (2026-07-23): the production map model now exposes a
   `refresh_from_persist` seam and a deterministic live/stale vehicle Bus fixture
   covering MG90 speed, battery, GNSS, WAN, and dashboard fold (including a six
@@ -976,8 +1490,8 @@ These decisions refine acceptance and sequencing for the active items below.
   search/menus, while host-down power prompts consume `deferred_notice` and emit
   no action until stopped (Lock stays available). The focused Car policy suite
   passed 8/8 and the moving Settings paint/defer regression passed 1/1 on farm
-  `.130`. Remaining is live MG90 + DRM-seat proof; human review is informative
-  only. A non-production `.15` DRM capture (fresh shell PID 2307515) proved the
+  `.130`. At that stage remaining was live MG90 + DRM-seat proof; human review
+  is informative only. A non-production `.15` DRM capture (fresh shell PID 2307515) proved the
   Car dashboard, left-third 10-tile instrument strip, and Nav/Media/Music/
   Comms/Vehicle/Settings strip with an online MG90 mirror; detiled PNG SHA256 is
   `54b9f22469c53b2d514e7baf8ba5a2ce0c1574cc29167efcda95bcd762bf9b56`. The same
@@ -985,6 +1499,100 @@ These decisions refine acceptance and sequencing for the active items below.
   with a regression test, so those nonzero coordinates cannot paint as a GPS
   lock. The seat was restored to workstation layout with the temporary boot
   override removed, service active, and DRM ownership confirmed.
+- Progress (2026-07-24 live Car pixel proof): with the `.15` vehicle mirror
+  publishing fresh `online=true`, MGOS `4.3.0.1`, `fix_type=no-fix`, zero
+  satellites, and zero speed, a reversible Car-profile + linear-GBM proof run
+  produced a 1920x1080 RGB PNG (SHA256
+  `abccf68e14102674626ed4c95e5ef9b31d66be59aa5f381d4f2e14860170d175`). Pixel
+  inspection shows Auto Mode, the full left instrument strip with honest no-fix
+  dashes, Navigation/Media/Telematics glance cards, and the six-app strip. The
+  appearance profile, secure boot curtain, and temporary systemd drop-in were
+  restored afterward; Construct is active again with the five required services
+  active and shell `NRestarts=0`. This closes the fresh `.15` Car pixel handoff;
+  direct MG90 SSH credentials and real driving/fix data remain external gates.
+- Progress (2026-07-24 MG90 access update): the operator confirmed full MG90
+  SSH access. The gateway is now also validated through its authenticated LCI
+  at `172.20.0.25`: MGOS `4.3.0.1`, main battery `13.00V`, cellular WAN up,
+  ignition `on`, eight satellites in view but zero usable, and GPS antenna
+  `Disconnected`. The live read-only LCI session proves the device and
+  management plane are reachable; the current root-SSH credential path still
+  rejects the configured ESN password, so the worker records an honest SSH GPS
+  gap rather than fabricating a fix. Real driving/fix acceptance remains open
+  until the antenna has a lock and the authorized SSH path is exercised.
+- Progress (2026-07-24 MG90 communication-plane adapter):
+  `install-helpers/mg90-access.sh` is now the canonical bounded entry point for
+  pinned root SSH (`ssh-probe`/`ssh-exec`), authenticated MG-LCI (`lci-get`), the
+  separate `:11532` application server (`app-get`), and read-only TCP inventory.
+  The current host proves `ssh-up`, `lci-up`, and `app-up`; a strict root probe
+  reaches the MG90 host but returns `Permission denied`, so no credential bypass
+  is claimed. The adapter requires root-only password files, never places a
+  password in argv, pins the verified `[172.20.0.25]:2222` ED25519 key, and
+  documents the GPS/OBD/HDOBD/GPIO/Acetech application surfaces. The Rust worker
+  now prefers the same root-only SSH password-file contract and feeds the
+  password over stdin. Farm `mackesd` vehicle tests passed 20/20 (including the
+  LCI ignition parser), and the LCI/application endpoint parsers remain the next
+  cutover before OBD or application telemetry can leave the honest-gap state.
+- Progress (2026-07-24 MG90 guide reconciliation): the Sierra Wireless AirLink
+  MG90 Software Configuration Guide Rev 6 confirms a higher-value documented
+  path we were not using: Status Broadcast emits a selectable UDP JSON beacon
+  carrying location, GPIO, WAN, GNSS fix/satellites/antenna, VPN, ignition,
+  battery, and temperature; GPS configuration also supports NMEA/TAIP local TCP,
+  UDP, serial, and remote forwarding with threshold-driven intervals. The
+  adapter now exposes receive/connect commands for those streams and records the
+  guide as the protocol authority. The live unit's broadcast/GPS forwarding
+  configuration is not yet read-only verified, so this remains an optional
+  evidence follow-up, not a cutover blocker or claimed live feed.
+- Progress (2026-07-24 status-beacon implementation): `mackesd` now accepts the
+  documented MG90 Status Broadcast UDP JSON stream through the bounded
+  `MDE_VEHICLE_STATUS_PORT` listener, validates coordinates/telemetry ranges,
+  prefers beacon battery/temperature/ignition/GNSS fields, and preserves LCI,
+  NMEA, and explicit stream-gap provenance when the beacon is malformed or
+  absent. The farm vehicle suite passes 22/22, including override and malformed
+  payload regressions. Live broadcast configuration and antenna/fix acceptance
+  remain open as non-blocking evidence follow-ups; no synthetic fix is promoted.
+- Progress (2026-07-24 bounded-status hardening): Status Broadcast datagrams now
+  have a 16 KiB receive bound with truncation and invalid-UTF-8 rejection, while
+  out-of-range satellite, voltage, and temperature fields are dropped without
+  silent clamping and LCI/NMEA fallbacks remain intact. The focused farm vehicle
+  suite is green at 24/24; live broadcast configuration and GNSS lock remain
+  non-blocking evidence follow-ups.
+- Progress (2026-07-24 wildfire consumer-boundary hardening): the retained NIFC
+  overlay now rejects future-dated snapshots and malformed coordinates, bounds
+  perimeter/polygon/ring/point work before tessellation, and fails soft to an
+  honest no-data or stale badge. The focused `.50` wildfire suite is green at
+  7/7.
+- Progress (2026-07-24 MG90 parser boundary hardening): GPGGA now verifies a
+  supplied NMEA checksum, rejects invalid coordinate/quality/satellite/HDOP/
+  altitude ranges, and preserves coordinate-free no-fix samples without
+  inventing a position. Empty Status Broadcast payloads now fail as a schema
+  gap and retain authenticated LCI values. The focused worker suite is green at
+  25/25 and the mesh-type vehicle suite at 8/8; no undocumented `:11532`
+  application response schema was guessed or promoted into telemetry.
+- Progress (2026-07-24 Car sparse-data and touch-boundary hardening): empty or
+  whitespace telemetry now falls back to honest descriptors, undersized viewports
+  fail closed before producing off-body targets, and all six Car strip routes
+  retain 44pt touch targets. The focused Car farm suite is green at 7/7; live
+  MG90 telemetry and rendered instrument-strip proof remain external evidence.
+- Progress (2026-07-24 Car Auto-mode degraded-state hardening): an undersized
+  workspace now renders an actionable “Resize workspace to use Auto Mode” notice
+  instead of silently showing only the title. The focused BigBoy Car binary gate
+  is green at 8/8.
+- Progress (2026-07-24 Car accessibility-boundary hardening): dashboard cards
+  and six app-strip targets now expose labeled button semantics, visible focus
+  rings, and shared Enter/Space activation in addition to pointer taps. The
+  focused BigBoy Car Home gate is green at 8/8; live visual evidence remains
+  external.
+- Progress (2026-07-24 Car navigation route hardening): the large Car Navigation
+  tile now selects the Maps `Drive` tab while the Vehicle tile remains on the
+  `Vehicle`/OBD telematics tab, so Navigation cannot open the telematics view or
+  strand the driver without a route-home path. The focused shell route test is
+  green, with the Car Home suite at 7/7; live MG90/seat evidence remains
+  external.
+- Progress (2026-07-24 firmware-fixture honesty): the simulated firmware workflow
+  no longer reports package integrity as a passing placeholder; it now renders an
+  explicit unverified warning and has a focused regression preventing false
+  verification wording. Live MG90 firmware checks remain hardware-gated and no
+  live evidence is claimed.
 - Priority: P1
 - Complexity: Epic
 - Problem: Car mode is a SYNC 3-styled 2x3 tile grid whose 7th tile wraps, with

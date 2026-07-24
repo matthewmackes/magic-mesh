@@ -136,13 +136,26 @@ pub fn build_reply(svc: &VoipService, verb: &str, req_body: Option<&str>) -> Str
                 Some(p) if p > 0 && p != 5060 => format!("{host}:{p}"),
                 _ => host,
             };
+            // `get-gateway` deliberately redacts the password. Treat a blank
+            // password posted back by the existing panel as "unchanged" when
+            // a credential is already stored, so loading and applying the
+            // form cannot silently erase the gateway secret. A new gateway
+            // may still be created without a password; clearing the whole
+            // gateway remains the explicit way to remove the record.
+            let requested_password = req
+                .get("password")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let password = if requested_password.is_empty() {
+                read_gateway(&path)
+                    .map(|current| current.password)
+                    .unwrap_or_default()
+            } else {
+                requested_password.to_string()
+            };
             let rec = GatewayFile {
                 username,
-                password: req
-                    .get("password")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
+                password,
                 server,
                 display_name: req
                     .get("display_name")
@@ -168,7 +181,12 @@ pub fn build_reply(svc: &VoipService, verb: &str, req_body: Option<&str>) -> Str
                     "host": host,
                     "port": port,
                     "username": rec.username,
-                    "password": rec.password,
+                    // Keep the panel's password field in the response shape,
+                    // but never return the stored credential over the open
+                    // read. `password_set` lets a caller distinguish a
+                    // configured secret from an intentionally empty one.
+                    "password": "",
+                    "password_set": !rec.password.is_empty(),
                     "display_name": rec.display_name,
                     "expires": rec.expires,
                 })
@@ -368,6 +386,41 @@ mod tests {
         assert_eq!(v["host"], "pbx.example.com");
         assert_eq!(v["port"], 5062);
         assert_eq!(v["username"], "alice");
+        assert_eq!(v["password"], "");
+        assert_eq!(v["password_set"], true);
+        assert!(
+            !g.contains("s3cret"),
+            "get-gateway leaked the password: {g}"
+        );
+    }
+
+    #[test]
+    fn redacted_get_can_be_resubmitted_without_clearing_password() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = VoipService::new(tmp.path());
+        let initial = json!({
+            "host": "pbx.example.com",
+            "username": "alice",
+            "password": "s3cret",
+            "display_name": "Alice"
+        })
+        .to_string();
+        assert!(build_reply(&svc, "set-gateway", Some(&initial)).contains("\"ok\":true"));
+
+        let loaded: serde_json::Value =
+            serde_json::from_str(&build_reply(&svc, "get-gateway", None)).unwrap();
+        let resubmitted = json!({
+            "host": loaded["host"],
+            "port": loaded["port"],
+            "username": loaded["username"],
+            "password": loaded["password"],
+            "display_name": loaded["display_name"]
+        })
+        .to_string();
+        assert!(build_reply(&svc, "set-gateway", Some(&resubmitted)).contains("\"ok\":true"));
+
+        let stored = read_gateway(&gateway_path(tmp.path())).expect("gateway remains present");
+        assert_eq!(stored.password, "s3cret");
     }
 
     #[test]

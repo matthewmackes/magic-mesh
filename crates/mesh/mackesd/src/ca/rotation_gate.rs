@@ -43,10 +43,13 @@ fn hash(phrase: &str) -> String {
 /// IO failures.
 pub fn set_passphrase(workgroup_root: &Path, phrase: &str) -> io::Result<()> {
     let path = gate_path(workgroup_root);
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    std::fs::write(path, hash(phrase))
+    // Keep this replicated authority file on the same no-follow, mode-0600,
+    // crash-durable atomic writer used by the CA material. In particular, do
+    // not create the parent here: the trusted helper validates every parent
+    // component before creating anything, so a hostile `ca` symlink is never
+    // followed.
+    crate::ca::seal::write_atomic_sealed(&path, hash(phrase).as_bytes())
+        .map_err(|error| io::Error::other(error.to_string()))
 }
 
 /// Check `phrase` against the stored gate.
@@ -110,6 +113,50 @@ mod tests {
         let stored = std::fs::read_to_string(gate_path(tmp.path())).unwrap();
         assert!(!stored.contains("hunter2"));
         assert_eq!(stored.len(), 64);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn set_passphrase_replaces_a_hostile_leaf_symlink_without_touching_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ca = tmp.path().join("ca");
+        std::fs::create_dir_all(&ca).unwrap();
+        let victim = tmp.path().join("victim");
+        std::fs::write(&victim, b"do-not-touch").unwrap();
+        let path = gate_path(tmp.path());
+        symlink(&victim, &path).unwrap();
+
+        set_passphrase(tmp.path(), "new phrase").unwrap();
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"do-not-touch");
+        assert!(!std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(verify(tmp.path(), "new phrase"), GateCheck::Ok);
+        assert!(!std::fs::read_dir(&ca).unwrap().flatten().any(|entry| entry
+            .file_name()
+            .to_string_lossy()
+            .contains(".rotation-passphrase.hash.tmp.")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn set_passphrase_rejects_a_hostile_symlinked_parent_without_writing_outside() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), tmp.path().join("ca")).unwrap();
+
+        assert!(set_passphrase(tmp.path(), "must fail").is_err());
+        assert!(!outside.path().join("rotation-passphrase.hash").exists());
     }
 
     #[test]

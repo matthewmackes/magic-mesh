@@ -43,6 +43,11 @@ use crate::nebula_enroll_endpoint::fingerprint;
 /// Whole-exchange budget — TCP connect + TLS handshake + POST + read.
 pub const NETWORK_ENROLL_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Maximum complete HTTP response buffered by the enrollment client. The
+/// lighthouse request path is deliberately small; a larger response cannot
+/// be a valid enrollment bundle and must not become an allocation oracle.
+pub const MAX_ENROLL_RESPONSE_BYTES: usize = 256 * 1024;
+
 /// XPA-11 — the enroll transport occasionally fails on the first attempt (the
 /// lighthouse busy, a cold relay path), so `network_enroll` retries **transient
 /// transport errors** this many times. Deterministic failures (fp mismatch,
@@ -403,9 +408,12 @@ async fn enroll_over_network_inner(
         .map_err(|e| NetEnrollError::Transport(format!("flush: {e}")))?;
 
     let mut raw = Vec::new();
-    tls.read_to_end(&mut raw)
+    let mut limited = (&mut tls).take((MAX_ENROLL_RESPONSE_BYTES + 1) as u64);
+    limited
+        .read_to_end(&mut raw)
         .await
         .map_err(|e| NetEnrollError::Transport(format!("read response: {e}")))?;
+    validate_response_size(&raw)?;
 
     let (status, body) = parse_http_response(&raw)
         .map_err(|e| NetEnrollError::Transport(format!("parse response: {e}")))?;
@@ -418,6 +426,16 @@ async fn enroll_over_network_inner(
     }
     serde_json::from_slice::<AuthenticatedEnrollmentResponse>(&body)
         .map_err(|e| NetEnrollError::BadBundle(e.to_string()))
+}
+
+fn validate_response_size(raw: &[u8]) -> Result<(), NetEnrollError> {
+    if raw.len() > MAX_ENROLL_RESPONSE_BYTES {
+        return Err(NetEnrollError::Transport(format!(
+            "enroll response exceeds {} bytes",
+            MAX_ENROLL_RESPONSE_BYTES
+        )));
+    }
+    Ok(())
 }
 
 /// Parse a minimal HTTP/1.1 response into (status, body). Accepts the
@@ -667,6 +685,9 @@ pub fn persist_authenticated_bundle(
     lighthouse_secrets: Option<&LighthouseEnrollmentSecrets>,
     requester_private_key: &Path,
 ) -> Result<(), NetEnrollError> {
+    if let Some(secrets) = lighthouse_secrets {
+        validate_lighthouse_authority_binding(bundle, secrets)?;
+    }
     crate::ca::bundle::write_relay_trust_authority_pin(
         bundle,
         std::path::Path::new(crate::ca::bundle::RELAY_TRUST_AUTHORITY_PIN_PATH),
@@ -696,6 +717,44 @@ pub fn persist_authenticated_bundle(
     // QNM-Shared bundle_path — where the supervisor re-reads on refresh.
     persist_steady_state_bundle(workgroup_root, node_id, bundle)?;
     Ok(())
+}
+
+/// Validate that a lighthouse-only relay authority seed is the private half of
+/// the public authority carried by the same authenticated response. Perform
+/// this before writing the root-local pin so a malformed response cannot leave
+/// a durable trust anchor for a signer that will never match it.
+fn validate_lighthouse_authority_binding(
+    bundle: &NebulaBundle,
+    secrets: &LighthouseEnrollmentSecrets,
+) -> Result<(), NetEnrollError> {
+    match (
+        bundle.relay_trust_authority.as_deref(),
+        secrets.relay_trust_authority_key.as_deref(),
+    ) {
+        (None, None) => Ok(()),
+        (Some(public), Some(private_hex)) => {
+            let private = crate::ca::bundle::relay_trust_authority_from_private_hex(private_hex)
+                .ok_or_else(|| {
+                    NetEnrollError::BadBundle(
+                        "lighthouse relay authority private key is malformed".into(),
+                    )
+                })?;
+            let derived = crate::ca::bundle::relay_trust_authority_public_key(&private);
+            if derived != public {
+                return Err(NetEnrollError::BadBundle(
+                    "lighthouse relay authority private key does not match bundle authority"
+                        .into(),
+                ));
+            }
+            Ok(())
+        }
+        (Some(_), None) => Err(NetEnrollError::BadBundle(
+            "bundle relay authority has no matching lighthouse private key".into(),
+        )),
+        (None, Some(_)) => Err(NetEnrollError::BadBundle(
+            "lighthouse private relay authority has no bundle public pin".into(),
+        )),
+    }
 }
 
 fn persist_steady_state_bundle(
@@ -907,6 +966,22 @@ printf '%s\\n' '-----BEGIN NEBULA X25519 PUBLIC KEY-----' 'AAAAAAAAAAAAAAAAAAAAA
     }
 
     #[test]
+    fn hostile_lighthouse_response_cannot_pair_a_different_authority_seed() {
+        let response = private_lighthouse_response();
+        let error = validate_lighthouse_authority_binding(
+            &response.bundle,
+            response
+                .lighthouse_secrets
+                .as_ref()
+                .expect("lighthouse secrets"),
+        )
+        .expect_err("mismatched authority seed must fail closed");
+        assert!(error
+            .to_string()
+            .contains("private key does not match bundle authority"));
+    }
+
+    #[test]
     fn hostile_cert_for_another_public_key_is_rejected() {
         let requester = "-----BEGIN NEBULA X25519 PUBLIC KEY-----\n\
 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n\
@@ -991,5 +1066,15 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n\
         let (status, body) = parse_http_response(raw).unwrap();
         assert_eq!(status, 401);
         assert!(body.starts_with(b"{\"error\""));
+    }
+
+    #[test]
+    fn oversized_response_is_rejected_before_bundle_parsing() {
+        let within = vec![b'x'; MAX_ENROLL_RESPONSE_BYTES];
+        validate_response_size(&within).expect("the response cap is inclusive");
+
+        let oversized = vec![b'x'; MAX_ENROLL_RESPONSE_BYTES + 1];
+        let error = validate_response_size(&oversized).expect_err("oversized response");
+        assert!(error.to_string().contains("exceeds"));
     }
 }

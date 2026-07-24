@@ -12,10 +12,13 @@
 //! append-only — an existing version file is never overwritten, so a
 //! mint race degrades to two distinct files whose election the
 //! `version → at → author` total order settles identically on every
-//! node ([`crate::elect_revision`]).
+//! node ([`crate::elect_revision`]). Reads admit only canonical zero-padded
+//! filenames, regular non-symlink files, and revisions passing
+//! [`Revision::validate`].
 
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::Revision;
 
@@ -51,23 +54,54 @@ pub fn next_version(dir: &Path) -> u64 {
 /// # Errors
 /// IO failures, serialization failure, or the version already existing.
 pub fn write_revision(dir: &Path, revision: &Revision) -> io::Result<PathBuf> {
+    revision.validate().map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing invalid revision: {e}"),
+        )
+    })?;
     std::fs::create_dir_all(dir)?;
     let path = revision_path(dir, revision.version);
-    if path.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!(
-                "revision {} already in the log (append-only)",
-                revision.version
-            ),
-        ));
-    }
     let yaml = revision
         .to_yaml()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-    let tmp = dir.join(format!(".{:020}.yaml.tmp", revision.version));
-    std::fs::write(&tmp, yaml)?;
-    std::fs::rename(&tmp, &path)?;
+    // A unique hidden staging file plus hard-link creation gives us an
+    // atomic, no-replace install on the replicated filesystem. `rename`
+    // replaces an existing destination on Unix, which would violate the
+    // append-only contract under a concurrent mint or a hostile symlink.
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let tmp = dir.join(format!(
+        ".{:020}.{}.{}.yaml.tmp",
+        revision.version,
+        std::process::id(),
+        stamp
+    ));
+    let result: io::Result<()> = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(yaml.as_bytes())?;
+        file.sync_all()?;
+        std::fs::hard_link(&tmp, &path).map_err(|e| {
+            if e.kind() == io::ErrorKind::AlreadyExists {
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "revision {} already in the log (append-only)",
+                        revision.version
+                    ),
+                )
+            } else {
+                e
+            }
+        })?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    result?;
     Ok(path)
 }
 
@@ -82,9 +116,28 @@ pub fn read_revisions(dir: &Path) -> Vec<Revision> {
     };
     let mut out: Vec<Revision> = entries
         .filter_map(Result::ok)
-        .filter(|e| e.path().extension().is_some_and(|x| x == "yaml"))
-        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
-        .filter_map(|raw| Revision::from_yaml(&raw).ok())
+        .filter_map(|e| {
+            let path = e.path();
+            let file_name = path.file_name()?.to_str()?;
+            let stem = file_name.strip_suffix(".yaml")?;
+            if stem.len() != 20 || !stem.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let version = stem.parse::<u64>().ok()?;
+            if revision_path(dir, version) != path {
+                return None;
+            }
+            let metadata = std::fs::symlink_metadata(&path).ok()?;
+            if !metadata.file_type().is_file() {
+                return None;
+            }
+            let raw = std::fs::read_to_string(&path).ok()?;
+            let revision = Revision::from_yaml(&raw).ok()?;
+            if revision.version != version || revision.validate().is_err() {
+                return None;
+            }
+            Some(revision)
+        })
         .collect();
     out.sort_by_key(|r| (r.version, r.at, r.author.clone()));
     out
@@ -186,23 +239,41 @@ pub fn nudges_dir(workgroup_root: &Path) -> PathBuf {
 /// # Errors
 /// IO failures.
 pub fn write_nudge(workgroup_root: &Path, hostname: &str) -> io::Result<PathBuf> {
+    write_nudge_payload(workgroup_root, hostname, "reconcile\n")
+}
+
+/// Write a nudge carrying an authenticated producer envelope.
+///
+/// The marker is still a one-file, idempotent trigger, but the payload lets
+/// the destination worker verify the exact Bus capability before it starts a
+/// reconcile. Legacy callers may use [`write_nudge`] and will be rejected by
+/// an authenticated consumer until they are migrated.
+pub fn write_nudge_payload(
+    workgroup_root: &Path,
+    hostname: &str,
+    payload: &str,
+) -> io::Result<PathBuf> {
     let dir = nudges_dir(workgroup_root);
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(hostname);
-    std::fs::write(
-        &path,
-        b"reconcile
-",
-    )?;
+    std::fs::write(&path, payload)?;
     Ok(path)
+}
+
+/// Consume the destination nudge and return its producer envelope.
+#[must_use]
+pub fn take_nudge_payload(workgroup_root: &Path, hostname: &str) -> Option<String> {
+    let path = nudges_dir(workgroup_root).join(hostname);
+    let payload = std::fs::read_to_string(&path).ok()?;
+    let _ = std::fs::remove_file(path);
+    Some(payload)
 }
 
 /// Consume this host's pending nudge — `true` exactly once per nudge
 /// (the file is removed).
 #[must_use]
 pub fn take_nudge(workgroup_root: &Path, hostname: &str) -> bool {
-    let path = nudges_dir(workgroup_root).join(hostname);
-    std::fs::remove_file(path).is_ok()
+    take_nudge_payload(workgroup_root, hostname).is_some()
 }
 
 #[cfg(test)]
@@ -267,6 +338,51 @@ mod tests {
         std::fs::write(dir.join("garbage.yaml"), "{{not yaml").unwrap();
         std::fs::write(dir.join("README.txt"), "hello").unwrap();
         assert_eq!(read_revisions(&dir).len(), 1);
+    }
+
+    #[test]
+    fn only_canonical_valid_revision_files_are_electable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = revisions_dir(tmp.path());
+        write_revision(&dir, &rev(1, 100, "peer:pine")).unwrap();
+        let yaml = rev(9, 900, "peer:oak").to_yaml().unwrap();
+        std::fs::write(dir.join("9.yaml"), &yaml).unwrap();
+        std::fs::write(
+            dir.join("00000000000000000002.yaml"),
+            rev(0, 0, "peer:oak").to_yaml().unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("00000000000000000003.yaml"),
+            rev(3, 300, "peer/evil").to_yaml().unwrap(),
+        )
+        .unwrap();
+        let all = read_revisions(&dir);
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].version, 1);
+    }
+
+    #[test]
+    fn invalid_revision_is_rejected_before_any_file_is_created() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = revisions_dir(tmp.path());
+        let error = write_revision(&dir, &rev(0, 100, "peer:pine")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(!dir.exists(), "invalid input must not create the log");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_install_does_not_follow_a_destination_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = revisions_dir(tmp.path());
+        std::fs::create_dir_all(&dir).unwrap();
+        let outside = tmp.path().join("outside.yaml");
+        std::fs::write(&outside, "untouched").unwrap();
+        std::os::unix::fs::symlink(&outside, revision_path(&dir, 1)).unwrap();
+        let error = write_revision(&dir, &rev(1, 100, "peer:pine")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(outside).unwrap(), "untouched");
     }
 
     #[test]

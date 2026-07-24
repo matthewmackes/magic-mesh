@@ -1482,11 +1482,42 @@ fn the_no_hypervisor_gate_reads_the_local_kvm_lane_status() {
         local_hypervisor_gate(&[lane("local-kvm", "ok (2 vms)")]).is_none(),
         "a live hypervisor does not gate"
     );
-    assert!(
-        local_hypervisor_gate(&[lane("mdns", "ok")]).is_none(),
-        "no local-kvm lane → no gate"
+    assert_eq!(
+        local_hypervisor_gate(&[lane("mdns", "ok")]).as_deref(),
+        Some("local-kvm capability not reported"),
+        "a local VM must be gated when the producer omits capability evidence"
     );
-    assert!(local_hypervisor_gate(&[]).is_none());
+    assert_eq!(
+        local_hypervisor_gate(&[]).as_deref(),
+        Some("local-kvm capability not reported"),
+        "an empty lane set is not proof that libvirt is available"
+    );
+    assert_eq!(
+        local_hypervisor_gate(&[lane("local-kvm", "unknown: backend state unavailable")])
+            .as_deref(),
+        Some("unknown: backend state unavailable"),
+        "an unrecognized lane status must fail closed"
+    );
+}
+
+#[test]
+fn the_gated_local_vm_has_no_enabled_context_menu_power_path() {
+    let local = local_vm("dev", "elm", "shut off");
+    assert_eq!(
+        super::render::power_menu_ops(&local, Some("local-kvm capability not reported")),
+        &[],
+        "the right-click menu must honor the same no-libvirt gate as the inline row"
+    );
+    assert_eq!(
+        super::render::power_menu_ops(&local, None),
+        &[PowerOp::Start],
+        "an explicitly healthy lane keeps the valid Start affordance"
+    );
+    assert!(
+        super::render::power_menu_ops(&source("peer:oak", "oak", &[Protocol::Rdp]), None)
+            .is_empty(),
+        "peer sources never expose local KVM power controls"
+    );
 }
 
 #[test]
@@ -1629,6 +1660,7 @@ fn add_and_remove_source_bodies_match_the_worker_shape() {
     // The add-source body carries host + port + protocol (§9 — never a command
     // string); an absent name is skipped so the worker defaults it to host:port.
     let add = AddSourceRequest {
+        schema_version: mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION,
         name: Some("OfficePC".to_string()),
         host: "10.0.0.5".to_string(),
         port: 3389,
@@ -1640,6 +1672,7 @@ fn add_and_remove_source_bodies_match_the_worker_shape() {
     assert_eq!(v["port"], 3389);
     assert_eq!(v["protocol"], "rdp");
     let bare = AddSourceRequest {
+        schema_version: mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION,
         name: None,
         host: "h".to_string(),
         port: 1,
@@ -1652,6 +1685,7 @@ fn add_and_remove_source_bodies_match_the_worker_shape() {
     );
     // The remove-source body is just the manual id.
     let rm = RemoveSourceRequest {
+        schema_version: mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION,
         id: "manual:h:1:vnc".to_string(),
     };
     let vr: serde_json::Value = serde_json::from_str(&rm.to_body()).unwrap();

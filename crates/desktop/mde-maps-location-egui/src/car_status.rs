@@ -355,7 +355,13 @@ pub fn telemetry_is_live(s: &MapsLocationSurface) -> bool {
 /// seed or an offline adapter. PLATFORM-INTERFACES Q33.
 #[must_use]
 pub fn live_speed_mph(s: &MapsLocationSurface) -> Option<f32> {
-    telemetry_is_live(s).then(|| s.vehicle.telemetry.speed_mph.max(0.0))
+    let mph = s.vehicle.telemetry.speed_mph;
+    // A gateway can be live while one decoded field is malformed.  Do not
+    // turn a negative/NaN/infinite speed into a fabricated stopped reading;
+    // the honest value for an unusable speed sample is absent.  The motion
+    // policy applies the same validation at its public boundary as defense in
+    // depth for callers that do not use this helper.
+    (telemetry_is_live(s) && mph.is_finite() && mph >= 0.0).then_some(mph)
 }
 
 fn cardinal(deg: f32) -> &'static str {
@@ -705,6 +711,36 @@ mod tests {
         s.refresh_from_vehicle(&offline);
         assert!(!telemetry_is_live(&s), "adapter offline is not live");
         assert_eq!(CarStatusItem::SpeedMph.value(&s), "—");
+    }
+
+    #[test]
+    fn malformed_live_speed_is_absent_not_clamped_or_rendered() {
+        use mackes_mesh_types::vehicle::VehicleState as WireVehicleState;
+
+        for speed in [-1.0, f32::NAN, f32::INFINITY] {
+            let mut mirror = WireVehicleState::offline("eagle");
+            mirror.online = true;
+            mirror.model = "MG90".to_string();
+            mirror.published_at_ms = test_now_ms();
+            mirror.telem.speed_mph = speed;
+
+            let mut s = MapsLocationSurface::live();
+            s.refresh_from_vehicle(&mirror);
+            assert!(
+                telemetry_is_live(&s),
+                "the source itself is live: {speed:?}"
+            );
+            assert_eq!(
+                live_speed_mph(&s),
+                None,
+                "invalid speed {speed:?} must not become a live reading"
+            );
+            assert_eq!(
+                CarStatusItem::SpeedMph.value(&s),
+                "—",
+                "invalid speed {speed:?} must dash in the instrument catalog"
+            );
+        }
     }
 
     #[test]

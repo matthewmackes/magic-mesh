@@ -29,6 +29,15 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Hard upper bound on rows materialized by the read-only roster export.
+///
+/// The enrollment path normally caps a mesh at twelve active peers, but an
+/// audited operator override can exceed that policy.  Keep this independent
+/// safety bound so a corrupt or cross-mesh database cannot make the exporter
+/// allocate without limit; overflow is an error rather than a truncated
+/// roster.
+const MAX_ROSTER_ROWS: usize = 4096;
+
 /// One row per active peer cert.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RosterRow {
@@ -60,7 +69,7 @@ pub struct RosterRow {
 /// Read every active row from `nebula_peer_certs` (revoked_at
 /// IS NULL), join with `nodes` for the display name + role,
 /// and project into a sorted Vec (by `node_id` ASC). Errors on
-/// any SQL failure.
+/// any SQL failure or when the bounded export size is exceeded.
 ///
 /// # Errors
 ///
@@ -95,6 +104,11 @@ pub fn export_roster(conn: &rusqlite::Connection) -> Result<Vec<RosterRow>, Stri
     let mut out = Vec::new();
     for r in rows {
         out.push(r.map_err(|e| format!("row: {e}"))?);
+    }
+    if out.len() > MAX_ROSTER_ROWS {
+        return Err(format!(
+            "roster contains more than {MAX_ROSTER_ROWS} active certificate rows"
+        ));
     }
     // Per-node deduplication: keep only the highest-epoch active
     // cert. The SQL ORDER BY puts the highest epoch first, so a
@@ -178,23 +192,22 @@ mod tests {
     }
 
     #[test]
-    fn export_roster_emits_empty_strings_when_nodes_row_missing() {
-        // A cert can outlive its nodes row (decommission +
-        // immediate re-enroll, or a manual sign without a
-        // matching node entry). The LEFT JOIN should COALESCE
-        // to defaults, not error.
+    fn export_roster_rejects_more_than_maximum_rows() {
         let conn = fresh_store();
-        conn.execute(
-            "INSERT INTO nebula_peer_certs \
-             (node_id, epoch, cert_pem, overlay_ip, expires_at) \
-             VALUES ('peer:orphan', 0, 'PEM-O', '10.42.0.9', 9999999)",
-            [],
-        )
-        .unwrap();
-        let rows = export_roster(&conn).expect("ok");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].name, "");
-        assert_eq!(rows[0].groups, "peer"); // COALESCE default
+        for i in 0..=MAX_ROSTER_ROWS {
+            conn.execute(
+                "INSERT INTO nebula_peer_certs \
+                 (node_id, epoch, cert_pem, overlay_ip, expires_at) \
+                 VALUES (?1, 0, 'PEM', ?2, 9999999)",
+                rusqlite::params![
+                    format!("peer:overflow-{i}"),
+                    format!("10.42.{}.{}", i / 256, (i % 256) + 1)
+                ],
+            )
+            .unwrap();
+        }
+        let error = export_roster(&conn).expect_err("oversized roster must fail closed");
+        assert!(error.contains("more than 4096"), "{error}");
     }
 
     #[test]

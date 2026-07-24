@@ -108,12 +108,14 @@
 
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_bus::rpc::reply_topic;
 
+use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
 use crate::ipc::secret_store::{self, SecretStore};
 use crate::workers::action::ActionRequest;
 
@@ -125,6 +127,11 @@ use super::{ShutdownToken, Worker};
 /// workbench publishes via the canonical RPC caller (`rpc::publish_request`,
 /// which rejects any topic outside `action/`).
 pub const ACTION_TOPIC: &str = "action/copilot/ask";
+
+/// Capability context for the resource-bearing ask lane. The copilot must
+/// verify this before reading the sealed key or launching the codex process.
+const COPILOT_AUTH_VERB: &str = "copilot-ask";
+const COPILOT_AUTH_TARGET: &str = "ask";
 
 /// Bus topic the copilot PUBLISHES typed action PROPOSALS to (FD-12 §2).
 ///
@@ -1119,6 +1126,8 @@ pub struct CopilotWorker {
     /// FD-13 — moderate alert-triage cadence ([`ALERT_TRIAGE_TOPIC`]). Tests
     /// shorten it.
     triage_interval: Duration,
+    /// Verifier for the root-only capability on `action/copilot/ask`.
+    authorizer: Arc<ActionAuthorizer>,
 }
 
 impl CopilotWorker {
@@ -1141,6 +1150,7 @@ impl CopilotWorker {
             suggestion_interval: DEFAULT_SUGGESTION_INTERVAL,
             suggestion_timeout: DEFAULT_SUGGESTION_TIMEOUT,
             triage_interval: DEFAULT_TRIAGE_INTERVAL,
+            authorizer: Arc::new(ActionAuthorizer::production()),
         }
     }
 
@@ -1164,6 +1174,14 @@ impl CopilotWorker {
     #[must_use]
     pub fn with_bus_root(mut self, p: PathBuf) -> Self {
         self.bus_root_override = Some(p);
+        self
+    }
+
+    /// Override the Copilot capability verifier for deterministic hostile
+    /// fixtures. Production always uses the root/systemd credential verifier.
+    #[must_use]
+    pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
+        self.authorizer = authorizer;
         self
     }
 
@@ -1859,7 +1877,31 @@ impl CopilotWorker {
                 );
                 continue;
             }
-            collected.push((msg.ulid, msg.body.unwrap_or_default()));
+            let Some(body) = msg.body else {
+                tracing::warn!(
+                    target: "mackesd::copilot",
+                    ulid = %msg.ulid,
+                    "refused empty action/copilot/ask body",
+                );
+                continue;
+            };
+            if let Err(error) = self.authorizer.authorize(
+                &body,
+                MutationContext {
+                    verb: COPILOT_AUTH_VERB,
+                    node: &self.node_id,
+                    target: COPILOT_AUTH_TARGET,
+                },
+            ) {
+                tracing::warn!(
+                    target: "mackesd::copilot",
+                    ulid = %msg.ulid,
+                    error = %error,
+                    "refused unauthorized action/copilot/ask",
+                );
+                continue;
+            }
+            collected.push((msg.ulid, body));
         }
         collected
     }
@@ -1967,6 +2009,29 @@ fn publish_triage(persist: &Persist, triage: &AlertTriage) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::action_auth::authorize_test_body;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const AUTH_KEY: &[u8] = b"copilot-action-auth-test-key";
+    const AUTH_NOW: i64 = 1_700_000_000_000;
+    static NEXT_NONCE: AtomicU64 = AtomicU64::new(1);
+
+    fn authorized_ask_body(w: &CopilotWorker, unsigned: &str, nonce: &str) -> String {
+        let mut value: serde_json::Value = serde_json::from_str(unsigned).expect("ask JSON");
+        value["schema_version"] = serde_json::Value::from(1_u64);
+        let body = serde_json::to_string(&value).expect("ask envelope");
+        authorize_test_body(
+            AUTH_KEY,
+            &body,
+            MutationContext {
+                verb: COPILOT_AUTH_VERB,
+                node: &w.node_id,
+                target: COPILOT_AUTH_TARGET,
+            },
+            nonce,
+            AUTH_NOW + 30_000,
+        )
+    }
 
     #[test]
     fn action_topic_is_canonical_three_segments() {
@@ -1995,6 +2060,41 @@ mod tests {
     fn parse_ask_rejects_garbage() {
         let err = parse_ask_request("not json").expect_err("should fail");
         assert!(err.contains("malformed"), "{err}");
+    }
+
+    #[test]
+    fn copilot_ask_requires_exact_single_use_capability() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bus = Persist::open(tmp.path().join("bus")).expect("persist");
+        let w =
+            CopilotWorker::new(tmp.path().to_path_buf(), "n1".into()).with_authorizer(Arc::new(
+                ActionAuthorizer::for_test(AUTH_KEY, tmp.path().join("auth"), AUTH_NOW),
+            ));
+        let mut cursor = None;
+        let unsigned = r#"{"prompt":"show status"}"#;
+
+        bus.write(ACTION_TOPIC, Priority::Default, None, Some(unsigned))
+            .expect("unsigned ask");
+        assert!(
+            w.collect_asks(&bus, &mut cursor).is_empty(),
+            "unsigned asks never reach key access or codex"
+        );
+
+        let nonce = format!(
+            "copilot-test-{:032x}",
+            NEXT_NONCE.fetch_add(1, Ordering::Relaxed)
+        );
+        let authorized = authorized_ask_body(&w, unsigned, &nonce);
+        bus.write(ACTION_TOPIC, Priority::Default, None, Some(&authorized))
+            .expect("authorized ask");
+        assert_eq!(w.collect_asks(&bus, &mut cursor).len(), 1);
+
+        bus.write(ACTION_TOPIC, Priority::Default, None, Some(&authorized))
+            .expect("replayed ask");
+        assert!(
+            w.collect_asks(&bus, &mut cursor).is_empty(),
+            "a copilot capability is single-use"
+        );
     }
 
     #[test]

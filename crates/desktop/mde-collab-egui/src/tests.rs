@@ -265,6 +265,37 @@ fn rail_row_model_maps_the_directory_in_order() {
 }
 
 #[test]
+fn call_bar_rejects_a_selection_removed_from_the_directory() {
+    // The read model may remove a space while the surface still holds its
+    // previous view selection. The persistent call bar must not offer a
+    // StartCall target that is no longer a member of the directory.
+    let removed = SpaceId::new();
+    let data = FixtureData::new("eagle", 1_000);
+
+    assert_eq!(
+        crate::frame::selected_space_in_directory(Some(removed), data.space_directory()),
+        None,
+        "an empty directory must invalidate a retained selection"
+    );
+
+    let present = SpaceId::new();
+    let data = FixtureData::new("eagle", 1_000).with_space(space_summary(
+        present,
+        SpaceKind::Team,
+        "Team Ops",
+        SpaceRole::Owner,
+        0,
+        1,
+        1_000,
+    ));
+    assert_eq!(
+        crate::frame::selected_space_in_directory(Some(present), data.space_directory()),
+        Some(present),
+        "a current directory member remains a valid call target"
+    );
+}
+
+#[test]
 fn rail_paints_the_shared_sidebar_with_the_unread_badge_overlay() {
     // PLATFORM-INTERFACES Q19 — the painted rail is the shared Sidebar: the
     // "Spaces" section header and both row labels paint, the auto-selected
@@ -1530,6 +1561,11 @@ fn switching_space_resets_the_picked_document() {
         surface.active_document(),
         None,
         "a space switch must reset the picked document"
+    );
+    assert_eq!(
+        surface.document_editor_text(),
+        None,
+        "a space switch must close the previous space's editor so its Markdown cannot remain visible"
     );
 }
 

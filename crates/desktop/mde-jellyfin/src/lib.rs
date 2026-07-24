@@ -59,7 +59,7 @@
 //!
 //! // The pure request builder needs no transport — the URL + auth header are
 //! // fully formed and unit-testable before any byte hits the wire.
-//! let device = ClientInfo::new("mde-media", "workstation", "device-42", "12.0.0");
+//! let device = ClientInfo::new("mde-media", "workstation", "device-42", env!("CARGO_PKG_VERSION"));
 //! let req = mde_jellyfin::build_items_request(
 //!     "https://jelly.mesh:8096",
 //!     "user-abc",

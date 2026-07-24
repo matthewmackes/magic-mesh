@@ -3032,7 +3032,12 @@ mod tests {
     // ── Jellyfin Sources (MEDIA-10) ──────────────────────────────────────────────
 
     fn jelly_device() -> ClientInfo {
-        ClientInfo::new("mde-media", "workstation", "device-42", "12.0.0")
+        ClientInfo::new(
+            "mde-media",
+            "workstation",
+            "device-42",
+            env!("CARGO_PKG_VERSION"),
+        )
     }
 
     /// A Jellyfin movie with one direct-playable (mkv / h264 / aac) source.

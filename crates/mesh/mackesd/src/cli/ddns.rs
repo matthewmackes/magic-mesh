@@ -82,10 +82,43 @@ pub fn run(action: DdnsCmd) -> anyhow::Result<()> {
         let svc = DdnsService::new(root);
         let reply = build_reply(&svc, verb, body.as_deref());
         println!("{reply}");
-        // Exit non-zero on an error reply so scripts can branch on it.
-        if reply.contains("\"error\"") {
+        // Exit non-zero on an error reply so scripts can branch on it. Inspect
+        // the reply's top-level JSON field rather than searching the serialized
+        // payload: a valid record/config value may itself contain the string
+        // `"error"`.
+        if reply_is_error(&reply) {
             std::process::exit(1);
         }
     }
     Ok(())
+}
+
+/// Return whether a DDNS reply is an error envelope.
+///
+/// `build_reply` always emits a JSON object, but treat an unexpected or
+/// malformed reply as an error so the CLI remains fail-closed for scripts.
+fn reply_is_error(reply: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(reply)
+        .map(|value| value.get("error").is_some())
+        .unwrap_or(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reply_is_error;
+
+    #[test]
+    fn success_payload_with_error_value_is_not_an_error_reply() {
+        let reply = r#"{
+            "ok": true,
+            "config": {"record": [{"name": "error", "source": "wan"}]}
+        }"#;
+        assert!(!reply_is_error(reply));
+    }
+
+    #[test]
+    fn top_level_error_and_malformed_replies_fail_closed() {
+        assert!(reply_is_error(r#"{"error":"bad config"}"#));
+        assert!(reply_is_error("not-json"));
+    }
 }

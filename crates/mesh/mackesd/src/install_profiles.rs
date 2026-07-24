@@ -224,12 +224,107 @@ pub fn write_profile(
 ) -> Result<PathBuf, ProfileWriteError> {
     validate_profile(profile)?;
     let dir = profiles_dir(workgroup_root);
+    reject_symlinked_directory_components(&dir)
+        .map_err(|e| ProfileWriteError::Io(e.to_string()))?;
     std::fs::create_dir_all(&dir).map_err(|e| ProfileWriteError::Io(e.to_string()))?;
+    reject_symlinked_directory_components(&dir)
+        .map_err(|e| ProfileWriteError::Io(e.to_string()))?;
     let body =
         toml::to_string_pretty(profile).map_err(|e| ProfileWriteError::Serialize(e.to_string()))?;
     let path = dir.join(format!("{}.toml", profile.name));
-    std::fs::write(&path, body).map_err(|e| ProfileWriteError::Io(e.to_string()))?;
+    write_atomic_public(&path, body.as_bytes())
+        .map_err(|e| ProfileWriteError::Io(e.to_string()))?;
     Ok(path)
+}
+
+/// Refuse to traverse a replicated directory symlink while preparing a profile
+/// destination. The final TOML is replaced by rename only after its complete
+/// body is synced, so a bad peer cannot redirect the write through a parent or
+/// expose a truncated profile.
+fn reject_symlinked_directory_components(path: &Path) -> std::io::Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("refusing symlinked profile directory {}", current.display()),
+                ));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotADirectory,
+                    format!(
+                        "profile path component is not a directory: {}",
+                        current.display()
+                    ),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+/// Crash-durable public-state replacement for a profile TOML. The unique
+/// `create_new` sibling cannot follow an attacker-created temp symlink; the
+/// final rename replaces a destination symlink without touching its target.
+fn write_atomic_public(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} has no parent directory", path.display()),
+        )
+    })?;
+    let leaf = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid profile filename {}", path.display()),
+            )
+        })?;
+    let (tmp, mut file) = (0..16)
+        .find_map(|_| {
+            let candidate = parent.join(format!(
+                ".{leaf}.tmp.{}.{}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            match std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&candidate)
+            {
+                Ok(file) => Some(Ok((candidate, file))),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .unwrap_or_else(|| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("temporary profile collisions for {}", path.display()),
+            ))
+        })?;
+
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)?;
+        std::fs::File::open(parent)?.sync_all()
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// Delete an on-disk profile's TOML by name. A core profile has no TOML,
@@ -448,5 +543,67 @@ mod tests {
         // A core profile has no TOML → delete is a clean no-op (false).
         assert!(!delete_profile("lighthouse", tmp.path()).unwrap());
         assert_eq!(load_profiles(tmp.path()).len(), core_pack().len());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_profile_replaces_final_symlink_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = InstallProfile {
+            name: "edge-relay".into(),
+            description: "safe replacement".into(),
+            role: "server".into(),
+            tags: BTreeSet::from(["execution".to_string()]),
+            ks_fragments: vec![],
+            auto_join: false,
+        };
+        let dir = profiles_dir(tmp.path());
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = tmp.path().join("victim.toml");
+        std::fs::write(&victim, b"sentinel").unwrap();
+        symlink(&victim, dir.join("edge-relay.toml")).unwrap();
+
+        write_profile(&profile, tmp.path()).expect("replace safely");
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"sentinel");
+        assert_eq!(
+            load_profiles(tmp.path())
+                .into_iter()
+                .find(|candidate| candidate.name == profile.name),
+            Some(profile)
+        );
+        assert!(!std::fs::symlink_metadata(dir.join("edge-relay.toml"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(!std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().contains(".tmp.")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_profile_rejects_symlinked_parent_before_escape() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), profiles_dir(tmp.path())).unwrap();
+
+        let profile = InstallProfile {
+            name: "edge-relay".into(),
+            description: String::new(),
+            role: "server".into(),
+            tags: BTreeSet::new(),
+            ks_fragments: vec![],
+            auto_join: false,
+        };
+        let error = write_profile(&profile, tmp.path())
+            .expect_err("symlinked profile root must be rejected");
+        assert!(matches!(error, ProfileWriteError::Io(_)));
+        assert!(!outside.path().join("edge-relay.toml").exists());
     }
 }

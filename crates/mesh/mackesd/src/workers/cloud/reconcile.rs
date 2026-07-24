@@ -21,6 +21,7 @@
 //! [`DriftFlag::Unknown`] rather than a fabricated `InSync`; a missing desired dir is
 //! an honest empty slice, never an invented workload.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use mackes_mesh_types::cloud::{
@@ -59,6 +60,127 @@ pub(crate) fn desired_doc_path(
     )))
 }
 
+/// Walk the desired-state directory without following symlinks. The Bus is a
+/// cross-UID input boundary, so a planted link in the state tree must not turn a
+/// workload write, read, or removal into an operation on an unrelated path.
+///
+/// When `create` is false, a missing component is an ordinary empty slice. When
+/// true, each missing component is created only after its parent has been
+/// verified as a real directory; a race is re-checked with `symlink_metadata`.
+fn checked_desired_dir(
+    state_root: &Path,
+    node: &str,
+    create: bool,
+) -> Result<Option<PathBuf>, String> {
+    let node = path_key::segment("node", node)?;
+    let mut path = state_root.to_path_buf();
+    let root_metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
+            std::fs::create_dir_all(&path)
+                .map_err(|e| format!("create desired state root {}: {e}", path.display()))?;
+            std::fs::symlink_metadata(&path)
+                .map_err(|e| format!("inspect desired state root {}: {e}", path.display()))?
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "inspect desired state root {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    if !root_metadata.file_type().is_dir() {
+        return Err(format!(
+            "desired state root {} is not a directory",
+            path.display()
+        ));
+    }
+
+    for component in ["mcnf", "cloud", "desired", node] {
+        path.push(component);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Ok(_) => {
+                return Err(format!(
+                    "desired path component {} is not a real directory",
+                    path.display()
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
+                if let Err(create_error) = std::fs::create_dir(&path) {
+                    if create_error.kind() != std::io::ErrorKind::AlreadyExists {
+                        return Err(format!(
+                            "create desired path component {}: {create_error}",
+                            path.display()
+                        ));
+                    }
+                }
+                let metadata = std::fs::symlink_metadata(&path).map_err(|e| {
+                    format!("inspect desired path component {}: {e}", path.display())
+                })?;
+                if !metadata.file_type().is_dir() {
+                    return Err(format!(
+                        "desired path component {} is not a real directory",
+                        path.display()
+                    ));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(format!(
+                    "inspect desired path component {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(Some(path))
+}
+
+/// Replace one desired document atomically. `create_new` prevents a stale temp
+/// path or a planted symlink from becoming the write target; `rename` replaces a
+/// destination symlink itself rather than following it on Linux.
+fn write_desired_doc_atomic(path: &Path, body: &str) -> Result<(), String> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            format!(
+                "desired document path has no valid filename: {}",
+                path.display()
+            )
+        })?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let temp = path.with_file_name(format!(".{file_name}.tmp-{}-{nonce}", std::process::id()));
+
+    let result = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temp)
+            .map_err(|e| format!("create temporary desired document {}: {e}", temp.display()))?;
+        file.write_all(body.as_bytes())
+            .map_err(|e| format!("write temporary desired document {}: {e}", temp.display()))?;
+        file.sync_all()
+            .map_err(|e| format!("sync temporary desired document {}: {e}", temp.display()))?;
+        std::fs::rename(&temp, path)
+            .map_err(|e| format!("replace desired document {}: {e}", path.display()))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
 /// Read node `node`'s desired-state slice — every `*.json` doc under its desired
 /// dir, parsed into a [`WorkloadSpec`], sorted by name for a deterministic render.
 ///
@@ -67,7 +189,7 @@ pub(crate) fn desired_doc_path(
 /// declared, well-formed workloads still converge.
 #[must_use]
 pub(crate) fn read_desired_slice(state_root: &Path, node: &str) -> Vec<WorkloadSpec> {
-    let Ok(dir) = desired_dir(state_root, node) else {
+    let Ok(Some(dir)) = checked_desired_dir(state_root, node, false) else {
         return Vec::new();
     };
     let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -79,10 +201,27 @@ pub(crate) fn read_desired_slice(state_root: &Path, node: &str) -> Vec<WorkloadS
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
+        let Some(file_stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.file_type().is_file() {
+            continue;
+        }
         let Ok(body) = std::fs::read_to_string(&path) else {
             continue;
         };
         if let Ok(spec) = serde_json::from_str::<WorkloadSpec>(&body) {
+            let Ok(expected_stem) =
+                path_key::file_stem("name", &spec.name, DESIRED_DOC_SUFFIX)
+            else {
+                continue;
+            };
+            if spec.node != node || file_stem != expected_stem {
+                continue;
+            }
             specs.push(spec);
         }
     }
@@ -99,13 +238,12 @@ pub(crate) fn read_desired_slice(state_root: &Path, node: &str) -> Vec<WorkloadS
 pub(crate) fn write_desired_doc(state_root: &Path, spec: &WorkloadSpec) -> Result<(), String> {
     let node = path_key::segment("node", &spec.node)?;
     let name = path_key::file_stem("name", &spec.name, DESIRED_DOC_SUFFIX)?;
-    let dir = desired_dir(state_root, node)?;
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("create desired dir {}: {e}", dir.display()))?;
+    let dir = checked_desired_dir(state_root, node, true)?
+        .ok_or_else(|| format!("desired directory {} was not created", state_root.display()))?;
     let body =
         serde_json::to_string_pretty(spec).map_err(|e| format!("serialize desired doc: {e}"))?;
-    let path = desired_doc_path(state_root, node, name)?;
-    std::fs::write(&path, body).map_err(|e| format!("write {}: {e}", path.display()))
+    let path = dir.join(format!("{name}{DESIRED_DOC_SUFFIX}"));
+    write_desired_doc_atomic(&path, &body)
 }
 
 /// Remove workload `name`'s desired-state doc from node `node`. Returns whether a
@@ -119,11 +257,22 @@ pub(crate) fn remove_desired_doc(
     node: &str,
     name: &str,
 ) -> Result<bool, String> {
-    let path = desired_doc_path(state_root, node, name)?;
-    match std::fs::remove_file(&path) {
-        Ok(()) => Ok(true),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(format!("remove {}: {e}", path.display())),
+    let name = path_key::file_stem("name", name, DESIRED_DOC_SUFFIX)?;
+    let Some(dir) = checked_desired_dir(state_root, node, false)? else {
+        return Ok(false);
+    };
+    let path = dir.join(format!("{name}{DESIRED_DOC_SUFFIX}"));
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if !metadata.file_type().is_file() => Err(format!(
+            "refusing to remove non-regular desired document {}",
+            path.display()
+        )),
+        Ok(_) => match std::fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(error) => Err(format!("remove {}: {error}", path.display())),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("inspect {}: {error}", path.display())),
     }
 }
 
@@ -341,6 +490,62 @@ mod tests {
         assert!(remove_desired_doc(&root, "../escape", "victim").is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn desired_store_is_symlink_hostile_for_directory_reads_writes_and_removes() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("state");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(root.join("mcnf/cloud")).unwrap();
+        symlink(&outside, root.join("mcnf/cloud/desired")).unwrap();
+
+        let err = write_desired_doc(&root, &spec("web", "eagle")).unwrap_err();
+        assert!(
+            err.contains("not a real directory"),
+            "unexpected error: {err}"
+        );
+        assert!(!outside.join("eagle").exists());
+
+        std::fs::remove_file(root.join("mcnf/cloud/desired")).unwrap();
+        write_desired_doc(&root, &spec("web", "eagle")).unwrap();
+        let dir = desired_dir(&root, "eagle").unwrap();
+        let doc = desired_doc_path(&root, "eagle", "web").unwrap();
+
+        // A symlinked JSON entry is ignored by reads instead of leaking an
+        // outside document into this node's desired slice.
+        let outside_file = outside.join("foreign.json");
+        std::fs::write(
+            &outside_file,
+            serde_json::to_string(&spec("leak", "eagle")).unwrap(),
+        )
+        .unwrap();
+        symlink(&outside_file, dir.join("leak.json")).unwrap();
+        let slice = read_desired_slice(&root, "eagle");
+        assert_eq!(slice.len(), 1);
+        assert_eq!(slice[0].name, "web");
+
+        // Atomic replacement swaps out a planted document link without touching
+        // its target, and removal refuses the link rather than following it.
+        std::fs::remove_file(&doc).unwrap();
+        symlink(&outside_file, &doc).unwrap();
+        write_desired_doc(&root, &spec("web", "eagle")).unwrap();
+        assert_eq!(
+            serde_json::from_str::<WorkloadSpec>(&std::fs::read_to_string(&outside_file).unwrap())
+                .unwrap()
+                .name,
+            "leak"
+        );
+
+        std::fs::remove_file(&doc).unwrap();
+        symlink(&outside_file, &doc).unwrap();
+        let err = remove_desired_doc(&root, "eagle", "web").unwrap_err();
+        assert!(err.contains("non-regular"), "unexpected error: {err}");
+        assert!(doc.is_symlink());
+    }
+
     #[test]
     fn desired_store_accepts_hostname_and_workload_tokens() {
         let tmp = tempfile::tempdir().unwrap();
@@ -348,6 +553,24 @@ mod tests {
         let slice = read_desired_slice(tmp.path(), "node-1.example_lab");
         assert_eq!(slice.len(), 1);
         assert_eq!(slice[0].name, "web_api.v2");
+    }
+
+    #[test]
+    fn desired_read_rejects_a_payload_name_that_does_not_match_its_filename() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_desired_doc(root, &spec("web", "eagle")).unwrap();
+        let dir = desired_dir(root, "eagle").unwrap();
+        let canonical = desired_doc_path(root, "eagle", "web").unwrap();
+        let forged = dir.join("wrong.json");
+
+        // A stale/hostile regular file must not smuggle a workload into the
+        // slice under a name that remove_desired_doc cannot address.
+        std::fs::rename(&canonical, &forged).unwrap();
+        let slice = read_desired_slice(root, "eagle");
+        assert!(slice.is_empty(), "mismatched desired doc was reconciled");
+        assert!(!remove_desired_doc(root, "eagle", "web").unwrap());
+        assert!(forged.is_file(), "the rejected record must remain inspectable");
     }
 
     #[test]

@@ -36,8 +36,8 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use mde_egui::egui::{self, FontId, Rect, TextureHandle, TextureOptions, Vec2};
-use mde_egui::{Motion, Style};
+use mde_egui::egui::{self, Rect, TextureHandle, TextureOptions, Vec2};
+use mde_egui::{Motion, Style, TypographyRole};
 
 use mde_theme::brand;
 use serde::{Deserialize, Serialize};
@@ -305,18 +305,19 @@ fn paint_status(
     anchor: StatusAnchor,
 ) {
     let center_x = free.center().x;
-    let title_galley = painter.layout_no_wrap(
-        title.to_owned(),
-        FontId::proportional(Style::BODY),
+    let title_galley = painter.layout_job(Style::typography_job(
+        title,
+        TypographyRole::Body,
         Style::TEXT,
-    );
+        f32::INFINITY,
+    ));
     let wrap = Style::SP_XL.mul_add(-2.0, free.width()).max(Style::SP_XL);
-    let detail_galley = painter.layout(
-        detail.to_owned(),
-        FontId::proportional(Style::SMALL),
+    let detail_galley = painter.layout_job(Style::typography_job(
+        detail,
+        TypographyRole::Caption,
         Style::TEXT_DIM,
         wrap,
-    );
+    ));
 
     let block_w = title_galley.size().x.max(detail_galley.size().x);
     let block_h = title_galley.size().y + Style::SP_XS + detail_galley.size().y;
@@ -362,21 +363,24 @@ fn paint_watermark(ui: &egui::Ui, painter: &egui::Painter, free: Rect, screen: R
     // ink-independent), so a single layout serves both the resting ghost and the
     // hover-brightened link — the ink is applied as a paint-time override below.
     let galleys = [
-        painter.layout_no_wrap(
+        painter.layout_job(Style::typography_job(
             product.clone(),
-            FontId::proportional(Style::BODY),
+            TypographyRole::Body,
             egui::Color32::PLACEHOLDER,
-        ),
-        painter.layout_no_wrap(
+            f32::INFINITY,
+        )),
+        painter.layout_job(Style::typography_job(
             version.clone(),
-            FontId::proportional(Style::SMALL),
+            TypographyRole::Caption,
             egui::Color32::PLACEHOLDER,
-        ),
-        painter.layout_no_wrap(
+            f32::INFINITY,
+        )),
+        painter.layout_job(Style::typography_job(
             node.clone(),
-            FontId::proportional(Style::SMALL),
+            TypographyRole::Caption,
             egui::Color32::PLACEHOLDER,
-        ),
+            f32::INFINITY,
+        )),
     ];
 
     // Springboard owns the entire central canvas. Keep the watermark inside the

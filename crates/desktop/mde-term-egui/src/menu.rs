@@ -30,6 +30,11 @@
 use std::path::{Path, PathBuf};
 use std::process::Command as OsCommand;
 
+use mackes_mesh_types::cloud::{
+    cloud_request_digest, CloudArmSigner, CloudArmedToken, CLOUD_ACTION_SCHEMA_VERSION,
+};
+#[cfg(not(test))]
+use mackes_mesh_types::cloud::{decode_cloud_arm_credential, CLOUD_ARM_CREDENTIAL};
 use serde::{Deserialize, Serialize};
 
 use mde_chat::MessageKind;
@@ -40,6 +45,12 @@ use mde_chat::MessageKind;
 /// local mirror of the worker's request shape, never a dep on `mackesd` (the same
 /// discipline `mde-files-egui::chat_bridge` and [`crate::notify`] keep).
 pub const ACTION_CHAT_SEND: &str = "action/chat/send";
+
+/// The exact capability verb for a local chat-send mutation.
+const CHAT_AUTH_VERB: &str = "chat-send";
+
+/// Keep a chat capability useful for one Bus drain while limiting replay value.
+const ACTION_TOKEN_TTL_MS: i64 = 30_000;
 
 /// The placeholder tokens a custom-command template substitutes the selection
 /// for — `{}` (the common shell idiom) or `%s` (Terminator's spelling).
@@ -141,6 +152,8 @@ impl CommandRunner for OsCommandRunner {
 /// NOTIFY-CHAT [`MessageKind::Text`] carrying the selection.
 #[derive(Serialize)]
 struct ChatSend<'a> {
+    /// Schema version required by the privileged action contract.
+    schema_version: u16,
     /// `"peer"` — a 1:1 conversation (the worker's `Scope::Peer`, `snake_case`).
     scope: &'a str,
     /// The recipient contact: a peer **host** (username = hostname).
@@ -150,21 +163,114 @@ struct ChatSend<'a> {
     kind: MessageKind,
 }
 
+/// Load the production mint authority from the root DRM shell's sealed systemd
+/// credential. Test builds use the existing deterministic injection seam so the
+/// Bus contract remains executable without a live service credential.
+fn action_signer() -> Result<CloudArmSigner, String> {
+    #[cfg(test)]
+    {
+        return CloudArmSigner::new(b"0123456789abcdef0123456789abcdef".to_vec())
+            .map_err(str::to_string);
+    }
+    #[cfg(not(test))]
+    {
+        if !rustix::process::geteuid().is_root() {
+            return Err(
+                "Chat-send authorization is available only in the root DRM shell.".to_string(),
+            );
+        }
+        let directory = std::env::var_os("CREDENTIALS_DIRECTORY")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .ok_or_else(|| {
+                "The root shell has no systemd action credential; chat sends are disabled."
+                    .to_string()
+            })?;
+        let path = directory.join(CLOUD_ARM_CREDENTIAL);
+        let raw = std::fs::read(&path)
+            .map_err(|e| format!("Could not read systemd action credential: {e}"))?;
+        let key = decode_cloud_arm_credential(&raw).map_err(str::to_string)?;
+        CloudArmSigner::new(key).map_err(str::to_string)
+    }
+}
+
+/// Add schema 1 and an exact-body, short-lived HMAC capability to one chat
+/// request. The unsigned JSON, including schema 1, is what the token hashes.
+fn authorize_chat_body(to: &str, body: &str) -> Result<String, String> {
+    let signer = action_signer()?;
+    let mut document: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("Invalid chat-send request body: {e}"))?;
+    let object = document
+        .as_object_mut()
+        .ok_or_else(|| "Chat-send request body is not a JSON object.".to_string())?;
+    object.remove("armed_token");
+    object.insert(
+        "schema_version".to_string(),
+        serde_json::Value::from(CLOUD_ACTION_SCHEMA_VERSION),
+    );
+    let node = crate::layout::local_node();
+    let target = format!("peer:{to}");
+    if to.contains('|') || to.len() > 251 || to.trim().is_empty() {
+        return Err("Chat-send authorization target is not capability-safe.".to_string());
+    }
+    for (label, value) in [
+        ("verb", CHAT_AUTH_VERB),
+        ("node", node.as_str()),
+        ("target", target.as_str()),
+    ] {
+        if value.contains('|') || value.len() > 255 || value.trim().is_empty() {
+            return Err(format!(
+                "Chat-send authorization {label} is not capability-safe."
+            ));
+        }
+    }
+    let unsigned = document.to_string();
+    use rand::RngCore as _;
+    let mut nonce_bytes = [0_u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = nonce_bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .map_err(|_| "The system clock is before the Unix epoch.".to_string())?;
+    let token = CloudArmedToken::mint(
+        &signer,
+        &nonce,
+        now.saturating_add(ACTION_TOKEN_TTL_MS),
+        CHAT_AUTH_VERB,
+        &node,
+        &target,
+        &cloud_request_digest(&unsigned).map_err(str::to_string)?,
+    )
+    .encode();
+    document
+        .as_object_mut()
+        .expect("validated object")
+        .insert("armed_token".to_string(), serde_json::Value::String(token));
+    serde_json::to_string(&document).map_err(|e| format!("Couldn't encode chat send: {e}"))
+}
+
 /// Build the `action/chat/send` body posting `text` (the selection) to `to`.
 ///
-/// The message is a [`MessageKind::Text`] in `to`'s conversation — the pure,
-/// headless core of [`BusChatClient::send`] (its exact wire shape is asserted
-/// without a Bus).
+/// The message is a [`MessageKind::Text`] in `to`'s conversation — the
+/// headless request builder used by [`BusChatClient::send`] (its exact wire
+/// shape is asserted without a Bus).
 ///
 /// # Errors
-/// A serialization failure (never expected for this fixed shape).
+/// Returns an encoding, credential, clock, or capability-scope error; production
+/// callers therefore fail closed when the root systemd credential is unavailable.
 pub fn chat_send_body(to: &str, text: &str) -> Result<String, String> {
-    serde_json::to_string(&ChatSend {
+    let body = serde_json::to_string(&ChatSend {
+        schema_version: CLOUD_ACTION_SCHEMA_VERSION,
         scope: "peer",
         to,
         kind: MessageKind::Text(text.to_string()),
     })
-    .map_err(|e| format!("Couldn't encode the chat send: {e}"))
+    .map_err(|e| format!("Couldn't encode the chat send: {e}"))?;
+    authorize_chat_body(to, &body)
 }
 
 /// The Bus seam send-selection-to-Chat is dispatched over — publish the selection
@@ -353,6 +459,7 @@ mod tests {
     fn chat_body_is_a_peer_scoped_text_message_kind() {
         let body = chat_send_body("eagle", "cargo test failed on line 42").expect("encode");
         let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["schema_version"], CLOUD_ACTION_SCHEMA_VERSION);
         assert_eq!(v["scope"], "peer");
         assert_eq!(v["to"], "eagle");
         // The worker reads `kind` as a real mde-chat MessageKind (snake_case-tagged).
@@ -366,6 +473,29 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         let kind: MessageKind = serde_json::from_value(v["kind"].clone()).expect("a MessageKind");
         assert_eq!(kind, MessageKind::Text("hello mesh".to_string()));
+    }
+
+    #[test]
+    fn chat_body_has_an_exact_body_bound_short_lived_capability() {
+        let body = chat_send_body("eagle", "hello mesh").expect("encode");
+        let mut value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let token = CloudArmedToken::parse(value["armed_token"].as_str().unwrap()).unwrap();
+        assert_eq!(token.verb, CHAT_AUTH_VERB);
+        assert_eq!(token.node, crate::layout::local_node());
+        assert_eq!(token.target, "peer:eagle");
+        assert!(token.expires_at_ms > 0);
+        value.as_object_mut().unwrap().remove("armed_token");
+        assert_eq!(
+            token.request_sha256,
+            cloud_request_digest(&value.to_string()).unwrap()
+        );
+        let signer = action_signer().unwrap();
+        assert!(signer.verify_payload(&token.signing_payload(), &token.signature));
+    }
+
+    #[test]
+    fn chat_body_rejects_an_unsafe_capability_target() {
+        assert!(chat_send_body("eagle|forged", "hello mesh").is_err());
     }
 
     #[derive(Default)]

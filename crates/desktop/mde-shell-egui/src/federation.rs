@@ -20,7 +20,9 @@
 //! after the operator types the peer's passcode.
 
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION;
 use mde_egui::egui::{self, RichText};
 use mde_egui::Style;
 
@@ -37,6 +39,8 @@ const ACCEPT_TOPIC: &str = "action/federation/accept";
 const REVOKE_TOPIC: &str = "action/federation/revoke";
 /// The cancel-a-pending-offer lane the worker drains (`{ulid}`).
 const REFUSE_MINT_TOPIC: &str = "action/federation/refuse-mint";
+/// The federation worker's closed capability node scope.
+const ACTION_NODE_SCOPE: &str = "federation";
 
 // ── status mirror (local serde, the shell-tier read pattern) ─────────────────────
 
@@ -287,12 +291,23 @@ impl FederationPanel {
                 .size(Style::SMALL)
                 .color(Style::TEXT_STRONG),
         );
+        let now_unix_ms = unix_now_ms();
         let mut cancel: Option<String> = None;
         for m in &mints {
             ui.horizontal_wrapped(|ui| {
                 ui.colored_label(
                     Style::TEXT_DIM,
                     RichText::new(format!("offer {}", short_id(&m.ulid))).size(Style::SMALL),
+                );
+                let expiry_state = pending_expiry_state(m.expires_at_unix_ms, now_unix_ms);
+                let expiry_color = match expiry_state {
+                    PendingExpiry::Active => Style::TEXT_DIM,
+                    PendingExpiry::Expired | PendingExpiry::Unknown => Style::WARN,
+                };
+                ui.colored_label(
+                    expiry_color,
+                    RichText::new(pending_expiry_label(m.expires_at_unix_ms, now_unix_ms))
+                        .size(Style::SMALL),
                 );
                 if ui
                     .button(
@@ -371,19 +386,71 @@ impl FederationPanel {
 /// The accept body: `{"passcode":…,"label":…}` — decoded by
 /// `federation_enforcer::handle_accept`.
 fn accept_body(passcode: &str, label: &str) -> String {
-    serde_json::json!({ "passcode": passcode, "label": label }).to_string()
+    serde_json::json!({
+        "schema_version": CLOUD_ACTION_SCHEMA_VERSION,
+        "passcode": passcode,
+        "label": label,
+    })
+    .to_string()
 }
 
 /// The revoke body: `{"peer-mesh-id":…}` — decoded by
 /// `federation_enforcer::handle_revoke`.
 fn revoke_body(peer_mesh_id: &str) -> String {
-    serde_json::json!({ "peer-mesh-id": peer_mesh_id }).to_string()
+    serde_json::json!({
+        "schema_version": CLOUD_ACTION_SCHEMA_VERSION,
+        "peer-mesh-id": peer_mesh_id,
+    })
+    .to_string()
 }
 
 /// The refuse-mint body: `{"ulid":…}` — decoded by
 /// `federation_enforcer::handle_refuse_mint`.
 fn refuse_mint_body(ulid: &str) -> String {
-    serde_json::json!({ "ulid": ulid }).to_string()
+    serde_json::json!({
+        "schema_version": CLOUD_ACTION_SCHEMA_VERSION,
+        "ulid": ulid,
+    })
+    .to_string()
+}
+
+/// Derive the same closed capability context as the root federation worker.
+fn action_context(topic: &str, body: &str) -> Result<(&'static str, String), String> {
+    let value: serde_json::Value = serde_json::from_str(body)
+        .map_err(|_| "federation request body must be JSON".to_string())?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "federation request body must be an object".to_string())?;
+    match topic {
+        ACCEPT_TOPIC => Ok(("federation-accept", "pair".to_string())),
+        REVOKE_TOPIC => {
+            let id = object
+                .get("peer-mesh-id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| is_safe_id(id))
+                .ok_or_else(|| "federation revoke needs a safe peer-mesh-id".to_string())?;
+            Ok(("federation-revoke", format!("peer:{id}")))
+        }
+        REFUSE_MINT_TOPIC => {
+            let id = object
+                .get("ulid")
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| is_safe_id(id))
+                .ok_or_else(|| "federation refuse-mint needs a safe ulid".to_string())?;
+            Ok(("federation-refuse-mint", format!("mint:{id}")))
+        }
+        _ => Err("unknown federation mutation topic".to_string()),
+    }
+}
+
+/// Match the worker's path/topic-safe identifier contract before minting a
+/// capability target. The passcode itself is deliberately never a target.
+fn is_safe_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
 /// The one write seam — publishers keep `Persist::open` (not the read-only
@@ -392,8 +459,10 @@ fn publish(bus_root: Option<&Path>, topic: &str, body: &str) -> Result<(), Strin
     let Some(root) = bus_root else {
         return Err("No mesh Bus directory — can't reach the federation enforcer.".to_string());
     };
+    let (verb, target) = action_context(topic, body)?;
+    let body = crate::iac::authorize_root_mutation_body(body, verb, ACTION_NODE_SCOPE, &target)?;
     Persist::open(root.to_path_buf())
-        .and_then(|p| p.write(topic, Priority::Default, None, Some(body)))
+        .and_then(|p| p.write(topic, Priority::Default, None, Some(&body)))
         .map(|_| ())
         .map_err(|e| format!("Couldn't reach the mesh Bus: {e}"))
 }
@@ -453,6 +522,65 @@ fn short_id(id: &str) -> String {
     id.chars().take(8).collect()
 }
 
+/// The UI must not make an expired or malformed expiry look like a live offer.
+/// `None` is also treated as degraded: a clock failure cannot turn an offer into
+/// an apparently usable capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingExpiry {
+    Active,
+    Expired,
+    Unknown,
+}
+
+fn pending_expiry_state(expires_at_unix_ms: i64, now_unix_ms: Option<i64>) -> PendingExpiry {
+    let Some(now) = now_unix_ms else {
+        return PendingExpiry::Unknown;
+    };
+    if expires_at_unix_ms <= 0 {
+        return PendingExpiry::Unknown;
+    }
+    if expires_at_unix_ms <= now {
+        PendingExpiry::Expired
+    } else {
+        PendingExpiry::Active
+    }
+}
+
+fn pending_expiry_label(expires_at_unix_ms: i64, now_unix_ms: Option<i64>) -> String {
+    match pending_expiry_state(expires_at_unix_ms, now_unix_ms) {
+        PendingExpiry::Expired => "expired — no longer usable".to_string(),
+        PendingExpiry::Unknown => "expiry unavailable — degraded".to_string(),
+        PendingExpiry::Active => {
+            let remaining = expires_at_unix_ms - now_unix_ms.expect("active has a clock");
+            format!("expires in {}", format_duration_ms(remaining))
+        }
+    }
+}
+
+fn format_duration_ms(milliseconds: i64) -> String {
+    const MINUTE: i64 = 60_000;
+    const HOUR: i64 = 60 * MINUTE;
+    let hours = milliseconds / HOUR;
+    let minutes = (milliseconds % HOUR) / MINUTE;
+    let seconds = (milliseconds % MINUTE) / 1_000;
+    if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{}s", seconds.max(1))
+    }
+}
+
+fn unix_now_ms() -> Option<i64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_millis()
+        .try_into()
+        .ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -507,6 +635,8 @@ mod tests {
             "the explicit Accept act publishes the request"
         );
         let v: serde_json::Value = serde_json::from_str(rows[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!(v["schema_version"], CLOUD_ACTION_SCHEMA_VERSION);
+        assert!(v["armed_token"].as_str().is_some());
         assert_eq!(v["passcode"], "mesh node link mint mode myth");
         assert_eq!(v["label"], "Mesh A");
         assert_eq!(panel.note.as_ref().map(|n| n.1), Some(false));
@@ -527,7 +657,17 @@ mod tests {
         let rows = persist.list_since(REVOKE_TOPIC, None).unwrap();
         assert_eq!(rows.len(), 1);
         let v: serde_json::Value = serde_json::from_str(rows[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!(v["schema_version"], CLOUD_ACTION_SCHEMA_VERSION);
+        assert!(v["armed_token"].as_str().is_some());
         assert_eq!(v["peer-mesh-id"], "MESH-A");
+    }
+
+    #[test]
+    fn action_context_rejects_unsafe_targets_before_minting() {
+        let body = revoke_body("peer/../../root");
+        assert!(action_context(REVOKE_TOPIC, &body).is_err());
+        let body = refuse_mint_body("mint/escape");
+        assert!(action_context(REFUSE_MINT_TOPIC, &body).is_err());
     }
 
     #[test]
@@ -587,5 +727,29 @@ mod tests {
     #[test]
     fn normalize_passcode_lowercases_and_collapses() {
         assert_eq!(normalize_passcode("  Mesh   NODE link "), "mesh node link");
+    }
+
+    #[test]
+    fn pending_expiry_is_visible_and_fails_closed_when_unknown() {
+        assert_eq!(
+            pending_expiry_state(1_000, Some(900)),
+            PendingExpiry::Active
+        );
+        assert_eq!(
+            pending_expiry_label(91_000, Some(1_000)),
+            "expires in 1m 30s"
+        );
+        assert_eq!(
+            pending_expiry_label(1_000, Some(1_000)),
+            "expired — no longer usable"
+        );
+        assert_eq!(
+            pending_expiry_label(0, Some(1_000)),
+            "expiry unavailable — degraded"
+        );
+        assert_eq!(
+            pending_expiry_state(2_000, None),
+            PendingExpiry::Unknown
+        );
     }
 }

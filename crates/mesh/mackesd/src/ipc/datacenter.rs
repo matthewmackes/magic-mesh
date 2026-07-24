@@ -701,9 +701,9 @@ pub fn lock_key(verb: &str, req_body: Option<&str>) -> Option<String> {
 }
 
 /// Return the capability target for a privileged datacenter mutation. Read-only
-/// inventory/console/planning verbs remain open; every mutation must carry a
-/// resource lock key so the signed body is bound to the exact target that the
-/// dispatcher is about to touch.
+/// inventory/planning verbs remain open; every mutation must carry a resource
+/// lock key so the signed body is bound to the exact target that the dispatcher
+/// is about to touch.
 fn mutation_target(verb: &str, req_body: Option<&str>) -> Result<Option<String>, String> {
     if !ACTION_VERBS.contains(&verb)
         || matches!(
@@ -718,15 +718,41 @@ fn mutation_target(verb: &str, req_body: Option<&str>) -> Result<Option<String>,
     Ok(Some(target))
 }
 
-/// Verify a datacenter mutation before the op-lock or any SSH/filesystem/XAPI
-/// backend call. The production responder's verifier is root-credential-backed;
-/// tests inject an isolated verifier through [`DatacenterService::with_authorizer`].
+/// Return the capability target for the `vm-console` access-material read.
+/// Although it does not mutate XAPI, its reply contains a live console
+/// connection URL, so an arbitrary shared-spool writer must not be able to
+/// mint one by publishing an unsigned request.
+fn access_material_target(verb: &str, req_body: Option<&str>) -> Result<Option<String>, String> {
+    if verb != "vm-console" {
+        return Ok(None);
+    }
+    let body = req_body.ok_or_else(|| "vm-console: missing request body".to_string())?;
+    let req: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("vm-console: bad json: {e}"))?;
+    let uuid = req
+        .get("uuid")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "vm-console: missing uuid".to_string())?;
+    // Reuse the production command validator before authorizing so the
+    // capability target cannot be formed for an invalid command input.
+    vm_console_command(uuid).map_err(|e| format!("vm-console: {e}"))?;
+    Ok(Some(format!("vm:{uuid}")))
+}
+
+/// Verify a datacenter mutation or access-material read before the op-lock or
+/// any SSH/filesystem/XAPI backend call. The production responder's verifier is
+/// root-credential-backed; tests inject an isolated verifier through
+/// [`DatacenterService::with_authorizer`].
 fn authorize_mutation(
     svc: &DatacenterService,
     verb: &str,
     req_body: Option<&str>,
 ) -> Result<(), String> {
-    let Some(target) = mutation_target(verb, req_body)? else {
+    let target = match mutation_target(verb, req_body)? {
+        Some(target) => Some(target),
+        None => access_material_target(verb, req_body)?,
+    };
+    let Some(target) = target else {
         return Ok(());
     };
     svc.authorizer.authorize(
@@ -739,8 +765,9 @@ fn authorize_mutation(
     )
 }
 
-/// Production Bus dispatch wrapper. Reads remain available without a
-/// capability; mutations fail closed before resource locking or backend work.
+/// Production Bus dispatch wrapper. Ordinary reads remain available without a
+/// capability; mutations and access-material reads fail closed before resource
+/// locking or backend work.
 fn build_authorized_reply(svc: &DatacenterService, verb: &str, req_body: Option<&str>) -> String {
     if let Err(error) = authorize_mutation(svc, verb, req_body) {
         tracing::warn!(
@@ -2322,6 +2349,46 @@ mod tests {
     }
 
     #[test]
+    fn production_dispatch_refuses_unsigned_structural_mutations_before_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = authorized_service(tmp.path());
+        let cases = [
+            (
+                "vm-create",
+                json!({
+                    "name": "unsigned-vm",
+                    "vcpus": 2,
+                    "mem_mib": 2048,
+                    "network_uuid": "420c5872-dd49",
+                    "dom0": "10.9.9.9"
+                })
+                .to_string(),
+                "infra/tofu/xen-xapi/dc-vms.tf",
+            ),
+            (
+                "lighthouse-create",
+                json!({ "name": "unsigned-lighthouse", "region": "sfo3" }).to_string(),
+                "infra/tofu/zone1-do/dc-lighthouses.tf",
+            ),
+            (
+                "genesis-write",
+                json!({ "mesh_id": "unsigned-mesh", "region": "sfo3", "confirm": true })
+                    .to_string(),
+                "infra/tofu/zone1-do/dc-lighthouses.tf",
+            ),
+        ];
+
+        for (verb, body, output) in cases {
+            let reply = build_authorized_reply(&svc, verb, Some(&body));
+            assert!(reply.contains("authorization refused"), "{verb}: {reply}");
+            assert!(
+                !tmp.path().join(output).exists(),
+                "{verb} wrote {output} before authorization: {reply}"
+            );
+        }
+    }
+
+    #[test]
     fn authorized_vm_mutation_reaches_validation_and_replay_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
         let svc = authorized_service(tmp.path());
@@ -2342,6 +2409,48 @@ mod tests {
         let first = build_authorized_reply(&svc, "vm-power", Some(&armed));
         assert!(first.contains("dom0 not in allowed set"), "{first}");
         let replay = build_authorized_reply(&svc, "vm-power", Some(&armed));
+        assert!(replay.contains("already used"), "{replay}");
+    }
+
+    #[test]
+    fn production_dispatch_refuses_unsigned_vm_console_before_backend() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = authorized_service(tmp.path());
+        let body = json!({
+            "schema_version": 1,
+            "uuid": "abcd1234-5678-90ab-cdef-1234567890ab",
+            "dom0": "definitely-not-an-allowed-dom0"
+        })
+        .to_string();
+        let reply = build_authorized_reply(&svc, "vm-console", Some(&body));
+        assert!(reply.contains("authorization refused"), "{reply}");
+        assert!(!reply.contains("dom0 not in allowed set"), "{reply}");
+    }
+
+    #[test]
+    fn authorized_vm_console_reaches_dom0_validation_and_replay_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = authorized_service(tmp.path());
+        let body = json!({
+            "schema_version": 1,
+            "uuid": "abcd1234-5678-90ab-cdef-1234567890ab",
+            "dom0": "definitely-not-an-allowed-dom0"
+        })
+        .to_string();
+        let armed = authorize_test_body(
+            AUTH_KEY,
+            &body,
+            MutationContext {
+                verb: "vm-console",
+                node: DC_ACTION_NODE_SCOPE,
+                target: "vm:abcd1234-5678-90ab-cdef-1234567890ab",
+            },
+            "dc-vm-console-once",
+            AUTH_NOW + 30_000,
+        );
+        let first = build_authorized_reply(&svc, "vm-console", Some(&armed));
+        assert!(first.contains("dom0 not in allowed set"), "{first}");
+        let replay = build_authorized_reply(&svc, "vm-console", Some(&armed));
         assert!(replay.contains("already used"), "{replay}");
     }
 

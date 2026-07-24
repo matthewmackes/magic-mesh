@@ -103,9 +103,8 @@ impl<'a, S: EventSigner, I: IdSource> ApplyCtx<'a, S, I> {
 /// event(s) it produces. A rejected command returns a typed [`CollabError`].
 ///
 /// A few commands intentionally produce **zero** events (they carry no
-/// convergent fact for the log): the ephemeral in-call media-plane signals
-/// ([`SendDtmf`](CollabCommand::SendDtmf),
-/// [`SetCallMuted`](CollabCommand::SetCallMuted)), the local-seat notification
+/// convergent fact for the log): the ephemeral in-call media-plane signal
+/// ([`SendDtmf`](CollabCommand::SendDtmf)), the local-seat notification
 /// preferences ([`SetAlertMute`](CollabCommand::SetAlertMute),
 /// [`SetSeverityThreshold`](CollabCommand::SetSeverityThreshold)), and the
 /// AI-suggestion *request* (the offer is emitted later by the worker once the
@@ -640,6 +639,11 @@ pub fn apply_command<S: EventSigner, I: IdSource>(
                 .transfers
                 .get(transfer)
                 .ok_or(CollabError::TransferNotFound(*transfer))?;
+            // Transfer controls are shared space facts.  Without this guard,
+            // any actor who had learned a transfer id could mint a pause,
+            // resume, or cancel event for a space they do not belong to.
+            require_active_space(state, space)?;
+            require_member(state, space, &ctx.actor)?;
             let new_state = match control {
                 TransferControl::Pause => TransferState::Paused,
                 TransferControl::Resume => TransferState::Active,
@@ -690,7 +694,9 @@ pub fn apply_command<S: EventSigner, I: IdSource>(
             )])
         }
         CollabCommand::HangUpCall { call } => {
-            let space = require_call(state, *call)?;
+            // A hang-up changes shared participant state and may end the call;
+            // knowing a call id is not sufficient authority to mint either fact.
+            let space = require_active_call_participant(state, *call, &ctx.actor)?;
             let left = ctx.emit(
                 space,
                 CollabEventKind::CallParticipantChanged {
@@ -721,13 +727,23 @@ pub fn apply_command<S: EventSigner, I: IdSource>(
             }
             Ok(events)
         }
-        // Ephemeral in-call media-plane signals — no convergent log fact.
-        // WL-FUNC-011 Phase 1 follow-up: the worker forwards DTMF + mute over
-        // the live RTP/media plane; the Phase-0 event taxonomy carries neither
-        // (CallParticipantChanged has no muted/dtmf field).
-        CollabCommand::SendDtmf { call, .. } | CollabCommand::SetCallMuted { call, .. } => {
+        // DTMF remains an ephemeral in-call media-plane signal. Mute is a
+        // signed, convergent call-state fact so every peer can render the same
+        // participant read model after replay.
+        CollabCommand::SendDtmf { call, .. } => {
             require_call(state, *call)?;
             Ok(Vec::new())
+        }
+        CollabCommand::SetCallMuted { call, muted } => {
+            let space = require_active_call_participant(state, *call, &ctx.actor)?;
+            Ok(vec![ctx.emit(
+                space,
+                CollabEventKind::CallParticipantMuted {
+                    call: *call,
+                    actor: ctx.actor.clone(),
+                    muted: *muted,
+                },
+            )])
         }
 
         // ---- AI --------------------------------------------------------
@@ -842,6 +858,31 @@ fn require_call(state: &DomainState, call: mde_collab_types::ids::CallId) -> Res
         .ok_or(CollabError::CallNotFound(call))
 }
 
+/// The actor must be a present space member and a connected participant in an
+/// active call. Call-scoped mutations that alter the participant read model
+/// must not be authorized by a call id alone: that would let an unrelated
+/// peer forge state for someone else's media session.
+fn require_active_call_participant(
+    state: &DomainState,
+    call: mde_collab_types::ids::CallId,
+    actor: &mde_collab_types::ActorId,
+) -> Result<SpaceId> {
+    let c = state
+        .calls
+        .get(&call)
+        .ok_or(CollabError::CallNotFound(call))?;
+    if c.ended
+        || !matches!(
+            c.participants.get(actor),
+            Some(CallParticipantState::Connected)
+        )
+    {
+        return Err(CollabError::CallNotFound(call));
+    }
+    require_member(state, c.space, actor)?;
+    Ok(c.space)
+}
+
 /// The author edit/delete window guard.
 fn enforce_window(
     target: mde_collab_types::ids::EventId,
@@ -868,5 +909,161 @@ fn would_orphan(state: &DomainState, space: SpaceId, actor: &mde_collab_types::A
                 && s.present_owner_count() <= 1
         }
         None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::signer::{Ed25519Signer, IdSource};
+    use mde_collab_types::ids::{CallId, EventId, FileRefId, TransferId};
+    use mde_collab_types::value::{CallKind, FileRef, TransferDirection, TransferMethod};
+    use mde_collab_types::{ActorClock, ActorId, CollabEventEnvelope, SpaceKind};
+    use uuid::Uuid;
+
+    struct SeqIds(u128);
+
+    impl IdSource for SeqIds {
+        fn next_event_id(&mut self) -> EventId {
+            let id = EventId::from_uuid(Uuid::from_u128(self.0));
+            self.0 += 1;
+            id
+        }
+    }
+
+    #[test]
+    fn control_transfer_requires_space_membership() {
+        let signer = Ed25519Signer::from_seed([7; 32]);
+        let mut ids = SeqIds(1);
+        let mut alice = ApplyCtx::new(ActorId::new("alice"), 1_000, &signer, &mut ids);
+
+        let created = apply_command(
+            &DomainState::default(),
+            &CollabCommand::CreateSpace {
+                kind: SpaceKind::Team,
+                name: "ops".into(),
+            },
+            &mut alice,
+        )
+        .expect("create space");
+        let space = created[0].space_id;
+        let file = FileRefId::from_uuid(Uuid::from_u128(10));
+        let transfer = TransferId::from_uuid(Uuid::from_u128(11));
+
+        let state = DomainState::from_events(&created);
+        let linked = apply_command(
+            &state,
+            &CollabCommand::LinkFile {
+                space,
+                file,
+                reference: FileRef {
+                    name: "report.txt".into(),
+                    size: 0,
+                    sha256_hex: "0".repeat(64),
+                    mime: None,
+                },
+            },
+            &mut alice,
+        )
+        .expect("link file");
+
+        let mut events = created;
+        events.extend(linked);
+        let state = DomainState::from_events(&events);
+        let started = apply_command(
+            &state,
+            &CollabCommand::StartTransfer {
+                space,
+                transfer,
+                file,
+                method: TransferMethod::Node,
+                direction: TransferDirection::Inbound,
+            },
+            &mut alice,
+        )
+        .expect("start transfer");
+        events.extend(started);
+        let state = DomainState::from_events(&events);
+
+        let mut intruder = ApplyCtx::new(ActorId::new("mallory"), 1_100, &signer, &mut ids);
+        let denied = apply_command(
+            &state,
+            &CollabCommand::ControlTransfer {
+                transfer,
+                control: TransferControl::Cancel,
+            },
+            &mut intruder,
+        );
+
+        assert!(matches!(
+            denied,
+            Err(CollabError::NotMember {
+                space: denied_space,
+                actor
+            }) if denied_space == space && actor == ActorId::new("mallory")
+        ));
+        assert!(state.is_owner(space, &ActorId::new("alice")));
+        assert!(!state.is_member(space, &ActorId::new("mallory")));
+    }
+
+    #[test]
+    fn hang_up_requires_a_connected_member_of_the_call_space() {
+        let signer = Ed25519Signer::from_seed([8; 32]);
+        let mut ids = SeqIds(20);
+        let mut alice = ApplyCtx::new(ActorId::new("alice"), 1_000, &signer, &mut ids);
+
+        let created = apply_command(
+            &DomainState::default(),
+            &CollabCommand::CreateSpace {
+                kind: SpaceKind::Team,
+                name: "ops".into(),
+            },
+            &mut alice,
+        )
+        .expect("create space");
+        let space = created[0].space_id;
+        let state = DomainState::from_events(&created);
+        let call = CallId::from_uuid(Uuid::from_u128(30));
+        let started = apply_command(
+            &state,
+            &CollabCommand::StartCall {
+                space,
+                call,
+                kind: CallKind::Audio,
+            },
+            &mut alice,
+        )
+        .expect("start call");
+
+        // Model the hostile precondition: the actor has learned the call id
+        // and even appears as a connected participant, but is not a space
+        // member. The command boundary must still refuse a leave/end event.
+        let forged_participant = CollabEventEnvelope::new(
+            EventId::from_uuid(Uuid::from_u128(31)),
+            space,
+            ActorId::new("mallory"),
+            ActorClock::at(2_000, 0),
+            2_000,
+            CollabEventKind::CallParticipantChanged {
+                call,
+                actor: ActorId::new("mallory"),
+                state: CallParticipantState::Connected,
+            },
+        );
+        let mut events = created;
+        events.extend(started);
+        events.push(forged_participant);
+        let state = DomainState::from_events(&events);
+
+        let mut mallory = ApplyCtx::new(ActorId::new("mallory"), 2_100, &signer, &mut ids);
+        let denied = apply_command(&state, &CollabCommand::HangUpCall { call }, &mut mallory);
+
+        assert!(matches!(
+            denied,
+            Err(CollabError::NotMember {
+                space: denied_space,
+                actor
+            }) if denied_space == space && actor == ActorId::new("mallory")
+        ));
     }
 }

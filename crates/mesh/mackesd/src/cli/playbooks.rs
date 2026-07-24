@@ -3,6 +3,7 @@
 //! Extracted verbatim from `main()` in `bin/mackesd.rs` (arch-1 SLICE 1:
 //! CLI verb handlers). Behaviour is unchanged; only the location moved.
 use crate::*;
+use std::path::{Component, Path};
 
 /// Handle the `playbooks` subcommand.
 #[allow(unreachable_code)]
@@ -37,6 +38,8 @@ pub fn run(cmd: PlaybooksCmd) -> anyhow::Result<()> {
                 }
             }
             PlaybooksCmd::Run { name } => {
+                let root = playbooks_root();
+                validate_playbook_name(&root, &name)?;
                 // Spawn ansible-pull directly so the user sees
                 // its progress streaming. Exit with whatever
                 // ansible-pull exited with.
@@ -52,6 +55,51 @@ pub fn run(cmd: PlaybooksCmd) -> anyhow::Result<()> {
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// Enforce the same role boundary advertised by `playbooks list` before a
+/// privileged `ansible-pull` is started. Without this check, `run` accepted
+/// any arbitrary tag from `site.yml`, including tags that were never present in
+/// the curated role tree.
+fn validate_playbook_name(root: &Path, name: &str) -> anyhow::Result<()> {
+    let mut components = Path::new(name).components();
+    let is_single_name = matches!(
+        (components.next(), components.next()),
+        (Some(Component::Normal(_)), None)
+    );
+    if !is_single_name || name.chars().any(|c| c == '\\' || c.is_control()) {
+        anyhow::bail!("playbooks run: `{name}` is not a valid role name")
+    }
+
+    let role_path = root.join(name);
+    let metadata = std::fs::symlink_metadata(&role_path).with_context(|| {
+        format!(
+            "playbooks run: `{name}` is not a curated role under {}",
+            root.display()
+        )
+    })?;
+    if !metadata.file_type().is_dir() {
+        anyhow::bail!(
+            "playbooks run: `{name}` is not a curated role under {}",
+            root.display()
+        )
+    }
+
+    // A role directory must not escape the curated root through a symlink in
+    // an ancestor. The final component is already rejected as a symlink by the
+    // metadata check above.
+    let canonical_root = std::fs::canonicalize(root).with_context(|| {
+        format!(
+            "playbooks run: curated role root {} is unavailable",
+            root.display()
+        )
+    })?;
+    let canonical_role = std::fs::canonicalize(&role_path)
+        .with_context(|| format!("playbooks run: cannot resolve curated role `{name}`"))?;
+    if !canonical_role.starts_with(&canonical_root) {
+        anyhow::bail!("playbooks run: curated role `{name}` resolves outside its root")
     }
     Ok(())
 }
@@ -99,5 +147,35 @@ fn playbook_description(name: &str) -> &'static str {
         "bloat-removal" => "Remove the curated bloat package list",
         "apps-install" => "Install the curated MDE app list",
         _ => "Custom role",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_accepts_only_a_real_role_directory_under_the_curated_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("roles");
+        std::fs::create_dir_all(root.join("system-update")).unwrap();
+
+        assert!(validate_playbook_name(&root, "system-update").is_ok());
+        assert!(validate_playbook_name(&root, "not-listed").is_err());
+        assert!(validate_playbook_name(&root, "../site").is_err());
+        assert!(validate_playbook_name(&root, "system-update/child").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_rejects_a_role_symlink_that_escapes_the_curated_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("roles");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("escaped")).unwrap();
+
+        assert!(validate_playbook_name(&root, "escaped").is_err());
     }
 }

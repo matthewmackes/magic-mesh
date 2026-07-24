@@ -133,16 +133,14 @@ pub fn remove_peer(db_path: &std::path::Path, node_id: &str, force: bool) -> any
         let eps = etcd::default_endpoints();
         if !eps.is_empty() {
             let target = node_id.strip_prefix("peer:").unwrap_or(node_id).to_string();
-            match etcd_membership::remove_member_blocking(
+            let member_result = etcd_membership::remove_member_blocking(
                 &eps,
                 &etcd_membership::MemberSel::Hostname(target.clone()),
-            ) {
-                Some(Ok(true)) => println!("etcd: removed '{node_id}' from the cluster"),
-                Some(Ok(false)) | None => {}
-                Some(Err(e)) => {
-                    eprintln!("etcd: could not remove '{node_id}' from the cluster ({e})");
-                }
+            );
+            if matches!(&member_result, Some(Ok(true))) {
+                println!("etcd: removed '{node_id}' from the cluster");
             }
+            ensure_member_removal_succeeded(member_result)?;
             // MIG-1 — also drop the `/mesh/peers/<hostname>` directory key, not
             // just the etcd MEMBERSHIP. Otherwise the PeerRecord lingers and the
             // roster reconcile keeps re-adding a node whose droplet is gone (the
@@ -150,6 +148,10 @@ pub fn remove_peer(db_path: &std::path::Path, node_id: &str, force: bool) -> any
             // decommission is now complete: member + directory row both removed.
             if peers::delete_peer_blocking(&eps, &target) {
                 println!("etcd: deleted directory key /mesh/peers/{target}");
+            } else {
+                anyhow::bail!(
+                    "etcd directory cleanup failed for '{node_id}'; refusing to finish removal"
+                );
             }
         }
     }
@@ -220,6 +222,9 @@ pub fn lighthouse_retire(
     force: bool,
 ) -> anyhow::Result<()> {
     let root = mackesd_core::default_qnm_shared_root();
+    if droplet_id.is_some() && mackesd_core::substrate::etcd::default_endpoints().is_empty() {
+        anyhow::bail!("refusing to delete lighthouse droplet without configured etcd endpoints");
+    }
     // HA drain gate — never drop below the lighthouse floor without --force.
     let current =
         mackesd_core::substrate::etcd_membership::voter_overlays_from_directory(&root).len();
@@ -253,4 +258,30 @@ pub fn lighthouse_retire(
         );
     }
     Ok(())
+}
+
+/// A lighthouse droplet must never be deleted after an unconfirmed etcd
+/// membership removal. `None` means the blocking bridge could not run, while
+/// `Err` means etcd rejected the mutation; both are fail-closed outcomes.
+fn ensure_member_removal_succeeded(result: Option<Result<bool, String>>) -> anyhow::Result<()> {
+    match result {
+        Some(Ok(_)) => Ok(()),
+        Some(Err(error)) => {
+            anyhow::bail!("etcd member removal failed ({error}); refusing to finish peer removal")
+        }
+        None => anyhow::bail!("etcd member removal could not run; refusing to finish peer removal"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_member_removal_succeeded;
+
+    #[test]
+    fn etcd_member_removal_failures_are_fail_closed() {
+        assert!(ensure_member_removal_succeeded(Some(Ok(true))).is_ok());
+        assert!(ensure_member_removal_succeeded(Some(Ok(false))).is_ok());
+        assert!(ensure_member_removal_succeeded(Some(Err("offline".into()))).is_err());
+        assert!(ensure_member_removal_succeeded(None).is_err());
+    }
 }

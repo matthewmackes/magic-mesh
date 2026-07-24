@@ -13,6 +13,13 @@ use mde_egui::Style;
 /// Three missed fifteen-minute polls make the retained perimeter set stale.
 pub const SNAPSHOT_STALE_AFTER_MS: i64 = 45 * 60 * 1_000;
 
+/// A retained Bus payload is untrusted even when the producer normally bounds
+/// it. Keep one paint pass bounded if a peer publishes an oversized snapshot.
+const MAX_PAINTABLE_PERIMETERS: usize = 256;
+const MAX_PAINTABLE_POLYGONS: usize = 64;
+const MAX_PAINTABLE_RINGS: usize = 32;
+const MAX_PAINTABLE_POINTS: usize = 100_000;
+
 const WILDFIRE_FILL: Color32 = Color32::from_rgb(0xE8, 0x52, 0x2E); // style-leak-ok: map-content-color
 const CONTAINMENT_MID: Color32 = Color32::from_rgb(0xF2, 0x82, 0x22); // style-leak-ok: map-content-color
 
@@ -35,14 +42,17 @@ impl WildfireLayerState {
     pub fn age_ms(&self, now_ms: i64) -> Option<i64> {
         self.snapshot
             .as_ref()
-            .map(|snapshot| now_ms.saturating_sub(snapshot.fetched_at_ms).max(0))
+            .and_then(|snapshot| now_ms.checked_sub(snapshot.fetched_at_ms))
+            .filter(|age| *age >= 0)
     }
 
     /// Whether three expected refreshes have been missed.
     #[must_use]
     pub fn stale(&self, now_ms: i64) -> bool {
-        self.age_ms(now_ms)
-            .is_some_and(|age| age > SNAPSHOT_STALE_AFTER_MS)
+        self.snapshot.as_ref().is_some_and(|_| {
+            self.age_ms(now_ms)
+                .map_or(true, |age| age > SNAPSHOT_STALE_AFTER_MS)
+        })
     }
 
     /// Whether a failed refresh or loss of the fresh same-host fix has paused
@@ -87,22 +97,37 @@ where
     if !rect.is_finite() || rect.width() <= 0.0 || rect.height() <= 0.0 {
         return PaintStats::default();
     }
+    let future_dated = layer.snapshot.as_ref().is_some_and(|snapshot| {
+        snapshot.fetched_at_ms > now_ms
+    });
     let dimmed = layer.stale(now_ms) || layer.paused();
     let mut stats = PaintStats::default();
-    if let Some(snapshot) = &layer.snapshot {
-        let clip = rect.intersect(painter.clip_rect());
-        let perimeter_painter = painter.with_clip_rect(clip);
-        for perimeter in &snapshot.perimeters {
-            for polygon in &perimeter.polygons {
-                if paint_polygon(
-                    &perimeter_painter,
-                    rect,
-                    polygon,
-                    perimeter,
-                    dimmed,
-                    &mut project,
-                ) {
-                    stats.polygons += 1;
+    if !future_dated {
+        if let Some(snapshot) = &layer.snapshot {
+            let clip = rect.intersect(painter.clip_rect());
+            let perimeter_painter = painter.with_clip_rect(clip);
+            let mut point_budget = MAX_PAINTABLE_POINTS;
+            for perimeter in snapshot
+                .perimeters
+                .iter()
+                .take(MAX_PAINTABLE_PERIMETERS)
+            {
+                for polygon in perimeter
+                    .polygons
+                    .iter()
+                    .take(MAX_PAINTABLE_POLYGONS)
+                {
+                    if paint_polygon(
+                        &perimeter_painter,
+                        rect,
+                        polygon,
+                        perimeter,
+                        dimmed,
+                        &mut point_budget,
+                        &mut project,
+                    ) {
+                        stats.polygons += 1;
+                    }
                 }
             }
         }
@@ -118,11 +143,38 @@ fn paint_polygon<F>(
     polygon: &WildfirePolygon,
     perimeter: &WildfirePerimeter,
     dimmed: bool,
+    point_budget: &mut usize,
     project: &mut F,
 ) -> bool
 where
     F: FnMut(f64, f64) -> Option<Pos2>,
 {
+    if polygon.rings.is_empty()
+        || polygon.rings.len() > MAX_PAINTABLE_RINGS
+        || polygon.rings.iter().any(|ring| {
+            ring.len() < 3
+                || ring.len() > MAX_PAINTABLE_POINTS
+                || ring.iter().any(|point| {
+                    !point.latitude.is_finite()
+                        || !(-90.0..=90.0).contains(&point.latitude)
+                        || !point.longitude.is_finite()
+                        || !(-180.0..=180.0).contains(&point.longitude)
+                })
+        })
+    {
+        return false;
+    }
+    let point_count = polygon
+        .rings
+        .iter()
+        .try_fold(0usize, |total, ring| total.checked_add(ring.len()));
+    let Some(point_count) = point_count else {
+        return false;
+    };
+    if point_count > *point_budget {
+        return false;
+    }
+    *point_budget -= point_count;
     let projected_rings: Vec<Vec<Pos2>> = polygon
         .rings
         .iter()
@@ -130,7 +182,7 @@ where
             let points: Vec<_> = ring
                 .iter()
                 .filter_map(|point| project(point.latitude, point.longitude))
-                .filter(|point| !point.any_nan())
+                .filter(|point| point.x.is_finite() && point.y.is_finite())
                 .collect();
             (points.len() >= 3).then_some(points)
         })
@@ -277,27 +329,18 @@ fn point_in_triangle(point: Pos2, a: Pos2, b: Pos2, c: Pos2) -> bool {
 
 fn paint_age_badge(painter: &Painter, rect: Rect, layer: &WildfireLayerState, now_ms: i64) {
     let (label, tone) = match (&layer.snapshot, layer.age_ms(now_ms)) {
-        (None, _) => (
-            "Wildfire · NIFC no data · FIRMS key needed".to_string(),
-            Style::TEXT_DIM,
-        ),
+        (None, _) => ("Wildfire · NIFC no data".to_string(), Style::TEXT_DIM),
         (Some(_), Some(age)) if layer.paused() => (
-            format!(
-                "Wildfire · NIFC PAUSED {} · FIRMS key needed",
-                age_label(age)
-            ),
+            format!("Wildfire · NIFC PAUSED {}", age_label(age)),
             Style::WARN,
         ),
         (Some(_), Some(age)) if age > SNAPSHOT_STALE_AFTER_MS => (
-            format!(
-                "Wildfire · NIFC STALE {} · FIRMS key needed",
-                age_label(age)
-            ),
+            format!("Wildfire · NIFC STALE {}", age_label(age)),
             Style::WARN,
         ),
         (Some(snapshot), Some(age)) if !snapshot.gaps.is_empty() => (
             format!(
-                "Wildfire · NIFC {} · {} perimeters · degraded · FIRMS key needed",
+                "Wildfire · NIFC {} · {} perimeters · degraded",
                 age_label(age),
                 snapshot.perimeters.len()
             ),
@@ -305,16 +348,13 @@ fn paint_age_badge(painter: &Painter, rect: Rect, layer: &WildfireLayerState, no
         ),
         (Some(snapshot), Some(age)) => (
             format!(
-                "Wildfire · NIFC {} · {} perimeters · FIRMS key needed",
+                "Wildfire · NIFC {} · {} perimeters",
                 age_label(age),
                 snapshot.perimeters.len()
             ),
             Style::TEXT,
         ),
-        (Some(_), None) => (
-            "Wildfire · NIFC no timestamp · FIRMS key needed".to_string(),
-            Style::WARN,
-        ),
+        (Some(_), None) => ("Wildfire · NIFC no timestamp".to_string(), Style::WARN),
     };
     let galley = painter.layout_no_wrap(label, FontId::proportional(Style::SMALL), tone);
     let pad = egui::vec2(Style::SP_S, Style::SP_XS);
@@ -437,5 +477,76 @@ mod tests {
         assert_eq!(observed.polygons, 1);
         assert!(observed.badge);
         assert!(ctx.tessellate(output.shapes, output.pixels_per_point).len() >= 3);
+    }
+
+    #[test]
+    fn no_snapshot_is_an_idle_no_data_state() {
+        let ctx = egui::Context::default();
+        let mut stats = PaintStats::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = ui.max_rect();
+                stats = paint_layer(
+                    ui.painter(),
+                    rect,
+                    &WildfireLayerState::default(),
+                    1,
+                    |_, _| Some(rect.center()),
+                );
+            });
+        });
+        assert_eq!(stats.polygons, 0);
+        assert!(stats.badge);
+    }
+
+    #[test]
+    fn future_dated_snapshot_is_not_painted_as_live() {
+        let now = 10_000_000;
+        let mut layer = WildfireLayerState::default();
+        layer.fold(snapshot(now + 1));
+
+        let ctx = egui::Context::default();
+        let mut stats = PaintStats::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = ui.max_rect();
+                stats = paint_layer(ui.painter(), rect, &layer, now, |_, _| {
+                    Some(rect.center())
+                });
+            });
+        });
+
+        assert_eq!(layer.age_ms(now), None);
+        assert!(layer.stale(now));
+        assert_eq!(stats.polygons, 0);
+        assert!(stats.badge);
+    }
+
+    #[test]
+    fn oversized_snapshot_is_bounded_at_the_paint_boundary() {
+        let now = 10_000_000;
+        let mut layer = WildfireLayerState::default();
+        let base = snapshot(now).perimeters[0].clone();
+        let mut oversized = snapshot(now);
+        oversized.perimeters = (0..(MAX_PAINTABLE_PERIMETERS + 1))
+            .map(|index| WildfirePerimeter {
+                id: index.to_string(),
+                ..base.clone()
+            })
+            .collect();
+        layer.fold(oversized);
+
+        let ctx = egui::Context::default();
+        let mut stats = PaintStats::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = ui.max_rect();
+                stats = paint_layer(ui.painter(), rect, &layer, now, |_, _| {
+                    Some(rect.center())
+                });
+            });
+        });
+
+        assert_eq!(stats.polygons, MAX_PAINTABLE_PERIMETERS);
     }
 }

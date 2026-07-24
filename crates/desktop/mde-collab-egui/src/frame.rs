@@ -50,6 +50,18 @@ pub fn body_frame() -> egui::Frame {
 /// deterministic.
 pub(crate) const RAIL_SIDEBAR_SALT: &str = "collab-rail";
 
+/// Return the selected space only while it is still present in the current
+/// directory. The read model can advance between frames (for example, after a
+/// membership removal), while the surface deliberately retains view state; a
+/// stale selection must not become an actionable call target.
+#[must_use]
+pub(crate) fn selected_space_in_directory(
+    selected: Option<SpaceId>,
+    directory: &SpaceDirectory,
+) -> Option<SpaceId> {
+    selected.filter(|selected| directory.spaces.iter().any(|space| space.id == *selected))
+}
+
 /// The rail's pure row model: one row per
 /// [`SpaceSummary`](mde_collab_types::SpaceSummary) in directory order — the
 /// selection id, the drawn name, the kind's Carbon glyph, and the unread count
@@ -194,13 +206,15 @@ impl CommunicationsSurface {
         let car = crate::car_mode(ui);
         let glyph = if car { Style::SP_L } else { Style::SP_M };
         let calls = data.call_state().active.clone();
+        let selected_space =
+            selected_space_in_directory(self.selected_space(), data.space_directory());
         ui.horizontal(|ui| {
             icons::icon(ui, icons::CALL_UNMUTE, glyph, Style::TEXT_DIM);
             ui.add_space(Style::SP_XS);
             if calls.is_empty() {
                 let none = egui::RichText::new("No active call").color(Style::TEXT_DIM);
                 ui.label(if car { none.size(Style::TITLE) } else { none });
-                if let Some(space) = self.selected_space() {
+                if let Some(space) = selected_space {
                     ui.add_space(Style::SP_S);
                     if icons::icon_button(
                         ui,

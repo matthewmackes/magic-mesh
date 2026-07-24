@@ -13,6 +13,7 @@
 //! channel.
 
 use mde_enroll::app;
+use mde_enroll::public_roster::{LighthouseEndpoint, PUBLIC_LIGHTHOUSE_HOSTS};
 
 use std::io::{self, Stdout};
 use std::sync::mpsc;
@@ -30,8 +31,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{Frame, Terminal};
 
-use app::{App, Field, Phase, Step, StepState};
-use mackesd_core::nebula_enroll::JoinToken;
+use app::{App, Field, Phase, Step, StepState, ValidatedJoin};
 
 /// Messages the enroll worker sends back to the UI loop.
 enum EnrollMsg {
@@ -105,10 +105,10 @@ fn run(terminal: &mut Tui) -> anyhow::Result<()> {
                     (Phase::Editing, KeyCode::Tab) => app.toggle_focus(),
                     (Phase::Editing, KeyCode::Backspace) => app.backspace(),
                     (Phase::Editing, KeyCode::Char(c)) => app.push_char(c),
-                    (Phase::Editing, KeyCode::Enter) => match app.validated_token() {
-                        Ok(token) => {
+                    (Phase::Editing, KeyCode::Enter) => match app.validated_join() {
+                        Ok(join) => {
                             app.begin_enroll();
-                            rx = Some(spawn_enroll(token));
+                            rx = Some(spawn_enroll(join));
                         }
                         Err(e) => app.error = Some(e),
                     },
@@ -127,10 +127,11 @@ fn run(terminal: &mut Tui) -> anyhow::Result<()> {
 
 /// Spawn the worker thread that runs the real enroll stages and reports
 /// progress. Returns the receiver the UI loop polls.
-fn spawn_enroll(token: JoinToken) -> mpsc::Receiver<EnrollMsg> {
+fn spawn_enroll(join: ValidatedJoin) -> mpsc::Receiver<EnrollMsg> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         // Token already validated by the caller.
+        let ValidatedJoin { token, endpoint } = join;
         let _ = tx.send(EnrollMsg::Step(Step::Validate));
 
         let node_id = node_id();
@@ -148,8 +149,7 @@ fn spawn_enroll(token: JoinToken) -> mpsc::Receiver<EnrollMsg> {
                 return;
             }
         };
-        let lighthouse = token.lighthouse.clone();
-        let port = token.port;
+        let LighthouseEndpoint { host, port, .. } = endpoint;
 
         let requester_key =
             match mackesd_core::nebula_enroll_client::generate_requester_nebula_key(&config_dir) {
@@ -187,19 +187,15 @@ fn spawn_enroll(token: JoinToken) -> mpsc::Receiver<EnrollMsg> {
         };
 
         let _ = tx.send(EnrollMsg::Step(Step::Connect));
-        let response =
-            match runtime.block_on(mackesd_core::nebula_enroll_client::enroll_over_network(
-                &lighthouse,
-                port,
-                &fp,
-                &csr_json,
-            )) {
-                Ok(b) => b,
-                Err(e) => {
-                    let _ = tx.send(EnrollMsg::Failed(e.to_string()));
-                    return;
-                }
-            };
+        let response = match runtime.block_on(
+            mackesd_core::nebula_enroll_client::enroll_over_network(&host, port, &fp, &csr_json),
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                let _ = tx.send(EnrollMsg::Failed(e.to_string()));
+                return;
+            }
+        };
         let _ = tx.send(EnrollMsg::Step(Step::Receive));
 
         if let Err(e) = mackesd_core::nebula_enroll_client::verify_authenticated_enrollment_bundle(
@@ -260,7 +256,7 @@ fn render(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // title
+            Constraint::Length(4), // title + public roster help
             Constraint::Length(3), // lighthouse field
             Constraint::Length(3), // token field
             Constraint::Min(7),    // steps
@@ -273,7 +269,7 @@ fn render(f: &mut Frame, app: &App) {
     render_field(
         f,
         chunks[1],
-        "Lighthouse IP (optional — overrides token)",
+        "Endpoint override (optional — public roster or pinned IPv4)",
         &app.lighthouse,
         app.phase == Phase::Editing && app.focus == Field::Lighthouse,
     );
@@ -290,13 +286,23 @@ fn render(f: &mut Frame, app: &App) {
 }
 
 fn render_title(f: &mut Frame, area: Rect) {
-    let p = Paragraph::new(Line::from(vec![Span::styled(
-        " MCNF — join a mesh ",
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )]))
+    let roster = format!(
+        "Public roster: {} · {} · {}",
+        PUBLIC_LIGHTHOUSE_HOSTS[0], PUBLIC_LIGHTHOUSE_HOSTS[1], PUBLIC_LIGHTHOUSE_HOSTS[2]
+    );
+    let p = Paragraph::new(vec![
+        Line::from(vec![Span::styled(
+            " MCNF — join a mesh ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::styled(
+            format!(" {roster} (requires token ?fp= pin)"),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ])
     .block(Block::default().borders(Borders::ALL));
     f.render_widget(p, area);
 }

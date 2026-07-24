@@ -8,7 +8,7 @@
 //! next peer in lexicographic node-id order takes over.
 
 use fs2::FileExt;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -124,11 +124,7 @@ pub fn try_acquire(lock_path: &Path, node_id: &str) -> std::io::Result<AcquireRe
         }
         std::fs::create_dir_all(parent)?;
     }
-    let mut file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .open(lock_path)?;
+    let mut file = open_lock_file(lock_path, true)?;
 
     // Advisory lock — non-blocking. If another peer is mid-write,
     // we report `HeldBy` based on the on-disk lease (which may be
@@ -188,7 +184,7 @@ pub fn try_acquire(lock_path: &Path, node_id: &str) -> std::io::Result<AcquireRe
 /// that need to know *who* leads without contending for the lock.
 #[must_use]
 pub fn read_current_lease(lock_path: &Path) -> Option<Lease> {
-    let mut file = OpenOptions::new().read(true).open(lock_path).ok()?;
+    let mut file = open_lock_file(lock_path, false).ok()?;
     let lease = read_lease(&mut file).ok().flatten()?;
     if lease.is_expired(now_s()) {
         None
@@ -205,13 +201,18 @@ pub fn read_current_lease(lock_path: &Path) -> Option<Lease> {
 /// Returns `std::io::Error` when the lock file can't be rewritten.
 pub fn force_take(lock_path: &Path, node_id: &str) -> std::io::Result<Lease> {
     if let Some(parent) = lock_path.parent() {
+        if !crate::shared_root_writable(parent) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!(
+                    "shared dir {} is down — refusing to take leadership on a missing volume",
+                    parent.display()
+                ),
+            ));
+        }
         std::fs::create_dir_all(parent)?;
     }
-    let mut file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .open(lock_path)?;
+    let mut file = open_lock_file(lock_path, true)?;
     let _ = file.lock_exclusive();
     let prior_epoch = read_lease(&mut file)?.map_or(0, |l| l.epoch);
     let next = Lease {
@@ -222,6 +223,24 @@ pub fn force_take(lock_path: &Path, node_id: &str) -> std::io::Result<Lease> {
     write_lease(&mut file, &next)?;
     let _ = file.unlock();
     Ok(next)
+}
+
+/// Open the stable lock inode without ever following a symlink at the final
+/// path component. The advisory lock must remain on this inode for the whole
+/// read/modify/write operation, so replacing the file with a temporary rename
+/// would reintroduce a leadership race; `O_NOFOLLOW` is the correct boundary
+/// here instead.
+fn open_lock_file(lock_path: &Path, create: bool) -> std::io::Result<File> {
+    use rustix::fs::{Mode, OFlags};
+
+    let mut flags = OFlags::CLOEXEC | OFlags::NOFOLLOW;
+    if create {
+        flags |= OFlags::CREATE | OFlags::RDWR;
+    } else {
+        flags |= OFlags::RDONLY;
+    }
+    let fd = rustix::fs::open(lock_path, flags, Mode::RUSR | Mode::WUSR)?;
+    Ok(fd.into())
 }
 
 fn read_lease(file: &mut File) -> std::io::Result<Option<Lease>> {
@@ -351,6 +370,25 @@ mod tests {
         assert_eq!(l.node_id, "peer:fresh");
         // No prior lease → epoch starts at 1.
         assert_eq!(l.epoch, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn force_take_rejects_symlinked_lock_target_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("outside.lock");
+        std::fs::write(&target, "sentinel").unwrap();
+        let link = dir.path().join(".mackesd-leader.lock");
+        symlink(&target, &link).unwrap();
+
+        let error = force_take(&link, "peer:attacker").unwrap_err();
+        assert!(
+            error.raw_os_error().is_some(),
+            "expected an OS-level no-follow error"
+        );
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "sentinel");
     }
 
     #[test]

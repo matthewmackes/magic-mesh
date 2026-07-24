@@ -8,11 +8,9 @@
 pub fn run() -> anyhow::Result<()> {
     {
         use mackesd_core::surrounding_hosts::read_all_surrounding;
-        if let Some(data_dir) = dirs::data_dir() {
-            let base = data_dir.join("mde").join("surrounding");
-            for ch in read_all_surrounding(&base) {
-                println!("{}", serde_json::to_string(&ch)?);
-            }
+        let base = mackesd_core::surrounding_hosts::default_surrounding_root();
+        for ch in read_all_surrounding(&base) {
+            println!("{}", serde_json::to_string(&ch)?);
         }
     }
     Ok(())

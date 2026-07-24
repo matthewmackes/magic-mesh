@@ -199,7 +199,7 @@ fn prime_cursor(bus_root: &Path) -> Option<String> {
 }
 
 fn default_bus_root() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join("mde").join("bus"))
+    mde_bus::default_data_dir()
 }
 
 fn default_home() -> PathBuf {

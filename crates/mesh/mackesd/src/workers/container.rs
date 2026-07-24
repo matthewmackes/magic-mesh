@@ -751,9 +751,8 @@ pub fn apply_action(backend: &dyn PodmanBackend, action: &ContainerAction) -> Re
 /// open + a [`crate::proc_reap`] reaper thread) per roster. Byte-identical stored
 /// row to the old `mde-bus publish <topic> --body-flag <json>`. `bus_root` is
 /// [`ContainerWorker::publish_bus_root`] — the MDE_BUS_ROOT-honouring root the
-/// fork+exec'd CLI resolved via the inherited env (NOT the worker's
-/// `dirs::data_dir()`-based ACTION-read root, which the live daemon's
-/// `MDE_BUS_ROOT=/run/mde-bus` diverges from). Best-effort: an absent root /
+/// fork+exec'd CLI resolved via the inherited env, also used by the worker's
+/// ACTION-read root. Best-effort: an absent root /
 /// failed open / write error is swallowed.
 fn publish_containers(bus_root: Option<&Path>, report: &ContainerReport) {
     if let Some(mut persist) = crate::bus_publish::open_bus(bus_root.map(Path::to_path_buf)) {
@@ -823,7 +822,7 @@ fn prime_cursor(bus_root: &Path) -> Option<String> {
 }
 
 fn default_bus_root() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join("mde").join("bus"))
+    mde_bus::default_data_dir()
 }
 
 fn now_ms() -> u64 {
@@ -850,7 +849,7 @@ pub struct ContainerWorker {
     poll: Duration,
     /// Roster-publish heartbeat.
     heartbeat: Duration,
-    /// Bus root override (tests). `None` ⇒ [`default_bus_root`].
+    /// Bus root override (tests). `None` ⇒ [`mde_bus::default_data_dir`].
     bus_root_override: Option<PathBuf>,
 }
 
@@ -919,9 +918,8 @@ impl ContainerWorker {
     /// The root the in-process roster publish targets (perf-10). A test's
     /// `with_bus_root` override wins (so a driven `run` publishes into the temp
     /// store, never the real one); production falls back to
-    /// [`crate::bus_publish::default_bus_root`] — the MDE_BUS_ROOT-honouring root
-    /// the fork+exec'd `mde-bus` used, NOT the `dirs`-based [`default_bus_root`]
-    /// this worker READS actions from.
+    /// [`crate::bus_publish::default_bus_root`] — the same MDE_BUS_ROOT-honouring
+    /// root the fork+exec'd `mde-bus` used and this worker READS actions from.
     fn publish_bus_root(&self) -> Option<PathBuf> {
         self.bus_root_override
             .clone()
@@ -1591,6 +1589,28 @@ mod tests {
         assert_eq!(CONTAINERS_TOPIC, "event/podman/containers");
         assert!(ACTION_TOPIC.starts_with("action/"));
         assert!(CONTAINERS_TOPIC.starts_with("event/"));
+    }
+
+    #[test]
+    fn default_bus_root_honors_mde_bus_root() {
+        let root = tempfile::tempdir().unwrap();
+        let expected = root.path().to_path_buf();
+        let previous = std::env::var_os("MDE_BUS_ROOT");
+        let got = {
+            std::env::set_var("MDE_BUS_ROOT", &expected);
+            let got = (
+                default_bus_root(),
+                ContainerWorker::new("node-a".to_string()).bus_root(),
+            );
+            match previous {
+                Some(value) => std::env::set_var("MDE_BUS_ROOT", value),
+                None => std::env::remove_var("MDE_BUS_ROOT"),
+            }
+            got
+        };
+
+        assert_eq!(got.0, Some(expected.clone()));
+        assert_eq!(got.1, Some(expected));
     }
 
     fn armed_container_body(

@@ -193,9 +193,33 @@ pub const RELAY_TRUST_AUTHORITY_KEY_PATH: &str = "/var/lib/mackesd/relay-trust-a
 pub const RELAY_TRUST_AUTHORITY_PIN_PATH: &str = "/var/lib/mackesd/relay-trust-authority.pub";
 
 /// Persist the authenticated relay authority outside replicated state.
+///
+/// The first authenticated enrollment creates the pin. Later enrollments may
+/// confirm the same authority, but can never replace it with a value supplied
+/// by a mutable bundle or a different enrollment endpoint. This is deliberately
+/// create-if-absent rather than ordinary atomic replacement: the pin is the
+/// trust anchor, not replicated configuration.
 pub fn write_relay_trust_authority_pin(bundle: &NebulaBundle, path: &Path) -> Result<(), CaError> {
     if let Some(authority) = bundle.relay_trust_authority.as_deref() {
-        super::seal::write_sealed(path, authority.as_bytes())?;
+        if decode_hex::<32>(authority).is_none()
+            || authority
+                .chars()
+                .any(|ch| !ch.is_ascii_digit() && !matches!(ch, 'a'..='f'))
+        {
+            return Err(CaError::Io(
+                "relay trust authority pin must be canonical lowercase 64-character hex".into(),
+            ));
+        }
+        if super::seal::write_sealed_if_absent(path, authority.as_bytes())? {
+            return Ok(());
+        }
+        let pinned = super::seal::read_sealed(path)?;
+        if pinned == authority.as_bytes() {
+            return Ok(());
+        }
+        return Err(CaError::Io(
+            "refusing to replace existing relay trust authority pin".into(),
+        ));
     }
     Ok(())
 }
@@ -500,8 +524,8 @@ pub fn write_bundle(path: &Path, bundle: &NebulaBundle) -> Result<(), CaError> {
 /// - [`CaError::Io`] when the file is missing or unreadable.
 /// - [`CaError::Sql`] when the JSON doesn't parse.
 pub fn read_bundle(path: &Path) -> Result<NebulaBundle, CaError> {
-    let body = std::fs::read_to_string(path)
-        .map_err(|e| CaError::Io(format!("read {}: {e}", path.display())))?;
+    let body = String::from_utf8(super::seal::read_no_follow(path)?)
+        .map_err(|e| CaError::Io(format!("read {}: bundle is not UTF-8: {e}", path.display())))?;
     match serde_json::from_str(&body) {
         Ok(bundle) => Ok(bundle),
         Err(public_error) => {
@@ -784,7 +808,35 @@ mod tests {
         // An attacker replacing the replicated authority and re-signing relay
         // records under their own key cannot replace this root-local pin.
         bundle.relay_trust_authority = Some("22".repeat(32));
+        let error = write_relay_trust_authority_pin(&bundle, &pin)
+            .expect_err("an existing authority pin must be immutable");
+        assert!(error.to_string().contains("refusing to replace"));
         assert!(!relay_trust_authority_matches_pin(&bundle, &pin));
+        bundle.relay_trust_authority = Some("11".repeat(32));
+        write_relay_trust_authority_pin(&bundle, &pin)
+            .expect("reconfirming the same authority is idempotent");
+    }
+
+    #[test]
+    fn authority_pin_rejects_invalid_value_and_does_not_follow_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let invalid_pin = temp.path().join("invalid.pub");
+        let mut bundle = sample_bundle();
+        bundle.relay_trust_authority = Some("not-a-public-key".into());
+        let error = write_relay_trust_authority_pin(&bundle, &invalid_pin)
+            .expect_err("malformed authority must not become a trust anchor");
+        assert!(error.to_string().contains("canonical lowercase"));
+        assert!(!invalid_pin.exists());
+
+        let victim = temp.path().join("victim");
+        std::fs::write(&victim, b"do-not-replace").expect("victim");
+        let link = temp.path().join("linked.pub");
+        symlink(&victim, &link).expect("hostile pin symlink");
+        bundle.relay_trust_authority = Some("33".repeat(32));
+        assert!(write_relay_trust_authority_pin(&bundle, &link).is_err());
+        assert_eq!(std::fs::read(&victim).expect("victim remains"), b"do-not-replace");
     }
 
     #[test]

@@ -8,18 +8,20 @@
 //! tap-to-research detail. Real-time only (no history); scans only while open.
 //!
 //! Production is LIVE-ONLY (WL-UX-007/S1, operator directive 2026-07-22,
-//! PLATFORM-INTERFACES P8/Q33): no scanner source exists yet, so the production
-//! [`AirspaceState::live`] state holds ZERO contacts and the scope renders a
-//! designed honest-empty ("NO SCANNER FEED") rather than fake radar. The future
-//! source is the `mackesd` `airspace` worker (MG90 WiFi survey + AT/QMI cell +
-//! BT/BLE), which will populate `signals` at this same seam. The rich animated
-//! simulation ([`AirspaceState::simulated`]) survives as a cfg-gated test
-//! fixture only.
+//! PLATFORM-INTERFACES P8/Q33): the scope consumes the typed
+//! `state/airspace/<node>` mirror when present and keeps ZERO contacts when the
+//! scanner source is unavailable. It renders a designed honest-empty rather
+//! than fake radar. The rich animated simulation ([`AirspaceState::simulated`])
+//! survives as a cfg-gated test fixture only.
 
 use std::f32::consts::TAU;
+use std::time::Duration;
 
 use mde_egui::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 use mde_egui::Style;
+
+/// Cadence for the active radar sweep and typed mirror refresh heartbeat.
+const AIRSPACE_REPAINT_INTERVAL: Duration = Duration::from_millis(33);
 
 /// A discovered wireless emitter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,6 +109,8 @@ pub struct AirspaceState {
     /// Whether Airspace is active (scanning + rendering). Scans only when true.
     pub active: bool,
     pub signals: Vec<AirspaceSignal>,
+    /// Availability reported by the daemon-side typed scanner mirror.
+    pub source_status: mackes_mesh_types::airspace::AirspaceAvailability,
     pub show_wifi: bool,
     pub show_cell: bool,
     pub show_bt: bool,
@@ -132,6 +136,7 @@ impl AirspaceState {
         Self {
             active: false,
             signals: Vec::new(),
+            source_status: mackes_mesh_types::airspace::AirspaceAvailability::NoSource,
             show_wifi: true,
             show_cell: true,
             show_bt: true,
@@ -514,11 +519,63 @@ impl AirspaceState {
         Self {
             active: true,
             signals,
+            source_status: mackes_mesh_types::airspace::AirspaceAvailability::Ready,
             show_wifi: true,
             show_cell: true,
             show_bt: true,
             heatmap: false,
             selected: None,
+        }
+    }
+
+    /// Replace the live picture from one validated daemon mirror snapshot.
+    ///
+    /// This is a whole-snapshot fold: a later empty/offline snapshot retracts
+    /// old contacts instead of leaving stale RF blips on screen. The animation
+    /// state and local filter preferences remain seat-owned.
+    pub fn refresh_from_wire(
+        &mut self,
+        snapshot: &mackes_mesh_types::airspace::AirspaceSnapshot,
+    ) {
+        self.source_status = snapshot.availability;
+        // A source-less/offline status is not allowed to smuggle retained or
+        // malformed contacts into the live-only surface. The typed contract
+        // normally emits an empty list for these states, but keep this UI
+        // boundary defensive so "NO SCANNER FEED" remains truthful.
+        let contacts: &[mackes_mesh_types::airspace::AirspaceContact] = match snapshot.availability {
+            mackes_mesh_types::airspace::AirspaceAvailability::Ready => snapshot.contacts.as_slice(),
+            mackes_mesh_types::airspace::AirspaceAvailability::NoSource
+            | mackes_mesh_types::airspace::AirspaceAvailability::Offline => &[],
+        };
+        self.signals = contacts
+            .iter()
+            .enumerate()
+            .map(|(index, contact)| AirspaceSignal {
+                kind: match contact.kind {
+                    mackes_mesh_types::airspace::AirspaceContactKind::Wifi => SignalKind::Wifi,
+                    mackes_mesh_types::airspace::AirspaceContactKind::Cell => SignalKind::Cell,
+                    mackes_mesh_types::airspace::AirspaceContactKind::Bluetooth => {
+                        SignalKind::Bluetooth
+                    }
+                },
+                id: contact.id.clone(),
+                name: contact.name.clone(),
+                signal_dbm: contact.signal_dbm,
+                bearing_deg: contact.bearing_deg,
+                channel: contact.channel,
+                encryption: contact.encryption.clone(),
+                notable: contact.notable,
+                watchlist: contact.watchlist,
+                own: contact.own,
+                phase: index as f32 * 0.6,
+            })
+            .collect();
+        if self
+            .selected
+            .as_ref()
+            .is_some_and(|selected| !self.signals.iter().any(|signal| &signal.id == selected))
+        {
+            self.selected = None;
         }
     }
 
@@ -556,13 +613,14 @@ fn finite_or(v: f32, f: f32) -> f32 {
 
 /// Render the Airspace surface: the radar scope + a live-now panel beside it.
 pub fn airspace_panel(ui: &mut Ui, state: &mut AirspaceState) {
+    // The tab rail can select Airspace by assigning `WorkspaceTab::Airspace`
+    // directly, so do not rely on the caller remembering a second activation
+    // flag. The panel is only mounted while visible; arming here makes the
+    // sweep render and repaint even when the pointer is completely still.
+    state.active = true;
     // Continuous repaint drives the sweep + signal flutter — the "active" look.
-    if state.active {
-        // ~30 fps animation cadence — smooth sweep/flutter without pinning the CPU
-        // (the debug seat is unoptimized; the release build has ample headroom).
-        ui.ctx()
-            .request_repaint_after(std::time::Duration::from_millis(33));
-    }
+    // ~30 fps keeps the animation smooth without pinning the CPU.
+    ui.ctx().request_repaint_after(AIRSPACE_REPAINT_INTERVAL);
     let t = ui.input(|i| i.time) as f32;
     let full = ui.available_rect_before_wrap();
     if !full.is_finite() || full.width() < 40.0 || full.height() < 40.0 {
@@ -732,9 +790,20 @@ fn paint_radar_scope(ui: &mut Ui, rect: Rect, state: &mut AirspaceState, t: f32)
     );
 
     // Honest empty state: the scope stays armed (sweep runs) but a source-less
-    // airspace says so explicitly — "no scanner feed", never fake radar. The
-    // MG90 airspace worker is the future source (P8/Q33).
+    // airspace says so explicitly — never fake radar. The typed worker status
+    // distinguishes an unconfigured scanner from an attempted/offline one.
     if state.signals.is_empty() {
+        let detail = match state.source_status {
+            mackes_mesh_types::airspace::AirspaceAvailability::NoSource => {
+                "MG90 scanner source not configured"
+            }
+            mackes_mesh_types::airspace::AirspaceAvailability::Offline => {
+                "MG90 scanner is offline"
+            }
+            mackes_mesh_types::airspace::AirspaceAvailability::Ready => {
+                "MG90 scanner returned no contacts"
+            }
+        };
         p.text(
             center + Vec2::new(0.0, radius * 0.45),
             Align2::CENTER_CENTER,
@@ -745,7 +814,7 @@ fn paint_radar_scope(ui: &mut Ui, rect: Rect, state: &mut AirspaceState, t: f32)
         p.text(
             center + Vec2::new(0.0, radius * 0.45 + Style::SP_M),
             Align2::CENTER_CENTER,
-            "MG90 airspace worker not wired",
+            detail,
             FontId::proportional(Style::SMALL),
             Style::TEXT_DIM,
         );
@@ -921,6 +990,26 @@ fn paint_live_panel(ui: &mut Ui, rect: Rect, state: &mut AirspaceState, t: f32) 
 mod tests {
     use super::*;
 
+    fn painted_texts(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
+        fn collect(shape: &egui::epaint::Shape, texts: &mut Vec<String>) {
+            match shape {
+                egui::epaint::Shape::Text(text) => texts.push(text.galley.text().to_string()),
+                egui::epaint::Shape::Vec(children) => {
+                    for child in children {
+                        collect(child, texts);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut texts = Vec::new();
+        for clipped in shapes {
+            collect(&clipped.shape, &mut texts);
+        }
+        texts
+    }
+
     #[test]
     fn simulated_feed_is_rich_and_typed() {
         let a = AirspaceState::simulated();
@@ -948,6 +1037,149 @@ mod tests {
         // Default is the live (honest) state, not the fixture.
         let d = AirspaceState::default();
         assert!(d.signals.is_empty());
+    }
+
+    #[test]
+    fn typed_mirror_replaces_contacts_and_retracts_stale_selection() {
+        let mut state = AirspaceState::live();
+        let snapshot = mackes_mesh_types::airspace::AirspaceSnapshot::from_survey(
+            "mg90-live",
+            42,
+            mackes_mesh_types::airspace::AirspaceSurvey {
+                scanned_at_ms: Some(41),
+                contacts: vec![mackes_mesh_types::airspace::AirspaceContact {
+                    id: "aa:bb".to_string(),
+                    kind: mackes_mesh_types::airspace::AirspaceContactKind::Wifi,
+                    name: "mesh-ap".to_string(),
+                    signal_dbm: -55,
+                    bearing_deg: 12.0,
+                    channel: Some(36),
+                    encryption: Some("WPA3".to_string()),
+                    notable: false,
+                    watchlist: false,
+                    own: true,
+                }],
+                gaps: Vec::new(),
+            },
+        );
+        state.refresh_from_wire(&snapshot);
+        state.selected = Some("aa:bb".to_string());
+        assert_eq!(state.source_status, mackes_mesh_types::airspace::AirspaceAvailability::Ready);
+        assert_eq!(state.signals.len(), 1);
+        assert_eq!(state.signals[0].kind, SignalKind::Wifi);
+
+        let empty = mackes_mesh_types::airspace::AirspaceSnapshot::offline(
+            "mg90-live",
+            43,
+            "scanner timeout",
+        );
+        state.refresh_from_wire(&empty);
+        assert_eq!(state.source_status, mackes_mesh_types::airspace::AirspaceAvailability::Offline);
+        assert!(state.signals.is_empty());
+        assert!(state.selected.is_none());
+    }
+
+    #[test]
+    fn source_less_mirrors_keep_no_scanner_feed_truthful() {
+        for (availability, expected_detail) in [
+            (
+                mackes_mesh_types::airspace::AirspaceAvailability::NoSource,
+                "MG90 scanner source not configured",
+            ),
+            (
+                mackes_mesh_types::airspace::AirspaceAvailability::Offline,
+                "MG90 scanner is offline",
+            ),
+        ] {
+            let mut snapshot = mackes_mesh_types::airspace::AirspaceSnapshot::no_source(
+                "mg90-ui-test",
+                42,
+            );
+            snapshot.availability = availability;
+            snapshot.contacts.push(mackes_mesh_types::airspace::AirspaceContact {
+                id: "must-not-render".to_string(),
+                kind: mackes_mesh_types::airspace::AirspaceContactKind::Wifi,
+                name: "forged-contact".to_string(),
+                signal_dbm: -45,
+                bearing_deg: 0.0,
+                channel: None,
+                encryption: None,
+                notable: false,
+                watchlist: false,
+                own: false,
+            });
+
+            let mut state = AirspaceState::live();
+            state.refresh_from_wire(&snapshot);
+            assert!(state.signals.is_empty(), "{availability:?} must have no contacts");
+
+            let ctx = egui::Context::default();
+            Style::install(&ctx);
+            let out = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        Pos2::ZERO,
+                        Vec2::new(1280.0, 820.0),
+                    )),
+                    events: Vec::new(),
+                    time: Some(1.0),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        airspace_panel(ui, &mut state);
+                    });
+                },
+            );
+            let texts = painted_texts(&out.shapes);
+            assert!(texts.iter().any(|text| text == "NO SCANNER FEED"));
+            assert!(texts.iter().any(|text| text == expected_detail));
+            assert!(!texts.iter().any(|text| text == "forged-contact"));
+        }
+    }
+
+    #[test]
+    fn active_airspace_renders_and_requests_repaint_without_pointer_events() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut state = AirspaceState::live();
+        let frame = |ctx: &egui::Context, state: &mut AirspaceState, time: f64| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        Pos2::ZERO,
+                        Vec2::new(1280.0, 820.0),
+                    )),
+                    events: Vec::new(),
+                    time: Some(time),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        airspace_panel(ui, state);
+                    });
+                },
+            )
+        };
+
+        // Run two event-free frames: the second one proves the panel keeps
+        // producing paint and a future wake-up without pointer movement.
+        let _ = frame(&ctx, &mut state, 0.0);
+        let out = frame(&ctx, &mut state, 1.0 / 30.0);
+        let repaint_delay = out
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .expect("root viewport output")
+            .repaint_delay;
+        assert!(
+            repaint_delay <= AIRSPACE_REPAINT_INTERVAL,
+            "active airspace must schedule a pointer-free heartbeat (delay {repaint_delay:?})"
+        );
+        let texts = painted_texts(&out.shapes);
+        assert!(
+            texts.iter().any(|text| text == "NO SCANNER FEED"),
+            "event-free frame still paints the honest airspace state: {texts:?}"
+        );
     }
 
     #[test]

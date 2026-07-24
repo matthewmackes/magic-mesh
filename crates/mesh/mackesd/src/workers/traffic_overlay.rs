@@ -10,6 +10,7 @@ use std::time::Duration;
 use mackes_mesh_types::traffic::{traffic_state_topic, TrafficEvent, TrafficSnapshot};
 use reqwest::blocking::Client;
 use reqwest::header::{CONTENT_TYPE, ETAG, IF_NONE_MATCH, RETRY_AFTER};
+use serde::de::{self, Deserializer, SeqAccess, Visitor};
 use serde::Deserialize;
 
 use super::{ShutdownToken, Worker};
@@ -27,6 +28,7 @@ const QUERY_RADIUS_KM: u16 = 100;
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_FEED_FEATURES: usize = 1_000;
 const MAX_RETAINED_EVENTS: usize = 256;
+const MAX_POINT_COORDINATES: usize = 3;
 const MAX_STRING_BYTES: usize = 512;
 const MAX_GAPS: usize = 128;
 const VEHICLE_FIX_MAX_AGE_MS: i64 = 30_000;
@@ -324,13 +326,18 @@ struct FeatureCollection {
     #[serde(rename = "type")]
     kind: String,
     #[serde(default)]
-    features: Vec<Feature>,
+    // Keep raw feature values until the per-feature parser runs.  A single
+    // bad property must not make an otherwise useful current-event feed
+    // disappear wholesale.
+    features: Vec<serde_json::Value>,
     #[serde(default, rename = "exceededTransferLimit")]
     exceeded_transfer_limit: bool,
 }
 
 #[derive(Debug, Deserialize)]
 struct Feature {
+    #[serde(rename = "type")]
+    kind: String,
     #[serde(default)]
     properties: Properties,
     geometry: Option<PointGeometry>,
@@ -374,7 +381,46 @@ struct Properties {
 struct PointGeometry {
     #[serde(rename = "type")]
     kind: String,
+    #[serde(deserialize_with = "deserialize_point_coordinates")]
     coordinates: Vec<f64>,
+}
+
+fn deserialize_point_coordinates<'de, D>(deserializer: D) -> Result<Vec<f64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct CoordinatesVisitor;
+
+    impl<'de> Visitor<'de> for CoordinatesVisitor {
+        type Value = Vec<f64>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a GeoJSON point coordinate sequence with two or three numbers")
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut coordinates = Vec::with_capacity(2);
+            while let Some(coordinate) = sequence.next_element::<f64>()? {
+                if coordinates.len() >= MAX_POINT_COORDINATES {
+                    return Err(de::Error::custom(format!(
+                        "point geometry exceeds {MAX_POINT_COORDINATES} coordinates"
+                    )));
+                }
+                coordinates.push(coordinate);
+            }
+            if coordinates.len() < 2 {
+                return Err(de::Error::custom(
+                    "point geometry needs at least two coordinates",
+                ));
+            }
+            Ok(coordinates)
+        }
+    }
+
+    deserializer.deserialize_seq(CoordinatesVisitor)
 }
 
 fn parse_snapshot(
@@ -410,12 +456,31 @@ fn parse_snapshot(
             "NCDOT transfer limit reached".to_string(),
         );
     }
-    for (index, feature) in feed
+    for (index, raw_feature) in feed
         .features
         .into_iter()
         .take(MAX_FEED_FEATURES)
         .enumerate()
     {
+        let feature = match serde_json::from_value::<Feature>(raw_feature) {
+            Ok(feature) => feature,
+            Err(error) => {
+                snapshot.omitted_features = snapshot.omitted_features.saturating_add(1);
+                push_gap(
+                    &mut snapshot.gaps,
+                    format!("NCDOT feature {index} omitted: malformed feature: {error}"),
+                );
+                continue;
+            }
+        };
+        if feature.kind != "Feature" {
+            snapshot.omitted_features = snapshot.omitted_features.saturating_add(1);
+            push_gap(
+                &mut snapshot.gaps,
+                format!("NCDOT feature {index} omitted: not a GeoJSON Feature"),
+            );
+            continue;
+        }
         match parse_feature(feature, context, fetched_at_ms) {
             Ok(Some(event)) => snapshot.events.push(event),
             Ok(None) => snapshot.omitted_features = snapshot.omitted_features.saturating_add(1),
@@ -637,6 +702,37 @@ impl TrafficOverlayWorker {
         }
     }
 
+    fn degraded_snapshot(
+        &self,
+        last_good: Option<&TrafficSnapshot>,
+        error: &ProbeFailure,
+    ) -> TrafficSnapshot {
+        // On restart, the in-memory cache is empty while the Bus can still
+        // contain a prior successful record. Read that record only to derive a
+        // cleared degraded projection; never treat it as current traffic.
+        let persisted = self.bus_root.clone().and_then(|root| {
+            let persist = mde_bus::persist::Persist::open(root).ok()?;
+            let body = persist
+                .read_latest(&traffic_state_topic(&self.host))
+                .ok()
+                .flatten()?
+                .body?;
+            serde_json::from_str::<TrafficSnapshot>(&body).ok()
+        });
+        let mut degraded = last_good
+            .cloned()
+            .or(persisted)
+            .unwrap_or_else(|| TrafficSnapshot::empty(&self.host, now_ms(), 0.0, 0.0, QUERY_RADIUS_KM));
+        degraded.events.clear();
+        degraded.omitted_features = 0;
+        degraded.fetched_at_ms = now_ms();
+        degraded
+            .gaps
+            .retain(|gap| !gap.starts_with("NCDOT traffic paused:"));
+        push_gap(&mut degraded.gaps, format!("NCDOT traffic paused: {error}"));
+        degraded
+    }
+
     fn apply_result(
         &self,
         result: Result<PreparedResponse, ProbeFailure>,
@@ -652,13 +748,12 @@ impl TrafficOverlayWorker {
                 }
             }
             Err(error) => {
-                if let Some(snapshot) = last_good {
-                    snapshot
-                        .gaps
-                        .retain(|gap| !gap.starts_with("NCDOT traffic paused:"));
-                    push_gap(&mut snapshot.gaps, format!("NCDOT traffic paused: {error}"));
-                    self.publish(snapshot);
-                }
+                // Keep a successful in-memory snapshot as the conditional-
+                // refresh cache, but publish only an empty degraded projection
+                // after the vehicle fix or feed has gone stale. This also
+                // clears a stale persisted record after a worker restart.
+                let degraded = self.degraded_snapshot(last_good.as_ref(), &error);
+                self.publish(&degraded);
                 ApplyOutcome {
                     success: false,
                     retry_after: error.retry_after,
@@ -728,6 +823,7 @@ fn validated_vehicle_context(
     if vehicle.host != expected_host
         || !vehicle.online
         || !gps.has_fix()
+        || !matches!(gps.fix_type.as_str(), "gps" | "dgps")
         || !gps.latitude.is_finite()
         || !gps.longitude.is_finite()
         || !gps.age_s.is_finite()
@@ -865,6 +961,61 @@ mod tests {
     }
 
     #[test]
+    fn malformed_feature_isolated_from_valid_current_events() {
+        let mut feed: serde_json::Value =
+            serde_json::from_str(&live_geojson()).expect("fixture json");
+        feed["features"]
+            .as_array_mut()
+            .expect("features")
+            .push(json!({
+                "type": "Feature",
+                "properties": {"Id": "not-an-integer"},
+                "geometry": {"type": "Point", "coordinates": [-78.70, 35.70]}
+            }));
+
+        let snapshot =
+            parse_snapshot("rig-1", context(), &feed.to_string(), NOW_MS).expect("partial feed");
+        assert_eq!(snapshot.events.len(), 1);
+        assert_eq!(snapshot.omitted_features, 1);
+        assert!(snapshot
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("feature 1 omitted: malformed feature")));
+    }
+
+    #[test]
+    fn non_feature_geojson_member_isolated_from_valid_current_events() {
+        let mut feed: serde_json::Value =
+            serde_json::from_str(&live_geojson()).expect("fixture json");
+        feed["features"][0]["type"] = json!("Geometry");
+
+        let snapshot =
+            parse_snapshot("rig-1", context(), &feed.to_string(), NOW_MS).expect("partial feed");
+        assert!(snapshot.events.is_empty());
+        assert_eq!(snapshot.omitted_features, 1);
+        assert!(snapshot
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("feature 0 omitted: not a GeoJSON Feature")));
+    }
+
+    #[test]
+    fn overlong_point_coordinates_are_bounded_and_isolated() {
+        let mut feed: serde_json::Value =
+            serde_json::from_str(&live_geojson()).expect("fixture json");
+        feed["features"][0]["geometry"]["coordinates"] = json!([-78.7545, 35.5574, 10.0, 20.0]);
+
+        let snapshot = parse_snapshot("rig-1", context(), &feed.to_string(), NOW_MS)
+            .expect("bounded malformed feature should not poison the feed");
+        assert!(snapshot.events.is_empty());
+        assert_eq!(snapshot.omitted_features, 1);
+        assert!(snapshot
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("exceeds 3 coordinates")));
+    }
+
+    #[test]
     fn endpoint_bbox_body_and_record_counts_are_bounded() {
         let url = query_url(context()).expect("query");
         assert_eq!(url.host_str(), Some("services.arcgis.com"));
@@ -896,6 +1047,11 @@ mod tests {
         };
         assert!(validated_vehicle_context(&vehicle, "rig-1", 110_000).is_some());
         assert!(validated_vehicle_context(&vehicle, "other", 110_000).is_none());
+        vehicle.gps.fix_type = "simulated".to_string();
+        assert!(validated_vehicle_context(&vehicle, "rig-1", 110_000).is_none());
+        vehicle.gps.fix_type = "gps".to_string();
+        vehicle.gps.age_s = 21.0;
+        assert!(validated_vehicle_context(&vehicle, "rig-1", 110_000).is_none());
         vehicle.gps.latitude = 44.0;
         vehicle.gps.longitude = -120.0;
         assert!(validated_vehicle_context(&vehicle, "rig-1", 100_000).is_none());
@@ -929,18 +1085,54 @@ mod tests {
         assert!(!paused.success);
         let retained = last_good.as_ref().expect("last good");
         assert_eq!(retained.fetched_at_ms, NOW_MS);
+        assert_eq!(retained.events.len(), 1, "cache remains usable for 304");
         assert!(retained
             .gaps
             .iter()
+            .all(|gap| !gap.starts_with("NCDOT traffic paused:")));
+        let rows = Persist::open(root)
+            .expect("bus")
+            .list_since(&traffic_state_topic("rig-1"), None)
+            .expect("rows");
+        assert_eq!(rows.len(), 2);
+        let degraded: TrafficSnapshot =
+            serde_json::from_str(rows[1].body.as_deref().expect("degraded body"))
+                .expect("degraded snapshot");
+        assert!(degraded.events.is_empty());
+        assert!(degraded
+            .gaps
+            .iter()
             .any(|gap| gap.starts_with("NCDOT traffic paused:")));
-        assert_eq!(
-            Persist::open(root)
-                .expect("bus")
-                .list_since(&traffic_state_topic("rig-1"), None)
-                .expect("rows")
-                .len(),
-            2
+        assert!(degraded.fetched_at_ms > NOW_MS);
+
+        // The worker above uses a fresh root, so seed it with the successful
+        // record and then verify a no-cache failure clears that persisted data.
+        let restart_root = tempfile::tempdir().expect("restart root");
+        let restarted = TrafficOverlayWorker::new("rig-1".to_string())
+            .with_bus_root(Some(restart_root.path().to_path_buf()));
+        let mut seed_cache = None;
+        restarted.apply_result(
+            Ok(PreparedResponse::Modified(retained.clone())),
+            &mut seed_cache,
         );
+        let mut restart_cache = None;
+        let restarted_failure = restarted.apply_result(
+            Err(ProbeFailure::other("no fresh vehicle fix")),
+            &mut restart_cache,
+        );
+        assert!(!restarted_failure.success);
+        let restarted_rows = Persist::open(restart_root.path().to_path_buf())
+            .expect("restart bus")
+            .list_since(&traffic_state_topic("rig-1"), None)
+            .expect("restart rows");
+        let cleared: TrafficSnapshot = serde_json::from_str(
+            restarted_rows
+                .last()
+                .and_then(|row| row.body.as_deref())
+                .expect("cleared body"),
+        )
+        .expect("cleared snapshot");
+        assert!(cleared.events.is_empty());
     }
 
     struct SlowProbe;

@@ -564,6 +564,37 @@ impl Revision {
         serde_yaml::to_string(self)
     }
 
+    /// Validate the fields that make a revision safe to place in the
+    /// replicated append-only log.
+    ///
+    /// YAML parsing intentionally remains separate from this check so callers
+    /// can inspect or migrate older documents without accidentally treating
+    /// them as an electable revision. The log is an authority input to
+    /// netstate/Ansible, so an electable revision must have a real version and
+    /// a canonical, printable node identity. Cryptographic origin remains a
+    /// transport/enrollment concern; this check prevents malformed or
+    /// path-shaped replicated documents from becoming authority by accident.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.version == 0 {
+            return Err("revision version must be greater than zero".to_string());
+        }
+        if self.author.is_empty() {
+            return Err("revision author must not be empty".to_string());
+        }
+        if self.author.len() > 128 {
+            return Err("revision author is too long".to_string());
+        }
+        if self.author != self.author.trim()
+            || !self
+                .author
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, ':' | '.' | '_' | '-'))
+        {
+            return Err("revision author must be a canonical node id".to_string());
+        }
+        Ok(())
+    }
+
     /// Does this revision win over `other` under the fleet's total order?
     ///
     /// Higher `version` wins; equal versions break to the later `at`; an exact

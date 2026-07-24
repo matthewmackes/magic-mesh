@@ -27,6 +27,7 @@
 
 use std::path::Path;
 
+use mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION;
 use mackes_mesh_types::vdi_session::SessionRequest;
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
@@ -89,20 +90,27 @@ pub(crate) fn local_peer() -> String {
     "localhost".to_string()
 }
 
-/// Publish an `Open` request `body` to `action/vdi/session` via the persist-first
+/// Publish one session request to `action/vdi/session` via the persist-first
 /// path (`mde-bus publish`'s own path): the write is recorded locally and the Bus
 /// replicates it to the serving peer. Records any failure in `last_error` — never
-/// panics. (The cross-peer *serving* is gated downstream in the broker; the publish
-/// itself is the reachable near half.)
-fn publish(bus_root: Option<&Path>, last_error: &mut Option<String>, body: &str) {
+/// panics. The exact body is wrapped in the same schema-v1, session-targeted root
+/// capability the broker verifies before folding its roster.
+fn publish(bus_root: Option<&Path>, last_error: &mut Option<String>, request: &SessionRequest) {
     let Some(root) = bus_root else {
         *last_error = Some("No mesh Bus directory — can't request a desktop session.".to_string());
         return;
     };
+    let body = match authorize_session_request(request) {
+        Ok(body) => body,
+        Err(error) => {
+            *last_error = Some(format!("Couldn't authorize the desktop session: {error}"));
+            return;
+        }
+    };
     // arch-11: writer — the shared BusReader seam is read-only; this publish keeps
     // Persist::open because it needs the write Result to set `last_error`.
     match Persist::open(root.to_path_buf())
-        .and_then(|p| p.write(ACTION_TOPIC, Priority::Default, None, Some(body)))
+        .and_then(|p| p.write(ACTION_TOPIC, Priority::Default, None, Some(&body)))
     {
         Ok(_) => *last_error = None,
         Err(e) => *last_error = Some(format!("Couldn't request the session: {e}")),
@@ -134,15 +142,42 @@ pub(crate) fn publish_open_record(
     client_peer: &str,
 ) -> OpenPublication {
     let id = mint_session_id(vm_id, now_ms());
-    let body = SessionRequest::Open {
+    let request = SessionRequest::Open {
         id: id.clone(),
         serving_peer: serving_peer.to_string(),
         vm_id: vm_id.to_string(),
         client_peer: client_peer.to_string(),
-    }
-    .to_body();
-    publish(bus_root, last_error, &body);
+    };
+    let body = request.to_body();
+    publish(bus_root, last_error, &request);
     OpenPublication { id, body }
+}
+
+/// Return the broker's exact capability context for one session transition.
+fn session_auth_context(request: &SessionRequest) -> (&'static str, String) {
+    match request {
+        SessionRequest::Open { id, .. } => ("vdi-session-open", format!("session:{id}")),
+        SessionRequest::Active { id } => ("vdi-session-active", format!("session:{id}")),
+        SessionRequest::Disconnect { id } => ("vdi-session-disconnect", format!("session:{id}")),
+        SessionRequest::Close { id } => ("vdi-session-close", format!("session:{id}")),
+    }
+}
+
+/// Add the schema marker and mint the root-only exact-body capability consumed by
+/// `mackesd::workers::session_broker`. The legacy `SessionRequest` wire shape is
+/// preserved inside the envelope so the shared decoder remains byte-compatible.
+fn authorize_session_request(request: &SessionRequest) -> Result<String, String> {
+    let mut body: serde_json::Value = serde_json::from_str(&request.to_body())
+        .map_err(|error| format!("session request serialization failed: {error}"))?;
+    body.as_object_mut()
+        .ok_or_else(|| "session request is not a JSON object".to_string())?
+        .insert(
+            "schema_version".to_string(),
+            serde_json::Value::from(CLOUD_ACTION_SCHEMA_VERSION),
+        );
+    let body = body.to_string();
+    let (verb, target) = session_auth_context(request);
+    crate::iac::authorize_root_mutation_body(&body, verb, "vdi-session", &target)
 }
 
 #[cfg(any(test, feature = "live-vdi"))]
@@ -152,7 +187,7 @@ fn publish_lifecycle(
     request: SessionRequest,
 ) -> String {
     let body = request.to_body();
-    publish(bus_root, last_error, &body);
+    publish(bus_root, last_error, &request);
     body
 }
 
@@ -297,6 +332,29 @@ mod tests {
                 .is_some_and(|e| e.contains("No mesh Bus")),
             "no Bus dir surfaces an error, not a panic"
         );
+    }
+
+    #[test]
+    fn publish_open_writes_a_session_targeted_capability() {
+        let bus = tempfile::tempdir().unwrap();
+        let mut last_error = None;
+        let publication = publish_open_record(
+            Some(bus.path()),
+            &mut last_error,
+            "node-b",
+            "db1",
+            "client-node",
+        );
+        assert!(last_error.is_none());
+        let persist = Persist::open(bus.path().to_path_buf()).unwrap();
+        let rows = persist.list_since(ACTION_TOPIC, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        let signed: serde_json::Value =
+            serde_json::from_str(rows[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!(signed["schema_version"], CLOUD_ACTION_SCHEMA_VERSION);
+        assert!(signed["armed_token"].as_str().is_some());
+        assert_eq!(signed["id"], publication.id);
+        assert_eq!(signed["op"], "open");
     }
 
     #[test]

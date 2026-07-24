@@ -129,14 +129,51 @@ pub fn ensure_self_signed_cert(
     key_path: &std::path::Path,
     sans: &[String],
 ) -> Result<bool, String> {
-    if cert_path.exists() && key_path.exists() {
+    // `exists()` follows links and therefore cannot establish that a
+    // pre-existing private key is the owner-controlled identity we intend to
+    // reuse. Validate the complete pair through the sealed readers before
+    // treating it as idempotent. The public certificate reader accepts the
+    // canonical generation switch produced by `write_atomic_pair`, while the
+    // private-key reader additionally enforces owner + mode 0600.
+    let cert_present = match std::fs::symlink_metadata(cert_path) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(format!(
+                "inspect existing enroll certificate {}: {error}",
+                cert_path.display()
+            ));
+        }
+    };
+    let key_present = match std::fs::symlink_metadata(key_path) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(format!(
+                "inspect existing enroll private key {}: {error}",
+                key_path.display()
+            ));
+        }
+    };
+    if cert_present && key_present {
+        crate::ca::seal::read_no_follow(cert_path).map_err(|e| {
+            format!(
+                "refusing unsafe existing enroll certificate {}: {e}",
+                cert_path.display()
+            )
+        })?;
+        crate::ca::seal::read_sealed(key_path).map_err(|e| {
+            format!(
+                "refusing unsafe existing enroll private key {}: {e}",
+                key_path.display()
+            )
+        })?;
         return Ok(true);
     }
-    if cert_path.exists() != key_path.exists() {
+    if cert_present != key_present {
         return Err(format!(
             "refusing to replace incomplete enroll TLS identity (cert_exists={}, key_exists={})",
-            cert_path.exists(),
-            key_path.exists()
+            cert_present, key_present
         ));
     }
     let identity = generate_endpoint_identity(sans)?;
@@ -212,17 +249,25 @@ pub fn parse_request(buf: &[u8]) -> ParseOutcome {
         return ParseOutcome::Invalid("malformed request line");
     };
     // Content-Length drives body framing. Absent → zero-length body.
-    let mut content_length: usize = 0;
+    let mut content_length: Option<usize> = None;
     for line in lines {
         if let Some((name, value)) = line.split_once(':') {
             if name.trim().eq_ignore_ascii_case("content-length") {
-                match value.trim().parse::<usize>() {
-                    Ok(n) => content_length = n,
+                let parsed = match value.trim().parse::<usize>() {
+                    Ok(n) => n,
                     Err(_) => return ParseOutcome::Invalid("bad content-length"),
+                };
+                // Do not let the last repeated header silently redefine the
+                // framing chosen by an intermediary or a future caller. This
+                // endpoint has one request per TLS connection, so rejecting
+                // repetition is the safest unambiguous contract.
+                if content_length.replace(parsed).is_some() {
+                    return ParseOutcome::Invalid("duplicate content-length");
                 }
             }
         }
     }
+    let content_length = content_length.unwrap_or(0);
     if content_length > MAX_ENROLL_BODY {
         return ParseOutcome::Invalid("body too large");
     }
@@ -267,6 +312,7 @@ impl HttpResponse {
             "HTTP/1.1 {} {}\r\n\
              Content-Type: application/json\r\n\
              Content-Length: {}\r\n\
+             Cache-Control: no-store\r\n\
              Connection: close\r\n\r\n",
             self.status,
             reason,
@@ -307,6 +353,7 @@ fn sign_error_status(err: &SignCsrError) -> u16 {
         SignCsrError::BearerNotIssued { .. } => 401,
         SignCsrError::NodeBanned { .. } => 403,
         SignCsrError::PeerCapReached { .. } => 409,
+        SignCsrError::InvalidTarget { .. } | SignCsrError::CsrTargetMismatch { .. } => 400,
         // CsrCorrupt only fires on the file path; if it ever surfaces
         // here it's a client-sent bad CSR → 400. The rest are server
         // faults (no active CA, key read, nebula-cert missing).
@@ -445,6 +492,50 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn ensure_refuses_existing_untrusted_identity_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tmp");
+        let outside = tempfile::tempdir().expect("outside tmp");
+        let cert = dir.path().join("nebula/enroll.crt");
+        let key = dir.path().join("nebula/enroll.key");
+        let outside_cert = outside.path().join("cert.pem");
+        let outside_key = outside.path().join("key.pem");
+        std::fs::write(&outside_cert, b"attacker certificate").expect("cert fixture");
+        std::fs::write(&outside_key, b"attacker private key").expect("key fixture");
+        std::fs::create_dir_all(cert.parent().unwrap()).expect("mkdir");
+        symlink(&outside_cert, &cert).expect("cert symlink");
+        symlink(&outside_key, &key).expect("key symlink");
+
+        let error = ensure_self_signed_cert(&cert, &key, &[])
+            .expect_err("an existing identity must not follow arbitrary symlinks");
+        assert!(error.contains("unsafe existing enroll certificate"));
+        assert_eq!(
+            std::fs::read(&outside_key).unwrap(),
+            b"attacker private key"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_refuses_existing_private_key_with_group_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tmp");
+        let cert = dir.path().join("nebula/enroll.crt");
+        let key = dir.path().join("nebula/enroll.key");
+        ensure_self_signed_cert(&cert, &key, &[]).expect("initial identity");
+        let mut permissions = std::fs::metadata(&key).unwrap().permissions();
+        permissions.set_mode(0o640);
+        std::fs::set_permissions(&key, permissions).expect("weaken key permissions");
+
+        let error = ensure_self_signed_cert(&cert, &key, &[])
+            .expect_err("an insecure existing private key must not be reused");
+        assert!(error.contains("unsafe existing enroll private key"));
+    }
+
     #[test]
     fn endpoint_fingerprint_from_pem_matches_generated_identity() {
         // SETUP-5: re-reading an endpoint cert's PEM yields the same fingerprint
@@ -528,6 +619,15 @@ mod tests {
     }
 
     #[test]
+    fn parse_rejects_duplicate_content_lengths() {
+        let raw = b"POST /enroll HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello!";
+        assert_eq!(
+            parse_request(raw),
+            ParseOutcome::Invalid("duplicate content-length")
+        );
+    }
+
+    #[test]
     fn response_to_wire_has_status_and_body() {
         let resp = HttpResponse {
             status: 200,
@@ -536,6 +636,7 @@ mod tests {
         let wire = String::from_utf8(resp.to_wire()).unwrap();
         assert!(wire.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(wire.contains("Content-Length: 2\r\n"));
+        assert!(wire.contains("Cache-Control: no-store\r\n"));
         assert!(wire.contains("Connection: close\r\n"));
         assert!(wire.ends_with("\r\n\r\n{}"));
     }

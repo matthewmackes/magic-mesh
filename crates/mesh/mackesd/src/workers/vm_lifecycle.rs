@@ -82,7 +82,7 @@ use std::time::{Duration, Instant};
 use mde_bus::persist::Persist;
 use thiserror::Error;
 
-use crate::workers::proc::{output_with_timeout, status_with_timeout, DEFAULT_CMD_TIMEOUT};
+use crate::workers::proc::{output_with_timeout, DEFAULT_CMD_TIMEOUT};
 
 use super::cloud::{
     claim_nonce, verify_token, HmacTokenSigner, NullSigner, TokenSigner, TokenVerdict,
@@ -1129,19 +1129,19 @@ impl VirshCli {
         }
     }
 
-    /// Run a program to completion (status only; stdout/stderr nulled), bounded.
+    /// Run a program to completion, bounded, retaining stderr for diagnostics.
     fn run_status(program: &str, args: &[String]) -> Result<(), LibvirtError> {
         let mut cmd = Command::new(program);
         cmd.args(args);
-        let st = status_with_timeout(cmd, DEFAULT_CMD_TIMEOUT)
+        let output = output_with_timeout(cmd, DEFAULT_CMD_TIMEOUT)
             .map_err(|e| LibvirtError::Spawn(program.to_string(), e))?;
-        if st.success() {
+        if output.status.success() {
             Ok(())
         } else {
             Err(LibvirtError::Command {
                 cmd: args.first().cloned().unwrap_or_else(|| program.to_string()),
-                code: st.code().unwrap_or(-1),
-                stderr: String::new(),
+                code: output.status.code().unwrap_or(-1),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
             })
         }
     }
@@ -1392,8 +1392,7 @@ pub fn apply_action(backend: &dyn LibvirtBackend, action: &LifecycleAction) -> R
 /// row to the old `mde-bus publish <topic> --body-flag <json>` (the compact
 /// `serde_json` of the report). `bus_root` is [`VmLifecycleWorker::publish_bus_root`]
 /// — the MDE_BUS_ROOT-honouring root the fork+exec'd CLI resolved via the
-/// inherited env (NOT the worker's `dirs::data_dir()`-based ACTION-read root,
-/// which the live daemon's `MDE_BUS_ROOT=/run/mde-bus` diverges from).
+/// inherited env, also used by this worker's ACTION reader.
 /// Best-effort: an absent root / failed open / write error is swallowed.
 fn publish_instances(bus_root: Option<&Path>, report: &InstanceReport) {
     if let Some(mut persist) = crate::bus_publish::open_bus(bus_root.map(Path::to_path_buf)) {
@@ -1461,7 +1460,7 @@ fn prime_cursor(bus_root: &Path) -> Option<String> {
 }
 
 fn default_bus_root() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join("mde").join("bus"))
+    mde_bus::default_data_dir()
 }
 
 fn now_ms() -> u64 {
@@ -1557,9 +1556,8 @@ impl VmLifecycleWorker {
     /// The root the in-process roster publish targets (perf-10). A test's
     /// `with_bus_root` override wins (so a driven `run` publishes into the temp
     /// store, never the real one); production falls back to
-    /// [`crate::bus_publish::default_bus_root`] — the MDE_BUS_ROOT-honouring root
-    /// the fork+exec'd `mde-bus` used, NOT the `dirs`-based [`default_bus_root`]
-    /// this worker READS actions from.
+    /// [`crate::bus_publish::default_bus_root`] — the MDE_BUS_ROOT-honouring
+    /// resolver shared with this worker's action reader.
     fn publish_bus_root(&self) -> Option<PathBuf> {
         self.bus_root_override
             .clone()
@@ -2589,6 +2587,112 @@ mod tests {
     }
 
     #[test]
+    fn apply_destroy_is_target_scoped_and_forwards_storage_flag() {
+        // A destroy request must remove only the named domain. In particular,
+        // the storage-removal flag belongs to that same target and must not
+        // turn into a broad cleanup of the other domains on the host.
+        let fake = FakeLibvirt::new();
+        fake.domains.lock().unwrap().extend([
+            ("destroy-me".into(), VmState::Running),
+            ("keep-running".into(), VmState::Running),
+            ("keep-off".into(), VmState::ShutOff),
+        ]);
+
+        apply_action(
+            &fake,
+            &LifecycleAction::Destroy {
+                host: "node-a".into(),
+                name: "destroy-me".into(),
+                remove_storage: true,
+            },
+        )
+        .expect("targeted destroy ok");
+
+        assert_eq!(fake.state_of("destroy-me"), None);
+        assert_eq!(fake.state_of("keep-running"), Some(VmState::Running));
+        assert_eq!(fake.state_of("keep-off"), Some(VmState::ShutOff));
+        assert_eq!(fake.calls(), vec!["destroy:destroy-me:rm=true".to_string()]);
+    }
+
+    #[test]
+    fn apply_full_lifecycle_round_trip_through_injected_backend() {
+        // This is the complete deterministic lifecycle proof: the orchestration
+        // reads the current state before every transition, then drives only the
+        // injected backend. It exercises the same seam that production wires to
+        // VirshCli, without claiming a live libvirt/virsh drill.
+        let fake = FakeLibvirt::new();
+
+        apply_action(&fake, &create_action("desktop-1")).expect("create ok");
+        assert_eq!(fake.state_of("desktop-1"), Some(VmState::ShutOff));
+
+        apply_action(
+            &fake,
+            &LifecycleAction::Start {
+                host: "node-a".into(),
+                name: "desktop-1".into(),
+            },
+        )
+        .expect("start ok");
+        assert_eq!(fake.state_of("desktop-1"), Some(VmState::Running));
+
+        apply_action(
+            &fake,
+            &LifecycleAction::Pause {
+                host: "node-a".into(),
+                name: "desktop-1".into(),
+            },
+        )
+        .expect("pause ok");
+        assert_eq!(fake.state_of("desktop-1"), Some(VmState::Paused));
+
+        apply_action(
+            &fake,
+            &LifecycleAction::Resume {
+                host: "node-a".into(),
+                name: "desktop-1".into(),
+            },
+        )
+        .expect("resume ok");
+        assert_eq!(fake.state_of("desktop-1"), Some(VmState::Running));
+
+        apply_action(
+            &fake,
+            &LifecycleAction::Stop {
+                host: "node-a".into(),
+                name: "desktop-1".into(),
+                force: false,
+            },
+        )
+        .expect("stop ok");
+        assert_eq!(fake.state_of("desktop-1"), Some(VmState::ShutOff));
+
+        apply_action(
+            &fake,
+            &LifecycleAction::Destroy {
+                host: "node-a".into(),
+                name: "desktop-1".into(),
+                remove_storage: true,
+            },
+        )
+        .expect("destroy ok");
+        assert_eq!(fake.state_of("desktop-1"), None);
+        assert!(fake.list().expect("list ok").is_empty());
+        assert_eq!(
+            fake.calls(),
+            vec![
+                "ensure_default_pool",
+                "ensure_default_network",
+                "create:desktop-1",
+                "start:desktop-1",
+                "pause:desktop-1",
+                "resume:desktop-1",
+                "stop:desktop-1:force=false",
+                "destroy:desktop-1:rm=true",
+            ]
+        );
+    }
+
+    #[test]
     fn apply_pause_resume_lifecycle() {
         // A running VM pauses → suspended; resume wakes it back to running. Each
         // step drives the injected backend and advances the recorded state.
@@ -3029,6 +3133,11 @@ mod tests {
         let mut cursor = None;
         assert!(!worker.drain_and_apply(dir.path(), &mut cursor).await);
         assert!(fake.calls().iter().all(|call| call != "start:web1"));
+    }
+
+    #[test]
+    fn default_bus_root_uses_the_shared_mde_bus_resolver() {
+        assert_eq!(default_bus_root(), mde_bus::default_data_dir());
     }
 
     #[test]

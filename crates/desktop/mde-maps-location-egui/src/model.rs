@@ -215,8 +215,8 @@ impl MapsLocationSurface {
     ///
     /// * locations — the MG90 GNSS primary is armed but source-less (`No fix`,
     ///   null coordinates, disconnected) until a mirror folds in;
-    /// * airspace — zero contacts ("no scanner feed", not fake radar) until the
-    ///   MG90 airspace worker lands;
+    /// * airspace — zero contacts ("no scanner feed", not fake radar) until a
+    ///   typed MG90 airspace mirror reports a survey;
     /// * vehicle — absent telemetry whose confidence label never claims live;
     /// * trips / dead zones — empty, with the real recording seams
     ///   ([`Self::record_dead_zone_from_current_status`]) still functional;
@@ -254,7 +254,7 @@ impl MapsLocationSurface {
             vault: EncryptedVaultState::ready_for_local_admin(),
             real_hardware_gaps: vec![
                 AWAITING_MIRROR_GAP_NOTE.to_string(),
-                "MG90 airspace worker (WiFi survey / cell scan / BT) is not wired; Airspace has no scanner feed."
+                "MG90 airspace worker is publishing an explicit no-source state; no scanner probe is configured."
                     .to_string(),
                 "Valhalla offline routing is not wired; chosen destinations preview as straight-line only."
                     .to_string(),
@@ -779,6 +779,12 @@ impl MapsLocationSurface {
         if let Some(snapshot) = read_wildfire_mirror(persist, node) {
             self.refresh_from_wildfire(snapshot);
         }
+        if let Some(snapshot) = read_airspace_mirror(persist, node) {
+            self.refresh_from_airspace(snapshot);
+        }
+        if let Some(snapshot) = read_firms_mirror(persist, node) {
+            self.refresh_from_firms(snapshot);
+        }
         if let Some(snapshot) = read_traffic_mirror(persist, node) {
             self.refresh_from_traffic(snapshot);
         }
@@ -849,6 +855,44 @@ impl MapsLocationSurface {
         self.map.wildfire.fold(snapshot);
     }
 
+    /// Fold the latest typed MG90 scanner mirror. Whole-snapshot replacement
+    /// retracts contacts after an offline/empty poll, so stale RF blips cannot
+    /// survive a failed scan.
+    pub fn refresh_from_airspace(
+        &mut self,
+        snapshot: mackes_mesh_types::airspace::AirspaceSnapshot,
+    ) {
+        self.airspace.refresh_from_wire(&snapshot);
+        self.real_hardware_gaps.retain(|gap| {
+            !gap.starts_with("MG90 airspace worker is publishing an explicit no-source state")
+                && !gap.starts_with("MG90 airspace mirror")
+        });
+        match snapshot.availability {
+            mackes_mesh_types::airspace::AirspaceAvailability::NoSource => {
+                self.real_hardware_gaps.push(
+                    "MG90 airspace mirror is live, but no scanner probe is configured.".to_string(),
+                );
+            }
+            mackes_mesh_types::airspace::AirspaceAvailability::Offline => {
+                self.real_hardware_gaps.push(
+                    "MG90 airspace mirror is live, but the scanner probe is offline.".to_string(),
+                );
+            }
+            mackes_mesh_types::airspace::AirspaceAvailability::Ready => {}
+        }
+        for gap in snapshot.gaps {
+            let note = format!("Airspace adapter gap: {gap}");
+            if !self.real_hardware_gaps.contains(&note) {
+                self.real_hardware_gaps.push(note);
+            }
+        }
+    }
+
+    /// Fold a complete vehicle-centred NASA FIRMS hotspot snapshot.
+    pub fn refresh_from_firms(&mut self, snapshot: mackes_mesh_types::firms::FirmsSnapshot) {
+        self.map.firms.fold(snapshot);
+    }
+
     /// Fold a complete vehicle-centred NCDOT current-event set.
     pub fn refresh_from_traffic(&mut self, snapshot: mackes_mesh_types::traffic::TrafficSnapshot) {
         self.map.traffic_events.fold(snapshot);
@@ -891,6 +935,13 @@ impl MapsLocationSurface {
         self.active = WorkspaceTab::Vehicle;
     }
 
+    /// Open the cockpit on the Navigation home/Drive HUD. Car Mode may have
+    /// previously left the Maps surface on Vehicle telematics; the dedicated
+    /// Navigation card must always reset that tab before entering the cockpit.
+    pub fn focus_navigation_tab(&mut self) {
+        self.active = WorkspaceTab::Drive;
+    }
+
     /// Open the cockpit on the **Airspace** wardriving radar (and arm scanning) —
     /// the target of the Airspace keyboard action + feature-bar item.
     pub fn focus_airspace_tab(&mut self) {
@@ -928,12 +979,17 @@ fn mirror_age_s(published_at_ms: i64) -> f32 {
 /// body — the same "resolve `client_data_dir`, open `Persist` fail-soft,
 /// newest row, `serde_json` decode" seam the shell's own per-host readers use,
 /// embedded locally since that seam is crate-private to `mde-shell-egui`.
+///
+/// The topic path is an address, not an authority. Require the body to repeat
+/// the selected node's exact host stamp before folding it into the cockpit;
+/// otherwise a stale or manually injected cross-node row could move the map's
+/// projection origin and make another gateway look local.
 fn read_vehicle_mirror(
     persist: &mde_bus::persist::Persist,
     node: &str,
 ) -> Option<mackes_mesh_types::vehicle::VehicleState> {
     let topic = mackes_mesh_types::vehicle::vehicle_state_topic(node);
-    read_latest_json(persist, &topic)
+    read_latest_json_for_node(persist, &topic, node)
 }
 
 /// Decode the retained keyless-USGS overlay snapshot, fail-soft when the adapter
@@ -943,7 +999,7 @@ fn read_earthquake_mirror(
     node: &str,
 ) -> Option<mackes_mesh_types::earthquake::EarthquakeSnapshot> {
     let topic = mackes_mesh_types::earthquake::earthquake_state_topic(node);
-    read_latest_json(persist, &topic)
+    read_latest_json_for_node(persist, &topic, node)
 }
 
 /// Decode the retained NWS active-alert snapshot, fail-soft when the opt-in
@@ -953,7 +1009,7 @@ fn read_nws_alert_mirror(
     node: &str,
 ) -> Option<mackes_mesh_types::nws_alert::NwsAlertSnapshot> {
     let topic = mackes_mesh_types::nws_alert::nws_alert_state_topic(node);
-    read_latest_json(persist, &topic)
+    read_latest_json_for_node(persist, &topic, node)
 }
 
 /// Decode the retained adsb.lol aircraft snapshot, fail-soft when the adapter
@@ -963,7 +1019,7 @@ fn read_aircraft_mirror(
     node: &str,
 ) -> Option<mackes_mesh_types::aircraft::AircraftSnapshot> {
     let topic = mackes_mesh_types::aircraft::aircraft_state_topic(node);
-    read_latest_json(persist, &topic)
+    read_latest_json_for_node(persist, &topic, node)
 }
 
 /// Decode the retained MBTA transit snapshot, fail-soft when disabled/absent.
@@ -972,7 +1028,7 @@ fn read_transit_mirror(
     node: &str,
 ) -> Option<mackes_mesh_types::transit::TransitSnapshot> {
     let topic = mackes_mesh_types::transit::transit_state_topic(node);
-    read_latest_json(persist, &topic)
+    read_latest_json_for_node(persist, &topic, node)
 }
 
 /// Decode the retained NWS hourly snapshot, including explicit no-fix state.
@@ -981,7 +1037,7 @@ fn read_nws_forecast_mirror(
     node: &str,
 ) -> Option<mackes_mesh_types::nws_forecast::NwsForecastSnapshot> {
     let topic = mackes_mesh_types::nws_forecast::nws_forecast_state_topic(node);
-    read_latest_json(persist, &topic)
+    read_latest_json_for_node(persist, &topic, node)
 }
 
 /// Decode the retained Caltrans camera snapshot, fail-soft when disabled/absent.
@@ -990,7 +1046,7 @@ fn read_caltrans_camera_mirror(
     node: &str,
 ) -> Option<mackes_mesh_types::caltrans_camera::CaltransCameraSnapshot> {
     let topic = mackes_mesh_types::caltrans_camera::caltrans_camera_state_topic(node);
-    read_latest_json(persist, &topic)
+    read_latest_json_for_node(persist, &topic, node)
 }
 
 /// Decode the retained IEM/NWS NEXRAD snapshot, fail-soft when disabled/absent.
@@ -999,7 +1055,7 @@ fn read_iem_radar_mirror(
     node: &str,
 ) -> Option<mackes_mesh_types::iem_radar::IemRadarSnapshot> {
     let topic = mackes_mesh_types::iem_radar::iem_radar_state_topic(node);
-    read_latest_json(persist, &topic)
+    read_latest_json_for_node(persist, &topic, node)
 }
 
 /// Decode the retained keyless NIFC WFIGS perimeter snapshot, fail-soft when
@@ -1009,7 +1065,30 @@ fn read_wildfire_mirror(
     node: &str,
 ) -> Option<mackes_mesh_types::wildfire::WildfireSnapshot> {
     let topic = mackes_mesh_types::wildfire::wildfire_state_topic(node);
-    read_latest_json(persist, &topic)
+    read_latest_json_for_node(persist, &topic, node)
+}
+
+/// Decode the retained typed MG90 airspace scanner snapshot. The worker owns
+/// source honesty; the desktop only accepts a same-node envelope and folds it
+/// into the live-only Airspace surface.
+fn read_airspace_mirror(
+    persist: &mde_bus::persist::Persist,
+    node: &str,
+) -> Option<mackes_mesh_types::airspace::AirspaceSnapshot> {
+    let topic = mackes_mesh_types::airspace::airspace_state_topic(node);
+    read_latest_json_for_node(persist, &topic, node)
+}
+
+/// Decode the retained credential-gated NASA FIRMS hotspot snapshot. A
+/// malformed, absent, or cross-node row is isolated from the independent NIFC
+/// fold. All overlay readers enforce the producer host stamp because the topic
+/// namespace alone is not sufficient provenance on a shared Bus.
+fn read_firms_mirror(
+    persist: &mde_bus::persist::Persist,
+    node: &str,
+) -> Option<mackes_mesh_types::firms::FirmsSnapshot> {
+    let topic = mackes_mesh_types::firms::firms_state_topic(node);
+    read_latest_json_for_node(persist, &topic, node)
 }
 
 /// Decode the retained keyless NCDOT traffic snapshot, fail-soft outside North
@@ -1019,7 +1098,7 @@ fn read_traffic_mirror(
     node: &str,
 ) -> Option<mackes_mesh_types::traffic::TrafficSnapshot> {
     let topic = mackes_mesh_types::traffic::traffic_state_topic(node);
-    read_latest_json(persist, &topic)
+    read_latest_json_for_node(persist, &topic, node)
 }
 
 /// Decode retained AirNow state, including the explicit missing-key state.
@@ -1028,19 +1107,46 @@ fn read_air_quality_mirror(
     node: &str,
 ) -> Option<mackes_mesh_types::air_quality::AirQualitySnapshot> {
     let topic = mackes_mesh_types::air_quality::air_quality_state_topic(node);
-    read_latest_json(persist, &topic)
+    read_latest_json_for_node(persist, &topic, node)
 }
 
 /// Read and decode one retained latest-wins payload from an already-open Bus
 /// spool.  A missing row, absent body, SQL failure, or malformed JSON all
 /// intentionally collapse to `None`: one unhealthy feed must not prevent the
 /// remaining map layers from folding during the same poll.
+const MAX_RETAINED_OVERLAY_BYTES: usize = 4 * 1024 * 1024;
+
+fn retained_overlay_body(
+    persist: &mde_bus::persist::Persist,
+    topic: &str,
+) -> Option<String> {
+    let body = persist.read_latest(topic).ok().flatten()?.body?;
+    (body.len() <= MAX_RETAINED_OVERLAY_BYTES).then_some(body)
+}
+
 fn read_latest_json<T: DeserializeOwned>(
     persist: &mde_bus::persist::Persist,
     topic: &str,
 ) -> Option<T> {
-    let body = persist.read_latest(topic).ok().flatten()?.body?;
+    let body = retained_overlay_body(persist, topic)?;
     serde_json::from_str(&body).ok()
+}
+
+/// Read one retained overlay snapshot only when its producer host agrees with
+/// the node selected by the cockpit. A topic is an address, not an authority:
+/// a malformed or manually injected row can still be written under another
+/// node's topic, so every typed overlay envelope must repeat and match its
+/// own `host` stamp before it is folded.
+fn read_latest_json_for_node<T: DeserializeOwned>(
+    persist: &mde_bus::persist::Persist,
+    topic: &str,
+    node: &str,
+) -> Option<T> {
+    let body = retained_overlay_body(persist, topic)?;
+    let value: serde_json::Value = serde_json::from_str(&body).ok()?;
+    (value.get("host").and_then(serde_json::Value::as_str) == Some(node))
+        .then(|| serde_json::from_value(value).ok())
+        .flatten()
 }
 
 impl Default for MapsLocationSurface {
@@ -1300,6 +1406,8 @@ pub struct MapViewState {
     pub wildfire_overlay: bool,
     /// Latest vehicle-centred current wildfire perimeter set.
     pub wildfire: crate::wildfire::WildfireLayerState,
+    /// Latest vehicle-centred NASA FIRMS thermal-hotspot set.
+    pub firms: crate::firms::FirmsLayerState,
     /// Whether the regional NCDOT TIMS traffic-event layer is visible.
     pub traffic_event_overlay: bool,
     /// Latest vehicle-centred current NCDOT event set.
@@ -1349,6 +1457,7 @@ impl MapViewState {
             iem_radar: crate::iem_radar::IemRadarLayerState::default(),
             wildfire_overlay: true,
             wildfire: crate::wildfire::WildfireLayerState::default(),
+            firms: crate::firms::FirmsLayerState::default(),
             traffic_event_overlay: false,
             traffic_events: crate::traffic::TrafficLayerState::default(),
             air_quality_overlay: false,
@@ -1393,6 +1502,7 @@ impl MapViewState {
             iem_radar: crate::iem_radar::IemRadarLayerState::default(),
             wildfire_overlay: true,
             wildfire: crate::wildfire::WildfireLayerState::default(),
+            firms: crate::firms::FirmsLayerState::default(),
             traffic_event_overlay: false,
             traffic_events: crate::traffic::TrafficLayerState::default(),
             air_quality_overlay: false,
@@ -1439,6 +1549,8 @@ impl MapViewState {
         if self.wildfire_overlay {
             attribution.push_str(" | ");
             attribution.push_str(crate::wildfire::WildfireLayerState::attribution());
+            attribution.push_str(" | ");
+            attribution.push_str(crate::firms::FirmsLayerState::attribution());
         }
         if self.traffic_event_overlay {
             attribution.push_str(" | ");
@@ -1647,8 +1759,9 @@ pub struct LocalNavigationState {
 
 impl LocalNavigationState {
     /// The production navigation state: real provider contracts, an unplanned
-    /// route, and NO destinations beyond what live geocoding adds — the presets
-    /// ("Home", "Precinct HQ", …) were fixture data and never ship.
+    /// route, and no destinations beyond what live geocoding or the explicit
+    /// local home-address setting adds. The presets ("Home", "Precinct HQ", …)
+    /// were fixture data and never ship.
     fn live() -> Self {
         Self {
             routing: ProviderContract {
@@ -1685,7 +1798,7 @@ impl LocalNavigationState {
                 graceful_unavailable: true,
             },
             active_route: RoutePlan::none(),
-            destinations: Vec::new(),
+            destinations: configured_home_destination().into_iter().collect(),
             route_options: Vec::new(),
             selected_route: 0,
             selected_destination: 0,
@@ -1866,6 +1979,53 @@ impl LocalNavigationState {
             RouteTraffic::Heavy => "Heavy traffic ahead".to_string(),
         };
     }
+}
+
+/// Resolve the operator's private home address from the local seat setting.
+///
+/// The address is intentionally opt-in (`MDE_HOME_ADDRESS`) rather than
+/// guessed from the machine, GNSS, or a fabricated fixture. The installed
+/// gazetteer supplies the coordinate and the coordinate must fall inside the
+/// broad US bounds before Maps exposes the Home chip. This keeps the home
+/// destination local and makes a missing/unsupported US gazetteer explicit.
+fn configured_home_destination() -> Option<Destination> {
+    let query = std::env::var("MDE_HOME_ADDRESS").ok()?;
+    let query = query.trim();
+    if query.is_empty() {
+        return None;
+    }
+    crate::geocode::geocode(query, 8)
+        .results
+        .into_iter()
+        .find(|result| is_us_coordinate(result.lat, result.lon))
+        .map(home_destination_from_result)
+}
+
+/// Convert a validated gazetteer hit into the Home chip's durable destination.
+///
+/// Some place rows contain a coordinate but no separate subtitle (for example,
+/// a locality-only result). Keep the chip useful and honest by showing the
+/// result's title in that case rather than silently presenting an unlabeled
+/// address.
+fn home_destination_from_result(result: crate::geocode::GeoResult) -> Destination {
+    let address = result.subtitle();
+    let address = if address.trim().is_empty() {
+        result.title()
+    } else {
+        address
+    };
+    Destination {
+        label: "Home".to_string(),
+        category: "home".to_string(),
+        distance_mi: 0.0,
+        address,
+        lat: Some(result.lat),
+        lon: Some(result.lon),
+    }
+}
+
+fn is_us_coordinate(lat: f64, lon: f64) -> bool {
+    (18.0..=72.5).contains(&lat) && (-180.0..=-66.0).contains(&lon)
 }
 
 impl RoutePlan {
@@ -3570,7 +3730,7 @@ impl FirmwareWorkflow {
             checks: vec![
                 FirmwareCheck::pass("correct MG90 model"),
                 FirmwareCheck::pass("correct MGOS family"),
-                FirmwareCheck::pass("package integrity placeholder"),
+                FirmwareCheck::warn("package integrity not verified (simulated fixture)"),
                 FirmwareCheck::warn("verify vehicle/MG90 power before install"),
                 FirmwareCheck::pass("pre-update backup completed"),
                 FirmwareCheck::pass("direct Ethernet present"),
@@ -4054,6 +4214,33 @@ mod tests {
     }
 
     #[test]
+    fn home_coordinate_gate_covers_the_us_without_accepting_foreign_results() {
+        assert!(is_us_coordinate(40.7128, -74.0060));
+        assert!(is_us_coordinate(64.2008, -149.4937));
+        assert!(is_us_coordinate(21.3069, -157.8583));
+        assert!(!is_us_coordinate(51.5074, -0.1278));
+        assert!(!is_us_coordinate(35.6762, 139.6503));
+    }
+
+    #[test]
+    fn home_destination_keeps_a_visible_label_for_locality_only_hits() {
+        let home = home_destination_from_result(crate::geocode::GeoResult {
+            name: "Albany".to_string(),
+            housenumber: String::new(),
+            street: String::new(),
+            city: "Albany".to_string(),
+            lat: 42.6526,
+            lon: -73.7562,
+            kind: "place:city".to_string(),
+        });
+        assert_eq!(home.label, "Home");
+        assert_eq!(home.category, "home");
+        assert_eq!(home.address, "Albany");
+        assert_eq!(home.lat, Some(42.6526));
+        assert_eq!(home.lon, Some(-73.7562));
+    }
+
+    #[test]
     fn each_quick_category_chip_has_a_matching_destination() {
         // The "Where to?" chips (Home / Work / Fuel / Food / Parking) must each
         // resolve to a recent/favorite so a chip tap always opens a preview.
@@ -4365,6 +4552,49 @@ mod tests {
     }
 
     #[test]
+    fn live_persist_rejects_cross_node_vehicle_mirror() {
+        use mackes_mesh_types::vehicle::VehicleState;
+
+        let dir = tempfile::tempdir().expect("bus dir");
+        let persist = mde_bus::persist::Persist::open(dir.path().to_path_buf()).expect("bus");
+        let node = "rig-func-012";
+        let topic = mackes_mesh_types::vehicle::vehicle_state_topic(node);
+        let valid = VehicleState::offline(node);
+        persist
+            .write(
+                &topic,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&serde_json::to_string(&valid).expect("valid vehicle json")),
+            )
+            .expect("valid vehicle mirror");
+        assert_eq!(
+            read_vehicle_mirror(&persist, node)
+                .as_ref()
+                .map(|mirror| mirror.host.as_str()),
+            Some(node)
+        );
+
+        // The topic namespace alone is not provenance. A wrong-node latest row
+        // must be rejected before it can become the map's projection origin or
+        // feed the car telemetry fold.
+        let mut wrong_node = valid;
+        wrong_node.host = "another-node".to_string();
+        persist
+            .write(
+                &topic,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&serde_json::to_string(&wrong_node).expect("cross-node vehicle json")),
+            )
+            .expect("cross-node vehicle mirror");
+        assert!(
+            read_vehicle_mirror(&persist, node).is_none(),
+            "cross-node vehicle state must not fold under the selected node topic"
+        );
+    }
+
+    #[test]
     fn latest_json_is_feed_local_and_fail_soft() {
         // The shared Persist handle must let a malformed feed fall out without
         // poisoning the other latest-wins reads in the same refresh.  This is
@@ -4398,6 +4628,31 @@ mod tests {
         );
         let bad: Option<serde_json::Value> = read_latest_json(&persist, bad_topic);
         assert!(bad.is_none(), "malformed feed must fail soft locally");
+    }
+
+    #[test]
+    fn oversized_retained_overlay_is_rejected_before_json_decode() {
+        let dir = tempfile::tempdir().expect("temp bus dir");
+        let persist = mde_bus::persist::Persist::open(dir.path().to_path_buf()).expect("bus");
+        let topic = "state/overlay/test/oversized";
+        let body = serde_json::json!({
+            "host": "rig-func-012",
+            "padding": "x".repeat(MAX_RETAINED_OVERLAY_BYTES + 1),
+        })
+        .to_string();
+        persist
+            .write(
+                topic,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&body),
+            )
+            .expect("oversized retained payload is still a valid Bus row");
+
+        assert!(
+            read_latest_json::<serde_json::Value>(&persist, topic).is_none(),
+            "the Maps consumer must bound retained payloads before decoding"
+        );
     }
 
     #[test]
@@ -4587,8 +4842,221 @@ mod tests {
         assert!(state.map.wildfire.snapshot.is_some());
         assert!(state.map.wildfire_overlay);
         assert!(state.map.attribution_line().contains("NIFC WFIGS"));
+        assert!(state.map.attribution_line().contains("NASA FIRMS"));
         state.map.wildfire_overlay = false;
         assert!(!state.map.attribution_line().contains("NIFC WFIGS"));
+        assert!(!state.map.attribution_line().contains("NASA FIRMS"));
+    }
+
+    #[test]
+    fn live_persist_folds_firms_and_nifc_independently() {
+        use mackes_mesh_types::firms::{FirmsHotspot, FirmsSnapshot};
+        use mackes_mesh_types::wildfire::WildfireSnapshot;
+
+        let dir = tempfile::tempdir().expect("bus dir");
+        let persist = mde_bus::persist::Persist::open(dir.path().to_path_buf()).expect("bus");
+        let node = "rig-func-012";
+        let now_ms = test_now_ms();
+        let wildfire_topic = mackes_mesh_types::wildfire::wildfire_state_topic(node);
+        let firms_topic = mackes_mesh_types::firms::firms_state_topic(node);
+        let nifc = WildfireSnapshot::empty(node, now_ms, 44.0, -120.0, 200);
+        let mut firms =
+            FirmsSnapshot::empty(node, now_ms, now_ms, "VIIRS_NOAA20_NRT", 44.0, -120.0, 200);
+        firms.hotspots.push(FirmsHotspot {
+            id: "firms-1".to_string(),
+            latitude: 44.01,
+            longitude: -120.02,
+            brightness_k: Some(330.0),
+            frp_mw: Some(18.0),
+            confidence: Some("nominal".to_string()),
+            satellite: Some("N20".to_string()),
+            observed_at_ms: now_ms - 60_000,
+            distance_km: 2.0,
+        });
+        persist
+            .write(
+                &wildfire_topic,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&serde_json::to_string(&nifc).expect("NIFC json")),
+            )
+            .expect("NIFC mirror");
+        persist
+            .write(
+                &firms_topic,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&serde_json::to_string(&firms).expect("FIRMS json")),
+            )
+            .expect("FIRMS mirror");
+
+        let mut state = MapsLocationSurface::live();
+        state.refresh_from_persist(&persist, node);
+        assert!(state.map.wildfire.snapshot.is_some());
+        assert_eq!(
+            state
+                .map
+                .firms
+                .snapshot
+                .as_ref()
+                .expect("FIRMS snapshot")
+                .hotspots
+                .len(),
+            1
+        );
+
+        // A malformed FIRMS row must not prevent a newer valid NIFC snapshot
+        // from folding, and must not erase the last valid FIRMS fold.
+        let mut newer_nifc = WildfireSnapshot::empty(node, now_ms + 1, 44.0, -120.0, 200);
+        newer_nifc
+            .gaps
+            .push("NIFC wildfire paused: test".to_string());
+        persist
+            .write(
+                &wildfire_topic,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&serde_json::to_string(&newer_nifc).expect("new NIFC json")),
+            )
+            .expect("new NIFC mirror");
+        persist
+            .write(
+                &firms_topic,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some("{malformed FIRMS"),
+            )
+            .expect("malformed FIRMS mirror");
+        state.refresh_from_persist(&persist, node);
+        assert!(state.map.wildfire.paused());
+        assert_eq!(
+            state
+                .map
+                .firms
+                .snapshot
+                .as_ref()
+                .expect("last FIRMS snapshot")
+                .hotspots
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn live_persist_rejects_cross_node_firms_snapshot() {
+        use mackes_mesh_types::firms::{FirmsHotspot, FirmsSnapshot};
+
+        let dir = tempfile::tempdir().expect("bus dir");
+        let persist = mde_bus::persist::Persist::open(dir.path().to_path_buf()).expect("bus");
+        let node = "rig-func-012";
+        let now_ms = test_now_ms();
+        let topic = mackes_mesh_types::firms::firms_state_topic(node);
+
+        let mut valid =
+            FirmsSnapshot::empty(node, now_ms, now_ms, "VIIRS_NOAA20_NRT", 44.0, -120.0, 200);
+        valid.hotspots.push(FirmsHotspot {
+            id: "firms-valid".to_string(),
+            latitude: 44.01,
+            longitude: -120.02,
+            brightness_k: None,
+            frp_mw: Some(12.0),
+            confidence: None,
+            satellite: Some("N20".to_string()),
+            observed_at_ms: now_ms - 1_000,
+            distance_km: 2.0,
+        });
+        persist
+            .write(
+                &topic,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&serde_json::to_string(&valid).expect("valid FIRMS json")),
+            )
+            .expect("valid FIRMS mirror");
+
+        let mut state = MapsLocationSurface::live();
+        state.refresh_from_persist(&persist, node);
+        assert_eq!(
+            state.map.firms.snapshot.as_ref().map(|s| s.host.as_str()),
+            Some(node)
+        );
+
+        let mut wrong_node = valid;
+        wrong_node.host = "another-node".to_string();
+        wrong_node.hotspots[0].id = "firms-wrong-node".to_string();
+        persist
+            .write(
+                &topic,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&serde_json::to_string(&wrong_node).expect("cross-node FIRMS json")),
+            )
+            .expect("cross-node FIRMS mirror");
+
+        state.refresh_from_persist(&persist, node);
+        let retained = state
+            .map
+            .firms
+            .snapshot
+            .as_ref()
+            .expect("valid snapshot retained");
+        assert_eq!(retained.host, node);
+        assert_eq!(retained.hotspots[0].id, "firms-valid");
+    }
+
+    #[test]
+    fn live_persist_rejects_cross_node_keyless_earthquake_snapshot() {
+        use mackes_mesh_types::earthquake::EarthquakeSnapshot;
+
+        let dir = tempfile::tempdir().expect("bus dir");
+        let persist = mde_bus::persist::Persist::open(dir.path().to_path_buf()).expect("bus");
+        let node = "rig-func-012";
+        let now_ms = test_now_ms();
+        let topic = mackes_mesh_types::earthquake::earthquake_state_topic(node);
+        let valid = EarthquakeSnapshot::empty(node, now_ms);
+        persist
+            .write(
+                &topic,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&serde_json::to_string(&valid).expect("valid USGS json")),
+            )
+            .expect("valid USGS mirror");
+
+        let mut state = MapsLocationSurface::live();
+        state.refresh_from_persist(&persist, node);
+        assert_eq!(
+            state
+                .map
+                .earthquakes
+                .snapshot
+                .as_ref()
+                .map(|s| s.host.as_str()),
+            Some(node)
+        );
+
+        // The topic path is not sufficient provenance on the shared Bus. A
+        // wrong-node latest row must be ignored, preserving the last valid
+        // keyless feed instead of folding another workstation's snapshot.
+        let mut wrong_node = valid;
+        wrong_node.host = "another-node".to_string();
+        persist
+            .write(
+                &topic,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&serde_json::to_string(&wrong_node).expect("cross-node USGS json")),
+            )
+            .expect("cross-node USGS mirror");
+
+        state.refresh_from_persist(&persist, node);
+        let retained = state
+            .map
+            .earthquakes
+            .snapshot
+            .as_ref()
+            .expect("valid snapshot retained");
+        assert_eq!(retained.host, node);
     }
 
     #[test]
@@ -4679,6 +5147,23 @@ mod tests {
             .real_hardware_gaps
             .iter()
             .any(|g| g == AWAITING_MIRROR_GAP_NOTE));
+    }
+
+    #[test]
+    fn simulated_firmware_integrity_check_is_explicitly_unverified_fixture() {
+        let check = MapsLocationSurface::simulated()
+            .firmware
+            .checks
+            .into_iter()
+            .find(|check| check.label.starts_with("package integrity"))
+            .expect("simulated firmware fixture includes an integrity row");
+
+        assert_eq!(check.state, CheckState::Warn);
+        assert_eq!(
+            check.label,
+            "package integrity not verified (simulated fixture)"
+        );
+        assert!(!check.label.contains("placeholder"));
     }
 
     #[test]

@@ -14,7 +14,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use mackes_mesh_types::cloud::CloudArmedToken;
+use mackes_mesh_types::cloud::{
+    decode_cloud_arm_credential, CloudArmSigner, CloudArmedToken, CLOUD_ARM_CREDENTIAL,
+};
 
 use crate::workers::cloud::{
     claim_nonce, verify_token, HmacTokenSigner, NullSigner, TokenSigner, DEFAULT_AUTH_ROOT,
@@ -86,6 +88,31 @@ impl ActionAuthorizer {
     ///
     /// A log-safe refusal reason. The raw request body/token is never copied.
     pub fn authorize(&self, body: &str, context: MutationContext<'_>) -> Result<(), String> {
+        let token = self.verify_exact_body(body, context)?;
+        let now = (self.now)();
+        match claim_nonce(&self.auth_root, &token.nonce, token.expires_at_ms, now) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err("armed token was already used".to_string()),
+            Err(_) => Err("armed-token replay store is unavailable".to_string()),
+        }
+    }
+
+    /// Verify schema, exact-body authority, and bounded freshness without
+    /// consuming the capability nonce.
+    ///
+    /// This is reserved for a privileged worker that must inspect a signed
+    /// mutable document on every poll, then call [`Self::authorize`] exactly
+    /// once immediately before the destructive operation. In particular, a
+    /// read-only status/plan poll must not spend a capability.
+    ///
+    /// # Errors
+    ///
+    /// A log-safe refusal reason. The raw request body/token is never copied.
+    pub(crate) fn verify_exact_body(
+        &self,
+        body: &str,
+        context: MutationContext<'_>,
+    ) -> Result<CloudArmedToken, String> {
         if !super::body_within_cap(Some(body)) {
             return Err("request body exceeds the 64 KiB cap".to_string());
         }
@@ -125,11 +152,7 @@ impl ActionAuthorizer {
         if token.expires_at_ms > now.saturating_add(MAX_AUTH_TTL_MS) {
             return Err("armed token exceeds the 30-second lifetime".to_string());
         }
-        match claim_nonce(&self.auth_root, &token.nonce, token.expires_at_ms, now) {
-            Ok(true) => Ok(()),
-            Ok(false) => Err("armed token was already used".to_string()),
-            Err(_) => Err("armed-token replay store is unavailable".to_string()),
-        }
+        Ok(token)
     }
 
     #[cfg(test)]
@@ -141,6 +164,25 @@ impl ActionAuthorizer {
             now: Arc::new(move || now_ms),
         }
     }
+}
+
+/// Load the root-only HMAC mint authority for daemon-owned internal handoffs.
+/// This is deliberately separate from [`ActionAuthorizer`]'s verifier API:
+/// callers use it only for a narrowly named producer envelope, never for an
+/// arbitrary UI-controlled mutation.
+pub(crate) fn production_action_signer() -> Result<CloudArmSigner, String> {
+    if !rustix::process::geteuid().is_root() {
+        return Err("privileged action signing requires the root service process".to_string());
+    }
+    let directory = std::env::var_os("CREDENTIALS_DIRECTORY")
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| "systemd action credential is unavailable".to_string())?;
+    let path = directory.join(CLOUD_ARM_CREDENTIAL);
+    let raw = std::fs::read(&path)
+        .map_err(|error| format!("read systemd credential {}: {error}", path.display()))?;
+    let key = decode_cloud_arm_credential(&raw).map_err(str::to_string)?;
+    CloudArmSigner::new(key).map_err(str::to_string)
 }
 
 fn wall_now_ms() -> i64 {

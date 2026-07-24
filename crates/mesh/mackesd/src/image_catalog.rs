@@ -116,17 +116,38 @@ pub fn load_manifests(workgroup_root: &Path) -> Vec<ImageManifest> {
         return out;
     };
     for name_entry in names.filter_map(Result::ok) {
-        if !name_entry.path().is_dir() {
+        let Ok(name_type) = name_entry.file_type() else {
+            continue;
+        };
+        if !name_type.is_dir() || name_type.is_symlink() {
             continue;
         }
+        let name = name_entry.file_name();
         let Ok(versions) = std::fs::read_dir(name_entry.path()) else {
             continue;
         };
         for ver_entry in versions.filter_map(Result::ok) {
+            let Ok(version_type) = ver_entry.file_type() else {
+                continue;
+            };
+            if !version_type.is_dir() || version_type.is_symlink() {
+                continue;
+            }
             let manifest = ver_entry.path().join("manifest.toml");
             if let Ok(raw) = std::fs::read_to_string(&manifest) {
                 if let Ok(m) = toml::from_str::<ImageManifest>(&raw) {
-                    out.push(m);
+                    // The replicated path is part of the identity. Do not
+                    // surface a valid TOML blob copied under another image or
+                    // version directory; that would let stale/hostile state
+                    // masquerade as a different build.
+                    let path_name = name.to_string_lossy().into_owned();
+                    let path_version = ver_entry.file_name().to_string_lossy().into_owned();
+                    if validate_manifest(&m).is_ok()
+                        && m.name == path_name
+                        && m.version == path_version
+                    {
+                        out.push(m);
+                    }
                 }
             }
         }
@@ -214,12 +235,108 @@ pub fn record_manifest(
     let dir = images_dir(workgroup_root)
         .join(&manifest.name)
         .join(&manifest.version);
+    reject_symlinked_directory_components(&dir)
+        .map_err(|e| ManifestWriteError::Io(e.to_string()))?;
     std::fs::create_dir_all(&dir).map_err(|e| ManifestWriteError::Io(e.to_string()))?;
+    reject_symlinked_directory_components(&dir)
+        .map_err(|e| ManifestWriteError::Io(e.to_string()))?;
     let body = toml::to_string_pretty(manifest)
         .map_err(|e| ManifestWriteError::Serialize(e.to_string()))?;
     let path = dir.join("manifest.toml");
-    std::fs::write(&path, body).map_err(|e| ManifestWriteError::Io(e.to_string()))?;
+    write_atomic_public(&path, body.as_bytes())
+        .map_err(|e| ManifestWriteError::Io(e.to_string()))?;
     Ok(path)
+}
+
+/// Refuse to traverse a replicated directory symlink while preparing an image
+/// manifest destination. The final file is replaced by rename, so a hostile
+/// final-file symlink is also replaced rather than followed; parent symlinks
+/// must be rejected before `create_dir_all` can escape the image root.
+fn reject_symlinked_directory_components(path: &Path) -> std::io::Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("refusing symlinked image directory {}", current.display()),
+                ));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotADirectory,
+                    format!(
+                        "image path component is not a directory: {}",
+                        current.display()
+                    ),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+/// Crash-durable public-state replacement. `create_new` makes the temporary
+/// inode non-following, and rename replaces (rather than follows) a hostile
+/// final symlink. The old manifest therefore remains intact until the new
+/// complete body is synced.
+fn write_atomic_public(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} has no parent directory", path.display()),
+        )
+    })?;
+    let leaf = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid image manifest filename {}", path.display()),
+            )
+        })?;
+    let (tmp, mut file) = (0..16)
+        .find_map(|_| {
+            let candidate = parent.join(format!(
+                ".{leaf}.tmp.{}.{}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            match std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&candidate)
+            {
+                Ok(file) => Some(Ok((candidate, file))),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .unwrap_or_else(|| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("temporary image manifest collisions for {}", path.display()),
+            ))
+        })?;
+
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)?;
+        std::fs::File::open(parent)?.sync_all()
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -326,5 +443,61 @@ mod tests {
             load_manifests(tmp.path()).is_empty(),
             "no reject wrote a file"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn record_manifest_replaces_final_symlink_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let m = sample("cosmic-iso", "iso", "3.0");
+        let dir = images_dir(tmp.path()).join(&m.name).join(&m.version);
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = tmp.path().join("victim.toml");
+        std::fs::write(&victim, b"sentinel").unwrap();
+        symlink(&victim, dir.join("manifest.toml")).unwrap();
+
+        record_manifest(&m, tmp.path()).expect("replace safely");
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"sentinel");
+        assert_eq!(load_manifests(tmp.path()), vec![m]);
+        assert!(!std::fs::symlink_metadata(dir.join("manifest.toml"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(!std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().contains(".tmp.")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn record_manifest_rejects_symlinked_parent_before_escape() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), images_dir(tmp.path())).unwrap();
+
+        let error = record_manifest(&sample("cosmic-iso", "iso", "3.0"), tmp.path())
+            .expect_err("symlinked image root must be rejected");
+        assert!(matches!(error, ManifestWriteError::Io(_)));
+        assert!(!outside.path().join("cosmic-iso/3.0/manifest.toml").exists());
+    }
+
+    #[test]
+    fn load_manifests_rejects_content_moved_under_another_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = images_dir(tmp.path()).join("catalog-name").join("1.0");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("manifest.toml"),
+            "name = \"different-name\"\nkind = \"iso\"\nversion = \"1.0\"\n",
+        )
+        .unwrap();
+
+        assert!(load_manifests(tmp.path()).is_empty());
     }
 }

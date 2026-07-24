@@ -35,6 +35,8 @@ pub const DEFAULT_ROLE_HOST_MARKER: &str = "/var/lib/mackesd/nebula/role.host";
 pub struct MirrorSyncd {
     workgroup_root: PathBuf,
     role_marker_path: PathBuf,
+    node_id: String,
+    leadership_endpoints: Vec<String>,
     repo_dir: PathBuf,
     tick_interval: Duration,
     runner: Box<dyn MirrorSyncRunner + Send + Sync>,
@@ -48,6 +50,8 @@ impl MirrorSyncd {
         Self {
             workgroup_root,
             role_marker_path: PathBuf::from(DEFAULT_ROLE_HOST_MARKER),
+            node_id: local_node_id(),
+            leadership_endpoints: crate::substrate::etcd::default_endpoints(),
             repo_dir: PathBuf::from(mirrors::DEFAULT_REPO_DIR),
             tick_interval: DEFAULT_SYNC_INTERVAL,
             runner: Box::new(SubprocessSync),
@@ -58,6 +62,20 @@ impl MirrorSyncd {
     #[must_use]
     pub fn with_role_marker_path(mut self, p: PathBuf) -> Self {
         self.role_marker_path = p;
+        self
+    }
+
+    /// Override the local node identity — used by isolated authority tests.
+    #[must_use]
+    pub(crate) fn with_node_id(mut self, node_id: impl Into<String>) -> Self {
+        self.node_id = node_id.into();
+        self
+    }
+
+    /// Override the coordination-plane authority — used by isolated tests.
+    #[must_use]
+    pub(crate) fn with_leadership_endpoints(mut self, endpoints: Vec<String>) -> Self {
+        self.leadership_endpoints = endpoints;
         self
     }
 
@@ -88,7 +106,13 @@ impl MirrorSyncd {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() as u64);
-        let is_leader = self.role_marker_path.exists();
+        let is_leader = super::nebula_supervisor::role_marker_is_current_leader(
+            &self.role_marker_path,
+            &self.workgroup_root,
+            &self.node_id,
+            &self.leadership_endpoints,
+        )
+        .await;
         for m in mirrors::load_mirrors(&self.workgroup_root)
             .iter()
             .filter(|m| m.enabled)
@@ -111,6 +135,19 @@ impl MirrorSyncd {
             }
         }
     }
+}
+
+fn local_node_id() -> String {
+    if let Ok(node_id) = std::env::var("MACKESD_NODE_ID") {
+        if !node_id.trim().is_empty() {
+            return node_id;
+        }
+    }
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|hostname| !hostname.trim().is_empty())
+        .map(|hostname| format!("peer:{hostname}"))
+        .unwrap_or_else(|| "peer:unknown".to_owned())
 }
 
 #[async_trait::async_trait]
@@ -154,6 +191,8 @@ mod tests {
     fn worker(root: &Path, marker: PathBuf) -> MirrorSyncd {
         MirrorSyncd::new(root.to_path_buf())
             .with_role_marker_path(marker)
+            .with_node_id("peer:test")
+            .with_leadership_endpoints(vec![])
             .with_repo_dir(root.join("yum.repos.d"))
             .with_runner(Box::new(MockRunner))
     }
@@ -162,7 +201,8 @@ mod tests {
     async fn leader_tick_pulls_and_self_serves() {
         let tmp = tempfile::tempdir().unwrap();
         let marker = tmp.path().join("role.host");
-        std::fs::write(&marker, "host\n").unwrap(); // leader
+        crate::leader::force_take(&tmp.path().join(".mackesd-leader.lock"), "peer:test").unwrap();
+        crate::workers::nebula_supervisor::write_role_marker(&marker, "peer:test").unwrap();
         let mut w = worker(tmp.path(), marker);
         w.tick().await;
         let m = &mirrors::core_pack()[0];
@@ -177,7 +217,7 @@ mod tests {
     #[tokio::test]
     async fn non_leader_tick_self_serves_without_pulling() {
         let tmp = tempfile::tempdir().unwrap();
-        // marker absent → not leader
+        // No lease and no marker → not leader.
         let mut w = worker(tmp.path(), tmp.path().join("role.host"));
         w.tick().await;
         let m = &mirrors::core_pack()[0];
@@ -190,5 +230,15 @@ mod tests {
             .path()
             .join("yum.repos.d/mackes-mirror-magic-mesh.repo")
             .exists());
+    }
+
+    #[tokio::test]
+    async fn forged_or_legacy_marker_does_not_pull() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("role.host");
+        std::fs::write(&marker, "role:host\n").unwrap();
+        let mut w = worker(tmp.path(), marker);
+        w.tick().await;
+        assert!(mirrors::core_pack()[0].last_sync_ms(tmp.path()).is_none());
     }
 }

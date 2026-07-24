@@ -113,6 +113,17 @@ fn err(msg: impl std::fmt::Display) -> String {
     json!({ "ok": false, "error": msg.to_string() }).to_string()
 }
 
+/// A nudge is materialized as `<root>/fleet/nudges/<peer>`. Keep the peer a
+/// single, stable filename component even though the surrounding action is
+/// capability-gated: a malformed or over-broad capability target must not
+/// turn the responder's replicated root into an arbitrary path writer.
+fn valid_nudge_peer(peer: &str) -> bool {
+    !peer.is_empty()
+        && peer == peer.trim()
+        && !matches!(peer, "." | "..")
+        && !peer.chars().any(|ch| matches!(ch, '/' | '\\' | '\0'))
+}
+
 /// Action verbs served on `action/fleet/<verb>` (E0.3.3).
 pub const ACTION_VERBS: [&str; 5] = [
     "push-revision",
@@ -231,7 +242,14 @@ pub fn build_reply(svc: &FleetService, verb: &str, body: Option<&str>) -> String
             let Some(peer) = req.get("peer").and_then(|v| v.as_str()) else {
                 return err("nudge: missing `peer`");
             };
-            match magic_fleet::store::write_nudge(&svc.workgroup_root, peer) {
+            if !valid_nudge_peer(peer) {
+                return err("nudge: `peer` must be one path component");
+            }
+            match magic_fleet::store::write_nudge_payload(
+                &svc.workgroup_root,
+                peer,
+                body.unwrap_or("{}"),
+            ) {
                 Ok(_) => json!({ "ok": true, "nudged": peer }).to_string(),
                 Err(e) => err(format!("nudge: {e}")),
             }
@@ -260,10 +278,21 @@ fn build_bus_reply(
                 .as_ref()
                 .and_then(|value| value.get("peer"))
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
+                .map_or_else(
+                    || String::new(),
+                    |peer| {
+                        if valid_nudge_peer(peer) {
+                            peer.to_string()
+                        } else {
+                            String::new()
+                        }
+                    },
+                ),
             _ => unreachable!("closed mutation verb set"),
         };
+        if verb == "nudge" && target.is_empty() {
+            return err("nudge: `peer` must be one path component");
+        }
         let auth_verb = format!("fleet-{verb}");
         let context = MutationContext {
             verb: &auth_verb,
@@ -592,6 +621,23 @@ mod tests {
             serde_json::from_str(&build_reply(&svc, "nudge", Some(r#"{"peer":"oak"}"#))).unwrap();
         assert_eq!(r["ok"], true);
         assert!(magic_fleet::store::take_nudge(tmp.path(), "oak"));
+    }
+
+    #[test]
+    fn nudge_rejects_path_escape_before_any_file_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = svc_in(tmp.path());
+        for peer in ["../escape", "/tmp/escape", "a/b", "..", " oak "] {
+            let reply: serde_json::Value = serde_json::from_str(&build_reply(
+                &svc,
+                "nudge",
+                Some(&json!({ "peer": peer }).to_string()),
+            ))
+            .unwrap();
+            assert_eq!(reply["ok"], false, "unsafe peer {peer:?} was accepted");
+        }
+        assert!(!tmp.path().join("escape").exists());
+        assert!(!tmp.path().join("fleet/outside").exists());
     }
 
     #[test]

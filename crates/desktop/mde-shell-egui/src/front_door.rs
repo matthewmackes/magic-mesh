@@ -8,7 +8,7 @@
 use mde_egui::egui;
 use mde_egui::search_omnibox::{ranked_hits, MatchTier, SearchDomain, SearchHit, SearchItem};
 use mde_egui::style::Elevation;
-use mde_egui::{Motion, MotionPreset, Style};
+use mde_egui::{Motion, MotionPreset, Style, TypographyRole};
 use mde_files_egui::model::FileSearchTarget;
 use mde_theme::brand::icons::IconId;
 
@@ -46,8 +46,6 @@ const RESULT_TEXT_MIN_W: f32 = 72.0;
 const SEARCH_MIN_W: f32 = 72.0;
 const TOOLTIP_W: f32 = 260.0;
 const ACTION_BUTTON_TEXT_MIN_W: f32 = 72.0;
-// PLATFORM-INTERFACES Q15 — the query line rides the TYPE_TITLE3 rung.
-const SEARCH_TEXT_SIZE: f32 = Style::TYPE_TITLE3;
 const SEARCH_HINT: &str = "Search apps, workloads, services, commands, files, mesh, Browser";
 
 /// Unified-search privacy policy (WL-FUNC-005): the omnibox is **ephemeral and
@@ -695,7 +693,9 @@ fn app_search_item(surface: Surface, idx: usize) -> SearchItem<FrontDoorTarget> 
 
 const fn app_surface_keywords(surface: Surface) -> &'static str {
     match surface {
-        Surface::Workbench => "services provisioning fleet mesh control",
+        Surface::FleetMesh | Surface::Workbench | Surface::MeshView | Surface::Explorer => {
+            "fleet mesh workbench map explorer services provisioning control"
+        }
         Surface::InfraCode => "workloads services iaas cloud catalog",
         Surface::Desktop => "workloads sessions vdi virtual machines remote desktop",
         Surface::Communications => {
@@ -1217,7 +1217,7 @@ fn front_door_tooltip(ui: &mut egui::Ui, text: &str) {
             ui.add(
                 egui::Label::new(
                     egui::RichText::new(text)
-                        .size(Style::SMALL)
+                        .font(Style::typography_font(TypographyRole::Caption))
                         .color(Style::TEXT),
                 )
                 .wrap(),
@@ -1351,11 +1351,11 @@ fn front_door_search_field(
                 egui::TextEdit::singleline(query)
                     .id(input_id)
                     .frame(false)
-                    .font(egui::FontId::proportional(SEARCH_TEXT_SIZE))
+                    .font(Style::typography_font(TypographyRole::Title))
                     .text_color(Style::TEXT)
                     .hint_text(
                         egui::RichText::new(SEARCH_HINT)
-                            .size(SEARCH_TEXT_SIZE)
+                            .font(Style::typography_font(TypographyRole::Title))
                             .color(Style::TEXT_DIM),
                     )
                     .desired_width(f32::INFINITY),
@@ -1467,7 +1467,7 @@ fn filter_chip_row(ui: &mut egui::Ui, active: &mut FrontDoorFilter) -> (egui::Re
         }
         let selected = *active == filter;
         // Q15 — chips ride RADIUS_M plates with the shared selection idiom
-        // (selection fill when active, wash on hover) and TYPE_CAPTION labels.
+        // (selection fill when active, wash on hover) and Caption labels.
         let fill = if selected {
             Style::selection_fill()
         } else if response.hovered() {
@@ -1489,7 +1489,7 @@ fn filter_chip_row(ui: &mut egui::Ui, active: &mut FrontDoorFilter) -> (egui::Re
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
                 filter.label(),
-                egui::FontId::proportional(Style::TYPE_CAPTION),
+                Style::typography_font(TypographyRole::Caption),
                 if selected {
                     Style::TEXT_STRONG
                 } else {
@@ -1513,7 +1513,7 @@ fn empty_note(ui: &mut egui::Ui, blank: bool, filter: FrontDoorFilter) {
         rect.center(),
         egui::Align2::CENTER_CENTER,
         text,
-        egui::FontId::proportional(Style::TYPE_BODY),
+        Style::typography_font(TypographyRole::Body),
         Style::TEXT_DIM,
     );
 }
@@ -1607,14 +1607,14 @@ fn source_status_note(ui: &mut egui::Ui, note: FrontDoorSourceNote) {
         egui::pos2(text_rect.left(), text_rect.center().y - 7.0),
         egui::Align2::LEFT_CENTER,
         note.label,
-        egui::FontId::proportional(Style::TYPE_BODY),
+        Style::typography_font(TypographyRole::Body),
         Style::TEXT,
     );
     painter.text(
         egui::pos2(text_rect.left(), text_rect.center().y + 8.0),
         egui::Align2::LEFT_CENTER,
         note.detail,
-        egui::FontId::proportional(Style::TYPE_FOOTNOTE),
+        Style::typography_font(TypographyRole::Caption),
         Style::TEXT_DIM,
     );
 }
@@ -1628,7 +1628,7 @@ fn command_empty_note(ui: &mut egui::Ui) {
         rect.center(),
         egui::Align2::CENTER_CENTER,
         "Type a command after >",
-        egui::FontId::proportional(Style::TYPE_BODY),
+        Style::typography_font(TypographyRole::Body),
         Style::TEXT_DIM,
     );
 }
@@ -1671,7 +1671,7 @@ fn run_command_row(ui: &mut egui::Ui, command: &str) -> egui::Response {
             domain_rect.center(),
             egui::Align2::CENTER_CENTER,
             "Command",
-            egui::FontId::proportional(Style::TYPE_CAPTION),
+            Style::typography_font(TypographyRole::Caption),
             Style::TEXT_DIM,
         );
 
@@ -1686,7 +1686,7 @@ fn run_command_row(ui: &mut egui::Ui, command: &str) -> egui::Response {
             egui::pos2(title_rect.left(), rect.center().y - 8.0),
             egui::Align2::LEFT_CENTER,
             "Run command",
-            egui::FontId::proportional(Style::TYPE_BODY),
+            Style::typography_font(TypographyRole::Body),
             Style::TEXT_STRONG,
         );
         let target_rect = egui::Rect::from_min_max(
@@ -1697,7 +1697,7 @@ fn run_command_row(ui: &mut egui::Ui, command: &str) -> egui::Response {
             egui::pos2(target_rect.left(), rect.center().y + 10.0),
             egui::Align2::LEFT_CENTER,
             command,
-            egui::FontId::proportional(Style::TYPE_FOOTNOTE),
+            Style::typography_font(TypographyRole::Caption),
             Style::TEXT_DIM,
         );
     }
@@ -1758,7 +1758,7 @@ fn option_row(
             domain_rect.center(),
             egui::Align2::CENTER_CENTER,
             result_domain_label(hit),
-            egui::FontId::proportional(Style::TYPE_CAPTION),
+            Style::typography_font(TypographyRole::Caption),
             Style::TEXT_DIM,
         );
 
@@ -1769,12 +1769,12 @@ fn option_row(
             egui::pos2(text_left, rect.top()),
             egui::pos2(text_right, rect.center().y),
         );
-        // Q15 — primary text on TYPE_BODY, secondary on TYPE_FOOTNOTE.
+        // Q15 — primary text uses Body, secondary uses Caption.
         painter.with_clip_rect(title_rect).text(
             egui::pos2(title_rect.left(), rect.center().y - 8.0),
             egui::Align2::LEFT_CENTER,
             &hit.item.title,
-            egui::FontId::proportional(Style::TYPE_BODY),
+            Style::typography_font(TypographyRole::Body),
             if selected {
                 Style::TEXT_STRONG
             } else {
@@ -1789,7 +1789,7 @@ fn option_row(
             egui::pos2(target_rect.left(), rect.center().y + 10.0),
             egui::Align2::LEFT_CENTER,
             &hit.item.target,
-            egui::FontId::proportional(Style::TYPE_FOOTNOTE),
+            Style::typography_font(TypographyRole::Caption),
             Style::TEXT_DIM,
         );
     }
@@ -2364,7 +2364,7 @@ fn action_button(
                 text_rect.center(),
                 egui::Align2::CENTER_CENTER,
                 label,
-                egui::FontId::proportional(12.0),
+                Style::typography_font(TypographyRole::Label),
                 Style::TEXT,
             );
         response
@@ -2580,7 +2580,7 @@ fn result_action_panel(
             egui::pos2(text_rect.left(), text_rect.center().y),
             egui::Align2::LEFT_CENTER,
             text,
-            egui::FontId::proportional(12.0),
+            Style::typography_font(TypographyRole::Caption),
             color,
         );
     }
@@ -2642,7 +2642,7 @@ fn context_menu_row(ui: &mut egui::Ui, id: egui::Id, label: &str) -> bool {
         egui::pos2(rect.left() + Style::SP_S, rect.center().y),
         egui::Align2::LEFT_CENTER,
         label,
-        egui::FontId::proportional(Style::SMALL),
+        Style::typography_font(TypographyRole::Label),
         Style::TEXT,
     );
     mde_egui::focus::paint_focus_ring(ui.painter(), rect, response.has_focus());
@@ -2830,7 +2830,7 @@ fn run_command_action_panel(ui: &mut egui::Ui, command: &str) -> egui::Response 
             button_rect.center(),
             egui::Align2::CENTER_CENTER,
             "Run",
-            egui::FontId::proportional(12.0),
+            Style::typography_font(TypographyRole::Label),
             Style::TEXT,
         );
 
@@ -2845,7 +2845,7 @@ fn run_command_action_panel(ui: &mut egui::Ui, command: &str) -> egui::Response 
             egui::pos2(text_rect.left(), text_rect.center().y),
             egui::Align2::LEFT_CENTER,
             command,
-            egui::FontId::proportional(12.0),
+            Style::typography_font(TypographyRole::Caption),
             Style::TEXT_DIM,
         );
     }
@@ -3672,8 +3672,8 @@ mod tests {
             .map(FrontDoorTarget::App)
             .collect::<Vec<_>>();
         assert_eq!(actual, expected);
-        assert_eq!(actual[0], FrontDoorTarget::App(Surface::Workbench));
-        assert_eq!(actual[1], FrontDoorTarget::App(Surface::MeshView));
+        assert_eq!(actual[0], FrontDoorTarget::App(Surface::FleetMesh));
+        assert_eq!(actual[1], FrontDoorTarget::App(Surface::InfraCode));
     }
 
     #[test]
@@ -3719,15 +3719,15 @@ mod tests {
         assert_eq!(hits.len(), MAX_HITS);
         assert_eq!(
             hits[0].item.payload,
-            FrontDoorTarget::App(Surface::Workbench)
+            FrontDoorTarget::App(Surface::FleetMesh)
         );
         assert_eq!(
             hits[0].item.target,
-            launcher_group_label(Surface::Workbench)
+            launcher_group_label(Surface::FleetMesh)
         );
         assert_eq!(
             hits[1].item.payload,
-            FrontDoorTarget::App(Surface::MeshView)
+            FrontDoorTarget::App(Surface::InfraCode)
         );
         assert_eq!(hits[1].item.target, "Mesh Control");
     }
@@ -5033,7 +5033,7 @@ mod tests {
             .expect("blank Front Door search results status");
         let value = results.value().expect("blank Front Door status value");
         assert!(
-            value.contains("local shortcut") && value.contains("Workbench highlighted"),
+            value.contains("local shortcut") && value.contains("Fleet & Mesh highlighted"),
             "blank Front Door should announce available shortcuts: {value}"
         );
     }

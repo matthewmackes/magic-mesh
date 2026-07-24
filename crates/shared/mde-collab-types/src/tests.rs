@@ -168,6 +168,11 @@ fn every_event_kind() -> Vec<CollabEventKind> {
             actor: ActorId::new("fra1"),
             state: CallParticipantState::Connected,
         },
+        CollabEventKind::CallParticipantMuted {
+            call: CallId::new(),
+            actor: ActorId::new("fra1"),
+            muted: true,
+        },
         CollabEventKind::CallEnded {
             call: CallId::new(),
             reason: Some("hung_up".into()),
@@ -399,7 +404,7 @@ fn every_event_kind_round_trips_and_has_a_unique_tag() {
         );
     }
     // Guards against a variant being added without an accompanying sample here.
-    assert_eq!(tags.len(), 34, "sample set must cover every event kind");
+    assert_eq!(tags.len(), 35, "sample set must cover every event kind");
 }
 
 #[test]
@@ -443,7 +448,12 @@ fn ledger_coverage_every_replaced_subsystem_has_covering_event_kinds() {
         ),
         (
             "Voice / Calls / SIP",
-            &["call_started", "call_participant_changed", "call_ended"],
+            &[
+                "call_started",
+                "call_participant_changed",
+                "call_participant_muted",
+                "call_ended",
+            ],
         ),
         (
             "Editor",

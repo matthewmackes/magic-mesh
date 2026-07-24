@@ -33,12 +33,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
+use mackes_mesh_types::cloud::CloudArmSigner;
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::ipc::action_auth::{production_action_signer, ActionAuthorizer, MutationContext};
 use crate::workers::mesh_dns::MESH_SUFFIX;
 use crate::workers::mesh_mount::{
-    KeyProvider, MountScope, SecretStoreKeyProvider, DEFAULT_MESH_USER,
+    scope_auth_payload, KeyProvider, MountScope, SecretStoreKeyProvider, DEFAULT_MESH_USER,
 };
 
 /// Action-topic prefix for the direct-transfer surface (`action/mesh-transfer/<verb>`).
@@ -431,16 +433,25 @@ pub struct MeshTransfer {
     backend: Arc<dyn TransferBackend>,
     keys: Arc<dyn KeyProvider>,
     mesh_user: String,
+    node: String,
+    authorizer: Arc<ActionAuthorizer>,
     /// Bus data dir for reading `state/mesh-mount/<host>` scope. `None` (or an
     /// unreadable/absent record) → home scope, the least-privilege default.
     bus_dir: Option<PathBuf>,
+    /// Root-only verifier for the mutable mount-scope projection.
+    scope_verifier: Option<CloudArmSigner>,
 }
 
 impl MeshTransfer {
     /// Construct with production seams: the shared-key provider materializes the
     /// FILEMGR-6 sealed key at the same path FILEMGR-5's mount worker uses.
     #[must_use]
-    pub fn new(runtime_base: PathBuf, repo_dir: PathBuf, workgroup_root: PathBuf) -> Self {
+    pub fn new(
+        runtime_base: PathBuf,
+        repo_dir: PathBuf,
+        workgroup_root: PathBuf,
+        node: impl Into<String>,
+    ) -> Self {
         let key_path = runtime_base.join("mde-mesh").join(".mesh-ssh-key");
         let keys = Arc::new(SecretStoreKeyProvider::new(
             key_path,
@@ -451,7 +462,10 @@ impl MeshTransfer {
             backend: Arc::new(RsyncSshBackend::new()),
             keys,
             mesh_user: DEFAULT_MESH_USER.to_string(),
+            node: node.into(),
+            authorizer: Arc::new(ActionAuthorizer::production()),
             bus_dir: None,
+            scope_verifier: production_action_signer().ok(),
         }
     }
 
@@ -483,6 +497,14 @@ impl MeshTransfer {
         self
     }
 
+    /// Inject an isolated verifier for hostile responder tests.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
+        self.authorizer = authorizer;
+        self
+    }
+
     /// `action/mesh-transfer/<verb>` reply builder (the [`crate::ipc::files::Surface`]
     /// `reply` closure calls this).
     #[must_use]
@@ -500,10 +522,38 @@ impl MeshTransfer {
     /// key, plan, run the backend, and format the typed JSON reply. A
     /// [`TransferError::Gated`] carries `"gated": true` so the surface relays.
     fn direct_reply(&self, body: Option<&str>) -> String {
-        let req = match parse_request(body) {
+        let Some(raw_body) = body else {
+            return error_reply(&TransferError::Rejected(
+                "missing body (need {src_host,src_rel,dst_host,dst_rel})".into(),
+            ));
+        };
+        if !crate::ipc::body_within_cap(Some(raw_body)) {
+            return error_reply(&TransferError::Rejected(
+                "request body exceeds the 64 KiB cap".into(),
+            ));
+        }
+        let req = match parse_request(Some(raw_body)) {
             Ok(r) => r,
             Err(e) => return error_reply(&e),
         };
+        let target = format!("{}->{}", req.src_host, req.dst_host);
+        if let Err(error) = self.authorizer.authorize(
+            raw_body,
+            MutationContext {
+                verb: "mesh-transfer-direct",
+                node: &self.node,
+                target: &target,
+            },
+        ) {
+            tracing::warn!(
+                target: "mackesd::action_auth",
+                %error,
+                "refused unauthorized direct mesh transfer"
+            );
+            return error_reply(&TransferError::Rejected(format!(
+                "direct transfer authorization refused: {error}"
+            )));
+        }
         let key = match self.keys.identity_key() {
             Ok(k) => k,
             // The mount worker's KeyProvider returns MountError; surface its
@@ -547,7 +597,7 @@ impl MeshTransfer {
         let Some(dir) = self.bus_dir.as_ref() else {
             return MountScope::Home;
         };
-        read_mount_scope(dir, host).unwrap_or(MountScope::Home)
+        read_mount_scope(dir, host, self.scope_verifier.as_ref()).unwrap_or(MountScope::Home)
     }
 }
 
@@ -580,15 +630,32 @@ fn parse_request(body: Option<&str>) -> Result<DirectXferRequest, TransferError>
 
 /// Read the scope tag from the latest `state/mesh-mount/<host>` record. `None`
 /// on any miss (no Bus, no record, unparseable, no scope field).
-fn read_mount_scope(bus_dir: &Path, host: &str) -> Option<MountScope> {
+fn read_mount_scope(
+    bus_dir: &Path,
+    host: &str,
+    verifier: Option<&CloudArmSigner>,
+) -> Option<MountScope> {
     let persist = mde_bus::persist::Persist::open(bus_dir.to_path_buf()).ok()?;
     let topic = format!("{}{host}", crate::workers::mesh_mount::STATE_PREFIX);
     let latest = persist.list_since(&topic, None).ok()?.pop()?;
     let body = latest.body?;
     let v: serde_json::Value = serde_json::from_str(&body).ok()?;
-    match v.get("scope").and_then(serde_json::Value::as_str)? {
-        "full" => Some(MountScope::Full),
-        _ => Some(MountScope::Home),
+    if v.get("state").and_then(serde_json::Value::as_str) != Some("mounted") {
+        return Some(MountScope::Home);
+    }
+    let scope = v.get("scope").and_then(serde_json::Value::as_str)?;
+    if scope == "full" {
+        let signature = v
+            .get("scope_signature")
+            .and_then(serde_json::Value::as_str)?;
+        let since_ms = v.get("since_ms").and_then(serde_json::Value::as_u64)?;
+        let payload = scope_auth_payload(host, "mounted", scope, since_ms);
+        if !verifier.is_some_and(|signer| signer.verify_payload(&payload, signature)) {
+            return None;
+        }
+        Some(MountScope::Full)
+    } else {
+        Some(MountScope::Home)
     }
 }
 
@@ -779,18 +846,36 @@ Total transferred file size: 4,096 bytes
         }
     }
 
+    fn auth_root() -> PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "mde-mesh-transfer-auth-tests-{}-{stamp}",
+            std::process::id()
+        ))
+    }
+
     fn responder(backend: Arc<dyn TransferBackend>) -> MeshTransfer {
         MeshTransfer::new(
             PathBuf::from("/run/user/1000"),
             PathBuf::from("/nonexistent-repo"),
             PathBuf::from("/nonexistent-wg"),
+            "test-node",
         )
         .with_backend(backend)
         .with_key_provider(Arc::new(FakeKeys))
+        .with_authorizer(Arc::new(ActionAuthorizer::for_test(
+            b"mesh-transfer-test-key",
+            auth_root(),
+            1_700_000_000_000,
+        )))
     }
 
     fn req_json() -> String {
         json!({
+            "schema_version": 1,
             "op_id": 9,
             "src_host": "oak",
             "src_rel": "docs/a.txt",
@@ -801,6 +886,65 @@ Total transferred file size: 4,096 bytes
         .to_string()
     }
 
+    fn authorized(raw: &str, nonce: &str, target: &str) -> String {
+        crate::ipc::action_auth::authorize_test_body(
+            b"mesh-transfer-test-key",
+            raw,
+            MutationContext {
+                verb: "mesh-transfer-direct",
+                node: "test-node",
+                target,
+            },
+            nonce,
+            1_700_000_030_000,
+        )
+    }
+
+    #[test]
+    fn forged_full_scope_projection_falls_back_to_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let persist = mde_bus::persist::Persist::open(tmp.path().to_path_buf()).unwrap();
+        let signer = CloudArmSigner::new(b"mesh-scope-test-key".to_vec()).unwrap();
+        let signature = signer.sign_payload(&scope_auth_payload("oak", "mounted", "full", 42));
+        let valid = json!({
+            "host": "oak",
+            "state": "mounted",
+            "scope": "full",
+            "scope_signature": signature,
+            "since_ms": 42,
+        })
+        .to_string();
+        persist
+            .write(
+                "state/mesh-mount/oak",
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&valid),
+            )
+            .unwrap();
+        assert_eq!(
+            read_mount_scope(tmp.path(), "oak", Some(&signer)),
+            Some(MountScope::Full)
+        );
+
+        // A cross-UID writer can replace the retained body, but cannot mint a
+        // matching scope proof. The direct path therefore narrows to home.
+        let forged = valid.replace(&signature, "00");
+        persist
+            .write(
+                "state/mesh-mount/oak",
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&forged),
+            )
+            .unwrap();
+        assert_eq!(
+            read_mount_scope(tmp.path(), "oak", Some(&signer)),
+            None,
+            "invalid full-scope proof must not widen the transfer"
+        );
+    }
+
     #[test]
     fn direct_reply_ok_reports_files_and_bytes() {
         let backend = FakeBackend::new(Ok(TransferReport {
@@ -808,7 +952,8 @@ Total transferred file size: 4,096 bytes
             bytes: 2048,
         }));
         let r = responder(backend.clone());
-        let reply = r.reply(DIRECT_VERB, Some(&req_json()));
+        let body = authorized(&req_json(), "mesh-ok", "oak->birch");
+        let reply = r.reply(DIRECT_VERB, Some(&body));
         let v: serde_json::Value = serde_json::from_str(&reply).unwrap();
         assert_eq!(v["ok"], true);
         assert_eq!(v["files"], 2);
@@ -823,7 +968,8 @@ Total transferred file size: 4,096 bytes
     #[test]
     fn direct_reply_gated_backend_marks_gated_for_relay() {
         let backend = FakeBackend::new(Err(TransferError::Gated("no ssh".into())));
-        let reply = responder(backend).reply(DIRECT_VERB, Some(&req_json()));
+        let body = authorized(&req_json(), "mesh-gated", "oak->birch");
+        let reply = responder(backend).reply(DIRECT_VERB, Some(&body));
         let v: serde_json::Value = serde_json::from_str(&reply).unwrap();
         assert_eq!(v["ok"], false);
         assert_eq!(v["gated"], true, "the surface relays a gated direct leg");
@@ -832,7 +978,8 @@ Total transferred file size: 4,096 bytes
     #[test]
     fn direct_reply_failed_backend_is_not_gated() {
         let backend = FakeBackend::new(Err(TransferError::Failed("rsync: denied".into())));
-        let reply = responder(backend).reply(DIRECT_VERB, Some(&req_json()));
+        let body = authorized(&req_json(), "mesh-failed", "oak->birch");
+        let reply = responder(backend).reply(DIRECT_VERB, Some(&body));
         let v: serde_json::Value = serde_json::from_str(&reply).unwrap();
         assert_eq!(v["ok"], false);
         assert_eq!(v["gated"], false, "a real rsync error surfaces, not relays");
@@ -841,10 +988,12 @@ Total transferred file size: 4,096 bytes
     #[test]
     fn direct_reply_rejects_same_host() {
         let body = json!({
+            "schema_version": 1,
             "src_host": "oak", "src_rel": "a", "dst_host": "oak", "dst_rel": "b",
         })
         .to_string();
         let backend = FakeBackend::new(Ok(TransferReport::default()));
+        let body = authorized(&body, "mesh-same", "oak->oak");
         let reply = responder(backend.clone()).reply(DIRECT_VERB, Some(&body));
         let v: serde_json::Value = serde_json::from_str(&reply).unwrap();
         assert_eq!(v["ok"], false);
@@ -856,11 +1005,13 @@ Total transferred file size: 4,096 bytes
     #[test]
     fn direct_reply_rejects_path_traversal() {
         let body = json!({
+            "schema_version": 1,
             "src_host": "oak", "src_rel": "../../etc/shadow",
             "dst_host": "birch", "dst_rel": "loot",
         })
         .to_string();
         let backend = FakeBackend::new(Ok(TransferReport::default()));
+        let body = authorized(&body, "mesh-traversal", "oak->birch");
         let reply = responder(backend.clone()).reply(DIRECT_VERB, Some(&body));
         let v: serde_json::Value = serde_json::from_str(&reply).unwrap();
         assert_eq!(v["ok"], false);
@@ -876,5 +1027,31 @@ Total transferred file size: 4,096 bytes
         let reply = responder(backend).reply("bogus", None);
         let v: serde_json::Value = serde_json::from_str(&reply).unwrap();
         assert_eq!(v["ok"], false);
+    }
+
+    #[test]
+    fn direct_reply_refuses_unsigned_and_replayed_requests_before_backend() {
+        let backend = FakeBackend::new(Ok(TransferReport::default()));
+        let r = responder(backend.clone());
+        let unsigned = r.reply(DIRECT_VERB, Some(&req_json()));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&unsigned).unwrap()["ok"],
+            false
+        );
+        assert!(backend.seen.lock().unwrap().is_none());
+
+        let body = authorized(&req_json(), "mesh-replay", "oak->birch");
+        let first = r.reply(DIRECT_VERB, Some(&body));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&first).unwrap()["ok"],
+            true
+        );
+        let second = r.reply(DIRECT_VERB, Some(&body));
+        let v: serde_json::Value = serde_json::from_str(&second).unwrap();
+        assert_eq!(v["ok"], false);
+        assert!(v["error"]
+            .as_str()
+            .unwrap()
+            .contains("authorization refused"));
     }
 }

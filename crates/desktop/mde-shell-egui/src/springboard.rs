@@ -1,41 +1,35 @@
-//! `springboard` — WL-UX-006/U10: the **Construct springboard home** — the
-//! persistent paged icon grid that IS the shell's base layer, mounted from the
-//! U09 scaffold's reserved `mount_springboard_slot` and rendered by the
-//! collapsed central view in place of the retired session EmptyState.
+//! `springboard` — WL-UX-006/U10: the **Construct desktop** — the persistent
+//! all-app icon grid that IS the shell's base layer, mounted from the U09
+//! scaffold's reserved `mount_springboard_slot` and rendered by the collapsed
+//! central view in place of the retired session EmptyState.
 //!
-// PLATFORM-INTERFACES Q5/Q8/Q22 — the locked home: a paged icon grid is the
-// base layer the seat boots to and every app leaves onto, drawn over the
-// existing wallpaper backdrop (Q5); pages ARE the 8 `LAUNCHER_GROUPS` in
-// taxonomy order — auto-grouped only, no free arrangement, no folders, no
-// arrangement state, no dock, no widgets (Q8/Q6/Q7/Q9/Q10); a tile is a
-// rounded-rect plate in the group accent with a white Carbon glyph and a
-// label beneath (Q22). Page dots; swipe / Page keys / click-drag to page.
+// PLATFORM-INTERFACES Q5/Q8/Q22 — the locked home: one all-app icon grid is
+// the base layer the seat boots to and every app leaves onto, drawn over the
+// existing wallpaper backdrop (Q5). The grid keeps the canonical launcher
+// order, uses the taxonomy group's accent as the tile color, and has no
+// desktop heading, folders, arrangement state, dock, widgets, or page dots;
+// a tile is a rounded-rect plate with a white Carbon glyph and a label beneath
+// (Q22).
 //!
-//! ## Pages, honestly
+//! ## One desktop, honestly
 //!
-//! The pages are not springboard state — they are a **pure projection of
-//! [`LAUNCHER_GROUPS`]**: one page per group, tiles in the group's own
-//! (taxonomy-preserving) order. The dock's compile-time "every `Surface::ALL`
-//! entry appears in `LAUNCHER_GROUPS` exactly once" guard is therefore the
-//! page guard too; this module's tests add the runtime twin (page count ==
-//! group count, tile sum == `Surface::ALL` len, every surface exactly once).
+//! The desktop is not springboard state — it is a **pure projection of
+//! [`Surface::ALL`]**. The taxonomy groups remain the source of tile colors and
+//! Spotlight grouping. The shared compile-time guard still guarantees every
+//! launchable surface appears exactly once; this module's tests add the runtime
+//! twin (one desktop, tile sum == `Surface::ALL` len, every surface exactly
+//! once).
 //! No recents, no badges, no live data — pure icons (Q6/Q7/Q9).
 //!
 //! ## Input
 //!
-//! * **Paging**: a horizontal drag pulls the neighbor page in live; release
-//!   lands on [`Motion::page_settle`]'s page (Q24 — fling advances one page,
-//!   a slow release settles nearest) and the shared `DragSettle` spring snaps
-//!   the offset there (reduced motion: endpoint-only). `PageUp`/`PageDown`
-//!   page directly.
-//! * **Selection**: `Tab`/`Shift+Tab` and `ArrowLeft`/`ArrowRight` walk the
-//!   tiles in **lock-step with this module's own selection model** — keys are
+//! * **Selection**: `Tab`/`Shift+Tab` and arrow keys walk the complete icon
+//!   list in **lock-step with this module's own selection model** — keys are
 //!   consumed up front and there is deliberately NO `request_focus` (driving
 //!   egui's focus a second time is the double-step desync
-//!   `mde_egui::nav_chrome` documents); stepping past a page's edge tile IS
-//!   the arrow-paging affordance (the §2.2 "Page keys" row resolved: arrows
-//!   page exactly when the walk crosses a page boundary). `ArrowUp`/`Down`
-//!   move by grid row within the page. `Enter`/click opens the surface.
+//!   `mde_egui::nav_chrome` documents). `ArrowUp`/`Down` move by grid row.
+//!   `PageUp`/`PageDown` are harmless no-ops on the single desktop.
+//!   `Enter`/click opens the surface.
 //! * **Pull-down → Spotlight** (Q11 "pull-down on home grid"): a downward
 //!   drag beginning in the grid's upper region past a threshold queues the
 //!   distinct [`SpringboardAction::Spotlight`]; the slot body lands it on the
@@ -55,11 +49,10 @@
 //! for the slot body to apply. State rides egui memory (the switcher/backdrop
 //! pattern), so `main.rs` grows no new fields.
 
-use mde_egui::motion::Spring;
-use mde_egui::{egui, Motion, MotionPreset, Style};
+use mde_egui::{Motion, MotionPreset, Style, TypographyRole, egui};
 
 use crate::construct::{ChromeIntent, ConstructChrome};
-use crate::surfaces::{icon_texture, Surface, LAUNCHER_GROUPS};
+use crate::surfaces::{LAUNCHER_GROUPS, Surface, icon_texture};
 
 /// Stable egui-memory key the per-frame [`SpringboardState`] persists under.
 const STATE_KEY: &str = "construct-springboard-state";
@@ -79,20 +72,14 @@ const CELL_W: f32 = PLATE_EDGE + Style::SP_M * 2.0;
 const CELL_H: f32 = PLATE_EDGE + LABEL_BAND;
 /// Gap between grid cells.
 const GRID_GAP: f32 = Style::SP_M;
-/// Outer margin the grid keeps from the page edges.
+/// Outer margin the grid keeps from the desktop edges.
 const GRID_MARGIN: f32 = Style::SP_XL;
-/// Height of the page-indicator band reserved at the springboard's bottom.
-const DOTS_BAND_H: f32 = Style::SP_XL;
-/// Radius of the active page dot (inactive dots draw slightly smaller).
-const DOT_R: f32 = 3.5;
-/// Gap between page dots.
-const DOT_GAP: f32 = Style::SP_M;
 /// Pointer travel (either axis) past which an undecided drag classifies as
-/// paging (dominant-horizontal) or the Spotlight pull (dominant-vertical).
+/// a gesture (dominant-horizontal) or the Spotlight pull (dominant-vertical).
 const DRAG_SLOP: f32 = 8.0;
 /// The upper fraction of the grid a Spotlight pull must begin in (Q11's
 /// "pull-down on home" — a downward drag from the top region, never a stray
-/// scroll near the dots).
+/// scroll near the desktop edge).
 const PULL_REGION: f32 = 0.4;
 /// Downward travel past which an armed pull fires Spotlight, once.
 const PULL_FIRE: f32 = 56.0;
@@ -112,20 +99,10 @@ pub(crate) enum SpringboardAction {
     Spotlight,
 }
 
-/// The number of home pages — pages ARE the launcher groups (Q8), so this is
-/// definitionally `LAUNCHER_GROUPS.len()`; the tests assert the runtime twin.
+/// The tiles of the single desktop in canonical surface order.
 #[must_use]
-const fn page_count() -> usize {
-    LAUNCHER_GROUPS.len()
-}
-
-/// The tiles of one page: the group's surfaces in taxonomy order (Q8). Total
-/// for out-of-range pages (empty), so every caller stays panic-free.
-#[must_use]
-fn page_tiles(page: usize) -> &'static [Surface] {
-    LAUNCHER_GROUPS
-        .get(page)
-        .map_or(&[], |group| group.surfaces)
+const fn desktop_tiles() -> &'static [Surface] {
+    &Surface::ALL
 }
 
 /// The launcher-group accent for `surface` off the ONE shared taxonomy table
@@ -151,13 +128,8 @@ enum Gesture {
         /// Accumulated vertical travel in points.
         dy: f32,
     },
-    /// A horizontal page swipe: the offset follows the finger live.
-    Page {
-        /// The page (as an offset) the drag began from.
-        from: f32,
-        /// Accumulated horizontal travel in points.
-        dx: f32,
-    },
+    /// A horizontal drag is intentionally inert: the desktop has no pages.
+    Ignored,
     /// A vertical pull — fires Spotlight once when armed (upper-region origin)
     /// and past [`PULL_FIRE`]; an unarmed/upward pull is inert, honestly.
     Pull {
@@ -179,7 +151,7 @@ fn plate_rect(cell: egui::Rect) -> egui::Rect {
     )
 }
 
-/// The centered cell grid for `n` tiles on `page`: the column count and one
+/// The centered cell grid for `n` tiles on `desktop`: the column count and one
 /// cell rect per tile, row-major. Columns are whatever the width fits (a real
 /// group is small, so this is one row on any sane screen — the tests derive
 /// the ≤2-row bound from the real group sizes, never a hardcoded count).
@@ -189,18 +161,18 @@ fn plate_rect(cell: egui::Rect) -> egui::Rect {
     clippy::cast_sign_loss         // both casts are of small non-negative values
 )]
 #[must_use]
-fn grid_layout(page: egui::Rect, n: usize) -> (usize, Vec<egui::Rect>) {
+fn grid_layout(desktop: egui::Rect, n: usize) -> (usize, Vec<egui::Rect>) {
     if n == 0 {
         return (1, Vec::new());
     }
-    let usable_w = (page.width() - 2.0 * GRID_MARGIN).max(CELL_W);
+    let usable_w = (desktop.width() - 2.0 * GRID_MARGIN).max(CELL_W);
     let fit = (((usable_w + GRID_GAP) / (CELL_W + GRID_GAP)).floor() as usize).max(1);
     let cols = fit.min(n);
     let rows = n.div_ceil(cols);
     let grid_w = (cols as f32).mul_add(CELL_W, (cols - 1) as f32 * GRID_GAP);
     let grid_h = (rows as f32).mul_add(CELL_H, (rows - 1) as f32 * GRID_GAP);
-    let origin_x = page.center().x - grid_w / 2.0;
-    let origin_y = (page.center().y - grid_h / 2.0).max(page.top() + GRID_MARGIN);
+    let origin_x = desktop.center().x - grid_w / 2.0;
+    let origin_y = (desktop.center().y - grid_h / 2.0).max(desktop.top() + GRID_MARGIN);
     let rects = (0..n)
         .map(|i| {
             let (row, col) = (i / cols, i % cols);
@@ -227,21 +199,14 @@ struct ZoomGhost {
     t: f32,
 }
 
-/// The springboard's whole model: the settled page, the live swipe offset (in
-/// page units) with its snap-spring velocity, the keyboard tile selection, the
-/// one in-flight gesture, the open-presence ghost, and the action queue the
-/// mount slot drains. Pure — every mutation is a plain method, so paging /
-/// pull / selection semantics unit-test without a frame loop. Persisted across
+/// The springboard's whole model: the keyboard tile selection, the one in-flight
+/// gesture, the open-presence ghost, and the action queue the mount slot drains.
+/// Pure — every mutation is a plain method, so pull / selection semantics
+/// unit-test without a frame loop. Persisted across
 /// frames in egui memory (see [`STATE_KEY`]).
 #[derive(Debug, Clone)]
 pub(crate) struct SpringboardState {
-    /// The settled/target page index (`0..page_count()`).
-    page: usize,
-    /// The live visual offset in page units (`page as f32` at rest).
-    offset: f32,
-    /// The snap spring's velocity in page units per second.
-    vel: f32,
-    /// The keyboard-selected tile index within the current page.
+    /// The keyboard-selected tile index within the single desktop.
     selected: usize,
     /// The pointer gesture in flight, if any.
     gesture: Option<Gesture>,
@@ -255,9 +220,6 @@ pub(crate) struct SpringboardState {
 impl Default for SpringboardState {
     fn default() -> Self {
         Self {
-            page: 0,
-            offset: 0.0,
-            vel: 0.0,
             selected: 0,
             gesture: None,
             zoom: None,
@@ -267,51 +229,24 @@ impl Default for SpringboardState {
 }
 
 impl SpringboardState {
-    /// Keep the selection on a real tile of the current page.
+    /// Keep the selection on a real tile of the single desktop.
     fn clamp_selected(&mut self) {
-        self.selected = self
-            .selected
-            .min(page_tiles(self.page).len().saturating_sub(1));
+        self.selected = self.selected.min(desktop_tiles().len().saturating_sub(1));
     }
 
-    /// Jump the target page (clamped); the offset snaps there via the spring.
-    fn set_page(&mut self, page: usize) {
-        self.page = page.min(page_count().saturating_sub(1));
-        self.clamp_selected();
-    }
-
-    /// Page by `delta` pages (PageUp/PageDown), clamped to real pages.
-    fn page_by(&mut self, delta: isize) {
-        let last = isize::try_from(page_count().saturating_sub(1)).unwrap_or(0);
-        let next = isize::try_from(self.page).unwrap_or(0) + delta;
-        self.set_page(usize::try_from(next.clamp(0, last)).unwrap_or(0));
-    }
-
-    /// Walk the tile selection by `delta` (Tab / ArrowLeft/Right): stepping
-    /// past the page's edge tile pages to the neighbor (arrow paging, module
-    /// doc), landing on its nearest tile; the extremes clamp.
+    /// Walk the tile selection by `delta` (Tab / ArrowLeft/Right), clamping at
+    /// the edges of the single desktop.
     fn select_step(&mut self, delta: isize) {
-        let n = isize::try_from(page_tiles(self.page).len()).unwrap_or(0);
+        let n = isize::try_from(desktop_tiles().len()).unwrap_or(0);
         let next = isize::try_from(self.selected).unwrap_or(0) + delta;
-        if next < 0 {
-            if self.page > 0 {
-                self.page -= 1;
-                self.selected = page_tiles(self.page).len().saturating_sub(1);
-            }
-        } else if next >= n {
-            if self.page + 1 < page_count() {
-                self.page += 1;
-                self.selected = 0;
-            }
-        } else {
+        if (0..n).contains(&next) {
             self.selected = usize::try_from(next).unwrap_or(0);
         }
     }
 
-    /// Move the selection by `delta` grid rows within the page (ArrowUp/Down
-    /// never page — vertical means the pull, not navigation).
+    /// Move the selection by `delta` grid rows within the desktop.
     fn select_row(&mut self, delta: isize, cols: usize) {
-        let n = isize::try_from(page_tiles(self.page).len()).unwrap_or(0);
+        let n = isize::try_from(desktop_tiles().len()).unwrap_or(0);
         let step = delta * isize::try_from(cols.max(1)).unwrap_or(1);
         let next = isize::try_from(self.selected).unwrap_or(0) + step;
         if (0..n).contains(&next) {
@@ -326,15 +261,12 @@ impl SpringboardState {
             dx: 0.0,
             dy: 0.0,
         });
-        self.vel = 0.0;
     }
 
     /// Accumulate one frame's pointer travel: classify on clearing the slop,
-    /// then either follow the finger with the page offset (rubber-banded past
-    /// the first/last page) or arm/fire the Spotlight pull.
-    #[allow(clippy::cast_precision_loss)] // page counts are tiny
-    fn drag_by(&mut self, delta_x: f32, delta_y: f32, page_w: f32) {
-        let page_w = page_w.max(1.0);
+    /// then either ignore a horizontal drag (there are no pages) or arm/fire
+    /// the Spotlight pull.
+    fn drag_by(&mut self, delta_x: f32, delta_y: f32) {
         let Some(gesture) = self.gesture else {
             return;
         };
@@ -352,10 +284,7 @@ impl SpringboardState {
                         dy,
                     }
                 } else if dx.abs() >= dy.abs() {
-                    Gesture::Page {
-                        from: self.page as f32,
-                        dx,
-                    }
+                    Gesture::Ignored
                 } else {
                     Gesture::Pull {
                         origin_frac_y,
@@ -364,10 +293,7 @@ impl SpringboardState {
                     }
                 }
             }
-            Gesture::Page { from, dx } => Gesture::Page {
-                from,
-                dx: dx + delta_x,
-            },
+            Gesture::Ignored => Gesture::Ignored,
             Gesture::Pull {
                 origin_frac_y,
                 dy,
@@ -379,15 +305,7 @@ impl SpringboardState {
             },
         };
         self.gesture = Some(match classified {
-            Gesture::Page { from, dx } => {
-                // Follow the finger in page units, compressed past the ends
-                // (the shared iOS-feel rubber band, in px so the slack is
-                // screen-honest, then back to page units).
-                let hi = (page_count().saturating_sub(1)) as f32 * page_w;
-                let raw = (from - dx / page_w) * page_w;
-                self.offset = Motion::rubber_band(raw, 0.0, hi) / page_w;
-                Gesture::Page { from, dx }
-            }
+            Gesture::Ignored => Gesture::Ignored,
             Gesture::Pull {
                 origin_frac_y,
                 dy,
@@ -409,51 +327,10 @@ impl SpringboardState {
         });
     }
 
-    /// The drag released with `velocity_pages` (pages/second, positive toward
-    /// higher indices). A page swipe lands on [`Motion::page_settle`]'s page
-    /// (Q24: fling advances one, slow release settles nearest) and carries its
-    /// velocity into the snap spring; a pull just ends.
-    fn release_drag(&mut self, velocity_pages: f32) {
-        let Some(gesture) = self.gesture.take() else {
-            return;
-        };
-        if matches!(gesture, Gesture::Page { .. }) {
-            self.set_page(Motion::page_settle(
-                self.offset,
-                velocity_pages,
-                page_count(),
-            ));
-            self.vel = velocity_pages;
-        }
-    }
-
-    /// Advance the snap spring toward the settled page by `dt` seconds.
-    /// Returns whether the offset is still travelling (the caller keeps
-    /// repainting while it is). Under `reduced` the offset lands endpoint-only
-    /// (Q24 reduced-motion). Pure given `dt`, so tests pump it directly.
-    #[allow(clippy::cast_precision_loss)] // page indices are tiny
-    fn step_settle(&mut self, dt: f32, reduced: bool) -> bool {
-        if matches!(self.gesture, Some(Gesture::Page { .. })) {
-            return false; // the finger owns the offset mid-swipe
-        }
-        let target = self.page as f32;
-        if reduced {
-            self.offset = target;
-            self.vel = 0.0;
-            return false;
-        }
-        let spring = Motion::spec(MotionPreset::DragSettle)
-            .spring
-            .unwrap_or(Spring::SNAPPY);
-        if spring.settled(self.offset, self.vel, target) {
-            self.offset = target;
-            self.vel = 0.0;
-            return false;
-        }
-        let (pos, vel) = spring.step(self.offset, self.vel, target, dt);
-        self.offset = pos;
-        self.vel = vel;
-        true
+    /// End the current gesture. Horizontal drags are deliberately inert and a
+    /// Spotlight pull has already queued its action before release.
+    fn release_drag(&mut self) {
+        self.gesture = None;
     }
 
     /// A tile was chosen: queue the open for [`mount`] and arm the Q24
@@ -501,22 +378,14 @@ pub(crate) fn show(ui: &mut egui::Ui, overlay_above: bool) {
     let mut state = ctx
         .data_mut(|d| d.get_temp::<SpringboardState>(state_key))
         .unwrap_or_default();
+    state.clamp_selected();
 
     let rect = ui.max_rect();
-    let page_rect = egui::Rect::from_min_max(
-        rect.min,
-        egui::pos2(rect.right(), (rect.bottom() - DOTS_BAND_H).max(rect.top())),
-    );
-    let page_w = page_rect.width().max(1.0);
-
+    let page_rect = rect;
     handle_keys(&ctx, &mut state, page_rect, overlay_above);
-    handle_drag(ui, &mut state, page_rect, page_w);
-    if state.step_settle(ctx.input(|i| i.stable_dt), Motion::reduce_motion()) {
-        ctx.request_repaint();
-    }
-    paint_pages(ui, &mut state, page_rect, page_w);
+    handle_drag(ui, &mut state, page_rect);
+    paint_desktop(ui, &mut state, page_rect);
     paint_zoom_ghost(ui, &mut state);
-    paint_page_dots(ui, &state, rect);
 
     ctx.data_mut(|d| d.insert_temp(state_key, state));
 }
@@ -534,7 +403,7 @@ fn handle_keys(
     if overlay_above || ctx.memory(|m| m.focused().is_some()) {
         return;
     }
-    let (left, right, up, down, tab, back_tab, page_up, page_down, enter) = ctx.input_mut(|i| {
+    let (left, right, up, down, tab, back_tab, enter, _page_up, _page_down) = ctx.input_mut(|i| {
         (
             i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft),
             i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight),
@@ -542,9 +411,9 @@ fn handle_keys(
             i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
             i.consume_key(egui::Modifiers::NONE, egui::Key::Tab),
             i.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab),
+            i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
             i.consume_key(egui::Modifiers::NONE, egui::Key::PageUp),
             i.consume_key(egui::Modifiers::NONE, egui::Key::PageDown),
-            i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
         )
     });
     if left || back_tab {
@@ -553,22 +422,16 @@ fn handle_keys(
     if right || tab {
         state.select_step(1);
     }
-    let (cols, _) = grid_layout(page_rect, page_tiles(state.page).len());
+    let (cols, _) = grid_layout(page_rect, desktop_tiles().len());
     if up {
         state.select_row(-1, cols);
     }
     if down {
         state.select_row(1, cols);
     }
-    if page_up {
-        state.page_by(-1);
-    }
-    if page_down {
-        state.page_by(1);
-    }
     if enter {
-        if let Some(surface) = page_tiles(state.page).get(state.selected).copied() {
-            let (_, cells) = grid_layout(page_rect, page_tiles(state.page).len());
+        if let Some(surface) = desktop_tiles().get(state.selected).copied() {
+            let (_, cells) = grid_layout(page_rect, desktop_tiles().len());
             let from = cells
                 .get(state.selected)
                 .map_or(page_rect, |cell| plate_rect(*cell));
@@ -579,8 +442,9 @@ fn handle_keys(
 
 /// The whole-grid gesture target: registered BEFORE the tiles so they win the
 /// hit order for clicks while a drag anywhere (tiles included — they sense
-/// only clicks) pages or pulls.
-fn handle_drag(ui: &egui::Ui, state: &mut SpringboardState, page_rect: egui::Rect, page_w: f32) {
+/// only clicks) can pull Spotlight. Horizontal drags are inert because the
+/// desktop has no pages.
+fn handle_drag(ui: &egui::Ui, state: &mut SpringboardState, page_rect: egui::Rect) {
     let bg = ui.interact(
         page_rect,
         egui::Id::new(SPRINGBOARD_BG),
@@ -594,45 +458,26 @@ fn handle_drag(ui: &egui::Ui, state: &mut SpringboardState, page_rect: egui::Rec
     }
     if bg.dragged() {
         let delta = bg.drag_delta();
-        state.drag_by(delta.x, delta.y, page_w);
+        state.drag_by(delta.x, delta.y);
     }
     if bg.drag_stopped() {
-        let velocity = ui.ctx().input(|i| i.pointer.velocity());
-        state.release_drag(-velocity.x / page_w);
+        state.release_drag();
     }
 }
 
-/// Paint every page within a page-width of the live offset (the current page
-/// at rest; it plus the incoming neighbor mid-swipe), each with its group
-/// label atop and its centered tile grid.
-#[allow(clippy::cast_precision_loss)] // page indices are tiny
-fn paint_pages(ui: &egui::Ui, state: &mut SpringboardState, page_rect: egui::Rect, page_w: f32) {
-    let ctx = ui.ctx().clone();
+/// Paint the one desktop's complete tile list. Each tile retains the accent of
+/// its taxonomy group, but no group heading is painted on the desktop.
+fn paint_desktop(ui: &egui::Ui, state: &mut SpringboardState, page_rect: egui::Rect) {
     let painter = ui.painter().clone();
     let reduced = Motion::reduce_motion();
-    for (page_idx, group) in LAUNCHER_GROUPS.iter().enumerate() {
-        let shift = (page_idx as f32 - state.offset) * page_w;
-        if shift.abs() >= page_w {
-            continue; // fully offscreen
-        }
-        let prect = page_rect.translate(egui::vec2(shift, 0.0));
-        // The group label atop the page (§2.2's auto-grouped honesty: the
-        // page IS the group, so it says so).
-        painter.text(
-            egui::pos2(prect.center().x, prect.top() + Style::SP_XL),
-            egui::Align2::CENTER_CENTER,
-            group.label,
-            egui::FontId::proportional(Style::TYPE_TITLE3),
-            Style::resolve_color(&ctx, Style::TEXT_DIM),
-        );
-        let (_, cells) = grid_layout(prect, group.surfaces.len());
-        for (tile_idx, (surface, cell)) in group.surfaces.iter().copied().zip(&cells).enumerate() {
-            let selected = page_idx == state.page && tile_idx == state.selected;
-            if tile(ui, &painter, surface, *cell, group.accent, selected) {
-                state.page = page_idx;
-                state.selected = tile_idx;
-                state.open(surface, plate_rect(*cell), reduced);
-            }
+    let tiles = desktop_tiles();
+    let (_, cells) = grid_layout(page_rect, tiles.len());
+    for (tile_idx, (surface, cell)) in tiles.iter().copied().zip(&cells).enumerate() {
+        let selected = tile_idx == state.selected;
+        let accent = group_accent(surface).unwrap_or(Style::ACCENT);
+        if tile(ui, &painter, surface, *cell, accent, selected) {
+            state.selected = tile_idx;
+            state.open(surface, plate_rect(*cell), reduced);
         }
     }
 }
@@ -682,11 +527,18 @@ fn tile(
             egui::Rect::from_center_size(plate.center(), egui::vec2(GLYPH_EDGE, GLYPH_EDGE));
         painter.image(tex.id(), glyph, uv, egui::Color32::WHITE);
     }
-    painter.text(
-        egui::pos2(cell.center().x, plate.bottom() + LABEL_BAND / 2.0),
-        egui::Align2::CENTER_CENTER,
+    let label = painter.layout_job(Style::typography_job(
         surface.label(),
-        egui::FontId::proportional(Style::TYPE_FOOTNOTE),
+        TypographyRole::Label,
+        Style::resolve_color(&ctx, Style::TEXT),
+        f32::INFINITY,
+    ));
+    painter.galley(
+        egui::pos2(
+            cell.center().x - label.size().x / 2.0,
+            plate.bottom() + (LABEL_BAND - label.size().y) / 2.0,
+        ),
+        label,
         Style::resolve_color(&ctx, Style::TEXT),
     );
 
@@ -738,35 +590,6 @@ fn paint_zoom_ghost(ui: &egui::Ui, state: &mut SpringboardState) {
     }
 }
 
-/// The page-indicator dots, bottom-center: one per page, the (nearest) live
-/// page emphasized.
-#[allow(
-    clippy::cast_precision_loss,   // page counts are tiny
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss         // offset.round() is clamped non-negative
-)]
-fn paint_page_dots(ui: &egui::Ui, state: &SpringboardState, rect: egui::Rect) {
-    let ctx = ui.ctx().clone();
-    let count = page_count();
-    let active = (state.offset.round().max(0.0) as usize).min(count.saturating_sub(1));
-    let total_w = (count as f32).mul_add(DOT_R * 2.0, (count.saturating_sub(1)) as f32 * DOT_GAP);
-    let y = rect.bottom() - DOTS_BAND_H / 2.0;
-    let mut x = rect.center().x - total_w / 2.0 + DOT_R;
-    let painter = ui.painter();
-    for i in 0..count {
-        let (r, color) = if i == active {
-            (DOT_R, Style::resolve_color(&ctx, Style::TEXT))
-        } else {
-            (
-                DOT_R * 0.75,
-                Style::resolve_color(&ctx, Style::TEXT_DIM).gamma_multiply(0.6),
-            )
-        };
-        painter.circle_filled(egui::pos2(x, y), r, color);
-        x += DOT_R.mul_add(2.0, DOT_GAP);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -809,6 +632,24 @@ mod tests {
 
     fn frame(ctx: &egui::Context, events: Vec<egui::Event>) -> (egui::Rect, egui::FullOutput) {
         frame_with(ctx, false, events)
+    }
+
+    /// One production-shaped collapsed-central-view frame. Unlike [`frame`],
+    /// this calls [`show`] exactly once: `central_view` owns one CentralPanel
+    /// pass per egui frame, so pointer regressions must not rely on a doubled
+    /// test mount.
+    fn production_frame(
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+    ) -> (egui::Rect, egui::FullOutput) {
+        let mut inner = egui::Rect::from_min_size(egui::Pos2::ZERO, SCREEN);
+        let out = ctx.run(raw(events), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                inner = ui.max_rect();
+                show(ui, false);
+            });
+        });
+        (inner, out)
     }
 
     fn state_of(ctx: &egui::Context) -> SpringboardState {
@@ -870,160 +711,77 @@ mod tests {
         }
     }
 
-    // --- the Q8 page projection: the runtime twin of the compile-time guard -------
+    // --- the single-desktop projection: the runtime twin of the compile-time guard
 
     #[test]
-    fn pages_are_the_eight_launcher_groups_with_every_surface_exactly_once() {
-        // Q8: pages ARE the groups — the runtime twin of dock's compile-time
-        // "every Surface::ALL entry appears exactly once" guard.
-        assert_eq!(page_count(), LAUNCHER_GROUPS.len());
-        let total: usize = (0..page_count()).map(|p| page_tiles(p).len()).sum();
+    fn desktop_lists_every_surface_exactly_once() {
+        let all_tiles = desktop_tiles();
+        let total = all_tiles.len();
         assert_eq!(
             total,
             Surface::ALL.len(),
-            "the tile sum must be exactly the launchable platform"
+            "the desktop tile list must be exactly the launchable platform"
         );
-        let all_tiles: Vec<Surface> = (0..page_count())
-            .flat_map(|p| page_tiles(p).iter().copied())
-            .collect();
         for surface in Surface::ALL {
-            assert_eq!(
-                all_tiles.iter().filter(|s| **s == surface).count(),
-                1,
-                "{surface:?} must appear on exactly one page"
-            );
+            assert_eq!(all_tiles.iter().filter(|s| **s == surface).count(), 1);
         }
-        // Taxonomy order: page i is literally group i.
-        for (i, group) in LAUNCHER_GROUPS.iter().enumerate() {
-            assert_eq!(page_tiles(i), group.surfaces);
-        }
-        assert!(page_tiles(page_count()).is_empty(), "out of range is empty");
+        assert_eq!(all_tiles, &Surface::ALL);
     }
 
     // --- grid math (pure) ---------------------------------------------------------
 
     #[test]
-    fn grid_layout_is_centered_bounded_and_at_most_two_rows_for_real_groups() {
+    fn grid_layout_is_centered_bounded_for_the_single_desktop() {
         let page = egui::Rect::from_min_size(egui::Pos2::ZERO, SCREEN);
-        for group in &LAUNCHER_GROUPS {
-            let n = group.surfaces.len();
-            let (cols, cells) = grid_layout(page, n);
-            assert!(cols >= 1);
-            assert_eq!(cells.len(), n);
-            let rows = n.div_ceil(cols.max(1));
-            assert!(
-                rows <= 2,
-                "{} ({n} tiles) must fold into at most two rows, got {rows}",
-                group.label
-            );
-            for cell in &cells {
-                assert!(cell.left() >= page.left(), "{}: {cell:?}", group.label);
-                assert!(cell.right() <= page.right(), "{}: {cell:?}", group.label);
-                assert!(cell.top() >= page.top(), "{}: {cell:?}", group.label);
-            }
+        let n = desktop_tiles().len();
+        let (cols, cells) = grid_layout(page, n);
+        assert!(cols >= 1);
+        assert_eq!(cells.len(), n);
+        for cell in &cells {
+            assert!(cell.left() >= page.left(), "{cell:?}");
+            assert!(cell.right() <= page.right(), "{cell:?}");
+            assert!(cell.top() >= page.top(), "{cell:?}");
         }
         // One tile sits dead-centre horizontally.
         let (_, cells) = grid_layout(page, 1);
         assert!((cells[0].center().x - page.center().x).abs() < 0.5);
     }
 
-    // --- selection + paging (pure) ------------------------------------------------
+    // --- selection on the single desktop (pure) ----------------------------------
 
     #[test]
-    fn select_step_walks_tiles_and_pages_at_the_edges() {
+    fn select_step_walks_the_complete_desktop_and_clamps_at_the_edges() {
         let mut s = SpringboardState::default();
         s.select_step(-1);
-        assert_eq!((s.page, s.selected), (0, 0), "the very first tile clamps");
-        let n0 = page_tiles(0).len();
-        for _ in 0..n0 {
+        assert_eq!(s.selected, 0, "the very first tile clamps");
+        let last = desktop_tiles().len() - 1;
+        for _ in 0..=last {
             s.select_step(1);
         }
         assert_eq!(
-            (s.page, s.selected),
-            (1, 0),
-            "stepping past the last tile pages forward (arrow paging)"
+            s.selected, last,
+            "stepping past the last tile clamps on the single desktop"
         );
         s.select_step(-1);
         assert_eq!(
-            (s.page, s.selected),
-            (0, n0 - 1),
-            "stepping before the first tile pages back to the neighbor's last"
+            s.selected,
+            last - 1,
+            "stepping back walks to the preceding icon"
         );
-        // The very last tile of the very last page clamps.
-        s.set_page(page_count() - 1);
-        s.selected = page_tiles(s.page).len() - 1;
+        s.selected = last;
         s.select_step(1);
-        assert_eq!(s.page, page_count() - 1);
-        assert_eq!(s.selected, page_tiles(s.page).len() - 1);
+        assert_eq!(s.selected, last);
     }
 
     #[test]
-    fn page_keys_page_and_clamp_and_vertical_moves_stay_within_the_page() {
-        let mut s = SpringboardState::default();
-        s.page_by(-1);
-        assert_eq!(s.page, 0, "PageUp clamps at the first page");
-        s.page_by(1);
-        assert_eq!(s.page, 1, "PageDown pages forward");
-        for _ in 0..page_count() * 2 {
-            s.page_by(1);
-        }
-        assert_eq!(s.page, page_count() - 1, "PageDown clamps at the last page");
-        // Vertical selection never pages (a 3-tile single-row page: no move).
+    fn vertical_moves_stay_within_the_single_desktop() {
         let mut s = SpringboardState::default();
         let (cols, _) = grid_layout(
             egui::Rect::from_min_size(egui::Pos2::ZERO, SCREEN),
-            page_tiles(0).len(),
+            desktop_tiles().len(),
         );
         s.select_row(1, cols);
-        assert_eq!((s.page, s.selected), (0, 0), "ArrowDown off-grid is inert");
-    }
-
-    #[test]
-    fn drag_release_lands_on_the_page_settle_contract_and_the_spring_snaps() {
-        let mut s = SpringboardState::default();
-        let w = 1000.0;
-        s.begin_drag(0.9);
-        s.drag_by(-60.0, 0.0, w); // dominant-horizontal, toward the next page
-        assert!(
-            matches!(s.gesture, Some(Gesture::Page { .. })),
-            "past the slop a horizontal drag classifies as paging"
-        );
-        assert!(s.offset > 0.0, "the offset follows the finger live");
-        // A fast fling commits one page — exactly Motion::page_settle's word.
-        assert_eq!(Motion::page_settle(s.offset, 2.0, page_count()), 1);
-        s.release_drag(2.0);
-        assert_eq!(s.page, 1, "the release lands on page_settle's page");
-        let mut frames = 0;
-        while s.step_settle(1.0 / 60.0, false) {
-            frames += 1;
-            assert!(frames < 600, "the snap spring must settle");
-        }
-        assert!((s.offset - 1.0).abs() < 0.01, "settled on the page exactly");
-        // A slow release near the resting page springs back to it.
-        s.begin_drag(0.9);
-        s.drag_by(80.0, 0.0, w);
-        s.release_drag(0.0);
-        assert_eq!(s.page, 1, "a slow release settles on the nearest page");
-        // Reduced motion: endpoint-only, no travel frames.
-        s.page_by(1);
-        assert!(!s.step_settle(1.0 / 60.0, true));
-        assert!((s.offset - 2.0).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn a_drag_rubber_bands_past_the_first_page_instead_of_escaping() {
-        let mut s = SpringboardState::default();
-        let w = 1000.0;
-        s.begin_drag(0.9);
-        s.drag_by(5000.0, 0.0, w); // a huge pull toward "before page 0"
-        assert!(s.offset <= 0.0, "overscroll compresses past the edge");
-        assert!(
-            s.offset * w >= -Motion::RUBBER_SLACK,
-            "never further than the shared slack: {}",
-            s.offset * w
-        );
-        s.release_drag(0.0);
-        assert_eq!(s.page, 0, "release snaps back to the real first page");
+        assert!(s.selected < desktop_tiles().len());
     }
 
     // --- the Q11 pull-down → Spotlight seam (pure) --------------------------------
@@ -1032,14 +790,13 @@ mod tests {
     fn a_pull_down_from_the_upper_region_fires_spotlight_exactly_once() {
         let mut s = SpringboardState::default();
         s.begin_drag(0.2);
-        s.drag_by(0.0, 30.0, 1000.0);
+        s.drag_by(0.0, 30.0);
         assert!(s.actions.is_empty(), "under the fire threshold: armed only");
-        s.drag_by(0.0, 40.0, 1000.0);
+        s.drag_by(0.0, 40.0);
         assert_eq!(s.actions, vec![SpringboardAction::Spotlight]);
-        s.drag_by(0.0, 40.0, 1000.0);
+        s.drag_by(0.0, 40.0);
         assert_eq!(s.actions.len(), 1, "one fire per gesture");
-        s.release_drag(0.0);
-        assert_eq!(s.page, 0, "a pull never pages");
+        s.release_drag();
     }
 
     #[test]
@@ -1047,14 +804,15 @@ mod tests {
         // Low origin: a long downward drag from the grid's lower region is inert.
         let mut s = SpringboardState::default();
         s.begin_drag(0.8);
-        s.drag_by(0.0, 200.0, 1000.0);
+        s.drag_by(0.0, 200.0);
         assert!(s.actions.is_empty(), "a low-origin pull never fires");
-        s.release_drag(0.0);
-        // Dominant-horizontal: paging, not the pull, even with some dy.
+        s.release_drag();
+        // Dominant-horizontal: inert, not the pull, because there are no pages.
         s.begin_drag(0.2);
-        s.drag_by(-200.0, 40.0, 1000.0);
-        assert!(s.actions.is_empty(), "a page swipe is not the pull");
-        assert!(matches!(s.gesture, Some(Gesture::Page { .. })));
+        s.drag_by(-200.0, 40.0);
+        assert!(s.actions.is_empty(), "a horizontal drag is not the pull");
+        assert!(matches!(s.gesture, Some(Gesture::Ignored)));
+        s.release_drag();
     }
 
     // --- the open presence ghost (Q24, module-scoped) -----------------------------
@@ -1124,33 +882,35 @@ mod tests {
         frame(&ctx, vec![key(egui::Key::Enter)]);
         assert_eq!(
             mount(&ctx, &mut construct),
-            Some(SpringboardAction::Open(page_tiles(0)[0])),
-            "Enter opens the first (selected) tile of the first page"
+            Some(SpringboardAction::Open(desktop_tiles()[0])),
+            "Enter opens the first (selected) tile of the desktop"
         );
         frame(&ctx, vec![key(egui::Key::ArrowRight)]);
         assert_eq!(state_of(&ctx).selected, 1, "ArrowRight walks the tiles");
         frame(&ctx, vec![key(egui::Key::Enter)]);
         assert_eq!(
             mount(&ctx, &mut construct),
-            Some(SpringboardAction::Open(page_tiles(0)[1])),
+            Some(SpringboardAction::Open(desktop_tiles()[1])),
             "Enter routes the arrow-selected neighbor"
         );
     }
 
     #[test]
-    fn page_down_pages_and_the_offset_settles_there() {
+    fn page_keys_are_harmless_on_the_single_desktop() {
         let ctx = ctx();
         frame(&ctx, Vec::new());
         frame(&ctx, vec![key(egui::Key::PageDown)]);
-        assert_eq!(state_of(&ctx).page, 1, "PageDown pages forward");
-        let mut frames = 0;
-        while (state_of(&ctx).offset - 1.0).abs() > 0.01 {
-            frame(&ctx, Vec::new());
-            frames += 1;
-            assert!(frames < 600, "the snap spring must settle in-frame");
-        }
+        assert_eq!(
+            state_of(&ctx).selected,
+            0,
+            "PageDown cannot leave the desktop"
+        );
         frame(&ctx, vec![key(egui::Key::PageUp)]);
-        assert_eq!(state_of(&ctx).page, 0, "PageUp pages back");
+        assert_eq!(
+            state_of(&ctx).selected,
+            0,
+            "PageUp cannot leave the desktop"
+        );
     }
 
     #[test]
@@ -1176,11 +936,8 @@ mod tests {
         let (inner, _) = frame(&ctx, Vec::new());
         let (inner2, _) = frame(&ctx, Vec::new());
         assert_eq!(inner, inner2, "the panel rect is stable across frames");
-        let page_rect = egui::Rect::from_min_max(
-            inner.min,
-            egui::pos2(inner.right(), inner.bottom() - DOTS_BAND_H),
-        );
-        let (_, cells) = grid_layout(page_rect, page_tiles(0).len());
+        let page_rect = inner;
+        let (_, cells) = grid_layout(page_rect, desktop_tiles().len());
         let target = plate_rect(cells[1]).center();
         frame(
             &ctx,
@@ -1205,8 +962,57 @@ mod tests {
         );
         assert_eq!(
             mount(&ctx, &mut construct),
-            Some(SpringboardAction::Open(page_tiles(0)[1])),
+            Some(SpringboardAction::Open(desktop_tiles()[1])),
             "the clicked tile routes its surface"
+        );
+    }
+
+    #[test]
+    fn production_pointer_click_selects_the_canonical_fleet_mesh_tile() {
+        let ctx = ctx();
+        let mut construct = ConstructChrome::default();
+        let (inner, _) = production_frame(&ctx, Vec::new());
+        let (inner2, _) = production_frame(&ctx, Vec::new());
+        assert_eq!(inner, inner2, "the production panel rect is stable");
+
+        let tile_idx = desktop_tiles()
+            .iter()
+            .position(|surface| *surface == Surface::FleetMesh)
+            .expect("Fleet & Mesh must remain a canonical desktop tile");
+        let (_, cells) = grid_layout(inner, desktop_tiles().len());
+        let target = plate_rect(cells[tile_idx]).center();
+
+        production_frame(
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(target),
+                egui::Event::PointerButton {
+                    pos: target,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+        );
+        production_frame(
+            &ctx,
+            vec![egui::Event::PointerButton {
+                pos: target,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+
+        assert_eq!(
+            mount(&ctx, &mut construct),
+            Some(SpringboardAction::Open(Surface::FleetMesh)),
+            "a real once-per-frame tile click must select Fleet & Mesh"
+        );
+        assert_eq!(
+            mount(&ctx, &mut construct),
+            None,
+            "the pointer action must drain exactly once"
         );
     }
 
@@ -1250,7 +1056,7 @@ mod tests {
     // --- the collapsed base layer paints honestly -----------------------------------
 
     #[test]
-    fn the_collapsed_view_paints_plates_labels_and_no_empty_state() {
+    fn the_collapsed_view_paints_all_color_coded_tiles_without_a_desktop_title() {
         let ctx = ctx();
         // Two settle frames (the curtain-test idiom; the live DRM loop
         // repaints continuously so both are long gone before a human looks).
@@ -1265,20 +1071,32 @@ mod tests {
         );
         let texts = painted_texts(&out.shapes);
         assert!(
-            texts.iter().any(|t| t == LAUNCHER_GROUPS[0].label),
-            "the group label heads its page: {texts:?}"
-        );
-        assert!(
-            texts.iter().any(|t| t == page_tiles(0)[0].label()),
+            texts.iter().any(|t| t == desktop_tiles()[0].label()),
             "tile labels paint beneath the plates: {texts:?}"
         );
+        for surface in desktop_tiles() {
+            assert!(
+                texts.iter().any(|text| text == surface.label()),
+                "every desktop icon label must paint: {}",
+                surface.label()
+            );
+        }
+        for title in [
+            "Mesh Control",
+            "Desktop & Session",
+            "Files & Data",
+            "Web",
+            "Developer Tools",
+            "Comms",
+        ] {
+            assert!(
+                !texts.iter().any(|text| text == title),
+                "desktop title leaked: {title}"
+            );
+        }
         assert!(
             !texts.iter().any(|t| t.contains("No active session")),
             "Q5: the session EmptyState is retired from the collapsed view"
-        );
-        assert!(
-            !texts.iter().any(|t| t == LAUNCHER_GROUPS[1].label),
-            "at rest only the current page paints (neighbors are offscreen)"
         );
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
         assert!(

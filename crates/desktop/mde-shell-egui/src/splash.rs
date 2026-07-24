@@ -501,6 +501,9 @@ mod tests {
     /// internal build semver/codename.
     #[test]
     fn the_splash_version_line_is_the_visible_product_release() {
-        assert_eq!(mde_theme::brand::logo::PRODUCT_RELEASE, "Release 1.0 BETA");
+        assert_eq!(
+            mde_theme::brand::logo::PRODUCT_RELEASE,
+            concat!("Release ", env!("CARGO_PKG_VERSION"))
+        );
     }
 }

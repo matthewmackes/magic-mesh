@@ -2,8 +2,10 @@
 //!
 //! A command is an *intent* published on `action/collab/*`; the worker
 //! validates it, mints + signs the resulting [`CollabEventEnvelope`]s, and
-//! projects them into the read models. Commands are never signed themselves
-//! (the worker signs the events they produce); they are plain typed requests.
+//! projects them into the read models. The shell carries a root-only, exact-body
+//! HMAC capability on the Bus envelope; the worker verifies it before applying
+//! the command and signs the resulting events. The typed command remains a
+//! plain request shape.
 
 use serde::{Deserialize, Serialize};
 

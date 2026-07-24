@@ -9,6 +9,7 @@ Printed on every interactive bash shell by /etc/profile.d/zz-mde-welcome.sh.
 """
 import json
 import os
+import subprocess
 import sys
 import time
 
@@ -37,6 +38,45 @@ def load():
         return None
 
 
+def installed_platform_version():
+    """Return the installed RPM's platform version, or an empty string."""
+    try:
+        result = subprocess.run(
+            ["rpm", "-q", "--qf", "%{VERSION}", "magic-mesh"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        version = result.stdout.strip()
+        return version if result.returncode == 0 and version else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def platform_version(snapshot, installed_version=None):
+    """Prefer the installed RPM, with the snapshot as a graceful fallback."""
+    if installed_version:
+        return installed_version
+    if isinstance(snapshot, dict):
+        version = snapshot.get("platform_version")
+        if version:
+            return str(version)
+    return "unknown"
+
+
+def self_test():
+    """Run dependency-free behavior checks for the release identity contract."""
+    assert platform_version({"platform_version": "snapshot-version"}, "rpm-version") == "rpm-version"
+    assert platform_version({"platform_version": "snapshot-version"}, "") == "snapshot-version"
+    assert platform_version({}, "") == "unknown"
+    assert "Platform Release: snapshot-version" in release_header("snapshot-version")
+
+
+def release_header(version):
+    return f"     Platform Release: {version}"
+
+
 SERVICES = [
     ("bus", "Bus"), ("sync", "Sync"), ("nebula", "Neb"), ("dns", "DNS"),
     ("voice", "Voi"), ("music", "Mus"), ("kdc", "KDC"), ("workbench", "WB"),
@@ -46,12 +86,14 @@ DOT = {"online": (GREEN, "●"), "idle": (AMBER, "●"), "offline": (RED, "○")
 
 def main():
     d = load()
+    release = platform_version(d, installed_platform_version())
     # Wordmark header (Carbon blue box).
     line = "─" * 52
     print()
     print(c(f"┌{line}┐", BLUE))
     box_line("  ⬢  C O N S T R U C T", BOLD + BLUE)
     box_line("     Software Studio: MDE", GRAY)
+    box_line(release_header(release), GRAY)
     print(c(f"└{line}┘", BLUE))
 
     if not d:
@@ -172,6 +214,10 @@ def network_overview(d):
 
 if __name__ == "__main__":
     try:
+        if "--self-test" in sys.argv[1:]:
+            self_test()
+            print("mesh-welcome self-test: ok")
+            sys.exit(0)
         main()
     except Exception:
         sys.exit(0)  # never break a shell login

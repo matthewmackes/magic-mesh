@@ -48,6 +48,13 @@ pub fn revoke_peer(
     self_node_id: &str,
     node_id: &str,
 ) -> anyhow::Result<u32> {
+    // Both identities become replicated filenames below: self_node_id selects
+    // the local ban-list directory and node_id selects the data-plane
+    // blocklist record. Validate before touching SQLite so a hostile direct
+    // CLI argument cannot escape the workgroup root or leave a half-applied
+    // revocation behind.
+    validate_revoke_identity(self_node_id, "self node-id")?;
+    validate_revoke_identity(node_id, "target node-id")?;
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -133,10 +140,29 @@ pub fn revoke_peer(
 /// best-effort (the DB mark + ban-list write are the durable parts).
 fn publish_revoke_event(node_id: &str) {
     let topic = format!("ca/revoke/{node_id}");
-    let body = format!(r#"{{"node_id":"{node_id}","ok":true}}"#);
+    let body = serde_json::json!({ "node_id": node_id, "ok": true }).to_string();
     let mut cmd = std::process::Command::new("mde-bus");
     cmd.args(["publish", &topic, "--body-flag", &body]);
     crate::proc_reap::fire_and_reap(cmd, crate::proc_reap::DEFAULT_REAP_TIMEOUT);
+}
+
+/// Node IDs are used as path components and Bus-topic components by the
+/// direct revocation authority. Keep the accepted mesh identifier shape broad
+/// enough for existing `peer:` IDs, while refusing traversal, absolute paths,
+/// separators, controls, and surrounding whitespace.
+fn validate_revoke_identity(value: &str, label: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !value.is_empty()
+            && value.len() <= 255
+            && value.trim() == value
+            && value != "."
+            && value != ".."
+            && !value
+                .chars()
+                .any(|character| character == '/' || character == '\\' || character.is_control()),
+        "invalid {label}: must be one path-safe mesh identity component"
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -219,5 +245,34 @@ mod tests {
         revoke_peer(&conn, tmp.path(), "peer:self", "peer:anvil").expect("first revoke");
         revoke_peer(&conn, tmp.path(), "peer:self", "peer:anvil").expect("second revoke");
         assert!(crate::ca::ban_list::is_banned(tmp.path(), "peer:anvil"));
+    }
+
+    #[test]
+    fn unsafe_identity_is_rejected_before_database_or_filesystem_mutation() {
+        for (self_id, target_id) in [("../escape", "peer:anvil"), ("peer:self", "../escape")] {
+            let conn = setup_db();
+            conn.execute(
+                "INSERT INTO nebula_peer_certs (node_id, epoch, revoked_at) VALUES (?1, 1, NULL)",
+                ["peer:anvil"],
+            )
+            .expect("insert active cert");
+            let tmp = tempfile::tempdir().expect("workgroup root");
+
+            let error = revoke_peer(&conn, tmp.path(), self_id, target_id)
+                .expect_err("path-shaped identity must be refused");
+            assert!(error.to_string().contains("invalid"), "{error:#}");
+            let active: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM nebula_peer_certs WHERE node_id = 'peer:anvil' AND revoked_at IS NULL",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("count active certs");
+            assert_eq!(active, 1, "rejection must precede the DB mutation");
+            assert!(
+                tmp.path().read_dir().unwrap().next().is_none(),
+                "rejection must not create a replicated path"
+            );
+        }
     }
 }

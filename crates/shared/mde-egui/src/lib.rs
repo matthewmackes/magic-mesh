@@ -92,7 +92,7 @@ pub use sheet::{
 };
 pub use style::{
     Density, Elevation, GradeBand, LayoutProfile, ShadowToken, Style, StyleColorScheme,
-    StylePalette, SurfaceLevel,
+    StylePalette, SurfaceLevel, TypographyRole,
 };
 pub use toast::{
     ChyronInteraction, Dwell, OsdKind, OsdLevel, Severity, Tier, Toast, ToastAction, ToastHost,

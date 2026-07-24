@@ -48,17 +48,28 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
+
+use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
 
 use super::{ShutdownToken, Worker};
 
 /// Default poll cadence — control surface (firewalld changes are
 /// not on a human's interactive path).
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(400);
+
+/// Closed capability verb for adding compute firewall forwards.
+pub const COMPUTE_EXPOSE_AUTH_VERB: &str = "compute-expose";
+
+/// Closed capability verb for removing compute firewall forwards.
+pub const COMPUTE_UNEXPOSE_AUTH_VERB: &str = "compute-unexpose";
+
+/// Stable node scope shared by the compute firewall capabilities.
+pub const COMPUTE_EXPOSE_NODE_SCOPE: &str = "compute";
 
 /// Nebula overlay interface name (firewall_monitor + compute_registry
 /// both bind here; matches the v2.5 NF-6.1 enrollment convention).
@@ -286,6 +297,64 @@ pub fn parse_unexpose_request(body: &str) -> Result<UnexposeRequest, String> {
     serde_json::from_str(body).map_err(|e| format!("malformed unexpose request: {e}"))
 }
 
+/// Stable semantic target for a firewall forward. The exact raw body is also
+/// HMAC-bound by [`ActionAuthorizer`], while this target prevents a capability
+/// for one VM endpoint from being used in another semantic context.
+#[must_use]
+fn expose_auth_target(req: &ExposeRequest) -> String {
+    format!(
+        "vm:{}:{}:{}",
+        req.vm_nebula_ip.trim(),
+        req.guest_port,
+        req.proto.trim()
+    )
+}
+
+/// Stable semantic target for removing a firewall forward.
+#[must_use]
+fn unexpose_auth_target(req: &UnexposeRequest) -> String {
+    format!(
+        "vm:{}:{}:{}",
+        req.vm_nebula_ip.trim(),
+        req.host_port,
+        req.proto.trim()
+    )
+}
+
+/// Verify an expose request before any firewalld command is invoked.
+fn authorize_expose_request(
+    authorizer: &ActionAuthorizer,
+    body: &str,
+    req: &ExposeRequest,
+) -> Result<(), String> {
+    let target = expose_auth_target(req);
+    authorizer.authorize(
+        body,
+        MutationContext {
+            verb: COMPUTE_EXPOSE_AUTH_VERB,
+            node: COMPUTE_EXPOSE_NODE_SCOPE,
+            target: &target,
+        },
+    )
+}
+
+/// Verify an unexpose request before any firewalld command is invoked.
+fn authorize_unexpose_request(
+    authorizer: &ActionAuthorizer,
+    body: &str,
+    req: &UnexposeRequest,
+) -> Result<(), String> {
+    let target = unexpose_auth_target(req);
+    authorizer.authorize(
+        body,
+        MutationContext {
+            verb: COMPUTE_UNEXPOSE_AUTH_VERB,
+            node: COMPUTE_EXPOSE_NODE_SCOPE,
+            target: &target,
+        },
+    )
+}
+
 /// Parse the default-gateway device name from a
 /// `nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device` payload. The
 /// returned device is the first non-loopback `connected` ethernet
@@ -456,6 +525,7 @@ pub struct ComputeExposeWorker {
     nebula_addr_hint: String,
     poll_interval: Duration,
     bus_root_override: Option<PathBuf>,
+    authorizer: Arc<ActionAuthorizer>,
     active: Mutex<BTreeSet<ActiveRule>>,
 }
 
@@ -474,6 +544,7 @@ impl ComputeExposeWorker {
             nebula_addr_hint: String::new(),
             poll_interval: DEFAULT_POLL_INTERVAL,
             bus_root_override: None,
+            authorizer: Arc::new(ActionAuthorizer::production()),
             active: Mutex::new(BTreeSet::new()),
         }
     }
@@ -490,6 +561,16 @@ impl ComputeExposeWorker {
     #[must_use]
     pub fn with_bus_root(mut self, p: PathBuf) -> Self {
         self.bus_root_override = Some(p);
+        self
+    }
+
+    /// Inject an isolated verifier and replay ledger for hostile action tests.
+    /// Production always uses the root-only systemd-credential-backed
+    /// authorizer and fails closed when it is unavailable.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
+        self.authorizer = authorizer;
         self
     }
 
@@ -629,6 +710,7 @@ fn poll_once(
     wan_zone: &str,
     expose_cursor: &mut Option<String>,
     unexpose_cursor: &mut Option<String>,
+    authorizer: &ActionAuthorizer,
 ) {
     let expose_topic = format!("compute/expose/{nebula_ip}");
     let unexpose_topic = format!("compute/unexpose/{nebula_ip}");
@@ -641,6 +723,14 @@ fn poll_once(
                 let body = msg.body.as_deref().unwrap_or("");
                 match parse_expose_request(body) {
                     Ok(req) => {
+                        if let Err(error) = authorize_expose_request(authorizer, body, &req) {
+                            tracing::warn!(
+                                ulid = %msg.ulid,
+                                error = %error,
+                                "compute_expose: refused unauthorized expose request"
+                            );
+                            continue;
+                        }
                         apply_expose(worker, nebula_ip, wan_zone, &req);
                         changed = true;
                     }
@@ -662,6 +752,14 @@ fn poll_once(
                 let body = msg.body.as_deref().unwrap_or("");
                 match parse_unexpose_request(body) {
                     Ok(req) => {
+                        if let Err(error) = authorize_unexpose_request(authorizer, body, &req) {
+                            tracing::warn!(
+                                ulid = %msg.ulid,
+                                error = %error,
+                                "compute_expose: refused unauthorized unexpose request"
+                            );
+                            continue;
+                        }
                         apply_unexpose(worker, wan_zone, &req);
                         changed = true;
                     }
@@ -682,7 +780,7 @@ fn poll_once(
 }
 
 fn default_bus_root() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join("mde").join("bus"))
+    mde_bus::default_data_dir()
 }
 
 /// Seed the active-rule shadow set from firewalld's persisted rich rules
@@ -771,6 +869,7 @@ impl Worker for ComputeExposeWorker {
                         &wan_zone,
                         &mut expose_cursor,
                         &mut unexpose_cursor,
+                        self.authorizer.as_ref(),
                     );
                 }
                 _ = shutdown.wait() => break,
@@ -783,6 +882,72 @@ impl Worker for ComputeExposeWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::action_auth::{authorize_test_body, ActionAuthorizer};
+
+    const AUTH_KEY: &[u8] = b"compute-expose-action-auth-key";
+    const AUTH_NOW: i64 = 1_700_000_000_000;
+
+    #[test]
+    fn default_bus_root_uses_the_shared_mde_bus_resolver() {
+        assert_eq!(default_bus_root(), mde_bus::default_data_dir());
+    }
+
+    #[test]
+    fn expose_rejects_unsigned_tampered_and_replayed_bodies() {
+        let unsigned = r#"{"vm_nebula_ip":"10.42.128.1","guest_port":8080,"proto":"tcp","networks":["mesh","lan"],"schema_version":1}"#;
+        let request = parse_expose_request(unsigned).expect("valid expose request");
+        let target = expose_auth_target(&request);
+        let armed = authorize_test_body(
+            AUTH_KEY,
+            unsigned,
+            MutationContext {
+                verb: COMPUTE_EXPOSE_AUTH_VERB,
+                node: COMPUTE_EXPOSE_NODE_SCOPE,
+                target: &target,
+            },
+            "compute-expose-once",
+            AUTH_NOW + 30_000,
+        );
+        let tampered = armed.replace("10.42.128.1", "10.42.128.2");
+        let tampered_request = parse_expose_request(&tampered).expect("tamper remains parseable");
+        let auth_root = tempfile::tempdir().expect("auth root");
+        let authorizer =
+            ActionAuthorizer::for_test(AUTH_KEY, auth_root.path().to_path_buf(), AUTH_NOW);
+
+        assert!(authorize_expose_request(&authorizer, unsigned, &request).is_err());
+        assert!(authorize_expose_request(&authorizer, &tampered, &tampered_request).is_err());
+        assert!(authorize_expose_request(&authorizer, &armed, &request).is_ok());
+        assert!(authorize_expose_request(&authorizer, &armed, &request).is_err());
+    }
+
+    #[test]
+    fn unexpose_rejects_unsigned_tampered_and_replayed_bodies() {
+        let unsigned =
+            r#"{"vm_nebula_ip":"10.42.128.1","host_port":8080,"proto":"tcp","schema_version":1}"#;
+        let request = parse_unexpose_request(unsigned).expect("valid unexpose request");
+        let target = unexpose_auth_target(&request);
+        let armed = authorize_test_body(
+            AUTH_KEY,
+            unsigned,
+            MutationContext {
+                verb: COMPUTE_UNEXPOSE_AUTH_VERB,
+                node: COMPUTE_EXPOSE_NODE_SCOPE,
+                target: &target,
+            },
+            "compute-unexpose-once",
+            AUTH_NOW + 30_000,
+        );
+        let tampered = armed.replace("8080", "8081");
+        let tampered_request = parse_unexpose_request(&tampered).expect("tamper remains parseable");
+        let auth_root = tempfile::tempdir().expect("auth root");
+        let authorizer =
+            ActionAuthorizer::for_test(AUTH_KEY, auth_root.path().to_path_buf(), AUTH_NOW);
+
+        assert!(authorize_unexpose_request(&authorizer, unsigned, &request).is_err());
+        assert!(authorize_unexpose_request(&authorizer, &tampered, &tampered_request).is_err());
+        assert!(authorize_unexpose_request(&authorizer, &armed, &request).is_ok());
+        assert!(authorize_unexpose_request(&authorizer, &armed, &request).is_err());
+    }
 
     // ── VIRT-7.followup: parse_rich_rule (reverse of build_rich_rule_body) ──
 

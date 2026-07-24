@@ -605,7 +605,7 @@ fn run_pass(persist: &Persist, alerts_dir: &std::path::Path) {
 }
 
 fn default_bus_root() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join("mde").join("bus"))
+    mde_bus::default_data_dir()
 }
 
 /// The supervised worker. Leader-gated (only the elected node snapshots +

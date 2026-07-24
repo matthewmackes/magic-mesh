@@ -619,20 +619,29 @@ impl AirQualityOverlayWorker {
                 }
             }
             Err(error) => {
-                if let Some(snapshot) = last_good {
-                    snapshot.published_at_ms = now_ms();
-                    snapshot
-                        .gaps
-                        .retain(|gap| !gap.starts_with("AirNow AQI paused:"));
-                    push_gap(&mut snapshot.gaps, format!("AirNow AQI paused: {error}"));
-                    self.publish(snapshot);
+                // Never expose retained station readings after a failed
+                // refresh: they belong to the previous query context and
+                // would be presented as current if the vehicle moved. Keep
+                // `last_good` private for retry bookkeeping, but retract its
+                // public observations with an empty degraded shell.
+                let previous_context = last_good.as_ref().and_then(|snapshot| {
+                    Some(AirQualityContext {
+                        latitude: snapshot.query_latitude?,
+                        longitude: snapshot.query_longitude?,
+                    })
+                });
+                let reason = if previous_context.is_some_and(|previous| {
+                    previous.latitude != context.latitude || previous.longitude != context.longitude
+                }) {
+                    format!("AirNow AQI prior-location readings withheld after refresh failure: {error}")
                 } else {
-                    self.publish(&self.status_snapshot(
-                        AirNowAvailability::Ready,
-                        Some(context),
-                        format!("AirNow AQI paused: {error}"),
-                    ));
-                }
+                    format!("AirNow AQI refresh unavailable; readings withheld: {error}")
+                };
+                self.publish(&self.status_snapshot(
+                    AirNowAvailability::Ready,
+                    Some(context),
+                    reason,
+                ));
                 ApplyOutcome {
                     success: false,
                     retry_after: error.retry_after,
@@ -764,20 +773,15 @@ impl Worker for AirQualityOverlayWorker {
                 if !no_fix_published {
                     let unavailable =
                         ProbeFailure::other("fresh same-host US vehicle fix unavailable");
-                    if let Some(last_context) = last_good.as_ref().and_then(|snapshot| {
-                        Some(AirQualityContext {
-                            latitude: snapshot.query_latitude?,
-                            longitude: snapshot.query_longitude?,
-                        })
-                    }) {
-                        self.apply_result(Err(unavailable), last_context, &mut last_good);
-                    } else {
-                        self.publish(&self.status_snapshot(
-                            AirNowAvailability::Ready,
-                            None,
-                            unavailable.to_string(),
-                        ));
-                    }
+                    // A missing fix is a hard context boundary. Publish an
+                    // empty status so a prior-location snapshot, including
+                    // one left on the Bus across a worker restart, is
+                    // immediately retracted. `last_good` remains private.
+                    self.publish(&self.status_snapshot(
+                        AirNowAvailability::Ready,
+                        None,
+                        unavailable.to_string(),
+                    ));
                     no_fix_published = true;
                 }
                 tokio::select! {
@@ -967,7 +971,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_refresh_retains_fetch_time_and_publishes_paused_last_good() {
+    fn failed_refresh_withholds_stations_but_keeps_private_last_good() {
         let temp = tempfile::tempdir().expect("temp");
         let root = temp.path().to_path_buf();
         let worker =
@@ -988,18 +992,69 @@ mod tests {
         assert!(!paused.success);
         let retained = last_good.as_ref().expect("last good");
         assert_eq!(retained.fetched_at_ms, Some(NOW_MS));
-        assert!(retained
+        assert_eq!(retained.stations.len(), 2);
+        assert!(retained.gaps.is_empty(), "private last-good stays intact");
+
+        let persisted = Persist::open(root)
+            .expect("bus")
+            .read_latest(&air_quality_state_topic("rig-1"))
+            .expect("latest")
+            .expect("degraded row");
+        let degraded: AirQualitySnapshot =
+            serde_json::from_str(&persisted.body.expect("snapshot body")).expect("snapshot");
+        assert_eq!(degraded.availability, AirNowAvailability::Ready);
+        assert_eq!(degraded.fetched_at_ms, None);
+        assert_eq!(degraded.query_latitude, Some(context().latitude));
+        assert_eq!(degraded.query_longitude, Some(context().longitude));
+        assert!(degraded.stations.is_empty());
+        assert!(degraded
             .gaps
             .iter()
-            .any(|gap| gap.starts_with("AirNow AQI paused:")));
-        assert_eq!(
-            Persist::open(root)
-                .expect("bus")
-                .list_since(&air_quality_state_topic("rig-1"), None)
-                .expect("rows")
-                .len(),
-            2
-        );
+            .any(|gap| gap.contains("readings withheld")));
+    }
+
+    #[test]
+    fn failed_refresh_after_vehicle_moves_clears_prior_location_stations() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().to_path_buf();
+        let worker =
+            AirQualityOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+        let original = parse_snapshot("rig-1", context(), &official_schema_fixture(), NOW_MS)
+            .expect("snapshot");
+        let moved = AirQualityContext {
+            latitude: 36.16,
+            longitude: -86.78,
+        };
+        let mut last_good = None;
+        assert!(worker
+            .apply_result(Ok(original), context(), &mut last_good)
+            .success);
+        assert!(!worker
+            .apply_result(
+                Err(ProbeFailure::other("timeout")),
+                moved,
+                &mut last_good,
+            )
+            .success);
+
+        let persisted = Persist::open(root)
+            .expect("bus")
+            .read_latest(&air_quality_state_topic("rig-1"))
+            .expect("latest")
+            .expect("clearing row");
+        let cleared: AirQualitySnapshot =
+            serde_json::from_str(&persisted.body.expect("snapshot body")).expect("snapshot");
+        assert!(cleared.stations.is_empty());
+        assert_eq!(cleared.fetched_at_ms, None);
+        assert_eq!(cleared.query_latitude, Some(moved.latitude));
+        assert_eq!(cleared.query_longitude, Some(moved.longitude));
+        assert!(cleared
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("prior-location readings withheld")));
+        let retained = last_good.expect("private last-good");
+        assert_eq!(retained.query_latitude, Some(context().latitude));
+        assert_eq!(retained.stations.len(), 2);
     }
 
     struct MissingKey;
@@ -1039,6 +1094,49 @@ mod tests {
         assert_eq!(snapshot.availability, AirNowAvailability::Unconfigured);
         assert_eq!(snapshot.fetched_at_ms, None);
         assert!(snapshot.stations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn restart_with_only_persisted_stale_record_retracts_it_without_fix() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().to_path_buf();
+        let mut worker = AirQualityOverlayWorker::new("rig-1".to_string())
+            .with_probe(Arc::new(SlowProbe))
+            .with_bus_root(Some(root.clone()));
+        let stale = parse_snapshot("rig-1", context(), &official_schema_fixture(), NOW_MS)
+            .expect("snapshot");
+        worker.publish(&stale);
+
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move { worker.run(ShutdownToken::from_receiver(rx)).await });
+        let topic = air_quality_state_topic("rig-1");
+        let mut cleared = None;
+        for _ in 0..20 {
+            if let Some(snapshot) = Persist::open(root.clone())
+                .ok()
+                .and_then(|persist| persist.read_latest(&topic).ok().flatten())
+                .and_then(|event| event.body)
+                .and_then(|body| serde_json::from_str::<AirQualitySnapshot>(&body).ok())
+            {
+                if snapshot.fetched_at_ms.is_none()
+                    && snapshot.query_latitude.is_none()
+                    && snapshot.query_longitude.is_none()
+                    && snapshot.stations.is_empty()
+                {
+                    cleared = Some(snapshot);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tx.send(true).expect("shutdown");
+        task.await.expect("join").expect("worker");
+        let cleared = cleared.expect("stale persisted row was retracted");
+        assert_eq!(cleared.availability, AirNowAvailability::Ready);
+        assert!(cleared
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("fresh same-host US vehicle fix unavailable")));
     }
 
     struct SlowProbe;

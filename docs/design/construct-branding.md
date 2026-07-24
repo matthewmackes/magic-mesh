@@ -16,7 +16,7 @@ the shell now paints its own UI and owns its branding directly.
 | 3 | Icon style | **Monochrome Carbon line-art** — single-weight line glyphs on the Carbon grid, tinted per state (accent / dim / warn) from the tokens; IBM-Carbon-grade consistency with the shell. |
 | 4 | Brand mechanism | **Extend `mde-theme`** — a `brand` submodule inside the theme crate (icons + logo + version/build-info) alongside the color tokens. One source of truth; every surface + the RPM + `--version` read from it. |
 | 5 | Version placement | **All four:** shell chrome/status bar · About/System panel · DRM boot-splash · Mesh Map / fleet (per-node version, so fleet version-skew is visible). |
-| 6 | Version format | **Internal semver + codename** — `12.0.0 "Construct"` remains the build identity; visible chrome/splash copy uses the Construct product labels and release line. |
+| 6 | Version format | **Internal semver + codename** — the shared build identity is `<workspace version> "Construct"`; visible chrome/splash copy uses the Construct product labels and the derived `Release <workspace version>` line. |
 | 7 | Build identity | **Baked via `build.rs`** — version + short git hash + build date + release channel + codename stamped at compile time into `mde-theme::brand::build`; `--version` and every surface read it. |
 | 8 | Boot-splash | **Logo + wordmark + version** — centered product mark + wordmark + the version line on the Carbon field while the shell initializes. |
 
@@ -36,8 +36,8 @@ share and locked its placement:
 
 | # | Decision | Lock |
 |---|----------|------|
-| 9 | **Canonical codename = "Construct"** | The 12.x codename is **Construct** — version line `12.0.0 "Construct"`; supersedes the earlier legacy naming in current code/docs and release notes. |
-| 10 | Product name (user-facing) | **"Construct"** in About/splash/chrome, with **"Software Studio: MDE"** and **"Release 1.0 BETA"** as supporting visible identity lines where space allows; `magic-mesh` stays the infra/mesh + package name underneath (GNOME vs gnome-shell split). |
+| 9 | **Canonical codename = "Construct"** | The 12.x codename is **Construct** — the version line is `<workspace version> "Construct"`; supersedes the earlier legacy naming in current code/docs and release notes. |
+| 10 | Product name (user-facing) | **"Construct"** in About/splash/chrome, with **"Software Studio: MDE"** and the derived **`Release <workspace version>`** line as supporting visible identity where space allows; `magic-mesh` stays the infra/mesh + package name underneath (GNOME vs gnome-shell split). |
 | 11 | DRM boot-splash image | **`CONSTRUCT-WALLPAPER1.png`** is the source splash asset; the shell paints native Construct text and token progress over the shell field. |
 | 12 | Default desktop wallpaper | **`CONSTRUCT-WALLPAPER4.png`**; **all five generated Construct wallpapers ship** in the RPM as a selectable set. |
 | 13 | About / System panel | **`CONSTRUCT-MAIN.png`** is the canonical Construct lockup source; About renders the text identity from `brand::logo`. |
@@ -52,7 +52,7 @@ sibling to the existing color-token modules):
 
 - **`brand::build`** — a `build.rs` stamps `BuildInfo { version, codename, git_hash,
   build_date, channel }` at compile time (env vars → `include!`/`env!`). Internal
-  helpers keep `version_line()` → `12.0.0 "Construct"` and `full()` → the complete
+  helpers keep `version_line()` → `<workspace version> "Construct"` and `full()` → the complete
   build-info string for diagnostics and `--version`; visible product UI reads
   `brand::logo` Construct constants instead. Handles the no-git case (release
   tarball) with a sentinel hash. Codename is keyed off the workspace version's epoch.
@@ -85,7 +85,7 @@ mark is identical everywhere.
 
 ## Acceptance (runtime-observable, per task)
 - A Workstation boots to a platform boot-splash showing Construct, Software Studio:
-  MDE, and Release 1.0 BETA, then the dock.
+  MDE, and the derived release line, then the dock.
 - The shell chrome and product surfaces avoid old brand names; opening About shows
   Construct identity + full build-info (version · git hash · date · channel) + links.
 - Every dock surface renders its monochrome Carbon glyph from `brand::icons`, crisp at

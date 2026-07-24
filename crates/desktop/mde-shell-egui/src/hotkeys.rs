@@ -156,6 +156,12 @@ const fn leader_chord(key: egui::Key) -> Option<&'static str> {
 pub(crate) struct HotkeyRouter {
     /// Whether the leader (Super) is currently held — arms the leader chords.
     leader: bool,
+    /// Whether a Super release is still inside the one-frame chord grace window.
+    ///
+    /// The DRM runner and egui do not share one event queue: libinput can report
+    /// Super-up in the frame before egui reports Tab. Keeping this window open
+    /// lets that delayed Tab still resolve as Super+Tab.
+    leader_release_pending: bool,
     /// Whether a leader chord actually fired during the current Super hold — set
     /// when a named leader key resolves, cleared on the rising edge of a fresh
     /// Super press. Distinguishes a Super *hold* (a leader) from a clean *tap*
@@ -164,6 +170,9 @@ pub(crate) struct HotkeyRouter {
     /// Latched `true` on a clean Super-tap release; drained by
     /// [`Self::take_super_tap`]. A leader-chord hold never sets it.
     super_tap: bool,
+    /// A clean release waits one render frame before becoming `super_tap`, so a
+    /// named egui key arriving in the next frame can still complete the chord.
+    tap_pending: bool,
     /// Latched Super+number navigation request. Drained by the shell after normal
     /// hotkey actions so the existing typed host-action table stays closed.
     nav_slot: Option<NavSlot>,
@@ -202,15 +211,18 @@ impl HotkeyRouter {
                     self.leader_used = false;
                 }
                 self.leader = true;
+                self.leader_release_pending = false;
+                self.tap_pending = false;
                 None
             }
             HostKey::Leader(false) => {
-                // Release: a clean tap returns to the shell launcher; a hold used
-                // as a leader just disarms.
+                // Release: keep a one-frame chord grace window because the egui
+                // named-key event may arrive after this host-side transition.
+                // A clean tap becomes visible on the next quiet frame; a hold
+                // used as a leader is cleared as soon as its chord is observed.
                 self.leader = false;
-                if !self.leader_used {
-                    self.super_tap = true;
-                }
+                self.leader_release_pending = true;
+                self.tap_pending = !self.leader_used;
                 None
             }
         }
@@ -223,7 +235,7 @@ impl HotkeyRouter {
     /// nav slot through [`nav_slot_for`], which reads the press's Shift bit to
     /// pick the tier (REACH-2).
     fn on_egui_key(&mut self, press: KeyPress) -> Option<HotkeyAction> {
-        if !self.leader {
+        if !self.leader && !self.leader_release_pending {
             return None;
         }
         if let Some(slot) = nav_slot_for(press.key, press.shift) {
@@ -242,13 +254,31 @@ impl HotkeyRouter {
     /// leader), then fold this frame's egui key presses against the leader latch.
     /// Returns every matched typed action, in input order — the shell applies each
     /// to its seat / nav. Host keys are processed first so a same-frame
-    /// `Super`+named-key chord sees the freshly-armed latch.
+    /// `Super`+named-key chord sees the freshly-armed latch. A fast physical chord
+    /// may split Super-up and the named egui key across adjacent render frames;
+    /// the release grace window keeps that sequence from becoming Spotlight.
     pub(crate) fn dispatch(
         &mut self,
         host_keys: &[HostScan],
         egui_presses: &[KeyPress],
     ) -> Vec<HotkeyAction> {
         let mut actions = Vec::new();
+        let has_leader_chord = egui_presses.iter().any(|press| {
+            leader_chord(press.key).is_some() || nav_slot_for(press.key, press.shift).is_some()
+        });
+
+        // Do not commit a clean Super tap until one quiet frame has passed. If
+        // the next frame contains a named key, the pending release is instead
+        // the tail of a physical Super chord.
+        if self.leader_release_pending && !has_leader_chord {
+            self.leader_release_pending = false;
+            self.leader_used = false;
+            if self.tap_pending {
+                self.super_tap = true;
+                self.tap_pending = false;
+            }
+        }
+
         for scan in host_keys {
             if let Some(a) = self.on_host_key(*scan) {
                 actions.push(a);
@@ -259,19 +289,25 @@ impl HotkeyRouter {
                 actions.push(a);
             }
         }
+
+        // A release following a chord is safe to close immediately; a release
+        // with no observed chord remains pending for the next frame's grace
+        // check above.
+        if self.leader_release_pending && self.leader_used {
+            self.leader_release_pending = false;
+            self.tap_pending = false;
+            self.leader_used = false;
+        }
         actions
     }
 }
 
 /// Map a leader-held number key (+ its Shift state) to the surface slot it
-/// selects. Two tiers cover **all 20** `Surface::ALL` entries (REACH-2):
+/// selects. Two tiers cover the complete `Surface::ALL` list (REACH-2):
 ///
 /// * plain **`Super`+`1`…`9`/`0`** → Springboard slots 0…=9
 ///   (`Super+0` = the tenth slot);
-/// * **`Super`+`Shift`+`1`…`9`/`0`** → `Surface::ALL[10..=19]` — the ten surfaces
-///   beyond the first ten (`Super+Shift+0` = the twentieth slot, `ALL[19]`, the
-///   Communications hub that WL-FUNC-011 landed in the slot the prior 19-surface
-///   set left open).
+/// * **`Super`+`Shift`+`1`…`9`/`0`** → the ten slots beyond the first ten.
 ///
 /// A slot past the last surface (only reachable if `Surface::ALL` shrinks below
 /// 20) is handled bounds-safely: the [`NavSlot`] consumer (`apply_nav_slot`)
@@ -291,8 +327,7 @@ const fn nav_slot_for(key: egui::Key, shift: bool) -> Option<NavSlot> {
         egui::Key::Num0 => 9,
         _ => return None,
     };
-    // Shift shifts to the second tier: its ten-surface offset lands Num1..Num9 on
-    // ALL[10..=18] and the shifted Num0 on ALL[19] (the twentieth surface).
+    // Shift shifts to the second tier by ten slots.
     Some(NavSlot(if shift { digit + 10 } else { digit }))
 }
 
@@ -300,8 +335,8 @@ const fn nav_slot_for(key: egui::Key, shift: bool) -> Option<NavSlot> {
 /// the only egui-side modifier the router reads — the Super leader arrives
 /// host-first (evdev 125/126, [`decode_scan`]), so a chord is the leader latch
 /// crossed with a `(key, shift)` press. Shift selects the **second** Super-number
-/// nav tier (REACH-2): `Super+1..0` reaches `Surface::ALL[0..=9]`,
-/// `Super+Shift+1..9/0` reaches `ALL[10..=19]`, so all 20 surfaces are reachable.
+/// nav tier (REACH-2): `Super+1..0` reaches the first ten slots and
+/// `Super+Shift+1..9/0` reaches the second ten, with bounds-safe overshoot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct KeyPress {
     /// The pressed egui key.
@@ -419,11 +454,36 @@ mod tests {
             vec![HotkeyAction::OpenSystem]
         );
 
-        // Release the leader → the chord disarms; Tab reaches the guest again.
-        assert!(r
-            .dispatch(&[scan(125, false)], &[press(egui::Key::Tab)])
-            .is_empty());
+        // Release the leader → the chord disarms. If the host release and egui
+        // Tab share a wake, the grace window still treats that edge as the
+        // physical Super+Tab chord rather than leaking Tab into the guest.
+        assert_eq!(
+            r.dispatch(&[scan(125, false)], &[press(egui::Key::Tab)]),
+            vec![HotkeyAction::SessionSwitch]
+        );
         assert!(!r.leader_armed());
+    }
+
+    #[test]
+    fn a_batched_fast_super_tab_chord_defers_release_until_after_tab() {
+        let mut r = HotkeyRouter::default();
+
+        // A real DRM/libinput wake can batch Super down, Tab, and Super up into
+        // one egui frame. The release must not turn this into the clean-Super
+        // Spotlight/Home action before Tab sees the leader latch.
+        let acts = r.dispatch(
+            &[scan(125, true), scan(125, false)],
+            &[press(egui::Key::Tab)],
+        );
+        assert_eq!(acts, vec![HotkeyAction::SessionSwitch]);
+        assert!(
+            !r.leader_armed(),
+            "the deferred release still disarms Super"
+        );
+        assert!(
+            !r.take_super_tap(),
+            "a batched Super+Tab chord is not a clean Super tap"
+        );
     }
 
     #[test]
@@ -479,6 +539,11 @@ mod tests {
         let _ = r.dispatch(&[scan(125, true)], &[]);
         assert!(!r.take_super_tap(), "no action until the tap completes");
         let _ = r.dispatch(&[scan(125, false)], &[]);
+        assert!(
+            !r.take_super_tap(),
+            "the clean tap waits one frame for a delayed chord key"
+        );
+        let _ = r.dispatch(&[], &[]);
         assert!(r.take_super_tap(), "a clean Super tap latches shell home");
         assert!(
             !r.take_super_tap(),
@@ -499,13 +564,33 @@ mod tests {
         // used-flag) and toggles again.
         let _ = r.dispatch(&[scan(125, true)], &[]);
         let _ = r.dispatch(&[scan(125, false)], &[]);
+        let _ = r.dispatch(&[], &[]);
         assert!(r.take_super_tap(), "a fresh Super tap re-arms");
 
         // A same-frame press+release (a very quick tap) still toggles.
         let _ = r.dispatch(&[scan(125, true), scan(125, false)], &[]);
+        let _ = r.dispatch(&[], &[]);
         assert!(
             r.take_super_tap(),
             "a same-frame Super tap latches shell home"
+        );
+    }
+
+    #[test]
+    fn a_super_release_before_the_delayed_tab_still_switches_sessions() {
+        let mut r = HotkeyRouter::default();
+        let _ = r.dispatch(&[scan(125, true)], &[]);
+        let _ = r.dispatch(&[scan(125, false)], &[]);
+        assert!(
+            !r.take_super_tap(),
+            "the release remains in the chord grace window"
+        );
+
+        let acts = r.dispatch(&[], &[press(egui::Key::Tab)]);
+        assert_eq!(acts, vec![HotkeyAction::SessionSwitch]);
+        assert!(
+            !r.take_super_tap(),
+            "a delayed Super+Tab is not a clean tap"
         );
     }
 
@@ -563,8 +648,8 @@ mod tests {
 
     #[test]
     fn super_shift_numbers_reach_the_second_surface_tier() {
-        // REACH-2 — Super+Shift+1..9 selects Surface::ALL[10..=18], the nine
-        // surfaces the plain Super+1..0 tier can't reach.
+        // REACH-2 — Super+Shift+1..9 selects the reserved second-tier slots
+        // 10..=18, beyond the surfaces the plain Super+1..0 tier can reach.
         for (key, want) in [
             (egui::Key::Num1, 10),
             (egui::Key::Num2, 11),
@@ -617,8 +702,8 @@ mod tests {
             (egui::Key::Num7, true),
             (egui::Key::Num8, true),
             (egui::Key::Num9, true),
-            // Super+Shift+0 → slot 19 (an overshoot no-op after the WL-FUNC-011
-            // Phase-2 17-surface cutover; slots 17..=19 resolve to no surface).
+            // Super+Shift+0 → slot 19 (an overshoot no-op after the
+            // Fleet & Mesh consolidation; slots 15..=19 resolve to no surface).
             (egui::Key::Num0, true),
         ];
         let mut reached = BTreeSet::new();
@@ -631,13 +716,12 @@ mod tests {
                 .expect("a Super-number chord latches a slot");
             reached.insert(slot.index());
         }
-        // REACH-2 provides 20 chord slots across two Super-number tiers. After the
-        // WL-FUNC-011 Phase-2 cutover 17 surfaces remain, occupying slots 0..=16, so
-        // every surface index stays keyboard-reachable; the three overshoot chords
-        // (slots 17..=19) latch a slot that resolves to no surface — a safe no-op
+        // REACH-2 provides 20 chord slots across two Super-number tiers. Every
+        // current surface index stays keyboard-reachable; overshoot chords latch a
+        // slot that resolves to no surface — a safe no-op
         // (see `a_slot_past_the_last_surface_is_a_safe_no_op`).
         let all: BTreeSet<usize> = (0..crate::surfaces::Surface::ALL.len()).collect();
-        assert_eq!(all.len(), 17, "Springboard has 17 surface tiles");
+        assert_eq!(all.len(), crate::surfaces::Surface::ALL.len());
         assert!(
             all.is_subset(&reached),
             "every Surface::ALL index has a Super-number chord"
@@ -646,10 +730,9 @@ mod tests {
 
     #[test]
     fn a_slot_past_the_last_surface_is_a_safe_no_op() {
-        // REACH-2 provides 20 chord slots across two Super-number tiers. After the
-        // WL-FUNC-011 Phase-2 cutover only 17 surfaces remain (slots 0..=16), so the
-        // top tier-2 chords overshoot: Super+Shift+0 latches slot 19, which now
-        // resolves to NO surface. Prove the chord still latches that slot and
+        // REACH-2 provides 20 chord slots across two Super-number tiers. The
+        // top tier-2 chords may overshoot the current surface list: prove the
+        // chord still latches that slot and
         // consumes the hold (so releasing does not toggle the dock)…
         let mut r = HotkeyRouter::default();
         let _ = r.dispatch(&[scan(125, true)], &[shift_press(egui::Key::Num0)]);
@@ -657,7 +740,7 @@ mod tests {
         assert_eq!(slot.index(), 19, "Super+Shift+0 → slot 19");
         assert!(
             crate::surfaces::springboard_surface(slot.index()).is_none(),
-            "slot 19 overshoots the 17-surface set — resolves to no surface",
+            "slot 19 overshoots the current surface set — resolves to no surface",
         );
         // It consumed the hold, so releasing does not trigger shell home.
         let _ = r.dispatch(&[scan(125, false)], &[]);

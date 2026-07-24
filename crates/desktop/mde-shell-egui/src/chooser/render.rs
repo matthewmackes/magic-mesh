@@ -436,7 +436,7 @@ pub(super) fn source_card(
     // precedence over the inline controls + the primary click.
     let mut menu_action = None;
     chooser_context_menu(&response, |ui| {
-        card_context_menu(ui, source, favorite, &mut menu_action);
+        card_context_menu(ui, source, favorite, gate, &mut menu_action);
     });
     if menu_action.is_some() {
         return menu_action;
@@ -464,6 +464,7 @@ pub(super) fn card_context_menu(
     ui: &mut egui::Ui,
     source: &DesktopSource,
     favorite: bool,
+    power_gate: Option<&str>,
     out: &mut Option<CardAction>,
 ) {
     if source.connectable() && ui.button("Connect…").clicked() {
@@ -483,11 +484,7 @@ pub(super) fn card_context_menu(
     }
     // KVM power — the CHOOSER-7 state-appropriate ops, only for a local VM.
     if source.origin == SourceOrigin::LocalVm {
-        let ops = source
-            .power_state
-            .as_deref()
-            .map_or(PowerState::Unknown, PowerState::from_wire)
-            .actions();
+        let ops = power_menu_ops(source, power_gate);
         if !ops.is_empty() {
             ui.separator();
             for op in ops {
@@ -513,6 +510,23 @@ pub(super) fn card_context_menu(
             ui.close_menu();
         }
     }
+}
+
+/// The context-menu power affordance is capability-gated separately from the
+/// inline row. A missing/unhealthy local-kvm lane must not leave a second,
+/// enabled lifecycle path through the right-click menu.
+pub(super) fn power_menu_ops(
+    source: &DesktopSource,
+    power_gate: Option<&str>,
+) -> &'static [PowerOp] {
+    if source.origin != SourceOrigin::LocalVm || power_gate.is_some() {
+        return &[];
+    }
+    source
+        .power_state
+        .as_deref()
+        .map_or(PowerState::Unknown, PowerState::from_wire)
+        .actions()
 }
 
 /// The card's thumbnail well: the source's decoded live preview when its

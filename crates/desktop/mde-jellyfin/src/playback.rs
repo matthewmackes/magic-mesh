@@ -592,7 +592,12 @@ mod tests {
 
     #[test]
     fn playback_info_request_carries_the_device_profile() {
-        let device = ClientInfo::new("mde-media", "workstation", "device-42", "12.0.0");
+        let device = ClientInfo::new(
+            "mde-media",
+            "workstation",
+            "device-42",
+            env!("CARGO_PKG_VERSION"),
+        );
         let req = build_playback_info_request(
             "https://jelly.mesh:8096/",
             "user-1",

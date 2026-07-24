@@ -20,6 +20,7 @@ fi
 
 python3 - "$ROOT" "$SRC" <<'PY'
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -34,7 +35,23 @@ construct.mkdir(parents=True, exist_ok=True)
 
 PRODUCT = "Construct"
 STUDIO = "Software Studio: MDE"
-RELEASE = "Release 1.0 BETA"
+
+
+def workspace_version(root: Path) -> str:
+    """Read the platform release from Cargo's single workspace source."""
+    cargo = (root / "Cargo.toml").read_text(encoding="utf-8")
+    section = re.search(
+        r"(?ms)^\[workspace\.package\]\s*(.*?)(?=^\[|\Z)", cargo
+    )
+    if not section:
+        raise RuntimeError("Cargo.toml has no [workspace.package] section")
+    version = re.search(r'(?m)^version\s*=\s*"([^"]+)"\s*$', section.group(1))
+    if not version:
+        raise RuntimeError("Cargo.toml [workspace.package] has no version")
+    return version.group(1)
+
+
+RELEASE = f"Release {workspace_version(root)}"
 
 
 def font_path(query: str) -> str:
@@ -214,6 +231,18 @@ def watermark() -> Image.Image:
     left_text(draw, (132, 64), PRODUCT, font(42, True), (245, 247, 250, 220))
     left_text(draw, (134, 104), STUDIO, font(18, True), (190, 199, 211, 195))
     return img
+
+
+# The checked-in README banners are generated artifacts too. Keep their visible
+# release line tied to the same Cargo-derived value whenever brand assets are
+# refreshed; the SVGs must never become a second release source.
+for banner in (brand / "readme-banner-light.svg", brand / "readme-banner-dark.svg"):
+    text = banner.read_text(encoding="utf-8")
+    updated, count = re.subn(r"Release [^<]+(?=</text>)", RELEASE, text)
+    if count != 1:
+        raise RuntimeError(f"{banner} has {count} release labels; expected one")
+    banner.write_text(updated, encoding="utf-8")
+    print(f"updated {banner} ({RELEASE})")
 
 
 outputs = {

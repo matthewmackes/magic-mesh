@@ -21,12 +21,15 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_bus::rpc::reply_topic;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+
+use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
 
 /// One launchable entry in the unified list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -617,6 +620,14 @@ pub struct AppsService {
     workgroup_root: PathBuf,
     node_id: String,
     home: PathBuf,
+    authorizer: Arc<ActionAuthorizer>,
+}
+
+fn production_authorizer() -> Arc<ActionAuthorizer> {
+    static AUTHORIZER: OnceLock<Arc<ActionAuthorizer>> = OnceLock::new();
+    AUTHORIZER
+        .get_or_init(|| Arc::new(ActionAuthorizer::production()))
+        .clone()
 }
 
 impl AppsService {
@@ -627,7 +638,33 @@ impl AppsService {
             workgroup_root: workgroup_root.to_path_buf(),
             node_id: node_id.to_string(),
             home: home.to_path_buf(),
+            authorizer: production_authorizer(),
         }
+    }
+
+    /// Inject an isolated verifier for hostile responder tests.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
+        self.authorizer = authorizer;
+        self
+    }
+
+    fn authorize_mutation(&self, verb: &str, body: Option<&str>) -> Result<(), String> {
+        let auth_verb = format!("apps-{verb}");
+        let target = match verb {
+            "set-favorite" => "apps-favorites",
+            "set-groups" => "apps-groups",
+            _ => return Err(format!("apps verb `{verb}` is not a mutation")),
+        };
+        self.authorizer.authorize(
+            body.ok_or_else(|| format!("apps/{verb}: missing request body"))?,
+            MutationContext {
+                verb: &auth_verb,
+                node: &self.node_id,
+                target,
+            },
+        )
     }
 }
 
@@ -932,10 +969,19 @@ pub fn poll_once<D, I>(
         };
         for msg in msgs {
             cursors.insert(topic.clone(), msg.ulid.clone());
-            let reply = if crate::ipc::body_within_cap(msg.body.as_deref()) {
-                build_reply(svc, verb, msg.body.as_deref(), dir_doc, inv_doc)
-            } else {
+            let reply = if !crate::ipc::body_within_cap(msg.body.as_deref()) {
                 crate::ipc::body_too_large_reply(verb)
+            } else if matches!(verb, "set-favorite" | "set-groups") {
+                match svc.authorize_mutation(verb, msg.body.as_deref()) {
+                    Ok(()) => build_reply(svc, verb, msg.body.as_deref(), dir_doc, inv_doc),
+                    Err(error) => json!({
+                        "ok": false,
+                        "error": format!("{verb}: authorization refused: {error}"),
+                    })
+                    .to_string(),
+                }
+            } else {
+                build_reply(svc, verb, msg.body.as_deref(), dir_doc, inv_doc)
             };
             if let Err(e) = persist.write(
                 &reply_topic(&msg.ulid),
@@ -972,6 +1018,10 @@ pub fn serve_bus<F, D, I>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::action_auth::{authorize_test_body, ActionAuthorizer, MutationContext};
+    use mde_bus::hooks::config::Priority;
+    use mde_bus::persist::Persist;
+    use std::sync::Arc;
 
     #[test]
     fn parse_desktop_entry_reads_application_and_skips_nondisplay() {
@@ -1285,6 +1335,66 @@ mod tests {
         assert!(favorites_path(root, "../etc/passwd")
             .to_string_lossy()
             .ends_with("apps-favorites/___etc_passwd.json"));
+    }
+
+    #[test]
+    fn responder_gates_shared_favorite_mutations_and_consumes_replay() {
+        const KEY: &[u8] = b"apps-action-auth-test-key";
+        const NOW: i64 = 1_700_000_000_000;
+        let workgroup = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let bus = tempfile::tempdir().unwrap();
+        let persist = Persist::open(bus.path().to_path_buf()).unwrap();
+        let svc = AppsService::new(workgroup.path(), "me", home.path()).with_authorizer(Arc::new(
+            ActionAuthorizer::for_test(KEY, bus.path().join("auth"), NOW),
+        ));
+        let topic = action_topic("set-favorite");
+        let unsigned =
+            json!({ "user": "mm", "id": "firefox", "pinned": true, "schema_version": 1 })
+                .to_string();
+        persist
+            .write(&topic, Priority::Default, None, Some(&unsigned))
+            .unwrap();
+        let mut cursors = HashMap::new();
+        poll_once(&persist, &svc, &mut cursors, &|| json!({}), &|| json!({}));
+        assert!(!favorites_path(workgroup.path(), "mm").exists());
+
+        let armed = authorize_test_body(
+            KEY,
+            &unsigned,
+            MutationContext {
+                verb: "apps-set-favorite",
+                node: "me",
+                target: "apps-favorites",
+            },
+            "apps-favorite-once",
+            NOW + 30_000,
+        );
+        let first = persist
+            .write(&topic, Priority::Default, None, Some(&armed))
+            .unwrap();
+        poll_once(&persist, &svc, &mut cursors, &|| json!({}), &|| json!({}));
+        assert_eq!(read_favorites(workgroup.path(), "mm"), vec!["firefox"]);
+
+        // A second Bus row carrying the same capability is refused and cannot
+        // turn the shared writer into a replayable mutation endpoint.
+        let replay = persist
+            .write(&topic, Priority::Default, None, Some(&armed))
+            .unwrap();
+        let replay_id = replay.ulid.clone();
+        poll_once(&persist, &svc, &mut cursors, &|| json!({}), &|| json!({}));
+        assert_eq!(read_favorites(workgroup.path(), "mm"), vec!["firefox"]);
+        for id in [first.ulid, replay.ulid] {
+            let reply = persist
+                .list_since(&reply_topic(&id), None)
+                .unwrap()
+                .pop()
+                .and_then(|message| message.body)
+                .unwrap_or_default();
+            if id == replay_id {
+                assert!(reply.contains("authorization refused"));
+            }
+        }
     }
 
     #[test]

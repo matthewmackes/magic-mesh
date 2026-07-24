@@ -237,11 +237,30 @@ pub struct VehicleReply {
 #[must_use]
 pub fn parse_gpgga(line: &str) -> Option<GpsFix> {
     let line = line.trim();
-    // Accept "$GPGGA,..." / "$GNGGA,..." (strip any leading noise before the tag).
-    let start = line.find("GGA,")?;
-    let body = &line[start + 4..];
-    // Drop the checksum suffix if present.
-    let body = body.split('*').next().unwrap_or(body);
+    // Accept "$GPGGA,..." / "$GNGGA,..." (strip any leading transport noise before
+    // the sentence). When a checksum is present, verify it rather than folding a
+    // truncated or corrupted sentence into the mirror.
+    let sentence_start = line.find('$')?;
+    let sentence = &line[sentence_start..];
+    let start = sentence.find("GGA,")?;
+    let body_with_checksum = &sentence[start + 4..];
+    let body = body_with_checksum
+        .split('*')
+        .next()
+        .unwrap_or(body_with_checksum);
+    if let Some(checksum) = body_with_checksum.split_once('*').map(|(_, value)| value) {
+        let checksum = checksum.trim();
+        if checksum.len() != 2 || !checksum.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        let expected = u8::from_str_radix(checksum, 16).ok()?;
+        let actual = sentence.as_bytes()[1..sentence.find('*')?]
+            .iter()
+            .fold(0_u8, |sum, byte| sum ^ byte);
+        if actual != expected {
+            return None;
+        }
+    }
     let f: Vec<&str> = body.split(',').collect();
     // Fields after "GGA,": 0=time,1=lat,2=N/S,3=lon,4=E/W,5=quality,6=numSats,7=HDOP,8=alt
     if f.len() < 9 {
@@ -249,10 +268,31 @@ pub fn parse_gpgga(line: &str) -> Option<GpsFix> {
     }
     let lat = nmea_coord(f.get(1)?, f.get(2)?);
     let lon = nmea_coord(f.get(3)?, f.get(4)?);
-    let quality: u8 = f.get(5).and_then(|s| s.trim().parse().ok()).unwrap_or(0);
-    let satellites: u8 = f.get(6).and_then(|s| s.trim().parse().ok()).unwrap_or(0);
-    let hdop: f32 = f.get(7).and_then(|s| s.trim().parse().ok()).unwrap_or(99.0);
-    let altitude_m: f32 = f.get(8).and_then(|s| s.trim().parse().ok()).unwrap_or(0.0);
+    let quality: u8 = f.get(5)?.trim().parse().ok()?;
+    // NMEA 0183 GGA quality values are 0..=8. Keep the existing neutral mapping
+    // below, but reject arbitrary values instead of silently calling them GPS.
+    if quality > 8 {
+        return None;
+    }
+    let satellites: u8 = f.get(6)?.trim().parse().ok()?;
+    if satellites > 99 {
+        return None;
+    }
+    let hdop: f32 = f.get(7)?.trim().parse().ok()?;
+    if !hdop.is_finite() || !(0.0..=99.9).contains(&hdop) {
+        return None;
+    }
+    let altitude_m: f32 = f.get(8)?.trim().parse().ok()?;
+    if !altitude_m.is_finite() || !(-12_000.0..=100_000.0).contains(&altitude_m) {
+        return None;
+    }
+    let (latitude, longitude) = match (lat, lon) {
+        (Some(latitude), Some(longitude)) => (latitude, longitude),
+        // A no-fix GGA may omit both coordinates. Preserve the honest no-fix sample
+        // without inventing a position; a partial or fixed position is invalid.
+        (None, None) if quality == 0 => (0.0, 0.0),
+        _ => return None,
+    };
     let fix_type = match quality {
         0 => "no-fix",
         2 => "dgps",
@@ -261,8 +301,8 @@ pub fn parse_gpgga(line: &str) -> Option<GpsFix> {
     .to_string();
     Some(GpsFix {
         fix_type,
-        latitude: lat.unwrap_or(0.0),
-        longitude: lon.unwrap_or(0.0),
+        latitude,
+        longitude,
         altitude_m,
         hdop,
         satellites,
@@ -275,14 +315,27 @@ pub fn parse_gpgga(line: &str) -> Option<GpsFix> {
 
 /// Convert an NMEA `ddmm.mmmm` value + hemisphere into signed decimal degrees.
 fn nmea_coord(value: &str, hemi: &str) -> Option<f64> {
-    let v: f64 = value.trim().parse().ok()?;
-    if v == 0.0 && value.trim().is_empty() {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let hemi = hemi.trim();
+    let max_degrees = match hemi {
+        "N" | "S" => 90.0,
+        "E" | "W" => 180.0,
+        _ => return None,
+    };
+    let v: f64 = value.parse().ok()?;
+    if !v.is_finite() || v < 0.0 {
         return None;
     }
     let deg = (v / 100.0).trunc();
     let min = v - deg * 100.0;
+    if min >= 60.0 || deg > max_degrees || (deg == max_degrees && min > 0.0) {
+        return None;
+    }
     let mut dd = deg + min / 60.0;
-    if matches!(hemi.trim(), "S" | "W") {
+    if matches!(hemi, "S" | "W") {
         dd = -dd;
     }
     Some(dd)
@@ -340,6 +393,33 @@ mod tests {
     fn parse_rejects_non_gga() {
         assert!(parse_gpgga("$PSIWMMPU,48.850,0.26605").is_none());
         assert!(parse_gpgga("garbage").is_none());
+    }
+
+    #[test]
+    fn parse_gpgga_rejects_bad_checksum_and_out_of_range_fields() {
+        assert!(
+            parse_gpgga("$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*00")
+                .is_none()
+        );
+        assert!(
+            parse_gpgga("$GPGGA,123519,4860.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,").is_none()
+        );
+        assert!(
+            parse_gpgga("$GPGGA,123519,4807.038,N,01131.000,E,9,08,0.9,545.4,M,46.9,M,,").is_none()
+        );
+        assert!(
+            parse_gpgga("$GPGGA,123519,4807.038,N,01131.000,E,1,100,0.9,545.4,M,46.9,M,,")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn parse_gpgga_allows_coordinate_free_no_fix_but_not_partial_coordinates() {
+        let no_fix = parse_gpgga("$GPGGA,123519,,,,,0,00,99.0,0.0,M,0.0,M,,*00");
+        assert!(no_fix.is_none(), "bad checksum must still be rejected");
+
+        assert!(parse_gpgga("$GPGGA,123519,,,,,0,00,99.0,0.0,M,0.0,M,,").is_some());
+        assert!(parse_gpgga("$GPGGA,123519,4807.038,N,,,0,00,99.0,0.0,M,0.0,M,,").is_none());
     }
 
     #[test]

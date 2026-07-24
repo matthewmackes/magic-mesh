@@ -244,6 +244,11 @@ impl DocumentsState {
         self.active_title.clear();
         self.template_open = false;
         self.notice = None;
+        // The previous space's editor is a loaded view, not durable state. Drop
+        // it with the per-space selection so the no-selection path cannot keep
+        // rendering the old space's Markdown while the new session projection
+        // is still arriving (or has disappeared after membership loss).
+        self.editor = real_editor();
     }
 }
 

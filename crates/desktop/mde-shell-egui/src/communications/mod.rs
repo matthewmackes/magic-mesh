@@ -29,6 +29,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION;
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_egui::egui;
@@ -37,8 +38,9 @@ use serde::de::DeserializeOwned;
 use mde_collab_egui::{CollabData, CommandSink, CommunicationsSurface};
 use mde_collab_types::topics::{self, projection as proj};
 use mde_collab_types::{
-    ActivityFeed, ActorId, CallState, CollabCommand, ConversationTimeline, SpaceDirectory, SpaceId,
-    ThreadId, ThreadTimeline,
+    ActivityFeed, ActorId, AlertInbox, CallState, ClipboardLane, CollabCommand,
+    ConversationTimeline, DocumentSessions, EventId, FileReferences, SpaceDirectory, SpaceId,
+    ThreadId, ThreadTimeline, TransferJobs,
 };
 
 use crate::bus_reader::BusReader;
@@ -46,6 +48,11 @@ use crate::bus_reader::BusReader;
 /// Poll cadence — matches the collab worker's own 2 s tick so the rail +
 /// conversations stay live without a cold-start wait (the `chat.rs` cadence).
 const REFRESH: Duration = Duration::from_secs(2);
+
+/// Seat-local read cursors. This topic deliberately lives outside the
+/// replicated `state/collab/*` namespace: read position is a UI preference for
+/// this seat, not a collaboration event or a remote read receipt.
+const LOCAL_READ_CURSORS_TOPIC: &str = "local/collab/read-cursors";
 
 /// The local seat's wall time in epoch milliseconds (the collab worker's
 /// `now_unix_ms` shape). Injected into [`CollabData::now_unix_ms`] so the surface
@@ -90,9 +97,33 @@ pub(crate) struct LiveCollabData {
     /// Per-space conversation timelines (folded from
     /// `state/collab/conversation/<space>`).
     conversations: HashMap<SpaceId, ConversationTimeline>,
+    /// Retained thread timelines, keyed by their typed thread id. The worker's
+    /// per-space thread topic carries one typed timeline, so the root index is
+    /// built at the same time for the message-row reply affordance.
+    threads: HashMap<ThreadId, ThreadTimeline>,
+    /// Thread lookup by its owning space and root message event.
+    thread_roots: HashMap<(SpaceId, EventId), ThreadId>,
     /// The aggregated active-call state — every space's `state/collab/call-state`
     /// concatenated into the one persistent call bar's read model.
     call_state: CallState,
+    /// Per-space linked-file references (folded from
+    /// `state/collab/file-references/<space>`).
+    file_references: HashMap<SpaceId, FileReferences>,
+    /// Fleet-wide transfer ledger mirror (folded from
+    /// `state/collab/transfer-jobs`).
+    transfer_jobs: Option<TransferJobs>,
+    /// Fleet-wide alert inbox (folded from `state/collab/alert-inbox`).
+    alert_inbox: Option<AlertInbox>,
+    /// Per-space clipboard lanes (folded from
+    /// `state/collab/clipboard-lane/<space>`).
+    clipboard_lanes: HashMap<SpaceId, ClipboardLane>,
+    /// Per-space live document-session lists (folded from
+    /// `state/collab/document-sessions/<space>`).
+    document_sessions: HashMap<SpaceId, DocumentSessions>,
+    /// The local seat's durable read position for each space. Cursors are
+    /// compared with the activity HLC, so a restart does not turn retained
+    /// history into a new unread storm.
+    read_cursors: HashMap<SpaceId, mde_collab_types::ActorClock>,
     /// The last fold time; the poll self-throttles to [`REFRESH`].
     last_poll: Option<Instant>,
 }
@@ -108,7 +139,15 @@ impl LiveCollabData {
             directory: SpaceDirectory::default(),
             activity: HashMap::new(),
             conversations: HashMap::new(),
+            threads: HashMap::new(),
+            thread_roots: HashMap::new(),
             call_state: CallState::default(),
+            file_references: HashMap::new(),
+            transfer_jobs: None,
+            alert_inbox: None,
+            clipboard_lanes: HashMap::new(),
+            document_sessions: HashMap::new(),
+            read_cursors: HashMap::new(),
             last_poll: None,
         }
     }
@@ -134,16 +173,30 @@ impl LiveCollabData {
             self.directory = SpaceDirectory::default();
             self.activity.clear();
             self.conversations.clear();
+            self.threads.clear();
+            self.thread_roots.clear();
             self.call_state = CallState::default();
+            self.file_references.clear();
+            self.transfer_jobs = None;
+            self.alert_inbox = None;
+            self.clipboard_lanes.clear();
+            self.document_sessions.clear();
+            self.read_cursors.clear();
             return;
         };
 
         self.directory =
             read_state(&persist, &topics::state_topic(proj::SPACE_DIRECTORY)).unwrap_or_default();
+        self.read_cursors = read_state(&persist, LOCAL_READ_CURSORS_TOPIC).unwrap_or_default();
 
         let mut activity = HashMap::new();
         let mut conversations = HashMap::new();
+        let mut threads = HashMap::new();
+        let mut thread_roots = HashMap::new();
         let mut call_state = CallState::default();
+        let mut file_references = HashMap::new();
+        let mut clipboard_lanes = HashMap::new();
+        let mut document_sessions = HashMap::new();
         for summary in &self.directory.spaces {
             let space = summary.id;
             if let Some(feed) = read_state::<ActivityFeed>(
@@ -158,6 +211,31 @@ impl LiveCollabData {
             ) {
                 conversations.insert(space, convo);
             }
+            if let Some(thread) = read_state::<ThreadTimeline>(
+                &persist,
+                &topics::space_state_topic(proj::THREAD, space),
+            ) {
+                thread_roots.insert((thread.space, thread.root.event_id), thread.thread);
+                threads.insert(thread.thread, thread);
+            }
+            if let Some(files) = read_state::<FileReferences>(
+                &persist,
+                &topics::space_state_topic(proj::FILE_REFERENCES, space),
+            ) {
+                file_references.insert(space, files);
+            }
+            if let Some(clipboard) = read_state::<ClipboardLane>(
+                &persist,
+                &topics::space_state_topic(proj::CLIPBOARD_LANE, space),
+            ) {
+                clipboard_lanes.insert(space, clipboard);
+            }
+            if let Some(sessions) = read_state::<DocumentSessions>(
+                &persist,
+                &topics::space_state_topic(proj::DOCUMENT_SESSIONS, space),
+            ) {
+                document_sessions.insert(space, sessions);
+            }
             if let Some(calls) = read_state::<CallState>(
                 &persist,
                 &topics::space_state_topic(proj::CALL_STATE, space),
@@ -167,9 +245,85 @@ impl LiveCollabData {
                 call_state.active.extend(calls.active);
             }
         }
+        for summary in &mut self.directory.spaces {
+            let cursor = self
+                .read_cursors
+                .get(&summary.id)
+                .copied()
+                .unwrap_or_default();
+            summary.unread = activity
+                .get(&Some(summary.id))
+                .map(|feed| {
+                    feed.entries
+                        .iter()
+                        .filter(|entry| entry.clock > cursor)
+                        .count()
+                        .min(u32::MAX as usize) as u32
+                })
+                .unwrap_or(0);
+        }
+        let transfer_jobs =
+            read_state::<TransferJobs>(&persist, &topics::state_topic(proj::TRANSFER_JOBS));
+        let alert_inbox =
+            read_state::<AlertInbox>(&persist, &topics::state_topic(proj::ALERT_INBOX));
         self.activity = activity;
         self.conversations = conversations;
+        self.threads = threads;
+        self.thread_roots = thread_roots;
         self.call_state = call_state;
+        self.file_references = file_references;
+        self.transfer_jobs = transfer_jobs;
+        self.alert_inbox = alert_inbox;
+        self.clipboard_lanes = clipboard_lanes;
+        self.document_sessions = document_sessions;
+    }
+
+    /// Advance a seat-local cursor to the newest activity currently visible in
+    /// `space`. A failed write leaves the in-memory cursor unchanged, so the
+    /// badge remains honest and the next render can retry the persistence.
+    fn mark_space_read(&mut self, space: SpaceId) {
+        let Some(latest) = self
+            .activity
+            .get(&Some(space))
+            .and_then(|feed| feed.entries.iter().map(|entry| entry.clock).max())
+        else {
+            return;
+        };
+        if self
+            .read_cursors
+            .get(&space)
+            .is_some_and(|cursor| *cursor >= latest)
+        {
+            return;
+        }
+
+        let mut next = self.read_cursors.clone();
+        next.insert(space, latest);
+        let Ok(body) = serde_json::to_string(&next) else {
+            tracing::debug!(target: "shell::communications", "failed to encode local read cursors");
+            return;
+        };
+        let Some(persist) = self.reader.open() else {
+            return;
+        };
+        if let Err(error) = persist.write(
+            LOCAL_READ_CURSORS_TOPIC,
+            Priority::Default,
+            None,
+            Some(&body),
+        ) {
+            tracing::debug!(
+                target: "shell::communications",
+                %error,
+                "failed to persist local collaboration read cursor",
+            );
+            return;
+        }
+
+        self.read_cursors = next;
+        if let Some(summary) = self.directory.spaces.iter_mut().find(|s| s.id == space) {
+            summary.unread = 0;
+        }
     }
 }
 
@@ -194,14 +348,38 @@ impl CollabData for LiveCollabData {
         self.conversations.get(&space)
     }
 
-    fn thread(&self, _space: SpaceId, _thread: ThreadId) -> Option<&ThreadTimeline> {
-        // The collab worker does not (yet) republish per-thread timelines; the
-        // surface's "N replies" affordance stays closed honestly until it does.
-        None
+    fn thread(&self, space: SpaceId, thread: ThreadId) -> Option<&ThreadTimeline> {
+        self.threads
+            .get(&thread)
+            .filter(|timeline| timeline.space == space)
+    }
+
+    fn thread_for_root(&self, space: SpaceId, root: EventId) -> Option<ThreadId> {
+        self.thread_roots.get(&(space, root)).copied()
     }
 
     fn call_state(&self) -> &CallState {
         &self.call_state
+    }
+
+    fn file_references(&self, space: SpaceId) -> Option<&FileReferences> {
+        self.file_references.get(&space)
+    }
+
+    fn transfer_jobs(&self) -> Option<&TransferJobs> {
+        self.transfer_jobs.as_ref()
+    }
+
+    fn alert_inbox(&self) -> Option<&AlertInbox> {
+        self.alert_inbox.as_ref()
+    }
+
+    fn clipboard_lane(&self, space: SpaceId) -> Option<&ClipboardLane> {
+        self.clipboard_lanes.get(&space)
+    }
+
+    fn document_sessions(&self, space: SpaceId) -> Option<&DocumentSessions> {
+        self.document_sessions.get(&space)
     }
 }
 
@@ -249,6 +427,9 @@ impl CommunicationsState {
     pub(crate) fn show(&mut self, ui: &mut egui::Ui) {
         let mut sink = CommandSink::new();
         self.surface.ui(ui, &self.data, &mut sink);
+        if let Some(space) = self.surface.selected_space() {
+            self.data.mark_space_read(space);
+        }
         drain_to_bus(&mut sink, self.bus_root.as_deref());
     }
 }
@@ -281,12 +462,21 @@ fn publish_command(
     let Some(root) = bus_root else {
         return Err("No local Bus — the mesh daemon may be down.".to_string());
     };
-    let body =
-        serde_json::to_string(command).map_err(|e| format!("serialize collab command: {e}"))?;
+    let mut envelope =
+        serde_json::to_value(command).map_err(|e| format!("serialize collab command: {e}"))?;
+    envelope["schema_version"] = serde_json::Value::from(CLOUD_ACTION_SCHEMA_VERSION);
+    let body = serde_json::to_string(&envelope)
+        .map_err(|e| format!("serialize collab command envelope: {e}"))?;
+    let authorized = crate::iac::authorize_root_mutation_body(
+        &body,
+        "collab-command",
+        &crate::explorer::local_hostname(),
+        command.verb(),
+    )?;
     let persist = Persist::open(root.to_path_buf())
         .map_err(|e| format!("Couldn't open the local Bus: {e}"))?;
     persist
-        .write(topic, Priority::Default, None, Some(&body))
+        .write(topic, Priority::Default, None, Some(&authorized))
         .map_err(|e| format!("Bus write failed: {e}"))?;
     Ok(())
 }
@@ -335,6 +525,18 @@ mod tests {
             deleted: false,
             delivery: DeliveryState::Sent,
             reply_count: 0,
+        }
+    }
+
+    fn activity_entry(space: SpaceId, actor: &ActorId, wall_ms: u64) -> ActivityEntry {
+        ActivityEntry {
+            event_id: EventId::new(),
+            space,
+            actor: actor.clone(),
+            clock: ActorClock::at(wall_ms, 0),
+            created_unix_ms: wall_ms as i64,
+            kind_tag: "message_posted".to_owned(),
+            summary: "posted a message".to_owned(),
         }
     }
 
@@ -402,6 +604,50 @@ mod tests {
                 }],
             },
         );
+        let thread_id = ThreadId::new();
+        let thread_root = message(&peer, "thread root");
+        write_state(
+            &persist,
+            &topics::space_state_topic(proj::THREAD, ops),
+            &ThreadTimeline {
+                space: ops,
+                thread: thread_id,
+                root: thread_root.clone(),
+                replies: vec![message(&me, "thread reply")],
+                resolved: false,
+            },
+        );
+        write_state(
+            &persist,
+            &topics::space_state_topic(proj::FILE_REFERENCES, ops),
+            &FileReferences {
+                space: ops,
+                files: Vec::new(),
+            },
+        );
+        write_state(
+            &persist,
+            &topics::space_state_topic(proj::CLIPBOARD_LANE, ops),
+            &ClipboardLane {
+                space: ops,
+                items: Vec::new(),
+            },
+        );
+        write_state(
+            &persist,
+            &topics::space_state_topic(proj::DOCUMENT_SESSIONS, ops),
+            &DocumentSessions::default(),
+        );
+        write_state(
+            &persist,
+            &topics::state_topic(proj::TRANSFER_JOBS),
+            &TransferJobs::default(),
+        );
+        write_state(
+            &persist,
+            &topics::state_topic(proj::ALERT_INBOX),
+            &AlertInbox::default(),
+        );
 
         let mut data = LiveCollabData::new(Some(dir.path().to_path_buf()));
         data.refresh();
@@ -425,6 +671,20 @@ mod tests {
         // Per-space call-state aggregated into the one call-bar read model.
         assert_eq!(data.call_state().active.len(), 1, "call-state aggregated");
         assert_eq!(data.call_state().active[0].space, ops);
+
+        let thread = data.thread(ops, thread_id).expect("thread folded");
+        assert_eq!(thread.root.event_id, thread_root.event_id);
+        assert_eq!(thread.replies.len(), 1);
+        assert_eq!(
+            data.thread_for_root(ops, thread_root.event_id),
+            Some(thread_id),
+            "thread root lookup folded"
+        );
+        assert!(data.file_references(ops).is_some(), "files folded");
+        assert!(data.transfer_jobs().is_some(), "transfers folded");
+        assert!(data.alert_inbox().is_some(), "alerts folded");
+        assert!(data.clipboard_lane(ops).is_some(), "clipboard folded");
+        assert!(data.document_sessions(ops).is_some(), "documents folded");
     }
 
     #[test]
@@ -436,6 +696,68 @@ mod tests {
         assert!(data.space_directory().spaces.is_empty());
         assert!(data.activity(None).is_none());
         assert!(data.call_state().active.is_empty());
+        assert!(data.thread(SpaceId::new(), ThreadId::new()).is_none());
+        assert!(data.transfer_jobs().is_none());
+        assert!(data.alert_inbox().is_none());
+    }
+
+    #[test]
+    fn read_cursors_drive_unread_badges_and_survive_reload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let persist = persist_at(dir.path());
+        let space = SpaceId::new();
+        let peer = ActorId::new("falcon");
+        let feed = |entries| ActivityFeed {
+            space: Some(space),
+            entries,
+        };
+
+        write_state(
+            &persist,
+            &topics::state_topic(proj::SPACE_DIRECTORY),
+            &SpaceDirectory {
+                spaces: vec![space_summary(space, "Team Ops")],
+            },
+        );
+        write_state(
+            &persist,
+            &topics::space_state_topic(proj::ACTIVITY, space),
+            &feed(vec![
+                activity_entry(space, &peer, 1_000),
+                activity_entry(space, &peer, 1_001),
+            ]),
+        );
+
+        let mut data = LiveCollabData::new(Some(dir.path().to_path_buf()));
+        data.refresh();
+        assert_eq!(data.space_directory().spaces[0].unread, 2);
+
+        data.mark_space_read(space);
+        assert_eq!(data.space_directory().spaces[0].unread, 0);
+
+        let mut reloaded = LiveCollabData::new(Some(dir.path().to_path_buf()));
+        reloaded.refresh();
+        assert_eq!(
+            reloaded.space_directory().spaces[0].unread,
+            0,
+            "the seat-local cursor is durable across a shell reload"
+        );
+
+        write_state(
+            &persist,
+            &topics::space_state_topic(proj::ACTIVITY, space),
+            &feed(vec![
+                activity_entry(space, &peer, 1_000),
+                activity_entry(space, &peer, 1_001),
+                activity_entry(space, &peer, 1_002),
+            ]),
+        );
+        reloaded.refresh();
+        assert_eq!(
+            reloaded.space_directory().spaces[0].unread,
+            1,
+            "only activity after the stored cursor is unread"
+        );
     }
 
     #[test]
@@ -464,9 +786,23 @@ mod tests {
             .read_latest(&topic)
             .expect("read command")
             .expect("command published");
-        let back: CollabCommand =
+        let envelope: serde_json::Value =
             serde_json::from_str(published.body.as_deref().expect("command body"))
-                .expect("decode command");
+                .expect("decode command envelope");
+        assert_eq!(envelope["schema_version"], 1);
+        assert!(
+            envelope["armed_token"].as_str().is_some(),
+            "mutable collab commands carry the root capability"
+        );
+        let mut command_value: serde_json::Value =
+            serde_json::from_str(published.body.as_deref().expect("command body"))
+                .expect("decode command envelope");
+        let object = command_value
+            .as_object_mut()
+            .expect("command envelope object");
+        object.remove("armed_token");
+        object.remove("schema_version");
+        let back: CollabCommand = serde_json::from_value(command_value).expect("decode command");
         assert_eq!(
             back,
             CollabCommand::SendMessage {

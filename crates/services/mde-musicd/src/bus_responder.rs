@@ -27,6 +27,453 @@ use crate::airsonic::Client;
 use crate::creds;
 use crate::engine::{Engine, SourceCodec};
 
+/// Shared `ipc/action_auth` wire contract for the music responder.
+///
+/// `mde-musicd` is a user-service crate and intentionally does not depend on
+/// the root `mackesd` binary crate. Keep this verifier byte-compatible with
+/// `mackesd::ipc::action_auth`: schema v1, the canonical request digest, the
+/// v2 armed-token format, a 30-second maximum lifetime, and a durable
+/// host-local nonce claim. Missing credentials fail closed.
+mod music_action_auth {
+    use std::path::{Path, PathBuf};
+
+    use serde_json::Value;
+
+    pub(super) const SCHEMA_VERSION: u64 = 1;
+    const MAX_TTL_MS: i64 = 30_000;
+    const NONCE_MIN_LEN: usize = 8;
+    const CREDENTIAL_NAME: &str = "cloud-arm-key";
+    const DEFAULT_AUTH_ROOT: &str = "/var/lib/mackesd/cloud-auth";
+
+    #[derive(Debug, Clone)]
+    struct ArmedToken {
+        nonce: String,
+        expires_at_ms: i64,
+        verb: String,
+        node: String,
+        target: String,
+        request_sha256: String,
+        signature: String,
+    }
+
+    impl ArmedToken {
+        fn parse(raw: &str) -> Option<Self> {
+            let parts: Vec<&str> = raw.trim().split('|').collect();
+            if parts.len() != 8 || parts[0] != "v2" {
+                return None;
+            }
+            Some(Self {
+                nonce: parts[1].to_string(),
+                expires_at_ms: parts[2].parse().ok()?,
+                verb: parts[3].to_string(),
+                node: parts[4].to_string(),
+                target: parts[5].to_string(),
+                request_sha256: parts[6].to_string(),
+                signature: parts[7].to_string(),
+            })
+        }
+
+        fn signing_payload(&self) -> String {
+            format!(
+                "v2|{}|{}|{}|{}|{}|{}",
+                self.nonce,
+                self.expires_at_ms,
+                self.verb,
+                self.node,
+                self.target,
+                self.request_sha256
+            )
+        }
+    }
+
+    pub(super) struct Authorizer {
+        key: Option<Vec<u8>>,
+        auth_root: PathBuf,
+        test_now_ms: Option<i64>,
+    }
+
+    impl std::fmt::Debug for Authorizer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("Authorizer")
+                .field("auth_root", &self.auth_root)
+                .field("has_key", &self.key.is_some())
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl Authorizer {
+        pub(super) fn production() -> Self {
+            let key = load_production_key().ok();
+            if key.is_none() {
+                tracing::error!(
+                    target: "mde_musicd::action_auth",
+                    "music mutation authorization unavailable; mutations are disabled"
+                );
+            }
+            Self {
+                key,
+                auth_root: PathBuf::from(DEFAULT_AUTH_ROOT),
+                test_now_ms: None,
+            }
+        }
+
+        #[cfg(test)]
+        pub(super) fn for_test(key: &[u8], auth_root: PathBuf, now_ms: i64) -> Self {
+            Self {
+                key: Some(key.to_vec()),
+                auth_root,
+                test_now_ms: Some(now_ms),
+            }
+        }
+
+        fn now_ms(&self) -> i64 {
+            self.test_now_ms
+                .unwrap_or_else(|| i64::try_from(crate::state::now_ms()).unwrap_or(i64::MAX))
+        }
+
+        pub(super) fn authorize(
+            &self,
+            body: &str,
+            verb: &str,
+            node: &str,
+            target: &str,
+        ) -> Result<(), String> {
+            if body.len() > 64 * 1024 {
+                return Err("request body exceeds the 64 KiB cap".to_string());
+            }
+            let envelope: Value = serde_json::from_str(body)
+                .map_err(|_| "request body is not a JSON object".to_string())?;
+            let object = envelope
+                .as_object()
+                .ok_or_else(|| "request body is not a JSON object".to_string())?;
+            if object.get("schema_version").and_then(Value::as_u64) != Some(SCHEMA_VERSION) {
+                return Err(format!(
+                    "privileged action requires schema_version {SCHEMA_VERSION}"
+                ));
+            }
+            let raw_token = object
+                .get("armed_token")
+                .and_then(Value::as_str)
+                .filter(|token| !token.trim().is_empty())
+                .ok_or_else(|| "no armed token supplied".to_string())?;
+            let key = self
+                .key
+                .as_deref()
+                .ok_or_else(|| "music arming credential is unavailable".to_string())?;
+            let token = ArmedToken::parse(raw_token)
+                .ok_or_else(|| "armed token is malformed".to_string())?;
+            if token.nonce.len() < NONCE_MIN_LEN {
+                return Err("armed token is malformed".to_string());
+            }
+            if token.verb != verb || token.node != node || token.target != target {
+                return Err("armed token does not authorize this verb/node/target".to_string());
+            }
+            let request_sha256 = request_digest(body)?;
+            if token.request_sha256 != request_sha256 {
+                return Err("armed token does not authorize this request body".to_string());
+            }
+            let now_ms = self.now_ms();
+            if now_ms > token.expires_at_ms {
+                return Err("armed token has expired".to_string());
+            }
+            if token.expires_at_ms > now_ms.saturating_add(MAX_TTL_MS) {
+                return Err("armed token exceeds the 30-second lifetime".to_string());
+            }
+            let expected = hmac_sha256_hex(key, token.signing_payload().as_bytes());
+            if !constant_time_eq(expected.as_bytes(), token.signature.as_bytes()) {
+                return Err("armed token signature did not verify".to_string());
+            }
+            match claim_nonce(&self.auth_root, &token.nonce, token.expires_at_ms, now_ms)? {
+                true => Ok(()),
+                false => Err("armed token was already used".to_string()),
+            }
+        }
+    }
+
+    fn load_production_key() -> Result<Vec<u8>, String> {
+        let directory = std::env::var_os("CREDENTIALS_DIRECTORY")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .ok_or_else(|| "systemd action credential is unavailable".to_string())?;
+        let raw = std::fs::read(directory.join(CREDENTIAL_NAME))
+            .map_err(|error| format!("read systemd action credential: {error}"))?;
+        let text = std::str::from_utf8(&raw)
+            .map_err(|_| "cloud arming credential is not UTF-8".to_string())?
+            .trim();
+        let key = decode_hex(text).ok_or_else(|| {
+            "cloud arming credential must encode exactly 32 hexadecimal bytes".to_string()
+        })?;
+        if key.len() != 32 {
+            return Err("cloud arming credential must encode exactly 32 bytes".to_string());
+        }
+        Ok(key)
+    }
+
+    fn request_digest(raw: &str) -> Result<String, String> {
+        let mut value: Value =
+            serde_json::from_str(raw).map_err(|_| "request body is not valid JSON".to_string())?;
+        value
+            .as_object_mut()
+            .ok_or_else(|| "request body JSON root is not an object".to_string())?
+            .remove("armed_token");
+        let mut canonical = String::new();
+        write_canonical_json(&value, &mut canonical)?;
+        Ok(hex_encode(&sha256(canonical.as_bytes())))
+    }
+
+    fn write_canonical_json(value: &Value, output: &mut String) -> Result<(), String> {
+        match value {
+            Value::Null => output.push_str("null"),
+            Value::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
+            Value::Number(value) => output.push_str(&value.to_string()),
+            Value::String(value) => output.push_str(
+                &serde_json::to_string(value)
+                    .map_err(|_| "request string cannot serialize".to_string())?,
+            ),
+            Value::Array(values) => {
+                output.push('[');
+                for (index, value) in values.iter().enumerate() {
+                    if index > 0 {
+                        output.push(',');
+                    }
+                    write_canonical_json(value, output)?;
+                }
+                output.push(']');
+            }
+            Value::Object(values) => {
+                let mut entries: Vec<_> = values.iter().collect();
+                entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+                output.push('{');
+                for (index, (key, value)) in entries.into_iter().enumerate() {
+                    if index > 0 {
+                        output.push(',');
+                    }
+                    output.push_str(
+                        &serde_json::to_string(key)
+                            .map_err(|_| "request key cannot serialize".to_string())?,
+                    );
+                    output.push(':');
+                    write_canonical_json(value, output)?;
+                }
+                output.push('}');
+            }
+        }
+        Ok(())
+    }
+
+    fn claim_nonce(
+        root: &Path,
+        nonce: &str,
+        expires_at_ms: i64,
+        now_ms: i64,
+    ) -> Result<bool, String> {
+        use std::io::Write as _;
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+        let dir = root.join("spent-nonces");
+        std::fs::create_dir_all(&dir)
+            .map_err(|error| format!("create armed-token replay store: {error}"))?;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("secure armed-token replay store: {error}"))?;
+        for entry in std::fs::read_dir(&dir)
+            .map_err(|error| format!("read armed-token replay store: {error}"))?
+        {
+            let Ok(entry) = entry else { continue };
+            if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+                continue;
+            }
+            let expired = std::fs::read_to_string(entry.path())
+                .ok()
+                .and_then(|value| value.trim().parse::<i64>().ok())
+                .is_some_and(|expiry| expiry < now_ms);
+            if expired {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+        let path = dir.join(hex_encode(&sha256(nonce.as_bytes())));
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+            Err(error) => return Err(format!("claim armed-token nonce: {error}")),
+        };
+        file.write_all(expires_at_ms.to_string().as_bytes())
+            .and_then(|()| file.sync_all())
+            .map_err(|error| format!("persist armed-token nonce: {error}"))?;
+        std::fs::File::open(&dir)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("sync armed-token replay store: {error}"))?;
+        Ok(true)
+    }
+
+    fn hmac_sha256_hex(key: &[u8], payload: &[u8]) -> String {
+        let mut padded = [0_u8; 64];
+        if key.len() > 64 {
+            padded[..32].copy_from_slice(&sha256(key));
+        } else {
+            padded[..key.len()].copy_from_slice(key);
+        }
+        let mut inner = Vec::with_capacity(64 + payload.len());
+        let mut outer = Vec::with_capacity(64 + 32);
+        for byte in &padded {
+            inner.push(*byte ^ 0x36);
+            outer.push(*byte ^ 0x5c);
+        }
+        inner.extend_from_slice(payload);
+        outer.extend_from_slice(&sha256(&inner));
+        hex_encode(&sha256(&outer))
+    }
+
+    fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+        if left.len() != right.len() {
+            return false;
+        }
+        let mut difference = 0_u8;
+        for (left, right) in left.iter().zip(right) {
+            difference |= left ^ right;
+        }
+        difference == 0
+    }
+
+    fn decode_hex(text: &str) -> Option<Vec<u8>> {
+        if text.len() % 2 != 0 {
+            return None;
+        }
+        let bytes = text.as_bytes();
+        let mut decoded = Vec::with_capacity(bytes.len() / 2);
+        for pair in bytes.chunks_exact(2) {
+            let high = hex_value(pair[0])?;
+            let low = hex_value(pair[1])?;
+            decoded.push((high << 4) | low);
+        }
+        Some(decoded)
+    }
+
+    fn hex_value(value: u8) -> Option<u8> {
+        match value {
+            b'0'..=b'9' => Some(value - b'0'),
+            b'a'..=b'f' => Some(value - b'a' + 10),
+            b'A'..=b'F' => Some(value - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    fn hex_encode(bytes: &[u8]) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut output = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            output.push(HEX[(byte >> 4) as usize] as char);
+            output.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        output
+    }
+
+    fn sha256(input: &[u8]) -> [u8; 32] {
+        const K: [u32; 64] = [
+            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+            0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+            0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+            0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+            0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+            0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+            0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+            0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+            0xc67178f2,
+        ];
+        let mut message = input.to_vec();
+        let bit_len = (message.len() as u64).saturating_mul(8);
+        message.push(0x80);
+        while message.len() % 64 != 56 {
+            message.push(0);
+        }
+        message.extend_from_slice(&bit_len.to_be_bytes());
+        let mut state = [
+            0x6a09e667_u32,
+            0xbb67ae85,
+            0x3c6ef372,
+            0xa54ff53a,
+            0x510e527f,
+            0x9b05688c,
+            0x1f83d9ab,
+            0x5be0cd19,
+        ];
+        for chunk in message.chunks_exact(64) {
+            let mut words = [0_u32; 64];
+            for (index, word) in words[..16].iter_mut().enumerate() {
+                let offset = index * 4;
+                *word = u32::from_be_bytes([
+                    chunk[offset],
+                    chunk[offset + 1],
+                    chunk[offset + 2],
+                    chunk[offset + 3],
+                ]);
+            }
+            for index in 16..64 {
+                let s0 = words[index - 15].rotate_right(7)
+                    ^ words[index - 15].rotate_right(18)
+                    ^ (words[index - 15] >> 3);
+                let s1 = words[index - 2].rotate_right(17)
+                    ^ words[index - 2].rotate_right(19)
+                    ^ (words[index - 2] >> 10);
+                words[index] = words[index - 16]
+                    .wrapping_add(s0)
+                    .wrapping_add(words[index - 7])
+                    .wrapping_add(s1);
+            }
+            let mut working = state;
+            for index in 0..64 {
+                let s1 = working[4].rotate_right(6)
+                    ^ working[4].rotate_right(11)
+                    ^ working[4].rotate_right(25);
+                let choose = (working[4] & working[5]) ^ ((!working[4]) & working[6]);
+                let temp1 = working[7]
+                    .wrapping_add(s1)
+                    .wrapping_add(choose)
+                    .wrapping_add(K[index])
+                    .wrapping_add(words[index]);
+                let s0 = working[0].rotate_right(2)
+                    ^ working[0].rotate_right(13)
+                    ^ working[0].rotate_right(22);
+                let majority = (working[0] & working[1])
+                    ^ (working[0] & working[2])
+                    ^ (working[1] & working[2]);
+                let temp2 = s0.wrapping_add(majority);
+                working[7] = working[6];
+                working[6] = working[5];
+                working[5] = working[4];
+                working[4] = working[3].wrapping_add(temp1);
+                working[3] = working[2];
+                working[2] = working[1];
+                working[1] = working[0];
+                working[0] = temp1.wrapping_add(temp2);
+            }
+            for (slot, value) in state.iter_mut().zip(working) {
+                *slot = slot.wrapping_add(value);
+            }
+        }
+        let mut output = [0_u8; 32];
+        for (index, word) in state.iter().enumerate() {
+            output[index * 4..index * 4 + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        output
+    }
+
+    #[cfg(test)]
+    pub(super) fn request_digest_for_test(raw: &str) -> String {
+        request_digest(raw).expect("test body is canonical JSON")
+    }
+
+    #[cfg(test)]
+    pub(super) fn sign_for_test(key: &[u8], payload: &str) -> String {
+        hmac_sha256_hex(key, payload.as_bytes())
+    }
+}
+
 /// MUSIC-RESPONSIVE-7 — short-TTL cache of the Internet-radio station list so
 /// only the first `list-radio` open pays the upstream round-trip (the saved
 /// station list rarely changes). 5-minute TTL; in-process (per daemon).
@@ -617,6 +1064,44 @@ fn dispatch_browse(
     }
 }
 
+/// Closed mutation contexts for the music action surface. The verb is exact;
+/// the target is a stable capability scope, so a queue token cannot authorize
+/// transport, playlist, or peer-takeover effects.
+fn music_mutation_scope(verb: &str) -> Option<&'static str> {
+    match verb {
+        "enqueue" | "enqueue-after" | "clear" | "next" | "prev" | "queue-move" | "queue-remove"
+        | "queue-remove-many" | "queue-move-to-next" => Some("queue"),
+        "playlist-create" | "playlist-update" | "playlist-delete" | "playlist-reorder" => {
+            Some("playlists")
+        }
+        "play" | "pause" | "resume" | "stop" | "set-volume" | "seek" => Some("transport"),
+        "take-over" => Some("peer-takeover"),
+        // `get-queue`, browse, `get-state`, and `peer-states` are reads.
+        _ => None,
+    }
+}
+
+fn authorize_music_mutation(
+    authorizer: &music_action_auth::Authorizer,
+    verb: &str,
+    body: &str,
+) -> Result<(), String> {
+    let Some(target) = music_mutation_scope(verb) else {
+        return Ok(());
+    };
+    let auth_verb = format!("music-{verb}");
+    let node = state::local_host();
+    authorizer.authorize(body, &auth_verb, &node, target)
+}
+
+fn unauthorized_reply(verb: &str, error: &str) -> String {
+    json!({
+        "ok": false,
+        "error": format!("{verb}: authorization refused: {error}")
+    })
+    .to_string()
+}
+
 /// One browse-poll sweep: for each browse verb, dispatch new requests
 /// against the shared Airsonic client. A missing-creds state (`client: None`)
 /// replies with an error (the GUI prompts the operator to connect).
@@ -631,6 +1116,17 @@ pub fn poll_browse(
     cursors: &mut HashMap<String, String>,
     client: Option<&Client>,
 ) {
+    let authorizer = music_action_auth::Authorizer::production();
+    poll_browse_with_authorizer(persist, rt, cursors, client, &authorizer);
+}
+
+fn poll_browse_with_authorizer(
+    persist: &Persist,
+    rt: &tokio::runtime::Runtime,
+    cursors: &mut HashMap<String, String>,
+    client: Option<&Client>,
+    authorizer: &music_action_auth::Authorizer,
+) {
     for verb in BROWSE_VERBS {
         let topic = format!("action/music/{verb}");
         let since = cursors.get(&topic).map(String::as_str);
@@ -640,11 +1136,15 @@ pub fn poll_browse(
         };
         for msg in msgs {
             cursors.insert(topic.clone(), msg.ulid.clone());
-            let reply = match client {
-                Some(c) => dispatch_browse(verb, msg.body.as_deref().unwrap_or(""), c, rt),
-                None => {
-                    json!({ "ok": false, "error": "no Airsonic server configured" }).to_string()
-                }
+            let body = msg.body.as_deref().unwrap_or("");
+            let reply = match authorize_music_mutation(authorizer, verb, body) {
+                Err(error) => unauthorized_reply(verb, &error),
+                Ok(()) => match client {
+                    Some(c) => dispatch_browse(verb, body, c, rt),
+                    None => {
+                        json!({ "ok": false, "error": "no Airsonic server configured" }).to_string()
+                    }
+                },
             };
             let _ = persist.write(
                 &reply_topic(&msg.ulid),
@@ -864,6 +1364,18 @@ pub fn poll_transport(
     cursors: &mut HashMap<String, String>,
     client: Option<&Client>,
 ) {
+    let authorizer = music_action_auth::Authorizer::production();
+    poll_transport_with_authorizer(persist, queue_path, engine, cursors, client, &authorizer);
+}
+
+fn poll_transport_with_authorizer(
+    persist: &Persist,
+    queue_path: &Path,
+    engine: Option<&Engine>,
+    cursors: &mut HashMap<String, String>,
+    client: Option<&Client>,
+    authorizer: &music_action_auth::Authorizer,
+) {
     let queue = queue::read_from(queue_path);
     for verb in TRANSPORT_VERBS {
         let topic = format!("action/music/{verb}");
@@ -874,13 +1386,11 @@ pub fn poll_transport(
         };
         for msg in msgs {
             cursors.insert(topic.clone(), msg.ulid.clone());
-            let reply = apply_transport(
-                verb,
-                msg.body.as_deref().unwrap_or(""),
-                engine,
-                client,
-                &queue,
-            );
+            let body = msg.body.as_deref().unwrap_or("");
+            let reply = match authorize_music_mutation(authorizer, verb, body) {
+                Err(error) => unauthorized_reply(verb, &error),
+                Ok(()) => apply_transport(verb, body, engine, client, &queue),
+            };
             let _ = persist.write(
                 &reply_topic(&msg.ulid),
                 Priority::Default,
@@ -1049,6 +1559,7 @@ pub fn serve<F: Fn() -> bool>(bus_root: PathBuf, queue_path: &Path, should_stop:
             }
         }
     }
+    let authorizer = music_action_auth::Authorizer::production();
     while !should_stop() {
         if engine.is_none() && last_audio_retry.elapsed() >= AUDIO_RETRY_INTERVAL {
             last_audio_retry = Instant::now();
@@ -1077,7 +1588,7 @@ pub fn serve<F: Fn() -> bool>(bus_root: PathBuf, queue_path: &Path, should_stop:
         // get-state is answered within POLL_INTERVAL of the request regardless
         // of browse latency. (The Airsonic client also has connect/total
         // timeouts now so browse itself can't hang forever.)
-        poll_once(&persist, queue_path, &mut cursors);
+        poll_once_with_authorizer(&persist, queue_path, &mut cursors, &authorizer);
         // AIR-2.c — advance the persisted queue cursor to the audible track as
         // gapless playback crosses boundaries, BEFORE poll_transport so a
         // get-state in this same sweep reports the song you actually hear.
@@ -1085,9 +1596,16 @@ pub fn serve<F: Fn() -> bool>(bus_root: PathBuf, queue_path: &Path, should_stop:
         // MUSIC-RESPONSIVE-10 — refresh the shared client once per sweep (cheap;
         // rebuilds only on a creds change) and hand it to both network pollers.
         let client = refresh_airsonic_client(&mut airsonic);
-        poll_transport(&persist, queue_path, engine.as_ref(), &mut cursors, client);
-        poll_peers(&persist, &mut cursors);
-        poll_browse(&persist, &rt, &mut cursors, client);
+        poll_transport_with_authorizer(
+            &persist,
+            queue_path,
+            engine.as_ref(),
+            &mut cursors,
+            client,
+            &authorizer,
+        );
+        poll_peers_with_authorizer(&persist, &mut cursors, &authorizer);
+        poll_browse_with_authorizer(&persist, &rt, &mut cursors, client, &authorizer);
         if last_state_write.elapsed() >= STATE_WRITE_INTERVAL {
             write_periodic_state(engine.as_ref(), queue_path);
             last_state_write = Instant::now();
@@ -1120,6 +1638,15 @@ pub fn seed_cursors_at_tail(persist: &Persist) -> HashMap<String, String> {
 /// One poll sweep over the AIR-15.b.5 peer verbs (`peer-states`,
 /// `take-over`) — reads/writes the AIR-8 state dir, replies on reply/<ulid>.
 pub fn poll_peers(persist: &Persist, cursors: &mut HashMap<String, String>) {
+    let authorizer = music_action_auth::Authorizer::production();
+    poll_peers_with_authorizer(persist, cursors, &authorizer);
+}
+
+fn poll_peers_with_authorizer(
+    persist: &Persist,
+    cursors: &mut HashMap<String, String>,
+    authorizer: &music_action_auth::Authorizer,
+) {
     let dir = state::data_dir();
     for verb in PEER_VERBS {
         let topic = format!("action/music/{verb}");
@@ -1130,7 +1657,11 @@ pub fn poll_peers(persist: &Persist, cursors: &mut HashMap<String, String>) {
         };
         for msg in msgs {
             cursors.insert(topic.clone(), msg.ulid.clone());
-            let reply = dispatch_peer(verb, msg.body.as_deref().unwrap_or(""), &dir);
+            let body = msg.body.as_deref().unwrap_or("");
+            let reply = match authorize_music_mutation(authorizer, verb, body) {
+                Err(error) => unauthorized_reply(verb, &error),
+                Ok(()) => dispatch_peer(verb, body, &dir),
+            };
             let _ = persist.write(
                 &reply_topic(&msg.ulid),
                 Priority::Default,
@@ -1144,6 +1675,16 @@ pub fn poll_peers(persist: &Persist, cursors: &mut HashMap<String, String>) {
 /// One poll sweep across the queue-control action verbs (extracted so tests
 /// can drive it deterministically without the sleep loop).
 pub fn poll_once(persist: &Persist, queue_path: &Path, cursors: &mut HashMap<String, String>) {
+    let authorizer = music_action_auth::Authorizer::production();
+    poll_once_with_authorizer(persist, queue_path, cursors, &authorizer);
+}
+
+fn poll_once_with_authorizer(
+    persist: &Persist,
+    queue_path: &Path,
+    cursors: &mut HashMap<String, String>,
+    authorizer: &music_action_auth::Authorizer,
+) {
     let mut q = queue::read_from(queue_path);
     for verb in ACTION_VERBS {
         let topic = format!("action/music/{verb}");
@@ -1154,7 +1695,11 @@ pub fn poll_once(persist: &Persist, queue_path: &Path, cursors: &mut HashMap<Str
         };
         for msg in msgs {
             cursors.insert(topic.clone(), msg.ulid.clone());
-            let d = dispatch_queue_action(verb, msg.body.as_deref().unwrap_or(""), &mut q);
+            let body = msg.body.as_deref().unwrap_or("");
+            let d = match authorize_music_mutation(authorizer, verb, body) {
+                Err(error) => error_reply(&format!("{verb}: authorization refused: {error}")),
+                Ok(()) => dispatch_queue_action(verb, body, &mut q),
+            };
             let _ = persist.write(
                 &reply_topic(&msg.ulid),
                 Priority::Default,
@@ -1171,6 +1716,106 @@ pub fn poll_once(persist: &Persist, queue_path: &Path, cursors: &mut HashMap<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const AUTH_KEY: &[u8] = b"music-action-auth-test-key";
+    const AUTH_NOW_MS: i64 = 1_700_000_000_000;
+
+    fn test_authorizer(root: &Path) -> music_action_auth::Authorizer {
+        music_action_auth::Authorizer::for_test(AUTH_KEY, root.join("auth"), AUTH_NOW_MS)
+    }
+
+    fn armed_test_body(unsigned: &str, verb: &str, target: &str, nonce: &str) -> String {
+        let node = state::local_host();
+        let request_sha256 = music_action_auth::request_digest_for_test(unsigned);
+        let payload = format!(
+            "v2|{nonce}|{}|music-{verb}|{node}|{target}|{request_sha256}",
+            AUTH_NOW_MS + 30_000
+        );
+        let signature = music_action_auth::sign_for_test(AUTH_KEY, &payload);
+        let token = format!("{payload}|{signature}");
+        let mut body: serde_json::Value = serde_json::from_str(unsigned).unwrap();
+        body.as_object_mut()
+            .unwrap()
+            .insert("armed_token".to_string(), serde_json::Value::String(token));
+        body.to_string()
+    }
+
+    #[test]
+    fn music_mutation_scopes_cover_every_write_and_leave_reads_open() {
+        for verb in [
+            "enqueue",
+            "enqueue-after",
+            "clear",
+            "next",
+            "prev",
+            "queue-move",
+            "queue-remove",
+            "queue-remove-many",
+            "queue-move-to-next",
+        ] {
+            assert_eq!(music_mutation_scope(verb), Some("queue"), "{verb}");
+        }
+        for verb in [
+            "playlist-create",
+            "playlist-update",
+            "playlist-delete",
+            "playlist-reorder",
+        ] {
+            assert_eq!(music_mutation_scope(verb), Some("playlists"), "{verb}");
+        }
+        for verb in ["play", "pause", "resume", "stop", "set-volume", "seek"] {
+            assert_eq!(music_mutation_scope(verb), Some("transport"), "{verb}");
+        }
+        assert_eq!(music_mutation_scope("take-over"), Some("peer-takeover"));
+        for verb in [
+            "get-queue",
+            "list-albums",
+            "get-playlist",
+            "get-state",
+            "peer-states",
+        ] {
+            assert_eq!(
+                music_mutation_scope(verb),
+                None,
+                "{verb} must stay read-only"
+            );
+        }
+    }
+
+    #[test]
+    fn music_action_auth_rejects_hostile_accepts_authorized_and_replays_once() {
+        let root = tempfile::tempdir().unwrap();
+        let authorizer = test_authorizer(root.path());
+        let verb = "enqueue";
+        let target = "queue";
+        let unsigned = r#"{"schema_version":1,"song_id":"track-a"}"#;
+        let node = state::local_host();
+
+        assert!(authorizer
+            .authorize(unsigned, "music-enqueue", &node, target)
+            .is_err());
+
+        let armed = armed_test_body(unsigned, verb, target, "music-nonce-hostile");
+        let tampered = armed.replace("track-a", "track-b");
+        assert!(authorizer
+            .authorize(&tampered, "music-enqueue", &node, target)
+            .is_err());
+        assert!(authorizer
+            .authorize(&armed, "music-enqueue", &node, target)
+            .is_ok());
+        assert!(authorizer
+            .authorize(&armed, "music-enqueue", &node, target)
+            .unwrap_err()
+            .contains("already used"));
+    }
+
+    #[test]
+    fn music_action_auth_hmac_matches_sha256_test_vector() {
+        assert_eq!(
+            music_action_auth::sign_for_test(b"key", "The quick brown fox jumps over the lazy dog"),
+            "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
+        );
+    }
 
     #[test]
     fn airsonic_creds_changed_detects_first_build_and_changes() {
@@ -1341,30 +1986,43 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let persist = Persist::open(dir.path().join("bus")).unwrap();
         let queue_path = dir.path().join("queue.json");
+        let authorizer = test_authorizer(dir.path());
         // A stale enqueue sits in the backlog from "before the restart".
+        let stale = armed_test_body(
+            r#"{"schema_version":1,"song_id":"stale"}"#,
+            "enqueue",
+            "queue",
+            "music-nonce-stale",
+        );
         persist
             .write(
                 "action/music/enqueue",
                 Priority::Default,
                 None,
-                Some(r#"{"song_id":"stale"}"#),
+                Some(&stale),
             )
             .unwrap();
         // Seed cursors at the tail (simulating daemon startup), then poll.
         let mut cursors = seed_cursors_at_tail(&persist);
-        poll_once(&persist, &queue_path, &mut cursors);
+        poll_once_with_authorizer(&persist, &queue_path, &mut cursors, &authorizer);
         // The stale request is NOT replayed — the queue stays empty.
         assert!(queue::read_from(&queue_path).songs.is_empty());
         // A NEW request after seeding IS handled.
+        let fresh_body = armed_test_body(
+            r#"{"schema_version":1,"song_id":"fresh"}"#,
+            "enqueue",
+            "queue",
+            "music-nonce-fresh",
+        );
         let fresh = persist
             .write(
                 "action/music/enqueue",
                 Priority::Default,
                 None,
-                Some(r#"{"song_id":"fresh"}"#),
+                Some(&fresh_body),
             )
             .unwrap();
-        poll_once(&persist, &queue_path, &mut cursors);
+        poll_once_with_authorizer(&persist, &queue_path, &mut cursors, &authorizer);
         assert_eq!(queue::read_from(&queue_path).songs, vec!["fresh"]);
         assert!(persist
             .list_since(&reply_topic(&fresh.ulid), None)
@@ -1378,17 +2036,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let persist = Persist::open(dir.path().join("bus")).unwrap();
         let queue_path = dir.path().join("queue.json");
+        let authorizer = test_authorizer(dir.path());
         // A GUI publishes an enqueue request on the action topic.
+        let body = armed_test_body(
+            r#"{"schema_version":1,"song_id":"t1"}"#,
+            "enqueue",
+            "queue",
+            "music-nonce-round-trip",
+        );
         let req = persist
-            .write(
-                "action/music/enqueue",
-                Priority::Default,
-                None,
-                Some(r#"{"song_id":"t1"}"#),
-            )
+            .write("action/music/enqueue", Priority::Default, None, Some(&body))
             .unwrap();
         let mut cursors = HashMap::new();
-        poll_once(&persist, &queue_path, &mut cursors);
+        poll_once_with_authorizer(&persist, &queue_path, &mut cursors, &authorizer);
         // A reply landed on reply/<ulid> with ok:true.
         let replies = persist.list_since(&reply_topic(&req.ulid), None).unwrap();
         assert_eq!(replies.len(), 1);
@@ -1396,7 +2056,7 @@ mod tests {
         // The queue was persisted with the enqueued track.
         assert_eq!(queue::read_from(&queue_path).songs, vec!["t1"]);
         // A second poll with the advanced cursor does nothing new.
-        poll_once(&persist, &queue_path, &mut cursors);
+        poll_once_with_authorizer(&persist, &queue_path, &mut cursors, &authorizer);
         assert_eq!(
             persist
                 .list_since(&reply_topic(&req.ulid), None)

@@ -14,6 +14,6 @@
     <text x="132" y="56" font-size="45" font-weight="800" letter-spacing="0" fill="#111827">Construct</text>
     <rect x="134" y="68" width="308" height="2" fill="#111827" opacity="0.22"/>
     <text x="134" y="94" font-size="19" font-weight="600" letter-spacing="0" fill="#374151">Software Studio: MDE</text>
-    <text x="334" y="94" font-size="15" font-weight="600" letter-spacing="0" fill="#2f6fed">Release 1.0 BETA</text>
+    <text x="334" y="94" font-size="15" font-weight="600" letter-spacing="0" fill="#2f6fed">Release 12.1.0</text>
   </g>
 </svg>

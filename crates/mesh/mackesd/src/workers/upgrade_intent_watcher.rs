@@ -1,6 +1,6 @@
 //! INST-11 + INST-12 + INST-13 (v2.7) — fleet upgrade-barrier worker.
 //!
-//! Runs on **every** peer. Drives the `mde-update --coordinate
+//! Runs on **every** peer. Drives the signed `mde-update --coordinate
 //! <version>` cycle to completion without operator intervention:
 //!
 //!   * **INST-11 (watch + upgrade).** Each 5 s tick enumerates
@@ -20,13 +20,12 @@
 //!     grace-after-grace has elapsed, so the dir doesn't accumulate and
 //!     a re-coordinate of the same version works after a rollback.
 //!
-//! **Schema tolerance.** `mde-update --coordinate` (INST-10) writes a
-//! minimal intent (`target_version` + `initiated_at_ms` + an empty
-//! `ready` array). This worker operates on the file as a
-//! [`serde_json::Value`] and *normalizes* the three ack maps (`ready` /
-//! `ready_failed` / `complete`) to objects on first write — so it
-//! interoperates with the minimal writer without a cross-crate schema
-//! refactor and preserves any fields it doesn't own.
+//! **Schema tolerance.** The pure state-machine helpers continue to accept the
+//! historical minimal intent shape (`target_version` + `initiated_at_ms` + an
+//! empty `ready` array), and normalize the three ack maps (`ready` /
+//! `ready_failed` / `complete`) to objects on first write. The production file
+//! path additionally requires a root-issued, exact-body HMAC v1 capability, so
+//! unsigned legacy bytes remain inert rather than becoming package authority.
 //!
 //! Test surface: every decision is a pure function over a
 //! `serde_json::Value` (`pending_intents`, `should_act`, `mark_ready`,
@@ -43,9 +42,14 @@ use std::process::Command;
 use std::time::Duration;
 
 use fs2::FileExt;
+use mackes_mesh_types::cloud::{cloud_request_digest, CloudArmSigner, CloudArmedToken};
 use serde_json::{json, Value};
 
 use super::{ShutdownToken, Worker};
+use crate::ipc::action_auth::{
+    production_action_signer, ActionAuthorizer, MutationContext, ACTION_SCHEMA_VERSION,
+    MAX_AUTH_TTL_MS,
+};
 
 /// Tick cadence — five seconds, matching `gluster_worker` /
 /// `nebula_supervisor`.
@@ -69,6 +73,10 @@ pub const PEER_UNREACHABLE_MS: u64 = 12 * 60 * 60 * 1000;
 pub const BASE_PACKAGE: &str = "mde-core";
 /// Desktop subpackage — only upgraded when already installed.
 pub const DESKTOP_PACKAGE: &str = "mde-desktop";
+
+/// Closed capability context for every root-issued replicated upgrade intent.
+pub const UPGRADE_INTENT_AUTH_VERB: &str = "upgrade-intent";
+const UPGRADE_INTENT_AUTH_NODE: &str = "fleet";
 
 // ───────────────────────── pure helpers ─────────────────────────
 
@@ -142,11 +150,39 @@ fn normalize(intent: &Value) -> Value {
 /// ready-set, so every peer upgrades again.
 ///
 /// # Errors
-/// IO / serialization failure writing the intent file.
+/// IO, credential, or serialization failure writing the intent file.
 pub fn write_intent(
     mesh_home: &Path,
     target_version: &str,
     now_ms: u64,
+) -> std::io::Result<PathBuf> {
+    let signer = production_action_signer()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error))?;
+    let auth_now_ms = i64::try_from(now_ms).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "upgrade intent timestamp is outside the capability range",
+        )
+    })?;
+    write_intent_with_signer(
+        mesh_home,
+        target_version,
+        now_ms,
+        &signer,
+        auth_now_ms,
+        &fresh_nonce(),
+    )
+}
+
+/// Testable signing seam for the direct CLI authority path. Production callers
+/// use [`write_intent`], which loads the root-only systemd credential first.
+fn write_intent_with_signer(
+    mesh_home: &Path,
+    target_version: &str,
+    initiated_at_ms: u64,
+    signer: &CloudArmSigner,
+    auth_now_ms: i64,
+    nonce: &str,
 ) -> std::io::Result<PathBuf> {
     let dir = mesh_home.join("upgrade-intent");
     std::fs::create_dir_all(&dir)?;
@@ -163,13 +199,172 @@ pub fn write_intent(
     let stem = if safe.is_empty() { "latest" } else { &safe };
     let path = dir.join(format!("{stem}.json"));
     let body = json!({
+        "schema_version": ACTION_SCHEMA_VERSION,
         "target_version": target_version,
-        "initiated_at_ms": now_ms,
+        "initiated_at_ms": initiated_at_ms,
         "ready": {},
     });
-    let text = serde_json::to_string_pretty(&body).map_err(std::io::Error::other)?;
-    std::fs::write(&path, text)?;
+    let text = sign_intent_document(&path, body, signer, auth_now_ms, nonce)?;
+    write_intent_file(&path, &text)?;
     Ok(path)
+}
+
+/// Build the stable capability target from the exact replicated filename. A
+/// valid intent copied to a different filename therefore fails provenance
+/// verification instead of being adopted by the watcher.
+fn intent_auth_target(path: &Path) -> std::io::Result<String> {
+    let name = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .filter(|name| name.len() > 5 && name.ends_with(".json"))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "upgrade intent path has no safe JSON filename",
+            )
+        })?;
+    Ok(format!("upgrade-intent:{name}"))
+}
+
+/// Validate the signed document's shape before any state-machine decision.
+fn validate_intent_document(value: &Value) -> Result<(), String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "upgrade intent is not a JSON object".to_string())?;
+    let target_version = object
+        .get("target_version")
+        .and_then(Value::as_str)
+        .filter(|version| !version.trim().is_empty())
+        .ok_or_else(|| "upgrade intent has no target_version".to_string())?;
+    if target_version.len() > 256 {
+        return Err("upgrade intent target_version is too long".to_string());
+    }
+    if object
+        .get("initiated_at_ms")
+        .and_then(Value::as_u64)
+        .is_none()
+    {
+        return Err("upgrade intent has no initiated_at_ms".to_string());
+    }
+    for field in ["ready", "ready_failed", "complete"] {
+        if let Some(value) = object.get(field) {
+            if !value.is_object() && !value.is_array() {
+                return Err(format!("upgrade intent field `{field}` is not a map"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn sign_intent_document(
+    path: &Path,
+    mut document: Value,
+    signer: &CloudArmSigner,
+    auth_now_ms: i64,
+    nonce: &str,
+) -> std::io::Result<String> {
+    let object = document.as_object_mut().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "upgrade intent must be a JSON object",
+        )
+    })?;
+    object.insert(
+        "schema_version".to_string(),
+        Value::from(ACTION_SCHEMA_VERSION),
+    );
+    object.remove("armed_token");
+    validate_intent_document(&document)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let unsigned = serde_json::to_string_pretty(&document).map_err(std::io::Error::other)?;
+    let target = intent_auth_target(path)?;
+    let token = CloudArmedToken::mint(
+        signer,
+        nonce,
+        auth_now_ms.saturating_add(MAX_AUTH_TTL_MS),
+        UPGRADE_INTENT_AUTH_VERB,
+        UPGRADE_INTENT_AUTH_NODE,
+        &target,
+        &cloud_request_digest(&unsigned).map_err(std::io::Error::other)?,
+    )
+    .encode();
+    document["armed_token"] = Value::String(token);
+    serde_json::to_string_pretty(&document).map_err(std::io::Error::other)
+}
+
+fn write_intent_file(path: &Path, text: &str) -> std::io::Result<()> {
+    use rustix::fs::{Mode, OFlags};
+
+    let fd = rustix::fs::open(
+        path,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )?;
+    let mut file: std::fs::File = fd.into();
+    file.write_all(text.as_bytes())?;
+    file.sync_all()
+}
+
+fn fresh_nonce() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+fn wall_now_ms_i64() -> std::io::Result<i64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "system clock is before the Unix epoch",
+            )
+        })
+        .and_then(|duration| {
+            i64::try_from(duration.as_millis()).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "system clock is outside the capability range",
+                )
+            })
+        })
+}
+
+fn verify_intent_body(
+    authorizer: &ActionAuthorizer,
+    path: &Path,
+    raw: &str,
+) -> Result<Value, String> {
+    let value: Value =
+        serde_json::from_str(raw).map_err(|_| "upgrade intent is not valid JSON".to_string())?;
+    validate_intent_document(&value)?;
+    let target = intent_auth_target(path).map_err(|error| error.to_string())?;
+    authorizer.verify_exact_body(
+        raw,
+        MutationContext {
+            verb: UPGRADE_INTENT_AUTH_VERB,
+            node: UPGRADE_INTENT_AUTH_NODE,
+            target: &target,
+        },
+    )?;
+    Ok(value)
+}
+
+fn authorize_intent_body(
+    authorizer: &ActionAuthorizer,
+    path: &Path,
+    raw: &str,
+) -> Result<(), String> {
+    let value: Value =
+        serde_json::from_str(raw).map_err(|_| "upgrade intent is not valid JSON".to_string())?;
+    validate_intent_document(&value)?;
+    let target = intent_auth_target(path).map_err(|error| error.to_string())?;
+    authorizer.authorize(
+        raw,
+        MutationContext {
+            verb: UPGRADE_INTENT_AUTH_VERB,
+            node: UPGRADE_INTENT_AUTH_NODE,
+            target: &target,
+        },
+    )
 }
 
 /// All intent files in `dir`, sorted. Missing dir → empty.
@@ -316,6 +511,16 @@ pub struct UpgradeIntentWatcher {
     leader_lock: PathBuf,
     dnf_binary: String,
     install_binary: String,
+    /// Verifier for the root-issued, exact-body intent capability.
+    authorizer: ActionAuthorizer,
+    /// Root signer used to issue the next exact-body capability after this
+    /// worker appends its authenticated state transition. Missing credentials
+    /// disable the execution path entirely.
+    signer: Option<CloudArmSigner>,
+    /// Deterministic capability clock used only by the in-process test seam.
+    /// Production state updates always call [`wall_now_ms_i64`].
+    #[cfg(test)]
+    test_now_ms: Option<i64>,
     /// OBS-7 — where upgrade-state-transition alerts are dropped for
     /// `alert_relay` to surface (the MON-3 alerts dir). `None` skips the
     /// emit (a test that doesn't assert on alerts).
@@ -328,6 +533,17 @@ impl UpgradeIntentWatcher {
     /// leader lock, and the real `dnf` / `mde-install` binaries.
     #[must_use]
     pub fn new(workgroup_root: PathBuf, node_id: String) -> Self {
+        let signer = match production_action_signer() {
+            Ok(signer) => Some(signer),
+            Err(error) => {
+                tracing::error!(
+                    target: "mackesd::upgrade_intent_watcher",
+                    %error,
+                    "root upgrade-intent signing unavailable; upgrade execution is disabled"
+                );
+                None
+            }
+        };
         Self {
             tick: DEFAULT_TICK_INTERVAL,
             mesh_home: mackes_mesh_types::peers::default_mesh_home(),
@@ -336,8 +552,30 @@ impl UpgradeIntentWatcher {
             leader_lock: workgroup_root.join(".mackesd-leader.lock"),
             dnf_binary: "dnf".to_string(),
             install_binary: "mde-install".to_string(),
+            authorizer: ActionAuthorizer::production(),
+            signer,
+            #[cfg(test)]
+            test_now_ms: None,
             alerts_dir: crate::workers::alert_relay::default_alerts_dir(),
         }
+    }
+
+    /// Inject deterministic HMAC authority for hostile/valid watcher tests.
+    #[cfg(test)]
+    #[must_use]
+    fn with_test_authority(mut self, key: &[u8], auth_root: PathBuf, now_ms: i64) -> Self {
+        self.authorizer = ActionAuthorizer::for_test(key, auth_root, now_ms);
+        self.signer = Some(CloudArmSigner::new(key.to_vec()).expect("test signer key"));
+        self.test_now_ms = Some(now_ms);
+        self
+    }
+
+    fn auth_now_ms(&self) -> std::io::Result<i64> {
+        #[cfg(test)]
+        if let Some(now_ms) = self.test_now_ms {
+            return Ok(now_ms);
+        }
+        wall_now_ms_i64()
     }
 
     /// OBS-7 test seam — point the alert emit at a scratch dir.
@@ -395,24 +633,45 @@ impl UpgradeIntentWatcher {
     /// One tick. Silent no-op when the upgrade-intent dir doesn't exist
     /// (no coordinate in flight, or mesh-home not mounted).
     fn tick_once(&self) {
+        // A watcher without both halves of the root authority must never turn
+        // replicated bytes into a package-manager invocation.
+        let Some(signer) = self.signer.as_ref() else {
+            return;
+        };
         let dir = self.intent_dir();
         if !dir.is_dir() {
             return;
         }
+        let Ok(state_auth_now_ms) = self.auth_now_ms() else {
+            return;
+        };
         let now_s = now_s();
         let (all_peers, unreachable, peer_count) = self.roster();
 
         for path in pending_intents(&dir) {
-            let Ok(intent) = read_value(&path) else {
+            let Ok((raw, intent)) = read_authorized_intent(&path, &self.authorizer) else {
                 continue;
             };
 
             // INST-11 — upgrade half.
             if should_act(&intent, &self.hostname) {
+                if authorize_intent_body(&self.authorizer, &path, &raw).is_err() {
+                    continue;
+                }
                 match self.run_dnf_upgrade() {
                     Ok(version) => {
                         let host = self.hostname.clone();
-                        let _ = locked_update(&path, |v| mark_ready(v, &host, &version, now_s));
+                        let initiated_at_ms = intent["initiated_at_ms"].as_u64().unwrap_or(0);
+                        let intent_target_version = target_version(&intent);
+                        let _ = locked_authorized_update(
+                            &path,
+                            &self.authorizer,
+                            signer,
+                            &intent_target_version,
+                            initiated_at_ms,
+                            state_auth_now_ms,
+                            |v| mark_ready(v, &host, &version, now_s),
+                        );
                         self.emit_upgrade_alert(
                             &version,
                             "ready",
@@ -422,7 +681,17 @@ impl UpgradeIntentWatcher {
                     }
                     Err(err) => {
                         let host = self.hostname.clone();
-                        let _ = locked_update(&path, |v| mark_ready_failed(v, &host, &err, now_s));
+                        let initiated_at_ms = intent["initiated_at_ms"].as_u64().unwrap_or(0);
+                        let intent_target_version = target_version(&intent);
+                        let _ = locked_authorized_update(
+                            &path,
+                            &self.authorizer,
+                            signer,
+                            &intent_target_version,
+                            initiated_at_ms,
+                            state_auth_now_ms,
+                            |v| mark_ready_failed(v, &host, &err, now_s),
+                        );
                         self.emit_upgrade_alert(
                             &target_version(&intent),
                             "failed",
@@ -435,13 +704,26 @@ impl UpgradeIntentWatcher {
             }
 
             // INST-12 — barrier half (re-read so a sibling's mark is seen).
-            let Ok(fresh) = read_value(&path) else {
+            let Ok((fresh_raw, fresh)) = read_authorized_intent(&path, &self.authorizer) else {
                 continue;
             };
             if barrier_should_fire(&fresh, peer_count, now_s, &self.hostname) {
+                if authorize_intent_body(&self.authorizer, &path, &fresh_raw).is_err() {
+                    continue;
+                }
                 if self.run_mde_install().is_ok() {
                     let host = self.hostname.clone();
-                    let _ = locked_update(&path, |v| mark_complete(v, &host, now_s));
+                    let initiated_at_ms = fresh["initiated_at_ms"].as_u64().unwrap_or(0);
+                    let target = target_version(&fresh);
+                    let _ = locked_authorized_update(
+                        &path,
+                        &self.authorizer,
+                        signer,
+                        &target,
+                        initiated_at_ms,
+                        state_auth_now_ms,
+                        |v| mark_complete(v, &host, now_s),
+                    );
                     self.emit_upgrade_alert(
                         &target_version(&fresh),
                         "complete",
@@ -456,7 +738,11 @@ impl UpgradeIntentWatcher {
         if self.am_leader() {
             let intents: Vec<(PathBuf, Value)> = pending_intents(&dir)
                 .into_iter()
-                .filter_map(|p| read_value(&p).ok().map(|v| (p, v)))
+                .filter_map(|p| {
+                    read_authorized_intent(&p, &self.authorizer)
+                        .ok()
+                        .map(|(_, v)| (p, v))
+                })
                 .collect();
             for path in intents_to_clean(&intents, &all_peers, &unreachable, now_s) {
                 let _ = std::fs::remove_file(&path);
@@ -518,23 +804,46 @@ impl Worker for UpgradeIntentWatcher {
 
 // ───────────────────────── shell-out helpers ─────────────────────────
 
+fn open_intent_file(path: &Path, flags: rustix::fs::OFlags) -> std::io::Result<std::fs::File> {
+    use rustix::fs::Mode;
+
+    let fd = rustix::fs::open(path, flags | rustix::fs::OFlags::NOFOLLOW, Mode::empty())?;
+    Ok(fd.into())
+}
+
+fn read_raw(path: &Path) -> std::io::Result<String> {
+    use rustix::fs::OFlags;
+
+    let mut file = open_intent_file(path, OFlags::RDONLY | OFlags::CLOEXEC)?;
+    let mut raw = String::new();
+    file.read_to_string(&mut raw)?;
+    Ok(raw)
+}
+
+#[cfg(test)]
 fn read_value(path: &Path) -> std::io::Result<Value> {
-    let s = std::fs::read_to_string(path)?;
+    let s = read_raw(path)?;
     serde_json::from_str(&s).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
-/// Exclusive-locked read-modify-write of an intent file: lock, read the
-/// current contents (so a sibling peer's concurrent mark isn't lost),
-/// apply `f`, truncate + rewrite, unlock. Lock contention / IO errors
-/// are returned so the caller retries next tick.
+fn read_authorized_intent(
+    path: &Path,
+    authorizer: &ActionAuthorizer,
+) -> std::io::Result<(String, Value)> {
+    let raw = read_raw(path)?;
+    let value = verify_intent_body(authorizer, path, &raw)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error))?;
+    Ok((raw, value))
+}
+
+/// Test-only legacy lock fixture for the pure file-lock test below. Production
+/// state transitions use [`locked_authorized_update`] exclusively.
+#[cfg(test)]
 fn locked_update<F>(path: &Path, f: F) -> std::io::Result<()>
 where
     F: FnOnce(&Value) -> Value,
 {
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)?;
+    let mut file = open_intent_file(path, rustix::fs::OFlags::RDWR | rustix::fs::OFlags::CLOEXEC)?;
     file.lock_exclusive()?;
     let result = (|| {
         let mut s = String::new();
@@ -548,6 +857,45 @@ where
         file.seek(SeekFrom::Start(0))?;
         file.write_all(json.as_bytes())?;
         file.flush()
+    })();
+    let _ = FileExt::unlock(&file);
+    result
+}
+
+fn locked_authorized_update<F>(
+    path: &Path,
+    authorizer: &ActionAuthorizer,
+    signer: &CloudArmSigner,
+    expected_target_version: &str,
+    expected_initiated_at_ms: u64,
+    auth_now_ms: i64,
+    f: F,
+) -> std::io::Result<()>
+where
+    F: FnOnce(&Value) -> Value,
+{
+    let mut file = open_intent_file(path, rustix::fs::OFlags::RDWR | rustix::fs::OFlags::CLOEXEC)?;
+    file.lock_exclusive()?;
+    let result = (|| {
+        let mut raw = String::new();
+        file.read_to_string(&mut raw)?;
+        let current = verify_intent_body(authorizer, path, &raw)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error))?;
+        if target_version(&current) != expected_target_version
+            || current["initiated_at_ms"].as_u64() != Some(expected_initiated_at_ms)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "upgrade intent changed while the package operation was running",
+            ));
+        }
+        let next = f(&current);
+        let text = sign_intent_document(path, next, signer, auth_now_ms, &fresh_nonce())?;
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(text.as_bytes())?;
+        file.flush()?;
+        file.sync_all()
     })();
     let _ = FileExt::unlock(&file);
     result
@@ -603,6 +951,9 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
+    const TEST_KEY: &[u8] = b"upgrade-intent-test-key";
+    const TEST_NOW_MS: i64 = 1_700_000_000_000;
+
     fn minimal_intent(ts_ms: u64) -> Value {
         // The exact shape INST-10's `mde-update --coordinate` writes.
         json!({
@@ -613,12 +964,25 @@ mod tests {
         })
     }
 
+    fn test_signer() -> CloudArmSigner {
+        CloudArmSigner::new(TEST_KEY.to_vec()).unwrap()
+    }
+
     #[test]
     fn write_intent_publishes_a_watcher_readable_intent() {
         // PLANES-7 — the in-tree coordinate writer lands an intent that
         // pending_intents finds, carrying the minimal watcher schema.
         let home = tempdir().unwrap();
-        let path = write_intent(home.path(), "latest", 4242).unwrap();
+        let signer = test_signer();
+        let path = write_intent_with_signer(
+            home.path(),
+            "latest",
+            4242,
+            &signer,
+            TEST_NOW_MS,
+            "write-intent-valid-nonce",
+        )
+        .unwrap();
         assert!(path.ends_with("upgrade-intent/latest.json"));
         let found = pending_intents(&home.path().join("upgrade-intent"));
         assert_eq!(found.len(), 1);
@@ -633,11 +997,197 @@ mod tests {
     #[test]
     fn write_intent_sanitizes_the_filename() {
         let home = tempdir().unwrap();
-        let path = write_intent(home.path(), "v2.7.1/weird name", 1).unwrap();
+        let signer = test_signer();
+        let path = write_intent_with_signer(
+            home.path(),
+            "v2.7.1/weird name",
+            1,
+            &signer,
+            TEST_NOW_MS,
+            "write-intent-sanitize-nonce",
+        )
+        .unwrap();
         // Path-unsafe chars collapse to '-'; the label is preserved inside.
         assert!(path.ends_with("upgrade-intent/v2.7.1-weird-name.json"));
         let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(v["target_version"], "v2.7.1/weird name");
+    }
+
+    #[test]
+    fn signed_intent_is_readable_without_spending_its_nonce() {
+        let home = tempdir().unwrap();
+        let signer = test_signer();
+        let path = write_intent_with_signer(
+            home.path(),
+            "latest",
+            4242,
+            &signer,
+            TEST_NOW_MS,
+            "read-only-poll-nonce",
+        )
+        .unwrap();
+        let gate = ActionAuthorizer::for_test(TEST_KEY, home.path().join("auth"), TEST_NOW_MS);
+
+        // Status/plan-style reads can poll repeatedly; verification alone does
+        // not consume the capability.
+        assert!(read_authorized_intent(&path, &gate).is_ok());
+        assert!(read_authorized_intent(&path, &gate).is_ok());
+
+        let raw = read_raw(&path).unwrap();
+        assert!(authorize_intent_body(&gate, &path, &raw).is_ok());
+        assert!(authorize_intent_body(&gate, &path, &raw)
+            .unwrap_err()
+            .contains("already used"));
+    }
+
+    #[test]
+    fn unsigned_tampered_and_relocated_intents_fail_closed() {
+        let home = tempdir().unwrap();
+        let dir = home.path().join("upgrade-intent");
+        fs::create_dir_all(&dir).unwrap();
+        let gate = ActionAuthorizer::for_test(TEST_KEY, home.path().join("auth"), TEST_NOW_MS);
+
+        let unsigned_path = dir.join("unsigned.json");
+        fs::write(
+            &unsigned_path,
+            serde_json::to_string(&minimal_intent(4242)).unwrap(),
+        )
+        .unwrap();
+        assert!(read_authorized_intent(&unsigned_path, &gate).is_err());
+
+        let signer = test_signer();
+        let signed_path = write_intent_with_signer(
+            home.path(),
+            "latest",
+            4242,
+            &signer,
+            TEST_NOW_MS,
+            "tamper-source-nonce",
+        )
+        .unwrap();
+        let raw = read_raw(&signed_path).unwrap();
+        let mut tampered: Value = serde_json::from_str(&raw).unwrap();
+        tampered["ready"] = json!({"forge": {"at": 1, "rpm_version": "forged"}});
+        fs::write(
+            &signed_path,
+            serde_json::to_string_pretty(&tampered).unwrap(),
+        )
+        .unwrap();
+        assert!(read_authorized_intent(&signed_path, &gate).is_err());
+
+        // The HMAC target includes the filename, so a valid body cannot be
+        // adopted merely by moving it to another replicated intent path.
+        fs::write(&signed_path, raw).unwrap();
+        let relocated = dir.join("other.json");
+        fs::copy(&signed_path, &relocated).unwrap();
+        assert!(read_authorized_intent(&relocated, &gate).is_err());
+    }
+
+    #[cfg(unix)]
+    fn executable_marker(path: &Path, marker: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::write(
+            path,
+            format!("#!/bin/sh\nprintf x > '{}'\n", marker.display()),
+        )
+        .unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn only_a_valid_intent_can_reach_the_package_manager_seams() {
+        let home = tempdir().unwrap();
+        let mesh_home = home.path().join("mesh");
+        let intent_dir = mesh_home.join("upgrade-intent");
+        fs::create_dir_all(&intent_dir).unwrap();
+        let dnf_marker = home.path().join("dnf-ran");
+        let install_marker = home.path().join("install-ran");
+        let dnf = home.path().join("dnf");
+        let install = home.path().join("mde-install");
+        executable_marker(&dnf, &dnf_marker);
+        executable_marker(&install, &install_marker);
+
+        let signer = test_signer();
+        let now_ms = wall_now_ms_i64().unwrap();
+        let valid_path = write_intent_with_signer(
+            &mesh_home,
+            "valid",
+            now_ms as u64,
+            &signer,
+            now_ms,
+            "valid-execution-nonce",
+        )
+        .unwrap();
+
+        // A valid intent is allowed through the exact-body gate and reaches
+        // dnf; its authenticated ready transition is written back as a new
+        // signed document.
+        let mut valid_watcher = UpgradeIntentWatcher::new(
+            home.path().join("workgroup-valid"),
+            "node-valid".to_string(),
+        )
+        .with_test_authority(TEST_KEY, home.path().join("auth-valid"), now_ms)
+        .with_alerts_dir(home.path().join("alerts-valid"));
+        valid_watcher.mesh_home = mesh_home.clone();
+        valid_watcher.hostname = "forge".to_string();
+        valid_watcher.dnf_binary = dnf.display().to_string();
+        valid_watcher.install_binary = install.display().to_string();
+        valid_watcher.tick_once();
+        assert!(dnf_marker.exists(), "valid intent must reach dnf");
+        let (_, updated) = read_authorized_intent(&valid_path, &valid_watcher.authorizer)
+            .expect("valid dnf transition is re-signed");
+        assert!(updated["ready"]["forge"].is_object());
+
+        // The hostile files live in a separate directory so this assertion is
+        // independent of the valid intent's state transition above.
+        let hostile_home = home.path().join("hostile-mesh");
+        let hostile_dir = hostile_home.join("upgrade-intent");
+        fs::create_dir_all(&hostile_dir).unwrap();
+        let unsigned_path = hostile_dir.join("unsigned.json");
+        fs::write(
+            &unsigned_path,
+            serde_json::to_string(&minimal_intent(1)).unwrap(),
+        )
+        .unwrap();
+        let signed_path = hostile_dir.join("tampered.json");
+        let signed = sign_intent_document(
+            &signed_path,
+            json!({
+                "target_version": "tampered",
+                "initiated_at_ms": 1,
+                "grace_seconds": 0,
+                "ready": {"forge": {"at": 1, "rpm_version": "real"}},
+            }),
+            &signer,
+            now_ms,
+            "tamper-execution-nonce",
+        )
+        .unwrap();
+        let mut tampered: Value = serde_json::from_str(&signed).unwrap();
+        tampered["ready"]["forge"]["rpm_version"] = Value::String("forged".to_string());
+        fs::write(
+            &signed_path,
+            serde_json::to_string_pretty(&tampered).unwrap(),
+        )
+        .unwrap();
+
+        let mut hostile_watcher = UpgradeIntentWatcher::new(
+            home.path().join("workgroup-hostile"),
+            "node-hostile".to_string(),
+        )
+        .with_test_authority(TEST_KEY, home.path().join("auth-hostile"), now_ms)
+        .with_alerts_dir(home.path().join("alerts-hostile"));
+        hostile_watcher.mesh_home = hostile_home;
+        hostile_watcher.hostname = "forge".to_string();
+        hostile_watcher.dnf_binary = dnf.display().to_string();
+        hostile_watcher.install_binary = install.display().to_string();
+        hostile_watcher.tick_once();
+        assert!(
+            !install_marker.exists(),
+            "tampered quorum state must not reach mde-install"
+        );
     }
 
     #[test]

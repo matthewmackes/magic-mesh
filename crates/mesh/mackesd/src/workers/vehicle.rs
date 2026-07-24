@@ -28,10 +28,18 @@
 //! - `MDE_VEHICLE_GATEWAY` — the gateway endpoint, an IP or `ip:sshport`. **When
 //!   unset the worker is a no-op** (logs once, publishes nothing) — most nodes have
 //!   no vehicle gateway attached.
-//! - `MDE_VEHICLE_ROOT_PW` — the gateway's `root` SSH password (the oMG SSH host is
-//!   a legacy-crypto box, hence the explicit `+ssh-rsa` / `diffie-hellman-group1`
-//!   options on the real probe). HTTP auth is the fixed oMG `admin`/`admin` LCI
-//!   login.
+//! - `MDE_VEHICLE_ROOT_PW_FILE` — preferred root-only file containing the gateway's
+//!   `root` SSH password (default `/etc/mackesd/mg90-root-password`). The legacy
+//!   `MDE_VEHICLE_ROOT_PW` value remains a compatibility fallback only. The SSH
+//!   password is fed over stdin to `sshpass`; it is never placed in process argv.
+//!   The oMG SSH host is a legacy-crypto box, hence the explicit `+ssh-rsa` /
+//!   `diffie-hellman-group1` options on the real probe.
+//! - `MDE_VEHICLE_STATUS_PORT` — optional local UDP port for the MG90 documented
+//!   JSON Status Broadcast. When configured, the beacon is preferred for GNSS,
+//!   ignition, battery, and temperature; LCI/NMEA remain fallbacks.
+//! - HTTP auth is the fixed oMG `admin`/`admin` LCI login for this deployment; the
+//!   standalone `mg90-access` helper exposes the LCI and application planes with
+//!   a root-only HTTP password file.
 //!
 //! On any anchor-probe error (the LCI general read — the gateway's reachability
 //! signal) the worker publishes an honest [`VehicleState::offline`] snapshot; the
@@ -41,9 +49,10 @@
 #![cfg(feature = "async-services")]
 
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, Write};
+use std::net::UdpSocket;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -65,6 +74,36 @@ pub const GATEWAY_ENV: &str = "MDE_VEHICLE_GATEWAY";
 /// Env: the gateway `root` SSH password (later mde-seal; env is fine for now).
 pub const ROOT_PW_ENV: &str = "MDE_VEHICLE_ROOT_PW";
 
+/// Preferred env: path to the root-owned MG90 SSH password file.
+pub const ROOT_PW_FILE_ENV: &str = "MDE_VEHICLE_ROOT_PW_FILE";
+
+/// Default root-owned MG90 SSH password file used by the packaged worker/helper.
+pub const ROOT_PW_FILE_DEFAULT: &str = "/etc/mackesd/mg90-root-password";
+
+/// Optional env: local UDP port receiving the MG90 JSON Status Broadcast.
+pub const STATUS_PORT_ENV: &str = "MDE_VEHICLE_STATUS_PORT";
+
+/// The Status Broadcast is a small selected-field JSON object, not an arbitrary
+/// UDP transport. Keep the receive allocation bounded and leave one byte for
+/// detecting a datagram that would otherwise be truncated by `recv`.
+const STATUS_BEACON_MAX_DATAGRAM_BYTES: usize = 16 * 1024;
+
+/// `GpsFix::satellites` is an unsigned byte. Do not silently clamp a hostile or
+/// corrupt MG90 value into that type; drop the field and retain the NMEA value.
+const STATUS_BEACON_MAX_SATELLITES: u16 = u8::MAX as u16;
+
+/// Broad physical sanity bounds for the MG90's input-voltage and internal-board
+/// temperature reports. They reject corrupt values without rejecting cold-crank
+/// voltage or a hot enclosure that can still be reported by a reachable unit.
+const STATUS_BEACON_MIN_BATTERY_V: f32 = 0.0;
+const STATUS_BEACON_MAX_BATTERY_V: f32 = 36.0;
+const STATUS_BEACON_MIN_TEMPERATURE_C: f32 = -40.0;
+const STATUS_BEACON_MAX_TEMPERATURE_C: f32 = 125.0;
+
+/// Pinned host-key file used by the packaged worker/helper.
+const KNOWN_HOSTS_FILE_DEFAULT: &str = "/etc/mackesd/mg90_known_hosts";
+const KNOWN_HOSTS_FILE_PACKAGED: &str = "/usr/share/magic-mesh/mg90-known-hosts";
+
 /// Shared-Bus capability context for the destructive gateway reboot verb.
 const VEHICLE_REBOOT_AUTH_VERB: &str = "vehicle-reboot";
 const VEHICLE_REBOOT_AUTH_TARGET: &str = "gateway";
@@ -84,7 +123,7 @@ const LCI_WAN_URL: &str = "MG-LCI/wan/status/status.html?displayExtended=true";
 
 // ─────────────────────────── the injectable probe seam ───────────────────────────
 
-/// The raw-text read seam the worker folds into a [`VehicleState`]: three methods,
+/// The raw-text read seam the worker folds into a [`VehicleState`]: four methods,
 /// each returning the RAW text the adapter reads, so tests inject a fake without a
 /// live gateway (the same applier-injection idiom as the `cloud` worker's
 /// `CloudRunner` seam).
@@ -109,6 +148,13 @@ pub trait VehicleProbe: Send + Sync {
     /// The HTTP transport's failure.
     fn read_lci_wan(&self) -> io::Result<String>;
 
+    /// The optional documented MG90 JSON Status Broadcast. A missing configured
+    /// stream is `Ok(None)`; malformed packets are an `Err` so callers preserve an
+    /// honest gap rather than silently accepting partial data.
+    fn read_status_beacon(&self) -> io::Result<Option<String>> {
+        Ok(None)
+    }
+
     /// Run an arbitrary command on the gateway over SSH, returning its stdout — the
     /// seam the `action/vehicle/*` control verbs (`get-config` / `reboot`) shell
     /// through. Real: the same legacy-crypto SSH as [`Self::read_gps_nmea`]; tests
@@ -126,20 +172,45 @@ pub struct SshHttpProbe {
     ip: String,
     /// The SSH port (default 2222 — the oMG SSH port).
     ssh_port: u16,
-    /// The `root` SSH password (from [`ROOT_PW_ENV`]).
+    /// The `root` SSH password (read from a root-only file, or the legacy env).
     ssh_pw: String,
+    /// The pinned host-key file for this gateway.
+    known_hosts_file: PathBuf,
+    /// Optional nonblocking socket for the documented MG90 JSON status beacon.
+    status_socket: Option<UdpSocket>,
 }
 
 impl SshHttpProbe {
-    /// Build from a raw `MDE_VEHICLE_GATEWAY` value (an IP or `ip:sshport`) + the
-    /// `root` password from [`ROOT_PW_ENV`] (empty when unset).
+    /// Build from a raw `MDE_VEHICLE_GATEWAY` value (an IP or `ip:sshport`) plus a
+    /// root-only password file. The legacy password env remains a compatibility
+    /// fallback so an older deployment can roll forward without a synchronized
+    /// systemd drop-in update.
     #[must_use]
     pub fn from_env(gateway: &str) -> Self {
         let (ip, ssh_port) = parse_endpoint(gateway);
+        let ssh_pw = std::env::var(ROOT_PW_FILE_ENV)
+            .ok()
+            .and_then(|path| read_root_password_file(&path))
+            .or_else(|| read_root_password_file(ROOT_PW_FILE_DEFAULT))
+            .or_else(|| std::env::var(ROOT_PW_ENV).ok())
+            .unwrap_or_default();
+        let known_hosts_file = if std::path::Path::new(KNOWN_HOSTS_FILE_DEFAULT).is_file() {
+            PathBuf::from(KNOWN_HOSTS_FILE_DEFAULT)
+        } else {
+            PathBuf::from(KNOWN_HOSTS_FILE_PACKAGED)
+        };
+        let status_socket = std::env::var(STATUS_PORT_ENV).ok().and_then(|raw| {
+            let port = raw.parse::<u16>().ok().filter(|port| *port != 0)?;
+            let socket = UdpSocket::bind(("0.0.0.0", port)).ok()?;
+            socket.set_nonblocking(true).ok()?;
+            Some(socket)
+        });
         Self {
             ip,
             ssh_port,
-            ssh_pw: std::env::var(ROOT_PW_ENV).unwrap_or_default(),
+            ssh_pw,
+            known_hosts_file,
+            status_socket,
         }
     }
 
@@ -208,22 +279,19 @@ impl SshHttpProbe {
     fn ssh(&self, remote_cmd: &str) -> io::Result<String> {
         let port = self.ssh_port.to_string();
         let target = format!("root@{}", self.ip);
+        let known_hosts = format!("UserKnownHostsFile={}", self.known_hosts_file.display());
         // `ssh-dss` must NOT appear in HostKeyAlgorithms: modern OpenSSH REMOVED it
         // (not merely deprecated), so listing it makes ssh reject the whole option
         // value ("command-line: Bad key types") and every SSH read (GPS/IMU/control)
         // fails before connecting — the MG90 offers an ssh-rsa (and ed25519) host
         // key, so +ssh-rsa alone connects. Verified live against the bench MG90.
-        let out = Command::new("sshpass")
+        let mut child = Command::new("sshpass")
             .args([
-                "-p",
-                &self.ssh_pw,
+                "-d",
+                "0",
                 "ssh",
                 "-p",
                 &port,
-                "-o",
-                "StrictHostKeyChecking=no",
-                "-o",
-                "UserKnownHostsFile=/dev/null",
                 "-o",
                 "HostKeyAlgorithms=+ssh-rsa",
                 "-o",
@@ -232,10 +300,37 @@ impl SshHttpProbe {
                 "PubkeyAcceptedAlgorithms=+ssh-rsa",
                 "-o",
                 "Ciphers=+aes128-cbc,3des-cbc",
+                "-o",
+                "StrictHostKeyChecking=yes",
+                "-o",
+                "GlobalKnownHostsFile=/dev/null",
+                "-o",
+                &known_hosts,
+                "-o",
+                "PreferredAuthentications=password",
+                "-o",
+                "PubkeyAuthentication=no",
+                "-o",
+                "NumberOfPasswordPrompts=1",
+                "-o",
+                "ConnectTimeout=8",
+                "-o",
+                "ConnectionAttempts=1",
                 &target,
                 remote_cmd,
             ])
-            .output()?;
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        {
+            let mut stdin = child.stdin.take().ok_or_else(|| {
+                io::Error::other("sshpass stdin pipe unavailable for MG90 password")
+            })?;
+            stdin.write_all(self.ssh_pw.as_bytes())?;
+            stdin.write_all(b"\n")?;
+        }
+        let out = child.wait_with_output()?;
         if !out.status.success() {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
@@ -250,6 +345,23 @@ impl SshHttpProbe {
     }
 }
 
+/// Read the first line of a root-owned, mode-0400/0600 password file without ever
+/// placing its contents in a child-process argument. A malformed/untrusted file is
+/// treated as absent; the caller then emits the normal honest SSH gap.
+fn read_root_password_file(path: &str) -> Option<String> {
+    let metadata = std::fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() != 0 || metadata.mode() & 0o077 != 0 {
+            return None;
+        }
+    }
+    let text = std::fs::read_to_string(path).ok()?;
+    let first = text.split('\n').next()?.trim_end_matches('\r');
+    (!first.is_empty()).then(|| first.to_string())
+}
+
 impl VehicleProbe for SshHttpProbe {
     fn read_gps_nmea(&self) -> io::Result<String> {
         self.ssh(&format!("cat {GPS_INFO_PATH}"))
@@ -261,6 +373,33 @@ impl VehicleProbe for SshHttpProbe {
 
     fn read_lci_wan(&self) -> io::Result<String> {
         self.http_authed_get(LCI_WAN_URL)
+    }
+
+    fn read_status_beacon(&self) -> io::Result<Option<String>> {
+        let Some(socket) = &self.status_socket else {
+            return Ok(None);
+        };
+        let mut buf = [0_u8; STATUS_BEACON_MAX_DATAGRAM_BYTES + 1];
+        match socket.recv(&mut buf) {
+            Ok(size) if size > STATUS_BEACON_MAX_DATAGRAM_BYTES => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "status broadcast datagram exceeds {} bytes",
+                    STATUS_BEACON_MAX_DATAGRAM_BYTES
+                ),
+            )),
+            Ok(size) => {
+                let payload = std::str::from_utf8(&buf[..size]).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("status broadcast is not UTF-8: {error}"),
+                    )
+                })?;
+                Ok(Some(payload.to_owned()))
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     fn run_ssh(&self, cmd: &str) -> io::Result<String> {
@@ -387,22 +526,42 @@ impl VehicleWorker {
 
         let mut gaps: Vec<String> = Vec::new();
         let general_text = strip_html(&general);
+        let mut status_beacon = match probe.read_status_beacon() {
+            Ok(Some(raw)) => parse_status_beacon(&raw, &mut gaps),
+            Ok(None) => None,
+            Err(e) => {
+                gaps.push(format!("status broadcast unavailable (udp): {e}"));
+                None
+            }
+        };
 
         // ── general.html: MCU power/board + identity ──
-        let battery_v =
-            find_number_after(&general_text, "Main Battery Voltage").unwrap_or_else(|| {
-                gaps.push("telem.battery_v not reported by general.html".to_string());
-                0.0
-            });
-        let internal_temp_c = find_number_after(&general_text, "Internal Temperature")
-            .unwrap_or_else(|| {
-                gaps.push("telem.internal_temp_c not reported by general.html".to_string());
-                0.0
-            });
         let esn = find_token_after(&general_text, "ESN").unwrap_or_else(|| {
             gaps.push("esn not reported by general.html".to_string());
             String::new()
         });
+        validate_status_beacon_identity(&mut status_beacon, &esn, &mut gaps);
+        let battery_v = status_beacon
+            .as_ref()
+            .and_then(|beacon| beacon.general_information.as_ref())
+            .and_then(|general| general.battery_v)
+            .or_else(|| find_number_after(&general_text, "Main Battery Voltage"))
+            .unwrap_or_else(|| {
+                gaps.push(
+                    "telem.battery_v not reported by MG90 status/general.html or status broadcast"
+                        .to_string(),
+                );
+                0.0
+            });
+        let internal_temp_c = status_beacon
+            .as_ref()
+            .and_then(|beacon| beacon.general_information.as_ref())
+            .and_then(|general| general.internal_temp_c)
+            .or_else(|| find_number_after(&general_text, "Internal Temperature"))
+            .unwrap_or_else(|| {
+                gaps.push("telem.internal_temp_c not reported by MG90 status/general.html or status broadcast".to_string());
+                0.0
+            });
         let mgos_version = find_token_after(&general_text, "Version").unwrap_or_else(|| {
             gaps.push("mgos_version not reported by general.html".to_string());
             String::new()
@@ -411,15 +570,26 @@ impl VehicleWorker {
             gaps.push("model not reported by general.html".to_string());
             String::new()
         });
+        let ignition_on = status_beacon
+            .as_ref()
+            .and_then(|beacon| beacon.general_information.as_ref())
+            .and_then(|general| general.ignition_on)
+            .unwrap_or_else(|| parse_ignition_state(&general_text, &mut gaps));
 
         // ── GNSS/IMU over SSH ──
-        let (gps, imu) = match probe.read_gps_nmea() {
+        let (mut gps, imu) = match probe.read_gps_nmea() {
             Ok(nmea) => parse_gps_imu(&nmea, &mut gaps),
             Err(e) => {
                 gaps.push(format!("gps/imu unavailable (ssh): {e}"));
                 (GpsFix::default(), None)
             }
         };
+        if let Some(beacon_gps) = status_beacon
+            .as_ref()
+            .and_then(|beacon| status_beacon_gps(beacon, &mut gaps))
+        {
+            gps = merge_beacon_gps(gps, beacon_gps);
+        }
 
         // ── WAN status over HTTP ──
         let wan = match probe.read_lci_wan() {
@@ -431,16 +601,13 @@ impl VehicleWorker {
         };
 
         // ── vehicle power + OBD telemetry ──
-        // ignition/OBD source (the MCU ignition-sense line + an OBD-II dongle) is a
-        // follow-up; leave the flags false with an honest gap rather than guessing.
-        gaps.push(
-            "ignition/OBD not wired (MCU ignition-sense + OBD-II source is a follow-up)"
-                .to_string(),
-        );
+        // The authenticated LCI general page carries the MCU ignition-sense line;
+        // OBD-II remains a separate follow-up and must not be inferred from it.
+        gaps.push("OBD not wired (OBD-II source is a follow-up)".to_string());
         let telem = VehicleTelem {
             battery_v,
             internal_temp_c,
-            ignition_on: false,
+            ignition_on,
             moving: gps.speed_mph > 0.5,
             obd_present: false,
             ..Default::default()
@@ -808,6 +975,204 @@ impl Worker for VehicleWorker {
 
 // ─────────────────────────── raw-text folds ───────────────────────────
 
+/// The documented MG90 JSON Status Broadcast. Unknown fields are intentionally
+/// ignored: the gateway emits WAN/GPIO/VPN fields that the current vehicle mirror
+/// does not yet model, while these fields are the primary power/GNSS facts we can
+/// fold without inventing values.
+#[derive(Debug, Deserialize)]
+struct Mg90StatusBeacon {
+    #[serde(default, rename = "vehicleID")]
+    vehicle_id: Option<String>,
+    #[serde(default)]
+    location: Option<Mg90BeaconLocation>,
+    #[serde(default, rename = "gnssStatus")]
+    gnss_status: Option<Mg90BeaconGnss>,
+    #[serde(default, rename = "generalInformation")]
+    general_information: Option<Mg90BeaconGeneral>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Mg90BeaconLocation {
+    latitude: f64,
+    longitude: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct Mg90BeaconGnss {
+    #[serde(default)]
+    fix: Option<bool>,
+    #[serde(default, rename = "numberSatellites")]
+    number_satellites: Option<u16>,
+    #[serde(default, rename = "antennaConnected")]
+    antenna_connected: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Mg90BeaconGeneral {
+    #[serde(default, rename = "ignitionOn")]
+    ignition_on: Option<bool>,
+    #[serde(default, rename = "mainBatteryVoltage")]
+    battery_v: Option<f32>,
+    #[serde(default, rename = "internalTemperature")]
+    internal_temp_c: Option<f32>,
+}
+
+/// Decode and lightly validate one MG90 Status Broadcast datagram. A valid JSON
+/// object with only some documented fields is useful; absent fields fall back to
+/// the LCI/NMEA planes. Invalid scalar values are dropped individually so one bad
+/// field cannot turn a reachable gateway into an offline mirror.
+fn parse_status_beacon(raw: &str, gaps: &mut Vec<String>) -> Option<Mg90StatusBeacon> {
+    let mut beacon = match serde_json::from_str::<Mg90StatusBeacon>(raw.trim()) {
+        Ok(beacon) => beacon,
+        Err(error) => {
+            gaps.push(format!("status broadcast invalid JSON: {error}"));
+            return None;
+        }
+    };
+
+    if beacon.location.is_none()
+        && beacon.gnss_status.is_none()
+        && beacon.general_information.is_none()
+    {
+        gaps.push("status broadcast has no documented telemetry fields".to_string());
+        return None;
+    }
+
+    if let Some(location) = beacon.location.as_ref() {
+        if !location.latitude.is_finite()
+            || !location.longitude.is_finite()
+            || !(-90.0..=90.0).contains(&location.latitude)
+            || !(-180.0..=180.0).contains(&location.longitude)
+        {
+            gaps.push("status broadcast location invalid".to_string());
+            beacon.location = None;
+        }
+    }
+    if let Some(general) = beacon.general_information.as_mut() {
+        if let Some(value) = general.battery_v {
+            if !value.is_finite()
+                || !(STATUS_BEACON_MIN_BATTERY_V..=STATUS_BEACON_MAX_BATTERY_V).contains(&value)
+            {
+                gaps.push("status broadcast battery voltage out of range".to_string());
+                general.battery_v = None;
+            }
+        }
+        if let Some(value) = general.internal_temp_c {
+            if !value.is_finite()
+                || !(STATUS_BEACON_MIN_TEMPERATURE_C..=STATUS_BEACON_MAX_TEMPERATURE_C)
+                    .contains(&value)
+            {
+                gaps.push("status broadcast internal temperature out of range".to_string());
+                general.internal_temp_c = None;
+            }
+        }
+    }
+    if let Some(gnss) = beacon.gnss_status.as_mut() {
+        if gnss
+            .number_satellites
+            .is_some_and(|value| value > STATUS_BEACON_MAX_SATELLITES)
+        {
+            gaps.push("status broadcast satellite count out of range".to_string());
+            gnss.number_satellites = None;
+        }
+    }
+    if let Some(gnss) = beacon.gnss_status.as_ref() {
+        if gnss.fix.is_none() {
+            gaps.push("status broadcast GNSS fix flag missing".to_string());
+        }
+    }
+    if let Some(gnss) = beacon.gnss_status.as_ref() {
+        if gnss.antenna_connected.is_none() {
+            gaps.push("status broadcast GNSS antenna state missing".to_string());
+        }
+    }
+    Some(beacon)
+}
+
+/// Bind the unauthenticated UDP beacon to the gateway identity authenticated by
+/// the LCI page. A beacon without the documented `vehicleID`, or one naming a
+/// different vehicle, must not override the trusted LCI/NMEA planes.
+fn validate_status_beacon_identity(
+    beacon: &mut Option<Mg90StatusBeacon>,
+    expected_esn: &str,
+    gaps: &mut Vec<String>,
+) {
+    let Some(candidate) = beacon
+        .as_ref()
+        .and_then(|beacon| beacon.vehicle_id.as_deref())
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+    else {
+        if beacon.is_some() {
+            gaps.push("status broadcast vehicleID missing; ignored".to_string());
+            *beacon = None;
+        }
+        return;
+    };
+    if expected_esn.is_empty() {
+        gaps.push("status broadcast identity cannot be verified; ignored".to_string());
+        *beacon = None;
+    } else if candidate != expected_esn {
+        gaps.push(format!(
+            "status broadcast vehicleID does not match gateway ESN; ignored: {candidate}"
+        ));
+        *beacon = None;
+    }
+}
+
+/// Fold the beacon's GNSS fields into the neutral GPS shape. The antenna state is
+/// retained only as an evidence check: a packet may report a fix even when the
+/// antenna flag is absent, but a disconnected antenna is surfaced as a gap.
+fn status_beacon_gps(beacon: &Mg90StatusBeacon, gaps: &mut Vec<String>) -> Option<GpsFix> {
+    let gnss = beacon.gnss_status.as_ref()?;
+    let fix = gnss.fix?;
+    if gnss.antenna_connected == Some(false) {
+        gaps.push("status broadcast reports GNSS antenna disconnected".to_string());
+    }
+    let satellites = match gnss.number_satellites {
+        Some(value) if value <= STATUS_BEACON_MAX_SATELLITES => value as u8,
+        Some(_) => {
+            // Defensive duplicate of parse_status_beacon's validation: this
+            // keeps this fold honest if its caller ever changes.
+            gaps.push("status broadcast satellite count out of range".to_string());
+            return None;
+        }
+        None => {
+            gaps.push("status broadcast GNSS satellite count unavailable".to_string());
+            return None;
+        }
+    };
+    let has_position = fix && beacon.location.is_some();
+    if fix && !has_position {
+        gaps.push("status broadcast GNSS fix has no valid location".to_string());
+        return None;
+    }
+    let (latitude, longitude) = beacon
+        .location
+        .as_ref()
+        .filter(|_| has_position)
+        .map(|location| (location.latitude, location.longitude))
+        .unwrap_or((0.0, 0.0));
+    Some(GpsFix {
+        fix_type: if has_position { "gps" } else { "no-fix" }.to_string(),
+        latitude,
+        longitude,
+        satellites,
+        ..Default::default()
+    })
+}
+
+/// Preserve richer NMEA fields (altitude, speed, heading, dilution, age, update
+/// rate) while letting the documented beacon own the current fix/coordinates/sats.
+fn merge_beacon_gps(mut nmea: GpsFix, beacon: GpsFix) -> GpsFix {
+    nmea.fix_type = beacon.fix_type;
+    nmea.satellites = beacon.satellites;
+    nmea.latitude = beacon.latitude;
+    nmea.longitude = beacon.longitude;
+    nmea
+}
+
 /// Parse the GNSS `$GPGGA` + IMU `$PSIWMMPU` lines out of an oMG NMEA blob. GPS via
 /// the pure [`parse_gpgga`]; IMU best-effort (a missing line ⇒ `None` + a gap).
 fn parse_gps_imu(nmea: &str, gaps: &mut Vec<String>) -> (GpsFix, Option<ImuSample>) {
@@ -1078,6 +1443,26 @@ fn find_token_after(text: &str, label: &str) -> Option<String> {
     }
 }
 
+/// Fold the authenticated LCI MCU ignition-sense row. Unknown or missing values
+/// remain off and become an explicit gap; the worker never treats reachability or
+/// battery voltage as an ignition signal.
+fn parse_ignition_state(text: &str, gaps: &mut Vec<String>) -> bool {
+    let Some(value) = find_token_after(text, "Ignition State") else {
+        gaps.push("telem.ignition_on not reported by general.html".to_string());
+        return false;
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "on" | "true" | "yes" | "active" => true,
+        "off" | "false" | "no" | "inactive" => false,
+        other => {
+            gaps.push(format!(
+                "unrecognized ignition state in general.html: {other}"
+            ));
+            false
+        }
+    }
+}
+
 /// The signed integer immediately preceding the first `dBm` token (e.g. `-72 dBm` ⇒
 /// `-72`). `None` when there is no `dBm` reading.
 fn find_signal_dbm(text: &str) -> Option<i32> {
@@ -1132,6 +1517,7 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         nmea: Result<String, String>,
         general: Result<String, String>,
         wan: Result<String, String>,
+        status: Option<String>,
         ssh_out: Result<String, String>,
         ssh_calls: Arc<std::sync::Mutex<Vec<String>>>,
         general_calls: Arc<std::sync::Mutex<u32>>,
@@ -1150,6 +1536,7 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
                 <tr><td>Version </td><td> 4.3.0.1</td></tr>\
                 <tr><td>Main Battery Voltage </td><td> 12.60v</td></tr>\
                 <tr><td>Internal Temperature </td><td> 33.89</td></tr>\
+                <tr><td>Ignition State </td><td> on</td></tr>\
                 </table>"
                 .to_string();
             let wan = "<table>\
@@ -1164,6 +1551,7 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
                 nmea: Ok(nmea),
                 general: Ok(general),
                 wan: Ok(wan),
+                status: None,
                 ssh_out: Ok(FAKE_YAML.to_string()),
                 ssh_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
                 general_calls: Arc::new(std::sync::Mutex::new(0)),
@@ -1196,6 +1584,9 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         fn read_lci_wan(&self) -> io::Result<String> {
             to_io(&self.wan)
         }
+        fn read_status_beacon(&self) -> io::Result<Option<String>> {
+            Ok(self.status.clone())
+        }
         fn run_ssh(&self, cmd: &str) -> io::Result<String> {
             self.ssh_calls.lock().unwrap().push(cmd.to_string());
             to_io(&self.ssh_out)
@@ -1208,6 +1599,17 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
 
     const ACTION_KEY: &[u8] = b"vehicle-action-auth-test-key";
     const ACTION_NOW: i64 = 1_700_000_000_000;
+
+    const STATUS_BEACON: &str = r#"{
+        "vehicleID": "ND84720078011035",
+        "location": {"latitude": 35.1234, "longitude": -78.4567},
+        "gnssStatus": {"fix": true, "numberSatellites": 7, "antennaConnected": true},
+        "generalInformation": {
+            "ignitionOn": true,
+            "mainBatteryVoltage": 13.6,
+            "internalTemperature": 35.5
+        }
+    }"#;
 
     fn reboot_context() -> MutationContext<'static> {
         MutationContext {
@@ -1286,14 +1688,169 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         assert_eq!(state.wan.vpn_state, "Connected");
         assert_eq!(state.wan.cellular_a.signal_dbm, -72);
 
-        // Honest-partial: OBD/ignition is explicitly gapped, never fabricated.
+        // The LCI reports ignition directly; OBD remains honestly gapped.
         assert!(
-            state.gaps.iter().any(|g| g.contains("ignition/OBD")),
-            "ignition/OBD is honestly gapped: {:?}",
+            state.gaps.iter().any(|g| g.contains("OBD not wired")),
+            "OBD is honestly gapped: {:?}",
             state.gaps
         );
         assert!(!state.telem.obd_present);
-        assert!(!state.telem.ignition_on);
+        assert!(state.telem.ignition_on);
+    }
+
+    #[test]
+    fn ignition_parser_rejects_unknown_values_without_fabricating_on() {
+        let mut gaps = Vec::new();
+        assert!(!parse_ignition_state(
+            "Ignition State definitely-maybe",
+            &mut gaps
+        ));
+        assert!(gaps.iter().any(|gap| gap.contains("unrecognized ignition")));
+    }
+
+    #[test]
+    fn status_beacon_overrides_lci_and_nmea_for_primary_telemetry() {
+        let probe = FakeProbe {
+            status: Some(STATUS_BEACON.to_string()),
+            nmea: Err("ssh unavailable".to_string()),
+            ..FakeProbe::real()
+        };
+        let state = worker().build_state(&probe);
+
+        assert!(state.online);
+        assert!((state.telem.battery_v - 13.6).abs() < 0.01);
+        assert!((state.telem.internal_temp_c - 35.5).abs() < 0.01);
+        assert!(state.telem.ignition_on);
+        assert!(state.gps.has_fix());
+        assert_eq!(state.gps.satellites, 7);
+        assert!((state.gps.latitude - 35.1234).abs() < 0.0001);
+        assert!((state.gps.longitude + 78.4567).abs() < 0.0001);
+        assert!(state
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("gps/imu unavailable")));
+    }
+
+    #[test]
+    fn status_beacon_from_different_vehicle_cannot_override_trusted_telemetry() {
+        let baseline = worker().build_state(&FakeProbe::real());
+        let probe = FakeProbe {
+            status: Some(STATUS_BEACON.replace("ND84720078011035", "different-mg90")),
+            ..FakeProbe::real()
+        };
+        let state = worker().build_state(&probe);
+
+        assert_eq!(state.gps, baseline.gps);
+        assert_eq!(state.telem.battery_v, baseline.telem.battery_v);
+        assert_eq!(state.telem.internal_temp_c, baseline.telem.internal_temp_c);
+        assert!(state
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("vehicleID does not match gateway ESN")));
+    }
+
+    #[test]
+    fn status_beacon_reader_rejects_oversized_and_non_utf8_datagrams() {
+        let cases = [
+            (vec![b'x'; STATUS_BEACON_MAX_DATAGRAM_BYTES + 1], "exceeds"),
+            (vec![b'{', 0xff], "not UTF-8"),
+        ];
+
+        for (payload, expected_error) in cases {
+            let receiver = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+            let sender = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+            sender
+                .send_to(&payload, receiver.local_addr().unwrap())
+                .unwrap();
+            let probe = SshHttpProbe {
+                ip: "127.0.0.1".to_string(),
+                ssh_port: 2222,
+                ssh_pw: String::new(),
+                known_hosts_file: PathBuf::new(),
+                status_socket: Some(receiver),
+            };
+
+            let error = probe.read_status_beacon().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(
+                error.to_string().contains(expected_error),
+                "unexpected status datagram error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn out_of_range_status_values_fall_back_without_silent_clamping() {
+        let baseline = worker().build_state(&FakeProbe::real());
+        let probe = FakeProbe {
+            status: Some(
+                r#"{
+                    "vehicleID": "ND84720078011035",
+                    "location": {"latitude": 35.1234, "longitude": -78.4567},
+                    "gnssStatus": {"fix": true, "numberSatellites": 256,
+                                   "antennaConnected": true},
+                    "generalInformation": {
+                        "ignitionOn": true,
+                        "mainBatteryVoltage": -1.0,
+                        "internalTemperature": 500.0
+                    }
+                }"#
+                .to_string(),
+            ),
+            ..FakeProbe::real()
+        };
+        let state = worker().build_state(&probe);
+
+        // Invalid beacon fields do not overwrite the existing LCI/NMEA planes;
+        // in particular, 256 must not become the representable value 255.
+        assert_eq!(state.gps, baseline.gps);
+        assert_eq!(state.telem.battery_v, baseline.telem.battery_v);
+        assert_eq!(state.telem.internal_temp_c, baseline.telem.internal_temp_c);
+        assert!(state
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("satellite count out of range")));
+        assert!(state
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("battery voltage out of range")));
+        assert!(state
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("internal temperature out of range")));
+    }
+
+    #[test]
+    fn malformed_status_beacon_preserves_lci_values_and_records_gap() {
+        let probe = FakeProbe {
+            status: Some("{not-json".to_string()),
+            ..FakeProbe::real()
+        };
+        let state = worker().build_state(&probe);
+
+        assert!((state.telem.battery_v - 12.60).abs() < 0.01);
+        assert!((state.telem.internal_temp_c - 33.89).abs() < 0.01);
+        assert!(state.telem.ignition_on);
+        assert!(state
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("status broadcast invalid JSON")));
+    }
+
+    #[test]
+    fn empty_status_beacon_preserves_lci_values_and_records_schema_gap() {
+        let probe = FakeProbe {
+            status: Some("{}".to_string()),
+            ..FakeProbe::real()
+        };
+        let state = worker().build_state(&probe);
+
+        assert!((state.telem.battery_v - 12.60).abs() < 0.01);
+        assert!(state.telem.ignition_on);
+        assert!(state
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("no documented telemetry fields")));
     }
 
     #[test]

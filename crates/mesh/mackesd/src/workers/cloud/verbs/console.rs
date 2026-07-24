@@ -20,7 +20,7 @@
 use mackes_mesh_types::cloud::{CloudReply, ConsoleEndpoint, ConsoleProto};
 
 use crate::workers::console_broker::{
-    ConsoleAddr, ConsoleBrokerError, ConsoleRelay, LiveConsoleRelay,
+    is_loopback, ConsoleAddr, ConsoleBrokerError, ConsoleRelay, LiveConsoleRelay,
 };
 use crate::workers::desktop_sources::DesktopProtocol;
 
@@ -33,33 +33,50 @@ use super::CloudActionBody;
 /// [`LiveConsoleRelay`] (`virsh domdisplay`); the reply-shaping is the pure,
 /// fake-testable [`console_endpoint_reply`].
 pub(super) fn handle(verb_name: &str, body: &CloudActionBody) -> CloudReply {
-    let Some(workload) = workload_name(body) else {
-        return CloudReply {
-            ok: false,
-            verb: verb_name.to_string(),
-            error: Some(format!(
-                "`{verb_name}` requires a workload `name` (the running VM/domain) to attach a console to"
-            )),
-            ..Default::default()
-        };
+    let workload = match workload_name(body) {
+        Ok(Some(workload)) => workload,
+        Ok(None) => {
+            return CloudReply {
+                ok: false,
+                verb: verb_name.to_string(),
+                error: Some(format!(
+                    "`{verb_name}` requires a workload `name` (the running VM/domain) to attach a console to"
+                )),
+                ..Default::default()
+            }
+        }
+        Err(reason) => {
+            return CloudReply {
+                ok: false,
+                verb: verb_name.to_string(),
+                error: Some(format!("`{verb_name}` rejects the workload target: {reason}")),
+                ..Default::default()
+            }
+        }
     };
     console_endpoint_reply(&LiveConsoleRelay::new(), verb_name, workload)
 }
 
 /// The workload/domain name a `console-attach` targets — its `name`, else the
-/// lifecycle `instance` field. `None` when neither is a non-empty string.
-fn workload_name(body: &CloudActionBody) -> Option<&str> {
-    let raw = body.name.as_deref().or(body.instance.as_deref())?;
+/// lifecycle `instance` field. `None` when neither is a non-empty string. A
+/// target is also a libvirt/path-safe component before it can reach `virsh` or
+/// become the authorization target.
+fn workload_name(body: &CloudActionBody) -> Result<Option<&str>, String> {
+    let Some(raw) = body.name.as_deref().or(body.instance.as_deref()) else {
+        return Ok(None);
+    };
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        None
+        Ok(None)
+    } else if trimmed.starts_with('-') {
+        Err("workload target must not begin with `-`".to_string())
     } else {
-        Some(trimmed)
+        super::super::path_key::segment("workload", trimmed).map(Some)
     }
 }
 
 pub(super) fn authorization_target(body: &CloudActionBody) -> Option<&str> {
-    workload_name(body)
+    workload_name(body).ok().flatten()
 }
 
 /// Resolve `workload`'s live console through the injected `relay` and shape the
@@ -67,6 +84,14 @@ pub(super) fn authorization_target(body: &CloudActionBody) -> Option<&str> {
 /// resolve → map → reply path runs without a live hypervisor.
 fn console_endpoint_reply(relay: &dyn ConsoleRelay, verb_name: &str, workload: &str) -> CloudReply {
     match relay.resolve(workload) {
+        Ok(addr) if endpoint_requires_retained_relay(&addr.host) => CloudReply {
+            ok: false,
+            verb: verb_name.to_string(),
+            gated: Some(format!(
+                "`{verb_name}`: workload `{workload}` exposes a loopback or wildcard console; use the retained VDI session broker for mesh reachability"
+            )),
+            ..Default::default()
+        },
         Ok(addr) => match endpoint_from_addr(&addr) {
             Some(console) => CloudReply {
                 ok: true,
@@ -101,11 +126,16 @@ fn console_endpoint_reply(relay: &dyn ConsoleRelay, verb_name: &str, workload: &
     }
 }
 
-/// Map a resolved [`ConsoleAddr`] onto the neutral [`ConsoleEndpoint`] the shell
-/// attaches over. Spice/VNC map to their proto; an RDP head (never emitted by
+/// Map a directly reachable [`ConsoleAddr`] onto the neutral
+/// [`ConsoleEndpoint`] the shell attaches over. Loopback addresses are rejected
+/// by [`console_endpoint_reply`]: a one-shot reply cannot retain the relay handle
+/// required to make them mesh-reachable. An RDP head (never emitted by
 /// `virsh domdisplay` for a KVM guest) has no `ConsoleProto` form, so it is honestly
 /// `None` rather than silently coerced.
 fn endpoint_from_addr(addr: &ConsoleAddr) -> Option<ConsoleEndpoint> {
+    if addr.port == 0 || !valid_console_host(&addr.host) {
+        return None;
+    }
     let proto = match addr.protocol {
         DesktopProtocol::Spice => ConsoleProto::Spice,
         DesktopProtocol::Vnc => ConsoleProto::Vnc,
@@ -118,13 +148,33 @@ fn endpoint_from_addr(addr: &ConsoleAddr) -> Option<ConsoleEndpoint> {
     })
 }
 
+/// Keep an endpoint URI an authority, not an attacker-controlled URI fragment.
+/// `ConsoleAddr` normally comes from local `virsh`, but this boundary is also
+/// exercised by the typed relay seam and must stay fail-closed there.
+fn valid_console_host(host: &str) -> bool {
+    let host = host.trim();
+    !host.is_empty()
+        && host == host.trim()
+        && !host.chars().any(|c| {
+            c.is_ascii_control() || c.is_ascii_whitespace() || matches!(c, '/' | '?' | '#' | '@')
+        })
+}
+
+/// A loopback or wildcard bind is not a directly dialable mesh endpoint. The
+/// long-lived broker can safely relay it; this one-shot verb cannot.
+fn endpoint_requires_retained_relay(host: &str) -> bool {
+    is_loopback(host) || matches!(host.trim(), "0.0.0.0" | "::" | "[::]")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::workers::console_broker::RelayHandle;
 
-    /// A scripted [`ConsoleRelay`] — returns a canned resolve result. `console-attach`
-    /// only calls `resolve`, so `overlay_addr`/`start_relay` are inert stubs.
+    /// A scripted [`ConsoleRelay`] — returns a canned resolve result. The
+    /// one-shot `console-attach` path intentionally does not call
+    /// `overlay_addr`/`start_relay`, because it cannot retain their handle; the
+    /// retained session broker owns that path.
     struct FakeRelay(Result<ConsoleAddr, ConsoleBrokerError>);
 
     impl ConsoleRelay for FakeRelay {
@@ -162,12 +212,12 @@ mod tests {
 
     #[test]
     fn a_running_spice_workload_mints_a_spice_endpoint() {
-        let relay = FakeRelay(Ok(addr(DesktopProtocol::Spice, "127.0.0.1", 5900)));
+        let relay = FakeRelay(Ok(addr(DesktopProtocol::Spice, "10.42.0.7", 5900)));
         let reply = console_endpoint_reply(&relay, "console-attach", "win11");
         assert!(reply.ok, "gated: {:?} err: {:?}", reply.gated, reply.error);
         let console = reply.console.expect("console handle");
         assert_eq!(console.proto, ConsoleProto::Spice);
-        assert_eq!(console.uri, "spice://127.0.0.1:5900");
+        assert_eq!(console.uri, "spice://10.42.0.7:5900");
         assert!(console.ticket.is_none());
     }
 
@@ -191,6 +241,20 @@ mod tests {
     }
 
     #[test]
+    fn a_loopback_console_is_gated_until_a_retained_relay_exists() {
+        for host in ["127.0.0.1", "0.0.0.0", "::", "[::]"] {
+            let relay = FakeRelay(Ok(addr(DesktopProtocol::Spice, host, 5900)));
+            let reply = console_endpoint_reply(&relay, "console-attach", "win11");
+            assert!(!reply.ok, "accepted non-dialable host {host:?}");
+            assert!(reply.console.is_none());
+            assert!(reply
+                .gated
+                .unwrap()
+                .contains("retained VDI session broker"));
+        }
+    }
+
+    #[test]
     fn an_absent_virsh_toolchain_is_gated_not_errored() {
         let relay = FakeRelay(Err(ConsoleBrokerError::Gated("virsh not found".into())));
         let reply = console_endpoint_reply(&relay, "console-attach", "dev");
@@ -201,7 +265,7 @@ mod tests {
 
     #[test]
     fn an_rdp_head_has_no_attachable_console_endpoint_form() {
-        let relay = FakeRelay(Ok(addr(DesktopProtocol::Rdp, "127.0.0.1", 3389)));
+        let relay = FakeRelay(Ok(addr(DesktopProtocol::Rdp, "10.42.0.7", 3389)));
         let reply = console_endpoint_reply(&relay, "console-attach", "winvm");
         assert!(!reply.ok);
         assert!(reply.console.is_none());
@@ -221,18 +285,52 @@ mod tests {
     fn the_instance_field_is_accepted_as_the_workload_fallback() {
         assert_eq!(
             workload_name(&body(None, Some("web"))),
-            Some("web"),
+            Ok(Some("web")),
             "falls back to instance"
         );
         assert_eq!(
             workload_name(&body(Some("db"), Some("web"))),
-            Some("db"),
+            Ok(Some("db")),
             "name wins over instance"
         );
         assert_eq!(
             workload_name(&body(Some("  "), None)),
-            None,
+            Ok(None),
             "blank is none"
         );
+    }
+
+    #[test]
+    fn malformed_or_overlong_workload_targets_are_rejected_before_resolution() {
+        for target in ["../vm", "vm/name", "vm name", "--help"] {
+            let body = body(Some(target), None);
+            assert!(workload_name(&body).is_err(), "accepted unsafe target {target:?}");
+            assert!(authorization_target(&body).is_none());
+        }
+        let overlong = "x".repeat(256);
+        let body = body(Some(&overlong), None);
+        assert!(workload_name(&body).is_err());
+        assert!(authorization_target(&body).is_none());
+
+        let reply = handle("console-attach", &body);
+        assert!(!reply.ok);
+        assert!(reply
+            .error
+            .unwrap()
+            .contains("rejects the workload target"));
+    }
+
+    #[test]
+    fn malformed_console_addresses_never_become_endpoint_uris() {
+        for host in ["", "bad host", "10.42.0.7/path", "10.42.0.7?x=1"] {
+            let relay = FakeRelay(Ok(addr(DesktopProtocol::Vnc, host, 5901)));
+            let reply = console_endpoint_reply(&relay, "console-attach", "vm");
+            assert!(!reply.ok, "accepted malformed host {host:?}");
+            assert!(reply.console.is_none());
+        }
+        let relay = FakeRelay(Ok(addr(DesktopProtocol::Vnc, "10.42.0.7", 0)));
+        let reply = console_endpoint_reply(&relay, "console-attach", "vm");
+        assert!(!reply.ok);
+        assert!(reply.console.is_none());
     }
 }

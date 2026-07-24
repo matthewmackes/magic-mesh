@@ -14,7 +14,7 @@
 //! layout (the `widget_rect` panic class).
 
 use mde_egui::egui::{self, Color32, Rect, Sense, Ui, Vec2};
-use mde_egui::{Density, Style};
+use mde_egui::{Density, Style, TypographyRole};
 use mde_theme::brand::icons::IconId;
 
 use crate::surfaces::{self, Surface};
@@ -123,18 +123,35 @@ pub struct CarHomeGlance {
 }
 
 impl CarHomeGlance {
+    /// A gateway can publish an optional field with an empty payload while its
+    /// feed is present but sparse. Treat that exactly like absent data: an
+    /// empty strong-colored line would falsely suggest a live reading.
+    fn non_empty(value: Option<&str>) -> Option<&str> {
+        value.map(str::trim).filter(|value| !value.is_empty())
+    }
+
+    fn nav_value(&self) -> Option<&str> {
+        Self::non_empty(self.nav.as_deref())
+    }
+
+    fn media_value(&self) -> Option<&str> {
+        Self::non_empty(self.media.as_deref())
+    }
+
+    fn vehicle_value(&self) -> Option<&str> {
+        Self::non_empty(self.vehicle.as_deref())
+    }
+
     /// The Nav card's line: the live route summary, else the honest prompt.
     #[must_use]
     pub fn nav_line(&self) -> String {
-        self.nav.clone().unwrap_or_else(|| "Where to?".to_string())
+        self.nav_value().unwrap_or("Where to?").to_owned()
     }
 
     /// The Media card's line: the now-playing title, else the honest descriptor.
     #[must_use]
     pub fn media_line(&self) -> String {
-        self.media
-            .clone()
-            .unwrap_or_else(|| "Music & podcasts".to_string())
+        self.media_value().unwrap_or("Music & podcasts").to_owned()
     }
 
     /// The glance card's comms row: the alert count, else the honest descriptor.
@@ -149,9 +166,7 @@ impl CarHomeGlance {
     /// The glance card's vehicle row: live telematics, else the honest descriptor.
     #[must_use]
     pub fn vehicle_line(&self) -> String {
-        self.vehicle
-            .clone()
-            .unwrap_or_else(|| "Telematics".to_string())
+        self.vehicle_value().unwrap_or("Telematics").to_owned()
     }
 }
 
@@ -184,16 +199,30 @@ pub(crate) struct CarHomeLayout {
 }
 
 /// Compute the dashboard geometry for the home's body rect, or `None` when the
-/// rect is degenerate (crash-safety: nothing tiny/NaN reaches egui layout).
+/// rect is degenerate or too small for safe Car touch targets.
 pub(crate) fn dashboard_layout(body: Rect) -> Option<CarHomeLayout> {
     if !body.is_finite() || body.width() < 2.0 || body.height() < 2.0 {
         return None;
     }
     let gap = Style::SP_M;
+    let cols = CarTile::ALL.len() as f32;
+    let touch_target = Density::Touch.min_hit_target();
+    // Car's one-row strip and split cards are all primary targets. If the
+    // viewport cannot hold six square 44pt targets plus the design gaps, or
+    // two 44pt glance-card rows plus the strip, returning no layout is safer
+    // than painting controls outside the body or shrinking them below the
+    // driver's touch contract.
+    let min_strip_height = touch_target + Style::SP_XL;
+    let min_cards_height = touch_target * 2.0 + gap;
+    let min_body_width = touch_target * cols + gap * (cols - 1.0);
+    let min_body_height = min_strip_height + gap + min_cards_height;
+    if body.width() < min_body_width || body.height() < min_body_height {
+        return None;
+    }
     // The strip stays compact but never below a real touch row: the finger
     // hit-target floor plus room for the glyph + label (Density::Touch, Q35).
     let strip_h = (body.height() * 0.26)
-        .max(Density::Touch.min_hit_target() + Style::SP_XL)
+        .max(min_strip_height)
         .min(body.height() * 0.45);
     let cards_h = (body.height() - strip_h - gap).max(1.0);
     let nav_w = ((body.width() - gap) * 0.56).max(1.0);
@@ -208,20 +237,29 @@ pub(crate) fn dashboard_layout(body: Rect) -> Option<CarHomeLayout> {
         egui::vec2(right_w, half_h),
     );
     let strip_top = body.bottom() - strip_h;
-    let cols = CarTile::ALL.len() as f32;
-    let tile_w = ((body.width() - gap * (cols - 1.0)) / cols).max(1.0);
+    let tile_w = (body.width() - gap * (cols - 1.0)) / cols;
     let strip = core::array::from_fn(|i| {
         Rect::from_min_size(
             egui::pos2(body.left() + i as f32 * (tile_w + gap), strip_top),
             egui::vec2(tile_w, strip_h),
         )
     });
-    Some(CarHomeLayout {
+    let layout = CarHomeLayout {
         nav_card,
         media_card,
         glance_card,
         strip,
-    })
+    };
+    // Keep the guard close to the geometry producer: future ratio changes must
+    // fail closed instead of handing egui an off-body interaction rectangle.
+    if !body.contains_rect(layout.nav_card)
+        || !body.contains_rect(layout.media_card)
+        || !body.contains_rect(layout.glance_card)
+        || layout.strip.iter().any(|rect| !body.contains_rect(*rect))
+    {
+        return None;
+    }
+    Some(layout)
 }
 
 /// Render the Auto Mode home. Returns the tile the driver activated this frame
@@ -251,12 +289,26 @@ pub fn car_home_panel(ui: &mut Ui, glance: &CarHomeGlance) -> Option<CarTile> {
         egui::pos2(inner.left(), inner.top()),
         egui::Align2::LEFT_TOP,
         "Auto Mode",
-        egui::FontId::new(Style::DISPLAY, egui::FontFamily::Name("heading".into())),
+        Style::typography_font(TypographyRole::Display),
         Style::SYNC3_TEXT_STRONG,
     );
 
     let body = Rect::from_min_max(egui::pos2(inner.left(), inner.top() + header_h), inner.max);
-    let layout = dashboard_layout(body)?;
+    let Some(layout) = dashboard_layout(body) else {
+        // A narrow/short workspace is an honest degraded state, not a reason
+        // to paint controls below the touch-target floor. Tell the driver why
+        // the cards are absent instead of leaving a title over an empty panel.
+        if body.is_finite() && body.width() >= 2.0 && body.height() >= 2.0 {
+            painter.text(
+                body.center(),
+                egui::Align2::CENTER_CENTER,
+                "Resize workspace to use Auto Mode",
+                Style::typography_font(TypographyRole::Body),
+                Style::SYNC3_TEXT_DIM,
+            );
+        }
+        return None;
+    };
 
     let mut activated = None;
     if paint_nav_card(ui, &painter, layout.nav_card, glance) {
@@ -287,11 +339,15 @@ fn card_plate(
     painter: &egui::Painter,
     rect: Rect,
     salt: &'static str,
+    label: &'static str,
 ) -> Option<(egui::Painter, bool)> {
     if !rect.is_finite() || rect.width() < 2.0 || rect.height() < 2.0 {
         return None;
     }
     let resp = ui.interact(rect, egui::Id::new(("car-home-card", salt)), Sense::click());
+    resp.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+    });
     let fill = if resp.is_pointer_button_down_on() {
         Style::pressed_fill(Style::SYNC3_ACCENT)
     } else if resp.hovered() {
@@ -327,8 +383,12 @@ fn card_plate(
         },
         Style::SYNC3_ACCENT,
     );
+    mde_egui::focus::paint_focus_ring(painter, rect, resp.has_focus());
     // Clip the content to the card so a long now-playing title never overflows.
-    Some((painter.with_clip_rect(rect), resp.clicked()))
+    Some((
+        painter.with_clip_rect(rect),
+        surfaces::response_activated(ui, &resp),
+    ))
 }
 
 /// A card's icon + app-name header row, top-left, SYNC3-accent tinted glyph.
@@ -353,10 +413,7 @@ fn card_header(ui: &Ui, p: &egui::Painter, rect: Rect, icon: IconId, title: &str
         ),
         egui::Align2::LEFT_CENTER,
         title,
-        egui::FontId::new(
-            Style::TYPE_HEADLINE,
-            egui::FontFamily::Name("heading".into()),
-        ),
+        Style::typography_font(TypographyRole::Headline),
         Style::SYNC3_TEXT_DIM,
     );
 }
@@ -364,18 +421,18 @@ fn card_header(ui: &Ui, p: &egui::Painter, rect: Rect, icon: IconId, title: &str
 /// The Nav card — the largest card: the live route/ETA glance while guidance
 /// runs, else the honest "Where to?" prompt. Tap opens Navigation.
 fn paint_nav_card(ui: &mut Ui, painter: &egui::Painter, rect: Rect, g: &CarHomeGlance) -> bool {
-    let Some((p, clicked)) = card_plate(ui, painter, rect, "nav") else {
+    let Some((p, clicked)) = card_plate(ui, painter, rect, "nav", "Navigation") else {
         return false;
     };
     card_header(ui, &p, rect, IconId::MapsLocation, "Navigation");
     // The glance line — live values read strong, the absent-data prompt reads
     // dim (the honesty cue: a fallback never masquerades as a reading).
-    let live = g.nav.is_some();
+    let live = g.nav_value().is_some();
     p.text(
         egui::pos2(rect.left() + Style::SP_M, rect.bottom() - Style::SP_M),
         egui::Align2::LEFT_BOTTOM,
         g.nav_line(),
-        egui::FontId::new(Style::TYPE_TITLE2, egui::FontFamily::Proportional),
+        Style::typography_font(TypographyRole::Title),
         if live {
             Style::SYNC3_TEXT_STRONG
         } else {
@@ -388,16 +445,16 @@ fn paint_nav_card(ui: &mut Ui, painter: &egui::Painter, rect: Rect, g: &CarHomeG
 /// The Media card — the now-playing glance (honest "Music & podcasts" when
 /// nothing is loaded). Tap opens Media.
 fn paint_media_card(ui: &mut Ui, painter: &egui::Painter, rect: Rect, g: &CarHomeGlance) -> bool {
-    let Some((p, clicked)) = card_plate(ui, painter, rect, "media") else {
+    let Some((p, clicked)) = card_plate(ui, painter, rect, "media", "Media") else {
         return false;
     };
     card_header(ui, &p, rect, IconId::Media, "Media");
-    let live = g.media.is_some();
+    let live = g.media_value().is_some();
     p.text(
         egui::pos2(rect.left() + Style::SP_M, rect.bottom() - Style::SP_M),
         egui::Align2::LEFT_BOTTOM,
         g.media_line(),
-        egui::FontId::new(Style::TYPE_TITLE3, egui::FontFamily::Proportional),
+        Style::typography_font(TypographyRole::Body),
         if live {
             Style::SYNC3_TEXT_STRONG
         } else {
@@ -437,7 +494,7 @@ fn glance_row(
         egui::pos2(rect.left() + edge + Style::SP_S, rect.center().y),
         egui::Align2::LEFT_CENTER,
         line,
-        egui::FontId::new(Style::TYPE_TITLE3, egui::FontFamily::Proportional),
+        Style::typography_font(TypographyRole::Body),
         if live {
             Style::SYNC3_TEXT_STRONG
         } else {
@@ -450,7 +507,7 @@ fn glance_row(
 /// the gateway drives location) over the comms alert count. Tap opens the
 /// Vehicle telematics tab.
 fn paint_glance_card(ui: &mut Ui, painter: &egui::Painter, rect: Rect, g: &CarHomeGlance) -> bool {
-    let Some((p, clicked)) = card_plate(ui, painter, rect, "glance") else {
+    let Some((p, clicked)) = card_plate(ui, painter, rect, "glance", "Vehicle telematics") else {
         return false;
     };
     let inset = Rect::from_min_max(
@@ -471,7 +528,7 @@ fn paint_glance_card(ui: &mut Ui, painter: &egui::Painter, rect: Rect, g: &CarHo
             IconId::HealthStatus,
             Style::OK,
             &g.vehicle_line(),
-            g.vehicle.is_some(),
+            g.vehicle_value().is_some(),
         );
         glance_row(
             ui,
@@ -494,6 +551,9 @@ fn paint_app_tile(ui: &mut Ui, painter: &egui::Painter, rect: Rect, tile: CarTil
     }
     let id = egui::Id::new(("car-home-app", tile.label()));
     let resp = ui.interact(rect, id, Sense::click());
+    resp.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), tile.label())
+    });
 
     let fill = if resp.is_pointer_button_down_on() {
         Style::pressed_fill(tile.accent())
@@ -534,11 +594,12 @@ fn paint_app_tile(ui: &mut Ui, painter: &egui::Painter, rect: Rect, tile: CarTil
         egui::pos2(rect.center().x, rect.bottom() - Style::SP_S),
         egui::Align2::CENTER_BOTTOM,
         tile.label(),
-        egui::FontId::new(Style::TYPE_SUBHEADLINE, egui::FontFamily::Proportional),
+        Style::typography_font(TypographyRole::Label),
         Style::SYNC3_TEXT_STRONG,
     );
 
-    resp.clicked()
+    mde_egui::focus::paint_focus_ring(painter, rect, resp.has_focus());
+    surfaces::response_activated(ui, &resp)
 }
 
 #[cfg(test)]
@@ -581,6 +642,19 @@ mod tests {
         assert_eq!(empty.media_line(), "Music & podcasts");
         assert_eq!(empty.comms_line(), "Alerts & messages");
         assert_eq!(empty.vehicle_line(), "Telematics");
+
+        // A sparse gateway payload is not a live reading: empty and whitespace
+        // strings must keep the dim honest descriptors instead of a blank,
+        // strong-colored card line.
+        let sparse = CarHomeGlance {
+            nav: Some("  ".to_string()),
+            media: Some(String::new()),
+            vehicle: Some("\n\t".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(sparse.nav_line(), "Where to?");
+        assert_eq!(sparse.media_line(), "Music & podcasts");
+        assert_eq!(sparse.vehicle_line(), "Telematics");
 
         let live = CarHomeGlance {
             nav: Some("12 min · 4.3 mi · ETA 14:32".to_string()),
@@ -632,6 +706,8 @@ mod tests {
         assert_eq!(l.strip.len(), CarTile::ALL.len());
         for (i, r) in l.strip.iter().enumerate() {
             assert!(body.contains_rect(*r), "strip tile {i} inside the body");
+            assert!(r.width() >= Density::Touch.min_hit_target());
+            assert!(r.height() >= Density::Touch.min_hit_target());
             if i > 0 {
                 assert!(
                     r.left() > l.strip[i - 1].right(),
@@ -643,6 +719,45 @@ mod tests {
         assert!(l.media_card.left() > l.nav_card.right());
         assert!(l.glance_card.top() > l.media_card.bottom());
         assert!(l.strip[0].top() > l.nav_card.bottom());
+        for (name, card) in [
+            ("nav", l.nav_card),
+            ("media", l.media_card),
+            ("glance", l.glance_card),
+        ] {
+            assert!(
+                card.width() >= Density::Touch.min_hit_target()
+                    && card.height() >= Density::Touch.min_hit_target(),
+                "{name} card remains a touch target: {card:?}"
+            );
+        }
+
+        // A one-row six-app strip cannot remain a safe touch surface below its
+        // minimum width, and the split cards cannot remain two touch rows below
+        // their minimum height. Reject both before producing off-body rects.
+        let cols = CarTile::ALL.len() as f32;
+        let min_width = Density::Touch.min_hit_target() * cols + Style::SP_M * (cols - 1.0);
+        let min_height = (Density::Touch.min_hit_target() + Style::SP_XL)
+            + Style::SP_M
+            + (Density::Touch.min_hit_target() * 2.0 + Style::SP_M);
+        assert!(dashboard_layout(Rect::from_min_size(
+            pos2(0.0, 0.0),
+            vec2(min_width - 1.0, min_height + 64.0),
+        ))
+        .is_none());
+        assert!(dashboard_layout(Rect::from_min_size(
+            pos2(0.0, 0.0),
+            vec2(min_width + 64.0, min_height - 1.0),
+        ))
+        .is_none());
+        let minimum = dashboard_layout(Rect::from_min_size(
+            pos2(0.0, 0.0),
+            vec2(min_width, min_height),
+        ))
+        .expect("the exact safe minimum still has a complete dashboard");
+        assert!(minimum.strip.iter().all(|r| {
+            r.width() >= Density::Touch.min_hit_target()
+                && r.height() >= Density::Touch.min_hit_target()
+        }));
 
         // A degenerate body never lays out (crash-safety).
         assert!(dashboard_layout(Rect::from_min_size(pos2(0.0, 0.0), vec2(1.0, 1.0))).is_none());
@@ -654,9 +769,10 @@ mod tests {
     /// The headless render harness: `Context::run` → tessellate (the DRM
     /// runner's path minus the GPU), driving the panel over a margin-less
     /// CentralPanel so the geometry matches [`dashboard_layout`] exactly.
-    fn drive(
+    fn drive_with_screen(
         glance: &CarHomeGlance,
         frames: Vec<Vec<egui::Event>>,
+        screen_size: Vec2,
     ) -> (Vec<Option<CarTile>>, Vec<egui::epaint::ClippedShape>) {
         let ctx = egui::Context::default();
         Style::install(&ctx);
@@ -664,7 +780,7 @@ mod tests {
         let mut shapes = Vec::new();
         for events in frames {
             let input = egui::RawInput {
-                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1024.0, 640.0))),
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), screen_size)),
                 events,
                 ..Default::default()
             };
@@ -680,6 +796,13 @@ mod tests {
             shapes = out.shapes;
         }
         (picks, shapes)
+    }
+
+    fn drive(
+        glance: &CarHomeGlance,
+        frames: Vec<Vec<egui::Event>>,
+    ) -> (Vec<Option<CarTile>>, Vec<egui::epaint::ClippedShape>) {
+        drive_with_screen(glance, frames, vec2(1024.0, 640.0))
     }
 
     /// Every painted text run from a frame's shapes.
@@ -739,6 +862,23 @@ mod tests {
                 || t.contains("ETA")
                 || t.contains("min ·")),
             "an empty glance must paint no invented readings: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn dashboard_renders_an_honest_notice_when_touch_layout_does_not_fit() {
+        let (picks, shapes) = drive_with_screen(
+            &CarHomeGlance::default(),
+            vec![vec![]],
+            vec2(420.0, 220.0),
+        );
+        assert_eq!(picks, vec![None], "a too-small workspace has no active target");
+        let texts = painted_text(&shapes);
+        assert!(
+            texts
+                .iter()
+                .any(|text| text == "Resize workspace to use Auto Mode"),
+            "small workspaces explain their degraded state: {texts:?}"
         );
     }
 
@@ -803,16 +943,63 @@ mod tests {
             ]
         };
 
-        // Strip: the Music tile (index 2 in Q32 order) routes CarTile::Music.
-        let (picks, _) = drive(&CarHomeGlance::default(), tap(l.strip[2].center()));
-        assert_eq!(picks.last(), Some(&Some(CarTile::Music)));
+        // Every strip target routes its own app; none of the six becomes an
+        // unreachable decorative icon at the edge of the row.
+        for (tile, rect) in CarTile::ALL.into_iter().zip(l.strip) {
+            let (picks, _) = drive(&CarHomeGlance::default(), tap(rect.center()));
+            assert_eq!(picks.last(), Some(&Some(tile)), "{tile:?} strip tap");
+        }
 
         // The Nav card routes CarTile::Nav.
         let (picks, _) = drive(&CarHomeGlance::default(), tap(l.nav_card.center()));
         assert_eq!(picks.last(), Some(&Some(CarTile::Nav)));
 
+        // The Media card remains independently reachable from its split card.
+        let (picks, _) = drive(&CarHomeGlance::default(), tap(l.media_card.center()));
+        assert_eq!(picks.last(), Some(&Some(CarTile::Media)));
+
         // The glance card routes CarTile::Vehicle (its telematics tab target).
         let (picks, _) = drive(&CarHomeGlance::default(), tap(l.glance_card.center()));
         assert_eq!(picks.last(), Some(&Some(CarTile::Vehicle)));
+    }
+
+    #[test]
+    fn focused_car_targets_activate_with_enter() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let glance = CarHomeGlance::default();
+        let mut picks = Vec::new();
+
+        let mut frame = |events: Vec<egui::Event>| {
+            let out = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1024.0, 640.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |ui| picks.push(car_home_panel(ui, &glance)));
+                },
+            );
+            assert!(!ctx.tessellate(out.shapes, out.pixels_per_point).is_empty());
+        };
+
+        // Register the hand-painted controls before requesting focus by their
+        // stable IDs, matching the shell's keyboard-navigation lifecycle.
+        frame(vec![]);
+        ctx.memory_mut(|memory| {
+            memory.request_focus(egui::Id::new(("car-home-app", "Navigation")))
+        });
+        frame(vec![egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+
+        assert_eq!(picks, vec![None, Some(CarTile::Nav)]);
     }
 }

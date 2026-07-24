@@ -248,10 +248,16 @@ mod tests {
         // A panel jump opens the lens.
         apply(&mut state, MenuAction::Open(Panel::Status));
         assert_eq!(state.panel(), Panel::Status);
-        // Apply infrastructure opens the typed-confirm (nothing publishes yet).
+        // Apply infrastructure fails closed without a selected node capability.
         apply(&mut state, MenuAction::ProvisionApply);
         assert_eq!(state.panel(), Panel::Provision);
-        assert!(state.has_arming(), "Apply opens the typed-confirm");
+        assert!(
+            !state.has_arming(),
+            "unavailable apply must not open the confirm"
+        );
+        assert!(state
+            .note_text()
+            .is_some_and(|note| note.contains("unavailable")));
         // Help surfaces the honest posture note.
         apply(&mut state, MenuAction::HelpAbout);
         assert!(state.note_text().is_some_and(|n| n.contains("apply")));

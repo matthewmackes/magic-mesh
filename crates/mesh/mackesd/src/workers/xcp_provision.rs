@@ -40,6 +40,7 @@
 #![cfg(feature = "async-services")]
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mackes_xcp::{
@@ -50,6 +51,7 @@ use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_bus::rpc::reply_topic;
 
+use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
 use crate::ipc::secret_store::{self, SecretStore};
 
 use super::{ShutdownToken, Worker};
@@ -88,6 +90,13 @@ pub const HOSTS_TOPIC: &str = "action/provision/hosts";
 /// on `reply/<request-ulid>`. Leader-managed: any authorized node can drive it
 /// and every enrolled node then reads the same replicated secret.
 pub const SET_CREDS_TOPIC: &str = "action/provision/set-creds";
+
+/// Capability verbs for the four XCP mutation lanes. Read-only list/hosts
+/// requests intentionally stay open.
+const XCP_SPAWN_AUTH_VERB: &str = "xcp-provision-spawn";
+const XCP_START_AUTH_VERB: &str = "xcp-provision-start";
+const XCP_DESTROY_AUTH_VERB: &str = "xcp-provision-destroy";
+const XCP_SET_CREDS_AUTH_VERB: &str = "xcp-provision-set-creds";
 
 /// The golden template every spawn clones (design A2).
 pub const GOLDEN_TEMPLATE: &str = "MDE-VM-golden";
@@ -506,7 +515,7 @@ fn poll_vm_ip<H: Hypervisor>(hv: &H, uuid: &str, wait: Duration, poll: Duration)
 
 /// Read new spawn requests on [`SPAWN_TOPIC`] since `cursor`. Opens + drops a
 /// `Persist` synchronously so it never crosses an `.await`.
-fn read_new_spawns(bus_root: &Path, cursor: &mut Option<String>) -> Vec<SpawnRequest> {
+fn read_new_spawns(bus_root: &Path, cursor: &mut Option<String>) -> Vec<PendingRequest> {
     let Ok(persist) = Persist::open(bus_root.to_path_buf()) else {
         return vec![];
     };
@@ -516,13 +525,10 @@ fn read_new_spawns(bus_root: &Path, cursor: &mut Option<String>) -> Vec<SpawnReq
     let mut out = Vec::new();
     for msg in msgs {
         *cursor = Some(msg.ulid.clone());
-        let body = msg.body.as_deref().unwrap_or("");
-        match parse_spawn_request(body) {
-            Ok(req) => out.push(req),
-            Err(e) => {
-                tracing::warn!(ulid = %msg.ulid, error = %e, "xcp_provision: bad spawn request");
-            }
-        }
+        out.push(PendingRequest {
+            body: msg.body.unwrap_or_default(),
+            ulid: msg.ulid,
+        });
     }
     out
 }
@@ -559,7 +565,65 @@ fn operator_ssh_key() -> String {
 }
 
 fn default_bus_root() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join("mde").join("bus"))
+    mde_bus::default_data_dir()
+}
+
+/// Stable node scope for XCP capabilities. Publishers may override it for a
+/// test or an explicitly named daemon node; the hostname fallback keeps the
+/// capability bound to this machine rather than an arbitrary remote writer.
+fn auth_node_id() -> String {
+    if let Ok(value) = std::env::var("MACKESD_NODE_ID") {
+        let value = value.trim();
+        if !value.is_empty() {
+            return value.to_owned();
+        }
+    }
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "local".to_string())
+}
+
+/// Build the stable capability target from a raw typed request body. Parsing
+/// only extracts binding fields; the typed request is decoded after this gate
+/// and before any backend call.
+fn auth_target(body: &str, fields: &[&str]) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return String::new();
+    };
+    fields
+        .iter()
+        .map(|field| {
+            value
+                .get(*field)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Authorize one XCP mutation before request decoding or any Xe/SSH/secret
+/// effect. The shared helper keeps the exact-body, TTL, and replay semantics
+/// identical across spawn, start, destroy, and credential rotation.
+fn authorize_xcp_request(
+    authorizer: &ActionAuthorizer,
+    verb: &'static str,
+    body: &str,
+    target: &str,
+) -> Result<(), String> {
+    let node = auth_node_id();
+    authorizer.authorize(
+        body,
+        MutationContext {
+            verb,
+            node: &node,
+            target,
+        },
+    )
 }
 
 /// Run one spawn end-to-end on a blocking thread + write the ack. Never panics.
@@ -899,7 +963,11 @@ impl ResponderCursors {
 /// (keeping the async loop responsive + `Persist` off the `.await`), exactly
 /// like the spawn drain. Separate cursors mean these never interfere with the
 /// spawn flow.
-async fn drain_responders(bus_root: &Path, cursors: &mut ResponderCursors) {
+async fn drain_responders(
+    bus_root: &Path,
+    cursors: &mut ResponderCursors,
+    authorizer: &ActionAuthorizer,
+) {
     for req in read_new_requests(bus_root, LIST_TOPIC, &mut cursors.list) {
         let bus_root = bus_root.to_path_buf();
         run_blocking(move || handle_list_blocking(&bus_root, &req.ulid), "list").await;
@@ -909,6 +977,15 @@ async fn drain_responders(bus_root: &Path, cursors: &mut ResponderCursors) {
         run_blocking(move || handle_hosts_blocking(&bus_root, &req.ulid), "hosts").await;
     }
     for req in read_new_requests(bus_root, START_TOPIC, &mut cursors.start) {
+        if let Err(error) = authorize_xcp_request(
+            authorizer,
+            XCP_START_AUTH_VERB,
+            &req.body,
+            &auth_target(&req.body, &["host", "name"]),
+        ) {
+            tracing::warn!(req = %req.ulid, %error, "xcp_provision: unauthorized start refused");
+            continue;
+        }
         let bus_root = bus_root.to_path_buf();
         run_blocking(
             move || handle_start_blocking(&bus_root, &req.ulid, &req.body),
@@ -917,6 +994,15 @@ async fn drain_responders(bus_root: &Path, cursors: &mut ResponderCursors) {
         .await;
     }
     for req in read_new_requests(bus_root, DESTROY_TOPIC, &mut cursors.destroy) {
+        if let Err(error) = authorize_xcp_request(
+            authorizer,
+            XCP_DESTROY_AUTH_VERB,
+            &req.body,
+            &auth_target(&req.body, &["host", "name"]),
+        ) {
+            tracing::warn!(req = %req.ulid, %error, "xcp_provision: unauthorized destroy refused");
+            continue;
+        }
         let bus_root = bus_root.to_path_buf();
         run_blocking(
             move || handle_destroy_blocking(&bus_root, &req.ulid, &req.body),
@@ -928,6 +1014,15 @@ async fn drain_responders(bus_root: &Path, cursors: &mut ResponderCursors) {
     // so its cursor is seeded at the tail like start/destroy — no replay of an
     // old credential write on a worker restart.
     for req in read_new_requests(bus_root, SET_CREDS_TOPIC, &mut cursors.set_creds) {
+        if let Err(error) = authorize_xcp_request(
+            authorizer,
+            XCP_SET_CREDS_AUTH_VERB,
+            &req.body,
+            &auth_target(&req.body, &["host"]),
+        ) {
+            tracing::warn!(req = %req.ulid, %error, "xcp_provision: unauthorized set-creds refused");
+            continue;
+        }
         let bus_root = bus_root.to_path_buf();
         run_blocking(
             move || handle_set_creds_blocking(&bus_root, &req.ulid, &req.body),
@@ -949,6 +1044,7 @@ async fn run_blocking<F: FnOnce() + Send + 'static>(f: F, verb: &str) {
 pub struct XcpProvisionWorker {
     poll_interval: Duration,
     bus_root_override: Option<PathBuf>,
+    authorizer: Arc<ActionAuthorizer>,
 }
 
 impl Default for XcpProvisionWorker {
@@ -960,10 +1056,11 @@ impl Default for XcpProvisionWorker {
 impl XcpProvisionWorker {
     /// Construct with production defaults.
     #[must_use]
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             poll_interval: DEFAULT_POLL_INTERVAL,
             bus_root_override: None,
+            authorizer: Arc::new(ActionAuthorizer::production()),
         }
     }
 
@@ -971,6 +1068,15 @@ impl XcpProvisionWorker {
     #[must_use]
     pub fn with_bus_root(mut self, p: PathBuf) -> Self {
         self.bus_root_override = Some(p);
+        self
+    }
+
+    /// Inject an isolated verifier/replay ledger for hostile action tests.
+    /// Production always uses the systemd-credential-backed authorizer.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
+        self.authorizer = authorizer;
         self
     }
 }
@@ -998,7 +1104,23 @@ impl Worker for XcpProvisionWorker {
             tokio::select! {
                 _ = tick.tick() => {
                     let new_reqs = read_new_spawns(&bus_root, &mut cursor);
-                    for req in new_reqs {
+                    for pending in new_reqs {
+                        if let Err(error) = authorize_xcp_request(
+                            &self.authorizer,
+                            XCP_SPAWN_AUTH_VERB,
+                            &pending.body,
+                            &auth_target(&pending.body, &["host", "name"]),
+                        ) {
+                            tracing::warn!(req = %pending.ulid, %error, "xcp_provision: unauthorized spawn refused");
+                            continue;
+                        }
+                        let req = match parse_spawn_request(&pending.body) {
+                            Ok(req) => req,
+                            Err(error) => {
+                                tracing::warn!(req = %pending.ulid, %error, "xcp_provision: bad spawn request");
+                                continue;
+                            }
+                        };
                         let bus_root = bus_root.clone();
                         // Each spawn shells out via xe/ssh + polls for the IP
                         // (up to IP_WAIT_TIMEOUT) on a blocking thread so the
@@ -1012,7 +1134,7 @@ impl Worker for XcpProvisionWorker {
                     // XCP-4: drain the list/destroy/hosts responder topics the
                     // Workbench Provisioning panel queries — separate cursors,
                     // so they never disturb the spawn flow above.
-                    drain_responders(&bus_root, &mut responder_cursors).await;
+                    drain_responders(&bus_root, &mut responder_cursors, &self.authorizer).await;
                 }
                 () = shutdown.wait() => break,
             }
@@ -1026,6 +1148,108 @@ mod tests {
     use super::*;
     use mackes_xcp::{HostCapacity, IdentitySeed, VmInfo, XcpError};
     use std::cell::RefCell;
+
+    const ACTION_KEY: &[u8] = b"xcp-provision-action-auth-test-key";
+    const ACTION_NOW: i64 = 1_700_000_000_000;
+
+    fn armed_xcp_body(unsigned: &str, verb: &'static str, target: &str, nonce: &str) -> String {
+        let node = auth_node_id();
+        crate::ipc::action_auth::authorize_test_body(
+            ACTION_KEY,
+            unsigned,
+            MutationContext {
+                verb,
+                node: &node,
+                target,
+            },
+            nonce,
+            ACTION_NOW + 30_000,
+        )
+    }
+
+    #[test]
+    fn xcp_mutation_capabilities_refuse_unsigned_tampered_and_replayed_bodies() {
+        let cases = [
+            (
+                XCP_SPAWN_AUTH_VERB,
+                r#"{"request_ulid":"01SPAWN","name":"web1","host":"172.20.0.4","schema_version":1}"#,
+                "172.20.0.4/web1",
+            ),
+            (
+                XCP_START_AUTH_VERB,
+                r#"{"name":"web1","host":"172.20.0.4","schema_version":1}"#,
+                "172.20.0.4/web1",
+            ),
+            (
+                XCP_DESTROY_AUTH_VERB,
+                r#"{"name":"web1","host":"172.20.0.4","schema_version":1}"#,
+                "172.20.0.4/web1",
+            ),
+            (
+                XCP_SET_CREDS_AUTH_VERB,
+                r#"{"host":"172.20.0.4","username":"root","password":"secret","schema_version":1}"#,
+                "172.20.0.4",
+            ),
+        ];
+
+        for (index, (verb, unsigned, target)) in cases.into_iter().enumerate() {
+            let auth_root = tempfile::tempdir().unwrap();
+            let gate =
+                ActionAuthorizer::for_test(ACTION_KEY, auth_root.path().to_path_buf(), ACTION_NOW);
+            assert!(
+                gate.authorize(
+                    unsigned,
+                    MutationContext {
+                        verb,
+                        node: &auth_node_id(),
+                        target,
+                    },
+                )
+                .is_err(),
+                "unsigned {verb} must be refused"
+            );
+
+            let nonce = format!("xcp-once-{index}");
+            let armed = armed_xcp_body(unsigned, verb, target, &nonce);
+            let tampered = armed.replace("172.20.0.4", "172.20.0.5");
+            assert!(
+                gate.authorize(
+                    &tampered,
+                    MutationContext {
+                        verb,
+                        node: &auth_node_id(),
+                        target,
+                    },
+                )
+                .is_err(),
+                "tampered {verb} must be refused"
+            );
+            assert!(
+                gate.authorize(
+                    &armed,
+                    MutationContext {
+                        verb,
+                        node: &auth_node_id(),
+                        target,
+                    },
+                )
+                .is_ok(),
+                "authorized {verb} must pass once"
+            );
+            assert!(
+                gate.authorize(
+                    &armed,
+                    MutationContext {
+                        verb,
+                        node: &auth_node_id(),
+                        target,
+                    },
+                )
+                .is_err(),
+                "replayed {verb} must be refused"
+            );
+        }
+    }
 
     // ── parse / ack codecs ──
 

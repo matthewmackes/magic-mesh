@@ -20,20 +20,18 @@
 //! The ring freezes while the grid is showing, so a card mid-flick is never
 //! resurrected by the same-frame promote of the still-foreground surface.
 //!
-//! ## Snapshots: what is real today
+//! ## Snapshots
 //!
 //! * The **Desktop card** shows the live VDI frame texture the session preview
 //!   already holds (`vdi::session_preview_frame` — a real decoded frame).
-//! * Every other card shows the **fallback plate** — the Q22 tile treatment
-//!   ([`Style::tile_plate_fill`] over the launcher-group accent + the white
-//!   surface glyph) — which the Q16 lock names as the legitimate no-snapshot
-//!   rendering, not a placeholder.
-//! * **Snapshot-on-leave for arbitrary egui surfaces is deferred to U29**: the
-//!   only in-tree rasterizer (`mde_egui::capture`) is the headless offscreen
-//!   wgpu PNG path — wiring it (or a live copy of the shell's own render
-//!   target) to fire on surface-leave needs `main.rs` surgery beyond this
-//!   unit's slot. The hook is this module's [`mount`] `desktop_preview`
-//!   parameter generalized to a per-surface texture map; U29 feeds it.
+//! * Every card without a captured frame shows the **fallback plate** — the Q22
+//!   tile treatment ([`Style::tile_plate_fill`] over the launcher-group accent +
+//!   the white surface glyph) — which the Q16 lock names as the legitimate
+//!   no-snapshot rendering, not a placeholder.
+//! * `main.rs` captures the actual surface body on navigation leave through the
+//!   shared `mde_egui::capture` backend and supplies the resulting textures here.
+//!   The capture is best-effort: an unavailable adapter or an honest render
+//!   error leaves the accent plate in place instead of minting a thumbnail.
 //!
 //! ## Input
 //!
@@ -49,11 +47,18 @@
 //! past the threshold removes it, with the shared [`Motion`] `DragSettle`
 //! spring flying the card out (reduced motion: instant removal).
 
+use std::collections::HashMap;
+
 use mde_egui::motion::Spring;
-use mde_egui::{egui, Motion, MotionPreset, Style};
+use mde_egui::{Motion, MotionPreset, Style, TypographyRole, egui};
 
 use crate::construct::{ChromeIntent, ConstructChrome};
-use crate::surfaces::{icon_texture, Surface, LAUNCHER_GROUPS};
+use crate::surfaces::{LAUNCHER_GROUPS, Surface, icon_texture};
+
+/// Per-surface snapshot textures captured from the real shell body on leave.
+/// The map is bounded by the canonical surface catalog because callers only
+/// insert [`Surface`] keys; replacing a key drops the previous GPU texture.
+pub(crate) type SurfaceSnapshots = HashMap<Surface, egui::TextureHandle>;
 
 /// Stable id of the switcher's foreground overlay layer.
 const SWITCHER_AREA: &str = "construct-switcher-area";
@@ -70,7 +75,8 @@ const CARD_W: f32 = 256.0;
 const HEADER_H: f32 = 36.0;
 /// Height of the preview region under the header (16:10 of [`CARD_W`]).
 const PREVIEW_H: f32 = 160.0;
-/// Full card height.
+/// Preferred full card height. The grid compresses the preview region when a
+/// complete recents ring would otherwise extend below the viewport.
 const CARD_H: f32 = HEADER_H + PREVIEW_H;
 /// Gap between grid cards.
 const GRID_GAP: f32 = Style::SP_M;
@@ -313,7 +319,19 @@ fn grid_layout(screen: egui::Rect, n: usize) -> (usize, Vec<egui::Rect>) {
     let cols = fit.min(square).min(n).max(1);
     let rows = n.div_ceil(cols);
     let grid_w = (cols as f32).mul_add(CARD_W, (cols - 1) as f32 * GRID_GAP);
-    let grid_h = (rows as f32).mul_add(CARD_H, (rows - 1) as f32 * GRID_GAP);
+    let preferred_grid_h =
+        (rows as f32).mul_add(CARD_H, (rows - 1) as f32 * GRID_GAP);
+    let available_card_h = ((screen.height()
+        - 2.0 * GRID_MARGIN
+        - (rows.saturating_sub(1) as f32) * GRID_GAP)
+        / rows as f32)
+        .max(HEADER_H + 2.0 * Style::SP_S);
+    let card_h = CARD_H.min(available_card_h);
+    let grid_h = if preferred_grid_h > screen.height() - 2.0 * GRID_MARGIN {
+        (rows as f32).mul_add(card_h, (rows - 1) as f32 * GRID_GAP)
+    } else {
+        preferred_grid_h
+    };
     let origin_x = screen.center().x - grid_w / 2.0;
     let origin_y = (screen.center().y - grid_h / 2.0).max(screen.top() + GRID_MARGIN);
     let rects = (0..n)
@@ -322,9 +340,9 @@ fn grid_layout(screen: egui::Rect, n: usize) -> (usize, Vec<egui::Rect>) {
             egui::Rect::from_min_size(
                 egui::pos2(
                     (col as f32).mul_add(CARD_W + GRID_GAP, origin_x),
-                    (row as f32).mul_add(CARD_H + GRID_GAP, origin_y),
+                    (row as f32).mul_add(card_h + GRID_GAP, origin_y),
                 ),
-                egui::vec2(CARD_W, CARD_H),
+                egui::vec2(CARD_W, card_h),
             )
         })
         .collect();
@@ -336,9 +354,9 @@ fn grid_layout(screen: egui::Rect, n: usize) -> (usize, Vec<egui::Rect>) {
 /// Consumes this frame's [`ChromeIntent::Switcher`] (toggling
 /// `construct.switcher_open`), feeds the recents ring from the shell's current
 /// surface (`current`/`app_expanded` — a surface entering the foreground
-/// promotes), and renders the Q16 overlay while open. `desktop_preview` is
-/// the live VDI frame texture for the Desktop card when one exists (the U29
-/// hook generalizes this to a per-surface snapshot map, module doc).
+/// promotes), and renders the Q16 overlay while open. `snapshots` carries the
+/// latest captured body for each surface that has been left. `desktop_preview`
+/// remains the live VDI frame fallback for a focused remote desktop.
 ///
 /// Returns the surface a click/Enter chose, if any — the one-line slot body in
 /// `main.rs` applies it to `nav` (the U09 "main.rs never changes again" rule
@@ -348,6 +366,7 @@ pub fn mount(
     construct: &mut ConstructChrome,
     current: Surface,
     app_expanded: bool,
+    snapshots: &SurfaceSnapshots,
     desktop_preview: Option<egui::TextureHandle>,
 ) -> Option<Surface> {
     let state_key = egui::Id::new(STATE_KEY);
@@ -378,6 +397,7 @@ pub fn mount(
             construct,
             &mut state,
             current,
+            snapshots,
             desktop_preview.as_ref(),
         );
     } else {
@@ -401,6 +421,7 @@ fn overlay(
     construct: &mut ConstructChrome,
     state: &mut SwitcherState,
     current: Surface,
+    snapshots: &SurfaceSnapshots,
     desktop_preview: Option<&egui::TextureHandle>,
 ) -> Option<Surface> {
     let screen = ctx.screen_rect();
@@ -469,11 +490,15 @@ fn overlay(
             }
 
             if state.ring.is_empty() {
-                ui.painter().text(
-                    screen.center(),
-                    egui::Align2::CENTER_CENTER,
+                let empty_state = ui.painter().layout_job(Style::typography_job(
                     "No recent apps",
-                    egui::FontId::proportional(Style::TYPE_CALLOUT),
+                    TypographyRole::Callout,
+                    Style::resolve_color(ctx, Style::TEXT_DIM),
+                    f32::INFINITY,
+                ));
+                ui.painter().galley(
+                    screen.center() - empty_state.size() / 2.0,
+                    empty_state,
                     Style::resolve_color(ctx, Style::TEXT_DIM),
                 );
                 return;
@@ -489,9 +514,11 @@ fn overlay(
                         screen,
                         selected: idx == state.selected,
                         is_current: surface == current,
-                        preview: (surface == Surface::Desktop)
-                            .then_some(desktop_preview)
-                            .flatten(),
+                        preview: snapshots.get(&surface).or_else(|| {
+                            (surface == Surface::Desktop)
+                                .then_some(desktop_preview)
+                                .flatten()
+                        }),
                     },
                     state,
                 ) {
@@ -525,8 +552,7 @@ struct CardPaint<'a> {
     selected: bool,
     /// Whether this card is the surface currently in the foreground.
     is_current: bool,
-    /// The live snapshot texture for this card, when one exists (Desktop's
-    /// VDI frame today; the U29 hook widens this, module doc).
+    /// The latest real snapshot texture for this card, when one exists.
     preview: Option<&'a egui::TextureHandle>,
 }
 
@@ -550,7 +576,7 @@ fn card(ui: &mut egui::Ui, paint: CardPaint<'_>, state: &mut SwitcherState) -> O
         // the screen top from its resting place.
         let fly_target = paint.base_rect.bottom() - paint.screen.top();
         state.release_drag(
-            CARD_H * FLICK_CLOSE_FRACTION,
+            paint.base_rect.height() * FLICK_CLOSE_FRACTION,
             fly_target,
             Motion::reduce_motion(),
         );
@@ -588,11 +614,18 @@ fn card(ui: &mut egui::Ui, paint: CardPaint<'_>, state: &mut SwitcherState) -> O
     if let Some(tex) = icon_texture(&ctx, paint.surface.icon_id(), glyph_edge, Style::TEXT) {
         painter.image(tex.id(), glyph_rect, uv, egui::Color32::WHITE);
     }
-    painter.text(
-        egui::pos2(glyph_rect.right() + Style::SP_S, header.center().y),
-        egui::Align2::LEFT_CENTER,
+    let label = painter.layout_job(Style::typography_job(
         paint.surface.label(),
-        egui::FontId::proportional(Style::TYPE_CALLOUT),
+        TypographyRole::Headline,
+        Style::resolve_color(&ctx, Style::TEXT),
+        f32::INFINITY,
+    ));
+    painter.galley(
+        egui::pos2(
+            glyph_rect.right() + Style::SP_S,
+            header.center().y - label.size().y / 2.0,
+        ),
+        label,
         Style::resolve_color(&ctx, Style::TEXT),
     );
 
@@ -691,9 +724,21 @@ mod tests {
         expanded: bool,
         events: Vec<egui::Event>,
     ) -> (Option<Surface>, egui::FullOutput) {
+        let snapshots = SurfaceSnapshots::default();
+        frame_with_snapshots(ctx, construct, current, expanded, &snapshots, events)
+    }
+
+    fn frame_with_snapshots(
+        ctx: &egui::Context,
+        construct: &mut ConstructChrome,
+        current: Surface,
+        expanded: bool,
+        snapshots: &SurfaceSnapshots,
+        events: Vec<egui::Event>,
+    ) -> (Option<Surface>, egui::FullOutput) {
         let mut routed = None;
         let out = ctx.run(raw(events), |ctx| {
-            routed = mount(ctx, construct, current, expanded, None);
+            routed = mount(ctx, construct, current, expanded, snapshots, None);
         });
         (routed, out)
     }
@@ -916,6 +961,41 @@ mod tests {
     }
 
     #[test]
+    fn a_real_surface_snapshot_replaces_only_that_card_plate() {
+        let (ctx, mut construct) = open_switcher();
+        let mut snapshots = SurfaceSnapshots::default();
+        snapshots.insert(
+            Surface::Files,
+            ctx.load_texture(
+                "switcher-real-snapshot",
+                egui::ColorImage::new([2, 2], egui::Color32::WHITE),
+                egui::TextureOptions::LINEAR,
+            ),
+        );
+        let (_, out) = frame_with_snapshots(
+            &ctx,
+            &mut construct,
+            Surface::Files,
+            true,
+            &snapshots,
+            Vec::new(),
+        );
+        let fills = painted_fills(&out.shapes);
+        assert!(
+            fills.contains(&Style::tile_plate_fill(
+                group_accent(Surface::Music).unwrap_or(Style::ACCENT)
+            )),
+            "Music still needs its no-snapshot plate: {fills:?}"
+        );
+        assert!(
+            !fills.contains(&Style::tile_plate_fill(
+                group_accent(Surface::Files).unwrap_or(Style::ACCENT)
+            )),
+            "Files should paint the supplied real snapshot instead of its plate: {fills:?}"
+        );
+    }
+
+    #[test]
     fn enter_routes_the_selected_surface_out_and_closes() {
         let (ctx, mut construct) = open_switcher();
         let (routed, _) = frame(
@@ -1061,8 +1141,42 @@ mod tests {
         assert_eq!(routed, None);
         let fills = painted_fills(&out.shapes);
         assert!(fills.contains(&Style::SCRIM_REGULAR));
+        let empty_state = painted_text(&out.shapes)
+            .into_iter()
+            .find(|(text, _, _)| text == "No recent apps")
+            .expect("the empty switcher state must paint its caption");
+        assert_eq!(empty_state.1, TypographyRole::Callout.letter_spacing());
+        assert_eq!(empty_state.2, Some(TypographyRole::Callout.line_height()));
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
         assert!(!prims.is_empty());
+    }
+
+    fn painted_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, f32, Option<f32>)> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, f32, Option<f32>)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    if let Some(section) = text.galley.job.sections.first() {
+                        out.push((
+                            text.galley.text().to_owned(),
+                            section.format.extra_letter_spacing,
+                            section.format.line_height,
+                        ));
+                    }
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
     }
 
     #[test]
@@ -1081,5 +1195,60 @@ mod tests {
         // One card sits dead-centre horizontally.
         let (_, rects) = grid_layout(screen, 1);
         assert!((rects[0].center().x - screen.center().x).abs() < 0.5);
+    }
+
+    #[test]
+    fn a_full_recent_ring_keeps_the_last_card_on_screen_and_clickable() {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, SCREEN);
+        let (_, rects) = grid_layout(screen, Surface::ALL.len());
+        assert!(
+            rects.iter().all(|rect| {
+                rect.left() >= screen.left()
+                    && rect.right() <= screen.right()
+                    && rect.top() >= screen.top()
+                    && rect.bottom() <= screen.bottom()
+            }),
+            "the complete recents ring must stay inside the viewport: {rects:?}"
+        );
+
+        // Exercise the actual card hit target, not just the layout math. The
+        // last card is the one that used to fall below an 800-point viewport.
+        let ctx = ctx();
+        let mut construct = ConstructChrome::default();
+        for surface in Surface::ALL {
+            frame(&ctx, &mut construct, surface, true, Vec::new());
+        }
+        construct.switcher_open = true;
+        frame(&ctx, &mut construct, Surface::ALL[0], true, Vec::new());
+        frame(&ctx, &mut construct, Surface::ALL[0], true, Vec::new());
+        let target = rects.last().expect("the full ring has a last card").center();
+        frame(
+            &ctx,
+            &mut construct,
+            Surface::ALL[0],
+            true,
+            vec![
+                egui::Event::PointerMoved(target),
+                egui::Event::PointerButton {
+                    pos: target,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+        );
+        let (routed, _) = frame(
+            &ctx,
+            &mut construct,
+            Surface::ALL[0],
+            true,
+            vec![egui::Event::PointerButton {
+                pos: target,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+        assert_eq!(routed, Some(Surface::ALL[0]));
     }
 }

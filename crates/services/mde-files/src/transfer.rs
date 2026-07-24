@@ -385,6 +385,11 @@ impl std::error::Error for TransferError {}
 /// A typed [`TransferError`] for any non-success reply (incl. an undecodable
 /// body, which is treated as an unavailable transport).
 pub fn parse_direct_reply(raw: &str) -> Result<DirectOutcome, TransferError> {
+    if raw.len() > MAX_DIRECT_REPLY_BYTES {
+        return Err(TransferError::Unavailable(format!(
+            "direct transfer reply exceeds the {MAX_DIRECT_REPLY_BYTES} byte cap"
+        )));
+    }
     let v: serde_json::Value = serde_json::from_str(raw)
         .map_err(|e| TransferError::Unavailable(format!("undecodable reply: {e}")))?;
     if v.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
@@ -402,8 +407,10 @@ pub fn parse_direct_reply(raw: &str) -> Result<DirectOutcome, TransferError> {
     let msg = v
         .get("error")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("direct transfer rejected")
-        .to_string();
+        .map_or_else(
+            || "direct transfer rejected".to_string(),
+            bounded_direct_error,
+        );
     if v.get("gated").and_then(serde_json::Value::as_bool) == Some(true) {
         Err(TransferError::Gated(msg))
     } else {
@@ -562,6 +569,51 @@ pub fn parse_progress2_line(line: &str) -> Option<TransferTick> {
 /// The action topic the mackesd peer-side helper serves.
 pub const DIRECT_ACTION_TOPIC: &str = "action/mesh-transfer/direct";
 
+/// Maximum reply body the Files surface will parse from the Bus. The responder
+/// uses the same 64 KiB action-body ceiling; keeping the client-side boundary
+/// here prevents a rogue/stale reply from reaching `serde_json` or the GUI
+/// unbounded.
+pub const MAX_DIRECT_REPLY_BYTES: usize = 64 * 1024;
+
+/// Maximum peer-provided error detail retained in a UI-facing transfer error.
+const MAX_DIRECT_ERROR_BYTES: usize = 1024;
+
+/// Keep peer-provided error text bounded and harmless to line-oriented UI/log
+/// consumers. Truncate on a UTF-8 boundary and replace control characters so a
+/// remote error cannot inject newlines or other terminal/UI control sequences.
+fn bounded_direct_error(value: &str) -> String {
+    let mut end = value.len().min(MAX_DIRECT_ERROR_BYTES);
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut bounded: String = value[..end]
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    if end < value.len() {
+        bounded.push('…');
+    }
+    bounded
+}
+
+/// Mint the exact-body capability consumed by mackesd's direct-transfer
+/// responder. The target is derived from the same request fields the responder
+/// uses, so a capability for one peer pair cannot authorize another pair.
+#[cfg(feature = "dbus")]
+fn authorized_direct_body(req: &DirectRequest) -> Result<String, TransferError> {
+    let target = format!("{}->{}", req.src_host, req.dst_host);
+    crate::editor_open::capability::mint_body(
+        &req.to_json(),
+        crate::editor_open::capability::DIRECT_TRANSFER_VERB,
+        &target,
+    )
+    .map_err(|error| {
+        TransferError::Gated(format!(
+            "direct transfer authorization unavailable: {error}"
+        ))
+    })
+}
+
 /// Bus client that dispatches a resolved [`DirectRequest`] to the mackesd
 /// peer-side helper (`action/mesh-transfer/direct`) and folds its typed reply.
 ///
@@ -621,7 +673,7 @@ impl TransferDispatch {
     /// # Errors
     /// A typed [`TransferError`] on any non-success reply.
     pub fn dispatch(&self, req: &DirectRequest) -> Result<DirectOutcome, TransferError> {
-        let body = req.to_json();
+        let body = authorized_direct_body(req)?;
         let raw = self.rt.block_on(async {
             let persist = mde_bus::persist::Persist::open(self.bus_dir.clone())
                 .map_err(|e| TransferError::Unavailable(format!("bus persist: {e}")))?;
@@ -830,6 +882,45 @@ mod tests {
         assert_eq!(back.src_rel, "docs/a.txt");
     }
 
+    #[cfg(feature = "dbus")]
+    #[test]
+    fn direct_dispatch_body_is_schema_bound_to_the_exact_peer_pair() {
+        use mackes_mesh_types::cloud::{
+            cloud_request_digest, CloudArmedToken, CLOUD_ACTION_SCHEMA_VERSION,
+        };
+
+        let t = DirectTransfer {
+            src_host: "oak".into(),
+            src_rel: PathBuf::from("docs/a.txt"),
+            dst_host: "birch".into(),
+            dst_rel: PathBuf::from("incoming"),
+            mode: TransferMode::Copy,
+        };
+        let req = DirectRequest::new(9, &t);
+        let body = authorized_direct_body(&req).expect("capability body");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(value["schema_version"], CLOUD_ACTION_SCHEMA_VERSION);
+        assert_eq!(value["src_host"], "oak");
+        assert_eq!(value["dst_host"], "birch");
+        assert_eq!(value["src_rel"], "docs/a.txt");
+        assert_eq!(value["dst_rel"], "incoming");
+
+        let token = CloudArmedToken::parse(value["armed_token"].as_str().expect("token"))
+            .expect("well-formed capability");
+        assert_eq!(token.verb, "mesh-transfer-direct");
+        assert_eq!(token.target, "oak->birch");
+
+        let mut unsigned = value;
+        unsigned
+            .as_object_mut()
+            .expect("object")
+            .remove("armed_token");
+        assert_eq!(
+            token.request_sha256,
+            cloud_request_digest(&unsigned.to_string()).expect("request digest")
+        );
+    }
+
     #[test]
     fn parse_reply_ok_is_an_outcome() {
         let out = parse_direct_reply(r#"{"ok":true,"files":3,"bytes":4096}"#).expect("ok");
@@ -866,6 +957,36 @@ mod tests {
         let err = parse_direct_reply("not json").expect_err("garbage");
         assert!(matches!(err, TransferError::Unavailable(_)));
         assert!(err.should_relay());
+    }
+
+    #[test]
+    fn parse_reply_rejects_oversized_body_before_decoding() {
+        let raw = format!(
+            r#"{{"ok":true,"files":1,"bytes":2,"padding":"{}"}}"#,
+            "x".repeat(MAX_DIRECT_REPLY_BYTES)
+        );
+        let err = parse_direct_reply(&raw).expect_err("oversized reply");
+        assert!(
+            matches!(err, TransferError::Unavailable(ref message) if message.contains("exceeds"))
+        );
+        assert!(err.should_relay());
+    }
+
+    #[test]
+    fn parse_reply_bounds_and_sanitizes_hostile_error_text() {
+        let hostile = format!("prefix\n{}", "é".repeat(MAX_DIRECT_ERROR_BYTES));
+        let raw = serde_json::json!({
+            "ok": false,
+            "error": hostile,
+        })
+        .to_string();
+        let err = parse_direct_reply(&raw).expect_err("failed reply");
+        let TransferError::Failed(message) = err else {
+            panic!("expected failed transfer reply");
+        };
+        assert!(!message.contains('\n'));
+        assert!(message.len() <= "direct transfer failed: ".len() + MAX_DIRECT_ERROR_BYTES + 3);
+        assert!(message.ends_with('…'));
     }
 
     // ── the queued-transfer progress folds ───────────────────────────────────

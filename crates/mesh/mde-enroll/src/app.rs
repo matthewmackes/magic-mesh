@@ -7,6 +7,19 @@
 
 use mackesd_core::nebula_enroll::{parse_join_token, JoinToken};
 
+use crate::public_roster::{resolve_endpoint, LighthouseEndpoint};
+
+/// A parsed join token plus the separately selected transport destination.
+/// Keeping these as separate values prevents an endpoint override from
+/// rewriting the mesh-scoped token carried in the CSR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedJoin {
+    /// The original, fingerprint-pinned token, unchanged.
+    pub token: JoinToken,
+    /// The endpoint the worker may dial after closed-roster validation.
+    pub endpoint: LighthouseEndpoint,
+}
+
 /// Which input field has focus while editing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
@@ -161,23 +174,19 @@ impl App {
         }
     }
 
-    /// Validate the current inputs and produce the parsed token to
-    /// enroll with — applying the lighthouse-IP override if the
-    /// operator filled that field. Returns the error message to show
-    /// in the strip on invalid input. Does NOT change phase (the caller
-    /// flips to [`Phase::Enrolling`] once it kicks off the work).
+    /// Validate the current inputs and produce the parsed token plus its
+    /// separately selected transport endpoint. The token is never rewritten
+    /// by the optional endpoint field. Returns the error message to show in
+    /// the strip on invalid input. Does NOT change phase (the caller flips to
+    /// [`Phase::Enrolling`] once it kicks off the work).
     ///
     /// # Errors
     /// A human message when the token is unparseable or lacks the
     /// pinned fingerprint the network path requires.
-    pub fn validated_token(&self) -> Result<JoinToken, String> {
-        let mut token = parse_join_token(self.token.trim()).ok_or_else(|| {
+    pub fn validated_join(&self) -> Result<ValidatedJoin, String> {
+        let token = parse_join_token(self.token.trim()).ok_or_else(|| {
             "invalid join token — expected mesh:<id>@<ip>:<port>#<bearer>?fp=<sha256>".to_string()
         })?;
-        let lh = self.lighthouse.trim();
-        if !lh.is_empty() {
-            token.lighthouse = lh.to_string();
-        }
         if token.fp.is_none() {
             return Err(
                 "this token has no ?fp= fingerprint — it can't be used over the network \
@@ -185,7 +194,15 @@ impl App {
                     .to_string(),
             );
         }
-        Ok(token)
+        let endpoint = resolve_endpoint(&token, &self.lighthouse).map_err(|e| e.to_string())?;
+        Ok(ValidatedJoin { token, endpoint })
+    }
+
+    /// Compatibility helper for callers that only need the original token.
+    /// Endpoint selection is still validated, but the returned token remains
+    /// byte-for-byte equivalent to the pasted token's parsed form.
+    pub fn validated_token(&self) -> Result<JoinToken, String> {
+        self.validated_join().map(|join| join.token)
     }
 
     /// Transition into the enrolling phase, marking the first step
@@ -284,17 +301,25 @@ mod tests {
     }
 
     #[test]
-    fn validate_accepts_good_token_and_applies_ip_override() {
+    fn validate_accepts_good_token_and_keeps_override_out_of_the_token() {
         let mut app = App::new();
         app.token = GOOD_TOKEN.into();
         let t = app.validated_token().expect("valid");
         assert_eq!(t.lighthouse, "10.0.0.5");
         assert!(t.fp.is_some());
-        // Override the IP via the lighthouse field.
+        // An explicit override is a separate transport destination; it never
+        // rewrites the token carried in the CSR.
         app.lighthouse = "203.0.113.9".into();
-        let t = app.validated_token().expect("valid");
-        assert_eq!(t.lighthouse, "203.0.113.9", "override applied");
-        assert_eq!(t.port, 4243, "port preserved from token");
+        let join = app.validated_join().expect("valid override");
+        assert_eq!(
+            join.token.lighthouse, "10.0.0.5",
+            "token endpoint preserved"
+        );
+        assert_eq!(
+            join.endpoint.host, "203.0.113.9",
+            "override selected explicitly"
+        );
+        assert_eq!(join.endpoint.port, 4243, "port preserved from token");
     }
 
     #[test]

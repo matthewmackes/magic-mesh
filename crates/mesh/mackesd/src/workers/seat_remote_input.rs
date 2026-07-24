@@ -47,6 +47,12 @@ pub const RESULT_PREFIX: &str = "event/seat-remote-input/";
 /// from the arm/disarm consent control, which cannot itself inject input.
 pub const REMOTE_INPUT_AUTH_VERB: &str = "seat-remote-input";
 
+/// Capability verb for seated-user arm/disarm consent controls.
+pub const ARM_AUTH_VERB: &str = "seat-remote-input-arm";
+
+/// Stable semantic target for the one local seat controlled by this worker.
+pub const ARM_AUTH_TARGET: &str = "seat";
+
 /// Default poll cadence. Phone touchpad input is interactive, so stay below the
 /// control-poller cadence while still using the Bus as the handoff contract.
 pub const DEFAULT_TICK: Duration = Duration::from_millis(40);
@@ -585,12 +591,41 @@ impl SeatRemoteInputWorker {
         for msg in msgs {
             self.arm_cursor = Some(msg.ulid.clone());
             let body = msg.body.unwrap_or_default();
-            match parse_arm(&body) {
-                Ok(ArmCommand::Arm {
+            if !crate::ipc::body_within_cap(Some(&body)) {
+                tracing::warn!(
+                    target: "mackesd::seat_remote_input",
+                    "ignored oversized arm control"
+                );
+                continue;
+            }
+            let command = match parse_arm(&body) {
+                Ok(command) => command,
+                Err(error) => {
+                    tracing::debug!(target: "mackesd::seat_remote_input", error = %error, "ignored malformed arm control");
+                    continue;
+                }
+            };
+            if let Err(error) = self.authorizer.authorize(
+                &body,
+                MutationContext {
+                    verb: ARM_AUTH_VERB,
+                    node: &self.node,
+                    target: ARM_AUTH_TARGET,
+                },
+            ) {
+                tracing::warn!(
+                    target: "mackesd::seat_remote_input",
+                    error = %error,
+                    "refused unauthorized arm control"
+                );
+                continue;
+            }
+            match command {
+                ArmCommand::Arm {
                     ttl_ms,
                     source,
                     phone,
-                }) => {
+                } => {
                     let now = self.now_ms();
                     let ttl = ttl_ms.min(MAX_ARM_TTL_MS);
                     let armed_until_ms = now.saturating_add(ttl);
@@ -614,16 +649,13 @@ impl SeatRemoteInputWorker {
                     );
                     self.refresh_indicator(persist);
                 }
-                Ok(ArmCommand::Disarm { source }) => {
+                ArmCommand::Disarm { source } => {
                     if self.arm.take().is_some() {
                         let now = self.now_ms();
                         tracing::info!(target: "mackesd::seat_remote_input", %source, "seat disarmed");
                         self.publish_arm_audit(persist, "disarm", &source, None, None, now);
                         self.refresh_indicator(persist);
                     }
-                }
-                Err(e) => {
-                    tracing::debug!(target: "mackesd::seat_remote_input", error = %e, "ignored malformed arm control");
                 }
             }
         }
@@ -1023,6 +1055,51 @@ mod tests {
         .to_string()
     }
 
+    fn signed_arm_body(
+        node: &str,
+        ttl_ms: u64,
+        source: &str,
+        phone: Option<&str>,
+        nonce: &str,
+    ) -> String {
+        let mut value: serde_json::Value = serde_json::from_str(&arm_body(ttl_ms)).unwrap();
+        value["source"] = serde_json::json!(source);
+        if let Some(phone) = phone {
+            value["phone"] = serde_json::json!(phone);
+        }
+        value["schema_version"] = serde_json::json!(crate::ipc::action_auth::ACTION_SCHEMA_VERSION);
+        authorize_test_body(
+            AUTH_KEY,
+            &value.to_string(),
+            MutationContext {
+                verb: ARM_AUTH_VERB,
+                node,
+                target: ARM_AUTH_TARGET,
+            },
+            nonce,
+            AUTH_NOW + 30_000,
+        )
+    }
+
+    fn signed_disarm_body(node: &str, source: &str, nonce: &str) -> String {
+        let value = serde_json::json!({
+            "op": "disarm",
+            "source": source,
+            "schema_version": crate::ipc::action_auth::ACTION_SCHEMA_VERSION,
+        });
+        authorize_test_body(
+            AUTH_KEY,
+            &value.to_string(),
+            MutationContext {
+                verb: ARM_AUTH_VERB,
+                node,
+                target: ARM_AUTH_TARGET,
+            },
+            nonce,
+            AUTH_NOW + 30_000,
+        )
+    }
+
     fn live_arm() -> Option<ArmState> {
         Some(ArmState {
             armed_until_ms: u64::MAX,
@@ -1322,7 +1399,18 @@ mod tests {
         let bus = tempfile::tempdir().expect("bus");
         let mut persist = Persist::open(bus.path().to_path_buf()).expect("persist");
         persist
-            .write(ARM_TOPIC, Priority::Default, None, Some(&arm_body(60_000)))
+            .write(
+                ARM_TOPIC,
+                Priority::Default,
+                None,
+                Some(&signed_arm_body(
+                    "node-a",
+                    60_000,
+                    "shell:seat-user",
+                    None,
+                    "armed",
+                )),
+            )
             .expect("write arm");
         let body = signed_move_body("node-a", "armed-1");
         persist
@@ -1421,6 +1509,127 @@ mod tests {
     }
 
     #[test]
+    fn hostile_arm_controls_cannot_change_arm_or_indicator_state() {
+        let bus = tempfile::tempdir().expect("bus");
+        let mut persist = Persist::open(bus.path().to_path_buf()).expect("persist");
+        let injector = Arc::new(RecordingInjector::default());
+        let mut worker = SeatRemoteInputWorker::with_injector("node-a".into(), injector)
+            .with_now_fn(Arc::new(|| 1_000))
+            .with_authorizer(test_authorizer(bus.path()));
+        worker.refresh_indicator(&persist);
+        let initial_indicator_rows = persist
+            .list_since(&format!("{INDICATOR_PREFIX}node-a"), None)
+            .unwrap()
+            .len();
+
+        let unsigned = arm_body(60_000);
+        persist
+            .write(ARM_TOPIC, Priority::Default, None, Some(&unsigned))
+            .expect("write unsigned arm");
+
+        let valid = signed_arm_body(
+            "node-a",
+            60_000,
+            "shell:seat-user",
+            Some("phone-1"),
+            "arm-once",
+        );
+        let tampered = valid.replace("\"ttl_ms\":60000", "\"ttl_ms\":120000");
+        persist
+            .write(ARM_TOPIC, Priority::Default, None, Some(&tampered))
+            .expect("write tampered arm");
+
+        let mut future_value: serde_json::Value = serde_json::from_str(&arm_body(60_000)).unwrap();
+        future_value["schema_version"] = serde_json::json!(2);
+        let future = authorize_test_body(
+            AUTH_KEY,
+            &future_value.to_string(),
+            MutationContext {
+                verb: ARM_AUTH_VERB,
+                node: "node-a",
+                target: ARM_AUTH_TARGET,
+            },
+            "arm-future",
+            AUTH_NOW + 30_000,
+        );
+        persist
+            .write(ARM_TOPIC, Priority::Default, None, Some(&future))
+            .expect("write future-schema arm");
+
+        let oversized = serde_json::json!({
+            "op": "arm",
+            "source": "shell:seat-user",
+            "ttl_ms": 60_000,
+            "schema_version": crate::ipc::action_auth::ACTION_SCHEMA_VERSION,
+            "padding": "x".repeat(crate::ipc::MAX_RPC_BODY_BYTES),
+        })
+        .to_string();
+        persist
+            .write(ARM_TOPIC, Priority::Default, None, Some(&oversized))
+            .expect("write oversized arm");
+
+        worker.drain_arm(&persist);
+        assert!(
+            worker.arm.is_none(),
+            "unauthorized arms must not arm the seat"
+        );
+        assert_eq!(
+            persist
+                .list_since(&format!("{INDICATOR_PREFIX}node-a"), None)
+                .unwrap()
+                .len(),
+            initial_indicator_rows,
+            "unauthorized arms must not publish an indicator transition"
+        );
+
+        persist
+            .write(ARM_TOPIC, Priority::Default, None, Some(&valid))
+            .expect("write authorized arm");
+        worker.drain_arm(&persist);
+        let armed = worker.arm.clone().expect("authorized arm applies");
+        let indicator_rows = persist
+            .list_since(&format!("{INDICATOR_PREFIX}node-a"), None)
+            .unwrap()
+            .len();
+
+        persist
+            .write(ARM_TOPIC, Priority::Default, None, Some(&valid))
+            .expect("write replayed arm");
+        worker.drain_arm(&persist);
+        assert_eq!(worker.arm, Some(armed), "replayed arm must have no effect");
+        assert_eq!(
+            persist
+                .list_since(&format!("{INDICATOR_PREFIX}node-a"), None)
+                .unwrap()
+                .len(),
+            indicator_rows,
+            "replayed arm must not republish the indicator"
+        );
+
+        let unsigned_disarm = serde_json::json!({
+            "op": "disarm",
+            "source": "shell:seat-user",
+        })
+        .to_string();
+        persist
+            .write(ARM_TOPIC, Priority::Default, None, Some(&unsigned_disarm))
+            .expect("write unsigned disarm");
+        worker.drain_arm(&persist);
+        assert!(
+            worker.arm.is_some(),
+            "unsigned disarm must not revoke consent"
+        );
+
+        let signed_disarm = signed_disarm_body("node-a", "shell:seat-user", "disarm-once");
+        persist
+            .write(ARM_TOPIC, Priority::Default, None, Some(&signed_disarm))
+            .expect("write authorized disarm");
+        worker.drain_arm(&persist);
+        assert!(worker.arm.is_none(), "authorized disarm revokes consent");
+        assert!(!latest_indicator(&persist, "node-a").armed);
+    }
+
+    #[test]
     fn arm_auto_disarms_after_ttl() {
         let bus = tempfile::tempdir().expect("bus");
         let mut persist = Persist::open(bus.path().to_path_buf()).expect("persist");
@@ -1432,7 +1641,18 @@ mod tests {
 
         // Arm for 5s, then inject once inside the window -> delivered.
         persist
-            .write(ARM_TOPIC, Priority::Default, None, Some(&arm_body(5_000)))
+            .write(
+                ARM_TOPIC,
+                Priority::Default,
+                None,
+                Some(&signed_arm_body(
+                    "node-a",
+                    5_000,
+                    "shell:seat-user",
+                    None,
+                    "ttl-1-arm",
+                )),
+            )
             .expect("write arm");
         let body = signed_move_body("node-a", "ttl-1");
         persist
@@ -1466,7 +1686,8 @@ mod tests {
         let mut persist = Persist::open(bus.path().to_path_buf()).expect("persist");
         let injector = Arc::new(RecordingInjector::default());
         let mut worker = SeatRemoteInputWorker::with_injector("node-a".into(), injector)
-            .with_now_fn(Arc::new(|| 1_000));
+            .with_now_fn(Arc::new(|| 1_000))
+            .with_authorizer(test_authorizer(bus.path()));
 
         // Baseline: worker publishes a disarmed indicator up front.
         worker.refresh_indicator(&persist);
@@ -1474,7 +1695,18 @@ mod tests {
 
         // Arm -> indicator reports armed + the controlling source.
         persist
-            .write(ARM_TOPIC, Priority::Default, None, Some(&arm_body(60_000)))
+            .write(
+                ARM_TOPIC,
+                Priority::Default,
+                None,
+                Some(&signed_arm_body(
+                    "node-a",
+                    60_000,
+                    "shell:seat-user",
+                    None,
+                    "indicator-arm",
+                )),
+            )
             .expect("write arm");
         worker.tick_once(&mut persist);
         let armed = latest_indicator(&persist, "node-a");
@@ -1488,7 +1720,11 @@ mod tests {
                 ARM_TOPIC,
                 Priority::Default,
                 None,
-                Some(&serde_json::json!({"op":"disarm","source":"shell:seat-user"}).to_string()),
+                Some(&signed_disarm_body(
+                    "node-a",
+                    "shell:seat-user",
+                    "indicator-disarm",
+                )),
             )
             .expect("write disarm");
         worker.tick_once(&mut persist);

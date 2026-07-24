@@ -50,6 +50,12 @@ const REVOKE_TOPIC: &str = "action/federation/revoke";
 const REFUSE_MINT_TOPIC: &str = "action/federation/refuse-mint";
 /// The retained per-node enforcement status mirror the shell reads.
 const STATUS_PREFIX: &str = "state/federation/";
+/// Bound the number of untrusted grant/mint rows exposed to the status mirror.
+const MAX_STATUS_ROWS: usize = 256;
+/// Bound untrusted display fields before serializing the status mirror.
+const MAX_STATUS_TEXT_BYTES: usize = 256;
+/// Status is a Bus body and must remain within the shared RPC body limit.
+const MAX_STATUS_BYTES: usize = crate::ipc::MAX_RPC_BODY_BYTES;
 /// The audit lane a refused cross-mesh ingress message lands on.
 const REFUSED_PREFIX: &str = "federation/refused/";
 /// The audit lane an accepted (forwarded) cross-mesh ingress message lands on.
@@ -398,38 +404,43 @@ impl FederationEnforcerWorker {
     // ── (3) status mirror (only on change) ──────────────────────────────────────
 
     fn publish_status(&mut self, persist: &Persist, bus_root: &Path, grants: &FederationGrants) {
-        let accepted: Vec<serde_json::Value> = grants
+        let accepted_total = grants.pairs.len();
+        let mut accepted: Vec<serde_json::Value> = grants
             .pairs
             .iter()
+            .take(MAX_STATUS_ROWS)
             .map(|p| {
                 serde_json::json!({
-                    "peer-mesh-id": p.peer_mesh_id,
-                    "peer-mesh-label": p.peer_mesh_label,
-                    "established": p.established,
+                    "peer-mesh-id": bounded_status_text(&p.peer_mesh_id),
+                    "peer-mesh-label": bounded_status_text(&p.peer_mesh_label),
+                    "established": bounded_status_text(&p.established),
                     "subscribe-count": p.subscribe_topics.len(),
                     "publish-count": p.publish_topics.len(),
                     "excluded-count": p.excluded_topics.len(),
                 })
             })
             .collect();
-        let pending: Vec<serde_json::Value> = pending_mints(bus_root)
+        let pending_all = pending_mints(bus_root);
+        let pending_total = pending_all.len();
+        let mut pending: Vec<serde_json::Value> = pending_all
             .into_iter()
+            .take(MAX_STATUS_ROWS)
             .map(|m| {
                 serde_json::json!({
-                    "ulid": m.ulid,
+                    "ulid": bounded_status_text(&m.ulid),
                     "expires-at-unix-ms": m.expires_at_unix_ms,
                 })
             })
             .collect();
         // Stable status body (no timestamp) so an unchanged posture is a no-op write
         // (§7: no inert churn) — the change-gate compares this exact string.
-        let body = serde_json::json!({
-            "node": self.node_id,
-            "enforced": true,
-            "accepted": accepted,
-            "pending-mints": pending,
-        })
-        .to_string();
+        let body = bounded_status_body(
+            &self.node_id,
+            &mut accepted,
+            &mut pending,
+            accepted_total,
+            pending_total,
+        );
         if self.last_status.as_deref() == Some(body.as_str()) {
             return;
         }
@@ -444,6 +455,52 @@ impl FederationEnforcerWorker {
 }
 
 // ── free helpers ────────────────────────────────────────────────────────────────
+
+/// Keep status display fields bounded even when the local grant store contains
+/// hostile or accidentally enormous strings. Truncation is byte-safe for UTF-8.
+fn bounded_status_text(value: &str) -> String {
+    if value.len() <= MAX_STATUS_TEXT_BYTES {
+        return value.to_string();
+    }
+    let mut end = MAX_STATUS_TEXT_BYTES;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
+}
+
+/// Serialize a status mirror while keeping the retained body within the common
+/// Bus/RPC body limit. Counts remain complete when rows are omitted so the shell
+/// can distinguish a bounded view from an empty posture.
+fn bounded_status_body(
+    node_id: &str,
+    accepted: &mut Vec<serde_json::Value>,
+    pending: &mut Vec<serde_json::Value>,
+    accepted_total: usize,
+    pending_total: usize,
+) -> String {
+    loop {
+        let body = serde_json::json!({
+            "node": bounded_status_text(node_id),
+            "enforced": true,
+            "accepted": accepted,
+            "pending-mints": pending,
+            "accepted-count": accepted_total,
+            "pending-mint-count": pending_total,
+            "accepted-truncated": accepted.len() < accepted_total,
+            "pending-mints-truncated": pending.len() < pending_total,
+        })
+        .to_string();
+        if body.len() <= MAX_STATUS_BYTES {
+            return body;
+        }
+        if pending.pop().is_none() && accepted.pop().is_none() {
+            // The scalar fields are themselves bounded, so this is only a
+            // defensive escape hatch if the shared cap changes unexpectedly.
+            return body;
+        }
+    }
+}
 
 /// Derive the closed capability target for a federation mutation without
 /// touching grants, mints, or the trust-cert directory.
@@ -526,10 +583,7 @@ fn is_safe_id(id: &str) -> bool {
 }
 
 fn default_bus_root() -> Option<PathBuf> {
-    if let Some(root) = std::env::var_os("MDE_BUS_ROOT").filter(|r| !r.is_empty()) {
-        return Some(PathBuf::from(root));
-    }
-    Some(dirs::data_dir()?.join("mde").join("bus"))
+    mde_bus::default_data_dir()
 }
 
 #[async_trait::async_trait]
@@ -569,7 +623,8 @@ mod tests {
     use super::*;
     use crate::ipc::action_auth::{authorize_test_body, ActionAuthorizer};
     use mde_bus::federation::{
-        read_grants, write_mint_envelope, CrossMeshEnvelope, FederationGrants,
+        read_grants, write_grants, write_mint_envelope, CrossMeshEnvelope, FederationGrants,
+        FederationPair,
     };
     use std::sync::Arc;
 
@@ -935,6 +990,68 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&latest).unwrap();
         assert_eq!(v["accepted"].as_array().unwrap().len(), 1);
         assert_eq!(v["enforced"], true);
+    }
+
+    #[test]
+    fn status_mirror_bounds_large_pair_and_pending_mint_sets() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = dir.path();
+        let trust = trusts(bus);
+        let persist = persist_at(bus);
+        let mut w = worker(bus);
+
+        let total = MAX_STATUS_ROWS + 44;
+        let grants = FederationGrants {
+            pairs: (0..total)
+                .map(|i| FederationPair {
+                    peer_mesh_id: format!("MESH-{i}"),
+                    peer_mesh_label: "oversized-label".repeat(MAX_STATUS_TEXT_BYTES),
+                    established: "now".to_string(),
+                    subscribe_topics: vec!["#".to_string()],
+                    publish_topics: Vec::new(),
+                    excluded_topics: Vec::new(),
+                })
+                .collect(),
+        };
+        write_grants(bus, &grants).unwrap();
+        for i in 0..total {
+            write_mint_envelope(
+                bus,
+                &MintEnvelope {
+                    ulid: format!("MINT-{i}"),
+                    mnemonic: format!("mint pending offer {i} for test"),
+                    expires_at_unix_ms: mde_bus::federation::now_unix_ms() + 86_400_000,
+                    used: false,
+                },
+            )
+            .unwrap();
+        }
+
+        w.tick_once(&persist, bus, &trust);
+        let topic = format!("{STATUS_PREFIX}peer:test");
+        let body = persist
+            .list_since(&topic, None)
+            .unwrap()
+            .last()
+            .and_then(|m| m.body.clone())
+            .expect("bounded status mirror");
+        assert!(
+            body.len() <= MAX_STATUS_BYTES,
+            "status mirror exceeded the shared body cap: {} bytes",
+            body.len()
+        );
+        let status: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(status["accepted-count"].as_u64(), Some(total as u64));
+        assert_eq!(
+            status["pending-mint-count"].as_u64(),
+            Some(total as u64)
+        );
+        assert!(status["accepted-truncated"].as_bool().unwrap());
+        assert!(status["pending-mints-truncated"].as_bool().unwrap());
+        assert!(status["accepted"].as_array().unwrap().len() <= MAX_STATUS_ROWS);
+        assert!(
+            status["pending-mints"].as_array().unwrap().len() <= MAX_STATUS_ROWS
+        );
     }
 
     #[test]

@@ -53,11 +53,18 @@ use mde_bus::persist::Persist;
 use mde_bus::rpc::reply_topic;
 use serde_json::{json, Value};
 
+use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
+
 use super::nebula_supervisor::DEFAULT_OVERLAY_IP_PATH;
 use super::{ShutdownToken, Worker};
 
 /// PRINT-8.b — the two `action/printers/<verb>` topics this worker serves.
 const ACTION_VERBS: [&str; 2] = ["sync-now", "list"];
+
+/// Shared-Bus capability context for the printer-stack mutation. The action is
+/// local to this node; the body is still bound exactly so a shared-spool writer
+/// cannot turn `sync-now` into an unauthenticated CUPS/filesystem effect.
+const CUPS_SYNC_AUTH_VERB: &str = "printers-sync-now";
 
 /// Tick cadence — five seconds, matching the other mesh workers.
 pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(5);
@@ -300,6 +307,8 @@ pub struct CupsSyncWorker {
     bus_root: Option<PathBuf>,
     /// Per-verb read cursors for the `action/printers/<verb>` topics.
     action_cursors: HashMap<String, String>,
+    /// Shared, fail-closed authorization gate for `sync-now`.
+    authorizer: std::sync::Arc<ActionAuthorizer>,
 }
 
 impl CupsSyncWorker {
@@ -318,7 +327,17 @@ impl CupsSyncWorker {
             cupsctl: "cupsctl".to_string(),
             bus_root: default_bus_root(),
             action_cursors: HashMap::new(),
+            authorizer: std::sync::Arc::new(ActionAuthorizer::production()),
         }
+    }
+
+    /// Inject an isolated verifier and replay ledger for hostile action tests.
+    /// Production always uses the systemd-credential-backed authorizer.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_authorizer(mut self, authorizer: std::sync::Arc<ActionAuthorizer>) -> Self {
+        self.authorizer = authorizer;
+        self
     }
 
     fn printers_dir(&self) -> PathBuf {
@@ -527,7 +546,7 @@ impl CupsSyncWorker {
             };
             for msg in msgs {
                 self.action_cursors.insert(topic.clone(), msg.ulid.clone());
-                let reply_json = self.handle_action(verb);
+                let reply_json = self.handle_bus_action(verb, msg.body.as_deref());
                 let _ = persist.write(
                     &reply_topic(&msg.ulid),
                     Priority::Default,
@@ -538,11 +557,44 @@ impl CupsSyncWorker {
         }
     }
 
-    /// Dispatch one `action/printers/<verb>` message. Returns the JSON
-    /// body to write to `reply/<ulid>`. Pure over `&self` so tests can
-    /// call it without a running Bus.
+    /// Dispatch one Bus action. Read-only listing stays open; the sync lane
+    /// must authenticate before it reaches [`Self::handle_action`], which owns
+    /// the CUPS/filesystem side effects.
     #[must_use]
-    pub fn handle_action(&self, verb: &str) -> String {
+    fn handle_bus_action(&self, verb: &str, body: Option<&str>) -> String {
+        if verb == "sync-now" {
+            let result = body
+                .ok_or_else(|| "sync-now requires an authenticated request body".to_string())
+                .and_then(|body| {
+                    self.authorizer.authorize(
+                        body,
+                        MutationContext {
+                            verb: CUPS_SYNC_AUTH_VERB,
+                            node: &self.hostname,
+                            target: &self.hostname,
+                        },
+                    )
+                });
+            if let Err(error) = result {
+                tracing::warn!(
+                    target: "mackesd::action_auth",
+                    node = %self.hostname,
+                    %error,
+                    "cups_sync: refused unauthorized sync-now request"
+                );
+                return json!({ "error": format!("sync-now: authorization refused: {error}") })
+                    .to_string();
+            }
+        }
+        self.handle_action(verb)
+    }
+
+    /// Dispatch one `action/printers/<verb>` message. Returns the JSON
+    /// body to write to `reply/<ulid>`. This is called only after the Bus
+    /// mutation gate above; the periodic local tick is an explicit daemon-owned
+    /// authority path and does not consume a Bus capability.
+    #[must_use]
+    fn handle_action(&self, verb: &str) -> String {
         match verb {
             "sync-now" => {
                 self.tick_once();
@@ -654,12 +706,16 @@ fn now_ms() -> u64 {
 }
 
 fn default_bus_root() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join("mde").join("bus"))
+    mde_bus::default_data_dir()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::action_auth::{authorize_test_body, ActionAuthorizer};
+
+    const AUTH_KEY: &[u8] = b"cups-sync-action-auth-key";
+    const AUTH_NOW: i64 = 1_700_000_000_000;
 
     #[test]
     fn parse_lpstat_e_lists_queues() {
@@ -797,6 +853,7 @@ mod tests {
             cupsctl: "cupsctl".to_string(),
             bus_root: None, // no Bus in unit tests
             action_cursors: HashMap::new(),
+            authorizer: std::sync::Arc::new(ActionAuthorizer::production()),
         }
     }
 
@@ -829,5 +886,50 @@ mod tests {
     #[test]
     fn action_verbs_are_the_locked_two() {
         assert_eq!(ACTION_VERBS, ["sync-now", "list"]);
+    }
+
+    #[test]
+    fn sync_now_refuses_unsigned_tampered_and_replayed_bodies() {
+        let auth_root = tempfile::tempdir().expect("auth root");
+        let w = test_worker().with_authorizer(std::sync::Arc::new(ActionAuthorizer::for_test(
+            AUTH_KEY,
+            auth_root.path().to_path_buf(),
+            AUTH_NOW,
+        )));
+        let unsigned = r#"{"schema_version":1,"request":"sync-now"}"#;
+        let context = MutationContext {
+            verb: CUPS_SYNC_AUTH_VERB,
+            node: "testpeer",
+            target: "testpeer",
+        };
+        let armed = authorize_test_body(
+            AUTH_KEY,
+            unsigned,
+            context,
+            "cups-sync-once",
+            AUTH_NOW + 30_000,
+        );
+        let tampered = armed.replace("sync-now", "sync-now-tampered");
+
+        let unsigned_reply = w.handle_bus_action("sync-now", Some(unsigned));
+        assert!(unsigned_reply.contains("authorization refused"));
+        let tampered_reply = w.handle_bus_action("sync-now", Some(&tampered));
+        assert!(
+            tampered_reply.contains("authorization refused"),
+            "tampered sync request must be refused: {tampered_reply}"
+        );
+        assert_eq!(
+            w.handle_bus_action("sync-now", Some(&armed)),
+            r#"{"ok":true}"#
+        );
+        let replay = w.handle_bus_action("sync-now", Some(&armed));
+        assert!(replay.contains("already used"));
+    }
+
+    #[test]
+    fn list_stays_read_only_and_does_not_require_a_capability() {
+        let reply = test_worker().handle_bus_action("list", None);
+        let value: serde_json::Value = serde_json::from_str(&reply).expect("valid JSON");
+        assert!(value.is_array());
     }
 }

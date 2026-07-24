@@ -20,7 +20,12 @@ SEV="${2:-crit}"                 # crit | warn | info
 SUMMARY="${3:-$SRC is offline}"
 HOST="$(hostname 2>/dev/null || echo node)"
 
-DIR="${MDE_ALERTS_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/mde/alerts}"
+# systemd's root service environment is intentionally minimal and commonly
+# omits HOME. Keep the alert path writable and deterministic without making
+# the failure-notification unit fail because its own alert helper tripped
+# `set -u`.
+ALERT_HOME="${HOME:-/var/lib/mackesd}"
+DIR="${MDE_ALERTS_DIR:-${XDG_DATA_HOME:-$ALERT_HOME/.local/share}/mde/alerts}"
 if ! mkdir -p "$DIR" 2>/dev/null; then DIR=/tmp/mde-alerts; mkdir -p "$DIR"; fi
 
 SAFE="$(printf '%s' "$SRC" | tr -c 'a-zA-Z0-9' '_')"

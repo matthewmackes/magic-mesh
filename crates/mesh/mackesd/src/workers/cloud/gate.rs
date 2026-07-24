@@ -243,7 +243,7 @@ pub(crate) enum TokenVerdict {
     Missing,
     /// A token was presented but is not a parseable `v2` armed token / has a stunted nonce.
     Malformed,
-    /// The token's expiry is in the past.
+    /// The token's expiry is at or before the current time.
     Expired,
     /// The token is validly signed but remains usable beyond the narrow
     /// privileged-mutation window accepted by the consumer.
@@ -322,7 +322,10 @@ pub(crate) fn verify_token(
     if parsed.request_sha256 != request_sha256 {
         return TokenVerdict::RequestMismatch;
     }
-    if now_ms > parsed.expires_at_ms {
+    // `expires_at_ms` is an exclusive deadline. Accepting equality would give a
+    // capability one extra millisecond at the boundary and make the wire
+    // contract's expiry semantics ambiguous.
+    if now_ms >= parsed.expires_at_ms {
         return TokenVerdict::Expired;
     }
     if !signer.verify_payload(&parsed.signing_payload(), &parsed.signature) {
@@ -434,6 +437,36 @@ mod tests {
         let back = ArmedToken::parse(&tok.encode()).expect("parse");
         assert_eq!(back, tok);
         assert_eq!(back.node, "db.mesh.internal");
+    }
+
+    #[test]
+    fn a_capability_is_expired_at_its_exact_deadline() {
+        let s = signer();
+        let body = r#"{"node":"eagle"}"#;
+        let tok = mint(
+            &s,
+            "nonce-exact-deadline",
+            10_000,
+            "provision",
+            "eagle",
+            CLOUD_ARM_NODE_SCOPE,
+            body,
+        );
+
+        // A capability must not gain an extra millisecond merely because the
+        // verifier sampled the clock at the encoded deadline.
+        assert_eq!(
+            verify_token(
+                Some(&tok.encode()),
+                "provision",
+                "eagle",
+                CLOUD_ARM_NODE_SCOPE,
+                body,
+                10_000,
+                &s,
+            ),
+            TokenVerdict::Expired
+        );
     }
 
     #[test]

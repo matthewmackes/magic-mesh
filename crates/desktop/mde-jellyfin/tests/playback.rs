@@ -81,7 +81,12 @@ impl HttpTransport for RecordingTransport {
 }
 
 fn device() -> ClientInfo {
-    ClientInfo::new("mde-media", "workstation", "device-42", "12.0.0")
+    ClientInfo::new(
+        "mde-media",
+        "workstation",
+        "device-42",
+        env!("CARGO_PKG_VERSION"),
+    )
 }
 
 fn client() -> JellyfinClient<RecordingTransport> {

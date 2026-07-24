@@ -103,7 +103,7 @@ if command -v etcdctl >/dev/null 2>&1 && [ -s "$ENDPOINTS_FILE" ]; then
 fi
 
 # ── 2. aggregate the directory + every node's shell-status → snapshot ────────
-WG="$WG" SELF="$SELF" SELF_VER="$VER" \
+WG="$WG" SELF="$SELF" SELF_VER="$VER" PLATFORM_VERSION="$VER" \
 ETCD_MODE="$ETCD_MODE" ETCD_PEERS="$ETCD_PEERS" ETCD_LEADER="$ETCD_LEADER" \
 NET_IF="$NET_IF" NET_IP="$NET_IP" NET_CIDR="$NET_CIDR" NET_ROUTES="$NET_ROUTES" \
 NET_DEFGW="$NET_DEFGW" NET_GWEPS="$NET_GWEPS" NET_CIPHER="$NET_CIPHER" NET_LHIPS="$NET_LHIPS" \
@@ -182,7 +182,9 @@ network={"overlay_if":os.environ.get("NET_IF","") or "",
          "gateway_endpoints":_split("NET_GWEPS"),
          "lighthouse_ips":_split("NET_LHIPS"),
          "cipher":os.environ.get("NET_CIPHER","") or ""}
-snap={"generated_ms":int(time.time()*1000),"self":self_host,"latest_version":latest,
+platform_version=os.environ.get("PLATFORM_VERSION") or "unknown"
+snap={"generated_ms":int(time.time()*1000),"self":self_host,
+      "platform_version":platform_version,"latest_version":latest,
       "online":sum(1 for n in nodes if n["presence"]=="online"),"total":len(nodes),
       "nodes":nodes,"network":network}
 tmp=out+".tmp"

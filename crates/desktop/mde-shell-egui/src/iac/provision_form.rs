@@ -9,7 +9,7 @@
 //! apply (§7): a live apply only ever reaches the Bus past the arming gate.
 
 use mde_egui::egui::{self, Color32, Response, RichText};
-use mde_egui::{card, section, Style};
+use mde_egui::{card, section, Style, TypographyRole};
 
 use mackes_mesh_types::cloud::WorkloadSpec;
 
@@ -71,6 +71,14 @@ impl State {
     fn is_valid(&self) -> bool {
         !self.name.trim().is_empty()
     }
+}
+
+/// The live provision affordance requires both a valid draft and positive
+/// capability evidence from the selected placement node. Plan-only nodes can
+/// still author/plan, but must not open a live-apply arm that the worker cannot
+/// honor.
+pub(super) const fn live_provision_enabled(valid: bool, apply_armed: bool) -> bool {
+    valid && apply_armed
 }
 
 /// Trim a field, folding blank to `None` (the honest "unset").
@@ -176,7 +184,7 @@ pub(super) fn provision_form(ui: &mut egui::Ui, state: &mut WorkloadsState) {
         mde_egui::inset().show(ui, |ui| {
             ui.add(
                 egui::TextEdit::multiline(&mut form.raw_hcl)
-                    .font(egui::TextStyle::Monospace)
+                    .font(Style::typography_font(TypographyRole::Mono))
                     .desired_rows(4)
                     .desired_width(f32::INFINITY)
                     .hint_text("# optional HCL fragment"),
@@ -186,10 +194,17 @@ pub(super) fn provision_form(ui: &mut egui::Ui, state: &mut WorkloadsState) {
 
     ui.add_space(Style::SP_S);
     let valid = state.form.is_valid();
+    let live_apply_available = state.selected_node_apply_armed();
     if !valid {
         mde_egui::muted_note(
             ui,
             "A workload name is required before it can be set desired, planned, or provisioned.",
+        );
+    } else if !live_apply_available {
+        mde_egui::muted_note(
+            ui,
+            "Live provision is unavailable: the selected node is plan-only or no longer reports \
+             an armed-apply capability.",
         );
     }
 
@@ -205,7 +220,14 @@ pub(super) fn provision_form(ui: &mut egui::Ui, state: &mut WorkloadsState) {
             plan = true;
         }
         ui.add_space(Style::SP_S);
-        if action_button(ui, valid, "Provision\u{2026}", Style::DANGER).clicked() {
+        if action_button(
+            ui,
+            live_provision_enabled(valid, live_apply_available),
+            "Provision\u{2026}",
+            Style::DANGER,
+        )
+        .clicked()
+        {
             provision = true;
         }
     });
@@ -309,6 +331,13 @@ mod tests {
         assert!(!form.is_valid(), "whitespace-only name blocks authoring");
         form.name = "ok".to_string();
         assert!(form.is_valid());
+    }
+
+    #[test]
+    fn live_provision_requires_a_valid_draft_and_armed_node() {
+        assert!(!live_provision_enabled(false, true));
+        assert!(!live_provision_enabled(true, false));
+        assert!(live_provision_enabled(true, true));
     }
 
     #[test]

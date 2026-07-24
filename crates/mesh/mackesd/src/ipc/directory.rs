@@ -20,6 +20,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
 use mackes_mesh_types::peers::{read_peers, PeerRecord};
 use magic_fleet::store;
@@ -27,6 +28,8 @@ use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_bus::rpc::reply_topic;
 use serde_json::json;
+
+use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
 
 /// The directory verb's action topic.
 pub const ACTION_TOPIC: &str = "action/mesh/directory";
@@ -171,7 +174,7 @@ pub fn directory_row(
 }
 
 /// Directory service — owns the source locations.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct DirectoryService {
     /// The replicated workgroup root (PeerRecords + the fleet log).
     pub workgroup_root: PathBuf,
@@ -179,6 +182,22 @@ pub struct DirectoryService {
     /// roster mirror (overlay IP + role). `None` → those fields are
     /// `null` honestly.
     pub store_db: Option<PathBuf>,
+    node_id: String,
+    authorizer: Arc<ActionAuthorizer>,
+}
+
+fn production_authorizer() -> Arc<ActionAuthorizer> {
+    static AUTHORIZER: OnceLock<Arc<ActionAuthorizer>> = OnceLock::new();
+    AUTHORIZER
+        .get_or_init(|| Arc::new(ActionAuthorizer::production()))
+        .clone()
+}
+
+fn local_node_id() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "localhost".to_string())
 }
 
 impl DirectoryService {
@@ -188,7 +207,17 @@ impl DirectoryService {
         Self {
             workgroup_root: workgroup_root.to_path_buf(),
             store_db,
+            node_id: local_node_id(),
+            authorizer: production_authorizer(),
         }
+    }
+
+    /// Inject an isolated verifier for hostile responder tests.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
+        self.authorizer = authorizer;
+        self
     }
 
     /// Overlay-ip + role per hostname from the roster mirror.
@@ -492,7 +521,7 @@ pub fn serve_bus<F: Fn() -> bool>(persist: &Persist, svc: &DirectoryService, sho
     let mut tick: u64 = 0;
     while !should_stop() {
         poll_once(persist, svc, &mut cursor);
-        poll_wake_once(persist, &mut wake_cursor);
+        poll_wake_once(persist, svc, &mut wake_cursor);
         poll_lifecycle_once(persist, svc, &mut lifecycle_cursor);
         poll_lifecycle_result_once(persist, svc, &mut result_cursor);
         // PD-3/Q10 — push a change event ~every 3 s when the roster moves.
@@ -538,10 +567,29 @@ pub fn poll_lifecycle_result_once(
             req.get("id").and_then(|v| v.as_str()),
         ) {
             (Some(peer), Some(id)) => {
-                match crate::lifecycle::take_result(&svc.workgroup_root, peer, id) {
-                    Some(r) => json!({ "ok": true, "found": true,
-                                       "result": { "ok": r.ok, "error": r.error } }),
-                    None => json!({ "ok": true, "found": false }),
+                // A result poll is destructive: `take_result` reads and deletes
+                // the replicated result file.  The shared Bus is writable by
+                // every local UID, so parsing `peer`/`id` is not an authority
+                // boundary.  Require the same exact-body, single-use capability
+                // used by the other privileged responders before consuming it.
+                let target = format!("{peer}:{id}");
+                match svc.authorizer.authorize(
+                    msg.body.as_deref().unwrap_or_default(),
+                    MutationContext {
+                        verb: "lifecycle-result",
+                        node: &svc.node_id,
+                        target: &target,
+                    },
+                ) {
+                    Ok(()) => match crate::lifecycle::take_result(&svc.workgroup_root, peer, id) {
+                        Some(r) => json!({ "ok": true, "found": true,
+                                           "result": { "ok": r.ok, "error": r.error } }),
+                        None => json!({ "ok": true, "found": false }),
+                    },
+                    Err(error) => json!({
+                        "ok": false,
+                        "error": format!("lifecycle-result: authorization refused: {error}"),
+                    }),
                 }
             }
             _ => json!({ "ok": false, "error": "lifecycle-result: need peer + id" }),
@@ -599,7 +647,7 @@ pub fn lifecycle_reply(_svc: &DirectoryService, _body: Option<&str>, _id: &str) 
 
 /// PD-12 — answer wake requests: validate the MAC, fire the magic
 /// packet (UDP/9 broadcast), reply `{ok}` / honest error.
-pub fn poll_wake_once(persist: &Persist, cursor: &mut Option<String>) {
+pub fn poll_wake_once(persist: &Persist, svc: &DirectoryService, cursor: &mut Option<String>) {
     let msgs = match persist.list_since(WAKE_TOPIC, cursor.as_deref()) {
         Ok(m) => m,
         Err(_) => return,
@@ -607,15 +655,31 @@ pub fn poll_wake_once(persist: &Persist, cursor: &mut Option<String>) {
     for msg in msgs {
         *cursor = Some(msg.ulid.clone());
         // EFF-23 — refuse an oversized body before wake_reply parses it.
-        let reply = if crate::ipc::body_within_cap(msg.body.as_deref()) {
-            wake_reply(msg.body.as_deref())
-        } else {
+        let reply = if !crate::ipc::body_within_cap(msg.body.as_deref()) {
             tracing::warn!(
                 topic = WAKE_TOPIC,
                 len = msg.body.as_ref().map_or(0, String::len),
                 "directory responder: wake body exceeds cap; refusing",
             );
             crate::ipc::body_too_large_reply("wake")
+        } else if let Some(target) = wake_target(msg.body.as_deref()) {
+            match svc.authorizer.authorize(
+                msg.body.as_deref().unwrap_or_default(),
+                MutationContext {
+                    verb: "mesh-wake",
+                    node: &svc.node_id,
+                    target: &target,
+                },
+            ) {
+                Ok(()) => wake_reply(msg.body.as_deref()),
+                Err(error) => json!({
+                    "ok": false,
+                    "error": format!("wake: authorization refused: {error}"),
+                })
+                .to_string(),
+            }
+        } else {
+            wake_reply(msg.body.as_deref())
         };
         let _ = persist.write(
             &reply_topic(&msg.ulid),
@@ -624,6 +688,18 @@ pub fn poll_wake_once(persist: &Persist, cursor: &mut Option<String>) {
             Some(&reply),
         );
     }
+}
+
+fn wake_target(body: Option<&str>) -> Option<String> {
+    let req: serde_json::Value = serde_json::from_str(body.unwrap_or("{}")).ok()?;
+    let raw = req.get("mac").and_then(serde_json::Value::as_str)?;
+    let mac = crate::workers::wol::normalize_mac(raw)?;
+    Some(
+        mac.iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join(":"),
+    )
 }
 
 /// Build the wake reply (pure-ish; the send is the side effect).
@@ -670,6 +746,7 @@ pub fn poll_once(persist: &Persist, svc: &DirectoryService, cursor: &mut Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::action_auth::authorize_test_body;
     use mackes_mesh_types::peers::write_peer_record;
 
     #[test]
@@ -1041,6 +1118,67 @@ mod tests {
     }
 
     #[test]
+    fn wake_responder_requires_single_use_capability_before_packet_send() {
+        const KEY: &[u8] = b"directory-wake-auth-test-key";
+        const NOW: i64 = 1_700_000_000_000;
+        let workgroup = tempfile::tempdir().unwrap();
+        let bus = tempfile::tempdir().unwrap();
+        let persist = Persist::open(bus.path().to_path_buf()).unwrap();
+        let svc = DirectoryService::new(workgroup.path(), None).with_authorizer(Arc::new(
+            ActionAuthorizer::for_test(KEY, bus.path().join("auth"), NOW),
+        ));
+        let raw = r#"{"mac":"aa:bb:cc:dd:ee:ff","schema_version":1}"#;
+        let unsigned = persist
+            .write(WAKE_TOPIC, Priority::Default, None, Some(raw))
+            .unwrap();
+        let mut cursor = None;
+        poll_wake_once(&persist, &svc, &mut cursor);
+        let unsigned_reply = persist
+            .list_since(&reply_topic(&unsigned.ulid), None)
+            .unwrap()
+            .pop()
+            .and_then(|message| message.body)
+            .unwrap_or_default();
+        assert!(unsigned_reply.contains("authorization refused"));
+
+        let target = wake_target(Some(raw)).unwrap();
+        let armed = authorize_test_body(
+            KEY,
+            raw,
+            MutationContext {
+                verb: "mesh-wake",
+                node: &svc.node_id,
+                target: &target,
+            },
+            "directory-wake-once",
+            NOW + 30_000,
+        );
+        let armed_id = persist
+            .write(WAKE_TOPIC, Priority::Default, None, Some(&armed))
+            .unwrap();
+        poll_wake_once(&persist, &svc, &mut cursor);
+        let armed_reply = persist
+            .list_since(&reply_topic(&armed_id.ulid), None)
+            .unwrap()
+            .pop()
+            .and_then(|message| message.body)
+            .unwrap_or_default();
+        assert!(!armed_reply.contains("authorization refused"));
+
+        let replay_id = persist
+            .write(WAKE_TOPIC, Priority::Default, None, Some(&armed))
+            .unwrap();
+        poll_wake_once(&persist, &svc, &mut cursor);
+        let replay_reply = persist
+            .list_since(&reply_topic(&replay_id.ulid), None)
+            .unwrap()
+            .pop()
+            .and_then(|message| message.body)
+            .unwrap_or_default();
+        assert!(replay_reply.contains("authorization refused"));
+    }
+
+    #[test]
     fn retired_lifecycle_verb_never_writes_a_request_file() {
         let tmp = tempfile::tempdir().unwrap();
         let svc = DirectoryService::new(tmp.path(), None);
@@ -1053,6 +1191,96 @@ mod tests {
         assert_eq!(reply["ok"], false);
         assert!(reply["error"].as_str().unwrap().contains("authenticated"));
         assert!(crate::lifecycle::take_requests(tmp.path(), "oak").is_empty());
+    }
+
+    #[test]
+    fn lifecycle_result_requires_single_use_capability_before_consuming_result() {
+        const KEY: &[u8] = b"directory-lifecycle-result-auth-test-key";
+        const NOW: i64 = 1_700_000_000_000;
+        let workgroup = tempfile::tempdir().unwrap();
+        let bus = tempfile::tempdir().unwrap();
+        let persist = Persist::open(bus.path().to_path_buf()).unwrap();
+        let svc = DirectoryService::new(workgroup.path(), None).with_authorizer(Arc::new(
+            ActionAuthorizer::for_test(KEY, bus.path().join("auth"), NOW),
+        ));
+        let result = crate::lifecycle::LifecycleResult {
+            id: "r1".into(),
+            ok: true,
+            error: String::new(),
+        };
+        let result_path = crate::lifecycle::write_result(workgroup.path(), "oak", &result)
+            .expect("write lifecycle result");
+        let raw = r#"{"peer":"oak","id":"r1","schema_version":1}"#;
+        let mut cursor = None;
+
+        let unsigned = persist
+            .write(LIFECYCLE_RESULT_TOPIC, Priority::Default, None, Some(raw))
+            .unwrap();
+        poll_lifecycle_result_once(&persist, &svc, &mut cursor);
+        let unsigned_reply = persist
+            .list_since(&reply_topic(&unsigned.ulid), None)
+            .unwrap()
+            .pop()
+            .and_then(|message| message.body)
+            .unwrap_or_default();
+        assert!(unsigned_reply.contains("authorization refused"));
+        assert!(
+            result_path.exists(),
+            "unsigned poll must not consume a result"
+        );
+
+        let armed = authorize_test_body(
+            KEY,
+            raw,
+            MutationContext {
+                verb: "lifecycle-result",
+                node: &svc.node_id,
+                target: "oak:r1",
+            },
+            "lifecycle-result-once",
+            NOW + 30_000,
+        );
+        let armed_id = persist
+            .write(
+                LIFECYCLE_RESULT_TOPIC,
+                Priority::Default,
+                None,
+                Some(&armed),
+            )
+            .unwrap();
+        poll_lifecycle_result_once(&persist, &svc, &mut cursor);
+        let armed_reply = persist
+            .list_since(&reply_topic(&armed_id.ulid), None)
+            .unwrap()
+            .pop()
+            .and_then(|message| message.body)
+            .unwrap_or_default();
+        let armed_value: serde_json::Value = serde_json::from_str(&armed_reply).unwrap();
+        assert_eq!(armed_value["found"], true, "armed reply: {armed_reply}");
+        assert!(!result_path.exists(), "authorized poll consumes the result");
+
+        crate::lifecycle::write_result(workgroup.path(), "oak", &result)
+            .expect("restore lifecycle result for replay test");
+        let replay_id = persist
+            .write(
+                LIFECYCLE_RESULT_TOPIC,
+                Priority::Default,
+                None,
+                Some(&armed),
+            )
+            .unwrap();
+        poll_lifecycle_result_once(&persist, &svc, &mut cursor);
+        let replay_reply = persist
+            .list_since(&reply_topic(&replay_id.ulid), None)
+            .unwrap()
+            .pop()
+            .and_then(|message| message.body)
+            .unwrap_or_default();
+        assert!(replay_reply.contains("authorization refused"));
+        assert!(
+            result_path.exists(),
+            "replayed capability must not consume a second result"
+        );
     }
 
     #[test]

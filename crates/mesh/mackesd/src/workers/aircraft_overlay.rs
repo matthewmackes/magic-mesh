@@ -611,6 +611,40 @@ impl AircraftOverlayWorker {
         }
     }
 
+    fn degraded_snapshot(
+        &self,
+        last_good: Option<&AircraftSnapshot>,
+        reason: &str,
+    ) -> AircraftSnapshot {
+        // A worker restart has no private cache, but the Bus can still hold a
+        // prior location's successful record. Read it only to derive an empty
+        // degraded projection; never expose those aircraft as current data.
+        let persisted = self.bus_root.clone().and_then(|root| {
+            let persist = mde_bus::persist::Persist::open(root).ok()?;
+            let body = persist
+                .read_latest(&aircraft_state_topic(&self.host))
+                .ok()
+                .flatten()?
+                .body?;
+            serde_json::from_str::<AircraftSnapshot>(&body).ok()
+        });
+        let mut degraded = last_good
+            .cloned()
+            .or(persisted)
+            .unwrap_or_else(|| AircraftSnapshot::empty(&self.host, 0, 0.0, 0.0, 0.0));
+        degraded.aircraft.clear();
+        degraded.feed_generated_at_ms = None;
+        degraded.feed_total = None;
+        degraded.relevance_filtered = 0;
+        degraded.quality_filtered = 0;
+        degraded.fetched_at_ms = now_ms();
+        degraded
+            .gaps
+            .retain(|gap| !gap.starts_with("adsb.lol refresh failed:"));
+        push_gap(&mut degraded.gaps, reason.to_string());
+        degraded
+    }
+
     fn apply_result(
         &self,
         result: io::Result<PreparedResponse>,
@@ -653,14 +687,9 @@ impl AircraftOverlayWorker {
     }
 
     fn publish_failure(&self, last_good: &mut Option<AircraftSnapshot>, gap: &str) {
-        tracing::warn!(target: "mackesd::aircraft_overlay", host = %self.host, error = gap, "aircraft refresh failed; retaining last-good snapshot");
-        if let Some(snapshot) = last_good {
-            snapshot
-                .gaps
-                .retain(|existing| !existing.starts_with("adsb.lol refresh failed:"));
-            push_gap(&mut snapshot.gaps, gap.to_string());
-            self.publish(snapshot);
-        }
+        tracing::warn!(target: "mackesd::aircraft_overlay", host = %self.host, error = gap, "aircraft refresh failed; publishing empty degraded snapshot");
+        let degraded = self.degraded_snapshot(last_good.as_ref(), gap);
+        self.publish(&degraded);
     }
 
     async fn fetch_async(
@@ -737,14 +766,23 @@ impl Worker for AircraftOverlayWorker {
         };
         let mut last_good = None;
         let mut retry = self.poll;
+        let mut no_fix_published = false;
         loop {
             let Some(fix) = self.current_vehicle_fix() else {
+                if !no_fix_published {
+                    self.publish_failure(
+                        &mut last_good,
+                        "adsb.lol refresh failed: fresh same-host MG90 vehicle fix unavailable",
+                    );
+                    no_fix_published = true;
+                }
                 tokio::select! {
                     () = shutdown.wait() => break,
                     () = tokio::time::sleep(NO_FIX_RETRY.min(self.poll)) => {}
                 }
                 continue;
             };
+            no_fix_published = false;
             let Some(result) = self.fetch_async(probe.clone(), fix, &mut shutdown).await else {
                 break;
             };
@@ -975,7 +1013,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_refresh_keeps_original_timestamp_and_publishes_gap() {
+    fn failed_refresh_publishes_empty_degraded_without_mutating_private_cache() {
         let temp = tempfile::tempdir().expect("temp");
         let root = temp.path().to_path_buf();
         let worker = worker().with_bus_root(Some(root.clone()));
@@ -989,12 +1027,129 @@ mod tests {
             .expect("last")
             .gaps
             .iter()
-            .any(|gap| gap.contains("timeout")));
+            .all(|gap| !gap.contains("timeout")));
         let persist = Persist::open(root).expect("bus");
         let rows = persist
             .list_since(&aircraft_state_topic("rig-1"), None)
             .expect("read");
         assert_eq!(rows.len(), 2);
+        assert!(!last.as_ref().expect("private cache").aircraft.is_empty());
+        let degraded: AircraftSnapshot = serde_json::from_str(
+            rows.last()
+                .and_then(|row| row.body.as_deref())
+                .expect("degraded body"),
+        )
+        .expect("degraded snapshot");
+        assert!(degraded.aircraft.is_empty());
+        assert!(degraded.feed_total.is_none());
+        assert!(degraded
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("timeout")));
+    }
+
+    #[test]
+    fn mismatched_not_modified_publishes_empty_degraded_and_keeps_private_cache() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().to_path_buf();
+        let worker = worker().with_bus_root(Some(root.clone()));
+        let original = build_snapshot("rig-1", fix(), CAPTURED_ADSB, FETCHED_AT_MS).expect("parse");
+        let mut last = None;
+        assert!(worker.apply_result(Ok(PreparedResponse::Modified(original)), fix(), &mut last));
+        let mut moved = fix();
+        moved.latitude += 1.0;
+        assert!(!worker.apply_result(
+            Ok(PreparedResponse::NotModified),
+            moved,
+            &mut last,
+        ));
+
+        let private = last.as_ref().expect("private cache");
+        assert!(!private.aircraft.is_empty());
+        assert!(snapshot_matches_fix(private, fix()));
+        let rows = Persist::open(root)
+            .expect("bus")
+            .list_since(&aircraft_state_topic("rig-1"), None)
+            .expect("read");
+        assert_eq!(rows.len(), 2);
+        let degraded: AircraftSnapshot = serde_json::from_str(
+            rows.last()
+                .and_then(|row| row.body.as_deref())
+                .expect("degraded body"),
+        )
+        .expect("degraded snapshot");
+        assert!(degraded.aircraft.is_empty());
+        assert!(degraded
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("304 point does not match")));
+    }
+
+    #[test]
+    fn persisted_stale_record_is_cleared_after_restart() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().to_path_buf();
+        let seed_worker = worker().with_bus_root(Some(root.clone()));
+        let original = build_snapshot("rig-1", fix(), CAPTURED_ADSB, FETCHED_AT_MS).expect("parse");
+        let mut seed_cache = None;
+        assert!(seed_worker.apply_result(
+            Ok(PreparedResponse::Modified(original)),
+            fix(),
+            &mut seed_cache,
+        ));
+
+        let restarted = worker().with_bus_root(Some(root.clone()));
+        let mut private_cache = None;
+        restarted.publish_failure(
+            &mut private_cache,
+            "adsb.lol refresh failed: no fresh vehicle fix after restart",
+        );
+        assert!(private_cache.is_none());
+        let latest: AircraftSnapshot = serde_json::from_str(
+            Persist::open(root)
+                .expect("bus")
+                .read_latest(&aircraft_state_topic("rig-1"))
+                .expect("read")
+                .expect("message")
+                .body
+                .as_deref()
+                .expect("body"),
+        )
+        .expect("degraded snapshot");
+        assert!(latest.aircraft.is_empty());
+        assert!(latest
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("after restart")));
+    }
+
+    #[test]
+    fn no_fresh_vehicle_fix_publishes_empty_state_before_first_fetch() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().to_path_buf();
+        let worker = worker().with_bus_root(Some(root));
+        let mut private_cache = None;
+        worker.publish_failure(
+            &mut private_cache,
+            "adsb.lol refresh failed: fresh same-host MG90 vehicle fix unavailable",
+        );
+        assert!(private_cache.is_none());
+        let snapshot: AircraftSnapshot = serde_json::from_str(
+            Persist::open(worker.bus_root.clone().expect("root"))
+                .expect("bus")
+                .read_latest(&aircraft_state_topic("rig-1"))
+                .expect("read")
+                .expect("message")
+                .body
+                .as_deref()
+                .expect("body"),
+        )
+        .expect("degraded snapshot");
+        assert!(snapshot.aircraft.is_empty());
+        assert!(snapshot
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("vehicle fix unavailable")));
     }
 
     struct SlowProbe;

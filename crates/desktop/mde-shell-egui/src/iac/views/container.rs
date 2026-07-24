@@ -2,22 +2,22 @@
 //! containers (rootless by default), installed as systemd units by the
 //! `container-deploy` verb. Unlike the VM views these are **not** libvirt domains,
 //! so the `instance-*` virsh verbs do not apply; per-container lifecycle
-//! (restart / logs / destroy) rides Podman/systemd ops the cloud worker does not
-//! yet expose as action verbs. The roster is real (live status · drift · metrics);
-//! those row actions are shown as honest, disabled affordances (never a fake op).
+//! (restart / logs / destroy) rides the dedicated Podman/systemd action verbs.
+//! The roster and its actions are real (live status · drift · metrics), with
+//! action outcomes surfaced through the shared Workloads status note.
 
 use mackes_mesh_types::cloud::{DriftFlag, WorkloadRow};
 use mde_egui::egui::{self, Color32, RichText};
 use mde_egui::{carbon_icon, card, field, inset, muted_note, status_dot, Style};
 
-use super::super::{DeliveryView, Panel, WorkloadsState};
+use super::super::{row_button, DeliveryView, Panel, WorkloadsState};
 
 /// The Service Container view's own state (U16 owns its fields).
 #[derive(Debug, Default)]
 pub(in crate::iac) struct State;
 
-/// Render the Service Container view — the Podman/Quadlet roster + honest pending
-/// per-container lifecycle affordances.
+/// Render the Service Container view — the Podman/Quadlet roster + per-container
+/// lifecycle affordances.
 pub(super) fn view(ui: &mut egui::Ui, state: &mut WorkloadsState) {
     heading(
         ui,
@@ -40,27 +40,33 @@ pub(super) fn view(ui: &mut egui::Ui, state: &mut WorkloadsState) {
         return;
     }
     for row in &rows {
-        container_card(ui, row);
+        container_card(ui, state, row);
     }
     muted_note(
         ui,
-        "Restart / Logs / Destroy ride Podman + systemd (Quadlet) ops the cloud worker does not yet \
-         expose as action verbs — only container-deploy is wired. These affordances are disabled \
-         until the container-lifecycle unit lands; nothing is issued here.",
+        "Restart / Logs / Destroy ride the placement node's Podman + systemd (Quadlet) \
+         lifecycle actions. Requests retain this row's node and container identity; outcomes \
+         appear in the shared action status above.",
     );
 }
 
 /// One container card — name · `rootless` tag · reachability · status · drift, the
-/// metrics, then the honest pending lifecycle affordances (disabled).
-fn container_card(ui: &mut egui::Ui, row: &WorkloadRow) {
+/// metrics, then the Podman/systemd lifecycle verbs (destructive ones typed-armed).
+fn container_card(ui: &mut egui::Ui, state: &mut WorkloadsState, row: &WorkloadRow) {
     card().show(ui, |ui| {
         header_row(ui, row);
         metrics_line(ui, row);
         ui.add_space(Style::SP_XS);
         ui.horizontal(|ui| {
-            pending_button(ui, "Restart");
-            pending_button(ui, "Logs");
-            pending_button(ui, "Destroy\u{2026}");
+            if row_button(ui, "Restart", false).clicked() {
+                state.issue_lifecycle_direct("container-restart", &row.node, &row.name, &row.name);
+            }
+            if row_button(ui, "Logs", false).clicked() {
+                state.issue_lifecycle_direct("container-logs", &row.node, &row.name, &row.name);
+            }
+            if row_button(ui, "Destroy\u{2026}", true).clicked() {
+                state.issue_lifecycle_direct("container-destroy", &row.node, &row.name, &row.name);
+            }
         });
     });
     ui.add_space(Style::SP_S);
@@ -140,20 +146,6 @@ fn drift_chip(ui: &mut egui::Ui, drift: DriftFlag) {
     let tone = drift_tone(drift);
     status_dot(ui, tone);
     ui.colored_label(tone, RichText::new(drift_word(drift)).size(Style::SMALL));
-}
-
-/// A disabled action affordance — the intended verb is shown so the surface reads
-/// completely, but it is honestly non-functional until its backend leg lands
-/// (never a fake success).
-fn pending_button(ui: &mut egui::Ui, label: &str) {
-    ui.add_enabled(
-        false,
-        egui::Button::new(
-            RichText::new(label)
-                .size(Style::SMALL)
-                .color(Style::TEXT_DIM),
-        ),
-    );
 }
 
 /// The view heading — the Workloads-accent glyph + title + a one-line blurb.

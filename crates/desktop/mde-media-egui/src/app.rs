@@ -693,7 +693,7 @@ fn jellyfin_device() -> ClientInfo {
         "mde-media",
         "mde-media-egui",
         "mde-media-egui-seat",
-        "12.0.0",
+        env!("CARGO_PKG_VERSION"),
     )
 }
 
@@ -2347,14 +2347,14 @@ fn car_transport_button(
     media_hover_text(response, tip).on_hover_cursor(CursorIcon::PointingHand)
 }
 
-/// A [`FontId`] on the shared `"heading"` font family
-/// ([`mde_egui::fonts::HEADING_FAMILY`]) at `size` — the large-type family the Car-Mode
-/// now-playing block reads with (§4 — the shared family, never a crate-local face).
+/// A crash-safe Car-Mode heading font at `size`.
+///
+/// Car can be entered while the shell is re-installing its appearance fonts. The
+/// proportional family is always present in egui's base definitions, whereas a
+/// named role may be transiently absent during that handoff; keep the live seat
+/// renderable rather than panicking on an unbound named family.
 fn car_heading_font(size: f32) -> FontId {
-    FontId::new(
-        size,
-        egui::FontFamily::Name(std::sync::Arc::from(mde_egui::fonts::HEADING_FAMILY)),
-    )
+    FontId::new(size, egui::FontFamily::Proportional)
 }
 
 fn media_text_button_sized(
@@ -3303,7 +3303,8 @@ mod tests {
         // A configured server (no titles yet) renders the server row + add fields.
         render(&mut c, sources_view);
         // Browse a title through a stub client, then the playable row tessellates.
-        let device = mde_jellyfin::ClientInfo::new("mde-media", "test", "dev", "12.0.0");
+        let device =
+            mde_jellyfin::ClientInfo::new("mde-media", "test", "dev", env!("CARGO_PKG_VERSION"));
         let client =
             mde_jellyfin::JellyfinClient::new("https://jelly.mesh:8096", device, JellyStub)
                 .with_auth("T", "u");
@@ -3356,7 +3357,8 @@ mod tests {
         c.add_jellyfin_profile("srv", profile("user-b", "guest", "B"));
 
         // Browse a title, then download it → the offline badge + downloaded list draw.
-        let device = mde_jellyfin::ClientInfo::new("mde-media", "test", "dev", "12.0.0");
+        let device =
+            mde_jellyfin::ClientInfo::new("mde-media", "test", "dev", env!("CARGO_PKG_VERSION"));
         let client =
             mde_jellyfin::JellyfinClient::new("https://jelly.mesh:8096", device, JellyDownloadStub)
                 .with_auth("A", "user-a");

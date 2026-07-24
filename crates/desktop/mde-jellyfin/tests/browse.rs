@@ -106,7 +106,12 @@ impl HttpTransport for StatusTransport {
 }
 
 fn device() -> ClientInfo {
-    ClientInfo::new("mde-media", "workstation", "device-42", "12.0.0")
+    ClientInfo::new(
+        "mde-media",
+        "workstation",
+        "device-42",
+        env!("CARGO_PKG_VERSION"),
+    )
 }
 
 /// A movies-serving client already signed in as the fixture user.

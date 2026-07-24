@@ -9,8 +9,11 @@ use crate::*;
 pub fn run(mesh_id: String, lighthouse: Option<String>, note: String) -> anyhow::Result<()> {
     {
         let root = mackesd_core::default_qnm_shared_root();
-        let bearer = mackesd_core::bearer_ledger::issue(&root, &note)
-            .map_err(|e| anyhow::anyhow!("minting bearer: {e}"))?;
+        if note.len() > 256 || note.chars().any(char::is_control) {
+            anyhow::bail!(
+                "enroll-token: note must be at most 256 bytes with no control characters"
+            );
+        }
         // DAR-19 / XPA-5 — default to THIS lighthouse's PUBLIC address at
         // the dedicated `/enroll` HTTPS port, never the overlay IP at
         // Nebula's UDP data-plane port (`:4242`). A not-yet-enrolled node
@@ -31,9 +34,11 @@ pub fn run(mesh_id: String, lighthouse: Option<String>, note: String) -> anyhow:
         // mints (without `?fp=`), matching `join`'s documented fallback
         // for a fingerprint-less token.
         let cert_path = mackesd_core::workers::nebula_enroll_listener::DEFAULT_CERT_PATH;
-        let fp = std::fs::read(cert_path).ok().and_then(|pem| {
-            mackesd_core::nebula_enroll_endpoint::endpoint_fingerprint_from_pem(&pem)
-        });
+        let fp = mackesd_core::ca::seal::read_no_follow(std::path::Path::new(cert_path))
+            .ok()
+            .and_then(|pem| {
+                mackesd_core::nebula_enroll_endpoint::endpoint_fingerprint_from_pem(&pem)
+            });
         if fp.is_none() {
             eprintln!(
                 "enroll-token: no /enroll endpoint cert at {cert_path} yet — minting a \
@@ -42,6 +47,21 @@ pub fn run(mesh_id: String, lighthouse: Option<String>, note: String) -> anyhow:
                      endpoint) and use `mackesd add-peer` for a network-joinable token."
             );
         }
+        // Validate every caller-controlled token field before minting the
+        // single-use bearer. A malformed mesh-id must never leave an
+        // unredeemable authority record behind in the replicated ledger.
+        let preview = mackesd_core::nebula_enroll::JoinToken {
+            mesh_id: mesh_id.clone(),
+            lighthouse: host.clone(),
+            port,
+            bearer: "preview".into(),
+            fp: fp.clone(),
+        };
+        if mackesd_core::nebula_enroll::parse_join_token(&preview.encode()).is_none() {
+            anyhow::bail!("enroll-token: invalid mesh-id or lighthouse endpoint");
+        }
+        let bearer = mackesd_core::bearer_ledger::issue(&root, &note)
+            .map_err(|e| anyhow::anyhow!("minting bearer: {e}"))?;
         let token = mackesd_core::nebula_enroll::JoinToken {
             mesh_id,
             lighthouse: host,

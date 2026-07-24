@@ -10,11 +10,9 @@ pub fn run() -> anyhow::Result<()> {
         use mackesd_core::surrounding_hosts::{
             blocked_ips, drop_rich_rule_body, read_all_surrounding,
         };
-        if let Some(data_dir) = dirs::data_dir() {
-            let base = data_dir.join("mde").join("surrounding");
-            for ip in blocked_ips(&read_all_surrounding(&base)) {
-                println!("{}", drop_rich_rule_body(&ip));
-            }
+        let base = mackesd_core::surrounding_hosts::default_surrounding_root();
+        for ip in blocked_ips(&read_all_surrounding(&base)) {
+            println!("{}", drop_rich_rule_body(&ip));
         }
     }
     Ok(())

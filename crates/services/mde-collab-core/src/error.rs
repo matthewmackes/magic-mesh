@@ -154,6 +154,10 @@ pub enum CollabError {
     /// A serialization/deserialization failure.
     #[error("serde error: {0}")]
     Serde(String),
+    /// An event supplied to the projection was unsigned, malformed, or used a
+    /// schema version the projection does not understand.
+    #[error("collaboration event {0} failed schema or signature validation")]
+    InvalidEvent(EventId),
 }
 
 impl From<rusqlite::Error> for CollabError {

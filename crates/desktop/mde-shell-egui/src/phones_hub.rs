@@ -83,6 +83,21 @@ const PAIR_ENROLL_TOKEN_ACTION: &str = "action/connect/mesh-enroll-token";
 /// Refresh a daemon token before its expiry reaches the visible Pair QR.
 const PAIR_ENROLL_REFRESH_LEAD_MS: i64 = 60_000;
 
+/// Connect mutations are privileged because they change the host pairing
+/// store, enqueue phone actions, or mint an enrollment invite. Read-only roster
+/// and browse requests remain open transport queries.
+const CONNECT_MUTATION_VERBS: [&str; 9] = [
+    "pair",
+    "pair-device",
+    "unpair",
+    "ring",
+    "sms",
+    "clipboard",
+    "share",
+    "sftp",
+    "mesh-enroll-token",
+];
+
 // ── Bus payload mirrors (local serde, the shell-tier pattern) ────────────────
 
 /// One roster row as `action/connect/devices` publishes it (mirrors the worker's
@@ -563,7 +578,39 @@ impl PhonesHubState {
 
     fn publish(&self, topic: &str, body: Option<&str>) -> Option<String> {
         let persist = self.persist()?;
-        publish_request(&persist, topic, Priority::Default, None, body).ok()
+        let body = if let Some(verb) = connect_mutation_verb(topic) {
+            let unsigned = body.unwrap_or("{}");
+            Some(self.authorize_connect_body(verb, unsigned).ok()?)
+        } else {
+            body.map(str::to_owned)
+        };
+        publish_request(&persist, topic, Priority::Default, None, body.as_deref()).ok()
+    }
+
+    /// Add the schema and root-minted exact-body capability expected by the
+    /// privileged KDC responder. The test build uses the deterministic signer
+    /// seam in `iac`; production loads the root/systemd credential there.
+    fn authorize_connect_body(&self, verb: &str, body: &str) -> Result<String, String> {
+        let mut document: serde_json::Value = serde_json::from_str(body)
+            .map_err(|error| format!("Connect request is not JSON: {error}"))?;
+        let object = document
+            .as_object_mut()
+            .ok_or_else(|| "Connect request must be a JSON object".to_string())?;
+        if object.contains_key("armed_token") {
+            return Err("Connect request already contains an armed token".to_string());
+        }
+        object.insert(
+            "schema_version".to_string(),
+            serde_json::json!(mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION),
+        );
+        let unsigned = document.to_string();
+        let target = connect_auth_target(verb, &document);
+        crate::iac::authorize_root_mutation_body(
+            &unsigned,
+            &format!("connect-{verb}"),
+            &self.self_host,
+            &target,
+        )
     }
 
     fn read_reply(&self, ulid: &str) -> Option<String> {
@@ -1219,6 +1266,22 @@ fn hostname() -> String {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn connect_mutation_verb(topic: &str) -> Option<&str> {
+    let verb = topic.strip_prefix("action/connect/")?;
+    CONNECT_MUTATION_VERBS.contains(&verb).then_some(verb)
+}
+
+fn connect_auth_target(verb: &str, body: &serde_json::Value) -> String {
+    let device = body
+        .get("device_id")
+        .or_else(|| body.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty());
+    device
+        .map(|value| format!("device:{value}"))
+        .unwrap_or_else(|| format!("connect:{verb}"))
 }
 
 /// The mesh service directory dir under the workgroup root (mirrors

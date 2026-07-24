@@ -651,7 +651,7 @@ fn now_ms_i64() -> i64 {
 
 /// The default Bus root (persisted message tree), matching every other worker.
 fn default_bus_root() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join("mde").join("bus"))
+    mde_bus::default_data_dir()
 }
 
 /// Parse the 1-minute load from a `/proc/loadavg` body (first whitespace field).

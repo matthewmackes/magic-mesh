@@ -54,6 +54,7 @@ mod keyboard;
 mod lock_signal;
 mod logging;
 mod mesh_view;
+mod nav_bar;
 mod network;
 mod notification_center;
 mod pam_auth;
@@ -158,10 +159,36 @@ const LAYOUT_MODE_HUD_CLEARANCE: f32 = Style::SP_XL * 3.0;
 struct Nav {
     /// `true` while the shell body (the active surface) fills the central view.
     expanded: bool,
-    /// Which surface fills the shell body (Remote Sessions by default).
+    /// Which surface fills the shell body (Remote Sessions by default). The
+    /// legacy Workbench/MeshView/Explorer values are normalized into Fleet &
+    /// Mesh when that interface renders.
     surface: Surface,
     /// The Workbench plane shown when the Workbench surface is active.
     plane: Plane,
+}
+
+/// The three views folded into the single Fleet & Mesh interface. The legacy
+/// `Surface` variants remain internal deep-link aliases so existing alerts and
+/// workflows land on the right tab while the launcher exposes only one icon.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum FleetMeshTab {
+    /// Mesh-control planes: This Node, Network, Fleet, and Provisioning.
+    #[default]
+    Workbench,
+    /// Live topology and links.
+    MeshMap,
+    /// Discovered mesh, LAN, and cloud units.
+    Explorer,
+}
+
+/// One history point for the navigation bar's Back action. Fleet & Mesh tabs
+/// are first-class points even though they share one launcher surface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NavLocation {
+    expanded: bool,
+    surface: Surface,
+    plane: Plane,
+    fleet_mesh_tab: FleetMeshTab,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -778,7 +805,8 @@ fn surface_needs_remote_sessions_fallback(surface: Surface) -> bool {
         // crash-on-navigation to Media/Files/Terminal/Music/Voice/Editor/MeshView
         // (`push_id` cannot disambiguate an explicit `Id::new`). The menubar
         // provides the control for all of these, so they return false.
-        Surface::Workbench
+        Surface::FleetMesh
+        | Surface::Workbench
         | Surface::InfraCode
         | Surface::System
         | Surface::Storage
@@ -820,6 +848,16 @@ fn remote_sessions_fallback_pos(screen: egui::Rect) -> egui::Pos2 {
 struct Shell {
     /// Body-vs-session state + the active surface + the selected Workbench plane.
     nav: Nav,
+    /// Previous app/tab locations for the persistent navigation bar's Back action.
+    nav_history: Vec<NavLocation>,
+    /// Last observed location; changes are folded into `nav_history` at frame start.
+    last_nav_location: Option<NavLocation>,
+    /// Real egui body snapshots retained for the app switcher. A surface is
+    /// captured when navigation leaves it; an unavailable offscreen adapter
+    /// simply leaves that card on the switcher's honest accent plate.
+    surface_snapshots: switcher::SurfaceSnapshots,
+    /// Persistent floating/docked navigation bar state.
+    nav_bar: nav_bar::State,
     /// Fleet plane — live per-node KVM host health + VM roster, and the
     /// host-targeted VM lifecycle controls (MV-6). Subscribes to the Bus.
     datacenter: datacenter::DatacenterState,
@@ -1041,15 +1079,15 @@ struct Shell {
     /// Workbench planes read. Polled while in view; opens the honest "waiting for
     /// mesh" EmptyState until a snapshot lands.
     mesh_view: mesh_view::MeshViewState,
-    /// The Discovery hero-card surface (EXPLORER-3) — the cinematic one-unit-at-a-
+    /// The Discovery hero-card view (EXPLORER-3) — the cinematic one-unit-at-a-
     /// time view over every discovered unit (mesh peers · LAN hosts · cloud
     /// objects), folded from the aggregator's `state/units/*` mirrors (EXPLORER-1).
-    /// A thin renderer (§6): it reads the Bus, never scans. Reachable two ways
-    /// (shell-ux-8): as the first-class [`Surface::Explorer`] (its own dock/menu
-    /// entry) AND as the Mesh Map surface's **Explorer** lens (the
-    /// [`explorer::LENS_KEY`] toggle, which also serves the NODE-GRADE-2 node-focus
-    /// jump). Polled only while one of those is in view (#24).
+    /// A thin renderer (§6): it reads the Bus, never scans. It is the Explorer
+    /// tab inside Fleet & Mesh; legacy Explorer deep links still land there.
+    /// Polled only while that tab is in view (#24).
     explorer: explorer::ExplorerState,
+    /// The selected view inside the unified Fleet & Mesh interface.
+    fleet_mesh_tab: FleetMeshTab,
     /// The onboard self-test watch (OW-10) — observes the `event/onboard/self-test`
     /// verdict lane and raises a one-shot edge the instant a node goes all-green, so
     /// the shell auto-opens the Mesh Map. The receive half of a flow whose publish
@@ -1109,6 +1147,10 @@ impl Shell {
     fn new_for_ctx(ctx: &egui::Context) -> Self {
         let mut shell = Self {
             nav: Nav::default(),
+            nav_history: Vec::new(),
+            last_nav_location: None,
+            surface_snapshots: switcher::SurfaceSnapshots::default(),
+            nav_bar: nav_bar::State::load(),
             datacenter: datacenter::DatacenterState::default(),
             thisnode: thisnode::ThisNodeState::default(),
             surface_card: surface_card::SurfaceCardState::default(),
@@ -1156,6 +1198,7 @@ impl Shell {
             terminal: real_terminal(),
             mesh_view: mesh_view::MeshViewState::default(),
             explorer: explorer::ExplorerState::default(),
+            fleet_mesh_tab: FleetMeshTab::default(),
             self_test: mesh_view::SelfTestWatch::default(),
             timers: timers::TimersState::default(),
             power_honor: power_honor::PowerHonor::default(),
@@ -1220,6 +1263,139 @@ impl Shell {
         }
     }
 
+    /// Capture the real body of a surface that just left the foreground. This
+    /// uses the shared offscreen egui backend rather than inventing a thumbnail
+    /// from a glyph or a model summary; if the host has no usable adapter, the
+    /// switcher keeps its explicit no-snapshot plate.
+    fn capture_surface_snapshot(&mut self, ctx: &egui::Context, location: NavLocation) {
+        if !location.expanded {
+            return;
+        }
+        // A live VDI decoder already owns the strongest possible Desktop
+        // preview. Avoid rendering its external texture through a second
+        // context, where the original texture id is not available to the
+        // offscreen renderer.
+        if location.surface == Surface::Desktop && self.vdi.session_preview_frame().is_some() {
+            return;
+        }
+        let size = ctx.screen_rect().size();
+        let ppp = ctx.pixels_per_point();
+        if !size.is_finite() || size.x <= 0.0 || size.y <= 0.0 || !ppp.is_finite() || ppp <= 0.0 {
+            return;
+        }
+
+        let saved_nav = Nav {
+            expanded: self.nav.expanded,
+            surface: self.nav.surface,
+            plane: self.nav.plane,
+        };
+        let saved_fleet_mesh_tab = self.fleet_mesh_tab;
+        self.nav.expanded = true;
+        self.nav.surface = location.surface;
+        self.nav.plane = location.plane;
+        self.fleet_mesh_tab = location.fleet_mesh_tab;
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            mde_egui::capture::capture_ui_png(size, ppp, |capture_ctx| {
+                Style::install(capture_ctx);
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE.fill(Style::BG))
+                    .show(capture_ctx, |ui| self.body(ui));
+            })
+        }));
+
+        self.nav = saved_nav;
+        self.fleet_mesh_tab = saved_fleet_mesh_tab;
+
+        match result {
+            Ok(Ok(png)) => {
+                if let Some(image) = chooser::decode_png_rgba(&png) {
+                    let texture = ctx.load_texture(
+                        format!("construct-surface-snapshot-{}", location.surface.label()),
+                        image,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    self.surface_snapshots.insert(location.surface, texture);
+                } else {
+                    tracing::debug!(
+                        target: "shell::switcher",
+                        surface = location.surface.label(),
+                        "surface snapshot PNG did not decode; retaining fallback plate",
+                    );
+                }
+            }
+            Ok(Err(error)) => tracing::debug!(
+                target: "shell::switcher",
+                surface = location.surface.label(),
+                error = %error,
+                "surface snapshot capture unavailable; retaining fallback plate",
+            ),
+            Err(_) => tracing::debug!(
+                target: "shell::switcher",
+                surface = location.surface.label(),
+                "surface snapshot capture panicked; retaining fallback plate",
+            ),
+        }
+    }
+
+    /// Fold one frame's navigation changes into the Back history. Most shell
+    /// routes are intentionally direct assignments owned by their feature, so
+    /// observing the stable location at the frame boundary keeps every route —
+    /// including Fleet & Mesh tab clicks and workflow deep links — covered by
+    /// one history seam. The same boundary captures the surface being left for
+    /// the Q16 switcher.
+    fn observe_nav_location(&mut self, ctx: &egui::Context) {
+        let current = NavLocation {
+            expanded: self.nav.expanded,
+            surface: self.nav.surface,
+            plane: self.nav.plane,
+            fleet_mesh_tab: self.fleet_mesh_tab,
+        };
+        if let Some(previous) = self.last_nav_location {
+            if previous != current {
+                self.capture_surface_snapshot(ctx, previous);
+                self.nav_history.push(previous);
+                self.nav_history.truncate(32);
+            }
+        }
+        self.last_nav_location = Some(current);
+    }
+
+    /// Apply a saved navigation point without feeding the same point back into
+    /// the history on the next frame.
+    fn apply_nav_location(&mut self, location: NavLocation) {
+        self.nav.expanded = location.expanded;
+        self.nav.surface = location.surface;
+        self.nav.plane = location.plane;
+        self.fleet_mesh_tab = location.fleet_mesh_tab;
+        self.last_nav_location = Some(location);
+    }
+
+    /// Execute one navigation-bar action. The Auto action uses the same layout
+    /// profile seam as Settings and the existing lower-left mode control.
+    fn apply_nav_bar_action(&mut self, action: nav_bar::Action, ctx: &egui::Context) {
+        match action {
+            nav_bar::Action::Back => {
+                if let Some(previous) = self.nav_history.pop() {
+                    self.apply_nav_location(previous);
+                } else {
+                    self.nav.expanded = false;
+                    self.nav.surface = Surface::Desktop;
+                }
+            }
+            nav_bar::Action::Home => {
+                self.nav.expanded = false;
+                self.nav.surface = Surface::Desktop;
+            }
+            nav_bar::Action::ToggleDock => {
+                self.nav_bar.toggle(Instant::now(), Motion::mode());
+            }
+            nav_bar::Action::DesktopSource(id) => {
+                self.connect_front_door_desktop_source(ctx, &id);
+            }
+        }
+    }
+
     /// WL-UX-006/U09 — the five Construct chrome mount slots, called in
     /// z-order (bottom→top): springboard → status bar → switcher →
     /// notification center → control center. Each is the reserved, reachable
@@ -1236,9 +1412,18 @@ impl Shell {
         self.mount_control_center_slot(ctx);
     }
 
+    /// Mount the persistent navigation bar late enough to remain above ordinary
+    /// app overlays, but before the lock curtain's absolute top layer.
+    fn mount_navigation_bar(&mut self, ctx: &egui::Context) {
+        let pinned_sources = self.chooser.pinned_rail_sources();
+        if let Some(action) = self.nav_bar.mount(ctx, &pinned_sources) {
+            self.apply_nav_bar_action(action, ctx);
+        }
+    }
+
     /// U10 — the Construct springboard home (`springboard.rs`, §2.2 — the
     /// persistent base layer, no open flag): the module consumes the Home
-    /// intent + the paged grid's queued interactions and returns ONE typed
+    /// intent + the all-app grid's queued interactions and returns ONE typed
     /// action for this slot to apply — a chosen tile routes the nav, Home
     /// collapses to the base (this slot stays the single Home consumer), and
     /// the Q11 on-home pull-down lands on the existing Spotlight toggle.
@@ -1259,6 +1444,7 @@ impl Shell {
     /// will PUSH `NotificationCenter` / `ControlCenter` intents into the same
     /// `construct` queue — the §2.3 pointer rows — not a second dispatch path.
     fn mount_status_bar_slot(&mut self, ctx: &egui::Context) {
+        let immersive_vdi = self.immersive_vdi();
         status_bar::mount(
             ctx,
             &mut self.construct,
@@ -1267,9 +1453,7 @@ impl Shell {
             status_bar::StatusBarEnv {
                 curtain_engaged: self.curtain.engaged(),
                 car: self.system.layout_profile() == LayoutProfile::Car,
-                immersive_app: (self.nav.surface == Surface::Desktop
-                    && self.vdi.requested_target().is_some())
-                    || self.nav.surface == Surface::MapsLocation,
+                immersive_app: immersive_vdi || self.nav.surface == Surface::MapsLocation,
             },
         );
     }
@@ -1284,6 +1468,7 @@ impl Shell {
             &mut self.construct,
             self.nav.surface,
             self.nav.expanded,
+            &self.surface_snapshots,
             self.vdi.session_preview_frame().map(|frame| frame.texture),
         ) {
             self.nav.surface = surface;
@@ -1418,55 +1603,63 @@ impl Shell {
         }
     }
 
-    /// Poll the Mesh Map surface and — when its EXPLORER-3 **Explorer** lens is the
-    /// one showing — the Discovery hero card, which tails `state/units/*` ONLY while
-    /// that lens is visible: the honest reachable half of the #24 scan-active gate
-    /// (the aggregator's in-process scan flag has no Bus seam yet, so nothing is
-    /// published here — §7). The mesh fold is the same cheap local scan the
-    /// Workbench planes poll (it self-gates).
+    /// Poll the live topology view inside Fleet & Mesh.
     fn poll_mesh_map(&mut self, ctx: &egui::Context) {
         self.mesh_view.poll(ctx);
-        let explorer_lens = ctx.data(|d| {
-            d.get_temp::<bool>(egui::Id::new(explorer::LENS_KEY))
-                .unwrap_or(false)
-        });
-        if explorer_lens {
-            self.explorer.poll(ctx);
-        }
     }
 
-    /// The Mesh Map surface (OW-10) with its EXPLORER-3 sibling **Explorer** lens
-    /// (the Discovery hero card). A slim segmented header toggles between the two
-    /// topology lenses — the map (nodes + links) and the one-unit-at-a-time hero
-    /// shelf over every discovered unit. The lens persists in egui memory under
-    /// [`explorer::LENS_KEY`] so [`Self::poll_mesh_map`] reads the same choice; it
-    /// defaults to the map, so OW-10's all-green auto-open still lands on the map.
-    /// The Explorer now also stands alone as [`Surface::Explorer`] (its dedicated
-    /// dock/menu entry, shell-ux-8); this in-map lens is kept for side-by-side
-    /// toggling and drives the NODE-GRADE-2 node-focus jump.
-    fn show_mesh_map(&mut self, ui: &mut egui::Ui) {
-        let mesh_view = &mut self.mesh_view;
-        let explorer = &mut self.explorer;
-        ui.push_id("shell-mesh-view", |ui| {
-            let lens_id = egui::Id::new(explorer::LENS_KEY);
-            let mut show_explorer = ui.data(|d| d.get_temp::<bool>(lens_id).unwrap_or(false));
+    /// Render the unified Fleet & Mesh interface. The three formerly separate
+    /// surfaces remain real views, but share one shell surface and one compact
+    /// tab rail so the launcher has a single coherent entry point.
+    fn show_fleet_mesh(&mut self, ui: &mut egui::Ui) {
+        self.fleet_mesh_tab = match self.nav.surface {
+            Surface::Workbench => FleetMeshTab::Workbench,
+            Surface::MeshView => FleetMeshTab::MeshMap,
+            Surface::Explorer => FleetMeshTab::Explorer,
+            _ => self.fleet_mesh_tab,
+        };
+        self.nav.surface = Surface::FleetMesh;
+
+        let mut tab = self.fleet_mesh_tab;
+        ui.push_id("shell-fleet-mesh", |ui| {
+            let _ = mde_egui::nav_chrome::NavigationBar::new("Fleet & Mesh").show(ui);
             ui.horizontal(|ui| {
-                ui.add_space(Style::SP_S);
-                if ui.selectable_label(!show_explorer, "Mesh Map").clicked() {
-                    show_explorer = false;
-                }
-                if ui.selectable_label(show_explorer, "Explorer").clicked() {
-                    show_explorer = true;
+                for (candidate, label) in [
+                    (FleetMeshTab::Workbench, "Workbench"),
+                    (FleetMeshTab::MeshMap, "Mesh Map"),
+                    (FleetMeshTab::Explorer, "Explorer"),
+                ] {
+                    if ui.selectable_label(tab == candidate, label).clicked() {
+                        tab = candidate;
+                    }
                 }
             });
-            ui.data_mut(|d| d.insert_temp(lens_id, show_explorer));
             ui.separator();
-            if show_explorer {
-                explorer.show(ui);
-            } else {
-                mesh_view.show(ui);
+            match tab {
+                FleetMeshTab::Workbench => {
+                    workbench::show(
+                        ui,
+                        &mut self.nav.plane,
+                        &mut self.datacenter,
+                        &self.thisnode,
+                        &mut self.surface_card,
+                        &self.network,
+                        &self.controller,
+                        &self.provisioning,
+                        &mut self.services,
+                        &mut self.spawn_lighthouse,
+                    );
+                }
+                FleetMeshTab::MeshMap => self.show_mesh_map(ui),
+                FleetMeshTab::Explorer => self.show_explorer(ui),
             }
         });
+        self.fleet_mesh_tab = tab;
+    }
+
+    /// Render the live topology view inside Fleet & Mesh.
+    fn show_mesh_map(&mut self, ui: &mut egui::Ui) {
+        ui.push_id("shell-mesh-view", |ui| self.mesh_view.show(ui));
     }
 
     /// The standalone **Explorer** surface ([`Surface::Explorer`], shell-ux-8) —
@@ -1502,22 +1695,9 @@ impl Shell {
         self.web
             .note_surface_foreground(self.nav.surface == Surface::Browser);
         match self.nav.surface {
-            Surface::Workbench => {
-                workbench::show(
-                    ui,
-                    &mut self.nav.plane,
-                    &mut self.datacenter,
-                    &self.thisnode,
-                    &mut self.surface_card,
-                    &self.network,
-                    &self.controller,
-                    &self.provisioning,
-                    &mut self.services,
-                    &mut self.spawn_lighthouse,
-                );
+            Surface::FleetMesh | Surface::Workbench | Surface::MeshView | Surface::Explorer => {
+                self.show_fleet_mesh(ui);
             }
-            Surface::MeshView => self.show_mesh_map(ui),
-            Surface::Explorer => self.show_explorer(ui),
             Surface::Desktop => {
                 // The Desktop surface's no-session face IS the Desktop Chooser
                 // (CHOOSER-2, superseding the E12-5b flat picker): with nothing
@@ -1826,8 +2006,10 @@ impl Shell {
         self.front_door.close();
         self.nav.expanded = true;
         self.nav.surface = tile.surface();
-        if tile == car_home::CarTile::Vehicle {
-            self.maps_location.focus_vehicle_tab();
+        match tile {
+            car_home::CarTile::Nav => self.maps_location.focus_navigation_tab(),
+            car_home::CarTile::Vehicle => self.maps_location.focus_vehicle_tab(),
+            _ => {}
         }
     }
 }
@@ -1897,6 +2079,7 @@ impl Shell {
     /// (`run_drm`), which owns the seat with a bare `Context` and no eframe `Frame`.
     /// The body never touched `Frame`, so both runners render identically.
     fn render(&mut self, ctx: &egui::Context) {
+        self.observe_nav_location(ctx);
         // SURFACE-10: flush any key the OSK queued last frame into THIS frame's input,
         // before the focused field draws, so it consumes them exactly like a hardware
         // key (a no-op when nothing is queued).
@@ -1909,7 +2092,11 @@ impl Shell {
         // a control-service flip, or a node enrolling / an update landing surfaces
         // without operator input; the polls self-gate and keep the repaint heartbeat
         // alive. The app surfaces drive their own repaints from their workers.
-        if self.nav.expanded && self.nav.surface == Surface::Workbench {
+        if self.nav.expanded
+            && (self.nav.surface == Surface::Workbench
+                || (self.nav.surface == Surface::FleetMesh
+                    && self.fleet_mesh_tab == FleetMeshTab::Workbench))
+        {
             // perf-11: stagger the seven planes' FIRST poll by a distinct offset so
             // their shared 5 s cadences interleave instead of all firing on this
             // frame (and re-expiring in lockstep every 5 s). `elapsed` is measured
@@ -1973,14 +2160,22 @@ impl Shell {
             }
         }
 
-        // The Mesh Map surface (+ its EXPLORER-3 Explorer lens) refolds while in view.
-        if self.nav.expanded && self.nav.surface == Surface::MeshView {
+        // The Mesh Map tab inside Fleet & Mesh refolds while in view.
+        if self.nav.expanded
+            && (self.nav.surface == Surface::MeshView
+                || (self.nav.surface == Surface::FleetMesh
+                    && self.fleet_mesh_tab == FleetMeshTab::MeshMap))
+        {
             self.poll_mesh_map(ctx);
         }
-        // The standalone Explorer surface (shell-ux-8) tails the SAME `state/units/*`
-        // Discovery mirrors while it is the surface in view — the reachable half of
-        // the #24 scan-active gate, exactly as the Mesh Map's Explorer lens does.
-        if self.nav.expanded && self.nav.surface == Surface::Explorer {
+        // The Fleet & Mesh Explorer tab (shell-ux-8) tails the SAME
+        // `state/units/*` Discovery mirrors while it is in view — the reachable
+        // half of the #24 scan-active gate.
+        if self.nav.expanded
+            && (self.nav.surface == Surface::Explorer
+                || (self.nav.surface == Surface::FleetMesh
+                    && self.fleet_mesh_tab == FleetMeshTab::Explorer))
+        {
             self.explorer.poll(ctx);
         }
 
@@ -2249,6 +2444,9 @@ impl Shell {
         // It reads the live focus + the cached formfactor and self-manages its raise /
         // dismiss; on a Laptop (or the windowed fallback) it stays inert.
         self.keyboard.show(ctx);
+        if !self.immersive_vdi() {
+            self.mount_navigation_bar(ctx);
+        }
 
         // CURTAIN-1 — the lock curtain, driven absolutely last: its whole-screen
         // Foreground layer (re-raised with `move_to_top`) covers everything above,
@@ -2912,6 +3110,14 @@ impl Shell {
         front_door::FrontDoorSourceStatus::new(mesh)
     }
 
+    /// A focused VDI guest is an immersive workspace: it owns every output
+    /// pixel, so persistent shell chrome must neither reserve layout space nor
+    /// paint over the guest. Escape / the host return chord remains the exit
+    /// path back to Construct chrome.
+    fn immersive_vdi(&self) -> bool {
+        self.nav.surface == Surface::Desktop && self.vdi.requested_target().is_some()
+    }
+
     /// The central view: the session↔body cross-fade through the expand
     /// transition. While the settled curtain fully covers the seat (CURTAIN-1,
     /// lock 10) it mounts NOTHING — an opaque sheet hides it anyway, and
@@ -2938,6 +3144,35 @@ impl Shell {
             mde_maps_location_egui::car_status::live_speed_mph(&self.maps_location),
         );
         car_motion_policy::publish(ctx, self.car_motion);
+        // Reserve the persistent Construct status-bar strip before any workspace
+        // panel is laid out. The bar still paints in its own foreground Area, but
+        // every surface now starts below the same 24 px band instead of letting
+        // content slide underneath the clock/status chrome.
+        if status_bar::status_bar_visible(status_bar::StatusBarEnv {
+            curtain_engaged: self.curtain.engaged(),
+            car: is_car,
+            immersive_app: self.immersive_vdi() || self.nav.surface == Surface::MapsLocation,
+        }) {
+            egui::TopBottomPanel::top("construct-status-bar-space")
+                .exact_height(status_bar::STATUS_BAR_H)
+                .frame(egui::Frame::NONE)
+                .show(ctx, |_ui| {});
+        }
+        if self.nav_bar.reserves_bottom_space() && !self.immersive_vdi() {
+            egui::TopBottomPanel::bottom("construct-springboard-dock-space")
+                .exact_height(nav_bar::SPRINGBOARD_DOCK_RESERVED_H)
+                .resizable(false)
+                .frame(egui::Frame::NONE)
+                .show(ctx, |_ui| {});
+        }
+        if self.nav_bar.reserves_left_space() && !self.immersive_vdi() {
+            egui::SidePanel::left("construct-navigation-bar-space")
+                .exact_width(nav_bar::DOCKED_W)
+                .resizable(false)
+                .show_separator_line(false)
+                .frame(egui::Frame::NONE)
+                .show(ctx, |_ui| {});
+        }
         // Auto Mode driver's instrument strip — the left (driver's-side) third,
         // full height: an analog speedometer on top + selectable status readouts
         // below. Reserved as a SidePanel BEFORE the CentralPanel so it never
@@ -2971,7 +3206,7 @@ impl Shell {
                 if t < 0.5 {
                     ui.set_opacity((1.0 - t * 2.0).clamp(0.0, 1.0));
                     // WL-UX-006/U10 (PLATFORM-INTERFACES Q5): the collapsed base
-                    // layer IS the springboard — the paged group grid draws over
+                    // layer IS the springboard — the all-app grid draws over
                     // the wallpaper backdrop. Chrome overlays mounted above own the
                     // keyboard while open.
                     let overlay_above = self.front_door.is_open()
@@ -2999,8 +3234,13 @@ impl Shell {
     }
 
     fn mount_remote_sessions_fallback(&self, ctx: &egui::Context) {
+        let needs_fallback = if self.nav.surface == Surface::FleetMesh {
+            self.fleet_mesh_tab == FleetMeshTab::Explorer
+        } else {
+            surface_needs_remote_sessions_fallback(self.nav.surface)
+        };
         if !self.nav.expanded
-            || !surface_needs_remote_sessions_fallback(self.nav.surface)
+            || !needs_fallback
             || self.curtain.covers_fully()
             || self.menu_bar_minimize.is_some()
         {
@@ -4126,6 +4366,35 @@ mod tests {
     }
 
     #[test]
+    fn car_navigation_and_vehicle_tiles_remain_distinct_maps_routes() {
+        use car_home::CarTile;
+        use mde_maps_location_egui::model::WorkspaceTab;
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.maps_location.focus_vehicle_tab();
+        assert_eq!(shell.maps_location.active, WorkspaceTab::Vehicle);
+
+        shell.apply_car_tile(CarTile::Nav);
+
+        assert_eq!(shell.nav.surface, Surface::MapsLocation);
+        assert_eq!(
+            shell.maps_location.active,
+            WorkspaceTab::Drive,
+            "Navigation must never inherit the Vehicle/OBD telematics tab"
+        );
+
+        shell.apply_car_tile(CarTile::Vehicle);
+        assert_eq!(shell.nav.surface, Surface::MapsLocation);
+        assert_eq!(
+            shell.maps_location.active,
+            WorkspaceTab::Vehicle,
+            "Vehicle must continue to open its dedicated telematics tab"
+        );
+    }
+
+    #[test]
     fn menu_bar_minimize_effect_completes_by_routing_to_remote_sessions() {
         let start = std::time::Instant::now();
         let workspace = Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 700.0));
@@ -4350,7 +4619,8 @@ mod tests {
             let expected = !matches!(
                 surface,
                 // Own workspace chrome / handle remote-sessions themselves.
-                Surface::Workbench
+                Surface::FleetMesh
+                    | Surface::Workbench
                     | Surface::InfraCode
                     | Surface::Desktop
                     | Surface::System
@@ -4585,7 +4855,7 @@ mod tests {
     fn springboard_slot_zero_is_the_first_mesh_control_tile() {
         assert_eq!(
             super::surfaces::springboard_surface(0),
-            Some(Surface::Workbench)
+            Some(Surface::FleetMesh)
         );
     }
 
@@ -5298,6 +5568,7 @@ mod tests {
         for action in actions {
             shell.apply_hotkey(action);
         }
+        let _ = shell.hotkeys.dispatch(&[], &[]);
         // WL-UX-006/U09 rerouted the render wiring: the drained Super tap now
         // flows through the §2.3 contract dispatcher, where on home (the fresh
         // shell — nothing expanded) it resolves to Spotlight = the Front Door
@@ -5630,6 +5901,7 @@ mod tests {
         for action in actions {
             shell.apply_hotkey(action);
         }
+        let _ = shell.hotkeys.dispatch(&[], &[]);
         if shell.hotkeys.take_super_tap() {
             shell.toggle_front_door_panel();
         }
@@ -6150,6 +6422,130 @@ mod tests {
             !prims.is_empty(),
             "the mounted terminal surface produced no draw primitives"
         );
+    }
+
+    /// WL-UX-006 — the status bar and Springboard Dock are foreground chrome,
+    /// but their matching layout panels must consume the same bands before
+    /// CentralPanel lays out the workspace. This drives the real `central_view`
+    /// seam so a foreground-only refactor cannot reintroduce overlap.
+    #[test]
+    fn central_workspace_starts_below_the_reserved_status_bar_band() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        ctx.style_mut(|style| style.animation_time = 0.0);
+
+        let mut shell = Shell::new_for_ctx(&ctx);
+        // Keep this fixture deterministic regardless of persisted seat policy.
+        shell.curtain = super::curtain::Curtain::default();
+        shell
+            .system
+            .set_layout_profile(mde_egui::LayoutProfile::Construct, &ctx);
+        shell.nav_bar = super::nav_bar::State::with_mode(super::nav_bar::DockMode::Floating);
+        shell.nav.expanded = false;
+
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(960.0, 640.0));
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ctx| shell.central_view(ctx),
+        );
+
+        let workspace = shell
+            .last_workspace_rect
+            .expect("central_view must record the workspace rect");
+        assert_eq!(workspace.left(), screen.left());
+        assert_eq!(workspace.right(), screen.right());
+        assert_eq!(workspace.top(), super::status_bar::STATUS_BAR_H);
+        assert_eq!(
+            workspace.bottom(),
+            screen.bottom() - super::nav_bar::SPRINGBOARD_DOCK_RESERVED_H
+        );
+    }
+
+    /// WL-UX-006 — docking the navigation pill must reserve both shell chrome
+    /// bands before the central workspace is laid out. This is the integration
+    /// proof that the docked left rail and the top-bar exclusion do not overlap
+    /// the first workspace pixel.
+    #[test]
+    fn docked_workspace_reserves_top_bar_and_navigation_rail() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        ctx.style_mut(|style| style.animation_time = 0.0);
+
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.curtain = super::curtain::Curtain::default();
+        shell
+            .system
+            .set_layout_profile(mde_egui::LayoutProfile::Construct, &ctx);
+        shell.nav_bar = super::nav_bar::State::with_mode(super::nav_bar::DockMode::Docked);
+        shell.nav.expanded = false;
+
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(960.0, 640.0));
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ctx| shell.central_view(ctx),
+        );
+
+        let workspace = shell
+            .last_workspace_rect
+            .expect("central_view must record the workspace rect");
+        assert_eq!(workspace.left(), super::nav_bar::DOCKED_W);
+        assert_eq!(workspace.right(), screen.right());
+        assert_eq!(workspace.top(), super::status_bar::STATUS_BAR_H);
+        assert_eq!(workspace.bottom(), screen.bottom());
+    }
+
+    /// WL-UX-006/U24 — a focused VDI guest is immersive: neither the 24px
+    /// status band nor the docked navigation rail may steal pixels from the
+    /// negotiated remote desktop body.
+    #[test]
+    fn immersive_vdi_uses_the_full_screen_workspace_without_chrome_reservation() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        ctx.style_mut(|style| style.animation_time = 0.0);
+
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.curtain = super::curtain::Curtain::default();
+        shell
+            .system
+            .set_layout_profile(mde_egui::LayoutProfile::Construct, &ctx);
+        shell.nav_bar = super::nav_bar::State::with_mode(super::nav_bar::DockMode::Docked);
+        shell.nav.expanded = true;
+        shell.nav.surface = Surface::Desktop;
+        shell.vdi.request_connect(super::vdi::ConnectRequest::new(
+            super::vdi::RequestedTarget::new("node-a", "win11"),
+            super::vdi::VdiProtocol::Rdp,
+            super::vdi::DisplayMode::Fullscreen,
+            super::vdi::MonitorSpan::Single,
+            super::auth::DesktopAuth::mesh_identity("node-a"),
+        ));
+
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(960.0, 640.0));
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ctx| shell.central_view(ctx),
+        );
+
+        assert!(shell.immersive_vdi());
+        let workspace = shell
+            .last_workspace_rect
+            .expect("central_view must record the workspace rect");
+        assert_eq!(workspace, screen);
+        assert!(!super::status_bar::status_bar_visible(
+            super::status_bar::StatusBarEnv {
+                curtain_engaged: false,
+                car: false,
+                immersive_app: true,
+            }
+        ));
     }
 
     // WL-FUNC-011 Phase-2 retired the standalone Surface::Editor; the editor crate

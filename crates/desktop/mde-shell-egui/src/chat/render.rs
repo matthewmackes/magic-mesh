@@ -526,7 +526,14 @@ pub(super) fn publish_mute(
     id: &str,
     muted: bool,
 ) -> Result<(), String> {
-    let body = serde_json::json!({ "target": target, "id": id, "muted": muted }).to_string();
+    let body = serde_json::json!({
+        "schema_version": CLOUD_ACTION_SCHEMA_VERSION,
+        "target": target,
+        "id": id,
+        "muted": muted,
+    })
+    .to_string();
+    let body = authorize_chat_mutation_body(&body, "chat-mute", &format!("{target}:{id}"))?;
     publish(bus_root, ACTION_CHAT_MUTE, &body)
 }
 
@@ -537,6 +544,7 @@ pub(super) fn publish_alert_action(
     armed: bool,
 ) {
     let body = serde_json::json!({
+        "schema_version": CLOUD_ACTION_SCHEMA_VERSION,
         "message_id": msg.id.as_str(),
         "sender": msg.sender,
         "action_id": action.id,
@@ -546,6 +554,13 @@ pub(super) fn publish_alert_action(
         "armed": armed,
     })
     .to_string();
+    let Ok(body) = authorize_chat_mutation_body(
+        &body,
+        "chat-alert-action",
+        &format!("alert:{}:{}:{}", msg.sender, msg.id.as_str(), action.id),
+    ) else {
+        return;
+    };
     // Best-effort, but no longer a buried silent swallow (shell-ux-11): the action
     // button stays on screen after a failed publish, so nothing is destroyed and the
     // operator can click again — unlike a composed draft, which is why alert actions

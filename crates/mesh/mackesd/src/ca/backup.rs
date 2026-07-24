@@ -189,6 +189,14 @@ pub fn dearmor(armored: &str) -> Result<Vec<u8>, BackupError> {
             "missing BEGIN delimiter — input is not a Mackes Nebula CA bundle".into(),
         ));
     }
+    if !armored
+        .lines()
+        .any(|line| line.trim() == "-----END MACKES NEBULA CA EXPORT-----")
+    {
+        return Err(BackupError::Armor(
+            "missing END delimiter — input is an incomplete Mackes Nebula CA bundle".into(),
+        ));
+    }
     let body: String = armored
         .lines()
         .skip_while(|l| !l.trim().is_empty())
@@ -322,37 +330,122 @@ pub fn restore_to_store(
     conn: &rusqlite::Connection,
     bundle: &BundlePlaintext,
 ) -> Result<(), CaError> {
-    for ca in &bundle.ca_certs {
-        conn.execute(
-            "INSERT OR REPLACE INTO nebula_ca \
+    validate_restore_bundle(bundle)?;
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .map_err(|e| CaError::Sql(format!("begin CA backup restore: {e}")))?;
+    let result = (|| {
+        for ca in &bundle.ca_certs {
+            conn.execute(
+                "INSERT OR REPLACE INTO nebula_ca \
              (mesh_id, epoch, ca_cert_pem, created_at, retired_at) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![
-                bundle.mesh_id,
-                ca.epoch,
-                ca.ca_cert_pem,
-                ca.created_at,
-                ca.retired_at
-            ],
-        )
-        .map_err(|e| CaError::Sql(e.to_string()))?;
-    }
-    for p in &bundle.peer_certs {
-        conn.execute(
-            "INSERT OR REPLACE INTO nebula_peer_certs \
+                rusqlite::params![
+                    bundle.mesh_id,
+                    ca.epoch,
+                    ca.ca_cert_pem,
+                    ca.created_at,
+                    ca.retired_at
+                ],
+            )
+            .map_err(|e| CaError::Sql(e.to_string()))?;
+        }
+        for p in &bundle.peer_certs {
+            conn.execute(
+                "INSERT OR REPLACE INTO nebula_peer_certs \
              (node_id, epoch, cert_pem, overlay_ip, public_key_pem, created_at, expires_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![
-                p.node_id,
-                p.epoch,
-                p.cert_pem,
-                p.overlay_ip,
-                p.public_key_pem,
-                p.created_at,
-                p.expires_at,
-            ],
-        )
-        .map_err(|e| CaError::Sql(e.to_string()))?;
+                rusqlite::params![
+                    p.node_id,
+                    p.epoch,
+                    p.cert_pem,
+                    p.overlay_ip,
+                    p.public_key_pem,
+                    p.created_at,
+                    p.expires_at,
+                ],
+            )
+            .map_err(|e| CaError::Sql(e.to_string()))?;
+        }
+        conn.execute_batch("COMMIT")
+            .map_err(|e| CaError::Sql(format!("commit CA backup restore: {e}")))
+    })();
+    if result.is_err() {
+        let _ = conn.execute_batch("ROLLBACK");
+    }
+    result
+}
+
+/// Validate all archive-controlled identifiers and cross-row issuer
+/// relationships before opening the restore transaction. This keeps malformed
+/// or path-shaped replicated data from becoming durable CA authority and makes
+/// malformed imports a no-op rather than a prefix of a restore.
+fn validate_restore_bundle(bundle: &BundlePlaintext) -> Result<(), CaError> {
+    if bundle.schema_version != 1 {
+        return Err(CaError::Io(format!(
+            "unsupported CA backup schema version {}",
+            bundle.schema_version
+        )));
+    }
+    validate_archive_identifier(&bundle.mesh_id, "mesh-id")?;
+    if bundle.ca_certs.is_empty() {
+        return Err(CaError::Io("CA backup contains no CA issuer rows".into()));
+    }
+    let mut epochs = std::collections::HashSet::new();
+    let mut active = 0_u8;
+    for ca in &bundle.ca_certs {
+        if ca.epoch < 0 || !epochs.insert(ca.epoch) {
+            return Err(CaError::Io(format!(
+                "CA backup contains an invalid or duplicate CA epoch {}",
+                ca.epoch
+            )));
+        }
+        if ca.ca_cert_pem.trim().is_empty() || ca.ca_key_pem.trim().is_empty() {
+            return Err(CaError::Io(format!(
+                "CA backup issuer row at epoch {} is incomplete",
+                ca.epoch
+            )));
+        }
+        if ca.retired_at.is_none() {
+            active = active.saturating_add(1);
+        }
+    }
+    if active > 1 {
+        return Err(CaError::Io(
+            "CA backup contains more than one active issuer row".into(),
+        ));
+    }
+
+    let mut peer_keys = std::collections::HashSet::new();
+    let mut overlay_keys = std::collections::HashSet::new();
+    for peer in &bundle.peer_certs {
+        validate_archive_identifier(&peer.node_id, "peer node-id")?;
+        if peer.epoch < 0
+            || !epochs.contains(&peer.epoch)
+            || peer.cert_pem.trim().is_empty()
+            || peer.overlay_ip.parse::<std::net::Ipv4Addr>().is_err()
+            || !peer_keys.insert((peer.node_id.clone(), peer.epoch))
+            || !overlay_keys.insert((peer.overlay_ip.clone(), peer.epoch))
+        {
+            return Err(CaError::Io(format!(
+                "CA backup peer row for {:?} is invalid or has no matching issuer epoch",
+                peer.node_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_archive_identifier(value: &str, label: &str) -> Result<(), CaError> {
+    if value.is_empty()
+        || value.trim() != value
+        || value.len() > 255
+        || value == "."
+        || value == ".."
+        || value
+            .chars()
+            .any(|c| c == '/' || c == '\\' || c.is_control())
+    {
+        return Err(CaError::Io(format!("unsafe {label} {value:?}")));
     }
     Ok(())
 }
@@ -478,6 +571,20 @@ mod tests {
     fn dearmor_rejects_missing_delimiters() {
         let r = dearmor("not an armored bundle");
         assert!(matches!(r, Err(BackupError::Armor(_))));
+    }
+
+    #[test]
+    fn dearmor_rejects_truncated_bundle_without_end_delimiter() {
+        let armored = armor(&[1, 2, 3], 0);
+        let truncated = armored
+            .split("-----END MACKES NEBULA CA EXPORT-----")
+            .next()
+            .expect("armor has an end delimiter");
+        let error = dearmor(truncated).expect_err("truncated armor must be refused");
+        assert!(matches!(
+            error,
+            BackupError::Armor(message) if message.contains("missing END delimiter")
+        ));
     }
 
     #[test]
@@ -626,5 +733,56 @@ mod tests {
         assert_eq!(pt2.ca_certs[0].ca_cert_pem, "CA-PEM");
         assert_eq!(pt2.peer_certs[0].node_id, "peer:a");
         assert_eq!(pt2.peer_certs[0].overlay_ip, "10.42.0.5");
+    }
+
+    #[test]
+    fn restore_rejects_invalid_authority_rows_without_partial_effects() {
+        let dest = fresh_store();
+        dest.execute(
+            "INSERT INTO nebula_ca (mesh_id, epoch, ca_cert_pem, created_at, retired_at) \
+             VALUES ('existing', 0, 'EXISTING-CA', 100, NULL)",
+            [],
+        )
+        .unwrap();
+        let bundle = BundlePlaintext {
+            schema_version: 1,
+            exported_at: 100,
+            mesh_id: "restored".into(),
+            ca_certs: vec![
+                CaCertRow {
+                    epoch: 0,
+                    ca_cert_pem: "CA-PEM".into(),
+                    ca_key_pem: "CA-KEY".into(),
+                    created_at: 100,
+                    retired_at: None,
+                },
+                CaCertRow {
+                    epoch: 0,
+                    ca_cert_pem: "DUPLICATE".into(),
+                    ca_key_pem: "CA-KEY".into(),
+                    created_at: 101,
+                    retired_at: Some(101),
+                },
+            ],
+            peer_certs: Vec::new(),
+        };
+
+        let error = restore_to_store(&dest, &bundle).expect_err("duplicate issuer must be refused");
+        assert!(error.to_string().contains("duplicate CA epoch"));
+        let count: i64 = dest
+            .query_row("SELECT COUNT(*) FROM nebula_ca", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "invalid restore must not partially add authority rows"
+        );
+        let existing: String = dest
+            .query_row(
+                "SELECT ca_cert_pem FROM nebula_ca WHERE mesh_id = 'existing'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(existing, "EXISTING-CA");
     }
 }

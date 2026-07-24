@@ -19,12 +19,17 @@
 //! nothing.
 
 use serde::Deserialize;
+use std::path::{Path, PathBuf};
 
 use mackes_mesh_types::cloud::{AnsibleSummary, CloudReply};
 
 use super::super::{path_key, CloudWorker};
 
 const QUADLET_SUFFIX: &str = ".container";
+/// A container pull needs room for layers and transient extraction files. Keep a
+/// small absolute reserve so a nearly-full seat cannot be driven into ENOSPC by a
+/// deploy; the image's actual size is not knowable from an arbitrary OCI reference.
+const MIN_CONTAINER_FREE_BYTES: u64 = 512 * 1024 * 1024;
 
 /// The parsed `container-deploy` request body.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -104,6 +109,20 @@ pub(crate) fn handle(w: &CloudWorker, verb_name: &str, raw: &str) -> CloudReply 
         };
     }
 
+    // Check the filesystem that carries the staged state before creating a
+    // replicated desired artifact or asking the host to pull image layers.
+    if let Err(reason) = disk_preflight(&w.state_root) {
+        return CloudReply {
+            ok: false,
+            verb: verb_name.to_string(),
+            gated: Some(format!(
+                "container deploy blocked by disk preflight: {reason}"
+            )),
+            raw_log: Some(unit),
+            ..Default::default()
+        };
+    }
+
     // Stage the unit into the Syncthing-replicated tree so the placement node's
     // container-host role picks it up.
     let staged = match stage_unit(&w.state_root, stage_node, &name, &unit) {
@@ -122,21 +141,26 @@ pub(crate) fn handle(w: &CloudWorker, verb_name: &str, raw: &str) -> CloudReply 
         "-i",
         inventory.as_str(),
         playbook.as_str(),
-        "--tags",
-        "container",
+        // site.yml and the container_host role do not tag their tasks. A
+        // `--tags container` filter would therefore let Ansible exit 0 after
+        // running no install tasks, which this handler would misreport as a
+        // deployed unit.
         "--extra-vars",
         extra.as_str(),
     ];
     match w.runner.run_tool("ansible-playbook", &args) {
-        Err(spawn) => CloudReply {
-            ok: false,
-            verb: verb_name.to_string(),
-            gated: Some(format!(
-                "ansible unavailable: {spawn} — quadlet `{name}.container` staged at {staged_disp} but not installed"
-            )),
-            raw_log: Some(unit),
-            ..Default::default()
-        },
+        Err(spawn) => {
+            let rollback = rollback_staged(&staged);
+            CloudReply {
+                ok: false,
+                verb: verb_name.to_string(),
+                gated: Some(format!(
+                    "ansible unavailable: {spawn} — quadlet `{name}.container` was not installed{rollback}"
+                )),
+                raw_log: Some(unit),
+                ..Default::default()
+            }
+        }
         Ok(run) => {
             let summary = parse_recap(&run.stdout);
             let clean_run = run.ok && summary.failed == 0 && summary.unreachable == 0;
@@ -151,14 +175,15 @@ pub(crate) fn handle(w: &CloudWorker, verb_name: &str, raw: &str) -> CloudReply 
                     ..Default::default()
                 }
             } else {
+                let rollback = rollback_staged(&staged);
                 CloudReply {
                     ok: false,
                     verb: verb_name.to_string(),
                     ansible: Some(summary),
                     error: Some(format!(
-                        "ansible container install failed for `{name}.container`"
+                        "ansible container install failed for `{name}.container`{rollback}"
                     )),
-                    raw_log: Some(pick_log(&run.stdout, &run.stderr)),
+                    raw_log: Some(format!("{}{rollback}", pick_log(&run.stdout, &run.stderr))),
                     ..Default::default()
                 }
             }
@@ -218,23 +243,183 @@ fn render_quadlet(name: &str, image: &str, scope: &str, body: &ContainerDeployBo
     s
 }
 
+/// The staged file plus the bytes it replaced, used to roll back a failed live
+/// install without leaving a failed image pull queued in the replicated tree.
+#[derive(Debug)]
+struct StagedUnit {
+    path: std::path::PathBuf,
+    previous: Option<Vec<u8>>,
+}
+
+impl StagedUnit {
+    fn display(&self) -> String {
+        self.path.display().to_string()
+    }
+}
+
 /// Stage the rendered unit under `<workgroup>/quadlets/<node>/<name>.container`
-/// (Syncthing-replicated so the placement node sees it).
-fn stage_unit(
-    root: &std::path::Path,
-    node: &str,
-    name: &str,
-    unit: &str,
-) -> Result<std::path::PathBuf, String> {
+/// (Syncthing-replicated so the placement node sees it), retaining the prior
+/// leaf so a failed live install can roll back.
+fn stage_unit(root: &Path, node: &str, name: &str, unit: &str) -> Result<StagedUnit, String> {
     let node = path_key::segment("placement node", node)?;
     let name = path_key::file_stem("container name", name, QUADLET_SUFFIX)?;
     let dir = root.join("quadlets").join(node);
+    reject_symlinked_stage_directories(&dir)?;
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("create quadlet stage dir {}: {e}", dir.display()))?;
+    // Re-check after mkdir so an already-present replicated component cannot be
+    // traversed if it was replaced while the directory was being prepared.
+    reject_symlinked_stage_directories(&dir)?;
     let path = dir.join(format!("{name}{QUADLET_SUFFIX}"));
-    std::fs::write(&path, unit)
-        .map_err(|e| format!("write quadlet stage {}: {e}", path.display()))?;
-    Ok(path)
+    let previous =
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!(
+                    "refusing symlinked quadlet stage {}",
+                    path.display()
+                ));
+            }
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(format!(
+                    "quadlet stage is not a regular file {}",
+                    path.display()
+                ));
+            }
+            Ok(_) => Some(std::fs::read(&path).map_err(|error| {
+                format!("read existing quadlet stage {}: {error}", path.display())
+            })?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(format!(
+                    "read existing quadlet stage {}: {error}",
+                    path.display()
+                ));
+            }
+        };
+    write_stage_atomic(&path, unit.as_bytes())?;
+    Ok(StagedUnit { path, previous })
+}
+
+/// Refuse to traverse a replicated directory symlink while preparing a
+/// container stage. A peer-controlled state tree must not redirect a write
+/// outside the worker's state root.
+fn reject_symlinked_stage_directories(path: &Path) -> Result<(), String> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!(
+                    "refusing symlinked quadlet stage directory {}",
+                    current.display()
+                ));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(format!(
+                    "quadlet stage path component is not a directory: {}",
+                    current.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(format!(
+                    "inspect quadlet stage directory {}: {error}",
+                    current.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Write a complete stage through a create-new temporary and atomic rename.
+/// The temporary cannot be a planted symlink, and rename replaces (rather than
+/// follows) a hostile final leaf if one appears after validation.
+fn write_stage_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write as _;
+
+    let leaf = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("invalid quadlet stage filename {}", path.display()))?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let temp = path.with_file_name(format!(".{leaf}.tmp-{}-{nonce}", std::process::id()));
+
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .map_err(|error| {
+                format!("create temporary quadlet stage {}: {error}", temp.display())
+            })?;
+        file.write_all(bytes).map_err(|error| {
+            format!("write temporary quadlet stage {}: {error}", temp.display())
+        })?;
+        file.sync_all()
+            .map_err(|error| format!("sync temporary quadlet stage {}: {error}", temp.display()))?;
+        drop(file);
+        std::fs::rename(&temp, path)
+            .map_err(|error| format!("replace quadlet stage {}: {error}", path.display()))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+/// Restore the prior stage, or remove a newly-created stage, after Ansible fails.
+/// A rollback failure is surfaced in the reply because the replicated tree may
+/// otherwise retry a deployment that did not complete.
+fn rollback_staged(staged: &StagedUnit) -> String {
+    let result = match &staged.previous {
+        Some(previous) => write_stage_atomic(&staged.path, previous)
+            .map_err(|error| format!("restore failed stage {}: {error}", staged.display())),
+        None => match std::fs::remove_file(&staged.path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("remove failed stage {}: {error}", staged.display())),
+        },
+    };
+    match result {
+        Ok(()) => "; staged Quadlet rolled back".to_string(),
+        Err(error) => format!("; staged Quadlet rollback failed: {error}"),
+    }
+}
+
+/// Refuse a live deploy when the backing filesystem is below the reserve.
+fn disk_preflight(root: &std::path::Path) -> Result<(), String> {
+    let output = std::process::Command::new("df")
+        .arg("-B1")
+        .arg("--output=avail")
+        .arg(root)
+        .output()
+        .map_err(|error| format!("disk availability probe unavailable: {error}"))?;
+    if !output.status.success() {
+        return Err("disk availability probe failed".to_string());
+    }
+    let available = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .nth(1)
+        .and_then(|line| line.trim().parse::<u64>().ok())
+        .ok_or_else(|| "disk availability probe returned no numeric result".to_string())?;
+    disk_capacity_gate(Some(available))
+}
+
+fn disk_capacity_gate(available: Option<u64>) -> Result<(), String> {
+    let Some(available) = available else {
+        return Err("disk availability is unknown".to_string());
+    };
+    if available < MIN_CONTAINER_FREE_BYTES {
+        return Err(format!(
+            "only {available} bytes are free; at least {MIN_CONTAINER_FREE_BYTES} bytes are required"
+        ));
+    }
+    Ok(())
 }
 
 /// The Ansible playbook + mesh dynamic inventory paths (the same tree the configure
@@ -392,7 +577,7 @@ mod tests {
         let w = staged_worker(tmp.path(), runner.clone());
         let reply = w.handle(
             "container-deploy",
-            r#"{"node":"me","name":"web","image":"nginx:1"}"#,
+            r#"{"schema_version":1,"node":"me","name":"web","image":"nginx:1"}"#,
         );
         assert!(!reply.ok);
         let gated = reply.gated.unwrap();
@@ -410,6 +595,7 @@ mod tests {
         let runner = Arc::new(FakeRunner::default());
         let w = armed_worker(tmp.path(), runner.clone());
         let raw = armed_request(serde_json::json!({
+            "schema_version": 1,
             "node": "me",
             "name": "web",
             "image": "nginx:1",
@@ -427,11 +613,25 @@ mod tests {
         let calls = runner.tool_calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "ansible-playbook");
-        assert!(calls[0].1.iter().any(|a| a == "container"));
+        assert!(
+            !calls[0]
+                .1
+                .windows(2)
+                .any(|pair| pair[0] == "--tags" && pair[1] == "container"),
+            "an untagged role must not be filtered into a successful no-op"
+        );
+        let extra = calls[0]
+            .1
+            .windows(2)
+            .find(|pair| pair[0] == "--extra-vars")
+            .map(|pair| pair[1].as_str())
+            .expect("quadlet install variables");
+        assert!(extra.contains("mde_quadlet_unit="));
+        assert!(extra.contains("mde_container_name=web"));
     }
 
     #[test]
-    fn ansible_absent_is_honestly_gated_and_the_unit_is_still_staged() {
+    fn ansible_absent_is_honestly_gated_and_new_stage_is_removed() {
         let tmp = tempfile::tempdir().unwrap();
         let runner = Arc::new(FakeRunner {
             tool_absent: true,
@@ -439,6 +639,7 @@ mod tests {
         });
         let w = armed_worker(tmp.path(), runner);
         let raw = armed_request(serde_json::json!({
+            "schema_version": 1,
             "node": "me",
             "name": "web",
             "image": "nginx:1",
@@ -446,7 +647,7 @@ mod tests {
         let reply = w.handle("container-deploy", &raw);
         assert!(!reply.ok);
         assert!(reply.gated.unwrap().contains("ansible unavailable"));
-        assert!(tmp
+        assert!(!tmp
             .path()
             .join("quadlets")
             .join("me")
@@ -463,6 +664,7 @@ mod tests {
         });
         let w = armed_worker(tmp.path(), runner);
         let raw = armed_request(serde_json::json!({
+            "schema_version": 1,
             "node": "me",
             "name": "web",
             "image": "nginx:1",
@@ -470,6 +672,43 @@ mod tests {
         let reply = w.handle("container-deploy", &raw);
         assert!(!reply.ok);
         assert!(reply.error.unwrap().contains("failed"));
+        assert!(!tmp
+            .path()
+            .join("quadlets")
+            .join("me")
+            .join("web.container")
+            .exists());
+    }
+
+    #[test]
+    fn failed_deploy_restores_the_previous_staged_unit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staged = tmp.path().join("quadlets").join("me").join("web.container");
+        std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        std::fs::write(&staged, "old-unit\n").unwrap();
+        let runner = Arc::new(FakeRunner {
+            tool_fail: true,
+            ..Default::default()
+        });
+        let w = armed_worker(tmp.path(), runner);
+        let raw = armed_request(serde_json::json!({
+            "schema_version": 1,
+            "node": "me",
+            "name": "web",
+            "image": "nginx:1",
+        }));
+
+        let reply = w.handle("container-deploy", &raw);
+        assert!(!reply.ok);
+        assert_eq!(std::fs::read_to_string(staged).unwrap(), "old-unit\n");
+    }
+
+    #[test]
+    fn disk_capacity_gate_rejects_the_live_seat_low_space_case() {
+        let low = 324 * 1024 * 1024;
+        assert!(disk_capacity_gate(Some(low)).is_err());
+        assert!(disk_capacity_gate(Some(MIN_CONTAINER_FREE_BYTES)).is_ok());
+        assert!(disk_capacity_gate(None).is_err());
     }
 
     #[test]
@@ -478,6 +717,7 @@ mod tests {
         let runner = Arc::new(FakeRunner::default());
         let w = armed_worker(tmp.path(), runner.clone());
         let authorized = serde_json::json!({
+            "schema_version": 1,
             "node": "me",
             "name": "web",
             "image": "nginx:1",
@@ -502,14 +742,20 @@ mod tests {
     fn a_missing_name_or_image_is_an_honest_rejection() {
         let tmp = tempfile::tempdir().unwrap();
         let w = armed_worker(tmp.path(), Arc::new(FakeRunner::default()));
-        let no_name = w.handle("container-deploy", r#"{"node":"me","image":"nginx:1"}"#);
+        let no_name = w.handle(
+            "container-deploy",
+            r#"{"schema_version":1,"node":"me","image":"nginx:1"}"#,
+        );
         assert!(!no_name.ok && no_name.error.unwrap().contains("name"));
-        let no_image = w.handle("container-deploy", r#"{"node":"me","name":"web"}"#);
+        let no_image = w.handle(
+            "container-deploy",
+            r#"{"schema_version":1,"node":"me","name":"web"}"#,
+        );
         assert!(!no_image.ok && no_image.error.unwrap().contains("image"));
         // A path-escaping name is refused.
         let bad = w.handle(
             "container-deploy",
-            r#"{"node":"me","name":"../evil","image":"nginx:1"}"#,
+            r#"{"schema_version":1,"node":"me","name":"../evil","image":"nginx:1"}"#,
         );
         assert!(!bad.ok && bad.error.unwrap().contains("invalid container name"));
     }
@@ -519,12 +765,46 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let w = armed_worker(tmp.path(), Arc::new(FakeRunner::default()));
         for node in ["..", "../escape", "/tmp/escape", "node/child"] {
-            let raw = format!(r#"{{"node":"{node}","name":"web","image":"nginx:1"}}"#);
+            let raw =
+                format!(r#"{{"schema_version":1,"node":"{node}","name":"web","image":"nginx:1"}}"#);
             let reply = w.handle("container-deploy", &raw);
             assert!(!reply.ok);
             assert!(reply.error.unwrap().contains("path-safe"));
         }
         assert!(!tmp.path().join("quadlets").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stage_refuses_symlinked_directories_and_leaf_without_touching_outside() {
+        use std::os::unix::fs::symlink;
+
+        let parent_case = tempfile::tempdir().unwrap();
+        let parent_outside = tempfile::tempdir().unwrap();
+        symlink(parent_outside.path(), parent_case.path().join("quadlets")).unwrap();
+        let parent_error = stage_unit(parent_case.path(), "me", "web", "unit").unwrap_err();
+        assert!(
+            parent_error.contains("symlink"),
+            "unexpected error: {parent_error}"
+        );
+        assert!(!parent_outside.path().join("me").exists());
+
+        let leaf_case = tempfile::tempdir().unwrap();
+        let leaf_outside = tempfile::tempdir().unwrap();
+        let leaf_dir = leaf_case.path().join("quadlets").join("me");
+        std::fs::create_dir_all(&leaf_dir).unwrap();
+        let victim = leaf_outside.path().join("victim");
+        std::fs::write(&victim, "must remain unchanged\n").unwrap();
+        symlink(&victim, leaf_dir.join("web.container")).unwrap();
+        let leaf_error = stage_unit(leaf_case.path(), "me", "web", "unit").unwrap_err();
+        assert!(
+            leaf_error.contains("symlink"),
+            "unexpected error: {leaf_error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(victim).unwrap(),
+            "must remain unchanged\n"
+        );
     }
 
     #[test]

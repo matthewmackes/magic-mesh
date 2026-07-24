@@ -49,6 +49,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
@@ -62,9 +63,22 @@ use mde_chat::{
 use serde::{Deserialize, Serialize};
 
 use super::{ShutdownToken, Worker};
+use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
 
 /// The UI's outbound verb: a chat message to send.
 pub const ACTION_CHAT_SEND: &str = "action/chat/send";
+/// The capability context used by the root shell's Chat publishers.
+pub const CHAT_SEND_AUTH_VERB: &str = "chat-send";
+/// Capability context for the seat's manual presence mutation.
+pub const CHAT_PRESENCE_AUTH_VERB: &str = "chat-presence";
+/// Capability context for one seat-local mute mutation.
+pub const CHAT_MUTE_AUTH_VERB: &str = "chat-mute";
+/// Capability context for the seat's global notification policy.
+pub const CHAT_NOTIFY_PREFS_AUTH_VERB: &str = "chat-notify-prefs";
+/// Capability context for room registry lifecycle mutations.
+pub const CHAT_ROOM_AUTH_VERB: &str = "chat-room";
+/// Capability context for typed alert actions and their local effects.
+pub const CHAT_ALERT_ACTION_AUTH_VERB: &str = "chat-alert-action";
 /// The UI's room-lifecycle verb (NOTIFY-CHAT-5): create / self-join / dissolve.
 pub const ACTION_CHAT_ROOM: &str = "action/chat/room";
 /// The UI's presence verb (NOTIFY-CHAT-3, lock 5/21).
@@ -174,6 +188,16 @@ pub fn dm_key(a: &str, b: &str) -> String {
 #[must_use]
 pub fn room_key(id: &str) -> String {
     format!("room:{id}")
+}
+
+/// Bind a send capability to the exact conversation addressed by the request.
+#[must_use]
+pub fn chat_send_auth_target(scope: Scope, to: &str) -> String {
+    let scope = match scope {
+        Scope::Peer => "peer",
+        Scope::Room => "room",
+    };
+    format!("{scope}:{to}")
 }
 
 /// The conversation key for a host's folded-alert timeline.
@@ -824,6 +848,7 @@ pub struct ChatWorker {
     bus_root_override: Option<PathBuf>,
     manual_presence: Option<Presence>,
     status_message: Option<String>,
+    authorizer: Arc<ActionAuthorizer>,
 }
 
 impl ChatWorker {
@@ -831,7 +856,7 @@ impl ChatWorker {
     /// hostname (the roster/DM identity), `signing_key` its persisted node
     /// identity ([`crate::node_key`]).
     #[must_use]
-    pub const fn new(workgroup_root: PathBuf, self_host: String, signing_key: SigningKey) -> Self {
+    pub fn new(workgroup_root: PathBuf, self_host: String, signing_key: SigningKey) -> Self {
         Self {
             self_host,
             workgroup_root,
@@ -840,7 +865,16 @@ impl ChatWorker {
             bus_root_override: None,
             manual_presence: None,
             status_message: None,
+            authorizer: Arc::new(ActionAuthorizer::production()),
         }
+    }
+
+    /// Replace the production verifier in focused tests; production callers use
+    /// the root credential loaded by [`ActionAuthorizer::production`].
+    #[cfg(test)]
+    pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
+        self.authorizer = authorizer;
+        self
     }
 
     /// Override the Bus root (tests point it at a tempdir Persist).
@@ -957,11 +991,43 @@ impl ChatWorker {
         }
     }
 
+    /// Verify a root-minted capability before any seat-local Chat mutation. The
+    /// Bus spool is intentionally cross-UID writable, so typed JSON alone is not
+    /// authority; every mutable chat lane binds the exact frozen body to this
+    /// node and its semantic target.
+    fn authorize_chat_action(&self, m: &StoredMessage, verb: &str, target: &str) -> bool {
+        let Some(body) = m.body.as_deref() else {
+            return false;
+        };
+        match self.authorizer.authorize(
+            body,
+            MutationContext {
+                verb,
+                node: &self.self_host,
+                target,
+            },
+        ) {
+            Ok(()) => true,
+            Err(reason) => {
+                tracing::warn!(
+                    target: "mackesd::chat",
+                    verb,
+                    reason,
+                    "refusing unauthorised Chat mutation"
+                );
+                false
+            }
+        }
+    }
+
     fn drain_presence(&mut self, persist: &Persist, state: &mut ChatState) {
         for m in take_new(persist, &mut state.cursors, ACTION_CHAT_PRESENCE) {
             let Some(req) = Self::parse_action_body::<PresenceRequest>(&m, "presence") else {
                 continue;
             };
+            if !self.authorize_chat_action(&m, CHAT_PRESENCE_AUTH_VERB, "self") {
+                continue;
+            }
             if let Some(choice) = req.presence {
                 self.manual_presence = choice.to_manual();
             }
@@ -983,6 +1049,18 @@ impl ChatWorker {
             let Some(req) = Self::parse_action_body::<MuteRequest>(&m, "mute") else {
                 continue;
             };
+            let target = format!(
+                "{}:{}",
+                match req.target {
+                    MuteTarget::Contact => "contact",
+                    MuteTarget::Room => "room",
+                    MuteTarget::Source => "source",
+                },
+                req.id
+            );
+            if !self.authorize_chat_action(&m, CHAT_MUTE_AUTH_VERB, &target) {
+                continue;
+            }
             let applied = match req.target {
                 MuteTarget::Contact => {
                     if req.muted {
@@ -1029,6 +1107,9 @@ impl ChatWorker {
             else {
                 continue;
             };
+            if !self.authorize_chat_action(&m, CHAT_NOTIFY_PREFS_AUTH_VERB, "self") {
+                continue;
+            }
             if let Some(threshold) = req.threshold {
                 if state.notify.threshold() != threshold {
                     state.notify.set_threshold(threshold);
@@ -1057,6 +1138,10 @@ impl ChatWorker {
             else {
                 continue;
             };
+            let target = format!("alert:{}:{}:{}", req.sender, req.message_id, req.action_id);
+            if !self.authorize_chat_action(&m, CHAT_ALERT_ACTION_AUTH_VERB, &target) {
+                continue;
+            }
             match req.kind {
                 AlertActionKind::Safe => {
                     if let Some(verb) = req.verb.as_deref() {
@@ -1104,6 +1189,24 @@ impl ChatWorker {
             let Some((scope, to, kind)) = req.resolve() else {
                 continue;
             };
+            let Some(body) = m.body.as_deref() else {
+                continue;
+            };
+            if let Err(reason) = self.authorizer.authorize(
+                body,
+                MutationContext {
+                    verb: CHAT_SEND_AUTH_VERB,
+                    node: &self.self_host,
+                    target: &chat_send_auth_target(scope, &to),
+                },
+            ) {
+                tracing::warn!(
+                    target: "mackesd::chat",
+                    reason,
+                    "refusing unauthorised action/chat/send"
+                );
+                continue;
+            }
             let mut msg = Message::new(self.self_host.as_str(), now_ms, kind);
             sign(&mut msg, &self.signing_key);
             let Some(key) = local_convo_key(&self.self_host, scope, &to, &self.self_host) else {
@@ -1249,6 +1352,10 @@ impl ChatWorker {
             let Some(req) = Self::parse_action_body::<RoomRequest>(&m, "room") else {
                 continue;
             };
+            let target = format!("room:{}", req.id);
+            if !self.authorize_chat_action(&m, CHAT_ROOM_AUTH_VERB, &target) {
+                continue;
+            }
             match req.op {
                 RoomOp::Create => {
                     // A fresh ad-hoc room owned + joined by this node. Re-creating
@@ -1568,9 +1675,14 @@ impl Worker for ChatWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::action_auth::{authorize_test_body, ActionAuthorizer};
     use ed25519_dalek::SigningKey;
     use mde_chat::SYS_ALL_FLEET_ID;
     use rand::rngs::OsRng;
+    use std::sync::Arc;
+
+    const CHAT_AUTH_KEY: &[u8] = b"chat-action-auth-test-key";
+    const CHAT_AUTH_NOW: i64 = 1_700_000_000_000;
 
     fn key() -> SigningKey {
         SigningKey::generate(&mut OsRng)
@@ -1750,14 +1862,60 @@ mod tests {
     // ── worker ticks against a tempdir Bus + tempdir Syncthing root ─────
 
     fn worker(root: &Path) -> ChatWorker {
-        ChatWorker::new(root.to_path_buf(), "eagle".into(), key()).with_bus_root(root.join("bus"))
+        ChatWorker::new(root.to_path_buf(), "eagle".into(), key())
+            .with_bus_root(root.join("bus"))
+            .with_authorizer(Arc::new(ActionAuthorizer::for_test(
+                CHAT_AUTH_KEY,
+                root.join("auth"),
+                CHAT_AUTH_NOW,
+            )))
+    }
+
+    fn authorized_chat_body(verb: &str, target: &str, body: &str, nonce: &str) -> String {
+        authorize_test_body(
+            CHAT_AUTH_KEY,
+            body,
+            MutationContext {
+                verb,
+                node: "eagle",
+                target,
+            },
+            nonce,
+            CHAT_AUTH_NOW + 30_000,
+        )
+    }
+
+    fn authorized_chat_json(verb: &str, target: &str, body: &str, nonce: &str) -> String {
+        let mut document: serde_json::Value = serde_json::from_str(body).unwrap();
+        document["schema_version"] = serde_json::json!(1);
+        authorized_chat_body(verb, target, &document.to_string(), nonce)
+    }
+
+    fn authorized_send_body(to: &str, text: &str, nonce: &str) -> String {
+        let unsigned = serde_json::json!({
+            "schema_version": 1,
+            "scope": "peer",
+            "to": to,
+            "text": text,
+        })
+        .to_string();
+        authorized_chat_body(
+            CHAT_SEND_AUTH_VERB,
+            &chat_send_auth_target(Scope::Peer, to),
+            &unsigned,
+            nonce,
+        )
     }
 
     #[test]
     fn send_signs_persists_and_relays() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let mut w = worker(root);
+        let mut w = worker(root).with_authorizer(Arc::new(ActionAuthorizer::for_test(
+            CHAT_AUTH_KEY,
+            root.join("auth"),
+            CHAT_AUTH_NOW,
+        )));
         let persist = persist_at(root);
         let mut state = ChatState::default();
         // Tick 1 seeds cursors to head — the send lane is empty so nothing yet.
@@ -1768,7 +1926,11 @@ mod tests {
                 ACTION_CHAT_SEND,
                 Priority::Default,
                 None,
-                Some(r#"{"scope":"peer","to":"nyc3","text":"hello mesh"}"#),
+                Some(&authorized_send_body(
+                    "nyc3",
+                    "hello mesh",
+                    "chat-send-once",
+                )),
             )
             .unwrap();
         w.tick_once(&persist, &mut state, 200);
@@ -1792,6 +1954,48 @@ mod tests {
         let msgs: Vec<Message> =
             serde_json::from_str(mirror.last().unwrap().body.as_ref().unwrap()).unwrap();
         assert_eq!(msgs.len(), 1);
+    }
+
+    #[test]
+    fn send_rejects_unsigned_and_replayed_requests_before_signing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut w = worker(root).with_authorizer(Arc::new(ActionAuthorizer::for_test(
+            CHAT_AUTH_KEY,
+            root.join("auth"),
+            CHAT_AUTH_NOW,
+        )));
+        let persist = persist_at(root);
+        let mut state = ChatState::default();
+        w.tick_once(&persist, &mut state, CHAT_AUTH_NOW);
+
+        let unsigned = serde_json::json!({
+            "schema_version": 1,
+            "scope": "peer",
+            "to": "nyc3",
+            "text": "unsigned",
+        })
+        .to_string();
+        persist
+            .write(ACTION_CHAT_SEND, Priority::Default, None, Some(&unsigned))
+            .unwrap();
+        w.tick_once(&persist, &mut state, CHAT_AUTH_NOW + 1);
+        assert!(read_log(&own_log_path(root, "eagle", &dm_key("eagle", "nyc3"))).is_empty());
+
+        let armed = authorized_send_body("nyc3", "authorized", "chat-send-replay");
+        for _ in 0..2 {
+            persist
+                .write(ACTION_CHAT_SEND, Priority::Default, None, Some(&armed))
+                .unwrap();
+            w.tick_once(&persist, &mut state, CHAT_AUTH_NOW + 2);
+        }
+        let logged = read_log(&own_log_path(root, "eagle", &dm_key("eagle", "nyc3")));
+        assert_eq!(
+            logged.len(),
+            1,
+            "the one-shot capability signs exactly once"
+        );
+        assert_eq!(logged[0].kind.tag(), "text");
     }
 
     #[test]
@@ -2251,9 +2455,21 @@ mod tests {
         let mut state = ChatState::default();
         w.tick_once(&persist, &mut state, 100); // seed the room-op lane cursor
 
-        let room_op = |persist: &Persist, body: &str| {
+        let mut room_nonce = 0;
+        let mut room_op = |persist: &Persist, body: &str| {
+            room_nonce += 1;
+            let id = serde_json::from_str::<serde_json::Value>(body).unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let body = authorized_chat_json(
+                CHAT_ROOM_AUTH_VERB,
+                &format!("room:{id}"),
+                body,
+                &format!("chat-room-{room_nonce}"),
+            );
             persist
-                .write(ACTION_CHAT_ROOM, Priority::Default, None, Some(body))
+                .write(ACTION_CHAT_ROOM, Priority::Default, None, Some(&body))
                 .unwrap();
         };
 
@@ -2384,7 +2600,12 @@ mod tests {
                 ACTION_CHAT_PRESENCE,
                 Priority::Default,
                 None,
-                Some(r#"{"presence":"dnd","status":"heads-down"}"#),
+                Some(&authorized_chat_json(
+                    CHAT_PRESENCE_AUTH_VERB,
+                    "self",
+                    r#"{"presence":"dnd","status":"heads-down"}"#,
+                    "chat-presence-dnd",
+                )),
             )
             .unwrap();
         w.tick_once(&persist, &mut state, 200);
@@ -2415,7 +2636,12 @@ mod tests {
                 ACTION_CHAT_PRESENCE,
                 Priority::Default,
                 None,
-                Some(r#"{"presence":"available","status":""}"#),
+                Some(&authorized_chat_json(
+                    CHAT_PRESENCE_AUTH_VERB,
+                    "self",
+                    r#"{"presence":"available","status":""}"#,
+                    "chat-presence-available",
+                )),
             )
             .unwrap();
         w.tick_once(&persist, &mut state, 300);
@@ -2444,7 +2670,12 @@ mod tests {
                 ACTION_CHAT_PRESENCE,
                 Priority::Default,
                 None,
-                Some(r#"{"status":"reviewing PRs"}"#),
+                Some(&authorized_chat_json(
+                    CHAT_PRESENCE_AUTH_VERB,
+                    "self",
+                    r#"{"status":"reviewing PRs"}"#,
+                    "chat-presence-status",
+                )),
             )
             .unwrap();
         w.tick_once(&persist, &mut state, 200);
@@ -2501,7 +2732,12 @@ mod tests {
                 ACTION_CHAT_MUTE,
                 Priority::Default,
                 None,
-                Some(r#"{"target":"contact","id":"nyc3","muted":true}"#),
+                Some(&authorized_chat_json(
+                    CHAT_MUTE_AUTH_VERB,
+                    "contact:nyc3",
+                    r#"{"target":"contact","id":"nyc3","muted":true}"#,
+                    "chat-mute-contact",
+                )),
             )
             .unwrap();
         persist
@@ -2509,7 +2745,12 @@ mod tests {
                 ACTION_CHAT_MUTE,
                 Priority::Default,
                 None,
-                Some(r#"{"target":"room","id":"ops","muted":true}"#),
+                Some(&authorized_chat_json(
+                    CHAT_MUTE_AUTH_VERB,
+                    "room:ops",
+                    r#"{"target":"room","id":"ops","muted":true}"#,
+                    "chat-mute-room",
+                )),
             )
             .unwrap();
         persist
@@ -2517,7 +2758,12 @@ mod tests {
                 ACTION_CHAT_MUTE,
                 Priority::Default,
                 None,
-                Some(r#"{"target":"source","id":"security","muted":true}"#),
+                Some(&authorized_chat_json(
+                    CHAT_MUTE_AUTH_VERB,
+                    "source:security",
+                    r#"{"target":"source","id":"security","muted":true}"#,
+                    "chat-mute-source",
+                )),
             )
             .unwrap();
         w.tick_once(&persist, &mut state, 200);
@@ -2573,7 +2819,12 @@ mod tests {
                 ACTION_CHAT_MUTE,
                 Priority::Default,
                 None,
-                Some(r#"{"target":"contact","id":"nyc3","muted":false}"#),
+                Some(&authorized_chat_json(
+                    CHAT_MUTE_AUTH_VERB,
+                    "contact:nyc3",
+                    r#"{"target":"contact","id":"nyc3","muted":false}"#,
+                    "chat-unmute-contact",
+                )),
             )
             .unwrap();
         w.tick_once(&persist, &mut state, 400);
@@ -2601,7 +2852,12 @@ mod tests {
                 ACTION_CHAT_NOTIFY_PREFS,
                 Priority::Default,
                 None,
-                Some(r#"{"threshold":"critical"}"#),
+                Some(&authorized_chat_json(
+                    CHAT_NOTIFY_PREFS_AUTH_VERB,
+                    "self",
+                    r#"{"threshold":"critical"}"#,
+                    "chat-notify-critical",
+                )),
             )
             .unwrap();
         persist
@@ -2609,7 +2865,12 @@ mod tests {
                 ACTION_CHAT_MUTE,
                 Priority::Default,
                 None,
-                Some(r#"{"target":"source","id":"security","muted":true}"#),
+                Some(&authorized_chat_json(
+                    CHAT_MUTE_AUTH_VERB,
+                    "source:security",
+                    r#"{"target":"source","id":"security","muted":true}"#,
+                    "chat-mute-source-policy",
+                )),
             )
             .unwrap();
         w.tick_once(&persist, &mut state, 200);
@@ -2666,7 +2927,12 @@ mod tests {
                 Priority::Default,
                 None,
                 Some(
-                    r#"{"message_id":"m1","sender":"nyc3","action_id":"restart","label":"Restart","kind":"safe","verb":"action/systemd/restart"}"#,
+                    &authorized_chat_json(
+                        CHAT_ALERT_ACTION_AUTH_VERB,
+                        "alert:nyc3:m1:restart",
+                        r#"{"message_id":"m1","sender":"nyc3","action_id":"restart","label":"Restart","kind":"safe","verb":"action/systemd/restart"}"#,
+                        "chat-alert-safe",
+                    ),
                 ),
             )
             .unwrap();
@@ -2676,7 +2942,12 @@ mod tests {
                 Priority::Default,
                 None,
                 Some(
-                    r#"{"message_id":"m2","sender":"nyc3","action_id":"poweroff","label":"Power Off","kind":"destructive","verb":"action/power/off","armed":false}"#,
+                    &authorized_chat_json(
+                        CHAT_ALERT_ACTION_AUTH_VERB,
+                        "alert:nyc3:m2:poweroff",
+                        r#"{"message_id":"m2","sender":"nyc3","action_id":"poweroff","label":"Power Off","kind":"destructive","verb":"action/power/off","armed":false}"#,
+                        "chat-alert-unarmed",
+                    ),
                 ),
             )
             .unwrap();
@@ -2686,7 +2957,12 @@ mod tests {
                 Priority::Default,
                 None,
                 Some(
-                    r#"{"message_id":"m3","sender":"nyc3","action_id":"ack","label":"Ack","kind":"ack"}"#,
+                    &authorized_chat_json(
+                        CHAT_ALERT_ACTION_AUTH_VERB,
+                        "alert:nyc3:m3:ack",
+                        r#"{"message_id":"m3","sender":"nyc3","action_id":"ack","label":"Ack","kind":"ack"}"#,
+                        "chat-alert-ack",
+                    ),
                 ),
             )
             .unwrap();
@@ -2696,7 +2972,12 @@ mod tests {
                 Priority::Default,
                 None,
                 Some(
-                    r#"{"message_id":"m4","sender":"nyc3","action_id":"later","label":"Snooze","kind":"snooze"}"#,
+                    &authorized_chat_json(
+                        CHAT_ALERT_ACTION_AUTH_VERB,
+                        "alert:nyc3:m4:later",
+                        r#"{"message_id":"m4","sender":"nyc3","action_id":"later","label":"Snooze","kind":"snooze"}"#,
+                        "chat-alert-snooze",
+                    ),
                 ),
             )
             .unwrap();
@@ -2745,7 +3026,12 @@ mod tests {
                 Priority::Default,
                 None,
                 Some(
-                    r#"{"message_id":"m5","sender":"nyc3","action_id":"poweroff","label":"Power Off","kind":"destructive","verb":"action/power/off","armed":true}"#,
+                    &authorized_chat_json(
+                        CHAT_ALERT_ACTION_AUTH_VERB,
+                        "alert:nyc3:m5:poweroff",
+                        r#"{"message_id":"m5","sender":"nyc3","action_id":"poweroff","label":"Power Off","kind":"destructive","verb":"action/power/off","armed":true}"#,
+                        "chat-alert-armed",
+                    ),
                 ),
             )
             .unwrap();

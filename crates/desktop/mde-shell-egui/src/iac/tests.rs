@@ -98,6 +98,8 @@ fn placed_bus_state() -> (tempfile::TempDir, WorkloadsState) {
     let mut state = WorkloadsState::default();
     state.bus_root = Some(tmp.path().join("bus"));
     state.selected_node = Some("eagle".to_string());
+    state.states = vec![fixture_state()];
+    state.states[0].apply_armed = true;
     state.arm_key_override = Some(TEST_ARM_KEY.to_vec());
     (tmp, state)
 }
@@ -222,6 +224,8 @@ fn the_roster_reads_its_workloads_by_delivery_type() {
 fn provision_apply_is_typed_confirm_gated_and_emits_provision_only_after_confirm() {
     // Dry-run default: a plan is a direct emit (no confirm). Apply is gated.
     let mut state = state_on(DeliveryView::DesktopVm, Panel::Provision);
+    state.selected_node = Some("eagle".to_string());
+    state.states[0].apply_armed = true;
 
     // Arming a live apply OPENS the confirm and publishes NOTHING (§ RUN-006).
     state.arm_provision();
@@ -262,6 +266,80 @@ fn provision_apply_is_typed_confirm_gated_and_emits_provision_only_after_confirm
         "the confirmed apply emits the provision verb: {:?}",
         state.note
     );
+}
+
+#[test]
+fn plan_only_selected_node_cannot_open_live_provision_arm() {
+    let mut state = state_on(DeliveryView::DesktopVm, Panel::Provision);
+    state.selected_node = Some("eagle".to_string());
+
+    state.arm_provision();
+
+    assert!(
+        !state.has_arming(),
+        "plan-only nodes must not open live apply"
+    );
+    assert!(state
+        .note_text()
+        .is_some_and(|note| note.contains("plan-only")));
+
+    state.states[0].apply_armed = true;
+    state.arm_provision();
+    assert!(
+        state.has_arming(),
+        "an armed node may open the typed confirm"
+    );
+}
+
+#[test]
+fn configure_apply_refuses_missing_or_plan_only_selected_node() {
+    let mut state = state_on(DeliveryView::DesktopVm, Panel::Provision);
+
+    state.arm_configure();
+    assert!(!state.has_arming(), "a missing node must fail closed");
+    assert!(state
+        .note_text()
+        .is_some_and(|note| note.contains("Live configuration is unavailable")));
+
+    state.selected_node = Some("eagle".to_string());
+    state.arm_configure();
+    assert!(!state.has_arming(), "a plan-only node must fail closed");
+    assert!(state
+        .note_text()
+        .is_some_and(|note| note.contains("plan-only")));
+}
+
+#[test]
+fn armed_selected_node_accepts_configure_confirmation() {
+    let mut state = state_on(DeliveryView::DesktopVm, Panel::Provision);
+    state.selected_node = Some("eagle".to_string());
+    state.states[0].apply_armed = true;
+
+    state.arm_configure();
+
+    let arming = state.arming.as_ref().expect("armed node opens configure");
+    assert_eq!(arming.action, ArmAction::Configure);
+    assert_eq!(arming.action.verb(), "configure");
+    assert!(arming.typed.is_empty());
+    assert!(state.note.is_none());
+}
+
+#[test]
+fn configure_apply_rechecks_capability_after_confirmation() {
+    let mut state = state_on(DeliveryView::DesktopVm, Panel::Provision);
+    state.selected_node = Some("eagle".to_string());
+    state.states[0].apply_armed = true;
+    state.arm_configure();
+
+    let action = state.arming.take().expect("configure confirmation").action;
+    let echo = action.echo();
+    state.states[0].apply_armed = false;
+    state.perform(action, &echo);
+
+    assert!(state.mutation_pending.is_none());
+    assert!(state
+        .note_text()
+        .is_some_and(|note| note.contains("Nothing was sent")));
 }
 
 #[test]
@@ -400,6 +478,38 @@ fn lifecycle_reboot_and_delete_are_typed_confirm_gated() {
     assert_eq!(delete["instance"], "seat-1");
     assert_eq!(delete["typed_name"], "seat-1");
     assert!(CloudArmedToken::parse(delete["armed_token"].as_str().unwrap()).is_some());
+}
+
+#[test]
+fn lifecycle_and_console_actions_reject_incomplete_workload_identity() {
+    let mut state = state_on(DeliveryView::DesktopVm, Panel::Roster);
+
+    state.arm_lifecycle("instance-delete", "eagle", "seat-1", "");
+    assert!(
+        !state.has_arming(),
+        "blank names must not open delete confirmation"
+    );
+    assert!(state
+        .note_text()
+        .is_some_and(|note| note.contains("identity is incomplete")));
+
+    state.note = None;
+    state.arm_lifecycle("instance-delete", "eagle", "", "seat-1");
+    assert!(
+        !state.has_arming(),
+        "blank instance ids must not open delete confirmation"
+    );
+
+    state.note = None;
+    state.issue_console_attach("eagle", "", "seat-1");
+    assert!(
+        !state.has_arming(),
+        "blank console instance ids must not open attachment confirmation"
+    );
+    assert!(
+        state.console_target.is_none(),
+        "a rejected console request must not retain a stale target"
+    );
 }
 
 #[test]

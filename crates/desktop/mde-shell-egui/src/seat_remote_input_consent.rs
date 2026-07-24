@@ -13,9 +13,9 @@
 //!
 //! The worker drains its arm-control topic with a plain
 //! `Persist::list_since(ARM_TOPIC, …)` cursor (NOT the request/reply RPC path),
-//! so this module publishes with a plain `Persist::write` — exactly as
-//! [`crate::discovery`] mints the broker `Open` body. The bytes we emit here are
-//! the shape the worker's `parse_arm` decodes:
+//! so this module publishes with a plain `Persist::write` after minting the
+//! exact-body capability through the existing root/systemd signer. The bytes
+//! we authorize here are the shape the worker's `parse_arm` decodes:
 //!
 //! * **arm** — `{"op":"arm","source":"<label>","ttl_ms":<u64>}` (plus an optional
 //!   `phone` binding, unused by this control). `ttl_ms` is the bounded window; the
@@ -45,6 +45,10 @@ use crate::bus_reader::BusReader;
 /// `mackesd_core::workers::seat_remote_input::ARM_TOPIC` drains. A plain retained
 /// topic (not an RPC request), folded by the worker's `drain_arm` cursor.
 const ARM_TOPIC: &str = "action/seat/remote-input-arm";
+
+/// Exact capability context consumed by the seat worker for both arm and disarm.
+const ARM_AUTH_VERB: &str = "seat-remote-input-arm";
+const ARM_AUTH_TARGET: &str = "seat";
 
 /// The retained-latest "is this seat being remotely driven" indicator prefix
 /// (mirrors `seat_remote_input::INDICATOR_PREFIX`); the worker publishes the live
@@ -267,6 +271,7 @@ fn arm_body(ttl_ms: u64, source: &str, phone: Option<&str>) -> String {
         "op": "arm",
         "source": source,
         "ttl_ms": ttl_ms,
+        "schema_version": mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION,
     });
     if let Some(phone) = phone.filter(|p| !p.is_empty()) {
         obj["phone"] = serde_json::Value::String(phone.to_string());
@@ -277,12 +282,18 @@ fn arm_body(ttl_ms: u64, source: &str, phone: Option<&str>) -> String {
 /// The disarm body: `{"op":"disarm","source":…}` — decoded by
 /// `seat_remote_input::parse_arm` (op `"disarm"`, non-empty `source`).
 fn disarm_body(source: &str) -> String {
-    serde_json::json!({ "op": "disarm", "source": source }).to_string()
+    serde_json::json!({
+        "op": "disarm",
+        "source": source,
+        "schema_version": mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION,
+    })
+    .to_string()
 }
 
 /// Publish an arm grant to [`ARM_TOPIC`] via the persist-first write path (the
-/// same path `mde-bus publish` uses); records any failure in `last_error` and
-/// never panics. A missing Bus is the honest off-mesh error, not a fake success.
+/// same path `mde-bus publish` uses); the write is preceded by a short-lived,
+/// exact-body capability minted only by the root systemd credential. Records
+/// any failure in `last_error` and never panics.
 fn publish_arm(
     bus_root: Option<&Path>,
     last_error: &mut Option<String>,
@@ -295,7 +306,7 @@ fn publish_arm(
     body
 }
 
-/// Publish a disarm to [`ARM_TOPIC`] via the same write path.
+/// Publish a disarm to [`ARM_TOPIC`] via the same signed write path.
 fn publish_disarm(
     bus_root: Option<&Path>,
     last_error: &mut Option<String>,
@@ -316,8 +327,20 @@ fn publish(bus_root: Option<&Path>, last_error: &mut Option<String>, body: &str)
         );
         return;
     };
+    let node = local_node_id();
+    let authorized =
+        match crate::iac::authorize_root_mutation_body(body, ARM_AUTH_VERB, &node, ARM_AUTH_TARGET)
+        {
+            Ok(body) => body,
+            Err(error) => {
+                *last_error = Some(format!(
+                    "Remote-input consent authorization unavailable: {error}"
+                ));
+                return;
+            }
+        };
     match Persist::open(root.to_path_buf())
-        .and_then(|p| p.write(ARM_TOPIC, Priority::Default, None, Some(body)))
+        .and_then(|p| p.write(ARM_TOPIC, Priority::Default, None, Some(&authorized)))
     {
         Ok(_) => *last_error = None,
         Err(e) => *last_error = Some(format!("Couldn't reach the mesh Bus: {e}")),
@@ -454,10 +477,15 @@ mod tests {
         let rows = persist.list_since(ARM_TOPIC, None).expect("arm rows");
         assert_eq!(rows.len(), 1, "exactly one arm grant landed");
         let landed = rows[0].body.clone().expect("body");
-        assert_eq!(landed, body);
+        assert_ne!(landed, body, "the shell must add an exact-body capability");
         let v: serde_json::Value = serde_json::from_str(&landed).expect("arm JSON");
         assert_eq!(v["op"], "arm");
         assert_eq!(v["ttl_ms"], 120_000);
+        assert_eq!(
+            v["schema_version"],
+            mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION
+        );
+        assert!(v["armed_token"].as_str().is_some());
     }
 
     #[test]
@@ -479,6 +507,11 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(rows[0].body.as_deref().expect("body")).expect("disarm JSON");
         assert_eq!(v["op"], "disarm");
+        assert_eq!(
+            v["schema_version"],
+            mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION
+        );
+        assert!(v["armed_token"].as_str().is_some());
     }
 
     #[test]

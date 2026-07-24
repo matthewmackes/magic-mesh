@@ -253,8 +253,8 @@ pub enum IconId {
     Start,
     /// Shared UI: pin/favorite glyph for launchers and rows that expose pinning.
     Pin,
-    /// Shared UI: up navigation arrow. The bottom taskbar no longer uses this for
-    /// Desktop Sources, Health, or overflow controls.
+    /// Shared UI: up navigation arrow. The Construct navigation bar does not use
+    /// this for Desktop Sources, Health, or overflow controls.
     ChevronUp,
     /// Tray: speaker with sound-wave arcs (volume).
     Volume,

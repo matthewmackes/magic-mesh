@@ -1,24 +1,29 @@
 //! `status_bar` — WL-UX-006/U11: the **Construct slim top status bar**.
 //!
 //! Authority: `docs/design/platform-interfaces.md` §2.3 (Q12): a ~24px
-//! HIG-style strip — clock + date on the left; the mesh/system rollups on the
-//! right — fed by the existing [`crate::status`] `StatusSegments` read-model.
+//! HIG-style strip — a centered clock, the mesh/system rollups, and compact
+//! system-control glyphs on the right — fed by the existing
+//! [`crate::status`] `StatusSegments` read-model.
 //! **This deliberately REVERSES the old NAVBAR-W10 "no top bar" decision**
 //! (Q12 says so in as many words).
 //!
-//! ## Why a floating overlay, not a reserved panel
+//! ## Paint layer and reserved layout band
 //!
-//! The strip renders as a foreground [`egui::Area`] pinned to the top edge and
-//! does **not** reserve layout space. The Q28 full-native-resolution guarantee
-//! therefore holds for every app canvas.
+//! The strip paints as a foreground [`egui::Area`] pinned to the top edge, while
+//! `main.rs::central_view` reserves the matching [`STATUS_BAR_H`] band before
+//! laying out every workspace. This keeps the strip's fixed chrome interaction
+//! model without allowing app content to slide underneath it.
 //!
 //! ## Auto-hide (Q12/Q28)
 //!
 //! Hidden while the curtain is engaged (CURTAIN-1: no chrome under the lock),
 //! in the Car profile (Auto Mode owns its own instrument chrome), and over a
 //! focused full-screen remote desktop or immersive Maps workspace (U24).
-//! Visibility is a pure fold ([`status_bar_visible`]); the transition fades
-//! through [`Motion::animate`].
+//! Visibility is a pure fold ([`status_bar_visible`]); appearing transitions
+//! fade through [`Motion::animate`]. A hiding frame stops painting immediately:
+//! `main.rs::central_view` removes the reserved band at the same target-state
+//! boundary, so fading over the newly reclaimed workspace would reintroduce the
+//! very overlap this strip is meant to prevent.
 //!
 //! ## Material (§2.6 doctrine)
 //!
@@ -39,12 +44,14 @@
 
 use std::time::Duration;
 
-use mde_egui::egui::{self, FontId};
-use mde_egui::{GradeBand, Motion, Style};
+use mde_egui::egui;
+use mde_egui::{GradeBand, Motion, Style, TypographyRole};
+use mde_theme::brand::icons::IconId;
 
 use crate::chrome::NodeGrades;
 use crate::construct::ConstructChrome;
 use crate::status::{segment_label, severity_color, severity_label, StatusSegment, StatusSegments};
+use crate::surfaces::icon_texture;
 
 /// The locked strip height (Q12: "~24px").
 pub(crate) const STATUS_BAR_H: f32 = 24.0;
@@ -59,6 +66,119 @@ pub(crate) const RIGHT_SEGMENTS: [StatusSegment; 4] = [
     StatusSegment::Power,
     StatusSegment::Alerts,
 ];
+
+/// Compact right-rail controls. These are intentionally action-only: the
+/// existing Control Center remains the source of truth for their live values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StatusControl {
+    /// Open the Control Center's volume controls.
+    Volume,
+    /// Open the Control Center's network controls.
+    Network,
+    /// Open the Control Center's display/brightness controls.
+    Brightness,
+}
+
+impl StatusControl {
+    /// The fixed, deterministic order used by the top rail.
+    pub(crate) const ALL: [Self; 3] = [Self::Volume, Self::Network, Self::Brightness];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Volume => 0,
+            Self::Network => 1,
+            Self::Brightness => 2,
+        }
+    }
+
+    /// Existing YAMIS glyph selected for this status/control-center affordance.
+    pub(crate) const fn icon(self) -> IconId {
+        match self {
+            Self::Volume => IconId::Volume,
+            Self::Network => IconId::Signal,
+            Self::Brightness => IconId::DisplaySettings,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Volume => "Volume",
+            Self::Network => "Network",
+            Self::Brightness => "Screen brightness",
+        }
+    }
+}
+
+/// Each icon gets one full rail-height hit target, matching the compact macOS
+/// menu-bar rhythm while keeping the pointer target larger than the glyph.
+const STATUS_CONTROL_W: f32 = STATUS_BAR_H;
+const STATUS_CONTROL_GAP: f32 = Style::SP_XS;
+const STATUS_CONTROL_ICON: f32 = Style::ICON_M;
+
+fn status_controls_width() -> f32 {
+    STATUS_CONTROL_W * StatusControl::ALL.len() as f32
+        + STATUS_CONTROL_GAP * (StatusControl::ALL.len().saturating_sub(1) as f32)
+}
+
+/// Fit the right-control cluster to the available rail without changing its
+/// normal macOS-sized geometry on a real workstation. Tiny headless/windowed
+/// surfaces still get bounded hit targets instead of controls extending past
+/// the top-bar edge.
+fn status_controls_metrics(bar: egui::Rect) -> (f32, f32) {
+    let available = (bar.width() - Style::SP_S * 2.0).max(1.0);
+    let count = StatusControl::ALL.len() as f32;
+    let normal_width = STATUS_CONTROL_W;
+    let normal_gap = STATUS_CONTROL_GAP;
+    let min_gap = normal_gap.min((available / (count * 4.0)).max(0.0));
+    let control_width = normal_width
+        .min(((available - min_gap * (count - 1.0)) / count).max(1.0));
+    (control_width, min_gap)
+}
+
+fn status_controls_rect(bar: egui::Rect) -> egui::Rect {
+    let right = bar.right() - Style::SP_S;
+    let (control_width, gap) = status_controls_metrics(bar);
+    egui::Rect::from_min_max(
+        egui::pos2(
+            right
+                - control_width * StatusControl::ALL.len() as f32
+                - gap * (StatusControl::ALL.len().saturating_sub(1) as f32),
+            bar.top(),
+        ),
+        egui::pos2(right, bar.bottom()),
+    )
+}
+
+fn status_control_rect(bar: egui::Rect, control: StatusControl) -> egui::Rect {
+    let controls = status_controls_rect(bar);
+    let (control_width, gap) = status_controls_metrics(bar);
+    let x = controls.left() + control.index() as f32 * (control_width + gap);
+    egui::Rect::from_min_size(
+        egui::pos2(x, controls.top()),
+        egui::vec2(control_width, controls.height()),
+    )
+}
+
+fn status_control_id(control: StatusControl) -> egui::Id {
+    egui::Id::new((
+        "construct-status-bar",
+        match control {
+            StatusControl::Volume => "volume",
+            StatusControl::Network => "network",
+            StatusControl::Brightness => "brightness",
+        },
+    ))
+}
+
+fn centered_clock_rect(bar: egui::Rect, time_width: f32) -> egui::Rect {
+    egui::Rect::from_center_size(
+        bar.center(),
+        egui::vec2(
+            (time_width + Style::SP_S * 2.0).min(bar.width()),
+            bar.height(),
+        ),
+    )
+}
 
 /// The shell state the strip's visibility folds over — read in `main.rs`'s
 /// slot (the only place with the fields) and passed by value.
@@ -133,22 +253,12 @@ pub(crate) fn mesh_grade_cell(grades: &NodeGrades) -> (String, egui::Color32) {
         )
 }
 
-/// The date line — the dock tray clock's civil `M/D/YYYY` fold
-/// (`dock::clock_date_text`, private there; the *call* is replicated citing
-/// that origin so the date math itself stays in the crate's ONE calendar,
-/// [`crate::chat::civil_from_days`], §6).
-#[must_use]
-pub(crate) fn date_text(now_unix: i64) -> String {
-    let (year, month, day) = crate::chat::civil_from_days(now_unix.div_euclid(86_400));
-    format!("{month}/{day}/{year}")
-}
-
 /// Stable id of the strip's Area.
 fn status_bar_area_id() -> egui::Id {
     egui::Id::new("construct-status-bar")
 }
 
-/// Stable id of the left clock cluster (the Notification Center trigger).
+/// Stable id of the centered clock (the Notification Center trigger).
 pub(crate) fn status_bar_clock_id() -> egui::Id {
     egui::Id::new(("construct-status-bar", "clock"))
 }
@@ -174,6 +284,12 @@ pub fn mount(
     // frame path always has a positive pass number. This mirrors the overlay
     // guard in control_center.rs and notification_center.rs.
     if ctx.cumulative_pass_nr() == 0 {
+        return;
+    }
+    // The central workspace releases its reserved band when the target state
+    // becomes hidden. Do not leave a fading foreground Area over those pixels;
+    // the workspace must remain clear for the entire hidden state transition.
+    if !visible {
         return;
     }
     let t = Motion::animate(ctx, "construct-status-bar-visible", visible, Motion::BASE);
@@ -221,52 +337,36 @@ fn strip(
         egui::Stroke::new(1.0, Style::BORDER),
     );
     let cy = bar.center().y;
-    let time_font = FontId::proportional(Style::TYPE_FOOTNOTE);
-    let date_font = FontId::proportional(Style::TYPE_CAPTION);
-
-    // ── Left cluster: clock + date (the crate's one clock/calendar) ────────
+    let time_role = TypographyRole::Label;
+    // ── Center cluster: the one authoritative clock ────────────────────────
     let now = crate::timers::now_unix();
     let time = crate::timers::hhmm(now);
-    let date = date_text(now);
-    let time_w = painter
-        .layout_no_wrap(time.clone(), time_font.clone(), Style::TEXT)
-        .size()
-        .x;
-    let date_w = painter
-        .layout_no_wrap(date.clone(), date_font.clone(), Style::TEXT_DIM)
-        .size()
-        .x;
-    let clock_rect = egui::Rect::from_min_max(
-        bar.left_top(),
-        egui::pos2(
-            bar.left() + Style::SP_S + time_w + Style::SP_S + date_w + Style::SP_S,
-            bar.bottom(),
-        ),
-    );
+    let time_galley = painter.layout_job(Style::typography_job(
+        time.clone(),
+        TypographyRole::Label,
+        Style::TEXT,
+        f32::INFINITY,
+    ));
+    let time_w = time_galley.size().x;
+    let clock_rect = centered_clock_rect(bar, time_w);
     let clock = ui.interact(clock_rect, status_bar_clock_id(), egui::Sense::click());
     clock.widget_info(|| {
         egui::WidgetInfo::labeled(
             egui::WidgetType::Button,
             ui.is_enabled(),
-            format!("Clock {time}, {date} — Notification Center"),
+            format!("Clock {time} — Notification Center"),
         )
     });
     if clock.hovered() {
         painter.rect_filled(clock_rect.shrink(2.0), Style::RADIUS_S, Style::SURFACE_HI);
     }
-    painter.text(
-        egui::pos2(bar.left() + Style::SP_S, cy),
-        egui::Align2::LEFT_CENTER,
-        &time,
-        time_font.clone(),
+    painter.galley(
+        egui::pos2(
+            clock_rect.center().x - time_galley.size().x / 2.0,
+            cy - time_galley.size().y / 2.0,
+        ),
+        time_galley,
         Style::TEXT,
-    );
-    painter.text(
-        egui::pos2(bar.left() + Style::SP_S + time_w + Style::SP_S, cy),
-        egui::Align2::LEFT_CENTER,
-        &date,
-        date_font.clone(),
-        Style::TEXT_DIM,
     );
     if clock.clicked() {
         // PLATFORM-INTERFACES §2.3 — "Notification Center | click status-bar
@@ -274,7 +374,8 @@ fn strip(
         construct.notification_center_open = !construct.notification_center_open;
     }
 
-    // ── Right cluster: mesh grade + the four rollup cells ──────────────────
+    // ── Right cluster: rollups, then the three compact system controls ─────
+    let controls_rect = status_controls_rect(bar);
     let (grade_text, grade_color) = mesh_grade_cell(grades);
     let cells = right_cells(segments);
     let dot_r = Style::SP_XS;
@@ -284,7 +385,12 @@ fn strip(
         .iter()
         .map(|cell| {
             let text_w = painter
-                .layout_no_wrap(cell.text.clone(), time_font.clone(), Style::TEXT)
+                .layout_job(Style::typography_job(
+                    cell.text.clone(),
+                    time_role,
+                    Style::TEXT,
+                    f32::INFINITY,
+                ))
                 .size()
                 .x;
             let w = dot_r * 2.0 + Style::SP_XS + text_w;
@@ -292,12 +398,10 @@ fn strip(
             w
         })
         .collect();
+    let cluster_right = controls_rect.left() - Style::SP_XS;
     let cluster_rect = egui::Rect::from_min_max(
-        egui::pos2(
-            bar.right() - Style::SP_S - cluster_w - Style::SP_XS,
-            bar.top(),
-        ),
-        bar.right_bottom(),
+        egui::pos2(cluster_right - cluster_w, bar.top()),
+        egui::pos2(cluster_right, bar.bottom()),
     );
     let cluster = ui.interact(
         cluster_rect,
@@ -318,7 +422,7 @@ fn strip(
     if cluster.hovered() {
         painter.rect_filled(cluster_rect.shrink(2.0), Style::RADIUS_S, Style::SURFACE_HI);
     }
-    let mut x = bar.right() - Style::SP_S - cluster_w;
+    let mut x = cluster_rect.left();
     // The grade glyph — the letter over its band-coloured pip (the dock's
     // local-grade idiom, shrunk to the strip).
     let grade_center = egui::pos2(x + Style::SP_S, cy);
@@ -327,18 +431,29 @@ fn strip(
         grade_center,
         egui::Align2::CENTER_CENTER,
         &grade_text,
-        date_font,
+        Style::typography_font(TypographyRole::Caption),
         Style::BG,
     );
     x += grade_w;
     for (cell, w) in cells.iter().zip(cell_widths) {
         x += Style::SP_S;
         painter.circle_filled(egui::pos2(x + dot_r, cy), dot_r, cell.dot);
-        painter.text(
-            egui::pos2(x + dot_r * 2.0 + Style::SP_XS, cy),
-            egui::Align2::LEFT_CENTER,
-            &cell.text,
-            time_font.clone(),
+        let cell_galley = painter.layout_job(Style::typography_job(
+            cell.text.clone(),
+            time_role,
+            if cell.present {
+                Style::TEXT
+            } else {
+                Style::TEXT_DIM
+            },
+            f32::INFINITY,
+        ));
+        painter.galley(
+            egui::pos2(
+                x + dot_r * 2.0 + Style::SP_XS,
+                cy - cell_galley.size().y / 2.0,
+            ),
+            cell_galley,
             if cell.present {
                 Style::TEXT
             } else {
@@ -351,6 +466,44 @@ fn strip(
         // PLATFORM-INTERFACES §2.3 — "Control Center | click status-bar right
         // cluster": the pub open flag IS the sanctioned seam.
         construct.control_center_open = !construct.control_center_open;
+    }
+
+    for control in StatusControl::ALL {
+        let rect = status_control_rect(bar, control);
+        let response = ui.interact(rect, status_control_id(control), egui::Sense::click());
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Button,
+                ui.is_enabled(),
+                format!("{} — Control Center", control.label()),
+            )
+        });
+        if response.hovered() {
+            painter.rect_filled(rect.shrink(2.0), Style::RADIUS_S, Style::SURFACE_HI);
+        }
+        if let Some(texture) =
+            icon_texture(ui.ctx(), control.icon(), STATUS_CONTROL_ICON, Style::TEXT)
+        {
+            let draw = egui::Rect::from_center_size(
+                rect.center(),
+                egui::vec2(STATUS_CONTROL_ICON, STATUS_CONTROL_ICON),
+            );
+            painter.image(
+                texture.id(),
+                draw,
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        } else {
+            // The bundled glyph loader fails soft; retain a visible, honest
+            // interaction target rather than manufacturing a status value.
+            painter.circle_filled(rect.center(), Style::SP_XS, Style::TEXT_DIM);
+        }
+        if response.clicked() {
+            // The three glyphs are shortcuts into the existing Control Center;
+            // the panel remains the sole source of truth for live values.
+            construct.control_center_open = !construct.control_center_open;
+        }
     }
 
     // Wake at the next minute rollover so the painted minute is never stale
@@ -592,18 +745,12 @@ mod tests {
         );
         let after = crate::timers::now_unix();
         let texts = frame_texts(&out);
-        // The clock (bracketed against a minute rollover mid-test) + date.
+        // The centered clock (bracketed against a minute rollover mid-test).
         assert!(
             texts
                 .iter()
                 .any(|t| *t == crate::timers::hhmm(before) || *t == crate::timers::hhmm(after)),
             "no clock text painted: {texts:?}"
-        );
-        assert!(
-            texts
-                .iter()
-                .any(|t| *t == date_text(before) || *t == date_text(after)),
-            "no date text painted: {texts:?}"
         );
         // At least one rollup cell + the grade letter.
         assert!(
@@ -715,6 +862,81 @@ mod tests {
     }
 
     #[test]
+    fn centered_clock_and_right_controls_have_deterministic_geometry() {
+        let bar = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, STATUS_BAR_H));
+        let clock = centered_clock_rect(bar, 48.0);
+        assert!((clock.center().x - bar.center().x).abs() < f32::EPSILON);
+        assert!((clock.center().y - bar.center().y).abs() < f32::EPSILON);
+
+        let controls = status_controls_rect(bar);
+        assert!((controls.right() - (bar.right() - Style::SP_S)).abs() < f32::EPSILON);
+        assert!((status_controls_width() - (STATUS_CONTROL_W * 3.0 + STATUS_CONTROL_GAP * 2.0)).abs() < f32::EPSILON);
+        for (index, control) in StatusControl::ALL.into_iter().enumerate() {
+            let rect = status_control_rect(bar, control);
+            assert_eq!(rect.top(), bar.top());
+            assert_eq!(rect.bottom(), bar.bottom());
+            assert!(
+                (rect.left()
+                    - (controls.left() + index as f32 * (STATUS_CONTROL_W + STATUS_CONTROL_GAP)))
+                    .abs()
+                    < f32::EPSILON
+            );
+            assert!(rect.right() <= controls.right());
+        }
+        let last = status_control_rect(bar, StatusControl::Brightness);
+        assert!((last.right() - controls.right()).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn right_controls_remain_inside_a_narrow_top_bar() {
+        let bar = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(72.0, STATUS_BAR_H));
+        let controls = status_controls_rect(bar);
+        assert!(bar.contains_rect(controls), "cluster escaped narrow bar: {controls:?}");
+        let rects: Vec<_> = StatusControl::ALL
+            .into_iter()
+            .map(|control| status_control_rect(bar, control))
+            .collect();
+        assert!(rects.iter().all(|rect| bar.contains_rect(*rect)));
+        assert!(rects.windows(2).all(|pair| pair[0].right() <= pair[1].left()));
+    }
+
+    #[test]
+    fn clicking_a_status_control_toggles_the_existing_control_center() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut construct = ConstructChrome::default();
+        let segments = StatusSegments::default();
+        let grades = NodeGrades::default();
+        for _ in 0..3 {
+            let _ = drive(
+                &ctx,
+                &mut construct,
+                &segments,
+                &grades,
+                visible_env(),
+                Vec::new(),
+            );
+        }
+        let pos = ctx
+            .read_response(status_control_id(StatusControl::Volume))
+            .expect("volume control registered")
+            .rect
+            .center();
+        click(&ctx, &mut construct, &segments, &grades, pos);
+        assert!(construct.control_center_open, "volume control opens CC");
+        click(&ctx, &mut construct, &segments, &grades, pos);
+        assert!(!construct.control_center_open, "second click closes CC");
+    }
+
+    #[test]
+    fn status_controls_use_the_requested_existing_icon_identities() {
+        assert_eq!(StatusControl::Volume.icon(), IconId::Volume);
+        assert_eq!(StatusControl::Network.icon(), IconId::Signal);
+        assert_eq!(StatusControl::Brightness.icon(), IconId::DisplaySettings);
+        assert_eq!(StatusControl::ALL.len(), 3);
+    }
+
+    #[test]
     fn the_strip_hides_under_the_curtain_car_and_fullscreen_remote() {
         for env in [
             StatusBarEnv {
@@ -742,5 +964,46 @@ mod tests {
                 "a hidden strip must draw nothing at all ({env:?})"
             );
         }
+    }
+
+    #[test]
+    fn hiding_stops_paint_before_the_workspace_band_is_reclaimed() {
+        // The central workspace removes its TopBottomPanel reservation as soon
+        // as the target visibility becomes false. A prior visible frame leaves
+        // Motion::animate with a non-zero fade-out value, so this same-context
+        // transition catches any status-bar paint that would overlay the newly
+        // available workspace pixels.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut construct = ConstructChrome::default();
+        let segments = StatusSegments::default();
+        let grades = NodeGrades::default();
+
+        for _ in 0..3 {
+            let _ = drive(
+                &ctx,
+                &mut construct,
+                &segments,
+                &grades,
+                visible_env(),
+                Vec::new(),
+            );
+        }
+
+        let out = drive(
+            &ctx,
+            &mut construct,
+            &segments,
+            &grades,
+            StatusBarEnv {
+                curtain_engaged: true,
+                ..visible_env()
+            },
+            Vec::new(),
+        );
+        assert!(
+            out.shapes.is_empty(),
+            "a hidden status bar must not fade over the reclaimed workspace"
+        );
     }
 }

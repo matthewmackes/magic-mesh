@@ -16,7 +16,7 @@
 
 use std::collections::BTreeSet;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -92,6 +92,53 @@ pub fn templates_dir(root: &Path) -> PathBuf {
     root.join("jobs").join("templates")
 }
 
+/// Normalize a replicated playbook reference to the only execution namespace
+/// accepted by the job worker. Bare references are kept compatible with the
+/// original CLI and become `playbooks/<ref>`; explicit `playbooks/` references
+/// are preserved. Absolute paths, parent traversal, and dot components are
+/// refused before a path is ever handed to a backend.
+pub fn normalize_playbook_ref(raw: &str) -> Result<String, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("playbook reference is empty".into());
+    }
+    let path = Path::new(raw);
+    if path.is_absolute() {
+        return Err("playbook reference must be relative".into());
+    }
+    let components: Vec<_> = path.components().collect();
+    if components.is_empty()
+        || components.iter().any(|component| {
+            matches!(
+                component,
+                Component::CurDir
+                    | Component::ParentDir
+                    | Component::RootDir
+                    | Component::Prefix(_)
+            )
+        })
+    {
+        return Err("playbook reference contains unsafe path components".into());
+    }
+    let normalized = if components.first() == Some(&Component::Normal("playbooks".as_ref())) {
+        path.to_path_buf()
+    } else {
+        Path::new("playbooks").join(path)
+    };
+    if normalized == Path::new("playbooks") {
+        return Err("playbook reference names the playbooks directory".into());
+    }
+    Ok(normalized.to_string_lossy().into_owned())
+}
+
+/// Resolve a normalized playbook reference below the replicated playbooks
+/// directory. The worker additionally canonicalizes the result to reject a
+/// symlink that escapes that directory.
+pub fn resolve_playbook_path(root: &Path, raw: &str) -> Result<PathBuf, String> {
+    let normalized = normalize_playbook_ref(raw)?;
+    Ok(root.join(normalized))
+}
+
 /// The runs directory.
 #[must_use]
 pub fn runs_dir(root: &Path) -> PathBuf {
@@ -137,6 +184,10 @@ pub struct JobRun {
     pub run_id: String,
     /// Playbook path executed by every target (relative to the replicated `playbooks/` dir).
     pub playbook: String,
+    /// SHA-256 of the playbook bytes observed by the privileged launcher.
+    /// Legacy or unsigned runs leave this empty and are refused by executors.
+    #[serde(default)]
+    pub playbook_digest: String,
     /// Variable overrides applied for this run (merged over template defaults at launch).
     #[serde(default)]
     pub vars: std::collections::BTreeMap<String, String>,
@@ -147,6 +198,10 @@ pub struct JobRun {
     pub launched_by: String,
     /// Launch time, Unix seconds.
     pub at: u64,
+    /// Per-target, exact signed execution envelopes. A distinct capability is
+    /// minted for every target so consuming one target cannot authorize another.
+    #[serde(default)]
+    pub execution_auth: std::collections::BTreeMap<String, String>,
 }
 
 /// One target's result within a run
@@ -262,6 +317,30 @@ mod tests {
     }
 
     #[test]
+    fn playbook_refs_are_confined_to_the_replicated_playbooks_tree() {
+        assert_eq!(
+            normalize_playbook_ref("repair.yml").unwrap(),
+            "playbooks/repair.yml"
+        );
+        assert_eq!(
+            normalize_playbook_ref("playbooks/repair.yml").unwrap(),
+            "playbooks/repair.yml"
+        );
+        for hostile in [
+            "",
+            "/etc/passwd",
+            "../outside.yml",
+            "playbooks/../outside.yml",
+            "./repair.yml",
+        ] {
+            assert!(
+                normalize_playbook_ref(hostile).is_err(),
+                "accepted {hostile:?}"
+            );
+        }
+    }
+
+    #[test]
     fn templates_round_trip_through_the_store() {
         let tmp = tempfile::tempdir().unwrap();
         let tpl = JobTemplate {
@@ -287,10 +366,12 @@ mod tests {
         let run = JobRun {
             run_id: "r-1".into(),
             playbook: "playbooks/patch.yml".into(),
+            playbook_digest: String::new(),
             vars: Default::default(),
             targets: vec!["pine".into(), "oak".into()],
             launched_by: "peer:pine".into(),
             at: 100,
+            execution_auth: Default::default(),
         };
         write_run(tmp.path(), &run).unwrap();
         assert_eq!(read_run(tmp.path(), "r-1").unwrap().targets.len(), 2);

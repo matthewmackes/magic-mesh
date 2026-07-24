@@ -67,7 +67,7 @@ impl MotionMode {
 pub enum MotionPreset {
     /// Hover, focus, press, and selected/toggle micro states.
     Control,
-    /// Taskbar, drawers, sheets, and Start-like panels.
+    /// Navigation bars, drawers, sheets, and Springboard panels.
     Panel,
     /// Anchored menus, context menus, browser/site popups.
     Popover,
@@ -253,7 +253,7 @@ pub struct StatusMotion {
 }
 
 /// A **spring** — stiffness/damping for the macOS-style physical transitions the
-/// chrome uses (Start open/close, taskbar reveal, panel slides, surface switches,
+/// chrome uses (Springboard open/close, navigation reveal, panel slides, surface switches,
 /// the splash→Workbench hero expansion). Unlike the cubic [`Motion::animate`]
 /// helpers a spring carries velocity, so it settles with a natural
 /// overshoot-and-relax rather than a fixed-duration ease. [`step`](Self::step) is
@@ -268,7 +268,7 @@ pub struct Spring {
 }
 
 impl Spring {
-    /// Snappy UI spring — chrome reveals, Start open/close, taskbar slide. Fast
+    /// Snappy UI spring — chrome reveals, Springboard open/close, and navigation slide. Fast
     /// settle with only a hair of overshoot.
     pub const SNAPPY: Self = Self {
         stiffness: 220.0,

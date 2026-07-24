@@ -236,7 +236,13 @@ fn elect(paths: &[PathBuf], except: Option<&Path>, json: bool) -> ExitCode {
             return ExitCode::FAILURE;
         };
         match magic_fleet::Revision::from_yaml(&yaml) {
-            Ok(r) => revisions.push(r),
+            Ok(r) => {
+                if let Err(e) = r.validate() {
+                    eprintln!("magic-fleet: invalid revision {}: {e}", p.display());
+                    return ExitCode::FAILURE;
+                }
+                revisions.push(r);
+            }
             Err(e) => {
                 eprintln!("magic-fleet: invalid revision {}: {e}", p.display());
                 return ExitCode::FAILURE;
@@ -270,9 +276,10 @@ fn elect(paths: &[PathBuf], except: Option<&Path>, json: bool) -> ExitCode {
 /// replicated revision log (FPG-2), converge to it host-local (Q10 —
 /// no push-SSH; this node applies itself), then write this node's
 /// apply-ack into `<root>/fleet/acks/<version>/` (FPG-5 / Q14) so the
-/// author's FSM can advance to Verified. Revision authenticity rests
-/// on the Nebula transport carrying the replicated volume; `author`
-/// is advisory (Q17). The `settings` domain is skipped here — mackesd
+/// author's FSM can advance to Verified. Revision authenticity rests on the
+/// Nebula transport carrying the replicated volume; `author` is advisory
+/// (Q17), while the store rejects malformed, anonymous, and non-canonical
+/// revision files before election. The `settings` domain is skipped here — mackesd
 /// applies settings natively (FPG-1/Q9).
 fn reconcile(
     root: Option<PathBuf>,

@@ -909,6 +909,8 @@ impl WorkloadsState {
             self.note = Some("Typed confirmation did not match; nothing was sent.".to_string());
             return;
         }
+        let requires_apply_capability =
+            matches!(&action, ArmAction::Provision | ArmAction::Configure);
         let (verb, node, target, body, label) = match action {
             ArmAction::Provision => {
                 let Some(node) = self.require_selected_node("live provision") else {
@@ -961,6 +963,14 @@ impl WorkloadsState {
                 ..
             } => (verb, node, target, body, label),
         };
+        if requires_apply_capability && !self.selected_node_apply_armed() {
+            self.note = Some(
+                "Live apply is unavailable: the selected node is plan-only or no longer \
+                 reports an armed-apply capability. Nothing was sent."
+                    .to_string(),
+            );
+            return;
+        }
         match self.authorize_body(&body, verb, &node, &target) {
             Ok(body) => self.issue(verb, Some(&body), &label),
             Err(error) => self.note = Some(format!("{error} Nothing was sent.")),
@@ -982,6 +992,14 @@ impl WorkloadsState {
     /// Open the typed-arming confirm for a live provision **apply** (#RUN-006 —
     /// nothing publishes until the echo matches).
     pub(super) fn arm_provision(&mut self) {
+        if !self.selected_node_apply_armed() {
+            self.note = Some(
+                "Live provision is unavailable: the selected node is plan-only or no longer \
+                 reports an armed-apply capability."
+                    .to_string(),
+            );
+            return;
+        }
         self.arming = Some(Arming {
             action: ArmAction::Provision,
             typed: String::new(),
@@ -997,6 +1015,14 @@ impl WorkloadsState {
 
     /// Open the typed-arming confirm for a live configuration **apply**.
     pub(super) fn arm_configure(&mut self) {
+        if !self.selected_node_apply_armed() {
+            self.note = Some(
+                "Live configuration is unavailable: the selected node is plan-only or no longer \
+                 reports an armed-apply capability."
+                    .to_string(),
+            );
+            return;
+        }
         self.arming = Some(Arming {
             action: ArmAction::Configure,
             typed: String::new(),
@@ -1029,14 +1055,25 @@ impl WorkloadsState {
     /// attributed honestly rather than guessed. The roster rows' Console button
     /// calls this instead of the generic direct-issue seam.
     pub(super) fn issue_console_attach(&mut self, node: &str, instance_id: &str, name: &str) {
-        if node.trim().is_empty() {
+        let node = node.trim();
+        let instance_id = instance_id.trim();
+        let name = name.trim();
+        if node.is_empty() {
             self.note = Some(format!(
                 "Could not request console on {name}: the workload has no placement node."
             ));
             return;
         }
+        if instance_id.is_empty() || name.is_empty() {
+            self.note = Some(
+                "Could not request console: the workload identity is incomplete (instance and \
+                 name are required). Nothing was sent."
+                    .to_string(),
+            );
+            return;
+        }
         self.console_target = Some(name.to_string());
-        let body = lifecycle_request_body(node.trim(), instance_id, None);
+        let body = lifecycle_request_body(node, instance_id, None);
         self.arm_prepared(
             "console-attach",
             node.trim().to_string(),
@@ -1063,6 +1100,16 @@ impl WorkloadsState {
         if node.is_empty() {
             self.note = Some(format!(
                 "Could not arm {} on {name}: the workload has no placement node.",
+                verb_label(verb)
+            ));
+            return;
+        }
+        let instance_id = instance_id.trim();
+        let name = name.trim();
+        if instance_id.is_empty() || name.is_empty() {
+            self.note = Some(format!(
+                "Could not arm {}: the workload identity is incomplete (instance and name are \
+                 required). Nothing was sent.",
                 verb_label(verb)
             ));
             return;
@@ -1152,6 +1199,19 @@ impl WorkloadsState {
     /// The placement node the provision panel targets, if one is chosen.
     pub(super) fn selected_node(&self) -> Option<&str> {
         self.selected_node.as_deref()
+    }
+
+    /// Whether the selected placement node currently reports the armed-token
+    /// capability needed for a live provision. A missing node or a stale
+    /// selection fails closed; plan-only nodes must not open a live-apply arm.
+    pub(super) fn selected_node_apply_armed(&self) -> bool {
+        let Some(selected) = self.selected_node.as_deref() else {
+            return false;
+        };
+        self.states
+            .iter()
+            .find(|state| state.host == selected)
+            .is_some_and(|state| state.apply_armed)
     }
 
     /// Queue an immediate re-fold of the `state/cloud` mirror.
@@ -1448,40 +1508,6 @@ fn render_arming(ui: &mut egui::Ui, state: &mut WorkloadsState) {
 
 // ─────────────────────────── shared panel-body helpers ──────────────────────
 
-/// The honest **not yet built** stub every seam panel renders for its
-/// unimplemented body (§7) — a Workloads-accent glyph + `<unit> · <what>` +
-/// the honest reason. Downstream (U14–U19) replaces the panel's body with the
-/// real render; the backend (WL-ARCH-001) is already live behind the Bus.
-pub(super) fn workloads_pending(ui: &mut egui::Ui, unit: &str, what: &str) {
-    egui::Frame::group(ui.style())
-        .fill(Style::SURFACE_HI)
-        .stroke(egui::Stroke::new(Style::STROKE_HAIRLINE, Style::BORDER))
-        .corner_radius(Style::RADIUS_S)
-        .shadow(card_shadow())
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.scope(|ui| {
-                    ui.visuals_mut().override_text_color = Some(Style::ACCENT_WORKLOADS);
-                    carbon_icon(ui, "view-grid", Style::ICON_S);
-                });
-                ui.add_space(Style::SP_XS);
-                ui.label(
-                    RichText::new(format!("{unit} \u{00B7} {what}"))
-                        .size(Style::BODY)
-                        .strong()
-                        .color(Style::TEXT),
-                );
-            });
-            mde_egui::muted_note(
-                ui,
-                "This cockpit panel is a seam stub \u{2014} not yet built. The Workloads backend \
-                 (OpenTofu + Ansible + libvirt + Podman) is live behind the Bus; this surface \
-                 panel lands with its build unit.",
-            );
-        });
-    ui.add_space(Style::SP_S);
-}
-
 /// An honest one-line summary of the folded `state/cloud` mirror — the shared
 /// context line the stub panels show so the seam's live data flow is visible
 /// even before a panel's body lands.
@@ -1585,116 +1611,6 @@ pub(super) fn render_audit(ui: &mut egui::Ui, audit: &[AuditEntry]) {
                 RichText::new(format!("\u{2014} {}", entry.detail)).size(Style::SMALL),
             );
         });
-    }
-}
-
-/// Render one delivery view's live roster — the U3 seam the five U16 view files
-/// share: the view heading, each matching [`WorkloadRow`] from the mirror with
-/// its inline lifecycle verbs (Start/Stop direct, Reboot…/Delete… armed), and an
-/// honest note that the rich per-type body is U16. An empty roster reads
-/// honestly (§7), never fabricated.
-pub(super) fn roster(ui: &mut egui::Ui, state: &mut WorkloadsState, view: DeliveryView) {
-    view_heading(ui, view);
-
-    // Snapshot the matching rows so the immutable mirror borrow ends before the
-    // lifecycle verbs take `&mut state`.
-    let rows: Vec<WorkloadRow> = state.workloads_of(view).cloned().collect();
-    if rows.is_empty() {
-        crate::empty_state::show(
-            ui,
-            "No workloads of this type yet",
-            "This delivery-type roster fills once a placement node reports a matching workload in \
-             its state/cloud mirror.",
-        );
-    } else {
-        for row in &rows {
-            workload_row(ui, state, row);
-        }
-    }
-
-    mde_egui::muted_note(
-        ui,
-        "U16 \u{2014} the rich per-type view (live metrics, drift, console attach) lands with its \
-         build unit.",
-    );
-}
-
-/// A delivery-view heading — the view's icon + label + the placement blurb.
-fn view_heading(ui: &mut egui::Ui, view: DeliveryView) {
-    ui.horizontal(|ui| {
-        ui.scope(|ui| {
-            ui.visuals_mut().override_text_color = Some(Style::ACCENT_WORKLOADS);
-            carbon_icon(ui, view.icon(), Style::ICON_S);
-        });
-        ui.add_space(Style::SP_XS);
-        ui.label(
-            RichText::new(view.label())
-                .size(Style::BODY)
-                .strong()
-                .color(Style::ACCENT_WORKLOADS),
-        );
-    });
-    mde_egui::muted_note(
-        ui,
-        "Workloads of this delivery type, placed on their mesh nodes.",
-    );
-    ui.add_space(Style::SP_S);
-}
-
-/// One workload roster row — its name · status · node, then the inline lifecycle
-/// verbs wired to the preserved seams (destructive ones typed-armed).
-fn workload_row(ui: &mut egui::Ui, state: &mut WorkloadsState, row: &WorkloadRow) {
-    egui::Frame::group(ui.style())
-        .shadow(card_shadow())
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(&row.name)
-                        .size(Style::BODY)
-                        .strong()
-                        .color(Style::TEXT),
-                );
-                ui.add_space(Style::SP_S);
-                ui.colored_label(
-                    Style::TEXT_DIM,
-                    RichText::new(&row.status).size(Style::SMALL),
-                );
-                ui.add_space(Style::SP_S);
-                ui.colored_label(
-                    Style::TEXT_DIM,
-                    RichText::new(format!("on {}", row.node)).size(Style::SMALL),
-                );
-            });
-            ui.add_space(Style::SP_XS);
-            ui.horizontal(|ui| {
-                if row_button(ui, "Start", false).clicked() {
-                    state.issue_lifecycle_direct("instance-start", &row.node, &row.name, &row.name);
-                }
-                if row_button(ui, "Stop", false).clicked() {
-                    state.issue_lifecycle_direct("instance-stop", &row.node, &row.name, &row.name);
-                }
-                if row_button(ui, "Reboot\u{2026}", true).clicked() {
-                    state.arm_lifecycle("instance-reboot", &row.node, &row.name, &row.name);
-                }
-                if row_button(ui, "Delete\u{2026}", true).clicked() {
-                    state.arm_lifecycle("instance-delete", &row.node, &row.name, &row.name);
-                }
-            });
-        });
-    ui.add_space(Style::SP_S);
-}
-
-/// The shared **Raised** depth token the workspace's cards cast (Phase-C depth
-/// adoption): every field comes straight from the token (offset/blur/spread + the
-/// translucent umbra colour, no minted `Color32`, §4), so the cards read as
-/// genuinely lifted.
-fn card_shadow() -> egui::Shadow {
-    let token = mde_egui::style::Elevation::Raised.shadow();
-    egui::Shadow {
-        offset: [token.offset[0] as i8, token.offset[1] as i8],
-        blur: token.blur as u8,
-        spread: token.spread as u8,
-        color: token.umbra,
     }
 }
 

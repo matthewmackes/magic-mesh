@@ -702,9 +702,9 @@ impl HostStateWorker {
     }
 }
 
-/// The default Bus root (same shape the other bus workers use).
+/// The shared Bus root used by the daemon and desktop publishers.
 fn default_bus_root() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join("mde").join("bus"))
+    mde_bus::default_data_dir()
 }
 
 /// Monotonic-ish wall clock in ms for the two-phase deadlines (a coarse clock is
@@ -1022,6 +1022,60 @@ mod tests {
     }
 
     // ── the Bus I/O pass (mirror + authorize over a temp Bus) ──────────────────
+
+    #[test]
+    fn shared_bus_root_resolver_covers_authenticated_apply_forwarding() {
+        struct BusRootEnvGuard {
+            previous: Option<std::ffi::OsString>,
+        }
+
+        impl Drop for BusRootEnvGuard {
+            fn drop(&mut self) {
+                match self.previous.take() {
+                    Some(value) => std::env::set_var("MDE_BUS_ROOT", value),
+                    None => std::env::remove_var("MDE_BUS_ROOT"),
+                }
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _env_guard = BusRootEnvGuard {
+            previous: std::env::var_os("MDE_BUS_ROOT"),
+        };
+        std::env::set_var("MDE_BUS_ROOT", temp.path());
+
+        let persist = Persist::open(temp.path().to_path_buf()).expect("open shared bus");
+        let signer = Arc::new(HmacTokenSigner::new(b"host-state-shared-root-key".to_vec()));
+        let request = req(
+            HostVerb::Volume {
+                strip: "master".into(),
+                level: 20,
+            },
+            Phase::Confirm,
+        );
+        let body = armed_body(
+            &request,
+            "nodeA",
+            "host-shared-root-apply-nonce",
+            i64::try_from(now_ms()).unwrap().saturating_add(30_000),
+            signer.as_ref(),
+        );
+        persist
+            .write(&action_topic("nodeA"), Priority::Default, None, Some(&body))
+            .expect("publish authenticated action");
+
+        let mut worker = HostStateWorker::new(temp.path().to_path_buf(), "nodeA".into())
+            .with_authorization(signer, temp.path().join("auth"));
+        assert_eq!(worker.bus_root.as_deref(), Some(temp.path()));
+        worker.poll_once(&persist);
+
+        let applied = persist.list_since(APPLY_TOPIC, None).unwrap();
+        assert_eq!(applied.len(), 1);
+        assert!(applied[0]
+            .body
+            .as_deref()
+            .is_some_and(|body| body.contains("\"level\":20")));
+    }
 
     #[test]
     fn poll_once_mirrors_the_snapshot_and_forwards_an_approved_verb() {

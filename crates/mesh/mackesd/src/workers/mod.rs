@@ -456,7 +456,7 @@ pub mod compute_event_toast;
 pub mod netassess;
 // MESH-A-4.c.2 (v5.0.0) — surrounding_worker. Sweeps the LAN for
 // non-mesh-peer neighbours (mDNS + ARP-MAC + OUI) every 10 min and
-// writes a per-peer snapshot under ~/.local/share/mde/surrounding/.
+// writes a per-peer snapshot under <workgroup-root>/surrounding/.
 pub mod surrounding_worker;
 // VOIP-4.b (v5.0.0) — voip_rtt_worker. Broadcasts this peer's Vitelity-link
 // RTT to voip/link-rtt/<peer> every 60s for the dialer route override.
@@ -474,7 +474,7 @@ pub mod mesh_firewall;
 // nebula_supervisor::render_guest_config_yaml.
 pub mod compute_provision;
 // INST-11 + INST-12 + INST-13 (v2.7) — fleet upgrade-barrier
-// worker. Runs on every peer: watches `<mesh-home>/upgrade-
+// worker. Runs on every peer: watches signed `<mesh-home>/upgrade-
 // intent/*.json` (written by `mde-update --coordinate`), runs
 // `dnf upgrade mde-core` on its own schedule + marks itself
 // `ready`, fires `mde-install --yes` once quorum + grace are
@@ -522,6 +522,11 @@ pub mod device_inventory;
 // display/power) behind the allowlist + safety interlocks. Runs on every
 // node; spawned in run_serve.
 pub mod host_state;
+// WL-FUNC-012 / MG90 airspace — bounded typed survey adapter. The production
+// constructor has no guessed endpoint; a proven MG90 probe is injected when
+// the physical survey protocol is available.
+#[cfg(feature = "async-services")]
+pub mod airspace;
 // WL-FUNC-012 / OVERLAY-7 — credential-gated US EPA AirNow AQI stations.
 #[cfg(feature = "async-services")]
 pub mod air_quality_overlay;
@@ -530,6 +535,11 @@ pub mod air_quality_overlay;
 pub mod iem_radar_overlay;
 pub mod traffic_overlay;
 pub mod wildfire_overlay;
+// WL-FUNC-012 / OVERLAY-6 — credential-gated NASA FIRMS near-real-time
+// hotspot points.  This publishes a separate latest-wins snapshot from the
+// NIFC perimeter lane so the two providers can fail independently.
+#[cfg(feature = "async-services")]
+pub mod firms_overlay;
 // notification_relay retired in BUS-4.2 (2026-05-26). Cross-peer
 // notification routing is now handled by the BUS-4.4 FDO bridge:
 // every Notify call publishes to `fdo/<app>` on the Mackes Bus,

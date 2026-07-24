@@ -658,11 +658,11 @@ fn drain_refresh_triggers(bus_root: &Path, cursor: &mut Option<String>) -> usize
     valid
 }
 
-/// Resolve the Bus root (`~/.local/share/mde/bus`) for the refresh
-/// subscriber. `None` when no data dir resolves — the subscriber then
+/// Resolve the daemon Bus root through [`mde_bus::default_data_dir`] for the
+/// refresh subscriber. `None` when no data dir resolves — the subscriber then
 /// stays idle and only the hourly tick runs.
 fn default_bus_root() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join("mde").join("bus"))
+    mde_bus::default_data_dir()
 }
 
 /// Worker handle.
@@ -1318,5 +1318,10 @@ mod tests {
         let ips: Vec<&str> = t.iter().map(|(ip, _)| ip.as_str()).collect();
         assert_eq!(ips, vec!["10.42.0.6", "10.42.0.7"]);
         assert!(!ips.contains(&"10.42.0.5"), "self must be excluded");
+    }
+
+    #[test]
+    fn default_bus_root_uses_the_shared_mde_bus_resolver() {
+        assert_eq!(default_bus_root(), mde_bus::default_data_dir());
     }
 }

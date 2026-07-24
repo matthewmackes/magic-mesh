@@ -48,10 +48,9 @@ pub fn issue(workgroup_root: &Path, note: &str) -> io::Result<String> {
             .map_or(0, |d| d.as_millis() as u64),
         "note": note,
     });
-    std::fs::write(
-        dir.join(format!("{}.json", hash_hex(&bearer))),
-        entry.to_string(),
-    )?;
+    let path = dir.join(format!("{}.json", hash_hex(&bearer)));
+    crate::ca::seal::write_atomic_sealed(&path, entry.to_string().as_bytes())
+        .map_err(|e| io::Error::other(e.to_string()))?;
     Ok(bearer)
 }
 
@@ -63,18 +62,18 @@ pub fn issue(workgroup_root: &Path, note: &str) -> io::Result<String> {
 pub fn record_issued(workgroup_root: &Path, bearer: &str) -> io::Result<()> {
     let dir = ledger_dir(workgroup_root);
     std::fs::create_dir_all(&dir)?;
-    std::fs::write(
-        dir.join(format!("{}.json", hash_hex(bearer))),
-        "{\"issued_at_ms\":0,\"note\":\"recorded\"}",
-    )
+    let path = dir.join(format!("{}.json", hash_hex(bearer)));
+    crate::ca::seal::write_atomic_sealed(&path, b"{\"issued_at_ms\":0,\"note\":\"recorded\"}")
+        .map_err(|e| io::Error::other(e.to_string()))
 }
 
 /// Is `bearer` issued and not yet redeemed?
 #[must_use]
 pub fn is_pending(workgroup_root: &Path, bearer: &str) -> bool {
-    ledger_dir(workgroup_root)
-        .join(format!("{}.json", hash_hex(bearer)))
-        .exists()
+    let path = ledger_dir(workgroup_root).join(format!("{}.json", hash_hex(bearer)));
+    std::fs::symlink_metadata(path)
+        .map(|meta| meta.file_type().is_file())
+        .unwrap_or(false)
 }
 
 /// The note marker that scopes a bearer to a **lighthouse** join (set by
@@ -90,7 +89,9 @@ pub const LIGHTHOUSE_ROLE_NOTE: &str = "role:lighthouse";
 #[must_use]
 pub fn is_lighthouse_bearer(workgroup_root: &Path, bearer: &str) -> bool {
     let path = ledger_dir(workgroup_root).join(format!("{}.json", hash_hex(bearer)));
-    let Ok(body) = std::fs::read_to_string(&path) else {
+    let Ok(body) = crate::ca::seal::read_no_follow(&path).and_then(|bytes| {
+        String::from_utf8(bytes).map_err(|e| crate::ca::CaError::Io(e.to_string()))
+    }) else {
         return false;
     };
     serde_json::from_str::<serde_json::Value>(&body)
@@ -124,8 +125,14 @@ pub fn is_lighthouse_bearer(workgroup_root: &Path, bearer: &str) -> bool {
 /// winner proceeds.
 #[must_use]
 pub fn consume(workgroup_root: &Path, bearer: &str) -> bool {
-    std::fs::remove_file(ledger_dir(workgroup_root).join(format!("{}.json", hash_hex(bearer))))
-        .is_ok()
+    let path = ledger_dir(workgroup_root).join(format!("{}.json", hash_hex(bearer)));
+    if !std::fs::symlink_metadata(&path)
+        .map(|meta| meta.file_type().is_file())
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    std::fs::remove_file(path).is_ok()
 }
 
 /// Redeem `bearer` — single-use: returns `true` exactly once per
@@ -267,5 +274,28 @@ mod tests {
             !is_lighthouse_bearer(tmp.path(), &lh),
             "a spent bearer → false (single-use)"
         );
+    }
+
+    #[test]
+    fn record_issued_replaces_a_hostile_symlink_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let bearer = "known-bearer";
+        let dir = ledger_dir(tmp.path());
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = tmp.path().join("victim");
+        std::fs::write(&victim, b"do-not-touch").unwrap();
+        let entry = dir.join(format!("{}.json", hash_hex(bearer)));
+        symlink(&victim, &entry).unwrap();
+
+        record_issued(tmp.path(), bearer).expect("atomic ledger replace");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"do-not-touch");
+        assert!(entry.is_file());
+        assert!(!std::fs::symlink_metadata(&entry)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(is_pending(tmp.path(), bearer));
     }
 }

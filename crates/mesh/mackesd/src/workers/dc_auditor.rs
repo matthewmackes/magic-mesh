@@ -247,12 +247,10 @@ impl DcAuditor {
 /// [`crate::proc_reap`] reaper thread) per record. Byte-identical stored row to
 /// the old `mde-bus publish <topic> --body-flag <body>`.
 ///
-/// The publish targets [`crate::bus_publish::default_bus_root`] (which honours
-/// `MDE_BUS_ROOT`) — the SAME root the fork+exec'd CLI resolved via the
-/// inherited environment. This is deliberately NOT the worker's own
-/// [`default_bus_root`] READ root (`dirs::data_dir()`-based, MDE_BUS_ROOT-blind):
-/// on the live daemon (`mackesd.service` pins `MDE_BUS_ROOT=/run/mde-bus`) the
-/// two diverge, and the CLI published to the MDE_BUS_ROOT spool.
+/// The publish and read paths both target [`mde_bus::default_data_dir`], the
+/// same resolver the fork+exec'd CLI uses via the inherited `MDE_BUS_ROOT`
+/// environment. Keeping the observer on that canonical root is required for
+/// the live daemon, whose service pins the shared `/run/mde-bus` spool.
 fn publish(rec: &AuditRecord) {
     publish_to(crate::bus_publish::default_bus_root().as_deref(), rec);
 }
@@ -298,7 +296,7 @@ fn poll_and_audit(persist: &Persist, core: &mut DcAuditor) {
 }
 
 fn default_bus_root() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join("mde").join("bus"))
+    mde_bus::default_data_dir()
 }
 
 /// The supervised worker. Leader-gated (only the elected node writes the audit

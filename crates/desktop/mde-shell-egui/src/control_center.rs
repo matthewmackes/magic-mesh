@@ -49,7 +49,9 @@
 
 use mde_egui::egui;
 use mde_egui::motion::Spring;
-use mde_egui::{paint_carbon, LayoutProfile, Motion, OsdLevel, Style};
+use mde_egui::{
+    paint_carbon, LayoutProfile, Motion, OsdLevel, Style, TypographyRole,
+};
 use mde_files_egui::model::OperationProgressSummary;
 use mde_files_egui::FileBrowser;
 use mde_seat::hotkeys::HotkeyAction;
@@ -268,7 +270,7 @@ enum CcAction {
 struct Tile {
     /// The action glyph.
     glyph: Glyph,
-    /// The `TYPE_FOOTNOTE` title line.
+    /// The compact interactive label line.
     title: &'static str,
     /// The dimmed caption line (live state or the route's description).
     caption: String,
@@ -770,6 +772,24 @@ fn paint_meter(painter: &egui::Painter, rect: egui::Rect, fraction: f32, tint: e
     painter.rect_filled(fill, Style::RADIUS_S, tint);
 }
 
+/// Paint a semantic typography role at the same anchor coordinates used by
+/// the control-center's original painter text calls. Keeping the anchor math
+/// local preserves the existing hit-target and layout geometry while allowing
+/// the shared role to provide the font, tracking, and line-height contract.
+fn paint_typography(
+    painter: &egui::Painter,
+    pos: egui::Pos2,
+    anchor: egui::Align2,
+    text: impl Into<String>,
+    role: TypographyRole,
+    color: egui::Color32,
+) -> egui::Rect {
+    let galley = painter.layout_job(Style::typography_job(text, role, color, f32::INFINITY));
+    let rect = anchor.anchor_size(pos, galley.size());
+    painter.galley(rect.min, galley, color);
+    rect
+}
+
 /// A level row's shared frame: lead glyph, label, meter, − / + steppers.
 /// Returns `(lead_clicked, minus_clicked, plus_clicked)`.
 fn level_row(
@@ -819,11 +839,12 @@ fn level_row(
     // Label over the meter, between the glyph and the steppers.
     let left = lead.right() + Style::SP_S;
     let right = minus.left() - Style::SP_S;
-    ui.painter().text(
+    paint_typography(
+        ui.painter(),
         egui::pos2(left, rect.top() + Style::SP_XS),
         egui::Align2::LEFT_TOP,
         label,
-        egui::FontId::proportional(Style::TYPE_FOOTNOTE),
+        TypographyRole::Label,
         text,
     );
     paint_meter(
@@ -957,21 +978,23 @@ fn tile_cell(ui: &egui::Ui, rect: egui::Rect, idx: usize, tile: &Tile) -> bool {
     );
     paint_glyph(ui, glyph_rect, tile.glyph, text);
     let text_x = glyph_rect.right() + Style::SP_S;
-    ui.painter().text(
+    paint_typography(
+        ui.painter(),
         egui::pos2(text_x, rect.top() + Style::SP_S),
         egui::Align2::LEFT_TOP,
         tile.title,
-        egui::FontId::proportional(Style::TYPE_FOOTNOTE),
+        TypographyRole::Label,
         text,
     );
-    ui.painter().text(
+    paint_typography(
+        ui.painter(),
         egui::pos2(
             text_x,
-            rect.top() + Style::SP_S + Style::TYPE_FOOTNOTE + Style::SP_XS,
+            rect.top() + Style::SP_S + TypographyRole::Label.size() + Style::SP_XS,
         ),
         egui::Align2::LEFT_TOP,
         &tile.caption,
-        egui::FontId::proportional(Style::TYPE_FOOTNOTE),
+        TypographyRole::Caption,
         Style::resolve_color(ctx, Style::TEXT_DIM),
     );
     if let Some(tone) = tile.tone {
@@ -994,7 +1017,8 @@ fn session_list(
     total: usize,
 ) -> (Option<CcAction>, f32) {
     let ctx = ui.ctx();
-    ui.painter().text(
+    paint_typography(
+        ui.painter(),
         egui::pos2(inner.left(), top),
         egui::Align2::LEFT_TOP,
         if total > sessions.len() {
@@ -1002,7 +1026,7 @@ fn session_list(
         } else {
             "Sessions".to_owned()
         },
-        egui::FontId::proportional(Style::TYPE_FOOTNOTE),
+        TypographyRole::Caption,
         Style::resolve_color(ctx, Style::TEXT_DIM),
     );
     let mut y = top + HEADER_H;
@@ -1026,18 +1050,20 @@ fn session_list(
             egui::vec2(Style::SP_M, Style::SP_M),
         );
         paint_glyph(ui, glyph_rect, Glyph::Carbon("view"), text);
-        ui.painter().text(
+        paint_typography(
+            ui.painter(),
             egui::pos2(glyph_rect.right() + Style::SP_S, rect.center().y),
             egui::Align2::LEFT_CENTER,
             &session.label,
-            egui::FontId::proportional(Style::TYPE_FOOTNOTE),
+            TypographyRole::Label,
             text,
         );
-        ui.painter().text(
+        paint_typography(
+            ui.painter(),
             egui::pos2(rect.right() - Style::SP_S, rect.center().y),
             egui::Align2::RIGHT_CENTER,
             session.badge,
-            egui::FontId::proportional(Style::TYPE_FOOTNOTE),
+            TypographyRole::Caption,
             Style::resolve_color(ctx, Style::TEXT_DIM),
         );
         install_button_accessibility(ctx, id, rect, &session.label);
@@ -1086,11 +1112,12 @@ fn file_ops_row(ui: &egui::Ui, rect: egui::Rect, model: &FileOpModel) -> Option<
     } else {
         format!("{} - {} operations", model.label, model.active)
     };
-    ui.painter().text(
+    paint_typography(
+        ui.painter(),
         egui::pos2(left, rect.top() + Style::SP_XS),
         egui::Align2::LEFT_TOP,
         label,
-        egui::FontId::proportional(Style::TYPE_FOOTNOTE),
+        TypographyRole::Label,
         text,
     );
     let meter = egui::Rect::from_min_max(
@@ -1107,11 +1134,12 @@ fn file_ops_row(ui: &egui::Ui, rect: egui::Rect, model: &FileOpModel) -> Option<
                 0.0,
                 Style::resolve_color(ctx, Style::ACCENT),
             );
-            ui.painter().text(
+            paint_typography(
+                ui.painter(),
                 egui::pos2(rect.right() - Style::SP_S, rect.top() + Style::SP_XS),
                 egui::Align2::RIGHT_TOP,
                 "starting",
-                egui::FontId::proportional(Style::TYPE_FOOTNOTE),
+                TypographyRole::Caption,
                 Style::resolve_color(ctx, Style::TEXT_DIM),
             );
         },

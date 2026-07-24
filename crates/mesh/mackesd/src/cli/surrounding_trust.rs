@@ -17,11 +17,7 @@ pub fn run(key: String, state: String) -> anyhow::Result<()> {
                 std::process::exit(1);
             }
         };
-        let Some(data_dir) = dirs::data_dir() else {
-            eprintln!("error: no XDG data dir");
-            std::process::exit(1);
-        };
-        let path = data_dir.join("mde").join("surrounding").join("trust.json");
+        let path = mackesd_core::surrounding_hosts::default_surrounding_root().join("trust.json");
         match set_host_trust(&path, &key, ts) {
             Ok(_) => println!("{key}\t{}", ts.wire_name()),
             Err(e) => {

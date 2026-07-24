@@ -686,16 +686,42 @@ impl NwsForecastOverlayWorker {
         }
     }
 
+    fn degraded_snapshot(
+        &self,
+        last_good: Option<&NwsForecastSnapshot>,
+        reason: &str,
+    ) -> NwsForecastSnapshot {
+        // A worker restart has no in-memory cache, but the Bus may still hold
+        // the prior location's forecast. Use it only to publish a cleared
+        // degraded state; never expose its samples as current data.
+        let persisted = self.bus_root.clone().and_then(|root| {
+            let persist = mde_bus::persist::Persist::open(root).ok()?;
+            let body = persist
+                .read_latest(&nws_forecast_state_topic(&self.host))
+                .ok()
+                .flatten()?
+                .body?;
+            serde_json::from_str::<NwsForecastSnapshot>(&body).ok()
+        });
+        let mut degraded = last_good
+            .cloned()
+            .or(persisted)
+            .unwrap_or_else(|| NwsForecastSnapshot::unavailable(&self.host, reason));
+        degraded.samples.clear();
+        degraded.feed_generated_at_ms = None;
+        degraded.query_latitude = None;
+        degraded.query_longitude = None;
+        degraded.heading_deg = None;
+        degraded
+            .gaps
+            .retain(|gap| !gap.starts_with("NWS forecast paused:"));
+        push_gap(&mut degraded.gaps, format!("NWS forecast paused: {reason}"));
+        degraded
+    }
+
     fn publish_unavailable(&self, last_good: &mut Option<NwsForecastSnapshot>, reason: &str) {
-        if let Some(snapshot) = last_good {
-            snapshot
-                .gaps
-                .retain(|gap| !gap.starts_with("NWS forecast paused:"));
-            push_gap(&mut snapshot.gaps, format!("NWS forecast paused: {reason}"));
-            self.publish(snapshot);
-        } else {
-            self.publish(&NwsForecastSnapshot::unavailable(&self.host, reason));
-        }
+        let degraded = self.degraded_snapshot(last_good.as_ref(), reason);
+        self.publish(&degraded);
     }
 
     fn apply_result(
@@ -1153,12 +1179,54 @@ mod tests {
             .expect("last")
             .gaps
             .iter()
-            .any(|gap| gap.contains("fresh same-host")));
+            .all(|gap| !gap.contains("fresh same-host")));
         let persist = Persist::open(root).expect("bus");
         let rows = persist
             .list_since(&nws_forecast_state_topic("rig-1"), None)
             .expect("read");
         assert_eq!(rows.len(), 3);
+        let degraded: NwsForecastSnapshot = serde_json::from_str(
+            rows.last()
+                .and_then(|row| row.body.as_deref())
+                .expect("degraded body"),
+        )
+        .expect("degraded snapshot");
+        assert!(degraded.samples.is_empty());
+        assert!(degraded
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("fresh same-host")));
+
+        let restart_root = tempfile::tempdir().expect("restart root");
+        let seed_worker = NwsForecastOverlayWorker::new("rig-1".to_string())
+            .with_bus_root(Some(restart_root.path().to_path_buf()));
+        let mut seed_cache = None;
+        seed_worker.apply_result(
+            Ok(build_snapshot(
+                &FakeProbe::captured(),
+                "rig-1",
+                context(),
+                NOW_MS,
+            )
+            .expect("restart seed")),
+            &mut seed_cache,
+        );
+        let restarted = NwsForecastOverlayWorker::new("rig-1".to_string())
+            .with_bus_root(Some(restart_root.path().to_path_buf()));
+        let mut restart_cache = None;
+        restarted.publish_unavailable(&mut restart_cache, "no fresh fix after restart");
+        let latest: NwsForecastSnapshot = serde_json::from_str(
+            Persist::open(restart_root.path().to_path_buf())
+                .expect("restart bus")
+                .read_latest(&nws_forecast_state_topic("rig-1"))
+                .expect("restart read")
+                .expect("restart message")
+                .body
+                .as_deref()
+                .expect("restart body"),
+        )
+        .expect("restart degraded snapshot");
+        assert!(latest.samples.is_empty());
     }
 
     #[test]

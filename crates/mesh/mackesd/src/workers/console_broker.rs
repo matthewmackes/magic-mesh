@@ -54,16 +54,22 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use mackes_mesh_types::cloud::CloudArmedToken;
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 
+use super::cloud::{
+    claim_nonce, verify_token, HmacTokenSigner, NullSigner, TokenSigner, DEFAULT_AUTH_ROOT,
+};
 use super::desktop_sources::DesktopProtocol;
 use super::proc::{output_with_timeout, DEFAULT_CMD_TIMEOUT};
 use super::scheduler::NodeId;
 use super::session_broker::{parse_request, SessionId, SessionRequest, VmId};
 use super::{ShutdownToken, Worker};
+use crate::ipc::action_auth::{MutationContext, ACTION_SCHEMA_VERSION, MAX_AUTH_TTL_MS};
 
 /// The session-lifecycle topic this worker folds (the same log
 /// [`super::session_broker`] drains). Two independent cursors on one
@@ -524,9 +530,147 @@ struct BrokerEntry {
     _relay: Option<RelayHandle>,
 }
 
+/// The console broker is a second consumer of `action/vdi/session`, independent
+/// of [`super::session_broker`]. It therefore verifies the same versioned,
+/// exact-body HMAC capability before it can resolve a VM or change a relay.
+///
+/// Its replay ledger is deliberately namespaced below the host-local cloud auth
+/// root. Both consumers must accept the one capability minted for a session
+/// action; sharing the nonce ledger would make the first consumer to see the
+/// replicated message consume the token and silently disable the other consumer.
+struct ConsoleAuthorizer {
+    verifier: Arc<dyn TokenSigner>,
+    auth_root: PathBuf,
+    now: Arc<dyn Fn() -> i64 + Send + Sync>,
+}
+
+impl std::fmt::Debug for ConsoleAuthorizer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConsoleAuthorizer")
+            .field("auth_root", &self.auth_root)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ConsoleAuthorizer {
+    fn production() -> Self {
+        let verifier: Arc<dyn TokenSigner> = match HmacTokenSigner::from_systemd_credential() {
+            Ok(verifier) => Arc::new(verifier),
+            Err(error) => {
+                tracing::error!(
+                    target: "mackesd::console_broker",
+                    %error,
+                    "console-broker authorization unavailable; session relay mutations are disabled"
+                );
+                Arc::new(NullSigner)
+            }
+        };
+        Self {
+            verifier,
+            auth_root: PathBuf::from(DEFAULT_AUTH_ROOT).join("console-broker"),
+            now: Arc::new(wall_now_ms),
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test(key: &[u8], auth_root: PathBuf, now_ms: i64) -> Self {
+        Self {
+            verifier: Arc::new(HmacTokenSigner::new(key.to_vec())),
+            auth_root,
+            now: Arc::new(move || now_ms),
+        }
+    }
+
+    fn authorize(&self, body: &str, context: MutationContext<'_>) -> Result<(), String> {
+        if !crate::ipc::body_within_cap(Some(body)) {
+            return Err("request body exceeds the 64 KiB cap".to_string());
+        }
+        let envelope: serde_json::Value = serde_json::from_str(body)
+            .map_err(|_| "request body is not a JSON object".to_string())?;
+        let object = envelope
+            .as_object()
+            .ok_or_else(|| "request body is not a JSON object".to_string())?;
+        if object
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            != Some(ACTION_SCHEMA_VERSION)
+        {
+            return Err(format!(
+                "privileged action requires schema_version {ACTION_SCHEMA_VERSION}"
+            ));
+        }
+        let raw_token = object
+            .get("armed_token")
+            .and_then(serde_json::Value::as_str);
+        let now = (self.now)();
+        let verdict = verify_token(
+            raw_token,
+            context.verb,
+            context.node,
+            context.target,
+            body,
+            now,
+            self.verifier.as_ref(),
+        );
+        if !verdict.is_valid() {
+            return Err(verdict.reason().to_string());
+        }
+        let token = raw_token
+            .and_then(CloudArmedToken::parse)
+            .ok_or_else(|| "armed token is malformed".to_string())?;
+        if token.expires_at_ms > now.saturating_add(MAX_AUTH_TTL_MS) {
+            return Err("armed token exceeds the 30-second lifetime".to_string());
+        }
+        match claim_nonce(&self.auth_root, &token.nonce, token.expires_at_ms, now) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err("armed token was already used".to_string()),
+            Err(_) => Err("armed-token replay store is unavailable".to_string()),
+        }
+    }
+}
+
+fn wall_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// Bind one session action to the same semantic capability context as the
+/// session broker. The exact raw body, including schema and armed token, is
+/// what the verifier authenticates.
+fn session_auth_target(request: &SessionRequest) -> (&'static str, String) {
+    match request {
+        SessionRequest::Open { id, .. } => ("vdi-session-open", format!("session:{id}")),
+        SessionRequest::Active { id } => ("vdi-session-active", format!("session:{id}")),
+        SessionRequest::Disconnect { id } => ("vdi-session-disconnect", format!("session:{id}")),
+        SessionRequest::Close { id } => ("vdi-session-close", format!("session:{id}")),
+    }
+}
+
+fn authorize_session_request(
+    authorizer: &ConsoleAuthorizer,
+    body: &str,
+    request: &SessionRequest,
+) -> Result<(), String> {
+    let (verb, target) = session_auth_target(request);
+    authorizer.authorize(
+        body,
+        MutationContext {
+            verb,
+            node: "vdi-session",
+            target: &target,
+        },
+    )
+}
+
 /// Read new [`SESSION_TOPIC`] messages since `cursor`, advancing it. A short
 /// sync open-read-drop, mirroring `session_broker::read_new_actions`.
-fn read_new_actions(bus_root: &Path, cursor: &mut Option<String>) -> Vec<SessionRequest> {
+fn read_new_actions(
+    bus_root: &Path,
+    cursor: &mut Option<String>,
+    authorizer: &ConsoleAuthorizer,
+) -> Vec<SessionRequest> {
     let Ok(persist) = Persist::open(bus_root.to_path_buf()) else {
         return vec![];
     };
@@ -538,7 +682,17 @@ fn read_new_actions(bus_root: &Path, cursor: &mut Option<String>) -> Vec<Session
         *cursor = Some(msg.ulid.clone());
         let body = msg.body.as_deref().unwrap_or("");
         match parse_request(body) {
-            Ok(r) => out.push(r),
+            Ok(r) => {
+                if let Err(e) = authorize_session_request(authorizer, body, &r) {
+                    tracing::warn!(
+                        ulid = %msg.ulid,
+                        error = %e,
+                        "console_broker: unauthorized session request refused"
+                    );
+                    continue;
+                }
+                out.push(r);
+            }
             Err(e) => {
                 tracing::warn!(ulid = %msg.ulid, error = %e, "console_broker: bad session request");
             }
@@ -548,7 +702,7 @@ fn read_new_actions(bus_root: &Path, cursor: &mut Option<String>) -> Vec<Session
 }
 
 fn default_bus_root() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join("mde").join("bus"))
+    mde_bus::default_data_dir()
 }
 
 /// The console-broker worker. Serving-peer-gated + best-effort.
@@ -565,6 +719,8 @@ pub struct ConsoleBrokerWorker {
     bus_root_override: Option<PathBuf>,
     /// Live brokered consoles, keyed by session id.
     brokered: HashMap<SessionId, BrokerEntry>,
+    /// Exact-body capability verifier for the independent session-log consumer.
+    authorizer: ConsoleAuthorizer,
 }
 
 impl ConsoleBrokerWorker {
@@ -578,6 +734,7 @@ impl ConsoleBrokerWorker {
             heartbeat: PUBLISH_HEARTBEAT,
             bus_root_override: None,
             brokered: HashMap::new(),
+            authorizer: ConsoleAuthorizer::production(),
         }
     }
 
@@ -599,6 +756,14 @@ impl ConsoleBrokerWorker {
     #[must_use]
     pub fn with_bus_root(mut self, root: PathBuf) -> Self {
         self.bus_root_override = Some(root);
+        self
+    }
+
+    /// Inject an isolated verifier and replay ledger for hostile action tests.
+    /// Production always uses the systemd-credential-backed verifier.
+    #[cfg(test)]
+    fn with_authorizer(mut self, authorizer: ConsoleAuthorizer) -> Self {
+        self.authorizer = authorizer;
         self
     }
 
@@ -696,7 +861,7 @@ impl Worker for ConsoleBrokerWorker {
             tokio::select! {
                 _ = tick.tick() => {
                     let mut changed = false;
-                    for req in read_new_actions(&bus_root, &mut cursor) {
+                    for req in read_new_actions(&bus_root, &mut cursor, &self.authorizer) {
                         changed |= self.apply(&req);
                     }
                     let due = last_pub.elapsed() >= self.heartbeat;
@@ -717,7 +882,11 @@ impl Worker for ConsoleBrokerWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use crate::ipc::action_auth::authorize_test_body;
+    use std::sync::{Arc, Mutex};
+
+    const AUTH_KEY: &[u8] = b"vdi-console-action-auth-test-key";
+    const AUTH_NOW: i64 = 1_700_000_000_000;
 
     // ── pure: parse_domdisplay ──
 
@@ -814,7 +983,7 @@ mod tests {
         resolve: Option<Result<ConsoleAddr, ConsoleBrokerError>>,
         overlay: String,
         relay_ok: bool,
-        started: Mutex<Vec<(String, u16, u16)>>, // (overlay_addr, overlay_port, target_port)
+        started: Arc<Mutex<Vec<(String, u16, u16)>>>, // (overlay_addr, overlay_port, target_port)
     }
 
     impl ConsoleRelay for FakeRelay {
@@ -957,6 +1126,27 @@ mod tests {
         }
     }
 
+    fn signed_request(request: &SessionRequest, nonce: &str) -> String {
+        let mut unsigned = serde_json::to_value(request).expect("request value");
+        unsigned
+            .as_object_mut()
+            .expect("session request object")
+            .insert("schema_version".into(), serde_json::json!(1));
+        let unsigned = unsigned.to_string();
+        let (verb, target) = session_auth_target(request);
+        authorize_test_body(
+            AUTH_KEY,
+            &unsigned,
+            MutationContext {
+                verb,
+                node: "vdi-session",
+                target: &target,
+            },
+            nonce,
+            AUTH_NOW + 30_000,
+        )
+    }
+
     fn worker_with(relay: FakeRelay) -> ConsoleBrokerWorker {
         ConsoleBrokerWorker::new("peer:oak".into()).with_relay(Box::new(relay))
     }
@@ -1040,6 +1230,95 @@ mod tests {
     }
 
     #[test]
+    fn session_log_gate_refuses_unsigned_future_schema_and_replay_before_relay_effects() {
+        use mde_bus::hooks::config::Priority;
+
+        let bus = tempfile::tempdir().expect("temp bus");
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let valid_request = open("authorized", "oak", "win11");
+        let valid = signed_request(&valid_request, "console-open-once");
+        let mut future_value: serde_json::Value =
+            serde_json::from_str(&valid).expect("signed body is JSON");
+        future_value["schema_version"] = serde_json::json!(2);
+        let future = future_value.to_string();
+        let unsigned = serde_json::to_string(&valid_request).expect("unsigned request");
+
+        for body in [&unsigned, &future, &valid, &valid] {
+            persist
+                .write(SESSION_TOPIC, Priority::Default, None, Some(body))
+                .expect("write session action");
+        }
+
+        let authorizer =
+            ConsoleAuthorizer::for_test(AUTH_KEY, bus.path().join("console-auth"), AUTH_NOW);
+        let mut cursor = None;
+        let requests = read_new_actions(bus.path(), &mut cursor, &authorizer);
+        assert_eq!(requests, vec![valid_request.clone()]);
+
+        let relay = FakeRelay {
+            resolve: Some(Ok(spice(5900))),
+            overlay: "10.42.0.7".into(),
+            relay_ok: true,
+            ..FakeRelay::default()
+        };
+        let started = Arc::clone(&relay.started);
+        let mut worker = worker_with(relay);
+        for request in &requests {
+            assert!(worker.apply(request));
+        }
+        assert_eq!(started.lock().unwrap().len(), 1);
+        assert!(worker.brokered.contains_key("authorized"));
+    }
+
+    #[test]
+    fn unsigned_close_cannot_reach_relay_teardown() {
+        use mde_bus::hooks::config::Priority;
+
+        let bus = tempfile::tempdir().expect("temp bus");
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let open_request = open("close-guard", "oak", "win11");
+        let close_request = SessionRequest::Close {
+            id: "close-guard".into(),
+        };
+        persist
+            .write(
+                SESSION_TOPIC,
+                Priority::Default,
+                None,
+                Some(&signed_request(&open_request, "console-close-open")),
+            )
+            .expect("write authorized open");
+        persist
+            .write(
+                SESSION_TOPIC,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&close_request).expect("unsigned close")),
+            )
+            .expect("write unsigned close");
+
+        let authorizer =
+            ConsoleAuthorizer::for_test(AUTH_KEY, bus.path().join("console-auth"), AUTH_NOW);
+        let mut cursor = None;
+        let requests = read_new_actions(bus.path(), &mut cursor, &authorizer);
+        assert_eq!(requests, vec![open_request]);
+
+        let mut worker = worker_with(FakeRelay {
+            resolve: Some(Ok(spice(5900))),
+            overlay: "10.42.0.7".into(),
+            relay_ok: true,
+            ..FakeRelay::default()
+        });
+        assert!(worker.apply(&requests[0]));
+        assert!(worker.brokered.contains_key("close-guard"));
+    }
+
+    #[test]
+    fn default_bus_root_uses_the_shared_mde_bus_resolver() {
+        assert_eq!(default_bus_root(), mde_bus::default_data_dir());
+    }
+
+    #[test]
     fn record_round_trips_the_wire_shape() {
         // The shell decodes this exact body off CONSOLE_TOPIC.
         let rec = BrokeredConsole {
@@ -1072,7 +1351,10 @@ mod tests {
                 SESSION_TOPIC,
                 Priority::Default,
                 None,
-                Some(&serde_json::to_string(&open("s1", "oak", "win11")).unwrap()),
+                Some(&signed_request(
+                    &open("s1", "oak", "win11"),
+                    "console-e2e-open",
+                )),
             )
             .expect("seed open");
 
@@ -1083,11 +1365,16 @@ mod tests {
             ..FakeRelay::default()
         })
         .with_bus_root(dir.clone())
-        .with_poll(Duration::from_millis(20));
+        .with_poll(Duration::from_millis(20))
+        .with_authorizer(ConsoleAuthorizer::for_test(
+            AUTH_KEY,
+            dir.join("console-auth"),
+            AUTH_NOW,
+        ));
 
         // Drive one fold+publish by hand (deterministic — no timing on the tick).
         let mut cursor = None;
-        for req in read_new_actions(&dir, &mut cursor) {
+        for req in read_new_actions(&dir, &mut cursor, &w.authorizer) {
             w.apply(&req);
         }
         w.publish(&persist);

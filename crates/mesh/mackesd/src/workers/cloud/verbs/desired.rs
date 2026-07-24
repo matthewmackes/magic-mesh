@@ -18,6 +18,7 @@
 //! is an honest `error`, never a silent success.
 
 use serde::Deserialize;
+use std::collections::HashSet;
 
 use mackes_mesh_types::cloud::{CloudReply, WorkloadSpec};
 
@@ -134,9 +135,38 @@ pub(crate) fn handle_set_desired(w: &CloudWorker, verb_name: &str, body_str: &st
             return reject(verb_name, e);
         }
     }
+    // A batch must have one unambiguous operation per workload. Without this
+    // preflight, duplicate declarations silently resolve by input order, while
+    // a declaration plus removal writes the document and then retracts it — an
+    // accepted reply that does not describe the durable result. Reject every
+    // collision before the first filesystem mutation.
+    let mut declared_names = HashSet::new();
+    for spec in &to_write {
+        let name = spec.name.trim();
+        if !declared_names.insert(name.to_owned()) {
+            return reject(
+                verb_name,
+                format!("duplicate workload `{name}` in set-desired batch"),
+            );
+        }
+    }
+    let mut removed_names = HashSet::new();
     for name in &body.remove {
         if let Err(e) = super::super::path_key::file_stem("name", name, ".json") {
             return reject(verb_name, e);
+        }
+        let name = name.trim();
+        if declared_names.contains(name) {
+            return reject(
+                verb_name,
+                format!("workload `{name}` cannot be declared and removed in one batch"),
+            );
+        }
+        if !removed_names.insert(name.to_owned()) {
+            return reject(
+                verb_name,
+                format!("duplicate removal `{name}` in set-desired batch"),
+            );
         }
     }
 
@@ -340,6 +370,48 @@ mod tests {
         let reply = handle_set_desired(&w, "set-desired", body);
         assert!(!reply.ok);
         assert!(reply.error.unwrap().contains("path-safe"));
+        assert!(reconcile::read_desired_slice(tmp.path(), "eagle").is_empty());
+    }
+
+    #[test]
+    fn set_desired_rejects_ambiguous_duplicate_operations_before_any_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let w = worker(
+            "eagle",
+            tmp.path().to_path_buf(),
+            Arc::new(FakeRunner::default()),
+        );
+        let body = r#"{"node":"eagle","specs":[
+            {"name":"web","delivery_type":"service_vm","node":"eagle",
+             "vcpu":1,"memory_mb":512,"disk_gb":4},
+            {"name":"web","delivery_type":"service_vm","node":"eagle",
+             "vcpu":2,"memory_mb":1024,"disk_gb":8}
+        ],"remove":["web"]}"#;
+
+        let reply = handle_set_desired(&w, "set-desired", body);
+        assert!(!reply.ok);
+        assert!(reply.error.unwrap().contains("duplicate workload"));
+        assert!(reconcile::read_desired_slice(tmp.path(), "eagle").is_empty());
+    }
+
+    #[test]
+    fn set_desired_rejects_declare_remove_collision_before_any_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let w = worker(
+            "eagle",
+            tmp.path().to_path_buf(),
+            Arc::new(FakeRunner::default()),
+        );
+        let body = r#"{"node":"eagle","spec":{
+            "name":"web","delivery_type":"service_vm","node":"eagle",
+            "vcpu":1,"memory_mb":512,"disk_gb":4},"remove":["web"]}"#;
+
+        let reply = handle_set_desired(&w, "set-desired", body);
+        assert!(!reply.ok);
+        assert!(reply
+            .error
+            .unwrap()
+            .contains("declared and removed in one batch"));
         assert!(reconcile::read_desired_slice(tmp.path(), "eagle").is_empty());
     }
 

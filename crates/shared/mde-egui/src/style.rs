@@ -9,10 +9,11 @@
 //! are render-agnostic data, so they are unit-tested without a GPU.
 
 use egui::{
+    Color32, Context, FontFamily, FontId, RichText, Stroke, TextStyle,
     epaint::{ClippedShape, ColorMode},
-    Color32, Context, FontFamily, FontId, Stroke, TextStyle,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 use crate::formfactor::Formfactor;
 
@@ -26,7 +27,7 @@ use crate::formfactor::Formfactor;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LayoutProfile {
-    /// The workstation interface: classic bottom taskbar + Start lower-left.
+    /// The workstation interface: an untitled all-icons desktop with floating navigation.
     /// Absorbs the retired Workstation and Tablet profiles — persisted
     /// `"workstation"` / `"tablet"` seat configs deserialize here silently via
     /// the serde aliases (PLATFORM-INTERFACES Q42; a parse failure would reset
@@ -149,6 +150,96 @@ impl Density {
             Self::Comfortable => 1.25,
             Self::Touch => 1.5,
         }
+    }
+}
+
+/// Semantic typography roles shared by Construct and Car chrome.
+///
+/// egui's `FontId` carries family and size but not a weight axis. The shared
+/// Inter face is therefore paired with deliberate size, tracking, line-height,
+/// and emphasis tokens so canonical chrome does not fall back to a flat
+/// `FontId::proportional(...)` treatment at every call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypographyRole {
+    /// Hero/large-title copy.
+    Display,
+    /// Surface or workspace title copy.
+    Title,
+    /// Strong section and card heading copy.
+    Headline,
+    /// Normal readable prose and status values.
+    Body,
+    /// Emphasized standalone copy above body scale.
+    Callout,
+    /// Compact interactive labels.
+    Label,
+    /// Supporting metadata and captions.
+    Caption,
+    /// Fixed-width telemetry, IDs, and code.
+    Mono,
+}
+
+impl TypographyRole {
+    /// Every role in descending visual hierarchy order.
+    pub const ALL: [Self; 8] = [
+        Self::Display,
+        Self::Title,
+        Self::Headline,
+        Self::Body,
+        Self::Callout,
+        Self::Label,
+        Self::Caption,
+        Self::Mono,
+    ];
+
+    /// The shared size token for this role.
+    #[must_use]
+    pub const fn size(self) -> f32 {
+        match self {
+            Self::Display => Style::TYPE_LARGE_TITLE,
+            Self::Title => Style::TYPE_TITLE1,
+            Self::Headline => Style::TYPE_HEADLINE,
+            Self::Body => Style::TYPE_BODY,
+            Self::Callout => Style::TYPE_CALLOUT,
+            Self::Label => Style::TYPE_FOOTNOTE,
+            Self::Caption => Style::TYPE_CAPTION,
+            Self::Mono => Style::TYPE_BODY,
+        }
+    }
+
+    /// Optical tracking in logical points. Display headings tighten slightly;
+    /// small labels open up enough to survive rasterization at 1x.
+    #[must_use]
+    pub const fn letter_spacing(self) -> f32 {
+        match self {
+            Self::Display => -0.15,
+            Self::Title => -0.10,
+            Self::Headline => -0.05,
+            Self::Body | Self::Callout | Self::Mono => 0.0,
+            Self::Label => 0.10,
+            Self::Caption => 0.15,
+        }
+    }
+
+    /// Explicit line height for stable multi-line layout and DPI captures.
+    #[must_use]
+    pub const fn line_height(self) -> f32 {
+        match self {
+            Self::Display => 34.0,
+            Self::Title => 32.0,
+            Self::Headline => 22.0,
+            Self::Body => 18.0,
+            Self::Callout => 20.0,
+            Self::Label => 15.0,
+            Self::Caption => 15.0,
+            Self::Mono => 18.0,
+        }
+    }
+
+    /// Whether this role should use the fixed-width family.
+    #[must_use]
+    pub const fn is_mono(self) -> bool {
+        matches!(self, Self::Mono)
     }
 }
 
@@ -318,28 +409,13 @@ impl Style {
     /// paints bold spans + heading titles with it.
     pub const TEXT_STRONG: Color32 = Color32::from_rgb(0xF4, 0xF4, 0xF4);
 
-    // ── Bottom taskbar chrome ──────────────────────────────────────────────
-    // The platform taskbar is deliberately a black shell strip with white glyphs
-    // and a Windows-11-style tray island. Keep the exact palette in shared Style
-    // so dock rendering and visual tests do not mint private shell colours.
-    /// Full-width bottom taskbar strip.
-    pub const TASKBAR_BG: Color32 = Color32::BLACK;
-    /// Taskbar hairline/separator.
-    pub const TASKBAR_BORDER: Color32 = Color32::from_rgb(0x26, 0x26, 0x26);
-    /// Hover fill for taskbar-owned cells.
-    pub const TASKBAR_HOVER_FILL: Color32 = Color32::from_rgb(0x20, 0x20, 0x20);
-    /// Active/selected fill for taskbar-owned cells.
-    pub const TASKBAR_ACTIVE_FILL: Color32 = Color32::from_rgb(0x2D, 0x2D, 0x2D);
-    /// Taskbar-owned control glyph tint.
-    pub const TASKBAR_ICON: Color32 = Color32::WHITE;
-    /// Windows 11-style tray island fill.
-    pub const TASKBAR_TRAY_ISLAND_FILL: Color32 = Color32::from_rgb(0x17, 0x17, 0x17);
-    /// Active Windows 11-style tray island fill.
-    pub const TASKBAR_TRAY_ISLAND_ACTIVE_FILL: Color32 = Color32::from_rgb(0x22, 0x22, 0x22);
-    /// Windows 11-style tray island border.
-    pub const TASKBAR_TRAY_ISLAND_BORDER: Color32 = Color32::from_rgb(0x3A, 0x3A, 0x3A);
-    /// Secondary date text in the taskbar clock stack.
-    pub const TASKBAR_CLOCK_DATE: Color32 = Color32::from_rgb(0xD6, 0xD6, 0xD6);
+    // ── Floating navigation chrome ─────────────────────────────────────────
+    /// Opaque backing for the Construct navigation bar and its docked rail.
+    pub const NAV_BAR_BG: Color32 = Color32::BLACK;
+    /// High-contrast glyph ink for navigation-bar controls.
+    pub const NAV_BAR_ICON: Color32 = Color32::WHITE;
+    /// Subtle pointer-hover wash for navigation-bar controls.
+    pub const NAV_BAR_HOVER: Color32 = Color32::from_rgba_premultiplied(24, 24, 24, 24);
 
     /// Interactive / brand accent (Construct azure).
     pub const ACCENT: Color32 = Color32::from_rgb(0x5B, 0x8C, 0xFF);
@@ -450,10 +526,10 @@ impl Style {
     // ── Corner-radius tiers (applied by surfaces at draw time as raw data, so the
     //    harness build stays free of egui's version-sensitive corner-radius type) ──
     // PLATFORM-INTERFACES Q23: the HIG radii ladder (~6/10/16/26) — continuous
-    // curvature-era rounding replacing the Win10-era 4/6/8 squareness. Nested
+    // curvature-era rounding replacing legacy square chrome. Nested
     // rounded rects follow the concentric rule via
     // [`concentric_radius`](Self::concentric_radius).
-    /// Tight radius — buttons, chips, taskbar/cell inner fills.
+    /// Tight radius — buttons, chips, navigation cells, and inner fills.
     pub const RADIUS_S: f32 = 6.0;
     /// Mid radius — cards, menus, popovers (the historical default).
     pub const RADIUS_M: f32 = 10.0;
@@ -615,6 +691,53 @@ impl Style {
             3 => Self::TITLE,
             _ => Self::BODY,
         }
+    }
+
+    /// Resolve a semantic typography role to the installed family and size.
+    #[must_use]
+    pub fn typography_font(role: TypographyRole) -> FontId {
+        let family = if role.is_mono() {
+            FontFamily::Monospace
+        } else if matches!(
+            role,
+            TypographyRole::Display | TypographyRole::Title | TypographyRole::Headline
+        ) {
+            FontFamily::Name(Arc::from(crate::fonts::HEADING_FAMILY))
+        } else {
+            FontFamily::Proportional
+        };
+        FontId::new(role.size(), family)
+    }
+
+    /// Build styled text with the shared tracking and line-height contract.
+    #[must_use]
+    pub fn typography_text(text: impl Into<String>, role: TypographyRole) -> RichText {
+        RichText::new(text)
+            .font(Self::typography_font(role))
+            .extra_letter_spacing(role.letter_spacing())
+            .line_height(Some(role.line_height()))
+    }
+
+    /// Build a layout job with the same typography contract for painter-based
+    /// chrome, where `Painter::text` cannot carry tracking or line-height.
+    #[must_use]
+    pub fn typography_job(
+        text: impl Into<String>,
+        role: TypographyRole,
+        color: Color32,
+        wrap_width: f32,
+    ) -> egui::text::LayoutJob {
+        let mut job = egui::text::LayoutJob::simple(
+            text.into(),
+            Self::typography_font(role),
+            color,
+            wrap_width,
+        );
+        if let Some(section) = job.sections.first_mut() {
+            section.format.extra_letter_spacing = role.letter_spacing();
+            section.format.line_height = Some(role.line_height());
+        }
+        job
     }
 
     /// Install the shared look on an egui [`Context`] at the default (pointer)
@@ -1319,7 +1442,7 @@ pub enum Elevation {
     Flat,
     /// A card / cell lifted off its surface.
     Raised,
-    /// A floating overlay — menu, popover, tooltip, the taskbar Start grid.
+    /// A floating overlay — menu, popover, tooltip, or the Springboard grid.
     Overlay,
     /// A modal sheet / dialog / lock curtain — the deepest tier.
     Modal,
@@ -1439,7 +1562,7 @@ impl SurfaceLevel {
 mod tests {
     use super::{
         Density, Elevation, GradeBand, LayoutProfile, ShadowToken, Style, StyleColorScheme,
-        SurfaceLevel,
+        SurfaceLevel, TypographyRole,
     };
     use crate::formfactor::Formfactor;
 
@@ -1748,29 +1871,12 @@ mod tests {
     }
 
     #[test]
-    fn taskbar_palette_keeps_black_bar_white_glyphs_and_grouped_tray() {
-        assert_eq!(Style::TASKBAR_BG, egui::Color32::BLACK);
-        assert_eq!(Style::TASKBAR_ICON, egui::Color32::WHITE);
-        assert_ne!(Style::TASKBAR_BORDER, Style::TASKBAR_BG);
-        assert_ne!(Style::TASKBAR_HOVER_FILL, Style::TASKBAR_BG);
-        assert_ne!(Style::TASKBAR_ACTIVE_FILL, Style::TASKBAR_HOVER_FILL);
-        assert_ne!(
-            Style::TASKBAR_TRAY_ISLAND_ACTIVE_FILL,
-            Style::TASKBAR_TRAY_ISLAND_FILL,
-            "active tray island needs its own tone"
-        );
-        assert_ne!(
-            Style::TASKBAR_TRAY_ISLAND_BORDER,
-            Style::TASKBAR_TRAY_ISLAND_FILL,
-            "tray island border must remain visible on the island fill"
-        );
+    fn navigation_bar_palette_keeps_black_backing_and_white_glyphs() {
+        assert_eq!(Style::NAV_BAR_BG, egui::Color32::BLACK);
+        assert_eq!(Style::NAV_BAR_ICON, egui::Color32::WHITE);
         assert!(
-            wcag_contrast_ratio(Style::TASKBAR_ICON, Style::TASKBAR_BG) >= 7.0,
-            "white taskbar icons must remain high contrast on the black bar"
-        );
-        assert!(
-            wcag_contrast_ratio(Style::TASKBAR_CLOCK_DATE, Style::TASKBAR_BG) >= 7.0,
-            "taskbar date text must remain readable on the black bar"
+            wcag_contrast_ratio(Style::NAV_BAR_ICON, Style::NAV_BAR_BG) >= 7.0,
+            "white navigation icons must remain high contrast on the black backing"
         );
     }
 
@@ -2029,6 +2135,40 @@ mod tests {
             "TEXT must sit brighter than TEXT_DIM"
         );
         assert_eq!(Style::TEXT_STRONG.a(), 0xFF, "emphasis text must be opaque");
+    }
+
+    #[test]
+    fn typography_contract_has_distinct_roles_and_stable_layout_metrics() {
+        assert_eq!(TypographyRole::ALL.len(), 8);
+        assert!(TypographyRole::Display.size() > TypographyRole::Title.size());
+        assert!(TypographyRole::Title.size() > TypographyRole::Headline.size());
+        assert!(TypographyRole::Headline.size() > TypographyRole::Callout.size());
+        assert!(TypographyRole::Callout.size() > TypographyRole::Body.size());
+        assert!(TypographyRole::Body.size() > TypographyRole::Caption.size());
+        assert!(TypographyRole::Display.letter_spacing() < 0.0);
+        assert!(TypographyRole::Caption.letter_spacing() > 0.0);
+
+        for role in TypographyRole::ALL {
+            assert!(
+                role.line_height() >= role.size(),
+                "{role:?} line height must not clip glyphs"
+            );
+            let font = Style::typography_font(role);
+            assert_eq!(font.size, role.size(), "{role:?} size must use its token");
+            assert_eq!(font.family == egui::FontFamily::Monospace, role.is_mono());
+        }
+
+        let job =
+            Style::typography_job("stable callout", TypographyRole::Callout, Style::TEXT, 240.0);
+        let section = job.sections.first().expect("one typography section");
+        assert_eq!(
+            section.format.extra_letter_spacing,
+            TypographyRole::Callout.letter_spacing()
+        );
+        assert_eq!(
+            section.format.line_height,
+            Some(TypographyRole::Callout.line_height())
+        );
     }
 
     #[test]

@@ -187,8 +187,12 @@ pub fn run(sub: CaCmd, db_path: PathBuf) -> anyhow::Result<()> {
                 let armored = mackesd_core::ca::backup::armor(&sealed, plaintext.exported_at);
                 match output {
                     Some(path) => {
-                        std::fs::write(&path, &armored)
-                            .with_context(|| format!("write {}", path.display()))?;
+                        // Backups contain the CA private key after decryption;
+                        // publish them through the sealed atomic writer so a
+                        // crash cannot leave a partial archive and an
+                        // operator-selected symlink cannot redirect the write.
+                        mackesd_core::ca::seal::write_atomic_sealed(&path, armored.as_bytes())
+                            .map_err(|e| anyhow::anyhow!("write {}: {e}", path.display()))?;
                         eprintln!(
                             "exported {} CA rows + {} peer certs → {} ({} bytes armored)",
                             plaintext.ca_certs.len(),
@@ -220,8 +224,13 @@ pub fn run(sub: CaCmd, db_path: PathBuf) -> anyhow::Result<()> {
                     })?
                 };
                 let armored = match input {
-                    Some(path) => std::fs::read_to_string(&path)
-                        .with_context(|| format!("read {}", path.display()))?,
+                    Some(path) => {
+                        let bytes = mackesd_core::ca::seal::read_no_follow(&path)
+                            .map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
+                        String::from_utf8(bytes).with_context(|| {
+                            format!("read {}: input is not UTF-8", path.display())
+                        })?
+                    }
                     None => {
                         use std::io::Read;
                         let mut s = String::new();

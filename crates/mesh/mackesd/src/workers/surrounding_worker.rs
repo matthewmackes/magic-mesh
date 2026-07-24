@@ -2,7 +2,7 @@
 //!
 //! Runs the MESH-A-4.c.1 local sweep (mDNS → reverse-DNS → ARP-MAC →
 //! OUI vendor → classify) every 10 min (R8-Q12) and writes a per-peer
-//! snapshot to `~/.local/share/mde/surrounding/<host>/<iso>-<hash>.json`.
+//! snapshot to `<workgroup-root>/surrounding/<host>/<iso>-<hash>.json`.
 //! The directory lands under mesh-storage once mounted, so every peer
 //! reads the union of all peers' LAN-neighbour views (R8-Q13).
 //!
@@ -61,7 +61,7 @@ pub struct SurroundingWorker {
 impl SurroundingWorker {
     /// Construct with production defaults. `host` is this peer's name;
     /// `base_dir` is the `surrounding` root
-    /// (`~/.local/share/mde/surrounding` in prod).
+    /// (`<workgroup-root>/surrounding` in prod).
     #[must_use]
     pub fn new(host: String, base_dir: PathBuf) -> Self {
         Self {
@@ -141,11 +141,11 @@ fn now_epoch_ms() -> i64 {
         .as_millis() as i64
 }
 
-/// Resolve the Bus root (`~/.local/share/mde/bus`) for the refresh
-/// subscriber. `None` when no data dir resolves (the subscriber stays
+/// Resolve the daemon Bus root through [`mde_bus::default_data_dir`] for the
+/// refresh subscriber. `None` when no data dir resolves (the subscriber stays
 /// idle; the 10-min tick is unaffected).
 fn default_bus_root() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join("mde").join("bus"))
+    mde_bus::default_data_dir()
 }
 
 /// Drain new [`REFRESH_TOPIC`] triggers since `cursor`, returning how
@@ -276,5 +276,10 @@ mod tests {
         assert_eq!(drain_refresh(&bus_root, &mut cursor), 2);
         // Cursor advanced — a re-drain with no new messages is a no-op.
         assert_eq!(drain_refresh(&bus_root, &mut cursor), 0);
+    }
+
+    #[test]
+    fn default_bus_root_uses_the_shared_mde_bus_resolver() {
+        assert_eq!(default_bus_root(), mde_bus::default_data_dir());
     }
 }

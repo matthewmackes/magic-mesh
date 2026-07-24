@@ -40,7 +40,9 @@ use mde_egui::egui::{
     self, pos2, vec2, Align, CornerRadius, Frame, Layout, Rect, RichText, Sense, UiKind,
 };
 use mde_egui::motion::Spring;
-use mde_egui::{paint_carbon, Elevation, Motion, Severity, Style};
+use mde_egui::{
+    paint_carbon, Elevation, Motion, Severity, Style, TypographyRole,
+};
 
 use crate::construct::{ChromeIntent, ConstructChrome};
 use crate::status::{SegmentRollup, StatusSegments};
@@ -340,7 +342,10 @@ fn panel_contents(
             // are current posture, not clearable history (module doc).
             if !toasts.history().is_empty()
                 && ui
-                    .button(RichText::new("Clear all").size(Style::TYPE_FOOTNOTE))
+                    .button(
+                        RichText::new("Clear all")
+                            .font(Style::typography_font(TypographyRole::Label)),
+                    )
                     .clicked()
             {
                 toasts.history_mut().clear();
@@ -356,13 +361,13 @@ fn panel_contents(
         ui.vertical_centered(|ui| {
             ui.label(
                 RichText::new(EMPTY_HEADLINE)
-                    .size(Style::TYPE_BODY)
+                    .font(Style::typography_font(TypographyRole::Body))
                     .color(Style::TEXT_DIM),
             );
             ui.add_space(Style::SP_XS);
             ui.label(
                 RichText::new("Alerts raised while this shell runs appear here.")
-                    .size(Style::TYPE_FOOTNOTE)
+                    .font(Style::typography_font(TypographyRole::Label))
                     .color(Style::TEXT_DIM),
             );
         });
@@ -420,13 +425,16 @@ fn group_header(ui: &mut egui::Ui, topic: &str, clearable: bool) -> bool {
     ui.horizontal(|ui| {
         ui.label(
             RichText::new(topic.to_uppercase())
-                .size(Style::TYPE_FOOTNOTE)
+                .font(Style::typography_font(TypographyRole::Label))
                 .color(Style::TEXT_DIM),
         );
         if clearable {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 clicked = ui
-                    .button(RichText::new("Clear").size(Style::TYPE_FOOTNOTE))
+                    .button(
+                        RichText::new("Clear")
+                            .font(Style::typography_font(TypographyRole::Label)),
+                    )
                     .clicked();
             });
         }
@@ -448,12 +456,12 @@ fn row(ui: &mut egui::Ui, severity: Severity, title: &str, footnote: &str) {
             ui.spacing_mut().item_spacing.y = 2.0;
             ui.label(
                 RichText::new(title)
-                    .size(Style::TYPE_BODY)
+                    .font(Style::typography_font(TypographyRole::Body))
                     .color(Style::TEXT),
             );
             ui.label(
                 RichText::new(footnote)
-                    .size(Style::TYPE_FOOTNOTE)
+                    .font(Style::typography_font(TypographyRole::Label))
                     .color(Style::TEXT_DIM),
             );
         });

@@ -616,18 +616,22 @@ impl PowerState {
 
 /// The honest no-local-hypervisor gate (§7): the `local-kvm` lane's published
 /// status when it reports the hypervisor toolchain is unavailable
-/// (`gated: …` / `error: …`), else `None` when a live hypervisor is present. When
-/// `Some`, a local-VM card shows its power buttons disabled with this reason,
-/// never a control that pretends to act.
+/// (`gated: …` / `error: …`), else `None` only when the lane explicitly reports
+/// `ok`. Missing or unrecognized status is also gated: a LocalVm card must never
+/// expose a mutating control without positive capability evidence. When `Some`,
+/// a local-VM card shows its power buttons disabled with this reason, never a
+/// control that pretends to act.
 fn local_hypervisor_gate(lanes: &[LaneStatus]) -> Option<String> {
-    lanes
-        .iter()
-        .find(|l| l.lane == "local-kvm")
-        .filter(|l| {
-            let s = l.status.trim_start();
-            s.starts_with("gated") || s.starts_with("error")
-        })
-        .map(|l| l.status.clone())
+    let Some(lane) = lanes.iter().find(|l| l.lane == "local-kvm") else {
+        return Some("local-kvm capability not reported".to_string());
+    };
+    if lane.status.trim_start().starts_with("ok") {
+        None
+    } else if lane.status.trim().is_empty() {
+        Some("local-kvm capability unavailable".to_string())
+    } else {
+        Some(lane.status.clone())
+    }
 }
 
 /// Build the host-targeted `vm_lifecycle` request a card power click drives — the
@@ -668,6 +672,8 @@ const REFRESH_TOPIC: &str = "action/desktops/refresh";
 /// empty `name` is skipped so the worker defaults it to `host:port`.
 #[derive(Debug, Serialize)]
 struct AddSourceRequest {
+    /// Versioned action contract marker consumed by the root worker.
+    schema_version: u16,
     /// Operator's display name, or `None` (worker defaults to `host:port`).
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
@@ -683,6 +689,8 @@ struct AddSourceRequest {
 /// of an `action/desktops/remove-source` request (the manual source id).
 #[derive(Debug, Serialize)]
 struct RemoveSourceRequest {
+    /// Versioned action contract marker consumed by the root worker.
+    schema_version: u16,
     /// The `manual:<host>:<port>:<proto>` id to remove.
     id: String,
 }
@@ -719,14 +727,111 @@ fn publish_source_action(
         *last_error = Some(format!("No mesh Bus directory — {noun} unavailable."));
         return;
     };
+    let authorized_body = match body {
+        Some(body) if topic == ADD_SOURCE_TOPIC => {
+            let parsed: serde_json::Value = match serde_json::from_str(body) {
+                Ok(value) => value,
+                Err(error) => {
+                    *last_error = Some(format!("Couldn't authorize {noun}: {error}"));
+                    return;
+                }
+            };
+            let host = parsed
+                .get("host")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|host| !host.is_empty());
+            let port = parsed.get("port").and_then(serde_json::Value::as_u64);
+            let protocol = parsed
+                .get("protocol")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|protocol| !protocol.is_empty());
+            let Some((host, port, protocol)) = host
+                .zip(port)
+                .zip(protocol)
+                .map(|((host, port), protocol)| (host, port, protocol))
+            else {
+                *last_error = Some(format!("Couldn't authorize {noun}: incomplete source body"));
+                return;
+            };
+            let target = format!("manual:{host}:{port}:{protocol}");
+            match crate::iac::authorize_root_mutation_body(
+                body,
+                "desktop-add-source",
+                &local_hostname(),
+                &target,
+            ) {
+                Ok(body) => Some(body),
+                Err(error) => {
+                    *last_error = Some(format!("Couldn't authorize {noun}: {error}"));
+                    return;
+                }
+            }
+        }
+        Some(body) if topic == REMOVE_SOURCE_TOPIC => {
+            let parsed: serde_json::Value = match serde_json::from_str(body) {
+                Ok(value) => value,
+                Err(error) => {
+                    *last_error = Some(format!("Couldn't authorize {noun}: {error}"));
+                    return;
+                }
+            };
+            let Some(target) = parsed
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            else {
+                *last_error = Some(format!("Couldn't authorize {noun}: missing source id"));
+                return;
+            };
+            match crate::iac::authorize_root_mutation_body(
+                body,
+                "desktop-remove-source",
+                &local_hostname(),
+                target,
+            ) {
+                Ok(body) => Some(body),
+                Err(error) => {
+                    *last_error = Some(format!("Couldn't authorize {noun}: {error}"));
+                    return;
+                }
+            }
+        }
+        _ => body.map(str::to_owned),
+    };
     // arch-11: writer — the shared BusReader seam is read-only; this publish keeps
     // Persist::open because it needs the write Result to set `last_error`.
-    match mde_bus::persist::Persist::open(root.to_path_buf())
-        .and_then(|p| p.write(topic, mde_bus::hooks::config::Priority::Default, None, body))
-    {
+    match mde_bus::persist::Persist::open(root.to_path_buf()).and_then(|p| {
+        p.write(
+            topic,
+            mde_bus::hooks::config::Priority::Default,
+            None,
+            authorized_body.as_deref(),
+        )
+    }) {
         Ok(_) => *last_error = None,
         Err(e) => *last_error = Some(format!("Couldn't publish {noun}: {e}")),
     }
+}
+
+fn local_hostname() -> String {
+    if let Ok(host) = std::env::var("HOSTNAME") {
+        let host = host.trim();
+        if !host.is_empty() {
+            return host.to_owned();
+        }
+    }
+    for path in ["/proc/sys/kernel/hostname", "/etc/hostname"] {
+        if let Ok(host) = std::fs::read_to_string(path) {
+            let host = host.trim();
+            if !host.is_empty() {
+                return host.to_owned();
+            }
+        }
+    }
+    "localhost".to_owned()
 }
 
 /// How the filtered grid is ordered within each node group (CHOOSER-8). Favorites
@@ -1415,6 +1520,19 @@ impl ChooserState {
             .collect()
     }
 
+    /// Compact rows for the Springboard Dock's chooser-pinned face.
+    ///
+    /// This deliberately filters the already-authoritative [`Self::rail_sources`]
+    /// projection instead of rebuilding a second source list: chooser preferences
+    /// are refreshed, synthetic pinned manual entries are retained, and the
+    /// existing favorite/recent/node/name ordering remains unchanged.
+    pub(crate) fn pinned_rail_sources(&mut self) -> Vec<DesktopRailSource> {
+        self.rail_sources()
+            .into_iter()
+            .filter(|source| source.favorite)
+            .collect()
+    }
+
     /// Connect a source selected from the compact rail flyout. Reuses the same
     /// activation/confirmation path as the expanded chooser; if credentials are
     /// needed, the pending prompt remains in `ChooserState` and the shell simply
@@ -1547,6 +1665,7 @@ impl ChooserState {
                 continue;
             };
             let body = AddSourceRequest {
+                schema_version: mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION,
                 name: entry.name.clone(),
                 host: entry.host.clone(),
                 port: entry.port,
@@ -1836,7 +1955,11 @@ impl ChooserState {
         // mesh-less seat skips it silently — the prefs tombstone below is the
         // remove for a pinned-register card (TESTVM-4), so no error is faked.
         if self.bus_root.is_some() {
-            let body = RemoveSourceRequest { id: id.to_string() }.to_body();
+            let body = RemoveSourceRequest {
+                schema_version: mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION,
+                id: id.to_string(),
+            }
+            .to_body();
             publish_source_action(
                 self.bus_root.as_deref(),
                 &mut self.last_error,
@@ -2064,6 +2187,7 @@ impl ChooserState {
     ) {
         if let Some(original_id) = original_id {
             let remove_body = RemoveSourceRequest {
+                schema_version: mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION,
                 id: original_id.to_owned(),
             }
             .to_body();
@@ -2079,6 +2203,7 @@ impl ChooserState {
             }
         }
         let add_body = AddSourceRequest {
+            schema_version: mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION,
             name: name.map(str::to_owned),
             host: host.to_owned(),
             port,
@@ -2420,3 +2545,123 @@ use render::*;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod pinned_rail_sources_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    struct FakeSources(Option<DesktopSourcesState>);
+
+    impl DesktopSourcesClient for FakeSources {
+        fn latest(&self) -> Option<DesktopSourcesState> {
+            self.0.clone()
+        }
+
+        fn has_bus(&self) -> bool {
+            true
+        }
+    }
+
+    fn source(id: &str, name: &str, node: &str) -> DesktopSource {
+        DesktopSource {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            node: node.to_owned(),
+            host: node.to_owned(),
+            protocols: vec![ProtocolOffer {
+                protocol: Protocol::Rdp,
+                port: Some(3389),
+            }],
+            origin: SourceOrigin::MeshPeer,
+            reachability: Reachability::Reachable,
+            reason: None,
+            os_hint: None,
+            power_state: None,
+            thumbnail_ref: None,
+        }
+    }
+
+    fn state_with_sources(sources: Vec<DesktopSource>) -> ChooserState {
+        let prefs = ChooserPrefs::new(
+            chooser_prefs::ChooserPrefsStore::new(PathBuf::from("/no/such/mesh/root")),
+            "test-identity",
+            "test-seat",
+        );
+        let mut state = ChooserState::with_client(
+            Box::new(FakeSources(Some(DesktopSourcesState {
+                sources,
+                lanes: Vec::new(),
+            }))),
+            None,
+            "test-node".to_owned(),
+            Box::new(MeshCredentialStore),
+            prefs,
+        );
+        state.refresh();
+        state
+    }
+
+    #[test]
+    fn pinned_rail_sources_filters_to_chooser_pins_only() {
+        let mut state = state_with_sources(vec![
+            source("peer:ash", "Ash", "ash"),
+            source("peer:oak", "Oak", "oak"),
+            source("peer:elm", "Elm", "elm"),
+        ]);
+        state.toggle_favorite("peer:oak");
+
+        let pinned = state.pinned_rail_sources();
+
+        assert_eq!(
+            pinned.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            vec!["peer:oak"]
+        );
+        assert!(pinned[0].favorite, "the dock row retains its pin marker");
+    }
+
+    #[test]
+    fn pinned_rail_sources_preserves_rail_order() {
+        let mut state = state_with_sources(vec![
+            source("peer:zulu", "Zulu", "zulu"),
+            source("peer:alpha", "Alpha", "alpha"),
+            source("peer:beta", "Beta", "beta"),
+        ]);
+        state.toggle_favorite("peer:zulu");
+        state.toggle_favorite("peer:alpha");
+
+        let all = state.rail_sources();
+        let expected = all
+            .iter()
+            .filter(|row| row.favorite)
+            .map(|row| row.id.clone())
+            .collect::<Vec<_>>();
+        let pinned = state.pinned_rail_sources();
+        let actual = pinned.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
+
+        assert_eq!(
+            expected,
+            vec!["peer:alpha".to_owned(), "peer:zulu".to_owned()]
+        );
+        assert_eq!(actual, expected);
+        let second = state
+            .pinned_rail_sources()
+            .into_iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>();
+        assert_eq!(actual, second);
+    }
+
+    #[test]
+    fn pinned_rail_sources_is_empty_without_sources_or_pins() {
+        assert!(state_with_sources(Vec::new())
+            .pinned_rail_sources()
+            .is_empty());
+
+        let mut state = state_with_sources(vec![source("peer:oak", "Oak", "oak")]);
+        assert!(
+            state.pinned_rail_sources().is_empty(),
+            "unpinned chooser sources are not dock entries"
+        );
+    }
+}

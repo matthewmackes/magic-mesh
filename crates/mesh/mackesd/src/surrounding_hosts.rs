@@ -34,8 +34,11 @@
 //! valid taxonomy members reachable for manual assignment today.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::Path;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
 
 /// One of the 14 surrounding-host types (R8-Q9). Wire form is the
 /// kebab-case [`HostType::wire_name`].
@@ -863,14 +866,7 @@ pub fn coalesce_sightings(raw: Vec<SurroundingHost>) -> Vec<CoalescedHost> {
         .collect()
 }
 
-/// Read + union every peer's latest surrounding snapshot under `root`
-/// (`<root>/<peer>/<iso>-<hash>.json`, each a `Vec<SurroundingHost>`),
-/// then [`coalesce_sightings`] into one card per host (R8-Q14). Uses
-/// each peer's freshest snapshot (filenames sort chronologically by
-/// their `<iso>` prefix). Per-file fail-open: a malformed/unreadable
-/// snapshot is skipped, never aborts.
-#[must_use]
-pub fn read_all_surrounding(root: &Path) -> Vec<CoalescedHost> {
+fn read_surrounding_snapshots(root: &Path) -> Vec<CoalescedHost> {
     let mut raw: Vec<SurroundingHost> = Vec::new();
     let Ok(peers) = std::fs::read_dir(root) else {
         return Vec::new();
@@ -898,9 +894,61 @@ pub fn read_all_surrounding(root: &Path) -> Vec<CoalescedHost> {
             }
         }
     }
-    let mut cards = coalesce_sightings(raw);
-    apply_trust(&mut cards, &load_trust_store(&root.join("trust.json")));
-    cards
+    coalesce_sightings(raw)
+}
+
+/// Read + union every peer's latest surrounding snapshot under `root`
+/// (`<root>/<peer>/<iso>-<hash>.json`, each a `Vec<SurroundingHost>`),
+/// then [`coalesce_sightings`] into one card per host (R8-Q14). Uses
+/// each peer's freshest snapshot (filenames sort chronologically by
+/// their `<iso>` prefix). Per-file fail-open: a malformed/unreadable
+/// discovery snapshot is skipped, never aborts.
+///
+/// The trust authority is different: malformed, unsigned, tampered, or unsafe
+/// `trust.json` content is rejected. Callers that drive privileged consumers
+/// (notably `mesh_firewall`) must use this checked boundary so a bad replicated
+/// file cannot silently remove an existing block.
+///
+/// # Errors
+///
+/// Returns an error when the replicated trust authority is present but cannot
+/// be authenticated or safely read.
+pub fn read_all_surrounding_checked(root: &Path) -> io::Result<Vec<CoalescedHost>> {
+    let mut cards = read_surrounding_snapshots(root);
+    let store = load_trust_store(&root.join("trust.json"))?;
+    apply_trust(&mut cards, &store);
+    Ok(cards)
+}
+
+/// Read the surrounding-host view for non-privileged display callers.
+///
+/// An invalid trust authority never grants `Trusted` or `Blocked`: cards remain
+/// `Unknown` and the error is logged. Privileged consumers must use
+/// [`read_all_surrounding_checked`] and retain their last safe state on error.
+#[must_use]
+pub fn read_all_surrounding(root: &Path) -> Vec<CoalescedHost> {
+    match read_all_surrounding_checked(root) {
+        Ok(cards) => cards,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                path = %root.join("trust.json").display(),
+                "surrounding trust authority rejected; displaying hosts as unknown"
+            );
+            read_surrounding_snapshots(root)
+        }
+    }
+}
+
+/// Canonical replicated surrounding-host root shared by discovery, operator
+/// trust edits, the read/list commands, and the firewall consumer.
+///
+/// Keeping this under the workgroup root is important: a user-local XDG path
+/// is not the mesh-synced authority and would let the CLI, discovery worker,
+/// and firewall worker observe different trust stores.
+#[must_use]
+pub fn default_surrounding_root() -> PathBuf {
+    crate::default_qnm_shared_root().join("surrounding")
 }
 
 /// Operator trust overrides keyed by host identity (MAC when known,
@@ -909,32 +957,152 @@ pub fn read_all_surrounding(root: &Path) -> Vec<CoalescedHost> {
 /// R8-Q10 / R8-Q11). Absence of a key means the default `Unknown`.
 pub type TrustStore = BTreeMap<String, TrustState>;
 
-/// Parse the trust-store JSON object (`{ "<key>": "trusted" | … }`).
-/// Fail-open: a malformed body yields an empty store.
-#[must_use]
-pub fn parse_trust_store(json: &str) -> TrustStore {
-    serde_json::from_str(json).unwrap_or_default()
+const TRUST_STORE_SCHEMA_VERSION: u64 = 1;
+const TRUST_STORE_DOMAIN: &str = "mde-surrounding-trust-v1";
+const MAX_TRUST_STORE_BYTES: usize = 1024 * 1024;
+const MAX_TRUST_ENTRIES: usize = 4096;
+const MAX_TRUST_KEY_BYTES: usize = 256;
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct SignedTrustStore {
+    schema_version: u64,
+    signer_public_key: String,
+    entries: TrustStore,
+    signature: String,
 }
 
-/// Load the trust store from `path` (empty when absent / malformed).
-#[must_use]
-pub fn load_trust_store(path: &Path) -> TrustStore {
-    std::fs::read_to_string(path)
-        .map(|s| parse_trust_store(&s))
-        .unwrap_or_default()
+fn invalid_trust_store(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
-/// Persist the trust store to `path` (creates the parent dir).
+fn encode_hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+fn decode_hex<const N: usize>(value: &str) -> Option<[u8; N]> {
+    if value.len() != N * 2 {
+        return None;
+    }
+    let mut out = [0_u8; N];
+    for (index, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(value.get(index * 2..index * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
+fn validate_trust_entries(store: &TrustStore) -> io::Result<()> {
+    if store.len() > MAX_TRUST_ENTRIES {
+        return Err(invalid_trust_store("trust store has too many entries"));
+    }
+    if store.keys().any(|key| {
+        key.is_empty() || key.len() > MAX_TRUST_KEY_BYTES || key.chars().any(char::is_control)
+    }) {
+        return Err(invalid_trust_store(
+            "trust store contains an invalid host identity",
+        ));
+    }
+    Ok(())
+}
+
+fn trust_store_signing_bytes(signer_public_key: &str, entries: &TrustStore) -> io::Result<Vec<u8>> {
+    let canonical_entries = serde_json::to_vec(entries)
+        .map_err(|error| invalid_trust_store(format!("serialize trust entries: {error}")))?;
+    let mut out =
+        format!("{TRUST_STORE_DOMAIN}\0{TRUST_STORE_SCHEMA_VERSION}\0{signer_public_key}\0")
+            .into_bytes();
+    out.extend_from_slice(&canonical_entries);
+    Ok(out)
+}
+
+/// Parse and authenticate the versioned trust-store envelope.
+///
+/// Plain legacy maps, unknown schemas, malformed bodies, and forged signatures
+/// are errors. Returning an empty map for any of those cases would let a
+/// replicated corruption silently revoke firewall blocks.
+pub fn parse_trust_store(json: &str) -> io::Result<TrustStore> {
+    if json.len() > MAX_TRUST_STORE_BYTES {
+        return Err(invalid_trust_store("trust store exceeds size limit"));
+    }
+    let envelope: SignedTrustStore = serde_json::from_str(json)
+        .map_err(|error| invalid_trust_store(format!("parse signed trust store: {error}")))?;
+    if envelope.schema_version != TRUST_STORE_SCHEMA_VERSION {
+        return Err(invalid_trust_store(format!(
+            "unsupported trust store schema {}",
+            envelope.schema_version
+        )));
+    }
+    validate_trust_entries(&envelope.entries)?;
+    let signer_bytes = decode_hex::<32>(&envelope.signer_public_key)
+        .ok_or_else(|| invalid_trust_store("trust store signer key is not 32-byte lower hex"))?;
+    let signature_bytes = decode_hex::<64>(&envelope.signature)
+        .ok_or_else(|| invalid_trust_store("trust store signature is not 64-byte lower hex"))?;
+    let signer = VerifyingKey::from_bytes(&signer_bytes)
+        .map_err(|_| invalid_trust_store("trust store signer key is invalid"))?;
+    let payload = trust_store_signing_bytes(&envelope.signer_public_key, &envelope.entries)?;
+    signer
+        .verify(&payload, &Signature::from_bytes(&signature_bytes))
+        .map_err(|_| invalid_trust_store("trust store signature did not verify"))?;
+    Ok(envelope.entries)
+}
+
+/// Load the authenticated trust store from `path`.
+///
+/// A genuinely absent store means no overrides. Every present-but-invalid or
+/// unsafe authority file is an error, including symlinks and files not owned by
+/// the current uid at exact mode 0600.
+pub fn load_trust_store(path: &Path) -> io::Result<TrustStore> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(TrustStore::new());
+        }
+        Err(error) => return Err(error),
+        Ok(_) => {}
+    }
+    let bytes = crate::ca::seal::read_sealed(path)
+        .map_err(|error| invalid_trust_store(format!("unsafe trust store: {error}")))?;
+    if bytes.len() > MAX_TRUST_STORE_BYTES {
+        return Err(invalid_trust_store("trust store exceeds size limit"));
+    }
+    let json =
+        std::str::from_utf8(&bytes).map_err(|_| invalid_trust_store("trust store is not UTF-8"))?;
+    parse_trust_store(json)
+}
+
+pub(crate) fn save_trust_store_with_signer(
+    path: &Path,
+    store: &TrustStore,
+    signer: &ed25519_dalek::SigningKey,
+) -> io::Result<()> {
+    validate_trust_entries(store)?;
+    let signer_public_key = encode_hex(signer.verifying_key().as_bytes());
+    let signature = signer.sign(&trust_store_signing_bytes(&signer_public_key, store)?);
+    let envelope = SignedTrustStore {
+        schema_version: TRUST_STORE_SCHEMA_VERSION,
+        signer_public_key,
+        entries: store.clone(),
+        signature: encode_hex(&signature.to_bytes()),
+    };
+    let body = serde_json::to_vec_pretty(&envelope)
+        .map_err(|error| invalid_trust_store(format!("serialize signed trust store: {error}")))?;
+    crate::ca::seal::write_atomic_sealed(path, &body)
+        .map_err(|error| io::Error::other(format!("write trust store: {error}")))
+}
+
+/// Persist a signed trust store to `path` (creates the parent dir).
 ///
 /// # Errors
 ///
-/// I/O errors creating the parent dir or writing the file.
+/// Errors loading the persisted node signer, validating the store, or safely
+/// replacing the authority file.
 pub fn save_trust_store(path: &Path, store: &TrustStore) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let body = serde_json::to_string_pretty(store).unwrap_or_else(|_| "{}".to_string());
-    std::fs::write(path, body)
+    let signer = crate::node_key::load_or_create(Path::new(crate::node_key::DEFAULT_KEY_PATH))?;
+    save_trust_store_with_signer(path, store, &signer)
 }
 
 /// Set a host's trust override + persist (the Trust / Block card
@@ -945,13 +1113,23 @@ pub fn save_trust_store(path: &Path, store: &TrustStore) -> std::io::Result<()> 
 ///
 /// Propagates [`save_trust_store`] I/O errors.
 pub fn set_host_trust(path: &Path, key: &str, state: TrustState) -> std::io::Result<TrustStore> {
-    let mut store = load_trust_store(path);
+    let signer = crate::node_key::load_or_create(Path::new(crate::node_key::DEFAULT_KEY_PATH))?;
+    set_host_trust_with_signer(path, key, state, &signer)
+}
+
+fn set_host_trust_with_signer(
+    path: &Path,
+    key: &str,
+    state: TrustState,
+    signer: &ed25519_dalek::SigningKey,
+) -> io::Result<TrustStore> {
+    let mut store = load_trust_store(path)?;
     if state == TrustState::Unknown {
         store.remove(key);
     } else {
         store.insert(key.to_string(), state);
     }
-    save_trust_store(path, &store)?;
+    save_trust_store_with_signer(path, &store, signer)?;
     Ok(store)
 }
 
@@ -1916,21 +2094,124 @@ mod tests {
     fn trust_store_round_trips_and_clears_on_unknown() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("surrounding").join("trust.json");
-        set_host_trust(&path, "aa:bb", TrustState::Blocked).unwrap();
-        set_host_trust(&path, "10.0.0.5", TrustState::Trusted).unwrap();
-        let store = load_trust_store(&path);
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[7_u8; 32]);
+        set_host_trust_with_signer(&path, "aa:bb", TrustState::Blocked, &signer).unwrap();
+        set_host_trust_with_signer(&path, "10.0.0.5", TrustState::Trusted, &signer).unwrap();
+        let store = load_trust_store(&path).unwrap();
         assert_eq!(store.get("aa:bb"), Some(&TrustState::Blocked));
         assert_eq!(store.get("10.0.0.5"), Some(&TrustState::Trusted));
         // Unknown clears the override.
-        set_host_trust(&path, "aa:bb", TrustState::Unknown).unwrap();
-        assert!(!load_trust_store(&path).contains_key("aa:bb"));
+        set_host_trust_with_signer(&path, "aa:bb", TrustState::Unknown, &signer).unwrap();
+        assert!(!load_trust_store(&path).unwrap().contains_key("aa:bb"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
     }
 
     #[test]
-    fn parse_trust_store_fail_open() {
-        assert!(parse_trust_store("not json").is_empty());
-        let s = parse_trust_store(r#"{"aa:bb":"blocked"}"#);
+    fn unsigned_or_malformed_trust_store_fails_closed() {
+        assert!(parse_trust_store("not json").is_err());
+        assert!(
+            parse_trust_store(r#"{"aa:bb":"blocked"}"#).is_err(),
+            "a legacy plain map has no writer provenance"
+        );
+    }
+
+    #[test]
+    fn signed_trust_store_round_trip_authenticates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("trust.json");
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[9_u8; 32]);
+        let mut expected = TrustStore::new();
+        expected.insert("aa:bb".into(), TrustState::Blocked);
+        save_trust_store_with_signer(&path, &expected, &signer).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        let s = parse_trust_store(&body).unwrap();
         assert_eq!(s.get("aa:bb"), Some(&TrustState::Blocked));
+    }
+
+    #[test]
+    fn tampered_signed_trust_store_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("trust.json");
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[11_u8; 32]);
+        let mut store = TrustStore::new();
+        store.insert("aa:bb".into(), TrustState::Blocked);
+        save_trust_store_with_signer(&path, &store, &signer).unwrap();
+        let mut envelope: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        envelope["entries"]["aa:bb"] = serde_json::json!("trusted");
+        crate::ca::seal::write_atomic_sealed(
+            &path,
+            serde_json::to_string_pretty(&envelope).unwrap().as_bytes(),
+        )
+        .unwrap();
+        assert!(
+            load_trust_store(&path).is_err(),
+            "changing Blocked to Trusted must invalidate provenance"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trust_store_rejects_symlinks_and_unsafe_permissions() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[13_u8; 32]);
+        let real = tmp.path().join("real.json");
+        save_trust_store_with_signer(&real, &TrustStore::new(), &signer).unwrap();
+
+        let link = tmp.path().join("trust-link.json");
+        symlink(&real, &link).unwrap();
+        assert!(load_trust_store(&link).is_err(), "leaf symlink refused");
+
+        let mut permissions = std::fs::metadata(&real).unwrap().permissions();
+        permissions.set_mode(0o644);
+        std::fs::set_permissions(&real, permissions).unwrap();
+        assert!(
+            load_trust_store(&real).is_err(),
+            "group/world-readable authority refused"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_trust_save_does_not_follow_hostile_paths() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[15_u8; 32]);
+        let victim = outside.path().join("victim");
+        std::fs::write(&victim, b"do-not-touch").unwrap();
+
+        let leaf = tmp.path().join("trust.json");
+        symlink(&victim, &leaf).unwrap();
+        save_trust_store_with_signer(&leaf, &TrustStore::new(), &signer).unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"do-not-touch");
+        assert!(!std::fs::symlink_metadata(&leaf)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        let linked_parent = tmp.path().join("linked-parent");
+        symlink(outside.path(), &linked_parent).unwrap();
+        assert!(
+            save_trust_store_with_signer(
+                &linked_parent.join("trust.json"),
+                &TrustStore::new(),
+                &signer
+            )
+            .is_err(),
+            "symlinked parent must be refused"
+        );
+        assert!(!outside.path().join("trust.json").exists());
     }
 
     #[test]

@@ -10,6 +10,23 @@ have(){ command -v "$1" >/dev/null 2>&1; }
 header(){ printf '\n%s  %s%s\n' "$BOLD$BLUE" "$1" "$RST"; }
 cmd(){ printf '    %s%-36s%s %s%s%s\n' "$BOLD" "$1" "$RST" "$GRAY" "$2" "$RST"; }
 
+# The package metadata is the installed-node view of the platform release.
+# Keep this query dynamic: the Cargo workspace version is the release source,
+# while RPM's release/architecture fields identify the installed artifact.
+platform_release(){
+  local installed
+  if ! have rpm; then
+    cmd "platform release" "RPM metadata unavailable (rpm not installed)"
+    return 0
+  fi
+  if installed="$(rpm -q --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' magic-mesh 2>/dev/null)" \
+    && [ -n "$installed" ]; then
+    cmd "platform release" "$installed (installed RPM metadata)"
+  else
+    cmd "platform release" "magic-mesh RPM not installed"
+  fi
+}
+
 # Live subcommand list for a clap tool: the 2-space-indented command lines under
 # "Commands:" (continuation lines are indented deeper, so they're skipped), with
 # the first line of each description truncated.
@@ -29,6 +46,9 @@ verbs(){
 printf '%s┌──────────────────────────────────────────────┐%s\n' "$BLUE" "$RST"
 printf '%s│%s  %s⬢  M A G I C   M E S H  —  cheat sheet%s       %s│%s\n' "$BLUE" "$RST" "$BOLD$BLUE" "$RST" "$BLUE" "$RST"
 printf '%s└──────────────────────────────────────────────┘%s\n' "$BLUE" "$RST"
+
+header "Platform release"
+platform_release
 
 header "Enrollment & join"
 cmd "mackesd found <name>"            "found a new mesh (this node = first lighthouse)"

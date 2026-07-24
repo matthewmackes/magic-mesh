@@ -203,7 +203,7 @@ fn publish(workgroup_root: &Path, node_id: &str) {
 
 /// The default Bus root (persisted message tree), matching every other worker.
 fn default_bus_root() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join("mde").join("bus"))
+    mde_bus::default_data_dir()
 }
 
 /// The hardware-probe producer worker.
@@ -340,5 +340,10 @@ mod tests {
         let json = serde_json::to_string(&probe).expect("serialize");
         let back: PeerProbe = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.peer_id, "peer:test-node");
+    }
+
+    #[test]
+    fn default_bus_root_uses_the_shared_mde_bus_resolver() {
+        assert_eq!(default_bus_root(), mde_bus::default_data_dir());
     }
 }

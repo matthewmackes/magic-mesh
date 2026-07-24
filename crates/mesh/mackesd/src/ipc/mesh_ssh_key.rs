@@ -48,6 +48,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::{net::IpAddr, path::Component};
 
 use base64::Engine as _;
 use ed25519_dalek::SigningKey;
@@ -637,13 +638,43 @@ impl MeshKeyProvisioner {
     /// # Errors
     /// [`ProvisionError::Io`] on a file write failure.
     pub fn apply(&self, public_line: &str) -> Result<SshdReload, ProvisionError> {
-        write_atomic(
+        validate_mesh_user(&self.mesh_user)?;
+        validate_overlay_cidr(&self.overlay_cidr)?;
+        validate_output_path(&self.mesh_keys_path)?;
+        validate_output_path(&self.sshd_dropin_path)?;
+        if self.mesh_keys_path == self.sshd_dropin_path {
+            return Err(ProvisionError::Io(
+                "authorized-keys and sshd drop-in paths must be distinct".to_string(),
+            ));
+        }
+
+        // The public half is a consumer-bound projection of the sealed
+        // `mesh-ssh-key` ref. Do not let a caller use this installer as a
+        // general authorized-keys writer for an unrelated target.
+        let expected = self
+            .sealed_public_line()?
+            .ok_or_else(|| ProvisionError::Store("mesh SSH key is not sealed".to_string()))?;
+        if expected != public_line {
+            return Err(ProvisionError::Malformed(
+                "public key does not match the sealed mesh-ssh-key consumer ref".to_string(),
+            ));
+        }
+
+        let dropin =
+            render_sshd_overlay_dropin(&self.overlay_cidr, &self.mesh_user, &self.mesh_keys_path);
+        // Stage both files before renaming either one. A bad second target (or
+        // a symlink race caught during staging) therefore cannot leave only the
+        // authorized-keys half of the consumer binding installed.
+        let keys = stage_atomic(
             &self.mesh_keys_path,
             &render_mesh_authorized_keys(public_line),
         )?;
-        let dropin =
-            render_sshd_overlay_dropin(&self.overlay_cidr, &self.mesh_user, &self.mesh_keys_path);
-        write_atomic(&self.sshd_dropin_path, &dropin)?;
+        let dropin = match stage_atomic(&self.sshd_dropin_path, &dropin) {
+            Ok(staged) => staged,
+            Err(error) => return Err(error),
+        };
+        keys.commit()?;
+        dropin.commit()?;
         let reload = self
             .sshd_unit
             .as_deref()
@@ -660,33 +691,240 @@ impl MeshKeyProvisioner {
     }
 }
 
-/// Write `body` to `path` via temp + rename (atomic) so a concurrent sshd reload
-/// never sees a half-formed file, and chmod `0644` (root-owned under `/etc/ssh`
-/// → sshd `StrictModes` accepts it; not group/world writable).
-fn write_atomic(path: &Path, body: &str) -> Result<(), ProvisionError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| ProvisionError::Io(format!("mkdir {}: {e}", parent.display())))?;
+fn validate_mesh_user(user: &str) -> Result<(), ProvisionError> {
+    if user.is_empty()
+        || !user
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    {
+        return Err(ProvisionError::Malformed(
+            "mesh SSH user contains unsupported characters".to_string(),
+        ));
     }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, body.as_bytes())
-        .map_err(|e| ProvisionError::Io(format!("write {}: {e}", tmp.display())))?;
-    set_mode_644(&tmp);
-    std::fs::rename(&tmp, path)
-        .map_err(|e| ProvisionError::Io(format!("rename into {}: {e}", path.display())))?;
     Ok(())
 }
 
-/// Best-effort chmod 0644 (Unix) for a world-readable-but-not-writable config
-/// file.
-fn set_mode_644(path: &Path) {
+fn validate_overlay_cidr(cidr: &str) -> Result<(), ProvisionError> {
+    let (address, prefix) = cidr.split_once('/').ok_or_else(|| {
+        ProvisionError::Malformed("overlay binding must be an address/prefix CIDR".to_string())
+    })?;
+    let address: IpAddr = address
+        .parse()
+        .map_err(|_| ProvisionError::Malformed("overlay binding has an invalid address".into()))?;
+    let prefix: u8 = prefix
+        .parse()
+        .map_err(|_| ProvisionError::Malformed("overlay binding has an invalid prefix".into()))?;
+    match address {
+        IpAddr::V4(address) => {
+            if prefix > 32 {
+                return Err(ProvisionError::Malformed(
+                    "IPv4 overlay binding prefix exceeds 32".to_string(),
+                ));
+            }
+            let bits = u32::from(address);
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix)
+            };
+            if bits & mask != bits {
+                return Err(ProvisionError::Malformed(
+                    "overlay binding must use the canonical network address".to_string(),
+                ));
+            }
+        }
+        IpAddr::V6(address) => {
+            if prefix > 128 {
+                return Err(ProvisionError::Malformed(
+                    "IPv6 overlay binding prefix exceeds 128".to_string(),
+                ));
+            }
+            let bits = u128::from(address);
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            if bits & mask != bits {
+                return Err(ProvisionError::Malformed(
+                    "overlay binding must use the canonical network address".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_output_path(path: &Path) -> Result<(), ProvisionError> {
+    if !path.is_absolute() || path.file_name().is_none() {
+        return Err(ProvisionError::Io(format!(
+            "output path {} must be absolute and name a file",
+            path.display()
+        )));
+    }
+    ensure_no_symlink_components(path)
+}
+
+fn ensure_no_symlink_components(path: &Path) -> Result<(), ProvisionError> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        if matches!(component, Component::CurDir | Component::ParentDir) {
+            return Err(ProvisionError::Io(format!(
+                "unsafe path component in {}",
+                path.display()
+            )));
+        }
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(ProvisionError::Io(format!(
+                    "refusing symlink component {}",
+                    current.display()
+                )));
+            }
+            Ok(meta) if current != path && !meta.is_dir() => {
+                return Err(ProvisionError::Io(format!(
+                    "non-directory path component {}",
+                    current.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(ProvisionError::Io(format!(
+                    "inspect {}: {error}",
+                    current.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn set_mode_exact(path: &Path, mode: u32) -> Result<(), ProvisionError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644));
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).map_err(|error| {
+            ProvisionError::Io(format!(
+                "set permissions {mode:o} on {}: {error}",
+                path.display()
+            ))
+        })?;
     }
     #[cfg(not(unix))]
-    let _ = path;
+    let _ = (path, mode);
+    Ok(())
+}
+
+struct StagedWrite {
+    target: PathBuf,
+    temp: Option<PathBuf>,
+}
+
+impl Drop for StagedWrite {
+    fn drop(&mut self) {
+        if let Some(temp) = self.temp.take() {
+            let _ = std::fs::remove_file(temp);
+        }
+    }
+}
+
+impl StagedWrite {
+    fn commit(mut self) -> Result<(), ProvisionError> {
+        let temp = self
+            .temp
+            .take()
+            .expect("staged write always has a temporary file before commit");
+        std::fs::rename(&temp, &self.target).map_err(|error| {
+            ProvisionError::Io(format!("rename into {}: {error}", self.target.display()))
+        })?;
+        if let Some(parent) = self.target.parent() {
+            if let Ok(directory) = std::fs::File::open(parent) {
+                let _ = directory.sync_all();
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Stage a root-owned configuration file using an exclusive, unpredictable
+/// temporary sibling. The final rename is atomic and never follows a target or
+/// temp symlink; preparation is separate so `apply` can validate both outputs
+/// before committing either one.
+fn stage_atomic(path: &Path, body: &str) -> Result<StagedWrite, ProvisionError> {
+    validate_output_path(path)?;
+    let parent = path.parent().ok_or_else(|| {
+        ProvisionError::Io(format!("output path {} has no parent", path.display()))
+    })?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| ProvisionError::Io(format!("mkdir {}: {error}", parent.display())))?;
+    validate_output_path(path)?;
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if !meta.is_file() {
+            return Err(ProvisionError::Io(format!(
+                "output target {} is not a regular file",
+                path.display()
+            )));
+        }
+    }
+
+    use rand::RngCore as _;
+    use std::io::Write as _;
+    let file_name = path.file_name().ok_or_else(|| {
+        ProvisionError::Io(format!("output path {} has no filename", path.display()))
+    })?;
+    let mut opened = None;
+    for _ in 0..16 {
+        let mut nonce = [0u8; 8];
+        OsRng.fill_bytes(&mut nonce);
+        let candidate = parent.join(format!(
+            ".{}.tmp-{:016x}",
+            file_name.to_string_lossy(),
+            u64::from_be_bytes(nonce)
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        match options.open(&candidate) {
+            Ok(file) => {
+                opened = Some((candidate, file));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(ProvisionError::Io(format!(
+                    "create temporary file in {}: {error}",
+                    parent.display()
+                )));
+            }
+        }
+    }
+    let (temp, mut file) = opened.ok_or_else(|| {
+        ProvisionError::Io(format!(
+            "unable to allocate a unique temporary file in {}",
+            parent.display()
+        ))
+    })?;
+    let result = (|| {
+        set_mode_exact(&temp, 0o644)?;
+        file.write_all(body.as_bytes())
+            .map_err(|error| ProvisionError::Io(format!("write {}: {error}", temp.display())))?;
+        file.sync_all()
+            .map_err(|error| ProvisionError::Io(format!("sync {}: {error}", temp.display())))?;
+        Ok(StagedWrite {
+            target: path.to_path_buf(),
+            temp: Some(temp.clone()),
+        })
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -868,6 +1106,27 @@ mod tests {
         let second = p.provision().unwrap();
         assert!(!second.generated, "second provision reuses the sealed key");
         assert_eq!(second.public_line, first.public_line);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(tmp.path().join("mesh_authorized_keys"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o644
+            );
+            assert_eq!(
+                std::fs::metadata(tmp.path().join("mackes-mesh-sshkey.conf"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o644
+            );
+        }
     }
 
     #[test]
@@ -910,6 +1169,74 @@ mod tests {
         // never faked as Reloaded.
         assert!(tmp.path().join("mesh_authorized_keys").is_file());
         assert!(matches!(out.reload, SshdReload::Gated(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_refuses_symlink_target_without_touching_the_target() {
+        use std::os::unix::fs::symlink;
+
+        let (tmp, store) = temp_store();
+        let p = provisioner_in(store, tmp.path());
+        let first = p.provision().unwrap();
+        let outside = tmp.path().join("outside-authorized-keys");
+        std::fs::write(&outside, b"sentinel").unwrap();
+        let keys = tmp.path().join("mesh_authorized_keys");
+        std::fs::remove_file(&keys).unwrap();
+        symlink(&outside, &keys).unwrap();
+
+        let error = p.apply(&first.public_line).unwrap_err();
+        assert!(
+            error.to_string().contains("symlink"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(std::fs::read(&outside).unwrap(), b"sentinel");
+        assert!(std::fs::symlink_metadata(&keys)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn apply_stages_both_outputs_before_any_commit() {
+        let (tmp, store) = temp_store();
+        let p = provisioner_in(store.clone(), tmp.path());
+        let first = p.provision().unwrap();
+        let keys = tmp.path().join("mesh_authorized_keys");
+        let before = std::fs::read(&keys).unwrap();
+
+        // The installer is consumer-bound: an arbitrary public key cannot be
+        // projected into the mesh SSH target.
+        let error = p.apply("ssh-ed25519 AAAA attacker").unwrap_err();
+        assert!(
+            error.to_string().contains("does not match the sealed"),
+            "unexpected error: {error}"
+        );
+
+        // A regular file in the drop-in's parent is an unsafe target. The
+        // authorized-keys file must remain byte-for-byte unchanged.
+        let blocked_parent = tmp.path().join("blocked");
+        std::fs::write(&blocked_parent, b"not a directory").unwrap();
+        let p = p.with_sshd_dropin_path(blocked_parent.join("dropin.conf"));
+        assert!(p.provision().is_err());
+        assert_eq!(std::fs::read(keys).unwrap(), before);
+        assert!(!first.public_line.is_empty());
+    }
+
+    #[test]
+    fn apply_rejects_unbound_user_and_noncanonical_overlay() {
+        let (tmp, store) = temp_store();
+        let p = provisioner_in(store.clone(), tmp.path());
+        let first = p.provision().unwrap();
+
+        let bad_user = p.with_mesh_user("root\nAuthorizedKeysCommand attacker");
+        let error = bad_user.apply(&first.public_line).unwrap_err();
+        assert!(error.to_string().contains("unsupported characters"));
+
+        let p = provisioner_in(store, tmp.path());
+        let bad_cidr = p.with_overlay_cidr("10.42.0.7/16");
+        let error = bad_cidr.apply(&first.public_line).unwrap_err();
+        assert!(error.to_string().contains("canonical network"));
     }
 
     /// The load-bearing security invariant: after a full provision, the private

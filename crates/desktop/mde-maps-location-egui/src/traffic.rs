@@ -6,6 +6,11 @@ use mde_egui::Style;
 
 /// Five missed one-minute polls make retained traffic visibly stale.
 pub const SNAPSHOT_STALE_AFTER_MS: i64 = 5 * 60 * 1_000;
+/// Allow small clock skew, but never present a future retained fetch as live.
+const MAX_TIMESTAMP_FUTURE_SKEW_MS: i64 = 5_000;
+/// The worker retains at most this many events; keep the shared-Bus consumer
+/// bounded even when a peer publishes an oversized snapshot.
+const MAX_PAINTABLE_EVENTS: usize = 256;
 
 const ROADWORK: Color32 = Color32::from_rgb(0xF2, 0x82, 0x22); // style-leak-ok: map-content-color
 
@@ -27,14 +32,29 @@ impl TrafficLayerState {
     pub fn age_ms(&self, now_ms: i64) -> Option<i64> {
         self.snapshot
             .as_ref()
-            .map(|snapshot| now_ms.saturating_sub(snapshot.fetched_at_ms).max(0))
+            .and_then(|snapshot| {
+                (!self.future_dated(now_ms))
+                    .then(|| now_ms.saturating_sub(snapshot.fetched_at_ms).max(0))
+            })
+    }
+
+    /// Whether the retained fetch timestamp is too far ahead of the consumer
+    /// clock to be trusted. Treating it as age zero would make an old or
+    /// hostile mirror look indefinitely fresh.
+    #[must_use]
+    pub fn future_dated(&self, now_ms: i64) -> bool {
+        self.snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot.fetched_at_ms > now_ms.saturating_add(MAX_TIMESTAMP_FUTURE_SKEW_MS)
+        })
     }
 
     /// Whether the adapter missed five expected polls.
     #[must_use]
     pub fn stale(&self, now_ms: i64) -> bool {
-        self.age_ms(now_ms)
-            .is_some_and(|age| age > SNAPSHOT_STALE_AFTER_MS)
+        self.future_dated(now_ms)
+            || self
+                .age_ms(now_ms)
+                .is_some_and(|age| age > SNAPSHOT_STALE_AFTER_MS)
     }
 
     /// Whether a failed refresh/fix loss paused the last-good set.
@@ -78,23 +98,27 @@ where
     if !rect.is_finite() || rect.width() <= 0.0 || rect.height() <= 0.0 {
         return PaintStats::default();
     }
+    let future_dated = layer.future_dated(now_ms);
     let dimmed = layer.stale(now_ms) || layer.paused();
     let mut stats = PaintStats::default();
-    if let Some(snapshot) = &layer.snapshot {
-        let marker_painter = painter.with_clip_rect(rect.intersect(painter.clip_rect()));
-        for event in snapshot
-            .events
-            .iter()
-            .filter(|event| event.ends_at_ms.is_none_or(|end| end >= now_ms))
-        {
-            let Some(point) = project(event.latitude, event.longitude) else {
-                continue;
-            };
-            if point.any_nan() || !rect.expand(18.0).contains(point) {
-                continue;
+    if !future_dated {
+        if let Some(snapshot) = &layer.snapshot {
+            let marker_painter = painter.with_clip_rect(rect.intersect(painter.clip_rect()));
+            for event in snapshot
+                .events
+                .iter()
+                .take(MAX_PAINTABLE_EVENTS)
+                .filter(|event| event.ends_at_ms.is_none_or(|end| end >= now_ms))
+            {
+                let Some(point) = project(event.latitude, event.longitude) else {
+                    continue;
+                };
+                if point.any_nan() || !rect.expand(18.0).contains(point) {
+                    continue;
+                }
+                paint_marker(&marker_painter, point, event, dimmed);
+                stats.markers += 1;
             }
-            paint_marker(&marker_painter, point, event, dimmed);
-            stats.markers += 1;
         }
     }
     paint_age_badge(painter, rect, layer, now_ms);
@@ -136,6 +160,10 @@ fn paint_marker(painter: &Painter, point: Pos2, event: &TrafficEvent, dimmed: bo
 fn paint_age_badge(painter: &Painter, rect: Rect, layer: &TrafficLayerState, now_ms: i64) {
     let (label, tone) = match (&layer.snapshot, layer.age_ms(now_ms)) {
         (None, _) => ("NCDOT traffic · no data".to_string(), Style::TEXT_DIM),
+        (Some(_), _) if layer.future_dated(now_ms) => (
+            "NCDOT traffic · invalid future timestamp".to_string(),
+            Style::WARN,
+        ),
         (Some(_), Some(age)) if layer.paused() => (
             format!("NCDOT traffic · PAUSED · {}", age_label(age)),
             Style::WARN,
@@ -148,7 +176,7 @@ fn paint_age_badge(painter: &Painter, rect: Rect, layer: &TrafficLayerState, now
             format!(
                 "NCDOT traffic · {} · {} events · degraded",
                 age_label(age),
-                snapshot.events.len()
+                event_count_label(snapshot)
             ),
             Style::WARN,
         ),
@@ -156,7 +184,7 @@ fn paint_age_badge(painter: &Painter, rect: Rect, layer: &TrafficLayerState, now
             format!(
                 "NCDOT traffic · {} · {} events",
                 age_label(age),
-                snapshot.events.len()
+                event_count_label(snapshot)
             ),
             Style::TEXT,
         ),
@@ -180,6 +208,14 @@ fn paint_age_badge(painter: &Painter, rect: Rect, layer: &TrafficLayerState, now
         egui::StrokeKind::Inside,
     );
     painter.galley(badge.left_top() + pad, galley, tone);
+}
+
+fn event_count_label(snapshot: &TrafficSnapshot) -> String {
+    if snapshot.events.len() > MAX_PAINTABLE_EVENTS {
+        format!("{}+", MAX_PAINTABLE_EVENTS)
+    } else {
+        snapshot.events.len().to_string()
+    }
 }
 
 fn age_label(age_ms: i64) -> String {
@@ -279,5 +315,80 @@ mod tests {
         assert_eq!(stats.markers, 1);
         assert!(stats.badge);
         assert!(ctx.tessellate(output.shapes, output.pixels_per_point).len() >= 2);
+    }
+
+    #[test]
+    fn no_snapshot_is_an_idle_no_data_state() {
+        let ctx = egui::Context::default();
+        let mut stats = PaintStats::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = ui.max_rect();
+                stats = paint_layer(
+                    ui.painter(),
+                    rect,
+                    &TrafficLayerState::default(),
+                    1,
+                    |_, _| Some(rect.center()),
+                );
+            });
+        });
+        assert_eq!(stats.markers, 0);
+        assert!(stats.badge);
+    }
+
+    #[test]
+    fn future_snapshot_is_not_painted_as_fresh() {
+        let now = 1_000_000;
+        let mut future = snapshot(now);
+        future.fetched_at_ms = now + MAX_TIMESTAMP_FUTURE_SKEW_MS + 1;
+        let mut layer = TrafficLayerState::default();
+        layer.fold(future);
+        assert!(layer.future_dated(now));
+        assert!(layer.stale(now));
+        assert_eq!(layer.age_ms(now), None);
+
+        let ctx = egui::Context::default();
+        let mut stats = PaintStats::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = ui.max_rect();
+                stats = paint_layer(ui.painter(), rect, &layer, now, |_, _| {
+                    Some(rect.center())
+                });
+            });
+        });
+        assert_eq!(stats.markers, 0);
+        assert!(stats.badge);
+    }
+
+    #[test]
+    fn oversized_retained_snapshot_is_bounded_at_the_paint_boundary() {
+        let now = 1_000_000;
+        let base = snapshot(now).events[0].clone();
+        let mut oversized = snapshot(now);
+        oversized.events = (0..(MAX_PAINTABLE_EVENTS + 32))
+            .map(|index| TrafficEvent {
+                id: format!("event-{index}"),
+                ..base.clone()
+            })
+            .collect();
+        let mut layer = TrafficLayerState::default();
+        layer.fold(oversized);
+
+        let ctx = egui::Context::default();
+        let mut projected = 0;
+        let mut stats = PaintStats::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = ui.max_rect();
+                stats = paint_layer(ui.painter(), rect, &layer, now, |_, _| {
+                    projected += 1;
+                    Some(rect.center())
+                });
+            });
+        });
+        assert_eq!(projected, MAX_PAINTABLE_EVENTS);
+        assert_eq!(stats.markers, MAX_PAINTABLE_EVENTS);
     }
 }

@@ -42,15 +42,44 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use mackes_mesh_types::cloud::{cloud_request_digest, CloudArmSigner, CloudArmedToken};
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
+
+use crate::ipc::action_auth::{
+    production_action_signer, ActionAuthorizer, MutationContext, ACTION_SCHEMA_VERSION,
+    MAX_AUTH_TTL_MS,
+};
 
 use super::{ShutdownToken, Worker};
 
 /// Bus action topic this worker drains.
 pub const ACTION_TOPIC: &str = "action/compute/migrate";
+
+/// Closed capability verb for the source-side migration request.  The
+/// migration body is an administrative request: possession of the shared Bus
+/// spool is transport reachability, not permission to stop a VM or ship its
+/// disk to another peer.
+pub const COMPUTE_MIGRATE_AUTH_VERB: &str = "compute-migrate";
+
+/// Stable node scope used by the source-side capability.  The request's source
+/// and destination peers are bound in [`migration_auth_target`], so a
+/// capability for one migration route cannot be replayed on another route.
+pub const COMPUTE_MIGRATE_NODE_SCOPE: &str = "compute";
+
+/// Event capabilities are deliberately separate from the source request
+/// capability.  A source request is consumed on the source host; a target
+/// event and its source-side completion receipt must each be independently
+/// armed by the root publisher.  Until a publisher supplies these envelopes,
+/// the worker fails closed before every event-side backend call.
+pub const COMPUTE_MIGRATE_READY_AUTH_VERB: &str = "compute-migrate-ready";
+/// Capability verb for a target's successful migration receipt.
+pub const COMPUTE_MIGRATE_COMMITTED_AUTH_VERB: &str = "compute-migrate-committed";
+/// Capability verb for a target's migration-failure receipt.
+pub const COMPUTE_MIGRATE_FAILED_AUTH_VERB: &str = "compute-migrate-failed";
 
 /// Event topic published when the source side finishes shipping
 /// the disk to the target. The target side (VIRT-8.b, same worker)
@@ -240,6 +269,75 @@ pub enum MigrationOutcome {
 /// missing required fields.
 pub fn parse_migrate_request(body: &str) -> Result<MigrateRequest, String> {
     serde_json::from_str(body).map_err(|e| format!("malformed migrate request: {e}"))
+}
+
+/// Stable capability target for a source-side migration.  Keep the source and
+/// destination peers in the target so a capability cannot be replayed for the
+/// same VM on a different migration route.  The exact raw body is also bound by
+/// [`ActionAuthorizer`], so this is a semantic second check rather than a body
+/// replacement.
+#[must_use]
+pub fn migration_auth_target(req: &MigrateRequest) -> String {
+    format!(
+        "vm:{}:{}->{}",
+        req.vm_id.trim(),
+        req.source_peer.trim(),
+        req.target_peer.trim()
+    )
+}
+
+/// Stable capability target shared by the ready/committed/failed event lanes.
+#[must_use]
+fn migration_event_auth_target(vm_id: &str, source_peer: &str, target_peer: &str) -> String {
+    format!(
+        "vm:{}:{}->{}",
+        vm_id.trim(),
+        source_peer.trim(),
+        target_peer.trim()
+    )
+}
+
+/// Verify an event's exact raw envelope before any event-side mutation.  Event
+/// bodies intentionally carry their own schema-v1 `armed_token`; reusing the
+/// source action token would either permit replay or fail on the source host's
+/// already-spent nonce, so an explicit event publisher/key handoff is required.
+fn authorize_event_body(
+    authorizer: &ActionAuthorizer,
+    body: &str,
+    verb: &str,
+    vm_id: &str,
+    source_peer: &str,
+    target_peer: &str,
+) -> Result<(), String> {
+    let target = migration_event_auth_target(vm_id, source_peer, target_peer);
+    authorizer.authorize(
+        body,
+        MutationContext {
+            verb,
+            node: COMPUTE_MIGRATE_NODE_SCOPE,
+            target: &target,
+        },
+    )
+}
+
+/// Verify the source-side request before the migration runner can invoke
+/// `virsh`, `rsync`, or any other backend.  Parsing and source-peer routing are
+/// deliberately performed before this call; they are pure and do not consume a
+/// capability nonce on peers that are not the request's source.
+fn authorize_source_request(
+    authorizer: &ActionAuthorizer,
+    body: &str,
+    req: &MigrateRequest,
+) -> Result<(), String> {
+    let target = migration_auth_target(req);
+    authorizer.authorize(
+        body,
+        MutationContext {
+            verb: COMPUTE_MIGRATE_AUTH_VERB,
+            node: COMPUTE_MIGRATE_NODE_SCOPE,
+            target: &target,
+        },
+    )
 }
 
 /// `true` when this peer is the source for the request.
@@ -635,6 +733,88 @@ fn run_source_undefine(vm_id: &str) -> bool {
     run_virsh_status(&build_virsh_undefine_args(vm_id))
 }
 
+fn build_authorized_migrate_event_body<T: serde::Serialize>(
+    event: &T,
+    verb: &str,
+    target: &str,
+    signer: &CloudArmSigner,
+    nonce: &str,
+    now_ms: i64,
+) -> Result<String, String> {
+    let mut document = serde_json::to_value(event)
+        .map_err(|error| format!("serialize migration event: {error}"))?;
+    if !document.is_object() {
+        return Err("migration event must serialize as a JSON object".into());
+    }
+    document["schema_version"] = serde_json::Value::from(ACTION_SCHEMA_VERSION);
+    let unsigned = document.to_string();
+    let token = CloudArmedToken::mint(
+        signer,
+        nonce,
+        now_ms.saturating_add(MAX_AUTH_TTL_MS),
+        verb,
+        COMPUTE_MIGRATE_NODE_SCOPE,
+        target,
+        &cloud_request_digest(&unsigned).map_err(str::to_string)?,
+    )
+    .encode();
+    document["armed_token"] = serde_json::Value::String(token);
+    Ok(document.to_string())
+}
+
+fn publish_authorized_migrate_event<T: serde::Serialize>(
+    persist: &Persist,
+    topic: &str,
+    event: &T,
+    verb: &str,
+    target: &str,
+    signer: &CloudArmSigner,
+    nonce: &str,
+    now_ms: i64,
+) -> Result<(), String> {
+    let body = build_authorized_migrate_event_body(event, verb, target, signer, nonce, now_ms)?;
+    persist
+        .write(topic, Priority::Default, None, Some(&body))
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+fn production_migrate_event_credentials() -> Result<(CloudArmSigner, String, i64), String> {
+    let signer = production_action_signer()?;
+    let nonce = uuid::Uuid::new_v4().to_string();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "system clock is before the Unix epoch".to_string())
+        .and_then(|duration| {
+            i64::try_from(duration.as_millis())
+                .map_err(|_| "system clock is beyond the capability range".to_string())
+        })?;
+    Ok((signer, nonce, now_ms))
+}
+
+fn publish_production_migrate_event<T: serde::Serialize>(
+    persist: &Persist,
+    topic: &str,
+    event: &T,
+    verb: &str,
+    target: &str,
+    vm_id: &str,
+    event_name: &str,
+) {
+    let (signer, nonce, now_ms) = match production_migrate_event_credentials() {
+        Ok(credentials) => credentials,
+        Err(error) => {
+            tracing::warn!(%error, %vm_id, event = event_name, "compute_migrate: migration event credentials unavailable");
+            return;
+        }
+    };
+    if let Err(error) = publish_authorized_migrate_event(
+        persist, topic, event, verb, target, &signer, &nonce, now_ms,
+    ) {
+        tracing::warn!(%error, %vm_id, event = event_name, "compute_migrate: authenticated migration event publish failed");
+    }
+}
+
 fn publish_migrate_failed(persist: &Persist, event: &MigrateReadyEvent, error: &str) {
     let failed = MigrateFailedEvent {
         vm_id: event.vm_id.clone(),
@@ -642,45 +822,47 @@ fn publish_migrate_failed(persist: &Persist, event: &MigrateReadyEvent, error: &
         request_ulid: event.request_ulid.clone(),
         error: error.to_string(),
     };
-    let Ok(body) = serde_json::to_string(&failed) else {
-        return;
-    };
-    if let Err(e) = persist.write(MIGRATE_FAILED_TOPIC, Priority::Default, None, Some(&body)) {
-        tracing::warn!(error = %e, vm_id = %event.vm_id, "compute_migrate: migrate-failed publish failed");
-    }
+    let target = migration_event_auth_target(&failed.vm_id, "", &failed.target_peer);
+    publish_production_migrate_event(
+        persist,
+        MIGRATE_FAILED_TOPIC,
+        &failed,
+        COMPUTE_MIGRATE_FAILED_AUTH_VERB,
+        &target,
+        &failed.vm_id,
+        "migrate-failed",
+    );
 }
 
 fn publish_migrate_ready(persist: &Persist, event: &MigrateReadyEvent) {
-    let Ok(body) = serde_json::to_string(event) else {
-        return;
-    };
-    if let Err(e) = persist.write(MIGRATE_READY_TOPIC, Priority::Default, None, Some(&body)) {
-        tracing::warn!(
-            error = %e,
-            vm_id = %event.vm_id,
-            target = %event.target_peer,
-            "compute_migrate: migrate-ready publish failed"
-        );
-    }
+    let target = migration_event_auth_target(&event.vm_id, &event.source_peer, &event.target_peer);
+    publish_production_migrate_event(
+        persist,
+        MIGRATE_READY_TOPIC,
+        event,
+        COMPUTE_MIGRATE_READY_AUTH_VERB,
+        &target,
+        &event.vm_id,
+        "migrate-ready",
+    );
 }
 
 fn publish_migrate_committed(persist: &Persist, event: &MigrateReadyEvent) {
     let committed = build_migrate_committed_event(event);
-    let Ok(body) = serde_json::to_string(&committed) else {
-        return;
-    };
-    if let Err(e) = persist.write(
+    let target = migration_event_auth_target(
+        &committed.vm_id,
+        &committed.source_peer,
+        &committed.target_peer,
+    );
+    publish_production_migrate_event(
+        persist,
         MIGRATE_COMMITTED_TOPIC,
-        Priority::Default,
-        None,
-        Some(&body),
-    ) {
-        tracing::warn!(
-            error = %e,
-            vm_id = %event.vm_id,
-            "compute_migrate: migrate-committed publish failed"
-        );
-    }
+        &committed,
+        COMPUTE_MIGRATE_COMMITTED_AUTH_VERB,
+        &target,
+        &committed.vm_id,
+        "migrate-committed",
+    );
 }
 
 /// A migration whose disk shipped + `migrate-ready` published, now
@@ -703,6 +885,7 @@ struct PendingCommit {
 fn drain_committed_events(
     persist: &Persist,
     cursor: &mut Option<String>,
+    authorizer: &ActionAuthorizer,
 ) -> Vec<MigrateCommittedEvent> {
     let msgs = match persist.list_since(MIGRATE_COMMITTED_TOPIC, cursor.as_deref()) {
         Ok(m) => m,
@@ -716,7 +899,25 @@ fn drain_committed_events(
         *cursor = Some(msg.ulid.clone());
         let body = msg.body.as_deref().unwrap_or("");
         match parse_migrate_committed_event(body) {
-            Ok(ev) => out.push(ev),
+            Ok(ev) => {
+                if let Err(error) = authorize_event_body(
+                    authorizer,
+                    body,
+                    COMPUTE_MIGRATE_COMMITTED_AUTH_VERB,
+                    &ev.vm_id,
+                    &ev.source_peer,
+                    &ev.target_peer,
+                ) {
+                    tracing::warn!(
+                        ulid = %msg.ulid,
+                        vm_id = %ev.vm_id,
+                        %error,
+                        "compute_migrate: refused unauthorized migrate-committed event"
+                    );
+                    continue;
+                }
+                out.push(ev)
+            }
             Err(e) => {
                 tracing::warn!(ulid = %msg.ulid, error = %e, "compute_migrate: bad migrate-committed event");
             }
@@ -729,7 +930,11 @@ fn drain_committed_events(
 /// `cursor` past every message and returns the parsed events; the run
 /// loop rolls back any pending commit whose `request_ulid` matches
 /// (vdi-vm-5).
-fn drain_failed_events(persist: &Persist, cursor: &mut Option<String>) -> Vec<MigrateFailedEvent> {
+fn drain_failed_events(
+    persist: &Persist,
+    cursor: &mut Option<String>,
+    authorizer: &ActionAuthorizer,
+) -> Vec<MigrateFailedEvent> {
     let msgs = match persist.list_since(MIGRATE_FAILED_TOPIC, cursor.as_deref()) {
         Ok(m) => m,
         Err(e) => {
@@ -742,7 +947,25 @@ fn drain_failed_events(persist: &Persist, cursor: &mut Option<String>) -> Vec<Mi
         *cursor = Some(msg.ulid.clone());
         let body = msg.body.as_deref().unwrap_or("");
         match parse_migrate_failed_event(body) {
-            Ok(ev) => out.push(ev),
+            Ok(ev) => {
+                if let Err(error) = authorize_event_body(
+                    authorizer,
+                    body,
+                    COMPUTE_MIGRATE_FAILED_AUTH_VERB,
+                    &ev.vm_id,
+                    "",
+                    &ev.target_peer,
+                ) {
+                    tracing::warn!(
+                        ulid = %msg.ulid,
+                        vm_id = %ev.vm_id,
+                        %error,
+                        "compute_migrate: refused unauthorized migrate-failed event"
+                    );
+                    continue;
+                }
+                out.push(ev)
+            }
             Err(e) => {
                 tracing::warn!(ulid = %msg.ulid, error = %e, "compute_migrate: bad migrate-failed event");
             }
@@ -758,6 +981,7 @@ pub struct ComputeMigrateWorker {
     poll_interval: Duration,
     commit_timeout: Duration,
     bus_root_override: Option<PathBuf>,
+    authorizer: Arc<ActionAuthorizer>,
 }
 
 impl Default for ComputeMigrateWorker {
@@ -776,6 +1000,7 @@ impl ComputeMigrateWorker {
             poll_interval: DEFAULT_POLL_INTERVAL,
             commit_timeout: DEFAULT_COMMIT_TIMEOUT,
             bus_root_override: None,
+            authorizer: Arc::new(ActionAuthorizer::production()),
         }
     }
 
@@ -807,6 +1032,16 @@ impl ComputeMigrateWorker {
     #[must_use]
     pub fn with_commit_timeout(mut self, d: Duration) -> Self {
         self.commit_timeout = d;
+        self
+    }
+
+    /// Inject an isolated verifier and replay ledger for focused tests.  The
+    /// production constructor always loads the root-only systemd credential and
+    /// fails closed when it is unavailable.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
+        self.authorizer = authorizer;
         self
     }
 }
@@ -859,6 +1094,15 @@ fn drain_source_jobs(
             );
             continue;
         }
+        if let Err(error) = authorize_source_request(&worker.authorizer, body, &req) {
+            tracing::warn!(
+                ulid = %msg.ulid,
+                vm_id = %req.vm_id,
+                %error,
+                "compute_migrate: refused unauthorized source request"
+            );
+            continue;
+        }
         jobs.push((msg.ulid.clone(), req));
     }
     jobs
@@ -896,13 +1140,29 @@ fn drain_target_jobs(
         if !is_target_peer(&event, &own_ip) {
             continue;
         }
+        if let Err(error) = authorize_event_body(
+            &worker.authorizer,
+            body,
+            COMPUTE_MIGRATE_READY_AUTH_VERB,
+            &event.vm_id,
+            &event.source_peer,
+            &event.target_peer,
+        ) {
+            tracing::warn!(
+                ulid = %msg.ulid,
+                vm_id = %event.vm_id,
+                %error,
+                "compute_migrate: refused unauthorized migrate-ready event"
+            );
+            continue;
+        }
         jobs.push(event);
     }
     jobs
 }
 
 fn default_bus_root() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join("mde").join("bus"))
+    mde_bus::default_data_dir()
 }
 
 #[async_trait::async_trait]
@@ -1006,12 +1266,20 @@ impl Worker for ComputeMigrateWorker {
                     // back from the retained dumpxml, so the VM is never lost.
                     if !pending_commits.is_empty() {
                         let committed_ulids: Vec<String> =
-                            drain_committed_events(&persist, &mut committed_cursor)
+                            drain_committed_events(
+                                &persist,
+                                &mut committed_cursor,
+                                self.authorizer.as_ref(),
+                            )
                                 .into_iter()
                                 .map(|e| e.request_ulid)
                                 .collect();
                         let failed_pairs: Vec<(String, String)> =
-                            drain_failed_events(&persist, &mut failed_cursor)
+                            drain_failed_events(
+                                &persist,
+                                &mut failed_cursor,
+                                self.authorizer.as_ref(),
+                            )
                                 .into_iter()
                                 .map(|e| (e.request_ulid, e.error))
                                 .collect();
@@ -1061,6 +1329,104 @@ impl Worker for ComputeMigrateWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::action_auth::{authorize_test_body, ActionAuthorizer};
+    use mackes_mesh_types::cloud::CloudArmSigner;
+    use std::sync::Arc;
+
+    const AUTH_KEY: &[u8] = b"compute-migrate-test-key";
+    const AUTH_NOW_MS: i64 = 1_700_000_000_000;
+
+    fn request_body(req: &MigrateRequest) -> String {
+        let mut value = serde_json::to_value(req).expect("request value");
+        value["schema_version"] = serde_json::Value::from(1_u64);
+        value.to_string()
+    }
+
+    fn authorized_request_body(req: &MigrateRequest, nonce: &str) -> String {
+        let unsigned = request_body(req);
+        let target = migration_auth_target(req);
+        authorize_test_body(
+            AUTH_KEY,
+            &unsigned,
+            MutationContext {
+                verb: COMPUTE_MIGRATE_AUTH_VERB,
+                node: COMPUTE_MIGRATE_NODE_SCOPE,
+                target: &target,
+            },
+            nonce,
+            AUTH_NOW_MS + 30_000,
+        )
+    }
+
+    fn test_worker_at(auth_root: &std::path::Path, own_ip: &str) -> ComputeMigrateWorker {
+        ComputeMigrateWorker::new()
+            .with_nebula_addr_hint(own_ip.into())
+            .with_authorizer(Arc::new(ActionAuthorizer::for_test(
+                AUTH_KEY,
+                auth_root.to_path_buf(),
+                AUTH_NOW_MS,
+            )))
+    }
+
+    fn test_worker(auth_root: &std::path::Path) -> ComputeMigrateWorker {
+        test_worker_at(auth_root, "10.42.0.1")
+    }
+
+    fn authorized_ready_body(event: &MigrateReadyEvent, nonce: &str) -> String {
+        let mut value = serde_json::to_value(event).expect("ready value");
+        value["schema_version"] = serde_json::Value::from(1_u64);
+        let unsigned = value.to_string();
+        let target =
+            migration_event_auth_target(&event.vm_id, &event.source_peer, &event.target_peer);
+        authorize_test_body(
+            AUTH_KEY,
+            &unsigned,
+            MutationContext {
+                verb: COMPUTE_MIGRATE_READY_AUTH_VERB,
+                node: COMPUTE_MIGRATE_NODE_SCOPE,
+                target: &target,
+            },
+            nonce,
+            AUTH_NOW_MS + 30_000,
+        )
+    }
+
+    fn authorized_committed_body(event: &MigrateCommittedEvent, nonce: &str) -> String {
+        let mut value = serde_json::to_value(event).expect("committed value");
+        value["schema_version"] = serde_json::Value::from(1_u64);
+        let unsigned = value.to_string();
+        let target =
+            migration_event_auth_target(&event.vm_id, &event.source_peer, &event.target_peer);
+        authorize_test_body(
+            AUTH_KEY,
+            &unsigned,
+            MutationContext {
+                verb: COMPUTE_MIGRATE_COMMITTED_AUTH_VERB,
+                node: COMPUTE_MIGRATE_NODE_SCOPE,
+                target: &target,
+            },
+            nonce,
+            AUTH_NOW_MS + 30_000,
+        )
+    }
+
+    fn authorized_failed_body(event: &MigrateFailedEvent, nonce: &str) -> String {
+        let mut value = serde_json::to_value(event).expect("failed value");
+        value["schema_version"] = serde_json::Value::from(1_u64);
+        let unsigned = value.to_string();
+        let target = migration_event_auth_target(&event.vm_id, "", &event.target_peer);
+        authorize_test_body(
+            AUTH_KEY,
+            &unsigned,
+            MutationContext {
+                verb: COMPUTE_MIGRATE_FAILED_AUTH_VERB,
+                node: COMPUTE_MIGRATE_NODE_SCOPE,
+                target: &target,
+            },
+            nonce,
+            AUTH_NOW_MS + 30_000,
+        )
+    }
 
     // ── parse_migrate_request ──
 
@@ -1413,15 +1779,21 @@ mod tests {
         // re-drives already-consumed messages.
         let tmp = tempfile::tempdir().unwrap();
         let persist = Persist::open(tmp.path().to_path_buf()).expect("persist");
-        let mine = r#"{"source_peer":"10.42.0.1","target_peer":"10.42.0.2","vm_id":"vm-mine","disk_path":"/var/lib/mde-vms/vm-mine.qcow2"}"#;
+        let mine_req = MigrateRequest {
+            source_peer: "10.42.0.1".into(),
+            target_peer: "10.42.0.2".into(),
+            vm_id: "vm-mine".into(),
+            disk_path: "/var/lib/mde-vms/vm-mine.qcow2".into(),
+        };
+        let mine = authorized_request_body(&mine_req, "drain-mine");
         let other = r#"{"source_peer":"10.42.0.9","target_peer":"10.42.0.2","vm_id":"vm-other","disk_path":"/d"}"#;
         persist
-            .write(ACTION_TOPIC, Priority::Default, None, Some(mine))
+            .write(ACTION_TOPIC, Priority::Default, None, Some(&mine))
             .unwrap();
         persist
             .write(ACTION_TOPIC, Priority::Default, None, Some(other))
             .unwrap();
-        let worker = ComputeMigrateWorker::new().with_nebula_addr_hint("10.42.0.1".into());
+        let worker = test_worker(tmp.path().join("auth").as_path());
         let mut cursor = None;
         let jobs = drain_source_jobs(&persist, &worker, &mut cursor);
         assert_eq!(jobs.len(), 1, "only the source-peer request is returned");
@@ -1429,6 +1801,398 @@ mod tests {
         // Cursor advanced past BOTH messages → a second drain is empty.
         assert!(cursor.is_some());
         assert!(drain_source_jobs(&persist, &worker, &mut cursor).is_empty());
+    }
+
+    #[test]
+    fn unsigned_source_request_is_refused_before_backend_dispatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let persist = Persist::open(tmp.path().to_path_buf()).expect("persist");
+        let req = MigrateRequest {
+            source_peer: "10.42.0.1".into(),
+            target_peer: "10.42.0.2".into(),
+            vm_id: "vm-unsigned".into(),
+            disk_path: "/var/lib/mde-vms/vm-unsigned.qcow2".into(),
+        };
+        let unsigned = request_body(&req);
+        persist
+            .write(ACTION_TOPIC, Priority::Default, None, Some(&unsigned))
+            .unwrap();
+        let worker = test_worker(tmp.path().join("auth").as_path());
+        let mut cursor = None;
+        // An empty dispatch set is the no-backend proof: the caller only passes
+        // returned jobs to the virsh/rsync runner.
+        assert!(drain_source_jobs(&persist, &worker, &mut cursor).is_empty());
+    }
+
+    #[test]
+    fn tampered_source_request_is_refused_but_original_capability_remains_valid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let persist = Persist::open(tmp.path().to_path_buf()).expect("persist");
+        let req = MigrateRequest {
+            source_peer: "10.42.0.1".into(),
+            target_peer: "10.42.0.2".into(),
+            vm_id: "vm-tamper".into(),
+            disk_path: "/var/lib/mde-vms/vm-tamper.qcow2".into(),
+        };
+        let armed = authorized_request_body(&req, "tamper-once");
+        let tampered = armed.replace("vm-tamper", "vm-other");
+        persist
+            .write(ACTION_TOPIC, Priority::Default, None, Some(&tampered))
+            .unwrap();
+        persist
+            .write(ACTION_TOPIC, Priority::Default, None, Some(&armed))
+            .unwrap();
+        let worker = test_worker(tmp.path().join("auth").as_path());
+        let mut cursor = None;
+        let jobs = drain_source_jobs(&persist, &worker, &mut cursor);
+        assert_eq!(jobs.len(), 1, "tamper must not consume the valid nonce");
+        assert_eq!(jobs[0].1.vm_id, "vm-tamper");
+    }
+
+    #[test]
+    fn replayed_source_request_is_refused_after_first_dispatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let persist = Persist::open(tmp.path().to_path_buf()).expect("persist");
+        let req = MigrateRequest {
+            source_peer: "10.42.0.1".into(),
+            target_peer: "10.42.0.2".into(),
+            vm_id: "vm-replay".into(),
+            disk_path: "/var/lib/mde-vms/vm-replay.qcow2".into(),
+        };
+        let armed = authorized_request_body(&req, "replay-once");
+        persist
+            .write(ACTION_TOPIC, Priority::Default, None, Some(&armed))
+            .unwrap();
+        persist
+            .write(ACTION_TOPIC, Priority::Default, None, Some(&armed))
+            .unwrap();
+        let worker = test_worker(tmp.path().join("auth").as_path());
+        let mut cursor = None;
+        let jobs = drain_source_jobs(&persist, &worker, &mut cursor);
+        assert_eq!(jobs.len(), 1, "a capability nonce is single-use");
+    }
+
+    fn ready_event_for_tests() -> MigrateReadyEvent {
+        MigrateReadyEvent {
+            source_peer: "10.42.0.1".into(),
+            target_peer: "10.42.0.2".into(),
+            vm_id: "vm-ready-auth".into(),
+            target_disk_path: "/var/lib/mde-vms/vm-ready-auth.qcow2".into(),
+            request_ulid: "01READYAUTH".into(),
+            domain_xml: "<domain><name>vm-ready-auth</name></domain>".into(),
+        }
+    }
+
+    #[test]
+    fn unsigned_ready_event_is_refused_before_target_backend_dispatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let persist = Persist::open(tmp.path().to_path_buf()).expect("persist");
+        let event = ready_event_for_tests();
+        let unsigned = serde_json::to_string(&event).unwrap();
+        persist
+            .write(
+                MIGRATE_READY_TOPIC,
+                Priority::Default,
+                None,
+                Some(&unsigned),
+            )
+            .unwrap();
+        let worker = test_worker_at(tmp.path().join("auth").as_path(), "10.42.0.2");
+        let mut cursor = None;
+        // No event reaches run_migrate_target, so no virsh define/start can run.
+        assert!(drain_target_jobs(&persist, &worker, &mut cursor).is_empty());
+    }
+
+    #[test]
+    fn tampered_ready_event_is_refused_without_consuming_valid_event_nonce() {
+        let tmp = tempfile::tempdir().unwrap();
+        let persist = Persist::open(tmp.path().to_path_buf()).expect("persist");
+        let event = ready_event_for_tests();
+        let armed = authorized_ready_body(&event, "ready-tamper-once");
+        let tampered = armed.replace("vm-ready-auth", "vm-ready-other");
+        persist
+            .write(
+                MIGRATE_READY_TOPIC,
+                Priority::Default,
+                None,
+                Some(&tampered),
+            )
+            .unwrap();
+        persist
+            .write(MIGRATE_READY_TOPIC, Priority::Default, None, Some(&armed))
+            .unwrap();
+        let worker = test_worker_at(tmp.path().join("auth").as_path(), "10.42.0.2");
+        let mut cursor = None;
+        let jobs = drain_target_jobs(&persist, &worker, &mut cursor);
+        assert_eq!(jobs.len(), 1, "tamper must not consume the valid nonce");
+        assert_eq!(jobs[0].vm_id, event.vm_id);
+    }
+
+    #[test]
+    fn replayed_ready_event_is_refused_after_first_target_dispatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let persist = Persist::open(tmp.path().to_path_buf()).expect("persist");
+        let event = ready_event_for_tests();
+        let armed = authorized_ready_body(&event, "ready-replay-once");
+        for _ in 0..2 {
+            persist
+                .write(MIGRATE_READY_TOPIC, Priority::Default, None, Some(&armed))
+                .unwrap();
+        }
+        let worker = test_worker_at(tmp.path().join("auth").as_path(), "10.42.0.2");
+        let mut cursor = None;
+        let jobs = drain_target_jobs(&persist, &worker, &mut cursor);
+        assert_eq!(jobs.len(), 1, "event capability nonce is single-use");
+    }
+
+    #[test]
+    fn unsigned_commit_and_failure_events_cannot_resolve_source_destructive_steps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let persist = Persist::open(tmp.path().to_path_buf()).expect("persist");
+        let committed = MigrateCommittedEvent {
+            vm_id: "vm-complete-auth".into(),
+            source_peer: "10.42.0.1".into(),
+            target_peer: "10.42.0.2".into(),
+            request_ulid: "01COMPLETEAUTH".into(),
+        };
+        let failed = MigrateFailedEvent {
+            vm_id: committed.vm_id.clone(),
+            target_peer: committed.target_peer.clone(),
+            request_ulid: committed.request_ulid.clone(),
+            error: "target refused".into(),
+        };
+        persist
+            .write(
+                MIGRATE_COMMITTED_TOPIC,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&committed).unwrap()),
+            )
+            .unwrap();
+        persist
+            .write(
+                MIGRATE_FAILED_TOPIC,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&failed).unwrap()),
+            )
+            .unwrap();
+        let worker = test_worker(tmp.path().join("auth").as_path());
+        let mut committed_cursor = None;
+        let mut failed_cursor = None;
+        let committed_events =
+            drain_committed_events(&persist, &mut committed_cursor, worker.authorizer.as_ref());
+        let failed_events =
+            drain_failed_events(&persist, &mut failed_cursor, worker.authorizer.as_ref());
+        assert!(committed_events.is_empty());
+        assert!(failed_events.is_empty());
+        assert_eq!(
+            classify_commit(&committed.request_ulid, &[], &[], false),
+            CommitResolution::Pending,
+            "without an authenticated receipt the source must not undefine or roll back"
+        );
+    }
+
+    #[test]
+    fn authenticated_commit_and_failure_events_are_admitted_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let persist = Persist::open(tmp.path().to_path_buf()).expect("persist");
+        let committed = MigrateCommittedEvent {
+            vm_id: "vm-complete-auth-ok".into(),
+            source_peer: "10.42.0.1".into(),
+            target_peer: "10.42.0.2".into(),
+            request_ulid: "01COMPLETEAUTHOK".into(),
+        };
+        let failed = MigrateFailedEvent {
+            vm_id: committed.vm_id.clone(),
+            target_peer: committed.target_peer.clone(),
+            request_ulid: "01FAILAUTHOK".into(),
+            error: "target refused".into(),
+        };
+        let committed_body = authorized_committed_body(&committed, "commit-auth-once");
+        let failed_body = authorized_failed_body(&failed, "failed-auth-once");
+        persist
+            .write(
+                MIGRATE_COMMITTED_TOPIC,
+                Priority::Default,
+                None,
+                Some(&committed_body),
+            )
+            .unwrap();
+        persist
+            .write(
+                MIGRATE_FAILED_TOPIC,
+                Priority::Default,
+                None,
+                Some(&failed_body),
+            )
+            .unwrap();
+        let worker = test_worker(tmp.path().join("auth").as_path());
+        let mut committed_cursor = None;
+        let mut failed_cursor = None;
+        let committed_events =
+            drain_committed_events(&persist, &mut committed_cursor, worker.authorizer.as_ref());
+        let failed_events =
+            drain_failed_events(&persist, &mut failed_cursor, worker.authorizer.as_ref());
+        assert_eq!(committed_events, vec![committed]);
+        assert_eq!(failed_events, vec![failed]);
+    }
+
+    #[test]
+    fn published_event_envelopes_pass_the_receiving_gates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let persist = Persist::open(tmp.path().to_path_buf()).expect("persist");
+        let signer = CloudArmSigner::new(AUTH_KEY.to_vec()).expect("test signer");
+        let ready = ready_event_for_tests();
+        let committed = build_migrate_committed_event(&ready);
+        let failed = MigrateFailedEvent {
+            vm_id: ready.vm_id.clone(),
+            target_peer: ready.target_peer.clone(),
+            request_ulid: ready.request_ulid.clone(),
+            error: "target refused".into(),
+        };
+
+        publish_authorized_migrate_event(
+            &persist,
+            MIGRATE_READY_TOPIC,
+            &ready,
+            COMPUTE_MIGRATE_READY_AUTH_VERB,
+            &migration_event_auth_target(&ready.vm_id, &ready.source_peer, &ready.target_peer),
+            &signer,
+            "emitted-ready-0123456789abcdef0123456789",
+            AUTH_NOW_MS,
+        )
+        .expect("publish ready");
+        publish_authorized_migrate_event(
+            &persist,
+            MIGRATE_COMMITTED_TOPIC,
+            &committed,
+            COMPUTE_MIGRATE_COMMITTED_AUTH_VERB,
+            &migration_event_auth_target(
+                &committed.vm_id,
+                &committed.source_peer,
+                &committed.target_peer,
+            ),
+            &signer,
+            "emitted-committed-0123456789abcdef0123",
+            AUTH_NOW_MS,
+        )
+        .expect("publish committed");
+        publish_authorized_migrate_event(
+            &persist,
+            MIGRATE_FAILED_TOPIC,
+            &failed,
+            COMPUTE_MIGRATE_FAILED_AUTH_VERB,
+            &migration_event_auth_target(&failed.vm_id, "", &failed.target_peer),
+            &signer,
+            "emitted-failed-0123456789abcdef012345",
+            AUTH_NOW_MS,
+        )
+        .expect("publish failed");
+
+        for topic in [
+            MIGRATE_READY_TOPIC,
+            MIGRATE_COMMITTED_TOPIC,
+            MIGRATE_FAILED_TOPIC,
+        ] {
+            let messages = persist.list_since(topic, None).expect("list emitted event");
+            let body = messages
+                .last()
+                .and_then(|message| message.body.as_deref())
+                .expect("emitted event body");
+            let document: serde_json::Value = serde_json::from_str(body).expect("event JSON");
+            assert_eq!(document["schema_version"], serde_json::json!(1));
+            assert!(document["armed_token"].as_str().is_some());
+        }
+
+        let worker = test_worker_at(tmp.path().join("auth").as_path(), "10.42.0.2");
+        let mut ready_cursor = None;
+        let mut committed_cursor = None;
+        let mut failed_cursor = None;
+        assert_eq!(
+            drain_target_jobs(&persist, &worker, &mut ready_cursor),
+            vec![ready]
+        );
+        assert_eq!(
+            drain_committed_events(&persist, &mut committed_cursor, worker.authorizer.as_ref()),
+            vec![committed]
+        );
+        assert_eq!(
+            drain_failed_events(&persist, &mut failed_cursor, worker.authorizer.as_ref()),
+            vec![failed]
+        );
+    }
+
+    #[test]
+    fn unsigned_tampered_and_replayed_commit_and_failure_events_are_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let persist = Persist::open(tmp.path().to_path_buf()).expect("persist");
+        let committed = MigrateCommittedEvent {
+            vm_id: "vm-negative-auth".into(),
+            source_peer: "10.42.0.1".into(),
+            target_peer: "10.42.0.2".into(),
+            request_ulid: "01NEGATIVEAUTH".into(),
+        };
+        let failed = MigrateFailedEvent {
+            vm_id: committed.vm_id.clone(),
+            target_peer: committed.target_peer.clone(),
+            request_ulid: committed.request_ulid.clone(),
+            error: "target refused".into(),
+        };
+        let committed_body =
+            authorized_committed_body(&committed, "negative-committed-0123456789abcdef0123");
+        let failed_body = authorized_failed_body(&failed, "negative-failed-0123456789abcdef012345");
+        let tampered_committed = committed_body.replace("vm-negative-auth", "vm-tampered-auth");
+        let tampered_failed = failed_body.replace("target refused", "tampered failure");
+
+        persist
+            .write(
+                MIGRATE_COMMITTED_TOPIC,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&committed).unwrap()),
+            )
+            .unwrap();
+        for body in [&tampered_committed, &committed_body, &committed_body] {
+            persist
+                .write(MIGRATE_COMMITTED_TOPIC, Priority::Default, None, Some(body))
+                .unwrap();
+        }
+        persist
+            .write(
+                MIGRATE_FAILED_TOPIC,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&failed).unwrap()),
+            )
+            .unwrap();
+        for body in [&tampered_failed, &failed_body, &failed_body] {
+            persist
+                .write(MIGRATE_FAILED_TOPIC, Priority::Default, None, Some(body))
+                .unwrap();
+        }
+
+        let worker = test_worker(tmp.path().join("auth").as_path());
+        let mut committed_cursor = None;
+        let mut failed_cursor = None;
+        assert_eq!(
+            drain_committed_events(&persist, &mut committed_cursor, worker.authorizer.as_ref()),
+            vec![committed]
+        );
+        assert_eq!(
+            drain_failed_events(&persist, &mut failed_cursor, worker.authorizer.as_ref()),
+            vec![failed]
+        );
+        assert!(drain_committed_events(
+            &persist,
+            &mut committed_cursor,
+            worker.authorizer.as_ref()
+        )
+        .is_empty());
+        assert!(
+            drain_failed_events(&persist, &mut failed_cursor, worker.authorizer.as_ref())
+                .is_empty()
+        );
     }
 
     // ── vdi-vm-5: deferred undefine behind a target commit ack ──
@@ -1620,23 +2384,26 @@ mod tests {
             target_peer: "10.42.0.2".into(),
             request_ulid: "01B".into(),
         };
+        let auth_root = tmp.path().join("auth");
+        let authorizer = ActionAuthorizer::for_test(AUTH_KEY, auth_root, AUTH_NOW_MS);
         for ev in [&a, &b] {
+            let body = authorized_committed_body(ev, &format!("drain-{}", ev.request_ulid));
             persist
                 .write(
                     MIGRATE_COMMITTED_TOPIC,
                     Priority::Default,
                     None,
-                    Some(&serde_json::to_string(ev).unwrap()),
+                    Some(&body),
                 )
                 .unwrap();
         }
         let mut cursor = None;
-        let drained = drain_committed_events(&persist, &mut cursor);
+        let drained = drain_committed_events(&persist, &mut cursor, &authorizer);
         assert_eq!(drained.len(), 2);
         let ulids: Vec<&str> = drained.iter().map(|e| e.request_ulid.as_str()).collect();
         assert!(ulids.contains(&"01A") && ulids.contains(&"01B"));
         assert!(cursor.is_some());
-        assert!(drain_committed_events(&persist, &mut cursor).is_empty());
+        assert!(drain_committed_events(&persist, &mut cursor, &authorizer).is_empty());
     }
 
     #[test]
@@ -1647,9 +2414,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let persist = Persist::open(tmp.path().to_path_buf()).expect("persist");
         let mut committed_cursor = None;
+        let authorizer = ActionAuthorizer::for_test(AUTH_KEY, tmp.path().join("auth"), AUTH_NOW_MS);
 
         // Tick 1: no ack yet → Pending (source keeps the shut-off anchor).
-        let acks = drain_committed_events(&persist, &mut committed_cursor);
+        let acks = drain_committed_events(&persist, &mut committed_cursor, &authorizer);
         let ulids: Vec<String> = acks.into_iter().map(|e| e.request_ulid).collect();
         assert_eq!(
             classify_commit("01JAN", &ulids, &[], false),
@@ -1663,17 +2431,18 @@ mod tests {
             target_peer: "10.42.0.2".into(),
             request_ulid: "01JAN".into(),
         };
+        let committed_body = authorized_committed_body(&committed, "lifecycle-commit");
         persist
             .write(
                 MIGRATE_COMMITTED_TOPIC,
                 Priority::Default,
                 None,
-                Some(&serde_json::to_string(&committed).unwrap()),
+                Some(&committed_body),
             )
             .unwrap();
 
         // Tick 2: ack observed → Undefine authorized.
-        let acks = drain_committed_events(&persist, &mut committed_cursor);
+        let acks = drain_committed_events(&persist, &mut committed_cursor, &authorizer);
         let ulids: Vec<String> = acks.into_iter().map(|e| e.request_ulid).collect();
         assert_eq!(
             classify_commit("01JAN", &ulids, &[], false),

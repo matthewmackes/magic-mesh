@@ -61,6 +61,14 @@ pub const ENROLL_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// operator at the manual `mackesd ca sign-csr` recovery step.
 pub const ENROLL_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Maximum age (and tolerated clock skew into the future) for a pending CSR.
+/// The CSR carries an untrusted wall-clock timestamp, so both old and
+/// implausibly future-dated requests must be rejected before bearer
+/// authorization or signing. Five minutes leaves room for the 30-second
+/// replicated-file watcher cadence without allowing an issued bearer to sit
+/// signable indefinitely.
+pub const PENDING_CSR_MAX_AGE_SECS: i64 = 5 * 60;
+
 /// Parsed wire-form of `mesh:<id>@<ip>:<port>#<bearer>`. Lock-step
 /// with the Python `JoinToken` dataclass in
 /// `mackes/wizard/pages/mesh_passcode.py` so the wizard + the
@@ -164,13 +172,81 @@ fn is_mesh_id_url_safe(s: &str) -> bool {
 }
 
 fn is_bearer_url_safe(s: &str) -> bool {
-    s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '=' | '-'))
+    // Keep the legacy allowance for base-encoded padding, but never accept
+    // payload characters after the first `=`.  Otherwise malformed framing
+    // such as `bearer=tail` is accepted and can reach the network-enroll
+    // transport before the lighthouse rejects the bearer.
+    let (payload, padding) = s.split_once('=').unwrap_or((s, ""));
+    !payload.is_empty()
+        && payload
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+        && padding.chars().all(|c| c == '=')
 }
 
 fn is_lower_hex(s: &str) -> bool {
     s.chars()
         .all(|c| c.is_ascii_digit() || matches!(c, 'a'..='f'))
+}
+
+/// Keep a peer identity a single filesystem component. Enrollment uses the
+/// identity in replicated paths and scratch filenames, so accepting `/`, `\`,
+/// traversal components, or control characters would turn a bearer-authorized
+/// request into an arbitrary-path authority.
+fn validate_peer_id(peer_id: &str) -> Result<(), String> {
+    if peer_id.is_empty() || peer_id.trim() != peer_id {
+        return Err("peer node-id must be non-empty and contain no surrounding whitespace".into());
+    }
+    if peer_id.len() > 255 || peer_id == "." || peer_id == ".." {
+        return Err(format!("unsafe peer node-id {peer_id:?}"));
+    }
+    if peer_id
+        .chars()
+        .any(|c| c == '/' || c == '\\' || c.is_control())
+    {
+        return Err(format!(
+            "unsafe peer node-id {peer_id:?}: path separators and control characters are forbidden"
+        ));
+    }
+    Ok(())
+}
+
+/// Validate the complete CSR identity before any CA lookup, bearer decision,
+/// subprocess invocation, or durable write. The network endpoint deserializes
+/// the wire struct directly, so it must not rely on the CLI token parser having
+/// run first.
+fn validate_pending_csr(csr: &PendingEnrollment) -> Result<(), String> {
+    validate_peer_id(&csr.node_id)?;
+    if parse_join_token(&csr.token.encode()).as_ref() != Some(&csr.token) {
+        return Err("pending enrollment carries an invalid join token".into());
+    }
+    if csr.public_key_hex.len() != 64 || !is_lower_hex(&csr.public_key_hex) {
+        return Err("pending enrollment carries an invalid Ed25519 identity key".into());
+    }
+    if csr.display_name.len() > 256 || csr.hw_fingerprint.len() > 256 {
+        return Err("pending enrollment identity metadata is too large".into());
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| {
+            "pending enrollment freshness cannot be checked: system clock is before the UNIX epoch"
+                .to_string()
+        })
+        .and_then(|duration| {
+            i64::try_from(duration.as_secs()).map_err(|_| {
+                "pending enrollment freshness cannot be checked: system clock is out of range"
+                    .to_string()
+            })
+        })?;
+    let oldest_allowed = now.saturating_sub(PENDING_CSR_MAX_AGE_SECS);
+    let newest_allowed = now.saturating_add(PENDING_CSR_MAX_AGE_SECS);
+    if !(oldest_allowed..=newest_allowed).contains(&csr.created_at) {
+        return Err(format!(
+            "pending enrollment CSR is stale or future-dated (created_at {}, accepted range {}..={})",
+            csr.created_at, oldest_allowed, newest_allowed
+        ));
+    }
+    Ok(())
 }
 
 fn is_ipv4(s: &str) -> bool {
@@ -307,6 +383,16 @@ pub fn publish_enrollment_request(
     node_id: &str,
     pending: &PendingEnrollment,
 ) -> Result<PathBuf, EnrollError> {
+    validate_peer_id(node_id).map_err(|reason| EnrollError::PublishFailed { reason })?;
+    if pending.node_id != node_id {
+        return Err(EnrollError::PublishFailed {
+            reason: format!(
+                "enrollment target mismatch: path target {node_id:?} does not match CSR node-id {:?}",
+                pending.node_id
+            ),
+        });
+    }
+    validate_pending_csr(pending).map_err(|reason| EnrollError::PublishFailed { reason })?;
     let path = pending_enroll_path(workgroup_root, node_id);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| EnrollError::PublishFailed {
@@ -316,13 +402,10 @@ pub fn publish_enrollment_request(
     let body = serde_json::to_vec_pretty(pending).map_err(|e| EnrollError::PublishFailed {
         reason: e.to_string(),
     })?;
-    // Atomic write: temp file + rename so a lighthouse polling
-    // mid-write never reads a half-formed CSR.
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &body).map_err(|e| EnrollError::PublishFailed {
-        reason: e.to_string(),
-    })?;
-    std::fs::rename(&tmp, &path).map_err(|e| EnrollError::PublishFailed {
+    // Atomic write: unique O_EXCL/no-follow staging + fsync + rename so a
+    // lighthouse polling mid-write never reads a half-formed CSR, and a
+    // hostile fixed-name temp symlink cannot redirect the write.
+    crate::ca::seal::write_atomic_sealed(&path, &body).map_err(|e| EnrollError::PublishFailed {
         reason: e.to_string(),
     })?;
     Ok(path)
@@ -475,6 +558,11 @@ pub struct SignOutcome {
 /// lighthouse-specific copy without mixing in peer hints.
 #[derive(Debug)]
 pub enum SignCsrError {
+    /// The requested peer name is not a safe single path component.
+    InvalidTarget {
+        /// Rejected target supplied by the caller.
+        node_id: String,
+    },
     /// No pending-enroll CSR for the named peer.
     CsrMissing {
         /// Path the lighthouse looked at.
@@ -485,6 +573,15 @@ pub enum SignCsrError {
     CsrCorrupt {
         /// Underlying parser error.
         reason: String,
+    },
+    /// The CSR was found under one peer's replicated entry but claimed a
+    /// different identity. Refuse before CA signing, bearer consumption, or
+    /// bundle delivery.
+    CsrTargetMismatch {
+        /// Directory target selected by the caller.
+        requested: String,
+        /// Identity claimed by the CSR body.
+        claimed: String,
     },
     /// ENT-1 (C1) — the presented bearer is not in the
     /// issued-but-unredeemed ledger: wrong, replayed, or never
@@ -535,6 +632,10 @@ pub enum SignCsrError {
 impl std::fmt::Display for SignCsrError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidTarget { node_id } => write!(
+                f,
+                "enrollment target {node_id:?} is not a safe single peer node-id"
+            ),
             Self::CsrMissing { path } => write!(
                 f,
                 "no pending-enroll CSR at {}. Has the peer \
@@ -545,6 +646,10 @@ impl std::fmt::Display for SignCsrError {
                 f,
                 "pending-enroll CSR didn't parse: {reason}. \
                  Confirm both peers are on the same MDE release.",
+            ),
+            Self::CsrTargetMismatch { requested, claimed } => write!(
+                f,
+                "pending-enroll CSR target mismatch: requested {requested:?}, but the CSR claims {claimed:?}"
             ),
             Self::BearerNotIssued { node_id } => write!(
                 f,
@@ -632,17 +737,32 @@ pub fn sign_pending_csr<B: crate::ca::NebulaCertBackend + ?Sized>(
     lighthouses: Vec<crate::ca::bundle::LighthouseEntry>,
     allow_override: bool,
 ) -> Result<SignOutcome, SignCsrError> {
-    let csr_path = pending_enroll_path(workgroup_root, peer_id);
-    if !csr_path.exists() {
-        return Err(SignCsrError::CsrMissing { path: csr_path });
-    }
-    let csr_bytes = std::fs::read(&csr_path).map_err(|e| SignCsrError::CsrCorrupt {
-        reason: format!("read {}: {e}", csr_path.display()),
+    validate_peer_id(peer_id).map_err(|_| SignCsrError::InvalidTarget {
+        node_id: peer_id.to_string(),
     })?;
+    let csr_path = pending_enroll_path(workgroup_root, peer_id);
+    let csr_bytes = match crate::ca::seal::read_no_follow(&csr_path) {
+        Ok(bytes) => bytes,
+        Err(_error) if std::fs::symlink_metadata(&csr_path).is_err() => {
+            return Err(SignCsrError::CsrMissing { path: csr_path });
+        }
+        Err(error) => {
+            return Err(SignCsrError::CsrCorrupt {
+                reason: error.to_string(),
+            });
+        }
+    };
     let csr: PendingEnrollment =
         serde_json::from_slice(&csr_bytes).map_err(|e| SignCsrError::CsrCorrupt {
             reason: e.to_string(),
         })?;
+    validate_pending_csr(&csr).map_err(|reason| SignCsrError::CsrCorrupt { reason })?;
+    if csr.node_id != peer_id {
+        return Err(SignCsrError::CsrTargetMismatch {
+            requested: peer_id.to_string(),
+            claimed: csr.node_id,
+        });
+    }
     if crate::bearer_ledger::is_lighthouse_bearer(workgroup_root, &csr.token.bearer) {
         return Err(SignCsrError::LighthouseRequiresAuthenticatedTransport {
             node_id: csr.node_id.clone(),
@@ -725,8 +845,38 @@ pub fn sign_csr_into_bundle<B: crate::ca::NebulaCertBackend + ?Sized>(
     lighthouses: Vec<crate::ca::bundle::LighthouseEntry>,
     allow_override: bool,
 ) -> Result<crate::ca::bundle::AuthenticatedEnrollmentResponse, SignCsrError> {
+    validate_pending_csr(csr).map_err(|reason| SignCsrError::CsrCorrupt { reason })?;
     // The mesh the peer is actually joining (authoritative — bed fix #5).
     let mesh_id: &str = &csr.token.mesh_id;
+    // Bind the subprocess signer to the active issuer recorded in SQLite.
+    // Without this preflight, an operator-supplied --ca-crt/--ca-key pair could
+    // sign a valid-looking peer certificate under a different CA while the
+    // bundle and database claimed the mesh's active issuer. Fail before bearer
+    // authorization, subprocess work, or any durable state change.
+    let (_, active_ca_pem) = crate::ca::mint::current_ca(conn, mesh_id)
+        .map_err(|e| SignCsrError::SignFailed {
+            reason: format!("read active CA issuer: {e}"),
+        })?
+        .ok_or_else(|| SignCsrError::SignFailed {
+            reason: format!("no active CA for mesh {mesh_id}"),
+        })?;
+    let ca_cert_pem =
+        String::from_utf8(crate::ca::seal::read_no_follow(&paths.ca_crt).map_err(|e| {
+            SignCsrError::SignFailed {
+                reason: format!("read CA cert {}: {e}", paths.ca_crt.display()),
+            }
+        })?)
+        .map_err(|e| SignCsrError::SignFailed {
+            reason: format!("CA cert is not UTF-8: {e}"),
+        })?;
+    if ca_cert_pem != active_ca_pem {
+        return Err(SignCsrError::SignFailed {
+            reason: format!(
+                "CA issuer mismatch: {} does not match the active mesh issuer in SQLite",
+                paths.ca_crt.display()
+            ),
+        });
+    }
     // EPIC-SEC-BANLIST (Q53) — refuse a banned node-id BEFORE the
     // cap check + before any signing work. A ban is a deliberate,
     // permanent block that survives CA rotation; there is no
@@ -872,10 +1022,6 @@ pub fn sign_csr_into_bundle<B: crate::ca::NebulaCertBackend + ?Sized>(
         );
     }
     // Read the CA cert PEM for the bundle.
-    let ca_cert_pem =
-        std::fs::read_to_string(&paths.ca_crt).map_err(|e| SignCsrError::SignFailed {
-            reason: format!("read CA cert {}: {e}", paths.ca_crt.display()),
-        })?;
     // #12 — a lighthouse-authorized join also receives the CA PRIVATE key (the
     // receiver seals it at rest) so the new node can itself sign/enroll. `None` for
     // ordinary peers — they never carry the CA key.
@@ -1044,6 +1190,16 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n-----END NEBULA X25519 PUBLIC KEY-
     }
 
     #[test]
+    fn parse_rejects_nonterminal_bearer_padding() {
+        // A bearer may retain legacy terminal `=` padding, but no payload
+        // character may follow it.  Otherwise the malformed token can pass
+        // parsing and reach the network-enroll transport.
+        assert!(parse_join_token("mesh:m@10.0.0.5:4242#bearer=tail").is_none());
+        assert!(parse_join_token("mesh:m@10.0.0.5:4242#=bearer").is_none());
+        assert!(parse_join_token("mesh:m@10.0.0.5:4242#bearer=_tail").is_none());
+    }
+
+    #[test]
     fn parse_accepts_url_safe_mesh_id() {
         for mesh_id in ["m", "mesh-001", "mesh_001", "mesh.001", "Mesh-A1.b_2"] {
             let raw = format!("mesh:{mesh_id}@10.0.0.5:4242#bearer");
@@ -1142,6 +1298,44 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n-----END NEBULA X25519 PUBLIC KEY-
         // Temp file shouldn't survive the atomic rename.
         let tmp_file = p2.with_extension("json.tmp");
         assert!(!tmp_file.exists());
+    }
+
+    #[test]
+    fn publish_refuses_a_path_target_that_does_not_match_the_csr_identity() {
+        let tmp = tempdir().expect("tempdir");
+        let identity = build_identity();
+        let token = parse_join_token("mesh:m@10.0.0.5:4242#bearer").unwrap();
+        let pending = build_pending_with_nebula_key(
+            &identity,
+            "peer:claimed",
+            "claimed",
+            token,
+            TEST_NEBULA_PUBLIC_KEY,
+        );
+
+        let error = publish_enrollment_request(tmp.path(), "peer:other", &pending)
+            .expect_err("a CSR must not be published under another peer target");
+        assert!(error.to_string().contains("target mismatch"));
+        assert!(!pending_enroll_path(tmp.path(), "peer:other").exists());
+    }
+
+    #[test]
+    fn publish_rejects_path_escape_before_creating_any_directory() {
+        let tmp = tempdir().expect("tempdir");
+        let identity = build_identity();
+        let token = parse_join_token("mesh:m@10.0.0.5:4242#bearer").unwrap();
+        let pending = build_pending_with_nebula_key(
+            &identity,
+            "../outside",
+            "outside",
+            token,
+            TEST_NEBULA_PUBLIC_KEY,
+        );
+
+        let error = publish_enrollment_request(tmp.path(), "../outside", &pending)
+            .expect_err("path traversal must be refused");
+        assert!(error.to_string().contains("unsafe peer node-id"));
+        assert!(!tmp.path().join("outside").exists());
     }
 
     // ---- wait_for_signed_bundle -----------------------------
@@ -1356,6 +1550,187 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n-----END NEBULA X25519 PUBLIC KEY-
         )
         .expect("mint");
         (ca_crt, ca_key)
+    }
+
+    #[test]
+    fn sign_csr_refuses_a_csr_claiming_a_different_path_target_without_effects() {
+        let tmp = tempdir().expect("tempdir");
+        let conn = fresh_store();
+        let (ca_crt, ca_key) = make_test_ca(tmp.path(), &conn);
+        let identity = build_identity();
+        let token = parse_join_token("mesh:test-mesh@10.0.0.5:4242#target-mismatch").unwrap();
+        crate::bearer_ledger::record_issued(tmp.path(), &token.bearer).expect("seed bearer");
+        let pending = build_pending_with_nebula_key(
+            &identity,
+            "peer:claimed",
+            "claimed",
+            token,
+            TEST_NEBULA_PUBLIC_KEY,
+        );
+        let target_path = pending_enroll_path(tmp.path(), "peer:target");
+        std::fs::create_dir_all(target_path.parent().unwrap()).expect("mkdir");
+        std::fs::write(&target_path, serde_json::to_vec(&pending).unwrap()).expect("seed CSR");
+        let paths = SignCsrPaths {
+            ca_crt,
+            ca_key,
+            scratch_dir: tmp.path().join("scratch"),
+        };
+
+        let error = sign_pending_csr(
+            &MockBackend,
+            &conn,
+            tmp.path(),
+            "peer:target",
+            "test-mesh",
+            &paths,
+            Vec::new(),
+            false,
+        )
+        .expect_err("claimed identity must bind to the selected target path");
+        assert!(matches!(error, SignCsrError::CsrTargetMismatch { .. }));
+        assert!(crate::bearer_ledger::is_pending(
+            tmp.path(),
+            "target-mismatch"
+        ));
+        assert!(!crate::ca::bundle::bundle_path(tmp.path(), "peer:target").exists());
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nebula_peer_certs WHERE node_id = 'peer:claimed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "target mismatch must not create a cert row");
+    }
+
+    #[test]
+    fn sign_csr_refuses_a_non_active_ca_issuer_before_consuming_bearer() {
+        let tmp = tempdir().expect("tempdir");
+        let conn = fresh_store();
+        let (_ca_crt, ca_key) = make_test_ca(tmp.path(), &conn);
+        let pending = place_csr(tmp.path(), "peer:issuer-mismatch");
+        let wrong_ca_crt = tmp.path().join("wrong-ca.crt");
+        std::fs::write(&wrong_ca_crt, "-----BEGIN OTHER CA-----\nwrong\n").expect("wrong issuer");
+        let paths = SignCsrPaths {
+            ca_crt: wrong_ca_crt,
+            ca_key,
+            scratch_dir: tmp.path().join("scratch"),
+        };
+
+        let error = sign_csr_into_bundle(
+            &MockBackend,
+            &conn,
+            tmp.path(),
+            &pending,
+            &paths,
+            Vec::new(),
+            false,
+        )
+        .expect_err("the signer must bind to the active database issuer");
+        assert!(
+            matches!(error, SignCsrError::SignFailed { ref reason } if reason.contains("issuer mismatch"))
+        );
+        assert!(crate::bearer_ledger::is_pending(
+            tmp.path(),
+            &pending.token.bearer
+        ));
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nebula_peer_certs WHERE node_id = 'peer:issuer-mismatch'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "issuer mismatch must not create a cert row");
+    }
+
+    #[test]
+    fn sign_csr_refuses_stale_pending_csr_before_consuming_bearer() {
+        let tmp = tempdir().expect("tempdir");
+        let conn = fresh_store();
+        let (ca_crt, ca_key) = make_test_ca(tmp.path(), &conn);
+        let mut pending = place_csr(tmp.path(), "peer:stale");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock")
+            .as_secs() as i64;
+        pending.created_at = now.saturating_sub(PENDING_CSR_MAX_AGE_SECS + 1);
+        let path = pending_enroll_path(tmp.path(), &pending.node_id);
+        std::fs::write(&path, serde_json::to_vec(&pending).unwrap()).expect("rewrite stale CSR");
+        let paths = SignCsrPaths {
+            ca_crt,
+            ca_key,
+            scratch_dir: tmp.path().join("scratch"),
+        };
+
+        let error = sign_pending_csr(
+            &MockBackend,
+            &conn,
+            tmp.path(),
+            &pending.node_id,
+            "test-mesh",
+            &paths,
+            Vec::new(),
+            false,
+        )
+        .expect_err("an old CSR must not be signable");
+        assert!(
+            matches!(error, SignCsrError::CsrCorrupt { ref reason } if reason.contains("stale or future-dated")),
+            "unexpected error: {error:?}"
+        );
+        assert!(
+            crate::bearer_ledger::is_pending(tmp.path(), &pending.token.bearer),
+            "freshness rejection must not consume the bearer"
+        );
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nebula_peer_certs WHERE node_id = 'peer:stale'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "stale CSR must not create a cert row");
+    }
+
+    #[test]
+    fn sign_csr_refuses_far_future_pending_csr() {
+        let tmp = tempdir().expect("tempdir");
+        let conn = fresh_store();
+        let (ca_crt, ca_key) = make_test_ca(tmp.path(), &conn);
+        let mut pending = place_csr(tmp.path(), "peer:future");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock")
+            .as_secs() as i64;
+        pending.created_at = now.saturating_add(PENDING_CSR_MAX_AGE_SECS + 1);
+        let path = pending_enroll_path(tmp.path(), &pending.node_id);
+        std::fs::write(&path, serde_json::to_vec(&pending).unwrap())
+            .expect("rewrite future-dated CSR");
+        let paths = SignCsrPaths {
+            ca_crt,
+            ca_key,
+            scratch_dir: tmp.path().join("scratch"),
+        };
+
+        let error = sign_pending_csr(
+            &MockBackend,
+            &conn,
+            tmp.path(),
+            &pending.node_id,
+            "test-mesh",
+            &paths,
+            Vec::new(),
+            false,
+        )
+        .expect_err("a far-future CSR must not bypass freshness");
+        assert!(
+            matches!(error, SignCsrError::CsrCorrupt { ref reason } if reason.contains("stale or future-dated")),
+            "unexpected error: {error:?}"
+        );
+        assert!(crate::bearer_ledger::is_pending(
+            tmp.path(),
+            &pending.token.bearer
+        ));
     }
 
     /// Write a pending-enroll CSR under workgroup_root/peer_id/mackesd/

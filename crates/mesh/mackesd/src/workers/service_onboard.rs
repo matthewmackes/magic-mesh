@@ -31,10 +31,12 @@
 #![cfg(feature = "async-services")]
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use mde_bus::persist::Persist;
 
+use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
 use crate::onboard::service_add::{
     execute, plan_service_add, ServiceAddFacts, ServiceAddRequest, ServiceApply, ServiceError,
     ServiceKind, SipAccount,
@@ -51,6 +53,15 @@ pub const ACTION_TOPIC: &str = "action/onboard/service-add";
 /// Bus event topic the typed result is published on — the matching
 /// `event/<domain>/<verb>` lane the shell's Services flow tails.
 pub const EVENT_TOPIC: &str = "event/onboard/service-add";
+
+/// Closed capability verb for non-preview service onboarding actions.
+pub const SERVICE_ONBOARD_AUTH_VERB: &str = "service-onboard";
+
+/// Stable capability scope for this leader-coordinated service plane.
+pub const SERVICE_ONBOARD_NODE_SCOPE: &str = "service-onboard";
+
+/// Current wire schema for service-add actions.
+pub const SERVICE_ACTION_SCHEMA_VERSION: u64 = 1;
 
 /// Poll cadence. The bus read is a cheap local log scan and a service add is a
 /// slow, operator-paced event, so the 2 s `session_broker` cadence is responsive
@@ -80,6 +91,9 @@ pub struct SipParams {
 /// caller-minted `id` the result event echoes for correlation.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ServiceAddAction {
+    /// Version of the action envelope; apply capabilities bind this field.
+    #[serde(default = "default_service_action_schema_version")]
+    pub schema_version: u64,
     /// Caller-minted correlation id — echoed on the [`ServiceAddEvent`].
     pub id: String,
     /// Which curated service to add (reused [`ServiceKind`] — `music` | `files`
@@ -93,6 +107,10 @@ pub struct ServiceAddAction {
     /// never touched.
     #[serde(default)]
     pub dry_run: bool,
+}
+
+const fn default_service_action_schema_version() -> u64 {
+    SERVICE_ACTION_SCHEMA_VERSION
 }
 
 /// Parse a [`ServiceAddAction`] body.
@@ -222,8 +240,12 @@ pub fn resolve(
 
 /// Read new [`ACTION_TOPIC`] messages since `cursor`, advancing it. A short sync
 /// open-read-drop (never crosses an `.await`), mirroring `session_broker`. A
-/// malformed action is dropped honestly with a warn.
-fn read_new_actions(bus_root: &Path, cursor: &mut Option<String>) -> Vec<ServiceAddAction> {
+/// malformed action is dropped honestly with a warn. Raw bodies stay attached
+/// until the elected node can authenticate them immediately before resolution.
+fn read_new_actions(
+    bus_root: &Path,
+    cursor: &mut Option<String>,
+) -> Vec<(String, ServiceAddAction)> {
     let Ok(persist) = Persist::open(bus_root.to_path_buf()) else {
         return vec![];
     };
@@ -235,7 +257,7 @@ fn read_new_actions(bus_root: &Path, cursor: &mut Option<String>) -> Vec<Service
         *cursor = Some(msg.ulid.clone());
         let body = msg.body.as_deref().unwrap_or("");
         match parse_action(body) {
-            Ok(a) => out.push(a),
+            Ok(a) => out.push((body.to_string(), a)),
             Err(e) => {
                 tracing::warn!(ulid = %msg.ulid, error = %e, "service_onboard: bad service-add action");
             }
@@ -252,8 +274,40 @@ fn prime_cursor(bus_root: &Path) -> Option<String> {
     msgs.last().map(|m| m.ulid.clone())
 }
 
+/// Bind a service-add capability to the semantic service target, not merely the
+/// shared action topic. Voice includes its external registrar/account identity;
+/// Music and Files are closed service scopes because they do not accept a
+/// caller-selected host target.
+#[must_use]
+fn service_auth_target(action: &ServiceAddAction) -> String {
+    match (action.kind, action.sip.as_ref()) {
+        (ServiceKind::Voice, Some(sip)) => format!(
+            "service:voice:{}@{} via {}",
+            sip.username, sip.domain, sip.registrar
+        ),
+        (kind, _) => format!("service:{}", kind.as_str()),
+    }
+}
+
+/// Verify the exact original body before [`resolve`] can reach any apply seam.
+fn authorize_service_action(
+    authorizer: &ActionAuthorizer,
+    body: &str,
+    action: &ServiceAddAction,
+) -> Result<(), String> {
+    let target = service_auth_target(action);
+    authorizer.authorize(
+        body,
+        MutationContext {
+            verb: SERVICE_ONBOARD_AUTH_VERB,
+            node: SERVICE_ONBOARD_NODE_SCOPE,
+            target: &target,
+        },
+    )
+}
+
 fn default_bus_root() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join("mde").join("bus"))
+    mde_bus::default_data_dir()
 }
 
 /// The Bus-reachable `onboard service-add` worker. Leader-gated + best-effort.
@@ -272,6 +326,9 @@ pub struct ServiceOnboardWorker {
     publisher: Box<dyn Publisher + Send + Sync>,
     /// Poll cadence.
     poll: Duration,
+    /// Exact-body capability verifier for the privileged apply lane.
+    /// Missing production credentials fail closed.
+    authorizer: Arc<ActionAuthorizer>,
     /// Bus root override (tests). `None` ⇒ [`default_bus_root`].
     bus_root_override: Option<PathBuf>,
 }
@@ -290,6 +347,7 @@ impl ServiceOnboardWorker {
             apply: Box::new(crate::onboard::service_add::LiveServiceApply::default()),
             publisher: Box::new(BusPublisher),
             poll: DEFAULT_POLL_INTERVAL,
+            authorizer: Arc::new(ActionAuthorizer::production()),
             bus_root_override: None,
         }
     }
@@ -322,6 +380,15 @@ impl ServiceOnboardWorker {
         self
     }
 
+    /// Inject an isolated verifier and replay ledger for focused action tests.
+    /// Production always uses the root-only systemd-credential-backed verifier.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
+        self.authorizer = authorizer;
+        self
+    }
+
     fn bus_root(&self) -> Option<PathBuf> {
         self.bus_root_override.clone().or_else(default_bus_root)
     }
@@ -349,7 +416,23 @@ impl ServiceOnboardWorker {
         // Gather once per tick — the replicated roster is the same for every
         // action in this batch.
         let facts = crate::onboard::service_add::gather(&self.workgroup_root);
-        for action in actions {
+        for (body, action) in actions {
+            // Dry-run is a read-only plan preview and remains usable without an
+            // arm token. Every apply, including currently retired/no-op branches,
+            // is authenticated before `resolve` can reach `execute` or a future
+            // ServiceApply backend.
+            if !action.dry_run {
+                if let Err(error) =
+                    authorize_service_action(self.authorizer.as_ref(), &body, &action)
+                {
+                    tracing::warn!(
+                        id = %action.id,
+                        error = %error,
+                        "service_onboard: unauthorized service-add apply refused"
+                    );
+                    continue;
+                }
+            }
             let event = resolve(&action, &facts, self.apply.as_ref());
             match serde_json::to_string(&event) {
                 Ok(body) => self.publisher.publish(EVENT_TOPIC, &body),
@@ -390,6 +473,7 @@ impl Worker for ServiceOnboardWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::action_auth::authorize_test_body;
     use crate::onboard::service_add::{
         LighthouseFact, LiveServiceApply, MediaLighthouseTarget, MusicEndpoint,
     };
@@ -414,6 +498,7 @@ mod tests {
 
     fn action(kind: ServiceKind, sip: Option<SipParams>, dry_run: bool) -> ServiceAddAction {
         ServiceAddAction {
+            schema_version: SERVICE_ACTION_SCHEMA_VERSION,
             id: format!("svc-test-{}", kind.as_str()),
             kind,
             sip,
@@ -433,7 +518,7 @@ mod tests {
     /// never touch the seam, and that applies drive it.
     #[derive(Default)]
     struct FakeApply {
-        calls: Mutex<Vec<&'static str>>,
+        calls: Arc<Mutex<Vec<&'static str>>>,
     }
 
     impl ServiceApply for FakeApply {
@@ -483,6 +568,7 @@ mod tests {
         // Pin the exact bytes the shell's mirror serialises (its own test pins
         // the identical string) so the two sides can't silently drift.
         let a = ServiceAddAction {
+            schema_version: SERVICE_ACTION_SCHEMA_VERSION,
             id: "svc-42-voice".to_string(),
             kind: ServiceKind::Voice,
             sip: Some(sip()),
@@ -491,7 +577,7 @@ mod tests {
         let json = serde_json::to_string(&a).expect("serialize");
         assert_eq!(
             json,
-            r#"{"id":"svc-42-voice","kind":"voice","sip":{"registrar":"sip.provider.net","domain":"provider.net","username":"alice"},"dry_run":true}"#
+            r#"{"schema_version":1,"id":"svc-42-voice","kind":"voice","sip":{"registrar":"sip.provider.net","domain":"provider.net","username":"alice"},"dry_run":true}"#
         );
         assert_eq!(parse_action(&json).expect("parse"), a);
         // Music/Files omit `sip`; `dry_run` defaults false when absent.
@@ -651,6 +737,35 @@ mod tests {
         assert!(ev.summary.contains("retired"));
     }
 
+    #[test]
+    fn apply_capability_rejects_unsigned_tampered_and_replayed_bodies() {
+        const KEY: &[u8] = b"service-onboard-action-auth-key";
+        const NOW: i64 = 1_700_000_000_000;
+        let unsigned = r#"{"schema_version":1,"id":"svc-auth-voice","kind":"voice","sip":{"registrar":"sip.provider.net","domain":"provider.net","username":"alice"},"dry_run":false}"#;
+        let action = parse_action(unsigned).expect("valid service action");
+        let target = service_auth_target(&action);
+        let armed = authorize_test_body(
+            KEY,
+            unsigned,
+            MutationContext {
+                verb: SERVICE_ONBOARD_AUTH_VERB,
+                node: SERVICE_ONBOARD_NODE_SCOPE,
+                target: &target,
+            },
+            "service-onboard-once",
+            NOW + 30_000,
+        );
+        let tampered = armed.replace("alice", "mallory");
+        let tampered_action = parse_action(&tampered).expect("tamper remains parseable");
+        let auth_root = tempfile::tempdir().expect("auth root");
+        let authorizer = ActionAuthorizer::for_test(KEY, auth_root.path().to_path_buf(), NOW);
+
+        assert!(authorize_service_action(&authorizer, unsigned, &action).is_err());
+        assert!(authorize_service_action(&authorizer, &tampered, &tampered_action).is_err());
+        assert!(authorize_service_action(&authorizer, &armed, &action).is_ok());
+        assert!(authorize_service_action(&authorizer, &armed, &action).is_err());
+    }
+
     // ── the worker: drain → resolve → publish ──
 
     /// A [`Publisher`] recorder (the `scheduler` test seam re-typed locally —
@@ -677,16 +792,19 @@ mod tests {
     }
 
     fn seed_bus(actions: &[ServiceAddAction]) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("mde-so-{}-{}", now_ms(), actions.len()));
+        let bodies = actions
+            .iter()
+            .map(|action| serde_json::to_string(action).unwrap())
+            .collect::<Vec<_>>();
+        seed_bus_bodies(&bodies)
+    }
+
+    fn seed_bus_bodies(bodies: &[String]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mde-so-{}-{}", now_ms(), bodies.len()));
         let persist = Persist::open(dir.clone()).expect("open bus");
-        for a in actions {
+        for body in bodies {
             persist
-                .write(
-                    ACTION_TOPIC,
-                    Priority::Default,
-                    None,
-                    Some(&serde_json::to_string(a).unwrap()),
-                )
+                .write(ACTION_TOPIC, Priority::Default, None, Some(body))
                 .expect("write action");
         }
         dir
@@ -698,6 +816,7 @@ mod tests {
         // EVENT_TOPIC with the echoed id (a fresh temp workgroup ⇒ this node
         // wins the leader lock).
         let bus = seed_bus(&[ServiceAddAction {
+            schema_version: SERVICE_ACTION_SCHEMA_VERSION,
             id: "svc-77-files".to_string(),
             kind: ServiceKind::Files,
             sip: None,
@@ -728,6 +847,56 @@ mod tests {
         w.drain_and_publish(&bus, &mut cursor);
         assert_eq!(log.lock().expect("recorder mutex").len(), 1);
 
+        let _ = std::fs::remove_dir_all(&bus);
+        let _ = std::fs::remove_dir_all(&wg);
+    }
+
+    #[test]
+    fn worker_authenticates_apply_before_the_backend_and_consumes_replay_once() {
+        const KEY: &[u8] = b"service-onboard-worker-auth-key";
+        const NOW: i64 = 1_700_000_000_000;
+        let unsigned = r#"{"schema_version":1,"id":"svc-worker-voice","kind":"voice","sip":{"registrar":"sip.provider.net","domain":"provider.net","username":"alice"},"dry_run":false}"#;
+        let action = parse_action(unsigned).expect("valid service action");
+        let target = service_auth_target(&action);
+        let armed = authorize_test_body(
+            KEY,
+            unsigned,
+            MutationContext {
+                verb: SERVICE_ONBOARD_AUTH_VERB,
+                node: SERVICE_ONBOARD_NODE_SCOPE,
+                target: &target,
+            },
+            "service-onboard-worker-once",
+            NOW + 30_000,
+        );
+        let bus = seed_bus_bodies(&[unsigned.to_string(), armed.clone(), armed]);
+        let wg = std::env::temp_dir().join(format!("mde-so-auth-wg-{}", now_ms()));
+        std::fs::create_dir_all(&wg).expect("mk workgroup");
+        let auth_root = tempfile::tempdir().expect("auth root");
+        let apply = FakeApply::default();
+        let calls = apply.calls.clone();
+        let rec = RecordingPublisher::default();
+        let sent = rec.sent.clone();
+        let authorizer = Arc::new(ActionAuthorizer::for_test(
+            KEY,
+            auth_root.path().to_path_buf(),
+            NOW,
+        ));
+        let worker = ServiceOnboardWorker::new(wg.clone(), "peer:auth".to_string())
+            .with_apply(Box::new(apply))
+            .with_publisher(Box::new(rec))
+            .with_authorizer(authorizer)
+            .with_bus_root(bus.clone());
+
+        let mut cursor = None;
+        worker.drain_and_publish(&bus, &mut cursor);
+
+        assert_eq!(
+            calls.lock().expect("calls mutex").as_slice(),
+            ["register_voice"],
+            "unsigned and replayed requests must not reach the apply seam"
+        );
+        assert_eq!(sent.lock().expect("sent mutex").len(), 1);
         let _ = std::fs::remove_dir_all(&bus);
         let _ = std::fs::remove_dir_all(&wg);
     }

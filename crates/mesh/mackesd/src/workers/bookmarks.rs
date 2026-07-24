@@ -71,6 +71,7 @@ use mde_bus::persist::Persist;
 use uuid::Uuid;
 
 use super::{ShutdownToken, Worker};
+use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
 
 /// The `action/bookmarks/` RPC domain prefix this worker drains.
 ///
@@ -126,6 +127,12 @@ pub const DEFAULT_TAIL_THRESHOLD: usize = 256;
 
 /// The `action/bookmarks/<verb>` slot used for daemon-owned dead-link checks.
 const CHECK_LINKS_VERB: &str = "check-links";
+
+/// The fixed target used when an add-folder request lets the worker mint its
+/// id. Every other mutating target is derived from a typed UUID, while `add`
+/// deliberately binds the exact trimmed URL to match the shell publisher's
+/// `bookmarks-add` contract.
+const BOOKMARKS_COLLECTION_TARGET: &str = "collection";
 
 /// Hard cap per link-check request. The worker is operator-triggered but still
 /// bounded so a stale imported collection cannot turn into a network storm.
@@ -364,6 +371,30 @@ pub fn parse_action(verb: &str, body: &str) -> Result<BookmarkAction, String> {
             })
         }
         other => Err(format!("unknown bookmarks action verb `{other}`")),
+    }
+}
+
+/// Return the stable capability context for one parsed bookmark mutation.
+///
+/// The shell publisher and this worker intentionally share this contract:
+/// `add` uses `bookmarks-add`, the local daemon node, and the trimmed URL as
+/// target. Other verbs use a fixed `bookmarks-*` verb and a target that is
+/// either a typed item/folder UUID or the collection when the worker mints a
+/// new folder id. Targets never become filesystem paths or shell arguments.
+fn action_auth_context(action: &BookmarkAction) -> (&'static str, String) {
+    match action {
+        BookmarkAction::Add { url, .. } => ("bookmarks-add", url.trim().to_string()),
+        BookmarkAction::Edit { id, .. } => ("bookmarks-edit", format!("bookmark:{id}")),
+        BookmarkAction::Move { id, .. } => ("bookmarks-move", format!("bookmark:{id}")),
+        BookmarkAction::Delete { id } => ("bookmarks-delete", format!("bookmark:{id}")),
+        BookmarkAction::AddFolder { id: Some(id), .. } => {
+            ("bookmarks-add-folder", format!("folder:{id}"))
+        }
+        BookmarkAction::AddFolder { id: None, .. } => (
+            "bookmarks-add-folder",
+            BOOKMARKS_COLLECTION_TARGET.to_string(),
+        ),
+        BookmarkAction::Rename { id, .. } => ("bookmarks-rename", format!("folder:{id}")),
     }
 }
 
@@ -753,6 +784,8 @@ pub struct BookmarksWorker {
     share_gate: Option<Arc<AtomicBool>>,
     /// Bus spool root override (tests point this at a tempdir).
     bus_root_override: Option<PathBuf>,
+    /// Exact-body capability verifier for the root-owned replicated store.
+    authorizer: Arc<ActionAuthorizer>,
 }
 
 impl BookmarksWorker {
@@ -784,6 +817,7 @@ impl BookmarksWorker {
             link_probe: Arc::new(probe_link_with_curl),
             share_gate: None,
             bus_root_override: None,
+            authorizer: Arc::new(ActionAuthorizer::production()),
         }
     }
 
@@ -819,6 +853,13 @@ impl BookmarksWorker {
     #[must_use]
     pub fn with_bus_root(mut self, root: PathBuf) -> Self {
         self.bus_root_override = Some(root);
+        self
+    }
+
+    /// Override the production capability verifier for isolated tests.
+    #[must_use]
+    pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
+        self.authorizer = authorizer;
         self
     }
 
@@ -1254,8 +1295,20 @@ impl BookmarksWorker {
             };
             for msg in msgs {
                 self.cursors.insert(topic.clone(), msg.ulid.clone());
+                let body = msg.body.as_deref().unwrap_or_default();
+                if !crate::ipc::body_within_cap(Some(body)) {
+                    tracing::warn!(
+                        target: "mackesd::bookmarks",
+                        verb = %verb,
+                        "oversized bookmarks request refused"
+                    );
+                    continue;
+                }
                 if verb == CHECK_LINKS_VERB {
-                    match parse_link_check_request(msg.body.as_deref().unwrap_or_default()) {
+                    // This is daemon-owned observational state: it never mints
+                    // or persists a BookmarkAction, so retain its existing
+                    // internally-triggered behavior outside the mutation gate.
+                    match parse_link_check_request(body) {
                         Ok(request) => {
                             let status = self.run_link_check(&request);
                             self.publish_link_check(persist, &status);
@@ -1266,8 +1319,25 @@ impl BookmarksWorker {
                     }
                     continue;
                 }
-                match parse_action(&verb, msg.body.as_deref().unwrap_or_default()) {
+                match parse_action(&verb, body) {
                     Ok(action) => {
+                        let (auth_verb, target) = action_auth_context(&action);
+                        if let Err(error) = self.authorizer.authorize(
+                            body,
+                            MutationContext {
+                                verb: auth_verb,
+                                node: &self.node,
+                                target: &target,
+                            },
+                        ) {
+                            tracing::warn!(
+                                target: "mackesd::bookmarks",
+                                verb = %auth_verb,
+                                error = %error,
+                                "unauthorized bookmarks mutation refused"
+                            );
+                            continue;
+                        }
                         self.apply_action(action);
                         changed = true;
                     }
@@ -1390,7 +1460,11 @@ fn default_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::action_auth::authorize_test_body;
     use std::sync::atomic::AtomicU64;
+
+    const AUTH_KEY: &[u8] = b"bookmarks-action-auth-test-key";
+    const AUTH_NOW: i64 = 1_700_000_000_000;
 
     // ── a deterministic fake wall clock shared across nodes ─────────────────
 
@@ -1409,6 +1483,22 @@ mod tests {
             share.to_path_buf(),
         )
         .with_now_fn(now)
+    }
+
+    fn signed_body(node: &str, topic_verb: &str, unsigned: &str, nonce: &str) -> String {
+        let action = parse_action(topic_verb, unsigned).expect("valid bookmark action");
+        let (verb, target) = action_auth_context(&action);
+        authorize_test_body(
+            AUTH_KEY,
+            unsigned,
+            MutationContext {
+                verb,
+                node,
+                target: &target,
+            },
+            nonce,
+            AUTH_NOW + 30_000,
+        )
     }
 
     fn add(url: &str, title: &str) -> BookmarkAction {
@@ -1511,6 +1601,181 @@ mod tests {
         assert!(parse_action("edit", r#"{"title":"x"}"#).is_err());
         // `add` without a url is malformed.
         assert!(parse_action("add", "{}").is_err());
+    }
+
+    #[test]
+    fn bookmark_mutation_auth_context_is_stable_and_safe() {
+        let id = Uuid::from_u128(7);
+        let (verb, target) = action_auth_context(&BookmarkAction::Add {
+            id: None,
+            parent: None,
+            order_key: None,
+            url: "  https://example.test/item  ".into(),
+            title: "Example".into(),
+            tags: vec![],
+            notes: String::new(),
+            source: None,
+        });
+        assert_eq!(verb, "bookmarks-add");
+        assert_eq!(target, "https://example.test/item");
+
+        assert_eq!(
+            action_auth_context(&BookmarkAction::Edit {
+                id,
+                url: None,
+                title: Some("Edited".into()),
+                tags: None,
+                notes: None,
+            }),
+            ("bookmarks-edit", format!("bookmark:{id}"))
+        );
+        assert_eq!(
+            action_auth_context(&BookmarkAction::Move {
+                id,
+                parent: None,
+                order_key: None,
+                before: None,
+                after: None,
+            }),
+            ("bookmarks-move", format!("bookmark:{id}"))
+        );
+        assert_eq!(
+            action_auth_context(&BookmarkAction::Delete { id }),
+            ("bookmarks-delete", format!("bookmark:{id}"))
+        );
+        assert_eq!(
+            action_auth_context(&BookmarkAction::AddFolder {
+                id: Some(id),
+                parent: None,
+                order_key: None,
+                name: "Folder".into(),
+            }),
+            ("bookmarks-add-folder", format!("folder:{id}"))
+        );
+        assert_eq!(
+            action_auth_context(&BookmarkAction::AddFolder {
+                id: None,
+                parent: None,
+                order_key: None,
+                name: "Folder".into(),
+            }),
+            ("bookmarks-add-folder", BOOKMARKS_COLLECTION_TARGET.into())
+        );
+        assert_eq!(
+            action_auth_context(&BookmarkAction::Rename {
+                id,
+                name: "Renamed".into(),
+            }),
+            ("bookmarks-rename", format!("folder:{id}"))
+        );
+    }
+
+    #[test]
+    fn unauthorized_bookmark_mutations_have_no_effect() {
+        let (_c, now) = fake_clock(1000);
+        let local = tempfile::tempdir().unwrap();
+        let share = tempfile::tempdir().unwrap();
+        let bus = tempfile::tempdir().unwrap();
+        let auth_root = tempfile::tempdir().unwrap();
+        let authorizer = Arc::new(ActionAuthorizer::for_test(
+            AUTH_KEY,
+            auth_root.path().to_path_buf(),
+            AUTH_NOW,
+        ));
+        let mut w =
+            worker("n1", "alice", local.path(), share.path(), now).with_authorizer(authorizer);
+        let persist = Persist::open(bus.path().to_path_buf()).unwrap();
+        let topic = format!("{ACTION_PREFIX}add");
+
+        // Unsigned requests are transport-reachable but never administrative.
+        persist
+            .write(
+                &topic,
+                Priority::Default,
+                None,
+                Some(r#"{"url":"https://unsigned.test","title":"Unsigned"}"#),
+            )
+            .unwrap();
+
+        // A valid envelope whose signed body is changed after minting fails
+        // exact-body verification before the worker can mint an Op.
+        let signed = signed_body(
+            "n1",
+            "add",
+            r#"{"schema_version":1,"url":"https://signed.test","title":"Signed"}"#,
+            "nonce-tampered-bookmark",
+        );
+        let mut tampered: serde_json::Value = serde_json::from_str(&signed).unwrap();
+        tampered["title"] = serde_json::Value::String("Tampered".into());
+        let tampered = tampered.to_string();
+        persist
+            .write(&topic, Priority::Default, None, Some(&tampered))
+            .unwrap();
+
+        // Future schema is rejected even if a token-shaped field is present.
+        let future = signed_body(
+            "n1",
+            "add",
+            r#"{"schema_version":2,"url":"https://future.test","title":"Future"}"#,
+            "nonce-future-bookmark",
+        );
+        persist
+            .write(&topic, Priority::Default, None, Some(&future))
+            .unwrap();
+
+        // The shared responder cap is enforced before JSON parsing or auth.
+        let oversized = format!(
+            r#"{{"url":"https://oversized.test","title":"{}"}}"#,
+            "x".repeat(crate::ipc::MAX_RPC_BODY_BYTES + 1)
+        );
+        persist
+            .write(&topic, Priority::Default, None, Some(&oversized))
+            .unwrap();
+
+        w.drain_requests(&persist);
+        assert_eq!(w.collection().len(), 0);
+        assert!(w.own_tail.is_empty());
+        assert_eq!(w.pending, 0);
+        assert!(!segment_path(local.path(), "n1").exists());
+    }
+
+    #[test]
+    fn authorized_bookmark_add_is_single_use_and_replay_has_no_effect() {
+        let (_c, now) = fake_clock(1000);
+        let local = tempfile::tempdir().unwrap();
+        let share = tempfile::tempdir().unwrap();
+        let bus = tempfile::tempdir().unwrap();
+        let auth_root = tempfile::tempdir().unwrap();
+        let authorizer = Arc::new(ActionAuthorizer::for_test(
+            AUTH_KEY,
+            auth_root.path().to_path_buf(),
+            AUTH_NOW,
+        ));
+        let mut w =
+            worker("n1", "alice", local.path(), share.path(), now).with_authorizer(authorizer);
+        let persist = Persist::open(bus.path().to_path_buf()).unwrap();
+        let topic = format!("{ACTION_PREFIX}add");
+        let unsigned =
+            r#"{"schema_version":1,"url":"https://example.test/item","title":"Example"}"#;
+        let signed = signed_body("n1", "add", unsigned, "nonce-single-use-bookmark");
+
+        persist
+            .write(&topic, Priority::Default, None, Some(&signed))
+            .unwrap();
+        w.drain_requests(&persist);
+        assert_eq!(w.collection().len(), 1);
+        assert_eq!(w.own_tail.len(), 1);
+        assert_eq!(w.pending, 1);
+
+        // A second Bus message carrying the same capability is rejected by the
+        // durable nonce ledger, even though it has a fresh message ULID.
+        persist
+            .write(&topic, Priority::Default, None, Some(&signed))
+            .unwrap();
+        w.drain_requests(&persist);
+        assert_eq!(w.collection().len(), 1);
+        assert_eq!(w.own_tail.len(), 1);
+        assert_eq!(w.pending, 1);
     }
 
     #[test]

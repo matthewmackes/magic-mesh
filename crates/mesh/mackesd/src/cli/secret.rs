@@ -25,10 +25,13 @@ pub fn run(cmd: SecretCmd) -> anyhow::Result<()> {
     };
     match cmd {
         SecretCmd::Put { name, local } => {
+            let store = store_for(local);
+            mackesd_core::ipc::secret_store::SecretStore::validate_name(&name)
+                .map_err(|e| anyhow::anyhow!(e))?;
             let mut plaintext = String::new();
             std::io::Read::read_to_string(&mut std::io::stdin(), &mut plaintext)
                 .context("reading secret plaintext from stdin")?;
-            store_for(local)
+            store
                 .put(&name, &plaintext)
                 .map_err(|e| anyhow::anyhow!(e))?;
             eprintln!(
@@ -65,7 +68,63 @@ pub fn run(cmd: SecretCmd) -> anyhow::Result<()> {
 /// too, but failing early gives an operator-actionable message). The phrase is
 /// NEVER logged — only its presence/length feeds the error path.
 fn read_passphrase_file(path: &std::path::Path) -> anyhow::Result<String> {
-    let raw = std::fs::read_to_string(path)
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("inspecting passphrase file {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        anyhow::bail!(
+            "passphrase file {} is a symlink; use a root-owned regular file",
+            path.display()
+        );
+    }
+    if !metadata.is_file() {
+        anyhow::bail!("passphrase path {} is not a regular file", path.display());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = metadata.permissions().mode();
+        if mode & 0o077 != 0 {
+            anyhow::bail!(
+                "passphrase file {} is group/world accessible (mode {:o}); use 0600 or stricter",
+                path.display(),
+                mode & 0o777
+            );
+        }
+    }
+    #[cfg(unix)]
+    let mut file: std::fs::File = {
+        use rustix::fs::{Mode, OFlags};
+        rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .with_context(|| format!("opening passphrase file {}", path.display()))?
+        .into()
+    };
+    #[cfg(not(unix))]
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("opening passphrase file {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let opened = file
+            .metadata()
+            .with_context(|| format!("inspecting opened passphrase file {}", path.display()))?;
+        if !opened.is_file() {
+            anyhow::bail!("passphrase path {} is not a regular file", path.display());
+        }
+        let mode = opened.permissions().mode();
+        if mode & 0o077 != 0 {
+            anyhow::bail!(
+                "passphrase file {} became group/world accessible (mode {:o})",
+                path.display(),
+                mode & 0o777
+            );
+        }
+    }
+    let mut raw = String::new();
+    std::io::Read::read_to_string(&mut file, &mut raw)
         .with_context(|| format!("reading passphrase file {}", path.display()))?;
     // Take the first line; strip a single trailing CR/LF pair, not interior bytes.
     let phrase = raw.lines().next().unwrap_or("").to_string();
@@ -135,4 +194,31 @@ pub fn unseal(passphrase_file: &std::path::Path) -> anyhow::Result<()> {
         .write_all(&plain)
         .context("writing unsealed plaintext to stdout")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_passphrase_file;
+
+    #[cfg(unix)]
+    #[test]
+    fn passphrase_reader_rejects_symlinks_and_loose_permissions() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let passphrase = tmp.path().join("passphrase");
+        std::fs::write(&passphrase, "correct horse battery staple\n").unwrap();
+        std::fs::set_permissions(&passphrase, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_passphrase_file(&passphrase).is_err());
+
+        std::fs::set_permissions(&passphrase, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            read_passphrase_file(&passphrase).unwrap(),
+            "correct horse battery staple"
+        );
+
+        let link = tmp.path().join("passphrase-link");
+        symlink(&passphrase, &link).unwrap();
+        assert!(read_passphrase_file(&link).is_err());
+    }
 }

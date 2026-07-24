@@ -50,6 +50,8 @@ use std::time::Duration;
 
 use mde_bus::persist::Persist;
 
+use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
+
 use super::session_broker::SessionId;
 use super::{ShutdownToken, Worker};
 
@@ -60,6 +62,12 @@ use super::{ShutdownToken, Worker};
 /// clipboard endpoint. Sits beside the broker's `action/vdi/session` and the
 /// roaming plane's `action/vdi/roaming` under the shared `action/vdi/` namespace.
 pub const ACTION_TOPIC: &str = "action/vdi/clipboard";
+
+/// Capability verb for the local OS/guest clipboard write handoff.
+pub const ACTION_AUTH_VERB: &str = "vdi-clipboard-write";
+
+/// Stable node scope used by the clipboard bridge's exact-body capability.
+pub const ACTION_AUTH_NODE_SCOPE: &str = "vdi-clipboard";
 
 /// The hard ceiling on a single clip's payload, in bytes (1 MiB).
 ///
@@ -529,7 +537,34 @@ impl ClipboardAccess for OsClipboardAccess {
 
 /// Read new [`ACTION_TOPIC`] messages since `cursor`, advancing it. A short sync
 /// open-read-drop (never crosses an `.await`), mirroring [`super::session_broker`].
-fn read_new_events(bus_root: &Path, cursor: &mut Option<String>) -> Vec<ClipboardEvent> {
+fn clipboard_auth_target(event: &ClipboardEvent) -> String {
+    format!("session:{}", event.session_id)
+}
+
+/// Verify the exact bus body before the event can reach the OS/guest write seam.
+/// Parsing is pure and only derives the closed session target; the original body,
+/// including its capability envelope, is what the authorizer authenticates.
+fn authorize_clipboard_event(
+    authorizer: &ActionAuthorizer,
+    body: &str,
+    event: &ClipboardEvent,
+) -> Result<(), String> {
+    let target = clipboard_auth_target(event);
+    authorizer.authorize(
+        body,
+        MutationContext {
+            verb: ACTION_AUTH_VERB,
+            node: ACTION_AUTH_NODE_SCOPE,
+            target: &target,
+        },
+    )
+}
+
+fn read_new_events(
+    bus_root: &Path,
+    cursor: &mut Option<String>,
+    authorizer: &ActionAuthorizer,
+) -> Vec<ClipboardEvent> {
     let Ok(persist) = Persist::open(bus_root.to_path_buf()) else {
         return vec![];
     };
@@ -541,7 +576,17 @@ fn read_new_events(bus_root: &Path, cursor: &mut Option<String>) -> Vec<Clipboar
         *cursor = Some(msg.ulid.clone());
         let body = msg.body.as_deref().unwrap_or("");
         match parse_event(body) {
-            Ok(e) => out.push(e),
+            Ok(event) => {
+                if let Err(error) = authorize_clipboard_event(authorizer, body, &event) {
+                    tracing::warn!(
+                        ulid = %msg.ulid,
+                        %error,
+                        "clipboard_bridge: refused unauthorized clipboard mutation"
+                    );
+                    continue;
+                }
+                out.push(event);
+            }
             Err(e) => {
                 tracing::warn!(ulid = %msg.ulid, error = %e, "clipboard_bridge: bad clipboard event");
             }
@@ -560,7 +605,7 @@ fn prime_cursor(bus_root: &Path) -> Option<String> {
 }
 
 fn default_bus_root() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join("mde").join("bus"))
+    mde_bus::default_data_dir()
 }
 
 /// The VDI clipboard-bridge worker. Per-session + node-local (NOT leader-gated).
@@ -573,6 +618,8 @@ pub struct ClipboardBridgeWorker {
     poll: Duration,
     /// Bus root override (tests). `None` ⇒ [`default_bus_root`].
     bus_root_override: Option<PathBuf>,
+    /// Exact-body capability verifier for cross-UID clipboard mutations.
+    authorizer: std::sync::Arc<ActionAuthorizer>,
 }
 
 impl Default for ClipboardBridgeWorker {
@@ -592,6 +639,7 @@ impl ClipboardBridgeWorker {
             policy: ClipboardPolicy::allow_all(),
             poll: DEFAULT_POLL_INTERVAL,
             bus_root_override: None,
+            authorizer: std::sync::Arc::new(ActionAuthorizer::production()),
         }
     }
 
@@ -620,6 +668,14 @@ impl ClipboardBridgeWorker {
     #[must_use]
     pub fn with_bus_root(mut self, root: PathBuf) -> Self {
         self.bus_root_override = Some(root);
+        self
+    }
+
+    /// Inject an isolated verifier and replay ledger (tests only).
+    #[cfg(test)]
+    #[must_use]
+    fn with_authorizer(mut self, authorizer: std::sync::Arc<ActionAuthorizer>) -> Self {
+        self.authorizer = authorizer;
         self
     }
 
@@ -681,7 +737,7 @@ impl ClipboardBridgeWorker {
         cursor: &mut Option<String>,
         latest: &mut BTreeMap<SessionId, ClipPayload>,
     ) {
-        for event in read_new_events(bus_root, cursor) {
+        for event in read_new_events(bus_root, cursor, self.authorizer.as_ref()) {
             self.relay_event(&event, latest);
         }
     }
@@ -719,8 +775,12 @@ impl Worker for ClipboardBridgeWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::action_auth::{authorize_test_body, ActionAuthorizer, MutationContext};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
+
+    const AUTH_KEY: &[u8] = b"clipboard-bridge-action-auth-test-key";
+    const AUTH_NOW: i64 = 1_700_000_000_000;
 
     fn now_ms() -> u64 {
         std::time::SystemTime::now()
@@ -1010,10 +1070,51 @@ mod tests {
         assert_eq!(ClipboardBridgeWorker::new().name(), "clipboard_bridge");
     }
 
+    #[test]
+    fn default_bus_root_uses_the_shared_mde_bus_resolver() {
+        assert_eq!(default_bus_root(), mde_bus::default_data_dir());
+    }
+
     // ── worker wiring (seeded temp bus + injected fake access) ──
 
-    /// Seed a temp bus with `action/vdi/clipboard` bodies and return its root.
+    fn test_authorizer(bus_root: &Path) -> Arc<ActionAuthorizer> {
+        Arc::new(ActionAuthorizer::for_test(
+            AUTH_KEY,
+            bus_root.join("auth"),
+            AUTH_NOW,
+        ))
+    }
+
+    fn signed_body(event: &ClipboardEvent, nonce: &str) -> String {
+        let mut unsigned = serde_json::to_value(event).expect("event value");
+        unsigned
+            .as_object_mut()
+            .expect("event object")
+            .insert("schema_version".into(), serde_json::json!(1));
+        authorize_test_body(
+            AUTH_KEY,
+            &unsigned.to_string(),
+            MutationContext {
+                verb: ACTION_AUTH_VERB,
+                node: ACTION_AUTH_NODE_SCOPE,
+                target: &clipboard_auth_target(event),
+            },
+            nonce,
+            AUTH_NOW + 30_000,
+        )
+    }
+
+    /// Seed a temp bus with authorized `action/vdi/clipboard` bodies and return its root.
     fn seed_bus(events: &[ClipboardEvent]) -> PathBuf {
+        let bodies = events
+            .iter()
+            .enumerate()
+            .map(|(index, event)| signed_body(event, &format!("clip-seed-{index}")))
+            .collect::<Vec<_>>();
+        seed_bodies(&bodies)
+    }
+
+    fn seed_bodies(bodies: &[String]) -> PathBuf {
         use mde_bus::hooks::config::Priority;
         // A per-process counter makes the dir unique across PARALLEL tests — `now_ms`
         // + event count alone collide when two tests share a millisecond, and one
@@ -1021,16 +1122,11 @@ mod tests {
         static SEED_SEQ: AtomicU64 = AtomicU64::new(0);
         let uniq = SEED_SEQ.fetch_add(1, Ordering::Relaxed);
         let dir =
-            std::env::temp_dir().join(format!("mde-clip-{}-{}-{uniq}", now_ms(), events.len()));
+            std::env::temp_dir().join(format!("mde-clip-{}-{}-{uniq}", now_ms(), bodies.len()));
         let persist = Persist::open(dir.clone()).expect("open bus");
-        for e in events {
+        for body in bodies {
             persist
-                .write(
-                    ACTION_TOPIC,
-                    Priority::Default,
-                    None,
-                    Some(&serde_json::to_string(e).unwrap()),
-                )
+                .write(ACTION_TOPIC, Priority::Default, None, Some(body))
                 .expect("write event");
         }
         dir
@@ -1044,7 +1140,8 @@ mod tests {
         let rows = access.rows.clone();
         let w = ClipboardBridgeWorker::new()
             .with_access(Box::new(access))
-            .with_bus_root(bus.clone());
+            .with_bus_root(bus.clone())
+            .with_authorizer(test_authorizer(&bus));
 
         let mut cursor = None;
         let mut latest = BTreeMap::new();
@@ -1068,7 +1165,8 @@ mod tests {
         let w = ClipboardBridgeWorker::new()
             .with_access(Box::new(access))
             .with_policy(ClipboardPolicy::deny_all())
-            .with_bus_root(bus.clone());
+            .with_bus_root(bus.clone())
+            .with_authorizer(test_authorizer(&bus));
 
         let mut cursor = None;
         let mut latest = BTreeMap::new();
@@ -1093,7 +1191,8 @@ mod tests {
         let writes = access.writes.clone();
         let w = ClipboardBridgeWorker::new()
             .with_access(Box::new(access))
-            .with_bus_root(bus.clone());
+            .with_bus_root(bus.clone())
+            .with_authorizer(test_authorizer(&bus));
 
         let mut cursor = None;
         let mut latest = BTreeMap::new();
@@ -1120,7 +1219,8 @@ mod tests {
         let baseline = writes.lock().expect("writes mutex").len(); // 1 (the seed write)
         let w = ClipboardBridgeWorker::new()
             .with_access(Box::new(access))
-            .with_bus_root(bus.clone());
+            .with_bus_root(bus.clone())
+            .with_authorizer(test_authorizer(&bus));
 
         let mut cursor = None;
         let mut latest = BTreeMap::new();
@@ -1145,6 +1245,7 @@ mod tests {
         let mut w = ClipboardBridgeWorker::new()
             .with_access(Box::new(access))
             .with_bus_root(bus.clone())
+            .with_authorizer(test_authorizer(&bus))
             .with_poll(Duration::from_millis(10));
         let token = ShutdownToken::from_receiver(rx);
         let handle = tokio::spawn(async move { w.run(token).await });
@@ -1157,6 +1258,57 @@ mod tests {
             writes.lock().expect("writes mutex").is_empty(),
             "the backlog clip was primed past, not re-applied on start"
         );
+        let _ = std::fs::remove_dir_all(&bus);
+    }
+
+    #[tokio::test]
+    async fn unsigned_and_tampered_clipboard_bodies_have_no_write_effect() {
+        let event = event("s1", ClipDirection::ClientToGuest, "secret");
+        let unsigned = serde_json::to_string(&event).expect("event JSON");
+        let signed = signed_body(&event, "clip-tamper");
+        let tampered = signed.replace("secret", "forged");
+        let bus = seed_bodies(&[unsigned, tampered]);
+        let access = FakeClipboard::default();
+        let writes = access.writes.clone();
+        let w = ClipboardBridgeWorker::new()
+            .with_access(Box::new(access))
+            .with_bus_root(bus.clone())
+            .with_authorizer(test_authorizer(&bus));
+
+        let mut cursor = None;
+        let mut latest = BTreeMap::new();
+        w.drain_and_relay(&bus, &mut cursor, &mut latest);
+
+        assert!(
+            writes.lock().expect("writes mutex").is_empty(),
+            "unauthorized and tampered bodies must not reach write_local"
+        );
+        assert!(latest.is_empty(), "refused bodies must not enter the fold");
+        let _ = std::fs::remove_dir_all(&bus);
+    }
+
+    #[tokio::test]
+    async fn replayed_clipboard_capability_has_only_one_write_effect() {
+        let event = event("s1", ClipDirection::ClientToGuest, "once");
+        let body = signed_body(&event, "clip-replay");
+        let bus = seed_bodies(&[body.clone(), body]);
+        let access = FakeClipboard::default();
+        let writes = access.writes.clone();
+        let w = ClipboardBridgeWorker::new()
+            .with_access(Box::new(access))
+            .with_bus_root(bus.clone())
+            .with_authorizer(test_authorizer(&bus));
+
+        let mut cursor = None;
+        let mut latest = BTreeMap::new();
+        w.drain_and_relay(&bus, &mut cursor, &mut latest);
+
+        assert_eq!(
+            writes.lock().expect("writes mutex").len(),
+            1,
+            "durably single-use capability permits only one write_local effect"
+        );
+        assert_eq!(latest["s1"], ClipPayload::text("once"));
         let _ = std::fs::remove_dir_all(&bus);
     }
 }

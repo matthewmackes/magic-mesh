@@ -18,6 +18,9 @@ use crate::MapsLocationSurface;
 
 const RAIL_W: f32 = 176.0;
 const HEADER_H: f32 = mde_egui::menubar::BAR_HEIGHT + Style::SP_S;
+const RAIL_INNER_MARGIN: f32 = Style::SP_S;
+const ADVANCED_REVEAL_ID: &str = "maps-location-advanced-reveal";
+const ADVANCED_CARD_MIN_WIDTH: f32 = 280.0;
 const CARD_MIN_H: f32 = 84.0;
 const MAP_DARK_BG: Color32 = Color32::from_rgb(0x0D, 0x13, 0x18); // style-leak-ok: map-content-color
 const MAP_LIGHT_BG: Color32 = Color32::from_rgb(0xE8, 0xEF, 0xE8); // style-leak-ok: map-content-color
@@ -263,41 +266,98 @@ fn paint_simulated_ribbon(ui: &egui::Ui, panel: Rect) {
     );
 }
 
-fn tab_rail(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
-    egui::Frame::NONE
-        .fill(Style::LAYER_01)
-        .inner_margin(Style::SP_S)
-        .show(ui, |ui| {
-            ui.set_width(RAIL_W);
-            ui.vertical(|ui| {
-                // Primary surfaces — the clean first-level nav.
-                for tab in WorkspaceTab::PRIMARY {
-                    if rail_button(ui, tab.label(), state.active == tab).clicked() {
-                        state.active = tab;
-                    }
-                }
-                // "Advanced" — progressive disclosure for the technical/config
-                // sections. Tapping it expands/collapses the nested submenu; it
-                // reads as selected while one of its children is the active tab.
-                let open = state.advanced_open();
-                if advanced_parent_button(ui, state.active.is_advanced(), open).clicked() {
-                    state.toggle_advanced();
-                }
-                if open {
-                    // Second-level list, indented under Advanced.
-                    ui.horizontal(|ui| {
-                        ui.add_space(Style::SP_S);
-                        ui.vertical(|ui| {
-                            for tab in WorkspaceTab::ADVANCED {
-                                if rail_button(ui, tab.label(), state.active == tab).clicked() {
-                                    state.active = tab;
-                                }
-                            }
-                        });
-                    });
-                }
-            });
+fn tab_rail(ui: &mut egui::Ui, state: &mut MapsLocationSurface) -> Rect {
+    // The shell has already removed the top status-bar and bottom/left dock
+    // reservations before this workspace is laid out. Keep the Maps rail in
+    // that remaining screen-space budget as well: an expanded Advanced list
+    // must scroll inside the rail rather than painting/hit-testing below the
+    // workspace clip.
+    let available = ui.available_size();
+    let inner_width = (available.x - 2.0 * RAIL_INNER_MARGIN)
+        .clamp(1.0, RAIL_W)
+        .max(1.0);
+    let inner_height = (available.y - 2.0 * RAIL_INNER_MARGIN).max(1.0);
+
+    // A reveal is a one-shot entry aid, not a permanent scroll lock. Clear it
+    // after the Advanced group closes so reopening the same page gets a fresh
+    // bounded anchor without fighting manual scrolling while the group stays
+    // open.
+    if !state.advanced_open() {
+        ui.ctx().data_mut(|data| {
+            data.remove_temp::<WorkspaceTab>(egui::Id::new(ADVANCED_REVEAL_ID));
         });
+    }
+
+    let rendered = egui::Frame::NONE
+        .fill(Style::LAYER_01)
+        .inner_margin(RAIL_INNER_MARGIN)
+        .show(ui, |ui| {
+            ui.set_width(inner_width);
+            egui::ScrollArea::vertical()
+                .id_salt("maps-location-tab-rail")
+                .auto_shrink([false, false])
+                .max_height(inner_height)
+                .min_scrolled_height(inner_height)
+                .show(ui, |ui| {
+                    ui.set_width(inner_width);
+
+                    // Primary surfaces — the clean first-level nav.
+                    for tab in WorkspaceTab::PRIMARY {
+                        if rail_button(ui, tab.label(), state.active == tab).clicked() {
+                            state.active = tab;
+                        }
+                    }
+
+                    // "Advanced" — progressive disclosure for the
+                    // technical/config sections. Tapping it expands/collapses
+                    // the nested submenu; it reads as selected while one of
+                    // its children is the active tab.
+                    let open = state.advanced_open();
+                    if advanced_parent_button(ui, state.active.is_advanced(), open).clicked() {
+                        state.toggle_advanced();
+                    }
+                    if open {
+                        // Second-level list, indented under Advanced. The
+                        // ScrollArea above is the interaction boundary: rows
+                        // outside the visible viewport are clipped and cannot
+                        // steal pointer input from the workspace.
+                        ui.horizontal(|ui| {
+                            ui.add_space(Style::SP_S);
+                            ui.vertical(|ui| {
+                                for tab in WorkspaceTab::ADVANCED {
+                                    let response =
+                                        rail_button(ui, tab.label(), state.active == tab);
+                                    if response.clicked() {
+                                        state.active = tab;
+                                    }
+                                    // If the shell enters Maps on an Advanced
+                                    // page, reveal that page after the shell's
+                                    // reserved chrome has been applied. This
+                                    // prevents a stale scroll offset from
+                                    // leaving the selected page off-screen.
+                                    let reveal_id = egui::Id::new(ADVANCED_REVEAL_ID);
+                                    let needs_reveal = state.active == tab
+                                        && ui
+                                            .ctx()
+                                            .data(|data| data.get_temp::<WorkspaceTab>(reveal_id))
+                                            != Some(tab);
+                                    if needs_reveal {
+                                        response.scroll_to_me_animation(
+                                            Some(Align::Center),
+                                            egui::style::ScrollAnimation::none(),
+                                        );
+                                        ui.ctx().data_mut(|data| {
+                                            data.insert_temp(reveal_id, tab);
+                                        });
+                                    }
+                                }
+                            });
+                        });
+                    }
+                })
+        });
+
+    rendered.inner.inner_rect
 }
 
 /// The top-level **Advanced** rail entry: a [`rail_button`] carrying a
@@ -306,7 +366,8 @@ fn tab_rail(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
 /// the Advanced group even when the submenu is collapsed.
 fn advanced_parent_button(ui: &mut egui::Ui, selected: bool, expanded: bool) -> egui::Response {
     let size = egui::vec2(ui.available_width(), Style::SP_XL);
-    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let (_, rect) = ui.allocate_space(size);
+    let response = ui.interact(rect, rail_item_id("Advanced"), Sense::click());
     let fill = if selected {
         Style::pressed_fill(Style::ACCENT)
     } else if response.hovered() {
@@ -378,8 +439,9 @@ fn paint_disclosure_chevron(painter: &Painter, center: Pos2, expanded: bool, col
 }
 
 fn rail_button(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
-    let size = egui::vec2(ui.available_width(), Style::SP_XL);
-    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let size = egui::vec2(ui.available_width().max(1.0), Style::SP_XL);
+    let (_, rect) = ui.allocate_space(size);
+    let response = ui.interact(rect, rail_item_id(label), Sense::click());
     let fill = if selected {
         Style::pressed_fill(Style::ACCENT)
     } else if response.hovered() {
@@ -408,6 +470,14 @@ fn rail_button(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response
     );
     ui.add_space(Style::SP_XS);
     response
+}
+
+/// Stable hit-test identity for Maps' rail rows. The row rectangles are
+/// screen-space widgets inside the bounded ScrollArea, so keeping their IDs
+/// independent of the content's scroll offset preserves pointer routing when
+/// the Advanced list is revealed or restored from a previous frame.
+fn rail_item_id(label: &str) -> egui::Id {
+    egui::Id::new(("maps-location-tab-rail-item", label))
 }
 
 /// Normalized (u right, v down) route polyline the synthetic HUD scene follows.
@@ -1329,6 +1399,24 @@ struct SearchLayout {
     rows: Vec<Rect>,
 }
 
+/// Keep the destination-search surface inside the space that is actually
+/// visible to its parent. A small seat can report a larger layout budget than
+/// the current clip (for example, a 320 px minimum inside a 240 px viewport),
+/// which would make the lower search controls render below the screen.
+fn bounded_search_height(available_height: f32, clip_remaining: f32) -> f32 {
+    let bound = [available_height, clip_remaining]
+        .into_iter()
+        .filter(|height| height.is_finite() && *height > 1.0)
+        .fold(f32::INFINITY, f32::min);
+    if bound.is_finite() {
+        bound.clamp(1.0, 1400.0)
+    } else {
+        // The clip is normally finite for an on-screen UI. Preserve the
+        // historical fallback only for an unbounded/offline layout probe.
+        520.0
+    }
+}
+
 /// Lay out the search chrome over `rect`: a back button + full-width search bar
 /// at the top, a row of category chips, then a scroll-free list card holding one
 /// tappable row per destination (clipped to what fits). Every rect is crash-safe.
@@ -1402,12 +1490,8 @@ fn show_destination_search(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
     state.refresh_geocode();
 
     let width = safe_width(ui);
-    let avail_h = ui.available_height();
-    let height = if avail_h.is_finite() && avail_h > 1.0 {
-        avail_h.clamp(320.0, 1400.0)
-    } else {
-        520.0
-    };
+    let clip_remaining = ui.clip_rect().bottom() - ui.cursor().top();
+    let height = bounded_search_height(ui.available_height(), clip_remaining);
     let (rect, _resp) = ui.allocate_exact_size(egui::vec2(width, height), Sense::hover());
     if !ui.is_rect_visible(rect) {
         return;
@@ -2477,15 +2561,22 @@ fn paint_map_scene(
         );
     }
 
-    // WL-FUNC-012 / OVERLAY-6 — keyless current NIFC WFIGS wildfire
-    // perimeters. FIRMS hotspots remain explicitly unconfigured until an
-    // operator supplies the separate free key; no synthetic heat dots appear.
+    // WL-FUNC-012 / OVERLAY-6 — merged NIFC WFIGS + NASA FIRMS wildfire feed.
+    // NIFC perimeters and FIRMS thermal hotspots retain independent snapshots,
+    // status badges, and fail-soft folds under the one wildfire toggle.
     if map.wildfire_overlay {
         let projection_ref = projection.as_ref();
         let _ = crate::wildfire::paint_layer(
             painter,
             rect,
             &map.wildfire,
+            crate::earthquake::now_ms(),
+            |lat, lon| projection_ref.map(|projection| projection.project(lat, lon)),
+        );
+        let _ = crate::firms::paint_layer(
+            painter,
+            rect,
+            &map.firms,
             crate::earthquake::now_ms(),
             |lat, lon| projection_ref.map(|projection| projection.project(lat, lon)),
         );
@@ -3397,31 +3488,14 @@ fn show_map(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
     }
     ui.add_space(Style::SP_S);
     // Generic Traffic/Weather toggles remain retired with the production
-    // simulators. The explicit NWS toggle below controls the real safety feed.
+    // simulators. Base-map controls stay directly visible; the ten real feed
+    // toggles live in one grouped popover so the Map tab remains scannable.
     ui.horizontal_wrapped(|ui| {
         ui.checkbox(&mut state.map.dark_mode, "Dark mode");
         ui.checkbox(&mut state.map.route_visible, "Route");
         ui.checkbox(&mut state.map.dead_zone_overlay, "Dead zones");
         ui.checkbox(&mut state.map.gnss_overlay, "GNSS quality");
-        ui.checkbox(&mut state.map.earthquake_overlay, "Earthquakes");
-        ui.checkbox(&mut state.map.nws_alert_overlay, "Weather alerts");
-        ui.checkbox(&mut state.map.iem_radar_overlay, "NEXRAD radar");
-        if state.map.iem_radar_overlay {
-            ui.checkbox(&mut state.map.iem_radar.animate, "Animate radar");
-        }
-        ui.checkbox(&mut state.map.wildfire_overlay, "Wildfire perimeters");
-        ui.checkbox(&mut state.map.traffic_event_overlay, "NCDOT traffic");
-        ui.checkbox(&mut state.map.air_quality_overlay, "AirNow AQI");
-        ui.checkbox(&mut state.map.aircraft_overlay, "Aircraft");
-        if state.map.aircraft_overlay {
-            ui.checkbox(&mut state.map.aircraft.show_callsigns, "Callsigns");
-        }
-        ui.checkbox(&mut state.map.transit_overlay, "MBTA transit");
-        if state.map.transit_overlay {
-            ui.checkbox(&mut state.map.transit.show_labels, "Transit labels");
-        }
-        ui.checkbox(&mut state.map.nws_forecast_overlay, "Hourly forecast");
-        ui.checkbox(&mut state.map.caltrans_camera_overlay, "Caltrans cameras");
+        map_layers_menu(ui, &mut state.map);
     });
     ui.add_space(Style::SP_S);
     ui.horizontal(|ui| {
@@ -3479,6 +3553,74 @@ fn show_map(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
             ui.set_width(col_w);
             provider_card(ui, &state.local_navigation.satellite);
         });
+    });
+}
+
+/// Count the ten live external feeds represented by the grouped Layers menu.
+/// Base-map presentation toggles (route, dead zones, GNSS, dark mode) are
+/// intentionally excluded so the badge answers one precise question: how many
+/// external overlay feeds are currently enabled.
+fn active_live_overlay_count(map: &MapViewState) -> usize {
+    [
+        map.earthquake_overlay,
+        map.nws_alert_overlay,
+        map.aircraft_overlay,
+        map.transit_overlay,
+        map.nws_forecast_overlay,
+        map.caltrans_camera_overlay,
+        map.iem_radar_overlay,
+        map.wildfire_overlay,
+        map.traffic_event_overlay,
+        map.air_quality_overlay,
+    ]
+    .into_iter()
+    .filter(|enabled| *enabled)
+    .count()
+}
+
+/// Grouped live-feed controls for the Map tab. Every checkbox maps directly to
+/// one of the ten typed latest-wins overlay states; optional label/animation
+/// preferences remain next to their owning feed so turning a feed off cannot
+/// leave a detached preference control in the main toolbar.
+fn map_layers_menu(ui: &mut egui::Ui, map: &mut MapViewState) {
+    let active = active_live_overlay_count(map);
+    ui.menu_button(format!("Layers ({active})"), |ui| {
+        ui.label(RichText::new("Safety").strong().color(Style::TEXT_STRONG));
+        ui.checkbox(&mut map.nws_alert_overlay, "Weather alerts");
+        ui.checkbox(&mut map.iem_radar_overlay, "NEXRAD radar");
+        if map.iem_radar_overlay {
+            ui.indent("layers-radar-options", |ui| {
+                ui.checkbox(&mut map.iem_radar.animate, "Animate radar");
+            });
+        }
+        ui.checkbox(&mut map.wildfire_overlay, "Wildfire perimeters + hotspots");
+
+        ui.separator();
+        ui.label(
+            RichText::new("Road & transit")
+                .strong()
+                .color(Style::TEXT_STRONG),
+        );
+        ui.checkbox(&mut map.traffic_event_overlay, "NCDOT traffic");
+        ui.checkbox(&mut map.caltrans_camera_overlay, "Caltrans cameras");
+        ui.checkbox(&mut map.nws_forecast_overlay, "Hourly forecast");
+        ui.checkbox(&mut map.transit_overlay, "MBTA transit");
+        if map.transit_overlay {
+            ui.indent("layers-transit-options", |ui| {
+                ui.checkbox(&mut map.transit.show_labels, "Transit labels");
+            });
+        }
+
+        ui.separator();
+        ui.label(RichText::new("Ambient").strong().color(Style::TEXT_STRONG));
+        ui.checkbox(&mut map.earthquake_overlay, "Earthquakes");
+        ui.checkbox(&mut map.air_quality_overlay, "AirNow AQI");
+        ui.checkbox(&mut map.aircraft_overlay, "Aircraft");
+        if map.aircraft_overlay {
+            ui.indent("layers-aircraft-options", |ui| {
+                ui.checkbox(&mut map.aircraft.show_callsigns, "Callsigns");
+            });
+        }
     });
 }
 
@@ -3836,8 +3978,12 @@ fn show_connectivity(ui: &mut egui::Ui, mg90: &Mg90State) {
 }
 
 fn show_devices_io(ui: &mut egui::Ui, devices: &mut DeviceIoState) {
-    let col_w = split_width(ui, 2);
-    ui.horizontal_top(|ui| {
+    // The serial controls need enough width for their checkbox, baud pill, and
+    // recovery actions. Below that width, keep each card full-width so the
+    // wrapped layout preserves both rendering and hit targets inside the
+    // narrow Advanced viewport.
+    let col_w = responsive_column_width(ui, 2, ADVANCED_CARD_MIN_WIDTH);
+    ui.horizontal_wrapped(|ui| {
         ui.scope(|ui| {
             ui.set_width(col_w);
             glyph_card(
@@ -3851,7 +3997,7 @@ fn show_devices_io(ui: &mut egui::Ui, devices: &mut DeviceIoState) {
                         "Recovery console only; normal settings use direct Ethernet.",
                         Style::WARN,
                     );
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.checkbox(&mut devices.serial.connected, "Connected");
                         ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                             pill(ui, &devices.serial.baud_profile, Style::ACCENT);
@@ -4357,18 +4503,12 @@ fn show_mg90_setup(
                 Style::TEXT_DIM,
             );
             ui.add_space(Style::SP_XS);
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("Confirm")
-                        .size(Style::SMALL)
-                        .color(Style::TEXT_DIM),
-                );
-                ui.text_edit_singleline(&mut mg90.reset.typed_confirmation);
-                let enabled = mg90.reset.armed();
-                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                    let _ = ui.add_enabled(enabled, egui::Button::new("Reset MG90"));
-                });
-            });
+            let reset_enabled = mg90.reset.armed();
+            reset_confirmation_row(
+                ui,
+                &mut mg90.reset.typed_confirmation,
+                reset_enabled,
+            );
             ui.add_space(Style::SP_XS);
             divider(ui);
             ui.add_space(Style::SP_S);
@@ -4405,6 +4545,39 @@ fn show_mg90_setup(
     backups(ui, &mg90.backups);
     ui.add_space(Style::SP_S);
     show_vault(ui, vault);
+}
+
+/// Keep the destructive confirmation target inside narrow Advanced-page
+/// viewports. The old single-line row let the text field consume the whole
+/// remaining width, placing the reset button outside the clipped workspace;
+/// wrapping preserves a real, on-screen hit target without changing the
+/// guardrail state machine.
+fn reset_confirmation_row(
+    ui: &mut egui::Ui,
+    typed_confirmation: &mut String,
+    enabled: bool,
+) -> egui::Rect {
+    ui.vertical(|ui| {
+        ui.label(
+            RichText::new("Confirm")
+                .size(Style::SMALL)
+                .color(Style::TEXT_DIM),
+        );
+        ui.horizontal_wrapped(|ui| {
+            let input_width = (ui.available_width() - 112.0).clamp(40.0, 220.0);
+            ui.add_sized(
+                egui::vec2(input_width, ui.spacing().interact_size.y),
+                egui::TextEdit::singleline(typed_confirmation),
+            );
+            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                ui.add_enabled(enabled, egui::Button::new("Reset MG90"))
+                    .rect
+            })
+            .inner
+        })
+        .inner
+    })
+    .inner
 }
 
 /// A capability chip — green when the feature is present, dim when it is not.
@@ -4660,14 +4833,46 @@ fn map_canvas(
         FontId::proportional(Style::SMALL),
         chrome,
     );
-    painter.text(
-        rect.right_bottom() - egui::vec2(Style::SP_S, Style::SP_S),
-        Align2::RIGHT_BOTTOM,
+    let _ = paint_map_attribution(&painter, rect, map, chrome);
+    rect
+}
+
+/// Paint every active provider credit inside the map clip.
+///
+/// Ten simultaneous feeds produce a deliberately long attribution string. A
+/// single right-aligned `Painter::text` call lets that string run off the left
+/// edge of narrow map viewports, hiding credits while the map remains clipped.
+/// Wrapping the galley and backing it with a small translucent card keeps all
+/// credits readable without stealing a separate toolbar row.
+fn paint_map_attribution(
+    painter: &Painter,
+    rect: Rect,
+    map: &MapViewState,
+    color: Color32,
+) -> Rect {
+    let outer_pad = Style::SP_S;
+    let inner_pad = egui::vec2(Style::SP_S, Style::SP_XS);
+    let wrap_width = (rect.width() - 2.0 * outer_pad - 2.0 * inner_pad.x).max(1.0);
+    let galley = painter.layout(
         map.attribution_line(),
         FontId::proportional(Style::SMALL),
-        chrome,
+        color,
+        wrap_width,
     );
-    rect
+    let card_size = galley.size() + inner_pad * 2.0;
+    let card = Rect::from_min_size(
+        rect.right_bottom() - egui::vec2(card_size.x + outer_pad, card_size.y + outer_pad),
+        card_size,
+    );
+    painter.rect_filled(card, Style::RADIUS_S, Style::BG.gamma_multiply(0.86));
+    painter.rect_stroke(
+        card,
+        Style::RADIUS_S,
+        Stroke::new(1.0, color.gamma_multiply(0.35)),
+        StrokeKind::Inside,
+    );
+    painter.galley(card.left_top() + inner_pad, galley, color);
+    card
 }
 
 fn map_point(rect: Rect, x: f32, y: f32) -> Pos2 {
@@ -4759,6 +4964,25 @@ fn split_width(ui: &egui::Ui, columns: usize) -> f32 {
     .max(1.0);
     let gaps = ui.spacing().item_spacing.x * columns.saturating_sub(1) as f32;
     ((total - gaps) / columns.max(1) as f32).max(1.0)
+}
+
+/// Return a column width that preserves a readable card width, stacking the
+/// caller's wrapped row when a narrow viewport cannot fit `columns` cards.
+fn responsive_column_width(ui: &egui::Ui, columns: usize, min_column_width: f32) -> f32 {
+    let available = ui.available_width();
+    let total = if available.is_finite() && available > 0.0 {
+        available
+    } else {
+        ui.clip_rect().width()
+    }
+    .max(1.0);
+    let gap = ui.spacing().item_spacing.x * columns.saturating_sub(1) as f32;
+    let split = ((total - gap) / columns.max(1) as f32).max(1.0);
+    if split < min_column_width {
+        total
+    } else {
+        split
+    }
 }
 
 fn provider_card(ui: &mut egui::Ui, provider: &ProviderContract) {
@@ -5559,6 +5783,188 @@ mod tests {
         ctx.tessellate(out.shapes, out.pixels_per_point).len()
     }
 
+    fn render_rail_frame(
+        ctx: &egui::Context,
+        surface: &mut MapsLocationSurface,
+        screen: Rect,
+        events: Vec<egui::Event>,
+        reserve_shell_chrome: bool,
+    ) -> Rect {
+        let mut viewport = Rect::NOTHING;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                if reserve_shell_chrome {
+                    // Mirrors the shell's Construct reservations: 24 px top
+                    // status bar, 72 px floating dock band, and 56 px docked
+                    // left rail. The Maps panel itself must remain inside the
+                    // resulting CentralPanel workspace.
+                    egui::TopBottomPanel::top("test-construct-status-space")
+                        .exact_height(24.0)
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |_ui| {});
+                    egui::TopBottomPanel::bottom("test-construct-dock-space")
+                        .exact_height(72.0)
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |_ui| {});
+                    egui::SidePanel::left("test-construct-docked-rail-space")
+                        .exact_width(56.0)
+                        .frame(egui::Frame::NONE)
+                        .show(ctx, |_ui| {});
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    viewport = tab_rail(ui, surface);
+                });
+            },
+        );
+        viewport
+    }
+
+    fn click_rail_row(
+        ctx: &egui::Context,
+        surface: &mut MapsLocationSurface,
+        screen: Rect,
+        at: Pos2,
+    ) {
+        let _ = render_rail_frame(
+            ctx,
+            surface,
+            screen,
+            vec![
+                egui::Event::PointerMoved(at),
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+            false,
+        );
+        let _ = render_rail_frame(
+            ctx,
+            surface,
+            screen,
+            vec![
+                egui::Event::PointerMoved(at),
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+            false,
+        );
+    }
+
+    #[test]
+    fn advanced_rail_is_bounded_and_reveals_an_offscreen_selected_page() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        ctx.style_mut(|style| style.animation_time = 0.0);
+
+        // This is intentionally shorter than the complete primary + Advanced
+        // list. The selected last item must be scrolled into the rail viewport,
+        // not painted below the shell-reserved workspace.
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(360.0, 260.0));
+        let mut surface = MapsLocationSurface::simulated();
+        surface.active = WorkspaceTab::FirmwareRecovery;
+
+        let mut viewport = render_rail_frame(&ctx, &mut surface, screen, Vec::new(), true);
+        for _ in 0..3 {
+            viewport = render_rail_frame(&ctx, &mut surface, screen, Vec::new(), true);
+        }
+
+        let selected = ctx
+            .read_response(rail_item_id("Firmware & Recovery"))
+            .expect("selected Advanced row should register a stable hit target");
+        assert!(
+            screen.contains_rect(viewport),
+            "rail viewport escaped screen"
+        );
+        assert!(
+            viewport.contains_rect(selected.rect),
+            "selected Advanced page remained outside the bounded viewport: {selected:?}"
+        );
+        assert!(screen.contains_rect(selected.rect));
+    }
+
+    #[test]
+    fn advanced_parent_and_child_rows_are_clickable_in_the_bounded_viewport() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        ctx.style_mut(|style| style.animation_time = 0.0);
+
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(1024.0, 768.0));
+        let mut surface = MapsLocationSurface::simulated();
+        surface.active = WorkspaceTab::Drive;
+
+        let viewport = render_rail_frame(&ctx, &mut surface, screen, Vec::new(), false);
+        let parent = ctx
+            .read_response(rail_item_id("Advanced"))
+            .expect("Advanced parent should register a hit target");
+        assert!(viewport.contains_rect(parent.rect));
+        click_rail_row(&ctx, &mut surface, screen, parent.rect.center());
+        assert!(surface.advanced_expanded, "Advanced parent click was lost");
+
+        let viewport = render_rail_frame(&ctx, &mut surface, screen, Vec::new(), false);
+        let child = ctx
+            .read_response(rail_item_id("MG90 Settings"))
+            .expect("Advanced child should register a hit target");
+        assert!(viewport.contains_rect(child.rect));
+        click_rail_row(&ctx, &mut surface, screen, child.rect.center());
+        assert_eq!(surface.active, WorkspaceTab::Mg90Settings);
+    }
+
+    #[test]
+    fn advanced_device_cards_stack_when_two_columns_are_too_narrow() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let narrow = Rect::from_min_size(Pos2::ZERO, egui::vec2(320.0, 480.0));
+        let wide = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 480.0));
+        let mut narrow_width = 0.0;
+        let mut narrow_available = 0.0;
+        let mut wide_width = 0.0;
+
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(narrow),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    narrow_available = ui.available_width();
+                    narrow_width = responsive_column_width(ui, 2, ADVANCED_CARD_MIN_WIDTH);
+                });
+            },
+        );
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(wide),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    wide_width = responsive_column_width(ui, 2, ADVANCED_CARD_MIN_WIDTH);
+                });
+            },
+        );
+
+        assert_eq!(
+            narrow_width,
+            narrow_available,
+            "stacked cards should use the CentralPanel's actual usable width"
+        );
+        assert!(narrow_width >= ADVANCED_CARD_MIN_WIDTH);
+        assert!(wide_width < wide.width());
+        assert!(wide_width >= ADVANCED_CARD_MIN_WIDTH);
+    }
+
     #[test]
     fn workspace_tabs_match_product_layout() {
         let labels: Vec<&str> = WorkspaceTab::ALL.iter().map(|tab| tab.label()).collect();
@@ -5673,6 +6079,78 @@ mod tests {
         search.active = WorkspaceTab::Drive;
         search.destination_search = true;
         assert!(tessellate(&mut search) > 0);
+    }
+
+    #[test]
+    fn map_layers_menu_covers_all_ten_feeds_and_keeps_safety_defaults_visible() {
+        let mut surface = MapsLocationSurface::live();
+        surface.active = WorkspaceTab::Map;
+        let texts = painted_texts(&mut surface);
+        assert!(texts.iter().any(|text| text == "Layers (3)"));
+        assert_eq!(
+            active_live_overlay_count(&surface.map),
+            3,
+            "NWS alerts, NEXRAD, and wildfire are the three safety defaults"
+        );
+
+        surface.map.earthquake_overlay = true;
+        surface.map.nws_alert_overlay = true;
+        surface.map.aircraft_overlay = true;
+        surface.map.transit_overlay = true;
+        surface.map.nws_forecast_overlay = true;
+        surface.map.caltrans_camera_overlay = true;
+        surface.map.iem_radar_overlay = true;
+        surface.map.wildfire_overlay = true;
+        surface.map.traffic_event_overlay = true;
+        surface.map.air_quality_overlay = true;
+        assert_eq!(active_live_overlay_count(&surface.map), 10);
+        let texts = painted_texts(&mut surface);
+        assert!(texts.iter().any(|text| text == "Layers (10)"));
+    }
+
+    #[test]
+    fn active_provider_attribution_stays_inside_narrow_map_clip() {
+        let mut map = MapViewState::live(false);
+        map.earthquake_overlay = true;
+        map.nws_alert_overlay = true;
+        map.aircraft_overlay = true;
+        map.transit_overlay = true;
+        map.nws_forecast_overlay = true;
+        map.caltrans_camera_overlay = true;
+        map.iem_radar_overlay = true;
+        map.wildfire_overlay = true;
+        map.traffic_event_overlay = true;
+        map.air_quality_overlay = true;
+
+        let map_rect = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(320.0, 180.0));
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut painted = None;
+        let input = egui::RawInput {
+            screen_rect: Some(map_rect),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let painter = ui.painter_at(map_rect);
+                painted = Some(paint_map_attribution(
+                    &painter,
+                    map_rect,
+                    &map,
+                    Style::TEXT_DIM,
+                ));
+            });
+        });
+
+        let painted = painted.expect("map attribution should paint");
+        assert!(painted.left() >= map_rect.left());
+        assert!(painted.right() <= map_rect.right());
+        assert!(painted.top() >= map_rect.top());
+        assert!(painted.bottom() <= map_rect.bottom());
+        assert!(
+            painted.height() > 30.0,
+            "all ten provider credits should wrap instead of overflowing one line"
+        );
     }
 
     /// Recursively collect every text string in a painted shape tree.
@@ -5815,8 +6293,8 @@ mod tests {
             "scope-level empty state paints"
         );
         assert!(
-            texts.iter().any(|t| t == "MG90 airspace worker not wired"),
-            "the future-source note paints"
+            texts.iter().any(|t| t == "MG90 scanner source not configured"),
+            "the typed worker status note paints"
         );
         // No fixture contact ever paints on the production surface.
         assert!(
@@ -6163,6 +6641,54 @@ mod tests {
         let rect = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(40.0, 40.0));
         let layout = search_layout(rect, 7, 5);
         assert_eq!(layout.chips.len(), 5);
+    }
+
+    #[test]
+    fn destination_search_surface_stays_inside_narrow_clip() {
+        // The old 320 px minimum escaped a 240 px seat and put the list card
+        // below the visible workspace. The remaining clip wins over the
+        // larger layout budget, including when the cursor is already offset.
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(360.0, 240.0));
+        let cursor_top = 24.0;
+        let height = bounded_search_height(320.0, screen.bottom() - cursor_top);
+        let search_rect = Rect::from_min_size(
+            egui::pos2(screen.left(), cursor_top),
+            egui::vec2(screen.width(), height),
+        );
+
+        assert_eq!(height, 216.0);
+        assert!(
+            screen.contains_rect(search_rect),
+            "search surface escaped the narrow clip: {search_rect:?}"
+        );
+    }
+
+    #[test]
+    fn reset_confirmation_action_stays_inside_a_narrow_advanced_clip() {
+        // The confirmation input and button must wrap instead of letting the
+        // destructive action escape the narrow Advanced-page workspace.
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(128.0, 160.0));
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut typed_confirmation = String::new();
+        let mut reset_button = Rect::NOTHING;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    reset_button = reset_confirmation_row(ui, &mut typed_confirmation, false);
+                });
+            },
+        );
+
+        assert!(
+            screen.contains_rect(reset_button),
+            "reset action escaped the narrow Advanced clip: {reset_button:?}"
+        );
+        assert!(reset_button.is_positive(), "reset action lost its hit target");
     }
 
     #[test]

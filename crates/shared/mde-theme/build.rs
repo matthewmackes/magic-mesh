@@ -3,7 +3,7 @@
 //! Emits four `cargo:rustc-env` variables the `brand::build` module reads back
 //! with `env!`:
 //!
-//! * `MDE_BUILD_VERSION` — the crate (workspace) `CARGO_PKG_VERSION` (`12.0.0`).
+//! * `MDE_BUILD_VERSION` — the crate (workspace) `CARGO_PKG_VERSION`.
 //! * `MDE_BUILD_GIT_HASH` — `git rev-parse --short HEAD`, or the sentinel
 //!   `nogit` when git is absent (a release tarball / shallow export).
 //! * `MDE_BUILD_DATE` — UTC calendar date `YYYY-MM-DD`; from `SOURCE_DATE_EPOCH`

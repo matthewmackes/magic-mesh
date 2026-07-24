@@ -74,13 +74,18 @@ impl CarMotionPolicy {
             && match live_mph {
                 // Honesty (P8): only a LIVE speed engages the limits.
                 None => false,
-                Some(mph) => {
+                Some(mph) if mph.is_finite() && mph >= 0.0 => {
                     if self.in_motion {
                         mph >= CAR_MOTION_RELEASE_MPH
                     } else {
                         mph >= CAR_MOTION_THRESHOLD_MPH
                     }
                 }
+                // A malformed decoded speed is not an honest live speed.  A
+                // public policy caller may bypass `live_speed_mph`, so keep
+                // this boundary defensive as well: invalid input releases
+                // limits instead of engaging them from +∞/NaN.
+                Some(_) => false,
             };
         Self { in_motion }
     }
@@ -178,6 +183,20 @@ mod tests {
         // upstream (`live_speed_mph`) — no live speed = no limits, ever.
         assert!(!car(false, None), "None speed never engages");
         assert!(!car(true, None), "None speed releases an engaged policy");
+    }
+
+    #[test]
+    fn malformed_speed_never_engages_or_holds_limits() {
+        for speed in [-1.0, f32::NAN, f32::INFINITY] {
+            assert!(
+                !car(false, Some(speed)),
+                "invalid speed {speed:?} must not engage limits"
+            );
+            assert!(
+                !car(true, Some(speed)),
+                "invalid speed {speed:?} must release limits"
+            );
+        }
     }
 
     #[test]

@@ -30,6 +30,7 @@ use super::CloudWorker;
 
 // Disjoint per-verb handler modules (one unit each, `cloud/verbs/<unit>.rs`).
 mod container;
+mod container_lifecycle;
 mod image;
 // Disjoint per-verb handler modules (one unit each owns its file).
 mod android; // U9 · android-provision
@@ -71,6 +72,13 @@ pub(crate) enum CloudVerb {
     ImageBuild,
     /// `container-deploy` — render + hand off a Quadlet unit (MUTATION; skeleton, U8).
     ContainerDeploy,
+    /// `container-restart` — restart one rootless Quadlet systemd unit (MUTATION).
+    ContainerRestart,
+    /// `container-logs` — read the recent journal for one Quadlet unit (READ).
+    ContainerLogs,
+    /// `container-destroy` — stop/disable one Quadlet unit and retract its desired
+    /// entry (DESTRUCTIVE MUTATION).
+    ContainerDestroy,
     /// `console-attach` — a SPICE/VNC console handle (MUTATION-placed; skeleton, U9).
     ConsoleAttach,
     /// `android-provision` — the two-layer Cuttlefish path (MUTATION; skeleton, U10).
@@ -106,6 +114,9 @@ impl CloudVerb {
             v if v == VERB_SET_DESIRED => Self::SetDesired,
             v if v == VERB_IMAGE_BUILD => Self::ImageBuild,
             v if v == VERB_CONTAINER_DEPLOY => Self::ContainerDeploy,
+            "container-restart" => Self::ContainerRestart,
+            "container-logs" => Self::ContainerLogs,
+            "container-destroy" => Self::ContainerDestroy,
             v if v == VERB_CONSOLE_ATTACH => Self::ConsoleAttach,
             v if v == VERB_ANDROID_PROVISION => Self::AndroidProvision,
             _ => return None,
@@ -128,6 +139,8 @@ impl CloudVerb {
                 | Self::SetDesired
                 | Self::ImageBuild
                 | Self::ContainerDeploy
+                | Self::ContainerRestart
+                | Self::ContainerDestroy
                 | Self::ConsoleAttach
                 | Self::AndroidProvision
         )
@@ -141,7 +154,7 @@ impl CloudVerb {
         self.is_mutation()
             || matches!(
                 self,
-                Self::LocalList | Self::Inventory | Self::Output | Self::Plan
+                Self::LocalList | Self::Inventory | Self::Output | Self::Plan | Self::ContainerLogs
             )
     }
 
@@ -153,18 +166,20 @@ impl CloudVerb {
             Self::Destroy => true,
             Self::Lifecycle(a) => a.is_destructive(),
             Self::BulkLifecycle(a) => a.is_destructive(),
+            Self::ContainerDestroy => true,
             _ => false,
         }
     }
 }
 
 /// The parsed `action/cloud/*` request body — the fields the worker reads off the
-/// wire JSON. Every field is optional so a legacy `{}` request still parses; the
-/// per-verb handlers enforce what each actually requires.
+/// wire JSON. Every field is optional so read-only requests can retain their
+/// legacy shape; [`Self::schema_error_for`] applies the v1 envelope requirement
+/// to placement-scoped mutations before any handler or backend is reached.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct CloudActionBody {
-    /// Explicit request-envelope version. Omitted means the legacy v1 shape;
-    /// unknown future versions fail closed before verb-specific decoding.
+    /// Explicit request-envelope version. Mutations must carry exactly v1;
+    /// read-only requests may omit it for compatibility.
     #[serde(default)]
     pub schema_version: Option<u16>,
     /// The placement node this request targets (the placement gate's key).
@@ -183,14 +198,47 @@ pub(crate) struct CloudActionBody {
     /// The typed-arming confirmation a destructive lifecycle request carries.
     #[serde(default)]
     pub typed_name: Option<String>,
+    /// Set only when the wire body could not be parsed. This is deliberately
+    /// outside the wire schema so a malformed body cannot be mistaken for the
+    /// valid legacy `{}` read envelope.
+    #[serde(skip)]
+    parse_error: Option<String>,
 }
 
 impl CloudActionBody {
-    /// Parse a request body, degrading a malformed body to an all-empty request
-    /// (the per-verb handlers then honestly reject what they require).
+    /// Parse a request body while retaining malformed-input state for the shared
+    /// dispatch gate. Valid legacy `{}` read requests still parse as an empty
+    /// body; malformed JSON never gets that compatibility treatment.
     #[must_use]
     pub fn parse(body: &str) -> Self {
-        serde_json::from_str(body.trim()).unwrap_or_default()
+        match serde_json::from_str(body.trim()) {
+            Ok(parsed) => parsed,
+            Err(_) => Self {
+                parse_error: Some("cloud action body must be valid JSON".to_string()),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Refuse an unsupported envelope, or a missing envelope on a mutation.
+    ///
+    /// Placement-scoped reads (including the dry-run `plan`) intentionally keep
+    /// accepting an omitted version. An explicit future version is refused for
+    /// every verb because the worker cannot safely interpret its fields.
+    #[must_use]
+    pub(crate) fn schema_error_for(&self, verb: CloudVerb) -> Option<String> {
+        if let Some(error) = &self.parse_error {
+            return Some(error.clone());
+        }
+        match self.schema_version {
+            Some(version) if version != CLOUD_ACTION_SCHEMA_VERSION => Some(format!(
+                "unsupported cloud request schema version {version} (expected {CLOUD_ACTION_SCHEMA_VERSION})"
+            )),
+            None if verb.is_mutation() => Some(format!(
+                "cloud mutation requires schema_version {CLOUD_ACTION_SCHEMA_VERSION}"
+            )),
+            _ => None,
+        }
     }
 }
 
@@ -211,18 +259,11 @@ pub(crate) fn dispatch(w: &CloudWorker, verb_name: &str, body_str: &str) -> Clou
     // parse their verb-specific fields from; `body` = the shared gate fields.
     let raw = body_str;
     let body = CloudActionBody::parse(body_str);
-    if body
-        .schema_version
-        .is_some_and(|version| version != CLOUD_ACTION_SCHEMA_VERSION)
-    {
+    if let Some(error) = body.schema_error_for(verb) {
         return CloudReply {
             ok: false,
             verb: verb_name.to_string(),
-            error: Some(format!(
-                "unsupported cloud request schema version {} (expected {})",
-                body.schema_version.unwrap_or_default(),
-                CLOUD_ACTION_SCHEMA_VERSION
-            )),
+            error: Some(error),
             ..Default::default()
         };
     }
@@ -268,6 +309,13 @@ pub(crate) fn dispatch(w: &CloudWorker, verb_name: &str, body_str: &str) -> Clou
         // ── wired MUTATIONS — image-build (U6) + container-deploy (U7) ──
         CloudVerb::ImageBuild => image::handle(w, verb_name, raw),
         CloudVerb::ContainerDeploy => container::handle(w, verb_name, raw),
+        CloudVerb::ContainerRestart => {
+            container_lifecycle::handle_restart(w, verb_name, &body, raw)
+        }
+        CloudVerb::ContainerLogs => container_lifecycle::handle_logs(w, verb_name, &body),
+        CloudVerb::ContainerDestroy => {
+            container_lifecycle::handle_destroy(w, verb_name, &body, raw)
+        }
 
         // ── wired MUTATIONS — console-attach (U8) + android-provision (U9) ──
         CloudVerb::ConsoleAttach => {
@@ -614,6 +662,18 @@ mod tests {
             CloudVerb::from_verb("android-provision"),
             Some(CloudVerb::AndroidProvision)
         );
+        assert_eq!(
+            CloudVerb::from_verb("container-restart"),
+            Some(CloudVerb::ContainerRestart)
+        );
+        assert_eq!(
+            CloudVerb::from_verb("container-logs"),
+            Some(CloudVerb::ContainerLogs)
+        );
+        assert_eq!(
+            CloudVerb::from_verb("container-destroy"),
+            Some(CloudVerb::ContainerDestroy)
+        );
         assert_eq!(CloudVerb::from_verb("frobnicate"), None);
 
         // read/mutation/destructive classification.
@@ -628,6 +688,12 @@ mod tests {
         assert!(CloudVerb::Provision.is_mutation());
         assert!(CloudVerb::SetDesired.is_mutation());
         assert!(CloudVerb::AndroidProvision.is_mutation());
+        assert!(CloudVerb::ContainerRestart.is_mutation());
+        assert!(!CloudVerb::ContainerLogs.is_mutation());
+        assert!(CloudVerb::ContainerDestroy.is_mutation());
+        assert!(CloudVerb::ContainerLogs.requires_placement());
+        assert!(CloudVerb::ContainerDestroy.is_destructive());
+        assert!(!CloudVerb::ContainerRestart.is_destructive());
         assert!(CloudVerb::Destroy.is_destructive());
         assert!(!CloudVerb::Provision.is_destructive());
         assert!(CloudVerb::Lifecycle(LifecycleAction::Delete).is_destructive());
@@ -644,8 +710,80 @@ mod tests {
         assert_eq!(b.node, "eagle");
         assert_eq!(b.instance.as_deref(), Some("web"));
         assert_eq!(b.armed_token.as_deref(), Some("tok"));
-        // A malformed body degrades to all-empty (handlers then reject).
+        // A malformed body is retained as an explicit parse failure rather than
+        // being treated as the valid legacy empty read envelope.
         let empty = CloudActionBody::parse("not json");
         assert!(empty.node.is_empty() && empty.armed_token.is_none());
+        assert!(empty
+            .schema_error_for(CloudVerb::List)
+            .is_some_and(|error| error.contains("valid JSON")));
+    }
+
+    #[test]
+    fn mutations_require_explicit_v1_but_reads_and_plan_keep_legacy_shape() {
+        let missing = CloudActionBody::parse(r#"{"node":"eagle"}"#);
+        let error = missing
+            .schema_error_for(CloudVerb::Lifecycle(LifecycleAction::Start))
+            .expect("missing mutation schema must fail closed");
+        assert!(error.contains("requires schema_version 1"), "{error}");
+
+        let future = CloudActionBody::parse(r#"{"schema_version":2,"node":"eagle"}"#);
+        let error = future
+            .schema_error_for(CloudVerb::SetDesired)
+            .expect("future mutation schema must fail closed");
+        assert!(
+            error.contains("unsupported cloud request schema version 2"),
+            "{error}"
+        );
+
+        let v1 = CloudActionBody::parse(r#"{"schema_version":1,"node":"eagle"}"#);
+        assert!(v1
+            .schema_error_for(CloudVerb::Lifecycle(LifecycleAction::Start))
+            .is_none());
+        assert!(missing.schema_error_for(CloudVerb::Inventory).is_none());
+        assert!(missing.schema_error_for(CloudVerb::Plan).is_none());
+        assert!(missing.schema_error_for(CloudVerb::List).is_none());
+    }
+
+    #[test]
+    fn malformed_json_is_refused_before_read_or_mutation_handlers() {
+        use std::path::PathBuf;
+        use std::sync::Arc;
+
+        use super::super::runner::fake::FakeRunner;
+        use super::super::CloudWorker;
+
+        let read_runner = Arc::new(FakeRunner {
+            roster_err: Some("roster handler must not run".to_string()),
+            ..Default::default()
+        });
+        let read_worker = CloudWorker::new(
+            "me".into(),
+            "peer:me".into(),
+            PathBuf::from("/tmp/mackesd-cloud-verbs-test"),
+        )
+        .with_runner(read_runner);
+        let read_reply = read_worker.handle("list", "{\"node\":");
+        assert!(!read_reply.ok);
+        assert!(read_reply
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("valid JSON")));
+        assert!(read_reply.gated.is_none());
+
+        let mutation_runner = Arc::new(FakeRunner::default());
+        let mutation_worker = CloudWorker::new(
+            "me".into(),
+            "peer:me".into(),
+            PathBuf::from("/tmp/mackesd-cloud-verbs-test"),
+        )
+        .with_runner(mutation_runner.clone());
+        let mutation_reply = mutation_worker.handle("instance-start", "[");
+        assert!(!mutation_reply.ok);
+        assert!(mutation_reply
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("valid JSON")));
+        assert!(mutation_runner.calls.lock().unwrap().is_empty());
     }
 }

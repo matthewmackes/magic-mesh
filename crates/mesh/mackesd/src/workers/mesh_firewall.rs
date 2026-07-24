@@ -23,7 +23,7 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use crate::surrounding_hosts::{blocked_ips, drop_rich_rule_body, read_all_surrounding};
+use crate::surrounding_hosts::{blocked_ips, drop_rich_rule_body, read_all_surrounding_checked};
 
 use super::{ShutdownToken, Worker};
 
@@ -32,7 +32,7 @@ pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Worker handle.
 pub struct MeshFirewallWorker {
-    /// Surrounding-host snapshot root (`~/.local/share/mde/surrounding`).
+    /// Surrounding-host snapshot root (`<workgroup-root>/surrounding`).
     base_dir: PathBuf,
     tick: Duration,
     /// IPs currently dropped (in-memory shadow). Rebuilt empty on boot —
@@ -61,9 +61,17 @@ impl MeshFirewallWorker {
     }
 
     fn tick_once(&self) {
-        let desired: BTreeSet<String> = blocked_ips(&read_all_surrounding(&self.base_dir))
-            .into_iter()
-            .collect();
+        let desired = match desired_blocked_ips(&self.base_dir) {
+            Ok(desired) => desired,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    path = %self.base_dir.join("trust.json").display(),
+                    "mesh_firewall: trust authority rejected; retaining current DROP set"
+                );
+                return;
+            }
+        };
         let mut active = self
             .active
             .lock()
@@ -90,6 +98,12 @@ impl MeshFirewallWorker {
             let _ = run_firewall_cmd(&["--reload".to_string()]);
         }
     }
+}
+
+fn desired_blocked_ips(base_dir: &std::path::Path) -> std::io::Result<BTreeSet<String>> {
+    Ok(blocked_ips(&read_all_surrounding_checked(base_dir)?)
+        .into_iter()
+        .collect())
 }
 
 /// Pure reconcile — `(to_add, to_remove)` = `(desired − active,
@@ -191,5 +205,51 @@ mod tests {
         assert!(add[1].contains("drop"));
         let rem = remove_drop_args("10.0.0.5");
         assert!(rem[1].starts_with("--remove-rich-rule="));
+    }
+
+    #[test]
+    fn trust_consumer_rejects_tamper_instead_of_unblocking() {
+        use crate::surrounding_hosts::{
+            save_trust_store_with_signer, HostType, SurroundingHost, TrustState, TrustStore,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let peer = tmp.path().join("peer-a");
+        std::fs::create_dir_all(&peer).unwrap();
+        let host = SurroundingHost {
+            ip: "10.0.0.5".into(),
+            mac: "aa:bb".into(),
+            vendor: String::new(),
+            hostname: String::new(),
+            services: Vec::new(),
+            host_type: HostType::Unknown,
+            trust: TrustState::Unknown,
+            first_seen_ms: 1,
+            last_seen_ms: 1,
+        };
+        std::fs::write(
+            peer.join("20260101T000000-a.json"),
+            serde_json::to_vec(&vec![host]).unwrap(),
+        )
+        .unwrap();
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[17_u8; 32]);
+        let mut trust = TrustStore::new();
+        trust.insert("aa:bb".into(), TrustState::Blocked);
+        let path = tmp.path().join("trust.json");
+        save_trust_store_with_signer(&path, &trust, &signer).unwrap();
+        assert_eq!(desired_blocked_ips(tmp.path()).unwrap(), set(&["10.0.0.5"]));
+
+        let mut envelope: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        envelope["entries"]["aa:bb"] = serde_json::json!("trusted");
+        crate::ca::seal::write_atomic_sealed(
+            &path,
+            serde_json::to_string(&envelope).unwrap().as_bytes(),
+        )
+        .unwrap();
+        assert!(
+            desired_blocked_ips(tmp.path()).is_err(),
+            "the firewall tick must retain its active DROP set on bad provenance"
+        );
     }
 }

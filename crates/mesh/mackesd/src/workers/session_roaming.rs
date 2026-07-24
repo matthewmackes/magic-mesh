@@ -66,6 +66,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use mde_bus::persist::Persist;
@@ -76,6 +77,7 @@ use super::session_broker::{
     SessionStore, SessionStoreError, VdiSession, VmId,
 };
 use super::{ShutdownToken, Worker};
+use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
 
 /// Bus topic the worker drains for roaming-policy requests (arrive / set-policy /
 /// save-layout).
@@ -1329,7 +1331,13 @@ impl RoamingFold {
 
 /// Read new [`ACTION_TOPIC`] messages since `cursor`, advancing it. A short sync
 /// open-read-drop (never crosses an `.await`), mirroring the broker / scheduler.
-fn read_new_actions(bus_root: &Path, cursor: &mut Option<String>) -> Vec<RoamingRequest> {
+/// Requests are authenticated against their exact wire body before they reach
+/// the roaming fold or any layout/session store write.
+fn read_new_actions(
+    bus_root: &Path,
+    cursor: &mut Option<String>,
+    authorizer: &ActionAuthorizer,
+) -> Vec<RoamingRequest> {
     let Ok(persist) = Persist::open(bus_root.to_path_buf()) else {
         return vec![];
     };
@@ -1340,8 +1348,26 @@ fn read_new_actions(bus_root: &Path, cursor: &mut Option<String>) -> Vec<Roaming
     for msg in msgs {
         *cursor = Some(msg.ulid.clone());
         let body = msg.body.as_deref().unwrap_or("");
+        if !crate::ipc::body_within_cap(Some(body)) {
+            tracing::warn!(
+                ulid = %msg.ulid,
+                cap = crate::ipc::MAX_RPC_BODY_BYTES,
+                "session_roaming: oversized roaming request refused"
+            );
+            continue;
+        }
         match parse_request(body) {
-            Ok(r) => out.push(r),
+            Ok(r) => {
+                if let Err(e) = authorize_roaming_request(authorizer, body, &r) {
+                    tracing::warn!(
+                        ulid = %msg.ulid,
+                        error = %e,
+                        "session_roaming: unauthorized roaming request refused"
+                    );
+                    continue;
+                }
+                out.push(r);
+            }
             Err(e) => {
                 tracing::warn!(ulid = %msg.ulid, error = %e, "session_roaming: bad roaming request");
             }
@@ -1350,17 +1376,57 @@ fn read_new_actions(bus_root: &Path, cursor: &mut Option<String>) -> Vec<Roaming
     out
 }
 
+/// Return the closed capability verb and stable semantic target for one
+/// roaming request. The original body is separately HMAC-bound, so a valid
+/// capability cannot be retargeted to another peer, VM, or layout owner.
+fn roaming_auth_target(request: &RoamingRequest) -> (&'static str, String) {
+    match request {
+        RoamingRequest::Arrive {
+            from, workstation, ..
+        } => ("vdi-roaming-arrive", format!("peer:{from}->{workstation}")),
+        RoamingRequest::SetPolicy { vm_id, .. } => {
+            ("vdi-roaming-set-policy", format!("vm:{vm_id}"))
+        }
+        RoamingRequest::SaveLayout { client_peer, .. } => {
+            ("vdi-roaming-save-layout", format!("peer:{client_peer}"))
+        }
+    }
+}
+
+/// Verify a roaming action's exact body before any fold or shared-plane write.
+/// Typed parsing is pure and only supplies the closed semantic target.
+fn authorize_roaming_request(
+    authorizer: &ActionAuthorizer,
+    body: &str,
+    request: &RoamingRequest,
+) -> Result<(), String> {
+    let (verb, target) = roaming_auth_target(request);
+    authorizer.authorize(
+        body,
+        MutationContext {
+            verb,
+            node: "vdi-roaming",
+            target: &target,
+        },
+    )
+}
+
 /// Fold new `action/vdi/roaming` messages (advancing `cursor`) into `fold`. Runs on
 /// every node (the log is mesh-replicated), so any node has a warm policy view ready
 /// to converge if it wins the election.
-fn drain(bus_root: &Path, cursor: &mut Option<String>, fold: &mut RoamingFold) {
-    for req in read_new_actions(bus_root, cursor) {
+fn drain(
+    bus_root: &Path,
+    cursor: &mut Option<String>,
+    fold: &mut RoamingFold,
+    authorizer: &ActionAuthorizer,
+) {
+    for req in read_new_actions(bus_root, cursor, authorizer) {
         fold.apply(req);
     }
 }
 
 fn default_bus_root() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join("mde").join("bus"))
+    mde_bus::default_data_dir()
 }
 
 fn now_ms() -> u64 {
@@ -1385,6 +1451,9 @@ pub struct SessionRoamingWorker {
     leader_lock: PathBuf,
     /// Convergence cadence.
     poll: Duration,
+    /// Exact-body capability verifier for the privileged roaming-action lane.
+    /// Missing production credentials install a fail-closed verifier.
+    authorizer: Arc<ActionAuthorizer>,
     /// Bus root override (tests). `None` ⇒ [`default_bus_root`].
     bus_root_override: Option<PathBuf>,
 }
@@ -1404,6 +1473,7 @@ impl SessionRoamingWorker {
             node_id,
             leader_lock,
             poll: DEFAULT_POLL_INTERVAL,
+            authorizer: Arc::new(ActionAuthorizer::production()),
             bus_root_override: None,
         }
     }
@@ -1419,6 +1489,15 @@ impl SessionRoamingWorker {
     #[must_use]
     pub fn with_layout_store(mut self, layouts: Box<dyn LayoutStore + Send + Sync>) -> Self {
         self.layouts = layouts;
+        self
+    }
+
+    /// Inject an isolated verifier and replay ledger for hostile action tests.
+    /// Production always uses the systemd-credential-backed authorizer.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
+        self.authorizer = authorizer;
         self
     }
 
@@ -1559,7 +1638,7 @@ impl Worker for SessionRoamingWorker {
         loop {
             tokio::select! {
                 _ = tick.tick() => {
-                    drain(&bus_root, &mut cursor, &mut fold);
+                    drain(&bus_root, &mut cursor, &mut fold, self.authorizer.as_ref());
                     self.converge(&fold);
                 }
                 () = shutdown.wait() => break,
@@ -1572,7 +1651,11 @@ impl Worker for SessionRoamingWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::action_auth::authorize_test_body;
     use std::sync::{Arc, Mutex};
+
+    const AUTH_KEY: &[u8] = b"vdi-roaming-action-auth-test-key";
+    const AUTH_NOW: i64 = 1_700_000_000_000;
 
     fn sess(id: &str, client_peer: &str, serving_peer: &str, state: SessionState) -> VdiSession {
         VdiSession {
@@ -2613,6 +2696,64 @@ mod tests {
     }
 
     #[test]
+    fn unsigned_roaming_action_is_refused_before_fold_mutation() {
+        use mde_bus::hooks::config::Priority;
+
+        let bus = tempfile::tempdir().expect("temp bus");
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let unsigned = serde_json::json!({
+            "schema_version": 1,
+            "op": "set_policy",
+            "vm_id": "vm-unsigned",
+            "policy": "shutdown"
+        })
+        .to_string();
+        persist
+            .write(ACTION_TOPIC, Priority::Default, None, Some(&unsigned))
+            .expect("write unsigned action");
+        let authorizer = ActionAuthorizer::for_test(AUTH_KEY, bus.path().join("auth"), AUTH_NOW);
+        let mut cursor = None;
+        let mut fold = RoamingFold::default();
+        drain(bus.path(), &mut cursor, &mut fold, &authorizer);
+        assert!(fold.policies.is_empty(), "unsigned action mutated the fold");
+    }
+
+    #[test]
+    fn authorized_roaming_action_is_exact_body_bound_and_single_use() {
+        use mde_bus::hooks::config::Priority;
+
+        let bus = tempfile::tempdir().expect("temp bus");
+        let persist = Persist::open(bus.path().to_path_buf()).expect("open bus");
+        let req = RoamingRequest::SetPolicy {
+            vm_id: "vm-authorized".into(),
+            policy: DisconnectPolicy::Shutdown,
+        };
+        let armed = signed_body(&req, "roaming-replay");
+        let tampered = armed.replace("vm-authorized", "vm-tampered");
+        // A body tamper must not consume the original capability. The original
+        // then succeeds once; publishing it again exercises the replay ledger.
+        for body in [&tampered, &armed, &armed] {
+            persist
+                .write(ACTION_TOPIC, Priority::Default, None, Some(body))
+                .expect("write roaming action");
+        }
+        let authorizer = ActionAuthorizer::for_test(AUTH_KEY, bus.path().join("auth"), AUTH_NOW);
+        let mut cursor = None;
+        let mut fold = RoamingFold::default();
+        drain(bus.path(), &mut cursor, &mut fold, &authorizer);
+        assert_eq!(
+            fold.policies.get("vm-authorized"),
+            Some(&DisconnectPolicy::Shutdown)
+        );
+        assert_eq!(fold.policies.len(), 1);
+    }
+
+    #[test]
+    fn default_bus_root_uses_the_shared_mde_bus_resolver() {
+        assert_eq!(default_bus_root(), mde_bus::default_data_dir());
+    }
+
+    #[test]
     fn worker_name_matches_module() {
         let w = SessionRoamingWorker::new(std::env::temp_dir(), "peer:a".to_string());
         assert_eq!(w.name(), "session_roaming");
@@ -2620,8 +2761,31 @@ mod tests {
 
     // ── worker wiring (seeded temp bus + injected fakes) ──
 
-    /// Seed a temp bus with `action/vdi/roaming` bodies and return its root.
-    fn seed_bus(reqs: &[RoamingRequest]) -> PathBuf {
+    /// Sign one roaming request body for the isolated test authorizer.
+    fn signed_body(req: &RoamingRequest, nonce: &str) -> String {
+        let mut unsigned = serde_json::to_value(req).expect("request value");
+        unsigned
+            .as_object_mut()
+            .expect("roaming request object")
+            .insert("schema_version".into(), serde_json::json!(1));
+        let unsigned = unsigned.to_string();
+        let (verb, target) = roaming_auth_target(req);
+        authorize_test_body(
+            AUTH_KEY,
+            &unsigned,
+            MutationContext {
+                verb,
+                node: "vdi-roaming",
+                target: &target,
+            },
+            nonce,
+            AUTH_NOW + 30_000,
+        )
+    }
+
+    /// Seed a temp bus with authorized `action/vdi/roaming` bodies and return
+    /// its root plus the matching isolated verifier.
+    fn seed_bus(reqs: &[RoamingRequest]) -> (PathBuf, Arc<ActionAuthorizer>) {
         use mde_bus::hooks::config::Priority;
         // A process-wide sequence keeps parallel tests seeded in the same
         // millisecond from colliding on the temp dir.
@@ -2629,17 +2793,22 @@ mod tests {
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("mde-sr-{}-{seq}-{}", now_ms(), reqs.len()));
         let persist = Persist::open(dir.clone()).expect("open bus");
-        for r in reqs {
+        let authorizer = Arc::new(ActionAuthorizer::for_test(
+            AUTH_KEY,
+            dir.join("auth"),
+            AUTH_NOW,
+        ));
+        for (index, r) in reqs.iter().enumerate() {
             persist
                 .write(
                     ACTION_TOPIC,
                     Priority::Default,
                     None,
-                    Some(&serde_json::to_string(r).unwrap()),
+                    Some(&signed_body(r, &format!("seed-{index}"))),
                 )
                 .expect("write action");
         }
-        dir
+        (dir, authorizer)
     }
 
     #[tokio::test]
@@ -2654,7 +2823,7 @@ mod tests {
             geometry: MonitorGeometry::new(0, 0, 1920, 1080),
             primary: true,
         }]);
-        let bus = seed_bus(&[
+        let (bus, authorizer) = seed_bus(&[
             RoamingRequest::Arrive {
                 from: "peer:old".into(),
                 workstation: "peer:new".into(),
@@ -2686,11 +2855,12 @@ mod tests {
             .with_layout_store(Box::new(layouts))
             // serving node peer:vmhost is live ⇒ no node-loss interference.
             .with_live_nodes(Box::new(FakeLiveNodes(live_set(&["vmhost"]))))
-            .with_bus_root(bus.clone());
+            .with_bus_root(bus.clone())
+            .with_authorizer(Arc::clone(&authorizer));
 
         let mut cursor = None;
         let mut fold = RoamingFold::default();
-        drain(&bus, &mut cursor, &mut fold);
+        drain(&bus, &mut cursor, &mut fold, authorizer.as_ref());
         w.converge(&fold);
 
         let published = rows.lock().expect("rows mutex");
@@ -2725,7 +2895,7 @@ mod tests {
             MonitorSession::new("edid:DEL:U2720Q:1", "s1"),
             MonitorSession::new("edid:LEN:P27:2", "s2"),
         ]);
-        let bus = seed_bus(&[
+        let (bus, authorizer) = seed_bus(&[
             RoamingRequest::SaveLayout {
                 client_peer: "peer:old".into(),
                 layout: layout.clone(),
@@ -2764,11 +2934,12 @@ mod tests {
             .with_store(Box::new(store))
             .with_layout_store(Box::new(layouts))
             .with_live_nodes(Box::new(FakeLiveNodes(live_set(&["h1", "h2"]))))
-            .with_bus_root(bus.clone());
+            .with_bus_root(bus.clone())
+            .with_authorizer(Arc::clone(&authorizer));
 
         let mut cursor = None;
         let mut fold = RoamingFold::default();
-        drain(&bus, &mut cursor, &mut fold);
+        drain(&bus, &mut cursor, &mut fold, authorizer.as_ref());
         w.converge(&fold);
 
         let published = rows.lock().expect("rows mutex");
@@ -2803,7 +2974,7 @@ mod tests {
             MonitorSession::new("edid:DEL:U2720Q:1", "s1"),
             MonitorSession::new("edid:LEN:P27:2", "s2"),
         ]);
-        let bus = seed_bus(&[RoamingRequest::Arrive {
+        let (bus, authorizer) = seed_bus(&[RoamingRequest::Arrive {
             from: "peer:old".into(),
             workstation: "peer:new".into(),
             monitors: Some(WorkstationMonitors::new(
@@ -2831,12 +3002,13 @@ mod tests {
             .with_store(Box::new(store))
             .with_layout_store(Box::new(layouts))
             .with_live_nodes(Box::new(FakeLiveNodes(live_set(&["h1", "h2"]))))
-            .with_bus_root(bus.clone());
+            .with_bus_root(bus.clone())
+            .with_authorizer(Arc::clone(&authorizer));
 
         let mut cursor = None;
         let mut fold = RoamingFold::default();
         w.preload_layouts(&mut fold);
-        drain(&bus, &mut cursor, &mut fold);
+        drain(&bus, &mut cursor, &mut fold, authorizer.as_ref());
         w.converge(&fold);
 
         let published = rows.lock().expect("rows mutex");
@@ -2862,7 +3034,7 @@ mod tests {
     async fn worker_shutdown_policy_ends_a_disconnected_session() {
         // A Disconnected session whose VM has a Shutdown policy is removed from the
         // plane on converge.
-        let bus = seed_bus(&[RoamingRequest::SetPolicy {
+        let (bus, authorizer) = seed_bus(&[RoamingRequest::SetPolicy {
             vm_id: "uuid-s1".into(),
             policy: DisconnectPolicy::Shutdown,
         }]);
@@ -2881,10 +3053,11 @@ mod tests {
         let w = SessionRoamingWorker::new(wg.clone(), "peer:a".to_string())
             .with_store(Box::new(store))
             .with_live_nodes(Box::new(FakeLiveNodes(live_set(&["live"]))))
-            .with_bus_root(bus.clone());
+            .with_bus_root(bus.clone())
+            .with_authorizer(Arc::clone(&authorizer));
         let mut cursor = None;
         let mut fold = RoamingFold::default();
-        drain(&bus, &mut cursor, &mut fold);
+        drain(&bus, &mut cursor, &mut fold, authorizer.as_ref());
         w.converge(&fold);
         assert!(
             rows.lock().expect("rows mutex").is_empty(),

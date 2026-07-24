@@ -95,6 +95,8 @@ pub struct CallAgg {
     pub ended: bool,
     /// Participant states, LWW-folded.
     pub participants: BTreeMap<ActorId, CallParticipantState>,
+    /// Participant mute bits, LWW-folded independently from lifecycle state.
+    pub muted: BTreeMap<ActorId, bool>,
 }
 
 /// The folded aggregate.
@@ -267,23 +269,38 @@ impl DomainState {
             } => {
                 let mut participants = BTreeMap::new();
                 participants.insert(initiator.clone(), CallParticipantState::Connected);
+                let mut muted = BTreeMap::new();
+                muted.insert(initiator.clone(), false);
                 self.calls.insert(
                     *call,
                     CallAgg {
                         space: space_id,
                         ended: false,
                         participants,
+                        muted,
                     },
                 );
             }
             CollabEventKind::CallParticipantChanged { call, actor, state } => {
                 if let Some(c) = self.calls.get_mut(call) {
-                    c.participants.insert(actor.clone(), *state);
+                    if c.space == space_id {
+                        c.participants.insert(actor.clone(), *state);
+                        c.muted.entry(actor.clone()).or_insert(false);
+                    }
+                }
+            }
+            CollabEventKind::CallParticipantMuted { call, actor, muted } => {
+                if let Some(c) = self.calls.get_mut(call) {
+                    if c.space == space_id {
+                        c.muted.insert(actor.clone(), *muted);
+                    }
                 }
             }
             CollabEventKind::CallEnded { call, .. } => {
                 if let Some(c) = self.calls.get_mut(call) {
-                    c.ended = true;
+                    if c.space == space_id {
+                        c.ended = true;
+                    }
                 }
             }
             CollabEventKind::AiSuggestionOffered { .. }
@@ -320,5 +337,99 @@ impl DomainState {
     #[must_use]
     pub fn is_owner(&self, space: SpaceId, actor: &ActorId) -> bool {
         matches!(self.role(space, actor), Some(SpaceRole::Owner))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DomainState;
+    use mde_collab_types::event::CollabEventKind;
+    use mde_collab_types::ids::{CallId, EventId, SpaceId};
+    use mde_collab_types::value::{CallKind, CallParticipantState};
+    use mde_collab_types::{ActorClock, ActorId, CollabEventEnvelope};
+    use uuid::Uuid;
+
+    fn event_id(value: u128) -> EventId {
+        EventId::from_uuid(Uuid::from_u128(value))
+    }
+
+    fn space_id(value: u128) -> SpaceId {
+        SpaceId::from_uuid(Uuid::from_u128(value))
+    }
+
+    fn call_id(value: u128) -> CallId {
+        CallId::from_uuid(Uuid::from_u128(value))
+    }
+
+    fn event(
+        id: u128,
+        space: SpaceId,
+        wall: u64,
+        kind: CollabEventKind,
+    ) -> CollabEventEnvelope {
+        CollabEventEnvelope::new(
+            event_id(id),
+            space,
+            ActorId::new("alice"),
+            ActorClock::at(wall, 0),
+            i64::try_from(wall).expect("test clock fits"),
+            kind,
+        )
+    }
+
+    #[test]
+    fn cross_space_call_mutations_do_not_touch_the_target_call() {
+        let owner_space = space_id(1);
+        let forged_space = space_id(2);
+        let call = call_id(3);
+        let events = vec![
+            event(
+                4,
+                owner_space,
+                1,
+                CollabEventKind::CallStarted {
+                    call,
+                    kind: CallKind::Audio,
+                    initiator: ActorId::new("alice"),
+                },
+            ),
+            event(
+                5,
+                forged_space,
+                2,
+                CollabEventKind::CallParticipantChanged {
+                    call,
+                    actor: ActorId::new("bob"),
+                    state: CallParticipantState::Connected,
+                },
+            ),
+            event(
+                6,
+                forged_space,
+                3,
+                CollabEventKind::CallParticipantMuted {
+                    call,
+                    actor: ActorId::new("alice"),
+                    muted: true,
+                },
+            ),
+            event(
+                7,
+                forged_space,
+                4,
+                CollabEventKind::CallEnded {
+                    call,
+                    reason: Some("forged-cross-space".into()),
+                },
+            ),
+        ];
+
+        let state = DomainState::from_events(&events);
+        let call_state = state.calls.get(&call).expect("call is folded");
+        assert_eq!(call_state.space, owner_space);
+        assert_eq!(call_state.participants.len(), 1);
+        assert!(call_state.participants.contains_key(&ActorId::new("alice")));
+        assert_eq!(call_state.muted.get(&ActorId::new("alice")), Some(&false));
+        assert!(!call_state.ended);
     }
 }

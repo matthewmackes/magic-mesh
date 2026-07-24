@@ -310,9 +310,8 @@ pub fn save_prod_arm(path: &Path, armed: bool) -> Result<(), String> {
 /// old `mde-bus publish <topic> --body-flag <body>`.
 ///
 /// Targets [`crate::bus_publish::default_bus_root`] (which honours
-/// `MDE_BUS_ROOT`) — the SAME root the fork+exec'd CLI resolved, NOT the
-/// worker's own MDE_BUS_ROOT-blind [`default_bus_root`] read root (they diverge
-/// on the live daemon; see [`crate::workers::dc_auditor`]).
+/// `MDE_BUS_ROOT`) — the same canonical root used by the promotion verdict
+/// reader and by the fork+exec'd CLI.
 fn publish(rec: &PromoteRecord) {
     publish_to(crate::bus_publish::default_bus_root().as_deref(), rec);
 }
@@ -448,7 +447,7 @@ fn default_home() -> Option<PathBuf> {
 /// The default Bus persist root (where `event/test/*` lives). Mirrors
 /// `dc_auditor::default_bus_root`.
 fn default_bus_root() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join("mde").join("bus"))
+    mde_bus::default_data_dir()
 }
 
 /// The supervised worker. Leader-gated (only the elected node publishes the

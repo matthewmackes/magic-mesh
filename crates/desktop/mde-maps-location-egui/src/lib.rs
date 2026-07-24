@@ -21,6 +21,7 @@ pub mod basemap;
 pub mod caltrans_camera;
 pub mod car_status;
 pub mod earthquake;
+pub mod firms;
 pub mod geocode;
 pub mod iem_radar;
 pub mod model;

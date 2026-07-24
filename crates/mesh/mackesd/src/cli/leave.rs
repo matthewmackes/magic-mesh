@@ -22,16 +22,11 @@ pub fn run(yes: bool) -> anyhow::Result<()> {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "unknown".to_string());
         let node_id = format!("peer:{hostname}");
-        let report = mackesd_core::leave::leave(
-            &root,
-            &hostname,
-            &node_id,
-            std::path::Path::new("/etc/nebula"),
-            std::path::Path::new("/var/lib/mde/role.toml"),
-        );
         // HA — drop our own etcd cluster membership BEFORE stopping the overlay
         // (the cluster is reached over nebula), so a retired node never leaves a
-        // ghost voter dragging quorum. Best-effort; a non-member is a no-op.
+        // ghost voter dragging quorum. A live etcd failure is fatal: wiping the
+        // local identity first would leave an unprunable ghost voter and make a
+        // retry impossible from this node.
         {
             use mackesd_core::substrate::{etcd, etcd_membership};
             let eps = etcd::default_endpoints();
@@ -40,16 +35,20 @@ pub fn run(yes: bool) -> anyhow::Result<()> {
                     Some(ip) => etcd_membership::MemberSel::Overlay(ip),
                     None => etcd_membership::MemberSel::Hostname(hostname.clone()),
                 };
-                match etcd_membership::remove_member_blocking(&eps, &sel) {
-                    Some(Ok(true)) => println!("etcd: removed self from the cluster"),
-                    Some(Ok(false)) | None => {}
-                    Some(Err(e)) => eprintln!(
-                        "etcd: could not remove self ({e}) — prune the stale member \
-                             with `etcdctl member remove`"
-                    ),
+                let result = etcd_membership::remove_member_blocking(&eps, &sel);
+                if matches!(&result, Some(Ok(true))) {
+                    println!("etcd: removed self from the cluster");
                 }
+                ensure_member_removal_succeeded(result)?;
             }
         }
+        let report = mackesd_core::leave::leave(
+            &root,
+            &hostname,
+            &node_id,
+            std::path::Path::new("/etc/nebula"),
+            std::path::Path::new("/var/lib/mde/role.toml"),
+        );
         let _ = std::process::Command::new("systemctl")
             .args(["stop", "nebula.service"])
             .status();
@@ -58,4 +57,36 @@ pub fn run(yes: bool) -> anyhow::Result<()> {
         return Ok(());
     }
     Ok(())
+}
+
+/// A configured coordination plane must confirm departure before local state is
+/// destroyed. `None` means the blocking bridge could not run; `Err` means etcd
+/// rejected the mutation. Both leave the node intact so an operator can retry.
+fn ensure_member_removal_succeeded(result: Option<Result<bool, String>>) -> anyhow::Result<()> {
+    match result {
+        Some(Ok(_)) => Ok(()),
+        Some(Err(error)) => {
+            anyhow::bail!("etcd member removal failed ({error}); refusing to wipe local mesh state")
+        }
+        None => {
+            anyhow::bail!("etcd member removal could not run; refusing to wipe local mesh state")
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_member_removal_succeeded;
+
+    #[test]
+    fn departure_gate_accepts_confirmed_or_idempotent_removal() {
+        assert!(ensure_member_removal_succeeded(Some(Ok(true))).is_ok());
+        assert!(ensure_member_removal_succeeded(Some(Ok(false))).is_ok());
+    }
+
+    #[test]
+    fn departure_gate_refuses_unavailable_or_failed_etcd() {
+        assert!(ensure_member_removal_succeeded(None).is_err());
+        assert!(ensure_member_removal_succeeded(Some(Err("offline".into()))).is_err());
+    }
 }

@@ -16,14 +16,18 @@
 #![cfg(feature = "async-services")]
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use mackes_mesh_types::cap_tags::{read_tags, CapabilityTag};
 use magic_fleet::jobs::{
-    read_run, run_pending_for, runs_dir, write_target_result, JobRun, TargetResult,
+    normalize_playbook_ref, read_run, resolve_playbook_path, run_pending_for, runs_dir,
+    write_target_result, JobRun, TargetResult,
 };
+use sha2::{Digest, Sha256};
 
 use super::{ShutdownToken, Worker};
+use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
 
 /// Run poll cadence.
 pub const POLL: Duration = Duration::from_secs(5);
@@ -32,6 +36,7 @@ pub const POLL: Duration = Duration::from_secs(5);
 pub struct JobExecWorker {
     workgroup_root: PathBuf,
     hostname: String,
+    authorizer: Arc<ActionAuthorizer>,
 }
 
 impl JobExecWorker {
@@ -42,7 +47,14 @@ impl JobExecWorker {
         Self {
             workgroup_root,
             hostname,
+            authorizer: Arc::new(ActionAuthorizer::production()),
         }
+    }
+
+    #[cfg(test)]
+    fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
+        self.authorizer = authorizer;
+        self
     }
 
     /// Every run with a pending target slot for this box.
@@ -53,7 +65,10 @@ impl JobExecWorker {
         entries
             .filter_map(Result::ok)
             .filter_map(|e| e.file_name().to_str().map(str::to_string))
-            .filter_map(|id| read_run(&self.workgroup_root, &id))
+            .filter_map(|id| {
+                let run = read_run(&self.workgroup_root, &id)?;
+                (run.run_id == id).then_some(run)
+            })
             .filter(|run| run_pending_for(&self.workgroup_root, run, &self.hostname))
             .collect()
     }
@@ -81,17 +96,74 @@ impl JobExecWorker {
 
     /// Resolve + apply the run's playbook locally.
     fn execute(&self, run: &JobRun) -> TargetResult {
-        let playbook_path = self.workgroup_root.join(&run.playbook);
+        let playbook = match normalize_playbook_ref(&run.playbook) {
+            Ok(playbook) if playbook == run.playbook => playbook,
+            Ok(_) => return self.refused("playbook reference is not normalized"),
+            Err(error) => return self.refused(&error),
+        };
+        if run.playbook_digest.is_empty() {
+            return self.refused("run has no signed playbook digest");
+        }
+        let Some(auth_body) = run.execution_auth.get(&self.hostname) else {
+            return self.refused("run has no target execution authorization");
+        };
+        let envelope: serde_json::Value = match serde_json::from_str(auth_body) {
+            Ok(envelope) => envelope,
+            Err(_) => return self.refused("target execution authorization is not JSON"),
+        };
+        let fields_match = envelope.get("run_id").and_then(serde_json::Value::as_str)
+            == Some(run.run_id.as_str())
+            && envelope.get("node").and_then(serde_json::Value::as_str)
+                == Some(self.hostname.as_str())
+            && envelope.get("playbook").and_then(serde_json::Value::as_str)
+                == Some(playbook.as_str())
+            && envelope
+                .get("playbook_digest")
+                .and_then(serde_json::Value::as_str)
+                == Some(run.playbook_digest.as_str());
+        if !fields_match {
+            return self.refused("target execution authorization does not match the run");
+        }
+        let auth_target = format!("{}:{}", run.run_id, run.playbook_digest);
+        if let Err(error) = self.authorizer.authorize(
+            auth_body,
+            MutationContext {
+                verb: "jobs-execute",
+                node: &self.hostname,
+                target: &auth_target,
+            },
+        ) {
+            return self.refused(&format!("target execution authorization refused: {error}"));
+        }
+
+        let playbook_path = match resolve_playbook_path(&self.workgroup_root, &playbook) {
+            Ok(path) => path,
+            Err(error) => return self.refused(&error),
+        };
+        let playbooks_root = self.workgroup_root.join("playbooks");
+        let canonical_root = match std::fs::canonicalize(&playbooks_root) {
+            Ok(root) => root,
+            Err(error) => return self.failed(&format!("playbooks directory unavailable: {error}")),
+        };
+        let canonical_path = match std::fs::canonicalize(&playbook_path) {
+            Ok(path) => path,
+            Err(error) => {
+                return self.failed(&format!("playbook {} unreadable: {error}", playbook))
+            }
+        };
+        if !canonical_path.starts_with(&canonical_root) {
+            return self.refused("playbook resolves outside the replicated playbooks directory");
+        }
         let yaml = match std::fs::read_to_string(&playbook_path) {
             Ok(y) => y,
             Err(e) => {
-                return TargetResult {
-                    hostname: self.hostname.clone(),
-                    status: "failed".into(),
-                    detail: format!("playbook {} unreadable: {e}", run.playbook),
-                };
+                return self.failed(&format!("playbook {} unreadable: {e}", playbook));
             }
         };
+        let digest = sha256_hex(yaml.as_bytes());
+        if digest != run.playbook_digest {
+            return self.refused("playbook digest differs from the signed run");
+        }
         let work =
             std::env::temp_dir().join(format!("mde-job-{}-{}", run.run_id, std::process::id()));
         match magic_fleet::apply(&yaml, &work) {
@@ -115,6 +187,25 @@ impl JobExecWorker {
             },
         }
     }
+
+    fn failed(&self, detail: &str) -> TargetResult {
+        TargetResult {
+            hostname: self.hostname.clone(),
+            status: "failed".into(),
+            detail: detail.into(),
+        }
+    }
+
+    fn refused(&self, detail: &str) -> TargetResult {
+        self.failed(&format!("refused: {detail}"))
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 #[async_trait::async_trait]
@@ -129,6 +220,7 @@ impl Worker for JobExecWorker {
             let this = JobExecWorker {
                 workgroup_root: self.workgroup_root.clone(),
                 hostname: self.hostname.clone(),
+                authorizer: Arc::clone(&self.authorizer),
             };
             let _ = tokio::task::spawn_blocking(move || this.run_once()).await;
             tokio::select! {
@@ -152,10 +244,12 @@ mod tests {
             &JobRun {
                 run_id: "r-1".into(),
                 playbook: "playbooks/noop.yml".into(),
+                playbook_digest: String::new(),
                 vars: Default::default(),
                 targets: vec!["pine".into()],
                 launched_by: "peer:oak".into(),
                 at: 1,
+                execution_auth: Default::default(),
             },
         )
         .unwrap();
@@ -178,16 +272,26 @@ mod tests {
         let mut tags = NodeTags::default();
         tags.tags.insert(CapabilityTag::Execution);
         write_tags(tmp.path(), "pine", &tags).unwrap();
-        // No playbook file on disk → the apply path reports failed,
-        // but the run is HANDLED (result written, slot cleared) — the
-        // gate + dispatch + result-write loop is what we're pinning.
+        // Missing target capability is refused before a playbook is read or
+        // handed to ansible-runner; the result still clears the pending slot.
         let w = JobExecWorker::new(tmp.path().to_path_buf(), "pine".into());
         assert_eq!(w.run_once(), ["r-1"]);
         let results = read_target_results(tmp.path(), "r-1");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].hostname, "pine");
-        assert_eq!(results[0].status, "failed"); // missing playbook
-                                                 // Slot cleared — a second pass finds nothing pending.
+        assert_eq!(results[0].status, "failed");
+        assert!(results[0].detail.contains("no signed playbook digest"));
+        // Slot cleared — a second pass finds nothing pending.
         assert!(w.run_once().is_empty());
+    }
+
+    #[test]
+    fn path_traversal_is_rejected_by_the_shared_reference_validator() {
+        assert!(magic_fleet::jobs::normalize_playbook_ref("../outside.yml").is_err());
+        assert!(magic_fleet::jobs::normalize_playbook_ref("/etc/passwd").is_err());
+        assert_eq!(
+            magic_fleet::jobs::normalize_playbook_ref("repair.yml").unwrap(),
+            "playbooks/repair.yml"
+        );
     }
 }

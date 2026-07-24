@@ -63,12 +63,18 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
+use mackes_mesh_types::cloud::{
+    cloud_request_digest, CloudArmSigner, CloudArmedToken, CLOUD_ACTION_SCHEMA_VERSION,
+};
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_bus::rpc::{publish_request, reply_topic};
+
+use crate::ipc::action_auth::{production_action_signer, ActionAuthorizer, MutationContext};
 
 use super::cert_authority::ACTION_TOPIC as CERT_SIGN_TOPIC;
 use super::compute_registry;
@@ -80,6 +86,14 @@ pub const CREATE_TOPIC_PREFIX: &str = "compute/create/";
 
 /// Reply-topic prefix for create acks (suffix = request ULID).
 pub const CREATE_ACK_PREFIX: &str = "compute/create-ack/";
+
+/// Closed capability verb for VM creation. Possession of the shared Bus topic
+/// is transport reachability, not permission to create a VM or mint its guest
+/// credentials.
+pub const COMPUTE_PROVISION_AUTH_VERB: &str = "compute-provision-create";
+
+/// Stable node scope shared by the compute-create capability.
+pub const COMPUTE_PROVISION_NODE_SCOPE: &str = "compute";
 
 /// Default poll cadence — control surface.
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(400);
@@ -105,6 +119,11 @@ pub const CERT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Cert-sign RPC poll cadence while awaiting the reply.
 pub const CERT_RPC_POLL: Duration = Duration::from_millis(250);
+
+/// Capability context for the internal compute → CA signing handoff.
+pub const CERT_AUTH_VERB: &str = super::cert_authority::CERT_AUTH_VERB;
+/// Node scope expected by the local certificate authority responder.
+pub const CERT_AUTH_NODE_SCOPE: &str = super::cert_authority::CERT_AUTH_NODE_SCOPE;
 
 /// Create-request payload per design doc §3.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -161,6 +180,31 @@ fn is_false(b: &bool) -> bool {
 /// required fields.
 pub fn parse_create_request(body: &str) -> Result<CreateRequest, String> {
     serde_json::from_str(body).map_err(|e| format!("malformed create request: {e}"))
+}
+
+/// Bind a create capability to the exact VM request and correlation id. The
+/// raw body is independently authenticated by [`ActionAuthorizer`], while
+/// this semantic target prevents a valid capability from being retargeted to a
+/// different VM or request stream.
+#[must_use]
+pub fn create_auth_target(req: &CreateRequest) -> String {
+    format!("vm:{}:{}", req.name.trim(), req.request_ulid.trim())
+}
+
+fn authorize_create_request(
+    authorizer: &ActionAuthorizer,
+    body: &str,
+    req: &CreateRequest,
+) -> Result<(), String> {
+    let target = create_auth_target(req);
+    authorizer.authorize(
+        body,
+        MutationContext {
+            verb: COMPUTE_PROVISION_AUTH_VERB,
+            node: COMPUTE_PROVISION_NODE_SCOPE,
+            target: &target,
+        },
+    )
 }
 
 /// The VM /24's third octet for this peer (lock 1):
@@ -728,8 +772,11 @@ fn request_cert(
     ip_cidr: &str,
     public_key_pem: &str,
 ) -> Result<(String, String), String> {
-    let body = build_cert_sign_request_body(vm_id, ip_cidr, public_key_pem);
     for attempt in 0..2 {
+        // Mint a fresh one-shot capability for every attempt. If the CA saw a
+        // request but its reply was lost, retrying the same bearer would be a
+        // replay refusal rather than a second signing effect.
+        let body = authorize_cert_sign_request_body(vm_id, ip_cidr, public_key_pem)?;
         let ulid = publish_request(
             persist,
             CERT_SIGN_TOPIC,
@@ -764,6 +811,61 @@ fn request_cert(
     Err("cert request exhausted retries".into())
 }
 
+fn authorize_cert_sign_request_body(
+    common_name: &str,
+    ip_cidr: &str,
+    public_key_pem: &str,
+) -> Result<String, String> {
+    let signer = production_action_signer()?;
+    let nonce = uuid::Uuid::new_v4().to_string();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "system clock is before the Unix epoch".to_string())
+        .and_then(|duration| {
+            i64::try_from(duration.as_millis())
+                .map_err(|_| "system clock is beyond the capability range".to_string())
+        })?;
+    authorize_cert_sign_request_body_with_signer(
+        &signer,
+        common_name,
+        ip_cidr,
+        public_key_pem,
+        now_ms,
+        &nonce,
+    )
+}
+
+fn authorize_cert_sign_request_body_with_signer(
+    signer: &CloudArmSigner,
+    common_name: &str,
+    ip_cidr: &str,
+    public_key_pem: &str,
+    now_ms: i64,
+    nonce: &str,
+) -> Result<String, String> {
+    let mut document: serde_json::Value = serde_json::from_str(&build_cert_sign_request_body(
+        common_name,
+        ip_cidr,
+        public_key_pem,
+    ))
+    .map_err(|error| format!("build cert-sign request: {error}"))?;
+    document["schema_version"] = serde_json::json!(CLOUD_ACTION_SCHEMA_VERSION);
+    let unsigned = document.to_string();
+    let target = format!("vm:{common_name}");
+    let token = CloudArmedToken::mint(
+        signer,
+        nonce,
+        now_ms.saturating_add(crate::ipc::action_auth::MAX_AUTH_TTL_MS),
+        CERT_AUTH_VERB,
+        CERT_AUTH_NODE_SCOPE,
+        &target,
+        &cloud_request_digest(&unsigned).map_err(str::to_string)?,
+    )
+    .encode();
+    document["armed_token"] = serde_json::Value::String(token);
+    Ok(document.to_string())
+}
+
 /// Read the new create requests on this peer's topic since `cursor`.
 /// Opens + drops a `Persist` synchronously so it never crosses an
 /// `.await` in the run-loop.
@@ -771,6 +873,7 @@ fn read_new_creates(
     bus_root: &Path,
     topic: &str,
     cursor: &mut Option<String>,
+    authorizer: &ActionAuthorizer,
 ) -> Vec<CreateRequest> {
     let Ok(persist) = Persist::open(bus_root.to_path_buf()) else {
         return vec![];
@@ -782,8 +885,26 @@ fn read_new_creates(
     for msg in msgs {
         *cursor = Some(msg.ulid.clone());
         let body = msg.body.as_deref().unwrap_or("");
+        if !crate::ipc::body_within_cap(Some(body)) {
+            tracing::warn!(
+                ulid = %msg.ulid,
+                cap = crate::ipc::MAX_RPC_BODY_BYTES,
+                "compute_provision: oversized create request refused"
+            );
+            continue;
+        }
         match parse_create_request(body) {
-            Ok(req) => out.push(req),
+            Ok(req) => {
+                if let Err(e) = authorize_create_request(authorizer, body, &req) {
+                    tracing::warn!(
+                        ulid = %msg.ulid,
+                        error = %e,
+                        "compute_provision: unauthorized create request refused"
+                    );
+                    continue;
+                }
+                out.push(req);
+            }
             Err(e) => {
                 tracing::warn!(ulid = %msg.ulid, error = %e, "compute_provision: bad create request")
             }
@@ -793,7 +914,7 @@ fn read_new_creates(
 }
 
 fn default_bus_root() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join("mde").join("bus"))
+    mde_bus::default_data_dir()
 }
 
 /// Worker handle.
@@ -807,6 +928,7 @@ pub struct ComputeProvisionWorker {
     bus_root_override: Option<PathBuf>,
     vm_storage: PathBuf,
     meshfs_mount: PathBuf,
+    authorizer: Arc<ActionAuthorizer>,
 }
 
 impl ComputeProvisionWorker {
@@ -825,6 +947,7 @@ impl ComputeProvisionWorker {
             bus_root_override: None,
             vm_storage: PathBuf::from(DEFAULT_VM_STORAGE),
             meshfs_mount: crate::default_qnm_shared_root(),
+            authorizer: Arc::new(ActionAuthorizer::production()),
         }
     }
 
@@ -839,6 +962,16 @@ impl ComputeProvisionWorker {
     #[must_use]
     pub fn with_bus_root(mut self, p: PathBuf) -> Self {
         self.bus_root_override = Some(p);
+        self
+    }
+
+    /// Inject an isolated verifier and replay ledger for focused tests. The
+    /// production constructor always uses the root-only systemd credential
+    /// and fails closed when it is unavailable.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
+        self.authorizer = authorizer;
         self
     }
 
@@ -889,7 +1022,12 @@ impl Worker for ComputeProvisionWorker {
                     let topic = format!("{CREATE_TOPIC_PREFIX}{own}");
                     // Sync read — Persist opened + dropped inside; never
                     // crosses the await below.
-                    let new_reqs = read_new_creates(&bus_root, &topic, &mut cursor);
+                    let new_reqs = read_new_creates(
+                        &bus_root,
+                        &topic,
+                        &mut cursor,
+                        self.authorizer.as_ref(),
+                    );
                     for req in new_reqs {
                         let ctx = self.ctx(own.clone(), bus_root.clone());
                         // Each provision shells out + polls the cert
@@ -912,6 +1050,11 @@ impl Worker for ComputeProvisionWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::action_auth::{authorize_test_body, ActionAuthorizer};
+    use std::sync::Arc;
+
+    const AUTH_KEY: &[u8] = b"compute-provision-test-key";
+    const AUTH_NOW_MS: i64 = 1_700_000_000_000;
 
     // ── parse_create_request ──
 
@@ -1077,6 +1220,36 @@ mod tests {
         assert_eq!(v["groups"][0], "mde-vms");
     }
 
+    #[test]
+    fn cert_sign_request_capability_binds_vm_and_exact_body() {
+        let signer = CloudArmSigner::new(b"cert-sign-test-key".to_vec()).unwrap();
+        let body = authorize_cert_sign_request_body_with_signer(
+            &signer,
+            "vm-01",
+            "10.42.129.1/17",
+            "PUBKEY",
+            1_700_000_000_000,
+            "cert-sign-once",
+        )
+        .unwrap();
+        let document: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(document["schema_version"], CLOUD_ACTION_SCHEMA_VERSION);
+        let token = CloudArmedToken::parse(document["armed_token"].as_str().unwrap()).unwrap();
+        assert_eq!(token.verb, CERT_AUTH_VERB);
+        assert_eq!(token.node, CERT_AUTH_NODE_SCOPE);
+        assert_eq!(token.target, "vm:vm-01");
+        let unsigned = {
+            let mut copy = document.clone();
+            copy.as_object_mut().unwrap().remove("armed_token");
+            copy.to_string()
+        };
+        assert!(signer.verify_payload(&token.signing_payload(), &token.signature));
+        assert_eq!(
+            token.request_sha256,
+            cloud_request_digest(&unsigned).unwrap()
+        );
+    }
+
     // ── cloud-init build (lock 2) ──
 
     #[test]
@@ -1111,6 +1284,62 @@ mod tests {
             iso_path: iso.map(String::from),
             share_meshfs,
         }
+    }
+
+    fn create_body(req: &CreateRequest) -> String {
+        let mut value = serde_json::to_value(req).expect("request value");
+        value["schema_version"] = serde_json::Value::from(1_u64);
+        value.to_string()
+    }
+
+    fn authorized_create_body(req: &CreateRequest, nonce: &str) -> String {
+        let unsigned = create_body(req);
+        let target = create_auth_target(req);
+        authorize_test_body(
+            AUTH_KEY,
+            &unsigned,
+            MutationContext {
+                verb: COMPUTE_PROVISION_AUTH_VERB,
+                node: COMPUTE_PROVISION_NODE_SCOPE,
+                target: &target,
+            },
+            nonce,
+            AUTH_NOW_MS + 30_000,
+        )
+    }
+
+    #[test]
+    fn create_capability_binds_vm_and_request() {
+        let req = sample_req(false, None);
+        assert_eq!(create_auth_target(&req), "vm:dev:01JAN");
+    }
+
+    #[test]
+    fn create_drain_refuses_unsigned_and_replayed_requests() {
+        let bus = tempfile::tempdir().expect("bus");
+        let persist = Persist::open(bus.path().to_path_buf()).expect("persist");
+        let req = sample_req(false, None);
+        let topic = format!("{CREATE_TOPIC_PREFIX}10.42.0.1");
+        let unsigned = create_body(&req);
+        let authorized = authorized_create_body(&req, "create-once");
+        persist
+            .write(&topic, Priority::Default, None, Some(&unsigned))
+            .expect("unsigned write");
+        persist
+            .write(&topic, Priority::Default, None, Some(&authorized))
+            .expect("authorized write");
+        persist
+            .write(&topic, Priority::Default, None, Some(&authorized))
+            .expect("replay write");
+
+        let authorizer = Arc::new(ActionAuthorizer::for_test(
+            AUTH_KEY,
+            bus.path().join("auth"),
+            AUTH_NOW_MS,
+        ));
+        let mut cursor = None;
+        let requests = read_new_creates(bus.path(), &topic, &mut cursor, authorizer.as_ref());
+        assert_eq!(requests, vec![req]);
     }
 
     #[test]

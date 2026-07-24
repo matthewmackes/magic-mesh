@@ -56,6 +56,8 @@ use mde_adblock::{Engine, FilterListStore, Staleness};
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 
+use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
+
 use super::{ShutdownToken, Worker};
 
 /// Retained-latest topic prefix carrying this node's [`AdfilterStatus`]
@@ -295,6 +297,8 @@ pub struct AdfilterWorker {
     share_gate: Option<Arc<AtomicBool>>,
     /// Bus spool root override (tests point this at a tempdir).
     bus_root_override: Option<PathBuf>,
+    /// Exact-body capability verifier for cross-UID allowlist mutations.
+    authorizer: Arc<ActionAuthorizer>,
 }
 
 impl AdfilterWorker {
@@ -319,6 +323,7 @@ impl AdfilterWorker {
             now_fn: Arc::new(default_now),
             share_gate: None,
             bus_root_override: None,
+            authorizer: Arc::new(ActionAuthorizer::production()),
         }
     }
 
@@ -347,6 +352,14 @@ impl AdfilterWorker {
     #[must_use]
     pub fn with_bus_root(mut self, root: PathBuf) -> Self {
         self.bus_root_override = Some(root);
+        self
+    }
+
+    /// Inject an isolated verifier and replay ledger for hostile action tests.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
+        self.authorizer = authorizer;
         self
     }
 
@@ -590,15 +603,38 @@ impl AdfilterWorker {
             };
             for msg in msgs {
                 self.cursors.insert(topic.clone(), msg.ulid.clone());
-                match parse_action(&verb, msg.body.as_deref().unwrap_or_default()) {
-                    Ok(action) => {
-                        self.apply_action(action);
-                        changed = true;
-                    }
+                let body = msg.body.as_deref().unwrap_or_default();
+                let action = match parse_action(&verb, body) {
+                    Ok(action) => action,
                     Err(e) => {
                         tracing::warn!(target: "mackesd::adfilter", verb = %verb, error = %e, "bad request");
+                        continue;
                     }
+                };
+                let target = match &action {
+                    AdfilterAction::Allow { domain } | AdfilterAction::Block { domain } => {
+                        domain.as_str()
+                    }
+                };
+                let auth_verb = format!("adfilter-{verb}");
+                if let Err(e) = self.authorizer.authorize(
+                    body,
+                    MutationContext {
+                        verb: &auth_verb,
+                        node: &self.node,
+                        target,
+                    },
+                ) {
+                    tracing::warn!(
+                        target: "mackesd::adfilter",
+                        verb = %verb,
+                        error = %e,
+                        "refused unauthorized allowlist mutation"
+                    );
+                    continue;
                 }
+                self.apply_action(action);
+                changed = true;
             }
         }
         if changed {
@@ -690,6 +726,7 @@ fn default_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::action_auth::{authorize_test_body, ActionAuthorizer, MutationContext};
     use std::sync::atomic::AtomicU64;
 
     fn fake_clock(start: u64) -> (Arc<AtomicU64>, NowFn) {
@@ -939,6 +976,133 @@ mod tests {
             parse_action("allow", r#"{"domain":"  "}"#).is_err(),
             "empty domain rejected"
         );
+    }
+
+    // ── privileged action boundary ──────────────────────────────────────────
+
+    const AUTH_KEY: &[u8] = b"adfilter-action-auth-test-key";
+    const AUTH_NOW: i64 = 1_700_000_000_000;
+
+    fn signed_allow_body(node: &str, domain: &str, nonce: &str) -> String {
+        let unsigned = serde_json::json!({
+            "domain": domain,
+            "schema_version": 1,
+        })
+        .to_string();
+        let target = domain.trim().to_ascii_lowercase();
+        authorize_test_body(
+            AUTH_KEY,
+            &unsigned,
+            MutationContext {
+                verb: "adfilter-allow",
+                node,
+                target: &target,
+            },
+            nonce,
+            AUTH_NOW + 30_000,
+        )
+    }
+
+    #[test]
+    fn adfilter_mutations_fail_closed_and_authorized_body_applies_once() {
+        let local = tempfile::tempdir().unwrap();
+        let share = tempfile::tempdir().unwrap();
+        let bus = tempfile::tempdir().unwrap();
+        let persist = Persist::open(bus.path().to_path_buf()).unwrap();
+        let authorizer = Arc::new(ActionAuthorizer::for_test(
+            AUTH_KEY,
+            bus.path().join("auth"),
+            AUTH_NOW,
+        ));
+        let (_clock, now) = fake_clock(1_000);
+        let mut worker =
+            worker("local-host", local.path(), share.path(), now).with_authorizer(authorizer);
+        let topic = format!("{ACTION_PREFIX}allow");
+        let write = |body: &str| {
+            persist
+                .write(&topic, Priority::Default, None, Some(body))
+                .unwrap();
+        };
+
+        let unsigned = serde_json::json!({
+            "domain": "unsigned.example",
+            "schema_version": 1,
+        })
+        .to_string();
+        write(&unsigned);
+        worker.drain_requests(&persist);
+
+        let valid = signed_allow_body("local-host", "authorized.example", "once");
+        let tampered = valid.replace("authorized.example", "tampered.example");
+        write(&tampered);
+        worker.drain_requests(&persist);
+
+        let future_unsigned = serde_json::json!({
+            "domain": "future.example",
+            "schema_version": 2,
+        })
+        .to_string();
+        let future = authorize_test_body(
+            AUTH_KEY,
+            &future_unsigned,
+            MutationContext {
+                verb: "adfilter-allow",
+                node: "local-host",
+                target: "future.example",
+            },
+            "future-schema",
+            AUTH_NOW + 30_000,
+        );
+        write(&future);
+        worker.drain_requests(&persist);
+
+        let oversized = serde_json::json!({
+            "domain": "oversized.example",
+            "padding": "x".repeat(crate::ipc::MAX_RPC_BODY_BYTES),
+            "schema_version": 1,
+        })
+        .to_string();
+        write(&oversized);
+        worker.drain_requests(&persist);
+
+        for domain in [
+            "unsigned.example",
+            "tampered.example",
+            "future.example",
+            "oversized.example",
+        ] {
+            assert!(
+                !worker.own.allowlist().is_allowed(domain),
+                "unauthorized request changed {domain}"
+            );
+        }
+        assert!(
+            !store_path(local.path(), "local-host").exists(),
+            "unauthorized requests must not persist the local store"
+        );
+        assert!(
+            !store_path(share.path(), "local-host").exists(),
+            "unauthorized requests must not mirror the shared store"
+        );
+
+        write(&valid);
+        worker.drain_requests(&persist);
+        assert!(worker.own.allowlist().is_allowed("authorized.example"));
+        let persisted = std::fs::read_to_string(store_path(local.path(), "local-host"))
+            .expect("authorized request persists the local store");
+        assert!(store_path(share.path(), "local-host").exists());
+
+        // The exact same capability is replayed under a new Bus message. The
+        // authorizer consumes its nonce on the first application, so this pass
+        // must leave both the model and persisted bytes unchanged.
+        write(&valid);
+        worker.drain_requests(&persist);
+        assert_eq!(
+            std::fs::read_to_string(store_path(local.path(), "local-host")).unwrap(),
+            persisted,
+            "replayed capability must not apply or persist a second edit"
+        );
+        assert_eq!(worker.own.allowlist().domains().count(), 1);
     }
 
     // ── the published status shape ──

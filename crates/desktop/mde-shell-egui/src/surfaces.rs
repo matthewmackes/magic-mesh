@@ -11,11 +11,13 @@ use mde_theme::brand::icons::{icon_image, IconId};
 /// Which surface fills the shell body.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub enum Surface {
-    /// Mesh-control Workbench.
+    /// Unified fleet, mesh-map, workbench, and discovered-unit interface.
+    FleetMesh,
+    /// Legacy deep-link alias for the Workbench tab inside [`Surface::FleetMesh`].
     Workbench,
-    /// Live mesh topology.
+    /// Legacy deep-link alias for the Mesh Map tab inside [`Surface::FleetMesh`].
     MeshView,
-    /// Discovered-unit explorer.
+    /// Legacy deep-link alias for the Explorer tab inside [`Surface::FleetMesh`].
     Explorer,
     /// Brokered remote desktop sessions.
     #[default]
@@ -55,10 +57,8 @@ pub enum Surface {
 #[allow(clippy::use_self)]
 impl Surface {
     /// Every Springboard/Spotlight surface in canonical keyboard order.
-    pub(crate) const ALL: [Surface; 17] = [
-        Surface::Workbench,
-        Surface::MeshView,
-        Surface::Explorer,
+    pub(crate) const ALL: [Surface; 15] = [
+        Surface::FleetMesh,
         Surface::InfraCode,
         Surface::Desktop,
         Surface::Music,
@@ -78,9 +78,10 @@ impl Surface {
     /// The shared Carbon glyph for this surface.
     pub(crate) const fn icon_id(self) -> IconId {
         match self {
-            Surface::Workbench | Surface::AutoHome => IconId::Workbench,
-            Surface::MeshView => IconId::MeshView,
-            Surface::Explorer => IconId::Instances,
+            Surface::FleetMesh | Surface::Workbench | Surface::MeshView | Surface::Explorer => {
+                IconId::MeshView
+            }
+            Surface::AutoHome => IconId::Workbench,
             Surface::InfraCode => IconId::Server,
             Surface::Desktop => IconId::Desktop,
             Surface::Music => IconId::Music,
@@ -101,9 +102,9 @@ impl Surface {
     /// Human-facing label shared by every launcher and switcher.
     pub(crate) const fn label(self) -> &'static str {
         match self {
-            Surface::Workbench => "Workbench",
-            Surface::MeshView => "Mesh Map",
-            Surface::Explorer => "Explorer",
+            Surface::FleetMesh | Surface::Workbench | Surface::MeshView | Surface::Explorer => {
+                "Fleet & Mesh"
+            }
             Surface::InfraCode => "Infra as Code",
             Surface::Desktop => "Remote Sessions",
             Surface::Music => "Music",
@@ -124,24 +125,43 @@ impl Surface {
     }
 }
 
-/// One Springboard page and Spotlight grouping.
+/// Desktop egui crates embedded by the shell's launchable surface catalog.
+///
+/// This is intentionally a package-name list rather than a second navigation
+/// model: the static RPM gate reads it to catch a crate that compiles in the
+/// workspace but is no longer reachable from the shipped shell. The panel
+/// client and the shell host are deliberately outside this list.
+#[allow(dead_code)]
+pub(crate) const EMBEDDED_SURFACE_CRATES: [&str; 8] = [
+    "mde-bookmarks-egui",
+    "mde-collab-egui",
+    "mde-editor-egui",
+    "mde-files-egui",
+    "mde-maps-location-egui",
+    "mde-media-egui",
+    "mde-music-egui",
+    "mde-term-egui",
+];
+
+/// One launcher taxonomy group used for color coding and Spotlight grouping.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LauncherGroup {
-    /// Human page/group title.
+    /// Human group title, used by Spotlight and other grouped launchers.
     pub(crate) label: &'static str,
     /// Shared group accent.
     pub(crate) accent: egui::Color32,
-    /// Surfaces on this page in canonical order.
+    /// Surfaces in this group in canonical order.
     pub(crate) surfaces: &'static [Surface],
 }
 
-/// The eight persistent Springboard pages. Every [`Surface::ALL`] entry appears
-/// exactly once; timers and Car home use dedicated entry points.
+/// The eight persistent launcher taxonomy groups. Every [`Surface::ALL`] entry
+/// appears exactly once; the single Springboard desktop uses the flattened
+/// taxonomy order while Spotlight and the switcher retain these groups.
 pub(crate) const LAUNCHER_GROUPS: [LauncherGroup; 8] = [
     LauncherGroup {
         label: "Mesh Control",
         accent: Style::ACCENT_MESH,
-        surfaces: &[Surface::Workbench, Surface::MeshView, Surface::InfraCode],
+        surfaces: &[Surface::FleetMesh, Surface::InfraCode],
     },
     LauncherGroup {
         label: "Desktop & Session",
@@ -176,11 +196,11 @@ pub(crate) const LAUNCHER_GROUPS: [LauncherGroup; 8] = [
     LauncherGroup {
         label: "System",
         accent: Style::ACCENT_WORKLOADS,
-        surfaces: &[Surface::System, Surface::About, Surface::Explorer],
+        surfaces: &[Surface::System, Surface::About],
     },
 ];
 
-/// Surface at a flattened Springboard tile position (page order, then row order).
+/// Surface at a flattened launcher tile position (group order, then row order).
 #[must_use]
 pub(crate) fn springboard_surface(index: usize) -> Option<Surface> {
     LAUNCHER_GROUPS
@@ -216,6 +236,12 @@ const _: () = {
 
 /// Group label for a surface, or an empty string for dedicated-only surfaces.
 pub(crate) fn launcher_group_label(surface: Surface) -> &'static str {
+    if matches!(
+        surface,
+        Surface::Workbench | Surface::MeshView | Surface::Explorer
+    ) {
+        return "Mesh Control";
+    }
     LAUNCHER_GROUPS
         .iter()
         .find(|group| group.surfaces.contains(&surface))
@@ -224,6 +250,12 @@ pub(crate) fn launcher_group_label(surface: Surface) -> &'static str {
 
 #[cfg(test)]
 pub(crate) fn launcher_group_accent(surface: Surface) -> Option<egui::Color32> {
+    if matches!(
+        surface,
+        Surface::Workbench | Surface::MeshView | Surface::Explorer
+    ) {
+        return Some(Style::ACCENT_MESH);
+    }
     LAUNCHER_GROUPS
         .iter()
         .find(|group| group.surfaces.contains(&surface))
@@ -419,6 +451,16 @@ mod tests {
         for surface in Surface::ALL {
             assert_eq!(projected.iter().filter(|item| **item == surface).count(), 1);
         }
+    }
+
+    #[test]
+    fn embedded_surface_catalog_excludes_host_and_standalone_panel() {
+        assert_eq!(EMBEDDED_SURFACE_CRATES.len(), 8);
+        assert!(EMBEDDED_SURFACE_CRATES
+            .windows(2)
+            .all(|pair| pair[0] < pair[1]));
+        assert!(!EMBEDDED_SURFACE_CRATES.contains(&"mde-shell-egui"));
+        assert!(!EMBEDDED_SURFACE_CRATES.contains(&"mde-panel-egui"));
     }
 
     #[test]

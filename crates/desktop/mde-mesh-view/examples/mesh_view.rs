@@ -65,12 +65,15 @@ fn sample_state() -> MeshState {
     let nodes = vec![
         MeshNode::new("lh-nyc3", "lighthouse-nyc3", Role::Lighthouse, Health::Ok)
             .leader()
-            .version("12.0.0"),
-        MeshNode::new("lh-fra1", "lighthouse-fra1", Role::Lighthouse, Health::Ok).version("12.0.0"),
+            .version(env!("CARGO_PKG_VERSION")),
+        MeshNode::new("lh-fra1", "lighthouse-fra1", Role::Lighthouse, Health::Ok)
+            .version(env!("CARGO_PKG_VERSION")),
         MeshNode::new("lh-sfo3", "lighthouse-sfo3", Role::Lighthouse, Health::Warn)
-            .version("12.0.0"),
-        MeshNode::new("media", "media-server", Role::Server, Health::Ok).version("12.0.0"),
-        MeshNode::new("eagle", "eagle", Role::Workstation, Health::Ok).version("12.0.0"),
+            .version(env!("CARGO_PKG_VERSION")),
+        MeshNode::new("media", "media-server", Role::Server, Health::Ok)
+            .version(env!("CARGO_PKG_VERSION")),
+        MeshNode::new("eagle", "eagle", Role::Workstation, Health::Ok)
+            .version(env!("CARGO_PKG_VERSION")),
         MeshNode::new("ws-01", "workstation-01", Role::Workstation, Health::Warn)
             .version("11.4.1")
             .stale(), // an older build — flagged so it stands out

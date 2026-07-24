@@ -909,6 +909,9 @@ mod menubar_coverage {
     const fn coverage(surface: Surface) -> Coverage {
         match surface {
             // ── covered: the MENUBAR-ALL / MENUBAR-SWEEP bars ──
+            Surface::FleetMesh => Coverage::Covered {
+                title: "Fleet & Mesh",
+            },
             Surface::Workbench => Coverage::Covered {
                 title: "State of the Mesh", // MENU-1 (workbench.rs)
             },
@@ -1009,10 +1012,11 @@ mod menubar_coverage {
         ),
     ];
 
-    /// Every routed surface: the picker set plus the clock-cell Timers surface
-    /// (deliberately outside `Surface::ALL`, still routed by the dock).
+    /// Every routed surface: the picker set plus legacy Fleet & Mesh deep-link
+    /// aliases and the clock-cell surfaces deliberately outside `Surface::ALL`.
     fn every_routed() -> Vec<Surface> {
         let mut all = Surface::ALL.to_vec();
+        all.extend([Surface::Workbench, Surface::MeshView, Surface::Explorer]);
         all.push(Surface::Timers);
         all.push(Surface::AutoHome);
         all
@@ -1051,9 +1055,9 @@ mod menubar_coverage {
         }
         assert_eq!(covered + first_party + exempt, every_routed().len());
         assert_eq!(
-            covered, 5,
-            "the shared covered set is the five landed bars (WL-FUNC-011 Phase-2 \
-             retired the Chat bar)"
+            covered, 6,
+            "the shared covered set is the five landed bars plus Fleet & Mesh \
+             (WL-FUNC-011 Phase-2 retired the Chat bar)"
         );
         assert_eq!(
             first_party, 2,
@@ -1076,8 +1080,6 @@ mod menubar_coverage {
         assert_eq!(
             bare,
             [
-                Surface::MeshView,
-                Surface::Explorer,
                 Surface::Desktop,
                 Surface::Music,
                 Surface::Media,
@@ -1086,10 +1088,12 @@ mod menubar_coverage {
                 Surface::Terminal,
                 Surface::Phones,
                 // WL-FUNC-011 — the Communications hub carries its own frame
-                // (rail · mode tabs · call bar), a MENUBAR-SWEEP follow-on. Sits
-                // here in `Surface::ALL` order (the twentieth surface), before the
-                // out-of-ALL Timers `every_routed` appends.
+                // (rail · mode tabs · call bar), a MENUBAR-SWEEP follow-on.
                 Surface::Communications,
+                // Legacy Fleet & Mesh aliases remain routed for deep links but
+                // are folded into the unified interface before rendering.
+                Surface::MeshView,
+                Surface::Explorer,
                 Surface::Timers,
                 // AUTO-HOME — the out-of-ALL Auto Mode home, appended after Timers
                 // by `every_routed`; a full-bleed Car-Mode tile launcher, bare by

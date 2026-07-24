@@ -56,11 +56,18 @@ use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_bus::rpc::reply_topic;
 
+use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
+
 use super::{ShutdownToken, Worker};
 
 /// Bus action topic this worker drains. Locked to the
 /// `action/<domain>/<verb>` Q96 convention.
 pub const ACTION_TOPIC: &str = "action/compute/cert-sign-request";
+
+/// Exact capability context for the CA-side VM certificate signing effect.
+pub const CERT_AUTH_VERB: &str = "compute-cert-sign";
+/// Node scope used by the local certificate authority responder.
+pub const CERT_AUTH_NODE_SCOPE: &str = "cert-authority";
 
 /// Default poll cadence — control surface per `rpc::CONTROL_POLL_INTERVAL`
 /// (cert signing is not on a human's interactive path).
@@ -203,6 +210,13 @@ impl CertAuthorityWorker {
 /// request: ..."` string.
 pub fn parse_sign_request(body: &str) -> Result<CertSignRequest, String> {
     serde_json::from_str(body).map_err(|e| format!("malformed cert-sign request: {e}"))
+}
+
+/// Stable target bound into the signing capability. The CA never authorizes a
+/// request for one VM using a token minted for another VM.
+#[must_use]
+pub fn cert_auth_target(req: &CertSignRequest) -> String {
+    format!("vm:{}", req.common_name)
 }
 
 /// CA-peer detection: this peer is the CA iff the CA private key
@@ -377,7 +391,29 @@ fn handle_request(worker: &CertAuthorityWorker, body: &str) -> Result<String, St
     Ok(build_success_reply(cert_pem, ca_pem))
 }
 
-fn poll_once(persist: &Persist, worker: &CertAuthorityWorker, cursor: &mut Option<String>) {
+fn authorize_sign_request(
+    body: &str,
+    authorizer: &ActionAuthorizer,
+) -> Result<CertSignRequest, String> {
+    let req = parse_sign_request(body)?;
+    let target = cert_auth_target(&req);
+    authorizer.authorize(
+        body,
+        MutationContext {
+            verb: CERT_AUTH_VERB,
+            node: CERT_AUTH_NODE_SCOPE,
+            target: &target,
+        },
+    )?;
+    Ok(req)
+}
+
+fn poll_once(
+    persist: &Persist,
+    worker: &CertAuthorityWorker,
+    cursor: &mut Option<String>,
+    authorizer: &ActionAuthorizer,
+) {
     let msgs = match persist.list_since(ACTION_TOPIC, cursor.as_deref()) {
         Ok(m) => m,
         Err(e) => {
@@ -392,11 +428,17 @@ fn poll_once(persist: &Persist, worker: &CertAuthorityWorker, cursor: &mut Optio
             continue;
         }
         let body = msg.body.as_deref().unwrap_or("");
-        let reply_json = match handle_request(worker, body) {
-            Ok(s) => s,
+        let reply_json = match authorize_sign_request(body, authorizer) {
+            Ok(_) => match handle_request(worker, body) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(ulid = %msg.ulid, error = %e, "cert_authority: sign failed");
+                    build_error_reply(&e)
+                }
+            },
             Err(e) => {
                 tracing::warn!(ulid = %msg.ulid, error = %e, "cert_authority: sign failed");
-                build_error_reply(&e)
+                build_error_reply(&format!("authorization refused: {e}"))
             }
         };
         if let Err(e) = persist.write(
@@ -429,7 +471,7 @@ pub fn default_ca_cert_path() -> PathBuf {
 }
 
 fn default_bus_root() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join("mde").join("bus"))
+    mde_bus::default_data_dir()
 }
 
 #[async_trait::async_trait]
@@ -453,6 +495,7 @@ impl Worker for CertAuthorityWorker {
                 return Ok(());
             }
         };
+        let authorizer = ActionAuthorizer::production();
         let mut cursor: Option<String> = None;
         let mut tick = tokio::time::interval(self.poll_interval);
         // First `tick().await` resolves immediately — burn it so the
@@ -462,7 +505,7 @@ impl Worker for CertAuthorityWorker {
         loop {
             tokio::select! {
                 _ = tick.tick() => {
-                    poll_once(&persist, self, &mut cursor);
+                    poll_once(&persist, self, &mut cursor, &authorizer);
                 }
                 _ = shutdown.wait() => break,
             }
@@ -641,6 +684,42 @@ mod tests {
         let req =
             parse_sign_request(r#"{"common_name":"vm-04","ip":"10.42.129.2/17"}"#).expect("parse");
         assert!(req.public_key_pem.is_none());
+    }
+
+    #[test]
+    fn cert_sign_request_requires_exact_body_capability_before_ca_effect() {
+        let unsigned = serde_json::json!({
+            "schema_version": 1,
+            "common_name": "vm-04",
+            "ip": "10.42.129.2/17",
+            "groups": ["mde-vms"],
+            "public_key_pem": "PUBKEY",
+        })
+        .to_string();
+        let root = tempfile::tempdir().unwrap();
+        let authorizer = ActionAuthorizer::for_test(
+            b"cert-authority-test-key",
+            root.path().join("auth"),
+            1_700_000_000_000,
+        );
+        assert!(authorize_sign_request(&unsigned, &authorizer).is_err());
+
+        let body = crate::ipc::action_auth::authorize_test_body(
+            b"cert-authority-test-key",
+            &unsigned,
+            MutationContext {
+                verb: CERT_AUTH_VERB,
+                node: CERT_AUTH_NODE_SCOPE,
+                target: "vm:vm-04",
+            },
+            "cert-authority-once",
+            1_700_000_030_000,
+        );
+        assert!(authorize_sign_request(&body, &authorizer).is_ok());
+        assert!(
+            authorize_sign_request(&body, &authorizer).is_err(),
+            "the CA signing capability must be durably single-use"
+        );
     }
 
     // ── Required scenario 1: CA peer replies (success-shape) ──

@@ -47,6 +47,9 @@ const ACTION_TOPIC: &str = "action/onboard/spawn-lighthouse";
 /// for the event echoing our request id.
 const EVENT_TOPIC: &str = "event/onboard/spawn-lighthouse";
 
+/// The authenticated action-envelope version shared with the daemon worker.
+const ACTION_SCHEMA_VERSION: u64 = 1;
+
 /// Result-poll cadence while a request is in flight — the worker answers on its
 /// own 2 s drain tick, so polling faster only spins.
 const REFRESH: Duration = Duration::from_secs(2);
@@ -108,6 +111,9 @@ struct SpawnLighthouseAction {
     pair: bool,
     /// `true` ⇒ preview the plan only (the seam is never touched).
     dry_run: bool,
+    /// Capability envelope version; dry-runs carry it too so the wire shape is
+    /// stable when an operator turns a preview into an apply.
+    schema_version: u64,
 }
 
 impl SpawnLighthouseAction {
@@ -270,6 +276,7 @@ impl SpawnLighthouseFlowState {
             target: self.target,
             pair: self.pair,
             dry_run,
+            schema_version: ACTION_SCHEMA_VERSION,
         }
     }
 
@@ -277,7 +284,29 @@ impl SpawnLighthouseFlowState {
     /// body (for the test to assert the shape); `None` when the publish failed.
     fn submit(&mut self, dry_run: bool, now_ms: u64) -> Option<String> {
         let action = self.build_action(dry_run, now_ms);
-        let body = action.to_body();
+        let unsigned_body = action.to_body();
+        let body = if dry_run {
+            unsigned_body
+        } else {
+            let target = format!(
+                "lighthouse:{}:{}:{}",
+                action.target.wire(),
+                action.id,
+                if action.pair { "pair" } else { "single" },
+            );
+            match crate::iac::authorize_root_mutation_body(
+                &unsigned_body,
+                "onboard-spawn-lighthouse",
+                "lighthouse-onboard",
+                &target,
+            ) {
+                Ok(body) => body,
+                Err(error) => {
+                    self.last_error = Some(error);
+                    return None;
+                }
+            }
+        };
         let Some(root) = self.bus_root.clone() else {
             self.last_error =
                 Some("No mesh Bus directory \u{2014} can't request the spawn.".to_string());
@@ -524,7 +553,7 @@ mod tests {
         s.target = TargetPick::Cloud;
         assert_eq!(
             s.build_action(true, 42).to_body(),
-            r#"{"id":"lh-42-cloud","target":"cloud","pair":false,"dry_run":true}"#
+            r#"{"id":"lh-42-cloud","target":"cloud","pair":false,"dry_run":true,"schema_version":1}"#
         );
     }
 

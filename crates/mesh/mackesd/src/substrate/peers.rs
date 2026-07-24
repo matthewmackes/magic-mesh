@@ -96,7 +96,30 @@ where
     // building OR entering a runtime here panics ("Cannot start a runtime from
     // within a runtime"). Drive `fut` on a FRESH OS thread that owns its own
     // current-thread runtime — that thread has no ambient runtime, so no nesting.
-    // `block_in_place` yields this worker to the pool while we join the thread.
+    //
+    // `block_in_place` yields a worker from a multi-thread runtime while we
+    // join the helper thread. It is itself invalid on a current-thread runtime,
+    // though. The Nebula Bus responder intentionally uses that runtime because
+    // its Persist/rusqlite state is !Send, so detect that flavor and use the
+    // same helper thread without calling `block_in_place`.
+    if matches!(
+        tokio::runtime::Handle::current().runtime_flavor(),
+        tokio::runtime::RuntimeFlavor::CurrentThread
+    ) {
+        return std::thread::scope(|s| {
+            s.spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .ok()
+                    .map(|rt| rt.block_on(fut))
+            })
+            .join()
+            .ok()
+            .flatten()
+        });
+    }
+
     tokio::task::block_in_place(|| {
         std::thread::scope(|s| {
             s.spawn(|| {
@@ -228,4 +251,21 @@ pub fn read_directory(workgroup_root: &std::path::Path) -> Vec<PeerRecord> {
         }
     }
     mackes_mesh_types::peers::read_peers(&mackes_mesh_types::peers::peers_dir(workgroup_root))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::block_on;
+
+    #[test]
+    fn blocking_bridge_is_safe_inside_current_thread_runtime() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+
+        let result = runtime.block_on(async { block_on(async { 7_u8 }) });
+
+        assert_eq!(result, Some(7));
+    }
 }

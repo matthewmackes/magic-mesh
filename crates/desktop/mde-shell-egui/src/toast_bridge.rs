@@ -228,6 +228,7 @@ pub(crate) fn resolve_action(verb: &str) -> Option<Navigate> {
 /// Map a `shell/goto/<name>` target to a dock [`Surface`] (case-insensitive).
 fn surface_by_name(name: &str) -> Option<Surface> {
     match name.to_ascii_lowercase().as_str() {
+        "fleet-mesh" | "fleetmesh" | "fleet" => Some(Surface::FleetMesh),
         "workbench" => Some(Surface::Workbench),
         // OW-10 — the live Mesh Map. An all-green onboard self-test auto-opens it
         // through this same grammar (accepting the `mde-mesh-view` variant name too).

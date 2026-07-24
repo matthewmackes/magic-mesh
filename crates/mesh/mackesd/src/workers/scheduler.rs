@@ -529,7 +529,13 @@ fn prime_cursor(bus_root: &Path) -> Option<String> {
 }
 
 fn default_bus_root() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join("mde").join("bus"))
+    // Keep the action reader on the same resolver as every other daemon-side
+    // worker.  In production this is the shared `/run/mde-bus` spool through
+    // `MDE_BUS_ROOT`; the per-home fallback remains available for standalone
+    // development runs.  The publisher already used this resolver, so using a
+    // hand-rolled `dirs::data_dir()` path here could silently split requests
+    // from their placement events.
+    mde_bus::default_data_dir()
 }
 
 fn now_ms() -> u64 {

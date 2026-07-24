@@ -32,6 +32,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION;
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 
@@ -1653,7 +1654,14 @@ impl ChatState {
     /// the worker signs, persists, and relays it. Returns the publish result so the
     /// composer keeps the draft + surfaces the error on failure (shell-ux-11).
     fn send(&self, to: &str, text: &str) -> Result<(), String> {
-        let body = serde_json::json!({ "scope": "peer", "to": to, "text": text }).to_string();
+        let body = serde_json::json!({
+            "schema_version": CLOUD_ACTION_SCHEMA_VERSION,
+            "scope": "peer",
+            "to": to,
+            "text": text,
+        })
+        .to_string();
+        let body = authorize_chat_send_body(&body, "peer", to)?;
         publish(self.bus_root.as_deref(), ACTION_CHAT_SEND, &body)
     }
 
@@ -1669,25 +1677,34 @@ impl ChatState {
             |n| n.to_string_lossy().into_owned(),
         );
         let size_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        // 1) The real transfer — the exact `bus_backend::send_to` wire (§6 boundary).
-        let send_to = serde_json::json!({
-            "sources": [path.to_string_lossy()],
-            "selector": format!("peer:{to}"),
-            "mode": "copy",
-            "conflict": "rename",
-        })
-        .to_string();
-        publish(self.bus_root.as_deref(), ACTION_FILE_SEND_TO, &send_to)?;
-        // 2) The conversation offer — human text now, an upgradeable `file` field for
-        //    the worker's File-card fold.
+        // 1) Authorize the conversation offer before starting the real transfer. This
+        // prevents a denied Chat capability from leaving an unpaired Send-To request.
         let offer = serde_json::json!({
+            "schema_version": CLOUD_ACTION_SCHEMA_VERSION,
             "scope": "peer",
             "to": to,
             "text": format!("{CHAT_SENT_FILE_PREFIX} {name} ({size_bytes} bytes)"),
             "file": { "name": name, "size_bytes": size_bytes },
         })
         .to_string();
-        // The offer publish carries the user's intent; surface its failure so the
+        let offer = authorize_chat_send_body(&offer, "peer", to)?;
+        // 2) The real transfer — the exact `bus_backend::send_to` wire (§6 boundary).
+        let send_to = serde_json::json!({
+            "schema_version": CLOUD_ACTION_SCHEMA_VERSION,
+            "sources": [path.to_string_lossy()],
+            "selector": format!("peer:{to}"),
+            "mode": "copy",
+            "conflict": "rename",
+        })
+        .to_string();
+        let send_to = crate::iac::authorize_root_mutation_body(
+            &send_to,
+            "file-ops-send-to",
+            &local_hostname(),
+            &format!("peer:{to}"),
+        )?;
+        publish(self.bus_root.as_deref(), ACTION_FILE_SEND_TO, &send_to)?;
+        // 3) The offer publish carries the user's intent; surface its failure so the
         // attach path is kept for a retry (shell-ux-11).
         publish(self.bus_root.as_deref(), ACTION_CHAT_SEND, &offer)
     }
@@ -1843,7 +1860,14 @@ impl ChatState {
     /// it, appends to the room's shared Syncthing log, and fans it out to each online
     /// member (best-effort; a missing Bus is a silent no-op).
     fn send_room(&self, id: &str, text: &str) -> Result<(), String> {
-        let body = serde_json::json!({ "scope": "room", "to": id, "text": text }).to_string();
+        let body = serde_json::json!({
+            "schema_version": CLOUD_ACTION_SCHEMA_VERSION,
+            "scope": "room",
+            "to": id,
+            "text": text,
+        })
+        .to_string();
+        let body = authorize_chat_send_body(&body, "room", id)?;
         publish(self.bus_root.as_deref(), ACTION_CHAT_SEND, &body)
     }
 
@@ -1854,26 +1878,52 @@ impl ChatState {
         if id.is_empty() {
             return;
         }
-        let body = serde_json::json!({ "op": "create", "id": id, "name": name }).to_string();
+        let body = serde_json::json!({
+            "schema_version": CLOUD_ACTION_SCHEMA_VERSION,
+            "op": "create",
+            "id": id,
+            "name": name,
+        })
+        .to_string();
+        let Ok(body) = authorize_chat_mutation_body(&body, "chat-room", &format!("room:{id}"))
+        else {
+            return;
+        };
         // Best-effort: the create op is retriable and the worker owns room state.
         let _ = publish(self.bus_root.as_deref(), ACTION_CHAT_ROOM, &body);
     }
 
     /// Fire an `action/chat/room` lifecycle op (`join` / `dissolve`) for room `id`.
     fn room_action(&self, op: &str, id: &str, name: Option<&str>) {
-        let mut obj = serde_json::json!({ "op": op, "id": id });
+        let mut obj = serde_json::json!({
+            "schema_version": CLOUD_ACTION_SCHEMA_VERSION,
+            "op": op,
+            "id": id,
+        });
         if let Some(n) = name {
             obj["name"] = serde_json::Value::String(n.to_string());
         }
+        let Ok(body) =
+            authorize_chat_mutation_body(&obj.to_string(), "chat-room", &format!("room:{id}"))
+        else {
+            return;
+        };
         // Best-effort: a retriable lifecycle op the worker republishes.
-        let _ = publish(self.bus_root.as_deref(), ACTION_CHAT_ROOM, &obj.to_string());
+        let _ = publish(self.bus_root.as_deref(), ACTION_CHAT_ROOM, &body);
     }
 
     /// Post `action/chat/presence` to set this seat's presence (Available ⇒ clear
     /// to auto). The worker updates its self-presence, gossips it, and republishes
     /// the self roster entry the roster rail then reads back.
     fn set_presence(&self, choice: PresenceChoice) {
-        let body = serde_json::json!({ "presence": choice.wire() }).to_string();
+        let body = serde_json::json!({
+            "schema_version": CLOUD_ACTION_SCHEMA_VERSION,
+            "presence": choice.wire(),
+        })
+        .to_string();
+        let Ok(body) = authorize_chat_mutation_body(&body, "chat-presence", "self") else {
+            return;
+        };
         // Best-effort: presence is a retriable toggle the worker republishes.
         let _ = publish(self.bus_root.as_deref(), ACTION_CHAT_PRESENCE, &body);
     }
@@ -1881,7 +1931,14 @@ impl ChatState {
     /// Post `action/chat/presence` to set this seat's free-text status (empty ⇒
     /// clear at the worker). Carried on the same action the worker republishes.
     fn set_status(&self, status: Option<&str>) {
-        let body = serde_json::json!({ "status": status }).to_string();
+        let body = serde_json::json!({
+            "schema_version": CLOUD_ACTION_SCHEMA_VERSION,
+            "status": status,
+        })
+        .to_string();
+        let Ok(body) = authorize_chat_mutation_body(&body, "chat-presence", "self") else {
+            return;
+        };
         // Best-effort: a retriable status the worker republishes.
         let _ = publish(self.bus_root.as_deref(), ACTION_CHAT_PRESENCE, &body);
     }
@@ -1952,7 +2009,14 @@ impl ChatState {
 
     /// Post `action/chat/notify-prefs` to update the persisted alert threshold.
     fn set_notify_threshold(&self, threshold: Severity) {
-        let body = serde_json::json!({ "threshold": threshold.tag() }).to_string();
+        let body = serde_json::json!({
+            "schema_version": CLOUD_ACTION_SCHEMA_VERSION,
+            "threshold": threshold.tag(),
+        })
+        .to_string();
+        let Ok(body) = authorize_chat_mutation_body(&body, "chat-notify-prefs", "self") else {
+            return;
+        };
         // Best-effort: a retriable pref the worker republishes.
         let _ = publish(self.bus_root.as_deref(), ACTION_CHAT_NOTIFY_PREFS, &body);
     }
@@ -2793,6 +2857,17 @@ fn publish(bus_root: Option<&Path>, topic: &str, body: &str) -> Result<(), Strin
         .write(topic, Priority::Default, None, Some(body))
         .map_err(|e| format!("Bus write failed: {e}"))?;
     Ok(())
+}
+
+/// Mint the same root-only, exact-body capability the Chat worker verifies.
+/// Every shell-side Chat producer uses this helper so a shared-spool writer
+/// cannot make the root worker sign or relay a forged message.
+fn authorize_chat_mutation_body(body: &str, verb: &str, target: &str) -> Result<String, String> {
+    crate::iac::authorize_root_mutation_body(body, verb, &local_hostname(), target)
+}
+
+fn authorize_chat_send_body(body: &str, scope: &str, to: &str) -> Result<String, String> {
+    authorize_chat_mutation_body(body, "chat-send", &format!("{scope}:{to}"))
 }
 
 /// Raise a click-to-navigate chyron on the shell's ONE toast lane

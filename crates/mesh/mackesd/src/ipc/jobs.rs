@@ -10,16 +10,21 @@
 
 use std::path::{Path, PathBuf};
 
+use mackes_mesh_types::cloud::{cloud_request_digest, CloudArmSigner, CloudArmedToken};
 use magic_fleet::jobs::{
-    read_run, read_target_results, read_templates, runs_dir, write_run, Candidate, JobRun,
-    TargetSelector,
+    normalize_playbook_ref, read_run, read_target_results, read_templates, resolve_playbook_path,
+    runs_dir, write_run, Candidate, JobRun, TargetSelector,
 };
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_bus::rpc::reply_topic;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
-use super::action_auth::{ActionAuthorizer, MutationContext};
+use super::action_auth::{
+    production_action_signer, ActionAuthorizer, MutationContext, ACTION_SCHEMA_VERSION,
+    MAX_AUTH_TTL_MS,
+};
 
 /// Action verbs served on `action/jobs/<verb>`.
 pub const ACTION_VERBS: [&str; 4] = ["list-templates", "launch", "runs", "run-results"];
@@ -29,10 +34,25 @@ pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(
 
 /// Jobs service — rooted at the replicated workgroup root + the
 /// optional roster DB (for selector resolution).
-#[derive(Debug, Default, Clone)]
+#[derive(Clone)]
 pub struct JobsService {
     pub workgroup_root: PathBuf,
     pub store_db: Option<PathBuf>,
+    execution_signer: Option<CloudArmSigner>,
+    execution_now_ms: std::sync::Arc<dyn Fn() -> i64 + Send + Sync>,
+}
+
+impl std::fmt::Debug for JobsService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JobsService")
+            .field("workgroup_root", &self.workgroup_root)
+            .field("store_db", &self.store_db)
+            .field(
+                "execution_signer",
+                &self.execution_signer.as_ref().map(|_| "configured"),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl JobsService {
@@ -41,7 +61,16 @@ impl JobsService {
         Self {
             workgroup_root: workgroup_root.to_path_buf(),
             store_db,
+            execution_signer: production_action_signer().ok(),
+            execution_now_ms: std::sync::Arc::new(wall_now_ms),
         }
+    }
+
+    #[cfg(test)]
+    fn with_execution_signer(mut self, signer: CloudArmSigner, now_ms: i64) -> Self {
+        self.execution_signer = Some(signer);
+        self.execution_now_ms = std::sync::Arc::new(move || now_ms);
+        self
     }
 
     /// The live candidate set: every PeerRecord joined with its
@@ -100,6 +129,136 @@ fn now_s() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+fn wall_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+const JOBS_EXEC_AUTH_VERB: &str = "jobs-execute";
+
+fn execution_target(run_id: &str, playbook_digest: &str) -> String {
+    format!("{run_id}:{playbook_digest}")
+}
+
+fn mint_execution_authorization(
+    signer: &CloudArmSigner,
+    run_id: &str,
+    node: &str,
+    playbook: &str,
+    playbook_digest: &str,
+    now_ms: i64,
+) -> Result<String, String> {
+    let target = execution_target(run_id, playbook_digest);
+    let unsigned = json!({
+        "schema_version": ACTION_SCHEMA_VERSION,
+        "run_id": run_id,
+        "node": node,
+        "playbook": playbook,
+        "playbook_digest": playbook_digest,
+    })
+    .to_string();
+    let token = CloudArmedToken::mint(
+        signer,
+        &format!("job-exec-{run_id}-{node}-{now_ms}"),
+        now_ms.saturating_add(MAX_AUTH_TTL_MS),
+        JOBS_EXEC_AUTH_VERB,
+        node,
+        &target,
+        &cloud_request_digest(&unsigned).map_err(|error| error.to_string())?,
+    )
+    .encode();
+    let mut body: serde_json::Value =
+        serde_json::from_str(&unsigned).map_err(|error| error.to_string())?;
+    body.as_object_mut()
+        .ok_or_else(|| "execution authorization body is not an object".to_string())?
+        .insert("armed_token".into(), serde_json::Value::String(token));
+    serde_json::to_string(&body).map_err(|error| error.to_string())
+}
+
+fn build_launch_reply(
+    svc: &JobsService,
+    req: &serde_json::Value,
+    ulid: &str,
+    signer: Option<&CloudArmSigner>,
+    now_ms: i64,
+) -> String {
+    let Some(raw_playbook) = req.get("playbook").and_then(|v| v.as_str()) else {
+        return json!({ "ok": false, "error": "launch: need `playbook`" }).to_string();
+    };
+    let playbook = match normalize_playbook_ref(raw_playbook) {
+        Ok(playbook) => playbook,
+        Err(error) => {
+            return json!({ "ok": false, "error": format!("launch: {error}") }).to_string();
+        }
+    };
+    let selector: TargetSelector = req
+        .get("targets")
+        .and_then(|t| serde_json::from_value(t.clone()).ok())
+        .unwrap_or_default();
+    let targets = selector.resolve(&svc.candidates());
+    if targets.is_empty() {
+        return json!({ "ok": false, "error": "launch: selector matched no nodes" }).to_string();
+    }
+    let vars = req
+        .get("vars")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+
+    let (playbook_digest, execution_auth) = if let Some(signer) = signer {
+        let path = match resolve_playbook_path(&svc.workgroup_root, &playbook) {
+            Ok(path) => path,
+            Err(error) => {
+                return json!({ "ok": false, "error": format!("launch: {error}") }).to_string();
+            }
+        };
+        let yaml = match std::fs::read(&path) {
+            Ok(yaml) => yaml,
+            Err(error) => {
+                return json!({ "ok": false, "error": format!("launch: playbook unreadable: {error}") }).to_string();
+            }
+        };
+        let digest = sha256_hex(&yaml);
+        let mut auth = std::collections::BTreeMap::new();
+        for target in &targets {
+            match mint_execution_authorization(signer, ulid, target, &playbook, &digest, now_ms) {
+                Ok(body) => {
+                    auth.insert(target.clone(), body);
+                }
+                Err(error) => {
+                    return json!({ "ok": false, "error": format!("launch: execution authorization failed: {error}") }).to_string();
+                }
+            }
+        }
+        (digest, auth)
+    } else {
+        (String::new(), std::collections::BTreeMap::new())
+    };
+
+    let run = JobRun {
+        run_id: ulid.to_string(),
+        playbook,
+        playbook_digest,
+        vars,
+        targets: targets.clone(),
+        launched_by: "local".into(),
+        at: now_s(),
+        execution_auth,
+    };
+    match write_run(&svc.workgroup_root, &run) {
+        Ok(_) => json!({ "ok": true, "run_id": ulid, "targets": targets }).to_string(),
+        Err(e) => json!({ "ok": false, "error": format!("launch: {e}") }).to_string(),
+    }
+}
+
 /// Build the reply for one `action/jobs/<verb>` request.
 #[must_use]
 pub fn build_reply(svc: &JobsService, verb: &str, body: Option<&str>, ulid: &str) -> String {
@@ -116,38 +275,7 @@ pub fn build_reply(svc: &JobsService, verb: &str, body: Option<&str>, ulid: &str
                 .collect();
             json!({ "ok": true, "templates": tpls }).to_string()
         }
-        "launch" => {
-            // {playbook, targets:{tags,roles,peers}, vars?} → resolve +
-            // write the run; the message ulid is the run id.
-            let Some(playbook) = req.get("playbook").and_then(|v| v.as_str()) else {
-                return json!({ "ok": false, "error": "launch: need `playbook`" }).to_string();
-            };
-            let selector: TargetSelector = req
-                .get("targets")
-                .and_then(|t| serde_json::from_value(t.clone()).ok())
-                .unwrap_or_default();
-            let targets = selector.resolve(&svc.candidates());
-            if targets.is_empty() {
-                return json!({ "ok": false, "error": "launch: selector matched no nodes" })
-                    .to_string();
-            }
-            let vars = req
-                .get("vars")
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
-                .unwrap_or_default();
-            let run = JobRun {
-                run_id: ulid.to_string(),
-                playbook: playbook.to_string(),
-                vars,
-                targets: targets.clone(),
-                launched_by: "local".into(),
-                at: now_s(),
-            };
-            match write_run(&svc.workgroup_root, &run) {
-                Ok(_) => json!({ "ok": true, "run_id": ulid, "targets": targets }).to_string(),
-                Err(e) => json!({ "ok": false, "error": format!("launch: {e}") }).to_string(),
-            }
-        }
+        "launch" => build_launch_reply(svc, &req, ulid, None, wall_now_ms()),
         "runs" => {
             let mut runs: Vec<_> = std::fs::read_dir(runs_dir(&svc.workgroup_root))
                 .into_iter()
@@ -192,6 +320,13 @@ fn build_bus_reply(
     authorizer: &ActionAuthorizer,
 ) -> String {
     if verb == "launch" {
+        let Some(signer) = svc.execution_signer.as_ref() else {
+            return json!({
+                "ok": false,
+                "error": "launch authorization refused: execution signing authority unavailable"
+            })
+            .to_string();
+        };
         let raw = body.unwrap_or_default();
         let target = serde_json::from_str::<serde_json::Value>(raw)
             .ok()
@@ -216,6 +351,11 @@ fn build_bus_reply(
             return json!({ "ok": false, "error": format!("launch authorization refused: {error}") })
                 .to_string();
         }
+        let request: serde_json::Value = match serde_json::from_str(raw) {
+            Ok(request) => request,
+            Err(_) => return json!({ "ok": false, "error": "launch: bad json" }).to_string(),
+        };
+        return build_launch_reply(svc, &request, ulid, Some(signer), (svc.execution_now_ms)());
     }
     build_reply(svc, verb, body, ulid)
 }
@@ -311,16 +451,27 @@ mod tests {
         )
     }
 
+    fn test_svc(root: &Path) -> JobsService {
+        JobsService::new(root, None)
+            .with_execution_signer(CloudArmSigner::new(AUTH_KEY.to_vec()).unwrap(), AUTH_NOW)
+    }
+
     #[test]
     fn hostile_bus_launches_never_write_a_run_and_replay_executes_once() {
         let tmp = tempfile::tempdir().unwrap();
-        let svc = JobsService::new(tmp.path(), None);
+        let svc = test_svc(tmp.path());
         svc_with_peer(
             tmp.path(),
             "oak",
             &[mackes_mesh_types::cap_tags::CapabilityTag::Execution],
         );
         let authorizer = ActionAuthorizer::for_test(AUTH_KEY, tmp.path().join("auth"), AUTH_NOW);
+        std::fs::create_dir_all(tmp.path().join("playbooks")).unwrap();
+        std::fs::write(
+            tmp.path().join("playbooks/once.yml"),
+            "- hosts: localhost\n",
+        )
+        .unwrap();
 
         let unsigned = json!({
             "playbook": "unsigned.yml",
@@ -370,7 +521,31 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(second["ok"], false);
-        assert!(read_run(tmp.path(), "authorized-once").is_some());
+        let stored = read_run(tmp.path(), "authorized-once").expect("authorized run");
+        assert_eq!(stored.playbook, "playbooks/once.yml");
+        assert!(!stored.playbook_digest.is_empty());
+        let execution_body = stored
+            .execution_auth
+            .get("oak")
+            .expect("one target capability");
+        let execution: serde_json::Value = serde_json::from_str(execution_body).unwrap();
+        assert_eq!(execution["run_id"], "authorized-once");
+        assert_eq!(execution["node"], "oak");
+        assert_eq!(execution["playbook"], "playbooks/once.yml");
+        assert_eq!(
+            execution["playbook_digest"],
+            stored.playbook_digest.as_str()
+        );
+        let token = CloudArmedToken::parse(execution["armed_token"].as_str().unwrap()).unwrap();
+        assert_eq!(token.verb, JOBS_EXEC_AUTH_VERB);
+        assert_eq!(token.node, "oak");
+        assert_eq!(
+            token.target,
+            execution_target("authorized-once", &stored.playbook_digest)
+        );
+        assert!(CloudArmSigner::new(AUTH_KEY.to_vec())
+            .unwrap()
+            .verify_payload(&token.signing_payload(), &token.signature));
         assert!(read_run(tmp.path(), "authorized-replay").is_none());
 
         let reads = ["list-templates", "runs", "run-results"];
@@ -390,7 +565,7 @@ mod tests {
     #[test]
     fn launch_resolves_the_selector_and_writes_a_run() {
         let tmp = tempfile::tempdir().unwrap();
-        let svc = JobsService::new(tmp.path(), None);
+        let svc = test_svc(tmp.path());
         svc_with_peer(
             tmp.path(),
             "oak",
@@ -413,7 +588,7 @@ mod tests {
     #[test]
     fn launch_with_no_match_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
-        let svc = JobsService::new(tmp.path(), None);
+        let svc = test_svc(tmp.path());
         svc_with_peer(tmp.path(), "pine", &[]);
         let reply: serde_json::Value = serde_json::from_str(&build_reply(
             &svc,
@@ -432,7 +607,7 @@ mod tests {
     #[test]
     fn runs_and_results_surface_the_history() {
         let tmp = tempfile::tempdir().unwrap();
-        let svc = JobsService::new(tmp.path(), None);
+        let svc = test_svc(tmp.path());
         svc_with_peer(
             tmp.path(),
             "oak",

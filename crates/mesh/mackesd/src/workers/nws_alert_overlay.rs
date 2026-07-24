@@ -677,9 +677,10 @@ impl NwsAlertOverlayWorker {
                     .as_ref()
                     .is_some_and(|snapshot| snapshot.query_point != Some(point))
                 {
-                    self.publish_failure(
+                    self.publish_unavailable(
                         last_good,
-                        "NWS refresh failed: 304 point does not match last-good snapshot",
+                        Some(point),
+                        "304 point does not match last-good snapshot",
                     );
                     return false;
                 }
@@ -688,29 +689,78 @@ impl NwsAlertOverlayWorker {
                     snapshot.query_point = Some(point);
                     snapshot
                         .gaps
-                        .retain(|gap| !gap.starts_with("NWS refresh failed:"));
+                        .retain(|gap| !gap.starts_with("NWS alert overlay paused:"));
                     self.publish(snapshot);
                     true
                 } else {
+                    self.publish_unavailable(
+                        last_good,
+                        Some(point),
+                        "304 received without a last-good snapshot",
+                    );
                     false
                 }
             }
             Err(error) => {
-                self.publish_failure(last_good, &format!("NWS refresh failed: {error}"));
+                self.publish_unavailable(
+                    last_good,
+                    Some(point),
+                    &format!("refresh failed: {error}"),
+                );
                 false
             }
         }
     }
 
-    fn publish_failure(&self, last_good: &mut Option<NwsAlertSnapshot>, gap: &str) {
-        tracing::warn!(target: "mackesd::nws_alert_overlay", host = %self.host, error = gap, "NWS refresh failed; retaining last-good snapshot");
-        if let Some(snapshot) = last_good {
-            snapshot
-                .gaps
-                .retain(|existing| !existing.starts_with("NWS refresh failed:"));
-            snapshot.gaps.push(gap.to_string());
-            self.publish(snapshot);
-        }
+    fn degraded_snapshot(
+        &self,
+        last_good: Option<&NwsAlertSnapshot>,
+        query_point: Option<GeoPoint>,
+        reason: &str,
+    ) -> NwsAlertSnapshot {
+        // A restart has no in-memory conditional snapshot, but the Bus may
+        // still contain a prior successful record. Read it only as a template
+        // for a cleared projection; never republish its prior-location alerts.
+        let persisted = self.bus_root.clone().and_then(|root| {
+            let persist = mde_bus::persist::Persist::open(root).ok()?;
+            let body = persist
+                .read_latest(&nws_alert_state_topic(&self.host))
+                .ok()
+                .flatten()?
+                .body?;
+            serde_json::from_str::<NwsAlertSnapshot>(&body).ok()
+        });
+        let mut degraded = last_good
+            .cloned()
+            .or(persisted)
+            .unwrap_or_else(|| NwsAlertSnapshot::empty(&self.host, now_ms()));
+        degraded.alerts.clear();
+        degraded.feed_updated_at_ms = None;
+        degraded.query_point = query_point;
+        degraded.fetched_at_ms = now_ms();
+        degraded
+            .gaps
+            .retain(|gap| !gap.starts_with("NWS alert overlay paused:"));
+        degraded
+            .gaps
+            .push(format!("NWS alert overlay paused: {reason}"));
+        degraded
+    }
+
+    fn publish_unavailable(
+        &self,
+        last_good: &Option<NwsAlertSnapshot>,
+        query_point: Option<GeoPoint>,
+        reason: &str,
+    ) {
+        let degraded = self.degraded_snapshot(last_good.as_ref(), query_point, reason);
+        tracing::warn!(
+            target: "mackesd::nws_alert_overlay",
+            host = %self.host,
+            error = reason,
+            "NWS alert refresh unavailable; publishing an empty degraded snapshot"
+        );
+        self.publish(&degraded);
     }
 
     async fn fetch_async(
@@ -782,6 +832,11 @@ impl Worker for NwsAlertOverlayWorker {
         let mut retry = RETRY_MIN.min(self.poll);
         loop {
             let Some(point) = self.current_vehicle_point() else {
+                self.publish_unavailable(
+                    &last_good,
+                    None,
+                    "fresh same-host MG90 vehicle fix unavailable",
+                );
                 tokio::select! {
                     () = shutdown.wait() => break,
                     () = tokio::time::sleep(NO_FIX_RETRY.min(self.poll)) => {}
@@ -1008,12 +1063,13 @@ mod tests {
 
     #[test]
     fn not_modified_cannot_relabel_a_prior_points_snapshot() {
-        let worker = NwsAlertOverlayWorker::new("rig-1".to_string()).with_bus_root(None);
-        let mut old = NwsAlertSnapshot::empty("rig-1", 10);
-        old.query_point = Some(GeoPoint {
-            latitude: 32.0,
-            longitude: -95.0,
-        });
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().to_path_buf();
+        let worker = NwsAlertOverlayWorker::new("rig-1".to_string())
+            .with_bus_root(Some(root.clone()));
+        let old = build_snapshot(&FakeProbe::captured(), "rig-1", point(), CAPTURED_ALERTS, 10)
+            .expect("captured NWS parse");
+        let old_alert_count = old.alerts.len();
         let mut last_good = Some(old);
         let new_point = GeoPoint {
             latitude: 33.0,
@@ -1023,7 +1079,111 @@ mod tests {
         let retained = last_good.expect("old snapshot retained");
         assert_ne!(retained.query_point, Some(new_point));
         assert_eq!(retained.fetched_at_ms, 10);
-        assert!(retained.gaps.iter().any(|gap| gap.contains("304 point")));
+        assert_eq!(retained.alerts.len(), old_alert_count);
+
+        let body = Persist::open(root)
+            .expect("bus")
+            .read_latest(&nws_alert_state_topic("rig-1"))
+            .expect("read")
+            .expect("degraded message")
+            .body
+            .expect("degraded body");
+        let degraded: NwsAlertSnapshot = serde_json::from_str(&body).expect("snapshot");
+        assert!(degraded.alerts.is_empty());
+        assert_eq!(degraded.query_point, Some(new_point));
+        assert!(degraded
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("304 point")));
+        assert_eq!(degraded.license_tier, "public-domain");
+        assert_eq!(degraded.attribution, "NWS");
+    }
+
+    #[test]
+    fn failed_refresh_publishes_empty_degraded_projection_and_retains_private_cache() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().to_path_buf();
+        let worker = NwsAlertOverlayWorker::new("rig-1".to_string())
+            .with_bus_root(Some(root.clone()));
+        let original =
+            build_snapshot(&FakeProbe::captured(), "rig-1", point(), CAPTURED_ALERTS, 10)
+                .expect("captured NWS parse");
+        let mut last_good = None;
+        assert!(worker.apply_result(
+            Ok(PreparedResponse::Modified(original)),
+            point(),
+            &mut last_good
+        ));
+        assert!(!worker.apply_result(
+            Err(io::Error::other("timeout")),
+            point(),
+            &mut last_good
+        ));
+
+        let retained = last_good.as_ref().expect("private conditional cache");
+        assert_eq!(retained.alerts.len(), 2);
+        assert_eq!(retained.query_point, Some(point()));
+        assert_eq!(retained.fetched_at_ms, 10);
+
+        let body = Persist::open(root)
+            .expect("bus")
+            .read_latest(&nws_alert_state_topic("rig-1"))
+            .expect("read")
+            .expect("degraded message")
+            .body
+            .expect("degraded body");
+        let degraded: NwsAlertSnapshot = serde_json::from_str(&body).expect("snapshot");
+        assert!(degraded.alerts.is_empty());
+        assert_eq!(degraded.query_point, Some(point()));
+        assert!(degraded
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("timeout")));
+        assert_eq!(degraded.license_tier, "public-domain");
+        assert_eq!(degraded.attribution, "NWS");
+    }
+
+    #[test]
+    fn no_fresh_fix_clears_persisted_stale_alerts_after_restart() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().to_path_buf();
+        let seed_worker = NwsAlertOverlayWorker::new("rig-1".to_string())
+            .with_bus_root(Some(root.clone()));
+        let original =
+            build_snapshot(&FakeProbe::captured(), "rig-1", point(), CAPTURED_ALERTS, 10)
+                .expect("captured NWS parse");
+        let mut seed_cache = None;
+        assert!(seed_worker.apply_result(
+            Ok(PreparedResponse::Modified(original)),
+            point(),
+            &mut seed_cache
+        ));
+
+        let restarted = NwsAlertOverlayWorker::new("rig-1".to_string())
+            .with_bus_root(Some(root.clone()));
+        let restart_cache = None;
+        restarted.publish_unavailable(
+            &restart_cache,
+            None,
+            "fresh same-host MG90 vehicle fix unavailable",
+        );
+
+        let body = Persist::open(root)
+            .expect("bus")
+            .read_latest(&nws_alert_state_topic("rig-1"))
+            .expect("read")
+            .expect("degraded message")
+            .body
+            .expect("degraded body");
+        let degraded: NwsAlertSnapshot = serde_json::from_str(&body).expect("snapshot");
+        assert!(degraded.alerts.is_empty());
+        assert_eq!(degraded.query_point, None);
+        assert!(degraded
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("vehicle fix unavailable")));
+        assert_eq!(degraded.license_tier, "public-domain");
+        assert_eq!(degraded.attribution, "NWS");
     }
 
     #[test]

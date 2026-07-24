@@ -13,7 +13,7 @@
 #
 #   (b) SHIPPED-BUT-DEAD SURFACE. A whole `mde-*-egui` surface epic (terminal,
 #       media) can build green yet be UNREACHABLE — its lib compiled into no
-#       shipped binary and mounted at no dock Surface, with zero launchers. That
+#       shipped binary and mounted in no surface catalog, with zero launchers. That
 #       is a surface that exists in the tree, passes tests, and reaches no user.
 #       TERM-16 / MEDIA-18 wired the two that had regressed; this script guards
 #       every future `mde-*-egui` the same way.
@@ -21,7 +21,7 @@
 # Neither regression has an automated gate today. This one is STATIC (no build,
 # no cargo, no network): it parses the RPM asset manifest out of
 # `crates/mesh/mackesd/Cargo.toml` ([package.metadata.generate-rpm].assets plus
-# the thin lighthouse variant) and greps the shell's dock. It is fast enough to
+# the thin lighthouse variant) and checks the shell's surface catalog. It is fast enough to
 # run on every push.
 #
 # ─────────────────────────────────────────────────────────────────────────────
@@ -60,8 +60,8 @@
 #              mde-web-cef, cef-verify): each MUST appear as a target/release
 #              asset across the base + Browser package asset sets.
 #   surfaces : every mde-*-egui crate under crates/desktop (minus the shell host
-#              and the documented EXEMPT list) MUST be BOTH dock-mounted (named in
-#              the shell's dock.rs Surface enum) AND shipped (a path-dep of
+#              and the documented EXEMPT list) MUST be BOTH catalog-mounted (named in
+#              the shell's surfaces.rs catalog) AND shipped (a path-dep of
 #              mde-shell-egui, whose binary is itself in the asset set). A surface
 #              that is one but not the other FAILs.
 #
@@ -79,20 +79,20 @@
 # the channel cannot be silently broken.
 #
 # ─────────────────────────────────────────────────────────────────────────────
-# EXEMPT surface crates — mde-*-egui crates under crates/desktop that are NOT dock
-# surfaces and so are not required to be dock-mounted. Keep this list SHORT and
+# EXEMPT surface crates — mde-*-egui crates under crates/desktop that are NOT
+# launchable surfaces and so are not required to be catalog-mounted. Keep this list SHORT and
 # justify every entry; the whole point of the gate is that new surfaces cannot
 # silently join this set.
 #   mde-panel-egui : the E12-7 egui panel CLIENT (the retired cosmic-applet's
-#                    replacement), not a dock Surface. It renders standalone, not
-#                    inside the shell's dock. If it is ever wired into the shell
+#                    replacement), not a launchable surface. It renders standalone,
+#                    not inside the shell's catalog. If it is ever wired into the shell
 #                    or retired, drop it from this list.
-# (mde-shell-egui is the dock HOST itself, handled separately — never a surface.)
+# (mde-shell-egui is the shell HOST itself, handled separately — never a surface.)
 #
 # Env overrides (mostly for --self-test; default to the live repo layout):
 #   CARGO_TOML   RPM manifest         (default crates/mesh/mackesd/Cargo.toml)
 #   SHELL_CARGO  shell manifest       (default crates/desktop/mde-shell-egui/Cargo.toml)
-#   DOCK_RS      dock source          (default crates/desktop/mde-shell-egui/src/dock.rs)
+#   SURFACES_RS  surface catalog      (default crates/desktop/mde-shell-egui/src/surfaces.rs)
 #   DESKTOP_DIR  surface-crate dir    (default crates/desktop)
 #   REPO_ROOT    tree root for assets (default: the git worktree this script is in)
 #   MCNF_FAKE_RPM_LIST  a file whose lines stand in for `rpm -qlp` (real-RPM test hook)
@@ -104,10 +104,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="${REPO_ROOT:-$(cd "$HERE/.." && pwd)}"
 CARGO_TOML="${CARGO_TOML:-$REPO_ROOT/crates/mesh/mackesd/Cargo.toml}"
 SHELL_CARGO="${SHELL_CARGO:-$REPO_ROOT/crates/desktop/mde-shell-egui/Cargo.toml}"
-DOCK_RS="${DOCK_RS:-$REPO_ROOT/crates/desktop/mde-shell-egui/src/dock.rs}"
+SURFACES_RS="${SURFACES_RS:-$REPO_ROOT/crates/desktop/mde-shell-egui/src/surfaces.rs}"
 DESKTOP_DIR="${DESKTOP_DIR:-$REPO_ROOT/crates/desktop}"
 
-# The dock HOST (never a surface) and the justified non-surface egui crates.
+# The shell HOST (never a surface) and the justified non-surface egui crates.
 readonly SHELL_HOST_CRATE="mde-shell-egui"
 EXEMPT_SURFACES=("mde-panel-egui")
 
@@ -189,8 +189,8 @@ is_exempt() {
 shell_depends_on() {
   grep -qE "^[[:space:]]*$1[[:space:]]*=[[:space:]]*\{[[:space:]]*path" "$SHELL_CARGO"
 }
-# Is the crate named in dock.rs? (its Surface variant doc names it as `mde-x-egui`)
-dock_mounts() { grep -q "$1" "$DOCK_RS"; }
+# Is the crate named in the canonical surface catalog?
+surface_catalog_mounts() { grep -qF "$1" "$SURFACES_RS"; }
 
 # ═════════════════════════════════════════════════════════════════════════════
 # CHECK 1 — RPM payload (build-deploy-2)
@@ -374,7 +374,7 @@ check_payload() {
 # CHECK 2 — surface reachability (test-obs-4)
 # ═════════════════════════════════════════════════════════════════════════════
 check_surfaces() {
-  hdr "surfaces (dry-run, static) — dock: ${DOCK_RS#"$REPO_ROOT"/}"
+  hdr "surfaces (dry-run, static) — catalog: ${SURFACES_RS#"$REPO_ROOT"/}"
 
   # Precompute: is the shell binary itself shipped? A surface can only "ship"
   # by being compiled into a shipped binary — and mde-shell-egui is that binary.
@@ -393,27 +393,27 @@ check_surfaces() {
   while IFS= read -r c; do
     [ -n "$c" ] || continue
     if [ "$c" = "$SHELL_HOST_CRATE" ]; then
-      info "host           $c is the dock host, not a surface (skipped)"
+      info "host           $c is the shell host, not a surface (skipped)"
       continue
     fi
     if is_exempt "$c"; then
       # Still report its wiring truthfully so an accidental one is visible.
       local dep="no" mnt="no"
       shell_depends_on "$c" && dep="yes"
-      dock_mounts "$c" && mnt="yes"
-      skip "exempt         $c (documented non-dock-surface; shell-dep=$dep dock-ref=$mnt)"
+      surface_catalog_mounts "$c" && mnt="yes"
+      skip "exempt         $c (documented non-launchable surface; shell-dep=$dep catalog-ref=$mnt)"
       continue
     fi
 
     local is_dep=0 is_mnt=0
     shell_depends_on "$c" && is_dep=1
-    dock_mounts "$c" && is_mnt=1
+    surface_catalog_mounts "$c" && is_mnt=1
 
     if [ "$is_dep" -eq 1 ] && [ "$is_mnt" -eq 1 ] && [ "$shell_shipped" -eq 1 ]; then
-      ok "surface        $c  mounted in dock.rs AND compiled into the shipped shell"
+      ok "surface        $c  mounted in surfaces.rs AND compiled into the shipped shell"
     else
       local why=""
-      [ "$is_mnt" -eq 1 ] || why+=" NOT-mounted(no dock.rs Surface reference)"
+      [ "$is_mnt" -eq 1 ] || why+=" NOT-mounted(no surfaces.rs catalog reference)"
       [ "$is_dep" -eq 1 ] || why+=" NOT-shipped(not a mde-shell-egui path-dep → compiled into no shipped bin)"
       [ "$shell_shipped" -eq 1 ] || why+=" shell-bin-unshipped"
       fail "surface        $c  built-but-dead:$why"
@@ -504,16 +504,13 @@ TOML
   local dt="$tmp/desktop"
   mkdir -p "$dt/mde-shell-egui/src" "$dt/mde-good-egui" "$dt/mde-orphan-egui"
   local scargo="$dt/mde-shell-egui/Cargo.toml"
-  local sdock="$dt/mde-shell-egui/src/dock.rs"
+  local ssurfaces="$dt/mde-shell-egui/src/surfaces.rs"
   cat >"$scargo" <<'TOML'
 [dependencies]
 mde-good-egui = { path = "../mde-good-egui" }
 TOML
-  cat >"$sdock" <<'RS'
-pub enum Surface {
-    /// The good surface (`mde-good-egui`).
-    Good,
-}
+  cat >"$ssurfaces" <<'RS'
+const EMBEDDED_SURFACE_CRATES: &[&str] = &["mde-good-egui"];
 RS
   # good manifest that ships the shell so surfaces can ride it
   local scmani="$tmp/surf.toml"
@@ -523,8 +520,8 @@ assets = [
     { source = "target/release/mde-shell-egui", dest = "/usr/bin/mde-shell-egui", mode = "755" },
 ]
 TOML
-  out="$(DESKTOP_DIR="$dt" SHELL_CARGO="$scargo" DOCK_RS="$sdock" CARGO_TOML="$scmani" bash "$0" surfaces 2>&1)"; rc=$?
-  if grep -q "surface        mde-good-egui  mounted in dock.rs AND compiled" <<<"$out"; then
+  out="$(DESKTOP_DIR="$dt" SHELL_CARGO="$scargo" SURFACES_RS="$ssurfaces" CARGO_TOML="$scmani" bash "$0" surfaces 2>&1)"; rc=$?
+  if grep -q "surface        mde-good-egui  mounted in surfaces.rs AND compiled" <<<"$out"; then
     ok "self-test: a properly wired surface PASSES"
   else
     fail "self-test: wired surface did not pass"; st_fail=1

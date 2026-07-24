@@ -25,14 +25,15 @@ pub struct KvmService {
     /// Short canonical id — the key under which the service is reported in host
     /// health (e.g. `"libvirtd"`, `"libvirt-network"`).
     pub id: &'static str,
-    /// The systemd unit whose liveness backs it (`systemctl is-active <unit>`).
+    /// The primary systemd unit whose liveness backs it
+    /// (`systemctl is-active <unit>`).
     ///
     /// The default libvirt network and storage pool have **no own systemd unit**
     /// under the monolithic `libvirtd` that `node-virt.yml` enables — they are
     /// served in-process by libvirtd — so they carry `libvirtd.service` as their
-    /// backing unit (its liveness *is* their availability). A future migration
-    /// to the modular libvirt daemons would repoint them to
-    /// `virtnetworkd.service` / `virtstoraged.service`.
+    /// primary backing unit (its liveness *is* their availability). Fedora's
+    /// modular libvirt layout is exposed by [`Self::alternative_units`] and is
+    /// probed after this compatibility unit.
     pub unit: &'static str,
     /// One-line role in the stack.
     pub summary: &'static str,
@@ -42,15 +43,40 @@ impl KvmService {
     const fn new(id: &'static str, unit: &'static str, summary: &'static str) -> Self {
         Self { id, unit, summary }
     }
+
+    /// Additional systemd units that can provide this canonical service.
+    ///
+    /// The published service ids intentionally remain the stable, legacy
+    /// libvirt ids. Keeping the alternatives here (next to the canonical
+    /// catalog) lets both the older monolithic `libvirtd` layout and Fedora's
+    /// modular `virt*` daemons feed the same health rows without changing the
+    /// consumer contract.
+    #[must_use]
+    pub fn alternative_units(&self) -> &'static [&'static str] {
+        match self.id {
+            "libvirtd" => &["virtqemud.service", "virtqemud.socket"],
+            "libvirt-network" => &["virtnetworkd.service", "virtnetworkd.socket"],
+            "libvirt-storage" => &["virtstoraged.service", "virtstoraged.socket"],
+            _ => &[],
+        }
+    }
+
+    /// Candidate units in probe order: the legacy-compatible primary unit,
+    /// followed by any Fedora modular alternatives.
+    #[must_use]
+    pub fn probe_units(&self) -> impl Iterator<Item = &'static str> + '_ {
+        std::iter::once(self.unit).chain(self.alternative_units().iter().copied())
+    }
 }
 
 /// The per-node KVM virtualization service set every mesh node provisions
 /// (`infra/ansible/node-virt.yml`) — the Fedora + KVM replacement for the
 /// xcp-ng toolstack. Ordered management-brain-first: `libvirtd` (the lifecycle +
-/// network + storage daemon) leads, then the container socket, host networking,
-/// and the libvirt-served default network + storage pool. Cockpit's interim VM
-/// console is retired by the CONSTRUCT-CLOUD/QC-15 cutover and is deliberately not
-/// part of the live catalog.
+/// network + storage service, backed by legacy `libvirtd.service` or modular
+/// `virtqemud`/`virtnetworkd`/`virtstoraged`) leads, then the container socket,
+/// host networking, and the libvirt-served default network + storage pool.
+/// Cockpit's interim VM console is retired by the CONSTRUCT-CLOUD/QC-15 cutover
+/// and is deliberately not part of the live catalog.
 pub static KVM_SERVICES: &[KvmService] = &[
     KvmService::new(
         "libvirtd",
@@ -121,7 +147,7 @@ mod tests {
         // Every entry is fully populated and the ids are unique. Units are NOT
         // asserted unique: under the monolithic libvirtd node-virt.yml enables,
         // the default network and storage pool legitimately share
-        // `libvirtd.service` as their backing unit.
+        // `libvirtd.service` as their primary backing unit.
         for (i, a) in KVM_SERVICES.iter().enumerate() {
             assert!(!a.id.is_empty() && !a.unit.is_empty() && !a.summary.is_empty());
             for b in &KVM_SERVICES[i + 1..] {
@@ -133,12 +159,37 @@ mod tests {
     #[test]
     fn libvirt_network_and_storage_back_onto_libvirtd() {
         // The two libvirt-served items carry libvirtd's unit — their
-        // availability IS libvirtd's liveness on a monolithic-libvirtd host.
+        // availability IS libvirtd's liveness on a monolithic-libvirtd host;
+        // Fedora's modular units are alternatives, not new service ids.
         for id in ["libvirt-network", "libvirt-storage"] {
-            assert_eq!(
-                find_by_id(id).expect("present in catalog").unit,
-                "libvirtd.service"
-            );
+            let service = find_by_id(id).expect("present in catalog");
+            assert_eq!(service.unit, "libvirtd.service");
+        }
+    }
+
+    #[test]
+    fn modular_units_are_alternatives_for_stable_service_ids() {
+        assert_eq!(
+            find_by_id("libvirtd")
+                .expect("present in catalog")
+                .alternative_units(),
+            &["virtqemud.service", "virtqemud.socket"]
+        );
+        assert_eq!(
+            find_by_id("libvirt-network")
+                .expect("present in catalog")
+                .alternative_units(),
+            &["virtnetworkd.service", "virtnetworkd.socket"]
+        );
+        assert_eq!(
+            find_by_id("libvirt-storage")
+                .expect("present in catalog")
+                .alternative_units(),
+            &["virtstoraged.service", "virtstoraged.socket"]
+        );
+        for id in ["libvirtd", "libvirt-network", "libvirt-storage"] {
+            let service = find_by_id(id).expect("present in catalog");
+            assert_eq!(service.probe_units().next(), Some("libvirtd.service"));
         }
     }
 

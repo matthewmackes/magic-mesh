@@ -917,7 +917,7 @@ mod worker {
 
     /// The default Bus root (same shape the other bus workers use).
     fn default_bus_root() -> Option<PathBuf> {
-        Some(dirs::data_dir()?.join("mde").join("bus"))
+        mde_bus::default_data_dir()
     }
 
     #[async_trait::async_trait]
@@ -973,6 +973,24 @@ mod worker {
                 model: identify(&dmi),
                 dmi,
             }
+        }
+
+        #[test]
+        fn default_bus_root_honors_mde_bus_root() {
+            let root = tempfile::tempdir().expect("tempdir");
+            let expected = root.path().to_path_buf();
+            let previous = std::env::var_os("MDE_BUS_ROOT");
+            let got = {
+                std::env::set_var("MDE_BUS_ROOT", &expected);
+                let got = SurfaceVerifyWorker::new("node-a".into()).bus_root;
+                match previous {
+                    Some(value) => std::env::set_var("MDE_BUS_ROOT", value),
+                    None => std::env::remove_var("MDE_BUS_ROOT"),
+                }
+                got
+            };
+
+            assert_eq!(got, Some(expected));
         }
 
         #[test]

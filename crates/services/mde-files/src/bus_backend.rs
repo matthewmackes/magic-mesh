@@ -21,9 +21,13 @@
 
 #![cfg(feature = "dbus")]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use mackes_mesh_types::cloud::{
+    cloud_request_digest, decode_cloud_arm_credential, CloudArmSigner, CloudArmedToken,
+    CLOUD_ACTION_SCHEMA_VERSION, CLOUD_ARM_CREDENTIAL,
+};
 use serde::Deserialize;
 use tokio::runtime::Runtime;
 
@@ -35,8 +39,177 @@ use crate::model::{FileRow, Mime, Peer, PeerKind, PeerStatus, SelfNode};
 pub const FLEET_FILES_PREFIX: &str = "fleet-files";
 /// AUD-1 — the file-operations surface (Send-To / rollback / audit-log).
 pub const FILE_OPS_PREFIX: &str = "file-ops";
+/// Capability verb consumed by mackesd's `action/file-ops/send-to` gate.
+const FILE_OPS_SEND_TO_AUTH_VERB: &str = "file-ops-send-to";
+/// Keep a file-operation capability useful for one Bus drain only.
+const ACTION_TOKEN_TTL_MS: i64 = 30_000;
 /// AUD-1/AUD-7 — the replicated inbox surface (received files).
 pub const INBOX_PREFIX: &str = "files-inbox";
+
+/// Resolve the host identity used by mackesd's file responder for the
+/// capability's node context. `/etc/hostname` is authoritative for that
+/// responder; the environment fallback keeps desktop/test launches useful.
+fn local_node() -> String {
+    for path in ["/etc/hostname", "/proc/sys/kernel/hostname"] {
+        if let Ok(hostname) = std::fs::read_to_string(path) {
+            let hostname = hostname.trim();
+            if !hostname.is_empty() {
+                return hostname.to_string();
+            }
+        }
+    }
+    std::env::var("HOSTNAME")
+        .ok()
+        .map(|hostname| hostname.trim().to_string())
+        .filter(|hostname| !hostname.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// The root/systemd credential loader shared by the privileged Bus
+/// producers. A missing credential, an unprivileged process, or an invalid
+/// credential is an authorization failure, never a reason to publish an
+/// unsigned mutation.
+fn action_signer() -> Result<CloudArmSigner, String> {
+    #[cfg(test)]
+    {
+        return CloudArmSigner::new(b"0123456789abcdef0123456789abcdef".to_vec())
+            .map_err(str::to_string);
+    }
+    #[cfg(not(test))]
+    {
+        if !running_as_root() {
+            return Err("file-operation authorization requires the root service process".into());
+        }
+        let directory = std::env::var_os("CREDENTIALS_DIRECTORY")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .ok_or_else(|| "systemd action credential is unavailable".to_string())?;
+        load_action_signer(&directory, true)
+    }
+}
+
+/// Load one credential from an explicit directory. The boolean is injectable
+/// only so hostile tests can prove the root gate without changing process
+/// credentials or global environment state.
+fn load_action_signer(directory: &Path, running_as_root: bool) -> Result<CloudArmSigner, String> {
+    if !running_as_root {
+        return Err("file-operation authorization requires the root service process".into());
+    }
+    let path = directory.join(CLOUD_ARM_CREDENTIAL);
+    let raw = std::fs::read(&path)
+        .map_err(|error| format!("read systemd action credential {}: {error}", path.display()))?;
+    let key = decode_cloud_arm_credential(&raw).map_err(str::to_string)?;
+    CloudArmSigner::new(key).map_err(str::to_string)
+}
+
+/// Linux's standard-library-only euid probe keeps this service crate's
+/// dependency graph unchanged while retaining the root-only signer boundary.
+#[cfg(not(test))]
+fn running_as_root() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        return std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                status.lines().find_map(|line| {
+                    let mut fields = line.split_whitespace();
+                    if fields.next() == Some("Uid:") {
+                        fields.nth(1).and_then(|euid| euid.parse::<u32>().ok())
+                    } else {
+                        None
+                    }
+                })
+            })
+            == Some(0);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// Mint a cryptographically random, single-use nonce without adding a
+/// second RNG dependency to this render-agnostic service crate.
+fn fresh_nonce() -> Result<String, String> {
+    let mut bytes = [0_u8; 32];
+    let mut random = std::fs::File::open("/dev/urandom")
+        .map_err(|error| format!("open system random source: {error}"))?;
+    std::io::Read::read_exact(&mut random, &mut bytes)
+        .map_err(|error| format!("read system random source: {error}"))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// Add schema v1 and an exact-body, short-lived capability to one
+/// `action/file-ops/send-to` request. The four pre-existing business fields
+/// remain unchanged; only the required auth envelope is additive.
+fn authorize_send_to_body(unsigned_body: &str) -> Result<String, String> {
+    let mut document: serde_json::Value = serde_json::from_str(unsigned_body)
+        .map_err(|error| format!("invalid file-operation request body: {error}"))?;
+    let object = document
+        .as_object_mut()
+        .ok_or_else(|| "file-operation request body must be a JSON object".to_string())?;
+    object.remove("armed_token");
+    object.insert(
+        "schema_version".to_string(),
+        serde_json::Value::from(CLOUD_ACTION_SCHEMA_VERSION),
+    );
+    let selector = object
+        .get("selector")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    let peer = selector
+        .strip_prefix("peer:")
+        .filter(|peer| {
+            !peer.is_empty()
+                && *peer != "."
+                && *peer != ".."
+                && !peer.contains('/')
+                && !peer.contains('\\')
+                && !peer.contains('\0')
+        })
+        .ok_or_else(|| {
+            format!(
+                "file-operation authorization requires a clean peer selector (got '{selector}')"
+            )
+        })?;
+    let node = local_node();
+    let target = format!("peer:{peer}");
+    for (label, value) in [
+        ("verb", FILE_OPS_SEND_TO_AUTH_VERB),
+        ("node", node.as_str()),
+        ("target", target.as_str()),
+    ] {
+        if value.contains('|') || value.len() > 255 || value.trim().is_empty() {
+            return Err(format!(
+                "file-operation authorization {label} is not capability-safe"
+            ));
+        }
+    }
+    let unsigned = document.to_string();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .map_err(|_| "system clock is before the Unix epoch".to_string())?;
+    let nonce = fresh_nonce()?;
+    let signer = action_signer()?;
+    let token = CloudArmedToken::mint(
+        &signer,
+        &nonce,
+        now.saturating_add(ACTION_TOKEN_TTL_MS),
+        FILE_OPS_SEND_TO_AUTH_VERB,
+        &node,
+        &target,
+        &cloud_request_digest(&unsigned).map_err(str::to_string)?,
+    )
+    .encode();
+    document
+        .as_object_mut()
+        .expect("validated JSON object")
+        .insert("armed_token".to_string(), serde_json::Value::String(token));
+    serde_json::to_string(&document)
+        .map_err(|error| format!("encode authorized file-operation request: {error}"))
+}
 
 /// E10 — one row of the `action/connect/devices` KDE-Connect roster reply
 /// (mirrors the shell's `connect::WireDevice`). Extra fields are ignored.
@@ -281,13 +454,15 @@ impl BusBackend {
         mode: SendMode,
         conflict: ConflictPolicy,
     ) -> Result<OpId, BackendError> {
-        let body = serde_json::json!({
+        let unsigned_body = serde_json::json!({
             "sources": sources.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>(),
             "selector": destination_to_selector(destination),
             "mode": send_mode_to_str(mode),
             "conflict": conflict_policy_to_str(conflict),
         })
         .to_string();
+        let body = authorize_send_to_body(&unsigned_body)
+            .map_err(|error| BackendError::Rejected(format!("send-to authorization: {error}")))?;
         let raw = self.bus_request_at(FILE_OPS_PREFIX, "send-to", Some(&body))?;
         let v: serde_json::Value = serde_json::from_str(&raw)
             .map_err(|e| BackendError::Rejected(format!("send-to decode: {e}")))?;
@@ -651,6 +826,76 @@ mod tests {
             "overwrite"
         );
         assert_eq!(conflict_policy_to_str(ConflictPolicy::Rename), "rename");
+    }
+
+    #[test]
+    fn send_to_body_keeps_wire_fields_and_binds_schema_v1_to_exact_body() {
+        let unsigned = serde_json::json!({
+            "sources": ["/home/mm/share/report.pdf"],
+            "selector": "peer:oak",
+            "mode": "copy",
+            "conflict": "rename",
+        })
+        .to_string();
+        let body = authorize_send_to_body(&unsigned).expect("authorized body");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(value["schema_version"], CLOUD_ACTION_SCHEMA_VERSION);
+        assert_eq!(
+            value["sources"],
+            serde_json::json!(["/home/mm/share/report.pdf"])
+        );
+        assert_eq!(value["selector"], "peer:oak");
+        assert_eq!(value["mode"], "copy");
+        assert_eq!(value["conflict"], "rename");
+
+        let token = CloudArmedToken::parse(value["armed_token"].as_str().expect("token"))
+            .expect("well-formed capability");
+        assert_eq!(token.verb, FILE_OPS_SEND_TO_AUTH_VERB);
+        assert_eq!(token.node, local_node());
+        assert_eq!(token.target, "peer:oak");
+        let signer = action_signer().expect("test signer");
+        assert!(signer.verify_payload(&token.signing_payload(), &token.signature));
+
+        let mut unsigned_value = value.clone();
+        unsigned_value
+            .as_object_mut()
+            .expect("object")
+            .remove("armed_token");
+        assert_eq!(
+            token.request_sha256,
+            cloud_request_digest(&unsigned_value.to_string()).expect("digest")
+        );
+
+        // Any body edit, even one that leaves the selector/target unchanged,
+        // receives a different digest and cannot reuse this capability.
+        unsigned_value["sources"][0] = serde_json::Value::String("/etc/shadow".into());
+        assert_ne!(
+            token.request_sha256,
+            cloud_request_digest(&unsigned_value.to_string()).expect("tampered digest")
+        );
+    }
+
+    #[test]
+    fn send_to_body_rejects_hostile_peer_selector_before_publication() {
+        for selector in ["peer:../oak", "peer:oak/../../etc", "peer:oak|forged"] {
+            let unsigned = serde_json::json!({
+                "sources": ["/home/mm/share/report.pdf"],
+                "selector": selector,
+                "mode": "copy",
+                "conflict": "rename",
+            })
+            .to_string();
+            assert!(
+                authorize_send_to_body(&unsigned).is_err(),
+                "hostile selector was accepted: {selector}"
+            );
+        }
+    }
+
+    #[test]
+    fn action_signer_fails_closed_for_missing_credential_or_non_root() {
+        assert!(load_action_signer(Path::new("/definitely/missing"), true).is_err());
+        assert!(load_action_signer(Path::new("/"), false).is_err());
     }
 
     #[test]

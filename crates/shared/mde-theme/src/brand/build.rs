@@ -4,9 +4,9 @@
 //! release channel into `cargo:rustc-env` variables; this module reads them back
 //! with `env!` and shapes them into the two lines the platform shows:
 //!
-//! * [`version_line`] → `12.0.0 "Construct"` — the short brand line in the shell
+//! * [`version_line`] → `<version> "Construct"` — the short brand line in the shell
 //!   chrome and the boot-splash.
-//! * [`full`] → `12.0.0 "Construct" · <hash> · <date> · <channel>` — the complete
+//! * [`full`] → `<version> "Construct" · <hash> · <date> · <channel>` — the complete
 //!   build stamp for the About panel and `--version`.
 //!
 //! Both are single-sourced from [`info`] so the shell, `mde-shell-egui --version`
@@ -41,7 +41,7 @@ pub const fn codename_for(major: u64) -> &'static str {
 /// binary built from the same tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuildInfo {
-    /// Semver version — the workspace `CARGO_PKG_VERSION` (`12.0.0`).
+    /// Semver version — the workspace `CARGO_PKG_VERSION`.
     pub version: &'static str,
     /// Codename for the version's major epoch (`"Construct"`; `""` if unknown).
     pub codename: &'static str,
@@ -53,7 +53,7 @@ pub struct BuildInfo {
     pub channel: &'static str,
 }
 
-/// Parse the semver major epoch from the stamped version (`"12.0.0"` → `12`).
+/// Parse the semver major epoch from the stamped version.
 fn major_epoch() -> u64 {
     VERSION
         .split('.')
@@ -75,7 +75,7 @@ pub fn info() -> BuildInfo {
 }
 
 /// The short brand line — semver plus the quoted codename — for the shell chrome
-/// and the boot-splash: `12.0.0 "Construct"`. The codename is omitted (bare semver)
+/// and the boot-splash: `<version> "Construct"`. The codename is omitted (bare semver)
 /// when the epoch has no name.
 #[must_use]
 pub fn version_line() -> String {
@@ -88,7 +88,7 @@ pub fn version_line() -> String {
 }
 
 /// The complete build-identity line for the About panel and `--version`:
-/// `12.0.0 "Construct" · <hash> · <date> · <channel>`. Reuses [`version_line`] for
+/// `<version> "Construct" · <hash> · <date> · <channel>`. Reuses [`version_line`] for
 /// the leading brand line so the two never drift.
 #[must_use]
 pub fn full() -> String {
@@ -128,8 +128,8 @@ mod tests {
 
     #[test]
     fn version_line_is_semver_plus_quoted_codename() {
-        // The workspace is 12.0.0 → the "Construct" epoch, so the shape is
-        // `<semver> "Construct"` (the chrome/splash line the design locks).
+        // The current workspace major maps to the "Construct" epoch, so the
+        // shape is `<semver> "Construct"` (the chrome/splash line the design locks).
         assert_eq!(version_line(), format!("{VERSION} \"Construct\""));
         assert!(version_line().starts_with(VERSION));
         assert!(version_line().contains("\"Construct\""));

@@ -1070,6 +1070,7 @@ pub(crate) fn start_files_bus_responder(
                     runtime_base,
                     mackesd_core::ipc::secret_store::repo_root(),
                     mackes_mesh_types::peers::default_workgroup_root(),
+                    host.clone(),
                 )
                 .with_bus_dir(mesh_bus_dir);
                 surfaces.push(files::Surface {
@@ -1305,6 +1306,18 @@ pub(crate) fn spawn_compute_lifecycle_workers(
                 .to_string(),
         )
     });
+    // WL-FUNC-012 / MG90 airspace — publish a typed per-node scanner mirror.
+    // The default constructor is deliberately source-less until a proven MG90
+    // survey probe is configured; this makes the worker path live and honest
+    // instead of leaving the desktop to claim that the worker is unwired.
+    spawn_tiered(sup, worker_names, role_rank, "airspace", || {
+        mackesd_core::workers::airspace::AirspaceWorker::new(
+            node_id
+                .strip_prefix("peer:")
+                .unwrap_or(&node_id)
+                .to_string(),
+        )
+    });
     // WL-FUNC-012 / OVERLAY-10 — the keyless USGS earthquake adapter. This is
     // Workstation-tier because external overlay bandwidth lives on the seated
     // adapter host, never on the MG90 cellular gateway or a Lighthouse. It is an
@@ -1345,6 +1358,17 @@ pub(crate) fn spawn_compute_lifecycle_workers(
     // fresh same-host US vehicle fix, and 429-aware with last-good retention.
     spawn_tiered(sup, worker_names, role_rank, "wildfire_overlay", || {
         mackesd_core::workers::wildfire_overlay::WildfireOverlayWorker::new(
+            node_id
+                .strip_prefix("peer:")
+                .unwrap_or(&node_id)
+                .to_string(),
+        )
+    });
+    // WL-FUNC-012 / OVERLAY-6 — NASA FIRMS near-real-time hotspots. This is
+    // a separate credential-gated workstation lane so a missing FIRMS key or
+    // a provider failure never suppresses the keyless NIFC perimeter mirror.
+    spawn_tiered(sup, worker_names, role_rank, "firms_overlay", || {
+        mackesd_core::workers::firms_overlay::FirmsOverlayWorker::new(
             node_id
                 .strip_prefix("peer:")
                 .unwrap_or(&node_id)
@@ -1724,9 +1748,26 @@ pub(crate) fn spawn_mesh_plumbing_workers(
                 .to_string(),
         )
     });
-    spawn_tiered(sup, worker_names, role_rank, "ssh_pubkey_gossip", || {
-        ssh_pubkey_gossip::SshPubkeyGossipWorker::new(workgroup_root.clone(), node_id.clone())
-    });
+    // SEC-007 provenance boundary — the replicated SSH-key lane is a direct
+    // input to authorized_keys, so never let the worker publish/consume plain
+    // text when the persisted node signer is unavailable.
+    match mackesd_core::node_key::load_or_create(std::path::Path::new(
+        mackesd_core::node_key::DEFAULT_KEY_PATH,
+    )) {
+        Ok(signing_key) => {
+            spawn_tiered(sup, worker_names, role_rank, "ssh_pubkey_gossip", || {
+                ssh_pubkey_gossip::SshPubkeyGossipWorker::new(
+                    workgroup_root.clone(),
+                    node_id.clone(),
+                )
+                .with_signing_key(signing_key)
+            });
+        }
+        Err(e) => tracing::warn!(
+            error = %e,
+            "ssh_pubkey_gossip: node signing key unavailable; worker skipped"
+        ),
+    }
     // NF-21.3 — firewall_preset worker. Applies the Nebula
     // firewalld preset (UDP/4242 inbound on all peers; TCP/443
     // inbound additionally on lighthouses) on first tick + on
@@ -1798,7 +1839,7 @@ pub(crate) fn spawn_datacenter_scheduler_workers(
         .push("alert_relay".into());
 
     // INST-11 + INST-12 + INST-13 (v2.7) — fleet upgrade-barrier
-    // worker. Runs on every peer; silently no-ops until a
+    // worker. Runs on every peer; silently no-ops until a signed
     // `mde-update --coordinate <ver>` writes an intent file into
     // `<mesh-home>/upgrade-intent/`. Then it runs `dnf upgrade
     // mde-core` on its own schedule, marks itself ready, fires
@@ -2731,9 +2772,9 @@ pub(crate) fn spawn_fleet_compute_workers(
         // MESH-A-4.c.2 (v5.0.0) — surrounding-host discovery worker.
         // Sweeps the LAN (mDNS + ARP-MAC + OUI) every 10 min and
         // writes a per-peer snapshot under
-        // ~/.local/share/mde/surrounding/<host>/ (mesh-synced;
+        // <workgroup-root>/surrounding/<host>/ (mesh-synced;
         // every peer reads the union per R8-Q13).
-        let surrounding_base = data_dir.join("mde").join("surrounding");
+        let surrounding_base = mackesd_core::surrounding_hosts::default_surrounding_root();
         sup.spawn(Spawn::new(
             mackesd_core::workers::surrounding_worker::SurroundingWorker::new(
                 fw_host,
@@ -2751,7 +2792,7 @@ pub(crate) fn spawn_fleet_compute_workers(
         // mesh-synced Blocked-host consensus every minute.
         sup.spawn(Spawn::new(
             mackesd_core::workers::mesh_firewall::MeshFirewallWorker::new(
-                data_dir.join("mde").join("surrounding"),
+                mackesd_core::surrounding_hosts::default_surrounding_root(),
             ),
             RestartPolicy::Always,
         ));

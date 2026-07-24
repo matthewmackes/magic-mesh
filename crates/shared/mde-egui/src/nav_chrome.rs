@@ -20,15 +20,14 @@
 use std::hash::Hash;
 
 use egui::{
-    Align2, Color32, FontId, Key, Modifiers, Rect, Response, Sense, Ui, Vec2, WidgetInfo,
-    WidgetType,
+    Align2, Color32, Key, Modifiers, Rect, Response, Sense, Ui, Vec2, WidgetInfo, WidgetType,
 };
 
 use crate::{
     carbon::paint_carbon,
     focus::paint_focus_ring,
     motion::Motion,
-    style::{Density, Style},
+    style::{Density, Style, TypographyRole},
 };
 
 // ── Chrome heights (Density-aware) ──────────────────────────────────────────
@@ -247,7 +246,7 @@ impl<'a> NavigationBar<'a> {
             let accent = Style::resolve_color(ui.ctx(), Style::ACCENT);
             let galley = ui.painter().layout_no_wrap(
                 previous.to_owned(),
-                FontId::proportional(Style::TYPE_BODY),
+                Style::typography_font(TypographyRole::Label),
                 accent,
             );
             let width = Style::SP_S + Style::ICON_L + Style::SP_XS + galley.size().x + Style::SP_S;
@@ -329,7 +328,7 @@ impl<'a> NavigationBar<'a> {
                 egui::pos2(rect.left() + Style::SP_M, rect.bottom() - Style::SP_S),
                 Align2::LEFT_BOTTOM,
                 self.title,
-                FontId::proportional(Style::TYPE_LARGE_TITLE),
+                Style::typography_font(TypographyRole::Display),
                 strong,
             );
         } else if self.leading {
@@ -337,7 +336,7 @@ impl<'a> NavigationBar<'a> {
                 egui::pos2(title_left, strip.center().y),
                 Align2::LEFT_CENTER,
                 self.title,
-                FontId::proportional(Style::TYPE_TITLE3),
+                Style::typography_font(TypographyRole::Headline),
                 strong,
             );
         } else {
@@ -345,7 +344,7 @@ impl<'a> NavigationBar<'a> {
                 strip.center(),
                 Align2::CENTER_CENTER,
                 self.title,
-                FontId::proportional(Style::TYPE_TITLE3),
+                Style::typography_font(TypographyRole::Headline),
                 strong,
             );
         }
@@ -517,7 +516,7 @@ impl<'a> Toolbar<'a> {
         } else {
             let galley = ui.painter().layout_no_wrap(
                 item.label.to_owned(),
-                FontId::proportional(Style::MENU_TEXT),
+                Style::typography_font(TypographyRole::Label),
                 Color32::PLACEHOLDER,
             );
             galley.size().x + 2.0 * Style::SP_S * sp
@@ -553,7 +552,7 @@ impl<'a> Toolbar<'a> {
                     slot.center(),
                     Align2::CENTER_CENTER,
                     item.label,
-                    FontId::proportional(Style::MENU_TEXT),
+                    Style::typography_font(TypographyRole::Label),
                     accent,
                 );
                 paint_focus_ring(ui.painter(), slot, response.has_focus());
@@ -709,7 +708,7 @@ impl Sidebar {
                         egui::pos2(head.left() + Style::SP_S, head.bottom() - Style::SP_XS * sp),
                         Align2::LEFT_BOTTOM,
                         header,
-                        FontId::proportional(Style::TYPE_FOOTNOTE),
+                        Style::typography_font(TypographyRole::Caption),
                         Style::resolve_color(ui.ctx(), Style::TEXT_DIM),
                     );
                 }
@@ -793,7 +792,7 @@ impl Sidebar {
                 egui::pos2(text_x, plate.center().y),
                 Align2::LEFT_CENTER,
                 row.label,
-                FontId::proportional(Style::TYPE_BODY),
+                Style::typography_font(TypographyRole::Body),
                 color,
             );
             paint_focus_ring(ui.painter(), plate, response.has_focus());
@@ -839,6 +838,12 @@ mod tests {
         out
     }
 
+    fn test_context() -> egui::Context {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        ctx
+    }
+
     fn key_press(key: Key) -> RawInput {
         RawInput {
             events: vec![Event::Key {
@@ -869,7 +874,7 @@ mod tests {
 
     #[test]
     fn nav_bar_renders_title_and_back_fires_on_click_and_enter() {
-        let ctx = egui::Context::default();
+        let ctx = test_context();
         let actions = [NavAction::new("view-refresh", "Refresh")];
         let mut last: Option<NavBarResponse> = None;
         let run = |input: RawInput, last: &mut Option<NavBarResponse>| {
@@ -890,10 +895,9 @@ mod tests {
         assert!(!out.shapes.is_empty(), "nav bar must paint visible shapes");
         let texts = painted_text(&out.shapes);
         assert!(
-            texts
-                .iter()
-                .any(|(t, s)| t == "Settings" && (*s - Style::TYPE_TITLE3).abs() < f32::EPSILON),
-            "title must render on the Title3 rung: {texts:?}"
+            texts.iter().any(|(t, s)| t == "Settings"
+                && (*s - TypographyRole::Headline.size()).abs() < f32::EPSILON),
+            "title must render on the shared headline rung: {texts:?}"
         );
         assert!(
             texts.iter().any(|(t, _)| t == "Home"),
@@ -925,7 +929,7 @@ mod tests {
 
     #[test]
     fn nav_bar_large_title_paints_the_hero_rung() {
-        let ctx = egui::Context::default();
+        let ctx = test_context();
         let out = ctx.run(RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let response = NavigationBar::new("Library").large_title().show(ui);
@@ -938,17 +942,15 @@ mod tests {
         });
         let texts = painted_text(&out.shapes);
         assert!(
-            texts
-                .iter()
-                .any(|(t, s)| t == "Library"
-                    && (*s - Style::TYPE_LARGE_TITLE).abs() < f32::EPSILON),
-            "large title must render on the LARGE_TITLE rung: {texts:?}"
+            texts.iter().any(|(t, s)| t == "Library"
+                && (*s - TypographyRole::Display.size()).abs() < f32::EPSILON),
+            "large title must render on the shared display rung: {texts:?}"
         );
     }
 
     #[test]
     fn toolbar_action_fires_on_click_and_reports_its_index() {
-        let ctx = egui::Context::default();
+        let ctx = test_context();
         let leading = [ToolbarItem::labeled("Select")];
         let trailing = [
             ToolbarItem::icon("download", "Download"),
@@ -987,7 +989,7 @@ mod tests {
 
     #[test]
     fn sidebar_selection_moves_with_arrows_and_enter_reports_the_id() {
-        let ctx = egui::Context::default();
+        let ctx = test_context();
         let rows = [
             SidebarRow::new("general", "General").with_icon("view-grid"),
             SidebarRow::new("network", "Network"),
@@ -1017,10 +1019,9 @@ mod tests {
             );
         }
         assert!(
-            texts
-                .iter()
-                .any(|(t, s)| t == "Settings" && (*s - Style::TYPE_FOOTNOTE).abs() < f32::EPSILON),
-            "section header must sit on the footnote rung: {texts:?}"
+            texts.iter().any(|(t, s)| t == "Settings"
+                && (*s - TypographyRole::Caption.size()).abs() < f32::EPSILON),
+            "section header must sit on the shared caption rung: {texts:?}"
         );
         assert_eq!(picked, None);
 

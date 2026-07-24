@@ -328,7 +328,7 @@ fn prime_cursor(bus_root: &Path) -> Option<String> {
 }
 
 fn default_bus_root() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join("mde").join("bus"))
+    mde_bus::default_data_dir()
 }
 
 fn now_unix() -> i64 {
@@ -767,6 +767,28 @@ mod tests {
         w.drain_and_publish(&bus, &mut cursor);
         assert_eq!(log.lock().expect("recorder mutex").len(), 1);
         let _ = std::fs::remove_dir_all(&bus);
+    }
+
+    #[test]
+    fn default_bus_root_honors_mde_bus_root() {
+        let root = tempfile::tempdir().expect("temporary bus root");
+        let expected = root.path().to_path_buf();
+        let previous = std::env::var_os("MDE_BUS_ROOT");
+        let got = {
+            std::env::set_var("MDE_BUS_ROOT", &expected);
+            let got = (
+                default_bus_root(),
+                OnboardApplyWorker::new(&std::env::temp_dir(), "peer:me".to_string()).bus_root(),
+            );
+            match previous {
+                Some(value) => std::env::set_var("MDE_BUS_ROOT", value),
+                None => std::env::remove_var("MDE_BUS_ROOT"),
+            }
+            got
+        };
+
+        assert_eq!(got.0, Some(expected.clone()));
+        assert_eq!(got.1, Some(expected));
     }
 
     #[tokio::test]

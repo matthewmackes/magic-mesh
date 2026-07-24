@@ -200,7 +200,10 @@ mod tests {
         // Construct identity (lock #10) and the complete build stamp (`--version`).
         assert_eq!(brand::logo::PRODUCT_NAME, "Construct");
         assert_eq!(brand::logo::PRODUCT_TAGLINE, brand::logo::SOFTWARE_STUDIO);
-        assert_eq!(brand::logo::PRODUCT_RELEASE, "Release 1.0 BETA");
+        assert_eq!(
+            brand::logo::PRODUCT_RELEASE,
+            concat!("Release ", env!("CARGO_PKG_VERSION"))
+        );
         assert_eq!(brand::logo::SOFTWARE_STUDIO, "Software Studio: MDE");
         let full = brand::build::full();
         let info = brand::build::info();

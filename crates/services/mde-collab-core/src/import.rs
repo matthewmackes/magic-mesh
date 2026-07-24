@@ -49,6 +49,7 @@
 //! as the chat union does — a bad file is skipped, never fatal.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -72,6 +73,12 @@ pub const IMPORT_MAP_VERSION: u32 = 1;
 const SEED_SPACE: &str = "wl-func-011-import|space|";
 const SEED_EVENT: &str = "wl-func-011-import|event|";
 const SEED_DOC: &str = "wl-func-011-import|document|";
+
+/// Keep one hostile or half-synced legacy source from making the importer read
+/// without a bound. The legacy chat ring is capped at 500 entries; 8 MiB leaves
+/// room for unusually large message metadata while keeping one source bounded.
+const MAX_IMPORT_SOURCE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_RING_MESSAGES: usize = 500;
 
 /// The stable conversation key of the migration's editor-documents space (the
 /// one space every imported editor document is linked into).
@@ -714,7 +721,14 @@ fn read_chat_conversations(chat_root: &Path) -> BTreeMap<String, Vec<RingMessage
         return BTreeMap::new();
     };
     for host in hosts.flatten() {
-        let out_dir = host.path().join("chat").join("out");
+        let host_dir = host.path();
+        if !is_real_directory(&host_dir) {
+            continue;
+        }
+        let out_dir = host_dir.join("chat").join("out");
+        if !is_real_directory(&out_dir) {
+            continue;
+        }
         let Ok(files) = std::fs::read_dir(&out_dir) else {
             continue;
         };
@@ -751,16 +765,26 @@ fn read_chat_conversations(chat_root: &Path) -> BTreeMap<String, Vec<RingMessage
 /// `read_log` does). Decoded per-entry so a single unrecognized message never
 /// discards the whole ring — it is skipped, the rest import.
 fn read_ring(path: &Path) -> Vec<RingMessage> {
-    let Ok(text) = std::fs::read_to_string(path) else {
+    let Some(text) = read_bounded_regular_text(path) else {
         return Vec::new();
     };
     let Ok(values) = serde_json::from_str::<Vec<serde_json::Value>>(&text) else {
         return Vec::new();
     };
+    if values.len() > MAX_RING_MESSAGES {
+        return Vec::new();
+    }
     values
         .into_iter()
         .filter_map(|v| serde_json::from_value::<RingMessage>(v).ok())
         .collect()
+}
+
+/// Do not traverse a symlinked host or output directory during migration.
+fn is_real_directory(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_dir())
+        .unwrap_or(false)
 }
 
 /// The editor autosave file's decoded shape. The shipping file carries only the
@@ -786,8 +810,34 @@ struct EditorDocument {
 
 /// Read + decode the editor autosave file, or `None` when it is absent/corrupt.
 fn read_editor_autosave(path: &Path) -> Option<EditorAutosave> {
-    let data = std::fs::read_to_string(path).ok()?;
+    let data = read_bounded_regular_text(path)?;
     serde_json::from_str::<EditorAutosave>(&data).ok()
+}
+
+/// Read a legacy source only when it is a regular, non-symlink file and stays
+/// within the importer budget. The second metadata/read-length checks make a
+/// source that grows after the initial check fail closed instead of bypassing
+/// the bound with a stale directory entry.
+fn read_bounded_regular_text(path: &Path) -> Option<String> {
+    let entry = std::fs::symlink_metadata(path).ok()?;
+    if !entry.file_type().is_file() || entry.len() > MAX_IMPORT_SOURCE_BYTES {
+        return None;
+    }
+
+    let file = std::fs::File::open(path).ok()?;
+    let opened = file.metadata().ok()?;
+    if !opened.file_type().is_file() || opened.len() > MAX_IMPORT_SOURCE_BYTES {
+        return None;
+    }
+
+    let mut bytes = Vec::with_capacity(opened.len() as usize);
+    file.take(MAX_IMPORT_SOURCE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_IMPORT_SOURCE_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
 }
 
 #[cfg(test)]
@@ -938,6 +988,72 @@ mod tests {
             .expect("no-op");
         assert_eq!(report, ImportReport::default());
         assert!(sink.is_empty());
+    }
+
+    #[test]
+    fn source_readers_reject_oversized_and_non_regular_inputs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let oversized = tmp.path().join("oversized.json");
+        std::fs::write(
+            &oversized,
+            vec![b' '; (MAX_IMPORT_SOURCE_BYTES + 1) as usize],
+        )
+        .expect("write oversized source");
+        assert!(read_ring(&oversized).is_empty(), "oversized ring was read");
+
+        let ring_dir = tmp.path().join("ring.json");
+        std::fs::create_dir(&ring_dir).expect("create non-regular source");
+        assert!(read_ring(&ring_dir).is_empty(), "directory was read as a ring");
+        assert!(
+            read_editor_autosave(&ring_dir).is_none(),
+            "directory was read as editor state"
+        );
+    }
+
+    #[test]
+    fn ring_reader_rejects_entries_above_the_legacy_cap() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("over-cap.json");
+        let values: Vec<_> = (0..=MAX_RING_MESSAGES)
+            .map(|i| {
+                serde_json::json!({
+                    "id": format!("message-{i}"),
+                    "sender": "eagle",
+                    "ts_unix_ms": i,
+                    "kind": { "text": "bounded" },
+                })
+            })
+            .collect();
+        std::fs::write(&path, serde_json::to_vec(&values).expect("encode ring"))
+            .expect("write ring");
+
+        assert!(read_ring(&path).is_empty(), "over-cap ring was partially read");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_readers_reject_symlinked_inputs() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real_ring = tmp.path().join("real-ring.json");
+        std::fs::write(
+            &real_ring,
+            ring_json(&[("01AAA", "eagle", 1_000, "outside link")]),
+        )
+        .expect("write ring");
+        let linked_ring = tmp.path().join("linked-ring.json");
+        symlink(&real_ring, &linked_ring).expect("link ring");
+        assert!(read_ring(&linked_ring).is_empty(), "symlinked ring was read");
+
+        let real_editor = tmp.path().join("real-editor.json");
+        std::fs::write(&real_editor, r#"{"enabled":true}"#).expect("write editor");
+        let linked_editor = tmp.path().join("linked-editor.json");
+        symlink(&real_editor, &linked_editor).expect("link editor");
+        assert!(
+            read_editor_autosave(&linked_editor).is_none(),
+            "symlinked editor state was read"
+        );
     }
 
     #[test]

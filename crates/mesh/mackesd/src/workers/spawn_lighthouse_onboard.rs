@@ -34,10 +34,12 @@
 #![cfg(feature = "async-services")]
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use mde_bus::persist::Persist;
 
+use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
 use crate::onboard::spawn_lighthouse::{
     execute, gather, plan_spawn, ProvisionError, Provisioner, SpawnOutcome, SpawnPlan,
     SpawnRequest, SpawnTarget,
@@ -54,6 +56,17 @@ pub const ACTION_TOPIC: &str = "action/onboard/spawn-lighthouse";
 /// Bus event topic the typed result is published on — the matching
 /// `event/<domain>/<verb>` lane the shell's Spawn Lighthouse flow tails.
 pub const EVENT_TOPIC: &str = "event/onboard/spawn-lighthouse";
+
+/// Closed capability verb for non-preview lighthouse provisioning actions.
+/// Possession of the shared action topic is transport reachability, not IaC
+/// authority.
+pub const SPAWN_LIGHTHOUSE_AUTH_VERB: &str = "onboard-spawn-lighthouse";
+
+/// Stable capability scope for the leader-coordinated lighthouse plane.
+pub const SPAWN_LIGHTHOUSE_NODE_SCOPE: &str = "lighthouse-onboard";
+
+/// Version of the authenticated action envelope accepted by the worker.
+pub const ACTION_SCHEMA_VERSION: u64 = 1;
 
 /// Poll cadence. The bus read is a cheap local log scan and a spawn is a slow,
 /// operator-paced event, so the 2 s `service_onboard` cadence is responsive
@@ -102,6 +115,14 @@ pub struct SpawnLighthouseAction {
     /// never touched.
     #[serde(default)]
     pub dry_run: bool,
+    /// Authenticated action-envelope schema. Defaults keep older read-only
+    /// previews parseable; apply requests must carry the explicit field.
+    #[serde(default = "default_action_schema_version")]
+    pub schema_version: u64,
+}
+
+fn default_action_schema_version() -> u64 {
+    ACTION_SCHEMA_VERSION
 }
 
 /// Parse a [`SpawnLighthouseAction`] body.
@@ -273,7 +294,10 @@ pub fn resolve(
 /// Read new [`ACTION_TOPIC`] messages since `cursor`, advancing it. A short sync
 /// open-read-drop (never crosses an `.await`), mirroring `service_onboard`. A
 /// malformed action is dropped honestly with a warn.
-fn read_new_actions(bus_root: &Path, cursor: &mut Option<String>) -> Vec<SpawnLighthouseAction> {
+fn read_new_actions(
+    bus_root: &Path,
+    cursor: &mut Option<String>,
+) -> Vec<(String, SpawnLighthouseAction)> {
     let Ok(persist) = Persist::open(bus_root.to_path_buf()) else {
         return vec![];
     };
@@ -285,7 +309,7 @@ fn read_new_actions(bus_root: &Path, cursor: &mut Option<String>) -> Vec<SpawnLi
         *cursor = Some(msg.ulid.clone());
         let body = msg.body.as_deref().unwrap_or("");
         match parse_action(body) {
-            Ok(a) => out.push(a),
+            Ok(a) => out.push((body.to_string(), a)),
             Err(e) => {
                 tracing::warn!(ulid = %msg.ulid, error = %e, "spawn_lighthouse_onboard: bad spawn-lighthouse action");
             }
@@ -303,7 +327,37 @@ fn prime_cursor(bus_root: &Path) -> Option<String> {
 }
 
 fn default_bus_root() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join("mde").join("bus"))
+    mde_bus::default_data_dir()
+}
+
+/// Bind the capability to the requested lighthouse identity and HA shape. The
+/// exact body is also authenticated, so this scope is defense in depth against
+/// a capability minted for another onboarding request.
+#[must_use]
+pub fn spawn_auth_target(action: &SpawnLighthouseAction) -> String {
+    let target = match action.target {
+        SpawnTargetKind::Cloud => "cloud",
+    };
+    let shape = if action.pair { "pair" } else { "single" };
+    format!("lighthouse:{target}:{}:{shape}", action.id,)
+}
+
+/// Verify an exact apply body before the onboarding engine can reach its
+/// provider, enrollment, CA, or secret-minting seams.
+fn authorize_spawn_action(
+    authorizer: &ActionAuthorizer,
+    body: &str,
+    action: &SpawnLighthouseAction,
+) -> Result<(), String> {
+    let target = spawn_auth_target(action);
+    authorizer.authorize(
+        body,
+        MutationContext {
+            verb: SPAWN_LIGHTHOUSE_AUTH_VERB,
+            node: SPAWN_LIGHTHOUSE_NODE_SCOPE,
+            target: &target,
+        },
+    )
 }
 
 /// The Bus-reachable `onboard spawn-lighthouse` worker. Leader-gated +
@@ -322,6 +376,13 @@ pub struct SpawnLighthouseOnboardWorker {
     prov: Box<dyn Provisioner + Send + Sync>,
     /// The injectable publish seam (production: the shared [`BusPublisher`]).
     publisher: Box<dyn Publisher + Send + Sync>,
+    /// Exact-body capability verifier for the privileged apply lane. Missing
+    /// production credentials fail closed.
+    authorizer: Arc<ActionAuthorizer>,
+    /// Deterministic live-facts seam for the authorization test; production
+    /// always gathers from the workgroup and host environment.
+    #[cfg(test)]
+    facts_override: Option<crate::onboard::spawn_lighthouse::SpawnFacts>,
     /// Poll cadence.
     poll: Duration,
     /// Bus root override (tests). `None` ⇒ [`default_bus_root`].
@@ -341,6 +402,9 @@ impl SpawnLighthouseOnboardWorker {
             leader_lock,
             prov: Box::new(crate::onboard::spawn_lighthouse::LiveProvisioner::default()),
             publisher: Box::new(BusPublisher),
+            authorizer: Arc::new(ActionAuthorizer::production()),
+            #[cfg(test)]
+            facts_override: None,
             poll: DEFAULT_POLL_INTERVAL,
             bus_root_override: None,
         }
@@ -357,6 +421,27 @@ impl SpawnLighthouseOnboardWorker {
     #[must_use]
     pub fn with_publisher(mut self, publisher: Box<dyn Publisher + Send + Sync>) -> Self {
         self.publisher = publisher;
+        self
+    }
+
+    /// Inject an isolated verifier and replay ledger for focused action tests.
+    /// Production always uses the root-only systemd-credential-backed verifier.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
+        self.authorizer = authorizer;
+        self
+    }
+
+    /// Inject live facts so the authorization test can prove that exactly one
+    /// authorized body reaches the provider seam without host credentials.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_facts(
+        mut self,
+        facts: crate::onboard::spawn_lighthouse::SpawnFacts,
+    ) -> Self {
+        self.facts_override = Some(facts);
         self
     }
 
@@ -399,10 +484,39 @@ impl SpawnLighthouseOnboardWorker {
         if actions.is_empty() || !self.is_leader() {
             return;
         }
+        // Authenticate every apply before gathering the founding bundle. That
+        // gather reads the CA-holder bundle, and no untrusted apply may reach
+        // provider/backend/secret-adjacent work before its capability passes.
+        // Dry-run remains an intentionally unsigned, read-only preview.
+        let mut authorized_actions = Vec::with_capacity(actions.len());
+        for (body, action) in actions {
+            if !action.dry_run {
+                if let Err(error) = authorize_spawn_action(self.authorizer.as_ref(), &body, &action)
+                {
+                    tracing::warn!(
+                        id = %action.id,
+                        error = %error,
+                        "spawn_lighthouse_onboard: unauthorized apply refused"
+                    );
+                    continue;
+                }
+            }
+            authorized_actions.push(action);
+        }
+        if authorized_actions.is_empty() {
+            return;
+        }
+
         // Gather once per tick — the founding bundle is the same for every
-        // action in this batch.
+        // authorized action in this batch.
+        #[cfg(test)]
+        let facts = self
+            .facts_override
+            .clone()
+            .unwrap_or_else(|| gather(&self.workgroup_root, &self.node_id));
+        #[cfg(not(test))]
         let facts = gather(&self.workgroup_root, &self.node_id);
-        for action in actions {
+        for action in authorized_actions {
             let event = resolve(&action, &facts, self.prov.as_ref());
             match serde_json::to_string(&event) {
                 Ok(body) => self.publisher.publish(EVENT_TOPIC, &body),
@@ -443,6 +557,7 @@ impl Worker for SpawnLighthouseOnboardWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::action_auth::authorize_test_body;
     use crate::onboard::spawn_lighthouse::{
         CaMigrationStep, Endpoint, EnrollBootstrap, LiveProvisioner, ProvisionSpec,
     };
@@ -463,6 +578,7 @@ mod tests {
             target,
             pair,
             dry_run,
+            schema_version: ACTION_SCHEMA_VERSION,
         }
     }
 
@@ -470,7 +586,7 @@ mod tests {
     /// never touch the seam, and that applies drive it in order.
     #[derive(Default)]
     struct FakeProvisioner {
-        calls: Mutex<Vec<&'static str>>,
+        calls: Arc<Mutex<Vec<&'static str>>>,
     }
 
     impl Provisioner for FakeProvisioner {
@@ -525,11 +641,12 @@ mod tests {
             target: SpawnTargetKind::Cloud,
             pair: false,
             dry_run: true,
+            schema_version: ACTION_SCHEMA_VERSION,
         };
         let json = serde_json::to_string(&a).expect("serialize");
         assert_eq!(
             json,
-            r#"{"id":"lh-42-cloud","target":"cloud","pair":false,"dry_run":true}"#
+            r#"{"id":"lh-42-cloud","target":"cloud","pair":false,"dry_run":true,"schema_version":1}"#
         );
         assert_eq!(parse_action(&json).expect("parse"), a);
         // A minimal body omitting pair/dry_run defaults both to false.
@@ -708,19 +825,78 @@ mod tests {
     }
 
     fn seed_bus(actions: &[SpawnLighthouseAction]) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("mde-slo-{}-{}", now_ms(), actions.len()));
+        let bodies = actions
+            .iter()
+            .map(|action| serde_json::to_string(action).unwrap())
+            .collect::<Vec<_>>();
+        seed_bus_bodies(&bodies)
+    }
+
+    fn seed_bus_bodies(bodies: &[String]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mde-slo-{}-{}", now_ms(), bodies.len()));
         let persist = Persist::open(dir.clone()).expect("open bus");
-        for a in actions {
+        for body in bodies {
             persist
-                .write(
-                    ACTION_TOPIC,
-                    Priority::Default,
-                    None,
-                    Some(&serde_json::to_string(a).unwrap()),
-                )
+                .write(ACTION_TOPIC, Priority::Default, None, Some(body))
                 .expect("write action");
         }
         dir
+    }
+
+    #[test]
+    fn worker_refuses_unsigned_tampered_and_replayed_applies_before_provisioning() {
+        const KEY: &[u8] = b"spawn-lighthouse-action-auth-key";
+        const NOW: i64 = 1_700_000_000_000;
+        let unsigned =
+            r#"{"id":"lh-auth","target":"cloud","pair":false,"dry_run":false,"schema_version":1}"#;
+        let action = parse_action(unsigned).expect("valid spawn action");
+        let target = spawn_auth_target(&action);
+        let armed = authorize_test_body(
+            KEY,
+            unsigned,
+            MutationContext {
+                verb: SPAWN_LIGHTHOUSE_AUTH_VERB,
+                node: SPAWN_LIGHTHOUSE_NODE_SCOPE,
+                target: &target,
+            },
+            "spawn-lighthouse-once",
+            NOW + 30_000,
+        );
+        // This remains parseable, but its exact body and semantic target no
+        // longer match the capability.
+        let tampered = armed.replace("\"id\":\"lh-auth\"", "\"id\":\"lh-tampered\"");
+        let bus = seed_bus_bodies(&[unsigned.to_string(), tampered, armed.clone(), armed]);
+        let wg = std::env::temp_dir().join(format!("mde-slo-auth-wg-{}", now_ms()));
+        std::fs::create_dir_all(&wg).expect("mk workgroup");
+        let auth_root = tempfile::tempdir().expect("auth root");
+        let authorizer = Arc::new(ActionAuthorizer::for_test(
+            KEY,
+            auth_root.path().to_path_buf(),
+            NOW,
+        ));
+        let provisioner = FakeProvisioner::default();
+        let calls = provisioner.calls.clone();
+        let publisher = RecordingPublisher::default();
+        let sent = publisher.sent.clone();
+        let worker = SpawnLighthouseOnboardWorker::new(wg.clone(), "peer:auth".to_string())
+            .with_provisioner(Box::new(provisioner))
+            .with_publisher(Box::new(publisher))
+            .with_authorizer(authorizer)
+            .with_facts(facts(true, true))
+            .with_bus_root(bus.clone());
+
+        let mut cursor = None;
+        worker.drain_and_publish(&bus, &mut cursor);
+        let calls = calls.lock().unwrap().clone();
+
+        assert_eq!(
+            calls.as_slice(),
+            ["provision", "push_enroll", "migrate_ca"],
+            "only the one authorized body reaches the provider seam; unsigned, tampered, and replayed bodies have no effect"
+        );
+        assert_eq!(sent.lock().expect("sent mutex").len(), 1);
+        let _ = std::fs::remove_dir_all(&bus);
+        let _ = std::fs::remove_dir_all(&wg);
     }
 
     #[test]
@@ -733,6 +909,7 @@ mod tests {
             target: SpawnTargetKind::Cloud,
             pair: false,
             dry_run: true,
+            schema_version: ACTION_SCHEMA_VERSION,
         }]);
         let wg = std::env::temp_dir().join(format!("mde-slo-wg-{}", now_ms()));
         std::fs::create_dir_all(&wg).expect("mk workgroup");

@@ -99,7 +99,7 @@ fn now_ms() -> u64 {
 /// The default Bus root (the persisted message tree), matching every other
 /// mackesd worker's resolution.
 fn default_bus_root() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join("mde").join("bus"))
+    mde_bus::default_data_dir()
 }
 
 /// Publish a JSON state-mirror body to `topic` in-process (perf-10 / arch-6) —
@@ -463,5 +463,10 @@ mod tests {
         let joined = tokio::time::timeout(Duration::from_secs(2), handle).await;
         assert!(joined.is_ok(), "worker must exit promptly on shutdown");
         assert!(joined.unwrap().expect("join").is_ok());
+    }
+
+    #[test]
+    fn default_bus_root_uses_the_shared_mde_bus_resolver() {
+        assert_eq!(default_bus_root(), mde_bus::default_data_dir());
     }
 }

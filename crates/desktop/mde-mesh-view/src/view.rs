@@ -491,8 +491,9 @@ mod tests {
             nodes: vec![
                 MeshNode::new("lh", "lighthouse", Role::Lighthouse, Health::Ok)
                     .leader()
-                    .version("12.0.0"),
-                MeshNode::new("srv", "server-01", Role::Server, Health::Ok).version("12.0.0"),
+                    .version(env!("CARGO_PKG_VERSION")),
+                MeshNode::new("srv", "server-01", Role::Server, Health::Ok)
+                    .version(env!("CARGO_PKG_VERSION")),
                 MeshNode::new("a", "peer-a", Role::Workstation, Health::Warn).version("11.4.1"), // older build
                 MeshNode::new("b", "peer-b", Role::Workstation, Health::Down), // no version → "—"
             ],
@@ -549,10 +550,11 @@ mod tests {
     fn version_line_renders_current_stale_and_absent_honestly() {
         // Current build → dim; older build → marked + WARN so it stands out;
         // absent version → an honest "—", never a fabricated build (§7).
-        let current = MeshNode::new("a", "a", Role::Workstation, Health::Ok).version("12.0.0");
+        let current = MeshNode::new("a", "a", Role::Workstation, Health::Ok)
+            .version(env!("CARGO_PKG_VERSION"));
         assert_eq!(
             version_line(&current),
-            ("12.0.0".to_string(), Style::TEXT_DIM)
+            (env!("CARGO_PKG_VERSION").to_string(), Style::TEXT_DIM)
         );
 
         let old = MeshNode::new("b", "b", Role::Workstation, Health::Warn)

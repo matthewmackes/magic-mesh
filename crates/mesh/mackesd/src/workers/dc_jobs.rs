@@ -145,9 +145,8 @@ impl DcJobs {
 /// old `mde-bus publish <topic> --body-flag <body>`.
 ///
 /// Targets [`crate::bus_publish::default_bus_root`] (which honours
-/// `MDE_BUS_ROOT`) — the SAME root the fork+exec'd CLI resolved, NOT the
-/// worker's own MDE_BUS_ROOT-blind [`default_bus_root`] read root (they diverge
-/// on the live daemon; see [`crate::workers::dc_auditor`]).
+/// `MDE_BUS_ROOT`) — the same canonical root used by this worker's request
+/// reader and by the fork+exec'd CLI.
 fn publish(rec: &JobRecord) {
     publish_to(crate::bus_publish::default_bus_root().as_deref(), rec);
 }
@@ -203,7 +202,7 @@ fn poll_and_track(persist: &Persist, core: &mut DcJobs) {
 }
 
 fn default_bus_root() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join("mde").join("bus"))
+    mde_bus::default_data_dir()
 }
 
 /// The supervised worker. Leader-gated (only the elected node writes the

@@ -4,6 +4,26 @@
 //! CLI verb handlers). Behaviour is unchanged; only the location moved.
 use crate::*;
 
+/// Write the leader nudge without following a hostile final-component
+/// symlink. `validation/` is intentionally sticky-world-writable so the
+/// desktop user can request a run, which makes the marker itself an
+/// attacker-controlled filesystem boundary for this root CLI.
+fn write_run_now(root: &std::path::Path) -> std::io::Result<()> {
+    use rustix::fs::{Mode, OFlags};
+    use std::io::Write;
+
+    let vdir = root.join("validation");
+    std::fs::create_dir_all(&vdir)?;
+    let fd = rustix::fs::open(
+        vdir.join("runnow"),
+        OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
+    )?;
+    let mut file: std::fs::File = fd.into();
+    file.write_all(b"mackesd")?;
+    file.sync_all()
+}
+
 /// Handle the `validate` subcommand.
 #[allow(unreachable_code)]
 pub fn run(cmd: ValidateCmd) -> anyhow::Result<()> {
@@ -13,9 +33,7 @@ pub fn run(cmd: ValidateCmd) -> anyhow::Result<()> {
         let root = mackesd_core::default_qnm_shared_root();
         match cmd {
             ValidateCmd::Run => {
-                let vdir = root.join("validation");
-                std::fs::create_dir_all(&vdir)?;
-                std::fs::write(vdir.join("runnow"), b"mackesd")?;
+                write_run_now(&root)?;
                 println!("requested a fresh overlay-reachability run (the leader mints it)");
                 return Ok(());
             }
@@ -70,4 +88,37 @@ pub fn run(cmd: ValidateCmd) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn run_now_refuses_a_final_symlink_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("mesh");
+        let vdir = root.join("validation");
+        std::fs::create_dir_all(&vdir).expect("validation dir");
+        let outside = tmp.path().join("outside");
+        std::fs::write(&outside, b"keep me").expect("sentinel");
+        symlink(&outside, vdir.join("runnow")).expect("symlink");
+
+        let error = write_run_now(&root).expect_err("symlink must be refused");
+        assert!(
+            error.raw_os_error().is_some(),
+            "symlink refusal should preserve the underlying OS error"
+        );
+        assert_eq!(std::fs::read(&outside).expect("sentinel read"), b"keep me");
+
+        std::fs::remove_file(vdir.join("runnow")).expect("remove symlink");
+        write_run_now(&root).expect("regular marker write");
+        assert_eq!(
+            std::fs::read(vdir.join("runnow")).expect("marker read"),
+            b"mackesd"
+        );
+    }
 }

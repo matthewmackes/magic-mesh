@@ -85,6 +85,7 @@ use serde_json::{json, Value};
 use tracing::{debug, error, info, warn};
 
 use super::{ShutdownToken, Worker};
+use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
 // KDC-MESH-8 — drive placement-local instance lifecycle from the phone over the neutral
 // `action/cloud/*` Bus verb namespace (design #12). This is a read-only producer
 // of typed cloud requests + reader of the typed reply; the cloud backend that
@@ -126,6 +127,20 @@ const CONNECT_VERBS: [&str; 11] = [
     // KDC-MESH-7 — ask the phone to start SFTP browsing; the phone replies with a
     // `kdeconnect.sftp` mount-info packet this host mounts (design #11a).
     "sftp",
+];
+
+/// Connect mutations require a root-minted exact-body capability. Roster,
+/// version, get, and browse remain read-only transport queries.
+const CONNECT_MUTATION_VERBS: [&str; 9] = [
+    "pair",
+    "pair-device",
+    "unpair",
+    "ring",
+    "sms",
+    "clipboard",
+    "share",
+    "sftp",
+    "mesh-enroll-token",
 ];
 
 /// Bus topic the worker answers with the live device roster (E2.3 — the same
@@ -236,7 +251,7 @@ const FANOUT_SEEN_CAP: usize = 256;
 /// it directly guarantees a republished `event/notify/phone` is folded by chat and
 /// a forwarded notify is read from the same lanes the producer writes.
 fn notify_bus_root() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join("mde").join("bus"))
+    mde_bus::default_data_dir()
 }
 
 /// A bounded de-dup ring of notification keys (phone id + notif id + cancel). A
@@ -1602,18 +1617,27 @@ async fn run_host(
                             let bus_root = mde_bus::default_data_dir();
                             let browser_status =
                                 browser_media_status_from_bus(bus_root.as_deref(), &host);
-                            if let Some(command) = apply_browser_mpris_media_command(
-                                bus_root.as_deref(),
-                                &host,
-                                &body,
-                                browser_status.as_ref(),
-                            ) {
-                                audit_kdc_action(json!({
-                                    "action": "kdc_media_control",
-                                    "phone": peer.as_str(),
-                                    "command": command,
-                                    "target": "browser",
-                                }));
+                            if browser_mpris_target_requested(&body.player) {
+                                if let Some(command) =
+                                    apply_browser_mpris_media_command_if_active(
+                                        bus_root.as_deref(),
+                                        &host,
+                                        &body,
+                                        browser_status.as_ref(),
+                                    )
+                                {
+                                    audit_kdc_action(json!({
+                                        "action": "kdc_media_control",
+                                        "phone": peer.as_str(),
+                                        "command": command,
+                                        "target": "browser",
+                                    }));
+                                } else {
+                                    debug!(
+                                        phone = %peer.as_str(),
+                                        "kdc-host: Browser media command refused without an active Browser projection"
+                                    );
+                                }
                             } else if let Some(command) =
                                 apply_mpris_media_command(&PlayerctlMediaControl, &body)
                             {
@@ -1639,18 +1663,27 @@ async fn run_host(
                             let bus_root = mde_bus::default_data_dir();
                             let browser_status =
                                 browser_media_status_from_bus(bus_root.as_deref(), &host);
-                            if let Some(command) = apply_browser_mpris_request_command(
-                                bus_root.as_deref(),
-                                &host,
-                                &body,
-                                browser_status.as_ref(),
-                            ) {
-                                audit_kdc_action(json!({
-                                    "action": "kdc_media_control",
-                                    "phone": peer.as_str(),
-                                    "command": command,
-                                    "target": "browser",
-                                }));
+                            if browser_mpris_target_requested(&body.player) {
+                                if let Some(command) =
+                                    apply_browser_mpris_request_command_if_active(
+                                        bus_root.as_deref(),
+                                        &host,
+                                        &body,
+                                        browser_status.as_ref(),
+                                    )
+                                {
+                                    audit_kdc_action(json!({
+                                        "action": "kdc_media_control",
+                                        "phone": peer.as_str(),
+                                        "command": command,
+                                        "target": "browser",
+                                    }));
+                                } else {
+                                    debug!(
+                                        phone = %peer.as_str(),
+                                        "kdc-host: Browser media request refused without an active Browser projection"
+                                    );
+                                }
                             } else if let Some(command) =
                                 apply_mpris_request_command(&PlayerctlMediaControl, &body)
                             {
@@ -2260,6 +2293,37 @@ fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// Browser MPRIS is a distinct target, not a request to fall back to the
+/// host's generic `playerctl` player. Keep that distinction at the KDC
+/// dispatch boundary so a paired phone cannot steer an unrelated Browser tab
+/// when the Browser has not published an active media projection.
+fn browser_mpris_target_requested(player: &str) -> bool {
+    matches!(
+        player.trim().to_ascii_lowercase().as_str(),
+        "mde-browser" | "browser" | "magic mesh browser"
+    )
+}
+
+fn apply_browser_mpris_media_command_if_active(
+    bus_root: Option<&Path>,
+    host: &str,
+    body: &MprisBody,
+    status: Option<&BrowserMediaStatus>,
+) -> Option<&'static str> {
+    let status = status?;
+    apply_browser_mpris_media_command(bus_root, host, body, Some(status))
+}
+
+fn apply_browser_mpris_request_command_if_active(
+    bus_root: Option<&Path>,
+    host: &str,
+    body: &MprisRequestBody,
+    status: Option<&BrowserMediaStatus>,
+) -> Option<&'static str> {
+    let status = status?;
+    apply_browser_mpris_request_command(bus_root, host, body, Some(status))
 }
 
 // ───────────────── KDC-MESH-7: two-way files + service directory ──────────────
@@ -2923,6 +2987,45 @@ fn handle_connect_verb(
     reply.to_string()
 }
 
+fn connect_mutation_verb(verb: &str) -> bool {
+    CONNECT_MUTATION_VERBS.contains(&verb)
+}
+
+fn connect_auth_target(verb: &str, body: &Value) -> String {
+    let device = body
+        .get("device_id")
+        .or_else(|| body.get("id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    device
+        .map(|value| format!("device:{value}"))
+        .unwrap_or_else(|| format!("connect:{verb}"))
+}
+
+/// Verify a Connect mutation before its body reaches a store or outbound queue.
+/// The exact serialized body is authenticated; the parsed value is returned only
+/// after the durable nonce claim succeeds.
+fn authorize_connect_body(
+    raw: &str,
+    verb: &str,
+    node: &str,
+    authorizer: &ActionAuthorizer,
+) -> Result<Value, String> {
+    let body: Value = serde_json::from_str(raw)
+        .map_err(|_| "Connect mutation body is not a JSON object".to_string())?;
+    let context_verb = format!("connect-{verb}");
+    let target = connect_auth_target(verb, &body);
+    authorizer.authorize(
+        raw,
+        MutationContext {
+            verb: &context_verb,
+            node,
+            target: &target,
+        },
+    )?;
+    Ok(body)
+}
+
 /// The daemon-published mesh enroll token state consumed by the Phones hub Pair QR.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 struct MeshEnrollTokenState {
@@ -2984,6 +3087,7 @@ fn serve_connect_bus(
     roster: &Roster,
     outbound: &PendingSends,
     config_dir: &std::path::Path,
+    authorizer: &ActionAuthorizer,
     stop: &AtomicBool,
 ) {
     let mut cursors: HashMap<String, String> = HashMap::new();
@@ -2999,20 +3103,39 @@ fn serve_connect_bus(
             };
             for msg in msgs {
                 cursors.insert(topic.clone(), msg.ulid.clone());
-                let body: Value = msg
-                    .body
-                    .as_deref()
-                    .and_then(|b| serde_json::from_str(b).ok())
-                    .unwrap_or(Value::Null);
-                // EFF-7 — a panicking verb handler must not kill the Connect
-                // responder thread; answer with an error envelope instead.
-                let reply = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    handle_connect_verb(store, outbound, verb, &body)
-                }))
-                .unwrap_or_else(|_| {
-                    error!(verb = %verb, "kdc-host: connect verb handler panicked");
-                    json!({ "ok": false, "error": "internal error" }).to_string()
-                });
+                let reply = match msg.body.as_deref() {
+                    Some(raw) if connect_mutation_verb(verb) => {
+                        match authorize_connect_body(raw, verb, &node_id, authorizer) {
+                            Ok(body) => {
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    handle_connect_verb(store, outbound, verb, &body)
+                                }))
+                                .unwrap_or_else(|_| {
+                                    error!(verb = %verb, "kdc-host: connect verb handler panicked");
+                                    json!({ "ok": false, "error": "internal error" }).to_string()
+                                })
+                            }
+                            Err(error) => {
+                                warn!(verb = %verb, %error, "kdc-host: refused unauthorized Connect mutation");
+                                json!({ "ok": false, "error": format!("authorization refused: {error}") }).to_string()
+                            }
+                        }
+                    }
+                    raw => {
+                        let body: Value = raw
+                            .and_then(|b| serde_json::from_str(b).ok())
+                            .unwrap_or(Value::Null);
+                        // EFF-7 — a panicking verb handler must not kill the Connect
+                        // responder thread; answer with an error envelope instead.
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            handle_connect_verb(store, outbound, verb, &body)
+                        }))
+                        .unwrap_or_else(|_| {
+                            error!(verb = %verb, "kdc-host: connect verb handler panicked");
+                            json!({ "ok": false, "error": "internal error" }).to_string()
+                        })
+                    }
+                };
                 let _ = persist.write(
                     &reply_topic(&msg.ulid),
                     Priority::Default,
@@ -3071,7 +3194,20 @@ fn serve_connect_bus(
         ) {
             for msg in msgs {
                 cursors.insert(MESH_ENROLL_TOKEN_ACTION.to_string(), msg.ulid.clone());
-                let reply = serve_mesh_enroll_token(persist, &workgroup_root, &node_id);
+                let reply = match msg.body.as_deref() {
+                    Some(raw) => {
+                        match authorize_connect_body(raw, "mesh-enroll-token", &node_id, authorizer)
+                        {
+                            Ok(_) => serve_mesh_enroll_token(persist, &workgroup_root, &node_id),
+                            Err(error) => {
+                                warn!(%error, "kdc-host: refused unauthorized mesh-enroll-token mutation");
+                                json!({ "ok": false, "error": format!("authorization refused: {error}") }).to_string()
+                            }
+                        }
+                    }
+                    None => json!({ "ok": false, "error": "authorization refused: missing body" })
+                        .to_string(),
+                };
                 let _ = persist.write(
                     &reply_topic(&msg.ulid),
                     Priority::Default,
@@ -3131,14 +3267,18 @@ impl Worker for KdcHostWorker {
                     return;
                 };
                 match Persist::open(bus_root) {
-                    Ok(p) => serve_connect_bus(
-                        &p,
-                        &store,
-                        &resp_roster,
-                        &outbound,
-                        &responder_config_dir,
-                        &stop,
-                    ),
+                    Ok(p) => {
+                        let authorizer = ActionAuthorizer::production();
+                        serve_connect_bus(
+                            &p,
+                            &store,
+                            &resp_roster,
+                            &outbound,
+                            &responder_config_dir,
+                            &authorizer,
+                            &stop,
+                        )
+                    }
                     Err(e) => {
                         warn!(error = %e, "kdc-host: opening Bus store for Connect responder")
                     }

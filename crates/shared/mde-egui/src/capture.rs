@@ -66,8 +66,14 @@ pub fn capture_ui_png(
     let height = (size.y * pixels_per_point).round().max(1.0) as u32;
 
     // ---- wgpu: instance -> adapter (accept a software adapter) -> device ----
+    // The live DRM seat owns an EGL/GL context in this process. Do not let an
+    // offscreen snapshot create a second wgpu GL context: Mesa's surfaceless
+    // path can replace or invalidate the current DRM context, and the next
+    // egui_glow texture upload then panics inside its unavoidable `unwrap()`.
+    // Vulkan is independent of the seat's EGL context; when it is unavailable
+    // the caller keeps the honest fallback plate instead of risking the shell.
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
+        backends: wgpu::Backends::VULKAN,
         ..Default::default()
     });
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {

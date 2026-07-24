@@ -32,6 +32,8 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+const MAX_SECRET_NAME_BYTES: usize = 192;
+
 /// The path (relative to the repo root) of the mesh secret-store helper.
 ///
 /// Single-sourced so a move only touches one line; matches the path the other
@@ -137,6 +139,15 @@ pub enum SecretStore {
 }
 
 impl SecretStore {
+    /// Validate a secret reference before it reaches either the replicated
+    /// helper or the local filesystem. References are a small, stable key
+    /// language (`namespace/name`); accepting arbitrary strings here would
+    /// make the CLI an authority over unrelated etcd keys and would also make
+    /// the local flat-file encoding ambiguous.
+    pub fn validate_name(name: &str) -> Result<(), String> {
+        validate_secret_name(name)
+    }
+
     /// Pick the store this node should use: the mesh `age`+etcd store when its
     /// helper script is found under `repo_dir` (the canonical, replicated path),
     /// else the local-AEAD fallback rooted under `workgroup_root`.
@@ -168,6 +179,7 @@ impl SecretStore {
     /// failure here is reported honestly (the caller surfaces it) rather than
     /// claiming the secret was distributed.
     pub fn put(&self, name: &str, plaintext: &str) -> Result<(), String> {
+        validate_secret_name(name)?;
         match self {
             Self::Mesh { repo_dir } => mesh_put(repo_dir, name, plaintext),
             Self::LocalAead { dir, key_path } => local_put(dir, key_path, name, plaintext),
@@ -185,11 +197,47 @@ impl SecretStore {
     /// ciphertext). Distinguished from `Ok(None)` so a real fault isn't silently
     /// read as "pending".
     pub fn get(&self, name: &str) -> Result<Option<String>, String> {
+        validate_secret_name(name)?;
         match self {
             Self::Mesh { repo_dir } => mesh_get(repo_dir, name),
             Self::LocalAead { dir, key_path } => local_get(dir, key_path, name),
         }
     }
+}
+
+/// The secret store is a keyed authority, not a general path/etcd namespace.
+/// Keep the accepted grammar deliberately narrower than shell or filesystem
+/// syntax. `@` is retained for SIP userinfo and `:` for XCP host:port refs.
+fn validate_secret_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("secret store: empty secret reference".to_string());
+    }
+    if name.len() > MAX_SECRET_NAME_BYTES {
+        return Err(format!(
+            "secret store: secret reference exceeds {MAX_SECRET_NAME_BYTES} bytes"
+        ));
+    }
+    if name.contains("__") {
+        return Err(
+            "secret store: secret reference cannot contain consecutive underscores".to_string(),
+        );
+    }
+    for (index, segment) in name.split('/').enumerate() {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return Err(format!(
+                "secret store: invalid empty/dot segment at position {index}"
+            ));
+        }
+        if !segment
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '@'))
+        {
+            return Err(format!(
+                "secret store: invalid character in secret reference '{name}'"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The deployed repo root holding the mesh secret-store helper.
@@ -303,6 +351,184 @@ fn local_secret_path(dir: &Path, name: &str) -> PathBuf {
     dir.join(format!("{}.age", name.replace('/', "__")))
 }
 
+/// Refuse symlink traversal for a configured secret-store path. Missing
+/// components are allowed because the caller creates the store directory, but
+/// every existing component must be a directory (except the final file).
+fn ensure_no_symlink_components(path: &Path) -> Result<(), String> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        if matches!(
+            component,
+            std::path::Component::CurDir | std::path::Component::ParentDir
+        ) {
+            return Err(format!(
+                "local secret store: unsafe path component in {}",
+                path.display()
+            ));
+        }
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(format!(
+                    "local secret store: refusing symlink component {}",
+                    current.display()
+                ));
+            }
+            Ok(meta) if current != path && !meta.is_dir() => {
+                return Err(format!(
+                    "local secret store: non-directory path component {}",
+                    current.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(format!(
+                    "local secret store: inspect {}: {e}",
+                    current.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn set_mode_exact(path: &Path, mode: u32) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).map_err(|e| {
+            format!(
+                "local secret store: set permissions {mode:o} on {}: {e}",
+                path.display()
+            )
+        })?;
+    }
+    #[cfg(not(unix))]
+    let _ = (path, mode);
+    Ok(())
+}
+
+/// Read a regular file through an `O_NOFOLLOW|O_CLOEXEC` descriptor on Unix.
+/// The metadata preflight remains useful for actionable diagnostics, while the
+/// descriptor closes the check/read race for replicated or operator-managed
+/// secret paths.
+fn read_regular_no_follow(path: &Path) -> std::io::Result<Vec<u8>> {
+    #[cfg(unix)]
+    {
+        use rustix::fs::{Mode, OFlags};
+        use std::io::Read as _;
+
+        let fd = rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        let mut file: std::fs::File = fd.into();
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "secret path is not a regular file",
+            ));
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::read(path)
+    }
+}
+
+/// Write an encrypted blob without following a target/temp symlink. The
+/// temporary file is created with `O_EXCL`, written and synced with the final
+/// mode, then atomically renamed into place; failed writes leave the old
+/// ciphertext untouched.
+fn write_secret_atomic(path: &Path, body: &[u8]) -> Result<(), String> {
+    let parent = path.parent().ok_or_else(|| {
+        format!(
+            "local secret store: secret path {} has no parent",
+            path.display()
+        )
+    })?;
+    ensure_no_symlink_components(parent)?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("local secret store: mkdir {}: {e}", parent.display()))?;
+    ensure_no_symlink_components(path)?;
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if !meta.is_file() {
+            return Err(format!(
+                "local secret store: target {} is not a regular file",
+                path.display()
+            ));
+        }
+    }
+
+    use rand::RngCore as _;
+    use std::io::Write as _;
+    let file_name = path.file_name().ok_or_else(|| {
+        format!(
+            "local secret store: secret path {} has no filename",
+            path.display()
+        )
+    })?;
+    let mut temp = None;
+    let mut file = None;
+    for _ in 0..16 {
+        let mut nonce = [0u8; 8];
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        let candidate = parent.join(format!(
+            ".{}.tmp-{:016x}",
+            file_name.to_string_lossy(),
+            u64::from_be_bytes(nonce)
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        match options.open(&candidate) {
+            Ok(opened) => {
+                temp = Some(candidate);
+                file = Some(opened);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(format!(
+                    "local secret store: create temporary file in {}: {e}",
+                    parent.display()
+                ));
+            }
+        }
+    }
+    let temp = temp.ok_or_else(|| {
+        format!(
+            "local secret store: unable to allocate a unique temporary file in {}",
+            parent.display()
+        )
+    })?;
+    let mut file = file.expect("temporary path and file are created together");
+    let result = (|| {
+        set_mode_exact(&temp, 0o600)?;
+        file.write_all(body)
+            .map_err(|e| format!("local secret store: write {}: {e}", temp.display()))?;
+        file.sync_all()
+            .map_err(|e| format!("local secret store: sync {}: {e}", temp.display()))?;
+        std::fs::rename(&temp, path)
+            .map_err(|e| format!("local secret store: rename into {}: {e}", path.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
 /// Derive the local-AEAD passphrase from the mesh age identity bytes. The
 /// identity is the same artifact gating the mesh store, so a node that can
 /// decrypt mesh secrets can decrypt these and vice-versa (same trust root). The
@@ -314,7 +540,8 @@ fn local_secret_path(dir: &Path, name: &str) -> PathBuf {
 /// key the local store, so we fail honestly rather than invent one.
 fn local_passphrase(key_path: &Path) -> Result<String, String> {
     use std::fmt::Write as _;
-    let bytes = std::fs::read(key_path).map_err(|e| {
+    ensure_no_symlink_components(key_path)?;
+    let bytes = read_regular_no_follow(key_path).map_err(|e| {
         format!(
             "local secret store: mesh age identity {} unreadable: {e}",
             key_path.display()
@@ -339,23 +566,35 @@ fn local_passphrase(key_path: &Path) -> Result<String, String> {
 /// Seal `plaintext` under the [`crate::ca::backup`] envelope and write the
 /// ciphertext file 0600 (it decrypts to the private key).
 fn local_put(dir: &Path, key_path: &Path, name: &str, plaintext: &str) -> Result<(), String> {
+    validate_secret_name(name)?;
     let passphrase = local_passphrase(key_path)?;
     let sealed = crate::ca::backup::seal_bytes(&passphrase, plaintext.as_bytes())
         .map_err(|e| format!("local secret store: seal: {e}"))?;
+    ensure_no_symlink_components(dir)?;
     std::fs::create_dir_all(dir)
         .map_err(|e| format!("local secret store: mkdir {}: {e}", dir.display()))?;
+    ensure_no_symlink_components(dir)?;
+    set_mode_exact(dir, 0o700)?;
     let path = local_secret_path(dir, name);
-    std::fs::write(&path, &sealed)
-        .map_err(|e| format!("local secret store: write {}: {e}", path.display()))?;
-    set_owner_only(&path);
-    Ok(())
+    write_secret_atomic(&path, &sealed)
 }
 
 /// Read + decrypt the ciphertext file. Missing file → `Ok(None)` (not
 /// distributed); a decrypt failure → `Err` (wrong key / tamper).
 fn local_get(dir: &Path, key_path: &Path, name: &str) -> Result<Option<String>, String> {
+    validate_secret_name(name)?;
     let path = local_secret_path(dir, name);
-    let sealed = match std::fs::read(&path) {
+    ensure_no_symlink_components(dir)?;
+    ensure_no_symlink_components(&path)?;
+    if let Ok(meta) = std::fs::symlink_metadata(&path) {
+        if !meta.is_file() {
+            return Err(format!(
+                "local secret store: target {} is not a regular file",
+                path.display()
+            ));
+        }
+    }
+    let sealed = match read_regular_no_follow(&path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("local secret store: read {}: {e}", path.display())),
@@ -366,17 +605,6 @@ fn local_get(dir: &Path, key_path: &Path, name: &str) -> Result<Option<String>, 
     String::from_utf8(plain)
         .map(Some)
         .map_err(|e| format!("local secret store: secret not utf-8: {e}"))
-}
-
-/// Best-effort 0600 on a secret file (Unix).
-fn set_owner_only(path: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
-    #[cfg(not(unix))]
-    let _ = path;
 }
 
 #[cfg(test)]
@@ -427,6 +655,19 @@ mod tests {
         // namespace (a `/`, a space) are dropped.
         assert_eq!(xcp_creds_ref("  10.0.0.5 "), "xcp/10.0.0.5");
         assert_eq!(xcp_creds_ref("a/b c"), "xcp/abc");
+    }
+
+    #[test]
+    fn secret_refs_reject_namespace_escape_and_flat_file_collisions() {
+        for invalid in ["", "/vpn", "vpn/", "vpn//key", "vpn/../key", "vpn/key\n"] {
+            assert!(
+                SecretStore::validate_name(invalid).is_err(),
+                "invalid secret ref was accepted: {invalid:?}"
+            );
+        }
+        assert!(SecretStore::validate_name("sip/bob@corp").is_ok());
+        assert!(SecretStore::validate_name("xcp/dom0.lab.local:22").is_ok());
+        assert!(SecretStore::validate_name("vpn/a__b").is_err());
     }
 
     #[test]
@@ -521,6 +762,55 @@ mod tests {
             key_path: tmp.path().join("does-not-exist"),
         };
         assert!(store.put("vpn/mvpn-z", "x").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_ciphertext_is_owner_only_and_store_dir_is_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (_t, store) = local_store();
+        let name = creds_ref_for("mvpn-perms");
+        store.put(&name, "secret").unwrap();
+        let SecretStore::LocalAead { dir, .. } = &store else {
+            unreachable!()
+        };
+        assert_eq!(
+            std::fs::metadata(dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(local_secret_path(dir, &name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_put_refuses_a_symlink_target_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let (tmp, store) = local_store();
+        let SecretStore::LocalAead { dir, .. } = &store else {
+            unreachable!()
+        };
+        std::fs::create_dir_all(dir).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::write(&outside, b"sentinel").unwrap();
+        let target = local_secret_path(dir, "vpn/mvpn-symlink");
+        symlink(&outside, &target).unwrap();
+
+        let error = store.put("vpn/mvpn-symlink", "must-not-write").unwrap_err();
+        assert!(error.contains("symlink"), "unexpected error: {error}");
+        assert_eq!(std::fs::read(&outside).unwrap(), b"sentinel");
+        assert!(std::fs::symlink_metadata(&target)
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     #[test]

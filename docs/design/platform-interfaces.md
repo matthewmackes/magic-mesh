@@ -96,15 +96,17 @@ azure accent `#5B8CFF`, the 8 categorical group accents, Carbon glyphs.
 
 ### 2.2 Home — the springboard (Q5–Q9)
 
-- **Q5 — Persistent home.** A paged icon grid is the **base layer**: the seat
-  boots to it, and leaving any app lands on it. It draws over the existing
-  wallpaper/backdrop. The collapsed "session EmptyState" is retired.
+- **Q5 — Persistent home.** One untitled all-icons grid is the **base layer**:
+  the seat boots to it, and leaving any app lands on it. It draws over the
+  existing wallpaper/backdrop. The collapsed "session EmptyState" is retired.
   *(Designing for iPadOS › The Home Screen)*
-- **Q8 — Pages ARE the groups.** Home pages are generated from the 8
+- **Q8 — One desktop, taxonomy accents.** The single desktop flattens the 8
   `LAUNCHER_GROUPS` (Mesh Control · Desktop & Session · Media · Files & Data ·
-  Web · Developer Tools · Comms · System), one page per group, in taxonomy
-  order. **No free arrangement, no folders, no arrangement state.** The
-  compile-time "every Surface exactly once" guard becomes the page guard.
+  Web · Developer Tools · Comms · System) into one canonical icon list. Groups
+  remain the source of tile accent colors and search grouping; they are not
+  separate pages. **No free arrangement, no folders, no arrangement state.**
+  The compile-time "every Surface exactly once" guard remains the desktop
+  catalog guard.
 - **Q6/Q7/Q9 — No widgets, no live-data cards.** Home is pure icons. Live data
   lives in the surfaces that own it (Maps, Workbench) — nothing new.
 - **Q10 — No dock.** (Confirms front-door Q86/89.) Pinned-app state
@@ -112,7 +114,8 @@ azure accent `#5B8CFF`, the 8 categorical group accents, Carbon glyphs.
 - Tile treatment (Q22): rounded-rect plate, per-group accent background, white
   Carbon glyph, label beneath. *(App Icons — as principles: one silhouette
   language, no photorealism)*
-- Page indicator dots; swipe / Page keys / click-drag to page.
+- No page indicator dots or page swipe; Tab/arrow keys and click open the
+  complete list directly.
 
 ### 2.3 Persistent chrome (Q11–Q12)
 
@@ -156,7 +159,8 @@ azure accent `#5B8CFF`, the 8 categorical group accents, Carbon glyphs.
 - **Q17/Q18 — Full-screen only.** One surface per frame (the engine's native
   model). No Split View, no Slide Over.
 - **Q19 — Shared nav components.** `NavigationBar` (title + back + actions),
-  `Toolbar`, `Sidebar` in `mde-egui`; **all 17 surfaces adopt** (farm sweep).
+  `Toolbar`, `Sidebar` in `mde-egui`; **all canonical surfaces adopt** (farm
+  sweep).
   *(Navigation Bars; Toolbars; Sidebars)*
 - **Q20 — Sheets + popovers everywhere.** Shared `Sheet` (detents,
   drag-to-dismiss) and `Popover`; all surface dialogs migrate in the sweep.
@@ -168,8 +172,8 @@ azure accent `#5B8CFF`, the 8 categorical group accents, Carbon glyphs.
   dark scrims); **no live blur** on the GLES/DRM path. *(Materials — honest to
   the render budget)*
 - **Q23 — Radii ladder** ~6/10/16/26 with a concentric-nesting rule.
-- **Q24 — Full HIG transitions:** zoom-from-tile open/close, interruptible
-  spring page swipes, sheet detent physics — on the existing MOTION-DRM spring
+- **Q24 — Full HIG transitions:** zoom-from-tile open/close, the navigation-bar
+  slide/melt morph, and sheet detent physics — on the existing MOTION-DRM spring
   substrate. Reduced-motion respected throughout. *(Motion)*
 
 ### 2.7 System surfaces (Q25–Q28, Q50)
@@ -243,9 +247,10 @@ bindings (`CarAction`) re-map accordingly; Music gains media-transport keys.
 ## 4. Acceptance (Q48)
 
 - **Construct (WL-UX-006):** screenshot/pixel proof on the `.15` DRM seat —
-  springboard pages (all 8), status bar, Control Center, Notification Center,
-  Spotlight, app switcher with real snapshots, zoom transitions, VDI
-  full-resolution with auto-hidden bar. Operator visual signoff.
+  the untitled all-icons Desktop, status bar, Control Center, Notification
+  Center, Spotlight, app switcher with real snapshots, zoom and navigation-bar
+  transitions, VDI full-resolution with auto-hidden bar. Operator visual
+  signoff.
 - **Car (WL-UX-007):** live proof with the MG90 vehicle mirror online —
   dashboard cards live, instrument strip **fresh on every Car screen**,
   soft in-motion limits engage above threshold, one-tap toggle. Operator

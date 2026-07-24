@@ -229,6 +229,17 @@ fn author_edit_within_window_ok_late_edit_denied_nonauthor_denied() {
         1050,
     )
     .expect("add bob");
+    a.apply(
+        &CollabCommand::AddMember {
+            space,
+            actor: ActorId::new("carol"),
+            role: SpaceRole::Member,
+        },
+        &sa,
+        &mut ia,
+        1075,
+    )
+    .expect("add carol");
     let target = a
         .apply(
             &CollabCommand::SendMessage {
@@ -963,6 +974,43 @@ fn an_invalid_signature_event_is_dropped() {
     );
 }
 
+#[test]
+fn malformed_presence_cannot_impersonate_another_envelope_actor() {
+    use crate::signer::EventSigner;
+
+    let alice = ActorId::new("alice");
+    let bob = ActorId::new("bob");
+    let mut env = CollabEventEnvelope::new(
+        EventId::from_uuid(Uuid::from_u128(43)),
+        SpaceId::nil(),
+        alice,
+        ActorClock::at(3_100, 0),
+        3_100,
+        CollabEventKind::PresenceChanged {
+            actor: bob,
+            presence: PresenceState::Dnd,
+            status: Some("spoofed".into()),
+        },
+    );
+    // The envelope is cryptographically valid; the malformed cross-actor
+    // payload is the condition the projection must fail soft on.
+    sig(1).sign(&mut env);
+
+    let mut projection = Projection::open_in_memory().expect("projection");
+    projection
+        .project(&[env])
+        .expect("project malformed presence");
+
+    assert!(
+        projection
+            .presence_board()
+            .expect("presence board")
+            .members
+            .is_empty(),
+        "a signed event claiming another actor must not create a presence row"
+    );
+}
+
 // ---- tombstones -----------------------------------------------------------
 
 #[test]
@@ -1361,6 +1409,84 @@ fn start_call_flows_into_the_call_state_projection() {
             .iter()
             .any(|p| p.actor == ActorId::new("bob") && p.state == CallParticipantState::Connected),
         "AnswerCall connects bob in the projection"
+    );
+
+    // Bob's mute is a signed event, not a media-plane-only no-op. The
+    // projection exposes the converged read-model bit after replication.
+    let muted = b
+        .apply(
+            &CollabCommand::SetCallMuted { call, muted: true },
+            &sb,
+            &mut ib,
+            1250,
+        )
+        .expect("connected member mutes");
+    assert_eq!(muted.len(), 1);
+    assert!(matches!(
+        muted[0].kind,
+        CollabEventKind::CallParticipantMuted {
+            call: c,
+            actor: ref who,
+            muted: true
+        } if c == call && who == &ActorId::new("bob")
+    ));
+    a.merge(b.all_events()).expect("alice syncs bob mute");
+    let cs = a.projection().call_state(Some(space)).expect("call_state");
+    assert!(cs.active[0]
+        .participants
+        .iter()
+        .any(|p| p.actor == ActorId::new("bob") && p.muted));
+
+    let dtmf = b
+        .apply(
+            &CollabCommand::SendDtmf { call, digit: '5' },
+            &sb,
+            &mut ib,
+            1255,
+        )
+        .expect("connected member sends DTMF");
+    assert!(dtmf.is_empty(), "DTMF remains ephemeral");
+
+    // A present member who is not a call participant cannot mint a shared mute
+    // fact. A non-member who injects a call-participant event is also denied.
+    let mut carol = engine("carol");
+    carol.merge(a.all_events()).expect("carol syncs");
+    let denied = carol.apply(
+        &CollabCommand::SetCallMuted { call, muted: true },
+        &sig(3),
+        &mut SeqIds::new(2_000),
+        1260,
+    );
+    assert!(matches!(denied, Err(CollabError::CallNotFound(c)) if c == call));
+
+    let mut dave = engine("dave");
+    dave.merge(a.all_events()).expect("dave syncs");
+    dave.apply(
+        &CollabCommand::AnswerCall { call },
+        &sig(4),
+        &mut SeqIds::new(3_000),
+        1265,
+    )
+    .expect("test participant injection");
+    let denied = dave.apply(
+        &CollabCommand::SetCallMuted { call, muted: true },
+        &sig(4),
+        &mut SeqIds::new(3_100),
+        1270,
+    );
+    assert!(matches!(denied, Err(CollabError::NotMember { space: s, .. }) if s == space));
+
+    // A fresh engine folding the same set in a different arrival order gets
+    // the same SQLite rows, including the mute bit.
+    let expected = a.projection().dump_tables().expect("dump projection");
+    let mut replay = engine("replay");
+    replay
+        .merge(shuffle(&a.all_events(), 0xC011_AFE))
+        .expect("replay shuffled call log");
+    assert_eq!(
+        replay.projection().dump_tables().expect("dump replay"),
+        expected,
+        "call mute projection converges independent of arrival order"
     );
 
     // Alice hangs up while bob is still Connected → the call stays active.

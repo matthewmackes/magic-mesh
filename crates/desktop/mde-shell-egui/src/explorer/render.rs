@@ -15,6 +15,7 @@
 
 use super::*;
 use mde_egui::style::Elevation;
+use mde_egui::TypographyRole;
 
 const EXPLORER_TOOLTIP_MAX_W: f32 = Style::SP_XL * 12.0;
 
@@ -29,7 +30,10 @@ pub(super) fn explorer_tooltip(ui: &mut egui::Ui, text: &str) {
         .show(ui, |ui| {
             ui.set_max_width(EXPLORER_TOOLTIP_MAX_W);
             ui.add(
-                egui::Label::new(RichText::new(text).size(Style::SMALL).color(Style::TEXT)).wrap(),
+                egui::Label::new(
+                    Style::typography_text(text, TypographyRole::Caption).color(Style::TEXT),
+                )
+                .wrap(),
             );
         });
 }
@@ -130,8 +134,7 @@ pub(super) fn chip(
     accent: Color32,
     rest: Color32,
 ) -> bool {
-    let text = RichText::new(label)
-        .size(Style::SMALL)
+    let text = Style::typography_text(label, TypographyRole::Caption)
         .color(if active { Style::BG } else { rest });
     let button = egui::Button::new(text)
         .fill(if active { accent } else { Style::SURFACE })
@@ -163,21 +166,20 @@ pub(super) fn search_hit_row(ui: &mut egui::Ui, unit: &Unit, selected: bool) -> 
                 cat.accent(),
             );
             ui.label(
-                RichText::new(&unit.name)
-                    .size(Style::BODY)
-                    .color(Style::TEXT),
+                Style::typography_text(&unit.name, TypographyRole::Body).color(Style::TEXT),
             );
             ui.label(
-                RichText::new(unit.kind.label())
-                    .size(Style::SMALL)
+                Style::typography_text(unit.kind.label(), TypographyRole::Caption)
                     .color(cat.accent()),
             );
             ui.label(
-                RichText::new(reachability_line(
-                    &unit.reachability,
-                    unit.address.as_deref(),
-                ))
-                .size(Style::SMALL)
+                Style::typography_text(
+                    reachability_line(
+                        &unit.reachability,
+                        unit.address.as_deref(),
+                    ),
+                    TypographyRole::Caption,
+                )
                 .color(Style::TEXT_DIM),
             );
         })
@@ -214,7 +216,7 @@ pub(super) fn edge_chip(ui: &mut egui::Ui, chip: &ChipItem) -> bool {
     let accent = chip.kind.category().accent();
     let galley = ui.painter().layout_no_wrap(
         truncate(&chip.name, 18),
-        FontId::proportional(Style::SMALL),
+        Style::typography_font(TypographyRole::Caption),
         Style::TEXT,
     );
     let glyph = Style::SP_M;
@@ -275,9 +277,7 @@ pub(super) fn filmstrip_divider(ui: &mut egui::Ui, cluster: Cluster) {
     ui.vertical(|ui| {
         ui.add_space(Style::SP_XS);
         ui.label(
-            RichText::new(cluster.label())
-                .size(Style::SMALL)
-                .color(cluster.accent()),
+            Style::typography_text(cluster.label(), TypographyRole::Caption).color(cluster.accent()),
         );
         let (rect, _) =
             ui.allocate_exact_size(Vec2::new(Style::SP_XS, THUMB_H * 0.6), Sense::hover());
@@ -362,7 +362,7 @@ pub(super) fn thumbnail(
                 egui::pos2(rect.center().x, rect.max.y - Style::SP_S),
                 Align2::CENTER_BOTTOM,
                 name,
-                FontId::proportional(Style::SMALL),
+                Style::typography_font(TypographyRole::Caption),
                 Style::TEXT,
             );
         })
@@ -487,8 +487,7 @@ pub(super) fn health_dot(ui: &mut egui::Ui, color: Color32, count: usize) {
         ui.painter()
             .circle_filled(rect.center(), Style::SP_XS * 0.9, color);
         ui.label(
-            RichText::new(count.to_string())
-                .size(Style::SMALL)
+            Style::typography_text(count.to_string(), TypographyRole::Caption)
                 .color(Style::TEXT_DIM),
         );
     });
@@ -501,14 +500,12 @@ pub(super) fn mosaic_cluster_header(ui: &mut egui::Ui, cluster: Cluster, count: 
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = Style::SP_S;
         ui.label(
-            RichText::new(cluster.label())
-                .size(Style::BODY)
+            Style::typography_text(cluster.label(), TypographyRole::Body)
                 .strong()
                 .color(cluster.accent()),
         );
         ui.label(
-            RichText::new(count.to_string())
-                .size(Style::SMALL)
+            Style::typography_text(count.to_string(), TypographyRole::Caption)
                 .color(Style::TEXT_DIM),
         );
     });
@@ -582,14 +579,14 @@ pub(super) fn mosaic_tile(
         egui::pos2(rect.center().x, rect.max.y - Style::SP_M),
         Align2::CENTER_BOTTOM,
         truncate(&unit.name, 14),
-        FontId::proportional(Style::BODY),
+        Style::typography_font(TypographyRole::Body),
         Style::TEXT,
     );
     painter.text(
         egui::pos2(rect.center().x, rect.max.y - Style::SP_XS),
         Align2::CENTER_BOTTOM,
         unit.kind.label(),
-        FontId::proportional(Style::SMALL),
+        Style::typography_font(TypographyRole::Caption),
         cat.accent(),
     );
     // The pin marker (O9) in the tile's top-left corner.
@@ -645,9 +642,7 @@ pub(super) fn ipam_name_budget(width: f32) -> usize {
 
 /// A dim small-face `RichText` for a table caption / column header.
 pub(super) fn ipam_dim(text: &str) -> RichText {
-    RichText::new(text)
-        .size(Style::SMALL)
-        .color(Style::TEXT_DIM)
+    Style::typography_text(text, TypographyRole::Caption).color(Style::TEXT_DIM)
 }
 
 /// A fixed-width table cell holding one left-aligned label (keeps the columns
@@ -682,8 +677,7 @@ pub(super) fn ipam_prefix_header(ui: &mut egui::Ui, p: &IpamPrefix) {
                     .color(Style::TEXT),
             );
             ui.label(
-                RichText::new(p.category.label())
-                    .size(Style::SMALL)
+                Style::typography_text(p.category.label(), TypographyRole::Caption)
                     .color(accent)
                     .background_color(Style::SURFACE),
             );
@@ -700,9 +694,8 @@ pub(super) fn ipam_prefix_header(ui: &mut egui::Ui, p: &IpamPrefix) {
                     .find(|o| o.addr == gw)
                     .map_or_else(|| format!("gw {gw}"), |o| format!("gw {gw} · {}", o.name));
                 ui.label(
-                    RichText::new(gw_txt)
+                    Style::typography_text(gw_txt, TypographyRole::Caption)
                         .monospace()
-                        .size(Style::SMALL)
                         .color(Style::TEXT_DIM),
                 );
                 ui.add_space(Style::SP_M);
@@ -765,16 +758,16 @@ pub(super) fn ipam_address_row(
             ipam_cell(
                 ui,
                 name_w,
-                RichText::new(truncate(&occ.name, ipam_name_budget(name_w)))
-                    .size(Style::BODY)
-                    .color(Style::ACCENT_HI),
+                Style::typography_text(
+                    truncate(&occ.name, ipam_name_budget(name_w)),
+                    TypographyRole::Body,
+                )
+                .color(Style::ACCENT_HI),
             );
             ipam_cell(
                 ui,
                 IPAM_TYPE_COL,
-                RichText::new(occ.kind.label())
-                    .size(Style::SMALL)
-                    .color(accent),
+                Style::typography_text(occ.kind.label(), TypographyRole::Caption).color(accent),
             );
         })
         .response
@@ -861,8 +854,7 @@ pub(super) fn hero_card(
 
     // Name + type badge + reachability (#10).
     ui.label(
-        RichText::new(&unit.name)
-            .size(HERO_TITLE_FS)
+        Style::typography_text(&unit.name, TypographyRole::Display)
             .strong()
             .color(Style::TEXT),
     );
@@ -872,17 +864,15 @@ pub(super) fn hero_card(
         // Centre the badge row within the top-down-centre layout.
         ui.add_space(ui.available_width() * 0.5 - Style::SP_XL * 2.0);
         ui.label(
-            RichText::new(unit.kind.label())
-                .size(Style::SMALL)
+            Style::typography_text(unit.kind.label(), TypographyRole::Caption)
                 .color(cat.accent())
                 .background_color(Style::SURFACE_HI),
         );
         ui.label(
-            RichText::new(reachability_line(
-                &unit.reachability,
-                unit.address.as_deref(),
-            ))
-            .size(Style::BODY)
+            Style::typography_text(
+                reachability_line(&unit.reachability, unit.address.as_deref()),
+                TypographyRole::Body,
+            )
             .color(Style::TEXT_DIM),
         );
     });
@@ -915,9 +905,11 @@ pub(super) fn hero_card(
         let tracked = fmt_duration(unit.last_seen_ms.saturating_sub(unit.first_seen_ms) / 1_000);
         ui.add_space(Style::SP_M);
         ui.label(
-            RichText::new(format!("Last seen {ago} · tracked {tracked}"))
-                .size(Style::SMALL)
-                .color(Style::TEXT_DIM),
+            Style::typography_text(
+                format!("Last seen {ago} · tracked {tracked}"),
+                TypographyRole::Caption,
+            )
+            .color(Style::TEXT_DIM),
         );
     }
 }
@@ -947,8 +939,7 @@ pub(super) fn hero_telemetry(ui: &mut egui::Ui, unit: &Unit, history: Option<&Un
     let accent = unit.kind.category().accent();
     if let Some(health) = unit.health {
         ui.label(
-            RichText::new(health_label(health))
-                .size(Style::BODY)
+            Style::typography_text(health_label(health), TypographyRole::Body)
                 .color(health.ring_color()),
         );
     }
@@ -965,8 +956,7 @@ pub(super) fn hero_telemetry(ui: &mut egui::Ui, unit: &Unit, history: Option<&Un
         }
         if !facts.is_empty() {
             ui.label(
-                RichText::new(facts.join(" · "))
-                    .size(Style::SMALL)
+                Style::typography_text(facts.join(" · "), TypographyRole::Caption)
                     .color(Style::TEXT_DIM),
             );
         }
@@ -1059,14 +1049,12 @@ pub(super) fn metric_cell(
             let has_value = value.is_some();
             match value {
                 Some(v) => ui.label(
-                    RichText::new(v)
-                        .size(Style::BODY)
+                    Style::typography_text(v, TypographyRole::Body)
                         .strong()
                         .color(Style::TEXT),
                 ),
                 None => ui.label(
-                    RichText::new("—")
-                        .size(Style::BODY)
+                    Style::typography_text("—", TypographyRole::Body)
                         .strong()
                         .color(Style::TEXT_DIM),
                 ),
@@ -1081,9 +1069,7 @@ pub(super) fn metric_cell(
                 (None, false) => spark_note(ui, "no source"),
             }
             ui.label(
-                RichText::new(caption)
-                    .size(Style::SMALL)
-                    .color(Style::TEXT_DIM),
+                Style::typography_text(caption, TypographyRole::Caption).color(Style::TEXT_DIM),
             );
         },
     );
@@ -1139,7 +1125,7 @@ pub(super) fn spark_note(ui: &mut egui::Ui, text: &str) {
         rect.center(),
         Align2::CENTER_CENTER,
         text,
-        FontId::proportional(Style::SMALL),
+        Style::typography_font(TypographyRole::Caption),
         Style::TEXT_DIM,
     );
 }

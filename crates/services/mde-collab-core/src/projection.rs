@@ -20,6 +20,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+use mde_collab_types::envelope::SCHEMA_VERSION;
 use mde_collab_types::event::CollabEventKind;
 use mde_collab_types::ids::{
     CallId, DocumentId, EventId, FileRefId, SpaceId, ThreadId, TransferId,
@@ -35,7 +36,7 @@ use mde_collab_types::value::{
     PresenceState, TransferDirection, TransferMethod, TransferState,
 };
 use mde_collab_types::{ActorClock, ActorId, CollabEventEnvelope, SpaceKind, SpaceRole};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::domain::sort_key;
 use crate::error::{CollabError, Result};
@@ -93,6 +94,17 @@ impl Projection {
     /// every touched space (and the global presence board) from the canonical
     /// event order, all in one transaction.
     pub fn project(&mut self, events: &[CollabEventEnvelope]) -> Result<()> {
+        // `Projection` is a public read-side boundary, so do not rely solely on
+        // `CollabEngine::merge` to have checked its inputs.  Without this gate a
+        // direct caller could persist an unsigned or future-schema envelope and
+        // make replay expose facts that never crossed the signed-event boundary.
+        // Validate the complete batch before opening the transaction so a bad
+        // event cannot leave a partially projected offline replay behind.
+        for env in events {
+            if env.schema_version != SCHEMA_VERSION || !env.verify() {
+                return Err(CollabError::InvalidEvent(env.event_id));
+            }
+        }
         let tx = self.conn.transaction()?;
         let mut touched: BTreeSet<SpaceId> = BTreeSet::new();
         let mut presence_touched = false;
@@ -187,14 +199,19 @@ impl Projection {
 
     /// A thread's root message + ordered replies + resolved flag.
     pub fn thread_timeline(&self, space: SpaceId, thread: ThreadId) -> Result<ThreadTimeline> {
-        let (root_event_id, resolved): (String, i64) = self.conn.query_row(
-            "SELECT root_event_id, resolved FROM threads WHERE thread_id = ?1",
-            params![thread.to_string()],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
+        let (root_event_id, resolved): (String, i64) = self
+            .conn
+            .query_row(
+                "SELECT root_event_id, resolved FROM threads \
+             WHERE space_id = ?1 AND thread_id = ?2",
+                params![space.to_string(), thread.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+            .ok_or(CollabError::ThreadNotFound(thread))?;
         let root_id = parse_event(&root_event_id)?;
         let root = self
-            .message_by_id(root_id)?
+            .message_by_id(space, root_id)?
             .ok_or(CollabError::MessageNotFound(root_id))?;
         let replies = self.messages_where(space, Some(thread))?;
         Ok(ThreadTimeline {
@@ -590,28 +607,29 @@ impl Projection {
                 // time. The honest default is Sent (published; reachability
                 // unknown), never a fabricated read receipt.
                 delivery: DeliveryState::Sent,
-                reply_count: self.reply_count(id)?,
+                reply_count: self.reply_count(space, id)?,
             });
         }
         Ok(out)
     }
 
-    fn reply_count(&self, root: EventId) -> Result<u32> {
+    fn reply_count(&self, space: SpaceId, root: EventId) -> Result<u32> {
         let n: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM messages WHERE thread_id IN \
-             (SELECT thread_id FROM threads WHERE root_event_id = ?1)",
-            params![root.to_string()],
+            "SELECT COUNT(*) FROM messages WHERE space_id = ?1 AND thread_id IN \
+             (SELECT thread_id FROM threads WHERE space_id = ?1 AND root_event_id = ?2)",
+            params![space.to_string(), root.to_string()],
             |r| r.get(0),
         )?;
         Ok(u32::try_from(n).unwrap_or(0))
     }
 
-    fn message_by_id(&self, id: EventId) -> Result<Option<MessageView>> {
+    fn message_by_id(&self, space: SpaceId, id: EventId) -> Result<Option<MessageView>> {
         let row = self
             .conn
             .query_row(
-                "SELECT author, created_ms, body, edited, deleted FROM messages WHERE event_id = ?1",
-                params![id.to_string()],
+                "SELECT author, created_ms, body, edited, deleted FROM messages \
+                 WHERE space_id = ?1 AND event_id = ?2",
+                params![space.to_string(), id.to_string()],
                 |r| {
                     Ok((
                         r.get::<_, String>(0)?,
@@ -634,7 +652,7 @@ impl Projection {
             edited: edited != 0,
             deleted: deleted != 0,
             delivery: DeliveryState::Sent,
-            reply_count: self.reply_count(id)?,
+            reply_count: self.reply_count(space, id)?,
         }))
     }
 
@@ -723,6 +741,12 @@ fn rebuild_presence(tx: &rusqlite::Transaction<'_>) -> Result<()> {
             status,
         } = &env.kind
         {
+            // Presence is self-authored.  The envelope author is covered by
+            // the signature/trust boundary; do not let a malformed event
+            // claim a different member in the global board.
+            if actor != &env.actor {
+                continue;
+            }
             latest.insert(actor.0.clone(), (*presence, status.clone(), env.clock));
         }
     }
@@ -839,6 +863,9 @@ struct CallRow {
     started_ms: i64,
     ended: bool,
     participants: BTreeMap<String, (CallParticipantState, bool)>,
+    /// Kept separately so a valid mute event is not lost if its lifecycle
+    /// event is observed earlier/later in a merged canonical replay.
+    muted: BTreeMap<String, bool>,
     clock: ActorClock,
 }
 
@@ -1082,14 +1109,30 @@ impl SpaceFold {
                         started_ms: env.created_unix_ms,
                         ended: false,
                         participants,
+                        muted: BTreeMap::from([(initiator.0.clone(), false)]),
                         clock: env.clock,
                     },
                 );
             }
             CollabEventKind::CallParticipantChanged { call, actor, state } => {
+                // Participant lifecycle changes are self-authored.  A signed
+                // event whose payload names another actor must not let the
+                // author impersonate that participant during replay.
+                if actor != &env.actor {
+                    return;
+                }
                 if let Some(c) = self.calls.get_mut(call) {
-                    let muted = c.participants.get(&actor.0).is_some_and(|p| p.1);
+                    let muted = c.muted.get(&actor.0).copied().unwrap_or(false);
                     c.participants.insert(actor.0.clone(), (*state, muted));
+                    c.muted.entry(actor.0.clone()).or_insert(muted);
+                }
+            }
+            CollabEventKind::CallParticipantMuted { call, actor, muted } => {
+                if let Some(c) = self.calls.get_mut(call) {
+                    c.muted.insert(actor.0.clone(), *muted);
+                    if let Some(participant) = c.participants.get_mut(&actor.0) {
+                        participant.1 = *muted;
+                    }
                 }
             }
             CollabEventKind::CallEnded { call, .. } => {
@@ -1371,4 +1414,309 @@ fn parse_call(s: &str) -> Result<CallId> {
 
 fn summarize(kind_tag: &str) -> String {
     kind_tag.replace('_', " ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Projection;
+    use crate::error::CollabError;
+    use crate::signer::{Ed25519Signer, EventSigner};
+    use mde_collab_types::envelope::SCHEMA_VERSION;
+    use mde_collab_types::event::CollabEventKind;
+    use mde_collab_types::ids::{EventId, SpaceId, ThreadId};
+    use mde_collab_types::value::MessageBody;
+    use mde_collab_types::{ActorClock, ActorId, CollabEventEnvelope, SpaceKind, SpaceRole};
+    use uuid::Uuid;
+
+    fn event_id(value: u128) -> EventId {
+        EventId::from_uuid(Uuid::from_u128(value))
+    }
+
+    fn space_id(value: u128) -> SpaceId {
+        SpaceId::from_uuid(Uuid::from_u128(value))
+    }
+
+    fn thread_id(value: u128) -> ThreadId {
+        ThreadId::from_uuid(Uuid::from_u128(value))
+    }
+
+    fn event(id: u128, space: SpaceId, clock: u64, kind: CollabEventKind) -> CollabEventEnvelope {
+        let mut event = CollabEventEnvelope::new(
+            event_id(id),
+            space,
+            ActorId::new("alice"),
+            ActorClock::at(clock, 0),
+            i64::try_from(clock).expect("test clock fits"),
+            kind,
+        );
+        Ed25519Signer::from_seed([1; 32]).sign(&mut event);
+        event
+    }
+
+    fn space_setup(space: SpaceId, name: &str, start: u128) -> Vec<CollabEventEnvelope> {
+        vec![
+            event(
+                start,
+                space,
+                1,
+                CollabEventKind::SpaceCreated {
+                    kind: SpaceKind::Team,
+                    name: name.to_owned(),
+                },
+            ),
+            event(
+                start + 1,
+                space,
+                2,
+                CollabEventKind::MemberJoined {
+                    actor: ActorId::new("alice"),
+                    role: SpaceRole::Owner,
+                },
+            ),
+        ]
+    }
+
+    #[test]
+    fn thread_timeline_returns_ordered_replies_and_deleted_root() {
+        let space = space_id(1);
+        let root = event_id(12);
+        let thread = thread_id(4);
+        let mut events = space_setup(space, "ops", 10);
+        events.extend([
+            event(
+                12,
+                space,
+                3,
+                CollabEventKind::MessagePosted {
+                    body: MessageBody::new("root"),
+                    thread: None,
+                },
+            ),
+            event(
+                13,
+                space,
+                4,
+                CollabEventKind::ThreadStarted {
+                    thread,
+                    root,
+                    title: Some("follow-up".into()),
+                },
+            ),
+            event(
+                14,
+                space,
+                5,
+                CollabEventKind::MessagePosted {
+                    body: MessageBody::new("first"),
+                    thread: Some(thread),
+                },
+            ),
+            event(
+                15,
+                space,
+                6,
+                CollabEventKind::MessagePosted {
+                    body: MessageBody::new("second"),
+                    thread: Some(thread),
+                },
+            ),
+            event(
+                16,
+                space,
+                7,
+                CollabEventKind::MessageDeleted { target: root },
+            ),
+            event(17, space, 8, CollabEventKind::ThreadResolved { thread }),
+        ]);
+
+        let mut projection = Projection::open_in_memory().expect("open projection");
+        projection.project(&events).expect("project thread events");
+
+        let timeline = projection
+            .thread_timeline(space, thread)
+            .expect("thread timeline");
+        assert!(timeline.resolved);
+        assert!(timeline.root.deleted);
+        assert_eq!(timeline.root.body, "");
+        assert_eq!(timeline.root.reply_count, 2);
+        assert_eq!(
+            timeline
+                .replies
+                .iter()
+                .map(|message| message.body.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        assert!(
+            timeline
+                .replies
+                .iter()
+                .all(|message| message.reply_count == 0)
+        );
+
+        let main = projection
+            .conversation_timeline(space, None)
+            .expect("main timeline");
+        assert_eq!(main.messages.len(), 1);
+        assert_eq!(main.messages[0].event_id, root);
+        assert_eq!(main.messages[0].reply_count, 2);
+    }
+
+    #[test]
+    fn thread_lookup_and_root_lookup_are_scoped_to_the_requested_space() {
+        let first_space = space_id(20);
+        let second_space = space_id(21);
+        let root = event_id(22);
+        let first_thread = thread_id(23);
+        let second_thread = thread_id(24);
+        let mut events = space_setup(first_space, "first", 30);
+        events.extend([
+            event(
+                32,
+                first_space,
+                3,
+                CollabEventKind::MessagePosted {
+                    body: MessageBody::new("first root"),
+                    thread: None,
+                },
+            ),
+            event(
+                33,
+                first_space,
+                4,
+                CollabEventKind::ThreadStarted {
+                    thread: first_thread,
+                    root,
+                    title: None,
+                },
+            ),
+        ]);
+        events.extend(space_setup(second_space, "second", 40));
+        events.push(event(
+            42,
+            second_space,
+            5,
+            CollabEventKind::ThreadStarted {
+                thread: second_thread,
+                root,
+                title: None,
+            },
+        ));
+
+        let mut projection = Projection::open_in_memory().expect("open projection");
+        projection
+            .project(&events)
+            .expect("project cross-space events");
+
+        assert!(matches!(
+            projection.thread_timeline(second_space, first_thread),
+            Err(CollabError::ThreadNotFound(thread)) if thread == first_thread
+        ));
+        assert!(matches!(
+            projection.thread_timeline(second_space, second_thread),
+            Err(CollabError::MessageNotFound(message)) if message == root
+        ));
+    }
+
+    #[test]
+    fn projection_rejects_unsigned_or_future_schema_batches_atomically() {
+        let space = space_id(27);
+        let valid = event(
+            28,
+            space,
+            1,
+            CollabEventKind::SpaceCreated {
+                kind: SpaceKind::Team,
+                name: "signed".into(),
+            },
+        );
+        let unsigned = CollabEventEnvelope::new(
+            event_id(29),
+            space,
+            ActorId::new("alice"),
+            ActorClock::at(2, 0),
+            2,
+            CollabEventKind::SpaceRenamed {
+                name: "should not land".into(),
+            },
+        );
+        // Keep this envelope unsigned: the projection must reject it before
+        // accepting the otherwise-valid event in the same batch.
+        assert!(!unsigned.verify());
+
+        let mut projection = Projection::open_in_memory().expect("open projection");
+        let before = projection.dump_tables().expect("empty dump");
+        assert!(matches!(
+            projection.project(&[valid.clone(), unsigned]),
+            Err(CollabError::InvalidEvent(id)) if id == event_id(29)
+        ));
+        assert_eq!(
+            projection.dump_tables().expect("unchanged dump"),
+            before,
+            "invalid replay batches must not partially project"
+        );
+
+        projection
+            .project(std::slice::from_ref(&valid))
+            .expect("valid signed event projects");
+        assert!(projection
+            .dump_tables()
+            .expect("projected dump")
+            .contains("signed"));
+
+        let mut future_schema = valid;
+        future_schema.schema_version = SCHEMA_VERSION + 1;
+        Ed25519Signer::from_seed([1; 32]).sign(&mut future_schema);
+        assert!(future_schema.verify(), "future-schema envelope is still signed");
+        assert!(matches!(
+            projection.project(std::slice::from_ref(&future_schema)),
+            Err(CollabError::InvalidEvent(id)) if id == event_id(28)
+        ));
+    }
+
+    #[test]
+    fn replay_does_not_let_a_participant_event_impersonate_another_actor() {
+        use mde_collab_types::ids::CallId;
+        use mde_collab_types::value::{CallKind, CallParticipantState};
+
+        let space = space_id(25);
+        let call = CallId::from_uuid(Uuid::from_u128(26));
+        let mut events = space_setup(space, "ops", 50);
+        events.extend([
+            event(
+                52,
+                space,
+                3,
+                CollabEventKind::CallStarted {
+                    call,
+                    kind: CallKind::Audio,
+                    initiator: ActorId::new("alice"),
+                },
+            ),
+            event(
+                53,
+                space,
+                4,
+                CollabEventKind::CallParticipantChanged {
+                    call,
+                    actor: ActorId::new("bob"),
+                    state: CallParticipantState::Connected,
+                },
+            ),
+        ]);
+
+        let mut projection = Projection::open_in_memory().expect("open projection");
+        projection
+            .project(&events)
+            .expect("project call replay");
+
+        let calls = projection.call_state(Some(space)).expect("call state");
+        assert_eq!(calls.active.len(), 1);
+        assert_eq!(calls.active[0].participants.len(), 1);
+        assert_eq!(calls.active[0].participants[0].actor, ActorId::new("alice"));
+        assert_eq!(
+            calls.active[0].participants[0].state,
+            CallParticipantState::Connected
+        );
+    }
 }

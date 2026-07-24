@@ -68,6 +68,9 @@ pub struct NebulaSupervisor {
     workgroup_root: PathBuf,
     /// ENT-3 — last-applied blocklist union (change triggers reload).
     last_blocklist: Vec<String>,
+    /// Coordination-plane endpoints. Empty means the legacy filesystem lease
+    /// is authoritative; non-empty means etcd is authoritative.
+    leadership_endpoints: Vec<String>,
     /// Last-known leader state — flipping this triggers the
     /// promote / demote transition.
     last_is_leader: bool,
@@ -101,6 +104,7 @@ impl NebulaSupervisor {
             last_is_leader: false,
             workgroup_root,
             last_blocklist: Vec::new(),
+            leadership_endpoints: crate::substrate::etcd::default_endpoints(),
         }
     }
 
@@ -141,23 +145,54 @@ impl NebulaSupervisor {
         self
     }
 
+    /// Override the coordination-plane authority — used by isolated tests.
+    #[must_use]
+    pub(crate) fn with_leadership_endpoints(mut self, endpoints: Vec<String>) -> Self {
+        self.leadership_endpoints = endpoints;
+        self
+    }
+
     /// One sweep. Pure-ish (touches disk + may shell out
     /// to systemctl, but no network). Returns Ok(()) on
     /// success; logs + swallows individual step failures so
     /// a single bad tick doesn't kill the worker.
     async fn tick(&mut self) {
-        // 1. Check current leader state — the role-host marker (configurable
-        //    path, so tests don't read the production marker).
-        let is_leader_now = check_leader(&self.role_marker_path);
-        if is_leader_now != self.last_is_leader {
-            if is_leader_now {
-                if let Err(e) = self.promote().await {
-                    tracing::warn!(error = %e, "nebula-supervisor: promote failed");
+        // 1. Check the authoritative lease. Promotion owns creation/repair of
+        //    the local marker, so requiring that marker here would make a
+        //    clean elected lighthouse unable to bootstrap. The mirror puller
+        //    below keeps the stricter marker-plus-lease check.
+        let is_leader_now = authoritative_lease_names_node(
+            &self.workgroup_root,
+            &self.node_id,
+            &self.leadership_endpoints,
+        )
+        .await;
+        let marker_is_ours = read_role_marker(&self.role_marker_path)
+            .is_some_and(|marker_node_id| marker_node_id == self.node_id);
+        let needs_transition = if is_leader_now {
+            !self.last_is_leader || !marker_is_ours
+        } else {
+            self.last_is_leader || self.role_marker_path.exists()
+        };
+        if needs_transition {
+            let transition = if is_leader_now {
+                self.promote().await
+            } else {
+                self.demote()
+            };
+            match transition {
+                Ok(()) => {
+                    // Keep the transition pending after any error so a later
+                    // tick retries the marker/service change instead of
+                    // treating a partially-applied role change as complete.
+                    self.last_is_leader = is_leader_now;
                 }
-            } else if let Err(e) = self.demote() {
-                tracing::warn!(error = %e, "nebula-supervisor: demote failed");
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    leader = is_leader_now,
+                    "nebula-supervisor: role transition failed; will retry"
+                ),
             }
-            self.last_is_leader = is_leader_now;
         }
 
         // 1.5 HA — keep THIS node's bundle lighthouse roster in sync with the
@@ -207,7 +242,7 @@ impl NebulaSupervisor {
             // installed — log + continue.
         }
         // b. Write the role marker.
-        write_role_marker(&self.role_marker_path)?;
+        write_role_marker(&self.role_marker_path, &self.node_id)?;
         // c. Start the systemd units. systemctl invocations
         //    are best-effort — we still proceed if systemctl
         //    is unreachable (containerized test envs).
@@ -930,12 +965,36 @@ pub fn publish_overlay_ip(path: &Path, overlay_ip: &str) -> Result<(), String> {
         .map_err(|e| format!("rename {} → {}: {e}", tmp.display(), path.display()))
 }
 
-fn write_role_marker(path: &Path) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+/// Marker schema version. This is intentionally local and owner-bound: the
+/// marker is not a replicated authorization document.
+const ROLE_MARKER_SCHEMA: &str = "mackesd-role-host-v1";
+
+pub(crate) fn write_role_marker(path: &Path, node_id: &str) -> Result<(), String> {
+    if node_id.is_empty() || node_id.bytes().any(|b| matches!(b, b'\n' | b'\r' | b'\t')) {
+        return Err(format!("invalid role-marker node id {node_id:?}"));
     }
-    std::fs::write(path, b"role:host\n")
-        .map_err(|e| format!("write marker {}: {e}", path.display()))
+    let body = format!("schema:{ROLE_MARKER_SCHEMA}\nrole:host\nnode_id:{node_id}\n");
+    crate::ca::seal::write_atomic_sealed(path, body.as_bytes()).map_err(|e| e.to_string())
+}
+
+/// Read and validate the local leadership marker. `read_sealed` rejects
+/// symlink leaves/parents, non-regular files, group/world permissions, and a
+/// different owner, so marker existence alone is never treated as authority.
+pub(crate) fn read_role_marker(path: &Path) -> Option<String> {
+    let bytes = crate::ca::seal::read_sealed(path).ok()?;
+    let text = std::str::from_utf8(&bytes).ok()?;
+    let mut lines = text.lines();
+    if lines.next()? != format!("schema:{ROLE_MARKER_SCHEMA}") || lines.next()? != "role:host" {
+        return None;
+    }
+    let node_id = lines.next()?.strip_prefix("node_id:")?;
+    if node_id.is_empty()
+        || lines.next().is_some()
+        || node_id.bytes().any(|b| matches!(b, b'\n' | b'\r' | b'\t'))
+    {
+        return None;
+    }
+    Some(node_id.to_owned())
 }
 
 /// Lightweight `systemctl <verb> <unit>` invocation. Returns
@@ -966,16 +1025,50 @@ fn systemctl_reload(unit: &str) -> Result<(), String> {
     systemctl("reload-or-restart", unit)
 }
 
-/// Pure helper — `true` when this node currently holds the host (leader)
-/// role, signalled by the presence of the role-host marker at
-/// `marker_path`. The marker is the leader signal in both directions: the
-/// boot-time wizard / a promotion writes it (via [`write_role_marker`],
-/// reached from `promote`), and `demote` (or an external actor) removes it.
-/// `marker_path` is the supervisor's configurable `role_marker_path` so
-/// tests point it at a tempdir rather than the production
-/// `/var/lib/mackesd/nebula/role.host`.
-fn check_leader(marker_path: &Path) -> bool {
-    marker_path.exists()
+/// Verify both halves of the local leadership contract:
+///
+/// 1. the marker is an owner-checked, exact-schema file naming this node; and
+/// 2. the current non-expired filesystem/etcd lease names the same node.
+///
+/// Any missing, malformed, replaced, stale, or unavailable authority returns
+/// `false`. This function is shared by the supervisor and mirror puller so the
+/// latter cannot accidentally turn marker existence into leadership.
+pub(crate) async fn role_marker_is_current_leader(
+    marker_path: &Path,
+    workgroup_root: &Path,
+    expected_node_id: &str,
+    leadership_endpoints: &[String],
+) -> bool {
+    let Some(marker_node_id) = read_role_marker(marker_path) else {
+        return false;
+    };
+    if marker_node_id != expected_node_id {
+        return false;
+    }
+    authoritative_lease_names_node(workgroup_root, expected_node_id, leadership_endpoints).await
+}
+
+/// Read only the authoritative coordination-plane lease. This is intentionally
+/// separate from [`role_marker_is_current_leader`]: the supervisor must be able
+/// to create a missing marker during promotion, while privileged mirror pulls
+/// must require both the marker and the lease.
+async fn authoritative_lease_names_node(
+    workgroup_root: &Path,
+    expected_node_id: &str,
+    leadership_endpoints: &[String],
+) -> bool {
+    let lease = if leadership_endpoints.is_empty() {
+        crate::leader::read_current_lease(&workgroup_root.join(".mackesd-leader.lock"))
+    } else {
+        let Ok(mut client) = crate::substrate::etcd::connect(leadership_endpoints).await else {
+            return false;
+        };
+        crate::substrate::leader::current_leader(&mut client)
+            .await
+            .ok()
+            .flatten()
+    };
+    lease.is_some_and(|lease| lease.node_id == expected_node_id)
 }
 
 #[cfg(test)]
@@ -1375,20 +1468,38 @@ mod tests {
     fn write_role_marker_creates_parent_dir() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let marker = tmp.path().join("var/lib/mackesd/nebula/role.host");
-        write_role_marker(&marker).expect("write");
+        write_role_marker(&marker, "peer:test").expect("write");
         assert!(marker.exists());
-        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "role:host\n");
+        assert_eq!(read_role_marker(&marker).as_deref(), Some("peer:test"));
     }
 
     #[test]
-    fn check_leader_reads_the_given_marker_path() {
-        // AUD7-1: leadership is the presence of the *configurable* marker, not
-        // the hardcoded production path — so a test marker is honoured.
+    fn role_marker_requires_exact_owner_checked_schema() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let marker = tmp.path().join("role.host");
-        assert!(!check_leader(&marker), "absent marker → not leader");
-        write_role_marker(&marker).expect("write");
-        assert!(check_leader(&marker), "present marker → leader");
+        assert!(
+            read_role_marker(&marker).is_none(),
+            "absent marker → invalid"
+        );
+        write_role_marker(&marker, "peer:test").expect("write");
+        assert_eq!(read_role_marker(&marker).as_deref(), Some("peer:test"));
+        std::fs::write(&marker, b"role:host\n").expect("legacy overwrite");
+        assert!(
+            read_role_marker(&marker).is_none(),
+            "legacy marker must fail closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn marker_requires_the_current_local_leader_lease() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let lock = tmp.path().join(".mackesd-leader.lock");
+        let marker = tmp.path().join("role.host");
+        write_role_marker(&marker, "peer:test").expect("write");
+        assert!(!role_marker_is_current_leader(&marker, tmp.path(), "peer:test", &[],).await);
+        crate::leader::force_take(&lock, "peer:test").expect("acquire lease");
+        assert!(role_marker_is_current_leader(&marker, tmp.path(), "peer:test", &[],).await);
+        assert!(!role_marker_is_current_leader(&marker, tmp.path(), "peer:other", &[],).await);
     }
 
     #[tokio::test]
@@ -1426,6 +1537,57 @@ mod tests {
             .await
             .expect("worker must exit");
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn failed_demotion_remains_pending_for_a_later_retry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("store.sqlite");
+        let conn = crate::store::open(&db).expect("open");
+        let marker = tmp.path().join("role.host");
+        // A directory at the marker path makes the demotion's remove_file
+        // fail, modelling a hostile replacement or filesystem error.
+        std::fs::create_dir(&marker).expect("marker directory");
+        let mut supervisor = NebulaSupervisor::new(
+            Arc::new(Mutex::new(conn)),
+            "peer:test".into(),
+            "m1".into(),
+            tmp.path().join("nebula-bundle.json"),
+        )
+        .with_role_marker(marker);
+        supervisor.last_is_leader = true;
+
+        supervisor.tick().await;
+
+        assert!(
+            supervisor.last_is_leader,
+            "a failed demotion must remain pending so the next tick retries it"
+        );
+    }
+
+    #[tokio::test]
+    async fn elected_leader_bootstraps_a_missing_role_marker() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("store.sqlite");
+        let conn = crate::store::open(&db).expect("open");
+        let lock = tmp.path().join(".mackesd-leader.lock");
+        crate::leader::force_take(&lock, "peer:test").expect("acquire lease");
+        let marker = tmp.path().join("role.host");
+        let mut supervisor = NebulaSupervisor::new(
+            Arc::new(Mutex::new(conn)),
+            "peer:test".into(),
+            "m1".into(),
+            tmp.path().join("nebula-bundle.json"),
+        )
+        .with_workgroup_root(tmp.path().to_path_buf())
+        .with_role_marker(marker.clone())
+        .with_leadership_endpoints(Vec::new());
+
+        assert!(!marker.exists(), "test starts without a role marker");
+        supervisor.tick().await;
+
+        assert!(supervisor.last_is_leader);
+        assert_eq!(read_role_marker(&marker).as_deref(), Some("peer:test"));
     }
 
     // HA / Gap-C — an already-enrolled peer (e.g. Eagle) picks up newly-added

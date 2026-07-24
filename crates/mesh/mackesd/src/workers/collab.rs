@@ -45,6 +45,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use std::str::FromStr;
@@ -62,6 +63,7 @@ use mde_collab_types::{
 };
 
 use super::{ShutdownToken, Worker};
+use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
 
 /// The alert-source topic prefixes the collab worker folds into
 /// [`AlertRaised`](CollabEventKind::AlertRaised) events — the same truthful lanes
@@ -153,6 +155,9 @@ const COMMAND_VERBS: &[&str] = &[
     "request_ai_suggestion",
 ];
 
+/// Capability context for every mutable `action/collab/<verb>` command.
+const COLLAB_AUTH_VERB: &str = "collab-command";
+
 /// The universal, rank-0 collaboration worker for one node.
 pub struct CollabWorker {
     /// This node's collaboration identity (the bare hostname — the same identity
@@ -167,6 +172,8 @@ pub struct CollabWorker {
     poll_interval: Duration,
     /// Bus root override (tests point it at a tempdir Persist).
     bus_root_override: Option<PathBuf>,
+    /// Verifier for the root-only capability on the mutable command lanes.
+    authorizer: Arc<ActionAuthorizer>,
 }
 
 impl CollabWorker {
@@ -184,6 +191,7 @@ impl CollabWorker {
             log_root,
             poll_interval: DEFAULT_POLL_INTERVAL,
             bus_root_override: None,
+            authorizer: Arc::new(ActionAuthorizer::production()),
         }
     }
 
@@ -191,6 +199,13 @@ impl CollabWorker {
     #[must_use]
     pub fn with_bus_root(mut self, p: PathBuf) -> Self {
         self.bus_root_override = Some(p);
+        self
+    }
+
+    /// Override the Bus capability verifier for deterministic hostile fixtures.
+    #[must_use]
+    pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
+        self.authorizer = authorizer;
         self
     }
 
@@ -433,7 +448,36 @@ impl CollabWorker {
                     tracing::warn!(target: "mackesd::collab", verb, "action/collab command with empty body");
                     continue;
                 };
-                let cmd: CollabCommand = match serde_json::from_str(body) {
+                if let Err(error) = self.authorizer.authorize(
+                    body,
+                    MutationContext {
+                        verb: COLLAB_AUTH_VERB,
+                        node: self.self_actor.as_str(),
+                        target: *verb,
+                    },
+                ) {
+                    tracing::warn!(
+                        target: "mackesd::collab",
+                        verb,
+                        error = %error,
+                        "refused unauthorized action/collab command",
+                    );
+                    continue;
+                }
+                let mut envelope: serde_json::Value = match serde_json::from_str(body) {
+                    Ok(value) => value,
+                    Err(e) => {
+                        tracing::warn!(target: "mackesd::collab", verb, error = %e, "bad action/collab command body");
+                        continue;
+                    }
+                };
+                let Some(object) = envelope.as_object_mut() else {
+                    tracing::warn!(target: "mackesd::collab", verb, "action/collab command envelope is not an object");
+                    continue;
+                };
+                object.remove("armed_token");
+                object.remove("schema_version");
+                let cmd: CollabCommand = match serde_json::from_value(envelope) {
                     Ok(c) => c,
                     Err(e) => {
                         tracing::warn!(target: "mackesd::collab", verb, error = %e, "bad action/collab command body");
@@ -1174,6 +1218,7 @@ impl Worker for CollabWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::action_auth::authorize_test_body;
     use ed25519_dalek::SigningKey;
     use mde_collab_types::value::MessageBody;
     use mde_collab_types::{
@@ -1182,6 +1227,11 @@ mod tests {
         TransferDirection, TransferId, TransferJobs, TransferMethod, TransferState,
     };
     use rand::rngs::OsRng;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const AUTH_KEY: &[u8] = b"collab-action-auth-test-key";
+    const AUTH_NOW: i64 = 1_700_000_000_000;
+    static NEXT_NONCE: AtomicU64 = AtomicU64::new(1);
 
     fn key() -> SigningKey {
         SigningKey::generate(&mut OsRng)
@@ -1191,14 +1241,40 @@ mod tests {
         CollabWorker::new(root.to_path_buf(), actor.into(), key())
             .with_bus_root(root.join("bus"))
             .with_log_root(root.join("collab-logs"))
+            .with_authorizer(Arc::new(ActionAuthorizer::for_test(
+                AUTH_KEY,
+                root.join("auth-ledger"),
+                AUTH_NOW,
+            )))
     }
 
     fn persist_at(root: &Path) -> Persist {
         Persist::open(root.join("bus")).expect("open persist")
     }
 
-    fn write_command(persist: &Persist, cmd: &CollabCommand) {
-        let body = serde_json::to_string(cmd).expect("serialize command");
+    fn authorized_command_body(w: &CollabWorker, cmd: &CollabCommand, nonce: &str) -> String {
+        let mut unsigned = serde_json::to_value(cmd).expect("serialize command");
+        unsigned["schema_version"] = serde_json::Value::from(1_u64);
+        let unsigned = serde_json::to_string(&unsigned).expect("serialize command envelope");
+        authorize_test_body(
+            AUTH_KEY,
+            &unsigned,
+            MutationContext {
+                verb: COLLAB_AUTH_VERB,
+                node: w.self_actor.as_str(),
+                target: cmd.verb(),
+            },
+            nonce,
+            AUTH_NOW + 30_000,
+        )
+    }
+
+    fn write_command(w: &CollabWorker, persist: &Persist, cmd: &CollabCommand) {
+        let nonce = format!(
+            "collab-test-{:032x}",
+            NEXT_NONCE.fetch_add(1, Ordering::Relaxed)
+        );
+        let body = authorized_command_body(w, cmd, &nonce);
         persist
             .write(
                 &topics::command_topic(cmd.verb()),
@@ -1325,6 +1401,47 @@ mod tests {
         assert!(take_new_all(&persist, &mut cursors, "t/all").is_empty());
     }
 
+    #[test]
+    fn collab_commands_require_exact_single_use_capability() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let w = worker(dir.path(), "eagle");
+        let persist = persist_at(dir.path());
+        let mut state = CollabState::new(w.self_actor.clone()).expect("state");
+        let command = CollabCommand::CreateSpace {
+            kind: SpaceKind::Team,
+            name: "authorized".into(),
+        };
+        let topic = topics::command_topic(command.verb());
+
+        // The command lane is seeded forward-only, then an unsigned body is
+        // rejected before deserialization or any engine effect.
+        w.tick_once(&persist, &mut state, 100);
+        let unsigned = serde_json::to_string(&command).expect("serialize command");
+        write_raw(&persist, &topic, &unsigned);
+        w.tick_once(&persist, &mut state, 200);
+        assert!(
+            state.engine.state().spaces.is_empty(),
+            "unsigned collab commands have no mutation effect"
+        );
+
+        // The exact body, context, and a fresh nonce authorize one mutation.
+        let authorized =
+            authorized_command_body(&w, &command, "collab-hostile-0000000000000000000000001");
+        write_raw(&persist, &topic, &authorized);
+        w.tick_once(&persist, &mut state, 300);
+        assert_eq!(state.engine.state().spaces.len(), 1);
+
+        // Replaying the same signed envelope is refused by the durable nonce
+        // ledger, so it cannot create a second space.
+        write_raw(&persist, &topic, &authorized);
+        w.tick_once(&persist, &mut state, 400);
+        assert_eq!(
+            state.engine.state().spaces.len(),
+            1,
+            "a collab capability is single-use"
+        );
+    }
+
     // ── the worker flow ─────────────────────────────────────────────────
 
     #[test]
@@ -1338,6 +1455,7 @@ mod tests {
         // CreateSpace command and drain it.
         w.tick_once(&persist, &mut state, 100);
         write_command(
+            &w,
             &persist,
             &CollabCommand::CreateSpace {
                 kind: SpaceKind::Team,
@@ -1392,6 +1510,7 @@ mod tests {
 
         // A follow-up SendMessage into the space projects into the conversation.
         write_command(
+            &w,
             &persist,
             &CollabCommand::SendMessage {
                 space,
@@ -1422,6 +1541,7 @@ mod tests {
         t0: i64,
     ) -> SpaceId {
         write_command(
+            w,
             persist,
             &CollabCommand::CreateSpace {
                 kind: SpaceKind::Team,
@@ -1431,6 +1551,7 @@ mod tests {
         w.tick_once(persist, state, t0);
         let space = only_space(state);
         write_command(
+            w,
             persist,
             &CollabCommand::LinkFile {
                 space,
@@ -1486,7 +1607,7 @@ mod tests {
         );
 
         // Unlink: removes the space's reference.
-        write_command(&persist, &CollabCommand::UnlinkFile { space, file });
+        write_command(&w, &persist, &CollabCommand::UnlinkFile { space, file });
         w.tick_once(&persist, &mut state, 400);
         let refs = read_refs(&persist);
         assert!(
@@ -1548,6 +1669,7 @@ mod tests {
         // Share to members → StartTransfer → the mirror carries a Queued job.
         let transfer = TransferId::new();
         write_command(
+            &w,
             &persist,
             &CollabCommand::StartTransfer {
                 space,
@@ -1571,6 +1693,7 @@ mod tests {
 
         // Pause → the state machine moves; still no second progress authority.
         write_command(
+            &w,
             &persist,
             &CollabCommand::ControlTransfer {
                 transfer,
@@ -1670,6 +1793,7 @@ mod tests {
 
         // alpha creates a shared space and adds beta as a member.
         write_command(
+            &wa,
             &pa,
             &CollabCommand::CreateSpace {
                 kind: SpaceKind::Team,
@@ -1679,6 +1803,7 @@ mod tests {
         wa.tick_once(&pa, &mut sa, 200);
         let space = only_space(&sa);
         write_command(
+            &wa,
             &pa,
             &CollabCommand::AddMember {
                 space,
@@ -1706,6 +1831,7 @@ mod tests {
 
         // Divergent commands: each member posts a message on its own node.
         write_command(
+            &wa,
             &pa,
             &CollabCommand::SendMessage {
                 space,
@@ -1715,6 +1841,7 @@ mod tests {
         );
         wa.tick_once(&pa, &mut sa, 500);
         write_command(
+            &wb,
             &pb,
             &CollabCommand::SendMessage {
                 space,

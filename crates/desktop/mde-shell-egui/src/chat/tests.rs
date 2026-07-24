@@ -1188,17 +1188,31 @@ fn notification_control_helpers_publish_and_persist() {
     let prefs_msgs = persist
         .list_since(ACTION_CHAT_NOTIFY_PREFS, None)
         .expect("notify prefs action");
-    assert_eq!(
-        prefs_msgs.last().and_then(|m| m.body.as_deref()),
-        Some(r#"{"threshold":"critical"}"#)
-    );
+    let prefs_body: serde_json::Value = serde_json::from_str(
+        prefs_msgs
+            .last()
+            .and_then(|m| m.body.as_deref())
+            .expect("authorized notify prefs body"),
+    )
+    .expect("notify prefs JSON");
+    assert_eq!(prefs_body["schema_version"], 1);
+    assert_eq!(prefs_body["threshold"], "critical");
+    assert!(prefs_body["armed_token"].as_str().is_some());
     let mute_msgs = persist
         .list_since(ACTION_CHAT_MUTE, None)
         .expect("mute action");
-    assert_eq!(
-        mute_msgs.last().and_then(|m| m.body.as_deref()),
-        Some(r#"{"id":"security","muted":true,"target":"source"}"#)
-    );
+    let mute_body: serde_json::Value = serde_json::from_str(
+        mute_msgs
+            .last()
+            .and_then(|m| m.body.as_deref())
+            .expect("authorized mute body"),
+    )
+    .expect("mute JSON");
+    assert_eq!(mute_body["schema_version"], 1);
+    assert_eq!(mute_body["id"], "security");
+    assert_eq!(mute_body["muted"], true);
+    assert_eq!(mute_body["target"], "source");
+    assert!(mute_body["armed_token"].as_str().is_some());
 
     assert!(!state.dnd_active());
     state.set_dnd(true);
@@ -1208,6 +1222,60 @@ fn notification_control_helpers_publish_and_persist() {
     assert!(!dnd.set_by_peer.is_empty());
     state.set_dnd(false);
     assert!(!mde_bus::dnd::load_default(&bus_root).active);
+}
+
+#[test]
+fn send_file_publishes_schema_v1_target_bound_capability() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bus_root = tmp.path().join("bus");
+    let source = tmp.path().join("notes.txt");
+    std::fs::write(&source, b"mesh file").unwrap();
+    let state = ChatState {
+        bus_root: Some(bus_root.clone()),
+        ..ChatState::default()
+    };
+
+    state
+        .send_file("nyc3", &source)
+        .expect("file send publishes both mutation handoffs");
+
+    let persist = Persist::open(bus_root).expect("bus");
+    let messages = persist
+        .list_since(ACTION_FILE_SEND_TO, None)
+        .expect("file send-to action");
+    assert_eq!(messages.len(), 1);
+    let body: serde_json::Value = serde_json::from_str(
+        messages[0]
+            .body
+            .as_deref()
+            .expect("authorized file send-to body"),
+    )
+    .expect("file send-to JSON");
+    assert_eq!(body["schema_version"], 1);
+    assert_eq!(body["selector"], "peer:nyc3");
+    assert_eq!(body["mode"], "copy");
+    assert_eq!(body["conflict"], "rename");
+
+    let token = mackes_mesh_types::cloud::CloudArmedToken::parse(
+        body["armed_token"].as_str().expect("armed token"),
+    )
+    .expect("well-formed file operation capability");
+    assert_eq!(token.verb, "file-ops-send-to");
+    assert_eq!(token.node, local_hostname());
+    assert_eq!(token.target, "peer:nyc3");
+
+    let mut unsigned = body;
+    unsigned
+        .as_object_mut()
+        .expect("file send-to object")
+        .remove("armed_token");
+    let digest = mackes_mesh_types::cloud::cloud_request_digest(&unsigned.to_string())
+        .expect("canonical file send-to digest");
+    assert_eq!(token.request_sha256, digest);
+    let signer =
+        mackes_mesh_types::cloud::CloudArmSigner::new(b"0123456789abcdef0123456789abcdef".to_vec())
+            .expect("test signer");
+    assert!(signer.verify_payload(&token.signing_payload(), &token.signature));
 }
 
 #[test]

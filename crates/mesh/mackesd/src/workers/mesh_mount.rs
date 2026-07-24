@@ -43,10 +43,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use mackes_mesh_types::cloud::CloudArmSigner;
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 
-use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
+use crate::ipc::action_auth::{production_action_signer, ActionAuthorizer, MutationContext};
 
 use super::{ShutdownToken, Worker};
 
@@ -699,6 +700,9 @@ pub struct MeshMountState {
     /// The mount scope tag, when relevant (`home` / `full`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+    /// Root-only HMAC proof for the mutable scope projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_signature: Option<String>,
     /// The live mountpoint, present once `mounted`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
@@ -757,6 +761,8 @@ pub struct MeshMountWorker {
     keys: std::sync::Arc<dyn KeyProvider>,
     /// Exact-body capability verifier for mount lifecycle mutations.
     authorizer: std::sync::Arc<ActionAuthorizer>,
+    /// Root-only signer for the scope projection consumed by direct transfer.
+    state_signer: Option<CloudArmSigner>,
     /// Mount tuning (connect timeout + cache).
     tuning: MountTuning,
     /// Idle-unmount window.
@@ -791,6 +797,7 @@ impl MeshMountWorker {
             backend: std::sync::Arc::new(SshfsBackend::new()),
             keys,
             authorizer: std::sync::Arc::new(ActionAuthorizer::production()),
+            state_signer: production_action_signer().ok(),
             tuning: MountTuning::default(),
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             stale_after: DEFAULT_STALE_AFTER,
@@ -860,13 +867,25 @@ impl MeshMountWorker {
             .then(|| entry.scope.tag().to_string());
         let path =
             matches!(entry.phase, Phase::Mounted).then(|| entry.mountpoint.display().to_string());
+        let since_ms = now_ms();
+        let scope_signature = scope.as_deref().and_then(|scope| {
+            self.state_signer.as_ref().map(|signer| {
+                signer.sign_payload(&scope_auth_payload(
+                    host,
+                    entry.phase.tag(),
+                    scope,
+                    since_ms,
+                ))
+            })
+        });
         let rec = MeshMountState {
             host: host.to_string(),
             state: entry.phase.tag().to_string(),
             scope,
+            scope_signature,
             path,
             reason: entry.reason.clone(),
-            since_ms: now_ms(),
+            since_ms,
         };
         let body = serde_json::to_string(&rec).unwrap_or_default();
         let topic = format!("{STATE_PREFIX}{host}");
@@ -1062,6 +1081,7 @@ impl MeshMountWorker {
                         host: host.to_string(),
                         state: Phase::Unmounted.tag().to_string(),
                         scope: None,
+                        scope_signature: None,
                         path: None,
                         reason: None,
                         since_ms: now_ms(),
@@ -1124,6 +1144,12 @@ impl MeshMountWorker {
             }
         }
     }
+}
+
+/// Canonical payload signed by the root daemon for a live mount scope.
+#[must_use]
+pub fn scope_auth_payload(host: &str, state: &str, scope: &str, since_ms: u64) -> String {
+    format!("v1|mesh-mount-state|{host}|{state}|{scope}|{since_ms}")
 }
 
 #[async_trait::async_trait]

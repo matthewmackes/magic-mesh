@@ -43,6 +43,13 @@ const ACTION_TOPIC: &str = "action/onboard/service-add";
 /// event echoing our request id.
 const EVENT_TOPIC: &str = "event/onboard/service-add";
 
+/// Current wire schema required by the daemon's privileged apply gate.
+const ACTION_SCHEMA_VERSION: u64 = 1;
+
+/// Closed capability context shared with `mackesd::workers::service_onboard`.
+const AUTH_VERB: &str = "service-onboard";
+const AUTH_NODE: &str = "service-onboard";
+
 /// Result-poll cadence while a request is in flight — the worker answers on its
 /// own 2 s drain tick, so polling faster only spins.
 const REFRESH: Duration = Duration::from_secs(2);
@@ -122,6 +129,8 @@ struct SipParams {
 /// `parse_action` decodes (byte-pinned by a test on each side).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct ServiceAddAction {
+    /// Versioned envelope field; live applies bind it into the HMAC body.
+    schema_version: u64,
     /// Shell-minted correlation id — the result event echoes it.
     id: String,
     /// Which curated service to add.
@@ -138,6 +147,17 @@ impl ServiceAddAction {
     /// serialisation can't realistically fail (the discovery idiom).
     fn to_body(&self) -> String {
         serde_json::to_string(self).unwrap_or_default()
+    }
+
+    /// Stable semantic target shared with the daemon's verifier.
+    fn auth_target(&self) -> String {
+        match (self.kind, self.sip.as_ref()) {
+            (ServicePick::Voice, Some(sip)) => format!(
+                "service:voice:{}@{} via {}",
+                sip.username, sip.domain, sip.registrar
+            ),
+            (kind, _) => format!("service:{}", kind.wire()),
+        }
     }
 }
 
@@ -298,6 +318,7 @@ impl ServicesFlowState {
     /// mirroring `discovery::build_open`.
     fn build_action(&self, dry_run: bool, now_ms: u64) -> ServiceAddAction {
         ServiceAddAction {
+            schema_version: ACTION_SCHEMA_VERSION,
             id: format!("svc-{now_ms}-{}", self.selected.wire()),
             kind: self.selected,
             sip: (self.selected == ServicePick::Voice)
@@ -311,7 +332,24 @@ impl ServicesFlowState {
     /// body (for the test to assert the shape); `None` when the publish failed.
     fn submit(&mut self, dry_run: bool, now_ms: u64) -> Option<String> {
         let action = self.build_action(dry_run, now_ms);
-        let body = action.to_body();
+        let unsigned_body = action.to_body();
+        let body = if dry_run {
+            unsigned_body
+        } else {
+            match crate::iac::authorize_root_mutation_body(
+                &unsigned_body,
+                AUTH_VERB,
+                AUTH_NODE,
+                &action.auth_target(),
+            ) {
+                Ok(body) => body,
+                Err(error) => {
+                    self.last_error =
+                        Some(format!("Couldn't authorize the service apply: {error}"));
+                    return None;
+                }
+            }
+        };
         let Some(root) = self.bus_root.clone() else {
             self.last_error =
                 Some("No mesh Bus directory \u{2014} can't request the service.".to_string());
@@ -548,13 +586,13 @@ mod tests {
         s.sip_username = "alice".to_string();
         assert_eq!(
             s.build_action(true, 42).to_body(),
-            r#"{"id":"svc-42-voice","kind":"voice","sip":{"registrar":"sip.provider.net","domain":"provider.net","username":"alice"},"dry_run":true}"#
+            r#"{"schema_version":1,"id":"svc-42-voice","kind":"voice","sip":{"registrar":"sip.provider.net","domain":"provider.net","username":"alice"},"dry_run":true}"#
         );
         // Music omits `sip` entirely (the worker's serde default fills None).
         s.selected = ServicePick::Music;
         assert_eq!(
             s.build_action(false, 7).to_body(),
-            r#"{"id":"svc-7-music","kind":"music","dry_run":false}"#
+            r#"{"schema_version":1,"id":"svc-7-music","kind":"music","dry_run":false}"#
         );
     }
 
@@ -626,6 +664,29 @@ mod tests {
     }
 
     #[test]
+    fn apply_submit_mints_an_exact_body_capability_but_preview_stays_open() {
+        let dir = std::env::temp_dir().join(format!("mde-svcflow-auth-{}", now_ms()));
+        let mut apply = state_with_bus(Some(dir.clone()));
+        apply.selected = ServicePick::Files;
+        let body = apply
+            .submit(false, 101)
+            .expect("apply publish succeeds in test");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("JSON body");
+        assert_eq!(value["schema_version"], 1);
+        assert!(value["armed_token"].as_str().is_some());
+
+        let mut preview = state_with_bus(Some(dir.clone()));
+        preview.selected = ServicePick::Files;
+        let preview_body = preview.submit(true, 102).expect("preview publish succeeds");
+        let preview_value: serde_json::Value =
+            serde_json::from_str(&preview_body).expect("preview JSON body");
+        assert_eq!(preview_value["schema_version"], 1);
+        assert!(preview_value.get("armed_token").is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_matching_result_event_resolves_the_wait() {
         // The daemon's answer (matching id) lands on the event lane ⇒ the wait
         // resolves and the typed event is held for render; a mismatched id is
@@ -668,10 +729,10 @@ mod tests {
     #[test]
     fn catalog_blurbs_state_the_worklist_semantics() {
         // The one-line descriptions carry the honest semantics: Music names
-        // Navidrome + DO Spaces + music.mesh, Files says nothing is
-        // provisioned, Voice says external provider / no PBX.
+        // Navidrome + DO Spaces + retired lighthouse path, Files says nothing
+        // is provisioned, Voice says external provider / no PBX.
         assert!(ServicePick::Music.blurb().contains("Navidrome"));
-        assert!(ServicePick::Music.blurb().contains("music.mesh"));
+        assert!(ServicePick::Music.blurb().contains("retired"));
         assert!(ServicePick::Files.blurb().contains("nothing to provision"));
         assert!(ServicePick::Voice.blurb().contains("external SIP provider"));
         for p in ServicePick::ALL {
