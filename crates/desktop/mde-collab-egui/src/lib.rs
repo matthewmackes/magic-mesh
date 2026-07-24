@@ -493,3 +493,39 @@ impl CommunicationsSurface {
 pub(crate) fn car_mode(ui: &egui::Ui) -> bool {
     mde_egui::Style::color_scheme(ui.ctx()) == mde_egui::StyleColorScheme::AutoSync3
 }
+
+/// The maximum number of cards a moving driver should scan in one glance.
+/// This mirrors the shell's published `car_motion_policy` seam without making
+/// the pure Communications crate depend on the shell crate.
+pub(crate) const CAR_GLANCE_LIST_MAX: usize = 6;
+
+/// Bound one car-path list when the shell has published the live in-motion fold.
+/// A missing fold or non-Car palette leaves desktop behavior unchanged.
+#[must_use]
+pub(crate) const fn bounded_car_list_len(
+    is_car: bool,
+    in_motion: bool,
+    full_len: usize,
+) -> usize {
+    if is_car && in_motion {
+        if full_len < CAR_GLANCE_LIST_MAX {
+            full_len
+        } else {
+            CAR_GLANCE_LIST_MAX
+        }
+    } else {
+        full_len
+    }
+}
+
+/// Read the shell's same-frame in-motion publication for a Communications
+/// surface. The string is the documented Context seam owned by the shell's
+/// `car_motion_policy`; absent state is deliberately the unrestricted default.
+#[must_use]
+pub(crate) fn car_glance_limit(ui: &egui::Ui, full_len: usize) -> usize {
+    let in_motion = ui.ctx().data(|data| {
+        data.get_temp::<bool>(egui::Id::new("mcnf-car-motion-in-motion"))
+            .unwrap_or(false)
+    });
+    bounded_car_list_len(car_mode(ui), in_motion, full_len)
+}

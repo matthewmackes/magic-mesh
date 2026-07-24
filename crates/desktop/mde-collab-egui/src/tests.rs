@@ -1238,6 +1238,14 @@ fn car_mode_defaults_to_alerts_and_renders_glanceably() {
 }
 
 #[test]
+fn moving_car_call_roster_uses_the_glance_budget() {
+    assert_eq!(crate::bounded_car_list_len(true, true, 12), 6);
+    assert_eq!(crate::bounded_car_list_len(true, true, 4), 4);
+    assert_eq!(crate::bounded_car_list_len(true, false, 12), 12);
+    assert_eq!(crate::bounded_car_list_len(false, true, 12), 12);
+}
+
+#[test]
 fn car_mode_leaves_a_non_dense_mode_untouched_on_entry() {
     // The bias only rescues a driver off a dense pane; entering car mode already on
     // a glanceable (non-dense) mode does not force a switch to Alerts.

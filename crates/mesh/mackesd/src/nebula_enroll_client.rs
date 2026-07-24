@@ -47,6 +47,10 @@ pub const NETWORK_ENROLL_TIMEOUT: Duration = Duration::from_secs(20);
 /// lighthouse request path is deliberately small; a larger response cannot
 /// be a valid enrollment bundle and must not become an allocation oracle.
 pub const MAX_ENROLL_RESPONSE_BYTES: usize = 256 * 1024;
+/// Maximum HTTP header block accepted before the enrollment body. The
+/// endpoint emits only a few small headers; a hostile peer must not spend the
+/// complete response budget on header scanning instead of the bundle body.
+pub const MAX_ENROLL_RESPONSE_HEADER_BYTES: usize = 16 * 1024;
 
 /// XPA-11 — the enroll transport occasionally fails on the first attempt (the
 /// lighthouse busy, a cold relay path), so `network_enroll` retries **transient
@@ -521,6 +525,12 @@ fn parse_http_response(raw: &[u8]) -> Result<(u16, Vec<u8>), String> {
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .ok_or("no header/body separator")?;
+    if split > MAX_ENROLL_RESPONSE_HEADER_BYTES {
+        return Err(format!(
+            "response headers exceed {} bytes",
+            MAX_ENROLL_RESPONSE_HEADER_BYTES
+        ));
+    }
     let head = std::str::from_utf8(&raw[..split]).map_err(|_| "non-utf8 headers")?;
     let mut lines = head.split("\r\n");
     let status_line = lines.next().ok_or("empty response")?;
@@ -1273,6 +1283,15 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n\
         let bad_header = b"HTTP/1.1 200 OK\r\nContent-Length 2\r\n\r\n{}";
         let header_error = parse_http_response(bad_header).expect_err("bad header must fail");
         assert!(header_error.contains("malformed header"));
+    }
+
+    #[test]
+    fn hostile_response_with_oversized_header_block_is_rejected() {
+        let mut raw = b"HTTP/1.1 200 OK\r\nX-Filler: ".to_vec();
+        raw.extend(std::iter::repeat(b'x').take(MAX_ENROLL_RESPONSE_HEADER_BYTES));
+        raw.extend_from_slice(b"\r\n\r\n{}");
+        let error = parse_http_response(&raw).expect_err("oversized headers must fail closed");
+        assert!(error.contains("response headers exceed"));
     }
 
     #[test]

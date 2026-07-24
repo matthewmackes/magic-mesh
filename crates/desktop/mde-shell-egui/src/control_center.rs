@@ -49,9 +49,7 @@
 
 use mde_egui::egui;
 use mde_egui::motion::Spring;
-use mde_egui::{
-    paint_carbon, LayoutProfile, Motion, OsdLevel, Style, TypographyRole,
-};
+use mde_egui::{paint_carbon, LayoutProfile, Motion, OsdLevel, Style, TypographyRole};
 use mde_files_egui::model::OperationProgressSummary;
 use mde_files_egui::FileBrowser;
 use mde_seat::hotkeys::HotkeyAction;
@@ -567,15 +565,17 @@ pub(crate) fn mount(ctx: &egui::Context, mut deps: ControlCenterDeps<'_>) {
 }
 
 /// The card rect: anchored to the top-right, slid up off-screen by the
-/// un-revealed remainder (the drop-from-the-corner entry).
+/// un-revealed remainder (the drop-from-the-corner entry). The resting card
+/// is always kept inside the viewport so a short window cannot leave an
+/// invisible lower section with a live hit target.
 fn panel_rect(screen: egui::Rect, height: f32, reveal: f32) -> egui::Rect {
-    let rest = egui::Rect::from_min_size(
-        egui::pos2(
-            screen.right() - PANEL_MARGIN - PANEL_W,
-            screen.top() + PANEL_MARGIN,
-        ),
-        egui::vec2(PANEL_W, height),
-    );
+    let width = PANEL_W.min((screen.width() - 2.0 * PANEL_MARGIN).max(0.0));
+    let height = height.min((screen.height() - 2.0 * PANEL_MARGIN).max(0.0));
+    let left = (screen.right() - PANEL_MARGIN - width).max(screen.left());
+    let top = (screen.top() + PANEL_MARGIN)
+        .min(screen.bottom() - height)
+        .max(screen.top());
+    let rest = egui::Rect::from_min_size(egui::pos2(left, top), egui::vec2(width, height));
     rest.translate(egui::vec2(
         0.0,
         -(1.0 - reveal) * (height + PANEL_MARGIN * 2.0),
@@ -663,6 +663,11 @@ fn stored_brightness(ctx: &egui::Context) -> Option<f32> {
 /// Paint the RADIUS_XL card and its sections; returns the clicked action.
 fn paint_panel(ui: &mut egui::Ui, rect: egui::Rect, model: &PanelModel) -> Option<CcAction> {
     let ctx = ui.ctx().clone();
+    // The model can be taller than a portrait/short viewport. Clip both paint
+    // and interaction to the visible card before the scroll region is built;
+    // otherwise the lower sections remain a transparent input shield over the
+    // scrim even when they are below the viewport.
+    ui.shrink_clip_rect(rect);
     // Swallow in-card clicks that miss a control (never a scrim dismiss).
     let _bg = ui.interact(rect, egui::Id::new(PANEL_BG_KEY), egui::Sense::click());
     ui.painter().rect(
@@ -673,7 +678,45 @@ fn paint_panel(ui: &mut egui::Ui, rect: egui::Rect, model: &PanelModel) -> Optio
         egui::StrokeKind::Outside,
     );
 
-    let inner = rect.shrink(PANEL_PAD);
+    let inner = panel_inner_rect(rect);
+    let content_height = model.height();
+    ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
+        egui::ScrollArea::vertical()
+            .id_salt((AREA_KEY, "scroll"))
+            .max_height(inner.height())
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                // Keep the manual screen-space geometry stable while letting
+                // egui move the content origin as the user scrolls.
+                ui.set_min_size(egui::vec2(inner.width(), content_height));
+                let content = egui::Rect::from_min_size(
+                    ui.max_rect().min,
+                    egui::vec2(inner.width(), content_height),
+                );
+                paint_panel_contents(ui, content, model)
+            })
+            .inner
+    })
+    .inner
+}
+
+/// Return a non-inverted content rect even for an extremely narrow/short
+/// window. Normal Construct cards retain the full token padding; degenerate
+/// test/window sizes reduce it only as much as necessary.
+fn panel_inner_rect(rect: egui::Rect) -> egui::Rect {
+    let x_pad = PANEL_PAD.min(rect.width() * 0.5);
+    let y_pad = PANEL_PAD.min(rect.height() * 0.5);
+    egui::Rect::from_min_size(
+        rect.min + egui::vec2(x_pad, y_pad),
+        egui::vec2(
+            (rect.width() - 2.0 * x_pad).max(0.0),
+            (rect.height() - 2.0 * y_pad).max(0.0),
+        ),
+    )
+}
+
+/// Paint the scrollable card sections and return the first clicked action.
+fn paint_panel_contents(ui: &egui::Ui, inner: egui::Rect, model: &PanelModel) -> Option<CcAction> {
     let mut y = inner.top();
     let mut action: Option<CcAction> = None;
 
@@ -1227,11 +1270,22 @@ mod tests {
     /// Run one headless frame mounting the Control Center, tessellating on the
     /// CPU (the DRM runner's path minus the GPU — the system/tests idiom).
     fn frame(ctx: &egui::Context, harness: &mut Harness, events: Vec<egui::Event>) -> usize {
+        frame_at(
+            ctx,
+            harness,
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1280.0, 800.0)),
+            events,
+        )
+    }
+
+    fn frame_at(
+        ctx: &egui::Context,
+        harness: &mut Harness,
+        screen: egui::Rect,
+        events: Vec<egui::Event>,
+    ) -> usize {
         let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::pos2(0.0, 0.0),
-                egui::vec2(1280.0, 800.0),
-            )),
+            screen_rect: Some(screen),
             events,
             ..Default::default()
         };
@@ -1358,6 +1412,61 @@ mod tests {
         assert!(
             !harness.construct.control_center_open,
             "a click on the scrim must dismiss the Control Center"
+        );
+    }
+
+    #[test]
+    fn a_short_narrow_viewport_bounds_the_card_and_scrim_hit_test() {
+        let screen = egui::Rect::from_min_size(egui::pos2(17.0, 23.0), egui::vec2(320.0, 200.0));
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut harness = Harness::new();
+        harness.construct.control_center_open = true;
+
+        for _ in 0..10 {
+            let _ = frame_at(&ctx, &mut harness, screen, Vec::new());
+        }
+        let panel = panel_rect(screen, 900.0, 1.0);
+        assert!(
+            panel.left() >= screen.left()
+                && panel.right() <= screen.right()
+                && panel.top() >= screen.top()
+                && panel.bottom() <= screen.bottom(),
+            "the Control Center card must stay inside a narrow/short viewport: {panel:?}"
+        );
+
+        // This point is horizontally inside the card but below its bounded
+        // resting rect. Before the clamp, the oversized card background won
+        // this hit and prevented the full-screen scrim from dismissing it.
+        let pos = egui::pos2(screen.right() - 20.0, screen.bottom() - 5.0);
+        let _ = frame_at(
+            &ctx,
+            &mut harness,
+            screen,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+        );
+        let _ = frame_at(
+            &ctx,
+            &mut harness,
+            screen,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+        assert!(
+            !harness.construct.control_center_open,
+            "a click below a short card must still reach the scrim"
         );
     }
 

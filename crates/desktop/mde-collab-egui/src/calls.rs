@@ -173,9 +173,21 @@ impl CommunicationsSurface {
             .id_salt("collab-calls")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for call in &calls {
+                let visible = crate::car_glance_limit(ui, calls.len());
+                for call in calls.iter().take(visible) {
                     self.call_card(ui, sink, &me, &directory, now, call);
                     ui.add_space(Style::SP_XS);
+                }
+                if visible < calls.len() {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} more active call{} available when stopped",
+                            calls.len() - visible,
+                            if calls.len() - visible == 1 { " is" } else { "s are" }
+                        ))
+                        .small()
+                        .color(Style::TEXT_DIM),
+                    );
                 }
             });
     }

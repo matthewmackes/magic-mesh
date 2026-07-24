@@ -22,6 +22,9 @@ const MAX_JPEG_BYTES: usize = 128 * 1024;
 const MAX_JPEG_BASE64_BYTES: usize = 4 * MAX_JPEG_BYTES.div_ceil(3);
 const MAX_IMAGE_DIMENSION: u32 = 2_048;
 const MAX_DECODE_ALLOC: u64 = 16 * 1024 * 1024;
+/// Keep the shared-Bus consumer bounded even when a peer publishes more rows
+/// than the worker's retained-camera cap.
+const MAX_PAINTABLE_CAMERAS: usize = 128;
 const CARD_WIDTH: f32 = 152.0;
 const CARD_HEIGHT: f32 = 116.0;
 const IMAGE_HEIGHT: f32 = 82.0;
@@ -112,7 +115,12 @@ where
         ..PaintStats::default()
     };
     if let Some(snapshot) = &layer.snapshot {
-        for camera in &snapshot.cameras {
+        for camera in snapshot
+            .cameras
+            .iter()
+            .filter(|camera| camera_is_paintable(camera))
+            .take(MAX_PAINTABLE_CAMERAS)
+        {
             if !valid_coordinate(camera.latitude, camera.longitude) {
                 continue;
             }
@@ -128,7 +136,8 @@ where
         for camera in snapshot
             .cameras
             .iter()
-            .filter(|camera| camera.thumbnail.is_some())
+            .filter(|camera| camera_is_paintable(camera) && camera.thumbnail.is_some())
+            .take(MAX_PAINTABLE_CAMERAS)
         {
             if stats.cards >= 3 {
                 break;
@@ -158,6 +167,12 @@ where
     paint_age_badge(painter, rect, layer, now_ms);
     stats.badge = true;
     stats
+}
+
+fn camera_is_paintable(camera: &CaltransCamera) -> bool {
+    valid_coordinate(camera.latitude, camera.longitude)
+        && camera.distance_nm.is_finite()
+        && camera.distance_nm >= 0.0
 }
 
 fn valid_coordinate(latitude: f64, longitude: f64) -> bool {
@@ -450,5 +465,73 @@ mod tests {
         });
         assert!(paused.non_live);
         assert_eq!(paused.cards, 1);
+    }
+
+    #[test]
+    fn malformed_camera_rows_do_not_hide_valid_rows() {
+        let now_ms = 1_000_000;
+        let mut retained = snapshot(now_ms);
+        let valid = retained.cameras[0].clone();
+        retained.cameras = vec![
+            CaltransCamera {
+                latitude: f64::NAN,
+                ..valid.clone()
+            },
+            CaltransCamera {
+                distance_nm: f32::NAN,
+                ..valid.clone()
+            },
+            valid,
+        ];
+        let mut layer = CaltransCameraLayerState::default();
+        layer.fold(retained);
+
+        let context = egui::Context::default();
+        let mut projected = 0;
+        let mut stats = PaintStats::default();
+        let _ = context.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = ui.max_rect();
+                stats = paint_layer(ui.painter(), rect, &layer, now_ms, |_lat, _lon| {
+                    projected += 1;
+                    Some(rect.center())
+                });
+            });
+        });
+        assert_eq!(projected, 1);
+        assert_eq!(stats.markers, 1);
+        assert_eq!(stats.cards, 1);
+    }
+
+    #[test]
+    fn oversized_retained_camera_rows_are_bounded_at_the_paint_boundary() {
+        let now_ms = 1_000_000;
+        let mut retained = snapshot(now_ms);
+        let base = retained.cameras[0].clone();
+        retained.cameras = (0..MAX_PAINTABLE_CAMERAS + 32)
+            .map(|index| CaltransCamera {
+                id: format!("camera-{index}"),
+                thumbnail: None,
+                ..base.clone()
+            })
+            .collect();
+        let mut layer = CaltransCameraLayerState::default();
+        layer.fold(retained);
+
+        let context = egui::Context::default();
+        let mut projected = 0;
+        let mut stats = PaintStats::default();
+        let _ = context.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = ui.max_rect();
+                stats = paint_layer(ui.painter(), rect, &layer, now_ms, |_lat, _lon| {
+                    projected += 1;
+                    Some(rect.center())
+                });
+            });
+        });
+        assert_eq!(projected, MAX_PAINTABLE_CAMERAS);
+        assert_eq!(stats.markers, MAX_PAINTABLE_CAMERAS);
+        assert_eq!(stats.cards, 0);
     }
 }

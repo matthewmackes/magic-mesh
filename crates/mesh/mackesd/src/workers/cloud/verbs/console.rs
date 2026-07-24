@@ -33,6 +33,17 @@ use super::CloudActionBody;
 /// [`LiveConsoleRelay`] (`virsh domdisplay`); the reply-shaping is the pure,
 /// fake-testable [`console_endpoint_reply`].
 pub(super) fn handle(verb_name: &str, body: &CloudActionBody) -> CloudReply {
+    handle_with_relay(&LiveConsoleRelay::new(), verb_name, body)
+}
+
+/// Validate the target before dispatching to the live console backend. Keeping
+/// the relay injected here makes the rejection-before-`virsh` ordering explicit
+/// and regression-testable, while production still uses [`LiveConsoleRelay`].
+fn handle_with_relay(
+    relay: &dyn ConsoleRelay,
+    verb_name: &str,
+    body: &CloudActionBody,
+) -> CloudReply {
     let workload = match workload_name(body) {
         Ok(Some(workload)) => workload,
         Ok(None) => {
@@ -54,16 +65,28 @@ pub(super) fn handle(verb_name: &str, body: &CloudActionBody) -> CloudReply {
             }
         }
     };
-    console_endpoint_reply(&LiveConsoleRelay::new(), verb_name, workload)
+    console_endpoint_reply(relay, verb_name, workload)
 }
 
 /// The workload/domain name a `console-attach` targets — its `name`, else the
-/// lifecycle `instance` field. `None` when neither is a non-empty string. A
-/// target is also a libvirt/path-safe component before it can reach `virsh` or
-/// become the authorization target.
+/// lifecycle `instance` field. When both identity fields are present they must
+/// agree; silently choosing one would make the authorization and backend target
+/// ambiguous. `None` when neither is a non-empty string. A target is also a
+/// libvirt/path-safe component before it can reach `virsh` or become the
+/// authorization target.
 fn workload_name(body: &CloudActionBody) -> Result<Option<&str>, String> {
-    let Some(raw) = body.name.as_deref().or(body.instance.as_deref()) else {
-        return Ok(None);
+    let raw = match (body.name.as_deref(), body.instance.as_deref()) {
+        (None, None) => return Ok(None),
+        (Some(name), None) | (None, Some(name)) => name,
+        (Some(name), Some(instance)) => {
+            if name.trim() != instance.trim() {
+                return Err(
+                    "workload `name` and lifecycle `instance` must identify the same target"
+                        .to_string(),
+                );
+            }
+            name
+        }
     };
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -170,6 +193,7 @@ fn endpoint_requires_retained_relay(host: &str) -> bool {
 mod tests {
     use super::*;
     use crate::workers::console_broker::RelayHandle;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A scripted [`ConsoleRelay`] — returns a canned resolve result. The
     /// one-shot `console-attach` path intentionally does not call
@@ -180,6 +204,28 @@ mod tests {
     impl ConsoleRelay for FakeRelay {
         fn resolve(&self, _vm_id: &str) -> Result<ConsoleAddr, ConsoleBrokerError> {
             self.0.clone()
+        }
+        fn overlay_addr(&self) -> String {
+            String::new()
+        }
+        fn start_relay(
+            &self,
+            _overlay_addr: &str,
+            _overlay_port: u16,
+            _target: &ConsoleAddr,
+        ) -> Result<RelayHandle, ConsoleBrokerError> {
+            Ok(RelayHandle::detached())
+        }
+    }
+
+    /// A backend probe used to prove malformed requests are rejected before the
+    /// live console-resolution seam is dispatched.
+    struct DispatchProbe(AtomicUsize);
+
+    impl ConsoleRelay for DispatchProbe {
+        fn resolve(&self, _vm_id: &str) -> Result<ConsoleAddr, ConsoleBrokerError> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Err(ConsoleBrokerError::Resolve("backend must not be called".into()))
         }
         fn overlay_addr(&self) -> String {
             String::new()
@@ -290,8 +336,13 @@ mod tests {
         );
         assert_eq!(
             workload_name(&body(Some("db"), Some("web"))),
-            Ok(Some("db")),
-            "name wins over instance"
+            Err("workload `name` and lifecycle `instance` must identify the same target".into()),
+            "conflicting identity fields fail closed"
+        );
+        assert_eq!(
+            workload_name(&body(Some(" web "), Some("web"))),
+            Ok(Some("web")),
+            "equivalent trimmed identity fields are one target"
         );
         assert_eq!(
             workload_name(&body(Some("  "), None)),
@@ -318,6 +369,26 @@ mod tests {
             .error
             .unwrap()
             .contains("rejects the workload target"));
+    }
+
+    #[test]
+    fn conflicting_workload_identities_are_rejected_before_backend_dispatch() {
+        let relay = DispatchProbe(AtomicUsize::new(0));
+        let request = body(Some("db"), Some("web"));
+
+        let reply = handle_with_relay(&relay, "console-attach", &request);
+
+        assert!(!reply.ok);
+        assert!(reply
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("must identify the same target")));
+        assert_eq!(
+            relay.0.load(Ordering::Relaxed),
+            0,
+            "invalid target is rejected before console backend resolution"
+        );
+        assert!(authorization_target(&request).is_none());
     }
 
     #[test]

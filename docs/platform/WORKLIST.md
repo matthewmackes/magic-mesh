@@ -251,6 +251,10 @@ These decisions refine acceptance and sequencing for the active items below.
   `Transfer-Encoding`/`Content-Length` combinations before request dispatch.
   The focused BigBoy endpoint gate is green at 18/18; live enrollment remains
   external.
+- Progress (2026-07-24 HTTP header framing hardening): the TLS enrollment parser
+  now caps the response header block at 16 KiB before scanning or allocating the
+  enrollment body, rejecting oversized hostile headers fail-closed. The focused
+  BigBoy endpoint gate is green at 21/21; live enrollment remains external.
 - Progress (2026-07-23): code and hostile fixtures now meet the local-key design.
   Joining nodes generate their key locally; the signer consumes only the strict
   requester public key and verifies the returned certificate identity before an
@@ -443,6 +447,10 @@ These decisions refine acceptance and sequencing for the active items below.
   the requested placement before authorization/replay or systemd execution.
   The focused BigBoy lifecycle gate is green at 10/10; live Podman/systemd
   success evidence remains external.
+- Progress (2026-07-24 console identity hardening): `console-attach` now rejects
+  requests whose `name` and lifecycle `instance` identify different workloads,
+  before dispatching to console resolution. The focused cloud-console farm gate
+  is green at 11/11; live backend evidence remains external.
 - Progress (2026-07-23): UI contract slice landed in the takeover tree. Set
   desired now publishes the worker's `{node,spec}` envelope; provision,
   configure, plan, destroy, lifecycle, and console requests carry explicit
@@ -1113,6 +1121,11 @@ These decisions refine acceptance and sequencing for the active items below.
   cross-node/FIRMS isolation regression is included. External feed credentials,
   fresh MG90 fix, and NCDOT acceptance remain optional live-data evidence
   follow-ups, not blockers to the autonomous implementation drain.
+- Progress (2026-07-24 Caltrans retained-row hardening): the Maps consumer now
+  drops malformed coordinates and non-finite/negative distances before paint and
+  caps retained camera rows at 128, so hostile or oversized Bus snapshots cannot
+  monopolize the map frame. The focused Caltrans farm gate is green at 5/5;
+  live feed acceptance remains external.
 - Progress (2026-07-24 live-mirror proof-tool no-follow hardening): the
   read-only verifier now rejects traversal, symlinked parents/leaves, and
   non-regular indexed files, then performs the final read with `O_NOFOLLOW` and
@@ -1294,6 +1307,12 @@ These decisions refine acceptance and sequencing for the active items below.
   centered clock and right controls on narrow screens. A non-zero-origin,
   narrow-rail geometry/click regression is green at 16/16 on `.50`; live pixel
   comparison remains external.
+- Progress (2026-07-24 Control Center viewport hardening): the Construct panel
+  now clamps its card and inner content to short/narrow viewports, clips the
+  scrollable paint/input region, and preserves scrim dismissal outside the
+  visible card. The focused regression is green at 1/1 and the full Control
+  Center test slice at 15/15; live physical pointer/pixel evidence remains
+  external.
 - Progress (2026-07-23): the home contract was reconciled to the operator's
   single-desktop directive: one untitled all-icons Desktop now flattens the
   canonical surface catalog, uses launcher-group accents for color coding, and
@@ -1647,6 +1666,12 @@ These decisions refine acceptance and sequencing for the active items below.
   valid bindings and the legacy `go_phone` alias without allowing an unbounded
   active map. The focused shell Car keymap gate is green at 7/7; live MG90 and
   physical Car evidence remains external.
+- Progress (2026-07-24 moving-Car glance budget): the Communications calls roster
+  now limits the visible list to six entries while Car mode is in motion, with
+  an explicit count of additional calls available when stopped; stationary and
+  non-Car views retain the full roster. The focused Car slice is green at 4/4
+  and the full Communications crate at 53/53 on `.50`; live MG90 and physical
+  Car evidence remains external.
 - Progress (2026-07-23 live mirror proof): the MG90 gateway at `172.20.0.25`
   is reachable from the network (ping and TCP/2222), and `.15`'s active
   `mackesd` is publishing a fresh `state/vehicle/Basement-Test-Workstation`
