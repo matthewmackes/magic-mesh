@@ -129,6 +129,9 @@ pub fn maps_location_panel(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
 /// Render the active workspace tab's body — shared by the normal (rail) layout and
 /// the Car Mode full-bleed layout.
 fn render_active_tab(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
+    if state.active != WorkspaceTab::Airspace {
+        state.airspace.deactivate();
+    }
     match state.active {
         WorkspaceTab::Drive => show_drive(ui, state),
         WorkspaceTab::Airspace => crate::airspace::airspace_panel(ui, &mut state.airspace),

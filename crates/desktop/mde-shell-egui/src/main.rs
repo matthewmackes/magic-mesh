@@ -3153,10 +3153,7 @@ impl Shell {
             car: is_car,
             immersive_app: self.immersive_vdi() || self.nav.surface == Surface::MapsLocation,
         }) {
-            egui::TopBottomPanel::top("construct-status-bar-space")
-                .exact_height(status_bar::STATUS_BAR_H)
-                .frame(egui::Frame::NONE)
-                .show(ctx, |_ui| {});
+            construct::reserve_top_rail(ctx);
         }
         if self.nav_bar.reserves_bottom_space() && !self.immersive_vdi() {
             egui::TopBottomPanel::bottom("construct-springboard-dock-space")

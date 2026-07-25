@@ -25,6 +25,13 @@ use crate::signer::{EventSigner, IdSource};
 /// The author edit/delete window: 5 minutes, in milliseconds.
 pub const EDIT_WINDOW_MS: i64 = 5 * 60 * 1000;
 
+/// The maximum UTF-8 byte length of an inline message body.
+///
+/// This mirrors the collaboration projection's existing 256 KiB message-body
+/// contract. Enforcing it here keeps oversized user input from being signed
+/// and materialized into an event that the read model would later reject.
+pub const MAX_MESSAGE_BODY_BYTES: usize = 256 * 1024;
+
 /// The maximum number of tombstones one `ClearClipboard` command may author.
 ///
 /// The mesh clipboard history already retains at most 50 unpinned entries, so
@@ -298,6 +305,7 @@ pub fn apply_command<S: EventSigner, I: IdSource>(
                     return Err(CollabError::ThreadNotFound(*t));
                 }
             }
+            validate_message_body(body)?;
             Ok(vec![ctx.emit(
                 *space,
                 CollabEventKind::MessagePosted {
@@ -323,6 +331,7 @@ pub fn apply_command<S: EventSigner, I: IdSource>(
                 return Err(CollabError::TargetDeleted(*target));
             }
             enforce_window(*target, msg.created_ms, ctx.now_unix_ms)?;
+            validate_message_body(body)?;
             Ok(vec![ctx.emit(
                 *space,
                 CollabEventKind::MessageEdited {
@@ -375,6 +384,7 @@ pub fn apply_command<S: EventSigner, I: IdSource>(
             if state.threads.get(thread) != Some(space) {
                 return Err(CollabError::ThreadNotFound(*thread));
             }
+            validate_message_body(body)?;
             Ok(vec![ctx.emit(
                 *space,
                 CollabEventKind::MessagePosted {
@@ -798,6 +808,19 @@ fn require_active_space(state: &DomainState, space: SpaceId) -> Result<()> {
     }
 }
 
+/// Reject an oversized inline body before [`ApplyCtx::emit`] can consume an id
+/// or HLC tick. The projection has the same cap when it builds message views;
+/// keeping the command boundary aligned avoids signing events that can never be
+/// represented by the read model.
+fn validate_message_body(body: &MessageBody) -> Result<()> {
+    if body.as_str().len() > MAX_MESSAGE_BODY_BYTES {
+        return Err(CollabError::Serde(format!(
+            "message body exceeds {MAX_MESSAGE_BODY_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
 /// The actor must be a present member of the space.
 fn require_member(
     state: &DomainState,
@@ -948,7 +971,8 @@ mod tests {
     use crate::signer::{Ed25519Signer, IdSource};
     use mde_collab_types::ids::{CallId, EventId, FileRefId, TransferId};
     use mde_collab_types::value::{
-        CallKind, ClipItemKind, ClipboardItem, FileRef, TransferDirection, TransferMethod,
+        CallKind, ClipItemKind, ClipboardItem, FileRef, MessageBody, TransferDirection,
+        TransferMethod,
     };
     use mde_collab_types::{ActorClock, ActorId, CollabEventEnvelope, SpaceKind};
     use uuid::Uuid;
@@ -1218,6 +1242,66 @@ mod tests {
                 }) if denied_space == space && actor == ActorId::new("bob")
             ));
         }
+    }
+
+    #[test]
+    fn message_body_cap_is_enforced_before_event_materialization() {
+        let signer = Ed25519Signer::from_seed([13; 32]);
+        let mut ids = SeqIds(200);
+        let mut alice = ApplyCtx::new(ActorId::new("alice"), 1_000, &signer, &mut ids);
+        let created = apply_command(
+            &DomainState::default(),
+            &CollabCommand::CreateSpace {
+                kind: SpaceKind::Team,
+                name: "ops".into(),
+            },
+            &mut alice,
+        )
+        .expect("create space");
+        let space = created[0].space_id;
+        let state = DomainState::from_events(&created);
+
+        let accepted = apply_command(
+            &state,
+            &CollabCommand::SendMessage {
+                space,
+                thread: None,
+                body: MessageBody::new("x".repeat(MAX_MESSAGE_BODY_BYTES)),
+            },
+            &mut alice,
+        )
+        .expect("the existing message-body boundary remains accepted");
+        assert!(matches!(
+            &accepted[0].kind,
+            CollabEventKind::MessagePosted { body, thread: None }
+                if body.as_str().len() == MAX_MESSAGE_BODY_BYTES
+        ));
+
+        let before_clock = alice.clock;
+        let before_next_id = alice.ids.0;
+        let denied = apply_command(
+            &state,
+            &CollabCommand::SendMessage {
+                space,
+                thread: None,
+                body: MessageBody::new("x".repeat(MAX_MESSAGE_BODY_BYTES + 1)),
+            },
+            &mut alice,
+        );
+
+        assert!(matches!(
+            denied,
+            Err(CollabError::Serde(message))
+                if message == format!("message body exceeds {MAX_MESSAGE_BODY_BYTES} bytes")
+        ));
+        assert_eq!(
+            alice.clock, before_clock,
+            "refusal must not mint an HLC tick"
+        );
+        assert_eq!(
+            alice.ids.0, before_next_id,
+            "refusal must not consume an event id"
+        );
     }
 
     fn state_with_unpinned_clips(

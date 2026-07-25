@@ -651,6 +651,12 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-ARCH-007 - Repair Workloads cockpit E2E wire, placement, and authorization
 
 - Status: Remaining
+- Progress (2026-07-25 container-lifecycle argv boundary): container lifecycle
+  helpers now terminate option parsing before systemd unit targets and bind
+  journal targets as `--unit=...`, preserving valid names while preventing
+  option-shaped targets from becoming commands. Focused lifecycle tests are
+  green at **9/9**; the integrated BigBoy mackesd gate is **4,117 passed, 0
+  failed, 1 ignored**. Live libvirt/Podman lifecycle evidence remains external.
 - Progress (2026-07-25 lifecycle-argv boundary): Workloads lifecycle verbs
   now reject option-shaped instance targets beginning with `-` before
   authorization/replay consumption or virsh execution. Focused cloud
@@ -1003,6 +1009,12 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-011 - Communications collaboration suite full replacement
 
 - Status: Remaining
+- Progress (2026-07-25 collaboration message-body boundary): the command
+  pipeline now rejects inline message, edit, and thread-reply bodies above
+  the existing 256 KiB projection contract before signing, ID allocation, or
+  HLC consumption; the exact boundary remains accepted. Focused regression is
+  green at **1/1** and the full collaboration-core farm suite at **70/70**.
+  Live WebRTC/SIP and sealed DO/LLM evidence remain external.
 - Progress (2026-07-25 import-map commit boundary): collaboration import-map
   saves now reject symlinked/non-directory parent components, allocate unique
   0600 create-new temporary files, sync the file and parent directory, and
@@ -1611,6 +1623,12 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-012 - Maps live-data overlays (zero-cost external feeds)
 
 - Status: Remaining
+- Progress (2026-07-25 Airspace repaint-liveness boundary): the visible
+  Airspace panel now schedules a 33 ms repaint heartbeat and feed folds wake
+  the bound egui context without pointer input; leaving the tab clears that
+  waker so hidden Airspace cannot keep the seat repainting. Focused Airspace
+  tests are green at **13/13** and the full Maps farm suite at **231/231**;
+  live MG90 scanner/worker evidence remains external.
 - Progress (2026-07-25 stale-route selection boundary): Maps navigation
   now refuses to start guidance when the selected route index is stale or out
   of range, preserving the preview and prior route state instead of claiming
@@ -1964,6 +1982,12 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-006 - Construct interface (Apple-HIG-principled workstation shell)
 
 - Status: Remaining
+- Progress (2026-07-25 top-rail reservation boundary): the Construct status
+  rail's tested geometry is now the production reservation path used by the
+  shell central view, keeping workspace content below the 24 px rail across
+  narrow through large supported viewports. The focused Construct module is
+  green at **21/21** and the integrated shell gate at **1,809/1,809**. Physical
+  DRM/compositor pixel proof remains external.
 - Progress (2026-07-25 detailed display-resolution interface): Construct
   Displays now expose separate resolution and refresh controls plus an
   expandable list of every advertised mode, marking the preferred/native mode

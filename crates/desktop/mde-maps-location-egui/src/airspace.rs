@@ -122,6 +122,10 @@ pub struct AirspaceState {
     /// Whether Airspace is active (scanning + rendering). Scans only when true.
     pub active: bool,
     pub signals: Vec<AirspaceSignal>,
+    /// The active panel's waker lets a daemon mirror update wake an idle egui
+    /// loop without waiting for pointer input. It is bound only while the
+    /// panel is mounted, so background updates cannot keep a hidden tab alive.
+    repaint_context: Option<egui::Context>,
     /// Availability reported by the daemon-side typed scanner mirror.
     pub source_status: mackes_mesh_types::airspace::AirspaceAvailability,
     pub show_wifi: bool,
@@ -149,6 +153,7 @@ impl AirspaceState {
         Self {
             active: false,
             signals: Vec::new(),
+            repaint_context: None,
             source_status: mackes_mesh_types::airspace::AirspaceAvailability::NoSource,
             show_wifi: true,
             show_cell: true,
@@ -532,6 +537,7 @@ impl AirspaceState {
         Self {
             active: true,
             signals,
+            repaint_context: None,
             source_status: mackes_mesh_types::airspace::AirspaceAvailability::Ready,
             show_wifi: true,
             show_cell: true,
@@ -582,6 +588,7 @@ impl AirspaceState {
             self.source_status = mackes_mesh_types::airspace::AirspaceAvailability::Offline;
             self.signals.clear();
             self.selected = None;
+            self.request_repaint();
             return;
         }
         // A source-less/offline status is not allowed to smuggle retained or
@@ -638,6 +645,13 @@ impl AirspaceState {
         {
             self.selected = None;
         }
+        self.request_repaint();
+    }
+
+    fn request_repaint(&self) {
+        if let Some(ctx) = &self.repaint_context {
+            ctx.request_repaint();
+        }
     }
 
     fn unix_now_ms() -> i64 {
@@ -670,6 +684,14 @@ impl AirspaceState {
             SignalKind::Bluetooth => self.show_bt = !self.show_bt,
         }
     }
+
+    /// Stop the visible-panel heartbeat when navigation leaves Airspace. The
+    /// next mount binds a fresh context, so a hidden tab cannot keep the seat
+    /// repainting after its last visible frame.
+    pub(crate) fn deactivate(&mut self) {
+        self.active = false;
+        self.repaint_context = None;
+    }
 }
 
 fn finite_or(v: f32, f: f32) -> f32 {
@@ -687,6 +709,7 @@ pub fn airspace_panel(ui: &mut Ui, state: &mut AirspaceState) {
     // flag. The panel is only mounted while visible; arming here makes the
     // sweep render and repaint even when the pointer is completely still.
     state.active = true;
+    state.repaint_context = Some(ui.ctx().clone());
     // Continuous repaint drives the sweep + signal flutter — the "active" look.
     // ~30 fps keeps the animation smooth without pinning the CPU.
     ui.ctx().request_repaint_after(AIRSPACE_REPAINT_INTERVAL);
@@ -1467,7 +1490,7 @@ mod tests {
     }
 
     #[test]
-    fn active_airspace_renders_and_requests_repaint_without_pointer_events() {
+    fn active_airspace_and_feed_updates_repaint_without_pointer_events() {
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let mut state = AirspaceState::live();
@@ -1490,6 +1513,31 @@ mod tests {
         // Run two event-free frames: the second one proves the panel keeps
         // producing paint and a future wake-up without pointer movement.
         let _ = frame(&ctx, &mut state, 0.0);
+        let snapshot = mackes_mesh_types::airspace::AirspaceSnapshot::from_survey(
+            "mg90-live",
+            42,
+            mackes_mesh_types::airspace::AirspaceSurvey {
+                scanned_at_ms: Some(41),
+                contacts: vec![mackes_mesh_types::airspace::AirspaceContact {
+                    id: "aa:bb".to_string(),
+                    kind: mackes_mesh_types::airspace::AirspaceContactKind::Wifi,
+                    name: "event-free-ap".to_string(),
+                    signal_dbm: -55,
+                    bearing_deg: 12.0,
+                    channel: Some(36),
+                    encryption: Some("WPA3".to_string()),
+                    notable: false,
+                    watchlist: false,
+                    own: false,
+                }],
+                gaps: Vec::new(),
+            },
+        );
+        state.refresh_from_wire_at(&snapshot, 43);
+        assert!(
+            ctx.has_requested_repaint(),
+            "a feed fold must wake an idle context without pointer input"
+        );
         let out = frame(&ctx, &mut state, 1.0 / 30.0);
         let repaint_delay = out
             .viewport_output
@@ -1502,8 +1550,8 @@ mod tests {
         );
         let texts = painted_texts(&out.shapes);
         assert!(
-            texts.iter().any(|text| text == "NO SCANNER FEED"),
-            "event-free frame still paints the honest airspace state: {texts:?}"
+            texts.iter().any(|text| text == "event-free-ap"),
+            "event-free frame paints the folded scanner update: {texts:?}"
         );
     }
 

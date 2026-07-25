@@ -38,7 +38,7 @@ pub(crate) fn handle_restart(
     }
 
     let unit = format!("{instance}{SERVICE_SUFFIX}");
-    let args = ["--user", "restart", unit.as_str()];
+    let args = ["--user", "restart", "--", unit.as_str()];
     match w.runner.run_tool(SYSTEMCTL, &args) {
         Err(error) => finish_mutation(
             w,
@@ -68,13 +68,13 @@ pub(crate) fn handle_logs(w: &CloudWorker, verb_name: &str, body: &CloudActionBo
         return reply;
     }
     let unit = format!("{instance}{SERVICE_SUFFIX}");
+    let unit_arg = format!("--unit={unit}");
     let args = [
         "--user",
         "--no-pager",
         "--lines",
         RECENT_LINES,
-        "--unit",
-        unit.as_str(),
+        unit_arg.as_str(),
     ];
     match w.runner.run_tool(JOURNALCTL, &args) {
         Err(error) => CloudReply {
@@ -145,7 +145,7 @@ pub(crate) fn handle_destroy(
     }
 
     let unit = format!("{instance}{SERVICE_SUFFIX}");
-    let args = ["--user", "disable", "--now", unit.as_str()];
+    let args = ["--user", "disable", "--now", "--", unit.as_str()];
     let mut outcome = match w.runner.run_tool(SYSTEMCTL, &args) {
         Err(error) => {
             return finish_mutation(
@@ -528,7 +528,12 @@ mod tests {
             runner.tool_calls.lock().unwrap().as_slice(),
             &[(
                 "systemctl".to_string(),
-                vec!["--user".into(), "restart".into(), "web.service".into()]
+                vec![
+                    "--user".into(),
+                    "restart".into(),
+                    "--".into(),
+                    "web.service".into(),
+                ]
             )]
         );
     }
@@ -557,8 +562,7 @@ mod tests {
                     "--no-pager".into(),
                     "--lines".into(),
                     "200".into(),
-                    "--unit".into(),
-                    "web.service".into(),
+                    "--unit=web.service".into(),
                 ]
             )]
         );
@@ -635,6 +639,7 @@ mod tests {
                     "--user".into(),
                     "disable".into(),
                     "--now".into(),
+                    "--".into(),
                     "web.service".into(),
                 ]
             )]

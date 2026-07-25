@@ -49,7 +49,47 @@
 
 use std::time::{Duration, Instant};
 
+use mde_egui::egui;
 use mde_egui::{Edge, EdgeSwipeEvent};
+
+/// The stable layout id for Construct's persistent top-rail reservation.
+///
+/// The status bar is painted by a foreground Area, but its footprint belongs
+/// to the shell layout. Keeping the reservation id and geometry in this
+/// module makes that contract explicit instead of leaving workspace surfaces
+/// to infer it from the painted chrome.
+const TOP_RAIL_LAYOUT_ID: &str = "construct-status-bar-space";
+
+/// The top-rail rectangle clipped to the supplied viewport.
+///
+/// A fixed rail height is intentional: the bar is a single-row shell contract
+/// at every supported form factor, including narrow/tablet viewports. The
+/// height is clipped only for a pathological viewport shorter than the rail so
+/// the returned rectangle always remains inside the screen.
+#[must_use]
+pub(crate) fn top_rail_rect(screen: egui::Rect) -> egui::Rect {
+    let height = screen
+        .height()
+        .max(0.0)
+        .min(crate::status_bar::STATUS_BAR_H);
+    egui::Rect::from_min_size(screen.left_top(), egui::vec2(screen.width(), height))
+}
+
+/// Reserve the Construct top rail before a workspace is laid out.
+///
+/// The visible status bar remains a foreground layer, but this empty
+/// `TopBottomPanel` consumes the exact same vertical band. Central/workspace
+/// panels mounted after this function therefore begin below the rail instead
+/// of painting underneath its clock and controls.
+pub(crate) fn reserve_top_rail(ctx: &egui::Context) -> egui::Rect {
+    let rail = top_rail_rect(ctx.screen_rect());
+    egui::TopBottomPanel::top(TOP_RAIL_LAYOUT_ID)
+        .exact_height(rail.height())
+        .resizable(false)
+        .frame(egui::Frame::NONE)
+        .show(ctx, |_ui| {});
+    rail
+}
 
 /// The five system intents of the locked input contract — §2.3's five rows
 /// (PLATFORM-INTERFACES Q11), each landing on one Construct chrome surface
@@ -787,5 +827,64 @@ mod tests {
         );
         assert!(chrome.take_intent(ChromeIntent::ControlCenter));
         assert!(chrome.pending.is_empty(), "every intent has one consumer");
+    }
+
+    /// WL-UX-006 — the top rail is persistent shell chrome, not an overlay
+    /// that may cover the first workspace row. Exercise the actual egui panel
+    /// reservation and tessellation at the supported narrow/tablet, desktop,
+    /// and large-desktop shapes so the contract cannot regress to a
+    /// foreground-only paint fix.
+    #[test]
+    fn workspace_render_starts_below_the_reserved_top_rail_at_supported_sizes() {
+        let sizes = [
+            (320.0, 96.0),    // narrow/tablet
+            (480.0, 360.0),   // compact desktop/tablet
+            (960.0, 640.0),   // standard desktop
+            (1920.0, 1080.0), // large desktop
+        ];
+
+        for (width, height) in sizes {
+            let ctx = egui::Context::default();
+            mde_egui::Style::install(&ctx);
+            let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(width, height));
+            let mut rail = None;
+            let mut workspace = None;
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ctx| {
+                    rail = Some(reserve_top_rail(ctx));
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE.fill(mde_egui::Style::BG))
+                        .show(ctx, |ui| {
+                            workspace = Some(ui.max_rect());
+                            // Force a real workspace primitive through the
+                            // headless render path, not just a rect query.
+                            ui.painter().rect_filled(
+                                ui.max_rect().shrink(1.0),
+                                egui::CornerRadius::ZERO,
+                                mde_egui::Style::SURFACE,
+                            );
+                        });
+                },
+            );
+
+            let rail = rail.expect("top rail reservation must run");
+            let workspace = workspace.expect("workspace must be laid out");
+            assert_eq!(rail, top_rail_rect(screen));
+            assert_eq!(workspace.top(), rail.bottom(), "{width}x{height}");
+            assert!(
+                workspace.top() >= crate::status_bar::STATUS_BAR_H,
+                "workspace overlaps the top rail at {width}x{height}: {workspace:?}"
+            );
+
+            let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
+            assert!(
+                !primitives.is_empty(),
+                "workspace render produced no primitives at {width}x{height}"
+            );
+        }
     }
 }
