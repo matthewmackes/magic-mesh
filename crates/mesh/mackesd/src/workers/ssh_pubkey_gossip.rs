@@ -49,6 +49,12 @@ pub const TICK_SECS: u64 = 60;
 const PUBLISHED_KEY_SCHEMA_VERSION: u64 = 1;
 const PUBLISHED_KEY_DOMAIN: &str = "mde-ssh-gossip-pubkey-v1";
 
+/// Keep local and replicated SSH public-key material bounded before any
+/// trimming, signature verification, or JSON materialization. A 256 KiB
+/// envelope is far beyond the size of one published key while still allowing
+/// a large authorized_keys managed block.
+const MAX_SSH_KEY_MATERIAL_BYTES: u64 = 256 * 1024;
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct PublishedKeyEnvelope {
     schema_version: u64,
@@ -97,6 +103,95 @@ fn decode_hex<const N: usize>(value: &str) -> Option<[u8; N]> {
 fn node_id_for_host(hostname: &str) -> String {
     let host = hostname.strip_prefix("peer:").unwrap_or(hostname);
     format!("peer:{host}")
+}
+
+/// Read SSH public-key material through a descriptor that is opened without
+/// following its final symlink and in non-blocking mode. The descriptor is
+/// checked before and after the bounded read so a replicated leaf that grows,
+/// shrinks, or changes file type during the read is rejected. The blocking
+/// filesystem work is kept off the async executor; callers can fail soft on
+/// any error and preserve the worker's existing best-effort behavior.
+async fn read_bounded_ssh_key_material(path: &Path) -> std::io::Result<String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || read_bounded_ssh_key_material_sync(&path))
+        .await
+        .map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("SSH key material reader task failed: {error}"),
+            )
+        })?
+}
+
+fn read_bounded_ssh_key_material_sync(path: &Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        options.custom_flags(0o400000 | 0o4000 | 0o2000000); // O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        options.custom_flags(0x100 | 0x4); // O_NOFOLLOW | O_NONBLOCK
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        if !std::fs::symlink_metadata(path)
+            .ok()
+            .is_some_and(|metadata| metadata.file_type().is_file())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "SSH key material is not a regular file",
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    if !std::fs::symlink_metadata(path)
+        .ok()
+        .is_some_and(|metadata| metadata.file_type().is_file())
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "SSH key material is not a regular file",
+        ));
+    }
+
+    let file = options.open(path)?;
+    let before = file.metadata()?;
+    if !before.file_type().is_file() || before.len() > MAX_SSH_KEY_MATERIAL_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "SSH key material exceeds the bounded regular-file limit",
+        ));
+    }
+
+    let capacity = usize::try_from(before.len())
+        .unwrap_or(MAX_SSH_KEY_MATERIAL_BYTES as usize)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(capacity);
+    (&file)
+        .take(MAX_SSH_KEY_MATERIAL_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    let after = file.metadata()?;
+    if !after.file_type().is_file()
+        || after.len() != before.len()
+        || bytes.len() as u64 != before.len()
+        || bytes.len() as u64 > MAX_SSH_KEY_MATERIAL_BYTES
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "SSH key material changed while being read",
+        ));
+    }
+
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
 fn signed_published_key(
@@ -339,7 +434,7 @@ impl SshPubkeyGossipWorker {
                 }
             }
         }
-        let Ok(pubkey) = tokio::fs::read_to_string(&pub_path).await else {
+        let Ok(pubkey) = read_bounded_ssh_key_material(&pub_path).await else {
             return;
         };
         let pubkey = pubkey.trim().to_string();
@@ -366,7 +461,11 @@ impl SshPubkeyGossipWorker {
             return;
         }
         let mine = lane.join(format!("{}.pub", self.hostname));
-        let current = tokio::fs::read_to_string(&mine).await.unwrap_or_default();
+        let current = match read_bounded_ssh_key_material(&mine).await {
+            Ok(current) => current,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(_) => return,
+        };
         let published = signed_published_key(signing_key, &self.hostname, scope, &pubkey);
         if current.trim() != published {
             if let Err(e) = tokio::fs::write(&mine, format!("{published}\n")).await {
@@ -380,7 +479,7 @@ impl SshPubkeyGossipWorker {
             while let Ok(Some(entry)) = rd.next_entry().await {
                 let p = entry.path();
                 if p.extension().is_some_and(|e| e == "pub") {
-                    if let Ok(content) = tokio::fs::read_to_string(&p).await {
+                    if let Ok(content) = read_bounded_ssh_key_material(&p).await {
                         if let Some(host) = p.file_stem().and_then(|name| name.to_str()) {
                             let expected_node_id = node_id_for_host(host);
                             if let Some(line) =
@@ -398,9 +497,11 @@ impl SshPubkeyGossipWorker {
 
         // 4. Merge into authorized_keys (write-on-change, 0600).
         let ak_path = ssh_dir.join("authorized_keys");
-        let existing = tokio::fs::read_to_string(&ak_path)
-            .await
-            .unwrap_or_default();
+        let existing = match read_bounded_ssh_key_material(&ak_path).await {
+            Ok(existing) => existing,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(_) => return,
+        };
         let merged = merge_authorized_keys(&existing, &keys);
         if merged != existing {
             if tokio::fs::write(&ak_path, &merged).await.is_ok() {
@@ -503,6 +604,45 @@ mod tests {
         assert!(!valid_pubkey_line("ssh-ed25519"));
         assert!(!valid_pubkey_line("# comment"));
         assert!(!valid_pubkey_line(""));
+    }
+
+    #[tokio::test]
+    async fn bounded_key_material_rejects_oversized_input() {
+        let dir = tempfile::tempdir().expect("key material directory");
+        let path = dir.path().join("oversized.pub");
+        std::fs::write(
+            &path,
+            vec![b'x'; usize::try_from(MAX_SSH_KEY_MATERIAL_BYTES).unwrap() + 1],
+        )
+        .expect("oversized key material");
+
+        assert!(read_bounded_ssh_key_material(&path).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn bounded_key_material_rejects_invalid_utf8() {
+        let dir = tempfile::tempdir().expect("key material directory");
+        let path = dir.path().join("invalid.pub");
+        std::fs::write(&path, [b's', b's', b'h', b'-', 0xff]).expect("invalid UTF-8 key material");
+
+        assert!(read_bounded_ssh_key_material(&path).await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bounded_key_material_rejects_final_symlinks_and_special_files() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("key material directory");
+        let target = dir.path().join("target.pub");
+        let link = dir.path().join("link.pub");
+        std::fs::write(&target, KEY_A).expect("target key material");
+        symlink(&target, &link).expect("final symlink");
+
+        assert!(read_bounded_ssh_key_material(&link).await.is_err());
+        assert!(read_bounded_ssh_key_material(Path::new("/dev/null"))
+            .await
+            .is_err());
     }
 
     #[test]

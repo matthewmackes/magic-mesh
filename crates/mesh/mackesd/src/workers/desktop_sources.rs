@@ -40,6 +40,7 @@
 #![cfg(feature = "async-services")]
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -96,6 +97,11 @@ pub const DESKTOP_MDNS_TYPES: &[&str] = &["_rdp._tcp", "_rfb._tcp", "_spice._tcp
 /// CHOOSER-9 later lifts manual sources onto the mesh-synced plane; the
 /// node-local file keeps them durable across restarts today.
 pub const MANUAL_STORE_FILE: &str = "manual-sources.json";
+
+/// Manual sources are compact endpoint records. Keep the persisted collection
+/// bounded before JSON parsing while leaving ample room for a large operator
+/// roster.
+const MAX_MANUAL_STORE_BYTES: usize = 1024 * 1024;
 
 // ───────────────────────────── data model ─────────────────────────────
 
@@ -662,11 +668,76 @@ fn manual_store_path(store_root: &Path) -> PathBuf {
     store_root.join(MANUAL_STORE_FILE)
 }
 
+/// Read the node-local manual-source store through the descriptor that will be
+/// parsed. Refuse final symlinks, blocking special files, oversized input,
+/// invalid UTF-8, and files that change while being materialized.
+fn read_bounded_manual_store(path: &Path) -> std::io::Result<String> {
+    #[cfg(unix)]
+    let file: std::fs::File = {
+        use rustix::fs::{Mode, OFlags};
+
+        rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?
+        .into()
+    };
+    #[cfg(not(unix))]
+    let file = {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "manual source store is a final symlink",
+            ));
+        }
+        std::fs::File::open(path)?
+    };
+
+    let initial = file.metadata()?;
+    if !initial.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "manual source store is not a regular file",
+        ));
+    }
+    let initial_len = initial.len();
+    if initial_len > MAX_MANUAL_STORE_BYTES as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("manual source store exceeds {MAX_MANUAL_STORE_BYTES}-byte limit"),
+        ));
+    }
+
+    let capacity = usize::try_from(initial_len)
+        .unwrap_or(MAX_MANUAL_STORE_BYTES)
+        .min(MAX_MANUAL_STORE_BYTES)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(capacity);
+    let mut limited = file.take((MAX_MANUAL_STORE_BYTES as u64).saturating_add(1));
+    limited.read_to_end(&mut bytes)?;
+    let file = limited.into_inner();
+    let final_len = file.metadata()?.len();
+    if bytes.len() > MAX_MANUAL_STORE_BYTES
+        || bytes.len() as u64 != initial_len
+        || final_len != initial_len
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "manual source store changed or exceeds its byte limit",
+        ));
+    }
+
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
 /// Load the node-local manual-source store (absent/corrupt → empty, never
 /// fatal — a half-written file must not kill the worker).
 #[must_use]
 pub fn load_manual_sources(store_root: &Path) -> Vec<ManualSource> {
-    std::fs::read_to_string(manual_store_path(store_root))
+    read_bounded_manual_store(&manual_store_path(store_root))
         .ok()
         .and_then(|data| serde_json::from_str(&data).ok())
         .unwrap_or_default()
@@ -1556,6 +1627,44 @@ mod tests {
         // Corrupt store → empty, never fatal.
         std::fs::write(dir.path().join(MANUAL_STORE_FILE), "{ not json").unwrap();
         assert!(load_manual_sources(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn manual_store_rejects_oversized_invalid_utf8_and_special_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(MANUAL_STORE_FILE);
+
+        std::fs::write(&path, vec![b'x'; MAX_MANUAL_STORE_BYTES + 1]).unwrap();
+        assert!(
+            read_bounded_manual_store(&path).is_err(),
+            "oversized manual stores must be rejected before JSON parsing"
+        );
+
+        std::fs::write(&path, [0xff, 0xfe]).unwrap();
+        assert_eq!(
+            load_manual_sources(dir.path()),
+            Vec::<ManualSource>::new(),
+            "invalid UTF-8 must fail soft to an empty manual roster"
+        );
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(
+            read_bounded_manual_store(&path).is_err(),
+            "directories must not be consumed as manual stores"
+        );
+
+        #[cfg(unix)]
+        {
+            std::fs::remove_dir(&path).unwrap();
+            let target = dir.path().join("target.json");
+            std::fs::write(&target, "[]").unwrap();
+            std::os::unix::fs::symlink(&target, &path).unwrap();
+            assert!(
+                read_bounded_manual_store(&path).is_err(),
+                "final symlinks must not be followed"
+            );
+        }
     }
 
     // ── the merge fold ──

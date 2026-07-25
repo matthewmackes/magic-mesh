@@ -241,6 +241,14 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-SEC-006 - Keep Nebula private keys local to their owning node
 
 - Status: Remaining
+- Progress (2026-07-25 SSH public-key gossip materialization boundary): local
+  and replicated SSH public-key envelopes plus the managed `authorized_keys`
+  read now use bounded no-follow regular-file readers that reject special
+  files, final symlinks, oversized or changing input, and invalid UTF-8 before
+  signature or key materialization. The focused farm gate is green at
+  **12/12**, and the integrated BigBoy `mackesd --lib --features
+  async-services` gate is green at **4,080 passed, 0 failed, 1 ignored**;
+  live Nebula rotation/reconnect evidence remains external.
 - Progress (2026-07-25 mesh-init materialization boundary): mesh-init now
   reads requester public keys, CA certs, signed peer certs, and the optional
   enrollment endpoint cert through bounded no-follow readers, preserving the
@@ -1715,6 +1723,16 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-006 - Construct interface (Apple-HIG-principled workstation shell)
 
 - Status: Remaining
+- Progress (2026-07-25 desktop-source and Browser persistence boundaries): the
+  node-local desktop-source roster plus Browser offline-cache records and CEF
+  security manifests now use bounded no-follow regular-file readers that
+  reject special files, final symlinks, oversized or changing input, and
+  invalid UTF-8 before JSON/key-value materialization. Focused farm gates are
+  green at **24/24** desktop-source tests, **15/15** offline-cache tests plus
+  **1/1** hostile regression, and **8/8** security-update tests. The integrated
+  `mde-browser-workers --lib` gate is green at **120/120** after correcting
+  the outbox-relative-path assertion exposed by the full run. Live pointer,
+  pixel, physical, and VDI acceptance remain external evidence.
 - Progress (2026-07-25 Mesh Map/This Node snapshot boundary): both shell panels
   now read the shared mesh-status snapshot through bounded no-follow
   descriptor-backed regular-file readers that reject special files, symlinks,
