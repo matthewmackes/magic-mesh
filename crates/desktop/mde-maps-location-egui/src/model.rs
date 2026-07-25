@@ -691,8 +691,13 @@ impl MapsLocationSurface {
         // Retract the seed's "no mirror yet" / "simulator is active" gaps now a
         // live mirror exists and fold the adapter's own honest gap report in
         // their place.
-        self.real_hardware_gaps
-            .retain(|g| g != SIMULATED_MG90_GAP_NOTE && g != AWAITING_MIRROR_GAP_NOTE);
+        self.real_hardware_gaps.retain(|g| {
+            g != SIMULATED_MG90_GAP_NOTE
+                && g != AWAITING_MIRROR_GAP_NOTE
+                && !g.starts_with(VEHICLE_LIVE_NOTE_PREFIX)
+                && !g.starts_with(VEHICLE_GAP_NOTE_PREFIX)
+                && g != VEHICLE_GAPS_CAPPED_NOTE
+        });
         if v.gaps.is_empty() {
             let note = format!(
                 "Live vehicle-gateway mirror active for node `{}` ({} {}).",
@@ -702,11 +707,15 @@ impl MapsLocationSurface {
                 self.real_hardware_gaps.insert(0, note);
             }
         } else {
-            for gap in &v.gaps {
-                let note = format!("Vehicle-gateway adapter gap: {gap}");
+            for gap in v.gaps.iter().take(MAX_RETAINED_VEHICLE_GAPS) {
+                let note = bounded_gap_note(VEHICLE_GAP_NOTE_PREFIX, gap);
                 if !self.real_hardware_gaps.contains(&note) {
                     self.real_hardware_gaps.push(note);
                 }
+            }
+            if v.gaps.len() > MAX_RETAINED_VEHICLE_GAPS {
+                self.real_hardware_gaps
+                    .push(VEHICLE_GAPS_CAPPED_NOTE.to_string());
             }
         }
     }
@@ -1119,6 +1128,33 @@ fn read_air_quality_mirror(
 /// intentionally collapse to `None`: one unhealthy feed must not prevent the
 /// remaining map layers from folding during the same poll.
 const MAX_RETAINED_OVERLAY_BYTES: usize = 4 * 1024 * 1024;
+
+/// The vehicle mirror is latest-wins. Keep its diagnostic projection latest-wins
+/// too, rather than retaining every distinct producer gap ever observed.
+const MAX_RETAINED_VEHICLE_GAPS: usize = 32;
+/// Gap text is operator-facing diagnostic data, not an unbounded log channel.
+const MAX_RETAINED_GAP_TEXT_BYTES: usize = 512;
+const VEHICLE_LIVE_NOTE_PREFIX: &str = "Live vehicle-gateway mirror active for node `";
+const VEHICLE_GAP_NOTE_PREFIX: &str = "Vehicle-gateway adapter gap: ";
+const VEHICLE_GAPS_CAPPED_NOTE: &str = "Vehicle-gateway adapter gaps capped at 32 entries.";
+
+fn bounded_gap_note(prefix: &str, gap: &str) -> String {
+    let mut note = String::with_capacity(prefix.len() + gap.len().min(MAX_RETAINED_GAP_TEXT_BYTES));
+    note.push_str(prefix);
+    let mut used = 0;
+    for character in gap.chars() {
+        let character_bytes = character.len_utf8();
+        if used + character_bytes > MAX_RETAINED_GAP_TEXT_BYTES {
+            break;
+        }
+        note.push(character);
+        used += character_bytes;
+    }
+    if used < gap.len() {
+        note.push('\u{2026}');
+    }
+    note
+}
 
 fn retained_overlay_body(
     persist: &mde_bus::persist::Persist,
@@ -4444,6 +4480,46 @@ mod tests {
                 .any(|g| g == SIMULATED_MG90_GAP_NOTE),
             "live mirror retracts the simulator gap note"
         );
+    }
+
+    #[test]
+    fn live_mirror_gap_projection_is_bounded_and_latest_wins() {
+        use mackes_mesh_types::vehicle::VehicleState as WireVehicleState;
+
+        let mut mirror = WireVehicleState::offline("eagle");
+        mirror.online = true;
+        mirror.model = "MG90".to_string();
+        mirror.mgos_version = "4.3.0.1".to_string();
+        mirror.gaps = (0..(MAX_RETAINED_VEHICLE_GAPS + 8))
+            .map(|index| format!("gap-{index}-{}", "x".repeat(MAX_RETAINED_GAP_TEXT_BYTES + 32)))
+            .collect();
+        mirror.published_at_ms = test_now_ms();
+
+        let mut state = MapsLocationSurface::simulated();
+        state.refresh_from_vehicle(&mirror);
+
+        let adapter_notes: Vec<_> = state
+            .real_hardware_gaps
+            .iter()
+            .filter(|note| note.starts_with(VEHICLE_GAP_NOTE_PREFIX))
+            .collect();
+        assert_eq!(adapter_notes.len(), MAX_RETAINED_VEHICLE_GAPS);
+        assert!(adapter_notes
+            .iter()
+            .all(|note| note.len() <= VEHICLE_GAP_NOTE_PREFIX.len() + MAX_RETAINED_GAP_TEXT_BYTES + 3));
+        assert!(state
+            .real_hardware_gaps
+            .contains(&VEHICLE_GAPS_CAPPED_NOTE.to_string()));
+
+        mirror.gaps.clear();
+        state.refresh_from_vehicle(&mirror);
+        assert!(!state
+            .real_hardware_gaps
+            .iter()
+            .any(|note| note.starts_with(VEHICLE_GAP_NOTE_PREFIX)));
+        assert!(!state
+            .real_hardware_gaps
+            .contains(&VEHICLE_GAPS_CAPPED_NOTE.to_string()));
     }
 
     #[test]

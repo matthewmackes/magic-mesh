@@ -53,6 +53,11 @@ const MAX_ENVELOPE_JSON_BYTES: usize = 256 * 1024;
 const MAX_DOCUMENT_SESSIONS: usize = 1024;
 const MAX_DOCUMENT_PARTICIPANTS: usize = 256;
 const MAX_READ_MODEL_TEXT_BYTES: usize = 64 * 1024;
+// Keep one conversation read bounded even when a peer has authored a very
+// long history. The query probes one row beyond the accepted count so callers
+// receive an error instead of an arbitrary truncated timeline.
+const MAX_TIMELINE_MESSAGES: usize = 4096;
+const MAX_MESSAGE_BODY_BYTES: usize = 256 * 1024;
 
 /// The materialized read tables, in a fixed order — used by [`dump_tables`] and
 /// the per-space rebuild.
@@ -595,27 +600,34 @@ impl Projection {
     }
 
     fn messages_where(&self, space: SpaceId, thread: Option<ThreadId>) -> Result<Vec<MessageView>> {
+        let body_limit = MAX_MESSAGE_BODY_BYTES + 1;
+        let row_limit = MAX_TIMELINE_MESSAGES + 1;
         let sql = match thread {
-            Some(_) => {
-                "SELECT event_id, author, created_ms, body, edited, deleted \
+            Some(_) => format!(
+                "SELECT event_id, author, created_ms, \
+                 COALESCE(substr(CAST(body AS BLOB), 1, {body_limit}), X''), edited, deleted, \
+                 COALESCE(length(CAST(body AS BLOB)), 0) \
                  FROM messages WHERE space_id = ?1 AND thread_id = ?2 \
-                 ORDER BY clock_wall, clock_counter, event_id"
-            }
-            None => {
-                "SELECT event_id, author, created_ms, body, edited, deleted \
+                 ORDER BY clock_wall, clock_counter, event_id LIMIT {row_limit}"
+            ),
+            None => format!(
+                "SELECT event_id, author, created_ms, \
+                 COALESCE(substr(CAST(body AS BLOB), 1, {body_limit}), X''), edited, deleted, \
+                 COALESCE(length(CAST(body AS BLOB)), 0) \
                  FROM messages WHERE space_id = ?1 AND thread_id IS NULL \
-                 ORDER BY clock_wall, clock_counter, event_id"
-            }
+                 ORDER BY clock_wall, clock_counter, event_id LIMIT {row_limit}"
+            ),
         };
-        let mut stmt = self.conn.prepare(sql)?;
+        let mut stmt = self.conn.prepare(&sql)?;
         let map = |r: &rusqlite::Row<'_>| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, i64>(2)?,
-                r.get::<_, String>(3)?,
+                r.get::<_, Vec<u8>>(3)?,
                 r.get::<_, i64>(4)?,
                 r.get::<_, i64>(5)?,
+                r.get::<_, i64>(6)?,
             ))
         };
         let collected: Vec<_> = match thread {
@@ -626,8 +638,21 @@ impl Projection {
                 .query_map(params![space.to_string()], map)?
                 .collect::<std::result::Result<Vec<_>, _>>()?,
         };
+        if collected.len() > MAX_TIMELINE_MESSAGES {
+            return Err(CollabError::Serde(format!(
+                "conversation timeline exceeds {MAX_TIMELINE_MESSAGES} messages"
+            )));
+        }
         let mut out = Vec::new();
-        for (event, author, created, body, edited, deleted) in collected {
+        for (event, author, created, body, edited, deleted, body_bytes) in collected {
+            if body_bytes > i64::try_from(MAX_MESSAGE_BODY_BYTES).unwrap_or(i64::MAX) {
+                return Err(CollabError::Serde(format!(
+                    "message body exceeds {MAX_MESSAGE_BODY_BYTES} bytes"
+                )));
+            }
+            let body = String::from_utf8(body).map_err(|error| {
+                CollabError::Serde(format!("message body is not UTF-8: {error}"))
+            })?;
             let id = parse_event(&event)?;
             out.push(MessageView {
                 event_id: id,
@@ -658,26 +683,40 @@ impl Projection {
     }
 
     fn message_by_id(&self, space: SpaceId, id: EventId) -> Result<Option<MessageView>> {
+        let body_limit = MAX_MESSAGE_BODY_BYTES + 1;
         let row = self
             .conn
             .query_row(
-                "SELECT author, created_ms, body, edited, deleted FROM messages \
-                 WHERE space_id = ?1 AND event_id = ?2",
+                &format!(
+                    "SELECT author, created_ms, \
+                     COALESCE(substr(CAST(body AS BLOB), 1, {body_limit}), X''), edited, deleted, \
+                     COALESCE(length(CAST(body AS BLOB)), 0) FROM messages \
+                     WHERE space_id = ?1 AND event_id = ?2"
+                ),
                 params![space.to_string(), id.to_string()],
                 |r| {
                     Ok((
                         r.get::<_, String>(0)?,
                         r.get::<_, i64>(1)?,
-                        r.get::<_, String>(2)?,
+                        r.get::<_, Vec<u8>>(2)?,
                         r.get::<_, i64>(3)?,
                         r.get::<_, i64>(4)?,
+                        r.get::<_, i64>(5)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((author, created, body, edited, deleted)) = row else {
+        let Some((author, created, body, edited, deleted, body_bytes)) = row else {
             return Ok(None);
         };
+        if body_bytes > i64::try_from(MAX_MESSAGE_BODY_BYTES).unwrap_or(i64::MAX) {
+            return Err(CollabError::Serde(format!(
+                "message body exceeds {MAX_MESSAGE_BODY_BYTES} bytes"
+            )));
+        }
+        let body = String::from_utf8(body).map_err(|error| {
+            CollabError::Serde(format!("message body is not UTF-8: {error}"))
+        })?;
         Ok(Some(MessageView {
             event_id: id,
             author: ActorId::new(author),
@@ -1490,6 +1529,7 @@ fn summarize(kind_tag: &str) -> String {
 mod tests {
     use super::{
         Projection, MAX_DOCUMENT_PARTICIPANTS, MAX_DOCUMENT_SESSIONS, MAX_ENVELOPE_JSON_BYTES,
+        MAX_MESSAGE_BODY_BYTES, MAX_TIMELINE_MESSAGES,
     };
     use crate::error::CollabError;
     use crate::signer::{Ed25519Signer, EventSigner};
@@ -1841,6 +1881,59 @@ mod tests {
         assert!(matches!(
             row_error,
             CollabError::Serde(message) if message.contains("session read model exceeds")
+        ));
+    }
+
+    #[test]
+    fn conversation_timeline_fails_closed_before_message_fanout_or_body_overflow() {
+        let projection = Projection::open_in_memory().expect("open projection");
+        let space = space_id(274);
+        for index in 0..=MAX_TIMELINE_MESSAGES {
+            projection
+                .connection()
+                .execute(
+                    "INSERT INTO messages \
+                     (space_id, event_id, author, created_ms, thread_id, body, edited, deleted, delivery, clock_wall, clock_counter) \
+                     VALUES (?1, ?2, 'alice', 1, NULL, 'bounded', 0, 0, 'sent', ?3, 0)",
+                    rusqlite::params![
+                        space.to_string(),
+                        Uuid::from_u128(20_000 + index as u128).to_string(),
+                        index as i64,
+                    ],
+                )
+                .expect("insert message row");
+        }
+        let row_error = projection
+            .conversation_timeline(space, None)
+            .expect_err("message fan-out must be rejected");
+        assert!(matches!(
+            row_error,
+            CollabError::Serde(message) if message.contains("timeline exceeds")
+        ));
+
+        projection
+            .connection()
+            .execute("DELETE FROM messages", [])
+            .expect("clear test messages");
+        projection
+            .connection()
+            .execute(
+                "INSERT INTO messages \
+                 (space_id, event_id, author, created_ms, thread_id, body, edited, deleted, delivery, clock_wall, clock_counter) \
+                 VALUES (?1, ?2, 'alice', 1, NULL, ?3, 0, 0, 'sent', 1, 0)",
+                rusqlite::params![
+                    space.to_string(),
+                    Uuid::from_u128(30_000).to_string(),
+                    "x".repeat(MAX_MESSAGE_BODY_BYTES + 1),
+                ],
+            )
+            .expect("insert oversized message body");
+        let body_error = projection
+            .conversation_timeline(space, None)
+            .expect_err("message body must be rejected");
+        assert!(matches!(
+            body_error,
+            CollabError::Serde(message) if message.contains("message body exceeds")
         ));
     }
 

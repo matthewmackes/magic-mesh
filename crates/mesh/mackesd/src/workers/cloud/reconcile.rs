@@ -21,7 +21,7 @@
 //! [`DriftFlag::Unknown`] rather than a fabricated `InSync`; a missing desired dir is
 //! an honest empty slice, never an invented workload.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use mackes_mesh_types::cloud::{
@@ -36,6 +36,9 @@ use super::runner::CloudRunner;
 /// realization of the `/mcnf/cloud/desired/…` key namespace.
 const DESIRED_SUBTREE: &str = "mcnf/cloud/desired";
 const DESIRED_DOC_SUFFIX: &str = ".json";
+/// Keep one hostile desired document from forcing an unbounded allocation while
+/// leaving room for pretty-printed specs and their optional raw-HCL fragment.
+const MAX_DESIRED_DOC_BYTES: usize = 256 * 1024;
 
 /// The directory holding node `node`'s desired-state docs (`<state_root>/mcnf/cloud/
 /// desired/<node>/`).
@@ -181,6 +184,36 @@ fn write_desired_doc_atomic(path: &Path, body: &str) -> Result<(), String> {
     result
 }
 
+/// Read one desired document through a hard byte ceiling. The metadata check
+/// avoids reading an obviously oversized file, while `take(limit + 1)` closes
+/// the race where a file grows after metadata was inspected.
+fn read_desired_doc_bounded(path: &Path) -> std::io::Result<String> {
+    let file = std::fs::File::open(path)?;
+    let limit = u64::try_from(MAX_DESIRED_DOC_BYTES).unwrap_or(u64::MAX);
+    let declared_len = file.metadata()?.len();
+    if declared_len > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("desired document exceeds {MAX_DESIRED_DOC_BYTES}-byte limit"),
+        ));
+    }
+
+    let capacity = usize::try_from(declared_len)
+        .unwrap_or(MAX_DESIRED_DOC_BYTES)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_DESIRED_DOC_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("desired document exceeds {MAX_DESIRED_DOC_BYTES}-byte limit"),
+        ));
+    }
+    String::from_utf8(bytes).map_err(|error| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+    })
+}
+
 /// Read node `node`'s desired-state slice — every `*.json` doc under its desired
 /// dir, parsed into a [`WorkloadSpec`], sorted by name for a deterministic render.
 ///
@@ -210,7 +243,7 @@ pub(crate) fn read_desired_slice(state_root: &Path, node: &str) -> Vec<WorkloadS
         if !metadata.file_type().is_file() {
             continue;
         }
-        let Ok(body) = std::fs::read_to_string(&path) else {
+        let Ok(body) = read_desired_doc_bounded(&path) else {
             continue;
         };
         if let Ok(spec) = serde_json::from_str::<WorkloadSpec>(&body) {
@@ -262,7 +295,7 @@ fn read_desired_slice_strict(
                 path.display()
             ));
         }
-        let body = std::fs::read_to_string(&path)
+        let body = read_desired_doc_bounded(&path)
             .map_err(|e| format!("read desired document {}: {e}", path.display()))?;
         let spec = serde_json::from_str::<WorkloadSpec>(&body)
             .map_err(|e| format!("malformed desired document {}: {e}", path.display()))?;
@@ -645,6 +678,33 @@ mod tests {
         assert!(
             runner.tfvars_written.lock().unwrap().is_empty(),
             "malformed desired state must not reach the plan backend"
+        );
+    }
+
+    #[test]
+    fn desired_read_bounds_oversized_documents_in_both_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_desired_doc(root, &spec("good", "eagle")).unwrap();
+        write_desired_doc(root, &spec("huge", "eagle")).unwrap();
+        let oversized = desired_doc_path(root, "eagle", "huge").unwrap();
+        std::fs::write(&oversized, vec![b'x'; MAX_DESIRED_DOC_BYTES + 1]).unwrap();
+
+        // The mirror reader keeps its existing best-effort contract: a bad
+        // document is skipped while a valid sibling remains visible.
+        let slice = read_desired_slice(root, "eagle");
+        assert_eq!(
+            slice.iter().map(|spec| spec.name.as_str()).collect::<Vec<_>>(),
+            ["good"]
+        );
+
+        // The reconciliation reader fails closed before any JSON/backend work.
+        let error = read_desired_slice_strict(root, "eagle")
+            .expect_err("an oversized desired document must gate reconciliation");
+        let limit_error = format!("exceeds {MAX_DESIRED_DOC_BYTES}-byte limit");
+        assert!(
+            error.contains(&limit_error),
+            "unexpected error: {error}"
         );
     }
 

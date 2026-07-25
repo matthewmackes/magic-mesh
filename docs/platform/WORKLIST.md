@@ -478,6 +478,12 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-ARCH-007 - Repair Workloads cockpit E2E wire, placement, and authorization
 
 - Status: Remaining
+- Progress (2026-07-25 desired-document read boundary): cloud reconciliation
+  now reads desired documents through a 256 KiB bounded regular-file path before
+  JSON materialization. Best-effort mirror reads skip an oversized sibling while
+  strict reconciliation fails closed; the integrated BigBoy `mackesd --lib`
+  gate is green at **3,998 passed, 1 ignored**. Live libvirt/Podman evidence
+  remains external.
 - Progress (2026-07-24 image provider boundary): `image-build` now caps raw
   requests before verb parsing, bounds replicated promotion/SHA sidecars,
   limits roster rows, and keeps reply/error/raw-log text bounded. The focused
@@ -697,6 +703,13 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-011 - Communications collaboration suite full replacement
 
 - Status: Remaining
+- Progress (2026-07-25 conversation timeline boundary): collaboration
+  projections now probe one row beyond a 4,096-message timeline limit and bound
+  message bodies to 256 KiB before UTF-8 materialization, including the
+  single-message lookup path. Deleted tombstones retain an empty body instead
+  of surfacing a SQLite NULL. The focused projection regression is green at
+  1/1 and the full `.90` `mde-collab-core` library gate at **57/57**; live
+  media/LLM evidence remains external.
 - Progress (2026-07-24 Documents presentation boundary): document titles,
   summaries, review comments, and Visual Markdown previews are now bounded and
   bidi/control-safe at the egui boundary while Source, Save, and Export retain
@@ -1489,6 +1502,11 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-006 - Construct interface (Apple-HIG-principled workstation shell)
 
 - Status: Remaining
+- Progress (2026-07-25 Front Door query boundary): launcher query state and
+  ranking now enforce a UTF-8-safe 256-character cap, with the egui input
+  applying the same limit to keystrokes and oversized paste/restored state.
+  The focused farm query and paste regressions are green at 1/1 each; live
+  pixel and physical acceptance remains external evidence.
 - Progress (2026-07-25 shared typography adoption): the menu bar now uses the
   shared semantic typography contract for its mono workspace title, tracked
   menu labels, captions, menu items, and status chips; shared toast/widgets,
@@ -1872,6 +1890,11 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-007 - Car interface (CarPlay-principled vehicle mode)
 
 - Status: Remaining
+- Progress (2026-07-25 vehicle diagnostic projection boundary): live vehicle
+  mirror adapter gaps are now latest-wins, bounded to 32 entries and 512 bytes
+  per diagnostic before Maps renders them, with an explicit capped marker and
+  stale-note retraction. The focused `.50` live-mirror slice is green at 4/4;
+  live MG90 and physical Car evidence remains external.
 - Progress (2026-07-24 Car-keymap persistence boundary): persisted key bindings
   now use a regular-file, 64 KiB bounded read before JSON materialization and
   fail closed for oversized/corrupt data while preserving unknown-key streaming

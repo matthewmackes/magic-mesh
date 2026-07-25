@@ -21,6 +21,10 @@ const AREA_ID: &str = "shell-front-door-omnibox";
 const INPUT_ID: &str = "shell-front-door-omnibox-input";
 const RESULTS_SCROLL_ID: &str = "shell-front-door-results-scroll";
 const MAX_HITS: usize = 12;
+// Keep hostile paste/restored state from making every local search producer and
+// the shared ranker process an arbitrarily large query. This is intentionally a
+// generous search-input budget; normal launcher queries are unaffected.
+const MAX_QUERY_CHARS: usize = 256;
 // PLATFORM-INTERFACES Q15 — Spotlight card width: min(640px, screen − 2×SP_XL).
 const PANEL_W: f32 = 640.0;
 const ROW_H: f32 = 42.0;
@@ -535,7 +539,7 @@ impl FrontDoorState {
     }
 
     pub(crate) fn query(&self) -> &str {
-        &self.query
+        bounded_front_door_query(&self.query)
     }
 
     pub(crate) fn selected_peer_node(
@@ -543,11 +547,11 @@ impl FrontDoorState {
         items: Vec<SearchItem<FrontDoorTarget>>,
         sources: FrontDoorSourceStatus,
     ) -> Option<String> {
-        if !self.open || run_command_mode(&self.query) {
+        if !self.open || run_command_mode(self.query()) {
             return None;
         }
         let hits = visible_front_door_hits_for_filter_with_sources(
-            &self.query,
+            self.query(),
             self.filter,
             items,
             sources,
@@ -805,7 +809,20 @@ pub(crate) fn ranked_front_door_hits(
     query: &str,
     items: Vec<SearchItem<FrontDoorTarget>>,
 ) -> Vec<SearchHit<FrontDoorTarget>> {
-    ranked_hits(query, items, MAX_HITS)
+    ranked_hits(bounded_front_door_query(query), items, MAX_HITS)
+}
+
+fn bounded_front_door_query(query: &str) -> &str {
+    query
+        .char_indices()
+        .nth(MAX_QUERY_CHARS)
+        .map_or(query, |(byte, _)| &query[..byte])
+}
+
+fn cap_front_door_query(query: &mut String) {
+    if let Some((byte, _)) = query.char_indices().nth(MAX_QUERY_CHARS) {
+        query.truncate(byte);
+    }
 }
 
 fn run_command_query(query: &str) -> Option<&str> {
@@ -911,6 +928,11 @@ pub(crate) fn front_door_panel_with_sources(
     if !state.open {
         return None;
     }
+    // `TextEdit::char_limit` bounds keystrokes and pastes. Keep this second
+    // guard for callers that seed the ephemeral state directly (for example,
+    // restored UI state or an accessibility harness) before layout and source
+    // materialization can observe it.
+    cap_front_door_query(&mut state.query);
 
     let screen = ctx.screen_rect();
     let panel_rect = front_door_panel_rect(screen, state.expanded);
@@ -1351,6 +1373,7 @@ fn front_door_search_field(
                 egui::TextEdit::singleline(query)
                     .id(input_id)
                     .frame(false)
+                    .char_limit(MAX_QUERY_CHARS)
                     .font(Style::typography_font(TypographyRole::Title))
                     .text_color(Style::TEXT)
                     .hint_text(
@@ -3571,6 +3594,47 @@ mod tests {
             front_door_clicked_elsewhere_should_close(&mut state, true),
             "outside clicks after an inside frame should close normally"
         );
+    }
+
+    #[test]
+    fn front_door_query_cap_is_utf8_safe_and_bounded() {
+        let mut query = format!("🙂{}", "x".repeat(MAX_QUERY_CHARS + 32));
+        cap_front_door_query(&mut query);
+
+        assert_eq!(query.chars().count(), MAX_QUERY_CHARS);
+        assert!(query.starts_with('🙂'));
+        assert!(query.is_char_boundary(query.len()));
+        assert_eq!(bounded_front_door_query(&query), query);
+    }
+
+    #[test]
+    fn front_door_search_input_caps_oversized_paste() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        mde_egui::fonts::install(&ctx);
+
+        let mut state = FrontDoorState::default();
+        state.open();
+        let input = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 640.0),
+            )),
+            events,
+            time: Some(0.0),
+            ..Default::default()
+        };
+
+        let _ = ctx.run(input(Vec::new()), |ctx| {
+            let _ = front_door_panel(ctx, &mut state, fixture_front_door_items());
+        });
+        let oversized = format!("🙂{}", "x".repeat(MAX_QUERY_CHARS + 32));
+        let _ = ctx.run(input(vec![egui::Event::Text(oversized)]), |ctx| {
+            let _ = front_door_panel(ctx, &mut state, fixture_front_door_items());
+        });
+
+        assert_eq!(state.query().chars().count(), MAX_QUERY_CHARS);
+        assert!(state.query().starts_with('🙂'));
     }
 
     fn drive_front_door_action(
