@@ -56,7 +56,7 @@ use mde_bus::persist::{Persist, StoredMessage};
 use mde_collab_core::{ActorLog, CollabEngine, Ed25519Signer, FileActorLog, Projection, RandomIds};
 use mde_collab_types::topics::{self, projection as proj};
 use mde_collab_types::value::{
-    AlertAction, AlertActionKind, AlertPayload, ClipItemKind, ClipboardItem, Severity, sha256_hex,
+    sha256_hex, AlertAction, AlertActionKind, AlertPayload, ClipItemKind, ClipboardItem, Severity,
 };
 use mde_collab_types::{
     ActorId, AiSuggestionRequestStatus, AiSuggestionRequestView, AiSuggestionRequests,
@@ -192,6 +192,10 @@ pub struct CollabWorker {
     /// authority; until then AI requests are visible failures and every local
     /// collaboration workflow continues.
     ai_cloud_consent: bool,
+    /// Worker-owned real-media proof providers. Empty by default, which keeps
+    /// `state/collab/call-media-verification` honest until a WebRTC/SIP/LiveKit
+    /// adapter is explicitly registered.
+    call_media_providers: super::collab_media::CallMediaProviderRegistry,
 }
 
 impl CollabWorker {
@@ -211,6 +215,7 @@ impl CollabWorker {
             bus_root_override: None,
             authorizer: Arc::new(ActionAuthorizer::production()),
             ai_cloud_consent: false,
+            call_media_providers: super::collab_media::CallMediaProviderRegistry::empty(),
         }
     }
 
@@ -231,8 +236,19 @@ impl CollabWorker {
     /// Override AI-cloud consent for deterministic sidecar tests.
     #[cfg(test)]
     #[must_use]
-    pub(crate) const fn with_ai_cloud_consent_for_test(mut self, consent: bool) -> Self {
+    pub(crate) fn with_ai_cloud_consent_for_test(mut self, consent: bool) -> Self {
         self.ai_cloud_consent = consent;
+        self
+    }
+
+    /// Register bounded real-media proof providers for tests or future
+    /// in-daemon WebRTC/SIP/LiveKit adapters.
+    #[must_use]
+    pub(crate) fn with_call_media_providers(
+        mut self,
+        providers: super::collab_media::CallMediaProviderRegistry,
+    ) -> Self {
+        self.call_media_providers = providers;
         self
     }
 
@@ -245,7 +261,7 @@ impl CollabWorker {
 
     /// Override the poll cadence (tests use a short value).
     #[must_use]
-    pub const fn with_poll_interval(mut self, d: Duration) -> Self {
+    pub fn with_poll_interval(mut self, d: Duration) -> Self {
         self.poll_interval = d;
         self
     }
@@ -819,6 +835,7 @@ impl CollabWorker {
             super::collab_media::publish_retained_call_media_verification(
                 persist,
                 &mut state.last_published,
+                &self.call_media_providers,
             );
         }
         let ai_requests = Ok(state.ai_requests.all());
@@ -1463,8 +1480,8 @@ mod tests {
     use crate::ipc::action_auth::authorize_test_body;
     use ed25519_dalek::SigningKey;
     use mde_collab_types::read_model::{
-        CallMediaAdapter, CallMediaAdmission, CallMediaRequirement, CallMediaVerification,
-        CallMediaVerificationStatus,
+        CallMediaAdapter, CallMediaAdmission, CallMediaFrameEvidence, CallMediaRequirement,
+        CallMediaVerification, CallMediaVerificationStatus,
     };
     use mde_collab_types::value::{CallKind, MessageBody};
     use mde_collab_types::{
@@ -2073,6 +2090,139 @@ mod tests {
                     .as_deref()
                     .is_some_and(|detail| detail.contains("connected remote peer"))
         }));
+    }
+
+    #[test]
+    fn registered_call_media_provider_proves_frames_through_worker_publish() {
+        struct WebRtcAudioProof;
+        impl super::super::collab_media::CallMediaFrameVerifier for WebRtcAudioProof {
+            fn prove_advancing_frames(
+                &self,
+                session: &mde_collab_types::CallMediaSession,
+                adapter: CallMediaAdapter,
+            ) -> Result<CallMediaFrameEvidence, super::super::collab_media::CallMediaProviderError>
+            {
+                assert_eq!(adapter, CallMediaAdapter::WebRtcP2p);
+                assert_eq!(session.admission, CallMediaAdmission::AdapterReady);
+                Ok(CallMediaFrameEvidence {
+                    audio_frames: 3,
+                    video_frames: 0,
+                    screen_frames: 0,
+                    data_messages: 0,
+                })
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut providers = super::super::collab_media::CallMediaProviderRegistry::empty();
+        providers
+            .register(CallMediaAdapter::WebRtcP2p, WebRtcAudioProof)
+            .expect("register WebRTC provider");
+        let w = worker(dir.path(), "alice").with_call_media_providers(providers);
+        let persist = persist_at(dir.path());
+        let mut state = CollabState::new(w.self_actor.clone()).expect("state");
+        w.tick_once(&persist, &mut state, 100); // seed cursors
+
+        write_command(
+            &w,
+            &persist,
+            &CollabCommand::CreateSpace {
+                kind: SpaceKind::Team,
+                name: "ops".into(),
+            },
+        );
+        w.tick_once(&persist, &mut state, 200);
+        let space = only_space(&state);
+        write_command(
+            &w,
+            &persist,
+            &CollabCommand::AddMember {
+                space,
+                actor: ActorId::new("bob"),
+                role: SpaceRole::Member,
+            },
+        );
+        w.tick_once(&persist, &mut state, 300);
+        let call = CallId::new();
+        write_command(
+            &w,
+            &persist,
+            &CollabCommand::StartCall {
+                space,
+                call,
+                kind: CallKind::Audio,
+            },
+        );
+        w.tick_once(&persist, &mut state, 400);
+
+        let mut bob = CollabEngine::in_memory(ActorId::new("bob")).expect("bob engine");
+        bob.merge(state.engine.all_events()).expect("bob syncs");
+        let mut bob_ids = RandomIds;
+        let bob_signer = Ed25519Signer::new(key());
+        let bob_events = bob
+            .apply(
+                &CollabCommand::AnswerCall { call },
+                &bob_signer,
+                &mut bob_ids,
+                500,
+            )
+            .expect("bob answers");
+        for env in &bob_events {
+            write_event(&persist, env);
+        }
+        w.tick_once(&persist, &mut state, 600);
+
+        let readiness_msg = persist
+            .read_latest(&topics::state_topic(proj::CALL_MEDIA_READINESS))
+            .expect("read media readiness")
+            .expect("media readiness published");
+        let readiness: CallMediaReadiness =
+            serde_json::from_str(readiness_msg.body.as_deref().expect("body"))
+                .expect("decode media readiness");
+        assert_eq!(readiness.sessions.len(), 1);
+        assert_eq!(
+            readiness.sessions[0].admission,
+            CallMediaAdmission::AdapterReady
+        );
+        assert_eq!(
+            readiness.sessions[0].connected_participants,
+            vec![ActorId::new("alice"), ActorId::new("bob")]
+        );
+
+        let verification_msg = persist
+            .read_latest(&topics::state_topic(proj::CALL_MEDIA_VERIFICATION))
+            .expect("read media verification")
+            .expect("media verification published");
+        let verification: CallMediaVerification =
+            serde_json::from_str(verification_msg.body.as_deref().expect("body"))
+                .expect("decode media verification");
+        let webrtc = verification
+            .rows
+            .iter()
+            .find(|row| row.adapter == CallMediaAdapter::WebRtcP2p)
+            .expect("WebRTC row");
+        assert_eq!(
+            webrtc.status,
+            CallMediaVerificationStatus::LiveMediaVerified
+        );
+        assert_eq!(
+            webrtc.evidence,
+            Some(CallMediaFrameEvidence {
+                audio_frames: 3,
+                video_frames: 0,
+                screen_frames: 0,
+                data_messages: 0,
+            })
+        );
+        for adapter in [CallMediaAdapter::LiveKitSfu, CallMediaAdapter::SipGateway] {
+            let row = verification
+                .rows
+                .iter()
+                .find(|row| row.adapter == adapter)
+                .expect("missing provider row");
+            assert_eq!(row.status, CallMediaVerificationStatus::ProviderUnavailable);
+            assert!(row.evidence.is_none());
+        }
     }
 
     /// Create a space (this node becomes Owner) and link `reference` into it as

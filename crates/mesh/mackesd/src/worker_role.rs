@@ -243,7 +243,8 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
     WorkerSpec::tier("airspace", 1, RestartPolicy::OnFailure),
     // WL-FUNC-012 / OVERLAY-10 — keyless USGS earthquake feed adapter.
     // Workstation-tier: external overlay bandwidth stays on the seated adapter
-    // host; unconfigured nodes idle and publish nothing.
+    // host. This zero-cost public feed is default-on and can be explicitly
+    // disabled with MDE_OVERLAY_USGS_EARTHQUAKES=0/false/no/off.
     WorkerSpec::tier("earthquake_overlay", 1, RestartPolicy::OnFailure),
     // WL-FUNC-012 / OVERLAY-1 — point-scoped keyless NWS alert adapter with
     // affected-zone geometry fallback. Workstation-tier, explicit opt-in.
@@ -1134,8 +1135,9 @@ mod tests {
         // WL-FUNC-011 U2 -1 voice_config (the Kamailio/RTPengine VV render-config
         // worker; Q9 retired the dead SIP-proxy stack) => len 76.
         // WL-FUNC-012 +2 workstation-tier keyless adapters: USGS earthquakes
-        // NWS active alerts, and adsb.lol aircraft (explicit opt-in;
-        // unconfigured is idle) => len 79. OVERLAY-9 adds MBTA transit => 80;
+        // (default-on, explicit false opt-out), NWS active alerts, and
+        // adsb.lol aircraft (explicit opt-in; unconfigured is idle) => len 79.
+        // OVERLAY-9 adds MBTA transit => 80;
         // OVERLAY-4 adds NWS hourly guidance => 81; OVERLAY-5 adds Caltrans
         // traffic cameras => 82; OVERLAY-2 adds IEM NEXRAD radar => 83;
         // OVERLAY-6 adds keyless NIFC WFIGS perimeters => 84; OVERLAY-3 adds

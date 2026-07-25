@@ -3,9 +3,11 @@
 //! This module deliberately consumes the retained
 //! `state/collab/call-media-readiness` board before any media provider is
 //! touched. Readiness is signed collaboration state; this verifier board is the
-//! separate worker-owned live-proof state. The default transport reports an
-//! honest unavailable result, so a one-seat or no-provider test can never be
-//! mistaken for SIP/WebRTC/LiveKit media success.
+//! separate worker-owned live-proof state. The provider registry defaults empty
+//! and reports honest unavailable rows, so a one-seat or no-provider test can
+//! never be mistaken for SIP/WebRTC/LiveKit media success. A registered provider
+//! may claim success only by returning observed advancing frame/data deltas for
+//! the ready session.
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -28,9 +30,10 @@ const MAX_DETAIL_BYTES: usize = 512;
 pub(super) fn publish_retained_call_media_verification(
     persist: &Persist,
     last_published: &mut BTreeMap<String, String>,
+    providers: &CallMediaProviderRegistry,
 ) {
     let topic = topics::state_topic(proj::CALL_MEDIA_VERIFICATION);
-    match verify_retained_call_media(persist, &NoCallMediaTransport) {
+    match verify_retained_call_media(persist, providers) {
         Ok(board) => match serde_json::to_string(&board) {
             Ok(body) => {
                 if last_published.get(&topic).map(String::as_str) == Some(body.as_str()) {
@@ -54,7 +57,7 @@ pub(super) fn publish_retained_call_media_verification(
 
 fn verify_retained_call_media(
     persist: &Persist,
-    transport: &dyn CallMediaTransport,
+    providers: &CallMediaProviderRegistry,
 ) -> Result<CallMediaVerification, CallMediaVerificationError> {
     let topic = topics::state_topic(proj::CALL_MEDIA_READINESS);
     let msg = persist
@@ -85,12 +88,12 @@ fn verify_retained_call_media(
             detail: source.to_string(),
         }
     })?;
-    verify_call_media_readiness(&readiness, transport)
+    verify_call_media_readiness(&readiness, providers)
 }
 
 fn verify_call_media_readiness(
     readiness: &CallMediaReadiness,
-    transport: &dyn CallMediaTransport,
+    providers: &CallMediaProviderRegistry,
 ) -> Result<CallMediaVerification, CallMediaVerificationError> {
     if readiness.sessions.len() > MAX_VERIFICATION_SESSIONS {
         return Err(CallMediaVerificationError::TooManySessions {
@@ -108,7 +111,7 @@ fn verify_call_media_readiness(
                     max: MAX_VERIFICATION_ROWS,
                 });
             }
-            rows.push(verify_candidate(session, adapter, transport)?);
+            rows.push(verify_candidate(session, adapter, providers)?);
         }
     }
 
@@ -121,7 +124,7 @@ fn verify_call_media_readiness(
 fn verify_candidate(
     session: &CallMediaSession,
     adapter: CallMediaAdapter,
-    transport: &dyn CallMediaTransport,
+    providers: &CallMediaProviderRegistry,
 ) -> Result<CallMediaVerificationRow, CallMediaVerificationError> {
     if session.admission == CallMediaAdmission::WaitingForConnectedPeer {
         return row(
@@ -133,7 +136,7 @@ fn verify_candidate(
         );
     }
 
-    match transport.verify(session, adapter) {
+    match providers.prove_advancing_frames(session, adapter) {
         Ok(evidence) => {
             if evidence_satisfies_requirements(&session.requirements, evidence) {
                 row(
@@ -153,14 +156,14 @@ fn verify_candidate(
                 )
             }
         }
-        Err(CallMediaTransportError::TransportUnavailable { detail }) => row(
+        Err(CallMediaProviderError::TransportUnavailable { detail }) => row(
             session,
             adapter,
             CallMediaVerificationStatus::TransportUnavailable,
             None,
             Some(detail.as_str()),
         ),
-        Err(CallMediaTransportError::ProviderUnavailable { detail }) => row(
+        Err(CallMediaProviderError::ProviderUnavailable { detail }) => row(
             session,
             adapter,
             CallMediaVerificationStatus::ProviderUnavailable,
@@ -243,43 +246,114 @@ fn missing_evidence_detail(
     )
 }
 
-trait CallMediaTransport {
-    fn verify(
+pub(crate) trait CallMediaFrameVerifier: Send + Sync {
+    /// Prove live media for `session` by returning frame/data deltas observed
+    /// during a bounded provider-owned sampling window. Cumulative counters or
+    /// desired-state readiness are not sufficient for a
+    /// [`CallMediaVerificationStatus::LiveMediaVerified`] row.
+    fn prove_advancing_frames(
         &self,
         session: &CallMediaSession,
         adapter: CallMediaAdapter,
-    ) -> Result<CallMediaFrameEvidence, CallMediaTransportError>;
+    ) -> Result<CallMediaFrameEvidence, CallMediaProviderError>;
 }
 
-struct NoCallMediaTransport;
+/// One bounded in-process registration table for concrete call-media proof
+/// providers. At most one provider can own each adapter family; the worker's
+/// production default is empty and therefore fail-honest.
+#[derive(Default)]
+pub(crate) struct CallMediaProviderRegistry {
+    webrtc_p2p: Option<Box<dyn CallMediaFrameVerifier>>,
+    livekit_sfu: Option<Box<dyn CallMediaFrameVerifier>>,
+    sip_gateway: Option<Box<dyn CallMediaFrameVerifier>>,
+    document_collab: Option<Box<dyn CallMediaFrameVerifier>>,
+    vdi_remote_desktop: Option<Box<dyn CallMediaFrameVerifier>>,
+}
 
-impl CallMediaTransport for NoCallMediaTransport {
-    fn verify(
-        &self,
-        _session: &CallMediaSession,
+impl CallMediaProviderRegistry {
+    #[must_use]
+    pub(crate) fn empty() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn register<P>(
+        &mut self,
         adapter: CallMediaAdapter,
-    ) -> Result<CallMediaFrameEvidence, CallMediaTransportError> {
+        provider: P,
+    ) -> Result<(), CallMediaProviderRegistrationError>
+    where
+        P: CallMediaFrameVerifier + 'static,
+    {
+        let slot = self.slot_mut(adapter);
+        if slot.is_some() {
+            return Err(CallMediaProviderRegistrationError::AlreadyRegistered { adapter });
+        }
+        *slot = Some(Box::new(provider));
+        Ok(())
+    }
+
+    fn prove_advancing_frames(
+        &self,
+        session: &CallMediaSession,
+        adapter: CallMediaAdapter,
+    ) -> Result<CallMediaFrameEvidence, CallMediaProviderError> {
+        let Some(provider) = self.slot(adapter).as_deref() else {
+            return Err(missing_provider_error(adapter));
+        };
+        provider.prove_advancing_frames(session, adapter)
+    }
+
+    fn slot_mut(
+        &mut self,
+        adapter: CallMediaAdapter,
+    ) -> &mut Option<Box<dyn CallMediaFrameVerifier>> {
         match adapter {
-            CallMediaAdapter::LiveKitSfu | CallMediaAdapter::SipGateway => {
-                Err(CallMediaTransportError::ProviderUnavailable {
-                    detail: format!(
-                        "no {:?} provider/gateway is registered on this node",
-                        adapter
-                    ),
-                })
-            }
-            CallMediaAdapter::WebRtcP2p
-            | CallMediaAdapter::DocumentCollab
-            | CallMediaAdapter::VdiRemoteDesktop => {
-                Err(CallMediaTransportError::TransportUnavailable {
-                    detail: format!("no {:?} media verifier is registered on this node", adapter),
-                })
-            }
+            CallMediaAdapter::WebRtcP2p => &mut self.webrtc_p2p,
+            CallMediaAdapter::LiveKitSfu => &mut self.livekit_sfu,
+            CallMediaAdapter::SipGateway => &mut self.sip_gateway,
+            CallMediaAdapter::DocumentCollab => &mut self.document_collab,
+            CallMediaAdapter::VdiRemoteDesktop => &mut self.vdi_remote_desktop,
+        }
+    }
+
+    fn slot(&self, adapter: CallMediaAdapter) -> &Option<Box<dyn CallMediaFrameVerifier>> {
+        match adapter {
+            CallMediaAdapter::WebRtcP2p => &self.webrtc_p2p,
+            CallMediaAdapter::LiveKitSfu => &self.livekit_sfu,
+            CallMediaAdapter::SipGateway => &self.sip_gateway,
+            CallMediaAdapter::DocumentCollab => &self.document_collab,
+            CallMediaAdapter::VdiRemoteDesktop => &self.vdi_remote_desktop,
         }
     }
 }
 
-enum CallMediaTransportError {
+fn missing_provider_error(adapter: CallMediaAdapter) -> CallMediaProviderError {
+    match adapter {
+        CallMediaAdapter::LiveKitSfu => CallMediaProviderError::ProviderUnavailable {
+            detail: "no LiveKit SFU provider is registered on this node".to_string(),
+        },
+        CallMediaAdapter::SipGateway => CallMediaProviderError::ProviderUnavailable {
+            detail: "no SIP gateway/provider is registered on this node".to_string(),
+        },
+        CallMediaAdapter::WebRtcP2p => CallMediaProviderError::TransportUnavailable {
+            detail: "no WebRTC media verifier is registered on this node".to_string(),
+        },
+        CallMediaAdapter::DocumentCollab => CallMediaProviderError::TransportUnavailable {
+            detail: "no document-collaboration media verifier is registered on this node"
+                .to_string(),
+        },
+        CallMediaAdapter::VdiRemoteDesktop => CallMediaProviderError::TransportUnavailable {
+            detail: "no VDI remote-desktop media verifier is registered on this node".to_string(),
+        },
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CallMediaProviderRegistrationError {
+    AlreadyRegistered { adapter: CallMediaAdapter },
+}
+
+pub(crate) enum CallMediaProviderError {
     TransportUnavailable { detail: String },
     ProviderUnavailable { detail: String },
 }
@@ -389,6 +463,10 @@ mod tests {
         }
     }
 
+    fn empty_registry() -> CallMediaProviderRegistry {
+        CallMediaProviderRegistry::empty()
+    }
+
     #[test]
     fn retained_verifier_reports_absent_transport_without_claiming_frames() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -399,18 +477,16 @@ mod tests {
         };
         write_readiness(&persist, &readiness);
 
-        let board =
-            verify_retained_call_media(&persist, &NoCallMediaTransport).expect("verification");
+        let board = verify_retained_call_media(&persist, &empty_registry()).expect("verification");
 
         assert_eq!(board.local_actor, ActorId::new("alice"));
         assert_eq!(board.rows.len(), 3);
         for row in &board.rows {
             assert!(row.evidence.is_none());
-            assert!(
-                row.detail
-                    .as_deref()
-                    .is_some_and(|detail| detail.contains("no ") && detail.contains("registered"))
-            );
+            assert!(row
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("no ") && detail.contains("registered")));
             let expected = match row.adapter {
                 CallMediaAdapter::WebRtcP2p => CallMediaVerificationStatus::TransportUnavailable,
                 CallMediaAdapter::LiveKitSfu | CallMediaAdapter::SipGateway => {
@@ -425,16 +501,108 @@ mod tests {
     }
 
     #[test]
+    fn publisher_uses_registered_provider_to_prove_advancing_frames() {
+        struct AdvancingAudioProvider;
+        impl CallMediaFrameVerifier for AdvancingAudioProvider {
+            fn prove_advancing_frames(
+                &self,
+                session: &CallMediaSession,
+                adapter: CallMediaAdapter,
+            ) -> Result<CallMediaFrameEvidence, CallMediaProviderError> {
+                assert_eq!(session.admission, CallMediaAdmission::AdapterReady);
+                assert_eq!(adapter, CallMediaAdapter::WebRtcP2p);
+                Ok(CallMediaFrameEvidence {
+                    audio_frames: 7,
+                    video_frames: 0,
+                    screen_frames: 0,
+                    data_messages: 0,
+                })
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let persist = Persist::open(dir.path().to_path_buf()).expect("persist");
+        let readiness = CallMediaReadiness {
+            local_actor: ActorId::new("alice"),
+            sessions: vec![ready_audio_session()],
+        };
+        write_readiness(&persist, &readiness);
+
+        let mut providers = CallMediaProviderRegistry::empty();
+        providers
+            .register(CallMediaAdapter::WebRtcP2p, AdvancingAudioProvider)
+            .expect("register WebRTC proof provider");
+        let mut last_published = BTreeMap::new();
+
+        publish_retained_call_media_verification(&persist, &mut last_published, &providers);
+
+        let msg = persist
+            .read_latest(&topics::state_topic(proj::CALL_MEDIA_VERIFICATION))
+            .expect("read verification")
+            .expect("verification published");
+        let board: CallMediaVerification =
+            serde_json::from_str(msg.body.as_deref().expect("body")).expect("decode board");
+
+        assert_eq!(board.rows.len(), 3);
+        let webrtc = board
+            .rows
+            .iter()
+            .find(|row| row.adapter == CallMediaAdapter::WebRtcP2p)
+            .expect("WebRTC row");
+        assert_eq!(
+            webrtc.status,
+            CallMediaVerificationStatus::LiveMediaVerified
+        );
+        assert_eq!(
+            webrtc.evidence,
+            Some(CallMediaFrameEvidence {
+                audio_frames: 7,
+                video_frames: 0,
+                screen_frames: 0,
+                data_messages: 0,
+            })
+        );
+        assert!(webrtc.detail.is_none());
+
+        for adapter in [CallMediaAdapter::LiveKitSfu, CallMediaAdapter::SipGateway] {
+            let row = board
+                .rows
+                .iter()
+                .find(|row| row.adapter == adapter)
+                .expect("missing provider row");
+            assert_eq!(row.status, CallMediaVerificationStatus::ProviderUnavailable);
+            assert!(row.evidence.is_none());
+            assert!(
+                row.detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("registered")),
+                "{adapter:?} must fail honestly when no provider is registered"
+            );
+        }
+    }
+
+    #[test]
     fn verifier_waits_for_connected_peer_before_transport_probe() {
-        struct PanicTransport;
-        impl CallMediaTransport for PanicTransport {
-            fn verify(
+        struct PanicProvider;
+        impl CallMediaFrameVerifier for PanicProvider {
+            fn prove_advancing_frames(
                 &self,
                 _session: &CallMediaSession,
                 _adapter: CallMediaAdapter,
-            ) -> Result<CallMediaFrameEvidence, CallMediaTransportError> {
-                panic!("waiting readiness must not touch media transport");
+            ) -> Result<CallMediaFrameEvidence, CallMediaProviderError> {
+                panic!("waiting readiness must not touch media provider");
             }
+        }
+
+        let mut providers = CallMediaProviderRegistry::empty();
+        for adapter in [
+            CallMediaAdapter::WebRtcP2p,
+            CallMediaAdapter::LiveKitSfu,
+            CallMediaAdapter::SipGateway,
+        ] {
+            providers
+                .register(adapter, PanicProvider)
+                .expect("register panic provider");
         }
 
         let mut session = ready_audio_session();
@@ -446,7 +614,7 @@ mod tests {
         };
 
         let board =
-            verify_call_media_readiness(&readiness, &PanicTransport).expect("verification board");
+            verify_call_media_readiness(&readiness, &providers).expect("verification board");
 
         assert_eq!(board.rows.len(), 3);
         assert!(board.rows.iter().all(|row| {
@@ -457,13 +625,13 @@ mod tests {
 
     #[test]
     fn verifier_rejects_missing_required_frames() {
-        struct AudioOnlyTransport;
-        impl CallMediaTransport for AudioOnlyTransport {
-            fn verify(
+        struct AudioOnlyProvider;
+        impl CallMediaFrameVerifier for AudioOnlyProvider {
+            fn prove_advancing_frames(
                 &self,
                 _session: &CallMediaSession,
                 _adapter: CallMediaAdapter,
-            ) -> Result<CallMediaFrameEvidence, CallMediaTransportError> {
+            ) -> Result<CallMediaFrameEvidence, CallMediaProviderError> {
                 Ok(CallMediaFrameEvidence {
                     audio_frames: 12,
                     video_frames: 0,
@@ -484,9 +652,13 @@ mod tests {
             local_actor: ActorId::new("alice"),
             sessions: vec![session],
         };
+        let mut providers = CallMediaProviderRegistry::empty();
+        providers
+            .register(CallMediaAdapter::WebRtcP2p, AudioOnlyProvider)
+            .expect("register audio provider");
 
-        let board = verify_call_media_readiness(&readiness, &AudioOnlyTransport)
-            .expect("verification board");
+        let board =
+            verify_call_media_readiness(&readiness, &providers).expect("verification board");
 
         assert_eq!(board.rows.len(), 1);
         assert_eq!(
@@ -494,12 +666,10 @@ mod tests {
             CallMediaVerificationStatus::MediaNotProven
         );
         assert!(board.rows[0].evidence.is_none());
-        assert!(
-            board.rows[0]
-                .detail
-                .as_deref()
-                .expect("detail")
-                .contains("video frames")
-        );
+        assert!(board.rows[0]
+            .detail
+            .as_deref()
+            .expect("detail")
+            .contains("video frames"));
     }
 }

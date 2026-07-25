@@ -252,6 +252,34 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-SEC-006 - Keep Nebula private keys local to their owning node
 
 - Status: Remaining
+- Progress (2026-07-25 live-readonly `.15` collector rerun): streamed the
+  existing `install-helpers/verify-nebula-rotation-evidence.sh` collector to the
+  enrolled non-production seat `Basement-Test-Workstation` (`172.20.0.15`,
+  overlay `10.42.0.8`) with `sudo -n`, `--probe 10.42.0.1`, and
+  `--max-scan-files 10000` after a read-only sizing check found 5,300
+  candidate replicated files. Exact safe streaming shape:
+  ```sh
+  ssh mm@172.20.0.15 \
+    "sudo -n bash -s -- collect \
+      --out /var/tmp/wl-sec-006-nebula-live-readonly-20260725T195445Z-final2 \
+      --probe 10.42.0.1 \
+      --max-scan-files 10000" \
+    < install-helpers/verify-nebula-rotation-evidence.sh
+  ```
+  The collector remained read-only and did not print/copy private-key material;
+  the failed evidence snapshot is on the seat at
+  `/var/tmp/wl-sec-006-nebula-live-readonly-20260725T195445Z-final2`.
+  It proves live preconditions are still missing, not rotation success:
+  `/etc/nebula/identity/current` is absent because the seat still uses legacy
+  flat `/etc/nebula/host.{crt,key}`, the replicated scan found 9 suspicious
+  marker paths (paths only; contents not copied), and the LH1 overlay probe
+  `10.42.0.1` was unreachable. Read-only Eagle preflight at `172.20.146.13`
+  also showed active `nebula`/`mackesd`, overlay `10.42.0.3`, legacy flat
+  identity files, and failed overlay probes, so no destructive rotation was
+  attempted. The verifier now documents the safe live command/preconditions,
+  refuses ambiguous stdin-sudo streaming guidance, calls out legacy flat identity
+  as a rotation-readiness gap, and tells operators how to size/rerun bounded
+  workgroup scans.
 - Progress (2026-07-25 evidence-harness guardrails/live-gap diagnostics):
   `install-helpers/verify-nebula-rotation-evidence.sh` now refuses non-empty
   collection directories, fingerprints the collecting node with a hashed
@@ -690,6 +718,27 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-ARCH-007 - Repair Workloads cockpit E2E wire, placement, and authorization
 
 - Status: Remaining
+- Progress (2026-07-25 post-hotfix `.15` Workloads verifier recheck): after
+  installing the 2026-07-25 `mackesd` hotfix binary on
+  `Basement-Test-Workstation` and force-clearing the stale stop-sigterm service
+  cgroup, the required live Workloads proof still exits 0 over direct root SSH.
+  `mackesd` and `mde-shell-egui` are active with `NRestarts=0`; the encrypted
+  cloud-arm credential remains root-only; `state/cloud/Basement-Test-Workstation`
+  is fresh at **5.959 s** with `opentofu=up`, `ansible=up`, `libvirt=up`, and
+  apply armed; Podman `5.8.4` is active. KVM remains explicitly not claimed:
+  `/dev/kvm` is absent and the CPU exposes no `vmx/svm` virtualization flag.
+- Progress (2026-07-25 integrated `.15` Workloads verifier recheck): after the
+  integrated `mackesd` release binary
+  `61c0c202f39cb12286e1c69e2b2d74c0c947eecd7124c73dbcf4acd782b4bbaf` was
+  installed on `.15`, the old daemon again hung during restart and was recovered
+  with the bounded forced systemd path. The required read-only verifier still
+  exits 0 over direct root SSH: `mackesd` and `mde-shell-egui` are active with
+  `NRestarts=0`; the encrypted cloud-arm credential and systemd drop-ins remain
+  OK; `state/cloud/Basement-Test-Workstation` is fresh at **44.108 s** with
+  `construct_cloud`, `opentofu=up`, `ansible=up`, `libvirt=up`, and apply
+  armed; Podman `5.8.4` and `podman.socket` are active. KVM remains a warning,
+  not a claim, because `/dev/kvm` is absent and the CPU still exposes no
+  `vmx/svm` virtualization flag.
 - Progress (2026-07-25 live `.15` Workloads backend remediation/proof): live
   `Basement-Test-Workstation` (`172.20.0.15`) was read-only probed with
   `install-helpers/verify-workloads-live-proof.py`, then remediated in-place
@@ -1125,6 +1174,18 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-011 - Communications collaboration suite full replacement
 
 - Status: Remaining
+- Progress (2026-07-25 call media provider-proof seam): the retained
+  `state/collab/call-media-verification` publisher now consumes an explicit
+  in-daemon `CallMediaProviderRegistry` instead of a hardcoded null transport.
+  The registry is bounded to one verifier per adapter family and defaults empty
+  in `CollabWorker`, preserving honest `transport_unavailable` /
+  `provider_unavailable` rows until a WebRTC/SIP/LiveKit provider is registered.
+  Registered providers must return observed advancing frame/data deltas before a
+  row can become `live_media_verified`; waiting-for-peer rows still short-circuit
+  before provider access. Farm gates are green on `.130` BigBoy at **2/2**
+  focused worker `call_media` tests plus **4/4** `collab_media` verifier tests,
+  and `.90` touched-file `rustfmt --edition 2024 --config skip_children=true
+  --check`. Live WebRTC/SIP/LiveKit/media proof remains external.
 - Progress (2026-07-25 call media-verifier seam): Communications now publishes a
   retained `state/collab/call-media-verification` sidecar by consuming the
   global `state/collab/call-media-readiness` board. The verifier is bounded and
@@ -1804,6 +1865,29 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-012 - Maps live-data overlays (zero-cost external feeds)
 
 - Status: Remaining
+- Progress (2026-07-25 USGS keyless default-on producer wiring): the
+  `earthquake_overlay` Workstation-tier worker is no longer absent-by-default:
+  the zero-cost public USGS all-hour GeoJSON producer now starts unless
+  explicitly disabled with `MDE_OVERLAY_USGS_EARTHQUAKES=0/false/no/off`, polls
+  at the existing 60 s cache cadence, and still publishes only successful
+  normalized USGS snapshots to `state/overlay/usgs-earthquakes/<node>`. Farm
+  `.50` slot `wl-func-012-usgs` is green for
+  `cargo test -p mackesd --lib workers::earthquake_overlay::tests -- --nocapture`
+  at **10/10** after moving the blocking reqwest client lifetime inside the
+  `spawn_blocking` fetch path; farm `.170` touched-file rustfmt is green, farm
+  `.90` Python bytecode + `verify-live-mirrors.py --self-test` is green, and
+  `lint-worklist.sh --self-test` is green.
+- Progress (2026-07-25 live `.15` USGS absent-to-present proof): after deploying
+  the integrated `mackesd` release binary
+  `61c0c202f39cb12286e1c69e2b2d74c0c947eecd7124c73dbcf4acd782b4bbaf` to
+  `.15`, a read-only verifier streamed over root SSH passed for
+  `state/overlay/usgs-earthquakes/Basement-Test-Workstation` with
+  `ready=true`, `fresh=true`, `record_count=6`, `license_tier=public-domain`,
+  `attribution=USGS`, and age **33.437 s**. The catalog audit now reports
+  **present=1, absent=10, invalid=0** for
+  `Basement-Test-Workstation`; only `usgs-earthquakes` is present. This proves
+  the default-on keyless producer and consumer-proof path for USGS only; the
+  other ten zero-cost feeds remain absent and are not claimed complete.
 - Progress (2026-07-25 live `.15` zero-cost catalog absence proof): the
   read-only live-mirror verifier now has a node-wide catalog audit
   (`--catalog-overlay-node` plus optional `--require-catalog-complete`) that
@@ -2224,6 +2308,37 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-006 - Construct interface (Apple-HIG-principled workstation shell)
 
 - Status: Remaining
+- Progress (2026-07-25 primary-seat SSH and Surface hotfix deploy proof):
+  local-network SSH access for the two primary test seats is now key-only clean
+  for both automation accounts: `.15`/`Basement-Test-Workstation` accepts the
+  mesh Ed25519 key for `root` and `mm`, Dell (`172.20.146.2`) accepts the same
+  key for `root` and `mm`, and both `mm` accounts have passwordless sudo. The
+  earlier failed key installs were traced to a literal placeholder line in
+  `authorized_keys`; those bad lines were removed without dropping existing
+  keys. The 2026-07-25 `mackesd` hotfix binary
+  `0161c30e4357f991d0a9162b231317a317e32654d851cd79b8b9745a20de6c69` was
+  installed on Dell and `.15` with timestamped backups under
+  `/usr/local/lib/magic-mesh-backups/`. Dell proved `mackesd` and shell active
+  with `NRestarts=0`, and its post-restart log window showed the Surface workers
+  start without immediate `worker returned Ok`, half-open relapse, or breaker
+  alert. `.15` needed a forced kill of the stale stopping `mackesd` cgroup after
+  the old daemon hung in `stop-sigterm`; after clean start, `.15` proved the same
+  hotfix SHA, `mackesd` and shell active with `NRestarts=0`, and a **65 s**
+  post-start log window with the three Surface workers started and no Surface
+  `worker returned Ok`, half-open relapse, or breaker alert.
+- Progress (2026-07-25 integrated primary-seat deploy proof): the integrated
+  release binary
+  `61c0c202f39cb12286e1c69e2b2d74c0c947eecd7124c73dbcf4acd782b4bbaf` was built
+  on BigBoy slot `mackesd-integrated-seats` and installed on both primary test
+  seats with timestamped backups under `/usr/local/lib/magic-mesh-backups/`.
+  Dell restarted normally and reports `mackesd` active with `MainPID=1194313`
+  and `NRestarts=0`. `.15` hit the known bounded restart hang, was force-cleared
+  through systemd, and reports `mackesd` active with `MainPID=2403560` and
+  `NRestarts=0`. A **70 s** post-start observation window on both seats found
+  no Surface `worker returned Ok`, half-open relapse, breaker alert, panic,
+  segfault, or crash signature. Dell still warns because Nebula enrollment has
+  no `/var/lib/mackesd/nebula/overlay-ip`; `.15` still warns on oversized
+  collaboration merge batches. Those are recorded warnings, not service crashes.
 - Progress (2026-07-25 Surface-worker non-Surface breaker fix): live `.15`
   remained active after disk cleanup but still emitted repeated
   `circuit breaker tripped` alerts. Timeout-bounded journal evidence isolated

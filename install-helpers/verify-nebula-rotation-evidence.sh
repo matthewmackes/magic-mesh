@@ -17,6 +17,32 @@
 #     --out /var/tmp/nebula-rotation-after --probe 10.42.0.1
 #   install-helpers/verify-nebula-rotation-evidence.sh compare \
 #     /var/tmp/nebula-rotation-before /var/tmp/nebula-rotation-after
+#
+# Safe live preconditions:
+#   * run on the target node as root, or through sudo without feeding secrets into
+#     this script's stdin;
+#   * /etc/nebula/identity/current is a symlink to generation-<n>-<hex>;
+#   * /etc/nebula/identity and the active generation are owner-only directories;
+#   * only the active generation remains after rotation;
+#   * nebula.service is active, the overlay interface has an IPv4 address, and
+#     --probe names a peer/lighthouse overlay IP that is reachable from the node;
+#   * the replicated workgroup scan is bounded and has zero private-key markers.
+#
+# Safe read-only live snapshot command on the target:
+#   sudo install-helpers/verify-nebula-rotation-evidence.sh collect \
+#     --out /var/tmp/wl-sec-006-nebula-live-before-$(date -u +%Y%m%dT%H%M%SZ) \
+#     --probe <reachable-peer-overlay-ip> \
+#     --max-scan-files <candidate-file-count-plus-headroom>
+#
+# Safe SSH streaming form when the helper is not installed on the target (do not
+# prepend a sudo password to stdin; authenticate separately or use sudo -n):
+#   ssh <target> \
+#     "sudo -n bash -s -- collect --out /var/tmp/wl-sec-006-nebula-live-before --probe <overlay-ip> --max-scan-files <n>" \
+#     < install-helpers/verify-nebula-rotation-evidence.sh
+#
+# A live node that still uses flat /etc/nebula/host.{crt,key} files without the
+# identity/current generation symlink is enrolled, but is not a safe target for
+# this rotation proof until the generation layout and rollback plan are present.
 set -euo pipefail
 
 DEFAULT_CONFIG_DIR="/etc/nebula"
@@ -26,7 +52,11 @@ DEFAULT_MAX_SCAN_FILES="${MCNF_NEBULA_EVIDENCE_MAX_FILES:-4096}"
 DEFAULT_MAX_SCAN_BYTES="${MCNF_NEBULA_EVIDENCE_MAX_BYTES:-1048576}"
 
 usage() {
-  sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+  awk '
+    NR == 1 { next }
+    /^#/ { sub(/^# ?/, ""); print; next }
+    { exit }
+  ' "$0"
   cat <<'USAGE'
 
 Commands:
@@ -206,6 +236,12 @@ collect_mode() {
   local identity_dir="$config_dir/identity"
   local current_link="$identity_dir/current"
   local current_target="" current_generation="" current_link_type="missing"
+  local flat_host_cert_present=false flat_host_key_present=false legacy_flat_identity=false
+  [ -f "$config_dir/host.crt" ] && flat_host_cert_present=true
+  [ -f "$config_dir/host.key" ] && flat_host_key_present=true
+  if [ ! -d "$identity_dir" ] && { [ "$flat_host_cert_present" = true ] || [ "$flat_host_key_present" = true ]; }; then
+    legacy_flat_identity=true
+  fi
   if [ -L "$current_link" ]; then
     current_link_type="symlink"
     current_target="$(readlink "$current_link" 2>/dev/null || true)"
@@ -225,6 +261,9 @@ collect_mode() {
   write_kv workgroup_root "$workgroup_root"
   write_kv iface "$iface"
   write_kv identity_dir "$identity_dir"
+  write_kv flat_host_cert_present "$flat_host_cert_present"
+  write_kv flat_host_key_present "$flat_host_key_present"
+  write_kv legacy_flat_identity "$legacy_flat_identity"
   write_kv identity_root_mode "$(stat_value nofollow %a "$identity_dir")"
   write_kv identity_root_uid "$(stat_value nofollow %u "$identity_dir")"
   write_kv current_link_type "$current_link_type"
@@ -242,19 +281,26 @@ collect_mode() {
     printf 'current_target=%s\n' "$current_target"
   } >"$out_dir/identity-generations.txt"
 
-  if [ "$(stat_value nofollow %a "$identity_dir")" != "700" ]; then
+  if [ "$legacy_flat_identity" = true ]; then
+    printf 'FAIL rotation-ready identity generation layout is absent: %s/current is missing; found legacy flat %s/host.{crt,key}. Run only read-only collection here; do not perform live rotation until the generation layout and rollback target are present.\n' \
+      "$identity_dir" "$config_dir" >>"$summary"
+    fail=1
+  elif [ ! -d "$identity_dir" ]; then
+    printf 'FAIL rotation-ready identity root is missing: %s\n' "$identity_dir" >>"$summary"
+    fail=1
+  elif [ "$(stat_value nofollow %a "$identity_dir")" != "700" ]; then
     printf 'FAIL identity root is not mode 0700: %s\n' "$identity_dir" >>"$summary"
     fail=1
-  fi
-  if [ "$(stat_value nofollow %u "$identity_dir")" != "$(id -u)" ]; then
+  elif [ "$(stat_value nofollow %u "$identity_dir")" != "$(id -u)" ]; then
     printf 'FAIL identity root is not owned by current verifier uid: %s\n' "$identity_dir" >>"$summary"
     fail=1
   fi
   if [ "$current_link_type" != "symlink" ] || [ -z "$current_generation" ]; then
-    printf 'FAIL active identity switch is missing or not a generation symlink: %s\n' "$current_link" >>"$summary"
+    if [ "$legacy_flat_identity" != true ]; then
+      printf 'FAIL active identity switch is missing or not a generation symlink: %s\n' "$current_link" >>"$summary"
+    fi
     fail=1
-  fi
-  if [ "$(stat_value follow %a "$current_link/host.key")" != "600" ]; then
+  elif [ "$(stat_value follow %a "$current_link/host.key")" != "600" ]; then
     printf 'FAIL active Nebula private key target is not mode 0600: %s/host.key\n' "$current_link" >>"$summary"
     fail=1
   fi
@@ -295,7 +341,7 @@ collect_mode() {
   write_kv generation_count "$generation_count"
   write_kv stale_generation_count "$stale_generation_count"
   write_kv unsafe_generation_count "$unsafe_generation_count"
-  if [ "$generation_count" -ne 1 ] || [ "$stale_generation_count" -ne 0 ] || [ "$unsafe_generation_count" -ne 0 ]; then
+  if [ -d "$identity_dir" ] && { [ "$generation_count" -ne 1 ] || [ "$stale_generation_count" -ne 0 ] || [ "$unsafe_generation_count" -ne 0 ]; }; then
     printf 'FAIL identity generations are not pruned to the single active generation (total=%s stale=%s unsafe=%s)\n' \
       "$generation_count" "$stale_generation_count" "$unsafe_generation_count" >>"$summary"
     fail=1
@@ -315,7 +361,8 @@ collect_mode() {
     printf 'FAIL replicated workgroup root is missing: %s\n' "$workgroup_root" >>"$summary"
     fail=1
   elif [ "$scan_truncated" = "true" ]; then
-    printf 'FAIL replicated secret-marker scan truncated at %s files under %s\n' "$max_scan_files" "$workgroup_root" >>"$summary"
+    printf 'FAIL replicated secret-marker scan truncated at %s files under %s; size it read-only with: sudo find %s -xdev -type f -size -%sc 2>/dev/null | wc -l ; then rerun collect with --max-scan-files above that count\n' \
+      "$max_scan_files" "$workgroup_root" "$workgroup_root" "$max_scan_bytes" >>"$summary"
     fail=1
   fi
   if [ "$scan_hits" != "0" ]; then
@@ -366,7 +413,8 @@ collect_mode() {
       fail=1
     fi
     if [ "$reachable" = "false" ]; then
-      printf 'FAIL overlay probe target is unreachable: %s\n' "$probe_target" >>"$summary"
+      printf 'FAIL overlay probe target is unreachable: %s; live reconnect proof requires a reachable peer/lighthouse overlay IP before and after rotation\n' \
+        "$probe_target" >>"$summary"
       fail=1
     fi
   fi
@@ -555,6 +603,7 @@ self_test() {
   local before="$td/before" after="$td/after" leak="$td/leak"
   local unsafe="$td/unsafe" mismatched="$td/mismatched" nonempty="$td/nonempty"
   local live_missing="$td/live-missing"
+  local legacy="$td/legacy-flat" legacy_config="$td/legacy-nebula"
   mkdir -p "$config_dir/identity" "$workgroup_root"
   chmod 700 "$config_dir/identity"
   printf '{"peer_cert_pem":"public-only"}\n' >"$workgroup_root/nebula-bundle.json"
@@ -631,6 +680,21 @@ self_test() {
     echo "  ok: missing live interface records live evidence gaps"
   else
     echo "  FAIL: missing live interface did not leave diagnosable evidence" >&2
+    fails=$((fails + 1))
+  fi
+
+  mkdir -p "$legacy_config"
+  printf '%s\n' cert-flat >"$legacy_config/host.crt"
+  printf '%s\n' key-flat >"$legacy_config/host.key"
+  chmod 600 "$legacy_config/host.key"
+  if collect_mode --config-dir "$legacy_config" --workgroup-root "$workgroup_root" --out "$legacy" --no-live >/dev/null 2>&1; then
+    echo "  FAIL: legacy flat identity layout should fail collection" >&2
+    fails=$((fails + 1))
+  elif grep -q '^legacy_flat_identity=true$' "$legacy/snapshot.env" \
+    && grep -q 'legacy flat .*/host.{crt,key}' "$legacy/summary.txt"; then
+    echo "  ok: legacy flat identity layout records explicit live precondition gap"
+  else
+    echo "  FAIL: legacy flat identity layout did not leave diagnosable evidence" >&2
     fails=$((fails + 1))
   fi
 

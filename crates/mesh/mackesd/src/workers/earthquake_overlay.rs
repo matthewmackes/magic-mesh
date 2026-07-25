@@ -1,11 +1,12 @@
 //! WL-FUNC-012 / OVERLAY-10 — keyless USGS earthquake overlay adapter.
 //!
-//! A Workstation opts in with `MDE_OVERLAY_USGS_EARTHQUAKES=1`. The worker then
-//! polls the official USGS all-hour GeoJSON feed once per minute, normalizes it
-//! into the shared wire contract, and publishes a latest-wins
-//! `state/overlay/usgs-earthquakes/<node>` snapshot. An unconfigured worker is a
-//! genuine no-op. Fetch failures retain the last-good snapshot and its original
-//! `fetched_at_ms`, adding an honest gap so the Maps layer ages it to stale.
+//! Workstation-tier nodes start this keyless, low-bandwidth producer by default.
+//! The worker polls the official USGS all-hour GeoJSON feed once per minute,
+//! normalizes it into the shared wire contract, and publishes a latest-wins
+//! `state/overlay/usgs-earthquakes/<node>` snapshot. Operators can explicitly
+//! disable the producer with `MDE_OVERLAY_USGS_EARTHQUAKES=0/false/no/off`.
+//! Fetch failures retain the last-good snapshot and its original `fetched_at_ms`,
+//! adding an honest gap so the Maps layer ages it to stale.
 
 #![cfg(feature = "async-services")]
 
@@ -23,7 +24,7 @@ use serde::Deserialize;
 
 use super::{ShutdownToken, Worker};
 
-/// Explicit opt-in. Unset/false means idle and publishes nothing.
+/// Explicit disable for the keyless default-on USGS producer.
 pub const ENABLED_ENV: &str = "MDE_OVERLAY_USGS_EARTHQUAKES";
 /// Optional endpoint override, primarily for an operator-controlled mirror.
 pub const ENDPOINT_ENV: &str = "MDE_OVERLAY_USGS_EARTHQUAKES_URL";
@@ -63,21 +64,13 @@ struct Validators {
 
 /// Production rustls HTTP probe with ETag/Last-Modified conditional requests.
 pub struct UsgsHttpProbe {
-    client: Client,
     endpoint: String,
     validators: Mutex<Validators>,
 }
 
 impl UsgsHttpProbe {
     fn new(endpoint: String) -> io::Result<Self> {
-        let client = Client::builder()
-            .timeout(HTTP_TIMEOUT)
-            .user_agent(USER_AGENT)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(io_other)?;
         Ok(Self {
-            client,
             endpoint,
             validators: Mutex::new(Validators::default()),
         })
@@ -86,7 +79,17 @@ impl UsgsHttpProbe {
 
 impl EarthquakeProbe for UsgsHttpProbe {
     fn fetch(&self) -> io::Result<ProbeResponse> {
-        let mut request = self.client.get(&self.endpoint);
+        // `reqwest::blocking::Client` owns an internal runtime that must be
+        // dropped outside Tokio async contexts. Build and drop it inside this
+        // blocking fetch call; `poll_once_async` already runs `fetch()` via
+        // `spawn_blocking`, while sync tests call it outside an async runtime.
+        let client = Client::builder()
+            .timeout(HTTP_TIMEOUT)
+            .user_agent(USER_AGENT)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(io_other)?;
+        let mut request = client.get(&self.endpoint);
         let mut sent_validator = false;
         {
             let validators = self
@@ -286,11 +289,12 @@ pub struct EarthquakeOverlayWorker {
 }
 
 impl EarthquakeOverlayWorker {
-    /// Build production wiring. The adapter is disabled unless the explicit
-    /// opt-in env is truthy; a client construction failure also degrades to idle.
+    /// Build production wiring. The keyless USGS adapter is enabled by default
+    /// on spawned Workstation-tier nodes; an explicit false-y env disables it.
+    /// Client construction failure also degrades to idle.
     #[must_use]
     pub fn new(host: String) -> Self {
-        let probe = if env_truthy(ENABLED_ENV) {
+        let probe = if env_default_enabled(ENABLED_ENV) {
             let endpoint = std::env::var(ENDPOINT_ENV)
                 .ok()
                 .filter(|value| !value.trim().is_empty())
@@ -449,7 +453,7 @@ impl Worker for EarthquakeOverlayWorker {
             tracing::info!(
                 target: "mackesd::earthquake_overlay",
                 env = ENABLED_ENV,
-                "earthquake overlay not configured; worker idle"
+                "earthquake overlay disabled or unavailable; worker idle"
             );
             shutdown.wait().await;
             return Ok(());
@@ -479,13 +483,15 @@ impl Worker for EarthquakeOverlayWorker {
     }
 }
 
-fn env_truthy(name: &str) -> bool {
-    std::env::var(name).is_ok_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
+fn env_default_enabled(name: &str) -> bool {
+    overlay_enabled_from_env(std::env::var(name).ok().as_deref())
+}
+
+fn overlay_enabled_from_env(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(|value| value.trim().to_ascii_lowercase()),
+        Some(value) if matches!(value.as_str(), "0" | "false" | "no" | "off")
+    )
 }
 
 fn now_ms() -> i64 {
@@ -587,6 +593,18 @@ mod tests {
             accept_not_modified(true).expect("validated 304"),
             ProbeResponse::NotModified
         );
+    }
+
+    #[test]
+    fn keyless_usgs_producer_defaults_on_with_explicit_false_opt_out() {
+        assert!(overlay_enabled_from_env(None));
+        assert!(overlay_enabled_from_env(Some("")));
+        assert!(overlay_enabled_from_env(Some("1")));
+        assert!(overlay_enabled_from_env(Some("true")));
+        assert!(!overlay_enabled_from_env(Some("0")));
+        assert!(!overlay_enabled_from_env(Some("false")));
+        assert!(!overlay_enabled_from_env(Some("NO")));
+        assert!(!overlay_enabled_from_env(Some(" off ")));
     }
 
     #[test]

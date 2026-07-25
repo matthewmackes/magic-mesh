@@ -1320,9 +1320,11 @@ pub(crate) fn spawn_compute_lifecycle_workers(
     });
     // WL-FUNC-012 / OVERLAY-10 — the keyless USGS earthquake adapter. This is
     // Workstation-tier because external overlay bandwidth lives on the seated
-    // adapter host, never on the MG90 cellular gateway or a Lighthouse. It is an
-    // explicit-opt-in no-op unless `MDE_OVERLAY_USGS_EARTHQUAKES=1` and publishes
-    // normalized latest-wins `state/overlay/usgs-earthquakes/<node>` snapshots.
+    // adapter host, never on the MG90 cellular gateway or a Lighthouse. It is
+    // default-on for this zero-cost, low-bandwidth public feed and can be
+    // explicitly disabled with `MDE_OVERLAY_USGS_EARTHQUAKES=0`; successful
+    // polls publish normalized latest-wins
+    // `state/overlay/usgs-earthquakes/<node>` snapshots.
     spawn_tiered(sup, worker_names, role_rank, "earthquake_overlay", || {
         mackesd_core::workers::earthquake_overlay::EarthquakeOverlayWorker::new(
             node_id
