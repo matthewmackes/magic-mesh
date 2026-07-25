@@ -46,6 +46,12 @@ const MAX_ADVERT_BYTES: usize = 64 * 1024;
 const MAX_ADVERT_FILES: usize = 4096;
 /// Keep one peer from turning its row into an unbounded route fan-out.
 const MAX_SUBNETS_PER_ADVERT: usize = 256;
+/// Keep external VPN profile names path-safe and bounded before they become
+/// replicated filenames.
+const MAX_VPN_PROFILE_NAME_CHARS: usize = 128;
+/// A profile is configuration, not an arbitrary blob store; reject oversized
+/// input before creating or replacing its on-disk leaf.
+const MAX_VPN_PROFILE_BYTES: usize = 256 * 1024;
 
 /// One hop node's advertisement (own-row fleet state): the underlay
 /// subnets it can route on the fleet's behalf.
@@ -79,12 +85,17 @@ pub fn hops_dir(root: &Path) -> PathBuf {
 /// # Errors
 /// IO / serialization failures.
 pub fn write_advert(root: &Path, advert: &HopAdvert) -> io::Result<PathBuf> {
+    let advert = validate_advert(advert.clone()).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "hop advertisement is invalid or contains an unsafe identity",
+        )
+    })?;
     let dir = hops_dir(root);
-    std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{}.json", advert.hop));
-    let tmp = dir.join(format!(".{}.json.tmp", advert.hop));
-    std::fs::write(&tmp, serde_json::to_string_pretty(advert)?)?;
-    std::fs::rename(&tmp, &path)?;
+    let body = serde_json::to_vec_pretty(&advert)?;
+    crate::ca::seal::write_atomic_sealed(&path, &body)
+        .map_err(|error| io::Error::other(error.to_string()))?;
     Ok(path)
 }
 
@@ -326,13 +337,36 @@ pub fn vpn_profiles_dir(root: &Path) -> PathBuf {
 /// # Errors
 /// IO failures.
 pub fn write_vpn_profile(root: &Path, profile: &VpnProfile) -> io::Result<PathBuf> {
+    if !valid_vpn_profile_name(&profile.name) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "VPN profile name is empty, oversized, or path-shaped",
+        ));
+    }
+    if profile.config.len() > MAX_VPN_PROFILE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "VPN profile exceeds the bounded configuration size",
+        ));
+    }
     let dir = vpn_profiles_dir(root);
-    std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{}.{}", profile.name, profile.kind.ext()));
-    let tmp = dir.join(format!(".{}.tmp", profile.name));
-    std::fs::write(&tmp, &profile.config)?;
-    std::fs::rename(&tmp, &path)?;
+    crate::ca::seal::write_atomic_sealed(&path, profile.config.as_bytes())
+        .map_err(|error| io::Error::other(error.to_string()))?;
     Ok(path)
+}
+
+fn valid_vpn_profile_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_VPN_PROFILE_NAME_CHARS
+        && name == name.trim()
+        && name != "."
+        && name != ".."
+        && !name.starts_with('.')
+        && name.is_ascii()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 /// List the VPN profiles present (by name + kind, sorted by name).
@@ -387,6 +421,38 @@ mod tests {
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].subnets, vec!["192.168.50.0/24"]);
         assert!(!back[0].is_exit());
+    }
+
+    #[test]
+    fn write_advert_rejects_path_shaped_identity_before_touching_the_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let error = write_advert(
+            tmp.path(),
+            &advert("../escape", "10.42.0.9", &["192.168.50.0/24"]),
+        )
+        .expect_err("path-shaped hop identity must fail closed");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(!tmp.path().join("escape.json").exists());
+        assert!(!tmp.path().join("topology/hops").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_advert_replaces_a_hostile_final_symlink_without_following_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hops = hops_dir(tmp.path());
+        std::fs::create_dir_all(&hops).unwrap();
+        let victim = tmp.path().join("victim.json");
+        std::fs::write(&victim, b"victim").unwrap();
+        std::os::unix::fs::symlink(&victim, hops.join("gw.json")).unwrap();
+
+        write_advert(tmp.path(), &advert("gw", "10.42.0.9", &["192.168.50.0/24"]))
+            .expect("atomic writer replaces the link itself");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"victim");
+        assert_eq!(
+            read_adverts(tmp.path()),
+            vec![advert("gw", "10.42.0.9", &["192.168.50.0/24"],)]
+        );
     }
 
     #[test]
@@ -536,5 +602,33 @@ mod tests {
             listed,
             vec![("branch-office".to_string(), VpnKind::Wireguard)]
         );
+    }
+
+    #[test]
+    fn vpn_profile_writer_rejects_path_names_and_oversized_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path_error = write_vpn_profile(
+            tmp.path(),
+            &VpnProfile {
+                name: "../outside".into(),
+                kind: VpnKind::Openvpn,
+                config: "client\n".into(),
+            },
+        )
+        .expect_err("profile names must not escape the profile directory");
+        assert_eq!(path_error.kind(), io::ErrorKind::InvalidInput);
+        assert!(!tmp.path().join("outside.ovpn").exists());
+
+        let size_error = write_vpn_profile(
+            tmp.path(),
+            &VpnProfile {
+                name: "large".into(),
+                kind: VpnKind::Wireguard,
+                config: "x".repeat(MAX_VPN_PROFILE_BYTES + 1),
+            },
+        )
+        .expect_err("profile bodies must stay bounded");
+        assert_eq!(size_error.kind(), io::ErrorKind::InvalidInput);
+        assert!(!vpn_profiles_dir(tmp.path()).exists());
     }
 }

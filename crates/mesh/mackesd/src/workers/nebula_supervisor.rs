@@ -1146,7 +1146,10 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
 /// Creates parent dirs if missing. Idempotent: a re-write of
 /// the same IP still bumps mtime, but the bytes match so
 /// downstream mtime-gate consumers can use a byte-compare to
-/// skip the reload step.
+/// skip the reload step. Use the sealed writer even though this
+/// is not secret material: it rejects symlinked parent components
+/// and uses a unique `create_new` staging file, so a hostile
+/// replacement cannot redirect the publish outside its intended tree.
 ///
 /// Exposed at module scope so the gluster bind helper (and
 /// future consumers) have a single shared path constant +
@@ -1157,15 +1160,8 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
 /// Returns the formatted error string from the underlying
 /// `std::fs` call when directory creation or rename fails.
 pub fn publish_overlay_ip(path: &Path, overlay_ip: &str) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
-    }
     let body = format!("{overlay_ip}\n");
-    let tmp = path.with_extension("ip.tmp");
-    std::fs::write(&tmp, body.as_bytes())
-        .map_err(|e| format!("write tmp {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path)
-        .map_err(|e| format!("rename {} → {}: {e}", tmp.display(), path.display()))
+    write_atomic(path, body.as_bytes())
 }
 
 /// Marker schema version. This is intentionally local and owner-bound: the
@@ -2222,6 +2218,29 @@ mod tests {
             !tmp_path.exists(),
             "tempfile {} should have been renamed away",
             tmp_path.display()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publish_overlay_ip_rejects_symlinked_parent_before_writing_outside_tree() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("root");
+        let outside = tempfile::tempdir().expect("outside");
+        let redirected = root.path().join("var");
+        symlink(outside.path(), &redirected).expect("symlink parent");
+
+        let error = publish_overlay_ip(&redirected.join("overlay-ip"), "10.42.0.5")
+            .expect_err("symlinked parent must be refused");
+
+        assert!(
+            error.contains("symlinked parent"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !outside.path().join("overlay-ip").exists(),
+            "a hostile parent link must not redirect the overlay-IP write"
         );
     }
 

@@ -32,6 +32,12 @@ const SENSITIVE_PLACEHOLDER: &str = "(sensitive — value withheld)";
 /// large; the shell's expandable raw-log pane wants the head, not megabytes).
 const RAW_LOG_CAP: usize = 4096;
 
+/// Reject an inventory document before JSON parsing can materialize an unbounded
+/// tool response. The row/group caps below bound the read model, while this cap
+/// bounds the parser's input allocation; the handler still exposes only the
+/// [`RAW_LOG_CAP`]-sized diagnostic on rejection.
+const MAX_INVENTORY_INPUT_BYTES: usize = 1024 * 1024;
+
 /// Keep a hostile inventory from turning one read reply into an unbounded roster.
 const MAX_INVENTORY_HOSTS: usize = 256;
 
@@ -108,6 +114,12 @@ pub(super) fn handle_output(w: &CloudWorker, verb_name: &str) -> CloudReply {
 /// mesh dynamic inventory only emits hosts that hold a live keepalive lease).
 /// Deterministic ordering (BTree) so the surface renders stably.
 fn parse_inventory(json: &str) -> Result<Vec<InventoryHost>, String> {
+    if json.len() > MAX_INVENTORY_INPUT_BYTES {
+        return Err(format!(
+            "inventory document exceeds the {}-byte input limit",
+            MAX_INVENTORY_INPUT_BYTES
+        ));
+    }
     let value: Value = serde_json::from_str(json.trim()).map_err(|e| e.to_string())?;
     let root = value
         .as_object()
@@ -352,6 +364,17 @@ mod tests {
     fn inventory_parse_rejects_a_non_object_root() {
         assert!(parse_inventory("[]").is_err());
         assert!(parse_inventory("not json").is_err());
+    }
+
+    #[test]
+    fn inventory_parse_fails_closed_before_materializing_an_oversized_document() {
+        let oversized = format!(
+            "{{\"all\":{{\"hosts\":[]}},\"padding\":\"{}\"}}",
+            "x".repeat(MAX_INVENTORY_INPUT_BYTES)
+        );
+
+        let error = parse_inventory(&oversized).expect_err("oversized input must be rejected");
+        assert!(error.contains("input limit"));
     }
 
     #[test]

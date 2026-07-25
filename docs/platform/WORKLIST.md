@@ -257,6 +257,20 @@ These decisions refine acceptance and sequencing for the active items below.
   ambiguous hop is omitted and an oversized roster fails closed. The focused
   BigBoy topology gate is green at 9/9, with exact-file rustfmt and diff checks
   clean. Live Nebula rotation/reconnect evidence remains external.
+- Progress (2026-07-24 topology-writer boundary hardening): hop advertisements
+  are now validated before path construction, VPN profile names/configuration
+  are bounded before filesystem mutation, and both writers use the sealed
+  unique-temp atomic path so hostile final symlinks are replaced rather than
+  followed. The regression coverage includes traversal, oversized profile,
+  and hostile-leaf cases; the full BigBoy `mackesd` library gate is green at
+  3,997 passed, 1 ignored. Live Nebula rotation/reconnect evidence remains
+  external.
+- Progress (2026-07-24 overlay-IP publication hardening): the Nebula
+  supervisor's replicated overlay-IP writer now rejects symlinked parent
+  components and uses unique create-new staging with crash-durable replacement;
+  the hostile-parent regression is included in the full BigBoy `mackesd` gate
+  at 3,997 passed, 1 ignored. Live rotation/reconnect evidence remains
+  external.
 - Progress (2026-07-24 relay-authority refresh hardening): the Nebula supervisor
   now refuses replicated bundle refresh and lighthouse-roster reconciliation
   when the public relay authority does not match the root-local enrollment pin.
@@ -474,6 +488,11 @@ These decisions refine acceptance and sequencing for the active items below.
   `CloudReply` materialization while preserving sensitive-value masking. The
   focused BigBoy inventory gate is green at 60/60; live libvirt/Podman evidence
   remains external.
+- Progress (2026-07-24 inventory parser boundary hardening): inventory JSON is
+  now rejected above 1 MiB before `serde_json` materialization, with bounded
+  diagnostics preserved for the caller. The focused inventory gate is green at
+  14/14 and the full BigBoy `mackesd` library gate at 3,997 passed, 1 ignored;
+  live libvirt/Podman evidence remains external.
 - Progress (2026-07-24 direct-libvirt action framing hardening): the lifecycle
   Bus parser now rejects action bodies above the shared 64 KiB RPC limit before
   JSON materialization, with the oversized-body regression covered by the
@@ -715,6 +734,12 @@ These decisions refine acceptance and sequencing for the active items below.
   projection boundary now rejects serialized signed envelopes above 256 KiB
   before opening its SQLite transaction, preserving atomic replay behavior for
   hostile inline payloads. The focused BigBoy projection gate is green at 10/10;
+  live media/LLM evidence remains external.
+- Progress (2026-07-24 document-session materialization hardening): the
+  collaboration projection now probes one row beyond a 1,024-session limit,
+  caps participant lists at 256 entries, and bounds public titles/participant
+  text at 64 KiB before read-model construction. The fail-closed regression is
+  green at 1/1 and the full `.90` `mde-collab-core` library gate at 56/56;
   live media/LLM evidence remains external.
 - Progress (2026-07-25 clipboard fan-out hardening): `ClearClipboard` now caps
   authored tombstones at the existing 50-entry history budget and rejects an

@@ -47,6 +47,12 @@ const SCHEMA: &str = include_str!("../migrations/0001_init.sql");
 // substance belongs in the signed, content-addressed `PayloadRef` instead.
 // Keep the projection boundary finite even when a peer signs a hostile event.
 const MAX_ENVELOPE_JSON_BYTES: usize = 256 * 1024;
+// A read-model consumer must not be forced to materialize an attacker-sized
+// document-session fan-out.  The query deliberately probes one row beyond the
+// accepted count so overflow is rejected rather than silently truncated.
+const MAX_DOCUMENT_SESSIONS: usize = 1024;
+const MAX_DOCUMENT_PARTICIPANTS: usize = 256;
+const MAX_READ_MODEL_TEXT_BYTES: usize = 64 * 1024;
 
 /// The materialized read tables, in a fixed order — used by [`dump_tables`] and
 /// the per-space rebuild.
@@ -470,12 +476,16 @@ impl Projection {
         let (sql, want) = match space {
             Some(s) => (
                 format!(
-                    "{base} WHERE space_id = ?1 ORDER BY clock_wall, clock_counter, document_id"
+                    "{base} WHERE space_id = ?1 ORDER BY clock_wall, clock_counter, document_id LIMIT {}",
+                    MAX_DOCUMENT_SESSIONS + 1
                 ),
                 Some(s.to_string()),
             ),
             None => (
-                format!("{base} ORDER BY clock_wall, clock_counter, document_id"),
+                format!(
+                    "{base} ORDER BY clock_wall, clock_counter, document_id LIMIT {}",
+                    MAX_DOCUMENT_SESSIONS + 1
+                ),
                 None,
             ),
         };
@@ -495,9 +505,25 @@ impl Projection {
             stmt.query_map([], map)?
                 .collect::<std::result::Result<Vec<_>, _>>()?
         };
+        if collected.len() > MAX_DOCUMENT_SESSIONS {
+            return Err(CollabError::Serde(format!(
+                "document session read model exceeds {} rows",
+                MAX_DOCUMENT_SESSIONS
+            )));
+        }
         let mut sessions = Vec::new();
         for (space_id, document, title, participants_json) in collected {
+            ensure_read_model_text("document title", &title)?;
             let names: Vec<String> = serde_json::from_str(&participants_json)?;
+            if names.len() > MAX_DOCUMENT_PARTICIPANTS {
+                return Err(CollabError::Serde(format!(
+                    "document session participant list exceeds {} entries",
+                    MAX_DOCUMENT_PARTICIPANTS
+                )));
+            }
+            for name in &names {
+                ensure_read_model_text("document participant", name)?;
+            }
             sessions.push(DocumentSession {
                 document: parse_document(&document)?,
                 space: parse_space(&space_id)?,
@@ -1447,13 +1473,24 @@ fn parse_call(s: &str) -> Result<CallId> {
         .map_err(|_| CollabError::Serde(format!("bad call id {s}")))
 }
 
+fn ensure_read_model_text(field: &str, value: &str) -> Result<()> {
+    if value.len() > MAX_READ_MODEL_TEXT_BYTES {
+        return Err(CollabError::Serde(format!(
+            "{field} exceeds {MAX_READ_MODEL_TEXT_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
 fn summarize(kind_tag: &str) -> String {
     kind_tag.replace('_', " ")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_ENVELOPE_JSON_BYTES, Projection};
+    use super::{
+        Projection, MAX_DOCUMENT_PARTICIPANTS, MAX_DOCUMENT_SESSIONS, MAX_ENVELOPE_JSON_BYTES,
+    };
     use crate::error::CollabError;
     use crate::signer::{Ed25519Signer, EventSigner};
     use mde_collab_types::envelope::SCHEMA_VERSION;
@@ -1743,6 +1780,68 @@ mod tests {
             before,
             "oversized signed events must not enter the projection"
         );
+    }
+
+    #[test]
+    fn document_sessions_fail_closed_before_public_materialization_overflow() {
+        let projection = Projection::open_in_memory().expect("open projection");
+        let space = space_id(272);
+        let participants = serde_json::to_string(
+            &(0..=MAX_DOCUMENT_PARTICIPANTS)
+                .map(|index| format!("seat-{index}"))
+                .collect::<Vec<_>>(),
+        )
+        .expect("serialize participants");
+
+        projection
+            .connection()
+            .execute(
+                "INSERT INTO documents \
+                 (space_id, document_id, title, latest_summary, participants_json, clock_wall, clock_counter) \
+                 VALUES (?1, ?2, ?3, NULL, ?4, 1, 0)",
+                rusqlite::params![
+                    space.to_string(),
+                    Uuid::from_u128(273).to_string(),
+                    "bounded",
+                    participants,
+                ],
+            )
+            .expect("insert participant overflow row");
+        let participant_error = projection
+            .document_sessions(None)
+            .expect_err("participant overflow must be rejected");
+        assert!(matches!(
+            participant_error,
+            CollabError::Serde(message) if message.contains("participant list exceeds")
+        ));
+
+        projection
+            .connection()
+            .execute("DELETE FROM documents", [])
+            .expect("clear test documents");
+        for index in 0..=MAX_DOCUMENT_SESSIONS {
+            projection
+                .connection()
+                .execute(
+                    "INSERT INTO documents \
+                     (space_id, document_id, title, latest_summary, participants_json, clock_wall, clock_counter) \
+                     VALUES (?1, ?2, ?3, NULL, '[]', ?4, 0)",
+                    rusqlite::params![
+                        space.to_string(),
+                        Uuid::from_u128(10_000 + index as u128).to_string(),
+                        "bounded",
+                        index as i64,
+                    ],
+                )
+                .expect("insert session row");
+        }
+        let row_error = projection
+            .document_sessions(None)
+            .expect_err("session row fan-out must be rejected");
+        assert!(matches!(
+            row_error,
+            CollabError::Serde(message) if message.contains("session read model exceeds")
+        ));
     }
 
     #[test]
