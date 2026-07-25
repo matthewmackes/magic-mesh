@@ -33,7 +33,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -47,6 +47,77 @@ pub const PREFS_SUBDIR: &str = "chooser-prefs";
 /// recents are a convenience, not an archive) so the record never grows without
 /// bound; older uses fall off the tail.
 const RECENTS_CAP: usize = 24;
+
+/// Keep hostile or stale Syncthing leaves bounded before `serde_json` owns the
+/// document. A normal seat record is only a few kilobytes; this leaves room for
+/// a real roster without turning a replicated path into an unbounded allocator.
+const MAX_PREFS_RECORD_BYTES: usize = 256 * 1024;
+
+/// Read one replicated chooser record through a bounded descriptor-backed
+/// regular-file boundary. The final component is opened without following a
+/// symlink and with non-blocking semantics, so a FIFO or other special file
+/// cannot stall the chooser. The descriptor metadata check rejects anything
+/// that is not a regular file, and reading one byte past the initial bound
+/// rejects a file that grows while it is being consumed. Invalid UTF-8 is
+/// rejected here, before JSON materialization. Callers deliberately collapse
+/// every failure to their existing fail-soft behavior.
+fn read_bounded_prefs_record(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        options.custom_flags(0o400000 | 0o4000); // O_NOFOLLOW | O_NONBLOCK
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        options.custom_flags(0x100 | 0x4); // O_NOFOLLOW | O_NONBLOCK
+
+        // Unsupported Unix targets still fail closed for a final symlink even
+        // when their standard library does not expose O_NOFOLLOW.
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        if !fs::symlink_metadata(path)
+            .ok()
+            .is_some_and(|metadata| metadata.file_type().is_file())
+        {
+            return None;
+        }
+    }
+    #[cfg(not(unix))]
+    if !fs::symlink_metadata(path)
+        .ok()
+        .is_some_and(|metadata| metadata.file_type().is_file())
+    {
+        return None;
+    }
+
+    let file = options.open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    let max_bytes = u64::try_from(MAX_PREFS_RECORD_BYTES).ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > max_bytes {
+        return None;
+    }
+
+    let capacity = usize::try_from(metadata.len())
+        .ok()?
+        .min(MAX_PREFS_RECORD_BYTES)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > MAX_PREFS_RECORD_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
 
 // ── the synced entry types ───────────────────────────────────────────────────
 
@@ -315,7 +386,7 @@ impl ChooserPrefsStore {
             {
                 continue; // an in-flight atomic-write temp file
             }
-            if let Ok(data) = fs::read_to_string(&path) {
+            if let Some(data) = read_bounded_prefs_record(&path) {
                 if let Ok(rec) = serde_json::from_str::<SeatPrefs>(&data) {
                     out.push(rec);
                 }
@@ -329,7 +400,7 @@ impl ChooserPrefsStore {
     /// resume a seat's tombstones on start-up).
     #[must_use]
     fn seat_record(&self, identity: &str, seat: &str) -> Option<SeatPrefs> {
-        let data = fs::read_to_string(self.seat_path(identity, seat)).ok()?;
+        let data = read_bounded_prefs_record(&self.seat_path(identity, seat))?;
         serde_json::from_str::<SeatPrefs>(&data).ok()
     }
 }
@@ -798,6 +869,81 @@ mod tests {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         std::env::temp_dir().join(format!("mde-chooser9-{tag}-{n}"))
+    }
+
+    #[test]
+    fn persisted_record_reader_accepts_valid_round_trip() {
+        let dir = temp_root("bounded-valid");
+        std::fs::create_dir_all(&dir).expect("mkroot");
+        let store = ChooserPrefsStore::new(dir.clone());
+        let mut expected = seat("seat-a");
+        expected.recents.push(RecentEntry {
+            id: "peer:oak".to_owned(),
+            name: "oak".to_owned(),
+            used_ms: 42,
+        });
+        store.publish(&expected).expect("publish valid record");
+
+        let path = store.seat_path("matthew", "seat-a");
+        let raw = read_bounded_prefs_record(&path).expect("read valid record");
+        assert_eq!(
+            raw,
+            serde_json::to_string_pretty(&expected).expect("serialize record")
+        );
+        assert_eq!(
+            store.seat_record("matthew", "seat-a"),
+            Some(expected.clone())
+        );
+        assert_eq!(store.records("matthew"), vec![expected]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persisted_reader_rejects_hostile_leaves_without_breaking_the_valid_fold() {
+        let dir = temp_root("bounded-hostile");
+        std::fs::create_dir_all(&dir).expect("mkroot");
+        let store = ChooserPrefsStore::new(dir.clone());
+        let identity_dir = store.identity_dir("matthew");
+        std::fs::create_dir_all(&identity_dir).expect("mk identity dir");
+
+        let valid = seat("seat-a");
+        let valid_path = identity_dir.join("seat-a.json");
+        std::fs::write(
+            &valid_path,
+            serde_json::to_vec(&valid).expect("serialize valid record"),
+        )
+        .expect("write valid record");
+
+        let oversized = identity_dir.join("oversized.json");
+        std::fs::write(
+            &oversized,
+            vec![b'{'; MAX_PREFS_RECORD_BYTES.saturating_add(1)],
+        )
+        .expect("write oversized record");
+        assert!(read_bounded_prefs_record(&oversized).is_none());
+
+        let invalid_utf8 = identity_dir.join("invalid-utf8.json");
+        std::fs::write(&invalid_utf8, [0xff, 0xfe, 0xfd]).expect("write invalid UTF-8");
+        assert!(read_bounded_prefs_record(&invalid_utf8).is_none());
+
+        let non_regular = identity_dir.join("directory.json");
+        std::fs::create_dir(&non_regular).expect("create non-regular leaf");
+        assert!(read_bounded_prefs_record(&non_regular).is_none());
+
+        #[cfg(unix)]
+        {
+            let symlink = identity_dir.join("linked.json");
+            std::os::unix::fs::symlink(&valid_path, &symlink).expect("create final symlink");
+            assert!(read_bounded_prefs_record(&symlink).is_none());
+            assert!(store.seat_record("matthew", "linked").is_none());
+        }
+
+        let records = store.records("matthew");
+        assert_eq!(records, vec![valid], "hostile leaves are skipped fail-soft");
+        assert_eq!(store.seat_record("matthew", "seat-a"), Some(seat("seat-a")));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

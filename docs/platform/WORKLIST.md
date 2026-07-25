@@ -584,6 +584,13 @@ These decisions refine acceptance and sequencing for the active items below.
   The focused farm gate is green at **9/9**, and the integrated
   `magic-fleet --lib` gate is green at **65/65**. Live libvirt/Podman evidence
   remains external.
+- Progress (2026-07-25 runner/CLI read boundaries): runner event snapshots and
+  CLI baseline/exception inputs now use bounded descriptor-backed regular-file
+  reads that reject final symlinks, non-regular leaves, oversized or growing
+  input, and invalid UTF-8 before parsing. The focused runner gate is green at
+  **2/2**, the CLI gate at **3/3**, and the integrated `magic-fleet
+  --all-targets` farm gate is green at **67 library, 3 binary, and 3
+  multiprocess tests**. Live libvirt/Podman evidence remains external.
 - Progress (2026-07-24 image provider boundary): `image-build` now caps raw
   requests before verb parsing, bounds replicated promotion/SHA sidecars,
   limits roster rows, and keeps reply/error/raw-log text bounded. The focused
@@ -876,6 +883,12 @@ These decisions refine acceptance and sequencing for the active items below.
   authored tombstones at the existing 50-entry history budget and rejects an
   oversized aggregate before consuming an event ID or HLC tick. The focused
   BigBoy pipeline gate is green at 6/6; live media/LLM evidence remains external.
+- Progress (2026-07-25 KDE Connect fan-out read boundary): request/response
+  fan-out rows and replicated row reads now use bounded descriptor-backed
+  regular-file reads that reject final symlinks, non-regular leaves, oversized
+  or growing input, and invalid UTF-8 before JSON materialization. The focused
+  farm gate is green at **10/10**, and the integrated KDC-host library gate is
+  green at **92/92**. Live peer/media evidence remains external.
 - Progress (2026-07-24 replay ownership hardening): replayed `SpaceDeleted`
   events now require a currently present owner in the folded membership state,
   preventing a signed non-owner event from deleting a space read model. The
@@ -1662,6 +1675,13 @@ These decisions refine acceptance and sequencing for the active items below.
   --features async-services` gate is green at **4,061 passed, 0 failed, 1
   ignored**. Live pointer, pixel, physical, and VDI acceptance remain external
   evidence.
+- Progress (2026-07-25 Chooser roaming read boundary): persisted Construct
+  Chooser records and seat-resume state now use bounded descriptor-backed
+  regular-file reads that reject final symlinks, non-regular leaves, oversized
+  or growing input, and invalid UTF-8 before state folding. The focused farm
+  gate is green at **12/12**, and the integrated shell binary suite is green
+  at **1,785/1,785**. Live pointer, pixel, physical, and VDI acceptance remain
+  external evidence.
 - Progress (2026-07-25 Front Door query boundary): launcher query state and
   ranking now enforce a UTF-8-safe 256-character cap, with the egui input
   applying the same limit to keystrokes and oversized paste/restored state.

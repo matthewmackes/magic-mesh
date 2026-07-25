@@ -17,6 +17,65 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
+/// Ansible event records are local runner output but can still be malformed or
+/// unexpectedly large before they reach the JSON parser.
+const MAX_EVENT_BYTES: usize = 256 * 1024;
+
+/// Read one runner event through a bounded descriptor-backed regular file.
+/// Reject final symlinks, blocking special files, oversized input, growth past
+/// the bound, and invalid UTF-8 before parsing.
+fn read_bounded_event(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        options.custom_flags(0o400000 | 0o4000); // O_NOFOLLOW | O_NONBLOCK
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        options.custom_flags(0x100 | 0x4); // O_NOFOLLOW | O_NONBLOCK
+
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        if !std::fs::symlink_metadata(path).ok()?.file_type().is_file() {
+            return None;
+        }
+    }
+
+    #[cfg(not(unix))]
+    if !std::fs::symlink_metadata(path).ok()?.file_type().is_file() {
+        return None;
+    }
+
+    let file = options.open(path).ok()?;
+
+    let metadata = file.metadata().ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_EVENT_BYTES as u64 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len())
+            .unwrap_or(MAX_EVENT_BYTES)
+            .min(MAX_EVENT_BYTES)
+            .saturating_add(1),
+    );
+    file.take((MAX_EVENT_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > MAX_EVENT_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
 /// Convergence summary parsed from an ansible-runner `playbook_on_stats` event.
 ///
 /// The PLAY RECAP totals, summed across hosts (a node applies to `localhost`, so
@@ -903,7 +962,7 @@ fn latest_stats(root: &Path) -> Option<ApplyReport> {
     std::fs::read_dir(&events)
         .ok()?
         .filter_map(Result::ok)
-        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .filter_map(|e| read_bounded_event(&e.path()))
         .find_map(|s| parse_stats(&s))
 }
 
@@ -958,6 +1017,53 @@ mod tests {
     fn parse_stats_rejects_non_stats_events() {
         assert!(parse_stats(r#"{"event":"runner_on_ok","event_data":{}}"#).is_none());
         assert!(parse_stats("not json").is_none());
+    }
+
+    #[test]
+    fn latest_stats_skips_hostile_event_files_before_parsing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let events = tmp.path().join("artifacts/job/job_events");
+        std::fs::create_dir_all(&events).unwrap();
+        std::fs::write(
+            events.join("oversized.json"),
+            vec![b'x'; MAX_EVENT_BYTES + 1],
+        )
+        .unwrap();
+        std::fs::write(events.join("invalid-utf8.json"), [0xff, 0xfe]).unwrap();
+        std::fs::create_dir(events.join("directory.json")).unwrap();
+
+        #[cfg(unix)]
+        {
+            let target = events.join("target.json");
+            std::fs::write(&target, REAL_STATS).unwrap();
+            std::os::unix::fs::symlink(&target, events.join("symlink.json")).unwrap();
+        }
+
+        std::fs::write(events.join("valid.json"), REAL_STATS).unwrap();
+        assert_eq!(
+            latest_stats(tmp.path()),
+            Some(ApplyReport {
+                ok: 1,
+                changed: 1,
+                failures: 0,
+                unreachable: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn latest_stats_returns_none_when_all_event_files_are_hostile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let events = tmp.path().join("artifacts/job/job_events");
+        std::fs::create_dir_all(&events).unwrap();
+        std::fs::write(
+            events.join("oversized.json"),
+            vec![b'x'; MAX_EVENT_BYTES + 1],
+        )
+        .unwrap();
+        std::fs::write(events.join("invalid-utf8.json"), [0xff, 0xfe]).unwrap();
+        std::fs::create_dir(events.join("directory.json")).unwrap();
+        assert_eq!(latest_stats(tmp.path()), None);
     }
 
     #[test]

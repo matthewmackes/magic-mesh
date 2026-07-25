@@ -8,7 +8,7 @@
 //!
 //! Exit 0 only when the node converged / the heal did not fail.
 
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -191,13 +191,100 @@ fn apply(playbook: &Path, json: bool) -> ExitCode {
 
 /// Read a YAML input file or print the canonical error.
 fn read(path: &Path) -> Option<String> {
-    match std::fs::read_to_string(path) {
+    match read_bounded_text(path, MAX_CLI_INPUT_BYTES) {
         Ok(s) => Some(s),
         Err(e) => {
             eprintln!("magic-fleet: cannot read {}: {e}", path.display());
             None
         }
     }
+}
+
+/// CLI YAML is still peer- or operator-provided input. Keep it bounded before
+/// handing it to serde, and make the descriptor the security boundary: the
+/// final path component is not followed, blocking special files cannot stall
+/// the caller, and growth after the metadata check is detected by reading one
+/// byte beyond the cap.
+const MAX_CLI_INPUT_BYTES: usize = 4 * 1024 * 1024;
+
+fn open_cli_input(path: &Path) -> io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        options.custom_flags(0o400000 | 0o4000); // O_NOFOLLOW | O_NONBLOCK
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        options.custom_flags(0x100 | 0x4); // O_NOFOLLOW | O_NONBLOCK
+
+        // Unsupported Unix targets still get a fail-closed preflight. The
+        // deployment target uses the descriptor-level O_NOFOLLOW above.
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        if !std::fs::symlink_metadata(path)?.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "input is not a regular file",
+            ));
+        }
+    }
+
+    #[cfg(not(unix))]
+    if !std::fs::symlink_metadata(path)?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "input is not a regular file",
+        ));
+    }
+
+    options.open(path)
+}
+
+/// Read one CLI text input through a bounded descriptor-backed regular file.
+fn read_bounded_text(path: &Path, max_bytes: usize) -> io::Result<String> {
+    let file = open_cli_input(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "input is not a regular file",
+        ));
+    }
+
+    let max_bytes_u64 = u64::try_from(max_bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "input size limit cannot be represented",
+        )
+    })?;
+    if metadata.len() > max_bytes_u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::FileTooLarge,
+            "input exceeds the maximum size",
+        ));
+    }
+
+    let capacity = usize::try_from(metadata.len())
+        .unwrap_or(max_bytes)
+        .min(max_bytes)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(max_bytes_u64.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::FileTooLarge,
+            "input grew beyond the maximum size",
+        ));
+    }
+    String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 /// Per-invocation scratch root (ansible work dir).
@@ -209,7 +296,7 @@ fn work_root(verb: &str) -> PathBuf {
 /// returns `spec` unchanged; an unreadable/invalid file errors out.
 fn with_exceptions(spec: BaselineSpec, except: Option<&Path>) -> Result<BaselineSpec, ExitCode> {
     let Some(p) = except else { return Ok(spec) };
-    let yaml = std::fs::read_to_string(p).map_err(|e| {
+    let yaml = read_bounded_text(p, MAX_CLI_INPUT_BYTES).map_err(|e| {
         eprintln!("magic-fleet: cannot read {}: {e}", p.display());
         ExitCode::FAILURE
     })?;
@@ -491,5 +578,62 @@ const fn exit_for(ok: bool) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_readers_accept_valid_yaml_inputs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let baseline = tmp.path().join("baseline.yaml");
+        std::fs::write(&baseline, "packages:\n  - name: htop\n").unwrap();
+        assert_eq!(
+            read(&baseline).as_deref(),
+            Some("packages:\n  - name: htop\n")
+        );
+
+        let exceptions = tmp.path().join("exceptions.yaml");
+        std::fs::write(&exceptions, "packages: [htop]\n").unwrap();
+        let spec = BaselineSpec::from_yaml("packages:\n  - name: htop\n  - name: vim\n").unwrap();
+        let filtered = with_exceptions(spec, Some(&exceptions)).unwrap();
+        assert_eq!(filtered.packages.len(), 1);
+        assert_eq!(filtered.packages[0].name, "vim");
+    }
+
+    #[test]
+    fn cli_readers_reject_nonregular_oversized_and_invalid_utf8_inputs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = BaselineSpec::default();
+
+        let directory = tmp.path().join("directory.yaml");
+        std::fs::create_dir(&directory).unwrap();
+        assert!(read(&directory).is_none());
+        assert!(with_exceptions(spec.clone(), Some(&directory)).is_err());
+
+        let oversized = tmp.path().join("oversized.yaml");
+        std::fs::write(&oversized, vec![b'x'; MAX_CLI_INPUT_BYTES + 1]).unwrap();
+        assert!(read(&oversized).is_none());
+        assert!(with_exceptions(spec.clone(), Some(&oversized)).is_err());
+
+        let invalid_utf8 = tmp.path().join("invalid-utf8.yaml");
+        std::fs::write(&invalid_utf8, [0xff, 0xfe]).unwrap();
+        assert!(read(&invalid_utf8).is_none());
+        assert!(with_exceptions(spec, Some(&invalid_utf8)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_readers_reject_final_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target.yaml");
+        std::fs::write(&target, "packages: []\n").unwrap();
+        let symlink = tmp.path().join("symlink.yaml");
+        std::os::unix::fs::symlink(&target, &symlink).unwrap();
+
+        assert!(read(&symlink).is_none());
+        assert!(with_exceptions(BaselineSpec::default(), Some(&symlink)).is_err());
     }
 }

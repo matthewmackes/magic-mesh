@@ -274,6 +274,80 @@ pub fn aggregate_responses(
 
 // ── shared own-row substrate helpers ────────────────────────────────────────
 
+/// Keep replicated request/response rows bounded before `serde_json` can
+/// materialize attacker-controlled collections and strings.
+const MAX_FANOUT_ROW_BYTES: usize = 256 * 1024;
+
+/// Read one replicated row through a descriptor-backed regular-file boundary.
+///
+/// The final path component is opened without following a symlink and with
+/// non-blocking semantics, so a FIFO or other special file cannot stall the
+/// fanout worker before the descriptor is inspected and rejected. The second
+/// metadata check rejects anything that is not a regular file. Reading one
+/// byte beyond the initial metadata bound closes the race where a peer grows a
+/// regular file while it is being consumed. Invalid UTF-8 is rejected before
+/// any JSON materialization. Callers intentionally collapse every failure to
+/// their existing fail-soft behavior.
+fn read_bounded_fanout_row(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        options.custom_flags(0o400000 | 0o4000 | 0o2000000); // O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        options.custom_flags(0x100 | 0x4); // O_NOFOLLOW | O_NONBLOCK
+
+        // Unsupported Unix targets still fail closed for a final symlink even
+        // when their standard library does not expose O_NOFOLLOW.
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        if !std::fs::symlink_metadata(path)
+            .ok()
+            .is_some_and(|metadata| metadata.file_type().is_file())
+        {
+            return None;
+        }
+    }
+
+    #[cfg(not(unix))]
+    if !std::fs::symlink_metadata(path)
+        .ok()
+        .is_some_and(|metadata| metadata.file_type().is_file())
+    {
+        return None;
+    }
+
+    let file = options.open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_FANOUT_ROW_BYTES as u64 {
+        return None;
+    }
+
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len())
+            .unwrap_or(MAX_FANOUT_ROW_BYTES)
+            .min(MAX_FANOUT_ROW_BYTES)
+            .saturating_add(1),
+    );
+    file.take((MAX_FANOUT_ROW_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > MAX_FANOUT_ROW_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
 /// Append one `entry` to `dir/<host>.json`, idempotent per `key_of` and bounded to
 /// the newest `cap` by `ts_of`. Atomic temp + rename (the notification-relay shape,
 /// factored so requests + responses share it).
@@ -292,8 +366,7 @@ where
 {
     std::fs::create_dir_all(dir)?;
     let path = dir.join(format!("{host}.json"));
-    let mut rows: Vec<T> = std::fs::read_to_string(&path)
-        .ok()
+    let mut rows: Vec<T> = read_bounded_fanout_row(&path)
         .and_then(|raw| serde_json::from_str(&raw).ok())
         .unwrap_or_default();
     let key = key_of(entry);
@@ -326,7 +399,7 @@ fn read_rows<T: for<'de> Deserialize<'de>>(dir: &Path) -> Vec<(String, Vec<T>)> 
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
-        let Ok(raw) = std::fs::read_to_string(&path) else {
+        let Some(raw) = read_bounded_fanout_row(&path) else {
             continue;
         };
         if let Ok(rows) = serde_json::from_str::<Vec<T>>(&raw) {
@@ -517,5 +590,92 @@ mod tests {
         .unwrap();
         let got = collect_pending_requests(root, "oak", 100, i64::MAX);
         assert_eq!(got.len(), 1);
+    }
+
+    #[test]
+    fn bounded_row_reader_preserves_a_valid_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let request = FanoutRequest {
+            id: "eagle:7:ring".into(),
+            action: FanoutAction::Ring,
+            origin_host: "eagle".into(),
+            ts_ms: 7,
+        };
+
+        publish_request(root, "eagle", &request, 8).unwrap();
+
+        let path = requests_dir(root).join("eagle.json");
+        let raw = read_bounded_fanout_row(&path).expect("valid row is readable");
+        assert_eq!(
+            serde_json::from_str::<Vec<FanoutRequest>>(&raw).unwrap(),
+            vec![request.clone()]
+        );
+        assert_eq!(
+            collect_pending_requests(root, "oak", 8, i64::MAX),
+            vec![request]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn row_store_skips_hostile_leaves_without_following_or_blocking() {
+        use std::os::unix::fs::symlink;
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let dir = requests_dir(root);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let valid = FanoutRequest {
+            id: "eagle:1:ring".into(),
+            action: FanoutAction::Ring,
+            origin_host: "eagle".into(),
+            ts_ms: 1,
+        };
+        publish_request(root, "eagle", &valid, 8).unwrap();
+
+        let outside = root.join("outside.json");
+        let outside_body = serde_json::to_vec(&vec![valid.clone()]).unwrap();
+        std::fs::write(&outside, &outside_body).unwrap();
+        symlink(&outside, dir.join("symlink.json")).unwrap();
+        std::fs::write(
+            dir.join("oversized.json"),
+            vec![b'x'; MAX_FANOUT_ROW_BYTES + 1],
+        )
+        .unwrap();
+        std::fs::write(dir.join("invalid-utf8.json"), [0xff, 0xfe]).unwrap();
+        std::fs::create_dir(dir.join("directory.json")).unwrap();
+        let _socket = UnixListener::bind(dir.join("special.json")).unwrap();
+
+        assert!(read_bounded_fanout_row(&dir.join("symlink.json")).is_none());
+        assert!(read_bounded_fanout_row(&dir.join("oversized.json")).is_none());
+        assert!(read_bounded_fanout_row(&dir.join("invalid-utf8.json")).is_none());
+        assert!(read_bounded_fanout_row(&dir.join("directory.json")).is_none());
+        assert!(read_bounded_fanout_row(&dir.join("special.json")).is_none());
+
+        let rows = read_rows::<FanoutRequest>(&dir);
+        assert_eq!(rows, vec![("eagle".into(), vec![valid.clone()])]);
+
+        // The own-row append path also rejects the symlink target before its
+        // atomic rename replaces the hostile leaf, leaving the outside file
+        // untouched.
+        let replacement = FanoutRequest {
+            id: "oak:2:ring".into(),
+            action: FanoutAction::Ring,
+            origin_host: "oak".into(),
+            ts_ms: 2,
+        };
+        symlink(&outside, dir.join("oak.json")).unwrap();
+        publish_request(root, "oak", &replacement, 8).unwrap();
+        assert_eq!(std::fs::read(&outside).unwrap(), outside_body);
+        assert_eq!(
+            read_rows::<FanoutRequest>(&dir)
+                .into_iter()
+                .find(|(stem, _)| stem == "oak")
+                .map(|(_, rows)| rows),
+            Some(vec![replacement]),
+        );
     }
 }
