@@ -487,6 +487,11 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-ARCH-007 - Repair Workloads cockpit E2E wire, placement, and authorization
 
 - Status: Remaining
+- Progress (2026-07-24 bounded cloud I/O): Workloads now drains stdout/stderr
+  concurrently to EOF with a 1 MiB cap and UTF-8-safe truncation, rejects
+  oversized inventory/output JSON before parsing, and bounds prior Quadlet
+  rollback reads with `O_NOFOLLOW` plus a 1 MiB cap. BigBoy cloud tests are
+  green at **181/181**; live libvirt/Podman evidence remains external.
 - Progress (2026-07-25 desired-document read boundary): cloud reconciliation
   now reads desired documents through a 256 KiB bounded regular-file path before
   JSON materialization. Best-effort mirror reads skip an oversized sibling while
@@ -712,6 +717,10 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-011 - Communications collaboration suite full replacement
 
 - Status: Remaining
+- Progress (2026-07-24 file-reference boundary): selected collaboration files
+  now require regular non-symlink leaves and a bounded 100 MiB read before
+  hashing. The focused farm gate is green at **7/7** and the full UI package
+  gate at **75/75**; live media/LLM evidence remains external.
 - Progress (2026-07-25 conversation timeline boundary): collaboration
   projections now probe one row beyond a 4,096-message timeline limit and bound
   message bodies to 256 KiB before UTF-8 materialization, including the
@@ -1218,6 +1227,11 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-012 - Maps live-data overlays (zero-cost external feeds)
 
 - Status: Remaining
+- Progress (2026-07-24 retained-envelope boundary): Maps now reads the
+  authoritative on-disk retained envelope through an exact-ULID, bounded 8 MiB
+  no-follow path before JSON decoding, while preserving the existing body cap
+  and feed-local fail-soft behavior. The model farm gate is green at **60/60**;
+  live provider and MG90 scanner evidence remains external.
 - Progress (2026-07-25 shared typography adoption): transit and Caltrans camera
   overlay labels/badges now resolve through the shared `TypographyRole::Caption`
   ramp, while technical distance readouts remain monospace at their existing

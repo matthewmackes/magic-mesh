@@ -1,6 +1,7 @@
 //! Render-agnostic state for the Maps & Location workspace.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
@@ -750,11 +751,11 @@ impl MapsLocationSurface {
         let Some(root) = mde_bus::client_data_dir() else {
             return;
         };
-        let Ok(persist) = mde_bus::persist::Persist::open(root) else {
+        let Ok(persist) = mde_bus::persist::Persist::open(root.clone()) else {
             return;
         };
 
-        self.refresh_from_persist(&persist, node);
+        self.refresh_from_persist(&persist, &root, node);
     }
 
     /// Fold one already-open Bus spool into the cockpit.
@@ -764,44 +765,50 @@ impl MapsLocationSurface {
     /// without mutating process-global `MDE_BUS_ROOT` or depending on a
     /// workstation's real daemon. Production still reaches this seam through
     /// the fail-soft, cadence-gated method above.
-    fn refresh_from_persist(&mut self, persist: &mde_bus::persist::Persist, node: &str) {
-        if let Some(mirror) = read_vehicle_mirror(persist, node) {
+    fn refresh_from_persist(
+        &mut self,
+        persist: &mde_bus::persist::Persist,
+        bus_root: &Path,
+        node: &str,
+    ) {
+        let reader = PersistedMirrorReader { persist, bus_root };
+        if let Some(mirror) = read_vehicle_mirror(&reader, node) {
             self.refresh_from_vehicle(&mirror);
         }
-        if let Some(snapshot) = read_earthquake_mirror(persist, node) {
+        if let Some(snapshot) = read_earthquake_mirror(&reader, node) {
             self.refresh_from_earthquakes(snapshot);
         }
-        if let Some(snapshot) = read_nws_alert_mirror(persist, node) {
+        if let Some(snapshot) = read_nws_alert_mirror(&reader, node) {
             self.refresh_from_nws_alerts(snapshot);
         }
-        if let Some(snapshot) = read_aircraft_mirror(persist, node) {
+        if let Some(snapshot) = read_aircraft_mirror(&reader, node) {
             self.refresh_from_aircraft(snapshot);
         }
-        if let Some(snapshot) = read_transit_mirror(persist, node) {
+        if let Some(snapshot) = read_transit_mirror(&reader, node) {
             self.refresh_from_transit(snapshot);
         }
-        if let Some(snapshot) = read_nws_forecast_mirror(persist, node) {
+        if let Some(snapshot) = read_nws_forecast_mirror(&reader, node) {
             self.refresh_from_nws_forecast(snapshot);
         }
-        if let Some(snapshot) = read_caltrans_camera_mirror(persist, node) {
+        if let Some(snapshot) = read_caltrans_camera_mirror(&reader, node) {
             self.refresh_from_caltrans_cameras(snapshot);
         }
-        if let Some(snapshot) = read_iem_radar_mirror(persist, node) {
+        if let Some(snapshot) = read_iem_radar_mirror(&reader, node) {
             self.refresh_from_iem_radar(snapshot);
         }
-        if let Some(snapshot) = read_wildfire_mirror(persist, node) {
+        if let Some(snapshot) = read_wildfire_mirror(&reader, node) {
             self.refresh_from_wildfire(snapshot);
         }
-        if let Some(snapshot) = read_airspace_mirror(persist, node) {
+        if let Some(snapshot) = read_airspace_mirror(&reader, node) {
             self.refresh_from_airspace(snapshot);
         }
-        if let Some(snapshot) = read_firms_mirror(persist, node) {
+        if let Some(snapshot) = read_firms_mirror(&reader, node) {
             self.refresh_from_firms(snapshot);
         }
-        if let Some(snapshot) = read_traffic_mirror(persist, node) {
+        if let Some(snapshot) = read_traffic_mirror(&reader, node) {
             self.refresh_from_traffic(snapshot);
         }
-        if let Some(snapshot) = read_air_quality_mirror(persist, node) {
+        if let Some(snapshot) = read_air_quality_mirror(&reader, node) {
             self.refresh_from_air_quality(snapshot);
         }
     }
@@ -997,99 +1004,104 @@ fn mirror_age_s(published_at_ms: i64) -> f32 {
 /// the selected node's exact host stamp before folding it into the cockpit;
 /// otherwise a stale or manually injected cross-node row could move the map's
 /// projection origin and make another gateway look local.
+struct PersistedMirrorReader<'a> {
+    persist: &'a mde_bus::persist::Persist,
+    bus_root: &'a Path,
+}
+
 fn read_vehicle_mirror(
-    persist: &mde_bus::persist::Persist,
+    reader: &PersistedMirrorReader<'_>,
     node: &str,
 ) -> Option<mackes_mesh_types::vehicle::VehicleState> {
     let topic = mackes_mesh_types::vehicle::vehicle_state_topic(node);
-    read_latest_json_for_node(persist, &topic, node)
+    read_latest_json_for_node(reader, &topic, node)
 }
 
 /// Decode the retained keyless-USGS overlay snapshot, fail-soft when the adapter
 /// is disabled, the Bus is absent, or the latest payload is malformed.
 fn read_earthquake_mirror(
-    persist: &mde_bus::persist::Persist,
+    reader: &PersistedMirrorReader<'_>,
     node: &str,
 ) -> Option<mackes_mesh_types::earthquake::EarthquakeSnapshot> {
     let topic = mackes_mesh_types::earthquake::earthquake_state_topic(node);
-    read_latest_json_for_node(persist, &topic, node)
+    read_latest_json_for_node(reader, &topic, node)
 }
 
 /// Decode the retained NWS active-alert snapshot, fail-soft when the opt-in
 /// adapter has no fresh vehicle fix or has not published yet.
 fn read_nws_alert_mirror(
-    persist: &mde_bus::persist::Persist,
+    reader: &PersistedMirrorReader<'_>,
     node: &str,
 ) -> Option<mackes_mesh_types::nws_alert::NwsAlertSnapshot> {
     let topic = mackes_mesh_types::nws_alert::nws_alert_state_topic(node);
-    read_latest_json_for_node(persist, &topic, node)
+    read_latest_json_for_node(reader, &topic, node)
 }
 
 /// Decode the retained adsb.lol aircraft snapshot, fail-soft when the adapter
 /// is disabled, lacks a qualified vehicle fix, or has not published yet.
 fn read_aircraft_mirror(
-    persist: &mde_bus::persist::Persist,
+    reader: &PersistedMirrorReader<'_>,
     node: &str,
 ) -> Option<mackes_mesh_types::aircraft::AircraftSnapshot> {
     let topic = mackes_mesh_types::aircraft::aircraft_state_topic(node);
-    read_latest_json_for_node(persist, &topic, node)
+    read_latest_json_for_node(reader, &topic, node)
 }
 
 /// Decode the retained MBTA transit snapshot, fail-soft when disabled/absent.
 fn read_transit_mirror(
-    persist: &mde_bus::persist::Persist,
+    reader: &PersistedMirrorReader<'_>,
     node: &str,
 ) -> Option<mackes_mesh_types::transit::TransitSnapshot> {
     let topic = mackes_mesh_types::transit::transit_state_topic(node);
-    read_latest_json_for_node(persist, &topic, node)
+    read_latest_json_for_node(reader, &topic, node)
 }
 
 /// Decode the retained NWS hourly snapshot, including explicit no-fix state.
 fn read_nws_forecast_mirror(
-    persist: &mde_bus::persist::Persist,
+    reader: &PersistedMirrorReader<'_>,
     node: &str,
 ) -> Option<mackes_mesh_types::nws_forecast::NwsForecastSnapshot> {
     let topic = mackes_mesh_types::nws_forecast::nws_forecast_state_topic(node);
-    read_latest_json_for_node(persist, &topic, node)
+    read_latest_json_for_node(reader, &topic, node)
 }
 
 /// Decode the retained Caltrans camera snapshot, fail-soft when disabled/absent.
 fn read_caltrans_camera_mirror(
-    persist: &mde_bus::persist::Persist,
+    reader: &PersistedMirrorReader<'_>,
     node: &str,
 ) -> Option<mackes_mesh_types::caltrans_camera::CaltransCameraSnapshot> {
     let topic = mackes_mesh_types::caltrans_camera::caltrans_camera_state_topic(node);
-    read_latest_json_for_node(persist, &topic, node)
+    read_latest_json_for_node(reader, &topic, node)
 }
 
 /// Decode the retained IEM/NWS NEXRAD snapshot, fail-soft when disabled/absent.
 fn read_iem_radar_mirror(
-    persist: &mde_bus::persist::Persist,
+    reader: &PersistedMirrorReader<'_>,
     node: &str,
 ) -> Option<mackes_mesh_types::iem_radar::IemRadarSnapshot> {
     let topic = mackes_mesh_types::iem_radar::iem_radar_state_topic(node);
-    read_latest_json_for_node(persist, &topic, node)
+    read_latest_json_for_node(reader, &topic, node)
 }
 
 /// Decode the retained keyless NIFC WFIGS perimeter snapshot, fail-soft when
 /// the opt-in adapter is disabled, has no fresh fix, or has not published yet.
 fn read_wildfire_mirror(
-    persist: &mde_bus::persist::Persist,
+    reader: &PersistedMirrorReader<'_>,
     node: &str,
 ) -> Option<mackes_mesh_types::wildfire::WildfireSnapshot> {
     let topic = mackes_mesh_types::wildfire::wildfire_state_topic(node);
-    read_latest_json_for_node(persist, &topic, node)
+    read_latest_json_for_node(reader, &topic, node)
 }
 
 /// Decode the retained typed MG90 airspace scanner snapshot. The worker owns
 /// source honesty; the desktop only accepts a same-node envelope and folds it
 /// into the live-only Airspace surface.
 fn read_airspace_mirror(
-    persist: &mde_bus::persist::Persist,
+    reader: &PersistedMirrorReader<'_>,
     node: &str,
 ) -> Option<mackes_mesh_types::airspace::AirspaceSnapshot> {
     let topic = mackes_mesh_types::airspace::airspace_state_topic(node);
-    read_latest_json_for_node(persist, &topic, node)
+    read_latest_json_for_node(reader, &topic, node)
 }
 
 /// Decode the retained credential-gated NASA FIRMS hotspot snapshot. A
@@ -1097,30 +1109,30 @@ fn read_airspace_mirror(
 /// fold. All overlay readers enforce the producer host stamp because the topic
 /// namespace alone is not sufficient provenance on a shared Bus.
 fn read_firms_mirror(
-    persist: &mde_bus::persist::Persist,
+    reader: &PersistedMirrorReader<'_>,
     node: &str,
 ) -> Option<mackes_mesh_types::firms::FirmsSnapshot> {
     let topic = mackes_mesh_types::firms::firms_state_topic(node);
-    read_latest_json_for_node(persist, &topic, node)
+    read_latest_json_for_node(reader, &topic, node)
 }
 
 /// Decode the retained keyless NCDOT traffic snapshot, fail-soft outside North
 /// Carolina, while disabled, or before the first publish.
 fn read_traffic_mirror(
-    persist: &mde_bus::persist::Persist,
+    reader: &PersistedMirrorReader<'_>,
     node: &str,
 ) -> Option<mackes_mesh_types::traffic::TrafficSnapshot> {
     let topic = mackes_mesh_types::traffic::traffic_state_topic(node);
-    read_latest_json_for_node(persist, &topic, node)
+    read_latest_json_for_node(reader, &topic, node)
 }
 
 /// Decode retained AirNow state, including the explicit missing-key state.
 fn read_air_quality_mirror(
-    persist: &mde_bus::persist::Persist,
+    reader: &PersistedMirrorReader<'_>,
     node: &str,
 ) -> Option<mackes_mesh_types::air_quality::AirQualitySnapshot> {
     let topic = mackes_mesh_types::air_quality::air_quality_state_topic(node);
-    read_latest_json_for_node(persist, &topic, node)
+    read_latest_json_for_node(reader, &topic, node)
 }
 
 /// Read and decode one retained latest-wins payload from an already-open Bus
@@ -1128,6 +1140,11 @@ fn read_air_quality_mirror(
 /// intentionally collapse to `None`: one unhealthy feed must not prevent the
 /// remaining map layers from folding during the same poll.
 const MAX_RETAINED_OVERLAY_BYTES: usize = 4 * 1024 * 1024;
+/// Bound the authoritative on-disk message envelope before JSON parsing. The
+/// envelope includes the retained body plus metadata, so it is deliberately
+/// wider than the typed body cap while remaining finite for malformed or
+/// hostile Bus rows.
+const MAX_RETAINED_ENVELOPE_BYTES: usize = 8 * 1024 * 1024;
 
 /// The vehicle mirror is latest-wins. Keep its diagnostic projection latest-wins
 /// too, rather than retaining every distinct producer gap ever observed.
@@ -1156,19 +1173,88 @@ fn bounded_gap_note(prefix: &str, gap: &str) -> String {
     note
 }
 
-fn retained_overlay_body(
-    persist: &mde_bus::persist::Persist,
-    topic: &str,
-) -> Option<String> {
-    let body = persist.read_latest(topic).ok().flatten()?.body?;
+fn read_bounded_no_follow(path: &Path, max_bytes: usize) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+
+    // The Bus spool is a shared filesystem boundary. Open the final message
+    // leaf without following a replacement symlink, then read at most one
+    // byte over the envelope cap so an oversized row is rejected before JSON
+    // parsing can materialize it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        options.custom_flags(0o400000); // O_NOFOLLOW
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        options.custom_flags(0x100); // O_NOFOLLOW
+
+        // Keep unsupported Unix targets fail-closed for symlink leaves even
+        // when their standard library does not expose an O_NOFOLLOW value in
+        // this crate's dependency surface.
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        if !std::fs::symlink_metadata(path).ok()?.file_type().is_file() {
+            return None;
+        }
+    }
+
+    #[cfg(not(unix))]
+    if !std::fs::symlink_metadata(path).ok()?.file_type().is_file() {
+        return None;
+    }
+
+    let file = options.open(path).ok()?;
+    let mut bytes = Vec::with_capacity(max_bytes.min(64 * 1024));
+    file.take(u64::try_from(max_bytes).ok()?.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() <= max_bytes).then_some(bytes)
+}
+
+fn retained_overlay_body(reader: &PersistedMirrorReader<'_>, topic: &str) -> Option<String> {
+    let ulid = reader.persist.latest_ulid(topic).ok().flatten()?;
+    let topic_path = Path::new(topic);
+    if topic_path.is_absolute()
+        || topic_path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+        || ulid.len() != 26
+        || !ulid.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+
+    let path = reader
+        .bus_root
+        .join(topic_path)
+        .join(format!("{ulid}.json"));
+    let raw = read_bounded_no_follow(&path, MAX_RETAINED_ENVELOPE_BYTES)?;
+    let message: mde_bus::persist::StoredMessage = serde_json::from_slice(&raw).ok()?;
+    if message.ulid != ulid || message.topic != topic {
+        return None;
+    }
+    let body = message.body?;
     (body.len() <= MAX_RETAINED_OVERLAY_BYTES).then_some(body)
 }
 
 fn read_latest_json<T: DeserializeOwned>(
-    persist: &mde_bus::persist::Persist,
+    reader: &PersistedMirrorReader<'_>,
     topic: &str,
 ) -> Option<T> {
-    let body = retained_overlay_body(persist, topic)?;
+    let body = retained_overlay_body(reader, topic)?;
     serde_json::from_str(&body).ok()
 }
 
@@ -1178,11 +1264,11 @@ fn read_latest_json<T: DeserializeOwned>(
 /// node's topic, so every typed overlay envelope must repeat and match its
 /// own `host` stamp before it is folded.
 fn read_latest_json_for_node<T: DeserializeOwned>(
-    persist: &mde_bus::persist::Persist,
+    reader: &PersistedMirrorReader<'_>,
     topic: &str,
     node: &str,
 ) -> Option<T> {
-    let body = retained_overlay_body(persist, topic)?;
+    let body = retained_overlay_body(reader, topic)?;
     let value: serde_json::Value = serde_json::from_str(&body).ok()?;
     (value.get("host").and_then(serde_json::Value::as_str) == Some(node))
         .then(|| serde_json::from_value(value).ok())
@@ -4599,7 +4685,7 @@ mod tests {
             .expect("retained vehicle mirror");
 
         let mut state = MapsLocationSurface::live();
-        state.refresh_from_persist(&persist, "mg90-live");
+        state.refresh_from_persist(&persist, dir.path(), "mg90-live");
         assert!(state.vehicle.telemetry.is_live());
         assert_eq!(live_speed_mph(&state), Some(48.0));
         assert_eq!(state.vehicle_glance().as_deref(), Some("48 mph"));
@@ -4639,7 +4725,7 @@ mod tests {
                 Some(&serde_json::to_string(&mirror).expect("stale mirror json")),
             )
             .expect("stale retained vehicle mirror");
-        state.refresh_from_persist(&persist, "mg90-live");
+        state.refresh_from_persist(&persist, dir.path(), "mg90-live");
         assert!(!state.vehicle.telemetry.is_live());
         assert_eq!(live_speed_mph(&state), None);
         assert_eq!(state.vehicle_glance(), None);
@@ -4651,6 +4737,10 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("bus dir");
         let persist = mde_bus::persist::Persist::open(dir.path().to_path_buf()).expect("bus");
+        let reader = PersistedMirrorReader {
+            persist: &persist,
+            bus_root: dir.path(),
+        };
         let node = "rig-func-012";
         let topic = mackes_mesh_types::vehicle::vehicle_state_topic(node);
         let valid = VehicleState::offline(node);
@@ -4663,7 +4753,7 @@ mod tests {
             )
             .expect("valid vehicle mirror");
         assert_eq!(
-            read_vehicle_mirror(&persist, node)
+            read_vehicle_mirror(&reader, node)
                 .as_ref()
                 .map(|mirror| mirror.host.as_str()),
             Some(node)
@@ -4683,7 +4773,7 @@ mod tests {
             )
             .expect("cross-node vehicle mirror");
         assert!(
-            read_vehicle_mirror(&persist, node).is_none(),
+            read_vehicle_mirror(&reader, node).is_none(),
             "cross-node vehicle state must not fold under the selected node topic"
         );
     }
@@ -4696,6 +4786,10 @@ mod tests {
         // through a JSON publish.
         let dir = tempfile::tempdir().expect("temp bus dir");
         let persist = mde_bus::persist::Persist::open(dir.path().to_path_buf()).expect("bus");
+        let reader = PersistedMirrorReader {
+            persist: &persist,
+            bus_root: dir.path(),
+        };
         let good_topic = "state/overlay/test/good";
         let bad_topic = "state/overlay/test/bad";
         persist
@@ -4715,12 +4809,12 @@ mod tests {
             )
             .expect("bad payload is still a stored message");
 
-        let good: Option<serde_json::Value> = read_latest_json(&persist, good_topic);
+        let good: Option<serde_json::Value> = read_latest_json(&reader, good_topic);
         assert_eq!(
             good.as_ref().and_then(|v| v["fetched_at"].as_i64()),
             Some(42)
         );
-        let bad: Option<serde_json::Value> = read_latest_json(&persist, bad_topic);
+        let bad: Option<serde_json::Value> = read_latest_json(&reader, bad_topic);
         assert!(bad.is_none(), "malformed feed must fail soft locally");
     }
 
@@ -4728,6 +4822,10 @@ mod tests {
     fn oversized_retained_overlay_is_rejected_before_json_decode() {
         let dir = tempfile::tempdir().expect("temp bus dir");
         let persist = mde_bus::persist::Persist::open(dir.path().to_path_buf()).expect("bus");
+        let reader = PersistedMirrorReader {
+            persist: &persist,
+            bus_root: dir.path(),
+        };
         let topic = "state/overlay/test/oversized";
         let body = serde_json::json!({
             "host": "rig-func-012",
@@ -4744,8 +4842,65 @@ mod tests {
             .expect("oversized retained payload is still a valid Bus row");
 
         assert!(
-            read_latest_json::<serde_json::Value>(&persist, topic).is_none(),
+            read_latest_json::<serde_json::Value>(&reader, topic).is_none(),
             "the Maps consumer must bound retained payloads before decoding"
+        );
+    }
+
+    #[test]
+    fn oversized_retained_envelope_is_rejected_before_json_decode() {
+        let dir = tempfile::tempdir().expect("temp bus dir");
+        let persist = mde_bus::persist::Persist::open(dir.path().to_path_buf()).expect("bus");
+        let reader = PersistedMirrorReader {
+            persist: &persist,
+            bus_root: dir.path(),
+        };
+        let topic = "state/overlay/test/oversized-envelope";
+        let body = "x".repeat(MAX_RETAINED_ENVELOPE_BYTES + 1);
+        persist
+            .write(
+                topic,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&body),
+            )
+            .expect("oversized retained envelope is still an indexed Bus row");
+
+        assert!(
+            read_latest_json::<serde_json::Value>(&reader, topic).is_none(),
+            "the persisted envelope must be bounded before it reaches serde_json"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_overlay_rejects_symlinked_envelope_leaf() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("temp bus dir");
+        let persist = mde_bus::persist::Persist::open(dir.path().to_path_buf()).expect("bus");
+        let topic = "state/overlay/test/symlink";
+        let row = persist
+            .write(
+                topic,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(r#"{"fetched_at":42}"#),
+            )
+            .expect("retained Bus row");
+        let message_path = dir.path().join(&row.file_path);
+        let target_path = dir.path().join("outside-message.json");
+        std::fs::copy(&message_path, &target_path).expect("copy message outside topic");
+        std::fs::remove_file(&message_path).expect("remove original message leaf");
+        symlink(&target_path, &message_path).expect("replace message with symlink");
+
+        let reader = PersistedMirrorReader {
+            persist: &persist,
+            bus_root: dir.path(),
+        };
+        assert!(
+            read_latest_json::<serde_json::Value>(&reader, topic).is_none(),
+            "a retained mirror leaf must not be followed outside the topic tree"
         );
     }
 
@@ -4985,7 +5140,7 @@ mod tests {
             .expect("FIRMS mirror");
 
         let mut state = MapsLocationSurface::live();
-        state.refresh_from_persist(&persist, node);
+        state.refresh_from_persist(&persist, dir.path(), node);
         assert!(state.map.wildfire.snapshot.is_some());
         assert_eq!(
             state
@@ -5021,7 +5176,7 @@ mod tests {
                 Some("{malformed FIRMS"),
             )
             .expect("malformed FIRMS mirror");
-        state.refresh_from_persist(&persist, node);
+        state.refresh_from_persist(&persist, dir.path(), node);
         assert!(state.map.wildfire.paused());
         assert_eq!(
             state
@@ -5069,7 +5224,7 @@ mod tests {
             .expect("valid FIRMS mirror");
 
         let mut state = MapsLocationSurface::live();
-        state.refresh_from_persist(&persist, node);
+        state.refresh_from_persist(&persist, dir.path(), node);
         assert_eq!(
             state.map.firms.snapshot.as_ref().map(|s| s.host.as_str()),
             Some(node)
@@ -5087,7 +5242,7 @@ mod tests {
             )
             .expect("cross-node FIRMS mirror");
 
-        state.refresh_from_persist(&persist, node);
+        state.refresh_from_persist(&persist, dir.path(), node);
         let retained = state
             .map
             .firms
@@ -5118,7 +5273,7 @@ mod tests {
             .expect("valid USGS mirror");
 
         let mut state = MapsLocationSurface::live();
-        state.refresh_from_persist(&persist, node);
+        state.refresh_from_persist(&persist, dir.path(), node);
         assert_eq!(
             state
                 .map
@@ -5143,7 +5298,7 @@ mod tests {
             )
             .expect("cross-node USGS mirror");
 
-        state.refresh_from_persist(&persist, node);
+        state.refresh_from_persist(&persist, dir.path(), node);
         let retained = state
             .map
             .earthquakes

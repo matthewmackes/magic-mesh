@@ -7,8 +7,10 @@
 //! here so the drain / gate / reply paths (in the sibling modules) are exercised
 //! WITHOUT a live hypervisor. Nothing here changed in U2 — only its home did.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
 use std::time::Instant;
 
 use mackes_mesh_types::cloud::{
@@ -37,6 +39,103 @@ pub(crate) const TOFU_SUBDIR: &str = "infra/tofu/cloud";
 
 /// The Ansible tree (configure), relative to the IaC root.
 pub(crate) const ANSIBLE_SUBDIR: &str = "automation/ansible";
+
+/// Bound each child stream before it becomes a `String`. The inventory/output
+/// parsers apply the same one-megabyte input ceiling, while the reply paths
+/// apply their smaller presentation bounds afterward.
+const MAX_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
+const COMMAND_OUTPUT_TRUNCATION_MARKER: &str = "\n[command output truncated]";
+
+struct CapturedCommandStream {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+/// Drain a child stream without retaining more than the command-output cap.
+///
+/// The reader must continue to EOF after reaching the cap: closing a pipe early
+/// can turn an otherwise successful backend command into a SIGPIPE failure. The
+/// stdout and stderr readers run concurrently in [`run_bounded_command`], so a
+/// child that fills both pipes cannot deadlock while it exits.
+fn read_command_stream(mut reader: impl Read) -> std::io::Result<CapturedCommandStream> {
+    let mut bytes = Vec::with_capacity(MAX_COMMAND_OUTPUT_BYTES);
+    let mut buffer = [0_u8; 16 * 1024];
+    let mut truncated = false;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let room = MAX_COMMAND_OUTPUT_BYTES.saturating_sub(bytes.len());
+        let keep = room.min(read);
+        bytes.extend_from_slice(&buffer[..keep]);
+        truncated |= keep < read;
+    }
+    Ok(CapturedCommandStream { bytes, truncated })
+}
+
+/// Materialize a bounded child stream while retaining the leading diagnostics.
+/// Invalid UTF-8 keeps the old lossy-conversion behavior, but the final String
+/// is bounded as well because lossy conversion can expand invalid bytes.
+fn materialize_command_stream(captured: CapturedCommandStream) -> String {
+    let mut text = String::from_utf8_lossy(&captured.bytes).into_owned();
+    if !captured.truncated && text.len() <= MAX_COMMAND_OUTPUT_BYTES {
+        return text;
+    }
+
+    let keep = MAX_COMMAND_OUTPUT_BYTES.saturating_sub(COMMAND_OUTPUT_TRUNCATION_MARKER.len());
+    let mut end = keep.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text.push_str(COMMAND_OUTPUT_TRUNCATION_MARKER);
+    text
+}
+
+/// Run a backend command with bounded, concurrently drained stdout/stderr.
+/// `Err` remains reserved for process/pipe I/O failures; a successful command
+/// with verbose output retains its leading diagnostics and is marked truncated.
+fn run_bounded_command(bin: &str, args: &[&str]) -> Result<(bool, String, String), String> {
+    let mut command = Command::new(bin);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|error| format!("{bin}: {error}"))?;
+
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!("{bin}: stdout pipe unavailable"));
+    };
+    let Some(stderr) = child.stderr.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!("{bin}: stderr pipe unavailable"));
+    };
+
+    let stdout_reader = thread::spawn(move || read_command_stream(stdout));
+    let stderr_reader = thread::spawn(move || read_command_stream(stderr));
+    let status = child
+        .wait()
+        .map_err(|error| format!("{bin}: waiting for child: {error}"))?;
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| format!("{bin}: stdout reader panicked"))?
+        .map_err(|error| format!("{bin}: reading stdout: {error}"))?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| format!("{bin}: stderr reader panicked"))?
+        .map_err(|error| format!("{bin}: reading stderr: {error}"))?;
+
+    Ok((
+        status.success(),
+        materialize_command_stream(stdout),
+        materialize_command_stream(stderr),
+    ))
+}
 
 // ── backend tool identifiers (the `service_type` on each health row) ──
 /// OpenTofu (provision leg).
@@ -149,15 +248,8 @@ pub trait CloudRunner: Send + Sync {
     /// unavailable" gate rather than a fabricated failure (§7). The default shells the
     /// process; the injected test fake scripts it.
     fn run_tool(&self, bin: &str, args: &[&str]) -> Result<ToolRun, String> {
-        let out = Command::new(bin)
-            .args(args)
-            .output()
-            .map_err(|e| format!("{bin}: {e}"))?;
-        Ok(ToolRun {
-            ok: out.status.success(),
-            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-        })
+        let (ok, stdout, stderr) = run_bounded_command(bin, args)?;
+        Ok(ToolRun { ok, stdout, stderr })
     }
     /// Resolve the mesh Ansible inventory (`ansible-inventory --list`) as raw JSON —
     /// a READ (U10). `Err` when the tool is absent or the resolve fails (an honest
@@ -238,15 +330,7 @@ impl ShellCloudRunner {
     /// spawn failure (binary absent) so the caller can report an honest "tool
     /// unavailable" rather than a fake failure.
     fn run(bin: &str, args: &[&str]) -> Result<(bool, String, String), String> {
-        let out = Command::new(bin)
-            .args(args)
-            .output()
-            .map_err(|e| format!("{bin}: {e}"))?;
-        Ok((
-            out.status.success(),
-            String::from_utf8_lossy(&out.stdout).into_owned(),
-            String::from_utf8_lossy(&out.stderr).into_owned(),
-        ))
+        run_bounded_command(bin, args)
     }
 
     /// Map a shell result into a [`CloudRunOutcome`] for `action` (`applied` is the
@@ -700,5 +784,43 @@ mod tests {
 
         assert_eq!(summary, format!("{}…", "x".repeat(199)));
         assert!(summary.is_char_boundary(summary.len()));
+    }
+
+    #[test]
+    fn bounded_runner_preserves_small_stdout_and_stderr_diagnostics() {
+        let runner = ShellCloudRunner::new(Path::new("/"), DEFAULT_LIBVIRT_URI.to_string());
+        let run = runner
+            .run_tool(
+                "sh",
+                &[
+                    "-c",
+                    "printf 'stdout diagnostic\\n'; printf 'stderr diagnostic\\n' >&2",
+                ],
+            )
+            .expect("shell command should run");
+
+        assert!(run.ok);
+        assert_eq!(run.stdout, "stdout diagnostic\n");
+        assert_eq!(run.stderr, "stderr diagnostic\n");
+    }
+
+    #[test]
+    fn bounded_runner_drains_and_marks_verbose_stdout_and_stderr() {
+        let (ok, stdout, stderr) = ShellCloudRunner::run(
+            "sh",
+            &[
+                "-c",
+                "(printf 'stdout head\\n'; printf '%*s' 1048577 '') & (printf 'stderr head\\n' >&2; printf '%*s' 1048577 '' >&2) & wait",
+            ],
+        )
+        .expect("verbose shell command should run");
+
+        assert!(ok, "bounded capture must not make a successful child fail");
+        assert!(stdout.len() <= MAX_COMMAND_OUTPUT_BYTES);
+        assert!(stderr.len() <= MAX_COMMAND_OUTPUT_BYTES);
+        assert!(stdout.ends_with(COMMAND_OUTPUT_TRUNCATION_MARKER));
+        assert!(stderr.ends_with(COMMAND_OUTPUT_TRUNCATION_MARKER));
+        assert_eq!(summary_line(&stdout), "stdout head");
+        assert_eq!(summary_line(&stderr), "stderr head");
     }
 }

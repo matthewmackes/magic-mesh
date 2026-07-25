@@ -35,10 +35,12 @@
 //!   (pause / resume / cancel) once it is running — the state read from the shared
 //!   ledger mirror.
 
+use std::fs::{self, File};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-use mde_egui::Style;
 use mde_egui::egui;
+use mde_egui::Style;
 
 use mde_collab_types::{
     CollabCommand, FileRef, FileRefId, FileReferenceView, SpaceId, TransferControl,
@@ -47,7 +49,7 @@ use mde_collab_types::{
 use mde_files::{LocalFsBackend, Mime};
 
 use crate::icons::CommsHoverExt;
-use crate::{CommandSink, CommunicationsSurface, icons, relative_age};
+use crate::{icons, relative_age, CommandSink, CommunicationsSurface};
 
 // Files-mode values are read from the collab read model or the local filesystem.
 // Keep the complete values in the model, but put a bounded, single-line surface
@@ -57,6 +59,10 @@ const FILE_DISPLAY_MAX_CHARS: usize = 160;
 const FILE_TOOLTIP_MAX_CHARS: usize = 512;
 const FILE_ROW_ACTIONS_RESERVE: f32 = Style::SP_XL * 4.0;
 const PICKER_SIZE_RESERVE: f32 = Style::SP_XL * 2.0;
+/// The largest local payload this paint-thread file-reference path will hash.
+/// Larger files belong on the transfer path rather than being materialized in
+/// one GUI allocation.
+const MAX_FILE_REF_BYTES: u64 = 100 * 1024 * 1024;
 
 fn is_unsafe_display_char(ch: char) -> bool {
     ch.is_control()
@@ -736,10 +742,10 @@ impl CommunicationsSurface {
 /// convention). Mints a fresh [`FileRefId`] — the opaque, stable handle the space
 /// keys the reference by.
 ///
-/// Reads the whole file to hash it; acceptable for an operator-picked file, and a
-/// fleet-scale version would stream the hash off the paint thread.
-pub fn file_ref_of_path(path: &Path) -> std::io::Result<(FileRefId, FileRef)> {
-    let bytes = std::fs::read(path)?;
+/// Reads the bounded regular file to hash it; acceptable for an operator-picked
+/// file, and a fleet-scale version would stream the hash off the paint thread.
+pub fn file_ref_of_path(path: &Path) -> io::Result<(FileRefId, FileRef)> {
+    let bytes = read_regular_file_bounded(path)?;
     let name = path
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -751,6 +757,92 @@ pub fn file_ref_of_path(path: &Path) -> std::io::Result<(FileRefId, FileRef)> {
         mime: mime_hint(path),
     };
     Ok((FileRefId::new(), reference))
+}
+
+/// Read a local link candidate without following an untrusted final symlink or
+/// materializing more than the file-reference ceiling. The pre-open metadata
+/// check gives callers a useful error, while the descriptor check protects the
+/// read from a path being replaced between inspection and open.
+fn read_regular_file_bounded(path: &Path) -> io::Result<Vec<u8>> {
+    let inspected = fs::symlink_metadata(path)?;
+    if inspected.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing symlinked file reference {}", path.display()),
+        ));
+    }
+    if !inspected.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("file reference is not a regular file {}", path.display()),
+        ));
+    }
+    reject_oversized_file_ref(path, inspected.len())?;
+
+    let file = open_regular_file_no_follow(path)?;
+    let opened = file.metadata()?;
+    if !opened.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("file reference is not a regular file {}", path.display()),
+        ));
+    }
+    reject_oversized_file_ref(path, opened.len())?;
+
+    let mut bytes = Vec::with_capacity(opened.len() as usize);
+    file.take(MAX_FILE_REF_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_FILE_REF_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "file reference {} exceeds {MAX_FILE_REF_BYTES}-byte limit",
+                path.display()
+            ),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn reject_oversized_file_ref(path: &Path, len: u64) -> io::Result<()> {
+    if len > MAX_FILE_REF_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "file reference {} exceeds {MAX_FILE_REF_BYTES}-byte limit",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Open the final leaf without following a symlink. The current desktop target
+/// is Linux; its stable std extension accepts the kernel's O_NOFOLLOW flag
+/// without requiring another direct dependency in this pure UI crate.
+#[cfg(target_os = "linux")]
+fn open_regular_file_no_follow(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // Linux fcntl.h: O_NOFOLLOW == 00400000 (octal).
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(0o400000)
+        .open(path)
+}
+
+/// On non-Linux targets, retain the explicit symlink rejection before opening;
+/// Linux uses the race-resistant O_NOFOLLOW path above.
+#[cfg(not(target_os = "linux"))]
+fn open_regular_file_no_follow(path: &Path) -> io::Result<File> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing symlinked file reference {}", path.display()),
+        ));
+    }
+    File::open(path)
 }
 
 /// A conservative content-type hint from the file extension — only the few
@@ -838,7 +930,7 @@ pub(crate) fn fmt_bytes(n: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::safe_display_text;
+    use super::{file_ref_of_path, safe_display_text, MAX_FILE_REF_BYTES};
 
     #[test]
     fn safe_display_text_replaces_control_and_bidi_format_characters() {
@@ -858,5 +950,34 @@ mod tests {
     #[test]
     fn safe_display_text_preserves_truthful_mime_values_when_bounded() {
         assert_eq!(safe_display_text("application/pdf", 64), "application/pdf");
+    }
+
+    #[test]
+    fn file_ref_of_path_rejects_oversized_input_before_materialization() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("too-large.bin");
+        let file = std::fs::File::create(&path).expect("create sparse file");
+        file.set_len(MAX_FILE_REF_BYTES + 1)
+            .expect("extend sparse file");
+
+        let error = file_ref_of_path(&path).expect_err("oversized file reference");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("exceeds"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_ref_of_path_rejects_a_final_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("outside.txt");
+        let link = dir.path().join("picked.txt");
+        std::fs::write(&target, b"must not be linked").expect("write target");
+        symlink(&target, &link).expect("create symlink");
+
+        let error = file_ref_of_path(&link).expect_err("symlinked file reference");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("symlink"));
     }
 }

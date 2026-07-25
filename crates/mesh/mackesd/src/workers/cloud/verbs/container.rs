@@ -28,6 +28,11 @@ use super::super::{path_key, CloudWorker};
 const QUADLET_SUFFIX: &str = ".container";
 const MAX_CONTAINER_LIST_ITEMS: usize = 128;
 const MAX_CONTAINER_VALUE_BYTES: usize = 4096;
+/// A peer-controlled prior Quadlet must not become an unbounded allocation
+/// during rollback capture. The rendered unit is bounded below this ceiling by
+/// the form limits, while the extra byte read detects a file that grew after
+/// its descriptor was opened.
+const MAX_STAGED_UNIT_BYTES: usize = 1024 * 1024;
 /// A container pull needs room for layers and transient extraction files. Keep a
 /// small absolute reserve so a nearly-full seat cannot be driven into ENOSPC by a
 /// deploy; the image's actual size is not knowable from an arbitrary OCI reference.
@@ -301,9 +306,7 @@ fn stage_unit(root: &Path, node: &str, name: &str, unit: &str) -> Result<StagedU
                     path.display()
                 ));
             }
-            Ok(_) => Some(std::fs::read(&path).map_err(|error| {
-                format!("read existing quadlet stage {}: {error}", path.display())
-            })?),
+            Ok(_) => Some(read_existing_stage(&path)?),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => {
                 return Err(format!(
@@ -314,6 +317,56 @@ fn stage_unit(root: &Path, node: &str, name: &str, unit: &str) -> Result<StagedU
         };
     write_stage_atomic(&path, unit.as_bytes())?;
     Ok(StagedUnit { path, previous })
+}
+
+/// Read an existing replicated Quadlet through the descriptor that was opened
+/// after the metadata check. On Unix, `O_NOFOLLOW` closes the final-leaf race;
+/// on every platform the sentinel byte keeps hostile state from becoming an
+/// unbounded rollback buffer.
+fn read_existing_stage(path: &Path) -> Result<Vec<u8>, String> {
+    #[cfg(unix)]
+    let file: std::fs::File = {
+        use rustix::fs::{Mode, OFlags};
+
+        rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| format!("read existing quadlet stage {}: {error}", path.display()))?
+        .into()
+    };
+    #[cfg(not(unix))]
+    let file = std::fs::File::open(path)
+        .map_err(|error| format!("read existing quadlet stage {}: {error}", path.display()))?;
+
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("metadata existing quadlet stage {}: {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "existing quadlet stage is not a regular file {}",
+            path.display()
+        ));
+    }
+    if metadata.len() > MAX_STAGED_UNIT_BYTES as u64 {
+        return Err(format!(
+            "existing quadlet stage {} exceeds {MAX_STAGED_UNIT_BYTES}-byte limit",
+            path.display()
+        ));
+    }
+    let mut bytes = Vec::with_capacity(MAX_STAGED_UNIT_BYTES.min(64 * 1024));
+    use std::io::Read as _;
+    file.take((MAX_STAGED_UNIT_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read existing quadlet stage {}: {error}", path.display()))?;
+    if bytes.len() > MAX_STAGED_UNIT_BYTES {
+        return Err(format!(
+            "existing quadlet stage {} exceeds {MAX_STAGED_UNIT_BYTES}-byte limit",
+            path.display()
+        ));
+    }
+    Ok(bytes)
 }
 
 /// Refuse to traverse a replicated directory symlink while preparing a
@@ -889,6 +942,20 @@ mod tests {
             !tmp.path().join("quadlets").exists(),
             "invalid filename must fail before I/O"
         );
+    }
+
+    #[test]
+    fn prior_quadlet_read_accepts_exact_limit_and_rejects_overflow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exact = tmp.path().join("exact.container");
+        let oversized = tmp.path().join("oversized.container");
+        std::fs::write(&exact, vec![b'x'; MAX_STAGED_UNIT_BYTES]).unwrap();
+        std::fs::write(&oversized, vec![b'x'; MAX_STAGED_UNIT_BYTES + 1]).unwrap();
+
+        assert_eq!(read_existing_stage(&exact).unwrap().len(), MAX_STAGED_UNIT_BYTES);
+        let error = read_existing_stage(&oversized).expect_err("oversized prior unit");
+        assert!(error.contains("exceeds"));
+        assert!(error.contains(&MAX_STAGED_UNIT_BYTES.to_string()));
     }
 
     #[test]
