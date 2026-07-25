@@ -1845,12 +1845,19 @@ These decisions refine acceptance and sequencing for the active items below.
   switcher suite is green at **22/22**; live VDI reconnect/full-resolution and
   physical pointer/pixel evidence remain external.
 - Progress (2026-07-25 Dell refresh and release cut): DELL-LAPTOP completed
-  Fedora 44 transaction 3 with status `Ok`; the Magic Mesh 12.1.0 package,
-  `mackesd`, and the shell are healthy with zero shell restarts, while the
-  newly installed kernel remains pending reboot. The BigBoy farm release lane
-  also generated and payload-verified the 12.1.0 base, browser, and thin
-  lighthouse RPMs; live seat reboot and F44 workstation package-install proof
-  remain external.
+  the Fedora 44 package refresh and a dry-run plus real replacement of the
+  exact-tree 12.1.0 base/browser RPMs. `dnf -q check` is clean; `mackesd` and
+  the shell are active with `NRestarts=0`; and the CEF link-navigation verifier
+  passes with process cleanup. The newly installed kernel remains pending
+  reboot. BigBoy generated and payload-verified the 12.1.0 base, browser, and
+  thin lighthouse RPMs. Release hashes are:
+  `38362d92c366296484744c59156aac82208ada3508e62f90ad507074320f26e6`
+  (base),
+  `6cac2c00f0a5db4c886591cef53f5bedb9708a634ba24399e4d9c83aaf364cdd`
+  (browser), and
+  `a9c24c3a88a85c54ba7ceab620287d78c42aa9de78ee895c4c241bdabcd8cfc9`
+  (thin lighthouse); optional kernel reboot and pixel/pointer signoff remain
+  external.
 - Progress (2026-07-25 live `.15` Browser proof): the installed CEF and Servo
   engine verifier passed, including CEF link-navigation, with process cleanup
   passing. The DRM shell is active at `NRestarts=0` in its delegated `shell`
