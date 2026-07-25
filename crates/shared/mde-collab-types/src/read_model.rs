@@ -45,6 +45,8 @@ pub enum CollabReadModel {
     CallState(CallState),
     /// Local media-adapter readiness for active calls.
     CallMediaReadiness(CallMediaReadiness),
+    /// Local media-adapter live-proof results for active calls.
+    CallMediaVerification(CallMediaVerification),
     /// DigitalOcean AI suggestion request state.
     AiSuggestionRequests(AiSuggestionRequests),
 }
@@ -414,6 +416,73 @@ pub enum CallMediaAdapter {
     VdiRemoteDesktop,
 }
 
+/// Worker-owned media verification rows derived from retained
+/// [`CallMediaReadiness`].
+///
+/// This is not signed collaboration history and is not a route authority. It is
+/// the honest sidecar board a SIP/WebRTC/LiveKit/VDI verifier publishes after
+/// consuming readiness: a row may only use [`CallMediaVerificationStatus::LiveMediaVerified`]
+/// when a concrete adapter reports advancing frames/data for the session's
+/// declared requirements.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallMediaVerification {
+    /// The local actor the consumed readiness board was built for.
+    pub local_actor: ActorId,
+    /// One bounded result row per readiness session and candidate adapter.
+    pub rows: Vec<CallMediaVerificationRow>,
+}
+
+/// One media-verifier result for a candidate adapter on a call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallMediaVerificationRow {
+    /// The call id.
+    pub call: CallId,
+    /// The collaboration space.
+    pub space: SpaceId,
+    /// The declared collaboration/call kind.
+    pub kind: CallKind,
+    /// The candidate adapter that was evaluated.
+    pub adapter: CallMediaAdapter,
+    /// The verifier outcome.
+    pub status: CallMediaVerificationStatus,
+    /// Frame/data counters supplied by a concrete verifier. Absent for blocked
+    /// or unproven rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<CallMediaFrameEvidence>,
+    /// Bounded human-readable detail for an honest blocked/unproven row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// Whether a media adapter actually proved live media for a readiness row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallMediaVerificationStatus {
+    /// The signed call state is still waiting for a connected remote peer.
+    WaitingForConnectedPeer,
+    /// No local media transport/verifier is registered for this adapter.
+    TransportUnavailable,
+    /// The adapter exists, but its external provider/gateway is unavailable.
+    ProviderUnavailable,
+    /// A verifier ran, but did not prove the required advancing frames/data.
+    MediaNotProven,
+    /// A verifier proved advancing frames/data for the call requirements.
+    LiveMediaVerified,
+}
+
+/// Counters from a concrete live-media verifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct CallMediaFrameEvidence {
+    /// Advancing audio frames/packets observed.
+    pub audio_frames: u64,
+    /// Advancing camera/video frames observed.
+    pub video_frames: u64,
+    /// Advancing screen-share frames observed.
+    pub screen_frames: u64,
+    /// Advancing collaboration/data-channel messages observed.
+    pub data_messages: u64,
+}
+
 /// The bounded DigitalOcean AI suggestion request board.
 ///
 /// This is worker-owned sidecar state, not signed collaboration history: it lets
@@ -505,6 +574,10 @@ mod tests {
             CollabReadModel::CallMediaReadiness(CallMediaReadiness {
                 local_actor: ActorId::new("alice"),
                 sessions: Vec::new(),
+            }),
+            CollabReadModel::CallMediaVerification(CallMediaVerification {
+                local_actor: ActorId::new("alice"),
+                rows: Vec::new(),
             }),
             CollabReadModel::AiSuggestionRequests(AiSuggestionRequests::default()),
         ];

@@ -688,7 +688,9 @@ impl CollabWorker {
     fn publish_event(&self, persist: &Persist, env: &CollabEventEnvelope) {
         let topic = topics::event_topic(env.space_id, &self.self_actor);
         match serde_json::to_string(env) {
-            Ok(body) => publish(persist, &topic, &body),
+            Ok(body) => {
+                publish(persist, &topic, &body);
+            }
             Err(e) => {
                 tracing::warn!(target: "mackesd::collab", error = %e, "serialize collab event failed")
             }
@@ -807,12 +809,18 @@ impl CollabWorker {
             .engine
             .projection()
             .call_media_readiness(&self.self_actor, None);
-        publish_state(
+        let media_readiness_available = publish_state(
             persist,
             &mut state.last_published,
             &topics::state_topic(proj::CALL_MEDIA_READINESS),
             media_readiness,
         );
+        if media_readiness_available {
+            super::collab_media::publish_retained_call_media_verification(
+                persist,
+                &mut state.last_published,
+            );
+        }
         let ai_requests = Ok(state.ai_requests.all());
         publish_state(
             persist,
@@ -1074,22 +1082,28 @@ fn publish_state<T: serde::Serialize>(
     last_published: &mut BTreeMap<String, String>,
     topic: &str,
     model: mde_collab_core::Result<T>,
-) {
+) -> bool {
     match model {
         Ok(m) => match serde_json::to_string(&m) {
             Ok(body) => {
                 if last_published.get(topic).map(String::as_str) == Some(body.as_str()) {
-                    return;
+                    return true;
                 }
-                publish(persist, topic, &body);
-                last_published.insert(topic.to_string(), body);
+                if publish(persist, topic, &body) {
+                    last_published.insert(topic.to_string(), body);
+                    true
+                } else {
+                    false
+                }
             }
             Err(e) => {
-                tracing::warn!(target: "mackesd::collab", topic, error = %e, "serialize read model failed")
+                tracing::warn!(target: "mackesd::collab", topic, error = %e, "serialize read model failed");
+                false
             }
         },
         Err(e) => {
-            tracing::debug!(target: "mackesd::collab", topic, error = %e, "read model unavailable")
+            tracing::debug!(target: "mackesd::collab", topic, error = %e, "read model unavailable");
+            false
         }
     }
 }
@@ -1097,9 +1111,12 @@ fn publish_state<T: serde::Serialize>(
 /// In-process Bus publish (best-effort). Writing to the local Persist store is the
 /// same store the broker + surface read; whether it federates to peers is the
 /// broker's job (the live multi-node reach is integration-gated).
-fn publish(persist: &Persist, topic: &str, body: &str) {
+fn publish(persist: &Persist, topic: &str, body: &str) -> bool {
     if let Err(e) = persist.write(topic, Priority::Default, None, Some(body)) {
         tracing::debug!(target: "mackesd::collab", topic, error = %e, "collab publish failed");
+        false
+    } else {
+        true
     }
 }
 
@@ -1446,7 +1463,8 @@ mod tests {
     use crate::ipc::action_auth::authorize_test_body;
     use ed25519_dalek::SigningKey;
     use mde_collab_types::read_model::{
-        CallMediaAdapter, CallMediaAdmission, CallMediaRequirement,
+        CallMediaAdapter, CallMediaAdmission, CallMediaRequirement, CallMediaVerification,
+        CallMediaVerificationStatus,
     };
     use mde_collab_types::value::{CallKind, MessageBody};
     use mde_collab_types::{
@@ -2029,6 +2047,32 @@ mod tests {
                 .is_some(),
             "the adapter can also consume the unscoped local readiness board"
         );
+
+        let verification_topic = topics::state_topic(proj::CALL_MEDIA_VERIFICATION);
+        assert_eq!(verification_topic, "state/collab/call-media-verification");
+        let verification_msg = persist
+            .read_latest(&verification_topic)
+            .expect("read media verification")
+            .expect("media verification published");
+        let verification: CallMediaVerification =
+            serde_json::from_str(verification_msg.body.as_deref().expect("body"))
+                .expect("decode media verification");
+        assert_eq!(verification.local_actor, w.self_actor);
+        assert_eq!(
+            verification.rows.len(),
+            session.candidate_adapters.len(),
+            "the verifier emits one honest row per candidate adapter"
+        );
+        assert!(verification.rows.iter().all(|row| {
+            row.call == call
+                && row.space == space
+                && row.status == CallMediaVerificationStatus::WaitingForConnectedPeer
+                && row.evidence.is_none()
+                && row
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("connected remote peer"))
+        }));
     }
 
     /// Create a space (this node becomes Owner) and link `reference` into it as

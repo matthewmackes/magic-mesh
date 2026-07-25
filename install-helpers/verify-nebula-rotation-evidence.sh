@@ -73,6 +73,18 @@ sha_or_unreadable() {
   fi
 }
 
+prepare_output_dir() {
+  local out_dir="$1"
+  if [ -e "$out_dir" ]; then
+    [ -d "$out_dir" ] || die "--out exists and is not a directory: $out_dir"
+    if find "$out_dir" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+      die "refusing to collect into non-empty output directory: $out_dir"
+    fi
+  else
+    mkdir -m 700 -p "$out_dir"
+  fi
+}
+
 stat_value() {
   local follow="$1" fmt="$2" path="$3"
   if [ "$follow" = "follow" ]; then
@@ -98,7 +110,7 @@ iface_up() {
 
 overlay_ipv4() {
   local iface="$1"
-  ip -o -4 addr show "$iface" 2>/dev/null | awk '{split($4, a, "/"); print a[1]; exit}'
+  ip -o -4 addr show "$iface" 2>/dev/null | awk '{split($4, a, "/"); print a[1]; exit}' || true
 }
 
 write_kv() {
@@ -184,9 +196,8 @@ collect_mode() {
   if [ -z "$out_dir" ]; then
     out_dir="$(mktemp -d "${TMPDIR:-/tmp}/nebula-rotation-evidence.XXXXXX")"
   fi
-  mkdir -p "$out_dir"
+  prepare_output_dir "$out_dir"
   SNAPSHOT_FILE="$out_dir/snapshot.env"
-  [ ! -e "$SNAPSHOT_FILE" ] || die "refusing to overwrite existing $SNAPSHOT_FILE"
 
   local fail=0 summary="$out_dir/summary.txt"
   : >"$SNAPSHOT_FILE"
@@ -208,6 +219,7 @@ collect_mode() {
   write_kv format 1
   write_kv collected_at_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   write_kv hostname "$(hostname -f 2>/dev/null || hostname 2>/dev/null || printf unknown)"
+  write_kv machine_id_sha256 "$(sha_or_unreadable /etc/machine-id)"
   write_kv euid "$(id -u)"
   write_kv config_dir "$config_dir"
   write_kv workgroup_root "$workgroup_root"
@@ -369,6 +381,28 @@ collect_mode() {
   fi
 }
 
+snapshot_has_clean_summary() {
+  local dir="$1" summary="$1/summary.txt"
+  [ -f "$summary" ] || return 1
+  grep -Eq '^PASS snapshot is clean: ' "$summary" || return 1
+  ! grep -Eq '^FAIL ' "$summary"
+}
+
+require_same_snapshot_field() {
+  local before_dir="$1" after_dir="$2" key="$3" label="$4"
+  local before_value after_value
+  before_value="$(kv_get "$before_dir" "$key")"
+  after_value="$(kv_get "$after_dir" "$key")"
+  if [ -z "$before_value" ] || [ -z "$after_value" ]; then
+    echo "FAIL snapshots are missing $label metadata (before=${before_value:-missing} after=${after_value:-missing})"
+    return 1
+  fi
+  if [ "$before_value" != "$after_value" ]; then
+    echo "FAIL snapshots do not describe the same $label ($before_value -> $after_value)"
+    return 1
+  fi
+}
+
 compare_mode() {
   local before="" after="" fail=0 live_claim=1
   while [ "$#" -gt 0 ]; do
@@ -393,6 +427,27 @@ compare_mode() {
   done
   [ -n "$before" ] && [ -n "$after" ] || die "compare needs BEFORE_DIR and AFTER_DIR"
 
+  echo "== WL-SEC-006 Nebula rotation evidence compare =="
+  if snapshot_has_clean_summary "$before"; then
+    echo "PASS before snapshot was a clean collection"
+  else
+    echo "FAIL before snapshot was not a clean collection: $before"
+    fail=1
+  fi
+  if snapshot_has_clean_summary "$after"; then
+    echo "PASS after snapshot was a clean collection"
+  else
+    echo "FAIL after snapshot was not a clean collection: $after"
+    fail=1
+  fi
+  require_same_snapshot_field "$before" "$after" format "snapshot format" || fail=1
+  require_same_snapshot_field "$before" "$after" hostname "node hostname" || fail=1
+  require_same_snapshot_field "$before" "$after" machine_id_sha256 "node machine-id fingerprint" || fail=1
+  require_same_snapshot_field "$before" "$after" config_dir "Nebula config directory" || fail=1
+  require_same_snapshot_field "$before" "$after" identity_dir "Nebula identity directory" || fail=1
+  require_same_snapshot_field "$before" "$after" workgroup_root "replicated workgroup root" || fail=1
+  require_same_snapshot_field "$before" "$after" iface "Nebula interface" || fail=1
+
   local before_gen after_gen before_cert after_cert before_key after_key
   before_gen="$(kv_get "$before" current_generation)"
   after_gen="$(kv_get "$after" current_generation)"
@@ -401,7 +456,6 @@ compare_mode() {
   before_key="$(kv_get "$before" active_key_sha256)"
   after_key="$(kv_get "$after" active_key_sha256)"
 
-  echo "== WL-SEC-006 Nebula rotation evidence compare =="
   if [ -z "$before_gen" ] || [ -z "$after_gen" ] || [ "$before_gen" = "$after_gen" ]; then
     echo "FAIL active identity generation did not change ($before_gen -> $after_gen)"
     fail=1
@@ -499,6 +553,8 @@ self_test() {
 
   local config_dir="$td/etc/nebula" workgroup_root="$td/workgroup"
   local before="$td/before" after="$td/after" leak="$td/leak"
+  local unsafe="$td/unsafe" mismatched="$td/mismatched" nonempty="$td/nonempty"
+  local live_missing="$td/live-missing"
   mkdir -p "$config_dir/identity" "$workgroup_root"
   chmod 700 "$config_dir/identity"
   printf '{"peer_cert_pem":"public-only"}\n' >"$workgroup_root/nebula-bundle.json"
@@ -532,6 +588,50 @@ self_test() {
     fails=$((fails + 1))
   else
     echo "  ok: unchanged snapshots fail compare"
+  fi
+
+  cp -a "$after" "$mismatched"
+  sed -i 's/^iface=.*/iface=nebula99/' "$mismatched/snapshot.env"
+  if compare_mode "$before" "$mismatched" >/dev/null 2>&1; then
+    echo "  FAIL: mismatched snapshot metadata must not prove rotation" >&2
+    fails=$((fails + 1))
+  else
+    echo "  ok: mismatched snapshot metadata fails compare"
+  fi
+
+  chmod 644 "$config_dir/identity/generation-2-2222222222222222/host.key"
+  if collect_mode --config-dir "$config_dir" --workgroup-root "$workgroup_root" --out "$unsafe" --no-live >/dev/null 2>&1; then
+    echo "  FAIL: unsafe active key mode should fail collection" >&2
+    fails=$((fails + 1))
+  else
+    echo "  ok: unsafe active key mode fails collection"
+  fi
+  if compare_mode "$before" "$unsafe" >/dev/null 2>&1; then
+    echo "  FAIL: failed snapshots must not prove rotation" >&2
+    fails=$((fails + 1))
+  else
+    echo "  ok: failed snapshots are refused by compare"
+  fi
+  chmod 600 "$config_dir/identity/generation-2-2222222222222222/host.key"
+
+  mkdir -p "$nonempty"
+  printf 'stale\n' >"$nonempty/old-summary.txt"
+  if ( collect_mode --config-dir "$config_dir" --workgroup-root "$workgroup_root" --out "$nonempty" --no-live ) >/dev/null 2>&1; then
+    echo "  FAIL: non-empty output directories must be refused" >&2
+    fails=$((fails + 1))
+  else
+    echo "  ok: non-empty output directory is refused"
+  fi
+
+  if collect_mode --config-dir "$config_dir" --workgroup-root "$workgroup_root" --out "$live_missing" --iface definitely-missing-nebula-test0 >/dev/null 2>&1; then
+    echo "  FAIL: missing live interface should fail collection" >&2
+    fails=$((fails + 1))
+  elif grep -q '^live_checks=enabled$' "$live_missing/snapshot.env" \
+    && grep -q 'FAIL definitely-missing-nebula-test0 is not up with an IPv4 overlay address' "$live_missing/summary.txt"; then
+    echo "  ok: missing live interface records live evidence gaps"
+  else
+    echo "  FAIL: missing live interface did not leave diagnosable evidence" >&2
+    fails=$((fails + 1))
   fi
 
   printf '%s\n' '-----BEGIN PRIVATE KEY-----' >"$workgroup_root/leaked.json"

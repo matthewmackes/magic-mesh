@@ -15,6 +15,8 @@ Examples::
     verify-live-mirrors.py --vehicle-node workstation --overlay \
         state/overlay/usgs-earthquakes/workstation --require-online \
         --require-same-host
+    verify-live-mirrors.py --catalog-overlay-node workstation \
+        --require-catalog-complete --require-ready --max-age-seconds 300
     verify-live-mirrors.py --airspace-node workstation --require-airspace-ready
     verify-live-mirrors.py --vdi-console-session vdi-1-win11 \
         --require-vdi-brokered --expected-vdi-protocol spice \
@@ -402,6 +404,19 @@ def _overlay_catalog_errors(topic: str, payload: dict[str, Any]) -> list[str]:
     return errors
 
 
+def _catalog_overlay_topic(feed: str, node: str) -> str:
+    if (
+        not isinstance(node, str)
+        or not node
+        or "/" in node
+        or "\\" in node
+        or "\x00" in node
+        or node in {".", ".."}
+    ):
+        raise MirrorError(f"invalid catalog overlay node: {node!r}")
+    return f"{OVERLAY_PREFIX}{feed}/{node}"
+
+
 def _license_tier_errors(payload: dict[str, Any]) -> list[str]:
     tier = payload.get("license_tier")
     if not isinstance(tier, str) or not tier:
@@ -480,6 +495,109 @@ def validate_overlay(
         }
     )
     return result
+
+
+def validate_overlay_catalog_node(
+    bus_root: Path,
+    node: str,
+    now_ms: int,
+    max_age_ms: int,
+    require_ready: bool,
+    require_catalog_complete: bool,
+    expected_host: str | None = None,
+) -> dict[str, Any]:
+    """Audit every locked WL-FUNC-012 zero-cost overlay mirror for one node."""
+    feeds = sorted(CATALOG_OVERLAYS)
+    per_feed: dict[str, dict[str, Any]] = {}
+    feeds_present: list[str] = []
+    feeds_absent: list[str] = []
+    feeds_invalid: list[str] = []
+    errors: list[str] = []
+
+    for feed in feeds:
+        topic = _catalog_overlay_topic(feed, node)
+        try:
+            result = validate_overlay(
+                bus_root,
+                topic,
+                now_ms,
+                max_age_ms,
+                require_ready,
+                True,
+                expected_host,
+            )
+        except MirrorError as exc:
+            message = str(exc)
+            if message == f"no indexed message for {topic}":
+                feeds_absent.append(feed)
+                per_feed[feed] = {
+                    "topic": topic,
+                    "state": "absent",
+                    "errors": [],
+                }
+            else:
+                feeds_invalid.append(feed)
+                per_feed[feed] = {
+                    "topic": topic,
+                    "state": "invalid",
+                    "errors": [message],
+                }
+                errors.append(f"{feed}: {message}")
+            continue
+
+        feeds_present.append(feed)
+        feed_errors = result.get("errors", [])
+        if feed_errors:
+            feeds_invalid.append(feed)
+            per_feed[feed] = {
+                "topic": topic,
+                "state": "invalid",
+                "ready": result.get("ready"),
+                "fresh": result.get("fresh"),
+                "age_ms": result.get("age_ms"),
+                "availability": result.get("availability"),
+                "record_count": result.get("record_count"),
+                "license_tier": result.get("license_tier"),
+                "errors": feed_errors,
+            }
+            errors.extend(f"{feed}: {error}" for error in feed_errors)
+        else:
+            per_feed[feed] = {
+                "topic": topic,
+                "state": "present",
+                "ready": result.get("ready"),
+                "fresh": result.get("fresh"),
+                "age_ms": result.get("age_ms"),
+                "availability": result.get("availability"),
+                "record_count": result.get("record_count"),
+                "license_tier": result.get("license_tier"),
+                "errors": [],
+            }
+
+    if require_catalog_complete and feeds_absent:
+        errors.append(
+            f"missing zero-cost catalog overlay mirrors for node {node!r}: "
+            f"{', '.join(feeds_absent)}"
+        )
+
+    return {
+        "kind": "overlay_catalog",
+        "topic": f"{OVERLAY_PREFIX}*/{node}",
+        "node": node,
+        "catalog_count": len(feeds),
+        "catalog_feeds": feeds,
+        "feeds_present": feeds_present,
+        "feeds_absent": feeds_absent,
+        "feeds_invalid": feeds_invalid,
+        "present_count": len(feeds_present),
+        "absent_count": len(feeds_absent),
+        "invalid_count": len(feeds_invalid),
+        "catalog_complete": not feeds_absent,
+        "catalog_valid": not feeds_absent and not feeds_invalid,
+        "require_catalog_complete": require_catalog_complete,
+        "per_feed": per_feed,
+        "errors": errors,
+    }
 
 
 def _indexed_age_check(row: dict[str, Any], now_ms: int, max_age_ms: int) -> tuple[int, list[str]]:
@@ -857,6 +975,25 @@ def run(args: argparse.Namespace) -> int:
             result = {"kind": "vehicle", "topic": f"{VEHICLE_PREFIX}{args.vehicle_node}", "errors": [str(exc)]}
         results.append(result)
         failures.extend(result.get("errors", []))
+    for node in args.catalog_overlay_node:
+        try:
+            result = validate_overlay_catalog_node(
+                root,
+                node,
+                now_ms,
+                max_age_ms,
+                args.require_ready,
+                args.require_catalog_complete,
+                args.vehicle_node if args.require_same_host else None,
+            )
+        except MirrorError as exc:
+            result = {
+                "kind": "overlay_catalog",
+                "topic": f"{OVERLAY_PREFIX}*/{node}",
+                "errors": [str(exc)],
+            }
+        results.append(result)
+        failures.extend(result.get("errors", []))
     for topic in args.overlay:
         try:
             result = validate_overlay(
@@ -1139,6 +1276,29 @@ def _self_test() -> None:
         )
         assert not catalog_overlay["errors"], catalog_overlay
         assert catalog_overlay["catalog_feed"] == "usgs-earthquakes", catalog_overlay
+        catalog_audit = validate_overlay_catalog_node(
+            root,
+            "test-node",
+            now_ms,
+            30_000,
+            False,
+            False,
+        )
+        assert catalog_audit["catalog_count"] == len(CATALOG_OVERLAYS), catalog_audit
+        assert catalog_audit["feeds_present"] == ["usgs-earthquakes"], catalog_audit
+        assert "adsb-aircraft" in catalog_audit["feeds_absent"], catalog_audit
+        assert not catalog_audit["errors"], catalog_audit
+        required_catalog = validate_overlay_catalog_node(
+            root,
+            "test-node",
+            now_ms,
+            30_000,
+            False,
+            True,
+        )
+        assert required_catalog["catalog_complete"] is False, required_catalog
+        assert any("missing zero-cost catalog overlay mirrors" in error for error in required_catalog["errors"]), required_catalog
+        assert "usgs-earthquakes" not in required_catalog["feeds_absent"], required_catalog
         generic_overlay = validate_overlay(
             root,
             "state/overlay/non-commercial/test-node",
@@ -1272,6 +1432,7 @@ def _self_test() -> None:
             now_ms=now_ms,
             max_age_seconds=30.0,
             vehicle_node="test-node",
+            catalog_overlay_node=[],
             overlay=["state/overlay/usgs-earthquakes/test-node"],
             airspace_node=["test-node"],
             vdi_console_session="vdi-1-win11",
@@ -1280,6 +1441,7 @@ def _self_test() -> None:
             expected_model="MG90",
             require_ready=True,
             require_catalog_feed=True,
+            require_catalog_complete=False,
             require_same_host=True,
             require_airspace_ready=True,
             require_airspace_contacts=True,
@@ -1296,6 +1458,28 @@ def _self_test() -> None:
         cli_report = json.loads(cli_output.getvalue())
         assert cli_report["same_host_required"] is True, cli_report
         assert cli_report["ok"] is True, cli_report
+        catalog_cli_output = StringIO()
+        with redirect_stdout(catalog_cli_output):
+            assert (
+                main(
+                    [
+                        "--bus-root",
+                        str(root),
+                        "--now-ms",
+                        str(now_ms),
+                        "--max-age-seconds",
+                        "30",
+                        "--catalog-overlay-node",
+                        "test-node",
+                    ]
+                )
+                == 0
+            )
+        catalog_cli_report = json.loads(catalog_cli_output.getvalue())
+        catalog_cli_result = catalog_cli_report["results"][0]
+        assert catalog_cli_report["ok"] is True, catalog_cli_report
+        assert catalog_cli_result["feeds_present"] == ["usgs-earthquakes"], catalog_cli_result
+        assert "airnow-aqi" in catalog_cli_result["feeds_absent"], catalog_cli_result
         mismatched = validate_overlay(
             root,
             "state/overlay/usgs-earthquakes/test-node",
@@ -1367,6 +1551,18 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="require overlay topics to match the locked zero-cost catalog",
     )
+    parser.add_argument(
+        "--catalog-overlay-node",
+        action="append",
+        default=[],
+        metavar="NODE",
+        help="audit every locked zero-cost state/overlay/<feed>/<node> topic and report exact present/absent feeds",
+    )
+    parser.add_argument(
+        "--require-catalog-complete",
+        action="store_true",
+        help="when used with --catalog-overlay-node, fail if any zero-cost catalog feed has no indexed mirror",
+    )
     parser.add_argument("--airspace-node", action="append", default=[], metavar="NODE")
     parser.add_argument(
         "--require-airspace-ready",
@@ -1422,17 +1618,25 @@ def main(argv: list[str] | None = None) -> int:
     if args.self_test:
         _self_test()
         return 0
-    if not args.vehicle_node and not args.overlay and not args.airspace_node and not args.vdi_console_session:
+    if (
+        not args.vehicle_node
+        and not args.overlay
+        and not args.catalog_overlay_node
+        and not args.airspace_node
+        and not args.vdi_console_session
+    ):
         parser.error(
-            "provide --vehicle-node, --overlay, --airspace-node, "
+            "provide --vehicle-node, --overlay, --catalog-overlay-node, --airspace-node, "
             "--vdi-console-session, or --self-test"
         )
     if args.require_same_host and not args.vehicle_node:
         parser.error("--require-same-host requires --vehicle-node")
-    if args.require_same_host and not (args.overlay or args.airspace_node):
-        parser.error("--require-same-host requires at least one --overlay or --airspace-node")
+    if args.require_same_host and not (args.overlay or args.catalog_overlay_node or args.airspace_node):
+        parser.error("--require-same-host requires at least one --overlay, --catalog-overlay-node, or --airspace-node")
     if args.require_catalog_feed and not args.overlay:
         parser.error("--require-catalog-feed requires at least one --overlay")
+    if args.require_catalog_complete and not args.catalog_overlay_node:
+        parser.error("--require-catalog-complete requires --catalog-overlay-node")
     if (args.require_airspace_ready or args.require_airspace_contacts) and not args.airspace_node:
         parser.error("airspace expectations require --airspace-node")
     vdi_args = (

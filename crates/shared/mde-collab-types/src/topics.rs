@@ -47,6 +47,8 @@ pub mod projection {
     pub const CALL_STATE: &str = "call-state";
     /// Local media-adapter readiness for active calls.
     pub const CALL_MEDIA_READINESS: &str = "call-media-readiness";
+    /// Local media adapter live-proof results for active calls.
+    pub const CALL_MEDIA_VERIFICATION: &str = "call-media-verification";
     /// DigitalOcean AI suggestion request state.
     pub const AI_REQUESTS: &str = "ai-requests";
     /// The launcher/dock badge rollup.
@@ -122,6 +124,10 @@ mod tests {
         assert_eq!(
             state_topic(projection::CALL_MEDIA_READINESS),
             "state/collab/call-media-readiness"
+        );
+        assert_eq!(
+            state_topic(projection::CALL_MEDIA_VERIFICATION),
+            "state/collab/call-media-verification"
         );
         let space = SpaceId::new();
         assert_eq!(

@@ -64,11 +64,12 @@ pub use ids::{CallId, DocumentId, EventId, FileRefId, SpaceId, ThreadId, Transfe
 pub use read_model::{
     ActivityEntry, ActivityFeed, AiSuggestionRequestStatus, AiSuggestionRequestView,
     AiSuggestionRequests, AlertInbox, AlertView, CallMediaAdapter, CallMediaAdmission,
-    CallMediaReadiness, CallMediaRequirement, CallMediaSession, CallParticipantView, CallState,
-    CallView, ClipboardLane, ClipboardView, CollabReadModel, CommsBadges, ConversationTimeline,
-    DocumentSession, DocumentSessions, FileReferenceView, FileReferences, MessageView,
-    PresenceBoard, PresenceView, SpaceDirectory, SpaceSummary, ThreadTimeline, TransferJobView,
-    TransferJobs,
+    CallMediaFrameEvidence, CallMediaReadiness, CallMediaRequirement, CallMediaSession,
+    CallMediaVerification, CallMediaVerificationRow, CallMediaVerificationStatus,
+    CallParticipantView, CallState, CallView, ClipboardLane, ClipboardView, CollabReadModel,
+    CommsBadges, ConversationTimeline, DocumentSession, DocumentSessions, FileReferenceView,
+    FileReferences, MessageView, PresenceBoard, PresenceView, SpaceDirectory, SpaceSummary,
+    ThreadTimeline, TransferJobView, TransferJobs,
 };
 pub use space::{SpaceKind, SpaceRole};
 pub use value::{

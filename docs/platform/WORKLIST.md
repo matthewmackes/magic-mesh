@@ -252,6 +252,22 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-SEC-006 - Keep Nebula private keys local to their owning node
 
 - Status: Remaining
+- Progress (2026-07-25 evidence-harness guardrails/live-gap diagnostics):
+  `install-helpers/verify-nebula-rotation-evidence.sh` now refuses non-empty
+  collection directories, fingerprints the collecting node with a hashed
+  machine-id, and requires clean before/after summaries plus stable
+  format/host/config/workgroup/interface metadata before `compare` can claim
+  rotation proof. Missing live interfaces no longer abort collection before
+  live-check metadata is written. Local `bash -n`, `--self-test`, and
+  diff-check are clean; the focused `.50` farm slot
+  `wlsec006-nebula-evidence` ran `bash -n` plus `--self-test` clean, including
+  mismatched-metadata, failed-snapshot, non-empty-output, and missing-live-iface
+  regressions. A read-only local collection wrote the failed snapshot
+  `/var/tmp/wl-sec-006-nebula-readonly-20260725T192202Z` without mutating
+  Nebula state; it confirms this dev host (`rocky9-kvm2`) has no
+  `/etc/nebula/identity`, no `/mnt/mesh-storage`, inactive `nebula.service` and
+  `mackesd.service`, and no `nebula1` overlay, so real live
+  rotation/reconnect/prune proof still needs an enrolled live peer/seat.
 - Progress (2026-07-25 read-only live-evidence harness): added
   `install-helpers/verify-nebula-rotation-evidence.sh`, a bounded collector and
   pre/post comparator for the remaining controlled Nebula drill. It hashes the
@@ -674,6 +690,24 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-ARCH-007 - Repair Workloads cockpit E2E wire, placement, and authorization
 
 - Status: Remaining
+- Progress (2026-07-25 live `.15` Workloads backend remediation/proof): live
+  `Basement-Test-Workstation` (`172.20.0.15`) was read-only probed with
+  `install-helpers/verify-workloads-live-proof.py`, then remediated in-place
+  where the missing pieces were normal package/service state. Installed
+  `opentofu` and `libvirt-daemon-kvm`, reclaimed explicit disposable disk
+  pressure only (`dnf`/PackageKit/libdnf caches, bounded journal/log growth,
+  stale `/root/.local/share/mde/bus.pre-chat-bus-root-20260717-212313`), and
+  restarted `mackesd` once to re-arm tripped breakers and refresh backend
+  health. Rootfs improved from **243 MiB free / 99% used** to **2.4 GiB free /
+  84% used**. The required proof now exits 0 with `mackesd` and
+  `mde-shell-egui` active at **NRestarts=0**, root-only encrypted
+  cloud-arm credential and systemd drop-ins OK, fresh
+  `state/cloud/Basement-Test-Workstation` mirror **14.189 s** old with
+  `opentofu=up`, `ansible=up`, `libvirt=up`, apply armed, Podman
+  `5.8.4` active, local SSH active, and libvirt `default` network plus
+  `mde-vms` pool active. The remaining KVM evidence is honestly not claimed:
+  this seat still reports `/dev/kvm` absent and no CPU `vmx/svm` virtualization
+  flag, so direct KVM lifecycle remains a firmware/hardware exposure follow-up.
 - Progress (2026-07-25 Workloads live-proof verifier harness):
   `install-helpers/verify-workloads-live-proof.py` now provides a bounded,
   read-only WL-ARCH-007 evidence collector for placement hosts. It opens the
@@ -1091,6 +1125,18 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-011 - Communications collaboration suite full replacement
 
 - Status: Remaining
+- Progress (2026-07-25 call media-verifier seam): Communications now publishes a
+  retained `state/collab/call-media-verification` sidecar by consuming the
+  global `state/collab/call-media-readiness` board. The verifier is bounded and
+  emits one row per candidate adapter; single-seat readiness stays
+  `waiting_for_connected_peer`, and adapter-ready rows fail honestly as
+  `transport_unavailable` for missing WebRTC verifier transport or
+  `provider_unavailable` for missing LiveKit/SIP gateway/provider until a real
+  SIP/WebRTC/LiveKit transport is registered and proves advancing frames. Farm
+  gates are green on `.90` at **37/37** `mde-collab-types --lib`, `.130`
+  BigBoy at **3/3** `mackesd collab_media` plus **1/1**
+  `call_media_readiness_is_published_for_the_local_media_adapter`, and `.50`
+  touched-file rustfmt. Live WebRTC/SIP/LiveKit/media proof remains external.
 - Progress (2026-07-25 media-readiness publish boundary): the mackesd
   collaboration worker now publishes the core `CallMediaReadiness` projection
   for the local actor as retained adapter-facing Bus state at
@@ -1758,6 +1804,24 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-012 - Maps live-data overlays (zero-cost external feeds)
 
 - Status: Remaining
+- Progress (2026-07-25 live `.15` zero-cost catalog absence proof): the
+  read-only live-mirror verifier now has a node-wide catalog audit
+  (`--catalog-overlay-node` plus optional `--require-catalog-complete`) that
+  enumerates every locked zero-cost `state/overlay/<feed>/<node>` topic and
+  separates absent mirrors from present-but-invalid evidence. Farm `.50` slot
+  `wl-func-012-catalog` passed Python bytecode compilation plus
+  `verify-live-mirrors.py --self-test`; local diff-check is clean. A read-only
+  patched verifier streamed over SSH to live `.15` observed a fresh **383 ms**
+  `state/vehicle/Basement-Test-Workstation` mirror with `online=true`, MGOS
+  `4.3.0.1`, honest `fix_type=no-fix`, zero satellites, and zero speed, then
+  failed the required overlay catalog proof with **present=0, absent=11,
+  invalid=0**. Exact absent zero-cost feeds on `.15`:
+  `adsb-aircraft`, `airnow-aqi`, `caltrans-cameras`, `firms-hotspots`,
+  `gtfs-transit`, `iem-nexrad`, `ncdot-traffic`, `nifc-wildfire`,
+  `nws-alerts`, `nws-hourly`, and `usgs-earthquakes`. This collected absence
+  evidence only; no external feed was contacted, no MG90 scanner-contact
+  protocol or synthetic contact was added, and live painted-overlay/scanner
+  proof remains external.
 - Progress (2026-07-25 Airspace headless paint-proof seam): the Maps Airspace
   panel now exposes bounded paint stats for proof tooling, counting radar blips,
   live-panel rows, and the honest `NO SCANNER FEED` empty badge without changing
@@ -2160,6 +2224,18 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-006 - Construct interface (Apple-HIG-principled workstation shell)
 
 - Status: Remaining
+- Progress (2026-07-25 deterministic Construct pixel verifier):
+  `install-helpers/verify-shell-pixel-proof.py` now validates already-captured
+  KMS/linear-GBM PNG artifacts without touching the Workloads verifier lane. Its
+  `--profile construct-home` path decodes PNGs with the Python standard
+  library, records artifact SHA256/dimensions, requires the 24 px top status
+  rail, multiple shared Springboard tile-plate color families, white
+  glyph/text paint, and the bounded floating navigation pill, and fails a
+  taskbar-shaped full-width bottom bar fixture. Local bytecode compilation and
+  self-test are clean; focused farm `.50` slot `ux-pixel-proof` ran bytecode
+  compilation plus `--self-test` clean. No live `.15` capture or physical
+  pointer/VDI proof was collected in this slice, so live pointer/DRM/pixel/VDI
+  acceptance remains external.
 - Progress (2026-07-25 VDI status-rail proof verifier): `verify-live-mirrors.py`
   now validates the Construct status-rail lifecycle source
   `action/vdi/session` for a console session, requiring a matching rail-visible
@@ -2735,6 +2811,17 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-007 - Car interface (CarPlay-principled vehicle mode)
 
 - Status: Remaining
+- Progress (2026-07-25 deterministic live-capture Car pixel verifier):
+  `install-helpers/verify-shell-pixel-proof.py` now has a `--profile car-home`
+  path for already-captured KMS/linear-GBM PNG artifacts. It fails closed on
+  undersized/flat/blank captures and requires the Ford SYNC3 ground, raised
+  dashboard/card paint, Ford-blue accent pixels, bottom app-strip/card paint,
+  and strong glance text before a Car Home capture can be counted as repeatable
+  pixel evidence. Local bytecode compilation and self-test are clean; focused
+  farm `.50` slot `ux-pixel-proof` ran bytecode compilation plus `--self-test`
+  clean, including generated passing Car and blank-capture failure fixtures. No
+  live `.15` capture was collected in this slice; live MG90/physical Car and
+  real driving/fix evidence remain external.
 - Progress (2026-07-25 Car Home headless pixel proof): `car_home.rs` now has a
   test-only software-rasterized proof that drives the real `car_home_panel`
   through egui `Context::run` plus the existing screenshot backend, then checks

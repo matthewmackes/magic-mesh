@@ -891,6 +891,7 @@ pub mod chat;
 // will EVENTUALLY replace (Phase 4; it runs ALONGSIDE chat for now). Bus + actor
 // -log roots are injectable seams so the whole flow is headless-testable.
 pub mod collab;
+mod collab_media;
 // CHAT-FIX-2 — the local-notification producer worker (design
 // docs/design/console-frontdoor.md Q34/46/47). The real empty-Chat fix: with the
 // chat worker running but no peer chatter, nothing produced local system events,
