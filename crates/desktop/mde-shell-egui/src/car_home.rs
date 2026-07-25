@@ -1215,6 +1215,69 @@ mod tests {
     }
 
     #[test]
+    fn nav_card_remains_reachable_at_the_narrowest_safe_touch_layout() {
+        // Derive the smallest body that the production layout accepts, then
+        // account for the Auto title and the shell's inset. This is the
+        // boundary most likely to regress into an unreachable or misrouted
+        // large Navigation tile when a seat is narrow.
+        let cols = CarTile::ALL.len() as f32;
+        let touch_target = Density::Touch.min_hit_target();
+        let gap = Style::SP_M;
+        let body_size = vec2(
+            touch_target * cols + gap * (cols - 1.0),
+            (touch_target + Style::SP_XL)
+                + gap
+                + (touch_target * 2.0 + gap),
+        );
+        let screen_size = vec2(
+            body_size.x + Style::SP_L * 2.0,
+            body_size.y + Style::SP_L * 2.0 + Style::DISPLAY + Style::SP_M,
+        );
+        let body = Rect::from_min_size(
+            pos2(Style::SP_L, Style::SP_L + Style::DISPLAY + Style::SP_M),
+            body_size,
+        );
+        let layout = dashboard_layout(body).expect("exact 44pt-safe boundary lays out");
+        assert!(layout.nav_card.width() >= touch_target);
+        assert!(layout.nav_card.height() >= touch_target);
+
+        let tap = |pos: egui::Pos2| {
+            vec![
+                vec![],
+                vec![egui::Event::PointerMoved(pos), pointer_button(pos, true)],
+                vec![pointer_button(pos, false)],
+            ]
+        };
+        let (picks, _) = drive_with_screen(
+            &CarHomeGlance {
+                vehicle: Some("MG90 telematics".to_string()),
+                ..Default::default()
+            },
+            tap(layout.nav_card.center()),
+            screen_size,
+        );
+        assert_eq!(
+            picks.last(),
+            Some(&Some(CarTile::Nav)),
+            "the large Nav card must not fall through to Vehicle/OBD at the safe narrow boundary"
+        );
+
+        // One point below either body dimension must fail closed rather than
+        // expose a partial target or an off-body activation region.
+        for undersized in [
+            vec2(screen_size.x - 1.0, screen_size.y),
+            vec2(screen_size.x, screen_size.y - 1.0),
+        ] {
+            let (picks, shapes) =
+                drive_with_screen(&CarHomeGlance::default(), vec![vec![]], undersized);
+            assert_eq!(picks, vec![None], "unsupported seat size has no active target");
+            assert!(painted_text(&shapes)
+                .iter()
+                .any(|text| text == "Resize workspace to use Auto Mode"));
+        }
+    }
+
+    #[test]
     fn focused_car_targets_activate_with_enter() {
         let ctx = egui::Context::default();
         Style::install(&ctx);

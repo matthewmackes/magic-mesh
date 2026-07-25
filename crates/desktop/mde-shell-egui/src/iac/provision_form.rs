@@ -195,6 +195,7 @@ pub(super) fn provision_form(ui: &mut egui::Ui, state: &mut WorkloadsState) {
     ui.add_space(Style::SP_S);
     let valid = state.form.is_valid();
     let live_apply_available = state.selected_node_apply_armed();
+    let android_name = state.form.name.trim().to_string();
     if !valid {
         mde_egui::muted_note(
             ui,
@@ -211,6 +212,7 @@ pub(super) fn provision_form(ui: &mut egui::Ui, state: &mut WorkloadsState) {
     let mut set_desired = false;
     let mut plan = false;
     let mut provision = false;
+    let mut android_prepare = false;
     ui.horizontal(|ui| {
         if action_button(ui, valid, "Set desired", Style::ACCENT_WORKLOADS).clicked() {
             set_desired = true;
@@ -230,12 +232,31 @@ pub(super) fn provision_form(ui: &mut egui::Ui, state: &mut WorkloadsState) {
         {
             provision = true;
         }
+        if view == DeliveryView::AndroidVm
+            && action_button(
+                ui,
+                true,
+                "Prepare Android VM\u{2026}",
+                Style::ACCENT_WORKLOADS,
+            )
+            .clicked()
+        {
+            android_prepare = true;
+        }
     });
     mde_egui::muted_note(
         ui,
         "Set desired persists the spec; Plan is a dry-run (counts only); Provision opens a \
          typed-arm before any live apply.",
     );
+    if view == DeliveryView::AndroidVm {
+        mde_egui::muted_note(
+            ui,
+            "Prepare Android VM uses the dedicated android-provision contract and saves a \
+             Cuttlefish-sized desired spec; it does not claim the VM is live until Provision \
+             runs.",
+        );
+    }
 
     // Dispatch past the form's `&mut` borrow — one distinct emit per button, so no
     // two mutations race the single in-flight reply slot.
@@ -248,6 +269,9 @@ pub(super) fn provision_form(ui: &mut egui::Ui, state: &mut WorkloadsState) {
     }
     if provision {
         state.arm_provision();
+    }
+    if android_prepare {
+        state.arm_android_provision(&android_name);
     }
 }
 
@@ -357,5 +381,16 @@ mod tests {
             body.get("name").is_none(),
             "the workload spec must not be published bare at the JSON root"
         );
+    }
+
+    #[test]
+    fn android_provision_body_keeps_the_dedicated_contract_and_default_name() {
+        let body: serde_json::Value = serde_json::from_str(
+            &super::super::android_provision_request_body(" eagle ", "  "),
+        )
+        .expect("android-provision request encodes");
+        assert_eq!(body["schema_version"], 1);
+        assert_eq!(body["node"], "eagle");
+        assert_eq!(body["name"], "");
     }
 }

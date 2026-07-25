@@ -45,7 +45,7 @@ use mackes_mesh_types::cloud::{
     cloud_request_digest, decode_cloud_arm_credential, CloudArmSigner, CloudArmedToken,
     CloudReply as WireCloudReply, CloudState, ConsoleEndpoint, DeliveryType, WorkloadRow,
     WorkloadSpec, CLOUD_ACTION_SCHEMA_VERSION, CLOUD_ARM_CREDENTIAL, CLOUD_ARM_NODE_SCOPE,
-    CLOUD_STATE_PREFIX,
+    CLOUD_STATE_PREFIX, VERB_ANDROID_PROVISION,
 };
 
 use mde_bus::hooks::config::Priority;
@@ -291,6 +291,19 @@ fn node_request_body(node: &str) -> String {
     serde_json::json!({
         "schema_version": CLOUD_ACTION_SCHEMA_VERSION,
         "node": node,
+    })
+    .to_string()
+}
+
+/// Serialize the dedicated Cuttlefish desired-state request. The Android worker
+/// supplies the minimum nested-KVM sizing and persists the resulting
+/// `DeliveryType::AndroidVm` spec; a blank name intentionally lets it derive the
+/// stable `android-<node>` default.
+fn android_provision_request_body(node: &str, name: &str) -> String {
+    serde_json::json!({
+        "schema_version": CLOUD_ACTION_SCHEMA_VERSION,
+        "node": node.trim(),
+        "name": name.trim(),
     })
     .to_string()
 }
@@ -594,6 +607,8 @@ fn armed(typed: &str, echo: &str) -> bool {
 enum AuditOutcome {
     /// The op was applied live (and, if destructive, audited to the events plane).
     Applied,
+    /// The backend persisted desired state, but a separate live apply remains.
+    Desired,
     /// The op was staged (a `tofu plan` / `--check` dry-run — nothing applied).
     Staged,
     /// The op failed.
@@ -605,6 +620,7 @@ impl AuditOutcome {
     const fn color(self) -> Color32 {
         match self {
             Self::Applied => Style::OK,
+            Self::Desired => Style::ACCENT_WORKLOADS,
             Self::Staged => Style::WARN,
             Self::Failed => Style::DANGER,
         }
@@ -614,6 +630,7 @@ impl AuditOutcome {
     const fn word(self) -> &'static str {
         match self {
             Self::Applied => "applied",
+            Self::Desired => "desired saved",
             Self::Staged => "staged",
             Self::Failed => "failed",
         }
@@ -955,6 +972,31 @@ impl WorkloadsState {
             spec.name.trim().to_string(),
             "Save",
             format!("desired state for workload {}", spec.name),
+        );
+    }
+
+    /// Open typed confirmation for the dedicated Cuttlefish Android contract.
+    /// `android-provision` persists the correctly sized Android desired slice;
+    /// the separate Provision action is still required for a live VM apply.
+    pub(super) fn arm_android_provision(&mut self, name: &str) {
+        let Some(node) = self.require_selected_node("Android provisioning") else {
+            return;
+        };
+        let name = name.trim();
+        let target = if name.is_empty() {
+            format!("android-{node}")
+        } else {
+            name.to_string()
+        };
+        self.arm_prepared(
+            VERB_ANDROID_PROVISION,
+            node.clone(),
+            target.clone(),
+            android_provision_request_body(&node, name),
+            format!("prepare Cuttlefish Android VM ({target})"),
+            target.clone(),
+            "Prepare",
+            format!("Cuttlefish Android desired state for {target}"),
         );
     }
 
@@ -1356,7 +1398,17 @@ fn fold_mutation(reply: &CloudReply) -> (String, AuditEntry) {
     } else {
         reply.verb.clone()
     };
-    if reply.ok {
+    if reply.ok && reply.verb == VERB_ANDROID_PROVISION {
+        let detail = "Cuttlefish desired state saved; live VM provision remains a separate action";
+        (
+            format!("{verb} saved desired state; no VM was provisioned yet."),
+            AuditEntry {
+                verb,
+                outcome: AuditOutcome::Desired,
+                detail: detail.to_string(),
+            },
+        )
+    } else if reply.ok {
         let audited = if reply.audited { " (audited)" } else { "" };
         (
             format!("{verb} applied{audited}."),

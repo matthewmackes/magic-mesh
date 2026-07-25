@@ -20,6 +20,12 @@ const RAIL_W: f32 = 176.0;
 const HEADER_H: f32 = mde_egui::menubar::BAR_HEIGHT + Style::SP_S;
 const RAIL_INNER_MARGIN: f32 = Style::SP_S;
 const ADVANCED_REVEAL_ID: &str = "maps-location-advanced-reveal";
+const ADVANCED_REVEAL_VIEWPORT_ID: &str = "maps-location-advanced-reveal-viewport";
+const MAP_LAYERS_POPUP_ID: &str = "maps-location-layers-popup";
+const MAP_LAYERS_SCROLL_ID: &str = "maps-location-layers-scroll";
+const MAP_LAYERS_POPUP_WIDTH: f32 = 280.0;
+const MAP_LAYERS_POPUP_HEIGHT: f32 = 360.0;
+const MAP_LAYERS_POPUP_GAP: f32 = Style::SP_XS;
 const ADVANCED_CARD_MIN_WIDTH: f32 = 280.0;
 const CARD_MIN_H: f32 = 84.0;
 const MAP_DARK_BG: Color32 = Color32::from_rgb(0x0D, 0x13, 0x18); // style-leak-ok: map-content-color
@@ -275,11 +281,14 @@ fn tab_rail(ui: &mut egui::Ui, state: &mut MapsLocationSurface) -> Rect {
     // that remaining screen-space budget as well: an expanded Advanced list
     // must scroll inside the rail rather than painting/hit-testing below the
     // workspace clip.
-    let available = ui.available_size();
-    let inner_width = (available.x - 2.0 * RAIL_INNER_MARGIN)
+    let available = ui.available_rect_before_wrap().intersect(ui.clip_rect());
+    let inset = RAIL_INNER_MARGIN
+        .min((available.width() * 0.5).max(0.0))
+        .min((available.height() * 0.5).max(0.0));
+    let inner_width = (available.width() - 2.0 * inset)
         .clamp(1.0, RAIL_W)
         .max(1.0);
-    let inner_height = (available.y - 2.0 * RAIL_INNER_MARGIN).max(1.0);
+    let inner_height = (available.height() - 2.0 * inset).max(1.0);
 
     // A reveal is a one-shot entry aid, not a permanent scroll lock. Clear it
     // whenever selection leaves Advanced, even if the disclosure remains
@@ -288,22 +297,47 @@ fn tab_rail(ui: &mut egui::Ui, state: &mut MapsLocationSurface) -> Rect {
     if !state.active.is_advanced() {
         ui.ctx().data_mut(|data| {
             data.remove_temp::<WorkspaceTab>(egui::Id::new(ADVANCED_REVEAL_ID));
+            data.remove_temp::<u32>(egui::Id::new(ADVANCED_REVEAL_VIEWPORT_ID));
         });
     }
 
+    let reveal_id = egui::Id::new(ADVANCED_REVEAL_ID);
+    let reveal_viewport_id = egui::Id::new(ADVANCED_REVEAL_VIEWPORT_ID);
+    let reveal_offset = if state.active.is_advanced()
+        && (ui
+            .ctx()
+            .data(|data| data.get_temp::<WorkspaceTab>(reveal_id))
+            != Some(state.active)
+            || ui
+                .ctx()
+                .data(|data| data.get_temp::<u32>(reveal_viewport_id))
+                != Some(inner_height.to_bits()))
+    {
+        Some(advanced_reveal_offset(
+            state.active,
+            inner_height,
+            ui.spacing().item_spacing.y,
+        ))
+    } else {
+        None
+    };
+
     let rendered = egui::Frame::NONE
         .fill(Style::LAYER_01)
-        .inner_margin(RAIL_INNER_MARGIN)
+        .inner_margin(inset)
         .show(ui, |ui| {
             ui.set_width(inner_width);
-            egui::ScrollArea::vertical()
+            let mut rail_scroll = egui::ScrollArea::vertical()
                 .id_salt("maps-location-tab-rail")
                 .auto_shrink([false, false])
                 .max_height(inner_height)
-                .min_scrolled_height(inner_height)
-                .show(ui, |ui| {
-                    ui.set_width(inner_width);
-
+                .min_scrolled_height(inner_height);
+            if let Some(offset) = reveal_offset {
+                rail_scroll = rail_scroll.vertical_scroll_offset(offset);
+            }
+            rail_scroll.show(ui, |ui| {
+                ui.set_width(inner_width);
+                ui.with_layout(egui::Layout::top_down(Align::Min), |ui| {
                     // Primary surfaces — the clean first-level nav.
                     for tab in WorkspaceTab::PRIMARY {
                         if rail_button(ui, tab.label(), state.active == tab).clicked() {
@@ -324,43 +358,90 @@ fn tab_rail(ui: &mut egui::Ui, state: &mut MapsLocationSurface) -> Rect {
                         // ScrollArea above is the interaction boundary: rows
                         // outside the visible viewport are clipped and cannot
                         // steal pointer input from the workspace.
-                        ui.horizontal(|ui| {
-                            ui.add_space(Style::SP_S);
-                            ui.vertical(|ui| {
-                                for tab in WorkspaceTab::ADVANCED {
-                                    let response =
-                                        rail_button(ui, tab.label(), state.active == tab);
-                                    if response.clicked() {
-                                        state.active = tab;
-                                    }
-                                    // If the shell enters Maps on an Advanced
-                                    // page, reveal that page after the shell's
-                                    // reserved chrome has been applied. This
-                                    // prevents a stale scroll offset from
-                                    // leaving the selected page off-screen.
-                                    let reveal_id = egui::Id::new(ADVANCED_REVEAL_ID);
-                                    let needs_reveal = state.active == tab
-                                        && ui
-                                            .ctx()
-                                            .data(|data| data.get_temp::<WorkspaceTab>(reveal_id))
-                                            != Some(tab);
-                                    if needs_reveal {
-                                        response.scroll_to_me_animation(
-                                            Some(Align::Center),
-                                            egui::style::ScrollAnimation::none(),
-                                        );
-                                        ui.ctx().data_mut(|data| {
-                                            data.insert_temp(reveal_id, tab);
-                                        });
-                                    }
+                        ui.indent("maps-location-advanced-submenu", |ui| {
+                            for tab in WorkspaceTab::ADVANCED {
+                                let response = rail_button(ui, tab.label(), state.active == tab);
+                                if response.clicked() {
+                                    state.active = tab;
                                 }
-                            });
+                                // If the shell enters Maps on an Advanced
+                                // page, reveal that page after the shell's
+                                // reserved chrome has been applied. This
+                                // prevents a stale scroll offset from
+                                // leaving the selected page off-screen.
+                                let needs_reveal = state.active == tab
+                                    && ui
+                                        .ctx()
+                                        .data(|data| data.get_temp::<WorkspaceTab>(reveal_id))
+                                        != Some(tab);
+                                if needs_reveal {
+                                    ui.ctx().data_mut(|data| {
+                                        data.insert_temp(reveal_id, tab);
+                                        data.insert_temp(
+                                            reveal_viewport_id,
+                                            inner_height.to_bits(),
+                                        );
+                                    });
+                                }
+                            }
                         });
                     }
-                })
+                });
+            })
         });
 
     rendered.inner.inner_rect
+}
+
+/// Compute the one-shot vertical offset that centers an active Advanced row in
+/// the bounded rail viewport. This is explicit instead of relying on a nested
+/// child response's scroll request: egui clips that response before the parent
+/// scroll area can consume it on very short seats, leaving an unclickable row.
+fn advanced_reveal_offset(tab: WorkspaceTab, viewport_height: f32, item_spacing_y: f32) -> f32 {
+    let Some(index) = WorkspaceTab::ADVANCED
+        .iter()
+        .position(|candidate| *candidate == tab)
+    else {
+        return 0.0;
+    };
+    let row_step = Style::SP_XL + Style::SP_XS + item_spacing_y;
+    let row_center = (WorkspaceTab::PRIMARY.len() + 1 + index) as f32 * row_step - Style::SP_XS
+        + Style::SP_XL * 0.5;
+    let content_height = (WorkspaceTab::PRIMARY.len() + 1 + WorkspaceTab::ADVANCED.len()) as f32
+        * row_step
+        - Style::SP_XS;
+    let max_offset = (content_height - viewport_height).max(0.0);
+    (row_center - viewport_height * 0.5).clamp(0.0, max_offset)
+}
+
+/// Keep a foreground control surface inside the workspace clip, including the
+/// shell's reserved top rail. The stock `menu_button` popup is constrained to
+/// the full egui screen, so a tall Layers list can cover the top bar or leave
+/// its lower rows outside a short seat. This rectangle picks the side with the
+/// most usable room and gives the caller a bounded scrolling viewport.
+fn bounded_popup_rect(anchor: Rect, clip: Rect, desired_width: f32, desired_height: f32) -> Rect {
+    if !anchor.is_positive() || !clip.is_positive() {
+        return Rect::NOTHING;
+    }
+
+    let width = desired_width.max(1.0).min(clip.width().max(1.0));
+    let desired_height = desired_height.max(1.0).min(clip.height().max(1.0));
+    let left = anchor
+        .left()
+        .clamp(clip.left(), (clip.right() - width).max(clip.left()));
+    let below = (clip.bottom() - anchor.bottom() - MAP_LAYERS_POPUP_GAP).max(0.0);
+    let above = (anchor.top() - clip.top() - MAP_LAYERS_POPUP_GAP).max(0.0);
+
+    if below >= above {
+        let height = desired_height.min(below.max(1.0));
+        let top =
+            (anchor.bottom() + MAP_LAYERS_POPUP_GAP).min((clip.bottom() - height).max(clip.top()));
+        Rect::from_min_size(egui::pos2(left, top), egui::vec2(width, height))
+    } else {
+        let height = desired_height.min(above.max(1.0));
+        let bottom = (anchor.top() - MAP_LAYERS_POPUP_GAP).max(clip.top() + height);
+        Rect::from_min_size(egui::pos2(left, bottom - height), egui::vec2(width, height))
+    }
 }
 
 /// The top-level **Advanced** rail entry: a [`rail_button`] carrying a
@@ -1205,7 +1286,12 @@ fn paint_destination_summary(painter: &Painter, rect: Rect, destination: Option<
         Style::typography_font(TypographyRole::Headline),
         Style::TEXT_STRONG,
     );
-    let addr_s = elide(painter, addr, Style::typography_font(TypographyRole::Body), max_w);
+    let addr_s = elide(
+        painter,
+        addr,
+        Style::typography_font(TypographyRole::Body),
+        max_w,
+    );
     painter.text(
         egui::pos2(tx, rect.center().y + Style::SP_M - 2.0),
         Align2::LEFT_CENTER,
@@ -3512,7 +3598,7 @@ fn show_map(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
         ui.checkbox(&mut state.map.route_visible, "Route");
         ui.checkbox(&mut state.map.dead_zone_overlay, "Dead zones");
         ui.checkbox(&mut state.map.gnss_overlay, "GNSS quality");
-        map_layers_menu(ui, &mut state.map);
+        let _ = map_layers_menu(ui, &mut state.map);
     });
     ui.add_space(Style::SP_S);
     ui.horizontal(|ui| {
@@ -3599,46 +3685,131 @@ fn active_live_overlay_count(map: &MapViewState) -> usize {
 /// one of the ten typed latest-wins overlay states; optional label/animation
 /// preferences remain next to their owning feed so turning a feed off cannot
 /// leave a detached preference control in the main toolbar.
-fn map_layers_menu(ui: &mut egui::Ui, map: &mut MapViewState) {
+#[derive(Debug, Clone, Copy)]
+struct MapLayersLayout {
+    button: Rect,
+    popup: Rect,
+    first_toggle: Rect,
+}
+
+impl Default for MapLayersLayout {
+    fn default() -> Self {
+        Self {
+            button: Rect::NOTHING,
+            popup: Rect::NOTHING,
+            first_toggle: Rect::NOTHING,
+        }
+    }
+}
+
+fn map_layers_menu(ui: &mut egui::Ui, map: &mut MapViewState) -> MapLayersLayout {
     let active = active_live_overlay_count(map);
-    ui.menu_button(format!("Layers ({active})"), |ui| {
-        ui.label(RichText::new("Safety").strong().color(Style::TEXT_STRONG));
-        ui.checkbox(&mut map.nws_alert_overlay, "Weather alerts");
-        ui.checkbox(&mut map.iem_radar_overlay, "NEXRAD radar");
-        if map.iem_radar_overlay {
-            ui.indent("layers-radar-options", |ui| {
-                ui.checkbox(&mut map.iem_radar.animate, "Animate radar");
-            });
-        }
-        ui.checkbox(&mut map.wildfire_overlay, "Wildfire perimeters + hotspots");
+    let popup_id = ui.make_persistent_id(MAP_LAYERS_POPUP_ID);
+    let was_open = ui.memory(|memory| memory.is_popup_open(popup_id));
+    let button = ui.button(format!("Layers ({active})"));
+    if button.clicked() {
+        ui.memory_mut(|memory| memory.toggle_popup(popup_id));
+    }
 
-        ui.separator();
-        ui.label(
-            RichText::new("Road & transit")
-                .strong()
-                .color(Style::TEXT_STRONG),
-        );
-        ui.checkbox(&mut map.traffic_event_overlay, "NCDOT traffic");
-        ui.checkbox(&mut map.caltrans_camera_overlay, "Caltrans cameras");
-        ui.checkbox(&mut map.nws_forecast_overlay, "Hourly forecast");
-        ui.checkbox(&mut map.transit_overlay, "MBTA transit");
-        if map.transit_overlay {
-            ui.indent("layers-transit-options", |ui| {
-                ui.checkbox(&mut map.transit.show_labels, "Transit labels");
-            });
-        }
+    let mut layout = MapLayersLayout {
+        button: button.rect,
+        ..MapLayersLayout::default()
+    };
+    if !ui.memory(|memory| memory.is_popup_open(popup_id)) {
+        return layout;
+    }
 
-        ui.separator();
-        ui.label(RichText::new("Ambient").strong().color(Style::TEXT_STRONG));
-        ui.checkbox(&mut map.earthquake_overlay, "Earthquakes");
-        ui.checkbox(&mut map.air_quality_overlay, "AirNow AQI");
-        ui.checkbox(&mut map.aircraft_overlay, "Aircraft");
-        if map.aircraft_overlay {
-            ui.indent("layers-aircraft-options", |ui| {
-                ui.checkbox(&mut map.aircraft.show_callsigns, "Callsigns");
-            });
-        }
-    });
+    let popup_rect = bounded_popup_rect(
+        button.rect,
+        ui.clip_rect(),
+        MAP_LAYERS_POPUP_WIDTH,
+        MAP_LAYERS_POPUP_HEIGHT,
+    );
+    if !popup_rect.is_positive() {
+        ui.memory_mut(|memory| memory.close_popup());
+        return layout;
+    }
+
+    let frame = egui::Frame::popup(ui.style());
+    let frame_margin = frame.total_margin();
+    let content_width = (popup_rect.width() - frame_margin.sum().x).max(1.0);
+    let content_height = (popup_rect.height() - frame_margin.sum().y).max(1.0);
+    let popup = egui::Area::new(popup_id)
+        .kind(egui::UiKind::Popup)
+        .order(egui::Order::Foreground)
+        .fixed_pos(popup_rect.left_top())
+        .constrain_to(ui.clip_rect())
+        .default_width(popup_rect.width())
+        .sense(Sense::hover())
+        .show(ui.ctx(), |ui| {
+            frame
+                .show(ui, |ui| {
+                    ui.set_width(content_width);
+                    let mut first_toggle = Rect::NOTHING;
+                    egui::ScrollArea::vertical()
+                        .id_salt(MAP_LAYERS_SCROLL_ID)
+                        .auto_shrink([false, false])
+                        .max_height(content_height)
+                        .show(ui, |ui| {
+                            ui.set_width(content_width);
+                            ui.label(RichText::new("Safety").strong().color(Style::TEXT_STRONG));
+                            let response =
+                                ui.checkbox(&mut map.nws_alert_overlay, "Weather alerts");
+                            first_toggle = response.rect;
+                            ui.checkbox(&mut map.iem_radar_overlay, "NEXRAD radar");
+                            if map.iem_radar_overlay {
+                                ui.indent("layers-radar-options", |ui| {
+                                    ui.checkbox(&mut map.iem_radar.animate, "Animate radar");
+                                });
+                            }
+                            ui.checkbox(
+                                &mut map.wildfire_overlay,
+                                "Wildfire perimeters + hotspots",
+                            );
+
+                            ui.separator();
+                            ui.label(
+                                RichText::new("Road & transit")
+                                    .strong()
+                                    .color(Style::TEXT_STRONG),
+                            );
+                            ui.checkbox(&mut map.traffic_event_overlay, "NCDOT traffic");
+                            ui.checkbox(&mut map.caltrans_camera_overlay, "Caltrans cameras");
+                            ui.checkbox(&mut map.nws_forecast_overlay, "Hourly forecast");
+                            ui.checkbox(&mut map.transit_overlay, "MBTA transit");
+                            if map.transit_overlay {
+                                ui.indent("layers-transit-options", |ui| {
+                                    ui.checkbox(&mut map.transit.show_labels, "Transit labels");
+                                });
+                            }
+
+                            ui.separator();
+                            ui.label(RichText::new("Ambient").strong().color(Style::TEXT_STRONG));
+                            ui.checkbox(&mut map.earthquake_overlay, "Earthquakes");
+                            ui.checkbox(&mut map.air_quality_overlay, "AirNow AQI");
+                            ui.checkbox(&mut map.aircraft_overlay, "Aircraft");
+                            if map.aircraft_overlay {
+                                ui.indent("layers-aircraft-options", |ui| {
+                                    ui.checkbox(&mut map.aircraft.show_callsigns, "Callsigns");
+                                });
+                            }
+                        });
+                    first_toggle
+                })
+                .inner
+        });
+    layout.popup = popup.response.rect;
+    layout.first_toggle = popup.inner;
+
+    if ui.input(|input| input.key_pressed(egui::Key::Escape))
+        || (was_open
+            && !button.clicked()
+            && button.clicked_elsewhere()
+            && popup.response.clicked_elsewhere())
+    {
+        ui.memory_mut(|memory| memory.close_popup());
+    }
+    layout
 }
 
 fn show_routes_trips(ui: &mut egui::Ui, state: &MapsLocationSurface) {
@@ -4521,11 +4692,7 @@ fn show_mg90_setup(
             );
             ui.add_space(Style::SP_XS);
             let reset_enabled = mg90.reset.armed();
-            reset_confirmation_row(
-                ui,
-                &mut mg90.reset.typed_confirmation,
-                reset_enabled,
-            );
+            reset_confirmation_row(ui, &mut mg90.reset.typed_confirmation, reset_enabled);
             ui.add_space(Style::SP_XS);
             divider(ui);
             ui.add_space(Style::SP_S);
@@ -5862,6 +6029,7 @@ mod tests {
         surface: &mut MapsLocationSurface,
         screen: Rect,
         at: Pos2,
+        reserve_shell_chrome: bool,
     ) {
         let _ = render_rail_frame(
             ctx,
@@ -5876,7 +6044,7 @@ mod tests {
                     modifiers: egui::Modifiers::default(),
                 },
             ],
-            false,
+            reserve_shell_chrome,
         );
         let _ = render_rail_frame(
             ctx,
@@ -5891,7 +6059,75 @@ mod tests {
                     modifiers: egui::Modifiers::default(),
                 },
             ],
-            false,
+            reserve_shell_chrome,
+        );
+    }
+
+    fn render_map_layers_frame(
+        ctx: &egui::Context,
+        map: &mut MapViewState,
+        screen: Rect,
+        events: Vec<egui::Event>,
+    ) -> (Rect, MapLayersLayout) {
+        let mut clip = Rect::NOTHING;
+        let mut layout = MapLayersLayout::default();
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                // This is the shell contract relevant to the regression: the
+                // workspace starts below the top status rail, so a popup must
+                // not use the full display rect as its interaction surface.
+                egui::TopBottomPanel::top("test-maps-status-space")
+                    .exact_height(24.0)
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |_ui| {});
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    clip = ui.clip_rect();
+                    layout = map_layers_menu(ui, map);
+                });
+            },
+        );
+        (clip, layout)
+    }
+
+    fn click_map_layers_rect(
+        ctx: &egui::Context,
+        map: &mut MapViewState,
+        screen: Rect,
+        rect: Rect,
+    ) {
+        let at = rect.center();
+        let _ = render_map_layers_frame(
+            ctx,
+            map,
+            screen,
+            vec![
+                egui::Event::PointerMoved(at),
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+        );
+        let _ = render_map_layers_frame(
+            ctx,
+            map,
+            screen,
+            vec![
+                egui::Event::PointerMoved(at),
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
         );
     }
 
@@ -5942,7 +6178,7 @@ mod tests {
             .read_response(rail_item_id("Advanced"))
             .expect("Advanced parent should register a hit target");
         assert!(viewport.contains_rect(parent.rect));
-        click_rail_row(&ctx, &mut surface, screen, parent.rect.center());
+        click_rail_row(&ctx, &mut surface, screen, parent.rect.center(), false);
         assert!(surface.advanced_expanded, "Advanced parent click was lost");
 
         let viewport = render_rail_frame(&ctx, &mut surface, screen, Vec::new(), false);
@@ -5950,8 +6186,74 @@ mod tests {
             .read_response(rail_item_id("MG90 Settings"))
             .expect("Advanced child should register a hit target");
         assert!(viewport.contains_rect(child.rect));
-        click_rail_row(&ctx, &mut surface, screen, child.rect.center());
+        click_rail_row(&ctx, &mut surface, screen, child.rect.center(), false);
         assert_eq!(surface.active, WorkspaceTab::Mg90Settings);
+    }
+
+    #[test]
+    fn advanced_selected_row_remains_clickable_inside_short_reserved_workspace() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        ctx.style_mut(|style| style.animation_time = 0.0);
+
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(280.0, 220.0));
+        let mut surface = MapsLocationSurface::simulated();
+        surface.active = WorkspaceTab::Mg90Settings;
+        surface.advanced_expanded = true;
+
+        let mut viewport = Rect::NOTHING;
+        for _ in 0..3 {
+            viewport = render_rail_frame(&ctx, &mut surface, screen, Vec::new(), true);
+        }
+        let selected = ctx
+            .read_response(rail_item_id("MG90 Settings"))
+            .expect("selected Advanced row should register in a short workspace");
+        assert!(
+            viewport.contains_rect(selected.rect),
+            "viewport={viewport:?} selected={selected:?}"
+        );
+        assert!(screen.contains_rect(selected.rect));
+
+        click_rail_row(&ctx, &mut surface, screen, selected.rect.center(), true);
+        assert!(
+            ctx.read_response(rail_item_id("MG90 Settings"))
+                .is_some_and(|response| response.clicked()),
+            "selected Advanced row lost its pointer click after shell reservations"
+        );
+    }
+
+    #[test]
+    fn map_layers_popup_is_bounded_and_clickable_on_a_short_reserved_workspace() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        ctx.style_mut(|style| style.animation_time = 0.0);
+
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(220.0, 180.0));
+        let mut map = MapViewState::live(false);
+        let (clip, closed) = render_map_layers_frame(&ctx, &mut map, screen, Vec::new());
+        assert!(
+            clip.top() >= 24.0,
+            "test workspace did not reserve the top rail"
+        );
+        assert!(clip.contains_rect(closed.button));
+
+        click_map_layers_rect(&ctx, &mut map, screen, closed.button);
+        let (clip, open) = render_map_layers_frame(&ctx, &mut map, screen, Vec::new());
+        assert!(
+            clip.contains_rect(open.popup),
+            "Layers popup escaped workspace clip"
+        );
+        assert!(
+            clip.contains_rect(open.first_toggle),
+            "first Layers checkbox lost its hit target in the clipped popup"
+        );
+        assert!(open.popup.height() < MAP_LAYERS_POPUP_HEIGHT);
+
+        click_map_layers_rect(&ctx, &mut map, screen, open.first_toggle);
+        assert!(
+            !map.nws_alert_overlay,
+            "a visible Layers checkbox must remain clickable after popup scrolling"
+        );
     }
 
     #[test]
@@ -5970,9 +6272,7 @@ mod tests {
             let _ = render_rail_frame(&ctx, &mut surface, screen, Vec::new(), false);
         }
         assert_eq!(
-            ctx.data(|data| {
-                data.get_temp::<WorkspaceTab>(egui::Id::new(ADVANCED_REVEAL_ID))
-            }),
+            ctx.data(|data| { data.get_temp::<WorkspaceTab>(egui::Id::new(ADVANCED_REVEAL_ID)) }),
             Some(WorkspaceTab::FirmwareRecovery)
         );
 
@@ -5983,9 +6283,7 @@ mod tests {
         let _ = render_rail_frame(&ctx, &mut surface, screen, Vec::new(), false);
 
         assert_eq!(
-            ctx.data(|data| {
-                data.get_temp::<WorkspaceTab>(egui::Id::new(ADVANCED_REVEAL_ID))
-            }),
+            ctx.data(|data| { data.get_temp::<WorkspaceTab>(egui::Id::new(ADVANCED_REVEAL_ID)) }),
             None,
             "a primary selection must invalidate the prior Advanced reveal"
         );
@@ -6026,8 +6324,7 @@ mod tests {
         );
 
         assert_eq!(
-            narrow_width,
-            narrow_available,
+            narrow_width, narrow_available,
             "stacked cards should use the CentralPanel's actual usable width"
         );
         assert!(narrow_width >= ADVANCED_CARD_MIN_WIDTH);
@@ -6411,7 +6708,9 @@ mod tests {
             "scope-level empty state paints"
         );
         assert!(
-            texts.iter().any(|t| t == "MG90 scanner source not configured"),
+            texts
+                .iter()
+                .any(|t| t == "MG90 scanner source not configured"),
             "the typed worker status note paints"
         );
         // No fixture contact ever paints on the production surface.
@@ -6806,7 +7105,10 @@ mod tests {
             screen.contains_rect(reset_button),
             "reset action escaped the narrow Advanced clip: {reset_button:?}"
         );
-        assert!(reset_button.is_positive(), "reset action lost its hit target");
+        assert!(
+            reset_button.is_positive(),
+            "reset action lost its hit target"
+        );
     }
 
     #[test]

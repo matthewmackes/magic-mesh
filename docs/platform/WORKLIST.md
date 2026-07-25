@@ -598,6 +598,12 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-ARCH-007 - Repair Workloads cockpit E2E wire, placement, and authorization
 
 - Status: Remaining
+- Progress (2026-07-25 Android VM preparation contract): the Workloads
+  cockpit now exposes the existing typed `android-provision` Bus contract with
+  explicit node placement, default naming, typed confirmation, and an honest
+  `desired saved` result that does not claim a live Cuttlefish VM. The focused
+  `.90` shell gate is green at **50/50**; live libvirt/Podman/Cuttlefish
+  evidence remains external.
 - Progress (2026-07-25 VDI session persistence boundary): replicated VDI
   session records and roaming monitor layouts now use bounded no-follow
   regular-file reads with UTF-8, special-file, symlink, and growth rejection
@@ -1466,6 +1472,20 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-012 - Maps live-data overlays (zero-cost external feeds)
 
 - Status: Remaining
+- Progress (2026-07-25 Advanced Maps viewport regression): Advanced navigation
+  rows now reveal inside the actual reserved workspace viewport, and the Layers
+  popup is constrained to the workspace clip with an internal scroll region.
+  The focused `.50` Maps gate is green at **221/221**; live display proof
+  remains external.
+- Progress (2026-07-25 MG90 protocol audit): the supplied AirLink MG90
+  Software Configuration Guide documents UDP Status Broadcast for location,
+  GNSS, WAN, VPN, GPIO, ignition, battery, and temperature fields, but does
+  not document a Wi-Fi/cellular/Bluetooth scanner-contact endpoint. The
+  existing Airspace worker therefore remains wired to the typed probe seam and
+  publishes an explicit `NO SCANNER FEED` state until a real scanner protocol
+  or configured probe is supplied; no undocumented transport or synthetic
+  contacts were added. Source: AirLink MG90 Software Configuration Guide Rev 6,
+  pp. 24 and 91, https://www.communica.se/sierrawireless/4118700%20AirLink%20MG90%20Software%20Configuration%20Guide_r6.pdf.
 - Progress (2026-07-24 retained-envelope boundary): Maps now reads the
   authoritative on-disk retained envelope through an exact-ULID, bounded 8 MiB
   no-follow path before JSON decoding, while preserving the existing body cap
@@ -2252,6 +2272,11 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-007 - Car interface (CarPlay-principled vehicle mode)
 
 - Status: Remaining
+- Progress (2026-07-25 Car navigation narrow-layout regression): the Car Home
+  Navigation tile now has a regression proof at the narrowest supported
+  touch-safe layout and fails closed one pixel below either dimension instead
+  of exposing a partial or misrouted target. The focused `.90` Car gate is
+  green at **12/12**; live MG90 and physical Car evidence remain external.
 - Progress (2026-07-25 Car status persistence boundary): the selected Car
   status configuration now uses a descriptor-backed no-follow regular-file
   reader that rejects final symlinks, special files, oversized or changing

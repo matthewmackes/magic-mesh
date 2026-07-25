@@ -459,6 +459,45 @@ fn set_desired_emits_the_worker_envelope_instead_of_a_bare_spec() {
 }
 
 #[test]
+fn android_cuttlefish_action_emits_the_dedicated_cloud_contract() {
+    let (_tmp, mut state) = placed_bus_state();
+
+    state.arm_android_provision("  droid-1  ");
+    let arming = state
+        .arming
+        .take()
+        .expect("Android action opens confirmation");
+    assert_eq!(arming.action.echo(), "droid-1");
+    assert_eq!(arming.action.verb(), VERB_ANDROID_PROVISION);
+    state.perform(arming.action, "droid-1");
+
+    let body = emitted_request(&state, VERB_ANDROID_PROVISION);
+    assert_eq!(body["schema_version"], CLOUD_ACTION_SCHEMA_VERSION);
+    assert_eq!(body["node"], "eagle");
+    assert_eq!(body["name"], "droid-1");
+    let token = CloudArmedToken::parse(body["armed_token"].as_str().unwrap())
+        .expect("Android action is capability-bound");
+    assert_eq!(token.verb, VERB_ANDROID_PROVISION);
+    assert_eq!(token.node, "eagle");
+    assert_eq!(token.target, "droid-1");
+}
+
+#[test]
+fn android_cuttlefish_reply_reads_as_desired_saved_not_live_applied() {
+    let reply: CloudReply = serde_json::from_str(
+        r#"{"ok":true,"verb":"android-provision","desired":[{"name":"droid-1"}]}"#,
+    )
+    .expect("Android reply parses");
+    let (note, entry) = fold_mutation(&reply);
+    assert!(
+        note.contains("saved desired state") && note.contains("no VM"),
+        "{note}"
+    );
+    assert_eq!(entry.outcome, AuditOutcome::Desired);
+    assert!(entry.detail.contains("separate action"));
+}
+
+#[test]
 fn ui_mutation_requests_carry_their_explicit_placement_node() {
     let (_tmp, mut state) = placed_bus_state();
 
