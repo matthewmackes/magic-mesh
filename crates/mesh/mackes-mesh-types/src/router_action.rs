@@ -366,6 +366,86 @@ pub fn action_dir(workgroup_root: &Path, target_host: &str) -> PathBuf {
         .join(target_host)
 }
 
+// Replicated action leaves are peer-controlled input. Keep the request/result
+// documents and the audit chain bounded before serde can materialize them.
+const MAX_ROUTER_ACTION_JSON_BYTES: usize = 256 * 1024;
+const MAX_ROUTER_AUDIT_BYTES: usize = 4 * 1024 * 1024;
+
+/// Read a replicated text leaf through the descriptor that will be consumed.
+///
+/// The final path component is opened without following symlinks, and known
+/// Unix targets use non-blocking open semantics so a FIFO or other special file
+/// cannot stall a worker. The descriptor must identify a regular file whose
+/// size stays within the bound and does not change while it is read. UTF-8 is
+/// validated before a caller invokes serde.
+fn read_bounded_router_record(path: &Path, max_bytes: usize) -> Option<String> {
+    use std::io::Read as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        options.custom_flags(0o400000 | 0o4000 | 0o2000000); // O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        options.custom_flags(0x100 | 0x4); // O_NOFOLLOW | O_NONBLOCK
+
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        if !std::fs::symlink_metadata(path).ok()?.file_type().is_file() {
+            return None;
+        }
+    }
+    #[cfg(not(unix))]
+    if !std::fs::symlink_metadata(path).ok()?.file_type().is_file() {
+        return None;
+    }
+
+    let file = options.open(path).ok()?;
+    let before = file.metadata().ok()?;
+    let max_bytes_u64 = u64::try_from(max_bytes).ok()?;
+    if !before.file_type().is_file() || before.len() > max_bytes_u64 {
+        return None;
+    }
+
+    let capacity = usize::try_from(before.len())
+        .ok()?
+        .min(max_bytes)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(capacity);
+    (&file)
+        .take(max_bytes_u64.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let after = file.metadata().ok()?;
+    // A peer can extend or truncate a regular file after the first metadata
+    // snapshot. Do not parse a row that changed while it was being consumed.
+    if !after.file_type().is_file()
+        || after.len() != before.len()
+        || bytes.len() > max_bytes
+        || bytes.len() as u64 != before.len()
+    {
+        return None;
+    }
+
+    String::from_utf8(bytes).ok()
+}
+
+fn read_bounded_router_json<T>(path: &Path, max_bytes: usize) -> Option<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let raw = read_bounded_router_record(path, max_bytes)?;
+    serde_json::from_str(&raw).ok()
+}
+
 /// Write a request into `target_host`'s replicated dir (atomic temp + rename).
 ///
 /// # Errors
@@ -399,11 +479,11 @@ pub fn take_requests(workgroup_root: &Path, self_host: &str) -> Vec<RouterAction
         if !name.ends_with(".json") || name.ends_with(".result.json") || name.starts_with('.') {
             continue;
         }
-        if let Ok(raw) = std::fs::read_to_string(&p) {
-            if let Ok(req) = serde_json::from_str::<RouterActionRequest>(&raw) {
-                let _ = std::fs::remove_file(&p);
-                out.push(req);
-            }
+        if let Some(req) =
+            read_bounded_router_json::<RouterActionRequest>(&p, MAX_ROUTER_ACTION_JSON_BYTES)
+        {
+            let _ = std::fs::remove_file(&p);
+            out.push(req);
         }
     }
     out
@@ -435,8 +515,8 @@ pub fn take_result(
     id: &str,
 ) -> Option<RouterActionResult> {
     let path = action_dir(workgroup_root, target_host).join(format!("{id}.result.json"));
-    let raw = std::fs::read_to_string(&path).ok()?;
-    let result = serde_json::from_str(&raw).ok()?;
+    let result =
+        read_bounded_router_json::<RouterActionResult>(&path, MAX_ROUTER_ACTION_JSON_BYTES)?;
     let _ = std::fs::remove_file(&path);
     Some(result)
 }
@@ -525,12 +605,12 @@ struct AuditPayload<'a> {
 /// the audit trail; `mackesd` uses it to walk + verify the chain.
 #[must_use]
 pub fn read_audit(path: &Path) -> Vec<AuditRecord> {
-    let Ok(raw) = std::fs::read_to_string(path) else {
+    let Some(raw) = read_bounded_router_record(path, MAX_ROUTER_AUDIT_BYTES) else {
         return Vec::new();
     };
     raw.lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str::<AuditRecord>(l).ok())
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str::<AuditRecord>(line).ok())
         .collect()
 }
 
@@ -719,6 +799,114 @@ mod tests {
     }
 
     #[test]
+    fn request_reader_rejects_hostile_leaves_without_consuming_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let invalid = action_dir(root, "invalid-utf8");
+        std::fs::create_dir_all(&invalid).unwrap();
+        let invalid_path = invalid.join("bad.json");
+        std::fs::write(&invalid_path, [b'{', 0xff, b'}']).unwrap();
+        assert!(take_requests(root, "invalid-utf8").is_empty());
+        assert!(invalid_path.exists(), "rejected input is not consumed");
+
+        let oversized = action_dir(root, "oversized");
+        std::fs::create_dir_all(&oversized).unwrap();
+        let oversized_path = oversized.join("bad.json");
+        std::fs::write(
+            &oversized_path,
+            vec![b' '; MAX_ROUTER_ACTION_JSON_BYTES + 1],
+        )
+        .unwrap();
+        assert!(take_requests(root, "oversized").is_empty());
+        assert!(oversized_path.exists(), "rejected input is not consumed");
+
+        let directory = action_dir(root, "directory");
+        std::fs::create_dir_all(directory.join("directory.json")).unwrap();
+        assert!(take_requests(root, "directory").is_empty());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            use std::os::unix::net::UnixListener;
+
+            let linked = action_dir(root, "symlink");
+            std::fs::create_dir_all(&linked).unwrap();
+            let target = tmp.path().join("request-target.json");
+            std::fs::write(&target, serde_json::to_vec(&sample_request()).unwrap()).unwrap();
+            let linked_path = linked.join("linked.json");
+            symlink(&target, &linked_path).unwrap();
+            assert!(take_requests(root, "symlink").is_empty());
+            assert!(std::fs::symlink_metadata(&linked_path)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+
+            let socket = action_dir(root, "socket");
+            std::fs::create_dir_all(&socket).unwrap();
+            let socket_path = socket.join("socket.json");
+            let _listener = UnixListener::bind(&socket_path).unwrap();
+            assert!(take_requests(root, "socket").is_empty());
+        }
+    }
+
+    #[test]
+    fn result_reader_rejects_hostile_leaves_without_consuming_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let invalid = action_dir(root, "invalid-utf8");
+        std::fs::create_dir_all(&invalid).unwrap();
+        let invalid_path = invalid.join("bad.result.json");
+        std::fs::write(&invalid_path, [b'{', 0xff, b'}']).unwrap();
+        assert!(take_result(root, "invalid-utf8", "bad").is_none());
+        assert!(invalid_path.exists(), "rejected input is not consumed");
+
+        let oversized = action_dir(root, "oversized");
+        std::fs::create_dir_all(&oversized).unwrap();
+        let oversized_path = oversized.join("bad.result.json");
+        std::fs::write(
+            &oversized_path,
+            vec![b' '; MAX_ROUTER_ACTION_JSON_BYTES + 1],
+        )
+        .unwrap();
+        assert!(take_result(root, "oversized", "bad").is_none());
+        assert!(oversized_path.exists(), "rejected input is not consumed");
+
+        let directory = action_dir(root, "directory");
+        std::fs::create_dir_all(directory.join("bad.result.json")).unwrap();
+        assert!(take_result(root, "directory", "bad").is_none());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            use std::os::unix::net::UnixListener;
+
+            let linked = action_dir(root, "symlink");
+            std::fs::create_dir_all(&linked).unwrap();
+            let target = tmp.path().join("result-target.json");
+            std::fs::write(
+                &target,
+                serde_json::to_vec(&RouterActionResult::ok("bad", "applied")).unwrap(),
+            )
+            .unwrap();
+            let linked_path = linked.join("bad.result.json");
+            symlink(&target, &linked_path).unwrap();
+            assert!(take_result(root, "symlink", "bad").is_none());
+            assert!(std::fs::symlink_metadata(&linked_path)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+
+            let socket = action_dir(root, "socket");
+            std::fs::create_dir_all(&socket).unwrap();
+            let socket_path = socket.join("bad.result.json");
+            let _listener = UnixListener::bind(&socket_path).unwrap();
+            assert!(take_result(root, "socket", "bad").is_none());
+        }
+    }
+
+    #[test]
     fn result_shapes_stay_honest() {
         let staged = RouterActionResult::staged("a", "recorded; live-apply parked");
         assert!(!staged.ok && staged.staged && !staged.reverted);
@@ -766,5 +954,47 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].outcome, "applied");
         assert!(read_audit(&tmp.path().join("missing.jsonl")).is_empty());
+    }
+
+    #[test]
+    fn audit_reader_rejects_hostile_leaves_fail_soft() {
+        let tmp = tempfile::tempdir().unwrap();
+        let valid = AuditRecord {
+            seq: 1,
+            outcome: "applied".into(),
+            ..AuditRecord::default()
+        };
+
+        let invalid_path = tmp.path().join("invalid.jsonl");
+        std::fs::write(&invalid_path, [b'{', 0xff, b'}']).unwrap();
+        assert!(read_audit(&invalid_path).is_empty());
+
+        let oversized_path = tmp.path().join("oversized.jsonl");
+        std::fs::write(&oversized_path, vec![b' '; MAX_ROUTER_AUDIT_BYTES + 1]).unwrap();
+        assert!(read_audit(&oversized_path).is_empty());
+
+        let directory_path = tmp.path().join("directory.jsonl");
+        std::fs::create_dir(&directory_path).unwrap();
+        assert!(read_audit(&directory_path).is_empty());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            use std::os::unix::net::UnixListener;
+
+            let target = tmp.path().join("audit-target.jsonl");
+            std::fs::write(
+                &target,
+                format!("{}\n", serde_json::to_string(&valid).unwrap()),
+            )
+            .unwrap();
+            let linked_path = tmp.path().join("linked.jsonl");
+            symlink(&target, &linked_path).unwrap();
+            assert!(read_audit(&linked_path).is_empty());
+
+            let socket_path = tmp.path().join("socket.jsonl");
+            let _listener = UnixListener::bind(&socket_path).unwrap();
+            assert!(read_audit(&socket_path).is_empty());
+        }
     }
 }

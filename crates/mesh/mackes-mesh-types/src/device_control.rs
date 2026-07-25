@@ -217,6 +217,86 @@ pub fn write_request(
     Ok(path)
 }
 
+/// Keep replicated request/result records bounded before JSON materialization.
+/// Device-control records are intentionally small typed envelopes, so a finite
+/// cap leaves room for forward-compatible fields without allowing a peer to
+/// force an unbounded allocation in either reader.
+const MAX_DEVICE_CONTROL_RECORD_BYTES: usize = 64 * 1024;
+
+/// Read one replicated device-control record through the descriptor that will
+/// be consumed. The final path component is opened without following a
+/// symlink, and non-blocking semantics keep a FIFO or other special file from
+/// stalling the worker. Descriptor metadata admits only regular files;
+/// reading one byte beyond the cap and comparing the descriptor size before
+/// and after consumption rejects oversized or changing input. UTF-8 is
+/// validated before either caller invokes serde.
+fn read_bounded_device_control_record(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        options.custom_flags(0o400000 | 0o4000 | 0o2000000); // O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        options.custom_flags(0x100 | 0x4); // O_NOFOLLOW | O_NONBLOCK
+
+        // Unsupported Unix targets still fail closed for a final symlink when
+        // their standard library does not expose an O_NOFOLLOW value here.
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        if !std::fs::symlink_metadata(path)
+            .ok()
+            .is_some_and(|metadata| metadata.file_type().is_file())
+        {
+            return None;
+        }
+    }
+
+    #[cfg(not(unix))]
+    if !std::fs::symlink_metadata(path)
+        .ok()
+        .is_some_and(|metadata| metadata.file_type().is_file())
+    {
+        return None;
+    }
+
+    let file = options.open(path).ok()?;
+    let before = file.metadata().ok()?;
+    let limit = u64::try_from(MAX_DEVICE_CONTROL_RECORD_BYTES).ok()?;
+    if !before.file_type().is_file() || before.len() > limit {
+        return None;
+    }
+
+    let capacity = usize::try_from(before.len())
+        .ok()?
+        .min(MAX_DEVICE_CONTROL_RECORD_BYTES)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(capacity);
+    (&file)
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let after = file.metadata().ok()?;
+    if !after.file_type().is_file()
+        || after.len() != before.len()
+        || bytes.len() > MAX_DEVICE_CONTROL_RECORD_BYTES
+        || bytes.len() as u64 != before.len()
+    {
+        return None;
+    }
+
+    String::from_utf8(bytes).ok()
+}
+
 /// Consume (read + delete) every pending request addressed to `self_host`. Result
 /// files (`*.result.json`) and half-written dotfiles are skipped.
 #[must_use]
@@ -237,7 +317,7 @@ pub fn take_requests(workgroup_root: &Path, self_host: &str) -> Vec<DeviceContro
         if !name.ends_with(".json") || name.ends_with(".result.json") || name.starts_with('.') {
             continue;
         }
-        if let Ok(raw) = std::fs::read_to_string(&p) {
+        if let Some(raw) = read_bounded_device_control_record(&p) {
             if let Ok(req) = serde_json::from_str::<DeviceControlRequest>(&raw) {
                 let _ = std::fs::remove_file(&p);
                 out.push(req);
@@ -273,7 +353,7 @@ pub fn take_result(
     id: &str,
 ) -> Option<DeviceControlResult> {
     let path = control_dir(workgroup_root, target_host).join(format!("{id}.result.json"));
-    let raw = std::fs::read_to_string(&path).ok()?;
+    let raw = read_bounded_device_control_record(&path)?;
     let result = serde_json::from_str(&raw).ok()?;
     let _ = std::fs::remove_file(&path);
     Some(result)
@@ -380,5 +460,87 @@ mod tests {
             take_result(root, "edge-2", "01HZX").is_none(),
             "consumed once"
         );
+    }
+
+    #[test]
+    fn request_reader_rejects_hostile_files_without_consuming_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let request = serde_json::to_vec_pretty(&sample_request()).unwrap();
+
+        let oversized_dir = control_dir(tmp.path(), "oversized");
+        std::fs::create_dir_all(&oversized_dir).unwrap();
+        let oversized = oversized_dir.join("oversized.json");
+        std::fs::write(&oversized, vec![b' '; MAX_DEVICE_CONTROL_RECORD_BYTES + 1]).unwrap();
+        assert!(take_requests(tmp.path(), "oversized").is_empty());
+        assert!(oversized.exists(), "rejected requests remain pending");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            use std::process::Command;
+
+            let symlink_dir = control_dir(tmp.path(), "symlink");
+            std::fs::create_dir_all(&symlink_dir).unwrap();
+            let outside = tmp.path().join("request-outside.json");
+            std::fs::write(&outside, &request).unwrap();
+            let link = symlink_dir.join("planted.json");
+            symlink(&outside, &link).unwrap();
+            assert!(take_requests(tmp.path(), "symlink").is_empty());
+            assert!(link.exists(), "rejected symlinks remain pending");
+
+            let special_dir = control_dir(tmp.path(), "special");
+            std::fs::create_dir_all(&special_dir).unwrap();
+            let fifo = special_dir.join("request.fifo.json");
+            if Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false)
+            {
+                assert!(take_requests(tmp.path(), "special").is_empty());
+                assert!(fifo.exists(), "rejected special files remain pending");
+            }
+        }
+    }
+
+    #[test]
+    fn result_reader_rejects_hostile_files_without_consuming_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = serde_json::to_vec_pretty(&DeviceControlResult::ok("01HZX", "done")).unwrap();
+
+        let oversized_dir = control_dir(tmp.path(), "oversized");
+        std::fs::create_dir_all(&oversized_dir).unwrap();
+        let oversized = oversized_dir.join("01HZX.result.json");
+        std::fs::write(&oversized, vec![b' '; MAX_DEVICE_CONTROL_RECORD_BYTES + 1]).unwrap();
+        assert!(take_result(tmp.path(), "oversized", "01HZX").is_none());
+        assert!(oversized.exists(), "rejected results remain pending");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            use std::process::Command;
+
+            let symlink_dir = control_dir(tmp.path(), "symlink");
+            std::fs::create_dir_all(&symlink_dir).unwrap();
+            let outside = tmp.path().join("result-outside.json");
+            std::fs::write(&outside, &result).unwrap();
+            let link = symlink_dir.join("01HZX.result.json");
+            symlink(&outside, &link).unwrap();
+            assert!(take_result(tmp.path(), "symlink", "01HZX").is_none());
+            assert!(link.exists(), "rejected symlinks remain pending");
+
+            let special_dir = control_dir(tmp.path(), "special");
+            std::fs::create_dir_all(&special_dir).unwrap();
+            let fifo = special_dir.join("01HZX.result.json");
+            if Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false)
+            {
+                assert!(take_result(tmp.path(), "special", "01HZX").is_none());
+                assert!(fifo.exists(), "rejected special files remain pending");
+            }
+        }
     }
 }

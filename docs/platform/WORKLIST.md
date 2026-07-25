@@ -878,6 +878,13 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-011 - Communications collaboration suite full replacement
 
 - Status: Remaining
+- Progress (2026-07-25 mesh media-registry boundary): replicated Nebula bundle
+  and media-registry JSON consumers now use bounded no-follow regular-file
+  readers that reject final symlinks, special files, oversized or changing
+  input, and invalid UTF-8 before peer or shared-account materialization. The
+  focused `mesh_media` farm gate is green at **20/20**, and the integrated
+  `mackesd --lib` gate is green at **4,083 passed, 0 failed, 1 ignored**; live
+  peer/media/LLM evidence remains external.
 - Progress (2026-07-25 media-session roaming boundary): replicated per-seat
   playback records now use bounded no-follow regular-file reads rejecting
   special files, final symlinks, oversized or changing input, and invalid
@@ -1736,6 +1743,14 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-006 - Construct interface (Apple-HIG-principled workstation shell)
 
 - Status: Remaining
+- Progress (2026-07-25 replicated control-action boundaries): router
+  request/result/audit records and device-control request/result records now
+  use bounded descriptor-backed regular-file reads that reject final symlinks,
+  special files, oversized or changing input, and invalid UTF-8 before action
+  or audit materialization while preserving fail-soft and consume semantics.
+  Focused farm gates are green at **12/12** router tests and **6/6** device
+  control tests; the full shared mesh-types gate is green at **275/275**. Live
+  pointer, pixel, physical, and VDI acceptance remain external evidence.
 - Progress (2026-07-25 status-chrome and terminal persistence boundaries):
   shell mesh-status/node-grade records and terminal tmux state now use bounded
   no-follow regular-file reads rejecting special files, final symlinks,
@@ -2216,6 +2231,13 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-007 - Car interface (CarPlay-principled vehicle mode)
 
 - Status: Remaining
+- Progress (2026-07-25 Car status persistence boundary): the selected Car
+  status configuration now uses a descriptor-backed no-follow regular-file
+  reader that rejects final symlinks, special files, oversized or changing
+  input, and invalid UTF-8 before JSON materialization. The focused Car-status
+  farm gate is green at **12/12**; the integrated Maps gate is green at
+  **219/219** and the shell gate at **1,797/1,797**. Live MG90 and physical
+  Car evidence remain external.
 - Progress (2026-07-25 MG90 password-file boundary): the root password input
   now opens without following a final symlink, checks the descriptor's regular
   file/owner/mode, and caps bytes at 4 KiB before UTF-8/string materialization.

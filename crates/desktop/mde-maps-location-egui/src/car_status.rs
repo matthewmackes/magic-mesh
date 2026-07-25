@@ -523,22 +523,57 @@ impl CarStatusSelection {
 /// The metadata checks reduce needless allocation, while the bounded read
 /// closes the race where a file grows after its first metadata snapshot.
 fn read_bounded_config(path: &Path) -> Option<String> {
-    let entry = std::fs::symlink_metadata(path).ok()?;
-    if !entry.file_type().is_file() || entry.len() > MAX_CAR_STATUS_CONFIG_BYTES {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        options.custom_flags(0o400000 | 0o4000); // O_NOFOLLOW | O_NONBLOCK
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        options.custom_flags(0x100 | 0x4); // O_NOFOLLOW | O_NONBLOCK
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        if !std::fs::symlink_metadata(path)
+            .ok()
+            .is_some_and(|metadata| metadata.file_type().is_file())
+        {
+            return None;
+        }
+    }
+    #[cfg(not(unix))]
+    if !std::fs::symlink_metadata(path)
+        .ok()
+        .is_some_and(|metadata| metadata.file_type().is_file())
+    {
         return None;
     }
 
-    let file = std::fs::File::open(path).ok()?;
+    let file = options.open(path).ok()?;
     let opened = file.metadata().ok()?;
     if !opened.file_type().is_file() || opened.len() > MAX_CAR_STATUS_CONFIG_BYTES {
         return None;
     }
 
-    let mut bytes = Vec::with_capacity(opened.len() as usize);
-    file.take(MAX_CAR_STATUS_CONFIG_BYTES + 1)
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(opened.len())
+            .unwrap_or(MAX_CAR_STATUS_CONFIG_BYTES as usize)
+            .saturating_add(1),
+    );
+    (&file)
+        .take(MAX_CAR_STATUS_CONFIG_BYTES + 1)
         .read_to_end(&mut bytes)
         .ok()?;
-    if bytes.len() as u64 > MAX_CAR_STATUS_CONFIG_BYTES {
+    let closed = file.metadata().ok()?;
+    if bytes.len() as u64 > MAX_CAR_STATUS_CONFIG_BYTES
+        || closed.len() != opened.len()
+        || !closed.file_type().is_file()
+    {
         return None;
     }
     String::from_utf8(bytes).ok()
@@ -598,6 +633,18 @@ mod tests {
             CarStatusSelection::load_from_path(&path),
             CarStatusSelection::defaults()
         );
+
+        let fifo = dir.path().join("car-status.fifo");
+        if std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            assert_eq!(
+                CarStatusSelection::load_from_path(&fifo),
+                CarStatusSelection::defaults()
+            );
+        }
     }
 
     #[test]
@@ -606,6 +653,27 @@ mod tests {
         let path = dir.path().join(CAR_STATUS_CONFIG_FILE);
         std::fs::write(&path, b"not-json").expect("write corrupt config");
 
+        assert_eq!(
+            CarStatusSelection::load_from_path(&path),
+            CarStatusSelection::defaults()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_rejects_final_symlink_and_invalid_utf8() {
+        let dir = tempfile::tempdir().expect("temp config dir");
+        let path = dir.path().join(CAR_STATUS_CONFIG_FILE);
+        let target = dir.path().join("outside.json");
+        std::fs::write(&target, b"{\"slots\":[\"speed_mph\"]}").expect("write target");
+        std::os::unix::fs::symlink(&target, &path).expect("create symlink");
+        assert_eq!(
+            CarStatusSelection::load_from_path(&path),
+            CarStatusSelection::defaults()
+        );
+
+        std::fs::remove_file(&path).expect("remove symlink");
+        std::fs::write(&path, [b'{', 0xff]).expect("write invalid utf8");
         assert_eq!(
             CarStatusSelection::load_from_path(&path),
             CarStatusSelection::defaults()

@@ -45,6 +45,85 @@ struct BundleOverlayIp {
     overlay_ip: String,
 }
 
+/// Replicated Nebula bundles contain PEM material and a lighthouse roster, so
+/// leave room for a useful fleet bundle while keeping peer-controlled JSON
+/// bounded before serde materializes it.
+const MAX_NEBULA_BUNDLE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Media registrations are compact records. A smaller bound prevents a
+/// malformed replicated registration from consuming an unreasonable amount of
+/// memory before serde materializes it.
+const MAX_MEDIA_REGISTRY_BYTES: usize = 256 * 1024;
+
+/// Read one replicated JSON record through the descriptor that will actually
+/// be consumed. Final symlinks and special files are rejected at open time;
+/// the bounded read and post-read metadata check reject oversized or changing
+/// input before a caller invokes serde.
+fn read_bounded_media_json(path: &Path, max_bytes: usize) -> Option<String> {
+    #[cfg(unix)]
+    let file: std::fs::File = {
+        use rustix::fs::{Mode, OFlags};
+
+        rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .ok()?
+        .into()
+    };
+    #[cfg(not(unix))]
+    let file = {
+        let metadata = std::fs::symlink_metadata(path).ok()?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            return None;
+        }
+        std::fs::File::open(path).ok()?
+    };
+
+    let expected_len = file.metadata().ok()?.len();
+    read_bounded_media_file(file, expected_len, max_bytes)
+}
+
+/// Consume an already-open replicated JSON record and verify that the regular
+/// file stayed the same size throughout the bounded read. The explicit
+/// `expected_len` seam makes the growth-race regression deterministic without
+/// making production behavior depend on thread timing.
+fn read_bounded_media_file(
+    mut file: std::fs::File,
+    expected_len: u64,
+    max_bytes: usize,
+) -> Option<String> {
+    use std::io::Read as _;
+
+    let before = file.metadata().ok()?;
+    let max_bytes_u64 = u64::try_from(max_bytes).ok()?;
+    if !before.file_type().is_file() || before.len() != expected_len || before.len() > max_bytes_u64
+    {
+        return None;
+    }
+
+    let capacity = usize::try_from(before.len())
+        .unwrap_or(max_bytes)
+        .min(max_bytes)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(capacity);
+    (&mut file)
+        .take(max_bytes_u64.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+
+    let after = file.metadata().ok()?;
+    if !after.file_type().is_file()
+        || after.len() != expected_len
+        || bytes.len() > max_bytes
+        || bytes.len() as u64 != after.len()
+    {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
 /// Airsonic / Subsonic media-server kind tag.
 pub const KIND_AIRSONIC: &str = "airsonic";
 /// Jellyfin media-server kind tag.
@@ -108,10 +187,10 @@ pub fn peer_overlay_ips(workgroup_root: &Path) -> Vec<(String, String)> {
             continue;
         };
         let bundle_path = entry.path().join("mackesd").join("nebula-bundle.json");
-        let Ok(bytes) = std::fs::read(&bundle_path) else {
+        let Some(body) = read_bounded_media_json(&bundle_path, MAX_NEBULA_BUNDLE_BYTES) else {
             continue;
         };
-        let Ok(bundle) = serde_json::from_slice::<BundleOverlayIp>(&bytes) else {
+        let Ok(bundle) = serde_json::from_str::<BundleOverlayIp>(&body) else {
             continue;
         };
         if !bundle.overlay_ip.is_empty() {
@@ -366,7 +445,7 @@ pub fn read_shared_account_from_plane(workgroup_root: &Path) -> Option<SharedAcc
     let mut fallback: Option<SharedAccount> = None;
     for ent in entries.flatten() {
         let path = ent.path().join(MEDIA_REGISTRY_FILE);
-        let Ok(body) = std::fs::read_to_string(&path) else {
+        let Some(body) = read_bounded_media_json(&path, MAX_MEDIA_REGISTRY_BYTES) else {
             continue;
         };
         let Ok(reg) = serde_json::from_str::<MediaRegistration>(&body) else {
@@ -434,6 +513,93 @@ mod tests {
                 ("peer-b".to_string(), "10.42.0.6".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn peer_overlay_ips_skips_hostile_bundle_inputs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let valid = tmp
+            .path()
+            .join("valid-peer")
+            .join("mackesd")
+            .join("nebula-bundle.json");
+        std::fs::create_dir_all(valid.parent().unwrap()).unwrap();
+        std::fs::write(&valid, br#"{"overlay_ip":"10.42.0.5"}"#).unwrap();
+
+        let invalid_utf8 = tmp
+            .path()
+            .join("invalid-utf8")
+            .join("mackesd")
+            .join("nebula-bundle.json");
+        std::fs::create_dir_all(invalid_utf8.parent().unwrap()).unwrap();
+        std::fs::write(&invalid_utf8, [0xff, 0xfe, 0xfd]).unwrap();
+
+        let oversized = tmp
+            .path()
+            .join("oversized")
+            .join("mackesd")
+            .join("nebula-bundle.json");
+        std::fs::create_dir_all(oversized.parent().unwrap()).unwrap();
+        std::fs::write(&oversized, vec![b'x'; MAX_NEBULA_BUNDLE_BYTES + 1]).unwrap();
+
+        let directory = tmp
+            .path()
+            .join("directory")
+            .join("mackesd")
+            .join("nebula-bundle.json");
+        std::fs::create_dir_all(directory.parent().unwrap()).unwrap();
+        std::fs::create_dir(&directory).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            use std::process::Command;
+
+            let linked = tmp
+                .path()
+                .join("symlink")
+                .join("mackesd")
+                .join("nebula-bundle.json");
+            std::fs::create_dir_all(linked.parent().unwrap()).unwrap();
+            symlink(&valid, &linked).unwrap();
+
+            let fifo = tmp
+                .path()
+                .join("fifo")
+                .join("mackesd")
+                .join("nebula-bundle.json");
+            std::fs::create_dir_all(fifo.parent().unwrap()).unwrap();
+            assert!(Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success());
+        }
+
+        assert_eq!(
+            peer_overlay_ips(tmp.path()),
+            vec![("valid-peer".to_string(), "10.42.0.5".to_string())]
+        );
+    }
+
+    #[test]
+    fn bounded_media_json_reader_rejects_growth() {
+        use std::io::Write as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("growth.json");
+        let body = br#"{"overlay_ip":"10.42.0.5"}"#;
+        std::fs::write(&path, body).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let expected_len = file.metadata().unwrap().len();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b" ")
+            .unwrap();
+
+        assert!(read_bounded_media_file(file, expected_len, MAX_NEBULA_BUNDLE_BYTES).is_none());
     }
 
     // ── MEDIA-7: the mesh service registration ──
@@ -640,5 +806,66 @@ ND_ADMIN_PASS='p@ss=word'\n";
         let acct = read_shared_account_from_plane(&tmp).expect("the down account is the fallback");
         let _ = std::fs::remove_dir_all(&tmp);
         assert_eq!(acct.username, "mesh-music");
+    }
+
+    #[test]
+    fn read_shared_account_from_plane_skips_hostile_registry_inputs() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_plane_doc(
+            tmp.path(),
+            "valid",
+            &registration_with_account(
+                "peer:valid",
+                NAVIDROME_PORT,
+                HEALTH_UP,
+                Some(SharedAccount::new("mesh-music", "p1")),
+            ),
+        );
+
+        let invalid_utf8 = tmp.path().join("invalid-utf8").join(MEDIA_REGISTRY_FILE);
+        std::fs::create_dir_all(invalid_utf8.parent().unwrap()).unwrap();
+        std::fs::write(&invalid_utf8, [0xff, 0xfe, 0xfd]).unwrap();
+
+        let oversized = tmp.path().join("oversized").join(MEDIA_REGISTRY_FILE);
+        std::fs::create_dir_all(oversized.parent().unwrap()).unwrap();
+        std::fs::write(&oversized, vec![b'x'; MAX_MEDIA_REGISTRY_BYTES + 1]).unwrap();
+
+        let directory = tmp.path().join("directory").join(MEDIA_REGISTRY_FILE);
+        std::fs::create_dir_all(directory.parent().unwrap()).unwrap();
+        std::fs::create_dir(&directory).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            use std::process::Command;
+
+            let outside = tmp.path().join("outside-registry.json");
+            std::fs::write(
+                &outside,
+                serde_json::to_string(&registration_with_account(
+                    "peer:outside",
+                    NAVIDROME_PORT,
+                    HEALTH_UP,
+                    Some(SharedAccount::new("outside", "p2")),
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+            let linked = tmp.path().join("symlink").join(MEDIA_REGISTRY_FILE);
+            std::fs::create_dir_all(linked.parent().unwrap()).unwrap();
+            symlink(&outside, &linked).unwrap();
+
+            let fifo = tmp.path().join("fifo").join(MEDIA_REGISTRY_FILE);
+            std::fs::create_dir_all(fifo.parent().unwrap()).unwrap();
+            assert!(Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success());
+        }
+
+        let account = read_shared_account_from_plane(tmp.path()).unwrap();
+        assert_eq!(account.username, "mesh-music");
+        assert_eq!(account.password, "p1");
     }
 }
