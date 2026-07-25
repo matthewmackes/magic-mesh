@@ -90,6 +90,10 @@ pub const ACTION_TOPIC: &str = "action/vdi/roaming";
 /// at (the bus read is a cheap local log scan).
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Persisted per-peer roaming layouts are compact JSON records. Keep
+/// peer-controlled bytes bounded before serde materializes the record.
+const MAX_LAYOUT_RECORD_BYTES: usize = 256 * 1024;
+
 // ───────────────────────────── monitor layout ─────────────────────────────
 
 /// A rectangle on the virtual desktop, in pixels — where a VM surface lands.
@@ -1056,6 +1060,81 @@ impl MeshLayoutStore {
     }
 }
 
+/// Read one persisted layout through the descriptor that will be consumed.
+/// Reject final symlinks, blocking special files, oversized input, growth while
+/// reading, and invalid UTF-8 before the JSON parser sees peer-controlled bytes.
+fn read_bounded_layout_record(path: &Path) -> std::io::Result<String> {
+    use std::io::{Error, ErrorKind, Read as _};
+
+    #[cfg(unix)]
+    let file: std::fs::File = {
+        use rustix::fs::{Mode, OFlags};
+
+        rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?
+        .into()
+    };
+    #[cfg(not(unix))]
+    let file = {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_file() {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "persisted layout is not a regular file",
+            ));
+        }
+        std::fs::File::open(path)?
+    };
+
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "persisted layout is not a regular file",
+        ));
+    }
+    if metadata.len() > MAX_LAYOUT_RECORD_BYTES as u64 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("persisted layout exceeds {MAX_LAYOUT_RECORD_BYTES}-byte limit"),
+        ));
+    }
+
+    let capacity = usize::try_from(metadata.len())
+        .unwrap_or(MAX_LAYOUT_RECORD_BYTES)
+        .min(MAX_LAYOUT_RECORD_BYTES)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(capacity);
+    (&file)
+        .take((MAX_LAYOUT_RECORD_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_LAYOUT_RECORD_BYTES {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("persisted layout exceeds {MAX_LAYOUT_RECORD_BYTES}-byte limit"),
+        ));
+    }
+
+    let final_len = file.metadata()?.len();
+    if final_len != bytes.len() as u64 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "persisted layout changed while reading",
+        ));
+    }
+
+    String::from_utf8(bytes).map_err(|_| {
+        Error::new(
+            ErrorKind::InvalidData,
+            "persisted layout is not valid UTF-8",
+        )
+    })
+}
+
 impl LayoutStore for MeshLayoutStore {
     fn publish(
         &self,
@@ -1114,7 +1193,7 @@ impl LayoutStore for MeshLayoutStore {
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            let raw = std::fs::read_to_string(&path).map_err(|e| SessionStoreError::Failed {
+            let raw = read_bounded_layout_record(&path).map_err(|e| SessionStoreError::Failed {
                 op: "list",
                 reason: format!("read {}: {e}", path.display()),
             })?;
@@ -2468,6 +2547,51 @@ mod tests {
         store.remove(&peer_b).expect("remove b");
         store.remove(&peer_b).expect("remove b again");
         assert_eq!(store.list().expect("list after remove").len(), 1);
+    }
+
+    #[test]
+    fn mesh_layout_store_rejects_oversized_invalid_utf8_and_special_records() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = MeshLayoutStore::new(tmp.path().to_path_buf());
+        std::fs::create_dir_all(store.dir()).expect("layout dir");
+        let path = store.dir().join("hostile.json");
+
+        std::fs::write(&path, vec![b'x'; MAX_LAYOUT_RECORD_BYTES + 1])
+            .expect("write oversized record");
+        let error = store.list().expect_err("oversized record must be refused");
+        assert!(error.to_string().contains("exceeds"));
+
+        std::fs::write(&path, [0xff, 0xfe]).expect("write invalid UTF-8 record");
+        let error = store.list().expect_err("invalid UTF-8 must be refused");
+        assert!(error.to_string().contains("valid UTF-8"));
+
+        std::fs::remove_file(&path).expect("remove invalid record");
+        std::fs::create_dir(&path).expect("create special record path");
+        let error = store.list().expect_err("special file must be refused");
+        assert!(error.to_string().contains("regular file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mesh_layout_store_rejects_final_symlink_records() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = MeshLayoutStore::new(tmp.path().to_path_buf());
+        std::fs::create_dir_all(store.dir()).expect("layout dir");
+        let target = tmp.path().join("target.json");
+        let path = store.dir().join("symlink.json");
+        std::fs::write(
+            &target,
+            br#"{"client_peer":"peer:target","layout":{"assignments":[]}}"#,
+        )
+        .expect("write target record");
+        symlink(&target, &path).expect("create final symlink");
+
+        assert!(
+            store.list().is_err(),
+            "a final symlink must never be consumed as a layout record"
+        );
     }
 
     #[test]

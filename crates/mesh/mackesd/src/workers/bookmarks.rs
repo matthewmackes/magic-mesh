@@ -58,7 +58,7 @@
 #![cfg(feature = "async-services")]
 
 use std::collections::HashMap;
-use std::io::Write as _;
+use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -124,6 +124,20 @@ pub const DEFAULT_PRUNE_EVERY: u32 = 20;
 /// Fold the tail into the snapshot once it grows past this many ops, so a burst
 /// of edits can't unbound the segment between periodic prunes (lock Q20).
 pub const DEFAULT_TAIL_THRESHOLD: usize = 256;
+
+/// Maximum bytes materialized from a replicated append-only segment. The tail
+/// is pruned at DEFAULT_TAIL_THRESHOLD ops, and the cap leaves room for the
+/// 64 KiB action-body contract plus serialized op metadata for every
+/// unpruned op without allowing a peer-controlled file to allocate forever.
+const MAX_BOOKMARK_SEGMENT_BYTES: usize = 32 * 1024 * 1024;
+
+/// Maximum bytes materialized from a folded bookmark collection snapshot. A
+/// snapshot can contain the full converged tree, so it gets its own generous
+/// record-sized ceiling rather than inheriting the smaller clock limit.
+const MAX_BOOKMARK_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
+
+/// The persisted HLC clock contains only a node id and two integers.
+const MAX_BOOKMARK_CLOCK_BYTES: usize = 64 * 1024;
 
 /// The `action/bookmarks/<verb>` slot used for daemon-owned dead-link checks.
 const CHECK_LINKS_VERB: &str = "check-links";
@@ -594,11 +608,78 @@ fn parse_segment(text: &str) -> Vec<Op> {
         .collect()
 }
 
+/// Read one persisted bookmark document from the descriptor that will be
+/// consumed. Replicated Syncthing material is peer-controlled: refuse a final
+/// symlink, a blocking special file, oversized input, invalid UTF-8, and a
+/// regular file whose size changes while it is being materialized. The
+/// descriptor-backed read keeps the no-follow check attached to the inode that
+/// reaches the JSON parser, while the caller decides the fail-soft fallback.
+fn read_bookmark_text(path: &Path, max_bytes: usize, label: &str) -> io::Result<String> {
+    #[cfg(unix)]
+    let file: std::fs::File = {
+        use rustix::fs::{Mode, OFlags};
+
+        rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?
+        .into()
+    };
+    #[cfg(not(unix))]
+    let file = {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{label} is a final symlink"),
+            ));
+        }
+        std::fs::File::open(path)?
+    };
+
+    let initial_len = file.metadata()?.len();
+    let max_bytes_u64 = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+    if initial_len > max_bytes_u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{label} exceeds its {max_bytes}-byte limit"),
+        ));
+    }
+    if !file.metadata()?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{label} is not a regular file"),
+        ));
+    }
+
+    let capacity = usize::try_from(initial_len)
+        .unwrap_or(max_bytes)
+        .min(max_bytes)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(capacity);
+    let mut limited = file.take(max_bytes_u64.saturating_add(1));
+    limited.read_to_end(&mut bytes)?;
+    let file = limited.into_inner();
+    let final_len = file.metadata()?.len();
+    if bytes.len() > max_bytes
+        || u64::try_from(bytes.len()).unwrap_or(u64::MAX) != initial_len
+        || final_len != initial_len
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{label} changed or exceeds its {max_bytes}-byte limit"),
+        ));
+    }
+
+    String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
 /// Load a node's folded snapshot [`Collection`], or an empty one when absent /
 /// corrupt.
 #[must_use]
 fn load_snapshot(path: &Path) -> Collection {
-    std::fs::read_to_string(path)
+    read_bookmark_text(path, MAX_BOOKMARK_SNAPSHOT_BYTES, "bookmark snapshot")
         .ok()
         .and_then(|s| serde_json::from_str::<Collection>(&s).ok())
         .unwrap_or_default()
@@ -607,7 +688,7 @@ fn load_snapshot(path: &Path) -> Collection {
 /// Load a persisted [`HlcClock`], if present + parseable.
 #[must_use]
 fn load_clock(path: &Path) -> Option<HlcClock> {
-    let s = std::fs::read_to_string(path).ok()?;
+    let s = read_bookmark_text(path, MAX_BOOKMARK_CLOCK_BYTES, "bookmark clock").ok()?;
     serde_json::from_str(&s).ok()
 }
 
@@ -617,7 +698,13 @@ fn load_clock(path: &Path) -> Option<HlcClock> {
 #[must_use]
 fn read_node_state(dir: &Path) -> (Collection, Option<Hlc>) {
     let mut coll = load_snapshot(&dir.join(SNAPSHOT_FILE));
-    let ops = parse_segment(&std::fs::read_to_string(dir.join(SEGMENT_FILE)).unwrap_or_default());
+    let ops = read_bookmark_text(
+        &dir.join(SEGMENT_FILE),
+        MAX_BOOKMARK_SEGMENT_BYTES,
+        "bookmark segment",
+    )
+    .map(|text| parse_segment(&text))
+    .unwrap_or_default();
     let max_hlc = ops.iter().map(|o| o.hlc.clone()).max();
     coll.apply_all(&ops);
     (coll, max_hlc)
@@ -905,8 +992,12 @@ impl BookmarksWorker {
     fn load(&mut self) {
         self.own_snapshot = load_snapshot(&snapshot_path(&self.local_root, &self.node));
         self.own_tail = parse_segment(
-            &std::fs::read_to_string(segment_path(&self.local_root, &self.node))
-                .unwrap_or_default(),
+            &read_bookmark_text(
+                &segment_path(&self.local_root, &self.node),
+                MAX_BOOKMARK_SEGMENT_BYTES,
+                "bookmark segment",
+            )
+            .unwrap_or_default(),
         );
         // A persisted clock already dominates every op it ever minted; on a fresh
         // store, seed from the tail's max stamp so the first new op still sorts
@@ -1935,6 +2026,94 @@ mod tests {
         let poisoned = format!("{{ not json\n{text}");
         let ops = parse_segment(&poisoned);
         assert_eq!(ops.len(), 2);
+    }
+
+    #[test]
+    fn persisted_bookmark_materialization_rejects_hostile_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = tmp.path().join("node");
+        std::fs::create_dir_all(&node).unwrap();
+
+        let snapshot = node.join(SNAPSHOT_FILE);
+        std::fs::write(
+            &snapshot,
+            vec![b'x'; MAX_BOOKMARK_SNAPSHOT_BYTES.saturating_add(1)],
+        )
+        .unwrap();
+        assert_eq!(
+            load_snapshot(&snapshot),
+            Collection::default(),
+            "oversized snapshots restore an empty collection"
+        );
+
+        let clock = node.join(CLOCK_FILE);
+        std::fs::write(&clock, [0xff, 0xfe]).unwrap();
+        assert!(
+            load_clock(&clock).is_none(),
+            "invalid UTF-8 clocks fail soft before JSON parsing"
+        );
+
+        let segment = node.join(SEGMENT_FILE);
+        std::fs::write(
+            &segment,
+            vec![b'x'; MAX_BOOKMARK_SEGMENT_BYTES.saturating_add(1)],
+        )
+        .unwrap();
+        let (collection, max_hlc) = read_node_state(&node);
+        assert_eq!(
+            collection,
+            Collection::default(),
+            "oversized segments are ignored"
+        );
+        assert!(max_hlc.is_none());
+
+        std::fs::write(&segment, [0xff, 0xfe]).unwrap();
+        let (collection, max_hlc) = read_node_state(&node);
+        assert_eq!(
+            collection,
+            Collection::default(),
+            "invalid UTF-8 segments are ignored atomically"
+        );
+        assert!(max_hlc.is_none());
+
+        std::fs::remove_file(&segment).unwrap();
+        std::fs::create_dir(&segment).unwrap();
+        assert!(
+            read_bookmark_text(&segment, MAX_BOOKMARK_SEGMENT_BYTES, "bookmark segment").is_err(),
+            "non-regular bookmark material is rejected before reading"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_bookmark_materialization_rejects_final_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let node = tmp.path().join("node");
+        std::fs::create_dir_all(&node).unwrap();
+
+        let target = tmp.path().join("outside.json");
+        std::fs::write(
+            &target,
+            serde_json::to_string(&Collection::default()).unwrap(),
+        )
+        .unwrap();
+        let snapshot = node.join(SNAPSHOT_FILE);
+        symlink(&target, &snapshot).unwrap();
+        assert_eq!(
+            load_snapshot(&snapshot),
+            Collection::default(),
+            "snapshot loading must not follow a final symlink"
+        );
+
+        let segment_target = tmp.path().join("outside.jsonl");
+        std::fs::write(&segment_target, "").unwrap();
+        let segment = node.join(SEGMENT_FILE);
+        symlink(&segment_target, &segment).unwrap();
+        let (collection, max_hlc) = read_node_state(&node);
+        assert_eq!(collection, Collection::default());
+        assert!(max_hlc.is_none());
     }
 
     // ── offline-first: edits apply with no share / no flush ─────────────────

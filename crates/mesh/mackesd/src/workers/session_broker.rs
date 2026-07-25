@@ -65,6 +65,12 @@ pub const ACTION_TOPIC: &str = "action/vdi/session";
 /// cadence `scheduler` drains at).
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
+/// A persisted VDI session is a compact replicated control record: it contains
+/// only peer, VM, and session identifiers, one lifecycle enum, and timestamps.
+/// It has no payload/blob fields, so 256 KiB leaves ample room for legacy
+/// identifiers while bounding hostile materialization before JSON parsing.
+const MAX_SESSION_RECORD_BYTES: usize = 256 * 1024;
+
 /// A VDI session identity — an opaque id minted by the requesting shell (a ULID in
 /// production), the key of the roster and the mesh-state record.
 pub type SessionId = String;
@@ -427,6 +433,102 @@ pub trait SessionStore {
     fn remove(&self, id: &str) -> Result<(), SessionStoreError>;
 }
 
+/// Read one Syncthing-replicated session record through the descriptor that will
+/// actually be consumed. Reject final symlinks, blocking special files,
+/// oversized input, growth/shrinkage while reading, and invalid UTF-8 before
+/// `serde_json` materializes a [`VdiSession`].
+fn read_bounded_session_record(path: &Path) -> std::io::Result<String> {
+    #[cfg(unix)]
+    let file: std::fs::File = {
+        use rustix::fs::{Mode, OFlags};
+
+        rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?
+        .into()
+    };
+    #[cfg(not(unix))]
+    let file = {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "session record must be a regular non-symlink file",
+            ));
+        }
+        std::fs::File::open(path)?
+    };
+
+    let expected_len = file.metadata()?.len();
+    read_bounded_session_file(file, path, expected_len)
+}
+
+/// Consume an already-open session record and verify that the inode remains the
+/// same-sized regular file that was observed before reading. The explicit
+/// `expected_len` seam also lets hostile-input tests cover a growth race without
+/// making the production path depend on timing.
+fn read_bounded_session_file(
+    mut file: std::fs::File,
+    path: &Path,
+    expected_len: u64,
+) -> std::io::Result<String> {
+    use std::io::Read as _;
+
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("session record {} is not a regular file", path.display()),
+        ));
+    }
+    if metadata.len() != expected_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("session record {} changed before reading", path.display()),
+        ));
+    }
+    if metadata.len() > MAX_SESSION_RECORD_BYTES as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "session record {} exceeds {MAX_SESSION_RECORD_BYTES}-byte limit",
+                path.display()
+            ),
+        ));
+    }
+
+    let capacity = usize::try_from(metadata.len())
+        .unwrap_or(MAX_SESSION_RECORD_BYTES)
+        .min(MAX_SESSION_RECORD_BYTES)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(capacity);
+    (&mut file)
+        .take((MAX_SESSION_RECORD_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_SESSION_RECORD_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "session record {} exceeds {MAX_SESSION_RECORD_BYTES}-byte limit",
+                path.display()
+            ),
+        ));
+    }
+
+    let final_len = file.metadata()?.len();
+    if final_len != expected_len || bytes.len() as u64 != final_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("session record {} changed while reading", path.display()),
+        ));
+    }
+
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
 /// Production [`SessionStore`]: the roaming-session plane.
 ///
 /// The authoritative cross-peer session directory under the mesh workgroup root.
@@ -512,10 +614,11 @@ impl SessionStore for MeshSessionStore {
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            let raw = std::fs::read_to_string(&path).map_err(|e| SessionStoreError::Failed {
-                op: "list",
-                reason: format!("read {}: {e}", path.display()),
-            })?;
+            let raw =
+                read_bounded_session_record(&path).map_err(|e| SessionStoreError::Failed {
+                    op: "list",
+                    reason: format!("read {}: {e}", path.display()),
+                })?;
             let row: VdiSession =
                 serde_json::from_str(&raw).map_err(|e| SessionStoreError::Failed {
                     op: "list",
@@ -1494,6 +1597,65 @@ mod tests {
         let rows = store.list().expect("list after remove");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, "s2/slash");
+    }
+
+    #[test]
+    fn session_store_reader_rejects_hostile_persisted_material() {
+        use std::io::Write as _;
+
+        let tmp = tempfile::tempdir().expect("temp session records");
+        let valid = tmp.path().join("valid.json");
+        let valid_body = serde_json::to_vec(&sess("valid", SessionState::Active))
+            .expect("serialize valid session");
+        std::fs::write(&valid, &valid_body).expect("write valid session");
+        assert!(read_bounded_session_record(&valid).is_ok());
+
+        let invalid_utf8 = tmp.path().join("invalid-utf8.json");
+        std::fs::write(&invalid_utf8, [b'{', 0xff, b'}']).expect("write invalid UTF-8");
+        assert_eq!(
+            read_bounded_session_record(&invalid_utf8)
+                .expect_err("invalid UTF-8 must be rejected")
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+
+        let oversized = tmp.path().join("oversized.json");
+        std::fs::write(&oversized, vec![b'x'; MAX_SESSION_RECORD_BYTES + 1])
+            .expect("write oversized session");
+        assert_eq!(
+            read_bounded_session_record(&oversized)
+                .expect_err("oversized records must be rejected")
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+
+        let directory = tmp.path().join("directory.json");
+        std::fs::create_dir(&directory).expect("create special-file substitute");
+        assert!(read_bounded_session_record(&directory).is_err());
+
+        let growth = tmp.path().join("growth.json");
+        std::fs::write(&growth, &valid_body).expect("write growth fixture");
+        let file = std::fs::File::open(&growth).expect("open growth fixture");
+        let expected_len = file.metadata().expect("stat growth fixture").len();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&growth)
+            .expect("reopen growth fixture")
+            .write_all(b"x")
+            .expect("grow fixture");
+        assert_eq!(
+            read_bounded_session_file(file, &growth, expected_len)
+                .expect_err("growth between stat and read must be rejected")
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&valid, tmp.path().join("linked.json"))
+                .expect("create final symlink");
+            assert!(read_bounded_session_record(&tmp.path().join("linked.json")).is_err());
+        }
     }
 
     #[test]

@@ -50,7 +50,7 @@
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 // arch-11: prod now opens via the BusReader seam; only the tests still name
@@ -86,6 +86,74 @@ const SELF_TEST_TOPIC: &str = "event/onboard/self-test";
 /// within this window. Matches This Node / Network; the snapshot read is a cheap
 /// local file scan and the Bus drain an incremental spool read, so it stays tight.
 const REFRESH: Duration = Duration::from_secs(5);
+
+/// Keep the world-readable mesh snapshot bounded before `serde_json` walks its
+/// peer directory and service maps. The writer is local, but the desktop tier
+/// treats this filesystem boundary as hostile and fails soft.
+const MAX_SNAPSHOT_BYTES: usize = 64 * 1024;
+
+/// Read one mesh-status snapshot through the descriptor that is consumed.
+/// Reject the final symlink, special descriptors, oversized input, and files
+/// whose size changes while they are being read before JSON materialization.
+fn read_bounded_snapshot(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        options.custom_flags(0o400000 | 0o4000); // O_NOFOLLOW | O_NONBLOCK
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        options.custom_flags(0x100 | 0x4); // O_NOFOLLOW | O_NONBLOCK
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        if !std::fs::symlink_metadata(path)
+            .map(|metadata| metadata.file_type().is_file())
+            .unwrap_or(false)
+        {
+            return None;
+        }
+    }
+    #[cfg(not(unix))]
+    if !std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_file())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+
+    let file = options.open(path).ok()?;
+    let before = file.metadata().ok()?;
+    if !before.file_type().is_file() || before.len() > MAX_SNAPSHOT_BYTES as u64 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(before.len())
+            .unwrap_or(MAX_SNAPSHOT_BYTES)
+            .saturating_add(1),
+    );
+    (&file)
+        .take((MAX_SNAPSHOT_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > MAX_SNAPSHOT_BYTES {
+        return None;
+    }
+    let after = file.metadata().ok()?;
+    if !after.file_type().is_file()
+        || after.len() != before.len()
+        || after.len() != u64::try_from(bytes.len()).ok()?
+    {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
 
 // ─────────────────────────── the snapshot → MeshState fold ───────────────────────────
 
@@ -288,7 +356,7 @@ impl MeshViewState {
         let due = self.last_poll.is_none_or(|t| t.elapsed() >= REFRESH);
         if due {
             self.last_poll = Some(Instant::now());
-            let snapshot = std::fs::read_to_string(&self.snapshot_path).unwrap_or_default();
+            let snapshot = read_bounded_snapshot(&self.snapshot_path).unwrap_or_default();
             self.state = project(&snapshot);
             // Same cadence: drain the editor share-session lanes so the co-edit
             // badges track session join/leave/idle within the window.
@@ -834,6 +902,49 @@ mod tests {
             assert!(state.nodes.is_empty(), "{bad:?} must yield no nodes");
             assert!(renders(&state), "{bad:?} EmptyState produced no primitives");
         }
+    }
+
+    #[test]
+    fn bounded_snapshot_reader_rejects_hostile_files_before_projection() {
+        let dir = tempfile::tempdir().expect("snapshot tempdir");
+        let valid = dir.path().join("valid.json");
+        std::fs::write(&valid, snapshot()).expect("write valid snapshot");
+        assert!(read_bounded_snapshot(&valid).is_some());
+
+        let invalid_utf8 = dir.path().join("invalid.json");
+        std::fs::write(&invalid_utf8, [0xff, 0xfe]).expect("write invalid snapshot");
+        assert!(read_bounded_snapshot(&invalid_utf8).is_none());
+
+        let oversized = dir.path().join("oversized.json");
+        std::fs::write(&oversized, vec![b'{'; MAX_SNAPSHOT_BYTES + 1])
+            .expect("write oversized snapshot");
+        assert!(read_bounded_snapshot(&oversized).is_none());
+
+        let special = dir.path().join("special.json");
+        #[cfg(unix)]
+        {
+            use std::os::unix::net::UnixListener;
+            let _socket = UnixListener::bind(&special).expect("create socket");
+            assert!(read_bounded_snapshot(&special).is_none());
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::create_dir(&special).expect("create special fixture");
+            assert!(read_bounded_snapshot(&special).is_none());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_snapshot_reader_rejects_final_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("snapshot tempdir");
+        let target = dir.path().join("outside.json");
+        let link = dir.path().join("mesh-status.json");
+        std::fs::write(&target, snapshot()).expect("write target snapshot");
+        symlink(&target, &link).expect("create final symlink");
+        assert!(read_bounded_snapshot(&link).is_none());
     }
 
     #[test]

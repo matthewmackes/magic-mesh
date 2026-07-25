@@ -562,6 +562,12 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-ARCH-007 - Repair Workloads cockpit E2E wire, placement, and authorization
 
 - Status: Remaining
+- Progress (2026-07-25 VDI session persistence boundary): replicated VDI
+  session records and roaming monitor layouts now use bounded no-follow
+  regular-file reads with UTF-8, special-file, symlink, and growth rejection
+  before JSON materialization. The integrated session-broker farm gate is green
+  at **30/30** and the focused roaming-layout gate at **51/51**. Live
+  libvirt/Podman evidence remains external.
 - Progress (2026-07-25 subprocess capture boundary): timeout-bounded command
   execution now drains stdout/stderr concurrently, retains at most 64 KiB per
   stream, drains excess, and still kills/reaps timed-out children. The
@@ -857,6 +863,11 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-011 - Communications collaboration suite full replacement
 
 - Status: Remaining
+- Progress (2026-07-25 bookmark persistence boundary): replicated bookmark
+  snapshots, HLC clocks, and append-only segments now use bounded no-follow
+  regular-file reads with UTF-8, special-file, symlink, and growth rejection
+  before replay or JSON materialization. The integrated bookmark farm gate is
+  green at **17/17**. Live peer/media/LLM evidence remains external.
 - Progress (2026-07-25 platform passkey persistence boundary): credential
   records, sealed private material, local seal keys, and hardware descriptors
   now use bounded no-follow regular-file reads with hostile-input rejection.
@@ -1704,6 +1715,12 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-006 - Construct interface (Apple-HIG-principled workstation shell)
 
 - Status: Remaining
+- Progress (2026-07-25 Mesh Map/This Node snapshot boundary): both shell panels
+  now read the shared mesh-status snapshot through bounded no-follow
+  descriptor-backed regular-file readers that reject special files, symlinks,
+  oversized/changing input, and invalid UTF-8 before projection. The integrated
+  shell hostile-input farm gate is green at **6/6**. Live pointer, pixel,
+  physical, and VDI acceptance remain external evidence.
 - Progress (2026-07-25 Explorer preference boundary): persisted Explorer
   view preferences now use a bounded no-follow regular-file read that rejects
   special files, symlinks, oversized/changing input, and invalid UTF-8 before
