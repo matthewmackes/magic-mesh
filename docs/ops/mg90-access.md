@@ -11,7 +11,7 @@ Protocol reference: [AirLink MG90 Software Configuration Guide, Rev 6](https://w
 | Root SSH | `172.20.0.25:2222` | `ssh-probe`, `ssh-exec` | OS identity, raw NMEA, committed config, explicitly armed control |
 | MG-LCI | `http://172.20.0.25/` | `lci-get` | General board/ignition and WAN status |
 | MG90 apps | `http://172.20.0.25:11532/` | `app-get` | GPS, OBD-II, heavy telemetry, GPIO, and Acetech status pages |
-| Status broadcast | Configured UDP port | `status-listen PORT` | Documented JSON beacon: GNSS, WAN, VPN, GPIO, ignition, battery, temperature |
+| Status broadcast | MG90-configured UDP port | `status-listen PORT` | Documented JSON beacon: GNSS, WAN, VPN, GPIO, ignition, battery, temperature |
 | GPS forwarding | TCP `9345` / UDP `5067` by default | `gps-tcp-connect`, `gps-udp-listen` | NMEA/TAIP streams; MG90 can also forward to configured remote servers |
 | Reachability | ports 80/11532/2222 | `inventory` | Read-only transport inventory |
 
@@ -76,6 +76,22 @@ fixed or threshold-driven intervals, local TCP/UDP, serial forwarding, and remot
 server lists. The adapter's listeners only receive data; enabling or changing
 these streams is an explicit LCI configuration action and is not performed here.
 
+For the daemon-side vehicle mirror, set `MDE_VEHICLE_STATUS_PORT` to the same
+local UDP port selected on the MG90's `Status > Broadcast` page. The worker binds
+that local receiver at startup and uses the beacon as a typed GNSS/power fallback
+plane. An unset variable means the beacon plane is disabled. A non-numeric,
+zero, out-of-range, or already-bound local port is retained as a configuration
+error and is carried in the `gaps` field of the `state/vehicle/<node>` snapshot;
+it is no longer silently treated as an absent beacon. This is receiver diagnostics
+only—the worker does not alter the MG90 configuration. `status-listen PORT` performs
+the equivalent bounded
+receive-only check for an operator shell session and prints raw datagrams.
+
+The Rev. 6 guide does not define a Wi-Fi, cellular, or Bluetooth scanner-contact
+protocol or endpoint. The Airspace worker therefore remains `NO SCANNER FEED`
+until a real scanner adapter is supplied; this access helper and the vehicle
+Status Broadcast path must not be used to manufacture contacts.
+
 ## Failure interpretation
 
 - Port `2222` reachable plus `Permission denied` means the current root credential
@@ -84,13 +100,14 @@ these streams is an explicit LCI configuration action and is not performed here.
   changed. Stop and rotate the pin intentionally.
 - LCI success does not imply root access. LCI and the application server have
   independent sessions and permissions.
-- The current `mackesd` vehicle worker consumes LCI general/WAN and raw SSH NMEA;
-  the application pages and documented stream receivers are now exposed through
-  the adapter for the next parser cutover. The documented UDP JSON beacon should
-  become the primary telemetry source, with LCI as the authenticated fallback and
-  SSH as a narrow maintenance/configuration path. Until beacon, OBD, and
-  application parsers are wired into `VehicleState`, those fields must remain
-  honest gaps rather than fabricated telemetry.
+- The current `mackesd` vehicle worker consumes LCI general/WAN and raw SSH NMEA,
+  and uses the documented UDP JSON beacon when `MDE_VEHICLE_STATUS_PORT` is
+  configured and the local receiver is ready. The beacon is primary for the
+  documented GNSS/power fields, with LCI/NMEA as authenticated or local
+  fallbacks. Until OBD and application parsers are wired into `VehicleState`,
+  those fields remain honest gaps rather than fabricated telemetry. Receiver
+  configuration failures are also honest gaps, not a reason to claim beacon
+  telemetry.
 
 The guide also describes AMM management/deployment and a dedicated management
 tunnel. Those are separate Sierra Wireless control-plane products/configurations;

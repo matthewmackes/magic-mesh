@@ -216,10 +216,12 @@ pub trait CloudRunner: Send + Sync {
     /// backend can't be reached (an honest gate, never a fabricated empty roster).
     fn list_instances(&self) -> Result<Vec<CloudInstance>, String>;
 
-    /// Provision via OpenTofu. This seam always performs `tofu apply`; the caller
-    /// must consume mutation authority before invoking it. Preview uses the
-    /// separate read-only [`CloudRunner::plan_json`] seam.
-    fn provision(&self) -> CloudRunOutcome;
+    /// Provision via OpenTofu using the caller's freshly rendered desired slice.
+    /// This seam writes that document as `terraform.tfvars.json` and always
+    /// performs `tofu apply`; the caller must consume mutation authority before
+    /// invoking it. Preview uses the separate read-only
+    /// [`CloudRunner::plan_json`] seam.
+    fn provision(&self, tfvars_json: &str) -> CloudRunOutcome;
 
     /// Configure via Ansible. This seam always performs the playbook; the caller
     /// must consume mutation authority before invoking it.
@@ -440,7 +442,14 @@ impl CloudRunner for ShellCloudRunner {
         Ok(instances)
     }
 
-    fn provision(&self) -> CloudRunOutcome {
+    fn provision(&self, tfvars_json: &str) -> CloudRunOutcome {
+        let tfvars_path = self.tofu_dir.join("terraform.tfvars.json");
+        if let Err(error) = std::fs::write(&tfvars_path, tfvars_json) {
+            return CloudRunOutcome::failed(format!(
+                "tofu apply unavailable: write {}: {error}",
+                tfvars_path.display()
+            ));
+        }
         let chdir = self.tofu_chdir();
         let args = [
             &*chdir,
@@ -604,6 +613,9 @@ pub(crate) mod fake {
         pub plan_err: Option<String>,
         /// The tfvars documents `plan_json` was handed — proves the renderer ran.
         pub tfvars_written: Mutex<Vec<String>>,
+        /// The tfvars documents the authorized live provision was handed — proves
+        /// apply consumed the current desired slice rather than stale plan state.
+        pub provision_tfvars: Mutex<Vec<String>>,
         /// `run_tool` invocations recorded as `(bin, args)` — proves the image-build
         /// / container-deploy pipelines drove the right tools.
         pub tool_calls: Mutex<Vec<(String, Vec<String>)>>,
@@ -659,7 +671,11 @@ pub(crate) mod fake {
                 None => Ok(self.roster.clone()),
             }
         }
-        fn provision(&self) -> CloudRunOutcome {
+        fn provision(&self, tfvars_json: &str) -> CloudRunOutcome {
+            self.provision_tfvars
+                .lock()
+                .unwrap()
+                .push(tfvars_json.to_string());
             self.record("provision", true);
             CloudRunOutcome::ok("2 to add, 0 to change", true)
         }

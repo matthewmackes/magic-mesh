@@ -500,7 +500,7 @@ pub enum ConfigRole {
 /// it creates a generation directory: otherwise `create_dir_all` could first
 /// follow an attacker-controlled `config` or `identity` link.
 fn ensure_directory_tree(path: &Path, mode: u32, label: &str) -> Result<(), String> {
-    use std::os::unix::fs::DirBuilderExt;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     use std::path::Component;
 
     if path.as_os_str().is_empty() {
@@ -529,7 +529,23 @@ fn ensure_directory_tree(path: &Path, mode: u32, label: &str) -> Result<(), Stri
                     current.display()
                 ));
             }
-            Ok(_) => {}
+            Ok(metadata) => {
+                // The identity root contains the requester private key. A
+                // pre-existing root must be held to the same owner/mode
+                // contract as one created by this process; otherwise a
+                // group/world-writable directory can alter the next staged
+                // generation before the atomic identity switch.
+                if mode == 0o700
+                    && current == path
+                    && (metadata.uid() != rustix::process::getuid().as_raw()
+                        || metadata.permissions().mode() & 0o777 != 0o700)
+                {
+                    return Err(format!(
+                        "unsafe {label} directory component {}: owner/mode must be current uid and 0700",
+                        current.display()
+                    ));
+                }
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let mut builder = std::fs::DirBuilder::new();
                 builder.mode(mode);
@@ -542,6 +558,16 @@ fn ensure_directory_tree(path: &Path, mode: u32, label: &str) -> Result<(), Stri
                 if metadata.file_type().is_symlink() || !metadata.is_dir() {
                     return Err(format!(
                         "created {label} path component is not a directory: {}",
+                        current.display()
+                    ));
+                }
+                if mode == 0o700
+                    && current == path
+                    && (metadata.uid() != rustix::process::getuid().as_raw()
+                        || metadata.permissions().mode() & 0o777 != 0o700)
+                {
+                    return Err(format!(
+                        "unsafe {label} directory component {}: owner/mode must be current uid and 0700",
                         current.display()
                     ));
                 }
@@ -1425,6 +1451,35 @@ mod tests {
             !config_dir.join("host.key").exists(),
             "no compatibility key may be published after identity validation fails"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_rejects_an_unsafe_existing_identity_root_before_secret_write() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let config_dir = tmp.path().join("nebula");
+        let identity_dir = config_dir.join("identity");
+        std::fs::create_dir_all(&identity_dir).expect("identity directory");
+        std::fs::set_permissions(&identity_dir, std::fs::Permissions::from_mode(0o777))
+            .expect("weaken identity root");
+
+        let error = materialize_config(
+            &config_dir,
+            &sample_bundle(),
+            ConfigRole::Peer,
+            &[],
+            tmp.path(),
+            Some(b"must-not-write"),
+        )
+        .expect_err("an unsafe existing identity root must fail closed");
+        assert!(error.contains("unsafe Nebula identity directory"));
+        assert!(!config_dir.join("ca.crt").exists());
+        assert!(std::fs::read_dir(&identity_dir)
+            .expect("identity directory")
+            .next()
+            .is_none());
     }
 
     #[test]

@@ -833,6 +833,58 @@ mod tests {
     }
 
     #[test]
+    fn android_desired_state_is_rendered_into_the_live_provision_input() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runner = Arc::new(FakeRunner::default());
+        let w = CloudWorker::new("me".into(), "peer:me".into(), tmp.path().to_path_buf())
+            .with_runner(runner.clone())
+            .with_signer(Arc::new(signer()))
+            .with_bus_root(None);
+
+        let android_base = r#"{"schema_version":1,"node":"me","name":"phone"}"#;
+        let android_token = valid_token("android-provision", "me", "phone", android_base);
+        let android_body = format!(
+            r#"{{"schema_version":1,"node":"me","name":"phone","armed_token":"{android_token}"}}"#
+        );
+        let prepared = w.handle("android-provision", &android_body);
+        assert!(
+            prepared.ok,
+            "gated: {:?} error: {:?}",
+            prepared.gated,
+            prepared.error
+        );
+        assert_eq!(
+            reconcile::read_desired_slice(tmp.path(), "me")[0].delivery_type,
+            mackes_mesh_types::cloud::DeliveryType::AndroidVm
+        );
+
+        let provision_base = r#"{"schema_version":1,"node":"me"}"#;
+        let provision_token = valid_token(
+            "provision",
+            "me",
+            mackes_mesh_types::cloud::CLOUD_ARM_NODE_SCOPE,
+            provision_base,
+        );
+        let provision_body =
+            format!(r#"{{"schema_version":1,"node":"me","armed_token":"{provision_token}"}}"#);
+        let applied = w.handle("provision", &provision_body);
+        assert!(
+            applied.ok,
+            "gated: {:?} error: {:?}",
+            applied.gated,
+            applied.error
+        );
+
+        let rendered = runner.provision_tfvars.lock().unwrap();
+        assert_eq!(rendered.len(), 1);
+        let tfvars: serde_json::Value = serde_json::from_str(&rendered[0]).unwrap();
+        assert_eq!(tfvars["vms"]["phone"]["delivery_type"], "android_vm");
+        assert_eq!(tfvars["vms"]["phone"]["vcpu"], 4);
+        assert_eq!(tfvars["vms"]["phone"]["memory_mb"], 8192);
+        assert_eq!(tfvars["vms"]["phone"]["disk_gb"], 80);
+    }
+
+    #[test]
     fn an_armed_token_is_single_use_even_across_worker_restart() {
         let tmp = tempfile::tempdir().unwrap();
         let base = r#"{"schema_version":1,"node":"me"}"#;

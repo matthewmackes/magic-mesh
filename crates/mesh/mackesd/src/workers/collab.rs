@@ -484,6 +484,15 @@ impl CollabWorker {
                         continue;
                     }
                 };
+                if cmd.verb() != *verb {
+                    tracing::warn!(
+                        target: "mackesd::collab",
+                        topic_verb = *verb,
+                        command_verb = cmd.verb(),
+                        "refused action/collab command routed on the wrong verb lane",
+                    );
+                    continue;
+                }
                 let events = match state.engine.apply(&cmd, &signer, &mut state.ids, now_ms) {
                     Ok(evs) => evs,
                     Err(e) => {
@@ -1252,7 +1261,12 @@ mod tests {
         Persist::open(root.join("bus")).expect("open persist")
     }
 
-    fn authorized_command_body(w: &CollabWorker, cmd: &CollabCommand, nonce: &str) -> String {
+    fn authorized_command_body_for_topic(
+        w: &CollabWorker,
+        topic_verb: &str,
+        cmd: &CollabCommand,
+        nonce: &str,
+    ) -> String {
         let mut unsigned = serde_json::to_value(cmd).expect("serialize command");
         unsigned["schema_version"] = serde_json::Value::from(1_u64);
         let unsigned = serde_json::to_string(&unsigned).expect("serialize command envelope");
@@ -1262,11 +1276,15 @@ mod tests {
             MutationContext {
                 verb: COLLAB_AUTH_VERB,
                 node: w.self_actor.as_str(),
-                target: cmd.verb(),
+                target: topic_verb,
             },
             nonce,
             AUTH_NOW + 30_000,
         )
+    }
+
+    fn authorized_command_body(w: &CollabWorker, cmd: &CollabCommand, nonce: &str) -> String {
+        authorized_command_body_for_topic(w, cmd.verb(), cmd, nonce)
     }
 
     fn write_command(w: &CollabWorker, persist: &Persist, cmd: &CollabCommand) {
@@ -1439,6 +1457,54 @@ mod tests {
             state.engine.state().spaces.len(),
             1,
             "a collab capability is single-use"
+        );
+    }
+
+    #[test]
+    fn collab_command_capability_is_bound_to_its_command_lane() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let w = worker(dir.path(), "eagle");
+        let persist = persist_at(dir.path());
+        let mut state = CollabState::new(w.self_actor.clone()).expect("state");
+
+        // Seed every command cursor, then create a space through its matching
+        // lane so the owner-gated delete below would be effective if it escaped
+        // the routing check.
+        w.tick_once(&persist, &mut state, 100);
+        let create = CollabCommand::CreateSpace {
+            kind: SpaceKind::Team,
+            name: "lane-bound".into(),
+        };
+        write_command(&w, &persist, &create);
+        w.tick_once(&persist, &mut state, 200);
+        let space = only_space(&state);
+        let event_count = state.engine.all_events().len();
+
+        // The body is a valid, owner-authorized DeleteSpace command, but its
+        // capability is bound to the create_space lane. Before the lane/verb
+        // binding, the worker would apply this destructive command here.
+        let delete = CollabCommand::DeleteSpace { space };
+        let mismatched = authorized_command_body_for_topic(
+            &w,
+            "create_space",
+            &delete,
+            "collab-lane-mismatch-000000000000000000000001",
+        );
+        write_raw(
+            &persist,
+            &topics::command_topic("create_space"),
+            &mismatched,
+        );
+        w.tick_once(&persist, &mut state, 300);
+
+        assert!(
+            state.engine.state().space(space).is_some(),
+            "a capability for create_space must not authorize DeleteSpace"
+        );
+        assert_eq!(
+            state.engine.all_events().len(),
+            event_count,
+            "a cross-lane command must not mint any event"
         );
     }
 

@@ -354,7 +354,24 @@ pub(crate) fn dispatch(w: &CloudWorker, verb_name: &str, body_str: &str) -> Clou
             {
                 return reply;
             }
-            let outcome = w.runner.provision();
+            let tfvars = match super::reconcile::rendered_tfvars_for_node(
+                &w.state_root,
+                body.node.trim(),
+                &super::runner::default_libvirt_uri(),
+            ) {
+                Ok(tfvars) => tfvars,
+                Err(error) => {
+                    return CloudReply {
+                        ok: false,
+                        verb: verb_name.to_string(),
+                        error: Some(format!(
+                            "provision desired state could not be rendered: {error}"
+                        )),
+                        ..Default::default()
+                    }
+                }
+            };
+            let outcome = w.runner.provision(&tfvars);
             finish_authorized_mutation(w, verb, verb_name, &outcome, None)
         }
         CloudVerb::Configure => {

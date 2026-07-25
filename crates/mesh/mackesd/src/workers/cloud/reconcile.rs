@@ -9,9 +9,12 @@
 //!   the `/mcnf/cloud/desired/<node>/<name>` key). A worker on node N only ever
 //!   reads its own `<N>/*` slice, so N's `terraform.tfvars.json` carries only N's
 //!   workloads (per-node apply — no node renders another node's set).
-//! - **The plan/render bridge** ([`plan_counts_for_node`]) — renders the slice into
-//!   tfvars ([`super::render`]) and shells `tofu plan -json` through the injectable
-//!   [`CloudRunner`] seam, returning the pending-change [`PlanCounts`].
+//! - **The desired/render bridge** ([`rendered_tfvars_for_node`]) — renders the
+//!   slice into tfvars ([`super::render`]) for both plan and live apply, so the
+//!   authorized runner never applies a stale or missing desired document.
+//! - **The plan bridge** ([`plan_counts_for_node`]) — shells `tofu plan -json`
+//!   through the injectable [`CloudRunner`] seam, returning the pending-change
+//!   [`PlanCounts`].
 //! - **The drift tick** ([`drift_snapshot`]) — the throttled periodic plan (cadence
 //!   decoupled from the state-mirror heartbeat) that folds the node's live domains +
 //!   its desired slice into per-workload [`WorkloadRow`]s carrying a [`DriftFlag`],
@@ -366,6 +369,27 @@ pub(crate) fn remove_desired_doc(
     }
 }
 
+/// Render node `node`'s canonical desired slice into the exact tfvars document
+/// consumed by both `tofu plan` and `tofu apply`.
+///
+/// The strict reader is intentional: a malformed, foreign, or non-regular
+/// desired document must stop a live apply rather than allowing OpenTofu to
+/// consume a stale file left by an earlier plan. An empty valid slice remains a
+/// valid declarative document (it represents the requested removal of all
+/// workloads from this placement node).
+///
+/// # Errors
+/// An honest desired-state error before any backend process is invoked.
+pub(crate) fn rendered_tfvars_for_node(
+    state_root: &Path,
+    node: &str,
+    libvirt_uri: &str,
+) -> Result<String, String> {
+    path_key::segment("node", node)?;
+    let specs = read_desired_slice_strict(state_root, node)?;
+    Ok(render::render_tfvars(node, &specs, libvirt_uri))
+}
+
 /// Render node `node`'s desired slice into tfvars and shell `tofu plan -json`
 /// through `runner`, returning the pending-change [`PlanCounts`].
 ///
@@ -378,9 +402,7 @@ pub(crate) fn plan_counts_for_node(
     node: &str,
     libvirt_uri: &str,
 ) -> Result<PlanCounts, String> {
-    path_key::segment("node", node)?;
-    let specs = read_desired_slice_strict(state_root, node)?;
-    let tfvars = render::render_tfvars(node, &specs, libvirt_uri);
+    let tfvars = rendered_tfvars_for_node(state_root, node, libvirt_uri)?;
     let ndjson = runner.plan_json(&tfvars)?;
     render::parse_plan_counts(&ndjson)
 }
@@ -674,10 +696,29 @@ mod tests {
 
         let err = plan_counts_for_node(&runner, root, "eagle", "qemu:///system")
             .expect_err("a malformed desired document must gate reconciliation");
-        assert!(err.contains("malformed desired document"), "unexpected error: {err}");
+        assert!(
+            err.contains("malformed desired document"),
+            "unexpected error: {err}"
+        );
         assert!(
             runner.tfvars_written.lock().unwrap().is_empty(),
             "malformed desired state must not reach the plan backend"
+        );
+    }
+
+    #[test]
+    fn live_apply_render_rejects_a_malformed_canonical_doc_before_backend_io() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_desired_doc(root, &spec("web", "eagle")).unwrap();
+        let canonical = desired_doc_path(root, "eagle", "web").unwrap();
+        std::fs::write(&canonical, br#"{"name":"web","node":"eagle"}"#).unwrap();
+
+        let err = rendered_tfvars_for_node(root, "eagle", "qemu:///system")
+            .expect_err("a malformed desired document must gate live rendering");
+        assert!(
+            err.contains("malformed desired document"),
+            "unexpected error: {err}"
         );
     }
 

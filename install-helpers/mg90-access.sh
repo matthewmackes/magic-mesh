@@ -58,10 +58,10 @@ Environment overrides are intentionally explicit:
   MG90_HOST, MG90_SSH_PORT, MG90_SSH_USER
   MG90_ROOT_PASSWORD_FILE       root-only file, default /etc/mackesd/mg90-root-password
   MG90_HTTP_USER                default admin
-MG90_HTTP_PASSWORD_FILE       root-only file, default /etc/mackesd/mg90-http-password
-MG90_KNOWN_HOSTS_FILE         pinned host keys, default /etc/mackesd/mg90_known_hosts
-MG90_GPS_UDP_PORT              default 5067 for gps-udp-listen
-MG90_GPS_TCP_PORT              default 9345 for gps-tcp-connect
+  MG90_HTTP_PASSWORD_FILE       root-only file, default /etc/mackesd/mg90-http-password
+  MG90_KNOWN_HOSTS_FILE         pinned host keys, default /etc/mackesd/mg90_known_hosts
+  MG90_GPS_UDP_PORT              default 5067 for gps-udp-listen
+  MG90_GPS_TCP_PORT              default 9345 for gps-tcp-connect
 USAGE
 }
 
@@ -252,6 +252,17 @@ self_test() {
     need bash
     need stat
     need ssh-keygen
+    valid_port 1
+    valid_port 65535
+    if (valid_port 0 >/dev/null 2>&1); then
+        die "self-test accepted UDP port 0"
+    fi
+    if (valid_port 65536 >/dev/null 2>&1); then
+        die "self-test accepted UDP port 65536"
+    fi
+    if (valid_port not-a-port >/dev/null 2>&1); then
+        die "self-test accepted a non-numeric UDP port"
+    fi
     safe_http_path "/MG-LCI/status/general.html"
     safe_http_path "/MG-LCI/wan/status/status.html?displayExtended=true"
     ! safe_http_path "http://example.invalid/redirect"
@@ -294,6 +305,8 @@ case "$command_name" in
     status-listen)
         shift
         [[ "$#" -eq 1 ]] || die "status-listen requires the configured UDP broadcast port"
+        # The MG90's Status > Broadcast page must already be configured for
+        # this port; this command only receives and prints datagrams.
         udp_listen "$1"
         ;;
     gps-udp-listen)

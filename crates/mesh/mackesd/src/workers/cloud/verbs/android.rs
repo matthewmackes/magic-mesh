@@ -16,9 +16,9 @@
 //! concern; the spec this handler mints is identical either way.
 //!
 //! Honest routing (§7): the spec is routed through the reconcile/set-desired seam
-//! (shared with `set-desired`). Until that seam is wired (U4/U5), this verb honestly
-//! reports the leg is not yet wired WHILE still doing — and echoing — the real work
-//! of constructing the correct Cuttlefish workload spec. It never fakes a provision.
+//! (shared with `set-desired`) and the reply is explicitly desired-state-only.
+//! The separate armed `provision` action must render this persisted slice before
+//! OpenTofu applies it; `android-provision` itself never claims a live VM.
 
 use std::path::Path;
 

@@ -241,6 +241,11 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-SEC-006 - Keep Nebula private keys local to their owning node
 
 - Status: Remaining
+- Progress (2026-07-25 identity-root ownership boundary): existing Nebula
+  identity roots now require the current owner and mode `0700` before any
+  private-key generation or rotation write. The hostile-`0777` regression is
+  covered by the focused BigBoy supervisor gate at **45/45**; live
+  rotation/reconnect/prune evidence remains optional external proof.
 - Progress (2026-07-25 privileged router audit boundary): the router
   executor's append/verify path now reads the replicated audit chain through
   the bounded no-follow regular-file reader, rejecting final symlinks, special
@@ -598,6 +603,12 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-ARCH-007 - Repair Workloads cockpit E2E wire, placement, and authorization
 
 - Status: Remaining
+- Progress (2026-07-25 live-provision desired-state bridge): authorized
+  Workloads `provision` now renders the selected node's strict persisted
+  desired slice into fresh tfvars before `tofu apply`, preventing stale or
+  missing Android/Cuttlefish state from reaching OpenTofu. The focused cloud
+  gate is green at **163/163**; live libvirt/Podman/Cuttlefish evidence remains
+  external.
 - Progress (2026-07-25 Android VM preparation contract): the Workloads
   cockpit now exposes the existing typed `android-provision` Bus contract with
   explicit node placement, default naming, typed confirmation, and an honest
@@ -905,6 +916,11 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-011 - Communications collaboration suite full replacement
 
 - Status: Remaining
+- Progress (2026-07-25 collab command-lane authorization): the collaboration
+  worker now binds each decoded command's verb to its `action/collab/<verb>`
+  topic before applying it, blocking cross-lane capability reuse. The focused
+  authorization regression is green at **1/1** and the collab worker module at
+  **17/17**; live peer/media/LLM evidence remains external.
 - Progress (2026-07-25 mesh media-registry boundary): replicated Nebula bundle
   and media-registry JSON consumers now use bounded no-follow regular-file
   readers that reject final symlinks, special files, oversized or changing
@@ -1472,6 +1488,12 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-012 - Maps live-data overlays (zero-cost external feeds)
 
 - Status: Remaining
+- Progress (2026-07-25 MG90 Status Broadcast readiness): the vehicle adapter
+  now exposes typed local receiver readiness and carries malformed, out-of-range,
+  or occupied `MDE_VEHICLE_STATUS_PORT` configuration into the vehicle gap
+  snapshot instead of silently disabling the documented beacon plane. The helper
+  and vehicle gate is green at **32/32**; the Rev. 6 guide still defines no
+  scanner-contact protocol, so Airspace remains honestly `NO SCANNER FEED`.
 - Progress (2026-07-25 Advanced Maps viewport regression): Advanced navigation
   rows now reveal inside the actual reserved workspace viewport, and the Layers
   popup is constrained to the workspace clip with an internal scroll region.

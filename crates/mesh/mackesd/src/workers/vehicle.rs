@@ -93,6 +93,28 @@ const ROOT_PASSWORD_NOFOLLOW_FLAG: i32 = 0o400000;
 /// Optional env: local UDP port receiving the MG90 JSON Status Broadcast.
 pub const STATUS_PORT_ENV: &str = "MDE_VEHICLE_STATUS_PORT";
 
+/// Readiness of the local receiver for the MG90's documented Status Broadcast.
+///
+/// This describes only the workstation-side UDP socket. It does not claim that
+/// the MG90's Status > Broadcast page is enabled or configured to send to this
+/// port; that remains an explicit LCI operation from the Rev. 6 guide.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatusBroadcastReadiness {
+    /// `MDE_VEHICLE_STATUS_PORT` was not configured.
+    Disabled,
+    /// The local receiver is bound and ready for the configured port.
+    Listening {
+        /// Local UDP port bound by the receiver.
+        port: u16,
+    },
+    /// The local receiver could not be configured. The detail is safe for the
+    /// vehicle gap surface and contains no credentials or packet contents.
+    ConfigurationError {
+        /// Bounded setup detail suitable for an operator-facing gap.
+        detail: String,
+    },
+}
+
 /// The Status Broadcast is a small selected-field JSON object, not an arbitrary
 /// UDP transport. Keep the receive allocation bounded and leave one byte for
 /// detecting a datagram that would otherwise be truncated by `recv`.
@@ -188,6 +210,10 @@ pub struct SshHttpProbe {
     known_hosts_file: PathBuf,
     /// Optional nonblocking socket for the documented MG90 JSON status beacon.
     status_socket: Option<UdpSocket>,
+    /// Typed local receiver state, retained so invalid configuration is visible
+    /// through the normal VehicleState gap path instead of silently disabling the
+    /// documented beacon plane.
+    status_broadcast: StatusBroadcastReadiness,
 }
 
 impl SshHttpProbe {
@@ -209,19 +235,31 @@ impl SshHttpProbe {
         } else {
             PathBuf::from(KNOWN_HOSTS_FILE_PACKAGED)
         };
-        let status_socket = std::env::var(STATUS_PORT_ENV).ok().and_then(|raw| {
-            let port = raw.parse::<u16>().ok().filter(|port| *port != 0)?;
-            let socket = UdpSocket::bind(("0.0.0.0", port)).ok()?;
-            socket.set_nonblocking(true).ok()?;
-            Some(socket)
-        });
+        let (status_socket, status_broadcast) = match std::env::var(STATUS_PORT_ENV) {
+            Ok(raw) => configure_status_broadcast(Some(&raw)),
+            Err(std::env::VarError::NotPresent) => configure_status_broadcast(None),
+            Err(std::env::VarError::NotUnicode(_)) => (
+                None,
+                StatusBroadcastReadiness::ConfigurationError {
+                    detail: format!("{STATUS_PORT_ENV} is not valid Unicode"),
+                },
+            ),
+        };
         Self {
             ip,
             ssh_port,
             ssh_pw,
             known_hosts_file,
             status_socket,
+            status_broadcast,
         }
+    }
+
+    /// Report local readiness for the documented Status Broadcast receiver.
+    /// This is diagnostic state only; it never configures the MG90.
+    #[must_use]
+    pub fn status_broadcast_readiness(&self) -> &StatusBroadcastReadiness {
+        &self.status_broadcast
     }
 
     /// The LCI base URL (`http://<ip>/`).
@@ -423,6 +461,9 @@ impl VehicleProbe for SshHttpProbe {
     }
 
     fn read_status_beacon(&self) -> io::Result<Option<String>> {
+        if let StatusBroadcastReadiness::ConfigurationError { detail } = &self.status_broadcast {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, detail.clone()));
+        }
         let Some(socket) = &self.status_socket else {
             return Ok(None);
         };
@@ -452,6 +493,62 @@ impl VehicleProbe for SshHttpProbe {
     fn run_ssh(&self, cmd: &str) -> io::Result<String> {
         self.ssh(cmd)
     }
+}
+
+/// Parse the local receiver port without silently treating malformed
+/// configuration as an unconfigured Status Broadcast plane.
+fn parse_status_port(raw: &str) -> Result<u16, String> {
+    let port = raw
+        .parse::<u16>()
+        .map_err(|_| "must be an integer from 1 to 65535".to_string())?;
+    if port == 0 {
+        return Err("must be an integer from 1 to 65535".to_string());
+    }
+    Ok(port)
+}
+
+/// Configure the local receiver for one documented MG90 Status Broadcast port.
+/// The MG90-side broadcast remains externally configured through Status >
+/// Broadcast; this helper only binds the receiving socket.
+fn configure_status_broadcast(raw: Option<&str>) -> (Option<UdpSocket>, StatusBroadcastReadiness) {
+    let Some(raw) = raw else {
+        return (None, StatusBroadcastReadiness::Disabled);
+    };
+    let port = match parse_status_port(raw) {
+        Ok(port) => port,
+        Err(detail) => {
+            return (
+                None,
+                StatusBroadcastReadiness::ConfigurationError {
+                    detail: format!("{STATUS_PORT_ENV}: {detail}"),
+                },
+            );
+        }
+    };
+    let socket = match UdpSocket::bind(("0.0.0.0", port)) {
+        Ok(socket) => socket,
+        Err(error) => {
+            return (
+                None,
+                StatusBroadcastReadiness::ConfigurationError {
+                    detail: format!(
+                        "{STATUS_PORT_ENV}={port} could not bind local UDP receiver: {error}"
+                    ),
+                },
+            );
+        }
+    };
+    if let Err(error) = socket.set_nonblocking(true) {
+        return (
+            None,
+            StatusBroadcastReadiness::ConfigurationError {
+                detail: format!(
+                    "{STATUS_PORT_ENV}={port} could not enable nonblocking UDP receive: {error}"
+                ),
+            },
+        );
+    }
+    (Some(socket), StatusBroadcastReadiness::Listening { port })
 }
 
 /// Split a `MDE_VEHICLE_GATEWAY` value into `(ip, ssh_port)`. `ip:port` yields the
@@ -577,7 +674,12 @@ impl VehicleWorker {
             Ok(Some(raw)) => parse_status_beacon(&raw, &mut gaps),
             Ok(None) => None,
             Err(e) => {
-                gaps.push(format!("status broadcast unavailable (udp): {e}"));
+                let reason = if e.kind() == io::ErrorKind::InvalidInput {
+                    "configuration error"
+                } else {
+                    "unavailable"
+                };
+                gaps.push(format!("status broadcast {reason} (udp): {e}"));
                 None
             }
         };
@@ -1565,6 +1667,7 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         general: Result<String, String>,
         wan: Result<String, String>,
         status: Option<String>,
+        status_error: Option<String>,
         ssh_out: Result<String, String>,
         ssh_calls: Arc<std::sync::Mutex<Vec<String>>>,
         general_calls: Arc<std::sync::Mutex<u32>>,
@@ -1599,6 +1702,7 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
                 general: Ok(general),
                 wan: Ok(wan),
                 status: None,
+                status_error: None,
                 ssh_out: Ok(FAKE_YAML.to_string()),
                 ssh_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
                 general_calls: Arc::new(std::sync::Mutex::new(0)),
@@ -1632,6 +1736,9 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
             to_io(&self.wan)
         }
         fn read_status_beacon(&self) -> io::Result<Option<String>> {
+            if let Some(error) = &self.status_error {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, error.clone()));
+            }
             Ok(self.status.clone())
         }
         fn run_ssh(&self, cmd: &str) -> io::Result<String> {
@@ -1806,6 +1913,7 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         for (payload, expected_error) in cases {
             let receiver = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
             let sender = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+            let port = receiver.local_addr().unwrap().port();
             sender
                 .send_to(&payload, receiver.local_addr().unwrap())
                 .unwrap();
@@ -1815,6 +1923,7 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
                 ssh_pw: String::new(),
                 known_hosts_file: PathBuf::new(),
                 status_socket: Some(receiver),
+                status_broadcast: StatusBroadcastReadiness::Listening { port },
             };
 
             let error = probe.read_status_beacon().unwrap_err();
@@ -1824,6 +1933,55 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
                 "unexpected status datagram error: {error}"
             );
         }
+    }
+
+    #[test]
+    fn status_broadcast_port_parser_rejects_invalid_values_without_defaulting() {
+        assert_eq!(parse_status_port("5067"), Ok(5067));
+        assert_eq!(parse_status_port("65535"), Ok(65535));
+        for raw in ["", "0", "65536", "udp", " 5067"] {
+            assert!(
+                parse_status_port(raw).is_err(),
+                "invalid status port was accepted: {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_status_broadcast_configuration_reaches_the_typed_reader_error() {
+        let (socket, readiness) = configure_status_broadcast(Some("not-a-port"));
+        assert!(socket.is_none());
+        assert!(matches!(
+            &readiness,
+            StatusBroadcastReadiness::ConfigurationError { detail }
+                if detail.contains(STATUS_PORT_ENV)
+        ));
+        let probe = SshHttpProbe {
+            ip: "127.0.0.1".to_string(),
+            ssh_port: 2222,
+            ssh_pw: String::new(),
+            known_hosts_file: PathBuf::new(),
+            status_socket: None,
+            status_broadcast: readiness,
+        };
+        let error = probe
+            .read_status_beacon()
+            .expect_err("invalid config must be visible");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains(STATUS_PORT_ENV));
+    }
+
+    #[test]
+    fn occupied_status_broadcast_port_is_not_silently_disabled() {
+        let receiver = UdpSocket::bind(("0.0.0.0", 0)).expect("reserve UDP port");
+        let port = receiver.local_addr().expect("port").port().to_string();
+        let (socket, readiness) = configure_status_broadcast(Some(&port));
+        assert!(socket.is_none());
+        assert!(matches!(
+            readiness,
+            StatusBroadcastReadiness::ConfigurationError { detail }
+                if detail.contains("could not bind local UDP receiver")
+        ));
     }
 
     #[test]
@@ -1882,6 +2040,20 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
             .gaps
             .iter()
             .any(|gap| gap.contains("status broadcast invalid JSON")));
+    }
+
+    #[test]
+    fn status_broadcast_configuration_error_is_visible_in_vehicle_gap() {
+        let probe = FakeProbe {
+            status_error: Some(format!(
+                "{STATUS_PORT_ENV}: must be an integer from 1 to 65535"
+            )),
+            ..FakeProbe::real()
+        };
+        let state = worker().build_state(&probe);
+        assert!(state.gaps.iter().any(|gap| {
+            gap.contains("status broadcast configuration error") && gap.contains(STATUS_PORT_ENV)
+        }));
     }
 
     #[test]

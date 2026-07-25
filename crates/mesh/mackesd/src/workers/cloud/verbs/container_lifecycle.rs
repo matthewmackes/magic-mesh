@@ -413,7 +413,7 @@ mod tests {
             Ok(Vec::new())
         }
 
-        fn provision(&self) -> CloudRunOutcome {
+        fn provision(&self, _tfvars_json: &str) -> CloudRunOutcome {
             CloudRunOutcome::ok("test", true)
         }
 
