@@ -60,6 +60,81 @@ use crate::{CollabData, CommandSink, CommunicationsSurface, frame, icons};
 /// names `text/markdown` bytes.
 pub(crate) const MARKDOWN_MIME: &str = "text/markdown";
 
+/// Presentation limits for values that can arrive from another seat. These are
+/// display/read-boundary limits; the editor and Markdown export keep the complete
+/// canonical document untouched.
+const MAX_DOCUMENT_TITLE_CHARS: usize = 96;
+const MAX_DOCUMENT_SUMMARY_CHARS: usize = 160;
+const MAX_DOCUMENT_PREVIEW_CHARS: usize = 64 * 1024;
+const MAX_REVIEW_COMMENT_CHARS: usize = 4096;
+
+/// Characters that can change the visual direction or structure of a Documents
+/// label. They are replaced before text reaches egui's shaper; ordinary
+/// whitespace is handled separately so every presentation remains one line.
+fn is_document_format_control(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{00ad}'
+                | '\u{061c}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{206f}'
+                | '\u{feff}'
+        )
+}
+
+/// Make untrusted document metadata safe for a bounded, single-line
+/// presentation. The full source value remains in the read model; this helper
+/// only produces the copy sent to egui labels and the bounded activity summary.
+fn bounded_document_display(value: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+
+    let mut chars = value.chars().map(|character| {
+        if character.is_whitespace() {
+            ' '
+        } else if is_document_format_control(character) {
+            '\u{fffd}'
+        } else {
+            character
+        }
+    });
+    let mut bounded: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_none() {
+        return bounded;
+    }
+
+    // Leave room for a visible truncation marker without ever splitting UTF-8.
+    let keep_bytes = bounded
+        .char_indices()
+        .nth(max_chars.saturating_sub(1))
+        .map_or(0, |(byte, _)| byte);
+    bounded.truncate(keep_bytes);
+    bounded.push('\u{2026}');
+    bounded
+}
+
+/// Cap a local review buffer before egui measures it. `TextEdit::char_limit`
+/// handles new keystrokes/pastes; this in-place guard also protects the first
+/// frame when a caller or restored state seeded an oversized value.
+fn cap_review_comment(value: &mut String) {
+    if let Some((byte, _)) = value.char_indices().nth(MAX_REVIEW_COMMENT_CHARS) {
+        value.truncate(byte);
+    }
+}
+
+/// Return a UTF-8-safe prefix for the Visual Markdown view. Source, save, and
+/// export continue to use the complete editor rope; only the potentially
+/// expensive preview parser receives this bounded presentation excerpt.
+fn markdown_preview(text: &str) -> (&str, bool) {
+    text.char_indices()
+        .nth(MAX_DOCUMENT_PREVIEW_CHARS)
+        .map_or((text, false), |(byte, _)| (&text[..byte], true))
+}
+
 /// The two Documents sub-modes: the default one-pane Markdown document, or the
 /// full embedded IDE editor for a project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -339,7 +414,7 @@ impl CommunicationsSurface {
             let title = if self.documents.active_title.is_empty() {
                 "Untitled".to_owned()
             } else {
-                self.documents.active_title.clone()
+                bounded_document_display(&self.documents.active_title, MAX_DOCUMENT_TITLE_CHARS)
             };
             icons::icon(ui, icons::DOC_ROW, Style::SP_M, Style::ACCENT);
             ui.label(
@@ -425,8 +500,12 @@ impl CommunicationsSurface {
                     for session in &sessions.sessions {
                         let selected = self.active_document() == Some(session.document);
                         icons::icon(ui, icons::DOC_ROW, Style::SP_M, Style::TEXT_DIM);
-                        if ui.selectable_label(selected, &session.title).clicked() {
-                            pick = Some((session.document, session.title.clone()));
+                        let title =
+                            bounded_document_display(&session.title, MAX_DOCUMENT_TITLE_CHARS);
+                        if ui.selectable_label(selected, &title).clicked() {
+                            // Title is display-only state, not part of the canonical
+                            // Markdown command payload, so keep the click path bounded.
+                            pick = Some((session.document, title));
                         }
                     }
                 }
@@ -448,6 +527,7 @@ impl CommunicationsSurface {
         // local seat is excluded and an empty candidate set stays visible as a
         // truthful notice instead of emitting a review request to nobody.
         if self.active_document().is_some() {
+            cap_review_comment(&mut self.documents.review_comment);
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new("Review:")
@@ -458,6 +538,7 @@ impl CommunicationsSurface {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.documents.review_comment)
                         .desired_width(180.0)
+                        .char_limit(MAX_REVIEW_COMMENT_CHARS)
                         .hint_text("optional comment"),
                 );
                 if ui.button("Request review").clicked() {
@@ -494,8 +575,18 @@ impl CommunicationsSurface {
                 // The rendered Markdown — the editor's OWN parser + render over the
                 // same rope, so Source and Visual never diverge.
                 let text = self.documents.editor.current_text().unwrap_or_default();
-                let blocks = markdown::parse(&text);
+                let (preview, truncated) = markdown_preview(&text);
+                let blocks = markdown::parse(preview);
                 markdown::show(ui, &blocks);
+                if truncated {
+                    ui.label(
+                        egui::RichText::new(
+                            "Visual preview truncated; Source and Export retain the full Markdown.",
+                        )
+                        .small()
+                        .color(Style::TEXT_DIM),
+                    );
+                }
             }
         }
     }
@@ -582,7 +673,10 @@ impl CommunicationsSurface {
         self.load_editor_body(data.document_body(document).unwrap_or_default());
         self.documents.active_document = Some(document);
         self.documents.loaded_document = Some(document);
-        self.documents.active_title = title.into();
+        let title = title.into();
+        // Keep the title canonical in state; the toolbar applies the bounded
+        // presentation transform at the egui boundary below.
+        self.documents.active_title = title;
         self.documents.sub = DocSubMode::Document;
         self.documents.review_comment.clear();
         self.documents.notice = None;
@@ -633,7 +727,7 @@ impl CommunicationsSurface {
             return false;
         };
         let payload = PayloadRef::of_bytes(markdown.as_bytes()).with_content_type(MARKDOWN_MIME);
-        let summary = first_nonblank_line(&markdown).map(str::to_owned);
+        let summary = first_nonblank_line(&markdown);
         sink.emit(CollabCommand::UpdateDocument {
             space,
             document,
@@ -700,7 +794,7 @@ impl CommunicationsSurface {
         let comment = if trimmed.is_empty() {
             None
         } else {
-            Some(trimmed.chars().take(4096).collect())
+            Some(trimmed.chars().take(MAX_REVIEW_COMMENT_CHARS).collect())
         };
         sink.emit(CollabCommand::SubmitReview {
             space,
@@ -721,8 +815,82 @@ impl CommunicationsSurface {
     }
 }
 
-/// The first non-blank line of `text`, trimmed — a short human summary for the
-/// Activity feed (the `DocumentChange.summary`), or `None` for an empty document.
-fn first_nonblank_line(text: &str) -> Option<&str> {
-    text.lines().map(str::trim).find(|line| !line.is_empty())
+/// The first non-blank line of `text`, trimmed and bounded — a short human
+/// summary for the Activity feed (the `DocumentChange.summary`), or `None` for
+/// an empty document. The canonical Markdown itself is never passed through
+/// this presentation excerpt.
+fn first_nonblank_line(text: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| bounded_document_display(line, MAX_DOCUMENT_SUMMARY_CHARS))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        MAX_DOCUMENT_PREVIEW_CHARS, MAX_DOCUMENT_SUMMARY_CHARS, MAX_DOCUMENT_TITLE_CHARS,
+        MAX_REVIEW_COMMENT_CHARS, bounded_document_display, cap_review_comment,
+        first_nonblank_line, markdown_preview,
+    };
+
+    #[test]
+    fn hostile_document_title_is_single_line_bidi_safe_and_bounded() {
+        let hostile = format!(
+            "Runbook\n\t\u{202e}ops\u{200b}{}",
+            "x".repeat(MAX_DOCUMENT_TITLE_CHARS)
+        );
+        let display = bounded_document_display(&hostile, MAX_DOCUMENT_TITLE_CHARS);
+
+        assert_eq!(display.chars().count(), MAX_DOCUMENT_TITLE_CHARS);
+        assert!(display.ends_with('\u{2026}'));
+        assert!(!display.contains(['\n', '\r', '\t', '\u{202e}', '\u{200b}']));
+    }
+
+    #[test]
+    fn review_comment_cap_keeps_oversized_unicode_input_out_of_layout() {
+        let mut comment = format!("🙂{}", "x".repeat(MAX_REVIEW_COMMENT_CHARS + 32));
+        cap_review_comment(&mut comment);
+
+        assert_eq!(comment.chars().count(), MAX_REVIEW_COMMENT_CHARS);
+        assert!(comment.starts_with('🙂'));
+        assert!(comment.is_char_boundary(comment.len()));
+    }
+
+    #[test]
+    fn markdown_preview_is_a_utf8_safe_bounded_excerpt() {
+        let source = format!(
+            "{}é🦀{}",
+            "# hostile\n".repeat(MAX_DOCUMENT_PREVIEW_CHARS),
+            "tail"
+        );
+        let (preview, truncated) = markdown_preview(&source);
+
+        assert!(truncated);
+        assert_eq!(preview.chars().count(), MAX_DOCUMENT_PREVIEW_CHARS);
+        assert!(preview.is_char_boundary(preview.len()));
+        assert!(source.starts_with(preview));
+    }
+
+    #[test]
+    fn markdown_summary_is_bounded_without_rewriting_the_source_body() {
+        let markdown = format!("# \u{202e}{}\n\nbody", "x".repeat(512));
+        let summary = first_nonblank_line(&markdown).expect("the heading is non-blank");
+
+        assert_eq!(summary.chars().count(), MAX_DOCUMENT_SUMMARY_CHARS);
+        assert!(summary.ends_with('\u{2026}'));
+        assert!(!summary.contains('\u{202e}'));
+        assert!(markdown.contains("\n\nbody"));
+    }
+
+    #[test]
+    fn short_document_titles_remain_truthful() {
+        assert_eq!(
+            bounded_document_display("Runbook — ops", MAX_DOCUMENT_TITLE_CHARS),
+            "Runbook — ops"
+        );
+        let (preview, truncated) = markdown_preview("# Runbook\n");
+        assert_eq!(preview, "# Runbook\n");
+        assert!(!truncated);
+    }
 }

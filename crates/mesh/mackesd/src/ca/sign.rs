@@ -141,8 +141,7 @@ pub fn sign_peer_cert<B: NebulaCertBackend + ?Sized>(
         .map_err(|e| CaError::Io(format!("read peer key {}: {e}", key_out.display())))?;
     seal::write_sealed(key_out, &key_bytes)?;
 
-    let cert_pem = std::fs::read_to_string(crt_out)
-        .map_err(|e| CaError::Io(format!("read peer cert {}: {e}", crt_out.display())))?;
+    let cert_pem = read_generated_cert(crt_out)?;
 
     // SEC-1 (Q19) — peer certs do not expire mid-epoch: the backend
     // passes no -duration, so nebula signs to the CA's own lifetime,
@@ -365,8 +364,7 @@ pub(crate) fn sign_peer_material_with_public_key<B: NebulaCertBackend + ?Sized>(
             &staged_public_key,
             &staged_cert,
         )?;
-        let cert_pem = std::fs::read_to_string(&staged_cert)
-            .map_err(|e| CaError::Io(format!("read peer cert {}: {e}", staged_cert.display())))?;
+        let cert_pem = read_generated_cert(&staged_cert)?;
         if cert_pem.trim().is_empty() {
             return Err(CaError::Io(
                 "nebula-cert emitted an empty peer certificate".into(),
@@ -377,6 +375,17 @@ pub(crate) fn sign_peer_material_with_public_key<B: NebulaCertBackend + ?Sized>(
     })();
     let _ = std::fs::remove_dir_all(&staging_dir);
     result
+}
+
+/// Consume a backend-produced certificate through the no-follow, bounded file
+/// reader before converting it into the owned certificate string stored in the
+/// CA roster. Generated certs are small; a hostile replacement must fail
+/// closed rather than become an unbounded allocation.
+fn read_generated_cert(path: &Path) -> Result<String, CaError> {
+    let bytes = super::seal::read_no_follow(path)
+        .map_err(|e| CaError::Io(format!("read peer cert {}: {e}", path.display())))?;
+    String::from_utf8(bytes)
+        .map_err(|e| CaError::Io(format!("peer cert {} is not UTF-8: {e}", path.display())))
 }
 
 /// Per-cert role group. The open-mesh directive flattens
@@ -601,6 +610,20 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n-----END NEBULA X25519 PUBLIC KEY-
             })
             .unwrap();
         assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn generated_certificate_read_is_bounded_before_string_materialization() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("generated.crt");
+        crate::ca::seal::write_sealed(
+            &path,
+            &vec![b'x'; (crate::ca::seal::MAX_SEALED_FILE_BYTES + 1) as usize],
+        )
+        .expect("hostile generated cert");
+
+        let error = read_generated_cert(&path).expect_err("oversized cert must fail closed");
+        assert!(error.to_string().contains("exceeds"));
     }
 
     /// Backend that models real nebula-cert's refusal to overwrite an

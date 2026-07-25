@@ -19,8 +19,9 @@
 //! callers keep the honest "overlay" label — never a guess.
 
 use std::collections::HashMap;
+use std::io::{Error, ErrorKind, Read};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// Loopback port the Nebula debug SSH server listens on.
 pub const SSHD_PORT: u16 = 2476;
@@ -30,6 +31,18 @@ pub const SSHD_USER: &str = "mackesd";
 pub const HOST_KEY_FILE: &str = "sshd_host_key";
 /// Filename (under the nebula config dir) of mackesd's client key.
 pub const CLIENT_KEY_FILE: &str = "sshd_client_key";
+
+// NET-INTROSPECT is fed by local files and a local debug-SSH process. Treat
+// both as hostile input: the daemon must never materialize an unbounded key,
+// pipe, JSON document, or display field before it can decide to ignore it.
+const MAX_PUBLIC_KEY_BYTES: usize = 16 * 1024;
+const MAX_PUBLIC_KEY_CHARS: usize = 16 * 1024;
+const MAX_HOSTMAP_BYTES: usize = 1024 * 1024;
+const MAX_HOSTMAP_ENTRIES: usize = 256;
+const MAX_NAME_CHARS: usize = 256;
+const MAX_ENDPOINT_CHARS: usize = 256;
+const MAX_RELAY_VALUES_PER_ENTRY: usize = 64;
+const MAX_PATH_CHARS: usize = 4096;
 
 /// One peer tunnel's measured underlay path.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -64,6 +77,13 @@ impl TunnelPath {
 /// key (an OpenSSH `authorized_keys` line). Bound to `127.0.0.1` only.
 #[must_use]
 pub(crate) fn render_sshd_block(host_key_path: &str, authorized_pubkey: &str, port: u16) -> String {
+    let Some(host_key_path) = safe_yaml_scalar(host_key_path, MAX_PATH_CHARS) else {
+        return String::new();
+    };
+    let Some(authorized_pubkey) = safe_yaml_scalar(authorized_pubkey, MAX_PUBLIC_KEY_CHARS)
+    else {
+        return String::new();
+    };
     format!(
         "\n# NET-INTROSPECT (PD-6/PD-7) — loopback-only debug SSH for direct/relay\n\
          # tunnel classification. 127.0.0.1 only: no overlay/underlay exposure.\n\
@@ -75,7 +95,8 @@ pub(crate) fn render_sshd_block(host_key_path: &str, authorized_pubkey: &str, po
          \x20   - user: {SSHD_USER}\n\
          \x20     keys:\n\
          \x20       - \"{pk}\"\n",
-        pk = authorized_pubkey.trim(),
+        host_key_path = host_key_path,
+        pk = authorized_pubkey,
     )
 }
 
@@ -92,9 +113,11 @@ pub(crate) fn ensure_sshd_keys(config_dir: &Path) -> Result<String, String> {
     keygen_if_absent(&host_key, "nebula-sshd-host")?;
     keygen_if_absent(&client_key, "mackesd-nebula-admin")?;
     let pub_path = config_dir.join(format!("{CLIENT_KEY_FILE}.pub"));
-    std::fs::read_to_string(&pub_path)
-        .map(|s| s.trim().to_string())
-        .map_err(|e| format!("read {}: {e}", pub_path.display()))
+    let bytes = read_bounded_file(&pub_path, MAX_PUBLIC_KEY_BYTES)?;
+    let public_key = String::from_utf8(bytes)
+        .map_err(|_| format!("read {}: public key is not UTF-8", pub_path.display()))?;
+    safe_yaml_scalar(&public_key, MAX_PUBLIC_KEY_CHARS)
+        .ok_or_else(|| format!("read {}: public key is invalid or oversized", pub_path.display()))
 }
 
 fn keygen_if_absent(key_path: &Path, comment: &str) -> Result<(), String> {
@@ -104,17 +127,18 @@ fn keygen_if_absent(key_path: &Path, comment: &str) -> Result<(), String> {
     if let Some(parent) = key_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
     }
-    let out = Command::new("ssh-keygen")
+    let status = Command::new("ssh-keygen")
         .args(["-t", "ed25519", "-N", "", "-q", "-C", comment, "-f"])
         .arg(key_path)
-        .output()
+        // ssh-keygen is a local helper; discard both streams so a hostile or
+        // broken executable cannot flood or allocate through this boundary.
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
         .map_err(|e| format!("ssh-keygen spawn: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "ssh-keygen {}: {}",
-            key_path.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
+    if !status.success() {
+        return Err(format!("ssh-keygen failed for {}", key_path.display()));
     }
     Ok(())
 }
@@ -145,13 +169,30 @@ pub fn query_tunnels(config_dir: &Path) -> HashMap<String, TunnelPath> {
     if !client_key.exists() {
         return HashMap::new();
     }
+    let Some(stdout) = query_hostmap_stdout(&client_key) else {
+        return HashMap::new();
+    };
+    let Ok(json) = String::from_utf8(stdout) else {
+        return HashMap::new();
+    };
+    parse_hostmap(&json)
+}
+
+/// Run the fixed debug-SSH query while placing a hard ceiling on stdout.
+/// stderr is discarded because it is diagnostic-only and can be attacker-
+/// controlled through a substituted local helper. If stdout exceeds the
+/// ceiling, terminate the child before waiting so a pipe writer cannot leave
+/// this process blocked.
+fn query_hostmap_stdout(client_key: &Path) -> Option<Vec<u8>> {
+    let client_key = client_key.to_string_lossy().into_owned();
+    let port = SSHD_PORT.to_string();
     let dest = format!("{SSHD_USER}@127.0.0.1");
-    let out = Command::new("ssh")
+    let mut child = Command::new("ssh")
         .args([
             "-i",
-            &client_key.to_string_lossy(),
+            &client_key,
             "-p",
-            &SSHD_PORT.to_string(),
+            &port,
             "-o",
             "BatchMode=yes",
             "-o",
@@ -165,11 +206,57 @@ pub fn query_tunnels(config_dir: &Path) -> HashMap<String, TunnelPath> {
             &dest,
             "list-hostmap -json",
         ])
-        .output();
-    match out {
-        Ok(o) if o.status.success() => parse_hostmap(&String::from_utf8_lossy(&o.stdout)),
-        _ => HashMap::new(),
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
+    let bytes = read_bounded(stdout, MAX_HOSTMAP_BYTES);
+    if bytes.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
     }
+    let status = child.wait().ok()?;
+    status.success().then_some(bytes.ok()?)
+}
+
+/// Read at most `max_bytes` plus one sentinel byte. The sentinel makes an
+/// oversized input fail closed without ever allocating beyond the declared
+/// bound by more than one byte.
+fn read_bounded<R: Read>(reader: R, max_bytes: usize) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(max_bytes.saturating_add(1));
+    reader
+        .take(max_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "input exceeds the NET-INTROSPECT byte limit",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn read_bounded_file(path: &Path, max_bytes: usize) -> Result<Vec<u8>, String> {
+    // Keep the local public-key boundary on the same no-follow reader used by
+    // the CA material paths. `File::open` would follow a final symlink and
+    // make a replaced `.pub` file an authority/input confusion seam.
+    let bytes = crate::ca::seal::read_no_follow(path)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    if bytes.len() > max_bytes {
+        return Err(format!(
+            "read {}: input exceeds the NET-INTROSPECT byte limit",
+            path.display()
+        ));
+    }
+    Ok(bytes)
 }
 
 /// The default nebula config dir (matches `nebula_supervisor`'s
@@ -187,19 +274,28 @@ pub fn query_tunnels_default() -> HashMap<String, TunnelPath> {
 #[must_use]
 pub(crate) fn parse_hostmap(json: &str) -> HashMap<String, TunnelPath> {
     let mut out = HashMap::new();
+    if json.len() > MAX_HOSTMAP_BYTES {
+        return out;
+    }
     let Ok(serde_json::Value::Array(entries)) = serde_json::from_str::<serde_json::Value>(json)
     else {
         return out;
     };
+    if entries.len() > MAX_HOSTMAP_ENTRIES {
+        return out;
+    }
     for e in &entries {
         let Some(name) = cert_name(e) else { continue };
         let endpoint = e
             .get("currentRemote")
             .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
+            .and_then(|s| bounded_text(s, MAX_ENDPOINT_CHARS));
         let relay_via = first_relay(e);
+        // Duplicate cert names make the result ambiguous. Do not allow a
+        // later hostile row to overwrite an earlier measured path.
+        if out.contains_key(&name) {
+            return HashMap::new();
+        }
         out.insert(
             name.clone(),
             TunnelPath {
@@ -216,12 +312,17 @@ pub(crate) fn parse_hostmap(json: &str) -> HashMap<String, TunnelPath> {
 /// `cert.name` (cert v2).
 fn cert_name(entry: &serde_json::Value) -> Option<String> {
     let cert = entry.get("cert")?;
-    cert.get("details")
+    if let Some(name) = cert
+        .get("details")
         .and_then(|d| d.get("name"))
         .and_then(|n| n.as_str())
-        .or_else(|| cert.get("name").and_then(|n| n.as_str()))
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+        .and_then(|s| bounded_text(s, MAX_NAME_CHARS))
+    {
+        return Some(name);
+    }
+    cert.get("name")
+        .and_then(|n| n.as_str())
+        .and_then(|s| bounded_text(s, MAX_NAME_CHARS))
 }
 
 /// The relay peer this tunnel routes through, if any — `currentRelaysToMe`
@@ -231,15 +332,55 @@ fn first_relay(entry: &serde_json::Value) -> Option<String> {
         if let Some(arr) = entry.get(key).and_then(|v| v.as_array()) {
             if let Some(first) = arr
                 .iter()
+                .take(MAX_RELAY_VALUES_PER_ENTRY)
                 .filter_map(|v| v.as_str())
-                .map(str::trim)
-                .find(|s| !s.is_empty())
+                .find_map(|s| bounded_text(s, MAX_NAME_CHARS))
             {
-                return Some(first.to_string());
+                return Some(first);
             }
         }
     }
     None
+}
+
+/// Return a bounded, single-line value suitable for joining into the small
+/// NET-INTROSPECT result map or a YAML scalar. Unicode control and bidi/zero-
+/// width formatting characters are rejected rather than normalized so a
+/// hostile local value cannot spoof a peer or alter rendered configuration.
+fn bounded_text(value: &str, max_chars: usize) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.chars().count() > max_chars {
+        return None;
+    }
+    if value.chars().any(|ch| {
+        ch.is_control()
+            || matches!(
+                ch,
+                '\u{200b}'
+                    | '\u{200c}'
+                    | '\u{200d}'
+                    | '\u{202a}'..='\u{202e}'
+                    | '\u{2060}'
+                    | '\u{2066}'..='\u{2069}'
+                    | '\u{feff}'
+            )
+    }) {
+        return None;
+    }
+    Some(value.to_owned())
+}
+
+fn safe_yaml_scalar(value: &str, max_chars: usize) -> Option<String> {
+    let value = bounded_text(value, max_chars)?;
+    // Keep the existing unquoted YAML shape, but reject characters that can
+    // turn a local path/key into a second scalar, comment, or escape sequence.
+    if value
+        .chars()
+        .any(|ch| matches!(ch, '"' | '\\' | '#'))
+    {
+        return None;
+    }
+    Some(value)
 }
 
 #[cfg(test)]
@@ -310,6 +451,94 @@ mod tests {
     fn parse_hostmap_rejects_garbage() {
         assert!(parse_hostmap("not json").is_empty());
         assert!(parse_hostmap("{}").is_empty());
+    }
+
+    #[test]
+    fn bounded_reader_rejects_oversized_input() {
+        let exact = vec![b'k'; MAX_PUBLIC_KEY_BYTES];
+        assert_eq!(read_bounded(std::io::Cursor::new(exact), MAX_PUBLIC_KEY_BYTES)
+            .unwrap()
+            .len(), MAX_PUBLIC_KEY_BYTES);
+
+        let oversized = vec![b'k'; MAX_PUBLIC_KEY_BYTES + 1];
+        let error = read_bounded(std::io::Cursor::new(oversized), MAX_PUBLIC_KEY_BYTES)
+            .expect_err("the sentinel byte must fail closed");
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn oversized_public_key_file_degrades_without_materializing_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(HOST_KEY_FILE), b"host-key").expect("host key");
+        std::fs::write(dir.path().join(CLIENT_KEY_FILE), b"client-key").expect("client key");
+        std::fs::write(
+            dir.path().join(format!("{CLIENT_KEY_FILE}.pub")),
+            vec![b'k'; MAX_PUBLIC_KEY_BYTES + 1],
+        )
+        .expect("public key");
+
+        assert!(ensure_sshd_keys(dir.path()).is_err());
+    }
+
+    #[test]
+    fn render_sshd_block_rejects_untrusted_yaml_values() {
+        assert!(render_sshd_block(
+            "/etc/nebula/sshd_host_key\nsshd: enabled: true",
+            "ssh-ed25519 AAAA... mackesd",
+            SSHD_PORT,
+        )
+        .is_empty());
+        assert!(render_sshd_block(
+            "/etc/nebula/sshd_host_key",
+            &format!("ssh-ed25519 {}", "k".repeat(MAX_PUBLIC_KEY_CHARS + 1)),
+            SSHD_PORT,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn parse_hostmap_rejects_oversized_documents_and_entry_bursts() {
+        assert!(parse_hostmap(&"x".repeat(MAX_HOSTMAP_BYTES + 1)).is_empty());
+
+        let entries = (0..=MAX_HOSTMAP_ENTRIES)
+            .map(|index| {
+                serde_json::json!({
+                    "cert": {"details": {"name": format!("peer-{index}")}}
+                })
+                .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert!(parse_hostmap(&format!("[{}]", entries.join(","))).is_empty());
+    }
+
+    #[test]
+    fn parse_hostmap_bounds_and_rejects_spoofable_fields() {
+        let long_endpoint = "1".repeat(MAX_ENDPOINT_CHARS + 1);
+        let json = serde_json::json!([{
+            "currentRemote": long_endpoint,
+            "cert": {"details": {"name": "edge"}},
+            "relay": ["10.42.0.1\nspoof"]
+        }])
+        .to_string();
+        let paths = parse_hostmap(&json);
+        let edge = &paths["edge"];
+        assert_eq!(edge.endpoint, None);
+        assert_eq!(edge.relay_via, None);
+
+        let bidi_name = serde_json::json!([{
+            "cert": {"details": {"name": "ed\u{202e}ge"}}
+        }])
+        .to_string();
+        assert!(parse_hostmap(&bidi_name).is_empty());
+    }
+
+    #[test]
+    fn parse_hostmap_rejects_ambiguous_duplicate_names() {
+        let json = r#"[
+            {"currentRemote":"203.0.113.5:4242","cert":{"name":"same"}},
+            {"currentRemote":"203.0.113.6:4242","cert":{"name":"same"}}
+        ]"#;
+        assert!(parse_hostmap(json).is_empty());
     }
 
     #[test]

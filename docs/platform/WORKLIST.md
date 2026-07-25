@@ -241,6 +241,11 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-SEC-006 - Keep Nebula private keys local to their owning node
 
 - Status: Remaining
+- Progress (2026-07-24 requester/certificate materialization boundary): Nebula
+  enrollment requester public keys and generated peer certificates now use
+  bounded no-follow reads before UTF-8/string materialization, rejecting hostile
+  symlink or oversized output. The focused requester suite is green at 22/22;
+  the full BigBoy `mackesd` library gate is green at 3,992 passed, 1 ignored.
 - Progress (2026-07-24 sealed-read allocation boundary): CA, Nebula identity,
   CSR, and authority reads now share a 1 MiB descriptor-bound limit after the
   existing no-follow and permission checks. Oversized public/sealed material is
@@ -459,6 +464,11 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-ARCH-007 - Repair Workloads cockpit E2E wire, placement, and authorization
 
 - Status: Remaining
+- Progress (2026-07-24 image provider boundary): `image-build` now caps raw
+  requests before verb parsing, bounds replicated promotion/SHA sidecars,
+  limits roster rows, and keeps reply/error/raw-log text bounded. The focused
+  oversized-request regression is green at 1/1; the full BigBoy `mackesd`
+  library gate is green at 3,992 passed, 1 ignored.
 - Progress (2026-07-24 inventory read-boundary hardening): cloud inventory and
   output reads now cap host/output rows, group counts, and display text before
   `CloudReply` materialization while preserving sensitive-value masking. The
@@ -668,6 +678,11 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-011 - Communications collaboration suite full replacement
 
 - Status: Remaining
+- Progress (2026-07-24 Documents presentation boundary): document titles,
+  summaries, review comments, and Visual Markdown previews are now bounded and
+  bidi/control-safe at the egui boundary while Source, Save, and Export retain
+  canonical Markdown. The full `.90` `mde-collab-egui` library gate is green at
+  73/73; real peer/media evidence remains external.
 - Progress (2026-07-24 clipboard publish-boundary hardening): clipboard publish
   input now enforces the 100 MiB transfer/clip ceiling before preview/hash
   command materialization; normal preview behavior is unchanged. The focused
@@ -1156,6 +1171,11 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-012 - Maps live-data overlays (zero-cost external feeds)
 
 - Status: Remaining
+- Progress (2026-07-24 Airspace publish boundary): the `mackesd` Airspace
+  worker now rejects malformed contacts before JSON publication, trims valid
+  contact rows to the 64 KiB snapshot bound, and publishes an explicit bounded
+  offline state when a snapshot cannot be represented safely. The full BigBoy
+  `mackesd` library gate is green at 3,992 passed, 1 ignored.
 - Progress (2026-07-24 aircraft label boundary hardening): retained aircraft
   callsigns are sanitized, bounded, width-fit, and viewport-clamped before
   egui layout. The focused aircraft gate is green at 9/9 and the full Maps

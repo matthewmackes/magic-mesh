@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mackes_mesh_types::airspace::{
-    airspace_state_topic, AirspaceSnapshot, AirspaceSurvey, MAX_SNAPSHOT_BYTES,
+    airspace_state_topic, AirspaceSnapshot, AirspaceSurvey, MAX_GAPS, MAX_SNAPSHOT_BYTES,
 };
 
 use super::{ShutdownToken, Worker};
@@ -136,21 +136,51 @@ impl AirspaceWorker {
 
     /// Publish one bounded latest-wins mirror record.
     fn publish(&self, snapshot: &AirspaceSnapshot) {
-        let snapshot = match snapshot.encoded_len() {
-            Ok(size) if size <= MAX_SNAPSHOT_BYTES => snapshot.clone(),
-            Ok(size) => {
+        let Some(body) = self.body_for_publish(snapshot) else {
+            return;
+        };
+        if let Some(mut persist) = crate::bus_publish::open_bus(self.bus_root.clone()) {
+            crate::bus_publish::publish_body(
+                &mut persist,
+                &airspace_state_topic(&self.host),
+                &body,
+            );
+        }
+    }
+
+    /// Materialize exactly one bounded JSON body for the retained Bus row.
+    ///
+    /// `AirspaceSnapshot::from_survey` bounds each contact, but the legal
+    /// contact budget can still exceed the wire budget when every display
+    /// field is at its maximum. Trim only the tail in that case, preserving
+    /// the valid prefix and recording the omission. A malformed snapshot or
+    /// one whose non-contact fields alone exceed the budget becomes an
+    /// explicit offline state rather than reaching the Bus.
+    fn body_for_publish(&self, snapshot: &AirspaceSnapshot) -> Option<String> {
+        if snapshot
+            .contacts
+            .iter()
+            .any(|contact| contact.clone().bounded().is_err())
+        {
+            tracing::warn!(
+                target: "mackesd::airspace",
+                host = %self.host,
+                "airspace snapshot contained a malformed contact; publishing offline status"
+            );
+            return self.offline_body("airspace snapshot contained a malformed contact");
+        }
+        match serde_json::to_string(snapshot) {
+            Ok(body) if body.len() <= MAX_SNAPSHOT_BYTES => return Some(body),
+            Ok(body) => {
+                let size = body.len();
                 tracing::warn!(
                     target: "mackesd::airspace",
                     host = %self.host,
                     size,
                     limit = MAX_SNAPSHOT_BYTES,
-                    "airspace snapshot exceeded wire bound; publishing offline status"
+                    "airspace snapshot exceeded wire bound; trimming contacts"
                 );
-                AirspaceSnapshot::offline(
-                    &self.host,
-                    now_ms(),
-                    "airspace snapshot exceeded the published byte bound",
-                )
+                drop(body);
             }
             Err(error) => {
                 tracing::warn!(
@@ -159,19 +189,76 @@ impl AirspaceWorker {
                     %error,
                     "airspace snapshot could not be encoded; publishing offline status"
                 );
-                AirspaceSnapshot::offline(
-                    &self.host,
-                    now_ms(),
-                    "airspace snapshot could not be encoded",
-                )
+                return self.offline_body("airspace snapshot could not be encoded");
             }
         };
-        if let Some(mut persist) = crate::bus_publish::open_bus(self.bus_root.clone()) {
-            crate::bus_publish::publish_json(
-                &mut persist,
-                &airspace_state_topic(&self.host),
-                &snapshot,
-            );
+
+        let mut candidate = snapshot.clone();
+        let mut trimmed = 0_u32;
+        loop {
+            match serde_json::to_string(&candidate) {
+                Ok(body) if body.len() <= MAX_SNAPSHOT_BYTES => {
+                    if trimmed > 0 {
+                        tracing::warn!(
+                            target: "mackesd::airspace",
+                            host = %self.host,
+                            trimmed,
+                            retained = candidate.contacts.len(),
+                            "airspace snapshot contacts trimmed to fit wire bound"
+                        );
+                    }
+                    return Some(body);
+                }
+                Ok(_) => {
+                    if candidate.contacts.pop().is_none() {
+                        return self.offline_body(
+                            "airspace snapshot exceeded the published byte bound",
+                        );
+                    }
+                    trimmed = trimmed.saturating_add(1);
+                    candidate.omitted_contacts = candidate.omitted_contacts.saturating_add(1);
+                    if trimmed == 1 && candidate.gaps.len() < MAX_GAPS {
+                        candidate
+                            .gaps
+                            .push("airspace contacts trimmed to honor the published byte bound".into());
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "mackesd::airspace",
+                        host = %self.host,
+                        %error,
+                        "airspace snapshot remained unencodable after trimming; publishing offline status"
+                    );
+                    return self.offline_body("airspace snapshot could not be encoded");
+                }
+            }
+        }
+    }
+
+    fn offline_body(&self, reason: &str) -> Option<String> {
+        let snapshot = AirspaceSnapshot::offline(&self.host, now_ms(), reason);
+        match serde_json::to_string(&snapshot) {
+            Ok(body) if body.len() <= MAX_SNAPSHOT_BYTES => Some(body),
+            Ok(body) => {
+                tracing::error!(
+                    target: "mackesd::airspace",
+                    host = %self.host,
+                    size = body.len(),
+                    limit = MAX_SNAPSHOT_BYTES,
+                    "airspace offline fallback exceeded wire bound"
+                );
+                None
+            }
+            Err(error) => {
+                tracing::error!(
+                    target: "mackesd::airspace",
+                    host = %self.host,
+                    %error,
+                    "airspace offline fallback could not be encoded"
+                );
+                None
+            }
         }
     }
 
@@ -245,7 +332,7 @@ mod tests {
 
     use mackes_mesh_types::airspace::{
         AirspaceAvailability, AirspaceContact, AirspaceContactKind, AirspaceSnapshot,
-        AirspaceSurvey,
+        AirspaceSurvey, MAX_RETAINED_CONTACTS, MAX_STRING_BYTES,
     };
     use mde_bus::persist::Persist;
 
@@ -394,5 +481,121 @@ mod tests {
             .gaps
             .iter()
             .any(|gap| gap.contains("freshness window")));
+    }
+
+    #[test]
+    fn oversized_contact_rows_are_trimmed_before_bus_publish() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().to_path_buf();
+        let worker = AirspaceWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+        let contacts = (0..MAX_RETAINED_CONTACTS)
+            .map(|index| AirspaceContact {
+                id: format!("wifi-{index}-{}", "i".repeat(MAX_STRING_BYTES)),
+                kind: AirspaceContactKind::Wifi,
+                name: "n".repeat(MAX_STRING_BYTES),
+                signal_dbm: -61,
+                bearing_deg: 15.0,
+                channel: Some(11),
+                encryption: Some("e".repeat(MAX_STRING_BYTES)),
+                notable: false,
+                watchlist: false,
+                own: false,
+            })
+            .collect();
+        let snapshot = worker.build_snapshot(
+            Ok(AirspaceSurvey {
+                scanned_at_ms: Some(2),
+                contacts,
+                gaps: Vec::new(),
+            }),
+            2,
+        );
+        assert_eq!(snapshot.contacts.len(), MAX_RETAINED_CONTACTS);
+
+        worker.publish(&snapshot);
+
+        let body = Persist::open(root)
+            .expect("open bus")
+            .read_latest(&airspace_state_topic("rig-1"))
+            .expect("read bus")
+            .and_then(|message| message.body)
+            .expect("published body");
+        assert!(body.len() <= MAX_SNAPSHOT_BYTES);
+        let published: AirspaceSnapshot = serde_json::from_str(&body).expect("decode body");
+        assert_eq!(published.availability, AirspaceAvailability::Ready);
+        assert!(!published.contacts.is_empty());
+        assert!(published.contacts.len() < MAX_RETAINED_CONTACTS);
+        assert!(published.omitted_contacts > 0);
+        assert!(published
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("published byte bound")));
+    }
+
+    #[test]
+    fn hostile_display_field_is_retracted_before_bus_publish() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().to_path_buf();
+        let worker = AirspaceWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+        let snapshot = AirspaceSnapshot {
+            host: "hostile-host".repeat(MAX_SNAPSHOT_BYTES),
+            published_at_ms: 2,
+            scanned_at_ms: None,
+            availability: AirspaceAvailability::Ready,
+            contacts: Vec::new(),
+            omitted_contacts: 0,
+            gaps: Vec::new(),
+        };
+
+        worker.publish(&snapshot);
+
+        let body = Persist::open(root)
+            .expect("open bus")
+            .read_latest(&airspace_state_topic("rig-1"))
+            .expect("read bus")
+            .and_then(|message| message.body)
+            .expect("published body");
+        assert!(body.len() <= MAX_SNAPSHOT_BYTES);
+        let published: AirspaceSnapshot = serde_json::from_str(&body).expect("decode body");
+        assert_eq!(published.availability, AirspaceAvailability::Offline);
+        assert!(published.contacts.is_empty());
+        assert!(published
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("published byte bound")));
+        assert_eq!(published.host, "rig-1");
+    }
+
+    #[test]
+    fn malformed_contact_is_offline_before_bus_publish() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().to_path_buf();
+        let worker = AirspaceWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+        let mut snapshot = AirspaceSnapshot::from_survey(
+            "rig-1",
+            2,
+            AirspaceSurvey {
+                scanned_at_ms: Some(2),
+                contacts: vec![contact("aa:bb:cc")],
+                gaps: Vec::new(),
+            },
+        );
+        snapshot.contacts[0].bearing_deg = f32::NAN;
+
+        worker.publish(&snapshot);
+
+        let body = Persist::open(root)
+            .expect("open bus")
+            .read_latest(&airspace_state_topic("rig-1"))
+            .expect("read bus")
+            .and_then(|message| message.body)
+            .expect("published body");
+        let published: AirspaceSnapshot = serde_json::from_str(&body).expect("decode body");
+        assert_eq!(published.availability, AirspaceAvailability::Offline);
+        assert!(published.contacts.is_empty());
+        assert!(published
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("malformed contact")));
     }
 }

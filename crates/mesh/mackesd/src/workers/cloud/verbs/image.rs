@@ -28,9 +28,9 @@ use sha2::{Digest, Sha256};
 
 use mackes_mesh_types::cloud::{CloudReply, DeliveryType, ImageRow};
 
-use crate::image_catalog::{images_dir, load_manifests, record_manifest, ImageKind, ImageManifest};
+use crate::image_catalog::{ImageKind, ImageManifest, images_dir, load_manifests, record_manifest};
 
-use super::super::{path_key, CloudWorker};
+use super::super::{CloudWorker, path_key};
 
 /// The disk builder binary — bootc image-mode → osbuild bridge. Produces the golden
 /// qcow2 from a bootc container image (the same tool `packaging/bootc/build-image.sh`
@@ -48,6 +48,25 @@ const DEFAULT_BOOTC_IMAGE: &str = "localhost/magic-mesh-bootc:latest";
 /// normal `name[:tag][@algorithm:hex-digest]` forms while refusing shell/control
 /// characters, path-shaped names, and option-shaped values before auth/replay.
 const MAX_IMAGE_REFERENCE_BYTES: usize = 4096;
+
+/// Bound the complete verb body before serde can walk or allocate from it.
+const MAX_IMAGE_REQUEST_BYTES: usize = 64 * 1024;
+
+/// Bound text that is copied into the provider-neutral reply envelope.
+const MAX_REPLY_TEXT_BYTES: usize = 4096;
+
+/// Keep a failed builder from turning its diagnostic stream into an unbounded
+/// raw-log bus payload.
+const MAX_RAW_LOG_BYTES: usize = 64 * 1024;
+
+/// Marker and sidecar files are replicated state, not trusted local constants.
+const MAX_STORE_TEXT_BYTES: usize = 4096;
+
+/// Keep a hostile image store from turning one list reply into an unbounded
+/// roster. The order remains the catalog's existing newest-first order.
+const MAX_IMAGE_ROWS: usize = 256;
+
+const TEXT_TRUNCATION_MARKER: &str = "\n[output truncated]";
 
 /// The SHA256 sidecar written next to `manifest.toml` in each versioned dir — the
 /// verified content hash the Syncthing lane checks + the [`ImageRow`] surfaces.
@@ -230,7 +249,24 @@ fn valid_registry_port(port: &str) -> bool {
 
 /// Route an `image-build` request to its sub-action handler.
 pub(crate) fn handle(w: &CloudWorker, verb_name: &str, raw: &str) -> CloudReply {
-    let body: ImageBuildBody = serde_json::from_str(raw.trim()).unwrap_or_default();
+    if raw.len() > MAX_IMAGE_REQUEST_BYTES {
+        return reject(
+            verb_name,
+            format!("image-build request exceeds {MAX_IMAGE_REQUEST_BYTES} bytes"),
+        );
+    }
+    let body: ImageBuildBody = match serde_json::from_str(raw.trim()) {
+        Ok(body) => body,
+        Err(error) => {
+            return reject(
+                verb_name,
+                format!(
+                    "invalid image-build request: {}",
+                    bounded_text(&error.to_string(), MAX_REPLY_TEXT_BYTES)
+                ),
+            );
+        }
+    };
     match body
         .action
         .as_deref()
@@ -253,7 +289,7 @@ pub(crate) fn handle(w: &CloudWorker, verb_name: &str, raw: &str) -> CloudReply 
 fn list(w: &CloudWorker, verb_name: &str) -> CloudReply {
     CloudReply {
         ok: true,
-        verb: verb_name.to_string(),
+        verb: reply_verb(verb_name),
         images: Some(load_rows(&w.state_root)),
         ..Default::default()
     }
@@ -383,7 +419,7 @@ fn build(w: &CloudWorker, verb_name: &str, body: &ImageBuildBody, raw: &str) -> 
     let promoted = read_promoted(&w.state_root, &name).as_deref() == Some(version.as_str());
     CloudReply {
         ok: true,
-        verb: verb_name.to_string(),
+        verb: reply_verb(verb_name),
         images: Some(vec![ImageRow {
             name,
             sha256,
@@ -458,7 +494,7 @@ fn promote(w: &CloudWorker, verb_name: &str, body: &ImageBuildBody, raw: &str) -
     };
     // The SHA256 verification: the recorded sidecar must match the artifact's bytes.
     match read_sha(&w.state_root, &name, version) {
-        Some(recorded) if recorded.trim() != actual => {
+        Ok(Some(recorded)) if recorded.trim() != actual => {
             return error(
                 verb_name,
                 format!(
@@ -469,12 +505,13 @@ fn promote(w: &CloudWorker, verb_name: &str, body: &ImageBuildBody, raw: &str) -
             );
         }
         // No sidecar (a legacy build) — record the verified hash now as the baseline.
-        None => {
+        Ok(None) => {
             if let Err(e) = std::fs::write(version_dir.join(SHA_SIDECAR), &actual) {
                 return error(verb_name, format!("record SHA256 sidecar: {e}"));
             }
         }
-        _ => {}
+        Ok(Some(_)) => {}
+        Err(e) => return error(verb_name, format!("read SHA256 sidecar: {e}")),
     }
 
     let marker = images_dir(&w.state_root).join(&name).join(PROMOTED_MARKER);
@@ -483,7 +520,7 @@ fn promote(w: &CloudWorker, verb_name: &str, body: &ImageBuildBody, raw: &str) -
     }
     CloudReply {
         ok: true,
-        verb: verb_name.to_string(),
+        verb: reply_verb(verb_name),
         images: Some(vec![ImageRow {
             name,
             sha256: actual,
@@ -502,6 +539,12 @@ fn load_rows(root: &Path) -> Vec<ImageRow> {
     let mut seen = std::collections::BTreeSet::new();
     let mut rows = Vec::new();
     for m in &manifests {
+        if rows.len() >= MAX_IMAGE_ROWS {
+            break;
+        }
+        if path_key::segment("image name", &m.name).is_err() {
+            continue;
+        }
         if !seen.insert(m.name.clone()) {
             continue;
         }
@@ -517,7 +560,10 @@ fn load_rows(root: &Path) -> Vec<ImageRow> {
             .unwrap_or(m);
         rows.push(ImageRow {
             name: chosen.name.clone(),
-            sha256: read_sha(root, &chosen.name, &chosen.version).unwrap_or_default(),
+            sha256: read_sha(root, &chosen.name, &chosen.version)
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
             promoted: promoted_ver.as_deref() == Some(chosen.version.as_str()),
         });
     }
@@ -527,20 +573,63 @@ fn load_rows(root: &Path) -> Vec<ImageRow> {
 /// Read the promotion marker for `name` (the active-base version), if set.
 fn read_promoted(root: &Path, name: &str) -> Option<String> {
     path_key::segment("image name", name).ok()?;
-    std::fs::read_to_string(images_dir(root).join(name).join(PROMOTED_MARKER))
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    let value = read_bounded_text(
+        &images_dir(root).join(name).join(PROMOTED_MARKER),
+        "promotion marker",
+    )
+    .ok()??;
+    let value = value.trim();
+    path_key::segment("promoted version", value).ok()?;
+    Some(value.to_string())
 }
 
 /// Read the recorded SHA256 sidecar for `name@version`, if present.
-fn read_sha(root: &Path, name: &str, version: &str) -> Option<String> {
-    path_key::segment("image name", name).ok()?;
-    path_key::segment("image version", version).ok()?;
-    std::fs::read_to_string(images_dir(root).join(name).join(version).join(SHA_SIDECAR))
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+fn read_sha(root: &Path, name: &str, version: &str) -> Result<Option<String>, String> {
+    path_key::segment("image name", name)?;
+    path_key::segment("image version", version)?;
+    let Some(value) = read_bounded_text(
+        &images_dir(root).join(name).join(version).join(SHA_SIDECAR),
+        "SHA256 sidecar",
+    )?
+    else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("SHA256 sidecar is not a 64-character hexadecimal digest".to_string());
+    }
+    Ok(Some(value.to_string()))
+}
+
+/// Read replicated text with a hard byte ceiling. The metadata check avoids a
+/// large allocation in the usual case; `take(cap + 1)` also closes the race where
+/// a file grows after metadata was read. Missing files retain the old optional
+/// semantics, while malformed/oversized present files fail closed.
+fn read_bounded_text(path: &Path, label: &str) -> Result<Option<String>, String> {
+    use std::io::Read as _;
+
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("read {label}: {error}")),
+    };
+    let declared_len = file
+        .metadata()
+        .map_err(|error| format!("stat {label}: {error}"))?
+        .len();
+    if declared_len > MAX_STORE_TEXT_BYTES as u64 {
+        return Err(format!("{label} exceeds {MAX_STORE_TEXT_BYTES} bytes"));
+    }
+    let mut bytes = Vec::with_capacity((declared_len as usize).saturating_add(1));
+    file.take((MAX_STORE_TEXT_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read {label}: {error}"))?;
+    if bytes.len() > MAX_STORE_TEXT_BYTES {
+        return Err(format!("{label} exceeds {MAX_STORE_TEXT_BYTES} bytes"));
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| format!("{label} is not valid UTF-8"))
 }
 
 /// The produced disk artifact under `dir`: the largest file (recursively) with a
@@ -613,10 +702,11 @@ fn now_ms_u64() -> u64 {
 
 /// An honest gate reply (the backend/tool isn't in a state to serve this verb).
 fn gated(verb_name: &str, why: impl Into<String>) -> CloudReply {
+    let why = why.into();
     CloudReply {
         ok: false,
-        verb: verb_name.to_string(),
-        gated: Some(why.into()),
+        verb: reply_verb(verb_name),
+        gated: Some(bounded_text(&why, MAX_REPLY_TEXT_BYTES)),
         ..Default::default()
     }
 }
@@ -625,8 +715,8 @@ fn gated(verb_name: &str, why: impl Into<String>) -> CloudReply {
 fn reject(verb_name: &str, why: String) -> CloudReply {
     CloudReply {
         ok: false,
-        verb: verb_name.to_string(),
-        error: Some(why),
+        verb: reply_verb(verb_name),
+        error: Some(bounded_text(&why, MAX_REPLY_TEXT_BYTES)),
         ..Default::default()
     }
 }
@@ -635,8 +725,8 @@ fn reject(verb_name: &str, why: String) -> CloudReply {
 fn error(verb_name: &str, why: String) -> CloudReply {
     CloudReply {
         ok: false,
-        verb: verb_name.to_string(),
-        error: Some(why),
+        verb: reply_verb(verb_name),
+        error: Some(bounded_text(&why, MAX_REPLY_TEXT_BYTES)),
         ..Default::default()
     }
 }
@@ -646,19 +736,40 @@ fn error(verb_name: &str, why: String) -> CloudReply {
 fn error_with_log(verb_name: &str, why: String, log: String) -> CloudReply {
     CloudReply {
         ok: false,
-        verb: verb_name.to_string(),
-        error: Some(why),
-        raw_log: Some(log).filter(|s| !s.is_empty()),
+        verb: reply_verb(verb_name),
+        error: Some(bounded_text(&why, MAX_REPLY_TEXT_BYTES)),
+        raw_log: Some(bounded_text(&log, MAX_RAW_LOG_BYTES)).filter(|s| !s.is_empty()),
         ..Default::default()
     }
 }
 
 fn pick_log(stdout: &str, stderr: &str) -> String {
-    if stderr.trim().is_empty() {
-        stdout.trim().to_string()
+    let selected = if stderr.trim().is_empty() {
+        stdout.trim()
     } else {
-        stderr.trim().to_string()
+        stderr.trim()
+    };
+    bounded_text(selected, MAX_RAW_LOG_BYTES)
+}
+
+fn reply_verb(verb_name: &str) -> String {
+    bounded_text(verb_name, MAX_REPLY_TEXT_BYTES)
+}
+
+/// Truncate on a UTF-8 boundary while retaining a visible diagnostic marker.
+fn bounded_text(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
     }
+    let keep = max_bytes.saturating_sub(TEXT_TRUNCATION_MARKER.len());
+    let mut end = keep.min(value.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut bounded = String::with_capacity(end + TEXT_TRUNCATION_MARKER.len());
+    bounded.push_str(&value[..end]);
+    bounded.push_str(TEXT_TRUNCATION_MARKER);
+    bounded
 }
 
 #[cfg(test)]
@@ -667,7 +778,7 @@ mod tests {
 
     use super::super::super::gate::{ArmedToken, HmacTokenSigner};
     use super::super::super::runner::fake::FakeRunner;
-    use super::super::super::{now_ms, CloudWorker};
+    use super::super::super::{CloudWorker, now_ms};
     use super::*;
 
     const KEY: &[u8] = b"test-mesh-arming-key";
@@ -769,7 +880,11 @@ mod tests {
         assert_eq!(manifests[0].version, "1.0");
         assert_eq!(manifests[0].kind, "vm");
         // The SHA256 sidecar replicates alongside the image.
-        assert!(read_sha(tmp.path(), "desktop_vm-golden", "1.0").is_some());
+        assert!(
+            read_sha(tmp.path(), "desktop_vm-golden", "1.0")
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -789,10 +904,12 @@ mod tests {
         let first = w.handle("image-build", &raw);
         assert!(!first.ok);
         assert!(first.gated.is_none(), "invalid input must not reach auth");
-        assert!(first
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("must not begin with `-`")));
+        assert!(
+            first
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("must not begin with `-`"))
+        );
 
         // Replaying the exact request reaches the same pre-auth rejection: the
         // armed nonce was never claimed, and the runner was never dispatched.
@@ -800,6 +917,148 @@ mod tests {
         assert_eq!(second.error, first.error);
         assert!(second.gated.is_none());
         assert!(runner.tool_calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn oversized_request_is_rejected_before_deserialization_auth_or_runner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runner = Arc::new(FakeRunner::default());
+        let w = staged_worker(tmp.path(), runner.clone());
+        let raw = format!(
+            r#"{{"schema_version":1,"node":"me","action":"build","name":"{}"}}"#,
+            "x".repeat(MAX_IMAGE_REQUEST_BYTES)
+        );
+
+        // Call this verb seam directly: the shared cloud envelope has its own
+        // equal-or-smaller RPC cap and would reject the body before the
+        // image-specific boundary can be exercised.
+        let reply = handle(&w, "image-build", &raw);
+        assert!(!reply.ok);
+        assert!(reply.gated.is_none(), "oversized input must fail closed");
+        assert!(
+            reply
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("request exceeds"))
+        );
+        assert!(
+            reply
+                .error
+                .as_deref()
+                .is_some_and(|error| error.len() <= MAX_REPLY_TEXT_BYTES)
+        );
+        assert!(runner.tool_calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn replicated_marker_and_sidecar_caps_are_fail_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runner = Arc::new(FakeRunner::default());
+        let w = armed_worker(tmp.path(), runner);
+        let raw = armed_request(serde_json::json!({
+            "schema_version": 1,
+            "node": "me", "action": "build", "name": "gold", "version": "1.0"
+        }));
+        assert!(w.handle("image-build", &raw).ok);
+
+        let image_dir = images_dir(tmp.path()).join("gold");
+        std::fs::write(
+            image_dir.join(PROMOTED_MARKER),
+            "2".repeat(MAX_STORE_TEXT_BYTES + 1),
+        )
+        .unwrap();
+        std::fs::write(
+            image_dir.join("1.0").join(SHA_SIDECAR),
+            "a".repeat(MAX_STORE_TEXT_BYTES + 1),
+        )
+        .unwrap();
+
+        let listed = w
+            .handle(
+                "image-build",
+                r#"{"schema_version":1,"node":"me","action":"list"}"#,
+            )
+            .images
+            .expect("roster");
+        assert_eq!(listed.len(), 1);
+        assert!(!listed[0].promoted, "an oversized marker is not trusted");
+        assert!(
+            listed[0].sha256.is_empty(),
+            "an oversized sidecar is not surfaced"
+        );
+
+        let promote_raw = armed_request(serde_json::json!({
+            "schema_version": 1,
+            "node": "me", "action": "promote", "name": "gold", "version": "1.0"
+        }));
+        let reply = w.handle("image-build", &promote_raw);
+        assert!(!reply.ok);
+        assert!(
+            reply
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("sidecar"))
+        );
+        assert!(
+            reply
+                .error
+                .as_deref()
+                .is_some_and(|error| error.len() <= MAX_REPLY_TEXT_BYTES)
+        );
+    }
+
+    #[test]
+    fn image_roster_and_diagnostics_are_bounded_before_reply() {
+        let tmp = tempfile::tempdir().unwrap();
+        for index in 0..=MAX_IMAGE_ROWS {
+            record_manifest(
+                &ImageManifest {
+                    name: format!("gold-{index:03}"),
+                    kind: ImageKind::Vm.as_str().to_string(),
+                    version: "1".to_string(),
+                    built_at_ms: Some(index as u64),
+                    size_bytes: None,
+                    profile: None,
+                },
+                tmp.path(),
+            )
+            .unwrap();
+        }
+
+        let reply = list(
+            &armed_worker(tmp.path(), Arc::new(FakeRunner::default())),
+            "image-build",
+        );
+        let rows = reply.images.expect("roster");
+        assert_eq!(rows.len(), MAX_IMAGE_ROWS);
+        assert!(rows.iter().all(|row| row.name.len() <= 255));
+
+        let huge = "é".repeat(MAX_RAW_LOG_BYTES + 32);
+        let huge_verb = "v".repeat(MAX_REPLY_TEXT_BYTES + 32);
+        let diagnostic = error_with_log(
+            &huge_verb,
+            "e".repeat(MAX_REPLY_TEXT_BYTES + 32),
+            pick_log(&huge, ""),
+        );
+        assert!(diagnostic.verb.len() <= MAX_REPLY_TEXT_BYTES);
+        assert!(
+            diagnostic
+                .error
+                .as_deref()
+                .is_some_and(|error| error.len() <= MAX_REPLY_TEXT_BYTES)
+        );
+        assert!(
+            diagnostic
+                .raw_log
+                .as_deref()
+                .is_some_and(|log| log.len() <= MAX_RAW_LOG_BYTES)
+        );
+        assert!(
+            diagnostic
+                .raw_log
+                .as_deref()
+                .is_some_and(|log| log.is_char_boundary(log.len()))
+        );
     }
 
     #[test]

@@ -51,6 +51,10 @@ pub const MAX_ENROLL_RESPONSE_BYTES: usize = 256 * 1024;
 /// endpoint emits only a few small headers; a hostile peer must not spend the
 /// complete response budget on header scanning instead of the bundle body.
 pub const MAX_ENROLL_RESPONSE_HEADER_BYTES: usize = 16 * 1024;
+/// A generated Nebula X25519 public key is a tiny PEM document. Keep a
+/// compromised or replaced `nebula-cert` output from becoming an oversized
+/// requester string before validation or CSR serialization.
+const MAX_REQUESTER_PUBLIC_KEY_BYTES: usize = 4096;
 
 /// XPA-11 — the enroll transport occasionally fails on the first attempt (the
 /// lighthouse busy, a cold relay path), so `network_enroll` retries **transient
@@ -268,8 +272,7 @@ fn generate_requester_nebula_key_with_binary(
         .map_err(|e| NetEnrollError::Materialize(format!("chmod private key: {e}")))?;
     crate::ca::seal::read_sealed(&private_key_path)
         .map_err(|e| NetEnrollError::Materialize(format!("validate private key: {e}")))?;
-    let public_key_pem = std::fs::read_to_string(&public_key_path)
-        .map_err(|e| NetEnrollError::Materialize(format!("read requester public key: {e}")))?;
+    let public_key_pem = read_requester_public_key(&public_key_path)?;
     let _ = std::fs::remove_file(public_key_path);
     crate::ca::sign::validate_nebula_public_key_pem(&public_key_pem).map_err(|e| {
         NetEnrollError::Materialize(format!("nebula-cert emitted an invalid public key: {e}"))
@@ -279,6 +282,22 @@ fn generate_requester_nebula_key_with_binary(
         staging_dir,
         private_key_path,
         public_key_pem,
+    })
+}
+
+/// Read the generated public half through the same no-follow descriptor seam
+/// used by other local enrollment material, then apply the much smaller PEM
+/// contract before allocating the owned request string.
+fn read_requester_public_key(path: &Path) -> Result<String, NetEnrollError> {
+    let bytes = crate::ca::seal::read_no_follow(path)
+        .map_err(|e| NetEnrollError::Materialize(format!("read requester public key: {e}")))?;
+    if bytes.len() > MAX_REQUESTER_PUBLIC_KEY_BYTES {
+        return Err(NetEnrollError::Materialize(format!(
+            "requester public key exceeds {MAX_REQUESTER_PUBLIC_KEY_BYTES} bytes"
+        )));
+    }
+    String::from_utf8(bytes).map_err(|e| {
+        NetEnrollError::Materialize(format!("requester public key is not UTF-8: {e}"))
     })
 }
 
@@ -1089,6 +1108,17 @@ printf '%s\\n' '-----BEGIN NEBULA X25519 PUBLIC KEY-----' 'AAAAAAAAAAAAAAAAAAAAA
         )
         .expect_err("parent components must fail before keygen");
         assert!(error.to_string().contains("parent component"));
+    }
+
+    #[test]
+    fn requester_public_key_read_rejects_oversized_generated_output() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("host.pub");
+        std::fs::write(&path, vec![b'x'; MAX_REQUESTER_PUBLIC_KEY_BYTES + 1])
+            .expect("hostile public key");
+
+        let error = read_requester_public_key(&path).expect_err("oversized PEM must fail closed");
+        assert!(error.to_string().contains("requester public key exceeds"));
     }
 
     // ---- the pinning verifier (security-critical) -----------
