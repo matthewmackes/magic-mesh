@@ -20,7 +20,7 @@ instead of leaving closed work in this file.
 
 - **6 active epics:** 6 `Remaining`, 0 `Blocked`; no `Needs clarification`.
 - **Release gate:** the current integrated wave passes the full `mackesd` farm
-  suite at **4,113 passed, 0 failed, 1 ignored**. The Fedora 44
+  suite at **4,124 passed, 0 failed, 1 ignored**. The Fedora 44
   base/browser/thin-lighthouse RPM cut is green at **81.7 / 39.1 / 11.0 MiB**;
   the exact base RPM requires the F44 FFmpeg ABI (`libavcodec.so.62`,
   `libswresample.so.6`, `libswscale.so.9`).
@@ -658,6 +658,14 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-ARCH-007 - Repair Workloads cockpit E2E wire, placement, and authorization
 
 - Status: Remaining
+- Progress (2026-07-25 signed onboarding transport): `BusApply` now signs and
+  publishes a bounded JobBundle, waits for a matching target acknowledgement,
+  and rejects unrelated or expired responses. `OpenBroker` now carries full
+  session context, and the target `LocalApplier` persists the exact
+  `SessionRequest::Open`; focused remote-push tests pass **24/24**, the target
+  onboard worker passes **12/12**, and the integrated BigBoy `mackesd` gate is
+  **4,124 passed, 0 failed, 1 ignored**. Bootstrap SSH plus live
+  libvirt/Podman/Cuttlefish evidence remain external.
 - Progress (2026-07-25 container-lifecycle argv boundary): container lifecycle
   helpers now terminate option parsing before systemd unit targets and bind
   journal targets as `--unit=...`, preserving valid names while preventing
@@ -1016,6 +1024,11 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-011 - Communications collaboration suite full replacement
 
 - Status: Remaining
+- Progress (2026-07-25 no-peer call boundary): Communications now rejects stale
+  selected spaces and disables call-start controls when the selected space has
+  no other member, showing an honest no-peer state instead of emitting a call
+  target. The full Communications suite passes **77/77**; live
+  WebRTC/SIP/LiveKit/media and real partition evidence remain external.
 - Progress (2026-07-25 collaboration input boundary): Communications send,
   edit, and thread-reply editors now cap restored and pasted UTF-8 input at the
   256 KiB command-body limit before layout or action emission, preserving valid
@@ -1637,6 +1650,10 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-012 - Maps live-data overlays (zero-cost external feeds)
 
 - Status: Remaining
+- Progress (2026-07-25 map popup viewport boundary): the Layers popup now
+  clamps offscreen anchors inside non-zero short workspace clips while
+  preserving visible checkbox hit targets. The full Maps suite passes
+  **233/233**; live provider and MG90 scanner-feed evidence remain external.
 - Progress (2026-07-25 gazetteer parent/race boundary): offline Home-address
   geocoding now rejects symlinked or non-directory parent components and opens
   a validated regular database through a stable descriptor-backed SQLite URI,
@@ -2554,6 +2571,12 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-007 - Car interface (CarPlay-principled vehicle mode)
 
 - Status: Remaining
+- Progress (2026-07-25 MG90 diagnostic-plane boundary): the vehicle adapter now
+  reads only an explicitly configured `/obdii_status/` or `/hdobd_status/`
+  MG90 application page, bounds the access contract to those paths, and keeps
+  unknown payloads diagnostic-only instead of fabricating typed OBD telemetry.
+  Focused vehicle tests pass **35/35**; live MG90 and physical Car evidence
+  remain external.
 - Progress (2026-07-25 Car keymap persistence boundary): persisted Car
   bindings now walk real parent directories, reject symlinked/special final
   leaves, use private create-new temporary files, and atomically replace the

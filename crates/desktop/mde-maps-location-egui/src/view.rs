@@ -427,6 +427,22 @@ fn bounded_popup_rect(anchor: Rect, clip: Rect, desired_width: f32, desired_heig
         return Rect::NOTHING;
     }
 
+    // A wrapped/scrolling parent can leave the launcher partially or wholly
+    // outside the visible workspace.  Normalize the anchor to the visible
+    // portion before choosing above/below; otherwise the distance from an
+    // off-screen anchor can push the popup back out of the clip on short seats.
+    let anchor = anchor.intersect(clip);
+    let anchor = if anchor.is_positive() {
+        anchor
+    } else {
+        let point = anchor.center();
+        let point = egui::pos2(
+            point.x.clamp(clip.left(), clip.right()),
+            point.y.clamp(clip.top(), clip.bottom()),
+        );
+        Rect::from_min_max(point, point)
+    };
+
     let width = desired_width.max(1.0).min(clip.width().max(1.0));
     let desired_height = desired_height.max(1.0).min(clip.height().max(1.0));
     let left = anchor
@@ -437,12 +453,13 @@ fn bounded_popup_rect(anchor: Rect, clip: Rect, desired_width: f32, desired_heig
 
     if below >= above {
         let height = desired_height.min(below.max(1.0));
-        let top =
-            (anchor.bottom() + MAP_LAYERS_POPUP_GAP).min((clip.bottom() - height).max(clip.top()));
+        let top = (anchor.bottom() + MAP_LAYERS_POPUP_GAP)
+            .clamp(clip.top(), (clip.bottom() - height).max(clip.top()));
         Rect::from_min_size(egui::pos2(left, top), egui::vec2(width, height))
     } else {
         let height = desired_height.min(above.max(1.0));
-        let bottom = (anchor.top() - MAP_LAYERS_POPUP_GAP).max(clip.top() + height);
+        let bottom = (anchor.top() - MAP_LAYERS_POPUP_GAP)
+            .clamp((clip.top() + height).min(clip.bottom()), clip.bottom());
         Rect::from_min_size(egui::pos2(left, bottom - height), egui::vec2(width, height))
     }
 }
@@ -6257,6 +6274,27 @@ mod tests {
             !map.nws_alert_overlay,
             "a visible Layers checkbox must remain clickable after popup scrolling"
         );
+    }
+
+    #[test]
+    fn layers_popup_clamps_offscreen_anchors_inside_non_zero_short_clip() {
+        let clip = Rect::from_min_size(egui::pos2(147.0, 83.0), egui::vec2(106.0, 75.0));
+        let anchors = [
+            // A wrapped control row that ended above the reserved workspace.
+            Rect::from_min_size(egui::pos2(180.0, 20.0), egui::vec2(48.0, 18.0)),
+            // A control row clipped below a very short workspace.
+            Rect::from_min_size(egui::pos2(180.0, 170.0), egui::vec2(48.0, 18.0)),
+        ];
+
+        for anchor in anchors {
+            let popup = bounded_popup_rect(anchor, clip, MAP_LAYERS_POPUP_WIDTH, 360.0);
+            assert!(
+                clip.contains_rect(popup),
+                "popup escaped non-zero workspace clip: clip={clip:?} anchor={anchor:?} popup={popup:?}"
+            );
+            assert_eq!(popup.width(), clip.width());
+            assert!(popup.height() > 0.0);
+        }
     }
 
     #[test]

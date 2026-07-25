@@ -32,10 +32,10 @@
 //!
 //! # Scope (first cut)
 //! `PinRole` + `SealSecret` — OW-11's day-2 Music path (pin the Media role + seal
-//! `media-spaces` on a target lighthouse) — land as real node-local effects via
-//! [`LocalApplier`]. `RunEnroll` (a bootstrap SSH step) and `OpenBroker` (the Bus
-//! publish the broker owns) are honestly [`RemotePushError::NotWired`] here, named
-//! to the owning layer — never faked.
+//! `media-spaces` on a target lighthouse) — and `OpenBroker`, which carries the
+//! complete session context and lands as the exact `SessionRequest::Open` Bus
+//! message through [`LocalApplier`]. `RunEnroll` remains the bootstrap SSH step
+//! and is honestly [`RemotePushError::NotWired`] here — never faked.
 
 #![cfg(feature = "async-services")]
 
@@ -111,6 +111,13 @@ pub struct ApplyResultEvent {
     pub issuer: String,
     /// The node that applied (or refused) — this node's id.
     pub target: String,
+    /// The signed bundle nonce, echoed so a BusApply caller can correlate the
+    /// observed-state reply without trusting arrival order.
+    ///
+    /// `default` keeps older event records readable while all newly emitted
+    /// events carry the nonce from the bundle.
+    #[serde(default)]
+    pub nonce: String,
     /// The redacted descriptions of the actions that applied, in order (empty on a
     /// rejection).
     #[serde(default)]
@@ -125,6 +132,7 @@ impl ApplyResultEvent {
         Self {
             issuer: action.issuer.clone(),
             target: target.to_string(),
+            nonce: action.bundle.nonce.clone(),
             applied: Vec::new(),
             error: Some(why),
         }
@@ -289,6 +297,7 @@ pub fn resolve(
         Ok(outcome) => ApplyResultEvent {
             issuer: action.issuer.clone(),
             target: self_node_id.to_string(),
+            nonce: action.bundle.nonce.clone(),
             applied: outcome.applied,
             error: None,
         },
@@ -625,6 +634,7 @@ mod tests {
             ev.error.is_none(),
             "authorized+valid bundle applies: {ev:?}"
         );
+        assert_eq!(ev.nonce, b.nonce, "success echoes the signed bundle nonce");
         assert_eq!(ev.applied.len(), 2);
         assert!(ev.applied[0].contains("pin-role lighthouse"));
         // The secret material never appears in the observed-state echo (§8).
@@ -646,6 +656,7 @@ mod tests {
         // this node is a DIFFERENT peer ⇒ ignored, nothing applied
         let ev = resolve(&action, "peer:other", &resolver(&k), now, &mut guard, &app);
         assert!(ev.error.is_some());
+        assert_eq!(ev.nonce, b.nonce, "rejection echoes the signed bundle nonce");
         assert!(app.applied.lock().expect("mutex").is_empty());
     }
 
@@ -759,6 +770,7 @@ mod tests {
         assert_eq!(sent[0].0, EVENT_TOPIC);
         let ev: ApplyResultEvent = serde_json::from_str(&sent[0].1).expect("event parses");
         assert_eq!(ev.target, "peer:me");
+        assert_eq!(ev.nonce, b.nonce, "worker event carries the bundle nonce");
         assert!(ev.error.is_none(), "authorized valid apply: {ev:?}");
         assert_eq!(ev.applied.len(), 2);
         drop(sent);
@@ -767,6 +779,15 @@ mod tests {
         w.drain_and_publish(&bus, &mut cursor);
         assert_eq!(log.lock().expect("recorder mutex").len(), 1);
         let _ = std::fs::remove_dir_all(&bus);
+    }
+
+    #[test]
+    fn result_event_reads_legacy_payload_without_a_nonce() {
+        let event: ApplyResultEvent = serde_json::from_str(
+            r#"{"issuer":"peer:lh","target":"peer:me","applied":[],"error":null}"#,
+        )
+        .expect("legacy event parses");
+        assert!(event.nonce.is_empty(), "missing legacy nonce uses the default");
     }
 
     #[test]

@@ -560,6 +560,9 @@ impl FirstDesktopApply for LiveFirstDesktop {
         };
         let actions = [crate::onboard::remote_push::Action::OpenBroker {
             session_id: open.session_id.clone(),
+            serving_peer: open.serving_peer.clone(),
+            vm_id: open.vm_id.clone(),
+            client_peer: open.client_peer.clone(),
         }];
         self.remote_push.apply(&target, &actions).map_err(|e| {
             use crate::onboard::remote_push::RemotePushError as R;

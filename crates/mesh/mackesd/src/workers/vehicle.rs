@@ -37,6 +37,11 @@
 //! - `MDE_VEHICLE_STATUS_PORT` — optional local UDP port for the MG90 documented
 //!   JSON Status Broadcast. When configured, the beacon is preferred for GNSS,
 //!   ignition, battery, and temperature; LCI/NMEA remain fallbacks.
+//! - `MDE_VEHICLE_OBD_STATUS_PATH` — optional, explicit MG90 application path for
+//!   an OBD/HDOBD diagnostic read. Only the documented `/obdii_status/` and
+//!   `/hdobd_status/` paths are accepted. The response is currently a transport
+//!   diagnostic only; it is never promoted into typed OBD telemetry without a
+//!   verified payload schema.
 //! - HTTP auth is the fixed oMG `admin`/`admin` LCI login for this deployment; the
 //!   standalone `mg90-access` helper exposes the LCI and application planes with
 //!   a root-only HTTP password file.
@@ -92,6 +97,11 @@ const ROOT_PASSWORD_NOFOLLOW_FLAG: i32 = 0o400000;
 
 /// Optional env: local UDP port receiving the MG90 JSON Status Broadcast.
 pub const STATUS_PORT_ENV: &str = "MDE_VEHICLE_STATUS_PORT";
+
+/// Optional env: one of the documented MG90 application pages that exposes the
+/// OBD/HDOBD status surface. Keeping this opt-in prevents an unverified app page
+/// from being mistaken for typed OBD telemetry.
+pub const OBD_STATUS_PATH_ENV: &str = "MDE_VEHICLE_OBD_STATUS_PATH";
 
 /// Readiness of the local receiver for the MG90's documented Status Broadcast.
 ///
@@ -155,7 +165,7 @@ const LCI_WAN_URL: &str = "MG-LCI/wan/status/status.html?displayExtended=true";
 
 // ─────────────────────────── the injectable probe seam ───────────────────────────
 
-/// The raw-text read seam the worker folds into a [`VehicleState`]: four methods,
+/// The raw-text read seam the worker folds into a [`VehicleState`]: five methods,
 /// each returning the RAW text the adapter reads, so tests inject a fake without a
 /// live gateway (the same applier-injection idiom as the `cloud` worker's
 /// `CloudRunner` seam).
@@ -184,6 +194,14 @@ pub trait VehicleProbe: Send + Sync {
     /// stream is `Ok(None)`; malformed packets are an `Err` so callers preserve an
     /// honest gap rather than silently accepting partial data.
     fn read_status_beacon(&self) -> io::Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// The optional authenticated MG90 OBD/HDOBD application page. The current
+    /// repository has evidence for the page paths but not a stable response
+    /// schema, so callers must keep the result diagnostic-only until that schema
+    /// is verified against a real device.
+    fn read_obd_status(&self) -> io::Result<Option<String>> {
         Ok(None)
     }
 
@@ -294,14 +312,42 @@ impl SshHttpProbe {
     /// POST the fixed `admin`/`admin` FORM login (`j_security_check`, follow the 303),
     /// then GET the target page carrying the session cookie.
     fn http_authed_get(&self, page_url: &str) -> io::Result<String> {
+        self.http_authed_get_at(80, Some("MG-LCI"), page_url)
+    }
+
+    /// Fetch one explicitly allowlisted MG90 application page on port 11532.
+    /// This shares the same session shape as `mg90-access.sh app-get`, but does
+    /// not interpret the returned page.
+    fn http_app_authed_get(&self, page_url: &str) -> io::Result<String> {
+        self.http_authed_get_at(11532, None, page_url)
+    }
+
+    /// Perform the MG90 form-authenticated GET on either the LCI or application
+    /// HTTP service. `auth_prefix` is fixed by the service (`MG-LCI` for port 80,
+    /// absent for the application service); callers never supply it from input.
+    fn http_authed_get_at(
+        &self,
+        port: u16,
+        auth_prefix: Option<&str>,
+        page_url: &str,
+    ) -> io::Result<String> {
         let jar = self.jar_path();
         let jar_str = jar.display().to_string();
-        let base = self.base_url();
-        let lci = format!("{base}MG-LCI/");
-        let login = format!("{base}MG-LCI/j_security_check");
-        let page = format!("{base}{page_url}");
+        let base = if port == 80 {
+            self.base_url()
+        } else {
+            format!("http://{}:{port}/", self.ip)
+        };
+        let prefix = auth_prefix.unwrap_or("").trim_matches('/');
+        let login_base = if prefix.is_empty() {
+            base.clone()
+        } else {
+            format!("{base}{prefix}/")
+        };
+        let login = format!("{login_base}j_security_check");
+        let page = format!("{base}{}", page_url.trim_start_matches('/'));
         // 1) prime the Tomcat session (sets JSESSIONID in the jar).
-        Self::curl(&["-s", "-c", &jar_str, "-b", &jar_str, "-L", &lci])?;
+        Self::curl(&["-s", "-c", &jar_str, "-b", &jar_str, "-L", &login_base])?;
         // 2) FORM auth — follow the 303 back to the app.
         Self::curl(&[
             "-s",
@@ -460,6 +506,22 @@ impl VehicleProbe for SshHttpProbe {
         self.http_authed_get(LCI_WAN_URL)
     }
 
+    fn read_obd_status(&self) -> io::Result<Option<String>> {
+        let raw = match std::env::var(OBD_STATUS_PATH_ENV) {
+            Ok(raw) => raw,
+            Err(std::env::VarError::NotPresent) => return Ok(None),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{OBD_STATUS_PATH_ENV} is not valid Unicode"),
+                ));
+            }
+        };
+        let path = parse_obd_status_path(&raw)
+            .map_err(|detail| io::Error::new(io::ErrorKind::InvalidInput, detail))?;
+        self.http_app_authed_get(path).map(Some)
+    }
+
     fn read_status_beacon(&self) -> io::Result<Option<String>> {
         if let StatusBroadcastReadiness::ConfigurationError { detail } = &self.status_broadcast {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, detail.clone()));
@@ -505,6 +567,19 @@ fn parse_status_port(raw: &str) -> Result<u16, String> {
         return Err("must be an integer from 1 to 65535".to_string());
     }
     Ok(port)
+}
+
+/// Accept only the two MG90 OBD application paths documented by the repository's
+/// access contract. A free-form URL here would turn a diagnostic opt-in into an
+/// arbitrary authenticated HTTP fetch.
+fn parse_obd_status_path(raw: &str) -> Result<&'static str, String> {
+    match raw {
+        "/obdii_status/" => Ok("/obdii_status/"),
+        "/hdobd_status/" => Ok("/hdobd_status/"),
+        _ => Err(format!(
+            "{OBD_STATUS_PATH_ENV} must be /obdii_status/ or /hdobd_status/"
+        )),
+    }
 }
 
 /// Configure the local receiver for one documented MG90 Status Broadcast port.
@@ -751,8 +826,30 @@ impl VehicleWorker {
 
         // ── vehicle power + OBD telemetry ──
         // The authenticated LCI general page carries the MCU ignition-sense line;
-        // OBD-II remains a separate follow-up and must not be inferred from it.
-        gaps.push("OBD not wired (OBD-II source is a follow-up)".to_string());
+        // OBD-II is a separate application plane. The optional app read below is
+        // deliberately diagnostic-only: the repository documents the page paths
+        // but not a stable payload schema, so no OBD field is inferred here.
+        match probe.read_obd_status() {
+            Ok(Some(raw)) if raw.trim().is_empty() => gaps.push(
+                "OBD application returned an empty response; typed OBD telemetry remains unavailable"
+                    .to_string(),
+            ),
+            Ok(Some(_)) => gaps.push(
+                "OBD application HTTP response received; payload schema is not verified, so typed OBD telemetry remains unavailable"
+                    .to_string(),
+            ),
+            Ok(None) => gaps.push(format!(
+                "OBD not wired; set {OBD_STATUS_PATH_ENV} to /obdii_status/ or /hdobd_status/ for a diagnostic read"
+            )),
+            Err(e) => {
+                let reason = if e.kind() == io::ErrorKind::InvalidInput {
+                    "configuration error"
+                } else {
+                    "unavailable"
+                };
+                gaps.push(format!("OBD application {reason} (HTTP): {e}"));
+            }
+        }
         let telem = VehicleTelem {
             battery_v,
             internal_temp_c,
@@ -1668,6 +1765,7 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         wan: Result<String, String>,
         status: Option<String>,
         status_error: Option<String>,
+        obd_status: Result<Option<String>, String>,
         ssh_out: Result<String, String>,
         ssh_calls: Arc<std::sync::Mutex<Vec<String>>>,
         general_calls: Arc<std::sync::Mutex<u32>>,
@@ -1703,6 +1801,7 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
                 wan: Ok(wan),
                 status: None,
                 status_error: None,
+                obd_status: Ok(None),
                 ssh_out: Ok(FAKE_YAML.to_string()),
                 ssh_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
                 general_calls: Arc::new(std::sync::Mutex::new(0)),
@@ -1740,6 +1839,11 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
                 return Err(io::Error::new(io::ErrorKind::InvalidInput, error.clone()));
             }
             Ok(self.status.clone())
+        }
+        fn read_obd_status(&self) -> io::Result<Option<String>> {
+            self.obd_status
+                .clone()
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error))
         }
         fn run_ssh(&self, cmd: &str) -> io::Result<String> {
             self.ssh_calls.lock().unwrap().push(cmd.to_string());
@@ -1853,6 +1957,46 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
     }
 
     #[test]
+    fn configured_obd_app_response_is_diagnostic_only_until_schema_is_verified() {
+        let probe = FakeProbe {
+            // `currentStatus` is one of the app-side calls named by the MG90
+            // access contract; the payload is intentionally not interpreted.
+            obd_status: Ok(Some(r#"{"currentStatus":{"rpm":1800}}"#.to_string())),
+            ..FakeProbe::real()
+        };
+        let state = worker().build_state(&probe);
+
+        assert!(
+            !state.telem.obd_present,
+            "unknown app fields must not become telemetry"
+        );
+        assert!(state.gaps.iter().any(|gap| {
+            gap.contains("OBD application HTTP response received")
+                && gap.contains("payload schema is not verified")
+        }));
+    }
+
+    #[test]
+    fn obd_app_failure_is_reported_without_collapsing_a_reachable_gateway() {
+        let probe = FakeProbe {
+            obd_status: Err("connection refused".to_string()),
+            ..FakeProbe::real()
+        };
+        let state = worker().build_state(&probe);
+
+        assert!(
+            state.online,
+            "the LCI anchor still makes the gateway reachable"
+        );
+        assert!(!state.telem.obd_present);
+        assert!(state
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("OBD application unavailable")
+                && gap.contains("connection refused")));
+    }
+
+    #[test]
     fn ignition_parser_rejects_unknown_values_without_fabricating_on() {
         let mut gaps = Vec::new();
         assert!(!parse_ignition_state(
@@ -1943,6 +2087,24 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
             assert!(
                 parse_status_port(raw).is_err(),
                 "invalid status port was accepted: {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn obd_status_path_parser_accepts_only_documented_app_surfaces() {
+        assert_eq!(
+            parse_obd_status_path("/obdii_status/"),
+            Ok("/obdii_status/")
+        );
+        assert_eq!(
+            parse_obd_status_path("/hdobd_status/"),
+            Ok("/hdobd_status/")
+        );
+        for raw in ["/", "/obdii_status", "/hdobd_status/extra", "https://host/"] {
+            assert!(
+                parse_obd_status_path(raw).is_err(),
+                "arbitrary app path was accepted: {raw:?}"
             );
         }
     }

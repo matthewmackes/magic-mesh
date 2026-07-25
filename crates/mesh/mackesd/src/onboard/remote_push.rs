@@ -25,6 +25,11 @@ use mde_role::{Role, RoleClass};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "async-services")]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "async-services")]
+use std::time::{Duration, Instant};
+
 /// The bounded, exhaustive set of effects the executor will apply on a target.
 ///
 /// Adding a remote capability means adding a variant here **and** handling it in
@@ -48,8 +53,19 @@ pub enum Action {
     /// Run the RPM-shipped enroll bootstrap so a fresh box joins the mesh
     /// (OW-7 push-enroll). Carries the single-use enroll bearer.
     RunEnroll { bearer: String },
-    /// Open a broker session on a desktop host (OW-8 first-desktop).
-    OpenBroker { session_id: String },
+    /// Open a broker session on a desktop host (OW-8 first-desktop). The full
+    /// broker context is carried so the target can publish the exact authorized
+    /// `SessionRequest::Open` wire verb without inventing peer/VM identities.
+    OpenBroker {
+        /// Stable broker session identifier minted by the first-desktop flow.
+        session_id: String,
+        /// Mesh peer expected to serve the VM desktop session.
+        serving_peer: String,
+        /// VM identifier opened by the session broker.
+        vm_id: String,
+        /// Mesh peer requesting the session.
+        client_peer: String,
+    },
 }
 
 impl Action {
@@ -66,7 +82,7 @@ impl Action {
                 format!("seal-secret {name} ({} bytes, redacted)", secret.len())
             }
             Self::RunEnroll { .. } => "run-enroll (bearer redacted)".to_string(),
-            Self::OpenBroker { session_id } => format!("open-broker {session_id}"),
+            Self::OpenBroker { session_id, .. } => format!("open-broker {session_id}"),
         }
     }
 }
@@ -281,13 +297,11 @@ pub fn apply_all(applier: &dyn Applier, actions: &[Action]) -> Result<(), Remote
 /// * [`Action::SealSecret`] → [`SecretStore::put`] (encrypts at rest into the
 ///   replicated `age`+etcd store, or the local-AEAD fallback).
 ///
-/// [`Action::RunEnroll`] and [`Action::OpenBroker`] are **not** local effects:
-/// enroll is the bootstrap step the `SshBootstrap` transport runs over the
-/// enroll-bearer SSH, and open-broker is a Bus publish the `onboard_apply` worker
-/// (which holds the Bus handle) issues. This applier owns the two node-local
-/// effects only, so both transports + the worker converge on ONE place for them;
-/// it returns a typed [`RemotePushError::NotWired`] naming the layer that does own
-/// the action, never a fake success (§7).
+/// [`Action::RunEnroll`] remains a bootstrap transport effect and is intentionally
+/// refused here. [`Action::OpenBroker`] is different: once the signed bundle has
+/// reached the target, this applier publishes the exact typed session-open wire
+/// verb on the target's local Bus, so the session broker remains the sole owner of
+/// session state and no parallel broker model is invented.
 pub struct LocalApplier {
     /// Where the pinned role is written — the canonical `/var/lib/mde/role.toml`
     /// in production, a redirect in tests (via [`mde_role::default_role_path`]'s
@@ -296,6 +310,10 @@ pub struct LocalApplier {
     /// The node's secret store — the mesh `age`+etcd store when its helper is
     /// reachable, else the local-AEAD fallback ([`SecretStore::resolve`]).
     store: SecretStore,
+    /// The shared Bus root used for the target-side broker-open effect. `None`
+    /// is retained by the lean/test constructor so unit tests cannot publish
+    /// into an operator's live Bus by accident.
+    bus_root: Option<PathBuf>,
 }
 
 impl LocalApplier {
@@ -309,6 +327,10 @@ impl LocalApplier {
         Self {
             role_path: mde_role::default_role_path(),
             store: SecretStore::resolve(repo_dir, workgroup_root),
+            #[cfg(feature = "async-services")]
+            bus_root: mde_bus::default_data_dir(),
+            #[cfg(not(feature = "async-services"))]
+            bus_root: None,
         }
     }
 
@@ -317,7 +339,63 @@ impl LocalApplier {
     /// throwaway age identity).
     #[must_use]
     pub fn new(role_path: PathBuf, store: SecretStore) -> Self {
-        Self { role_path, store }
+        Self {
+            role_path,
+            store,
+            bus_root: None,
+        }
+    }
+
+    #[cfg(feature = "async-services")]
+    fn with_bus_root(mut self, bus_root: PathBuf) -> Self {
+        self.bus_root = Some(bus_root);
+        self
+    }
+
+    #[cfg(feature = "async-services")]
+    fn apply_open_broker(
+        &self,
+        action: &Action,
+        session_id: &str,
+        serving_peer: &str,
+        vm_id: &str,
+        client_peer: &str,
+    ) -> Result<(), RemotePushError> {
+        let Some(bus_root) = self.bus_root.as_ref() else {
+            return Err(RemotePushError::NotWired {
+                transport: "bus-worker (open-broker)",
+            });
+        };
+        let request = crate::workers::session_broker::SessionRequest::Open {
+            id: session_id.to_string(),
+            serving_peer: serving_peer.to_string(),
+            vm_id: vm_id.to_string(),
+            client_peer: client_peer.to_string(),
+        };
+        let body = serde_json::to_string(&request).map_err(|error| {
+            RemotePushError::ActionFailed {
+                action: action.redacted(),
+                why: format!("encode SessionRequest::Open: {error}"),
+            }
+        })?;
+        let persist = mde_bus::persist::Persist::open(bus_root.clone()).map_err(|error| {
+            RemotePushError::ActionFailed {
+                action: action.redacted(),
+                why: format!("open Mackes Bus: {error}"),
+            }
+        })?;
+        persist
+            .write(
+                crate::workers::session_broker::ACTION_TOPIC,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&body),
+            )
+            .map_err(|error| RemotePushError::ActionFailed {
+                action: action.redacted(),
+                why: format!("publish SessionRequest::Open: {error}"),
+            })?;
+        Ok(())
     }
 }
 
@@ -363,11 +441,30 @@ impl Applier for LocalApplier {
             Action::RunEnroll { .. } => Err(RemotePushError::NotWired {
                 transport: "ssh-bootstrap (enroll)",
             }),
-            // Owned by the onboard_apply worker's Bus publish (it holds the Bus
-            // handle the broker SessionRequest goes out on).
-            Action::OpenBroker { .. } => Err(RemotePushError::NotWired {
-                transport: "bus-worker (open-broker)",
-            }),
+            Action::OpenBroker {
+                session_id,
+                serving_peer,
+                vm_id,
+                client_peer,
+            } => {
+                #[cfg(feature = "async-services")]
+                {
+                    self.apply_open_broker(
+                        action,
+                        session_id,
+                        serving_peer,
+                        vm_id,
+                        client_peer,
+                    )
+                }
+                #[cfg(not(feature = "async-services"))]
+                {
+                    let _ = (session_id, serving_peer, vm_id, client_peer);
+                    Err(RemotePushError::NotWired {
+                        transport: "bus-worker (open-broker)",
+                    })
+                }
+            }
         }
     }
 }
@@ -520,12 +617,11 @@ impl RemotePush for SshBootstrap {
 ///
 /// Signing a [`JobBundle`] with the issuing node's identity key, publishing it on
 /// `action/onboard/apply`, and awaiting the target `onboard_apply` worker's
-/// observed-state reply over the overlay is the integration-gated live path
-/// (operator/live acceptance 1): with no live cross-node Bus round-trip wired on
-/// this build, [`RemotePush::apply`] returns a typed [`RemotePushError::NotWired`]
-/// — never a fake success (§7). The pure sign/verify/apply core (built + tested
-/// above) is what the live round-trip carries once wired; the target is left
-/// unchanged until then.
+/// nonce-correlated observed-state reply over the overlay is the live path. The
+/// local Bus spool and identity seams are resolved from the daemon environment;
+/// missing Bus/key/ack state returns a typed [`RemotePushError`] and never a fake
+/// success (§7). The target is considered complete only after its worker has
+/// persisted the observed result.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct BusApply;
 
@@ -550,9 +646,229 @@ impl RemotePush for BusApply {
                 });
             }
         }
-        Err(RemotePushError::NotWired {
-            transport: "bus-apply (signed-bundle cross-node round-trip)",
-        })
+
+        #[cfg(feature = "async-services")]
+        {
+            let Target::Enrolled { node_id } = target else {
+                unreachable!("bootstrap targets return above")
+            };
+            return self.apply_live(
+                node_id,
+                actions,
+                &mde_bus::default_data_dir().ok_or_else(|| RemotePushError::Unreachable {
+                    target: node_id.clone(),
+                    why: "no Mackes Bus root is configured".to_string(),
+                })?,
+                &std::env::var_os("MACKESD_NODE_SIGNING_KEY")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(crate::node_key::DEFAULT_KEY_PATH)),
+                default_issuer_node_id(),
+                DEFAULT_APPLY_ACK_TIMEOUT,
+            );
+        }
+
+        #[cfg(not(feature = "async-services"))]
+        {
+            let _ = target;
+            let _ = actions;
+            Err(RemotePushError::NotWired {
+                transport: "bus-apply (async-services feature disabled)",
+            })
+        }
+    }
+}
+
+#[cfg(feature = "async-services")]
+const DEFAULT_APPLY_ACK_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[cfg(feature = "async-services")]
+static APPLY_NONCE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Resolve the issuing node identity the same way the daemon's main process
+/// resolves its default node id. An explicit environment value is required in
+/// production when a host name is not a stable mesh identity.
+#[cfg(feature = "async-services")]
+fn default_issuer_node_id() -> String {
+    if let Ok(value) = std::env::var("MACKESD_NODE_ID") {
+        if !value.trim().is_empty() {
+            return value;
+        }
+    }
+    let host = std::env::var("HOSTNAME").ok().or_else(|| {
+        std::process::Command::new("hostname")
+            .output()
+            .ok()
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+    });
+    match host.map(|value| value.trim().to_string()) {
+        Some(value) if !value.is_empty() => format!("peer:{value}"),
+        _ => "peer:unknown".to_string(),
+    }
+}
+
+#[cfg(feature = "async-services")]
+fn now_unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+        .unwrap_or(0)
+}
+
+#[cfg(feature = "async-services")]
+fn next_apply_nonce(now: i64) -> String {
+    let sequence = APPLY_NONCE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{now}-{}-{sequence}", std::process::id())
+}
+
+#[cfg(feature = "async-services")]
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+#[cfg(feature = "async-services")]
+fn decode_hex<const N: usize>(value: &str) -> Option<[u8; N]> {
+    if value.len() != N * 2 {
+        return None;
+    }
+    let mut bytes = [0_u8; N];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(value.get(index * 2..index * 2 + 2)?, 16).ok()?;
+    }
+    Some(bytes)
+}
+
+#[cfg(feature = "async-services")]
+impl BusApply {
+    /// Publish one signed action and wait for the target's observed-state event.
+    ///
+    /// This helper keeps the filesystem/identity seams injectable for tests while
+    /// the production [`RemotePush::apply`] method resolves them from the normal
+    /// daemon environment. Returning only after a matching nonce-bearing event is
+    /// important: a successful local Bus write is not evidence that the remote
+    /// node accepted or applied the bundle.
+    fn apply_live(
+        &self,
+        target_node: &str,
+        actions: &[Action],
+        bus_root: &Path,
+        key_path: &Path,
+        issuer: String,
+        ack_timeout: Duration,
+    ) -> Result<(), RemotePushError> {
+        if target_node.trim().is_empty() {
+            return Err(RemotePushError::BundleRejected {
+                why: "enrolled target node id cannot be empty".to_string(),
+            });
+        }
+        if issuer.trim().is_empty() {
+            return Err(RemotePushError::BundleRejected {
+                why: "issuing node id cannot be empty".to_string(),
+            });
+        }
+        if actions.is_empty() {
+            return Err(RemotePushError::BundleRejected {
+                why: "an onboard apply bundle must contain at least one action".to_string(),
+            });
+        }
+
+        let key = crate::node_key::load_or_create(key_path).map_err(|error| {
+            RemotePushError::Unreachable {
+                target: target_node.to_string(),
+                why: format!("cannot load issuing node key {}: {error}", key_path.display()),
+            }
+        })?;
+        let now = now_unix_seconds();
+        let bundle = JobBundle {
+            target_node: target_node.to_string(),
+            actions: actions.to_vec(),
+            issued_at: now,
+            nonce: next_apply_nonce(now),
+        };
+        let sig_hex = encode_hex(&bundle.sign(&key));
+        let action = crate::workers::onboard_apply::ApplyAction {
+            issuer: issuer.clone(),
+            bundle: bundle.clone(),
+            sig_hex,
+        };
+        let body = serde_json::to_string(&action).map_err(|error| RemotePushError::Unreachable {
+            target: target_node.to_string(),
+            why: format!("cannot encode onboard apply action: {error}"),
+        })?;
+
+        let persist = mde_bus::persist::Persist::open(bus_root.to_path_buf()).map_err(|error| {
+            RemotePushError::Unreachable {
+                target: target_node.to_string(),
+                why: format!("cannot open Mackes Bus: {error}"),
+            }
+        })?;
+        let mut cursor = persist
+            .latest_ulid(crate::workers::onboard_apply::EVENT_TOPIC)
+            .map_err(|error| RemotePushError::Unreachable {
+                target: target_node.to_string(),
+                why: format!("cannot read onboard apply acknowledgements: {error}"),
+            })?;
+        persist
+            .write(
+                crate::workers::onboard_apply::ACTION_TOPIC,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&body),
+            )
+            .map_err(|error| RemotePushError::Unreachable {
+                target: target_node.to_string(),
+                why: format!("cannot publish onboard apply action: {error}"),
+            })?;
+
+        let deadline = Instant::now() + ack_timeout;
+        loop {
+            let messages = persist
+                .list_since(
+                    crate::workers::onboard_apply::EVENT_TOPIC,
+                    cursor.as_deref(),
+                )
+                .map_err(|error| RemotePushError::Unreachable {
+                    target: target_node.to_string(),
+                    why: format!("cannot read onboard apply acknowledgements: {error}"),
+                })?;
+            for message in messages {
+                cursor = Some(message.ulid);
+                let Some(body) = message.body.as_deref() else {
+                    continue;
+                };
+                let Ok(event) =
+                    serde_json::from_str::<crate::workers::onboard_apply::ApplyResultEvent>(body)
+                else {
+                    continue;
+                };
+                if event.issuer != issuer
+                    || event.target != target_node
+                    || event.nonce != bundle.nonce
+                {
+                    continue;
+                }
+                if let Some(error) = event.error {
+                    return Err(RemotePushError::BundleRejected { why: error });
+                }
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(RemotePushError::Unreachable {
+                    target: target_node.to_string(),
+                    why: format!(
+                        "no observed-state acknowledgement for nonce {} within {:?}",
+                        bundle.nonce, ack_timeout
+                    ),
+                });
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
     }
 }
 
@@ -624,6 +940,9 @@ mod tests {
             },
             Action::OpenBroker {
                 session_id: "x".into(),
+                serving_peer: "peer:serving".into(),
+                vm_id: "vm-x".into(),
+                client_peer: "peer:client".into(),
             },
         ];
         let err = apply_all(&app, &actions).unwrap_err();
@@ -790,10 +1109,10 @@ mod tests {
     }
 
     #[test]
-    fn enroll_and_broker_are_typed_gated_not_local_effects() {
-        // These belong to the SSH-bootstrap transport + the Bus worker; the
-        // local applier returns a typed NotWired naming the owning layer, never a
-        // fake apply (§7).
+    fn lean_local_applier_keeps_unconfigured_bus_effects_typed() {
+        // RunEnroll always belongs to the SSH-bootstrap transport. The explicit
+        // test constructor also has no Bus root, so OpenBroker remains a typed
+        // configuration gate instead of publishing into an operator's Bus.
         let (_tmp, applier) = local_applier();
         assert!(matches!(
             applier.apply_one(&Action::RunEnroll { bearer: "b".into() }),
@@ -801,10 +1120,46 @@ mod tests {
         ));
         assert!(matches!(
             applier.apply_one(&Action::OpenBroker {
-                session_id: "s".into()
+                session_id: "s".into(),
+                serving_peer: "peer:serving".into(),
+                vm_id: "vm-s".into(),
+                client_peer: "peer:client".into(),
             }),
             Err(RemotePushError::NotWired { .. })
         ));
+    }
+
+    #[cfg(feature = "async-services")]
+    #[test]
+    fn configured_local_applier_publishes_the_exact_session_open_wire_verb() {
+        let (tmp, applier) = local_applier();
+        let bus_root = tmp.path().join("bus");
+        let applier = applier.with_bus_root(bus_root.clone());
+        applier
+            .apply_one(&Action::OpenBroker {
+                session_id: "session-1".into(),
+                serving_peer: "peer:serving".into(),
+                vm_id: "vm-1".into(),
+                client_peer: "peer:client".into(),
+            })
+            .expect("configured Bus publishes the broker open");
+
+        let persist = mde_bus::persist::Persist::open(bus_root).expect("open bus");
+        let rows = persist
+            .list_since(crate::workers::session_broker::ACTION_TOPIC, None)
+            .expect("list session actions");
+        assert_eq!(rows.len(), 1);
+        let body = rows[0].body.as_deref().expect("session body");
+        let request = crate::workers::session_broker::parse_request(body).expect("typed request");
+        assert_eq!(
+            request,
+            crate::workers::session_broker::SessionRequest::Open {
+                id: "session-1".into(),
+                serving_peer: "peer:serving".into(),
+                vm_id: "vm-1".into(),
+                client_peer: "peer:client".into(),
+            }
+        );
     }
 
     // ── process_apply: the onboard_apply worker's validate→apply core ──
@@ -1039,5 +1394,80 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, RemotePushError::BundleRejected { .. }));
+    }
+
+    #[cfg(feature = "async-services")]
+    #[test]
+    fn bus_apply_publishes_a_signed_bundle_and_waits_for_matching_ack() {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().expect("temp bus root");
+        let key_path = tmp.path().join("node-signing.key");
+        let bus_root = tmp.path().join("bus");
+        let key = crate::node_key::load_or_create(&key_path).expect("create issuer key");
+        let (seen_tx, seen_rx) = mpsc::channel();
+        let ack_root = bus_root.clone();
+        let ack_thread = thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                let persist = mde_bus::persist::Persist::open(ack_root.clone()).expect("open bus");
+                if let Ok(messages) = persist.list_since(
+                    crate::workers::onboard_apply::ACTION_TOPIC,
+                    None,
+                ) {
+                    if let Some(message) = messages.last() {
+                        let body = message.body.as_deref().expect("action body");
+                        let action: crate::workers::onboard_apply::ApplyAction =
+                            serde_json::from_str(body).expect("typed action");
+                        let sig = decode_hex::<64>(&action.sig_hex).expect("signature hex");
+                        action
+                            .bundle
+                            .verify(&sig, &key.verifying_key(), now_unix_seconds())
+                            .expect("valid bundle signature");
+                        let event = serde_json::json!({
+                            "issuer": action.issuer,
+                            "target": action.bundle.target_node,
+                            "nonce": action.bundle.nonce,
+                            "applied": ["open-broker test-session"],
+                            "error": null
+                        });
+                        persist
+                            .write(
+                                crate::workers::onboard_apply::EVENT_TOPIC,
+                                mde_bus::hooks::config::Priority::Default,
+                                None,
+                                Some(&event.to_string()),
+                            )
+                            .expect("write ack");
+                        seen_tx.send(()).expect("report action");
+                        return;
+                    }
+                }
+                if std::time::Instant::now() >= deadline {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        BusApply
+            .apply_live(
+                "peer:target",
+                &[Action::OpenBroker {
+                    session_id: "test-session".into(),
+                    serving_peer: "peer:target".into(),
+                    vm_id: "vm-test".into(),
+                    client_peer: "peer:client".into(),
+                }],
+                &bus_root,
+                &key_path,
+                "peer:issuer".into(),
+                Duration::from_secs(2),
+            )
+            .expect("matching observed-state ack");
+        seen_rx.recv_timeout(Duration::from_secs(1)).expect("seen");
+        ack_thread.join().expect("ack worker");
     }
 }

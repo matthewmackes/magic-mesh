@@ -178,9 +178,15 @@ impl CommunicationsSurface {
         data: &dyn crate::CollabData,
         sink: &mut CommandSink,
     ) {
-        let Some(space) = self.selected_space() else {
+        // A membership update can remove the selected space between frames. Do
+        // not turn that stale view id into a new call target; the frame's call
+        // bar applies the same directory boundary.
+        let directory = data.space_directory().clone();
+        let Some(space) =
+            crate::frame::selected_space_in_directory(self.selected_space(), &directory)
+        else {
             ui.label(
-                egui::RichText::new("Select a space to place or join a call.")
+                egui::RichText::new("Select a current space to place or join a call.")
                     .color(Style::TEXT_DIM),
             );
             return;
@@ -191,8 +197,8 @@ impl CommunicationsSurface {
         let me = data.me().clone();
         let now = data.now_unix_ms();
         let calls = data.call_state().active.clone();
-        let directory = data.space_directory().clone();
         let (space_name, direct) = space_context(&directory, space);
+        let can_start = call_start_enabled(&directory, space);
 
         // Header — the mode title + the start cluster for the selected space.
         ui.horizontal(|ui| {
@@ -211,7 +217,7 @@ impl CommunicationsSurface {
                 .color(Style::TEXT_DIM),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                self.call_start_cluster(ui, sink, space);
+                self.call_start_cluster(ui, sink, space, can_start);
             });
         });
         ui.separator();
@@ -224,10 +230,13 @@ impl CommunicationsSurface {
         if calls.is_empty() {
             ui.label(egui::RichText::new("No active calls.").color(Style::TEXT_DIM));
             ui.label(
-                egui::RichText::new(
+                egui::RichText::new(if can_start {
                     "Start an audio, video, or screen-share call above — it appears here and in \
-                     the call bar for everyone in the space.",
-                )
+                     the call bar for everyone in the space."
+                } else {
+                    "No other members are available in this space. Call controls stay disabled \
+                     until a peer joins."
+                })
                 .small()
                 .color(Style::TEXT_DIM),
             );
@@ -263,39 +272,69 @@ impl CommunicationsSurface {
     /// The start cluster (screen-share · video · audio), laid out right-to-left so
     /// audio reads first. Each button emits [`StartCall`](CollabCommand::StartCall)
     /// with its [`CallKind`] for the selected space.
-    fn call_start_cluster(&self, ui: &mut egui::Ui, sink: &mut CommandSink, space: SpaceId) {
-        if icons::icon_button(
-            ui,
-            icons::CALL_SCREEN,
-            Style::SP_M,
-            Style::TEXT_DIM,
-            "Start a screen share",
-        )
-        .clicked()
-        {
-            self.start_call(sink, space, CallKind::Screen);
-        }
-        if icons::icon_button(
-            ui,
-            icons::CALL_VIDEO,
-            Style::SP_M,
-            Style::ACCENT,
-            "Start a video call",
-        )
-        .clicked()
-        {
-            self.start_call(sink, space, CallKind::Video);
-        }
-        if icons::icon_button(
-            ui,
-            icons::CALL_AUDIO,
-            Style::SP_M,
-            Style::OK,
-            "Start an audio call",
-        )
-        .clicked()
-        {
-            self.start_call(sink, space, CallKind::Audio);
+    fn call_start_cluster(
+        &self,
+        ui: &mut egui::Ui,
+        sink: &mut CommandSink,
+        space: SpaceId,
+        can_start: bool,
+    ) {
+        let hint = if can_start {
+            None
+        } else {
+            Some("Unavailable: no other members are currently in this space")
+        };
+        let tint = if can_start {
+            None
+        } else {
+            Some(Style::DISABLED)
+        };
+
+        // Disable the whole cluster at the egui level as well as changing the
+        // tint. This makes the no-peer state non-activatable for pointer and
+        // keyboard input, rather than relying on a colour-only affordance.
+        ui.add_enabled_ui(can_start, |ui| {
+            if icons::icon_button(
+                ui,
+                icons::CALL_SCREEN,
+                Style::SP_M,
+                tint.unwrap_or(Style::TEXT_DIM),
+                hint.unwrap_or("Start a screen share"),
+            )
+            .clicked()
+            {
+                self.start_call(sink, space, CallKind::Screen);
+            }
+            if icons::icon_button(
+                ui,
+                icons::CALL_VIDEO,
+                Style::SP_M,
+                tint.unwrap_or(Style::ACCENT),
+                hint.unwrap_or("Start a video call"),
+            )
+            .clicked()
+            {
+                self.start_call(sink, space, CallKind::Video);
+            }
+            if icons::icon_button(
+                ui,
+                icons::CALL_AUDIO,
+                Style::SP_M,
+                tint.unwrap_or(Style::OK),
+                hint.unwrap_or("Start an audio call"),
+            )
+            .clicked()
+            {
+                self.start_call(sink, space, CallKind::Audio);
+            }
+        });
+        if let Some(hint) = hint {
+            ui.label(
+                egui::RichText::new("No peers")
+                    .small()
+                    .color(Style::TEXT_DIM),
+            )
+            .on_hover_text(hint);
         }
     }
 
@@ -570,6 +609,19 @@ fn device_combo(ui: &mut egui::Ui, label: &str, glyph: &str, value: &mut String)
     ui.add_space(Style::SP_S);
 }
 
+/// Whether the selected directory row has at least one other member to receive
+/// a new call. The count is a retained membership fact, not an online-presence
+/// claim: a peer may still be offline or partitioned, in which case the worker
+/// remains responsible for the honest ringing/queued state.
+#[must_use]
+fn call_start_enabled(directory: &SpaceDirectory, space: SpaceId) -> bool {
+    directory
+        .spaces
+        .iter()
+        .find(|summary| summary.id == space)
+        .is_some_and(|summary| summary.members > 1)
+}
+
 /// An outgoing-media intent toggle (camera / screen-share). Records the seat's
 /// intent as local view state; the actual capture + track is the marked media-plane
 /// follow-up. Returns `true` when clicked (the caller flips the stored intent).
@@ -697,7 +749,10 @@ const fn participant_view(
 
 #[cfg(test)]
 mod tests {
-    use super::bounded_display_text;
+    use super::{bounded_display_text, call_start_enabled};
+    use mde_collab_types::{
+        ActorClock, SpaceDirectory, SpaceId, SpaceKind, SpaceRole, SpaceSummary,
+    };
 
     #[test]
     fn bounded_display_text_is_single_line_and_hides_direction_controls() {
@@ -716,5 +771,36 @@ mod tests {
     fn bounded_display_text_uses_a_placeholder_for_empty_input() {
         assert_eq!(bounded_display_text("\u{200b}\n", 48), "—");
         assert_eq!(bounded_display_text("anything", 0), "");
+    }
+
+    #[test]
+    fn call_start_requires_another_current_space_member() {
+        let space = SpaceId::new();
+        let mut directory = SpaceDirectory::default();
+        assert!(!call_start_enabled(&directory, space));
+
+        directory.spaces.push(SpaceSummary {
+            id: space,
+            kind: SpaceKind::Team,
+            name: "Operations".to_owned(),
+            role: SpaceRole::Owner,
+            unread: 0,
+            members: 1,
+            last_activity: ActorClock::at(0, 0),
+        });
+        assert!(
+            !call_start_enabled(&directory, space),
+            "a solo space must not expose a call action"
+        );
+
+        directory.spaces[0].members = 2;
+        assert!(
+            call_start_enabled(&directory, space),
+            "a space with another member may expose a call action"
+        );
+        assert!(
+            !call_start_enabled(&directory, SpaceId::new()),
+            "a stale or unknown space id must never become a call target"
+        );
     }
 }
