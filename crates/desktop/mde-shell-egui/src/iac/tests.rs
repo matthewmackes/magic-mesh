@@ -14,6 +14,46 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
+#[test]
+fn cloud_arm_credential_reader_is_bounded_and_non_following() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("cloud-arm-key");
+    let valid = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    std::fs::write(&path, valid).expect("credential");
+    assert_eq!(
+        read_cloud_arm_credential(&path).expect("valid credential"),
+        valid.to_vec()
+    );
+
+    std::fs::write(&path, vec![b'x'; MAX_CLOUD_ARM_CREDENTIAL_BYTES + 1])
+        .expect("oversized credential");
+    assert!(
+        read_cloud_arm_credential(&path).is_err(),
+        "oversized credentials must fail closed"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cloud_arm_credential_reader_rejects_a_final_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let target = tmp.path().join("outside-key");
+    let link = tmp.path().join("cloud-arm-key");
+    std::fs::write(
+        &target,
+        b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    )
+    .expect("target credential");
+    symlink(&target, &link).expect("credential symlink");
+
+    assert!(
+        read_cloud_arm_credential(&link).is_err(),
+        "credential loading must not follow a replaced final leaf"
+    );
+}
+
 /// One backend-tool health row in a fixture mirror.
 fn health(tool: &str, state: HealthState) -> ServiceHealth {
     ServiceHealth {

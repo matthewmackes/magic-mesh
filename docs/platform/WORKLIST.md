@@ -492,6 +492,15 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-ARCH-007 - Repair Workloads cockpit E2E wire, placement, and authorization
 
 - Status: Remaining
+- Progress (2026-07-25 cloud-arm credential boundary): the root Workloads
+  shell plus daemon ActionAuthorizer, cloud gate, KDC-host, and remediation CLI
+  now load the systemd cloud-arm credential through descriptor-backed,
+  regular-file readers that reject final symlinks and inputs above 4 KiB before
+  decoding while preserving the root-process gate. The Workloads/IAC farm suite
+  is green at **47/47**; the integrated BigBoy `mackesd --lib
+  --features async-services` run exercised **4,017 passed, 1 failed, 1
+  ignored**, with the unrelated storage shutdown timing test passing in an
+  isolated rerun (**1/1**). Live libvirt/Podman evidence remains external.
 - Progress (2026-07-24 bounded cloud I/O): Workloads now drains stdout/stderr
   concurrently to EOF with a 1 MiB cap and UTF-8-safe truncation, rejects
   oversized inventory/output JSON before parsing, and bounds prior Quadlet

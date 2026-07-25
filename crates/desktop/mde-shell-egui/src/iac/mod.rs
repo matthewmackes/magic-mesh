@@ -33,7 +33,7 @@
 //! destructive intent passes a typed-confirm echo first (RUN-006), and every
 //! performed op lands in the session audit trail.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -66,6 +66,11 @@ pub(super) const WORKSPACE_TITLE: &str = "Workloads";
 /// (RUN-006's typed-arming idiom — the destructive-op hard wall).
 const APPLY_ECHO: &str = "apply";
 
+/// The systemd credential is a 32-byte HMAC key encoded as 64 hex characters.
+/// Keep a small amount of whitespace headroom while refusing an unexpected file
+/// from becoming an unbounded allocation in the root shell.
+const MAX_CLOUD_ARM_CREDENTIAL_BYTES: usize = 4 * 1024;
+
 /// Capability lifetime: enough for one local publish and mesh drain, while
 /// limiting interception value on the deliberately public Bus.
 const ARM_TOKEN_TTL_MS: i64 = 30_000;
@@ -86,10 +91,77 @@ fn production_cloud_arm_signer() -> Result<CloudArmSigner, String> {
                 .to_string()
         })?;
     let path = directory.join(CLOUD_ARM_CREDENTIAL);
-    let raw = std::fs::read(&path)
-        .map_err(|e| format!("Could not read systemd cloud-arming credential: {e}"))?;
+    let raw = read_cloud_arm_credential(&path)?;
     let key = decode_cloud_arm_credential(&raw).map_err(str::to_string)?;
     CloudArmSigner::new(key).map_err(str::to_string)
+}
+
+/// Read the root shell's systemd credential through a bounded, regular-file
+/// boundary. The credential directory is privileged input, but the final leaf
+/// is still opened without following a planted Linux symlink.
+fn read_cloud_arm_credential(path: &Path) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(0o400000); // O_NOFOLLOW
+    }
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        ))
+    ))]
+    if !std::fs::symlink_metadata(path)
+        .map_err(|e| format!("Could not inspect systemd cloud-arming credential: {e}"))?
+        .file_type()
+        .is_file()
+    {
+        return Err("systemd cloud-arming credential is not a regular file".to_string());
+    }
+    #[cfg(not(unix))]
+    if !std::fs::symlink_metadata(path)
+        .map_err(|e| format!("Could not inspect systemd cloud-arming credential: {e}"))?
+        .file_type()
+        .is_file()
+    {
+        return Err("systemd cloud-arming credential is not a regular file".to_string());
+    }
+
+    let file = options
+        .open(path)
+        .map_err(|e| format!("Could not read systemd cloud-arming credential: {e}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("Could not inspect systemd cloud-arming credential: {e}"))?;
+    if !metadata.file_type().is_file() {
+        return Err("systemd cloud-arming credential is not a regular file".to_string());
+    }
+    if metadata.len() > MAX_CLOUD_ARM_CREDENTIAL_BYTES as u64 {
+        return Err(format!(
+            "systemd cloud-arming credential exceeds {MAX_CLOUD_ARM_CREDENTIAL_BYTES} bytes"
+        ));
+    }
+
+    let mut raw = Vec::with_capacity(
+        MAX_CLOUD_ARM_CREDENTIAL_BYTES
+            .min(usize::try_from(metadata.len()).unwrap_or(MAX_CLOUD_ARM_CREDENTIAL_BYTES)),
+    );
+    file.take((MAX_CLOUD_ARM_CREDENTIAL_BYTES + 1) as u64)
+        .read_to_end(&mut raw)
+        .map_err(|e| format!("Could not read systemd cloud-arming credential: {e}"))?;
+    if raw.len() > MAX_CLOUD_ARM_CREDENTIAL_BYTES {
+        return Err(format!(
+            "systemd cloud-arming credential exceeds {MAX_CLOUD_ARM_CREDENTIAL_BYTES} bytes"
+        ));
+    }
+    Ok(raw)
 }
 
 /// Insert a short-lived, request-body-bound capability into a frozen JSON body.

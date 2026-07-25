@@ -31,6 +31,11 @@ pub(crate) const TOKEN_NONCE_MIN_LEN: usize = 8;
 /// workgroup root; only the sealed credential is distributed mesh-wide.
 pub(crate) const DEFAULT_AUTH_ROOT: &str = "/var/lib/mackesd/cloud-auth";
 
+/// The systemd credential is 64 hexadecimal characters, with room for the
+/// surrounding whitespace accepted by [`decode_cloud_arm_credential`]. Keep
+/// malformed or replaced inputs from becoming an unbounded allocation.
+const MAX_CLOUD_ARM_CREDENTIAL_BYTES: usize = 4 * 1024;
+
 // ─────────────────────────── the signing seam ───────────────────────────
 
 /// The token signing/verification seam.
@@ -67,11 +72,54 @@ impl HmacTokenSigner {
             .filter(|path| path.is_absolute())
             .ok_or_else(|| "systemd cloud arming credential is unavailable".to_string())?;
         let path = directory.join(CLOUD_ARM_CREDENTIAL);
-        let raw = std::fs::read(&path)
-            .map_err(|e| format!("read systemd credential {}: {e}", path.display()))?;
+        let raw = read_systemd_credential(&path)?;
         let key = decode_cloud_arm_credential(&raw).map_err(str::to_string)?;
         Ok(Self::new(key))
     }
+}
+
+/// Read a systemd credential through the descriptor that will be consumed.
+/// `O_NOFOLLOW` rejects a final symlink, while the descriptor metadata and
+/// sentinel-bounded read prevent a replacement race or oversized input from
+/// escaping the regular-file and memory bounds.
+fn read_systemd_credential(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    use rustix::fs::{Mode, OFlags};
+    use std::io::Read as _;
+
+    let file: std::fs::File = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| format!("read systemd credential {}: {error}", path.display()))?
+    .into();
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("metadata systemd credential {}: {error}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "read systemd credential {}: not a regular file",
+            path.display()
+        ));
+    }
+    if metadata.len() > MAX_CLOUD_ARM_CREDENTIAL_BYTES as u64 {
+        return Err(format!(
+            "read systemd credential {} exceeds {MAX_CLOUD_ARM_CREDENTIAL_BYTES}-byte limit",
+            path.display()
+        ));
+    }
+
+    let mut raw = Vec::with_capacity(MAX_CLOUD_ARM_CREDENTIAL_BYTES + 1);
+    file.take((MAX_CLOUD_ARM_CREDENTIAL_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut raw)
+        .map_err(|error| format!("read systemd credential {}: {error}", path.display()))?;
+    if raw.len() > MAX_CLOUD_ARM_CREDENTIAL_BYTES {
+        return Err(format!(
+            "read systemd credential {} exceeds {MAX_CLOUD_ARM_CREDENTIAL_BYTES}-byte limit",
+            path.display()
+        ));
+    }
+    Ok(raw)
 }
 
 impl TokenSigner for HmacTokenSigner {
@@ -668,6 +716,40 @@ mod tests {
         assert_eq!(
             placement_match("otter", "eagle"),
             Placement::Remote("otter".to_string())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemd_credential_loader_rejects_a_final_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("real-credential");
+        let link = directory.path().join(CLOUD_ARM_CREDENTIAL);
+        std::fs::write(&target, format!("{}\n", "00".repeat(32))).unwrap();
+        symlink(&target, &link).unwrap();
+
+        let error = read_systemd_credential(&link)
+            .expect_err("the systemd credential loader must not follow a final symlink");
+        assert!(
+            error.contains("read systemd credential"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn systemd_credential_loader_rejects_oversized_regular_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(CLOUD_ARM_CREDENTIAL);
+        std::fs::write(&path, vec![b'x'; MAX_CLOUD_ARM_CREDENTIAL_BYTES + 1]).unwrap();
+
+        let error = read_systemd_credential(&path)
+            .expect_err("an oversized systemd credential must fail closed");
+        assert!(error.contains("exceeds"), "unexpected error: {error}");
+        assert!(
+            error.contains(&MAX_CLOUD_ARM_CREDENTIAL_BYTES.to_string()),
+            "unexpected error: {error}"
         );
     }
 

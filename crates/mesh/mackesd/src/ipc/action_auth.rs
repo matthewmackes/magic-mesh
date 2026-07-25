@@ -11,7 +11,7 @@
 //! install a verifier that rejects everything. The authorizer exposes no mint
 //! API in production; mint authority remains in the root shell.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use mackes_mesh_types::cloud::{
@@ -27,6 +27,10 @@ pub const ACTION_SCHEMA_VERSION: u64 = 1;
 
 /// Maximum capability lifetime accepted by a privileged consumer.
 pub const MAX_AUTH_TTL_MS: i64 = 30_000;
+
+/// The systemd cloud-arm credential is 64 hex characters plus optional
+/// surrounding whitespace. Keep hostile regular-file reads bounded.
+const CLOUD_ARM_CREDENTIAL_MAX_BYTES: usize = 4 * 1024;
 
 /// The semantic context an HMAC capability must bind in addition to the exact
 /// request body.
@@ -62,17 +66,18 @@ impl ActionAuthorizer {
     /// fails closed: the returned gate rejects every privileged mutation.
     #[must_use]
     pub fn production() -> Self {
-        let verifier: Arc<dyn TokenSigner> = match HmacTokenSigner::from_systemd_credential() {
-            Ok(verifier) => Arc::new(verifier),
-            Err(error) => {
-                tracing::error!(
-                    target: "mackesd::action_auth",
-                    %error,
-                    "privileged Bus authorization unavailable; mutations are disabled"
-                );
-                Arc::new(NullSigner)
-            }
-        };
+        let verifier: Arc<dyn TokenSigner> =
+            match load_systemd_cloud_arm_key("systemd cloud arming credential is unavailable") {
+                Ok(key) => Arc::new(HmacTokenSigner::new(key)),
+                Err(error) => {
+                    tracing::error!(
+                        target: "mackesd::action_auth",
+                        %error,
+                        "privileged Bus authorization unavailable; mutations are disabled"
+                    );
+                    Arc::new(NullSigner)
+                }
+            };
         Self {
             verifier,
             auth_root: PathBuf::from(DEFAULT_AUTH_ROOT),
@@ -174,15 +179,72 @@ pub(crate) fn production_action_signer() -> Result<CloudArmSigner, String> {
     if !rustix::process::geteuid().is_root() {
         return Err("privileged action signing requires the root service process".to_string());
     }
-    let directory = std::env::var_os("CREDENTIALS_DIRECTORY")
-        .map(std::path::PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .ok_or_else(|| "systemd action credential is unavailable".to_string())?;
-    let path = directory.join(CLOUD_ARM_CREDENTIAL);
-    let raw = std::fs::read(&path)
-        .map_err(|error| format!("read systemd credential {}: {error}", path.display()))?;
-    let key = decode_cloud_arm_credential(&raw).map_err(str::to_string)?;
+    let key = load_systemd_cloud_arm_key("systemd action credential is unavailable")?;
     CloudArmSigner::new(key).map_err(str::to_string)
+}
+
+fn load_systemd_cloud_arm_key(unavailable_error: &str) -> Result<Vec<u8>, String> {
+    if !rustix::process::geteuid().is_root() {
+        return Err("cloud authorization requires a root service process".to_string());
+    }
+    let directory = std::env::var_os("CREDENTIALS_DIRECTORY")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| unavailable_error.to_string())?;
+    let path = directory.join(CLOUD_ARM_CREDENTIAL);
+    let raw = read_cloud_arm_credential(&path)
+        .map_err(|error| format!("read systemd credential {}: {error}", path.display()))?;
+    decode_cloud_arm_credential(&raw).map_err(str::to_string)
+}
+
+/// Read the systemd credential from a descriptor that refuses a final
+/// symlink, verifies that the opened inode is a regular file, and consumes at
+/// most one sentinel byte beyond the credential ceiling. The descriptor is
+/// opened before metadata is checked so the inode inspected is the inode read.
+fn read_cloud_arm_credential(path: &Path) -> std::io::Result<Vec<u8>> {
+    #[cfg(unix)]
+    let file: std::fs::File = {
+        use rustix::fs::{Mode, OFlags};
+
+        rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?
+        .into()
+    };
+    #[cfg(not(unix))]
+    let file = std::fs::File::open(path)?;
+
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "cloud arming credential is not a regular file",
+        ));
+    }
+    let limit = CLOUD_ARM_CREDENTIAL_MAX_BYTES as u64;
+    if metadata.len() > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("cloud arming credential exceeds {CLOUD_ARM_CREDENTIAL_MAX_BYTES}-byte limit"),
+        ));
+    }
+
+    use std::io::Read as _;
+    let mut raw = Vec::with_capacity(
+        usize::try_from(metadata.len())
+            .unwrap_or(CLOUD_ARM_CREDENTIAL_MAX_BYTES)
+            .saturating_add(1),
+    );
+    file.take(limit.saturating_add(1)).read_to_end(&mut raw)?;
+    if raw.len() > CLOUD_ARM_CREDENTIAL_MAX_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("cloud arming credential exceeds {CLOUD_ARM_CREDENTIAL_MAX_BYTES}-byte limit"),
+        ));
+    }
+    Ok(raw)
 }
 
 fn wall_now_ms() -> i64 {
@@ -243,6 +305,40 @@ mod tests {
             node: "eagle",
             target: "/dev/sdb",
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cloud_arm_credential_loader_rejects_final_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real-credential");
+        let link = tmp.path().join(CLOUD_ARM_CREDENTIAL);
+        std::fs::write(
+            &real,
+            b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        assert!(
+            read_cloud_arm_credential(&link).is_err(),
+            "the credential loader must reject a final symlink"
+        );
+    }
+
+    #[test]
+    fn cloud_arm_credential_loader_rejects_oversized_material() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(CLOUD_ARM_CREDENTIAL);
+        std::fs::write(
+            &path,
+            vec![b'0'; CLOUD_ARM_CREDENTIAL_MAX_BYTES.saturating_add(1)],
+        )
+        .unwrap();
+
+        let error = read_cloud_arm_credential(&path).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeds"));
     }
 
     #[test]

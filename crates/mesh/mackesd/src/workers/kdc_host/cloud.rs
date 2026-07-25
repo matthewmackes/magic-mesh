@@ -24,6 +24,11 @@ const CLOUD_BUS_TIMEOUT: Duration = Duration::from_secs(30);
 /// Audit action name for phone-triggered cloud lifecycle work.
 const KDC_CLOUD_AUDIT_ACTION: &str = "kdc_cloud";
 
+/// The systemd cloud-arm credential is 64 hex characters plus optional
+/// surrounding whitespace. Keep the loader's allocation bounded even if the
+/// credential path is replaced with a hostile regular file.
+const CLOUD_ARM_CREDENTIAL_MAX_BYTES: usize = 4 * 1024;
+
 /// The placement-local cloud lifecycle commands the phone can trigger (design #12).
 ///
 /// Bulk-scoped because stock KDE Connect's run-command sends only a curated
@@ -235,10 +240,60 @@ pub(super) fn production_cloud_arm_signer() -> Result<CloudArmSigner, String> {
         .filter(|path| path.is_absolute())
         .ok_or_else(|| "systemd cloud arming credential is unavailable".to_string())?;
     let path = directory.join(CLOUD_ARM_CREDENTIAL);
-    let raw = std::fs::read(&path)
+    let raw = read_cloud_arm_credential(&path)
         .map_err(|error| format!("read systemd credential {}: {error}", path.display()))?;
     let key = decode_cloud_arm_credential(&raw).map_err(str::to_string)?;
     CloudArmSigner::new(key).map_err(str::to_string)
+}
+
+/// Read the systemd credential from a descriptor that refuses a final
+/// symlink, verifies that the opened inode is a regular file, and consumes at
+/// most one sentinel byte beyond the credential ceiling. The descriptor is
+/// opened before metadata is checked so the inode inspected is the inode read.
+fn read_cloud_arm_credential(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    #[cfg(unix)]
+    let file: std::fs::File = {
+        use rustix::fs::{Mode, OFlags};
+
+        rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?
+        .into()
+    };
+    #[cfg(not(unix))]
+    let file = std::fs::File::open(path)?;
+
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "cloud arming credential is not a regular file",
+        ));
+    }
+    let limit = CLOUD_ARM_CREDENTIAL_MAX_BYTES as u64;
+    if metadata.len() > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("cloud arming credential exceeds {CLOUD_ARM_CREDENTIAL_MAX_BYTES}-byte limit"),
+        ));
+    }
+
+    use std::io::Read as _;
+    let mut raw = Vec::with_capacity(
+        usize::try_from(metadata.len())
+            .unwrap_or(CLOUD_ARM_CREDENTIAL_MAX_BYTES)
+            .saturating_add(1),
+    );
+    file.take(limit.saturating_add(1)).read_to_end(&mut raw)?;
+    if raw.len() > CLOUD_ARM_CREDENTIAL_MAX_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("cloud arming credential exceeds {CLOUD_ARM_CREDENTIAL_MAX_BYTES}-byte limit"),
+        ));
+    }
+    Ok(raw)
 }
 
 fn authorize_bulk_body(node: &str, verb: &str) -> Result<String, String> {
@@ -341,5 +396,62 @@ pub(super) async fn handle_cloud_command(
     let pkt = build_packet("kdeconnect.ping", json!({ "message": result }));
     if let Err(e) = transport.send_to(peer, pkt).await {
         warn!(error = %e, "kdc-host: cloud command result ping failed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cloud_arm_credential_reader_accepts_a_regular_file() {
+        let temp = tempfile::tempdir().expect("temporary credential directory");
+        let path = temp.path().join(CLOUD_ARM_CREDENTIAL);
+        let credential = format!(" {}\n", "ab".repeat(32));
+        std::fs::write(&path, credential.as_bytes()).expect("write credential");
+
+        assert_eq!(
+            read_cloud_arm_credential(&path).expect("read credential"),
+            credential.as_bytes()
+        );
+    }
+
+    #[test]
+    fn cloud_arm_credential_reader_rejects_oversized_regular_file() {
+        let temp = tempfile::tempdir().expect("temporary credential directory");
+        let path = temp.path().join(CLOUD_ARM_CREDENTIAL);
+        std::fs::write(&path, vec![b'x'; CLOUD_ARM_CREDENTIAL_MAX_BYTES + 1])
+            .expect("write oversized credential");
+
+        let error = read_cloud_arm_credential(&path).expect_err("oversized credential");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeds"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cloud_arm_credential_reader_rejects_a_final_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("temporary credential directory");
+        let target = temp.path().join("real-credential");
+        let path = temp.path().join(CLOUD_ARM_CREDENTIAL);
+        std::fs::write(&target, "ab".repeat(32)).expect("write credential");
+        symlink(&target, &path).expect("create credential symlink");
+
+        assert!(
+            read_cloud_arm_credential(&path).is_err(),
+            "credential loader must not follow a final symlink"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cloud_arm_credential_reader_rejects_non_regular_files() {
+        let temp = tempfile::tempdir().expect("temporary credential directory");
+
+        let error = read_cloud_arm_credential(temp.path()).expect_err("directory credential");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("regular file"));
     }
 }

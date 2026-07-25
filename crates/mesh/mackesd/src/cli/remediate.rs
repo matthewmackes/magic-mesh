@@ -9,6 +9,7 @@ const JOBS_LAUNCH_TOPIC: &str = "action/jobs/launch";
 const JOBS_LAUNCH_AUTH_VERB: &str = "jobs-launch";
 const JOBS_LAUNCH_AUTH_NODE: &str = "jobs";
 const JOBS_LAUNCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const MAX_CLOUD_ARM_CREDENTIAL_BYTES: usize = 4 * 1024;
 
 /// Handle the `remediate` subcommand.
 #[allow(unreachable_code)]
@@ -143,10 +144,83 @@ fn production_jobs_signer() -> anyhow::Result<mackes_mesh_types::cloud::CloudArm
         .filter(|path| path.is_absolute())
         .ok_or_else(|| anyhow::anyhow!("systemd action credential is unavailable"))?;
     let path = directory.join(CLOUD_ARM_CREDENTIAL);
-    let raw = std::fs::read(&path)
-        .with_context(|| format!("reading systemd action credential {}", path.display()))?;
+    let raw = read_bounded_cloud_arm_credential(&path)?;
     let key = decode_cloud_arm_credential(&raw).map_err(|error| anyhow::anyhow!(error))?;
     CloudArmSigner::new(key).map_err(|error| anyhow::anyhow!(error))
+}
+
+/// Read the systemd credential through a bounded descriptor without following
+/// a final symlink. The metadata checks provide actionable errors, while the
+/// no-follow open closes the check/read replacement window on Unix.
+fn read_bounded_cloud_arm_credential(path: &std::path::Path) -> anyhow::Result<Vec<u8>> {
+    let inspected = std::fs::symlink_metadata(path)
+        .with_context(|| format!("inspecting systemd action credential {}", path.display()))?;
+    if inspected.file_type().is_symlink() {
+        anyhow::bail!(
+            "systemd action credential {} is a final symlink",
+            path.display()
+        );
+    }
+    if !inspected.file_type().is_file() {
+        anyhow::bail!(
+            "systemd action credential {} is not a regular file",
+            path.display()
+        );
+    }
+    if inspected.len() > MAX_CLOUD_ARM_CREDENTIAL_BYTES as u64 {
+        anyhow::bail!(
+            "systemd action credential {} exceeds {MAX_CLOUD_ARM_CREDENTIAL_BYTES}-byte limit",
+            path.display()
+        );
+    }
+
+    #[cfg(unix)]
+    let file: std::fs::File = {
+        use rustix::fs::{Mode, OFlags};
+
+        rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .with_context(|| format!("opening systemd action credential {}", path.display()))?
+        .into()
+    };
+    #[cfg(not(unix))]
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("opening systemd action credential {}", path.display()))?;
+
+    let opened = file.metadata().with_context(|| {
+        format!(
+            "inspecting opened systemd action credential {}",
+            path.display()
+        )
+    })?;
+    if !opened.file_type().is_file() {
+        anyhow::bail!(
+            "systemd action credential {} is not a regular file",
+            path.display()
+        );
+    }
+    if opened.len() > MAX_CLOUD_ARM_CREDENTIAL_BYTES as u64 {
+        anyhow::bail!(
+            "systemd action credential {} exceeds {MAX_CLOUD_ARM_CREDENTIAL_BYTES}-byte limit",
+            path.display()
+        );
+    }
+
+    use std::io::Read as _;
+    let mut raw = Vec::with_capacity(opened.len() as usize);
+    file.take((MAX_CLOUD_ARM_CREDENTIAL_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut raw)
+        .with_context(|| format!("reading systemd action credential {}", path.display()))?;
+    if raw.len() > MAX_CLOUD_ARM_CREDENTIAL_BYTES {
+        anyhow::bail!(
+            "systemd action credential {} exceeds {MAX_CLOUD_ARM_CREDENTIAL_BYTES}-byte limit",
+            path.display()
+        );
+    }
+    Ok(raw)
 }
 
 /// Testable signing seam for the direct CLI authority path.
@@ -294,5 +368,41 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("playbook"));
+    }
+
+    #[test]
+    fn cloud_arm_credential_loader_accepts_a_bounded_regular_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cloud-arm-key");
+        let credential = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n";
+        std::fs::write(&path, credential).unwrap();
+
+        assert_eq!(
+            read_bounded_cloud_arm_credential(&path).unwrap(),
+            credential
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cloud_arm_credential_loader_rejects_a_final_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("real-cloud-arm-key");
+        let path = tmp.path().join("cloud-arm-key");
+        std::fs::write(&target, b"0123456789abcdef0123456789abcdef").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        let error = read_bounded_cloud_arm_credential(&path).unwrap_err();
+        assert!(error.to_string().contains("final symlink"));
+    }
+
+    #[test]
+    fn cloud_arm_credential_loader_rejects_oversized_regular_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cloud-arm-key");
+        std::fs::write(&path, vec![b'0'; MAX_CLOUD_ARM_CREDENTIAL_BYTES + 1]).unwrap();
+
+        let error = read_bounded_cloud_arm_credential(&path).unwrap_err();
+        assert!(error.to_string().contains("exceeds"));
     }
 }
