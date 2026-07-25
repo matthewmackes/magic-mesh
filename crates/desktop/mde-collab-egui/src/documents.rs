@@ -40,17 +40,20 @@
 //!    the Bus per document is the next unit).
 //! 2. the **external-write three-way merge** (last-shared-base vs. collab vs. disk).
 //! 3. the **portable review sidecar** (comments/suggestions as anchored threads);
-//!    the `RequestReview`/`SubmitReview` commands exist but their UI is deferred.
+//!    the Documents strip now emits the existing `RequestReview`/`SubmitReview`
+//!    commands, while anchored comments remain a follow-up.
 //! 4. **autosave versioned snapshots** + a rendered word-diff timeline + git
 //!    integration.
 
-use mde_egui::egui;
 use mde_egui::Style;
+use mde_egui::egui;
 
-use mde_collab_types::{CollabCommand, DocumentChange, DocumentId, PayloadRef, SpaceId};
-use mde_editor_egui::{editor_panel, markdown, real_editor, EditorSurface};
+use mde_collab_types::{
+    CollabCommand, DocumentChange, DocumentId, PayloadRef, ReviewVerdict, SpaceId,
+};
+use mde_editor_egui::{EditorSurface, editor_panel, markdown, real_editor};
 
-use crate::{frame, icons, CollabData, CommandSink, CommunicationsSurface};
+use crate::{CollabData, CommandSink, CommunicationsSurface, frame, icons};
 
 /// The content-type the Documents mode stamps on its canonical export/update
 /// payload — Markdown is the source of truth, so an `UpdateDocument` change always
@@ -216,6 +219,9 @@ pub(crate) struct DocumentsState {
     /// A transient, honest notice (e.g. "Saved", "Exported 812 bytes"), shown
     /// once, cleared on the next action — never a silent swallow (§7).
     pub(crate) notice: Option<String>,
+    /// Optional review comment, kept local until the seat explicitly submits a
+    /// verdict. The durable review event carries the bounded snapshot.
+    pub(crate) review_comment: String,
 }
 
 impl std::fmt::Debug for DocumentsState {
@@ -228,6 +234,7 @@ impl std::fmt::Debug for DocumentsState {
             .field("loaded_document", &self.loaded_document)
             .field("active_title", &self.active_title)
             .field("template_open", &self.template_open)
+            .field("review_comment_len", &self.review_comment.len())
             .field("editor_open", &self.editor.is_open())
             .finish_non_exhaustive()
     }
@@ -244,6 +251,7 @@ impl DocumentsState {
         self.active_title.clear();
         self.template_open = false;
         self.notice = None;
+        self.review_comment.clear();
         // The previous space's editor is a loaded view, not durable state. Drop
         // it with the per-space selection so the no-selection path cannot keep
         // rendering the old space's Markdown while the new session projection
@@ -435,6 +443,38 @@ impl CommunicationsSurface {
             }
         });
 
+        // Review actions are explicit commands over the selected document. The
+        // current session participants are the honest reviewer candidates; the
+        // local seat is excluded and an empty candidate set stays visible as a
+        // truthful notice instead of emitting a review request to nobody.
+        if self.active_document().is_some() {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Review:")
+                        .small()
+                        .strong()
+                        .color(Style::TEXT_STRONG),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.documents.review_comment)
+                        .desired_width(180.0)
+                        .hint_text("optional comment"),
+                );
+                if ui.button("Request review").clicked() {
+                    self.request_review(data, sink, space);
+                }
+                if ui.button("Approve").clicked() {
+                    self.submit_review(sink, space, ReviewVerdict::Approved);
+                }
+                if ui.button("Changes").clicked() {
+                    self.submit_review(sink, space, ReviewVerdict::ChangesRequested);
+                }
+                if ui.button("Comment").clicked() {
+                    self.submit_review(sink, space, ReviewVerdict::Commented);
+                }
+            });
+        }
+
         if let Some(notice) = self.documents.notice.clone() {
             ui.label(egui::RichText::new(notice).small().color(Style::TEXT_DIM));
         }
@@ -544,6 +584,7 @@ impl CommunicationsSurface {
         self.documents.loaded_document = Some(document);
         self.documents.active_title = title.into();
         self.documents.sub = DocSubMode::Document;
+        self.documents.review_comment.clear();
         self.documents.notice = None;
     }
 
@@ -568,6 +609,7 @@ impl CommunicationsSurface {
         self.documents.loaded_document = Some(document);
         self.documents.active_title = title;
         self.documents.template_open = false;
+        self.documents.review_comment.clear();
         self.documents.notice = Some("Created — Save to share it.".to_owned());
         document
     }
@@ -598,6 +640,75 @@ impl CommunicationsSurface {
             change: DocumentChange { payload, summary },
         });
         self.documents.notice = Some("Saved — update shared.".to_owned());
+        true
+    }
+
+    /// Request review from every current peer in the selected document session.
+    /// The peer list comes from the retained read model, is bounded, and excludes
+    /// the local seat so a request cannot accidentally target the requester.
+    pub(crate) fn request_review(
+        &mut self,
+        data: &dyn CollabData,
+        sink: &mut CommandSink,
+        space: SpaceId,
+    ) -> bool {
+        let Some(document) = self.documents.active_document else {
+            self.documents.notice = Some("Open a document before requesting review.".to_owned());
+            return false;
+        };
+        let reviewers = data
+            .document_sessions(space)
+            .and_then(|sessions| sessions.sessions.iter().find(|s| s.document == document))
+            .map(|session| {
+                session
+                    .participants
+                    .iter()
+                    .filter(|actor| *actor != data.me())
+                    .take(32)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if reviewers.is_empty() {
+            self.documents.notice =
+                Some("No other document participants are available to review it.".to_owned());
+            return false;
+        }
+        sink.emit(CollabCommand::RequestReview {
+            space,
+            document,
+            reviewers,
+        });
+        self.documents.notice = Some("Review requested from current document peers.".to_owned());
+        true
+    }
+
+    /// Submit an explicit review verdict for the selected document. Comments are
+    /// copied from the local field and bounded before they cross the command
+    /// boundary; an empty comment remains `None`.
+    pub(crate) fn submit_review(
+        &mut self,
+        sink: &mut CommandSink,
+        space: SpaceId,
+        verdict: ReviewVerdict,
+    ) -> bool {
+        let Some(document) = self.documents.active_document else {
+            self.documents.notice = Some("Open a document before submitting review.".to_owned());
+            return false;
+        };
+        let trimmed = self.documents.review_comment.trim();
+        let comment = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.chars().take(4096).collect())
+        };
+        sink.emit(CollabCommand::SubmitReview {
+            space,
+            document,
+            verdict,
+            comment,
+        });
+        self.documents.notice = Some("Review submitted.".to_owned());
         true
     }
 

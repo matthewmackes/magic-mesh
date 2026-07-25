@@ -632,6 +632,14 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-011 - Communications collaboration suite full replacement
 
 - Status: Remaining
+- Progress (2026-07-24 Communications review/render hardening): the Documents
+  strip now emits bounded `RequestReview` and `SubmitReview` commands using the
+  current document peers and explicit approve/changes/comment verdicts. Calls,
+  Messages, and Files renderers now bound hostile labels/Markdown/file metadata
+  before layout while preserving the underlying read-model values and themed
+  tooltips. The focused Communications UI farm gate is green at 62/62, the
+  collaboration-core gate is green at 53/53, and targeted rustfmt plus the style
+  leak gate are green; live media/LLM evidence remains external.
 - Progress (2026-07-24 import-map version hardening): the legacy collaboration
   importer now rejects unsupported persisted ImportMap schema versions before
   replay or save, preventing a future map from silently changing idempotency

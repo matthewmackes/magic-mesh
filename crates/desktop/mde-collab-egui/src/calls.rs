@@ -42,8 +42,8 @@
 //! follow-up. There is deliberately **no recording and no transcription** anywhere
 //! — not in this UI, not in the commands, not in the worker or its state.
 
-use mde_egui::egui;
 use mde_egui::Style;
+use mde_egui::egui;
 
 use mde_collab_types::{
     ActorId, CallId, CallKind, CallParticipantState, CallParticipantView, CallView, CollabCommand,
@@ -52,11 +52,75 @@ use mde_collab_types::{
 
 use crate::frame::call_kind_label;
 use crate::icons::CommsHoverExt;
-use crate::{icons, relative_age, CommandSink, CommunicationsSurface};
+use crate::{CommandSink, CommunicationsSurface, icons, relative_age};
 
 /// The honest label for the one media device offered today. Live device
 /// enumeration is a marked media-plane follow-up (never a faked device list).
 const DEFAULT_DEVICE: &str = "System default";
+
+/// Keep data-backed labels readable inside the fixed Calls cards and rows. The
+/// projection may contain values supplied by another seat, so these limits are
+/// a rendering boundary rather than validation of the underlying data.
+const MAX_CALL_LABEL_CHARS: usize = 48;
+const MAX_CALL_STATUS_CHARS: usize = 24;
+
+/// Normalize and bound text before it enters a Calls widget.
+///
+/// egui will happily measure an arbitrarily long single-line label, which can
+/// push the roster and device controls off the available width. Control and
+/// bidi-isolation characters are also not useful in a seat label and can make
+/// the rendered value misleading. Preserve the source value in the projection;
+/// this helper only creates a safe, single-line display copy.
+fn bounded_display_text(value: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+
+    let mut normalized = String::with_capacity(value.len().min(max_chars));
+    let mut pending_space = false;
+    for character in value.chars() {
+        if is_calls_invisible(character) || character.is_whitespace() {
+            pending_space = true;
+            continue;
+        }
+        if pending_space && !normalized.is_empty() {
+            normalized.push(' ');
+        }
+        pending_space = false;
+        normalized.push(character);
+    }
+
+    if normalized.is_empty() {
+        return "—".to_owned();
+    }
+
+    if normalized.chars().count() <= max_chars {
+        return normalized;
+    }
+
+    let keep_chars = max_chars.saturating_sub(1);
+    let mut bounded: String = normalized.chars().take(keep_chars).collect();
+    while bounded.ends_with(' ') {
+        bounded.pop();
+    }
+    bounded.push('…');
+    bounded
+}
+
+/// Characters that can alter the visual structure or direction of a Calls
+/// label. Newlines/tabs are handled as spaces so adjacent words remain legible.
+fn is_calls_invisible(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{200B}'
+                | '\u{200C}'
+                | '\u{2060}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{FEFF}'
+        )
+}
 
 /// The in-call DTMF keypad layout (telephone order), driving
 /// [`SendDtmf`](CollabCommand::SendDtmf).
@@ -183,7 +247,11 @@ impl CommunicationsSurface {
                         egui::RichText::new(format!(
                             "{} more active call{} available when stopped",
                             calls.len() - visible,
-                            if calls.len() - visible == 1 { " is" } else { "s are" }
+                            if calls.len() - visible == 1 {
+                                " is"
+                            } else {
+                                "s are"
+                            }
                         ))
                         .small()
                         .color(Style::TEXT_DIM),
@@ -492,7 +560,7 @@ impl CommunicationsSurface {
 fn device_combo(ui: &mut egui::Ui, label: &str, glyph: &str, value: &mut String) {
     icons::icon(ui, glyph, Style::SP_M, Style::TEXT_DIM).comms_hover_text(label);
     egui::ComboBox::from_id_salt(("mde-collab-call-device", label))
-        .selected_text(value.clone())
+        .selected_text(bounded_display_text(value, MAX_CALL_LABEL_CHARS))
         .show_ui(ui, |ui| {
             // WL-FUNC-011 media: only the honest system default is offered today; the
             // real enumerated device list comes from the media plane (WebRTC
@@ -560,12 +628,16 @@ fn call_roster_row(ui: &mut egui::Ui, me: &ActorId, p: &CallParticipantView) {
     let (glyph, label, color) = participant_view(p.state);
     ui.horizontal(|ui| {
         icons::icon(ui, glyph, Style::SP_M, color);
-        let mut name = p.actor.as_str().to_owned();
-        if &p.actor == me {
-            name.push_str(" (you)");
-        }
+        let suffix = if &p.actor == me { " (you)" } else { "" };
+        let name_limit = MAX_CALL_LABEL_CHARS.saturating_sub(suffix.chars().count());
+        let mut name = bounded_display_text(p.actor.as_str(), name_limit);
+        name.push_str(suffix);
         ui.label(egui::RichText::new(name).color(Style::TEXT));
-        ui.label(egui::RichText::new(label).small().color(color));
+        ui.label(
+            egui::RichText::new(bounded_display_text(label, MAX_CALL_STATUS_CHARS))
+                .small()
+                .color(color),
+        );
         if p.muted {
             icons::icon(ui, icons::CALL_MUTE, Style::SP_M, Style::TEXT_DIM)
                 .comms_hover_text("Muted");
@@ -584,7 +656,12 @@ fn space_context(directory: &SpaceDirectory, space: SpaceId) -> (String, bool) {
             let head: String = id.chars().take(8).collect();
             (format!("space {head}\u{2026}"), false)
         },
-        |s| (s.name.clone(), s.kind == SpaceKind::Direct),
+        |s| {
+            (
+                bounded_display_text(&s.name, MAX_CALL_LABEL_CHARS),
+                s.kind == SpaceKind::Direct,
+            )
+        },
     )
 }
 
@@ -615,5 +692,29 @@ const fn participant_view(
             Style::TEXT_DIM,
         ),
         CallParticipantState::Left => (icons::CALL_PARTICIPANT_LEFT, "left", Style::TEXT_DIM),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bounded_display_text;
+
+    #[test]
+    fn bounded_display_text_is_single_line_and_hides_direction_controls() {
+        assert_eq!(
+            bounded_display_text("alice\n\t\u{202e}ops", 48),
+            "alice ops"
+        );
+    }
+
+    #[test]
+    fn bounded_display_text_truncates_by_unicode_scalar_without_overflow() {
+        assert_eq!(bounded_display_text("🚗 fleet participant", 8), "🚗 fleet…");
+    }
+
+    #[test]
+    fn bounded_display_text_uses_a_placeholder_for_empty_input() {
+        assert_eq!(bounded_display_text("\u{200b}\n", 48), "—");
+        assert_eq!(bounded_display_text("anything", 0), "");
     }
 }

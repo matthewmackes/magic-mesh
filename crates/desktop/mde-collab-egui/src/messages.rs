@@ -6,13 +6,13 @@
 //! locally-persisted draft, honest delivery state, and an edit/delete affordance
 //! that reflects the core's five-minute author window (spec §3).
 
-use mde_egui::egui;
 use mde_egui::Style;
+use mde_egui::egui;
 
 use mde_collab_types::{CollabCommand, DeliveryState, MessageBody, MessageView, SpaceId, ThreadId};
 
 use crate::icons::CommsHoverExt;
-use crate::{amend_affordance, icons, relative_age, AmendAffordance, CommunicationsSurface};
+use crate::{AmendAffordance, CommunicationsSurface, amend_affordance, icons, relative_age};
 
 impl CommunicationsSurface {
     /// Render Messages mode for the selected space: the conversation column,
@@ -414,6 +414,49 @@ fn thread_message(ui: &mut egui::Ui, msg: &MessageView, now_unix_ms: i64) {
     ui.add_space(Style::SP_XS);
 }
 
+/// Keep one hostile line from becoming an unbounded egui layout job. Chunks are
+/// split only at UTF-8 character boundaries and are all rendered, so this is a
+/// layout guard rather than a content limit.
+const MAX_MARKDOWN_LAYOUT_CHARS: usize = 1024;
+
+/// Visit bounded UTF-8-safe slices without allocating a normalized copy of the
+/// message. An empty slice is significant for empty headings and bullets, which
+/// retain the same visible affordance as the previous renderer.
+fn for_each_markdown_chunk(mut text: &str, mut visit: impl FnMut(&str)) {
+    if text.is_empty() {
+        visit(text);
+        return;
+    }
+
+    while !text.is_empty() {
+        let (chunk, rest) = text
+            .char_indices()
+            .nth(MAX_MARKDOWN_LAYOUT_CHARS)
+            .map_or((text, ""), |(byte, _)| text.split_at(byte));
+        visit(chunk);
+        text = rest;
+    }
+}
+
+/// Add styled message text with a finite layout job and anywhere-breaking wrap.
+/// The latter matters for hostile source such as a long URL or an unbroken hash:
+/// the label stays inside its pane instead of expanding the conversation column.
+/// Markdown remains source text here; this helper does not interpret links or
+/// discard control characters/content.
+fn markdown_label(ui: &mut egui::Ui, text: &str, mut style: impl FnMut(&str) -> egui::RichText) {
+    for_each_markdown_chunk(text, |chunk| {
+        let mut job = egui::text::LayoutJob::default();
+        style(chunk).append_to(
+            &mut job,
+            ui.style(),
+            egui::FontSelection::Default,
+            ui.text_valign(),
+        );
+        job.wrap.break_anywhere = true;
+        ui.add(egui::Label::new(job).wrap());
+    });
+}
+
 /// A lightweight Markdown line treatment for a message body: ATX headings
 /// (`#`/`##`/`###`, sized on the shared type ramp) and `-`/`*` bullets render as
 /// such; every other line is body text. Inline spans are shown as their Markdown
@@ -428,26 +471,42 @@ fn render_markdown(ui: &mut egui::Ui, body: &str) {
         } else if let Some(rest) = line.strip_prefix("# ") {
             heading(ui, rest, 1);
         } else if let Some(rest) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("•").color(Style::TEXT_DIM));
-                ui.label(egui::RichText::new(rest).color(Style::TEXT));
+            let mut first = true;
+            for_each_markdown_chunk(rest, |chunk| {
+                if first {
+                    first = false;
+                    ui.horizontal(|ui| {
+                        markdown_label(ui, "•", |text| {
+                            egui::RichText::new(text).color(Style::TEXT_DIM)
+                        });
+                        markdown_label(ui, chunk, |text| {
+                            egui::RichText::new(text).color(Style::TEXT)
+                        });
+                    });
+                } else {
+                    markdown_label(ui, chunk, |text| {
+                        egui::RichText::new(text).color(Style::TEXT)
+                    });
+                }
             });
         } else if line.is_empty() {
             ui.add_space(Style::SP_XS);
         } else {
-            ui.label(egui::RichText::new(line).color(Style::TEXT));
+            markdown_label(ui, line, |text| {
+                egui::RichText::new(text).color(Style::TEXT)
+            });
         }
     }
 }
 
 /// A Markdown heading line on the shared type ramp.
 fn heading(ui: &mut egui::Ui, text: &str, level: u8) {
-    ui.label(
-        egui::RichText::new(text)
+    markdown_label(ui, text, |chunk| {
+        egui::RichText::new(chunk)
             .size(Style::heading_size(level))
             .strong()
-            .color(Style::TEXT_STRONG),
-    );
+            .color(Style::TEXT_STRONG)
+    });
 }
 
 /// The Carbon tint for a delivery state.
@@ -465,5 +524,37 @@ const fn delivery_label(delivery: DeliveryState) -> &'static str {
         DeliveryState::Sent => "Sent",
         DeliveryState::Delivered => "Delivered",
         DeliveryState::Queued => "Queued — recipient offline",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_MARKDOWN_LAYOUT_CHARS, for_each_markdown_chunk};
+
+    #[test]
+    fn markdown_chunks_preserve_text_at_utf8_boundaries() {
+        let input = format!(
+            "{}é🦀{}",
+            "a".repeat(MAX_MARKDOWN_LAYOUT_CHARS + 1),
+            "z".repeat(MAX_MARKDOWN_LAYOUT_CHARS + 1)
+        );
+        let mut chunks = Vec::<String>::new();
+        for_each_markdown_chunk(&input, |chunk| chunks.push(chunk.to_owned()));
+
+        assert!(chunks.len() >= 3);
+        assert_eq!(chunks.concat(), input);
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.chars().count() <= MAX_MARKDOWN_LAYOUT_CHARS)
+        );
+    }
+
+    #[test]
+    fn markdown_chunks_keep_empty_markdown_content() {
+        let mut chunks = Vec::<String>::new();
+        for_each_markdown_chunk("", |chunk| chunks.push(chunk.to_owned()));
+
+        assert_eq!(chunks, vec![String::new()]);
     }
 }

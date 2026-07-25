@@ -37,8 +37,8 @@
 
 use std::path::{Path, PathBuf};
 
-use mde_egui::egui;
 use mde_egui::Style;
+use mde_egui::egui;
 
 use mde_collab_types::{
     CollabCommand, FileRef, FileRefId, FileReferenceView, SpaceId, TransferControl,
@@ -46,7 +46,61 @@ use mde_collab_types::{
 };
 use mde_files::{LocalFsBackend, Mime};
 
-use crate::{icons, relative_age, CommandSink, CommunicationsSurface};
+use crate::icons::CommsHoverExt;
+use crate::{CommandSink, CommunicationsSurface, icons, relative_age};
+
+// Files-mode values are read from the collab read model or the local filesystem.
+// Keep the complete values in the model, but put a bounded, single-line surface
+// around anything that can be long or operator-controlled. The tooltip is also
+// bounded so an adversarial name cannot create an unbounded popup.
+const FILE_DISPLAY_MAX_CHARS: usize = 160;
+const FILE_TOOLTIP_MAX_CHARS: usize = 512;
+const FILE_ROW_ACTIONS_RESERVE: f32 = Style::SP_XL * 4.0;
+const PICKER_SIZE_RESERVE: f32 = Style::SP_XL * 2.0;
+
+fn is_unsafe_display_char(ch: char) -> bool {
+    ch.is_control()
+        || matches!(
+            ch,
+            '\u{00ad}'
+                | '\u{061c}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{206f}'
+                | '\u{feff}'
+        )
+}
+
+/// Make untrusted text safe for a bounded Files-mode presentation without
+/// changing the underlying value used by commands or exact-name confirmation.
+/// Control and bidi-format characters become visible replacement glyphs, and a
+/// Unicode-safe ellipsis marks truncation at the requested character limit.
+fn safe_display_text(value: &str, max_chars: usize) -> String {
+    let normalized: String = value
+        .chars()
+        .map(|ch| {
+            if is_unsafe_display_char(ch) {
+                '\u{fffd}'
+            } else {
+                ch
+            }
+        })
+        .collect();
+    let count = normalized.chars().count();
+    if count <= max_chars {
+        return normalized;
+    }
+
+    let keep = max_chars.saturating_sub(1);
+    let mut clipped: String = normalized.chars().take(keep).collect();
+    clipped.push('\u{2026}');
+    clipped
+}
+
+fn safe_tooltip_text(value: &str) -> String {
+    safe_display_text(value, FILE_TOOLTIP_MAX_CHARS)
+}
 
 /// A pending **permanent-delete** typed-confirm: the file being deleted, its exact
 /// name (the string that must be typed to arm the delete), and the working buffer.
@@ -105,7 +159,12 @@ impl CommunicationsSurface {
 
         // A transient, honest notice (e.g. an unreadable pick) — never silent.
         if let Some(notice) = self.files_notice.clone() {
-            ui.label(egui::RichText::new(notice).small().color(Style::DANGER));
+            let display = safe_display_text(&notice, FILE_DISPLAY_MAX_CHARS);
+            let response = ui.add(
+                egui::Label::new(egui::RichText::new(display).small().color(Style::DANGER))
+                    .truncate(),
+            );
+            let _ = response.comms_hover_text(safe_tooltip_text(&notice));
         }
 
         // The link picker takes over the body while open.
@@ -169,23 +228,44 @@ impl CommunicationsSurface {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     icons::icon(ui, icons::FILE_ROW, Style::SP_M, Style::ACCENT);
-                    ui.label(
-                        egui::RichText::new(&view.reference.name)
-                            .strong()
-                            .color(Style::TEXT_STRONG),
+                    let display_name =
+                        safe_display_text(&view.reference.name, FILE_DISPLAY_MAX_CHARS);
+                    let response = ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(display_name)
+                                .strong()
+                                .color(Style::TEXT_STRONG),
+                        )
+                        .truncate(),
                     );
-                    ui.label(
-                        egui::RichText::new(format!("· {}", view.linked_by.as_str()))
-                            .small()
-                            .color(Style::TEXT_DIM),
+                    let _ = response.comms_hover_text(safe_tooltip_text(&view.reference.name));
+                });
+
+                // Keep owner/age metadata and actions in a separate bounded row
+                // so a long name cannot push either action off the card.
+                ui.horizontal(|ui| {
+                    let metadata = format!(
+                        "· {} · {}",
+                        view.linked_by.as_str(),
+                        relative_age(now_unix_ms, view.linked_unix_ms)
                     );
-                    ui.label(
-                        egui::RichText::new(relative_age(now_unix_ms, view.linked_unix_ms))
-                            .small()
-                            .color(Style::TEXT_DIM),
+                    let metadata_width =
+                        (ui.available_width() - FILE_ROW_ACTIONS_RESERVE).max(Style::SP_S);
+                    let display_metadata =
+                        safe_display_text(&metadata, FILE_DISPLAY_MAX_CHARS);
+                    let response = ui.add_sized(
+                        [metadata_width, Style::SP_L],
+                        egui::Label::new(
+                            egui::RichText::new(display_metadata)
+                                .small()
+                                .color(Style::TEXT_DIM),
+                        )
+                        .truncate(),
                     );
+                    let _ = response.comms_hover_text(safe_tooltip_text(&metadata));
+
                     // Reference-remove (safe) + permanent-delete (danger, gated),
-                    // right-aligned so they read as the row's controls.
+                    // right-aligned in the reserved action area.
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if icons::icon_button(
                             ui,
@@ -214,15 +294,33 @@ impl CommunicationsSurface {
 
                 // Honest facts: size + the content address (the version identity in
                 // a content-addressed model).
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{}  ·  content {}",
-                        fmt_bytes(view.reference.size),
-                        short_hash(&view.reference.sha256_hex),
-                    ))
-                    .small()
-                    .color(Style::TEXT_DIM),
-                );
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new(fmt_bytes(view.reference.size))
+                            .small()
+                            .color(Style::TEXT_DIM),
+                    );
+                    if let Some(mime) = view.reference.mime.as_deref() {
+                        let display_mime = safe_display_text(mime, FILE_DISPLAY_MAX_CHARS);
+                        let response = ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!("· type {display_mime}"))
+                                    .small()
+                                    .color(Style::TEXT_DIM),
+                            )
+                            .truncate(),
+                        );
+                    let _ = response.comms_hover_text(safe_tooltip_text(mime));
+                    }
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "· content {}",
+                            short_hash(&view.reference.sha256_hex),
+                        ))
+                        .small()
+                        .color(Style::TEXT_DIM),
+                    );
+                });
 
                 self.transfer_controls(ui, sink, space, view.file, job);
             });
@@ -359,11 +457,17 @@ impl CommunicationsSurface {
                 }
             });
         });
-        ui.label(
-            egui::RichText::new(dir.display().to_string())
-                .small()
-                .color(Style::TEXT_DIM),
+        let directory = dir.display().to_string();
+        let directory_display = safe_display_text(&directory, FILE_DISPLAY_MAX_CHARS);
+        let response = ui.add(
+            egui::Label::new(
+                egui::RichText::new(directory_display)
+                    .small()
+                    .color(Style::TEXT_DIM),
+            )
+            .truncate(),
         );
+        let _ = response.comms_hover_text(safe_tooltip_text(&directory));
         ui.separator();
 
         // Collected inside the closure, applied after (so `self` is not borrowed
@@ -397,13 +501,18 @@ impl CommunicationsSurface {
                     };
                     ui.horizontal(|ui| {
                         icons::icon(ui, glyph, Style::SP_M, Style::TEXT_DIM);
-                        if ui
-                            .selectable_label(
-                                false,
-                                egui::RichText::new(&row.name).color(Style::TEXT),
-                            )
-                            .clicked()
-                        {
+                        let name_width =
+                            (ui.available_width() - PICKER_SIZE_RESERVE).max(Style::SP_S);
+                        let display_name = safe_display_text(&row.name, FILE_DISPLAY_MAX_CHARS);
+                        let response = ui.add_sized(
+                            [name_width, Style::SP_L],
+                            egui::Label::new(egui::RichText::new(display_name).color(Style::TEXT))
+                                .truncate()
+                                .sense(egui::Sense::click()),
+                        );
+                        let clicked = response.clicked();
+                        let _ = response.comms_hover_text(safe_tooltip_text(&row.name));
+                        if clicked {
                             if is_dir {
                                 navigate = Some(PathBuf::from(path));
                             } else {
@@ -411,11 +520,16 @@ impl CommunicationsSurface {
                             }
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(
-                                egui::RichText::new(&row.size)
-                                    .small()
-                                    .color(Style::TEXT_DIM),
+                            let display_size = safe_display_text(&row.size, FILE_DISPLAY_MAX_CHARS);
+                            let response = ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(display_size)
+                                        .small()
+                                        .color(Style::TEXT_DIM),
+                                )
+                                .truncate(),
                             );
+                            let _ = response.comms_hover_text(safe_tooltip_text(&row.size));
                         });
                     });
                 }
@@ -448,6 +562,7 @@ impl CommunicationsSurface {
             return;
         };
         let name = pending.name.clone();
+        let display_name = safe_display_text(&name, FILE_DISPLAY_MAX_CHARS);
         let mut confirm = false;
         let mut cancel = false;
         mde_egui::card().show(ui, |ui| {
@@ -461,14 +576,16 @@ impl CommunicationsSurface {
             });
             ui.label(
                 egui::RichText::new(format!(
-                    "Permanently deletes \u{201c}{name}\u{201d} for everyone. This removes the \
+                    "Permanently deletes \u{201c}{display_name}\u{201d} for everyone. This removes the \
                          reference and lets the canonical file be purged once no space keeps it. \
                          This cannot be undone.",
                 ))
                 .color(Style::TEXT),
             );
             ui.label(
-                egui::RichText::new(format!("Type the file name to confirm: {name}"))
+                egui::RichText::new(format!(
+                    "Type the file name to confirm: {display_name}"
+                ))
                     .small()
                     .color(Style::TEXT_DIM),
             );
@@ -636,9 +753,9 @@ pub fn file_ref_of_path(path: &Path) -> std::io::Result<(FileRefId, FileRef)> {
     Ok((FileRefId::new(), reference))
 }
 
-/// A conservative content-type hint from the file extension — only the few types
-/// the platform commonly moves, `None` otherwise (an honest "unknown", never a
-/// guessed/faked MIME).
+/// A conservative content-type hint from the file extension — only the few
+/// types the platform commonly moves, `None` otherwise (an honest
+/// "unknown", never a guessed/faked MIME).
 fn mime_hint(path: &Path) -> Option<String> {
     let ext = path
         .extension()
@@ -716,5 +833,30 @@ pub(crate) fn fmt_bytes(n: u64) -> String {
         format!("{} KB", n / KB)
     } else {
         format!("{n} B")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_display_text;
+
+    #[test]
+    fn safe_display_text_replaces_control_and_bidi_format_characters() {
+        assert_eq!(
+            safe_display_text("report\n\u{202e}txt", 64),
+            "report\u{fffd}\u{fffd}txt"
+        );
+    }
+
+    #[test]
+    fn safe_display_text_truncates_on_unicode_character_boundaries() {
+        let display = safe_display_text("é📦-a-very-long-file-name", 8);
+        assert_eq!(display, "é📦-a-ve…");
+        assert_eq!(display.chars().count(), 8);
+    }
+
+    #[test]
+    fn safe_display_text_preserves_truthful_mime_values_when_bounded() {
+        assert_eq!(safe_display_text("application/pdf", 64), "application/pdf");
     }
 }

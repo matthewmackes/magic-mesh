@@ -6,8 +6,8 @@
 
 #![allow(clippy::unwrap_used, clippy::panic, clippy::float_cmp)]
 
-use mde_egui::egui;
 use mde_egui::Style;
+use mde_egui::egui;
 
 use std::collections::BTreeMap;
 
@@ -16,15 +16,15 @@ use mde_collab_types::{
     CallId, CallKind, CallParticipantState, CallParticipantView, CallView, ClipItemKind,
     ClipboardLane, ClipboardView, CollabCommand, ConversationTimeline, DeliveryState, DocumentId,
     DocumentSession, DocumentSessions, EventId, FileRef, FileRefId, FileReferenceView,
-    FileReferences, Severity, SpaceId, SpaceKind, SpaceRole, TransferControl, TransferDirection,
-    TransferId, TransferJobView, TransferJobs, TransferMethod, TransferState,
+    FileReferences, ReviewVerdict, Severity, SpaceId, SpaceKind, SpaceRole, TransferControl,
+    TransferDirection, TransferId, TransferJobView, TransferJobs, TransferMethod, TransferState,
 };
 
-use crate::fixture::{activity, message, space_summary, FixtureData};
+use crate::fixture::{FixtureData, activity, message, space_summary};
 use crate::{
-    amend_affordance, file_ref_of_path, ActivityFilter, AmendAffordance, CollabData, CommandSink,
-    CommunicationsSurface, DocSubMode, DocTemplate, DocView, Mode, ALL_COLLAB_ICONS,
-    EDIT_WINDOW_MS,
+    ALL_COLLAB_ICONS, ActivityFilter, AmendAffordance, CollabData, CommandSink,
+    CommunicationsSurface, DocSubMode, DocTemplate, DocView, EDIT_WINDOW_MS, Mode,
+    amend_affordance, file_ref_of_path,
 };
 
 /// A `1000 x 700` headless input with the given events.
@@ -1392,7 +1392,7 @@ fn documents_fixture(space: SpaceId, document: DocumentId, body: &str) -> Fixtur
                     document,
                     space,
                     title: "Runbook".to_owned(),
-                    participants: vec![ActorId::new("eagle")],
+                    participants: vec![ActorId::new("eagle"), ActorId::new("falcon")],
                     call: None,
                 }],
             },
@@ -1493,6 +1493,40 @@ fn saving_a_document_emits_update_document_with_the_canonical_markdown() {
         Some("text/markdown"),
         "the canonical payload is Markdown"
     );
+}
+
+#[test]
+fn document_review_actions_emit_peer_request_and_verdict() {
+    let space = SpaceId::new();
+    let document = DocumentId::new();
+    let data = documents_fixture(space, document, "# Runbook\n");
+
+    let mut surface = CommunicationsSurface::new();
+    surface.select_space(space);
+    surface.open_document(&data, document, "Runbook");
+
+    let mut sink = CommandSink::new();
+    assert!(surface.request_review(&data, &mut sink, space));
+    assert!(matches!(
+        sink.queued().first(),
+        Some(CollabCommand::RequestReview {
+            space: s,
+            document: d,
+            reviewers,
+        }) if *s == space && *d == document && reviewers == &vec![ActorId::new("falcon")]
+    ));
+
+    let mut sink = CommandSink::new();
+    assert!(surface.submit_review(&mut sink, space, ReviewVerdict::Approved));
+    assert!(matches!(
+        sink.queued().first(),
+        Some(CollabCommand::SubmitReview {
+            space: s,
+            document: d,
+            verdict: ReviewVerdict::Approved,
+            comment: None,
+        }) if *s == space && *d == document
+    ));
 }
 
 #[test]
