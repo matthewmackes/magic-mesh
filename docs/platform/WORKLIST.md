@@ -241,6 +241,11 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-SEC-006 - Keep Nebula private keys local to their owning node
 
 - Status: Remaining
+- Progress (2026-07-25 relay-authority enrollment boundary): authenticated
+  enrollment now reads the local relay seed through the sealed 0600/no-follow
+  1 MiB reader, rejecting hostile symlinks and oversized material before it can
+  enter the response. Focused farm gates are green at **101/101** enrollment
+  tests and **17/17** bundle tests; live rotation remains external.
 - Progress (2026-07-24 requester/certificate materialization boundary): Nebula
   enrollment requester public keys and generated peer certificates now use
   bounded no-follow reads before UTF-8/string materialization, rejecting hostile
@@ -1525,6 +1530,10 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-006 - Construct interface (Apple-HIG-principled workstation shell)
 
 - Status: Remaining
+- Progress (2026-07-25 auto-rotation sensor boundary): shared SysfsAccel reads
+  now reject final symlinks and values above 128 bytes before UTF-8/float
+  parsing, preserving honest absent/read errors. The full farm formfactor slice
+  is green at **23/23**; live pixel and physical acceptance remain external.
 - Progress (2026-07-25 Front Door query boundary): launcher query state and
   ranking now enforce a UTF-8-safe 256-character cap, with the egui input
   applying the same limit to keystrokes and oversized paste/restored state.
@@ -1913,6 +1922,11 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-007 - Car interface (CarPlay-principled vehicle mode)
 
 - Status: Remaining
+- Progress (2026-07-25 MG90 password-file boundary): the root password input
+  now opens without following a final symlink, checks the descriptor's regular
+  file/owner/mode, and caps bytes at 4 KiB before UTF-8/string materialization.
+  The focused farm vehicle slice is green at **42/42**; live MG90 and physical
+  Car evidence remain external.
 - Progress (2026-07-25 vehicle diagnostic projection boundary): live vehicle
   mirror adapter gaps are now latest-wins, bounded to 32 entries and 512 bytes
   per diagnostic before Maps renders them, with an explicit capped marker and

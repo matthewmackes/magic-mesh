@@ -1052,10 +1052,8 @@ pub fn sign_csr_into_bundle<B: crate::ca::NebulaCertBackend + ?Sized>(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    let relay_authority_key = std::fs::read(crate::ca::bundle::RELAY_TRUST_AUTHORITY_KEY_PATH)
-        .ok()
-        .and_then(|raw| <[u8; 32]>::try_from(raw).ok())
-        .map(|seed| ed25519_dalek::SigningKey::from_bytes(&seed));
+    let relay_authority_key =
+        read_relay_authority_key(Path::new(crate::ca::bundle::RELAY_TRUST_AUTHORITY_KEY_PATH));
     let relay_trust_authority = relay_authority_key
         .as_ref()
         .map(crate::ca::bundle::relay_trust_authority_public_key);
@@ -1088,6 +1086,18 @@ pub fn sign_csr_into_bundle<B: crate::ca::NebulaCertBackend + ?Sized>(
         bundle,
         lighthouse_secrets,
     })
+}
+
+/// Read the local relay authority seed through the sealed-file policy before it
+/// can enter an enrollment response. The relay seed is generated as a local
+/// mode-0600 file; an absent, malformed, replaced, or oversized file therefore
+/// degrades to the existing honest "no relay authority" response rather than
+/// being followed or materialized without the local ownership checks.
+fn read_relay_authority_key(path: &Path) -> Option<ed25519_dalek::SigningKey> {
+    crate::ca::seal::read_sealed(path)
+        .ok()
+        .and_then(|raw| <[u8; 32]>::try_from(raw).ok())
+        .map(|seed| ed25519_dalek::SigningKey::from_bytes(&seed))
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {
@@ -1182,6 +1192,43 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n-----END NEBULA X25519 PUBLIC KEY-
         assert!(parse_join_token("mesh:@10.0.0.5:4242#b").is_none());
         assert!(parse_join_token("mesh:m@10.0.0.5:4242#").is_none());
         assert!(parse_join_token("mesh:m@:4242#b").is_none());
+    }
+
+    #[test]
+    fn relay_authority_key_read_requires_sealed_bounded_local_file() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("relay-trust-authority.ed25519");
+        let expected = crate::node_key::load_or_create(&path).expect("seed");
+
+        assert_eq!(
+            read_relay_authority_key(&path)
+                .expect("sealed seed")
+                .to_bytes(),
+            expected.to_bytes()
+        );
+
+        std::fs::write(&path, vec![0_u8; 33]).expect("oversized seed");
+        assert!(
+            read_relay_authority_key(&path).is_none(),
+            "oversized authority material must fail closed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relay_authority_key_read_rejects_a_final_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().expect("tempdir");
+        let target = dir.path().join("outside-seed");
+        let link = dir.path().join("relay-trust-authority.ed25519");
+        crate::node_key::load_or_create(&target).expect("seed");
+        symlink(&target, &link).expect("symlink");
+
+        assert!(
+            read_relay_authority_key(&link).is_none(),
+            "authority reads must not follow a replaced final leaf"
+        );
     }
 
     #[test]

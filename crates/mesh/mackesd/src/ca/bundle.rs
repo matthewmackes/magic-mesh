@@ -433,10 +433,7 @@ pub fn advertise_local_relay_tls_identity(
     external_addr: &str,
     identity: RelayTlsIdentity,
 ) -> Result<(), CaError> {
-    let private = std::fs::read(RELAY_TRUST_AUTHORITY_KEY_PATH)
-        .ok()
-        .and_then(|raw| <[u8; 32]>::try_from(raw).ok())
-        .map(|seed| SigningKey::from_bytes(&seed))
+    let private = read_relay_trust_authority_key(Path::new(RELAY_TRUST_AUTHORITY_KEY_PATH))
         .ok_or_else(|| CaError::Io("relay trust authority key unavailable".to_string()))?;
     advertise_local_relay_tls_identity_with_key(
         workgroup_root,
@@ -446,6 +443,13 @@ pub fn advertise_local_relay_tls_identity(
         identity,
         &private,
     )
+}
+
+fn read_relay_trust_authority_key(path: &Path) -> Option<SigningKey> {
+    super::seal::read_sealed(path)
+        .ok()
+        .and_then(|raw| <[u8; 32]>::try_from(raw).ok())
+        .map(|seed| SigningKey::from_bytes(&seed))
 }
 
 /// Key-explicit form of [`advertise_local_relay_tls_identity`], used by tests
@@ -836,7 +840,30 @@ mod tests {
         symlink(&victim, &link).expect("hostile pin symlink");
         bundle.relay_trust_authority = Some("33".repeat(32));
         assert!(write_relay_trust_authority_pin(&bundle, &link).is_err());
-        assert_eq!(std::fs::read(&victim).expect("victim remains"), b"do-not-replace");
+        assert_eq!(
+            std::fs::read(&victim).expect("victim remains"),
+            b"do-not-replace"
+        );
+    }
+
+    #[test]
+    fn relay_authority_key_reader_treats_unsafe_and_oversized_material_as_unavailable() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("authority.key");
+        crate::ca::seal::write_sealed(&target, &[7_u8; 32]).expect("write authority key");
+        let link = temp.path().join("authority-link.key");
+        symlink(&target, &link).expect("hostile authority symlink");
+        assert!(read_relay_trust_authority_key(&link).is_none());
+
+        let oversized = temp.path().join("oversized-authority.key");
+        crate::ca::seal::write_sealed(
+            &oversized,
+            &vec![0_u8; (crate::ca::seal::MAX_SEALED_FILE_BYTES + 1) as usize],
+        )
+        .expect("write oversized authority key");
+        assert!(read_relay_trust_authority_key(&oversized).is_none());
     }
 
     #[test]

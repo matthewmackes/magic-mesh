@@ -441,14 +441,18 @@ impl std::error::Error for SensorError {}
 /// The live sysfs iio accelerometer reader.
 ///
 /// Reads `in_accel_{x,y,z}_raw × in_accel_*_scale` under an `iio:deviceN` directory.
-/// Plain file reads (no `unsafe`); it compiles everywhere and simply reports
-/// [`SensorError::Absent`] where there is no sensor, so auto-rotation is honestly inert
-/// on a non-tablet / headless host (§7).
+/// Bounded attribute reads (no `unsafe`); it compiles everywhere, refuses a hostile
+/// final symlink, and simply reports [`SensorError::Absent`] where there is no sensor,
+/// so auto-rotation is honestly inert on a non-tablet / headless host (§7).
 #[derive(Debug, Clone)]
 pub struct SysfsAccel {
     device_dir: PathBuf,
     scale: f32,
 }
+
+/// Sysfs accelerometer values are short decimal attributes. Keep malformed or hostile
+/// files from making the reader allocate without bound before attempting UTF-8 parsing.
+const MAX_SENSOR_FILE_BYTES: usize = 128;
 
 impl SysfsAccel {
     /// The iio bus root scanned for an accelerometer device.
@@ -504,11 +508,58 @@ impl AccelSensor for SysfsAccel {
     }
 }
 
-/// Read a whitespace-trimmed `f32` from a sysfs attribute, or `None` if absent/unparseable.
+/// Read a whitespace-trimmed `f32` from a sysfs attribute, or `None` if absent,
+/// symlinked, oversized, invalid UTF-8, or unparseable.
 fn read_f32(path: &Path) -> Option<f32> {
-    std::fs::read_to_string(path)
+    let bytes = read_bounded_no_follow(path, MAX_SENSOR_FILE_BYTES)?;
+    std::str::from_utf8(&bytes)
         .ok()
         .and_then(|s| s.trim().parse::<f32>().ok())
+}
+
+/// Open a sensor attribute without following its final symlink, then read at most
+/// `max_bytes + 1` bytes so an oversized value is rejected before UTF-8 parsing.
+fn read_bounded_no_follow(path: &Path, max_bytes: usize) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        options.custom_flags(0o400000); // O_NOFOLLOW
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        options.custom_flags(0x100); // O_NOFOLLOW
+
+        // Keep unsupported Unix targets fail-closed when their standard library
+        // does not expose a known O_NOFOLLOW value in this crate's dependency surface.
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        if !std::fs::symlink_metadata(path).ok()?.file_type().is_file() {
+            return None;
+        }
+    }
+
+    #[cfg(not(unix))]
+    if !std::fs::symlink_metadata(path).ok()?.file_type().is_file() {
+        return None;
+    }
+
+    let mut bytes = Vec::with_capacity(max_bytes.saturating_add(1));
+    options
+        .open(path)
+        .ok()?
+        .take(u64::try_from(max_bytes).ok()?.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() <= max_bytes).then_some(bytes)
 }
 
 // --- the seat → shell side channel (formfactor + rotation-lock commands) ------------
@@ -836,6 +887,60 @@ mod tests {
         assert!((z - 0.02).abs() < 1e-4, "{z}");
         // The scaled vector folds to the upright orientation (gravity ≈ -y).
         assert_eq!(orientation_from_accel(x, y, z), Some(Orientation::Normal));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sysfs_accel_rejects_oversized_sensor_files_as_read_errors() {
+        let dir = std::env::temp_dir().join(format!(
+            "surf9_iio_oversized_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let dev = dir.join("iio:device0");
+        std::fs::create_dir_all(&dev).expect("mkdir");
+        // Keep the contents valid and parseable after trimming so this proves the
+        // byte cap, rather than merely exercising the UTF-8/float parser failure.
+        let oversized = format!("1{}\n", " ".repeat(MAX_SENSOR_FILE_BYTES));
+        std::fs::write(dev.join("in_accel_x_raw"), oversized).expect("x");
+        std::fs::write(dev.join("in_accel_y_raw"), "-980\n").expect("y");
+        std::fs::write(dev.join("in_accel_z_raw"), "20\n").expect("z");
+
+        let mut accel = SysfsAccel::discover_in(&dir).expect("discovers the device");
+        assert!(matches!(
+            accel.read(),
+            Err(SensorError::Read(channel)) if channel == "in_accel_x_raw"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sysfs_accel_rejects_a_final_sensor_symlink_as_a_read_error() {
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join(format!(
+            "surf9_iio_symlink_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let dev = dir.join("iio:device0");
+        let target = dir.join("hostile-x-raw");
+        std::fs::create_dir_all(&dev).expect("mkdir");
+        std::fs::write(&target, "100\n").expect("target");
+        symlink(&target, dev.join("in_accel_x_raw")).expect("x symlink");
+        std::fs::write(dev.join("in_accel_y_raw"), "-980\n").expect("y");
+        std::fs::write(dev.join("in_accel_z_raw"), "20\n").expect("z");
+
+        let mut accel = SysfsAccel::discover_in(&dir).expect("discovers the device");
+        assert!(matches!(
+            accel.read(),
+            Err(SensorError::Read(channel)) if channel == "in_accel_x_raw"
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

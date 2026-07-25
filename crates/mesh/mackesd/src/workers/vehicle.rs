@@ -49,7 +49,7 @@
 #![cfg(feature = "async-services")]
 
 use std::collections::HashMap;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::net::UdpSocket;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -79,6 +79,16 @@ pub const ROOT_PW_FILE_ENV: &str = "MDE_VEHICLE_ROOT_PW_FILE";
 
 /// Default root-owned MG90 SSH password file used by the packaged worker/helper.
 pub const ROOT_PW_FILE_DEFAULT: &str = "/etc/mackesd/mg90-root-password";
+
+/// Password files contain one short line. Refuse unexpectedly large files before
+/// converting their contents into a `String`.
+const ROOT_PASSWORD_MAX_BYTES: usize = 4 * 1024;
+
+/// Linux's `O_NOFOLLOW`: the final password-file path component must not be a
+/// symlink. This worker is a Linux system service; keep the flag local rather
+/// than adding a libc dependency just for the open boundary.
+#[cfg(target_os = "linux")]
+const ROOT_PASSWORD_NOFOLLOW_FLAG: i32 = 0o400000;
 
 /// Optional env: local UDP port receiving the MG90 JSON Status Broadcast.
 pub const STATUS_PORT_ENV: &str = "MDE_VEHICLE_STATUS_PORT";
@@ -345,11 +355,26 @@ impl SshHttpProbe {
     }
 }
 
-/// Read the first line of a root-owned, mode-0400/0600 password file without ever
-/// placing its contents in a child-process argument. A malformed/untrusted file is
-/// treated as absent; the caller then emits the normal honest SSH gap.
-fn read_root_password_file(path: &str) -> Option<String> {
-    let metadata = std::fs::metadata(path).ok()?;
+/// Open the password file without following its final path component.
+fn open_root_password_file(path: &str) -> Option<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(ROOT_PASSWORD_NOFOLLOW_FLAG);
+    }
+    options.open(path).ok()
+}
+
+/// Read the first line of an already-open root-owned password file without ever
+/// placing its contents in a child-process argument. A malformed/untrusted file
+/// is treated as absent; the caller then emits the normal honest SSH gap.
+fn read_root_password_contents(file: std::fs::File) -> Option<String> {
+    let metadata = file.metadata().ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > ROOT_PASSWORD_MAX_BYTES as u64 {
+        return None;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -357,9 +382,31 @@ fn read_root_password_file(path: &str) -> Option<String> {
             return None;
         }
     }
-    let text = std::fs::read_to_string(path).ok()?;
+
+    let bytes = read_root_password_bytes(file)?;
+    let text = String::from_utf8(bytes).ok()?;
     let first = text.split('\n').next()?.trim_end_matches('\r');
     (!first.is_empty()).then(|| first.to_string())
+}
+
+/// Read at most one byte beyond the accepted limit so a file that grows after
+/// the metadata check is still rejected without an unbounded allocation.
+fn read_root_password_bytes(file: std::fs::File) -> Option<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(ROOT_PASSWORD_MAX_BYTES + 1);
+    file.take((ROOT_PASSWORD_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > ROOT_PASSWORD_MAX_BYTES {
+        return None;
+    }
+    Some(bytes)
+}
+
+/// Read the first line of a root-owned, mode-0400/0600 password file without ever
+/// placing its contents in a child-process argument. A malformed/untrusted file is
+/// treated as absent; the caller then emits the normal honest SSH gap.
+fn read_root_password_file(path: &str) -> Option<String> {
+    read_root_password_contents(open_root_password_file(path)?)
 }
 
 impl VehicleProbe for SshHttpProbe {
@@ -1912,6 +1959,37 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         assert_eq!(
             parse_endpoint("host.local:ssh"),
             ("host.local:ssh".to_string(), 2222)
+        );
+    }
+
+    #[test]
+    fn root_password_reader_rejects_oversized_file_before_string_materialization() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("oversized-password");
+        std::fs::write(&path, vec![b'x'; ROOT_PASSWORD_MAX_BYTES + 1]).unwrap();
+
+        let file = std::fs::File::open(path).unwrap();
+        assert!(
+            read_root_password_bytes(file).is_none(),
+            "password bytes beyond the bounded read must be rejected"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn root_password_reader_rejects_symlinked_file() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("password");
+        let link = tmp.path().join("password-link");
+        std::fs::write(&target, b"mg90-secret\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(
+            open_root_password_file(link.to_str().unwrap()).is_none(),
+            "the password path must reject a final symlink before reading"
         );
     }
 
