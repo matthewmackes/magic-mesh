@@ -2338,6 +2338,69 @@ fn the_displays_section_lays_outputs_across_and_still_drives_the_layout() {
     );
 }
 
+#[test]
+fn detailed_display_controls_expose_each_resolution_and_refresh_choice() {
+    let connector = Connector {
+        name: "HDMI-A-1".to_owned(),
+        status: ConnectorStatus::Connected,
+        size_mm: Some((600, 340)),
+        modes: vec![
+            DisplayMode {
+                width: 3840,
+                height: 2160,
+                refresh_hz: 60,
+                preferred: true,
+            },
+            DisplayMode {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 60,
+                preferred: false,
+            },
+            DisplayMode {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 144,
+                preferred: false,
+            },
+        ],
+    };
+
+    assert_eq!(
+        display_resolutions(&connector),
+        vec![(3840, 2160), (1920, 1080)]
+    );
+    assert_eq!(
+        display_modes_for_resolution(&connector, (1920, 1080))
+            .iter()
+            .map(|mode| mode.refresh_hz)
+            .collect::<Vec<_>>(),
+        vec![60, 144]
+    );
+    assert_eq!(
+        display_mode_for_resolution(&connector, (1920, 1080), Some(144))
+            .expect("advertised refresh")
+            .refresh_hz,
+        144
+    );
+    assert_eq!(
+        display_mode_for_resolution(&connector, (1920, 1080), Some(120))
+            .expect("preferred fallback")
+            .refresh_hz,
+        60
+    );
+
+    let mut state = SystemState {
+        nav: SettingsNav::at(SettingsSection::Displays),
+        ..SystemState::default()
+    };
+    let mut snapshot = Seat::new().snapshot();
+    snapshot.displays = Probe::Present(vec![connector]);
+    state.reconcile(&snapshot);
+    state.snapshot = Some(snapshot);
+    assert!(renders_at(&mut state, 1440.0));
+}
+
 // ── Mesh & System (SETTINGS-4) ────────────────────────────────────────────
 
 /// A faithful mesh-status snapshot — the exact shape `mesh-status-snapshot.sh`

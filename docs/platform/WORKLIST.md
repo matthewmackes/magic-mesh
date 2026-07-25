@@ -252,6 +252,12 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-SEC-006 - Keep Nebula private keys local to their owning node
 
 - Status: Remaining
+- Progress (2026-07-25 topology-directory boundary): replicated Nebula
+  topology now rejects symlinked or non-directory intermediate components
+  before enumerating hop adverts, preventing a `topology/hops` roster from
+  escaping the workgroup root. Focused topology farm gate is green at **15/15**;
+  integrated BigBoy mackesd gate is green at **4,117 passed, 0 failed, 1
+  ignored**. Live Nebula rotation/reconnect/prune evidence remains external.
 - Progress (2026-07-25 replay-ledger root boundary): armed-token replay roots
   now walk and validate every missing parent component, reject symlinks and
   non-directories before use, and retain `0700` permissions on both the root
@@ -645,6 +651,12 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-ARCH-007 - Repair Workloads cockpit E2E wire, placement, and authorization
 
 - Status: Remaining
+- Progress (2026-07-25 lifecycle-argv boundary): Workloads lifecycle verbs
+  now reject option-shaped instance targets beginning with `-` before
+  authorization/replay consumption or virsh execution. Focused cloud
+  regression is green at **1/1**; integrated BigBoy mackesd gate is green at
+  **4,117 passed, 0 failed, 1 ignored**. Live libvirt/Podman lifecycle evidence
+  remains external.
 - Progress (2026-07-25 desired-state write/preflight boundary): Workloads
   desired writes now reject serialized documents above 256 KiB before creating
   any state tree, and `set-desired` preflights every existing canonical JSON
@@ -1599,6 +1611,12 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-012 - Maps live-data overlays (zero-cost external feeds)
 
 - Status: Remaining
+- Progress (2026-07-25 stale-route selection boundary): Maps navigation
+  now refuses to start guidance when the selected route index is stale or out
+  of range, preserving the preview and prior route state instead of claiming
+  navigation. Focused regression is green at **1/1** and the full Maps farm
+  suite at **231/231**; live provider and MG90 scanner-feed evidence remains
+  external.
 - Progress (2026-07-25 forecast-retention boundary): NWS forecast retention
   now bounds both samples and periods before they survive into the next frame,
   while preserving stale and unavailable states. The focused forecast gate is
@@ -1946,6 +1964,12 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-006 - Construct interface (Apple-HIG-principled workstation shell)
 
 - Status: Remaining
+- Progress (2026-07-25 detailed display-resolution interface): Construct
+  Displays now expose separate resolution and refresh controls plus an
+  expandable list of every advertised mode, marking the preferred/native mode
+  while preserving the typed SetMode seam. The focused System farm suite is
+  green at **67/67** and the integrated shell gate at **1,808/1,808**. Live
+  pointer, pixel, physical, and VDI acceptance remain external evidence.
 - Progress (2026-07-25 shared-search bounded-ranking boundary): the shared
   omnibox ranker now bounds query, title/target, and auxiliary-term
   materialization, caps the candidate working set at 256 hits, and preserves
@@ -2479,6 +2503,11 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-007 - Car interface (CarPlay-principled vehicle mode)
 
 - Status: Remaining
+- Progress (2026-07-25 control-only telemetry boundary): Car glance values
+  containing only whitespace/control characters now fall back to honest
+  no-data labels instead of appearing as live telemetry. The focused Car farm
+  suite is green at **12/12** and the integrated shell gate at **1,808/1,808**.
+  Live MG90 and physical Car evidence remain external.
 - Progress (2026-07-25 Navigation route-priority boundary): Car Home now
   resolves overlapping card activations with explicit Navigation priority, so
   the large blue Navigation action cannot fall through to the Vehicle/OBD

@@ -411,6 +411,13 @@ impl MapsLocationSurface {
             return;
         }
         let selected = self.local_navigation.selected_route;
+        // A stale preview selection must not enter guidance with the previous
+        // route summary. `apply_route_option` is intentionally a no-op for an
+        // invalid index, so validate the selection before flipping the
+        // navigation state.
+        if self.local_navigation.route_options.get(selected).is_none() {
+            return;
+        }
         self.local_navigation.apply_route_option(selected);
         self.local_navigation.navigating = true;
         self.route_preview = false;
@@ -5556,6 +5563,24 @@ mod tests {
         s.start_navigation();
         assert!(!s.local_navigation.navigating);
         assert!(s.route_preview, "stays on the preview, honestly routeless");
+    }
+
+    #[test]
+    fn start_navigation_is_a_no_op_for_a_stale_route_selection() {
+        let mut s = MapsLocationSurface::simulated();
+        s.route_preview = true;
+        s.local_navigation.selected_route = usize::MAX;
+        let route_before = s.local_navigation.active_route.clone();
+
+        s.start_navigation();
+
+        assert!(!s.local_navigation.navigating);
+        assert!(s.route_preview, "stale selection keeps the preview open");
+        assert_eq!(
+            s.local_navigation.active_route.current_road,
+            route_before.current_road
+        );
+        assert_eq!(s.local_navigation.active_route.eta, route_before.eta);
     }
 
     #[test]

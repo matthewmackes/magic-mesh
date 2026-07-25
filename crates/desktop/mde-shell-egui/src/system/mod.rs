@@ -4006,7 +4006,13 @@ fn mode_picker(
     let current = out
         .effective_mode()
         .or_else(|| conn.preferred_mode().copied());
-    let label = current.map_or_else(|| "—".to_owned(), |m| m.label());
+    let resolutions = display_resolutions(conn);
+    let Some(current) = current.or_else(|| conn.modes.first().copied()) else {
+        muted_note(ui, "No modes advertised.");
+        return;
+    };
+    let current_resolution = (current.width, current.height);
+    let refresh_modes = display_modes_for_resolution(conn, current_resolution);
     ui.horizontal(|ui| {
         ui.label(
             RichText::new("Mode")
@@ -4015,16 +4021,49 @@ fn mode_picker(
         );
         ui.add_space(Style::SP_S);
         settings_popup_visual_scope(ui, |ui| {
-            ComboBox::from_id_salt((out.connector.as_str(), "mode"))
-                .selected_text(RichText::new(label).size(Style::SMALL))
+            ComboBox::from_id_salt((out.connector.as_str(), "resolution"))
+                .selected_text(
+                    RichText::new(format!("{} × {} px", current.width, current.height))
+                        .size(Style::SMALL),
+                )
                 .show_ui(ui, |ui| {
                     apply_settings_popup_style(ui.style_mut());
-                    for mode in &conn.modes {
-                        let selected = current == Some(*mode);
+                    for (width, height) in resolutions {
+                        let selected = current_resolution == (width, height);
                         if ui
                             .selectable_label(
                                 selected,
-                                RichText::new(mode.label()).size(Style::SMALL),
+                                RichText::new(format!("{} × {} px", width, height))
+                                    .size(Style::SMALL),
+                            )
+                            .clicked()
+                            && !selected
+                        {
+                            if let Some(mode) = display_mode_for_resolution(
+                                conn,
+                                (width, height),
+                                Some(current.refresh_hz),
+                            ) {
+                                actions.push(SysAction::SetMode(out.id.clone(), mode));
+                            }
+                        }
+                    }
+                });
+        });
+        ui.add_space(Style::SP_XS);
+        settings_popup_visual_scope(ui, |ui| {
+            ComboBox::from_id_salt((out.connector.as_str(), "refresh"))
+                .selected_text(
+                    RichText::new(format!("{} Hz", current.refresh_hz)).size(Style::SMALL),
+                )
+                .show_ui(ui, |ui| {
+                    apply_settings_popup_style(ui.style_mut());
+                    for mode in &refresh_modes {
+                        let selected = *mode == current;
+                        if ui
+                            .selectable_label(
+                                selected,
+                                RichText::new(format!("{} Hz", mode.refresh_hz)).size(Style::SMALL),
                             )
                             .clicked()
                             && !selected
@@ -4035,6 +4074,72 @@ fn mode_picker(
                 });
         });
     });
+
+    // Keep the complete connector advertisement visible for advanced users and
+    // diagnostics. The compact controls above are a fast path; this list is the
+    // detailed interface's source-of-truth view of every kernel-advertised mode.
+    egui::CollapsingHeader::new(
+        RichText::new(format!("All modes ({})", conn.modes.len())).size(Style::SMALL),
+    )
+    .id_salt((out.connector.as_str(), "all-modes"))
+    .show(ui, |ui| {
+        for mode in &conn.modes {
+            let selected = *mode == current;
+            let preferred = if mode.preferred { " · native" } else { "" };
+            let label = format!("{}{}", mode.label(), preferred);
+            if ui
+                .selectable_label(selected, RichText::new(label).size(Style::SMALL))
+                .clicked()
+                && !selected
+            {
+                actions.push(SysAction::SetMode(out.id.clone(), *mode));
+            }
+        }
+    });
+}
+
+/// Return each advertised pixel resolution once, preserving kernel order.
+fn display_resolutions(conn: &Connector) -> Vec<(u16, u16)> {
+    let mut resolutions = Vec::new();
+    for mode in &conn.modes {
+        let resolution = (mode.width, mode.height);
+        if !resolutions.contains(&resolution) {
+            resolutions.push(resolution);
+        }
+    }
+    resolutions
+}
+
+/// Return the advertised refresh modes for one resolution, de-duplicated while
+/// retaining the complete `DisplayMode` flags for the action seam.
+fn display_modes_for_resolution(conn: &Connector, resolution: (u16, u16)) -> Vec<DisplayMode> {
+    let mut modes = Vec::new();
+    for mode in &conn.modes {
+        if (mode.width, mode.height) == resolution && !modes.contains(mode) {
+            modes.push(*mode);
+        }
+    }
+    modes
+}
+
+/// Pick a mode after a resolution change: preserve the current refresh when the
+/// panel advertises it, otherwise choose the resolution's preferred mode, then
+/// its first advertised mode.
+fn display_mode_for_resolution(
+    conn: &Connector,
+    resolution: (u16, u16),
+    refresh_hint: Option<u32>,
+) -> Option<DisplayMode> {
+    let modes = display_modes_for_resolution(conn, resolution);
+    refresh_hint
+        .and_then(|refresh| {
+            modes
+                .iter()
+                .find(|mode| mode.refresh_hz == refresh)
+                .copied()
+        })
+        .or_else(|| modes.iter().find(|mode| mode.preferred).copied())
+        .or_else(|| modes.first().copied())
 }
 
 /// The per-output brightness control: DDC/CI for a matched external monitor,

@@ -112,7 +112,14 @@ pub fn write_advert(root: &Path, advert: &HopAdvert) -> io::Result<PathBuf> {
 /// closed instead of installing a partial snapshot.
 #[must_use]
 pub fn read_adverts(root: &Path) -> Vec<HopAdvert> {
-    let Ok(entries) = std::fs::read_dir(hops_dir(root)) else {
+    let dir = hops_dir(root);
+    // `read_bounded_regular_file` rejects a symlink at the row leaf, but a
+    // symlinked directory would still redirect the whole replicated roster
+    // outside the workgroup root before that leaf check runs.
+    if !replicated_directory_is_safe(&dir) {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
 
@@ -148,6 +155,24 @@ fn read_advert(path: &Path) -> Option<HopAdvert> {
     let bytes = read_bounded_regular_file(path, MAX_ADVERT_BYTES)?;
     let raw = std::str::from_utf8(&bytes).ok()?;
     validate_advert(serde_json::from_str(raw).ok()?)
+}
+
+/// Refuse to traverse a replicated directory symlink before enumerating its
+/// contents. The final row is protected independently by `O_NOFOLLOW`, but
+/// that boundary cannot prevent an intermediate `topology` or `hops` link
+/// from redirecting the roster to another tree.
+fn replicated_directory_is_safe(path: &Path) -> bool {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return false,
+            Ok(metadata) if !metadata.is_dir() => return false,
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+    }
+    true
 }
 
 /// Read a replicated text record from the descriptor that will actually be
@@ -591,6 +616,28 @@ mod tests {
         std::os::unix::fs::symlink(&target, hops.join("linked.json")).unwrap();
 
         assert!(read_adverts(tmp.path()).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replicated_hop_directory_rejects_symlink_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_row = outside.path().join("outside.json");
+        std::fs::write(
+            &outside_row,
+            serde_json::to_string(&advert("outside", "10.42.0.9", &["192.168.50.0/24"])).unwrap(),
+        )
+        .unwrap();
+
+        let topology = tmp.path().join("topology");
+        std::fs::create_dir_all(&topology).unwrap();
+        std::os::unix::fs::symlink(outside.path(), hops_dir(tmp.path())).unwrap();
+
+        assert!(
+            read_adverts(tmp.path()).is_empty(),
+            "a symlinked replicated roster must not import rows from outside the root"
+        );
     }
 
     #[test]

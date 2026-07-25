@@ -299,7 +299,11 @@ impl CarHomeGlance {
     /// feed is present but sparse. Treat that exactly like absent data: an
     /// empty strong-colored line would falsely suggest a live reading.
     fn non_empty(value: Option<&str>) -> Option<&str> {
-        value.map(str::trim).filter(|value| !value.is_empty())
+        value.map(str::trim).filter(|value| {
+            value
+                .chars()
+                .any(|ch| !ch.is_whitespace() && !ch.is_control())
+        })
     }
 
     fn nav_value(&self) -> Option<&str> {
@@ -879,6 +883,19 @@ mod tests {
         assert_eq!(sparse.media_line(), "Music & podcasts");
         assert_eq!(sparse.vehicle_line(), "Telematics");
 
+        // Control-only gateway payloads are also absent data. They are not
+        // removed by `str::trim`, but the render sanitizer removes them; do
+        // not classify that resulting empty line as a live reading.
+        let control_only = CarHomeGlance {
+            nav: Some("\u{0000}\u{0007}".to_string()),
+            media: Some("\u{001b}".to_string()),
+            vehicle: Some("\u{001f}".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(control_only.nav_line(), "Where to?");
+        assert_eq!(control_only.media_line(), "Music & podcasts");
+        assert_eq!(control_only.vehicle_line(), "Telematics");
+
         let live = CarHomeGlance {
             nav: Some("12 min · 4.3 mi · ETA 14:32".to_string()),
             media: Some("Comfortably Numb · Pink Floyd".to_string()),
@@ -1309,7 +1326,11 @@ mod tests {
         ] {
             let (picks, shapes) =
                 drive_with_screen(&CarHomeGlance::default(), vec![vec![]], undersized);
-            assert_eq!(picks, vec![None], "unsupported seat size has no active target");
+            assert_eq!(
+                picks,
+                vec![None],
+                "unsupported seat size has no active target"
+            );
             assert!(painted_text(&shapes)
                 .iter()
                 .any(|text| text == "Resize workspace to use Auto Mode"));

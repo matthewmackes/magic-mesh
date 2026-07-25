@@ -461,7 +461,7 @@ fn handle_lifecycle(
             ..Default::default()
         };
     };
-    if let Err(e) = super::path_key::segment("instance", instance) {
+    if let Err(e) = validated_lifecycle_instance(instance) {
         return CloudReply {
             ok: false,
             verb: verb_name.to_string(),
@@ -513,6 +513,17 @@ fn handle_lifecycle(
         }
     }
     finish_authorized_mutation(w, verb, verb_name, &outcome, Some(instance))
+}
+
+/// Validate a lifecycle target before it becomes a `virsh` argv value. The
+/// shared path-key grammar permits `-` for ordinary workload names, but an
+/// option-shaped domain such as `--help` can be interpreted as a virsh option;
+/// reject it before auth/replay consumption or backend work.
+fn validated_lifecycle_instance(instance: &str) -> Result<(), String> {
+    if instance.starts_with('-') {
+        return Err("`instance` must not begin with `-` for virsh lifecycle commands".to_string());
+    }
+    super::path_key::segment("instance", instance).map(|_| ())
 }
 
 /// A placement-local bulk lifecycle mutation. Authorization is node-wide, but
@@ -833,5 +844,38 @@ mod tests {
             .as_deref()
             .is_some_and(|error| error.contains("valid JSON")));
         assert!(mutation_runner.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn option_like_instance_is_rejected_before_auth_or_virsh() {
+        use std::path::PathBuf;
+        use std::sync::Arc;
+
+        use super::super::runner::fake::FakeRunner;
+        use super::super::CloudWorker;
+
+        let runner = Arc::new(FakeRunner::default());
+        let worker = CloudWorker::new(
+            "me".into(),
+            "peer:me".into(),
+            PathBuf::from("/tmp/mackesd-cloud-verbs-lifecycle-test"),
+        )
+        .with_runner(runner.clone());
+
+        for (verb, extra) in [
+            ("instance-start", ""),
+            ("instance-stop", ""),
+            ("instance-reboot", ""),
+            ("instance-delete", r#","typed_name":"--help""#),
+        ] {
+            let body = format!(r#"{{"schema_version":1,"node":"me","instance":"--help"{extra}}}"#);
+            let reply = worker.handle(verb, &body);
+            assert!(!reply.ok, "{verb} must reject option-shaped targets");
+            assert!(reply
+                .error
+                .as_deref()
+                .is_some_and(|error| { error.contains("must not begin with `-`") }));
+        }
+        assert!(runner.calls.lock().unwrap().is_empty());
     }
 }
