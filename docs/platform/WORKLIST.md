@@ -241,6 +241,15 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-SEC-006 - Keep Nebula private keys local to their owning node
 
 - Status: Remaining
+- Progress (2026-07-25 certificate and revocation handoff boundaries): active
+  Nebula certificate comparisons, replicated blocklist records, CA mint output,
+  and generated peer-key handoffs now use bounded regular-file readers that
+  reject final symlinks before materialization or sealing. Focused farm gates
+  are green at **44/44** supervisor tests, **10/10** blocklist tests, **7/7**
+  CA-mint tests, and **4/4** peer-key tests; the integrated BigBoy
+  `mackesd --lib --features async-services` gate is green at **4,032 passed,
+  0 failed, 1 ignored**. Live Nebula rotation/reconnect evidence remains
+  external.
 - Progress (2026-07-25 relay-authority enrollment boundary): authenticated
   enrollment now reads the local relay seed through the sealed 0600/no-follow
   1 MiB reader, rejecting hostile symlinks and oversized material before it can
@@ -731,6 +740,13 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-011 - Communications collaboration suite full replacement
 
 - Status: Remaining
+- Progress (2026-07-25 persisted Communications boundary): message logs,
+  notification preferences, room registries, and presence gossip now load
+  through bounded regular-file readers with Unix final-symlink rejection while
+  preserving legacy JSON and existing fail-soft defaults. The focused farm
+  Communications gate is green at **37/37**; the integrated BigBoy
+  `mackesd --lib --features async-services` gate is green at **4,032 passed,
+  0 failed, 1 ignored**. Live peer/media evidence remains external.
 - Progress (2026-07-24 file-reference boundary): selected collaboration files
   now require regular non-symlink leaves and a bounded 100 MiB read before
   hashing. The focused farm gate is green at **7/7** and the full UI package

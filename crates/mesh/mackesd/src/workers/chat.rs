@@ -48,6 +48,7 @@
 #![cfg(feature = "async-services")]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -698,6 +699,85 @@ fn notify_path(root: &Path, self_host: &str) -> PathBuf {
     root.join(self_host).join("chat").join("notify.json")
 }
 
+/// Keep replicated chat state bounded before JSON deserialization can allocate
+/// from an attacker-controlled or half-written Syncthing file. The message log
+/// ceiling leaves room for the existing 500-message ring, including clipboard
+/// payloads; the smaller metadata ceilings are ample for normal fleet state.
+const MAX_PERSISTED_MESSAGE_LOG_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PERSISTED_NOTIFY_PREFS_BYTES: usize = 64 * 1024;
+const MAX_PERSISTED_ROOM_REGISTRY_BYTES: usize = 256 * 1024;
+const MAX_PERSISTED_PRESENCE_BYTES: usize = 64 * 1024;
+
+/// Read a persisted chat document from a regular file without following its
+/// final symlink. On Unix the no-follow decision is made by the kernel on the
+/// descriptor that is then read, closing the check/read race. The extra byte
+/// probe preserves a hard allocation ceiling even if a file grows after open.
+fn read_persisted_text(path: &Path, max_bytes: usize) -> io::Result<String> {
+    #[cfg(unix)]
+    {
+        use rustix::fs::{Mode, OFlags};
+
+        let fd = rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        let file: std::fs::File = fd.into();
+        read_open_persisted_text(file, path, max_bytes)
+    }
+    #[cfg(not(unix))]
+    {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "persisted chat path is not a regular file",
+            ));
+        }
+        read_open_persisted_text(std::fs::File::open(path)?, path, max_bytes)
+    }
+}
+
+fn read_open_persisted_text(
+    file: std::fs::File,
+    path: &Path,
+    max_bytes: usize,
+) -> io::Result<String> {
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "persisted chat path is not a regular file",
+        ));
+    }
+    if metadata.len() > max_bytes as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "persisted chat file {} exceeds {max_bytes}-byte limit",
+                path.display()
+            ),
+        ));
+    }
+
+    let capacity = usize::try_from(metadata.len())
+        .unwrap_or(max_bytes)
+        .min(max_bytes.saturating_add(1));
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(max_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "persisted chat file {} exceeds {max_bytes}-byte limit",
+                path.display()
+            ),
+        ));
+    }
+    String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
 /// Serialize + publish a KIRON `event/toast/show` chyron body (the one lane;
 /// KIRON-2 owns the render + sound + suppression — this unit only emits).
 fn emit_toast(persist: &Persist, show: &ToastShow) {
@@ -729,7 +809,7 @@ fn merge_room(rooms: &mut BTreeMap<String, RoomDescriptor>, incoming: RoomDescri
 /// Read a ring-log file as a message vec (missing/corrupt ⇒ empty — the union
 /// tolerates a half-synced or absent file).
 fn read_log(path: &Path) -> Vec<Message> {
-    std::fs::read_to_string(path)
+    read_persisted_text(path, MAX_PERSISTED_MESSAGE_LOG_BYTES)
         .ok()
         .and_then(|s| serde_json::from_str::<Vec<Message>>(&s).ok())
         .unwrap_or_default()
@@ -811,10 +891,13 @@ fn discover_persisted_keys(root: &Path) -> BTreeSet<String> {
 /// Load this seat's [`NotifyPrefs`] from `<self>/chat/notify.json`; a missing or
 /// corrupt file is the permissive default (nothing muted, Warning threshold).
 fn load_notify_prefs(root: &Path, self_host: &str) -> NotifyPrefs {
-    std::fs::read_to_string(notify_path(root, self_host))
-        .ok()
-        .and_then(|s| serde_json::from_str::<NotifyPrefs>(&s).ok())
-        .unwrap_or_default()
+    read_persisted_text(
+        &notify_path(root, self_host),
+        MAX_PERSISTED_NOTIFY_PREFS_BYTES,
+    )
+    .ok()
+    .and_then(|s| serde_json::from_str::<NotifyPrefs>(&s).ok())
+    .unwrap_or_default()
 }
 
 /// Union every host's persisted ad-hoc room registry (`<host>/chat/rooms.json`).
@@ -827,9 +910,10 @@ fn load_all_rooms(root: &Path) -> Vec<RoomDescriptor> {
     };
     for h in hosts.flatten() {
         let host = h.file_name().to_string_lossy().to_string();
-        if let Some(rooms) = std::fs::read_to_string(rooms_path(root, &host))
-            .ok()
-            .and_then(|s| serde_json::from_str::<Vec<RoomDescriptor>>(&s).ok())
+        if let Some(rooms) =
+            read_persisted_text(&rooms_path(root, &host), MAX_PERSISTED_ROOM_REGISTRY_BYTES)
+                .ok()
+                .and_then(|s| serde_json::from_str::<Vec<RoomDescriptor>>(&s).ok())
         {
             out.extend(rooms);
         }
@@ -920,10 +1004,12 @@ impl ChatWorker {
         // gossip file so an operator's manual override survives a restart — the
         // same durability the notify prefs + room registry below already have. A
         // missing file leaves the construction seed intact.
-        if let Some(g) =
-            std::fs::read_to_string(presence_path(&self.workgroup_root, &self.self_host))
-                .ok()
-                .and_then(|s| serde_json::from_str::<PresenceGossip>(&s).ok())
+        if let Some(g) = read_persisted_text(
+            &presence_path(&self.workgroup_root, &self.self_host),
+            MAX_PERSISTED_PRESENCE_BYTES,
+        )
+        .ok()
+        .and_then(|s| serde_json::from_str::<PresenceGossip>(&s).ok())
         {
             self.manual_presence = g.manual;
             self.status_message = g.status_message;
@@ -1481,9 +1567,12 @@ impl ChatWorker {
             if host == self.self_host {
                 continue;
             }
-            if let Some(g) = std::fs::read_to_string(presence_path(&self.workgroup_root, &host))
-                .ok()
-                .and_then(|s| serde_json::from_str::<PresenceGossip>(&s).ok())
+            if let Some(g) = read_persisted_text(
+                &presence_path(&self.workgroup_root, &host),
+                MAX_PERSISTED_PRESENCE_BYTES,
+            )
+            .ok()
+            .and_then(|s| serde_json::from_str::<PresenceGossip>(&s).ok())
             {
                 out.insert(host, g);
             }
@@ -1857,6 +1946,127 @@ mod tests {
         append_own(root, "nyc3", &k, &msg);
         append_own(root, "nyc3", &k, &msg);
         assert_eq!(load_conversation(root, &k).len(), 1, "dedup by id");
+    }
+
+    #[test]
+    fn persisted_chat_reader_preserves_valid_legacy_json_and_rejects_oversized_input() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("legacy.json");
+        let legacy = r#"{"id":"ops","name":"Operations","members":["eagle"]}"#;
+        std::fs::write(&path, legacy).unwrap();
+        assert_eq!(
+            read_persisted_text(&path, MAX_PERSISTED_ROOM_REGISTRY_BYTES).unwrap(),
+            legacy
+        );
+
+        std::fs::write(&path, vec![b'x'; MAX_PERSISTED_ROOM_REGISTRY_BYTES + 1]).unwrap();
+        assert!(
+            read_persisted_text(&path, MAX_PERSISTED_ROOM_REGISTRY_BYTES).is_err(),
+            "the reader must reject an oversized document before JSON parsing"
+        );
+    }
+
+    #[test]
+    fn oversized_persisted_chat_documents_fail_soft_at_each_loader() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let log = own_log_path(root, "eagle", &dm_key("eagle", "nyc3"));
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(&log, vec![b'x'; MAX_PERSISTED_MESSAGE_LOG_BYTES + 1]).unwrap();
+        assert!(read_log(&log).is_empty(), "oversized logs are ignored");
+
+        let notify = notify_path(root, "eagle");
+        std::fs::write(&notify, vec![b'x'; MAX_PERSISTED_NOTIFY_PREFS_BYTES + 1]).unwrap();
+        assert_eq!(
+            load_notify_prefs(root, "eagle"),
+            NotifyPrefs::default(),
+            "oversized preferences restore the permissive default"
+        );
+
+        let rooms = rooms_path(root, "eagle");
+        std::fs::write(&rooms, vec![b'x'; MAX_PERSISTED_ROOM_REGISTRY_BYTES + 1]).unwrap();
+        assert!(
+            load_all_rooms(root).is_empty(),
+            "an oversized room registry is skipped"
+        );
+
+        let presence = presence_path(root, "eagle");
+        std::fs::write(&presence, vec![b'x'; MAX_PERSISTED_PRESENCE_BYTES + 1]).unwrap();
+        let mut w = worker(root)
+            .with_manual_presence(Presence::FreeForChat)
+            .with_status_message("seed");
+        let mut state = ChatState::default();
+        w.bootstrap(&mut state);
+        assert_eq!(
+            w.manual_presence,
+            Some(Presence::FreeForChat),
+            "an oversized self-gossip leaves the construction seed intact"
+        );
+        assert_eq!(w.status_message.as_deref(), Some("seed"));
+
+        let peer_presence = presence_path(root, "nyc3");
+        std::fs::create_dir_all(peer_presence.parent().unwrap()).unwrap();
+        std::fs::write(&peer_presence, vec![b'x'; MAX_PERSISTED_PRESENCE_BYTES + 1]).unwrap();
+        assert!(
+            w.read_peer_gossip().is_empty(),
+            "an oversized peer gossip is skipped"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_chat_loaders_reject_final_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let target = root.join("outside.json");
+        let presence = PresenceGossip {
+            manual: Some(Presence::Dnd),
+            status_message: Some("should not load".into()),
+            nickname: None,
+        };
+        std::fs::write(&target, serde_json::to_string(&presence).unwrap()).unwrap();
+
+        let log = own_log_path(root, "eagle", &dm_key("eagle", "nyc3"));
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        symlink(&target, &log).unwrap();
+        assert!(read_log(&log).is_empty(), "message log symlink is ignored");
+
+        let notify = notify_path(root, "eagle");
+        symlink(&target, &notify).unwrap();
+        assert_eq!(
+            load_notify_prefs(root, "eagle"),
+            NotifyPrefs::default(),
+            "notification preference symlink restores defaults"
+        );
+
+        let rooms = rooms_path(root, "eagle");
+        symlink(&target, &rooms).unwrap();
+        assert!(
+            load_all_rooms(root).is_empty(),
+            "room registry symlink is skipped"
+        );
+
+        let self_presence = presence_path(root, "eagle");
+        symlink(&target, &self_presence).unwrap();
+        let mut w = worker(root).with_manual_presence(Presence::FreeForChat);
+        let mut state = ChatState::default();
+        w.bootstrap(&mut state);
+        assert_eq!(
+            w.manual_presence,
+            Some(Presence::FreeForChat),
+            "self presence symlink cannot replace the construction seed"
+        );
+
+        let peer_presence = presence_path(root, "nyc3");
+        std::fs::create_dir_all(peer_presence.parent().unwrap()).unwrap();
+        symlink(&target, &peer_presence).unwrap();
+        assert!(
+            w.read_peer_gossip().is_empty(),
+            "peer presence symlink is skipped"
+        );
     }
 
     // ── worker ticks against a tempdir Bus + tempdir Syncthing root ─────

@@ -573,7 +573,7 @@ fn install_identity_generation(
     // activate a new cert/key generation.
     let current_cert = identity_dir.join("current/host.crt");
     if requester_private_key.is_none() && current_cert.exists() {
-        let active_cert = std::fs::read(&current_cert)
+        let active_cert = crate::ca::seal::read_no_follow(&current_cert)
             .map_err(|e| format!("read active identity cert {}: {e}", current_cert.display()))?;
         if active_cert != bundle.peer_cert_pem.as_bytes() {
             return Err(
@@ -1547,6 +1547,30 @@ mod tests {
             crate::ca::seal::read_sealed(&tmp.path().join("identity/current/host.key")).unwrap(),
             b"local-requester-key"
         );
+    }
+
+    #[test]
+    fn oversized_active_identity_cert_fails_closed_before_comparison() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let first = sample_bundle();
+        materialize_config(
+            tmp.path(),
+            &first,
+            ConfigRole::Peer,
+            &[],
+            tmp.path(),
+            Some(b"local-requester-key"),
+        )
+        .expect("first identity");
+        std::fs::write(
+            tmp.path().join("identity/current/host.crt"),
+            vec![b'x'; crate::ca::seal::MAX_SEALED_FILE_BYTES as usize + 1],
+        )
+        .expect("oversized active cert");
+
+        let error = materialize_config(tmp.path(), &first, ConfigRole::Peer, &[], tmp.path(), None)
+            .expect_err("oversized active certificate must fail closed");
+        assert!(error.contains("exceeds"), "unexpected error: {error}");
     }
 
     #[test]

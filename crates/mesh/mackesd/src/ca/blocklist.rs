@@ -15,6 +15,11 @@ use std::path::{Path, PathBuf};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
+/// Replicated records are small JSON envelopes. Keep hostile/corrupt entries
+/// bounded before serde materializes them, while leaving room for a large
+/// signed revocation set.
+const MAX_BLOCKLIST_RECORD_BYTES: usize = 64 * 1024;
+
 /// The replicated blocklist directory.
 #[must_use]
 pub fn blocklist_dir(workgroup_root: &Path) -> PathBuf {
@@ -149,6 +154,51 @@ fn signature_acceptable(v: &serde_json::Value) -> bool {
     .is_ok()
 }
 
+/// Read one replicated record through a descriptor whose final path component
+/// cannot be a symlink. The caller intentionally treats every error as a
+/// dropped entry: blocklist replication is fail-soft for malformed or
+/// half-written records, but must not turn an attacker-controlled file into an
+/// unbounded allocation or a blocking read.
+fn read_blocklist_record(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+
+    #[cfg(unix)]
+    let file = {
+        use rustix::fs::{Mode, OFlags};
+
+        let fd = rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .ok()?;
+        std::fs::File::from(fd)
+    };
+
+    #[cfg(not(unix))]
+    let file = {
+        let metadata = std::fs::symlink_metadata(path).ok()?;
+        if metadata.file_type().is_symlink() {
+            return None;
+        }
+        std::fs::File::open(path).ok()?
+    };
+
+    let metadata = file.metadata().ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_BLOCKLIST_RECORD_BYTES as u64 {
+        return None;
+    }
+
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take((MAX_BLOCKLIST_RECORD_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > MAX_BLOCKLIST_RECORD_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
 /// Union every entry's fingerprints — sorted + deduped, tolerant of
 /// junk/half-replicated files. What the config renderer emits.
 #[must_use]
@@ -159,7 +209,7 @@ pub fn all_fingerprints(workgroup_root: &Path) -> Vec<String> {
     let mut out: Vec<String> = entries
         .filter_map(Result::ok)
         .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
-        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .filter_map(|e| read_blocklist_record(&e.path()))
         .filter_map(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
         .filter(|v| {
             let ok = signature_acceptable(v);
@@ -280,6 +330,39 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         record_revoked(tmp.path(), "peer:elm", &[FP_A.into()]).unwrap();
         assert_eq!(all_fingerprints(tmp.path()), vec![FP_A]);
+    }
+
+    #[test]
+    fn oversized_records_are_dropped_before_json_parsing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = blocklist_dir(tmp.path()).join("oversized.json");
+        std::fs::create_dir_all(blocklist_dir(tmp.path())).unwrap();
+        std::fs::write(&path, vec![b'x'; MAX_BLOCKLIST_RECORD_BYTES + 1]).unwrap();
+
+        assert!(all_fingerprints(tmp.path()).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_symlink_records_are_dropped_without_following_them() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target.json");
+        record_revoked(tmp.path(), "peer:target", &[FP_A.into()]).unwrap();
+        std::fs::rename(blocklist_dir(tmp.path()).join("peer_target.json"), &target).unwrap();
+        symlink(&target, blocklist_dir(tmp.path()).join("linked.json")).unwrap();
+
+        assert!(all_fingerprints(tmp.path()).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_regular_records_are_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(blocklist_dir(tmp.path()).join("directory.json")).unwrap();
+
+        assert!(all_fingerprints(tmp.path()).is_empty());
     }
 
     #[test]

@@ -137,8 +137,7 @@ pub fn sign_peer_cert<B: NebulaCertBackend + ?Sized>(
     )?;
 
     // Seal the produced private key.
-    let key_bytes = std::fs::read(key_out)
-        .map_err(|e| CaError::Io(format!("read peer key {}: {e}", key_out.display())))?;
+    let key_bytes = read_generated_peer_key(key_out)?;
     seal::write_sealed(key_out, &key_bytes)?;
 
     let cert_pem = read_generated_cert(crt_out)?;
@@ -388,6 +387,16 @@ fn read_generated_cert(path: &Path) -> Result<String, CaError> {
         .map_err(|e| CaError::Io(format!("peer cert {} is not UTF-8: {e}", path.display())))
 }
 
+/// Consume a backend-produced peer key through the bounded, no-follow sealed
+/// file reader before replacing the hand-off file with its sealed form.
+/// Generated keys are ephemeral outputs, so a symlink, non-regular file, or
+/// oversized replacement must fail closed rather than being read or sealed.
+#[cfg(test)]
+fn read_generated_peer_key(path: &Path) -> Result<Vec<u8>, CaError> {
+    super::seal::read_no_follow(path)
+        .map_err(|e| CaError::Io(format!("read peer key {}: {e}", path.display())))
+}
+
 /// Per-cert role group. The open-mesh directive flattens
 /// this to two values: Host (lighthouse-eligible) + Peer
 /// (everything else). No per-service scopes.
@@ -624,6 +633,56 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n-----END NEBULA X25519 PUBLIC KEY-
 
         let error = read_generated_cert(&path).expect_err("oversized cert must fail closed");
         assert!(error.to_string().contains("exceeds"));
+    }
+
+    #[test]
+    fn generated_peer_key_read_accepts_a_bounded_regular_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("generated.key");
+        let expected = b"-----BEGIN NEBULA KEY-----\npeer\n-----END NEBULA KEY-----\n";
+        std::fs::write(&path, expected).expect("generated peer key");
+
+        assert_eq!(
+            read_generated_peer_key(&path).expect("bounded peer key"),
+            expected
+        );
+    }
+
+    #[test]
+    fn generated_peer_key_read_rejects_an_oversized_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("generated.key");
+        crate::ca::seal::write_sealed(
+            &path,
+            &vec![b'k'; (crate::ca::seal::MAX_SEALED_FILE_BYTES + 1) as usize],
+        )
+        .expect("oversized generated peer key");
+
+        let error = read_generated_peer_key(&path).expect_err("oversized peer key");
+        assert!(error.to_string().contains("exceeds"));
+    }
+
+    #[test]
+    fn generated_peer_key_read_rejects_a_non_regular_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let error = read_generated_peer_key(tmp.path()).expect_err("directory peer key");
+        assert!(error.to_string().contains("not a regular file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_peer_key_read_rejects_a_hostile_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let victim = tmp.path().join("victim");
+        let link = tmp.path().join("generated.key");
+        std::fs::write(&victim, b"do-not-read").expect("victim");
+        symlink(&victim, &link).expect("hostile peer-key symlink");
+
+        let error = read_generated_peer_key(&link).expect_err("symlink peer key");
+        assert!(error.to_string().contains("generated.key"));
+        assert_eq!(std::fs::read(&victim).expect("victim read"), b"do-not-read");
     }
 
     /// Backend that models real nebula-cert's refusal to overwrite an

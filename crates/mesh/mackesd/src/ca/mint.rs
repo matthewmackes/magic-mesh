@@ -74,8 +74,12 @@ pub fn mint_ca<B: NebulaCertBackend>(
     // shared CA-file ceiling before we materialize UTF-8 or SQLite text.
     let cert_bytes = seal::read_no_follow(crt)
         .map_err(|e| CaError::Io(format!("read CA cert {}: {e}", crt.display())))?;
-    let cert_pem = String::from_utf8(cert_bytes)
-        .map_err(|e| CaError::Io(format!("read CA cert {}: invalid UTF-8: {e}", crt.display())))?;
+    let cert_pem = String::from_utf8(cert_bytes).map_err(|e| {
+        CaError::Io(format!(
+            "read CA cert {}: invalid UTF-8: {e}",
+            crt.display()
+        ))
+    })?;
 
     conn.execute(
         "INSERT INTO nebula_ca (mesh_id, epoch, ca_cert_pem, retired_at) \
