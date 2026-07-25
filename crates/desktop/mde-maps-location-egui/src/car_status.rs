@@ -8,11 +8,16 @@
 //! to cycle it to the next catalog entry, so any readout can occupy any slot.
 
 use serde::{Deserialize, Serialize};
+use std::io::Read;
+use std::path::Path;
 
 use crate::MapsLocationSurface;
 
 /// The file (under the client data dir) the strip selection persists to.
 const CAR_STATUS_CONFIG_FILE: &str = "settings-car-status.json";
+/// A car-status selection is a small enum list; keep hostile/stale local JSON
+/// bounded before it reaches serde's materializer.
+const MAX_CAR_STATUS_CONFIG_BYTES: u64 = 64 * 1024;
 
 /// One selectable readout in the driver's status strip. Serialized by its
 /// `snake_case` name so the persisted selection is stable across reordering.
@@ -484,17 +489,20 @@ impl CarStatusSelection {
         mde_bus::client_data_dir().map(|d| d.join(CAR_STATUS_CONFIG_FILE))
     }
 
+    fn load_from_path(path: &Path) -> Self {
+        read_bounded_config(path)
+            .and_then(|s| serde_json::from_str::<Self>(&s).ok())
+            .filter(|s| !s.slots.is_empty())
+            .unwrap_or_default()
+    }
+
     /// Load from the default path (factory strip when absent / unparsable).
     #[must_use]
     pub fn load() -> Self {
         let Some(path) = Self::default_path() else {
             return Self::default();
         };
-        std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<Self>(&s).ok())
-            .filter(|s| !s.slots.is_empty())
-            .unwrap_or_default()
+        Self::load_from_path(&path)
     }
 
     /// Persist to the default path (atomic temp + rename; silent no-op headless).
@@ -509,6 +517,31 @@ impl CarStatusSelection {
             }
         }
     }
+}
+
+/// Read a local config through a finite buffer and reject non-regular files.
+/// The metadata checks reduce needless allocation, while the bounded read
+/// closes the race where a file grows after its first metadata snapshot.
+fn read_bounded_config(path: &Path) -> Option<String> {
+    let entry = std::fs::symlink_metadata(path).ok()?;
+    if !entry.file_type().is_file() || entry.len() > MAX_CAR_STATUS_CONFIG_BYTES {
+        return None;
+    }
+
+    let file = std::fs::File::open(path).ok()?;
+    let opened = file.metadata().ok()?;
+    if !opened.file_type().is_file() || opened.len() > MAX_CAR_STATUS_CONFIG_BYTES {
+        return None;
+    }
+
+    let mut bytes = Vec::with_capacity(opened.len() as usize);
+    file.take(MAX_CAR_STATUS_CONFIG_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_CAR_STATUS_CONFIG_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
 }
 
 #[cfg(test)]
@@ -549,6 +582,34 @@ mod tests {
         let json = serde_json::to_string(&sel).expect("serialize");
         let back: CarStatusSelection = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, sel);
+    }
+
+    #[test]
+    fn load_rejects_oversized_config_before_json_materialization() {
+        let dir = tempfile::tempdir().expect("temp config dir");
+        let path = dir.path().join(CAR_STATUS_CONFIG_FILE);
+        std::fs::write(
+            &path,
+            vec![b'{'; (MAX_CAR_STATUS_CONFIG_BYTES + 1) as usize],
+        )
+        .expect("write oversized config");
+
+        assert_eq!(
+            CarStatusSelection::load_from_path(&path),
+            CarStatusSelection::defaults()
+        );
+    }
+
+    #[test]
+    fn load_fails_closed_for_corrupt_config() {
+        let dir = tempfile::tempdir().expect("temp config dir");
+        let path = dir.path().join(CAR_STATUS_CONFIG_FILE);
+        std::fs::write(&path, b"not-json").expect("write corrupt config");
+
+        assert_eq!(
+            CarStatusSelection::load_from_path(&path),
+            CarStatusSelection::defaults()
+        );
     }
 
     #[test]

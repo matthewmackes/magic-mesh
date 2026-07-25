@@ -454,6 +454,11 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-ARCH-007 - Repair Workloads cockpit E2E wire, placement, and authorization
 
 - Status: Remaining
+- Progress (2026-07-24 direct-libvirt action framing hardening): the lifecycle
+  Bus parser now rejects action bodies above the shared 64 KiB RPC limit before
+  JSON materialization, with the oversized-body regression covered by the
+  focused BigBoy `vm_lifecycle` gate at 55/55. Direct libvirt/KVM live evidence
+  remains external.
 - Progress (2026-07-24 cloud action boundary hardening): the shared cloud action
   parser now rejects bodies above the RPC limit before JSON materialization, and
   container deploy rejects oversized image, port, environment, and volume
@@ -653,6 +658,11 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-011 - Communications collaboration suite full replacement
 
 - Status: Remaining
+- Progress (2026-07-24 replication batch admission hardening): the collaboration
+  engine now rejects merge batches above 4,096 envelopes before iteration or
+  retention, preserving all-or-nothing replication semantics. Oversized and
+  exact-boundary regressions are green, and the full collaboration-core suite
+  is green at 55/55 on the farm; live media/LLM evidence remains external.
 - Progress (2026-07-24 Communications review/render hardening): the Documents
   strip now emits bounded `RequestReview` and `SubmitReview` commands using the
   current document peers and explicit approve/changes/comment verdicts. Calls,
@@ -1126,6 +1136,11 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-012 - Maps live-data overlays (zero-cost external feeds)
 
 - Status: Remaining
+- Progress (2026-07-24 map attribution layout hardening): map credits are capped
+  at 512 characters with an explicit ellipsis before egui galley layout, while
+  the complete normal provider-credit set remains intact. Hostile and normal
+  attribution regressions are green, and the full Maps suite is green at
+  212/212 on the farm; live provider-key evidence remains external.
 - Progress (2026-07-24 AirNow consumer presentation hardening): retained gap
   scanning is capped, pollutant labels are single-line and bidi/control-safe,
   and the alert/status overlays clip to the map viewport with honest paint
@@ -1765,6 +1780,11 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-007 - Car interface (CarPlay-principled vehicle mode)
 
 - Status: Remaining
+- Progress (2026-07-24 Car-status persistence boundary hardening): persisted
+  status selections now use a regular-file, 64 KiB bounded read before JSON
+  materialization and fail closed to defaults for oversized/corrupt data. The
+  focused regression gate is green at 3/3; live MG90/direct-control evidence
+  remains external.
 - Progress (2026-07-24 Car keymap persistence hardening): persisted Car bindings
   now stream-discard unknown/non-bindable keys and malformed actions, preserving
   valid bindings and the legacy `go_phone` alias without allowing an unbounded

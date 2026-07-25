@@ -24,11 +24,18 @@ use mde_collab_types::ids::{EventId, SpaceId};
 use mde_collab_types::{ActorClock, ActorId, CollabCommand, CollabEventEnvelope};
 
 use crate::domain::DomainState;
-use crate::error::Result;
+use crate::error::{CollabError, Result};
 use crate::pipeline::{apply_command, ApplyCtx};
 use crate::projection::Projection;
 use crate::purge::PurgeGate;
 use crate::signer::{EventSigner, IdSource};
+
+/// Maximum number of envelopes one replication merge may inspect at once.
+///
+/// Rejecting an oversized batch preserves the all-or-nothing merge contract;
+/// silently truncating it would make peers appear converged while dropping
+/// accepted events.
+const MAX_MERGE_BATCH_EVENTS: usize = 4096;
 
 /// The outcome of a [`merge`](CollabEngine::merge): how many incoming events
 /// were newly accepted, dropped for a bad/absent signature, or already held.
@@ -164,6 +171,11 @@ impl CollabEngine {
     /// Merge replicated events from a peer: signature-check (drop invalid),
     /// dedup, and ingest the rest. Order-independent + idempotent.
     pub fn merge(&mut self, incoming: Vec<CollabEventEnvelope>) -> Result<MergeOutcome> {
+        if incoming.len() > MAX_MERGE_BATCH_EVENTS {
+            return Err(CollabError::Serde(format!(
+                "merge batch exceeds {MAX_MERGE_BATCH_EVENTS} events"
+            )));
+        }
         let mut outcome = MergeOutcome::default();
         let mut accept: Vec<CollabEventEnvelope> = Vec::new();
         for env in incoming {
@@ -237,5 +249,63 @@ impl CollabEngine {
         let members = self.space_members(space);
         self.purge
             .may_purge(&self.all_events(), &members, sha256_hex)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::signer::{Ed25519Signer, EventSigner};
+    use mde_collab_types::space::SpaceKind;
+    use uuid::Uuid;
+
+    fn signed_event() -> CollabEventEnvelope {
+        let mut event = CollabEventEnvelope::new(
+            EventId::from_uuid(Uuid::from_u128(1)),
+            SpaceId::from_uuid(Uuid::from_u128(2)),
+            ActorId::new("alice"),
+            ActorClock::at(1, 0),
+            1,
+            CollabEventKind::SpaceCreated {
+                kind: SpaceKind::Team,
+                name: "ops".into(),
+            },
+        );
+        Ed25519Signer::from_seed([7; 32]).sign(&mut event);
+        event
+    }
+
+    #[test]
+    fn merge_rejects_oversized_batch_before_iteration_or_retention() {
+        let mut engine = CollabEngine::in_memory("viewer").expect("engine");
+        let error = engine
+            .merge(vec![signed_event(); MAX_MERGE_BATCH_EVENTS + 1])
+            .expect_err("oversized merge must fail closed");
+
+        assert!(matches!(
+            error,
+            CollabError::Serde(message)
+                if message == format!("merge batch exceeds {MAX_MERGE_BATCH_EVENTS} events")
+        ));
+        assert!(engine.all_events().is_empty());
+    }
+
+    #[test]
+    fn merge_accepts_the_normal_batch_boundary() {
+        let mut engine = CollabEngine::in_memory("viewer").expect("engine");
+        let event = signed_event();
+        let invalid = CollabEventEnvelope {
+            signature: None,
+            ..event.clone()
+        };
+        let mut batch = vec![event.clone()];
+        batch.extend(vec![invalid; MAX_MERGE_BATCH_EVENTS - 1]);
+
+        let outcome = engine.merge(batch).expect("boundary-sized merge");
+
+        assert_eq!(outcome.accepted, 1);
+        assert_eq!(outcome.duplicates, 0);
+        assert_eq!(outcome.dropped_invalid, MAX_MERGE_BATCH_EVENTS - 1);
+        assert_eq!(engine.all_events(), vec![event]);
     }
 }

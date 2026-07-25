@@ -125,6 +125,9 @@ pub const PUBLISH_HEARTBEAT: Duration = Duration::from_secs(30);
 /// Maximum remaining lifetime accepted for a direct-libvirt mutation
 /// capability. A valid signature must not become a long-lived bearer token.
 const MAX_AUTH_TTL_MS: i64 = 30_000;
+/// Keep direct-libvirt Bus requests on the same bounded wire contract as the
+/// other typed mutation planes before serde materializes caller-owned fields.
+const MAX_ACTION_BODY_BYTES: usize = crate::ipc::MAX_RPC_BODY_BYTES;
 
 // ───────────────────────────── data model ─────────────────────────────
 
@@ -326,6 +329,11 @@ impl LifecycleAction {
 /// # Errors
 /// A human-readable message on malformed JSON / unknown `op`.
 pub fn parse_action(body: &str) -> Result<LifecycleAction, String> {
+    if body.len() > MAX_ACTION_BODY_BYTES {
+        return Err(format!(
+            "lifecycle action body exceeds {MAX_ACTION_BODY_BYTES}-byte limit"
+        ));
+    }
     serde_json::from_str(body).map_err(|e| format!("malformed lifecycle action: {e}"))
 }
 
@@ -1847,6 +1855,16 @@ mod tests {
         );
         assert!(parse_action("nope").is_err());
         assert!(parse_action(r#"{"op":"teleport","host":"n"}"#).is_err());
+    }
+
+    #[test]
+    fn oversized_action_body_is_rejected_before_json_materialization() {
+        let body = "{".repeat(MAX_ACTION_BODY_BYTES + 1);
+        let error = parse_action(&body).expect_err("oversized body must fail closed");
+        assert_eq!(
+            error,
+            format!("lifecycle action body exceeds {MAX_ACTION_BODY_BYTES}-byte limit")
+        );
     }
 
     #[test]

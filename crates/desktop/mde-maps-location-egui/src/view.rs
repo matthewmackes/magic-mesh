@@ -49,6 +49,9 @@ const HUD_CARD_HI: Color32 = Color32::from_rgb(0x24, 0x26, 0x30); // style-leak-
 const HUD_RADIUS: f32 = 16.0;
 /// Corner radius for smaller HUD chips (speed sign chips, option cards).
 const HUD_RADIUS_S: f32 = 12.0;
+/// Maximum attribution text submitted to egui's galley/layout machinery.
+const MAX_MAP_ATTRIBUTION_CHARS: usize = 512;
+const MAP_ATTRIBUTION_ELLIPSIS: char = '\u{2026}';
 
 /// Render the complete native Maps & Location workspace.
 pub fn maps_location_panel(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
@@ -4867,8 +4870,9 @@ fn paint_map_attribution(
     let outer_pad = Style::SP_S;
     let inner_pad = egui::vec2(Style::SP_S, Style::SP_XS);
     let wrap_width = (rect.width() - 2.0 * outer_pad - 2.0 * inner_pad.x).max(1.0);
+    let attribution = bounded_map_attribution(&map.attribution_line());
     let galley = painter.layout(
-        map.attribution_line(),
+        attribution,
         FontId::proportional(Style::SMALL),
         color,
         wrap_width,
@@ -4887,6 +4891,21 @@ fn paint_map_attribution(
     );
     painter.galley(card.left_top() + inner_pad, galley, color);
     card
+}
+
+/// Bound externally supplied attribution before egui measures or lays it out.
+/// Provider credits remain intact under the normal contract; hostile or
+/// accidentally oversized source labels receive an explicit trailing ellipsis.
+fn bounded_map_attribution(text: &str) -> String {
+    let mut bounded = String::new();
+    for (index, character) in text.chars().enumerate() {
+        if index == MAX_MAP_ATTRIBUTION_CHARS - 1 {
+            bounded.push(MAP_ATTRIBUTION_ELLIPSIS);
+            return bounded;
+        }
+        bounded.push(character);
+    }
+    bounded
 }
 
 fn map_point(rect: Rect, x: f32, y: f32) -> Pos2 {
@@ -6130,6 +6149,54 @@ mod tests {
         search.active = WorkspaceTab::Drive;
         search.destination_search = true;
         assert!(tessellate(&mut search) > 0);
+    }
+
+    #[test]
+    fn hostile_map_attribution_is_bounded_before_layout() {
+        let hostile = "untrusted-provider-label-".repeat(MAX_MAP_ATTRIBUTION_CHARS * 4);
+        let bounded = bounded_map_attribution(&hostile);
+
+        assert_eq!(bounded.chars().count(), MAX_MAP_ATTRIBUTION_CHARS);
+        assert!(bounded.ends_with(MAP_ATTRIBUTION_ELLIPSIS));
+    }
+
+    #[test]
+    fn normal_map_attribution_keeps_provider_credits() {
+        let mut map = MapViewState::live(true);
+        map.earthquake_overlay = true;
+        map.nws_alert_overlay = true;
+        map.aircraft_overlay = true;
+        map.transit_overlay = true;
+        map.nws_forecast_overlay = true;
+        map.caltrans_camera_overlay = true;
+        map.iem_radar_overlay = true;
+        map.wildfire_overlay = true;
+        map.traffic_event_overlay = true;
+        map.air_quality_overlay = true;
+
+        let normal = map.attribution_line();
+        let bounded = bounded_map_attribution(&normal);
+
+        assert_eq!(bounded, normal);
+        for credit in [
+            "OpenStreetMap contributors",
+            "USGS",
+            "NWS",
+            "adsb.lol",
+            "MassDOT",
+            "NOAA",
+            "Caltrans",
+            "IEM",
+            "NIFC WFIGS",
+            "NASA FIRMS",
+            "NCDOT",
+            "US EPA AirNow",
+        ] {
+            assert!(
+                bounded.contains(credit),
+                "missing provider credit: {credit}"
+            );
+        }
     }
 
     #[test]
