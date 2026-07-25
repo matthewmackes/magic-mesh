@@ -68,8 +68,14 @@ pub fn mint_ca<B: NebulaCertBackend>(
     // Validate the private half before publishing the database row.
     seal::read_sealed(key)?;
 
-    let cert_pem = std::fs::read_to_string(crt)
+    // The canonical CA-pair view is a project-owned symlink, so use the seal
+    // reader that validates that shape before opening the final descriptor.
+    // It then verifies the opened inode is regular and consumes at most the
+    // shared CA-file ceiling before we materialize UTF-8 or SQLite text.
+    let cert_bytes = seal::read_no_follow(crt)
         .map_err(|e| CaError::Io(format!("read CA cert {}: {e}", crt.display())))?;
+    let cert_pem = String::from_utf8(cert_bytes)
+        .map_err(|e| CaError::Io(format!("read CA cert {}: invalid UTF-8: {e}", crt.display())))?;
 
     conn.execute(
         "INSERT INTO nebula_ca (mesh_id, epoch, ca_cert_pem, retired_at) \
@@ -102,6 +108,47 @@ pub fn current_ca(conn: &Connection, mesh_id: &str) -> Result<Option<(i64, Strin
 mod tests {
     use super::*;
     use crate::ca::MockBackend;
+
+    #[cfg(unix)]
+    #[derive(Clone, Copy)]
+    enum CertificateFixture {
+        Oversized,
+        FinalSymlink,
+        Directory,
+    }
+
+    #[cfg(unix)]
+    struct HandoffBackend {
+        fixture: CertificateFixture,
+    }
+
+    #[cfg(unix)]
+    impl NebulaCertBackend for HandoffBackend {
+        fn mint_ca(&self, _mesh_id: &str, crt_out: &Path, key_out: &Path) -> Result<(), CaError> {
+            seal::write_sealed(
+                key_out,
+                b"-----BEGIN NEBULA CA KEY-----\nmock\n-----END NEBULA CA KEY-----\n",
+            )?;
+
+            match self.fixture {
+                CertificateFixture::Oversized => std::fs::write(
+                    crt_out,
+                    vec![b'x'; (seal::MAX_SEALED_FILE_BYTES + 1) as usize],
+                )
+                .map_err(|e| CaError::Io(e.to_string())),
+                CertificateFixture::FinalSymlink => {
+                    let target = crt_out.with_file_name("certificate-target.crt");
+                    std::fs::write(&target, b"-----BEGIN NEBULA CA-----\nforbidden\n")
+                        .map_err(|e| CaError::Io(e.to_string()))?;
+                    std::os::unix::fs::symlink(&target, crt_out)
+                        .map_err(|e| CaError::Io(e.to_string()))
+                }
+                CertificateFixture::Directory => {
+                    std::fs::create_dir(crt_out).map_err(|e| CaError::Io(e.to_string()))
+                }
+            }
+        }
+    }
 
     fn fresh_conn() -> Connection {
         let conn = Connection::open_in_memory().expect("memory db");
@@ -166,5 +213,70 @@ mod tests {
         mint_ca(&backend, &conn, "m1", Some(&crt), Some(&key)).expect("mint");
         let mode = std::fs::metadata(&key).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mint_rejects_an_oversized_public_certificate_before_materialization() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let crt = tmp.path().join("ca.crt");
+        let key = tmp.path().join("ca.key");
+        let conn = fresh_conn();
+        let backend = HandoffBackend {
+            fixture: CertificateFixture::Oversized,
+        };
+
+        let error = mint_ca(&backend, &conn, "oversized", Some(&crt), Some(&key))
+            .expect_err("oversized certificate must fail closed");
+        assert!(
+            error.to_string().contains("exceeds"),
+            "unexpected error: {error}"
+        );
+        assert!(current_ca(&conn, "oversized").unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mint_rejects_an_untrusted_final_certificate_symlink() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let crt = tmp.path().join("ca.crt");
+        let key = tmp.path().join("ca.key");
+        let target = tmp.path().join("certificate-target.crt");
+        let conn = fresh_conn();
+        let backend = HandoffBackend {
+            fixture: CertificateFixture::FinalSymlink,
+        };
+
+        let error = mint_ca(&backend, &conn, "symlinked", Some(&crt), Some(&key))
+            .expect_err("untrusted final symlink must fail closed");
+        assert!(
+            error.to_string().contains("untrusted sealed link"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"-----BEGIN NEBULA CA-----\nforbidden\n"
+        );
+        assert!(current_ca(&conn, "symlinked").unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mint_rejects_a_non_regular_public_certificate() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let crt = tmp.path().join("ca.crt");
+        let key = tmp.path().join("ca.key");
+        let conn = fresh_conn();
+        let backend = HandoffBackend {
+            fixture: CertificateFixture::Directory,
+        };
+
+        let error = mint_ca(&backend, &conn, "directory", Some(&crt), Some(&key))
+            .expect_err("directory certificate must fail closed");
+        assert!(
+            error.to_string().contains("regular file"),
+            "unexpected error: {error}"
+        );
+        assert!(current_ca(&conn, "directory").unwrap().is_none());
     }
 }
