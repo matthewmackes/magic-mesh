@@ -4728,6 +4728,9 @@ dependencies = [
 [[package]]
 name = "mde-role"
 version = "12.1.0"
+dependencies = [
+ "rustix 0.38.44",
+]
 
 [[package]]
 name = "mde-role-chooser"

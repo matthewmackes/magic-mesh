@@ -36,6 +36,7 @@
 //! detection, swapping in `notify` is mechanical — the public API
 //! here doesn't change.
 
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -56,6 +57,10 @@ pub const DEFAULT_TEMPLATE_PATH: &str = "/usr/share/mde/bus/subs.yaml.tmpl";
 /// criterion plenty of headroom (100 ms detection + a few ms to
 /// parse + propagate).
 pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Keep operator-controlled subscription manifests and the shipped seed
+/// bounded before YAML parsing materializes their strings and lists.
+const MAX_SUBS_FILE_BYTES: usize = 64 * 1024;
 
 /// Optional `start..end` window during which delivery defaults to
 /// no-op. Times are local-clock 24h strings — `"HH:MM"`.
@@ -218,6 +223,134 @@ pub fn default_per_peer_path() -> Option<PathBuf> {
     crate::default_data_dir().map(|d| d.join("subs.yaml"))
 }
 
+/// Read a stable regular file through an `O_NOFOLLOW` descriptor.
+///
+/// The descriptor is checked rather than the path after opening, so a final
+/// symlink, special file, oversized file, file growth, or invalid UTF-8 is
+/// rejected before the manifest reaches YAML parsing. Reading one byte beyond
+/// the cap catches growth after the initial metadata snapshot without an
+/// unbounded allocation.
+fn read_bounded_subs_file(path: &Path) -> io::Result<String> {
+    let max_bytes_u64 = u64::try_from(MAX_SUBS_FILE_BYTES).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "subscription size cap overflows u64",
+        )
+    })?;
+    let entry = std::fs::symlink_metadata(path)?;
+    if !entry.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    if entry.len() > max_bytes_u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} exceeds the {MAX_SUBS_FILE_BYTES}-byte subscription limit",
+                path.display()
+            ),
+        ));
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        options.custom_flags(0o400000); // O_NOFOLLOW
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        options.custom_flags(0x100); // O_NOFOLLOW
+
+        // Keep unsupported Unix targets fail-closed for a symlink leaf even
+        // when their standard library does not expose a known O_NOFOLLOW
+        // value in this crate's dependency surface.
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        if !std::fs::symlink_metadata(path)
+            .ok()
+            .is_some_and(|metadata| metadata.file_type().is_file())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} is not a regular file", path.display()),
+            ));
+        }
+    }
+
+    #[cfg(not(unix))]
+    if !std::fs::symlink_metadata(path)
+        .ok()
+        .is_some_and(|metadata| metadata.file_type().is_file())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+
+    let mut file = options.open(path)?;
+    let opened = file.metadata()?;
+    if !opened.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} opened as a non-regular file", path.display()),
+        ));
+    }
+    if opened.len() > max_bytes_u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} exceeds the {MAX_SUBS_FILE_BYTES}-byte subscription limit",
+                path.display()
+            ),
+        ));
+    }
+
+    let capacity = usize::try_from(opened.len())
+        .unwrap_or(MAX_SUBS_FILE_BYTES)
+        .min(MAX_SUBS_FILE_BYTES)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(capacity);
+    (&mut file)
+        .take(max_bytes_u64.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_SUBS_FILE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} exceeds the {MAX_SUBS_FILE_BYTES}-byte subscription limit",
+                path.display()
+            ),
+        ));
+    }
+
+    let after = file.metadata()?;
+    if !after.file_type().is_file()
+        || after.len() != opened.len()
+        || after.len() != u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} changed while being read", path.display()),
+        ));
+    }
+
+    String::from_utf8(bytes).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is not valid UTF-8: {error}", path.display()),
+        )
+    })
+}
+
 /// Seed the per-peer file from the template if the per-peer file
 /// doesn't exist yet. Returns the body that's now on disk (either
 /// the freshly-seeded template OR the existing file content).
@@ -226,14 +359,18 @@ pub fn default_per_peer_path() -> Option<PathBuf> {
 /// Returns `std::io::Error` on mkdir / read / write / rename
 /// failure.
 pub fn load_or_seed(per_peer_path: &Path, template_path: &Path) -> Result<String, SubsLoadError> {
-    if per_peer_path.exists() {
-        return std::fs::read_to_string(per_peer_path).map_err(SubsLoadError::ReadPerPeer);
+    match read_bounded_subs_file(per_peer_path) {
+        Ok(body) => return Ok(body),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(SubsLoadError::ReadPerPeer(error)),
     }
-    if !template_path.exists() {
-        return Err(SubsLoadError::TemplateMissing);
-    }
-    let template_body =
-        std::fs::read_to_string(template_path).map_err(SubsLoadError::ReadTemplate)?;
+    let template_body = match read_bounded_subs_file(template_path) {
+        Ok(body) => body,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(SubsLoadError::TemplateMissing);
+        }
+        Err(error) => return Err(SubsLoadError::ReadTemplate(error)),
+    };
     if let Some(parent) = per_peer_path.parent() {
         std::fs::create_dir_all(parent).map_err(SubsLoadError::Mkdir)?;
     }
@@ -334,10 +471,17 @@ impl SubsWatcher {
     /// Drive one tick of the watch loop. Public so tests can run
     /// it deterministically.
     pub fn tick_once(&mut self) -> TickOutcome {
-        if !self.per_peer_path.exists() {
-            return TickOutcome::FileMissing;
+        let entry = match std::fs::symlink_metadata(&self.per_peer_path) {
+            Ok(entry) => entry,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return TickOutcome::FileMissing;
+            }
+            Err(_) => return TickOutcome::Idle,
+        };
+        if !entry.file_type().is_file() {
+            return TickOutcome::Idle;
         }
-        let now = match std::fs::metadata(&self.per_peer_path).and_then(|m| m.modified()) {
+        let now = match entry.modified() {
             Ok(t) => t,
             Err(_) => return TickOutcome::Idle,
         };
@@ -346,7 +490,7 @@ impl SubsWatcher {
         if !advanced {
             return TickOutcome::Idle;
         }
-        let body = match std::fs::read_to_string(&self.per_peer_path) {
+        let body = match read_bounded_subs_file(&self.per_peer_path) {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!(
@@ -576,6 +720,87 @@ mod tests {
         assert!(matches!(r, Err(SubsLoadError::TemplateMissing)));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn load_or_seed_rejects_final_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let per_peer = tmp.path().join("subs.yaml");
+        let template = tmp.path().join("subs.yaml.tmpl");
+        let target = tmp.path().join("outside.yaml");
+        std::fs::write(&target, "topics: [outside]\n").expect("outside body");
+        std::fs::write(&template, template_body()).expect("seed template");
+
+        symlink(&target, &per_peer).expect("per-peer symlink");
+        assert!(matches!(
+            load_or_seed(&per_peer, &template),
+            Err(SubsLoadError::ReadPerPeer(error))
+                if error.kind() == io::ErrorKind::InvalidData
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("outside remains readable"),
+            "topics: [outside]\n"
+        );
+
+        std::fs::remove_file(&per_peer).expect("remove per-peer symlink");
+        std::fs::remove_file(&template).expect("remove regular template");
+        symlink(&target, &template).expect("template symlink");
+        assert!(matches!(
+            load_or_seed(&per_peer, &template),
+            Err(SubsLoadError::ReadTemplate(error))
+                if error.kind() == io::ErrorKind::InvalidData
+        ));
+    }
+
+    #[test]
+    fn load_or_seed_rejects_oversized_inputs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let per_peer = tmp.path().join("subs.yaml");
+        let template = tmp.path().join("subs.yaml.tmpl");
+        let oversized = vec![b'x'; MAX_SUBS_FILE_BYTES + 1];
+        std::fs::write(&per_peer, &oversized).expect("oversized per-peer body");
+        std::fs::write(&template, template_body()).expect("seed template");
+
+        assert!(matches!(
+            load_or_seed(&per_peer, &template),
+            Err(SubsLoadError::ReadPerPeer(error))
+                if error.kind() == io::ErrorKind::InvalidData
+        ));
+
+        std::fs::remove_file(&per_peer).expect("remove oversized per-peer body");
+        std::fs::write(&template, &oversized).expect("oversized template body");
+        assert!(matches!(
+            load_or_seed(&per_peer, &template),
+            Err(SubsLoadError::ReadTemplate(error))
+                if error.kind() == io::ErrorKind::InvalidData
+        ));
+    }
+
+    #[test]
+    fn load_or_seed_rejects_invalid_utf8_inputs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let per_peer = tmp.path().join("subs.yaml");
+        let template = tmp.path().join("subs.yaml.tmpl");
+        let invalid_utf8 = b"topics: [\xff]\n";
+        std::fs::write(&per_peer, invalid_utf8).expect("invalid per-peer body");
+        std::fs::write(&template, template_body()).expect("seed template");
+
+        assert!(matches!(
+            load_or_seed(&per_peer, &template),
+            Err(SubsLoadError::ReadPerPeer(error))
+                if error.kind() == io::ErrorKind::InvalidData
+        ));
+
+        std::fs::remove_file(&per_peer).expect("remove invalid per-peer body");
+        std::fs::write(&template, invalid_utf8).expect("invalid template body");
+        assert!(matches!(
+            load_or_seed(&per_peer, &template),
+            Err(SubsLoadError::ReadTemplate(error))
+                if error.kind() == io::ErrorKind::InvalidData
+        ));
+    }
+
     #[tokio::test]
     async fn watcher_reload_on_mtime_advance() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -621,6 +846,45 @@ mod tests {
         std::fs::write(&per_peer, "topics: [unterminated\n").expect("corrupt");
         assert_eq!(w.tick_once(), TickOutcome::ParseFailed);
         // Previous manifest still wins.
+        assert_eq!(w.current().topics, vec!["a".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn watcher_keeps_previous_manifest_on_bounded_read_failure() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let per_peer = tmp.path().join("subs.yaml");
+        std::fs::write(&per_peer, "topics: [\"a\"]\n").expect("seed");
+        let mut w = SubsWatcher::new(per_peer.clone(), "topics: [\"a\"]\n");
+        w.tick_once();
+
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&per_peer, vec![b'x'; MAX_SUBS_FILE_BYTES + 1]).expect("oversized rewrite");
+        assert_eq!(w.tick_once(), TickOutcome::Idle);
+        assert_eq!(w.current().topics, vec!["a".to_string()]);
+
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&per_peer, b"topics: [\xff]\n").expect("invalid UTF-8 rewrite");
+        assert_eq!(w.tick_once(), TickOutcome::Idle);
+        assert_eq!(w.current().topics, vec!["a".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn watcher_keeps_previous_manifest_on_final_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let per_peer = tmp.path().join("subs.yaml");
+        let target = tmp.path().join("outside.yaml");
+        std::fs::write(&per_peer, "topics: [\"a\"]\n").expect("seed");
+        std::fs::write(&target, "topics: [\"b\"]\n").expect("outside body");
+        let mut w = SubsWatcher::new(per_peer.clone(), "topics: [\"a\"]\n");
+        w.tick_once();
+
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::remove_file(&per_peer).expect("remove regular manifest");
+        symlink(&target, &per_peer).expect("manifest symlink");
+        assert_eq!(w.tick_once(), TickOutcome::Idle);
         assert_eq!(w.current().topics, vec!["a".to_string()]);
     }
 }

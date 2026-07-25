@@ -27,6 +27,7 @@
 //! - `system.mem_used_mb` — `MemTotal - MemAvailable` from `/proc/meminfo`
 
 use std::collections::HashMap;
+use std::io::{self, Read};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,6 +45,17 @@ pub const EXEC_STDOUT_CAP_BYTES: usize = 4 * 1024;
 /// process before killing it. Templates that shell out to something
 /// slow render a documented placeholder instead of hanging the bus.
 pub const EXEC_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `/proc` and the local overlay-IP mirror contain small scalar values. Keep
+/// their reads bounded even when a test fixture or a damaged mirror is not.
+const MAX_TEMPLATE_VAR_BYTES: usize = 64 * 1024;
+
+/// Includes are user-visible template material, but must not allow an
+/// unbounded allocation in the bus render path.
+const MAX_INCLUDE_FILE_BYTES: usize = 1024 * 1024;
+
+#[cfg(target_os = "linux")]
+const O_NOFOLLOW_NONBLOCK: i32 = 0o404000; // O_NOFOLLOW | O_NONBLOCK
 
 /// Source files for the mesh variables. Pulled into a struct so tests
 /// can point at temp files instead of real `/proc` and `/var`.
@@ -198,15 +210,88 @@ fn time_vars() -> Value {
     })
 }
 
+fn open_read_no_follow(path: &std::path::Path) -> io::Result<std::fs::File> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::fs::OpenOptions;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        // O_NONBLOCK prevents a hostile FIFO from hanging the render thread
+        // before the descriptor-backed regular-file check can reject it.
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NOFOLLOW_NONBLOCK)
+            .open(path)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        // The production platform is Linux. Keep the library portable for
+        // non-Linux targets with the strongest std-only pre-open check they
+        // provide; Linux takes the descriptor-level O_NOFOLLOW path above.
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "template source is not a regular file",
+            ));
+        }
+        std::fs::File::open(path)
+    }
+}
+
+fn read_bounded_bytes(path: &std::path::Path, max_bytes: usize) -> io::Result<Vec<u8>> {
+    let mut file = open_read_no_follow(path)?;
+    let metadata = file.metadata()?;
+    let max_bytes_u64 = u64::try_from(max_bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "template read limit does not fit in u64",
+        )
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "template source is not a regular file",
+        ));
+    }
+    if metadata.len() > max_bytes_u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "template source exceeds its read limit",
+        ));
+    }
+    let expected_len = metadata.len();
+    let capacity = usize::try_from(expected_len)
+        .unwrap_or(max_bytes)
+        .min(max_bytes)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(capacity);
+    (&mut file)
+        .take(max_bytes_u64.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    let after = file.metadata()?;
+    if !after.file_type().is_file() || after.len() != expected_len || bytes.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "template source changed or exceeds its read limit",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn read_bounded_text(path: &std::path::Path, max_bytes: usize) -> Option<String> {
+    String::from_utf8(read_bounded_bytes(path, max_bytes).ok()?).ok()
+}
+
 fn read_trim(path: &std::path::Path) -> Option<String> {
-    std::fs::read_to_string(path)
-        .ok()
+    read_bounded_text(path, MAX_TEMPLATE_VAR_BYTES)
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
 }
 
 fn read_uptime_seconds(path: &std::path::Path) -> Option<u64> {
-    let raw = std::fs::read_to_string(path).ok()?;
+    let raw = read_bounded_text(path, MAX_TEMPLATE_VAR_BYTES)?;
     let first = raw.split_ascii_whitespace().next()?;
     // /proc/uptime is `"<seconds.fractional> <idle>"` — chop the dot.
     let int_part = first.split('.').next()?;
@@ -223,13 +308,13 @@ fn count_peers(dir: &std::path::Path) -> u64 {
 }
 
 fn read_load_1(path: &std::path::Path) -> Option<f64> {
-    let raw = std::fs::read_to_string(path).ok()?;
+    let raw = read_bounded_text(path, MAX_TEMPLATE_VAR_BYTES)?;
     let first = raw.split_ascii_whitespace().next()?;
     first.parse::<f64>().ok()
 }
 
 fn read_mem_used_mb(path: &std::path::Path) -> Option<u64> {
-    let raw = std::fs::read_to_string(path).ok()?;
+    let raw = read_bounded_text(path, MAX_TEMPLATE_VAR_BYTES)?;
     let mut total: Option<u64> = None;
     let mut avail: Option<u64> = None;
     for line in raw.lines() {
@@ -333,13 +418,31 @@ fn include_function(
         )));
     }
     let target = root.join(path);
-    match std::fs::read_to_string(&target) {
-        Ok(s) => Ok(TeraValue::String(s)),
-        Err(e) => Err(tera::Error::msg(format!(
+    // Preserve the lexical traversal guard above and also reject a symlinked
+    // parent that resolves outside the configured root. The final read still
+    // uses O_NOFOLLOW on the descriptor, so a final symlink is rejected too.
+    if let (Ok(canonical_root), Ok(canonical_target)) =
+        (std::fs::canonicalize(root), std::fs::canonicalize(&target))
+    {
+        if !canonical_target.starts_with(&canonical_root) {
+            return Err(tera::Error::msg(format!(
+                "`include_file` path `{path}` escapes include-root"
+            )));
+        }
+    }
+    let bytes = read_bounded_bytes(&target, MAX_INCLUDE_FILE_BYTES).map_err(|e| {
+        tera::Error::msg(format!(
             "`include_file` failed to read {}: {e}",
             target.display()
-        ))),
-    }
+        ))
+    })?;
+    let contents = String::from_utf8(bytes).map_err(|_| {
+        tera::Error::msg(format!(
+            "`include_file` rejected {}: invalid UTF-8",
+            target.display()
+        ))
+    })?;
+    Ok(TeraValue::String(contents))
 }
 
 #[cfg(test)]
@@ -405,6 +508,68 @@ mod tests {
         let out = r.render("u={{system.mem_used_mb}}").unwrap();
         // (16_000_000 - 10_000_000) kB / 1024 = 5859 MB
         assert_eq!(out, "u=5859");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hostile_variable_symlinks_fail_closed() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut sources = fake_sources(tmp.path());
+        let outside = tmp.path().join("outside");
+        std::fs::write(&outside, "hostile\n").unwrap();
+
+        let hostname_link = tmp.path().join("hostname-link");
+        let overlay_link = tmp.path().join("overlay-link");
+        let uptime_link = tmp.path().join("uptime-link");
+        let loadavg_link = tmp.path().join("loadavg-link");
+        let meminfo_link = tmp.path().join("meminfo-link");
+        for link in [
+            &hostname_link,
+            &overlay_link,
+            &uptime_link,
+            &loadavg_link,
+            &meminfo_link,
+        ] {
+            symlink(&outside, link).unwrap();
+        }
+        sources.hostname_path = hostname_link;
+        sources.overlay_ip_path = overlay_link;
+        sources.uptime_path = uptime_link;
+        sources.loadavg_path = loadavg_link;
+        sources.meminfo_path = meminfo_link;
+
+        let r = Renderer::with(sources, tmp.path().join("inc"));
+        let vars = r.build_context();
+        assert_eq!(vars["peer"]["hostname"], json!("unknown"));
+        assert_eq!(vars["peer"]["overlay_ip"], json!(""));
+        assert_eq!(vars["peer"]["uptime_s"], json!(0));
+        assert_eq!(vars["system"]["load_1"], json!(0.0));
+        assert_eq!(vars["system"]["mem_used_mb"], json!(0));
+    }
+
+    #[test]
+    fn hostile_variable_bytes_use_honest_defaults() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sources = fake_sources(tmp.path());
+        std::fs::write(&sources.hostname_path, [0xff, 0xfe]).unwrap();
+        std::fs::write(
+            &sources.overlay_ip_path,
+            vec![b'9'; MAX_TEMPLATE_VAR_BYTES + 1],
+        )
+        .unwrap();
+        std::fs::write(&sources.uptime_path, [0xff]).unwrap();
+        std::fs::write(&sources.loadavg_path, [0xff]).unwrap();
+        std::fs::write(&sources.meminfo_path, [0xff]).unwrap();
+
+        let r = Renderer::with(sources, tmp.path().join("inc"));
+        let vars = r.build_context();
+        assert_eq!(vars["peer"]["hostname"], json!("unknown"));
+        assert_eq!(vars["peer"]["overlay_ip"], json!(""));
+        assert_eq!(vars["peer"]["uptime_s"], json!(0));
+        assert_eq!(vars["system"]["load_1"], json!(0.0));
+        assert_eq!(vars["system"]["mem_used_mb"], json!(0));
     }
 
     // SECURITY (security-3): with the default feature set, the
@@ -481,6 +646,79 @@ mod tests {
             .render(r#"x={{ include_file(path="hello.txt") }}"#)
             .unwrap();
         assert_eq!(out, "x=from disk");
+    }
+
+    #[test]
+    fn include_function_rejects_invalid_oversized_and_non_regular_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inc = tmp.path().join("inc");
+        std::fs::create_dir(&inc).unwrap();
+        let r = Renderer::with(fake_sources(tmp.path()), inc.clone());
+
+        std::fs::write(inc.join("invalid.txt"), [0xff, 0xfe]).unwrap();
+        let err = r
+            .render(r#"x={{ include_file(path="invalid.txt") }}"#)
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("invalid UTF-8"), "unexpected error: {msg}");
+
+        std::fs::write(
+            inc.join("oversized.txt"),
+            vec![b'x'; MAX_INCLUDE_FILE_BYTES + 1],
+        )
+        .unwrap();
+        let err = r
+            .render(r#"x={{ include_file(path="oversized.txt") }}"#)
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("exceeds its read limit"),
+            "unexpected error: {msg}"
+        );
+
+        std::fs::create_dir(inc.join("directory")).unwrap();
+        let err = r
+            .render(r#"x={{ include_file(path="directory") }}"#)
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not a regular file"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn include_function_rejects_symlinked_file_and_parent_escape() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let inc = tmp.path().join("inc");
+        let outside_dir = tmp.path().join("outside");
+        std::fs::create_dir(&inc).unwrap();
+        std::fs::create_dir(&outside_dir).unwrap();
+        std::fs::write(outside_dir.join("secret.txt"), "outside").unwrap();
+        symlink(outside_dir.join("secret.txt"), inc.join("file-link.txt")).unwrap();
+        symlink(&outside_dir, inc.join("parent-link")).unwrap();
+
+        let r = Renderer::with(fake_sources(tmp.path()), inc);
+        let err = r
+            .render(r#"x={{ include_file(path="file-link.txt") }}"#)
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("failed to read") || msg.contains("escapes include-root"),
+            "unexpected error: {msg}"
+        );
+
+        let err = r
+            .render(r#"x={{ include_file(path="parent-link/secret.txt") }}"#)
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("escapes include-root"),
+            "unexpected parent escape error: {msg}"
+        );
     }
 
     #[test]

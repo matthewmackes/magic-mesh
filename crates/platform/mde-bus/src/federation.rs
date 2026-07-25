@@ -27,7 +27,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::io;
+use std::io::{self, Read};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -92,6 +92,91 @@ pub fn federation_yaml_path(bus_root: &Path) -> PathBuf {
     bus_root.join("federation.yaml")
 }
 
+/// A grant store is small metadata, not a general-purpose document. Keep an
+/// attacker-controlled replica from turning YAML parsing into an allocation
+/// sink while leaving ample room for a useful federation roster.
+const MAX_FEDERATION_GRANTS_BYTES: u64 = 256 * 1024;
+
+/// A mint envelope contains only a ULID, a six-word mnemonic, an expiry, and a
+/// flag. This generous bound is still small enough that a hostile pending-mint
+/// entry cannot consume unbounded memory before JSON parsing.
+const MAX_MINT_ENVELOPE_BYTES: u64 = 64 * 1024;
+
+/// Read a UTF-8 regular file through one descriptor, without following a final
+/// symlink. The descriptor metadata is checked both before and after the
+/// bounded read so a file that grows or changes while being consumed is
+/// rejected rather than partially materialized.
+fn read_bounded_utf8_file(path: &Path, max_bytes: u64) -> io::Result<String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    options.custom_flags(0o400000 | 0o4000 | 0o2000000); // O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    options.custom_flags(0x100 | 0x4); // O_NOFOLLOW | O_NONBLOCK
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    )))]
+    if !std::fs::symlink_metadata(path)?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing non-regular file {}", path.display()),
+        ));
+    }
+
+    let file = options.open(path)?;
+    let before = file.metadata()?;
+    if !before.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing non-regular file {}", path.display()),
+        ));
+    }
+    if before.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("file {} exceeds {max_bytes}-byte limit", path.display()),
+        ));
+    }
+
+    read_bounded_utf8_descriptor(&file, &before, path, max_bytes)
+}
+
+/// Read an already-open descriptor. Keeping this separate makes the
+/// before/after growth check deterministic in tests without weakening the
+/// production path's descriptor-backed read.
+fn read_bounded_utf8_descriptor(
+    file: &std::fs::File,
+    before: &std::fs::Metadata,
+    path: &Path,
+    max_bytes: u64,
+) -> io::Result<String> {
+    let max_usize = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+    let capacity = usize::try_from(before.len())
+        .unwrap_or(max_usize)
+        .min(max_usize)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+
+    let after = file.metadata()?;
+    if !after.file_type().is_file()
+        || after.len() != before.len()
+        || bytes.len() > max_usize
+        || bytes.len() as u64 != before.len()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("file {} changed while being read", path.display()),
+        ));
+    }
+
+    String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
 /// Read the grant store. An absent file is the honest empty (default-deny) baseline,
 /// never an error.
 ///
@@ -99,11 +184,13 @@ pub fn federation_yaml_path(bus_root: &Path) -> PathBuf {
 /// Propagates a read or YAML-parse failure.
 pub fn read_grants(bus_root: &Path) -> Result<FederationGrants> {
     let path = federation_yaml_path(bus_root);
-    if !path.exists() {
-        return Ok(FederationGrants::default());
-    }
-    let text =
-        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let text = match read_bounded_utf8_file(&path, MAX_FEDERATION_GRANTS_BYTES) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(FederationGrants::default());
+        }
+        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+    };
     serde_yaml::from_str(&text).with_context(|| format!("parse {}", path.display()))
 }
 
@@ -345,7 +432,7 @@ pub fn consume_matching_mint(bus_root: &Path, passcode: &str) -> Result<MintEnve
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue; // skip *.json.tmp and anything else
         }
-        let Ok(text) = std::fs::read_to_string(&path) else {
+        let Ok(text) = read_bounded_utf8_file(&path, MAX_MINT_ENVELOPE_BYTES) else {
             continue;
         };
         let Ok(mut env) = serde_json::from_str::<MintEnvelope>(&text) else {
@@ -940,5 +1027,104 @@ mod tests {
         assert!(raw.contains("peer-mesh-id:"));
         assert!(raw.contains("subscribe-topics:"));
         assert_eq!(read_grants(bus).unwrap(), g);
+    }
+
+    #[test]
+    fn absent_grant_store_remains_default_deny() {
+        let dir = tmp();
+        assert_eq!(
+            read_grants(dir.path()).unwrap(),
+            FederationGrants::default()
+        );
+    }
+
+    #[test]
+    fn grant_store_rejects_final_symlink() {
+        let dir = tmp();
+        let target = dir.path().join("real-federation.yaml");
+        std::fs::write(&target, serde_yaml::to_string(&accepted_grants()).unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, federation_yaml_path(dir.path())).unwrap();
+
+        assert!(read_grants(dir.path()).is_err());
+    }
+
+    #[test]
+    fn grant_store_rejects_non_regular_oversized_and_invalid_utf8_files() {
+        let dir = tmp();
+        let path = federation_yaml_path(dir.path());
+        std::fs::create_dir(&path).unwrap();
+        assert!(read_grants(dir.path()).is_err());
+        std::fs::remove_dir(&path).unwrap();
+
+        std::fs::write(
+            &path,
+            vec![b' '; usize::try_from(MAX_FEDERATION_GRANTS_BYTES + 1).unwrap()],
+        )
+        .unwrap();
+        assert!(read_grants(dir.path()).is_err());
+
+        std::fs::write(&path, [0xff, 0xfe, 0xfd]).unwrap();
+        assert!(read_grants(dir.path()).is_err());
+    }
+
+    #[test]
+    fn bounded_file_reader_rejects_growth_after_descriptor_snapshot() {
+        use std::io::Write as _;
+
+        let dir = tmp();
+        let path = dir.path().join("growing.json");
+        std::fs::write(&path, b"{}\n").unwrap();
+        let file = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
+        let before = file.metadata().unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"growth")
+            .unwrap();
+
+        assert!(
+            read_bounded_utf8_descriptor(&file, &before, &path, MAX_MINT_ENVELOPE_BYTES).is_err()
+        );
+    }
+
+    #[test]
+    fn pending_mint_reads_skip_final_symlink() {
+        let dir = tmp();
+        let bus = dir.path();
+        let env = MintEnvelope {
+            ulid: "symlinked".to_string(),
+            mnemonic: "mesh node link mint mode symlink".to_string(),
+            expires_at_unix_ms: now_unix_ms() + 86_400_000,
+            used: false,
+        };
+        let target = bus.join("outside-mint.json");
+        std::fs::write(&target, serde_json::to_vec(&env).unwrap()).unwrap();
+        std::fs::create_dir_all(mints_dir(bus)).unwrap();
+        std::os::unix::fs::symlink(&target, mint_path(bus, &env.ulid)).unwrap();
+
+        assert!(consume_matching_mint(bus, &env.mnemonic).is_err());
+    }
+
+    #[test]
+    fn pending_mint_reads_skip_non_regular_oversized_and_invalid_utf8_files() {
+        let dir = tmp();
+        let bus = dir.path();
+        let mint_dir = mints_dir(bus);
+        std::fs::create_dir_all(&mint_dir).unwrap();
+
+        std::fs::create_dir(mint_dir.join("directory.json")).unwrap();
+        assert!(consume_matching_mint(bus, "directory entry").is_err());
+        std::fs::remove_dir(mint_dir.join("directory.json")).unwrap();
+
+        std::fs::write(
+            mint_dir.join("oversized.json"),
+            vec![b' '; usize::try_from(MAX_MINT_ENVELOPE_BYTES + 1).unwrap()],
+        )
+        .unwrap();
+        assert!(consume_matching_mint(bus, "oversized entry").is_err());
+
+        std::fs::write(mint_dir.join("invalid.json"), [0xff, 0xfe, 0xfd]).unwrap();
+        assert!(consume_matching_mint(bus, "invalid entry").is_err());
     }
 }

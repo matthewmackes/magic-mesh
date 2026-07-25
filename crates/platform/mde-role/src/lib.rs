@@ -20,8 +20,13 @@
 #![forbid(unsafe_code)]
 
 use std::fmt;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+
+/// A role pin is intentionally tiny. Keep hostile or corrupted input from
+/// becoming an unbounded allocation before the fail-closed parser sees it.
+const MAX_ROLE_FILE_BYTES: usize = 64 * 1024;
 
 /// A deployment role — the install-time identity, rank-ordered for the
 /// upgrade-only invariant ([`Role::rank`]): **Lighthouse** (the always-on
@@ -274,7 +279,7 @@ pub fn load_class() -> Result<RoleClass, LoadError> {
 /// [`LoadError::NotPinned`] when the file is absent, [`LoadError::Io`] on a read
 /// error, [`LoadError::Malformed`] when no parseable `role` value is present.
 pub fn load_class_from(path: &Path) -> Result<RoleClass, LoadError> {
-    let text = match std::fs::read_to_string(path) {
+    let text = match read_role_file(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(LoadError::NotPinned),
         Err(e) => return Err(LoadError::Io(e)),
@@ -294,13 +299,73 @@ pub fn load_class_from(path: &Path) -> Result<RoleClass, LoadError> {
 /// absent, [`LoadError::Malformed`] when it lacks a parseable `role` value.
 /// Callers fail closed on either.
 pub fn load_from(path: &Path) -> Result<Role, LoadError> {
-    let text = match std::fs::read_to_string(path) {
+    let text = match read_role_file(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(LoadError::NotPinned),
         Err(e) => return Err(LoadError::Io(e)),
     };
     parse_role_toml(&text)
         .ok_or_else(|| LoadError::Malformed(format!("no valid `role` value in {}", path.display())))
+}
+
+/// Read a role pin through the descriptor that is actually consumed. The
+/// role controls which daemon/surface capabilities a node may activate, so a
+/// final symlink, special file, oversized body, or invalid UTF-8 is an error,
+/// not a default.
+fn read_role_file(path: &Path) -> std::io::Result<String> {
+    #[cfg(unix)]
+    let file: std::fs::File = {
+        use rustix::fs::{Mode, OFlags};
+
+        rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?
+        .into()
+    };
+
+    #[cfg(not(unix))]
+    let file = {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "role pin is not a regular file",
+            ));
+        }
+        std::fs::File::open(path)?
+    };
+
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "role pin is not a regular file",
+        ));
+    }
+    if metadata.len() > MAX_ROLE_FILE_BYTES as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "role pin exceeds the byte limit",
+        ));
+    }
+
+    let capacity = usize::try_from(metadata.len())
+        .unwrap_or(MAX_ROLE_FILE_BYTES)
+        .min(MAX_ROLE_FILE_BYTES)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take((MAX_ROLE_FILE_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_ROLE_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "role pin exceeds the byte limit",
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
 /// Extract the role from a `role.toml` body — the value of the first
@@ -624,6 +689,40 @@ mod tests {
         // Crucially: NOT Ok(Workstation) — a corrupt file fails closed.
         assert!(matches!(load_from(&p), Err(LoadError::Malformed(_))));
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn role_reader_rejects_oversized_and_invalid_utf8_inputs() {
+        let oversized = scratch("oversized");
+        std::fs::write(&oversized, vec![b'x'; MAX_ROLE_FILE_BYTES + 1]).unwrap();
+        assert!(matches!(
+            load_from(&oversized),
+            Err(LoadError::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData
+        ));
+        let _ = std::fs::remove_file(&oversized);
+
+        let invalid = scratch("invalid-utf8");
+        std::fs::write(&invalid, [b'\xff', b'\xfe']).unwrap();
+        assert!(matches!(
+            load_from(&invalid),
+            Err(LoadError::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData
+        ));
+        let _ = std::fs::remove_file(&invalid);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn role_reader_rejects_final_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let target = scratch("symlink-target");
+        let path = scratch("symlink-leaf");
+        std::fs::write(&target, "role = \"workstation\"\n").unwrap();
+        let _ = std::fs::remove_file(&path);
+        symlink(&target, &path).unwrap();
+        assert!(matches!(load_from(&path), Err(LoadError::Io(_))));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&target);
     }
 
     #[test]

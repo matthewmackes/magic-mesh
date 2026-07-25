@@ -8,13 +8,15 @@ license.workspace      = true
 authors.workspace      = true
 repository.workspace   = true
 
+# The role.toml is a single `role = "<name>"` field, so the loader
+# hand-reads/writes it rather than pulling a TOML parser. `rustix` supplies the
+# descriptor-level no-follow open used for the privileged role boundary.
+[dependencies]
+rustix = { version = "0.38", features = ["fs"] }
+
 [lib]
 name = "mde_role"
 path = "src/lib.rs"
-
-# Zero runtime dependencies: the role.toml is a single `role = "<name>"`
-# field, so the loader hand-reads/writes it (std only) rather than pulling a
-# TOML parser the workspace doesn't otherwise carry.
 
 [lints]
 workspace = true

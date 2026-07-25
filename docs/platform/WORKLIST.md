@@ -255,6 +255,13 @@ These decisions refine acceptance and sequencing for the active items below.
   materialization. Focused farm gates are green at **9/9** router-registry,
   **34/34** probe-Nmap, and **17/17** device-inventory tests; live Nebula
   rotation/reconnect evidence remains external.
+- Progress (2026-07-25 platform role and bus configuration boundaries): the
+  pinned role reader plus federation grants/mints, template variables/includes,
+  subscription manifests, and webhook configuration now use bounded
+  descriptor-backed regular-file reads with final-symlink, special-file,
+  growth, oversized, and invalid-UTF-8 rejection before materialization.
+  Integrated farm gates are green at **424/424** `mde-bus` and **17/17**
+  `mde-role`; live Nebula rotation/reconnect evidence remains external.
 - Progress (2026-07-25 Browser action credential boundary): privileged Browser
   action credentials and replay-nonce expiry rows now use bounded
   descriptor-backed regular-file reads that reject final symlinks, special

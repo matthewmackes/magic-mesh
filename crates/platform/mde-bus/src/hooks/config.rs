@@ -39,6 +39,10 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 use thiserror::Error;
 
+/// Keep the operator-controlled YAML document bounded before serde materializes
+/// its maps, strings, and rules.
+const MAX_CONFIG_BYTES: usize = 64 * 1024;
+
 /// Top-level YAML config — `bus-hooks.yaml`.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -71,13 +75,104 @@ impl HooksConfig {
     /// - [`ConfigError::Io`] — read failed (permission, etc.)
     /// - [`ConfigError::Parse`] — invalid YAML
     pub fn load(path: &std::path::Path) -> Result<Self, ConfigError> {
-        if !path.exists() {
-            return Err(ConfigError::Missing(path.display().to_string()));
-        }
-        let body = std::fs::read_to_string(path)
-            .map_err(|e| ConfigError::Io(format!("{}: {e}", path.display())))?;
+        let bytes = read_bounded_no_follow(path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                ConfigError::Missing(path.display().to_string())
+            } else {
+                ConfigError::Io(format!("{}: {error}", path.display()))
+            }
+        })?;
+        let body = String::from_utf8(bytes).map_err(|error| {
+            ConfigError::Io(format!("{}: invalid UTF-8: {error}", path.display()))
+        })?;
         Self::parse_yaml(&body)
     }
+}
+
+/// Read a regular config file without following a hostile final symlink and
+/// without allowing an unbounded document to reach the YAML parser.
+fn read_bounded_no_follow(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        options.custom_flags(0o400000 | 0o4000); // O_NOFOLLOW | O_NONBLOCK
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        options.custom_flags(0x100 | 0x4); // O_NOFOLLOW | O_NONBLOCK
+
+        // Unsupported Unix targets still reject a final symlink before open;
+        // the production Linux path above uses the race-resistant flag.
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        if !std::fs::symlink_metadata(path)
+            .map(|metadata| metadata.file_type().is_file())
+            .unwrap_or(false)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "config path is not a regular file",
+            ));
+        }
+    }
+
+    #[cfg(not(unix))]
+    if !std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_file())
+        .unwrap_or(false)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "config path is not a regular file",
+        ));
+    }
+
+    let file = options.open(path)?;
+    let before = file.metadata()?;
+    if !before.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "config path is not a regular file",
+        ));
+    }
+    if before.len() > MAX_CONFIG_BYTES as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("config exceeds {MAX_CONFIG_BYTES}-byte limit"),
+        ));
+    }
+
+    let capacity = usize::try_from(before.len())
+        .unwrap_or(MAX_CONFIG_BYTES)
+        .min(MAX_CONFIG_BYTES)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(capacity);
+    (&file)
+        .take(MAX_CONFIG_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+
+    let after = file.metadata()?;
+    if !after.file_type().is_file()
+        || after.len() != before.len()
+        || bytes.len() > MAX_CONFIG_BYTES
+        || bytes.len() as u64 != before.len()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("config changed during bounded read or exceeds {MAX_CONFIG_BYTES}-byte limit"),
+        ));
+    }
+
+    Ok(bytes)
 }
 
 /// One adapter's rule list.
@@ -327,6 +422,41 @@ adapters:
         let p = std::path::Path::new("/nonexistent/path/bus-hooks.yaml");
         let err = HooksConfig::load(p).expect_err("missing file should error");
         assert!(matches!(err, ConfigError::Missing(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_rejects_a_final_symlink_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target.yaml");
+        let link = tmp.path().join("hooks.yaml");
+        std::fs::write(&target, "adapters: {}\n").unwrap();
+        symlink(&target, &link).unwrap();
+
+        let err = HooksConfig::load(&link).expect_err("symlink must not be loaded");
+        assert!(matches!(err, ConfigError::Io(_)));
+    }
+
+    #[test]
+    fn load_rejects_an_oversized_config_before_yaml_parsing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("hooks.yaml");
+        std::fs::write(&path, vec![b' '; MAX_CONFIG_BYTES + 1]).unwrap();
+
+        let err = HooksConfig::load(&path).expect_err("oversized config must be rejected");
+        assert!(matches!(err, ConfigError::Io(_)));
+    }
+
+    #[test]
+    fn load_rejects_invalid_utf8_before_yaml_parsing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("hooks.yaml");
+        std::fs::write(&path, [b'a', 0xff, 0xfe]).unwrap();
+
+        let err = HooksConfig::load(&path).expect_err("invalid UTF-8 must be rejected");
+        assert!(matches!(err, ConfigError::Io(_)));
     }
 
     #[test]
