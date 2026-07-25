@@ -16,6 +16,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// Lifecycle requests and results are compact replicated control records.
+/// Bound their materialization before `serde_json` sees peer-controlled bytes.
+const MAX_LIFECYCLE_RECORD_BYTES: usize = 256 * 1024;
+
 /// A lifecycle request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LifecycleRequest {
@@ -75,6 +79,53 @@ fn lifecycle_dir(workgroup_root: &Path, target_host: &str) -> io::Result<PathBuf
         .join(safe_component("target host", target_host)?))
 }
 
+/// Read one replicated lifecycle record through the descriptor that will be
+/// consumed. Reject final symlinks, blocking special files, oversized input,
+/// and growth beyond the bound before deserialization.
+fn read_bounded_lifecycle_record(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+
+    #[cfg(unix)]
+    let file: std::fs::File = {
+        use rustix::fs::{Mode, OFlags};
+
+        rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .ok()?
+        .into()
+    };
+    #[cfg(not(unix))]
+    let file = {
+        let metadata = std::fs::symlink_metadata(path).ok()?;
+        if !metadata.file_type().is_file() {
+            return None;
+        }
+        std::fs::File::open(path).ok()?
+    };
+
+    let metadata = file.metadata().ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_LIFECYCLE_RECORD_BYTES as u64 {
+        return None;
+    }
+
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len())
+            .unwrap_or(MAX_LIFECYCLE_RECORD_BYTES)
+            .min(MAX_LIFECYCLE_RECORD_BYTES)
+            .saturating_add(1),
+    );
+    file.take((MAX_LIFECYCLE_RECORD_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > MAX_LIFECYCLE_RECORD_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
 /// `true` for the op vocabulary the executor accepts.
 #[must_use]
 pub fn valid_op(op: &str) -> bool {
@@ -130,7 +181,7 @@ pub fn take_requests(workgroup_root: &Path, self_host: &str) -> Vec<LifecycleReq
         if !name.ends_with(".json") || name.ends_with(".result.json") || name.starts_with('.') {
             continue;
         }
-        if let Ok(raw) = std::fs::read_to_string(&p) {
+        if let Some(raw) = read_bounded_lifecycle_record(&p) {
             if let Ok(req) = serde_json::from_str::<LifecycleRequest>(&raw) {
                 let _ = std::fs::remove_file(&p);
                 if valid_kind(&req.kind)
@@ -172,7 +223,7 @@ pub fn take_result(workgroup_root: &Path, target_host: &str, id: &str) -> Option
     let path = lifecycle_dir(workgroup_root, target_host)
         .ok()?
         .join(format!("{id}.result.json"));
-    let raw = std::fs::read_to_string(&path).ok()?;
+    let raw = read_bounded_lifecycle_record(&path)?;
     let result = serde_json::from_str(&raw).ok()?;
     let _ = std::fs::remove_file(&path);
     Some(result)
@@ -313,6 +364,83 @@ mod tests {
         )
         .unwrap();
         assert!(take_requests(tmp.path(), "oak").is_empty());
+    }
+
+    #[test]
+    fn request_reader_skips_oversized_invalid_and_non_regular_leaves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("fleet/lifecycle/oak");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_request(
+            tmp.path(),
+            "oak",
+            &req("good", "container", "nginx", "start"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("oversized.json"),
+            vec![b'{'; MAX_LIFECYCLE_RECORD_BYTES + 1],
+        )
+        .unwrap();
+        std::fs::write(dir.join("invalid.json"), [0xff, 0xfe]).unwrap();
+        std::fs::create_dir(dir.join("directory.json")).unwrap();
+
+        let got = take_requests(tmp.path(), "oak");
+        assert_eq!(got, vec![req("good", "container", "nginx", "start")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lifecycle_readers_reject_final_symlinks_without_consuming_targets() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("fleet/lifecycle/oak");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let request_target = tmp.path().join("outside-request.json");
+        std::fs::write(
+            &request_target,
+            serde_json::to_string(&req("linked", "container", "nginx", "start")).unwrap(),
+        )
+        .unwrap();
+        symlink(&request_target, dir.join("linked.json")).unwrap();
+        assert!(take_requests(tmp.path(), "oak").is_empty());
+        assert!(request_target.exists());
+
+        let result_target = tmp.path().join("outside-result.json");
+        std::fs::write(
+            &result_target,
+            serde_json::to_string(&LifecycleResult {
+                id: "linked-result".into(),
+                ok: true,
+                error: String::new(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        symlink(&result_target, dir.join("linked-result.result.json")).unwrap();
+        assert!(take_result(tmp.path(), "oak", "linked-result").is_none());
+        assert!(result_target.exists());
+    }
+
+    #[test]
+    fn result_reader_leaves_oversized_payloads_unconsumed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("fleet/lifecycle/oak");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("large.result.json");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"id":"large","ok":true,"error":"{}"}}"#,
+                "x".repeat(MAX_LIFECYCLE_RECORD_BYTES)
+            ),
+        )
+        .unwrap();
+
+        assert!(take_result(tmp.path(), "oak", "large").is_none());
+        assert!(path.exists(), "invalid replicated input is not consumed");
     }
 
     #[test]

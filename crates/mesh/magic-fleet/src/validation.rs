@@ -20,7 +20,7 @@
 //! demand, is the operator's connectivity check.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -96,6 +96,71 @@ pub fn run_dir(root: &Path, run_id: &str) -> PathBuf {
     runs_dir(root).join(run_id)
 }
 
+/// Keep replicated validation manifests and rows bounded before `serde_json`
+/// materializes attacker-controlled collections and strings.
+const MAX_VALIDATION_RUN_BYTES: usize = 256 * 1024;
+const MAX_VALIDATION_ROW_BYTES: usize = 256 * 1024;
+
+/// Open a replicated record without following its final path component.
+///
+/// Linux is the supported deployment target. `O_NONBLOCK` is paired with
+/// `O_NOFOLLOW` so a hostile FIFO or other special file cannot stall a
+/// worker before the descriptor is inspected and rejected.
+#[cfg(target_os = "linux")]
+fn open_validation_record(path: &Path) -> io::Result<std::fs::File> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // Linux uapi values: O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC.
+    const O_NONBLOCK: i32 = 0o0004000;
+    const O_NOFOLLOW: i32 = 0o00400000;
+    const O_CLOEXEC: i32 = 0o02000000;
+
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
+        .open(path)
+}
+
+/// Preserve fail-soft behavior on non-Linux development targets. The
+/// preflight rejects an already-present final symlink before opening, while
+/// Linux uses the descriptor-level `O_NOFOLLOW` boundary above.
+#[cfg(not(target_os = "linux"))]
+fn open_validation_record(path: &Path) -> io::Result<std::fs::File> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "validation record is a symlink",
+        ));
+    }
+    std::fs::File::open(path)
+}
+
+/// Read a replicated text record through a bounded descriptor-backed regular
+/// file. Every failure is intentionally collapsed to `None`: replication can
+/// expose half-written or hostile files and callers must simply skip them.
+fn read_bounded_validation_record(path: &Path, max_bytes: usize) -> Option<String> {
+    let file = open_validation_record(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > max_bytes as u64 {
+        return None;
+    }
+
+    let capacity = usize::try_from(metadata.len())
+        .unwrap_or(max_bytes)
+        .min(max_bytes)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(max_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > max_bytes {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
 /// Write a run manifest (atomic).
 ///
 /// # Errors
@@ -113,7 +178,10 @@ pub fn write_run(root: &Path, run: &ValidationRun) -> io::Result<PathBuf> {
 /// Read a run manifest if present.
 #[must_use]
 pub fn read_run(root: &Path, run_id: &str) -> Option<ValidationRun> {
-    let raw = std::fs::read_to_string(run_dir(root, run_id).join("run.json")).ok()?;
+    let raw = read_bounded_validation_record(
+        &run_dir(root, run_id).join("run.json"),
+        MAX_VALIDATION_RUN_BYTES,
+    )?;
     serde_json::from_str(&raw).ok()
 }
 
@@ -158,7 +226,7 @@ pub fn read_rows(root: &Path, run_id: &str) -> Vec<NodeReachability> {
             let n = n.to_string_lossy();
             n.ends_with(".json") && n != "run.json"
         })
-        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .filter_map(|e| read_bounded_validation_record(&e.path(), MAX_VALIDATION_ROW_BYTES))
         .filter_map(|raw| serde_json::from_str(&raw).ok())
         .collect();
     out.sort_by(|a, b| a.from.cmp(&b.from));
@@ -303,6 +371,56 @@ mod tests {
             "row clears pending"
         );
         assert_eq!(read_rows(tmp.path(), "v-1").len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_manifests_skip_symlink_oversized_and_invalid_utf8_inputs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = run_dir(tmp.path(), "v-hostile");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = tmp.path().join("outside-run.json");
+        std::fs::write(&target, serde_json::to_vec(&run(&["pine", "oak"])).unwrap()).unwrap();
+
+        let path = dir.join("run.json");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(read_run(tmp.path(), "v-hostile").is_none());
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, vec![b'x'; MAX_VALIDATION_RUN_BYTES + 1]).unwrap();
+        assert!(read_run(tmp.path(), "v-hostile").is_none());
+
+        std::fs::write(&path, [0xff, 0xfe, 0xfd]).unwrap();
+        assert!(read_run(tmp.path(), "v-hostile").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reported_rows_skip_hostile_inputs_and_sort_valid_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_id = "v-rows";
+        let dir = run_dir(tmp.path(), run_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_row(tmp.path(), run_id, &row("zeta", &[])).unwrap();
+        write_row(tmp.path(), run_id, &row("alpha", &[])).unwrap();
+
+        std::fs::write(dir.join("invalid.json"), [0xff, 0xfe]).unwrap();
+        std::fs::write(
+            dir.join("oversized.json"),
+            vec![b'x'; MAX_VALIDATION_ROW_BYTES + 1],
+        )
+        .unwrap();
+        std::fs::create_dir(dir.join("directory.json")).unwrap();
+
+        let target = tmp.path().join("outside-row.json");
+        std::fs::write(&target, serde_json::to_vec(&row("linked", &[])).unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, dir.join("linked.json")).unwrap();
+
+        let rows = read_rows(tmp.path(), run_id);
+        assert_eq!(
+            rows.iter().map(|r| r.from.as_str()).collect::<Vec<_>>(),
+            ["alpha", "zeta"]
+        );
     }
 
     #[test]

@@ -302,6 +302,14 @@ These decisions refine acceptance and sequencing for the active items below.
   topology gate is green at **14/14**, and the integrated BigBoy `mackesd --lib
   --features async-services` gate is green at **4,050 passed, 0 failed, 1
   ignored**. Live Nebula rotation/reconnect evidence remains external.
+- Progress (2026-07-25 replicated install-profile boundary): the role/profile
+  loader now reads peer-provided TOML through bounded descriptor-backed regular
+  files, rejecting final symlinks, non-regular leaves, oversized input, and
+  invalid UTF-8 before materialization while preserving the built-in role
+  fallback. The focused farm profile gate is green at **14/14**, and the
+  integrated BigBoy `mackesd --lib --features async-services` gate is green at
+  **4,054 passed, 0 failed, 1 ignored**. Live Nebula rotation/reconnect
+  evidence remains external.
 - Progress (2026-07-24 overlay-IP publication hardening): the Nebula
   supervisor's replicated overlay-IP writer now rejects symlinked parent
   components and uses unique create-new staging with crash-durable replacement;
@@ -548,6 +556,20 @@ These decisions refine acceptance and sequencing for the active items below.
   and invalid UTF-8 before parser materialization. The full farm
   `magic-fleet --lib` gate is green at **56/56**; live libvirt/Podman evidence
   remains external.
+- Progress (2026-07-25 jobs/validation read boundaries): replicated job
+  templates, run manifests, target results, validation manifests, and
+  reachability rows now use bounded descriptor-backed regular-file reads that
+  reject final symlinks, non-regular leaves, oversized input, and invalid UTF-8
+  before YAML/JSON materialization. Focused farm evidence is green at **7/7**
+  jobs tests and **6/6** validation tests; the combined `magic-fleet --lib`
+  gate is green at **61/61**. Live libvirt/Podman evidence remains external.
+- Progress (2026-07-25 lifecycle persistence boundary): replicated service
+  lifecycle requests and results now use bounded descriptor-backed regular-file
+  reads that reject final symlinks, non-regular leaves, oversized input, and
+  invalid UTF-8 before JSON materialization. The focused lifecycle farm
+  invocation is green at **74/74**, and the integrated BigBoy `mackesd --lib
+  --features async-services` gate is green at **4,054 passed, 0 failed, 1
+  ignored**. Live libvirt/Podman evidence remains external.
 - Progress (2026-07-24 image provider boundary): `image-build` now caps raw
   requests before verb parsing, bounds replicated promotion/SHA sidecars,
   limits roster rows, and keeps reply/error/raw-log text bounded. The focused

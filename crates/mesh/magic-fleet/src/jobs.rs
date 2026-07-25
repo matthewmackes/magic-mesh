@@ -20,6 +20,75 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+// Replicated job leaves are peer-provided input. Keep enough room for useful
+// job definitions while bounding the bytes handed to YAML/JSON parsers.
+const MAX_TEMPLATE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_RUN_BYTES: usize = 4 * 1024 * 1024;
+const MAX_RESULT_BYTES: usize = 256 * 1024;
+
+/// Read one replicated leaf through a descriptor without following its final
+/// symlink, accepting only regular files and no more than `max_bytes`.
+///
+/// The descriptor metadata check rejects directories and other special files
+/// before their contents are consumed. Reading one byte beyond the bound
+/// closes the race where a peer grows a regular file after the first metadata
+/// snapshot, while invalid UTF-8 is rejected by [`read_bounded_text`] before
+/// any serializer materializes the document.
+fn read_bounded_regular_file(path: &Path, max_bytes: usize) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        options.custom_flags(0o400000 | 0o4000); // O_NOFOLLOW | O_NONBLOCK
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        options.custom_flags(0x100 | 0x4); // O_NOFOLLOW | O_NONBLOCK
+
+        // Keep unsupported Unix targets fail-closed for a symlink leaf even
+        // when their standard library does not expose an O_NOFOLLOW value.
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        if !std::fs::symlink_metadata(path).ok()?.file_type().is_file() {
+            return None;
+        }
+    }
+
+    #[cfg(not(unix))]
+    if !std::fs::symlink_metadata(path).ok()?.file_type().is_file() {
+        return None;
+    }
+
+    let file = options.open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    let max_bytes_u64 = u64::try_from(max_bytes).ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > max_bytes_u64 {
+        return None;
+    }
+
+    let capacity = usize::try_from(metadata.len())
+        .ok()?
+        .min(max_bytes)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(max_bytes_u64.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() <= max_bytes).then_some(bytes)
+}
+
+fn read_bounded_text(path: &Path, max_bytes: usize) -> Option<String> {
+    String::from_utf8(read_bounded_regular_file(path, max_bytes)?).ok()
+}
+
 /// A target selector (W31): any union of capability tags, roles, and
 /// explicit peer hostnames, resolved against the directory at launch.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -169,7 +238,7 @@ pub fn read_templates(root: &Path) -> Vec<JobTemplate> {
     let mut out: Vec<JobTemplate> = entries
         .filter_map(Result::ok)
         .filter(|e| e.path().extension().is_some_and(|x| x == "yaml"))
-        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .filter_map(|e| read_bounded_text(&e.path(), MAX_TEMPLATE_BYTES))
         .filter_map(|raw| serde_yaml::from_str(&raw).ok())
         .collect();
     out.sort_by(|a, b| a.id.cmp(&b.id));
@@ -238,7 +307,7 @@ pub fn write_run(root: &Path, run: &JobRun) -> io::Result<PathBuf> {
 /// Read a run manifest, if present.
 #[must_use]
 pub fn read_run(root: &Path, run_id: &str) -> Option<JobRun> {
-    let raw = std::fs::read_to_string(run_dir(root, run_id).join("run.json")).ok()?;
+    let raw = read_bounded_text(&run_dir(root, run_id).join("run.json"), MAX_RUN_BYTES)?;
     serde_json::from_str(&raw).ok()
 }
 
@@ -268,7 +337,7 @@ pub fn read_target_results(root: &Path, run_id: &str) -> Vec<TargetResult> {
             let n = n.to_string_lossy();
             n.ends_with(".json") && n != "run.json"
         })
-        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .filter_map(|e| read_bounded_text(&e.path(), MAX_RESULT_BYTES))
         .filter_map(|raw| serde_json::from_str(&raw).ok())
         .collect();
     out.sort_by(|a, b| a.hostname.cmp(&b.hostname));
@@ -295,6 +364,17 @@ mod tests {
             hostname: host.into(),
             role: role.into(),
             tags: tags.iter().map(|t| (*t).to_string()).collect(),
+        }
+    }
+
+    fn template(id: &str) -> JobTemplate {
+        JobTemplate {
+            id: id.into(),
+            description: format!("{id} description"),
+            playbook: "playbooks/patch.yml".into(),
+            vars: Default::default(),
+            targets: TargetSelector::default(),
+            schedule: None,
         }
     }
 
@@ -361,6 +441,33 @@ mod tests {
     }
 
     #[test]
+    fn template_reads_skip_hostile_leaves_and_keep_deterministic_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_template(tmp.path(), &template("zulu")).unwrap();
+        write_template(tmp.path(), &template("alpha")).unwrap();
+        let dir = templates_dir(tmp.path());
+
+        std::fs::write(dir.join("invalid.yaml"), [0xff, 0xfe]).unwrap();
+        std::fs::write(
+            dir.join("oversized.yaml"),
+            vec![b'x'; MAX_TEMPLATE_BYTES + 1],
+        )
+        .unwrap();
+        std::fs::create_dir(dir.join("directory.yaml")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.join("alpha.yaml"), dir.join("linked.yaml")).unwrap();
+
+        let templates = read_templates(tmp.path());
+        assert_eq!(
+            templates
+                .iter()
+                .map(|template| template.id.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "zulu"]
+        );
+    }
+
+    #[test]
     fn run_and_results_round_trip_and_pending_clears() {
         let tmp = tempfile::tempdir().unwrap();
         let run = JobRun {
@@ -393,5 +500,92 @@ mod tests {
             "result clears pending"
         );
         assert_eq!(read_target_results(tmp.path(), "r-1").len(), 1);
+    }
+
+    #[test]
+    fn run_manifest_reads_reject_hostile_leaves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let valid = JobRun {
+            run_id: "valid".into(),
+            playbook: "playbooks/patch.yml".into(),
+            playbook_digest: String::new(),
+            vars: Default::default(),
+            targets: vec!["pine".into()],
+            launched_by: String::new(),
+            at: 42,
+            execution_auth: Default::default(),
+        };
+        write_run(tmp.path(), &valid).unwrap();
+
+        let invalid = run_dir(tmp.path(), "invalid");
+        std::fs::create_dir_all(&invalid).unwrap();
+        std::fs::write(invalid.join("run.json"), [0xff, 0xfe]).unwrap();
+
+        let oversized = run_dir(tmp.path(), "oversized");
+        std::fs::create_dir_all(&oversized).unwrap();
+        std::fs::write(oversized.join("run.json"), vec![b'{'; MAX_RUN_BYTES + 1]).unwrap();
+
+        let directory = run_dir(tmp.path(), "directory");
+        std::fs::create_dir_all(directory.join("run.json")).unwrap();
+
+        #[cfg(unix)]
+        {
+            let linked = run_dir(tmp.path(), "linked");
+            std::fs::create_dir_all(&linked).unwrap();
+            std::os::unix::fs::symlink(
+                run_dir(tmp.path(), "valid").join("run.json"),
+                linked.join("run.json"),
+            )
+            .unwrap();
+        }
+
+        assert_eq!(read_run(tmp.path(), "valid"), Some(valid));
+        for run_id in ["invalid", "oversized", "directory"] {
+            assert!(read_run(tmp.path(), run_id).is_none(), "accepted {run_id}");
+        }
+        #[cfg(unix)]
+        assert!(read_run(tmp.path(), "linked").is_none());
+    }
+
+    #[test]
+    fn target_result_reads_skip_hostile_leaves_and_keep_sorted_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_id = "results";
+        write_target_result(
+            tmp.path(),
+            run_id,
+            &TargetResult {
+                hostname: "zulu".into(),
+                status: "ok".into(),
+                detail: String::new(),
+            },
+        )
+        .unwrap();
+        write_target_result(
+            tmp.path(),
+            run_id,
+            &TargetResult {
+                hostname: "alpha".into(),
+                status: "changed".into(),
+                detail: String::new(),
+            },
+        )
+        .unwrap();
+        let dir = run_dir(tmp.path(), run_id);
+
+        std::fs::write(dir.join("invalid.json"), [0xff, 0xfe]).unwrap();
+        std::fs::write(dir.join("oversized.json"), vec![b'{'; MAX_RESULT_BYTES + 1]).unwrap();
+        std::fs::create_dir(dir.join("directory.json")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.join("alpha.json"), dir.join("linked.json")).unwrap();
+
+        let results = read_target_results(tmp.path(), run_id);
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.hostname.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "zulu"]
+        );
     }
 }

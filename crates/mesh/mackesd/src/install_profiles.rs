@@ -49,6 +49,56 @@ pub fn profiles_dir(workgroup_root: &Path) -> PathBuf {
     workgroup_root.join("profiles")
 }
 
+/// Install profiles are small replicated TOML records. Keep peer-controlled
+/// input bounded before `toml` materializes it into an owned document.
+const MAX_PROFILE_BYTES: usize = 256 * 1024;
+
+/// Read one replicated profile through the descriptor that will be consumed.
+/// Reject final symlinks, blocking special files, oversized input, and invalid
+/// UTF-8 before the TOML parser sees peer-controlled bytes.
+fn read_bounded_profile(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+
+    #[cfg(unix)]
+    let file: std::fs::File = {
+        use rustix::fs::{Mode, OFlags};
+
+        rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .ok()?
+        .into()
+    };
+    #[cfg(not(unix))]
+    let file = {
+        let metadata = std::fs::symlink_metadata(path).ok()?;
+        if !metadata.file_type().is_file() {
+            return None;
+        }
+        std::fs::File::open(path).ok()?
+    };
+
+    let metadata = file.metadata().ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_PROFILE_BYTES as u64 {
+        return None;
+    }
+
+    let capacity = usize::try_from(metadata.len())
+        .unwrap_or(MAX_PROFILE_BYTES)
+        .min(MAX_PROFILE_BYTES)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take((MAX_PROFILE_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > MAX_PROFILE_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
 /// Read every profile TOML (junk-tolerant) plus the built-in core pack
 /// (the three role profiles). On-disk profiles with the same `name` as a
 /// core profile override it.
@@ -61,7 +111,7 @@ pub fn load_profiles(workgroup_root: &Path) -> Vec<InstallProfile> {
     if let Ok(entries) = std::fs::read_dir(profiles_dir(workgroup_root)) {
         for e in entries.filter_map(Result::ok) {
             if e.path().extension().is_some_and(|x| x == "toml") {
-                if let Ok(raw) = std::fs::read_to_string(e.path()) {
+                if let Some(raw) = read_bounded_profile(&e.path()) {
                     if let Ok(p) = toml::from_str::<InstallProfile>(&raw) {
                         // Retired media/file-sharing lighthouse profiles are
                         // ignored rather than reintroduced from replicated
@@ -442,6 +492,57 @@ mod tests {
     fn load_profiles_includes_core_pack_when_dir_absent() {
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(load_profiles(tmp.path()).len(), core_pack().len());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_profiles_skips_hostile_replicated_leaves_and_keeps_core_fallback() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = profiles_dir(tmp.path());
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A final symlink must not turn a replicated override into an escape
+        // or replace the built-in profile with data from outside the share.
+        let escaped = tmp.path().join("escaped-server.toml");
+        std::fs::write(
+            &escaped,
+            "name = \"server\"\nrole = \"server\"\ndescription = \"escaped\"\n",
+        )
+        .unwrap();
+        symlink(&escaped, dir.join("server.toml")).unwrap();
+
+        // A directory is a non-regular leaf even though its name looks like
+        // a profile. O_NONBLOCK also keeps special-file opens from blocking.
+        std::fs::create_dir(dir.join("directory.toml")).unwrap();
+
+        // Invalid UTF-8 is rejected before TOML materialization.
+        std::fs::write(dir.join("invalid-utf8.toml"), [0xff, 0xfe, 0xfd]).unwrap();
+
+        // Read at most the profile ceiling plus one sentinel byte.
+        std::fs::write(
+            dir.join("oversized.toml"),
+            vec![b'x'; MAX_PROFILE_BYTES.saturating_add(1)],
+        )
+        .unwrap();
+
+        // Existing junk tolerance remains intact for malformed TOML.
+        std::fs::write(dir.join("junk.toml"), "not = [valid TOML").unwrap();
+
+        let profiles = load_profiles(tmp.path());
+        assert_eq!(profiles.len(), core_pack().len());
+        let server = profiles.iter().find(|profile| profile.name == "server");
+        assert_eq!(
+            server,
+            core_pack().iter().find(|profile| profile.name == "server")
+        );
+        assert!(!profiles.iter().any(|profile| {
+            matches!(
+                profile.name.as_str(),
+                "directory" | "invalid-utf8" | "oversized" | "junk"
+            )
+        }));
     }
 
     // ---- W56 write side -----------------------------------------
