@@ -241,6 +241,12 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-SEC-006 - Keep Nebula private keys local to their owning node
 
 - Status: Remaining
+- Progress (2026-07-25 CA generation/epoch staging boundary): generated public
+  and private CA material plus staged CA, backup, and peer-rotation reads now
+  use the existing bounded no-follow/sealed readers, rejecting hostile staging
+  symlinks and oversized material before crypto or installation. The focused
+  CA farm gate is green at **141/141** (139 library and 2 CLI tests). Live
+  Nebula rotation/reconnect evidence remains external.
 - Progress (2026-07-25 local KDC pairing-store boundary): the host identity
   PKCS#8 key and persisted device pins now use bounded descriptor-backed
   regular-file reads that reject final symlinks, special files, oversized or
@@ -550,6 +556,11 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-ARCH-007 - Repair Workloads cockpit E2E wire, placement, and authorization
 
 - Status: Remaining
+- Progress (2026-07-25 console endpoint authority boundary): Workloads console
+  hosts are now bounded, delimiter-safe, malformed-input rejecting, and IPv6
+  addresses are bracketed before URI materialization. The focused cloud-console
+  farm gate is green at **12/12**. Live libvirt/Podman evidence remains
+  external.
 - Progress (2026-07-25 VM key and IP-mirror boundary): compute provisioning now
   reads generated Nebula key material and local `.nebula-ip` mirrors through
   bounded descriptor-backed regular-file readers that reject final symlinks,
@@ -835,6 +846,11 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-011 - Communications collaboration suite full replacement
 
 - Status: Remaining
+- Progress (2026-07-25 Browser policy persistence boundary): managed Browser
+  policy documents now use bounded no-follow regular-file reads that reject
+  symlinks, special files, oversized or changing input, and invalid UTF-8 while
+  retaining the last-good policy on transient corruption. The focused farm gate
+  is green at **20/20**. Live peer/media/LLM evidence remains external.
 - Progress (2026-07-25 encrypted session and Browser handoff boundaries): the
   sealed KDC session master/session files and Browser latest/outbox records now
   use bounded descriptor-backed regular-file readers that reject final
@@ -1672,6 +1688,12 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-006 - Construct interface (Apple-HIG-principled workstation shell)
 
 - Status: Remaining
+- Progress (2026-07-25 Workbench Controller snapshot boundary): the local
+  mesh-status snapshot now uses a bounded no-follow regular-file read that
+  rejects symlinks, special files, oversized or changing input, and invalid
+  UTF-8 before projection. The focused Controller farm gate is green at
+  **11/11**. Live pointer, pixel, physical, and VDI acceptance remain
+  external evidence.
 - Progress (2026-07-25 Console Custom-file boundary): the local Custom command
   store now uses a bounded descriptor-backed regular-file reader that rejects
   final symlinks, special files, oversized input, and invalid UTF-8 before JSON

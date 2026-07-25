@@ -269,13 +269,13 @@ where
         let staged_public = staging.join("public.pem");
         let staged_secret = staging.join("private.key");
         generate(&staged_public, &staged_secret)?;
-        let public = std::fs::read(&staged_public).map_err(|e| {
+        let public = seal::read_no_follow(&staged_public).map_err(|e| {
             CaError::Io(format!(
                 "read generated public {}: {e}",
                 staged_public.display()
             ))
         })?;
-        let secret = std::fs::read(&staged_secret).map_err(|e| {
+        let secret = seal::read_sealed(&staged_secret).map_err(|e| {
             CaError::Io(format!(
                 "read generated secret {}: {e}",
                 staged_secret.display()
@@ -512,5 +512,67 @@ mod tests {
         };
         let s = format!("{e}");
         assert!(s.contains("0o644") || s.contains("0644") || s.contains("644"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_pair_rejects_an_untrusted_staging_symlink() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let public_out = tmp.path().join("public.pem");
+        let secret_out = tmp.path().join("private.key");
+        let victim = tmp.path().join("victim");
+        std::fs::write(&victim, b"do-not-read").expect("victim");
+
+        let error = generate_pair_in_private_staging(
+            "hostile-public",
+            &public_out,
+            &secret_out,
+            |public, _secret| {
+                std::os::unix::fs::symlink(&victim, public)
+                    .map_err(|e| CaError::Io(format!("create hostile public: {e}")))
+            },
+        )
+        .expect_err("staging symlink must fail closed");
+
+        assert!(error.to_string().contains("untrusted sealed link"));
+        assert_eq!(std::fs::read(&victim).expect("victim read"), b"do-not-read");
+        assert!(!public_out.exists());
+        assert!(!secret_out.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_pair_rejects_oversized_private_staging_material() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let public_out = tmp.path().join("public.pem");
+        let secret_out = tmp.path().join("private.key");
+
+        let error = generate_pair_in_private_staging(
+            "oversized-private",
+            &public_out,
+            &secret_out,
+            |public, secret| {
+                std::fs::write(public, b"public")
+                    .map_err(|e| CaError::Io(format!("write public: {e}")))?;
+                std::fs::write(
+                    secret,
+                    vec![b'k'; (seal::MAX_SEALED_FILE_BYTES + 1) as usize],
+                )
+                .map_err(|e| CaError::Io(format!("write private: {e}")))?;
+                let mut permissions = std::fs::metadata(secret)
+                    .map_err(|e| CaError::Io(format!("stat private: {e}")))?
+                    .permissions();
+                permissions.set_mode(0o600);
+                std::fs::set_permissions(secret, permissions)
+                    .map_err(|e| CaError::Io(format!("seal private: {e}")))
+            },
+        )
+        .expect_err("oversized private material must fail closed");
+
+        assert!(error.to_string().contains("exceeds"));
+        assert!(!public_out.exists());
+        assert!(!secret_out.exists());
     }
 }

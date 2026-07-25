@@ -163,12 +163,19 @@ pub fn bump_epoch_into<B: NebulaCertBackend>(
         let staged_ca_crt = rotation_dir.join("ca.crt");
         let staged_ca_key = rotation_dir.join("ca.key");
         backend.mint_ca(mesh_id, &staged_ca_crt, &staged_ca_key)?;
-        let new_cert_pem = std::fs::read_to_string(&staged_ca_crt).map_err(|e| {
-            CaError::Io(format!(
-                "read staged CA cert {}: {e}",
-                staged_ca_crt.display()
-            ))
-        })?;
+        let new_cert_pem =
+            String::from_utf8(super::seal::read_no_follow(&staged_ca_crt).map_err(|e| {
+                CaError::Io(format!(
+                    "read staged CA cert {}: {e}",
+                    staged_ca_crt.display()
+                ))
+            })?)
+            .map_err(|e| {
+                CaError::Io(format!(
+                    "read staged CA cert {}: {e}",
+                    staged_ca_crt.display()
+                ))
+            })?;
         let new_key = super::seal::read_sealed(&staged_ca_key)?;
         if new_cert_pem.trim().is_empty() {
             return Err(CaError::Io(
@@ -223,7 +230,7 @@ pub fn bump_epoch_into<B: NebulaCertBackend>(
 
     let old_ca_pair = if crt.exists() && key.exists() {
         Some((
-            std::fs::read(crt)
+            super::seal::read_no_follow(crt)
                 .map_err(|e| CaError::Io(format!("backup CA cert {}: {e}", crt.display())))?,
             super::seal::read_sealed(key)?,
         ))
@@ -267,7 +274,7 @@ pub fn bump_epoch_into<B: NebulaCertBackend>(
     let mut installed_peer_files = Vec::new();
     for peer in &planned {
         let output = peer_cert_dir.join(format!("{}.crt", sanitize(&peer.node_id)));
-        let prior = std::fs::read(&output).ok();
+        let prior = super::seal::read_no_follow(&output).ok();
         if let Err(error) = super::seal::write_atomic_sealed(&output, peer.cert_pem.as_bytes()) {
             rollback_peer_files(&installed_peer_files);
             if let Some((old_cert, old_key)) = &old_ca_pair {
@@ -687,6 +694,64 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n-----END NEBULA X25519 PUBLIC KEY-
         ) -> Result<(), CaError> {
             Err(CaError::Subprocess("injected sign failure".into()))
         }
+    }
+
+    #[cfg(unix)]
+    struct HostileStagedCaBackend {
+        target: std::path::PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl NebulaCertBackend for HostileStagedCaBackend {
+        fn mint_ca(&self, _mesh_id: &str, crt_out: &Path, key_out: &Path) -> Result<(), CaError> {
+            crate::ca::seal::write_sealed(
+                key_out,
+                b"-----BEGIN NEBULA CA KEY-----\nmock\n-----END NEBULA CA KEY-----\n",
+            )?;
+            std::fs::write(&self.target, b"do-not-read")
+                .map_err(|e| CaError::Io(format!("write hostile CA target: {e}")))?;
+            std::os::unix::fs::symlink(&self.target, crt_out)
+                .map_err(|e| CaError::Io(format!("create hostile CA symlink: {e}")))
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rotation_rejects_an_untrusted_staged_ca_certificate() {
+        let mut conn = fresh_store();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let crt = tmp.path().join("ca.crt");
+        let key = tmp.path().join("ca.key");
+        let target = tmp.path().join("hostile-ca-target");
+        let backend = HostileStagedCaBackend {
+            target: target.clone(),
+        };
+
+        let error = bump_epoch_into(
+            &backend,
+            &mut conn,
+            "m1",
+            Some(&crt),
+            Some(&key),
+            tmp.path(),
+        )
+        .expect_err("staged CA symlink must fail closed");
+
+        assert!(error.to_string().contains("untrusted sealed link"));
+        assert_eq!(
+            std::fs::read(&target).expect("hostile target"),
+            b"do-not-read"
+        );
+        assert!(!crt.exists());
+        assert!(!key.exists());
+        let ca_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nebula_ca WHERE mesh_id = 'm1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("CA row count");
+        assert_eq!(ca_rows, 0);
     }
 
     #[test]

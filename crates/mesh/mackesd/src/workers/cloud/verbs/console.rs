@@ -18,6 +18,7 @@
 //! absent `virsh`) yields an honest `error`/`gated` reply, never a fake endpoint.
 
 use mackes_mesh_types::cloud::{CloudReply, ConsoleEndpoint, ConsoleProto};
+use std::net::Ipv6Addr;
 
 use crate::workers::console_broker::{
     is_loopback, ConsoleAddr, ConsoleBrokerError, ConsoleRelay, LiveConsoleRelay,
@@ -156,7 +157,8 @@ fn console_endpoint_reply(relay: &dyn ConsoleRelay, verb_name: &str, workload: &
 /// `virsh domdisplay` for a KVM guest) has no `ConsoleProto` form, so it is honestly
 /// `None` rather than silently coerced.
 fn endpoint_from_addr(addr: &ConsoleAddr) -> Option<ConsoleEndpoint> {
-    if addr.port == 0 || !valid_console_host(&addr.host) {
+    let host = canonical_console_host(&addr.host)?;
+    if addr.port == 0 {
         return None;
     }
     let proto = match addr.protocol {
@@ -166,21 +168,52 @@ fn endpoint_from_addr(addr: &ConsoleAddr) -> Option<ConsoleEndpoint> {
     };
     Some(ConsoleEndpoint {
         proto,
-        uri: format!("{}://{}:{}", addr.protocol.tag(), addr.host, addr.port),
+        uri: format!("{}://{}:{}", addr.protocol.tag(), host, addr.port),
         ticket: None,
     })
 }
 
 /// Keep an endpoint URI an authority, not an attacker-controlled URI fragment.
 /// `ConsoleAddr` normally comes from local `virsh`, but this boundary is also
-/// exercised by the typed relay seam and must stay fail-closed there.
-fn valid_console_host(host: &str) -> bool {
+/// exercised by the typed relay seam and must stay fail-closed there. Unbracketed
+/// IPv6 is canonicalized before interpolation so the final `:port` cannot be
+/// confused with one of the address's colons.
+const MAX_CONSOLE_HOST_BYTES: usize = 255;
+
+fn canonical_console_host(host: &str) -> Option<String> {
+    if host.is_empty() || host != host.trim() {
+        return None;
+    }
     let host = host.trim();
-    !host.is_empty()
-        && host == host.trim()
-        && !host.chars().any(|c| {
-            c.is_ascii_control() || c.is_ascii_whitespace() || matches!(c, '/' | '?' | '#' | '@')
+    if host.len() > MAX_CONSOLE_HOST_BYTES
+        || host.chars().any(|c| {
+            c.is_ascii_control()
+                || c.is_ascii_whitespace()
+                || matches!(c, '/' | '?' | '#' | '@' | '\\' | '%')
         })
+    {
+        return None;
+    }
+
+    if host.starts_with('[') || host.ends_with(']') {
+        let inner = host.strip_prefix('[')?.strip_suffix(']')?;
+        inner.parse::<Ipv6Addr>().ok()?;
+        return Some(format!("[{inner}]"));
+    }
+
+    if host.contains(':') {
+        let address = host.parse::<Ipv6Addr>().ok()?;
+        return Some(format!("[{address}]"));
+    }
+
+    if host
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    {
+        Some(host.to_string())
+    } else {
+        None
+    }
 }
 
 /// A loopback or wildcard bind is not a directly dialable mesh endpoint. The
@@ -225,7 +258,9 @@ mod tests {
     impl ConsoleRelay for DispatchProbe {
         fn resolve(&self, _vm_id: &str) -> Result<ConsoleAddr, ConsoleBrokerError> {
             self.0.fetch_add(1, Ordering::Relaxed);
-            Err(ConsoleBrokerError::Resolve("backend must not be called".into()))
+            Err(ConsoleBrokerError::Resolve(
+                "backend must not be called".into(),
+            ))
         }
         fn overlay_addr(&self) -> String {
             String::new()
@@ -293,10 +328,7 @@ mod tests {
             let reply = console_endpoint_reply(&relay, "console-attach", "win11");
             assert!(!reply.ok, "accepted non-dialable host {host:?}");
             assert!(reply.console.is_none());
-            assert!(reply
-                .gated
-                .unwrap()
-                .contains("retained VDI session broker"));
+            assert!(reply.gated.unwrap().contains("retained VDI session broker"));
         }
     }
 
@@ -355,7 +387,10 @@ mod tests {
     fn malformed_or_overlong_workload_targets_are_rejected_before_resolution() {
         for target in ["../vm", "vm/name", "vm name", "--help"] {
             let body = body(Some(target), None);
-            assert!(workload_name(&body).is_err(), "accepted unsafe target {target:?}");
+            assert!(
+                workload_name(&body).is_err(),
+                "accepted unsafe target {target:?}"
+            );
             assert!(authorization_target(&body).is_none());
         }
         let overlong = "x".repeat(256);
@@ -365,10 +400,7 @@ mod tests {
 
         let reply = handle("console-attach", &body);
         assert!(!reply.ok);
-        assert!(reply
-            .error
-            .unwrap()
-            .contains("rejects the workload target"));
+        assert!(reply.error.unwrap().contains("rejects the workload target"));
     }
 
     #[test]
@@ -393,7 +425,18 @@ mod tests {
 
     #[test]
     fn malformed_console_addresses_never_become_endpoint_uris() {
-        for host in ["", "bad host", "10.42.0.7/path", "10.42.0.7?x=1"] {
+        for host in [
+            "",
+            " 10.42.0.7",
+            "10.42.0.7 ",
+            "bad host",
+            "10.42.0.7/path",
+            "10.42.0.7?x=1",
+            "2001:db8::bad-host",
+            "host:5901",
+            "[not-an-ipv6-address]",
+            &"x".repeat(MAX_CONSOLE_HOST_BYTES + 1),
+        ] {
             let relay = FakeRelay(Ok(addr(DesktopProtocol::Vnc, host, 5901)));
             let reply = console_endpoint_reply(&relay, "console-attach", "vm");
             assert!(!reply.ok, "accepted malformed host {host:?}");
@@ -403,5 +446,16 @@ mod tests {
         let reply = console_endpoint_reply(&relay, "console-attach", "vm");
         assert!(!reply.ok);
         assert!(reply.console.is_none());
+    }
+
+    #[test]
+    fn ipv6_console_hosts_are_bracketed_before_uri_materialization() {
+        let relay = FakeRelay(Ok(addr(DesktopProtocol::Vnc, "2001:db8::7", 5901)));
+        let reply = console_endpoint_reply(&relay, "console-attach", "vm");
+        assert!(reply.ok);
+        assert_eq!(
+            reply.console.expect("console endpoint").uri,
+            "vnc://[2001:db8::7]:5901"
+        );
     }
 }
