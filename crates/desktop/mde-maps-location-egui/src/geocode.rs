@@ -15,6 +15,14 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, OpenFlags};
 
+/// Maximum UTF-8 byte length accepted for one offline-geocoder query.
+///
+/// This is a byte-level contract so the guard is O(1) and runs before any
+/// tokenization, FTS expression allocation, or SQLite work. The limit is
+/// intentionally generous for a human destination query while keeping the
+/// generated prefix expression bounded.
+const MAX_GEOCODER_QUERY_BYTES: usize = 4 * 1024;
+
 /// One gazetteer hit. Text columns are always present (empty, never `NULL`), so
 /// the UI can compose a title/subtitle without option juggling.
 #[derive(Debug, Clone, PartialEq)]
@@ -99,16 +107,21 @@ pub struct GeocodeOutcome {
 /// holds no usable token (so we skip the query entirely). Quoting a token that
 /// is pure alphanumeric (punctuation split out) keeps FTS5 operator keywords
 /// (`AND`/`OR`/`NEAR`) and stray syntax from ever reaching the parser.
-fn fts_match(text: &str) -> Option<String> {
+fn fts_match(text: &str) -> rusqlite::Result<Option<String>> {
+    if text.len() > MAX_GEOCODER_QUERY_BYTES {
+        return Err(rusqlite::Error::InvalidParameterName(format!(
+            "offline geocoder query exceeds {MAX_GEOCODER_QUERY_BYTES}-byte limit"
+        )));
+    }
     let terms: Vec<String> = text
         .split(|c: char| !c.is_alphanumeric())
         .filter(|t| !t.is_empty())
         .map(|t| format!("\"{t}\"*"))
         .collect();
     if terms.is_empty() {
-        None
+        Ok(None)
     } else {
-        Some(terms.join(" "))
+        Ok(Some(terms.join(" ")))
     }
 }
 
@@ -121,7 +134,7 @@ fn fts_match(text: &str) -> Option<String> {
 /// fails (e.g. the file is not a gazetteer). Callers use [`geocode`] to turn
 /// that into a fail-soft note.
 pub fn query_db(db: &Path, text: &str, limit: usize) -> rusqlite::Result<Vec<GeoResult>> {
-    let Some(match_expr) = fts_match(text) else {
+    let Some(match_expr) = fts_match(text)? else {
         return Ok(Vec::new());
     };
     let conn = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
@@ -294,8 +307,25 @@ mod tests {
         synth_gazetteer(&db);
         assert!(query_db(&db, "   ", 10).unwrap().is_empty());
         assert!(query_db(&db, "!!!", 10).unwrap().is_empty());
-        assert!(fts_match("  ,. ").is_none());
-        assert_eq!(fts_match("500 Main").as_deref(), Some("\"500\"* \"Main\"*"));
+        assert!(fts_match("  ,. ").unwrap().is_none());
+        assert_eq!(
+            fts_match("500 Main").unwrap().as_deref(),
+            Some("\"500\"* \"Main\"*")
+        );
+    }
+
+    #[test]
+    fn oversized_query_is_rejected_before_tokenization_or_sql() {
+        let oversized = "x".repeat(MAX_GEOCODER_QUERY_BYTES + 1);
+        let error = query_db(Path::new("/nonexistent/gazetteer.sqlite"), &oversized, 10)
+            .expect_err("oversized query must fail before opening SQLite");
+        match error {
+            rusqlite::Error::InvalidParameterName(message) => {
+                assert!(message.contains("offline geocoder query exceeds"));
+                assert!(message.contains("4096-byte limit"));
+            }
+            other => panic!("unexpected oversized-query error: {other:?}"),
+        }
     }
 
     #[test]

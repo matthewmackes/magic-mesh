@@ -16,6 +16,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use mde_egui::egui;
@@ -24,6 +25,11 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 /// The file (under the client data dir) the Car key bindings persist to.
 const CAR_KEYS_CONFIG_FILE: &str = "settings-car-keys.json";
+
+/// Keep hostile or stale local keymap JSON bounded before it reaches serde's
+/// materializer. The bounded read below also catches a file that grows after
+/// its initial metadata snapshot.
+const MAX_CAR_KEYMAP_CONFIG_BYTES: u64 = 64 * 1024;
 
 /// One action a Car-Mode key can be bound to.
 ///
@@ -393,8 +399,7 @@ impl CarKeyBindings {
     /// Load from `path`, folding a missing / malformed file to the defaults
     /// (never fatal).
     fn load_from(path: &Path) -> Self {
-        std::fs::read_to_string(path)
-            .ok()
+        read_bounded_config(path)
             .and_then(|s| serde_json::from_str::<Self>(&s).ok())
             .unwrap_or_default()
     }
@@ -428,6 +433,31 @@ impl CarKeyBindings {
             let _ = self.save_to(&path);
         }
     }
+}
+
+/// Read a local config through a finite buffer and reject non-regular files.
+/// The metadata checks avoid needless allocation, while the extra byte in the
+/// bounded read closes the race where a regular file grows after its snapshot.
+fn read_bounded_config(path: &Path) -> Option<String> {
+    let entry = std::fs::symlink_metadata(path).ok()?;
+    if !entry.file_type().is_file() || entry.len() > MAX_CAR_KEYMAP_CONFIG_BYTES {
+        return None;
+    }
+
+    let file = std::fs::File::open(path).ok()?;
+    let opened = file.metadata().ok()?;
+    if !opened.file_type().is_file() || opened.len() > MAX_CAR_KEYMAP_CONFIG_BYTES {
+        return None;
+    }
+
+    let mut bytes = Vec::with_capacity(opened.len() as usize);
+    file.take(MAX_CAR_KEYMAP_CONFIG_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_CAR_KEYMAP_CONFIG_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
 }
 
 #[cfg(test)]
@@ -533,6 +563,28 @@ mod tests {
         assert_eq!(object.get("A"), Some(&serde_json::json!("go_nav")));
         assert!(object.keys().all(|label| key_from_label(label).is_some()));
         assert!(object.len() <= bindable_keys().len());
+    }
+
+    #[test]
+    fn load_rejects_oversized_config_before_json_materialization() {
+        let dir = tempfile::tempdir().expect("temp config dir");
+        let path = dir.path().join(CAR_KEYS_CONFIG_FILE);
+        std::fs::write(
+            &path,
+            vec![b'{'; (MAX_CAR_KEYMAP_CONFIG_BYTES + 1) as usize],
+        )
+        .expect("write oversized config");
+
+        assert_eq!(CarKeyBindings::load_from(&path), CarKeyBindings::defaults());
+    }
+
+    #[test]
+    fn load_fails_closed_for_corrupt_config() {
+        let dir = tempfile::tempdir().expect("temp config dir");
+        let path = dir.path().join(CAR_KEYS_CONFIG_FILE);
+        std::fs::write(&path, b"not-json").expect("write corrupt config");
+
+        assert_eq!(CarKeyBindings::load_from(&path), CarKeyBindings::defaults());
     }
 
     #[test]

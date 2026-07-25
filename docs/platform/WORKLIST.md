@@ -241,6 +241,11 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-SEC-006 - Keep Nebula private keys local to their owning node
 
 - Status: Remaining
+- Progress (2026-07-24 sealed-read allocation boundary): CA, Nebula identity,
+  CSR, and authority reads now share a 1 MiB descriptor-bound limit after the
+  existing no-follow and permission checks. Oversized public/sealed material is
+  rejected before PEM/JSON materialization; the focused BigBoy seal gate is
+  green at 15/15. Live rotation/reconnect evidence remains external.
 - Progress (2026-07-24 replicated-topology input hardening): Nebula hop
   advertisements now impose byte, roster, identity, overlay-IP, CIDR, subnet,
   duplicate-row, and duplicate-subnet boundaries before route derivation; an
@@ -658,6 +663,11 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-011 - Communications collaboration suite full replacement
 
 - Status: Remaining
+- Progress (2026-07-24 Alerts display-boundary hardening): alert headlines,
+  sources, structured fields, and action labels are now single-line, bidi/control
+  safe, and bounded before egui layout while raw IDs remain unchanged for
+  commands. The focused BigBoy Alerts gate is green at 5/5; live media/LLM
+  evidence remains external.
 - Progress (2026-07-24 replication batch admission hardening): the collaboration
   engine now rejects merge batches above 4,096 envelopes before iteration or
   retention, preserving all-or-nothing replication semantics. Oversized and
@@ -1136,6 +1146,10 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-012 - Maps live-data overlays (zero-cost external feeds)
 
 - Status: Remaining
+- Progress (2026-07-24 offline-geocoder query boundary): destination-search
+  input is capped at 4 KiB before tokenization, FTS expression allocation, or
+  SQLite access, while normal prefix search remains unchanged. The focused farm
+  geocoder gate is green at 7/7; live provider-key evidence remains external.
 - Progress (2026-07-24 map attribution layout hardening): map credits are capped
   at 512 characters with an explicit ellipsis before egui galley layout, while
   the complete normal provider-credit set remains intact. Hostile and normal
@@ -1780,6 +1794,11 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-007 - Car interface (CarPlay-principled vehicle mode)
 
 - Status: Remaining
+- Progress (2026-07-24 Car-keymap persistence boundary): persisted key bindings
+  now use a regular-file, 64 KiB bounded read before JSON materialization and
+  fail closed for oversized/corrupt data while preserving unknown-key streaming
+  behavior. The focused BigBoy keymap gate is green at 9/9; live MG90 evidence
+  remains external.
 - Progress (2026-07-24 Car-status persistence boundary hardening): persisted
   status selections now use a regular-file, 64 KiB bounded read before JSON
   materialization and fail closed to defaults for oversized/corrupt data. The

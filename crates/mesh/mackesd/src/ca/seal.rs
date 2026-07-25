@@ -11,6 +11,12 @@ use std::path::Path;
 
 use super::CaError;
 
+/// Maximum sealed material read into memory from a local filesystem boundary.
+/// Nebula keys, certificates, CSRs, and authority pins are all far smaller;
+/// this protects callers from a hostile or corrupted replacement file before
+/// allocation or PEM/JSON materialization.
+pub const MAX_SEALED_FILE_BYTES: u64 = 1024 * 1024;
+
 /// Open a regular file without following a symlink in the final path
 /// component. Nonblocking open prevents a hostile FIFO from stalling an
 /// authority read. Callers read from the returned descriptor so the inode
@@ -109,6 +115,40 @@ fn open_generation_read(path: &Path) -> Result<Option<std::fs::File>, CaError> {
     Ok(Some(fd.into()))
 }
 
+/// Consume a descriptor through the shared sealed-file byte ceiling. The
+/// descriptor is already opened with the required no-follow policy, so the
+/// metadata and bounded read apply to the inode that will actually be used.
+fn read_bounded_file(file: std::fs::File, path: &Path) -> Result<Vec<u8>, CaError> {
+    use std::io::Read as _;
+
+    let metadata = file
+        .metadata()
+        .map_err(|e| CaError::Io(format!("metadata {}: {e}", path.display())))?;
+    if !metadata.file_type().is_file() {
+        return Err(CaError::Io(format!(
+            "read {}: not a regular file",
+            path.display()
+        )));
+    }
+    if metadata.len() > MAX_SEALED_FILE_BYTES {
+        return Err(CaError::Io(format!(
+            "read {}: exceeds {MAX_SEALED_FILE_BYTES}-byte limit",
+            path.display()
+        )));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_SEALED_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| CaError::Io(format!("read {}: {e}", path.display())))?;
+    if bytes.len() as u64 > MAX_SEALED_FILE_BYTES {
+        return Err(CaError::Io(format!(
+            "read {}: exceeds {MAX_SEALED_FILE_BYTES}-byte limit",
+            path.display()
+        )));
+    }
+    Ok(bytes)
+}
+
 /// Read a non-secret file without following an untrusted symlink at its leaf.
 ///
 /// Canonical CA-pair and Nebula-identity generation links are accepted because
@@ -116,22 +156,7 @@ fn open_generation_read(path: &Path) -> Result<Option<std::fs::File>, CaError> {
 /// attacker-controlled links remain refused; this reader intentionally does
 /// not apply the private-key mode-0600 check.
 pub fn read_no_follow(path: &Path) -> Result<Vec<u8>, CaError> {
-    use std::io::Read as _;
-
-    let mut file = open_sealed_read(path)?;
-    let meta = file
-        .metadata()
-        .map_err(|e| CaError::Io(format!("metadata {}: {e}", path.display())))?;
-    if !meta.file_type().is_file() {
-        return Err(CaError::Io(format!(
-            "read {}: not a regular file",
-            path.display()
-        )));
-    }
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .map_err(|e| CaError::Io(format!("read {}: {e}", path.display())))?;
-    Ok(bytes)
+    read_bounded_file(open_sealed_read(path)?, path)
 }
 
 /// Read a sealed file, enforcing mode-0600 + owner-matches-
@@ -148,17 +173,12 @@ pub fn read_no_follow(path: &Path) -> Result<Vec<u8>, CaError> {
 ///     - the file's owner uid doesn't match the running
 ///       process's effective uid.
 pub fn read_sealed(path: &Path) -> Result<Vec<u8>, CaError> {
-    use std::io::Read as _;
-
-    let mut file = open_sealed_read(path)?;
+    let file = open_sealed_read(path)?;
     let meta = file
         .metadata()
         .map_err(|e| CaError::Io(format!("metadata {}: {e}", path.display())))?;
     enforce_seal(path, &meta)?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .map_err(|e| CaError::Io(format!("read {}: {e}", path.display())))?;
-    Ok(bytes)
+    read_bounded_file(file, path)
 }
 
 /// Open a sealed file directly, allowing only the generation-link shape owned
@@ -841,6 +861,19 @@ mod tests {
             read_sealed(tmp.path()).is_err(),
             "directories are not secrets"
         );
+    }
+
+    #[test]
+    fn reads_reject_oversized_sealed_material_before_allocation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("oversized.key");
+        write_sealed(&path, &vec![b'x'; (MAX_SEALED_FILE_BYTES + 1) as usize])
+            .expect("write oversized fixture");
+
+        let no_follow = read_no_follow(&path).expect_err("oversized public read must fail closed");
+        assert!(no_follow.to_string().contains("exceeds"));
+        let sealed = read_sealed(&path).expect_err("oversized sealed read must fail closed");
+        assert!(sealed.to_string().contains("exceeds"));
     }
 
     #[test]
