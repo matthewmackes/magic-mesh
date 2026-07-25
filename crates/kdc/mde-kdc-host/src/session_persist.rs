@@ -13,11 +13,142 @@
 //! SEC-4's scope — this layer is its persistence substrate.
 
 use std::collections::BTreeMap;
-use std::io;
+use std::io::{self, Read, Write};
 use std::path::Path;
 
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, NONCE_LEN};
 use ring::rand::{SecureRandom, SystemRandom};
+
+const MASTER_KEY_LEN: usize = 32;
+// A session map is small in normal operation (one 32-byte key per device), but
+// keep the encrypted envelope bounded before either AES or serde sees it.
+const MAX_SESSION_FILE_BYTES: usize = 1024 * 1024;
+
+fn invalid_file(path: &Path, reason: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("{}: {reason}", path.display()),
+    )
+}
+
+/// Read a stable, regular file through its opened descriptor.
+///
+/// The path check rejects an existing final symlink, while `O_NOFOLLOW` closes
+/// the replacement race on Unix. The descriptor metadata check rejects a
+/// special file or a path that changed between the path and descriptor
+/// lookups. Reading one byte over the cap, then checking the descriptor size
+/// again, rejects files that are oversized or grow while being read before
+/// their contents reach decryption or deserialization.
+fn read_bounded_regular_file(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
+    let max_bytes_u64 = u64::try_from(max_bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "file size cap overflows u64"))?;
+    let entry = std::fs::symlink_metadata(path)?;
+    if !entry.file_type().is_file() {
+        return Err(invalid_file(path, "not a regular file"));
+    }
+    if entry.len() > max_bytes_u64 {
+        return Err(invalid_file(path, "file exceeds bounded read limit"));
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        options.custom_flags(0o400000); // O_NOFOLLOW
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        options.custom_flags(0x100); // O_NOFOLLOW
+
+        // Keep unsupported Unix targets fail-closed for symlink leaves even
+        // when their standard library does not expose an O_NOFOLLOW value in
+        // this crate's dependency surface.
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        if !std::fs::symlink_metadata(path)
+            .ok()
+            .is_some_and(|metadata| metadata.file_type().is_file())
+        {
+            return Err(invalid_file(path, "not a regular file"));
+        }
+    }
+
+    #[cfg(not(unix))]
+    if !std::fs::symlink_metadata(path)
+        .ok()
+        .is_some_and(|metadata| metadata.file_type().is_file())
+    {
+        return Err(invalid_file(path, "not a regular file"));
+    }
+
+    let mut file = options.open(path)?;
+    let opened = file.metadata()?;
+    if !opened.file_type().is_file() {
+        return Err(invalid_file(
+            path,
+            "opened descriptor is not a regular file",
+        ));
+    }
+    if opened.len() > max_bytes_u64 {
+        return Err(invalid_file(path, "file exceeds bounded read limit"));
+    }
+    let opened_len = opened.len();
+    let capacity = usize::try_from(opened_len).unwrap_or(max_bytes);
+    let mut bytes = Vec::with_capacity(capacity);
+    (&mut file)
+        .take(max_bytes_u64.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Err(invalid_file(path, "file grew beyond bounded read limit"));
+    }
+
+    let after = file.metadata()?;
+    if !after.file_type().is_file()
+        || after.len() != opened_len
+        || after.len() != u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+    {
+        return Err(invalid_file(path, "file changed while being read"));
+    }
+    Ok(bytes)
+}
+
+fn parse_master_key(path: &Path, bytes: &[u8]) -> io::Result<[u8; MASTER_KEY_LEN]> {
+    if bytes.len() != MASTER_KEY_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is not a 32-byte master key", path.display()),
+        ));
+    }
+    let mut key = [0_u8; MASTER_KEY_LEN];
+    key.copy_from_slice(bytes);
+    Ok(key)
+}
+
+fn create_master_key(path: &Path, key: &[u8; MASTER_KEY_LEN]) -> io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(key)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = file.metadata()?.permissions();
+        perms.set_mode(0o600);
+        file.set_permissions(perms)?;
+    }
+    Ok(())
+}
 
 /// Load (or mint) the 32-byte master key, 0600.
 ///
@@ -25,33 +156,24 @@ use ring::rand::{SecureRandom, SystemRandom};
 /// IO failures; a corrupt (wrong-length) master refuses rather than
 /// silently rotating (persisted sessions would all be lost quietly).
 pub fn load_or_create_master(path: &Path) -> io::Result<[u8; 32]> {
-    match std::fs::read(path) {
-        Ok(bytes) if bytes.len() == 32 => {
-            let mut arr = [0_u8; 32];
-            arr.copy_from_slice(&bytes);
-            Ok(arr)
-        }
-        Ok(_) => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{} is not a 32-byte master key", path.display()),
-        )),
+    match read_bounded_regular_file(path, MASTER_KEY_LEN) {
+        Ok(bytes) => parse_master_key(path, &bytes),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            let mut key = [0_u8; 32];
+            let mut key = [0_u8; MASTER_KEY_LEN];
             SystemRandom::new()
                 .fill(&mut key)
                 .map_err(|_| io::Error::other("CSPRNG failure"))?;
             if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir)?;
             }
-            std::fs::write(path, key)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mut perms = std::fs::metadata(path)?.permissions();
-                perms.set_mode(0o600);
-                std::fs::set_permissions(path, perms)?;
+            match create_master_key(path, &key) {
+                Ok(()) => Ok(key),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    let existing = read_bounded_regular_file(path, MASTER_KEY_LEN)?;
+                    parse_master_key(path, &existing)
+                }
+                Err(e) => Err(e),
             }
-            Ok(key)
         }
         Err(e) => Err(e),
     }
@@ -100,7 +222,7 @@ pub fn save_sessions(
 /// the wrong master, or any tampering — re-pairing beats garbage.
 #[must_use]
 pub fn load_sessions(path: &Path, master: &[u8; 32]) -> BTreeMap<String, Vec<u8>> {
-    let Ok(raw) = std::fs::read(path) else {
+    let Ok(raw) = read_bounded_regular_file(path, MAX_SESSION_FILE_BYTES) else {
         return BTreeMap::new();
     };
     if raw.len() < NONCE_LEN + 16 {
@@ -151,6 +273,18 @@ mod tests {
             !raw.windows(32).any(|w| w == [7_u8; 32]),
             "session key bytes must not appear in the sealed file"
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(tmp.path().join("master.key"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
     }
 
     #[test]
@@ -174,5 +308,66 @@ mod tests {
         let path = tmp.path().join("master.key");
         std::fs::write(&path, b"short").unwrap();
         assert!(load_or_create_master(&path).is_err());
+    }
+
+    #[test]
+    fn oversized_session_file_fails_closed_before_decrypting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let master = [3_u8; MASTER_KEY_LEN];
+        let path = tmp.path().join("sessions.enc");
+        std::fs::write(&path, vec![0_u8; MAX_SESSION_FILE_BYTES + 1]).unwrap();
+        assert!(load_sessions(&path, &master).is_empty());
+    }
+
+    #[test]
+    fn malformed_session_input_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let master = [4_u8; MASTER_KEY_LEN];
+        let path = tmp.path().join("sessions.enc");
+        for invalid in [
+            b"not a sealed session store".as_slice(),
+            &[0_u8; NONCE_LEN + 16],
+        ] {
+            std::fs::write(&path, invalid).unwrap();
+            assert!(load_sessions(&path, &master).is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_symlink_is_rejected_for_session_and_master_reads() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let master_path = tmp.path().join("master.key");
+        let master = load_or_create_master(&master_path).unwrap();
+        let session_path = tmp.path().join("sessions.enc");
+        save_sessions(&session_path, &master, &sample()).unwrap();
+
+        let session_link = tmp.path().join("sessions-link.enc");
+        symlink(&session_path, &session_link).unwrap();
+        assert!(load_sessions(&session_link, &master).is_empty());
+
+        let master_link = tmp.path().join("master-link.key");
+        symlink(&master_path, &master_link).unwrap();
+        assert!(load_or_create_master(&master_link).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn special_file_is_rejected_for_session_and_master_reads() {
+        let master = [5_u8; MASTER_KEY_LEN];
+        assert!(load_sessions(Path::new("/dev/null"), &master).is_empty());
+        assert!(load_or_create_master(Path::new("/dev/null")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oversized_master_is_rejected_without_rotation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("master.key");
+        std::fs::write(&path, vec![0_u8; MASTER_KEY_LEN + 1]).unwrap();
+        assert!(load_or_create_master(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap().len(), MASTER_KEY_LEN + 1);
     }
 }

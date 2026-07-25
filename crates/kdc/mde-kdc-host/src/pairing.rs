@@ -13,6 +13,7 @@
 //!   long-lived device records ever touch disk — never raw session keys).
 
 use std::collections::HashMap;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
@@ -20,6 +21,103 @@ use mde_kdc_proto::crypto::{KeyHandle, KeyStore, PairingKeyPair, RingKeyStore};
 use serde::{Deserialize, Serialize};
 
 use crate::error::HostError;
+
+const MAX_IDENTITY_PKCS8_BYTES: usize = 32 * 1024;
+const MAX_DEVICES_TOML_BYTES: usize = 256 * 1024;
+
+/// Read a local KDC store file through the descriptor that is consumed.
+///
+/// Identity material and peer pins are security-sensitive even though they are
+/// local files: reject final symlinks, special files, oversized/growing input,
+/// and non-regular descriptors before any crypto or TOML materialization.
+fn read_bounded_file(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        options.custom_flags(0o400000 | 0o4000 | 0o2000000); // O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        options.custom_flags(0x100 | 0x4); // O_NOFOLLOW | O_NONBLOCK
+
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        if !std::fs::symlink_metadata(path)?.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "KDC store input is not a regular file",
+            ));
+        }
+    }
+
+    #[cfg(not(unix))]
+    if !std::fs::symlink_metadata(path)?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "KDC store input is not a regular file",
+        ));
+    }
+
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "KDC store input is not a regular file",
+        ));
+    }
+    let max_u64 = u64::try_from(max_bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "KDC store input limit cannot be represented",
+        )
+    })?;
+    if metadata.len() > max_u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::FileTooLarge,
+            "KDC store input exceeds its maximum size",
+        ));
+    }
+    let initial_len = metadata.len();
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(initial_len)
+            .unwrap_or(max_bytes)
+            .min(max_bytes)
+            .saturating_add(1),
+    );
+    (&file)
+        .take(max_u64.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes || bytes.len() as u64 != initial_len {
+        return Err(io::Error::new(
+            io::ErrorKind::FileTooLarge,
+            "KDC store input changed size while being read",
+        ));
+    }
+    if file.metadata()?.len() != initial_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "KDC store input changed size while being read",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn read_bounded_text(path: &Path, max_bytes: usize) -> io::Result<String> {
+    String::from_utf8(read_bounded_file(path, max_bytes)?).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("KDC store input is not valid UTF-8: {error}"),
+        )
+    })
+}
 
 /// One trusted peer, as persisted in `devices.toml`. The peer's public key and
 /// certificate fingerprint are added by the pairing handshake (a later
@@ -140,16 +238,18 @@ impl PairingStore {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
 
         let key_path = dir.join("identity.pkcs8");
-        let pkcs8 = if key_path.exists() {
-            std::fs::read(&key_path)?
-        } else {
-            // §3 max-crypto: the long-lived identity key is RSA-4096, single-sourced
-            // through `keygen` (the same generator `issue_identity_cert` binds the
-            // cert to) so the key and cert are one identity at the pinned size.
-            let der =
-                crate::keygen::generate_pkcs8().map_err(|e| HostError::Keygen(e.to_string()))?;
-            write_private(&key_path, &der)?;
-            der
+        let pkcs8 = match read_bounded_file(&key_path, MAX_IDENTITY_PKCS8_BYTES) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                // §3 max-crypto: the long-lived identity key is RSA-4096, single-sourced
+                // through `keygen` (the same generator `issue_identity_cert` binds the
+                // cert to) so the key and cert are one identity at the pinned size.
+                let der = crate::keygen::generate_pkcs8()
+                    .map_err(|e| HostError::Keygen(e.to_string()))?;
+                write_private(&key_path, &der)?;
+                der
+            }
+            Err(error) => return Err(error.into()),
         };
         let keypair = PairingKeyPair::from_pkcs8(&pkcs8)?;
         let public_key_der = public_key_pkcs1_from_pkcs8(&pkcs8)?;
@@ -429,7 +529,7 @@ fn write_private(path: &Path, der: &[u8]) -> Result<(), HostError> {
 /// Read `devices.toml` into a map; a missing or unparseable file yields an empty
 /// store (never an error — the daemon must always start).
 fn read_devices(dir: &Path) -> HashMap<String, DeviceRecord> {
-    let Ok(text) = std::fs::read_to_string(dir.join("devices.toml")) else {
+    let Ok(text) = read_bounded_text(&dir.join("devices.toml"), MAX_DEVICES_TOML_BYTES) else {
         return HashMap::new();
     };
     let file: DeviceFile = toml::from_str(&text).unwrap_or_default();
@@ -561,6 +661,55 @@ mod tests {
         std::fs::write(tmp.path().join("devices.toml"), "not valid toml { [[[").unwrap();
         let s = PairingStore::open(tmp.path()).unwrap();
         assert!(s.is_empty());
+    }
+
+    #[test]
+    fn oversized_or_invalid_devices_files_fail_soft() {
+        let tmp = tempfile::tempdir().unwrap();
+        PairingStore::open(tmp.path()).unwrap();
+
+        std::fs::write(
+            tmp.path().join("devices.toml"),
+            vec![b'x'; MAX_DEVICES_TOML_BYTES + 1],
+        )
+        .unwrap();
+        assert!(PairingStore::open(tmp.path()).unwrap().is_empty());
+
+        std::fs::write(tmp.path().join("devices.toml"), [0xff, 0xfe]).unwrap();
+        assert!(PairingStore::open(tmp.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn oversized_identity_is_rejected_before_key_materialization() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("identity.pkcs8"),
+            vec![0_u8; MAX_IDENTITY_PKCS8_BYTES + 1],
+        )
+        .unwrap();
+        assert!(PairingStore::open(tmp.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_and_device_symlinks_or_special_files_fail_closed() {
+        use std::os::unix::fs::symlink;
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::write(&outside, b"not-a-private-key").unwrap();
+        symlink(&outside, tmp.path().join("identity.pkcs8")).unwrap();
+        assert!(PairingStore::open(tmp.path()).is_err());
+
+        let clean = tempfile::tempdir().unwrap();
+        PairingStore::open(clean.path()).unwrap();
+        let devices = clean.path().join("devices.toml");
+        symlink(&outside, &devices).unwrap();
+        assert!(PairingStore::open(clean.path()).unwrap().is_empty());
+        std::fs::remove_file(&devices).unwrap();
+        let _socket = UnixListener::bind(&devices).unwrap();
+        assert!(PairingStore::open(clean.path()).unwrap().is_empty());
     }
 
     // ── KDC-MESH-3 (#5): mesh-wide pairing replication ──────────────────────

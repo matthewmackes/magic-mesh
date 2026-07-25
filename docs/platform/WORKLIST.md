@@ -241,6 +241,13 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-SEC-006 - Keep Nebula private keys local to their owning node
 
 - Status: Remaining
+- Progress (2026-07-25 local KDC pairing-store boundary): the host identity
+  PKCS#8 key and persisted device pins now use bounded descriptor-backed
+  regular-file reads that reject final symlinks, special files, oversized or
+  growing input, and invalid UTF-8 before crypto/TOML materialization. The
+  focused pairing farm gate is green at **15/15**, and the integrated
+  `mde-kdc-host --lib` gate is green at **104/104**. Live Nebula
+  rotation/reconnect evidence remains external.
 - Progress (2026-07-25 CA-backup credential boundary): Nebula CA backup
   passphrases and backup-armor verification now use bounded regular-file reads
   that reject final symlinks and non-regular credential leaves before fallback
@@ -828,6 +835,15 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-011 - Communications collaboration suite full replacement
 
 - Status: Remaining
+- Progress (2026-07-25 encrypted session and Browser handoff boundaries): the
+  sealed KDC session master/session files and Browser latest/outbox records now
+  use bounded descriptor-backed regular-file readers that reject final
+  symlinks, special files, oversized input, invalid UTF-8, and hostile outbox
+  rows before decryption or JSON materialization. Focused farm gates are green
+  at **8/8** session-persistence tests and **14/14** Browser session-sync
+  tests; integrated gates are green at **104/104** `mde-kdc-host --lib` and
+  **110/110** `mde-browser-workers --lib`. Live peer/media evidence remains
+  external.
 - Progress (2026-07-25 transfer-ledger boundary): transfer ledger and recurring
   sync-pair records now use bounded descriptor-backed regular-file reads with
   final-symlink rejection before JSON parsing, preserving deterministic
@@ -1656,6 +1672,13 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-006 - Construct interface (Apple-HIG-principled workstation shell)
 
 - Status: Remaining
+- Progress (2026-07-25 Console Custom-file boundary): the local Custom command
+  store now uses a bounded descriptor-backed regular-file reader that rejects
+  final symlinks, special files, oversized input, and invalid UTF-8 before JSON
+  materialization while preserving the fail-soft empty fallback and atomic
+  save path. The focused Console farm gate is green at **54/54**, and the
+  integrated shell binary suite is green at **1,788/1,788**. Live pointer,
+  pixel, physical, and VDI acceptance remain external evidence.
 - Progress (2026-07-25 Device Manager mirror boundary): phone rosters and
   router-registry mirrors now use bounded descriptor-backed regular-file reads
   that reject final symlinks, non-regular leaves, oversized content, and

@@ -859,6 +859,11 @@ struct Arming {
 /// The Custom config's file name under the client data dir.
 const CUSTOM_FILE: &str = "console-custom.json";
 
+/// Keep the local Custom store bounded before `serde_json` materializes its
+/// entries. This leaves ample room for a real command roster while bounding
+/// the client-data-dir input just like the replicated Custom records.
+const MAX_CUSTOM_FILE_BYTES: usize = 256 * 1024;
+
 /// One operator-registered Custom entry (lock #35): a name + the command line
 /// its terminal tab will run once the CONSOLE-2 seam lands.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -878,12 +883,65 @@ struct CustomFile {
     entries: Vec<CustomEntry>,
 }
 
+/// Read the local Custom store through a descriptor-backed regular-file
+/// boundary. The final path component is opened without following symlinks,
+/// and a file that grows after its metadata snapshot is rejected before it can
+/// reach `serde_json`. Callers intentionally fold every failure to the empty
+/// store.
+fn read_bounded_custom_file(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+
+    if !fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_file())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        ))]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            options.custom_flags(0o400000); // O_NOFOLLOW
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            options.custom_flags(0x100); // O_NOFOLLOW
+        }
+    }
+
+    let file = options.open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_CUSTOM_FILE_BYTES as u64 {
+        return None;
+    }
+
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len())
+            .unwrap_or(MAX_CUSTOM_FILE_BYTES)
+            .saturating_add(1),
+    );
+    file.take((MAX_CUSTOM_FILE_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > MAX_CUSTOM_FILE_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
 impl CustomFile {
     /// Load from `path`, honestly folding a missing / half-written / malformed
     /// file to the empty store (never a fatal, never a fabricated entry).
     fn load_from(path: &Path) -> Self {
-        fs::read_to_string(path)
-            .ok()
+        read_bounded_custom_file(path)
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default()
     }
@@ -899,6 +957,65 @@ impl CustomFile {
         fs::write(&tmp, json)?;
         fs::rename(&tmp, path)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod custom_file_tests {
+    use super::*;
+
+    #[test]
+    fn custom_file_loads_valid_json_and_fails_soft_for_hostile_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(CUSTOM_FILE);
+        let expected = CustomFile {
+            entries: vec![CustomEntry {
+                name: "Fleet status".to_owned(),
+                command: "meshctl fleet status".to_owned(),
+            }],
+        };
+
+        fs::write(
+            &path,
+            serde_json::to_vec(&expected).expect("serialize valid custom file"),
+        )
+        .expect("write valid custom file");
+        assert_eq!(CustomFile::load_from(&path), expected);
+
+        fs::write(&path, [0xff, 0xfe]).expect("write invalid UTF-8 custom file");
+        assert_eq!(CustomFile::load_from(&path), CustomFile::default());
+
+        fs::write(&path, vec![b'{'; MAX_CUSTOM_FILE_BYTES + 1])
+            .expect("write oversized custom file");
+        assert_eq!(CustomFile::load_from(&path), CustomFile::default());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn custom_file_rejects_final_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("outside.json");
+        let link = dir.path().join(CUSTOM_FILE);
+        fs::write(&target, br#"{"entries":[]}"#).expect("write target custom file");
+        symlink(&target, &link).expect("create final symlink");
+
+        assert!(read_bounded_custom_file(&link).is_none());
+        assert_eq!(CustomFile::load_from(&link), CustomFile::default());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn custom_file_rejects_special_file() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(CUSTOM_FILE);
+        let _socket = UnixListener::bind(&path).expect("create Unix socket");
+
+        assert!(read_bounded_custom_file(&path).is_none());
+        assert_eq!(CustomFile::load_from(&path), CustomFile::default());
     }
 }
 
