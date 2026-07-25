@@ -42,6 +42,8 @@ const SLIDE_FRACTION: f32 = 0.34;
 const TRANSITION: Duration = Duration::from_millis(360);
 /// Persisted per-seat preference.
 const CONFIG_FILE: &str = "settings-nav-bar.json";
+/// Keep hostile or stale dock preferences bounded before serde materializes them.
+const MAX_NAV_PREFS_BYTES: usize = 64 * 1024;
 
 /// One action emitted by the painted controls.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,7 +132,7 @@ impl State {
     #[must_use]
     pub(crate) fn load() -> Self {
         Self::default_path().map_or_else(Self::default, |path| {
-            let mode = fs::read_to_string(path)
+            let mode = read_bounded_config(&path)
                 .ok()
                 .and_then(|json| serde_json::from_str::<NavBarPrefs>(&json).ok())
                 .map_or(DockMode::Floating, |prefs| prefs.mode);
@@ -330,6 +332,73 @@ impl State {
             let _ = save_to(&path, prefs);
         }
     }
+}
+
+/// Read the persisted dock preference without following a final symlink and
+/// without allowing an unbounded local file to reach serde.
+fn read_bounded_config(path: &Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        options.custom_flags(0o400000); // O_NOFOLLOW
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        options.custom_flags(0x100); // O_NOFOLLOW
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        if !fs::symlink_metadata(path)?.file_type().is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "navigation preference is not a regular file",
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    if !fs::symlink_metadata(path)?.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "navigation preference is not a regular file",
+        ));
+    }
+
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "navigation preference is not a regular file",
+        ));
+    }
+    if metadata.len() > MAX_NAV_PREFS_BYTES as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("navigation preference exceeds {MAX_NAV_PREFS_BYTES}-byte limit"),
+        ));
+    }
+
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len())
+            .unwrap_or(MAX_NAV_PREFS_BYTES)
+            .saturating_add(1),
+    );
+    file.take((MAX_NAV_PREFS_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_NAV_PREFS_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("navigation preference exceeds {MAX_NAV_PREFS_BYTES}-byte limit"),
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -687,15 +756,45 @@ mod tests {
             },
         )
         .expect("write nav-bar prefs");
-        let loaded = fs::read_to_string(&path).expect("read nav-bar prefs");
+        let loaded = read_bounded_config(&path).expect("read nav-bar prefs");
         let prefs: NavBarPrefs = serde_json::from_str(&loaded).expect("decode nav-bar prefs");
         assert_eq!(prefs.mode, DockMode::Docked);
         fs::write(&path, "not json").expect("write malformed nav-bar prefs");
-        let fallback = fs::read_to_string(&path)
+        let fallback = read_bounded_config(&path)
             .ok()
             .and_then(|json| serde_json::from_str::<NavBarPrefs>(&json).ok())
             .map_or(DockMode::Floating, |prefs| prefs.mode);
         assert_eq!(fallback, DockMode::Floating);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn oversized_preferences_degrade_to_floating_without_json_materialization() {
+        let dir = tempfile_dir();
+        let path = dir.join(CONFIG_FILE);
+        fs::write(&path, vec![b'x'; MAX_NAV_PREFS_BYTES + 1]).expect("oversized prefs");
+
+        assert!(read_bounded_config(&path).is_err());
+        let fallback = read_bounded_config(&path)
+            .ok()
+            .and_then(|json| serde_json::from_str::<NavBarPrefs>(&json).ok())
+            .map_or(DockMode::Floating, |prefs| prefs.mode);
+        assert_eq!(fallback, DockMode::Floating);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_symlink_preferences_are_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile_dir();
+        let target = dir.join("outside.json");
+        let link = dir.join(CONFIG_FILE);
+        fs::write(&target, r#"{"mode":"docked"}"#).expect("target prefs");
+        symlink(&target, &link).expect("preference symlink");
+
+        assert!(read_bounded_config(&link).is_err());
         let _ = fs::remove_dir_all(dir);
     }
 

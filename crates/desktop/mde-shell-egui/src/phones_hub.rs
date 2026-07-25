@@ -27,7 +27,7 @@
 //!   honestly carries `enroll:null` and labels that leg pending (§7).
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -59,6 +59,7 @@ const SERVICES_STATE_PREFIX: &str = "state/services/";
 const VERB_TIMEOUT: Duration = Duration::from_secs(6);
 const UNPAIR_HOVER_TIP: &str = "Removes this phone from the whole mesh";
 const PHONES_TOOLTIP_MAX_W: f32 = Style::SP_XL * 12.0;
+const MAX_SERVICE_MIRROR_BYTES: usize = 512 * 1024;
 
 /// The KDC overlay port every host binds (mirrors `kdc_host::KDC_PORT`) — shown in
 /// the pairing address.
@@ -1290,6 +1291,74 @@ fn services_dir(workgroup_root: &std::path::Path) -> PathBuf {
     workgroup_root.join("kdc-services")
 }
 
+/// Read one replicated service mirror through a bounded descriptor-backed
+/// regular-file boundary. The service directory is replicated input, so a
+/// corrupt or planted leaf must fail closed without reaching serde.
+fn read_bounded_service_mirror(path: &Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        options.custom_flags(0o400000); // O_NOFOLLOW
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        options.custom_flags(0x100); // O_NOFOLLOW
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        if !std::fs::symlink_metadata(path)?.file_type().is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "service mirror is not a regular file",
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    if !std::fs::symlink_metadata(path)?.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "service mirror is not a regular file",
+        ));
+    }
+
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "service mirror is not a regular file",
+        ));
+    }
+    if metadata.len() > MAX_SERVICE_MIRROR_BYTES as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("service mirror exceeds {MAX_SERVICE_MIRROR_BYTES}-byte limit"),
+        ));
+    }
+
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len())
+            .unwrap_or(MAX_SERVICE_MIRROR_BYTES)
+            .saturating_add(1),
+    );
+    file.take((MAX_SERVICE_MIRROR_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_SERVICE_MIRROR_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("service mirror exceeds {MAX_SERVICE_MIRROR_BYTES}-byte limit"),
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
 /// Read every node's published service set off the substrate (mirrors
 /// `service_directory::collect_all_services`). Junk / half-replicated files are
 /// skipped; sorted by hostname.
@@ -1303,7 +1372,7 @@ fn collect_nodes(workgroup_root: &std::path::Path) -> Vec<NodeMirror> {
         if path.extension().is_none_or(|x| x != "json") {
             continue;
         }
-        let Ok(raw) = std::fs::read_to_string(&path) else {
+        let Ok(raw) = read_bounded_service_mirror(&path) else {
             continue;
         };
         if let Ok(node) = serde_json::from_str::<NodeMirror>(&raw) {
@@ -2275,6 +2344,37 @@ mod tests {
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].node_host, "eagle");
         assert_eq!(nodes[0].shared_roots[0].entries[0].name, "a.txt");
+    }
+
+    #[test]
+    fn collect_nodes_skips_oversized_service_mirrors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = services_dir(tmp.path());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("oversized.json"),
+            vec![b'x'; MAX_SERVICE_MIRROR_BYTES + 1],
+        )
+        .unwrap();
+
+        assert!(collect_nodes(tmp.path()).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_nodes_skips_final_symlink_service_mirrors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = services_dir(tmp.path());
+        std::fs::create_dir_all(&dir).unwrap();
+        let outside = tmp.path().join("outside.json");
+        std::fs::write(
+            &outside,
+            r#"{"node_host":"outside","services":[],"shared_roots":[],"updated_ms":1}"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("linked.json")).unwrap();
+
+        assert!(collect_nodes(tmp.path()).is_empty());
     }
 
     #[test]

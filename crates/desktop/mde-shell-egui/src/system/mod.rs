@@ -87,6 +87,125 @@ const DOT: &str = "\u{25CF}";
 /// A coarse-but-responsive step — five taps span the range.
 const HOTKEY_STEP: i16 = 5;
 
+/// Keep local settings and the world-readable mesh snapshot bounded before any
+/// JSON deserializer materializes attacker-controlled input. The descriptor
+/// check + bounded read also closes the race where a regular file grows after
+/// its initial metadata snapshot.
+const MAX_LOCAL_CONFIG_BYTES: u64 = 64 * 1024;
+
+/// Read a local persisted text file from a descriptor without following a final
+/// symlink, accepting only regular files, and never allocating beyond the input
+/// bound. Callers intentionally fold every error to their existing safe default.
+fn read_bounded_local_config(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        options.custom_flags(0o400000); // O_NOFOLLOW
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        options.custom_flags(0x100); // O_NOFOLLOW
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        if !fs::symlink_metadata(path)
+            .map(|metadata| metadata.file_type().is_file())
+            .unwrap_or(false)
+        {
+            return None;
+        }
+    }
+    #[cfg(not(unix))]
+    if !fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_file())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+
+    let file = options.open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_LOCAL_CONFIG_BYTES {
+        return None;
+    }
+
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len())
+            .unwrap_or(MAX_LOCAL_CONFIG_BYTES as usize)
+            .saturating_add(1),
+    );
+    file.take(MAX_LOCAL_CONFIG_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_LOCAL_CONFIG_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+#[cfg(test)]
+mod persisted_config_tests {
+    use super::*;
+
+    #[test]
+    fn oversized_local_config_keeps_every_loader_on_safe_defaults() {
+        let dir = tempfile::tempdir().expect("temp config dir");
+        let path = dir.path().join("oversized.json");
+        fs::write(
+            &path,
+            vec![b'{'; usize::try_from(MAX_LOCAL_CONFIG_BYTES).unwrap() + 1],
+        )
+        .expect("write oversized config");
+
+        assert!(read_bounded_local_config(&path).is_none());
+        assert_eq!(SettingsNav::load_from(&path), SettingsNav::default());
+        assert_eq!(
+            MouseTouchConfig::load_from(&path),
+            MouseTouchConfig::default()
+        );
+        assert_eq!(
+            WallpaperServiceConfig::load_from(&path),
+            WallpaperServiceConfig::default()
+        );
+        assert_eq!(
+            RemoteProofingConfig::load_from(&path),
+            RemoteProofingConfig::default()
+        );
+        assert_eq!(
+            AppearanceConfig::load_from(&path),
+            AppearanceConfig::default()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_symlink_is_rejected_before_any_loader_deserializes_it() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("temp config dir");
+        let target = dir.path().join("outside.json");
+        let link = dir.path().join("settings.json");
+        fs::write(&target, b"{}").expect("write target config");
+        symlink(&target, &link).expect("create final symlink");
+
+        assert!(read_bounded_local_config(&link).is_none());
+        assert_eq!(SettingsNav::load_from(&link), SettingsNav::default());
+    }
+
+    #[test]
+    fn non_regular_local_config_is_rejected() {
+        let dir = tempfile::tempdir().expect("temp config dir");
+
+        assert!(read_bounded_local_config(dir.path()).is_none());
+    }
+}
+
 // ──────────────────────────── the System state ────────────────────────────
 
 /// The System surface's live state: the ONE [`Seat`] (lock 1) plus its latest
@@ -342,7 +461,8 @@ impl SystemState {
             // world-readable snapshot the chrome bar reads (SETTINGS-4, §6). A
             // missing / unreadable file folds to the honest unseen facts, never a
             // panic — mirroring the This Node / Network planes' tolerance.
-            let mesh_snapshot = fs::read_to_string(MESH_STATUS_PATH).unwrap_or_default();
+            let mesh_snapshot =
+                read_bounded_local_config(Path::new(MESH_STATUS_PATH)).unwrap_or_default();
             self.mesh = MeshFacts::project(&mesh_snapshot);
         }
         // WL-SEC-002 — reflect the federation_enforcer worker's retained cross-mesh
@@ -1467,8 +1587,7 @@ impl SettingsNav {
     /// Load from `path`, folding a missing / malformed file to the default (never a
     /// fatal) and normalising the group against the section.
     fn load_from(path: &Path) -> Self {
-        fs::read_to_string(path)
-            .ok()
+        read_bounded_local_config(path)
             .and_then(|s| serde_json::from_str::<Self>(&s).ok())
             .map_or_else(Self::default, Self::normalized)
     }
@@ -1642,8 +1761,7 @@ impl MouseTouchConfig {
 
     /// Load from `path`, folding missing / malformed data to sensitivity-safe defaults.
     fn load_from(path: &Path) -> Self {
-        fs::read_to_string(path)
-            .ok()
+        read_bounded_local_config(path)
             .and_then(|s| serde_json::from_str::<Self>(&s).ok())
             .map_or_else(Self::default, Self::normalized)
     }
@@ -1759,8 +1877,7 @@ impl WallpaperServiceConfig {
     }
 
     fn load_from(path: &Path) -> Self {
-        fs::read_to_string(path)
-            .ok()
+        read_bounded_local_config(path)
             .and_then(|s| serde_json::from_str::<Self>(&s).ok())
             .map_or_else(Self::default, Self::normalized)
     }
@@ -2293,8 +2410,7 @@ impl RemoteProofingConfig {
 
     /// Load from `path`, folding missing / malformed data to conservative defaults.
     fn load_from(path: &Path) -> Self {
-        fs::read_to_string(path)
-            .ok()
+        read_bounded_local_config(path)
             .and_then(|s| serde_json::from_str::<Self>(&s).ok())
             .map_or_else(Self::default, Self::normalized)
     }
@@ -2617,8 +2733,7 @@ impl AppearanceConfig {
     /// Load from `path`, folding a missing / malformed file to the default (never a
     /// fatal) — the `#[serde(default)]` fields also tolerate a partial / drifted file.
     fn load_from(path: &Path) -> Self {
-        fs::read_to_string(path)
-            .ok()
+        read_bounded_local_config(path)
             .and_then(|s| serde_json::from_str::<Self>(&s).ok())
             .unwrap_or_default()
     }

@@ -33,7 +33,7 @@
 //! `project` is pure (no IO, no egui, no GPU), so it's unit-tested directly; the
 //! only IO is the snapshot read in [`ProvisioningState::poll`].
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use mde_egui::egui::{self, Color32, RichText};
@@ -45,6 +45,12 @@ use serde_json::Value;
 /// This Node / Network planes read (the desktop user can't read the root-only
 /// replicated peer directory).
 const SNAPSHOT_PATH: &str = "/run/mde/mesh-status.json";
+
+/// Keep the world-readable snapshot finite before handing it to the JSON
+/// parser. A healthy fleet snapshot is substantially smaller than this, while
+/// the limit prevents a malformed or replaced leaf from becoming a shell-side
+/// allocation.
+const MAX_PROVISIONING_SNAPSHOT_BYTES: usize = 1024 * 1024;
 
 /// Poll cadence — a node enrolling, a role pin, or an update landing surfaces
 /// within this window. Matches the chrome bar + the This Node / Network / Fleet
@@ -287,12 +293,86 @@ impl ProvisioningState {
         let due = self.last_poll.is_none_or(|t| t.elapsed() >= REFRESH);
         if due {
             self.last_poll = Some(Instant::now());
-            let snapshot = std::fs::read_to_string(&self.snapshot_path).unwrap_or_default();
+            let snapshot = read_snapshot(&self.snapshot_path).unwrap_or_default();
             self.status = ProvStatus::project(&snapshot, &self.local_host);
         }
         ctx.request_repaint_after(REFRESH);
     }
+}
 
+/// Read the world-readable snapshot through a bounded descriptor-backed
+/// boundary. The final path component is opened without following symlinks on
+/// platforms that expose `O_NOFOLLOW`; the descriptor is then checked again so
+/// a directory, device, or oversized replacement cannot reach `serde_json`.
+fn read_snapshot(path: &Path) -> std::io::Result<String> {
+    use std::io::{Error, ErrorKind, Read as _};
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(0o400000); // O_NOFOLLOW
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(0x100); // O_NOFOLLOW
+    }
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        ))
+    ))]
+    if !std::fs::symlink_metadata(path)?.file_type().is_file() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "mesh provisioning snapshot is not a regular file",
+        ));
+    }
+    #[cfg(not(unix))]
+    if !std::fs::symlink_metadata(path)?.file_type().is_file() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "mesh provisioning snapshot is not a regular file",
+        ));
+    }
+
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "mesh provisioning snapshot is not a regular file",
+        ));
+    }
+    if metadata.len() > MAX_PROVISIONING_SNAPSHOT_BYTES as u64 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "mesh provisioning snapshot exceeds its byte limit",
+        ));
+    }
+
+    let mut bytes = Vec::with_capacity(
+        MAX_PROVISIONING_SNAPSHOT_BYTES
+            .min(usize::try_from(metadata.len()).unwrap_or(MAX_PROVISIONING_SNAPSHOT_BYTES)),
+    );
+    file.take((MAX_PROVISIONING_SNAPSHOT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_PROVISIONING_SNAPSHOT_BYTES {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "mesh provisioning snapshot exceeds its byte limit",
+        ));
+    }
+    String::from_utf8(bytes).map_err(|error| Error::new(ErrorKind::InvalidData, error))
+}
+
+impl ProvisioningState {
     /// The fleet-wide update target (`latest_version`), when the snapshot has
     /// named one — the same live projection the version card renders, surfaced
     /// read-only for the MENU-1 "State of the Mesh" bar's revision chip (§6).
@@ -577,6 +657,54 @@ mod tests {
             let s = ProvStatus::project(bad, "this-node");
             assert!(!s.seen, "{bad:?} must not read as a live snapshot");
         }
+    }
+
+    #[test]
+    fn poll_treats_oversized_snapshot_as_unseen() {
+        let dir = tempfile::tempdir().expect("snapshot directory");
+        let path = dir.path().join("mesh-status.json");
+        std::fs::write(&path, vec![b'{'; MAX_PROVISIONING_SNAPSHOT_BYTES + 1])
+            .expect("write oversized snapshot");
+
+        let mut state = ProvisioningState {
+            snapshot_path: path.clone(),
+            local_host: "fallback".to_string(),
+            status: ProvStatus::default(),
+            last_poll: None,
+        };
+        state.poll(&egui::Context::default());
+
+        assert!(read_snapshot(&path).is_err());
+        assert!(
+            !state.status.seen,
+            "oversized input keeps the unseen fallback"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn poll_rejects_a_final_symlink_as_unseen() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("snapshot directory");
+        let target = dir.path().join("target.json");
+        let link = dir.path().join("mesh-status.json");
+        std::fs::write(&target, r#"{"self":"target","nodes":[]}"#).expect("write target snapshot");
+        symlink(&target, &link).expect("create final symlink");
+
+        let mut state = ProvisioningState {
+            snapshot_path: link.clone(),
+            local_host: "fallback".to_string(),
+            status: ProvStatus::default(),
+            last_poll: None,
+        };
+        state.poll(&egui::Context::default());
+
+        assert!(read_snapshot(&link).is_err());
+        assert!(
+            !state.status.seen,
+            "final symlink keeps the unseen fallback"
+        );
     }
 
     #[test]

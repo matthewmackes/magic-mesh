@@ -42,7 +42,7 @@
 //! `project` is pure (no IO, no egui, no GPU), so it's unit-tested directly; the
 //! IO is the snapshot read + the vehicle-mirror fold, both in [`NetworkState::poll`].
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use mackes_mesh_types::vehicle::{CellLink, VehicleState, VEHICLE_STATE_PREFIX};
@@ -57,6 +57,11 @@ use crate::bus_reader::BusReader;
 /// This Node plane read (the desktop user can't read the root-only replicated
 /// peer directory).
 const SNAPSHOT_PATH: &str = "/run/mde/mesh-status.json";
+
+/// The snapshot is a compact world-readable projection, not an unbounded
+/// document. Keep the shell's parse boundary finite even if the producer or a
+/// replacement file is faulty.
+const MAX_SNAPSHOT_BYTES: usize = 64 * 1024;
 
 /// Poll cadence — a peer join/leave, a leader change, or a service flip surfaces
 /// within this window. Matches the chrome bar + the This Node / Fleet poll; the
@@ -332,7 +337,7 @@ impl NetworkState {
         let due = self.last_poll.is_none_or(|t| t.elapsed() >= REFRESH);
         if due {
             self.last_poll = Some(Instant::now());
-            let snapshot = std::fs::read_to_string(&self.snapshot_path).unwrap_or_default();
+            let snapshot = read_bounded_snapshot(&self.snapshot_path).unwrap_or_default();
             self.status = NetStatus::project(&snapshot, &self.local_host);
             self.vehicles = read_vehicle_mirrors(self.bus_root.clone());
         }
@@ -343,6 +348,84 @@ impl NetworkState {
     pub(crate) fn show(&self, ui: &mut egui::Ui) {
         show_status(ui, &self.status, &self.vehicles);
     }
+}
+
+/// Read the world-readable snapshot through a bounded descriptor-backed
+/// boundary. The final path component is opened without following a symlink,
+/// then the descriptor is checked for a regular file before at most one byte
+/// beyond the snapshot cap is read. A replaced or growing file therefore fails
+/// closed before serde can materialize attacker-controlled input.
+fn read_bounded_snapshot(path: &Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        options.custom_flags(0o400000); // O_NOFOLLOW
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        options.custom_flags(0x100); // O_NOFOLLOW
+
+        // Keep unsupported Unix targets fail-closed for final symlink leaves
+        // when their standard library does not expose O_NOFOLLOW here.
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        if !std::fs::symlink_metadata(path)?.file_type().is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "mesh-status snapshot is not a regular file",
+            ));
+        }
+    }
+
+    #[cfg(not(unix))]
+    if !std::fs::symlink_metadata(path)?.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "mesh-status snapshot is not a regular file",
+        ));
+    }
+
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "mesh-status snapshot is not a regular file",
+        ));
+    }
+    if metadata.len() > MAX_SNAPSHOT_BYTES as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "mesh-status snapshot exceeds its byte limit",
+        ));
+    }
+
+    let mut bytes = Vec::with_capacity(
+        MAX_SNAPSHOT_BYTES.min(usize::try_from(metadata.len()).unwrap_or(MAX_SNAPSHOT_BYTES)),
+    );
+    file.take((MAX_SNAPSHOT_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_SNAPSHOT_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "mesh-status snapshot exceeds its byte limit",
+        ));
+    }
+    String::from_utf8(bytes).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("mesh-status snapshot is not UTF-8: {error}"),
+        )
+    })
 }
 
 /// Fold every `state/vehicle/<node>` mirror on the Bus into a stable,
@@ -1096,6 +1179,42 @@ mod tests {
             "no vehicle mirrors before the first poll"
         );
         assert!(st.last_poll.is_none());
+    }
+
+    #[test]
+    fn network_poll_rejects_oversized_snapshot_and_keeps_unseen_fallback() {
+        let dir = tempfile::tempdir().expect("snapshot tempdir");
+        let path = dir.path().join("mesh-status.json");
+        std::fs::write(&path, vec![b'x'; MAX_SNAPSHOT_BYTES + 1]).expect("oversized snapshot");
+
+        let mut state = NetworkState::default();
+        state.snapshot_path = path;
+        state.bus_root = None;
+        state.poll(&egui::Context::default());
+
+        assert!(
+            !state.status.seen,
+            "oversized input must keep the unseen state"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn network_poll_rejects_final_symlink_snapshot_and_keeps_unseen_fallback() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("snapshot tempdir");
+        let target = dir.path().join("real-mesh-status.json");
+        let link = dir.path().join("mesh-status.json");
+        std::fs::write(&target, snapshot("this-node", "this-node")).expect("real snapshot");
+        symlink(&target, &link).expect("snapshot symlink");
+
+        let mut state = NetworkState::default();
+        state.snapshot_path = link;
+        state.bus_root = None;
+        state.poll(&egui::Context::default());
+
+        assert!(!state.status.seen, "final symlink input must be rejected");
     }
 
     // ──────────────────────── vehicle-gateway WAN card ─────────────────────

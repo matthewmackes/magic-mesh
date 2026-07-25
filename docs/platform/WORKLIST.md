@@ -1555,6 +1555,16 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-006 - Construct interface (Apple-HIG-principled workstation shell)
 
 - Status: Remaining
+- Progress (2026-07-25 shell persisted-state boundary): the Springboard Dock
+  preference, Network and Provisioning mesh snapshots, System settings and mesh
+  status, and replicated Phones Hub service mirrors now pass through bounded
+  descriptor-backed regular-file readers that reject final symlinks, non-regular
+  leaves, oversized input, and invalid UTF-8 before JSON materialization while
+  preserving the existing floating/unseen/default fallbacks. Focused farm
+  evidence is green at **13/13** navigation tests, **3/3** persisted-config
+  tests, and **25/25** Phones Hub tests; the integrated shell gate is green at
+  **1,778/1,778**. Live pointer, pixel, physical, and VDI acceptance remain
+  external evidence.
 - Progress (2026-07-25 auto-rotation sensor boundary): shared SysfsAccel reads
   now reject final symlinks and values above 128 bytes before UTF-8/float
   parsing, preserving honest absent/read errors. The full farm formfactor slice
