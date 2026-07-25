@@ -4,6 +4,35 @@
 //! only the location moved.
 use crate::*;
 
+/// Keep operator-provided secret material bounded before it reaches the store
+/// or the Argon2id envelope. The armored form has room for base64 expansion and
+/// framing around the bounded plaintext form.
+const MAX_SECRET_PLAINTEXT_BYTES: usize = 1024 * 1024;
+const MAX_SECRET_ARMORED_BYTES: usize = 2 * 1024 * 1024;
+const MAX_PASSPHRASE_FILE_BYTES: usize = 64 * 1024;
+
+fn read_bounded_input(
+    reader: impl std::io::Read,
+    max_bytes: usize,
+    label: &str,
+) -> anyhow::Result<Vec<u8>> {
+    use std::io::Read as _;
+
+    let mut bytes = Vec::with_capacity(max_bytes.min(64 * 1024));
+    reader
+        .take(
+            u64::try_from(max_bytes)
+                .unwrap_or(u64::MAX)
+                .saturating_add(1),
+        )
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading {label}"))?;
+    if bytes.len() > max_bytes {
+        anyhow::bail!("{label} exceeds {max_bytes}-byte limit");
+    }
+    Ok(bytes)
+}
+
 /// DATACENTER-3 — seal/read a leader-managed mesh secret from the CLI. `put` reads
 /// plaintext from stdin and age-encrypts it; `get` decrypts to stdout (exit 3 if
 /// absent). `--local` forces the Syncthing-replicated LocalAead store so a repo
@@ -28,9 +57,12 @@ pub fn run(cmd: SecretCmd) -> anyhow::Result<()> {
             let store = store_for(local);
             mackesd_core::ipc::secret_store::SecretStore::validate_name(&name)
                 .map_err(|e| anyhow::anyhow!(e))?;
-            let mut plaintext = String::new();
-            std::io::Read::read_to_string(&mut std::io::stdin(), &mut plaintext)
-                .context("reading secret plaintext from stdin")?;
+            let plaintext = String::from_utf8(read_bounded_input(
+                std::io::stdin().lock(),
+                MAX_SECRET_PLAINTEXT_BYTES,
+                "secret plaintext from stdin",
+            )?)
+            .context("secret plaintext from stdin is not UTF-8")?;
             store
                 .put(&name, &plaintext)
                 .map_err(|e| anyhow::anyhow!(e))?;
@@ -123,9 +155,12 @@ fn read_passphrase_file(path: &std::path::Path) -> anyhow::Result<String> {
             );
         }
     }
-    let mut raw = String::new();
-    std::io::Read::read_to_string(&mut file, &mut raw)
-        .with_context(|| format!("reading passphrase file {}", path.display()))?;
+    let raw = String::from_utf8(read_bounded_input(
+        &mut file,
+        MAX_PASSPHRASE_FILE_BYTES,
+        &format!("passphrase file {}", path.display()),
+    )?)
+    .with_context(|| format!("passphrase file {} is not UTF-8", path.display()))?;
     // Take the first line; strip a single trailing CR/LF pair, not interior bytes.
     let phrase = raw.lines().next().unwrap_or("").to_string();
     if phrase.is_empty() {
@@ -150,12 +185,12 @@ fn read_passphrase_file(path: &std::path::Path) -> anyhow::Result<String> {
 /// The plaintext is held only in-process and never logged; only its byte length
 /// is reported on stderr.
 pub fn seal(passphrase_file: &std::path::Path) -> anyhow::Result<()> {
-    use std::io::Read as _;
     let passphrase = read_passphrase_file(passphrase_file)?;
-    let mut plaintext = Vec::new();
-    std::io::stdin()
-        .read_to_end(&mut plaintext)
-        .context("reading plaintext bytes from stdin")?;
+    let plaintext = read_bounded_input(
+        std::io::stdin().lock(),
+        MAX_SECRET_PLAINTEXT_BYTES,
+        "secret-seal plaintext",
+    )?;
     if plaintext.is_empty() {
         anyhow::bail!("secret-seal: stdin was empty — nothing to seal");
     }
@@ -180,12 +215,14 @@ pub fn seal(passphrase_file: &std::path::Path) -> anyhow::Result<()> {
 /// passphrase or a tampered bundle surfaces as the existing AEAD error and emits
 /// NO plaintext.
 pub fn unseal(passphrase_file: &std::path::Path) -> anyhow::Result<()> {
-    use std::io::{Read as _, Write as _};
+    use std::io::Write as _;
     let passphrase = read_passphrase_file(passphrase_file)?;
-    let mut armored = String::new();
-    std::io::stdin()
-        .read_to_string(&mut armored)
-        .context("reading armored bundle from stdin")?;
+    let armored = String::from_utf8(read_bounded_input(
+        std::io::stdin().lock(),
+        MAX_SECRET_ARMORED_BYTES,
+        "secret-unseal armored bundle",
+    )?)
+    .context("secret-unseal armored bundle from stdin is not UTF-8")?;
     let binary = mackesd_core::ca::backup::dearmor(&armored)
         .map_err(|e| anyhow::anyhow!("secret-unseal: {e}"))?;
     let plain = mackesd_core::ca::backup::unseal_bytes(&passphrase, &binary)
@@ -198,7 +235,31 @@ pub fn unseal(passphrase_file: &std::path::Path) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::read_passphrase_file;
+    use super::{read_bounded_input, read_passphrase_file, MAX_SECRET_PLAINTEXT_BYTES};
+
+    #[test]
+    fn stdin_reader_accepts_exact_limit_and_rejects_overflow() {
+        let exact = vec![b'x'; MAX_SECRET_PLAINTEXT_BYTES];
+        assert_eq!(
+            read_bounded_input(
+                std::io::Cursor::new(exact),
+                MAX_SECRET_PLAINTEXT_BYTES,
+                "secret",
+            )
+            .unwrap()
+            .len(),
+            MAX_SECRET_PLAINTEXT_BYTES
+        );
+
+        let oversized = vec![b'x'; MAX_SECRET_PLAINTEXT_BYTES + 1];
+        let error = read_bounded_input(
+            std::io::Cursor::new(oversized),
+            MAX_SECRET_PLAINTEXT_BYTES,
+            "secret",
+        )
+        .expect_err("oversized stdin must fail closed");
+        assert!(error.to_string().contains("exceeds"));
+    }
 
     #[cfg(unix)]
     #[test]

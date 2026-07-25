@@ -34,6 +34,13 @@ use std::process::{Command, Stdio};
 
 const MAX_SECRET_NAME_BYTES: usize = 192;
 
+/// Keep local ciphertext reads bounded while leaving room for the existing
+/// secret plaintext ceiling plus the MNCA envelope's fixed framing and AEAD
+/// tag. The extra byte read below is intentional: it detects a file that grows
+/// past the limit after the descriptor is opened without allocating unbounded
+/// storage.
+const MAX_SECRET_CIPHERTEXT_BYTES: usize = 1024 * 1024 + 64;
+
 /// The path (relative to the repo root) of the mesh secret-store helper.
 ///
 /// Single-sourced so a move only touches one line; matches the path the other
@@ -417,14 +424,13 @@ fn read_regular_no_follow(path: &Path) -> std::io::Result<Vec<u8>> {
     #[cfg(unix)]
     {
         use rustix::fs::{Mode, OFlags};
-        use std::io::Read as _;
 
         let fd = rustix::fs::open(
             path,
             OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )?;
-        let mut file: std::fs::File = fd.into();
+        let file: std::fs::File = fd.into();
         let metadata = file.metadata()?;
         if !metadata.is_file() {
             return Err(std::io::Error::new(
@@ -432,14 +438,31 @@ fn read_regular_no_follow(path: &Path) -> std::io::Result<Vec<u8>> {
                 "secret path is not a regular file",
             ));
         }
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
-        Ok(bytes)
+        read_bounded_ciphertext(file)
     }
     #[cfg(not(unix))]
     {
-        std::fs::read(path)
+        read_bounded_ciphertext(std::fs::File::open(path)?)
     }
+}
+
+/// Read at most one sentinel byte beyond the local ciphertext ceiling. On
+/// Unix this runs on the already-open `O_NOFOLLOW` descriptor; on other
+/// platforms it preserves the prior `File::open` symlink behavior while still
+/// preventing an unbounded allocation.
+fn read_bounded_ciphertext(file: impl std::io::Read) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(MAX_SECRET_CIPHERTEXT_BYTES + 1);
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(file, (MAX_SECRET_CIPHERTEXT_BYTES + 1) as u64),
+        &mut bytes,
+    )?;
+    if bytes.len() > MAX_SECRET_CIPHERTEXT_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("secret ciphertext exceeds {MAX_SECRET_CIPHERTEXT_BYTES}-byte limit"),
+        ));
+    }
+    Ok(bytes)
 }
 
 /// Write an encrypted blob without following a target/temp symlink. The
@@ -811,6 +834,22 @@ mod tests {
             .unwrap()
             .file_type()
             .is_symlink());
+    }
+
+    #[test]
+    fn local_ciphertext_reader_accepts_exact_limit_and_rejects_one_byte_over() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exact = tmp.path().join("exact.age");
+        let oversized = tmp.path().join("oversized.age");
+        std::fs::write(&exact, vec![0xA5; MAX_SECRET_CIPHERTEXT_BYTES]).unwrap();
+        std::fs::write(&oversized, vec![0xA5; MAX_SECRET_CIPHERTEXT_BYTES + 1]).unwrap();
+
+        let bytes = read_regular_no_follow(&exact).unwrap();
+        assert_eq!(bytes.len(), MAX_SECRET_CIPHERTEXT_BYTES);
+
+        let error = read_regular_no_follow(&oversized).expect_err("oversized ciphertext");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeds"));
     }
 
     #[test]

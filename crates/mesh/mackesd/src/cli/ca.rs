@@ -3,6 +3,28 @@
 //! Extracted verbatim from `main()` in `bin/mackesd.rs` (arch-1 SLICE 1:
 //! CLI verb handlers). Behaviour is unchanged; only the location moved.
 use crate::*;
+use std::io::Read;
+
+/// Keep stdin imports under the same ceiling as the existing bounded file
+/// reader. The limit is applied to bytes before UTF-8 materialization or
+/// dearmor, so a hostile pipe cannot grow an unbounded `String` first.
+const MAX_IMPORT_ARMOR_BYTES: u64 = mackesd_core::ca::seal::MAX_SEALED_FILE_BYTES;
+
+fn read_armored_stdin() -> anyhow::Result<String> {
+    read_armored_reader(std::io::stdin().lock())
+}
+
+fn read_armored_reader<R: Read>(reader: R) -> anyhow::Result<String> {
+    let mut bytes = Vec::new();
+    reader
+        .take(MAX_IMPORT_ARMOR_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .context("import: reading armored bundle from stdin")?;
+    if bytes.len() as u64 > MAX_IMPORT_ARMOR_BYTES {
+        anyhow::bail!("import: armored bundle from stdin exceeds {MAX_IMPORT_ARMOR_BYTES}-byte limit; provide a smaller bundle and retry");
+    }
+    String::from_utf8(bytes).context("import: armored bundle from stdin is not valid UTF-8")
+}
 
 /// Handle the `ca` subcommand.
 #[allow(unreachable_code)]
@@ -231,12 +253,7 @@ pub fn run(sub: CaCmd, db_path: PathBuf) -> anyhow::Result<()> {
                             format!("read {}: input is not UTF-8", path.display())
                         })?
                     }
-                    None => {
-                        use std::io::Read;
-                        let mut s = String::new();
-                        std::io::stdin().read_to_string(&mut s)?;
-                        s
-                    }
+                    None => read_armored_stdin()?,
                 };
                 let sealed = mackesd_core::ca::backup::dearmor(&armored)
                     .map_err(|e| anyhow::anyhow!("import: dearmor: {e}"))?;
@@ -499,4 +516,32 @@ pub fn run(sub: CaCmd, db_path: PathBuf) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{read_armored_reader, MAX_IMPORT_ARMOR_BYTES};
+    use std::io::Cursor;
+
+    #[test]
+    fn armored_stdin_reader_preserves_normal_bundle_text() {
+        let bundle = "-----BEGIN MACKES NEBULA CA EXPORT-----\nsmall\n";
+
+        let read = read_armored_reader(Cursor::new(bundle.as_bytes()))
+            .expect("normal armored bundle should be read unchanged");
+
+        assert_eq!(read, bundle);
+    }
+
+    #[test]
+    fn armored_stdin_reader_rejects_oversized_bundle_before_dearmor() {
+        let oversized = vec![b'x'; (MAX_IMPORT_ARMOR_BYTES + 1) as usize];
+
+        let error = read_armored_reader(Cursor::new(oversized))
+            .expect_err("oversized stdin bundle must fail closed");
+        let message = error.to_string();
+        assert!(message.contains("armored bundle from stdin"));
+        assert!(message.contains("exceeds"));
+        assert!(message.contains(&MAX_IMPORT_ARMOR_BYTES.to_string()));
+    }
 }

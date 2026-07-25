@@ -251,6 +251,15 @@ These decisions refine acceptance and sequencing for the active items below.
   existing no-follow and permission checks. Oversized public/sealed material is
   rejected before PEM/JSON materialization; the focused BigBoy seal gate is
   green at 15/15. Live rotation/reconnect evidence remains external.
+- Progress (2026-07-24 secret and CA import allocation boundary): secret CLI
+  stdin/passphrase/armored inputs, local ciphertext reads, CA backup armor and
+  plaintext, and CA import stdin now enforce explicit byte ceilings before
+  UTF-8, dearmor, decryption, or JSON materialization. Exact-limit and
+  one-byte-over regressions are covered; the focused BigBoy gates are green at
+  3/3 CLI tests, 14/14 local-store tests, and 31/31 CA-backup tests, while the
+  integrated `mackesd` gate is green at 4,001 library tests (1 ignored), 36 CLI
+  tests, and all enabled integration suites. Live rotation/reconnect evidence
+  remains external.
 - Progress (2026-07-24 replicated-topology input hardening): Nebula hop
   advertisements now impose byte, roster, identity, overlay-IP, CIDR, subnet,
   duplicate-row, and duplicate-subnet boundaries before route derivation; an

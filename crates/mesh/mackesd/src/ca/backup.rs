@@ -64,6 +64,23 @@ pub use mde_seal::{
     SALT_LEN,
 };
 
+/// Maximum ASCII-armored input accepted by the CA backup parser. This leaves
+/// room for the 64-column base64 expansion of a one-megabyte plaintext bundle,
+/// its binary envelope, and the armor headers without allowing a pasted blob
+/// to become an unbounded body `String` allocation.
+pub const MAX_ARMORED_INPUT_BYTES: usize = 2 * 1024 * 1024;
+
+/// Maximum JSON plaintext accepted by the typed CA backup parser. A CA export
+/// for the supported fleet is substantially smaller; the cap is deliberately
+/// generous for future certificate metadata while bounding deserialization.
+pub const MAX_UNSEALED_PLAINTEXT_BYTES: usize = 1024 * 1024;
+
+// XChaCha20-Poly1305 appends a fixed 128-bit authentication tag to ciphertext.
+// Keep this local to the wrapper because `mde_seal::unseal_bytes` is also used
+// by binary secret-store callers that do not use the typed JSON boundary.
+const AEAD_TAG_BYTES: usize = 16;
+const MAX_SEALED_BUNDLE_BYTES: usize = HEADER_LEN + MAX_UNSEALED_PLAINTEXT_BYTES + AEAD_TAG_BYTES;
+
 /// Plaintext JSON the [`seal`] caller hands in. The CA mint
 /// path writes its own files separately; this format is the
 /// off-cluster shareable copy.
@@ -151,7 +168,20 @@ pub fn seal(passphrase: &str, plaintext: &BundlePlaintext) -> Result<Vec<u8>, Ba
 /// error is indistinguishable, and exposing the distinction
 /// would help an attacker confirm a tamper attempt).
 pub fn unseal(passphrase: &str, sealed: &[u8]) -> Result<BundlePlaintext, BackupError> {
+    // The envelope is length-preserving apart from the fixed AEAD tag. Reject
+    // an oversized frame before the shared decryptor can allocate its output.
+    // Keep the established Json error variant for the typed plaintext path.
+    if sealed.len() > MAX_SEALED_BUNDLE_BYTES {
+        return Err(BackupError::Json(format!(
+            "unsealed backup plaintext exceeds {MAX_UNSEALED_PLAINTEXT_BYTES} bytes"
+        )));
+    }
     let plain_bytes = unseal_bytes(passphrase, sealed)?;
+    if plain_bytes.len() > MAX_UNSEALED_PLAINTEXT_BYTES {
+        return Err(BackupError::Json(format!(
+            "unsealed backup plaintext exceeds {MAX_UNSEALED_PLAINTEXT_BYTES} bytes"
+        )));
+    }
     serde_json::from_slice(&plain_bytes).map_err(|e| BackupError::Json(e.to_string()))
 }
 
@@ -196,6 +226,11 @@ pub fn dearmor(armored: &str) -> Result<Vec<u8>, BackupError> {
         return Err(BackupError::Armor(
             "missing END delimiter — input is an incomplete Mackes Nebula CA bundle".into(),
         ));
+    }
+    if armored.len() > MAX_ARMORED_INPUT_BYTES {
+        return Err(BackupError::Armor(format!(
+            "armored input exceeds {MAX_ARMORED_INPUT_BYTES} bytes"
+        )));
     }
     let body: String = armored
         .lines()
@@ -568,6 +603,25 @@ mod tests {
     }
 
     #[test]
+    fn dearmor_accepts_exact_input_limit_and_rejects_one_byte_over() {
+        let mut exact = armor(&[1, 2, 3], 0);
+        exact.extend(std::iter::repeat(' ').take(MAX_ARMORED_INPUT_BYTES - exact.len()));
+        assert_eq!(exact.len(), MAX_ARMORED_INPUT_BYTES);
+        assert_eq!(
+            dearmor(&exact).expect("exact armor limit must decode"),
+            vec![1, 2, 3]
+        );
+
+        let mut oversized = exact;
+        oversized.push(' ');
+        let error = dearmor(&oversized).expect_err("armor over the limit must fail closed");
+        assert!(matches!(
+            error,
+            BackupError::Armor(message) if message.contains("armored input exceeds")
+        ));
+    }
+
+    #[test]
     fn dearmor_rejects_missing_delimiters() {
         let r = dearmor("not an armored bundle");
         assert!(matches!(r, Err(BackupError::Armor(_))));
@@ -606,6 +660,42 @@ mod tests {
         let decoded = dearmor(&envelope).expect("dearmor");
         let back = unseal("correct horse battery staple", &decoded).expect("unseal");
         assert_eq!(back, pt);
+    }
+
+    fn plaintext_with_json_len(target_len: usize) -> BundlePlaintext {
+        let mut plaintext = sample_plaintext();
+        let current_len = serde_json::to_vec(&plaintext)
+            .expect("sample plaintext must serialize")
+            .len();
+        plaintext
+            .mesh_id
+            .extend(std::iter::repeat('x').take(target_len - current_len));
+        assert_eq!(
+            serde_json::to_vec(&plaintext)
+                .expect("sized plaintext must serialize")
+                .len(),
+            target_len
+        );
+        plaintext
+    }
+
+    #[test]
+    fn unseal_accepts_exact_plaintext_limit_and_rejects_one_byte_over() {
+        let exact = plaintext_with_json_len(MAX_UNSEALED_PLAINTEXT_BYTES);
+        let sealed = seal("plaintext-boundary", &exact).expect("seal exact plaintext");
+        assert_eq!(
+            unseal("plaintext-boundary", &sealed).expect("exact plaintext limit must unseal"),
+            exact
+        );
+
+        let oversized = plaintext_with_json_len(MAX_UNSEALED_PLAINTEXT_BYTES + 1);
+        let sealed = seal("plaintext-boundary", &oversized).expect("seal oversized plaintext");
+        let error = unseal("plaintext-boundary", &sealed)
+            .expect_err("plaintext over the limit must fail closed");
+        assert!(matches!(
+            error,
+            BackupError::Json(message) if message.contains("unsealed backup plaintext exceeds")
+        ));
     }
 
     // ---- DAR-2: the `secret-seal`/`secret-unseal` thin-CLI path ----
