@@ -1171,6 +1171,11 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-012 - Maps live-data overlays (zero-cost external feeds)
 
 - Status: Remaining
+- Progress (2026-07-25 shared typography adoption): transit and Caltrans camera
+  overlay labels/badges now resolve through the shared `TypographyRole::Caption`
+  ramp, while technical distance readouts remain monospace at their existing
+  size. The final Maps farm suite is green at **215/215**; keyed provider and
+  MG90-backed live acceptance remains external evidence.
 - Progress (2026-07-24 Airspace publish boundary): the `mackesd` Airspace
   worker now rejects malformed contacts before JSON publication, trims valid
   contact rows to the 64 KiB snapshot bound, and publishes an explicit bounded
@@ -1459,6 +1464,15 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-006 - Construct interface (Apple-HIG-principled workstation shell)
 
 - Status: Remaining
+- Progress (2026-07-25 shared typography adoption): the menu bar now uses the
+  shared semantic typography contract for its mono workspace title, tracked
+  menu labels, captions, menu items, and status chips; shared toast/widgets,
+  IaC service/desktop workload views, and Maps overlay labels use the same
+  `TypographyRole` ramp while preserving monospace technical values and the
+  existing geometry. Final farm evidence is green at **247/247** for
+  `mde-egui`, **1,763/1,763** for the shell binary test suite, and a final
+  shell `cargo check` after the last test-only import cleanup; live pixel and
+  physical acceptance remains external evidence.
 - Progress (2026-07-24 NavigationBar Title3 alignment): shared NavigationBar
   standard titles now render on `Style::TYPE_TITLE3`, matching the Workbench
   content-pane contract. The focused mde-egui navigation gate is green at 5/5

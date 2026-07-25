@@ -4,9 +4,12 @@
 //! these instead of re-typing the same idiom, so a look lives in ONE place
 //! (§6 glue; `/polish` axis 7 — component reuse & consolidation).
 
-use egui::{Color32, CornerRadius, Frame, Margin, Response, RichText, Sense, Ui};
+use egui::{Color32, CornerRadius, Frame, Margin, Response, Sense, Ui};
 
-use crate::{style::Elevation, Style};
+use crate::{
+    style::{Elevation, TypographyRole},
+    Style,
+};
 
 // ── Surface primitives (UI-VIS-111) ─────────────────────────────────────────
 // The shared replacements for a hand-rolled `egui::Frame::group` / bordered
@@ -107,16 +110,19 @@ pub fn overlay() -> Frame {
 /// A **muted note** — a dim, small-caption label — returning its [`Response`].
 ///
 /// This is the single source for the "honestly empty / not-yet-reported" panel
-/// state (and any small secondary caption): [`Style::TEXT_DIM`] at the
-/// [`Style::SMALL`] type size. It consolidates the
-/// `ui.colored_label(Style::TEXT_DIM, RichText::new(msg).size(Style::SMALL))`
+/// state (and any small secondary caption): [`Style::TEXT_DIM`] at the shared
+/// `Caption` type size. It consolidates the
+/// `ui.colored_label(Style::TEXT_DIM, Style::typography_text(msg, Caption))`
 /// idiom that was hand-rolled across every surface — restyle the empty/caption
 /// look in one place now, and every panel follows.
 ///
 /// Use it for a genuinely-empty state (no data yet), NOT as a stand-in for real
 /// content (§7 — a muted note is an honest "nothing here", never a mockup).
 pub fn muted_note(ui: &mut Ui, msg: impl Into<String>) -> Response {
-    ui.colored_label(Style::TEXT_DIM, RichText::new(msg).size(Style::SMALL))
+    ui.colored_label(
+        Style::TEXT_DIM,
+        Style::typography_text(msg, TypographyRole::Caption),
+    )
 }
 
 /// A small filled **status dot** — a [`Style::SP_S`]-sized circle in `color` —
@@ -132,7 +138,7 @@ pub fn status_dot(ui: &mut Ui, color: Color32) {
         .circle_filled(rect.center(), diameter * 0.28, color);
 }
 
-/// A **labelled value row** on the spacing grid — a dim [`Style::SMALL`] `label`,
+/// A **labelled value row** on the spacing grid — a dim shared `Caption` `label`,
 /// a [`Style::SP_S`] gutter, then a `tone`-coloured `value` at the same size.
 ///
 /// The single source for the "field" row that several shell panels hand-rolled
@@ -140,12 +146,11 @@ pub fn status_dot(ui: &mut Ui, color: Color32) {
 pub fn field(ui: &mut Ui, label: &str, value: &str, tone: Color32) {
     ui.horizontal(|ui| {
         ui.label(
-            RichText::new(label)
+            Style::typography_text(label, TypographyRole::Caption)
                 .color(Style::TEXT_DIM)
-                .size(Style::SMALL),
         );
         ui.add_space(Style::SP_S);
-        ui.colored_label(tone, RichText::new(value).size(Style::SMALL));
+        ui.colored_label(tone, Style::typography_text(value, TypographyRole::Caption));
     });
 }
 
@@ -248,7 +253,7 @@ pub fn paint_operation_progress_badge(
 
     let clip = rect.shrink(Style::SP_XS);
     let painter = ui.painter().with_clip_rect(clip);
-    let font = egui::FontId::proportional(Style::SMALL);
+    let font = Style::typography_font(TypographyRole::Caption);
     let status = operation_progress_status_text(progress);
     let status_color = if progress.fraction.is_some() {
         Style::ACCENT

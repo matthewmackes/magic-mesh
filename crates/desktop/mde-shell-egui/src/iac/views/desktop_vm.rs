@@ -6,7 +6,7 @@
 
 use mackes_mesh_types::cloud::{DriftFlag, WorkloadRow};
 use mde_egui::egui::{self, Color32, RichText};
-use mde_egui::{carbon_icon, card, field, muted_note, status_dot, Style};
+use mde_egui::{carbon_icon, card, field, muted_note, status_dot, Style, TypographyRole};
 
 use super::super::{row_button, DeliveryView, Panel, WorkloadsState};
 
@@ -78,20 +78,26 @@ fn header_row(ui: &mut egui::Ui, row: &WorkloadRow) {
     ui.horizontal(|ui| {
         ui.label(
             RichText::new(&row.name)
-                .size(Style::BODY)
+                .font(Style::typography_font_with_size(TypographyRole::Body, Style::BODY))
                 .strong()
                 .color(Style::TEXT),
         );
         ui.add_space(Style::SP_S);
         let tone = status_tone(&row.status);
         status_dot(ui, tone);
-        ui.colored_label(tone, RichText::new(&row.status).size(Style::SMALL));
+        ui.colored_label(
+            tone,
+            RichText::new(&row.status)
+                .font(Style::typography_font_with_size(TypographyRole::Label, Style::SMALL)),
+        );
         ui.add_space(Style::SP_M);
         drift_chip(ui, row.drift);
         ui.add_space(Style::SP_M);
         ui.colored_label(
             Style::TEXT_DIM,
-            RichText::new(format!("on {}", row.node)).size(Style::SMALL),
+            RichText::new(format!("on {}", row.node)).font(
+                Style::typography_font_with_size(TypographyRole::Caption, Style::SMALL),
+            ),
         );
     });
 }
@@ -116,7 +122,11 @@ fn metrics_line(ui: &mut egui::Ui, row: &WorkloadRow) {
 fn drift_chip(ui: &mut egui::Ui, drift: DriftFlag) {
     let tone = drift_tone(drift);
     status_dot(ui, tone);
-    ui.colored_label(tone, RichText::new(drift_word(drift)).size(Style::SMALL));
+    ui.colored_label(
+        tone,
+        RichText::new(drift_word(drift))
+            .font(Style::typography_font_with_size(TypographyRole::Label, Style::SMALL)),
+    );
 }
 
 /// The view heading — the Workloads-accent glyph + title + a one-line blurb.
@@ -129,7 +139,7 @@ fn heading(ui: &mut egui::Ui, title: &str, blurb: &str) {
         ui.add_space(Style::SP_XS);
         ui.label(
             RichText::new(title)
-                .size(Style::TITLE)
+                .font(Style::typography_font_with_size(TypographyRole::Title, Style::TITLE))
                 .strong()
                 .color(Style::ACCENT_WORKLOADS),
         );
@@ -150,7 +160,7 @@ fn provision_cta(ui: &mut egui::Ui, state: &mut WorkloadsState, label: &str) {
         if ui
             .add(egui::Button::new(
                 RichText::new(label)
-                    .size(Style::SMALL)
+                    .font(Style::typography_font_with_size(TypographyRole::Label, Style::SMALL))
                     .color(Style::ACCENT_WORKLOADS),
             ))
             .clicked()

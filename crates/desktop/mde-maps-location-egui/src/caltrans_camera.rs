@@ -7,9 +7,9 @@ use mackes_mesh_types::caltrans_camera::{
     CaltransCamera, CaltransCameraSnapshot, CameraThumbnail, ATTRIBUTION,
 };
 use mde_egui::egui::{
-    self, Align2, Color32, FontId, Painter, Pos2, Rect, Stroke, TextureHandle, TextureOptions,
+    self, Align2, Color32, Painter, Pos2, Rect, Stroke, TextureHandle, TextureOptions,
 };
-use mde_egui::Style;
+use mde_egui::{Style, TypographyRole};
 
 /// Three missed one-minute refreshes make the whole layer visibly stale.
 pub const SNAPSHOT_STALE_AFTER_MS: i64 = 3 * 60 * 1_000;
@@ -313,14 +313,14 @@ fn paint_thumbnail_card(
         egui::pos2(card.left() + 6.0, image_rect.bottom() + 5.0),
         Align2::LEFT_TOP,
         format!("{route} · {}", camera.name),
-        FontId::proportional(Style::SMALL),
+        Style::typography_font(TypographyRole::Caption),
         tone,
     );
     painter.text(
         egui::pos2(card.left() + 6.0, card.bottom() - 5.0),
         Align2::LEFT_BOTTOM,
         format!("{} · {:.1} nm", age_label(age_ms), camera.distance_nm),
-        FontId::proportional(Style::SMALL),
+        Style::typography_font_with_size(TypographyRole::Mono, Style::SMALL),
         Style::TEXT_DIM,
     );
 }
@@ -354,7 +354,11 @@ fn paint_age_badge(painter: &Painter, rect: Rect, layer: &CaltransCameraLayerSta
         ),
         (Some(_), None) => ("Caltrans cameras · no timestamp".to_string(), Style::WARN),
     };
-    let galley = painter.layout_no_wrap(label, FontId::proportional(Style::SMALL), tone);
+    let galley = painter.layout_no_wrap(
+        label,
+        Style::typography_font(TypographyRole::Caption),
+        tone,
+    );
     let pad = egui::vec2(Style::SP_S, Style::SP_XS);
     let row_height = galley.size().y + pad.y * 2.0 + Style::SP_XS;
     let badge = Rect::from_min_size(

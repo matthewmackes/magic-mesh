@@ -31,11 +31,11 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use egui::{pos2, vec2, Align2, Color32, Context, FontFamily, FontId, Rect, Sense, Ui};
+use egui::{pos2, vec2, Align2, Color32, Context, FontId, Rect, Sense, Ui};
 
 use crate::carbon::paint_carbon;
 use crate::motion::Spring;
-use crate::style::Elevation;
+use crate::style::{Elevation, TypographyRole};
 use crate::{Motion, Style};
 
 /// Default on-screen dwell for an [`Severity::Info`] chyron — short, low-friction.
@@ -579,14 +579,15 @@ fn banner_rect(screen: Rect, t: f32) -> Rect {
     Rect::from_min_size(pos2(x, y), vec2(w, BANNER_H))
 }
 
-/// The banner title face — [`Style::TYPE_BODY`], proportional (Q14 HIG type).
+/// The banner title face — the shared [`TypographyRole::Body`] role (Q14 HIG
+/// type).
 fn banner_title_font() -> FontId {
-    FontId::new(Style::TYPE_BODY, FontFamily::Proportional)
+    Style::typography_font(TypographyRole::Body)
 }
 
-/// The banner detail face — [`Style::TYPE_FOOTNOTE`], proportional.
+/// The banner detail face — the shared [`TypographyRole::Label`] role.
 fn banner_detail_font() -> FontId {
-    FontId::new(Style::TYPE_FOOTNOTE, FontFamily::Proportional)
+    Style::typography_font(TypographyRole::Label)
 }
 
 /// Paint the top-center HIG banner card and return what its widgets reported.
@@ -699,7 +700,7 @@ fn paint_banner_controls(
     );
     let dismiss_resp = ui.put(
         dz,
-        egui::Button::new(egui::RichText::new(label).size(Style::TYPE_FOOTNOTE)),
+        egui::Button::new(Style::typography_text(label, TypographyRole::Label)),
     );
     if dismiss_resp.clicked() {
         if is_ack {
@@ -718,9 +719,7 @@ fn paint_banner_controls(
         let action_resp = ui.put(
             az,
             egui::Button::new(
-                egui::RichText::new(&action.label)
-                    .size(Style::TYPE_FOOTNOTE)
-                    .color(Style::BG),
+                Style::typography_text(&action.label, TypographyRole::Label).color(Style::BG),
             )
             .fill(Style::ACCENT),
         );
@@ -745,7 +744,8 @@ fn paint_banner_controls(
             pos2(rx - Style::SP_S, cy),
             Align2::RIGHT_CENTER,
             meta.join("  ·  "),
-            FontId::new(Style::TYPE_FOOTNOTE, FontFamily::Monospace),
+            // Fixed-width countdown metadata keeps digits stable-width.
+            Style::typography_font_with_size(TypographyRole::Mono, Style::TYPE_FOOTNOTE),
             Style::TEXT_DIM,
         );
     }
@@ -777,7 +777,7 @@ fn paint_osd(ui: &Ui, level: OsdLevel, t: f32) {
         pos2(rect.left() + Style::SP_M, rect.center().y),
         Align2::LEFT_CENTER,
         level.kind.glyph(),
-        FontId::new(Style::SMALL, FontFamily::Monospace),
+        Style::typography_font_with_size(TypographyRole::Mono, Style::SMALL),
         Style::TEXT,
     );
 
@@ -811,7 +811,7 @@ fn paint_osd(ui: &Ui, level: OsdLevel, t: f32) {
         pos2(rect.right() - Style::SP_M, rect.center().y),
         Align2::RIGHT_CENTER,
         format!("{:.0}%", fraction * 100.0),
-        FontId::new(Style::SMALL, FontFamily::Monospace),
+        Style::typography_font_with_size(TypographyRole::Mono, Style::SMALL),
         Style::TEXT,
     );
 }
@@ -819,6 +819,7 @@ fn paint_osd(ui: &Ui, level: OsdLevel, t: f32) {
 #[cfg(test)]
 #[allow(clippy::float_cmp)]
 mod tests {
+    use crate::egui::FontFamily;
     use super::*;
 
     fn info(host: &str) -> Toast {
@@ -1149,8 +1150,20 @@ mod tests {
 
     #[test]
     fn banner_type_reads_body_over_footnote() {
-        // Q14: the HIG type ladder — TYPE_BODY title over TYPE_FOOTNOTE detail.
-        assert_eq!(banner_title_font().size, Style::TYPE_BODY);
-        assert_eq!(banner_detail_font().size, Style::TYPE_FOOTNOTE);
+        // Q14: the HIG type ladder — Body title over Label detail.
+        assert_eq!(banner_title_font(), Style::typography_font(TypographyRole::Body));
+        assert_eq!(banner_detail_font(), Style::typography_font(TypographyRole::Label));
+    }
+
+    #[test]
+    fn technical_toast_text_remains_monospace() {
+        assert_eq!(
+            Style::typography_font_with_size(TypographyRole::Mono, Style::TYPE_FOOTNOTE).family,
+            FontFamily::Monospace
+        );
+        assert_eq!(
+            Style::typography_font_with_size(TypographyRole::Mono, Style::SMALL).family,
+            FontFamily::Monospace
+        );
     }
 }

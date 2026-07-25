@@ -44,11 +44,11 @@
 
 use egui::text::{LayoutJob, TextFormat};
 use egui::{
-    Align, Button, Color32, FontFamily, FontId, Key, Layout, Rect, RichText, Sense, Stroke,
+    Align, Button, Color32, Key, Layout, Rect, Sense, Stroke,
     StrokeKind, Ui, WidgetInfo, WidgetType,
 };
 
-use crate::{Motion, Style};
+use crate::{Motion, Style, TypographyRole};
 
 /// The shared workspace-title size: the display rung pulled down by two points so
 /// the top-left identity reads refined instead of oversized.
@@ -473,9 +473,13 @@ pub fn remote_sessions_button(ui: &mut Ui) {
 /// Paint the UPPERCASE mono accent title (lock 2/14).
 fn title_header(ui: &mut Ui, title: &str, accent: Color32) {
     ui.label(
-        RichText::new(display_title(title))
-            .family(FontFamily::Monospace)
-            .size(TITLE_FONT_SIZE)
+        Style::typography_text(display_title(title), TypographyRole::Mono)
+            .font(Style::typography_font_with_size(
+                TypographyRole::Mono,
+                TITLE_FONT_SIZE,
+            ))
+            .extra_letter_spacing(TypographyRole::Title.letter_spacing())
+            .line_height(Some(TypographyRole::Title.line_height()))
             .color(accent),
     );
 }
@@ -544,19 +548,22 @@ fn flatten_menu_buttons(ui: &mut Ui) {
 /// underlined. Its `.text()` equals `label`, so egui derives the same menu id the
 /// Alt handler computes from `label`.
 fn menu_label_job(label: &str, mnemonic: Option<char>, color: Color32) -> LayoutJob {
-    let font = FontId::new(MENU_FONT_SIZE, FontFamily::Proportional);
+    let role = TypographyRole::Label;
+    let font = Style::typography_font_with_size(role, MENU_FONT_SIZE);
     let underline = Stroke::new(1.0, color);
     let mut job = LayoutJob::default();
     let mut buf = [0u8; 4];
     let mut underlined = false;
     for ch in label.chars() {
         let is_mnemonic = !underlined && mnemonic.is_some_and(|m| ch.eq_ignore_ascii_case(&m));
-        let format = TextFormat {
+        let mut format = TextFormat {
             font_id: font.clone(),
             color,
             underline: if is_mnemonic { underline } else { Stroke::NONE },
             ..Default::default()
         };
+        format.extra_letter_spacing = role.letter_spacing();
+        format.line_height = Some(role.line_height());
         job.append(ch.encode_utf8(&mut buf), 0.0, format);
         underlined |= is_mnemonic;
     }
@@ -592,8 +599,7 @@ fn render_entries<Id: Clone>(
             }
             Entry::Caption(text) => {
                 ui.label(
-                    RichText::new(text.as_str())
-                        .size(Style::SMALL)
+                    Style::typography_text(text.as_str(), TypographyRole::Caption)
                         .color(colors.text_dim),
                 );
             }
@@ -632,7 +638,14 @@ fn render_item<Id: Clone>(
     } else {
         colors.text_dim
     };
-    let mut button = Button::new(RichText::new(label).size(MENU_FONT_SIZE).color(color));
+    let mut button = Button::new(
+        Style::typography_text(label, TypographyRole::Label)
+            .font(Style::typography_font_with_size(
+                TypographyRole::Label,
+                MENU_FONT_SIZE,
+            ))
+            .color(color),
+    );
     if let Some(hint) = &item.shortcut {
         button = button.shortcut_text(hint);
     }
@@ -695,7 +708,7 @@ fn status_chip(ui: &mut Ui, chip: &StatusChip) {
         .map_or_else(|| chip.text.clone(), |icon| format!("{icon} {}", chip.text));
     let galley = ui.painter().layout_no_wrap(
         text,
-        FontId::new(Style::SMALL, FontFamily::Proportional),
+        Style::typography_font(TypographyRole::Caption),
         color,
     );
     let pad = egui::vec2(Style::SP_S, Style::SP_XS);
