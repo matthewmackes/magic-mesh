@@ -2224,6 +2224,16 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-006 - Construct interface (Apple-HIG-principled workstation shell)
 
 - Status: Remaining
+- Progress (2026-07-25 Surface-worker non-Surface breaker fix): live `.15`
+  remained active after disk cleanup but still emitted repeated
+  `circuit breaker tripped` alerts. Timeout-bounded journal evidence isolated
+  the three tripped workers to `surface_firmware`, `surface_verify`, and
+  `surface_enable`: on this non-Surface workstation they logged
+  `worker returned Ok`, then the supervisor treated the immediate exits as
+  half-open relapses. The workers' comments already promised idle behavior, so
+  the code now waits on shutdown for non-Surface and no-Bus idle cases instead
+  of returning immediately. This is a code fix pending package/deploy proof; the
+  current installed `.15` binary still has the pre-fix behavior until upgraded.
 - Progress (2026-07-25 deterministic Construct pixel verifier):
   `install-helpers/verify-shell-pixel-proof.py` now validates already-captured
   KMS/linear-GBM PNG artifacts without touching the Workloads verifier lane. Its

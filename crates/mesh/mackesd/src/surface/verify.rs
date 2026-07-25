@@ -934,10 +934,12 @@ mod worker {
                     target: "mackesd::surface_verify",
                     "not a Surface; worker idle"
                 );
+                shutdown.wait().await;
                 return Ok(());
             }
             let Some(root) = self.bus_root.clone() else {
                 tracing::debug!(target: "mackesd::surface_verify", "no bus root; worker idle");
+                shutdown.wait().await;
                 return Ok(());
             };
             loop {
