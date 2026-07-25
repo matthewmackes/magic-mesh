@@ -218,7 +218,10 @@ fn parse_set_desired_body(body_str: &str) -> Result<SetDesiredBody, String> {
 /// wrong state). A plan the backend can't run is `gated`, never a faked in-sync plan.
 #[must_use]
 pub(crate) fn handle_plan(w: &CloudWorker, verb_name: &str, body_str: &str) -> CloudReply {
-    let body: PlanBody = serde_json::from_str(body_str.trim()).unwrap_or_default();
+    let body = match parse_plan_body(body_str) {
+        Ok(body) => body,
+        Err(error) => return reject(verb_name, error),
+    };
     let node = body.node.trim();
     let node = if node.is_empty() {
         w.host.as_str()
@@ -257,6 +260,18 @@ pub(crate) fn handle_plan(w: &CloudWorker, verb_name: &str, body_str: &str) -> C
             ..Default::default()
         },
     }
+}
+
+/// Parse a plan request without turning malformed input into the legacy empty
+/// request. `{}` remains valid and still means "plan this worker's slice", but
+/// malformed JSON must stop before the desired-state/backend boundary.
+fn parse_plan_body(body_str: &str) -> Result<PlanBody, String> {
+    if body_str.len() > MAX_SET_DESIRED_BODY_BYTES {
+        return Err(format!(
+            "plan request body exceeds {MAX_SET_DESIRED_BODY_BYTES}-byte limit"
+        ));
+    }
+    serde_json::from_str(body_str.trim()).map_err(|e| format!("malformed plan request: {e}"))
 }
 
 /// An honest rejection (a malformed / insufficient request).
@@ -548,6 +563,30 @@ mod tests {
         assert!(!reply.ok);
         assert!(reply.plan.is_none());
         assert!(reply.gated.unwrap().contains("plan unavailable"));
+    }
+
+    #[test]
+    fn plan_rejects_malformed_request_before_backend_io() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runner = Arc::new(FakeRunner {
+            plan_ndjson: Some(
+                r#"{"type":"change_summary","changes":{"add":1,"change":0,"remove":0}}"#
+                    .into(),
+            ),
+            ..Default::default()
+        });
+        let w = worker("eagle", tmp.path().to_path_buf(), runner.clone());
+
+        // Malformed input must not fall back to `{}` and accidentally plan the
+        // local node's desired slice.
+        let reply = handle_plan(&w, "plan", r#"{"node":"eagle""#);
+        assert!(!reply.ok);
+        assert!(reply.plan.is_none());
+        assert!(reply.error.unwrap().contains("malformed plan request"));
+        assert!(
+            runner.tfvars_written.lock().unwrap().is_empty(),
+            "malformed plan input must not reach the backend"
+        );
     }
 
     #[test]

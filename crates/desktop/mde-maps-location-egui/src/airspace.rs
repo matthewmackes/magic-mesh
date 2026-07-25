@@ -554,9 +554,10 @@ impl AirspaceState {
 
     /// Fold a mirror with an injected clock for deterministic tests and live
     /// freshness enforcement. A retained Ready record is useful only while its
-    /// publication time is within the scanner heartbeat window. Invalid,
-    /// ancient, or future-dated publication times become an offline empty
-    /// picture, so persisted Bus state cannot masquerade as a live scan.
+    /// publication time and, when supplied, the source observation time are
+    /// within the scanner heartbeat window. Invalid, ancient, or future-dated
+    /// timestamps become an offline empty picture, so a freshly republished
+    /// envelope cannot make an old scanner frame look live.
     pub fn refresh_from_wire_at(
         &mut self,
         snapshot: &mackes_mesh_types::airspace::AirspaceSnapshot,
@@ -567,7 +568,12 @@ impl AirspaceState {
             now_ms.saturating_sub(snapshot.published_at_ms) > AIRSPACE_SNAPSHOT_MAX_AGE_MS;
         let too_far_ahead =
             snapshot.published_at_ms > now_ms.saturating_add(AIRSPACE_SNAPSHOT_MAX_FUTURE_SKEW_MS);
-        let expired = age_invalid || too_old || too_far_ahead;
+        let observation_expired = snapshot.scanned_at_ms.is_some_and(|scanned_at_ms| {
+            scanned_at_ms <= 0
+                || now_ms.saturating_sub(scanned_at_ms) > AIRSPACE_SNAPSHOT_MAX_AGE_MS
+                || scanned_at_ms > now_ms.saturating_add(AIRSPACE_SNAPSHOT_MAX_FUTURE_SKEW_MS)
+        });
+        let expired = age_invalid || too_old || too_far_ahead || observation_expired;
 
         self.source_status = snapshot.availability;
         if expired
@@ -1190,6 +1196,49 @@ mod tests {
             state.source_status,
             mackes_mesh_types::airspace::AirspaceAvailability::Offline
         );
+    }
+
+    #[test]
+    fn fresh_envelope_cannot_resurrect_stale_or_future_scanner_observation() {
+        let mut state = AirspaceState::live();
+        let make_snapshot = |scanned_at_ms| mackes_mesh_types::airspace::AirspaceSnapshot {
+            host: "mg90-live".to_string(),
+            // The envelope is fresh. A consumer that checks only this field
+            // would incorrectly paint the retained scanner contact below.
+            published_at_ms: 20_000,
+            scanned_at_ms: Some(scanned_at_ms),
+            availability: mackes_mesh_types::airspace::AirspaceAvailability::Ready,
+            contacts: vec![mackes_mesh_types::airspace::AirspaceContact {
+                id: "aa:bb".to_string(),
+                kind: mackes_mesh_types::airspace::AirspaceContactKind::Wifi,
+                name: "retained-ap".to_string(),
+                signal_dbm: -55,
+                bearing_deg: 12.0,
+                channel: None,
+                encryption: None,
+                notable: false,
+                watchlist: false,
+                own: false,
+            }],
+            omitted_contacts: 0,
+            gaps: Vec::new(),
+        };
+
+        for scanned_at_ms in [
+            20_000 - AIRSPACE_SNAPSHOT_MAX_AGE_MS - 1,
+            20_000 + AIRSPACE_SNAPSHOT_MAX_FUTURE_SKEW_MS + 1,
+        ] {
+            state.refresh_from_wire_at(&make_snapshot(scanned_at_ms), 20_000);
+            assert_eq!(
+                state.source_status,
+                mackes_mesh_types::airspace::AirspaceAvailability::Offline,
+                "invalid observation timestamp must make the projection offline"
+            );
+            assert!(
+                state.signals.is_empty(),
+                "invalid observation timestamp must retract retained contacts"
+            );
+        }
     }
 
     #[test]

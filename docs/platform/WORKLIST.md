@@ -19,16 +19,17 @@ instead of leaving closed work in this file.
 ## Current Snapshot - 2026-07-25 release gate
 
 - **6 active epics:** 6 `Remaining`, 0 `Blocked`; no `Needs clarification`.
-- **Release gate:** pushed commits `9ef3067d` and `b9bfc084` pass the full
-  `mackesd` farm suite at **4,099 passed, 0 failed, 1 ignored**. The Fedora 44
+- **Release gate:** the current integrated wave passes the full `mackesd` farm
+  suite at **4,103 passed, 0 failed, 1 ignored**. The Fedora 44
   base/browser/thin-lighthouse RPM cut is green at **81.7 / 39.1 / 11.0 MiB**;
   the exact base RPM requires the F44 FFmpeg ABI (`libavcodec.so.62`,
   `libswresample.so.6`, `libswscale.so.9`).
-- **Dell seat:** `magic-mesh` and `magic-mesh-browser` 12.1.0-1 are installed
-  on `172.20.146.2`; `mackesd` and `mde-shell-egui` are active with zero
-  observed restarts. Kernel reboot remains intentionally pending so the live
-  seat is not interrupted; Nebula remains failed because the seat is not
-  enrolled.
+- **Dell seat:** Fedora 44 is refreshed and `magic-mesh` plus
+  `magic-mesh-browser` 12.1.0-1 are installed on `172.20.146.2`; `dnf check` is
+  clean, `mackesd` and `mde-shell-egui` are active with zero observed
+  restarts, and the CEF link-navigation verifier passes. Kernel reboot remains
+  intentionally pending so the live seat is not interrupted; Nebula remains
+  failed because the seat is not enrolled.
 - **P0:** WL-SEC-006 (stop replicating Nebula private keys), WL-ARCH-007
   (authorization mint + direct lifecycle proof), and
   WL-FUNC-011 (optional real media/LLM evidence remains).
@@ -251,6 +252,12 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-SEC-006 - Keep Nebula private keys local to their owning node
 
 - Status: Remaining
+- Progress (2026-07-25 enrollment-listener key boundary): the TLS enrollment
+  listener now reads its certificate/key material through bounded no-follow
+  readers, and refuses a non-owner-only endpoint key instead of starting with
+  unsafe private material. The focused farm listener gate is green at **13/13**;
+  the integrated BigBoy `mackesd` gate is **4,103 passed, 0 failed, 1 ignored**.
+  Live Nebula rotation/reconnect/prune evidence remains external.
 - Progress (2026-07-25 Nebula reconnect acknowledgement boundary): a failed
   `systemctl reload-or-restart` now leaves the rotated bundle unacknowledged,
   forcing the next supervisor sweep to retry the reconnect rather than losing
@@ -619,6 +626,11 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-ARCH-007 - Repair Workloads cockpit E2E wire, placement, and authorization
 
 - Status: Remaining
+- Progress (2026-07-25 malformed plan boundary): Workloads `plan` now rejects
+  malformed or oversized JSON before backend access; the intentional `{}`
+  worker-local plan request remains valid. The focused desired-verb farm gate is
+  green at **15/15** and the integrated BigBoy `mackesd` gate is **4,103 passed,
+  0 failed, 1 ignored**. Live libvirt/KVM lifecycle evidence remains external.
 - Progress (2026-07-25 lifecycle apply contract): authorized lifecycle verbs
   now fail closed when a backend reports `ok=true` without `applied=true`, and
   destructive desired-state records are retained instead of being retracted
@@ -938,6 +950,11 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-011 - Communications collaboration suite full replacement
 
 - Status: Remaining
+- Progress (2026-07-25 bounded import-map state): the durable collaboration
+  import map now rejects oversized, non-regular, changing, or invalid-UTF-8
+  state before JSON materialization, while preserving missing-map initialization
+  and idempotent replay. The full core farm suite is green at **59/59**; live
+  WebRTC/SIP and sealed DO/LLM evidence remain external.
 - Progress (2026-07-25 replay membership-authority boundary): domain and SQLite
   projection folds now reject a signed `MemberJoined` event that grants a
   different actor membership unless the envelope author is already an Owner;
@@ -1516,6 +1533,13 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-012 - Maps live-data overlays (zero-cost external feeds)
 
 - Status: Remaining
+- Progress (2026-07-25 offline geocoder and Airspace observation boundaries):
+  offline Home-address geocoding now rejects final symlinks and non-regular
+  gazetteer leaves before SQLite access (**9/9** focused tests). Airspace now
+  validates the source observation timestamp separately from its publication
+  envelope, retracting retained contacts when the scanner frame is stale or
+  future-dated (**12/12** focused tests). The full Maps suite is green at
+  **225/225**; live provider and MG90 scanner-feed evidence remains external.
 - Progress (2026-07-25 future-data boundary): retained IEM radar frames more
   than five seconds ahead of the consumer clock are withheld from paint and
   receive an explicit `invalid future timestamp` badge. The focused IEM slice
@@ -2353,6 +2377,12 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-007 - Car interface (CarPlay-principled vehicle mode)
 
 - Status: Remaining
+- Progress (2026-07-25 Navigation route-priority boundary): Car Home now
+  resolves overlapping card activations with explicit Navigation priority, so
+  the large blue Navigation action cannot fall through to the Vehicle/OBD
+  surface; the independent Vehicle route remains intact. The focused Car Home
+  farm gate is green at **12/12**, including the regression. Live MG90 and
+  physical Car evidence remain external.
 - Progress (2026-07-25 live mirror provenance recheck): read-only `.15`
   verification accepted a fresh `state/vehicle/Basement-Test-Workstation`
   envelope at 5.9 seconds old with `online=true`, MGOS `4.3.0.1`, honest

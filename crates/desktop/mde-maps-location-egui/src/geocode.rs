@@ -137,6 +137,7 @@ pub fn query_db(db: &Path, text: &str, limit: usize) -> rusqlite::Result<Vec<Geo
     let Some(match_expr) = fts_match(text)? else {
         return Ok(Vec::new());
     };
+    ensure_regular_gazetteer(db)?;
     let conn = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let mut stmt = conn.prepare(
         "SELECT p.name, p.housenumber, p.street, p.city, p.lat, p.lon, p.kind \
@@ -160,12 +161,33 @@ pub fn query_db(db: &Path, text: &str, limit: usize) -> rusqlite::Result<Vec<Geo
     Ok(rows.flatten().collect())
 }
 
+/// Reject a final symlink or special file before SQLite sees the path.
+///
+/// Gazetteers are installed artifacts, not user-controlled links. Keeping the
+/// final-leaf check here (rather than only in [`gazetteer_path`]) also protects
+/// the explicit-path test seam and callers that already resolved a path. The
+/// check is intentionally fail-closed; SQLite errors are converted to the
+/// normal unavailable note by [`geocode`].
+fn ensure_regular_gazetteer(db: &Path) -> rusqlite::Result<()> {
+    let metadata = std::fs::symlink_metadata(db).map_err(|_| {
+        rusqlite::Error::InvalidParameterName(
+            "offline gazetteer path is missing or unreadable".to_string(),
+        )
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(rusqlite::Error::InvalidParameterName(
+            "offline gazetteer path must be a regular file".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// The installed gazetteer path, if present.
 #[must_use]
 pub fn gazetteer_path() -> Option<PathBuf> {
     crate::basemap::region_dir()
         .map(|d| d.join("gazetteer.sqlite"))
-        .filter(|p| p.exists())
+        .filter(|p| ensure_regular_gazetteer(p).is_ok())
 }
 
 /// Geocode `text` against the installed offline gazetteer, fail-soft.
@@ -326,6 +348,30 @@ mod tests {
             }
             other => panic!("unexpected oversized-query error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn non_regular_gazetteer_leaves_are_rejected_before_sqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = query_db(dir.path(), "athens", 10)
+            .expect_err("a directory must not be opened as a gazetteer");
+        assert!(matches!(error, rusqlite::Error::InvalidParameterName(message) if message.contains("regular file")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_symlink_gazetteer_is_rejected_before_sqlite() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.sqlite");
+        synth_gazetteer(&real);
+        let link = dir.path().join("gazetteer.sqlite");
+        symlink(&real, &link).unwrap();
+
+        let error = query_db(&link, "athens", 10)
+            .expect_err("a final symlink must not be followed by the geocoder");
+        assert!(matches!(error, rusqlite::Error::InvalidParameterName(message) if message.contains("regular file")));
     }
 
     #[test]

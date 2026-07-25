@@ -440,6 +440,34 @@ pub(crate) fn dashboard_layout(body: Rect) -> Option<CarHomeLayout> {
     Some(layout)
 }
 
+/// Resolve the one Car Home activation returned to the shell.
+///
+/// The cards are deliberately painted in visual order, but their interaction
+/// responses must not use last-writer-wins routing. Navigation is the primary
+/// blue Home action; if a future inset, accessibility expansion, or rounding
+/// change makes its hit region overlap a later card, it must still open the
+/// Navigation home instead of falling through to Vehicle/OBD.
+fn activated_car_tile(
+    nav_clicked: bool,
+    media_clicked: bool,
+    vehicle_clicked: bool,
+    strip_clicked: [bool; 6],
+) -> Option<CarTile> {
+    if nav_clicked {
+        return Some(CarTile::Nav);
+    }
+    if media_clicked {
+        return Some(CarTile::Media);
+    }
+    if vehicle_clicked {
+        return Some(CarTile::Vehicle);
+    }
+    CarTile::ALL
+        .into_iter()
+        .zip(strip_clicked)
+        .find_map(|(tile, clicked)| clicked.then_some(tile))
+}
+
 /// Render the Auto Mode home. Returns the tile the driver activated this frame
 /// (a card or strip tap), or `None`. The shell maps that to a surface switch.
 pub fn car_home_panel(ui: &mut Ui, glance: &CarHomeGlance) -> Option<CarTile> {
@@ -488,24 +516,15 @@ pub fn car_home_panel(ui: &mut Ui, glance: &CarHomeGlance) -> Option<CarTile> {
         return None;
     };
 
-    let mut activated = None;
-    if paint_nav_card(ui, &painter, layout.nav_card, glance) {
-        activated = Some(CarTile::Nav);
-    }
-    if paint_media_card(ui, &painter, layout.media_card, glance) {
-        activated = Some(CarTile::Media);
-    }
+    let nav_clicked = paint_nav_card(ui, &painter, layout.nav_card, glance);
+    let media_clicked = paint_media_card(ui, &painter, layout.media_card, glance);
     // The glance card's dominant content is the vehicle telematics summary, so
     // its (full-card, Density::Touch) tap lands on the Vehicle telematics tab.
-    if paint_glance_card(ui, &painter, layout.glance_card, glance) {
-        activated = Some(CarTile::Vehicle);
-    }
-    for (tile, rect) in CarTile::ALL.into_iter().zip(layout.strip) {
-        if paint_app_tile(ui, &painter, rect, tile) {
-            activated = Some(tile);
-        }
-    }
-    activated
+    let vehicle_clicked = paint_glance_card(ui, &painter, layout.glance_card, glance);
+    let strip_clicked = core::array::from_fn(|index| {
+        paint_app_tile(ui, &painter, layout.strip[index], CarTile::ALL[index])
+    });
+    activated_car_tile(nav_clicked, media_clicked, vehicle_clicked, strip_clicked)
 }
 
 /// Paint one dashboard card's shared plate — the SYNC3_SURFACE ground on
@@ -817,6 +836,26 @@ mod tests {
         assert_eq!(CarTile::Comms.surface(), Surface::Communications);
         assert_eq!(CarTile::Vehicle.surface(), Surface::MapsLocation);
         assert_eq!(CarTile::Settings.surface(), Surface::System);
+    }
+
+    #[test]
+    fn navigation_home_route_wins_over_vehicle_fallback() {
+        // This models the failure mode directly: the large blue Navigation
+        // card and the later telematics card both report a hit. Navigation must
+        // remain the selected route; the shell can then record the normal
+        // expanded-surface transition for its Back action.
+        assert_eq!(
+            activated_car_tile(true, false, true, [false; 6]),
+            Some(CarTile::Nav)
+        );
+        assert_ne!(CarTile::Nav, CarTile::Vehicle);
+
+        // The Vehicle card keeps its independent telematics route when the
+        // Navigation card was not activated.
+        assert_eq!(
+            activated_car_tile(false, false, true, [false; 6]),
+            Some(CarTile::Vehicle)
+        );
     }
 
     #[test]

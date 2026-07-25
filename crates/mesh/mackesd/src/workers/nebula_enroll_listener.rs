@@ -279,10 +279,15 @@ fn build_acceptor(
     cert_path: &std::path::Path,
     key_path: &std::path::Path,
 ) -> Result<TlsAcceptor, String> {
-    let cert_pem =
-        std::fs::read(cert_path).map_err(|e| format!("read {}: {e}", cert_path.display()))?;
-    let key_pem =
-        std::fs::read(key_path).map_err(|e| format!("read {}: {e}", key_path.display()))?;
+    // These are root-local enrollment authorities, not ordinary config. Read
+    // through the descriptor-backed sealed readers so a replacement final
+    // symlink, special file, growing input, or oversized PEM cannot reach the
+    // TLS parser. The private key additionally has to remain owner-only 0600;
+    // an unsafe key must stop the listener rather than silently falling back.
+    let cert_pem = crate::ca::seal::read_no_follow(cert_path)
+        .map_err(|e| format!("read {}: {e}", cert_path.display()))?;
+    let key_pem = crate::ca::seal::read_sealed(key_path)
+        .map_err(|e| format!("read {}: {e}", key_path.display()))?;
     let cert_chain: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&cert_pem)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("parse cert pem: {e}"))?;
@@ -485,8 +490,29 @@ mod tests {
         let crt = tmp.path().join("e.crt");
         let key = tmp.path().join("e.key");
         std::fs::write(&crt, id.cert_pem).unwrap();
-        std::fs::write(&key, id.key_pem).unwrap();
+        crate::ca::seal::write_sealed(&key, id.key_pem.as_bytes()).unwrap();
         assert!(build_acceptor(&crt, &key).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_acceptor_refuses_an_unsealed_endpoint_key() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let id = crate::nebula_enroll_endpoint::generate_endpoint_identity(&["127.0.0.1".into()])
+            .expect("gen");
+        let crt = tmp.path().join("e.crt");
+        let key = tmp.path().join("e.key");
+        std::fs::write(&crt, id.cert_pem).unwrap();
+        std::fs::write(&key, id.key_pem).unwrap();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let error = match build_acceptor(&crt, &key) {
+            Ok(_) => panic!("world-readable key must fail closed"),
+            Err(error) => error,
+        };
+        assert!(error.contains("0600") || error.contains("insecure"));
     }
 
     fn roster_ctx(root: &std::path::Path) -> EnrollContext {
@@ -566,7 +592,7 @@ mod tests {
         let crt = root.join("e.crt");
         let key = root.join("e.key");
         std::fs::write(&crt, &id.cert_pem).unwrap();
-        std::fs::write(&key, &id.key_pem).unwrap();
+        crate::ca::seal::write_sealed(&key, id.key_pem.as_bytes()).unwrap();
         let acceptor = build_acceptor(&crt, &key).expect("acceptor");
 
         // Seed an issued bearer + build the CSR body the peer would POST.
@@ -669,7 +695,7 @@ mod tests {
         let crt = root.join("e.crt");
         let key = root.join("e.key");
         std::fs::write(&crt, &id.cert_pem).unwrap();
-        std::fs::write(&key, &id.key_pem).unwrap();
+        crate::ca::seal::write_sealed(&key, id.key_pem.as_bytes()).unwrap();
         let acceptor = build_acceptor(&crt, &key).expect("acceptor");
         let ctx = roster_ctx(root);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

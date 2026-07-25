@@ -78,6 +78,10 @@ const SEED_DOC: &str = "wl-func-011-import|document|";
 /// without a bound. The legacy chat ring is capped at 500 entries; 8 MiB leaves
 /// room for unusually large message metadata while keeping one source bounded.
 const MAX_IMPORT_SOURCE_BYTES: u64 = 8 * 1024 * 1024;
+/// Keep the durable idempotency map bounded too. It is replicated local state,
+/// not a trusted input: loading it must not turn a hostile or stale file into an
+/// unbounded allocation before the importer can validate its schema.
+const MAX_IMPORT_MAP_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_RING_MESSAGES: usize = 500;
 
 /// The stable conversation key of the migration's editor-documents space (the
@@ -126,14 +130,13 @@ impl ImportMap {
     /// Returns an error if the file exists but cannot be read, parsed, or is
     /// from an unsupported schema version.
     pub fn load(path: &Path) -> Result<Self> {
-        match std::fs::read_to_string(path) {
-            Ok(s) => {
+        match read_bounded_text(path, MAX_IMPORT_MAP_BYTES, "import map")? {
+            Some(s) => {
                 let map: Self = serde_json::from_str(&s)?;
                 map.validate_version()?;
                 Ok(map)
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::new()),
-            Err(e) => Err(e.into()),
+            None => Ok(Self::new()),
         }
     }
 
@@ -149,6 +152,11 @@ impl ImportMap {
             std::fs::create_dir_all(parent)?;
         }
         let body = serde_json::to_string_pretty(self)?;
+        if body.len() as u64 > MAX_IMPORT_MAP_BYTES {
+            return Err(CollabError::Serde(format!(
+                "import map exceeds {MAX_IMPORT_MAP_BYTES} bytes"
+            )));
+        }
         let mut tmp = path.as_os_str().to_owned();
         tmp.push(".tmp");
         let tmp = PathBuf::from(tmp);
@@ -838,25 +846,55 @@ fn read_editor_autosave(path: &Path) -> Option<EditorAutosave> {
 /// source that grows after the initial check fail closed instead of bypassing
 /// the bound with a stale directory entry.
 fn read_bounded_regular_text(path: &Path) -> Option<String> {
-    let entry = std::fs::symlink_metadata(path).ok()?;
-    if !entry.file_type().is_file() || entry.len() > MAX_IMPORT_SOURCE_BYTES {
-        return None;
+    read_bounded_text(path, MAX_IMPORT_SOURCE_BYTES, "legacy import source")
+        .ok()
+        .flatten()
+}
+
+/// Read a regular file through an opened descriptor while preserving the
+/// caller's missing-file policy. `Some` is a bounded, valid UTF-8 body; `None`
+/// means the path is absent. All other failures are returned so durable state
+/// loaders can fail closed instead of silently resetting their replay map.
+fn read_bounded_text(path: &Path, max_bytes: u64, label: &str) -> Result<Option<String>> {
+    let entry = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !entry.file_type().is_file() {
+        return Err(CollabError::Serde(format!(
+            "{label} must be a regular file"
+        )));
+    }
+    if entry.len() > max_bytes {
+        return Err(CollabError::Serde(format!(
+            "{label} exceeds {max_bytes} bytes"
+        )));
     }
 
-    let file = std::fs::File::open(path).ok()?;
-    let opened = file.metadata().ok()?;
-    if !opened.file_type().is_file() || opened.len() > MAX_IMPORT_SOURCE_BYTES {
-        return None;
+    let file = std::fs::File::open(path)?;
+    let opened = file.metadata()?;
+    if !opened.file_type().is_file() {
+        return Err(CollabError::Serde(format!(
+            "{label} must remain a regular file"
+        )));
+    }
+    if opened.len() > max_bytes {
+        return Err(CollabError::Serde(format!(
+            "{label} exceeds {max_bytes} bytes"
+        )));
     }
 
     let mut bytes = Vec::with_capacity(opened.len() as usize);
-    file.take(MAX_IMPORT_SOURCE_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    if bytes.len() as u64 > MAX_IMPORT_SOURCE_BYTES {
-        return None;
+    file.take(max_bytes + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(CollabError::Serde(format!(
+            "{label} grew beyond {max_bytes} bytes while being read"
+        )));
     }
-    String::from_utf8(bytes).ok()
+    let text = String::from_utf8(bytes)
+        .map_err(|error| CollabError::Serde(format!("{label} is not UTF-8: {error}")))?;
+    Ok(Some(text))
 }
 
 #[cfg(test)]
@@ -1189,6 +1227,35 @@ mod tests {
             "unsupported map must not be persisted"
         );
         assert!(!save_path.exists(), "rejected map left a replacement file");
+    }
+
+    #[test]
+    fn import_map_rejects_oversized_state_before_json_parse() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("oversized-map.json");
+        std::fs::write(&path, vec![b' '; (MAX_IMPORT_MAP_BYTES + 1) as usize])
+            .expect("write oversized map");
+
+        let error = ImportMap::load(&path).expect_err("oversized map must fail closed");
+        assert!(
+            error.to_string().contains("import map exceeds"),
+            "unexpected error: {error}"
+        );
+
+        let mut oversized = ImportMap::new();
+        oversized.record(
+            "source|".to_string() + &"x".repeat(MAX_IMPORT_MAP_BYTES as usize),
+            event_id_for("oversized-map"),
+        );
+        let save_path = tmp.path().join("would-be-oversized-map.json");
+        let save_error = oversized
+            .save(&save_path)
+            .expect_err("oversized map must not be persisted");
+        assert!(
+            save_error.to_string().contains("import map exceeds"),
+            "unexpected save error: {save_error}"
+        );
+        assert!(!save_path.exists(), "oversized map left a replacement file");
     }
 
     #[test]
