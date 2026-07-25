@@ -252,6 +252,41 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-SEC-006 - Keep Nebula private keys local to their owning node
 
 - Status: Remaining
+- Progress (2026-07-25 live `.15` legacy-bundle migration and replicated-secret
+  cleanup): `mackesd` now has a supervisor-only one-way migration for
+  pre-SEC-006 replicated bundles: generic bundle reads still fail closed on
+  secret-bearing JSON, while the local Nebula supervisor strips legacy
+  `peer_key_pem`/relay-authority/private-CA fields, rewrites the bundle through
+  the public serializer, and then migrates the owning node's already-local flat
+  `/etc/nebula/host.{crt,key}` into `/etc/nebula/identity/current` only when the
+  flat certificate matches the replicated public peer cert. Legacy flat-key
+  permissions are tightened only for owner-controlled stale read bits, and
+  config refresh now runs before a bounded leadership lookup so an unreachable
+  coordination plane cannot starve local Nebula repair; failed reloads remain
+  unacknowledged for retry. Farm gates are green: `.130` BigBoy
+  `cargo test -p mackesd --lib --features async-services
+  workers::nebula_supervisor::tests -- --nocapture` at **51/51**, `.50`
+  bundle-sanitizer regression at **1/1**, `.170` touched-file rustfmt, and the
+  corrected release build. The deployed `.15` release hash is
+  `8bccb4b1d596939942d1a2041256810a225957545f148e1d10279ae6e151ce73`; previous
+  hashes `61c0c202...` and `39349229...` were backed up under
+  `/usr/local/lib/magic-mesh-backups/`. Live proof on
+  `Basement-Test-Workstation` shows `/etc/nebula/identity` mode `0700`,
+  `identity/current -> generation-2452075-e2478c409683353e`,
+  `/etc/nebula/host.crt -> identity/current/host.crt`,
+  `/etc/nebula/host.key -> identity/current/host.key`, active key/cert targets
+  mode `0600`, and `config.yaml` pki paths set to
+  `/etc/nebula/identity/current/host.{crt,key}`. The local replicated bundle now
+  has no `peer_key_pem` and zero key/private field names. Eight other
+  replicated legacy records, including Syncthing `.stversions`, were sanitized
+  in place by removing only `peer_key_pem` without printing or copying secret
+  contents. The bounded collector snapshot
+  `/var/tmp/wl-sec-006-nebula-live-after-migration-clean-20260725T211259Z`
+  reports a clean replicated secret scan (`0` lines), `nebula.service` and
+  `mackesd.service` active with `NRestarts=0`, and `nebula1=10.42.0.8/17`.
+  The only remaining collector failure is the external overlay probe
+  `10.42.0.1` being unreachable; no replicated-key blocker remains in this
+  live workgroup scan.
 - Progress (2026-07-25 live-readonly `.15` collector rerun): streamed the
   existing `install-helpers/verify-nebula-rotation-evidence.sh` collector to the
   enrolled non-production seat `Basement-Test-Workstation` (`172.20.0.15`,
@@ -1174,6 +1209,18 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-011 - Communications collaboration suite full replacement
 
 - Status: Remaining
+- Progress (2026-07-25 worker merge/log backpressure boundary): the
+  collaboration worker now keeps its own merge slices below the core
+  all-or-nothing 4,096-envelope cap by batching retained Bus and actor-log input
+  at 1,024 events. Durable JSONL actor-log replay now streams through a
+  `BufReader`, skips oversized lines before serde/projection, avoids directory
+  symlink traversal by checking entry file types, and does not materialize an
+  unbounded retained log into memory before merge. Farm gates are green:
+  `.130` `cargo test -p mackesd --lib --features async-services
+  workers::collab::tests -- --nocapture` at **24/24**, `.90` focused
+  `merge_batch_chunks_oversized_retained_input` at **1/1**, and `.170`
+  touched-file rustfmt. Live WebRTC/SIP/LiveKit/media and sealed DO/LLM
+  provider demonstrations remain external evidence follow-ups, not blockers.
 - Progress (2026-07-25 call media provider-proof seam): the retained
   `state/collab/call-media-verification` publisher now consumes an explicit
   in-daemon `CallMediaProviderRegistry` instead of a hardcoded null transport.
@@ -1865,6 +1912,26 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-012 - Maps live-data overlays (zero-cost external feeds)
 
 - Status: Remaining
+- Progress (2026-07-25 NWS keyless default-on/degraded live proof): the
+  `nws_alert_overlay` Workstation-tier worker now starts by default unless
+  explicitly disabled with `MDE_OVERLAY_NWS_ALERTS=0/false/no/off`, keeps the
+  blocking `reqwest` client lifetime inside the blocking fetch path, and
+  publishes an honest public-domain degraded snapshot when a fresh same-host
+  MG90 vehicle fix is unavailable instead of staying absent. Farm gates are
+  green: `.90` `cargo test -p mackesd --lib
+  workers::nws_alert_overlay::tests -- --nocapture` at **15/15**, `.170`
+  focused
+  `nws_alert_overlay::tests::keyless_nws_alert_producer_defaults_on_with_explicit_false_opt_out`
+  at **1/1**, and touched-file rustfmt. After deploying the integrated
+  `mackesd` release
+  `8bccb4b1d596939942d1a2041256810a225957545f148e1d10279ae6e151ce73` to `.15`,
+  the read-only live verifier passed for
+  `state/overlay/nws-alerts/Basement-Test-Workstation` with `ok=true`,
+  `ready=true`, `fresh=true`, age **968 ms**, `record_count=0`,
+  `license_tier=public-domain`, `attribution=NWS`, catalog feed allowed, and
+  the explicit gap `fresh same-host MG90 vehicle fix unavailable`. This proves
+  default-on keyless NWS alert publication and honest degraded state; it does
+  not claim active alert polygons without a fresh MG90/home-location fix.
 - Progress (2026-07-25 USGS keyless default-on producer wiring): the
   `earthquake_overlay` Workstation-tier worker is no longer absent-by-default:
   the zero-cost public USGS all-hour GeoJSON producer now starts unless

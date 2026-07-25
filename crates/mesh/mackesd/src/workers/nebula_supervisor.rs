@@ -36,6 +36,11 @@ use super::{ShutdownToken, Worker};
 /// Default sweep cadence.
 pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(5);
 
+/// A stale or unreachable coordination plane must not starve local Nebula
+/// config repair. Leadership reconciliation is advisory for this worker's
+/// config-refresh path, so fail closed quickly and retry on the next tick.
+const DEFAULT_LEADERSHIP_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Default marker file path that systemd's
 /// `ConditionPathExists=` checks for lighthouse/tunnel
 /// units.
@@ -72,6 +77,7 @@ pub struct NebulaSupervisor {
     /// Coordination-plane endpoints. Empty means the legacy filesystem lease
     /// is authoritative; non-empty means etcd is authoritative.
     leadership_endpoints: Vec<String>,
+    leadership_lookup_timeout: Duration,
     /// Last-known leader state — flipping this triggers the
     /// promote / demote transition.
     last_is_leader: bool,
@@ -112,6 +118,7 @@ impl NebulaSupervisor {
             workgroup_root,
             last_blocklist: Vec::new(),
             leadership_endpoints: crate::substrate::etcd::default_endpoints(),
+            leadership_lookup_timeout: DEFAULT_LEADERSHIP_LOOKUP_TIMEOUT,
             systemctl_path: PathBuf::from("systemctl"),
         }
     }
@@ -180,6 +187,14 @@ impl NebulaSupervisor {
     /// success; logs + swallows individual step failures so
     /// a single bad tick doesn't kill the worker.
     async fn tick(&mut self) {
+        // Local config repair is deliberately first. A stale/unreachable
+        // coordination plane must not keep an already-enrolled peer from
+        // sanitizing a legacy bundle, materializing `/etc/nebula`, or retrying a
+        // failed reload.
+        if !self.refresh_changed_config().await {
+            return;
+        }
+
         // 1. Check the authoritative lease. Promotion owns creation/repair of
         //    the local marker, so requiring that marker here would make a
         //    clean elected lighthouse unable to bootstrap. The mirror puller
@@ -188,6 +203,7 @@ impl NebulaSupervisor {
             &self.workgroup_root,
             &self.node_id,
             &self.leadership_endpoints,
+            self.leadership_lookup_timeout,
         )
         .await;
         let marker_is_ours = read_role_marker(&self.role_marker_path)
@@ -225,8 +241,14 @@ impl NebulaSupervisor {
         //     step 2 then re-renders /etc/nebula + reloads nebula.
         self.reconcile_lighthouse_roster();
 
-        // 2. Watch the bundle file + the revocation blocklist for
-        //    changes (ENT-3: a revoke anywhere must evict here).
+        // 2. Re-run after roster reconciliation so a rewritten lighthouse set is
+        //    applied on the same tick instead of waiting for the next cadence.
+        let _ = self.refresh_changed_config().await;
+    }
+
+    /// Watch the bundle file + the revocation blocklist for changes
+    /// (ENT-3: a revoke anywhere must evict here).
+    async fn refresh_changed_config(&mut self) -> bool {
         let blocklist_now = crate::ca::blocklist::all_fingerprints(&self.workgroup_root);
         let blocklist_changed = blocklist_now != self.last_blocklist;
         if let Some(mtime) = bundle_watch_mtime(&self.bundle_path) {
@@ -243,10 +265,12 @@ impl NebulaSupervisor {
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "nebula-supervisor: config refresh failed; will retry");
+                        return false;
                     }
                 }
             }
         }
+        true
     }
 
     /// Leader-promotion: mint CA if missing, write
@@ -298,8 +322,15 @@ impl NebulaSupervisor {
     /// QNM-Shared bundle + signal the running nebula
     /// process to reload.
     async fn refresh_config(&self) -> Result<(), String> {
-        let bundle =
-            crate::ca::bundle::read_bundle(&self.bundle_path).map_err(|e| e.to_string())?;
+        let (bundle, sanitized_legacy_secret_bundle) =
+            crate::ca::bundle::read_bundle_sanitizing_legacy_secrets(&self.bundle_path)
+                .map_err(|e| e.to_string())?;
+        if sanitized_legacy_secret_bundle {
+            tracing::warn!(
+                path = %self.bundle_path.display(),
+                "nebula-supervisor: sanitized legacy replicated bundle by stripping private-key fields before local identity migration"
+            );
+        }
         if !relay_authority_is_trusted(&bundle, &self.relay_trust_authority_pin_path) {
             return Err(
                 "replicated Nebula bundle relay trust authority does not match the local enrollment pin"
@@ -641,13 +672,31 @@ fn install_identity_generation(
         key
     } else {
         let current_key = identity_dir.join("current/host.key");
+        let current_cert = identity_dir.join("current/host.crt");
+        let legacy_cert = config_dir.join("host.crt");
         let legacy_key = config_dir.join("host.key");
-        owned_key = crate::ca::seal::read_sealed(if current_key.exists() {
-            &current_key
+        if !current_cert.exists() && (legacy_cert.exists() || legacy_key.exists()) {
+            let legacy_cert_bytes = crate::ca::seal::read_no_follow(&legacy_cert).map_err(|e| {
+                format!(
+                    "read legacy local Nebula cert {}: {e}",
+                    legacy_cert.display()
+                )
+            })?;
+            if legacy_cert_bytes != bundle.peer_cert_pem.as_bytes() {
+                return Err(
+                    "legacy local Nebula cert does not match replicated bundle; authenticated enrollment is required"
+                        .into(),
+                );
+            }
+        }
+        let key_path = if current_key.exists() {
+            current_key.as_path()
         } else {
-            &legacy_key
-        })
-        .map_err(|e| format!("local requester-owned Nebula key unavailable: {e}"))?;
+            tighten_legacy_private_key_permissions(&legacy_key)?;
+            legacy_key.as_path()
+        };
+        owned_key = crate::ca::seal::read_sealed(key_path)
+            .map_err(|e| format!("local requester-owned Nebula key unavailable: {e}"))?;
         &owned_key
     };
 
@@ -727,6 +776,46 @@ fn install_identity_generation(
     // active generation is useful; retaining every historical key would make
     // local identity storage grow without bound.
     prune_stale_identity_generations(&identity_dir, generation_leaf);
+    Ok(())
+}
+
+fn tighten_legacy_private_key_permissions(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    match crate::ca::seal::read_sealed(path) {
+        Ok(_) => return Ok(()),
+        Err(crate::ca::CaError::InsecurePermissions { .. }) => {}
+        Err(error) => {
+            return Err(format!(
+                "legacy local Nebula key is not readable through the sealed-file boundary: {error}"
+            ));
+        }
+    }
+
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("inspect legacy local Nebula key {}: {e}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "legacy local Nebula key is not a regular file: {}",
+            path.display()
+        ));
+    }
+    if metadata.uid() != rustix::process::getuid().as_raw() {
+        return Err(format!(
+            "legacy local Nebula key is not owned by the current verifier uid: {}",
+            path.display()
+        ));
+    }
+    let mode = metadata.permissions().mode() & 0o777;
+    if (mode & !0o644) != 0 || (mode & 0o600) != 0o600 {
+        return Err(format!(
+            "legacy local Nebula key has unsafe permissions {mode:#o}; only owner read/write plus stale group/other read bits can be auto-tightened"
+        ));
+    }
+    let mut permissions = metadata.permissions();
+    permissions.set_mode(0o600);
+    std::fs::set_permissions(path, permissions)
+        .map_err(|e| format!("tighten legacy local Nebula key {}: {e}", path.display()))?;
     Ok(())
 }
 
@@ -1349,7 +1438,13 @@ pub(crate) async fn role_marker_is_current_leader(
     if marker_node_id != expected_node_id {
         return false;
     }
-    authoritative_lease_names_node(workgroup_root, expected_node_id, leadership_endpoints).await
+    authoritative_lease_names_node(
+        workgroup_root,
+        expected_node_id,
+        leadership_endpoints,
+        DEFAULT_LEADERSHIP_LOOKUP_TIMEOUT,
+    )
+    .await
 }
 
 /// Read only the authoritative coordination-plane lease. This is intentionally
@@ -1360,17 +1455,28 @@ async fn authoritative_lease_names_node(
     workgroup_root: &Path,
     expected_node_id: &str,
     leadership_endpoints: &[String],
+    lookup_timeout: Duration,
 ) -> bool {
-    let lease = if leadership_endpoints.is_empty() {
-        crate::leader::read_current_lease(&workgroup_root.join(".mackesd-leader.lock"))
-    } else {
-        let Ok(mut client) = crate::substrate::etcd::connect(leadership_endpoints).await else {
-            return false;
-        };
-        crate::substrate::leader::current_leader(&mut client)
-            .await
-            .ok()
-            .flatten()
+    let lookup = async {
+        if leadership_endpoints.is_empty() {
+            crate::leader::read_current_lease(&workgroup_root.join(".mackesd-leader.lock"))
+        } else {
+            let Ok(mut client) = crate::substrate::etcd::connect(leadership_endpoints).await else {
+                return None;
+            };
+            crate::substrate::leader::current_leader(&mut client)
+                .await
+                .ok()
+                .flatten()
+        }
+    };
+    let Ok(lease) = tokio::time::timeout(lookup_timeout, lookup).await else {
+        tracing::debug!(
+            timeout_ms = lookup_timeout.as_millis(),
+            endpoints = leadership_endpoints.len(),
+            "nebula-supervisor: leadership lookup timed out; retrying next tick"
+        );
+        return false;
     };
     lease.is_some_and(|lease| lease.node_id == expected_node_id)
 }
@@ -1711,6 +1817,64 @@ mod tests {
             crate::ca::seal::read_sealed(&tmp.path().join("identity/current/host.key")).unwrap(),
             b"key-generation-b",
             "replicated refresh must not replace local private-key material"
+        );
+    }
+
+    #[test]
+    fn replicated_refresh_migrates_matching_legacy_flat_identity() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bundle = sample_bundle();
+        std::fs::write(tmp.path().join("host.crt"), bundle.peer_cert_pem.as_bytes())
+            .expect("legacy cert");
+        std::fs::write(tmp.path().join("host.key"), b"legacy-local-key").expect("legacy key");
+        std::fs::set_permissions(
+            tmp.path().join("host.key"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .expect("legacy key mode");
+
+        materialize_config(tmp.path(), &bundle, ConfigRole::Peer, &[], tmp.path(), None)
+            .expect("legacy flat identity migration");
+
+        assert_eq!(
+            std::fs::read(tmp.path().join("identity/current/host.crt")).unwrap(),
+            bundle.peer_cert_pem.as_bytes()
+        );
+        assert_eq!(
+            crate::ca::seal::read_sealed(&tmp.path().join("identity/current/host.key")).unwrap(),
+            b"legacy-local-key"
+        );
+        assert_eq!(
+            std::fs::read_link(tmp.path().join("host.crt")).unwrap(),
+            std::path::PathBuf::from("identity/current/host.crt")
+        );
+        assert_eq!(
+            std::fs::read_link(tmp.path().join("host.key")).unwrap(),
+            std::path::PathBuf::from("identity/current/host.key")
+        );
+        assert!(std::fs::read_to_string(tmp.path().join("config.yaml"))
+            .unwrap()
+            .contains("key: /etc/nebula/identity/current/host.key"));
+    }
+
+    #[test]
+    fn replicated_refresh_refuses_mismatched_legacy_flat_cert() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bundle = sample_bundle();
+        std::fs::write(tmp.path().join("host.crt"), b"different-cert").expect("legacy cert");
+        crate::ca::seal::write_atomic_sealed(tmp.path().join("host.key").as_path(), b"legacy-key")
+            .expect("legacy key");
+
+        let error =
+            materialize_config(tmp.path(), &bundle, ConfigRole::Peer, &[], tmp.path(), None)
+                .expect_err("mismatched legacy cert must fail closed");
+
+        assert!(error.contains("legacy local Nebula cert does not match replicated bundle"));
+        assert!(
+            !tmp.path().join("identity/current").exists(),
+            "no identity switch should be activated for a mismatched legacy cert"
         );
     }
 

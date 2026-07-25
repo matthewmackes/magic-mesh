@@ -44,6 +44,8 @@
 #![cfg(feature = "async-services")]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -106,6 +108,18 @@ const SYSTEM_SPACE_NAME: &str = "System";
 /// The default poll cadence (tests override with a short value; the loop is
 /// entirely edge-driven off the Bus so the interval only bounds latency).
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Worker-side merge slices stay comfortably below the collaboration core's
+/// fail-closed 4,096-envelope admission cap. The core still owns the hard
+/// all-or-nothing batch bound; the worker just avoids manufacturing oversized
+/// aggregate batches from retained Bus lanes or actor logs.
+const MAX_WORKER_MERGE_BATCH_EVENTS: usize = 1024;
+
+/// Actor-log JSONL lines mirror the projection's 256 KiB serialized-envelope
+/// boundary, plus the writer's trailing `\n`. Oversized retained lines are
+/// skipped before serde/projection so a hostile durable log cannot force
+/// unbounded materialization in this worker.
+const MAX_ACTOR_LOG_LINE_BYTES: usize = 256 * 1024 + 1;
 
 /// Every [`CollabCommand`] verb, as the fixed `action/collab/<verb>` lane set the
 /// worker drains. Fixed (not discovered via `list_topics`) so each lane's drain
@@ -601,7 +615,8 @@ impl CollabWorker {
         changed: &mut bool,
     ) {
         let all_topics = persist.list_topics().unwrap_or_default();
-        let mut incoming: Vec<CollabEventEnvelope> = Vec::new();
+        let mut incoming: Vec<CollabEventEnvelope> =
+            Vec::with_capacity(MAX_WORKER_MERGE_BATCH_EVENTS);
         for topic in &all_topics {
             if !topic.starts_with(topics::EVENT_PREFIX) {
                 continue;
@@ -619,8 +634,30 @@ impl CollabWorker {
                 let Some(body) = m.body.as_deref() else {
                     continue;
                 };
+                if body.len() > MAX_ACTOR_LOG_LINE_BYTES {
+                    tracing::warn!(
+                        target: "mackesd::collab",
+                        topic = topic.as_str(),
+                        bytes = body.len(),
+                        max_bytes = MAX_ACTOR_LOG_LINE_BYTES,
+                        "skipping oversized collab/event envelope",
+                    );
+                    continue;
+                }
                 match serde_json::from_str::<CollabEventEnvelope>(body) {
-                    Ok(env) => incoming.push(env),
+                    Ok(env) => {
+                        incoming.push(env);
+                        if incoming.len() == MAX_WORKER_MERGE_BATCH_EVENTS {
+                            self.merge_batch(
+                                state,
+                                std::mem::take(&mut incoming),
+                                touched,
+                                changed,
+                                "bus",
+                            );
+                            incoming.reserve(MAX_WORKER_MERGE_BATCH_EVENTS);
+                        }
+                    }
                     Err(e) => tracing::warn!(
                         target: "mackesd::collab",
                         topic = topic.as_str(),
@@ -648,16 +685,16 @@ impl CollabWorker {
         touched: &mut BTreeSet<SpaceId>,
         changed: &mut bool,
     ) {
-        let mut incoming: Vec<CollabEventEnvelope> = Vec::new();
         for path in collect_log_files(&self.log_root) {
             let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             if state.log_sizes.get(&path) == Some(&len) {
                 continue; // unchanged since last backfill
             }
-            incoming.extend(read_log_envelopes(&path));
+            read_log_envelope_chunks(&path, |incoming| {
+                self.merge_batch(state, incoming, touched, changed, "log");
+            });
             state.log_sizes.insert(path, len);
         }
-        self.merge_batch(state, incoming, touched, changed, "log");
     }
 
     /// Merge a batch of foreign/replicated events into the engine, marking the
@@ -680,22 +717,30 @@ impl CollabWorker {
                 touched.insert(env.space_id);
             }
         }
-        match state.engine.merge(incoming) {
-            Ok(outcome) => {
-                if outcome.accepted > 0 {
-                    *changed = true;
+        for chunk in incoming.chunks(MAX_WORKER_MERGE_BATCH_EVENTS) {
+            match state.engine.merge(chunk.to_vec()) {
+                Ok(outcome) => {
+                    if outcome.accepted > 0 {
+                        *changed = true;
+                    }
+                    if outcome.dropped_invalid > 0 {
+                        tracing::warn!(
+                            target: "mackesd::collab",
+                            source,
+                            dropped = outcome.dropped_invalid,
+                            "dropped unverifiable collab events (bad/absent signature)",
+                        );
+                    }
                 }
-                if outcome.dropped_invalid > 0 {
+                Err(e) => {
                     tracing::warn!(
                         target: "mackesd::collab",
                         source,
-                        dropped = outcome.dropped_invalid,
-                        "dropped unverifiable collab events (bad/absent signature)",
+                        error = %e,
+                        "collab merge failed",
                     );
+                    break;
                 }
-            }
-            Err(e) => {
-                tracing::warn!(target: "mackesd::collab", source, error = %e, "collab merge failed")
             }
         }
     }
@@ -1147,7 +1192,7 @@ fn collect_log_files(root: &Path) -> Vec<PathBuf> {
     };
     for space_entry in spaces.flatten() {
         let space_dir = space_entry.path();
-        if !space_dir.is_dir() {
+        if !space_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
         }
         let Ok(files) = std::fs::read_dir(&space_dir) else {
@@ -1155,7 +1200,9 @@ fn collect_log_files(root: &Path) -> Vec<PathBuf> {
         };
         for file in files.flatten() {
             let p = file.path();
-            if p.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+            if file.file_type().map(|t| t.is_file()).unwrap_or(false)
+                && p.extension().and_then(|e| e.to_str()) == Some("jsonl")
+            {
                 out.push(p);
             }
         }
@@ -1163,29 +1210,115 @@ fn collect_log_files(root: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Read every signed envelope from one JSON-lines actor-log file. A torn/partial
-/// trailing line (a crash between sign + fsync) or a malformed line is skipped,
-/// never fatal.
-fn read_log_envelopes(path: &Path) -> Vec<CollabEventEnvelope> {
-    let mut out = Vec::new();
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return out;
+/// Read signed envelopes from one JSON-lines actor-log file in worker-sized
+/// chunks. A torn/partial trailing line, malformed line, or oversized line is
+/// skipped, never fatal.
+fn read_log_envelope_chunks(path: &Path, mut on_chunk: impl FnMut(Vec<CollabEventEnvelope>)) {
+    let Ok(file) = File::open(path) else {
+        return;
     };
-    for line in content.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<CollabEventEnvelope>(line) {
-            Ok(env) => out.push(env),
-            Err(e) => tracing::warn!(
-                target: "mackesd::collab",
-                path = %path.display(),
-                error = %e,
-                "skipping malformed actor-log line",
-            ),
+    let mut reader = BufReader::new(file);
+    let mut batch = Vec::with_capacity(MAX_WORKER_MERGE_BATCH_EVENTS);
+    let mut line_number: u64 = 0;
+    loop {
+        match read_bounded_log_line(&mut reader, MAX_ACTOR_LOG_LINE_BYTES) {
+            Ok(Some(BoundedLogLine::Line(line))) => {
+                line_number = line_number.saturating_add(1);
+                if line.iter().all(u8::is_ascii_whitespace) {
+                    continue;
+                }
+                match serde_json::from_slice::<CollabEventEnvelope>(&line) {
+                    Ok(env) => {
+                        batch.push(env);
+                        if batch.len() == MAX_WORKER_MERGE_BATCH_EVENTS {
+                            on_chunk(std::mem::take(&mut batch));
+                            batch.reserve(MAX_WORKER_MERGE_BATCH_EVENTS);
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        target: "mackesd::collab",
+                        path = %path.display(),
+                        line = line_number,
+                        error = %e,
+                        "skipping malformed actor-log line",
+                    ),
+                }
+            }
+            Ok(Some(BoundedLogLine::OverLimit)) => {
+                line_number = line_number.saturating_add(1);
+                tracing::warn!(
+                    target: "mackesd::collab",
+                    path = %path.display(),
+                    line = line_number,
+                    max_bytes = MAX_ACTOR_LOG_LINE_BYTES,
+                    "skipping oversized actor-log line",
+                );
+            }
+            Ok(None) => break,
+            Err(e) => {
+                tracing::warn!(
+                    target: "mackesd::collab",
+                    path = %path.display(),
+                    error = %e,
+                    "actor-log read failed",
+                );
+                break;
+            }
         }
     }
-    out
+    if !batch.is_empty() {
+        on_chunk(batch);
+    }
+}
+
+enum BoundedLogLine {
+    Line(Vec<u8>),
+    OverLimit,
+}
+
+fn read_bounded_log_line<R: BufRead>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> std::io::Result<Option<BoundedLogLine>> {
+    let mut line = Vec::new();
+    let mut over_limit = false;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            if line.is_empty() && !over_limit {
+                return Ok(None);
+            }
+            if over_limit {
+                return Ok(Some(BoundedLogLine::OverLimit));
+            }
+            return Ok(Some(BoundedLogLine::Line(line)));
+        }
+
+        let newline_at = available.iter().position(|b| *b == b'\n');
+        let consume = newline_at.map_or(available.len(), |pos| pos + 1);
+        if !over_limit {
+            let next_len = line.len().saturating_add(consume);
+            if next_len > max_bytes {
+                over_limit = true;
+            } else {
+                line.extend_from_slice(&available[..consume]);
+            }
+        }
+        reader.consume(consume);
+
+        if newline_at.is_some() {
+            if over_limit {
+                return Ok(Some(BoundedLogLine::OverLimit));
+            }
+            if line.ends_with(b"\n") {
+                line.pop();
+            }
+            if line.ends_with(b"\r") {
+                line.pop();
+            }
+            return Ok(Some(BoundedLogLine::Line(line)));
+        }
+    }
 }
 
 /// Whether `topic` is a truthful alert lane the collab worker folds — one of the
@@ -1491,6 +1624,7 @@ mod tests {
         TransferMethod, TransferState,
     };
     use rand::rngs::OsRng;
+    use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     const AUTH_KEY: &[u8] = b"collab-action-auth-test-key";
@@ -1682,6 +1816,126 @@ mod tests {
         assert_eq!(got.len(), 2, "the full backlog drains on first sight");
         // Forward thereafter.
         assert!(take_new_all(&persist, &mut cursors, "t/all").is_empty());
+    }
+
+    #[test]
+    fn merge_batch_chunks_oversized_retained_input() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let w = worker(dir.path(), "eagle");
+        let mut state = CollabState::new(w.self_actor.clone()).expect("state");
+        let foreign_signer = Ed25519Signer::new(key());
+        let mut foreign = CollabEngine::in_memory(ActorId::new("nyc3")).expect("engine");
+        let mut fids = RandomIds;
+        let env = foreign
+            .apply(
+                &CollabCommand::CreateSpace {
+                    kind: SpaceKind::Team,
+                    name: "oversized-batch".into(),
+                },
+                &foreign_signer,
+                &mut fids,
+                50,
+            )
+            .expect("foreign create")
+            .remove(0);
+        let space = env.space_id;
+        let incoming = vec![env; MAX_WORKER_MERGE_BATCH_EVENTS * 4 + 1];
+        let mut touched = BTreeSet::new();
+        let mut changed = false;
+
+        w.merge_batch(&mut state, incoming, &mut touched, &mut changed, "test");
+
+        assert!(
+            changed,
+            "the first bounded chunk is accepted instead of the whole aggregate failing"
+        );
+        assert!(
+            state.engine.state().space(space).is_some(),
+            "oversized retained aggregates converge over bounded worker chunks"
+        );
+        assert!(touched.contains(&space));
+    }
+
+    #[test]
+    fn backfill_logs_streams_retained_actor_log_in_chunks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let w = worker(dir.path(), "eagle");
+        let mut state = CollabState::new(w.self_actor.clone()).expect("state");
+        let foreign_signer = Ed25519Signer::new(key());
+        let mut foreign = CollabEngine::in_memory(ActorId::new("nyc3")).expect("engine");
+        let mut fids = RandomIds;
+        let env = foreign
+            .apply(
+                &CollabCommand::CreateSpace {
+                    kind: SpaceKind::Team,
+                    name: "retained-log".into(),
+                },
+                &foreign_signer,
+                &mut fids,
+                50,
+            )
+            .expect("foreign create")
+            .remove(0);
+        let space = env.space_id;
+        let log_path = w.log_root.join(space.to_string()).join("nyc3.jsonl");
+        std::fs::create_dir_all(log_path.parent().expect("log parent")).expect("mkdir log parent");
+        let line = serde_json::to_string(&env).expect("serialize event");
+        {
+            let mut file = File::create(&log_path).expect("create actor log");
+            for _ in 0..(MAX_WORKER_MERGE_BATCH_EVENTS * 4 + 1) {
+                writeln!(file, "{line}").expect("write actor log line");
+            }
+        }
+        let mut touched = BTreeSet::new();
+        let mut changed = false;
+
+        w.backfill_logs(&mut state, &mut touched, &mut changed);
+
+        assert!(
+            changed,
+            "a retained log longer than the core batch cap is streamed in bounded chunks"
+        );
+        assert!(state.engine.state().space(space).is_some());
+        assert!(touched.contains(&space));
+    }
+
+    #[test]
+    fn actor_log_reader_skips_oversized_line_and_keeps_following_valid_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("actor.jsonl");
+        let foreign_signer = Ed25519Signer::new(key());
+        let mut foreign = CollabEngine::in_memory(ActorId::new("nyc3")).expect("engine");
+        let mut fids = RandomIds;
+        let env = foreign
+            .apply(
+                &CollabCommand::CreateSpace {
+                    kind: SpaceKind::Team,
+                    name: "valid-after-oversized".into(),
+                },
+                &foreign_signer,
+                &mut fids,
+                50,
+            )
+            .expect("foreign create")
+            .remove(0);
+        {
+            let mut file = File::create(&path).expect("create actor log");
+            file.write_all(&vec![b'x'; MAX_ACTOR_LOG_LINE_BYTES + 1])
+                .expect("write oversized line");
+            file.write_all(b"\n").expect("write newline");
+            writeln!(
+                file,
+                "{}",
+                serde_json::to_string(&env).expect("serialize event")
+            )
+            .expect("write valid line");
+        }
+        let mut got = Vec::new();
+
+        read_log_envelope_chunks(&path, |chunk| got.extend(chunk));
+
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].event_id, env.event_id);
     }
 
     #[test]

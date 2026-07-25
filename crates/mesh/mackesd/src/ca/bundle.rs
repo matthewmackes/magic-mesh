@@ -546,6 +546,34 @@ pub fn read_bundle(path: &Path) -> Result<NebulaBundle, CaError> {
     }
 }
 
+/// Supervisor-only one-way migration for pre-SEC-006 replicated bundles.
+///
+/// Generic callers must keep using [`read_bundle`], which refuses any
+/// secret-bearing legacy record. The local Nebula supervisor has a narrower
+/// obligation during an in-place upgrade: if this node already owns its local
+/// `/etc/nebula/host.key`, it must be able to strip stale replicated secret
+/// fields, rewrite the bundle through the public serializer, and then migrate
+/// the local key into `/etc/nebula/identity/current`. This helper deliberately
+/// ignores every secret-bearing legacy field; it never returns or logs private
+/// material.
+pub(crate) fn read_bundle_sanitizing_legacy_secrets(
+    path: &Path,
+) -> Result<(NebulaBundle, bool), CaError> {
+    let body = String::from_utf8(super::seal::read_no_follow(path)?)
+        .map_err(|e| CaError::Io(format!("read {}: bundle is not UTF-8: {e}", path.display())))?;
+    match serde_json::from_str(&body) {
+        Ok(bundle) => Ok((bundle, false)),
+        Err(public_error) => {
+            let legacy: LegacySecretBearingBundle = serde_json::from_str(&body)
+                .map_err(|_| CaError::Sql(format!("parse bundle: {public_error}")))?;
+            let stripped_secret_material = legacy.has_private_material();
+            let public = legacy.into_public();
+            write_bundle(path, &public)?;
+            Ok((public, stripped_secret_material))
+        }
+    }
+}
+
 /// Deserialize-only compatibility adapter for pre-SEC-006 files. It is private,
 /// has no `Serialize` implementation, and refuses any non-empty secret before
 /// converting to the public type.
@@ -633,6 +661,26 @@ mod tests {
         std::fs::write(&path, json).unwrap();
         let error = read_bundle(&path).expect_err("migration adapter must refuse secrets");
         assert!(error.to_string().contains("re-enroll"));
+    }
+
+    #[test]
+    fn supervisor_migration_sanitizes_legacy_secret_bundle_without_returning_secret() {
+        let json = r#"{"mesh_id":"m","epoch":0,"ca_cert_pem":"c","peer_cert_pem":"p",
+            "peer_key_pem":"secret-peer-key","overlay_ip":"10.42.0.5",
+            "mesh_cidr":"10.42.0.0/16","lighthouses":[],"created_at":1}"#;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("legacy.json");
+        std::fs::write(&path, json).unwrap();
+
+        let (bundle, stripped) =
+            read_bundle_sanitizing_legacy_secrets(&path).expect("sanitize legacy bundle");
+
+        assert!(stripped, "secret-bearing legacy fields must be reported");
+        assert_eq!(bundle.peer_cert_pem, "p");
+        let sanitized = std::fs::read_to_string(&path).expect("read sanitized bundle");
+        assert!(!sanitized.contains("secret-peer-key"));
+        assert!(!sanitized.contains("peer_key_pem"));
+        read_bundle(&path).expect("sanitized bundle is public-readable");
     }
 
     #[test]

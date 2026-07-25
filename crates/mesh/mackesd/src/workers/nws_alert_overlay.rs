@@ -1,10 +1,12 @@
 //! WL-FUNC-012 / OVERLAY-1 — keyless NWS active-weather-alert adapter.
 //!
-//! Workstations opt in with `MDE_OVERLAY_NWS_ALERTS=1`. A fresh local vehicle
-//! fix drives the point-scoped `/alerts/active?point=lat,lon` query. Inline CAP
-//! geometry is normalized directly; alerts with null geometry resolve their
-//! `affectedZones` GeoJSON through a bounded static cache. Blocking rustls HTTP
-//! runs via `spawn_blocking`, never on a Tokio worker thread.
+//! Workstations start this keyless, public-domain producer by default. A fresh
+//! local vehicle fix drives the point-scoped `/alerts/active?point=lat,lon`
+//! query. Inline CAP geometry is normalized directly; alerts with null geometry
+//! resolve their `affectedZones` GeoJSON through a bounded static cache.
+//! Blocking rustls HTTP runs via `spawn_blocking`, never on a Tokio worker
+//! thread. Operators can explicitly disable the producer with
+//! `MDE_OVERLAY_NWS_ALERTS=0/false/no/off`.
 
 #![cfg(feature = "async-services")]
 
@@ -25,7 +27,7 @@ use serde_json::Value;
 
 use super::{ShutdownToken, Worker};
 
-/// Explicit opt-in; absent/false is an idle no-op.
+/// Explicit disable for the keyless default-on NWS alerts producer.
 pub const ENABLED_ENV: &str = "MDE_OVERLAY_NWS_ALERTS";
 /// Optional operator-controlled endpoint override.
 pub const ENDPOINT_ENV: &str = "MDE_OVERLAY_NWS_ALERTS_URL";
@@ -88,8 +90,6 @@ struct Validators {
 
 /// Production rustls probe with required descriptive User-Agent.
 pub struct NwsHttpProbe {
-    client: Client,
-    zone_client: Client,
     endpoint: String,
     validators: Mutex<Validators>,
     zone_cache: Mutex<HashMap<String, String>>,
@@ -97,23 +97,7 @@ pub struct NwsHttpProbe {
 
 impl NwsHttpProbe {
     fn new(endpoint: String) -> io::Result<Self> {
-        let client = Client::builder()
-            .timeout(HTTP_TIMEOUT)
-            .user_agent(USER_AGENT)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(io_other)?;
-        let zone_client = Client::builder()
-            .timeout(ZONE_HTTP_TIMEOUT)
-            .user_agent(USER_AGENT)
-            // An api.weather.gov affected-zone URL must never redirect this
-            // worker to a different origin.
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(io_other)?;
         Ok(Self {
-            client,
-            zone_client,
             endpoint,
             validators: Mutex::new(Validators::default()),
             zone_cache: Mutex::new(HashMap::new()),
@@ -133,7 +117,17 @@ impl NwsHttpProbe {
 impl NwsAlertProbe for NwsHttpProbe {
     fn fetch_alerts(&self, point: GeoPoint) -> io::Result<ProbeResponse> {
         let url = self.point_url(point)?;
-        let mut request = self.client.get(&url);
+        // `reqwest::blocking::Client` owns an internal runtime that must be
+        // dropped outside Tokio async contexts. Build and drop it inside this
+        // blocking fetch call; `fetch_async` already runs the probe via
+        // `spawn_blocking`, while sync tests call it outside an async runtime.
+        let client = Client::builder()
+            .timeout(HTTP_TIMEOUT)
+            .user_agent(USER_AGENT)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(io_other)?;
+        let mut request = client.get(&url);
         let mut sent_validator = false;
         {
             let validators = self
@@ -184,7 +178,16 @@ impl NwsAlertProbe for NwsHttpProbe {
         {
             return Ok(body);
         }
-        let response = self.zone_client.get(url).send().map_err(io_other)?;
+        // An api.weather.gov affected-zone URL must never redirect this worker
+        // to a different origin, and the blocking client must not outlive this
+        // blocking fetch call once the default-on worker is managed by Tokio.
+        let client = Client::builder()
+            .timeout(ZONE_HTTP_TIMEOUT)
+            .user_agent(USER_AGENT)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(io_other)?;
+        let response = client.get(url).send().map_err(io_other)?;
         reject_non_success(&response, "NWS zone")?;
         let mut response = response.error_for_status().map_err(io_other)?;
         reject_declared_oversize(&response, MAX_ZONE_BODY_BYTES, "NWS zone")?;
@@ -594,10 +597,12 @@ pub struct NwsAlertOverlayWorker {
 }
 
 impl NwsAlertOverlayWorker {
-    /// Production wiring. Disabled unless explicitly opted in.
+    /// Production wiring. The keyless NWS alert adapter is enabled by default
+    /// on spawned Workstation-tier nodes; an explicit false-y env disables it.
+    /// Blocking HTTP client/fetch failures publish honest degraded snapshots.
     #[must_use]
     pub fn new(host: String) -> Self {
-        let probe = if env_truthy(ENABLED_ENV) {
+        let probe = if env_default_enabled(ENABLED_ENV) {
             let endpoint = std::env::var(ENDPOINT_ENV)
                 .ok()
                 .filter(|value| !value.trim().is_empty())
@@ -824,7 +829,7 @@ impl Worker for NwsAlertOverlayWorker {
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
         let Some(probe) = self.probe.clone() else {
-            tracing::info!(target: "mackesd::nws_alert_overlay", env = ENABLED_ENV, "NWS alert overlay not configured; worker idle");
+            tracing::info!(target: "mackesd::nws_alert_overlay", env = ENABLED_ENV, "NWS alert overlay disabled or unavailable; worker idle");
             shutdown.wait().await;
             return Ok(());
         };
@@ -862,13 +867,15 @@ impl Worker for NwsAlertOverlayWorker {
     }
 }
 
-fn env_truthy(name: &str) -> bool {
-    std::env::var(name).is_ok_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
+fn env_default_enabled(name: &str) -> bool {
+    overlay_enabled_from_env(std::env::var(name).ok().as_deref())
+}
+
+fn overlay_enabled_from_env(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(|value| value.trim().to_ascii_lowercase()),
+        Some(value) if matches!(value.as_str(), "0" | "false" | "no" | "off")
+    )
 }
 
 fn now_ms() -> i64 {
@@ -1062,13 +1069,33 @@ mod tests {
     }
 
     #[test]
+    fn keyless_nws_alert_producer_defaults_on_with_explicit_false_opt_out() {
+        assert!(overlay_enabled_from_env(None));
+        assert!(overlay_enabled_from_env(Some("")));
+        assert!(overlay_enabled_from_env(Some("1")));
+        assert!(overlay_enabled_from_env(Some("true")));
+        assert!(overlay_enabled_from_env(Some("yes")));
+        assert!(overlay_enabled_from_env(Some("on")));
+        assert!(!overlay_enabled_from_env(Some("0")));
+        assert!(!overlay_enabled_from_env(Some("false")));
+        assert!(!overlay_enabled_from_env(Some("NO")));
+        assert!(!overlay_enabled_from_env(Some(" off ")));
+    }
+
+    #[test]
     fn not_modified_cannot_relabel_a_prior_points_snapshot() {
         let temp = tempfile::tempdir().expect("temp");
         let root = temp.path().to_path_buf();
-        let worker = NwsAlertOverlayWorker::new("rig-1".to_string())
-            .with_bus_root(Some(root.clone()));
-        let old = build_snapshot(&FakeProbe::captured(), "rig-1", point(), CAPTURED_ALERTS, 10)
-            .expect("captured NWS parse");
+        let worker =
+            NwsAlertOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+        let old = build_snapshot(
+            &FakeProbe::captured(),
+            "rig-1",
+            point(),
+            CAPTURED_ALERTS,
+            10,
+        )
+        .expect("captured NWS parse");
         let old_alert_count = old.alerts.len();
         let mut last_good = Some(old);
         let new_point = GeoPoint {
@@ -1091,10 +1118,7 @@ mod tests {
         let degraded: NwsAlertSnapshot = serde_json::from_str(&body).expect("snapshot");
         assert!(degraded.alerts.is_empty());
         assert_eq!(degraded.query_point, Some(new_point));
-        assert!(degraded
-            .gaps
-            .iter()
-            .any(|gap| gap.contains("304 point")));
+        assert!(degraded.gaps.iter().any(|gap| gap.contains("304 point")));
         assert_eq!(degraded.license_tier, "public-domain");
         assert_eq!(degraded.attribution, "NWS");
     }
@@ -1103,22 +1127,23 @@ mod tests {
     fn failed_refresh_publishes_empty_degraded_projection_and_retains_private_cache() {
         let temp = tempfile::tempdir().expect("temp");
         let root = temp.path().to_path_buf();
-        let worker = NwsAlertOverlayWorker::new("rig-1".to_string())
-            .with_bus_root(Some(root.clone()));
-        let original =
-            build_snapshot(&FakeProbe::captured(), "rig-1", point(), CAPTURED_ALERTS, 10)
-                .expect("captured NWS parse");
+        let worker =
+            NwsAlertOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+        let original = build_snapshot(
+            &FakeProbe::captured(),
+            "rig-1",
+            point(),
+            CAPTURED_ALERTS,
+            10,
+        )
+        .expect("captured NWS parse");
         let mut last_good = None;
         assert!(worker.apply_result(
             Ok(PreparedResponse::Modified(original)),
             point(),
             &mut last_good
         ));
-        assert!(!worker.apply_result(
-            Err(io::Error::other("timeout")),
-            point(),
-            &mut last_good
-        ));
+        assert!(!worker.apply_result(Err(io::Error::other("timeout")), point(), &mut last_good));
 
         let retained = last_good.as_ref().expect("private conditional cache");
         assert_eq!(retained.alerts.len(), 2);
@@ -1135,10 +1160,7 @@ mod tests {
         let degraded: NwsAlertSnapshot = serde_json::from_str(&body).expect("snapshot");
         assert!(degraded.alerts.is_empty());
         assert_eq!(degraded.query_point, Some(point()));
-        assert!(degraded
-            .gaps
-            .iter()
-            .any(|gap| gap.contains("timeout")));
+        assert!(degraded.gaps.iter().any(|gap| gap.contains("timeout")));
         assert_eq!(degraded.license_tier, "public-domain");
         assert_eq!(degraded.attribution, "NWS");
     }
@@ -1147,11 +1169,16 @@ mod tests {
     fn no_fresh_fix_clears_persisted_stale_alerts_after_restart() {
         let temp = tempfile::tempdir().expect("temp");
         let root = temp.path().to_path_buf();
-        let seed_worker = NwsAlertOverlayWorker::new("rig-1".to_string())
-            .with_bus_root(Some(root.clone()));
-        let original =
-            build_snapshot(&FakeProbe::captured(), "rig-1", point(), CAPTURED_ALERTS, 10)
-                .expect("captured NWS parse");
+        let seed_worker =
+            NwsAlertOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+        let original = build_snapshot(
+            &FakeProbe::captured(),
+            "rig-1",
+            point(),
+            CAPTURED_ALERTS,
+            10,
+        )
+        .expect("captured NWS parse");
         let mut seed_cache = None;
         assert!(seed_worker.apply_result(
             Ok(PreparedResponse::Modified(original)),
@@ -1159,8 +1186,8 @@ mod tests {
             &mut seed_cache
         ));
 
-        let restarted = NwsAlertOverlayWorker::new("rig-1".to_string())
-            .with_bus_root(Some(root.clone()));
+        let restarted =
+            NwsAlertOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
         let restart_cache = None;
         restarted.publish_unavailable(
             &restart_cache,
@@ -1341,5 +1368,55 @@ mod tests {
         tx.send(true).expect("shutdown");
         let joined = tokio::time::timeout(Duration::from_millis(200), task).await;
         assert!(joined.is_ok(), "shutdown wins over blocking reqwest seam");
+    }
+
+    #[tokio::test]
+    async fn default_on_worker_publishes_degraded_snapshot_without_vehicle_fix() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().to_path_buf();
+        let mut worker = NwsAlertOverlayWorker::new("rig-1".to_string())
+            .with_probe(Arc::new(FakeProbe::captured()))
+            .with_bus_root(Some(root.clone()))
+            .with_poll(Duration::from_millis(50));
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let token = ShutdownToken::from_receiver(rx);
+        let handle = tokio::spawn(async move { worker.run(token).await });
+
+        let topic = nws_alert_state_topic("rig-1");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let body = loop {
+            if let Some(row) = Persist::open(root.clone())
+                .expect("bus")
+                .read_latest(&topic)
+                .expect("read")
+            {
+                break row.body.expect("body");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "default-on NWS worker did not publish a degraded no-fix snapshot"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        tx.send(true).expect("shutdown");
+        let joined = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert!(joined.is_ok(), "worker exits promptly after proof");
+        joined
+            .expect("join timeout")
+            .expect("join")
+            .expect("worker ok");
+
+        let snapshot: NwsAlertSnapshot = serde_json::from_str(&body).expect("snapshot");
+        assert_eq!(snapshot.host, "rig-1");
+        assert!(snapshot.fetched_at_ms > 0);
+        assert!(snapshot.alerts.is_empty());
+        assert!(snapshot.query_point.is_none());
+        assert!(snapshot
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("vehicle fix unavailable")));
+        assert_eq!(snapshot.license_tier, "public-domain");
+        assert_eq!(snapshot.attribution, "NWS");
     }
 }
