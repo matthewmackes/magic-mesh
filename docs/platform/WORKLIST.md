@@ -645,6 +645,14 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-ARCH-007 - Repair Workloads cockpit E2E wire, placement, and authorization
 
 - Status: Remaining
+- Progress (2026-07-25 desired-state write/preflight boundary): Workloads
+  desired writes now reject serialized documents above 256 KiB before creating
+  any state tree, and `set-desired` preflights every existing canonical JSON
+  document with bounded no-follow regular-file reads before the first batch
+  mutation. The focused desired-verb farm gate is green at **16/16**, the
+  focused reconcile gate at **18/18**, and the integrated BigBoy `mackesd`
+  gate is green at **4,115 passed, 0 failed, 1 ignored**. Live
+  libvirt/Podman lifecycle evidence remains external.
 - Progress (2026-07-25 image-catalog boundary): Workloads image roster and
   promotion now reject symlinked image roots/version directories, bounded
   manifest/sidecar reads use no-follow regular files, artifact discovery skips
@@ -983,6 +991,13 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-011 - Communications collaboration suite full replacement
 
 - Status: Remaining
+- Progress (2026-07-25 import-map commit boundary): collaboration import-map
+  saves now reject symlinked/non-directory parent components, allocate unique
+  0600 create-new temporary files, sync the file and parent directory, and
+  atomically replace the final map without following a planted legacy temp
+  link. The focused import farm gate is green at **17/17** and the full core
+  farm suite at **69/69**; live WebRTC/SIP and sealed DO/LLM evidence remain
+  external.
 - Progress (2026-07-25 purge-candidate boundary): collaboration purge
   accounting now admits only canonical lower-case 64-character SHA-256
   digests, so signed traversal/mixed-case/malformed references remain inert
@@ -1931,6 +1946,13 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-006 - Construct interface (Apple-HIG-principled workstation shell)
 
 - Status: Remaining
+- Progress (2026-07-25 shared-search bounded-ranking boundary): the shared
+  omnibox ranker now bounds query, title/target, and auxiliary-term
+  materialization, caps the candidate working set at 256 hits, and preserves
+  deterministic ranking under hostile large inventories. The focused search
+  farm gate is green at **10/10**, the full `mde-egui` suite at **251/251**,
+  and the integrated shell gate at **1,807/1,807**. Live pointer, pixel,
+  physical, and VDI acceptance remain external evidence.
 - Progress (2026-07-25 notification geometry boundary): Construct notification
   rows now reserve the glyph column and wrap hostile-length alert text inside
   the fixed panel width, keeping controls and hit targets in the workspace.

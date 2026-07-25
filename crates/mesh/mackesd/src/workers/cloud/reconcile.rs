@@ -271,8 +271,7 @@ pub(crate) fn read_desired_slice(state_root: &Path, node: &str) -> Vec<WorkloadS
             continue;
         };
         if let Ok(spec) = serde_json::from_str::<WorkloadSpec>(&body) {
-            let Ok(expected_stem) =
-                path_key::file_stem("name", &spec.name, DESIRED_DOC_SUFFIX)
+            let Ok(expected_stem) = path_key::file_stem("name", &spec.name, DESIRED_DOC_SUFFIX)
             else {
                 continue;
             };
@@ -290,7 +289,7 @@ pub(crate) fn read_desired_slice(state_root: &Path, node: &str) -> Vec<WorkloadS
 /// malformed or foreign JSON document into an empty/no-op plan. The public
 /// inspection helper above remains best-effort for state mirrors, but the plan
 /// path must fail closed because it drives the desired-state verdict.
-fn read_desired_slice_strict(
+pub(super) fn read_desired_slice_strict(
     state_root: &Path,
     node: &str,
 ) -> Result<Vec<WorkloadSpec>, String> {
@@ -328,13 +327,15 @@ fn read_desired_slice_strict(
         if spec.node != node {
             return Err(format!(
                 "desired document {} targets node `{}` instead of `{node}`",
-                path.display(), spec.node
+                path.display(),
+                spec.node
             ));
         }
         if file_stem != expected_stem {
             return Err(format!(
                 "desired document {} does not match workload name `{}`",
-                path.display(), spec.name
+                path.display(),
+                spec.name
             ));
         }
         specs.push(spec);
@@ -352,10 +353,15 @@ fn read_desired_slice_strict(
 pub(crate) fn write_desired_doc(state_root: &Path, spec: &WorkloadSpec) -> Result<(), String> {
     let node = path_key::segment("node", &spec.node)?;
     let name = path_key::file_stem("name", &spec.name, DESIRED_DOC_SUFFIX)?;
-    let dir = checked_desired_dir(state_root, node, true)?
-        .ok_or_else(|| format!("desired directory {} was not created", state_root.display()))?;
     let body =
         serde_json::to_string_pretty(spec).map_err(|e| format!("serialize desired doc: {e}"))?;
+    if body.len() > MAX_DESIRED_DOC_BYTES {
+        return Err(format!(
+            "desired document exceeds {MAX_DESIRED_DOC_BYTES}-byte limit"
+        ));
+    }
+    let dir = checked_desired_dir(state_root, node, true)?
+        .ok_or_else(|| format!("desired directory {} was not created", state_root.display()))?;
     let path = dir.join(format!("{name}{DESIRED_DOC_SUFFIX}"));
     write_desired_doc_atomic(&path, &body)
 }
@@ -611,6 +617,24 @@ mod tests {
     }
 
     #[test]
+    fn desired_store_rejects_an_oversized_payload_before_creating_the_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("state");
+        let mut oversized = spec("huge", "eagle");
+        oversized.raw_hcl = Some("x".repeat(MAX_DESIRED_DOC_BYTES));
+
+        let err = write_desired_doc(&root, &oversized).unwrap_err();
+        assert!(
+            err.contains("exceeds 262144-byte limit"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !root.exists(),
+            "an oversized desired document must fail before creating state"
+        );
+    }
+
+    #[test]
     fn desired_remove_rejects_escape_and_preserves_the_outside_file() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("state");
@@ -722,7 +746,10 @@ mod tests {
         let slice = read_desired_slice(root, "eagle");
         assert!(slice.is_empty(), "mismatched desired doc was reconciled");
         assert!(!remove_desired_doc(root, "eagle", "web").unwrap());
-        assert!(forged.is_file(), "the rejected record must remain inspectable");
+        assert!(
+            forged.is_file(),
+            "the rejected record must remain inspectable"
+        );
     }
 
     #[test]
@@ -775,7 +802,10 @@ mod tests {
         // document is skipped while a valid sibling remains visible.
         let slice = read_desired_slice(root, "eagle");
         assert_eq!(
-            slice.iter().map(|spec| spec.name.as_str()).collect::<Vec<_>>(),
+            slice
+                .iter()
+                .map(|spec| spec.name.as_str())
+                .collect::<Vec<_>>(),
             ["good"]
         );
 
@@ -783,10 +813,7 @@ mod tests {
         let error = read_desired_slice_strict(root, "eagle")
             .expect_err("an oversized desired document must gate reconciliation");
         let limit_error = format!("exceeds {MAX_DESIRED_DOC_BYTES}-byte limit");
-        assert!(
-            error.contains(&limit_error),
-            "unexpected error: {error}"
-        );
+        assert!(error.contains(&limit_error), "unexpected error: {error}");
     }
 
     #[test]

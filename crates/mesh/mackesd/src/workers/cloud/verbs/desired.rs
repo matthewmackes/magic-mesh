@@ -19,6 +19,8 @@
 
 use serde::Deserialize;
 use std::collections::HashSet;
+use std::io::Read;
+use std::path::Path;
 
 use mackes_mesh_types::cloud::{CloudReply, WorkloadSpec};
 
@@ -30,6 +32,9 @@ use super::super::CloudWorker;
 /// boundary. Check this before asking `serde_json` to materialize caller-owned
 /// arrays and strings; the shared IPC cap keeps the mutation surface bounded.
 const MAX_SET_DESIRED_BODY_BYTES: usize = crate::ipc::MAX_RPC_BODY_BYTES;
+/// Keep the existing-state preflight bounded by the same ceiling used by the
+/// reconcile reader, including room for an operator-supplied raw-HCL fragment.
+const MAX_EXISTING_DESIRED_DOC_BYTES: usize = 256 * 1024;
 
 /// The `set-desired` request body: one `spec`, a `specs` batch, and/or a `remove`
 /// list of workload names. Every field is optional so the handler enforces what it
@@ -174,6 +179,19 @@ pub(crate) fn handle_set_desired(w: &CloudWorker, verb_name: &str, body_str: &st
         }
     }
 
+    // Preflight the existing slice before the first mutation. A malformed,
+    // foreign, or non-regular JSON entry is stale desired state, not an empty
+    // slice; allowing the batch to start would make a later write/removal fail
+    // after earlier operations had already persisted. The strict reader keeps
+    // this mutation boundary fail-closed and preserves the batch's all-input
+    // validation-before-write contract.
+    if let Err(error) = preflight_existing_desired_slice(&w.state_root, request_node) {
+        return reject(
+            verb_name,
+            format!("existing desired state is not writable: {error}"),
+        );
+    }
+
     // Write each declared spec.
     let mut accepted: Vec<WorkloadSpec> = Vec::new();
     for spec in to_write {
@@ -208,6 +226,110 @@ fn parse_set_desired_body(body_str: &str) -> Result<SetDesiredBody, String> {
         ));
     }
     serde_json::from_str(body_str.trim()).map_err(|e| format!("malformed set-desired request: {e}"))
+}
+
+/// Validate every existing canonical document before a `set-desired` batch
+/// starts mutating the slice. This mirrors the reconcile reader locally because
+/// that strict helper is intentionally private to the reconcile module.
+///
+/// The final entry is opened with `NOFOLLOW` and a byte ceiling, so the
+/// preflight cannot turn a planted symlink or oversized document into an
+/// unbounded read while deciding whether the batch is safe to start.
+fn preflight_existing_desired_slice(state_root: &Path, node: &str) -> Result<(), String> {
+    let dir = reconcile::desired_dir(state_root, node)?;
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("read desired directory {}: {error}", dir.display())),
+    };
+
+    for entry in entries {
+        let path = entry
+            .map_err(|error| format!("read desired directory {}: {error}", dir.display()))?
+            .path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        let file_stem = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .ok_or_else(|| format!("desired document has no valid filename: {}", path.display()))?;
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|error| format!("inspect desired document {}: {error}", path.display()))?;
+        if !metadata.file_type().is_file() {
+            return Err(format!(
+                "refusing non-regular desired document {}",
+                path.display()
+            ));
+        }
+
+        let body = read_existing_desired_doc_bounded(&path)?;
+        let spec = serde_json::from_str::<WorkloadSpec>(&body)
+            .map_err(|error| format!("malformed desired document {}: {error}", path.display()))?;
+        let expected_stem = super::super::path_key::file_stem("name", &spec.name, ".json")
+            .map_err(|error| format!("invalid desired document {}: {error}", path.display()))?;
+        if spec.node != node {
+            return Err(format!(
+                "desired document {} targets node `{}` instead of `{node}`",
+                path.display(),
+                spec.node
+            ));
+        }
+        if file_stem != expected_stem {
+            return Err(format!(
+                "desired document {} does not match workload name `{}`",
+                path.display(),
+                spec.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn read_existing_desired_doc_bounded(path: &Path) -> Result<String, String> {
+    #[cfg(unix)]
+    let file: std::fs::File = {
+        use rustix::fs::{Mode, OFlags};
+
+        rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| format!("open desired document {}: {error}", path.display()))?
+        .into()
+    };
+    #[cfg(not(unix))]
+    let file = std::fs::File::open(path)
+        .map_err(|error| format!("open desired document {}: {error}", path.display()))?;
+
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("inspect desired document {}: {error}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "desired document {} is not a regular file",
+            path.display()
+        ));
+    }
+    let limit = u64::try_from(MAX_EXISTING_DESIRED_DOC_BYTES).unwrap_or(u64::MAX);
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len())
+            .unwrap_or(MAX_EXISTING_DESIRED_DOC_BYTES)
+            .saturating_add(1)
+            .min(MAX_EXISTING_DESIRED_DOC_BYTES.saturating_add(1)),
+    );
+    file.take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read desired document {}: {error}", path.display()))?;
+    if bytes.len() > MAX_EXISTING_DESIRED_DOC_BYTES {
+        return Err(format!(
+            "desired document {} exceeds {MAX_EXISTING_DESIRED_DOC_BYTES}-byte limit",
+            path.display()
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|error| format!("desired document {} is not UTF-8: {error}", path.display()))
 }
 
 /// Render this node's desired slice and return the pending-change [`PlanCounts`].
@@ -528,6 +650,31 @@ mod tests {
     }
 
     #[test]
+    fn set_desired_rejects_a_nonregular_existing_doc_before_any_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = reconcile::desired_dir(tmp.path(), "eagle").unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir(dir.join("stale.json")).unwrap();
+        let w = worker(
+            "eagle",
+            tmp.path().to_path_buf(),
+            Arc::new(FakeRunner::default()),
+        );
+        let body = r#"{"node":"eagle","spec":{
+            "name":"new","delivery_type":"service_vm","node":"eagle",
+            "vcpu":1,"memory_mb":512,"disk_gb":4}}"#;
+
+        let reply = handle_set_desired(&w, "set-desired", body);
+        assert!(!reply.ok);
+        assert!(reply
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("existing desired state is not writable")));
+        assert!(!dir.join("new.json").exists());
+        assert!(dir.join("stale.json").is_dir());
+    }
+
+    #[test]
     fn plan_renders_the_slice_and_returns_counts() {
         let tmp = tempfile::tempdir().unwrap();
         let runner = Arc::new(FakeRunner {
@@ -570,8 +717,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let runner = Arc::new(FakeRunner {
             plan_ndjson: Some(
-                r#"{"type":"change_summary","changes":{"add":1,"change":0,"remove":0}}"#
-                    .into(),
+                r#"{"type":"change_summary","changes":{"add":1,"change":0,"remove":0}}"#.into(),
             ),
             ..Default::default()
         });

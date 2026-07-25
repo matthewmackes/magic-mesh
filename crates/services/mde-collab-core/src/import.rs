@@ -147,21 +147,72 @@ impl ImportMap {
     /// Returns an error if the map schema is unsupported, the directory cannot
     /// be created, or the write fails.
     pub fn save(&self, path: &Path) -> Result<()> {
+        use std::io::Write as _;
+
         self.validate_version()?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        ensure_real_directory_tree(parent)?;
         let body = serde_json::to_string_pretty(self)?;
         if body.len() as u64 > MAX_IMPORT_MAP_BYTES {
             return Err(CollabError::Serde(format!(
                 "import map exceeds {MAX_IMPORT_MAP_BYTES} bytes"
             )));
         }
-        let mut tmp = path.as_os_str().to_owned();
-        tmp.push(".tmp");
-        let tmp = PathBuf::from(tmp);
-        std::fs::write(&tmp, body.as_bytes())?;
-        std::fs::rename(&tmp, path)?;
+        let leaf = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                CollabError::Serde("import map path has an invalid filename".to_string())
+            })?;
+
+        // A fixed sibling temp path can be planted as a symlink between runs.
+        // Allocate a private, create_new file instead, then atomically replace
+        // the final name. The counter is process-local; create_new closes the
+        // remaining collision window with stale files or another process.
+        static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let (tmp, mut file) = (0..16)
+            .find_map(|attempt| {
+                let serial = TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let candidate = parent.join(format!(
+                    ".{leaf}.tmp.{}.{}.{}",
+                    std::process::id(),
+                    serial,
+                    attempt
+                ));
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt as _;
+                    options.mode(0o600);
+                }
+                match options.open(&candidate) {
+                    Ok(file) => Some(Ok::<_, CollabError>((candidate, file))),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+                    Err(error) => Some(Err(CollabError::from(error))),
+                }
+            })
+            .ok_or_else(|| {
+                CollabError::Io("could not allocate import map temporary file".to_string())
+            })??;
+
+        if let Err(error) = file
+            .write_all(body.as_bytes())
+            .and_then(|()| file.sync_all())
+        {
+            drop(file);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error.into());
+        }
+        drop(file);
+        if let Err(error) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error.into());
+        }
+        std::fs::File::open(parent)?.sync_all()?;
         Ok(())
     }
 
@@ -814,6 +865,39 @@ fn is_real_directory(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Create an import-map parent only through real directory components. The
+/// migration state is local, but it still crosses a filesystem trust boundary;
+/// never let a planted symlink redirect a durable idempotency write.
+fn ensure_real_directory_tree(path: &Path) -> Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        // Components are accumulated so a relative path such as `state/maps`
+        // is checked one directory at a time rather than only at its leaf.
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(CollabError::Io(format!(
+                    "import map parent is not a real directory: {}",
+                    current.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&current)?;
+                let metadata = std::fs::symlink_metadata(&current)?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(CollabError::Io(format!(
+                        "created import map parent is unsafe: {}",
+                        current.display()
+                    )));
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
 /// The editor autosave file's decoded shape. The shipping file carries only the
 /// autosave *preference*; the optional `documents` array is a forward-compatible
 /// seam so a richer future autosave (open buffers) migrates without a code
@@ -1060,7 +1144,10 @@ mod tests {
 
         let ring_dir = tmp.path().join("ring.json");
         std::fs::create_dir(&ring_dir).expect("create non-regular source");
-        assert!(read_ring(&ring_dir).is_empty(), "directory was read as a ring");
+        assert!(
+            read_ring(&ring_dir).is_empty(),
+            "directory was read as a ring"
+        );
         assert!(
             read_editor_autosave(&ring_dir).is_none(),
             "directory was read as editor state"
@@ -1084,7 +1171,10 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&values).expect("encode ring"))
             .expect("write ring");
 
-        assert!(read_ring(&path).is_empty(), "over-cap ring was partially read");
+        assert!(
+            read_ring(&path).is_empty(),
+            "over-cap ring was partially read"
+        );
     }
 
     #[cfg(unix)]
@@ -1101,7 +1191,10 @@ mod tests {
         .expect("write ring");
         let linked_ring = tmp.path().join("linked-ring.json");
         symlink(&real_ring, &linked_ring).expect("link ring");
-        assert!(read_ring(&linked_ring).is_empty(), "symlinked ring was read");
+        assert!(
+            read_ring(&linked_ring).is_empty(),
+            "symlinked ring was read"
+        );
 
         let real_editor = tmp.path().join("real-editor.json");
         std::fs::write(&real_editor, r#"{"enabled":true}"#).expect("write editor");
@@ -1199,6 +1292,57 @@ mod tests {
         // A missing map file loads as empty (the first import).
         let fresh = ImportMap::load(&tmp.path().join("absent.json")).expect("load-absent");
         assert!(fresh.imported.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn import_map_save_rejects_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).expect("outside");
+        let linked_parent = tmp.path().join("state");
+        symlink(&outside, &linked_parent).expect("link parent");
+
+        let mut map = ImportMap::new();
+        map.record("msg|redirected".to_string(), event_id_for("redirected"));
+        let path = linked_parent.join("import-map.json");
+        let error = map
+            .save(&path)
+            .expect_err("symlinked parent must fail closed");
+
+        assert!(error.to_string().contains("import map parent"));
+        assert!(
+            !outside.join("import-map.json").exists(),
+            "save escaped through the symlinked parent"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn import_map_save_does_not_follow_planted_legacy_temp_link() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = tmp.path().join("state");
+        std::fs::create_dir(&state).expect("state");
+        let outside = tmp.path().join("outside.json");
+        std::fs::write(&outside, b"sentinel").expect("sentinel");
+        let path = state.join("import-map.json");
+        // Older implementations used this predictable sibling and followed it
+        // with `fs::write`, allowing a planted symlink to overwrite `outside`.
+        symlink(&outside, path.with_extension("json.tmp")).expect("link temp");
+
+        let map = ImportMap::new();
+        map.save(&path).expect("save with planted legacy temp link");
+
+        assert_eq!(std::fs::read(&outside).expect("read sentinel"), b"sentinel");
+        assert!(path.is_file(), "the real map was not installed");
+        assert!(
+            path.with_extension("json.tmp").symlink_metadata().is_ok(),
+            "the planted temp entry was unexpectedly removed"
+        );
     }
 
     #[test]

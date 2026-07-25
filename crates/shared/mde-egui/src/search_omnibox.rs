@@ -166,6 +166,11 @@ pub enum MatchTier {
     FuzzyTitle,
 }
 
+const MAX_RANKED_HITS: usize = 256;
+const MAX_QUERY_CHARS: usize = 256;
+const MAX_SEARCH_FIELD_CHARS: usize = 4096;
+const MAX_SEARCH_TERMS: usize = 32;
+
 /// Rank `items` for `query`, best first, capped at `cap`.
 ///
 /// Lexical exactness always wins: title prefix, target/URL prefix, title
@@ -180,32 +185,40 @@ pub fn ranked_hits<T: Clone>(
     items: impl IntoIterator<Item = SearchItem<T>>,
     cap: usize,
 ) -> Vec<SearchHit<T>> {
-    let q = query.trim().to_lowercase();
+    let q = query
+        .trim()
+        .chars()
+        .take(MAX_QUERY_CHARS)
+        .flat_map(|character| character.to_lowercase())
+        .collect::<String>();
+    let cap = cap.min(MAX_RANKED_HITS);
     if q.is_empty() || cap == 0 {
         return Vec::new();
     }
 
-    let mut scored: Vec<(MatchTier, (usize, usize), u8, i32, usize, SearchItem<T>)> = items
-        .into_iter()
-        .filter_map(|item| {
-            let (tier, cost) = score_item(&q, &item)?;
-            Some((
-                tier,
-                cost,
-                item.source_health.penalty(),
-                item.model_score.unwrap_or(0),
-                item.source_rank,
-                item,
-            ))
-        })
-        .collect();
-    scored.sort_by(|a, b| {
-        a.0.cmp(&b.0)
-            .then(a.1.cmp(&b.1))
-            .then(a.2.cmp(&b.2))
-            .then(b.3.cmp(&a.3))
-            .then(a.4.cmp(&b.4))
-    });
+    // Keep the working set bounded as well as the returned result. A caller can
+    // hand this shared core a large live inventory; collecting every matching
+    // candidate before applying `cap` would turn the result cap into a false
+    // memory-safety boundary.
+    let mut scored = Vec::with_capacity(cap.min(64));
+    for item in items {
+        let Some((tier, cost)) = score_item(&q, &item) else {
+            continue;
+        };
+        scored.push((
+            tier,
+            cost,
+            item.source_health.penalty(),
+            item.model_score.unwrap_or(0),
+            item.source_rank,
+            item,
+        ));
+        if scored.len() > cap {
+            scored.sort_by(compare_scored);
+            scored.pop();
+        }
+    }
+    scored.sort_by(compare_scored);
     scored
         .into_iter()
         .take(cap)
@@ -214,8 +227,8 @@ pub fn ranked_hits<T: Clone>(
 }
 
 fn score_item<T>(query: &str, item: &SearchItem<T>) -> Option<(MatchTier, (usize, usize))> {
-    let title = item.title.to_lowercase();
-    let target = item.target.to_lowercase();
+    let title = lowercase_bounded(&item.title);
+    let target = lowercase_bounded(&item.target);
     if title.starts_with(query) {
         return Some((MatchTier::TitlePrefix, (0, 0)));
     }
@@ -229,11 +242,31 @@ fn score_item<T>(query: &str, item: &SearchItem<T>) -> Option<(MatchTier, (usize
         || item
             .terms
             .iter()
-            .any(|term| term.to_lowercase().contains(query))
+            .take(MAX_SEARCH_TERMS)
+            .any(|term| lowercase_bounded(term).contains(query))
     {
         return Some((MatchTier::AuxiliarySubstring, (0, 0)));
     }
     fuzzy_cost(&title, query).map(|cost| (MatchTier::FuzzyTitle, cost))
+}
+
+fn lowercase_bounded(value: &str) -> String {
+    value
+        .chars()
+        .take(MAX_SEARCH_FIELD_CHARS)
+        .flat_map(|character| character.to_lowercase())
+        .collect()
+}
+
+fn compare_scored<T>(
+    a: &(MatchTier, (usize, usize), u8, i32, usize, SearchItem<T>),
+    b: &(MatchTier, (usize, usize), u8, i32, usize, SearchItem<T>),
+) -> std::cmp::Ordering {
+    a.0.cmp(&b.0)
+        .then(a.1.cmp(&b.1))
+        .then(a.2.cmp(&b.2))
+        .then(b.3.cmp(&a.3))
+        .then(a.4.cmp(&b.4))
 }
 
 fn target_prefix_matches(target: &str, query: &str) -> bool {
@@ -541,5 +574,41 @@ mod tests {
             .collect();
 
         assert_eq!(ids, ["browser", "storage", "broadcaster"]);
+    }
+
+    #[test]
+    fn hostile_query_and_fields_are_bounded_before_lowercase_allocation() {
+        let query = format!(
+            "  {}{}",
+            "x".repeat(MAX_QUERY_CHARS),
+            "z".repeat(MAX_SEARCH_FIELD_CHARS + 1024)
+        );
+        let title = format!("{}{}", "x".repeat(MAX_SEARCH_FIELD_CHARS), "tail");
+        let item = SearchItem::new(SearchDomain::App, title, "surface:search", "bounded");
+
+        let hits = ranked_hits(&query, [item], 1);
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].item.payload, "bounded");
+    }
+
+    #[test]
+    fn ranked_hits_bounds_the_candidate_working_set_and_requested_cap() {
+        let hits = ranked_hits(
+            "mesh",
+            (0..10_000).map(|index| {
+                SearchItem::new(
+                    SearchDomain::Mesh,
+                    format!("mesh-node-{index}"),
+                    format!("peer:node-{index}"),
+                    index,
+                )
+            }),
+            usize::MAX,
+        );
+
+        assert_eq!(hits.len(), MAX_RANKED_HITS);
+        assert_eq!(hits[0].item.payload, 0);
+        assert_eq!(hits[MAX_RANKED_HITS - 1].item.payload, MAX_RANKED_HITS - 1);
     }
 }
