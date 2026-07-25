@@ -465,12 +465,17 @@ impl NebulaSupervisor {
                     });
             }
         }
-        // Compare as sets (sorted by node_id) so render-order differences alone
-        // don't trigger a rewrite/reload every tick.
-        roster.sort_by(|a, b| a.node_id.cmp(&b.node_id));
-        let mut current = bundle.lighthouses.clone();
-        current.sort_by(|a, b| a.node_id.cmp(&b.node_id));
-        if current == roster {
+        roster = normalize_lighthouse_roster(roster, authority.as_deref());
+        if roster.is_empty() {
+            // Same anti-strand guard as above: invalid/duplicate-only input
+            // from a transient directory read cannot wipe a usable roster.
+            return;
+        }
+        // Compare normalized sets so render-order differences alone don't
+        // trigger a rewrite/reload every tick, but still rewrite when the
+        // stored bundle carries duplicate overlay-IP claims.
+        let current = normalize_lighthouse_roster(bundle.lighthouses.clone(), authority.as_deref());
+        if current == roster && bundle.lighthouses == current {
             return;
         }
         let count = roster.len();
@@ -529,14 +534,15 @@ impl Worker for NebulaSupervisor {
 /// Distinct from `ca::sign::PeerRole` — this enum drives
 /// the *config-file* shape rather than the cert groups.
 /// Host gets the full lighthouse listener section; Peer
-/// gets the lighthouse-roster client section only.
+/// gets the lighthouse-roster client section and uses relays, but does not
+/// advertise itself as a relay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigRole {
     /// Lighthouse-eligible role — config file carries the
     /// full lighthouse listener section.
     Host,
-    /// Mesh-peer role — config file carries the lighthouse-
-    /// roster client section only (no listener).
+    /// Mesh-peer role — config file carries the lighthouse-roster client
+    /// section, relay usage, and punchy, but no lighthouse listener.
     Peer,
 }
 
@@ -634,7 +640,7 @@ fn install_identity_generation(
     bundle: &crate::ca::bundle::NebulaBundle,
     requester_private_key: Option<&[u8]>,
 ) -> Result<(), String> {
-    use std::os::unix::fs::{symlink, DirBuilderExt};
+    use std::os::unix::fs::{DirBuilderExt, symlink};
 
     let identity_dir = config_dir.join("identity");
     ensure_directory_tree(&identity_dir, 0o700, "Nebula identity")?;
@@ -1119,6 +1125,66 @@ fn unique_lighthouse_static_maps<'a>(
     entries
 }
 
+fn relay_identity_verified(
+    authority: Option<&str>,
+    entry: &crate::ca::bundle::LighthouseEntry,
+) -> bool {
+    authority.is_some_and(|public_key| {
+        entry.relay_tls.as_ref().is_some_and(|identity| {
+            crate::ca::bundle::verify_relay_tls_identity(
+                identity,
+                &entry.node_id,
+                &entry.overlay_ip,
+                &entry.external_addr,
+                public_key,
+            )
+        })
+    })
+}
+
+fn lighthouse_entry_wins_overlay_tie(
+    candidate: &crate::ca::bundle::LighthouseEntry,
+    incumbent: &crate::ca::bundle::LighthouseEntry,
+    authority: Option<&str>,
+) -> bool {
+    let candidate_verified = relay_identity_verified(authority, candidate);
+    let incumbent_verified = relay_identity_verified(authority, incumbent);
+    if candidate_verified != incumbent_verified {
+        return candidate_verified;
+    }
+    let candidate_numeric = external_addr_host_is_numeric(&candidate.external_addr);
+    let incumbent_numeric = external_addr_host_is_numeric(&incumbent.external_addr);
+    if candidate_numeric != incumbent_numeric {
+        return candidate_numeric;
+    }
+    (&candidate.node_id, &candidate.external_addr) < (&incumbent.node_id, &incumbent.external_addr)
+}
+
+fn normalize_lighthouse_roster(
+    entries: Vec<crate::ca::bundle::LighthouseEntry>,
+    authority: Option<&str>,
+) -> Vec<crate::ca::bundle::LighthouseEntry> {
+    let mut by_overlay =
+        std::collections::BTreeMap::<String, crate::ca::bundle::LighthouseEntry>::new();
+    for entry in entries {
+        if entry.overlay_ip.trim().is_empty() || entry.external_addr.trim().is_empty() {
+            continue;
+        }
+        match by_overlay.get_mut(&entry.overlay_ip) {
+            Some(incumbent) if lighthouse_entry_wins_overlay_tie(&entry, incumbent, authority) => {
+                *incumbent = entry;
+            }
+            Some(_) => {}
+            None => {
+                by_overlay.insert(entry.overlay_ip.clone(), entry);
+            }
+        }
+    }
+    let mut entries: Vec<_> = by_overlay.into_values().collect();
+    entries.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+    entries
+}
+
 fn address_host(address: &str) -> &str {
     address
         .rsplit_once(':')
@@ -1238,6 +1304,19 @@ fn render_config_yaml_inner(
     out.push_str("\nlisten:\n");
     out.push_str("  host: 0.0.0.0\n");
     out.push_str("  port: 4242\n\n");
+    // Enable the built-in relay and punchy paths on every node. A peer does not
+    // relay for others, but it must be willing to use lighthouse relays and
+    // respond to punchy probes. Without this, same-NAT / hairpin paths can strand
+    // a freshly-enrolled seat even while every node can still reach a lighthouse.
+    out.push_str("relay:\n");
+    match role {
+        ConfigRole::Host => out.push_str("  am_relay: true\n"),
+        ConfigRole::Peer => out.push_str("  am_relay: false\n"),
+    }
+    out.push_str("  use_relays: true\n");
+    out.push_str("punchy:\n");
+    out.push_str("  punch: true\n");
+    out.push_str("  respond: true\n\n");
     // Per the open-mesh / flat-trust directive:
     // a single open firewall rule — every peer can reach
     // every other peer on every port + protocol.
@@ -1298,15 +1377,7 @@ pub fn render_lighthouse_config_yaml_with_routes(
     bundle: &crate::ca::bundle::NebulaBundle,
     extra_routes: &[(String, String)],
 ) -> String {
-    let mut out = render_config_yaml_with_routes(bundle, ConfigRole::Host, &[], extra_routes);
-    out.push_str("\n# Lighthouse-only:\n");
-    out.push_str("relay:\n");
-    out.push_str("  am_relay: true\n");
-    out.push_str("  use_relays: true\n");
-    out.push_str("punchy:\n");
-    out.push_str("  punch: true\n");
-    out.push_str("  respond: true\n");
-    out
+    render_config_yaml_with_routes(bundle, ConfigRole::Host, &[], extra_routes)
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -1661,10 +1732,12 @@ mod tests {
         .expect_err("an unsafe existing identity root must fail closed");
         assert!(error.contains("unsafe Nebula identity directory"));
         assert!(!config_dir.join("ca.crt").exists());
-        assert!(std::fs::read_dir(&identity_dir)
-            .expect("identity directory")
-            .next()
-            .is_none());
+        assert!(
+            std::fs::read_dir(&identity_dir)
+                .expect("identity directory")
+                .next()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1854,9 +1927,11 @@ mod tests {
             std::fs::read_link(tmp.path().join("host.key")).unwrap(),
             std::path::PathBuf::from("identity/current/host.key")
         );
-        assert!(std::fs::read_to_string(tmp.path().join("config.yaml"))
-            .unwrap()
-            .contains("key: /etc/nebula/identity/current/host.key"));
+        assert!(
+            std::fs::read_to_string(tmp.path().join("config.yaml"))
+                .unwrap()
+                .contains("key: /etc/nebula/identity/current/host.key")
+        );
     }
 
     #[test]
@@ -2016,6 +2091,17 @@ mod tests {
     }
 
     #[test]
+    fn render_peer_config_uses_lighthouse_relay_and_punchy_paths() {
+        let yaml = render_config_yaml(&sample_bundle(), ConfigRole::Peer);
+        assert!(yaml.contains("relay:"));
+        assert!(yaml.contains("am_relay: false"));
+        assert!(yaml.contains("use_relays: true"));
+        assert!(yaml.contains("punchy:"));
+        assert!(yaml.contains("punch: true"));
+        assert!(yaml.contains("respond: true"));
+    }
+
+    #[test]
     fn signed_configured_lighthouse_gets_local_https_proxy_endpoint() {
         let key = ed25519_dalek::SigningKey::from_bytes(&[9_u8; 32]);
         let mut bundle = sample_bundle();
@@ -2048,13 +2134,15 @@ mod tests {
     #[test]
     fn unsigned_lighthouse_never_gets_local_https_proxy_endpoint() {
         let bundle = sample_bundle();
-        assert!(https_proxy_endpoint_for(
-            &bundle,
-            &bundle.lighthouses[0],
-            Some("lh1.example.com"),
-            Some("127.0.0.1:4244"),
-        )
-        .is_none());
+        assert!(
+            https_proxy_endpoint_for(
+                &bundle,
+                &bundle.lighthouses[0],
+                Some("lh1.example.com"),
+                Some("127.0.0.1:4244"),
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -2648,6 +2736,69 @@ exit 0
                 "lh-03".to_string()
             ],
             "an enrolled peer's bundle must grow to the full directory roster"
+        );
+    }
+
+    #[test]
+    fn reconcile_normalizes_duplicate_lighthouse_overlay_claims() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        seed_lighthouse(&root, "lh-hostname", "10.42.0.1", "lh1.example.com:4242");
+        seed_lighthouse(&root, "lh-numeric", "10.42.0.1", "203.0.113.1:4242");
+        seed_lighthouse(&root, "lh-02", "10.42.0.2", "203.0.113.2:4242");
+
+        let bundle_path = root.join("nebula-bundle.json");
+        let mut b = sample_bundle();
+        b.overlay_ip = "10.42.0.9".into();
+        b.lighthouses = vec![
+            LighthouseEntry {
+                node_id: "lh-hostname".into(),
+                overlay_ip: "10.42.0.1".into(),
+                external_addr: "lh1.example.com:4242".into(),
+                relay_tls: None,
+            },
+            LighthouseEntry {
+                node_id: "lh-stale".into(),
+                overlay_ip: "10.42.0.1".into(),
+                external_addr: "198.51.100.99:4242".into(),
+                relay_tls: None,
+            },
+        ];
+        crate::ca::bundle::write_bundle(&bundle_path, &b).expect("seed duplicate bundle");
+
+        let conn = crate::store::open(&root.join("store.sqlite")).expect("open");
+        let s = NebulaSupervisor::new(
+            Arc::new(Mutex::new(conn)),
+            "peer:eagle".into(),
+            "m1".into(),
+            bundle_path.clone(),
+        )
+        .with_workgroup_root(root.clone());
+        s.reconcile_lighthouse_roster();
+
+        let after = crate::ca::bundle::read_bundle(&bundle_path).expect("read");
+        assert_eq!(
+            after
+                .lighthouses
+                .iter()
+                .filter(|lh| lh.overlay_ip == "10.42.0.1")
+                .count(),
+            1,
+            "a stored bundle must not retain duplicate lighthouse overlay IP claims"
+        );
+        let winner = after
+            .lighthouses
+            .iter()
+            .find(|lh| lh.overlay_ip == "10.42.0.1")
+            .expect("deduped lighthouse");
+        assert_eq!(winner.node_id, "lh-numeric");
+        assert_eq!(winner.external_addr, "203.0.113.1:4242");
+        assert!(
+            after
+                .lighthouses
+                .iter()
+                .any(|lh| lh.overlay_ip == "10.42.0.2"),
+            "normalization must preserve other unique lighthouses"
         );
     }
 

@@ -24,12 +24,19 @@ instead of leaving closed work in this file.
   base/browser/thin-lighthouse RPM cut is green at **81.7 / 39.1 / 11.0 MiB**;
   the exact base RPM requires the F44 FFmpeg ABI (`libavcodec.so.62`,
   `libswresample.so.6`, `libswscale.so.9`).
-- **Dell seat:** Fedora 44 is refreshed and `magic-mesh` plus
-  `magic-mesh-browser` 12.1.0-1 are installed on `172.20.146.2`; `dnf check` is
-  clean, `mackesd` and `mde-shell-egui` are active with zero observed
-  restarts, and the CEF link-navigation verifier passes. Kernel reboot remains
-  intentionally pending so the live seat is not interrupted; Nebula remains
-  failed because the seat is not enrolled.
+- **Live public mesh:** `ephemeral-public-20260725` now has three thin public
+  DigitalOcean lighthouses on the canonical smallest droplet shape and DNS
+  names `lighthouse1.ephemeral.team` through `lighthouse3.ephemeral.team`.
+  Lighthouses are `magic-mesh-lighthouse` only, small profile, and form a
+  healthy three-member etcd quorum at `10.42.0.1` through `10.42.0.3`.
+- **Seats:** Dell (`172.20.146.2`, overlay `10.42.0.4`) and `.15`
+  (`172.20.0.15`, overlay `10.42.0.5`) are enrolled in the new mesh with
+  `root` and `mm` key access, active `nebula`, `mackesd`, and shell services,
+  and a passing five-node overlay ping matrix against the three lighthouses.
+  Eagle was enrolled at `10.42.0.6`, but after the coordinated seat reboot it
+  dropped off both LAN and overlay (`172.20.146.13` and `10.42.0.6` unreachable
+  from dev, `.15`, Dell, and LH1); Eagle recovery is the current live hardware
+  blocker.
 - **P0:** WL-SEC-006 (stop replicating Nebula private keys), WL-ARCH-007
   (authorization mint + direct lifecycle proof), and
   WL-FUNC-011 (optional real media/LLM evidence remains).
@@ -252,6 +259,37 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-SEC-006 - Keep Nebula private keys local to their owning node
 
 - Status: Remaining
+- Progress (2026-07-25 public thin-lighthouse rollout and seat mesh proof):
+  DigitalOcean access was restored with the operator-provided token and three
+  new thin public lighthouses were created for mesh `ephemeral-public-20260725`:
+  `lighthouse1.ephemeral.team` / `159.203.172.15` / DO id `587552916` / `nyc3`
+  / overlay `10.42.0.1`, `lighthouse2.ephemeral.team` / `137.184.231.154` /
+  DO id `587553313` / `sfo3` / overlay `10.42.0.2`, and
+  `lighthouse3.ephemeral.team` / `159.65.236.239` / DO id `587553472` /
+  `nyc1` / overlay `10.42.0.3`. All three run
+  `magic-mesh-lighthouse-12.1.0-1`, profile `small`, and have
+  `nebula`, `mackesd`, `etcd`, `caddy`, and `mesh-health.timer` active with
+  `NRestarts=0`; public TCP `22`, `4243`, and `443` are open, UDP `4242`
+  listeners are active, and the DNS records have TTL `300`. `etcdctl endpoint
+  health` is green for all three overlay endpoints, and the replicated
+  `/etc/mackesd/etcd-endpoints` roster is
+  `http://10.42.0.1:2379,http://10.42.0.2:2379,http://10.42.0.3:2379`.
+  Dell and `.15` are upgraded/enrolled into the new mesh with `root` and `mm`
+  key access, active `nebula`, `mackesd`, and `mde-shell-egui`, and pass
+  full overlay pings among the five reachable nodes. Eagle was upgraded and
+  enrolled at `10.42.0.6` after hotfixing its stale packaged `mackesd` binary
+  with the known-good 2026-07-25 binary that sends `nebula_public_key_pem`;
+  its stale Nebula config was corrected from old-lighthouse mode to peer mode,
+  but after a coordinated seat reboot Eagle dropped off LAN and overlay, so
+  the six-node proof is blocked on restoring network/power access to
+  `172.20.146.13`. The Nebula renderer now emits peer-side
+  `relay.use_relays` and `punchy` by default so same-NAT/hairpin seats are not
+  stranded after the next supervisor rewrite; focused farm validation is green
+  at **53/53** `workers::nebula_supervisor::tests`, touched-file farm rustfmt
+  is green, local `git diff --check` is clean, and the worklist linter/self-test
+  is green. Sensitive one-time enrollment bearer files under the root-only
+  rollout directory were overwritten and unlinked; reachable nodes have no
+  leftover `/root/.mcnf-new-mesh-token` temporary file.
 - Progress (2026-07-25 live `.15` legacy-bundle migration and replicated-secret
   cleanup): `mackesd` now has a supervisor-only one-way migration for
   pre-SEC-006 replicated bundles: generic bundle reads still fail closed on
