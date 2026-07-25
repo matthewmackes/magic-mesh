@@ -151,7 +151,10 @@ pub fn spawn_heartbeat_worker(
         // endpoints file exists), the peer directory lives in etcd under a
         // keepalive lease; otherwise it's the replicated fs dir, unchanged.
         // Empty on every pre-cutover node, so the live fleet keeps the fs path.
+        #[cfg(feature = "async-services")]
         let etcd_endpoints = crate::substrate::etcd::default_endpoints();
+        #[cfg(not(feature = "async-services"))]
+        let etcd_endpoints: Vec<String> = Vec::new();
         let peer_write_min = std::time::Duration::from_secs(60);
         let mut last_peer_write: Option<std::time::Instant> = None;
         // Check the shutdown flag every 100 ms instead of sleeping the
@@ -222,10 +225,23 @@ pub fn spawn_heartbeat_worker(
                         Ok(_) => last_peer_write = Some(std::time::Instant::now()),
                         Err(e) => tracing::warn!(error = %e, "peer-record: write failed"),
                     }
-                } else if crate::substrate::peers::put_peer_blocking(&etcd_endpoints, &rec) {
-                    last_peer_write = Some(std::time::Instant::now());
                 } else {
-                    tracing::warn!("peer-record: etcd put failed; will retry next heartbeat");
+                    #[cfg(feature = "async-services")]
+                    {
+                        if crate::substrate::peers::put_peer_blocking(&etcd_endpoints, &rec) {
+                            last_peer_write = Some(std::time::Instant::now());
+                        } else {
+                            tracing::warn!(
+                                "peer-record: etcd put failed; will retry next heartbeat"
+                            );
+                        }
+                    }
+                    #[cfg(not(feature = "async-services"))]
+                    {
+                        tracing::warn!(
+                            "peer-record: etcd peer directory requires async-services; will retry next heartbeat"
+                        );
+                    }
                 }
             }
             // Interruptible interval sleep.

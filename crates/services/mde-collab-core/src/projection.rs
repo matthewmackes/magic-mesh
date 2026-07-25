@@ -26,7 +26,8 @@ use mde_collab_types::ids::{
     CallId, DocumentId, EventId, FileRefId, SpaceId, ThreadId, TransferId,
 };
 use mde_collab_types::read_model::{
-    ActivityEntry, ActivityFeed, AlertInbox, AlertView, CallParticipantView, CallState, CallView,
+    ActivityEntry, ActivityFeed, AlertInbox, AlertView, CallMediaAdapter, CallMediaReadiness,
+    CallMediaRequirement, CallMediaSession, CallParticipantView, CallState, CallView,
     ClipboardLane, ClipboardView, ConversationTimeline, DocumentSession, DocumentSessions,
     FileReferenceView, FileReferences, MessageView, PresenceBoard, PresenceView, SpaceDirectory,
     SpaceSummary, ThreadTimeline, TransferJobView, TransferJobs,
@@ -58,6 +59,10 @@ const MAX_READ_MODEL_TEXT_BYTES: usize = 64 * 1024;
 // long history. The query probes one row beyond the accepted count so callers
 // receive an error instead of an arbitrary truncated timeline.
 const MAX_TIMELINE_MESSAGES: usize = 4096;
+// Media adapters must never be handed an unbounded call roster or participant
+// list. These are readiness rows only; live provider attempts happen elsewhere.
+const MAX_MEDIA_READINESS_SESSIONS: usize = 256;
+const MAX_MEDIA_READINESS_PARTICIPANTS: usize = 256;
 const MAX_MESSAGE_BODY_BYTES: usize = 256 * 1024;
 // `dump_tables` is a diagnostic convergence fingerprint, not an unbounded
 // export API. Keep hostile rows from turning a read-side diagnostic into an
@@ -481,6 +486,83 @@ impl Projection {
         Ok(CallState { active })
     }
 
+    /// The adapter-facing readiness view for one local actor.
+    ///
+    /// This projects only signed call state: non-ended calls where `local_actor`
+    /// is a connected participant. It does **not** open media, select a route,
+    /// or claim WebRTC/SIP/LiveKit success.
+    pub fn call_media_readiness(
+        &self,
+        local_actor: &ActorId,
+        space: Option<SpaceId>,
+    ) -> Result<CallMediaReadiness> {
+        let limit = MAX_MEDIA_READINESS_SESSIONS + 1;
+        let connected = json_enum(&CallParticipantState::Connected)?;
+        let (sql, params) = match space {
+            Some(space) => (
+                format!(
+                    "SELECT c.call_id, c.space_id, c.kind, c.started_ms, local.muted \
+                     FROM calls c \
+                     JOIN call_participants local ON local.call_id = c.call_id \
+                     WHERE c.ended = 0 AND local.actor = ?1 AND local.state = ?2 \
+                     AND c.space_id = ?3 \
+                     ORDER BY c.clock_wall, c.clock_counter, c.call_id LIMIT {limit}"
+                ),
+                vec![
+                    local_actor.as_str().to_string(),
+                    connected,
+                    space.to_string(),
+                ],
+            ),
+            None => (
+                format!(
+                    "SELECT c.call_id, c.space_id, c.kind, c.started_ms, local.muted \
+                     FROM calls c \
+                     JOIN call_participants local ON local.call_id = c.call_id \
+                     WHERE c.ended = 0 AND local.actor = ?1 AND local.state = ?2 \
+                     ORDER BY c.clock_wall, c.clock_counter, c.call_id LIMIT {limit}"
+                ),
+                vec![local_actor.as_str().to_string(), connected],
+            ),
+        };
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+            ))
+        })?;
+        let collected = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        if collected.len() > MAX_MEDIA_READINESS_SESSIONS {
+            return Err(CollabError::Serde(format!(
+                "call media readiness exceeds {MAX_MEDIA_READINESS_SESSIONS} sessions"
+            )));
+        }
+
+        let mut sessions = Vec::new();
+        for (call, space_id, kind, started, local_muted) in collected {
+            let call = parse_call(&call)?;
+            let kind = parse_json_enum::<CallKind>(&kind)?;
+            sessions.push(CallMediaSession {
+                call,
+                space: parse_space(&space_id)?,
+                kind,
+                started_unix_ms: started,
+                requirements: media_requirements(kind),
+                candidate_adapters: candidate_media_adapters(kind),
+                connected_participants: self.connected_call_participants(call)?,
+                local_muted: local_muted != 0,
+            });
+        }
+        Ok(CallMediaReadiness {
+            local_actor: local_actor.clone(),
+            sessions,
+        })
+    }
+
     /// The live document sessions (optionally scoped to one space).
     pub fn document_sessions(&self, space: Option<SpaceId>) -> Result<DocumentSessions> {
         let base = "SELECT space_id, document_id, title, participants_json FROM documents";
@@ -603,6 +685,25 @@ impl Projection {
             });
         }
         Ok(out)
+    }
+
+    fn connected_call_participants(&self, call: CallId) -> Result<Vec<ActorId>> {
+        let connected = json_enum(&CallParticipantState::Connected)?;
+        let limit = MAX_MEDIA_READINESS_PARTICIPANTS + 1;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT actor FROM call_participants \
+             WHERE call_id = ?1 AND state = ?2 ORDER BY actor LIMIT {limit}"
+        ))?;
+        let rows = stmt.query_map(params![call.to_string(), connected], |r| {
+            Ok(r.get::<_, String>(0)?)
+        })?;
+        let actors = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        if actors.len() > MAX_MEDIA_READINESS_PARTICIPANTS {
+            return Err(CollabError::Serde(format!(
+                "call media readiness exceeds {MAX_MEDIA_READINESS_PARTICIPANTS} connected participants"
+            )));
+        }
+        Ok(actors.into_iter().map(ActorId::new).collect())
     }
 
     fn messages_where(&self, space: SpaceId, thread: Option<ThreadId>) -> Result<Vec<MessageView>> {
@@ -1540,6 +1641,37 @@ fn parse_call(s: &str) -> Result<CallId> {
         .map_err(|_| CollabError::Serde(format!("bad call id {s}")))
 }
 
+fn media_requirements(kind: CallKind) -> Vec<CallMediaRequirement> {
+    match kind {
+        CallKind::Audio => vec![CallMediaRequirement::Microphone],
+        CallKind::Video => vec![
+            CallMediaRequirement::Microphone,
+            CallMediaRequirement::Camera,
+        ],
+        CallKind::Screen => vec![
+            CallMediaRequirement::Microphone,
+            CallMediaRequirement::ScreenCapture,
+        ],
+        CallKind::CoEdit => vec![CallMediaRequirement::DocumentSync],
+        CallKind::RemoteDesktop => vec![CallMediaRequirement::RemoteDesktopStream],
+    }
+}
+
+fn candidate_media_adapters(kind: CallKind) -> Vec<CallMediaAdapter> {
+    match kind {
+        CallKind::Audio => vec![
+            CallMediaAdapter::WebRtcP2p,
+            CallMediaAdapter::LiveKitSfu,
+            CallMediaAdapter::SipGateway,
+        ],
+        CallKind::Video | CallKind::Screen => {
+            vec![CallMediaAdapter::WebRtcP2p, CallMediaAdapter::LiveKitSfu]
+        }
+        CallKind::CoEdit => vec![CallMediaAdapter::DocumentCollab],
+        CallKind::RemoteDesktop => vec![CallMediaAdapter::VdiRemoteDesktop],
+    }
+}
+
 fn ensure_read_model_text(field: &str, value: &str) -> Result<()> {
     if value.len() > MAX_READ_MODEL_TEXT_BYTES {
         return Err(CollabError::Serde(format!(
@@ -1557,14 +1689,16 @@ fn summarize(kind_tag: &str) -> String {
 mod tests {
     use super::{
         Projection, MAX_DOCUMENT_PARTICIPANTS, MAX_DOCUMENT_SESSIONS, MAX_ENVELOPE_JSON_BYTES,
-        MAX_MESSAGE_BODY_BYTES, MAX_TABLE_DUMP_BYTES, MAX_TIMELINE_MESSAGES,
+        MAX_MEDIA_READINESS_SESSIONS, MAX_MESSAGE_BODY_BYTES, MAX_TABLE_DUMP_BYTES,
+        MAX_TIMELINE_MESSAGES,
     };
     use crate::error::CollabError;
     use crate::signer::{Ed25519Signer, EventSigner};
     use mde_collab_types::envelope::SCHEMA_VERSION;
     use mde_collab_types::event::CollabEventKind;
-    use mde_collab_types::ids::{EventId, SpaceId, ThreadId};
-    use mde_collab_types::value::MessageBody;
+    use mde_collab_types::ids::{CallId, EventId, SpaceId, ThreadId};
+    use mde_collab_types::read_model::{CallMediaAdapter, CallMediaRequirement};
+    use mde_collab_types::value::{CallKind, CallParticipantState, MessageBody};
     use mde_collab_types::{ActorClock, ActorId, CollabEventEnvelope, SpaceKind, SpaceRole};
     use uuid::Uuid;
 
@@ -1933,6 +2067,225 @@ mod tests {
         assert!(matches!(
             row_error,
             CollabError::Serde(message) if message.contains("session read model exceeds")
+        ));
+    }
+
+    #[test]
+    fn media_readiness_only_exposes_connected_local_active_calls() {
+        let space = space_id(300);
+        let other_space = space_id(301);
+        let ready_call = CallId::from_uuid(Uuid::from_u128(302));
+        let ended_call = CallId::from_uuid(Uuid::from_u128(303));
+        let ringing_call = CallId::from_uuid(Uuid::from_u128(304));
+        let screen_call = CallId::from_uuid(Uuid::from_u128(305));
+        let mut events = space_setup(space, "ops", 310);
+        events.push(event(
+            312,
+            space,
+            3,
+            CollabEventKind::MemberJoined {
+                actor: ActorId::new("bob"),
+                role: SpaceRole::Member,
+            },
+        ));
+        events.extend([
+            event(
+                313,
+                space,
+                4,
+                CollabEventKind::CallStarted {
+                    call: ready_call,
+                    kind: CallKind::Audio,
+                    initiator: ActorId::new("alice"),
+                },
+            ),
+            event_as(
+                314,
+                space,
+                "bob",
+                5,
+                CollabEventKind::CallParticipantChanged {
+                    call: ready_call,
+                    actor: ActorId::new("bob"),
+                    state: CallParticipantState::Connected,
+                },
+            ),
+            event_as(
+                315,
+                space,
+                "bob",
+                6,
+                CollabEventKind::CallParticipantMuted {
+                    call: ready_call,
+                    actor: ActorId::new("bob"),
+                    muted: true,
+                },
+            ),
+            event(
+                316,
+                space,
+                7,
+                CollabEventKind::CallStarted {
+                    call: ended_call,
+                    kind: CallKind::Video,
+                    initiator: ActorId::new("alice"),
+                },
+            ),
+            event_as(
+                317,
+                space,
+                "bob",
+                8,
+                CollabEventKind::CallParticipantChanged {
+                    call: ended_call,
+                    actor: ActorId::new("bob"),
+                    state: CallParticipantState::Connected,
+                },
+            ),
+            event(
+                318,
+                space,
+                9,
+                CollabEventKind::CallEnded {
+                    call: ended_call,
+                    reason: Some("test-ended".into()),
+                },
+            ),
+            event(
+                319,
+                space,
+                10,
+                CollabEventKind::CallStarted {
+                    call: ringing_call,
+                    kind: CallKind::Audio,
+                    initiator: ActorId::new("alice"),
+                },
+            ),
+            event_as(
+                320,
+                space,
+                "bob",
+                11,
+                CollabEventKind::CallParticipantChanged {
+                    call: ringing_call,
+                    actor: ActorId::new("bob"),
+                    state: CallParticipantState::Ringing,
+                },
+            ),
+        ]);
+        events.extend(space_setup(other_space, "screen", 330));
+        events.push(event(
+            332,
+            other_space,
+            12,
+            CollabEventKind::MemberJoined {
+                actor: ActorId::new("bob"),
+                role: SpaceRole::Member,
+            },
+        ));
+        events.push(event_as(
+            333,
+            other_space,
+            "bob",
+            13,
+            CollabEventKind::CallStarted {
+                call: screen_call,
+                kind: CallKind::Screen,
+                initiator: ActorId::new("bob"),
+            },
+        ));
+
+        let mut projection = Projection::open_in_memory().expect("open projection");
+        projection
+            .project(&events)
+            .expect("project media readiness events");
+
+        let bob = ActorId::new("bob");
+        let readiness = projection
+            .call_media_readiness(&bob, Some(space))
+            .expect("readiness");
+        assert_eq!(readiness.local_actor, bob);
+        assert_eq!(readiness.sessions.len(), 1);
+        let session = &readiness.sessions[0];
+        assert_eq!(session.call, ready_call);
+        assert_eq!(session.space, space);
+        assert_eq!(session.kind, CallKind::Audio);
+        assert_eq!(session.requirements, vec![CallMediaRequirement::Microphone]);
+        assert_eq!(
+            session.candidate_adapters,
+            vec![
+                CallMediaAdapter::WebRtcP2p,
+                CallMediaAdapter::LiveKitSfu,
+                CallMediaAdapter::SipGateway,
+            ]
+        );
+        assert_eq!(
+            session.connected_participants,
+            vec![ActorId::new("alice"), ActorId::new("bob")]
+        );
+        assert!(session.local_muted);
+
+        let all_ready = projection
+            .call_media_readiness(&ActorId::new("bob"), None)
+            .expect("all readiness");
+        assert_eq!(all_ready.sessions.len(), 2);
+        let screen = all_ready
+            .sessions
+            .iter()
+            .find(|session| session.call == screen_call)
+            .expect("screen readiness");
+        assert_eq!(
+            screen.requirements,
+            vec![
+                CallMediaRequirement::Microphone,
+                CallMediaRequirement::ScreenCapture,
+            ]
+        );
+        assert_eq!(
+            screen.candidate_adapters,
+            vec![CallMediaAdapter::WebRtcP2p, CallMediaAdapter::LiveKitSfu]
+        );
+    }
+
+    #[test]
+    fn media_readiness_fails_closed_before_unbounded_session_fanout() {
+        let projection = Projection::open_in_memory().expect("open projection");
+        let space = space_id(340);
+        projection
+            .connection()
+            .execute(
+                "INSERT INTO spaces \
+                 (space_id, kind, name, created_ms, deleted, last_clock_wall, last_clock_counter) \
+                 VALUES (?1, 'team', 'ops', 1, 0, 1, 0)",
+                [space.to_string()],
+            )
+            .expect("insert space");
+        for index in 0..=MAX_MEDIA_READINESS_SESSIONS {
+            let call = Uuid::from_u128(10_000 + index as u128).to_string();
+            projection
+                .connection()
+                .execute(
+                    "INSERT INTO calls \
+                     (call_id, space_id, kind, initiator, started_ms, ended, clock_wall, clock_counter) \
+                     VALUES (?1, ?2, 'audio', 'bob', 1, 0, ?3, 0)",
+                    rusqlite::params![call.as_str(), space.to_string(), index as i64],
+                )
+                .expect("insert ready call");
+            projection
+                .connection()
+                .execute(
+                    "INSERT INTO call_participants (call_id, actor, state, muted) \
+                     VALUES (?1, 'bob', 'connected', 0)",
+                    [call.as_str()],
+                )
+                .expect("insert ready participant");
+        }
+        let error = projection
+            .call_media_readiness(&ActorId::new("bob"), None)
+            .expect_err("readiness fan-out must be rejected");
+        assert!(matches!(
+            error,
+            CollabError::Serde(message) if message.contains("readiness exceeds")
         ));
     }
 

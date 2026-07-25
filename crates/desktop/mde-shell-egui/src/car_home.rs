@@ -145,7 +145,9 @@ impl CarTile {
 
 /// The live glance values the dashboard cards read. Each is `None` when there
 /// is no honest live value (the card then shows a plain descriptor) — never a
-/// mock (PLATFORM-INTERFACES Q31 + honesty P8).
+/// mock (PLATFORM-INTERFACES Q31 + honesty P8). A non-empty `vehicle` value can
+/// also be a degraded status label (for example stale/offline MG90); only
+/// `vehicle_live` lets the card promote it with the strong live color.
 #[derive(Clone, Debug, Default)]
 pub struct CarHomeGlance {
     /// Navigation — active route summary/ETA (`None` ⇒ "Where to?").
@@ -154,8 +156,12 @@ pub struct CarHomeGlance {
     pub media: Option<String>,
     /// Comms — count of retained (unacked) alerts (`None`/0 ⇒ "Alerts & messages").
     pub comms: Option<usize>,
-    /// Vehicle — live telematics summary (`None` ⇒ "Telematics").
+    /// Vehicle — live telematics summary or a degraded MG90 status label
+    /// (`None` ⇒ "Telematics").
     pub vehicle: Option<String>,
+    /// Whether [`Self::vehicle`] is a fresh live telematics value. `false` keeps
+    /// stale/offline/awaiting labels dim: explicit, but not promoted as live.
+    pub vehicle_live: bool,
 }
 
 /// Keep untrusted gateway strings from creating huge galleys on a moving Car
@@ -349,6 +355,13 @@ impl CarHomeGlance {
     #[must_use]
     pub fn vehicle_line(&self) -> String {
         self.vehicle_value().unwrap_or("Telematics").to_owned()
+    }
+
+    /// Whether the vehicle row is an honest fresh MG90 reading. A stale/offline
+    /// status label remains useful to the driver but must paint dim.
+    #[must_use]
+    pub fn vehicle_line_live(&self) -> bool {
+        self.vehicle_live && self.vehicle_value().is_some()
     }
 }
 
@@ -730,7 +743,7 @@ fn paint_glance_card(ui: &mut Ui, painter: &egui::Painter, rect: Rect, g: &CarHo
             IconId::HealthStatus,
             Style::OK,
             &g.vehicle_line(),
-            g.vehicle_value().is_some(),
+            g.vehicle_line_live(),
         );
         glance_row(
             ui,
@@ -901,11 +914,24 @@ mod tests {
             media: Some("Comfortably Numb · Pink Floyd".to_string()),
             comms: Some(3),
             vehicle: Some("38 mph".to_string()),
+            vehicle_live: true,
         };
         assert_eq!(live.nav_line(), "12 min · 4.3 mi · ETA 14:32");
         assert_eq!(live.media_line(), "Comfortably Numb · Pink Floyd");
         assert_eq!(live.comms_line(), "3 alerts");
         assert_eq!(live.vehicle_line(), "38 mph");
+        assert!(live.vehicle_line_live());
+
+        let degraded = CarHomeGlance {
+            vehicle: Some("MG90 stale · 6 s".to_string()),
+            vehicle_live: false,
+            ..Default::default()
+        };
+        assert_eq!(degraded.vehicle_line(), "MG90 stale · 6 s");
+        assert!(
+            !degraded.vehicle_line_live(),
+            "explicit stale/offline MG90 labels stay dim, not promoted as live"
+        );
         assert_eq!(
             CarHomeGlance {
                 comms: Some(1),
@@ -941,6 +967,7 @@ mod tests {
             media: Some(hostile.clone()),
             comms: Some(usize::MAX),
             vehicle: Some(hostile),
+            vehicle_live: true,
         };
         let (_, shapes) = drive_with_screen(&glance, vec![vec![]], vec2(512.0, 640.0));
         let texts = painted_text(&shapes);
@@ -1196,6 +1223,7 @@ mod tests {
             media: Some("Comfortably Numb · Pink Floyd".to_string()),
             comms: Some(3),
             vehicle: Some("38 mph".to_string()),
+            vehicle_live: true,
         };
         let (_, shapes) = drive(&glance, vec![vec![]]);
         let texts = painted_text(&shapes);
@@ -1281,9 +1309,7 @@ mod tests {
         let gap = Style::SP_M;
         let body_size = vec2(
             touch_target * cols + gap * (cols - 1.0),
-            (touch_target + Style::SP_XL)
-                + gap
-                + (touch_target * 2.0 + gap),
+            (touch_target + Style::SP_XL) + gap + (touch_target * 2.0 + gap),
         );
         let screen_size = vec2(
             body_size.x + Style::SP_L * 2.0,

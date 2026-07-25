@@ -11,7 +11,23 @@
 //! fleet + voice/media + desktop worker sits at rank 1 (Workstation — a headless
 //! box is a Workstation too, its desktop workers idle without a local display).
 
-use crate::workers::RestartPolicy;
+#[cfg(feature = "async-services")]
+pub use crate::workers::RestartPolicy;
+#[cfg(not(feature = "async-services"))]
+/// Lean-build copy of the worker restart-policy tags used by the role registry.
+///
+/// The actual supervisor type lives in `workers`, which is available only with
+/// `async-services`. The registry remains useful in lean library builds, so the
+/// tag shape is mirrored here without pulling in the worker pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartPolicy {
+    /// Don't restart after the worker returns.
+    Never,
+    /// Restart only after a failed return.
+    OnFailure,
+    /// Restart after any return.
+    Always,
+}
 use mde_role::{Capability, Role, RoleClass};
 
 /// MEDIA-1 — the deployment **class** that gates worker spawns.

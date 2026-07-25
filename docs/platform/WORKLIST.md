@@ -664,6 +664,19 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-ARCH-007 - Repair Workloads cockpit E2E wire, placement, and authorization
 
 - Status: Remaining
+- Progress (2026-07-25 first-desktop lean feature boundary): the
+  `mackesd --no-default-features` library path no longer pulls the async daemon
+  surface into first-desktop tests. Bus/local-applier effects stay behind
+  `async-services`, worker restart-policy metadata has a lean registry tag,
+  Nebula enrollment uses the real filesystem peer-directory fallback without
+  `substrate`, mesh-init fails honestly when Nebula materialization is requested
+  from a lean build, and heartbeat etcd writes remain async-only. The BigBoy
+  no-default first-desktop gate is green at **17/17**; the async-services
+  first-desktop gate is green at **21/21** after pre-initializing the temp Bus
+  store used by the Bus lifecycle roster test; touched-file rustfmt is green
+  and local diff-check is clean. Live root credential, libvirt backend,
+  bootstrap SSH, Podman/Cuttlefish, and installed seat evidence remain
+  external.
 - Progress (2026-07-25 first-desktop authorized lifecycle publisher): live
   first-desktop placement now publishes signed `vm_lifecycle` Create/Start
   actions on `action/vm/lifecycle`, binds each request to the cloud-arm HMAC
@@ -672,11 +685,10 @@ These decisions refine acceptance and sequencing for the active items below.
   Tests cover injected placement ordering, worker parser/token-gate acceptance,
   Bus publish/readback, and running-roster observation; the final BigBoy
   `mackesd --lib onboard::first_desktop --features async-services` gate is green
-  at **21/21**, and touched-file rustfmt is green. A `--no-default-features`
-  probe still fails before this module because existing crate code references
-  `ipc`, `workers`, and `substrate` behind `async-services`. Live root
-  credential, libvirt backend, bootstrap SSH, Podman/Cuttlefish, and installed
-  seat evidence remain external.
+  at **21/21**, and touched-file rustfmt is green. The follow-up lean feature
+  boundary above closes the earlier `--no-default-features` probe failure. Live
+  root credential, libvirt backend, bootstrap SSH, Podman/Cuttlefish, and
+  installed seat evidence remain external.
 - Progress (2026-07-25 first-desktop lifecycle bridge): the first-desktop
   planner now carries an explicit VM name, placement peer, golden image path,
   libvirt sizing, and network, and folds the placement into the existing
@@ -1050,6 +1062,14 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-011 - Communications collaboration suite full replacement
 
 - Status: Remaining
+- Progress (2026-07-25 call media-readiness boundary): Communications now has a
+  typed adapter-facing `CallMediaReadiness` read model that exposes only
+  non-ended calls where the local actor is a connected participant, with bounded
+  session and participant fan-out plus explicit candidate adapter/requirement
+  rows. This prepares SIP/WebRTC/LiveKit admission without claiming live media.
+  Farm gates are green at **2/2** `mde-collab-core media_readiness`, **1/1**
+  `mde-collab-types read_model_variants_round_trip`, and touched-file rustfmt.
+  Live WebRTC/SIP/LiveKit/media proof remains external.
 - Progress (2026-07-25 DTMF media-admission boundary): ephemeral DTMF commands
   now require a connected call participant and validate the RFC 4733 keypad
   alphabet (`0-9`, `*`, `#`, `A-D`/lowercase) before any future SIP/WebRTC
@@ -2087,6 +2107,16 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-006 - Construct interface (Apple-HIG-principled workstation shell)
 
 - Status: Remaining
+- Progress (2026-07-25 VDI status-rail proof verifier): `verify-live-mirrors.py`
+  now validates the Construct status-rail lifecycle source
+  `action/vdi/session` for a console session, requiring a matching rail-visible
+  `open` row when requested and an `active`/`LIVE` folded state when live rail
+  proof is required. It cross-checks serving peer and VM id against the console
+  proof by default, can require the expected client peer, and fails closed on
+  missing lifecycle rows, closed/non-visible state, requested-only sessions when
+  LIVE is required, and peer/vm/client mismatches. Farm `.170` self-test is
+  green after cleaning stale farm workspaces; local diff-check is clean.
+  Physical `.15` pointer/DRM/pixel/VDI acceptance remains external.
 - Progress (2026-07-25 VDI console proof verifier): `verify-live-mirrors.py`
   now validates retained `state/vdi/console` rows by session id, including
   brokered/unbrokerable status, serving node, VM id, expected protocol, and
@@ -2652,6 +2682,14 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-007 - Car interface (CarPlay-principled vehicle mode)
 
 - Status: Remaining
+- Progress (2026-07-25 MG90 degraded-glance honesty): Car Home now separates the
+  vehicle glance label from its live-paint truth. Fresh MG90 telemetry still
+  paints live values, while stale/offline/awaiting/simulated MG90 states show
+  explicit dim labels such as `MG90 stale`, `MG90 offline`, or `Awaiting MG90`
+  instead of being promoted as live telemetry or collapsing to a generic
+  descriptor. The BigBoy `mde-shell-egui car_home` gate is green at **14/14**,
+  touched-file rustfmt is green, and local diff-check is clean. Live MG90 and
+  physical Car evidence remain external.
 - Progress (2026-07-25 MG90 Status Broadcast peer boundary): UDP Status
   Broadcast reads now accept packets only from the configured MG90 gateway IP
   before parsing payloads; unexpected senders are dropped in a bounded burst and

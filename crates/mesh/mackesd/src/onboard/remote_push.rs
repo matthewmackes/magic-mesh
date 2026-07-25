@@ -19,10 +19,14 @@
 //!   **signed** [`JobBundle`] to an **enrolled** peer; the `onboard_apply` worker
 //!   validates signer + freshness + the allow-list and applies.
 
+#[cfg(feature = "async-services")]
 use crate::ipc::secret_store::SecretStore;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use mde_role::{Role, RoleClass};
+use mde_role::Role;
+#[cfg(feature = "async-services")]
+use mde_role::RoleClass;
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "async-services")]
 use std::path::{Path, PathBuf};
 
 #[cfg(feature = "async-services")]
@@ -302,6 +306,7 @@ pub fn apply_all(applier: &dyn Applier, actions: &[Action]) -> Result<(), Remote
 /// reached the target, this applier publishes the exact typed session-open wire
 /// verb on the target's local Bus, so the session broker remains the sole owner of
 /// session state and no parallel broker model is invented.
+#[cfg(feature = "async-services")]
 pub struct LocalApplier {
     /// Where the pinned role is written — the canonical `/var/lib/mde/role.toml`
     /// in production, a redirect in tests (via [`mde_role::default_role_path`]'s
@@ -316,6 +321,7 @@ pub struct LocalApplier {
     bus_root: Option<PathBuf>,
 }
 
+#[cfg(feature = "async-services")]
 impl LocalApplier {
     /// Production constructor: pin at the canonical role path, and resolve the
     /// secret store from the deployed `repo_dir` (holding
@@ -346,13 +352,11 @@ impl LocalApplier {
         }
     }
 
-    #[cfg(feature = "async-services")]
     fn with_bus_root(mut self, bus_root: PathBuf) -> Self {
         self.bus_root = Some(bus_root);
         self
     }
 
-    #[cfg(feature = "async-services")]
     fn apply_open_broker(
         &self,
         action: &Action,
@@ -372,12 +376,11 @@ impl LocalApplier {
             vm_id: vm_id.to_string(),
             client_peer: client_peer.to_string(),
         };
-        let body = serde_json::to_string(&request).map_err(|error| {
-            RemotePushError::ActionFailed {
+        let body =
+            serde_json::to_string(&request).map_err(|error| RemotePushError::ActionFailed {
                 action: action.redacted(),
                 why: format!("encode SessionRequest::Open: {error}"),
-            }
-        })?;
+            })?;
         let persist = mde_bus::persist::Persist::open(bus_root.clone()).map_err(|error| {
             RemotePushError::ActionFailed {
                 action: action.redacted(),
@@ -399,6 +402,7 @@ impl LocalApplier {
     }
 }
 
+#[cfg(feature = "async-services")]
 impl Applier for LocalApplier {
     fn apply_one(&self, action: &Action) -> Result<(), RemotePushError> {
         match action {
@@ -446,25 +450,7 @@ impl Applier for LocalApplier {
                 serving_peer,
                 vm_id,
                 client_peer,
-            } => {
-                #[cfg(feature = "async-services")]
-                {
-                    self.apply_open_broker(
-                        action,
-                        session_id,
-                        serving_peer,
-                        vm_id,
-                        client_peer,
-                    )
-                }
-                #[cfg(not(feature = "async-services"))]
-                {
-                    let _ = (session_id, serving_peer, vm_id, client_peer);
-                    Err(RemotePushError::NotWired {
-                        transport: "bus-worker (open-broker)",
-                    })
-                }
-            }
+            } => self.apply_open_broker(action, session_id, serving_peer, vm_id, client_peer),
         }
     }
 }
@@ -781,7 +767,10 @@ impl BusApply {
         let key = crate::node_key::load_or_create(key_path).map_err(|error| {
             RemotePushError::Unreachable {
                 target: target_node.to_string(),
-                why: format!("cannot load issuing node key {}: {error}", key_path.display()),
+                why: format!(
+                    "cannot load issuing node key {}: {error}",
+                    key_path.display()
+                ),
             }
         })?;
         let now = now_unix_seconds();
@@ -797,10 +786,11 @@ impl BusApply {
             bundle: bundle.clone(),
             sig_hex,
         };
-        let body = serde_json::to_string(&action).map_err(|error| RemotePushError::Unreachable {
-            target: target_node.to_string(),
-            why: format!("cannot encode onboard apply action: {error}"),
-        })?;
+        let body =
+            serde_json::to_string(&action).map_err(|error| RemotePushError::Unreachable {
+                target: target_node.to_string(),
+                why: format!("cannot encode onboard apply action: {error}"),
+            })?;
 
         let persist = mde_bus::persist::Persist::open(bus_root.to_path_buf()).map_err(|error| {
             RemotePushError::Unreachable {
@@ -1045,6 +1035,7 @@ mod tests {
     /// A `LocalAead` secret store over a throwaway age identity + a temp role
     /// path — the real primitives PinRole/SealSecret drive, so these tests
     /// exercise the actual `role.toml` write + the actual at-rest seal.
+    #[cfg(feature = "async-services")]
     fn local_applier() -> (tempfile::TempDir, LocalApplier) {
         let tmp = tempfile::tempdir().unwrap();
         let key_path = tmp.path().join("mcnf-age-key");
@@ -1061,6 +1052,7 @@ mod tests {
         (tmp, applier)
     }
 
+    #[cfg(feature = "async-services")]
     #[test]
     fn pin_role_refuses_the_retired_media_lighthouse_role() {
         // Thin-lighthouse policy: the historical OW-11 promotion path must not
@@ -1079,6 +1071,7 @@ mod tests {
         assert!(!tmp.path().join("role.toml").exists());
     }
 
+    #[cfg(feature = "async-services")]
     #[test]
     fn seal_secret_encrypts_at_rest_and_reads_back() {
         // The media-spaces secret seals into the store (ciphertext on disk) and
@@ -1095,6 +1088,7 @@ mod tests {
         assert_eq!(applier.store.get(&name).unwrap().as_deref(), Some(secret));
     }
 
+    #[cfg(feature = "async-services")]
     #[test]
     fn pin_role_rejects_an_unknown_role_name_honestly() {
         // A bogus role string is a typed ActionFailed, never a silent no-op.
@@ -1108,6 +1102,7 @@ mod tests {
         assert!(matches!(err, RemotePushError::ActionFailed { .. }));
     }
 
+    #[cfg(feature = "async-services")]
     #[test]
     fn lean_local_applier_keeps_unconfigured_bus_effects_typed() {
         // RunEnroll always belongs to the SSH-bootstrap transport. The explicit
@@ -1164,6 +1159,7 @@ mod tests {
 
     // ── process_apply: the onboard_apply worker's validate→apply core ──
 
+    #[cfg(feature = "async-services")]
     #[test]
     fn process_apply_verifies_then_applies_and_reports_observed_state() {
         // A valid signed bundle: verify → apply → the effects really land (role.toml
@@ -1192,6 +1188,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "async-services")]
     #[test]
     fn process_apply_refuses_media_secret_for_thin_lighthouse_before_apply() {
         let (tmp, applier) = local_applier();
@@ -1227,6 +1224,7 @@ mod tests {
         assert!(applier.store.get("media-spaces").unwrap().is_none());
     }
 
+    #[cfg(feature = "async-services")]
     #[test]
     fn local_applier_refuses_retired_media_secret_on_pinned_lighthouse() {
         let (tmp, applier) = local_applier();
@@ -1241,6 +1239,7 @@ mod tests {
         assert!(applier.store.get("media-spaces").unwrap().is_none());
     }
 
+    #[cfg(feature = "async-services")]
     #[test]
     fn process_apply_refuses_a_replayed_nonce() {
         // The same bundle applied twice: the second is rejected on the nonce, so a
@@ -1260,6 +1259,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "async-services")]
     #[test]
     fn process_apply_a_bad_signature_does_not_burn_the_nonce() {
         // A wrong-signer bundle is rejected WITHOUT recording its nonce, so a
@@ -1413,10 +1413,9 @@ mod tests {
             let deadline = std::time::Instant::now() + Duration::from_secs(2);
             loop {
                 let persist = mde_bus::persist::Persist::open(ack_root.clone()).expect("open bus");
-                if let Ok(messages) = persist.list_since(
-                    crate::workers::onboard_apply::ACTION_TOPIC,
-                    None,
-                ) {
+                if let Ok(messages) =
+                    persist.list_since(crate::workers::onboard_apply::ACTION_TOPIC, None)
+                {
                     if let Some(message) = messages.last() {
                         let body = message.body.as_deref().expect("action body");
                         let action: crate::workers::onboard_apply::ApplyAction =

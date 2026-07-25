@@ -973,9 +973,16 @@ pub fn sign_csr_into_bundle<B: crate::ca::NebulaCertBackend + ?Sized>(
     // the founding lighthouse's assignments (caught live 2026-06-27: a node
     // enrolled via a new lighthouse was handed 10.42.0.1, lh1's own IP). The
     // directory is the SUBSTRATE-V2 source of truth for who holds which IP.
+    #[cfg(feature = "async-services")]
     let etcd_eps = crate::substrate::etcd::default_endpoints();
-    let mut directory_taken: std::collections::HashSet<String> =
-        crate::substrate::peers::read_directory(workgroup_root)
+    let mut directory_taken: std::collections::HashSet<String> = {
+        #[cfg(feature = "async-services")]
+        let peers = crate::substrate::peers::read_directory(workgroup_root);
+        #[cfg(not(feature = "async-services"))]
+        let peers = mackes_mesh_types::peers::read_peers(&mackes_mesh_types::peers::peers_dir(
+            workgroup_root,
+        ));
+        peers
             .into_iter()
             .filter_map(|p| {
                 p.overlay_ip
@@ -984,11 +991,13 @@ pub fn sign_csr_into_bundle<B: crate::ca::NebulaCertBackend + ?Sized>(
                     .filter(|ip| !ip.is_empty())
                     .map(String::from)
             })
-            .collect();
+            .collect()
+    };
     // MIG-2 — also union the sign-time reservations (`/mesh/ipalloc/`), which are
     // visible immediately, unlike the heartbeat-lagged peer directory. Without
     // this a concurrent sign on another lighthouse could pick an IP this one (or
     // a peer signed seconds ago) just assigned but hasn't heartbeated yet.
+    #[cfg(feature = "async-services")]
     if !etcd_eps.is_empty() {
         directory_taken.extend(crate::substrate::peers::reserved_overlay_ips_blocking(
             &etcd_eps,
@@ -1017,6 +1026,7 @@ pub fn sign_csr_into_bundle<B: crate::ca::NebulaCertBackend + ?Sized>(
     // MIG-2 — record the just-assigned overlay IP in the shared reservation
     // keyspace IMMEDIATELY, so the next sign anywhere in the mesh sees it as
     // taken (best-effort; the directory read above is the fallback guard).
+    #[cfg(feature = "async-services")]
     if !etcd_eps.is_empty() {
         let _ = crate::substrate::peers::reserve_overlay_ip_blocking(
             &etcd_eps,

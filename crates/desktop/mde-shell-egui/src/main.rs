@@ -1138,6 +1138,52 @@ struct Shell {
     layout_mode: LayoutModeControl,
 }
 
+/// The Auto Home vehicle line has two separate truths:
+///
+/// - the text the driver should see (fresh telemetry or an explicit MG90 gap);
+/// - whether that text is a fresh live instrument reading.
+///
+/// Maps already returns `None` for stale/offline telemetry. The shell adds the
+/// degraded label here so Car Home does not collapse "stale", "offline", and
+/// "no mirror yet" into the same generic `Telematics` descriptor.
+fn car_home_vehicle_glance(
+    maps_location: &mde_maps_location_egui::MapsLocationSurface,
+) -> (Option<String>, bool) {
+    if let Some(line) = maps_location.vehicle_glance() {
+        return (Some(line), true);
+    }
+
+    let telemetry = &maps_location.vehicle.telemetry;
+    if telemetry.has_live_gateway_source() {
+        let age = if telemetry.last_update_age_s.is_finite() {
+            telemetry.last_update_age_s.max(0.0).round()
+        } else {
+            0.0
+        };
+        return (Some(format!("MG90 stale · {age:.0} s")), false);
+    }
+
+    if telemetry
+        .confidence
+        .contains("vehicle-gateway mirror reports the adapter offline")
+    {
+        return (Some("MG90 offline".to_string()), false);
+    }
+
+    if telemetry
+        .confidence
+        .contains("awaiting vehicle-gateway mirror")
+    {
+        return (Some("Awaiting MG90".to_string()), false);
+    }
+
+    if telemetry.confidence.contains("simulated CAN/OBD profile") {
+        return (Some("Simulated vehicle data".to_string()), false);
+    }
+
+    (None, false)
+}
+
 impl Shell {
     /// Build the shell + its embedded surfaces once over a bare egui
     /// [`egui::Context`] (the surfaces' workers clone it so their off-thread
@@ -1961,6 +2007,7 @@ impl Shell {
                 //   vehicle — the live MG90 telematics glance (speed / voltage)
                 //             when the gateway is the primary location source.
                 let nav_state = &self.maps_location.local_navigation;
+                let (vehicle, vehicle_live) = car_home_vehicle_glance(&self.maps_location);
                 let glance = car_home::CarHomeGlance {
                     nav: nav_state.navigating.then(|| {
                         let route = &nav_state.active_route;
@@ -1983,7 +2030,8 @@ impl Shell {
                         })
                     },
                     comms: Some(self.toasts.history().len()).filter(|n| *n > 0),
-                    vehicle: self.maps_location.vehicle_glance(),
+                    vehicle,
+                    vehicle_live,
                 };
                 let picked = ui
                     .push_id("shell-auto-home", |ui| {
@@ -3465,13 +3513,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        car_home, car_keymap, chat, complete_menu_bar_minimize, console, construct, datacenter,
-        desktop_reconnect_should_query_recents, files_panel, front_door, front_door_peer_apps,
-        install_layout_mode_button_accessibility, install_layout_profile_row_accessibility,
-        layout_mode_button_accesskit_value, layout_mode_button_rect, layout_mode_menu_rect,
-        layout_mode_primary_toggle, layout_profile_row_accesskit_value, layout_profile_tooltip,
-        media_header, media_panel, menu_bar_shuffle_cards, menu_bar_shuffle_paint_order,
-        paint_car_speedometer, paint_car_status_tile, publish_front_door_instance_lifecycle_to_bus,
+        car_home, car_home_vehicle_glance, car_keymap, chat, complete_menu_bar_minimize, console,
+        construct, datacenter, desktop_reconnect_should_query_recents, files_panel, front_door,
+        front_door_peer_apps, install_layout_mode_button_accessibility,
+        install_layout_profile_row_accessibility, layout_mode_button_accesskit_value,
+        layout_mode_button_rect, layout_mode_menu_rect, layout_mode_primary_toggle,
+        layout_profile_row_accesskit_value, layout_profile_tooltip, media_header, media_panel,
+        menu_bar_shuffle_cards, menu_bar_shuffle_paint_order, paint_car_speedometer,
+        paint_car_status_tile, publish_front_door_instance_lifecycle_to_bus,
         publish_front_door_peer_app_launch_to_bus, publish_front_door_service_lifecycle_to_bus,
         real_media, real_terminal, remote_sessions_fallback_pos, route_file_operation_request,
         screenshot, splash, status, surface_needs_remote_sessions_fallback, terminal_panel, vdi,
@@ -4388,6 +4437,63 @@ mod tests {
             shell.maps_location.active,
             WorkspaceTab::Vehicle,
             "Vehicle must continue to open its dedicated telematics tab"
+        );
+    }
+
+    #[test]
+    fn car_home_vehicle_glance_names_degraded_mg90_without_promoting_it_live() {
+        use mackes_mesh_types::vehicle::{VehicleState as WireVehicleState, VehicleTelem};
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_millis() as i64;
+
+        let awaiting = mde_maps_location_egui::MapsLocationSurface::live();
+        assert_eq!(
+            car_home_vehicle_glance(&awaiting),
+            (Some("Awaiting MG90".to_string()), false),
+            "no retained vehicle mirror is explicit but still dim"
+        );
+
+        let mut mirror = WireVehicleState::offline("eagle");
+        mirror.online = true;
+        mirror.model = "MG90".to_string();
+        mirror.mgos_version = "4.3.0.1".to_string();
+        mirror.telem = VehicleTelem {
+            speed_mph: 42.0,
+            battery_v: 13.2,
+            moving: true,
+            obd_present: true,
+            ..VehicleTelem::default()
+        };
+        mirror.published_at_ms = now_ms;
+
+        let mut state = mde_maps_location_egui::MapsLocationSurface::live();
+        state.refresh_from_vehicle(&mirror);
+        assert_eq!(
+            car_home_vehicle_glance(&state),
+            (Some("42 mph".to_string()), true),
+            "fresh online MG90 telemetry keeps the live Home glance"
+        );
+
+        mirror.published_at_ms = now_ms - 6_000;
+        state.refresh_from_vehicle(&mirror);
+        let (line, live) = car_home_vehicle_glance(&state);
+        assert!(!live, "stale retained telemetry must not paint as live");
+        assert!(
+            line.as_deref()
+                .is_some_and(|line| line.starts_with("MG90 stale · ")),
+            "stale MG90 gets an explicit dim label: {line:?}"
+        );
+
+        mirror.online = false;
+        mirror.published_at_ms = now_ms;
+        state.refresh_from_vehicle(&mirror);
+        assert_eq!(
+            car_home_vehicle_glance(&state),
+            (Some("MG90 offline".to_string()), false),
+            "adapter-offline mirrors remain visible but dim"
         );
     }
 

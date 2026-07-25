@@ -1761,6 +1761,8 @@ mod tests {
         let reader_root = bus_root.clone();
         let report_host = desktop.placement_peer.clone();
         let report_name = desktop.vm_name.clone();
+        let _initialized_bus =
+            mde_bus::persist::Persist::open(bus_root.clone()).expect("initialize temp bus");
         let observer = std::thread::spawn(move || {
             let persist = mde_bus::persist::Persist::open(reader_root).expect("open bus");
             let verifier = HmacTokenSigner::new(b"first-desktop-lifecycle-bus-test-key".to_vec());

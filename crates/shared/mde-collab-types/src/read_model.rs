@@ -43,6 +43,8 @@ pub enum CollabReadModel {
     Presence(PresenceBoard),
     /// The active call state.
     CallState(CallState),
+    /// Local media-adapter readiness for active calls.
+    CallMediaReadiness(CallMediaReadiness),
     /// DigitalOcean AI suggestion request state.
     AiSuggestionRequests(AiSuggestionRequests),
 }
@@ -330,6 +332,74 @@ pub struct CallParticipantView {
     pub muted: bool,
 }
 
+/// The adapter-facing media readiness projection for one local actor.
+///
+/// This is not proof that live media is connected. It is the bounded signed-state
+/// hand-off a WebRTC/SIP/LiveKit/VDI worker can consume before touching provider
+/// APIs: only non-ended calls where `local_actor` is already a connected
+/// participant are included.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallMediaReadiness {
+    /// The local actor this view was built for.
+    pub local_actor: ActorId,
+    /// Calls whose signed state is ready for an adapter attempt.
+    pub sessions: Vec<CallMediaSession>,
+}
+
+/// One active call that a future media adapter may attempt to bind.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallMediaSession {
+    /// The call id.
+    pub call: CallId,
+    /// The space it belongs to.
+    pub space: SpaceId,
+    /// The declared collaboration/call kind.
+    pub kind: CallKind,
+    /// When the call started (epoch ms).
+    pub started_unix_ms: i64,
+    /// Required local capabilities/devices for this call kind.
+    pub requirements: Vec<CallMediaRequirement>,
+    /// Candidate adapter classes. These are not a selected route and do not
+    /// claim the adapter is reachable.
+    pub candidate_adapters: Vec<CallMediaAdapter>,
+    /// Connected participants to offer to the adapter.
+    pub connected_participants: Vec<ActorId>,
+    /// The local actor's signed mute bit.
+    pub local_muted: bool,
+}
+
+/// Local capability/device requirements implied by a call kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallMediaRequirement {
+    /// Microphone/audio capture or playback.
+    Microphone,
+    /// Camera capture.
+    Camera,
+    /// Screen capture.
+    ScreenCapture,
+    /// Shared document/session state.
+    DocumentSync,
+    /// Remote desktop stream decode/input.
+    RemoteDesktopStream,
+}
+
+/// Adapter families a future worker may evaluate for a ready call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallMediaAdapter {
+    /// Mesh peer-to-peer WebRTC.
+    WebRtcP2p,
+    /// Mesh-reachable LiveKit SFU/SIP bridge.
+    LiveKitSfu,
+    /// SIP/PSTN gateway path.
+    SipGateway,
+    /// Document co-edit adapter.
+    DocumentCollab,
+    /// VDI remote-desktop adapter.
+    VdiRemoteDesktop,
+}
+
 /// The bounded DigitalOcean AI suggestion request board.
 ///
 /// This is worker-owned sidecar state, not signed collaboration history: it lets
@@ -418,6 +488,10 @@ mod tests {
             CollabReadModel::AlertInbox(AlertInbox::default()),
             CollabReadModel::Presence(PresenceBoard::default()),
             CollabReadModel::CallState(CallState::default()),
+            CollabReadModel::CallMediaReadiness(CallMediaReadiness {
+                local_actor: ActorId::new("alice"),
+                sessions: Vec::new(),
+            }),
             CollabReadModel::AiSuggestionRequests(AiSuggestionRequests::default()),
         ];
         for m in models {

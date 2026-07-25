@@ -661,6 +661,7 @@ pub struct LiveServiceApply {
     /// This authoring node's local secret store, when available — the source of the
     /// `media-spaces` plaintext that gets sealed into the target's bundle. `None`
     /// ⇒ only the Media-role pin is pushed (the live push delivers the seal).
+    #[cfg(feature = "async-services")]
     local_secrets: Option<crate::ipc::secret_store::SecretStore>,
 }
 
@@ -668,6 +669,7 @@ impl Default for LiveServiceApply {
     fn default() -> Self {
         Self {
             remote_push: std::sync::Arc::new(crate::onboard::remote_push::BusApply),
+            #[cfg(feature = "async-services")]
             local_secrets: None,
         }
     }
@@ -687,6 +689,7 @@ impl LiveServiceApply {
 
     /// Inject this node's local secret store (the source of the sealed
     /// `media-spaces` plaintext).
+    #[cfg(feature = "async-services")]
     #[must_use]
     pub fn with_local_secrets(mut self, store: crate::ipc::secret_store::SecretStore) -> Self {
         self.local_secrets = Some(store);

@@ -17,7 +17,8 @@ Examples::
         --require-same-host
     verify-live-mirrors.py --airspace-node workstation --require-airspace-ready
     verify-live-mirrors.py --vdi-console-session vdi-1-win11 \
-        --require-vdi-brokered --expected-vdi-protocol spice
+        --require-vdi-brokered --expected-vdi-protocol spice \
+        --require-vdi-status-rail-live
 """
 
 from __future__ import annotations
@@ -45,6 +46,7 @@ OVERLAY_PREFIX = "state/overlay/"
 AIRSPACE_PREFIX = "state/airspace/"
 VEHICLE_PREFIX = "state/vehicle/"
 VDI_CONSOLE_TOPIC = "state/vdi/console"
+VDI_SESSION_TOPIC = "action/vdi/session"
 MAX_TOPIC_SCAN_ROWS = 256
 ALLOWED_VDI_PROTOCOLS = frozenset({"rdp", "vnc", "spice"})
 ALLOWED_OVERLAY_LICENSE_TIERS = frozenset(
@@ -618,6 +620,143 @@ def validate_vdi_console(
     return result
 
 
+def validate_vdi_session_rail(
+    bus_root: Path,
+    session_id: str,
+    now_ms: int,
+    max_age_ms: int,
+    require_visible: bool,
+    require_active: bool,
+    expected_serving_node: str | None = None,
+    expected_vm_id: str | None = None,
+    expected_client_peer: str | None = None,
+) -> dict[str, Any]:
+    """Validate the shell/status-rail lifecycle proof for one brokered session."""
+    rows = _read_topic_rows(bus_root, VDI_SESSION_TOPIC, MAX_TOPIC_SCAN_ROWS)
+    matches: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any], str]] = []
+    for row, envelope, payload, digest in rows:
+        if payload.get("id") == session_id:
+            matches.append((row, envelope, payload, digest))
+    if not matches:
+        raise MirrorError(
+            f"no {VDI_SESSION_TOPIC} lifecycle row for session {session_id!r} "
+            f"in newest {MAX_TOPIC_SCAN_ROWS} rows"
+        )
+
+    matches.sort(key=lambda item: str(item[0].get("ulid", "")))
+    errors: list[str] = []
+    open_row: dict[str, Any] | None = None
+    open_payload: dict[str, Any] | None = None
+    active_row: dict[str, Any] | None = None
+    state_row: dict[str, Any] | None = None
+    state_payload: dict[str, Any] | None = None
+    state_digest = ""
+    state = "unknown"
+    ops_seen: list[str] = []
+    for row, _envelope, payload, digest in matches:
+        op = payload.get("op")
+        if not isinstance(op, str):
+            errors.append("VDI lifecycle row has no string op")
+            continue
+        ops_seen.append(op)
+        if op == "open":
+            open_row = row
+            open_payload = payload
+            state = "requested"
+            state_row = row
+            state_payload = payload
+            state_digest = digest
+        elif op == "active":
+            if open_payload is None:
+                errors.append("VDI lifecycle active row appeared before an open row")
+            active_row = row
+            state = "active"
+            state_row = row
+            state_payload = payload
+            state_digest = digest
+        elif op == "disconnect":
+            state = "disconnected"
+            state_row = row
+            state_payload = payload
+            state_digest = digest
+        elif op == "close":
+            state = "closed"
+            state_row = row
+            state_payload = payload
+            state_digest = digest
+        else:
+            errors.append(f"unknown VDI lifecycle op {op!r}")
+
+    if open_payload is None or open_row is None:
+        errors.append("VDI status rail has no open lifecycle row")
+    else:
+        serving_peer = open_payload.get("serving_peer")
+        vm_id = open_payload.get("vm_id")
+        client_peer = open_payload.get("client_peer")
+        if not isinstance(serving_peer, str) or not serving_peer:
+            errors.append("open lifecycle serving_peer is missing or not a non-empty string")
+        elif expected_serving_node is not None and serving_peer != expected_serving_node:
+            errors.append(
+                f"status-rail serving_peer {serving_peer!r} does not match "
+                f"console serving_node {expected_serving_node!r}"
+            )
+        if not isinstance(vm_id, str) or not vm_id:
+            errors.append("open lifecycle vm_id is missing or not a non-empty string")
+        elif expected_vm_id is not None and vm_id != expected_vm_id:
+            errors.append(
+                f"status-rail vm_id {vm_id!r} does not match console vm_id {expected_vm_id!r}"
+            )
+        if not isinstance(client_peer, str) or not client_peer:
+            errors.append("open lifecycle client_peer is missing or not a non-empty string")
+        elif expected_client_peer is not None and client_peer != expected_client_peer:
+            errors.append(
+                f"status-rail client_peer {client_peer!r} does not match "
+                f"{expected_client_peer!r}"
+            )
+
+    age_ms = 0
+    age_errors: list[str] = []
+    if state_row is not None:
+        age_ms, age_errors = _indexed_age_check(state_row, now_ms, max_age_ms)
+        errors.extend(age_errors)
+
+    visible = state in {"requested", "active", "disconnected"}
+    if require_visible and not visible:
+        errors.append(f"VDI status rail is not visible (latest lifecycle state is {state!r})")
+    if require_active and state != "active":
+        errors.append(f"VDI status rail is not LIVE (latest lifecycle state is {state!r})")
+    if require_active and active_row is None:
+        errors.append("VDI status rail has no active lifecycle row")
+    rail_badge = {
+        "requested": "VDI",
+        "active": "LIVE",
+        "disconnected": "DISC",
+    }.get(state)
+    result_row = state_row or open_row or matches[-1][0]
+    result_payload = state_payload or open_payload or matches[-1][2]
+    result_digest = state_digest or matches[-1][3]
+    result = _base_result(VDI_SESSION_TOPIC, result_row, result_payload, result_digest)
+    result.update(
+        {
+            "kind": "vdi_status_rail",
+            "age_ms": age_ms,
+            "fresh": not age_errors,
+            "session_id": session_id,
+            "state": state,
+            "visible_in_status_rail": visible,
+            "rail_badge": rail_badge,
+            "serving_peer": open_payload.get("serving_peer") if open_payload else None,
+            "vm_id": open_payload.get("vm_id") if open_payload else None,
+            "client_peer": open_payload.get("client_peer") if open_payload else None,
+            "opened": open_payload is not None,
+            "active": state == "active",
+            "ops_seen": ops_seen,
+            "errors": errors,
+        }
+    )
+    return result
+
+
 def validate_airspace(
     bus_root: Path,
     node: str,
@@ -749,8 +888,9 @@ def run(args: argparse.Namespace) -> int:
         results.append(result)
         failures.extend(result.get("errors", []))
     if args.vdi_console_session:
+        console_result: dict[str, Any] | None = None
         try:
-            result = validate_vdi_console(
+            console_result = validate_vdi_console(
                 root,
                 args.vdi_console_session,
                 now_ms,
@@ -761,9 +901,37 @@ def run(args: argparse.Namespace) -> int:
                 args.expected_vdi_vm,
             )
         except MirrorError as exc:
-            result = {"kind": "vdi_console", "topic": VDI_CONSOLE_TOPIC, "errors": [str(exc)]}
+            console_result = {"kind": "vdi_console", "topic": VDI_CONSOLE_TOPIC, "errors": [str(exc)]}
+        result = console_result
         results.append(result)
         failures.extend(result.get("errors", []))
+        if args.require_vdi_status_rail or args.require_vdi_status_rail_live or args.expected_vdi_client_peer:
+            expected_serving_node = args.expected_vdi_serving_node
+            expected_vm_id = args.expected_vdi_vm
+            if expected_serving_node is None and isinstance(console_result.get("serving_node"), str):
+                expected_serving_node = console_result["serving_node"]
+            if expected_vm_id is None and isinstance(console_result.get("vm_id"), str):
+                expected_vm_id = console_result["vm_id"]
+            try:
+                rail_result = validate_vdi_session_rail(
+                    root,
+                    args.vdi_console_session,
+                    now_ms,
+                    max_age_ms,
+                    args.require_vdi_status_rail or args.require_vdi_status_rail_live,
+                    args.require_vdi_status_rail_live,
+                    expected_serving_node,
+                    expected_vm_id,
+                    args.expected_vdi_client_peer,
+                )
+            except MirrorError as exc:
+                rail_result = {
+                    "kind": "vdi_status_rail",
+                    "topic": VDI_SESSION_TOPIC,
+                    "errors": [str(exc)],
+                }
+            results.append(rail_result)
+            failures.extend(rail_result.get("errors", []))
     report = {
         "observed_at_ms": now_ms,
         "bus_root": str(root.resolve()) if root.exists() else str(root),
@@ -882,6 +1050,29 @@ def _self_test() -> None:
             },
         )
         add(
+            "01J00000000000000000000009",
+            VDI_SESSION_TOPIC,
+            {
+                "schema_version": 1,
+                "armed_token": "fixture",
+                "op": "open",
+                "id": "vdi-1-win11",
+                "serving_peer": "peer:oak",
+                "vm_id": "win11",
+                "client_peer": "seat-15",
+            },
+        )
+        add(
+            "01J00000000000000000000010",
+            VDI_SESSION_TOPIC,
+            {
+                "schema_version": 1,
+                "armed_token": "fixture",
+                "op": "active",
+                "id": "vdi-1-win11",
+            },
+        )
+        add(
             "01J00000000000000000000006",
             VDI_CONSOLE_TOPIC,
             {
@@ -892,6 +1083,19 @@ def _self_test() -> None:
                     "state": "unbrokerable",
                     "reason": "unresolved: VM is shut off",
                 },
+            },
+        )
+        add(
+            "01J00000000000000000000011",
+            VDI_SESSION_TOPIC,
+            {
+                "schema_version": 1,
+                "armed_token": "fixture",
+                "op": "open",
+                "id": "vdi-2-off",
+                "serving_peer": "peer:oak",
+                "vm_id": "off",
+                "client_peer": "seat-15",
             },
         )
         add(
@@ -964,11 +1168,38 @@ def _self_test() -> None:
         )
         assert not vdi["errors"], vdi
         assert vdi["brokered"] is True and vdi["endpoint_port"] == 5900, vdi
+        rail = validate_vdi_session_rail(
+            root,
+            "vdi-1-win11",
+            now_ms,
+            30_000,
+            True,
+            True,
+            "peer:oak",
+            "win11",
+            "seat-15",
+        )
+        assert not rail["errors"], rail
+        assert rail["active"] is True and rail["rail_badge"] == "LIVE", rail
         unbrokerable = validate_vdi_console(
             root, "vdi-2-off", now_ms, 30_000, False
         )
         assert not unbrokerable["errors"], unbrokerable
         assert unbrokerable["status"] == "unbrokerable", unbrokerable
+        requested_rail = validate_vdi_session_rail(
+            root,
+            "vdi-2-off",
+            now_ms,
+            30_000,
+            True,
+            True,
+            "peer:oak",
+            "off",
+            "seat-15",
+        )
+        assert requested_rail["visible_in_status_rail"] is True, requested_rail
+        assert requested_rail["rail_badge"] == "VDI", requested_rail
+        assert any("not LIVE" in error for error in requested_rail["errors"]), requested_rail
         required_vdi = validate_vdi_console(
             root, "vdi-2-off", now_ms, 30_000, True
         )
@@ -1053,9 +1284,12 @@ def _self_test() -> None:
             require_airspace_ready=True,
             require_airspace_contacts=True,
             require_vdi_brokered=True,
+            require_vdi_status_rail=True,
+            require_vdi_status_rail_live=True,
             expected_vdi_protocol="spice",
             expected_vdi_serving_node="peer:oak",
             expected_vdi_vm="win11",
+            expected_vdi_client_peer="seat-15",
         )
         with redirect_stdout(cli_output):
             assert run(cli_args) == 0
@@ -1161,6 +1395,23 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--expected-vdi-serving-node")
     parser.add_argument("--expected-vdi-vm")
+    parser.add_argument("--expected-vdi-client-peer")
+    parser.add_argument(
+        "--require-vdi-status-rail",
+        action="store_true",
+        help=(
+            f"require a matching {VDI_SESSION_TOPIC} open lifecycle row that the "
+            "Construct status rail can project"
+        ),
+    )
+    parser.add_argument(
+        "--require-vdi-status-rail-live",
+        action="store_true",
+        help=(
+            f"require {VDI_SESSION_TOPIC} to fold the session to the LIVE rail "
+            "state (a transport-connected acceptance proof, not a pixel proof)"
+        ),
+    )
     parser.add_argument(
         "--require-same-host",
         action="store_true",
@@ -1186,9 +1437,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("airspace expectations require --airspace-node")
     vdi_args = (
         args.require_vdi_brokered,
+        args.require_vdi_status_rail,
+        args.require_vdi_status_rail_live,
         args.expected_vdi_protocol,
         args.expected_vdi_serving_node,
         args.expected_vdi_vm,
+        args.expected_vdi_client_peer,
     )
     if any(vdi_args) and not args.vdi_console_session:
         parser.error("VDI console expectations require --vdi-console-session")
