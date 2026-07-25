@@ -13,19 +13,24 @@
 //! Arbitrary MIME up to 100 MB rides the clipboard lane; anything larger is a
 //! Transfer, not a clip (the worker routes it there rather than truncating).
 
-use mde_egui::egui;
 use mde_egui::Style;
+use mde_egui::egui;
 
 use mde_collab_types::{
     ClipItemKind, ClipboardItem, ClipboardView, CollabCommand, EventId, SpaceId,
 };
 
 use crate::files::short_hash;
-use crate::{icons, relative_age, CommunicationsSurface};
+use crate::{CommunicationsSurface, icons, relative_age};
 
 /// The lane row preview cap — a clip's preview is a recognisable head, never the
 /// full (possibly large) content pasted into the row.
 const PREVIEW_MAX: usize = 160;
+
+/// The clipboard lane's content ceiling, matching the collab worker's fold gate.
+/// Larger content belongs on the Transfer lane and must not reach the publish
+/// command's preview/hash materialization path.
+const MAX_CLIP_BYTES: usize = 100 * 1024 * 1024;
 
 impl CommunicationsSurface {
     /// Render Clipboard mode for the selected space: the publish composer, then
@@ -125,9 +130,9 @@ impl CommunicationsSurface {
                 publish = true;
             }
         });
-        let text = buf.trim().to_owned();
+        let text = buf.trim();
         if publish && !text.is_empty() {
-            self.publish_clip_text(sink, space, &text, me);
+            self.publish_clip_text(sink, space, text, me);
             buf.clear();
         }
         self.clip_drafts.insert(space, buf);
@@ -213,6 +218,10 @@ impl CommunicationsSurface {
         text: &str,
         source: &str,
     ) {
+        if !clip_fits_lane(text.len()) {
+            return;
+        }
+
         let item = ClipboardItem {
             kind: detect_kind(text),
             preview: clip_preview(text),
@@ -253,6 +262,13 @@ impl CommunicationsSurface {
     }
 }
 
+/// Whether a clip of `len` bytes fits in the clipboard lane. Keep this a pure
+/// boundary seam so the oversized-input policy is testable without making every
+/// boundary test allocate a 100 MiB string.
+const fn clip_fits_lane(len: usize) -> bool {
+    len <= MAX_CLIP_BYTES
+}
+
 /// Classify a clip's content: an `http(s)://` head is a shared URI, everything
 /// else is text (an honest, conservative guess — never a faked MIME).
 fn detect_kind(text: &str) -> ClipItemKind {
@@ -273,5 +289,40 @@ fn clip_preview(text: &str) -> String {
         format!("{head}\u{2026}")
     } else {
         one_line
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_CLIP_BYTES, PREVIEW_MAX, clip_fits_lane, clip_preview};
+    use crate::{CommandSink, CommunicationsSurface};
+    use mde_collab_types::SpaceId;
+
+    #[test]
+    fn oversized_clip_is_rejected_before_publish_command_materialization() {
+        let surface = CommunicationsSurface::new();
+        let mut sink = CommandSink::new();
+        let oversized = "x".repeat(MAX_CLIP_BYTES + 1);
+
+        surface.publish_clip_text(&mut sink, SpaceId::new(), &oversized, "eagle");
+
+        assert!(
+            sink.queued().is_empty(),
+            "oversized clipboard text must not become a PublishClipboard command"
+        );
+    }
+
+    #[test]
+    fn clip_lane_boundary_is_inclusive() {
+        assert!(clip_fits_lane(MAX_CLIP_BYTES));
+        assert!(!clip_fits_lane(MAX_CLIP_BYTES + 1));
+    }
+
+    #[test]
+    fn clip_preview_keeps_normalization_and_truncation_behavior() {
+        assert_eq!(clip_preview("  hello\nmesh  "), "hello mesh");
+
+        let long = "a".repeat(PREVIEW_MAX + 1);
+        assert_eq!(clip_preview(&long), format!("{}…", "a".repeat(PREVIEW_MAX)));
     }
 }

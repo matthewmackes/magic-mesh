@@ -696,6 +696,14 @@ impl Style {
     /// Resolve a semantic typography role to the installed family and size.
     #[must_use]
     pub fn typography_font(role: TypographyRole) -> FontId {
+        Self::typography_font_with_size(role, role.size())
+    }
+
+    /// Resolve a semantic typography role while selecting an existing shared
+    /// size rung. Navigation chrome uses this to keep its HIG Title3 size
+    /// without inventing a second font family or role.
+    #[must_use]
+    pub fn typography_font_with_size(role: TypographyRole, size: f32) -> FontId {
         let family = if role.is_mono() {
             FontFamily::Monospace
         } else if matches!(
@@ -706,7 +714,7 @@ impl Style {
         } else {
             FontFamily::Proportional
         };
-        FontId::new(role.size(), family)
+        FontId::new(size, family)
     }
 
     /// Build styled text with the shared tracking and line-height contract.

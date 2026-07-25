@@ -32,6 +32,19 @@ const SENSITIVE_PLACEHOLDER: &str = "(sensitive — value withheld)";
 /// large; the shell's expandable raw-log pane wants the head, not megabytes).
 const RAW_LOG_CAP: usize = 4096;
 
+/// Keep a hostile inventory from turning one read reply into an unbounded roster.
+const MAX_INVENTORY_HOSTS: usize = 256;
+
+/// Keep a hostile tofu state from turning one read reply into an unbounded output
+/// table.
+const MAX_TOFU_OUTPUTS: usize = 256;
+
+/// A host can belong to many groups, all of which become row display data.
+const MAX_GROUPS_PER_HOST: usize = 64;
+
+/// Cap untrusted row labels and values before they cross into a [`CloudReply`].
+const MAX_DISPLAY_CHARS: usize = 256;
+
 /// Handle `action/cloud/inventory` → the resolved mesh Ansible inventory.
 pub(super) fn handle_inventory(w: &CloudWorker, verb_name: &str) -> CloudReply {
     match w.runner.resolve_inventory() {
@@ -105,8 +118,10 @@ fn parse_inventory(json: &str) -> Result<Vec<InventoryHost>, String> {
         .and_then(|m| m.get("hostvars"))
         .and_then(Value::as_object);
 
-    // host -> its groups. A `BTreeMap`/`BTreeSet` gives deterministic ordering.
-    let mut host_groups: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    // Select a bounded, deterministic host set before building the per-host group
+    // map. This keeps the fold itself bounded even when the tool reports a hostile
+    // number of distinct host names.
+    let mut selected_hosts = BTreeSet::new();
 
     for (group, membership) in root {
         if group == "_meta" {
@@ -116,18 +131,35 @@ fn parse_inventory(json: &str) -> Result<Vec<InventoryHost>, String> {
             continue;
         };
         for host in hosts.iter().filter_map(Value::as_str) {
-            let entry = host_groups.entry(host.to_string()).or_default();
-            // `all` / `ungrouped` are synthetic roll-ups, not meaningful groups.
-            if group != "all" && group != "ungrouped" {
-                entry.insert(group.clone());
-            }
+            retain_bounded(&mut selected_hosts, host.to_string(), MAX_INVENTORY_HOSTS);
         }
     }
 
     // A host present only in `_meta.hostvars` (no group membership) still counts.
     if let Some(hv) = hostvars {
         for host in hv.keys() {
-            host_groups.entry(host.clone()).or_default();
+            retain_bounded(&mut selected_hosts, host.clone(), MAX_INVENTORY_HOSTS);
+        }
+    }
+
+    // host -> its groups. A `BTreeMap`/`BTreeSet` gives deterministic ordering.
+    let mut host_groups: BTreeMap<String, BTreeSet<String>> = selected_hosts
+        .into_iter()
+        .map(|host| (host, BTreeSet::new()))
+        .collect();
+
+    for (group, membership) in root {
+        if group == "_meta" || group == "all" || group == "ungrouped" {
+            continue;
+        }
+        let Some(hosts) = membership.get("hosts").and_then(Value::as_array) else {
+            continue;
+        };
+        let group = bounded_display(group);
+        for host in hosts.iter().filter_map(Value::as_str) {
+            if let Some(groups) = host_groups.get_mut(host) {
+                retain_bounded(groups, group.clone(), MAX_GROUPS_PER_HOST);
+            }
         }
     }
 
@@ -140,14 +172,14 @@ fn parse_inventory(json: &str) -> Result<Vec<InventoryHost>, String> {
             let node = vars
                 .and_then(|v| v.get("ansible_host"))
                 .and_then(Value::as_str)
-                .unwrap_or(&host)
-                .to_string();
+                .map(bounded_display)
+                .unwrap_or_else(|| bounded_display(&host));
             let reachable = vars
                 .and_then(|v| v.get("reachable").or_else(|| v.get("alive")))
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
             InventoryHost {
-                id: host,
+                id: bounded_display(&host),
                 node,
                 groups: groups.into_iter().collect(),
                 reachable,
@@ -166,23 +198,34 @@ fn parse_outputs(json: &str) -> Result<Vec<TofuOutput>, String> {
         .as_object()
         .ok_or_else(|| "tofu output root is not a JSON object".to_string())?;
 
-    let mut rows: Vec<TofuOutput> = root
-        .iter()
-        .map(|(name, entry)| {
-            let sensitive = entry
-                .get("sensitive")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let value = if sensitive {
-                SENSITIVE_PLACEHOLDER.to_string()
-            } else {
-                entry.get("value").map(render_value).unwrap_or_default()
-            };
-            TofuOutput {
-                name: name.clone(),
-                value,
-                sensitive,
-            }
+    let mut names = BTreeSet::new();
+    for name in root.keys() {
+        retain_bounded(&mut names, name.as_str(), MAX_TOFU_OUTPUTS);
+    }
+
+    let mut rows: Vec<TofuOutput> = names
+        .into_iter()
+        .filter_map(|name| {
+            root.get(name).map(|entry| {
+                let sensitive = entry
+                    .get("sensitive")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let value = if sensitive {
+                    SENSITIVE_PLACEHOLDER.to_string()
+                } else {
+                    entry
+                        .get("value")
+                        .map(render_value)
+                        .map(|value| bounded_display(&value))
+                        .unwrap_or_default()
+                };
+                TofuOutput {
+                    name: bounded_display(name),
+                    value,
+                    sensitive,
+                }
+            })
         })
         .collect();
     rows.sort_by(|a, b| a.name.cmp(&b.name));
@@ -196,6 +239,60 @@ fn render_value(value: &Value) -> String {
         Value::String(s) => s.clone(),
         other => other.to_string(),
     }
+}
+
+/// Keep row text single-line, visible, and bounded. The read model does not retain
+/// a second raw copy, so this is intentionally applied before constructing the
+/// neutral rows rather than deferred to a particular shell renderer.
+fn bounded_display(value: &str) -> String {
+    let normalized: String = value
+        .chars()
+        .map(|character| {
+            if character.is_control()
+                || matches!(
+                    character,
+                    '\u{00ad}'
+                        | '\u{061c}'
+                        | '\u{200b}'..='\u{200f}'
+                        | '\u{202a}'..='\u{202e}'
+                        | '\u{2060}'..='\u{206f}'
+                        | '\u{feff}'
+                )
+            {
+                '\u{fffd}'
+            } else {
+                character
+            }
+        })
+        .collect();
+    if normalized.chars().count() <= MAX_DISPLAY_CHARS {
+        return normalized;
+    }
+
+    let mut bounded: String = normalized
+        .chars()
+        .take(MAX_DISPLAY_CHARS.saturating_sub(1))
+        .collect();
+    bounded.push('…');
+    bounded
+}
+
+/// Retain the lexicographically first `cap` values, regardless of input order.
+/// This makes a capped read stable while keeping only bounded folded state.
+fn retain_bounded<T: Ord + Clone>(set: &mut BTreeSet<T>, value: T, cap: usize) {
+    if cap == 0 || set.contains(&value) {
+        return;
+    }
+    if set.len() >= cap {
+        let Some(last) = set.iter().next_back().cloned() else {
+            return;
+        };
+        if value >= last {
+            return;
+        }
+        set.remove(&last);
+    }
+    set.insert(value);
 }
 
 /// Head of `s`, capped at [`RAW_LOG_CAP`] bytes on a char boundary.
@@ -258,6 +355,44 @@ mod tests {
     }
 
     #[test]
+    fn inventory_caps_host_rows_and_bounds_row_display_fields() {
+        let long = "a".repeat(MAX_DISPLAY_CHARS + 32);
+        let mut host_list = Vec::new();
+        let mut hostvars = serde_json::Map::new();
+        for index in 0..=MAX_INVENTORY_HOSTS {
+            let host = if index == 0 {
+                long.clone()
+            } else {
+                format!("host-{index:03}")
+            };
+            host_list.push(Value::String(host.clone()));
+            hostvars.insert(host, serde_json::json!({"ansible_host": long}));
+        }
+
+        let long_group = format!("group-{}", "g".repeat(MAX_DISPLAY_CHARS + 32));
+        let mut root = serde_json::Map::new();
+        root.insert(
+            "_meta".to_string(),
+            serde_json::json!({"hostvars": hostvars}),
+        );
+        root.insert(long_group, serde_json::json!({"hosts": host_list}));
+
+        let rows = parse_inventory(&Value::Object(root).to_string()).expect("parse");
+        assert_eq!(rows.len(), MAX_INVENTORY_HOSTS);
+        let long_row = rows
+            .iter()
+            .find(|row| row.id.starts_with('a'))
+            .expect("lexicographically first hostile host is retained");
+        assert_eq!(long_row.id.chars().count(), MAX_DISPLAY_CHARS);
+        assert!(long_row.id.ends_with('…'));
+        assert_eq!(long_row.node.chars().count(), MAX_DISPLAY_CHARS);
+        assert!(long_row.node.ends_with('…'));
+        assert_eq!(long_row.groups.len(), 1);
+        assert_eq!(long_row.groups[0].chars().count(), MAX_DISPLAY_CHARS);
+        assert!(long_row.groups[0].ends_with('…'));
+    }
+
+    #[test]
     fn inventory_handler_serves_the_parsed_roster_via_the_runner() {
         let w = worker_with_reads(Some(Ok(INVENTORY_JSON.to_string())), None);
         let reply = handle_inventory(&w, "inventory");
@@ -317,6 +452,57 @@ mod tests {
     #[test]
     fn output_parse_rejects_a_non_object_root() {
         assert!(parse_outputs("[1,2]").is_err());
+    }
+
+    #[test]
+    fn outputs_cap_rows_bound_display_fields_and_keep_sensitive_values_masked() {
+        let long_name = "a".repeat(MAX_DISPLAY_CHARS + 32);
+        let long_value = "v".repeat(MAX_DISPLAY_CHARS + 32);
+        let secret = "secret-that-must-not-cross-the-boundary";
+        let mut root = serde_json::Map::new();
+        root.insert(
+            long_name,
+            serde_json::json!({"value": long_value, "sensitive": false}),
+        );
+        root.insert(
+            "admin_password".to_string(),
+            serde_json::json!({"value": secret, "sensitive": true}),
+        );
+        for index in 0..MAX_TOFU_OUTPUTS {
+            root.insert(
+                format!("output-{index:03}"),
+                serde_json::json!({"value": "ok", "sensitive": false}),
+            );
+        }
+
+        let rows = parse_outputs(&Value::Object(root).to_string()).expect("parse");
+        assert_eq!(rows.len(), MAX_TOFU_OUTPUTS);
+        let long_row = rows
+            .iter()
+            .find(|row| row.name.starts_with('a'))
+            .expect("lexicographically first hostile output is retained");
+        assert_eq!(long_row.name.chars().count(), MAX_DISPLAY_CHARS);
+        assert!(long_row.name.ends_with('…'));
+        assert_eq!(long_row.value.chars().count(), MAX_DISPLAY_CHARS);
+        assert!(long_row.value.ends_with('…'));
+
+        let sensitive = rows
+            .iter()
+            .find(|row| row.name == "admin_password")
+            .expect("sensitive output is retained");
+        assert!(sensitive.sensitive);
+        assert_eq!(sensitive.value, SENSITIVE_PLACEHOLDER);
+        assert!(!rows.iter().any(|row| row.value.contains(secret)));
+    }
+
+    #[test]
+    fn bounded_display_replaces_invisible_text_and_truncates_on_character_boundaries() {
+        let hostile = format!("line\n\u{202e}{}", "🚗".repeat(MAX_DISPLAY_CHARS));
+        let display = bounded_display(&hostile);
+        assert!(display.chars().count() <= MAX_DISPLAY_CHARS);
+        assert!(!display.contains('\n'));
+        assert!(!display.contains('\u{202e}'));
+        assert!(display.ends_with('…'));
     }
 
     #[test]

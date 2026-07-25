@@ -1,8 +1,8 @@
 //! adsb.lol low-altitude aircraft layer model and painter.
 
-use mackes_mesh_types::aircraft::{AircraftSnapshot, AircraftTrack, ATTRIBUTION};
-use mde_egui::egui::{self, Align2, Color32, FontId, Painter, Pos2, Rect, Shape, Stroke};
+use mackes_mesh_types::aircraft::{ATTRIBUTION, AircraftSnapshot, AircraftTrack};
 use mde_egui::Style;
+use mde_egui::egui::{self, Color32, FontId, Painter, Pos2, Rect, Shape, Stroke};
 
 /// Five missed three-second polls make the layer visibly stale.
 pub const SNAPSHOT_STALE_AFTER_MS: i64 = 15_000;
@@ -16,6 +16,12 @@ pub const MAX_TIMESTAMP_FUTURE_SKEW_MS: i64 = 5_000;
 /// Keep an untrusted retained aircraft set bounded before any per-aircraft
 /// dead reckoning, projection, label layout, or tessellation work.
 const MAX_PAINTABLE_AIRCRAFT: usize = 256;
+/// Bound untrusted broadcast text before handing it to egui's text layout.
+const MAX_CALLSIGN_CHARS: usize = 16;
+/// Keep a callsign readable without allowing it to cover the map viewport.
+const MAX_CALLSIGN_LABEL_WIDTH: f32 = 160.0;
+const CALLSIGN_LABEL_GAP: f32 = 10.0;
+const CALLSIGN_LABEL_MARGIN: f32 = 2.0;
 
 const LOW_ALTITUDE: Color32 = Color32::from_rgb(0xF0, 0x66, 0x3A); // style-leak-ok: map-content-color
 const HIGH_ALTITUDE: Color32 = Color32::from_rgb(0x47, 0xB6, 0xE8); // style-leak-ok: map-content-color
@@ -134,14 +140,9 @@ where
                 stats.markers += 1;
                 if layer.show_callsigns {
                     if let Some(callsign) = aircraft.callsign.as_deref() {
-                        marker_painter.text(
-                            point + egui::vec2(10.0, 0.0),
-                            Align2::LEFT_CENTER,
-                            callsign,
-                            FontId::proportional(Style::SMALL),
-                            tone,
-                        );
-                        stats.labels += 1;
+                        if paint_callsign(&marker_painter, rect, point, callsign, tone) {
+                            stats.labels += 1;
+                        }
                     }
                 }
             }
@@ -150,6 +151,105 @@ where
     paint_age_badge(painter, rect, layer, now_ms);
     stats.badge = true;
     stats
+}
+
+fn bounded_callsign(callsign: &str) -> Option<String> {
+    let mut chars = callsign.chars();
+    let mut bounded = String::new();
+    for character in chars.by_ref().take(MAX_CALLSIGN_CHARS) {
+        if !character.is_whitespace() && !character.is_control() {
+            bounded.push(character);
+        }
+    }
+    if chars.next().is_some() {
+        bounded.push('\u{2026}');
+    }
+    (!bounded.is_empty()).then_some(bounded)
+}
+
+/// Fit a bounded callsign to the available width without ever laying out the
+/// untrusted source string. The extra binary-search layouts are all capped by
+/// `MAX_CALLSIGN_CHARS`.
+fn fit_callsign(painter: &Painter, callsign: &str, max_width: f32) -> Option<String> {
+    if !max_width.is_finite() || max_width <= 0.0 {
+        return None;
+    }
+    let font = FontId::proportional(Style::SMALL);
+    let full = painter.layout_no_wrap(callsign.to_owned(), font.clone(), Color32::WHITE);
+    if full.size().x <= max_width {
+        return Some(callsign.to_owned());
+    }
+
+    let chars: Vec<char> = callsign.chars().collect();
+    let mut low = 0;
+    let mut high = chars.len();
+    while low < high {
+        let mid = (low + high).div_ceil(2);
+        let prefix: String = chars.iter().take(mid).collect();
+        let candidate = format!("{prefix}\u{2026}");
+        let galley = painter.layout_no_wrap(candidate, font.clone(), Color32::WHITE);
+        if galley.size().x <= max_width {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+
+    let candidate = if low == 0 {
+        "\u{2026}".to_string()
+    } else {
+        let prefix: String = chars.into_iter().take(low).collect();
+        format!("{prefix}\u{2026}")
+    };
+    (painter
+        .layout_no_wrap(candidate.clone(), font, Color32::WHITE)
+        .size()
+        .x
+        <= max_width)
+        .then_some(candidate)
+}
+
+fn callsign_label_rect(
+    painter: &Painter,
+    rect: Rect,
+    point: Pos2,
+    callsign: &str,
+) -> Option<(String, Rect)> {
+    let callsign = bounded_callsign(callsign)?;
+    let inner = rect.shrink(CALLSIGN_LABEL_MARGIN);
+    let max_width = inner.width().min(MAX_CALLSIGN_LABEL_WIDTH);
+    if !max_width.is_finite() || max_width <= 0.0 || inner.height() <= 0.0 {
+        return None;
+    }
+    let callsign = fit_callsign(painter, &callsign, max_width)?;
+    let galley = painter.layout_no_wrap(
+        callsign.clone(),
+        FontId::proportional(Style::SMALL),
+        Color32::WHITE,
+    );
+    let size = galley.size();
+    if size.x > inner.width() || size.y > inner.height() {
+        return None;
+    }
+
+    let x = (point.x + CALLSIGN_LABEL_GAP).clamp(inner.left(), inner.right() - size.x);
+    let y = (point.y - size.y * 0.5).clamp(inner.top(), inner.bottom() - size.y);
+    Some((callsign, Rect::from_min_size(egui::pos2(x, y), size)))
+}
+
+fn paint_callsign(
+    painter: &Painter,
+    rect: Rect,
+    point: Pos2,
+    callsign: &str,
+    tone: Color32,
+) -> bool {
+    let Some((callsign, label_rect)) = callsign_label_rect(painter, rect, point, callsign) else {
+        return false;
+    };
+    let galley = painter.layout_no_wrap(callsign, FontId::proportional(Style::SMALL), tone);
+    painter.galley(label_rect.left_top(), galley, tone);
+    true
 }
 
 fn paint_marker(painter: &Painter, point: Pos2, track_deg: Option<f32>, tone: Color32) {
@@ -425,6 +525,51 @@ mod tests {
         });
         assert_eq!(observed.markers, 0);
         assert!(observed.badge);
+    }
+
+    #[test]
+    fn bounded_callsign_is_single_line_and_caps_untrusted_text() {
+        assert_eq!(bounded_callsign(" N123AB \n").as_deref(), Some("N123AB"));
+        assert!(bounded_callsign(" \n\t").is_none());
+
+        let oversized = "A".repeat(MAX_CALLSIGN_CHARS + 1);
+        let bounded = bounded_callsign(&oversized).expect("non-empty callsign");
+        assert_eq!(bounded.chars().count(), MAX_CALLSIGN_CHARS + 1);
+        assert!(bounded.ends_with('\u{2026}'));
+        assert!(
+            bounded
+                .chars()
+                .all(|character| !character.is_whitespace() && !character.is_control())
+        );
+    }
+
+    #[test]
+    fn hostile_callsign_label_is_fit_and_clamped_inside_viewport() {
+        let viewport = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(120.0, 30.0));
+        let hostile = format!("{}\n{}", "X".repeat(100_000), "off-screen");
+        let ctx = egui::Context::default();
+        let mut layout = None;
+        let mut painted = false;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                layout =
+                    callsign_label_rect(ui.painter(), viewport, egui::pos2(118.0, 0.0), &hostile);
+                painted = paint_callsign(
+                    ui.painter(),
+                    viewport,
+                    egui::pos2(118.0, 0.0),
+                    &hostile,
+                    Color32::WHITE,
+                );
+            });
+        });
+
+        let (shown, label_rect) = layout.expect("hostile callsign remains readable");
+        assert!(viewport.contains_rect(label_rect));
+        assert!(label_rect.width() <= MAX_CALLSIGN_LABEL_WIDTH);
+        assert!(shown.chars().count() <= MAX_CALLSIGN_CHARS + 1);
+        assert!(!shown.contains('\n'));
+        assert!(painted);
     }
 
     #[test]

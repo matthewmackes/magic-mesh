@@ -344,7 +344,7 @@ impl<'a> NavigationBar<'a> {
                 strip.center(),
                 Align2::CENTER_CENTER,
                 self.title,
-                Style::typography_font(TypographyRole::Headline),
+                Style::typography_font_with_size(TypographyRole::Headline, Style::TYPE_TITLE3),
                 strong,
             );
         }
@@ -895,9 +895,10 @@ mod tests {
         assert!(!out.shapes.is_empty(), "nav bar must paint visible shapes");
         let texts = painted_text(&out.shapes);
         assert!(
-            texts.iter().any(|(t, s)| t == "Settings"
-                && (*s - TypographyRole::Headline.size()).abs() < f32::EPSILON),
-            "title must render on the shared headline rung: {texts:?}"
+            texts
+                .iter()
+                .any(|(t, s)| t == "Settings" && (*s - Style::TYPE_TITLE3).abs() < f32::EPSILON),
+            "title must render on the shared Title3 rung: {texts:?}"
         );
         assert!(
             texts.iter().any(|(t, _)| t == "Home"),

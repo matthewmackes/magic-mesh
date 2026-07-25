@@ -459,6 +459,11 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-ARCH-007 - Repair Workloads cockpit E2E wire, placement, and authorization
 
 - Status: Remaining
+- Progress (2026-07-24 inventory read-boundary hardening): cloud inventory and
+  output reads now cap host/output rows, group counts, and display text before
+  `CloudReply` materialization while preserving sensitive-value masking. The
+  focused BigBoy inventory gate is green at 60/60; live libvirt/Podman evidence
+  remains external.
 - Progress (2026-07-24 direct-libvirt action framing hardening): the lifecycle
   Bus parser now rejects action bodies above the shared 64 KiB RPC limit before
   JSON materialization, with the oversized-body regression covered by the
@@ -663,6 +668,11 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-011 - Communications collaboration suite full replacement
 
 - Status: Remaining
+- Progress (2026-07-24 clipboard publish-boundary hardening): clipboard publish
+  input now enforces the 100 MiB transfer/clip ceiling before preview/hash
+  command materialization; normal preview behavior is unchanged. The focused
+  clipboard gate is green at 5/5 and the full Communications package at 68/68;
+  live media/LLM evidence remains external.
 - Progress (2026-07-24 Alerts display-boundary hardening): alert headlines,
   sources, structured fields, and action labels are now single-line, bidi/control
   safe, and bounded before egui layout while raw IDs remain unchanged for
@@ -1146,6 +1156,10 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-012 - Maps live-data overlays (zero-cost external feeds)
 
 - Status: Remaining
+- Progress (2026-07-24 aircraft label boundary hardening): retained aircraft
+  callsigns are sanitized, bounded, width-fit, and viewport-clamped before
+  egui layout. The focused aircraft gate is green at 9/9 and the full Maps
+  suite at 215/215; live provider-key evidence remains external.
 - Progress (2026-07-24 offline-geocoder query boundary): destination-search
   input is capped at 4 KiB before tokenization, FTS expression allocation, or
   SQLite access, while normal prefix search remains unchanged. The focused farm
@@ -1425,6 +1439,11 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-006 - Construct interface (Apple-HIG-principled workstation shell)
 
 - Status: Remaining
+- Progress (2026-07-24 NavigationBar Title3 alignment): shared NavigationBar
+  standard titles now render on `Style::TYPE_TITLE3`, matching the Workbench
+  content-pane contract. The focused mde-egui navigation gate is green at 5/5
+  and the previously failing Workbench regression at 1/1; live physical/pixel
+  evidence remains external.
 - Progress (2026-07-24 status-rail text and geometry hardening): status labels
   now have a bounded single-line presentation boundary, hostile control/bidi
   characters are removed, and narrow-bar hit targets remain inside the reserved
