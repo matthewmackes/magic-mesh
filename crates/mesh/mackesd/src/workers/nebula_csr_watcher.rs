@@ -38,6 +38,11 @@ use crate::ca::NebulaCertBackend;
 use crate::ipc::nebula::{NebulaSignal, SignalSenderSlot};
 use crate::nebula_enroll::{pending_enroll_path, SignCsrPaths};
 
+/// Bound one scan against a hostile or accidentally corrupted shared root.
+/// Normal meshes are far below this limit; exceeding it aborts the scan rather
+/// than allowing an unbounded directory walk and allocation in the worker.
+const MAX_DISCOVERY_ENTRIES: usize = 4096;
+
 /// Default tick cadence. Slower than the heartbeat (5 s) because
 /// enrollment is a low-frequency operator event; the operator
 /// doesn't typically join a peer every 5 seconds. 30 s gives
@@ -291,18 +296,48 @@ impl NebulaCsrWatcher {
 /// Surfaces I/O errors from reading workgroup_root. Permission denied
 /// counts as "no peers" (worker logs at debug + moves on).
 pub fn discover_pending_peers(workgroup_root: &Path) -> std::io::Result<Vec<String>> {
-    if !workgroup_root.exists() {
-        return Ok(Vec::new());
+    match std::fs::symlink_metadata(workgroup_root) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Vec::new());
+        }
+        Err(error) => return Err(error),
     }
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(workgroup_root)? {
+    for (index, entry) in std::fs::read_dir(workgroup_root)?.enumerate() {
+        if index >= MAX_DISCOVERY_ENTRIES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("CSR discovery root contains more than {MAX_DISCOVERY_ENTRIES} entries"),
+            ));
+        }
         let entry = entry?;
         let path = entry.path();
-        if !path.is_dir() {
+        let peer_metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if !peer_metadata.file_type().is_dir() {
             continue;
         }
-        let csr = path.join("mackesd").join("pending-enroll.json");
-        if csr.exists() {
+        let mackesd_dir = path.join("mackesd");
+        let mackesd_metadata = match std::fs::symlink_metadata(&mackesd_dir) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if !mackesd_metadata.file_type().is_dir() {
+            continue;
+        }
+        let csr = mackesd_dir.join("pending-enroll.json");
+        let csr_metadata = match std::fs::symlink_metadata(&csr) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if csr_metadata.file_type().is_file() {
             if let Some(peer) = path.file_name().and_then(|s| s.to_str()) {
                 out.push(peer.to_string());
             }
@@ -325,11 +360,38 @@ pub fn discover_pending_peers(workgroup_root: &Path) -> std::io::Result<Vec<Stri
 pub fn needs_signing(workgroup_root: &Path, peer_id: &str) -> std::io::Result<bool> {
     let csr = pending_enroll_path(workgroup_root, peer_id);
     let bundle = bundle_path(workgroup_root, peer_id);
-    if !bundle.exists() {
-        return Ok(true);
+    for directory in [
+        workgroup_root,
+        &workgroup_root.join(peer_id),
+        &workgroup_root.join(peer_id).join("mackesd"),
+    ] {
+        let metadata = match std::fs::symlink_metadata(directory) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if !metadata.file_type().is_dir() {
+            return Ok(false);
+        }
     }
-    let csr_mtime = csr.metadata()?.modified()?;
-    let bundle_mtime = bundle.metadata()?.modified()?;
+    let csr_metadata = match std::fs::symlink_metadata(&csr) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if !csr_metadata.file_type().is_file() {
+        return Ok(false);
+    }
+    let bundle_metadata = match std::fs::symlink_metadata(&bundle) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error),
+    };
+    if !bundle_metadata.file_type().is_file() {
+        return Ok(false);
+    }
+    let csr_mtime = csr_metadata.modified()?;
+    let bundle_mtime = bundle_metadata.modified()?;
     // Strict greater-than — same-mtime files (rare; same-second
     // writes) are treated as already-signed. Re-enroll always
     // generates a fresh CSR with a newer timestamp.
@@ -417,10 +479,72 @@ mod tests {
     }
 
     #[test]
+    fn discover_rejects_an_unbounded_hostile_root() {
+        let tmp = tempdir().unwrap();
+        for index in 0..=MAX_DISCOVERY_ENTRIES {
+            std::fs::write(tmp.path().join(format!("stray-{index}.txt")), "x").unwrap();
+        }
+
+        let error = discover_pending_peers(tmp.path()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_skips_symlinked_peer_and_csr_paths() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempdir().unwrap();
+        place_csr(tmp.path(), "peer:target");
+
+        symlink(
+            tmp.path().join("peer:target"),
+            tmp.path().join("peer:linked-dir"),
+        )
+        .unwrap();
+
+        let linked_csr_dir = tmp.path().join("peer:linked-csr").join("mackesd");
+        std::fs::create_dir_all(&linked_csr_dir).unwrap();
+        symlink(
+            tmp.path().join("peer:target/mackesd/pending-enroll.json"),
+            linked_csr_dir.join("pending-enroll.json"),
+        )
+        .unwrap();
+
+        let peers = discover_pending_peers(tmp.path()).unwrap();
+        assert_eq!(peers, vec!["peer:target"]);
+    }
+
+    #[test]
     fn needs_signing_returns_true_when_no_bundle() {
         let tmp = tempdir().unwrap();
         place_csr(tmp.path(), "peer:anvil");
         assert!(needs_signing(tmp.path(), "peer:anvil").unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn needs_signing_fails_closed_for_symlinked_csr_and_bundle() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempdir().unwrap();
+        place_csr(tmp.path(), "peer:target");
+
+        let linked_csr_dir = tmp.path().join("peer:linked-csr").join("mackesd");
+        std::fs::create_dir_all(&linked_csr_dir).unwrap();
+        symlink(
+            tmp.path().join("peer:target/mackesd/pending-enroll.json"),
+            linked_csr_dir.join("pending-enroll.json"),
+        )
+        .unwrap();
+        assert!(!needs_signing(tmp.path(), "peer:linked-csr").unwrap());
+
+        place_csr(tmp.path(), "peer:linked-bundle");
+        let bundle = bundle_path(tmp.path(), "peer:linked-bundle");
+        let target = tmp.path().join("outside-bundle.json");
+        std::fs::write(&target, b"{}").unwrap();
+        symlink(&target, &bundle).unwrap();
+        assert!(!needs_signing(tmp.path(), "peer:linked-bundle").unwrap());
     }
 
     #[test]

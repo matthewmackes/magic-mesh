@@ -29,8 +29,13 @@ pub struct EarthquakeLayerState {
 
 impl EarthquakeLayerState {
     /// Replace the prior feed wholesale. This makes upstream revisions and
-    /// deletes converge rather than accumulating dead event markers.
+    /// deletes converge rather than accumulating dead event markers. The
+    /// retained state is bounded here as well as at paint time because the
+    /// snapshot crosses a Bus mirror boundary and must not make one seat hold
+    /// an arbitrarily large event vector between frames.
     pub fn fold(&mut self, snapshot: EarthquakeSnapshot) {
+        let mut snapshot = snapshot;
+        snapshot.events.truncate(MAX_PAINTABLE_EVENTS);
         self.snapshot = Some(snapshot);
     }
 
@@ -422,6 +427,32 @@ mod tests {
         });
         assert_eq!(projected, MAX_PAINTABLE_EVENTS);
         assert_eq!(observed.markers, MAX_PAINTABLE_EVENTS);
+    }
+
+    #[test]
+    fn fold_bounds_untrusted_retained_snapshot_before_the_next_frame() {
+        let now = 1_000_000;
+        let base = snapshot(now).events[0].clone();
+        let mut oversized = snapshot(now);
+        oversized.events = (0..(MAX_PAINTABLE_EVENTS + 32))
+            .map(|index| EarthquakeEvent {
+                id: format!("event-{index}"),
+                ..base.clone()
+            })
+            .collect();
+
+        let mut layer = EarthquakeLayerState::default();
+        layer.fold(oversized);
+
+        assert_eq!(
+            layer
+                .snapshot
+                .as_ref()
+                .expect("retained snapshot")
+                .events
+                .len(),
+            MAX_PAINTABLE_EVENTS
+        );
     }
 
     #[test]

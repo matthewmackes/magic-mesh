@@ -164,8 +164,9 @@ where
         let points: Vec<Pos2> = ring
             .iter()
             .take(MAX_PAINTABLE_POINTS_PER_RING)
+            .filter(|point| valid_geo_point(**point))
             .filter_map(|point| project(point.latitude, point.longitude))
-            .filter(|point| !point.any_nan())
+            .filter(|point| point.x.is_finite() && point.y.is_finite())
             .collect();
         if points.len() >= 3 {
             projected_rings.push(points);
@@ -317,16 +318,14 @@ fn alert_contains(alert: &NwsAlert, point: GeoPoint) -> bool {
 }
 
 fn point_in_geo_ring(point: GeoPoint, ring: &[GeoPoint]) -> bool {
+    if !valid_geo_point(point) {
+        return false;
+    }
     let points: Vec<GeoPoint> = ring
         .iter()
         .copied()
         .take(MAX_PAINTABLE_POINTS_PER_RING)
-        .filter(|point| {
-            point.latitude.is_finite()
-                && point.longitude.is_finite()
-                && (-90.0..=90.0).contains(&point.latitude)
-                && (-180.0..=180.0).contains(&point.longitude)
-        })
+        .filter(|point| valid_geo_point(*point))
         .collect();
     if points.len() < 3 {
         return false;
@@ -346,6 +345,13 @@ fn point_in_geo_ring(point: GeoPoint, ring: &[GeoPoint]) -> bool {
         j = i;
     }
     inside
+}
+
+fn valid_geo_point(point: GeoPoint) -> bool {
+    point.latitude.is_finite()
+        && (-90.0..=90.0).contains(&point.latitude)
+        && point.longitude.is_finite()
+        && (-180.0..=180.0).contains(&point.longitude)
 }
 
 fn severity_color(severity: NwsSeverity) -> Color32 {
@@ -710,5 +716,81 @@ mod tests {
         assert_eq!(stats.polygons, 0);
         assert!(!stats.inside_alert);
         assert!(stats.badge);
+    }
+
+    #[test]
+    fn invalid_polygon_coordinates_fail_closed_before_projection() {
+        let now = 1_000_000;
+        let mut warning = alert(now);
+        warning.polygons[0].rings[0] = vec![
+            GeoPoint {
+                latitude: f64::NAN,
+                longitude: 1.0,
+            },
+            GeoPoint {
+                latitude: 0.0,
+                longitude: 0.0,
+            },
+            GeoPoint {
+                latitude: 0.0,
+                longitude: 2.0,
+            },
+        ];
+        let mut snapshot = NwsAlertSnapshot::empty("rig-1", now);
+        snapshot.alerts.push(warning);
+        let mut layer = NwsAlertLayerState::default();
+        layer.fold(snapshot);
+
+        let invalid_projection = std::cell::Cell::new(false);
+        let ctx = egui::Context::default();
+        let mut stats = PaintStats::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = ui.max_rect();
+                stats = paint_layer(
+                    ui.painter(),
+                    rect,
+                    &layer,
+                    now,
+                    Some(GeoPoint {
+                        latitude: 0.5,
+                        longitude: 0.5,
+                    }),
+                    |latitude, longitude| {
+                        if !valid_geo_point(GeoPoint {
+                            latitude,
+                            longitude,
+                        }) {
+                            invalid_projection.set(true);
+                        }
+                        Some(rect.center())
+                    },
+                );
+            });
+        });
+
+        assert_eq!(stats.polygons, 0);
+        assert!(!stats.inside_alert);
+        assert!(!invalid_projection.get());
+    }
+
+    #[test]
+    fn invalid_vehicle_coordinates_cannot_enter_a_warning() {
+        let now = 1_000_000;
+        let warning = alert(now);
+        assert!(!alert_contains(
+            &warning,
+            GeoPoint {
+                latitude: f64::NAN,
+                longitude: 0.5,
+            }
+        ));
+        assert!(!alert_contains(
+            &warning,
+            GeoPoint {
+                latitude: 91.0,
+                longitude: 0.5,
+            }
+        ));
     }
 }

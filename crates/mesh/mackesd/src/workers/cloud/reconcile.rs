@@ -187,13 +187,35 @@ fn write_desired_doc_atomic(path: &Path, body: &str) -> Result<(), String> {
     result
 }
 
-/// Read one desired document through a hard byte ceiling. The metadata check
-/// avoids reading an obviously oversized file, while `take(limit + 1)` closes
-/// the race where a file grows after metadata was inspected.
+/// Read one desired document through a hard byte ceiling. The descriptor is
+/// opened without following a final symlink (and without blocking on a raced
+/// special file) before the metadata check, while `take(limit + 1)` closes the
+/// race where a file grows after metadata was inspected.
 fn read_desired_doc_bounded(path: &Path) -> std::io::Result<String> {
+    #[cfg(unix)]
+    let file: std::fs::File = {
+        use rustix::fs::{Mode, OFlags};
+
+        rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?
+        .into()
+    };
+    #[cfg(not(unix))]
     let file = std::fs::File::open(path)?;
+
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "desired document is not a regular file",
+        ));
+    }
     let limit = u64::try_from(MAX_DESIRED_DOC_BYTES).unwrap_or(u64::MAX);
-    let declared_len = file.metadata()?.len();
+    let declared_len = metadata.len();
     if declared_len > limit {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -212,9 +234,8 @@ fn read_desired_doc_bounded(path: &Path) -> std::io::Result<String> {
             format!("desired document exceeds {MAX_DESIRED_DOC_BYTES}-byte limit"),
         ));
     }
-    String::from_utf8(bytes).map_err(|error| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, error)
-    })
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
 /// Read node `node`'s desired-state slice — every `*.json` doc under its desired
@@ -656,6 +677,25 @@ mod tests {
         let err = remove_desired_doc(&root, "eagle", "web").unwrap_err();
         assert!(err.contains("non-regular"), "unexpected error: {err}");
         assert!(doc.is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_desired_doc_rejects_a_final_symlink_at_open() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside.json");
+        let link = tmp.path().join("desired.json");
+        std::fs::write(&outside, "outside state").unwrap();
+        symlink(&outside, &link).unwrap();
+
+        // The pre-open metadata check alone is racy: before the old
+        // File::open, this final link could be swapped in and its target read.
+        assert!(
+            read_desired_doc_bounded(&link).is_err(),
+            "a final symlink must never become desired-state input"
+        );
     }
 
     #[test]

@@ -20,7 +20,7 @@ instead of leaving closed work in this file.
 
 - **6 active epics:** 6 `Remaining`, 0 `Blocked`; no `Needs clarification`.
 - **Release gate:** the current integrated wave passes the full `mackesd` farm
-  suite at **4,103 passed, 0 failed, 1 ignored**. The Fedora 44
+  suite at **4,107 passed, 0 failed, 1 ignored**. The Fedora 44
   base/browser/thin-lighthouse RPM cut is green at **81.7 / 39.1 / 11.0 MiB**;
   the exact base RPM requires the F44 FFmpeg ABI (`libavcodec.so.62`,
   `libswresample.so.6`, `libswscale.so.9`).
@@ -252,6 +252,13 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-SEC-006 - Keep Nebula private keys local to their owning node
 
 - Status: Remaining
+- Progress (2026-07-25 CSR discovery boundary): the Nebula CSR watcher now
+  rejects symlinked or non-regular roots, peer directories, CSR leaves, and
+  bundle leaves, and caps one shared-root scan at 4,096 entries before
+  allocation. The focused farm gate is green at **14/14**, and the integrated
+  BigBoy `mackesd --lib --features async-services` gate is **4,107 passed, 0
+  failed, 1 ignored**; live Nebula rotation/reconnect/prune evidence remains
+  external.
 - Progress (2026-07-25 enrollment-listener key boundary): the TLS enrollment
   listener now reads its certificate/key material through bounded no-follow
   readers, and refuses a non-owner-only endpoint key instead of starting with
@@ -626,6 +633,13 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-ARCH-007 - Repair Workloads cockpit E2E wire, placement, and authorization
 
 - Status: Remaining
+- Progress (2026-07-25 desired-document no-follow boundary): cloud
+  reconciliation now opens desired documents with no-follow, non-blocking,
+  close-on-exec descriptors before the existing 256 KiB bounded read, so a
+  raced final symlink cannot become plan input. The focused reconcile farm
+  gate is green at **42/42**, and the integrated BigBoy `mackesd` gate is
+  **4,107 passed, 0 failed, 1 ignored**; live libvirt/KVM lifecycle evidence
+  remains external.
 - Progress (2026-07-25 malformed plan boundary): Workloads `plan` now rejects
   malformed or oversized JSON before backend access; the intentional `{}`
   worker-local plan request remains valid. The focused desired-verb farm gate is
@@ -950,6 +964,12 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-011 - Communications collaboration suite full replacement
 
 - Status: Remaining
+- Progress (2026-07-25 content-addressed blob boundary): the filesystem blob
+  store now accepts only canonical lower-hex SHA-256 paths, rejects traversal
+  and final-symlink roots/leaves for reads and purge, and caps both put/get
+  materialization at 100 MiB with descriptor-backed reads. The full core farm
+  suite is green at **63/63**; live WebRTC/SIP and sealed DO/LLM evidence
+  remain external.
 - Progress (2026-07-25 bounded import-map state): the durable collaboration
   import map now rejects oversized, non-regular, changing, or invalid-UTF-8
   state before JSON materialization, while preserving missing-map initialization
@@ -1533,6 +1553,12 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-012 - Maps live-data overlays (zero-cost external feeds)
 
 - Status: Remaining
+- Progress (2026-07-25 map consumer input bounds): the earthquake consumer now
+  caps retained event vectors before the next frame, while NWS alert polygons
+  and vehicle containment reject invalid geographic coordinates and non-finite
+  projected points before paint. Focused earthquake/NWS checks are green at
+  **9/9** and **8/8**, and the full Maps suite is green at **228/228**; live
+  provider and MG90 scanner-feed evidence remains external.
 - Progress (2026-07-25 offline geocoder and Airspace observation boundaries):
   offline Home-address geocoding now rejects final symlinks and non-regular
   gazetteer leaves before SQLite access (**9/9** focused tests). Airspace now
@@ -1863,6 +1889,11 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-006 - Construct interface (Apple-HIG-principled workstation shell)
 
 - Status: Remaining
+- Progress (2026-07-25 notification geometry boundary): Construct notification
+  rows now reserve the glyph column and wrap hostile-length alert text inside
+  the fixed panel width, keeping controls and hit targets in the workspace.
+  The focused notification-center farm gate is green at **12/12**; live
+  pointer/pixel, physical, and VDI acceptance remain external.
 - Progress (2026-07-25 switcher freshness boundary): a decoded live Desktop
   VDI frame now outranks a retained body snapshot in the switcher, while the
   retained snapshot remains the fallback when no frame exists. The focused

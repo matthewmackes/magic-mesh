@@ -445,6 +445,10 @@ fn group_header(ui: &mut egui::Ui, topic: &str, clearable: bool) -> bool {
 /// One notification row: the Carbon severity glyph, a `TYPE_BODY` title, and a
 /// `TYPE_FOOTNOTE` `source · HH:MM` line.
 fn row(ui: &mut egui::Ui, severity: Severity, title: &str, footnote: &str) {
+    // Alert text is external input. Reserve the glyph and its gap before
+    // laying out the labels so a long headline cannot expand the modal past
+    // its fixed panel width and move controls outside the hit target.
+    let text_width = (ui.available_width() - GLYPH - ui.spacing().item_spacing.x).max(0.0);
     ui.horizontal(|ui| {
         let (rect, _) = ui.allocate_exact_size(vec2(GLYPH, GLYPH), Sense::hover());
         if !paint_carbon(ui.painter(), rect, severity.glyph_name(), severity.color()) {
@@ -453,16 +457,23 @@ fn row(ui: &mut egui::Ui, severity: Severity, title: &str, footnote: &str) {
                 .circle_filled(rect.center(), Style::SP_XS, severity.color());
         }
         ui.vertical(|ui| {
+            ui.set_width(text_width);
             ui.spacing_mut().item_spacing.y = 2.0;
-            ui.label(
-                RichText::new(title)
-                    .font(Style::typography_font(TypographyRole::Body))
-                    .color(Style::TEXT),
+            ui.add(
+                egui::Label::new(
+                    RichText::new(title)
+                        .font(Style::typography_font(TypographyRole::Body))
+                        .color(Style::TEXT),
+                )
+                .wrap(),
             );
-            ui.label(
-                RichText::new(footnote)
-                    .font(Style::typography_font(TypographyRole::Label))
-                    .color(Style::TEXT_DIM),
+            ui.add(
+                egui::Label::new(
+                    RichText::new(footnote)
+                        .font(Style::typography_font(TypographyRole::Label))
+                        .color(Style::TEXT_DIM),
+                )
+                .wrap(),
             );
         });
     });
@@ -536,6 +547,29 @@ mod tests {
             }
         }
         shapes.iter().any(|c| walk(&c.shape, needle))
+    }
+
+    fn right_edge_of_text(shapes: &[egui::epaint::ClippedShape], needle: &str) -> Option<f32> {
+        fn walk(shape: &egui::epaint::Shape, needle: &str, right: &mut Option<f32>) {
+            match shape {
+                egui::epaint::Shape::Text(t) if t.galley.job.text.contains(needle) => {
+                    let edge = t.visual_bounding_rect().right();
+                    *right = Some(right.map_or(edge, |current| current.max(edge)));
+                }
+                egui::epaint::Shape::Vec(v) => {
+                    for shape in v {
+                        walk(shape, needle, right);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut right = None;
+        for clipped in shapes {
+            walk(&clipped.shape, needle, &mut right);
+        }
+        right
     }
 
     fn press_events(pos: Pos2) -> Vec<egui::Event> {
@@ -775,6 +809,32 @@ mod tests {
         assert!(
             shapes_contain_text(&out.shapes, EMPTY_HEADLINE),
             "an empty Center says so — never a fabricated backlog"
+        );
+    }
+
+    #[test]
+    fn long_alert_text_stays_inside_the_fixed_panel() {
+        let ctx = ctx();
+        let mut construct = ConstructChrome::default();
+        construct.notification_center_open = true;
+        let mut toasts = ToastBridge::default();
+        let long_headline = "long-alert ".repeat(200);
+        toasts.history_mut().record(
+            Severity::Warning,
+            "lh-with-a-long-name",
+            "BUILD",
+            &long_headline,
+        );
+        let segments = StatusSegments::default();
+
+        let out = warm(&ctx, &mut construct, &mut toasts, &segments);
+        let panel = panel_rect(Rect::from_min_size(Pos2::ZERO, SCREEN));
+        let right = right_edge_of_text(&out.shapes, "long-alert")
+            .expect("the long alert headline should be rendered");
+        assert!(
+            right <= panel.right() + 0.5,
+            "long alert text escaped the fixed panel: right={right}, panel={}",
+            panel.right()
         );
     }
 
