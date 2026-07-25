@@ -154,25 +154,23 @@ impl State {
     /// never slides underneath either representation.
     #[must_use]
     pub(crate) fn reserves_bottom_space(&self) -> bool {
-        self.transition.as_ref().map_or(
-            matches!(self.mode, DockMode::Floating),
-            |transition| {
+        self.transition
+            .as_ref()
+            .map_or(matches!(self.mode, DockMode::Floating), |transition| {
                 matches!(transition.from, DockMode::Floating)
                     || matches!(transition.to, DockMode::Floating)
-            },
-        )
+            })
     }
 
     /// Whether the central workspace must reserve the vertical pinned rail.
     #[must_use]
     pub(crate) fn reserves_left_space(&self) -> bool {
-        self.transition.as_ref().map_or(
-            matches!(self.mode, DockMode::Docked),
-            |transition| {
+        self.transition
+            .as_ref()
+            .map_or(matches!(self.mode, DockMode::Docked), |transition| {
                 matches!(transition.from, DockMode::Docked)
                     || matches!(transition.to, DockMode::Docked)
-            },
-        )
+            })
     }
 
     /// Toggle placement and start the slide/melt transition.
@@ -240,7 +238,8 @@ impl State {
                     // the painter and AccessKit rectangles. Translating these
                     // into Area-local coordinates makes every control miss on
                     // any non-zero-position bar.
-                    let response = ui.interact(control.rect, control_id(*control), egui::Sense::click());
+                    let response =
+                        ui.interact(control.rect, control_id(*control), egui::Sense::click());
                     let hovered = response.hovered();
                     if hovered {
                         painter.rect_filled(
@@ -480,7 +479,10 @@ fn floating_geometry_for(screen: egui::Rect, pinned_count: usize) -> Geometry {
             screen.left() + FLOATING_MARGIN,
             screen.bottom() - FLOATING_MARGIN - FLOATING_H,
         ),
-        egui::vec2(width.min((screen.width() - 2.0 * FLOATING_MARGIN).max(1.0)), FLOATING_H),
+        egui::vec2(
+            width.min((screen.width() - 2.0 * FLOATING_MARGIN).max(1.0)),
+            FLOATING_H,
+        ),
     );
     let first_x = outer.left() + Style::SP_L;
     let y = outer.center().y - CONTROL_EDGE / 2.0;
@@ -639,7 +641,10 @@ fn control_label(
     control: Control,
     pinned_sources: &[crate::surfaces::DesktopRailSource],
 ) -> String {
-    match control.source_index.and_then(|index| pinned_sources.get(index)) {
+    match control
+        .source_index
+        .and_then(|index| pinned_sources.get(index))
+    {
         Some(source) => format!("Open pinned desktop {} on {}", source.label, source.node),
         None if control.kind == ControlKind::Pin => "Pin Springboard Dock".to_owned(),
         None => control.kind.tooltip().to_owned(),
@@ -650,27 +655,27 @@ fn control_action(
     control: Control,
     pinned_sources: &[crate::surfaces::DesktopRailSource],
 ) -> Action {
-    match control.source_index.and_then(|index| pinned_sources.get(index)) {
+    match control
+        .source_index
+        .and_then(|index| pinned_sources.get(index))
+    {
         Some(source) => Action::DesktopSource(source.id.clone()),
         None => control.kind.action(),
     }
 }
 
 fn install_accessibility(ctx: &egui::Context, control: Control, label: &str, _docked: bool) {
-    let _ = ctx.accesskit_node_builder(
-        control_id(control),
-        |node| {
-            node.set_role(egui::accesskit::Role::Button);
-            node.set_label(label.to_owned());
-            node.set_bounds(egui::accesskit::Rect {
-                x0: control.rect.left().into(),
-                y0: control.rect.top().into(),
-                x1: control.rect.right().into(),
-                y1: control.rect.bottom().into(),
-            });
-            node.add_action(egui::accesskit::Action::Click);
-        },
-    );
+    let _ = ctx.accesskit_node_builder(control_id(control), |node| {
+        node.set_role(egui::accesskit::Role::Button);
+        node.set_label(label.to_owned());
+        node.set_bounds(egui::accesskit::Rect {
+            x0: control.rect.left().into(),
+            y0: control.rect.top().into(),
+            x1: control.rect.right().into(),
+            y1: control.rect.bottom().into(),
+        });
+        node.add_action(egui::accesskit::Action::Click);
+    });
 }
 
 fn lerp_rect(from: egui::Rect, to: egui::Rect, t: f32) -> egui::Rect {
@@ -693,14 +698,103 @@ fn smoothstep(t: f32) -> f32 {
 }
 
 fn save_to(path: &Path, prefs: NavBarPrefs) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    use std::io::Write as _;
+
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "navigation preference path has no parent",
+        )
+    })?;
+    ensure_directory_tree(parent)?;
     let json = serde_json::to_string_pretty(&prefs)
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, json)?;
-    fs::rename(tmp, path)
+    let leaf = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "navigation preference path has an invalid filename",
+            )
+        })?;
+    let (tmp, mut file) = (0..16)
+        .find_map(|_| {
+            let candidate = parent.join(format!(
+                ".{leaf}.tmp.{}.{}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.mode(0o600);
+            }
+            match options.open(&candidate) {
+                Ok(file) => Some(Ok((candidate, file))),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "could not allocate a unique navigation preference temporary file",
+            )
+        })??;
+    if let Err(error) = file
+        .write_all(json.as_bytes())
+        .and_then(|()| file.sync_all())
+    {
+        drop(file);
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
+    }
+    drop(file);
+    if let Err(error) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
+    }
+    fs::File::open(parent)?.sync_all()
+}
+
+/// Create a preference directory only through real directory components. A
+/// client-data path is local but still crosses a filesystem trust boundary;
+/// never let a planted symlink redirect a navigation preference write.
+fn ensure_directory_tree(path: &Path) -> std::io::Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "navigation preference parent is not a real directory: {}",
+                        current.display()
+                    ),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&current)?;
+                let metadata = fs::symlink_metadata(&current)?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "created navigation preference parent is unsafe: {}",
+                            current.display()
+                        ),
+                    ));
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -795,6 +889,62 @@ mod tests {
         symlink(&target, &link).expect("preference symlink");
 
         assert!(read_bounded_config(&link).is_err());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_replaces_final_symlink_without_writing_through_it() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile_dir();
+        let target = dir.join("outside.json");
+        let link = dir.join(CONFIG_FILE);
+        fs::write(&target, r#"{"mode":"floating"}"#).expect("target prefs");
+        symlink(&target, &link).expect("preference symlink");
+
+        save_to(
+            &link,
+            NavBarPrefs {
+                mode: DockMode::Docked,
+            },
+        )
+        .expect("replace preference symlink atomically");
+
+        assert_eq!(
+            fs::read_to_string(&target).expect("read symlink target"),
+            r#"{"mode":"floating"}"#
+        );
+        let saved: NavBarPrefs =
+            serde_json::from_str(&fs::read_to_string(&link).expect("read replaced preference"))
+                .expect("decode replaced preference");
+        assert_eq!(saved.mode, DockMode::Docked);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_rejects_symlinked_parent_without_writing_outside() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile_dir();
+        let outside = dir.join("outside");
+        let parent = dir.join("prefs");
+        fs::create_dir(&outside).expect("outside directory");
+        symlink(&outside, &parent).expect("preference parent symlink");
+
+        let result = save_to(
+            &parent.join(CONFIG_FILE),
+            NavBarPrefs {
+                mode: DockMode::Docked,
+            },
+        );
+
+        assert!(
+            result.is_err(),
+            "symlinked preference parent must be rejected"
+        );
+        assert!(!outside.join(CONFIG_FILE).exists());
         let _ = fs::remove_dir_all(dir);
     }
 

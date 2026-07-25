@@ -114,6 +114,10 @@ impl StatusControl {
 const STATUS_CONTROL_W: f32 = STATUS_BAR_H;
 const STATUS_CONTROL_GAP: f32 = Style::SP_XS;
 const STATUS_CONTROL_ICON: f32 = Style::ICON_M;
+/// Keep a usable clock lane when a window is narrower than the normal menu
+/// bar. The lane may shrink below this value on an extremely small surface,
+/// but the controls must never consume the centered clock's hit target.
+const STATUS_CLOCK_MIN_W: f32 = Style::SP_XL;
 /// A single status cell is deliberately one line. This cap is generous for
 /// the current fixed labels, but prevents a future daemon-provided label from
 /// turning the rail into an unbounded layout job.
@@ -189,7 +193,11 @@ fn status_controls_metrics(bar: egui::Rect) -> (f32, f32) {
     // bar (which would steal clicks from the workspace).
     let width = finite_non_negative(bar.width());
     let inset = Style::SP_S.min(width / 2.0);
-    let available = (width - inset * 2.0).max(0.0);
+    // Leave a clock lane before allocating the right-hand controls. On a
+    // narrow window the old calculation let the controls span the centered
+    // clock; since those interactions are registered later, they stole clock
+    // clicks even though the clock remained visibly centered.
+    let available = (width - inset * 2.0 - STATUS_CONTROL_GAP - STATUS_CLOCK_MIN_W).max(0.0);
     let count = StatusControl::ALL.len() as f32;
     let normal_width = STATUS_CONTROL_W;
     let normal_gap = STATUS_CONTROL_GAP;
@@ -246,6 +254,27 @@ fn centered_clock_rect(bar: egui::Rect, time_width: f32) -> egui::Rect {
     egui::Rect::from_center_size(
         bar.center(),
         egui::vec2(desired_width.min(bar_width), bar.height()),
+    )
+}
+
+/// Keep the clock target disjoint from the right-hand controls. At normal
+/// desktop widths this is exactly the centered clock. If the controls would
+/// collide on a narrow surface, the clock moves into the remaining left lane
+/// and is clipped there; a slightly shifted, clickable clock is preferable to
+/// a centered target that later controls steal.
+fn clock_target_rect(bar: egui::Rect, time_width: f32, controls: egui::Rect) -> egui::Rect {
+    let centered = centered_clock_rect(bar, time_width);
+    if !centered.intersects(controls) {
+        return centered;
+    }
+
+    let right = (controls.left() - STATUS_CONTROL_GAP).clamp(bar.left(), bar.right());
+    let width = (right - bar.left())
+        .max(0.0)
+        .min(finite_non_negative(centered.width()));
+    egui::Rect::from_center_size(
+        egui::pos2((bar.left() + right) / 2.0, bar.center().y),
+        egui::vec2(width, bar.height()),
     )
 }
 
@@ -446,6 +475,7 @@ fn strip(
     let cy = bar.center().y;
     let time_role = TypographyRole::Label;
     // ── Center cluster: the one authoritative clock ────────────────────────
+    let controls_rect = status_controls_rect(bar);
     let now = crate::timers::now_unix();
     let time = crate::timers::hhmm(now);
     let time_galley = painter.layout_job(status_text_job(
@@ -455,7 +485,7 @@ fn strip(
         bar.width(),
     ));
     let time_w = time_galley.size().x;
-    let clock_rect = centered_clock_rect(bar, time_w);
+    let clock_rect = clock_target_rect(bar, time_w, controls_rect);
     let clock = ui.interact(clock_rect, status_bar_clock_id(), egui::Sense::click());
     clock.widget_info(|| {
         egui::WidgetInfo::labeled(
@@ -467,7 +497,10 @@ fn strip(
     if clock.hovered() {
         painter.rect_filled(clock_rect.shrink(2.0), Style::RADIUS_S, Style::SURFACE_HI);
     }
-    painter.galley(
+    // A narrow fallback lane may be smaller than the clock text. Clip the
+    // paint as well as the interaction so text cannot visually enter the
+    // controls' lane or the workspace outside the reserved rail.
+    painter.with_clip_rect(clock_rect).galley(
         egui::pos2(
             clock_rect.center().x - time_galley.size().x / 2.0,
             cy - time_galley.size().y / 2.0,
@@ -482,7 +515,6 @@ fn strip(
     }
 
     // ── Right cluster: rollups, then the three compact system controls ─────
-    let controls_rect = status_controls_rect(bar);
     let (grade_text, grade_color) = mesh_grade_cell(grades);
     let cells = right_cells(segments);
     let dot_r = Style::SP_XS;
@@ -1048,6 +1080,27 @@ mod tests {
     }
 
     #[test]
+    fn narrow_clock_target_does_not_overlap_later_control_targets() {
+        for width in [72.0, 128.0, 240.0] {
+            let bar =
+                egui::Rect::from_min_size(egui::pos2(73.0, 41.0), egui::vec2(width, STATUS_BAR_H));
+            let controls = status_controls_rect(bar);
+            let clock = clock_target_rect(bar, 48.0, controls);
+            assert!(
+                bar.contains_rect(clock),
+                "clock escaped {width}px bar: {clock:?} vs {bar:?}"
+            );
+            for control in StatusControl::ALL {
+                let rect = status_control_rect(bar, control);
+                assert!(
+                    !clock.intersects(rect),
+                    "clock target {clock:?} overlaps {control:?} target {rect:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn rail_text_is_single_line_bounded_and_direction_safe() {
         let hostile = format!(
             "Device\n{}\u{202e}tail",
@@ -1146,6 +1199,10 @@ mod tests {
                 response.rect
             );
         }
+        let clock = ctx
+            .read_response(status_bar_clock_id())
+            .expect("clock target registered")
+            .rect;
         for control in StatusControl::ALL {
             let response = ctx
                 .read_response(status_control_id(control))
@@ -1155,7 +1212,24 @@ mod tests {
                 "{control:?} target escaped the narrow status bar: {:?} vs {bar:?}",
                 response.rect
             );
+            assert!(
+                !clock.intersects(response.rect),
+                "clock target must not steal {control:?} on a narrow bar"
+            );
         }
+
+        click_at(
+            &ctx,
+            &mut construct,
+            &segments,
+            &grades,
+            screen,
+            clock.center(),
+        );
+        assert!(
+            construct.notification_center_open,
+            "the centered clock remains clickable beside narrow controls"
+        );
 
         let brightness = ctx
             .read_response(status_control_id(StatusControl::Brightness))

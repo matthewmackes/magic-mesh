@@ -36,7 +36,8 @@ use mde_collab_types::value::{
     PresenceState, TransferDirection, TransferMethod, TransferState,
 };
 use mde_collab_types::{ActorClock, ActorId, CollabEventEnvelope, SpaceKind, SpaceRole};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::types::ValueRef;
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::domain::sort_key;
 use crate::error::{CollabError, Result};
@@ -58,6 +59,11 @@ const MAX_READ_MODEL_TEXT_BYTES: usize = 64 * 1024;
 // receive an error instead of an arbitrary truncated timeline.
 const MAX_TIMELINE_MESSAGES: usize = 4096;
 const MAX_MESSAGE_BODY_BYTES: usize = 256 * 1024;
+// `dump_tables` is a diagnostic convergence fingerprint, not an unbounded
+// export API. Keep hostile rows from turning a read-side diagnostic into an
+// attacker-sized allocation; reject rather than truncate so the fingerprint
+// never claims convergence for incomplete data.
+const MAX_TABLE_DUMP_BYTES: usize = 8 * 1024 * 1024;
 
 /// The materialized read tables, in a fixed order — used by [`dump_tables`] and
 /// the per-space rebuild.
@@ -714,9 +720,8 @@ impl Projection {
                 "message body exceeds {MAX_MESSAGE_BODY_BYTES} bytes"
             )));
         }
-        let body = String::from_utf8(body).map_err(|error| {
-            CollabError::Serde(format!("message body is not UTF-8: {error}"))
-        })?;
+        let body = String::from_utf8(body)
+            .map_err(|error| CollabError::Serde(format!("message body is not UTF-8: {error}")))?;
         Ok(Some(MessageView {
             event_id: id,
             author: ActorId::new(author),
@@ -743,9 +748,9 @@ impl Projection {
     }
 
     fn dump_one(&self, table: &str, order_by: &str, out: &mut String) -> Result<()> {
-        out.push_str("== ");
-        out.push_str(table);
-        out.push('\n');
+        append_dump_text(out, "== ")?;
+        append_dump_text(out, table)?;
+        append_dump_text(out, "\n")?;
         let sql = format!("SELECT * FROM {table} ORDER BY {order_by}");
         let mut stmt = self.conn.prepare(&sql)?;
         let cols: Vec<String> = stmt
@@ -757,13 +762,13 @@ impl Projection {
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             for (i, col) in cols.iter().enumerate().take(count) {
-                let value: rusqlite::types::Value = row.get(i)?;
-                out.push_str(col);
-                out.push('=');
-                out.push_str(&render_value(&value));
-                out.push(';');
+                let value = row.get_ref(i)?;
+                append_dump_text(out, col)?;
+                append_dump_text(out, "=")?;
+                append_dump_value(out, value)?;
+                append_dump_text(out, ";")?;
             }
-            out.push('\n');
+            append_dump_text(out, "\n")?;
         }
         Ok(())
     }
@@ -1469,14 +1474,31 @@ fn order_for(table: &str) -> String {
     }
 }
 
-fn render_value(v: &rusqlite::types::Value) -> String {
-    use rusqlite::types::Value;
-    match v {
-        Value::Null => "NULL".to_string(),
-        Value::Integer(i) => i.to_string(),
-        Value::Real(f) => format!("{f}"),
-        Value::Text(s) => s.clone(),
-        Value::Blob(b) => format!("blob:{}", b.len()),
+fn append_dump_text(out: &mut String, value: &str) -> Result<()> {
+    if value.len() > MAX_TABLE_DUMP_BYTES.saturating_sub(out.len()) {
+        return Err(CollabError::Serde(format!(
+            "table dump exceeds {MAX_TABLE_DUMP_BYTES} bytes"
+        )));
+    }
+    out.push_str(value);
+    Ok(())
+}
+
+fn append_dump_value(out: &mut String, value: ValueRef<'_>) -> Result<()> {
+    match value {
+        ValueRef::Null => append_dump_text(out, "NULL"),
+        ValueRef::Integer(value) => append_dump_text(out, &value.to_string()),
+        ValueRef::Real(value) => append_dump_text(out, &value.to_string()),
+        ValueRef::Text(value) => {
+            let value = std::str::from_utf8(value).map_err(|error| {
+                CollabError::Serde(format!("table dump contains invalid UTF-8 text: {error}"))
+            })?;
+            append_dump_text(out, value)
+        }
+        ValueRef::Blob(value) => {
+            append_dump_text(out, "blob:")?;
+            append_dump_text(out, &value.len().to_string())
+        }
     }
 }
 
@@ -1535,7 +1557,7 @@ fn summarize(kind_tag: &str) -> String {
 mod tests {
     use super::{
         Projection, MAX_DOCUMENT_PARTICIPANTS, MAX_DOCUMENT_SESSIONS, MAX_ENVELOPE_JSON_BYTES,
-        MAX_MESSAGE_BODY_BYTES, MAX_TIMELINE_MESSAGES,
+        MAX_MESSAGE_BODY_BYTES, MAX_TABLE_DUMP_BYTES, MAX_TIMELINE_MESSAGES,
     };
     use crate::error::CollabError;
     use crate::signer::{Ed25519Signer, EventSigner};
@@ -1675,12 +1697,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["first", "second"]
         );
-        assert!(
-            timeline
-                .replies
-                .iter()
-                .all(|message| message.reply_count == 0)
-        );
+        assert!(timeline
+            .replies
+            .iter()
+            .all(|message| message.reply_count == 0));
 
         let main = projection
             .conversation_timeline(space, None)
@@ -1795,7 +1815,10 @@ mod tests {
         let mut future_schema = valid;
         future_schema.schema_version = SCHEMA_VERSION + 1;
         Ed25519Signer::from_seed([1; 32]).sign(&mut future_schema);
-        assert!(future_schema.verify(), "future-schema envelope is still signed");
+        assert!(
+            future_schema.verify(),
+            "future-schema envelope is still signed"
+        );
         assert!(matches!(
             projection.project(std::slice::from_ref(&future_schema)),
             Err(CollabError::InvalidEvent(id)) if id == event_id(28)
@@ -1826,6 +1849,29 @@ mod tests {
             before,
             "oversized signed events must not enter the projection"
         );
+    }
+
+    #[test]
+    fn table_dump_fails_closed_before_materializing_hostile_text() {
+        let projection = Projection::open_in_memory().expect("open projection");
+        let space = space_id(2710);
+        projection
+            .connection()
+            .execute(
+                "INSERT INTO spaces \
+                 (space_id, kind, name, created_ms, deleted, last_clock_wall, last_clock_counter) \
+                 VALUES (?1, 'team', ?2, 1, 0, 1, 0)",
+                rusqlite::params![space.to_string(), "x".repeat(MAX_TABLE_DUMP_BYTES + 1)],
+            )
+            .expect("insert hostile diagnostic row");
+
+        let error = projection
+            .dump_tables()
+            .expect_err("diagnostic dump must reject oversized text");
+        assert!(matches!(
+            error,
+            CollabError::Serde(message) if message.contains("table dump exceeds")
+        ));
     }
 
     #[test]
@@ -2024,9 +2070,7 @@ mod tests {
         ]);
 
         let mut projection = Projection::open_in_memory().expect("open projection");
-        projection
-            .project(&events)
-            .expect("project call replay");
+        projection.project(&events).expect("project call replay");
 
         let calls = projection.call_state(Some(space)).expect("call state");
         assert_eq!(calls.active.len(), 1);

@@ -989,6 +989,12 @@ These decisions refine acceptance and sequencing for the active items below.
   and cannot become filesystem purge candidates. The full core farm suite is
   green at **66/66**; live WebRTC/SIP and sealed DO/LLM evidence remain
   external.
+- Progress (2026-07-25 diagnostic projection boundary): collaboration table
+  diagnostics now render SQLite values by reference and fail closed at an 8 MiB
+  dump budget before hostile text can drive unbounded output allocation. The
+  focused projection regression is green at **11/11**, and the full core farm
+  suite is green at **67/67**; live WebRTC/SIP and sealed DO/LLM evidence remain
+  external.
 - Progress (2026-07-25 content-addressed blob boundary): the filesystem blob
   store now accepts only canonical lower-hex SHA-256 paths, rejects traversal
   and final-symlink roots/leaves for reads and purge, and caps both put/get
@@ -1612,6 +1618,12 @@ These decisions refine acceptance and sequencing for the active items below.
   popup is constrained to the workspace clip with an internal scroll region.
   The focused `.50` Maps gate is green at **221/221**; live display proof
   remains external.
+- Progress (2026-07-25 Airspace consumer identity boundary): ready Airspace
+  contacts now fold duplicate source IDs deterministically before render and
+  selection, while preserving the bounded scan and truthful `NO SCANNER FEED`
+  states. The focused Airspace gate is green at **13/13**, and the full Maps
+  farm suite is green at **230/230**; live provider and MG90 scanner-feed
+  evidence remains external.
 - Progress (2026-07-25 MG90 protocol audit): the supplied AirLink MG90
   Software Configuration Guide documents UDP Status Broadcast for location,
   GNSS, WAN, VPN, GPIO, ignition, battery, and temperature fields, but does
@@ -1965,6 +1977,13 @@ These decisions refine acceptance and sequencing for the active items below.
   restoration. Integrated farm gates are green at **1,797/1,797**
   `mde-shell-egui` tests and **394/394** `mde-term-egui` tests; live pointer,
   pixel, physical, and VDI acceptance remain external evidence.
+- Progress (2026-07-25 navigation hit-target and preference boundaries): the
+  status rail keeps the centered clock target disjoint from narrow-window
+  system controls, while Springboard Dock preferences create only real parent
+  directories and replace final symlinks atomically without writing through
+  them. Focused farm gates are green at **17/17** status-bar and **15/15**
+  navigation tests; the integrated shell gate is green at **1,807/1,807**.
+  Live pointer, pixel, physical, and VDI acceptance remain external evidence.
 - Progress (2026-07-25 desktop-source and Browser persistence boundaries): the
   node-local desktop-source roster plus Browser offline-cache records and CEF
   security manifests now use bounded no-follow regular-file readers that

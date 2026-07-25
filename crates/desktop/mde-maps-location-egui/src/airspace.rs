@@ -14,6 +14,7 @@
 //! than fake radar. The rich animated simulation ([`AirspaceState::simulated`])
 //! survives as a cfg-gated test fixture only.
 
+use std::collections::HashSet;
 use std::f32::consts::TAU;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -33,8 +34,7 @@ const AIRSPACE_SNAPSHOT_MAX_FUTURE_SKEW_MS: i64 = 5_000;
 /// The typed producer normally enforces this bound, but a persisted snapshot
 /// can be deserialized without passing through its constructor. Keep the UI's
 /// validation work bounded at this consumer boundary as well.
-const AIRSPACE_MAX_CONSUMER_CONTACTS: usize =
-    mackes_mesh_types::airspace::MAX_RETAINED_CONTACTS;
+const AIRSPACE_MAX_CONSUMER_CONTACTS: usize = mackes_mesh_types::airspace::MAX_RETAINED_CONTACTS;
 
 /// A discovered wireless emitter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -590,12 +590,21 @@ impl AirspaceState {
         // boundary defensive so "NO SCANNER FEED" remains truthful.
         let contacts: Vec<mackes_mesh_types::airspace::AirspaceContact> =
             match snapshot.availability {
-                mackes_mesh_types::airspace::AirspaceAvailability::Ready => snapshot
-                    .contacts
-                    .iter()
-                    .take(AIRSPACE_MAX_CONSUMER_CONTACTS)
-                    .filter_map(|contact| contact.clone().bounded().ok())
-                    .collect(),
+                mackes_mesh_types::airspace::AirspaceAvailability::Ready => {
+                    let mut seen_ids = HashSet::with_capacity(AIRSPACE_MAX_CONSUMER_CONTACTS);
+                    snapshot
+                        .contacts
+                        .iter()
+                        .take(AIRSPACE_MAX_CONSUMER_CONTACTS)
+                        .filter_map(|contact| contact.clone().bounded().ok())
+                        // The UI keys both hit targets and selection by id. A
+                        // duplicate source id would paint two records for one
+                        // emitter and make the selected detail nondeterministic.
+                        // Keep the first valid normalized record while retaining
+                        // the consumer's bounded scan.
+                        .filter(|contact| seen_ids.insert(contact.id.clone()))
+                        .collect()
+                }
                 mackes_mesh_types::airspace::AirspaceAvailability::NoSource
                 | mackes_mesh_types::airspace::AirspaceAvailability::Offline => Vec::new(),
             };
@@ -1327,7 +1336,75 @@ mod tests {
 
         assert_eq!(state.signals.len(), AIRSPACE_MAX_CONSUMER_CONTACTS);
         assert_eq!(state.signals[0].id, "aa:bb:00");
-        assert_eq!(state.signals.last().map(|signal| signal.name.as_str()), Some("mesh-ap-255"));
+        assert_eq!(
+            state.signals.last().map(|signal| signal.name.as_str()),
+            Some("mesh-ap-255")
+        );
+    }
+
+    #[test]
+    fn duplicate_ready_contacts_are_folded_once_for_render_and_selection() {
+        let contact =
+            |id: &str, name: &str, signal_dbm| mackes_mesh_types::airspace::AirspaceContact {
+                id: id.to_string(),
+                kind: mackes_mesh_types::airspace::AirspaceContactKind::Wifi,
+                name: name.to_string(),
+                signal_dbm,
+                bearing_deg: 12.0,
+                channel: Some(36),
+                encryption: Some("WPA3".to_string()),
+                notable: false,
+                watchlist: false,
+                own: false,
+            };
+        let snapshot = mackes_mesh_types::airspace::AirspaceSnapshot {
+            host: "mg90-live".to_string(),
+            published_at_ms: 42,
+            scanned_at_ms: Some(41),
+            availability: mackes_mesh_types::airspace::AirspaceAvailability::Ready,
+            contacts: vec![
+                contact("aa:bb", "first-observation", -55),
+                contact("aa:bb", "duplicate-observation", -45),
+                contact("cc:dd", "second-emitter", -65),
+            ],
+            omitted_contacts: 0,
+            gaps: Vec::new(),
+        };
+
+        let mut state = AirspaceState::live();
+        state.refresh_from_wire_at(&snapshot, 43);
+
+        assert_eq!(state.signals.len(), 2);
+        assert_eq!(state.in_range(), 2);
+        assert_eq!(
+            state
+                .signals
+                .iter()
+                .filter(|signal| signal.id == "aa:bb")
+                .count(),
+            1,
+            "one source id must produce one render and hit target"
+        );
+        assert_eq!(
+            state
+                .signals
+                .iter()
+                .find(|signal| signal.id == "aa:bb")
+                .map(|signal| signal.name.as_str()),
+            Some("first-observation"),
+            "deduplication must be deterministic first-valid-wins"
+        );
+
+        state.selected = Some("aa:bb".to_string());
+        assert_eq!(
+            state
+                .signals
+                .iter()
+                .filter(|signal| state.selected.as_deref() == Some(signal.id.as_str()))
+                .count(),
+            1,
+            "selection by id must resolve to one contact"
+        );
     }
 
     #[test]
