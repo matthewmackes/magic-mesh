@@ -31,6 +31,73 @@ use crate::{icons, CommunicationsSurface};
 /// How long a snooze hushes an alert — a fixed hour from the injected now.
 const SNOOZE_MS: i64 = 60 * 60 * 1_000;
 
+/// Keep projection-backed alert text inside the fixed card and action-row
+/// layout. These are display limits only: the full values remain available to
+/// the read model and the raw source/action IDs continue to drive commands.
+const MAX_ALERT_HEADLINE_CHARS: usize = 96;
+const MAX_ALERT_SOURCE_CHARS: usize = 48;
+const MAX_ALERT_FIELD_KEY_CHARS: usize = 32;
+const MAX_ALERT_FIELD_VALUE_CHARS: usize = 96;
+const MAX_ALERT_ACTION_CHARS: usize = 40;
+
+/// Normalize and bound text before it enters an Alerts widget.
+///
+/// Alerts may be folded from another seat, so newlines, control characters,
+/// and bidi-isolation marks are untrusted display input. Whitespace and those
+/// invisible characters become a single space, while a long value gets a
+/// visible ellipsis. The source value is never changed by this helper.
+fn bounded_alert_text(value: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+
+    let mut normalized = String::with_capacity(value.len().min(max_chars));
+    let mut pending_space = false;
+    for character in value.chars() {
+        if is_alert_invisible(character) || character.is_whitespace() {
+            pending_space = true;
+            continue;
+        }
+        if pending_space && !normalized.is_empty() {
+            normalized.push(' ');
+        }
+        pending_space = false;
+        normalized.push(character);
+    }
+
+    if normalized.is_empty() {
+        return "—".to_owned();
+    }
+    if normalized.chars().count() <= max_chars {
+        return normalized;
+    }
+
+    let mut bounded: String = normalized
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect();
+    while bounded.ends_with(' ') {
+        bounded.pop();
+    }
+    bounded.push('…');
+    bounded
+}
+
+/// Characters that can change the visual structure or direction of an alert
+/// label. Newlines and tabs are handled as spaces by `bounded_alert_text`.
+fn is_alert_invisible(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{200B}'
+                | '\u{200C}'
+                | '\u{2060}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{FEFF}'
+        )
+}
+
 impl CommunicationsSurface {
     /// Render Alerts mode: the notification-preference bar (severity threshold +
     /// DND), then the fleet-wide inbox, newest-first.
@@ -150,21 +217,23 @@ impl CommunicationsSurface {
                     severity_color(sev)
                 };
                 icons::icon(ui, icons::severity_icon(sev), glyph_size, glyph_tint);
-                let headline =
-                    egui::RichText::new(&view.alert.headline)
-                        .strong()
-                        .color(if hushed {
-                            Style::TEXT_DIM
-                        } else {
-                            Style::TEXT_STRONG
-                        });
+                let headline_text =
+                    bounded_alert_text(&view.alert.headline, MAX_ALERT_HEADLINE_CHARS);
+                let headline = egui::RichText::new(headline_text)
+                    .strong()
+                    .color(if hushed {
+                        Style::TEXT_DIM
+                    } else {
+                        Style::TEXT_STRONG
+                    });
                 ui.label(if car {
                     headline.size(Style::TITLE)
                 } else {
                     headline
                 });
+                let source_text = bounded_alert_text(&view.alert.source, MAX_ALERT_SOURCE_CHARS);
                 ui.label(
-                    egui::RichText::new(format!("· {}", view.alert.source))
+                    egui::RichText::new(format!("· {source_text}"))
                         .small()
                         .color(Style::TEXT_DIM),
                 );
@@ -182,8 +251,10 @@ impl CommunicationsSurface {
 
             // A few key detail fields (the folded structured payload).
             for (k, v) in view.alert.fields.iter().take(4) {
+                let key = bounded_alert_text(k, MAX_ALERT_FIELD_KEY_CHARS);
+                let value = bounded_alert_text(v, MAX_ALERT_FIELD_VALUE_CHARS);
                 ui.label(
-                    egui::RichText::new(format!("{k}: {v}"))
+                    egui::RichText::new(format!("{key}: {value}"))
                         .small()
                         .color(Style::TEXT_DIM),
                 );
@@ -238,6 +309,7 @@ impl CommunicationsSurface {
             }
 
             for action in &view.alert.actions {
+                let action_label = bounded_alert_text(&action.label, MAX_ALERT_ACTION_CHARS);
                 let arming_this = matches!(
                     &self.alert_arming,
                     Some((a, id)) if *a == alert && id == &action.id
@@ -246,7 +318,7 @@ impl CommunicationsSurface {
                     if arming_this {
                         if ui
                             .add(egui::Button::new(
-                                egui::RichText::new(format!("Confirm {}", action.label))
+                                egui::RichText::new(format!("Confirm {action_label}"))
                                     .color(Style::DANGER),
                             ))
                             .clicked()
@@ -261,7 +333,7 @@ impl CommunicationsSurface {
                         icons::ALERT_DESTRUCTIVE,
                         Style::SP_M,
                         Style::DANGER,
-                        &format!("{} (destructive — arms first)", action.label),
+                        &format!("{action_label} (destructive — arms first)"),
                     )
                     .clicked()
                     {
@@ -272,7 +344,7 @@ impl CommunicationsSurface {
                     icons::ALERT_RUN,
                     Style::SP_M,
                     Style::ACCENT,
-                    &action.label,
+                    &action_label,
                 )
                 .clicked()
                 {
@@ -415,5 +487,69 @@ const fn severity_color(severity: Severity) -> egui::Color32 {
         Severity::Info => Style::ACCENT,
         Severity::Warning => Style::WARN,
         Severity::Critical => Style::DANGER,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        bounded_alert_text, MAX_ALERT_ACTION_CHARS, MAX_ALERT_FIELD_KEY_CHARS,
+        MAX_ALERT_FIELD_VALUE_CHARS, MAX_ALERT_HEADLINE_CHARS, MAX_ALERT_SOURCE_CHARS,
+    };
+
+    #[test]
+    fn normal_alert_labels_are_preserved() {
+        assert_eq!(
+            bounded_alert_text("Disk pre-fail", MAX_ALERT_HEADLINE_CHARS),
+            "Disk pre-fail"
+        );
+        assert_eq!(bounded_alert_text("nyc3", MAX_ALERT_SOURCE_CHARS), "nyc3");
+        assert_eq!(
+            bounded_alert_text("restart service", MAX_ALERT_ACTION_CHARS),
+            "restart service"
+        );
+    }
+
+    #[test]
+    fn hostile_alert_labels_are_single_line_and_bounded() {
+        let hostile = format!(
+            "headline\n\t{}\u{202e}tail",
+            "x".repeat(MAX_ALERT_HEADLINE_CHARS * 2)
+        );
+        let display = bounded_alert_text(&hostile, MAX_ALERT_HEADLINE_CHARS);
+
+        assert!(display.chars().count() <= MAX_ALERT_HEADLINE_CHARS);
+        assert!(display.ends_with('…'));
+        assert!(display.chars().all(|character| {
+            !character.is_control()
+                && !matches!(
+                    character,
+                    '\u{200B}'
+                        | '\u{200C}'
+                        | '\u{2060}'
+                        | '\u{2066}'..='\u{2069}'
+                        | '\u{202A}'..='\u{202E}'
+                        | '\u{FEFF}'
+                )
+        }));
+        assert!(!display.contains('\n'));
+        assert!(!display.contains('\t'));
+    }
+
+    #[test]
+    fn every_alert_display_contract_bounds_hostile_fields_and_actions() {
+        let hostile = "\u{202e}\n".to_owned() + &"z".repeat(256);
+        for (value, limit) in [
+            (&hostile, MAX_ALERT_SOURCE_CHARS),
+            (&hostile, MAX_ALERT_FIELD_KEY_CHARS),
+            (&hostile, MAX_ALERT_FIELD_VALUE_CHARS),
+            (&hostile, MAX_ALERT_ACTION_CHARS),
+        ] {
+            let display = bounded_alert_text(value, limit);
+            assert!(display.chars().count() <= limit);
+            assert!(!display.contains('\n'));
+            assert!(!display.contains('\t'));
+            assert!(!display.contains('\u{202e}'));
+        }
     }
 }
