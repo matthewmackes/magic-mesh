@@ -11,8 +11,8 @@ use crate::clock::ActorClock;
 use crate::ids::{CallId, DocumentId, EventId, FileRefId, SpaceId, ThreadId, TransferId};
 use crate::space::{SpaceKind, SpaceRole};
 use crate::value::{
-    AlertPayload, CallKind, CallParticipantState, ClipItemKind, DeliveryState, FileRef,
-    PresenceState, Severity, TransferDirection, TransferMethod, TransferState,
+    AiSuggestionKind, AlertPayload, CallKind, CallParticipantState, ClipItemKind, DeliveryState,
+    FileRef, PresenceState, Severity, TransferDirection, TransferMethod, TransferState,
 };
 use crate::ActorId;
 
@@ -43,6 +43,8 @@ pub enum CollabReadModel {
     Presence(PresenceBoard),
     /// The active call state.
     CallState(CallState),
+    /// DigitalOcean AI suggestion request state.
+    AiSuggestionRequests(AiSuggestionRequests),
 }
 
 /// The rail directory of spaces.
@@ -328,6 +330,58 @@ pub struct CallParticipantView {
     pub muted: bool,
 }
 
+/// The bounded DigitalOcean AI suggestion request board.
+///
+/// This is worker-owned sidecar state, not signed collaboration history: it lets
+/// surfaces render honest pending/canceled/failed provider state while the
+/// eventual accepted suggestion remains an explicit user edit carrying
+/// provenance in the normal event history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AiSuggestionRequests {
+    /// One row per recent request.
+    pub requests: Vec<AiSuggestionRequestView>,
+}
+
+/// One DigitalOcean AI request row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiSuggestionRequestView {
+    /// Caller-minted opaque request id.
+    pub request_id: String,
+    /// The space whose bounded context was requested.
+    pub space: SpaceId,
+    /// The local actor who requested the suggestion.
+    pub requested_by: ActorId,
+    /// The assistance kind.
+    pub kind: AiSuggestionKind,
+    /// The scoped event target, if any.
+    #[serde(default)]
+    pub target: Option<EventId>,
+    /// Current sidecar status.
+    pub status: AiSuggestionRequestStatus,
+    /// The only hosted provider permitted by the Communications lock.
+    pub provider: String,
+    /// Provider model, once known.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Retryable/nonfatal failure reason, if the request did not reach an offer.
+    #[serde(default)]
+    pub error: Option<String>,
+    /// Last state transition time (epoch ms).
+    pub updated_unix_ms: i64,
+}
+
+/// Sidecar state for a DigitalOcean AI suggestion request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AiSuggestionRequestStatus {
+    /// Admitted to the worker sidecar and waiting on the provider adapter.
+    Pending,
+    /// Canceled by the user before an offer was accepted.
+    Canceled,
+    /// Failed without impairing local collaboration.
+    Failed,
+}
+
 /// The unread/alert badge counters the shell reads for the launcher tile + dock
 /// cell (bounded dimensions; a read-side rollup, not a second authority).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -364,6 +418,7 @@ mod tests {
             CollabReadModel::AlertInbox(AlertInbox::default()),
             CollabReadModel::Presence(PresenceBoard::default()),
             CollabReadModel::CallState(CallState::default()),
+            CollabReadModel::AiSuggestionRequests(AiSuggestionRequests::default()),
         ];
         for m in models {
             let json = serde_json::to_string(&m).expect("serialize");

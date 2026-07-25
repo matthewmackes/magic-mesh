@@ -1420,7 +1420,7 @@ fn remote_proofing_config_defaults_and_round_trips() {
 
     std::fs::write(
         &path,
-        r#"{"enabled":true,"exposure":"public","min_fps_target":250}"#,
+        r#"{"enabled":true,"exposure":"public","min_fps_target":250,"require_local_approval":false,"show_shadowing_indicator":false}"#,
     )
     .expect("write drifted config");
     let clamped = RemoteProofingConfig::load_from(&path);
@@ -1428,6 +1428,7 @@ fn remote_proofing_config_defaults_and_round_trips() {
     assert_eq!(clamped.min_fps_target, 120);
     assert_eq!(clamped.capture, RemoteProofingCapture::Kms);
     assert!(clamped.require_local_approval);
+    assert!(clamped.show_shadowing_indicator);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1514,6 +1515,14 @@ fn remote_proofing_service_plan_surfaces_degraded_or_public_exposure() {
     assert_eq!(
         public_plan.firewall,
         RemoteProofingFirewallPolicy::PublicExplicit
+    );
+    assert!(
+        public_plan.require_local_approval,
+        "public proofing must force local approval even if a saved config drifted off"
+    );
+    assert!(
+        public_plan.show_shadowing_indicator,
+        "public proofing must force the on-seat indicator visible in the effective plan"
     );
     assert!(
         public_plan

@@ -62,7 +62,8 @@ pub use envelope::{CollabEventEnvelope, EventSignature, SCHEMA_VERSION};
 pub use event::CollabEventKind;
 pub use ids::{CallId, DocumentId, EventId, FileRefId, SpaceId, ThreadId, TransferId};
 pub use read_model::{
-    ActivityEntry, ActivityFeed, AlertInbox, AlertView, CallParticipantView, CallState, CallView,
+    ActivityEntry, ActivityFeed, AiSuggestionRequestStatus, AiSuggestionRequestView,
+    AiSuggestionRequests, AlertInbox, AlertView, CallParticipantView, CallState, CallView,
     ClipboardLane, ClipboardView, CollabReadModel, CommsBadges, ConversationTimeline,
     DocumentSession, DocumentSessions, FileReferenceView, FileReferences, MessageView,
     PresenceBoard, PresenceView, SpaceDirectory, SpaceSummary, ThreadTimeline, TransferJobView,

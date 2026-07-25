@@ -113,6 +113,121 @@ fn create_space_makes_the_creator_an_owner() {
 }
 
 #[test]
+fn ai_suggestion_requests_are_scoped_and_cancelable_sidecar_intents() {
+    // WL-FUNC-011 DigitalOcean boundary: AI requests produce no signed event
+    // until the daemon/provider sidecar offers a suggestion, but the core still
+    // enforces current membership, a bounded caller request id, and same-space
+    // target context before the worker can enqueue anything.
+    let mut a = engine("alice");
+    let s = sig(1);
+    let mut ids = SeqIds::new(1);
+    let space_a = a
+        .apply(
+            &CollabCommand::CreateSpace {
+                kind: SpaceKind::Team,
+                name: "ops-a".into(),
+            },
+            &s,
+            &mut ids,
+            1000,
+        )
+        .expect("create a")[0]
+        .space_id;
+    let space_b = a
+        .apply(
+            &CollabCommand::CreateSpace {
+                kind: SpaceKind::Team,
+                name: "ops-b".into(),
+            },
+            &s,
+            &mut ids,
+            1100,
+        )
+        .expect("create b")[0]
+        .space_id;
+    let message = a
+        .apply(
+            &CollabCommand::SendMessage {
+                space: space_a,
+                thread: None,
+                body: MessageBody::new("summarize this bounded message"),
+            },
+            &s,
+            &mut ids,
+            1200,
+        )
+        .expect("message")[0]
+        .event_id;
+
+    let accepted = a
+        .apply(
+            &CollabCommand::RequestAiSuggestion {
+                space: space_a,
+                request_id: "ai:req-1".into(),
+                target: Some(message),
+                kind: mde_collab_types::AiSuggestionKind::Summary,
+            },
+            &s,
+            &mut ids,
+            1300,
+        )
+        .expect("same-space target is accepted");
+    assert!(
+        accepted.is_empty(),
+        "the provider sidecar, not core, emits the eventual suggestion"
+    );
+
+    let canceled = a
+        .apply(
+            &CollabCommand::CancelAiSuggestion {
+                space: space_a,
+                request_id: "ai:req-1".into(),
+            },
+            &s,
+            &mut ids,
+            1310,
+        )
+        .expect("cancel request");
+    assert!(canceled.is_empty(), "cancel is sidecar state, not history");
+
+    let cross_space = a
+        .apply(
+            &CollabCommand::RequestAiSuggestion {
+                space: space_b,
+                request_id: "ai:req-2".into(),
+                target: Some(message),
+                kind: mde_collab_types::AiSuggestionKind::Summary,
+            },
+            &s,
+            &mut ids,
+            1320,
+        )
+        .expect_err("cross-space context must be refused");
+    assert!(matches!(
+        cross_space,
+        CollabError::AiTargetNotFound {
+            space,
+            target
+        } if space == space_b && target == message
+    ));
+
+    let bad_id = a
+        .apply(
+            &CollabCommand::RequestAiSuggestion {
+                space: space_a,
+                request_id: "not a token".into(),
+                target: Some(message),
+                kind: mde_collab_types::AiSuggestionKind::Summary,
+            },
+            &s,
+            &mut ids,
+            1330,
+        )
+        .expect_err("request id must be a bounded token");
+    assert!(matches!(bad_id, CollabError::InvalidAiRequestId { .. }));
+}
+
+#[test]
 fn add_member_is_owner_gated_and_member_is_denied_visibly() {
     let mut a = engine("alice");
     let sa = sig(1);

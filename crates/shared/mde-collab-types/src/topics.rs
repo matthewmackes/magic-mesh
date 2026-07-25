@@ -45,6 +45,8 @@ pub mod projection {
     pub const PRESENCE: &str = "presence";
     /// The active call state.
     pub const CALL_STATE: &str = "call-state";
+    /// DigitalOcean AI suggestion request state.
+    pub const AI_REQUESTS: &str = "ai-requests";
     /// The launcher/dock badge rollup.
     pub const BADGES: &str = "badges";
 }

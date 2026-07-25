@@ -411,6 +411,11 @@ pub(super) fn remote_proofing_section(
     }
 
     ui.add_space(Style::SP_M);
+    let public_exposure = config.enabled && config.exposure == RemoteProofingExposure::Public;
+    if public_exposure {
+        config.require_local_approval = true;
+        config.show_shadowing_indicator = true;
+    }
     column_card(ui, "Authorization and controls", |ui| {
         let mut native_prompt = config.native_pairing_prompt;
         if ui
@@ -423,25 +428,35 @@ pub(super) fn remote_proofing_section(
             config.native_pairing_prompt = native_prompt;
         }
 
-        let mut approval = config.require_local_approval;
-        if ui
-            .checkbox(
+        let mut approval = if public_exposure {
+            true
+        } else {
+            config.require_local_approval
+        };
+        let approval_response = ui.add_enabled(
+            !public_exposure,
+            egui::Checkbox::new(
                 &mut approval,
                 RichText::new("Require local approval").size(Style::SMALL),
-            )
-            .changed()
-        {
+            ),
+        );
+        if approval_response.changed() {
             config.require_local_approval = approval;
         }
 
-        let mut indicator = config.show_shadowing_indicator;
-        if ui
-            .checkbox(
+        let mut indicator = if public_exposure {
+            true
+        } else {
+            config.show_shadowing_indicator
+        };
+        let indicator_response = ui.add_enabled(
+            !public_exposure,
+            egui::Checkbox::new(
                 &mut indicator,
                 RichText::new("Show on-seat shadowing indicator").size(Style::SMALL),
-            )
-            .changed()
-        {
+            ),
+        );
+        if indicator_response.changed() {
             config.show_shadowing_indicator = indicator;
         }
 
@@ -465,6 +480,13 @@ pub(super) fn remote_proofing_section(
             .changed()
         {
             config.vnc_fallback = vnc;
+        }
+        if public_exposure {
+            ui.add_space(Style::SP_XS);
+            muted_note(
+                ui,
+                "All-interfaces proofing forces local approval and the on-seat indicator in the saved policy and effective service plan.",
+            );
         }
 
         ui.add_space(Style::SP_S);

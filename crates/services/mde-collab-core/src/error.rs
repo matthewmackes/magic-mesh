@@ -46,6 +46,14 @@ pub enum CollabError {
     /// The referenced clipboard item does not exist.
     #[error("clipboard item {0} does not exist")]
     ClipNotFound(EventId),
+    /// The referenced AI context target is absent from, or outside, the request space.
+    #[error("AI suggestion target {target} is not available in space {space}")]
+    AiTargetNotFound {
+        /// The request space.
+        space: SpaceId,
+        /// The scoped event target.
+        target: EventId,
+    },
 
     // ---- Validation: membership + permission ---------------------------
     /// The actor is not a member of the space they addressed.
@@ -123,6 +131,16 @@ pub enum CollabError {
         alert: EventId,
         /// The action id.
         action_id: String,
+    },
+    /// The AI request id is not a bounded single-token identifier.
+    #[error(
+        "AI request id `{request_id}` is invalid (1..={max_bytes} bytes, ASCII alnum/._:- only)"
+    )]
+    InvalidAiRequestId {
+        /// The rejected request id.
+        request_id: String,
+        /// Maximum accepted byte length.
+        max_bytes: usize,
     },
 
     // ---- I/O boundaries ------------------------------------------------

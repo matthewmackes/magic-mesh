@@ -357,14 +357,28 @@ pub enum CollabCommand {
 
     // ---- AI ------------------------------------------------------------
     /// Request an AI suggestion (smart reply / summary / action item / draft).
+    ///
+    /// The `request_id` is caller-minted and lets the worker expose bounded
+    /// request state and cancel the specific in-flight provider call. The
+    /// eventual suggestion remains a separate, review-only
+    /// [`AiSuggestion`](crate::AiSuggestion) with provider/model provenance.
     RequestAiSuggestion {
         /// The space.
         space: SpaceId,
+        /// Stable opaque request id, unique within this seat's pending requests.
+        request_id: String,
         /// The event it should be about, if any.
         #[serde(default)]
         target: Option<EventId>,
         /// The kind of assistance requested.
         kind: AiSuggestionKind,
+    },
+    /// Cancel one pending AI-suggestion request.
+    CancelAiSuggestion {
+        /// The space.
+        space: SpaceId,
+        /// The caller-minted request id to cancel.
+        request_id: String,
     },
 }
 
@@ -415,6 +429,7 @@ impl CollabCommand {
             Self::SendDtmf { .. } => "send_dtmf",
             Self::SetCallMuted { .. } => "set_call_muted",
             Self::RequestAiSuggestion { .. } => "request_ai_suggestion",
+            Self::CancelAiSuggestion { .. } => "cancel_ai_suggestion",
         }
     }
 }

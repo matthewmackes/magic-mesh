@@ -1024,6 +1024,18 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-011 - Communications collaboration suite full replacement
 
 - Status: Remaining
+- Progress (2026-07-25 DigitalOcean AI sidecar boundary): Communications AI
+  suggestions now carry a bounded caller `request_id`, have a typed
+  `cancel_ai_suggestion` command, validate targeted context as belonging to the
+  request space before provider admission, and publish bounded
+  `state/collab/ai-requests` rows with DigitalOcean-only provider attribution.
+  Without cloud consent the worker publishes an honest failed sidecar row and
+  emits no signed collaboration history or provider call; consented test requests
+  can be canceled by request id. Farm gates are green at **37/37**
+  `mde-collab-types`, **1/1** focused `mde-collab-core` admission, and **2/2**
+  BigBoy `mackesd --lib --features async-services ai_request`; live WebRTC/SIP,
+  sealed DigitalOcean key/provider wiring, and LiveKit/media proof remain
+  external.
 - Progress (2026-07-25 no-peer call boundary): Communications now rejects stale
   selected spaces and disables call-start controls when the selected space has
   no other member, showing an honest no-peer state instead of emitting a call
@@ -1650,6 +1662,13 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-012 - Maps live-data overlays (zero-cost external feeds)
 
 - Status: Remaining
+- Progress (2026-07-25 zero-cost mirror-license audit): the live-mirror proof
+  helper now fail-closes overlay evidence whose `license_tier` is missing,
+  unknown, non-commercial, paid, trial, personal, educational, research-only, or
+  otherwise outside the shipped zero-cost overlay allowlist. The verifier output
+  carries `license_tier_allowed`; the `.90` farm gate is green for Python
+  bytecode compilation plus `verify-live-mirrors.py --self-test`. Fresh live
+  provider, MG90 scanner-feed, and painted-overlay proof remain external.
 - Progress (2026-07-25 map popup viewport boundary): the Layers popup now
   clamps offscreen anchors inside non-zero short workspace clips while
   preserving visible checkbox hit targets. The full Maps suite passes
@@ -2019,6 +2038,13 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-006 - Construct interface (Apple-HIG-principled workstation shell)
 
 - Status: Remaining
+- Progress (2026-07-25 public proofing safety boundary): Remote Proofing now
+  normalizes enabled all-interface Sunshine/Moonlight exposure so local approval
+  and the on-seat indicator are forced in both the saved policy and effective
+  service plan; the Settings UI disables those toggles while Public exposure is
+  active and explains the forced state. The focused BigBoy shell gate is green
+  at **4/4** `remote_proofing` tests; physical `.15` pointer/DRM/pixel/VDI
+  acceptance remains external.
 - Progress (2026-07-25 navigation hit-layer boundary): the Springboard Dock's
   bounded foreground Area now remains in egui's layer hit-test without becoming
   a transparent click shield, so Back, Home, Pin, and chooser-pinned targets

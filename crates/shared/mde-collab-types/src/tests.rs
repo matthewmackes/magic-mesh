@@ -381,8 +381,13 @@ fn every_command() -> Vec<CollabCommand> {
         },
         CollabCommand::RequestAiSuggestion {
             space: SpaceId::new(),
+            request_id: "ai-req-1".into(),
             target: None,
             kind: AiSuggestionKind::Summary,
+        },
+        CollabCommand::CancelAiSuggestion {
+            space: SpaceId::new(),
+            request_id: "ai-req-1".into(),
         },
     ]
 }
@@ -417,7 +422,7 @@ fn every_command_round_trips_and_has_a_unique_verb() {
         assert_eq!(*c, back, "round-trip {}", c.verb());
         assert!(verbs.insert(c.verb()), "duplicate verb {}", c.verb());
     }
-    assert_eq!(verbs.len(), 41, "sample set must cover every command");
+    assert_eq!(verbs.len(), 42, "sample set must cover every command");
 }
 
 /// The delivery-lock gate: each of the seven replaced subsystems must have at

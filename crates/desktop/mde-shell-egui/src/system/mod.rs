@@ -2327,6 +2327,10 @@ impl RemoteProofingConfig {
 
     fn normalized(mut self) -> Self {
         self.min_fps_target = self.min_fps_target.clamp(15, 120);
+        if self.enabled && matches!(self.exposure, RemoteProofingExposure::Public) {
+            self.require_local_approval = true;
+            self.show_shadowing_indicator = true;
+        }
         self
     }
 
@@ -2334,8 +2338,10 @@ impl RemoteProofingConfig {
     /// facts. The UI also renders this plan, so operator-visible exposure state and
     /// the future service bridge use the same source of truth.
     fn service_plan(self, mesh: &MeshFacts) -> RemoteProofingServicePlan {
+        let raw = self;
         let cfg = self.normalized();
         let mut warnings = Vec::new();
+        let public_exposure = cfg.enabled && matches!(cfg.exposure, RemoteProofingExposure::Public);
         let (bind_scope, bind_address, firewall) = if !cfg.enabled {
             (
                 RemoteProofingBindScope::Disabled,
@@ -2370,7 +2376,7 @@ impl RemoteProofingConfig {
                 }
                 RemoteProofingExposure::Public => {
                     warnings.push(
-                        "All-interfaces exposure must keep the firewall warning, local approval, and on-seat indicator visible.",
+                        "All-interfaces exposure forces local approval and an on-seat indicator in the effective service plan.",
                     );
                     (
                         RemoteProofingBindScope::Public,
@@ -2381,11 +2387,21 @@ impl RemoteProofingConfig {
             }
         };
 
-        if cfg.enabled && !cfg.require_local_approval {
-            warnings.push("Local approval is off; use only for controlled proofing.");
+        let require_local_approval = cfg.require_local_approval || public_exposure;
+        let show_shadowing_indicator = cfg.show_shadowing_indicator || public_exposure;
+        if raw.enabled && !raw.require_local_approval {
+            warnings.push(if public_exposure {
+                "Public exposure forces Local approval on; the saved off toggle is not applied to the service."
+            } else {
+                "Local approval is off; use only for controlled proofing."
+            });
         }
-        if cfg.enabled && !cfg.show_shadowing_indicator {
-            warnings.push("The on-seat shadowing indicator is off; remote viewers may be hidden.");
+        if raw.enabled && !raw.show_shadowing_indicator {
+            warnings.push(if public_exposure {
+                "Public exposure forces the on-seat shadowing indicator visible; the saved off toggle is not applied to the service."
+            } else {
+                "The on-seat shadowing indicator is off; remote viewers may be hidden."
+            });
         }
         if cfg.enabled && !cfg.allow_remote_input {
             warnings.push("Remote viewers can watch only; keyboard and mouse input are blocked.");
@@ -2400,8 +2416,8 @@ impl RemoteProofingConfig {
             sunshine_encoder: cfg.encoder.sunshine_value(),
             min_fps_target: cfg.min_fps_target,
             native_pairing_prompt: cfg.native_pairing_prompt,
-            require_local_approval: cfg.require_local_approval,
-            show_shadowing_indicator: cfg.show_shadowing_indicator,
+            require_local_approval,
+            show_shadowing_indicator,
             allow_remote_input: cfg.allow_remote_input,
             vnc_fallback: cfg.vnc_fallback,
             warnings,
@@ -3669,8 +3685,7 @@ fn adapter_row(ui: &mut egui::Ui, adapter: &BtAdapter, actions: &mut Vec<SysActi
         if ui
             .checkbox(
                 &mut discoverable,
-                RichText::new("Discoverable")
-                    .font(Style::typography_font(TypographyRole::Caption)),
+                RichText::new("Discoverable").font(Style::typography_font(TypographyRole::Caption)),
             )
             .changed()
         {
@@ -3708,9 +3723,7 @@ fn adapter_row(ui: &mut egui::Ui, adapter: &BtAdapter, actions: &mut Vec<SysActi
                         .font(Style::typography_font(TypographyRole::Caption)),
                 );
             } else if ui
-                .button(
-                    RichText::new("Scan").font(Style::typography_font(TypographyRole::Caption)),
-                )
+                .button(RichText::new("Scan").font(Style::typography_font(TypographyRole::Caption)))
                 .clicked()
             {
                 actions.push(SysAction::BtScan(adapter.path.clone(), true));
@@ -3806,8 +3819,7 @@ fn device_row(
             if acts.pair {
                 if ui
                     .button(
-                        RichText::new("Pair")
-                            .font(Style::typography_font(TypographyRole::Caption)),
+                        RichText::new("Pair").font(Style::typography_font(TypographyRole::Caption)),
                     )
                     .clicked()
                 {

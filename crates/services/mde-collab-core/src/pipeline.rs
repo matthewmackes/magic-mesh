@@ -12,7 +12,7 @@
 //! byte-identical events.
 
 use mde_collab_types::event::CollabEventKind;
-use mde_collab_types::ids::SpaceId;
+use mde_collab_types::ids::{EventId, SpaceId};
 use mde_collab_types::value::{AlertActionKind, CallParticipantState, MessageBody, TransferState};
 use mde_collab_types::{
     ActorClock, CollabCommand, CollabEventEnvelope, PresenceState, SpaceRole, TransferControl,
@@ -39,6 +39,12 @@ pub const MAX_MESSAGE_BODY_BYTES: usize = 256 * 1024;
 /// while preventing a malformed or legacy aggregate from creating an
 /// unbounded event batch.
 const MAX_CLEAR_CLIPBOARD_EVENTS: usize = 50;
+
+/// The largest accepted AI sidecar request id.
+///
+/// The worker publishes this id in `state/collab/ai-requests`; keep it a small
+/// single token so it never becomes layout, path, or topic material.
+pub const MAX_AI_REQUEST_ID_BYTES: usize = 128;
 
 /// The injected authoring context for [`apply_command`]. Carries the local
 /// actor, the injected wall time, the actor's running HLC (advanced per emitted
@@ -122,8 +128,8 @@ impl<'a, S: EventSigner, I: IdSource> ApplyCtx<'a, S, I> {
 /// ([`SendDtmf`](CollabCommand::SendDtmf)), the local-seat notification
 /// preferences ([`SetAlertMute`](CollabCommand::SetAlertMute),
 /// [`SetSeverityThreshold`](CollabCommand::SetSeverityThreshold)), and the
-/// AI-suggestion *request* (the offer is emitted later by the worker once the
-/// model answers — [`RequestAiSuggestion`](CollabCommand::RequestAiSuggestion)).
+/// AI-suggestion *request/cancel* sidecar verbs (the offer is emitted later by
+/// the worker once the model answers — [`RequestAiSuggestion`](CollabCommand::RequestAiSuggestion)).
 /// These still validate (membership/existence) and are documented Phase-1
 /// follow-ups where a Phase-0 event class does not yet carry the fact.
 #[allow(clippy::too_many_lines)]
@@ -791,9 +797,24 @@ pub fn apply_command<S: EventSigner, I: IdSource>(
         // AiSuggestionOffered event when the answer arrives.
         // WL-FUNC-011 Phase 1 follow-up: the model call + offer emission is the
         // Phase-2 worker's async flow.
-        CollabCommand::RequestAiSuggestion { space, .. } => {
+        CollabCommand::RequestAiSuggestion {
+            space,
+            request_id,
+            target,
+            ..
+        } => {
             require_active_space(state, *space)?;
             require_member(state, *space, &ctx.actor)?;
+            require_ai_request_id(request_id)?;
+            if let Some(target) = target {
+                require_ai_target_in_space(state, *space, *target)?;
+            }
+            Ok(Vec::new())
+        }
+        CollabCommand::CancelAiSuggestion { space, request_id } => {
+            require_active_space(state, *space)?;
+            require_member(state, *space, &ctx.actor)?;
+            require_ai_request_id(request_id)?;
             Ok(Vec::new())
         }
     }
@@ -909,6 +930,56 @@ fn require_call(state: &DomainState, call: mde_collab_types::ids::CallId) -> Res
         .get(&call)
         .map(|c| c.space)
         .ok_or(CollabError::CallNotFound(call))
+}
+
+/// An AI request may only target content already known to belong to the request
+/// space. This is the core admission boundary for the "bounded context only"
+/// DigitalOcean lock: a stale/cross-space event id cannot be smuggled into a
+/// future provider prompt.
+fn require_ai_target_in_space(state: &DomainState, space: SpaceId, target: EventId) -> Result<()> {
+    if state
+        .messages
+        .get(&target)
+        .is_some_and(|message| message.space == space && !message.deleted)
+        || state
+            .alerts
+            .get(&target)
+            .is_some_and(|(alert_space, _)| *alert_space == space)
+        || state
+            .clips
+            .get(&target)
+            .is_some_and(|clip| clip.space == space && !clip.deleted)
+    {
+        return Ok(());
+    }
+
+    Err(CollabError::AiTargetNotFound { space, target })
+}
+
+/// Validate the caller-minted id used for AI request/cancel sidecar state.
+fn require_ai_request_id(request_id: &str) -> Result<()> {
+    let valid = !request_id.is_empty()
+        && request_id.len() <= MAX_AI_REQUEST_ID_BYTES
+        && request_id.bytes().all(|b| {
+            matches!(
+                b,
+                b'a'..=b'z'
+                    | b'A'..=b'Z'
+                    | b'0'..=b'9'
+                    | b'-'
+                    | b'_'
+                    | b'.'
+                    | b':'
+            )
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(CollabError::InvalidAiRequestId {
+            request_id: request_id.to_string(),
+            max_bytes: MAX_AI_REQUEST_ID_BYTES,
+        })
+    }
 }
 
 /// The actor must be a present space member and a connected participant in an

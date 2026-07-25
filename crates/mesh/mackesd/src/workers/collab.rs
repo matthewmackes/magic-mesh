@@ -59,7 +59,8 @@ use mde_collab_types::value::{
     sha256_hex, AlertAction, AlertActionKind, AlertPayload, ClipItemKind, ClipboardItem, Severity,
 };
 use mde_collab_types::{
-    ActorId, CollabCommand, CollabEventEnvelope, CollabEventKind, SpaceId, SpaceKind, SpaceRole,
+    ActorId, AiSuggestionRequestStatus, AiSuggestionRequestView, AiSuggestionRequests,
+    CollabCommand, CollabEventEnvelope, CollabEventKind, SpaceId, SpaceKind, SpaceRole,
 };
 
 use super::{ShutdownToken, Worker};
@@ -153,7 +154,17 @@ const COMMAND_VERBS: &[&str] = &[
     "send_dtmf",
     "set_call_muted",
     "request_ai_suggestion",
+    "cancel_ai_suggestion",
 ];
+
+/// The only hosted provider permitted for Communications suggestions.
+const AI_PROVIDER_DIGITALOCEAN: &str = "digitalocean";
+
+/// Keep the provider sidecar read model bounded and deterministic.
+const MAX_AI_REQUEST_ROWS: usize = 64;
+
+/// Honest fail-closed reason before the operator grants global cloud consent.
+const AI_CONSENT_REQUIRED: &str = "DigitalOcean cloud consent is required before AI suggestions";
 
 /// Capability context for every mutable `action/collab/<verb>` command.
 const COLLAB_AUTH_VERB: &str = "collab-command";
@@ -174,6 +185,13 @@ pub struct CollabWorker {
     bus_root_override: Option<PathBuf>,
     /// Verifier for the root-only capability on the mutable command lanes.
     authorizer: Arc<ActionAuthorizer>,
+    /// Whether global hosted-AI consent has been granted for this seat.
+    ///
+    /// This defaults fail-closed. The sealed-key/provider adapter that will
+    /// consume this sidecar can flip it only through a future explicit consent
+    /// authority; until then AI requests are visible failures and every local
+    /// collaboration workflow continues.
+    ai_cloud_consent: bool,
 }
 
 impl CollabWorker {
@@ -192,6 +210,7 @@ impl CollabWorker {
             poll_interval: DEFAULT_POLL_INTERVAL,
             bus_root_override: None,
             authorizer: Arc::new(ActionAuthorizer::production()),
+            ai_cloud_consent: false,
         }
     }
 
@@ -206,6 +225,14 @@ impl CollabWorker {
     #[must_use]
     pub(crate) fn with_authorizer(mut self, authorizer: Arc<ActionAuthorizer>) -> Self {
         self.authorizer = authorizer;
+        self
+    }
+
+    /// Override AI-cloud consent for deterministic sidecar tests.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn with_ai_cloud_consent_for_test(mut self, consent: bool) -> Self {
+        self.ai_cloud_consent = consent;
         self
     }
 
@@ -501,6 +528,7 @@ impl CollabWorker {
                         continue;
                     }
                 };
+                self.handle_ai_sidecar(&cmd, state, now_ms, touched, changed);
                 for env in &events {
                     // Durable-append to this node's own per-space actor log BEFORE
                     // we relay, so we never publish an event the log couldn't
@@ -725,6 +753,13 @@ impl CollabWorker {
                 &topics::space_state_topic(proj::CALL_STATE, space),
                 calls,
             );
+            let ai_requests = Ok(state.ai_requests.for_space(space));
+            publish_state(
+                persist,
+                &mut state.last_published,
+                &topics::space_state_topic(proj::AI_REQUESTS, space),
+                ai_requests,
+            );
         }
 
         if !changed {
@@ -758,6 +793,56 @@ impl CollabWorker {
             &topics::state_topic(proj::TRANSFER_JOBS),
             transfers,
         );
+        let ai_requests = Ok(state.ai_requests.all());
+        publish_state(
+            persist,
+            &mut state.last_published,
+            &topics::state_topic(proj::AI_REQUESTS),
+            ai_requests,
+        );
+    }
+
+    /// Apply worker-owned AI request/cancel sidecar state after core admission.
+    ///
+    /// The core validates space membership, request-id shape, and target scoping.
+    /// This sidecar deliberately does **not** call DigitalOcean yet; it publishes
+    /// bounded request state so the UI can show fail-closed consent/provider
+    /// status and so the future sealed-key adapter has a cancellable request id.
+    fn handle_ai_sidecar(
+        &self,
+        cmd: &CollabCommand,
+        state: &mut CollabState,
+        now_ms: i64,
+        touched: &mut BTreeSet<SpaceId>,
+        changed: &mut bool,
+    ) {
+        match cmd {
+            CollabCommand::RequestAiSuggestion {
+                space,
+                request_id,
+                target,
+                kind,
+            } => {
+                state.ai_requests.request(AiRequestAdmission {
+                    space: *space,
+                    request_id,
+                    actor: &self.self_actor,
+                    kind: *kind,
+                    target: *target,
+                    now_ms,
+                    cloud_consent: self.ai_cloud_consent,
+                });
+                touched.insert(*space);
+                *changed = true;
+            }
+            CollabCommand::CancelAiSuggestion { space, request_id } => {
+                if state.ai_requests.cancel(*space, request_id, now_ms) {
+                    touched.insert(*space);
+                    *changed = true;
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -782,6 +867,8 @@ struct CollabState {
     /// The last published body per `state/collab/*` topic — skip republishing an
     /// identical read model (latest-wins churn guard).
     last_published: BTreeMap<String, String>,
+    /// Worker-owned DigitalOcean AI request/cancel sidecar state.
+    ai_requests: AiRequestBoard,
 }
 
 impl CollabState {
@@ -794,7 +881,116 @@ impl CollabState {
             own_logs: BTreeMap::new(),
             log_sizes: BTreeMap::new(),
             last_published: BTreeMap::new(),
+            ai_requests: AiRequestBoard::default(),
         })
+    }
+}
+
+/// Arguments for admitting a DigitalOcean AI sidecar request.
+struct AiRequestAdmission<'a> {
+    space: SpaceId,
+    request_id: &'a str,
+    actor: &'a ActorId,
+    kind: mde_collab_types::AiSuggestionKind,
+    target: Option<mde_collab_types::EventId>,
+    now_ms: i64,
+    cloud_consent: bool,
+}
+
+/// Bounded in-memory state for the worker-owned AI request sidecar.
+#[derive(Default)]
+struct AiRequestBoard {
+    rows: BTreeMap<(SpaceId, String), AiSuggestionRequestView>,
+}
+
+impl AiRequestBoard {
+    /// Admit a request into the sidecar, fail-closed when cloud consent is absent.
+    fn request(&mut self, admission: AiRequestAdmission<'_>) {
+        let (status, error) = if admission.cloud_consent {
+            (AiSuggestionRequestStatus::Pending, None)
+        } else {
+            (
+                AiSuggestionRequestStatus::Failed,
+                Some(AI_CONSENT_REQUIRED.to_string()),
+            )
+        };
+        let view = AiSuggestionRequestView {
+            request_id: admission.request_id.to_string(),
+            space: admission.space,
+            requested_by: admission.actor.clone(),
+            kind: admission.kind,
+            target: admission.target,
+            status,
+            provider: AI_PROVIDER_DIGITALOCEAN.to_string(),
+            model: None,
+            error,
+            updated_unix_ms: admission.now_ms,
+        };
+        self.rows
+            .insert((admission.space, admission.request_id.to_string()), view);
+        self.prune();
+    }
+
+    /// Cancel a pending request. Failed/offered/unknown rows are left unchanged.
+    fn cancel(&mut self, space: SpaceId, request_id: &str, now_ms: i64) -> bool {
+        let Some(row) = self.rows.get_mut(&(space, request_id.to_string())) else {
+            return false;
+        };
+        if row.status != AiSuggestionRequestStatus::Pending {
+            return false;
+        }
+        row.status = AiSuggestionRequestStatus::Canceled;
+        row.error = None;
+        row.updated_unix_ms = now_ms;
+        true
+    }
+
+    /// The per-space request board.
+    fn for_space(&self, space: SpaceId) -> AiSuggestionRequests {
+        self.model(self.rows.values().filter(|row| row.space == space))
+    }
+
+    /// The fleet-wide request board.
+    fn all(&self) -> AiSuggestionRequests {
+        self.model(self.rows.values())
+    }
+
+    fn model<'a>(
+        &self,
+        rows: impl IntoIterator<Item = &'a AiSuggestionRequestView>,
+    ) -> AiSuggestionRequests {
+        let mut requests: Vec<AiSuggestionRequestView> = rows.into_iter().cloned().collect();
+        requests.sort_by(|a, b| {
+            (
+                a.updated_unix_ms,
+                a.space,
+                a.request_id.as_str(),
+                a.requested_by.as_str(),
+            )
+                .cmp(&(
+                    b.updated_unix_ms,
+                    b.space,
+                    b.request_id.as_str(),
+                    b.requested_by.as_str(),
+                ))
+        });
+        AiSuggestionRequests { requests }
+    }
+
+    fn prune(&mut self) {
+        while self.rows.len() > MAX_AI_REQUEST_ROWS {
+            let Some(oldest) = self
+                .rows
+                .iter()
+                .min_by(|(key_a, row_a), (key_b, row_b)| {
+                    (row_a.updated_unix_ms, key_a).cmp(&(row_b.updated_unix_ms, key_b))
+                })
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.rows.remove(&oldest);
+        }
     }
 }
 
@@ -1363,6 +1559,16 @@ mod tests {
                 thread: None,
                 body: MessageBody::new("x"),
             },
+            CollabCommand::RequestAiSuggestion {
+                space,
+                request_id: "ai:req-1".into(),
+                target: None,
+                kind: mde_collab_types::AiSuggestionKind::Summary,
+            },
+            CollabCommand::CancelAiSuggestion {
+                space,
+                request_id: "ai:req-1".into(),
+            },
         ];
         for cmd in &samples {
             assert!(
@@ -1371,11 +1577,11 @@ mod tests {
                 cmd.verb()
             );
         }
-        // The count must equal the full taxonomy (41 verbs) so a NEW command
+        // The count must equal the full taxonomy (42 verbs) so a NEW command
         // variant forces an update here.
         assert_eq!(
             COMMAND_VERBS.len(),
-            41,
+            42,
             "COMMAND_VERBS drifted from the taxonomy"
         );
     }
@@ -1594,6 +1800,134 @@ mod tests {
         let timeline: ConversationTimeline =
             serde_json::from_str(convo_msg.body.as_deref().expect("convo body")).expect("decode");
         assert_eq!(timeline.messages.len(), 1, "the message is projected");
+    }
+
+    #[test]
+    fn ai_request_without_cloud_consent_publishes_honest_failure_state() {
+        // WL-FUNC-011 DigitalOcean boundary: an AI request is no longer a silent
+        // zero-event no-op. Without global cloud consent the worker publishes a
+        // bounded failed request row under state/collab/ai-requests, emits no
+        // provider call/event, and normal collaboration state remains intact.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let w = worker(dir.path(), "eagle");
+        let persist = persist_at(dir.path());
+        let mut state = CollabState::new(w.self_actor.clone()).expect("state");
+        w.tick_once(&persist, &mut state, 100); // seed cursors
+
+        write_command(
+            &w,
+            &persist,
+            &CollabCommand::CreateSpace {
+                kind: SpaceKind::Team,
+                name: "ops".into(),
+            },
+        );
+        w.tick_once(&persist, &mut state, 200);
+        let space = only_space(&state);
+        let event_count = state.engine.all_events().len();
+
+        write_command(
+            &w,
+            &persist,
+            &CollabCommand::RequestAiSuggestion {
+                space,
+                request_id: "ai:req-1".into(),
+                target: None,
+                kind: mde_collab_types::AiSuggestionKind::Summary,
+            },
+        );
+        w.tick_once(&persist, &mut state, 300);
+
+        assert_eq!(
+            state.engine.all_events().len(),
+            event_count,
+            "a consent-blocked AI request does not mint collaboration history"
+        );
+        let topic = topics::state_topic(proj::AI_REQUESTS);
+        assert_eq!(topic, "state/collab/ai-requests");
+        let msg = persist
+            .read_latest(&topic)
+            .expect("read ai requests")
+            .expect("ai request state published");
+        let requests: AiSuggestionRequests =
+            serde_json::from_str(msg.body.as_deref().expect("body")).expect("decode ai requests");
+        assert_eq!(requests.requests.len(), 1);
+        let row = &requests.requests[0];
+        assert_eq!(row.request_id, "ai:req-1");
+        assert_eq!(row.space, space);
+        assert_eq!(row.status, AiSuggestionRequestStatus::Failed);
+        assert_eq!(row.provider, AI_PROVIDER_DIGITALOCEAN);
+        assert_eq!(row.error.as_deref(), Some(AI_CONSENT_REQUIRED));
+        assert!(
+            row.model.is_none(),
+            "no model attribution exists before a provider call"
+        );
+    }
+
+    #[test]
+    fn admitted_ai_request_can_be_canceled_by_request_id() {
+        // The provider adapter is still external/sealed-key-gated, but the worker
+        // sidecar now has a real cancelable request boundary for it to consume.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let w = worker(dir.path(), "eagle").with_ai_cloud_consent_for_test(true);
+        let persist = persist_at(dir.path());
+        let mut state = CollabState::new(w.self_actor.clone()).expect("state");
+        w.tick_once(&persist, &mut state, 100); // seed cursors
+
+        write_command(
+            &w,
+            &persist,
+            &CollabCommand::CreateSpace {
+                kind: SpaceKind::Team,
+                name: "ops".into(),
+            },
+        );
+        w.tick_once(&persist, &mut state, 200);
+        let space = only_space(&state);
+        let read_space_ai = |persist: &Persist| -> AiSuggestionRequests {
+            let topic = topics::space_state_topic(proj::AI_REQUESTS, space);
+            let msg = persist
+                .read_latest(&topic)
+                .expect("read space ai")
+                .expect("space ai request state published");
+            serde_json::from_str(msg.body.as_deref().expect("body")).expect("decode space ai")
+        };
+
+        write_command(
+            &w,
+            &persist,
+            &CollabCommand::RequestAiSuggestion {
+                space,
+                request_id: "ai:req-2".into(),
+                target: None,
+                kind: mde_collab_types::AiSuggestionKind::SmartReply,
+            },
+        );
+        w.tick_once(&persist, &mut state, 300);
+        let requests = read_space_ai(&persist);
+        assert_eq!(requests.requests.len(), 1);
+        assert_eq!(
+            requests.requests[0].status,
+            AiSuggestionRequestStatus::Pending,
+            "cloud-consented requests are admitted to the cancellable sidecar"
+        );
+
+        write_command(
+            &w,
+            &persist,
+            &CollabCommand::CancelAiSuggestion {
+                space,
+                request_id: "ai:req-2".into(),
+            },
+        );
+        w.tick_once(&persist, &mut state, 400);
+        let requests = read_space_ai(&persist);
+        assert_eq!(requests.requests.len(), 1);
+        assert_eq!(
+            requests.requests[0].status,
+            AiSuggestionRequestStatus::Canceled
+        );
+        assert!(requests.requests[0].error.is_none());
     }
 
     /// Create a space (this node becomes Owner) and link `reference` into it as

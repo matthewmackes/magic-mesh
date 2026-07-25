@@ -39,6 +39,29 @@ from urllib.parse import quote
 DEFAULT_BUS_ROOT = Path("/run/mde-bus")
 OVERLAY_PREFIX = "state/overlay/"
 VEHICLE_PREFIX = "state/vehicle/"
+ALLOWED_OVERLAY_LICENSE_TIERS = frozenset(
+    {
+        # Locked zero-cost overlay catalog tiers. Keep this list in sync with the
+        # `LICENSE_TIER` constants under crates/mesh/mackes-mesh-types/src/*.
+        "free-key-gov",
+        "open-data-attribution",
+        "public-data-attribution",
+        "public-domain",
+        "public-domain-courtesy-attribution",
+        "us-government-public-domain",
+    }
+)
+DISALLOWED_LICENSE_TIER_HINTS = (
+    "non-commercial",
+    "noncommercial",
+    "paid",
+    "personal",
+    "trial",
+    "educational",
+    "education",
+    "research-only",
+    "evaluation",
+)
 
 
 class MirrorError(Exception):
@@ -246,6 +269,21 @@ def _collection_count(payload: dict[str, Any]) -> int | None:
     return None
 
 
+def _license_tier_errors(payload: dict[str, Any]) -> list[str]:
+    tier = payload.get("license_tier")
+    if not isinstance(tier, str) or not tier:
+        return ["missing license_tier"]
+    if tier in ALLOWED_OVERLAY_LICENSE_TIERS:
+        return []
+    normalized = tier.strip().lower()
+    if any(hint in normalized for hint in DISALLOWED_LICENSE_TIER_HINTS):
+        return [
+            f"license_tier {tier!r} is disallowed by the zero-cost overlay audit"
+        ]
+    allowed = ", ".join(sorted(ALLOWED_OVERLAY_LICENSE_TIERS))
+    return [f"license_tier {tier!r} is not in the release allowlist: {allowed}"]
+
+
 def validate_overlay(
     bus_root: Path,
     topic: str,
@@ -279,11 +317,11 @@ def validate_overlay(
     availability = payload.get("availability")
     availability_text = availability if isinstance(availability, str) else None
     ready = fetched_at is not None and availability_text not in {"unconfigured", "secret_store_error", "error", "paused"}
+    license_tier_errors = _license_tier_errors(payload)
+    errors.extend(license_tier_errors)
     if require_ready:
         if not ready:
             errors.append(f"overlay is not ready (availability={availability_text!r})")
-        if not isinstance(payload.get("license_tier"), str) or not payload["license_tier"]:
-            errors.append("missing license_tier")
         if not isinstance(payload.get("attribution"), str) or not payload["attribution"]:
             errors.append("missing attribution")
     result.update(
@@ -296,6 +334,7 @@ def validate_overlay(
             "fetched_at_ms": fetched_at,
             "record_count": _collection_count(payload),
             "license_tier": payload.get("license_tier"),
+            "license_tier_allowed": not license_tier_errors,
             "attribution": payload.get("attribution"),
             "gaps": payload.get("gaps", []),
             "errors": errors,
@@ -411,6 +450,17 @@ def _self_test() -> None:
                 "attribution": "fixture",
             },
         )
+        add(
+            "01J00000000000000000000004",
+            "state/overlay/non-commercial/test-node",
+            {
+                "host": "test-node",
+                "fetched_at_ms": now_ms - 10_000,
+                "events": [],
+                "license_tier": "non-commercial-free",
+                "attribution": "fixture",
+            },
+        )
         conn.commit()
         conn.close()
 
@@ -420,6 +470,11 @@ def _self_test() -> None:
         overlay = validate_overlay(root, "state/overlay/test-feed/test-node", now_ms, 30_000, True)
         assert not overlay["errors"], overlay
         assert overlay["ready"] is True and overlay["record_count"] == 0
+        blocked_license = validate_overlay(
+            root, "state/overlay/non-commercial/test-node", now_ms, 30_000, True
+        )
+        assert blocked_license["license_tier_allowed"] is False, blocked_license
+        assert any("zero-cost" in error for error in blocked_license["errors"]), blocked_license
         missing_host_payload = {
             "fetched_at_ms": now_ms - 10_000,
             "events": [],
