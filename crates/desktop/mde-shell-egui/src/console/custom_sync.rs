@@ -69,7 +69,7 @@
 //! `ChooserPrefs` "inert session still pins locally" idiom restated).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::{fs, io};
 
 use serde::{Deserialize, Serialize};
@@ -83,6 +83,69 @@ use crate::chooser::chooser_prefs::{resolve_identity, resolve_seat};
 /// different root entirely: the Syncthing workgroup root, never the local
 /// client data dir), so the two never collide.
 pub(crate) const CUSTOM_SYNC_SUBDIR: &str = "console-custom-sync";
+
+/// Keep a corrupt or hostile replicated Custom-sync leaf bounded before
+/// `serde_json` materializes its contents. This leaves ample room for a real
+/// seat's command roster while keeping the untrusted Syncthing boundary small.
+const MAX_CUSTOM_SYNC_RECORD_BYTES: usize = 256 * 1024;
+
+/// Read one replicated Custom-sync record through a descriptor-backed,
+/// regular-file boundary. The final path component is opened without
+/// following symlinks, and a file that grows after its metadata snapshot is
+/// rejected before it can reach serde. Callers intentionally fold every
+/// failure to their existing fail-soft empty-source behavior.
+fn read_bounded_custom_sync_record(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        options.custom_flags(0o400000); // O_NOFOLLOW
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        options.custom_flags(0x100); // O_NOFOLLOW
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        if !fs::symlink_metadata(path)
+            .map(|metadata| metadata.file_type().is_file())
+            .unwrap_or(false)
+        {
+            return None;
+        }
+    }
+    #[cfg(not(unix))]
+    if !fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_file())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+
+    let file = options.open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_CUSTOM_SYNC_RECORD_BYTES as u64 {
+        return None;
+    }
+
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len())
+            .unwrap_or(MAX_CUSTOM_SYNC_RECORD_BYTES)
+            .saturating_add(1),
+    );
+    file.take((MAX_CUSTOM_SYNC_RECORD_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > MAX_CUSTOM_SYNC_RECORD_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
 
 /// One Custom entry as a last-writer-wins register (see the module doc for
 /// why content, not a synthetic id, is the key): `present: false` is the
@@ -237,7 +300,7 @@ impl CustomSyncStore {
             {
                 continue; // an in-flight atomic-write temp file
             }
-            if let Ok(data) = fs::read_to_string(&path) {
+            if let Some(data) = read_bounded_custom_sync_record(&path) {
                 if let Ok(rec) = serde_json::from_str::<SeatCustomFile>(&data) {
                     out.push(rec);
                 }
@@ -251,7 +314,7 @@ impl CustomSyncStore {
     /// (used to resume a seat's tombstones on start-up).
     #[must_use]
     fn seat_record(&self, identity: &str, seat: &str) -> Option<SeatCustomFile> {
-        let data = fs::read_to_string(self.seat_path(identity, seat)).ok()?;
+        let data = read_bounded_custom_sync_record(&self.seat_path(identity, seat))?;
         serde_json::from_str::<SeatCustomFile>(&data).ok()
     }
 }
@@ -549,6 +612,95 @@ mod tests {
             .join("seat-c.json");
         std::fs::write(&corrupt, "{ not json").expect("write corrupt");
         assert_eq!(store.records("matthew").len(), 2, "corrupt skipped");
+    }
+
+    #[test]
+    fn records_skip_oversized_invalid_and_non_regular_leaves_in_seat_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = CustomSyncStore::new(dir.path().to_path_buf());
+        let identity_dir = dir.path().join(CUSTOM_SYNC_SUBDIR).join("matthew");
+        fs::create_dir_all(&identity_dir).expect("create identity dir");
+
+        for seat in ["seat-b", "seat-a"] {
+            fs::write(
+                identity_dir.join(format!("{seat}.json")),
+                serde_json::to_vec(&seat_rec(seat)).expect("serialize seat record"),
+            )
+            .expect("write valid seat record");
+        }
+        fs::write(
+            identity_dir.join("oversized.json"),
+            vec![b'{'; MAX_CUSTOM_SYNC_RECORD_BYTES + 1],
+        )
+        .expect("write oversized record");
+        fs::write(identity_dir.join("invalid-utf8.json"), [0xff, 0xfe])
+            .expect("write invalid UTF-8 record");
+        fs::create_dir(identity_dir.join("directory.json")).expect("create directory leaf");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let target = dir.path().join("outside-record.json");
+            fs::write(
+                &target,
+                serde_json::to_vec(&seat_rec("symlink-target")).expect("serialize symlink target"),
+            )
+            .expect("write symlink target");
+            symlink(&target, identity_dir.join("symlink.json")).expect("create symlink leaf");
+        }
+
+        let records = store.records("matthew");
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.seat.as_str())
+                .collect::<Vec<_>>(),
+            vec!["seat-a", "seat-b"],
+            "valid records keep deterministic seat ordering while hostile leaves are skipped"
+        );
+    }
+
+    #[test]
+    fn seat_record_rejects_oversized_invalid_and_non_regular_leaves() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = CustomSyncStore::new(dir.path().to_path_buf());
+        let path = store.seat_path("matthew", "seat-a");
+        fs::create_dir_all(path.parent().expect("seat parent")).expect("create seat dir");
+
+        fs::write(&path, vec![b'{'; MAX_CUSTOM_SYNC_RECORD_BYTES + 1])
+            .expect("write oversized record");
+        assert!(store.seat_record("matthew", "seat-a").is_none());
+
+        fs::write(&path, [0xff, 0xfe]).expect("write invalid UTF-8 record");
+        assert!(store.seat_record("matthew", "seat-a").is_none());
+
+        fs::remove_file(&path).expect("remove invalid record");
+        fs::create_dir(&path).expect("create directory leaf");
+        assert!(store.seat_record("matthew", "seat-a").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn seat_record_rejects_final_symlink_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = CustomSyncStore::new(dir.path().to_path_buf());
+        let path = store.seat_path("matthew", "seat-a");
+        fs::create_dir_all(path.parent().expect("seat parent")).expect("create seat dir");
+        let target = dir.path().join("outside-record.json");
+        fs::write(
+            &target,
+            serde_json::to_vec(&seat_rec("seat-a")).expect("serialize target record"),
+        )
+        .expect("write target record");
+        symlink(&target, &path).expect("create final symlink");
+
+        assert!(
+            store.seat_record("matthew", "seat-a").is_none(),
+            "a replicated final symlink must not be deserialized"
+        );
     }
 
     #[test]

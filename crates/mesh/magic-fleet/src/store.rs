@@ -35,6 +35,71 @@ pub fn revision_path(dir: &Path, version: u64) -> PathBuf {
     dir.join(format!("{version:020}.yaml"))
 }
 
+// Replicated leaves are inputs from peers, not trusted local configuration.
+// Keep enough room for a useful fleet baseline while ensuring a corrupt or
+// hostile leaf cannot make a parser materialize an unbounded document.
+const MAX_REVISION_BYTES: usize = 4 * 1024 * 1024;
+const MAX_ACK_BYTES: usize = 64 * 1024;
+const MAX_NUDGE_BYTES: usize = 64 * 1024;
+
+/// Read one replicated leaf through a descriptor without following its final
+/// symlink, accepting only regular files and no more than `max_bytes`.
+///
+/// The metadata check before the read avoids needless allocation for an
+/// already-oversized file. The descriptor-backed bounded read closes the race
+/// where a peer grows the file after that first metadata snapshot; one extra
+/// byte is read only to detect that growth before any caller parses it.
+fn read_bounded_regular_file(path: &Path, max_bytes: usize) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        options.custom_flags(0o400000); // O_NOFOLLOW
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        options.custom_flags(0x100); // O_NOFOLLOW
+
+        // Keep unsupported Unix targets fail-closed for a symlink leaf even
+        // when their standard library does not expose an O_NOFOLLOW value.
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        if !std::fs::symlink_metadata(path).ok()?.file_type().is_file() {
+            return None;
+        }
+    }
+
+    #[cfg(not(unix))]
+    if !std::fs::symlink_metadata(path).ok()?.file_type().is_file() {
+        return None;
+    }
+
+    let file = options.open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    let max_bytes_u64 = u64::try_from(max_bytes).ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > max_bytes_u64 {
+        return None;
+    }
+
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).ok()?);
+    file.take(max_bytes_u64.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() <= max_bytes).then_some(bytes)
+}
+
+fn read_bounded_text(path: &Path, max_bytes: usize) -> Option<String> {
+    String::from_utf8(read_bounded_regular_file(path, max_bytes)?).ok()
+}
+
 /// Highest version present in the log + 1 (1 for an empty/missing
 /// log). What a minting node stamps on its next revision.
 #[must_use]
@@ -131,7 +196,7 @@ pub fn read_revisions(dir: &Path) -> Vec<Revision> {
             if !metadata.file_type().is_file() {
                 return None;
             }
-            let raw = std::fs::read_to_string(&path).ok()?;
+            let raw = read_bounded_text(&path, MAX_REVISION_BYTES)?;
             let revision = Revision::from_yaml(&raw).ok()?;
             if revision.version != version || revision.validate().is_err() {
                 return None;
@@ -212,7 +277,7 @@ pub fn read_acks(workgroup_root: &Path, version: u64) -> Vec<ApplyAck> {
     let mut out: Vec<ApplyAck> = entries
         .filter_map(Result::ok)
         .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
-        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .filter_map(|e| read_bounded_text(&e.path(), MAX_ACK_BYTES))
         .filter_map(|raw| serde_json::from_str(&raw).ok())
         .collect();
     out.sort_by(|a, b| a.peer.cmp(&b.peer));
@@ -264,7 +329,7 @@ pub fn write_nudge_payload(
 #[must_use]
 pub fn take_nudge_payload(workgroup_root: &Path, hostname: &str) -> Option<String> {
     let path = nudges_dir(workgroup_root).join(hostname);
-    let payload = std::fs::read_to_string(&path).ok()?;
+    let payload = read_bounded_text(&path, MAX_NUDGE_BYTES)?;
     let _ = std::fs::remove_file(path);
     Some(payload)
 }
@@ -338,6 +403,31 @@ mod tests {
         std::fs::write(dir.join("garbage.yaml"), "{{not yaml").unwrap();
         std::fs::write(dir.join("README.txt"), "hello").unwrap();
         assert_eq!(read_revisions(&dir).len(), 1);
+    }
+
+    #[test]
+    fn oversized_revision_leaves_are_skipped_before_yaml_parsing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = revisions_dir(tmp.path());
+        write_revision(&dir, &rev(1, 100, "peer:pine")).unwrap();
+        std::fs::write(revision_path(&dir, 2), vec![b'x'; MAX_REVISION_BYTES + 1]).unwrap();
+        assert_eq!(read_revisions(&dir).len(), 1);
+        assert_eq!(read_revisions(&dir)[0].version, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn revision_reads_reject_final_symlinks_and_non_regular_leaves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = revisions_dir(tmp.path());
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let outside = tmp.path().join("outside.yaml");
+        std::fs::write(&outside, rev(1, 100, "peer:pine").to_yaml().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&outside, revision_path(&dir, 1)).unwrap();
+        std::fs::create_dir(revision_path(&dir, 2)).unwrap();
+
+        assert!(read_revisions(&dir).is_empty());
     }
 
     #[test]
@@ -428,6 +518,45 @@ mod tests {
     }
 
     #[test]
+    fn oversized_ack_leaves_are_skipped_before_json_parsing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ack = ApplyAck {
+            peer: "pine".into(),
+            status: "applied".into(),
+            at: 100,
+            detail: String::new(),
+        };
+        write_ack(tmp.path(), 3, &ack).unwrap();
+        std::fs::write(
+            acks_dir(tmp.path(), 3).join("oversized.json"),
+            vec![b'x'; MAX_ACK_BYTES + 1],
+        )
+        .unwrap();
+
+        let acks = read_acks(tmp.path(), 3);
+        assert_eq!(acks, vec![ack]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ack_reads_reject_final_symlinks_and_non_regular_leaves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ack = ApplyAck {
+            peer: "pine".into(),
+            status: "applied".into(),
+            at: 100,
+            detail: String::new(),
+        };
+        write_ack(tmp.path(), 3, &ack).unwrap();
+        let outside = tmp.path().join("outside-ack.json");
+        std::fs::write(&outside, serde_json::to_string(&ack).unwrap()).unwrap();
+        std::os::unix::fs::symlink(&outside, acks_dir(tmp.path(), 3).join("linked.json")).unwrap();
+        std::fs::create_dir(acks_dir(tmp.path(), 3).join("directory.json")).unwrap();
+
+        assert_eq!(read_acks(tmp.path(), 3), vec![ack]);
+    }
+
+    #[test]
     fn nudges_are_consumed_exactly_once() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(!take_nudge(tmp.path(), "pine"), "no nudge yet");
@@ -435,6 +564,32 @@ mod tests {
         write_nudge(tmp.path(), "pine").unwrap(); // idempotent re-nudge
         assert!(take_nudge(tmp.path(), "pine"), "consumed");
         assert!(!take_nudge(tmp.path(), "pine"), "exactly once");
+    }
+
+    #[test]
+    fn oversized_nudge_payloads_are_not_materialized_or_consumed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let payload = "x".repeat(MAX_NUDGE_BYTES + 1);
+        write_nudge_payload(tmp.path(), "pine", &payload).unwrap();
+
+        assert!(take_nudge_payload(tmp.path(), "pine").is_none());
+        assert!(nudges_dir(tmp.path()).join("pine").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nudge_reads_reject_final_symlinks_and_non_regular_leaves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = nudges_dir(tmp.path());
+        std::fs::create_dir_all(&dir).unwrap();
+        let outside = tmp.path().join("outside-nudge");
+        std::fs::write(&outside, "reconcile\n").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("pine")).unwrap();
+        std::fs::create_dir(dir.join("oak")).unwrap();
+
+        assert!(take_nudge_payload(tmp.path(), "pine").is_none());
+        assert!(take_nudge_payload(tmp.path(), "oak").is_none());
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "reconcile\n");
     }
 
     #[test]

@@ -295,6 +295,13 @@ These decisions refine acceptance and sequencing for the active items below.
   and hostile-leaf cases; the full BigBoy `mackesd` library gate is green at
   3,997 passed, 1 ignored. Live Nebula rotation/reconnect evidence remains
   external.
+- Progress (2026-07-25 topology-verdict read boundary): replicated hop
+  advertisements and validation verdicts now use bounded descriptor-backed
+  regular-file reads that reject final symlinks, non-regular leaves, oversized
+  input, and invalid UTF-8 before JSON materialization. The focused farm
+  topology gate is green at **14/14**, and the integrated BigBoy `mackesd --lib
+  --features async-services` gate is green at **4,050 passed, 0 failed, 1
+  ignored**. Live Nebula rotation/reconnect evidence remains external.
 - Progress (2026-07-24 overlay-IP publication hardening): the Nebula
   supervisor's replicated overlay-IP writer now rejects symlinked parent
   components and uses unique create-new staging with crash-durable replacement;
@@ -534,6 +541,12 @@ These decisions refine acceptance and sequencing for the active items below.
   JSON materialization. Best-effort mirror reads skip an oversized sibling while
   strict reconciliation fails closed; the integrated BigBoy `mackesd --lib`
   gate is green at **3,998 passed, 1 ignored**. Live libvirt/Podman evidence
+  remains external.
+- Progress (2026-07-25 fleet-store read boundary): revision YAML, apply-ack
+  JSON, and one-shot nudge payloads now use bounded descriptor-backed regular
+  file reads that reject final symlinks, non-regular leaves, oversized input,
+  and invalid UTF-8 before parser materialization. The full farm
+  `magic-fleet --lib` gate is green at **56/56**; live libvirt/Podman evidence
   remains external.
 - Progress (2026-07-24 image provider boundary): `image-build` now caps raw
   requests before verb parsing, bounds replicated promotion/SHA sidecars,
@@ -1593,6 +1606,13 @@ These decisions refine acceptance and sequencing for the active items below.
   tests, and **25/25** Phones Hub tests; the integrated shell gate is green at
   **1,778/1,778**. Live pointer, pixel, physical, and VDI acceptance remain
   external evidence.
+- Progress (2026-07-25 Custom-sync read boundary): replicated console custom
+  command records now use bounded descriptor-backed regular-file reads that
+  reject final symlinks, non-regular leaves, oversized input, and invalid UTF-8
+  before JSON materialization while retaining deterministic seat ordering. The
+  focused farm gate is green at **11/11**, and the integrated shell package
+  gate is green at **1,783/1,783**. Live pointer, pixel, physical, and VDI
+  acceptance remain external evidence.
 - Progress (2026-07-25 auto-rotation sensor boundary): shared SysfsAccel reads
   now reject final symlinks and values above 128 bytes before UTF-8/float
   parsing, preserving honest absent/read errors. The full farm formfactor slice

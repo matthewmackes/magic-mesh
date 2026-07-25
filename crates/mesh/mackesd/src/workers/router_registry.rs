@@ -39,6 +39,11 @@ pub const PUBLISH_HEARTBEAT: Duration = Duration::from_secs(300);
 /// The QNM-Shared mirror filename.
 pub const ROUTER_REGISTRY_FILE: &str = "router-registry.json";
 
+/// Replicated router entries are compact records. Keep malformed or hostile
+/// mirror leaves bounded before serde materializes them, while leaving ample
+/// room for future registry fields.
+pub const MAX_ROUTER_REGISTRY_BYTES: usize = 256 * 1024;
+
 /// Bus topic a router entry publishes to: `mesh/devices/router/<mac>`.
 #[must_use]
 pub fn router_topic(mac: &str) -> String {
@@ -95,6 +100,82 @@ pub fn write_shared_entry(mount: &Path, hostname: &str, entry: &RouterEntry) {
     if let Err(e) = std::fs::rename(&tmp, &final_path) {
         tracing::warn!("router_registry: rename entry failed: {e}");
     }
+}
+
+/// Read one replicated router entry from the descriptor that will actually be
+/// consumed. Unix opens reject a final symlink in the kernel, then the same
+/// descriptor is checked as a regular file and read with a hard byte ceiling
+/// before serde sees the UTF-8 body. All failures collapse to `None` so a
+/// missing or hostile peer mirror remains a fail-soft empty source.
+#[must_use]
+pub fn read_shared_entry(mount: &Path, hostname: &str) -> Option<RouterEntry> {
+    if hostname.is_empty() {
+        return None;
+    }
+    let path = mount.join(hostname).join(ROUTER_REGISTRY_FILE);
+    let body = read_bounded_router_mirror(&path).ok()?;
+    serde_json::from_str(&body).ok()
+}
+
+/// Read a router-registry leaf without following its final symlink or
+/// allocating beyond [`MAX_ROUTER_REGISTRY_BYTES`].
+fn read_bounded_router_mirror(path: &Path) -> std::io::Result<String> {
+    use std::io::{Error, ErrorKind, Read as _};
+
+    #[cfg(unix)]
+    let file: std::fs::File = {
+        use rustix::fs::{Mode, OFlags};
+
+        rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?
+        .into()
+    };
+
+    #[cfg(not(unix))]
+    let file = {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "router mirror must not be a final symlink",
+            ));
+        }
+        std::fs::File::open(path)?
+    };
+
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "router mirror is not a regular file",
+        ));
+    }
+
+    let max_bytes = MAX_ROUTER_REGISTRY_BYTES as u64;
+    if metadata.len() > max_bytes {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "router mirror exceeds the byte limit",
+        ));
+    }
+
+    let capacity = usize::try_from(metadata.len())
+        .unwrap_or(MAX_ROUTER_REGISTRY_BYTES)
+        .min(MAX_ROUTER_REGISTRY_BYTES)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_ROUTER_REGISTRY_BYTES {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "router mirror exceeds the byte limit",
+        ));
+    }
+    String::from_utf8(bytes).map_err(|error| Error::new(ErrorKind::InvalidData, error))
 }
 
 /// Active Vyatta `show version` over SSH. The password (from the sealed cred) is
@@ -333,14 +414,70 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         let e = build_entry_from("peer:eagle", &candidate(), None, |_, _, _| None);
         write_shared_entry(&tmp, "eagle", &e);
+        assert_eq!(read_shared_entry(&tmp, "eagle"), Some(e.clone()));
         let path = tmp.join("eagle").join(ROUTER_REGISTRY_FILE);
-        let back: RouterEntry =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(back, e);
         assert!(!tmp.join("eagle").join("router-registry.json.tmp").exists());
         // empty hostname writes nothing
         write_shared_entry(&tmp.join("none"), "", &e);
         assert!(!tmp.join("none").exists());
+        assert!(read_shared_entry(&tmp, "").is_none());
+        assert!(path.is_file());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn shared_mirror_reader_skips_oversized_and_invalid_utf8_leaves() {
+        let tmp =
+            std::env::temp_dir().join(format!("mde-routerreg-hostile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let dir = tmp.join("eagle");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(ROUTER_REGISTRY_FILE);
+
+        std::fs::write(
+            &path,
+            vec![b'x'; MAX_ROUTER_REGISTRY_BYTES.saturating_add(1)],
+        )
+        .unwrap();
+        assert!(read_shared_entry(&tmp, "eagle").is_none());
+
+        std::fs::write(&path, [0xff, 0xfe, 0xfd]).unwrap();
+        assert!(read_shared_entry(&tmp, "eagle").is_none());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn shared_mirror_reader_skips_non_regular_leaves() {
+        let tmp =
+            std::env::temp_dir().join(format!("mde-routerreg-nonregular-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let dir = tmp.join("eagle");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir(dir.join(ROUTER_REGISTRY_FILE)).unwrap();
+
+        assert!(read_shared_entry(&tmp, "eagle").is_none());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_mirror_reader_rejects_final_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let tmp =
+            std::env::temp_dir().join(format!("mde-routerreg-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let dir = tmp.join("eagle");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = tmp.join("target.json");
+        let entry = build_entry_from("peer:eagle", &candidate(), None, |_, _, _| None);
+        std::fs::write(&target, serde_json::to_string(&entry).unwrap()).unwrap();
+        symlink(&target, dir.join(ROUTER_REGISTRY_FILE)).unwrap();
+
+        assert!(read_shared_entry(&tmp, "eagle").is_none());
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

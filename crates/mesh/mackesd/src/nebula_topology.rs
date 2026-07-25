@@ -52,6 +52,9 @@ const MAX_VPN_PROFILE_NAME_CHARS: usize = 128;
 /// A profile is configuration, not an arbitrary blob store; reject oversized
 /// input before creating or replacing its on-disk leaf.
 const MAX_VPN_PROFILE_BYTES: usize = 256 * 1024;
+/// Validation verdicts are tiny JSON records. Keep a replicated verdict
+/// bounded before `serde_json` materializes it.
+const MAX_VERDICT_BYTES: usize = 256 * 1024;
 
 /// One hop node's advertisement (own-row fleet state): the underlay
 /// subnets it can route on the fleet's behalf.
@@ -142,16 +145,49 @@ pub fn read_adverts(root: &Path) -> Vec<HopAdvert> {
 /// Read one replicated row with a hard byte ceiling and validate it before it
 /// becomes part of the route-derivation input.
 fn read_advert(path: &Path) -> Option<HopAdvert> {
-    let file = std::fs::File::open(path).ok()?;
-    let mut bytes = Vec::new();
-    file.take((MAX_ADVERT_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    if bytes.len() > MAX_ADVERT_BYTES {
-        return None;
-    }
+    let bytes = read_bounded_regular_file(path, MAX_ADVERT_BYTES)?;
     let raw = std::str::from_utf8(&bytes).ok()?;
     validate_advert(serde_json::from_str(raw).ok()?)
+}
+
+/// Read a replicated text record from the descriptor that will actually be
+/// consumed. Reject a final symlink, blocking special file, oversized input,
+/// and growth beyond the bound before callers parse or materialize it.
+fn read_bounded_regular_file(path: &Path, max_bytes: usize) -> Option<Vec<u8>> {
+    #[cfg(unix)]
+    let file: std::fs::File = {
+        use rustix::fs::{Mode, OFlags};
+
+        rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .ok()?
+        .into()
+    };
+    #[cfg(not(unix))]
+    let file = {
+        let metadata = std::fs::symlink_metadata(path).ok()?;
+        if !metadata.file_type().is_file() {
+            return None;
+        }
+        std::fs::File::open(path).ok()?
+    };
+
+    let metadata = file.metadata().ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > max_bytes as u64 {
+        return None;
+    }
+    let capacity = usize::try_from(metadata.len())
+        .unwrap_or(max_bytes)
+        .min(max_bytes)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take((max_bytes as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() <= max_bytes).then_some(bytes)
 }
 
 /// Validate the canonical grammar emitted by `hop-advertise`. Keeping this
@@ -280,10 +316,12 @@ pub fn exits_validated(workgroup_root: &Path) -> bool {
     let ids = magic_fleet::validation::list_run_ids(workgroup_root);
     for id in ids.into_iter().rev() {
         let path = magic_fleet::validation::run_dir(workgroup_root, &id).join("verdict.json");
-        if let Ok(raw) = std::fs::read_to_string(&path) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
-                if let Some(passed) = v.get("passed").and_then(serde_json::Value::as_bool) {
-                    return passed; // newest verdict wins
+        if let Some(bytes) = read_bounded_regular_file(&path, MAX_VERDICT_BYTES) {
+            if let Ok(raw) = std::str::from_utf8(&bytes) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
+                    if let Some(passed) = v.get("passed").and_then(serde_json::Value::as_bool) {
+                        return passed; // newest verdict wins
+                    }
                 }
             }
         }
@@ -538,6 +576,23 @@ mod tests {
         assert!(read_adverts(tmp.path()).is_empty());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn replicated_hop_rows_reject_final_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("outside.json");
+        std::fs::write(
+            &target,
+            serde_json::to_string(&advert("linked", "10.42.0.9", &["192.168.50.0/24"])).unwrap(),
+        )
+        .unwrap();
+        let hops = hops_dir(tmp.path());
+        std::fs::create_dir_all(&hops).unwrap();
+        std::os::unix::fs::symlink(&target, hops.join("linked.json")).unwrap();
+
+        assert!(read_adverts(tmp.path()).is_empty());
+    }
+
     #[test]
     fn derive_routes_installs_hop_subnets_but_not_my_own() {
         let adverts = vec![
@@ -573,6 +628,33 @@ mod tests {
         std::fs::write(dir.join("run.json"), "{}").unwrap();
         std::fs::write(dir.join("verdict.json"), r#"{"passed":true}"#).unwrap();
         assert!(exits_validated(root));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validation_verdict_reads_reject_oversized_and_final_symlink_inputs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let oversized_dir = magic_fleet::validation::run_dir(root, "v-300");
+        std::fs::create_dir_all(&oversized_dir).unwrap();
+        std::fs::write(oversized_dir.join("run.json"), "{}").unwrap();
+        std::fs::write(
+            oversized_dir.join("verdict.json"),
+            format!(
+                r#"{{"passed":true,"padding":"{}"}}"#,
+                "x".repeat(MAX_VERDICT_BYTES)
+            ),
+        )
+        .unwrap();
+        assert!(!exits_validated(root));
+
+        let target = root.join("outside-verdict.json");
+        std::fs::write(&target, r#"{"passed":true}"#).unwrap();
+        let linked_dir = magic_fleet::validation::run_dir(root, "v-400");
+        std::fs::create_dir_all(&linked_dir).unwrap();
+        std::fs::write(linked_dir.join("run.json"), "{}").unwrap();
+        std::os::unix::fs::symlink(&target, linked_dir.join("verdict.json")).unwrap();
+        assert!(!exits_validated(root));
     }
 
     #[test]
