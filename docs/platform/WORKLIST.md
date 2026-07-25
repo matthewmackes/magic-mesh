@@ -485,6 +485,18 @@ These decisions refine acceptance and sequencing for the active items below.
   generated name grammar; unexpected names, symlinks, and unsafe metadata are
   preserved. The focused BigBoy supervisor gate is green at 42/42, including
   prior-generation pruning; live rotation/reconnect evidence remains external.
+- Progress (2026-07-25 node-signing-key read boundary): the persisted Ed25519
+  seed now uses an exact 32-byte descriptor-backed regular-file read that
+  rejects final symlinks, special files, oversized or growing input before key
+  materialization. The focused farm gate is green at **4/4**, and the
+  integrated BigBoy `mackesd --lib --features async-services` gate is green at
+  **4,063 passed, 0 failed, 1 ignored**. Live Nebula rotation/reconnect
+  evidence remains external.
+- Progress (2026-07-25 overlay-IP read boundary): the canonical Nebula
+  overlay-IP reader now rejects final symlinks, special files, oversized or
+  growing input, and invalid UTF-8 before IP parsing while preserving the
+  unresolved/no-public-bind gate. The focused KDC overlay gate is green at
+  **5/5**, and live Nebula rotation/reconnect evidence remains external.
 - Priority: P0
 - Complexity: Epic
 - Problem: Any node able to read replicated enrollment bundles can obtain other
@@ -591,6 +603,12 @@ These decisions refine acceptance and sequencing for the active items below.
   **2/2**, the CLI gate at **3/3**, and the integrated `magic-fleet
   --all-targets` farm gate is green at **67 library, 3 binary, and 3
   multiprocess tests**. Live libvirt/Podman evidence remains external.
+- Progress (2026-07-25 service-directory read boundary): replicated KDC service
+  rows now use bounded descriptor-backed regular-file reads that reject final
+  symlinks, non-regular leaves, oversized input, and invalid UTF-8 before JSON
+  materialization while preserving fail-soft sorting. The focused farm gate is
+  green at **8/8**, and the integrated KDC-host library gate is green at
+  **96/96**. Live libvirt/Podman evidence remains external.
 - Progress (2026-07-24 image provider boundary): `image-build` now caps raw
   requests before verb parsing, bounds replicated promotion/SHA sidecars,
   limits roster rows, and keeps reply/error/raw-log text bounded. The focused
@@ -1682,6 +1700,13 @@ These decisions refine acceptance and sequencing for the active items below.
   gate is green at **12/12**, and the integrated shell binary suite is green
   at **1,785/1,785**. Live pointer, pixel, physical, and VDI acceptance remain
   external evidence.
+- Progress (2026-07-25 device-inventory read boundary): replicated hardware
+  inventory rows now use bounded descriptor-backed regular-file reads that
+  reject final symlinks, non-regular leaves, oversized or growing input, and
+  invalid UTF-8 before JSON materialization while preserving hostname sorting.
+  The focused farm gate is green at **8/8**, and the integrated mesh-types
+  library gate is green at **273/273**. Live pointer, pixel, physical, and VDI
+  acceptance remain external evidence.
 - Progress (2026-07-25 Front Door query boundary): launcher query state and
   ranking now enforce a UTF-8-safe 256-character cap, with the egui input
   applying the same limit to keystrokes and oversized paste/restored state.

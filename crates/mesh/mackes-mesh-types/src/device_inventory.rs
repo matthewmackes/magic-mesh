@@ -417,11 +417,82 @@ pub fn inventory_path(workgroup_root: &Path, hostname: &str) -> PathBuf {
     inventory_dir(workgroup_root).join(format!("{hostname}.json"))
 }
 
+/// Keep replicated inventory input bounded before `serde_json` materializes it
+/// into an owned document.
+const MAX_INVENTORY_BYTES: usize = 256 * 1024;
+
+/// Read one replicated inventory row through the descriptor that will be
+/// consumed. Reject final symlinks, blocking special files, oversized input,
+/// growth while reading, and invalid UTF-8 before the JSON parser sees it.
+fn read_bounded_inventory_json(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+
+    #[cfg(unix)]
+    let file: std::fs::File = {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        options.custom_flags(0o400000 | 0o4000 | 0o2000000); // O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        options.custom_flags(0x100 | 0x4); // O_NOFOLLOW | O_NONBLOCK
+
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        if !std::fs::symlink_metadata(path).ok()?.file_type().is_file() {
+            return None;
+        }
+
+        options.open(path).ok()?
+    };
+    #[cfg(not(unix))]
+    let file = {
+        let metadata = std::fs::symlink_metadata(path).ok()?;
+        if !metadata.file_type().is_file() {
+            return None;
+        }
+        std::fs::File::open(path).ok()?
+    };
+
+    let metadata = file.metadata().ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_INVENTORY_BYTES as u64 {
+        return None;
+    }
+    let initial_len = metadata.len();
+
+    let capacity = usize::try_from(initial_len)
+        .unwrap_or(MAX_INVENTORY_BYTES)
+        .min(MAX_INVENTORY_BYTES)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(capacity);
+    (&file)
+        .take((MAX_INVENTORY_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > MAX_INVENTORY_BYTES || bytes.len() as u64 != initial_len {
+        return None;
+    }
+
+    // A regular file can be extended after the first metadata snapshot. Keep
+    // the row fail-soft if the descriptor observes any size change while it is
+    // being consumed.
+    if file.metadata().ok()?.len() != initial_len {
+        return None;
+    }
+
+    String::from_utf8(bytes).ok()
+}
+
 /// Read one host's published inventory, or `None` when it is absent / unreadable
 /// / half-replicated (an honest miss, never a panic).
 #[must_use]
 pub fn read_inventory(workgroup_root: &Path, hostname: &str) -> Option<DeviceInventory> {
-    let data = std::fs::read_to_string(inventory_path(workgroup_root, hostname)).ok()?;
+    let data = read_bounded_inventory_json(&inventory_path(workgroup_root, hostname))?;
     serde_json::from_str(&data).ok()
 }
 
@@ -448,7 +519,7 @@ pub fn read_all(workgroup_root: &Path) -> Vec<DeviceInventory> {
         {
             continue;
         }
-        if let Ok(data) = std::fs::read_to_string(&path) {
+        if let Some(data) = read_bounded_inventory_json(&path) {
             if let Ok(inv) = serde_json::from_str::<DeviceInventory>(&data) {
                 out.push(inv);
             }
@@ -533,5 +604,77 @@ mod tests {
         assert_eq!(read_all(root).len(), 1);
         // A missing host reads as an honest None.
         assert!(read_inventory(root, "ghost").is_none());
+    }
+
+    #[test]
+    fn valid_rows_are_read_and_sorted_by_hostname() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(inventory_dir(root)).unwrap();
+
+        let mut zulu = DeviceInventory::fixture();
+        zulu.host = "zulu".to_string();
+        let mut alpha = DeviceInventory::fixture();
+        alpha.host = "alpha".to_string();
+        std::fs::write(
+            inventory_path(root, &zulu.host),
+            serde_json::to_vec(&zulu).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            inventory_path(root, &alpha.host),
+            serde_json::to_vec(&alpha).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(read_inventory(root, "alpha"), Some(alpha));
+        let all = read_all(root);
+        assert_eq!(
+            all.iter()
+                .map(|inventory| inventory.host.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "zulu"]
+        );
+    }
+
+    #[test]
+    fn hostile_rows_are_fail_soft() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(inventory_dir(root)).unwrap();
+
+        std::fs::write(inventory_path(root, "invalid-utf8"), [0xff, 0xfe]).unwrap();
+        std::fs::write(
+            inventory_path(root, "oversized"),
+            vec![b' '; MAX_INVENTORY_BYTES + 1],
+        )
+        .unwrap();
+        std::fs::create_dir(inventory_path(root, "directory")).unwrap();
+
+        assert!(read_inventory(root, "invalid-utf8").is_none());
+        assert!(read_inventory(root, "oversized").is_none());
+        assert!(read_inventory(root, "directory").is_none());
+        assert!(read_all(root).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_symlinks_and_unix_sockets_are_ignored() {
+        use std::os::unix::fs::symlink;
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(inventory_dir(root)).unwrap();
+
+        let inventory = DeviceInventory::fixture();
+        let target = inventory_path(root, &inventory.host);
+        std::fs::write(&target, serde_json::to_vec(&inventory).unwrap()).unwrap();
+        symlink(&target, inventory_path(root, "linked")).unwrap();
+        let _socket = UnixListener::bind(inventory_path(root, "socket")).unwrap();
+
+        assert!(read_inventory(root, "linked").is_none());
+        assert!(read_inventory(root, "socket").is_none());
+        assert_eq!(read_all(root), vec![inventory]);
     }
 }

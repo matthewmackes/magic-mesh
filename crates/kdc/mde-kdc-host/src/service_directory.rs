@@ -119,6 +119,81 @@ pub fn publish_services(
     Ok(path)
 }
 
+/// Keep replicated service-directory rows bounded before `serde_json` can
+/// materialize attacker-controlled collections and strings.
+const MAX_SERVICE_DIRECTORY_BYTES: usize = 256 * 1024;
+
+/// Read one replicated service-directory row through a descriptor-backed
+/// regular-file boundary.
+///
+/// The final path component is opened without following a symlink and with
+/// non-blocking semantics, so a FIFO or other special file cannot stall the
+/// directory reader before the descriptor is inspected and rejected. The
+/// second metadata check rejects anything that is not a regular file. Reading
+/// one byte beyond the initial metadata bound closes the race where a peer
+/// grows a regular file while it is being consumed. Invalid UTF-8 is rejected
+/// before any JSON materialization. The caller intentionally folds every
+/// failure to its existing fail-soft behavior.
+fn read_bounded_service_directory_row(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        options.custom_flags(0o400000 | 0o4000 | 0o2000000); // O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        options.custom_flags(0x100 | 0x4); // O_NOFOLLOW | O_NONBLOCK
+
+        // Unsupported Unix targets still fail closed for a final symlink even
+        // when their standard library does not expose O_NOFOLLOW.
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        if !std::fs::symlink_metadata(path)
+            .ok()
+            .is_some_and(|metadata| metadata.file_type().is_file())
+        {
+            return None;
+        }
+    }
+
+    #[cfg(not(unix))]
+    if !std::fs::symlink_metadata(path)
+        .ok()
+        .is_some_and(|metadata| metadata.file_type().is_file())
+    {
+        return None;
+    }
+
+    let file = options.open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_SERVICE_DIRECTORY_BYTES as u64 {
+        return None;
+    }
+
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len())
+            .unwrap_or(MAX_SERVICE_DIRECTORY_BYTES)
+            .min(MAX_SERVICE_DIRECTORY_BYTES)
+            .saturating_add(1),
+    );
+    file.take((MAX_SERVICE_DIRECTORY_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > MAX_SERVICE_DIRECTORY_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
 /// Read every node's published service set (own row + neighbors) — the whole mesh
 /// directory a phone/hub browses to pick a node. Junk / half-replicated files are
 /// skipped, like every other replicated reader. Sorted by hostname for a
@@ -134,7 +209,7 @@ pub fn collect_all_services(workgroup_root: &Path) -> Vec<NodeServices> {
         if path.extension().is_none_or(|x| x != "json") {
             continue;
         }
-        let Ok(raw) = std::fs::read_to_string(&path) else {
+        let Some(raw) = read_bounded_service_directory_row(&path) else {
             continue;
         };
         if let Ok(node) = serde_json::from_str::<NodeServices>(&raw) {
@@ -237,6 +312,67 @@ mod tests {
         let all = collect_all_services(root);
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].node_host, "nodeA");
+    }
+
+    #[test]
+    fn bounded_reader_preserves_a_valid_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let services = node("nodeA", "id-a", &[service::FILES]);
+
+        publish_services(root, &services).unwrap();
+
+        let path = services_dir(root).join("nodeA.json");
+        let raw = read_bounded_service_directory_row(&path).expect("valid row is readable");
+        assert_eq!(
+            serde_json::from_str::<NodeServices>(&raw).unwrap(),
+            services
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_reader_skips_hostile_leaves_without_following_or_blocking() {
+        use std::os::unix::fs::symlink;
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let dir = services_dir(root);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let valid_a = node("nodeA", "id-a", &[service::FILES]);
+        let valid_b = node("nodeB", "id-b", &[service::WORKLOADS]);
+        publish_services(root, &valid_b).unwrap();
+        publish_services(root, &valid_a).unwrap();
+
+        let outside = root.join("outside.json");
+        let outside_body =
+            serde_json::to_vec(&node("outside", "id-outside", &[service::FILES])).unwrap();
+        std::fs::write(&outside, &outside_body).unwrap();
+        symlink(&outside, dir.join("symlink.json")).unwrap();
+        std::fs::write(
+            dir.join("oversized.json"),
+            vec![b'x'; MAX_SERVICE_DIRECTORY_BYTES + 1],
+        )
+        .unwrap();
+        std::fs::write(dir.join("invalid-utf8.json"), [0xff, 0xfe]).unwrap();
+        std::fs::create_dir(dir.join("directory.json")).unwrap();
+        let _socket = UnixListener::bind(dir.join("special.json")).unwrap();
+
+        assert!(read_bounded_service_directory_row(&dir.join("symlink.json")).is_none());
+        assert!(read_bounded_service_directory_row(&dir.join("oversized.json")).is_none());
+        assert!(read_bounded_service_directory_row(&dir.join("invalid-utf8.json")).is_none());
+        assert!(read_bounded_service_directory_row(&dir.join("directory.json")).is_none());
+        assert!(read_bounded_service_directory_row(&dir.join("special.json")).is_none());
+
+        let all = collect_all_services(root);
+        assert_eq!(
+            all.iter()
+                .map(|node| node.node_host.as_str())
+                .collect::<Vec<_>>(),
+            vec!["nodeA", "nodeB"]
+        );
     }
 
     #[test]

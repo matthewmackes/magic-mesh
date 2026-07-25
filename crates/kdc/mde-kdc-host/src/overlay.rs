@@ -57,6 +57,10 @@ use crate::PeerId;
 /// transport resolves the node's own overlay IP from here (design #3/#15).
 pub const DEFAULT_OVERLAY_IP_PATH: &str = "/var/lib/mackesd/nebula/overlay-ip";
 
+/// The canonical overlay-IP file contains one short textual IP address. Keep
+/// the descriptor-backed read bounded before UTF-8 conversion or IP parsing.
+const MAX_OVERLAY_IP_BYTES: usize = 4 * 1024;
+
 /// Whether the node's Nebula overlay IP has been resolved.
 ///
 /// The overlay transport binds + dials only when
@@ -97,7 +101,7 @@ impl OverlayStatus {
 /// (which would open a public port), or loopback (the node isn't on the mesh).
 #[must_use]
 pub fn resolve_overlay_ip(path: &Path) -> OverlayStatus {
-    let raw = match std::fs::read_to_string(path) {
+    let raw = match read_bounded_overlay_ip(path) {
         Ok(s) => s,
         Err(e) => {
             return OverlayStatus::Unresolved(format!(
@@ -120,6 +124,92 @@ pub fn resolve_overlay_ip(path: &Path) -> OverlayStatus {
         Ok(ip) => OverlayStatus::Resolved(ip),
         Err(e) => OverlayStatus::Unresolved(format!("overlay-ip {text:?} is not a valid IP: {e}")),
     }
+}
+
+/// Read the canonical overlay-IP file through the descriptor that is
+/// consumed. Reject final symlinks, blocking special files, oversized or
+/// growing input, and invalid UTF-8 before the resolver parses peer-controlled
+/// bytes. Callers retain the existing unresolved diagnostic for every read
+/// failure.
+fn read_bounded_overlay_ip(path: &Path) -> std::io::Result<String> {
+    use std::io::{Error, ErrorKind, Read as _};
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        options.custom_flags(0o400000 | 0o4000 | 0o2000000); // O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        options.custom_flags(0x100 | 0x4); // O_NOFOLLOW | O_NONBLOCK
+
+        // Unsupported Unix targets still fail closed for a final symlink even
+        // when their standard library does not expose O_NOFOLLOW.
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        if !std::fs::symlink_metadata(path)
+            .ok()
+            .is_some_and(|metadata| metadata.file_type().is_file())
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "overlay-ip is not a regular file",
+            ));
+        }
+    }
+
+    #[cfg(not(unix))]
+    if !std::fs::symlink_metadata(path)
+        .ok()
+        .is_some_and(|metadata| metadata.file_type().is_file())
+    {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "overlay-ip is not a regular file",
+        ));
+    }
+
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "overlay-ip is not a regular file",
+        ));
+    }
+    if metadata.len() > MAX_OVERLAY_IP_BYTES as u64 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("overlay-ip file exceeds the {MAX_OVERLAY_IP_BYTES}-byte limit"),
+        ));
+    }
+
+    let capacity = usize::try_from(metadata.len())
+        .unwrap_or(MAX_OVERLAY_IP_BYTES)
+        .min(MAX_OVERLAY_IP_BYTES)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take((MAX_OVERLAY_IP_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_OVERLAY_IP_BYTES {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("overlay-ip file grew beyond the {MAX_OVERLAY_IP_BYTES}-byte limit"),
+        ));
+    }
+    String::from_utf8(bytes).map_err(|error| {
+        Error::new(
+            ErrorKind::InvalidData,
+            format!("overlay-ip is not valid UTF-8: {error}"),
+        )
+    })
 }
 
 /// Compute the inbound-listener bind address for a resolved overlay `status`.
@@ -474,6 +564,65 @@ mod tests {
         std::fs::write(&garbage, "not-an-ip").unwrap();
         assert!(matches!(
             resolve_overlay_ip(&garbage),
+            OverlayStatus::Unresolved(_)
+        ));
+    }
+
+    #[test]
+    fn resolve_overlay_ip_rejects_oversized_invalid_utf8_and_non_regular_input() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let oversized = tmp.path().join("oversized");
+        std::fs::write(&oversized, vec![b'x'; MAX_OVERLAY_IP_BYTES + 1]).unwrap();
+        let status = resolve_overlay_ip(&oversized);
+        match status {
+            OverlayStatus::Unresolved(reason) => {
+                assert!(
+                    reason.contains("exceeds"),
+                    "unexpected diagnostic: {reason}"
+                );
+            }
+            other => panic!("oversized input resolved unexpectedly: {other:?}"),
+        }
+
+        let invalid_utf8 = tmp.path().join("invalid-utf8");
+        std::fs::write(&invalid_utf8, [0xff, 0xfe, 0xfd]).unwrap();
+        let status = resolve_overlay_ip(&invalid_utf8);
+        match status {
+            OverlayStatus::Unresolved(reason) => {
+                assert!(reason.contains("UTF-8"), "unexpected diagnostic: {reason}");
+            }
+            other => panic!("invalid UTF-8 resolved unexpectedly: {other:?}"),
+        }
+
+        let directory = tmp.path().join("directory");
+        std::fs::create_dir(&directory).unwrap();
+        assert!(matches!(
+            resolve_overlay_ip(&directory),
+            OverlayStatus::Unresolved(_)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_overlay_ip_rejects_final_symlink_and_special_file() {
+        use std::os::unix::fs::symlink;
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::write(&outside, "10.42.0.5\n").unwrap();
+        let symlinked = tmp.path().join("symlinked");
+        symlink(&outside, &symlinked).unwrap();
+        assert!(matches!(
+            resolve_overlay_ip(&symlinked),
+            OverlayStatus::Unresolved(_)
+        ));
+
+        let special = tmp.path().join("special");
+        let _socket = UnixListener::bind(&special).unwrap();
+        assert!(matches!(
+            resolve_overlay_ip(&special),
             OverlayStatus::Unresolved(_)
         ));
     }
