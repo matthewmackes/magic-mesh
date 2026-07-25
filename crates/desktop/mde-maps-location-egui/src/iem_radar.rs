@@ -4,14 +4,17 @@ use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
 
 use base64::Engine as _;
-use mackes_mesh_types::iem_radar::{IemRadarFrame, IemRadarSnapshot, IemRadarTile, ATTRIBUTION};
+use mackes_mesh_types::iem_radar::{ATTRIBUTION, IemRadarFrame, IemRadarSnapshot, IemRadarTile};
+use mde_egui::Style;
 use mde_egui::egui::{
     self, Color32, FontId, Painter, Pos2, Rect, Stroke, TextureHandle, TextureOptions,
 };
-use mde_egui::Style;
 
 /// Radar producer time older than twenty minutes is never painted as live.
 pub const SNAPSHOT_STALE_AFTER_MS: i64 = 20 * 60 * 1_000;
+/// Allow a small amount of clock skew, but never present a future producer
+/// frame as current data.
+const MAX_TIMESTAMP_FUTURE_SKEW_MS: i64 = 5_000;
 /// Animation frame dwell time.
 pub const FRAME_DWELL_MS: i64 = 900;
 
@@ -56,14 +59,35 @@ impl IemRadarLayerState {
         self.snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.frames.first())
-            .map(|frame| now_ms.saturating_sub(frame.valid_at_ms).max(0))
+            .and_then(|frame| {
+                (!self.future_dated(now_ms))
+                    .then(|| now_ms.saturating_sub(frame.valid_at_ms).max(0))
+            })
+    }
+
+    /// Whether any retained frame is too far ahead of the consumer clock to
+    /// be trusted. The animation can select older frames, so checking only
+    /// the newest frame would leave a malformed future frame paintable.
+    #[must_use]
+    pub fn future_dated(&self, now_ms: i64) -> bool {
+        self.snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot
+                .frames
+                .iter()
+                .take(MAX_PAINTABLE_FRAMES)
+                .any(|frame| {
+                    frame.valid_at_ms > now_ms.saturating_add(MAX_TIMESTAMP_FUTURE_SKEW_MS)
+                })
+        })
     }
 
     /// Whether the exact producer time exceeds the safety threshold.
     #[must_use]
     pub fn stale(&self, now_ms: i64) -> bool {
-        self.age_ms(now_ms)
-            .is_some_and(|age| age > SNAPSHOT_STALE_AFTER_MS)
+        self.future_dated(now_ms)
+            || self
+                .age_ms(now_ms)
+                .is_some_and(|age| age > SNAPSHOT_STALE_AFTER_MS)
     }
 
     /// Whether last-good tiles were retained after fix/refresh loss.
@@ -129,11 +153,17 @@ where
     if !rect.is_finite() || rect.width() <= 0.0 || rect.height() <= 0.0 {
         return PaintStats::default();
     }
+    let future_dated = layer.future_dated(now_ms);
     let non_live = layer.stale(now_ms) || layer.paused();
     let mut stats = PaintStats {
         non_live,
         ..PaintStats::default()
     };
+    if future_dated {
+        paint_age_badge(painter, rect, layer, now_ms);
+        stats.badge = true;
+        return stats;
+    }
     if let Some(snapshot) = &layer.snapshot {
         if let Some((frame_index, frame)) = selected_frame(snapshot, layer.animate, now_ms) {
             stats.frame_index = frame_index;
@@ -296,6 +326,9 @@ fn decode_tile(value: &str) -> Option<egui::ColorImage> {
 fn paint_age_badge(painter: &Painter, rect: Rect, layer: &IemRadarLayerState, now_ms: i64) {
     let (label, tone) = match (&layer.snapshot, layer.age_ms(now_ms)) {
         (None, _) => ("NEXRAD · no data".to_string(), Style::TEXT_DIM),
+        (Some(_), _) if layer.future_dated(now_ms) => {
+            ("NEXRAD · invalid future timestamp".to_string(), Style::WARN)
+        }
         (Some(_), Some(age)) if layer.paused() => {
             (format!("NEXRAD · PAUSED · {}", age_label(age)), Style::WARN)
         }
@@ -457,9 +490,9 @@ mod tests {
                 tiles: (0..(MAX_PAINTABLE_TILES_PER_FRAME + 2))
                     .map(|tile_index| IemRadarTile {
                         z: 6,
-                        // The first tile in the selected oldest frame is an
+                        // The first tile in the selected latest frame is an
                         // invalid coordinate with otherwise valid PNG data.
-                        x: if frame_index == MAX_PAINTABLE_FRAMES - 1 && tile_index == 0 {
+                        x: if frame_index == 0 && tile_index == 0 {
                             u32::MAX
                         } else {
                             19 + u32::try_from(tile_index).expect("tile index")
@@ -471,6 +504,7 @@ mod tests {
             })
             .collect();
         let mut layer = IemRadarLayerState::default();
+        layer.animate = false;
         layer.fold(retained);
         let context = egui::Context::default();
         let mut projected = 0;
@@ -478,7 +512,7 @@ mod tests {
         let _ = context.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let rect = ui.max_rect();
-                stats = paint_layer(ui.painter(), rect, &layer, 0, |_lat, _lon| {
+                stats = paint_layer(ui.painter(), rect, &layer, now_ms, |_lat, _lon| {
                     projected += 1;
                     Some(if projected % 2 == 1 {
                         rect.left_top()
@@ -538,5 +572,35 @@ mod tests {
             });
         });
         assert!(paused.non_live);
+    }
+
+    #[test]
+    fn future_dated_frame_is_not_painted_as_live() {
+        let now_ms = 1_000_000;
+        let mut retained = snapshot(now_ms);
+        retained.frames[0].valid_at_ms = now_ms.saturating_add(MAX_TIMESTAMP_FUTURE_SKEW_MS + 1);
+        let mut layer = IemRadarLayerState::default();
+        layer.animate = false;
+        layer.fold(retained);
+
+        assert!(layer.future_dated(now_ms));
+        assert!(layer.stale(now_ms));
+        assert_eq!(layer.age_ms(now_ms), None);
+
+        let context = egui::Context::default();
+        let mut stats = PaintStats::default();
+        let mut projected = 0;
+        let _ = context.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = ui.max_rect();
+                stats = paint_layer(ui.painter(), rect, &layer, now_ms, |_lat, _lon| {
+                    projected += 1;
+                    Some(rect.center())
+                });
+            });
+        });
+        assert!(stats.non_live);
+        assert_eq!(stats.tiles, 0);
+        assert_eq!(projected, 0);
     }
 }

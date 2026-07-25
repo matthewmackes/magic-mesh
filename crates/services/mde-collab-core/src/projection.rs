@@ -978,6 +978,12 @@ impl SpaceFold {
             }
             CollabEventKind::SpaceArchived => {}
             CollabEventKind::MemberJoined { actor, role } => {
+                // `JoinSpace` is self-authored, while `AddMember` is owner-
+                // authored.  A valid signature alone must not let a non-owner
+                // grant membership to another actor during replay.
+                if actor != &env.actor && !self.is_present_owner(&env.actor) {
+                    return;
+                }
                 self.members.insert(actor.0.clone(), (*role, true));
             }
             CollabEventKind::MemberLeft { actor } => {

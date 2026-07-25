@@ -182,6 +182,20 @@ impl CloudRunOutcome {
             applied: false,
         }
     }
+
+    /// Require a live mutation before an authorized caller can receive success.
+    ///
+    /// A provider-neutral adapter may report that it accepted or staged an
+    /// operation without applying it. That is not success for an action verb:
+    /// callers must not present it as applied or retract declarative state.
+    pub(crate) fn require_live_apply(mut self, action: &str) -> Self {
+        if self.ok && !self.applied {
+            self.ok = false;
+            self.summary =
+                format!("{action} backend reported success without applying the requested change");
+        }
+        self
+    }
 }
 
 /// The captured result of one generic backend-tool invocation through the
@@ -616,6 +630,8 @@ pub(crate) mod fake {
         /// The tfvars documents the authorized live provision was handed — proves
         /// apply consumed the current desired slice rather than stale plan state.
         pub provision_tfvars: Mutex<Vec<String>>,
+        /// Optional lifecycle result for negative provider-contract tests.
+        pub lifecycle_outcome: Option<CloudRunOutcome>,
         /// `run_tool` invocations recorded as `(bin, args)` — proves the image-build
         /// / container-deploy pipelines drove the right tools.
         pub tool_calls: Mutex<Vec<(String, Vec<String>)>>,
@@ -685,6 +701,9 @@ pub(crate) mod fake {
         }
         fn lifecycle(&self, action: LifecycleAction, instance: &str) -> CloudRunOutcome {
             self.record(&format!("lifecycle-{}", action.cli_verb()), true);
+            if let Some(outcome) = &self.lifecycle_outcome {
+                return outcome.clone();
+            }
             CloudRunOutcome::ok(format!("virsh {} {instance}", action.cli_verb()), true)
         }
 

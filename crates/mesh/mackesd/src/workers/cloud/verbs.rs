@@ -497,7 +497,10 @@ fn handle_lifecycle(
     if let Some(reply) = authorization_refusal(w, verb_name, body, instance, raw) {
         return reply;
     }
-    let mut outcome = w.runner.lifecycle(action, instance);
+    let mut outcome = w
+        .runner
+        .lifecycle(action, instance)
+        .require_live_apply(verb_name);
     if matches!(action, LifecycleAction::Delete) && outcome.ok {
         match super::reconcile::remove_desired_doc(&w.state_root, body.node.trim(), instance) {
             Ok(_) => {}
@@ -569,7 +572,10 @@ fn handle_bulk_lifecycle(
     let mut succeeded = 0_usize;
     let mut failures = Vec::new();
     for target in &targets {
-        let outcome = w.runner.lifecycle(action, target);
+        let outcome = w
+            .runner
+            .lifecycle(action, target)
+            .require_live_apply(verb_name);
         if verb.is_destructive() {
             w.audit(verb_name, Some(target), &outcome);
         }
@@ -627,9 +633,10 @@ fn finish_authorized_mutation(
     outcome: &CloudRunOutcome,
     instance: Option<&str>,
 ) -> CloudReply {
+    let outcome = outcome.clone().require_live_apply(verb_name);
     let audited = verb.is_destructive();
     if audited {
-        w.audit(verb_name, instance, outcome);
+        w.audit(verb_name, instance, &outcome);
     }
     if outcome.ok {
         CloudReply {

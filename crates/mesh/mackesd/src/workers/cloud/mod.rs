@@ -1154,6 +1154,58 @@ mod tests {
     }
 
     #[test]
+    fn an_unapplied_lifecycle_success_fails_closed_and_keeps_desired_state() {
+        use mackes_mesh_types::cloud::{DeliveryType, WorkloadSpec};
+
+        let tmp = tempfile::tempdir().unwrap();
+        reconcile::write_desired_doc(
+            tmp.path(),
+            &WorkloadSpec {
+                name: "web".into(),
+                delivery_type: DeliveryType::ServiceVm,
+                node: "me".into(),
+                vcpu: 2,
+                memory_mb: 2048,
+                disk_gb: 20,
+                image: None,
+                network_isolation: false,
+                raw_hcl: None,
+            },
+        )
+        .unwrap();
+        let runner = Arc::new(FakeRunner {
+            lifecycle_outcome: Some(CloudRunOutcome::ok("staged only", false)),
+            ..Default::default()
+        });
+        let worker = CloudWorker::new("me".into(), "peer:me".into(), tmp.path().to_path_buf())
+            .with_runner(runner.clone())
+            .with_signer(Arc::new(signer()))
+            .with_db_path(tmp.path().join("events.sqlite"))
+            .with_bus_root(None);
+        let unsigned = r#"{"schema_version":1,"node":"me","instance":"web","typed_name":"web"}"#;
+        let token = valid_token("instance-delete", "me", "web", unsigned);
+        let body = format!(
+            r#"{{"schema_version":1,"node":"me","instance":"web","typed_name":"web","armed_token":"{token}"}}"#
+        );
+
+        let reply = worker.handle("instance-delete", &body);
+
+        assert!(!reply.ok);
+        assert!(
+            reply
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("without applying"))
+        );
+        assert!(reply.audited, "the rejected destructive outcome is audited");
+        assert_eq!(reconcile::read_desired_slice(tmp.path(), "me").len(), 1);
+        assert_eq!(
+            runner.calls.lock().unwrap().as_slice(),
+            &[("lifecycle-delete".into(), true)]
+        );
+    }
+
+    #[test]
     fn armed_bulk_lifecycle_selects_targets_from_the_workers_live_roster() {
         let runner = Arc::new(FakeRunner {
             roster: vec![

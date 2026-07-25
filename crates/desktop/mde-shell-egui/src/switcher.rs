@@ -514,11 +514,7 @@ fn overlay(
                         screen,
                         selected: idx == state.selected,
                         is_current: surface == current,
-                        preview: snapshots.get(&surface).or_else(|| {
-                            (surface == Surface::Desktop)
-                                .then_some(desktop_preview)
-                                .flatten()
-                        }),
+                        preview: preview_for_surface(surface, snapshots, desktop_preview),
                     },
                     state,
                 ) {
@@ -537,6 +533,24 @@ fn overlay(
         construct.switcher_open = false;
     }
     chosen
+}
+
+/// Select the freshest preview for a switcher card.
+///
+/// A captured Desktop body is retained for the no-frame case, but it must not
+/// outrank a newly decoded VDI frame. The frame is the live session's current
+/// pixels; choosing the retained body first makes the card visibly stale after
+/// a VDI session becomes ready again.
+fn preview_for_surface<'a>(
+    surface: Surface,
+    snapshots: &'a SurfaceSnapshots,
+    desktop_preview: Option<&'a egui::TextureHandle>,
+) -> Option<&'a egui::TextureHandle> {
+    if surface == Surface::Desktop {
+        desktop_preview.or_else(|| snapshots.get(&surface))
+    } else {
+        snapshots.get(&surface)
+    }
 }
 
 /// Everything one card paints from — bundled so [`card`] stays one argument
@@ -1033,6 +1047,35 @@ mod tests {
                 group_accent(Surface::Files).unwrap_or(Style::ACCENT)
             )),
             "an invalid snapshot must fall back to the Files plate: {fills:?}"
+        );
+    }
+
+    #[test]
+    fn the_live_desktop_preview_wins_over_a_retained_body_snapshot() {
+        let ctx = ctx();
+        let retained = ctx.load_texture(
+            "switcher-retained-desktop-body",
+            egui::ColorImage::new([2, 2], egui::Color32::RED),
+            egui::TextureOptions::LINEAR,
+        );
+        let live = ctx.load_texture(
+            "switcher-live-desktop-frame",
+            egui::ColorImage::new([2, 2], egui::Color32::GREEN),
+            egui::TextureOptions::LINEAR,
+        );
+        let mut snapshots = SurfaceSnapshots::default();
+        snapshots.insert(Surface::Desktop, retained.clone());
+
+        let selected = preview_for_surface(Surface::Desktop, &snapshots, Some(&live));
+        assert_eq!(
+            selected.map(egui::TextureHandle::id),
+            Some(live.id()),
+            "a decoded VDI frame must outrank a retained body snapshot"
+        );
+        assert_eq!(
+            preview_for_surface(Surface::Desktop, &snapshots, None).map(egui::TextureHandle::id),
+            Some(retained.id()),
+            "the retained body remains the honest fallback when no VDI frame exists"
         );
     }
 

@@ -1011,6 +1011,69 @@ fn malformed_presence_cannot_impersonate_another_envelope_actor() {
     );
 }
 
+#[test]
+fn replay_does_not_accept_non_owner_cross_actor_membership_grant() {
+    use crate::signer::EventSigner;
+
+    let mut alice = engine("alice");
+    let alice_signer = sig(1);
+    let space = alice
+        .apply(
+            &CollabCommand::CreateSpace {
+                kind: SpaceKind::Team,
+                name: "ops".into(),
+            },
+            &alice_signer,
+            &mut SeqIds::new(1),
+            1000,
+        )
+        .expect("create space")[0]
+        .space_id;
+    alice
+        .apply(
+            &CollabCommand::AddMember {
+                space,
+                actor: ActorId::new("bob"),
+                role: SpaceRole::Member,
+            },
+            &alice_signer,
+            &mut SeqIds::new(100),
+            1100,
+        )
+        .expect("add bob");
+
+    let mut bob = engine("bob");
+    bob.merge(alice.all_events()).expect("bob syncs");
+    let mut forged = CollabEventEnvelope::new(
+        EventId::from_uuid(Uuid::from_u128(44)),
+        space,
+        ActorId::new("bob"),
+        ActorClock::at(1200, 0),
+        1200,
+        CollabEventKind::MemberJoined {
+            actor: ActorId::new("carol"),
+            role: SpaceRole::Owner,
+        },
+    );
+    sig(2).sign(&mut forged);
+
+    let outcome = bob.merge(vec![forged]).expect("signed event is ingested");
+    assert_eq!(outcome.accepted, 1);
+    assert!(!bob.state().is_member(space, &ActorId::new("carol")));
+    let directory = bob
+        .projection()
+        .space_directory(&ActorId::new("bob"))
+        .expect("directory");
+    assert_eq!(directory.spaces[0].members, 2);
+    assert_eq!(
+        bob.state()
+            .space(space)
+            .expect("space")
+            .present_owner_count(),
+        1
+    );
+}
+
 // ---- tombstones -----------------------------------------------------------
 
 #[test]

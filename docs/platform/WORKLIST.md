@@ -251,6 +251,12 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-SEC-006 - Keep Nebula private keys local to their owning node
 
 - Status: Remaining
+- Progress (2026-07-25 Nebula reconnect acknowledgement boundary): a failed
+  `systemctl reload-or-restart` now leaves the rotated bundle unacknowledged,
+  forcing the next supervisor sweep to retry the reconnect rather than losing
+  the update. The deterministic recovery regression and the full supervisor
+  slice are green at **46/46**; live rotation/reconnect/prune evidence remains
+  external.
 - Progress (2026-07-25 identity-root ownership boundary): existing Nebula
   identity roots now require the current owner and mode `0700` before any
   private-key generation or rotation write. The hostile-`0777` regression is
@@ -613,6 +619,12 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-ARCH-007 - Repair Workloads cockpit E2E wire, placement, and authorization
 
 - Status: Remaining
+- Progress (2026-07-25 lifecycle apply contract): authorized lifecycle verbs
+  now fail closed when a backend reports `ok=true` without `applied=true`, and
+  destructive desired-state records are retained instead of being retracted
+  after an unapplied delete. The focused cloud suite is green at **164/164**;
+  the merged BigBoy `mackesd` gate is **4,101 passed, 0 failed, 1 ignored**.
+  Live libvirt/KVM lifecycle evidence remains external.
 - Progress (2026-07-25 live-provision desired-state bridge): authorized
   Workloads `provision` now renders the selected node's strict persisted
   desired slice into fresh tfvars before `tofu apply`, preventing stale or
@@ -926,6 +938,12 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-011 - Communications collaboration suite full replacement
 
 - Status: Remaining
+- Progress (2026-07-25 replay membership-authority boundary): domain and SQLite
+  projection folds now reject a signed `MemberJoined` event that grants a
+  different actor membership unless the envelope author is already an Owner;
+  self-joins remain valid. The focused core suite is green at **58/58** with a
+  dedicated cross-actor replay regression. Live WebRTC/SIP and sealed DO/LLM
+  evidence remain external.
 - Progress (2026-07-25 collab command-lane authorization): the collaboration
   worker now binds each decoded command's verb to its `action/collab/<verb>`
   topic before applying it, blocking cross-lane capability reuse. The focused
@@ -1498,6 +1516,11 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-012 - Maps live-data overlays (zero-cost external feeds)
 
 - Status: Remaining
+- Progress (2026-07-25 future-data boundary): retained IEM radar frames more
+  than five seconds ahead of the consumer clock are withheld from paint and
+  receive an explicit `invalid future timestamp` badge. The focused IEM slice
+  is green at **6/6** and the full Maps suite at **222/222**; live provider and
+  MG90 feed evidence remains external.
 - Progress (2026-07-25 MG90 Status Broadcast readiness): the vehicle adapter
   now exposes typed local receiver readiness and carries malformed, out-of-range,
   or occupied `MDE_VEHICLE_STATUS_PORT` configuration into the vehicle gap
@@ -1816,6 +1839,11 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-006 - Construct interface (Apple-HIG-principled workstation shell)
 
 - Status: Remaining
+- Progress (2026-07-25 switcher freshness boundary): a decoded live Desktop
+  VDI frame now outranks a retained body snapshot in the switcher, while the
+  retained snapshot remains the fallback when no frame exists. The focused
+  switcher suite is green at **22/22**; live VDI reconnect/full-resolution and
+  physical pointer/pixel evidence remain external.
 - Progress (2026-07-25 Dell refresh and release cut): DELL-LAPTOP completed
   Fedora 44 transaction 3 with status `Ok`; the Magic Mesh 12.1.0 package,
   `mackesd`, and the shell are healthy with zero shell restarts, while the
@@ -1823,6 +1851,13 @@ These decisions refine acceptance and sequencing for the active items below.
   also generated and payload-verified the 12.1.0 base, browser, and thin
   lighthouse RPMs; live seat reboot and F44 workstation package-install proof
   remain external.
+- Progress (2026-07-25 live `.15` Browser proof): the installed CEF and Servo
+  engine verifier passed, including CEF link-navigation, with process cleanup
+  passing. The DRM shell is active at `NRestarts=0` in its delegated `shell`
+  cgroup; a live renderer inspection showed `NoNewPrivs=1`, `Seccomp=2`, zero
+  permitted/effective/bounding capabilities, and no access to `/home`, `/root`,
+  `/etc/nebula`, `/etc/mackesd`, `/mnt/mesh-storage`, or host D-Bus sockets.
+  Full-resolution VDI and physical pointer/pixel acceptance remain external.
 - Progress (2026-07-25 replicated control-action boundaries): router
   request/result/audit records and device-control request/result records now
   use bounded descriptor-backed regular-file reads that reject final symlinks,
@@ -2311,6 +2346,13 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-007 - Car interface (CarPlay-principled vehicle mode)
 
 - Status: Remaining
+- Progress (2026-07-25 live mirror provenance recheck): read-only `.15`
+  verification accepted a fresh `state/vehicle/Basement-Test-Workstation`
+  envelope at 5.9 seconds old with `online=true`, MGOS `4.3.0.1`, honest
+  `fix_type=no-fix`, zero satellites, and zero speed. The stricter MG90 model
+  assertion correctly failed because `general.html` reports no model; the
+  retained gaps are `model not reported by general.html` and `OBD not wired
+  (OBD-II source is a follow-up)`. No model or fix was inferred.
 - Progress (2026-07-25 Car navigation narrow-layout regression): the Car Home
   Navigation tile now has a regression proof at the narrowest supported
   touch-safe layout and fails closed one pixel below either dimension instead

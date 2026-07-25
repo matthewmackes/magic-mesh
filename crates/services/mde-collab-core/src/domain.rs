@@ -160,6 +160,14 @@ impl DomainState {
                 }
             }
             CollabEventKind::MemberJoined { actor, role } => {
+                // `JoinSpace` is self-authored, while `AddMember` is owner-
+                // authored.  Keep replay aligned with that command boundary:
+                // a signed event from one actor must not grant membership to a
+                // different actor unless the author was already an Owner at
+                // this canonical point in the log.
+                if actor != &env.actor && !self.is_owner(space_id, &env.actor) {
+                    return;
+                }
                 if let Some(s) = self.spaces.get_mut(&space_id) {
                     s.members.insert(
                         actor.clone(),

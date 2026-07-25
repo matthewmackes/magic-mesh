@@ -75,6 +75,9 @@ pub struct NebulaSupervisor {
     /// Last-known leader state — flipping this triggers the
     /// promote / demote transition.
     last_is_leader: bool,
+    /// Systemd command path. Kept configurable for deterministic supervisor
+    /// tests; production uses the normal PATH lookup for `systemctl`.
+    systemctl_path: PathBuf,
 }
 
 impl NebulaSupervisor {
@@ -109,6 +112,7 @@ impl NebulaSupervisor {
             workgroup_root,
             last_blocklist: Vec::new(),
             leadership_endpoints: crate::substrate::etcd::default_endpoints(),
+            systemctl_path: PathBuf::from("systemctl"),
         }
     }
 
@@ -160,6 +164,14 @@ impl NebulaSupervisor {
     #[must_use]
     pub(crate) fn with_leadership_endpoints(mut self, endpoints: Vec<String>) -> Self {
         self.leadership_endpoints = endpoints;
+        self
+    }
+
+    /// Override the systemctl executable — used by deterministic runtime
+    /// retry tests without requiring a live systemd instance.
+    #[must_use]
+    pub(crate) fn with_systemctl_path(mut self, path: PathBuf) -> Self {
+        self.systemctl_path = path;
         self
     }
 
@@ -266,8 +278,8 @@ impl NebulaSupervisor {
         // c. Start the systemd units. systemctl invocations
         //    are best-effort — we still proceed if systemctl
         //    is unreachable (containerized test envs).
-        let _ = systemctl_start("nebula-lighthouse.service");
-        let _ = systemctl_start("mackes-nebula-https-tunnel.service");
+        let _ = systemctl_start(&self.systemctl_path, "nebula-lighthouse.service");
+        let _ = systemctl_start(&self.systemctl_path, "mackes-nebula-https-tunnel.service");
         Ok(())
     }
 
@@ -276,8 +288,8 @@ impl NebulaSupervisor {
     /// needs its tun device regardless of role.
     fn demote(&self) -> Result<(), String> {
         tracing::info!(node = %self.node_id, "nebula-supervisor: demoting to peer role");
-        let _ = systemctl_stop("mackes-nebula-https-tunnel.service");
-        let _ = systemctl_stop("nebula-lighthouse.service");
+        let _ = systemctl_stop(&self.systemctl_path, "mackes-nebula-https-tunnel.service");
+        let _ = systemctl_stop(&self.systemctl_path, "nebula-lighthouse.service");
         if self.role_marker_path.exists() {
             std::fs::remove_file(&self.role_marker_path).map_err(|e| e.to_string())?;
         }
@@ -340,9 +352,14 @@ impl NebulaSupervisor {
                 "nebula-supervisor: publishing overlay-ip failed",
             );
         }
-        let _ = systemctl_reload("nebula.service");
+        // The on-disk render is not effective until Nebula accepts it.  Keep
+        // the bundle watch unacknowledged when the reload/reconnect fails so
+        // the next sweep retries the same rotated or revoked state.
+        systemctl_reload(&self.systemctl_path, "nebula.service")
+            .map_err(|e| format!("reload nebula.service: {e}"))?;
         if self.last_is_leader {
-            let _ = systemctl_reload("nebula-lighthouse.service");
+            systemctl_reload(&self.systemctl_path, "nebula-lighthouse.service")
+                .map_err(|e| format!("reload nebula-lighthouse.service: {e}"))?;
         }
         Ok(())
     }
@@ -1223,31 +1240,41 @@ pub(crate) fn read_role_marker(path: &Path) -> Option<String> {
 }
 
 /// Lightweight `systemctl <verb> <unit>` invocation. Returns
-/// Ok(()) on success or Err(stderr) on failure. Tolerates
-/// missing systemctl (returns Err so the caller can log +
-/// continue).
-fn systemctl(verb: &str, unit: &str) -> Result<(), String> {
-    let out = std::process::Command::new("systemctl")
+/// Ok(()) on success or Err(stderr) on failure. Missing
+/// systemctl is reported as an error; promotion/demotion may
+/// tolerate it, while config refresh keeps its watch pending
+/// so a later sweep can retry the reconnect.
+fn systemctl(path: &Path, verb: &str, unit: &str) -> Result<(), String> {
+    let out = std::process::Command::new(path)
         .args([verb, unit])
         .output()
-        .map_err(|e| format!("systemctl {verb}: {e}"))?;
+        .map_err(|e| format!("{} {verb} {unit}: {e}", path.display()))?;
     if out.status.success() {
         Ok(())
     } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if stderr.is_empty() {
+            Err(format!(
+                "{} {verb} {unit} exited with {}",
+                path.display(),
+                out.status
+            ))
+        } else {
+            Err(stderr)
+        }
     }
 }
 
-fn systemctl_start(unit: &str) -> Result<(), String> {
-    systemctl("start", unit)
+fn systemctl_start(path: &Path, unit: &str) -> Result<(), String> {
+    systemctl(path, "start", unit)
 }
 
-fn systemctl_stop(unit: &str) -> Result<(), String> {
-    systemctl("stop", unit)
+fn systemctl_stop(path: &Path, unit: &str) -> Result<(), String> {
+    systemctl(path, "stop", unit)
 }
 
-fn systemctl_reload(unit: &str) -> Result<(), String> {
-    systemctl("reload-or-restart", unit)
+fn systemctl_reload(path: &Path, unit: &str) -> Result<(), String> {
+    systemctl(path, "reload-or-restart", unit)
 }
 
 /// Verify both halves of the local leadership contract:
@@ -2011,6 +2038,94 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn fake_systemctl_fails_first_reload(root: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = root.join("systemctl");
+        std::fs::write(
+            &path,
+            br####"#!/bin/sh
+if [ "$1" = "reload-or-restart" ] && [ ! -e "${0}.failed" ]; then
+    touch "${0}.failed"
+    echo "simulated Nebula reconnect failure" >&2
+    exit 1
+fi
+exit 0
+"####,
+        )
+        .expect("write fake systemctl");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("make fake systemctl executable");
+        path
+    }
+
+    #[cfg(unix)]
+    fn fake_systemctl_succeeds(root: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = root.join("systemctl");
+        std::fs::write(&path, b"#!/bin/sh\nexit 0\n").expect("write fake systemctl");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("make fake systemctl executable");
+        path
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_nebula_reload_keeps_bundle_pending_for_reconnect() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let bundle_path = root.join("nebula-bundle.json");
+        let bundle = sample_bundle();
+        crate::ca::bundle::write_bundle(&bundle_path, &bundle).expect("seed bundle");
+
+        // Seed the already-materialized local identity. The supervisor must
+        // not acknowledge the bundle until Nebula has accepted the rendered
+        // config and reconnected; a later bundle change may never be required.
+        let config_dir = root.join("nebula");
+        materialize_config(
+            &config_dir,
+            &bundle,
+            ConfigRole::Peer,
+            &[],
+            root,
+            Some(b"local-key"),
+        )
+        .expect("seed local identity");
+
+        let systemctl_path = fake_systemctl_fails_first_reload(root);
+        let conn = crate::store::open(&root.join("store.sqlite")).expect("open");
+        let mut supervisor = NebulaSupervisor::new(
+            Arc::new(Mutex::new(conn)),
+            "peer:test".into(),
+            "m1".into(),
+            bundle_path,
+        )
+        .with_workgroup_root(root.to_path_buf())
+        .with_role_marker(root.join("role.host"))
+        .with_config_dir(config_dir)
+        .with_overlay_ip_path(root.join("overlay-ip"))
+        .with_leadership_endpoints(Vec::new())
+        .with_systemctl_path(systemctl_path.clone());
+
+        supervisor.tick().await;
+        assert!(
+            supervisor.last_bundle_mtime.is_none(),
+            "a failed Nebula reconnect must leave the bundle pending"
+        );
+
+        supervisor.tick().await;
+        assert!(
+            supervisor.last_bundle_mtime.is_some(),
+            "the unchanged bundle must be acknowledged after reconnect recovery"
+        );
+        assert!(
+            systemctl_path.with_file_name("systemctl.failed").exists(),
+            "the fixture must exercise the failed-reload branch"
+        );
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn failed_refresh_remains_pending_for_a_later_retry() {
         use std::os::unix::fs::symlink;
@@ -2037,7 +2152,8 @@ mod tests {
         .with_role_marker(root.join("role.host"))
         .with_config_dir(config_dir.clone())
         .with_overlay_ip_path(root.join("overlay-ip"))
-        .with_leadership_endpoints(Vec::new());
+        .with_leadership_endpoints(Vec::new())
+        .with_systemctl_path(fake_systemctl_succeeds(root));
 
         supervisor.tick().await;
         assert!(
