@@ -241,6 +241,13 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-SEC-006 - Keep Nebula private keys local to their owning node
 
 - Status: Remaining
+- Progress (2026-07-25 Browser action credential boundary): privileged Browser
+  action credentials and replay-nonce expiry rows now use bounded
+  descriptor-backed regular-file reads that reject final symlinks, special
+  files, oversized or changing input, and invalid UTF-8 before capability
+  decoding or expiry parsing. The integrated `mde-browser-workers --lib`
+  farm gate is green at **123/123**; live Nebula rotation/reconnect evidence
+  remains external.
 - Progress (2026-07-25 SSH public-key gossip materialization boundary): local
   and replicated SSH public-key envelopes plus the managed `authorized_keys`
   read now use bounded no-follow regular-file readers that reject special
@@ -871,6 +878,12 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-011 - Communications collaboration suite full replacement
 
 - Status: Remaining
+- Progress (2026-07-25 media-session roaming boundary): replicated per-seat
+  playback records now use bounded no-follow regular-file reads rejecting
+  special files, final symlinks, oversized or changing input, and invalid
+  UTF-8 before JSON materialization while preserving fail-soft seat folding.
+  The integrated `mde-media-core --lib` farm gate is green at **234/234**;
+  live peer/media/LLM evidence remains external.
 - Progress (2026-07-25 bookmark persistence boundary): replicated bookmark
   snapshots, HLC clocks, and append-only segments now use bounded no-follow
   regular-file reads with UTF-8, special-file, symlink, and growth rejection
@@ -1723,6 +1736,13 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-006 - Construct interface (Apple-HIG-principled workstation shell)
 
 - Status: Remaining
+- Progress (2026-07-25 status-chrome and terminal persistence boundaries):
+  shell mesh-status/node-grade records and terminal tmux state now use bounded
+  no-follow regular-file reads rejecting special files, final symlinks,
+  oversized or changing input, and invalid UTF-8 before projection or state
+  restoration. Integrated farm gates are green at **1,797/1,797**
+  `mde-shell-egui` tests and **394/394** `mde-term-egui` tests; live pointer,
+  pixel, physical, and VDI acceptance remain external evidence.
 - Progress (2026-07-25 desktop-source and Browser persistence boundaries): the
   node-local desktop-source roster plus Browser offline-cache records and CEF
   security manifests now use bounded no-follow regular-file readers that

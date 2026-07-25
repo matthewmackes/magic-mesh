@@ -53,6 +53,11 @@ use crate::playlist::Playlist;
 /// (`<root>/media-sessions/<identity>/<seat>.json`).
 pub const SESSIONS_SUBDIR: &str = "media-sessions";
 
+/// Hard ceiling for one replicated per-seat session record. A session can carry
+/// a queue and a track list, but a hostile replicated row must not become an
+/// unbounded allocation before it is parsed.
+const MAX_SESSION_RECORD_BYTES: usize = 16 * 1024 * 1024;
+
 // ── the synced session record ────────────────────────────────────────────────
 
 /// A snapshot of an operator's playback, bound to their mesh identity and synced
@@ -283,7 +288,7 @@ impl RoamingStore {
             {
                 continue; // an in-flight atomic-write temp file
             }
-            if let Ok(data) = fs::read_to_string(&path) {
+            if let Some(data) = read_bounded_session_record(&path) {
                 if let Ok(rec) = serde_json::from_str::<SessionRecord>(&data) {
                     out.push(rec);
                 }
@@ -325,6 +330,83 @@ impl RoamingStore {
             Err(e) => Err(e),
         }
     }
+}
+
+/// Read one replicated session record through a bounded descriptor.
+///
+/// The final path component is opened without following a symlink and with
+/// non-blocking semantics, so a FIFO or another special file cannot stall a
+/// roaming poll. Descriptor metadata admits only regular files; reading one
+/// byte beyond the cap and comparing the descriptor length before and after
+/// consumption rejects oversized or growing rows. UTF-8 is validated before
+/// the caller materializes JSON.
+fn read_bounded_session_record(path: &Path) -> Option<String> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        options.custom_flags(0o400000 | 0o4000 | 0o2000000); // O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        options.custom_flags(0x100 | 0x4); // O_NOFOLLOW | O_NONBLOCK
+
+        // Unsupported Unix targets still fail closed for a final symlink when
+        // their standard library does not expose O_NOFOLLOW here.
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        if !fs::symlink_metadata(path)
+            .ok()
+            .is_some_and(|metadata| metadata.file_type().is_file())
+        {
+            return None;
+        }
+    }
+    #[cfg(not(unix))]
+    if !fs::symlink_metadata(path)
+        .ok()
+        .is_some_and(|metadata| metadata.file_type().is_file())
+    {
+        return None;
+    }
+
+    let file = options.open(path).ok()?;
+    let before = file.metadata().ok()?;
+    if !before.file_type().is_file() || before.len() > MAX_SESSION_RECORD_BYTES as u64 {
+        return None;
+    }
+    read_bounded_session_record_file(&file, &before)
+}
+
+/// Consume an already-open session-record descriptor and reject metadata
+/// changes observed during the read. Keeping this boundary separate makes the
+/// growth check directly testable without introducing timing-sensitive sleeps.
+fn read_bounded_session_record_file(file: &fs::File, before: &fs::Metadata) -> Option<String> {
+    use std::io::Read as _;
+
+    let capacity = usize::try_from(before.len())
+        .unwrap_or(MAX_SESSION_RECORD_BYTES)
+        .min(MAX_SESSION_RECORD_BYTES)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(capacity);
+    (&*file)
+        .take((MAX_SESSION_RECORD_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let after = file.metadata().ok()?;
+    if !after.file_type().is_file()
+        || after.len() != before.len()
+        || bytes.len() > MAX_SESSION_RECORD_BYTES
+        || bytes.len() as u64 != before.len()
+    {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
 }
 
 /// Reduce an identity / seat id to a safe single path component
@@ -692,6 +774,31 @@ mod tests {
         std::fs::write(&corrupt, "{ not json").expect("write corrupt");
         assert_eq!(store.records("matthew").len(), 2, "corrupt file skipped");
 
+        let invalid_utf8 = dir
+            .path()
+            .join(SESSIONS_SUBDIR)
+            .join("matthew")
+            .join("seat-d.json");
+        std::fs::write(&invalid_utf8, [0xff, 0xfe]).expect("write invalid UTF-8");
+        let oversized = dir
+            .path()
+            .join(SESSIONS_SUBDIR)
+            .join("matthew")
+            .join("seat-e.json");
+        std::fs::write(&oversized, vec![b'x'; MAX_SESSION_RECORD_BYTES + 1])
+            .expect("write oversized record");
+        let non_regular = dir
+            .path()
+            .join(SESSIONS_SUBDIR)
+            .join("matthew")
+            .join("seat-f.json");
+        std::fs::create_dir(&non_regular).expect("create non-regular record");
+        assert_eq!(
+            store.records("matthew").len(),
+            2,
+            "hostile rows are skipped without losing valid seats"
+        );
+
         // Release removes only this seat's file.
         store.release("matthew", "seat-a").expect("release");
         assert_eq!(store.owner_seat("matthew").as_deref(), Some("seat-b"));
@@ -708,6 +815,78 @@ mod tests {
             .expect("no-op publish");
         assert!(store.records("matthew").is_empty());
         assert_eq!(store.owner_seat("matthew"), None);
+    }
+
+    #[test]
+    fn session_record_reader_rejects_invalid_utf8_and_oversized_rows() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        let valid = tmp.path().join("valid.json");
+        std::fs::write(&valid, "{\"ok\":true}").expect("write valid record");
+        assert_eq!(
+            read_bounded_session_record(&valid).as_deref(),
+            Some("{\"ok\":true}")
+        );
+
+        let invalid_utf8 = tmp.path().join("invalid-utf8.json");
+        std::fs::write(&invalid_utf8, [0xff, 0xfe, 0xfd]).expect("write invalid UTF-8");
+        assert!(read_bounded_session_record(&invalid_utf8).is_none());
+
+        let oversized = tmp.path().join("oversized.json");
+        std::fs::write(&oversized, vec![b'x'; MAX_SESSION_RECORD_BYTES + 1])
+            .expect("write oversized record");
+        assert!(read_bounded_session_record(&oversized).is_none());
+
+        let non_regular = tmp.path().join("directory.json");
+        std::fs::create_dir(&non_regular).expect("create directory row");
+        assert!(read_bounded_session_record(&non_regular).is_none());
+    }
+
+    #[test]
+    fn session_record_reader_rejects_a_row_that_grows_after_metadata_snapshot() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("growing.json");
+        std::fs::write(&path, "{}").expect("write initial row");
+
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .expect("open row");
+        let before = file.metadata().expect("read initial metadata");
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open append handle")
+            .set_len(before.len() + 2)
+            .expect("grow row");
+
+        assert!(read_bounded_session_record_file(&file, &before).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_record_reader_rejects_final_symlinks_and_special_files() {
+        use std::os::unix::fs::symlink;
+        use std::process::Command;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let outside = tmp.path().join("outside.json");
+        std::fs::write(&outside, "{\"outside\":true}").expect("write target");
+
+        let symlinked = tmp.path().join("linked.json");
+        symlink(&outside, &symlinked).expect("create symlink");
+        assert!(read_bounded_session_record(&symlinked).is_none());
+
+        let fifo = tmp.path().join("handoff.json");
+        assert!(
+            Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .expect("run mkfifo")
+                .success(),
+            "mkfifo must create the special-file fixture"
+        );
+        assert!(read_bounded_session_record(&fifo).is_none());
     }
 
     #[test]

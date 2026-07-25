@@ -15,7 +15,7 @@
 
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +25,9 @@ use crate::blueprint::Blueprint;
 const TMUX_SUBDIR: &str = "tmux";
 /// The state file name.
 const STATE_FILE: &str = "state.json";
+/// Keep the persisted terminal state bounded before `serde_json` materializes
+/// user-controlled templates and blueprints.
+const MAX_TMUX_STATE_BYTES: usize = 256 * 1024;
 
 /// A saved session template — a user-named "project" that seeds a whole
 /// layout + commands ([`Blueprint`]) when opened.
@@ -98,8 +101,7 @@ impl TmuxStateStore {
         let Some(path) = self.path.as_ref() else {
             return TmuxState::default();
         };
-        fs::read_to_string(path)
-            .ok()
+        read_bounded_state(path)
             .and_then(|raw| serde_json::from_str(&raw).ok())
             .unwrap_or_default()
     }
@@ -126,6 +128,73 @@ impl TmuxStateStore {
         fs::rename(&tmp, path)?;
         Ok(())
     }
+}
+
+/// Read the persisted state through the descriptor that is consumed.
+///
+/// The state file is normally written atomically by [`TmuxStateStore::save`],
+/// but it still crosses a filesystem boundary that can be replaced or made
+/// hostile. Refuse final symlinks, special files, oversized or changing input,
+/// and invalid UTF-8 before handing the body to `serde_json`.
+fn read_bounded_state(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        options.custom_flags(0o400000 | 0o4000); // O_NOFOLLOW | O_NONBLOCK
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        options.custom_flags(0x100 | 0x4); // O_NOFOLLOW | O_NONBLOCK
+
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        if !fs::symlink_metadata(path)
+            .ok()
+            .is_some_and(|metadata| metadata.file_type().is_file())
+        {
+            return None;
+        }
+    }
+    #[cfg(not(unix))]
+    if !fs::symlink_metadata(path)
+        .ok()
+        .is_some_and(|metadata| metadata.file_type().is_file())
+    {
+        return None;
+    }
+
+    let file = options.open(path).ok()?;
+    let before = file.metadata().ok()?;
+    if !before.file_type().is_file() || before.len() > MAX_TMUX_STATE_BYTES as u64 {
+        return None;
+    }
+
+    let capacity = usize::try_from(before.len())
+        .unwrap_or(MAX_TMUX_STATE_BYTES)
+        .min(MAX_TMUX_STATE_BYTES)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(capacity);
+    (&file)
+        .take((MAX_TMUX_STATE_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let after = file.metadata().ok()?;
+    if !after.file_type().is_file()
+        || after.len() != before.len()
+        || bytes.len() > MAX_TMUX_STATE_BYTES
+        || bytes.len() as u64 != before.len()
+    {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
 }
 
 /// Sanitise a name into a tmux session name.
@@ -191,6 +260,46 @@ mod tests {
         fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
         fs::write(&path, "{ not json").expect("write junk");
         assert_eq!(store.load(), TmuxState::default());
+    }
+
+    #[test]
+    fn bounded_state_reader_rejects_hostile_inputs_before_deserializing() {
+        let dir = tempfile::tempdir().expect("state tempdir");
+        let path = dir.path().join("state.json");
+        let store = TmuxStateStore::with_path(Some(path.clone()));
+
+        fs::write(&path, b"{}").expect("write valid state");
+        assert_eq!(read_bounded_state(&path).as_deref(), Some("{}"));
+
+        fs::write(&path, [0xff, 0xfe]).expect("write invalid state");
+        assert!(read_bounded_state(&path).is_none());
+        assert_eq!(store.load(), TmuxState::default());
+
+        fs::write(&path, vec![b'{'; MAX_TMUX_STATE_BYTES + 1]).expect("write oversized state");
+        assert!(read_bounded_state(&path).is_none());
+        assert_eq!(store.load(), TmuxState::default());
+
+        fs::remove_file(&path).expect("remove regular state");
+        fs::create_dir(&path).expect("create non-regular state");
+        assert!(read_bounded_state(&path).is_none());
+        assert_eq!(store.load(), TmuxState::default());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            use std::os::unix::net::UnixListener;
+
+            fs::remove_dir(&path).expect("remove non-regular state");
+            let socket = dir.path().join("state.sock");
+            let _listener = UnixListener::bind(&socket).expect("create socket state");
+            assert!(read_bounded_state(&socket).is_none());
+
+            let target = dir.path().join("outside.json");
+            fs::write(&target, b"{}").expect("write symlink target");
+            symlink(&target, &path).expect("create final symlink");
+            assert!(read_bounded_state(&path).is_none());
+            assert_eq!(store.load(), TmuxState::default());
+        }
     }
 
     #[test]

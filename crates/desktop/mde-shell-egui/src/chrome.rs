@@ -42,6 +42,74 @@ const SNAPSHOT_PATH: &str = "/run/mde/mesh-status.json";
 /// local file scan, so the cadence can stay tight.
 const REFRESH: Duration = Duration::from_secs(5);
 
+/// Both status-chrome inputs are compact JSON projections. Bound materialized
+/// bytes before serde sees a world-readable or replicated file.
+const MAX_CHROME_RECORD_BYTES: usize = 64 * 1024;
+
+/// Read one status-chrome record through the descriptor that will be parsed.
+/// Reject final symlinks, non-regular or blocking files, oversized input,
+/// invalid UTF-8, and size changes while the record is materialized.
+fn read_bounded_chrome_record(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        options.custom_flags(0o400000 | 0o4000); // O_NOFOLLOW | O_NONBLOCK
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        options.custom_flags(0x100 | 0x4); // O_NOFOLLOW | O_NONBLOCK
+
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        if !std::fs::symlink_metadata(path)
+            .ok()
+            .is_some_and(|metadata| metadata.file_type().is_file())
+        {
+            return None;
+        }
+    }
+    #[cfg(not(unix))]
+    if !std::fs::symlink_metadata(path)
+        .ok()
+        .is_some_and(|metadata| metadata.file_type().is_file())
+    {
+        return None;
+    }
+
+    let file = options.open(path).ok()?;
+    let before = file.metadata().ok()?;
+    if !before.file_type().is_file() || before.len() > MAX_CHROME_RECORD_BYTES as u64 {
+        return None;
+    }
+
+    let capacity = usize::try_from(before.len())
+        .unwrap_or(MAX_CHROME_RECORD_BYTES)
+        .min(MAX_CHROME_RECORD_BYTES)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(capacity);
+    (&file)
+        .take((MAX_CHROME_RECORD_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let after = file.metadata().ok()?;
+    if !after.file_type().is_file()
+        || after.len() != before.len()
+        || bytes.len() > MAX_CHROME_RECORD_BYTES
+        || bytes.len() as u64 != before.len()
+    {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
 // ──────────────────────────── projected view ────────────────────────────
 
 /// The shell's live mesh summary, folded from the mesh-status snapshot — the
@@ -250,7 +318,7 @@ fn read_grades(dir: &Path, local_host: &str) -> NodeGrades {
             {
                 continue;
             }
-            if let Ok(body) = std::fs::read_to_string(&path) {
+            if let Some(body) = read_bounded_chrome_record(&path) {
                 if let Ok(raw) = serde_json::from_str::<RawGrade>(&body) {
                     raws.push(raw);
                 }
@@ -318,7 +386,7 @@ impl ChromeState {
         let due = self.last_poll.is_none_or(|t| t.elapsed() >= REFRESH);
         if due {
             self.last_poll = Some(Instant::now());
-            let snapshot = std::fs::read_to_string(&self.snapshot_path).unwrap_or_default();
+            let snapshot = read_bounded_chrome_record(&self.snapshot_path).unwrap_or_default();
             self.summary = MeshSummary::from_snapshot(&snapshot);
             // The NODE-GRADE-2 grade fold rides the SAME status poll (no second
             // reader / cadence) — a cheap local scan of the replicated grade dir.
@@ -416,6 +484,43 @@ mod tests {
         assert!(!c.summary().seen);
         assert!(!c.grades().seen, "grades unseen before the first poll");
         assert!(c.last_poll.is_none());
+    }
+
+    #[test]
+    fn chrome_record_reader_rejects_hostile_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("record.json");
+        std::fs::write(&path, "{}\n").unwrap();
+        assert_eq!(read_bounded_chrome_record(&path).as_deref(), Some("{}\n"));
+
+        std::fs::write(&path, [0xff, 0xfe]).unwrap();
+        assert!(read_bounded_chrome_record(&path).is_none());
+
+        std::fs::write(&path, vec![b'x'; MAX_CHROME_RECORD_BYTES + 1]).unwrap();
+        assert!(read_bounded_chrome_record(&path).is_none());
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(read_bounded_chrome_record(&path).is_none());
+
+        #[cfg(unix)]
+        {
+            std::fs::remove_dir(&path).unwrap();
+            let target = dir.path().join("target.json");
+            std::fs::write(&target, "{}\n").unwrap();
+            std::os::unix::fs::symlink(&target, &path).unwrap();
+            assert!(read_bounded_chrome_record(&path).is_none());
+
+            std::fs::remove_file(&path).unwrap();
+            let fifo = dir.path().join("record.fifo");
+            if std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .is_ok_and(|status| status.success())
+            {
+                assert!(read_bounded_chrome_record(&fifo).is_none());
+            }
+        }
     }
 
     // ── NODE-GRADE-2: the grade fold (sort / pin / staleness) ─────────────────
