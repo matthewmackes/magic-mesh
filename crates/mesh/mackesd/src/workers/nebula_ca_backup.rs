@@ -67,6 +67,12 @@ pub const BACKUP_FILENAME: &str = "state-backup.enc";
 /// the old path during the upgrade window.
 pub const LEGACY_BACKUP_FILENAME: &str = "ca-backup.enc";
 
+/// A backup passphrase is a small text credential. Keep the credential
+/// boundary substantially below the shared sealed-file ceiling so a corrupt
+/// or hostile systemd-credential replacement cannot become a large String
+/// before the fallback path is considered.
+const MAX_BACKUP_PASSPHRASE_BYTES: usize = 64 * 1024;
+
 /// Worker handle. Cheap to construct.
 pub struct NebulaCaBackup {
     workgroup_root: PathBuf,
@@ -159,6 +165,25 @@ pub fn backup_path_for(workgroup_root: &Path, node_id: &str) -> PathBuf {
         .join(BACKUP_FILENAME)
 }
 
+/// Read the systemd credential as a small, UTF-8 text value.
+///
+/// `ca::seal::read_no_follow` opens and consumes the descriptor with the
+/// shared bounded/no-follow policy. The metadata check here rejects every
+/// visible final symlink before that helper is invoked as well: credential
+/// paths are not the trusted generation-link shape used by CA key pairs.
+fn read_passphrase_credential(path: &Path) -> Option<String> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return None;
+    }
+    let bytes = crate::ca::seal::read_no_follow(path).ok()?;
+    if bytes.len() > MAX_BACKUP_PASSPHRASE_BYTES {
+        return None;
+    }
+    let phrase = std::str::from_utf8(&bytes).ok()?.trim();
+    (!phrase.is_empty()).then(|| phrase.to_owned())
+}
+
 #[async_trait::async_trait]
 impl Worker for NebulaCaBackup {
     fn name(&self) -> &'static str {
@@ -203,11 +228,8 @@ impl NebulaCaBackup {
         }
         if let Some(dir) = std::env::var_os("CREDENTIALS_DIRECTORY") {
             let path = std::path::Path::new(&dir).join("backup-passphrase");
-            if let Ok(p) = std::fs::read_to_string(&path) {
-                let p = p.trim().to_string();
-                if !p.is_empty() {
-                    return p;
-                }
+            if let Some(p) = read_passphrase_credential(&path) {
+                return p;
             }
         }
         std::env::var(&self.passphrase_env)
@@ -369,6 +391,8 @@ impl std::fmt::Display for BackupTickError {
 mod ent11_tests {
     use super::*;
 
+    static CREDENTIALS_DIRECTORY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn worker(env_var: &str) -> NebulaCaBackup {
         NebulaCaBackup::new(
             std::path::PathBuf::from("/tmp/ent11-root"),
@@ -383,6 +407,7 @@ mod ent11_tests {
 
     #[test]
     fn credentials_directory_beats_the_env_var() {
+        let _guard = CREDENTIALS_DIRECTORY_LOCK.lock().unwrap();
         // ENT-11 — the systemd-creds file is preferred; the env var
         // (visible in systemctl show / /proc) is only a fallback.
         let tmp = tempfile::tempdir().unwrap();
@@ -397,6 +422,60 @@ mod ent11_tests {
         assert_eq!(w.read_passphrase(), "from-env");
         std::env::remove_var(env_name);
         assert_eq!(w.read_passphrase(), "");
+    }
+
+    #[test]
+    fn oversized_credentials_fall_back_without_materializing_a_passphrase() {
+        let _guard = CREDENTIALS_DIRECTORY_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("backup-passphrase"),
+            vec![b'x'; MAX_BACKUP_PASSPHRASE_BYTES + 1],
+        )
+        .unwrap();
+        let env_name = "ENT11_TEST_PASS_OVERSIZED";
+        std::env::set_var("CREDENTIALS_DIRECTORY", tmp.path());
+        std::env::set_var(env_name, "from-env");
+
+        assert_eq!(worker(env_name).read_passphrase(), "from-env");
+
+        std::env::remove_var("CREDENTIALS_DIRECTORY");
+        std::env::remove_var(env_name);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_symlink_credentials_fall_back_without_following_the_target() {
+        let _guard = CREDENTIALS_DIRECTORY_LOCK.lock().unwrap();
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target-passphrase");
+        std::fs::write(&target, "from-target").unwrap();
+        symlink(&target, tmp.path().join("backup-passphrase")).unwrap();
+        let env_name = "ENT11_TEST_PASS_SYMLINK";
+        std::env::set_var("CREDENTIALS_DIRECTORY", tmp.path());
+        std::env::set_var(env_name, "from-env");
+
+        assert_eq!(worker(env_name).read_passphrase(), "from-env");
+
+        std::env::remove_var("CREDENTIALS_DIRECTORY");
+        std::env::remove_var(env_name);
+    }
+
+    #[test]
+    fn non_regular_credentials_fall_back_without_reading_a_directory() {
+        let _guard = CREDENTIALS_DIRECTORY_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("backup-passphrase")).unwrap();
+        let env_name = "ENT11_TEST_PASS_DIRECTORY";
+        std::env::set_var("CREDENTIALS_DIRECTORY", tmp.path());
+        std::env::set_var(env_name, "from-env");
+
+        assert_eq!(worker(env_name).read_passphrase(), "from-env");
+
+        std::env::remove_var("CREDENTIALS_DIRECTORY");
+        std::env::remove_var(env_name);
     }
 }
 
@@ -525,7 +604,10 @@ mod tests {
         let bp = w.backup_path();
         assert!(bp.exists(), "expected bundle at {}", bp.display());
         // Decodes back through dearmor + unseal.
-        let armored = std::fs::read_to_string(&bp).unwrap();
+        let armored = String::from_utf8(
+            crate::ca::seal::read_no_follow(&bp).expect("bounded backup-file read"),
+        )
+        .expect("armored backup is UTF-8");
         assert!(armored.contains("-----BEGIN MACKES NEBULA CA EXPORT-----"));
         let sealed = crate::ca::backup::dearmor(&armored).expect("dearmor");
         let plain = crate::ca::backup::unseal("test-passphrase", &sealed).expect("unseal");

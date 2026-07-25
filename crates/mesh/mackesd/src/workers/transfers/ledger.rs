@@ -14,6 +14,11 @@ use std::path::{Path, PathBuf};
 
 use super::job::TransferJob;
 
+/// Transfer records are small JSON envelopes. Keep hostile or corrupt files
+/// bounded before `serde_json` materializes their strings, while leaving room
+/// for long paths and honest failure details.
+const MAX_LEDGER_RECORD_BYTES: usize = 1024 * 1024;
+
 /// The on-disk ledger — one directory of `<id>.json` records.
 #[derive(Debug, Clone)]
 pub struct Ledger {
@@ -57,7 +62,7 @@ impl Ledger {
     /// Read one job by id (`None` when absent or unparseable).
     #[must_use]
     pub fn get(&self, id: &str) -> Option<TransferJob> {
-        let data = std::fs::read_to_string(self.path(id)).ok()?;
+        let data = read_record(&self.path(id)).ok()?;
         serde_json::from_str(&data).ok()
     }
 
@@ -94,7 +99,7 @@ impl Ledger {
             {
                 continue;
             }
-            if let Ok(data) = std::fs::read_to_string(&path) {
+            if let Ok(data) = read_record(&path) {
                 if let Ok(job) = serde_json::from_str::<TransferJob>(&data) {
                     out.push(job);
                 }
@@ -107,6 +112,64 @@ impl Ledger {
         });
         out
     }
+}
+
+/// Read a ledger record through a descriptor that refuses a final symlink and
+/// a blocking special file. The descriptor metadata and byte ceiling are
+/// checked before the contents reach `serde_json`; the second bounded read
+/// check also catches a regular file that grows after it was opened.
+fn read_record(path: &Path) -> io::Result<String> {
+    use std::io::Read as _;
+
+    #[cfg(unix)]
+    let file = {
+        use rustix::fs::{Mode, OFlags};
+
+        let fd = rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(io::Error::from)?;
+        std::fs::File::from(fd)
+    };
+
+    #[cfg(not(unix))]
+    let file = {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "ledger record is a final symlink",
+            ));
+        }
+        std::fs::File::open(path)?
+    };
+
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ledger record is not a regular file",
+        ));
+    }
+    if metadata.len() > MAX_LEDGER_RECORD_BYTES as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "ledger record exceeds the byte limit",
+        ));
+    }
+
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take((MAX_LEDGER_RECORD_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_LEDGER_RECORD_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "ledger record exceeds the byte limit",
+        ));
+    }
+    String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 #[cfg(test)]
@@ -149,6 +212,44 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].source, "/b", "earlier created_ms sorts first");
         assert_eq!(all[1].source, "/a");
+    }
+
+    #[test]
+    fn oversized_records_are_skipped_before_json_parsing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = Ledger::open(tmp.path()).unwrap();
+        let path = ledger.path("oversized");
+        std::fs::write(&path, vec![b'x'; MAX_LEDGER_RECORD_BYTES + 1]).unwrap();
+
+        assert!(ledger.get("oversized").is_none());
+        assert!(ledger.load_all().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_symlink_records_are_skipped_without_following_them() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = Ledger::open(tmp.path()).unwrap();
+        let target_job = job("/target");
+        ledger.upsert(&target_job).unwrap();
+        symlink(ledger.path(&target_job.id), ledger.path("linked")).unwrap();
+
+        assert!(ledger.get("linked").is_none());
+        let all = ledger.load_all();
+        assert_eq!(all, vec![target_job]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_regular_records_are_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = Ledger::open(tmp.path()).unwrap();
+        std::fs::create_dir(ledger.path("directory")).unwrap();
+
+        assert!(ledger.get("directory").is_none());
+        assert!(ledger.load_all().is_empty());
     }
 
     #[test]

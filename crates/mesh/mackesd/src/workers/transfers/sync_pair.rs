@@ -7,7 +7,7 @@
 
 #![cfg(feature = "async-services")]
 
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -104,6 +104,69 @@ fn default_enabled() -> bool {
     true
 }
 
+/// Keep a corrupt or hostile sync-pair record from becoming an unbounded JSON
+/// allocation. The record schema is small; this leaves ample room for legacy
+/// paths and policy fields while still making the persistence boundary finite.
+const MAX_SYNC_PAIR_RECORD_BYTES: usize = 256 * 1024;
+
+/// Read one sync-pair record from the descriptor that will actually be used.
+/// Unix opens refuse a final symlink and a nonblocking descriptor prevents a
+/// FIFO or other special file from stalling the scheduler. The metadata check
+/// and bounded sentinel read then apply to that same inode.
+fn read_record(path: &Path) -> io::Result<Vec<u8>> {
+    #[cfg(unix)]
+    let file: std::fs::File = {
+        use rustix::fs::{Mode, OFlags};
+
+        rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?
+        .into()
+    };
+    #[cfg(not(unix))]
+    let file = {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "sync-pair record must not be a symlink",
+            ));
+        }
+        std::fs::File::open(path)?
+    };
+
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "sync-pair record is not a regular file",
+        ));
+    }
+    let limit = MAX_SYNC_PAIR_RECORD_BYTES as u64;
+    if metadata.len() > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("sync-pair record exceeds {MAX_SYNC_PAIR_RECORD_BYTES}-byte limit"),
+        ));
+    }
+
+    let capacity = usize::try_from(metadata.len())
+        .unwrap_or(MAX_SYNC_PAIR_RECORD_BYTES)
+        .saturating_add(1)
+        .min(MAX_SYNC_PAIR_RECORD_BYTES.saturating_add(1));
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_SYNC_PAIR_RECORD_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("sync-pair record exceeds {MAX_SYNC_PAIR_RECORD_BYTES}-byte limit"),
+        ));
+    }
+    Ok(bytes)
+}
+
 /// One-directory persistent store for sync pair records.
 #[derive(Debug, Clone)]
 pub struct SyncPairStore {
@@ -155,8 +218,8 @@ impl SyncPairStore {
         if validate_id(id).is_err() {
             return None;
         }
-        let data = std::fs::read_to_string(self.path(id)).ok()?;
-        serde_json::from_str(&data).ok()
+        let data = read_record(&self.path(id)).ok()?;
+        serde_json::from_slice(&data).ok()
     }
 
     /// Load all parseable pairs, sorted by id for deterministic scheduling/tests.
@@ -178,8 +241,8 @@ impl SyncPairStore {
             {
                 continue;
             }
-            if let Ok(data) = std::fs::read_to_string(&path) {
-                if let Ok(pair) = serde_json::from_str::<SyncPair>(&data) {
+            if let Ok(data) = read_record(&path) {
+                if let Ok(pair) = serde_json::from_slice::<SyncPair>(&data) {
                     out.push(pair);
                 }
             }
@@ -305,5 +368,55 @@ mod tests {
             ))
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn oversized_records_are_skipped_before_json_materialization() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SyncPairStore::open(tmp.path()).unwrap();
+        let pair = SyncPair::new(
+            "oversized",
+            "/source",
+            "/dest",
+            1,
+            TransferPolicy::default(),
+        );
+        let mut body = serde_json::to_vec(&pair).unwrap();
+        assert!(body.len() < MAX_SYNC_PAIR_RECORD_BYTES);
+        body.resize(MAX_SYNC_PAIR_RECORD_BYTES + 1, b' ');
+        std::fs::write(store.path("oversized"), body).unwrap();
+
+        assert!(store.get("oversized").is_none());
+        assert!(store.load_all().is_empty());
+    }
+
+    #[test]
+    fn non_regular_records_are_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SyncPairStore::open(tmp.path()).unwrap();
+        std::fs::create_dir(store.path("directory")).unwrap();
+
+        assert!(store.get("directory").is_none());
+        assert!(store.load_all().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_symlink_records_are_skipped_without_reading_target() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SyncPairStore::open(tmp.path()).unwrap();
+        let target = tmp.path().join("outside.json");
+        let record = store.path("linked");
+        std::fs::write(&target, br#"{"id":"linked"}"#).unwrap();
+        symlink(&target, &record).unwrap();
+
+        assert!(store.get("linked").is_none());
+        assert!(store.load_all().is_empty());
+        assert_eq!(
+            std::fs::read_to_string(target).unwrap(),
+            r#"{"id":"linked"}"#
+        );
     }
 }

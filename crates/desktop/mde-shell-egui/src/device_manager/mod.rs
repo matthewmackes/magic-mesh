@@ -177,6 +177,68 @@ use crate::toast_bridge::TOAST_TOPIC;
 /// immediate re-read regardless of this gate.
 const REFRESH: Duration = Duration::from_secs(30);
 const DEVMGR_TOOLTIP_MAX_W: f32 = Style::SP_XL * 12.0;
+/// Replicated phone/router mirrors are compact JSON records. Keep a corrupt or
+/// hostile leaf bounded before serde materializes it, while leaving ample room
+/// for a real fleet roster.
+const MAX_REPLICATED_DEVICE_MIRROR_BYTES: usize = 256 * 1024;
+
+/// Read a replicated Device Manager JSON leaf without following its final
+/// symlink, accepting only regular files, and never allocating beyond the
+/// mirror bound. Callers intentionally fold every error to their existing
+/// fail-soft empty-source behavior.
+fn read_bounded_replicated_mirror(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        options.custom_flags(0o400000); // O_NOFOLLOW
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        options.custom_flags(0x100); // O_NOFOLLOW
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        if !std::fs::symlink_metadata(path)
+            .map(|metadata| metadata.file_type().is_file())
+            .unwrap_or(false)
+        {
+            return None;
+        }
+    }
+    #[cfg(not(unix))]
+    if !std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_file())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+
+    let file = options.open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_REPLICATED_DEVICE_MIRROR_BYTES as u64
+    {
+        return None;
+    }
+
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len())
+            .unwrap_or(MAX_REPLICATED_DEVICE_MIRROR_BYTES)
+            .saturating_add(1),
+    );
+    file.take((MAX_REPLICATED_DEVICE_MIRROR_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > MAX_REPLICATED_DEVICE_MIRROR_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
 
 fn devmgr_tooltip(ui: &mut egui::Ui, text: &str) {
     egui::Frame::NONE
@@ -889,7 +951,7 @@ fn read_phones(workgroup_root: &Path) -> Vec<(PhoneMirror, String)> {
         else {
             continue;
         };
-        let Ok(data) = std::fs::read_to_string(&path) else {
+        let Some(data) = read_bounded_replicated_mirror(&path) else {
             continue;
         };
         let devices = serde_json::from_str::<PhoneRosterMirror>(&data)
@@ -947,7 +1009,7 @@ fn read_routers(workgroup_root: &Path) -> Vec<RouterMirror> {
     };
     for entry in entries.flatten() {
         let path = entry.path().join("router-registry.json");
-        let Ok(data) = std::fs::read_to_string(&path) else {
+        let Some(data) = read_bounded_replicated_mirror(&path) else {
             continue;
         };
         let Ok(router) = serde_json::from_str::<RouterMirror>(&data) else {

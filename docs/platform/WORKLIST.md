@@ -16,7 +16,7 @@ review ledgers, and operator queues are evidence sources, not parallel trackers.
 When an item is completed or retired, move it to the archive with a disposition
 instead of leaving closed work in this file.
 
-## Current Snapshot - 2026-07-24 security closure
+## Current Snapshot - 2026-07-25 security closure
 
 - **6 active epics:** 6 `Remaining`, 0 `Blocked`; no `Needs clarification`.
 - **P0:** WL-SEC-006 (stop replicating Nebula private keys), WL-ARCH-007
@@ -241,6 +241,13 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-SEC-006 - Keep Nebula private keys local to their owning node
 
 - Status: Remaining
+- Progress (2026-07-25 CA-backup credential boundary): Nebula CA backup
+  passphrases and backup-armor verification now use bounded regular-file reads
+  that reject final symlinks and non-regular credential leaves before fallback
+  or dearmor materialization. The focused CA-backup farm gate is green at
+  **12/12**, and the integrated BigBoy `mackesd --lib
+  --features async-services` gate is green at **4,045 passed, 0 failed, 1
+  ignored**. Live Nebula rotation/reconnect evidence remains external.
 - Progress (2026-07-25 certificate and revocation handoff boundaries): active
   Nebula certificate comparisons, replicated blocklist records, CA mint output,
   and generated peer-key handoffs now use bounded regular-file readers that
@@ -501,6 +508,13 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-ARCH-007 - Repair Workloads cockpit E2E wire, placement, and authorization
 
 - Status: Remaining
+- Progress (2026-07-25 VM key and IP-mirror boundary): compute provisioning now
+  reads generated Nebula key material and local `.nebula-ip` mirrors through
+  bounded descriptor-backed regular-file readers that reject final symlinks,
+  non-regular leaves, oversized content, and invalid UTF-8. The focused BigBoy
+  compute-provision gate is green at **39/39**; the integrated BigBoy
+  `mackesd --lib --features async-services` gate is green at **4,045 passed,
+  0 failed, 1 ignored**. Live libvirt/Podman evidence remains external.
 - Progress (2026-07-25 cloud-arm credential boundary): the root Workloads
   shell plus daemon ActionAuthorizer, cloud gate, KDC-host, and remediation CLI
   now load the systemd cloud-arm credential through descriptor-backed,
@@ -740,6 +754,13 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-011 - Communications collaboration suite full replacement
 
 - Status: Remaining
+- Progress (2026-07-25 transfer-ledger boundary): transfer ledger and recurring
+  sync-pair records now use bounded descriptor-backed regular-file reads with
+  final-symlink rejection before JSON parsing, preserving deterministic
+  fail-soft loading. Focused farm gates are green at **6/6 ledger tests** and
+  **6/6 sync-pair tests**; the integrated BigBoy `mackesd --lib
+  --features async-services` gate is green at **4,045 passed, 0 failed, 1
+  ignored**. Live peer/media evidence remains external.
 - Progress (2026-07-25 persisted Communications boundary): message logs,
   notification preferences, room registries, and presence gossip now load
   through bounded regular-file readers with Unix final-symlink rejection while
@@ -1555,6 +1576,13 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-006 - Construct interface (Apple-HIG-principled workstation shell)
 
 - Status: Remaining
+- Progress (2026-07-25 Device Manager mirror boundary): phone rosters and
+  router-registry mirrors now use bounded descriptor-backed regular-file reads
+  that reject final symlinks, non-regular leaves, oversized content, and
+  invalid UTF-8 before serde materialization while preserving fail-soft empty
+  sources. The focused farm Device Manager gate is green at **80/80**, and the
+  integrated shell package gate is green at **1,780/1,780**; live pointer,
+  pixel, physical, and VDI acceptance remain external evidence.
 - Progress (2026-07-25 shell persisted-state boundary): the Springboard Dock
   preference, Network and Provisioning mesh snapshots, System settings and mesh
   status, and replicated Phones Hub service mirrors now pass through bounded

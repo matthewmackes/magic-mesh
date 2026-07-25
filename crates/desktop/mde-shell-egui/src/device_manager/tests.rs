@@ -2,10 +2,11 @@ use super::{
     apply_devmgr_popup_style, build_connection_tree, build_node_tree, build_rail, cpu_line,
     derive_bus, device_a11y_label, device_a11y_value, device_armed, device_status_display,
     device_target, devmgr_tooltip, export_dir, format_mem_kb, header_lines, host_a11y_value,
-    host_dot_tone, host_hover, humanize_ago, humanize_uptime, now_ms, problem_code,
-    render_device_details, render_json, render_report, sanitize, scanned_label, status_tone,
-    write_export, DeviceAction, DeviceArming, DeviceManagerState, DeviceSelection, DrawerTab,
-    HostEntry, HostFreshness, MenuAction, RouterEditDraft, RowActionRequest, ViewMode, STALE_AFTER,
+    host_dot_tone, host_hover, humanize_ago, humanize_uptime, now_ms, problem_code, read_phones,
+    read_routers, render_device_details, render_json, render_report, sanitize, scanned_label,
+    status_tone, write_export, DeviceAction, DeviceArming, DeviceManagerState, DeviceSelection,
+    DrawerTab, HostEntry, HostFreshness, MenuAction, RouterEditDraft, RowActionRequest, ViewMode,
+    MAX_REPLICATED_DEVICE_MIRROR_BYTES, STALE_AFTER,
 };
 use mackes_mesh_types::device_control::{DeviceControlOp, DeviceTarget};
 use mackes_mesh_types::device_inventory::{
@@ -2278,6 +2279,70 @@ fn refresh_folds_every_non_pc_source_and_selecting_one_loads_its_tree() {
         drive(&mut s) > 0,
         "the vehicle-gateway tree renders headless"
     );
+}
+
+#[test]
+fn replicated_phone_and_router_mirrors_skip_oversized_leaves() {
+    let scratch = ScratchRoot::new("mirror-bounds");
+    let phones = scratch.path().join("kdc-phones");
+    std::fs::create_dir_all(&phones).unwrap();
+    std::fs::write(
+        phones.join("oversized.json"),
+        vec![b'x'; MAX_REPLICATED_DEVICE_MIRROR_BYTES + 1],
+    )
+    .unwrap();
+    assert!(read_phones(scratch.path()).is_empty());
+
+    let router = scratch.path().join("eagle");
+    std::fs::create_dir_all(&router).unwrap();
+    std::fs::write(
+        router.join("router-registry.json"),
+        vec![b'x'; MAX_REPLICATED_DEVICE_MIRROR_BYTES + 1],
+    )
+    .unwrap();
+    assert!(read_routers(scratch.path()).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn replicated_phone_and_router_mirrors_reject_final_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let scratch = ScratchRoot::new("mirror-symlink");
+    let phone_target = scratch.path().join("phone-target.json");
+    std::fs::write(
+        &phone_target,
+        serde_json::json!({
+            "devices": [{"device_id": "phone-1", "device_name": "Phone"}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let phones = scratch.path().join("kdc-phones");
+    std::fs::create_dir_all(&phones).unwrap();
+    symlink(&phone_target, phones.join("linked.json")).unwrap();
+    assert!(read_phones(scratch.path()).is_empty());
+
+    let router_target = scratch.path().join("router-target.json");
+    std::fs::write(
+        &router_target,
+        serde_json::json!({
+            "id": "aa:bb:cc:dd:ee:ff",
+            "ip": "172.20.0.1",
+            "node_id": "peer:eagle",
+            "vendor": "vyos",
+            "version": "VyOS",
+            "managed": false,
+            "needs_creds": true,
+            "is_default": false,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let router = scratch.path().join("eagle");
+    std::fs::create_dir_all(&router).unwrap();
+    symlink(&router_target, router.join("router-registry.json")).unwrap();
+    assert!(read_routers(scratch.path()).is_empty());
 }
 
 #[test]

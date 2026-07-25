@@ -114,6 +114,14 @@ pub const MESHFS_VIRTIOFS_TAG: &str = "mesh-storage";
 /// Default Nebula group every VM cert carries.
 pub const DEFAULT_NEBULA_GROUP: &str = "mde-vms";
 
+/// Generated Nebula key material is tiny PEM text. Keep the local handoff
+/// bounded before it can be copied into a cert request or cloud-init seed.
+const MAX_VM_KEY_MATERIAL_BYTES: usize = 64 * 1024;
+
+/// A VM IP sidecar contains one bare address, optionally followed by a
+/// newline. A small ceiling makes a corrupt or hostile mirror fail closed.
+const MAX_VM_IP_MIRROR_BYTES: usize = 128;
+
 /// Cert-sign RPC timeout (design doc §3 / VIRT-5 bullet 4).
 pub const CERT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -513,7 +521,7 @@ pub fn scan_local_vm_ips(vm_storage: &Path) -> Vec<String> {
             .and_then(|s| s.to_str())
             .is_some_and(|n| n.ends_with(".nebula-ip"))
         {
-            if let Ok(s) = std::fs::read_to_string(&path) {
+            if let Ok(s) = read_bounded_text(&path, MAX_VM_IP_MIRROR_BYTES, "VM IP mirror") {
                 let trimmed = s.trim();
                 if !trimmed.is_empty() {
                     ips.push(trimmed.to_string());
@@ -522,6 +530,70 @@ pub fn scan_local_vm_ips(vm_storage: &Path) -> Vec<String> {
         }
     }
     ips
+}
+
+/// Read local VM material from the descriptor that will actually be
+/// consumed. The final component is opened without following symlinks and
+/// nonblocking, then checked as a regular file before a bounded read. The
+/// extra sentinel byte detects growth after the metadata check without
+/// allowing unbounded allocation.
+fn read_bounded_text(path: &Path, max_bytes: usize, label: &str) -> std::io::Result<String> {
+    use std::io::{Error, ErrorKind, Read as _};
+
+    #[cfg(unix)]
+    let file: std::fs::File = {
+        use rustix::fs::{Mode, OFlags};
+
+        rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?
+        .into()
+    };
+    #[cfg(not(unix))]
+    let file = {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_file() {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!("{label} is not a regular file"),
+            ));
+        }
+        std::fs::File::open(path)?
+    };
+
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("{label} is not a regular file"),
+        ));
+    }
+
+    let max_bytes_u64 = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+    if metadata.len() > max_bytes_u64 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("{label} exceeds its {max_bytes}-byte limit"),
+        ));
+    }
+
+    let capacity = usize::try_from(metadata.len())
+        .unwrap_or(max_bytes)
+        .min(max_bytes)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(max_bytes_u64.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("{label} exceeds its {max_bytes}-byte limit"),
+        ));
+    }
+
+    String::from_utf8(bytes).map_err(|error| Error::new(ErrorKind::InvalidData, error))
 }
 
 /// Synchronously wait for a reply on `reply/<request_ulid>`. Mirrors
@@ -682,9 +754,10 @@ fn provision(ctx: &ProvisionCtx, persist: &Persist, req: &CreateRequest) -> Resu
         let _ = std::fs::remove_dir_all(&tmp_dir);
         return Err("nebula-cert keygen failed".into());
     }
-    let host_key_pem = std::fs::read_to_string(&key_path).map_err(|e| format!("read key: {e}"))?;
-    let public_key_pem =
-        std::fs::read_to_string(&pub_path).map_err(|e| format!("read pub: {e}"))?;
+    let host_key_pem = read_bounded_text(&key_path, MAX_VM_KEY_MATERIAL_BYTES, "VM private key")
+        .map_err(|e| format!("read key: {e}"))?;
+    let public_key_pem = read_bounded_text(&pub_path, MAX_VM_KEY_MATERIAL_BYTES, "VM public key")
+        .map_err(|e| format!("read pub: {e}"))?;
 
     // 4. Cert RPC — request, await reply (one retry).
     let (cert_pem, ca_pem) =
@@ -1505,6 +1578,69 @@ mod tests {
     #[test]
     fn scan_local_vm_ips_empty_dir() {
         let tmp = tempfile::tempdir().unwrap();
+        assert!(scan_local_vm_ips(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn generated_vm_material_reader_rejects_oversized_input() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("host.key");
+        std::fs::write(
+            &path,
+            vec![b'x'; MAX_VM_KEY_MATERIAL_BYTES.saturating_add(1)],
+        )
+        .unwrap();
+
+        let error = read_bounded_text(&path, MAX_VM_KEY_MATERIAL_BYTES, "VM key")
+            .expect_err("oversized key material must fail closed");
+        assert!(error.to_string().contains("exceeds"));
+    }
+
+    #[test]
+    fn scan_local_vm_ips_ignores_oversized_and_non_regular_mirrors() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("oversized.nebula-ip"),
+            vec![b'9'; MAX_VM_IP_MIRROR_BYTES.saturating_add(1)],
+        )
+        .unwrap();
+        std::fs::create_dir(tmp.path().join("directory.nebula-ip")).unwrap();
+        std::fs::write(tmp.path().join("valid.nebula-ip"), "10.42.129.9\n").unwrap();
+
+        assert_eq!(
+            scan_local_vm_ips(tmp.path()),
+            vec!["10.42.129.9".to_string()]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_vm_material_reader_rejects_final_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("outside.key");
+        let link = tmp.path().join("host.key");
+        std::fs::write(&target, "private-key").unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(
+            read_bounded_text(&link, MAX_VM_KEY_MATERIAL_BYTES, "VM key").is_err(),
+            "generated key reads must not follow a replaced final symlink"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_local_vm_ips_ignores_final_symlink_mirrors() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("outside.txt");
+        let link = tmp.path().join("vm.nebula-ip");
+        std::fs::write(&target, "10.42.129.99").unwrap();
+        symlink(&target, &link).unwrap();
+
         assert!(scan_local_vm_ips(tmp.path()).is_empty());
     }
 
