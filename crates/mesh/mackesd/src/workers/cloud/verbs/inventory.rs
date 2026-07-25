@@ -32,11 +32,11 @@ const SENSITIVE_PLACEHOLDER: &str = "(sensitive — value withheld)";
 /// large; the shell's expandable raw-log pane wants the head, not megabytes).
 const RAW_LOG_CAP: usize = 4096;
 
-/// Reject an inventory document before JSON parsing can materialize an unbounded
+/// Reject a cloud JSON document before JSON parsing can materialize an unbounded
 /// tool response. The row/group caps below bound the read model, while this cap
 /// bounds the parser's input allocation; the handler still exposes only the
 /// [`RAW_LOG_CAP`]-sized diagnostic on rejection.
-const MAX_INVENTORY_INPUT_BYTES: usize = 1024 * 1024;
+const MAX_CLOUD_INPUT_BYTES: usize = 1024 * 1024;
 
 /// Keep a hostile inventory from turning one read reply into an unbounded roster.
 const MAX_INVENTORY_HOSTS: usize = 256;
@@ -114,10 +114,10 @@ pub(super) fn handle_output(w: &CloudWorker, verb_name: &str) -> CloudReply {
 /// mesh dynamic inventory only emits hosts that hold a live keepalive lease).
 /// Deterministic ordering (BTree) so the surface renders stably.
 fn parse_inventory(json: &str) -> Result<Vec<InventoryHost>, String> {
-    if json.len() > MAX_INVENTORY_INPUT_BYTES {
+    if json.len() > MAX_CLOUD_INPUT_BYTES {
         return Err(format!(
             "inventory document exceeds the {}-byte input limit",
-            MAX_INVENTORY_INPUT_BYTES
+            MAX_CLOUD_INPUT_BYTES
         ));
     }
     let value: Value = serde_json::from_str(json.trim()).map_err(|e| e.to_string())?;
@@ -205,6 +205,12 @@ fn parse_inventory(json: &str) -> Result<Vec<InventoryHost>, String> {
 /// render). A `sensitive` output's value is withheld ([`SENSITIVE_PLACEHOLDER`]) —
 /// the secret never reaches the bus; the flag rides along for the shell to mask.
 fn parse_outputs(json: &str) -> Result<Vec<TofuOutput>, String> {
+    if json.len() > MAX_CLOUD_INPUT_BYTES {
+        return Err(format!(
+            "tofu output document exceeds the {}-byte input limit",
+            MAX_CLOUD_INPUT_BYTES
+        ));
+    }
     let value: Value = serde_json::from_str(json.trim()).map_err(|e| e.to_string())?;
     let root = value
         .as_object()
@@ -370,10 +376,44 @@ mod tests {
     fn inventory_parse_fails_closed_before_materializing_an_oversized_document() {
         let oversized = format!(
             "{{\"all\":{{\"hosts\":[]}},\"padding\":\"{}\"}}",
-            "x".repeat(MAX_INVENTORY_INPUT_BYTES)
+            "x".repeat(MAX_CLOUD_INPUT_BYTES)
         );
 
         let error = parse_inventory(&oversized).expect_err("oversized input must be rejected");
+        assert!(error.contains("input limit"));
+    }
+
+    #[test]
+    fn output_parse_accepts_exact_input_limit_and_rejects_one_byte_over() {
+        let mut root = serde_json::Map::new();
+        root.insert(
+            "output".to_string(),
+            serde_json::json!({
+                "value": "ok",
+                "sensitive": false,
+                "padding": ""
+            }),
+        );
+        let base = Value::Object(root.clone()).to_string();
+        let padding_len = MAX_CLOUD_INPUT_BYTES
+            .checked_sub(base.len())
+            .expect("test fixture must fit within the input limit");
+        root.get_mut("output")
+            .and_then(Value::as_object_mut)
+            .expect("output fixture object")
+            .insert(
+                "padding".to_string(),
+                Value::String("x".repeat(padding_len)),
+            );
+        let exact = Value::Object(root).to_string();
+        assert_eq!(exact.len(), MAX_CLOUD_INPUT_BYTES);
+        assert!(
+            parse_outputs(&exact).is_ok(),
+            "exact limit remains valid input"
+        );
+
+        let oversized = format!("{exact} ");
+        let error = parse_outputs(&oversized).expect_err("one byte over must be rejected");
         assert!(error.contains("input limit"));
     }
 
