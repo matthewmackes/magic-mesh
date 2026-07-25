@@ -1784,6 +1784,13 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-006 - Construct interface (Apple-HIG-principled workstation shell)
 
 - Status: Remaining
+- Progress (2026-07-25 Dell refresh and release cut): DELL-LAPTOP completed
+  Fedora 44 transaction 3 with status `Ok`; the Magic Mesh 12.1.0 package,
+  `mackesd`, and the shell are healthy with zero shell restarts, while the
+  newly installed kernel remains pending reboot. The BigBoy farm release lane
+  also generated and payload-verified the 12.1.0 base, browser, and thin
+  lighthouse RPMs; live seat reboot and F44 workstation package-install proof
+  remain external.
 - Progress (2026-07-25 replicated control-action boundaries): router
   request/result/audit records and device-control request/result records now
   use bounded descriptor-backed regular-file reads that reject final symlinks,
