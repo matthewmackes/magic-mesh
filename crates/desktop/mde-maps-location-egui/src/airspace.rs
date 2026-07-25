@@ -574,12 +574,19 @@ impl AirspaceState {
             now_ms.saturating_sub(snapshot.published_at_ms) > AIRSPACE_SNAPSHOT_MAX_AGE_MS;
         let too_far_ahead =
             snapshot.published_at_ms > now_ms.saturating_add(AIRSPACE_SNAPSHOT_MAX_FUTURE_SKEW_MS);
+        let ready_without_observation = snapshot.availability
+            == mackes_mesh_types::airspace::AirspaceAvailability::Ready
+            && snapshot.scanned_at_ms.is_none();
         let observation_expired = snapshot.scanned_at_ms.is_some_and(|scanned_at_ms| {
             scanned_at_ms <= 0
                 || now_ms.saturating_sub(scanned_at_ms) > AIRSPACE_SNAPSHOT_MAX_AGE_MS
                 || scanned_at_ms > now_ms.saturating_add(AIRSPACE_SNAPSHOT_MAX_FUTURE_SKEW_MS)
         });
-        let expired = age_invalid || too_old || too_far_ahead || observation_expired;
+        let expired = age_invalid
+            || too_old
+            || too_far_ahead
+            || ready_without_observation
+            || observation_expired;
 
         self.source_status = snapshot.availability;
         if expired
@@ -1271,6 +1278,41 @@ mod tests {
                 "invalid observation timestamp must retract retained contacts"
             );
         }
+    }
+
+    #[test]
+    fn ready_mirror_without_scan_timestamp_is_not_live_readiness() {
+        let mut state = AirspaceState::live();
+        let snapshot = mackes_mesh_types::airspace::AirspaceSnapshot {
+            host: "mg90-live".to_string(),
+            published_at_ms: 20_000,
+            scanned_at_ms: None,
+            availability: mackes_mesh_types::airspace::AirspaceAvailability::Ready,
+            contacts: vec![mackes_mesh_types::airspace::AirspaceContact {
+                id: "aa:bb".to_string(),
+                kind: mackes_mesh_types::airspace::AirspaceContactKind::Wifi,
+                name: "timestamp-less-ap".to_string(),
+                signal_dbm: -55,
+                bearing_deg: 12.0,
+                channel: None,
+                encryption: None,
+                notable: false,
+                watchlist: false,
+                own: false,
+            }],
+            omitted_contacts: 0,
+            gaps: Vec::new(),
+        };
+
+        state.refresh_from_wire_at(&snapshot, 20_001);
+
+        assert_eq!(
+            state.source_status,
+            mackes_mesh_types::airspace::AirspaceAvailability::Offline,
+            "a Ready mirror without source-observation evidence must not prove scanner readiness"
+        );
+        assert!(state.signals.is_empty());
+        assert!(state.selected.is_none());
     }
 
     #[test]

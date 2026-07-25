@@ -260,9 +260,9 @@ pub fn run(verb: OnboardCmd, db_path: PathBuf) -> anyhow::Result<()> {
         OnboardCmd::FirstDesktop { dry_run } => {
             // Plan the first cloud-backed VM desktop: gather this node's facts
             // (mesh-id, image catalog), fold into a place/reconnect/no-image
-            // plan. The live Nova placement + broker session publish is
-            // integration-gated behind the FirstDesktopApply seam; --dry-run
-            // stops at the plan + ordered steps.
+            // plan. The live libvirt lifecycle placement + broker session
+            // publish is integration-gated behind the FirstDesktopApply seam;
+            // --dry-run stops at the plan + ordered steps.
             use mackesd_core::onboard::first_desktop as fd;
             let node_id = default_node_id();
             let root = mackesd_core::default_qnm_shared_root();
@@ -281,8 +281,8 @@ pub fn run(verb: OnboardCmd, db_path: PathBuf) -> anyhow::Result<()> {
                 Ok(outcome) => println!("  {}", outcome.human()),
                 Err(e) => {
                     eprintln!(
-                            "  first-desktop failed (live Nova placement + session is integration-gated): {e}"
-                        );
+                        "  first-desktop failed (live libvirt lifecycle placement + session is integration-gated): {e}"
+                    );
                     std::process::exit(1);
                 }
             }

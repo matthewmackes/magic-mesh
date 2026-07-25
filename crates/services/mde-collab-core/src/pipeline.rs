@@ -773,11 +773,15 @@ pub fn apply_command<S: EventSigner, I: IdSource>(
             }
             Ok(events)
         }
-        // DTMF remains an ephemeral in-call media-plane signal. Mute is a
-        // signed, convergent call-state fact so every peer can render the same
-        // participant read model after replay.
-        CollabCommand::SendDtmf { call, .. } => {
-            require_call(state, *call)?;
+        // DTMF remains an ephemeral in-call media-plane signal. It still has to
+        // pass the same connected-participant boundary as convergent media
+        // controls, and the tone must be representable as an RFC 4733
+        // telephone-event before a future SIP/WebRTC adapter ever sees it.
+        // Mute is a signed, convergent call-state fact so every peer can render
+        // the same participant read model after replay.
+        CollabCommand::SendDtmf { call, digit } => {
+            require_active_call_participant(state, *call, &ctx.actor)?;
+            require_dtmf_digit(*digit)?;
             Ok(Vec::new())
         }
         CollabCommand::SetCallMuted { call, muted } => {
@@ -982,6 +986,18 @@ fn require_ai_request_id(request_id: &str) -> Result<()> {
     }
 }
 
+/// Validate the in-call DTMF tone alphabet accepted by RFC 4733
+/// `telephone-event`: 0-9, `*`, `#`, and the A-D row. Lower-case A-D is
+/// accepted so provider adapters can normalize without losing a valid keypad
+/// event.
+fn require_dtmf_digit(digit: char) -> Result<()> {
+    if matches!(digit, '0'..='9' | '*' | '#' | 'A'..='D' | 'a'..='d') {
+        Ok(())
+    } else {
+        Err(CollabError::InvalidDtmfDigit { digit })
+    }
+}
+
 /// The actor must be a present space member and a connected participant in an
 /// active call. Call-scoped mutations that alter the participant read model
 /// must not be authorized by a call id alone: that would let an unrelated
@@ -1045,7 +1061,7 @@ mod tests {
         CallKind, ClipItemKind, ClipboardItem, FileRef, MessageBody, TransferDirection,
         TransferMethod,
     };
-    use mde_collab_types::{ActorClock, ActorId, CollabEventEnvelope, SpaceKind};
+    use mde_collab_types::{ActorClock, ActorId, CollabEventEnvelope, SpaceKind, SpaceRole};
     use uuid::Uuid;
 
     struct SeqIds(u128);
@@ -1239,6 +1255,86 @@ mod tests {
                 }) if denied_space == space && actor == ActorId::new("mallory")
             ));
         }
+    }
+
+    #[test]
+    fn send_dtmf_requires_connected_participant_and_valid_tone() {
+        let signer = Ed25519Signer::from_seed([10; 32]);
+        let mut ids = SeqIds(60);
+        let mut alice = ApplyCtx::new(ActorId::new("alice"), 1_000, &signer, &mut ids);
+
+        let created = apply_command(
+            &DomainState::default(),
+            &CollabCommand::CreateSpace {
+                kind: SpaceKind::Team,
+                name: "ops".into(),
+            },
+            &mut alice,
+        )
+        .expect("create space");
+        let space = created[0].space_id;
+
+        let state = DomainState::from_events(&created);
+        let added_bob = apply_command(
+            &state,
+            &CollabCommand::AddMember {
+                space,
+                actor: ActorId::new("bob"),
+                role: SpaceRole::Member,
+            },
+            &mut alice,
+        )
+        .expect("add bob");
+
+        let mut events = created;
+        events.extend(added_bob);
+        let state = DomainState::from_events(&events);
+        let call = CallId::from_uuid(Uuid::from_u128(61));
+        let started = apply_command(
+            &state,
+            &CollabCommand::StartCall {
+                space,
+                call,
+                kind: CallKind::Audio,
+            },
+            &mut alice,
+        )
+        .expect("start call");
+        events.extend(started);
+        let state = DomainState::from_events(&events);
+
+        let invalid = apply_command(
+            &state,
+            &CollabCommand::SendDtmf { call, digit: '+' },
+            &mut alice,
+        );
+        assert!(matches!(
+            invalid,
+            Err(CollabError::InvalidDtmfDigit { digit: '+' })
+        ));
+
+        let mut bob = ApplyCtx::new(ActorId::new("bob"), 1_100, &signer, &mut ids);
+        let denied = apply_command(
+            &state,
+            &CollabCommand::SendDtmf { call, digit: '5' },
+            &mut bob,
+        );
+        assert!(matches!(denied, Err(CollabError::CallNotFound(c)) if c == call));
+
+        let answer = apply_command(&state, &CollabCommand::AnswerCall { call }, &mut bob)
+            .expect("bob answers");
+        events.extend(answer);
+        let state = DomainState::from_events(&events);
+        let accepted = apply_command(
+            &state,
+            &CollabCommand::SendDtmf { call, digit: '*' },
+            &mut bob,
+        )
+        .expect("connected bob sends DTMF");
+        assert!(
+            accepted.is_empty(),
+            "DTMF remains ephemeral after admission"
+        );
     }
 
     #[test]

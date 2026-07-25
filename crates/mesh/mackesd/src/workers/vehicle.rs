@@ -55,7 +55,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::UdpSocket;
+use std::net::{IpAddr, UdpSocket};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -129,6 +129,11 @@ pub enum StatusBroadcastReadiness {
 /// UDP transport. Keep the receive allocation bounded and leave one byte for
 /// detecting a datagram that would otherwise be truncated by `recv`.
 const STATUS_BEACON_MAX_DATAGRAM_BYTES: usize = 16 * 1024;
+
+/// Do not let an unrelated local/LAN sender starve the status receiver forever.
+/// One build tick may discard a small burst of non-MG90 packets, then reports an
+/// honest gap instead of treating them as vehicle telemetry.
+const STATUS_BEACON_MAX_PENDING_DATAGRAMS: usize = 8;
 
 /// `GpsFix::satellites` is an unsigned byte. Do not silently clamp a hostile or
 /// corrupt MG90 value into that type; drop the field and retain the NMEA value.
@@ -278,6 +283,18 @@ impl SshHttpProbe {
     #[must_use]
     pub fn status_broadcast_readiness(&self) -> &StatusBroadcastReadiness {
         &self.status_broadcast
+    }
+
+    /// The UDP Status Broadcast is unauthenticated at transport level, so the
+    /// receiver only accepts packets whose source IP matches the configured MG90
+    /// gateway. The JSON `vehicleID` check later binds the datagram to the LCI ESN.
+    fn expected_status_peer(&self) -> io::Result<IpAddr> {
+        self.ip.parse::<IpAddr>().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{STATUS_PORT_ENV} requires {GATEWAY_ENV} to be an IP address"),
+            )
+        })
     }
 
     /// The LCI base URL (`http://<ip>/`).
@@ -529,26 +546,46 @@ impl VehicleProbe for SshHttpProbe {
         let Some(socket) = &self.status_socket else {
             return Ok(None);
         };
+        let expected_peer = self.expected_status_peer()?;
         let mut buf = [0_u8; STATUS_BEACON_MAX_DATAGRAM_BYTES + 1];
-        match socket.recv(&mut buf) {
-            Ok(size) if size > STATUS_BEACON_MAX_DATAGRAM_BYTES => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "status broadcast datagram exceeds {} bytes",
-                    STATUS_BEACON_MAX_DATAGRAM_BYTES
-                ),
-            )),
-            Ok(size) => {
-                let payload = std::str::from_utf8(&buf[..size]).map_err(|error| {
-                    io::Error::new(
+        let mut unexpected_peer: Option<IpAddr> = None;
+        for _ in 0..STATUS_BEACON_MAX_PENDING_DATAGRAMS {
+            match socket.recv_from(&mut buf) {
+                Ok((_, peer)) if peer.ip() != expected_peer => {
+                    unexpected_peer = Some(peer.ip());
+                    continue;
+                }
+                Ok((size, _)) if size > STATUS_BEACON_MAX_DATAGRAM_BYTES => {
+                    return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!("status broadcast is not UTF-8: {error}"),
-                    )
-                })?;
-                Ok(Some(payload.to_owned()))
+                        format!(
+                            "status broadcast datagram exceeds {} bytes",
+                            STATUS_BEACON_MAX_DATAGRAM_BYTES
+                        ),
+                    ));
+                }
+                Ok((size, _)) => {
+                    let payload = std::str::from_utf8(&buf[..size]).map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("status broadcast is not UTF-8: {error}"),
+                        )
+                    })?;
+                    return Ok(Some(payload.to_owned()));
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    break;
+                }
+                Err(error) => return Err(error),
             }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
-            Err(error) => Err(error),
+        }
+        if let Some(peer) = unexpected_peer {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("status broadcast from unexpected peer {peer}; expected {expected_peer}"),
+            ))
+        } else {
+            Ok(None)
         }
     }
 
@@ -2077,6 +2114,33 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
                 "unexpected status datagram error: {error}"
             );
         }
+    }
+
+    #[test]
+    fn status_beacon_reader_rejects_packets_from_unconfigured_peer() {
+        let receiver = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        let sender = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        let port = receiver.local_addr().unwrap().port();
+        sender
+            .send_to(STATUS_BEACON.as_bytes(), receiver.local_addr().unwrap())
+            .unwrap();
+        let probe = SshHttpProbe {
+            ip: "127.0.0.2".to_string(),
+            ssh_port: 2222,
+            ssh_pw: String::new(),
+            known_hosts_file: PathBuf::new(),
+            status_socket: Some(receiver),
+            status_broadcast: StatusBroadcastReadiness::Listening { port },
+        };
+
+        let error = probe.read_status_beacon().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains("unexpected peer")
+                && error.to_string().contains("127.0.0.2"),
+            "unexpected status peer error: {error}"
+        );
     }
 
     #[test]

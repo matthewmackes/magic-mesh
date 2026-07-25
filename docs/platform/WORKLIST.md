@@ -664,6 +664,19 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-ARCH-007 - Repair Workloads cockpit E2E wire, placement, and authorization
 
 - Status: Remaining
+- Progress (2026-07-25 first-desktop authorized lifecycle publisher): live
+  first-desktop placement now publishes signed `vm_lifecycle` Create/Start
+  actions on `action/vm/lifecycle`, binds each request to the cloud-arm HMAC
+  token digest, waits for `event/vm/instances` to report the VM running, and
+  only then opens the broker session through the existing remote-push path.
+  Tests cover injected placement ordering, worker parser/token-gate acceptance,
+  Bus publish/readback, and running-roster observation; the final BigBoy
+  `mackesd --lib onboard::first_desktop --features async-services` gate is green
+  at **21/21**, and touched-file rustfmt is green. A `--no-default-features`
+  probe still fails before this module because existing crate code references
+  `ipc`, `workers`, and `substrate` behind `async-services`. Live root
+  credential, libvirt backend, bootstrap SSH, Podman/Cuttlefish, and installed
+  seat evidence remain external.
 - Progress (2026-07-25 first-desktop lifecycle bridge): the first-desktop
   planner now carries an explicit VM name, placement peer, golden image path,
   libvirt sizing, and network, and folds the placement into the existing
@@ -1037,6 +1050,13 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-011 - Communications collaboration suite full replacement
 
 - Status: Remaining
+- Progress (2026-07-25 DTMF media-admission boundary): ephemeral DTMF commands
+  now require a connected call participant and validate the RFC 4733 keypad
+  alphabet (`0-9`, `*`, `#`, `A-D`/lowercase) before any future SIP/WebRTC
+  adapter can see the tone. The focused farm regression passed, touched-file
+  rustfmt is green, and the BigBoy `mde-collab-core` suite is green at
+  **72/72** plus doc-tests. Live WebRTC/SIP/LiveKit/media proof remains
+  external.
 - Progress (2026-07-25 DigitalOcean AI sidecar boundary): Communications AI
   suggestions now carry a bounded caller `request_id`, have a typed
   `cancel_ai_suggestion` command, validate targeted context as belonging to the
@@ -1675,6 +1695,15 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-012 - Maps live-data overlays (zero-cost external feeds)
 
 - Status: Remaining
+- Progress (2026-07-25 MG90 Airspace observation-time boundary): the MG90
+  Airspace worker now stamps timestamp-less successful surveys with local poll
+  completion time, while future-dated source scan timestamps fail closed to an
+  Offline snapshot with zero contacts. The Maps Airspace consumer also rejects
+  retained Ready snapshots that lack source-observation time, so timestamp-less
+  retained contacts cannot prove live scanner readiness. Farm gates are green at
+  **9/9** `mackesd workers::airspace::tests`, **14/14**
+  `mde-maps-location-egui airspace::tests`, and touched-file rustfmt is green.
+  Fresh live MG90 scanner feed and painted overlay proof remain external.
 - Progress (2026-07-25 live-proof verifier catalog/airspace readiness):
   `verify-live-mirrors.py` now validates overlays against the locked zero-cost
   feed catalog and can require fresh `state/airspace/<node>` scanner readiness,
@@ -2623,6 +2652,14 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-007 - Car interface (CarPlay-principled vehicle mode)
 
 - Status: Remaining
+- Progress (2026-07-25 MG90 Status Broadcast peer boundary): UDP Status
+  Broadcast reads now accept packets only from the configured MG90 gateway IP
+  before parsing payloads; unexpected senders are dropped in a bounded burst and
+  surfaced as an honest status-broadcast gap instead of telemetry. The focused
+  farm `mackesd status_beacon` gate is green at **6/6**, and
+  `install-helpers/mg90-access.sh inventory` reports `ssh-up lci-up app-up`.
+  Live Bus proof was not claimed because `/run/mde-bus` is absent on the dev
+  host; physical Car/MG90 proof remains external.
 - Progress (2026-07-25 MG90 diagnostic-plane boundary): the vehicle adapter now
   reads only an explicitly configured `/obdii_status/` or `/hdobd_status/`
   MG90 application page, bounds the access contract to those paths, and keeps

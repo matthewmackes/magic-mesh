@@ -1497,12 +1497,12 @@ enum OnboardCmd {
     },
     /// OW-8 / QC-15 — bring up this Workstation's FIRST cloud-backed VM desktop:
     /// select a VM image from the mesh image catalog, place it through the VDI
-    /// broker's Nova desktop path, and open a broker session the shell's Desktop
-    /// surface renders. A desktop VM already present ⇒ reconnect (offer it, not a
-    /// duplicate); no VM image ⇒ a real no-image outcome (see Services ▸ Images).
-    /// The live placement/session path is integration-gated behind the
-    /// FirstDesktopApply seam; `--dry-run` prints the plan + ordered steps without
-    /// creating anything.
+    /// broker's libvirt lifecycle path, and open a broker session the shell's
+    /// Desktop surface renders. A desktop VM already present ⇒ reconnect (offer
+    /// it, not a duplicate); no VM image ⇒ a real no-image outcome (see Services
+    /// ▸ Images). The live placement/session path is integration-gated behind
+    /// the FirstDesktopApply seam; `--dry-run` prints the plan + ordered steps
+    /// without creating anything.
     FirstDesktop {
         /// Print the plan + ordered steps without placing / opening.
         #[arg(long)]

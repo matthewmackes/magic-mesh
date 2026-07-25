@@ -115,6 +115,15 @@ pub enum CollabError {
     #[error("message {0} has been deleted")]
     TargetDeleted(EventId),
 
+    // ---- Validation: call media controls -------------------------------
+    /// The requested DTMF tone is not representable as an RFC 4733 telephone
+    /// event.
+    #[error("DTMF digit `{digit}` is invalid (expected 0-9, *, #, or A-D)")]
+    InvalidDtmfDigit {
+        /// The rejected tone character.
+        digit: char,
+    },
+
     // ---- Validation: alert actions -------------------------------------
     /// The named inline alert action does not exist on the alert.
     #[error("alert {alert} has no action `{action_id}`")]
