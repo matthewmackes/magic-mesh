@@ -1005,7 +1005,7 @@ mod tests {
             pairs: (0..total)
                 .map(|i| FederationPair {
                     peer_mesh_id: format!("MESH-{i}"),
-                    peer_mesh_label: "oversized-label".repeat(MAX_STATUS_TEXT_BYTES),
+                    peer_mesh_label: "x".repeat(MAX_STATUS_TEXT_BYTES + 1),
                     established: "now".to_string(),
                     subscribe_topics: vec!["#".to_string()],
                     publish_topics: Vec::new(),
