@@ -56,7 +56,7 @@ use mde_bus::persist::{Persist, StoredMessage};
 use mde_collab_core::{ActorLog, CollabEngine, Ed25519Signer, FileActorLog, Projection, RandomIds};
 use mde_collab_types::topics::{self, projection as proj};
 use mde_collab_types::value::{
-    sha256_hex, AlertAction, AlertActionKind, AlertPayload, ClipItemKind, ClipboardItem, Severity,
+    AlertAction, AlertActionKind, AlertPayload, ClipItemKind, ClipboardItem, Severity, sha256_hex,
 };
 use mde_collab_types::{
     ActorId, AiSuggestionRequestStatus, AiSuggestionRequestView, AiSuggestionRequests,
@@ -753,6 +753,16 @@ impl CollabWorker {
                 &topics::space_state_topic(proj::CALL_STATE, space),
                 calls,
             );
+            let media_readiness = state
+                .engine
+                .projection()
+                .call_media_readiness(&self.self_actor, Some(space));
+            publish_state(
+                persist,
+                &mut state.last_published,
+                &topics::space_state_topic(proj::CALL_MEDIA_READINESS, space),
+                media_readiness,
+            );
             let ai_requests = Ok(state.ai_requests.for_space(space));
             publish_state(
                 persist,
@@ -792,6 +802,16 @@ impl CollabWorker {
             &mut state.last_published,
             &topics::state_topic(proj::TRANSFER_JOBS),
             transfers,
+        );
+        let media_readiness = state
+            .engine
+            .projection()
+            .call_media_readiness(&self.self_actor, None);
+        publish_state(
+            persist,
+            &mut state.last_published,
+            &topics::state_topic(proj::CALL_MEDIA_READINESS),
+            media_readiness,
         );
         let ai_requests = Ok(state.ai_requests.all());
         publish_state(
@@ -1425,11 +1445,15 @@ mod tests {
     use super::*;
     use crate::ipc::action_auth::authorize_test_body;
     use ed25519_dalek::SigningKey;
-    use mde_collab_types::value::MessageBody;
+    use mde_collab_types::read_model::{
+        CallMediaAdapter, CallMediaAdmission, CallMediaRequirement,
+    };
+    use mde_collab_types::value::{CallKind, MessageBody};
     use mde_collab_types::{
-        AlertInbox, ClipboardLane, CollabEventKind, ConversationTimeline, FileRef, FileRefId,
-        FileReferences, PresenceState, SpaceDirectory, SpaceKind, SpaceRole, TransferControl,
-        TransferDirection, TransferId, TransferJobs, TransferMethod, TransferState,
+        AlertInbox, CallId, CallMediaReadiness, ClipboardLane, CollabEventKind,
+        ConversationTimeline, FileRef, FileRefId, FileReferences, PresenceState, SpaceDirectory,
+        SpaceKind, SpaceRole, TransferControl, TransferDirection, TransferId, TransferJobs,
+        TransferMethod, TransferState,
     };
     use rand::rngs::OsRng;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1928,6 +1952,83 @@ mod tests {
             AiSuggestionRequestStatus::Canceled
         );
         assert!(requests.requests[0].error.is_none());
+    }
+
+    #[test]
+    fn call_media_readiness_is_published_for_the_local_media_adapter() {
+        // WL-FUNC-011 media boundary: the worker now publishes the core's
+        // adapter-facing signed-state readiness as a retained Bus model. This is
+        // intentionally not a provider probe; with only the local caller connected
+        // the row is degraded as waiting for a peer.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let w = worker(dir.path(), "eagle");
+        let persist = persist_at(dir.path());
+        let mut state = CollabState::new(w.self_actor.clone()).expect("state");
+        w.tick_once(&persist, &mut state, 100); // seed cursors
+
+        write_command(
+            &w,
+            &persist,
+            &CollabCommand::CreateSpace {
+                kind: SpaceKind::Team,
+                name: "ops".into(),
+            },
+        );
+        w.tick_once(&persist, &mut state, 200);
+        let space = only_space(&state);
+
+        let call = CallId::new();
+        write_command(
+            &w,
+            &persist,
+            &CollabCommand::StartCall {
+                space,
+                call,
+                kind: CallKind::Audio,
+            },
+        );
+        w.tick_once(&persist, &mut state, 300);
+
+        let topic = topics::space_state_topic(proj::CALL_MEDIA_READINESS, space);
+        assert_eq!(topic, format!("state/collab/call-media-readiness/{space}"));
+        let msg = persist
+            .read_latest(&topic)
+            .expect("read media readiness")
+            .expect("space media readiness published");
+        let readiness: CallMediaReadiness =
+            serde_json::from_str(msg.body.as_deref().expect("body"))
+                .expect("decode media readiness");
+        assert_eq!(readiness.local_actor, w.self_actor);
+        assert_eq!(readiness.sessions.len(), 1);
+        let session = &readiness.sessions[0];
+        assert_eq!(session.call, call);
+        assert_eq!(session.space, space);
+        assert_eq!(session.kind, CallKind::Audio);
+        assert_eq!(session.requirements, vec![CallMediaRequirement::Microphone]);
+        assert_eq!(
+            session.candidate_adapters,
+            vec![
+                CallMediaAdapter::WebRtcP2p,
+                CallMediaAdapter::LiveKitSfu,
+                CallMediaAdapter::SipGateway,
+            ]
+        );
+        assert_eq!(
+            session.admission,
+            CallMediaAdmission::WaitingForConnectedPeer,
+            "single-seat proof must stay degraded until another participant connects"
+        );
+        assert_eq!(session.connected_participants, vec![w.self_actor.clone()]);
+
+        let global_topic = topics::state_topic(proj::CALL_MEDIA_READINESS);
+        assert_eq!(global_topic, "state/collab/call-media-readiness");
+        assert!(
+            persist
+                .read_latest(&global_topic)
+                .expect("read global media readiness")
+                .is_some(),
+            "the adapter can also consume the unscoped local readiness board"
+        );
     }
 
     /// Create a space (this node becomes Owner) and link `reference` into it as

@@ -9,9 +9,9 @@
 //! * **Live signed events** — `collab/event/<space>/<actor>` (the signed
 //!   [`CollabEventEnvelope`] delivery lane).
 
+use crate::ActorId;
 use crate::command::CollabCommand;
 use crate::ids::SpaceId;
-use crate::ActorId;
 
 /// Prefix for command topics.
 pub const ACTION_PREFIX: &str = "action/collab/";
@@ -45,6 +45,8 @@ pub mod projection {
     pub const PRESENCE: &str = "presence";
     /// The active call state.
     pub const CALL_STATE: &str = "call-state";
+    /// Local media-adapter readiness for active calls.
+    pub const CALL_MEDIA_READINESS: &str = "call-media-readiness";
     /// DigitalOcean AI suggestion request state.
     pub const AI_REQUESTS: &str = "ai-requests";
     /// The launcher/dock badge rollup.
@@ -116,6 +118,10 @@ mod tests {
         assert_eq!(
             state_topic(projection::ALERT_INBOX),
             "state/collab/alert-inbox"
+        );
+        assert_eq!(
+            state_topic(projection::CALL_MEDIA_READINESS),
+            "state/collab/call-media-readiness"
         );
         let space = SpaceId::new();
         assert_eq!(

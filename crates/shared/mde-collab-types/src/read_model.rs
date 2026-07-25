@@ -7,6 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::ActorId;
 use crate::clock::ActorClock;
 use crate::ids::{CallId, DocumentId, EventId, FileRefId, SpaceId, ThreadId, TransferId};
 use crate::space::{SpaceKind, SpaceRole};
@@ -14,7 +15,6 @@ use crate::value::{
     AiSuggestionKind, AlertPayload, CallKind, CallParticipantState, ClipItemKind, DeliveryState,
     FileRef, PresenceState, Severity, TransferDirection, TransferMethod, TransferState,
 };
-use crate::ActorId;
 
 /// The full set of read-side projections, so a caller can name each shape by
 /// one type. Each variant is an independently-published `state/collab/*` model.
@@ -342,11 +342,12 @@ pub struct CallParticipantView {
 pub struct CallMediaReadiness {
     /// The local actor this view was built for.
     pub local_actor: ActorId,
-    /// Calls whose signed state is ready for an adapter attempt.
+    /// Calls whose local signed state should be surfaced to a media adapter,
+    /// either as adapter-ready or as an honest degraded/waiting state.
     pub sessions: Vec<CallMediaSession>,
 }
 
-/// One active call that a future media adapter may attempt to bind.
+/// One active call that a future media adapter may evaluate or attempt to bind.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallMediaSession {
     /// The call id.
@@ -362,10 +363,23 @@ pub struct CallMediaSession {
     /// Candidate adapter classes. These are not a selected route and do not
     /// claim the adapter is reachable.
     pub candidate_adapters: Vec<CallMediaAdapter>,
+    /// Signed-state admission status for a media adapter attempt. This is still
+    /// not provider health or proof of advancing media frames.
+    pub admission: CallMediaAdmission,
     /// Connected participants to offer to the adapter.
     pub connected_participants: Vec<ActorId>,
     /// The local actor's signed mute bit.
     pub local_muted: bool,
+}
+
+/// Whether the signed call state is sufficient for a media adapter attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallMediaAdmission {
+    /// A local connected participant and at least one connected remote peer exist.
+    AdapterReady,
+    /// The local actor is in the call, but no other participant is connected yet.
+    WaitingForConnectedPeer,
 }
 
 /// Local capability/device requirements implied by a call kind.

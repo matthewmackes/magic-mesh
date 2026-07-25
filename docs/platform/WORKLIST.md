@@ -252,6 +252,16 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-SEC-006 - Keep Nebula private keys local to their owning node
 
 - Status: Remaining
+- Progress (2026-07-25 read-only live-evidence harness): added
+  `install-helpers/verify-nebula-rotation-evidence.sh`, a bounded collector and
+  pre/post comparator for the remaining controlled Nebula drill. It hashes the
+  active identity generation/cert/key without copying secret material, checks
+  Nebula live reachability when not explicitly skipped, verifies stale
+  identity-generation pruning, and scans replicated workgroup state for
+  private-key markers while reporting only suspicious paths. Local `bash -n`
+  and `--self-test` are green. This prepares collection of real
+  rotation/reconnect/prune evidence but does not claim live proof; live evidence
+  remains external.
 - Progress (2026-07-25 stale identity-generation prune retry): replicated
   steady-state Nebula bundle refresh now retries stale local identity-generation
   pruning after confirming the active certificate still matches, without
@@ -664,6 +674,25 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-ARCH-007 - Repair Workloads cockpit E2E wire, placement, and authorization
 
 - Status: Remaining
+- Progress (2026-07-25 Workloads live-proof verifier harness):
+  `install-helpers/verify-workloads-live-proof.py` now provides a bounded,
+  read-only WL-ARCH-007 evidence collector for placement hosts. It opens the
+  Bus SQLite index in read-only mode, follows the indexed message envelope with
+  no-follow bounded reads, redacts retained `action/vm/lifecycle` HMAC tokens,
+  and checks the cloud-arm credential presence/permissions, fresh
+  `state/cloud/<node>` health, `event/vm/instances`, `event/onboard/apply`
+  open-broker acknowledgements, Podman socket/version, libvirt default network
+  and `mde-vms` pool, `/dev/kvm`, CPU virtualization flags, and bootstrap SSH
+  reachability without publishing actions or starting/stopping services. Local
+  verifier validation passed `python3 -m py_compile
+  install-helpers/verify-workloads-live-proof.py`,
+  `install-helpers/verify-workloads-live-proof.py --self-test`, and a
+  no-require read-only dry run. The dry run was only harness validation on the
+  dev host: it found no `/run/mde-bus` or cloud-arm credential, reported Podman
+  socket active, found libvirt reachable with `default` network active and
+  `/dev/kvm` present, but `mde-vms` absent. Live `.15` Workloads/libvirt
+  lifecycle/bootstrap closure remains external until the verifier is run on an
+  installed placement host with the required evidence flags.
 - Progress (2026-07-25 first-desktop lean feature boundary): the
   `mackesd --no-default-features` library path no longer pulls the async daemon
   surface into first-desktop tests. Bus/local-applier effects stay behind
@@ -1062,6 +1091,20 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-011 - Communications collaboration suite full replacement
 
 - Status: Remaining
+- Progress (2026-07-25 media-readiness publish boundary): the mackesd
+  collaboration worker now publishes the core `CallMediaReadiness` projection
+  for the local actor as retained adapter-facing Bus state at
+  `state/collab/call-media-readiness` and
+  `state/collab/call-media-readiness/<space>`. Readiness rows now carry
+  `CallMediaAdmission`, distinguishing signed-state `adapter_ready` from the
+  honest degraded `waiting_for_connected_peer` single-seat state so future
+  WebRTC/SIP/LiveKit workers can avoid treating one-seat tests as live remote
+  media. Farm gates are green on `.90` at **3/3** `mde-collab-core
+  media_readiness`, `.170` at **37/37** `mde-collab-types --lib`, `.130`
+  BigBoy at **1/1** `mackesd --lib --features async-services
+  call_media_readiness_is_published_for_the_local_media_adapter`, and `.50`
+  touched-file `rustfmt --edition 2024 --config skip_children=true --check`.
+  Live WebRTC/SIP/LiveKit/media proof remains external.
 - Progress (2026-07-25 call media-readiness boundary): Communications now has a
   typed adapter-facing `CallMediaReadiness` read model that exposes only
   non-ended calls where the local actor is a connected participant, with bounded
@@ -1715,6 +1758,16 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-012 - Maps live-data overlays (zero-cost external feeds)
 
 - Status: Remaining
+- Progress (2026-07-25 Airspace headless paint-proof seam): the Maps Airspace
+  panel now exposes bounded paint stats for proof tooling, counting radar blips,
+  live-panel rows, and the honest `NO SCANNER FEED` empty badge without changing
+  the production UI entrypoint. A new headless regression folds a fresh Ready
+  scanner mirror with Wi-Fi/cellular/Bluetooth contacts and proves one egui
+  frame reaches both contact paint paths while suppressing the empty badge; the
+  source-less/offline regression also asserts zero contact paint. Farm `.50`
+  `mde-maps-location-egui airspace::tests` is green at **15/15**, and
+  single-file Airspace rustfmt is green. This is not live MG90 scanner evidence;
+  fresh scanner feed and live DRM-seat pixel proof remain external.
 - Progress (2026-07-25 MG90 Airspace observation-time boundary): the MG90
   Airspace worker now stamps timestamp-less successful surveys with local poll
   completion time, while future-dated source scan timestamps fail closed to an
@@ -2682,6 +2735,17 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-007 - Car interface (CarPlay-principled vehicle mode)
 
 - Status: Remaining
+- Progress (2026-07-25 Car Home headless pixel proof): `car_home.rs` now has a
+  test-only software-rasterized proof that drives the real `car_home_panel`
+  through egui `Context::run` plus the existing screenshot backend, then checks
+  the 1024x640 canvas for SYNC3 ground/card pixels, the Ford-blue Navigation
+  accent cap, dim stale-MG90 vehicle text, and strong live-alert text. BigBoy
+  `.130` focused gate is green at **1/1**
+  `car_home_pixel_proof_paints_sync3_dashboard_and_honest_mg90_state` (1
+  passed, 0 failed, 1,812 filtered out), and `.50` touched-file
+  `rustfmt --check crates/desktop/mde-shell-egui/src/car_home.rs` is green. No
+  live `.15` proof collection was performed; live MG90/physical Car evidence
+  remains external.
 - Progress (2026-07-25 MG90 degraded-glance honesty): Car Home now separates the
   vehicle glance label from its live-paint truth. Fresh MG90 telemetry still
   paints live values, while stale/offline/awaiting/simulated MG90 states show
@@ -2690,6 +2754,20 @@ These decisions refine acceptance and sequencing for the active items below.
   descriptor. The BigBoy `mde-shell-egui car_home` gate is green at **14/14**,
   touched-file rustfmt is green, and local diff-check is clean. Live MG90 and
   physical Car evidence remain external.
+- Progress (2026-07-25 live `.15` MG90 credential-file migration): the physical
+  `.15` seat now uses the preferred `MDE_VEHICLE_ROOT_PW_FILE` service contract
+  with `/etc/mackesd/mg90-root-password` owned by root and mode `0600`; the
+  legacy plaintext `MDE_VEHICLE_ROOT_PW` environment value was removed from the
+  live `mackesd` environment. `mackesd` and `mde-shell-egui` are active with
+  `NRestarts=0` after daemon reload/restart, and read-only
+  `verify-live-mirrors.py --bus-root /run/mde-bus --vehicle-node
+  Basement-Test-Workstation --require-online --max-age-seconds 120` accepted a
+  fresh 6.3 s `state/vehicle/Basement-Test-Workstation` mirror with
+  `online=true`, MGOS `4.3.0.1`, honest `fix_type=no-fix`, and the existing
+  model/OBD gaps. Added the packaged
+  `verify-vehicle-credential-hygiene` helper so future live checks fail if the
+  legacy env secret returns. Airspace scanner feed, OBD parsing, and physical
+  Car/pixel proof remain external.
 - Progress (2026-07-25 MG90 Status Broadcast peer boundary): UDP Status
   Broadcast reads now accept packets only from the configured MG90 gateway IP
   before parsing payloads; unexpected senders are dropped in a bounded burst and

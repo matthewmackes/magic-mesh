@@ -38,7 +38,7 @@ use mde_collab_types::value::{
 };
 use mde_collab_types::{ActorClock, ActorId, CollabEventEnvelope, SpaceKind, SpaceRole};
 use rusqlite::types::ValueRef;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::domain::sort_key;
 use crate::error::{CollabError, Result};
@@ -546,6 +546,7 @@ impl Projection {
         for (call, space_id, kind, started, local_muted) in collected {
             let call = parse_call(&call)?;
             let kind = parse_json_enum::<CallKind>(&kind)?;
+            let connected_participants = self.connected_call_participants(call)?;
             sessions.push(CallMediaSession {
                 call,
                 space: parse_space(&space_id)?,
@@ -553,7 +554,8 @@ impl Projection {
                 started_unix_ms: started,
                 requirements: media_requirements(kind),
                 candidate_adapters: candidate_media_adapters(kind),
-                connected_participants: self.connected_call_participants(call)?,
+                admission: media_admission(&connected_participants, local_actor),
+                connected_participants,
                 local_muted: local_muted != 0,
             });
         }
@@ -1672,6 +1674,20 @@ fn candidate_media_adapters(kind: CallKind) -> Vec<CallMediaAdapter> {
     }
 }
 
+fn media_admission(
+    connected_participants: &[ActorId],
+    local_actor: &ActorId,
+) -> mde_collab_types::read_model::CallMediaAdmission {
+    if connected_participants
+        .iter()
+        .any(|actor| actor != local_actor)
+    {
+        mde_collab_types::read_model::CallMediaAdmission::AdapterReady
+    } else {
+        mde_collab_types::read_model::CallMediaAdmission::WaitingForConnectedPeer
+    }
+}
+
 fn ensure_read_model_text(field: &str, value: &str) -> Result<()> {
     if value.len() > MAX_READ_MODEL_TEXT_BYTES {
         return Err(CollabError::Serde(format!(
@@ -1688,16 +1704,18 @@ fn summarize(kind_tag: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Projection, MAX_DOCUMENT_PARTICIPANTS, MAX_DOCUMENT_SESSIONS, MAX_ENVELOPE_JSON_BYTES,
+        MAX_DOCUMENT_PARTICIPANTS, MAX_DOCUMENT_SESSIONS, MAX_ENVELOPE_JSON_BYTES,
         MAX_MEDIA_READINESS_SESSIONS, MAX_MESSAGE_BODY_BYTES, MAX_TABLE_DUMP_BYTES,
-        MAX_TIMELINE_MESSAGES,
+        MAX_TIMELINE_MESSAGES, Projection,
     };
     use crate::error::CollabError;
     use crate::signer::{Ed25519Signer, EventSigner};
     use mde_collab_types::envelope::SCHEMA_VERSION;
     use mde_collab_types::event::CollabEventKind;
     use mde_collab_types::ids::{CallId, EventId, SpaceId, ThreadId};
-    use mde_collab_types::read_model::{CallMediaAdapter, CallMediaRequirement};
+    use mde_collab_types::read_model::{
+        CallMediaAdapter, CallMediaAdmission, CallMediaRequirement,
+    };
     use mde_collab_types::value::{CallKind, CallParticipantState, MessageBody};
     use mde_collab_types::{ActorClock, ActorId, CollabEventEnvelope, SpaceKind, SpaceRole};
     use uuid::Uuid;
@@ -1831,10 +1849,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["first", "second"]
         );
-        assert!(timeline
-            .replies
-            .iter()
-            .all(|message| message.reply_count == 0));
+        assert!(
+            timeline
+                .replies
+                .iter()
+                .all(|message| message.reply_count == 0)
+        );
 
         let main = projection
             .conversation_timeline(space, None)
@@ -1941,10 +1961,12 @@ mod tests {
         projection
             .project(std::slice::from_ref(&valid))
             .expect("valid signed event projects");
-        assert!(projection
-            .dump_tables()
-            .expect("projected dump")
-            .contains("signed"));
+        assert!(
+            projection
+                .dump_tables()
+                .expect("projected dump")
+                .contains("signed")
+        );
 
         let mut future_schema = valid;
         future_schema.schema_version = SCHEMA_VERSION + 1;
@@ -2219,6 +2241,7 @@ mod tests {
                 CallMediaAdapter::SipGateway,
             ]
         );
+        assert_eq!(session.admission, CallMediaAdmission::AdapterReady);
         assert_eq!(
             session.connected_participants,
             vec![ActorId::new("alice"), ActorId::new("bob")]
@@ -2244,6 +2267,39 @@ mod tests {
         assert_eq!(
             screen.candidate_adapters,
             vec![CallMediaAdapter::WebRtcP2p, CallMediaAdapter::LiveKitSfu]
+        );
+    }
+
+    #[test]
+    fn media_readiness_marks_local_only_calls_waiting_for_a_connected_peer() {
+        let space = space_id(306);
+        let call = CallId::from_uuid(Uuid::from_u128(307));
+        let mut events = space_setup(space, "solo", 308);
+        events.push(event_as(
+            310,
+            space,
+            "alice",
+            3,
+            CollabEventKind::CallStarted {
+                call,
+                kind: CallKind::Audio,
+                initiator: ActorId::new("alice"),
+            },
+        ));
+
+        let mut projection = Projection::open_in_memory().expect("open projection");
+        projection
+            .project(&events)
+            .expect("project local-only media readiness events");
+
+        let readiness = projection
+            .call_media_readiness(&ActorId::new("alice"), Some(space))
+            .expect("readiness");
+        assert_eq!(readiness.sessions.len(), 1);
+        assert_eq!(
+            readiness.sessions[0].admission,
+            CallMediaAdmission::WaitingForConnectedPeer,
+            "one-seat signed state must not be reported as remote-media ready"
         );
     }
 

@@ -480,6 +480,7 @@ assets = [
     # and HTTP passwords are operator-provisioned under /etc/mackesd.
     { source = "install-helpers/mg90-access.sh",           dest = "/usr/libexec/mackesd/mg90-access",             mode = "755" },
     { source = "install-helpers/mg90-known-hosts",         dest = "/usr/share/magic-mesh/mg90-known-hosts",       mode = "644" },
+    { source = "install-helpers/verify-vehicle-credential-hygiene.sh", dest = "/usr/libexec/mackesd/verify-vehicle-credential-hygiene", mode = "755" },
     { source = "install-helpers/configure-small-lighthouse.sh", dest = "/usr/libexec/mackesd/configure-small-lighthouse", mode = "755" },
     { source = "install-helpers/provision-cloud-arm-credential.sh", dest = "/usr/libexec/mackesd/provision-cloud-arm-credential", mode = "755" },
     { source = "packaging/systemd/cloud-arm-credential.conf", dest = "/usr/libexec/mackesd/cloud-arm-credential.conf", mode = "644" },

@@ -63,17 +63,17 @@ pub use event::CollabEventKind;
 pub use ids::{CallId, DocumentId, EventId, FileRefId, SpaceId, ThreadId, TransferId};
 pub use read_model::{
     ActivityEntry, ActivityFeed, AiSuggestionRequestStatus, AiSuggestionRequestView,
-    AiSuggestionRequests, AlertInbox, AlertView, CallMediaAdapter, CallMediaReadiness,
-    CallMediaRequirement, CallMediaSession, CallParticipantView, CallState, CallView,
-    ClipboardLane, ClipboardView, CollabReadModel, CommsBadges, ConversationTimeline,
+    AiSuggestionRequests, AlertInbox, AlertView, CallMediaAdapter, CallMediaAdmission,
+    CallMediaReadiness, CallMediaRequirement, CallMediaSession, CallParticipantView, CallState,
+    CallView, ClipboardLane, ClipboardView, CollabReadModel, CommsBadges, ConversationTimeline,
     DocumentSession, DocumentSessions, FileReferenceView, FileReferences, MessageView,
     PresenceBoard, PresenceView, SpaceDirectory, SpaceSummary, ThreadTimeline, TransferJobView,
     TransferJobs,
 };
 pub use space::{SpaceKind, SpaceRole};
 pub use value::{
-    sha256_hex, AiSuggestion, AiSuggestionKind, AlertAction, AlertActionKind, AlertPayload,
-    CallKind, CallParticipantState, ClipItemKind, ClipboardItem, DeliveryState, DocumentChange,
-    FileRef, MessageBody, PayloadRef, PresenceState, ReviewVerdict, Severity, TransferDirection,
-    TransferMethod, TransferState,
+    AiSuggestion, AiSuggestionKind, AlertAction, AlertActionKind, AlertPayload, CallKind,
+    CallParticipantState, ClipItemKind, ClipboardItem, DeliveryState, DocumentChange, FileRef,
+    MessageBody, PayloadRef, PresenceState, ReviewVerdict, Severity, TransferDirection,
+    TransferMethod, TransferState, sha256_hex,
 };

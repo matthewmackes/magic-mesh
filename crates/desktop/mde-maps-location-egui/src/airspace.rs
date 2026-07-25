@@ -36,6 +36,32 @@ const AIRSPACE_SNAPSHOT_MAX_FUTURE_SKEW_MS: i64 = 5_000;
 /// validation work bounded at this consumer boundary as well.
 const AIRSPACE_MAX_CONSUMER_CONTACTS: usize = mackes_mesh_types::airspace::MAX_RETAINED_CONTACTS;
 
+/// Headless-observable Airspace paint facts.
+///
+/// This is a bounded CI/verifier seam: it proves that an already-folded,
+/// freshness-validated mirror reaches the egui paint paths. It is not live MG90
+/// scanner evidence and does not replace the live DRM-seat pixel proof.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PaintStats {
+    /// Visible scanner contacts painted as radar blips in the scope.
+    pub radar_blips: usize,
+    /// Visible scanner contacts painted as rows in the live-now panel.
+    pub live_panel_rows: usize,
+    /// Whether the honest `NO SCANNER FEED` empty-state badge painted.
+    pub empty_badge: bool,
+}
+
+impl PaintStats {
+    /// Whether one painted frame reached both contact render paths.
+    ///
+    /// Callers must still prove the source mirror is fresh/real before treating
+    /// this as acceptance evidence; this helper only describes the paint output.
+    #[must_use]
+    pub const fn has_contact_paint(self) -> bool {
+        self.radar_blips > 0 && self.live_panel_rows > 0 && !self.empty_badge
+    }
+}
+
 /// A discovered wireless emitter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SignalKind {
@@ -711,6 +737,11 @@ fn finite_or(v: f32, f: f32) -> f32 {
 
 /// Render the Airspace surface: the radar scope + a live-now panel beside it.
 pub fn airspace_panel(ui: &mut Ui, state: &mut AirspaceState) {
+    let _ = airspace_panel_with_stats(ui, state);
+}
+
+/// Render the Airspace surface and return bounded paint facts for proof tooling.
+pub fn airspace_panel_with_stats(ui: &mut Ui, state: &mut AirspaceState) -> PaintStats {
     // The tab rail can select Airspace by assigning `WorkspaceTab::Airspace`
     // directly, so do not rely on the caller remembering a second activation
     // flag. The panel is only mounted while visible; arming here makes the
@@ -723,7 +754,7 @@ pub fn airspace_panel(ui: &mut Ui, state: &mut AirspaceState) {
     let t = ui.input(|i| i.time) as f32;
     let full = ui.available_rect_before_wrap();
     if !full.is_finite() || full.width() < 40.0 || full.height() < 40.0 {
-        return;
+        return PaintStats::default();
     }
     ui.painter().rect_filled(full, 0.0, Style::BG);
 
@@ -736,22 +767,24 @@ pub fn airspace_panel(ui: &mut Ui, state: &mut AirspaceState) {
             (full.height() - Style::SP_M * 2.0).max(80.0),
         ),
     );
-    paint_radar_scope(ui, scope_rect, state, t);
+    let mut stats = paint_radar_scope(ui, scope_rect, state, t);
 
     let panel_rect = Rect::from_min_max(
         Pos2::new(scope_rect.right() + Style::SP_M, full.top() + Style::SP_M),
         full.max - Vec2::splat(Style::SP_M),
     );
     if panel_rect.width() > 60.0 {
-        paint_live_panel(ui, panel_rect, state, t);
+        stats.live_panel_rows = paint_live_panel(ui, panel_rect, state, t).live_panel_rows;
     }
+    stats
 }
 
 /// The PPI radar scope — the graphical centerpiece.
-fn paint_radar_scope(ui: &mut Ui, rect: Rect, state: &mut AirspaceState, t: f32) {
+fn paint_radar_scope(ui: &mut Ui, rect: Rect, state: &mut AirspaceState, t: f32) -> PaintStats {
     let p = ui.painter_at(rect);
     let center = rect.center();
     let radius = (rect.width().min(rect.height()) * 0.5 - 6.0).max(20.0);
+    let mut stats = PaintStats::default();
 
     // Scope face + range rings (dim), with a subtle green scope tint.
     p.circle_filled(center, radius, Style::BG);
@@ -838,6 +871,7 @@ fn paint_radar_scope(ui: &mut Ui, rect: Rect, state: &mut AirspaceState, t: f32)
             p.circle_stroke(pos, sz + 3.0, Stroke::new(1.5, Style::DANGER));
         }
         p.circle_filled(pos, sz, base.gamma_multiply(0.55 + pulse * 0.45));
+        stats.radar_blips += 1;
         // Label strong / notable / watchlist blips.
         if str_frac > 0.55 || s.notable || s.watchlist {
             p.text(
@@ -892,6 +926,7 @@ fn paint_radar_scope(ui: &mut Ui, rect: Rect, state: &mut AirspaceState, t: f32)
     // airspace says so explicitly — never fake radar. The typed worker status
     // distinguishes an unconfigured scanner from an attempted/offline one.
     if state.signals.is_empty() {
+        stats.empty_badge = true;
         let detail = match state.source_status {
             mackes_mesh_types::airspace::AirspaceAvailability::NoSource => {
                 "MG90 scanner source not configured"
@@ -916,13 +951,15 @@ fn paint_radar_scope(ui: &mut Ui, rect: Rect, state: &mut AirspaceState, t: f32)
             Style::TEXT_DIM,
         );
     }
+    stats
 }
 
 /// The live-now panel — grouped by type, bars + dBm, with the research detail.
-fn paint_live_panel(ui: &mut Ui, rect: Rect, state: &mut AirspaceState, t: f32) {
+fn paint_live_panel(ui: &mut Ui, rect: Rect, state: &mut AirspaceState, t: f32) -> PaintStats {
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(*ui.layout()));
     child.set_clip_rect(rect);
     let ui = &mut child;
+    let mut stats = PaintStats::default();
 
     // Type filter toggles.
     ui.horizontal(|ui| {
@@ -1075,12 +1112,14 @@ fn paint_live_panel(ui: &mut Ui, rect: Rect, state: &mut AirspaceState, t: f32) 
                         FontId::proportional(Style::SMALL),
                         Style::TEXT_DIM,
                     );
+                    stats.live_panel_rows += 1;
                     if resp.clicked() {
                         state.selected = Some(s.id.clone());
                     }
                 }
             }
         });
+    stats
 }
 
 #[cfg(test)]
@@ -1105,6 +1144,26 @@ mod tests {
             collect(&clipped.shape, &mut texts);
         }
         texts
+    }
+
+    fn paint_proof_contact(
+        id: &str,
+        name: &str,
+        kind: mackes_mesh_types::airspace::AirspaceContactKind,
+        bearing_deg: f32,
+    ) -> mackes_mesh_types::airspace::AirspaceContact {
+        mackes_mesh_types::airspace::AirspaceContact {
+            id: id.to_string(),
+            kind,
+            name: name.to_string(),
+            signal_dbm: -52,
+            bearing_deg,
+            channel: Some(36),
+            encryption: Some("WPA3".to_string()),
+            notable: false,
+            watchlist: false,
+            own: false,
+        }
     }
 
     #[test]
@@ -1511,6 +1570,7 @@ mod tests {
 
             let ctx = egui::Context::default();
             Style::install(&ctx);
+            let mut stats = PaintStats::default();
             let out = ctx.run(
                 egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 820.0))),
@@ -1520,15 +1580,93 @@ mod tests {
                 },
                 |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
-                        airspace_panel(ui, &mut state);
+                        stats = airspace_panel_with_stats(ui, &mut state);
                     });
                 },
+            );
+            assert_eq!(
+                stats,
+                PaintStats {
+                    radar_blips: 0,
+                    live_panel_rows: 0,
+                    empty_badge: true,
+                },
+                "source-less/offline mirrors must paint the honest empty state, not retained contacts"
             );
             let texts = painted_texts(&out.shapes);
             assert!(texts.iter().any(|text| text == "NO SCANNER FEED"));
             assert!(texts.iter().any(|text| text == expected_detail));
             assert!(!texts.iter().any(|text| text == "forged-contact"));
         }
+    }
+
+    #[test]
+    fn fresh_ready_mirror_has_headless_contact_paint_proof() {
+        let mut state = AirspaceState::live();
+        let snapshot = mackes_mesh_types::airspace::AirspaceSnapshot::from_survey(
+            "mg90-live",
+            42,
+            mackes_mesh_types::airspace::AirspaceSurvey {
+                scanned_at_ms: Some(41),
+                contacts: vec![
+                    paint_proof_contact(
+                        "aa:bb:cc:00:01",
+                        "drive-wifi",
+                        mackes_mesh_types::airspace::AirspaceContactKind::Wifi,
+                        12.0,
+                    ),
+                    paint_proof_contact(
+                        "cell-01",
+                        "drive-cell",
+                        mackes_mesh_types::airspace::AirspaceContactKind::Cell,
+                        128.0,
+                    ),
+                    paint_proof_contact(
+                        "bt-01",
+                        "drive-bt",
+                        mackes_mesh_types::airspace::AirspaceContactKind::Bluetooth,
+                        246.0,
+                    ),
+                ],
+                gaps: Vec::new(),
+            },
+        );
+        state.refresh_from_wire_at(&snapshot, 43);
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut stats = PaintStats::default();
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 820.0))),
+                events: Vec::new(),
+                time: Some(1.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    stats = airspace_panel_with_stats(ui, &mut state);
+                });
+            },
+        );
+
+        assert_eq!(stats.radar_blips, 3);
+        assert_eq!(stats.live_panel_rows, 3);
+        assert!(
+            stats.has_contact_paint(),
+            "fresh folded contacts should reach the radar and live-panel paint paths"
+        );
+        let texts = painted_texts(&out.shapes);
+        for expected in ["drive-wifi", "drive-cell", "drive-bt"] {
+            assert!(
+                texts.iter().any(|text| text == expected),
+                "painted frame should include {expected}: {texts:?}"
+            );
+        }
+        assert!(
+            !texts.iter().any(|text| text == "NO SCANNER FEED"),
+            "fresh retained contacts must not paint the empty scanner badge"
+        );
     }
 
     #[test]

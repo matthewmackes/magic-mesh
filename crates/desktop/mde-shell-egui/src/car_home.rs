@@ -1132,6 +1132,58 @@ mod tests {
         out
     }
 
+    fn car_home_body_rect(screen_size: Vec2) -> Rect {
+        let full = Rect::from_min_size(pos2(0.0, 0.0), screen_size);
+        let inner = Rect::from_min_max(
+            full.min + Vec2::splat(Style::SP_L),
+            full.max - Vec2::splat(Style::SP_L),
+        );
+        Rect::from_min_max(
+            pos2(inner.left(), inner.top() + Style::DISPLAY + Style::SP_M),
+            inner.max,
+        )
+    }
+
+    fn captured_car_home_canvas(
+        glance: &CarHomeGlance,
+        screen_size: Vec2,
+    ) -> crate::screenshot::Canvas {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let input = || egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), screen_size)),
+            ..Default::default()
+        };
+        let mut cap = crate::screenshot::Capture::new();
+        let mut render = |ctx: &egui::Context| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ctx, |ui| {
+                    let _ = car_home_panel(ui, glance);
+                });
+        };
+        let _settle = cap.frame(&ctx, input(), &mut render);
+        let canvas = cap.frame(&ctx, input(), &mut render);
+        assert_eq!(
+            (canvas.width(), canvas.height()),
+            (
+                screen_size.x.round() as usize,
+                screen_size.y.round() as usize
+            ),
+            "Car Home pixel proof canvas must match the driven viewport"
+        );
+        assert!(!canvas.is_blank(), "Car Home pixel proof must not be blank");
+        canvas
+    }
+
+    fn rect_pixels(rect: Rect, canvas: &crate::screenshot::Canvas) -> usize {
+        let x0 = rect.left().floor().max(0.0) as usize;
+        let y0 = rect.top().floor().max(0.0) as usize;
+        let x1 = rect.right().ceil().min(canvas.width() as f32) as usize;
+        let y1 = rect.bottom().ceil().min(canvas.height() as f32) as usize;
+        x1.saturating_sub(x0) * y1.saturating_sub(y0)
+    }
+
     /// Q31 + honesty P8 — with no live data the cards paint their honest
     /// absent-data descriptors and never a fabricated reading.
     #[test]
@@ -1169,6 +1221,78 @@ mod tests {
                 || t.contains("ETA")
                 || t.contains("min ·")),
             "an empty glance must paint no invented readings: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn car_home_pixel_proof_paints_sync3_dashboard_and_honest_mg90_state() {
+        let screen_size = vec2(1024.0, 640.0);
+        let glance = CarHomeGlance {
+            nav: Some("12 min · 4.3 mi · ETA 14:32".to_string()),
+            media: Some("Local radio · 101.1 FM".to_string()),
+            comms: Some(2),
+            vehicle: Some("MG90 stale · no fix".to_string()),
+            vehicle_live: false,
+        };
+        let canvas = captured_car_home_canvas(&glance, screen_size);
+        let body = car_home_body_rect(screen_size);
+        let layout = dashboard_layout(body).expect("pixel proof body lays out");
+
+        let total_pixels = canvas.width() * canvas.height();
+        let bg_pixels = canvas.count_exact_color(Style::SYNC3_BG);
+        assert!(
+            bg_pixels > total_pixels / 20,
+            "Car Home proof must paint the SYNC3 ground, got {bg_pixels}/{total_pixels}"
+        );
+
+        let nav_interior = Rect::from_min_max(
+            layout.nav_card.min + Vec2::splat(Style::SP_L),
+            layout.nav_card.max - Vec2::splat(Style::SP_L),
+        );
+        let nav_surface_pixels =
+            canvas.count_near_color_in_rect(nav_interior, Style::SYNC3_SURFACE, 1);
+        let nav_interior_pixels = rect_pixels(nav_interior, &canvas);
+        assert!(
+            (nav_surface_pixels as f32) >= (nav_interior_pixels as f32 * 0.55),
+            "Navigation card must rasterize as a SYNC3 surface, got {nav_surface_pixels}/{nav_interior_pixels}"
+        );
+
+        let accent_cap = Rect::from_min_max(
+            layout.nav_card.min,
+            pos2(
+                layout.nav_card.right(),
+                (layout.nav_card.top() + Style::SP_XS).min(layout.nav_card.bottom()),
+            ),
+        );
+        let accent_pixels = canvas.count_near_color_in_rect(accent_cap, Style::SYNC3_ACCENT, 4);
+        let accent_total = rect_pixels(accent_cap, &canvas);
+        assert!(
+            (accent_pixels as f32) >= (accent_total as f32 * 0.70),
+            "Navigation card must retain its Ford-blue accent cap, got {accent_pixels}/{accent_total}"
+        );
+
+        let inset = Rect::from_min_max(
+            layout.glance_card.min + Vec2::splat(Style::SP_M),
+            layout.glance_card.max - Vec2::splat(Style::SP_M),
+        );
+        let half = inset.height() / 2.0;
+        let vehicle_row = Rect::from_min_size(inset.min, vec2(inset.width(), half));
+        let comms_row = Rect::from_min_size(
+            pos2(inset.left(), inset.top() + half),
+            vec2(inset.width(), half),
+        );
+        let vehicle_dim = canvas.count_near_color_in_rect(vehicle_row, Style::SYNC3_TEXT_DIM, 24);
+        let vehicle_strong =
+            canvas.count_near_color_in_rect(vehicle_row, Style::SYNC3_TEXT_STRONG, 24);
+        assert!(
+            vehicle_dim > 24 && vehicle_dim > vehicle_strong * 2,
+            "stale MG90 vehicle text must rasterize dim, not live-strong ({vehicle_dim} dim vs {vehicle_strong} strong pixels)"
+        );
+
+        let comms_strong = canvas.count_near_color_in_rect(comms_row, Style::SYNC3_TEXT_STRONG, 24);
+        assert!(
+            comms_strong > 24,
+            "live alert count must rasterize as strong Car text, got {comms_strong} pixels"
         );
     }
 
