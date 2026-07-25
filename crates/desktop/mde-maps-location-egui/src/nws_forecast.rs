@@ -28,7 +28,7 @@ pub struct NwsForecastLayerState {
 impl NwsForecastLayerState {
     /// Replace the prior current/drive-ahead sample set wholesale.
     pub fn fold(&mut self, snapshot: NwsForecastSnapshot) {
-        self.snapshot = Some(snapshot);
+        self.snapshot = Some(bound_snapshot(snapshot));
     }
 
     /// Feed age derived from NWS `generatedAt`, never merely local fetch success.
@@ -78,6 +78,29 @@ impl NwsForecastLayerState {
     pub const fn attribution() -> &'static str {
         ATTRIBUTION
     }
+}
+
+/// Bound a retained mirror before it can survive into the next frame.
+///
+/// The producer normally sends these vectors in bounded form, but another
+/// node can write the retained snapshot directly. Rebuilding the vectors (as
+/// opposed to only truncating them) also drops hostile excess capacity.
+fn bound_snapshot(mut snapshot: NwsForecastSnapshot) -> NwsForecastSnapshot {
+    let samples = snapshot
+        .samples
+        .into_iter()
+        .take(MAX_PAINTABLE_SAMPLES)
+        .map(|mut sample| {
+            sample.periods = sample
+                .periods
+                .into_iter()
+                .take(MAX_PAINTABLE_PERIODS_PER_SAMPLE)
+                .collect();
+            sample
+        })
+        .collect();
+    snapshot.samples = samples;
+    snapshot
 }
 
 /// Observable painter facts used by headless tests.
@@ -431,6 +454,12 @@ mod tests {
 
         let mut layer = NwsForecastLayerState::default();
         layer.fold(retained);
+        let retained = layer.snapshot.as_ref().expect("bounded snapshot");
+        assert_eq!(retained.samples.len(), MAX_PAINTABLE_SAMPLES);
+        assert!(retained
+            .samples
+            .iter()
+            .all(|sample| sample.periods.len() == MAX_PAINTABLE_PERIODS_PER_SAMPLE));
         let ctx = egui::Context::default();
         let mut projected = 0;
         let mut bounded = PaintStats::default();
@@ -494,5 +523,40 @@ mod tests {
         assert_eq!(stats.samples_considered, 1);
         assert_eq!(stats.periods_considered, 0);
         assert!(stats.non_live);
+    }
+
+    #[test]
+    fn hostile_retention_bounds_preserve_stale_and_no_data_states() {
+        let now = 1_000_000;
+        let mut stale = snapshot(now - SNAPSHOT_STALE_AFTER_MS - 1);
+        let base = stale.samples[0].clone();
+        stale.samples = (0..MAX_PAINTABLE_SAMPLES + 3)
+            .map(|_| {
+                let mut sample = base.clone();
+                sample.periods = (0..MAX_PAINTABLE_PERIODS_PER_SAMPLE + 3)
+                    .map(|_| base.periods[0].clone())
+                    .collect();
+                sample
+            })
+            .collect();
+
+        let mut layer = NwsForecastLayerState::default();
+        layer.fold(stale);
+        assert!(
+            layer.stale(now),
+            "retention bounds must not make stale data live"
+        );
+        let retained = layer.snapshot.as_ref().expect("retained snapshot");
+        assert_eq!(retained.samples.len(), MAX_PAINTABLE_SAMPLES);
+        assert!(retained
+            .samples
+            .iter()
+            .all(|sample| sample.periods.len() == MAX_PAINTABLE_PERIODS_PER_SAMPLE));
+
+        layer.fold(NwsForecastSnapshot::unavailable("rig-1", "no fresh fix"));
+        let unavailable = layer.snapshot.as_ref().expect("unavailable snapshot");
+        assert!(unavailable.samples.is_empty());
+        assert_eq!(layer.age_ms(now), None);
+        assert!(!layer.stale(now));
     }
 }

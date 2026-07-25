@@ -20,7 +20,7 @@ instead of leaving closed work in this file.
 
 - **6 active epics:** 6 `Remaining`, 0 `Blocked`; no `Needs clarification`.
 - **Release gate:** the current integrated wave passes the full `mackesd` farm
-  suite at **4,107 passed, 0 failed, 1 ignored**. The Fedora 44
+  suite at **4,113 passed, 0 failed, 1 ignored**. The Fedora 44
   base/browser/thin-lighthouse RPM cut is green at **81.7 / 39.1 / 11.0 MiB**;
   the exact base RPM requires the F44 FFmpeg ABI (`libavcodec.so.62`,
   `libswresample.so.6`, `libswscale.so.9`).
@@ -252,6 +252,18 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-SEC-006 - Keep Nebula private keys local to their owning node
 
 - Status: Remaining
+- Progress (2026-07-25 replay-ledger root boundary): armed-token replay roots
+  now walk and validate every missing parent component, reject symlinks and
+  non-directories before use, and retain `0700` permissions on both the root
+  and spent-nonce store. Root/store symlink escape regressions are covered by
+  the focused `mackesd` gate at **30/30**; the integrated BigBoy gate is
+  **4,113 passed, 0 failed, 1 ignored**. Live Nebula rotation/reconnect/prune
+  evidence remains external.
+- Progress (2026-07-25 bundle-watch input boundary): the Nebula supervisor
+  ignores final symlinks and non-regular bundle leaves, leaving them
+  unacknowledged so a regular replacement is retried. The supervisor farm slice
+  is green at **48/48**; live rotation/reconnect/prune evidence remains
+  external.
 - Progress (2026-07-25 CSR discovery boundary): the Nebula CSR watcher now
   rejects symlinked or non-regular roots, peer directories, CSR leaves, and
   bundle leaves, and caps one shared-root scan at 4,096 entries before
@@ -633,6 +645,13 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-ARCH-007 - Repair Workloads cockpit E2E wire, placement, and authorization
 
 - Status: Remaining
+- Progress (2026-07-25 image-catalog boundary): Workloads image roster and
+  promotion now reject symlinked image roots/version directories, bounded
+  manifest/sidecar reads use no-follow regular files, artifact discovery skips
+  links and special files, and promotion replaces marker/sidecar leaves
+  atomically. The focused image farm gate is green at **16/16** and the
+  integrated BigBoy `mackesd` gate is **4,113 passed, 0 failed, 1 ignored**;
+  live libvirt/KVM lifecycle evidence remains external.
 - Progress (2026-07-25 desired-document no-follow boundary): cloud
   reconciliation now opens desired documents with no-follow, non-blocking,
   close-on-exec descriptors before the existing 256 KiB bounded read, so a
@@ -964,6 +983,12 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-011 - Communications collaboration suite full replacement
 
 - Status: Remaining
+- Progress (2026-07-25 purge-candidate boundary): collaboration purge
+  accounting now admits only canonical lower-case 64-character SHA-256
+  digests, so signed traversal/mixed-case/malformed references remain inert
+  and cannot become filesystem purge candidates. The full core farm suite is
+  green at **66/66**; live WebRTC/SIP and sealed DO/LLM evidence remain
+  external.
 - Progress (2026-07-25 content-addressed blob boundary): the filesystem blob
   store now accepts only canonical lower-hex SHA-256 paths, rejects traversal
   and final-symlink roots/leaves for reads and purge, and caps both put/get
@@ -1553,6 +1578,11 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-012 - Maps live-data overlays (zero-cost external feeds)
 
 - Status: Remaining
+- Progress (2026-07-25 forecast-retention boundary): NWS forecast retention
+  now bounds both samples and periods before they survive into the next frame,
+  while preserving stale and unavailable states. The focused forecast gate is
+  green at **7/7** and the full Maps farm suite at **229/229**; live provider
+  and MG90 scanner-feed evidence remains external.
 - Progress (2026-07-25 map consumer input bounds): the earthquake consumer now
   caps retained event vectors before the next frame, while NWS alert polygons
   and vehicle containment reject invalid geographic coordinates and non-finite

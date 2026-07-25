@@ -28,9 +28,14 @@ use sha2::{Digest, Sha256};
 
 use mackes_mesh_types::cloud::{CloudReply, DeliveryType, ImageRow};
 
-use crate::image_catalog::{ImageKind, ImageManifest, images_dir, load_manifests, record_manifest};
+use crate::image_catalog::{
+    images_dir, record_manifest, validate_manifest, ImageKind, ImageManifest,
+};
 
-use super::super::{CloudWorker, path_key};
+#[cfg(test)]
+use crate::image_catalog::load_manifests;
+
+use super::super::{path_key, CloudWorker};
 
 /// The disk builder binary — bootc image-mode → osbuild bridge. Produces the golden
 /// qcow2 from a bootc container image (the same tool `packaging/bootc/build-image.sh`
@@ -348,13 +353,10 @@ fn build(w: &CloudWorker, verb_name: &str, body: &ImageBuildBody, raw: &str) -> 
         );
     }
 
-    let out_dir = images_dir(&w.state_root).join(&name).join(&version);
-    if let Err(e) = std::fs::create_dir_all(&out_dir) {
-        return error(
-            verb_name,
-            format!("prepare image dir {}: {e}", out_dir.display()),
-        );
-    }
+    let out_dir = match ensure_image_version_directory(&w.state_root, &name, &version) {
+        Ok(path) => path,
+        Err(reason) => return error(verb_name, format!("prepare image dir: {reason}")),
+    };
 
     // The bootc image-mode → osbuild disk build. `bootc-image-builder` writes the
     // qcow2 under `--output`; a spawn failure means the tool is absent (honest gate).
@@ -475,12 +477,25 @@ fn promote(w: &CloudWorker, verb_name: &str, body: &ImageBuildBody, raw: &str) -
         );
     }
 
-    let version_dir = images_dir(&w.state_root).join(&name).join(version);
-    if !version_dir.join("manifest.toml").is_file() {
-        return reject(
-            verb_name,
-            format!("no such image version to promote: {name}@{version}"),
-        );
+    let version_dir = match image_version_directory(&w.state_root, &name, version) {
+        Ok(Some(path)) => path,
+        Ok(None) => {
+            return reject(
+                verb_name,
+                format!("no such image version to promote: {name}@{version}"),
+            );
+        }
+        Err(reason) => return error(verb_name, format!("inspect image version: {reason}")),
+    };
+    match read_bounded_text(&version_dir.join("manifest.toml"), "image manifest") {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return reject(
+                verb_name,
+                format!("no such image version to promote: {name}@{version}"),
+            );
+        }
+        Err(e) => return error(verb_name, format!("read image manifest: {e}")),
     }
     let Some(artifact) = find_artifact(&version_dir) else {
         return error(
@@ -506,7 +521,7 @@ fn promote(w: &CloudWorker, verb_name: &str, body: &ImageBuildBody, raw: &str) -
         }
         // No sidecar (a legacy build) — record the verified hash now as the baseline.
         Ok(None) => {
-            if let Err(e) = std::fs::write(version_dir.join(SHA_SIDECAR), &actual) {
+            if let Err(e) = write_image_leaf(&version_dir.join(SHA_SIDECAR), actual.as_bytes()) {
                 return error(verb_name, format!("record SHA256 sidecar: {e}"));
             }
         }
@@ -515,7 +530,7 @@ fn promote(w: &CloudWorker, verb_name: &str, body: &ImageBuildBody, raw: &str) -
     }
 
     let marker = images_dir(&w.state_root).join(&name).join(PROMOTED_MARKER);
-    if let Err(e) = std::fs::write(&marker, version) {
+    if let Err(e) = write_image_leaf(&marker, version.as_bytes()) {
         return error(verb_name, format!("set promotion marker: {e}"));
     }
     CloudReply {
@@ -535,7 +550,7 @@ fn promote(w: &CloudWorker, verb_name: &str, body: &ImageBuildBody, raw: &str) -
 /// Fold the Syncthing-replicated manifest store into one [`ImageRow`] per image name
 /// — the promoted version when set (and present), else the newest.
 fn load_rows(root: &Path) -> Vec<ImageRow> {
-    let manifests = load_manifests(root); // newest-first
+    let manifests = load_image_manifests(root); // newest-first
     let mut seen = std::collections::BTreeSet::new();
     let mut rows = Vec::new();
     for m in &manifests {
@@ -570,14 +585,120 @@ fn load_rows(root: &Path) -> Vec<ImageRow> {
     rows
 }
 
+/// Walk the replicated image catalog without materializing a manifest through a
+/// final symlink, special file, or an unbounded read. A malformed or hostile
+/// present leaf is junk-tolerant like the catalog's historical loader: it is
+/// omitted, while an absent manifest remains an ordinary missing build.
+fn load_image_manifests(workgroup_root: &Path) -> Vec<ImageManifest> {
+    let mut out = Vec::new();
+    let Ok(Some(images)) = image_directory(workgroup_root) else {
+        return out;
+    };
+    let Ok(names) = std::fs::read_dir(images) else {
+        return out;
+    };
+    for name_entry in names.filter_map(Result::ok) {
+        let Ok(name_type) = name_entry.file_type() else {
+            continue;
+        };
+        if !name_type.is_dir() || name_type.is_symlink() {
+            continue;
+        }
+        let name = name_entry.file_name();
+        let Ok(versions) = std::fs::read_dir(name_entry.path()) else {
+            continue;
+        };
+        for ver_entry in versions.filter_map(Result::ok) {
+            let Ok(version_type) = ver_entry.file_type() else {
+                continue;
+            };
+            if !version_type.is_dir() || version_type.is_symlink() {
+                continue;
+            }
+            let manifest = ver_entry.path().join("manifest.toml");
+            let Ok(Some(raw)) = read_bounded_text(&manifest, "image manifest") else {
+                continue;
+            };
+            if let Ok(m) = toml::from_str::<ImageManifest>(&raw) {
+                // The replicated path is part of the identity. Do not surface a
+                // valid TOML blob copied under another image or version directory.
+                let path_name = name.to_string_lossy().into_owned();
+                let path_version = ver_entry.file_name().to_string_lossy().into_owned();
+                if validate_manifest(&m).is_ok() && m.name == path_name && m.version == path_version
+                {
+                    out.push(m);
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| b.built_at_ms.cmp(&a.built_at_ms));
+    out
+}
+
+/// Resolve an image-store directory only when every component is a real
+/// directory. `read_dir` and `Path::is_dir` follow links, which would let a
+/// replicated image catalog redirect reads into an unrelated tree.
+fn real_directory(path: &Path, label: &str) -> Result<Option<PathBuf>, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err(format!("{label} {} is a symlink", path.display()))
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            Err(format!("{label} {} is not a directory", path.display()))
+        }
+        Ok(_) => Ok(Some(path.to_path_buf())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("inspect {label} {}: {error}", path.display())),
+    }
+}
+
+fn image_directory(root: &Path) -> Result<Option<PathBuf>, String> {
+    real_directory(&images_dir(root), "image store")
+}
+
+fn image_name_directory(root: &Path, name: &str) -> Result<Option<PathBuf>, String> {
+    let Some(images) = image_directory(root)? else {
+        return Ok(None);
+    };
+    real_directory(&images.join(name), "image name directory")
+}
+
+fn image_version_directory(
+    root: &Path,
+    name: &str,
+    version: &str,
+) -> Result<Option<PathBuf>, String> {
+    let Some(image) = image_name_directory(root, name)? else {
+        return Ok(None);
+    };
+    real_directory(&image.join(version), "image version directory")
+}
+
+fn ensure_real_directory(path: &Path, label: &str) -> Result<PathBuf, String> {
+    if let Some(path) = real_directory(path, label)? {
+        return Ok(path);
+    }
+    std::fs::create_dir(path)
+        .map_err(|error| format!("create {label} {}: {error}", path.display()))?;
+    real_directory(path, label)?
+        .ok_or_else(|| format!("created {label} {} disappeared before use", path.display()))
+}
+
+fn ensure_image_version_directory(
+    root: &Path,
+    name: &str,
+    version: &str,
+) -> Result<PathBuf, String> {
+    let images = ensure_real_directory(&images_dir(root), "image store")?;
+    let image = ensure_real_directory(&images.join(name), "image name directory")?;
+    ensure_real_directory(&image.join(version), "image version directory")
+}
+
 /// Read the promotion marker for `name` (the active-base version), if set.
 fn read_promoted(root: &Path, name: &str) -> Option<String> {
     path_key::segment("image name", name).ok()?;
-    let value = read_bounded_text(
-        &images_dir(root).join(name).join(PROMOTED_MARKER),
-        "promotion marker",
-    )
-    .ok()??;
+    let image = image_name_directory(root, name).ok()??;
+    let value = read_bounded_text(&image.join(PROMOTED_MARKER), "promotion marker").ok()??;
     let value = value.trim();
     path_key::segment("promoted version", value).ok()?;
     Some(value.to_string())
@@ -587,11 +708,10 @@ fn read_promoted(root: &Path, name: &str) -> Option<String> {
 fn read_sha(root: &Path, name: &str, version: &str) -> Result<Option<String>, String> {
     path_key::segment("image name", name)?;
     path_key::segment("image version", version)?;
-    let Some(value) = read_bounded_text(
-        &images_dir(root).join(name).join(version).join(SHA_SIDECAR),
-        "SHA256 sidecar",
-    )?
-    else {
+    let Some(version_dir) = image_version_directory(root, name, version)? else {
+        return Ok(None);
+    };
+    let Some(value) = read_bounded_text(&version_dir.join(SHA_SIDECAR), "SHA256 sidecar")? else {
         return Ok(None);
     };
     let value = value.trim();
@@ -604,14 +724,13 @@ fn read_sha(root: &Path, name: &str, version: &str) -> Result<Option<String>, St
 /// Read replicated text with a hard byte ceiling. The metadata check avoids a
 /// large allocation in the usual case; `take(cap + 1)` also closes the race where
 /// a file grows after metadata was read. Missing files retain the old optional
-/// semantics, while malformed/oversized present files fail closed.
+/// semantics, while malformed/oversized present files fail closed. The descriptor
+/// is opened with no-follow before any bytes can be materialized.
 fn read_bounded_text(path: &Path, label: &str) -> Result<Option<String>, String> {
     use std::io::Read as _;
 
-    let file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("read {label}: {error}")),
+    let Some(file) = open_replicated_regular(path, label)? else {
+        return Ok(None);
     };
     let declared_len = file
         .metadata()
@@ -632,6 +751,88 @@ fn read_bounded_text(path: &Path, label: &str) -> Result<Option<String>, String>
         .map_err(|_| format!("{label} is not valid UTF-8"))
 }
 
+/// Open one replicated image-store leaf as a regular file without following a
+/// final symlink. Missing leaves stay optional; a present directory, FIFO,
+/// device, or symlink is a hard read failure before any content is materialized.
+fn open_replicated_regular(path: &Path, label: &str) -> Result<Option<std::fs::File>, String> {
+    #[cfg(unix)]
+    let file: std::fs::File = {
+        use rustix::fs::{Mode, OFlags};
+
+        match rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd.into(),
+            Err(error) if error == rustix::io::Errno::NOENT => return Ok(None),
+            Err(error) => return Err(format!("read {label}: {error}")),
+        }
+    };
+
+    #[cfg(not(unix))]
+    let file = match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(format!("read {label}: final path is a symlink"));
+        }
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err(format!("read {label}: path is not a regular file"));
+        }
+        Ok(_) => std::fs::File::open(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("read {label}: {error}")),
+    }
+    .map_err(|error| format!("read {label}: {error}"))?;
+
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("stat {label}: {error}"))?;
+    if !metadata.file_type().is_file() {
+        return Err(format!("read {label}: path is not a regular file"));
+    }
+    Ok(Some(file))
+}
+
+/// Replace one replicated marker/sidecar atomically. The temporary inode is
+/// created exclusively and the final rename replaces a hostile leaf rather
+/// than following it; the parent is checked as a real directory first.
+fn write_image_leaf(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write as _;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("image leaf {} has no parent", path.display()))?;
+    real_directory(parent, "image leaf parent")?
+        .ok_or_else(|| format!("image leaf parent {} is missing", parent.display()))?;
+    let leaf = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("image leaf {} has an invalid name", path.display()))?;
+    let temporary = parent.join(format!(
+        ".{leaf}.tmp.{}.{}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(|error| format!("create image leaf temporary file: {error}"))?;
+    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(&temporary);
+        return Err(format!("persist image leaf: {error}"));
+    }
+    drop(file);
+    if let Err(error) = std::fs::rename(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(format!("replace image leaf {}: {error}", path.display()));
+    }
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("sync image leaf parent {}: {error}", parent.display()))
+}
+
 /// The produced disk artifact under `dir`: the largest file (recursively) with a
 /// recognized image extension. `None` when the builder produced nothing (honest —
 /// never a fabricated artifact path).
@@ -644,8 +845,17 @@ fn find_artifact(dir: &Path) -> Option<PathBuf> {
         };
         for e in entries.filter_map(Result::ok) {
             let p = e.path();
-            if p.is_dir() {
+            let Ok(file_type) = e.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
                 stack.push(p);
+                continue;
+            }
+            if !file_type.is_file() {
                 continue;
             }
             let is_image = p
@@ -655,7 +865,7 @@ fn find_artifact(dir: &Path) -> Option<PathBuf> {
             if !is_image {
                 continue;
             }
-            let size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+            let size = std::fs::symlink_metadata(&p).map(|m| m.len()).unwrap_or(0);
             if best.as_ref().is_none_or(|(b, _)| size > *b) {
                 best = Some((size, p));
             }
@@ -667,8 +877,8 @@ fn find_artifact(dir: &Path) -> Option<PathBuf> {
 /// Stream a file through SHA256, returning `(hex_digest, byte_len)`.
 fn hash_file(path: &Path) -> Result<(String, u64), String> {
     use std::io::Read as _;
-    let mut file =
-        std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let mut file = open_replicated_regular(path, "image artifact")?
+        .ok_or_else(|| format!("image artifact {} is missing", path.display()))?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
     let mut total: u64 = 0;
@@ -778,7 +988,7 @@ mod tests {
 
     use super::super::super::gate::{ArmedToken, HmacTokenSigner};
     use super::super::super::runner::fake::FakeRunner;
-    use super::super::super::{CloudWorker, now_ms};
+    use super::super::super::{now_ms, CloudWorker};
     use super::*;
 
     const KEY: &[u8] = b"test-mesh-arming-key";
@@ -792,6 +1002,7 @@ mod tests {
         CloudWorker::new("me".into(), "peer:me".into(), root.to_path_buf())
             .with_runner(runner)
             .with_signer(Arc::new(signer()))
+            .with_auth_root(root.join("cloud-auth"))
             .with_bus_root(None)
     }
 
@@ -880,11 +1091,9 @@ mod tests {
         assert_eq!(manifests[0].version, "1.0");
         assert_eq!(manifests[0].kind, "vm");
         // The SHA256 sidecar replicates alongside the image.
-        assert!(
-            read_sha(tmp.path(), "desktop_vm-golden", "1.0")
-                .unwrap()
-                .is_some()
-        );
+        assert!(read_sha(tmp.path(), "desktop_vm-golden", "1.0")
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -904,12 +1113,10 @@ mod tests {
         let first = w.handle("image-build", &raw);
         assert!(!first.ok);
         assert!(first.gated.is_none(), "invalid input must not reach auth");
-        assert!(
-            first
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("must not begin with `-`"))
-        );
+        assert!(first
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("must not begin with `-`")));
 
         // Replaying the exact request reaches the same pre-auth rejection: the
         // armed nonce was never claimed, and the runner was never dispatched.
@@ -935,18 +1142,14 @@ mod tests {
         let reply = handle(&w, "image-build", &raw);
         assert!(!reply.ok);
         assert!(reply.gated.is_none(), "oversized input must fail closed");
-        assert!(
-            reply
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("request exceeds"))
-        );
-        assert!(
-            reply
-                .error
-                .as_deref()
-                .is_some_and(|error| error.len() <= MAX_REPLY_TEXT_BYTES)
-        );
+        assert!(reply
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("request exceeds")));
+        assert!(reply
+            .error
+            .as_deref()
+            .is_some_and(|error| error.len() <= MAX_REPLY_TEXT_BYTES));
         assert!(runner.tool_calls.lock().unwrap().is_empty());
     }
 
@@ -993,18 +1196,94 @@ mod tests {
         }));
         let reply = w.handle("image-build", &promote_raw);
         assert!(!reply.ok);
-        assert!(
-            reply
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("sidecar"))
+        assert!(reply
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("sidecar")));
+        assert!(reply
+            .error
+            .as_deref()
+            .is_some_and(|error| error.len() <= MAX_REPLY_TEXT_BYTES));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replicated_manifest_and_text_leaves_reject_symlinks_and_non_regular_files() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let runner = Arc::new(FakeRunner::default());
+        let w = armed_worker(tmp.path(), runner);
+        let build_raw = armed_request(serde_json::json!({
+            "schema_version": 1,
+            "node": "me", "action": "build", "name": "gold", "version": "1.0"
+        }));
+        assert!(w.handle("image-build", &build_raw).ok);
+
+        let version_dir = images_dir(tmp.path()).join("gold").join("1.0");
+        let manifest = version_dir.join("manifest.toml");
+        let manifest_target = tmp.path().join("outside-manifest.toml");
+        std::fs::copy(&manifest, &manifest_target).unwrap();
+        std::fs::remove_file(&manifest).unwrap();
+        symlink(&manifest_target, &manifest).unwrap();
+
+        // A valid manifest outside the replicated lane must not become a roster row.
+        let listed = w.handle(
+            "image-build",
+            r#"{"schema_version":1,"node":"me","action":"list"}"#,
         );
-        assert!(
-            reply
-                .error
-                .as_deref()
-                .is_some_and(|error| error.len() <= MAX_REPLY_TEXT_BYTES)
-        );
+        assert!(listed.ok);
+        assert!(listed.images.as_deref().is_some_and(|rows| rows.is_empty()));
+
+        // Promotion checks the same leaf before hashing or writing the marker.
+        let promote_raw = armed_request(serde_json::json!({
+            "schema_version": 1,
+            "node": "me", "action": "promote", "name": "gold", "version": "1.0"
+        }));
+        let promoted = w.handle("image-build", &promote_raw);
+        assert!(!promoted.ok);
+        assert!(promoted
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("manifest")));
+
+        let missing = version_dir.join("missing-text");
+        assert_eq!(read_bounded_text(&missing, "missing text").unwrap(), None);
+
+        let directory = version_dir.join("directory-text");
+        std::fs::create_dir(&directory).unwrap();
+        assert!(read_bounded_text(&directory, "directory text").is_err());
+
+        let sidecar = version_dir.join(SHA_SIDECAR);
+        let sidecar_target = tmp.path().join("outside-sha256");
+        std::fs::write(&sidecar_target, "a".repeat(64)).unwrap();
+        std::fs::remove_file(&sidecar).unwrap();
+        symlink(&sidecar_target, &sidecar).unwrap();
+        assert!(read_sha(tmp.path(), "gold", "1.0").is_err());
+
+        let marker = images_dir(tmp.path()).join("gold").join(PROMOTED_MARKER);
+        let marker_target = tmp.path().join("outside-promoted");
+        std::fs::write(&marker_target, "1.0").unwrap();
+        symlink(&marker_target, &marker).unwrap();
+        assert!(read_promoted(tmp.path(), "gold").is_none());
+        write_image_leaf(&marker, b"1.0").unwrap();
+        assert_eq!(std::fs::read_to_string(&marker_target).unwrap(), "1.0");
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "1.0");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replicated_image_directory_symlinks_are_not_catalog_roots() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let images = images_dir(tmp.path());
+        std::fs::create_dir_all(&images).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), images.join("gold")).unwrap();
+
+        assert!(load_rows(tmp.path()).is_empty());
+        assert!(image_version_directory(tmp.path(), "gold", "1.0").is_err());
     }
 
     #[test]
@@ -1041,24 +1320,18 @@ mod tests {
             pick_log(&huge, ""),
         );
         assert!(diagnostic.verb.len() <= MAX_REPLY_TEXT_BYTES);
-        assert!(
-            diagnostic
-                .error
-                .as_deref()
-                .is_some_and(|error| error.len() <= MAX_REPLY_TEXT_BYTES)
-        );
-        assert!(
-            diagnostic
-                .raw_log
-                .as_deref()
-                .is_some_and(|log| log.len() <= MAX_RAW_LOG_BYTES)
-        );
-        assert!(
-            diagnostic
-                .raw_log
-                .as_deref()
-                .is_some_and(|log| log.is_char_boundary(log.len()))
-        );
+        assert!(diagnostic
+            .error
+            .as_deref()
+            .is_some_and(|error| error.len() <= MAX_REPLY_TEXT_BYTES));
+        assert!(diagnostic
+            .raw_log
+            .as_deref()
+            .is_some_and(|log| log.len() <= MAX_RAW_LOG_BYTES));
+        assert!(diagnostic
+            .raw_log
+            .as_deref()
+            .is_some_and(|log| log.is_char_boundary(log.len())));
     }
 
     #[test]

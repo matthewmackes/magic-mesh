@@ -229,22 +229,20 @@ impl NebulaSupervisor {
         //    changes (ENT-3: a revoke anywhere must evict here).
         let blocklist_now = crate::ca::blocklist::all_fingerprints(&self.workgroup_root);
         let blocklist_changed = blocklist_now != self.last_blocklist;
-        if let Ok(meta) = std::fs::metadata(&self.bundle_path) {
-            if let Ok(mtime) = meta.modified() {
-                if self.last_bundle_mtime.map_or(true, |t| t != mtime) || blocklist_changed {
-                    match self.refresh_config().await {
-                        Ok(()) => {
-                            // A watch marker is an acknowledgement, not an
-                            // observation.  Do not advance it after a failed
-                            // refresh: a transiently partial or hostile
-                            // bundle must be retried on the next tick instead
-                            // of being recorded as applied.
-                            self.last_bundle_mtime = Some(mtime);
-                            self.last_blocklist = blocklist_now;
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "nebula-supervisor: config refresh failed; will retry");
-                        }
+        if let Some(mtime) = bundle_watch_mtime(&self.bundle_path) {
+            if self.last_bundle_mtime.map_or(true, |t| t != mtime) || blocklist_changed {
+                match self.refresh_config().await {
+                    Ok(()) => {
+                        // A watch marker is an acknowledgement, not an
+                        // observation.  Do not advance it after a failed
+                        // refresh: a transiently partial or hostile
+                        // bundle must be retried on the next tick instead
+                        // of being recorded as applied.
+                        self.last_bundle_mtime = Some(mtime);
+                        self.last_blocklist = blocklist_now;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "nebula-supervisor: config refresh failed; will retry");
                     }
                 }
             }
@@ -1277,6 +1275,19 @@ fn systemctl_reload(path: &Path, unit: &str) -> Result<(), String> {
     systemctl(path, "reload-or-restart", unit)
 }
 
+/// Observe a bundle only when its final path component is a regular, non-link
+/// file. `read_bundle` consumes through a no-follow descriptor, but using
+/// `metadata` here would follow a hostile final symlink and make the watcher
+/// schedule a read of an input it did not authorize. Returning `None` leaves
+/// the acknowledgement state unchanged, so a later replacement is retried.
+fn bundle_watch_mtime(path: &Path) -> Option<SystemTime> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return None;
+    }
+    metadata.modified().ok()
+}
+
 /// Verify both halves of the local leadership contract:
 ///
 /// 1. the marker is an owner-checked, exact-schema file naming this node; and
@@ -2182,6 +2193,104 @@ exit 0
             "the unchanged bundle must be retried and acknowledged after recovery"
         );
         assert_eq!(supervisor.last_blocklist, vec![fingerprint]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn final_symlinked_bundle_is_ignored_until_replaced() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let bundle_path = root.join("nebula-bundle.json");
+        let outside = tempfile::tempdir().expect("outside");
+        let target = outside.path().join("bundle.json");
+        crate::ca::bundle::write_bundle(&target, &sample_bundle()).expect("seed target bundle");
+        symlink(&target, &bundle_path).expect("bundle symlink");
+
+        let config_dir = root.join("nebula");
+        materialize_config(
+            &config_dir,
+            &sample_bundle(),
+            ConfigRole::Peer,
+            &[],
+            root,
+            Some(b"local-key"),
+        )
+        .expect("seed local identity");
+        let conn = crate::store::open(&root.join("store.sqlite")).expect("open");
+        let mut supervisor = NebulaSupervisor::new(
+            Arc::new(Mutex::new(conn)),
+            "peer:test".into(),
+            "m1".into(),
+            bundle_path.clone(),
+        )
+        .with_workgroup_root(root.to_path_buf())
+        .with_role_marker(root.join("role.host"))
+        .with_config_dir(config_dir)
+        .with_overlay_ip_path(root.join("overlay-ip"))
+        .with_leadership_endpoints(Vec::new())
+        .with_systemctl_path(fake_systemctl_succeeds(root));
+
+        supervisor.tick().await;
+        assert!(
+            supervisor.last_bundle_mtime.is_none(),
+            "a final bundle symlink must be ignored and remain unacknowledged"
+        );
+
+        std::fs::remove_file(&bundle_path).expect("remove bundle symlink");
+        crate::ca::bundle::write_bundle(&bundle_path, &sample_bundle()).expect("replace bundle");
+        supervisor.tick().await;
+        assert!(
+            supervisor.last_bundle_mtime.is_some(),
+            "a regular replacement must be retried and acknowledged"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_regular_bundle_is_ignored_until_replaced() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let bundle_path = root.join("nebula-bundle.json");
+        std::fs::create_dir(&bundle_path).expect("bundle directory");
+
+        let config_dir = root.join("nebula");
+        materialize_config(
+            &config_dir,
+            &sample_bundle(),
+            ConfigRole::Peer,
+            &[],
+            root,
+            Some(b"local-key"),
+        )
+        .expect("seed local identity");
+        let conn = crate::store::open(&root.join("store.sqlite")).expect("open");
+        let mut supervisor = NebulaSupervisor::new(
+            Arc::new(Mutex::new(conn)),
+            "peer:test".into(),
+            "m1".into(),
+            bundle_path.clone(),
+        )
+        .with_workgroup_root(root.to_path_buf())
+        .with_role_marker(root.join("role.host"))
+        .with_config_dir(config_dir)
+        .with_overlay_ip_path(root.join("overlay-ip"))
+        .with_leadership_endpoints(Vec::new())
+        .with_systemctl_path(fake_systemctl_succeeds(root));
+
+        supervisor.tick().await;
+        assert!(
+            supervisor.last_bundle_mtime.is_none(),
+            "a non-regular bundle must be ignored and remain unacknowledged"
+        );
+
+        std::fs::remove_dir(&bundle_path).expect("remove bundle directory");
+        crate::ca::bundle::write_bundle(&bundle_path, &sample_bundle()).expect("replace bundle");
+        supervisor.tick().await;
+        assert!(
+            supervisor.last_bundle_mtime.is_some(),
+            "a regular replacement must be retried and acknowledged"
+        );
     }
 
     #[tokio::test]

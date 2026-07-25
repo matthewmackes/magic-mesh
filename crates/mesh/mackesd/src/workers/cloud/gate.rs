@@ -181,6 +181,54 @@ pub(crate) fn nonce_digest(nonce: &str) -> String {
 ///
 /// Returns an error if the replay directory cannot be secured, an expired row
 /// cannot be cleaned, or the new claim cannot be written and durably synced.
+fn ensure_replay_dir(root: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    fn ensure_directory_tree(path: &std::path::Path, label: &str) -> Result<(), String> {
+        let mut current = std::path::PathBuf::new();
+        for component in path.components() {
+            current.push(component.as_os_str());
+            match std::fs::symlink_metadata(&current) {
+                Ok(metadata)
+                    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {}
+                Ok(_) => {
+                    return Err(format!(
+                        "{label} {} is not a real directory",
+                        current.display()
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    std::fs::create_dir(&current).map_err(|error| {
+                        format!("create {label} {}: {error}", current.display())
+                    })?;
+                    let metadata = std::fs::symlink_metadata(&current).map_err(|error| {
+                        format!("inspect created {label} {}: {error}", current.display())
+                    })?;
+                    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+                        return Err(format!(
+                            "created {label} {} is not a real directory",
+                            current.display()
+                        ));
+                    }
+                }
+                Err(error) => {
+                    return Err(format!("inspect {label} {}: {error}", current.display()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    ensure_directory_tree(root, "armed-token replay root")?;
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("secure armed-token replay root {}: {error}", root.display()))?;
+    let dir = root.join("spent-nonces");
+    ensure_directory_tree(&dir, "armed-token replay store")?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("secure armed-token replay store {}: {error}", dir.display()))?;
+    Ok(dir)
+}
+
 pub(crate) fn claim_nonce(
     root: &std::path::Path,
     nonce: &str,
@@ -188,7 +236,7 @@ pub(crate) fn claim_nonce(
     now_ms: i64,
 ) -> Result<bool, String> {
     use std::io::Write as _;
-    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    use std::os::unix::fs::OpenOptionsExt as _;
 
     fn sync_directory(dir: &std::path::Path) -> Result<(), String> {
         std::fs::File::open(dir)
@@ -203,11 +251,7 @@ pub(crate) fn claim_nonce(
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     }
 
-    let dir = root.join("spent-nonces");
-    std::fs::create_dir_all(&dir)
-        .map_err(|error| format!("create armed-token replay store {}: {error}", dir.display()))?;
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-        .map_err(|error| format!("secure armed-token replay store {}: {error}", dir.display()))?;
+    let dir = ensure_replay_dir(root)?;
 
     // Tokens are rejected as expired before reaching this seam, so deleting an
     // expired row cannot revive its capability. Validate both the filename and
@@ -751,6 +795,47 @@ mod tests {
             error.contains(&MAX_CLOUD_ARM_CREDENTIAL_BYTES.to_string()),
             "unexpected error: {error}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claim_nonce_rejects_a_symlinked_replay_root_before_writing_outside() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let outside = directory.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let root = directory.path().join("auth");
+        symlink(&outside, &root).unwrap();
+
+        let error = claim_nonce(&root, "root-symlink-nonce", 10_000, 1)
+            .expect_err("a symlinked replay root must fail closed");
+        assert!(
+            error.contains("not a real directory"),
+            "unexpected error: {error}"
+        );
+        assert!(!outside.join("spent-nonces").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claim_nonce_rejects_a_symlinked_spent_nonce_dir_before_writing_outside() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("auth");
+        let outside = directory.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        symlink(&outside, root.join("spent-nonces")).unwrap();
+
+        let error = claim_nonce(&root, "ledger-symlink-nonce", 10_000, 1)
+            .expect_err("a symlinked replay store must fail closed");
+        assert!(
+            error.contains("not a real directory"),
+            "unexpected error: {error}"
+        );
+        assert!(outside.read_dir().unwrap().next().is_none());
     }
 
     #[test]

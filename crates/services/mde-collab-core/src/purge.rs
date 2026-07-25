@@ -24,6 +24,21 @@ use std::collections::{BTreeMap, BTreeSet};
 use mde_collab_types::event::CollabEventKind;
 use mde_collab_types::{ActorClock, ActorId, CollabEventEnvelope};
 
+const SHA256_HEX_LEN: usize = 64;
+
+/// Only the canonical content-address form is safe to hand to a blob store.
+///
+/// Payload references are signed, but a valid signature does not make a
+/// digest canonical: a peer can sign a path component, mixed-case hex, or an
+/// otherwise malformed string.  Such values must remain inert in purge
+/// accounting rather than becoming filesystem candidates downstream.
+fn is_canonical_payload_digest(digest: &str) -> bool {
+    digest.len() == SHA256_HEX_LEN
+        && digest
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// Tracks each member's replicated high-water clock (their "ack" of everything
 /// up to that point) and decides which deleted payloads are safe to purge.
 #[derive(Debug, Default, Clone)]
@@ -88,6 +103,9 @@ impl PurgeGate {
         known_members: &BTreeSet<ActorId>,
         sha256_hex: &str,
     ) -> bool {
+        if !is_canonical_payload_digest(sha256_hex) {
+            return false;
+        }
         self.purgeable(events, known_members).contains(sha256_hex)
     }
 }
@@ -114,7 +132,11 @@ impl PayloadRefs {
         for env in events {
             match &env.kind {
                 CollabEventKind::MessagePosted { .. } => {
-                    let sha = env.payload_ref.as_ref().map(|p| p.sha256_hex.clone());
+                    let sha = env
+                        .payload_ref
+                        .as_ref()
+                        .map(|p| p.sha256_hex.clone())
+                        .filter(|sha| is_canonical_payload_digest(sha));
                     msg_payload.insert(env.event_id, (sha, env.actor.clone()));
                 }
                 CollabEventKind::MessageDeleted { target } => {
@@ -126,8 +148,13 @@ impl PayloadRefs {
                     }
                 }
                 CollabEventKind::DocumentUpdated { change, .. } => {
-                    doc_live.insert(change.payload.sha256_hex.clone());
+                    if is_canonical_payload_digest(&change.payload.sha256_hex) {
+                        doc_live.insert(change.payload.sha256_hex.clone());
+                    }
                     if let Some(p) = &env.payload_ref {
+                        if !is_canonical_payload_digest(&p.sha256_hex) {
+                            continue;
+                        }
                         doc_live.insert(p.sha256_hex.clone());
                     }
                 }
@@ -160,5 +187,120 @@ impl PayloadRefs {
         // message or document still references those exact bytes).
         tombstoned.retain(|sha, _| !live.contains(sha));
         Self { live, tombstoned }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mde_collab_types::event::CollabEventKind;
+    use mde_collab_types::ids::{EventId, SpaceId};
+    use mde_collab_types::value::{MessageBody, PayloadRef};
+    use uuid::Uuid;
+
+    fn message_with_payload(
+        event_id: u128,
+        actor: &ActorId,
+        clock: ActorClock,
+        digest: &str,
+    ) -> CollabEventEnvelope {
+        CollabEventEnvelope::new(
+            EventId::from_uuid(Uuid::from_u128(event_id)),
+            SpaceId::nil(),
+            actor.clone(),
+            clock,
+            clock.wall_ms as i64,
+            CollabEventKind::MessagePosted {
+                body: MessageBody::new("payload"),
+                thread: None,
+            },
+        )
+        .with_payload_ref(PayloadRef {
+            sha256_hex: digest.to_owned(),
+            len: 7,
+            content_type: None,
+        })
+    }
+
+    fn delete_message(event_id: u128, actor: &ActorId, clock: ActorClock) -> CollabEventEnvelope {
+        CollabEventEnvelope::new(
+            EventId::from_uuid(Uuid::from_u128(event_id)),
+            SpaceId::nil(),
+            actor.clone(),
+            clock,
+            clock.wall_ms as i64,
+            CollabEventKind::MessageDeleted {
+                target: EventId::from_uuid(Uuid::from_u128(event_id - 1)),
+            },
+        )
+    }
+
+    #[test]
+    fn canonical_payload_digest_accepts_only_lower_hex_sha256() {
+        assert!(is_canonical_payload_digest(&"a".repeat(SHA256_HEX_LEN)));
+        assert!(!is_canonical_payload_digest(&"A".repeat(SHA256_HEX_LEN)));
+        assert!(!is_canonical_payload_digest(
+            &"0".repeat(SHA256_HEX_LEN - 1)
+        ));
+        assert!(!is_canonical_payload_digest(
+            &"0".repeat(SHA256_HEX_LEN + 1)
+        ));
+        assert!(!is_canonical_payload_digest("../purge-outside-store"));
+    }
+
+    #[test]
+    fn hostile_payload_digests_never_become_purge_candidates() {
+        let actor = ActorId::new("alice");
+        let tombstone_clock = ActorClock::at(20, 0);
+        let mut members = BTreeSet::new();
+        members.insert(actor.clone());
+        let mut gate = PurgeGate::new();
+        gate.note_ack(&actor, tombstone_clock);
+
+        for (event_id, digest) in [
+            (10, "../purge-outside-store".to_owned()),
+            (20, "A".repeat(SHA256_HEX_LEN)),
+            (30, "0".repeat(SHA256_HEX_LEN - 1)),
+        ] {
+            let post = message_with_payload(
+                event_id,
+                &actor,
+                ActorClock::at(10, event_id as u32),
+                &digest,
+            );
+            let delete = delete_message(event_id + 1, &actor, tombstone_clock);
+            let events = vec![post, delete];
+
+            assert!(gate.purgeable(&events, &members).is_empty());
+            assert!(!gate.may_purge(&events, &members, &digest));
+        }
+    }
+
+    #[test]
+    fn valid_lowercase_payload_digest_keeps_ack_gated_purge_semantics() {
+        let actor = ActorId::new("alice");
+        let digest = "b".repeat(SHA256_HEX_LEN);
+        let post_clock = ActorClock::at(10, 0);
+        let tombstone_clock = ActorClock::at(20, 0);
+        let post = message_with_payload(10, &actor, post_clock, &digest);
+        let delete = delete_message(11, &actor, tombstone_clock);
+        let mut members = BTreeSet::new();
+        members.insert(actor.clone());
+        let mut gate = PurgeGate::new();
+
+        assert!(!gate.may_purge(&[post.clone(), delete.clone()], &members, &digest));
+        gate.note_ack(&actor, tombstone_clock);
+        assert_eq!(
+            gate.purgeable(&[post, delete], &members),
+            BTreeSet::from([digest.clone()])
+        );
+        assert!(gate.may_purge(
+            &[
+                message_with_payload(10, &actor, post_clock, &digest),
+                delete_message(11, &actor, tombstone_clock),
+            ],
+            &members,
+            &digest
+        ));
     }
 }
