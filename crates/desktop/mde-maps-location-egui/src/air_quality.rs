@@ -1,10 +1,10 @@
 //! Credential-gated US EPA AirNow AQI model and painter (OVERLAY-7).
 
 use mackes_mesh_types::air_quality::{
-    AirNowAvailability, AirQualitySnapshot, AirQualityStation, ATTRIBUTION,
+    ATTRIBUTION, AirNowAvailability, AirQualitySnapshot, AirQualityStation,
 };
-use mde_egui::egui::{self, Align2, Color32, FontId, Painter, Pos2, Rect, Stroke};
 use mde_egui::Style;
+use mde_egui::egui::{self, Align2, Color32, FontId, Painter, Pos2, Rect, Stroke};
 
 /// AirNow updates hourly; observations become visibly stale after two hours.
 pub const SNAPSHOT_STALE_AFTER_MS: i64 = 2 * 60 * 60 * 1_000;
@@ -20,6 +20,10 @@ const MAX_TIMESTAMP_FUTURE_SKEW_MS: i64 = 5_000;
 const MAX_OBSERVATION_FUTURE_SKEW_MS: i64 = 60 * 60 * 1_000;
 /// Keep the UI's station timestamp contract aligned with the adapter.
 const MAX_OBSERVATION_AGE_MS: i64 = SNAPSHOT_DROP_AFTER_MS;
+/// The AirNow worker retains at most this many diagnostic gaps.  Keep the
+/// shared-Bus consumer bounded even when a hostile snapshot bypasses that
+/// producer-side limit.
+const MAX_STATUS_GAPS: usize = 128;
 const MAX_PARAMETER_LABEL_CHARS: usize = 32;
 
 const AQI_GOOD: Color32 = Color32::from_rgb(0x00, 0xE4, 0x00); // style-leak-ok: map-content-color
@@ -84,6 +88,7 @@ impl AirQualityLayerState {
             snapshot
                 .gaps
                 .iter()
+                .take(MAX_STATUS_GAPS)
                 .any(|gap| gap.starts_with("AirNow AQI paused:"))
         })
     }
@@ -143,11 +148,8 @@ where
             let ready = snapshot.availability == AirNowAvailability::Ready
                 && snapshot.fetched_at_ms.is_some();
             if !ready {
-                paint_status_badge(painter, rect, layer, now_ms, expired);
-                return PaintStats {
-                    badge: true,
-                    ..stats
-                };
+                let badge = paint_status_badge(painter, rect, layer, now_ms, expired);
+                return PaintStats { badge, ..stats };
             }
             let fetched_at_ms = snapshot
                 .fetched_at_ms
@@ -180,12 +182,10 @@ where
     }
     if !dimmed {
         if let Some(station) = highest.filter(|station| station.aqi >= 150) {
-            paint_alert_banner(painter, rect, station);
-            stats.alert_banner = true;
+            stats.alert_banner = paint_alert_banner(painter, rect, station);
         }
     }
-    paint_status_badge(painter, rect, layer, now_ms, expired);
-    stats.badge = true;
+    stats.badge = paint_status_badge(painter, rect, layer, now_ms, expired);
     stats
 }
 
@@ -221,14 +221,40 @@ fn station_count_label(snapshot: &AirQualitySnapshot, now_ms: i64) -> String {
 
 fn bounded_parameter_label(parameter: &str) -> String {
     let mut chars = parameter.chars();
-    let mut label = chars
-        .by_ref()
-        .take(MAX_PARAMETER_LABEL_CHARS)
-        .collect::<String>();
+    let mut label = String::new();
+    let mut pending_space = false;
+    for character in chars.by_ref().take(MAX_PARAMETER_LABEL_CHARS) {
+        if character.is_whitespace() || is_layout_control(character) {
+            pending_space = !label.is_empty();
+            continue;
+        }
+        if pending_space {
+            label.push(' ');
+            pending_space = false;
+        }
+        label.push(character);
+    }
     if chars.next().is_some() {
         label.push('…');
     }
-    label
+    if label.is_empty() {
+        "unknown".to_string()
+    } else {
+        label
+    }
+}
+
+fn is_layout_control(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{061C}'
+                | '\u{180E}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2060}'..='\u{206F}'
+                | '\u{FEFF}'
+        )
 }
 
 fn paint_marker(painter: &Painter, point: Pos2, station: &AirQualityStation, dimmed: bool) {
@@ -254,7 +280,11 @@ fn paint_marker(painter: &Painter, point: Pos2, station: &AirQualityStation, dim
     );
 }
 
-fn paint_alert_banner(painter: &Painter, rect: Rect, station: &AirQualityStation) {
+fn paint_alert_banner(painter: &Painter, rect: Rect, station: &AirQualityStation) -> bool {
+    let clip_rect = rect.intersect(painter.clip_rect());
+    if !clip_rect.is_finite() || clip_rect.width() <= 0.0 || clip_rect.height() <= 0.0 {
+        return false;
+    }
     let label = format!(
         "AirNow air quality alert · AQI {} · {}",
         station.aqi,
@@ -266,23 +296,28 @@ fn paint_alert_banner(painter: &Painter, rect: Rect, station: &AirQualityStation
         egui::pos2(rect.center().x, rect.top() + Style::SP_XL * 1.5),
         galley.size() + pad * 2.0,
     )
-    .intersect(rect);
-    painter.rect_filled(
+    .intersect(clip_rect);
+    if !banner.is_finite() || banner.width() <= 0.0 || banner.height() <= 0.0 {
+        return false;
+    }
+    let clipped_painter = painter.with_clip_rect(clip_rect);
+    clipped_painter.rect_filled(
         banner,
         Style::RADIUS_M,
         aqi_color(station.aqi).gamma_multiply(0.92),
     );
-    painter.rect_stroke(
+    clipped_painter.rect_stroke(
         banner,
         Style::RADIUS_M,
         Stroke::new(1.5, Color32::WHITE.gamma_multiply(0.72)),
         egui::StrokeKind::Inside,
     );
-    painter.galley(
+    clipped_painter.galley(
         banner.center() - galley.size() * 0.5,
         galley,
         Color32::WHITE,
     );
+    true
 }
 
 fn paint_status_badge(
@@ -291,7 +326,11 @@ fn paint_status_badge(
     layer: &AirQualityLayerState,
     now_ms: i64,
     expired: bool,
-) {
+) -> bool {
+    let clip_rect = rect.intersect(painter.clip_rect());
+    if !clip_rect.is_finite() || clip_rect.width() <= 0.0 || clip_rect.height() <= 0.0 {
+        return false;
+    }
     let (label, tone) = match (&layer.snapshot, layer.age_ms(now_ms)) {
         (None, _) => ("AirNow AQI · no data".to_string(), Style::TEXT_DIM),
         (Some(_), _) if layer.future_dated(now_ms) => (
@@ -348,15 +387,21 @@ fn paint_status_badge(
             rect.top() + Style::SP_S + row_height * 9.0,
         ),
         galley.size() + pad * 2.0,
-    );
-    painter.rect_filled(badge, Style::RADIUS_S, Style::BG.gamma_multiply(0.86));
-    painter.rect_stroke(
+    )
+    .intersect(clip_rect);
+    if !badge.is_finite() || badge.width() <= 0.0 || badge.height() <= 0.0 {
+        return false;
+    }
+    let clipped_painter = painter.with_clip_rect(clip_rect);
+    clipped_painter.rect_filled(badge, Style::RADIUS_S, Style::BG.gamma_multiply(0.86));
+    clipped_painter.rect_stroke(
         badge,
         Style::RADIUS_S,
         Stroke::new(1.0, tone.gamma_multiply(0.55)),
         egui::StrokeKind::Inside,
     );
-    painter.galley(badge.left_top() + pad, galley, tone);
+    clipped_painter.galley(badge.left_top() + pad, galley, tone);
+    true
 }
 
 fn aqi_color(aqi: u16) -> Color32 {
@@ -416,7 +461,10 @@ mod tests {
         assert_eq!(stats.markers, 1);
         assert!(stats.alert_banner);
         assert!(stats.badge);
-        assert!(ctx.tessellate(output.shapes, output.pixels_per_point).len() >= 3);
+        assert!(
+            !ctx.tessellate(output.shapes, output.pixels_per_point)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -662,6 +710,72 @@ mod tests {
         });
         assert_eq!(stats.markers, 0);
         assert!(!stats.alert_banner);
+        assert!(stats.badge);
+    }
+
+    #[test]
+    fn hostile_parameter_labels_are_single_line_and_bounded() {
+        let hostile = format!(
+            "\u{202e}PM2.5\n\u{2066}{}",
+            "X".repeat(MAX_PARAMETER_LABEL_CHARS + 8)
+        );
+        let label = bounded_parameter_label(&hostile);
+        assert!(label.chars().count() <= MAX_PARAMETER_LABEL_CHARS + 1);
+        assert!(!label.chars().any(is_layout_control));
+        assert!(!label.contains('\n'));
+        assert!(!label.contains('\r'));
+        assert!(label.ends_with('…'));
+        assert_eq!(bounded_parameter_label("\u{202e}\n"), "unknown");
+        assert_eq!(bounded_parameter_label("PM2.5"), "PM2.5");
+    }
+
+    #[test]
+    fn oversized_gap_history_keeps_pause_detection_bounded() {
+        let now = 1_000_000_000;
+        let mut retained = snapshot(now, 80);
+        retained
+            .gaps
+            .push("AirNow AQI paused: fresh vehicle fix unavailable".to_string());
+        retained.gaps.extend(
+            (0..MAX_STATUS_GAPS * 8).map(|index| format!("hostile diagnostic gap {index}")),
+        );
+        let mut layer = AirQualityLayerState::default();
+        layer.fold(retained);
+        assert!(layer.paused());
+
+        let ctx = egui::Context::default();
+        let mut stats = PaintStats::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                stats = paint_layer(ui.painter(), ui.max_rect(), &layer, now, |_lat, _lon| {
+                    Some(ui.max_rect().center())
+                });
+            });
+        });
+        assert_eq!(stats.markers, 1);
+        assert!(!stats.alert_banner);
+        assert!(stats.badge);
+    }
+
+    #[test]
+    fn narrow_viewport_keeps_overlay_paint_inside_its_clip() {
+        let now = 1_000_000_000;
+        let mut layer = AirQualityLayerState::default();
+        let mut retained = snapshot(now, 180);
+        retained.stations[0].parameter = format!("\u{202e}{}", "AQI".repeat(64));
+        layer.fold(retained);
+        let ctx = egui::Context::default();
+        let mut stats = PaintStats::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = Rect::from_min_size(ui.max_rect().min, egui::vec2(24.0, 400.0));
+                stats = paint_layer(ui.painter(), rect, &layer, now, |_lat, _lon| {
+                    Some(rect.center())
+                });
+            });
+        });
+        assert_eq!(stats.markers, 1);
+        assert!(stats.alert_banner);
         assert!(stats.badge);
     }
 

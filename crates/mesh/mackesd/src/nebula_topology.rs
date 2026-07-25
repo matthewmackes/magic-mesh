@@ -26,13 +26,26 @@
 //! Pure model + replicated store + route derivation; the render fragment
 //! feeds `nebula_supervisor`'s `tun.unsafe_routes`.
 
-use std::io;
+use std::collections::{BTreeMap, HashSet};
+use std::io::{self, Read};
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 /// The default-route CIDR — a hop advertising this is a full exit (W73).
 pub const EXIT_ROUTE: &str = "0.0.0.0/0";
+
+/// Keep replicated topology input bounded before JSON deserialization can
+/// allocate it. A normal advert is only a few hundred bytes; this leaves room
+/// for a deliberately large, but still useful, underlay list without making a
+/// single hostile file an unbounded-memory input.
+const MAX_ADVERT_BYTES: usize = 64 * 1024;
+/// A fleet roster larger than this is not a usable local snapshot. Fail closed
+/// rather than installing a partial route set selected by directory order.
+const MAX_ADVERT_FILES: usize = 4096;
+/// Keep one peer from turning its row into an unbounded route fan-out.
+const MAX_SUBNETS_PER_ADVERT: usize = 256;
 
 /// One hop node's advertisement (own-row fleet state): the underlay
 /// subnets it can route on the fleet's behalf.
@@ -75,20 +88,133 @@ pub fn write_advert(root: &Path, advert: &HopAdvert) -> io::Result<PathBuf> {
     Ok(path)
 }
 
-/// Read every parseable hop advertisement (junk-tolerant, sorted by hop).
+/// Read every valid hop advertisement (junk-tolerant, sorted by hop).
+///
+/// The directory is replicated input, not a trusted API. Each JSON file is
+/// bounded before parsing; malformed rows, non-canonical identities, and
+/// duplicate subnet entries are discarded. A duplicated hop identity is
+/// ambiguous, so all rows for that hop are omitted rather than letting an
+/// arbitrary directory order choose its routes. An oversized roster fails
+/// closed instead of installing a partial snapshot.
 #[must_use]
 pub fn read_adverts(root: &Path) -> Vec<HopAdvert> {
     let Ok(entries) = std::fs::read_dir(hops_dir(root)) else {
         return Vec::new();
     };
-    let mut out: Vec<HopAdvert> = entries
+
+    let mut entries: Vec<_> = entries
         .filter_map(Result::ok)
-        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
-        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
-        .filter_map(|raw| serde_json::from_str(&raw).ok())
+        .filter(|entry| {
+            entry.file_type().ok().is_some_and(|kind| kind.is_file())
+                && entry.path().extension().is_some_and(|x| x == "json")
+        })
         .collect();
-    out.sort_by(|a, b| a.hop.cmp(&b.hop));
-    out
+    entries.sort_by_key(|entry| entry.path());
+    if entries.len() > MAX_ADVERT_FILES {
+        return Vec::new();
+    }
+
+    let mut by_hop: BTreeMap<String, Vec<HopAdvert>> = BTreeMap::new();
+    for entry in entries {
+        let Some(advert) = read_advert(&entry.path()) else {
+            continue;
+        };
+        by_hop.entry(advert.hop.clone()).or_default().push(advert);
+    }
+
+    by_hop
+        .into_iter()
+        .filter_map(|(_, mut adverts)| (adverts.len() == 1).then(|| adverts.pop().unwrap()))
+        .collect()
+}
+
+/// Read one replicated row with a hard byte ceiling and validate it before it
+/// becomes part of the route-derivation input.
+fn read_advert(path: &Path) -> Option<HopAdvert> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take((MAX_ADVERT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > MAX_ADVERT_BYTES {
+        return None;
+    }
+    let raw = std::str::from_utf8(&bytes).ok()?;
+    validate_advert(serde_json::from_str(raw).ok()?)
+}
+
+/// Validate the canonical grammar emitted by `hop-advertise`. Keeping this
+/// check at the replicated-input boundary means callers cannot accidentally
+/// bypass the CLI's local-owner validation with a hand-written roster row.
+fn validate_advert(advert: HopAdvert) -> Option<HopAdvert> {
+    if !valid_hop_identity(&advert.hop) || !valid_overlay_ip(&advert.overlay_ip) {
+        return None;
+    }
+    if advert.subnets.is_empty() || advert.subnets.len() > MAX_SUBNETS_PER_ADVERT {
+        return None;
+    }
+
+    let mut seen_subnets = HashSet::with_capacity(advert.subnets.len());
+    for subnet in &advert.subnets {
+        if !valid_cidr(subnet) || !seen_subnets.insert(subnet) {
+            return None;
+        }
+    }
+    Some(advert)
+}
+
+fn valid_hop_identity(host: &str) -> bool {
+    if host.is_empty()
+        || host == "unknown"
+        || host.len() > 253
+        || host.trim() != host
+        || !host.is_ascii()
+    {
+        return false;
+    }
+    host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    })
+}
+
+fn valid_overlay_ip(value: &str) -> bool {
+    let Ok(ip) = value.parse::<Ipv4Addr>() else {
+        return false;
+    };
+    ip.to_string() == value
+        && !ip.is_unspecified()
+        && !ip.is_multicast()
+        && ip.octets() != [255, 255, 255, 255]
+}
+
+fn valid_cidr(value: &str) -> bool {
+    let Some((address, prefix)) = value.split_once('/') else {
+        return false;
+    };
+    if prefix.contains('/') {
+        return false;
+    }
+    let Ok(ip) = address.parse::<Ipv4Addr>() else {
+        return false;
+    };
+    let Ok(prefix_len) = prefix.parse::<u8>() else {
+        return false;
+    };
+    if ip.to_string() != address || prefix_len.to_string() != prefix || prefix_len > 32 {
+        return false;
+    }
+    let mask = if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - u32::from(prefix_len))
+    };
+    u32::from(ip) & mask == u32::from(ip)
 }
 
 /// Derive the `(route, via)` unsafe-route edges THIS node should install,
@@ -244,6 +370,15 @@ mod tests {
         }
     }
 
+    fn write_raw(root: &Path, name: &str, raw: &str) {
+        std::fs::create_dir_all(hops_dir(root)).unwrap();
+        std::fs::write(hops_dir(root).join(name), raw).unwrap();
+    }
+
+    fn write_json(root: &Path, name: &str, advert: &HopAdvert) {
+        write_raw(root, name, &serde_json::to_string(advert).unwrap());
+    }
+
     #[test]
     fn adverts_round_trip_through_the_store() {
         let tmp = tempfile::tempdir().unwrap();
@@ -252,6 +387,89 @@ mod tests {
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].subnets, vec!["192.168.50.0/24"]);
         assert!(!back[0].is_exit());
+    }
+
+    #[test]
+    fn read_adverts_rejects_oversized_and_malformed_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let oversized = format!(
+            r#"{{"hop":"large","overlay_ip":"10.42.0.9","subnets":["{}"]}}"#,
+            "x".repeat(MAX_ADVERT_BYTES)
+        );
+        write_raw(tmp.path(), "large.json", &oversized);
+        for (name, raw) in [
+            (
+                "bad-host.json",
+                r#"{"hop":"../escape","overlay_ip":"10.42.0.9","subnets":["192.168.50.0/24"]}"#,
+            ),
+            (
+                "bad-ip.json",
+                r#"{"hop":"bad-ip","overlay_ip":"10.42.0.999","subnets":["192.168.50.0/24"]}"#,
+            ),
+            (
+                "bad-cidr.json",
+                r#"{"hop":"bad-cidr","overlay_ip":"10.42.0.9","subnets":["192.168.50.7/24"]}"#,
+            ),
+            (
+                "duplicate-subnet.json",
+                r#"{"hop":"duplicate-subnet","overlay_ip":"10.42.0.9","subnets":["192.168.50.0/24","192.168.50.0/24"]}"#,
+            ),
+            (
+                "missing-subnets.json",
+                r#"{"hop":"missing-subnets","overlay_ip":"10.42.0.9"}"#,
+            ),
+        ] {
+            write_raw(tmp.path(), name, raw);
+        }
+        write_json(
+            tmp.path(),
+            "valid.json",
+            &advert("valid", "10.42.0.9", &["192.168.50.0/24"]),
+        );
+
+        assert_eq!(
+            read_adverts(tmp.path()),
+            vec![advert("valid", "10.42.0.9", &["192.168.50.0/24"])]
+        );
+    }
+
+    #[test]
+    fn read_adverts_omits_ambiguous_duplicate_hop_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_json(
+            tmp.path(),
+            "duplicate-a.json",
+            &advert("duplicate", "10.42.0.9", &["192.168.50.0/24"]),
+        );
+        write_json(
+            tmp.path(),
+            "duplicate-b.json",
+            &advert("duplicate", "10.42.0.10", &["192.168.60.0/24"]),
+        );
+        write_json(
+            tmp.path(),
+            "unique.json",
+            &advert("unique", "10.42.0.11", &["192.168.70.0/24"]),
+        );
+
+        assert_eq!(
+            read_adverts(tmp.path()),
+            vec![advert("unique", "10.42.0.11", &["192.168.70.0/24"])]
+        );
+    }
+
+    #[test]
+    fn read_adverts_fails_closed_on_an_oversized_roster() {
+        let tmp = tempfile::tempdir().unwrap();
+        for index in 0..=MAX_ADVERT_FILES {
+            write_json(
+                tmp.path(),
+                &format!("peer-{index}.json"),
+                &advert(&format!("peer-{index}"), "10.42.0.9", &["192.168.50.0/24"]),
+            );
+        }
+
+        assert!(read_adverts(tmp.path()).is_empty());
     }
 
     #[test]

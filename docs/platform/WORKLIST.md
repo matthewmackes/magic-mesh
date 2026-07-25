@@ -241,6 +241,12 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-SEC-006 - Keep Nebula private keys local to their owning node
 
 - Status: Remaining
+- Progress (2026-07-24 replicated-topology input hardening): Nebula hop
+  advertisements now impose byte, roster, identity, overlay-IP, CIDR, subnet,
+  duplicate-row, and duplicate-subnet boundaries before route derivation; an
+  ambiguous hop is omitted and an oversized roster fails closed. The focused
+  BigBoy topology gate is green at 9/9, with exact-file rustfmt and diff checks
+  clean. Live Nebula rotation/reconnect evidence remains external.
 - Progress (2026-07-24 relay-authority refresh hardening): the Nebula supervisor
   now refuses replicated bundle refresh and lighthouse-roster reconciliation
   when the public relay authority does not match the root-local enrollment pin.
@@ -448,6 +454,21 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-ARCH-007 - Repair Workloads cockpit E2E wire, placement, and authorization
 
 - Status: Remaining
+- Progress (2026-07-24 cloud action boundary hardening): the shared cloud action
+  parser now rejects bodies above the RPC limit before JSON materialization, and
+  container deploy rejects oversized image, port, environment, and volume
+  fields before authorization or Quadlet staging. The full BigBoy `mackesd`
+  library gate is green at 3,973 passed, 1 ignored; direct libvirt/KVM live
+  lifecycle evidence remains external.
+- Progress (2026-07-24 live rootless Quadlet lifecycle proof): the `.15`
+  placement seat ran a real Podman 5.8.4 rootless Quadlet generated from a
+  temporary `.container` unit: systemd user start, restart, journal retrieval,
+  and the same `systemctl --user disable --now` cleanup operation used by the
+  worker all completed successfully. The temporary unit, container, and pulled
+  Alpine image were removed afterward; no live success is claimed for the
+  unavailable libvirt/KVM backend. This closes the
+  remaining live Podman/systemd evidence follow-up while the direct libvirt
+  lifecycle remains an external firmware/backend proof.
 - Progress (2026-07-24 image-reference boundary hardening): image-build now
   validates caller-controlled OCI references before capability replay or builder
   dispatch, rejecting option-shaped, malformed, whitespace/control, path, and
@@ -1105,6 +1126,11 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-012 - Maps live-data overlays (zero-cost external feeds)
 
 - Status: Remaining
+- Progress (2026-07-24 AirNow consumer presentation hardening): retained gap
+  scanning is capped, pollutant labels are single-line and bidi/control-safe,
+  and the alert/status overlays clip to the map viewport with honest paint
+  stats. The focused `.50` AirNow suite is green at 13/13; live provider-key
+  evidence remains external.
 - Progress (2026-07-23): all ten catalog feeds are implemented through
   typed latest-wins Bus snapshots and the Maps painter: USGS earthquakes, NWS
   alerts, NWS hourly route forecast, adsb.lol aircraft, GTFS-Realtime transit,
@@ -1370,6 +1396,11 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-006 - Construct interface (Apple-HIG-principled workstation shell)
 
 - Status: Remaining
+- Progress (2026-07-24 status-rail text and geometry hardening): status labels
+  now have a bounded single-line presentation boundary, hostile control/bidi
+  characters are removed, and narrow-bar hit targets remain inside the reserved
+  top rail. The focused `.90` Construct status-bar target is green at 18/18;
+  live pixel comparison remains external.
 - Progress (2026-07-24 Springboard input proof): a non-zero-origin headless
   pointer regression now exercises Back, Home, and Pin in both floating and
   docked modes and proves the foreground dock remains non-interactive outside

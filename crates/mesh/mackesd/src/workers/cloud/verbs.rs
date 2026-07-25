@@ -28,6 +28,10 @@ use mackes_mesh_types::cloud::{
 use super::runner::CloudRunOutcome;
 use super::CloudWorker;
 
+/// The maximum action body accepted before JSON materialization. Direct callers
+/// and Bus callers share the same RPC-sized boundary.
+pub(crate) const MAX_CLOUD_ACTION_BODY_BYTES: usize = crate::ipc::MAX_RPC_BODY_BYTES;
+
 // Disjoint per-verb handler modules (one unit each, `cloud/verbs/<unit>.rs`).
 mod container;
 mod container_lifecycle;
@@ -211,6 +215,14 @@ impl CloudActionBody {
     /// body; malformed JSON never gets that compatibility treatment.
     #[must_use]
     pub fn parse(body: &str) -> Self {
+        if body.len() > MAX_CLOUD_ACTION_BODY_BYTES {
+            return Self {
+                parse_error: Some(format!(
+                    "cloud action body exceeds {MAX_CLOUD_ACTION_BODY_BYTES}-byte limit"
+                )),
+                ..Default::default()
+            };
+        }
         match serde_json::from_str(body.trim()) {
             Ok(parsed) => parsed,
             Err(_) => Self {
@@ -717,6 +729,18 @@ mod tests {
         assert!(empty
             .schema_error_for(CloudVerb::List)
             .is_some_and(|error| error.contains("valid JSON")));
+    }
+
+    #[test]
+    fn oversized_action_body_is_rejected_before_json_materialization() {
+        let body = "{".repeat(MAX_CLOUD_ACTION_BODY_BYTES + 1);
+        let parsed = CloudActionBody::parse(&body);
+        assert_eq!(
+            parsed.schema_error_for(CloudVerb::ContainerDeploy),
+            Some(format!(
+                "cloud action body exceeds {MAX_CLOUD_ACTION_BODY_BYTES}-byte limit"
+            ))
+        );
     }
 
     #[test]

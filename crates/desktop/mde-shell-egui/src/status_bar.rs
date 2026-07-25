@@ -114,6 +114,64 @@ impl StatusControl {
 const STATUS_CONTROL_W: f32 = STATUS_BAR_H;
 const STATUS_CONTROL_GAP: f32 = Style::SP_XS;
 const STATUS_CONTROL_ICON: f32 = Style::ICON_M;
+/// A single status cell is deliberately one line. This cap is generous for
+/// the current fixed labels, but prevents a future daemon-provided label from
+/// turning the rail into an unbounded layout job.
+const STATUS_CELL_TEXT_MAX_W: f32 = 128.0;
+const MAX_STATUS_TEXT_CHARS: usize = 256;
+
+fn is_status_format_control(ch: char) -> bool {
+    ch.is_control() || matches!(ch, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+}
+
+/// Keep status text single-line and bounded before it reaches egui's font
+/// shaper. The current status read model already folds severities to a
+/// canonical vocabulary; this is a final presentation boundary for future
+/// labels and hostile control/bidi characters. An ellipsis makes truncation
+/// truthful instead of silently dropping the value.
+fn safe_status_text(raw: &str) -> String {
+    let limit = MAX_STATUS_TEXT_CHARS.saturating_sub(1);
+    let mut out = String::new();
+    let mut chars = raw.chars().filter(|ch| !is_status_format_control(*ch));
+    for _ in 0..limit {
+        let Some(ch) = chars.next() else {
+            return out;
+        };
+        out.push(ch);
+    }
+    if chars.next().is_some() {
+        out.push('\u{2026}');
+    }
+    out
+}
+
+/// Build a rail-safe, single-row galley. `max_rows = 1` is important here:
+/// wrapping would increase the 24px strip's height and make the painted text
+/// disagree with its hit-test band on a narrow surface.
+fn status_text_job(
+    raw: impl Into<String>,
+    role: TypographyRole,
+    color: egui::Color32,
+    max_width: f32,
+) -> egui::text::LayoutJob {
+    let max_width = if max_width.is_finite() {
+        max_width.max(1.0)
+    } else {
+        1.0
+    };
+    let mut job = Style::typography_job(safe_status_text(&raw.into()), role, color, max_width);
+    job.wrap = egui::text::TextWrapping::truncate_at_width(max_width);
+    job.break_on_newline = false;
+    job
+}
+
+fn finite_non_negative(value: f32) -> f32 {
+    if value.is_finite() {
+        value.max(0.0)
+    } else {
+        0.0
+    }
+}
 
 fn status_controls_width() -> f32 {
     STATUS_CONTROL_W * StatusControl::ALL.len() as f32
@@ -125,36 +183,45 @@ fn status_controls_width() -> f32 {
 /// surfaces still get bounded hit targets instead of controls extending past
 /// the top-bar edge.
 fn status_controls_metrics(bar: egui::Rect) -> (f32, f32) {
-    let available = (bar.width() - Style::SP_S * 2.0).max(1.0);
+    // Scale the side inset down with the viewport. For a bar narrower than
+    // both insets there is no honest room for a positive hit target; return
+    // zero-sized targets at the center rather than placing them outside the
+    // bar (which would steal clicks from the workspace).
+    let width = finite_non_negative(bar.width());
+    let inset = Style::SP_S.min(width / 2.0);
+    let available = (width - inset * 2.0).max(0.0);
     let count = StatusControl::ALL.len() as f32;
     let normal_width = STATUS_CONTROL_W;
     let normal_gap = STATUS_CONTROL_GAP;
-    let min_gap = normal_gap.min((available / (count * 4.0)).max(0.0));
-    let control_width = normal_width.min(((available - min_gap * (count - 1.0)) / count).max(1.0));
+    let min_gap = normal_gap.min(available / (count * 4.0));
+    let control_width = normal_width.min(((available - min_gap * (count - 1.0)).max(0.0)) / count);
     (control_width, min_gap)
 }
 
 fn status_controls_rect(bar: egui::Rect) -> egui::Rect {
-    let right = bar.right() - Style::SP_S;
+    let width = finite_non_negative(bar.width());
+    let inset = Style::SP_S.min(width / 2.0);
+    let left = bar.left() + inset;
+    let right = bar.right() - inset;
     let (control_width, gap) = status_controls_metrics(bar);
+    let total = control_width * StatusControl::ALL.len() as f32
+        + gap * (StatusControl::ALL.len().saturating_sub(1) as f32);
+    let controls_left = (right - total).max(left).min(right);
     egui::Rect::from_min_max(
-        egui::pos2(
-            right
-                - control_width * StatusControl::ALL.len() as f32
-                - gap * (StatusControl::ALL.len().saturating_sub(1) as f32),
-            bar.top(),
-        ),
-        egui::pos2(right, bar.bottom()),
+        egui::pos2(controls_left, bar.top()),
+        egui::pos2((controls_left + total).min(right), bar.bottom()),
     )
 }
 
 fn status_control_rect(bar: egui::Rect, control: StatusControl) -> egui::Rect {
     let controls = status_controls_rect(bar);
     let (control_width, gap) = status_controls_metrics(bar);
-    let x = controls.left() + control.index() as f32 * (control_width + gap);
-    egui::Rect::from_min_size(
+    let x = (controls.left() + control.index() as f32 * (control_width + gap))
+        .clamp(controls.left(), controls.right());
+    let right = (x + control_width).min(controls.right()).max(x);
+    egui::Rect::from_min_max(
         egui::pos2(x, controls.top()),
-        egui::vec2(control_width, controls.height()),
+        egui::pos2(right, controls.bottom()),
     )
 }
 
@@ -170,12 +237,15 @@ fn status_control_id(control: StatusControl) -> egui::Id {
 }
 
 fn centered_clock_rect(bar: egui::Rect, time_width: f32) -> egui::Rect {
+    let bar_width = finite_non_negative(bar.width());
+    let desired_width = if time_width.is_finite() {
+        time_width.max(0.0) + Style::SP_S * 2.0
+    } else {
+        bar_width
+    };
     egui::Rect::from_center_size(
         bar.center(),
-        egui::vec2(
-            (time_width + Style::SP_S * 2.0).min(bar.width()),
-            bar.height(),
-        ),
+        egui::vec2(desired_width.min(bar_width), bar.height()),
     )
 }
 
@@ -190,10 +260,22 @@ fn bounded_cluster_rect(
     controls: egui::Rect,
     cluster_width: f32,
 ) -> egui::Rect {
-    let right = (controls.left() - Style::SP_XS).clamp(bar.left(), bar.right());
-    let left = (clock.right() + Style::SP_XS).clamp(bar.left(), right);
+    let bar_left = bar.left();
+    let bar_right = bar.right().max(bar_left);
+    let controls_left = if controls.left().is_finite() {
+        controls.left()
+    } else {
+        bar_right
+    };
+    let clock_right = if clock.right().is_finite() {
+        clock.right()
+    } else {
+        bar_left
+    };
+    let right = (controls_left - Style::SP_XS).clamp(bar_left, bar_right);
+    let left = (clock_right + Style::SP_XS).clamp(bar_left, right);
     let available = (right - left).max(0.0);
-    let width = cluster_width.max(0.0).min(available);
+    let width = finite_non_negative(cluster_width).min(available);
     egui::Rect::from_min_max(
         egui::pos2(right - width, bar.top()),
         egui::pos2(right, bar.bottom()),
@@ -242,9 +324,10 @@ pub(crate) fn right_cells(segments: &StatusSegments) -> Vec<RightCell> {
         .map(|segment| {
             let rollup = segments.get(segment);
             let value = rollup.map_or("—", |r| severity_label(Some(r)));
+            let text = format!("{} {value}", segment_label(segment));
             RightCell {
                 segment,
-                text: format!("{} {value}", segment_label(segment)),
+                text: safe_status_text(&text),
                 dot: severity_color(rollup),
                 present: rollup.is_some(),
             }
@@ -365,11 +448,11 @@ fn strip(
     // ── Center cluster: the one authoritative clock ────────────────────────
     let now = crate::timers::now_unix();
     let time = crate::timers::hhmm(now);
-    let time_galley = painter.layout_job(Style::typography_job(
+    let time_galley = painter.layout_job(status_text_job(
         time.clone(),
         TypographyRole::Label,
         Style::TEXT,
-        f32::INFINITY,
+        bar.width(),
     ));
     let time_w = time_galley.size().x;
     let clock_rect = centered_clock_rect(bar, time_w);
@@ -408,15 +491,17 @@ fn strip(
     let cell_widths: Vec<f32> = cells
         .iter()
         .map(|cell| {
-            let text_w = painter
-                .layout_job(Style::typography_job(
-                    cell.text.clone(),
-                    time_role,
-                    Style::TEXT,
-                    f32::INFINITY,
-                ))
-                .size()
-                .x;
+            let text_w = finite_non_negative(
+                painter
+                    .layout_job(status_text_job(
+                        cell.text.clone(),
+                        time_role,
+                        Style::TEXT,
+                        STATUS_CELL_TEXT_MAX_W,
+                    ))
+                    .size()
+                    .x,
+            );
             let w = dot_r * 2.0 + Style::SP_XS + text_w;
             cluster_w += Style::SP_S + w;
             w
@@ -459,7 +544,7 @@ fn strip(
     for (cell, w) in cells.iter().zip(cell_widths) {
         x += Style::SP_S;
         cluster_painter.circle_filled(egui::pos2(x + dot_r, cy), dot_r, cell.dot);
-        let cell_galley = cluster_painter.layout_job(Style::typography_job(
+        let cell_galley = cluster_painter.layout_job(status_text_job(
             cell.text.clone(),
             time_role,
             if cell.present {
@@ -467,7 +552,7 @@ fn strip(
             } else {
                 Style::TEXT_DIM
             },
-            f32::INFINITY,
+            STATUS_CELL_TEXT_MAX_W,
         ));
         cluster_painter.galley(
             egui::pos2(
@@ -745,6 +830,20 @@ mod tests {
         assert_eq!(mesh.text, "Mesh warning");
         assert!(mesh.present);
         assert_eq!(mesh.dot, Style::SUPPORT_WARNING);
+
+        // The wire severity is untrusted, but the rail exposes only the
+        // canonical severity vocabulary — no control or bidi payload leaks
+        // into painted or accessible status text.
+        let hostile = StatusSegments {
+            alerts: Some(rollup("alerts", "critical\n\u{202e}")),
+            seen: true,
+            ..StatusSegments::default()
+        };
+        let alerts = right_cells(&hostile)
+            .into_iter()
+            .find(|c| c.segment == StatusSegment::Alerts)
+            .expect("alerts cell folded");
+        assert_eq!(alerts.text, "Alerts unknown");
     }
 
     #[test]
@@ -946,6 +1045,51 @@ mod tests {
         }
         let last = status_control_rect(bar, StatusControl::Brightness);
         assert!((last.right() - controls.right()).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn rail_text_is_single_line_bounded_and_direction_safe() {
+        let hostile = format!(
+            "Device\n{}\u{202e}tail",
+            "x".repeat(MAX_STATUS_TEXT_CHARS * 2)
+        );
+        let safe = safe_status_text(&hostile);
+        assert!(safe.chars().count() <= MAX_STATUS_TEXT_CHARS);
+        assert!(safe.ends_with('\u{2026}'));
+        assert!(!safe.chars().any(is_status_format_control));
+
+        let job = status_text_job(hostile, TypographyRole::Label, Style::TEXT, 32.0);
+        assert_eq!(job.wrap.max_rows, 1);
+        assert!(job.wrap.break_anywhere);
+        assert_eq!(job.wrap.max_width, 32.0);
+        assert!(!job.break_on_newline);
+        assert!(!job.text.chars().any(is_status_format_control));
+    }
+
+    #[test]
+    fn status_hit_targets_stay_inside_the_bar_below_the_inset_width() {
+        for width in [0.0, 1.0, 7.0, 15.0, 31.0] {
+            let bar =
+                egui::Rect::from_min_size(egui::pos2(73.0, 41.0), egui::vec2(width, STATUS_BAR_H));
+            let controls = status_controls_rect(bar);
+            assert!(
+                bar.contains_rect(controls),
+                "control cluster escaped {width}px bar: {controls:?}"
+            );
+            for control in StatusControl::ALL {
+                let rect = status_control_rect(bar, control);
+                assert!(
+                    bar.contains_rect(rect),
+                    "{control:?} escaped {width}px bar: {rect:?}"
+                );
+            }
+
+            let clock = centered_clock_rect(bar, f32::INFINITY);
+            let cluster = bounded_cluster_rect(bar, clock, controls, f32::MAX);
+            assert!(bar.contains_rect(clock), "clock escaped {width}px bar");
+            assert!(bar.contains_rect(cluster), "cluster escaped {width}px bar");
+            assert!(cluster.width().is_finite());
+        }
     }
 
     #[test]

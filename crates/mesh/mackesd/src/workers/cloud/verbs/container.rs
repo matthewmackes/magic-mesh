@@ -26,6 +26,8 @@ use mackes_mesh_types::cloud::{AnsibleSummary, CloudReply};
 use super::super::{path_key, CloudWorker};
 
 const QUADLET_SUFFIX: &str = ".container";
+const MAX_CONTAINER_LIST_ITEMS: usize = 128;
+const MAX_CONTAINER_VALUE_BYTES: usize = 4096;
 /// A container pull needs room for layers and transient extraction files. Keep a
 /// small absolute reserve so a nearly-full seat cannot be driven into ENOSPC by a
 /// deploy; the image's actual size is not knowable from an arbitrary OCI reference.
@@ -82,6 +84,20 @@ pub(crate) fn handle(w: &CloudWorker, verb_name: &str, raw: &str) -> CloudReply 
     let Some(image) = clean(body.image.as_deref()) else {
         return reject(verb_name, "container-deploy requires an `image` reference");
     };
+    if image.len() > MAX_CONTAINER_VALUE_BYTES {
+        return reject(
+            verb_name,
+            &format!(
+                "container image reference exceeds {MAX_CONTAINER_VALUE_BYTES}-byte limit"
+            ),
+        );
+    }
+    if let Err(error) = validate_values("ports", &body.ports)
+        .and_then(|_| validate_values("environment", &body.env))
+        .and_then(|_| validate_values("volumes", &body.volumes))
+    {
+        return reject(verb_name, &error);
+    }
 
     // Render the Quadlet unit (pure — always, even for a staged request).
     let scope = if body.rootful { "rootful" } else { "rootless" };
@@ -478,6 +494,24 @@ fn clean(v: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Bound repeated caller-controlled Quadlet fields before they are copied into
+/// the rendered unit. The outer RPC cap limits total JSON size; these per-field
+/// limits keep a valid body from turning one section into an unexpectedly large
+/// unit or Ansible argument.
+fn validate_values(label: &str, values: &[String]) -> Result<(), String> {
+    if values.len() > MAX_CONTAINER_LIST_ITEMS {
+        return Err(format!(
+            "container {label} list exceeds {MAX_CONTAINER_LIST_ITEMS} entries"
+        ));
+    }
+    if values.iter().any(|value| value.len() > MAX_CONTAINER_VALUE_BYTES) {
+        return Err(format!(
+            "container {label} entry exceeds {MAX_CONTAINER_VALUE_BYTES}-byte limit"
+        ));
+    }
+    Ok(())
+}
+
 fn pick_log(stdout: &str, stderr: &str) -> String {
     if stderr.trim().is_empty() {
         stdout.trim().to_string()
@@ -758,6 +792,43 @@ mod tests {
             r#"{"schema_version":1,"node":"me","name":"../evil","image":"nginx:1"}"#,
         );
         assert!(!bad.ok && bad.error.unwrap().contains("invalid container name"));
+    }
+
+    #[test]
+    fn oversized_container_fields_are_rejected_before_auth_or_staging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runner = Arc::new(FakeRunner::default());
+        let w = armed_worker(tmp.path(), runner.clone());
+        let too_many_ports = serde_json::json!({
+            "schema_version": 1,
+            "node": "me",
+            "name": "web",
+            "image": "nginx:1",
+            "ports": vec!["80:80"; MAX_CONTAINER_LIST_ITEMS + 1],
+        });
+        let reply = w.handle("container-deploy", &too_many_ports.to_string());
+        assert!(!reply.ok);
+        assert!(reply
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("ports list")));
+        assert!(runner.tool_calls.lock().unwrap().is_empty());
+        assert!(!tmp.path().join("quadlets").exists());
+
+        let oversized_env = serde_json::json!({
+            "schema_version": 1,
+            "node": "me",
+            "name": "web",
+            "image": "nginx:1",
+            "env": [format!("KEY={}", "x".repeat(MAX_CONTAINER_VALUE_BYTES))],
+        });
+        let reply = w.handle("container-deploy", &oversized_env.to_string());
+        assert!(!reply.ok);
+        assert!(reply
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("environment entry")));
+        assert!(runner.tool_calls.lock().unwrap().is_empty());
     }
 
     #[test]
