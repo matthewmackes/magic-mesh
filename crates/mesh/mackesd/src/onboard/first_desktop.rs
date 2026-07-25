@@ -32,10 +32,11 @@
 //!   the newest `vm`-kind (golden desktop) manifest ([`select_golden_image`]). No
 //!   VM golden image present ⇒ the honest [`FirstDesktopPlan::NoImage`] outcome
 //!   (LAN-only, "see Services ▸ Provisioning ▸ Images"), never a fake success.
-//! * The **VM** is described by a lean [`CloudDesktopSpec`]: image + client peer +
-//!   owner + flavor. The local-first libvirt placement path owns placement,
-//!   flavor selection, metadata, and the final serving host; this unit does not
-//!   build a parallel cloud model.
+//! * The **VM** is described by a lean [`CloudDesktopSpec`]: VM name, target peer,
+//!   golden disk path, client peer, owner, flavor, and default libvirt sizing. That
+//!   folds directly into the existing
+//!   [`vm_lifecycle`](crate::workers::vm_lifecycle) `Create`/`Start` verbs in
+//!   async builds; this unit does not build a parallel cloud model.
 //! * The **session** is the broker's
 //!   [`SessionRequest::Open`](crate::workers::session_broker::SessionRequest) wire
 //!   verb on [`ACTION_TOPIC`](crate::workers::session_broker::ACTION_TOPIC): after
@@ -58,6 +59,14 @@ use crate::image_catalog::{images_dir, ImageKind, ImageManifest};
 /// The default first-desktop flavor. Mirrors the broker's Standard desktop
 /// class (`m1.medium`) without pulling the async worker module into lean builds.
 pub const DEFAULT_DESKTOP_FLAVOR: &str = "m1.medium";
+/// Default first-desktop vCPU count for the libvirt lifecycle bridge.
+pub const DEFAULT_DESKTOP_VCPUS: u32 = 2;
+/// Default first-desktop RAM in MiB for the libvirt lifecycle bridge.
+pub const DEFAULT_DESKTOP_RAM_MB: u64 = 4096;
+/// Default first-desktop disk size in GiB for the libvirt lifecycle bridge.
+pub const DEFAULT_DESKTOP_DISK_GB: u64 = 40;
+/// Default first-desktop libvirt network.
+pub const DEFAULT_DESKTOP_NETWORK: &str = "default";
 
 /// The broker session topic this verb's session-open publishes on.
 ///
@@ -138,16 +147,30 @@ impl FirstDesktopStep {
 /// `vm_lifecycle` worker) boots the desktop from once that leg is wired.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct CloudDesktopSpec {
+    /// The libvirt domain name to create/start.
+    pub vm_name: String,
     /// The session id to mint for the placed desktop.
     pub session_id: String,
     /// The peer whose shell drives the desktop.
     pub client_peer: String,
+    /// The peer whose local libvirt worker should place the desktop.
+    pub placement_peer: String,
     /// The owner used for quota attribution.
     pub owner: String,
-    /// The image to boot.
+    /// The image manifest name to boot.
     pub image: String,
+    /// The versioned golden base disk path to use as the VM backing image.
+    pub image_path: String,
     /// The selected flavor.
     pub flavor: String,
+    /// Virtual CPUs for the lifecycle create request.
+    pub vcpus: u32,
+    /// RAM in MiB for the lifecycle create request.
+    pub ram_mb: u64,
+    /// Disk size in GiB for the lifecycle create request.
+    pub disk_gb: u64,
+    /// Libvirt network for the first desktop NIC.
+    pub network: String,
 }
 
 /// Why the first desktop cannot be offered as a fresh create right now — a real,
@@ -318,7 +341,7 @@ pub fn plan_first_desktop(facts: &FirstDesktopFacts) -> FirstDesktopPlan {
         };
     };
     let vm_name = desktop_vm_name(&facts.node_id);
-    let desktop = build_cloud_desktop_spec(&vm_name, &facts.node_id, &image);
+    let desktop = build_cloud_desktop_spec(&vm_name, &facts.node_id, &image, &facts.workgroup_root);
     let session = session_for(&vm_name, &facts.node_id);
     FirstDesktopPlan::Create {
         mesh_id: facts.mesh_id.clone(),
@@ -390,14 +413,70 @@ pub fn build_cloud_desktop_spec(
     vm_name: &str,
     node_id: &str,
     image: &ImageManifest,
+    workgroup_root: &Path,
 ) -> CloudDesktopSpec {
     CloudDesktopSpec {
+        vm_name: vm_name.to_string(),
         session_id: format!("first-desktop-{vm_name}"),
         client_peer: node_id.to_string(),
+        placement_peer: node_id.to_string(),
         owner: node_id.to_string(),
         image: image.name.clone(),
+        image_path: golden_base_disk(workgroup_root, image)
+            .to_string_lossy()
+            .into_owned(),
         flavor: DEFAULT_DESKTOP_FLAVOR.to_string(),
+        vcpus: DEFAULT_DESKTOP_VCPUS,
+        ram_mb: DEFAULT_DESKTOP_RAM_MB,
+        disk_gb: DEFAULT_DESKTOP_DISK_GB,
+        network: DEFAULT_DESKTOP_NETWORK.to_string(),
     }
+}
+
+/// Fold a planned first-desktop placement into the existing `vm_lifecycle`
+/// `Create` action (§6 reuse: no parallel VM create wire type).
+#[cfg(feature = "async-services")]
+#[must_use]
+pub fn lifecycle_create_action(
+    desktop: &CloudDesktopSpec,
+) -> crate::workers::vm_lifecycle::LifecycleAction {
+    crate::workers::vm_lifecycle::LifecycleAction::Create {
+        host: desktop.placement_peer.clone(),
+        spec: crate::workers::vm_lifecycle::VmSpec {
+            name: desktop.vm_name.clone(),
+            vcpus: desktop.vcpus,
+            ram_mb: desktop.ram_mb,
+            disk_gb: desktop.disk_gb,
+            image_path: Some(desktop.image_path.clone()),
+            network: Some(desktop.network.clone()),
+            pci_passthrough: Vec::new(),
+        },
+    }
+}
+
+/// Fold a planned first-desktop placement into the existing `vm_lifecycle`
+/// `Start` action.
+#[cfg(feature = "async-services")]
+#[must_use]
+pub fn lifecycle_start_action(
+    desktop: &CloudDesktopSpec,
+) -> crate::workers::vm_lifecycle::LifecycleAction {
+    crate::workers::vm_lifecycle::LifecycleAction::Start {
+        host: desktop.placement_peer.clone(),
+        name: desktop.vm_name.clone(),
+    }
+}
+
+/// The ordered lifecycle actions needed before the broker session can be opened.
+#[cfg(feature = "async-services")]
+#[must_use]
+pub fn lifecycle_actions(
+    desktop: &CloudDesktopSpec,
+) -> [crate::workers::vm_lifecycle::LifecycleAction; 2] {
+    [
+        lifecycle_create_action(desktop),
+        lifecycle_start_action(desktop),
+    ]
 }
 
 /// The desktop a [`FirstDesktopApply::place_desktop`] placed.
@@ -528,17 +607,18 @@ impl LiveFirstDesktop {
         &self,
         desktop: &CloudDesktopSpec,
     ) -> Result<BootedDesktop, FirstDesktopError> {
-        // WL-ARCH-001 — VDI desktop placement is the local-first libvirt path (the
-        // `vm_lifecycle` worker over `action/vm/lifecycle`), which the onboarding
-        // flow does not yet drive. Honest-gate until that leg is wired — never a
-        // fabricated vm_id (§7).
+        // WL-ARCH-007 — VDI desktop placement is the local-first libvirt path. The
+        // pure plan now folds to typed `vm_lifecycle` Create/Start actions, but the
+        // live path still needs authorized Bus publication plus roster observation
+        // before it can return the broker VM id. Honest-gate until that leg is wired
+        // — never a fabricated vm_id (§7).
         Err(FirstDesktopError::IntegrationGated {
             step: "place-desktop",
             reason: format!(
-                "desktop session `{}` → needs the local libvirt VDI placement path \
-                 (`action/vm/lifecycle` via the `vm_lifecycle` worker) to boot the desktop \
-                 and return its VM id",
-                desktop.session_id
+                "desktop session `{}` → lifecycle create/start is typed for VM `{}` on `{}`, \
+                 but needs authorized Bus publish on `action/vm/lifecycle` and live \
+                 roster observation to return the placed VM id",
+                desktop.session_id, desktop.vm_name, desktop.placement_peer
             ),
         })
     }
@@ -862,12 +942,27 @@ mod tests {
     #[test]
     fn build_cloud_desktop_spec_targets_the_broker_placement_shape() {
         let image = manifest("win10-gold", "vm", "3.2", Some("workstation"));
-        let spec = build_cloud_desktop_spec("desktop-eagle", "peer:eagle", &image);
+        let spec = build_cloud_desktop_spec(
+            "desktop-eagle",
+            "peer:eagle",
+            &image,
+            Path::new("/mnt/mesh-storage"),
+        );
+        assert_eq!(spec.vm_name, "desktop-eagle");
         assert_eq!(spec.session_id, "first-desktop-desktop-eagle");
         assert_eq!(spec.client_peer, "peer:eagle");
+        assert_eq!(spec.placement_peer, "peer:eagle");
         assert_eq!(spec.owner, "peer:eagle");
         assert_eq!(spec.image, "win10-gold");
+        assert_eq!(
+            spec.image_path,
+            "/mnt/mesh-storage/images/win10-gold/3.2/win10-gold.img"
+        );
         assert_eq!(spec.flavor, DEFAULT_DESKTOP_FLAVOR);
+        assert_eq!(spec.vcpus, DEFAULT_DESKTOP_VCPUS);
+        assert_eq!(spec.ram_mb, DEFAULT_DESKTOP_RAM_MB);
+        assert_eq!(spec.disk_gb, DEFAULT_DESKTOP_DISK_GB);
+        assert_eq!(spec.network, DEFAULT_DESKTOP_NETWORK);
     }
 
     #[test]
@@ -1005,7 +1100,12 @@ mod tests {
     fn live_first_desktop_is_integration_gated_not_fake_success() {
         let apply = LiveFirstDesktop::default();
         let image = manifest("win10-gold", "vm", "3.2", Some("workstation"));
-        let desktop = build_cloud_desktop_spec("desktop-eagle", "peer:eagle", &image);
+        let desktop = build_cloud_desktop_spec(
+            "desktop-eagle",
+            "peer:eagle",
+            &image,
+            Path::new("/mnt/mesh-storage"),
+        );
         let err = apply
             .place_desktop(&desktop)
             .expect_err("live placement must not fake success");
@@ -1013,8 +1113,8 @@ mod tests {
             FirstDesktopError::IntegrationGated { step, reason } => {
                 assert_eq!(step, "place-desktop");
                 assert!(
-                    reason.contains("libvirt") || reason.contains("vm_lifecycle"),
-                    "names the missing cloud placement path: {reason}"
+                    reason.contains("action/vm/lifecycle"),
+                    "names the lifecycle topic: {reason}"
                 );
                 assert!(
                     reason.contains("first-desktop-desktop-eagle"),
@@ -1100,11 +1200,22 @@ mod tests {
     #[test]
     fn build_cloud_desktop_spec_shapes_the_placement_request() {
         let image = manifest("win10-gold", "vm", "3.2", Some("workstation"));
-        let desktop = build_cloud_desktop_spec("desktop-eagle", "peer:eagle", &image);
+        let desktop = build_cloud_desktop_spec(
+            "desktop-eagle",
+            "peer:eagle",
+            &image,
+            Path::new("/mnt/mesh-storage"),
+        );
+        assert_eq!(desktop.vm_name, "desktop-eagle");
         assert_eq!(desktop.session_id, "first-desktop-desktop-eagle");
         assert_eq!(desktop.client_peer, "peer:eagle");
+        assert_eq!(desktop.placement_peer, "peer:eagle");
         assert_eq!(desktop.owner, "peer:eagle");
         assert_eq!(desktop.image, "win10-gold");
+        assert_eq!(
+            desktop.image_path,
+            "/mnt/mesh-storage/images/win10-gold/3.2/win10-gold.img"
+        );
     }
 
     #[test]
@@ -1131,6 +1242,58 @@ mod tests {
                 vm_id: "desktop-eagle".into(),
                 client_peer: "peer:eagle".into(),
             }
+        );
+    }
+
+    #[cfg(feature = "async-services")]
+    #[test]
+    fn desktop_spec_maps_to_vm_lifecycle_create_then_start_actions() {
+        use crate::workers::vm_lifecycle::{parse_action, LifecycleAction, VmSpec};
+
+        let image = manifest("win10-gold", "vm", "3.2", Some("workstation"));
+        let desktop = build_cloud_desktop_spec(
+            "desktop-eagle",
+            "peer:eagle",
+            &image,
+            Path::new("/mnt/mesh-storage"),
+        );
+        let [create, start] = lifecycle_actions(&desktop);
+        assert_eq!(
+            create,
+            LifecycleAction::Create {
+                host: "peer:eagle".into(),
+                spec: VmSpec {
+                    name: "desktop-eagle".into(),
+                    vcpus: DEFAULT_DESKTOP_VCPUS,
+                    ram_mb: DEFAULT_DESKTOP_RAM_MB,
+                    disk_gb: DEFAULT_DESKTOP_DISK_GB,
+                    image_path: Some(
+                        "/mnt/mesh-storage/images/win10-gold/3.2/win10-gold.img".into()
+                    ),
+                    network: Some(DEFAULT_DESKTOP_NETWORK.into()),
+                    pci_passthrough: Vec::new(),
+                },
+            }
+        );
+        assert_eq!(
+            start,
+            LifecycleAction::Start {
+                host: "peer:eagle".into(),
+                name: "desktop-eagle".into(),
+            }
+        );
+
+        let create_json = serde_json::to_string(&create).expect("serialize create");
+        let start_json = serde_json::to_string(&start).expect("serialize start");
+        assert_eq!(
+            parse_action(&create_json).expect("parse create"),
+            create,
+            "the first-desktop adapter must emit the worker's actual create wire shape"
+        );
+        assert_eq!(
+            parse_action(&start_json).expect("parse start"),
+            start,
+            "the first-desktop adapter must emit the worker's actual start wire shape"
         );
     }
 }

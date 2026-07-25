@@ -252,6 +252,12 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-SEC-006 - Keep Nebula private keys local to their owning node
 
 - Status: Remaining
+- Progress (2026-07-25 stale identity-generation prune retry): replicated
+  steady-state Nebula bundle refresh now retries stale local identity-generation
+  pruning after confirming the active certificate still matches, without
+  receiving or replacing private-key material. The focused supervisor farm gate
+  is green at **49/49**, touched-file rustfmt is green, and local diff-check is
+  clean. Live Nebula rotation/reconnect/prune evidence remains external.
 - Progress (2026-07-25 node-key parent boundary): node signing-key reads and
   creation now reject symlinked or non-directory intermediate parents before
   opening or materializing the identity leaf, closing the parent redirect left
@@ -658,6 +664,13 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-ARCH-007 - Repair Workloads cockpit E2E wire, placement, and authorization
 
 - Status: Remaining
+- Progress (2026-07-25 first-desktop lifecycle bridge): the first-desktop
+  planner now carries an explicit VM name, placement peer, golden image path,
+  libvirt sizing, and network, and folds the placement into the existing
+  `vm_lifecycle` `Create` then `Start` wire actions instead of a parallel cloud
+  model. The BigBoy `onboard::first_desktop --features async-services` gate is
+  green at **18/18**. Live authorized Bus publish, roster observation, bootstrap
+  SSH, and libvirt/Podman/Cuttlefish evidence remain external.
 - Progress (2026-07-25 signed onboarding transport): `BusApply` now signs and
   publishes a bounded JobBundle, waits for a matching target acknowledgement,
   and rejects unrelated or expired responses. `OpenBroker` now carries full
@@ -1662,6 +1675,13 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-012 - Maps live-data overlays (zero-cost external feeds)
 
 - Status: Remaining
+- Progress (2026-07-25 live-proof verifier catalog/airspace readiness):
+  `verify-live-mirrors.py` now validates overlays against the locked zero-cost
+  feed catalog and can require fresh `state/airspace/<node>` scanner readiness,
+  contact retention, and same-host handoff without mutating the Bus. Farm `.50`
+  Python bytecode compilation plus self-test is green, local self-test and
+  diff-check are clean. Fresh live provider, MG90 scanner-feed, and painted
+  overlay proof remain external.
 - Progress (2026-07-25 zero-cost mirror-license audit): the live-mirror proof
   helper now fail-closes overlay evidence whose `license_tier` is missing,
   unknown, non-commercial, paid, trial, personal, educational, research-only, or
@@ -2038,6 +2058,12 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-006 - Construct interface (Apple-HIG-principled workstation shell)
 
 - Status: Remaining
+- Progress (2026-07-25 VDI console proof verifier): `verify-live-mirrors.py`
+  now validates retained `state/vdi/console` rows by session id, including
+  brokered/unbrokerable status, serving node, VM id, expected protocol, and
+  non-loopback/non-wildcard remote endpoint host/port. Farm `.50` Python
+  bytecode compilation plus self-test is green, local self-test and diff-check
+  are clean. Physical `.15` pointer/DRM/pixel/VDI acceptance remains external.
 - Progress (2026-07-25 public proofing safety boundary): Remote Proofing now
   normalizes enabled all-interface Sunshine/Moonlight exposure so local approval
   and the on-seat indicator are forced in both the saved policy and effective

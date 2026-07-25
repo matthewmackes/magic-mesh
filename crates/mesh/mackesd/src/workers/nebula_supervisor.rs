@@ -630,6 +630,9 @@ fn install_identity_generation(
             &config_dir.join("host.key"),
             Path::new("identity/current/host.key"),
         )?;
+        if let Some(active_generation) = active_identity_generation_leaf(&identity_dir)? {
+            prune_stale_identity_generations(&identity_dir, &active_generation);
+        }
         return Ok(());
     }
 
@@ -723,14 +726,52 @@ fn install_identity_generation(
     // Once the atomic switch and compatibility links are installed, only the
     // active generation is useful; retaining every historical key would make
     // local identity storage grow without bound.
-    if let Err(error) = prune_identity_generations(&identity_dir, generation_leaf) {
+    prune_stale_identity_generations(&identity_dir, generation_leaf);
+    Ok(())
+}
+
+fn active_identity_generation_leaf(
+    identity_dir: &Path,
+) -> Result<Option<std::ffi::OsString>, String> {
+    use std::path::Component;
+
+    let current = identity_dir.join("current");
+    let target = match std::fs::read_link(&current) {
+        Ok(target) => target,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "read active Nebula identity switch {}: {error}",
+                current.display()
+            ));
+        }
+    };
+    let mut components = target.components();
+    let Some(Component::Normal(name)) = components.next() else {
+        return Err(format!(
+            "refusing active Nebula identity switch {} -> {}",
+            current.display(),
+            target.display()
+        ));
+    };
+    if components.next().is_some() || !is_identity_generation_name(name) {
+        return Err(format!(
+            "refusing active Nebula identity switch {} -> {}",
+            current.display(),
+            target.display()
+        ));
+    }
+    Ok(Some(name.to_os_string()))
+}
+
+fn prune_stale_identity_generations(identity_dir: &Path, active_generation: &std::ffi::OsStr) {
+    if let Err(error) = prune_identity_generations(identity_dir, active_generation) {
         tracing::warn!(
             error = %error,
             path = %identity_dir.display(),
             "nebula-supervisor: stale identity generation cleanup failed"
         );
     }
-    Ok(())
 }
 
 fn is_identity_generation_name(name: &std::ffi::OsStr) -> bool {
@@ -1604,6 +1645,72 @@ mod tests {
         assert!(
             !tmp.path().join("identity").join(first_generation).exists(),
             "the previous generation must be removed after the atomic switch"
+        );
+    }
+
+    #[test]
+    fn replicated_refresh_retries_stale_identity_generation_prune() {
+        use std::os::unix::fs::DirBuilderExt as _;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let first = sample_bundle();
+        materialize_config(
+            tmp.path(),
+            &first,
+            ConfigRole::Peer,
+            &[],
+            tmp.path(),
+            Some(b"key-generation-a"),
+        )
+        .expect("first identity");
+
+        let mut second = first;
+        second.peer_cert_pem = "cert-generation-b".into();
+        materialize_config(
+            tmp.path(),
+            &second,
+            ConfigRole::Peer,
+            &[],
+            tmp.path(),
+            Some(b"key-generation-b"),
+        )
+        .expect("authenticated rotation");
+        let active_generation = std::fs::read_link(tmp.path().join("identity/current"))
+            .expect("active identity switch")
+            .file_name()
+            .expect("active generation name")
+            .to_os_string();
+
+        let stale_generation = tmp
+            .path()
+            .join("identity")
+            .join("generation-999999999-0123456789abcdef");
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder
+            .create(&stale_generation)
+            .expect("seed stale generation");
+        crate::ca::seal::write_atomic_sealed(&stale_generation.join("host.key"), b"stale-key")
+            .expect("seed stale private key");
+
+        materialize_config(tmp.path(), &second, ConfigRole::Peer, &[], tmp.path(), None)
+            .expect("replicated refresh");
+
+        assert!(
+            !stale_generation.exists(),
+            "a later steady-state refresh must retry stale private-key generation cleanup"
+        );
+        assert!(
+            tmp.path()
+                .join("identity")
+                .join(&active_generation)
+                .exists(),
+            "the active generation must remain installed"
+        );
+        assert_eq!(
+            crate::ca::seal::read_sealed(&tmp.path().join("identity/current/host.key")).unwrap(),
+            b"key-generation-b",
+            "replicated refresh must not replace local private-key material"
         );
     }
 
