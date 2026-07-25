@@ -327,6 +327,58 @@ pub fn mesh_targets(workgroup_root: &Path) -> Vec<String> {
 /// this resolver doesn't depend on the `async-services`-gated worker module.
 const COMPUTE_INVENTORY_FILE: &str = "compute-inventory.json";
 
+/// Keep replicated inventory documents and the writer's comparison read
+/// bounded before JSON parsing or string materialization. A peer can publish
+/// stale, malformed, or unexpectedly large files on the shared plane.
+const MAX_INVENTORY_READ_BYTES: usize = 1024 * 1024;
+/// Operator target/exclusion TOML is intentionally much smaller than an
+/// inventory document; it contains only a pair of string arrays.
+const MAX_OPERATOR_CONFIG_READ_BYTES: usize = 64 * 1024;
+
+/// Read a regular file through the descriptor that will actually be
+/// consumed. Replicated and operator-managed paths may be stale or hostile,
+/// so reject final symlinks, special files, oversized input, and growth beyond
+/// the bound before callers hand bytes to a parser.
+fn read_bounded_no_follow(path: &Path, max_bytes: usize) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+
+    #[cfg(unix)]
+    let file: std::fs::File = {
+        use rustix::fs::{Mode, OFlags};
+
+        rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .ok()?
+        .into()
+    };
+    #[cfg(not(unix))]
+    let file = {
+        let metadata = std::fs::symlink_metadata(path).ok()?;
+        if !metadata.file_type().is_file() {
+            return None;
+        }
+        std::fs::File::open(path).ok()?
+    };
+
+    let metadata = file.metadata().ok()?;
+    let max_bytes_u64 = u64::try_from(max_bytes).ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > max_bytes_u64 {
+        return None;
+    }
+    let capacity = usize::try_from(metadata.len())
+        .unwrap_or(max_bytes)
+        .min(max_bytes)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(max_bytes_u64.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() <= max_bytes).then_some(bytes)
+}
+
 /// SVC-VIEW-2 — harvest the overlay IPs of enrolled VMs so the probe scans a
 /// VM's services (e.g. whatever runs *inside* MDE-KVM-1), not just full mesh
 /// peers + the LAN.
@@ -362,10 +414,10 @@ pub fn vm_overlay_targets(workgroup_root: &Path) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path().join(COMPUTE_INVENTORY_FILE);
-        let Ok(body) = std::fs::read_to_string(&path) else {
+        let Some(body) = read_bounded_no_follow(&path, MAX_INVENTORY_READ_BYTES) else {
             continue;
         };
-        match serde_json::from_str::<InvVms>(&body) {
+        match serde_json::from_slice::<InvVms>(&body) {
             Ok(inv) => {
                 for vm in inv.vms {
                     if !vm.nebula_ip.is_empty() && !out.contains(&vm.nebula_ip) {
@@ -422,10 +474,10 @@ pub fn inventory(workgroup_root: &Path) -> Vec<Card> {
     let mut out: Vec<Card> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path().join("mackesd").join(INVENTORY_FILENAME);
-        let Ok(body) = std::fs::read_to_string(&path) else {
+        let Some(body) = read_bounded_no_follow(&path, MAX_INVENTORY_READ_BYTES) else {
             continue;
         };
-        match serde_json::from_str::<Vec<Card>>(&body) {
+        match serde_json::from_slice::<Vec<Card>>(&body) {
             Ok(cards) => out.extend(cards),
             Err(e) => tracing::debug!(
                 target: "mackesd::probe_nmap",
@@ -641,10 +693,13 @@ pub fn detect_lan_cidrs() -> Vec<String> {
 /// missing file / parse error / wrong type → empty.
 #[must_use]
 pub fn read_toml_string_list(path: &Path, key: &str) -> Vec<String> {
-    let Ok(body) = std::fs::read_to_string(path) else {
+    let Some(body) = read_bounded_no_follow(path, MAX_OPERATOR_CONFIG_READ_BYTES) else {
         return Vec::new();
     };
-    let Ok(val) = toml::from_str::<toml::Value>(&body) else {
+    let Ok(body) = std::str::from_utf8(&body) else {
+        return Vec::new();
+    };
+    let Ok(val) = toml::from_str::<toml::Value>(body) else {
         return Vec::new();
     };
     val.get(key)
@@ -723,7 +778,9 @@ pub fn serialize_inventory(cards: &[Card]) -> String {
 /// whether to publish `probe/changed`. A write error logs at warn +
 /// returns `false`.
 fn write_inventory_if_changed(path: &Path, payload: &str) -> bool {
-    if std::fs::read_to_string(path).is_ok_and(|existing| existing == payload) {
+    if read_bounded_no_follow(path, MAX_INVENTORY_READ_BYTES)
+        .is_some_and(|existing| existing == payload.as_bytes())
+    {
         return false;
     }
     let Some(parent) = path.parent() else {
@@ -1103,6 +1160,42 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn vm_overlay_targets_rejects_symlink_and_oversized_inventory() {
+        use std::os::unix::fs::symlink;
+
+        let root = tmp_root("vm-hostile");
+        seed_compute_inventory(&root, "host-good", &[("good", "10.42.1.40")]);
+
+        let outside = root.with_extension("outside");
+        seed_compute_inventory(&outside, "leaked", &[("leaked", "10.42.1.41")]);
+        let linked = root.join("host-link");
+        std::fs::create_dir_all(&linked).unwrap();
+        symlink(
+            outside.join("leaked").join(COMPUTE_INVENTORY_FILE),
+            linked.join(COMPUTE_INVENTORY_FILE),
+        )
+        .unwrap();
+
+        let oversized = root.join("host-large");
+        std::fs::create_dir_all(&oversized).unwrap();
+        std::fs::write(
+            oversized.join(COMPUTE_INVENTORY_FILE),
+            vec![b' '; MAX_INVENTORY_READ_BYTES + 1],
+        )
+        .unwrap();
+
+        let got = vm_overlay_targets(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+        assert_eq!(
+            got,
+            vec!["10.42.1.40".to_string()],
+            "final symlink and oversized compute inventories fail open"
+        );
+    }
+
     #[test]
     fn write_inventory_detects_change_then_noop() {
         let root = tmp_root("write");
@@ -1206,6 +1299,29 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn write_inventory_comparison_does_not_follow_final_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = tmp_root("write-link");
+        let path = inventory_path(&root, "self");
+        let outside = root.with_extension("outside.json");
+        std::fs::write(&outside, "[]").unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        symlink(&outside, &path).unwrap();
+
+        assert!(write_inventory_if_changed(&path, "[]"));
+        assert!(!std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[]");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "[]");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(&outside);
+    }
+
     #[test]
     fn read_toml_string_list_extracts_array() {
         let root = tmp_root("toml");
@@ -1221,6 +1337,33 @@ mod tests {
         );
         assert!(missing.is_empty(), "absent key → empty");
         assert!(absent.is_empty(), "absent file → empty");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_toml_string_list_rejects_symlink_and_oversized_config() {
+        use std::os::unix::fs::symlink;
+
+        let root = tmp_root("toml-hostile");
+        let good = root.join("good.toml");
+        std::fs::write(&good, "targets = [\"10.0.0.7\"]\n").unwrap();
+
+        let outside = root.with_extension("outside.toml");
+        std::fs::write(&outside, "targets = [\"10.0.0.8\"]\n").unwrap();
+        let linked = root.join("linked.toml");
+        symlink(&outside, &linked).unwrap();
+
+        let oversized = root.join("large.toml");
+        std::fs::write(&oversized, vec![b' '; MAX_OPERATOR_CONFIG_READ_BYTES + 1]).unwrap();
+
+        assert_eq!(
+            read_toml_string_list(&good, "targets"),
+            vec!["10.0.0.7".to_string()]
+        );
+        assert!(read_toml_string_list(&linked, "targets").is_empty());
+        assert!(read_toml_string_list(&oversized, "targets").is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_file(&outside);
     }
 
     // ── Read API (MESH-PROBE-6) ─────────────────────────────────────
@@ -1271,6 +1414,42 @@ mod tests {
         let inv = inventory(&root);
         let _ = std::fs::remove_dir_all(&root);
         assert_eq!(inv.len(), 2, "two valid host cards, malformed skipped");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inventory_rejects_symlink_and_oversized_peer_files() {
+        use std::os::unix::fs::symlink;
+
+        let root = tmp_root("inv-hostile");
+        seed_inventory(&root, "peer-good", "10.42.0.7", &[("ssh", 22)]);
+
+        let outside = root.with_extension("outside");
+        seed_inventory(&outside, "leaked", "10.42.0.8", &[("ssh", 22)]);
+        let linked = root.join("peer-link").join("mackesd");
+        std::fs::create_dir_all(&linked).unwrap();
+        symlink(
+            outside
+                .join("leaked")
+                .join("mackesd")
+                .join(INVENTORY_FILENAME),
+            linked.join(INVENTORY_FILENAME),
+        )
+        .unwrap();
+
+        let oversized = root.join("peer-large").join("mackesd");
+        std::fs::create_dir_all(&oversized).unwrap();
+        std::fs::write(
+            oversized.join(INVENTORY_FILENAME),
+            vec![b' '; MAX_INVENTORY_READ_BYTES + 1],
+        )
+        .unwrap();
+
+        let inv = inventory(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+        assert_eq!(inv.len(), 1, "hostile peer files fail open");
+        assert_eq!(host_facts(&inv[0]).unwrap().ip, "10.42.0.7");
     }
 
     #[test]

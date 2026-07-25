@@ -297,12 +297,30 @@ fn write_atomic_public(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// Unlike the shared display reader, the append path must not silently discard
 /// malformed rows: doing so would let the next append rewrite the chain and
 /// erase evidence of a damaged replicated audit file.
+const MAX_ROUTER_AUDIT_BYTES: usize = 1024 * 1024;
+
 fn read_audit_strict(path: &Path) -> std::io::Result<Vec<AuditRecord>> {
-    let raw = match std::fs::read_to_string(path) {
-        Ok(raw) => raw,
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),
     };
+    if metadata.len() > MAX_ROUTER_AUDIT_BYTES as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "router audit chain exceeds the byte limit",
+        ));
+    }
+    let bytes = crate::ca::seal::read_no_follow(path)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    if bytes.len() > MAX_ROUTER_AUDIT_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "router audit chain exceeds the byte limit",
+        ));
+    }
+    let raw = String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     let mut records = Vec::new();
     for (line, raw_line) in raw.lines().enumerate() {
         if raw_line.trim().is_empty() {
@@ -1081,5 +1099,31 @@ mod tests {
         assert_eq!(r2.seq, 2);
         assert_eq!(r2.prev_hash, r1.hash, "each row chains on the prior hash");
         assert_ne!(r1.hash, r2.hash);
+    }
+
+    #[test]
+    fn audit_append_rejects_hostile_existing_chain_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let path = audit_log_path(root, "eagle");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        std::fs::write(&path, [b'{', 0xff, b'}']).unwrap();
+        assert!(append_audit(root, "eagle", "m", "set", "s", "applied", "f", 1).is_err());
+
+        std::fs::write(&path, vec![b' '; MAX_ROUTER_AUDIT_BYTES + 1]).unwrap();
+        assert!(append_audit(root, "eagle", "m", "set", "s", "applied", "f", 2).is_err());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let outside = root.join("outside-audit.jsonl");
+            std::fs::write(&outside, "{}\n").unwrap();
+            std::fs::remove_file(&path).unwrap();
+            symlink(&outside, &path).unwrap();
+            assert!(append_audit(root, "eagle", "m", "set", "s", "applied", "f", 3).is_err());
+            assert_eq!(std::fs::read_to_string(&outside).unwrap(), "{}\n");
+        }
     }
 }

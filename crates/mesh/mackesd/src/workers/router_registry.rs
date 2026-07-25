@@ -104,9 +104,10 @@ pub fn write_shared_entry(mount: &Path, hostname: &str, entry: &RouterEntry) {
 
 /// Read one replicated router entry from the descriptor that will actually be
 /// consumed. Unix opens reject a final symlink in the kernel, then the same
-/// descriptor is checked as a regular file and read with a hard byte ceiling
-/// before serde sees the UTF-8 body. All failures collapse to `None` so a
-/// missing or hostile peer mirror remains a fail-soft empty source.
+/// descriptor is checked as a regular file and read with a hard byte ceiling,
+/// rejecting a leaf that changes while it is consumed, before serde sees the
+/// UTF-8 body. All failures collapse to `None` so a missing or hostile peer
+/// mirror remains a fail-soft empty source.
 #[must_use]
 pub fn read_shared_entry(mount: &Path, hostname: &str) -> Option<RouterEntry> {
     if hostname.is_empty() {
@@ -117,11 +118,10 @@ pub fn read_shared_entry(mount: &Path, hostname: &str) -> Option<RouterEntry> {
     serde_json::from_str(&body).ok()
 }
 
-/// Read a router-registry leaf without following its final symlink or
-/// allocating beyond [`MAX_ROUTER_REGISTRY_BYTES`].
+/// Read a router-registry leaf without following its final symlink, accepting
+/// only a stable regular file and allocating no more than
+/// [`MAX_ROUTER_REGISTRY_BYTES`].
 fn read_bounded_router_mirror(path: &Path) -> std::io::Result<String> {
-    use std::io::{Error, ErrorKind, Read as _};
-
     #[cfg(unix)]
     let file: std::fs::File = {
         use rustix::fs::{Mode, OFlags};
@@ -136,6 +136,8 @@ fn read_bounded_router_mirror(path: &Path) -> std::io::Result<String> {
 
     #[cfg(not(unix))]
     let file = {
+        use std::io::{Error, ErrorKind};
+
         let metadata = std::fs::symlink_metadata(path)?;
         if metadata.file_type().is_symlink() {
             return Err(Error::new(
@@ -146,6 +148,19 @@ fn read_bounded_router_mirror(path: &Path) -> std::io::Result<String> {
         std::fs::File::open(path)?
     };
 
+    let expected_len = file.metadata()?.len();
+    read_bounded_router_mirror_file(file, expected_len)
+}
+
+/// Consume an already-open router-registry mirror and reject a size change
+/// before or during the bounded read. The explicit `expected_len` seam keeps
+/// the growth-race regression deterministic without relying on thread timing.
+fn read_bounded_router_mirror_file(
+    mut file: std::fs::File,
+    expected_len: u64,
+) -> std::io::Result<String> {
+    use std::io::{Error, ErrorKind, Read as _};
+
     let metadata = file.metadata()?;
     if !metadata.file_type().is_file() {
         return Err(Error::new(
@@ -155,24 +170,34 @@ fn read_bounded_router_mirror(path: &Path) -> std::io::Result<String> {
     }
 
     let max_bytes = MAX_ROUTER_REGISTRY_BYTES as u64;
-    if metadata.len() > max_bytes {
+    if metadata.len() != expected_len || metadata.len() > max_bytes {
         return Err(Error::new(
             ErrorKind::InvalidData,
-            "router mirror exceeds the byte limit",
+            if metadata.len() != expected_len {
+                "router mirror changed while being read"
+            } else {
+                "router mirror exceeds the byte limit"
+            },
         ));
     }
 
-    let capacity = usize::try_from(metadata.len())
+    let capacity = usize::try_from(expected_len)
         .unwrap_or(MAX_ROUTER_REGISTRY_BYTES)
         .min(MAX_ROUTER_REGISTRY_BYTES)
         .saturating_add(1);
     let mut bytes = Vec::with_capacity(capacity);
-    file.take(max_bytes.saturating_add(1))
+    (&mut file)
+        .take(max_bytes.saturating_add(1))
         .read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_ROUTER_REGISTRY_BYTES {
+    let after = file.metadata()?;
+    if !after.file_type().is_file()
+        || after.len() != expected_len
+        || bytes.len() > MAX_ROUTER_REGISTRY_BYTES
+        || bytes.len() as u64 != after.len()
+    {
         return Err(Error::new(
             ErrorKind::InvalidData,
-            "router mirror exceeds the byte limit",
+            "router mirror changed while being read",
         ));
     }
     String::from_utf8(bytes).map_err(|error| Error::new(ErrorKind::InvalidData, error))
@@ -445,6 +470,26 @@ mod tests {
         assert!(read_shared_entry(&tmp, "eagle").is_none());
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn bounded_router_mirror_reader_rejects_growth() {
+        use std::io::Write as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(ROUTER_REGISTRY_FILE);
+        let body = br#"{"id":"46:6a:7c:96:e8:aa"}"#;
+        std::fs::write(&path, body).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let expected_len = file.metadata().unwrap().len();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b" ")
+            .unwrap();
+
+        assert!(read_bounded_router_mirror_file(file, expected_len).is_err());
     }
 
     #[test]

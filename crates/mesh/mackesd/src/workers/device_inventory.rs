@@ -92,9 +92,57 @@ impl SysfsRoots {
 
 // ── small sysfs read helpers ─────────────────────────────────────────────────
 
+/// Sysfs attributes are tiny; `/proc/cpuinfo` is the largest expected input.
+/// Keep even an unusually large host bounded before materializing it.
+const MAX_READ_TRIM_BYTES: usize = 256 * 1024;
+
 /// Read a small sysfs/procfs file, trimmed; `None` when absent/empty/unreadable.
 fn read_trim(path: &Path) -> Option<String> {
-    let s = std::fs::read_to_string(path).ok()?;
+    use std::io::Read as _;
+
+    #[cfg(unix)]
+    let file: std::fs::File = {
+        use rustix::fs::{Mode, OFlags};
+
+        rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .ok()?
+        .into()
+    };
+
+    #[cfg(not(unix))]
+    let file = {
+        // Keep non-Unix builds fail-soft without following an already-present
+        // final symlink. Unix production targets use descriptor-level
+        // NOFOLLOW + NONBLOCK above.
+        let metadata = std::fs::symlink_metadata(path).ok()?;
+        if !metadata.file_type().is_file() {
+            return None;
+        }
+        std::fs::File::open(path).ok()?
+    };
+
+    let metadata = file.metadata().ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_READ_TRIM_BYTES as u64 {
+        return None;
+    }
+
+    let capacity = usize::try_from(metadata.len())
+        .unwrap_or(MAX_READ_TRIM_BYTES)
+        .min(MAX_READ_TRIM_BYTES)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take((MAX_READ_TRIM_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > MAX_READ_TRIM_BYTES {
+        return None;
+    }
+
+    let s = String::from_utf8(bytes).ok()?;
     let t = s.trim();
     if t.is_empty() {
         None
@@ -1287,6 +1335,63 @@ mod tests {
                 "8086  Intel Corporation\n\t5917  UHD Graphics 620\n10ec  Realtek Semiconductor Co., Ltd.\n\t5227  RTS5227 PCI Express Card Reader\n",
             ),
             usb: parse_ids("046d  Logitech, Inc.\n\tc52b  Unifying Receiver\n1d6b  Linux Foundation\n\t0002  2.0 root hub\n"),
+        }
+    }
+
+    #[test]
+    fn read_trim_preserves_small_ids_and_rejects_hostile_values() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let valid = tmp.path().join("valid");
+        put(&valid, "\n 0x8086 \n");
+        assert_eq!(read_trim(&valid).as_deref(), Some("0x8086"));
+        assert_eq!(
+            read_trim(&valid).and_then(|s| parse_hex_id(&s)),
+            Some(0x8086)
+        );
+
+        let empty = tmp.path().join("empty");
+        put(&empty, " \n\t");
+        assert!(read_trim(&empty).is_none());
+
+        let invalid_utf8 = tmp.path().join("invalid-utf8");
+        fs::write(&invalid_utf8, [0xff, 0xfe, 0xfd]).unwrap();
+        assert!(read_trim(&invalid_utf8).is_none());
+
+        let oversized = tmp.path().join("oversized");
+        fs::write(
+            &oversized,
+            vec![b'x'; MAX_READ_TRIM_BYTES.saturating_add(1)],
+        )
+        .unwrap();
+        assert!(read_trim(&oversized).is_none());
+
+        let directory = tmp.path().join("directory");
+        fs::create_dir(&directory).unwrap();
+        assert!(read_trim(&directory).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_trim_rejects_final_symlinks_and_special_files() {
+        use std::os::unix::fs::symlink;
+        use std::process::Command;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        put(&outside, "0xffff\n");
+
+        let symlinked = tmp.path().join("symlinked");
+        symlink(&outside, &symlinked).unwrap();
+        assert!(read_trim(&symlinked).is_none());
+
+        let fifo = tmp.path().join("fifo");
+        if Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            assert!(read_trim(&fifo).is_none());
         }
     }
 

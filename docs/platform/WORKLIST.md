@@ -241,6 +241,20 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-SEC-006 - Keep Nebula private keys local to their owning node
 
 - Status: Remaining
+- Progress (2026-07-25 privileged router audit boundary): the router
+  executor's append/verify path now reads the replicated audit chain through
+  the bounded no-follow regular-file reader, rejecting final symlinks, special
+  files, oversized input, and invalid UTF-8 before hash-chain materialization.
+  The focused `workers::router_action` farm gate is green at **9/9**, and the
+  integrated BigBoy `mackesd --lib` gate is green at **4,091 passed, 0 failed,
+  1 ignored**; live Nebula rotation/reconnect evidence remains external.
+- Progress (2026-07-25 replicated discovery/config boundaries): router-registry
+  mirrors now reject size changes during bounded reads, while Nmap inventory,
+  VM-overlay, operator-TOML, and device-inventory readers reject final
+  symlinks, special files, oversized input, and invalid UTF-8 before
+  materialization. Focused farm gates are green at **9/9** router-registry,
+  **34/34** probe-Nmap, and **17/17** device-inventory tests; live Nebula
+  rotation/reconnect evidence remains external.
 - Progress (2026-07-25 Browser action credential boundary): privileged Browser
   action credentials and replay-nonce expiry rows now use bounded
   descriptor-backed regular-file reads that reject final symlinks, special
