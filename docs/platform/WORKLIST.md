@@ -16,9 +16,19 @@ review ledgers, and operator queues are evidence sources, not parallel trackers.
 When an item is completed or retired, move it to the archive with a disposition
 instead of leaving closed work in this file.
 
-## Current Snapshot - 2026-07-25 security closure
+## Current Snapshot - 2026-07-25 release gate
 
 - **6 active epics:** 6 `Remaining`, 0 `Blocked`; no `Needs clarification`.
+- **Release gate:** pushed commits `9ef3067d` and `b9bfc084` pass the full
+  `mackesd` farm suite at **4,099 passed, 0 failed, 1 ignored**. The Fedora 44
+  base/browser/thin-lighthouse RPM cut is green at **81.7 / 39.1 / 11.0 MiB**;
+  the exact base RPM requires the F44 FFmpeg ABI (`libavcodec.so.62`,
+  `libswresample.so.6`, `libswscale.so.9`).
+- **Dell seat:** `magic-mesh` and `magic-mesh-browser` 12.1.0-1 are installed
+  on `172.20.146.2`; `mackesd` and `mde-shell-egui` are active with zero
+  observed restarts. Kernel reboot remains intentionally pending so the live
+  seat is not interrupted; Nebula remains failed because the seat is not
+  enrolled.
 - **P0:** WL-SEC-006 (stop replicating Nebula private keys), WL-ARCH-007
   (authorization mint + direct lifecycle proof), and
   WL-FUNC-011 (optional real media/LLM evidence remains).
