@@ -13,6 +13,26 @@ use crate::ca::bundle::{bundle_path, LighthouseEntry, NebulaBundle};
 use crate::ca::sign::{sign_peer_cert_with_public_key, PeerRole};
 use crate::ca::NebulaCertBackend;
 
+/// Read a persisted PEM through the CA file boundary before converting it to
+/// owned text.  The mesh-init handoff files are local authority material: a
+/// replaced symlink, special file, growing file, or oversized file must fail
+/// at the named bootstrap step rather than reach certificate parsing or the
+/// bundle.
+fn read_pem_no_follow(path: &Path, context: &str) -> anyhow::Result<String> {
+    let bytes =
+        crate::ca::seal::read_no_follow(path).map_err(|e| anyhow::anyhow!("{context}: {e}"))?;
+    String::from_utf8(bytes).map_err(|e| anyhow::anyhow!("{context}: invalid UTF-8: {e}"))
+}
+
+/// The enrollment endpoint certificate is an optional enhancement to the
+/// founding bundle. Preserve the bootstrap fallback when it is absent or
+/// malformed, but never follow an attacker-controlled persisted leaf.
+fn read_optional_pem_no_follow(path: &Path) -> Option<String> {
+    crate::ca::seal::read_no_follow(path)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+}
+
 /// What `mesh_init` accomplished — printed by the CLI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeshInitReport {
@@ -98,8 +118,8 @@ pub fn mesh_init<B: NebulaCertBackend>(
         .map_err(|e| anyhow::anyhow!("mesh-init step 3 (requester keygen): {e}"))?;
     let requester_private_key = crate::ca::seal::read_sealed(&key_out)
         .map_err(|e| anyhow::anyhow!("mesh-init step 3 (read requester key): {e}"))?;
-    let requester_public_key = std::fs::read_to_string(&public_out)
-        .map_err(|e| anyhow::anyhow!("mesh-init step 3 (read requester public key): {e}"))?;
+    let requester_public_key =
+        read_pem_no_follow(&public_out, "mesh-init step 3 (read requester public key)")?;
     let signed = sign_peer_cert_with_public_key(
         backend,
         conn,
@@ -119,10 +139,8 @@ pub fn mesh_init<B: NebulaCertBackend>(
     let epoch = crate::ca::sign::active_epoch(conn, mesh_id)
         .map_err(|e| anyhow::anyhow!("mesh-init step 3 (epoch read): {e}"))?
         .unwrap_or(0);
-    let ca_cert_pem = std::fs::read_to_string(ca_crt)
-        .map_err(|e| anyhow::anyhow!("mesh-init step 3 (read CA cert): {e}"))?;
-    let peer_cert_pem = std::fs::read_to_string(&crt_out)
-        .map_err(|e| anyhow::anyhow!("mesh-init step 3 (read signed cert): {e}"))?;
+    let ca_cert_pem = read_pem_no_follow(ca_crt, "mesh-init step 3 (read CA cert)")?;
+    let peer_cert_pem = read_pem_no_follow(&crt_out, "mesh-init step 3 (read signed cert)")?;
     let now_s = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs()) as i64;
@@ -138,9 +156,8 @@ pub fn mesh_init<B: NebulaCertBackend>(
         crate::ca::bundle::relay_trust_authority_public_key(&relay_authority);
     crate::ca::seal::write_sealed(&relay_authority_pin_path, relay_authority_public.as_bytes())
         .map_err(|e| anyhow::anyhow!("mesh-init relay trust authority pin: {e}"))?;
-    let relay_tls = std::fs::read_to_string("/etc/nebula/enroll-endpoint.crt")
-        .ok()
-        .and_then(crate::ca::bundle::RelayTlsIdentity::from_certificate_pem)
+    let relay_tls = read_optional_pem_no_follow(Path::new("/etc/nebula/enroll-endpoint.crt"))
+        .and_then(|pem| crate::ca::bundle::RelayTlsIdentity::from_certificate_pem(&pem))
         .map(|identity| {
             crate::ca::bundle::sign_relay_tls_identity(
                 identity,
@@ -287,5 +304,33 @@ mod tests {
         )
         .expect("mesh init creates the CA dir");
         assert!(ca_dir.exists(), "mesh-init should mkdir -p the CA dir");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mesh_init_pem_readers_reject_hostile_persisted_material() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("outside.pem");
+        let link = tmp.path().join("requester.pub");
+        std::fs::write(&target, b"attacker-controlled PEM").unwrap();
+        symlink(&target, &link).unwrap();
+
+        let error = read_pem_no_follow(&link, "mesh-init requester public key")
+            .expect_err("mesh-init must reject a replaced requester key leaf");
+        assert!(error.to_string().contains("mesh-init requester public key"));
+        assert!(read_optional_pem_no_follow(&link).is_none());
+
+        let oversized = tmp.path().join("oversized.pem");
+        std::fs::write(
+            &oversized,
+            vec![b'x'; (crate::ca::seal::MAX_SEALED_FILE_BYTES + 1) as usize],
+        )
+        .unwrap();
+        let error = read_pem_no_follow(&oversized, "mesh-init CA certificate")
+            .expect_err("mesh-init must reject oversized persisted PEM");
+        assert!(error.to_string().contains("mesh-init CA certificate"));
+        assert!(read_optional_pem_no_follow(&oversized).is_none());
     }
 }

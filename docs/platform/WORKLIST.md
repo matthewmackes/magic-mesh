@@ -241,6 +241,12 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-SEC-006 - Keep Nebula private keys local to their owning node
 
 - Status: Remaining
+- Progress (2026-07-25 mesh-init materialization boundary): mesh-init now
+  reads requester public keys, CA certs, signed peer certs, and the optional
+  enrollment endpoint cert through bounded no-follow readers, preserving the
+  optional fallback while rejecting hostile symlinks and oversized material.
+  The focused integrated mesh-init farm gate is green at **4/4**. Live
+  Nebula rotation/reconnect evidence remains external.
 - Progress (2026-07-25 CA generation/epoch staging boundary): generated public
   and private CA material plus staged CA, backup, and peer-rotation reads now
   use the existing bounded no-follow/sealed readers, rejecting hostile staging
@@ -556,6 +562,11 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-ARCH-007 - Repair Workloads cockpit E2E wire, placement, and authorization
 
 - Status: Remaining
+- Progress (2026-07-25 subprocess capture boundary): timeout-bounded command
+  execution now drains stdout/stderr concurrently, retains at most 64 KiB per
+  stream, drains excess, and still kills/reaps timed-out children. The
+  integrated farm gate is green at **8/8**. Live libvirt/Podman evidence
+  remains external.
 - Progress (2026-07-25 console endpoint authority boundary): Workloads console
   hosts are now bounded, delimiter-safe, malformed-input rejecting, and IPv6
   addresses are bracketed before URI materialization. The focused cloud-console
@@ -846,6 +857,11 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-011 - Communications collaboration suite full replacement
 
 - Status: Remaining
+- Progress (2026-07-25 platform passkey persistence boundary): credential
+  records, sealed private material, local seal keys, and hardware descriptors
+  now use bounded no-follow regular-file reads with hostile-input rejection.
+  The integrated Browser passkey farm gate is green at **19/19**. Live
+  peer/media/LLM evidence remains external.
 - Progress (2026-07-25 Browser policy persistence boundary): managed Browser
   policy documents now use bounded no-follow regular-file reads that reject
   symlinks, special files, oversized or changing input, and invalid UTF-8 while
@@ -1688,6 +1704,11 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-006 - Construct interface (Apple-HIG-principled workstation shell)
 
 - Status: Remaining
+- Progress (2026-07-25 Explorer preference boundary): persisted Explorer
+  view preferences now use a bounded no-follow regular-file read that rejects
+  special files, symlinks, oversized/changing input, and invalid UTF-8 before
+  JSON projection. The focused Explorer farm gate is green at **100/100**.
+  Live pointer, pixel, physical, and VDI acceptance remain external evidence.
 - Progress (2026-07-25 Workbench Controller snapshot boundary): the local
   mesh-status snapshot now uses a bounded no-follow regular-file read that
   rejects symlinks, special files, oversized or changing input, and invalid

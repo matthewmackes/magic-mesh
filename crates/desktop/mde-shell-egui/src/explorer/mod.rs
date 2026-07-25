@@ -1705,6 +1705,7 @@ enum SurfaceMode {
 /// The file the Explorer's persisted preferences round-trip through — one JSON
 /// record under the client data dir, the SETTINGS-nav / `PowerHonorConfig` idiom.
 const PREFS_FILE: &str = "explorer-prefs.json";
+const MAX_EXPLORER_PREFS_BYTES: u64 = 64 * 1024;
 
 /// The Explorer surface's persisted preferences: the EXPLORER-12 ambient-idle
 /// toggle plus the EXPLORER-13 **view-continuity record** (O5) — the last mode,
@@ -1751,7 +1752,7 @@ impl ExplorerPrefs {
 
     /// Load from `path`, folding a missing / malformed file to the default.
     fn load_from(path: &Path) -> Self {
-        std::fs::read_to_string(path)
+        read_bounded_explorer_prefs(path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default()
@@ -1778,6 +1779,79 @@ impl ExplorerPrefs {
         std::fs::rename(&tmp, path)?;
         Ok(())
     }
+}
+
+/// Read persisted Explorer state through the descriptor that is consumed.
+/// Preference files are local but still cross a filesystem boundary; reject
+/// final symlinks, special files, oversized or changing input, and invalid
+/// UTF-8 before JSON materialization.
+fn read_bounded_explorer_prefs(path: &Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        options.custom_flags(0o400000 | 0o4000); // O_NOFOLLOW | O_NONBLOCK
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        options.custom_flags(0x100 | 0x4); // O_NOFOLLOW | O_NONBLOCK
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        if !std::fs::symlink_metadata(path)
+            .ok()
+            .is_some_and(|metadata| metadata.file_type().is_file())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Explorer preferences are not a regular file",
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    if !std::fs::symlink_metadata(path)
+        .ok()
+        .is_some_and(|metadata| metadata.file_type().is_file())
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Explorer preferences are not a regular file",
+        ));
+    }
+
+    let file = options.open(path)?;
+    let before = file.metadata()?;
+    if !before.file_type().is_file() || before.len() > MAX_EXPLORER_PREFS_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Explorer preferences exceed the bounded regular-file limit",
+        ));
+    }
+    let capacity = usize::try_from(before.len())
+        .unwrap_or(MAX_EXPLORER_PREFS_BYTES as usize)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(capacity);
+    (&file)
+        .take(MAX_EXPLORER_PREFS_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    let after = file.metadata()?;
+    if !after.file_type().is_file()
+        || after.len() != before.len()
+        || bytes.len() as u64 != before.len()
+        || bytes.len() as u64 > MAX_EXPLORER_PREFS_BYTES
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Explorer preferences changed while being read",
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
 /// Whether ANY user interaction landed this frame — a key/D-pad press, typed

@@ -2957,3 +2957,40 @@ fn explorer_composes_with_the_platform_text_scale_zoom() {
         "the scaled explorer still draws"
     );
 }
+
+#[test]
+fn explorer_preferences_reader_rejects_hostile_files() {
+    let dir = tempfile::tempdir().expect("Explorer prefs tempdir");
+    let valid = dir.path().join("valid.json");
+    std::fs::write(&valid, r#"{"ambient_idle":true,"search":"mesh"}"#).expect("write valid prefs");
+    assert!(read_bounded_explorer_prefs(&valid).is_ok());
+
+    let invalid_utf8 = dir.path().join("invalid-utf8.json");
+    std::fs::write(&invalid_utf8, [0xff, 0xfe]).expect("write invalid prefs");
+    assert!(read_bounded_explorer_prefs(&invalid_utf8).is_err());
+
+    let oversized = dir.path().join("oversized.json");
+    std::fs::write(
+        &oversized,
+        vec![b'{'; (MAX_EXPLORER_PREFS_BYTES + 1) as usize],
+    )
+    .expect("write oversized prefs");
+    assert!(read_bounded_explorer_prefs(&oversized).is_err());
+
+    let special = dir.path().join("special.json");
+    std::fs::create_dir(&special).expect("create special prefs fixture");
+    assert!(read_bounded_explorer_prefs(&special).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn explorer_preferences_reader_rejects_final_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().expect("Explorer prefs tempdir");
+    let target = dir.path().join("outside.json");
+    let link = dir.path().join("explorer-prefs.json");
+    std::fs::write(&target, r#"{"ambient_idle":true}"#).expect("write target prefs");
+    symlink(&target, &link).expect("create prefs symlink");
+    assert!(read_bounded_explorer_prefs(&link).is_err());
+}
