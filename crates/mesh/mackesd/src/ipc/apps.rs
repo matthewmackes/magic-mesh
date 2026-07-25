@@ -31,6 +31,59 @@ use serde_json::json;
 
 use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
 
+/// Local desktop entries and replicated application/workload state are
+/// operator-visible records. Keep hostile or half-written files bounded before
+/// parsers materialize their JSON/desktop contents.
+const MAX_APP_RECORD_BYTES: usize = 256 * 1024;
+
+/// Read one application record through a bounded descriptor-backed regular
+/// file. Replicated QNM-Shared content can be stale or hostile, so reject final
+/// symlinks, blocking special files, oversized input, growth beyond the bound,
+/// and invalid UTF-8 before parsing.
+fn read_bounded_app_record(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+
+    #[cfg(unix)]
+    let file: std::fs::File = {
+        use rustix::fs::{Mode, OFlags};
+
+        rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .ok()?
+        .into()
+    };
+    #[cfg(not(unix))]
+    let file = {
+        let metadata = std::fs::symlink_metadata(path).ok()?;
+        if !metadata.file_type().is_file() {
+            return None;
+        }
+        std::fs::File::open(path).ok()?
+    };
+
+    let metadata = file.metadata().ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_APP_RECORD_BYTES as u64 {
+        return None;
+    }
+
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len())
+            .unwrap_or(MAX_APP_RECORD_BYTES)
+            .min(MAX_APP_RECORD_BYTES)
+            .saturating_add(1),
+    );
+    file.take((MAX_APP_RECORD_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > MAX_APP_RECORD_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
 /// One launchable entry in the unified list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppEntry {
@@ -158,7 +211,7 @@ pub fn scan_local_apps(dirs: &[PathBuf]) -> Vec<AppEntry> {
             if by_id.contains_key(id) {
                 continue; // precedence: earlier dir already provided this id
             }
-            let Ok(body) = std::fs::read_to_string(&path) else {
+            let Some(body) = read_bounded_app_record(&path) else {
                 continue;
             };
             if let Some(entry) = parse_desktop_entry(id, &body, flatpak) {
@@ -328,7 +381,7 @@ pub fn fleet_workload_entries_in(root: &std::path::Path, this_node: &str) -> Vec
     let mut out: Vec<AppEntry> = Vec::new();
     for ent in entries.flatten() {
         let path = ent.path().join("compute-inventory.json");
-        let Ok(body) = std::fs::read_to_string(&path) else {
+        let Some(body) = read_bounded_app_record(&path) else {
             continue;
         };
         let Ok(inv) = serde_json::from_str::<serde_json::Value>(&body) else {
@@ -372,7 +425,7 @@ pub fn fleet_running_hosts_in(root: &std::path::Path) -> HashMap<String, Vec<Str
     };
     for ent in entries.flatten() {
         let path = ent.path().join("running-apps.json");
-        let Ok(body) = std::fs::read_to_string(&path) else {
+        let Some(body) = read_bounded_app_record(&path) else {
             continue;
         };
         let Ok(doc) = serde_json::from_str::<serde_json::Value>(&body) else {
@@ -459,7 +512,7 @@ pub fn read_peer_installed(workgroup_root: &Path, node: &str) -> Vec<AppEntry> {
         return Vec::new();
     }
     let path = workgroup_root.join(node).join("apps-installed.json");
-    let Ok(body) = std::fs::read_to_string(&path) else {
+    let Some(body) = read_bounded_app_record(&path) else {
         return Vec::new();
     };
     let Ok(doc) = serde_json::from_str::<serde_json::Value>(&body) else {
@@ -520,8 +573,7 @@ pub fn app_groups_path(workgroup_root: &Path, user: &str) -> PathBuf {
 /// Read a user's curated groups (empty when none/absent — never an error).
 #[must_use]
 pub fn read_app_groups(workgroup_root: &Path, user: &str) -> Vec<AppGroup> {
-    std::fs::read_to_string(app_groups_path(workgroup_root, user))
-        .ok()
+    read_bounded_app_record(&app_groups_path(workgroup_root, user))
         .and_then(|s| serde_json::from_str::<Vec<AppGroup>>(&s).ok())
         .unwrap_or_default()
 }
@@ -579,8 +631,7 @@ pub fn favorites_path(workgroup_root: &Path, user: &str) -> PathBuf {
 /// Read a user's pinned entry ids (empty when none/absent — never an error).
 #[must_use]
 pub fn read_favorites(workgroup_root: &Path, user: &str) -> Vec<String> {
-    std::fs::read_to_string(favorites_path(workgroup_root, user))
-        .ok()
+    read_bounded_app_record(&favorites_path(workgroup_root, user))
         .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
         .unwrap_or_default()
 }
@@ -1060,6 +1111,33 @@ mod tests {
             parse_desktop_entry("f", ok, true).unwrap().source,
             "flatpak"
         );
+    }
+
+    #[test]
+    fn app_records_reject_hostile_files_before_parsing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let valid = tmp.path().join("valid.json");
+        std::fs::write(&valid, br#"{"hostname":"node-1","ids":["files"]}"#).unwrap();
+        assert!(read_bounded_app_record(&valid).is_some());
+
+        let invalid_utf8 = tmp.path().join("invalid-utf8.json");
+        std::fs::write(&invalid_utf8, [b'{', 0xff, b'}']).unwrap();
+        assert!(read_bounded_app_record(&invalid_utf8).is_none());
+
+        let oversized = tmp.path().join("oversized.json");
+        std::fs::write(&oversized, vec![b'x'; MAX_APP_RECORD_BYTES + 1]).unwrap();
+        assert!(read_bounded_app_record(&oversized).is_none());
+
+        let directory = tmp.path().join("directory.json");
+        std::fs::create_dir(&directory).unwrap();
+        assert!(read_bounded_app_record(&directory).is_none());
+
+        #[cfg(unix)]
+        {
+            let link = tmp.path().join("link.json");
+            std::os::unix::fs::symlink(&valid, &link).unwrap();
+            assert!(read_bounded_app_record(&link).is_none());
+        }
     }
 
     #[test]

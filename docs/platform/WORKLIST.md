@@ -262,6 +262,14 @@ These decisions refine acceptance and sequencing for the active items below.
   1 MiB reader, rejecting hostile symlinks and oversized material before it can
   enter the response. Focused farm gates are green at **101/101** enrollment
   tests and **17/17** bundle tests; live rotation remains external.
+- Progress (2026-07-25 underlay and policy read boundaries): the external
+  lighthouse address and replicated policy TOML now use bounded,
+  descriptor-backed regular-file reads that reject final symlinks, non-regular
+  leaves, oversized input, and invalid UTF-8 before acceptance or parsing. The
+  focused farm gates are green at **7/7** lighthouse-address tests and **6/6**
+  policy tests; the integrated BigBoy `mackesd --lib --features async-services`
+  gate is green at **4,061 passed, 0 failed, 1 ignored**. Live Nebula
+  rotation/reconnect evidence remains external.
 - Progress (2026-07-24 requester/certificate materialization boundary): Nebula
   enrollment requester public keys and generated peer certificates now use
   bounded no-follow reads before UTF-8/string materialization, rejecting hostile
@@ -570,6 +578,12 @@ These decisions refine acceptance and sequencing for the active items below.
   invocation is green at **74/74**, and the integrated BigBoy `mackesd --lib
   --features async-services` gate is green at **4,054 passed, 0 failed, 1
   ignored**. Live libvirt/Podman evidence remains external.
+- Progress (2026-07-25 fleet-log read boundary): replicated JSONL fleet logs now
+  use bounded descriptor-backed regular-file reads that reject final symlinks,
+  non-regular leaves, oversized input, and invalid UTF-8 before line parsing.
+  The focused farm gate is green at **9/9**, and the integrated
+  `magic-fleet --lib` gate is green at **65/65**. Live libvirt/Podman evidence
+  remains external.
 - Progress (2026-07-24 image provider boundary): `image-build` now caps raw
   requests before verb parsing, bounds replicated promotion/SHA sidecars,
   limits roster rows, and keeps reply/error/raw-log text bounded. The focused
@@ -1639,6 +1653,15 @@ These decisions refine acceptance and sequencing for the active items below.
   now reject final symlinks and values above 128 bytes before UTF-8/float
   parsing, preserving honest absent/read errors. The full farm formfactor slice
   is green at **23/23**; live pixel and physical acceptance remain external.
+- Progress (2026-07-25 unified Applications state boundary): local XDG desktop
+  entries plus replicated compute inventory, running-app, installed-app,
+  Springboard group, and favorite records now use bounded descriptor-backed
+  regular-file reads that reject final symlinks, non-regular leaves, oversized
+  input, and invalid UTF-8 before parsing. The focused farm `ipc::apps` gate is
+  green at **20/20**, and the integrated BigBoy `mackesd --lib
+  --features async-services` gate is green at **4,061 passed, 0 failed, 1
+  ignored**. Live pointer, pixel, physical, and VDI acceptance remain external
+  evidence.
 - Progress (2026-07-25 Front Door query boundary): launcher query state and
   ranking now enforce a UTF-8-safe 256-character cap, with the egui input
   applying the same limit to keystrokes and oversized paste/restored state.

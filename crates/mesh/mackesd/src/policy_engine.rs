@@ -159,6 +159,56 @@ pub fn policies_dir(workgroup_root: &Path) -> PathBuf {
     workgroup_root.join("policies")
 }
 
+/// Policies are replicated TOML records. Keep peer-controlled input bounded
+/// before `toml` materializes it into an owned document.
+const MAX_POLICY_BYTES: usize = 256 * 1024;
+
+/// Read one replicated policy through the descriptor that will be consumed.
+/// Reject final symlinks, blocking special files, oversized input, and invalid
+/// UTF-8 before the TOML parser sees peer-controlled bytes.
+fn read_bounded_policy(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+
+    #[cfg(unix)]
+    let file: std::fs::File = {
+        use rustix::fs::{Mode, OFlags};
+
+        rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .ok()?
+        .into()
+    };
+    #[cfg(not(unix))]
+    let file = {
+        let metadata = std::fs::symlink_metadata(path).ok()?;
+        if !metadata.file_type().is_file() {
+            return None;
+        }
+        std::fs::File::open(path).ok()?
+    };
+
+    let metadata = file.metadata().ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_POLICY_BYTES as u64 {
+        return None;
+    }
+
+    let capacity = usize::try_from(metadata.len())
+        .unwrap_or(MAX_POLICY_BYTES)
+        .min(MAX_POLICY_BYTES)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take((MAX_POLICY_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > MAX_POLICY_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
 /// Read every policy TOML (junk-tolerant), plus the built-in core
 /// pack (W50 — ships enabled): all-nodes-current, role-pinned (a
 /// healthy fleet asserts these by default).
@@ -168,7 +218,7 @@ pub fn load_policies(workgroup_root: &Path) -> Vec<Policy> {
     if let Ok(entries) = std::fs::read_dir(policies_dir(workgroup_root)) {
         for e in entries.filter_map(Result::ok) {
             if e.path().extension().is_some_and(|x| x == "toml") {
-                if let Ok(raw) = std::fs::read_to_string(e.path()) {
+                if let Some(raw) = read_bounded_policy(&e.path()) {
                     if let Ok(p) = toml::from_str::<Policy>(&raw) {
                         out.push(p);
                     }
@@ -288,5 +338,78 @@ mod tests {
         let names: Vec<&str> = pack.iter().map(|p| p.name.as_str()).collect();
         assert!(names.contains(&"all-nodes-current"));
         assert!(names.contains(&"no-critical-alarms"));
+    }
+
+    #[test]
+    fn load_policies_reads_valid_toml_and_keeps_core_pack() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = policies_dir(tmp.path());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("custom.toml"),
+            "name = \"custom-health\"\nfield = \"health\"\nop = \"eq\"\nexpected = \"healthy\"\nseverity = \"info\"\n",
+        )
+        .unwrap();
+
+        let policies = load_policies(tmp.path());
+        assert_eq!(policies.len(), core_pack().len() + 1);
+        assert_eq!(
+            policies
+                .iter()
+                .find(|policy| policy.name == "custom-health"),
+            Some(&Policy {
+                name: "custom-health".into(),
+                description: String::new(),
+                field: "health".into(),
+                op: Op::Eq,
+                expected: "healthy".into(),
+                severity: Severity::Info,
+            })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_policies_skips_hostile_replicated_leaves() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = policies_dir(tmp.path());
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let escaped = tmp.path().join("escaped.toml");
+        std::fs::write(
+            &escaped,
+            "name = \"escaped\"\nfield = \"health\"\nop = \"eq\"\nexpected = \"healthy\"\nseverity = \"info\"\n",
+        )
+        .unwrap();
+        symlink(&escaped, dir.join("escaped.toml")).unwrap();
+
+        // A directory is a non-regular leaf even though its name looks like
+        // a policy. O_NONBLOCK also keeps special-file opens from blocking.
+        std::fs::create_dir(dir.join("directory.toml")).unwrap();
+
+        // Invalid UTF-8 is rejected before TOML materialization.
+        std::fs::write(dir.join("invalid-utf8.toml"), [0xff, 0xfe, 0xfd]).unwrap();
+
+        // Read at most the policy ceiling plus one sentinel byte.
+        std::fs::write(
+            dir.join("oversized.toml"),
+            vec![b'x'; MAX_POLICY_BYTES.saturating_add(1)],
+        )
+        .unwrap();
+
+        // Existing junk tolerance remains intact for malformed TOML.
+        std::fs::write(dir.join("junk.toml"), "not = [valid TOML").unwrap();
+
+        let policies = load_policies(tmp.path());
+        assert_eq!(policies.len(), core_pack().len());
+        assert!(!policies.iter().any(|policy| {
+            matches!(
+                policy.name.as_str(),
+                "escaped" | "directory" | "invalid-utf8" | "oversized" | "junk"
+            )
+        }));
+        assert!(escaped.exists(), "symlink target must remain untouched");
     }
 }

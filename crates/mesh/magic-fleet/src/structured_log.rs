@@ -12,7 +12,7 @@
 //! Nothing here shells out, so it's fully unit-tested.
 
 use std::collections::BTreeMap;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -48,6 +48,71 @@ pub fn host_log_path(root: &Path, host: &str) -> PathBuf {
     logs_dir(root).join(format!("{host}.jsonl"))
 }
 
+// Replicated log leaves are peer-provided input. Keep enough room for a
+// useful fleet log while bounding the bytes handed to the JSON parser.
+const MAX_LOG_BYTES: usize = 4 * 1024 * 1024;
+
+/// Read one replicated log through a descriptor without following its final
+/// symlink, accepting only regular files and no more than `max_bytes`.
+///
+/// The descriptor metadata check rejects directories and other special files
+/// before their contents are consumed. Reading one byte beyond the bound
+/// closes the race where a peer grows a regular file after the first metadata
+/// snapshot, while invalid UTF-8 is rejected by [`read_bounded_text`] before
+/// any JSON parser sees the input.
+fn read_bounded_regular_file(path: &Path, max_bytes: usize) -> Option<Vec<u8>> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        options.custom_flags(0o400000 | 0o4000); // O_NOFOLLOW | O_NONBLOCK
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        options.custom_flags(0x100 | 0x4); // O_NOFOLLOW | O_NONBLOCK
+
+        // Keep unsupported Unix targets fail-closed for a symlink leaf even
+        // when their standard library does not expose an O_NOFOLLOW value.
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        if !std::fs::symlink_metadata(path).ok()?.file_type().is_file() {
+            return None;
+        }
+    }
+
+    #[cfg(not(unix))]
+    if !std::fs::symlink_metadata(path).ok()?.file_type().is_file() {
+        return None;
+    }
+
+    let file = options.open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    let max_bytes_u64 = u64::try_from(max_bytes).ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > max_bytes_u64 {
+        return None;
+    }
+
+    let capacity = usize::try_from(metadata.len())
+        .ok()?
+        .min(max_bytes)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(max_bytes_u64.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() <= max_bytes).then_some(bytes)
+}
+
+fn read_bounded_text(path: &Path, max_bytes: usize) -> Option<String> {
+    String::from_utf8(read_bounded_regular_file(path, max_bytes)?).ok()
+}
+
 /// Append a record to its host's log file (own-row authority — a node
 /// only ever writes its own `<host>.jsonl`). One JSON object per line.
 ///
@@ -68,7 +133,7 @@ pub fn append(root: &Path, record: &LogRecord) -> io::Result<()> {
 /// unparseable line is skipped). Order preserved (append order).
 #[must_use]
 pub fn read_host(root: &Path, host: &str) -> Vec<LogRecord> {
-    std::fs::read_to_string(host_log_path(root, host))
+    read_bounded_text(&host_log_path(root, host), MAX_LOG_BYTES)
         .map(|raw| {
             raw.lines()
                 .filter_map(|l| serde_json::from_str::<LogRecord>(l).ok())
@@ -270,5 +335,50 @@ mod tests {
         let got = read_host(tmp.path(), "pine");
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].message, "ok");
+    }
+
+    #[test]
+    fn nonregular_log_leaf_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = logs_dir(tmp.path());
+        std::fs::create_dir_all(dir.join("pine.jsonl")).unwrap();
+        assert!(read_host(tmp.path(), "pine").is_empty());
+    }
+
+    #[test]
+    fn oversized_log_leaf_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = logs_dir(tmp.path());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("pine.jsonl"), vec![b'x'; MAX_LOG_BYTES + 1]).unwrap();
+        assert!(read_host(tmp.path(), "pine").is_empty());
+    }
+
+    #[test]
+    fn invalid_utf8_log_leaf_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = logs_dir(tmp.path());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("pine.jsonl"), [0xff, 0xfe]).unwrap();
+        assert!(read_host(tmp.path(), "pine").is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_symlink_log_leaf_is_skipped() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = logs_dir(tmp.path());
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("real.jsonl");
+        std::fs::write(
+            &target,
+            br#"{"ts_ms":1,"host":"pine","level":"info","message":"ok"}
+"#,
+        )
+        .unwrap();
+        symlink(&target, dir.join("pine.jsonl")).unwrap();
+        assert!(read_host(tmp.path(), "pine").is_empty());
     }
 }
