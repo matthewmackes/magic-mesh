@@ -6,13 +6,13 @@
 //! locally-persisted draft, honest delivery state, and an edit/delete affordance
 //! that reflects the core's five-minute author window (spec §3).
 
-use mde_egui::Style;
 use mde_egui::egui;
+use mde_egui::Style;
 
 use mde_collab_types::{CollabCommand, DeliveryState, MessageBody, MessageView, SpaceId, ThreadId};
 
 use crate::icons::CommsHoverExt;
-use crate::{AmendAffordance, CommunicationsSurface, amend_affordance, icons, relative_age};
+use crate::{amend_affordance, icons, relative_age, AmendAffordance, CommunicationsSurface};
 
 impl CommunicationsSurface {
     /// Render Messages mode for the selected space: the conversation column,
@@ -214,11 +214,14 @@ impl CommunicationsSurface {
     /// The inline edit editor for the message currently in [`Self::editing`].
     fn edit_editor(&mut self, ui: &mut egui::Ui, sink: &mut crate::CommandSink, space: SpaceId) {
         let mut result: Option<bool> = None;
+        let mut input_was_capped = false;
         if let Some((_, buf)) = self.editing.as_mut() {
+            input_was_capped = cap_message_input(buf);
             ui.horizontal(|ui| {
                 ui.add(
                     egui::TextEdit::singleline(buf)
                         .desired_width(f32::INFINITY)
+                        .char_limit(MAX_MESSAGE_BODY_BYTES)
                         .hint_text("Edit message"),
                 );
                 if ui.button("Save").clicked() {
@@ -228,8 +231,10 @@ impl CommunicationsSurface {
                     result = Some(false);
                 }
             });
+            input_was_capped |= cap_message_input(buf);
         }
         match result {
+            Some(true) if input_was_capped => {}
             Some(true) => {
                 if let Some((target, buf)) = self.editing.take() {
                     let text = buf.trim().to_owned();
@@ -245,6 +250,9 @@ impl CommunicationsSurface {
             Some(false) => self.editing = None,
             None => {}
         }
+        if input_was_capped {
+            message_input_notice(ui);
+        }
     }
 
     /// The main-timeline composer. <kbd>Enter</kbd> (or the Send glyph) emits
@@ -254,12 +262,14 @@ impl CommunicationsSurface {
     fn composer(&mut self, ui: &mut egui::Ui, sink: &mut crate::CommandSink, space: SpaceId) {
         let edit_id = self.composer_edit_id(space);
         let mut buf = self.drafts.get(&space).cloned().unwrap_or_default();
+        let mut input_was_capped = cap_message_input(&mut buf);
         let mut send = false;
         ui.horizontal(|ui| {
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut buf)
                     .id(edit_id)
                     .desired_width(f32::INFINITY)
+                    .char_limit(MAX_MESSAGE_BODY_BYTES)
                     .hint_text("Message  ·  Enter to send"),
             );
             let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -270,14 +280,18 @@ impl CommunicationsSurface {
                 send = true;
             }
         });
+        input_was_capped |= cap_message_input(&mut buf);
         let text = buf.trim().to_owned();
-        if send && !text.is_empty() {
+        if send && !input_was_capped && !text.is_empty() {
             sink.emit(CollabCommand::SendMessage {
                 space,
                 thread: None,
                 body: MessageBody::new(text),
             });
             buf.clear();
+        }
+        if input_was_capped {
+            message_input_notice(ui);
         }
         self.drafts.insert(space, buf);
     }
@@ -356,12 +370,14 @@ impl CommunicationsSurface {
     ) {
         let edit_id = egui::Id::new(("mde-collab-thread-composer", thread.as_uuid()));
         let mut buf = self.thread_drafts.get(&thread).cloned().unwrap_or_default();
+        let mut input_was_capped = cap_message_input(&mut buf);
         let mut send = false;
         ui.horizontal(|ui| {
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut buf)
                     .id(edit_id)
                     .desired_width(f32::INFINITY)
+                    .char_limit(MAX_MESSAGE_BODY_BYTES)
                     .hint_text("Reply in thread"),
             );
             let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -374,8 +390,9 @@ impl CommunicationsSurface {
                 send = true;
             }
         });
+        input_was_capped |= cap_message_input(&mut buf);
         let text = buf.trim().to_owned();
-        if send && !text.is_empty() {
+        if send && !input_was_capped && !text.is_empty() {
             sink.emit(CollabCommand::ReplyInThread {
                 space,
                 thread,
@@ -383,8 +400,42 @@ impl CommunicationsSurface {
             });
             buf.clear();
         }
+        if input_was_capped {
+            message_input_notice(ui);
+        }
         self.thread_drafts.insert(thread, buf);
     }
+}
+
+/// Match the command pipeline's 256 KiB UTF-8 body contract at the visible
+/// input boundary. `TextEdit::char_limit` bounds ordinary insertion, while
+/// this byte-based guard also handles multi-byte pastes and restored drafts.
+/// The prefix remains valid UTF-8 and is capped before the next frame can lay it
+/// out, so a hostile draft cannot expand the composer or emit a rejected action.
+const MAX_MESSAGE_BODY_BYTES: usize = 256 * 1024;
+
+fn cap_message_input(value: &mut String) -> bool {
+    if value.len() <= MAX_MESSAGE_BODY_BYTES {
+        return false;
+    }
+
+    let boundary = value
+        .char_indices()
+        .take_while(|(offset, character)| {
+            offset.saturating_add(character.len_utf8()) <= MAX_MESSAGE_BODY_BYTES
+        })
+        .last()
+        .map_or(0, |(offset, character)| offset + character.len_utf8());
+    value.truncate(boundary);
+    true
+}
+
+fn message_input_notice(ui: &mut egui::Ui) {
+    ui.label(
+        egui::RichText::new("Message limited to 256 KiB — review before sending.")
+            .small()
+            .color(Style::WARN),
+    );
 }
 
 /// Render one message inside a thread column (read-only: header + body).
@@ -529,7 +580,24 @@ const fn delivery_label(delivery: DeliveryState) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_MARKDOWN_LAYOUT_CHARS, for_each_markdown_chunk};
+    use super::{
+        cap_message_input, for_each_markdown_chunk, MAX_MARKDOWN_LAYOUT_CHARS,
+        MAX_MESSAGE_BODY_BYTES,
+    };
+
+    #[test]
+    fn message_input_cap_is_utf8_safe_at_the_oversized_action_boundary() {
+        let mut input = format!("🙂{}🦀", "x".repeat(MAX_MESSAGE_BODY_BYTES - 7));
+
+        assert!(cap_message_input(&mut input));
+        assert_eq!(input.len(), MAX_MESSAGE_BODY_BYTES - 3);
+        assert!(input.is_char_boundary(input.len()));
+        assert!(input.starts_with('🙂'));
+        assert!(!input.contains('🦀'));
+
+        assert!(!cap_message_input(&mut input));
+        assert_eq!(input.len(), MAX_MESSAGE_BODY_BYTES - 3);
+    }
 
     #[test]
     fn markdown_chunks_preserve_text_at_utf8_boundaries() {
@@ -543,11 +611,9 @@ mod tests {
 
         assert!(chunks.len() >= 3);
         assert_eq!(chunks.concat(), input);
-        assert!(
-            chunks
-                .iter()
-                .all(|chunk| chunk.chars().count() <= MAX_MARKDOWN_LAYOUT_CHARS)
-        );
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.chars().count() <= MAX_MARKDOWN_LAYOUT_CHARS));
     }
 
     #[test]

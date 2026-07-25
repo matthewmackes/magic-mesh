@@ -252,6 +252,13 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-SEC-006 - Keep Nebula private keys local to their owning node
 
 - Status: Remaining
+- Progress (2026-07-25 node-key parent boundary): node signing-key reads and
+  creation now reject symlinked or non-directory intermediate parents before
+  opening or materializing the identity leaf, closing the parent redirect left
+  by final-leaf no-follow checks. The focused `node_key` farm gate is green at
+  **5/5**, and the integrated BigBoy mackesd gate is green at **4,118 passed,
+  0 failed, 1 ignored**. Live Nebula rotation/reconnect/prune evidence remains
+  external.
 - Progress (2026-07-25 topology-directory boundary): replicated Nebula
   topology now rejects symlinked or non-directory intermediate components
   before enumerating hop adverts, preventing a `topology/hops` roster from
@@ -1009,6 +1016,13 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-011 - Communications collaboration suite full replacement
 
 - Status: Remaining
+- Progress (2026-07-25 collaboration input boundary): Communications send,
+  edit, and thread-reply editors now cap restored and pasted UTF-8 input at the
+  256 KiB command-body limit before layout or action emission, preserving valid
+  boundaries and showing a review notice when clipping occurs. The focused UI
+  gate is green at **3/3**, and the integrated `mde-collab-egui` gate is green
+  at **76 passed, 0 failed, 0 ignored**. Live WebRTC/SIP and sealed DO/LLM
+  evidence remain external.
 - Progress (2026-07-25 collaboration message-body boundary): the command
   pipeline now rejects inline message, edit, and thread-reply bodies above
   the existing 256 KiB projection contract before signing, ID allocation, or
@@ -1623,6 +1637,12 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-012 - Maps live-data overlays (zero-cost external feeds)
 
 - Status: Remaining
+- Progress (2026-07-25 gazetteer parent/race boundary): offline Home-address
+  geocoding now rejects symlinked or non-directory parent components and opens
+  a validated regular database through a stable descriptor-backed SQLite URI,
+  with post-open identity checks. The focused geocoder gate is green at
+  **10/10**, and the integrated Maps gate is green at **232 passed, 0 failed,
+  0 ignored**; live provider and MG90 scanner-feed evidence remain external.
 - Progress (2026-07-25 Airspace repaint-liveness boundary): the visible
   Airspace panel now schedules a 33 ms repaint heartbeat and feed folds wake
   the bound egui context without pointer input; leaving the tab clears that
@@ -1982,6 +2002,13 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-006 - Construct interface (Apple-HIG-principled workstation shell)
 
 - Status: Remaining
+- Progress (2026-07-25 navigation hit-layer boundary): the Springboard Dock's
+  bounded foreground Area now remains in egui's layer hit-test without becoming
+  a transparent click shield, so Back, Home, Pin, and chooser-pinned targets
+  remain clickable at non-zero origins and during the melt transition. The
+  focused nav-bar gate is green at **16/16**, and the integrated shell gate is
+  green at **1,811 passed, 0 failed, 0 ignored**. Physical `.15` pointer/DRM
+  proof remains external.
 - Progress (2026-07-25 top-rail reservation boundary): the Construct status
   rail's tested geometry is now the production reservation path used by the
   shell central view, keeping workspace content below the 24 px rail across
@@ -2527,6 +2554,13 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-007 - Car interface (CarPlay-principled vehicle mode)
 
 - Status: Remaining
+- Progress (2026-07-25 Car keymap persistence boundary): persisted Car
+  bindings now walk real parent directories, reject symlinked/special final
+  leaves, use private create-new temporary files, and atomically replace the
+  target without following a planted legacy temp link. The focused Car-keymap
+  gate is green at **10/10**, and the integrated shell gate is green at **1,811
+  passed, 0 failed, 0 ignored**. Live MG90 and physical Car evidence remain
+  external.
 - Progress (2026-07-25 control-only telemetry boundary): Car glance values
   containing only whitespace/control characters now fall back to honest
   no-data labels instead of appearing as live telemetry. The focused Car farm

@@ -228,16 +228,19 @@ impl State {
             // size from becoming a transparent input shield after an upgrade.
             .default_size(geometry.outer.size())
             .movable(false)
-            .interactable(false)
+            // Keep the Area in egui's layer hit-test without giving it a click
+            // sense. The child controls own clicks; a non-interactable Area is
+            // omitted from `layer_id_at`, which makes the foreground controls
+            // lose their layer during a move or dock/floating transition.
+            .sense(egui::Sense::hover())
             .show(ctx, |ui| {
                 ui.set_min_size(geometry.outer.size());
                 let painter = ui.painter().clone();
                 paint_backing(&painter, &geometry);
                 for control in &geometry.controls {
-                    // egui interaction rectangles are screen-space, just like
-                    // the painter and AccessKit rectangles. Translating these
-                    // into Area-local coordinates makes every control miss on
-                    // any non-zero-position bar.
+                    // The Area's content UI is created with its absolute screen
+                    // rect as max_rect, so these interaction rectangles stay in
+                    // the same screen space as the painter and AccessKit tree.
                     let response =
                         ui.interact(control.rect, control_id(*control), egui::Sense::click());
                     let hovered = response.hovered();
@@ -1268,6 +1271,94 @@ mod tests {
             |ctx| action = state.mount(ctx, &sources),
         );
         assert_eq!(action, Some(Action::DesktopSource("peer:oak".to_owned())));
+    }
+
+    #[test]
+    fn chooser_pin_click_keeps_the_foreground_layer_during_non_zero_transition() {
+        let screen = egui::Rect::from_min_size(egui::pos2(73.0, 41.0), egui::vec2(1280.0, 800.0));
+        let sources = vec![crate::surfaces::DesktopRailSource::new(
+            "peer:cedar",
+            "Cedar Desktop",
+            "cedar",
+            "RDP",
+            true,
+            true,
+            false,
+        )];
+        let transition_started = Instant::now();
+        let mut state = State {
+            mode: DockMode::Docked,
+            transition: Some(TransitionState {
+                from: DockMode::Floating,
+                to: DockMode::Docked,
+                started: transition_started,
+            }),
+        };
+        let ctx = egui::Context::default();
+        let input = |events| egui::RawInput {
+            screen_rect: Some(screen),
+            events,
+            ..Default::default()
+        };
+
+        // Warm the Area so the pointer hit-test sees the same foreground layer
+        // that the current frame will populate. The state remains in its
+        // transition window because this loop is intentionally immediate.
+        for _ in 0..3 {
+            let _ = ctx.run(input(Vec::new()), |ctx| {
+                assert_eq!(state.mount(ctx, &sources), None);
+            });
+        }
+        let geometry = state.geometry_for(screen, Instant::now(), sources.len());
+        let target = geometry
+            .controls
+            .iter()
+            .find(|control| control.source_index == Some(0))
+            .expect("transition geometry must retain the chooser pin")
+            .rect
+            .center();
+        let layer = egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("construct-navigation-bar"),
+        );
+        assert_eq!(
+            ctx.layer_id_at(target),
+            Some(layer),
+            "the navigation Area must remain in the foreground layer hit-test"
+        );
+
+        let _ = ctx.run(
+            input(vec![
+                egui::Event::PointerMoved(target),
+                egui::Event::PointerButton {
+                    pos: target,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]),
+            |ctx| {
+                let _ = state.mount(ctx, &sources);
+            },
+        );
+        let mut action = None;
+        let _ = ctx.run(
+            input(vec![
+                egui::Event::PointerMoved(target),
+                egui::Event::PointerButton {
+                    pos: target,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]),
+            |ctx| action = state.mount(ctx, &sources),
+        );
+        assert_eq!(
+            action,
+            Some(Action::DesktopSource("peer:cedar".to_owned())),
+            "a chooser-pinned target must emit its action during the transition"
+        );
     }
 
     #[test]

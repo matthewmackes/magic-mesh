@@ -8,7 +8,7 @@
 //! at 0600.
 
 use std::io::{self, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use ed25519_dalek::SigningKey;
 
@@ -17,12 +17,52 @@ pub const DEFAULT_KEY_PATH: &str = "/var/lib/mackesd/node-signing.key";
 
 const NODE_SEED_BYTES: usize = 32;
 
+/// Validate every existing parent component before opening or creating the
+/// identity leaf. `O_NOFOLLOW` protects only the final leaf; a symlinked
+/// `var/lib/mackesd` component could otherwise redirect the node key into an
+/// operator-controlled or replicated tree.
+fn validate_parent_chain(path: &Path) -> io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+
+    let mut current = PathBuf::new();
+    for component in parent.components() {
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "node signing key parent is a symlink: {}",
+                        current.display()
+                    ),
+                ));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "node signing key parent is not a directory: {}",
+                        current.display()
+                    ),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 /// Read an existing signing seed through a bounded descriptor boundary.
 ///
 /// The seed is a security-sensitive replicated/runtime identity. Do not follow
 /// a final symlink or open a special file that could block the daemon, and do
 /// not let a growing or oversized leaf reach the key parser.
 fn read_existing_seed(path: &Path) -> io::Result<[u8; NODE_SEED_BYTES]> {
+    validate_parent_chain(path)?;
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
 
@@ -110,6 +150,7 @@ pub fn load_or_create(path: &Path) -> io::Result<SigningKey> {
             rand::rngs::OsRng.fill_bytes(&mut seed);
             if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir)?;
+                validate_parent_chain(path)?;
             }
             let mut file = std::fs::OpenOptions::new()
                 .create_new(true)
@@ -185,5 +226,23 @@ mod tests {
         let socket_path = tmp.path().join("socket.key");
         let _socket = UnixListener::bind(&socket_path).unwrap();
         assert!(load_or_create(&socket_path).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hostile_parent_directory_is_not_followed() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let redirected = tmp.path().join("identity");
+        symlink(outside.path(), &redirected).unwrap();
+        let path = redirected.join("node-signing.key");
+
+        assert!(
+            load_or_create(&path).is_err(),
+            "a symlinked parent must not redirect node-key creation"
+        );
+        assert!(!outside.path().join("node-signing.key").exists());
     }
 }

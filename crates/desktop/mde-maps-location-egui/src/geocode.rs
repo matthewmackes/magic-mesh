@@ -137,8 +137,7 @@ pub fn query_db(db: &Path, text: &str, limit: usize) -> rusqlite::Result<Vec<Geo
     let Some(match_expr) = fts_match(text)? else {
         return Ok(Vec::new());
     };
-    ensure_regular_gazetteer(db)?;
-    let conn = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let conn = open_gazetteer(db)?;
     let mut stmt = conn.prepare(
         "SELECT p.name, p.housenumber, p.street, p.city, p.lat, p.lon, p.kind \
          FROM places_fts f JOIN places p ON p.id = f.rowid \
@@ -161,6 +160,37 @@ pub fn query_db(db: &Path, text: &str, limit: usize) -> rusqlite::Result<Vec<Geo
     Ok(rows.flatten().collect())
 }
 
+/// Reject symlinked or non-directory parent components before SQLite sees the
+/// path. A gazetteer is an installed artifact, so allowing a replicated parent
+/// to redirect the reader would defeat the boundary even when the final leaf
+/// itself is a regular file.
+fn ensure_safe_gazetteer_parents(db: &Path) -> rusqlite::Result<()> {
+    let Some(parent) = db.parent() else {
+        return Ok(());
+    };
+
+    let mut current = PathBuf::new();
+    for component in parent.components() {
+        current.push(component.as_os_str());
+        let metadata = std::fs::symlink_metadata(&current).map_err(|_| {
+            rusqlite::Error::InvalidParameterName(
+                "offline gazetteer parent is missing or unreadable".to_string(),
+            )
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "offline gazetteer parent must not be a symlink".to_string(),
+            ));
+        }
+        if !metadata.is_dir() {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "offline gazetteer parent must be a directory".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Reject a final symlink or special file before SQLite sees the path.
 ///
 /// Gazetteers are installed artifacts, not user-controlled links. Keeping the
@@ -169,6 +199,7 @@ pub fn query_db(db: &Path, text: &str, limit: usize) -> rusqlite::Result<Vec<Geo
 /// check is intentionally fail-closed; SQLite errors are converted to the
 /// normal unavailable note by [`geocode`].
 fn ensure_regular_gazetteer(db: &Path) -> rusqlite::Result<()> {
+    ensure_safe_gazetteer_parents(db)?;
     let metadata = std::fs::symlink_metadata(db).map_err(|_| {
         rusqlite::Error::InvalidParameterName(
             "offline gazetteer path is missing or unreadable".to_string(),
@@ -180,6 +211,112 @@ fn ensure_regular_gazetteer(db: &Path) -> rusqlite::Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Open a gazetteer without allowing pathname changes between validation and
+/// SQLite's open. The path is canonicalized only after the parent/leaf checks,
+/// then opened with `O_NOFOLLOW` and checked against both the canonical and
+/// caller-visible identities. On Linux, SQLite consumes
+/// `/proc/self/fd/<n>?immutable=1`, which keeps it anchored to the already-open
+/// inode even if a parent or the final leaf is renamed after the checks.
+/// SQLite's own `NOFOLLOW` flag remains on the non-Linux pathname fallback.
+fn open_gazetteer(db: &Path) -> rusqlite::Result<Connection> {
+    ensure_regular_gazetteer(db)?;
+    let resolved = std::fs::canonicalize(db).map_err(|_| {
+        rusqlite::Error::InvalidParameterName(
+            "offline gazetteer path could not be resolved safely".to_string(),
+        )
+    })?;
+    // A parent can be replaced after the first validation but before
+    // canonicalize returns. Revalidate before opening the physical path; the
+    // post-open identity checks below close the remaining rename window.
+    ensure_regular_gazetteer(db)?;
+    ensure_regular_gazetteer(&resolved)?;
+
+    #[cfg(unix)]
+    {
+        #[cfg(target_os = "linux")]
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(target_os = "linux")]
+        options.custom_flags(0o400000 | 0o2000000); // O_NOFOLLOW | O_CLOEXEC
+        let file = options.open(&resolved).map_err(|_| {
+            rusqlite::Error::InvalidParameterName(
+                "offline gazetteer path could not be opened safely".to_string(),
+            )
+        })?;
+        let opened = file.metadata().map_err(|_| {
+            rusqlite::Error::InvalidParameterName(
+                "offline gazetteer metadata could not be read".to_string(),
+            )
+        })?;
+        if !opened.file_type().is_file() {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "offline gazetteer path must be a regular file".to_string(),
+            ));
+        }
+
+        // Re-check both the parent chain and the final leaf after the actual
+        // file open. If a rename raced the first validation, the descriptor
+        // identity must not be accepted as a different pathname target.
+        ensure_regular_gazetteer(db)?;
+        ensure_regular_gazetteer(&resolved)?;
+        let visible = std::fs::metadata(db).map_err(|_| {
+            rusqlite::Error::InvalidParameterName(
+                "offline gazetteer path changed while opening".to_string(),
+            )
+        })?;
+        let canonical = std::fs::metadata(&resolved).map_err(|_| {
+            rusqlite::Error::InvalidParameterName(
+                "offline gazetteer path changed while opening".to_string(),
+            )
+        })?;
+        if !same_file_identity(&opened, &visible) || !same_file_identity(&opened, &canonical) {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "offline gazetteer path changed while opening".to_string(),
+            ));
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+
+            let uri = PathBuf::from(format!(
+                "file:/proc/self/fd/{}?immutable=1",
+                file.as_raw_fd()
+            ));
+            return Connection::open_with_flags(
+                uri,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+            );
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            drop(file);
+            return Connection::open_with_flags(
+                resolved,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            );
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        Connection::open_with_flags(
+            db,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+    }
+}
+
+#[cfg(unix)]
+fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    left.dev() == right.dev() && left.ino() == right.ino()
 }
 
 /// The installed gazetteer path, if present.
@@ -355,7 +492,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let error = query_db(dir.path(), "athens", 10)
             .expect_err("a directory must not be opened as a gazetteer");
-        assert!(matches!(error, rusqlite::Error::InvalidParameterName(message) if message.contains("regular file")));
+        assert!(matches!(
+            error,
+            rusqlite::Error::InvalidParameterName(message) if message.contains("regular file")
+        ));
     }
 
     #[cfg(unix)]
@@ -371,7 +511,32 @@ mod tests {
 
         let error = query_db(&link, "athens", 10)
             .expect_err("a final symlink must not be followed by the geocoder");
-        assert!(matches!(error, rusqlite::Error::InvalidParameterName(message) if message.contains("regular file")));
+        assert!(matches!(
+            error,
+            rusqlite::Error::InvalidParameterName(message) if message.contains("regular file")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn intermediate_symlink_gazetteer_parent_is_rejected_before_sqlite() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let real = outside.path().join("gazetteer.sqlite");
+        synth_gazetteer(&real);
+        let redirected = dir.path().join("region");
+        symlink(outside.path(), &redirected).unwrap();
+        let db = redirected.join("gazetteer.sqlite");
+
+        let error = query_db(&db, "athens", 10)
+            .expect_err("an intermediate symlink must not redirect the geocoder");
+        assert!(matches!(
+            error,
+            rusqlite::Error::InvalidParameterName(message)
+                if message.contains("parent must not be a symlink")
+        ));
     }
 
     #[test]

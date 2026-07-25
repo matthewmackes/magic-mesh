@@ -15,9 +15,12 @@
 //! the single source of truth the on-disk map round-trips through.
 
 use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::io::Read;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use mde_egui::egui;
 use serde::de::{self, MapAccess, Visitor};
@@ -416,15 +419,90 @@ impl CarKeyBindings {
     /// The [`std::io::Error`] if the dir cannot be created or the file cannot be
     /// written / renamed.
     fn save_to(&self, path: &Path) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let leaf = path.file_name().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Car keymap path has no valid filename",
+            )
+        })?;
+        let directory = open_preference_directory(parent, true)?;
+        let target = directory.child_path(leaf);
+
+        // Never replace a final symlink (or silently replace a directory/device)
+        // supplied by a hostile or damaged client-data tree. The directory
+        // descriptor above keeps this check and the rename in the same directory
+        // even if a parent is renamed concurrently.
+        match std::fs::symlink_metadata(&target) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Car keymap target is not a regular, non-symlink file",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
+
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, json)?;
-        std::fs::rename(&tmp, path)?;
-        Ok(())
+
+        // A fixed `.json.tmp` is itself a durable attack surface: another
+        // process can plant it as a symlink between saves. Allocate a private
+        // sibling with O_EXCL/create_new, sync its complete body, then replace
+        // the final name atomically. The process-local counter makes this
+        // deterministic without relying on a weak path-time random check.
+        static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let (tmp, mut file) = (0..16)
+            .find_map(|attempt| {
+                let serial = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let mut temp_name = OsString::from(".");
+                temp_name.push(leaf);
+                temp_name.push(format!(
+                    ".tmp.{}.{}.{}",
+                    std::process::id(),
+                    serial,
+                    attempt
+                ));
+                let candidate = directory.child_path(&temp_name);
+                let mut options = OpenOptions::new();
+                options.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt as _;
+                    options.mode(0o600);
+                }
+                match options.open(&candidate) {
+                    Ok(file) => Some(Ok((candidate, file))),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+                    Err(error) => Some(Err(error)),
+                }
+            })
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "could not allocate a private Car keymap temporary file",
+                )
+            })??;
+
+        if let Err(error) = file
+            .write_all(json.as_bytes())
+            .and_then(|()| file.sync_all())
+        {
+            drop(file);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error);
+        }
+        drop(file);
+        if let Err(error) = std::fs::rename(&tmp, &target) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error);
+        }
+        directory.sync_all()
     }
 
     /// Persist to the default path (a silent no-op when no data dir resolves).
@@ -435,26 +513,218 @@ impl CarKeyBindings {
     }
 }
 
+/// A directory held open while a preference operation runs. On Linux, children
+/// are addressed through `/proc/self/fd/<dir-fd>`, so a rename/symlink race in a
+/// path component cannot redirect the read or atomic replacement elsewhere.
+struct StablePreferenceDirectory {
+    handle: File,
+    #[cfg(not(target_os = "linux"))]
+    path: PathBuf,
+}
+
+impl StablePreferenceDirectory {
+    fn child_path(&self, leaf: &OsStr) -> PathBuf {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+
+            PathBuf::from("/proc/self/fd")
+                .join(self.handle.as_raw_fd().to_string())
+                .join(leaf)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.path.join(leaf)
+        }
+    }
+
+    fn sync_all(&self) -> std::io::Result<()> {
+        self.handle.sync_all()
+    }
+}
+
+/// Open every preference parent component as a real directory. Linux walks
+/// component-by-component with O_NOFOLLOW and keeps the final descriptor open;
+/// this closes the parent-symlink and parent-rename window that path-only checks
+/// cannot close. Other targets retain the same explicit real-directory policy.
+#[cfg(target_os = "linux")]
+fn open_preference_directory(
+    path: &Path,
+    create_missing: bool,
+) -> std::io::Result<StablePreferenceDirectory> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::path::Component;
+
+    const O_CLOEXEC: i32 = 0o2000000;
+    const O_DIRECTORY: i32 = 0o200000;
+    const O_NOFOLLOW: i32 = 0o400000;
+
+    fn open_directory(path: &Path) -> std::io::Result<File> {
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+        options.open(path)
+    }
+
+    let mut current = StablePreferenceDirectory {
+        handle: open_directory(if path.is_absolute() {
+            Path::new("/")
+        } else {
+            Path::new(".")
+        })?,
+    };
+
+    for component in path.components() {
+        let name = match component {
+            Component::RootDir | Component::CurDir => continue,
+            Component::Normal(name) => name,
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Car keymap parent contains an unsupported path component",
+                ));
+            }
+        };
+
+        let child = current.child_path(name);
+        let next = match open_directory(&child) {
+            Ok(directory) => directory,
+            Err(error) if create_missing && error.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::create_dir(&child) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error),
+                }
+                open_directory(&child)?
+            }
+            Err(error) => return Err(error),
+        };
+        current = StablePreferenceDirectory { handle: next };
+    }
+
+    Ok(current)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_preference_directory(
+    path: &Path,
+    create_missing: bool,
+) -> std::io::Result<StablePreferenceDirectory> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        use std::path::Component;
+
+        match component {
+            Component::ParentDir => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Car keymap parent contains an unsupported path component",
+                ));
+            }
+            _ => current.push(component.as_os_str()),
+        }
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Car keymap parent is not a real directory",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if create_missing && error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&current)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let handle = File::open(path)?;
+    if !handle.metadata()?.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Car keymap parent is not a directory",
+        ));
+    }
+    Ok(StablePreferenceDirectory {
+        handle,
+        path: path.to_path_buf(),
+    })
+}
+
+/// Open the final preference leaf without following it. O_NONBLOCK also keeps
+/// a final FIFO planted during the metadata/open race from stalling the shell.
+fn open_preference_file(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(0o400000 | 0o4000); // O_NOFOLLOW | O_NONBLOCK
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(0x100 | 0x4); // O_NOFOLLOW | O_NONBLOCK
+    }
+    #[cfg(all(
+        unix,
+        not(any(target_os = "linux", target_os = "macos", target_os = "ios"))
+    ))]
+    if std::fs::symlink_metadata(path)
+        .ok()
+        .is_none_or(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Car keymap leaf is a symlink or unavailable",
+        ));
+    }
+    #[cfg(not(unix))]
+    if std::fs::symlink_metadata(path)
+        .ok()
+        .is_none_or(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Car keymap leaf is a symlink or unavailable",
+        ));
+    }
+    options.open(path)
+}
+
 /// Read a local config through a finite buffer and reject non-regular files.
-/// The metadata checks avoid needless allocation, while the extra byte in the
-/// bounded read closes the race where a regular file grows after its snapshot.
+/// The opened parent and leaf descriptor close symlink/rename redirection; the
+/// extra byte and post-read length check close the race where a regular file
+/// grows or shrinks after its initial metadata snapshot.
 fn read_bounded_config(path: &Path) -> Option<String> {
-    let entry = std::fs::symlink_metadata(path).ok()?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let leaf = path.file_name()?;
+    let directory = open_preference_directory(parent, false).ok()?;
+    let target = directory.child_path(leaf);
+    let entry = std::fs::symlink_metadata(&target).ok()?;
     if !entry.file_type().is_file() || entry.len() > MAX_CAR_KEYMAP_CONFIG_BYTES {
         return None;
     }
 
-    let file = std::fs::File::open(path).ok()?;
+    let file = open_preference_file(&target).ok()?;
     let opened = file.metadata().ok()?;
     if !opened.file_type().is_file() || opened.len() > MAX_CAR_KEYMAP_CONFIG_BYTES {
         return None;
     }
 
     let mut bytes = Vec::with_capacity(opened.len() as usize);
-    file.take(MAX_CAR_KEYMAP_CONFIG_BYTES + 1)
+    (&file)
+        .take(MAX_CAR_KEYMAP_CONFIG_BYTES + 1)
         .read_to_end(&mut bytes)
         .ok()?;
-    if bytes.len() as u64 > MAX_CAR_KEYMAP_CONFIG_BYTES {
+    let closed = file.metadata().ok()?;
+    if bytes.len() as u64 > MAX_CAR_KEYMAP_CONFIG_BYTES
+        || closed.len() != opened.len()
+        || !closed.file_type().is_file()
+    {
         return None;
     }
     String::from_utf8(bytes).ok()
@@ -585,6 +855,57 @@ mod tests {
         std::fs::write(&path, b"not-json").expect("write corrupt config");
 
         assert_eq!(CarKeyBindings::load_from(&path), CarKeyBindings::defaults());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistence_rejects_hostile_paths_and_uses_a_private_temp() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("temp config dir");
+        let outside_dir = dir.path().join("outside");
+        std::fs::create_dir(&outside_dir).expect("outside dir");
+        let outside_path = outside_dir.join("sentinel.json");
+        let mut outside_bindings = CarKeyBindings::defaults();
+        outside_bindings.set(egui::Key::Z, CarAction::GoHome);
+        std::fs::write(
+            &outside_path,
+            serde_json::to_string(&outside_bindings).expect("outside json"),
+        )
+        .expect("outside sentinel");
+
+        let parent_link = dir.path().join("client-data");
+        symlink(&outside_dir, &parent_link).expect("symlinked parent");
+        let hostile_path = parent_link.join(CAR_KEYS_CONFIG_FILE);
+        let bindings = CarKeyBindings::defaults();
+        assert!(bindings.save_to(&hostile_path).is_err());
+        assert_eq!(
+            CarKeyBindings::load_from(&hostile_path),
+            CarKeyBindings::defaults()
+        );
+        assert_eq!(CarKeyBindings::load_from(&outside_path), outside_bindings);
+
+        std::fs::remove_file(&parent_link).expect("remove parent link");
+        std::fs::create_dir(&parent_link).expect("real parent");
+        let final_link = parent_link.join(CAR_KEYS_CONFIG_FILE);
+        symlink(&outside_path, &final_link).expect("symlinked final leaf");
+        assert!(bindings.save_to(&final_link).is_err());
+        assert_eq!(
+            CarKeyBindings::load_from(&final_link),
+            CarKeyBindings::defaults()
+        );
+        assert_eq!(CarKeyBindings::load_from(&outside_path), outside_bindings);
+
+        std::fs::remove_file(&final_link).expect("remove final link");
+        let planted_temp = final_link.with_extension("json.tmp");
+        symlink(&outside_path, &planted_temp).expect("planted legacy temp link");
+        bindings.save_to(&final_link).expect("private atomic save");
+        assert_eq!(CarKeyBindings::load_from(&final_link), bindings);
+        assert!(std::fs::symlink_metadata(&planted_temp)
+            .expect("planted temp metadata")
+            .file_type()
+            .is_symlink());
+        assert_eq!(CarKeyBindings::load_from(&outside_path), outside_bindings);
     }
 
     #[test]
