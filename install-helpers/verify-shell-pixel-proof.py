@@ -9,8 +9,9 @@ features that make the current shell profile recognizable:
 * Construct home: the 24 px top status rail, several shared springboard tile
   plate colours, enough white glyph/text paint, and the bounded floating
   navigation pill rather than a full-width bottom taskbar-shaped bar.
-* Car home: the Ford SYNC3 near-black ground, raised dashboard cards, Ford-blue
-  accent caps, bottom app strip/card paint, and strong glance text.
+* Car home: the Ford SYNC3 near-black ground, a populated left driver
+  instrument strip, raised dashboard cards in the right workspace, Ford-blue
+  accent caps, a six-slot bottom app strip, and strong glance text.
 
 Use this after a live `.15` KMS/linear-GBM capture to turn manual pixel
 inspection into a repeatable fail-closed check.  It intentionally does not prove
@@ -25,6 +26,7 @@ import argparse
 import binascii
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import struct
@@ -47,9 +49,17 @@ STYLE_TILE_GLYPH = (0xFF, 0xFF, 0xFF)
 SYNC3_BG = (0x04, 0x07, 0x0B)
 SYNC3_SURFACE = (0x12, 0x17, 0x1E)
 SYNC3_SURFACE_HI = (0x1C, 0x24, 0x2E)
+SYNC3_TEXT_DIM = (0xA6, 0xB4, 0xC2)
 SYNC3_TEXT_STRONG = (0xFF, 0xFF, 0xFF)
 SYNC3_ACCENT = (0x2E, 0x9B, 0xE6)
 SYNC3_ACCENT_HI = (0x5F, 0xB8, 0xF2)
+CAR_TILE_ACCENTS = (
+    (0x42, 0xBE, 0x65),  # ACCENT_MESH, Navigation glyph
+    (0xFF, 0x7E, 0xB6),  # ACCENT_MEDIA, Media/Music glyphs
+    (0x5B, 0x8C, 0xFF),  # ACCENT, Communications glyph
+    (0x4F, 0xD0, 0x8A),  # OK, Vehicle glyph
+    (0xF1, 0xC2, 0x1B),  # ACCENT_SYSTEM, Settings glyph
+)
 
 CONSTRUCT_ACCENTS = (
     (0x33, 0xB1, 0xFF),  # ACCENT_COMMS
@@ -66,6 +76,14 @@ FLOATING_NAV_X = 16
 FLOATING_NAV_BOTTOM_MARGIN = 16
 FLOATING_NAV_W = 240
 FLOATING_NAV_H = 56
+CAR_INSTRUMENT_FRACTION = 1.0 / 3.0
+CAR_PANEL_PAD = 24
+CAR_HEADER_H = 26 + 16  # Style::DISPLAY + Style::SP_M
+CAR_GAP = 16
+CAR_TOUCH_TARGET = 44
+CAR_MIN_STRIP_H = CAR_TOUCH_TARGET + 32  # Density::Touch + Style::SP_XL
+CAR_MIN_CARDS_H = CAR_TOUCH_TARGET * 2 + CAR_GAP
+CAR_STRIP_TILES = 6
 
 
 Color = tuple[int, int, int]
@@ -241,13 +259,80 @@ def _near_any(targets: Iterable[Color], tolerance: int) -> Predicate:
 def _count_where(image: PngImage, rect: tuple[int, int, int, int], pred: Predicate) -> int:
     x0, y0, x1, y1 = _clamp_rect(image, rect)
     count = 0
+    rgb = image.rgb
+    width = image.width
     for y in range(y0, y1):
-        row = y * image.width * 3
+        row = y * width * 3
         for x in range(x0, x1):
             offset = row + x * 3
-            if pred((image.rgb[offset], image.rgb[offset + 1], image.rgb[offset + 2])):
+            if pred((rgb[offset], rgb[offset + 1], rgb[offset + 2])):
                 count += 1
     return count
+
+
+def _count_near_any(
+    image: PngImage,
+    rect: tuple[int, int, int, int],
+    targets: Iterable[Color],
+    tolerance: int,
+) -> int:
+    """Count near-colour pixels without per-pixel predicate/tuple allocation."""
+
+    targets = tuple(targets)
+    x0, y0, x1, y1 = _clamp_rect(image, rect)
+    rgb = image.rgb
+    width = image.width
+    count = 0
+    for y in range(y0, y1):
+        row = y * width * 3
+        for x in range(x0, x1):
+            offset = row + x * 3
+            r = rgb[offset]
+            g = rgb[offset + 1]
+            b = rgb[offset + 2]
+            for tr, tg, tb in targets:
+                if (
+                    abs(r - tr) <= tolerance
+                    and abs(g - tg) <= tolerance
+                    and abs(b - tb) <= tolerance
+                ):
+                    count += 1
+                    break
+    return count
+
+
+def _count_groups(
+    image: PngImage,
+    rect: tuple[int, int, int, int],
+    groups: dict[str, tuple[Iterable[Color], int]],
+) -> dict[str, int]:
+    """Count multiple near-colour groups in one bounded rect scan."""
+
+    prepared = [
+        (name, tuple(targets), tolerance)
+        for name, (targets, tolerance) in groups.items()
+    ]
+    counts = {name: 0 for name, _targets, _tolerance in prepared}
+    x0, y0, x1, y1 = _clamp_rect(image, rect)
+    rgb = image.rgb
+    width = image.width
+    for y in range(y0, y1):
+        row = y * width * 3
+        for x in range(x0, x1):
+            offset = row + x * 3
+            r = rgb[offset]
+            g = rgb[offset + 1]
+            b = rgb[offset + 2]
+            for name, targets, tolerance in prepared:
+                for tr, tg, tb in targets:
+                    if (
+                        abs(r - tr) <= tolerance
+                        and abs(g - tg) <= tolerance
+                        and abs(b - tb) <= tolerance
+                    ):
+                        counts[name] += 1
+                        break
+    return counts
 
 
 def _fraction(numerator: int, denominator: int) -> float:
@@ -294,23 +379,198 @@ def _construct_tile_plate_colors() -> tuple[Color, ...]:
     return tuple(_blend(accent, STYLE_BG, 1.0 - TILE_PLATE_ALPHA) for accent in CONSTRUCT_ACCENTS)
 
 
+def _rect_i(x0: float, y0: float, x1: float, y1: float) -> tuple[int, int, int, int]:
+    return (math.floor(x0), math.floor(y0), math.ceil(x1), math.ceil(y1))
+
+
+def _inset_rect(
+    rect: tuple[int, int, int, int], inset: int
+) -> tuple[int, int, int, int]:
+    x0, y0, x1, y1 = rect
+    return (x0 + inset, y0 + inset, x1 - inset, y1 - inset)
+
+
+def _car_frame_geometry(width: int, height: int) -> dict[str, object]:
+    """Mirror the shell's Car frame: left third instrument strip + right home."""
+
+    instrument_w = max(1, math.floor(width * CAR_INSTRUMENT_FRACTION))
+    workspace = (instrument_w, 0, width, height)
+    inner = (
+        workspace[0] + CAR_PANEL_PAD,
+        workspace[1] + CAR_PANEL_PAD,
+        workspace[2] - CAR_PANEL_PAD,
+        workspace[3] - CAR_PANEL_PAD,
+    )
+    body = (
+        inner[0],
+        inner[1] + CAR_HEADER_H,
+        inner[2],
+        inner[3],
+    )
+    body_w = body[2] - body[0]
+    body_h = body[3] - body[1]
+    min_body_width = CAR_TOUCH_TARGET * CAR_STRIP_TILES + CAR_GAP * (CAR_STRIP_TILES - 1)
+    min_body_height = CAR_MIN_STRIP_H + CAR_GAP + CAR_MIN_CARDS_H
+    if body_w < min_body_width or body_h < min_body_height:
+        raise ProofError(
+            "Car frame is too small for the instrument strip plus six-slot dashboard "
+            f"body: body={body_w}x{body_h}, minimum={min_body_width}x{min_body_height}"
+        )
+
+    strip_h = min(max(body_h * 0.26, CAR_MIN_STRIP_H), body_h * 0.45)
+    cards_h = max(body_h - strip_h - CAR_GAP, 1.0)
+    nav_w = max((body_w - CAR_GAP) * 0.56, 1.0)
+    nav_card = _rect_i(body[0], body[1], body[0] + nav_w, body[1] + cards_h)
+    right_x = body[0] + nav_w + CAR_GAP
+    right_w = max(body[2] - right_x, 1.0)
+    half_h = max((cards_h - CAR_GAP) / 2.0, 1.0)
+    media_card = _rect_i(right_x, body[1], right_x + right_w, body[1] + half_h)
+    glance_card = _rect_i(
+        right_x,
+        body[1] + half_h + CAR_GAP,
+        right_x + right_w,
+        body[1] + half_h + CAR_GAP + half_h,
+    )
+    strip_top = body[3] - strip_h
+    tile_w = (body_w - CAR_GAP * (CAR_STRIP_TILES - 1)) / CAR_STRIP_TILES
+    strip = tuple(
+        _rect_i(
+            body[0] + index * (tile_w + CAR_GAP),
+            strip_top,
+            body[0] + index * (tile_w + CAR_GAP) + tile_w,
+            strip_top + strip_h,
+        )
+        for index in range(CAR_STRIP_TILES)
+    )
+    return {
+        "instrument": (0, 0, instrument_w, height),
+        "workspace": workspace,
+        "body": body,
+        "nav_card": nav_card,
+        "media_card": media_card,
+        "glance_card": glance_card,
+        "strip": strip,
+    }
+
+
 def validate_car_home(image: PngImage) -> dict[str, object]:
     if image.width < 1024 or image.height < 640:
         raise ProofError(f"Car home proof must be at least 1024x640, got {image.width}x{image.height}")
     luma_min, luma_max = _sample_luma_spread(image)
+    geom = _car_frame_geometry(image.width, image.height)
     full = (0, 0, image.width, image.height)
-    bottom = (0, int(image.height * 0.70), image.width, image.height)
-
-    bg = _count_where(image, full, _near_any((SYNC3_BG,), 10))
-    surface = _count_where(image, full, _near_any((SYNC3_SURFACE, SYNC3_SURFACE_HI), 12))
-    accent = _count_where(image, full, _near_any((SYNC3_ACCENT, SYNC3_ACCENT_HI), 14))
-    text = _count_where(image, full, _near_any((SYNC3_TEXT_STRONG,), 20))
-    bottom_surface = _count_where(
-        image, bottom, _near_any((SYNC3_SURFACE, SYNC3_SURFACE_HI, SYNC3_ACCENT), 14)
+    instrument = geom["instrument"]  # type: ignore[assignment]
+    nav_card = geom["nav_card"]  # type: ignore[assignment]
+    media_card = geom["media_card"]  # type: ignore[assignment]
+    glance_card = geom["glance_card"]  # type: ignore[assignment]
+    strip = geom["strip"]  # type: ignore[assignment]
+    strip_band = (
+        min(tile[0] for tile in strip),  # type: ignore[index]
+        min(tile[1] for tile in strip),  # type: ignore[index]
+        max(tile[2] for tile in strip),  # type: ignore[index]
+        max(tile[3] for tile in strip),  # type: ignore[index]
     )
 
     total = image.pixels
-    bottom_total = _rect_pixels(image, bottom)
+    bottom_total = _rect_pixels(image, strip_band)
+    instrument_total = _rect_pixels(image, instrument)
+    instrument_counts = _count_groups(
+        image,
+        instrument,
+        {
+            "bg": ((SYNC3_BG,), 10),
+            "surface": ((SYNC3_SURFACE, SYNC3_SURFACE_HI), 12),
+            "accent": ((SYNC3_ACCENT, SYNC3_ACCENT_HI), 14),
+            "text": ((SYNC3_TEXT_DIM, SYNC3_TEXT_STRONG), 24),
+        },
+    )
+    instrument_bg = instrument_counts["bg"]
+    instrument_surface = instrument_counts["surface"]
+    instrument_accent = instrument_counts["accent"]
+    instrument_text = instrument_counts["text"]
+
+    nav_interior = _inset_rect(nav_card, CAR_PANEL_PAD)
+    nav_surface = _count_near_any(image, nav_interior, (SYNC3_SURFACE, SYNC3_SURFACE_HI), 12)
+    nav_total = _rect_pixels(image, nav_interior)
+    media_interior = _inset_rect(media_card, CAR_PANEL_PAD)
+    media_surface = _count_near_any(
+        image, media_interior, (SYNC3_SURFACE, SYNC3_SURFACE_HI), 12
+    )
+    media_total = _rect_pixels(image, media_interior)
+    glance_interior = _inset_rect(glance_card, CAR_PANEL_PAD)
+    glance_surface = _count_near_any(
+        image, glance_interior, (SYNC3_SURFACE, SYNC3_SURFACE_HI), 12
+    )
+    glance_total = _rect_pixels(image, glance_interior)
+
+    nav_cap = (nav_card[0], nav_card[1], nav_card[2], min(nav_card[3], nav_card[1] + 4))
+    nav_cap_accent = _count_near_any(image, nav_cap, (SYNC3_ACCENT,), 8)
+    nav_cap_total = _rect_pixels(image, nav_cap)
+
+    strip_slot_surfaces = [
+        _require_ratio(
+            f"Car app-strip slot {idx + 1} surface",
+            _count_near_any(image, tile, (SYNC3_SURFACE, SYNC3_SURFACE_HI), 12),
+            _rect_pixels(image, tile),
+            0.35,
+        )
+        for idx, tile in enumerate(strip)
+    ]
+    strip_accent = _count_near_any(image, strip_band, CAR_TILE_ACCENTS, 18)
+    bottom_surface = _count_near_any(
+        image, strip_band, (SYNC3_SURFACE, SYNC3_SURFACE_HI, SYNC3_ACCENT), 14
+    )
+
+    bottom_strip_card_ratio = _require_ratio(
+        "bottom app-strip/card paint", bottom_surface, bottom_total, 0.10
+    )
+    instrument_strip_bg_ratio = _require_ratio(
+        "left driver instrument strip ground", instrument_bg, instrument_total, 0.20
+    )
+    instrument_strip_surface_ratio = _require_ratio(
+        "left driver instrument strip status tiles",
+        instrument_surface,
+        instrument_total,
+        0.03,
+    )
+    dashboard_nav_card_surface_ratio = _require_ratio(
+        "Car Navigation dashboard card surface", nav_surface, nav_total, 0.45
+    )
+    dashboard_media_card_surface_ratio = _require_ratio(
+        "Car Media dashboard card surface", media_surface, media_total, 0.35
+    )
+    dashboard_glance_card_surface_ratio = _require_ratio(
+        "Car Vehicle/Comms dashboard card surface", glance_surface, glance_total, 0.35
+    )
+    dashboard_nav_accent_cap_ratio = _require_ratio(
+        "Car Navigation Ford-blue card cap", nav_cap_accent, nav_cap_total, 0.55
+    )
+    _require_minimum(
+        "left driver instrument strip accent pixels",
+        instrument_accent,
+        max(120, instrument_total // 3500),
+    )
+    _require_minimum(
+        "left driver instrument strip text/readout pixels",
+        instrument_text,
+        max(300, instrument_total // 1200),
+    )
+    _require_minimum("Car app-strip accent/glyph pixels", strip_accent, max(160, total // 2500))
+
+    full_counts = _count_groups(
+        image,
+        full,
+        {
+            "bg": ((SYNC3_BG,), 10),
+            "surface": ((SYNC3_SURFACE, SYNC3_SURFACE_HI), 12),
+            "accent": ((SYNC3_ACCENT, SYNC3_ACCENT_HI), 14),
+            "text": ((SYNC3_TEXT_STRONG,), 20),
+        },
+    )
+    bg = full_counts["bg"]
+    surface = full_counts["surface"]
+    accent = full_counts["accent"]
+    text = full_counts["text"]
     metrics = {
         "profile": "car-home",
         "width": image.width,
@@ -322,9 +582,17 @@ def validate_car_home(image: PngImage) -> dict[str, object]:
         "sync3_card_ratio": _require_ratio("SYNC3 raised card", surface, total, 0.14),
         "sync3_accent_pixels": accent,
         "sync3_text_pixels": text,
-        "bottom_strip_card_ratio": _require_ratio(
-            "bottom app-strip/card paint", bottom_surface, bottom_total, 0.10
-        ),
+        "bottom_strip_card_ratio": bottom_strip_card_ratio,
+        "instrument_strip_bg_ratio": instrument_strip_bg_ratio,
+        "instrument_strip_surface_ratio": instrument_strip_surface_ratio,
+        "instrument_strip_accent_pixels": instrument_accent,
+        "instrument_strip_text_pixels": instrument_text,
+        "dashboard_nav_card_surface_ratio": dashboard_nav_card_surface_ratio,
+        "dashboard_media_card_surface_ratio": dashboard_media_card_surface_ratio,
+        "dashboard_glance_card_surface_ratio": dashboard_glance_card_surface_ratio,
+        "dashboard_nav_accent_cap_ratio": dashboard_nav_accent_cap_ratio,
+        "app_strip_slots": len(strip_slot_surfaces),
+        "app_strip_accent_pixels": strip_accent,
     }
     _require_minimum("Ford-blue accent pixels", accent, max(250, total // 500))
     _require_minimum("strong Car text/glyph pixels", text, max(250, total // 1000))
@@ -464,28 +732,76 @@ def _fixture_construct(path: Path, *, taskbar: bool = False) -> None:
     _write_png(path, width, height, bytes(buf))
 
 
-def _fixture_car(path: Path, *, blank: bool = False) -> None:
+def _fixture_car(
+    path: Path,
+    *,
+    blank: bool = False,
+    missing_instrument: bool = False,
+    missing_dashboard: bool = False,
+    missing_strip: bool = False,
+) -> None:
     width, height = 1024, 640
     base = SYNC3_BG if not blank else (0x08, 0x08, 0x08)
     buf = bytearray(bytes(base) * width * height)
     if not blank:
-        _fill_rect(buf, width, height, (36, 40, 340, 66), SYNC3_TEXT_STRONG)
-        cards = (
-            (24, 104, 560, 470),
-            (584, 104, 1000, 278),
-            (584, 302, 1000, 470),
-        )
-        for rect in cards:
-            _fill_rect(buf, width, height, rect, SYNC3_SURFACE)
-            _fill_rect(buf, width, height, (rect[0], rect[1], rect[2], rect[1] + 4), SYNC3_ACCENT)
-            _fill_rect(buf, width, height, (rect[0] + 24, rect[3] - 42, rect[2] - 24, rect[3] - 30), SYNC3_TEXT_STRONG)
-        x = 24
-        for _ in range(6):
-            _fill_rect(buf, width, height, (x, 496, x + 152, 616), SYNC3_SURFACE)
-            _fill_rect(buf, width, height, (x, 496, x + 152, 500), SYNC3_ACCENT)
-            _fill_rect(buf, width, height, (x + 56, 524, x + 96, 556), SYNC3_ACCENT_HI)
-            _fill_rect(buf, width, height, (x + 42, 584, x + 110, 592), SYNC3_TEXT_STRONG)
-            x += 164
+        geom = _car_frame_geometry(width, height)
+        instrument = geom["instrument"]  # type: ignore[assignment]
+        if not missing_instrument:
+            x0, y0, x1, y1 = instrument
+            _fill_rect(buf, width, height, (x0 + 24, y0 + 36, x1 - 24, y0 + 44), SYNC3_ACCENT)
+            _fill_rect(
+                buf,
+                width,
+                height,
+                (x0 + 96, y0 + 126, x1 - 96, y0 + 188),
+                SYNC3_TEXT_DIM,
+            )
+            _fill_rect(
+                buf,
+                width,
+                height,
+                (x0 + 176, y0 + 204, x1 - 176, y0 + 220),
+                SYNC3_TEXT_DIM,
+            )
+            grid_top = y0 + int((y1 - y0) * 0.46)
+            tile_gap = 8
+            tile_w = max(24, ((x1 - x0) - 48 - tile_gap) // 2)
+            tile_h = 58
+            for row in range(3):
+                for col in range(2):
+                    tx = x0 + 24 + col * (tile_w + tile_gap)
+                    ty = grid_top + row * (tile_h + tile_gap)
+                    rect = (tx, ty, tx + tile_w, ty + tile_h)
+                    _fill_rect(buf, width, height, rect, SYNC3_SURFACE)
+                    _fill_rect(buf, width, height, (rect[0] + 1, rect[1] + 4, rect[0] + 5, rect[3] - 4), SYNC3_ACCENT)
+                    _fill_rect(buf, width, height, (rect[0] + 16, rect[1] + 12, rect[2] - 16, rect[1] + 18), SYNC3_TEXT_DIM)
+                    _fill_rect(buf, width, height, (rect[0] + 16, rect[1] + 32, rect[2] - 28, rect[1] + 42), SYNC3_TEXT_STRONG)
+        if not missing_dashboard:
+            _fill_rect(buf, width, height, (instrument[2] + 24, 24, instrument[2] + 300, 52), SYNC3_TEXT_STRONG)
+            cards = (
+                geom["nav_card"],
+                geom["media_card"],
+                geom["glance_card"],
+            )
+            for rect in cards:
+                rect = rect  # type: ignore[assignment]
+                _fill_rect(buf, width, height, rect, SYNC3_SURFACE)
+                _fill_rect(buf, width, height, (rect[0], rect[1], rect[2], rect[1] + 4), SYNC3_ACCENT)
+                _fill_rect(
+                    buf,
+                    width,
+                    height,
+                    (rect[0] + 24, rect[3] - 42, rect[2] - 24, rect[3] - 30),
+                    SYNC3_TEXT_STRONG,
+                )
+            if not missing_strip:
+                strip = geom["strip"]  # type: ignore[assignment]
+                for index, rect in enumerate(strip):
+                    accent = CAR_TILE_ACCENTS[index % len(CAR_TILE_ACCENTS)]
+                    _fill_rect(buf, width, height, rect, SYNC3_SURFACE)
+                    _fill_rect(buf, width, height, (rect[0], rect[1], rect[2], rect[1] + 4), accent)
+                    _fill_rect(buf, width, height, (rect[0] + 44, rect[1] + 26, rect[2] - 44, rect[1] + 58), accent)
+                    _fill_rect(buf, width, height, (rect[0] + 36, rect[3] - 34, rect[2] - 36, rect[3] - 24), SYNC3_TEXT_STRONG)
     _write_png(path, width, height, bytes(buf))
 
 
@@ -504,14 +820,23 @@ def run_self_test() -> None:
         car = root / "car.png"
         construct_taskbar = root / "construct-taskbar.png"
         blank_car = root / "blank-car.png"
+        car_no_instrument = root / "car-no-instrument.png"
+        car_no_dashboard = root / "car-no-dashboard.png"
+        car_no_strip = root / "car-no-strip.png"
         _fixture_construct(construct)
         _fixture_car(car)
         _fixture_construct(construct_taskbar, taskbar=True)
         _fixture_car(blank_car, blank=True)
+        _fixture_car(car_no_instrument, missing_instrument=True)
+        _fixture_car(car_no_dashboard, missing_dashboard=True)
+        _fixture_car(car_no_strip, missing_strip=True)
         validate_construct_home(read_png(construct))
         validate_car_home(read_png(car))
         _expect_fail(lambda: validate_construct_home(read_png(construct_taskbar)), "taskbar-shaped construct fixture")
         _expect_fail(lambda: validate_car_home(read_png(blank_car)), "blank Car fixture")
+        _expect_fail(lambda: validate_car_home(read_png(car_no_instrument)), "Car fixture missing driver strip")
+        _expect_fail(lambda: validate_car_home(read_png(car_no_dashboard)), "Car fixture missing dashboard cards")
+        _expect_fail(lambda: validate_car_home(read_png(car_no_strip)), "Car fixture missing six-slot app strip")
     print("verify-shell-pixel-proof: self-test passed")
 
 

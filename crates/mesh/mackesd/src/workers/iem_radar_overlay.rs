@@ -17,7 +17,7 @@ use serde::Deserialize;
 
 use super::{ShutdownToken, Worker};
 
-/// Explicit opt-in; unset/false is an idle no-op.
+/// Explicit disable for the keyless default-on IEM/NWS radar producer.
 pub const ENABLED_ENV: &str = "MDE_OVERLAY_IEM_RADAR";
 /// Exact IEM metadata clock check cadence.
 pub const POLL: Duration = Duration::from_secs(60);
@@ -55,24 +55,26 @@ pub trait IemRadarProbe: Send + Sync {
 }
 
 /// Production rustls IEM courtesy-service probe.
-pub struct IemRadarHttpProbe {
-    client: Client,
-}
+pub struct IemRadarHttpProbe;
 
 impl IemRadarHttpProbe {
-    fn new() -> io::Result<Self> {
+    fn new() -> Self {
+        Self
+    }
+
+    fn client() -> io::Result<Client> {
         let client = Client::builder()
             .timeout(HTTP_TIMEOUT)
             .user_agent(USER_AGENT)
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(io_other)?;
-        Ok(Self { client })
+        Ok(client)
     }
 
     fn get_bounded(&self, url: &str, content_type: &str, cap: usize) -> io::Result<Vec<u8>> {
         validate_official_url(url)?;
-        let response = self.client.get(url).send().map_err(io_other)?;
+        let response = Self::client()?.get(url).send().map_err(io_other)?;
         if response.status() != reqwest::StatusCode::OK {
             return Err(io::Error::other(format!(
                 "IEM returned unexpected HTTP {} (redirects are disabled)",
@@ -415,17 +417,14 @@ pub struct IemRadarOverlayWorker {
 }
 
 impl IemRadarOverlayWorker {
-    /// Production wiring. Disabled unless explicitly opted in.
+    /// Production wiring. The keyless IEM/NWS radar adapter is enabled by
+    /// default on spawned Workstation-tier nodes; an explicit false-y env
+    /// disables it. Missing vehicle context publishes an honest empty mirror
+    /// instead of leaving the catalog topic absent.
     #[must_use]
     pub fn new(host: String) -> Self {
-        let probe = if env_truthy(ENABLED_ENV) {
-            match IemRadarHttpProbe::new() {
-                Ok(probe) => Some(Arc::new(probe) as Arc<dyn IemRadarProbe>),
-                Err(error) => {
-                    tracing::warn!(target: "mackesd::iem_radar_overlay", %error, "IEM radar client unavailable; worker idle");
-                    None
-                }
-            }
+        let probe = if env_default_enabled(ENABLED_ENV) {
+            Some(Arc::new(IemRadarHttpProbe::new()) as Arc<dyn IemRadarProbe>)
         } else {
             None
         };
@@ -468,6 +467,22 @@ impl IemRadarOverlayWorker {
                 snapshot,
             );
         }
+    }
+
+    fn no_context_snapshot(&self, reason: &str) -> IemRadarSnapshot {
+        let mut snapshot = IemRadarSnapshot::empty(&self.host, now_ms(), 0.0, 0.0);
+        push_gap(&mut snapshot.gaps, format!("IEM radar paused: {reason}"));
+        snapshot
+    }
+
+    fn publish_no_context_degraded(&self, reason: &str, last_good: &mut Option<IemRadarSnapshot>) {
+        let snapshot = self.no_context_snapshot(reason);
+        self.publish(&snapshot);
+        // A missing same-host fix invalidates the previous tile origin. Keep
+        // the Bus mirror present and licensed, but do not let later failures
+        // replay a tile fetched for an old point as if it still described the
+        // vehicle's surroundings.
+        *last_good = None;
     }
 
     fn apply_result(
@@ -578,10 +593,8 @@ impl Worker for IemRadarOverlayWorker {
         loop {
             let Some(context) = self.current_context() else {
                 if !no_fix_published {
-                    self.apply_result(
-                        Err(io::Error::other(
-                            "fresh same-host US vehicle fix unavailable",
-                        )),
+                    self.publish_no_context_degraded(
+                        "fresh same-host US vehicle fix unavailable",
                         &mut last_good,
                     );
                     no_fix_published = true;
@@ -615,13 +628,15 @@ impl Worker for IemRadarOverlayWorker {
     }
 }
 
-fn env_truthy(name: &str) -> bool {
-    std::env::var(name).is_ok_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
+fn env_default_enabled(name: &str) -> bool {
+    overlay_enabled_from_env(std::env::var(name).ok().as_deref())
+}
+
+fn overlay_enabled_from_env(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(|value| value.trim().to_ascii_lowercase()),
+        Some(value) if matches!(value.as_str(), "0" | "false" | "no" | "off")
+    )
 }
 
 fn now_ms() -> i64 {
@@ -755,6 +770,20 @@ mod tests {
     }
 
     #[test]
+    fn keyless_iem_radar_producer_defaults_on_with_explicit_false_opt_out() {
+        assert!(overlay_enabled_from_env(None));
+        assert!(overlay_enabled_from_env(Some("")));
+        assert!(overlay_enabled_from_env(Some("1")));
+        assert!(overlay_enabled_from_env(Some("true")));
+        assert!(overlay_enabled_from_env(Some("yes")));
+        assert!(overlay_enabled_from_env(Some("on")));
+        assert!(!overlay_enabled_from_env(Some("0")));
+        assert!(!overlay_enabled_from_env(Some("false")));
+        assert!(!overlay_enabled_from_env(Some("NO")));
+        assert!(!overlay_enabled_from_env(Some(" off ")));
+    }
+
+    #[test]
     fn unchanged_producer_frame_reuses_tiles_without_refetching() {
         let probe = FakeProbe::default();
         let current = parse_metadata(&metadata(0), NOW_MS, true).expect("metadata");
@@ -797,6 +826,49 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn no_vehicle_fix_degraded_snapshot_is_present_and_retracts_prior_frames() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().to_path_buf();
+        let worker =
+            IemRadarOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+        let probe = FakeProbe::default();
+        let current = parse_metadata(&metadata(0), NOW_MS, true).expect("metadata");
+        let original =
+            build_snapshot(&probe, "rig-1", context(), current, NOW_MS).expect("snapshot");
+        assert!(!original.frames.is_empty());
+        let mut last_good = Some(original);
+
+        worker.publish_no_context_degraded(
+            "fresh same-host US vehicle fix unavailable",
+            &mut last_good,
+        );
+
+        assert!(
+            last_good.is_none(),
+            "old vehicle-scoped radar tiles must not survive fix loss"
+        );
+        let body = Persist::open(root)
+            .expect("bus")
+            .read_latest(&iem_radar_state_topic("rig-1"))
+            .expect("read")
+            .expect("row")
+            .body
+            .expect("body");
+        let snapshot: IemRadarSnapshot = serde_json::from_str(&body).expect("snapshot");
+        assert_eq!(snapshot.host, "rig-1");
+        assert!(snapshot.fetched_at_ms > 0);
+        assert!(snapshot.frames.is_empty());
+        assert_eq!(snapshot.query_latitude, 0.0);
+        assert_eq!(snapshot.query_longitude, 0.0);
+        assert!(snapshot
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("vehicle fix unavailable")));
+        assert_eq!(snapshot.license_tier, "public-domain-courtesy-attribution");
+        assert_eq!(snapshot.attribution, "IEM / NOAA NWS NEXRAD");
     }
 
     #[test]
@@ -877,5 +949,53 @@ mod tests {
         .expect("responsive");
         assert!(result.is_none());
         sender.await.expect("sender");
+    }
+
+    #[tokio::test]
+    async fn default_on_worker_publishes_degraded_snapshot_without_vehicle_fix() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().to_path_buf();
+        let mut worker = IemRadarOverlayWorker::new("rig-1".to_string())
+            .with_probe(Arc::new(FakeProbe::default()))
+            .with_bus_root(Some(root.clone()));
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let token = ShutdownToken::from_receiver(rx);
+        let handle = tokio::spawn(async move { worker.run(token).await });
+
+        let topic = iem_radar_state_topic("rig-1");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let body = loop {
+            if let Some(row) = Persist::open(root.clone())
+                .expect("bus")
+                .read_latest(&topic)
+                .expect("read")
+            {
+                break row.body.expect("body");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "default-on IEM radar worker did not publish a degraded no-fix snapshot"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        tx.send(true).expect("shutdown");
+        let joined = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert!(joined.is_ok(), "worker exits promptly after proof");
+        joined
+            .expect("join timeout")
+            .expect("join")
+            .expect("worker ok");
+
+        let snapshot: IemRadarSnapshot = serde_json::from_str(&body).expect("snapshot");
+        assert_eq!(snapshot.host, "rig-1");
+        assert!(snapshot.fetched_at_ms > 0);
+        assert!(snapshot.frames.is_empty());
+        assert!(snapshot
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("vehicle fix unavailable")));
+        assert_eq!(snapshot.license_tier, "public-domain-courtesy-attribution");
+        assert_eq!(snapshot.attribution, "IEM / NOAA NWS NEXRAD");
     }
 }

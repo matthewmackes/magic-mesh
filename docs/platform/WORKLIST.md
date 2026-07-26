@@ -1995,6 +1995,20 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-012 - Maps live-data overlays (zero-cost external feeds)
 
 - Status: Remaining
+- Progress (2026-07-26 IEM/NEXRAD default-on degraded mirror): the
+  zero-cost `iem-radar` Workstation worker is now default-on with explicit
+  false-y opt-out via `MDE_OVERLAY_IEM_RADAR=0|false|no|off`. When the seat has
+  no fresh same-host US vehicle fix, it publishes a present licensed degraded
+  `state/overlay/iem-nexrad/<node>` snapshot instead of leaving the catalog
+  topic absent, and clears prior vehicle-scoped tiles so an old radar frame is
+  not replayed for a stale location. The production HTTP probe now constructs
+  its blocking reqwest client inside the blocking fetch path, avoiding Tokio
+  runtime-drop hazards. Sidecar farm evidence is green on `.90` for
+  `cargo test -p mackesd --lib --features async-services
+  workers::iem_radar_overlay::tests -- --nocapture` at **10/10**, `.170`
+  touched-file rustfmt is green, and local `git diff --check` for the touched
+  worker is clean. Live radar tiles still require a fresh same-host vehicle
+  fix; without that, the correct proof is the honest degraded mirror.
 - Progress (2026-07-26 Airspace publication/consumption audit): traced the
   reported Airspace path end-to-end with no code change. `airspace` is a
   Workstation-tier worker in the census (`crates/mesh/mackesd/src/worker_role.rs`
@@ -3179,6 +3193,18 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-007 - Car interface (CarPlay-principled vehicle mode)
 
 - Status: Remaining
+- Progress (2026-07-26 Car pixel verifier frame hardening):
+  `install-helpers/verify-shell-pixel-proof.py --profile car-home` now verifies
+  the full Car frame geometry instead of accepting broad color presence alone:
+  populated left driver instrument strip, right-side dashboard cards,
+  Ford-blue Navigation cap, and all six bottom app-strip slots. The self-test
+  suite now includes fail-closed fixtures for a missing driver strip, missing
+  dashboard cards, and missing app strip. The exact final verifier file passes
+  local bytecode compilation, `--self-test` (38 s), and `git diff --check`;
+  sidecar farm `.50` slot `ux-car-pixel-proof` covered the same geometry
+  contract before the final local counting/order optimization. No live `.15`
+  capture, package deploy, MG90 drive/fix, or physical Car proof was collected
+  in this slice.
 - Progress (2026-07-26 MG90 Admin single-interface consolidation): Maps &
   Location now exposes one top-level `MG90 Admin` rail target; the former
   Vehicle, Connectivity, Devices & I/O, Location Sources, MG90 Setup, MG90
