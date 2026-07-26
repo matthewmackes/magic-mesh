@@ -1,7 +1,7 @@
 use super::*;
 use mackes_mesh_types::cloud::{
-    CloudProviderAdapter, DriftFlag, DriftSummary, EndpointInterface, HealthState, NodeCapacity,
-    ServiceHealth,
+    CloudProviderAdapter, DriftFlag, DriftSummary, EndpointInterface, HealthState, ImageRow,
+    NodeCapacity, ServiceHealth,
 };
 use mde_egui::egui::{pos2, vec2, Rect};
 
@@ -544,6 +544,65 @@ fn containers_route_uses_dense_container_table_before_deploy_form() {
         state.view(),
         DeliveryView::DesktopVm,
         "Containers route must not mutate the operator's delivery filter just to show existing containers"
+    );
+}
+
+#[test]
+fn images_route_uses_dense_table_before_the_image_build_flow() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut state = state_on(DeliveryView::DesktopVm, WorkloadsRoute::Images);
+    state.bus_root = Some(tmp.path().join("bus"));
+    state.selected_node = Some("eagle".to_string());
+    state.images.set_test_version("1.0");
+    let rows = vec![
+        ImageRow {
+            name: "desktop_vm-golden".to_string(),
+            sha256: "abc123def456789000000000000000000000000000000000000000000000".to_string(),
+            promoted: true,
+        },
+        ImageRow {
+            name: "app_vm-golden".to_string(),
+            sha256: "001122334455667788990000000000000000000000000000000000000000".to_string(),
+            promoted: false,
+        },
+    ];
+    state.images.set_test_roster(rows.clone());
+
+    let text = rendered_text(|ui| route_body(ui, &mut state));
+
+    assert!(text.contains("Image lifecycle table"), "{text}");
+    assert!(text.contains("Image Actions"), "{text}");
+    assert!(text.contains("desktop_vm-golden"), "{text}");
+    assert!(text.contains("app_vm-golden"), "{text}");
+    assert!(text.contains("Promote"), "{text}");
+    assert!(
+        text.find("Image lifecycle table") < text.find("Build a golden image"),
+        "the dense table must render before the image-build flow: {text}"
+    );
+    assert_eq!(
+        emitted_request_count(&state, mackes_mesh_types::cloud::VERB_IMAGE_BUILD),
+        0,
+        "passive Images table render must not publish image-build requests"
+    );
+
+    let mut expanded_state = state_on(DeliveryView::DesktopVm, WorkloadsRoute::Images);
+    expanded_state.bus_root = Some(tmp.path().join("expanded-bus"));
+    expanded_state.selected_node = Some("eagle".to_string());
+    expanded_state.images.set_test_version("1.0");
+    let expanded = images::image_row_key(&rows[1]);
+    expanded_state.images.set_test_roster(rows);
+    expanded_state.images.expand_test_row(expanded);
+
+    let expanded_text = rendered_text(|ui| route_body(ui, &mut expanded_state));
+
+    assert!(
+        expanded_text.contains("Content hash") && expanded_text.contains("00112233445566778899"),
+        "{expanded_text}"
+    );
+    assert!(
+        expanded_text.contains("Command preview")
+            && expanded_text.contains("action/cloud/image-build"),
+        "{expanded_text}"
     );
 }
 

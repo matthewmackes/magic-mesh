@@ -18,7 +18,7 @@ instead of leaving closed work in this file.
 
 ## Current Snapshot - 2026-07-26 release gate
 
-- **10 active epics:** 10 `Remaining`, 0 `Blocked`; no `Needs clarification`.
+- **11 active epics:** 11 `Remaining`, 0 `Blocked`; no `Needs clarification`.
 - **Release gate:** the current integrated wave passes the full `mackesd` farm
   suite at **4,124 passed, 0 failed, 1 ignored**. The Fedora 44
   base/browser/thin-lighthouse RPM cut is green at **81.7 / 39.1 / 11.0 MiB**;
@@ -38,7 +38,8 @@ instead of leaving closed work in this file.
   from dev, `.15`, Dell, and LH1); Eagle recovery is the current live hardware
   blocker.
 - **P0:** WL-ARCH-007 (authorization mint + direct lifecycle proof),
-  WL-FUNC-011 (optional real media/LLM evidence remains), and WL-UX-010
+  WL-FUNC-011 (optional real media/LLM evidence remains), WL-FUNC-016
+  (native mesh clipboard lanes for seat/browser/VDI), and WL-UX-010
   (Mesh Teams near-parity interface redesign).
 - **In flight:** WL-FUNC-012 live map feeds, WL-UX-006 Construct, WL-UX-007
   Car, WL-UX-009 unified workspace design language, and WL-UX-010 Mesh Teams
@@ -2632,6 +2633,61 @@ These decisions refine acceptance and sequencing for the active items below.
   gateway registrations primary over direct discovery, and farm plus live LAN
   proof.
 
+### WL-FUNC-016 - Native mesh clipboard lanes for seat, browser, and VDI
+
+- Status: Remaining
+- Priority: P0
+- Complexity: Epic
+- Problem: The direct DRM egui seat has no production clipboard provider: key
+  handling does not synthesize `egui::Event::{Copy,Cut,Paste}`, platform
+  `CopyText` output is ignored, and the remaining clipboard sync path depends
+  on `wl-copy` / `wl-paste` even though the governed desktop has no Wayland
+  compositor. As a result cut/copy/paste fails locally and cross-app, while
+  browser, KDC/mobile, Communications clipboard history, and VDI guest
+  clipboard lanes do not share one native mesh contract.
+- Required outcome: Clipboard text is a first-class mesh lane across the
+  platform. Copying from any local egui app, browser surface, VDI guest, or
+  authorized remote/KDC producer updates the active seat clipboard where
+  appropriate, publishes the canonical `event/clipboard/clip` body, persists
+  into the shared clipboard history, and can be materialized back onto a target
+  seat or guest without using Wayland clipboard tools in production.
+- Scope: DRM seat clipboard provider, shell-to-mesh clipboard publication,
+  `mackesd` clipboard history consumer/responder, Communications Clipboard lane
+  actions, browser shell-mediated cut/copy/paste, KDC/mobile inbound
+  materialization, and live VDI text clipboard endpoints. Out of scope:
+  arbitrary MIME/images, secret filtering, and giving sandboxed browser helpers
+  direct host clipboard access.
+- Relevant files/components: `crates/shared/mde-egui/src/drm.rs`,
+  `crates/desktop/mde-shell-egui/src/`, `crates/mesh/mackesd/src/workers/clipboard_sync.rs`,
+  `crates/mesh/mackesd/src/ipc/clipboard.rs`,
+  `crates/mesh/mackesd/src/workers/clipboard_bridge.rs`,
+  `crates/desktop/mde-collab-egui/src/clipboard.rs`, and the live VDI crates
+  under `crates/desktop/mde-vdi-*`.
+- Dependencies: Preserve existing `event/clipboard/clip` compatibility with
+  body `{ id, text, source, time }`; preserve `action/clipboard/{list,pin,unpin,delete,clear}`;
+  preserve VDI clipboard authorization, echo guards, and the 1 MiB guest
+  transport cap; coordinate with WL-FUNC-011 / WL-UX-010 so Mesh Teams renders
+  the same clipboard lane instead of a parallel store.
+- Acceptance criteria: local copy/cut/paste works between egui apps on the DRM
+  seat; every seat/browser/VDI/KDC clipboard producer publishes
+  `event/clipboard/clip` with stable content id, source, and RFC3339 time;
+  clipboard history is updated by consuming that lane rather than watching
+  Wayland; a Clipboard row can materialize onto a target seat through an
+  authorized action lane; browser clipboard operations remain shell-mediated;
+  VNC guest clipboard is bidirectional through real RFB `ClientCutText` and
+  `ServerCutText`; RDP/SPICE either use real protocol clipboard channels or
+  report explicit unsupported status; duplicate/echo events are debounced.
+- Verification method: build-farm tests for `mde-egui` DRM shortcut/output
+  handling, shell publication/materialization, `mackesd` lane history folding,
+  Communications Clipboard actions, browser mediation, KDC/mobile inbound
+  action handling, VNC wire encoding/decoding, VDI host-to-guest and
+  guest-to-host flow, worklist lint, and live seat proof on `.15` or Dell
+  copying between Editor, Terminal, Browser chrome, Mesh Teams Clipboard, and a
+  VDI session.
+- Origin or merged source IDs: 2026-07-26 operator report that platform cut and
+  paste is impossible, followed by explicit scope lock that all clipboard paths
+  must natively connect with the mesh lanes.
+
 ## User Interface And Experience
 
 ### WL-UX-006 - Construct interface (Apple-HIG-principled workstation shell)
@@ -2713,6 +2769,18 @@ These decisions refine acceptance and sequencing for the active items below.
   output-waker regression **1/1**, `.170` widget repaint-waker test **1/1**, and
   `.130` `cargo fmt -p mde-term-egui -- --check` clean. Dell package deployment
   and live seat proof are still pending.
+- Progress (2026-07-26 Terminal cursor blink/reset fix): the Terminal
+  typing-lag path now resets the focused cursor's blink phase for a bounded
+  450 ms grace after accepted text, key, paste, Ctrl-C, or Ctrl-X input, without
+  fabricating terminal contents; the PTY/engine echo remains the only source of
+  displayed buffer text. This closes the stale-looking cursor frame where rapid
+  typing could repaint during a blink-off phase while the PTY echo caught the
+  next frame. Farm evidence is green: `.50` slot 0 `cargo test -p
+  mde-term-egui cursor -- --nocapture` passed **11/11**, including
+  `accepted_input_forces_the_focused_cursor_visible_during_blink_off` and
+  `input_activity_sets_a_bounded_cursor_visibility_deadline`; `.170` slot 0
+  `cargo fmt -p mde-term-egui -- --check` passed. Dell/.15 RPM deployment and
+  live seat proof are still pending.
 - Progress (2026-07-26 Springboard Dock Infra/Ops/Life grouping): the operator
   survey answer for dock grouping is now encoded as a dock-specific contract:
   **Infra** = VMs (`Remote Sessions`) + Terminal, **Ops** = Maps & Location +
@@ -4000,6 +4068,27 @@ These decisions refine acceptance and sequencing for the active items below.
   if this item changes; live or captured Farm + seat proof for desktop and
   tablet-like sizes, with explicit hardware-unavailable note if no seat is
   reachable.
+- Progress (2026-07-26 Images lifecycle table + Provision reachability): the
+  Images route now renders a dense `Image lifecycle table` before the golden
+  image build/promote form. Rows expose Details, Image, SHA256, Active base,
+  and Image Actions; expanded rows show placement, promotion state, version,
+  full SHA256 content hash, and an `action/cloud/image-build` command preview.
+  Candidate rows expose review-gated `Promote…`, while promoted rows show
+  `Active base`; promote now requires an explicit version before opening the
+  exact-echo review sheet, matching the backend `promote:<name>@<version>`
+  contract instead of silently using `latest`. The Provision wide rail was also
+  compacted for the Kdam-era text metrics: sticky actions render before the
+  HCL/validation rail, and the live-apply validation row is prioritized in the
+  compact rail so plan-only/live-apply state remains visible in the desktop
+  capture. Evidence is green: BigBoy `.130` slot `images-review-20260726`
+  focused `cargo test -p mde-shell-egui images -- --nocapture` passed **9/9**;
+  `.90` slot `provision-regress-20260726` focused
+  `cargo test -p mde-shell-egui provision_route_ -- --nocapture` passed
+  **2/2**; BigBoy `.130` slot `workloads-iac-review`
+  `cargo test -p mde-shell-egui iac -- --nocapture` passed **68/68**; `.170`
+  slot `ui-slices-fmt-review` touched-file rustfmt passed for the Workloads,
+  Communications, and Terminal files changed in this wave. No live seat
+  mutation or rendered tablet/live-seat proof was performed.
 - Progress (2026-07-26 exact review-sheet echo hardening): the Workloads
   review-sheet confirmation gate now requires the operator echo byte-for-byte.
   Whitespace-padded input such as `  apply ` no longer arms the review sheet and
@@ -4339,6 +4428,25 @@ These decisions refine acceptance and sequencing for the active items below.
   `ScrollArea::show_rows` virtualizes paint. This targets the seat `.15`
   slowdown when opening Mesh Teams Activity without changing collaboration Bus
   topics or command contracts.
+- Progress (2026-07-26 seat `.15` Activity read-bound clamp): the shell-side
+  Mesh Teams mount now defensively clamps retained Activity Bus mirrors to the
+  newest 1,024 rows before exposing them to the egui surface, so older or stale
+  live-seat mirrors cannot reintroduce an unbounded feed. Unread counting now
+  walks newest-last rows only until the durable cursor, and the per-frame
+  mark-read path advances from the newest retained row instead of scanning the
+  whole feed for a max clock. Evidence: BigBoy `.130` slot
+  `ux010-activity-clamp` focused
+  `cargo test -p mde-shell-egui
+  focused_activity_feed_is_clamped_and_read_cursor_uses_newest_row --
+  --nocapture` passed **1/1**; BigBoy `.130` slot
+  `ux010-activity-communications`
+  `cargo test -p mde-shell-egui communications::tests:: -- --nocapture` passed
+  **7/7**; `.170` slot `ux010-activity-fmt-file` synced checkout
+  `rustfmt --edition 2021 --check
+  crates/desktop/mde-shell-egui/src/communications/mod.rs` passed. A
+  package-wide `cargo fmt -p mde-shell-egui -- --check` remains blocked by
+  unrelated pre-existing formatting drift in other shell files outside this
+  slice.
 - Progress (2026-07-26 pins/saved pending seam): Mesh Teams Posts now paint a
   per-message `Keep` row with visible `Pin` and `Save` controls. Because
   `MessageView` has no message-level pinned/saved fields and `CollabCommand`

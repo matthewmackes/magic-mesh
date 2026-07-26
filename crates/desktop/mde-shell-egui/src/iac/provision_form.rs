@@ -193,10 +193,6 @@ fn provision_workspace(
             ui.add_space(Style::SP_S);
             ui.vertical(|ui| {
                 ui.set_min_width((total - left_w - Style::SP_M).max(280.0));
-                hcl_override_section(ui, form, true);
-                ui.add_space(Style::SP_S);
-                validation_section(ui, form, live_apply_available, true);
-                ui.add_space(Style::SP_S);
                 sticky_action_tray(ui, view, valid, live_apply_available, true, |ui| {
                     provision_action_controls(
                         ui,
@@ -209,6 +205,10 @@ fn provision_workspace(
                         android_prepare,
                     );
                 });
+                ui.add_space(Style::SP_S);
+                hcl_override_section(ui, form, true);
+                ui.add_space(Style::SP_S);
+                validation_section(ui, form, live_apply_available, true);
             });
         });
     } else {
@@ -453,6 +453,9 @@ fn validation_section(ui: &mut egui::Ui, form: &State, live_apply_available: boo
                 .strong()
                 .color(Style::TEXT_DIM),
         );
+        if compact {
+            validation_live_apply_row(ui, live_apply_available);
+        }
         validation_row(
             ui,
             form.is_valid(),
@@ -473,17 +476,23 @@ fn validation_section(ui: &mut egui::Ui, form: &State, live_apply_available: boo
                 "bounded to the Workloads contract before request emission"
             },
         );
-        validation_row(
-            ui,
-            live_apply_available,
-            "Live apply",
-            if live_apply_available {
-                "selected node reports an armed apply capability"
-            } else {
-                "Plan remains available; live Provision stays disabled"
-            },
-        );
+        if !compact {
+            validation_live_apply_row(ui, live_apply_available);
+        }
     });
+}
+
+fn validation_live_apply_row(ui: &mut egui::Ui, live_apply_available: bool) {
+    validation_row(
+        ui,
+        live_apply_available,
+        "Live apply",
+        if live_apply_available {
+            "selected node reports an armed apply capability"
+        } else {
+            "Plan remains available; live Provision stays disabled"
+        },
+    );
 }
 
 fn validation_row(ui: &mut egui::Ui, ok: bool, label: &str, detail: &str) {

@@ -50,6 +50,12 @@ use crate::bus_reader::BusReader;
 /// conversations stay live without a cold-start wait (the `chat.rs` cadence).
 const REFRESH: Duration = Duration::from_secs(2);
 
+/// Defensive shell-side cap for retained Activity mirrors. The current collab
+/// worker publishes the same 1,024-row cap, but a live seat can carry an older or
+/// hand-authored Bus mirror; the UI boundary still must not paint or scan an
+/// unbounded feed on low-end hardware.
+const MAX_ACTIVITY_FEED_ENTRIES: usize = 1024;
+
 /// Seat-local read cursors. This topic deliberately lives outside the
 /// replicated `state/collab/*` namespace: read position is a UI preference for
 /// this seat, not a collaboration event or a remote read receipt.
@@ -71,6 +77,17 @@ fn now_unix_ms() -> i64 {
 fn read_state<T: DeserializeOwned>(persist: &Persist, topic: &str) -> Option<T> {
     let msg = persist.read_latest(topic).ok().flatten()?;
     serde_json::from_str(&msg.body?).ok()
+}
+
+/// Keep only the newest Activity rows from a retained Bus mirror. Activity feeds
+/// are newest-last by contract, so draining from the front preserves order and
+/// keeps the cursor/virtualized renderer on the recent window.
+fn bounded_activity_feed(mut feed: ActivityFeed) -> ActivityFeed {
+    let overflow = feed.entries.len().saturating_sub(MAX_ACTIVITY_FEED_ENTRIES);
+    if overflow > 0 {
+        feed.entries.drain(0..overflow);
+    }
+    feed
 }
 
 /// The Bus-backed [`CollabData`] the Communications surface reads.
@@ -225,7 +242,7 @@ impl LiveCollabData {
                     &persist,
                     &topics::space_state_topic(proj::ACTIVITY, space),
                 ) {
-                    activity.insert(Some(space), feed);
+                    activity.insert(Some(space), bounded_activity_feed(feed));
                 }
                 if let Some(convo) = read_state::<ConversationTimeline>(
                     &persist,
@@ -279,7 +296,8 @@ impl LiveCollabData {
                 .map(|feed| {
                     feed.entries
                         .iter()
-                        .filter(|entry| entry.clock > cursor)
+                        .rev()
+                        .take_while(|entry| entry.clock > cursor)
                         .count()
                         .min(u32::MAX as usize) as u32
                 })
@@ -308,7 +326,7 @@ impl LiveCollabData {
         let Some(latest) = self
             .activity
             .get(&Some(space))
-            .and_then(|feed| feed.entries.iter().map(|entry| entry.clock).max())
+            .and_then(|feed| feed.entries.last().map(|entry| entry.clock))
         else {
             return;
         };
@@ -819,6 +837,69 @@ mod tests {
             noisy_row.unread, 1,
             "unfocused rows keep a cheap attention badge from the directory clock"
         );
+    }
+
+    #[test]
+    fn focused_activity_feed_is_clamped_and_read_cursor_uses_newest_row() {
+        // Seat .15 regression guard: a stale or older worker-retained Activity
+        // mirror can be larger than the current core projection cap. The shell
+        // keeps the newest-last contract, clamps that mirror at its read boundary,
+        // and marks read from the newest retained row without a per-frame max scan.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let persist = persist_at(dir.path());
+        let space = SpaceId::new();
+        let peer = ActorId::new("falcon");
+
+        write_state(
+            &persist,
+            &topics::state_topic(proj::SPACE_DIRECTORY),
+            &SpaceDirectory {
+                spaces: vec![space_summary(space, "Operations")],
+            },
+        );
+        write_state(
+            &persist,
+            &topics::space_state_topic(proj::ACTIVITY, space),
+            &ActivityFeed {
+                space: Some(space),
+                entries: (0..2_000)
+                    .map(|index| activity_entry(space, &peer, index))
+                    .collect(),
+            },
+        );
+
+        let mut data = LiveCollabData::new(Some(dir.path().to_path_buf()));
+        data.refresh_for(Some(space));
+
+        let feed = data.activity(Some(space)).expect("focused activity folded");
+        assert_eq!(
+            feed.entries.len(),
+            MAX_ACTIVITY_FEED_ENTRIES,
+            "oversized retained mirrors must be clamped at the UI read boundary"
+        );
+        assert_eq!(
+            feed.entries.first().expect("first retained").clock,
+            ActorClock::at(976, 0)
+        );
+        assert_eq!(
+            feed.entries.last().expect("newest retained").clock,
+            ActorClock::at(1_999, 0),
+            "clamping keeps newest-last order"
+        );
+        assert_eq!(
+            data.space_directory().spaces[0].unread,
+            MAX_ACTIVITY_FEED_ENTRIES as u32,
+            "unread counting is bounded to the retained activity window"
+        );
+
+        data.mark_space_read(space);
+
+        assert_eq!(
+            data.read_cursors.get(&space).copied(),
+            Some(ActorClock::at(1_999, 0)),
+            "mark-read advances to the newest retained row"
+        );
+        assert_eq!(data.space_directory().spaces[0].unread, 0);
     }
 
     #[test]

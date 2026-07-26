@@ -63,6 +63,13 @@ const LIVE_REPAINT: Duration = Duration::from_millis(33);
 /// Cursor blink half-period in seconds (the classic ~500 ms phase).
 const BLINK_HALF_PERIOD: f64 = 0.5;
 
+/// How long an accepted local input write forces the focused cursor visible.
+///
+/// The backing PTY/output pump remains the source of terminal contents; this
+/// grace only resets the blink phase so a fast typist never lands on a
+/// blink-off frame that makes the cursor look one input behind.
+const INPUT_CURSOR_GRACE: Duration = Duration::from_millis(450);
+
 /// Height of the per-pane title strip (TERM-12) — a compact caption bar above
 /// the grid (`SMALL` type padded on the 4px half-step).
 const TITLE_STRIP_H: f32 = Style::SMALL + Style::SP_XS * 2.0;
@@ -347,6 +354,11 @@ pub struct TerminalWidget {
     /// which backing output drives an immediate repaint instead of trailing
     /// the fixed [`LIVE_REPAINT`] self-timer (the render-lag fix).
     waker_set: bool,
+    /// Egui frame time until which a focused live cursor is forced visible after
+    /// accepted input. This keeps the cursor visually attached to rapid typing
+    /// instead of occasionally repainting on the global blink-off phase while
+    /// the PTY echo/output path catches the next frame.
+    input_cursor_visible_until: f64,
 }
 
 /// The item a TERM-15 context-menu click selected, recorded inside the menu
@@ -435,6 +447,7 @@ impl TerminalWidget {
             hold_on_exit: false,
             exit_ack: false,
             waker_set: false,
+            input_cursor_visible_until: 0.0,
         }
     }
 
@@ -780,6 +793,7 @@ impl TerminalWidget {
             usize::from(rows),
             history,
             mouse_report,
+            now,
         );
 
         // Scrollback search (TERM-9): rescan on a query/mode change or new
@@ -881,11 +895,39 @@ impl TerminalWidget {
     /// the blink-on phase (or always, when blink is off). `time` is the egui
     /// frame clock (seconds).
     fn cursor_paint(&self, response: &Response, time: f64, live: bool) -> CursorPaint {
-        if !live || self.scroll_offset > 0 {
+        Self::cursor_paint_mode(
+            live,
+            self.scroll_offset,
+            response.has_focus(),
+            self.cursor_blink,
+            self.input_cursor_visible_until,
+            time,
+        )
+    }
+
+    /// Record accepted terminal input at egui frame time `now`. The terminal
+    /// contents still come only from the engine/PTY echo; this only resets the
+    /// cursor blink so the caret stays visible while typed bytes are catching
+    /// the next repaint.
+    fn mark_input_activity(&mut self, now: f64) {
+        self.input_cursor_visible_until = now + INPUT_CURSOR_GRACE.as_secs_f64();
+    }
+
+    /// Pure cursor-paint decision, split out so the typing-lag edge is
+    /// regression-tested without constructing an egui [`Response`].
+    fn cursor_paint_mode(
+        live: bool,
+        scroll_offset: usize,
+        focused: bool,
+        cursor_blink: bool,
+        input_cursor_visible_until: f64,
+        time: f64,
+    ) -> CursorPaint {
+        if !live || scroll_offset > 0 {
             CursorPaint::Hidden
-        } else if !response.has_focus() {
+        } else if !focused {
             CursorPaint::Hollow
-        } else if !self.cursor_blink || blink_on(time) {
+        } else if input_cursor_visible_until >= time || !cursor_blink || blink_on(time) {
             CursorPaint::Filled
         } else {
             CursorPaint::Hidden
@@ -1037,6 +1079,7 @@ impl TerminalWidget {
         rows: usize,
         history: usize,
         mouse_report: bool,
+        now: f64,
     ) {
         // CONSOLE-2: while the held pane's exit prompt is up, the input path
         // becomes the close acknowledgement — a click or any key press closes
@@ -1137,14 +1180,26 @@ impl TerminalWidget {
                 continue;
             }
             match event {
-                Event::Text(text) => self.send(text.as_bytes()),
+                Event::Text(text) => {
+                    if self.send(text.as_bytes()) {
+                        self.mark_input_activity(now);
+                    }
+                }
                 Event::Key {
                     key,
                     pressed: true,
                     modifiers,
                     ..
-                } => self.on_key(ui.ctx(), key, modifiers, rows, history),
-                Event::Paste(text) => self.send(&paste_bytes(&text)),
+                } => {
+                    if self.on_key(ui.ctx(), key, modifiers, rows, history) {
+                        self.mark_input_activity(now);
+                    }
+                }
+                Event::Paste(text) => {
+                    if self.send(&paste_bytes(&text)) {
+                        self.mark_input_activity(now);
+                    }
+                }
                 // winit folds BOTH Ctrl+C and Ctrl+Shift+C into `Copy` (the raw
                 // key never reaches us); shift disambiguates — the chord copies
                 // the selection, plain Ctrl+C stays the terminal's own ETX.
@@ -1152,11 +1207,17 @@ impl TerminalWidget {
                     if shift_held {
                         self.copy_selection(ui.ctx());
                     } else {
-                        self.send(&[0x03]);
+                        if self.send(&[0x03]) {
+                            self.mark_input_activity(now);
+                        }
                     }
                 }
                 // Ctrl+X likewise arrives as `Cut`; the shell gets its CAN byte.
-                Event::Cut => self.send(&[0x18]),
+                Event::Cut => {
+                    if self.send(&[0x18]) {
+                        self.mark_input_activity(now);
+                    }
+                }
                 _ => {}
             }
         }
@@ -1170,30 +1231,31 @@ impl TerminalWidget {
         modifiers: Modifiers,
         rows: usize,
         history: usize,
-    ) {
+    ) -> bool {
         // The explicit copy/paste chords (bare-DRM backends deliver these as
         // raw keys; under winit they arrive as Copy/Paste events instead).
         if modifiers.ctrl && modifiers.shift && key == Key::C {
             self.copy_selection(ctx);
-            return;
+            return false;
         }
         if modifiers.ctrl && modifiers.shift && key == Key::V {
             // Paste lands via `Event::Paste`; egui has no synchronous
             // clipboard read to fall back on here.
-            return;
+            return false;
         }
         // Shift+PgUp/PgDn page the scrollback (terminal convention).
         if modifiers.shift && key == Key::PageUp {
             self.scroll_by(page_delta(rows), history);
-            return;
+            return false;
         }
         if modifiers.shift && key == Key::PageDown {
             self.scroll_by(-page_delta(rows), history);
-            return;
+            return false;
         }
         if let Some(bytes) = encode_key(key, modifiers) {
-            self.send(&bytes);
+            return self.send(&bytes);
         }
+        false
     }
 
     /// Fold one wheel event into the scrollback offset.
@@ -1622,19 +1684,19 @@ impl TerminalWidget {
     /// broadcast fan-out, then snap the view back to live. Recording here (not
     /// in [`Self::write_input`]) is what makes the *typed* bytes — and only
     /// those — the source the multiplexer replays to grouped panes.
-    fn send(&mut self, bytes: &[u8]) {
+    fn send(&mut self, bytes: &[u8]) -> bool {
         self.input_echo.extend_from_slice(bytes);
-        self.write_input(bytes);
+        self.write_input(bytes)
     }
 
     /// Write `bytes` to the PTY and snap to live — the shared tail of local
     /// typing ([`Self::send`]) and broadcast fan-out ([`Self::feed_broadcast`]).
     /// A dead session refuses input; the ended chip already tells that story,
     /// so the error is deliberately dropped here.
-    fn write_input(&mut self, bytes: &[u8]) {
+    fn write_input(&mut self, bytes: &[u8]) -> bool {
         self.scroll_offset = 0;
         self.scroll_accum = 0.0;
-        let _ = self.session.send_input(bytes);
+        !bytes.is_empty() && self.session.send_input(bytes).is_ok()
     }
 
     /// Write synthesized bytes straight to the backing, bypassing the
@@ -1658,7 +1720,7 @@ impl TerminalWidget {
     /// this widget still owns every PTY write). Not re-recorded into the echo,
     /// so a fan-out can never re-fan.
     pub fn feed_broadcast(&mut self, bytes: &[u8]) {
-        self.write_input(bytes);
+        let _ = self.write_input(bytes);
     }
 }
 
@@ -3007,6 +3069,45 @@ mod tests {
         assert!(blink_on(0.0));
         assert!(!blink_on(0.6));
         assert!(blink_on(1.1));
+    }
+
+    #[test]
+    fn accepted_input_forces_the_focused_cursor_visible_during_blink_off() {
+        assert_eq!(
+            TerminalWidget::cursor_paint_mode(true, 0, true, true, 0.0, 0.6),
+            CursorPaint::Hidden,
+            "baseline: focused cursor is hidden during the blink-off phase"
+        );
+        assert_eq!(
+            TerminalWidget::cursor_paint_mode(true, 0, true, true, 1.0, 0.6),
+            CursorPaint::Filled,
+            "accepted input keeps the cursor visibly attached to typing"
+        );
+        assert_eq!(
+            TerminalWidget::cursor_paint_mode(true, 0, true, true, 1.0, 1.6),
+            CursorPaint::Hidden,
+            "after the input grace expires, normal blink timing resumes"
+        );
+        assert_eq!(
+            TerminalWidget::cursor_paint_mode(true, 0, false, true, 1.0, 0.6),
+            CursorPaint::Hollow,
+            "unfocused panes still paint the hollow cursor"
+        );
+        assert_eq!(
+            TerminalWidget::cursor_paint_mode(true, 1, true, true, 1.0, 0.6),
+            CursorPaint::Hidden,
+            "scrollback view still hides the live cursor"
+        );
+    }
+
+    #[test]
+    fn input_activity_sets_a_bounded_cursor_visibility_deadline() {
+        let mut w = headless_widget();
+        w.mark_input_activity(42.0);
+        assert_eq!(
+            w.input_cursor_visible_until,
+            42.0 + INPUT_CURSOR_GRACE.as_secs_f64()
+        );
     }
 
     // ── TERM-15: selection context-menu action dispatch ─────────────────────
