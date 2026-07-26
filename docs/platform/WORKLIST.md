@@ -1950,6 +1950,31 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-012 - Maps live-data overlays (zero-cost external feeds)
 
 - Status: Remaining
+- Progress (2026-07-26 Airspace publication/consumption audit): traced the
+  reported Airspace path end-to-end with no code change. `airspace` is a
+  Workstation-tier worker in the census (`crates/mesh/mackesd/src/worker_role.rs`
+  lines 240-243) and is spawned through `spawn_tiered` from
+  `crates/mesh/mackesd/src/bin/mackesd/spawn.rs` lines 1309-1320. Its production
+  constructor deliberately has no probe (`crates/mesh/mackesd/src/workers/airspace.rs`
+  lines 60-72), and `run` therefore publishes exactly one explicit
+  `AirspaceSnapshot::no_source` to `state/airspace/<node>` through the shared
+  Bus root (`airspace.rs` lines 307-312 and 144-155). Maps resolves the same
+  retained Bus spool via `mde_bus::client_data_dir`, folds the same-node
+  `state/airspace/<node>` body through `read_airspace_mirror`, and replaces the
+  live-only Airspace state (`crates/desktop/mde-maps-location-egui/src/model.rs`
+  lines 731-756, 879-906, 1101-1109, and 1271-1280). The pointer-free render
+  path is already present: the mounted Airspace panel binds an egui context and
+  schedules a 33 ms repaint heartbeat while visible, and the view clears that
+  waker only when Airspace is hidden (`airspace.rs` lines 721-753;
+  `view.rs` lines 129-136). A bounded code fix is not clear because the repo
+  still has no proven MG90 Wi-Fi/cellular/Bluetooth scanner-contact protocol:
+  `docs/ops/mg90-access.md` lines 90-93 explicitly forbids using the documented
+  Status Broadcast path to manufacture Airspace contacts. Next implementation
+  step is narrow and blocker-free once a real source is identified: add an
+  injected `Mg90SurveyProbe` adapter in the Airspace worker for the proven
+  endpoint/command, parse it into `AirspaceSurvey`, wire the constructor from
+  explicit configuration, and keep the existing `NoSource` fallback for nodes
+  without that configured source.
 - Progress (2026-07-25 persistent offline map-data root): Maps offline raster
   bundles now default to the persistent RPM/tmpfiles-managed
   `/var/lib/mde/maps` root instead of the installed-seat Bus spool
@@ -2436,6 +2461,20 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-006 - Construct interface (Apple-HIG-principled workstation shell)
 
 - Status: Remaining
+- Progress (2026-07-26 capture-font panic hardening): the shared offscreen
+  `mde-egui::capture` renderer now installs the platform `Style`/font set on
+  its fresh egui context before running caller UI, so shared title/headline
+  typography can no longer reach egui layout with
+  `FontFamily::Name("heading")` unbound. This directly hardens the live `.15`
+  panic signature observed before the latest seat restart
+  (`FontFamily::Name("heading") is not bound to any fonts`) for capture/snapshot
+  paths that use shared typography. Focused farm verification is green: `.50`
+  touched-file rustfmt for `crates/shared/mde-egui/src/capture.rs`, and `.90`
+  `cargo test -p mde-egui
+  capture_context_binds_shared_heading_family_by_default -- --nocapture` at
+  **1/1**. This commit is not yet claimed installed on `.15`; the current live
+  `.15` shell remains active with `NRestarts=0` from the prior Fedora 44 RPM
+  correction.
 - Progress (2026-07-25 Springboard Dock/browser live-layout regression fixes):
   the Springboard Dock control IDs now include their placement
   (`floating`/`docked`), so egui cannot complete a stale click from the old

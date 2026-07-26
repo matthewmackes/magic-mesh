@@ -52,6 +52,24 @@ fn align_up(value: u32, align: u32) -> u32 {
     value.div_ceil(align) * align
 }
 
+fn capture_context(pixels_per_point: f32) -> egui::Context {
+    let ctx = egui::Context::default();
+    ctx.set_pixels_per_point(pixels_per_point);
+    // A capture target is a fresh egui context, not the live shell context.
+    // Install the shared Style here so callers can render shared typography
+    // (`FontFamily::Name("heading")`, `nav`, Browser chrome, etc.) without
+    // needing a second, easy-to-forget Style install inside their closure.
+    Style::install(&ctx);
+    ctx
+}
+
+fn capture_raw_input(size: egui::Vec2) -> egui::RawInput {
+    egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+        ..Default::default()
+    }
+}
+
 /// Render `run_ui` to a PNG of `size` logical points at `pixels_per_point`.
 ///
 /// Two egui frames are run: the first lets layout settle (sizes that depend on
@@ -119,17 +137,12 @@ pub fn capture_ui_png(
     });
 
     // ---- egui: settle frame, then the captured frame ----
-    let ctx = egui::Context::default();
-    let raw_input = || egui::RawInput {
-        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
-        ..Default::default()
-    };
-    ctx.set_pixels_per_point(pixels_per_point);
+    let ctx = capture_context(pixels_per_point);
     // The font/texture atlas is generated as a `textures_delta` on the FIRST frame
     // it is needed — so both frames' deltas must be applied, not just the last's
     // (egui paints even solid fills through the atlas's white texel).
-    let settle = ctx.run(raw_input(), &mut run_ui);
-    let full_output = ctx.run(raw_input(), &mut run_ui);
+    let settle = ctx.run(capture_raw_input(size), &mut run_ui);
+    let full_output = ctx.run(capture_raw_input(size), &mut run_ui);
     let paint_jobs = ctx.tessellate(full_output.shapes, pixels_per_point);
 
     // ---- egui_wgpu renderer: upload textures + buffers, paint ----
@@ -257,6 +270,25 @@ pub fn capture_ui_png(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TypographyRole;
+
+    #[test]
+    fn capture_context_binds_shared_heading_family_by_default() {
+        let size = egui::vec2(320.0, 180.0);
+        let ctx = capture_context(1.0);
+
+        // This used to be caller-dependent: a capture closure that used shared
+        // title/headline typography before installing Style could reach egui
+        // text layout with FontFamily::Name("heading") unbound and panic.
+        let _ = ctx.run(capture_raw_input(size), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.label(Style::typography_text(
+                    "Capture heading",
+                    TypographyRole::Title,
+                ));
+            });
+        });
+    }
 
     /// The rasterizer produces a real PNG of the right size whose content is not
     /// the blank `CAPTURE_CLEAR` sentinel — i.e. the themed panel actually drew.
