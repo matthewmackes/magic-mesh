@@ -253,6 +253,7 @@ collect_mode() {
   fi
 
   write_kv format 1
+  write_kv proof_scope steady-state
   write_kv collected_at_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   write_kv hostname "$(hostname -f 2>/dev/null || hostname 2>/dev/null || printf unknown)"
   write_kv machine_id_sha256 "$(sha_or_unreadable /etc/machine-id)"
@@ -420,8 +421,9 @@ collect_mode() {
   fi
 
   if [ "$fail" -eq 0 ]; then
+    printf 'INFO steady-state snapshot is clean; use compare with changed before/after snapshots to prove rotation/reconnect\n' >>"$summary"
     printf 'PASS snapshot is clean: %s\n' "$out_dir" >>"$summary"
-    printf 'WL-SEC-006 Nebula rotation evidence snapshot clean: %s\n' "$out_dir"
+    printf 'WL-SEC-006 Nebula steady-state evidence snapshot clean: %s\n' "$out_dir"
   else
     printf 'FAIL snapshot has evidence gaps: %s\n' "$out_dir" >>"$summary"
     sed -n '1,120p' "$summary" >&2
@@ -611,6 +613,14 @@ self_test() {
   make_fake_identity "$config_dir" generation-1-1111111111111111 cert-a key-a
   if collect_mode --config-dir "$config_dir" --workgroup-root "$workgroup_root" --out "$before" --no-live >/dev/null; then
     echo "  ok: clean before snapshot collects"
+    if [ "$(kv_get "$before" proof_scope)" != "steady-state" ]; then
+      echo "  FAIL: clean collection must label its proof scope as steady-state" >&2
+      fails=$((fails + 1))
+    fi
+    if ! grep -q '^INFO steady-state snapshot is clean; use compare ' "$before/summary.txt"; then
+      echo "  FAIL: clean collection must warn that compare proves rotation" >&2
+      fails=$((fails + 1))
+    fi
   else
     echo "  FAIL: clean before snapshot should collect" >&2
     fails=$((fails + 1))

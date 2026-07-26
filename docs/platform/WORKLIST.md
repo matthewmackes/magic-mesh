@@ -259,6 +259,29 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-SEC-006 - Keep Nebula private keys local to their owning node
 
 - Status: Remaining
+- Progress (2026-07-26 live `.15` clean steady-state Nebula evidence):
+  streamed the read-only `verify-nebula-rotation-evidence.sh collect` helper
+  to `Basement-Test-Workstation` after the latest Fedora 44 RPM promotion and
+  collected
+  `/var/tmp/wl-sec-006-nebula-live-clean-20260726T013433Z` with
+  `--probe 10.42.0.1 --max-scan-files 7000`. The snapshot exits clean and
+  proves the primary seat now has the generation-based identity layout
+  (`/etc/nebula/identity/current ->
+  generation-2547284-f00611649f26396d`), root-owned `0700` identity root,
+  active key mode `0600`, one active generation, zero stale or unsafe
+  generations, compatibility `host.{crt,key}` symlinks into
+  `identity/current`, active `nebula` and `mackesd`, `nebula1=10.42.0.5/17`,
+  and successful overlay reachability to LH1 `10.42.0.1`. The bounded
+  replicated scan inspected **5,331** files under `/mnt/mesh-storage`, stayed
+  below the 7,000-file cap, was not truncated, and found **0** private-key
+  marker paths. The verifier now records `proof_scope=steady-state` for clean
+  collection snapshots and prints an explicit compare-required note, preserving
+  `compare` as the only path that can claim a before/after rotation proof.
+  Local `bash -n`, helper `--self-test`, `git diff --check`, and worklist lint
+  are clean; farm `.90` reran `bash -n` plus helper `--self-test` clean after
+  sync. This is clean steady-state and migration evidence; it is not a
+  before/after key-rotation proof, so the controlled rotation/reconnect drill
+  remains the final external SEC-006 acceptance gap.
 - Progress (2026-07-25 public thin-lighthouse rollout and seat mesh proof):
   DigitalOcean access was restored with the operator-provided token and three
   new thin public lighthouses were created for mesh `ephemeral-public-20260725`:
