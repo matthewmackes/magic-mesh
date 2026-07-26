@@ -296,9 +296,8 @@ fn read_requester_public_key(path: &Path) -> Result<String, NetEnrollError> {
             "requester public key exceeds {MAX_REQUESTER_PUBLIC_KEY_BYTES} bytes"
         )));
     }
-    String::from_utf8(bytes).map_err(|e| {
-        NetEnrollError::Materialize(format!("requester public key is not UTF-8: {e}"))
-    })
+    String::from_utf8(bytes)
+        .map_err(|e| NetEnrollError::Materialize(format!("requester public key is not UTF-8: {e}")))
 }
 
 /// Errors the peer-side network enroll can hit.
@@ -585,9 +584,7 @@ fn parse_http_response(raw: &[u8]) -> Result<(u16, Vec<u8>), String> {
             if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
                 return Err("bad content-length".into());
             }
-            let length = value
-                .parse::<usize>()
-                .map_err(|_| "bad content-length")?;
+            let length = value.parse::<usize>().map_err(|_| "bad content-length")?;
             content_length = Some(length);
         }
     }
@@ -852,12 +849,13 @@ pub fn persist_authenticated_bundle(
     let private_key = crate::ca::seal::read_sealed(requester_private_key)
         .map_err(|e| NetEnrollError::Materialize(format!("read requester private key: {e}")))?;
     // /etc/nebula — the live config nebula reads on serve.
-    crate::workers::nebula_supervisor::materialize_config(
+    crate::workers::nebula_supervisor::materialize_config_for_node(
         config_dir,
         bundle,
         role,
         &[],
         workgroup_root,
+        node_id,
         Some(&private_key),
     )
     .map_err(NetEnrollError::Materialize)?;
@@ -889,8 +887,7 @@ fn validate_lighthouse_authority_binding(
             let derived = crate::ca::bundle::relay_trust_authority_public_key(&private);
             if derived != public {
                 return Err(NetEnrollError::BadBundle(
-                    "lighthouse relay authority private key does not match bundle authority"
-                        .into(),
+                    "lighthouse relay authority private key does not match bundle authority".into(),
                 ));
             }
             Ok(())
@@ -1051,13 +1048,15 @@ printf '%s\\n' '-----BEGIN NEBULA X25519 PUBLIC KEY-----' 'AAAAAAAAAAAAAAAAAAAAA
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
         generate_requester_nebula_key_with_binary(temp.path(), fake.as_os_str())
             .expect_err("failure must propagate");
-        assert!(!std::fs::read_dir(temp.path())
-            .unwrap()
-            .flatten()
-            .any(|entry| entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".enroll-key-")));
+        assert!(
+            !std::fs::read_dir(temp.path())
+                .unwrap()
+                .flatten()
+                .any(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".enroll-key-"))
+        );
     }
 
     #[test]
@@ -1076,11 +1075,13 @@ printf '%s\\n' '-----BEGIN NEBULA X25519 PUBLIC KEY-----' 'AAAAAAAAAAAAAAAAAAAAA
         )
         .expect_err("symlinked config roots must fail before keygen");
         assert!(error.to_string().contains("symlinked directory component"));
-        assert!(victim
-            .read_dir()
-            .expect("victim remains readable")
-            .next()
-            .is_none());
+        assert!(
+            victim
+                .read_dir()
+                .expect("victim remains readable")
+                .next()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1184,9 +1185,11 @@ printf '%s\\n' '-----BEGIN NEBULA X25519 PUBLIC KEY-----' 'AAAAAAAAAAAAAAAAAAAAA
                 .expect("lighthouse secrets"),
         )
         .expect_err("mismatched authority seed must fail closed");
-        assert!(error
-            .to_string()
-            .contains("private key does not match bundle authority"));
+        assert!(
+            error
+                .to_string()
+                .contains("private key does not match bundle authority")
+        );
     }
 
     #[test]
@@ -1200,9 +1203,11 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n\
         );
         let error = validate_nebula_cert_print(&hostile, "peer:anvil", "10.42.0.2", requester)
             .expect_err("mismatched certificate key must fail closed");
-        assert!(error
-            .to_string()
-            .contains("does not match requester-owned key"));
+        assert!(
+            error
+                .to_string()
+                .contains("does not match requester-owned key")
+        );
     }
 
     #[test]
@@ -1243,9 +1248,11 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n\
         let node_error =
             validate_nebula_cert_print(&wrong_node, "peer:anvil", "10.42.0.2", requester)
                 .expect_err("wrong node must fail closed");
-        assert!(node_error
-            .to_string()
-            .contains("name does not match enrollment node"));
+        assert!(
+            node_error
+                .to_string()
+                .contains("name does not match enrollment node")
+        );
 
         let wrong_ip = format!(
             "{{\"details\":{{\"name\":\"peer:anvil\",\"ips\":[\"10.42.0.99/17\"],\"publicKey\":\"{}\"}}}}",
@@ -1253,9 +1260,11 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n\
         );
         let ip_error = validate_nebula_cert_print(&wrong_ip, "peer:anvil", "10.42.0.2", requester)
             .expect_err("wrong overlay must fail closed");
-        assert!(ip_error
-            .to_string()
-            .contains("overlay IP does not match bundle"));
+        assert!(
+            ip_error
+                .to_string()
+                .contains("overlay IP does not match bundle")
+        );
     }
 
     // ---- HTTP response parsing ------------------------------

@@ -259,6 +259,56 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-SEC-006 - Keep Nebula private keys local to their owning node
 
 - Status: Remaining
+- Progress (2026-07-26 superseded-cert blocklist hardening): authenticated
+  Nebula identity rotation now captures the previously active certificate,
+  refuses to replace it without a local node id and a fingerprintable old cert,
+  records the superseded cert fingerprint in the replicated Nebula blocklist
+  before stale key generations are pruned, and rolls back the identity switch if
+  the blocklist record cannot be written. Per-node blocklist writes now
+  append/deduplicate existing acceptable fingerprints instead of overwriting
+  older revocations. Focused farm gates are green: `.50` slot
+  `sec006-blocklist` `cargo test -p mackesd ca::blocklist -- --nocapture` at
+  **11/11**, `.90` slot `sec006-supervisor`
+  `cargo test -p mackesd workers::nebula_supervisor --features async-services
+  -- --nocapture` at **53/53**, and changed-file rustfmt passed for the three
+  touched `mackesd` Rust files. Closure still needs a live patched-build proof
+  that `.15` renders/reloads the blocklist containing the superseded cert
+  fingerprint
+  `51c8f646ec57ecf946194c8aafa9a95e051c4bceebf09919b227e0b4f33f6901`.
+- Progress (2026-07-26 live `.15` rotation/reconnect/prune and cleanup proof):
+  `Basement-Test-Workstation` was rotated from identity generation
+  `generation-2547284-f00611649f26396d` to
+  `generation-1785031563709-d00f665695a80897` using a requester-owned Nebula
+  public key signed by LH1 for the existing overlay `10.42.0.5/17`. The active
+  certificate changed from PEM sha256
+  `d4df128967487247b9828b153e56af19c99c501952d4823ed709edc1df2546e9` to
+  `04325d7e1b78bdcf182388cf6cd3a3ef9098b7af06a83e6961eaef3a9ca89af1`, and
+  the active private-key hash changed from
+  `e66cd528ab218f29333b763ae87dd6a65b06d28cd7d199269e0556acd15b422a` to
+  `43935e2a7c8607a9910cab7016a4ee1b7c0d0fcc7c3a8a6bb063d1af13c23108`
+  without copying key material into the proof log. `nebula` was restarted,
+  overlay reachability to LH1 `10.42.0.1` recovered, and the old generation was
+  pruned. The helper `compare` between
+  `/var/tmp/wl-sec-006-rotation-before-20260726T020302Z` and
+  `/var/tmp/wl-sec-006-rotation-after-20260726T020621Z` passed every live
+  before/after assertion: clean snapshots, changed generation/cert/key hashes,
+  zero stale or unsafe after-generations, clean bounded replicated scan, active
+  Nebula overlay, and reachable probe. Follow-up cleanup removed the explicit
+  root-only rotation scratch path
+  `/root/wl-sec-006-rotation-20260726T020424Z` on `.15` because it still
+  contained old rollback identity material plus duplicate staged key material,
+  and removed the consumed LH1
+  `/mnt/mesh-storage/peer:Basement-Test-Workstation/mackesd/pending-enroll.json`
+  bearer request after verifying the signed bundle remained present with cert
+  sha256
+  `04325d7e1b78bdcf182388cf6cd3a3ef9098b7af06a83e6961eaef3a9ca89af1`.
+  A fresh post-cleanup snapshot
+  `/var/tmp/wl-sec-006-post-cleanup-20260726T021300Z` exits clean with
+  one generation, zero stale/unsafe generations, `identity_root_mode=700`,
+  `active_key_mode=600`, replicated scan **5,335** files / **0** hits / not
+  truncated, `nebula_active=true`, `mackesd_active=true`,
+  `overlay_ipv4=10.42.0.5`, and `probe_reachable=true`. The live
+  rotation/reconnect/prune evidence itself is no longer the gap.
 - Progress (2026-07-26 live `.15` clean steady-state Nebula evidence):
   streamed the read-only `verify-nebula-rotation-evidence.sh collect` helper
   to `Basement-Test-Workstation` after the latest Fedora 44 RPM promotion and
@@ -279,9 +329,9 @@ These decisions refine acceptance and sequencing for the active items below.
   `compare` as the only path that can claim a before/after rotation proof.
   Local `bash -n`, helper `--self-test`, `git diff --check`, and worklist lint
   are clean; farm `.90` reran `bash -n` plus helper `--self-test` clean after
-  sync. This is clean steady-state and migration evidence; it is not a
-  before/after key-rotation proof, so the controlled rotation/reconnect drill
-  remains the final external SEC-006 acceptance gap.
+  sync. This earlier snapshot was clean steady-state and migration evidence,
+  not a before/after key-rotation proof; the live before/after drill is now
+  recorded in the newer 2026-07-26 rotation progress entry above.
 - Progress (2026-07-25 public thin-lighthouse rollout and seat mesh proof):
   DigitalOcean access was restored with the operator-provided token and three
   new thin public lighthouses were created for mesh `ephemeral-public-20260725`:

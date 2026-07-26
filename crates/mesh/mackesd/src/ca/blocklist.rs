@@ -46,7 +46,8 @@ pub fn record_revoked(
     node_id: &str,
     fingerprints: &[String],
 ) -> io::Result<PathBuf> {
-    write_record(workgroup_root, node_id, fingerprints, None)
+    let fingerprints = merged_fingerprints(&record_path(workgroup_root, node_id), fingerprints);
+    write_record(workgroup_root, node_id, &fingerprints, None)
 }
 
 /// SEC-6 (Q28/29) — the signed retract record: gossiped peer-to-peer
@@ -62,7 +63,8 @@ pub fn record_revoked_signed(
     signer_node: &str,
     key: &SigningKey,
 ) -> io::Result<PathBuf> {
-    let sig = key.sign(&canonical_payload(node_id, fingerprints));
+    let fingerprints = merged_fingerprints(&record_path(workgroup_root, node_id), fingerprints);
+    let sig = key.sign(&canonical_payload(node_id, &fingerprints));
     let meta = serde_json::json!({
         "signed_by": signer_node,
         "pubkey": key
@@ -77,7 +79,11 @@ pub fn record_revoked_signed(
             .map(|b| format!("{b:02x}"))
             .collect::<String>(),
     });
-    write_record(workgroup_root, node_id, fingerprints, Some(meta))
+    write_record(workgroup_root, node_id, &fingerprints, Some(meta))
+}
+
+fn record_path(workgroup_root: &Path, node_id: &str) -> PathBuf {
+    blocklist_dir(workgroup_root).join(format!("{}.json", node_id.replace(':', "_")))
 }
 
 fn write_record(
@@ -89,8 +95,8 @@ fn write_record(
     let dir = blocklist_dir(workgroup_root);
     std::fs::create_dir_all(&dir)?;
     // Node ids carry a `peer:` prefix — keep filenames flat.
+    let path = record_path(workgroup_root, node_id);
     let stem = node_id.replace(':', "_");
-    let path = dir.join(format!("{stem}.json"));
     let mut body = serde_json::json!({ "node_id": node_id, "fingerprints": fingerprints });
     if let Some(sig) = signature {
         body["signature"] = sig;
@@ -99,6 +105,28 @@ fn write_record(
     std::fs::write(&tmp, body.to_string())?;
     std::fs::rename(&tmp, &path)?;
     Ok(path)
+}
+
+fn merged_fingerprints(path: &Path, fingerprints: &[String]) -> Vec<String> {
+    let mut merged = fingerprints.to_vec();
+    if let Some(raw) = read_blocklist_record(path) {
+        if let Ok(existing) = serde_json::from_str::<serde_json::Value>(&raw) {
+            if signature_acceptable(&existing) {
+                merged.extend(
+                    existing
+                        .get("fingerprints")
+                        .and_then(|value| value.as_array())
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|value| value.as_str().map(str::to_string)),
+                );
+            }
+        }
+    }
+    merged.retain(|fp| fp.len() == 64 && fp.bytes().all(|b| b.is_ascii_hexdigit()));
+    merged.sort();
+    merged.dedup();
+    merged
 }
 
 fn hex_to_bytes<const N: usize>(s: &str) -> Option<[u8; N]> {
@@ -330,6 +358,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         record_revoked(tmp.path(), "peer:elm", &[FP_A.into()]).unwrap();
         assert_eq!(all_fingerprints(tmp.path()), vec![FP_A]);
+    }
+
+    #[test]
+    fn repeated_records_for_one_node_append_instead_of_unblocking_old_fingerprints() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[9_u8; 32]);
+        record_revoked_signed(tmp.path(), "peer:oak", &[FP_A.into()], "peer:lh", &key).unwrap();
+        record_revoked_signed(tmp.path(), "peer:oak", &[FP_B.into()], "peer:lh", &key).unwrap();
+
+        assert_eq!(all_fingerprints(tmp.path()), vec![FP_A, FP_B]);
     }
 
     #[test]

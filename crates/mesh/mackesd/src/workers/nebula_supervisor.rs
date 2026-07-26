@@ -638,9 +638,13 @@ fn ensure_directory_tree(path: &Path, mode: u32, label: &str) -> Result<(), Stri
 fn install_identity_generation(
     config_dir: &Path,
     bundle: &crate::ca::bundle::NebulaBundle,
+    workgroup_root: &Path,
+    local_node_id: Option<&str>,
+    node_key_path: &Path,
     requester_private_key: Option<&[u8]>,
+    fingerprint_cert: fn(&str) -> Option<String>,
 ) -> Result<(), String> {
-    use std::os::unix::fs::{DirBuilderExt, symlink};
+    use std::os::unix::fs::DirBuilderExt;
 
     let identity_dir = config_dir.join("identity");
     ensure_directory_tree(&identity_dir, 0o700, "Nebula identity")?;
@@ -671,6 +675,29 @@ fn install_identity_generation(
             prune_stale_identity_generations(&identity_dir, &active_generation);
         }
         return Ok(());
+    }
+
+    let previous_generation = if requester_private_key.is_some() {
+        active_identity_generation_leaf(&identity_dir)?
+    } else {
+        None
+    };
+    let superseded_cert = if requester_private_key.is_some() && current_cert.exists() {
+        let active_cert = crate::ca::seal::read_no_follow(&current_cert)
+            .map_err(|e| format!("read active identity cert {}: {e}", current_cert.display()))?;
+        if active_cert == bundle.peer_cert_pem.as_bytes() {
+            None
+        } else {
+            Some(active_cert)
+        }
+    } else {
+        None
+    };
+    if superseded_cert.is_some() && local_node_id.is_none() {
+        return Err(
+            "authenticated Nebula identity rotation needs the local node-id to blocklist the superseded cert"
+                .into(),
+        );
     }
 
     let owned_key;
@@ -749,22 +776,12 @@ fn install_identity_generation(
 
     let generation_leaf = generation_dir
         .file_name()
-        .ok_or_else(|| "identity generation has no filename".to_string())?;
-    let temp_link = identity_dir.join(format!(
-        ".current.tmp.{}.{:016x}",
-        std::process::id(),
-        rand::random::<u64>()
-    ));
-    symlink(generation_leaf, &temp_link)
-        .map_err(|e| format!("create identity switch {}: {e}", temp_link.display()))?;
-    if let Err(error) = std::fs::rename(&temp_link, identity_dir.join("current")) {
-        let _ = std::fs::remove_file(&temp_link);
+        .ok_or_else(|| "identity generation has no filename".to_string())?
+        .to_os_string();
+    if let Err(error) = activate_identity_generation(&identity_dir, &generation_leaf) {
         let _ = std::fs::remove_dir_all(&generation_dir);
-        return Err(format!("activate identity generation: {error}"));
+        return Err(error);
     }
-    std::fs::File::open(&identity_dir)
-        .and_then(|dir| dir.sync_all())
-        .map_err(|e| format!("fsync identity dir {}: {e}", identity_dir.display()))?;
 
     // Compatibility paths point through the single atomic `current` switch;
     // replacing either link cannot expose a mismatched pair to Nebula because
@@ -777,12 +794,107 @@ fn install_identity_generation(
         &config_dir.join("host.key"),
         Path::new("identity/current/host.key"),
     )?;
+    if let (Some(node_id), Some(old_cert)) = (local_node_id, superseded_cert.as_deref()) {
+        if let Err(error) = record_superseded_identity_blocklist(
+            workgroup_root,
+            node_id,
+            old_cert,
+            node_key_path,
+            fingerprint_cert,
+        ) {
+            let rollback_error = previous_generation.as_deref().and_then(|generation| {
+                activate_identity_generation(&identity_dir, generation).err()
+            });
+            let _ = std::fs::remove_dir_all(&generation_dir);
+            return Err(match rollback_error {
+                Some(rollback) => {
+                    format!("{error}; rollback to prior identity generation failed: {rollback}")
+                }
+                None => error,
+            });
+        }
+    }
     // A rotation leaves the previous generation holding the old private key.
     // Once the atomic switch and compatibility links are installed, only the
     // active generation is useful; retaining every historical key would make
     // local identity storage grow without bound.
-    prune_stale_identity_generations(&identity_dir, generation_leaf);
+    prune_stale_identity_generations(&identity_dir, &generation_leaf);
     Ok(())
+}
+
+fn activate_identity_generation(
+    identity_dir: &Path,
+    generation_leaf: &std::ffi::OsStr,
+) -> Result<(), String> {
+    use std::os::unix::fs::symlink;
+
+    let temp_link = identity_dir.join(format!(
+        ".current.tmp.{}.{:016x}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    symlink(generation_leaf, &temp_link)
+        .map_err(|e| format!("create identity switch {}: {e}", temp_link.display()))?;
+    if let Err(error) = std::fs::rename(&temp_link, identity_dir.join("current")) {
+        let _ = std::fs::remove_file(&temp_link);
+        return Err(format!("activate identity generation: {error}"));
+    }
+    std::fs::File::open(identity_dir)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|e| format!("fsync identity dir {}: {e}", identity_dir.display()))
+}
+
+fn record_superseded_identity_blocklist(
+    workgroup_root: &Path,
+    node_id: &str,
+    cert_bytes: &[u8],
+    node_key_path: &Path,
+    fingerprint_cert: fn(&str) -> Option<String>,
+) -> Result<(), String> {
+    validate_blocklist_node_id(node_id)?;
+    let cert_pem = std::str::from_utf8(cert_bytes)
+        .map_err(|e| format!("superseded Nebula identity cert is not UTF-8: {e}"))?;
+    let fingerprint = fingerprint_cert(cert_pem).ok_or_else(|| {
+        "could not fingerprint superseded Nebula identity cert; refusing to rotate without a blocklist retract"
+            .to_string()
+    })?;
+    if fingerprint.len() != 64 || !fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!(
+            "superseded Nebula identity fingerprint has invalid shape: {fingerprint:?}"
+        ));
+    }
+    let fingerprints = vec![fingerprint];
+    let written = crate::node_key::load_or_create(node_key_path).map_or_else(
+        |_| crate::ca::blocklist::record_revoked(workgroup_root, node_id, &fingerprints),
+        |key| {
+            crate::ca::blocklist::record_revoked_signed(
+                workgroup_root,
+                node_id,
+                &fingerprints,
+                node_id,
+                &key,
+            )
+        },
+    );
+    written
+        .map(|_| ())
+        .map_err(|e| format!("record superseded Nebula identity blocklist: {e}"))
+}
+
+fn validate_blocklist_node_id(node_id: &str) -> Result<(), String> {
+    if !node_id.is_empty()
+        && node_id.len() <= 255
+        && node_id.trim() == node_id
+        && node_id != "."
+        && node_id != ".."
+        && !node_id
+            .chars()
+            .any(|character| character == '/' || character == '\\' || character.is_control())
+    {
+        Ok(())
+    } else {
+        Err("invalid local node-id for superseded Nebula identity blocklist".into())
+    }
 }
 
 fn tighten_legacy_private_key_permissions(path: &Path) -> Result<(), String> {
@@ -982,6 +1094,60 @@ pub fn materialize_config(
     workgroup_root: &Path,
     requester_private_key: Option<&[u8]>,
 ) -> Result<(), String> {
+    materialize_config_inner(
+        config_dir,
+        bundle,
+        role,
+        blocklist,
+        workgroup_root,
+        None,
+        requester_private_key,
+        Path::new(crate::node_key::DEFAULT_KEY_PATH),
+        crate::ca::blocklist::fingerprint_cert_pem,
+    )
+}
+
+/// Node-aware variant of [`materialize_config`] for authenticated enrollment.
+///
+/// When the fingerprint-pinned enrollment path supplies a requester private key
+/// and replaces an already-active local cert, this function records the
+/// superseded cert fingerprint in the replicated Nebula blocklist before stale
+/// key generations are pruned. Replicated steady-state refreshes should keep
+/// using [`materialize_config`]: they are not authorized to rotate identity.
+pub fn materialize_config_for_node(
+    config_dir: &Path,
+    bundle: &crate::ca::bundle::NebulaBundle,
+    role: ConfigRole,
+    blocklist: &[String],
+    workgroup_root: &Path,
+    local_node_id: &str,
+    requester_private_key: Option<&[u8]>,
+) -> Result<(), String> {
+    materialize_config_inner(
+        config_dir,
+        bundle,
+        role,
+        blocklist,
+        workgroup_root,
+        Some(local_node_id),
+        requester_private_key,
+        Path::new(crate::node_key::DEFAULT_KEY_PATH),
+        crate::ca::blocklist::fingerprint_cert_pem,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn materialize_config_inner(
+    config_dir: &Path,
+    bundle: &crate::ca::bundle::NebulaBundle,
+    role: ConfigRole,
+    blocklist: &[String],
+    workgroup_root: &Path,
+    local_node_id: Option<&str>,
+    requester_private_key: Option<&[u8]>,
+    node_key_path: &Path,
+    fingerprint_cert: fn(&str) -> Option<String>,
+) -> Result<(), String> {
     ensure_directory_tree(config_dir, 0o777, "Nebula config")?;
     // Validate the identity root before writing even the public CA file.  The
     // identity installer repeats this check immediately before generation
@@ -989,7 +1155,15 @@ pub fn materialize_config(
     ensure_directory_tree(&config_dir.join("identity"), 0o700, "Nebula identity")?;
 
     write_atomic(&config_dir.join("ca.crt"), bundle.ca_cert_pem.as_bytes())?;
-    install_identity_generation(config_dir, bundle, requester_private_key)?;
+    install_identity_generation(
+        config_dir,
+        bundle,
+        workgroup_root,
+        local_node_id,
+        node_key_path,
+        requester_private_key,
+        fingerprint_cert,
+    )?;
     // PLANES-17 — fold the fleet's hop/exit routes into this node's
     // unsafe_routes. Exits ride only behind a passing validation verdict.
     let routes = crate::nebula_topology::derive_routes(
@@ -1557,6 +1731,19 @@ mod tests {
     use super::*;
     use crate::ca::bundle::{LighthouseEntry, NebulaBundle};
 
+    const NODE_ID: &str = "peer:self";
+    const FP_CERT_GENERATION_A: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const FP_PEER_PEM: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn fake_identity_fingerprint(cert_pem: &str) -> Option<String> {
+        match cert_pem {
+            "cert-generation-a" => Some(FP_CERT_GENERATION_A.to_string()),
+            "peer-pem" => Some(FP_PEER_PEM.to_string()),
+            _ => None,
+        }
+    }
+
     fn sample_bundle() -> NebulaBundle {
         NebulaBundle {
             mesh_id: "m1".into(),
@@ -1574,6 +1761,25 @@ mod tests {
             relay_trust_authority: None,
             created_at: 1,
         }
+    }
+
+    fn materialize_authenticated_test_identity(
+        config_dir: &Path,
+        bundle: &NebulaBundle,
+        workgroup_root: &Path,
+        key: &[u8],
+    ) -> Result<(), String> {
+        materialize_config_inner(
+            config_dir,
+            bundle,
+            ConfigRole::Peer,
+            &[],
+            workgroup_root,
+            Some(NODE_ID),
+            Some(key),
+            &workgroup_root.join("node-signing.key"),
+            fake_identity_fingerprint,
+        )
     }
 
     #[test]
@@ -1744,24 +1950,20 @@ mod tests {
     fn authenticated_identity_rotation_switches_cert_and_key_as_one_generation() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let first = sample_bundle();
-        materialize_config(
+        materialize_authenticated_test_identity(
             tmp.path(),
             &first,
-            ConfigRole::Peer,
-            &[],
             tmp.path(),
-            Some(b"key-generation-a"),
+            b"key-generation-a",
         )
         .expect("first identity");
         let mut second = first.clone();
         second.peer_cert_pem = "cert-generation-b".into();
-        materialize_config(
+        materialize_authenticated_test_identity(
             tmp.path(),
             &second,
-            ConfigRole::Peer,
-            &[],
             tmp.path(),
-            Some(b"key-generation-b"),
+            b"key-generation-b",
         )
         .expect("authenticated rotation");
         assert_eq!(
@@ -1772,19 +1974,22 @@ mod tests {
             crate::ca::seal::read_sealed(&tmp.path().join("identity/current/host.key")).unwrap(),
             b"key-generation-b"
         );
+        assert_eq!(
+            crate::ca::blocklist::all_fingerprints(tmp.path()),
+            vec![FP_PEER_PEM],
+            "the superseded cert must be revoked in the replicated Nebula blocklist"
+        );
     }
 
     #[test]
     fn authenticated_identity_rotation_prunes_previous_generation() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let first = sample_bundle();
-        materialize_config(
+        materialize_authenticated_test_identity(
             tmp.path(),
             &first,
-            ConfigRole::Peer,
-            &[],
             tmp.path(),
-            Some(b"key-generation-a"),
+            b"key-generation-a",
         )
         .expect("first identity");
         let first_generation = std::fs::read_link(tmp.path().join("identity/current"))
@@ -1795,13 +2000,11 @@ mod tests {
 
         let mut second = first;
         second.peer_cert_pem = "cert-generation-b".into();
-        materialize_config(
+        materialize_authenticated_test_identity(
             tmp.path(),
             &second,
-            ConfigRole::Peer,
-            &[],
             tmp.path(),
-            Some(b"key-generation-b"),
+            b"key-generation-b",
         )
         .expect("authenticated rotation");
         let second_generation = std::fs::read_link(tmp.path().join("identity/current"))
@@ -1833,25 +2036,21 @@ mod tests {
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let first = sample_bundle();
-        materialize_config(
+        materialize_authenticated_test_identity(
             tmp.path(),
             &first,
-            ConfigRole::Peer,
-            &[],
             tmp.path(),
-            Some(b"key-generation-a"),
+            b"key-generation-a",
         )
         .expect("first identity");
 
         let mut second = first;
         second.peer_cert_pem = "cert-generation-b".into();
-        materialize_config(
+        materialize_authenticated_test_identity(
             tmp.path(),
             &second,
-            ConfigRole::Peer,
-            &[],
             tmp.path(),
-            Some(b"key-generation-b"),
+            b"key-generation-b",
         )
         .expect("authenticated rotation");
         let active_generation = std::fs::read_link(tmp.path().join("identity/current"))
