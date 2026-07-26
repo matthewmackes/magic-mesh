@@ -4414,13 +4414,14 @@ mod tests {
     #[test]
     fn car_navigation_and_vehicle_tiles_remain_distinct_maps_routes() {
         use car_home::CarTile;
-        use mde_maps_location_egui::model::WorkspaceTab;
+        use mde_maps_location_egui::model::{AdminSection, WorkspaceTab};
 
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let mut shell = Shell::new_for_ctx(&ctx);
         shell.maps_location.focus_vehicle_tab();
-        assert_eq!(shell.maps_location.active, WorkspaceTab::Vehicle);
+        assert_eq!(shell.maps_location.active, WorkspaceTab::Admin);
+        assert_eq!(shell.maps_location.admin_section, AdminSection::Vehicle);
 
         shell.apply_car_tile(CarTile::Nav);
 
@@ -4435,8 +4436,13 @@ mod tests {
         assert_eq!(shell.nav.surface, Surface::MapsLocation);
         assert_eq!(
             shell.maps_location.active,
-            WorkspaceTab::Vehicle,
-            "Vehicle must continue to open its dedicated telematics tab"
+            WorkspaceTab::Admin,
+            "Vehicle must continue to open the consolidated MG90 Admin tab"
+        );
+        assert_eq!(
+            shell.maps_location.admin_section,
+            AdminSection::Vehicle,
+            "Vehicle must land on the Admin Vehicle section"
         );
     }
 

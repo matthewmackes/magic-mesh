@@ -7,9 +7,9 @@ use mde_egui::egui::{
 use mde_egui::{paint_carbon, Style, StyleColorScheme, TypographyRole};
 
 use crate::model::{
-    BackupRecord, CheckState, DeadZoneSeverity, DeadZoneState, Destination, DeviceIoState,
-    EncryptedVaultState, FirmwareWorkflow, LocationManager, LocationSample, LocationSource,
-    LocationSourceKind, MapViewState, Mg90ManagementMethod, Mg90SettingCategory,
+    AdminSection, BackupRecord, CheckState, DeadZoneSeverity, DeadZoneState, Destination,
+    DeviceIoState, EncryptedVaultState, FirmwareWorkflow, LocationManager, LocationSample,
+    LocationSource, LocationSourceKind, MapViewState, Mg90ManagementMethod, Mg90SettingCategory,
     Mg90SettingDescriptor, Mg90State, OfflineMapManagerState, OfflineNavigationReadiness,
     OfflineNavigationStatus, ProviderContract, RouteOption, RoutePlan, RouteTraffic,
     SettingValueType, SetupStep, SourceStatus, TripRecorderState, VehicleState, WorkspaceTab,
@@ -19,14 +19,12 @@ use crate::MapsLocationSurface;
 const RAIL_W: f32 = 176.0;
 const HEADER_H: f32 = mde_egui::menubar::BAR_HEIGHT + Style::SP_S;
 const RAIL_INNER_MARGIN: f32 = Style::SP_S;
-const ADVANCED_REVEAL_ID: &str = "maps-location-advanced-reveal";
-const ADVANCED_REVEAL_VIEWPORT_ID: &str = "maps-location-advanced-reveal-viewport";
 const MAP_LAYERS_POPUP_ID: &str = "maps-location-layers-popup";
 const MAP_LAYERS_SCROLL_ID: &str = "maps-location-layers-scroll";
 const MAP_LAYERS_POPUP_WIDTH: f32 = 280.0;
 const MAP_LAYERS_POPUP_HEIGHT: f32 = 360.0;
 const MAP_LAYERS_POPUP_GAP: f32 = Style::SP_XS;
-const ADVANCED_CARD_MIN_WIDTH: f32 = 280.0;
+const ADMIN_CARD_MIN_WIDTH: f32 = 280.0;
 const CARD_MIN_H: f32 = 84.0;
 const MAP_DARK_BG: Color32 = Color32::from_rgb(0x0D, 0x13, 0x18); // style-leak-ok: map-content-color
 const MAP_LIGHT_BG: Color32 = Color32::from_rgb(0xE8, 0xEF, 0xE8); // style-leak-ok: map-content-color
@@ -76,7 +74,7 @@ pub fn maps_location_panel(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
                     egui::ScrollArea::vertical()
-                        .id_salt(("maps-location-car", state.active))
+                        .id_salt(("maps-location-car", state.active, state.admin_section))
                         .auto_shrink([false, false])
                         .show(ui, |ui| render_active_tab(ui, state));
                 },
@@ -117,7 +115,7 @@ pub fn maps_location_panel(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
                         .inner_margin(Style::SP_M)
                         .show(ui, |ui| {
                             egui::ScrollArea::vertical()
-                                .id_salt(("maps-location-tab", state.active))
+                                .id_salt(("maps-location-tab", state.active, state.admin_section))
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| render_active_tab(ui, state));
                         });
@@ -137,21 +135,7 @@ fn render_active_tab(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
         WorkspaceTab::Airspace => crate::airspace::airspace_panel(ui, &mut state.airspace),
         WorkspaceTab::Map => show_map(ui, state),
         WorkspaceTab::RoutesTrips => show_routes_trips(ui, state),
-        WorkspaceTab::Vehicle => show_vehicle(ui, &state.vehicle),
-        WorkspaceTab::Connectivity => show_connectivity(ui, &state.mg90),
-        WorkspaceTab::DevicesIo => show_devices_io(ui, &mut state.devices),
-        WorkspaceTab::LocationSources => show_location_sources(ui, &mut state.locations),
-        WorkspaceTab::Mg90Setup => show_mg90_setup(
-            ui,
-            &mut state.mg90,
-            &state.offline_maps,
-            &state.vault,
-            &state.real_hardware_gaps,
-        ),
-        WorkspaceTab::Mg90Settings => show_mg90_settings(ui, state),
-        WorkspaceTab::FirmwareRecovery => {
-            show_firmware_recovery(ui, &state.firmware, &state.devices)
-        }
+        WorkspaceTab::Admin => show_admin(ui, state),
     }
 }
 
@@ -281,9 +265,9 @@ fn paint_simulated_ribbon(ui: &egui::Ui, panel: Rect) {
 fn tab_rail(ui: &mut egui::Ui, state: &mut MapsLocationSurface) -> Rect {
     // The shell has already removed the top status-bar and bottom/left dock
     // reservations before this workspace is laid out. Keep the Maps rail in
-    // that remaining screen-space budget as well: an expanded Advanced list
-    // must scroll inside the rail rather than painting/hit-testing below the
-    // workspace clip.
+    // that remaining screen-space budget as well: the single-level rail must
+    // scroll inside the workspace rather than painting/hit-testing below the
+    // clip on short seats.
     let available = ui.available_rect_before_wrap().intersect(ui.clip_rect());
     let inset = RAIL_INNER_MARGIN
         .min((available.width() * 0.5).max(0.0))
@@ -293,128 +277,32 @@ fn tab_rail(ui: &mut egui::Ui, state: &mut MapsLocationSurface) -> Rect {
         .max(1.0);
     let inner_height = (available.height() - 2.0 * inset).max(1.0);
 
-    // A reveal is a one-shot entry aid, not a permanent scroll lock. Clear it
-    // whenever selection leaves Advanced, even if the disclosure remains
-    // latched open: otherwise returning to the same page can reuse a stale
-    // marker after the rail was manually scrolled or resized.
-    if !state.active.is_advanced() {
-        ui.ctx().data_mut(|data| {
-            data.remove_temp::<WorkspaceTab>(egui::Id::new(ADVANCED_REVEAL_ID));
-            data.remove_temp::<u32>(egui::Id::new(ADVANCED_REVEAL_VIEWPORT_ID));
-        });
-    }
-
-    let reveal_id = egui::Id::new(ADVANCED_REVEAL_ID);
-    let reveal_viewport_id = egui::Id::new(ADVANCED_REVEAL_VIEWPORT_ID);
-    let reveal_offset = if state.active.is_advanced()
-        && (ui
-            .ctx()
-            .data(|data| data.get_temp::<WorkspaceTab>(reveal_id))
-            != Some(state.active)
-            || ui
-                .ctx()
-                .data(|data| data.get_temp::<u32>(reveal_viewport_id))
-                != Some(inner_height.to_bits()))
-    {
-        Some(advanced_reveal_offset(
-            state.active,
-            inner_height,
-            ui.spacing().item_spacing.y,
-        ))
-    } else {
-        None
-    };
-
     let rendered = egui::Frame::NONE
         .fill(Style::LAYER_01)
         .inner_margin(inset)
         .show(ui, |ui| {
             ui.set_width(inner_width);
-            let mut rail_scroll = egui::ScrollArea::vertical()
+            egui::ScrollArea::vertical()
                 .id_salt("maps-location-tab-rail")
                 .auto_shrink([false, false])
                 .max_height(inner_height)
-                .min_scrolled_height(inner_height);
-            if let Some(offset) = reveal_offset {
-                rail_scroll = rail_scroll.vertical_scroll_offset(offset);
-            }
-            rail_scroll.show(ui, |ui| {
-                ui.set_width(inner_width);
-                ui.with_layout(egui::Layout::top_down(Align::Min), |ui| {
-                    // Primary surfaces — the clean first-level nav.
-                    for tab in WorkspaceTab::PRIMARY {
-                        if rail_button(ui, tab.label(), state.active == tab).clicked() {
-                            state.active = tab;
-                        }
-                    }
-
-                    // "Advanced" — progressive disclosure for the
-                    // technical/config sections. Tapping it expands/collapses
-                    // the nested submenu; it reads as selected while one of
-                    // its children is the active tab.
-                    let open = state.advanced_open();
-                    if advanced_parent_button(ui, state.active.is_advanced(), open).clicked() {
-                        state.toggle_advanced();
-                    }
-                    if open {
-                        // Second-level list, indented under Advanced. The
-                        // ScrollArea above is the interaction boundary: rows
-                        // outside the visible viewport are clipped and cannot
-                        // steal pointer input from the workspace.
-                        ui.indent("maps-location-advanced-submenu", |ui| {
-                            for tab in WorkspaceTab::ADVANCED {
-                                let response = rail_button(ui, tab.label(), state.active == tab);
-                                if response.clicked() {
-                                    state.active = tab;
-                                }
-                                // If the shell enters Maps on an Advanced
-                                // page, reveal that page after the shell's
-                                // reserved chrome has been applied. This
-                                // prevents a stale scroll offset from
-                                // leaving the selected page off-screen.
-                                let needs_reveal = state.active == tab
-                                    && ui
-                                        .ctx()
-                                        .data(|data| data.get_temp::<WorkspaceTab>(reveal_id))
-                                        != Some(tab);
-                                if needs_reveal {
-                                    ui.ctx().data_mut(|data| {
-                                        data.insert_temp(reveal_id, tab);
-                                        data.insert_temp(
-                                            reveal_viewport_id,
-                                            inner_height.to_bits(),
-                                        );
-                                    });
-                                }
+                .min_scrolled_height(inner_height)
+                .show(ui, |ui| {
+                    ui.set_width(inner_width);
+                    ui.with_layout(egui::Layout::top_down(Align::Min), |ui| {
+                        // Single-level top rail. MG90 administrative sub-sections
+                        // are selected inside the Admin page, not exposed as rail
+                        // leaves.
+                        for tab in WorkspaceTab::PRIMARY {
+                            if rail_button(ui, tab.label(), state.active == tab).clicked() {
+                                state.active = tab;
                             }
-                        });
-                    }
-                });
-            })
+                        }
+                    });
+                })
         });
 
     rendered.inner.inner_rect
-}
-
-/// Compute the one-shot vertical offset that centers an active Advanced row in
-/// the bounded rail viewport. This is explicit instead of relying on a nested
-/// child response's scroll request: egui clips that response before the parent
-/// scroll area can consume it on very short seats, leaving an unclickable row.
-fn advanced_reveal_offset(tab: WorkspaceTab, viewport_height: f32, item_spacing_y: f32) -> f32 {
-    let Some(index) = WorkspaceTab::ADVANCED
-        .iter()
-        .position(|candidate| *candidate == tab)
-    else {
-        return 0.0;
-    };
-    let row_step = Style::SP_XL + Style::SP_XS + item_spacing_y;
-    let row_center = (WorkspaceTab::PRIMARY.len() + 1 + index) as f32 * row_step - Style::SP_XS
-        + Style::SP_XL * 0.5;
-    let content_height = (WorkspaceTab::PRIMARY.len() + 1 + WorkspaceTab::ADVANCED.len()) as f32
-        * row_step
-        - Style::SP_XS;
-    let max_offset = (content_height - viewport_height).max(0.0);
-    (row_center - viewport_height * 0.5).clamp(0.0, max_offset)
 }
 
 /// Keep a foreground control surface inside the workspace clip, including the
@@ -464,84 +352,6 @@ fn bounded_popup_rect(anchor: Rect, clip: Rect, desired_width: f32, desired_heig
     }
 }
 
-/// The top-level **Advanced** rail entry: a [`rail_button`] carrying a
-/// disclosure chevron (▸ collapsed / ▾ expanded). Reads as selected while one
-/// of its nested sections is active so the driver always knows they are inside
-/// the Advanced group even when the submenu is collapsed.
-fn advanced_parent_button(ui: &mut egui::Ui, selected: bool, expanded: bool) -> egui::Response {
-    let size = egui::vec2(ui.available_width(), Style::SP_XL);
-    let (_, rect) = ui.allocate_space(size);
-    let response = ui.interact(rect, rail_item_id("Advanced"), Sense::click());
-    let fill = if selected {
-        Style::pressed_fill(Style::ACCENT)
-    } else if response.hovered() {
-        Style::SURFACE_HI
-    } else {
-        Style::SURFACE
-    };
-    ui.painter().rect_filled(rect, Style::RADIUS_S, fill);
-    if selected {
-        ui.painter().rect_filled(
-            Rect::from_min_size(rect.min, egui::vec2(3.0, rect.height())),
-            Style::RADIUS_S,
-            Style::ACCENT,
-        );
-    }
-    let text_color = if selected {
-        Style::TEXT_STRONG
-    } else {
-        Style::TEXT
-    };
-    ui.painter().text(
-        egui::pos2(rect.left() + Style::SP_S, rect.center().y),
-        Align2::LEFT_CENTER,
-        "Advanced",
-        FontId::proportional(Style::BODY),
-        text_color,
-    );
-    // Disclosure chevron on the right edge (Carbon glyph, painter fallback).
-    let box_r = Style::SP_S;
-    let icon_box = safe_rect(
-        rect.right() - Style::SP_S - box_r * 2.0,
-        rect.center().y - box_r,
-        box_r * 2.0,
-        box_r * 2.0,
-    );
-    let name = if expanded {
-        "chevron--down"
-    } else {
-        "chevron--right"
-    };
-    if !paint_carbon(ui.painter(), icon_box, name, text_color) {
-        paint_disclosure_chevron(ui.painter(), icon_box.center(), expanded, text_color);
-    }
-    ui.add_space(Style::SP_XS);
-    response
-}
-
-/// Painter fallback for the Advanced disclosure chevron: a small triangle
-/// pointing down when `expanded`, right when collapsed.
-fn paint_disclosure_chevron(painter: &Painter, center: Pos2, expanded: bool, color: Color32) {
-    if !center.x.is_finite() || !center.y.is_finite() {
-        return;
-    }
-    let r = Style::SP_XS;
-    let pts = if expanded {
-        vec![
-            egui::pos2(center.x - r, center.y - r * 0.5),
-            egui::pos2(center.x + r, center.y - r * 0.5),
-            egui::pos2(center.x, center.y + r * 0.7),
-        ]
-    } else {
-        vec![
-            egui::pos2(center.x - r * 0.5, center.y - r),
-            egui::pos2(center.x + r * 0.7, center.y),
-            egui::pos2(center.x - r * 0.5, center.y + r),
-        ]
-    };
-    painter.add(Shape::convex_polygon(pts, color, Stroke::NONE));
-}
-
 fn rail_button(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
     let size = egui::vec2(ui.available_width().max(1.0), Style::SP_XL);
     let (_, rect) = ui.allocate_space(size);
@@ -579,7 +389,7 @@ fn rail_button(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response
 /// Stable hit-test identity for Maps' rail rows. The row rectangles are
 /// screen-space widgets inside the bounded ScrollArea, so keeping their IDs
 /// independent of the content's scroll offset preserves pointer routing when
-/// the Advanced list is revealed or restored from a previous frame.
+/// the rail is restored from a previous frame.
 fn rail_item_id(label: &str) -> egui::Id {
     egui::Id::new(("maps-location-tab-rail-item", label))
 }
@@ -3916,6 +3726,141 @@ fn show_routes_trips(ui: &mut egui::Ui, state: &MapsLocationSurface) {
     dead_zone_card(ui, &state.dead_zones);
 }
 
+fn show_admin(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
+    apply_admin_keyboard_shortcuts(ui.ctx(), &mut state.admin_section);
+
+    ui.horizontal_wrapped(|ui| {
+        let (rect, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
+        let _ = paint_carbon(ui.painter(), rect, "settings", Style::ACCENT_HI);
+        ui.add_space(Style::SP_XS);
+        ui.label(
+            RichText::new("MG90 Admin · Single Interface")
+                .size(Style::TITLE)
+                .color(Style::TEXT_STRONG),
+        );
+        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+            pill(ui, "keys 1–7", Style::ACCENT);
+        });
+    });
+    mde_egui::widgets::muted_note(
+        ui,
+        "Vehicle, connectivity, local I/O, location-source, setup, settings, and firmware tools are consolidated here. Select a section with the mouse or number keys.",
+    );
+    ui.add_space(Style::SP_S);
+    admin_section_strip(ui, &mut state.admin_section);
+    ui.add_space(Style::SP_S);
+    divider(ui);
+    ui.add_space(Style::SP_S);
+
+    match state.admin_section {
+        AdminSection::Vehicle => show_vehicle(ui, &state.vehicle),
+        AdminSection::Connectivity => show_connectivity(ui, &state.mg90),
+        AdminSection::DevicesIo => show_devices_io(ui, &mut state.devices),
+        AdminSection::LocationSources => show_location_sources(ui, &mut state.locations),
+        AdminSection::Mg90Setup => show_mg90_setup(
+            ui,
+            &mut state.mg90,
+            &state.offline_maps,
+            &state.vault,
+            &state.real_hardware_gaps,
+        ),
+        AdminSection::Mg90Settings => show_mg90_settings(ui, state),
+        AdminSection::FirmwareRecovery => {
+            show_firmware_recovery(ui, &state.firmware, &state.devices)
+        }
+    }
+}
+
+fn apply_admin_keyboard_shortcuts(ctx: &egui::Context, selected: &mut AdminSection) {
+    if ctx.wants_keyboard_input() {
+        return;
+    }
+    let next = ctx.input(|input| {
+        if input.key_pressed(egui::Key::Num1) {
+            Some(AdminSection::Vehicle)
+        } else if input.key_pressed(egui::Key::Num2) {
+            Some(AdminSection::Connectivity)
+        } else if input.key_pressed(egui::Key::Num3) {
+            Some(AdminSection::DevicesIo)
+        } else if input.key_pressed(egui::Key::Num4) {
+            Some(AdminSection::LocationSources)
+        } else if input.key_pressed(egui::Key::Num5) {
+            Some(AdminSection::Mg90Setup)
+        } else if input.key_pressed(egui::Key::Num6) {
+            Some(AdminSection::Mg90Settings)
+        } else if input.key_pressed(egui::Key::Num7) {
+            Some(AdminSection::FirmwareRecovery)
+        } else {
+            None
+        }
+    });
+    if let Some(next) = next {
+        *selected = next;
+    }
+}
+
+fn admin_section_strip(ui: &mut egui::Ui, selected: &mut AdminSection) {
+    ui.horizontal_wrapped(|ui| {
+        for section in AdminSection::ALL {
+            if admin_section_button(ui, section, *selected == section).clicked() {
+                *selected = section;
+            }
+        }
+    });
+}
+
+fn admin_section_button(
+    ui: &mut egui::Ui,
+    section: AdminSection,
+    selected: bool,
+) -> egui::Response {
+    let label = format!("{} {}", section.shortcut_label(), section.label());
+    let galley = ui.painter().layout_no_wrap(
+        label.clone(),
+        FontId::proportional(Style::SMALL),
+        Style::TEXT,
+    );
+    let width =
+        (galley.size().x + Style::SP_M + Style::SP_S).clamp(96.0, ui.available_width().max(96.0));
+    let size = egui::vec2(width, Style::SP_XL);
+    let (_, rect) = ui.allocate_space(size);
+    let response = ui.interact(rect, admin_section_item_id(section), Sense::click());
+    let fill = if selected {
+        Style::pressed_fill(Style::ACCENT)
+    } else if response.hovered() {
+        Style::SURFACE_HI
+    } else {
+        Style::SURFACE
+    };
+    ui.painter().rect_filled(rect, Style::RADIUS_S, fill);
+    if selected {
+        ui.painter().rect_filled(
+            Rect::from_min_size(rect.min, egui::vec2(3.0, rect.height())),
+            Style::RADIUS_S,
+            Style::ACCENT,
+        );
+    }
+    let text_color = if selected {
+        Style::TEXT_STRONG
+    } else {
+        Style::TEXT
+    };
+    ui.painter().galley(
+        egui::pos2(
+            rect.left() + Style::SP_S,
+            rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        text_color,
+    );
+    ui.add_space(Style::SP_XS);
+    response
+}
+
+fn admin_section_item_id(section: AdminSection) -> egui::Id {
+    egui::Id::new(("maps-location-admin-section", section.label()))
+}
+
 fn show_vehicle(ui: &mut egui::Ui, vehicle: &VehicleState) {
     let telem = &vehicle.telemetry;
     // Every telemetry readout rides the live-mirror gate (Q33): a surface with
@@ -4189,8 +4134,8 @@ fn show_devices_io(ui: &mut egui::Ui, devices: &mut DeviceIoState) {
     // The serial controls need enough width for their checkbox, baud pill, and
     // recovery actions. Below that width, keep each card full-width so the
     // wrapped layout preserves both rendering and hit targets inside the
-    // narrow Advanced viewport.
-    let col_w = responsive_column_width(ui, 2, ADVANCED_CARD_MIN_WIDTH);
+    // narrow Admin viewport.
+    let col_w = responsive_column_width(ui, 2, ADMIN_CARD_MIN_WIDTH);
     ui.horizontal_wrapped(|ui| {
         ui.scope(|ui| {
             ui.set_width(col_w);
@@ -4751,7 +4696,7 @@ fn show_mg90_setup(
     show_vault(ui, vault);
 }
 
-/// Keep the destructive confirmation target inside narrow Advanced-page
+/// Keep the destructive confirmation target inside narrow Admin-page
 /// viewports. The old single-line row let the text field consume the whole
 /// remaining width, placing the reset button outside the clipped workspace;
 /// wrapping preserves a real, on-screen hit target without changing the
@@ -6083,6 +6028,77 @@ mod tests {
         );
     }
 
+    fn render_admin_frame(
+        ctx: &egui::Context,
+        surface: &mut MapsLocationSurface,
+        screen: Rect,
+        events: Vec<egui::Event>,
+    ) {
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show_admin(ui, surface);
+                });
+            },
+        );
+    }
+
+    fn click_admin_section(
+        ctx: &egui::Context,
+        surface: &mut MapsLocationSurface,
+        screen: Rect,
+        section: AdminSection,
+    ) {
+        let at = ctx
+            .read_response(admin_section_item_id(section))
+            .expect("admin section target should be registered before click")
+            .rect
+            .center();
+        render_admin_frame(
+            ctx,
+            surface,
+            screen,
+            vec![
+                egui::Event::PointerMoved(at),
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+        );
+        render_admin_frame(
+            ctx,
+            surface,
+            screen,
+            vec![
+                egui::Event::PointerMoved(at),
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+        );
+    }
+
+    fn key(k: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key: k,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        }
+    }
+
     fn render_map_layers_frame(
         ctx: &egui::Context,
         map: &mut MapViewState,
@@ -6152,39 +6168,7 @@ mod tests {
     }
 
     #[test]
-    fn advanced_rail_is_bounded_and_reveals_an_offscreen_selected_page() {
-        let ctx = egui::Context::default();
-        Style::install(&ctx);
-        ctx.style_mut(|style| style.animation_time = 0.0);
-
-        // This is intentionally shorter than the complete primary + Advanced
-        // list. The selected last item must be scrolled into the rail viewport,
-        // not painted below the shell-reserved workspace.
-        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(360.0, 260.0));
-        let mut surface = MapsLocationSurface::simulated();
-        surface.active = WorkspaceTab::FirmwareRecovery;
-
-        let mut viewport = render_rail_frame(&ctx, &mut surface, screen, Vec::new(), true);
-        for _ in 0..3 {
-            viewport = render_rail_frame(&ctx, &mut surface, screen, Vec::new(), true);
-        }
-
-        let selected = ctx
-            .read_response(rail_item_id("Firmware & Recovery"))
-            .expect("selected Advanced row should register a stable hit target");
-        assert!(
-            screen.contains_rect(viewport),
-            "rail viewport escaped screen"
-        );
-        assert!(
-            viewport.contains_rect(selected.rect),
-            "selected Advanced page remained outside the bounded viewport: {selected:?}"
-        );
-        assert!(screen.contains_rect(selected.rect));
-    }
-
-    #[test]
-    fn advanced_parent_and_child_rows_are_clickable_in_the_bounded_viewport() {
+    fn admin_rail_is_single_top_level_target_without_legacy_leaves() {
         let ctx = egui::Context::default();
         Style::install(&ctx);
         ctx.style_mut(|style| style.animation_time = 0.0);
@@ -6194,52 +6178,77 @@ mod tests {
         surface.active = WorkspaceTab::Drive;
 
         let viewport = render_rail_frame(&ctx, &mut surface, screen, Vec::new(), false);
-        let parent = ctx
-            .read_response(rail_item_id("Advanced"))
-            .expect("Advanced parent should register a hit target");
-        assert!(viewport.contains_rect(parent.rect));
-        click_rail_row(&ctx, &mut surface, screen, parent.rect.center(), false);
-        assert!(surface.advanced_expanded, "Advanced parent click was lost");
 
-        let viewport = render_rail_frame(&ctx, &mut surface, screen, Vec::new(), false);
-        let child = ctx
-            .read_response(rail_item_id("MG90 Settings"))
-            .expect("Advanced child should register a hit target");
-        assert!(viewport.contains_rect(child.rect));
-        click_rail_row(&ctx, &mut surface, screen, child.rect.center(), false);
-        assert_eq!(surface.active, WorkspaceTab::Mg90Settings);
+        let admin = ctx
+            .read_response(rail_item_id("MG90 Admin"))
+            .expect("single MG90 Admin rail target should register");
+        assert!(
+            screen.contains_rect(viewport),
+            "rail viewport escaped screen"
+        );
+        assert!(
+            viewport.contains_rect(admin.rect),
+            "Admin rail target escaped the bounded viewport: {admin:?}"
+        );
+
+        for legacy in [
+            "Advanced",
+            "Vehicle",
+            "Connectivity",
+            "Devices & I/O",
+            "Location Sources",
+            "MG90 Setup",
+            "MG90 Settings",
+            "Firmware & Recovery",
+        ] {
+            assert!(
+                ctx.read_response(rail_item_id(legacy)).is_none(),
+                "{legacy} must not be a top-level rail target"
+            );
+        }
+
+        click_rail_row(&ctx, &mut surface, screen, admin.rect.center(), false);
+        assert_eq!(surface.active, WorkspaceTab::Admin);
+        assert_eq!(surface.admin_section, AdminSection::Vehicle);
     }
 
     #[test]
-    fn advanced_selected_row_remains_clickable_inside_short_reserved_workspace() {
+    fn admin_section_strip_clicks_route_within_the_single_admin_tab() {
         let ctx = egui::Context::default();
         Style::install(&ctx);
         ctx.style_mut(|style| style.animation_time = 0.0);
 
-        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(280.0, 220.0));
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(1280.0, 820.0));
         let mut surface = MapsLocationSurface::simulated();
-        surface.active = WorkspaceTab::Mg90Settings;
-        surface.advanced_expanded = true;
+        surface.active = WorkspaceTab::Admin;
+        surface.admin_section = AdminSection::Vehicle;
 
-        let mut viewport = Rect::NOTHING;
-        for _ in 0..3 {
-            viewport = render_rail_frame(&ctx, &mut surface, screen, Vec::new(), true);
-        }
-        let selected = ctx
-            .read_response(rail_item_id("MG90 Settings"))
-            .expect("selected Advanced row should register in a short workspace");
-        assert!(
-            viewport.contains_rect(selected.rect),
-            "viewport={viewport:?} selected={selected:?}"
-        );
-        assert!(screen.contains_rect(selected.rect));
+        render_admin_frame(&ctx, &mut surface, screen, Vec::new());
+        let target = ctx
+            .read_response(admin_section_item_id(AdminSection::Mg90Settings))
+            .expect("MG90 Settings admin section should register a hit target");
+        assert!(screen.contains_rect(target.rect));
 
-        click_rail_row(&ctx, &mut surface, screen, selected.rect.center(), true);
-        assert!(
-            ctx.read_response(rail_item_id("MG90 Settings"))
-                .is_some_and(|response| response.clicked()),
-            "selected Advanced row lost its pointer click after shell reservations"
-        );
+        click_admin_section(&ctx, &mut surface, screen, AdminSection::Mg90Settings);
+        assert_eq!(surface.active, WorkspaceTab::Admin);
+        assert_eq!(surface.admin_section, AdminSection::Mg90Settings);
+    }
+
+    #[test]
+    fn admin_number_keys_select_sections_without_leaving_admin() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        ctx.style_mut(|style| style.animation_time = 0.0);
+
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(1280.0, 820.0));
+        let mut surface = MapsLocationSurface::simulated();
+        surface.active = WorkspaceTab::Admin;
+        surface.admin_section = AdminSection::Vehicle;
+
+        render_admin_frame(&ctx, &mut surface, screen, vec![key(egui::Key::Num7)]);
+
+        assert_eq!(surface.active, WorkspaceTab::Admin);
+        assert_eq!(surface.admin_section, AdminSection::FirmwareRecovery);
     }
 
     #[test]
@@ -6298,40 +6307,7 @@ mod tests {
     }
 
     #[test]
-    fn advanced_reveal_marker_clears_when_primary_selection_keeps_menu_open() {
-        let ctx = egui::Context::default();
-        Style::install(&ctx);
-        ctx.style_mut(|style| style.animation_time = 0.0);
-
-        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(360.0, 260.0));
-        let mut surface = MapsLocationSurface::simulated();
-        surface.active = WorkspaceTab::FirmwareRecovery;
-        surface.advanced_expanded = true;
-
-        // Entering an Advanced page records the one-shot reveal marker.
-        for _ in 0..3 {
-            let _ = render_rail_frame(&ctx, &mut surface, screen, Vec::new(), false);
-        }
-        assert_eq!(
-            ctx.data(|data| { data.get_temp::<WorkspaceTab>(egui::Id::new(ADVANCED_REVEAL_ID)) }),
-            Some(WorkspaceTab::FirmwareRecovery)
-        );
-
-        // The disclosure stays expanded when a primary page is selected, so
-        // advanced_open() alone cannot identify that this marker is stale.
-        surface.active = WorkspaceTab::Drive;
-        assert!(surface.advanced_open());
-        let _ = render_rail_frame(&ctx, &mut surface, screen, Vec::new(), false);
-
-        assert_eq!(
-            ctx.data(|data| { data.get_temp::<WorkspaceTab>(egui::Id::new(ADVANCED_REVEAL_ID)) }),
-            None,
-            "a primary selection must invalidate the prior Advanced reveal"
-        );
-    }
-
-    #[test]
-    fn advanced_device_cards_stack_when_two_columns_are_too_narrow() {
+    fn admin_device_cards_stack_when_two_columns_are_too_narrow() {
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let narrow = Rect::from_min_size(Pos2::ZERO, egui::vec2(320.0, 480.0));
@@ -6348,7 +6324,7 @@ mod tests {
             |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     narrow_available = ui.available_width();
-                    narrow_width = responsive_column_width(ui, 2, ADVANCED_CARD_MIN_WIDTH);
+                    narrow_width = responsive_column_width(ui, 2, ADMIN_CARD_MIN_WIDTH);
                 });
             },
         );
@@ -6359,7 +6335,7 @@ mod tests {
             },
             |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    wide_width = responsive_column_width(ui, 2, ADVANCED_CARD_MIN_WIDTH);
+                    wide_width = responsive_column_width(ui, 2, ADMIN_CARD_MIN_WIDTH);
                 });
             },
         );
@@ -6368,9 +6344,9 @@ mod tests {
             narrow_width, narrow_available,
             "stacked cards should use the CentralPanel's actual usable width"
         );
-        assert!(narrow_width >= ADVANCED_CARD_MIN_WIDTH);
+        assert!(narrow_width >= ADMIN_CARD_MIN_WIDTH);
         assert!(wide_width < wide.width());
-        assert!(wide_width >= ADVANCED_CARD_MIN_WIDTH);
+        assert!(wide_width >= ADMIN_CARD_MIN_WIDTH);
     }
 
     #[test]
@@ -6378,11 +6354,19 @@ mod tests {
         let labels: Vec<&str> = WorkspaceTab::ALL.iter().map(|tab| tab.label()).collect();
         assert_eq!(
             labels,
+            vec!["Drive", "Airspace", "Map", "Routes & Trips", "MG90 Admin"]
+        );
+    }
+
+    #[test]
+    fn admin_sections_match_requested_order() {
+        let labels: Vec<&str> = AdminSection::ALL
+            .iter()
+            .map(|section| section.label())
+            .collect();
+        assert_eq!(
+            labels,
             vec![
-                "Drive",
-                "Airspace",
-                "Map",
-                "Routes & Trips",
                 "Vehicle",
                 "Connectivity",
                 "Devices & I/O",
@@ -6461,6 +6445,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn every_admin_section_tessellates_without_hardware() {
+        for section in AdminSection::ALL {
+            let mut surface = MapsLocationSurface::simulated();
+            surface.active = WorkspaceTab::Admin;
+            surface.admin_section = section;
+            assert!(tessellate(&mut surface) > 0, "{section:?}");
+        }
+    }
+
     // ── WL-UX-007/S1 — the production (live, honest-empty) surface ──────────
 
     #[test]
@@ -6471,6 +6465,16 @@ mod tests {
             let mut surface = MapsLocationSurface::live();
             surface.active = tab;
             assert!(tessellate(&mut surface) > 0, "{tab:?}");
+        }
+    }
+
+    #[test]
+    fn every_admin_section_tessellates_on_the_live_surface() {
+        for section in AdminSection::ALL {
+            let mut surface = MapsLocationSurface::live();
+            surface.active = WorkspaceTab::Admin;
+            surface.admin_section = section;
+            assert!(tessellate(&mut surface) > 0, "{section:?}");
         }
     }
 
@@ -7036,7 +7040,8 @@ mod tests {
     #[test]
     fn location_sources_tessellate_with_blocked_manual_switches() {
         let mut surface = MapsLocationSurface::simulated();
-        surface.active = WorkspaceTab::LocationSources;
+        surface.active = WorkspaceTab::Admin;
+        surface.admin_section = AdminSection::LocationSources;
         surface.locations.sources[1].status = SourceStatus::Disconnected;
         surface.locations.sources[2].sample.update_age_s = 6.0;
         surface.locations.sources[3].sample.accuracy_m = 6.0;
@@ -7122,9 +7127,9 @@ mod tests {
     }
 
     #[test]
-    fn reset_confirmation_action_stays_inside_a_narrow_advanced_clip() {
+    fn reset_confirmation_action_stays_inside_a_narrow_admin_clip() {
         // The confirmation input and button must wrap instead of letting the
-        // destructive action escape the narrow Advanced-page workspace.
+        // destructive action escape the narrow Admin-page workspace.
         let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(128.0, 160.0));
         let ctx = egui::Context::default();
         Style::install(&ctx);
@@ -7144,7 +7149,7 @@ mod tests {
 
         assert!(
             screen.contains_rect(reset_button),
-            "reset action escaped the narrow Advanced clip: {reset_button:?}"
+            "reset action escaped the narrow Admin clip: {reset_button:?}"
         );
         assert!(
             reset_button.is_positive(),

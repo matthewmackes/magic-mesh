@@ -3081,6 +3081,16 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-007 - Car interface (CarPlay-principled vehicle mode)
 
 - Status: Remaining
+- Progress (2026-07-26 MG90 Admin single-interface consolidation): Maps &
+  Location now exposes one top-level `MG90 Admin` rail target; the former
+  Vehicle, Connectivity, Devices & I/O, Location Sources, MG90 Setup, MG90
+  Settings, and Firmware & Recovery leaves are internal `AdminSection` pages in
+  the requested order with 1-7 keyboard selectors. Car Home routing still sends
+  Navigation to Maps `Drive`, while Vehicle opens Admin -> Vehicle. No backend
+  MG90 mutation contracts were added. Focused farm verification is green:
+  touched-file rustfmt on `.50`, `mde-maps-location-egui admin` on `.90` at
+  **11/11**, and BigBoy `.130`
+  `car_navigation_and_vehicle_tiles_remain_distinct_maps_routes` at **1/1**.
 - Progress (2026-07-25 deterministic live-capture Car pixel verifier):
   `install-helpers/verify-shell-pixel-proof.py` now has a `--profile car-home`
   path for already-captured KMS/linear-GBM PNG artifacts. It fails closed on

@@ -45,7 +45,47 @@ pub enum WorkspaceTab {
     Map,
     /// Trips, routes, saved places, replay, and export.
     RoutesTrips,
+    /// Single keyboard-oriented local MG90 administrative interface.
+    Admin,
+}
+
+impl WorkspaceTab {
+    /// All top-level tabs in stable product order. The formerly separate
+    /// Vehicle / Connectivity / Devices & I/O / Location Sources / MG90 Setup /
+    /// MG90 Settings / Firmware & Recovery leaves now live inside
+    /// [`AdminSection`] under this single Admin entry.
+    pub const ALL: [Self; 5] = [
+        Self::Drive,
+        Self::Airspace,
+        Self::Map,
+        Self::RoutesTrips,
+        Self::Admin,
+    ];
+
+    /// Primary top-level surfaces — every rail target a driver can reach
+    /// directly. Kept as an alias for callers/tests that assert the first-level
+    /// product nav.
+    pub const PRIMARY: [Self; 5] = Self::ALL;
+
+    /// Human label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Drive => "Drive",
+            Self::Airspace => "Airspace",
+            Self::Map => "Map",
+            Self::RoutesTrips => "Routes & Trips",
+            Self::Admin => "MG90 Admin",
+        }
+    }
+}
+
+/// Internal sections of the single MG90 administrative interface, preserving the
+/// operator-requested order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum AdminSection {
     /// Ford 2020 Police Interceptor vehicle telemetry.
+    #[default]
     Vehicle,
     /// MG90 WAN/cellular/connectivity view.
     Connectivity,
@@ -61,18 +101,9 @@ pub enum WorkspaceTab {
     FirmwareRecovery,
 }
 
-impl WorkspaceTab {
-    /// All tabs in stable product order (primary surfaces first, then the
-    /// sections nested under **Advanced**). Kept as the flat 11-section list so
-    /// "every section reachable" iteration still covers the whole workspace.
-    /// The former Simulator control tab was removed from production entirely
-    /// (WL-UX-007/S1, operator directive 2026-07-22): production only shows
-    /// MG90-mirror data, so there is no simulator surface to control.
-    pub const ALL: [Self; 11] = [
-        Self::Drive,
-        Self::Airspace,
-        Self::Map,
-        Self::RoutesTrips,
+impl AdminSection {
+    /// Stable section order inside the single Admin interface.
+    pub const ALL: [Self; 7] = [
         Self::Vehicle,
         Self::Connectivity,
         Self::DevicesIo,
@@ -81,48 +112,11 @@ impl WorkspaceTab {
         Self::Mg90Settings,
         Self::FirmwareRecovery,
     ];
-
-    /// Primary top-level surfaces — the clean first-level nav a driver reaches
-    /// for. The technical/config sections are nested under [`Self::ADVANCED`]
-    /// (progressive disclosure), so the main rail stays uncluttered.
-    pub const PRIMARY: [Self; 4] = [Self::Drive, Self::Airspace, Self::Map, Self::RoutesTrips];
-
-    /// Technical / configuration sections nested under the top-level **Advanced**
-    /// entry. Off the primary nav by design — reached by expanding Advanced.
-    pub const ADVANCED: [Self; 7] = [
-        Self::Vehicle,
-        Self::Connectivity,
-        Self::DevicesIo,
-        Self::LocationSources,
-        Self::Mg90Setup,
-        Self::Mg90Settings,
-        Self::FirmwareRecovery,
-    ];
-
-    /// Whether this section lives under the top-level **Advanced** menu (the
-    /// technical / configuration sections) rather than the primary nav.
-    #[must_use]
-    pub const fn is_advanced(self) -> bool {
-        matches!(
-            self,
-            Self::Vehicle
-                | Self::Connectivity
-                | Self::DevicesIo
-                | Self::LocationSources
-                | Self::Mg90Setup
-                | Self::Mg90Settings
-                | Self::FirmwareRecovery
-        )
-    }
 
     /// Human label.
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Drive => "Drive",
-            Self::Airspace => "Airspace",
-            Self::Map => "Map",
-            Self::RoutesTrips => "Routes & Trips",
             Self::Vehicle => "Vehicle",
             Self::Connectivity => "Connectivity",
             Self::DevicesIo => "Devices & I/O",
@@ -132,6 +126,20 @@ impl WorkspaceTab {
             Self::FirmwareRecovery => "Firmware & Recovery",
         }
     }
+
+    /// One-based keyboard selector shown in the Admin section strip.
+    #[must_use]
+    pub const fn shortcut_label(self) -> &'static str {
+        match self {
+            Self::Vehicle => "1",
+            Self::Connectivity => "2",
+            Self::DevicesIo => "3",
+            Self::LocationSources => "4",
+            Self::Mg90Setup => "5",
+            Self::Mg90Settings => "6",
+            Self::FirmwareRecovery => "7",
+        }
+    }
 }
 
 /// Whole workspace state.
@@ -139,6 +147,8 @@ impl WorkspaceTab {
 pub struct MapsLocationSurface {
     /// Selected workspace tab.
     pub active: WorkspaceTab,
+    /// Selected section inside the single MG90 Admin interface.
+    pub admin_section: AdminSection,
     /// Airspace — the real-time wardriving radar state (WiFi/cell/BT around the
     /// vehicle). Live-only; simulated feed until the MG90 `airspace` worker lands.
     pub airspace: crate::airspace::AirspaceState,
@@ -162,12 +172,6 @@ pub struct MapsLocationSurface {
     pub arrived: bool,
     /// Whether turn-by-turn guidance is in the off-route "Recalculating…" state.
     pub off_route: bool,
-    /// Whether the top-level **Advanced** submenu is expanded in the nav rail.
-    /// Pure nav-view state (progressive disclosure): the technical/config
-    /// sections stay hidden until the driver opens Advanced. The submenu also
-    /// auto-reveals whenever the active section is one of the Advanced sections,
-    /// so the selected item is always visible — see [`Self::advanced_open`].
-    pub advanced_expanded: bool,
     /// Whether the (test-only) simulator fixture seeded this surface. Always
     /// `false` on the production [`Self::live`] path — only the cfg-gated
     /// [`Self::simulated`] fixture sets it, and the un-hideable Car-Mode
@@ -230,6 +234,7 @@ impl MapsLocationSurface {
         let map = MapViewState::live(!offline_maps.installed_regions.is_empty());
         Self {
             active: WorkspaceTab::Drive,
+            admin_section: AdminSection::Vehicle,
             airspace: crate::airspace::AirspaceState::live(),
             route_preview: false,
             destination_search: false,
@@ -240,7 +245,6 @@ impl MapsLocationSurface {
             request_search_focus: false,
             arrived: false,
             off_route: false,
-            advanced_expanded: false,
             simulator_enabled: false,
             map,
             offline_maps,
@@ -278,6 +282,7 @@ impl MapsLocationSurface {
     pub fn simulated() -> Self {
         Self {
             active: WorkspaceTab::Drive,
+            admin_section: AdminSection::Vehicle,
             airspace: crate::airspace::AirspaceState::simulated(),
             route_preview: false,
             destination_search: false,
@@ -288,7 +293,6 @@ impl MapsLocationSurface {
             request_search_focus: false,
             arrived: false,
             off_route: false,
-            advanced_expanded: false,
             simulator_enabled: true,
             map: MapViewState::simulated(),
             offline_maps: OfflineMapManagerState::simulated_default(),
@@ -450,19 +454,6 @@ impl MapsLocationSurface {
     /// Toggle the off-route / recalculating guidance state (dev toggle).
     pub fn toggle_off_route(&mut self) {
         self.off_route = !self.off_route;
-    }
-
-    /// Whether the top-level **Advanced** submenu is revealed in the nav rail —
-    /// either because the driver expanded it, or because the active section
-    /// already lives under Advanced (so the selected item is always visible).
-    #[must_use]
-    pub const fn advanced_open(&self) -> bool {
-        self.advanced_expanded || self.active.is_advanced()
-    }
-
-    /// Toggle the top-level **Advanced** submenu's expanded state.
-    pub const fn toggle_advanced(&mut self) {
-        self.advanced_expanded = !self.advanced_expanded;
     }
 
     /// Compute whether the current state can provide offline turn-by-turn use.
@@ -955,18 +946,25 @@ impl MapsLocationSurface {
         }
     }
 
-    /// Open the cockpit directly on its **Vehicle** telematics tab — the target of
-    /// the Auto Mode home's Vehicle tile, so it lands on telematics rather than the
-    /// default Drive HUD.
+    /// Open the cockpit directly on Admin → **Vehicle** — the target of the Auto
+    /// Mode home's Vehicle tile, so it lands on telematics rather than the
+    /// default Drive HUD or a stale Admin section.
     pub fn focus_vehicle_tab(&mut self) {
-        self.active = WorkspaceTab::Vehicle;
+        self.active = WorkspaceTab::Admin;
+        self.admin_section = AdminSection::Vehicle;
     }
 
     /// Open the cockpit on the Navigation home/Drive HUD. Car Mode may have
-    /// previously left the Maps surface on Vehicle telematics; the dedicated
+    /// previously left the Maps surface on Admin → Vehicle; the dedicated
     /// Navigation card must always reset that tab before entering the cockpit.
     pub fn focus_navigation_tab(&mut self) {
         self.active = WorkspaceTab::Drive;
+    }
+
+    /// Open the single MG90 Admin interface on a specific internal section.
+    pub fn focus_admin_section(&mut self, section: AdminSection) {
+        self.active = WorkspaceTab::Admin;
+        self.admin_section = section;
     }
 
     /// Open the cockpit on the **Airspace** wardriving radar (and arm scanning) —
@@ -4418,8 +4416,14 @@ mod tests {
 
         state.choose_destination(usize::MAX);
 
-        assert!(state.destination_search, "stale selection leaves search open");
-        assert!(!state.route_preview, "stale selection cannot open route preview");
+        assert!(
+            state.destination_search,
+            "stale selection leaves search open"
+        );
+        assert!(
+            !state.route_preview,
+            "stale selection cannot open route preview"
+        );
         assert_eq!(state.local_navigation.selected_destination, 2);
     }
 
@@ -4458,43 +4462,53 @@ mod tests {
     }
 
     #[test]
-    fn advanced_menu_partitions_the_full_section_list() {
-        // Primary + Advanced must exactly partition ALL (no section lost, none
-        // double-counted) so the "Advanced" progressive-disclosure nav still
-        // reaches every workspace section.
+    fn workspace_tabs_are_single_level_with_one_admin_target() {
+        // The rail is now truly single-level: the former seven MG90 leaves are
+        // not WorkspaceTab targets, and the Admin tab owns their internal order.
+        let labels: Vec<&str> = WorkspaceTab::ALL.iter().map(|tab| tab.label()).collect();
         assert_eq!(
-            WorkspaceTab::PRIMARY.len() + WorkspaceTab::ADVANCED.len(),
-            WorkspaceTab::ALL.len()
+            labels,
+            vec!["Drive", "Airspace", "Map", "Routes & Trips", "MG90 Admin"]
         );
-        for tab in WorkspaceTab::PRIMARY {
-            assert!(!tab.is_advanced(), "{tab:?} is a primary surface");
-            assert!(!WorkspaceTab::ADVANCED.contains(&tab));
-        }
-        for tab in WorkspaceTab::ADVANCED {
-            assert!(tab.is_advanced(), "{tab:?} nests under Advanced");
-            assert!(!WorkspaceTab::PRIMARY.contains(&tab));
-        }
+        assert_eq!(WorkspaceTab::PRIMARY, WorkspaceTab::ALL);
     }
 
     #[test]
-    fn advanced_submenu_expands_by_toggle_and_auto_reveals_for_active_child() {
+    fn admin_sections_preserve_operator_requested_order() {
+        let labels: Vec<&str> = AdminSection::ALL
+            .iter()
+            .map(|section| section.label())
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                "Vehicle",
+                "Connectivity",
+                "Devices & I/O",
+                "Location Sources",
+                "MG90 Setup",
+                "MG90 Settings",
+                "Firmware & Recovery",
+            ]
+        );
+    }
+
+    #[test]
+    fn vehicle_focus_opens_admin_vehicle_while_navigation_opens_drive() {
         let mut state = MapsLocationSurface::simulated();
-        // Default: on a primary surface, Advanced is collapsed.
         assert_eq!(state.active, WorkspaceTab::Drive);
-        assert!(!state.advanced_open());
+        assert_eq!(state.admin_section, AdminSection::Vehicle);
 
-        // Tapping "Advanced" expands the submenu without changing the content.
-        state.toggle_advanced();
-        assert!(state.advanced_open());
+        state.focus_admin_section(AdminSection::Mg90Settings);
+        assert_eq!(state.active, WorkspaceTab::Admin);
+        assert_eq!(state.admin_section, AdminSection::Mg90Settings);
+
+        state.focus_navigation_tab();
         assert_eq!(state.active, WorkspaceTab::Drive);
-        state.toggle_advanced();
-        assert!(!state.advanced_open());
 
-        // Selecting an Advanced child auto-reveals the submenu even when the
-        // driver never toggled it, so the highlighted item stays visible.
-        state.active = WorkspaceTab::Mg90Settings;
-        assert!(!state.advanced_expanded);
-        assert!(state.advanced_open());
+        state.focus_vehicle_tab();
+        assert_eq!(state.active, WorkspaceTab::Admin);
+        assert_eq!(state.admin_section, AdminSection::Vehicle);
     }
 
     #[test]
@@ -4584,7 +4598,12 @@ mod tests {
         mirror.model = "MG90".to_string();
         mirror.mgos_version = "4.3.0.1".to_string();
         mirror.gaps = (0..(MAX_RETAINED_VEHICLE_GAPS + 8))
-            .map(|index| format!("gap-{index}-{}", "x".repeat(MAX_RETAINED_GAP_TEXT_BYTES + 32)))
+            .map(|index| {
+                format!(
+                    "gap-{index}-{}",
+                    "x".repeat(MAX_RETAINED_GAP_TEXT_BYTES + 32)
+                )
+            })
             .collect();
         mirror.published_at_ms = test_now_ms();
 
@@ -4599,7 +4618,8 @@ mod tests {
         assert_eq!(adapter_notes.len(), MAX_RETAINED_VEHICLE_GAPS);
         assert!(adapter_notes
             .iter()
-            .all(|note| note.len() <= VEHICLE_GAP_NOTE_PREFIX.len() + MAX_RETAINED_GAP_TEXT_BYTES + 3));
+            .all(|note| note.len()
+                <= VEHICLE_GAP_NOTE_PREFIX.len() + MAX_RETAINED_GAP_TEXT_BYTES + 3));
         assert!(state
             .real_hardware_gaps
             .contains(&VEHICLE_GAPS_CAPPED_NOTE.to_string()));
