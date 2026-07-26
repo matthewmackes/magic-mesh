@@ -19,7 +19,7 @@ use crate::formfactor::Formfactor;
 
 /// The shell-wide layout profile. Profiles are not just density presets: each one
 /// names a distinct placement model the shell can branch on while still sharing
-/// the same `Style` palette and Inter-first font system.
+/// the same `Style` palette and Kdam Thmor Pro-first font system.
 ///
 /// PLATFORM-INTERFACES Q42: exactly two profiles — Construct + Car. The former
 /// Workstation and Tablet profiles folded into Construct; hardware formfactor
@@ -156,9 +156,9 @@ impl Density {
 /// Semantic typography roles shared by Construct and Car chrome.
 ///
 /// egui's `FontId` carries family and size but not a weight axis. The shared
-/// Inter face is therefore paired with deliberate size, tracking, line-height,
-/// and emphasis tokens so canonical chrome does not fall back to a flat
-/// `FontId::proportional(...)` treatment at every call site.
+/// Kdam Thmor Pro face is therefore paired with deliberate size, tracking,
+/// line-height, and emphasis tokens so canonical chrome does not fall back to a
+/// flat `FontId::proportional(...)` treatment at every call site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TypographyRole {
     /// Hero/large-title copy.
@@ -406,9 +406,9 @@ impl Style {
     /// Secondary / dimmed text.
     pub const TEXT_DIM: Color32 = Color32::from_rgb(0x9A, 0x9A, 0xA6);
     /// **Emphasis** text — one rung brighter than [`TEXT`](Self::TEXT) (Carbon
-    /// white). The shared font installer embeds Inter for proportional UI and
-    /// Intel One Mono for monospace surfaces; the honest token cue for emphasis
-    /// on the dark ground is this brighter tone, the mirror of
+    /// white). The shared font installer embeds Kdam Thmor Pro for proportional
+    /// UI and Intel One Mono for monospace surfaces; the honest token cue for
+    /// emphasis on the dark ground is this brighter tone, the mirror of
     /// [`TEXT_DIM`](Self::TEXT_DIM)'s dimmer one. Markdown preview (EDTB-7)
     /// paints bold spans + heading titles with it.
     pub const TEXT_STRONG: Color32 = Color32::from_rgb(0xF4, 0xF4, 0xF4);
@@ -597,8 +597,8 @@ impl Style {
     pub const MENU_TEXT: f32 = Self::BODY - 1.0;
 
     // ── HIG semantic type ramp (PLATFORM-INTERFACES Q4) ─────────────────────
-    // The HIG roles (Large Title → Caption) carried by the EXISTING Inter face
-    // (the SF stand-in; Plex Mono stays the code/terminal face — no new font).
+    // The HIG roles (Large Title → Caption) carried by the Kdam Thmor Pro
+    // platform face; Plex Mono stays the code/terminal face.
     // Where a role lands on an existing Carbon rung it ALIASES it (one scale,
     // not two): Title1 = DISPLAY, Headline = TITLE, Body = BODY, Caption =
     // SMALL. The ramp descends strictly, scaled to the platform's dense 12pt
@@ -613,8 +613,8 @@ impl Style {
     /// HIG **Title 3** — just under [`HEADING`](Self::HEADING).
     pub const TYPE_TITLE3: f32 = 19.0;
     /// HIG **Headline** — aliases the sub-heading rung ([`TITLE`](Self::TITLE)).
-    /// HIG headline is *semibold*; the embedded Inter face has no bold cut, so
-    /// the platform's honest emphasis cue is pairing this size with
+    /// HIG headline is *semibold*; the embedded Kdam Thmor Pro face has one
+    /// regular cut, so the platform's honest emphasis cue is pairing this size with
     /// [`TEXT_STRONG`](Self::TEXT_STRONG) (the established weight substitute).
     pub const TYPE_HEADLINE: f32 = Self::TITLE;
     /// HIG **Body** — aliases the platform body rung ([`BODY`](Self::BODY)).
@@ -776,8 +776,8 @@ impl Style {
         scheme: StyleColorScheme,
         density: Density,
     ) {
-        // Inter is the proportional platform face; Intel One Mono stays reserved
-        // for fixed-width surfaces that require monospace glyphs.
+        // Kdam Thmor Pro is the proportional platform face; Intel One Mono stays
+        // reserved for fixed-width surfaces that require monospace glyphs.
         crate::fonts::install(ctx);
 
         let v = Self::visuals_for(scheme, Self::ACCENT, Self::ACCENT_HI);

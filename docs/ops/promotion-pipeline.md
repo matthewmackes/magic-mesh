@@ -79,7 +79,7 @@ verification and playlist mutation stages are retired.
 `magic-mesh-12.0.0-1.x86_64` (`/root/mcnf-release-artifacts`, 112291230
 bytes, built 13:19 EDT, sha256
 `7e780ab7aee218116865a08b667cf04e7042a6b34d68759f80c3a3439489e251`)
-carries the Inter platform font, the bottom Windows-style notification rail, the
+carries the historical Inter platform font, the bottom Windows-style notification rail, the
 session rail, the bounded Caddy/SELinux install behavior, the fd-budget guards,
 the packaged `mackesd` stop-policy drop-in, and the `%post` cleanup for stale
 local `mde-shell.service` Construct units. It passed L1 clean install (6 passed),

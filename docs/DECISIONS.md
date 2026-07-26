@@ -52,7 +52,7 @@ delete a prior entry; supersede it with a newer one.
   manners: persistent springboard home with pages = the 8 launcher groups, no dock, no
   widgets, slim top status bar, Control Center, Notification Center, Spotlight, card
   app-switcher, full-screen-only apps, shared NavigationBar/Toolbar/Sidebar/Sheet/Popover
-  components, scrim materials, dark-only, Inter type ramp) and **Car** (CarPlay-principled:
+  components, scrim materials, dark-only, Kdam Thmor Pro type ramp) and **Car** (CarPlay-principled:
   SYNC3 dark palette kept, Dashboard-cards home, six apps, always-visible left instrument
   strip with per-frame telemetry fold, glance rules + soft in-motion limits, one-tap
   toggle). Mackes-Carbon icons kept platform-wide; the 2026-07-26 icon V2 survey

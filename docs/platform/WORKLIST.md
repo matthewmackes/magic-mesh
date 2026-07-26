@@ -4095,6 +4095,20 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-009 - Unified workspace theme and design language
 
 - Status: Remaining
+- Progress (2026-07-26 Kdam Thmor Pro platform font standard): the shared
+  `mde-egui` font installer now embeds `KdamThmorPro-Regular.ttf` from the
+  upstream Google Fonts `ofl/kdamthmorpro` package with its SIL OFL-1.1 license,
+  and makes Kdam Thmor Pro the first font for proportional UI copy, named
+  `heading` / `nav` families, and Browser chrome. Inter remains embedded only
+  as the broad proportional fallback behind Kdam Thmor Pro; IBM Plex Mono and
+  Intel One Mono remain the fixed-width code/terminal path. The active design
+  authority now names Kdam Thmor Pro as the standard platform UI face. Focused
+  verification is green: `.50` slot `kdam-font-egui-20260726` `cargo test -p
+  mde-egui fonts -- --nocapture` passed **3/3**, `.90` slot
+  `kdam-font-typography-20260726` `cargo test -p mde-egui typography -- --
+  nocapture` passed **2/2**, `.170` slot `kdam-font-fmt-r2-20260726`
+  touched-file `rustfmt --edition 2021 --check` passed, worklist lint passed,
+  and scoped `git diff --check` passed.
 - Progress (2026-07-26 themed tooltip style-gate cleanup): the Mesh Teams
   frame, Calls controls, thread resolution button, and local reaction chips now
   route their remaining hover labels through the existing themed

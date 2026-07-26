@@ -98,7 +98,7 @@ Light is a production first-class appearance, both share azure accent
 | Q1 | HIG as **principles**, not a pixel clone | Foundations (all) |
 | Q2 | **iPadOS structure + macOS pointer manners** | Designing for iPadOS / macOS |
 | Q3 | **Quazar Dark + production Quazar Light** appearances | Appearance / Color |
-| Q4 | **Inter** carries the HIG type ramp (SF stand-in); **IBM Plex Mono** for code/terminal content | Typography |
+| Q4 | **Kdam Thmor Pro** carries the HIG type ramp as the standard platform UI face; **IBM Plex Mono** remains for code/terminal content, with Inter retained only as a proportional fallback | Typography |
 
 ### 2.2 Home — the springboard (Q5–Q9)
 
