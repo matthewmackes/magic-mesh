@@ -70,6 +70,10 @@ cmd "systemctl status syncthing"      "the file plane (replicates /mnt/mesh-stor
 cmd "ls /mnt/mesh-storage"            "the shared workgroup dir (plain, no FUSE)"
 cmd "/usr/libexec/mackesd/syncthing-reconcile" "re-wire the device list from the etcd registry"
 
+header "Maps"
+cmd "/usr/libexec/mackesd/install-offline-map-region --status" "installed MBTiles/gazetteer regions"
+cmd "/usr/libexec/mackesd/install-offline-map-region --from-dir <dir>" "install a local offline map bundle"
+
 header "Services & logs"
 cmd "systemctl status mackesd nebula" "core daemon + overlay"
 cmd "systemctl --user status mde-musicd" "music daemon (Workstation)"

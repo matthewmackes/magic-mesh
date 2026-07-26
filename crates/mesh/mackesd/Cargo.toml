@@ -446,6 +446,9 @@ assets = [
     { source = "install-helpers/mde-remote-proofing-apply.py", dest = "/usr/libexec/mackesd/mde-remote-proofing-apply", mode = "755" },
     { source = "packaging/systemd/mde-remote-proofing-plan.service", dest = "/usr/lib/systemd/system/mde-remote-proofing-plan.service", mode = "644" },
     { source = "packaging/systemd/mde-remote-proofing-plan.path", dest = "/usr/lib/systemd/system/mde-remote-proofing-plan.path", mode = "644" },
+    # Maps — install operator-provided offline MBTiles/gazetteer bundles into
+    # the persistent map-data root the shell reads (`/var/lib/mde/maps`).
+    { source = "install-helpers/install-offline-map-region.sh", dest = "/usr/libexec/mackesd/install-offline-map-region", mode = "755" },
     # E12-14b — the obsolete Cosmic-era surfaces were dropped: the live-map
     # layer-shell wallpaper (mde-mesh-wallpaper) + the notify-hub bins
     # (mde-notify-{center,toast,capture}), AND the four Cosmic-era GUIs that

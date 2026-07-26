@@ -1950,6 +1950,29 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-012 - Maps live-data overlays (zero-cost external feeds)
 
 - Status: Remaining
+- Progress (2026-07-25 persistent offline map-data root): Maps offline raster
+  bundles now default to the persistent RPM/tmpfiles-managed
+  `/var/lib/mde/maps` root instead of the installed-seat Bus spool
+  `/run/mde-bus/maps`, with `MDE_MAPS_DIR` retained as the exact operator/test
+  override and the legacy client-data maps path retained only as a fallback for
+  old dev/test checkouts. The Workstation RPM ships
+  `/usr/libexec/mackesd/install-offline-map-region`, a bounded helper that
+  installs explicit operator-provided MBTiles/gazetteer bundles into the same
+  persistent root without downloading or inventing map data; server and
+  lighthouse variants intentionally do not ship it. The seat unit pins
+  `MDE_MAPS_DIR=/var/lib/mde/maps`, tmpfiles creates the root, `mesh-help`
+  exposes status/install commands, and the bootc verifier checks both the unit
+  env and tmpfiles entry. Farm evidence is green: `.90` slot `maps-root`
+  `cargo test -p mde-maps-location-egui
+  basemap::tests::map_roots_use_persistent_var_lib_before_legacy_bus_spool --
+  --nocapture` at **1/1**, `.50` slot `maps-pkg`
+  `cargo test -p mackesd
+  onboard::role_provision::tests::full_rpm_ships_offline_map_installer_and_persistent_map_root
+  --features async-services -- --nocapture` at **1/1**, and `.50` touched-file
+  rustfmt is green. Local `bash -n`, helper `--self-test`, and `git diff
+  --check` are clean. Live map-data installation on `.15` remains a deploy/proof
+  follow-up; this slice fixes the packaged location/interface that caused
+  installed seats to have no durable map data.
 - Progress (2026-07-25 NWS keyless default-on/degraded live proof): the
   `nws_alert_overlay` Workstation-tier worker now starts by default unless
   explicitly disabled with `MDE_OVERLAY_NWS_ALERTS=0/false/no/off`, keeps the
@@ -2413,6 +2436,23 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-006 - Construct interface (Apple-HIG-principled workstation shell)
 
 - Status: Remaining
+- Progress (2026-07-25 Springboard Dock/browser live-layout regression fixes):
+  the Springboard Dock control IDs now include their placement
+  (`floating`/`docked`), so egui cannot complete a stale click from the old
+  top-left docked rail against the bottom floating pill after a mode switch.
+  The Browser omnibox suggestions panel now renders in a foreground `Area`
+  anchored under the address field with bounded width/height, so suggestions
+  overlay the page instead of consuming normal-flow vertical space and shifting
+  the rendered web surface. Farm evidence is green: `.170` slot
+  `nav-pill-final` `cargo test -p mde-shell-egui nav_bar -- --nocapture`
+  at **17/17**, including
+  `stale_docked_hit_targets_do_not_fire_after_switching_to_floating`, and
+  `.90` slot `browser-suggest-final`
+  `cargo test -p mde-shell-egui
+  omnibox_suggestions_do_not_reflow_the_live_page_body -- --nocapture` at
+  **1/1**. `.50` touched-file rustfmt and local `git diff --check` are clean.
+  Live `.15` RPM deployment/physical pointer replay remains a follow-up; the
+  previous installed shell is not claimed fixed until that deploy proof lands.
 - Progress (2026-07-25 primary-seat SSH and Surface hotfix deploy proof):
   local-network SSH access for the two primary test seats is now key-only clean
   for both automation accounts: `.15`/`Basement-Test-Workstation` accepts the

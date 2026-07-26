@@ -76,6 +76,15 @@ impl Default for DockMode {
     }
 }
 
+impl DockMode {
+    const fn id_suffix(self) -> &'static str {
+        match self {
+            Self::Floating => "floating",
+            Self::Docked => "docked",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct NavBarPrefs {
     #[serde(default)]
@@ -241,8 +250,11 @@ impl State {
                     // The Area's content UI is created with its absolute screen
                     // rect as max_rect, so these interaction rectangles stay in
                     // the same screen space as the painter and AccessKit tree.
-                    let response =
-                        ui.interact(control.rect, control_id(*control), egui::Sense::click());
+                    let response = ui.interact(
+                        control.rect,
+                        control_id(self.mode, *control),
+                        egui::Sense::click(),
+                    );
                     let hovered = response.hovered();
                     if hovered {
                         painter.rect_filled(
@@ -272,7 +284,13 @@ impl State {
                         );
                     }
                     let label = control_label(*control, pinned_sources);
-                    install_accessibility(ctx, *control, label.as_str(), self.is_docked());
+                    install_accessibility(
+                        ctx,
+                        self.mode,
+                        *control,
+                        label.as_str(),
+                        self.is_docked(),
+                    );
                     let response = response.on_hover_ui(move |ui| {
                         nav_bar_tooltip(ui, label.as_str());
                     });
@@ -629,10 +647,19 @@ fn nav_bar_tooltip(ui: &mut egui::Ui, text: &str) {
         });
 }
 
-fn control_id(control: Control) -> egui::Id {
+fn control_id(mode: DockMode, control: Control) -> egui::Id {
     match control.source_index {
-        Some(index) => egui::Id::new(("construct-navigation-bar", "pinned", index)),
-        None => egui::Id::new(("construct-navigation-bar", control.kind.id_suffix())),
+        Some(index) => egui::Id::new((
+            "construct-navigation-bar",
+            mode.id_suffix(),
+            "pinned",
+            index,
+        )),
+        None => egui::Id::new((
+            "construct-navigation-bar",
+            mode.id_suffix(),
+            control.kind.id_suffix(),
+        )),
     }
 }
 
@@ -667,8 +694,14 @@ fn control_action(
     }
 }
 
-fn install_accessibility(ctx: &egui::Context, control: Control, label: &str, _docked: bool) {
-    let _ = ctx.accesskit_node_builder(control_id(control), |node| {
+fn install_accessibility(
+    ctx: &egui::Context,
+    mode: DockMode,
+    control: Control,
+    label: &str,
+    _docked: bool,
+) {
+    let _ = ctx.accesskit_node_builder(control_id(mode, control), |node| {
         node.set_role(egui::accesskit::Role::Button);
         node.set_label(label.to_owned());
         node.set_bounds(egui::accesskit::Rect {
@@ -1206,6 +1239,106 @@ mod tests {
                 assert_eq!(action, Some(expected), "{mode:?} {kind:?} target");
             }
         }
+    }
+
+    #[test]
+    fn stale_docked_hit_targets_do_not_fire_after_switching_to_floating() {
+        // egui resolves a click from the widget IDs registered in the previous
+        // frame, then reports `clicked()` on the current-frame widget with the
+        // same ID. The Springboard Dock reuses Back/Home/Pin semantics in both
+        // placements, so the IDs must include the placement: otherwise the old
+        // top-left rail buttons can complete a click on the new bottom pill.
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
+        let stale_home = docked_geometry(screen).controls[1].rect.center();
+        let floating_home = floating_geometry(screen).controls[1].rect.center();
+        assert!(
+            !floating_geometry(screen).controls[1]
+                .rect
+                .contains(stale_home),
+            "the stale top-left Home target must be outside the floating pill"
+        );
+
+        let ctx = egui::Context::default();
+        let mut state = State::with_mode(DockMode::Docked);
+        let input = |events| egui::RawInput {
+            screen_rect: Some(screen),
+            events,
+            ..Default::default()
+        };
+
+        for _ in 0..3 {
+            let _ = ctx.run(input(Vec::new()), |ctx| {
+                assert_eq!(state.mount(ctx, &[]), None);
+            });
+        }
+
+        state.toggle_mode(Instant::now(), MotionMode::Disabled);
+        assert_eq!(state.mode, DockMode::Floating);
+
+        let _ = ctx.run(
+            input(vec![
+                egui::Event::PointerMoved(stale_home),
+                egui::Event::PointerButton {
+                    pos: stale_home,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]),
+            |ctx| {
+                assert_eq!(state.mount(ctx, &[]), None);
+            },
+        );
+        let mut action = None;
+        let _ = ctx.run(
+            input(vec![
+                egui::Event::PointerMoved(stale_home),
+                egui::Event::PointerButton {
+                    pos: stale_home,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]),
+            |ctx| action = state.mount(ctx, &[]),
+        );
+        assert_eq!(
+            action, None,
+            "a stale top-left rail hit box must not activate the bottom floating pill"
+        );
+
+        let _ = ctx.run(
+            input(vec![
+                egui::Event::PointerMoved(floating_home),
+                egui::Event::PointerButton {
+                    pos: floating_home,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]),
+            |ctx| {
+                assert_eq!(state.mount(ctx, &[]), None);
+            },
+        );
+        let mut action = None;
+        let _ = ctx.run(
+            input(vec![
+                egui::Event::PointerMoved(floating_home),
+                egui::Event::PointerButton {
+                    pos: floating_home,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]),
+            |ctx| action = state.mount(ctx, &[]),
+        );
+        assert_eq!(
+            action,
+            Some(Action::Home),
+            "the actual bottom pill Home target must remain clickable"
+        );
     }
 
     #[test]

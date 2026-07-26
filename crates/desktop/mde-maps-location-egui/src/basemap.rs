@@ -1,8 +1,7 @@
 //! Offline raster basemap — `MBTiles` → egui texture slippy-tile layer (P2).
 //!
 //! The seat ships a region bundle under
-//! `<client_data_dir>/maps/<region>/<region>.mbtiles` (see
-//! [`mde_bus::client_data_dir`]); this module reads it and paints a real
+//! `/var/lib/mde/maps/<region>/<region>.mbtiles`; this module reads it and paints a real
 //! Web-Mercator tile layer under the Drive/Map HUD, replacing the old
 //! procedural grid + hard-coded road splines.
 //!
@@ -48,6 +47,13 @@ const MAX_TILES_PER_FRAME: usize = 256;
 /// without coupling live vector geometry to any one bundle's zoom inventory.
 const FALLBACK_MIN_ZOOM: u8 = 0;
 const FALLBACK_MAX_ZOOM: u8 = 22;
+
+/// Persistent, RPM/tmpfiles-managed offline map-data root.
+///
+/// The shared Bus root is `/run/mde-bus` on installed seats, which is tmpfs and
+/// cannot own offline data. `MDE_MAPS_DIR` remains the explicit test/operator
+/// override; this path is the durable default.
+pub const DEFAULT_MAPS_ROOT: &str = "/var/lib/mde/maps";
 
 /// Fractional Web-Mercator tile coordinate `(x, y)` for `lon`/`lat` at zoom `z`.
 ///
@@ -105,13 +111,32 @@ pub struct BasemapMeta {
     pub raw: RawMeta,
 }
 
-/// The maps root the seat reads region bundles from: `MDE_MAPS_DIR` when set (a
-/// test/override hook), else `<client_data_dir>/maps`.
-fn maps_root() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("MDE_MAPS_DIR") {
-        return Some(PathBuf::from(dir));
+/// Candidate map-data roots in lookup order.
+///
+/// `MDE_MAPS_DIR` is authoritative when set. Otherwise, production reads the
+/// persistent `/var/lib/mde/maps` root first, with the former
+/// `<client_data_dir>/maps` location retained only as a compatibility fallback
+/// for old dev/test checkouts.
+fn candidate_roots(override_root: Option<PathBuf>, client_root: Option<PathBuf>) -> Vec<PathBuf> {
+    if let Some(root) = override_root {
+        return vec![root];
     }
-    mde_bus::client_data_dir().map(|d| d.join("maps"))
+
+    let mut roots = vec![PathBuf::from(DEFAULT_MAPS_ROOT)];
+    if let Some(client_root) = client_root {
+        let legacy = client_root.join("maps");
+        if !roots.iter().any(|root| root == &legacy) {
+            roots.push(legacy);
+        }
+    }
+    roots
+}
+
+fn maps_roots() -> Vec<PathBuf> {
+    candidate_roots(
+        std::env::var_os("MDE_MAPS_DIR").map(PathBuf::from),
+        mde_bus::client_data_dir(),
+    )
 }
 
 /// The first `*.mbtiles` file directly inside `dir`, if any.
@@ -136,16 +161,24 @@ fn mbtiles_in(dir: &Path) -> Option<PathBuf> {
 /// offline fallback).
 #[must_use]
 pub fn region_dir() -> Option<PathBuf> {
-    let root = maps_root()?;
-    let mut dirs: Vec<PathBuf> = std::fs::read_dir(&root)
-        .ok()?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.is_dir())
-        .collect();
-    dirs.sort();
-    dirs.into_iter()
-        .find(|d| mbtiles_in(d).is_some() || d.join("gazetteer.sqlite").exists())
+    for root in maps_roots() {
+        let mut dirs: Vec<PathBuf> = std::fs::read_dir(&root)
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        dirs.sort();
+        if let Some(dir) = dirs
+            .into_iter()
+            .find(|d| mbtiles_in(d).is_some() || d.join("gazetteer.sqlite").exists())
+        {
+            return Some(dir);
+        }
+    }
+    None
 }
 
 /// Open an `MBTiles`/`SQLite` file read-only. Fail-soft: `None` when it cannot open.
@@ -658,6 +691,23 @@ mod tests {
     fn read_tile_missing_file_is_none_not_panic() {
         assert!(read_tile(Path::new("/nonexistent/none.mbtiles"), 12, 1, 1).is_none());
         assert!(read_meta(Path::new("/nonexistent/none.mbtiles")).is_none());
+    }
+
+    #[test]
+    fn map_roots_use_persistent_var_lib_before_legacy_bus_spool() {
+        let roots = candidate_roots(None, Some(PathBuf::from("/run/mde-bus")));
+        assert_eq!(roots[0], PathBuf::from(DEFAULT_MAPS_ROOT));
+        assert_eq!(roots[1], PathBuf::from("/run/mde-bus/maps"));
+
+        let override_root = PathBuf::from("/tmp/operator-map-root");
+        assert_eq!(
+            candidate_roots(
+                Some(override_root.clone()),
+                Some(PathBuf::from("/run/mde-bus")),
+            ),
+            vec![override_root],
+            "MDE_MAPS_DIR must remain the exact operator/test override"
+        );
     }
 
     #[test]

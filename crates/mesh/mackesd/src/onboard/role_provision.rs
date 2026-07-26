@@ -1062,6 +1062,52 @@ mod tests {
     }
 
     #[test]
+    fn full_rpm_ships_offline_map_installer_and_persistent_map_root() {
+        let manifest: toml::Value =
+            toml::from_str(include_str!("../../Cargo.toml")).expect("mackesd Cargo.toml parses");
+        let rpm = &manifest["package"]["metadata"]["generate-rpm"];
+        let base_assets = rpm["assets"].as_array().expect("base assets array");
+        let server_assets = rpm["variants"]["server"]["assets"]
+            .as_array()
+            .expect("server assets array");
+        let lighthouse_assets = rpm["variants"]["lighthouse"]["assets"]
+            .as_array()
+            .expect("lighthouse assets array");
+        let source = "install-helpers/install-offline-map-region.sh";
+        let dest = "/usr/libexec/mackesd/install-offline-map-region";
+
+        assert!(
+            asset_exists(base_assets, source, dest, "755"),
+            "full Workstation RPM must ship the offline Maps region installer"
+        );
+        for assets in [server_assets, lighthouse_assets] {
+            assert!(
+                dest_absent(assets, dest),
+                "headless RPM variants must not ship the Workstation Maps installer"
+            );
+        }
+
+        let tmpfiles = include_str!("../../../../../packaging/tmpfiles/magic-mesh.conf");
+        assert!(
+            tmpfiles.contains("d /var/lib/mde/maps 0755 root root -"),
+            "tmpfiles must create the persistent offline Maps root"
+        );
+
+        let unit = include_str!("../../../../../packaging/bootc/units/mde-shell-egui.service");
+        assert!(
+            unit.contains("Environment=MDE_MAPS_DIR=/var/lib/mde/maps"),
+            "the DRM shell unit must pin Maps to persistent storage, not /run/mde-bus"
+        );
+
+        let helper = include_str!("../../../../../install-helpers/install-offline-map-region.sh");
+        assert!(
+            helper.contains("DEFAULT_DEST_ROOT=\"${MDE_MAPS_DIR:-/var/lib/mde/maps}\"")
+                && helper.contains("--self-test"),
+            "the packaged helper must default to the persistent map root and carry a self-test"
+        );
+    }
+
+    #[test]
     fn browser_rpm_ships_cef_runtime_provisioning_but_base_and_server_do_not() {
         let manifest = rpm_manifest();
         let rpm = &manifest["package"]["metadata"]["generate-rpm"];

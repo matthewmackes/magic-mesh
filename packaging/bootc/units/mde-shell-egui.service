@@ -53,6 +53,9 @@ TTYVHangup=yes
 # the SAME bus spool + workgroup dir as the root daemon (the SETUP-fix split-brain).
 Environment=MDE_BUS_ROOT=/run/mde-bus
 Environment=MDE_WORKGROUP_ROOT=/mnt/mesh-storage
+# Offline maps are persistent seat data, not Bus spool data. Keep this explicit
+# so a shared `/run/mde-bus` client root cannot redirect Maps to tmpfs.
+Environment=MDE_MAPS_DIR=/var/lib/mde/maps
 # The shipped root DRM shell is the only production token minter. A provisioning
 # helper installs its LoadCredentialEncrypted drop-in only after host ciphertext
 # exists; without it every live action fails closed before publishing.

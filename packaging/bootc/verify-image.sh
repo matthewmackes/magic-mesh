@@ -75,6 +75,9 @@ grep -q '^DelegateSubgroup=shell$' /usr/lib/systemd/system/mde-shell-egui.servic
 grep -q '^Environment=MDE_WEB_SANDBOX_DELEGATE_SUBGROUP=shell$' /usr/lib/systemd/system/mde-shell-egui.service \
     && ok "seat unit tells browser sandbox which delegated subgroup to escape" \
     || bad "seat unit missing browser sandbox delegated-subgroup env"
+grep -q '^Environment=MDE_MAPS_DIR=/var/lib/mde/maps$' /usr/lib/systemd/system/mde-shell-egui.service \
+    && ok "seat unit pins offline Maps data to persistent storage" \
+    || bad "seat unit missing persistent offline Maps data root env"
 
 # Enablement symlinks (systemctl reads links; no running systemd needed).
 for u in mde-shell-egui.service podman.socket mackesd.service nebula.service \
@@ -91,6 +94,8 @@ done
 [ -f /etc/yum.repos.d/magic-mesh.repo ] && ok "channel .repo present" || bad "channel .repo missing"
 grep -q 'mesh-storage' /usr/lib/tmpfiles.d/magic-mesh.conf 2>/dev/null \
     && ok "tmpfiles doctrine present" || bad "tmpfiles magic-mesh.conf missing/short"
+grep -q '^d /var/lib/mde/maps 0755 root root -$' /usr/lib/tmpfiles.d/magic-mesh.conf 2>/dev/null \
+    && ok "persistent offline Maps root present" || bad "tmpfiles missing /var/lib/mde/maps"
 
 exit "$fail"
 INNER
