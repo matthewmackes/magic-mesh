@@ -465,9 +465,12 @@ impl Client {
 
     /// MEDIA-6 — playlist writes must land on one durable writer instead of the
     /// active-active read endpoint. The default autoconfig URL is
-    /// `music.mesh`; swap only that host to `music-writer.mesh`. Manual/legacy
-    /// URLs keep their original base unless the operator provides
-    /// [`MUSIC_WRITER_URL_ENV`].
+    /// `music.mesh`; swap only that URL's host to `music-writer.mesh`.
+    /// WL-FUNC-014 gateway proxy bases such as
+    /// `http://gateway.mesh:4040/mde/airsonic/<source-id>` are already a concrete
+    /// per-source session anchor and must keep their exact base for reads and
+    /// playlist mutations. Other manual URLs also keep their original base unless
+    /// the operator provides [`MUSIC_WRITER_URL_ENV`].
     #[must_use]
     pub fn playlist_writer_base_url(&self) -> String {
         if let Ok(override_url) = std::env::var(MUSIC_WRITER_URL_ENV) {
@@ -476,7 +479,7 @@ impl Client {
                 return trimmed.to_string();
             }
         }
-        self.base_url.replace(MUSIC_READ_HOST, MUSIC_WRITER_HOST)
+        music_mesh_writer_base_url(&self.base_url).unwrap_or_else(|| self.base_url.clone())
     }
 
     /// Build a URL for a playlist mutation against the deterministic writer.
@@ -1353,6 +1356,37 @@ fn urlencode(s: &str) -> String {
     out
 }
 
+/// Return a writer base only when the configured session base is actually hosted
+/// at the legacy active-active `music.mesh` authority. This intentionally avoids
+/// substring replacement so a WL-FUNC-014 gateway source id/path containing the
+/// text `music.mesh` is not rewritten away from the selected gateway proxy.
+fn music_mesh_writer_base_url(base_url: &str) -> Option<String> {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    let (scheme, rest) = trimmed.split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    if !matches!(scheme.as_str(), "http" | "https") {
+        return None;
+    }
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let path = &rest[authority_end..];
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+    let (host, port) = authority
+        .split_once(':')
+        .map_or((authority, ""), |(host, port)| (host, port));
+    if !host.eq_ignore_ascii_case(MUSIC_READ_HOST) {
+        return None;
+    }
+    let port = if port.is_empty() {
+        String::new()
+    } else {
+        format!(":{port}")
+    };
+    Some(format!("{scheme}://{MUSIC_WRITER_HOST}{port}{path}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1501,6 +1535,44 @@ mod tests {
         assert!(u.contains("name=Roadtrip"));
         let list = c.playlist_writer_endpoint_url("getPlaylists", &[]);
         assert!(list.starts_with("http://music-writer.mesh:4533/rest/getPlaylists?"));
+    }
+
+    #[test]
+    fn gateway_proxy_base_is_the_read_and_write_session_anchor() {
+        let _guard = env_lock();
+        std::env::remove_var(MUSIC_WRITER_URL_ENV);
+        let gateway_base = "http://gateway-a.mesh:4040/mde/airsonic/airsonic-gateway-a-abc123";
+        let c = Client::with_salt(gateway_base, "alice", "pw", "abc");
+
+        assert_eq!(c.playlist_writer_base_url(), gateway_base);
+        assert!(c
+            .endpoint_url("getArtists", &[])
+            .starts_with(&format!("{gateway_base}/rest/getArtists?")));
+        assert!(c
+            .playlist_writer_endpoint_url("createPlaylist", &[("name", "Roadtrip")])
+            .starts_with(&format!("{gateway_base}/rest/createPlaylist?")));
+        assert!(c
+            .stream_url("song-7")
+            .starts_with(&format!("{gateway_base}/rest/stream?")));
+        assert!(c
+            .cover_art_url("cover-7")
+            .starts_with(&format!("{gateway_base}/rest/getCoverArt?")));
+    }
+
+    #[test]
+    fn writer_rewrite_matches_music_mesh_host_not_path_text() {
+        let _guard = env_lock();
+        std::env::remove_var(MUSIC_WRITER_URL_ENV);
+        let gateway_base = "http://gateway-a.mesh:4040/mde/airsonic/music.mesh-source";
+        let c = Client::with_salt(gateway_base, "alice", "pw", "abc");
+        assert_eq!(c.playlist_writer_base_url(), gateway_base);
+
+        let legacy_with_path =
+            Client::with_salt("http://music.mesh:4533/subsonic", "alice", "pw", "abc");
+        assert_eq!(
+            legacy_with_path.playlist_writer_base_url(),
+            "http://music-writer.mesh:4533/subsonic"
+        );
     }
 
     #[test]

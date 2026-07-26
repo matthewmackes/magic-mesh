@@ -2208,6 +2208,17 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-014 - Music interface LAN AirSonic mesh gateway
 
 - Status: Remaining
+- Progress (2026-07-26 Music client gateway session hardening):
+  `mde-musicd` now treats a WL-FUNC-014 gateway proxy URL as the concrete
+  Subsonic session anchor for browse, stream, cover art, and playlist mutation
+  endpoints instead of applying the legacy `music.mesh` writer rewrite to pathful
+  gateway sources. The rewrite is host-aware now: only an actual `music.mesh`
+  authority maps to `music-writer.mesh`; a gateway URL or source id containing
+  the text `music.mesh` stays pinned to the selected gateway proxy. Credential
+  loading is also strict before any client session is built: `airsonic-creds.json`
+  rejects unknown/demo fields and invalid URL/username anchors. Farm evidence is
+  green: `.50` `cargo test -p mde-musicd --lib -- --nocapture` passed **112/112**;
+  `.90` `cargo fmt -p mde-musicd -- --check` passed.
 - Progress (2026-07-26 Music autoconfig gateway credential materialization):
   `music_autoconfig` now prefers manually registered AirSonic gateway sources
   over the legacy shared `media-registry.json` account path. When a gateway
@@ -2288,6 +2299,23 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-015 - Media Workspace LAN Jellyfin mesh gateway
 
 - Status: Remaining
+- Progress (2026-07-26 Jellyfin gateway streaming/progress proxy proof):
+  `media_jellyfin_proxy` now forwards range-safe upstream response headers
+  (`Content-Range`, `Accept-Ranges`, `ETag`, cache validators, and content
+  metadata) instead of collapsing streamed replies to only content type/length.
+  Focused loopback proxy tests prove a client `Range: bytes=4-9` direct-stream
+  request reaches the upstream without client auth/query tokens, upstream
+  `206 Partial Content` status, range headers, and body bytes return intact,
+  and a `/Sessions/Playing/Progress` POST materializes the sealed gateway user
+  into the JSON body, injects server-side auth, strips client auth, and returns
+  upstream `204 No Content`. Farm evidence is green: `.90`
+  `cargo test -p mackesd --lib --features async-services
+  media_jellyfin_proxy -- --nocapture` **12/12**; touched-file rustfmt is green
+  on `.50` with `rustup run 1.94.0 rustfmt --edition 2021 --check
+  crates/mesh/mackesd/src/workers/media_jellyfin_proxy.rs`; local
+  `git diff --check` is clean. Remaining WL-FUNC-015 layers are live
+  cross-node proof, role-gated playback actions, and metadata/artwork/recent
+  playback cache behavior through outages.
 - Progress (2026-07-26 live Jellyfin upstream probe): the operator-supplied
   Jellyfin server at `http://172.20.0.2:8096` is reachable from the dev host and
   from DELL-LAPTOP through the seat network path. Public server info reports
@@ -2321,6 +2349,15 @@ These decisions refine acceptance and sequencing for the active items below.
   superseded by the green `.130` rerun. Remaining WL-FUNC-015 layers are true
   streaming/range and live cross-node proof, playback-progress/resume role
   gates, and metadata/artwork/recent-playback cache behavior through outages.
+- Progress (2026-07-26 gateway range/progress forwarding): the
+  `media_jellyfin_proxy` now preserves real streaming response status and cache
+  headers from the LAN upstream, including `206 Partial Content`,
+  `Content-Range`, `Accept-Ranges`, `ETag`, and the upstream body, while still
+  stripping client auth and injecting only the server-side Jellyfin credential.
+  Playback progress POSTs also forward JSON bodies/status through the gateway
+  and rewrite the client sentinel to the sealed upstream Jellyfin user id. This
+  closes the unit-tested streaming/range and progress-forwarding proxy layer;
+  live cross-node playback proof and outage cache/resume behavior remain.
 - Progress (2026-07-26 Media Workspace source preference/failover): the Media
   Workspace now keeps a user-preferred mesh Jellyfin source outside the local
   `ServerStore`, marks the active mesh route in Sources, and applies the
@@ -2572,6 +2609,21 @@ These decisions refine acceptance and sequencing for the active items below.
   `surfaces.rs`. New regression coverage includes non-zero-origin pointer
   clicks for every grouped app target, directly covering the prior `.15`
   nav-pill trigger-offset bug class.
+- Progress (2026-07-26 Springboard bottom-placement correction): WL-UX-006 now
+  owns the Springboard bottom-rendering defect. `nav_bar.rs` changed the
+  floating Springboard Dock from the stale bottom-left geometry to a
+  bottom-centered pill, caps chooser-pinned desktop buttons to the available
+  horizontal pill width, and slides the centered pill to the left edge before
+  melting into the docked rail. The same regression pass found and closed the
+  adjacent short-screen vertical-rail overflow: Back/Home/Pin remain first, and
+  grouped app launchers are omitted when they cannot be painted and clicked
+  inside the 56px rail. Farm evidence is green: `.90` slot `nav-bottom`
+  `cargo test -p mde-shell-egui nav_bar -- --nocapture` passed **24/24**,
+  including `floating_dock_is_bottom_centered_and_caps_pins_to_available_width`,
+  `docked_rail_drops_launcher_overflow_on_short_screens`, the black-pill
+  slide/melt proof, and the all-mode hit-target boundary test; `.170` slot
+  `nav-bottom-fmt` passed touched-file `rustfmt --edition 2021 --check
+  crates/desktop/mde-shell-egui/src/nav_bar.rs`.
 - Progress (2026-07-26 Terminal typing/cursor lag live bug): the operator
   reported that Terminal rendering falls behind while typing, leaving the
   displayed cursor incorrect. This is now a WL-UX-006 live-acceptance defect
@@ -3852,6 +3904,17 @@ These decisions refine acceptance and sequencing for the active items below.
   `git diff --check` passed for the touched IAC files. Crate-wide
   `cargo fmt -p mde-shell-egui -- --check` remains blocked by unrelated
   pre-existing formatting drift outside `iac/`.
+- Progress (2026-07-26 Run/Drift lifecycle table seam): the Run and Drift routes
+  now reuse the dense sortable Workloads resource table instead of dropping
+  directly into legacy lens-only bodies. A route-specific table mode keeps the
+  shared delivery filter, density, sort, expanded-row metrics/placement/drift,
+  and exact node/target command preview while changing row actions by route:
+  Run exposes lifecycle controls behind the existing review gate, and Drift
+  exposes plan-only node actions rather than destructive controls. Evidence:
+  BigBoy `.130` slot `workloads-ui-iac` `cargo test -p mde-shell-egui iac --
+  --nocapture` passed **62/62** (1775 filtered), including new headless render
+  coverage for Run and Drift tables; `.170` touched-file `rustfmt --edition 2021
+  --check` and scoped `git diff --check` passed.
 - Origin or merged source IDs: 2026-07-26 planning handoff, "World-Class Infra
   as Code / Workloads Redesign"; UX references named in that handoff: Apple HIG
   sidebars, IBM Carbon data tables/filtering, HCP Terraform workspaces, and
@@ -4026,6 +4089,14 @@ These decisions refine acceptance and sequencing for the active items below.
   **2/2**; `.170` slot `collab-full-after-reactions`
   `cargo test -p mde-collab-egui -- --nocapture` passed **98/98** plus
   doc-tests; touched-file `.170` rustfmt and scoped `git diff --check` passed.
+- Progress (2026-07-26 focused first-open activity fold): the shell-side
+  Communications data fold now reads heavy per-space Mesh Teams mirrors only
+  for the focused channel on first open and on channel switch, while keeping the
+  directory/global rollups live. The Activity `All` filter also uses the source
+  slice directly instead of allocating a per-row filtered vector before
+  `ScrollArea::show_rows` virtualizes paint. This targets the seat `.15`
+  slowdown when opening Mesh Teams Activity without changing collaboration Bus
+  topics or command contracts.
 - Priority: P0
 - Complexity: Epic
 - Problem: The live Communications surface has a strong Bus-backed foundation,

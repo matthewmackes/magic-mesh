@@ -9,12 +9,13 @@
 //! left the Bus wiring "for a later shell-mount phase". That phase is here:
 //!
 //!   * [`LiveCollabData`] is the Bus-backed [`CollabData`]. Each refresh folds the
-//!     collab worker's retained `state/collab/*` mirrors (the `directory` rail, and
-//!     — per space in that directory — the `activity` feed, the `conversation`
-//!     timeline, and the `call-state`) into the owned projection shapes the surface
-//!     reads. It is a **pure renderer** over the worker's read-model: the shell
-//!     never depends on the mackesd collab worker crate — the Bus JSON is the seam
-//!     (the same discipline as `chat.rs`).
+//!     collab worker's retained `state/collab/*` mirrors into the owned projection
+//!     shapes the surface reads. The heavy per-space mirrors (Activity,
+//!     conversation, threads, files, clipboard, and document sessions) are folded
+//!     for the focused channel instead of every channel on first open; fleet-wide
+//!     rollups and the call bar still fold globally. It is a **pure renderer** over
+//!     the worker's read-model: the shell never depends on the mackesd collab
+//!     worker crate — the Bus JSON is the seam (the same discipline as `chat.rs`).
 //!   * [`CommunicationsState`] owns the surface + the data source, refreshes the
 //!     fold on a poll cadence while in view, and drains the surface's emitted
 //!     commands onto `action/collab/<verb>` ([`topics::command_topic_for`]) so the
@@ -90,9 +91,11 @@ pub(crate) struct LiveCollabData {
     now_unix_ms: i64,
     /// The rail directory (folded from `state/collab/directory`).
     directory: SpaceDirectory,
-    /// Per-space Activity feeds, keyed `Some(space)` to match the surface's
-    /// `data.activity(self.selected_space())` read (folded from
-    /// `state/collab/activity/<space>`).
+    /// Activity feeds currently folded for paint, keyed `Some(space)` to match
+    /// the surface's `data.activity(self.selected_space())` read (folded from
+    /// `state/collab/activity/<space>`). The shell intentionally keeps this to
+    /// the focused channel so opening Mesh Teams does not deserialize every
+    /// retained per-space Activity body on a modest seat.
     activity: HashMap<Option<SpaceId>, ActivityFeed>,
     /// Per-space conversation timelines (folded from
     /// `state/collab/conversation/<space>`).
@@ -155,19 +158,29 @@ impl LiveCollabData {
     /// Re-fold on the [`REFRESH`] cadence while the surface is in view, and keep
     /// the frame loop ticking so a worker republish surfaces without operator
     /// input (the `chat.rs` poll shape).
-    fn poll(&mut self, ctx: &egui::Context) {
+    fn poll(&mut self, ctx: &egui::Context, focus_space: Option<SpaceId>) {
         if self.last_poll.is_none_or(|t| t.elapsed() >= REFRESH) {
             self.last_poll = Some(Instant::now());
-            self.refresh();
+            self.refresh_for(focus_space);
             ctx.request_repaint_after(REFRESH);
         }
     }
 
     /// Fold the retained `state/collab/*` mirrors into the owned projections. Opens
     /// the spool fail-soft: no spool / an unopenable store clears to the honest
-    /// off-mesh empty state (§7). The `directory` names the spaces; each space's
-    /// per-space projections are then read off the one open handle.
+    /// off-mesh empty state (§7). The `directory` names the spaces and
+    /// [`refresh_for`](Self::refresh_for) chooses which channel's heavy
+    /// per-space projections are read from the one open handle.
     fn refresh(&mut self) {
+        self.refresh_for(None);
+    }
+
+    /// Fold the retained `state/collab/*` mirrors into the owned projections for
+    /// the currently focused channel. This is the seat .15 open-path guard: the
+    /// directory and global rollups stay live, but expensive per-space bodies are
+    /// read only for the selected channel (or the first directory row before the
+    /// first UI frame has selected one).
+    fn refresh_for(&mut self, focus_space: Option<SpaceId>) {
         self.now_unix_ms = now_unix_ms();
         let Some(persist) = self.reader.open() else {
             self.directory = SpaceDirectory::default();
@@ -188,6 +201,14 @@ impl LiveCollabData {
         self.directory =
             read_state(&persist, &topics::state_topic(proj::SPACE_DIRECTORY)).unwrap_or_default();
         self.read_cursors = read_state(&persist, LOCAL_READ_CURSORS_TOPIC).unwrap_or_default();
+        let focus_space = focus_space
+            .filter(|candidate| {
+                self.directory
+                    .spaces
+                    .iter()
+                    .any(|summary| summary.id == *candidate)
+            })
+            .or_else(|| self.directory.spaces.first().map(|summary| summary.id));
 
         let mut activity = HashMap::new();
         let mut conversations = HashMap::new();
@@ -199,42 +220,44 @@ impl LiveCollabData {
         let mut document_sessions = HashMap::new();
         for summary in &self.directory.spaces {
             let space = summary.id;
-            if let Some(feed) = read_state::<ActivityFeed>(
-                &persist,
-                &topics::space_state_topic(proj::ACTIVITY, space),
-            ) {
-                activity.insert(Some(space), feed);
-            }
-            if let Some(convo) = read_state::<ConversationTimeline>(
-                &persist,
-                &topics::space_state_topic(proj::CONVERSATION, space),
-            ) {
-                conversations.insert(space, convo);
-            }
-            if let Some(thread) = read_state::<ThreadTimeline>(
-                &persist,
-                &topics::space_state_topic(proj::THREAD, space),
-            ) {
-                thread_roots.insert((thread.space, thread.root.event_id), thread.thread);
-                threads.insert(thread.thread, thread);
-            }
-            if let Some(files) = read_state::<FileReferences>(
-                &persist,
-                &topics::space_state_topic(proj::FILE_REFERENCES, space),
-            ) {
-                file_references.insert(space, files);
-            }
-            if let Some(clipboard) = read_state::<ClipboardLane>(
-                &persist,
-                &topics::space_state_topic(proj::CLIPBOARD_LANE, space),
-            ) {
-                clipboard_lanes.insert(space, clipboard);
-            }
-            if let Some(sessions) = read_state::<DocumentSessions>(
-                &persist,
-                &topics::space_state_topic(proj::DOCUMENT_SESSIONS, space),
-            ) {
-                document_sessions.insert(space, sessions);
+            if Some(space) == focus_space {
+                if let Some(feed) = read_state::<ActivityFeed>(
+                    &persist,
+                    &topics::space_state_topic(proj::ACTIVITY, space),
+                ) {
+                    activity.insert(Some(space), feed);
+                }
+                if let Some(convo) = read_state::<ConversationTimeline>(
+                    &persist,
+                    &topics::space_state_topic(proj::CONVERSATION, space),
+                ) {
+                    conversations.insert(space, convo);
+                }
+                if let Some(thread) = read_state::<ThreadTimeline>(
+                    &persist,
+                    &topics::space_state_topic(proj::THREAD, space),
+                ) {
+                    thread_roots.insert((thread.space, thread.root.event_id), thread.thread);
+                    threads.insert(thread.thread, thread);
+                }
+                if let Some(files) = read_state::<FileReferences>(
+                    &persist,
+                    &topics::space_state_topic(proj::FILE_REFERENCES, space),
+                ) {
+                    file_references.insert(space, files);
+                }
+                if let Some(clipboard) = read_state::<ClipboardLane>(
+                    &persist,
+                    &topics::space_state_topic(proj::CLIPBOARD_LANE, space),
+                ) {
+                    clipboard_lanes.insert(space, clipboard);
+                }
+                if let Some(sessions) = read_state::<DocumentSessions>(
+                    &persist,
+                    &topics::space_state_topic(proj::DOCUMENT_SESSIONS, space),
+                ) {
+                    document_sessions.insert(space, sessions);
+                }
             }
             if let Some(calls) = read_state::<CallState>(
                 &persist,
@@ -260,7 +283,7 @@ impl LiveCollabData {
                         .count()
                         .min(u32::MAX as usize) as u32
                 })
-                .unwrap_or(0);
+                .unwrap_or_else(|| if summary.last_activity > cursor { 1 } else { 0 });
         }
         let transfer_jobs =
             read_state::<TransferJobs>(&persist, &topics::state_topic(proj::TRANSFER_JOBS));
@@ -417,7 +440,7 @@ impl CommunicationsState {
     /// Re-fold the `state/collab/*` mirrors on the poll cadence (the shell calls
     /// this while Communications is the surface in view).
     pub(crate) fn poll(&mut self, ctx: &egui::Context) {
-        self.data.poll(ctx);
+        self.data.poll(ctx, self.surface.selected_space());
     }
 
     /// Render the surface and route the frame's emitted commands. The widget reads
@@ -426,7 +449,13 @@ impl CommunicationsState {
     /// `action/collab/<verb>` so the collab worker applies it.
     pub(crate) fn show(&mut self, ui: &mut egui::Ui) {
         let mut sink = CommandSink::new();
+        let selected_before = self.surface.selected_space();
         self.surface.ui(ui, &self.data, &mut sink);
+        let selected_after = self.surface.selected_space();
+        if selected_after != selected_before {
+            self.data.refresh_for(selected_after);
+            ui.ctx().request_repaint();
+        }
         if let Some(space) = self.surface.selected_space() {
             self.data.mark_space_read(space);
         }
@@ -699,6 +728,97 @@ mod tests {
         assert!(data.thread(SpaceId::new(), ThreadId::new()).is_none());
         assert!(data.transfer_jobs().is_none());
         assert!(data.alert_inbox().is_none());
+    }
+
+    #[test]
+    fn first_open_folds_only_the_focused_channel_activity_body() {
+        // Seat .15 regression guard: opening Mesh Teams should not deserialize
+        // every retained channel Activity body before the first frame can paint.
+        // The focused channel still folds exactly; the non-focused channel keeps
+        // an attention badge derived from the directory clock until selected.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let persist = persist_at(dir.path());
+        let focused = SpaceId::new();
+        let noisy = SpaceId::new();
+        let peer = ActorId::new("falcon");
+
+        write_state(
+            &persist,
+            &topics::state_topic(proj::SPACE_DIRECTORY),
+            &SpaceDirectory {
+                spaces: vec![
+                    space_summary(focused, "Focused Ops"),
+                    space_summary(noisy, "Noisy Ops"),
+                ],
+            },
+        );
+        write_state(
+            &persist,
+            &topics::space_state_topic(proj::ACTIVITY, focused),
+            &ActivityFeed {
+                space: Some(focused),
+                entries: vec![
+                    activity_entry(focused, &peer, 1_000),
+                    activity_entry(focused, &peer, 1_001),
+                ],
+            },
+        );
+        write_state(
+            &persist,
+            &topics::space_state_topic(proj::ACTIVITY, noisy),
+            &ActivityFeed {
+                space: Some(noisy),
+                entries: (0..2_000)
+                    .map(|index| activity_entry(noisy, &peer, 2_000 + index))
+                    .collect(),
+            },
+        );
+        write_state(
+            &persist,
+            &topics::space_state_topic(proj::CONVERSATION, noisy),
+            &ConversationTimeline {
+                space: noisy,
+                thread: None,
+                messages: vec![message(&peer, "not on the first-open path")],
+            },
+        );
+
+        let mut data = LiveCollabData::new(Some(dir.path().to_path_buf()));
+        data.refresh_for(Some(focused));
+
+        assert_eq!(
+            data.activity(Some(focused))
+                .expect("focused activity folded")
+                .entries
+                .len(),
+            2,
+            "the focused channel keeps its exact unread/activity feed"
+        );
+        assert!(
+            data.activity(Some(noisy)).is_none(),
+            "a non-focused channel's retained Activity body must not be deserialized on open"
+        );
+        assert!(
+            data.conversation(noisy).is_none(),
+            "non-focused heavy per-space mirrors stay out of the first-open fold"
+        );
+        let focused_row = data
+            .space_directory()
+            .spaces
+            .iter()
+            .find(|summary| summary.id == focused)
+            .expect("focused row");
+        let noisy_row = data
+            .space_directory()
+            .spaces
+            .iter()
+            .find(|summary| summary.id == noisy)
+            .expect("noisy row");
+        assert_eq!(focused_row.unread, 2);
+        assert_eq!(
+            noisy_row.unread, 1,
+            "unfocused rows keep a cheap attention badge from the directory clock"
+        );
     }
 
     #[test]

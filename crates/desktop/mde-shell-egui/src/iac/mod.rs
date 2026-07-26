@@ -585,6 +585,67 @@ impl WorkloadSort {
     }
 }
 
+/// Which lifecycle route owns a resource table render. Keeping this separate
+/// from [`WorkloadsRoute`] lets the table expose route-specific action policy
+/// while sharing the same dense, sortable rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResourceTableMode {
+    /// Plan review: inspect sorted resources before a dry-run/apply.
+    Plan,
+    /// Run review: live day-2 controls for the filtered resources.
+    Run,
+    /// Drift review: desired-vs-actual signals and reconciliation dry-runs.
+    Drift,
+}
+
+impl ResourceTableMode {
+    const fn heading(self) -> &'static str {
+        match self {
+            Self::Plan => "Plan resource table",
+            Self::Run => "Run resource table",
+            Self::Drift => "Drift resource table",
+        }
+    }
+
+    const fn summary(self) -> &'static str {
+        match self {
+            Self::Plan => {
+                "Inspect filtered resources before publishing a dry-run plan or opening a review sheet."
+            }
+            Self::Run => {
+                "Operate filtered resources directly from dense rows; every live action opens review before publish."
+            }
+            Self::Drift => {
+                "Scan desired-vs-actual state first; row actions request node-scoped plans, never a blind apply."
+            }
+        }
+    }
+
+    const fn action_header(self) -> &'static str {
+        match self {
+            Self::Plan => "Plan Actions",
+            Self::Run => "Run Actions",
+            Self::Drift => "Drift Actions",
+        }
+    }
+
+    const fn empty_title(self) -> &'static str {
+        match self {
+            Self::Plan => "No plan rows for this filter",
+            Self::Run => "No run targets for this filter",
+            Self::Drift => "No drift rows for this filter",
+        }
+    }
+
+    const fn preview_word(self) -> &'static str {
+        match self {
+            Self::Plan => "Plan",
+            Self::Run => "Run",
+            Self::Drift => "Drift",
+        }
+    }
+}
+
 // ─────────────────────────────── the Bus reply ──────────────────────────────
 
 /// The shell-side mirror of the worker's `CloudReply` for an `action/cloud/*`
@@ -1833,13 +1894,19 @@ fn route_body(ui: &mut egui::Ui, state: &mut WorkloadsState) {
             provision_form::provision_form(ui, state);
         }
         WorkloadsRoute::Plan => {
-            filtered_resource_route(ui, state);
+            lifecycle_resource_route(ui, state, ResourceTableMode::Plan);
         }
         WorkloadsRoute::Run => {
             shared_placement_selector(ui, state);
+            lifecycle_resource_route(ui, state, ResourceTableMode::Run);
+            ui.add_space(Style::SP_S);
             configure::configure_panel(ui, state);
         }
-        WorkloadsRoute::Drift => status::status_panel(ui, state),
+        WorkloadsRoute::Drift => {
+            lifecycle_resource_route(ui, state, ResourceTableMode::Drift);
+            ui.add_space(Style::SP_S);
+            status::status_panel(ui, state);
+        }
         WorkloadsRoute::Audit => audit_route_panel(ui, state),
         WorkloadsRoute::Images => {
             shared_placement_selector(ui, state);
@@ -1934,45 +2001,59 @@ fn route_header(ui: &mut egui::Ui, route: WorkloadsRoute) {
     muted_note(ui, route.blurb());
 }
 
-fn filtered_resource_route(ui: &mut egui::Ui, state: &mut WorkloadsState) {
+fn lifecycle_resource_route(
+    ui: &mut egui::Ui,
+    state: &mut WorkloadsState,
+    mode: ResourceTableMode,
+) {
     mirror_summary(ui, state);
     ui.add_space(Style::SP_XS);
     muted_note(
         ui,
         format!(
-            "Showing {} resources as the current delivery filter. Row density: {} ({:.0}px).",
+            "{} · showing {} resources as the current delivery filter. Row density: {} ({:.0}px).",
+            mode.summary(),
             state.view.label(),
             state.density.label(),
             state.density.row_height()
         ),
     );
     ui.add_space(Style::SP_S);
-    plan_resource_table(ui, state);
-    console_section(ui, state);
+    resource_table(ui, state, mode);
+    if matches!(mode, ResourceTableMode::Plan | ResourceTableMode::Run) {
+        console_section(ui, state);
+    }
 }
 
-fn plan_resource_table(ui: &mut egui::Ui, state: &mut WorkloadsState) {
-    let rows = plan_resource_rows(state);
+fn resource_table(ui: &mut egui::Ui, state: &mut WorkloadsState, mode: ResourceTableMode) {
+    let rows = resource_rows(state);
     if rows.is_empty() {
         let message = format!(
             "No {} workloads are present in the folded state/cloud mirror.",
             state.view.label()
         );
-        crate::empty_state::show(ui, "No resources for this filter", &message);
+        crate::empty_state::show(ui, mode.empty_title(), &message);
         return;
     }
 
     card().show(ui, |ui| {
-        plan_table_header(ui, state);
+        ui.label(
+            RichText::new(mode.heading())
+                .size(Style::SMALL)
+                .strong()
+                .color(Style::TEXT_DIM),
+        );
+        ui.add_space(Style::SP_XS);
+        resource_table_header(ui, state, mode);
         ui.separator();
         ui.add_space(Style::SP_XS);
         for row in rows {
-            plan_table_row(ui, state, &row);
+            resource_table_row(ui, state, &row, mode);
         }
     });
 }
 
-fn plan_table_header(ui: &mut egui::Ui, state: &mut WorkloadsState) {
+fn resource_table_header(ui: &mut egui::Ui, state: &mut WorkloadsState, mode: ResourceTableMode) {
     let header_height = DensityMode::Compact.row_height();
     ui.horizontal(|ui| {
         ui.add_sized(
@@ -2002,7 +2083,7 @@ fn plan_table_header(ui: &mut egui::Ui, state: &mut WorkloadsState) {
         ui.add_sized(
             [188.0, header_height],
             egui::Label::new(
-                RichText::new("Actions")
+                RichText::new(mode.action_header())
                     .size(Style::SMALL)
                     .color(Style::TEXT_DIM),
             ),
@@ -2010,7 +2091,12 @@ fn plan_table_header(ui: &mut egui::Ui, state: &mut WorkloadsState) {
     });
 }
 
-fn plan_table_row(ui: &mut egui::Ui, state: &mut WorkloadsState, row: &WorkloadRow) {
+fn resource_table_row(
+    ui: &mut egui::Ui,
+    state: &mut WorkloadsState,
+    row: &WorkloadRow,
+    mode: ResourceTableMode,
+) {
     let key = plan_resource_key(row);
     let expanded = state.expanded_resource.as_deref() == Some(key.as_str());
     let row_height = state.density.row_height();
@@ -2075,10 +2161,10 @@ fn plan_table_row(ui: &mut egui::Ui, state: &mut WorkloadsState, row: &WorkloadR
             row_height,
             drift_tone(row.drift),
         );
-        plan_row_actions(ui, state, row);
+        resource_row_actions(ui, state, row, mode);
     });
     if expanded {
-        plan_expanded_row(ui, state, row);
+        plan_expanded_row(ui, state, row, mode);
     }
     ui.add_space(Style::SP_XS);
 }
@@ -2090,7 +2176,29 @@ fn plan_cell(ui: &mut egui::Ui, text: &str, width: f32, height: f32, color: Colo
     );
 }
 
-fn plan_row_actions(ui: &mut egui::Ui, state: &mut WorkloadsState, row: &WorkloadRow) {
+fn resource_row_actions(
+    ui: &mut egui::Ui,
+    state: &mut WorkloadsState,
+    row: &WorkloadRow,
+    mode: ResourceTableMode,
+) {
+    if mode == ResourceTableMode::Drift {
+        ui.horizontal(|ui| {
+            if row_button(ui, "Plan node", false).clicked() {
+                let body = node_request_body(&row.node);
+                state.issue(
+                    VERB_PLAN,
+                    Some(&body),
+                    &format!("drift plan for {}", row.name),
+                );
+            }
+            if row_button(ui, "Details", false).clicked() {
+                state.toggle_expanded_resource(plan_resource_key(row));
+            }
+        });
+        return;
+    }
+
     ui.horizontal(|ui| match row.delivery_type {
         DeliveryType::ServiceContainer => {
             if row_button(ui, "Restart", false).clicked() {
@@ -2135,7 +2243,12 @@ fn vm_lifecycle_actions(
     }
 }
 
-fn plan_expanded_row(ui: &mut egui::Ui, state: &WorkloadsState, row: &WorkloadRow) {
+fn plan_expanded_row(
+    ui: &mut egui::Ui,
+    state: &WorkloadsState,
+    row: &WorkloadRow,
+    mode: ResourceTableMode,
+) {
     egui::Frame::group(ui.style())
         .fill(Style::SURFACE_HI)
         .stroke(egui::Stroke::new(Style::STROKE_HAIRLINE, Style::BORDER))
@@ -2184,9 +2297,10 @@ fn plan_expanded_row(ui: &mut egui::Ui, state: &WorkloadsState, row: &WorkloadRo
             muted_note(
                 ui,
                 format!(
-                    "Command preview: row actions publish typed Bus lifecycle requests with \
-                     node=`{}` and target=`{}`. Destructive actions require the exact `{}` echo \
-                     before anything is sent; current table density is {}.",
+                    "Command preview \u{2014} {}: row actions publish typed Bus requests with \
+                     node=`{}` and target=`{}`. Live actions require the exact `{}` echo before \
+                     anything is sent; current table density is {}.",
+                    mode.preview_word(),
                     row.node,
                     row.name,
                     row.name,
@@ -2209,6 +2323,10 @@ fn column_width(column: WorkloadSortColumn) -> f32 {
 }
 
 fn plan_resource_rows(state: &WorkloadsState) -> Vec<WorkloadRow> {
+    resource_rows(state)
+}
+
+fn resource_rows(state: &WorkloadsState) -> Vec<WorkloadRow> {
     let mut rows: Vec<WorkloadRow> = state.workloads_of(state.view).cloned().collect();
     let sort = state.resource_sort;
     rows.sort_by(|a, b| {

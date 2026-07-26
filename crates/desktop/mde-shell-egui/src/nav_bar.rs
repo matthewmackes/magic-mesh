@@ -1,8 +1,9 @@
 //! The Construct Springboard Dock: persistent shell navigation plus chooser pins.
 //!
 //! The dock is shell-owned and always reserves its footprint. In the default
-//! bottom-left placement it is a solid-black springboard pill; Pin moves it into
-//! the 56px left rail that the central layout reserves below the top strip.
+//! bottom placement it is a solid-black, bottom-centered springboard pill; Pin
+//! moves it into the 56px left rail that the central layout reserves below the
+//! top strip.
 //! Placement is persisted per seat, while the visual transition is kept in
 //! memory so a restart never waits on animation state. Chooser-pinned remote
 //! desktop sources are rendered as additional dock targets from the chooser's
@@ -69,7 +70,7 @@ pub(crate) enum Action {
 /// The persisted placement choice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum DockMode {
-    /// The undocked bottom-left pill.
+    /// The undocked bottom-centered pill.
     #[serde(rename = "floating")]
     Floating,
     /// The reserved left rail below the status bar.
@@ -371,7 +372,7 @@ impl State {
             };
         }
         if transition.from == DockMode::Floating && transition.to == DockMode::Docked {
-            let staging = translate_geometry(&floating, egui::vec2(-FLOATING_MARGIN, 0.0));
+            let staging = floating_left_edge_staging(screen, &floating);
             if raw < SLIDE_FRACTION {
                 let t = smoothstep(raw / SLIDE_FRACTION);
                 return interpolate_geometry(&floating, &staging, t, false);
@@ -379,7 +380,7 @@ impl State {
             let t = smoothstep((raw - SLIDE_FRACTION) / (1.0 - SLIDE_FRACTION));
             return interpolate_geometry(&staging, &docked, t, false);
         }
-        let staging = translate_geometry(&floating, egui::vec2(-FLOATING_MARGIN, 0.0));
+        let staging = floating_left_edge_staging(screen, &floating);
         if raw < 1.0 - SLIDE_FRACTION {
             let t = smoothstep(raw / (1.0 - SLIDE_FRACTION));
             interpolate_geometry(&docked, &staging, t, false)
@@ -566,53 +567,55 @@ fn control_span(count: usize, gap: f32) -> f32 {
     }
 }
 
-fn docked_pinned_start_y(screen: egui::Rect) -> f32 {
-    let base_gap = Style::SP_XS;
-    let label_h = TypographyRole::Caption.line_height().ceil();
-    let mut y = screen.top() + STATUS_BAR_H + Style::SP_S;
-    y += control_span(3, base_gap) + Style::SP_S;
-    for group in DOCK_LAUNCHER_GROUPS {
-        y += label_h + Style::SP_XS;
-        y += control_span(group.surfaces.len(), base_gap) + Style::SP_S;
+fn effective_floating_pinned_count(screen: egui::Rect, requested: usize, gap: f32) -> usize {
+    let max_width = floating_available_width(screen);
+    let base = floating_content_width(0, gap);
+    let remaining = max_width - base - Style::SP_S;
+    if remaining < CONTROL_EDGE {
+        return 0;
     }
-    y
-}
-
-fn effective_pinned_count(screen: egui::Rect, requested: usize) -> usize {
-    let remaining = (screen.bottom() - Style::SP_S - docked_pinned_start_y(screen)).max(0.0);
-    let step = CONTROL_EDGE + Style::SP_XS;
-    let capacity = ((remaining + Style::SP_XS) / step).floor().max(0.0) as usize;
+    let capacity = ((remaining + gap) / (CONTROL_EDGE + gap)).floor().max(0.0) as usize;
     requested.min(capacity)
 }
 
-fn floating_geometry_for(screen: egui::Rect, pinned_count: usize) -> Geometry {
-    let gap = 4.0;
-    let pinned_count = effective_pinned_count(screen, pinned_count);
-    let base_w = control_span(3, gap);
-    let group_w: f32 = DOCK_LAUNCHER_GROUPS
+fn floating_available_width(screen: egui::Rect) -> f32 {
+    (screen.width() - 2.0 * FLOATING_MARGIN).max(1.0)
+}
+
+fn floating_group_width(gap: f32) -> f32 {
+    DOCK_LAUNCHER_GROUPS
         .iter()
         .map(|group| control_span(group.surfaces.len(), gap))
         .sum::<f32>()
-        + (DOCK_LAUNCHER_GROUPS.len().saturating_sub(1) as f32 * Style::SP_S);
+        + (DOCK_LAUNCHER_GROUPS.len().saturating_sub(1) as f32 * Style::SP_S)
+}
+
+fn floating_content_width(pinned_count: usize, gap: f32) -> f32 {
+    let base_w = control_span(3, gap);
     let pinned_w = control_span(pinned_count, gap);
-    let content_w = base_w
+    base_w
         + Style::SP_S
-        + group_w
+        + floating_group_width(gap)
         + if pinned_count > 0 {
             Style::SP_S + pinned_w
         } else {
             0.0
-        };
-    let width = FLOATING_W.max(content_w + Style::SP_L * 2.0);
+        }
+        + Style::SP_L * 2.0
+}
+
+fn floating_geometry_for(screen: egui::Rect, pinned_count: usize) -> Geometry {
+    let gap = 4.0;
+    let pinned_count = effective_floating_pinned_count(screen, pinned_count, gap);
+    let width = FLOATING_W
+        .max(floating_content_width(pinned_count, gap))
+        .min(floating_available_width(screen));
     let outer = egui::Rect::from_min_size(
         egui::pos2(
-            screen.left() + FLOATING_MARGIN,
+            screen.center().x - width / 2.0,
             screen.bottom() - FLOATING_MARGIN - FLOATING_H,
         ),
-        egui::vec2(
-            width.min((screen.width() - 2.0 * FLOATING_MARGIN).max(1.0)),
-            FLOATING_H,
-        ),
+        egui::vec2(width, FLOATING_H),
     );
     let first_x = outer.left() + Style::SP_L;
     let y = outer.bottom() - Style::SP_S - CONTROL_EDGE;
@@ -684,13 +687,32 @@ fn floating_geometry_for(screen: egui::Rect, pinned_count: usize) -> Geometry {
     }
 }
 
+fn floating_left_edge_staging(screen: egui::Rect, floating: &Geometry) -> Geometry {
+    translate_geometry(
+        floating,
+        egui::vec2(screen.left() - floating.outer.left(), 0.0),
+    )
+}
+
 fn docked_geometry(screen: egui::Rect) -> Geometry {
     docked_geometry_for(screen, 0)
 }
 
+fn docked_content_bottom(screen: egui::Rect) -> f32 {
+    screen.bottom() - Style::SP_S
+}
+
+fn docked_control_fits(screen: egui::Rect, cursor_y: f32) -> bool {
+    cursor_y + CONTROL_EDGE <= docked_content_bottom(screen)
+}
+
+fn docked_group_fits_one_control(screen: egui::Rect, cursor_y: f32, label_h: f32) -> bool {
+    cursor_y + label_h + Style::SP_XS + CONTROL_EDGE <= docked_content_bottom(screen)
+}
+
 fn docked_geometry_for(screen: egui::Rect, pinned_count: usize) -> Geometry {
     let outer = egui::Rect::from_min_size(screen.left_top(), egui::vec2(DOCKED_W, screen.height()));
-    let pinned_count = effective_pinned_count(screen, pinned_count);
+    let pinned_count = pinned_count.min(MAX_PINNED_SOURCES);
     let mut controls = Vec::with_capacity(dock_control_capacity(pinned_count));
     let mut group_labels = Vec::with_capacity(DOCK_LAUNCHER_GROUPS.len());
     let mut cursor_y = screen.top() + STATUS_BAR_H + Style::SP_S;
@@ -709,6 +731,9 @@ fn docked_geometry_for(screen: egui::Rect, pinned_count: usize) -> Geometry {
     }
     cursor_y += Style::SP_S - Style::SP_XS;
     for group in DOCK_LAUNCHER_GROUPS {
+        if !docked_group_fits_one_control(screen, cursor_y, label_h) {
+            break;
+        }
         group_labels.push(GroupLabel {
             label: group.label,
             rect: egui::Rect::from_min_max(
@@ -719,6 +744,9 @@ fn docked_geometry_for(screen: egui::Rect, pinned_count: usize) -> Geometry {
         });
         cursor_y += label_h + Style::SP_XS;
         for surface in group.surfaces {
+            if !docked_control_fits(screen, cursor_y) {
+                break;
+            }
             controls.push(Control {
                 kind: ControlKind::SurfaceLauncher,
                 rect: egui::Rect::from_min_size(
@@ -733,6 +761,9 @@ fn docked_geometry_for(screen: egui::Rect, pinned_count: usize) -> Geometry {
         cursor_y += Style::SP_S - Style::SP_XS;
     }
     for source_index in 0..pinned_count {
+        if !docked_control_fits(screen, cursor_y) {
+            break;
+        }
         controls.push(Control {
             kind: ControlKind::PinnedDesktop,
             rect: egui::Rect::from_min_size(
@@ -1193,6 +1224,7 @@ mod tests {
         let floating = floating_geometry(screen);
         let docked = docked_geometry(screen);
         assert_eq!(floating.outer.size(), egui::vec2(FLOATING_W, FLOATING_H));
+        assert_eq!(floating.outer.center().x, screen.center().x);
         assert_eq!(docked.outer.width(), DOCKED_W);
         assert_eq!(docked.outer.top(), screen.top());
         assert_eq!(docked.controls[0].rect.top(), STATUS_BAR_H + Style::SP_S);
@@ -1202,10 +1234,58 @@ mod tests {
     }
 
     #[test]
+    fn floating_dock_is_bottom_centered_and_caps_pins_to_available_width() {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let geometry = floating_geometry_for(screen, MAX_PINNED_SOURCES);
+
+        assert!(geometry.outer.left() >= screen.left() + FLOATING_MARGIN);
+        assert!(geometry.outer.right() <= screen.right() - FLOATING_MARGIN);
+        assert_eq!(geometry.outer.center().x, screen.center().x);
+        assert!(
+            geometry
+                .controls
+                .iter()
+                .filter(|control| control.kind == ControlKind::PinnedDesktop)
+                .count()
+                < MAX_PINNED_SOURCES,
+            "bottom dock must drop excess chooser pins instead of painting controls past the pill"
+        );
+        assert_hit_targets_inside_backing("floating narrow screen".to_string(), &geometry);
+    }
+
+    #[test]
+    fn docked_rail_drops_launcher_overflow_on_short_screens() {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let geometry = docked_geometry_for(screen, MAX_PINNED_SOURCES);
+
+        assert_eq!(
+            geometry
+                .controls
+                .iter()
+                .take(3)
+                .map(|control| control.kind)
+                .collect::<Vec<_>>(),
+            vec![ControlKind::Back, ControlKind::Home, ControlKind::Pin],
+            "rail safety controls must remain first even when app launchers overflow"
+        );
+        assert!(
+            geometry
+                .controls
+                .iter()
+                .filter(|control| control.kind == ControlKind::SurfaceLauncher)
+                .count()
+                < dock_launcher_count(),
+            "short vertical rails must omit lower-priority app launchers instead of painting below the rail"
+        );
+        assert_hit_targets_inside_backing("docked narrow screen".to_string(), &geometry);
+    }
+
+    #[test]
     fn hit_targets_stay_inside_the_painted_navigation_chrome() {
         let screens = [
             egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0)),
             egui::Rect::from_min_size(egui::pos2(73.0, 41.0), egui::vec2(1280.0, 800.0)),
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)),
         ];
         let pinned_counts = [0, 1, MAX_PINNED_SOURCES];
         let transition_offsets = [
@@ -2123,8 +2203,8 @@ mod tests {
 
         assert_eq!(
             floating.outer,
-            egui::Rect::from_min_max(egui::pos2(16.0, 704.0), egui::pos2(656.0, 784.0)),
-            "undocked navigation must be a fixed bottom-left pill"
+            egui::Rect::from_min_max(egui::pos2(320.0, 704.0), egui::pos2(960.0, 784.0)),
+            "undocked navigation must be a bottom-centered pill"
         );
         assert_eq!(
             floating.radius,

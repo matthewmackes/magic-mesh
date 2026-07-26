@@ -18,6 +18,7 @@ pub const MISSING_HINT: &str =
 
 /// Stored Airsonic credentials.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Creds {
     /// Base server URL, e.g. `http://airsonic.anvil.mesh:4040`.
     pub server_url: String,
@@ -36,6 +37,8 @@ pub enum CredsError {
     Io(std::io::Error),
     /// The file exists but isn't valid creds JSON.
     Parse(serde_json::Error),
+    /// The file parsed but cannot anchor a real Subsonic/AirSonic session.
+    Invalid(String),
 }
 
 impl std::fmt::Display for CredsError {
@@ -44,6 +47,7 @@ impl std::fmt::Display for CredsError {
             Self::Missing(p) => write!(f, "{MISSING_HINT} (looked at {})", p.display()),
             Self::Io(e) => write!(f, "mde-musicd: reading airsonic creds: {e}"),
             Self::Parse(e) => write!(f, "mde-musicd: airsonic creds malformed: {e}"),
+            Self::Invalid(e) => write!(f, "mde-musicd: airsonic creds invalid: {e}"),
         }
     }
 }
@@ -65,7 +69,11 @@ pub fn default_path() -> PathBuf {
 /// [`CredsError::Missing`] when absent, `Io`/`Parse` otherwise.
 pub fn load_from(path: &Path) -> Result<Creds, CredsError> {
     match std::fs::read_to_string(path) {
-        Ok(s) => serde_json::from_str(&s).map_err(CredsError::Parse),
+        Ok(s) => {
+            let creds: Creds = serde_json::from_str(&s).map_err(CredsError::Parse)?;
+            validate(&creds)?;
+            Ok(creds)
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             Err(CredsError::Missing(path.to_path_buf()))
         }
@@ -87,9 +95,41 @@ pub fn load() -> Result<Creds, CredsError> {
 #[must_use]
 pub fn is_valid(server_url: &str, username: &str) -> bool {
     let url = server_url.trim();
-    !username.trim().is_empty()
-        && (url.starts_with("http://") || url.starts_with("https://"))
-        && url.len() > "https://".len()
+    !username.trim().is_empty() && valid_http_base_url(url)
+}
+
+/// Minimal validation for a configured Subsonic base URL. Pathful gateway proxy
+/// bases are valid; credential/userinfo, query strings, fragments, whitespace,
+/// and empty authorities are not.
+fn valid_http_base_url(url: &str) -> bool {
+    if url.is_empty() || url.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
+    if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") {
+        return false;
+    }
+    if rest.contains('@') || rest.contains('?') || rest.contains('#') {
+        return false;
+    }
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    !authority.is_empty() && !authority.starts_with(':')
+}
+
+/// Validate parsed credentials before callers build a long-lived client/session.
+/// This keeps a malformed or stale materialized file from silently becoming an
+/// unusable Subsonic session anchor.
+fn validate(creds: &Creds) -> Result<(), CredsError> {
+    if is_valid(&creds.server_url, &creds.username) {
+        Ok(())
+    } else {
+        Err(CredsError::Invalid(
+            "server_url must be an http(s) URL and username must be non-empty".to_string(),
+        ))
+    }
 }
 
 /// Write `creds` to `path` (creating the parent dir), pretty-printed.
@@ -160,6 +200,36 @@ mod tests {
     }
 
     #[test]
+    fn unknown_fields_are_rejected_before_session_build() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("extra.json");
+        std::fs::write(
+            &p,
+            r#"{"server_url":"http://gateway.mesh:4040/mde/airsonic/src","username":"alice","password":"sesame","demo":true}"#,
+        )
+        .unwrap();
+        assert!(matches!(load_from(&p), Err(CredsError::Parse(_))));
+    }
+
+    #[test]
+    fn invalid_session_anchor_is_rejected() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("invalid.json");
+        std::fs::write(
+            &p,
+            r#"{"server_url":"airsonic.mesh:4040","username":"alice","password":"sesame"}"#,
+        )
+        .unwrap();
+        assert!(matches!(load_from(&p), Err(CredsError::Invalid(_))));
+        std::fs::write(
+            &p,
+            r#"{"server_url":"http://gateway.mesh:4040/mde/airsonic/src","username":"  ","password":"sesame"}"#,
+        )
+        .unwrap();
+        assert!(matches!(load_from(&p), Err(CredsError::Invalid(_))));
+    }
+
+    #[test]
     fn default_path_is_under_mesh_data_dir() {
         std::env::set_var("HOME", "/home/tester");
         assert_eq!(
@@ -172,10 +242,18 @@ mod tests {
     fn is_valid_requires_http_url_and_username() {
         assert!(is_valid("http://airsonic.mesh:4040", "alice"));
         assert!(is_valid("https://music.example.com", "bob"));
+        assert!(is_valid(
+            "http://gateway.mesh:4040/mde/airsonic/source",
+            "alice"
+        ));
         // Empty password is allowed (open server).
         assert!(is_valid("http://h:4040", "u"));
         // Rejections.
         assert!(!is_valid("airsonic.mesh:4040", "alice")); // no scheme
+        assert!(!is_valid("http://alice@airsonic.mesh:4040", "alice")); // userinfo
+        assert!(!is_valid("http://air sonic.mesh:4040", "alice")); // whitespace
+        assert!(!is_valid("http://airsonic.mesh:4040?token=x", "alice")); // query
+        assert!(!is_valid("http://airsonic.mesh:4040#frag", "alice")); // fragment
         assert!(!is_valid("http://h", "")); // no username
         assert!(!is_valid("https://", "alice")); // scheme only
         assert!(!is_valid("", "alice"));

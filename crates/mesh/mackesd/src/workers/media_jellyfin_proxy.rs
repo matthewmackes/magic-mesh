@@ -40,6 +40,16 @@ pub const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8097";
 const MAX_HEADER_BYTES: usize = 32 * 1024;
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(30);
+const RESPONSE_HEADERS_TO_FORWARD: &[(&str, &str)] = &[
+    ("content-type", "Content-Type"),
+    ("content-length", "Content-Length"),
+    ("content-range", "Content-Range"),
+    ("accept-ranges", "Accept-Ranges"),
+    ("etag", "ETag"),
+    ("last-modified", "Last-Modified"),
+    ("cache-control", "Cache-Control"),
+    ("expires", "Expires"),
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedRequest {
@@ -389,14 +399,9 @@ async fn proxy_request(
         .await
         .map_err(|e| (502, format!("jellyfin upstream request failed: {e}")))?;
     let status = response.status();
-    let content_type = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/octet-stream")
-        .to_string();
+    let response_headers = response.headers().clone();
     let content_length = response.content_length();
-    let header = render_response_head(status, &content_type, content_length);
+    let header = render_response_head(status, &response_headers, content_length);
     stream
         .write_all(header.as_bytes())
         .await
@@ -420,21 +425,46 @@ async fn proxy_request(
 
 fn render_response_head(
     status: reqwest::StatusCode,
-    content_type: &str,
+    headers: &HeaderMap,
     content_length: Option<u64>,
 ) -> String {
     let reason = status.canonical_reason().unwrap_or("Status");
-    let mut out = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nConnection: close\r\n",
-        status.as_u16(),
-        reason,
-        content_type
-    );
-    if let Some(len) = content_length {
-        out.push_str(&format!("Content-Length: {len}\r\n"));
+    let mut out = format!("HTTP/1.1 {} {}\r\n", status.as_u16(), reason);
+    let mut wrote_content_type = false;
+    let mut wrote_content_length = false;
+    for (name, display_name) in RESPONSE_HEADERS_TO_FORWARD {
+        for value in headers.get_all(*name) {
+            let Some(value) = safe_response_header_value(value) else {
+                continue;
+            };
+            wrote_content_type |= *name == "content-type";
+            wrote_content_length |= *name == "content-length";
+            out.push_str(display_name);
+            out.push_str(": ");
+            out.push_str(value);
+            out.push_str("\r\n");
+        }
     }
+    if !wrote_content_type {
+        out.push_str("Content-Type: application/octet-stream\r\n");
+    }
+    if !wrote_content_length {
+        if let Some(len) = content_length {
+            out.push_str(&format!("Content-Length: {len}\r\n"));
+        }
+    }
+    out.push_str("Connection: close\r\n");
     out.push_str("\r\n");
     out
+}
+
+fn safe_response_header_value(value: &HeaderValue) -> Option<&str> {
+    let value = value.to_str().ok()?;
+    if value.contains(['\r', '\n']) {
+        None
+    } else {
+        Some(value)
+    }
 }
 
 async fn write_text_response(
@@ -749,6 +779,67 @@ mod tests {
         }
     }
 
+    async fn read_http_request_bytes(stream: &mut TcpStream) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let head_end = loop {
+            if let Some(pos) = find_header_end(&buf) {
+                break pos;
+            }
+            let mut chunk = [0u8; 1024];
+            let n = stream.read(&mut chunk).await.expect("read request");
+            assert_ne!(n, 0, "request ended before header terminator");
+            buf.extend_from_slice(&chunk[..n]);
+        };
+        let head = String::from_utf8_lossy(&buf[..head_end]);
+        let content_length = head
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("Content-Length"))
+            .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        let body_end = head_end + 4 + content_length;
+        while buf.len() < body_end {
+            let mut chunk = [0u8; 1024];
+            let n = stream.read(&mut chunk).await.expect("read request body");
+            assert_ne!(n, 0, "request ended before declared body");
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        buf.truncate(body_end);
+        buf
+    }
+
+    async fn proxy_response_for(
+        request: ParsedRequest,
+        route: GatewayRoute,
+        credential: GatewayCredential,
+    ) -> Vec<u8> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            response
+        });
+        let (mut gateway_stream, _) = listener.accept().await.unwrap();
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        proxy_request(&mut gateway_stream, &http, request, route, credential)
+            .await
+            .unwrap();
+        drop(gateway_stream);
+        client.await.unwrap()
+    }
+
+    fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+        head.lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.trim())
+    }
+
     fn source(
         gateway_node: &str,
         upstream_url: &str,
@@ -925,6 +1016,150 @@ mod tests {
         let auth = headers.get("authorization").unwrap().to_str().unwrap();
         assert!(auth.contains("Token=\"TOKENbad\""));
         assert!(!auth.contains("client-token"));
+    }
+
+    #[tokio::test]
+    async fn proxy_preserves_range_stream_status_headers_and_body() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let request = read_http_request_bytes(&mut stream).await;
+            let request_text = String::from_utf8_lossy(&request);
+            assert!(
+                request_text.starts_with(
+                    "GET /Videos/movie-1/stream?static=true&mediaSourceId=src-1 HTTP/1.1"
+                ),
+                "{request_text}"
+            );
+            let request_lower = request_text.to_ascii_lowercase();
+            assert!(request_lower.contains("\r\nrange: bytes=4-9\r\n"));
+            assert!(request_lower.contains("\r\nauthorization: mediabrowser "));
+            assert!(request_text.contains("Token=\"SERVER-TOKEN\""));
+            assert!(!request_text.contains("CLIENT-TOKEN"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 206 Partial Content\r\n\
+                      Content-Type: video/mp4\r\n\
+                      Content-Length: 6\r\n\
+                      Content-Range: bytes 4-9/20\r\n\
+                      Accept-Ranges: bytes\r\n\
+                      ETag: \"media-etag\"\r\n\
+                      Connection: close\r\n\
+                      \r\n\
+                      EFGHIJ",
+                )
+                .await
+                .unwrap();
+        });
+
+        let source = source(
+            "seat-15",
+            &format!("http://{upstream_addr}"),
+            GatewayHealth::Healthy,
+        );
+        let target = format!(
+            "/mde/jellyfin/{}/Videos/movie-1/stream?static=true&api_key=CLIENT-TOKEN&mediaSourceId=src-1",
+            source.id
+        );
+        let route = resolve_gateway_route(&target, &[source]).unwrap();
+        let response = proxy_response_for(
+            ParsedRequest {
+                method: "GET".to_string(),
+                target,
+                headers: vec![
+                    ("Host".to_string(), "seat-15.mesh:8097".to_string()),
+                    ("Authorization".to_string(), "client-token".to_string()),
+                    ("Range".to_string(), "bytes=4-9".to_string()),
+                    ("Accept".to_string(), "video/*".to_string()),
+                ],
+                body: Vec::new(),
+            },
+            route,
+            GatewayCredential {
+                access_token: "SERVER-TOKEN".to_string(),
+                user_id: Some("gateway-user".to_string()),
+            },
+        )
+        .await;
+        upstream_task.await.unwrap();
+
+        let head_end = find_header_end(&response).expect("response head");
+        let head = String::from_utf8_lossy(&response[..head_end]);
+        assert!(head.starts_with("HTTP/1.1 206 Partial Content"), "{head}");
+        assert_eq!(header_value(&head, "Content-Type"), Some("video/mp4"));
+        assert_eq!(header_value(&head, "Content-Length"), Some("6"));
+        assert_eq!(header_value(&head, "Content-Range"), Some("bytes 4-9/20"));
+        assert_eq!(header_value(&head, "Accept-Ranges"), Some("bytes"));
+        assert_eq!(header_value(&head, "ETag"), Some("\"media-etag\""));
+        assert_eq!(&response[head_end + 4..], b"EFGHIJ");
+    }
+
+    #[tokio::test]
+    async fn proxy_forwards_playback_progress_body_and_status_without_client_auth() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let request = read_http_request_bytes(&mut stream).await;
+            let head_end = find_header_end(&request).expect("request head");
+            let request_head = String::from_utf8_lossy(&request[..head_end]);
+            assert!(
+                request_head.starts_with("POST /Sessions/Playing/Progress HTTP/1.1"),
+                "{request_head}"
+            );
+            let request_lower = request_head.to_ascii_lowercase();
+            assert!(request_lower.contains("\r\ncontent-type: application/json\r\n"));
+            assert!(request_lower.contains("\r\nauthorization: mediabrowser "));
+            assert!(request_head.contains("Token=\"SERVER-TOKEN\""));
+            assert!(!request_head.contains("CLIENT-TOKEN"));
+            let body: serde_json::Value =
+                serde_json::from_slice(&request[head_end + 4..]).expect("progress body");
+            assert_eq!(body["UserId"], "gateway-user");
+            assert_eq!(body["ItemId"], "movie-1");
+            assert_eq!(body["PositionTicks"], 420_000_000_i64);
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+        });
+
+        let source = source(
+            "seat-15",
+            &format!("http://{upstream_addr}"),
+            GatewayHealth::Healthy,
+        );
+        let target = format!("/mde/jellyfin/{}/Sessions/Playing/Progress", source.id);
+        let route = resolve_gateway_route(&target, &[source]).unwrap();
+        let body = format!(
+            r#"{{"UserId":"{}","ItemId":"movie-1","PositionTicks":420000000}}"#,
+            JELLYFIN_GATEWAY_USER_SENTINEL
+        )
+        .into_bytes();
+        let response = proxy_response_for(
+            ParsedRequest {
+                method: "POST".to_string(),
+                target,
+                headers: vec![
+                    ("Authorization".to_string(), "CLIENT-TOKEN".to_string()),
+                    ("Content-Type".to_string(), "application/json".to_string()),
+                    ("Content-Length".to_string(), body.len().to_string()),
+                ],
+                body,
+            },
+            route,
+            GatewayCredential {
+                access_token: "SERVER-TOKEN".to_string(),
+                user_id: Some("gateway-user".to_string()),
+            },
+        )
+        .await;
+        upstream_task.await.unwrap();
+
+        let head_end = find_header_end(&response).expect("response head");
+        let head = String::from_utf8_lossy(&response[..head_end]);
+        assert!(head.starts_with("HTTP/1.1 204 No Content"), "{head}");
+        assert_eq!(&response[head_end + 4..], b"");
     }
 
     #[test]

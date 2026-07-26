@@ -8,6 +8,8 @@
 use mde_egui::egui;
 use mde_egui::Style;
 
+use std::ops::Range;
+
 use mde_collab_types::ActivityEntry;
 
 use crate::{icons, relative_age, ActivityFilter, CommunicationsSurface, MeshTeamsApp};
@@ -34,7 +36,7 @@ impl CommunicationsSurface {
         let filter = self.activity_filter();
         let now = data.now_unix_ms();
 
-        let admitted = filtered_activity_entries(entries, filter);
+        let admitted = activity_rows(entries, filter);
         if admitted.is_empty() {
             ui.label(
                 egui::RichText::new("No activity for this filter yet.").color(Style::TEXT_DIM),
@@ -45,7 +47,7 @@ impl CommunicationsSurface {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show_rows(ui, ACTIVITY_ROW_HEIGHT, admitted.len(), |ui, row_range| {
-                for entry in &admitted[row_range] {
+                for entry in admitted.range(row_range) {
                     activity_row(ui, entry, now);
                 }
             });
@@ -71,6 +73,71 @@ impl CommunicationsSurface {
                 ui.add_space(Style::SP_XS);
             }
         });
+    }
+}
+
+/// The rows admitted by the active Activity filter. The common first-open path
+/// is [`ActivityFilter::All`], so keep that as a borrowed slice instead of
+/// allocating a `Vec<&ActivityEntry>` for every retained row before
+/// [`ScrollArea::show_rows`](egui::ScrollArea::show_rows) virtualizes painting.
+pub(crate) enum ActivityRows<'a> {
+    All(&'a [ActivityEntry]),
+    Filtered(Vec<&'a ActivityEntry>),
+}
+
+impl<'a> ActivityRows<'a> {
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::All(entries) => entries.len(),
+            Self::Filtered(entries) => entries.len(),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn range(&self, row_range: Range<usize>) -> ActivityRowRange<'_, 'a> {
+        ActivityRowRange {
+            rows: self,
+            next: row_range.start,
+            end: row_range.end,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn uses_unfiltered_source(&self) -> bool {
+        matches!(self, Self::All(_))
+    }
+}
+
+pub(crate) struct ActivityRowRange<'rows, 'entry> {
+    rows: &'rows ActivityRows<'entry>,
+    next: usize,
+    end: usize,
+}
+
+impl<'rows, 'entry> Iterator for ActivityRowRange<'rows, 'entry> {
+    type Item = &'entry ActivityEntry;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next >= self.end {
+            return None;
+        }
+        let index = self.next;
+        self.next += 1;
+        match self.rows {
+            ActivityRows::All(entries) => entries.get(index),
+            ActivityRows::Filtered(entries) => entries.get(index).copied(),
+        }
+    }
+}
+
+pub(crate) fn activity_rows(entries: &[ActivityEntry], filter: ActivityFilter) -> ActivityRows<'_> {
+    if filter == ActivityFilter::All {
+        ActivityRows::All(entries)
+    } else {
+        ActivityRows::Filtered(filtered_activity_entries(entries, filter))
     }
 }
 

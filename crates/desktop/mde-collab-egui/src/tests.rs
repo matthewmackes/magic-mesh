@@ -21,7 +21,7 @@ use mde_collab_types::{
     TransferMethod, TransferState,
 };
 
-use crate::activity::filtered_activity_entries;
+use crate::activity::{activity_rows, filtered_activity_entries};
 use crate::fixture::{activity, message, space_summary, FixtureData};
 use crate::{
     amend_affordance, file_ref_of_path, ActivityFilter, AmendAffordance, ChannelTab, CollabData,
@@ -1396,6 +1396,32 @@ fn activity_body_filters_before_virtualized_rows() {
         "filtering builds the virtualized row set without requiring every feed row to paint"
     );
     assert!(alerts.iter().all(|entry| entry.kind_tag == "alert_raised"));
+}
+
+#[test]
+fn activity_all_filter_keeps_the_source_slice_for_first_open() {
+    let space = SpaceId::new();
+    let actor = ActorId::new("seat-15");
+    let entries = (0..2_000)
+        .map(|index| {
+            activity(
+                EventId::new(),
+                space,
+                &actor,
+                index,
+                "message_posted",
+                "seat 15 activity",
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let rows = activity_rows(&entries, ActivityFilter::All);
+
+    assert!(
+        rows.uses_unfiltered_source(),
+        "opening Activity on the default All filter must not build a per-row filter index"
+    );
+    assert_eq!(rows.len(), entries.len());
 }
 
 #[test]

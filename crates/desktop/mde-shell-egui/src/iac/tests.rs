@@ -370,6 +370,67 @@ fn expanded_plan_row_renders_metrics_drift_and_command_preview() {
 }
 
 #[test]
+fn run_route_uses_dense_resource_table_before_configure_lens() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut state = state_on(DeliveryView::DesktopVm, WorkloadsRoute::Run);
+    state.bus_root = Some(tmp.path().join("bus"));
+    let key = plan_resource_key(&state.states[0].workloads[0]);
+    state.toggle_expanded_resource(key);
+
+    let text = rendered_text(|ui| lifecycle_resource_route(ui, &mut state, ResourceTableMode::Run));
+
+    assert!(text.contains("Run resource table"), "{text}");
+    assert!(text.contains("Run Actions"), "{text}");
+    assert!(
+        text.contains("Command preview") && text.contains("Run:"),
+        "{text}"
+    );
+    assert!(text.contains("Console"), "{text}");
+    assert!(text.contains("seat-1"), "{text}");
+    assert_eq!(state.route(), WorkloadsRoute::Run);
+    assert_eq!(
+        emitted_request_count(&state, mackes_mesh_types::cloud::VERB_INVENTORY),
+        0,
+        "passive Run table render must not publish inventory reads"
+    );
+    assert_eq!(
+        emitted_request_count(&state, "configure"),
+        0,
+        "passive Run table render must not publish configure requests"
+    );
+}
+
+#[test]
+fn drift_route_uses_dense_resource_table_with_plan_only_row_actions() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut state = state_on(DeliveryView::DesktopVm, WorkloadsRoute::Drift);
+    state.bus_root = Some(tmp.path().join("bus"));
+    state.states[0].workloads[0].drift = DriftFlag::Drift;
+    let key = plan_resource_key(&state.states[0].workloads[0]);
+    state.toggle_expanded_resource(key);
+
+    let text = rendered_text(|ui| route_body(ui, &mut state));
+
+    assert!(text.contains("Drift resource table"), "{text}");
+    assert!(text.contains("Drift Actions"), "{text}");
+    assert!(
+        text.contains("Command preview") && text.contains("Drift:"),
+        "{text}"
+    );
+    assert!(text.contains("Plan node"), "{text}");
+    assert!(text.contains("Desired-state drift"), "{text}");
+    assert!(
+        !text.contains("Destroy"),
+        "Drift route must not expose live destructive row actions: {text}"
+    );
+    assert_eq!(
+        emitted_request_count(&state, VERB_PLAN),
+        0,
+        "passive Drift render must not publish a plan until the row action is clicked"
+    );
+}
+
+#[test]
 fn the_empty_mirror_reads_honestly_never_fabricated() {
     // No mirror published yet → honest empty routes, never fake.
     for route in [
