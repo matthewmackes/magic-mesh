@@ -259,6 +259,17 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-SEC-006 - Keep Nebula private keys local to their owning node
 
 - Status: Remaining
+- Progress (2026-07-26 patched F44 `.15` promotion): the SEC-006 hardening
+  commit `d5434309` is now installed on live
+  `.15`/`Basement-Test-Workstation` through Fedora 44 container-built RPMs.
+  Post-install proof shows `mackesd` active as PID `696940` with `NRestarts=0`,
+  `/proc/<pid>/exe -> /usr/bin/mackesd`, and binary sha256
+  `07b8f348195826dc0a9212078d46cb010fc71f61b44df6d041e02843263df27d`.
+  This proves the patched daemon is present on the primary proof seat; it does
+  **not** close SEC-006 by itself because no new patched rotation/blocklist
+  reload proof has yet shown the superseded cert fingerprint
+  `51c8f646ec57ecf946194c8aafa9a95e051c4bceebf09919b227e0b4f33f6901`
+  present in the rendered/reloaded blocklist.
 - Progress (2026-07-26 superseded-cert blocklist hardening): authenticated
   Nebula identity rotation now captures the previously active certificate,
   refuses to replace it without a local node id and a fingerprintable old cert,
@@ -2571,6 +2582,35 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-006 - Construct interface (Apple-HIG-principled workstation shell)
 
 - Status: Remaining
+- Progress (2026-07-26 `.15` `d5434309` correction): the native
+  `xcp-build.sh rpm` artifacts for `d5434309` were intentionally **not**
+  installed on `.15` after `rpm -Uvh --test` rejected the Fedora 42-linked
+  dependency set (`libavcodec.so.61`, ICU 76, Python 3.13, `libplacebo.so.349`,
+  etc.). BigBoy `.130` then cut the correct Fedora 44 container RPMs with
+  `install-helpers/build-rpm-fedora43.sh 44`; payload-size gates are green at
+  base **81.8 MiB**, Browser **39.0 MiB**, and thin Lighthouse **11.1 MiB**.
+  The F44 base and Browser RPMs were staged under
+  `/root/ux006-head-d5434309-f44` on `.15`, passed
+  `rpm -Uvh --test --replacepkgs --force --nosignature`, and were installed
+  without `--nodeps`. The bounded restart path hit transient systemd transport
+  reset/canceled-job messages but recovered cleanly: post-install proof shows
+  `nebula` PID `508682`, `mackesd` PID `696940`, and `mde-shell-egui` PID
+  `697293` all active with `NRestarts=0`. `/proc/<pid>/exe` matches
+  `/usr/bin/mackesd` sha256
+  `07b8f348195826dc0a9212078d46cb010fc71f61b44df6d041e02843263df27d` and
+  `/usr/bin/mde-shell-egui` sha256
+  `67a4407f6d6826cbb06353ba9f624d1baa822e2000b4921cd1a1c658b10ae4e9`;
+  Browser helpers are present (`mde-web-preview`
+  `55ad4f7a4ce77b98e57d1229ddec39713fac9d0db16c92e46595fe7c191e2e66`,
+  `mde-web-cef`
+  `00a6c9bab50432b589db2725a66c77c2bbfbd2265c6f73458dd6036f4b177aaa`).
+  `ldd /usr/bin/mde-shell-egui` resolves the Fedora 44 ABI set
+  (`libavcodec.so.62`, ICU 77, Python 3.14, `libplacebo.so.360`, etc.) with no
+  `not found` lines; `MDE_MAPS_DIR=/var/lib/mde/maps`; the East Texas
+  MBTiles/gazetteer bundle is present; `ping 10.42.0.1` succeeds; and shell
+  critical-log grep since the install found no panic, crash, segfault, overlay,
+  or unbound-font signature. Live physical pointer/DRM replay remains the next
+  stronger proof for the Springboard Dock click-target bug.
 - Progress (2026-07-26 `.15` Fedora 44 RPM promotion): BigBoy `.130` cut the
   Fedora 44 split RPMs from commit `c7ac64a6` with payload-size verification
   green: base **81.8 MiB**, Browser **39.0 MiB**, and thin Lighthouse
