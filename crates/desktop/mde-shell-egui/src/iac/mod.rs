@@ -376,6 +376,17 @@ impl DeliveryView {
         }
     }
 
+    /// UI view for a wire delivery type.
+    pub(super) const fn from_delivery_type(delivery_type: DeliveryType) -> Self {
+        match delivery_type {
+            DeliveryType::DesktopVm => Self::DesktopVm,
+            DeliveryType::ServiceVm => Self::ServiceVm,
+            DeliveryType::AppVm => Self::AppVm,
+            DeliveryType::AndroidVm => Self::AndroidVm,
+            DeliveryType::ServiceContainer => Self::ServiceContainer,
+        }
+    }
+
     /// The delivery-view tab label.
     pub(super) const fn label(self) -> &'static str {
         match self {
@@ -502,7 +513,7 @@ impl DensityMode {
     }
 }
 
-/// Sortable columns in the Plan route's dense resource table.
+/// Sortable columns in the lifecycle routes' dense resource tables.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(super) enum WorkloadSortColumn {
     /// Workload name.
@@ -596,6 +607,8 @@ enum ResourceTableMode {
     Run,
     /// Drift review: desired-vs-actual signals and reconciliation dry-runs.
     Drift,
+    /// Container review: existing Quadlet service containers plus day-2 actions.
+    Containers,
 }
 
 impl ResourceTableMode {
@@ -604,6 +617,7 @@ impl ResourceTableMode {
             Self::Plan => "Plan resource table",
             Self::Run => "Run resource table",
             Self::Drift => "Drift resource table",
+            Self::Containers => "Container resource table",
         }
     }
 
@@ -618,6 +632,9 @@ impl ResourceTableMode {
             Self::Drift => {
                 "Scan desired-vs-actual state first; row actions request node-scoped plans, never a blind apply."
             }
+            Self::Containers => {
+                "Review existing service containers before deploying a new Quadlet unit."
+            }
         }
     }
 
@@ -626,6 +643,7 @@ impl ResourceTableMode {
             Self::Plan => "Plan Actions",
             Self::Run => "Run Actions",
             Self::Drift => "Drift Actions",
+            Self::Containers => "Container Actions",
         }
     }
 
@@ -634,6 +652,7 @@ impl ResourceTableMode {
             Self::Plan => "No plan rows for this filter",
             Self::Run => "No run targets for this filter",
             Self::Drift => "No drift rows for this filter",
+            Self::Containers => "No service containers in the mirror",
         }
     }
 
@@ -642,6 +661,7 @@ impl ResourceTableMode {
             Self::Plan => "Plan",
             Self::Run => "Run",
             Self::Drift => "Drift",
+            Self::Containers => "Containers",
         }
     }
 }
@@ -1914,6 +1934,13 @@ fn route_body(ui: &mut egui::Ui, state: &mut WorkloadsState) {
         }
         WorkloadsRoute::Containers => {
             shared_placement_selector(ui, state);
+            lifecycle_resource_route_for_delivery(
+                ui,
+                state,
+                ResourceTableMode::Containers,
+                DeliveryType::ServiceContainer,
+            );
+            ui.add_space(Style::SP_S);
             containers::containers_panel(ui, state);
         }
     }
@@ -2006,31 +2033,56 @@ fn lifecycle_resource_route(
     state: &mut WorkloadsState,
     mode: ResourceTableMode,
 ) {
+    lifecycle_resource_route_for_filter(ui, state, mode, None);
+}
+
+fn lifecycle_resource_route_for_delivery(
+    ui: &mut egui::Ui,
+    state: &mut WorkloadsState,
+    mode: ResourceTableMode,
+    delivery_type: DeliveryType,
+) {
+    lifecycle_resource_route_for_filter(ui, state, mode, Some(delivery_type));
+}
+
+fn lifecycle_resource_route_for_filter(
+    ui: &mut egui::Ui,
+    state: &mut WorkloadsState,
+    mode: ResourceTableMode,
+    delivery_type: Option<DeliveryType>,
+) {
     mirror_summary(ui, state);
     ui.add_space(Style::SP_XS);
+    let delivery_label = delivery_type.map_or_else(|| state.view.label(), DeliveryType::label);
     muted_note(
         ui,
         format!(
             "{} · showing {} resources as the current delivery filter. Row density: {} ({:.0}px).",
             mode.summary(),
-            state.view.label(),
+            delivery_label,
             state.density.label(),
             state.density.row_height()
         ),
     );
     ui.add_space(Style::SP_S);
-    resource_table(ui, state, mode);
+    resource_table(ui, state, mode, delivery_type);
     if matches!(mode, ResourceTableMode::Plan | ResourceTableMode::Run) {
         console_section(ui, state);
     }
 }
 
-fn resource_table(ui: &mut egui::Ui, state: &mut WorkloadsState, mode: ResourceTableMode) {
-    let rows = resource_rows(state);
+fn resource_table(
+    ui: &mut egui::Ui,
+    state: &mut WorkloadsState,
+    mode: ResourceTableMode,
+    delivery_type: Option<DeliveryType>,
+) {
+    let rows = resource_rows_for(state, delivery_type);
     if rows.is_empty() {
+        let delivery_label = delivery_type.map_or_else(|| state.view.label(), DeliveryType::label);
         let message = format!(
             "No {} workloads are present in the folded state/cloud mirror.",
-            state.view.label()
+            delivery_label
         );
         crate::empty_state::show(ui, mode.empty_title(), &message);
         return;
@@ -2323,11 +2375,15 @@ fn column_width(column: WorkloadSortColumn) -> f32 {
 }
 
 fn plan_resource_rows(state: &WorkloadsState) -> Vec<WorkloadRow> {
-    resource_rows(state)
+    resource_rows_for(state, None)
 }
 
-fn resource_rows(state: &WorkloadsState) -> Vec<WorkloadRow> {
-    let mut rows: Vec<WorkloadRow> = state.workloads_of(state.view).cloned().collect();
+fn resource_rows_for(
+    state: &WorkloadsState,
+    delivery_type: Option<DeliveryType>,
+) -> Vec<WorkloadRow> {
+    let view = delivery_type.map_or(state.view, DeliveryView::from_delivery_type);
+    let mut rows: Vec<WorkloadRow> = state.workloads_of(view).cloned().collect();
     let sort = state.resource_sort;
     rows.sort_by(|a, b| {
         let ordering = compare_workload_rows(a, b, sort.column);
@@ -2423,26 +2479,75 @@ fn audit_route_panel(ui: &mut egui::Ui, state: &WorkloadsState) {
         );
         return;
     }
-    for entry in state.audit.iter().rev() {
-        card().show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.colored_label(
-                    entry.outcome.color(),
-                    RichText::new(entry.outcome.word())
-                        .size(Style::SMALL)
-                        .strong(),
-                );
-                ui.add_space(Style::SP_S);
-                ui.label(RichText::new(&entry.verb).size(Style::BODY).strong());
-            });
-            ui.label(
-                RichText::new(&entry.detail)
-                    .size(Style::SMALL)
-                    .color(Style::TEXT_DIM),
+    audit_table(ui, &state.audit);
+}
+
+fn audit_table(ui: &mut egui::Ui, audit: &[AuditEntry]) {
+    card().show(ui, |ui| {
+        ui.label(
+            RichText::new("Audit table")
+                .size(Style::SMALL)
+                .strong()
+                .color(Style::TEXT_DIM),
+        );
+        ui.add_space(Style::SP_XS);
+        ui.horizontal(|ui| {
+            audit_cell(
+                ui,
+                "Outcome",
+                112.0,
+                DensityMode::Compact.row_height(),
+                Style::TEXT_DIM,
+            );
+            audit_cell(
+                ui,
+                "Verb",
+                150.0,
+                DensityMode::Compact.row_height(),
+                Style::TEXT_DIM,
+            );
+            audit_cell(
+                ui,
+                "Detail",
+                520.0,
+                DensityMode::Compact.row_height(),
+                Style::TEXT_DIM,
             );
         });
-        ui.add_space(Style::SP_XS);
-    }
+        ui.separator();
+        for entry in audit.iter().rev() {
+            ui.horizontal(|ui| {
+                audit_cell(
+                    ui,
+                    entry.outcome.word(),
+                    112.0,
+                    DensityMode::Compact.row_height(),
+                    entry.outcome.color(),
+                );
+                audit_cell(
+                    ui,
+                    &entry.verb,
+                    150.0,
+                    DensityMode::Compact.row_height(),
+                    Style::TEXT,
+                );
+                audit_cell(
+                    ui,
+                    &entry.detail,
+                    520.0,
+                    DensityMode::Compact.row_height(),
+                    Style::TEXT_DIM,
+                );
+            });
+        }
+    });
+}
+
+fn audit_cell(ui: &mut egui::Ui, text: &str, width: f32, height: f32, color: Color32) {
+    ui.add_sized(
+        [width, height],
+        egui::Label::new(RichText::new(text).size(Style::SMALL).color(color)),
+    );
 }
 
 fn health_rail(ui: &mut egui::Ui, state: &WorkloadsState) {

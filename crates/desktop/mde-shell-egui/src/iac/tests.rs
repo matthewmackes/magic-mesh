@@ -431,6 +431,79 @@ fn drift_route_uses_dense_resource_table_with_plan_only_row_actions() {
 }
 
 #[test]
+fn containers_route_uses_dense_container_table_before_deploy_form() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut state = state_on(DeliveryView::DesktopVm, WorkloadsRoute::Containers);
+    state.bus_root = Some(tmp.path().join("bus"));
+    state
+        .states
+        .get_mut(0)
+        .expect("fixture state")
+        .workloads
+        .push(workload("web-1", DeliveryType::ServiceContainer, "active"));
+    let key = plan_resource_key(
+        state
+            .states
+            .first()
+            .expect("fixture state")
+            .workloads
+            .last()
+            .expect("container workload"),
+    );
+    state.toggle_expanded_resource(key);
+
+    let text = rendered_text(|ui| route_body(ui, &mut state));
+
+    assert!(text.contains("Container resource table"), "{text}");
+    assert!(text.contains("Container Actions"), "{text}");
+    assert!(text.contains("web-1"), "{text}");
+    assert!(
+        text.contains("Command preview") && text.contains("Containers:"),
+        "{text}"
+    );
+    assert!(text.contains("Restart"), "{text}");
+    assert!(text.contains("Deploy a service container"), "{text}");
+    assert_eq!(
+        emitted_request_count(&state, "container-restart"),
+        0,
+        "passive Containers table render must not publish lifecycle requests"
+    );
+    assert_eq!(
+        state.view(),
+        DeliveryView::DesktopVm,
+        "Containers route must not mutate the operator's delivery filter just to show existing containers"
+    );
+}
+
+#[test]
+fn audit_route_renders_dense_session_table_newest_first() {
+    let mut state = state_on(DeliveryView::DesktopVm, WorkloadsRoute::Audit);
+    state.audit.push(AuditEntry {
+        verb: "plan".to_string(),
+        outcome: AuditOutcome::Staged,
+        detail: "planned node eagle".to_string(),
+    });
+    state.audit.push(AuditEntry {
+        verb: "container-deploy".to_string(),
+        outcome: AuditOutcome::Applied,
+        detail: "audited container web-1".to_string(),
+    });
+
+    let text = rendered_text(|ui| audit_route_panel(ui, &state));
+
+    assert!(text.contains("Audit table"), "{text}");
+    assert!(text.contains("Outcome"), "{text}");
+    assert!(text.contains("Verb"), "{text}");
+    assert!(text.contains("Detail"), "{text}");
+    assert!(text.contains("container-deploy"), "{text}");
+    assert!(text.contains("audited container web-1"), "{text}");
+    assert!(
+        text.find("container-deploy") < text.find("plan"),
+        "newest audit rows must render first: {text}"
+    );
+}
+
+#[test]
 fn the_empty_mirror_reads_honestly_never_fabricated() {
     // No mirror published yet → honest empty routes, never fake.
     for route in [

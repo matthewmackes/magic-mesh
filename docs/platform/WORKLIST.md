@@ -2208,6 +2208,23 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-014 - Music interface LAN AirSonic mesh gateway
 
 - Status: Remaining
+- Progress (2026-07-26 AirSonic gateway proxy responder): `mackesd` now has a
+  tiered `media_airsonic_proxy` worker for the Subsonic/AirSonic gateway source
+  model. It serves `/mde/airsonic/<source-id>/rest/...` from port 4040 for
+  sources whose gateway aliases match the local node, rejects unknown/degraded
+  sources, non-REST paths, path escapes, request bodies, and unsafe methods,
+  resolves the source's sealed strict `{username,password}` credential through
+  `SecretStore`, strips client-supplied Subsonic auth query parameters plus
+  auth/hop-by-hop headers, injects fresh server-side `u`/`t`/`s` MD5 token
+  auth, and forwards browse/stream/cover-art/playlist REST calls to the LAN
+  upstream while preserving range/cache/length headers and streaming bodies.
+  Farm evidence is green: `.130` BigBoy slot `airsonic-proxy-hardening` `cargo
+  test -p mackesd --lib --features async-services media_airsonic_proxy --
+  --nocapture` passed **10/10** including transfer-encoding body rejection, and
+  `worker_spawns_and_the_census_do_not_drift` passed **1/1**; `.50` slot
+  `airsonic-mackesd-fmt-hardening` touched-file `rustfmt --edition 2021 --config
+  skip_children=true --check` passed for the new proxy, spawn, worker census, and
+  worker module files.
 - Progress (2026-07-26 Music client gateway session hardening):
   `mde-musicd` now treats a WL-FUNC-014 gateway proxy URL as the concrete
   Subsonic session anchor for browse, stream, cover art, and playlist mutation
@@ -2299,6 +2316,25 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-015 - Media Workspace LAN Jellyfin mesh gateway
 
 - Status: Remaining
+- Progress (2026-07-26 Jellyfin gateway playback role gates):
+  `mde-jellyfin` now attaches an explicit `JellyfinAccessPolicy` to clients:
+  direct saved-token clients default to `full-access`, `gateway-playback`
+  clients can browse, negotiate/download streams, report `/Sessions/Playing*`
+  progress, and update user-scoped watched state while denying credential
+  exchange before any HTTP request, and `browse-only` clients can render
+  metadata/resume rows while denying stream/progress/watched-state actions
+  before transport. The Media Workspace gateway client now opts into the
+  `gateway-playback` role while still using the non-secret gateway user
+  sentinel and not materializing gateway rows into `ServerStore`. Focused farm
+  evidence is green: `.90` slot `wl-func-015-jellyfin-role` `cargo test -p
+  mde-jellyfin role -- --nocapture` **2/2**, `.130` slot
+  `wl-func-015-media-role` `cargo test -p mde-media-egui
+  mesh_gateway_jellyfin_client_uses_gateway_playback_role -- --nocapture`
+  **1/1**, `.50` slot `wl-func-015-role-fmt` `cargo fmt -p mde-jellyfin -p
+  mde-media-egui -- --check`, and local touched-file `git diff --check`.
+  This advances the role-gated stream/progress action layer without touching
+  the `mackesd` proxy; outage cache behavior and live cross-node playback proof
+  remain.
 - Progress (2026-07-26 Jellyfin gateway streaming/progress proxy proof):
   `media_jellyfin_proxy` now forwards range-safe upstream response headers
   (`Content-Range`, `Accept-Ranges`, `ETag`, cache validators, and content
@@ -2623,7 +2659,10 @@ These decisions refine acceptance and sequencing for the active items below.
   `docked_rail_drops_launcher_overflow_on_short_screens`, the black-pill
   slide/melt proof, and the all-mode hit-target boundary test; `.170` slot
   `nav-bottom-fmt` passed touched-file `rustfmt --edition 2021 --check
-  crates/desktop/mde-shell-egui/src/nav_bar.rs`.
+  crates/desktop/mde-shell-egui/src/nav_bar.rs`. Current-tree proof remains
+  green after the later worklist integrations: `.90` slot
+  `nav-bottom-current-proof` `cargo test -p mde-shell-egui nav_bar --
+  --nocapture` passed **24/24**.
 - Progress (2026-07-26 Terminal typing/cursor lag live bug): the operator
   reported that Terminal rendering falls behind while typing, leaving the
   displayed cursor incorrect. This is now a WL-UX-006 live-acceptance defect
@@ -3915,6 +3954,20 @@ These decisions refine acceptance and sequencing for the active items below.
   --nocapture` passed **62/62** (1775 filtered), including new headless render
   coverage for Run and Drift tables; `.170` touched-file `rustfmt --edition 2021
   --check` and scoped `git diff --check` passed.
+- Progress (2026-07-26 Containers/Audit lifecycle table seam): the Containers
+  route now renders a dense service-container resource table before the Quadlet
+  deploy form, preserving the operator's selected delivery filter while showing
+  existing container rows, expanded metrics/placement/drift details, and
+  review-gated day-2 row actions. The Audit route now renders the local session
+  audit as a dense newest-first table (`Outcome`, `Verb`, `Detail`) instead of
+  loose cards, keeping the same honest session-only audit source. Evidence:
+  BigBoy `.130` slot `workloads-audit-containers` `cargo test -p
+  mde-shell-egui iac -- --nocapture` passed **64/64** (1777 filtered),
+  including `containers_route_uses_dense_container_table_before_deploy_form` and
+  `audit_route_renders_dense_session_table_newest_first`; `.170` slot
+  `workloads-audit-containers-fmt` passed touched-file `rustfmt --edition 2021
+  --check crates/desktop/mde-shell-egui/src/iac/mod.rs
+  crates/desktop/mde-shell-egui/src/iac/tests.rs`.
 - Origin or merged source IDs: 2026-07-26 planning handoff, "World-Class Infra
   as Code / Workloads Redesign"; UX references named in that handoff: Apple HIG
   sidebars, IBM Carbon data tables/filtering, HCP Terraform workspaces, and
@@ -4097,6 +4150,19 @@ These decisions refine acceptance and sequencing for the active items below.
   `ScrollArea::show_rows` virtualizes paint. This targets the seat `.15`
   slowdown when opening Mesh Teams Activity without changing collaboration Bus
   topics or command contracts.
+- Progress (2026-07-26 pins/saved pending seam): Mesh Teams Posts now paint a
+  per-message `Keep` row with visible `Pin` and `Save` controls. Because
+  `MessageView` has no message-level pinned/saved fields and `CollabCommand`
+  has no pin/save-message verbs, the controls are disabled with explicit
+  pending-read-model copy and take no `CommandSink`, so no shared pin or private
+  saved-message state is fabricated. Evidence: `.50` slot `collab-pin-save`
+  `cargo test -p mde-collab-egui message_pin_save_affordances -- --nocapture`
+  passed 1/1 after the final source sync; `.90` slot `collab-pin-save-fmt`
+  touched-file `rustfmt --edition 2021 --check --config skip_children=true`
+  passed for `messages.rs` and `tests.rs`. A crate-wide
+  `cargo fmt -p mde-collab-egui -- --check` was not used as evidence because it
+  still reports unrelated pre-existing import-order drift in `clipboard.rs` and
+  `documents.rs`.
 - Priority: P0
 - Complexity: Epic
 - Problem: The live Communications surface has a strong Bus-backed foundation,

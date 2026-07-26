@@ -20,9 +20,9 @@ use mackes_mesh_types::media_sources::{
 };
 use mde_jellyfin::{
     build_playback_decision, direct_play_url, BaseItemDto, CacheEntry, CacheRequest,
-    ClientCapabilities, HttpTransport, ItemsQuery, JellyfinClient, JellyfinError, MediaSourceInfo,
-    OfflineCache, PlaybackDecision, PlaybackMethod, PlaybackReport, ServerAuth, ServerConfig,
-    ServerStore, StreamMediaType,
+    ClientCapabilities, HttpTransport, ItemsQuery, JellyfinAccessPolicy, JellyfinClient,
+    JellyfinError, MediaSourceInfo, OfflineCache, PlaybackDecision, PlaybackMethod, PlaybackReport,
+    ServerAuth, ServerConfig, ServerStore, StreamMediaType,
 };
 use mde_media_core::{
     classify_url, discover_all, unix_millis, AbLoop, AudioConfig, BrowseQuery, CaptureDevice,
@@ -1576,7 +1576,8 @@ impl<E: MediaEngine> MediaController<E> {
             );
         }
         Ok(JellyfinClient::new(source.endpoint, device, transport)
-            .with_auth("mde-gateway-proxy", JELLYFIN_GATEWAY_USER_SENTINEL))
+            .with_auth("mde-gateway-proxy", JELLYFIN_GATEWAY_USER_SENTINEL)
+            .with_access_policy(JellyfinAccessPolicy::gateway_playback()))
     }
 
     /// The materialized items of the last Jellyfin browse — the playable rows.
@@ -2296,7 +2297,9 @@ mod tests {
     use mackes_mesh_types::media_sources::{
         LaneStatus as MeshLaneStatus, MediaProtocol as MeshMediaProtocol,
     };
-    use mde_jellyfin::{ClientInfo, HttpRequest, HttpResponse, MediaStream, TransportError};
+    use mde_jellyfin::{
+        ClientInfo, HttpRequest, HttpResponse, JellyfinClientRole, MediaStream, TransportError,
+    };
     use mde_media_core::{FakeMpv, MediaMetadata};
 
     fn tracks() -> Vec<Track> {
@@ -3652,7 +3655,8 @@ mod tests {
     }
 
     #[test]
-    fn mesh_gateway_jellyfin_client_uses_sentinel_without_server_store_materialization() {
+    fn mesh_gateway_jellyfin_client_uses_gateway_playback_role_without_server_store_materialization(
+    ) {
         let mut c = controller();
         c.set_mesh_media_sources(Some(mesh_jellyfin_state(vec![mesh_jellyfin_source(
             "gateway",
@@ -3668,6 +3672,10 @@ mod tests {
             "http://gateway-a.mesh:8097/mde/jellyfin/gateway"
         );
         assert_eq!(client.user_id(), Some(JELLYFIN_GATEWAY_USER_SENTINEL));
+        assert_eq!(
+            client.access_policy().role(),
+            JellyfinClientRole::GatewayPlayback
+        );
         assert_eq!(c.jellyfin().store().servers.len(), 0);
 
         let count = c

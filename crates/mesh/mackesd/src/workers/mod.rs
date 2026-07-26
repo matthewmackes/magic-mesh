@@ -374,6 +374,13 @@ pub mod navidrome_supervisor;
 // shared account off the registry plane and idempotently write the desktop
 // user's airsonic-creds.json so mde-music auto-browses (no first-run connect).
 pub mod music_autoconfig;
+// WL-FUNC-014 — AirSonic gateway proxy: serves
+// `/mde/airsonic/<source-id>/rest/...` on the gateway node, resolves the
+// registered source from QNM-Shared, materializes the sealed read-only
+// Subsonic credential through the mesh secret store, strips client
+// auth/hop-by-hop headers and auth query params, and forwards browse/stream/
+// playlist requests to the LAN upstream without exposing credentials to clients.
+pub mod media_airsonic_proxy;
 // APPS-LIVE-1 — the apps_running worker: mirror this node's set of
 // currently-running launchable apps to <QNM-Shared>/<host>/running-
 // apps.json so the launcher can badge every entry "running on <host>"

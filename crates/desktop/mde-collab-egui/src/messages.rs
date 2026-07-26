@@ -4,7 +4,10 @@
 //! multiline composer whose <kbd>Ctrl</kbd>+<kbd>Enter</kbd> emits
 //! [`SendMessage`](mde_collab_types::CollabCommand::SendMessage) with a
 //! locally-persisted draft, honest delivery state, and an edit/delete affordance
-//! that reflects the core's five-minute author window (spec §3).
+//! that reflects the core's five-minute author window (spec §3). Shared message
+//! pins and private saved-message controls are visible but disabled until the
+//! backing read model / command contract exists, so this UI never fabricates
+//! mesh-pinned or locally-saved message state.
 
 use mde_egui::egui;
 use mde_egui::Style;
@@ -239,6 +242,7 @@ impl CommunicationsSurface {
             }
 
             self.local_reaction_buttons(ui, msg.event_id);
+            self.message_keep_affordances(ui);
 
             match affordance {
                 AmendAffordance::Allowed => {
@@ -265,6 +269,32 @@ impl CommunicationsSurface {
                 AmendAffordance::Hidden => {}
             }
         });
+    }
+
+    /// Visible, honest keep controls for the operator-requested shared pins and
+    /// private saved messages slice. The read model currently carries no
+    /// message-level pinned/saved facts and [`CollabCommand`] has no matching
+    /// verbs, so the controls are deliberately disabled and this helper takes no
+    /// [`CommandSink`]. Once WL-FUNC-011 adds the backing contract, this is the
+    /// single row to make actionable.
+    pub(crate) fn message_keep_affordances(&self, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.label(egui::RichText::new("Keep").small().color(Style::TEXT_DIM));
+        disabled_keep_button(
+            ui,
+            "Pin",
+            "Shared message pins are pending the real message-pin read model.",
+        );
+        disabled_keep_button(
+            ui,
+            "Save",
+            "Private saved messages are pending the local saved-message read model.",
+        );
+        ui.label(
+            egui::RichText::new("pending read model")
+                .small()
+                .color(Style::TEXT_DIM),
+        );
     }
 
     /// The per-seat quick-reaction chips. These mutate only local view state and
@@ -527,6 +557,14 @@ impl CommunicationsSurface {
         }
         self.thread_drafts.insert(thread, buf);
     }
+}
+
+fn disabled_keep_button(ui: &mut egui::Ui, label: &str, hint: &'static str) -> egui::Response {
+    ui.add_enabled(
+        false,
+        egui::Button::new(egui::RichText::new(label).small().color(Style::DISABLED)),
+    )
+    .on_disabled_hover_ui(move |ui| icons::comms_tooltip(ui, hint))
 }
 
 /// Match the command pipeline's 256 KiB UTF-8 body contract at the visible

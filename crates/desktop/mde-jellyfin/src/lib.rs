@@ -118,8 +118,9 @@ pub mod sync;
 pub use browse::{build_show_tree, group_by_type, SeasonNode, ShowTree};
 pub use cache::{CacheEntry, CacheError, CacheRequest, OfflineCache};
 pub use client::{
-    build_items_request, image_url, ClientInfo, ImageQuery, ImageType, ItemsQuery, JellyfinClient,
-    JellyfinError, SortOrder,
+    build_items_request, image_url, ClientInfo, ImageQuery, ImageType, ItemsQuery,
+    JellyfinAccessPolicy, JellyfinAction, JellyfinClient, JellyfinClientRole, JellyfinError,
+    SortOrder,
 };
 pub use models::{
     AuthenticationResult, BaseItemDto, ItemsResponse, MediaSourceInfo, MediaStream,

@@ -2600,6 +2600,22 @@ pub(crate) fn spawn_fleet_compute_workers(
         )
     });
 
+    // WL-FUNC-014 — AirSonic/Subsonic gateway proxy responder. A node-admin
+    // registered LAN AirSonic source advertises
+    // `http://<gateway>.mesh:4040/mde/airsonic/<source-id>`. This worker owns
+    // that route on the gateway node: it reads the replicated gateway registry,
+    // confirms the source belongs to this node, resolves the sealed read-only
+    // username/password via SecretStore, strips client auth, injects a fresh
+    // server-side Subsonic token, and forwards Subsonic `/rest/...` traffic to
+    // the LAN upstream.
+    spawn_tiered(sup, worker_names, role_rank, "media_airsonic_proxy", || {
+        mackesd_core::workers::media_airsonic_proxy::AirsonicGatewayProxyWorker::new(
+            node_id.clone(),
+            fw_host.clone(),
+            workgroup_root.clone(),
+        )
+    });
+
     // WL-FUNC-015 — Jellyfin gateway proxy responder. A node-admin registered
     // LAN Jellyfin source advertises
     // `http://<gateway>.mesh:<proxy-port>/mde/jellyfin/<source-id>`. This worker

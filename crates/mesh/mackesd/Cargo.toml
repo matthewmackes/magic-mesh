@@ -179,6 +179,9 @@ chrono = { version = "0.4", features = ["serde"] }
 # passcode generation.
 sha2 = "0.10"
 rand = "0.8"
+# WL-FUNC-014 — Subsonic gateway token injection:
+# token = md5(password + salt), matching the AirSonic/OpenSubsonic contract.
+md5 = "0.7"
 p256 = "0.14.0-rc.9"
 
 # ONBOARD-2 — self-signed TLS identity for the lighthouse `/enroll`

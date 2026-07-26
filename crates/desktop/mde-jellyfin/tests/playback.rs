@@ -7,8 +7,9 @@ use std::cell::RefCell;
 
 use mde_jellyfin::{
     build_playback_decision, resume_position_secs, ClientCapabilities, ClientInfo, HttpMethod,
-    HttpRequest, HttpResponse, HttpTransport, ItemsQuery, JellyfinClient, PlaybackMethod,
-    PlaybackReport, StreamMediaType, TransportError,
+    HttpRequest, HttpResponse, HttpTransport, ItemsQuery, JellyfinAccessPolicy, JellyfinAction,
+    JellyfinClient, JellyfinClientRole, JellyfinError, PlaybackMethod, PlaybackReport,
+    StreamMediaType, TransportError,
 };
 
 const PLAYBACK_INFO: &str = include_str!("fixtures/playback_info.json");
@@ -190,6 +191,100 @@ fn progress_reports_and_mark_played_drive_the_session_endpoints() {
         .any(|u| u.ends_with("/Users/user-9f3a/PlayedItems/movie-1")));
     // The delete (mark-unplayed) hit the same path with the DELETE verb.
     assert!(client.transport().methods().contains(&HttpMethod::Delete));
+}
+
+#[test]
+fn browse_only_role_denies_stream_progress_and_watched_state_before_http() {
+    let client = client().with_access_policy(JellyfinAccessPolicy::browse_only());
+
+    // Metadata/resume browse stays available.
+    let resume = client.resume().expect("resume");
+    assert_eq!(resume.items.len(), 1);
+    let seen_after_browse = client.transport().urls().len();
+
+    let stream_err = client
+        .playback_info("movie-1", &capable())
+        .expect_err("browse-only cannot open streams");
+    assert!(matches!(
+        stream_err,
+        JellyfinError::AccessDenied {
+            role: JellyfinClientRole::BrowseOnly,
+            action: JellyfinAction::Stream
+        }
+    ));
+
+    let report = PlaybackReport::new("movie-1")
+        .with_session(Some("src-4k".into()), Some("play-session-7".into()))
+        .at_secs(90.0);
+    let progress_err = client
+        .report_playback_progress(&report)
+        .expect_err("browse-only cannot report shared progress");
+    assert!(matches!(
+        progress_err,
+        JellyfinError::AccessDenied {
+            role: JellyfinClientRole::BrowseOnly,
+            action: JellyfinAction::PlaybackProgress
+        }
+    ));
+
+    let watched_err = client
+        .mark_played("movie-1")
+        .expect_err("browse-only cannot mutate watched state");
+    assert!(matches!(
+        watched_err,
+        JellyfinError::AccessDenied {
+            role: JellyfinClientRole::BrowseOnly,
+            action: JellyfinAction::WatchedState
+        }
+    ));
+
+    assert_eq!(
+        client.transport().urls().len(),
+        seen_after_browse,
+        "denied stream/progress/watched-state actions must not hit the transport"
+    );
+}
+
+#[test]
+fn gateway_playback_role_allows_stream_progress_and_watched_state_but_not_auth() {
+    let client = client().with_access_policy(JellyfinAccessPolicy::gateway_playback());
+    assert_eq!(
+        client.access_policy().role(),
+        JellyfinClientRole::GatewayPlayback
+    );
+
+    client
+        .playback_info("movie-1", &capable())
+        .expect("gateway playback can negotiate streams");
+    let report = PlaybackReport::new("movie-1")
+        .with_session(Some("src-4k".into()), Some("play-session-7".into()))
+        .with_method(PlaybackMethod::DirectPlay)
+        .at_secs(90.0);
+    client
+        .report_playback_progress(&report)
+        .expect("gateway playback can report progress");
+    client
+        .mark_played("movie-1")
+        .expect("gateway playback can update user-scoped watched state");
+
+    let auth_err = client
+        .authenticate_by_name("admin", "password")
+        .expect_err("gateway playback must not exchange credentials");
+    assert!(matches!(
+        auth_err,
+        JellyfinError::AccessDenied {
+            role: JellyfinClientRole::GatewayPlayback,
+            action: JellyfinAction::Authenticate
+        }
+    ));
+    assert!(
+        !client
+            .transport()
+            .urls()
+            .iter()
+            .any(|url| url.contains("/Users/AuthenticateByName")),
+        "denied auth must not reach the upstream"
+    );
 }
 
 #[test]

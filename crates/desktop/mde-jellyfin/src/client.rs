@@ -6,6 +6,8 @@
 //! those through an injected [`HttpTransport`]; a fixture transport exercises the
 //! same code path in tests.
 
+use std::fmt;
+
 use serde::de::DeserializeOwned;
 
 use crate::models::{AuthenticationResult, ItemsResponse, PlaybackInfoResponse, QuickConnectState};
@@ -15,6 +17,136 @@ use crate::sync::{
     build_mark_played_request, build_mark_unplayed_request, build_report_progress_request,
     build_report_start_request, build_report_stopped_request, PlaybackReport,
 };
+
+/// The role a [`JellyfinClient`] is acting under.
+///
+/// Normal saved-token clients default to [`FullAccess`](Self::FullAccess). Mesh
+/// gateway clients use [`GatewayPlayback`](Self::GatewayPlayback) so playback
+/// through the shared sealed account is an explicit capability, while
+/// [`BrowseOnly`](Self::BrowseOnly) can render metadata without opening streams
+/// or advancing another user's resume state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JellyfinClientRole {
+    /// A direct, user-authenticated client: all currently modeled client
+    /// actions are permitted.
+    FullAccess,
+    /// A mesh gateway playback client: browsing, stream negotiation/download,
+    /// playback progress, and user-scoped watched-state updates are permitted,
+    /// but credential/authentication flows are not.
+    GatewayPlayback,
+    /// A metadata-only client: browse/read calls are permitted, while stream,
+    /// progress, and watched-state actions are denied before any HTTP request.
+    BrowseOnly,
+}
+
+impl JellyfinClientRole {
+    /// Stable lowercase label for logs/errors.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FullAccess => "full-access",
+            Self::GatewayPlayback => "gateway-playback",
+            Self::BrowseOnly => "browse-only",
+        }
+    }
+}
+
+impl fmt::Display for JellyfinClientRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One guarded class of Jellyfin client action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JellyfinAction {
+    /// Login / Quick Connect credential exchange.
+    Authenticate,
+    /// Browse or metadata reads.
+    Browse,
+    /// Stream negotiation or direct-byte download.
+    Stream,
+    /// `/Sessions/Playing*` progress reports.
+    PlaybackProgress,
+    /// User-scoped played/unplayed state updates.
+    WatchedState,
+}
+
+impl JellyfinAction {
+    /// Stable lowercase label for logs/errors.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Authenticate => "authenticate",
+            Self::Browse => "browse",
+            Self::Stream => "stream",
+            Self::PlaybackProgress => "report playback progress",
+            Self::WatchedState => "update watched state",
+        }
+    }
+}
+
+impl fmt::Display for JellyfinAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Capability policy enforced before a client issues role-sensitive requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JellyfinAccessPolicy {
+    role: JellyfinClientRole,
+}
+
+impl JellyfinAccessPolicy {
+    /// Direct user-authenticated policy: all modeled actions are available.
+    #[must_use]
+    pub const fn full_access() -> Self {
+        Self {
+            role: JellyfinClientRole::FullAccess,
+        }
+    }
+
+    /// Mesh gateway policy: playback-safe actions are available, credential
+    /// exchange is not.
+    #[must_use]
+    pub const fn gateway_playback() -> Self {
+        Self {
+            role: JellyfinClientRole::GatewayPlayback,
+        }
+    }
+
+    /// Metadata-only policy: browse calls are available, stream/progress/write
+    /// actions are denied before the transport sees them.
+    #[must_use]
+    pub const fn browse_only() -> Self {
+        Self {
+            role: JellyfinClientRole::BrowseOnly,
+        }
+    }
+
+    /// The role this policy represents.
+    #[must_use]
+    pub const fn role(self) -> JellyfinClientRole {
+        self.role
+    }
+
+    /// Whether `action` is permitted by this policy.
+    #[must_use]
+    pub const fn permits(self, action: JellyfinAction) -> bool {
+        match self.role {
+            JellyfinClientRole::FullAccess => true,
+            JellyfinClientRole::GatewayPlayback => !matches!(action, JellyfinAction::Authenticate),
+            JellyfinClientRole::BrowseOnly => matches!(action, JellyfinAction::Browse),
+        }
+    }
+}
+
+impl Default for JellyfinAccessPolicy {
+    fn default() -> Self {
+        Self::full_access()
+    }
+}
 
 /// The calling app's identity, sent in Jellyfin's `Authorization` header on
 /// every request (Jellyfin binds the `AccessToken` to this device).
@@ -658,6 +790,14 @@ pub enum JellyfinError {
     /// A browse call was made before a `UserId` was set (no saved auth).
     #[error("jellyfin client is not authenticated (no UserId)")]
     NotAuthenticated,
+    /// The attached role/policy does not permit this client action.
+    #[error("jellyfin client role {role} cannot {action}")]
+    AccessDenied {
+        /// The role attached to the client.
+        role: JellyfinClientRole,
+        /// The action the caller attempted.
+        action: JellyfinAction,
+    },
 }
 
 /// A typed, headless Jellyfin client over an injected [`HttpTransport`].
@@ -672,6 +812,7 @@ pub struct JellyfinClient<T> {
     device: ClientInfo,
     token: Option<String>,
     user_id: Option<String>,
+    access_policy: JellyfinAccessPolicy,
     transport: T,
 }
 
@@ -684,6 +825,7 @@ impl<T: HttpTransport> JellyfinClient<T> {
             device,
             token: None,
             user_id: None,
+            access_policy: JellyfinAccessPolicy::default(),
             transport,
         }
     }
@@ -696,10 +838,22 @@ impl<T: HttpTransport> JellyfinClient<T> {
         self
     }
 
+    /// Attach an explicit role/capability policy (builder form).
+    #[must_use]
+    pub fn with_access_policy(mut self, access_policy: JellyfinAccessPolicy) -> Self {
+        self.access_policy = access_policy;
+        self
+    }
+
     /// Attach / replace the token + `UserId` in place (e.g. right after login).
     pub fn set_auth(&mut self, token: impl Into<String>, user_id: impl Into<String>) {
         self.token = Some(token.into());
         self.user_id = Some(user_id.into());
+    }
+
+    /// Attach / replace the role/capability policy in place.
+    pub fn set_access_policy(&mut self, access_policy: JellyfinAccessPolicy) {
+        self.access_policy = access_policy;
     }
 
     /// The configured base URL.
@@ -710,6 +864,12 @@ impl<T: HttpTransport> JellyfinClient<T> {
     /// The authenticated `UserId`, if any.
     pub fn user_id(&self) -> Option<&str> {
         self.user_id.as_deref()
+    }
+
+    /// The role/capability policy this client enforces.
+    #[must_use]
+    pub const fn access_policy(&self) -> JellyfinAccessPolicy {
+        self.access_policy
     }
 
     /// Borrow the underlying transport (tests inspect a recording transport
@@ -723,6 +883,18 @@ impl<T: HttpTransport> JellyfinClient<T> {
         self.user_id
             .as_deref()
             .ok_or(JellyfinError::NotAuthenticated)
+    }
+
+    /// Verify this client role permits `action` before any transport request.
+    fn require_action(&self, action: JellyfinAction) -> Result<(), JellyfinError> {
+        if self.access_policy.permits(action) {
+            Ok(())
+        } else {
+            Err(JellyfinError::AccessDenied {
+                role: self.access_policy.role(),
+                action,
+            })
+        }
     }
 
     /// Execute `request` and deserialize a 2xx JSON body into `R`.
@@ -768,6 +940,7 @@ impl<T: HttpTransport> JellyfinClient<T> {
         username: &str,
         password: &str,
     ) -> Result<AuthenticationResult, JellyfinError> {
+        self.require_action(JellyfinAction::Authenticate)?;
         let req =
             build_authenticate_by_name_request(&self.base_url, username, password, &self.device);
         self.send(&req)
@@ -781,6 +954,7 @@ impl<T: HttpTransport> JellyfinClient<T> {
     /// [`JellyfinError::Http`] if Quick Connect is disabled (401/403), or a
     /// transport / parse error.
     pub fn quick_connect_initiate(&self) -> Result<QuickConnectState, JellyfinError> {
+        self.require_action(JellyfinAction::Authenticate)?;
         let req = build_quick_connect_initiate_request(&self.base_url, &self.device);
         self.send(&req)
     }
@@ -794,6 +968,7 @@ impl<T: HttpTransport> JellyfinClient<T> {
     /// [`JellyfinError::Http`] if the secret is unknown / expired, or a transport
     /// / parse error.
     pub fn quick_connect_state(&self, secret: &str) -> Result<QuickConnectState, JellyfinError> {
+        self.require_action(JellyfinAction::Authenticate)?;
         let req = build_quick_connect_state_request(&self.base_url, secret, &self.device);
         self.send(&req)
     }
@@ -808,6 +983,7 @@ impl<T: HttpTransport> JellyfinClient<T> {
         &self,
         secret: &str,
     ) -> Result<AuthenticationResult, JellyfinError> {
+        self.require_action(JellyfinAction::Authenticate)?;
         let req =
             build_authenticate_with_quick_connect_request(&self.base_url, secret, &self.device);
         self.send(&req)
@@ -822,6 +998,7 @@ impl<T: HttpTransport> JellyfinClient<T> {
     /// [`JellyfinError::NotAuthenticated`] with no `UserId`, else a transport /
     /// HTTP / parse error.
     pub fn items(&self, query: &ItemsQuery) -> Result<ItemsResponse, JellyfinError> {
+        self.require_action(JellyfinAction::Browse)?;
         let user = self.require_user()?;
         let req = build_items_request(
             &self.base_url,
@@ -839,6 +1016,7 @@ impl<T: HttpTransport> JellyfinClient<T> {
     /// [`JellyfinError::NotAuthenticated`] with no `UserId`, else a transport /
     /// HTTP / parse error.
     pub fn seasons(&self, series_id: &str) -> Result<ItemsResponse, JellyfinError> {
+        self.require_action(JellyfinAction::Browse)?;
         let user = self.require_user()?;
         let req = build_seasons_request(
             &self.base_url,
@@ -861,6 +1039,7 @@ impl<T: HttpTransport> JellyfinClient<T> {
         series_id: &str,
         season_id: Option<&str>,
     ) -> Result<ItemsResponse, JellyfinError> {
+        self.require_action(JellyfinAction::Browse)?;
         let user = self.require_user()?;
         let req = build_episodes_request(
             &self.base_url,
@@ -879,6 +1058,7 @@ impl<T: HttpTransport> JellyfinClient<T> {
     /// [`JellyfinError::NotAuthenticated`] with no `UserId`, else a transport /
     /// HTTP / parse error.
     pub fn next_up(&self, series_id: Option<&str>) -> Result<ItemsResponse, JellyfinError> {
+        self.require_action(JellyfinAction::Browse)?;
         let user = self.require_user()?;
         let req = build_next_up_request(
             &self.base_url,
@@ -896,6 +1076,7 @@ impl<T: HttpTransport> JellyfinClient<T> {
     /// [`JellyfinError::NotAuthenticated`] with no `UserId`, else a transport /
     /// HTTP / parse error.
     pub fn resume(&self) -> Result<ItemsResponse, JellyfinError> {
+        self.require_action(JellyfinAction::Browse)?;
         let user = self.require_user()?;
         let req = build_resume_request(&self.base_url, user, &self.device, self.token.as_deref());
         self.send(&req)
@@ -907,6 +1088,7 @@ impl<T: HttpTransport> JellyfinClient<T> {
     /// [`JellyfinError::NotAuthenticated`] with no `UserId`, else a transport /
     /// HTTP / parse error.
     pub fn genres(&self, parent_id: Option<&str>) -> Result<ItemsResponse, JellyfinError> {
+        self.require_action(JellyfinAction::Browse)?;
         let user = self.require_user()?;
         let req = build_genres_request(
             &self.base_url,
@@ -946,6 +1128,7 @@ impl<T: HttpTransport> JellyfinClient<T> {
     /// [`JellyfinError::NotAuthenticated`] with no `UserId`, else a transport /
     /// HTTP / parse error.
     pub fn live_tv_channels(&self) -> Result<ItemsResponse, JellyfinError> {
+        self.require_action(JellyfinAction::Browse)?;
         let user = self.require_user()?;
         let req = build_live_tv_channels_request(
             &self.base_url,
@@ -963,6 +1146,7 @@ impl<T: HttpTransport> JellyfinClient<T> {
     /// [`JellyfinError::NotAuthenticated`] with no `UserId`, else a transport /
     /// HTTP / parse error.
     pub fn live_tv_guide(&self, channel_ids: &[String]) -> Result<ItemsResponse, JellyfinError> {
+        self.require_action(JellyfinAction::Browse)?;
         let user = self.require_user()?;
         let req = build_live_tv_programs_request(
             &self.base_url,
@@ -981,6 +1165,7 @@ impl<T: HttpTransport> JellyfinClient<T> {
     /// [`JellyfinError::NotAuthenticated`] with no `UserId`, else a transport /
     /// HTTP / parse error.
     pub fn recordings(&self) -> Result<ItemsResponse, JellyfinError> {
+        self.require_action(JellyfinAction::Browse)?;
         let user = self.require_user()?;
         let req =
             build_recordings_request(&self.base_url, user, &self.device, self.token.as_deref());
@@ -1002,6 +1187,7 @@ impl<T: HttpTransport> JellyfinClient<T> {
         item_id: &str,
         caps: &ClientCapabilities,
     ) -> Result<PlaybackInfoResponse, JellyfinError> {
+        self.require_action(JellyfinAction::Stream)?;
         let user = self.require_user()?;
         let req = build_playback_info_request(
             &self.base_url,
@@ -1019,6 +1205,7 @@ impl<T: HttpTransport> JellyfinClient<T> {
     /// # Errors
     /// A transport / HTTP error (the endpoint answers `204 No Content`).
     pub fn report_playback_start(&self, report: &PlaybackReport) -> Result<(), JellyfinError> {
+        self.require_action(JellyfinAction::PlaybackProgress)?;
         let req =
             build_report_start_request(&self.base_url, report, &self.device, self.token.as_deref());
         self.execute_ok(&req)
@@ -1030,6 +1217,7 @@ impl<T: HttpTransport> JellyfinClient<T> {
     /// # Errors
     /// A transport / HTTP error.
     pub fn report_playback_progress(&self, report: &PlaybackReport) -> Result<(), JellyfinError> {
+        self.require_action(JellyfinAction::PlaybackProgress)?;
         let req = build_report_progress_request(
             &self.base_url,
             report,
@@ -1045,6 +1233,7 @@ impl<T: HttpTransport> JellyfinClient<T> {
     /// # Errors
     /// A transport / HTTP error.
     pub fn report_playback_stopped(&self, report: &PlaybackReport) -> Result<(), JellyfinError> {
+        self.require_action(JellyfinAction::PlaybackProgress)?;
         let req = build_report_stopped_request(
             &self.base_url,
             report,
@@ -1060,6 +1249,7 @@ impl<T: HttpTransport> JellyfinClient<T> {
     /// [`JellyfinError::NotAuthenticated`] with no `UserId`, else a transport /
     /// HTTP error.
     pub fn mark_played(&self, item_id: &str) -> Result<(), JellyfinError> {
+        self.require_action(JellyfinAction::WatchedState)?;
         let user = self.require_user()?;
         let req = build_mark_played_request(
             &self.base_url,
@@ -1077,6 +1267,7 @@ impl<T: HttpTransport> JellyfinClient<T> {
     /// [`JellyfinError::NotAuthenticated`] with no `UserId`, else a transport /
     /// HTTP error.
     pub fn mark_unplayed(&self, item_id: &str) -> Result<(), JellyfinError> {
+        self.require_action(JellyfinAction::WatchedState)?;
         let user = self.require_user()?;
         let req = build_mark_unplayed_request(
             &self.base_url,
@@ -1106,6 +1297,7 @@ impl<T: HttpTransport> JellyfinClient<T> {
     /// [`JellyfinError::Transport`] on a connect / read failure, or
     /// [`JellyfinError::Http`] on a non-2xx status.
     pub fn download(&self, url: &str) -> Result<Vec<u8>, JellyfinError> {
+        self.require_action(JellyfinAction::Stream)?;
         let headers = vec![(
             "Authorization".to_string(),
             crate::client::authorization_header(&self.device, self.token.as_deref()),

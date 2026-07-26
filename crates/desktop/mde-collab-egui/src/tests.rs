@@ -898,6 +898,70 @@ fn messages_timeline_renders_constrained_local_reaction_chips() {
     }
 }
 
+#[test]
+fn message_pin_save_affordances_are_visible_but_contract_pending() {
+    let space = SpaceId::new();
+    let peer = ActorId::new("falcon");
+    let data = FixtureData::new("eagle", 1_000_000)
+        .with_space(space_summary(
+            space,
+            SpaceKind::Team,
+            "Team Ops",
+            SpaceRole::Owner,
+            0,
+            2,
+            1_000_000,
+        ))
+        .with_conversation(ConversationTimeline {
+            space,
+            thread: None,
+            messages: vec![message(
+                EventId::new(),
+                &peer,
+                900_000,
+                "Pin this once the real contract lands.",
+                DeliveryState::Delivered,
+                0,
+            )],
+        });
+    let mut surface = CommunicationsSurface::new();
+    surface.select_space(space);
+    surface.set_mode(Mode::Messages);
+
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let mut sink = CommandSink::new();
+    let mut shapes = Vec::new();
+    for time in [0.0, 1.0] {
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1000.0, 700.0),
+                )),
+                time: Some(time),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| surface.ui(ui, &data, &mut sink));
+            },
+        );
+        shapes = out.shapes;
+    }
+    let texts = painted_text(&shapes);
+
+    for expected in ["Keep", "Pin", "Save", "pending read model"] {
+        assert!(
+            texts.iter().any(|(text, _)| text == expected),
+            "Messages must paint the honest pin/save seam text {expected:?}: {texts:?}"
+        );
+    }
+    assert!(
+        sink.is_empty(),
+        "pending pin/save affordances must not fabricate or enqueue collaboration commands"
+    );
+}
+
 fn focused_messages_surface(
     ctx: &egui::Context,
     surface: &mut CommunicationsSurface,

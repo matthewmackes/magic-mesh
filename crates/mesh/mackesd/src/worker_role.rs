@@ -411,6 +411,14 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
     // media folders), so Workstation-tier; it idles gracefully on a headless
     // box (empty share manifest, empty aggregated library).
     WorkerSpec::tier("media_server", 1, RestartPolicy::OnFailure),
+    // WL-FUNC-014 — the AirSonic/Subsonic gateway proxy responder. A desktop/media
+    // gateway feature: it binds the mesh proxy port on a node that has been
+    // registered as a LAN AirSonic gateway, resolves the sealed read-only
+    // username/password server-side, strips client Subsonic auth, and forwards
+    // `/rest/...` without exposing credentials to clients. Workstation-tier like
+    // media_sources/media_server; headless workstations can still run it, stock
+    // lighthouses do not open the media proxy port.
+    WorkerSpec::tier("media_airsonic_proxy", 1, RestartPolicy::OnFailure),
     // WL-FUNC-015 — the Jellyfin gateway proxy responder. A desktop/media
     // gateway feature: it binds the mesh proxy port on a node that has been
     // registered as a LAN Jellyfin gateway, resolves the sealed read-only token
@@ -1067,6 +1075,8 @@ mod tests {
         // aggregator, Workstation-tier: a seated-user desktop feature).
         // +1 media_server (MEDIA-15 — the mesh media server + DLNA + aggregation,
         // the PRODUCER half; Workstation-tier: a seated-user desktop feature).
+        // +1 media_airsonic_proxy (WL-FUNC-014 — AirSonic/Subsonic gateway proxy,
+        // Workstation-tier media gateway).
         // +1 pty_broker (TERM-7 — the mesh PTY-broker opening remote shells over
         // the overlay, Workstation-tier: a seated-user desktop feature).
         // +1 adfilter (BOOKMARKS-7 — the mesh-wide ad-blocker worker replicating the
@@ -1183,8 +1193,8 @@ mod tests {
         );
         assert_eq!(
             count(1),
-            39,
-            "Workstation = fleet (ansible-pull/app-sync/job_exec) + peer_app_launch (WL-UX-005) + clipboard_sync/remmina + music_autoconfig (MEDIA-8) + mesh_mount (FILEMGR-5) + bookmarks (BOOKMARKS-2) + adfilter (BOOKMARKS-7) + browser_policy (BOOKMARKS-8) + browser_passkeys (BROWSER-DD-6) + browser_session_sync (BROWSER-DD-7) + browser_read_aloud/browser_voice_command (BROWSER-DD-11) + browser_protocol/browser_share/browser_translate/browser_offline_cache/browser_security_update/browser_tab_suspend (BROWSER-DD-12) + seat_remote_input (KDC-MESH-6) + desktop_sources (CHOOSER-1) + media_sources (MEDIA-14) + media_server (MEDIA-15) + pty_broker (TERM-7) + transfers (TRANSFERS-1) + airspace + earthquake_overlay + nws_alert_overlay + nws_forecast_overlay + iem_radar_overlay + wildfire_overlay + traffic_overlay + air_quality_overlay + firms_overlay + aircraft_overlay + transit_overlay + caltrans_camera_overlay (WL-FUNC-012 adapters) — kdc moved to rank 0 (KDC-MESH-3); peer_app_launch reconciled into this census (was an uncounted rank-1 entry)"
+            40,
+            "Workstation = fleet (ansible-pull/app-sync/job_exec) + peer_app_launch (WL-UX-005) + clipboard_sync/remmina + music_autoconfig (MEDIA-8) + mesh_mount (FILEMGR-5) + bookmarks (BOOKMARKS-2) + adfilter (BOOKMARKS-7) + browser_policy (BOOKMARKS-8) + browser_passkeys (BROWSER-DD-6) + browser_session_sync (BROWSER-DD-7) + browser_read_aloud/browser_voice_command (BROWSER-DD-11) + browser_protocol/browser_share/browser_translate/browser_offline_cache/browser_security_update/browser_tab_suspend (BROWSER-DD-12) + seat_remote_input (KDC-MESH-6) + desktop_sources (CHOOSER-1) + media_sources (MEDIA-14) + media_server (MEDIA-15) + media_airsonic_proxy (WL-FUNC-014) + pty_broker (TERM-7) + transfers (TRANSFERS-1) + airspace + earthquake_overlay + nws_alert_overlay + nws_forecast_overlay + iem_radar_overlay + wildfire_overlay + traffic_overlay + air_quality_overlay + firms_overlay + aircraft_overlay + transit_overlay + caltrans_camera_overlay (WL-FUNC-012 adapters) — kdc moved to rank 0 (KDC-MESH-3); peer_app_launch reconciled into this census (was an uncounted rank-1 entry)"
         );
         // No middle tier in the 2-role model — Workstation is the top rank.
         assert_eq!(
