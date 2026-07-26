@@ -16,9 +16,9 @@ review ledgers, and operator queues are evidence sources, not parallel trackers.
 When an item is completed or retired, move it to the archive with a disposition
 instead of leaving closed work in this file.
 
-## Current Snapshot - 2026-07-25 release gate
+## Current Snapshot - 2026-07-26 release gate
 
-- **6 active epics:** 6 `Remaining`, 0 `Blocked`; no `Needs clarification`.
+- **5 active epics:** 5 `Remaining`, 0 `Blocked`; no `Needs clarification`.
 - **Release gate:** the current integrated wave passes the full `mackesd` farm
   suite at **4,124 passed, 0 failed, 1 ignored**. The Fedora 44
   base/browser/thin-lighthouse RPM cut is green at **81.7 / 39.1 / 11.0 MiB**;
@@ -37,8 +37,7 @@ instead of leaving closed work in this file.
   dropped off both LAN and overlay (`172.20.146.13` and `10.42.0.6` unreachable
   from dev, `.15`, Dell, and LH1); Eagle recovery is the current live hardware
   blocker.
-- **P0:** WL-SEC-006 (stop replicating Nebula private keys), WL-ARCH-007
-  (authorization mint + direct lifecycle proof), and
+- **P0:** WL-ARCH-007 (authorization mint + direct lifecycle proof) and
   WL-FUNC-011 (optional real media/LLM evidence remains).
 - **In flight:** WL-FUNC-012 live map feeds, WL-UX-006 Construct, and WL-UX-007
   Car. The 2026-07-23 thin-lighthouse policy is enforced in role pinning,
@@ -46,14 +45,14 @@ instead of leaving closed work in this file.
   scope minting, and both media helpers; no new lighthouse may carry media or
   file-sharing duties.
 - **Non-blocking external evidence:** WL-FUNC-011 still has optional real
-  second-peer/SIP and sealed DigitalOcean model demonstrations; WL-SEC-006
-  still has an optional controlled Nebula identity rotation/reconnect/prune
-  demonstration. These proofs no longer block autonomous implementation or
-  the active drain; missing resources remain explicitly recorded below.
+  second-peer/SIP and sealed DigitalOcean model demonstrations. These proofs no
+  longer block autonomous implementation or the active drain; missing resources
+  remain explicitly recorded below.
 - **Archived by this takeover:** WL-DOC-004, WL-FUNC-013, and WL-RUN-008 in
   `docs/worklist-archive/2026-07-22-platform-takeover.md`; WL-SEC-005 and
   WL-BUILD-004 are archived in `docs/worklist-archive/2026-07-23-thin-drain.md`;
-  WL-SEC-007 is archived in `docs/worklist-archive/2026-07-24-sec007-closure.md`.
+  WL-SEC-007 is archived in `docs/worklist-archive/2026-07-24-sec007-closure.md`;
+  WL-SEC-006 is archived in `docs/worklist-archive/2026-07-26-sec006-closure.md`.
 
 The reconciliation and operator-decision sections below are dated historical
 context. Their old counts and execution suggestions do not supersede this
@@ -256,612 +255,6 @@ These decisions refine acceptance and sequencing for the active items below.
 
 ## Security
 
-### WL-SEC-006 - Keep Nebula private keys local to their owning node
-
-- Status: Remaining
-- Progress (2026-07-26 patched F44 `.15` promotion): the SEC-006 hardening
-  commit `d5434309` is now installed on live
-  `.15`/`Basement-Test-Workstation` through Fedora 44 container-built RPMs.
-  Post-install proof shows `mackesd` active as PID `696940` with `NRestarts=0`,
-  `/proc/<pid>/exe -> /usr/bin/mackesd`, and binary sha256
-  `07b8f348195826dc0a9212078d46cb010fc71f61b44df6d041e02843263df27d`.
-  This proves the patched daemon is present on the primary proof seat; it does
-  **not** close SEC-006 by itself because no new patched rotation/blocklist
-  reload proof has yet shown the superseded cert fingerprint
-  `51c8f646ec57ecf946194c8aafa9a95e051c4bceebf09919b227e0b4f33f6901`
-  present in the rendered/reloaded blocklist.
-- Progress (2026-07-26 superseded-cert blocklist hardening): authenticated
-  Nebula identity rotation now captures the previously active certificate,
-  refuses to replace it without a local node id and a fingerprintable old cert,
-  records the superseded cert fingerprint in the replicated Nebula blocklist
-  before stale key generations are pruned, and rolls back the identity switch if
-  the blocklist record cannot be written. Per-node blocklist writes now
-  append/deduplicate existing acceptable fingerprints instead of overwriting
-  older revocations. Focused farm gates are green: `.50` slot
-  `sec006-blocklist` `cargo test -p mackesd ca::blocklist -- --nocapture` at
-  **11/11**, `.90` slot `sec006-supervisor`
-  `cargo test -p mackesd workers::nebula_supervisor --features async-services
-  -- --nocapture` at **53/53**, and changed-file rustfmt passed for the three
-  touched `mackesd` Rust files. Closure still needs a live patched-build proof
-  that `.15` renders/reloads the blocklist containing the superseded cert
-  fingerprint
-  `51c8f646ec57ecf946194c8aafa9a95e051c4bceebf09919b227e0b4f33f6901`.
-- Progress (2026-07-26 live `.15` rotation/reconnect/prune and cleanup proof):
-  `Basement-Test-Workstation` was rotated from identity generation
-  `generation-2547284-f00611649f26396d` to
-  `generation-1785031563709-d00f665695a80897` using a requester-owned Nebula
-  public key signed by LH1 for the existing overlay `10.42.0.5/17`. The active
-  certificate changed from PEM sha256
-  `d4df128967487247b9828b153e56af19c99c501952d4823ed709edc1df2546e9` to
-  `04325d7e1b78bdcf182388cf6cd3a3ef9098b7af06a83e6961eaef3a9ca89af1`, and
-  the active private-key hash changed from
-  `e66cd528ab218f29333b763ae87dd6a65b06d28cd7d199269e0556acd15b422a` to
-  `43935e2a7c8607a9910cab7016a4ee1b7c0d0fcc7c3a8a6bb063d1af13c23108`
-  without copying key material into the proof log. `nebula` was restarted,
-  overlay reachability to LH1 `10.42.0.1` recovered, and the old generation was
-  pruned. The helper `compare` between
-  `/var/tmp/wl-sec-006-rotation-before-20260726T020302Z` and
-  `/var/tmp/wl-sec-006-rotation-after-20260726T020621Z` passed every live
-  before/after assertion: clean snapshots, changed generation/cert/key hashes,
-  zero stale or unsafe after-generations, clean bounded replicated scan, active
-  Nebula overlay, and reachable probe. Follow-up cleanup removed the explicit
-  root-only rotation scratch path
-  `/root/wl-sec-006-rotation-20260726T020424Z` on `.15` because it still
-  contained old rollback identity material plus duplicate staged key material,
-  and removed the consumed LH1
-  `/mnt/mesh-storage/peer:Basement-Test-Workstation/mackesd/pending-enroll.json`
-  bearer request after verifying the signed bundle remained present with cert
-  sha256
-  `04325d7e1b78bdcf182388cf6cd3a3ef9098b7af06a83e6961eaef3a9ca89af1`.
-  A fresh post-cleanup snapshot
-  `/var/tmp/wl-sec-006-post-cleanup-20260726T021300Z` exits clean with
-  one generation, zero stale/unsafe generations, `identity_root_mode=700`,
-  `active_key_mode=600`, replicated scan **5,335** files / **0** hits / not
-  truncated, `nebula_active=true`, `mackesd_active=true`,
-  `overlay_ipv4=10.42.0.5`, and `probe_reachable=true`. The live
-  rotation/reconnect/prune evidence itself is no longer the gap.
-- Progress (2026-07-26 live `.15` clean steady-state Nebula evidence):
-  streamed the read-only `verify-nebula-rotation-evidence.sh collect` helper
-  to `Basement-Test-Workstation` after the latest Fedora 44 RPM promotion and
-  collected
-  `/var/tmp/wl-sec-006-nebula-live-clean-20260726T013433Z` with
-  `--probe 10.42.0.1 --max-scan-files 7000`. The snapshot exits clean and
-  proves the primary seat now has the generation-based identity layout
-  (`/etc/nebula/identity/current ->
-  generation-2547284-f00611649f26396d`), root-owned `0700` identity root,
-  active key mode `0600`, one active generation, zero stale or unsafe
-  generations, compatibility `host.{crt,key}` symlinks into
-  `identity/current`, active `nebula` and `mackesd`, `nebula1=10.42.0.5/17`,
-  and successful overlay reachability to LH1 `10.42.0.1`. The bounded
-  replicated scan inspected **5,331** files under `/mnt/mesh-storage`, stayed
-  below the 7,000-file cap, was not truncated, and found **0** private-key
-  marker paths. The verifier now records `proof_scope=steady-state` for clean
-  collection snapshots and prints an explicit compare-required note, preserving
-  `compare` as the only path that can claim a before/after rotation proof.
-  Local `bash -n`, helper `--self-test`, `git diff --check`, and worklist lint
-  are clean; farm `.90` reran `bash -n` plus helper `--self-test` clean after
-  sync. This earlier snapshot was clean steady-state and migration evidence,
-  not a before/after key-rotation proof; the live before/after drill is now
-  recorded in the newer 2026-07-26 rotation progress entry above.
-- Progress (2026-07-25 public thin-lighthouse rollout and seat mesh proof):
-  DigitalOcean access was restored with the operator-provided token and three
-  new thin public lighthouses were created for mesh `ephemeral-public-20260725`:
-  `lighthouse1.ephemeral.team` / `159.203.172.15` / DO id `587552916` / `nyc3`
-  / overlay `10.42.0.1`, `lighthouse2.ephemeral.team` / `137.184.231.154` /
-  DO id `587553313` / `sfo3` / overlay `10.42.0.2`, and
-  `lighthouse3.ephemeral.team` / `159.65.236.239` / DO id `587553472` /
-  `nyc1` / overlay `10.42.0.3`. All three run
-  `magic-mesh-lighthouse-12.1.0-1`, profile `small`, and have
-  `nebula`, `mackesd`, `etcd`, `caddy`, and `mesh-health.timer` active with
-  `NRestarts=0`; public TCP `22`, `4243`, and `443` are open, UDP `4242`
-  listeners are active, and the DNS records have TTL `300`. `etcdctl endpoint
-  health` is green for all three overlay endpoints, and the replicated
-  `/etc/mackesd/etcd-endpoints` roster is
-  `http://10.42.0.1:2379,http://10.42.0.2:2379,http://10.42.0.3:2379`.
-  Dell and `.15` are upgraded/enrolled into the new mesh with `root` and `mm`
-  key access, active `nebula`, `mackesd`, and `mde-shell-egui`, and pass
-  full overlay pings among the five reachable nodes. Eagle was upgraded and
-  enrolled at `10.42.0.6` after hotfixing its stale packaged `mackesd` binary
-  with the known-good 2026-07-25 binary that sends `nebula_public_key_pem`;
-  its stale Nebula config was corrected from old-lighthouse mode to peer mode,
-  but after a coordinated seat reboot Eagle dropped off LAN and overlay, so
-  the six-node proof is blocked on restoring network/power access to
-  `172.20.146.13`. The Nebula renderer now emits peer-side
-  `relay.use_relays` and `punchy` by default so same-NAT/hairpin seats are not
-  stranded after the next supervisor rewrite; focused farm validation is green
-  at **53/53** `workers::nebula_supervisor::tests`, touched-file farm rustfmt
-  is green, local `git diff --check` is clean, and the worklist linter/self-test
-  is green. Sensitive one-time enrollment bearer files under the root-only
-  rollout directory were overwritten and unlinked; reachable nodes have no
-  leftover `/root/.mcnf-new-mesh-token` temporary file.
-- Progress (2026-07-25 live `.15` legacy-bundle migration and replicated-secret
-  cleanup): `mackesd` now has a supervisor-only one-way migration for
-  pre-SEC-006 replicated bundles: generic bundle reads still fail closed on
-  secret-bearing JSON, while the local Nebula supervisor strips legacy
-  `peer_key_pem`/relay-authority/private-CA fields, rewrites the bundle through
-  the public serializer, and then migrates the owning node's already-local flat
-  `/etc/nebula/host.{crt,key}` into `/etc/nebula/identity/current` only when the
-  flat certificate matches the replicated public peer cert. Legacy flat-key
-  permissions are tightened only for owner-controlled stale read bits, and
-  config refresh now runs before a bounded leadership lookup so an unreachable
-  coordination plane cannot starve local Nebula repair; failed reloads remain
-  unacknowledged for retry. Farm gates are green: `.130` BigBoy
-  `cargo test -p mackesd --lib --features async-services
-  workers::nebula_supervisor::tests -- --nocapture` at **51/51**, `.50`
-  bundle-sanitizer regression at **1/1**, `.170` touched-file rustfmt, and the
-  corrected release build. The deployed `.15` release hash is
-  `8bccb4b1d596939942d1a2041256810a225957545f148e1d10279ae6e151ce73`; previous
-  hashes `61c0c202...` and `39349229...` were backed up under
-  `/usr/local/lib/magic-mesh-backups/`. Live proof on
-  `Basement-Test-Workstation` shows `/etc/nebula/identity` mode `0700`,
-  `identity/current -> generation-2452075-e2478c409683353e`,
-  `/etc/nebula/host.crt -> identity/current/host.crt`,
-  `/etc/nebula/host.key -> identity/current/host.key`, active key/cert targets
-  mode `0600`, and `config.yaml` pki paths set to
-  `/etc/nebula/identity/current/host.{crt,key}`. The local replicated bundle now
-  has no `peer_key_pem` and zero key/private field names. Eight other
-  replicated legacy records, including Syncthing `.stversions`, were sanitized
-  in place by removing only `peer_key_pem` without printing or copying secret
-  contents. The bounded collector snapshot
-  `/var/tmp/wl-sec-006-nebula-live-after-migration-clean-20260725T211259Z`
-  reports a clean replicated secret scan (`0` lines), `nebula.service` and
-  `mackesd.service` active with `NRestarts=0`, and `nebula1=10.42.0.8/17`.
-  The only remaining collector failure is the external overlay probe
-  `10.42.0.1` being unreachable; no replicated-key blocker remains in this
-  live workgroup scan.
-- Progress (2026-07-25 live-readonly `.15` collector rerun): streamed the
-  existing `install-helpers/verify-nebula-rotation-evidence.sh` collector to the
-  enrolled non-production seat `Basement-Test-Workstation` (`172.20.0.15`,
-  overlay `10.42.0.8`) with `sudo -n`, `--probe 10.42.0.1`, and
-  `--max-scan-files 10000` after a read-only sizing check found 5,300
-  candidate replicated files. Exact safe streaming shape:
-  ```sh
-  ssh mm@172.20.0.15 \
-    "sudo -n bash -s -- collect \
-      --out /var/tmp/wl-sec-006-nebula-live-readonly-20260725T195445Z-final2 \
-      --probe 10.42.0.1 \
-      --max-scan-files 10000" \
-    < install-helpers/verify-nebula-rotation-evidence.sh
-  ```
-  The collector remained read-only and did not print/copy private-key material;
-  the failed evidence snapshot is on the seat at
-  `/var/tmp/wl-sec-006-nebula-live-readonly-20260725T195445Z-final2`.
-  It proves live preconditions are still missing, not rotation success:
-  `/etc/nebula/identity/current` is absent because the seat still uses legacy
-  flat `/etc/nebula/host.{crt,key}`, the replicated scan found 9 suspicious
-  marker paths (paths only; contents not copied), and the LH1 overlay probe
-  `10.42.0.1` was unreachable. Read-only Eagle preflight at `172.20.146.13`
-  also showed active `nebula`/`mackesd`, overlay `10.42.0.3`, legacy flat
-  identity files, and failed overlay probes, so no destructive rotation was
-  attempted. The verifier now documents the safe live command/preconditions,
-  refuses ambiguous stdin-sudo streaming guidance, calls out legacy flat identity
-  as a rotation-readiness gap, and tells operators how to size/rerun bounded
-  workgroup scans.
-- Progress (2026-07-25 evidence-harness guardrails/live-gap diagnostics):
-  `install-helpers/verify-nebula-rotation-evidence.sh` now refuses non-empty
-  collection directories, fingerprints the collecting node with a hashed
-  machine-id, and requires clean before/after summaries plus stable
-  format/host/config/workgroup/interface metadata before `compare` can claim
-  rotation proof. Missing live interfaces no longer abort collection before
-  live-check metadata is written. Local `bash -n`, `--self-test`, and
-  diff-check are clean; the focused `.50` farm slot
-  `wlsec006-nebula-evidence` ran `bash -n` plus `--self-test` clean, including
-  mismatched-metadata, failed-snapshot, non-empty-output, and missing-live-iface
-  regressions. A read-only local collection wrote the failed snapshot
-  `/var/tmp/wl-sec-006-nebula-readonly-20260725T192202Z` without mutating
-  Nebula state; it confirms this dev host (`rocky9-kvm2`) has no
-  `/etc/nebula/identity`, no `/mnt/mesh-storage`, inactive `nebula.service` and
-  `mackesd.service`, and no `nebula1` overlay, so real live
-  rotation/reconnect/prune proof still needs an enrolled live peer/seat.
-- Progress (2026-07-25 read-only live-evidence harness): added
-  `install-helpers/verify-nebula-rotation-evidence.sh`, a bounded collector and
-  pre/post comparator for the remaining controlled Nebula drill. It hashes the
-  active identity generation/cert/key without copying secret material, checks
-  Nebula live reachability when not explicitly skipped, verifies stale
-  identity-generation pruning, and scans replicated workgroup state for
-  private-key markers while reporting only suspicious paths. Local `bash -n`
-  and `--self-test` are green. This prepares collection of real
-  rotation/reconnect/prune evidence but does not claim live proof; live evidence
-  remains external.
-- Progress (2026-07-25 stale identity-generation prune retry): replicated
-  steady-state Nebula bundle refresh now retries stale local identity-generation
-  pruning after confirming the active certificate still matches, without
-  receiving or replacing private-key material. The focused supervisor farm gate
-  is green at **49/49**, touched-file rustfmt is green, and local diff-check is
-  clean. Live Nebula rotation/reconnect/prune evidence remains external.
-- Progress (2026-07-25 node-key parent boundary): node signing-key reads and
-  creation now reject symlinked or non-directory intermediate parents before
-  opening or materializing the identity leaf, closing the parent redirect left
-  by final-leaf no-follow checks. The focused `node_key` farm gate is green at
-  **5/5**, and the integrated BigBoy mackesd gate is green at **4,118 passed,
-  0 failed, 1 ignored**. Live Nebula rotation/reconnect/prune evidence remains
-  external.
-- Progress (2026-07-25 topology-directory boundary): replicated Nebula
-  topology now rejects symlinked or non-directory intermediate components
-  before enumerating hop adverts, preventing a `topology/hops` roster from
-  escaping the workgroup root. Focused topology farm gate is green at **15/15**;
-  integrated BigBoy mackesd gate is green at **4,117 passed, 0 failed, 1
-  ignored**. Live Nebula rotation/reconnect/prune evidence remains external.
-- Progress (2026-07-25 replay-ledger root boundary): armed-token replay roots
-  now walk and validate every missing parent component, reject symlinks and
-  non-directories before use, and retain `0700` permissions on both the root
-  and spent-nonce store. Root/store symlink escape regressions are covered by
-  the focused `mackesd` gate at **30/30**; the integrated BigBoy gate is
-  **4,113 passed, 0 failed, 1 ignored**. Live Nebula rotation/reconnect/prune
-  evidence remains external.
-- Progress (2026-07-25 bundle-watch input boundary): the Nebula supervisor
-  ignores final symlinks and non-regular bundle leaves, leaving them
-  unacknowledged so a regular replacement is retried. The supervisor farm slice
-  is green at **48/48**; live rotation/reconnect/prune evidence remains
-  external.
-- Progress (2026-07-25 CSR discovery boundary): the Nebula CSR watcher now
-  rejects symlinked or non-regular roots, peer directories, CSR leaves, and
-  bundle leaves, and caps one shared-root scan at 4,096 entries before
-  allocation. The focused farm gate is green at **14/14**, and the integrated
-  BigBoy `mackesd --lib --features async-services` gate is **4,107 passed, 0
-  failed, 1 ignored**; live Nebula rotation/reconnect/prune evidence remains
-  external.
-- Progress (2026-07-25 enrollment-listener key boundary): the TLS enrollment
-  listener now reads its certificate/key material through bounded no-follow
-  readers, and refuses a non-owner-only endpoint key instead of starting with
-  unsafe private material. The focused farm listener gate is green at **13/13**;
-  the integrated BigBoy `mackesd` gate is **4,103 passed, 0 failed, 1 ignored**.
-  Live Nebula rotation/reconnect/prune evidence remains external.
-- Progress (2026-07-25 Nebula reconnect acknowledgement boundary): a failed
-  `systemctl reload-or-restart` now leaves the rotated bundle unacknowledged,
-  forcing the next supervisor sweep to retry the reconnect rather than losing
-  the update. The deterministic recovery regression and the full supervisor
-  slice are green at **46/46**; live rotation/reconnect/prune evidence remains
-  external.
-- Progress (2026-07-25 identity-root ownership boundary): existing Nebula
-  identity roots now require the current owner and mode `0700` before any
-  private-key generation or rotation write. The hostile-`0777` regression is
-  covered by the focused BigBoy supervisor gate at **45/45**; live
-  rotation/reconnect/prune evidence remains optional external proof.
-- Progress (2026-07-25 privileged router audit boundary): the router
-  executor's append/verify path now reads the replicated audit chain through
-  the bounded no-follow regular-file reader, rejecting final symlinks, special
-  files, oversized input, and invalid UTF-8 before hash-chain materialization.
-  The focused `workers::router_action` farm gate is green at **9/9**, and the
-  integrated BigBoy `mackesd --lib` gate is green at **4,091 passed, 0 failed,
-  1 ignored**; live Nebula rotation/reconnect evidence remains external.
-- Progress (2026-07-25 replicated discovery/config boundaries): router-registry
-  mirrors now reject size changes during bounded reads, while Nmap inventory,
-  VM-overlay, operator-TOML, and device-inventory readers reject final
-  symlinks, special files, oversized input, and invalid UTF-8 before
-  materialization. Focused farm gates are green at **9/9** router-registry,
-  **34/34** probe-Nmap, and **17/17** device-inventory tests; live Nebula
-  rotation/reconnect evidence remains external.
-- Progress (2026-07-25 platform role and bus configuration boundaries): the
-  pinned role reader plus federation grants/mints, template variables/includes,
-  subscription manifests, and webhook configuration now use bounded
-  descriptor-backed regular-file reads with final-symlink, special-file,
-  growth, oversized, and invalid-UTF-8 rejection before materialization.
-  Integrated farm gates are green at **424/424** `mde-bus` and **17/17**
-  `mde-role`; live Nebula rotation/reconnect evidence remains external.
-- Progress (2026-07-25 Browser action credential boundary): privileged Browser
-  action credentials and replay-nonce expiry rows now use bounded
-  descriptor-backed regular-file reads that reject final symlinks, special
-  files, oversized or changing input, and invalid UTF-8 before capability
-  decoding or expiry parsing. The integrated `mde-browser-workers --lib`
-  farm gate is green at **123/123**; live Nebula rotation/reconnect evidence
-  remains external.
-- Progress (2026-07-25 SSH public-key gossip materialization boundary): local
-  and replicated SSH public-key envelopes plus the managed `authorized_keys`
-  read now use bounded no-follow regular-file readers that reject special
-  files, final symlinks, oversized or changing input, and invalid UTF-8 before
-  signature or key materialization. The focused farm gate is green at
-  **12/12**, and the integrated BigBoy `mackesd --lib --features
-  async-services` gate is green at **4,080 passed, 0 failed, 1 ignored**;
-  live Nebula rotation/reconnect evidence remains external.
-- Progress (2026-07-25 mesh-init materialization boundary): mesh-init now
-  reads requester public keys, CA certs, signed peer certs, and the optional
-  enrollment endpoint cert through bounded no-follow readers, preserving the
-  optional fallback while rejecting hostile symlinks and oversized material.
-  The focused integrated mesh-init farm gate is green at **4/4**. Live
-  Nebula rotation/reconnect evidence remains external.
-- Progress (2026-07-25 CA generation/epoch staging boundary): generated public
-  and private CA material plus staged CA, backup, and peer-rotation reads now
-  use the existing bounded no-follow/sealed readers, rejecting hostile staging
-  symlinks and oversized material before crypto or installation. The focused
-  CA farm gate is green at **141/141** (139 library and 2 CLI tests). Live
-  Nebula rotation/reconnect evidence remains external.
-- Progress (2026-07-25 local KDC pairing-store boundary): the host identity
-  PKCS#8 key and persisted device pins now use bounded descriptor-backed
-  regular-file reads that reject final symlinks, special files, oversized or
-  growing input, and invalid UTF-8 before crypto/TOML materialization. The
-  focused pairing farm gate is green at **15/15**, and the integrated
-  `mde-kdc-host --lib` gate is green at **104/104**. Live Nebula
-  rotation/reconnect evidence remains external.
-- Progress (2026-07-25 CA-backup credential boundary): Nebula CA backup
-  passphrases and backup-armor verification now use bounded regular-file reads
-  that reject final symlinks and non-regular credential leaves before fallback
-  or dearmor materialization. The focused CA-backup farm gate is green at
-  **12/12**, and the integrated BigBoy `mackesd --lib
-  --features async-services` gate is green at **4,045 passed, 0 failed, 1
-  ignored**. Live Nebula rotation/reconnect evidence remains external.
-- Progress (2026-07-25 certificate and revocation handoff boundaries): active
-  Nebula certificate comparisons, replicated blocklist records, CA mint output,
-  and generated peer-key handoffs now use bounded regular-file readers that
-  reject final symlinks before materialization or sealing. Focused farm gates
-  are green at **44/44** supervisor tests, **10/10** blocklist tests, **7/7**
-  CA-mint tests, and **4/4** peer-key tests; the integrated BigBoy
-  `mackesd --lib --features async-services` gate is green at **4,032 passed,
-  0 failed, 1 ignored**. Live Nebula rotation/reconnect evidence remains
-  external.
-- Progress (2026-07-25 relay-authority enrollment boundary): authenticated
-  enrollment now reads the local relay seed through the sealed 0600/no-follow
-  1 MiB reader, rejecting hostile symlinks and oversized material before it can
-  enter the response. Focused farm gates are green at **101/101** enrollment
-  tests and **17/17** bundle tests; live rotation remains external.
-- Progress (2026-07-25 underlay and policy read boundaries): the external
-  lighthouse address and replicated policy TOML now use bounded,
-  descriptor-backed regular-file reads that reject final symlinks, non-regular
-  leaves, oversized input, and invalid UTF-8 before acceptance or parsing. The
-  focused farm gates are green at **7/7** lighthouse-address tests and **6/6**
-  policy tests; the integrated BigBoy `mackesd --lib --features async-services`
-  gate is green at **4,061 passed, 0 failed, 1 ignored**. Live Nebula
-  rotation/reconnect evidence remains external.
-- Progress (2026-07-24 requester/certificate materialization boundary): Nebula
-  enrollment requester public keys and generated peer certificates now use
-  bounded no-follow reads before UTF-8/string materialization, rejecting hostile
-  symlink or oversized output. The focused requester suite is green at 22/22;
-  the full BigBoy `mackesd` library gate is green at 3,992 passed, 1 ignored.
-- Progress (2026-07-24 sealed-read allocation boundary): CA, Nebula identity,
-  CSR, and authority reads now share a 1 MiB descriptor-bound limit after the
-  existing no-follow and permission checks. Oversized public/sealed material is
-  rejected before PEM/JSON materialization; the focused BigBoy seal gate is
-  green at 15/15. Live rotation/reconnect evidence remains external.
-- Progress (2026-07-24 secret and CA import allocation boundary): secret CLI
-  stdin/passphrase/armored inputs, local ciphertext reads, CA backup armor and
-  plaintext, and CA import stdin now enforce explicit byte ceilings before
-  UTF-8, dearmor, decryption, or JSON materialization. Exact-limit and
-  one-byte-over regressions are covered; the focused BigBoy gates are green at
-  3/3 CLI tests, 14/14 local-store tests, and 31/31 CA-backup tests, while the
-  integrated `mackesd` gate is green at 4,001 library tests (1 ignored), 36 CLI
-  tests, and all enabled integration suites. Live rotation/reconnect evidence
-  remains external.
-- Progress (2026-07-24 replicated-topology input hardening): Nebula hop
-  advertisements now impose byte, roster, identity, overlay-IP, CIDR, subnet,
-  duplicate-row, and duplicate-subnet boundaries before route derivation; an
-  ambiguous hop is omitted and an oversized roster fails closed. The focused
-  BigBoy topology gate is green at 9/9, with exact-file rustfmt and diff checks
-  clean. Live Nebula rotation/reconnect evidence remains external.
-- Progress (2026-07-24 topology-writer boundary hardening): hop advertisements
-  are now validated before path construction, VPN profile names/configuration
-  are bounded before filesystem mutation, and both writers use the sealed
-  unique-temp atomic path so hostile final symlinks are replaced rather than
-  followed. The regression coverage includes traversal, oversized profile,
-  and hostile-leaf cases; the full BigBoy `mackesd` library gate is green at
-  3,997 passed, 1 ignored. Live Nebula rotation/reconnect evidence remains
-  external.
-- Progress (2026-07-25 topology-verdict read boundary): replicated hop
-  advertisements and validation verdicts now use bounded descriptor-backed
-  regular-file reads that reject final symlinks, non-regular leaves, oversized
-  input, and invalid UTF-8 before JSON materialization. The focused farm
-  topology gate is green at **14/14**, and the integrated BigBoy `mackesd --lib
-  --features async-services` gate is green at **4,050 passed, 0 failed, 1
-  ignored**. Live Nebula rotation/reconnect evidence remains external.
-- Progress (2026-07-25 replicated install-profile boundary): the role/profile
-  loader now reads peer-provided TOML through bounded descriptor-backed regular
-  files, rejecting final symlinks, non-regular leaves, oversized input, and
-  invalid UTF-8 before materialization while preserving the built-in role
-  fallback. The focused farm profile gate is green at **14/14**, and the
-  integrated BigBoy `mackesd --lib --features async-services` gate is green at
-  **4,054 passed, 0 failed, 1 ignored**. Live Nebula rotation/reconnect
-  evidence remains external.
-- Progress (2026-07-24 overlay-IP publication hardening): the Nebula
-  supervisor's replicated overlay-IP writer now rejects symlinked parent
-  components and uses unique create-new staging with crash-durable replacement;
-  the hostile-parent regression is included in the full BigBoy `mackesd` gate
-  at 3,997 passed, 1 ignored. Live rotation/reconnect evidence remains
-  external.
-- Progress (2026-07-24 relay-authority refresh hardening): the Nebula supervisor
-  now refuses replicated bundle refresh and lighthouse-roster reconciliation
-  when the public relay authority does not match the root-local enrollment pin.
-  The foreign-authority regression is covered by the focused BigBoy supervisor
-  gate at 40/40; live rotation/reconnect evidence remains external.
-- Progress (2026-07-24 enrollment framing hardening): the TLS enrollment parser
-  now rejects unsupported `Transfer-Encoding` and ambiguous
-  `Transfer-Encoding`/`Content-Length` combinations before request dispatch.
-  The focused BigBoy endpoint gate is green at 18/18; live enrollment remains
-  external.
-- Progress (2026-07-24 HTTP header framing hardening): the TLS enrollment parser
-  now caps the response header block at 16 KiB before scanning or allocating the
-  enrollment body, rejecting oversized hostile headers fail-closed. The focused
-  BigBoy endpoint gate is green at 21/21; live enrollment remains external.
-- Progress (2026-07-24 Nebula refresh retry hardening): a failed bundle or
-  blocklist refresh no longer advances the supervisor's watch markers, so a
-  transiently partial or hostile update is retried on the next tick and then
-  acknowledged only after successful materialization. The focused retry gate is
-  green at 1/1 and the full supervisor module at 41/41; live rotation remains
-  external.
-- Progress (2026-07-23): code and hostile fixtures now meet the local-key design.
-  Joining nodes generate their key locally; the signer consumes only the strict
-  requester public key and verifies the returned certificate identity before an
-  atomic swap. Public replicated bundles deny secret fields; legacy secret-bearing
-  bundles fail closed; lighthouse secret enrollment is TLS-only, redacted, and
-  persisted mode 0600 with symlink-hostile atomic replacement. Epoch rotation
-  preflights/stages exact peer identities and transactionally rolls back. BigBoy
-  farm proof is green: `mackesd` and `mde-enroll` all-target checks plus 204 focused
-  CA/enrollment/client/endpoint/supervisor tests. The farm and available live seat
-  have neither `nebula` nor `nebula-cert`, so the controlled live
-  rotation/reconnect/old-root-prune demonstration remains unperformed; the
-  operator has now torn down all DigitalOcean lighthouses, so there is no live
-  Nebula peer on which to run it. A post-policy attempt to provision a fresh
-  smallest-size DO lighthouse was refused by the API with HTTP 401, so no cloud
-  state changed. This is a non-blocking evidence follow-up, not a reason to stop
-  autonomous implementation.
-- Progress (2026-07-24 DO access recheck): the configured `doctl` context still
-  returns HTTP 401, and the node-local secret store has no `do-token`; no
-  droplet or cloud state was created. A fresh operator token is still required
-  before the optional live Nebula demonstration can run.
-- Progress (2026-07-24 Eagle/.15 mesh recheck): Eagle is enrolled at
-  `10.42.0.3` and `.15` at `10.42.0.8`; both `nebula` and `mackesd` are active,
-  but handshakes to the existing lighthouse endpoints and between the two
-  seats time out. The supplied DigitalOcean token was tested directly and
-  remains rejected with HTTP 401, so the requested two new cloud lighthouses
-  cannot be created yet and no cloud state was changed.
-- Progress (2026-07-24 enrollment identity hardening): reusing an existing
-  enrollment identity now validates both files with no-follow semantics and
-  rejects arbitrary symlinks or private keys that are not owner-only `0600`.
-  Hostile symlink/permission fixtures are included; the focused farm endpoint
-  suite passes 16/16. Live Nebula rotation remains optional evidence.
-- Progress (2026-07-24 DOM0 lighthouse recovery): the hermetic four-node
-  `test-lighthouse-replace.sh` drill ran on XEN-HOME-SERVICES with the thin
-  lighthouse RPM and passed 33/33. It proved found/join, Nebula overlay
-  reachability, three-member etcd health, survivor behavior after lighthouse
-  loss, stale-member removal, replacement-lighthouse enrollment, replacement
-  quorum health, and the absence of FUSE/LizardFS mounts. This clears the
-  lighthouse lifecycle proof in the controlled environment; production
-  DigitalOcean provisioning remains optional external evidence pending a valid
-  operator token.
-- Progress (2026-07-24 supervisor stale-state hardening): leadership state now
-  advances only after a successful promote/demote transition, so a failed role
-  change remains pending for the next retry instead of being recorded as applied.
-  The role marker is owner-checked, schema-bound, node-bound, and lease-checked;
-  the focused supervisor farm suite is green at 34/34.
-- Progress (2026-07-24 sealed-file race hardening): CA and Nebula sealed-file
-  reads now consume the descriptor opened after no-follow validation, canonical
-  generation switches are validated as owner-controlled, and atomic writes
-  reject symlinked parent components before and after directory creation. The
-  hostile sealed-file farm suite is green at 14/14; the optional live Nebula
-  rotation/reconnect/prune demonstration remains external evidence.
-- Progress (2026-07-24 CSR freshness hardening): Nebula enrollment now rejects
-  CSRs older than five minutes or future-dated beyond five minutes before bearer
-  consumption or signing. Stale and future-dated regressions are covered; the
-  focused BigBoy enrollment gate is green at 45/45.
-- Progress (2026-07-24 supervisor bootstrap hardening): lighthouse promotion now
-  follows the authoritative non-expired lease even when the local role marker
-  is missing, then creates or repairs that marker. The mirror puller retains the
-  stricter marker-plus-lease contract. The focused BigBoy supervisor suite is
-  green at 35/35, including clean-marker promotion and failed-demotion retry.
-- Progress (2026-07-24 public-lighthouse installer onboarding): `mde-enroll` now
-  carries the closed public roster `lighthouse1.ephemeral.team` through
-  `lighthouse3.ephemeral.team`, keeps the pasted mesh token and its CA pin
-  immutable, and permits only those roster names or an explicitly entered pinned
-  IPv4 override. Unknown hostnames and missing pins fail closed before network
-  access. The focused roster suite is green at 6/6 and the installer binaries
-  pass the farm compile check; live DNS/DO provisioning remains external.
-- Progress (2026-07-24 Nebula roster export hardening): public roster export now
-  fails closed above 4,096 rows while retaining deterministic ordering, epoch
-  de-duplication, and revoked-certificate filtering. The focused BigBoy roster
-  suite is green at 7/7.
-- Progress (2026-07-24 federation UI capability hardening): federation accept,
-  revoke, and refuse-mint mutations now publish schema-versioned, root-scoped
-  armed capability envelopes with validated action targets; pending offers
-  visibly report remaining lifetime and fail closed to an expired/degraded state
-  when the expiry or clock is unavailable. The focused BigBoy shell federation
-  suite is green at 9/9.
-- Progress (2026-07-24 federation status-boundary hardening): the runtime
-  federation status mirror now bounds display fields and row counts and enforces
-  the shared 64 KiB Bus body limit while retaining total counts and explicit
-  truncation indicators. The focused BigBoy federation-enforcer suite is green
-  at 7/7.
-- Progress (2026-07-24 enrollment response-boundary hardening): the
-  fingerprint-pinned enrollment client now caps complete HTTP responses at
-  256 KiB before bundle parsing, using a one-byte-over-cap read to fail closed
-  without unbounded buffering. The focused `.170` `nebula_enroll_client` suite
-  is green at 12/12.
-- Progress (2026-07-24 relay-authority pin hardening): root-local authority pins
-  now require canonical lowercase hexadecimal, are created once with atomic
-  no-overwrite semantics, and reject hostile symlink targets; replicated bundle
-  reads use the no-follow sealed-file path. The focused BigBoy CA/authority
-  suite is green at 16/16. Live Nebula rotation remains optional external
-  evidence.
-- Progress (2026-07-24 enrollment authority-binding hardening): when a
-  lighthouse response carries a relay-authority private seed, the enrollment
-  client now derives and verifies its public key against the authenticated
-  bundle before persisting the local trust anchor. The focused BigBoy client
-  suite is green at 13/13; live Nebula/credential proof remains external.
-- Progress (2026-07-24 enrollment HTTP framing hardening): the TLS enrollment
-  parser now rejects repeated `Content-Length` headers instead of allowing an
-  ambiguous framing choice to reach the JSON handler, and enrollment responses
-  carry `Cache-Control: no-store` because authenticated lighthouse responses can
-  contain sensitive CA material. The focused BigBoy endpoint suite is green at
-  17/17; live Nebula/lighthouse evidence remains external.
-- Progress (2026-07-24 bearer grammar hardening): Nebula join-token validation
-  now rejects nonterminal `=` padding inside bearer values and accepts padding
-  only at the terminal boundary, preventing malformed bearer text from reaching
-  enrollment. The focused `.50` enrollment suite is green at 46/46; live
-  Nebula/lighthouse evidence remains external.
-- Progress (2026-07-24 backup-armor boundary hardening): CA backup dearmor now
-  rejects an incomplete export without its exact END delimiter, while the
-  existing validated transactional restore remains covered. The focused `.50`
-  CA backup gate is green at 29/29; live CA restore evidence remains external.
-- Progress (2026-07-24 enrollment client response framing): the pinned TLS
-  enrollment client now validates the HTTP/1.1 status line, header names, exact
-  `Content-Length`, duplicate-length ambiguity, and unsupported transfer
-  coding before JSON parsing. Four hostile framing regressions are covered; the
-  focused BigBoy client gate is green at 17/17. Live Nebula/lighthouse evidence
-  remains external.
-- Progress (2026-07-24 pending-CSR key-boundary hardening): peer enrollment now
-  validates the submitted Nebula X25519 public-key PEM before bearer
-  authorization, signer scratch creation, certificate-row insertion, or bundle
-  writes. The hostile malformed-key regression is included in the focused
-  BigBoy enrollment gate at 93/93; live Nebula evidence remains external.
-- Progress (2026-07-24 requester-key staging boundary): network enrollment now
-  validates every config-root component as a real directory before creating the
-  requester staging tree, and revalidates the fresh staging directory before
-  invoking `nebula-cert`; symlinked, non-directory, and parent-component paths
-  fail before any key write. The focused BigBoy enrollment-client gate is green
-  at 20/20; live Nebula/lighthouse evidence remains external.
-- Progress (2026-07-24 identity-materialization path boundary): Nebula config and
-  identity roots now use no-follow, component-by-component directory creation
-  before CA, certificate, or private-key materialization. Four hostile
-  symlink/non-directory regressions are included in the BigBoy supervisor gate
-  at 39/39; live Nebula rotation remains external.
-- Progress (2026-07-25 identity-generation retention boundary): after an
-  authenticated atomic identity switch, the supervisor now removes only
-  owner-controlled, mode-0700 prior generation directories matching its
-  generated name grammar; unexpected names, symlinks, and unsafe metadata are
-  preserved. The focused BigBoy supervisor gate is green at 42/42, including
-  prior-generation pruning; live rotation/reconnect evidence remains external.
-- Progress (2026-07-25 node-signing-key read boundary): the persisted Ed25519
-  seed now uses an exact 32-byte descriptor-backed regular-file read that
-  rejects final symlinks, special files, oversized or growing input before key
-  materialization. The focused farm gate is green at **4/4**, and the
-  integrated BigBoy `mackesd --lib --features async-services` gate is green at
-  **4,063 passed, 0 failed, 1 ignored**. Live Nebula rotation/reconnect
-  evidence remains external.
-- Progress (2026-07-25 overlay-IP read boundary): the canonical Nebula
-  overlay-IP reader now rejects final symlinks, special files, oversized or
-  growing input, and invalid UTF-8 before IP parsing while preserving the
-  unresolved/no-public-bind gate. The focused KDC overlay gate is green at
-  **5/5**, and live Nebula rotation/reconnect evidence remains external.
-- Priority: P0
-- Complexity: Epic
-- Problem: Any node able to read replicated enrollment bundles can obtain other
-  nodes' Nebula private keys and impersonate them. A compromised shared tree can
-  also replace a relay trust authority and its signatures together unless the
-  enrollment-pinned authority is held outside that mutable bundle.
-- Required outcome: Each joining node generates and retains its own Nebula private
-  key, the CA signs only the submitted public key, and no peer, CA, or relay private
-  key is written to replicated state. Authenticated enrollment pins the relay
-  authority in a root-owned local trust file; steady-state bundle updates must
-  match that pin. Every remaining secret-bearing local write is atomic, durable,
-  and explicitly mode `0600`.
-- Scope: Nebula CSR/sign backend and wire contract, network/file enrollment
-  delivery, steady-state bundle schema, local trust/key persistence, migration,
-  revocation, and rotation of already-issued fleet identities. Public
-  certificates, lighthouse rosters, and signed relay advertisements may remain
-  replicated.
-- Relevant files/components: `crates/mesh/mackesd/src/nebula_enroll.rs`,
-  `nebula_enroll_client.rs`, `ca/sign.rs`, `ca/bundle.rs`,
-  `workers/nebula_supervisor.rs`, and the `NebulaCertBackend` implementations.
-- Acceptance criteria: The signer consumes the requester's exact public key and
-  never receives/creates its private half; serialized steady-state bundles contain
-  no private-key fields or PEM; a hostile peer reading every replicated file
-  cannot authenticate as another node; mutable authority substitution fails
-  against the local pin; migrated nodes rotate and revoke the former shared
-  identities without losing overlay reachability.
-- Verification method: Hostile serialization/permission tests, requester-key
-  certificate match proof, two-node enrollment fixture with filesystem inspection,
-  authority-substitution negative tests, farm suites, and a controlled live
-  rotation/reconnect drill.
-- Origin or merged source IDs: 2026-07-22 Codex takeover review of WL-RUN-008 trust
-  bootstrap and pre-existing enrollment persistence.
-
 ## Build, Installation, And Deployment
 
 ## Core Architecture
@@ -875,6 +268,15 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-ARCH-007 - Repair Workloads cockpit E2E wire, placement, and authorization
 
 - Status: Remaining
+- Progress (2026-07-26 lifecycle op allowlist verifier): the read-only
+  Workloads live-proof helper now refuses retained `action/vm/lifecycle`
+  evidence whose `op` is outside the real VM lifecycle contract
+  (`create`, `start`, `stop`, `pause`, `resume`, `destroy`, `attach_usb`,
+  `detach_usb`, or read-only `refresh`). The self-test proves an unknown op is
+  blocked while HMAC token material remains redacted. Validation is green via
+  local `python3 -m py_compile`, helper `--self-test`, and the `.50`
+  `proof-helpers` synced-checkout farm gate. No live lifecycle action or
+  destructive Workloads mutation was taken.
 - Progress (2026-07-26 lifecycle-action verifier freshness): the read-only
   Workloads live-proof helper now treats retained `action/vm/lifecycle`
   evidence as fresh only when its Bus index timestamp is an integer within the
@@ -2056,6 +1458,30 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-012 - Maps live-data overlays (zero-cost external feeds)
 
 - Status: Remaining
+- Progress (2026-07-26 MG90 Airspace root-SSH survey adapter): the Airspace
+  worker no longer stops at an unconditional production `NoSource` when a seat
+  already has `MDE_VEHICLE_GATEWAY` configured. It now wires a production
+  `Mg90RootSshSurveyProbe` through the same pinned root-SSH credential path as
+  the vehicle worker, runs only a bounded read-only `iw` survey on MG90
+  managed/station Wi-Fi interfaces, parses BSS rows into typed
+  `AirspaceSurvey` contacts, and publishes `Ready` with honest gaps when the
+  scan succeeds but observes zero contacts. The worker still refuses to invent
+  cellular-neighbor contacts or Bluetooth RSSI from Status Broadcast or
+  metadata-only inquiry output; those remain explicit gaps until a real
+  signal-bearing MG90 command/endpoint is proven. `docs/ops/mg90-access.md` and
+  the transport-neutral airspace type docs now record this boundary. Live
+  read-only MG90 probing from `.15` confirmed the root-SSH plane is reachable,
+  `iw`/`iwconfig`/`hcitool` are present, `wlan0` is managed, `wlan1` is AP,
+  `aeromon.wlan1` is monitor, and the current bounded scan observes no Wi-Fi
+  contacts while GNSS remains `no-fix`/0 satellites; no MG90 configuration was
+  changed. Farm evidence is green: `.90` slot `airspace-root-ssh`
+  `cargo test -p mackesd workers::airspace --features async-services
+  -- --nocapture` at **12/12**, `.170` slot `airspace-types`
+  `cargo test -p mackes-mesh-types airspace -- --nocapture` at **4/4**, and
+  `.50` slot `airspace-fmt` direct `rustfmt --edition 2021 --check` for the
+  touched Airspace files. Live `.15` package deploy/restart remains the next
+  proof before claiming the installed Airspace mirror has moved from
+  `no_source` to the new ready/offline production state.
 - Progress (2026-07-26 IEM/NEXRAD default-on degraded mirror): the
   zero-cost `iem-radar` Workstation worker is now default-on with explicit
   false-y opt-out via `MDE_OVERLAY_IEM_RADAR=0|false|no|off`. When the seat has
@@ -2582,6 +2008,22 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-006 - Construct interface (Apple-HIG-principled workstation shell)
 
 - Status: Remaining
+- Progress (2026-07-26 Springboard Dock deterministic hit-target proof):
+  `nav_bar.rs` now has
+  `hit_targets_stay_inside_the_painted_navigation_chrome`, proving the
+  Back/Home/Pin/pinned-source hit rectangles stay inside the painted rounded
+  backing for floating and docked modes, normal and non-zero-origin screens,
+  pinned-source counts `0`, `1`, and `MAX_PINNED_SOURCES`, and both transition
+  directions at multiple animation offsets. Focused farm verification is green:
+  BigBoy `.130` `cargo test -p mde-shell-egui
+  hit_targets_stay_inside_the_painted_navigation_chrome -- --nocapture` at
+  **1/1**, with the sidecar's broader `nav_bar` suite at **18/18**, and `.50`
+  touched-file rustfmt for `nav_bar.rs`. A read-only `.15` readiness check
+  found `mde-shell-egui`, `mackesd`, and `nebula` active with `NRestarts=0`,
+  `/usr/libexec/mackesd/seat-remote-input` present and dry-run working,
+  `/dev/uinput` owned `root:input`, and DRM connected at 1920x1080. Physical
+  pointer replay remains unclaimed because the available helper would drive the
+  live seat and there is no read-only click-result oracle in this slice.
 - Progress (2026-07-26 `.15` `d5434309` correction): the native
   `xcp-build.sh rpm` artifacts for `d5434309` were intentionally **not**
   installed on `.15` after `rpm -Uvh --test` rejected the Fedora 42-linked

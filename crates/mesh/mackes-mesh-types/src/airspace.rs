@@ -4,8 +4,9 @@
 //! the daemon boundary equally honest: a node with no proven survey source
 //! publishes AirspaceAvailability::NoSource, a failed probe publishes
 //! AirspaceAvailability::Offline, and only a typed survey supplied by an
-//! injected probe can contribute contacts. There is intentionally no MG90
-//! endpoint or command here; the repository does not prove one.
+//! injected probe can contribute contacts. This wire contract remains
+//! transport-neutral; the production worker is responsible for proving any MG90
+//! command or endpoint before injecting a typed survey.
 
 use serde::{Deserialize, Serialize};
 

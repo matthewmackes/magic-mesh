@@ -8,7 +8,7 @@ Protocol reference: [AirLink MG90 Software Configuration Guide, Rev 6](https://w
 
 | Plane | Endpoint | Adapter command | Use |
 | --- | --- | --- | --- |
-| Root SSH | `172.20.0.25:2222` | `ssh-probe`, `ssh-exec` | OS identity, raw NMEA, committed config, explicitly armed control |
+| Root SSH | `172.20.0.25:2222` | `ssh-probe`, `ssh-exec` | OS identity, raw NMEA, committed config, read-only Wi-Fi survey (`iw`), explicitly armed control |
 | MG-LCI | `http://172.20.0.25/` | `lci-get` | General board/ignition and WAN status |
 | MG90 apps | `http://172.20.0.25:11532/` | `app-get` | GPS, OBD-II, heavy telemetry, GPIO, and Acetech status pages |
 | Status broadcast | MG90-configured UDP port | `status-listen PORT` | Documented JSON beacon: GNSS, WAN, VPN, GPIO, ignition, battery, temperature |
@@ -87,10 +87,14 @@ only—the worker does not alter the MG90 configuration. `status-listen PORT` pe
 the equivalent bounded
 receive-only check for an operator shell session and prints raw datagrams.
 
-The Rev. 6 guide does not define a Wi-Fi, cellular, or Bluetooth scanner-contact
-protocol or endpoint. The Airspace worker therefore remains `NO SCANNER FEED`
-until a real scanner adapter is supplied; this access helper and the vehicle
-Status Broadcast path must not be used to manufacture contacts.
+The Rev. 6 guide does not define a Status Broadcast field for Wi-Fi, cellular,
+or Bluetooth scanner contacts. The production Airspace worker therefore does
+not manufacture contacts from Status Broadcast. On seats with
+`MDE_VEHICLE_GATEWAY` configured, it uses the pinned root-SSH plane to run a
+bounded, read-only `iw` survey on managed Wi-Fi interfaces and publishes the
+result as `state/airspace/<node>`. Current cellular-neighbor details and
+Bluetooth RSSI-bearing contacts remain unproven on this MG90 plane; they stay
+honest gaps until a real command/endpoint supplies signal-bearing rows.
 
 ## Failure interpretation
 

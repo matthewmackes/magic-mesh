@@ -51,6 +51,17 @@ VM_LIFECYCLE_ACTION_TOPIC = "action/vm/lifecycle"
 VM_INSTANCES_TOPIC = "event/vm/instances"
 ONBOARD_APPLY_ACTION_TOPIC = "action/onboard/apply"
 ONBOARD_APPLY_EVENT_TOPIC = "event/onboard/apply"
+VM_LIFECYCLE_MUTATION_OPS = {
+    "attach_usb",
+    "create",
+    "destroy",
+    "detach_usb",
+    "pause",
+    "resume",
+    "start",
+    "stop",
+}
+VM_LIFECYCLE_ACTION_OPS = VM_LIFECYCLE_MUTATION_OPS | {"refresh"}
 
 MAX_MESSAGE_BYTES = 1_048_576
 MAX_DROPIN_BYTES = 16 * 1024
@@ -582,6 +593,8 @@ def check_lifecycle_action(args: argparse.Namespace, checks: list[Check]) -> Non
             blockers.append("armed_token missing")
         if not isinstance(op, str):
             blockers.append("op missing")
+        elif op not in VM_LIFECYCLE_ACTION_OPS:
+            blockers.append(f"unknown lifecycle op {op!r}")
         if not name and op != "refresh":
             blockers.append("target VM name missing")
         evidence = {
@@ -986,6 +999,26 @@ def self_test() -> int:
             root,
             VM_LIFECYCLE_ACTION_TOPIC,
             "ZZZWORKLOADSLIVEPROOF0004",
+            {
+                "schema_version": 1,
+                "host": "node-a",
+                "op": "teleport",
+                "name": "demo-vm",
+                "armed_token": "invalid-op-super-secret-token",
+            },
+            now_ms(),
+        )
+        lifecycle_checks = []
+        check_lifecycle_action(lifecycle_args, lifecycle_checks)
+        assert lifecycle_checks[0].status == "blocked"
+        assert "unknown lifecycle op" in lifecycle_checks[0].detail
+        invalid_op_json = json.dumps(lifecycle_checks[0].to_json(), sort_keys=True)
+        assert "invalid-op-super-secret-token" not in invalid_op_json
+        assert "present-redacted" in invalid_op_json
+        _write_bus_message(
+            root,
+            VM_LIFECYCLE_ACTION_TOPIC,
+            "ZZZWORKLOADSLIVEPROOF0005",
             {
                 "schema_version": 1,
                 "host": "node-a",

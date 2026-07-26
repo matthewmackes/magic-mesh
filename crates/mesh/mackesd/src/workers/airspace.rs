@@ -1,12 +1,11 @@
 //! MG90 airspace survey adapter.
 //!
 //! This worker owns the daemon-side seam for the Maps Airspace surface. The
-//! repository proves MG90 LCI, application, status-broadcast, and GPS planes,
-//! but it does not prove a Wi-Fi/cellular/Bluetooth survey endpoint or command.
-//! Consequently the production constructor has no guessed transport. A future
-//! proven adapter, or a test fixture, injects the typed Mg90SurveyProbe seam.
-//! Until then the worker publishes an explicit no-source snapshot with zero
-//! contacts.
+//! repository proves MG90 LCI, application, status-broadcast, GPS, and pinned
+//! root-SSH planes. The production adapter therefore uses only the proven
+//! root-SSH plane and read-only OS survey commands (`iw`) for Wi-Fi contacts.
+//! Cellular survey and Bluetooth RSSI are still not invented from Status
+//! Broadcast or metadata-only inquiry output.
 
 #![cfg(feature = "async-services")]
 
@@ -16,10 +15,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mackes_mesh_types::airspace::{
-    airspace_state_topic, AirspaceSnapshot, AirspaceSurvey, MAX_GAPS, MAX_SNAPSHOT_BYTES,
+    airspace_state_topic, AirspaceContact, AirspaceContactKind, AirspaceSnapshot, AirspaceSurvey,
+    MAX_GAPS, MAX_SNAPSHOT_BYTES,
 };
 
-use super::{ShutdownToken, Worker};
+use super::{vehicle, ShutdownToken, Worker};
+
+use vehicle::VehicleProbe;
 
 /// Mirror cadence and heartbeat interval.
 pub const POLL: Duration = Duration::from_secs(5);
@@ -32,6 +34,55 @@ const MAX_SCAN_FUTURE_SKEW_MS: i64 = 5_000;
 /// bounded freshness window. The publication timestamp is local and therefore
 /// cannot by itself prove that the scanner data is current.
 const MAX_SCAN_AGE_MS: i64 = 30_000;
+/// Upper bound for the complete MG90 root-SSH survey transcript.
+const MAX_ROOT_SSH_SURVEY_BYTES: usize = 96 * 1024;
+
+/// Read-only MG90 root-SSH survey script.
+///
+/// This intentionally filters to managed/station Wi-Fi interfaces so an MG90
+/// access-point interface is not asked to scan. It does not alter wireless,
+/// Bluetooth, cellular, or GPS configuration.
+const ROOT_SSH_SURVEY_SCRIPT: &str = r#"PATH=/usr/sbin:/usr/bin:/sbin:/bin
+echo MDE_AIRSPACE_SURVEY_V1
+if command -v iw >/dev/null 2>&1; then
+    ifaces="$(iw dev 2>/dev/null | awk '
+        /^[[:space:]]*Interface[[:space:]]+/ { iface=$2 }
+        /^[[:space:]]*type[[:space:]]+/ && ($2 == "managed" || $2 == "station") && iface != "" { print iface; iface="" }
+    ' | head -4)"
+    if [ -z "$ifaces" ]; then
+        echo "GAP wifi: no managed interfaces reported by iw dev"
+    fi
+    for iface in $ifaces; do
+        echo "BEGIN_WIFI_IFACE $iface"
+        tmp="/tmp/mde-airspace-wifi-$$"
+        if timeout 8 iw dev "$iface" scan >"$tmp" 2>&1; then
+            rc=0
+        else
+            rc=$?
+        fi
+        head -220 "$tmp" 2>/dev/null || true
+        rm -f "$tmp"
+        echo "END_WIFI_IFACE $iface RC=$rc"
+    done
+else
+    echo "GAP wifi: iw command unavailable"
+fi
+if command -v hcitool >/dev/null 2>&1; then
+    echo "BEGIN_BT_INQUIRY"
+    tmp="/tmp/mde-airspace-bt-$$"
+    if timeout 10 hcitool scan >"$tmp" 2>&1; then
+        rc=0
+    else
+        rc=$?
+    fi
+    head -80 "$tmp" 2>/dev/null || true
+    rm -f "$tmp"
+    echo "END_BT_INQUIRY RC=$rc"
+else
+    echo "GAP bluetooth: hcitool command unavailable"
+fi
+echo "GAP cellular: no MG90 root-SSH cellular-neighbor survey command is proven"
+"#;
 
 /// Injectable typed MG90 survey seam.
 ///
@@ -58,16 +109,23 @@ pub struct AirspaceWorker {
 }
 
 impl AirspaceWorker {
-    /// Construct the honest production default.
+    /// Construct the production worker.
     ///
-    /// No endpoint is guessed because the repository does not establish an
-    /// MG90 survey protocol. Use with_probe only with a proven adapter or a
-    /// captured test seam.
+    /// When the seat already has `MDE_VEHICLE_GATEWAY` configured, this wires a
+    /// read-only MG90 root-SSH survey probe through the same pinned credential
+    /// path as the vehicle worker. Otherwise it publishes explicit no-source.
     #[must_use]
     pub fn new(host: String) -> Self {
+        let probe: Option<Arc<dyn Mg90SurveyProbe>> = std::env::var(vehicle::GATEWAY_ENV)
+            .ok()
+            .map(|gateway| gateway.trim().to_string())
+            .filter(|gateway| !gateway.is_empty())
+            .map(|gateway| {
+                Arc::new(Mg90RootSshSurveyProbe::from_gateway(&gateway)) as Arc<dyn Mg90SurveyProbe>
+            });
         Self {
             host,
-            probe: None,
+            probe,
             bus_root: crate::bus_publish::default_bus_root(),
             poll: POLL,
         }
@@ -298,6 +356,295 @@ impl AirspaceWorker {
     }
 }
 
+/// Production MG90 survey probe using the already-proven pinned root-SSH plane.
+pub struct Mg90RootSshSurveyProbe {
+    transport: vehicle::SshHttpProbe,
+}
+
+impl Mg90RootSshSurveyProbe {
+    /// Build the probe from the same gateway syntax used by the vehicle worker.
+    #[must_use]
+    pub fn from_gateway(gateway: &str) -> Self {
+        Self {
+            transport: vehicle::SshHttpProbe::from_env(gateway),
+        }
+    }
+}
+
+impl Mg90SurveyProbe for Mg90RootSshSurveyProbe {
+    fn survey(&self) -> io::Result<AirspaceSurvey> {
+        let body = self.transport.run_ssh(ROOT_SSH_SURVEY_SCRIPT)?;
+        parse_root_ssh_survey(&body, now_ms())
+    }
+}
+
+#[derive(Debug, Default)]
+struct WifiBuilder {
+    id: String,
+    iface: String,
+    name: String,
+    signal_dbm: Option<i32>,
+    channel: Option<u16>,
+    encryption: Option<String>,
+}
+
+impl WifiBuilder {
+    fn finish(self, contacts: &mut Vec<AirspaceContact>, gaps: &mut Vec<String>) {
+        let Some(signal_dbm) = self.signal_dbm else {
+            push_gap(
+                gaps,
+                format!(
+                    "Wi-Fi contact {} on {} omitted: signal strength missing",
+                    self.id, self.iface
+                ),
+            );
+            return;
+        };
+        contacts.push(AirspaceContact {
+            id: self.id,
+            kind: AirspaceContactKind::Wifi,
+            name: self.name,
+            signal_dbm,
+            // MG90 `iw` survey output does not report directional bearing.
+            // Preserve the contact and record the missing-bearing gap once at
+            // survey level instead of dropping real BSSID/signal evidence.
+            bearing_deg: 0.0,
+            channel: self.channel,
+            encryption: self.encryption,
+            notable: false,
+            watchlist: false,
+            own: false,
+        });
+    }
+}
+
+fn parse_root_ssh_survey(output: &str, scanned_at_ms: i64) -> io::Result<AirspaceSurvey> {
+    if output.len() > MAX_ROOT_SSH_SURVEY_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "MG90 airspace survey exceeded {MAX_ROOT_SSH_SURVEY_BYTES} bytes before parsing"
+            ),
+        ));
+    }
+
+    let mut lines = output.lines();
+    if lines.next() != Some("MDE_AIRSPACE_SURVEY_V1") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "MG90 airspace survey header missing",
+        ));
+    }
+
+    let mut contacts = Vec::new();
+    let mut gaps = Vec::new();
+    let mut current_wifi: Option<WifiBuilder> = None;
+    let mut wifi_attempts = 0_u32;
+    let mut wifi_successes = 0_u32;
+    let mut bluetooth_rows_without_rssi = 0_u32;
+    let mut in_bt = false;
+
+    for raw in lines {
+        let line = raw.trim_end_matches('\r');
+        if let Some(iface) = line.strip_prefix("BEGIN_WIFI_IFACE ") {
+            finish_wifi(&mut current_wifi, &mut contacts, &mut gaps);
+            wifi_attempts = wifi_attempts.saturating_add(1);
+            push_gap(&mut gaps, format!("Wi-Fi survey attempted on {iface}"));
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("END_WIFI_IFACE ") {
+            finish_wifi(&mut current_wifi, &mut contacts, &mut gaps);
+            if rest.ends_with(" RC=0") {
+                wifi_successes = wifi_successes.saturating_add(1);
+            } else {
+                push_gap(&mut gaps, format!("Wi-Fi survey failed: {rest}"));
+            }
+            continue;
+        }
+        if line == "BEGIN_BT_INQUIRY" {
+            in_bt = true;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("END_BT_INQUIRY") {
+            in_bt = false;
+            if !rest.trim().ends_with("RC=0") {
+                push_gap(&mut gaps, format!("Bluetooth inquiry failed: {rest}"));
+            }
+            continue;
+        }
+        if let Some(gap) = line.strip_prefix("GAP ") {
+            push_gap(&mut gaps, gap.to_string());
+            continue;
+        }
+
+        if in_bt {
+            if bluetooth_inquiry_row(line).is_some() {
+                bluetooth_rows_without_rssi = bluetooth_rows_without_rssi.saturating_add(1);
+            }
+            continue;
+        }
+
+        let trimmed = line.trim_start();
+        if let Some(id) = wifi_bss_id(trimmed) {
+            finish_wifi(&mut current_wifi, &mut contacts, &mut gaps);
+            current_wifi = Some(WifiBuilder {
+                id,
+                iface: wifi_bss_iface(trimmed).unwrap_or_default(),
+                ..WifiBuilder::default()
+            });
+            continue;
+        }
+
+        let Some(wifi) = current_wifi.as_mut() else {
+            continue;
+        };
+        if let Some(signal) = wifi_signal_dbm(trimmed) {
+            wifi.signal_dbm = Some(signal);
+        } else if let Some(ssid) = trimmed.strip_prefix("SSID:") {
+            wifi.name = ssid.trim_start().to_string();
+        } else if let Some(channel) = wifi_channel(trimmed) {
+            wifi.channel = Some(channel);
+        } else if trimmed.starts_with("RSN:") {
+            wifi.encryption = Some("WPA2/RSN".to_string());
+        } else if trimmed.starts_with("WPA:") {
+            wifi.encryption = Some("WPA".to_string());
+        } else if trimmed.starts_with("capability:")
+            && trimmed.split_whitespace().any(|part| part == "Privacy")
+            && wifi.encryption.is_none()
+        {
+            wifi.encryption = Some("secured".to_string());
+        }
+    }
+    finish_wifi(&mut current_wifi, &mut contacts, &mut gaps);
+
+    if wifi_attempts == 0 || wifi_successes == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "MG90 Wi-Fi survey source unavailable",
+        ));
+    }
+    if contacts.is_empty() {
+        push_gap(
+            &mut gaps,
+            "MG90 Wi-Fi survey completed but observed zero contacts".to_string(),
+        );
+    } else {
+        push_gap(
+            &mut gaps,
+            "MG90 Wi-Fi survey output does not report bearing; contacts use neutral bearing 0"
+                .to_string(),
+        );
+    }
+    if bluetooth_rows_without_rssi > 0 {
+        push_gap(
+            &mut gaps,
+            format!(
+                "Bluetooth inquiry observed {bluetooth_rows_without_rssi} device(s) but no RSSI; contacts omitted"
+            ),
+        );
+    } else {
+        push_gap(
+            &mut gaps,
+            "Bluetooth inquiry exposes no RSSI-bearing contacts in this MG90 plane".to_string(),
+        );
+    }
+
+    Ok(AirspaceSurvey {
+        scanned_at_ms: Some(scanned_at_ms),
+        contacts,
+        gaps,
+    })
+}
+
+fn finish_wifi(
+    current: &mut Option<WifiBuilder>,
+    contacts: &mut Vec<AirspaceContact>,
+    gaps: &mut Vec<String>,
+) {
+    if let Some(wifi) = current.take() {
+        wifi.finish(contacts, gaps);
+    }
+}
+
+fn push_gap(gaps: &mut Vec<String>, gap: String) {
+    if gaps.len() < MAX_GAPS && !gaps.iter().any(|existing| existing == &gap) {
+        gaps.push(gap);
+    }
+}
+
+fn wifi_bss_id(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("BSS ")?;
+    let id = rest
+        .split([' ', '('])
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    is_mac_like(&id).then_some(id)
+}
+
+fn wifi_bss_iface(line: &str) -> Option<String> {
+    line.split_once("(on ")
+        .and_then(|(_, rest)| rest.split_once(')').map(|(iface, _)| iface.to_string()))
+}
+
+fn wifi_signal_dbm(line: &str) -> Option<i32> {
+    let raw = line.strip_prefix("signal:")?.trim();
+    let number = raw.split_whitespace().next()?.parse::<f32>().ok()?;
+    if !number.is_finite() {
+        return None;
+    }
+    Some(number.round().clamp(-150.0, 0.0) as i32)
+}
+
+fn wifi_channel(line: &str) -> Option<u16> {
+    if let Some(raw) = line.strip_prefix("DS Parameter set: channel") {
+        return raw.trim().parse::<u16>().ok();
+    }
+    if let Some(raw) = line.strip_prefix("primary channel:") {
+        return raw.trim().parse::<u16>().ok();
+    }
+    let freq = line
+        .strip_prefix("freq:")?
+        .trim()
+        .split_whitespace()
+        .next()?
+        .parse::<u32>()
+        .ok()?;
+    wifi_freq_to_channel(freq)
+}
+
+fn wifi_freq_to_channel(freq_mhz: u32) -> Option<u16> {
+    match freq_mhz {
+        2_412..=2_472 if (freq_mhz - 2_407).is_multiple_of(5) => {
+            u16::try_from((freq_mhz - 2_407) / 5).ok()
+        }
+        2_484 => Some(14),
+        5_000..=5_895 if (freq_mhz - 5_000).is_multiple_of(5) => {
+            u16::try_from((freq_mhz - 5_000) / 5).ok()
+        }
+        5_955..=7_115 if (freq_mhz - 5_950).is_multiple_of(5) => {
+            u16::try_from((freq_mhz - 5_950) / 5).ok()
+        }
+        _ => None,
+    }
+}
+
+fn bluetooth_inquiry_row(line: &str) -> Option<(&str, &str)> {
+    let trimmed = line.trim();
+    let (mac, name) = trimmed.split_once(char::is_whitespace)?;
+    is_mac_like(mac).then_some((mac, name.trim()))
+}
+
+fn is_mac_like(value: &str) -> bool {
+    let mut parts = value.split(':');
+    (0..6).all(|_| {
+        parts
+            .next()
+            .is_some_and(|part| part.len() == 2 && part.chars().all(|c| c.is_ascii_hexdigit()))
+    }) && parts.next().is_none()
+}
+
 #[async_trait::async_trait]
 impl Worker for AirspaceWorker {
     fn name(&self) -> &'static str {
@@ -372,6 +719,82 @@ mod tests {
         }
     }
 
+    #[test]
+    fn root_ssh_survey_parses_iw_bss_contacts() {
+        let survey = parse_root_ssh_survey(
+            r#"MDE_AIRSPACE_SURVEY_V1
+BEGIN_WIFI_IFACE wlan0
+BSS aa:bb:cc:dd:ee:ff(on wlan0)
+	freq: 2412
+	signal: -45.00 dBm
+	SSID: shop-floor
+	RSN:	 * Version: 1
+END_WIFI_IFACE wlan0 RC=0
+BEGIN_BT_INQUIRY
+Scanning ...
+END_BT_INQUIRY RC=0
+GAP cellular: no MG90 root-SSH cellular-neighbor survey command is proven
+"#,
+            10_000,
+        )
+        .expect("survey parses");
+
+        assert_eq!(survey.scanned_at_ms, Some(10_000));
+        assert_eq!(survey.contacts.len(), 1);
+        let contact = &survey.contacts[0];
+        assert_eq!(contact.id, "aa:bb:cc:dd:ee:ff");
+        assert_eq!(contact.kind, AirspaceContactKind::Wifi);
+        assert_eq!(contact.name, "shop-floor");
+        assert_eq!(contact.signal_dbm, -45);
+        assert_eq!(contact.channel, Some(1));
+        assert_eq!(contact.encryption.as_deref(), Some("WPA2/RSN"));
+        assert!(survey.gaps.iter().any(|gap| gap.contains("bearing")));
+        assert!(survey.gaps.iter().any(|gap| gap.contains("cellular")));
+    }
+
+    #[test]
+    fn root_ssh_survey_ready_with_empty_successful_wifi_scan() {
+        let survey = parse_root_ssh_survey(
+            r#"MDE_AIRSPACE_SURVEY_V1
+BEGIN_WIFI_IFACE wlan0
+END_WIFI_IFACE wlan0 RC=0
+BEGIN_BT_INQUIRY
+Scanning ...
+END_BT_INQUIRY RC=0
+"#,
+            10_000,
+        )
+        .expect("empty scan is a successful survey");
+
+        assert!(survey.contacts.is_empty());
+        assert!(survey
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("observed zero contacts")));
+    }
+
+    #[test]
+    fn root_ssh_survey_rejects_missing_header_and_unavailable_wifi() {
+        let missing_header = parse_root_ssh_survey(
+            "BEGIN_WIFI_IFACE wlan0\nEND_WIFI_IFACE wlan0 RC=0\n",
+            10_000,
+        )
+        .expect_err("header required");
+        assert_eq!(missing_header.kind(), io::ErrorKind::InvalidData);
+
+        let unavailable = parse_root_ssh_survey(
+            r#"MDE_AIRSPACE_SURVEY_V1
+GAP wifi: no managed interfaces reported by iw dev
+BEGIN_BT_INQUIRY
+Scanning ...
+END_BT_INQUIRY RC=0
+"#,
+            10_000,
+        )
+        .expect_err("wifi source required");
+        assert_eq!(unavailable.kind(), io::ErrorKind::NotFound);
+    }
+
     #[tokio::test]
     async fn worker_publishes_ready_snapshot_to_node_topic() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -416,6 +839,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().to_path_buf();
         let mut worker = AirspaceWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+        worker.probe = None;
         let (tx, rx) = tokio::sync::watch::channel(false);
         let task = tokio::spawn(async move { worker.run(ShutdownToken::from_receiver(rx)).await });
         let topic = airspace_state_topic("rig-1");

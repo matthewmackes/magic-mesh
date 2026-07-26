@@ -43,6 +43,13 @@
 # A live node that still uses flat /etc/nebula/host.{crt,key} files without the
 # identity/current generation symlink is enrolled, but is not a safe target for
 # this rotation proof until the generation layout and rollback plan are present.
+#
+# Read-only blocklist render/reload proof for a known superseded cert:
+#   sudo install-helpers/verify-nebula-rotation-evidence.sh blocklist-proof \
+#     --fingerprint <64-hex-nebula-cert-fingerprint> \
+#     --out /var/tmp/wl-sec-006-blocklist-proof-$(date -u +%Y%m%dT%H%M%SZ) \
+#     --probe <reachable-peer-overlay-ip> \
+#     --require-active-not-target
 set -euo pipefail
 
 DEFAULT_CONFIG_DIR="/etc/nebula"
@@ -63,11 +70,18 @@ Commands:
   collect [--out DIR] [--config-dir DIR] [--workgroup-root DIR]
           [--iface IFACE] [--probe OVERLAY_IP] [--no-live]
           [--max-scan-files N] [--max-scan-bytes N]
+  blocklist-proof --fingerprint 64_HEX [--out DIR] [--config-dir DIR]
+          [--workgroup-root DIR] [--iface IFACE] [--probe OVERLAY_IP]
+          [--no-live] [--require-active-not-target]
   compare [--before DIR --after DIR] | compare BEFORE_DIR AFTER_DIR
   --self-test
 
 Exit status:
   collect exits nonzero when a hard invariant cannot be evidenced.
+  blocklist-proof exits nonzero unless the superseded cert fingerprint is present
+  in the replicated blocklist and rendered pki.blocklist; live mode also requires
+  Nebula active with a reload/start journal marker after the target blocklist
+  record mtime.
   compare exits nonzero unless the snapshots prove a real identity change and
   the after snapshot is clean. Snapshots made with --no-live can prove the
   filesystem/rotation harness only; they cannot claim live reconnect evidence.
@@ -81,6 +95,10 @@ die() {
 
 is_uint() {
   [[ "${1:-}" =~ ^[0-9]+$ ]]
+}
+
+is_fingerprint() {
+  [[ "${1:-}" =~ ^[0-9A-Fa-f]{64}$ ]]
 }
 
 is_generation_name() {
@@ -173,6 +191,258 @@ scan_replicated_state() {
   done < <(find "$root" -xdev -type f -size "-${max_bytes}c" -print0 2>>"$hits_file.find-errors")
 
   printf '%s %s %s\n' "$count" "$hits" "$truncated"
+}
+
+config_has_pki_blocklist_fingerprint() {
+  local config_yaml="$1" fp="$2"
+  awk -v fp="$fp" '
+    /^pki:/ { in_pki = 1; next }
+    in_pki && /^[^[:space:]]/ { in_pki = 0; in_block = 0 }
+    in_pki && /^  blocklist:/ { in_block = 1; next }
+    in_block && /^    - / {
+      if (index($0, fp) > 0) found = 1
+      next
+    }
+    in_block && $0 !~ /^    - / { in_block = 0 }
+    END { exit(found ? 0 : 1) }
+  ' "$config_yaml"
+}
+
+journal_last_nebula_reload_epoch() {
+  local since_epoch="$1"
+  if ! command -v journalctl >/dev/null 2>&1; then
+    return 0
+  fi
+  journalctl -u nebula.service --since "@$since_epoch" -o short-unix --no-pager 2>/dev/null \
+    | awk '
+        /Reloaded nebula.service|Started nebula.service/ {
+          split($1, ts, ".")
+          last = ts[1]
+        }
+        END {
+          if (last != "") print last
+        }
+      '
+}
+
+blocklist_proof_mode() {
+  local config_dir="$DEFAULT_CONFIG_DIR"
+  local workgroup_root="$DEFAULT_WORKGROUP_ROOT"
+  local iface="$DEFAULT_IFACE"
+  local out_dir=""
+  local fingerprint=""
+  local probe_target=""
+  local no_live=0
+  local require_active_not_target=0
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --fingerprint)
+        [ "$#" -ge 2 ] || die "--fingerprint needs 64_HEX"
+        fingerprint="$2"; shift 2 ;;
+      --out)
+        [ "$#" -ge 2 ] || die "--out needs DIR"
+        out_dir="$2"; shift 2 ;;
+      --config-dir)
+        [ "$#" -ge 2 ] || die "--config-dir needs DIR"
+        config_dir="$2"; shift 2 ;;
+      --workgroup-root)
+        [ "$#" -ge 2 ] || die "--workgroup-root needs DIR"
+        workgroup_root="$2"; shift 2 ;;
+      --iface)
+        [ "$#" -ge 2 ] || die "--iface needs IFACE"
+        iface="$2"; shift 2 ;;
+      --probe)
+        [ "$#" -ge 2 ] || die "--probe needs OVERLAY_IP"
+        probe_target="$2"; shift 2 ;;
+      --no-live)
+        no_live=1; shift ;;
+      --require-active-not-target)
+        require_active_not_target=1; shift ;;
+      -h|--help)
+        usage; return 0 ;;
+      *)
+        die "unexpected blocklist-proof argument: $1" ;;
+    esac
+  done
+
+  [ -n "$fingerprint" ] || die "blocklist-proof needs --fingerprint"
+  is_fingerprint "$fingerprint" || die "--fingerprint must be 64 hex characters"
+
+  if [ -z "$out_dir" ]; then
+    out_dir="$(mktemp -d "${TMPDIR:-/tmp}/nebula-blocklist-proof.XXXXXX")"
+  fi
+  prepare_output_dir "$out_dir"
+  SNAPSHOT_FILE="$out_dir/snapshot.env"
+
+  local fail=0 summary="$out_dir/summary.txt"
+  local blocklist_root="$workgroup_root/ca/blocklist"
+  local config_yaml="$config_dir/config.yaml"
+  local target_records="$out_dir/blocklist-target-records.txt"
+  : >"$SNAPSHOT_FILE"
+  : >"$summary"
+  : >"$target_records"
+
+  write_kv format 1
+  write_kv proof_scope blocklist-render-reload
+  write_kv collected_at_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  write_kv hostname "$(hostname -f 2>/dev/null || hostname 2>/dev/null || printf unknown)"
+  write_kv machine_id_sha256 "$(sha_or_unreadable /etc/machine-id)"
+  write_kv euid "$(id -u)"
+  write_kv config_dir "$config_dir"
+  write_kv workgroup_root "$workgroup_root"
+  write_kv iface "$iface"
+  write_kv target_fingerprint "$fingerprint"
+  write_kv blocklist_dir "$blocklist_root"
+  write_kv config_yaml "$config_yaml"
+
+  local replicated_contains=false target_record_count=0 target_record_latest_mtime=0 path mtime
+  if [ -d "$blocklist_root" ]; then
+    while IFS= read -r -d '' path; do
+      if LC_ALL=C grep -aFq -- "$fingerprint" "$path" 2>/dev/null; then
+        replicated_contains=true
+        target_record_count=$((target_record_count + 1))
+        printf '%s\n' "$path" >>"$target_records"
+        mtime="$(stat -c %Y -- "$path" 2>/dev/null || printf 0)"
+        if is_uint "$mtime" && [ "$mtime" -gt "$target_record_latest_mtime" ]; then
+          target_record_latest_mtime="$mtime"
+        fi
+      fi
+    done < <(find "$blocklist_root" -maxdepth 1 -type f -name '*.json' -print0 2>/dev/null)
+  fi
+  write_kv replicated_blocklist_contains_target "$replicated_contains"
+  write_kv replicated_blocklist_target_record_count "$target_record_count"
+  write_kv replicated_blocklist_target_latest_mtime_epoch "$target_record_latest_mtime"
+  if [ "$replicated_contains" != true ]; then
+    printf 'FAIL replicated blocklist does not contain target fingerprint under %s\n' "$blocklist_root" >>"$summary"
+    fail=1
+  fi
+
+  local rendered_contains=false rendered_pki_contains=false config_mtime=0
+  if [ -f "$config_yaml" ]; then
+    config_mtime="$(stat -c %Y -- "$config_yaml" 2>/dev/null || printf 0)"
+    if LC_ALL=C grep -aFq -- "$fingerprint" "$config_yaml" 2>/dev/null; then
+      rendered_contains=true
+    fi
+    if config_has_pki_blocklist_fingerprint "$config_yaml" "$fingerprint"; then
+      rendered_pki_contains=true
+    fi
+  fi
+  write_kv config_yaml_mtime_epoch "$config_mtime"
+  write_kv rendered_config_contains_target "$rendered_contains"
+  write_kv rendered_pki_blocklist_contains_target "$rendered_pki_contains"
+  if [ "$rendered_pki_contains" != true ]; then
+    printf 'FAIL rendered Nebula config pki.blocklist does not contain target fingerprint: %s\n' "$config_yaml" >>"$summary"
+    fail=1
+  fi
+  if [ "$target_record_latest_mtime" -gt 0 ] && [ "$config_mtime" -lt "$target_record_latest_mtime" ]; then
+    printf 'FAIL rendered config is older than the target blocklist record (config=%s blocklist=%s)\n' \
+      "$config_mtime" "$target_record_latest_mtime" >>"$summary"
+    fail=1
+  fi
+
+  if [ "$require_active_not_target" -eq 1 ]; then
+    local active_fingerprint=""
+    if command -v nebula-cert >/dev/null 2>&1 && [ -f "$config_dir/identity/current/host.crt" ]; then
+      active_fingerprint="$(
+        nebula-cert print -json -path "$config_dir/identity/current/host.crt" 2>/dev/null \
+          | sed -n 's/.*"fingerprint":"\([0-9A-Fa-f]\{64\}\)".*/\1/p' \
+          | head -n1
+      )"
+    fi
+    write_kv active_nebula_fingerprint "${active_fingerprint:-unavailable}"
+    if [ -z "$active_fingerprint" ]; then
+      printf 'FAIL could not fingerprint active Nebula cert to prove the target is superseded\n' >>"$summary"
+      fail=1
+    elif [ "$active_fingerprint" = "$fingerprint" ]; then
+      printf 'FAIL target fingerprint matches the active Nebula cert; refusing to call it superseded\n' >>"$summary"
+      fail=1
+    fi
+  else
+    write_kv active_nebula_fingerprint skipped
+  fi
+
+  if [ "$no_live" -eq 1 ]; then
+    write_kv live_checks skipped
+    write_kv nebula_active skipped
+    write_kv mackesd_active skipped
+    write_kv nebula_iface_up skipped
+    write_kv overlay_ipv4 skipped
+    write_kv probe_target "$probe_target"
+    write_kv probe_reachable skipped
+    write_kv nebula_reload_after_blocklist skipped
+    printf 'WARN live checks skipped by --no-live; this snapshot cannot prove a live Nebula reload\n' >>"$summary"
+  else
+    local nebula_active mackesd_active link_up overlay_ip reachable="skipped"
+    local reload_epoch="" reload_after_blocklist=false
+    nebula_active="$(bool_from_systemctl_active nebula.service)"
+    mackesd_active="$(bool_from_systemctl_active mackesd.service)"
+    link_up="$(iface_up "$iface")"
+    overlay_ip="$(overlay_ipv4 "$iface")"
+    write_kv live_checks enabled
+    write_kv nebula_active "$nebula_active"
+    write_kv mackesd_active "$mackesd_active"
+    write_kv nebula_iface_up "$link_up"
+    write_kv overlay_ipv4 "$overlay_ip"
+    write_kv probe_target "$probe_target"
+    if [ -n "$probe_target" ]; then
+      if timeout 6 ping -c1 -W2 "$probe_target" >/dev/null 2>&1; then
+        reachable=true
+      else
+        reachable=false
+      fi
+    fi
+    write_kv probe_reachable "$reachable"
+    systemctl show nebula.service mackesd.service \
+      -p Id -p LoadState -p ActiveState -p SubState -p NRestarts \
+      -p ActiveEnterTimestamp -p ExecMainPID -p ReloadResult --no-pager \
+      >"$out_dir/systemd-services.txt" 2>&1 || true
+    ip -o addr show "$iface" >"$out_dir/overlay-addresses.txt" 2>&1 || true
+    if [ "$target_record_latest_mtime" -gt 0 ]; then
+      reload_epoch="$(journal_last_nebula_reload_epoch "$target_record_latest_mtime")"
+      if is_uint "${reload_epoch:-}" && [ "$reload_epoch" -ge "$target_record_latest_mtime" ]; then
+        reload_after_blocklist=true
+      fi
+    fi
+    write_kv nebula_last_reload_or_start_epoch "${reload_epoch:-missing}"
+    write_kv nebula_reload_after_blocklist "$reload_after_blocklist"
+    journalctl -u nebula.service --since "@${target_record_latest_mtime:-0}" --no-pager \
+      >"$out_dir/journal-nebula-after-blocklist.txt" 2>&1 || true
+    if [ "$nebula_active" != "true" ]; then
+      printf 'FAIL nebula.service is not active\n' >>"$summary"
+      fail=1
+    fi
+    if [ "$mackesd_active" != "true" ]; then
+      printf 'FAIL mackesd.service is not active\n' >>"$summary"
+      fail=1
+    fi
+    if [ "$link_up" != "true" ] || [ -z "$overlay_ip" ]; then
+      printf 'FAIL %s is not up with an IPv4 overlay address\n' "$iface" >>"$summary"
+      fail=1
+    fi
+    if [ "$reachable" = "false" ]; then
+      printf 'FAIL overlay probe target is unreachable: %s\n' "$probe_target" >>"$summary"
+      fail=1
+    fi
+    if [ "$reload_after_blocklist" != true ]; then
+      printf 'FAIL no Nebula reload/start journal marker was found at or after the target blocklist record mtime\n' >>"$summary"
+      fail=1
+    fi
+  fi
+
+  if [ "$fail" -eq 0 ]; then
+    if [ "$no_live" -eq 1 ]; then
+      printf 'PASS WL-SEC-006 blocklist render evidence is complete for this snapshot; live reload proof was skipped\n' >>"$summary"
+      printf 'PASS WL-SEC-006 blocklist render evidence: %s\n' "$out_dir"
+    else
+      printf 'PASS WL-SEC-006 live blocklist render/reload evidence is complete for this snapshot\n' >>"$summary"
+      printf 'PASS WL-SEC-006 live blocklist render/reload evidence: %s\n' "$out_dir"
+    fi
+  else
+    printf 'FAIL WL-SEC-006 blocklist render/reload proof has evidence gaps: %s\n' "$out_dir" >>"$summary"
+    sed -n '1,160p' "$summary" >&2
+    return 1
+  fi
 }
 
 collect_mode() {
@@ -605,6 +875,7 @@ self_test() {
   local before="$td/before" after="$td/after" leak="$td/leak"
   local unsafe="$td/unsafe" mismatched="$td/mismatched" nonempty="$td/nonempty"
   local live_missing="$td/live-missing"
+  local blocklist_ok="$td/blocklist-ok" blocklist_missing="$td/blocklist-missing"
   local legacy="$td/legacy-flat" legacy_config="$td/legacy-nebula"
   mkdir -p "$config_dir/identity" "$workgroup_root"
   chmod 700 "$config_dir/identity"
@@ -640,6 +911,46 @@ self_test() {
   else
     echo "  FAIL: changed clean snapshots should compare" >&2
     fails=$((fails + 1))
+  fi
+
+  mkdir -p "$workgroup_root/ca/blocklist"
+  printf '%s\n' '{"node_id":"peer:test","fingerprints":["cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"]}' \
+    >"$workgroup_root/ca/blocklist/peer_test.json"
+  printf '%s\n' \
+    'pki:' \
+    '  ca: /etc/nebula/ca.crt' \
+    '  cert: /etc/nebula/identity/current/host.crt' \
+    '  key: /etc/nebula/identity/current/host.key' \
+    '  blocklist:' \
+    '    - "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"' \
+    '' \
+    'static_host_map: {}' \
+    >"$config_dir/config.yaml"
+  if blocklist_proof_mode \
+      --config-dir "$config_dir" \
+      --workgroup-root "$workgroup_root" \
+      --fingerprint cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc \
+      --out "$blocklist_ok" \
+      --no-live >/dev/null; then
+    echo "  ok: blocklist render proof passes without live reload claim"
+    if [ "$(kv_get "$blocklist_ok" proof_scope)" != "blocklist-render-reload" ]; then
+      echo "  FAIL: blocklist proof must label its proof scope" >&2
+      fails=$((fails + 1))
+    fi
+  else
+    echo "  FAIL: blocklist render proof should pass for matching replicated/rendered state" >&2
+    fails=$((fails + 1))
+  fi
+  if blocklist_proof_mode \
+      --config-dir "$config_dir" \
+      --workgroup-root "$workgroup_root" \
+      --fingerprint dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd \
+      --out "$blocklist_missing" \
+      --no-live >/dev/null 2>&1; then
+    echo "  FAIL: blocklist proof must fail when the target fingerprint is absent" >&2
+    fails=$((fails + 1))
+  else
+    echo "  ok: blocklist proof fails when target fingerprint is absent"
   fi
 
   if compare_mode "$before" "$before" >/dev/null 2>&1; then
@@ -728,6 +1039,10 @@ case "${1:-}" in
   collect)
     shift
     collect_mode "$@"
+    ;;
+  blocklist-proof)
+    shift
+    blocklist_proof_mode "$@"
     ;;
   compare)
     shift

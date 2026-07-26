@@ -869,6 +869,57 @@ mod tests {
     }
 
     #[test]
+    fn hit_targets_stay_inside_the_painted_navigation_chrome() {
+        let screens = [
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0)),
+            egui::Rect::from_min_size(egui::pos2(73.0, 41.0), egui::vec2(1280.0, 800.0)),
+        ];
+        let pinned_counts = [0, 1, MAX_PINNED_SOURCES];
+        let transition_offsets = [
+            Duration::ZERO,
+            Duration::from_millis(90),
+            Duration::from_millis(180),
+            Duration::from_millis(270),
+        ];
+
+        for screen in screens {
+            for pinned_count in pinned_counts {
+                assert_hit_targets_inside_backing(
+                    format!("floating screen={screen:?} pinned={pinned_count}"),
+                    &floating_geometry_for(screen, pinned_count),
+                );
+                assert_hit_targets_inside_backing(
+                    format!("docked screen={screen:?} pinned={pinned_count}"),
+                    &docked_geometry_for(screen, pinned_count),
+                );
+
+                let start = Instant::now();
+                for (from, to) in [
+                    (DockMode::Floating, DockMode::Docked),
+                    (DockMode::Docked, DockMode::Floating),
+                ] {
+                    let state = State {
+                        mode: to,
+                        transition: Some(TransitionState {
+                            from,
+                            to,
+                            started: start,
+                        }),
+                    };
+                    for offset in transition_offsets {
+                        assert_hit_targets_inside_backing(
+                            format!(
+                                "{from:?}->{to:?} screen={screen:?} pinned={pinned_count} offset={offset:?}"
+                            ),
+                            &state.geometry_for(screen, start + offset, pinned_count),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn smoothstep_has_stationary_endpoints() {
         assert_eq!(smoothstep(0.0), 0.0);
         assert_eq!(smoothstep(1.0), 1.0);
@@ -1615,5 +1666,109 @@ mod tests {
         ));
         fs::create_dir_all(&dir).expect("create nav-bar test directory");
         dir
+    }
+
+    fn assert_hit_targets_inside_backing(label: String, geometry: &Geometry) {
+        assert!(
+            geometry.outer.is_positive(),
+            "{label}: navigation backing must have a positive visual footprint"
+        );
+        for control in &geometry.controls {
+            for point in hit_rect_probe_points(control.rect) {
+                assert!(
+                    point_inside_rounded_rect(point, geometry.outer, geometry.radius),
+                    "{label}: {:?} hit target point {point:?} escapes painted backing {:?} radius {:?} rect {:?}",
+                    control.kind,
+                    geometry.outer,
+                    geometry.radius,
+                    control.rect
+                );
+            }
+        }
+    }
+
+    fn hit_rect_probe_points(rect: egui::Rect) -> [egui::Pos2; 9] {
+        [
+            rect.left_top(),
+            egui::pos2(rect.center().x, rect.top()),
+            rect.right_top(),
+            egui::pos2(rect.left(), rect.center().y),
+            rect.center(),
+            egui::pos2(rect.right(), rect.center().y),
+            rect.left_bottom(),
+            egui::pos2(rect.center().x, rect.bottom()),
+            rect.right_bottom(),
+        ]
+    }
+
+    fn point_inside_rounded_rect(
+        point: egui::Pos2,
+        rect: egui::Rect,
+        radius: egui::CornerRadius,
+    ) -> bool {
+        const EPSILON: f32 = 0.01;
+        if point.x < rect.left() - EPSILON
+            || point.x > rect.right() + EPSILON
+            || point.y < rect.top() - EPSILON
+            || point.y > rect.bottom() + EPSILON
+        {
+            return false;
+        }
+
+        let in_corner = |radius: u8, corner_center: egui::Pos2| {
+            let radius = f32::from(radius);
+            if radius <= 0.0 {
+                true
+            } else {
+                (point - corner_center).length_sq() <= (radius + EPSILON).powi(2)
+            }
+        };
+
+        if point.x < rect.left() + f32::from(radius.nw)
+            && point.y < rect.top() + f32::from(radius.nw)
+        {
+            return in_corner(
+                radius.nw,
+                egui::pos2(
+                    rect.left() + f32::from(radius.nw),
+                    rect.top() + f32::from(radius.nw),
+                ),
+            );
+        }
+        if point.x > rect.right() - f32::from(radius.ne)
+            && point.y < rect.top() + f32::from(radius.ne)
+        {
+            return in_corner(
+                radius.ne,
+                egui::pos2(
+                    rect.right() - f32::from(radius.ne),
+                    rect.top() + f32::from(radius.ne),
+                ),
+            );
+        }
+        if point.x < rect.left() + f32::from(radius.sw)
+            && point.y > rect.bottom() - f32::from(radius.sw)
+        {
+            return in_corner(
+                radius.sw,
+                egui::pos2(
+                    rect.left() + f32::from(radius.sw),
+                    rect.bottom() - f32::from(radius.sw),
+                ),
+            );
+        }
+        if point.x > rect.right() - f32::from(radius.se)
+            && point.y > rect.bottom() - f32::from(radius.se)
+        {
+            return in_corner(
+                radius.se,
+                egui::pos2(
+                    rect.right() - f32::from(radius.se),
+                    rect.bottom() - f32::from(radius.se),
+                ),
+            );
+        }
+
+        true
     }
 }
