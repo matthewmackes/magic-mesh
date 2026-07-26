@@ -415,4 +415,11 @@ the same `view.rs`/`model.rs` files.
   fail closed when `fetched_at_ms` is stale or future-dated; a mirror may report
   provider availability, but the verifier must not label it ready unless the
   feed timestamp is fresh for the selected acceptance window.
+- Installed-seat catalog proof: run
+  `install-helpers/verify-live-mirrors.py --catalog-overlay-node <node> --require-installed-overlay-catalog`.
+  It must fail unless every locked default-on `state/overlay/<feed>/<node>` topic
+  has a current installed-seat mirror. This proves topic/worker presence only:
+  explicit status-only mirrors can pass installed presence while still reporting
+  `ready=false` until fresh `fetched_at_ms` feed evidence exists; combine with
+  `--require-ready` for live provider acceptance.
 - License audit: grep the feed config for license tiers; §4 documents the failures.

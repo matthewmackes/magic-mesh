@@ -1582,6 +1582,24 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-012 - Maps live-data overlays (zero-cost external feeds)
 
 - Status: Remaining
+- Progress (2026-07-26 installed overlay catalog verifier): the live-mirror
+  verifier now has an installed-seat catalog gate:
+  `--require-installed-overlay-catalog` requires `--catalog-overlay-node` and
+  fails unless every locked default-on zero-cost
+  `state/overlay/<feed>/<node>` topic has a current installed-seat Bus mirror.
+  The proof deliberately separates installed-topic presence from live provider
+  readiness: explicit status-only mirrors with `availability`/`gaps` can satisfy
+  installed presence, but remain `fresh=false` and `ready=false` until a fresh
+  `fetched_at_ms` feed snapshot exists; `--require-ready` still requires live
+  feed evidence. The gate also fail-closes stale/future feed timestamps and
+  stale/future indexed Bus envelope `ts_unix_ms` values, so retained or future
+  mirrors cannot prove an installed catalog. `docs/design/maps-live-overlays.md`
+  now records this installed-seat proof contract. Verification is green locally
+  for `python3 -m py_compile install-helpers/verify-live-mirrors.py`,
+  `install-helpers/verify-live-mirrors.py --self-test`, and scoped
+  `git diff --check`; farm `.90` slot `probe-key` passed the same Python
+  bytecode/self-test after `xcp-build.sh sync`. No Bus publications, external
+  feed calls, credentials, or live host mutations were used.
 - Progress (2026-07-26 live-overlay verifier no-stale-as-ready hardening):
   `install-helpers/verify-live-mirrors.py` now fails closed on overlay readiness:
   `--require-ready` can no longer report a stale or future-dated `fetched_at_ms`
