@@ -2248,6 +2248,21 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-014 - Music interface LAN AirSonic mesh gateway
 
 - Status: Remaining
+- Progress (2026-07-26 AirSonic outage metadata/audio cache): `mde-musicd`
+  now has a gateway/source-scoped durable cache for cacheable read-only
+  AirSonic metadata responses (`getAlbumList2`, artist/search/song/album/genre/
+  podcast/radio/lyrics/playlist reads, and starred/frequent-style album
+  lists). Successful live responses refresh the cache; temporary transport/
+  gateway failures replay the cached metadata without masking API/auth/parse
+  failures or playlist mutations. The playback engine also writes complete
+  finite `/rest/stream?id=...` responses into the existing recently-played
+  audio cache with safe filenames and LRU index updates, and falls back to those
+  bytes when a later live stream fetch/read fails; raw radio URLs and cover-art
+  fetches stay on their separate paths. Farm evidence is green: `.130` BigBoy
+  slot `musicd-airsonic-cache-tests` `cargo test -p mde-musicd --lib --
+  --nocapture` passed **116/116**, including one-shot gateway outage metadata
+  replay and stream-cache identity tests; `.90` slot `musicd-airsonic-cache-fmt`
+  `cargo fmt -p mde-musicd -- --check` passed.
 - Progress (2026-07-26 AirSonic gateway proxy responder): `mackesd` now has a
   tiered `media_airsonic_proxy` worker for the Subsonic/AirSonic gateway source
   model. It serves `/mde/airsonic/<source-id>/rest/...` from port 4040 for
@@ -2356,6 +2371,27 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-015 - Media Workspace LAN Jellyfin mesh gateway
 
 - Status: Remaining
+- Progress (2026-07-26 Jellyfin gateway outage metadata cache):
+  `mde-jellyfin` now has a persisted, credential-free `MetadataCache` for
+  source-scoped Jellyfin snapshots under `mde/jellyfin/metadata/snapshots.json`.
+  The snapshot stores last successful metadata/recent rows, image tags used to
+  rebuild cache-stable artwork URLs, and `UserData` resume positions from
+  `BaseItemDto`, but strips `MediaSources` before persistence so stream/
+  transcode URLs and `api_key` query material cannot become a local credential
+  cache. Its write API accepts no token, password, client auth header, or sealed
+  `credential_ref`. The Media Workspace mesh-gateway Connect path now requests
+  `UserData`, refreshes the snapshot after a live gateway browse, and on
+  gateway-client or transport failure restores cached rows with an explicit
+  stale/unavailable status that says playback still needs the gateway or a
+  downloaded offline title; gateway rows still do not materialize into
+  `ServerStore`. Focused farm evidence is green: `.90` slot
+  `wl-func-015-metadata-cache` `cargo test -p mde-jellyfin metadata_cache -- --
+  nocapture` **2/2**, `.130` BigBoy slot `wl-func-015-media-cache` `cargo test
+  -p mde-media-egui mesh_gateway -- --nocapture` **3/3**, `.50` slot
+  `wl-func-015-cache-fmt` `cargo fmt -p mde-jellyfin -p mde-media-egui -- --
+  check`, and local `git diff --check`. This advances the
+  metadata/artwork/recent-playback outage-cache layer without storing
+  credentials; live cross-node gateway playback proof remains.
 - Progress (2026-07-26 Jellyfin gateway playback role gates):
   `mde-jellyfin` now attaches an explicit `JellyfinAccessPolicy` to clients:
   direct saved-token clients default to `full-access`, `gateway-playback`
@@ -3533,6 +3569,24 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-007 - Car interface (CarPlay-principled vehicle mode)
 
 - Status: Remaining
+- Progress (2026-07-26 Car installed-capture freshness guard):
+  `install-helpers/verify-shell-pixel-proof.py` now has a `car-screen` profile
+  for any Car surface, sharing the same populated left instrument-strip pixel
+  guard that `car-home` uses before the home-only dashboard/card/app-strip
+  assertions run. Installed Car proof can now add
+  `--require-car-instrument-freshness` with a same-run
+  `verify-live-mirrors.py --vehicle-node ... --require-online` JSON result; the
+  verifier fails closed when that evidence is missing, stale beyond policy,
+  offline, not a `state/vehicle/<node>` result, or time-skewed from the PNG
+  capture, and reports the mirror topic/host/age/MGOS/fix fields in the metric
+  bundle. This intentionally does not OCR the readout values or claim a fresh
+  live `.15` capture; it prevents a pixel-only Car PNG from being counted as
+  fresh-instrument evidence without a contemporaneous vehicle mirror proof.
+  Focused verification is green: local `python3 -m py_compile
+  install-helpers/verify-shell-pixel-proof.py` and
+  `install-helpers/verify-shell-pixel-proof.py --self-test`; farm `.170` slot
+  `ux-car-pixel-fresh` ran the same bytecode compile plus verifier `--self-test`
+  clean. Live MG90 drive/fix and physical Car capture remain external gates.
 - Progress (2026-07-26 Maps/MG90 Admin advanced-menu viewport regression):
   the Admin section selector no longer uses an unconditional 96 px minimum that
   can place its egui `interact` rect outside a shell-reserved/narrow workspace.
@@ -4041,6 +4095,33 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-009 - Unified workspace theme and design language
 
 - Status: Remaining
+- Progress (2026-07-26 themed tooltip style-gate cleanup): the Mesh Teams
+  frame, Calls controls, thread resolution button, and local reaction chips now
+  route their remaining hover labels through the existing themed
+  `CommsHoverExt` / `comms_tooltip` primitive instead of egui's raw
+  `.on_hover_text` popup. This clears the current shared style-leak gate's
+  hover-text class without changing command behavior or inventing new read
+  models. Verification is green: `install-helpers/lint-style-leaks.sh` reports
+  zero desktop/shared leaks; `.90` slot `collab-hover-style-test-20260726`
+  `cargo test -p mde-collab-egui comms_hover -- --nocapture` passed **1/1**;
+  `.170` slot `collab-hover-style-fmt-20260726` touched-file `rustfmt --edition
+  2021 --check` passed for `calls.rs`, `messages.rs`, and `frame.rs`.
+- Progress (2026-07-26 Quazar Light palette cutover): the shared `mde-egui`
+  light color scheme is now production Quazar Light instead of the temporary
+  Windows-2000-basic palette. The `Style` module owns named Quazar Light
+  ground/surface/border/text/accent/pressed-face tokens, light-mode color
+  projection remaps the default accent to the governed Quazar blue, and
+  selected/pressed controls keep high-contrast graphite text on the light
+  pressed face. Shell Settings copy and tests now call the mode `Quazar Light`,
+  and menu/chrome tests resolve the new shared tokens. Focused farm evidence is
+  green: `.50` slot `quazar-light-egui` `cargo test -p mde-egui light -- --
+  nocapture` **2/2**, `.130` BigBoy slot `quazar-light-system` `cargo test -p
+  mde-shell-egui quazar_light -- --nocapture` **1/1**, `.90` slot
+  `quazar-light-settings-choice` `cargo test -p mde-shell-egui
+  settings_choice_tiles_use_themed_selected_and_hover_colors -- --nocapture`
+  **1/1**, `.170` slot `quazar-light-fmt-r2` touched-file `rustfmt --edition
+  2021 --check`, plus a stale `WIN2000` / `Windows 2000` grep over non-target
+  files and `git diff --check`.
 - Progress (2026-07-26 governance/design-lock alignment): `AI_GOVERNANCE.md`
   §4 and `docs/design/platform-interfaces.md` now match the active WL-UX-006 /
   WL-UX-009 operator lock instead of the stale 2026-07-22 dark-only/no-launcher-

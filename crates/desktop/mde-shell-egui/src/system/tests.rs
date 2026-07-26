@@ -118,7 +118,7 @@ fn render_settings_choice_frame(ctx: &egui::Context, selected: bool) -> egui::Fu
                         ui,
                         selected,
                         "Light",
-                        Some("Windows 2000 basic"),
+                        Some("Quazar Light"),
                         SettingsGroup::Personalization.accent(),
                         Style::SP_XL,
                     );
@@ -285,8 +285,8 @@ fn settings_choice_tiles_use_themed_selected_and_hover_colors() {
     let light_selected = settings_choice_colors(&light, true, false, accent);
     assert_eq!(
         light_selected.fill,
-        Style::WIN2000_PRESSED_FACE,
-        "light selected choices should keep black text on the classic pressed face"
+        Style::QUAZAR_LIGHT_PRESSED_FACE,
+        "light selected choices should keep strong text on the Quazar Light pressed face"
     );
     assert_eq!(light_selected.text, light_palette.text_strong);
 
@@ -300,7 +300,7 @@ fn settings_choice_tiles_use_themed_selected_and_hover_colors() {
     );
     let fills = painted_fill_colors(&out.shapes);
     assert!(
-        fills.contains(&Style::WIN2000_PRESSED_FACE),
+        fills.contains(&Style::QUAZAR_LIGHT_PRESSED_FACE),
         "selected Settings choices should paint their own selected fill: {fills:?}"
     );
 }
@@ -1902,9 +1902,9 @@ fn the_theme_accent_choice_retints_the_live_context_on_poll() {
 }
 
 #[test]
-fn the_theme_color_scheme_applies_windows_2000_light_visuals_on_poll() {
+fn the_theme_color_scheme_applies_quazar_light_visuals_on_poll() {
     // The light-mode switch is a real palette change, not a dead setting: one poll
-    // applies classic Windows 2000 basic system colors to egui visuals, keeps dark as
+    // applies Quazar Light system colors to egui visuals, keeps dark as
     // the default/status quo, and leaves explicit accent picks usable.
     let ctx = egui::Context::default();
     Style::install(&ctx);
@@ -1928,13 +1928,13 @@ fn the_theme_color_scheme_applies_windows_2000_light_visuals_on_poll() {
     assert_eq!(ctx.style().visuals.override_text_color, Some(p.text));
     assert_eq!(
         ctx.style().visuals.widgets.active.bg_fill,
-        Style::WIN2000_PRESSED_FACE,
-        "pressed widgets use the classic gray face so black strong text stays readable"
+        Style::QUAZAR_LIGHT_PRESSED_FACE,
+        "pressed widgets use the Quazar Light face so strong text stays readable"
     );
     assert_eq!(
         ctx.style().visuals.hyperlink_color,
-        Style::WIN2000_ACTIVE_TITLE,
-        "the default brand accent becomes classic active-title blue in light mode"
+        Style::QUAZAR_LIGHT_ACCENT,
+        "the default brand accent becomes Quazar Light blue in light mode"
     );
 
     st.appearance.color_scheme = AppearanceColorScheme::Dark;

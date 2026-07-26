@@ -21,8 +21,8 @@ use mackes_mesh_types::media_sources::{
 use mde_jellyfin::{
     build_playback_decision, direct_play_url, BaseItemDto, CacheEntry, CacheRequest,
     ClientCapabilities, HttpTransport, ItemsQuery, JellyfinAccessPolicy, JellyfinClient,
-    JellyfinError, MediaSourceInfo, OfflineCache, PlaybackDecision, PlaybackMethod, PlaybackReport,
-    ServerAuth, ServerConfig, ServerStore, StreamMediaType,
+    JellyfinError, MediaSourceInfo, MetadataCache, OfflineCache, PlaybackDecision, PlaybackMethod,
+    PlaybackReport, ServerAuth, ServerConfig, ServerStore, StreamMediaType,
 };
 use mde_media_core::{
     classify_url, discover_all, unix_millis, AbLoop, AudioConfig, BrowseQuery, CaptureDevice,
@@ -314,6 +314,42 @@ pub struct JellyfinSession {
     pub subtitle_index: Option<i32>,
 }
 
+/// Whether a Jellyfin browse populated rows from a live server/gateway or from
+/// the credential-free metadata snapshot cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JellyfinBrowseOutcome {
+    /// Fresh rows from the Jellyfin endpoint.
+    Live {
+        /// Number of materialized rows.
+        count: usize,
+    },
+    /// Stale metadata rows restored after a gateway/upstream failure.
+    Cached {
+        /// Number of materialized rows.
+        count: usize,
+        /// Unix seconds when the snapshot was captured.
+        cached_at: u64,
+        /// The honest failure reason that caused fallback.
+        reason: String,
+    },
+}
+
+impl JellyfinBrowseOutcome {
+    /// Number of materialized rows.
+    #[must_use]
+    pub const fn count(&self) -> usize {
+        match self {
+            Self::Live { count } | Self::Cached { count, .. } => *count,
+        }
+    }
+
+    /// Whether the rows came from the stale metadata cache.
+    #[must_use]
+    pub const fn is_cached(&self) -> bool {
+        matches!(self, Self::Cached { .. })
+    }
+}
+
 /// The Jellyfin Sources state the controller holds (MEDIA-10).
 ///
 /// Configuration only — the [`ServerStore`] (loaded from the `0600` token store,
@@ -339,6 +375,9 @@ pub struct JellyfinState {
     /// The managed offline cache (MEDIA-11) — downloaded titles + their manifest,
     /// with the add / evict / size-budget / staleness lifecycle.
     cache: OfflineCache,
+    /// Credential-free metadata/artwork/resume snapshots for gateway outage
+    /// fallback. This is not a playable offline media cache.
+    metadata_cache: MetadataCache,
     /// Latest mesh-published media-source roster (`state/media/sources`). This is
     /// separate from [`ServerStore`]: gateway rows are visible before credential
     /// materialization exists, but they do not become local saved-token servers.
@@ -357,6 +396,7 @@ impl Default for JellyfinState {
             selected: None,
             session: None,
             cache: OfflineCache::new(),
+            metadata_cache: MetadataCache::new(),
             mesh_sources: None,
             selected_mesh_source: None,
         }
@@ -404,6 +444,12 @@ impl JellyfinState {
     #[must_use]
     pub const fn cache(&self) -> &OfflineCache {
         &self.cache
+    }
+
+    /// The credential-free metadata/artwork/resume snapshot cache.
+    #[must_use]
+    pub const fn metadata_cache(&self) -> &MetadataCache {
+        &self.metadata_cache
     }
 
     /// Latest mesh-published media-source roster.
@@ -1295,6 +1341,20 @@ impl<E: MediaEngine> MediaController<E> {
         }
     }
 
+    /// Point the metadata/artwork/recent-playback snapshot cache at `root` and
+    /// reload its manifest. Reports load failures honestly without touching the
+    /// playable offline media cache.
+    pub fn set_jellyfin_metadata_cache_root(&mut self, root: impl Into<std::path::PathBuf>) {
+        let root = root.into();
+        match MetadataCache::load_from(&root) {
+            Ok(cache) => self.jellyfin.metadata_cache = cache,
+            Err(e) => {
+                self.jellyfin.metadata_cache = MetadataCache::with_root(root);
+                self.ui.status = Some(format!("Jellyfin metadata cache: {e}"));
+            }
+        }
+    }
+
     /// Whether `item_id` is downloaded for offline playback.
     #[must_use]
     pub fn is_offline_available(&self, item_id: &str) -> bool {
@@ -1603,6 +1663,72 @@ impl<E: MediaEngine> MediaController<E> {
         let count = resp.items.len();
         self.jellyfin.items = resp.items;
         Ok(count)
+    }
+
+    /// Browse a mesh Jellyfin gateway and cache its metadata/artwork/resume rows.
+    ///
+    /// On a transport/server failure, this restores the last credential-free
+    /// snapshot for the same mesh source, if one exists. The restored rows are
+    /// stale display metadata only: playback still requires a live gateway or a
+    /// title already downloaded into [`OfflineCache`].
+    ///
+    /// # Errors
+    /// The live Jellyfin error when no cached snapshot exists, or a source-shape
+    /// error when the caller passes a non-gateway row.
+    pub fn browse_mesh_gateway_jellyfin_cached<T: HttpTransport>(
+        &mut self,
+        client: &JellyfinClient<T>,
+        query: &ItemsQuery,
+        source: &MeshJellyfinSourceRow,
+        now: u64,
+    ) -> Result<JellyfinBrowseOutcome, String> {
+        if source.origin != MeshSourceOrigin::Gateway {
+            return Err("Mesh Jellyfin metadata cache is only for gateway routes.".to_owned());
+        }
+        match client.items(query) {
+            Ok(resp) => {
+                let items = resp.items;
+                let count = items.len();
+                self.jellyfin.items = items.clone();
+                if let Err(e) = self.jellyfin.metadata_cache.store_snapshot(
+                    source.id.clone(),
+                    source.label.clone(),
+                    source.endpoint.clone(),
+                    items,
+                    now,
+                ) {
+                    self.ui.status = Some(format!("Jellyfin metadata cache: {e}"));
+                }
+                Ok(JellyfinBrowseOutcome::Live { count })
+            }
+            Err(error) => {
+                let reason = jellyfin_err(error);
+                self.restore_mesh_jellyfin_metadata_cache(source, reason.clone())
+                    .ok_or(reason)
+            }
+        }
+    }
+
+    /// Restore stale metadata rows for a mesh source without attempting network.
+    ///
+    /// This is used when the gateway client cannot be built because the current
+    /// roster marks the source degraded/missing credentials. It still does not
+    /// materialize credentials or claim playback availability.
+    #[must_use]
+    pub fn restore_mesh_jellyfin_metadata_cache(
+        &mut self,
+        source: &MeshJellyfinSourceRow,
+        reason: impl Into<String>,
+    ) -> Option<JellyfinBrowseOutcome> {
+        let snapshot = self.jellyfin.metadata_cache.snapshot(&source.id).cloned()?;
+        let count = snapshot.items.len();
+        let cached_at = snapshot.cached_at;
+        self.jellyfin.items = snapshot.items;
+        Some(JellyfinBrowseOutcome::Cached {
+            count,
+            cached_at,
+            reason: reason.into(),
+        })
     }
 
     /// Materialize a Jellyfin server's Live-TV channels (MEDIA-10). Honest-gated
@@ -3712,6 +3838,146 @@ mod tests {
             .mesh_gateway_jellyfin_client(jelly_device(), MeshGatewayStub)
             .expect_err("credential ref is required")
             .contains("missing a sealed credential"));
+    }
+
+    #[derive(Debug)]
+    struct MeshGatewayMetadataStub;
+    impl HttpTransport for MeshGatewayMetadataStub {
+        fn execute(&self, request: &HttpRequest) -> Result<HttpResponse, TransportError> {
+            assert!(
+                request
+                    .url
+                    .contains("Fields=Overview%2CGenres%2CMediaSources%2CUserData"),
+                "gateway metadata browse must hydrate resume-capable user data: {}",
+                request.url
+            );
+            Ok(HttpResponse {
+                status: 200,
+                body: br#"{"Items":[{"Id":"m1","Name":"Movie One","Type":"Movie",
+                    "Overview":"Cached synopsis",
+                    "ImageTags":{"Primary":"poster-tag-1"},
+                    "UserData":{"PlaybackPositionTicks":420000000,"Played":false},
+                    "MediaSources":[{"Id":"s1","Container":"mkv","MediaStreams":[
+                    {"Type":"Video","Codec":"h264","Index":0},
+                    {"Type":"Audio","Codec":"aac","Index":1}]}]}],
+                    "TotalRecordCount":1,"StartIndex":0}"#
+                    .to_vec(),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct MeshGatewayOutageStub;
+    impl HttpTransport for MeshGatewayOutageStub {
+        fn execute(&self, _request: &HttpRequest) -> Result<HttpResponse, TransportError> {
+            Err(TransportError(
+                "gateway temporarily unavailable".to_string(),
+            ))
+        }
+    }
+
+    #[test]
+    fn mesh_gateway_metadata_cache_survives_outage_without_credentials() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let query = ItemsQuery::default().recursive().fields([
+            "Overview",
+            "Genres",
+            "MediaSources",
+            "UserData",
+        ]);
+
+        let mut online = controller();
+        online.set_jellyfin_metadata_cache_root(dir.path());
+        online.set_mesh_media_sources(Some(mesh_jellyfin_state(vec![mesh_jellyfin_source(
+            "gateway",
+            MeshSourceOrigin::Gateway,
+            MeshReachability::Reachable,
+        )])));
+        let source = online
+            .active_mesh_jellyfin_source()
+            .expect("active gateway source");
+        let client = online
+            .mesh_gateway_jellyfin_client(jelly_device(), MeshGatewayMetadataStub)
+            .expect("gateway client");
+        assert_eq!(
+            online
+                .browse_mesh_gateway_jellyfin_cached(&client, &query, &source, 1000)
+                .expect("live browse"),
+            JellyfinBrowseOutcome::Live { count: 1 }
+        );
+        assert_eq!(
+            online.jellyfin_items()[0].overview.as_deref(),
+            Some("Cached synopsis")
+        );
+
+        let manifest = std::fs::read_to_string(online.jellyfin().metadata_cache().manifest_path())
+            .expect("metadata manifest");
+        assert!(!manifest.contains("mde-gateway-proxy"));
+        assert!(!manifest.contains("media/jellyfin/shared-readonly"));
+        assert!(!manifest.contains("TOKEN"));
+
+        let mut offline = controller();
+        offline.set_jellyfin_metadata_cache_root(dir.path());
+        offline.set_mesh_media_sources(Some(mesh_jellyfin_state(vec![mesh_jellyfin_source(
+            "gateway",
+            MeshSourceOrigin::Gateway,
+            MeshReachability::Reachable,
+        )])));
+        let source = offline
+            .active_mesh_jellyfin_source()
+            .expect("active gateway source");
+        let client = offline
+            .mesh_gateway_jellyfin_client(jelly_device(), MeshGatewayOutageStub)
+            .expect("gateway client");
+        let outcome = offline
+            .browse_mesh_gateway_jellyfin_cached(&client, &query, &source, 2000)
+            .expect("cached fallback");
+        assert!(matches!(
+            outcome,
+            JellyfinBrowseOutcome::Cached {
+                count: 1,
+                cached_at: 1000,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &outcome,
+            JellyfinBrowseOutcome::Cached { reason, .. }
+                if reason.contains("gateway temporarily unavailable")
+        ));
+
+        let item = &offline.jellyfin_items()[0];
+        assert_eq!(item.name.as_deref(), Some("Movie One"));
+        assert!(
+            item.media_sources.is_empty(),
+            "stale outage rows are metadata-only, not playable stream descriptors"
+        );
+        assert_eq!(
+            item.image_tags.get("Primary").map(String::as_str),
+            Some("poster-tag-1")
+        );
+        assert_eq!(
+            item.user_data
+                .as_ref()
+                .and_then(mde_jellyfin::resume_position_secs),
+            Some(42.0)
+        );
+
+        let snapshot = offline
+            .jellyfin()
+            .metadata_cache()
+            .snapshot("gateway")
+            .expect("cached snapshot");
+        assert_eq!(snapshot.resumable_items()[0].id, "m1");
+        let artwork = snapshot
+            .primary_artwork_url("m1", Some(320))
+            .expect("artwork url");
+        assert_eq!(
+            artwork,
+            "http://gateway-a.mesh:8097/mde/jellyfin/gateway/Items/m1/Images/Primary?tag=poster-tag-1&maxWidth=320"
+        );
+        assert!(!artwork.contains("api_key"));
+        assert!(offline.jellyfin().store().servers.is_empty());
     }
 
     #[test]

@@ -2472,7 +2472,7 @@ enum AppearanceColorScheme {
     /// Preserve the current dark platform look.
     #[default]
     Dark,
-    /// Windows 2000 basic-inspired light look.
+    /// Production Quazar Light look.
     Light,
 }
 
@@ -2492,7 +2492,7 @@ impl AppearanceColorScheme {
     const fn description(self) -> &'static str {
         match self {
             Self::Dark => "Current platform colours",
-            Self::Light => "Windows 2000 basic",
+            Self::Light => "Quazar Light",
         }
     }
 
@@ -4685,7 +4685,7 @@ fn key_mapping_section(ui: &mut egui::Ui, car_keys: &mut crate::car_keymap::CarK
 
 /// The Theme section (SETTINGS-5) under Personalization — the appearance controls
 /// the shell **genuinely applies at runtime**: the **colour mode** (dark status quo
-/// or Windows 2000 basic light), the interactive **accent**, the **text-scale**,
+/// or Quazar Light), the interactive **accent**, the **text-scale**,
 /// the **motion mode** (MOTION-DRM-5 normal/reduced/disabled runtime policy), and
 /// Each pick mutates the persisted [`AppearanceConfig`] in place; the change is
 /// saved after the render borrow and applied live by [`SystemState::apply_appearance`]
@@ -4693,7 +4693,7 @@ fn key_mapping_section(ui: &mut egui::Ui, car_keys: &mut crate::car_keymap::CarK
 /// selectable tiles.
 fn theme_section(ui: &mut egui::Ui, appearance: &mut AppearanceConfig) {
     // Colour mode — a real runtime palette selector. Dark preserves the shipped
-    // dark look; Light uses classic Windows 2000 basic system colours.
+    // dark look; Light uses the production Quazar Light palette.
     ui.label(
         RichText::new("Mode")
             .color(Style::TEXT_DIM)

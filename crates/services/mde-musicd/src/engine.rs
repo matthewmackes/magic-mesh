@@ -57,6 +57,8 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 use symphonia::core::units::Time;
 
+use crate::cache;
+
 /// Gapless pre-buffer lead (ms): the higher-level queue driver (AIR-2.c)
 /// starts resolving the next track's stream URL once the current track
 /// has this much or less remaining (R— AIR-5 lock). [`Engine::near_end`]
@@ -122,6 +124,37 @@ impl SourceCodec {
             Self::Opus | Self::Unknown => None,
         }
     }
+
+    fn cache_suffix(self) -> &'static str {
+        match self {
+            Self::Flac => "flac",
+            Self::Mp3 => "mp3",
+            Self::Vorbis => "ogg",
+            Self::Aac => "m4a",
+            Self::Wav => "wav",
+            Self::Opus => "opus",
+            Self::Unknown => "audio",
+        }
+    }
+}
+
+fn stream_cache_identity(url: &str, codec: SourceCodec) -> Option<(String, String)> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let is_stream_endpoint = parsed
+        .path_segments()
+        .and_then(|mut segments| segments.next_back())
+        == Some("stream");
+    if !is_stream_endpoint {
+        return None;
+    }
+    let song_id = parsed
+        .query_pairs()
+        .find(|(key, _)| key == "id")
+        .map(|(_, value)| value.into_owned())?;
+    if song_id.trim().is_empty() {
+        return None;
+    }
+    Some((song_id, codec.cache_suffix().to_string()))
 }
 
 /// Should the queue driver begin pre-buffering the next track? True once
@@ -714,36 +747,58 @@ fn apply_pending_seek(format: &mut dyn FormatReader, track_id: u32, shared: &Sha
 /// into the shared ring. Returns when the track is exhausted or `stop` is
 /// signalled.
 fn decode_track(url: &str, codec: SourceCodec, shared: &Shared) -> Result<(), String> {
-    let resp = reqwest::blocking::get(url)
-        .and_then(reqwest::blocking::Response::error_for_status)
-        .map_err(|e| format!("fetch {url}: {e}"))?;
-
-    // AIR — radio/live streams are infinite (no Content-Length / chunked), so
-    // buffering the whole body with `.bytes()` never returns → "error decoding
-    // response body" + an audio underrun (the reported Radio bug). Stream those
-    // through a pipe into an unseekable source instead. A finite track (a song
-    // from the Airsonic `stream` endpoint, which sends Content-Length) is still
-    // buffered into a seekable Cursor so format decoders that seek keep working.
-    let finite = resp.content_length().is_some_and(|n| n > 0);
-    // MUSIC-RFX-2 — only a finite (Cursor-backed) track is seekable; a live
-    // stream stays false so the scrubber is hidden + a seek request no-ops.
-    shared.seekable.store(finite, Ordering::Relaxed);
-    let source: Box<dyn symphonia::core::io::MediaSource> = if finite {
-        let bytes = resp
-            .bytes()
-            .map_err(|e| format!("read body {url}: {e}"))?
-            .to_vec();
-        Box::new(Cursor::new(bytes))
-    } else {
-        // Stream: a producer thread copies the response into a pipe; the decoder
-        // reads the pipe as an unseekable MediaSource (PipeReader is Send+Sync).
-        let (reader, mut writer) = std::io::pipe().map_err(|e| format!("pipe {url}: {e}"))?;
-        let mut resp = resp;
-        std::thread::spawn(move || {
-            let _ = std::io::copy(&mut resp, &mut writer);
-        });
-        Box::new(ReadOnlySource::new(reader))
-    };
+    let cache_identity = stream_cache_identity(url, codec);
+    let source: Box<dyn symphonia::core::io::MediaSource> =
+        match reqwest::blocking::get(url).and_then(reqwest::blocking::Response::error_for_status) {
+            Ok(resp) => {
+                // AIR — radio/live streams are infinite (no Content-Length / chunked), so
+                // buffering the whole body with `.bytes()` never returns → "error decoding
+                // response body" + an audio underrun (the reported Radio bug). Stream those
+                // through a pipe into an unseekable source instead. A finite track (a song
+                // from the Airsonic `stream` endpoint, which sends Content-Length) is still
+                // buffered into a seekable Cursor so format decoders that seek keep working.
+                let finite = resp.content_length().is_some_and(|n| n > 0);
+                // MUSIC-RFX-2 — only a finite (Cursor-backed) track is seekable; a live
+                // stream stays false so the scrubber is hidden + a seek request no-ops.
+                shared.seekable.store(finite, Ordering::Relaxed);
+                if finite {
+                    let bytes = match resp.bytes() {
+                        Ok(bytes) => bytes.to_vec(),
+                        Err(e) => cached_track_source(
+                            cache_identity.as_ref(),
+                            &format!("read body {url}: {e}"),
+                            shared,
+                        )?,
+                    };
+                    if let Some((song_id, suffix)) = &cache_identity {
+                        let _ = cache::write_cached_track(
+                            &cache::cache_dir(),
+                            song_id,
+                            suffix,
+                            &bytes,
+                            cache::now_ms(),
+                            false,
+                        );
+                    }
+                    Box::new(Cursor::new(bytes))
+                } else {
+                    // Stream: a producer thread copies the response into a pipe; the decoder
+                    // reads the pipe as an unseekable MediaSource (PipeReader is Send+Sync).
+                    let (reader, mut writer) =
+                        std::io::pipe().map_err(|e| format!("pipe {url}: {e}"))?;
+                    let mut resp = resp;
+                    std::thread::spawn(move || {
+                        let _ = std::io::copy(&mut resp, &mut writer);
+                    });
+                    Box::new(ReadOnlySource::new(reader))
+                }
+            }
+            Err(e) => Box::new(Cursor::new(cached_track_source(
+                cache_identity.as_ref(),
+                &format!("fetch {url}: {e}"),
+                shared,
+            )?)),
+        };
 
     let mss = MediaSourceStream::new(source, Default::default());
     let mut hint = Hint::new();
@@ -838,6 +893,27 @@ fn decode_track(url: &str, codec: SourceCodec, shared: &Shared) -> Result<(), St
         shared.push_samples(&mapped);
     }
     Ok(())
+}
+
+fn cached_track_source(
+    cache_identity: Option<&(String, String)>,
+    error: &str,
+    shared: &Shared,
+) -> Result<Vec<u8>, String> {
+    if let Some((song_id, _)) = cache_identity {
+        if let Some(bytes) =
+            cache::read_cached_track_bytes(&cache::cache_dir(), song_id, cache::now_ms())
+        {
+            shared.seekable.store(true, Ordering::Relaxed);
+            tracing::warn!(
+                song_id = %song_id,
+                error = %error,
+                "using cached Airsonic stream after live fetch failed"
+            );
+            return Ok(bytes);
+        }
+    }
+    Err(error.to_string())
 }
 
 /// Opus output is always 48 kHz.
@@ -988,6 +1064,30 @@ mod tests {
         assert_eq!(SourceCodec::Unknown.hint_ext(), None);
         // Opus rides the Ogg container — probed from bytes, no suffix hint.
         assert_eq!(SourceCodec::Opus.hint_ext(), None);
+        assert_eq!(SourceCodec::Opus.cache_suffix(), "opus");
+        assert_eq!(SourceCodec::Unknown.cache_suffix(), "audio");
+    }
+
+    #[test]
+    fn stream_cache_identity_extracts_gateway_stream_id() {
+        let url = "http://gateway.mesh:4040/mde/airsonic/source-1/rest/stream?u=alice&id=song%2F7&v=1.16.1";
+        assert_eq!(
+            stream_cache_identity(url, SourceCodec::Flac),
+            Some(("song/7".to_string(), "flac".to_string()))
+        );
+        assert_eq!(
+            stream_cache_identity(
+                "http://gateway.mesh:4040/mde/airsonic/source-1/rest/getCoverArt?id=song%2F7",
+                SourceCodec::Flac
+            ),
+            None,
+            "cover art has its own cache, not the audio cache"
+        );
+        assert_eq!(
+            stream_cache_identity("https://radio.example/live.mp3", SourceCodec::Mp3),
+            None,
+            "raw radio URLs are not finite Airsonic track cache entries"
+        );
     }
 
     #[test]

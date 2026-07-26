@@ -140,6 +140,33 @@ fn min_version(a: &str, b: &str) -> String {
     }
 }
 
+fn metadata_cacheable_view(view: &str) -> bool {
+    matches!(
+        view,
+        "getAlbumList2"
+            | "getArtists"
+            | "search3"
+            | "getSong"
+            | "getAlbum"
+            | "getGenres"
+            | "getArtist"
+            | "getInternetRadioStations"
+            | "getPodcasts"
+            | "getLyricsBySongId"
+            | "getPlaylists"
+            | "getPlaylist"
+            | "getStarred2"
+    )
+}
+
+fn metadata_cache_extra_key(extra: &[(&str, &str)]) -> String {
+    extra
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join("\u{1f}")
+}
+
 /// Client identifier sent as `c=` (shows up in the server's session
 /// list).
 pub const CLIENT_NAME: &str = "mde-music";
@@ -517,6 +544,42 @@ impl Client {
     }
 
     async fn get_at_base(
+        &self,
+        base_url: &str,
+        view: &str,
+        extra: &[(&str, &str)],
+    ) -> Result<Value, AirsonicError> {
+        let cacheable = metadata_cacheable_view(view);
+        let extra_key = cacheable.then(|| metadata_cache_extra_key(extra));
+        let result = self.get_live_at_base(base_url, view, extra).await;
+        match (result, extra_key) {
+            (Ok(inner), Some(key)) => {
+                crate::cache::write_cached_metadata(
+                    &crate::cache::metadata_cache_dir(),
+                    base_url,
+                    view,
+                    &key,
+                    &inner,
+                );
+                Ok(inner)
+            }
+            (Err(AirsonicError::Http(error)), Some(key)) => {
+                if let Some(cached) = crate::cache::read_cached_metadata(
+                    &crate::cache::metadata_cache_dir(),
+                    base_url,
+                    view,
+                    &key,
+                ) {
+                    Ok(cached)
+                } else {
+                    Err(AirsonicError::Http(error))
+                }
+            }
+            (other, _) => other,
+        }
+    }
+
+    async fn get_live_at_base(
         &self,
         base_url: &str,
         view: &str,
@@ -1397,6 +1460,27 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
     }
 
+    fn one_shot_json_server(body: &'static str) -> String {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind one-shot server");
+        let addr = listener.local_addr().expect("one-shot addr");
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0_u8; 2048];
+            let _ = stream.read(&mut buf);
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(reply.as_bytes());
+        });
+        format!("http://{addr}")
+    }
+
     #[test]
     fn error30_envelope_detected_in_raw_bytes() {
         // A capped server answers a raw-byte endpoint (cover art / stream) with
@@ -1482,6 +1566,37 @@ mod tests {
         assert_eq!(p.iter().find(|(k, _)| k == "f").unwrap().1, "json");
         // Default v= is the ceiling until a server negotiates it down.
         assert_eq!(p.iter().find(|(k, _)| k == "v").unwrap().1, API_VERSION);
+    }
+
+    #[test]
+    fn metadata_cache_replays_read_only_metadata_after_gateway_outage() {
+        let _guard = env_lock();
+        let cache_dir = tempfile::tempdir().expect("metadata cache dir");
+        std::env::set_var("MDE_MUSIC_METADATA_CACHE_DIR", cache_dir.path());
+        let body = r#"{"subsonic-response":{"status":"ok","version":"1.16.1","albumList2":{"album":[{"id":"al-1","name":"Cached Album","artist":"Mesh Artist","songCount":7}]}}}"#;
+        let base = one_shot_json_server(body);
+        let client = Client::with_salt(&base, "alice", "pw", "salt");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+
+        let live = rt
+            .block_on(client.get_album_list2("recent", 10))
+            .expect("live metadata");
+        assert_eq!(live[0].name, "Cached Album");
+
+        // The one-shot server is gone now. A second identical metadata request
+        // hits a transport error, then falls back to the durable metadata cache.
+        let stale = rt
+            .block_on(client.get_album_list2("recent", 10))
+            .expect("cached metadata after outage");
+        assert_eq!(stale, live);
+
+        // Different params are a different metadata key; do not invent a fallback.
+        let miss = rt.block_on(client.get_album_list2("newest", 10));
+        assert!(matches!(miss, Err(AirsonicError::Http(_))));
+        std::env::remove_var("MDE_MUSIC_METADATA_CACHE_DIR");
     }
 
     #[test]

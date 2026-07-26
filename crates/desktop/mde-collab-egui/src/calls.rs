@@ -334,7 +334,7 @@ impl CommunicationsSurface {
                     .small()
                     .color(Style::TEXT_DIM),
             )
-            .on_hover_text(hint);
+            .comms_hover_text(hint);
         }
     }
 
@@ -609,7 +609,7 @@ fn device_combo(ui: &mut egui::Ui, label: &str, glyph: &str, value: &mut String)
             });
     })
     .response
-    .on_hover_text("Provider device enumeration is not connected yet");
+    .comms_hover_text("Provider device enumeration is not connected yet");
     ui.add_space(Style::SP_S);
 }
 

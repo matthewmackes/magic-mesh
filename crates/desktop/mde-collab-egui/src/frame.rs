@@ -24,7 +24,7 @@ use mde_collab_types::{
     SpaceRole, SpaceSummary,
 };
 
-use crate::{icons, ChannelTab, CommunicationsSurface, MeshTeamsApp};
+use crate::{icons, icons::CommsHoverExt, ChannelTab, CommunicationsSurface, MeshTeamsApp};
 
 /// The Teams-style app rail width.
 pub const APP_RAIL_W: f32 = Style::SP_XL * 2.25;
@@ -370,7 +370,7 @@ impl CommunicationsSurface {
                             });
                         },
                     )
-                    .on_hover_text(label)
+                    .comms_hover_text(label)
                     .clicked();
                     if clicked {
                         self.set_app(app);

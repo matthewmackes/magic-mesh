@@ -30,8 +30,8 @@ use mde_media_core::{
 use crate::model::{
     capture_detail, format_time, item_title, jellyfin_item_title, library_row_texts,
     now_playing_title, osd_should_show, play_pause_label, progress_fraction, repeat_label,
-    state_word, track_label, MediaController, MediaTab, MeshJellyfinSourceRow, TransportAction,
-    EBU_R128_DEFAULT, EQ_GAIN_DB_LIMIT,
+    state_word, track_label, JellyfinBrowseOutcome, MediaController, MediaTab,
+    MeshJellyfinSourceRow, TransportAction, EBU_R128_DEFAULT, EQ_GAIN_DB_LIMIT,
 };
 use crate::Engine;
 
@@ -970,22 +970,36 @@ fn connect_mesh_jellyfin<E: MediaEngine>(controller: &mut MediaController<E>, so
         controller.ui_mut().status = Some("Unknown mesh Jellyfin source.".to_owned());
         return;
     }
-    let label = controller
-        .active_mesh_jellyfin_source()
-        .map(|source| source.label)
-        .unwrap_or_else(|| source_id.to_owned());
-    let transport =
-        match ReqwestTransport::new().map_err(|e| format!("Jellyfin transport error: {e}")) {
-            Ok(transport) => transport,
-            Err(message) => {
+    let Some(source) = controller.active_mesh_jellyfin_source() else {
+        controller.ui_mut().status = Some("No mesh Jellyfin source is available.".to_owned());
+        return;
+    };
+    let label = source.label.clone();
+    let transport = match ReqwestTransport::new()
+        .map_err(|e| format!("Jellyfin transport error: {e}"))
+    {
+        Ok(transport) => transport,
+        Err(message) => {
+            if let Some(outcome) =
+                controller.restore_mesh_jellyfin_metadata_cache(&source, message.clone())
+            {
+                controller.ui_mut().status = Some(mesh_jellyfin_browse_status(&label, &outcome));
+            } else {
                 controller.ui_mut().status = Some(message);
-                return;
             }
-        };
+            return;
+        }
+    };
     let client = match controller.mesh_gateway_jellyfin_client(jellyfin_device(), transport) {
         Ok(client) => client,
         Err(message) => {
-            controller.ui_mut().status = Some(message);
+            if let Some(outcome) =
+                controller.restore_mesh_jellyfin_metadata_cache(&source, message.clone())
+            {
+                controller.ui_mut().status = Some(mesh_jellyfin_browse_status(&label, &outcome));
+            } else {
+                controller.ui_mut().status = Some(message);
+            }
             return;
         }
     };
@@ -993,14 +1007,32 @@ fn connect_mesh_jellyfin<E: MediaEngine>(controller: &mut MediaController<E>, so
         .recursive()
         .include_item_types(["Movie", "Episode", "Audio"])
         .sort_by(["SortName"])
-        .fields(["Overview", "Genres", "MediaSources"]);
-    match controller.browse_jellyfin(&client, &query) {
-        Ok(count) => {
-            controller.ui_mut().status = Some(format!(
-                "Loaded {count} title(s) through mesh gateway {label}."
-            ));
+        .fields(["Overview", "Genres", "MediaSources", "UserData"]);
+    match controller.browse_mesh_gateway_jellyfin_cached(
+        &client,
+        &query,
+        &source,
+        mde_jellyfin::cache::unix_now(),
+    ) {
+        Ok(outcome) => {
+            controller.ui_mut().status = Some(mesh_jellyfin_browse_status(&label, &outcome));
         }
         Err(message) => controller.ui_mut().status = Some(message),
+    }
+}
+
+fn mesh_jellyfin_browse_status(label: &str, outcome: &JellyfinBrowseOutcome) -> String {
+    match outcome {
+        JellyfinBrowseOutcome::Live { count } => {
+            format!("Loaded {count} title(s) through mesh gateway {label}.")
+        }
+        JellyfinBrowseOutcome::Cached {
+            count,
+            cached_at,
+            reason,
+        } => format!(
+            "Mesh gateway {label} unavailable ({reason}); showing {count} cached metadata title(s) from unix {cached_at}. Playback still needs the gateway or a downloaded offline title."
+        ),
     }
 }
 

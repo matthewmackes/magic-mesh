@@ -1,5 +1,5 @@
-//! The offline cache (MEDIA-11): download Jellyfin titles to a managed local
-//! cache so they play with no server.
+//! The offline/cache layer (MEDIA-11 + WL-FUNC-015): downloaded Jellyfin titles
+//! and credential-free metadata snapshots.
 //!
 //! A title is downloaded once — the untouched direct-play bytes, fetched through
 //! [`JellyfinClient::download`](crate::JellyfinClient::download) over the same
@@ -7,6 +7,13 @@
 //! under a cache root with a JSON [`manifest`](OfflineCache::save). Playing offline
 //! is then a plain [`local_path`](OfflineCache::local_path) the media player loads
 //! (the existing `PlayPath` path); no negotiation, no network.
+//!
+//! The [`MetadataCache`] is a smaller sibling for gateway outages: it persists the
+//! last successful browse/recent rows, image tags used to rebuild artwork URLs, and
+//! per-user resume state from [`BaseItemDto`](crate::BaseItemDto) without accepting
+//! or storing access tokens, stream descriptors, passwords, or sealed credential
+//! references. It lets the Media Workspace honestly render stale metadata while
+//! still requiring a live gateway (or a downloaded title) for playback.
 //!
 //! # Lifecycle
 //!
@@ -31,7 +38,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::store::config_base;
+use crate::{
+    client::{image_url, ImageQuery, ImageType},
+    models::BaseItemDto,
+    store::config_base,
+    sync::resume_position_secs,
+};
 
 /// The offline cache root, relative to the user config dir:
 /// `<config>/mde/jellyfin/offline`.
@@ -39,6 +51,13 @@ pub const CACHE_DIR_REL: &str = "mde/jellyfin/offline";
 
 /// The manifest file name inside the cache root.
 pub const MANIFEST_NAME: &str = "manifest.json";
+
+/// The metadata snapshot cache root, relative to the user config dir:
+/// `<config>/mde/jellyfin/metadata`.
+pub const METADATA_CACHE_DIR_REL: &str = "mde/jellyfin/metadata";
+
+/// The metadata snapshot manifest inside the metadata cache root.
+pub const METADATA_MANIFEST_NAME: &str = "snapshots.json";
 
 /// The default size budget when one is not overridden: 16 GiB.
 pub const DEFAULT_SIZE_BUDGET_BYTES: u64 = 16 * 1024 * 1024 * 1024;
@@ -82,11 +101,80 @@ pub struct CacheRequest {
     pub container: String,
 }
 
+/// A credential-free snapshot of the last successful metadata browse for one
+/// Jellyfin source.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MetadataSnapshot {
+    /// Mesh/source-store id this snapshot belongs to.
+    pub source_id: String,
+    /// Human display label for stale-cache status text.
+    pub source_label: String,
+    /// The endpoint used to build cached artwork URLs. This is a gateway/direct
+    /// source URL, never a token-bearing URL.
+    pub endpoint: String,
+    /// When this snapshot was captured (unix seconds).
+    pub cached_at: u64,
+    /// Last successful item rows. These carry metadata, image tags, and optional
+    /// user resume state, but media-source descriptors are stripped before
+    /// persistence because Jellyfin can place token-bearing stream URLs there.
+    #[serde(default)]
+    pub items: Vec<BaseItemDto>,
+}
+
+impl MetadataSnapshot {
+    /// Return an item row by id.
+    #[must_use]
+    pub fn item(&self, item_id: &str) -> Option<&BaseItemDto> {
+        self.items.iter().find(|item| item.id == item_id)
+    }
+
+    /// Build a cache-stable artwork URL for an item from the stored endpoint and
+    /// image tag. Returns `None` when the snapshot has no primary-image tag for
+    /// the item, so callers do not fabricate artwork availability.
+    #[must_use]
+    pub fn primary_artwork_url(&self, item_id: &str, max_width: Option<u32>) -> Option<String> {
+        let item = self.item(item_id)?;
+        let tag = item.image_tags.get(ImageType::Primary.as_str())?.clone();
+        Some(image_url(
+            &self.endpoint,
+            item_id,
+            ImageType::Primary,
+            &ImageQuery {
+                tag: Some(tag),
+                max_width,
+                ..ImageQuery::default()
+            },
+        ))
+    }
+
+    /// The rows with a positive resume position — the cached Continue-Watching
+    /// signal during a temporary gateway/upstream outage.
+    #[must_use]
+    pub fn resumable_items(&self) -> Vec<&BaseItemDto> {
+        self.items
+            .iter()
+            .filter(|item| {
+                item.user_data
+                    .as_ref()
+                    .and_then(resume_position_secs)
+                    .is_some()
+            })
+            .collect()
+    }
+}
+
 /// The persisted manifest: the set of cached entries.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Manifest {
     #[serde(default)]
     entries: Vec<CacheEntry>,
+}
+
+/// The persisted metadata-snapshot manifest.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct MetadataManifest {
+    #[serde(default)]
+    snapshots: Vec<MetadataSnapshot>,
 }
 
 /// Why an offline-cache operation failed.
@@ -121,6 +209,20 @@ pub struct OfflineCache {
     entries: Vec<CacheEntry>,
     size_budget: Option<u64>,
     max_age_secs: Option<u64>,
+}
+
+/// A persisted, credential-free metadata/artwork/resume snapshot cache.
+///
+/// Unlike [`OfflineCache`], this does not claim a playable offline copy. It only
+/// lets the UI render stale-but-useful rows while the gateway/upstream is
+/// temporarily unavailable. The write path deliberately accepts no token,
+/// `credential_ref`, password, or authenticated request headers, and strips
+/// `MediaSources` before persistence so cached rows cannot carry stream tokens or
+/// masquerade as playable offline media.
+#[derive(Debug, Clone)]
+pub struct MetadataCache {
+    root: PathBuf,
+    snapshots: Vec<MetadataSnapshot>,
 }
 
 impl Default for OfflineCache {
@@ -464,6 +566,141 @@ impl OfflineCache {
     }
 }
 
+impl Default for MetadataCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MetadataCache {
+    /// A cache rooted at [`default_root`](Self::default_root). Does no filesystem
+    /// work until loaded/saved/stored.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_root(Self::default_root())
+    }
+
+    /// A cache rooted at `root` (tests use a scratch dir). Does no filesystem work.
+    #[must_use]
+    pub fn with_root(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            snapshots: Vec::new(),
+        }
+    }
+
+    /// The default metadata cache root: `<config dir>/mde/jellyfin/metadata`.
+    #[must_use]
+    pub fn default_root() -> PathBuf {
+        let mut root = config_base();
+        for part in METADATA_CACHE_DIR_REL.split('/') {
+            root.push(part);
+        }
+        root
+    }
+
+    /// The cache root directory.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// The snapshot manifest path.
+    #[must_use]
+    pub fn manifest_path(&self) -> PathBuf {
+        self.root.join(METADATA_MANIFEST_NAME)
+    }
+
+    /// All retained snapshots.
+    #[must_use]
+    pub fn snapshots(&self) -> &[MetadataSnapshot] {
+        &self.snapshots
+    }
+
+    /// The snapshot for `source_id`, if present.
+    #[must_use]
+    pub fn snapshot(&self, source_id: &str) -> Option<&MetadataSnapshot> {
+        self.snapshots
+            .iter()
+            .find(|snapshot| snapshot.source_id == source_id)
+    }
+
+    /// Upsert one source's latest metadata snapshot and persist the manifest.
+    ///
+    /// # Errors
+    /// [`CacheError::Io`] / [`CacheError::Parse`] on a filesystem / manifest failure.
+    pub fn store_snapshot(
+        &mut self,
+        source_id: impl Into<String>,
+        source_label: impl Into<String>,
+        endpoint: impl Into<String>,
+        items: Vec<BaseItemDto>,
+        cached_at: u64,
+    ) -> Result<MetadataSnapshot, CacheError> {
+        let snapshot = MetadataSnapshot {
+            source_id: source_id.into(),
+            source_label: source_label.into(),
+            endpoint: endpoint.into(),
+            cached_at,
+            items: items.into_iter().map(metadata_snapshot_item).collect(),
+        };
+        if let Some(existing) = self
+            .snapshots
+            .iter_mut()
+            .find(|entry| entry.source_id == snapshot.source_id)
+        {
+            *existing = snapshot.clone();
+        } else {
+            self.snapshots.push(snapshot.clone());
+        }
+        self.persist()?;
+        Ok(snapshot)
+    }
+
+    /// Load a metadata cache rooted at `root`. A missing manifest is a first-run
+    /// empty cache.
+    ///
+    /// # Errors
+    /// [`CacheError::Io`] on a read failure, [`CacheError::Parse`] on bad JSON.
+    pub fn load_from(root: impl Into<PathBuf>) -> Result<Self, CacheError> {
+        let mut cache = Self::with_root(root);
+        let path = cache.manifest_path();
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                let manifest: MetadataManifest =
+                    serde_json::from_str(&text).map_err(|e| CacheError::Parse(e.to_string()))?;
+                cache.snapshots = manifest.snapshots;
+                Ok(cache)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(cache),
+            Err(e) => Err(CacheError::Io(e.to_string())),
+        }
+    }
+
+    /// Persist the current metadata snapshot manifest.
+    ///
+    /// # Errors
+    /// [`CacheError::Io`] / [`CacheError::Parse`] on a filesystem / manifest failure.
+    pub fn save(&self) -> Result<(), CacheError> {
+        self.persist()
+    }
+
+    fn persist(&self) -> Result<(), CacheError> {
+        std::fs::create_dir_all(&self.root).map_err(|e| CacheError::Io(e.to_string()))?;
+        let manifest = MetadataManifest {
+            snapshots: self.snapshots.clone(),
+        };
+        let json = serde_json::to_string_pretty(&manifest)
+            .map_err(|e| CacheError::Parse(e.to_string()))?;
+        std::fs::write(self.manifest_path(), json).map_err(|e| CacheError::Io(e.to_string()))
+    }
+}
+
+fn metadata_snapshot_item(mut item: BaseItemDto) -> BaseItemDto {
+    item.media_sources.clear();
+    item
+}
+
 /// The filesystem-safe file name for a cached title:
 /// `<server-slug>_<item-slug>.<container-slug>`. Both ids are slugged so a base-URL
 /// server id (e.g. `https://jelly.mesh:8096`) is a valid path component.
@@ -654,5 +891,100 @@ mod tests {
             "got {}",
             root.display()
         );
+    }
+
+    fn metadata_item() -> BaseItemDto {
+        let mut image_tags = std::collections::BTreeMap::new();
+        image_tags.insert("Primary".to_string(), "poster-tag-1".to_string());
+        BaseItemDto {
+            id: "m1".to_string(),
+            name: Some("Movie One".to_string()),
+            item_type: Some("Movie".to_string()),
+            overview: Some("Cached synopsis".to_string()),
+            image_tags,
+            media_sources: vec![crate::MediaSourceInfo {
+                path: Some("http://gateway-a.mesh/stream?api_key=TOKEN".to_string()),
+                transcoding_url: Some("/Videos/m1/main.m3u8?api_key=TOKEN".to_string()),
+                ..crate::MediaSourceInfo::default()
+            }],
+            user_data: Some(crate::UserData {
+                playback_position_ticks: 42 * crate::TICKS_PER_SECOND,
+                ..crate::UserData::default()
+            }),
+            ..BaseItemDto::default()
+        }
+    }
+
+    #[test]
+    fn metadata_cache_persists_artwork_and_recent_rows_without_credentials() {
+        let dir = tempdir().expect("tempdir");
+        let mut cache = MetadataCache::with_root(dir.path());
+        cache
+            .store_snapshot(
+                "gateway-a",
+                "Gateway A",
+                "http://gateway-a.mesh:8097/mde/jellyfin/gateway-a",
+                vec![metadata_item()],
+                1234,
+            )
+            .expect("store");
+
+        let manifest = std::fs::read_to_string(cache.manifest_path()).expect("manifest");
+        assert!(!manifest.contains("TOKEN"));
+        assert!(!manifest.contains("api_key"));
+        assert!(!manifest.contains("TranscodingUrl"));
+        assert!(!manifest.contains("credential_ref"));
+        assert!(!manifest.contains("media/jellyfin/shared-readonly"));
+
+        let reloaded = MetadataCache::load_from(dir.path()).expect("reload");
+        let snapshot = reloaded.snapshot("gateway-a").expect("snapshot");
+        assert_eq!(snapshot.cached_at, 1234);
+        assert_eq!(
+            snapshot.items[0].overview.as_deref(),
+            Some("Cached synopsis")
+        );
+        assert!(snapshot.items[0].media_sources.is_empty());
+        assert_eq!(snapshot.resumable_items()[0].id, "m1");
+
+        let artwork = snapshot
+            .primary_artwork_url("m1", Some(320))
+            .expect("primary artwork");
+        assert_eq!(
+            artwork,
+            "http://gateway-a.mesh:8097/mde/jellyfin/gateway-a/Items/m1/Images/Primary?tag=poster-tag-1&maxWidth=320"
+        );
+        assert!(!artwork.contains("api_key"));
+        assert!(!artwork.contains("TOKEN"));
+    }
+
+    #[test]
+    fn metadata_cache_replaces_one_sources_snapshot_without_touching_peers() {
+        let dir = tempdir().expect("tempdir");
+        let mut cache = MetadataCache::with_root(dir.path());
+        cache
+            .store_snapshot("gateway-a", "Gateway A", "http://gateway-a.mesh", vec![], 1)
+            .expect("a");
+        cache
+            .store_snapshot(
+                "gateway-b",
+                "Gateway B",
+                "http://gateway-b.mesh",
+                vec![metadata_item()],
+                2,
+            )
+            .expect("b");
+        cache
+            .store_snapshot(
+                "gateway-a",
+                "Gateway A",
+                "http://gateway-a.mesh",
+                vec![metadata_item()],
+                3,
+            )
+            .expect("replace a");
+
+        assert_eq!(cache.snapshots().len(), 2);
+        assert_eq!(cache.snapshot("gateway-a").expect("a").cached_at, 3);
+        assert_eq!(cache.snapshot("gateway-b").expect("b").cached_at, 2);
     }
 }

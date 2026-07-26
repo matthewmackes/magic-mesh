@@ -533,7 +533,7 @@ impl CommunicationsSurface {
                         Style::TEXT_DIM
                     },
                 )))
-                .on_hover_text("Local-only reaction; not sent to the mesh")
+                .comms_hover_text("Local-only reaction; not sent to the mesh")
                 .clicked()
             {
                 self.toggle_local_reaction(message, reaction);
@@ -947,7 +947,7 @@ fn thread_resolution_button(ui: &mut egui::Ui, resolved: bool) -> egui::Response
                 .add(egui::Button::new(
                     egui::RichText::new(label).small().color(Style::TEXT),
                 ))
-                .on_hover_text(hint);
+                .comms_hover_text(hint);
             icon | text
         })
         .inner;

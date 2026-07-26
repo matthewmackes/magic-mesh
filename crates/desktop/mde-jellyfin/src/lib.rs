@@ -116,7 +116,9 @@ pub mod store;
 pub mod sync;
 
 pub use browse::{build_show_tree, group_by_type, SeasonNode, ShowTree};
-pub use cache::{CacheEntry, CacheError, CacheRequest, OfflineCache};
+pub use cache::{
+    CacheEntry, CacheError, CacheRequest, MetadataCache, MetadataSnapshot, OfflineCache,
+};
 pub use client::{
     build_items_request, image_url, ClientInfo, ImageQuery, ImageType, ItemsQuery,
     JellyfinAccessPolicy, JellyfinAction, JellyfinClient, JellyfinClientRole, JellyfinError,

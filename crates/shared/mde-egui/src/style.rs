@@ -250,8 +250,8 @@ pub enum StyleColorScheme {
     /// status-quo colours for operators that do not opt into light mode.
     #[default]
     Dark,
-    /// A Windows 2000 basic-inspired light palette: classic button-face gray,
-    /// white raised surfaces, gray borders, black text, and active-title blue.
+    /// Production **Quazar Light**: warm light ground, white raised surfaces,
+    /// graphite text, quiet borders, and the governed blue interactive accent.
     Light,
     /// **Ford Sync 3 Auto skin** — a black / white / blue in-vehicle palette,
     /// applied automatically while the [`LayoutProfile::Car`] Auto Mode is active
@@ -304,28 +304,32 @@ impl Style {
     /// Hairline borders + separators.
     pub const BORDER: Color32 = Color32::from_rgb(0x33, 0x33, 0x3D);
 
-    // ── Palette (Windows 2000 basic light) ──────────────────────────────────
-    /// Windows 2000 classic `ButtonFace`.
-    pub const WIN2000_BUTTON_FACE: Color32 = Color32::from_rgb(0xD4, 0xD0, 0xC8);
-    /// Windows 2000 classic raised/light face.
-    pub const WIN2000_BUTTON_HIGHLIGHT: Color32 = Color32::from_rgb(0xFF, 0xFF, 0xFF);
-    /// Windows 2000 classic shadow/border.
-    pub const WIN2000_BUTTON_SHADOW: Color32 = Color32::from_rgb(0x80, 0x80, 0x80);
-    /// Windows 2000 classic `WindowText`.
-    pub const WIN2000_WINDOW_TEXT: Color32 = Color32::from_rgb(0x00, 0x00, 0x00);
-    /// A readable dim text on classic button-face gray.
-    pub const WIN2000_DIM_TEXT: Color32 = Color32::from_rgb(0x40, 0x40, 0x40);
-    /// Windows 2000 classic active title/highlight blue.
-    pub const WIN2000_ACTIVE_TITLE: Color32 = Color32::from_rgb(0x0A, 0x24, 0x6A);
-    /// Windows 2000 classic pressed button face.
-    pub const WIN2000_PRESSED_FACE: Color32 = Color32::from_rgb(0xB8, 0xB4, 0xAC);
+    // ── Palette (Quazar Light) ─────────────────────────────────────────────
+    /// Quazar Light warm desktop ground.
+    pub const QUAZAR_LIGHT_BG: Color32 = Color32::from_rgb(0xF4, 0xF6, 0xFA);
+    /// Quazar Light default elevated surface.
+    pub const QUAZAR_LIGHT_SURFACE: Color32 = Color32::from_rgb(0xFF, 0xFF, 0xFF);
+    /// Quazar Light hovered / highlighted raised surface.
+    pub const QUAZAR_LIGHT_SURFACE_HI: Color32 = Color32::from_rgb(0xEA, 0xEF, 0xF8);
+    /// Quazar Light quiet graphite border.
+    pub const QUAZAR_LIGHT_BORDER: Color32 = Color32::from_rgb(0xC8, 0xD1, 0xDE);
+    /// Quazar Light primary text.
+    pub const QUAZAR_LIGHT_TEXT: Color32 = Color32::from_rgb(0x17, 0x1A, 0x21);
+    /// Quazar Light secondary/dim text.
+    pub const QUAZAR_LIGHT_TEXT_DIM: Color32 = Color32::from_rgb(0x55, 0x5D, 0x6B);
+    /// Quazar Light strong text.
+    pub const QUAZAR_LIGHT_TEXT_STRONG: Color32 = Color32::from_rgb(0x0B, 0x0D, 0x12);
+    /// Quazar Light default interactive accent.
+    pub const QUAZAR_LIGHT_ACCENT: Color32 = Color32::from_rgb(0x0B, 0x57, 0xD0);
+    /// Quazar Light active/pressed control face.
+    pub const QUAZAR_LIGHT_PRESSED_FACE: Color32 = Color32::from_rgb(0xD9, 0xE6, 0xFF);
 
     // ── Palette (Ford Sync 3 Auto skin — black / white / blue) ───────────────
     // The in-vehicle [`StyleColorScheme::AutoSync3`] palette, applied while Car
     // Mode is active. A near-black ground (glare-free at night), pure-white
     // glanceable text, and a bright Sync-3 blue accent — the Ford SYNC 3 dark
     // interface's black/white/blue language. Kept as its own token block (like
-    // `WIN2000_*`) so the scheme projection in `palette_for` reads named tokens,
+    // `QUAZAR_LIGHT_*`) so the scheme projection in `palette_for` reads named tokens,
     // never inline literals.
     /// Sync-3 deepest ground — near-black with a faint cool tint.
     pub const SYNC3_BG: Color32 = Color32::from_rgb(0x04, 0x07, 0x0B);
@@ -854,14 +858,14 @@ impl Style {
                 text_strong: Self::TEXT_STRONG,
             },
             StyleColorScheme::Light => StylePalette {
-                bg: Self::WIN2000_BUTTON_FACE,
-                surface: Self::WIN2000_BUTTON_FACE,
-                surface_hi: Self::WIN2000_BUTTON_HIGHLIGHT,
-                border: Self::WIN2000_BUTTON_SHADOW,
-                capture_clear: Self::WIN2000_BUTTON_FACE,
-                text: Self::WIN2000_WINDOW_TEXT,
-                text_dim: Self::WIN2000_DIM_TEXT,
-                text_strong: Self::WIN2000_WINDOW_TEXT,
+                bg: Self::QUAZAR_LIGHT_BG,
+                surface: Self::QUAZAR_LIGHT_SURFACE,
+                surface_hi: Self::QUAZAR_LIGHT_SURFACE_HI,
+                border: Self::QUAZAR_LIGHT_BORDER,
+                capture_clear: Self::QUAZAR_LIGHT_BG,
+                text: Self::QUAZAR_LIGHT_TEXT,
+                text_dim: Self::QUAZAR_LIGHT_TEXT_DIM,
+                text_strong: Self::QUAZAR_LIGHT_TEXT_STRONG,
             },
             StyleColorScheme::AutoSync3 => StylePalette {
                 bg: Self::SYNC3_BG,
@@ -901,11 +905,11 @@ impl Style {
             Self::TEXT_STRONG => p.text_strong,
             Self::ACCENT => match scheme {
                 StyleColorScheme::AutoSync3 => Self::SYNC3_ACCENT,
-                _ => Self::WIN2000_ACTIVE_TITLE,
+                _ => Self::QUAZAR_LIGHT_ACCENT,
             },
             Self::ACCENT_HI => match scheme {
                 StyleColorScheme::AutoSync3 => Self::SYNC3_ACCENT_HI,
-                _ => Self::WIN2000_ACTIVE_TITLE,
+                _ => Self::QUAZAR_LIGHT_ACCENT,
             },
             _ => color,
         }
@@ -966,7 +970,7 @@ impl Style {
 
         // Pressed / active. egui's `.strong()` text colour is hardwired to this
         // stroke. Dark mode keeps the historical bright-on-dark pressed style;
-        // light mode keeps strong text black and uses a classic gray pressed face.
+        // light mode keeps strong graphite text on the Quazar Light pressed face.
         v.widgets.active.fg_stroke = Stroke::new(1.0, p.text_strong);
 
         // The interactive **accent** — the ONE re-tintable field group: the
@@ -1030,17 +1034,17 @@ impl Style {
         v.widgets.active.bg_stroke = Stroke::new(1.0, accent_hi);
     }
 
-    /// The visible accent for `scheme`. The default brand accent becomes the classic
-    /// Windows active-title blue in light mode; explicit user accent picks remain
-    /// their chosen hue.
+    /// The visible accent for `scheme`. The default brand accent becomes the
+    /// governed Quazar Light blue in light mode; explicit user accent picks
+    /// remain their chosen hue.
     #[must_use]
     pub fn accent_for_scheme(scheme: StyleColorScheme, accent: Color32) -> Color32 {
         match scheme {
             // Dark keeps every accent exactly as chosen.
             StyleColorScheme::Dark => accent,
-            // Windows-2000 light folds the DEFAULT brand accent to the classic
-            // active-title blue; an explicit user accent pick keeps its hue.
-            StyleColorScheme::Light if accent == Self::ACCENT => Self::WIN2000_ACTIVE_TITLE,
+            // Quazar Light folds the DEFAULT brand accent to the light-mode
+            // interactive blue; an explicit user accent pick keeps its hue.
+            StyleColorScheme::Light if accent == Self::ACCENT => Self::QUAZAR_LIGHT_ACCENT,
             StyleColorScheme::Light => accent,
             // Sync-3 folds the default brand accent (both rungs) to the bright
             // Ford SYNC blue; a user pick keeps its hue.
@@ -1067,7 +1071,7 @@ impl Style {
             // Sync-3's near-black ground darkens the accent toward black just like
             // dark mode, keeping the bright pressed label WCAG-legible.
             StyleColorScheme::Dark | StyleColorScheme::AutoSync3 => Self::pressed_fill(accent),
-            StyleColorScheme::Light => Self::WIN2000_PRESSED_FACE,
+            StyleColorScheme::Light => Self::QUAZAR_LIGHT_PRESSED_FACE,
         }
     }
 
@@ -2223,39 +2227,60 @@ mod tests {
     }
 
     #[test]
-    fn light_install_uses_windows_2000_basic_palette() {
+    fn light_install_uses_quazar_light_palette() {
         let ctx = egui::Context::default();
         Style::install_color_scheme_with_density(&ctx, StyleColorScheme::Light, Density::Mouse);
         let visuals = &ctx.style().visuals;
         let p = Style::palette_for(StyleColorScheme::Light);
 
         assert_eq!(Style::color_scheme(&ctx), StyleColorScheme::Light);
-        assert_eq!(visuals.panel_fill, Style::WIN2000_BUTTON_FACE);
+        assert_eq!(p.bg, Style::QUAZAR_LIGHT_BG);
+        assert_eq!(p.surface, Style::QUAZAR_LIGHT_SURFACE);
+        assert_eq!(p.text, Style::QUAZAR_LIGHT_TEXT);
+        assert_eq!(visuals.panel_fill, Style::QUAZAR_LIGHT_BG);
         assert_eq!(visuals.window_fill, p.surface);
         assert_eq!(visuals.extreme_bg_color, p.bg);
-        assert_eq!(visuals.window_stroke.color, Style::WIN2000_BUTTON_SHADOW);
-        assert_eq!(
-            visuals.override_text_color,
-            Some(Style::WIN2000_WINDOW_TEXT)
-        );
+        assert_eq!(visuals.window_stroke.color, Style::QUAZAR_LIGHT_BORDER);
+        assert_eq!(visuals.override_text_color, Some(Style::QUAZAR_LIGHT_TEXT));
         assert_eq!(
             visuals.widgets.hovered.bg_fill,
-            Style::WIN2000_BUTTON_HIGHLIGHT
+            Style::QUAZAR_LIGHT_SURFACE_HI
         );
         assert_eq!(
             visuals.widgets.active.bg_fill,
-            Style::WIN2000_PRESSED_FACE,
-            "light-mode pressed state uses classic gray, not dark-mode accent fill"
+            Style::QUAZAR_LIGHT_PRESSED_FACE,
+            "light-mode pressed state uses Quazar Light face, not dark-mode accent fill"
         );
         assert_eq!(
             visuals.widgets.active.fg_stroke.color,
-            Style::WIN2000_WINDOW_TEXT,
-            "strong text remains black and readable in light mode"
+            Style::QUAZAR_LIGHT_TEXT_STRONG,
+            "strong text remains high-contrast graphite in light mode"
         );
         assert_eq!(
             visuals.hyperlink_color,
-            Style::WIN2000_ACTIVE_TITLE,
-            "default brand accent resolves to classic active-title blue"
+            Style::QUAZAR_LIGHT_ACCENT,
+            "default brand accent resolves to governed Quazar Light blue"
+        );
+        assert!(
+            wcag_contrast_ratio(p.text, p.bg) >= 7.0,
+            "Quazar Light text/BG contrast must stay high: {:.2}",
+            wcag_contrast_ratio(p.text, p.bg)
+        );
+        assert!(
+            wcag_contrast_ratio(p.text_dim, p.bg) >= 4.5,
+            "Quazar Light dim text/BG contrast must clear AA: {:.2}",
+            wcag_contrast_ratio(p.text_dim, p.bg)
+        );
+        assert!(
+            wcag_contrast_ratio(
+                Style::QUAZAR_LIGHT_TEXT_STRONG,
+                Style::QUAZAR_LIGHT_PRESSED_FACE
+            ) >= 7.0,
+            "Quazar Light pressed strong text contrast must stay high: {:.2}",
+            wcag_contrast_ratio(
+                Style::QUAZAR_LIGHT_TEXT_STRONG,
+                Style::QUAZAR_LIGHT_PRESSED_FACE
+            )
         );
     }
 
@@ -2386,7 +2411,7 @@ mod tests {
             egui::Shape::Mesh(mesh) => {
                 assert_eq!(mesh.vertices[0].color, p.text_dim);
                 assert_eq!(mesh.vertices[1].color, p.surface);
-                assert_eq!(mesh.vertices[2].color, Style::WIN2000_ACTIVE_TITLE);
+                assert_eq!(mesh.vertices[2].color, Style::QUAZAR_LIGHT_ACCENT);
             }
             other => panic!("unexpected mesh shape: {other:?}"),
         }

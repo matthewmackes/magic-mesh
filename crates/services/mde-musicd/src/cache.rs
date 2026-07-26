@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// Default cache cap: 10 GiB (Q27 — settings-adjustable).
 pub const DEFAULT_CAP_BYTES: u64 = 10 * 1024 * 1024 * 1024;
@@ -31,6 +32,7 @@ pub const DEFAULT_CAP_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 /// mounts via `MDE_MESH_ARTWORK_DIR`.
 const ARTWORK_DIR_ENV: &str = "MDE_MESH_ARTWORK_DIR";
 const DEFAULT_ARTWORK_DIR: &str = "/mnt/mesh-storage/music/artwork";
+const METADATA_DIR_ENV: &str = "MDE_MUSIC_METADATA_CACHE_DIR";
 
 /// The communal artwork dir IF it currently exists (the mount is up + mackesd
 /// provisioned it). `None` → fall back to a direct Airsonic fetch (no sharing).
@@ -85,6 +87,28 @@ pub fn write_shared_artwork(cover_id: &str, bytes: &[u8]) {
     let tmp = dir.join(format!(".{name}.tmp"));
     if std::fs::write(&tmp, bytes).is_ok() {
         let _ = std::fs::rename(&tmp, dir.join(name));
+    }
+}
+
+/// Sanitize an opaque Airsonic id into a safe single path component. This is
+/// intentionally shared by artwork, audio, and metadata helpers: Subsonic ids are
+/// server-owned strings, not filesystem paths.
+#[must_use]
+pub fn safe_component(raw: &str) -> String {
+    let safe: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if safe.is_empty() {
+        "_".to_string()
+    } else {
+        safe
     }
 }
 
@@ -181,6 +205,130 @@ pub fn cache_dir() -> PathBuf {
     Path::new(&home).join(".local/share/mde/music-cache")
 }
 
+/// Epoch milliseconds used for cache recency bookkeeping.
+#[must_use]
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// Safe on-disk file name for a cached audio track.
+#[must_use]
+pub fn track_filename(song_id: &str, suffix: &str) -> String {
+    format!("{}.{}", safe_component(song_id), safe_component(suffix))
+}
+
+/// Path for a cached audio track entry.
+#[must_use]
+pub fn track_path(dir: &Path, song_id: &str, suffix: &str) -> PathBuf {
+    dir.join(track_filename(song_id, suffix))
+}
+
+/// Read fully cached audio bytes for `song_id`, if the index points at a
+/// non-empty local file. Successful reads bump the LRU timestamp so replaying a
+/// recently-played cached track during an AirSonic outage keeps it hot.
+#[must_use]
+pub fn read_cached_track_bytes(dir: &Path, song_id: &str, now_ms: u64) -> Option<Vec<u8>> {
+    let mut index = read_index(dir);
+    let entry = index.entries.get(song_id)?.clone();
+    let path = track_path(dir, song_id, &entry.suffix);
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    index.record_play(song_id, now_ms);
+    let _ = write_index(dir, &index);
+    Some(bytes)
+}
+
+/// Write a fully-fetched finite stream into the recently-played audio cache.
+/// Temp-then-rename keeps readers from seeing partial audio if playback is
+/// interrupted mid-write; index persistence is best-effort for the caller.
+pub fn write_cached_track(
+    dir: &Path,
+    song_id: &str,
+    suffix: &str,
+    bytes: &[u8],
+    now_ms: u64,
+    starred: bool,
+) -> std::io::Result<()> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dir)?;
+    let name = track_filename(song_id, suffix);
+    let tmp = dir.join(format!(".{name}.tmp"));
+    let path = dir.join(&name);
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)?;
+    let mut index = read_index(dir);
+    index.upsert(
+        song_id,
+        u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        suffix,
+        now_ms,
+        starred,
+    );
+    write_index(dir, &index)
+}
+
+/// Directory for durable Airsonic metadata replies. Tests can override it with
+/// `MDE_MUSIC_METADATA_CACHE_DIR`; production keeps it below the music cache.
+#[must_use]
+pub fn metadata_cache_dir() -> PathBuf {
+    std::env::var(METADATA_DIR_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| cache_dir().join("metadata"))
+}
+
+fn fnv1a64(parts: &[&str]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for part in parts {
+        for b in part.as_bytes() {
+            hash ^= u64::from(*b);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        // Separator so ["ab", "c"] and ["a", "bc"] do not collide trivially.
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Stable file path for one metadata cache entry. `scope` should be the selected
+/// Airsonic/gateway base URL so switching sources cannot accidentally replay a
+/// different server's stale metadata.
+#[must_use]
+pub fn metadata_cache_path(dir: &Path, scope: &str, view: &str, extra_key: &str) -> PathBuf {
+    let digest = fnv1a64(&[scope, view, extra_key]);
+    dir.join(format!("{}-{digest:016x}.json", safe_component(view)))
+}
+
+/// Read a cached Airsonic metadata inner response.
+#[must_use]
+pub fn read_cached_metadata(dir: &Path, scope: &str, view: &str, extra_key: &str) -> Option<Value> {
+    let path = metadata_cache_path(dir, scope, view, extra_key);
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Persist an Airsonic metadata inner response for outage fallback.
+pub fn write_cached_metadata(dir: &Path, scope: &str, view: &str, extra_key: &str, value: &Value) {
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let path = metadata_cache_path(dir, scope, view, extra_key);
+    let tmp = path.with_extension("tmp");
+    let Ok(json) = serde_json::to_string_pretty(value) else {
+        return;
+    };
+    if std::fs::write(&tmp, json).is_ok() {
+        let _ = std::fs::rename(tmp, path);
+    }
+}
+
 /// Path of the index file within `dir`.
 #[must_use]
 pub fn index_path(dir: &Path) -> PathBuf {
@@ -219,7 +367,7 @@ pub fn run_gc(dir: &Path, cap_bytes: u64) -> std::io::Result<Vec<String>> {
     let plan = index.evict_plan(cap_bytes);
     for id in &plan {
         if let Some(entry) = index.entries.remove(id) {
-            let file = dir.join(format!("{id}.{}", entry.suffix));
+            let file = track_path(dir, id, &entry.suffix);
             let _ = std::fs::remove_file(file); // best-effort; absent is fine.
         }
     }
@@ -258,6 +406,7 @@ mod tests {
         assert_eq!(artwork_filename("../../etc/passwd"), "______etc_passwd");
         assert_eq!(artwork_filename("a b/c"), "a_b_c");
         assert_eq!(artwork_filename(""), "_");
+        assert_eq!(safe_component("a/b&c.flac"), "a_b_c.flac");
     }
 
     #[test]
@@ -356,15 +505,15 @@ mod tests {
     fn run_gc_deletes_files_and_trims_index() {
         let dir = tempdir().unwrap();
         // Two cached files; index says 100+100; cap 100 evicts the older.
-        std::fs::write(dir.path().join("a.flac"), b"xxxx").unwrap();
-        std::fs::write(dir.path().join("b.flac"), b"yyyy").unwrap();
+        std::fs::write(track_path(dir.path(), "a", "flac"), b"xxxx").unwrap();
+        std::fs::write(track_path(dir.path(), "b", "flac"), b"yyyy").unwrap();
         let i = idx(&[("a", 100, 1, false), ("b", 100, 9, false)]);
         write_index(dir.path(), &i).unwrap();
 
         let evicted = run_gc(dir.path(), 100).unwrap();
         assert_eq!(evicted, vec!["a".to_string()]);
-        assert!(!dir.path().join("a.flac").exists());
-        assert!(dir.path().join("b.flac").exists());
+        assert!(!track_path(dir.path(), "a", "flac").exists());
+        assert!(track_path(dir.path(), "b", "flac").exists());
         // Index trimmed + persisted.
         let back = read_index(dir.path());
         assert!(!back.entries.contains_key("a"));
@@ -375,6 +524,63 @@ mod tests {
     fn human_bytes_scales() {
         assert_eq!(human_bytes(512), "512 B");
         assert_eq!(human_bytes(10 * 1024 * 1024 * 1024), "10.0 GiB");
+    }
+
+    #[test]
+    fn cached_track_round_trips_and_records_recent_play() {
+        let dir = tempdir().unwrap();
+        write_cached_track(dir.path(), "song/7", "flac", b"audio-bytes", 10, false).unwrap();
+        assert!(track_path(dir.path(), "song/7", "flac").exists());
+
+        let bytes = read_cached_track_bytes(dir.path(), "song/7", 99).expect("cached audio");
+        assert_eq!(bytes, b"audio-bytes");
+        let index = read_index(dir.path());
+        assert_eq!(
+            index.entries.get("song/7").map(|e| e.last_played_ms),
+            Some(99)
+        );
+    }
+
+    #[test]
+    fn metadata_cache_keys_include_scope_and_body() {
+        let dir = tempdir().unwrap();
+        let value = serde_json::json!({"albumList2": {"album": [{"id": "a"}]}});
+        write_cached_metadata(
+            dir.path(),
+            "http://gateway-a/mde/airsonic/source-a",
+            "getAlbumList2",
+            "type=recent&size=10",
+            &value,
+        );
+        assert_eq!(
+            read_cached_metadata(
+                dir.path(),
+                "http://gateway-a/mde/airsonic/source-a",
+                "getAlbumList2",
+                "type=recent&size=10"
+            ),
+            Some(value)
+        );
+        assert!(
+            read_cached_metadata(
+                dir.path(),
+                "http://gateway-b/mde/airsonic/source-a",
+                "getAlbumList2",
+                "type=recent&size=10"
+            )
+            .is_none(),
+            "a different gateway/source scope must not reuse stale metadata"
+        );
+        assert!(
+            read_cached_metadata(
+                dir.path(),
+                "http://gateway-a/mde/airsonic/source-a",
+                "getAlbumList2",
+                "type=newest&size=10"
+            )
+            .is_none(),
+            "different query params get a different cache entry"
+        );
     }
 
     #[test]

@@ -9,15 +9,18 @@ features that make the current shell profile recognizable:
 * Construct home: the 24 px top status rail, several shared springboard tile
   plate colours, enough white glyph/text paint, and the bounded floating
   navigation pill rather than a full-width bottom taskbar-shaped bar.
-* Car home: the Ford SYNC3 near-black ground, a populated left driver
-  instrument strip, raised dashboard cards in the right workspace, Ford-blue
-  accent caps, a six-slot bottom app strip, and strong glance text.
+* Car screen: the Ford SYNC3 near-black ground plus a populated left driver
+  instrument strip in the reserved Car frame.
+* Car home: the Car-screen guard, raised dashboard cards in the right
+  workspace, Ford-blue accent caps, a six-slot bottom app strip, and strong
+  glance text.
 
 Use this after a live `.15` KMS/linear-GBM capture to turn manual pixel
 inspection into a repeatable fail-closed check.  It intentionally does not prove
-physical pointer input, VDI guest acceptance, MG90 SSH/drive data, or freshness
-of a Bus mirror; pair it with the relevant live mirror/input proof when those
-claims are needed.
+physical pointer input, VDI guest acceptance, or MG90 SSH/drive data.  Pixel-only
+mode also cannot prove Bus freshness; installed Car evidence can require a
+same-run `verify-live-mirrors.py --vehicle-node ... --require-online` JSON result
+with `--require-car-instrument-freshness`.
 """
 
 from __future__ import annotations
@@ -32,7 +35,7 @@ from pathlib import Path
 import struct
 import sys
 import tempfile
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable
 import zlib
 
 
@@ -84,6 +87,9 @@ CAR_TOUCH_TARGET = 44
 CAR_MIN_STRIP_H = CAR_TOUCH_TARGET + 32  # Density::Touch + Style::SP_XL
 CAR_MIN_CARDS_H = CAR_TOUCH_TARGET * 2 + CAR_GAP
 CAR_STRIP_TILES = 6
+MAX_EVIDENCE_JSON_BYTES = 1024 * 1024
+DEFAULT_CAR_MIRROR_MAX_AGE_SECONDS = 120.0
+DEFAULT_CAR_EVIDENCE_MAX_SKEW_SECONDS = 120.0
 
 
 Color = tuple[int, int, int]
@@ -453,6 +459,225 @@ def _car_frame_geometry(width: int, height: int) -> dict[str, object]:
     }
 
 
+def _validate_car_instrument_strip_pixels(
+    image: PngImage, instrument: tuple[int, int, int, int]
+) -> dict[str, object]:
+    """Require the persistent left Car instrument strip to be visibly populated."""
+
+    instrument_total = _rect_pixels(image, instrument)
+    instrument_counts = _count_groups(
+        image,
+        instrument,
+        {
+            "bg": ((SYNC3_BG,), 10),
+            "surface": ((SYNC3_SURFACE, SYNC3_SURFACE_HI), 12),
+            "accent": ((SYNC3_ACCENT, SYNC3_ACCENT_HI), 14),
+            "text": ((SYNC3_TEXT_DIM, SYNC3_TEXT_STRONG), 24),
+        },
+    )
+    instrument_bg = instrument_counts["bg"]
+    instrument_surface = instrument_counts["surface"]
+    instrument_accent = instrument_counts["accent"]
+    instrument_text = instrument_counts["text"]
+    instrument_strip_bg_ratio = _require_ratio(
+        "left driver instrument strip ground", instrument_bg, instrument_total, 0.20
+    )
+    instrument_strip_surface_ratio = _require_ratio(
+        "left driver instrument strip status tiles",
+        instrument_surface,
+        instrument_total,
+        0.03,
+    )
+    _require_minimum(
+        "left driver instrument strip accent pixels",
+        instrument_accent,
+        max(120, instrument_total // 3500),
+    )
+    _require_minimum(
+        "left driver instrument strip text/readout pixels",
+        instrument_text,
+        max(300, instrument_total // 1200),
+    )
+    return {
+        "instrument_strip_bg_ratio": instrument_strip_bg_ratio,
+        "instrument_strip_surface_ratio": instrument_strip_surface_ratio,
+        "instrument_strip_accent_pixels": instrument_accent,
+        "instrument_strip_text_pixels": instrument_text,
+    }
+
+
+def validate_car_screen(image: PngImage) -> dict[str, object]:
+    """Validate the persistent Car frame that should appear on every Car screen."""
+
+    if image.width < 1024 or image.height < 640:
+        raise ProofError(f"Car screen proof must be at least 1024x640, got {image.width}x{image.height}")
+    luma_min, luma_max = _sample_luma_spread(image)
+    geom = _car_frame_geometry(image.width, image.height)
+    full = (0, 0, image.width, image.height)
+    instrument = geom["instrument"]  # type: ignore[assignment]
+    workspace = geom["workspace"]  # type: ignore[assignment]
+    instrument_metrics = _validate_car_instrument_strip_pixels(image, instrument)
+
+    full_counts = _count_groups(
+        image,
+        full,
+        {
+            "bg": ((SYNC3_BG,), 10),
+            "surface": ((SYNC3_SURFACE, SYNC3_SURFACE_HI), 12),
+            "accent": ((SYNC3_ACCENT, SYNC3_ACCENT_HI), 14),
+            "text": ((SYNC3_TEXT_DIM, SYNC3_TEXT_STRONG), 24),
+        },
+    )
+    workspace_bg = _count_near_any(image, workspace, (SYNC3_BG,), 10)
+    workspace_total = _rect_pixels(image, workspace)
+    workspace_paint = max(0, workspace_total - workspace_bg)
+    metrics = {
+        "profile": "car-screen",
+        "width": image.width,
+        "height": image.height,
+        "sha256": image.sha256,
+        "luma_min": luma_min,
+        "luma_max": luma_max,
+        "sync3_bg_ratio": _require_ratio("SYNC3 ground", full_counts["bg"], image.pixels, 0.10),
+        "sync3_card_ratio": _require_ratio("SYNC3 raised card", full_counts["surface"], image.pixels, 0.03),
+        "sync3_accent_pixels": full_counts["accent"],
+        "sync3_text_pixels": full_counts["text"],
+        "right_workspace_paint_ratio": _require_ratio(
+            "right Car workspace paint", workspace_paint, workspace_total, 0.01
+        ),
+    }
+    metrics.update(instrument_metrics)
+    _require_minimum("Ford-blue accent pixels", full_counts["accent"], max(160, image.pixels // 1200))
+    _require_minimum("Car text/glyph pixels", full_counts["text"], max(250, image.pixels // 1200))
+    return metrics
+
+
+def _read_json_object(path: Path, label: str) -> dict[str, Any]:
+    try:
+        stat_result = path.lstat()
+    except OSError as exc:
+        raise ProofError(f"{label} path is not readable: {path}") from exc
+    if path.is_symlink():
+        raise ProofError(f"{label} path must be a regular file, not a symlink: {path}")
+    if not path.is_file():
+        raise ProofError(f"{label} path must be a regular file: {path}")
+    if stat_result.st_size > MAX_EVIDENCE_JSON_BYTES:
+        raise ProofError(
+            f"{label} JSON is too large: {stat_result.st_size} bytes > {MAX_EVIDENCE_JSON_BYTES}"
+        )
+    try:
+        raw = path.read_bytes()
+        data = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ProofError(f"{label} JSON cannot be read: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ProofError(f"{label} JSON must be an object")
+    return data
+
+
+def _integer_ms(value: Any, field: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ProofError(f"{field} must be an integer millisecond timestamp/count")
+    return value
+
+
+def _vehicle_result_from_live_mirror_report(
+    report: dict[str, Any], max_age_ms: int
+) -> tuple[int, dict[str, object]]:
+    observed_at_ms = _integer_ms(report.get("observed_at_ms"), "observed_at_ms")
+    results = report.get("results")
+    if not isinstance(results, list):
+        raise ProofError("vehicle evidence JSON must contain a results array")
+    vehicles = [entry for entry in results if isinstance(entry, dict) and entry.get("kind") == "vehicle"]
+    if len(vehicles) != 1:
+        raise ProofError(
+            "vehicle evidence JSON must contain exactly one verify-live-mirrors vehicle result"
+        )
+    vehicle = vehicles[0]
+    errors = vehicle.get("errors")
+    if errors:
+        raise ProofError(f"vehicle evidence contains errors: {errors}")
+    topic = vehicle.get("topic")
+    if not isinstance(topic, str) or not topic.startswith("state/vehicle/"):
+        raise ProofError(f"vehicle evidence topic is not state/vehicle/<node>: {topic!r}")
+    host = vehicle.get("host")
+    if not isinstance(host, str) or not host:
+        raise ProofError("vehicle evidence host is missing")
+    if topic != f"state/vehicle/{host}":
+        raise ProofError(f"vehicle evidence topic/host mismatch: topic={topic!r}, host={host!r}")
+    if vehicle.get("fresh") is not True:
+        raise ProofError("vehicle evidence is not fresh")
+    if vehicle.get("online") is not True:
+        raise ProofError("vehicle evidence is not online")
+    age_ms = _integer_ms(vehicle.get("age_ms"), "vehicle.age_ms")
+    if age_ms > max_age_ms:
+        raise ProofError(f"vehicle evidence is stale by policy: {age_ms} ms > {max_age_ms} ms")
+
+    return observed_at_ms, {
+        "car_instrument_freshness": "fresh-vehicle-mirror",
+        "car_vehicle_report_ok": report.get("ok") is True,
+        "car_vehicle_topic": topic,
+        "car_vehicle_host": host,
+        "car_vehicle_age_ms": age_ms,
+        "car_vehicle_online": vehicle.get("online"),
+        "car_vehicle_model": vehicle.get("model"),
+        "car_vehicle_mgos_version": vehicle.get("mgos_version"),
+        "car_vehicle_fix_type": vehicle.get("fix_type"),
+        "car_vehicle_satellites": vehicle.get("satellites"),
+        "car_vehicle_has_fix": vehicle.get("has_fix"),
+    }
+
+
+def validate_car_instrument_freshness(
+    png_path: Path,
+    evidence_path: Path | None,
+    captured_at_ms: int | None,
+    mirror_max_age_seconds: float,
+    evidence_max_skew_seconds: float,
+) -> dict[str, object]:
+    """Tie a Car PNG to same-run fresh vehicle mirror evidence."""
+
+    if evidence_path is None:
+        raise ProofError(
+            "--require-car-instrument-freshness needs --car-vehicle-evidence-json from "
+            "verify-live-mirrors.py"
+        )
+    if (
+        not math.isfinite(mirror_max_age_seconds)
+        or not math.isfinite(evidence_max_skew_seconds)
+        or mirror_max_age_seconds < 0
+        or evidence_max_skew_seconds < 0
+    ):
+        raise ProofError("Car freshness age/skew windows must be non-negative")
+    report = _read_json_object(evidence_path, "vehicle evidence")
+    mirror_max_age_ms = int(mirror_max_age_seconds * 1000)
+    observed_at_ms, metrics = _vehicle_result_from_live_mirror_report(report, mirror_max_age_ms)
+
+    if captured_at_ms is None:
+        try:
+            captured_at_ms = round(png_path.stat().st_mtime_ns / 1_000_000)
+        except OSError as exc:
+            raise ProofError(f"cannot stat PNG capture time: {png_path}") from exc
+    else:
+        _integer_ms(captured_at_ms, "captured_at_ms")
+    skew_ms = abs(captured_at_ms - observed_at_ms)
+    max_skew_ms = int(evidence_max_skew_seconds * 1000)
+    if skew_ms > max_skew_ms:
+        raise ProofError(
+            f"PNG capture time and vehicle evidence observation differ by {skew_ms} ms "
+            f"(limit {max_skew_ms} ms)"
+        )
+    metrics.update(
+        {
+            "car_capture_observed_at_ms": captured_at_ms,
+            "car_vehicle_observed_at_ms": observed_at_ms,
+            "car_capture_vehicle_evidence_skew_ms": skew_ms,
+            "car_vehicle_mirror_max_age_ms": mirror_max_age_ms,
+        }
+    )
+    return metrics
+
+
 def validate_car_home(image: PngImage) -> dict[str, object]:
     if image.width < 1024 or image.height < 640:
         raise ProofError(f"Car home proof must be at least 1024x640, got {image.width}x{image.height}")
@@ -473,21 +698,7 @@ def validate_car_home(image: PngImage) -> dict[str, object]:
 
     total = image.pixels
     bottom_total = _rect_pixels(image, strip_band)
-    instrument_total = _rect_pixels(image, instrument)
-    instrument_counts = _count_groups(
-        image,
-        instrument,
-        {
-            "bg": ((SYNC3_BG,), 10),
-            "surface": ((SYNC3_SURFACE, SYNC3_SURFACE_HI), 12),
-            "accent": ((SYNC3_ACCENT, SYNC3_ACCENT_HI), 14),
-            "text": ((SYNC3_TEXT_DIM, SYNC3_TEXT_STRONG), 24),
-        },
-    )
-    instrument_bg = instrument_counts["bg"]
-    instrument_surface = instrument_counts["surface"]
-    instrument_accent = instrument_counts["accent"]
-    instrument_text = instrument_counts["text"]
+    instrument_metrics = _validate_car_instrument_strip_pixels(image, instrument)
 
     nav_interior = _inset_rect(nav_card, CAR_PANEL_PAD)
     nav_surface = _count_near_any(image, nav_interior, (SYNC3_SURFACE, SYNC3_SURFACE_HI), 12)
@@ -524,15 +735,6 @@ def validate_car_home(image: PngImage) -> dict[str, object]:
     bottom_strip_card_ratio = _require_ratio(
         "bottom app-strip/card paint", bottom_surface, bottom_total, 0.10
     )
-    instrument_strip_bg_ratio = _require_ratio(
-        "left driver instrument strip ground", instrument_bg, instrument_total, 0.20
-    )
-    instrument_strip_surface_ratio = _require_ratio(
-        "left driver instrument strip status tiles",
-        instrument_surface,
-        instrument_total,
-        0.03,
-    )
     dashboard_nav_card_surface_ratio = _require_ratio(
         "Car Navigation dashboard card surface", nav_surface, nav_total, 0.45
     )
@@ -544,16 +746,6 @@ def validate_car_home(image: PngImage) -> dict[str, object]:
     )
     dashboard_nav_accent_cap_ratio = _require_ratio(
         "Car Navigation Ford-blue card cap", nav_cap_accent, nav_cap_total, 0.55
-    )
-    _require_minimum(
-        "left driver instrument strip accent pixels",
-        instrument_accent,
-        max(120, instrument_total // 3500),
-    )
-    _require_minimum(
-        "left driver instrument strip text/readout pixels",
-        instrument_text,
-        max(300, instrument_total // 1200),
     )
     _require_minimum("Car app-strip accent/glyph pixels", strip_accent, max(160, total // 2500))
 
@@ -583,10 +775,6 @@ def validate_car_home(image: PngImage) -> dict[str, object]:
         "sync3_accent_pixels": accent,
         "sync3_text_pixels": text,
         "bottom_strip_card_ratio": bottom_strip_card_ratio,
-        "instrument_strip_bg_ratio": instrument_strip_bg_ratio,
-        "instrument_strip_surface_ratio": instrument_strip_surface_ratio,
-        "instrument_strip_accent_pixels": instrument_accent,
-        "instrument_strip_text_pixels": instrument_text,
         "dashboard_nav_card_surface_ratio": dashboard_nav_card_surface_ratio,
         "dashboard_media_card_surface_ratio": dashboard_media_card_surface_ratio,
         "dashboard_glance_card_surface_ratio": dashboard_glance_card_surface_ratio,
@@ -594,6 +782,7 @@ def validate_car_home(image: PngImage) -> dict[str, object]:
         "app_strip_slots": len(strip_slot_surfaces),
         "app_strip_accent_pixels": strip_accent,
     }
+    metrics.update(instrument_metrics)
     _require_minimum("Ford-blue accent pixels", accent, max(250, total // 500))
     _require_minimum("strong Car text/glyph pixels", text, max(250, total // 1000))
     return metrics
@@ -805,6 +994,41 @@ def _fixture_car(
     _write_png(path, width, height, bytes(buf))
 
 
+def _fixture_vehicle_evidence(
+    path: Path,
+    *,
+    observed_at_ms: int,
+    age_ms: int = 10_000,
+    fresh: bool = True,
+    online: bool = True,
+    host: str = "test-node",
+) -> None:
+    payload = {
+        "observed_at_ms": observed_at_ms,
+        "bus_root": "/run/mde-bus",
+        "read_only": True,
+        "same_host_required": False,
+        "ok": fresh and online,
+        "results": [
+            {
+                "kind": "vehicle",
+                "topic": f"state/vehicle/{host}",
+                "host": host,
+                "age_ms": age_ms,
+                "fresh": fresh,
+                "online": online,
+                "model": "MG90",
+                "mgos_version": "4.3.0.1",
+                "fix_type": "no-fix",
+                "satellites": 0,
+                "has_fix": False,
+                "errors": [],
+            }
+        ],
+    }
+    path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+
+
 def _expect_fail(fn: Callable[[], object], label: str) -> None:
     try:
         fn()
@@ -818,25 +1042,92 @@ def run_self_test() -> None:
         root = Path(temp)
         construct = root / "construct.png"
         car = root / "car.png"
+        car_evidence = root / "car-vehicle-evidence.json"
+        car_stale_evidence = root / "car-stale-vehicle-evidence.json"
+        car_skewed_evidence = root / "car-skewed-vehicle-evidence.json"
         construct_taskbar = root / "construct-taskbar.png"
         blank_car = root / "blank-car.png"
         car_no_instrument = root / "car-no-instrument.png"
         car_no_dashboard = root / "car-no-dashboard.png"
         car_no_strip = root / "car-no-strip.png"
+        observed_at_ms = 1_700_000_000_000
         _fixture_construct(construct)
         _fixture_car(car)
+        _fixture_vehicle_evidence(car_evidence, observed_at_ms=observed_at_ms)
+        _fixture_vehicle_evidence(
+            car_stale_evidence, observed_at_ms=observed_at_ms, age_ms=180_000
+        )
+        _fixture_vehicle_evidence(
+            car_skewed_evidence, observed_at_ms=observed_at_ms + 600_000
+        )
         _fixture_construct(construct_taskbar, taskbar=True)
         _fixture_car(blank_car, blank=True)
         _fixture_car(car_no_instrument, missing_instrument=True)
         _fixture_car(car_no_dashboard, missing_dashboard=True)
         _fixture_car(car_no_strip, missing_strip=True)
         validate_construct_home(read_png(construct))
+        validate_car_screen(read_png(car))
         validate_car_home(read_png(car))
+        fresh_metrics = validate_car_instrument_freshness(
+            car,
+            car_evidence,
+            observed_at_ms,
+            DEFAULT_CAR_MIRROR_MAX_AGE_SECONDS,
+            DEFAULT_CAR_EVIDENCE_MAX_SKEW_SECONDS,
+        )
+        assert fresh_metrics["car_vehicle_topic"] == "state/vehicle/test-node", fresh_metrics
+        assert (
+            main(
+                [
+                    "--profile",
+                    "car-screen",
+                    "--png",
+                    str(car),
+                    "--require-car-instrument-freshness",
+                    "--car-vehicle-evidence-json",
+                    str(car_evidence),
+                    "--car-captured-at-ms",
+                    str(observed_at_ms),
+                ]
+            )
+            == 0
+        )
         _expect_fail(lambda: validate_construct_home(read_png(construct_taskbar)), "taskbar-shaped construct fixture")
         _expect_fail(lambda: validate_car_home(read_png(blank_car)), "blank Car fixture")
         _expect_fail(lambda: validate_car_home(read_png(car_no_instrument)), "Car fixture missing driver strip")
+        _expect_fail(lambda: validate_car_screen(read_png(car_no_instrument)), "Car screen missing driver strip")
         _expect_fail(lambda: validate_car_home(read_png(car_no_dashboard)), "Car fixture missing dashboard cards")
         _expect_fail(lambda: validate_car_home(read_png(car_no_strip)), "Car fixture missing six-slot app strip")
+        _expect_fail(
+            lambda: validate_car_instrument_freshness(
+                car,
+                None,
+                observed_at_ms,
+                DEFAULT_CAR_MIRROR_MAX_AGE_SECONDS,
+                DEFAULT_CAR_EVIDENCE_MAX_SKEW_SECONDS,
+            ),
+            "required Car freshness evidence omitted",
+        )
+        _expect_fail(
+            lambda: validate_car_instrument_freshness(
+                car,
+                car_stale_evidence,
+                observed_at_ms,
+                DEFAULT_CAR_MIRROR_MAX_AGE_SECONDS,
+                DEFAULT_CAR_EVIDENCE_MAX_SKEW_SECONDS,
+            ),
+            "stale vehicle evidence",
+        )
+        _expect_fail(
+            lambda: validate_car_instrument_freshness(
+                car,
+                car_skewed_evidence,
+                observed_at_ms,
+                DEFAULT_CAR_MIRROR_MAX_AGE_SECONDS,
+                DEFAULT_CAR_EVIDENCE_MAX_SKEW_SECONDS,
+            ),
+            "skewed vehicle evidence",
+        )
     print("verify-shell-pixel-proof: self-test passed")
 
 
@@ -846,10 +1137,52 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--profile",
-        choices=("construct-home", "car-home"),
+        choices=("construct-home", "car-screen", "car-home"),
         help="pixel contract to validate",
     )
     parser.add_argument("--png", type=Path, help="already-captured PNG artifact to validate")
+    parser.add_argument(
+        "--require-car-instrument-freshness",
+        action="store_true",
+        help=(
+            "for Car profiles, require same-run fresh vehicle evidence from "
+            "verify-live-mirrors.py"
+        ),
+    )
+    parser.add_argument(
+        "--car-vehicle-evidence-json",
+        type=Path,
+        help=(
+            "JSON output from verify-live-mirrors.py --vehicle-node <node> "
+            "--require-online"
+        ),
+    )
+    parser.add_argument(
+        "--car-captured-at-ms",
+        type=int,
+        help=(
+            "capture timestamp in Unix milliseconds; defaults to the PNG mtime "
+            "when Car freshness evidence is required"
+        ),
+    )
+    parser.add_argument(
+        "--car-mirror-max-age-seconds",
+        type=float,
+        default=DEFAULT_CAR_MIRROR_MAX_AGE_SECONDS,
+        help=(
+            "maximum vehicle mirror age accepted by --require-car-instrument-freshness "
+            f"(default: {DEFAULT_CAR_MIRROR_MAX_AGE_SECONDS:g})"
+        ),
+    )
+    parser.add_argument(
+        "--car-evidence-max-skew-seconds",
+        type=float,
+        default=DEFAULT_CAR_EVIDENCE_MAX_SKEW_SECONDS,
+        help=(
+            "maximum time skew between PNG capture time and live-mirror observation "
+            f"(default: {DEFAULT_CAR_EVIDENCE_MAX_SKEW_SECONDS:g})"
+        ),
+    )
     parser.add_argument(
         "--json",
         action="store_true",
@@ -868,10 +1201,28 @@ def main(argv: list[str] | None = None) -> int:
         if not args.profile or not args.png:
             raise ProofError("--profile and --png are required unless --self-test is used")
         image = read_png(args.png)
+        car_profile = args.profile in {"car-screen", "car-home"}
+        require_car_freshness = args.require_car_instrument_freshness or args.car_vehicle_evidence_json is not None
+        if require_car_freshness and not car_profile:
+            raise ProofError("Car freshness evidence options require --profile car-screen or car-home")
+        if args.car_captured_at_ms is not None and not car_profile:
+            raise ProofError("--car-captured-at-ms requires --profile car-screen or car-home")
         if args.profile == "construct-home":
             metrics = validate_construct_home(image)
-        else:
+        elif args.profile == "car-home":
             metrics = validate_car_home(image)
+        else:
+            metrics = validate_car_screen(image)
+        if require_car_freshness:
+            metrics.update(
+                validate_car_instrument_freshness(
+                    args.png,
+                    args.car_vehicle_evidence_json,
+                    args.car_captured_at_ms,
+                    args.car_mirror_max_age_seconds,
+                    args.car_evidence_max_skew_seconds,
+                )
+            )
     except ProofError as exc:
         print(f"verify-shell-pixel-proof: FAIL: {exc}", file=sys.stderr)
         return 1

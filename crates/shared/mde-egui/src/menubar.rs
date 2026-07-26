@@ -44,8 +44,8 @@
 
 use egui::text::{LayoutJob, TextFormat};
 use egui::{
-    Align, Button, Color32, Key, Layout, Rect, Sense, Stroke,
-    StrokeKind, Ui, WidgetInfo, WidgetType,
+    Align, Button, Color32, Key, Layout, Rect, Sense, Stroke, StrokeKind, Ui, WidgetInfo,
+    WidgetType,
 };
 
 use crate::{Motion, Style, TypographyRole};
@@ -706,11 +706,9 @@ fn status_chip(ui: &mut Ui, chip: &StatusChip) {
         .icon
         .as_ref()
         .map_or_else(|| chip.text.clone(), |icon| format!("{icon} {}", chip.text));
-    let galley = ui.painter().layout_no_wrap(
-        text,
-        Style::typography_font(TypographyRole::Caption),
-        color,
-    );
+    let galley =
+        ui.painter()
+            .layout_no_wrap(text, Style::typography_font(TypographyRole::Caption), color);
     let pad = egui::vec2(Style::SP_S, Style::SP_XS);
     let (rect, _) = ui.allocate_exact_size(galley.size() + pad * 2.0, Sense::hover());
     ui.painter().rect_filled(
@@ -832,9 +830,9 @@ mod tests {
         Style::install_color_scheme_with_density(&ctx, StyleColorScheme::Light, Density::Mouse);
 
         let colors = MenuColors::resolve(&ctx, Style::ACCENT);
-        assert_eq!(colors.text, Style::WIN2000_WINDOW_TEXT);
-        assert_eq!(colors.text_dim, Style::WIN2000_DIM_TEXT);
-        assert_eq!(colors.accent, Style::WIN2000_ACTIVE_TITLE);
+        assert_eq!(colors.text, Style::QUAZAR_LIGHT_TEXT);
+        assert_eq!(colors.text_dim, Style::QUAZAR_LIGHT_TEXT_DIM);
+        assert_eq!(colors.accent, Style::QUAZAR_LIGHT_ACCENT);
         assert_ne!(
             colors.text,
             Style::TEXT,
@@ -848,9 +846,9 @@ mod tests {
 
         let label = menu_label_job("File", Some('F'), colors.text);
         for section in &label.sections {
-            assert_eq!(section.format.color, Style::WIN2000_WINDOW_TEXT);
+            assert_eq!(section.format.color, Style::QUAZAR_LIGHT_TEXT);
             if section.byte_range == (0..1) {
-                assert_eq!(section.format.underline.color, Style::WIN2000_WINDOW_TEXT);
+                assert_eq!(section.format.underline.color, Style::QUAZAR_LIGHT_TEXT);
             }
         }
     }
