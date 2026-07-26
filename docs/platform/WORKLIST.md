@@ -2003,7 +2003,8 @@ These decisions refine acceptance and sequencing for the active items below.
   topic absent, and clears prior vehicle-scoped tiles so an old radar frame is
   not replayed for a stale location. The production HTTP probe now constructs
   its blocking reqwest client inside the blocking fetch path, avoiding Tokio
-  runtime-drop hazards. Sidecar farm evidence is green on `.90` for
+  runtime-drop hazards. Exact post-integration farm evidence is green on `.90`
+  for
   `cargo test -p mackesd --lib --features async-services
   workers::iem_radar_overlay::tests -- --nocapture` at **10/10**, `.170`
   touched-file rustfmt is green, and local `git diff --check` for the touched
@@ -3201,10 +3202,9 @@ These decisions refine acceptance and sequencing for the active items below.
   suite now includes fail-closed fixtures for a missing driver strip, missing
   dashboard cards, and missing app strip. The exact final verifier file passes
   local bytecode compilation, `--self-test` (38 s), and `git diff --check`;
-  sidecar farm `.50` slot `ux-car-pixel-proof` covered the same geometry
-  contract before the final local counting/order optimization. No live `.15`
-  capture, package deploy, MG90 drive/fix, or physical Car proof was collected
-  in this slice.
+  exact post-integration farm `.170` slot `ux-car-pixel-proof` ran bytecode
+  compilation plus `--self-test` clean. No live `.15` capture, package deploy,
+  MG90 drive/fix, or physical Car proof was collected in this slice.
 - Progress (2026-07-26 MG90 Admin single-interface consolidation): Maps &
   Location now exposes one top-level `MG90 Admin` rail target; the former
   Vehicle, Connectivity, Devices & I/O, Location Sources, MG90 Setup, MG90
