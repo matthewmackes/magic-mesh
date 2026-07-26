@@ -14,7 +14,7 @@ use mde_collab_types::event::CollabEventKind;
 use mde_collab_types::ids::{
     CallId, DocumentId, EventId, FileRefId, SpaceId, ThreadId, TransferId,
 };
-use mde_collab_types::value::{AlertActionKind, CallParticipantState};
+use mde_collab_types::value::{AlertActionKind, CallParticipantState, TransferState};
 use mde_collab_types::{ActorId, CollabEventEnvelope, SpaceKind, SpaceRole};
 
 /// The total, deterministic sort key that orders a merged multi-node log:
@@ -99,6 +99,15 @@ pub struct CallAgg {
     pub muted: BTreeMap<ActorId, bool>,
 }
 
+/// A transfer's validation facts.
+#[derive(Debug, Clone)]
+pub struct TransferAgg {
+    /// The space the transfer belongs to.
+    pub space: SpaceId,
+    /// The current ledger state.
+    pub state: TransferState,
+}
+
 /// The folded aggregate.
 #[derive(Debug, Default, Clone)]
 pub struct DomainState {
@@ -112,8 +121,8 @@ pub struct DomainState {
     pub documents: BTreeMap<DocumentId, SpaceId>,
     /// File references → (space, currently-present).
     pub files: BTreeMap<FileRefId, (SpaceId, bool)>,
-    /// Transfers → their space.
-    pub transfers: BTreeMap<TransferId, SpaceId>,
+    /// Transfers by id.
+    pub transfers: BTreeMap<TransferId, TransferAgg>,
     /// Calls by id.
     pub calls: BTreeMap<CallId, CallAgg>,
     /// Clipboard items by their publish event id.
@@ -269,9 +278,21 @@ impl DomainState {
                 }
             }
             CollabEventKind::TransferStarted { transfer, .. } => {
-                self.transfers.insert(*transfer, space_id);
+                self.transfers.insert(
+                    *transfer,
+                    TransferAgg {
+                        space: space_id,
+                        state: TransferState::Queued,
+                    },
+                );
             }
-            CollabEventKind::TransferStateChanged { .. } => {}
+            CollabEventKind::TransferStateChanged { transfer, state } => {
+                if let Some(t) = self.transfers.get_mut(transfer) {
+                    if t.space == space_id {
+                        t.state = *state;
+                    }
+                }
+            }
             CollabEventKind::CallStarted {
                 call, initiator, ..
             } => {
@@ -369,12 +390,7 @@ mod tests {
         CallId::from_uuid(Uuid::from_u128(value))
     }
 
-    fn event(
-        id: u128,
-        space: SpaceId,
-        wall: u64,
-        kind: CollabEventKind,
-    ) -> CollabEventEnvelope {
+    fn event(id: u128, space: SpaceId, wall: u64, kind: CollabEventKind) -> CollabEventEnvelope {
         CollabEventEnvelope::new(
             event_id(id),
             space,

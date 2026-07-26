@@ -674,20 +674,17 @@ pub fn apply_command<S: EventSigner, I: IdSource>(
             )])
         }
         CollabCommand::ControlTransfer { transfer, control } => {
-            let space = *state
+            let current = state
                 .transfers
                 .get(transfer)
                 .ok_or(CollabError::TransferNotFound(*transfer))?;
+            let space = current.space;
             // Transfer controls are shared space facts.  Without this guard,
             // any actor who had learned a transfer id could mint a pause,
             // resume, or cancel event for a space they do not belong to.
             require_active_space(state, space)?;
             require_member(state, space, &ctx.actor)?;
-            let new_state = match control {
-                TransferControl::Pause => TransferState::Paused,
-                TransferControl::Resume => TransferState::Active,
-                TransferControl::Cancel => TransferState::Canceled,
-            };
+            let new_state = next_transfer_state(*transfer, current.state, *control)?;
             Ok(vec![ctx.emit(
                 space,
                 CollabEventKind::TransferStateChanged {
@@ -824,6 +821,32 @@ pub fn apply_command<S: EventSigner, I: IdSource>(
     }
 }
 
+/// Mirror the UI/read-model transfer control contract at the authoritative
+/// command boundary. Queued transfers may only be canceled; active transfers
+/// may be paused/canceled; paused transfers may be resumed/canceled; terminal
+/// states carry no controls.
+fn next_transfer_state(
+    transfer: mde_collab_types::ids::TransferId,
+    state: TransferState,
+    control: TransferControl,
+) -> Result<TransferState> {
+    let next = match (state, control) {
+        (TransferState::Queued, TransferControl::Cancel) => TransferState::Canceled,
+        (TransferState::Active, TransferControl::Pause) => TransferState::Paused,
+        (TransferState::Active, TransferControl::Cancel) => TransferState::Canceled,
+        (TransferState::Paused, TransferControl::Resume) => TransferState::Active,
+        (TransferState::Paused, TransferControl::Cancel) => TransferState::Canceled,
+        _ => {
+            return Err(CollabError::InvalidTransferControl {
+                transfer,
+                state,
+                control,
+            });
+        }
+    };
+    Ok(next)
+}
+
 /// The space must exist and not be deleted.
 fn require_active_space(state: &DomainState, space: SpaceId) -> Result<()> {
     match state.space(space) {
@@ -832,7 +855,6 @@ fn require_active_space(state: &DomainState, space: SpaceId) -> Result<()> {
         Some(_) => Ok(()),
     }
 }
-
 /// Reject an oversized inline body before [`ApplyCtx::emit`] can consume an id
 /// or HLC tick. The projection has the same cap when it builds message views;
 /// keeping the command boundary aligned avoids signing events that can never be
@@ -1545,8 +1567,10 @@ mod tests {
             .expect("the existing 50-entry history remains clearable");
 
         assert_eq!(cleared.len(), MAX_CLEAR_CLIPBOARD_EVENTS);
-        assert!(cleared
-            .iter()
-            .all(|event| matches!(event.kind, CollabEventKind::ClipboardDeleted { .. })));
+        assert!(
+            cleared
+                .iter()
+                .all(|event| matches!(event.kind, CollabEventKind::ClipboardDeleted { .. }))
+        );
     }
 }

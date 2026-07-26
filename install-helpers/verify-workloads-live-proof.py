@@ -56,6 +56,7 @@ MAX_MESSAGE_BYTES = 1_048_576
 MAX_DROPIN_BYTES = 16 * 1024
 MAX_TOPIC_SCAN_ROWS = 256
 REQUIRED_CLOUD_TOOLS = ("opentofu", "ansible", "libvirt")
+LIFECYCLE_ACTION_FUTURE_SKEW_MS = 30 * 1000
 
 BAD_REQUIRED_STATUSES = {"blocked", "error"}
 
@@ -558,7 +559,23 @@ def check_lifecycle_action(args: argparse.Namespace, checks: list[Check]) -> Non
         name = _instance_name(payload)
         schema = payload.get("schema_version")
         has_token = isinstance(payload.get("armed_token"), str) and bool(payload.get("armed_token"))
+        ts_unix_ms = index.get("ts_unix_ms")
+        age_s: float | None = None
         blockers: list[str] = []
+        if not isinstance(ts_unix_ms, int):
+            blockers.append(f"Bus timestamp is not an integer: {ts_unix_ms!r}")
+        else:
+            age_ms = now_ms() - ts_unix_ms
+            if age_ms < -LIFECYCLE_ACTION_FUTURE_SKEW_MS:
+                blockers.append(
+                    f"future Bus timestamp age={age_ms / 1000.0:.1f}s "
+                    f"< -{LIFECYCLE_ACTION_FUTURE_SKEW_MS / 1000.0:.0f}s"
+                )
+            age_s = max(0.0, age_ms / 1000.0)
+            if age_s > args.max_lifecycle_action_age_seconds:
+                blockers.append(
+                    f"stale action age={age_s:.1f}s > {args.max_lifecycle_action_age_seconds}s"
+                )
         if schema != 1:
             blockers.append(f"schema_version={schema!r}, expected 1")
         if not has_token:
@@ -575,6 +592,7 @@ def check_lifecycle_action(args: argparse.Namespace, checks: list[Check]) -> Non
             "op": op,
             "target": name,
             "schema_version": schema,
+            "age_seconds": round(age_s, 3) if age_s is not None else None,
             "armed_token": "present-redacted" if has_token else "missing",
         }
         if blockers:
@@ -936,6 +954,53 @@ def self_test() -> int:
             raise AssertionError("symlinked indexed message was accepted")
         except ProofError as exc:
             assert "symlink" in str(exc)
+        _write_bus_message(
+            root,
+            VM_LIFECYCLE_ACTION_TOPIC,
+            "ZZZWORKLOADSLIVEPROOF0003",
+            {
+                "schema_version": 1,
+                "host": "node-a",
+                "op": "start",
+                "name": "demo-vm",
+                "armed_token": "super-secret-token",
+            },
+            ts - 200_000,
+        )
+        lifecycle_args = argparse.Namespace(
+            require_all=False,
+            require_lifecycle_action=True,
+            bus_root=str(root),
+            node="node-a",
+            bus_scan_limit=8,
+            max_lifecycle_action_age_seconds=120.0,
+        )
+        lifecycle_checks: list[Check] = []
+        check_lifecycle_action(lifecycle_args, lifecycle_checks)
+        assert lifecycle_checks[0].status == "blocked"
+        assert "stale action age" in lifecycle_checks[0].detail
+        stale_json = json.dumps(lifecycle_checks[0].to_json(), sort_keys=True)
+        assert "super-secret-token" not in stale_json
+        assert "present-redacted" in stale_json
+        _write_bus_message(
+            root,
+            VM_LIFECYCLE_ACTION_TOPIC,
+            "ZZZWORKLOADSLIVEPROOF0004",
+            {
+                "schema_version": 1,
+                "host": "node-a",
+                "op": "start",
+                "name": "demo-vm",
+                "armed_token": "new-super-secret-token",
+            },
+            now_ms(),
+        )
+        lifecycle_checks = []
+        check_lifecycle_action(lifecycle_args, lifecycle_checks)
+        assert lifecycle_checks[0].status == "ok"
+        fresh_json = json.dumps(lifecycle_checks[0].to_json(), sort_keys=True)
+        assert "new-super-secret-token" not in fresh_json
+        assert "present-redacted" in fresh_json
     print("verify-workloads-live-proof: self-test passed")
     return 0
 
@@ -953,6 +1018,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--expect-vm", help="require this VM name in event/vm/instances")
     parser.add_argument("--expect-vm-state", help="when --expect-vm is set, require this exact virsh state")
     parser.add_argument("--max-cloud-age-seconds", type=float, default=120.0)
+    parser.add_argument("--max-lifecycle-action-age-seconds", type=float, default=120.0)
     parser.add_argument("--max-roster-age-seconds", type=float, default=120.0)
     parser.add_argument("--bus-scan-limit", type=int, default=64)
     parser.add_argument("--command-timeout", type=float, default=5.0)
@@ -978,6 +1044,8 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         parser.error("--bootstrap-port must be 1..65535")
     if args.expect_vm_state and not args.expect_vm:
         parser.error("--expect-vm-state requires --expect-vm")
+    if not args.max_lifecycle_action_age_seconds >= 0:
+        parser.error("--max-lifecycle-action-age-seconds must be non-negative")
     return args
 
 

@@ -2,10 +2,11 @@
 //! specific, human-legible variant — a denied action is *visible* (an `Err`),
 //! never a silent no-op (the epic's "denied actions stay visible" rule).
 
+use mde_collab_types::ActorId;
 use mde_collab_types::ids::{
     CallId, DocumentId, EventId, FileRefId, SpaceId, ThreadId, TransferId,
 };
-use mde_collab_types::ActorId;
+use mde_collab_types::{TransferControl, TransferState};
 use thiserror::Error;
 
 /// The result alias the whole crate returns.
@@ -122,6 +123,16 @@ pub enum CollabError {
     InvalidDtmfDigit {
         /// The rejected tone character.
         digit: char,
+    },
+    /// The transfer control is not valid for the transfer's current state.
+    #[error("transfer {transfer} in state {state:?} cannot accept control {control:?}")]
+    InvalidTransferControl {
+        /// The transfer id.
+        transfer: TransferId,
+        /// The state folded from the transfer ledger.
+        state: TransferState,
+        /// The rejected operator control.
+        control: TransferControl,
     },
 
     // ---- Validation: alert actions -------------------------------------

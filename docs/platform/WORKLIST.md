@@ -791,6 +791,16 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-ARCH-007 - Repair Workloads cockpit E2E wire, placement, and authorization
 
 - Status: Remaining
+- Progress (2026-07-26 lifecycle-action verifier freshness): the read-only
+  Workloads live-proof helper now treats retained `action/vm/lifecycle`
+  evidence as fresh only when its Bus index timestamp is an integer within the
+  configurable `--max-lifecycle-action-age-seconds` window, and rejects far
+  future timestamps beyond a 30 s skew allowance. The helper still redacts
+  retained HMAC tokens in both text/JSON evidence. Validation passed local
+  `python3 -m py_compile install-helpers/verify-workloads-live-proof.py`,
+  local `install-helpers/verify-workloads-live-proof.py --self-test`, and the
+  focused `.50` farm slot 0 verifier gate after sync. No live `.15` state,
+  credentials, or service restarts were touched.
 - Progress (2026-07-25 post-hotfix `.15` Workloads verifier recheck): after
   installing the 2026-07-25 `mackesd` hotfix binary on
   `Basement-Test-Workstation` and force-clearing the stale stop-sigterm service
@@ -1247,6 +1257,18 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-011 - Communications collaboration suite full replacement
 
 - Status: Remaining
+- Progress (2026-07-26 transfer-control state boundary): collaboration-core
+  transfer admission now folds each transfer's current ledger state into the
+  domain aggregate and rejects stale or malicious `ControlTransfer` commands
+  outside that state: queued transfers can only cancel, active transfers can
+  pause/cancel, paused transfers can resume/cancel, and terminal completed/
+  failed/canceled transfers carry no controls. Farm gates are green on `.50` at
+  **1/1** focused `cargo test -p mde-collab-core
+  transfer_controls_follow_the_current_ledger_state -- --nocapture` and on
+  `.170` for touched-file `rustfmt --edition 2024 --check`. Full package
+  `cargo fmt -p mde-collab-core -- --check` was not claimed because it still
+  reports unrelated pre-existing `projection.rs` formatting drift outside this
+  slice.
 - Progress (2026-07-25 worker merge/log backpressure boundary): the
   collaboration worker now keeps its own merge slices below the core
   all-or-nothing 4,096-envelope cap by batching retained Bus and actor-log input
@@ -2461,6 +2483,20 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-006 - Construct interface (Apple-HIG-principled workstation shell)
 
 - Status: Remaining
+- Progress (2026-07-26 `.15` Fedora 44 RPM promotion): BigBoy `.130` cut the
+  Fedora 44 split RPMs from commit `c7ac64a6` with payload-size verification
+  green: base **81.8 MiB**, Browser **39.0 MiB**, and thin Lighthouse
+  **11.1 MiB**. The base and Browser RPMs were copied to
+  `.15`/`Basement-Test-Workstation`, passed
+  `rpm -Uvh --test --replacepkgs --force --nosignature`, then force-replaced
+  the same NEVRA packages. Post-install live proof: `nebula`, `mackesd`, and
+  `mde-shell-egui` are all active; `mackesd` and the shell both report
+  `NRestarts=0`; `/proc/<pid>/exe` hashes match `/usr/bin/mackesd` and
+  `/usr/bin/mde-shell-egui`; `MDE_MAPS_DIR=/var/lib/mde/maps`; the East Texas
+  MBTiles/gazetteer bundle is present; and `mde-shell-egui` journal warnings
+  since the restart contain only the known `ddcutil` dynamic-sleep-cache line.
+  The only failed systemd unit after the proof was unrelated
+  `fwupd-refresh.service`.
 - Progress (2026-07-26 capture-font panic hardening): the shared offscreen
   `mde-egui::capture` renderer now installs the platform `Style`/font set on
   its fresh egui context before running caller UI, so shared title/headline

@@ -11,22 +11,22 @@ use mde_collab_types::ids::{
     CallId, DocumentId, EventId, FileRefId, SpaceId, ThreadId, TransferId,
 };
 use mde_collab_types::value::{
-    sha256_hex, AlertAction, AlertActionKind, AlertPayload, CallKind, CallParticipantState,
-    ClipItemKind, ClipboardItem, DocumentChange, FileRef, MessageBody, PayloadRef, PresenceState,
-    Severity, TransferDirection, TransferMethod,
+    AlertAction, AlertActionKind, AlertPayload, CallKind, CallParticipantState, ClipItemKind,
+    ClipboardItem, DocumentChange, FileRef, MessageBody, PayloadRef, PresenceState, Severity,
+    TransferDirection, TransferMethod, TransferState, sha256_hex,
 };
 use mde_collab_types::{
     ActorClock, ActorId, CollabCommand, CollabEventEnvelope, SpaceKind, SpaceRole, TransferControl,
 };
 use uuid::Uuid;
 
-use crate::blob::{verify_bytes, BlobStore, FsBlobStore, MemoryBlobStore};
+use crate::CollabEngine;
+use crate::blob::{BlobStore, FsBlobStore, MemoryBlobStore, verify_bytes};
 use crate::error::CollabError;
 use crate::log::{ActorLog, FileActorLog, MemoryActorLog};
 use crate::pipeline::EDIT_WINDOW_MS;
 use crate::projection::Projection;
 use crate::signer::{Ed25519Signer, IdSource};
-use crate::CollabEngine;
 
 // ---- deterministic injection helpers --------------------------------------
 
@@ -287,6 +287,152 @@ fn add_member_is_owner_gated_and_member_is_denied_visibly() {
 }
 
 #[test]
+fn transfer_controls_follow_the_current_ledger_state() {
+    let mut a = engine("alice");
+    let sa = sig(1);
+    let mut ia = SeqIds::new(1);
+    let space = a
+        .apply(
+            &CollabCommand::CreateSpace {
+                kind: SpaceKind::Team,
+                name: "ops".into(),
+            },
+            &sa,
+            &mut ia,
+            1000,
+        )
+        .expect("create")[0]
+        .space_id;
+    let file = FileRefId::from_uuid(Uuid::from_u128(500));
+    a.apply(
+        &CollabCommand::LinkFile {
+            space,
+            file,
+            reference: FileRef {
+                name: "evidence.tar".into(),
+                size: 4096,
+                sha256_hex: sha256_hex(b"evidence"),
+                mime: Some("application/x-tar".into()),
+            },
+        },
+        &sa,
+        &mut ia,
+        1100,
+    )
+    .expect("link");
+    let transfer = TransferId::from_uuid(Uuid::from_u128(501));
+    a.apply(
+        &CollabCommand::StartTransfer {
+            space,
+            transfer,
+            file,
+            method: TransferMethod::Node,
+            direction: TransferDirection::Outbound,
+        },
+        &sa,
+        &mut ia,
+        1200,
+    )
+    .expect("start transfer");
+
+    let rejected_queued_pause = a
+        .apply(
+            &CollabCommand::ControlTransfer {
+                transfer,
+                control: TransferControl::Pause,
+            },
+            &sa,
+            &mut ia,
+            1210,
+        )
+        .expect_err("queued transfer may only be canceled");
+    assert!(matches!(
+        rejected_queued_pause,
+        CollabError::InvalidTransferControl {
+            transfer: denied_transfer,
+            state: TransferState::Queued,
+            control: TransferControl::Pause,
+        } if denied_transfer == transfer
+    ));
+
+    a.author(
+        space,
+        CollabEventKind::TransferStateChanged {
+            transfer,
+            state: TransferState::Active,
+        },
+        &sa,
+        &mut ia,
+        1220,
+    )
+    .expect("worker marks transfer active");
+    a.apply(
+        &CollabCommand::ControlTransfer {
+            transfer,
+            control: TransferControl::Pause,
+        },
+        &sa,
+        &mut ia,
+        1230,
+    )
+    .expect("active transfer may pause");
+    assert_eq!(
+        a.state().transfers.get(&transfer).expect("transfer").state,
+        TransferState::Paused
+    );
+
+    a.apply(
+        &CollabCommand::ControlTransfer {
+            transfer,
+            control: TransferControl::Resume,
+        },
+        &sa,
+        &mut ia,
+        1240,
+    )
+    .expect("paused transfer may resume");
+    assert_eq!(
+        a.state().transfers.get(&transfer).expect("transfer").state,
+        TransferState::Active
+    );
+
+    a.apply(
+        &CollabCommand::ControlTransfer {
+            transfer,
+            control: TransferControl::Cancel,
+        },
+        &sa,
+        &mut ia,
+        1250,
+    )
+    .expect("active transfer may cancel");
+    assert_eq!(
+        a.state().transfers.get(&transfer).expect("transfer").state,
+        TransferState::Canceled
+    );
+
+    let rejected_terminal_resume = a
+        .apply(
+            &CollabCommand::ControlTransfer {
+                transfer,
+                control: TransferControl::Resume,
+            },
+            &sa,
+            &mut ia,
+            1260,
+        )
+        .expect_err("terminal transfer carries no controls");
+    assert!(matches!(
+        rejected_terminal_resume,
+        CollabError::InvalidTransferControl {
+            transfer: denied_transfer,
+            state: TransferState::Canceled,
+            control: TransferControl::Resume,
+        } if denied_transfer == transfer
+    ));
+}
+
+#[test]
 fn sending_to_a_space_youre_not_in_is_denied() {
     let mut a = engine("alice");
     let space = a
@@ -520,12 +666,13 @@ fn delete_space_is_owner_gated_and_blocks_further_commands() {
     );
     assert!(matches!(after, Err(CollabError::SpaceDeleted(_))));
     // The tombstoned space drops out of the directory.
-    assert!(a
-        .projection()
-        .space_directory(&ActorId::new("alice"))
-        .expect("dir")
-        .spaces
-        .is_empty());
+    assert!(
+        a.projection()
+            .space_directory(&ActorId::new("alice"))
+            .expect("dir")
+            .spaces
+            .is_empty()
+    );
 }
 
 #[test]
@@ -1610,10 +1757,12 @@ fn start_call_flows_into_the_call_state_projection() {
     ));
     a.merge(b.all_events()).expect("alice syncs bob mute");
     let cs = a.projection().call_state(Some(space)).expect("call_state");
-    assert!(cs.active[0]
-        .participants
-        .iter()
-        .any(|p| p.actor == ActorId::new("bob") && p.muted));
+    assert!(
+        cs.active[0]
+            .participants
+            .iter()
+            .any(|p| p.actor == ActorId::new("bob") && p.muted)
+    );
 
     let dtmf = b
         .apply(
