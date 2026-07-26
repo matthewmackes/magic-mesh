@@ -270,6 +270,18 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-ARCH-007 - Repair Workloads cockpit E2E wire, placement, and authorization
 
 - Status: Remaining
+- Progress (2026-07-26 lifecycle action/roster correlation): the read-only
+  Workloads live-proof helper now correlates required VM roster evidence to the
+  retained authorized lifecycle action when both proof seams are required. If
+  the operator does not pass an explicit `--expect-vm`, a fresh valid
+  `action/vm/lifecycle` target is inferred and the `event/vm/instances` roster
+  must contain that same VM before the roster can count as lifecycle proof. This
+  prevents an unrelated fresh roster from being accepted beside a valid action.
+  The helper still redacts HMAC token material and remains read-only. Evidence:
+  local `python3 -m py_compile install-helpers/verify-workloads-live-proof.py &&
+  install-helpers/verify-workloads-live-proof.py --self-test` passed; farm `.50`
+  slot `workloads-proof-correlation` ran the same bytecode/self-test proof and
+  passed; scoped `git diff --check` passed for the helper.
 - Progress (2026-07-26 Workloads Plan verb contract): the Workloads UI
   `plan_provision` action now publishes the dedicated versioned `plan` Bus
   request contract for the selected placement node instead of reusing the live

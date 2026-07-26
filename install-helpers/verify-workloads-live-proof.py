@@ -557,6 +557,49 @@ def _instance_name(action: dict[str, Any]) -> str:
     return ""
 
 
+def _fresh_lifecycle_action_target(
+    args: argparse.Namespace,
+    candidates: list[str],
+) -> tuple[str | None, str | None, dict[str, Any]]:
+    """Return the fresh authorized lifecycle target this proof should correlate."""
+    rows = read_topic_rows(Path(args.bus_root), VM_LIFECYCLE_ACTION_TOPIC, args.bus_scan_limit)
+    for index, _envelope, payload, digest in rows:
+        if payload is None:
+            continue
+        host = payload.get("host")
+        if not isinstance(host, str) or host not in candidates:
+            continue
+        op = payload.get("op")
+        name = _instance_name(payload)
+        schema = payload.get("schema_version")
+        has_token = isinstance(payload.get("armed_token"), str) and bool(payload.get("armed_token"))
+        ts_unix_ms = index.get("ts_unix_ms")
+        if (
+            not isinstance(ts_unix_ms, int)
+            or schema != 1
+            or not has_token
+            or not isinstance(op, str)
+            or op not in VM_LIFECYCLE_ACTION_OPS
+            or not name
+        ):
+            continue
+        age_ms = now_ms() - ts_unix_ms
+        if age_ms < -LIFECYCLE_ACTION_FUTURE_SKEW_MS:
+            continue
+        if max(0.0, age_ms / 1000.0) > args.max_lifecycle_action_age_seconds:
+            continue
+        evidence = {
+            "topic": VM_LIFECYCLE_ACTION_TOPIC,
+            "ulid": index["ulid"],
+            "sha256": digest,
+            "host": host,
+            "op": op,
+            "target": name,
+        }
+        return name, op, evidence
+    return None, None, {}
+
+
 def _short_json(value: Any, max_chars: int = 160) -> str:
     try:
         text = json.dumps(value, sort_keys=True)
@@ -809,23 +852,41 @@ def check_vm_roster(args: argparse.Namespace, checks: list[Check]) -> None:
             for item in instances
             if isinstance(item, dict) and isinstance(item.get("name"), str)
         ]
+        inferred_vm: str | None = None
+        inferred_op: str | None = None
+        inferred_action: dict[str, Any] = {}
+        should_correlate_lifecycle = (
+            required
+            and not args.expect_vm
+            and (args.require_all or getattr(args, "require_lifecycle_action", False))
+        )
+        if should_correlate_lifecycle:
+            inferred_vm, inferred_op, inferred_action = _fresh_lifecycle_action_target(
+                args, candidates
+            )
         blockers: list[str] = []
         if age_s > args.max_roster_age_seconds:
             blockers.append(f"stale age={age_s:.1f}s > {args.max_roster_age_seconds}s")
-        if args.expect_vm:
+        expected_vm = args.expect_vm or inferred_vm
+        if expected_vm:
             found = False
             for item in instances:
                 if not isinstance(item, dict):
                     continue
-                if item.get("name") == args.expect_vm:
+                if item.get("name") == expected_vm:
                     found = True
                     if args.expect_vm_state and item.get("state") != args.expect_vm_state:
                         blockers.append(
-                            f"{args.expect_vm} state={item.get('state')!r}, expected {args.expect_vm_state!r}"
+                            f"{expected_vm} state={item.get('state')!r}, expected {args.expect_vm_state!r}"
                         )
                     break
             if not found:
-                blockers.append(f"expected VM {args.expect_vm!r} absent from roster")
+                if inferred_vm:
+                    blockers.append(
+                        f"lifecycle action target {inferred_vm!r} absent from roster"
+                    )
+                else:
+                    blockers.append(f"expected VM {expected_vm!r} absent from roster")
         if args.require_running_vm and not any(
             isinstance(item, dict) and item.get("state") == "running" for item in instances
         ):
@@ -839,12 +900,16 @@ def check_vm_roster(args: argparse.Namespace, checks: list[Check]) -> None:
             "instances": names[:32],
             "instance_count": len(instances),
         }
+        if inferred_action:
+            evidence["correlated_lifecycle_action"] = inferred_action
         if blockers:
             checks.append(Check("vm_lifecycle roster", "blocked" if required else "warn", "; ".join(blockers), required, evidence))
         else:
             detail = f"fresh roster for {payload.get('host')} with {len(instances)} instance(s)"
-            if args.expect_vm:
-                detail += f"; {args.expect_vm} observed"
+            if expected_vm:
+                detail += f"; {expected_vm} observed"
+                if inferred_op:
+                    detail += f" for retained {inferred_op} action"
             checks.append(Check("vm_lifecycle roster", "ok", detail, required, evidence))
     except ProofError as exc:
         checks.append(Check("vm_lifecycle roster", "error" if required else "warn", str(exc), required))
@@ -1288,10 +1353,12 @@ def self_test() -> int:
         roster_args = argparse.Namespace(
             require_all=False,
             require_vm_roster=True,
+            require_lifecycle_action=False,
             bus_root=str(root),
             node="node-a",
             bus_scan_limit=8,
             max_roster_age_seconds=120.0,
+            max_lifecycle_action_age_seconds=120.0,
             expect_vm="demo-vm",
             expect_vm_state="running",
             require_running_vm=True,
@@ -1300,6 +1367,43 @@ def self_test() -> int:
         check_vm_roster(roster_args, roster_checks)
         assert roster_checks[0].status == "ok"
         assert roster_checks[0].evidence["host"] == "peer:node-a"
+        roster_args.expect_vm = None
+        roster_args.expect_vm_state = None
+        roster_args.require_lifecycle_action = True
+        roster_checks = []
+        check_vm_roster(roster_args, roster_checks)
+        assert roster_checks[0].status == "ok"
+        assert roster_checks[0].evidence["correlated_lifecycle_action"]["target"] == "demo-vm"
+        _write_bus_message(
+            root,
+            VM_INSTANCES_TOPIC,
+            "ZZZWORKLOADSLIVEPROOF0006M",
+            {
+                "host": "peer:node-a",
+                "published_at_ms": now_ms(),
+                "instances": [{"name": "other-vm", "state": "running"}],
+            },
+            now_ms(),
+        )
+        roster_checks = []
+        check_vm_roster(roster_args, roster_checks)
+        assert roster_checks[0].status == "blocked"
+        assert "lifecycle action target 'demo-vm' absent from roster" in roster_checks[0].detail
+        _write_bus_message(
+            root,
+            VM_INSTANCES_TOPIC,
+            "ZZZWORKLOADSLIVEPROOF0006Z",
+            {
+                "host": "peer:node-a",
+                "published_at_ms": now_ms(),
+                "instances": [{"name": "demo-vm", "state": "running"}],
+            },
+            now_ms(),
+        )
+        roster_checks = []
+        check_vm_roster(roster_args, roster_checks)
+        assert roster_checks[0].status == "ok"
+        assert "retained start action" in roster_checks[0].detail
         onboard_args = lambda node: argparse.Namespace(
             require_all=False,
             require_onboard_open_broker=True,
