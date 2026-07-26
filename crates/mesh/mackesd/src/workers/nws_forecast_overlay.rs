@@ -1,4 +1,12 @@
 //! WL-FUNC-012 / OVERLAY-4 — keyless NWS hourly drive-ahead forecast adapter.
+//!
+//! Workstations start this keyless, public-domain producer by default. A fresh
+//! same-host vehicle fix drives the current/drive-ahead NWS `/points` and
+//! `forecastHourly` queries. Without that fix, the worker still publishes a
+//! fresh retained zero-sample mirror carrying the NWS license/attribution and
+//! an explicit gap, rather than leaving the catalog topic absent or replaying
+//! forecast rows for a prior location. Operators can explicitly disable the
+//! producer with `MDE_OVERLAY_NWS_FORECAST=0/false/no/off`.
 
 #![cfg(feature = "async-services")]
 
@@ -16,7 +24,7 @@ use serde::Deserialize;
 
 use super::{ShutdownToken, Worker};
 
-/// Explicit opt-in; unset/false is an idle no-op.
+/// Explicit disable for the keyless default-on NWS hourly forecast producer.
 pub const ENABLED_ENV: &str = "MDE_OVERLAY_NWS_FORECAST";
 /// NWS forecast refresh cadence.
 pub const POLL: Duration = Duration::from_secs(10 * 60);
@@ -76,15 +84,11 @@ pub struct ForecastPoint {
 }
 
 /// Production rustls NWS probe.
-pub struct NwsForecastHttpProbe {
-    client: Client,
-}
+pub struct NwsForecastHttpProbe;
 
 impl NwsForecastHttpProbe {
-    fn new() -> io::Result<Self> {
-        Ok(Self {
-            client: build_http_client()?,
-        })
+    fn new() -> Self {
+        Self
     }
 }
 
@@ -95,12 +99,14 @@ impl NwsForecastProbe for NwsForecastHttpProbe {
             "https://api.weather.gov/points/{:.4},{:.4}",
             point.latitude, point.longitude
         );
-        fetch_bounded_json(&self.client, &url, MAX_POINTS_BODY_BYTES)
+        let client = build_http_client()?;
+        fetch_bounded_json(&client, &url, MAX_POINTS_BODY_BYTES)
     }
 
     fn fetch_hourly(&self, url: &str) -> io::Result<String> {
         let validated = validate_hourly_url(url)?;
-        fetch_bounded_json(&self.client, validated.as_str(), MAX_FORECAST_BODY_BYTES)
+        let client = build_http_client()?;
+        fetch_bounded_json(&client, validated.as_str(), MAX_FORECAST_BODY_BYTES)
     }
 }
 
@@ -621,17 +627,14 @@ pub struct NwsForecastOverlayWorker {
 }
 
 impl NwsForecastOverlayWorker {
-    /// Production wiring. Disabled unless explicitly opted in.
+    /// Production wiring. The keyless NWS hourly forecast adapter is enabled by
+    /// default on spawned Workstation-tier nodes; an explicit false-y env
+    /// disables it. Blocking HTTP client/fetch failures publish honest degraded
+    /// snapshots.
     #[must_use]
     pub fn new(host: String) -> Self {
-        let probe = if env_truthy(ENABLED_ENV) {
-            match NwsForecastHttpProbe::new() {
-                Ok(probe) => Some(Arc::new(probe) as Arc<dyn NwsForecastProbe>),
-                Err(error) => {
-                    tracing::warn!(target: "mackesd::nws_forecast_overlay", %error, "NWS forecast client unavailable; worker idle");
-                    None
-                }
-            }
+        let probe = if env_default_enabled(ENABLED_ENV) {
+            Some(Arc::new(NwsForecastHttpProbe::new()) as Arc<dyn NwsForecastProbe>)
         } else {
             None
         };
@@ -694,6 +697,7 @@ impl NwsForecastOverlayWorker {
         // A worker restart has no in-memory cache, but the Bus may still hold
         // the prior location's forecast. Use it only to publish a cleared
         // degraded state; never expose its samples as current data.
+        let published_at_ms = now_ms();
         let persisted = self.bus_root.clone().and_then(|root| {
             let persist = mde_bus::persist::Persist::open(root).ok()?;
             let body = persist
@@ -707,6 +711,8 @@ impl NwsForecastOverlayWorker {
             .cloned()
             .or(persisted)
             .unwrap_or_else(|| NwsForecastSnapshot::unavailable(&self.host, reason));
+        degraded.host.clone_from(&self.host);
+        degraded.fetched_at_ms = published_at_ms;
         degraded.samples.clear();
         degraded.feed_generated_at_ms = None;
         degraded.query_latitude = None;
@@ -721,7 +727,14 @@ impl NwsForecastOverlayWorker {
 
     fn publish_unavailable(&self, last_good: &mut Option<NwsForecastSnapshot>, reason: &str) {
         let degraded = self.degraded_snapshot(last_good.as_ref(), reason);
+        tracing::warn!(
+            target: "mackesd::nws_forecast_overlay",
+            host = %self.host,
+            error = reason,
+            "NWS forecast refresh unavailable; publishing an empty degraded snapshot"
+        );
         self.publish(&degraded);
+        *last_good = None;
     }
 
     fn apply_result(
@@ -850,13 +863,15 @@ impl Worker for NwsForecastOverlayWorker {
     }
 }
 
-fn env_truthy(name: &str) -> bool {
-    std::env::var(name).is_ok_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
+fn env_default_enabled(name: &str) -> bool {
+    overlay_enabled_from_env(std::env::var(name).ok().as_deref())
+}
+
+fn overlay_enabled_from_env(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(|value| value.trim().to_ascii_lowercase()),
+        Some(value) if matches!(value.as_str(), "0" | "false" | "no" | "off")
+    )
 }
 
 fn now_ms() -> i64 {
@@ -1115,6 +1130,20 @@ mod tests {
     }
 
     #[test]
+    fn keyless_nws_forecast_producer_defaults_on_with_explicit_false_opt_out() {
+        assert!(overlay_enabled_from_env(None));
+        assert!(overlay_enabled_from_env(Some("")));
+        assert!(overlay_enabled_from_env(Some("1")));
+        assert!(overlay_enabled_from_env(Some("true")));
+        assert!(overlay_enabled_from_env(Some("yes")));
+        assert!(overlay_enabled_from_env(Some("on")));
+        assert!(!overlay_enabled_from_env(Some("0")));
+        assert!(!overlay_enabled_from_env(Some("false")));
+        assert!(!overlay_enabled_from_env(Some("NO")));
+        assert!(!overlay_enabled_from_env(Some(" off ")));
+    }
+
+    #[test]
     fn http_client_refuses_redirects() {
         let target = TcpListener::bind("127.0.0.1:0").expect("target");
         target.set_nonblocking(true).expect("nonblocking");
@@ -1162,7 +1191,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_refresh_and_no_fix_keep_last_good_timestamp_on_bus() {
+    fn failed_refresh_and_no_fix_publish_empty_fresh_degraded_projection() {
         let temp = tempfile::tempdir().expect("temp");
         let root = temp.path().to_path_buf();
         let worker =
@@ -1172,43 +1201,64 @@ mod tests {
         let mut last = None;
         assert!(worker.apply_result(Ok(original), &mut last));
         assert!(!worker.apply_result(Err(io::Error::other("timeout")), &mut last));
+        assert!(last.is_none());
         worker.publish_unavailable(&mut last, "fresh same-host MG90 fix unavailable");
-        assert_eq!(last.as_ref().expect("last").fetched_at_ms, NOW_MS);
-        assert!(last
-            .as_ref()
-            .expect("last")
-            .gaps
-            .iter()
-            .all(|gap| !gap.contains("fresh same-host")));
+        assert!(last.is_none());
         let persist = Persist::open(root).expect("bus");
         let rows = persist
             .list_since(&nws_forecast_state_topic("rig-1"), None)
             .expect("read");
         assert_eq!(rows.len(), 3);
-        let degraded: NwsForecastSnapshot = serde_json::from_str(
+        let failed_degraded: NwsForecastSnapshot = serde_json::from_str(
+            rows.get(1)
+                .and_then(|row| row.body.as_deref())
+                .expect("failed degraded body"),
+        )
+        .expect("failed degraded snapshot");
+        assert_eq!(failed_degraded.host, "rig-1");
+        assert!(failed_degraded.fetched_at_ms > 0);
+        assert_eq!(failed_degraded.feed_generated_at_ms, None);
+        assert_eq!(failed_degraded.query_latitude, None);
+        assert_eq!(failed_degraded.query_longitude, None);
+        assert!(failed_degraded.samples.is_empty());
+        assert!(failed_degraded
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("timeout")));
+        assert_eq!(failed_degraded.license_tier, "us-government-public-domain");
+        assert!(failed_degraded
+            .attribution
+            .contains("National Weather Service"));
+
+        let no_fix_degraded: NwsForecastSnapshot = serde_json::from_str(
             rows.last()
                 .and_then(|row| row.body.as_deref())
                 .expect("degraded body"),
         )
         .expect("degraded snapshot");
-        assert!(degraded.samples.is_empty());
-        assert!(degraded
+        assert!(no_fix_degraded.fetched_at_ms > 0);
+        assert_eq!(no_fix_degraded.feed_generated_at_ms, None);
+        assert_eq!(no_fix_degraded.query_latitude, None);
+        assert_eq!(no_fix_degraded.query_longitude, None);
+        assert!(no_fix_degraded.samples.is_empty());
+        assert!(no_fix_degraded
             .gaps
             .iter()
             .any(|gap| gap.contains("fresh same-host")));
+        assert_eq!(no_fix_degraded.license_tier, "us-government-public-domain");
+        assert!(no_fix_degraded
+            .attribution
+            .contains("National Weather Service"));
 
         let restart_root = tempfile::tempdir().expect("restart root");
         let seed_worker = NwsForecastOverlayWorker::new("rig-1".to_string())
             .with_bus_root(Some(restart_root.path().to_path_buf()));
         let mut seed_cache = None;
         seed_worker.apply_result(
-            Ok(build_snapshot(
-                &FakeProbe::captured(),
-                "rig-1",
-                context(),
-                NOW_MS,
-            )
-            .expect("restart seed")),
+            Ok(
+                build_snapshot(&FakeProbe::captured(), "rig-1", context(), NOW_MS)
+                    .expect("restart seed"),
+            ),
             &mut seed_cache,
         );
         let restarted = NwsForecastOverlayWorker::new("rig-1".to_string())
@@ -1227,6 +1277,16 @@ mod tests {
         )
         .expect("restart degraded snapshot");
         assert!(latest.samples.is_empty());
+        assert_eq!(latest.feed_generated_at_ms, None);
+        assert_eq!(latest.query_latitude, None);
+        assert_eq!(latest.query_longitude, None);
+        assert!(latest.fetched_at_ms > 0);
+        assert!(latest
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("no fresh fix after restart")));
+        assert_eq!(latest.license_tier, "us-government-public-domain");
+        assert!(latest.attribution.contains("National Weather Service"));
     }
 
     #[test]
@@ -1246,12 +1306,19 @@ mod tests {
             .body
             .expect("body");
         let snapshot: NwsForecastSnapshot = serde_json::from_str(&body).expect("snapshot");
-        assert_eq!(snapshot.fetched_at_ms, 0);
+        assert_eq!(snapshot.host, "rig-1");
+        assert!(snapshot.fetched_at_ms > 0);
+        assert_eq!(snapshot.feed_generated_at_ms, None);
+        assert_eq!(snapshot.query_latitude, None);
+        assert_eq!(snapshot.query_longitude, None);
+        assert_eq!(snapshot.heading_deg, None);
         assert!(snapshot.samples.is_empty());
         assert!(snapshot
             .gaps
             .iter()
             .any(|gap| gap.contains("fresh same-host")));
+        assert_eq!(snapshot.license_tier, "us-government-public-domain");
+        assert!(snapshot.attribution.contains("National Weather Service"));
     }
 
     struct SlowProbe;
@@ -1284,5 +1351,56 @@ mod tests {
         .expect("runtime remains responsive");
         assert!(result.is_none());
         sender.await.expect("sender");
+    }
+
+    #[tokio::test]
+    async fn default_on_worker_publishes_degraded_snapshot_without_vehicle_fix() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().to_path_buf();
+        let mut worker = NwsForecastOverlayWorker::new("rig-1".to_string())
+            .with_probe(Arc::new(FakeProbe::captured()))
+            .with_bus_root(Some(root.clone()));
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let token = ShutdownToken::from_receiver(rx);
+        let handle = tokio::spawn(async move { worker.run(token).await });
+
+        let topic = nws_forecast_state_topic("rig-1");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let body = loop {
+            if let Some(row) = Persist::open(root.clone())
+                .expect("bus")
+                .read_latest(&topic)
+                .expect("read")
+            {
+                break row.body.expect("body");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "default-on NWS forecast worker did not publish a degraded no-fix snapshot"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        tx.send(true).expect("shutdown");
+        let joined = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert!(joined.is_ok(), "worker exits promptly after proof");
+        joined
+            .expect("join timeout")
+            .expect("join")
+            .expect("worker ok");
+
+        let snapshot: NwsForecastSnapshot = serde_json::from_str(&body).expect("snapshot");
+        assert_eq!(snapshot.host, "rig-1");
+        assert!(snapshot.fetched_at_ms > 0);
+        assert_eq!(snapshot.feed_generated_at_ms, None);
+        assert_eq!(snapshot.query_latitude, None);
+        assert_eq!(snapshot.query_longitude, None);
+        assert!(snapshot.samples.is_empty());
+        assert!(snapshot
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("fresh same-host MG90 fix unavailable")));
+        assert_eq!(snapshot.license_tier, "us-government-public-domain");
+        assert!(snapshot.attribution.contains("National Weather Service"));
     }
 }

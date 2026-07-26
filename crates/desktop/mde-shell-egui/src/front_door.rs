@@ -703,7 +703,10 @@ const fn app_surface_keywords(surface: Surface) -> &'static str {
         Surface::InfraCode => "workloads services iaas cloud catalog",
         Surface::Desktop => "workloads sessions vdi virtual machines remote desktop",
         Surface::Communications => {
-            "communications collaboration spaces activity messages chat threads calls presence comms"
+            "mesh teams communications collaboration spaces activity messages chat threads calls presence comms"
+        }
+        Surface::ThisNode | Surface::System | Surface::Storage | Surface::About => {
+            "this node system storage about settings hardware identity local host"
         }
         _ => "",
     }

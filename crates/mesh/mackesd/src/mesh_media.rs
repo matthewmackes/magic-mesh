@@ -35,6 +35,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 /// Minimal projection of `nebula-bundle.json` — we only need the
 /// overlay IP. Serde ignores the bundle's other fields (cert PEMs,
@@ -133,6 +134,12 @@ pub const KIND_JELLYFIN: &str = "jellyfin";
 pub const AIRSONIC_PORT: u16 = 4040;
 /// Default Jellyfin port.
 pub const JELLYFIN_PORT: u16 = 8096;
+/// Mesh Jellyfin gateway proxy port.
+///
+/// Kept separate from [`JELLYFIN_PORT`] so a node that already runs a real local
+/// Jellyfin on 8096 does not collide with mackesd's gateway responder or get
+/// mis-advertised as a direct Jellyfin instance by the descriptor probe.
+pub const JELLYFIN_GATEWAY_PROXY_PORT: u16 = 8097;
 
 /// One media server reachable on the mesh. Built by app_sync from a
 /// probe-inventory `HostService` row; consumed by app_sync's Sublime
@@ -223,6 +230,18 @@ pub const NAVIDROME_KIND: &str = "navidrome";
 /// see the fleet's published services.
 pub const MEDIA_REGISTRY_FILE: &str = "media-registry.json";
 
+/// File name that holds manually registered LAN AirSonic/Subsonic gateway
+/// sources under the gateway node's replicated QNM-Shared directory. Unlike the
+/// legacy [`MEDIA_REGISTRY_FILE`], this registry describes LAN upstreams that a
+/// node proxies into the mesh; it never carries plaintext credentials.
+pub const AIRSONIC_GATEWAY_REGISTRY_FILE: &str = "airsonic-gateway-registry.json";
+
+/// File name that holds manually registered LAN Jellyfin gateway sources under
+/// the gateway node's replicated QNM-Shared directory. These records describe a
+/// gateway proxy source and a sealed credential/token reference, never plaintext
+/// Jellyfin user credentials or API tokens.
+pub const JELLYFIN_GATEWAY_REGISTRY_FILE: &str = "jellyfin-gateway-registry.json";
+
 /// Per-instance health budget — localhost answers in microseconds; 200 ms is
 /// generous and matches `descriptors::CONNECT_TIMEOUT` so the probe can never
 /// stall the worker tick.
@@ -260,6 +279,676 @@ pub const MUSIC_MESH_HOST: &str = "music.mesh";
 #[must_use]
 pub fn music_mesh_server_url() -> String {
     format!("http://{MUSIC_MESH_HOST}:{NAVIDROME_PORT}")
+}
+
+/// Gateway health for a LAN AirSonic/Subsonic upstream manually registered on a
+/// mesh node. `healthy` means the gateway can currently reach the LAN server;
+/// `degraded` keeps the source visible for diagnosis and cached metadata while
+/// failover prefers a healthy source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayHealth {
+    /// Gateway probe succeeded.
+    Healthy,
+    /// Gateway/upstream probe failed or timed out.
+    Degraded,
+}
+
+impl GatewayHealth {
+    /// `true` when clients should prefer this gateway for new playback.
+    #[must_use]
+    pub fn is_healthy(self) -> bool {
+        matches!(self, Self::Healthy)
+    }
+}
+
+/// A gateway node's replicated declaration of one LAN-reachable
+/// AirSonic/Subsonic upstream. This is the authoritative source-registration
+/// shape for WL-FUNC-014: it stores a canonical LAN URL and a sealed credential
+/// reference, never username/password material.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AirsonicGatewayRegistration {
+    /// Stable source id derived from gateway node + canonical upstream URL.
+    pub id: String,
+    /// Mesh node that can reach the LAN AirSonic server.
+    pub gateway_node: String,
+    /// Canonical LAN URL the gateway proxies to.
+    pub upstream_url: String,
+    /// Deduplication key. Today it is the canonical upstream URL, so the same
+    /// LAN server registered through multiple gateways folds into one source.
+    pub upstream_key: String,
+    /// Secret-store reference for sealed read-only Subsonic credentials.
+    pub credential_ref: String,
+    /// Gateway/upstream reachability status.
+    pub health: GatewayHealth,
+    /// Whether this source is the mesh-wide default when no healthy
+    /// user-selected source exists.
+    pub mesh_default: bool,
+}
+
+impl AirsonicGatewayRegistration {
+    /// Build a validated gateway registration. Blank `credential_ref` derives a
+    /// stable secret path under `media/airsonic/<source-id>`.
+    #[must_use]
+    pub fn new(
+        gateway_node: &str,
+        upstream_url: &str,
+        credential_ref: &str,
+        health: GatewayHealth,
+        mesh_default: bool,
+    ) -> Option<Self> {
+        let gateway_node = gateway_node.trim();
+        if gateway_node.is_empty() || gateway_node.chars().any(char::is_whitespace) {
+            return None;
+        }
+
+        let upstream_url = canonical_airsonic_upstream_url(upstream_url)?;
+        if canonical_url_host(&upstream_url)?.eq_ignore_ascii_case(MUSIC_MESH_HOST) {
+            return None;
+        }
+
+        let id = airsonic_gateway_source_id(gateway_node, &upstream_url)?;
+        let credential_ref = credential_ref.trim();
+        if credential_ref.chars().any(char::is_whitespace) {
+            return None;
+        }
+        let credential_ref = if credential_ref.is_empty() {
+            airsonic_gateway_secret_ref(&id)
+        } else {
+            credential_ref.to_owned()
+        };
+
+        Some(Self {
+            id,
+            gateway_node: gateway_node.to_owned(),
+            upstream_key: upstream_url.clone(),
+            upstream_url,
+            credential_ref,
+            health,
+            mesh_default,
+        })
+    }
+
+    /// Revalidate a deserialized registration before consumers trust its id,
+    /// upstream key, or credential reference.
+    #[must_use]
+    pub fn validated(&self) -> Option<Self> {
+        let expected = Self::new(
+            &self.gateway_node,
+            &self.upstream_url,
+            &self.credential_ref,
+            self.health,
+            self.mesh_default,
+        )?;
+        if self.id != expected.id
+            || self.gateway_node != expected.gateway_node
+            || self.upstream_url != expected.upstream_url
+            || self.upstream_key != expected.upstream_key
+            || self.credential_ref != expected.credential_ref
+        {
+            return None;
+        }
+        Some(expected)
+    }
+}
+
+/// Client-facing source published from a validated gateway registration. Clients
+/// use `source_url` over the mesh and materialize credentials through
+/// `credential_ref`; `upstream_url` remains diagnostic/admin-only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AirsonicGatewaySource {
+    /// Stable source id.
+    pub id: String,
+    /// Always [`KIND_AIRSONIC`].
+    pub kind: String,
+    /// Mesh node proxying the LAN upstream.
+    pub gateway_node: String,
+    /// Mesh-reachable gateway proxy URL.
+    pub source_url: String,
+    /// Canonical LAN upstream URL, retained for admin diagnostics.
+    pub upstream_url: String,
+    /// Upstream dedupe key.
+    pub upstream_key: String,
+    /// Secret-store reference for sealed read-only Subsonic credentials.
+    pub credential_ref: String,
+    /// Gateway/upstream reachability status.
+    pub health: GatewayHealth,
+    /// Mesh-wide default marker.
+    pub mesh_default: bool,
+}
+
+/// A gateway node's replicated declaration of one LAN-reachable Jellyfin
+/// upstream. This is the WL-FUNC-015 sibling to
+/// [`AirsonicGatewayRegistration`]: canonical LAN URL, gateway health, default
+/// marker, and a sealed credential/token reference only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JellyfinGatewayRegistration {
+    /// Stable source id derived from gateway node + canonical upstream URL.
+    pub id: String,
+    /// Mesh node that can reach the LAN Jellyfin server.
+    pub gateway_node: String,
+    /// Canonical LAN URL the gateway proxies to.
+    pub upstream_url: String,
+    /// Deduplication key. Today it is the canonical upstream URL, so the same
+    /// LAN server registered through multiple gateways folds into one source.
+    pub upstream_key: String,
+    /// Secret-store reference for sealed read-only Jellyfin credentials/token.
+    pub credential_ref: String,
+    /// Gateway/upstream reachability status.
+    pub health: GatewayHealth,
+    /// Whether this source is the mesh-wide default when no healthy
+    /// user-selected source exists.
+    pub mesh_default: bool,
+}
+
+impl JellyfinGatewayRegistration {
+    /// Build a validated gateway registration. Blank `credential_ref` derives a
+    /// stable secret path under `media/jellyfin/<source-id>`.
+    #[must_use]
+    pub fn new(
+        gateway_node: &str,
+        upstream_url: &str,
+        credential_ref: &str,
+        health: GatewayHealth,
+        mesh_default: bool,
+    ) -> Option<Self> {
+        let gateway_node = gateway_node.trim();
+        if gateway_node.is_empty() || gateway_node.chars().any(char::is_whitespace) {
+            return None;
+        }
+
+        let upstream_url = canonical_jellyfin_upstream_url(upstream_url)?;
+        if canonical_url_host(&upstream_url)?.eq_ignore_ascii_case(MUSIC_MESH_HOST) {
+            return None;
+        }
+
+        let id = jellyfin_gateway_source_id(gateway_node, &upstream_url)?;
+        let credential_ref = credential_ref.trim();
+        if credential_ref.chars().any(char::is_whitespace) {
+            return None;
+        }
+        let credential_ref = if credential_ref.is_empty() {
+            jellyfin_gateway_secret_ref(&id)
+        } else {
+            credential_ref.to_owned()
+        };
+
+        Some(Self {
+            id,
+            gateway_node: gateway_node.to_owned(),
+            upstream_key: upstream_url.clone(),
+            upstream_url,
+            credential_ref,
+            health,
+            mesh_default,
+        })
+    }
+
+    /// Revalidate a deserialized registration before consumers trust its id,
+    /// upstream key, or credential reference.
+    #[must_use]
+    pub fn validated(&self) -> Option<Self> {
+        let expected = Self::new(
+            &self.gateway_node,
+            &self.upstream_url,
+            &self.credential_ref,
+            self.health,
+            self.mesh_default,
+        )?;
+        if self.id != expected.id
+            || self.gateway_node != expected.gateway_node
+            || self.upstream_url != expected.upstream_url
+            || self.upstream_key != expected.upstream_key
+            || self.credential_ref != expected.credential_ref
+        {
+            return None;
+        }
+        Some(expected)
+    }
+}
+
+/// Client-facing Jellyfin source published from a validated gateway
+/// registration. Clients use `source_url` over the mesh and materialize the
+/// shared read-only credential/token through `credential_ref`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JellyfinGatewaySource {
+    /// Stable source id.
+    pub id: String,
+    /// Always [`KIND_JELLYFIN`].
+    pub kind: String,
+    /// Mesh node proxying the LAN upstream.
+    pub gateway_node: String,
+    /// Mesh-reachable gateway proxy URL.
+    pub source_url: String,
+    /// Canonical LAN upstream URL, retained for admin diagnostics.
+    pub upstream_url: String,
+    /// Upstream dedupe key.
+    pub upstream_key: String,
+    /// Secret-store reference for sealed read-only Jellyfin credentials/token.
+    pub credential_ref: String,
+    /// Gateway/upstream reachability status.
+    pub health: GatewayHealth,
+    /// Mesh-wide default marker.
+    pub mesh_default: bool,
+}
+
+/// Canonicalize an AirSonic/Subsonic LAN upstream URL for stable ids and
+/// deduplication. Scheme and authority are lowercase, a missing scheme defaults
+/// to `http`, and trailing slashes are removed. Userinfo, query strings, and
+/// fragments are rejected so credentials and non-canonical selectors cannot
+/// leak into replicated source ids.
+#[must_use]
+pub fn canonical_airsonic_upstream_url(raw: &str) -> Option<String> {
+    canonical_media_upstream_url(raw)
+}
+
+/// Canonicalize a Jellyfin LAN upstream URL for stable ids and deduplication.
+/// This intentionally matches the AirSonic gateway URL contract so the two media
+/// gateway types reject userinfo/query/fragment leakage consistently.
+#[must_use]
+pub fn canonical_jellyfin_upstream_url(raw: &str) -> Option<String> {
+    canonical_media_upstream_url(raw)
+}
+
+fn canonical_media_upstream_url(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let with_scheme = if raw.contains("://") {
+        raw.to_owned()
+    } else {
+        format!("http://{raw}")
+    };
+    if with_scheme.contains('@') || with_scheme.contains('?') || with_scheme.contains('#') {
+        return None;
+    }
+    let (scheme, rest) = with_scheme.split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    if !matches!(scheme.as_str(), "http" | "https") {
+        return None;
+    }
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let authority = rest[..authority_end].to_ascii_lowercase();
+    if authority.is_empty() || authority.starts_with(':') {
+        return None;
+    }
+    let path = rest[authority_end..].trim_end_matches('/');
+    let mut out = format!("{scheme}://{authority}");
+    if !path.is_empty() {
+        out.push_str(path);
+    }
+    Some(out)
+}
+
+/// Stable AirSonic gateway source id derived from gateway node + canonical
+/// upstream. The source id does not include plaintext credentials.
+#[must_use]
+pub fn airsonic_gateway_source_id(gateway_node: &str, upstream_url: &str) -> Option<String> {
+    let gateway_node = gateway_node.trim();
+    if gateway_node.is_empty() || gateway_node.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let upstream_url = canonical_airsonic_upstream_url(upstream_url)?;
+    let digest = short_hash_hex(&[gateway_node, &upstream_url]);
+    Some(format!(
+        "airsonic-{}-{digest}",
+        safe_media_token(gateway_node)
+    ))
+}
+
+/// Default sealed credential location for a gateway AirSonic source.
+#[must_use]
+pub fn airsonic_gateway_secret_ref(source_id: &str) -> String {
+    format!("media/airsonic/{}", safe_media_token(source_id))
+}
+
+/// Stable Jellyfin gateway source id derived from gateway node + canonical
+/// upstream. The source id does not include plaintext credentials or tokens.
+#[must_use]
+pub fn jellyfin_gateway_source_id(gateway_node: &str, upstream_url: &str) -> Option<String> {
+    let gateway_node = gateway_node.trim();
+    if gateway_node.is_empty() || gateway_node.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let upstream_url = canonical_jellyfin_upstream_url(upstream_url)?;
+    let digest = short_hash_hex(&[gateway_node, &upstream_url]);
+    Some(format!(
+        "jellyfin-{}-{digest}",
+        safe_media_token(gateway_node)
+    ))
+}
+
+/// Default sealed credential/token location for a gateway Jellyfin source.
+#[must_use]
+pub fn jellyfin_gateway_secret_ref(source_id: &str) -> String {
+    format!("media/jellyfin/{}", safe_media_token(source_id))
+}
+
+/// Build a client-facing mesh source from a validated gateway registration.
+#[must_use]
+pub fn source_from_airsonic_gateway(
+    registration: &AirsonicGatewayRegistration,
+) -> Option<AirsonicGatewaySource> {
+    let registration = registration.validated()?;
+    let gateway_host = format!("{}.mesh", safe_media_token(&registration.gateway_node));
+    Some(AirsonicGatewaySource {
+        id: registration.id.clone(),
+        kind: KIND_AIRSONIC.to_owned(),
+        gateway_node: registration.gateway_node.clone(),
+        source_url: format!(
+            "http://{gateway_host}:{AIRSONIC_PORT}/mde/airsonic/{}",
+            registration.id
+        ),
+        upstream_url: registration.upstream_url.clone(),
+        upstream_key: registration.upstream_key.clone(),
+        credential_ref: registration.credential_ref.clone(),
+        health: registration.health,
+        mesh_default: registration.mesh_default,
+    })
+}
+
+/// Build a client-facing mesh source from a validated Jellyfin gateway
+/// registration.
+#[must_use]
+pub fn source_from_jellyfin_gateway(
+    registration: &JellyfinGatewayRegistration,
+) -> Option<JellyfinGatewaySource> {
+    let registration = registration.validated()?;
+    let gateway_host = format!("{}.mesh", safe_media_token(&registration.gateway_node));
+    Some(JellyfinGatewaySource {
+        id: registration.id.clone(),
+        kind: KIND_JELLYFIN.to_owned(),
+        gateway_node: registration.gateway_node.clone(),
+        source_url: format!(
+            "http://{gateway_host}:{JELLYFIN_GATEWAY_PROXY_PORT}/mde/jellyfin/{}",
+            registration.id
+        ),
+        upstream_url: registration.upstream_url.clone(),
+        upstream_key: registration.upstream_key.clone(),
+        credential_ref: registration.credential_ref.clone(),
+        health: registration.health,
+        mesh_default: registration.mesh_default,
+    })
+}
+
+/// Fold all gateway registrations into client sources. The same upstream server
+/// dedupes by canonical URL; a healthy gateway wins over degraded, mesh default
+/// wins within the same health tier, and ids provide deterministic tie-breaks.
+#[must_use]
+pub fn merge_airsonic_gateway_sources(
+    registrations: &[AirsonicGatewayRegistration],
+) -> Vec<AirsonicGatewaySource> {
+    let mut by_upstream: std::collections::BTreeMap<String, AirsonicGatewaySource> =
+        std::collections::BTreeMap::new();
+    for registration in registrations {
+        let Some(candidate) = source_from_airsonic_gateway(registration) else {
+            continue;
+        };
+        by_upstream
+            .entry(candidate.upstream_key.clone())
+            .and_modify(|current| {
+                if airsonic_gateway_source_wins(&candidate, current) {
+                    *current = candidate.clone();
+                }
+            })
+            .or_insert(candidate);
+    }
+
+    let mut out: Vec<_> = by_upstream.into_values().collect();
+    out.sort_by(|a, b| {
+        b.mesh_default
+            .cmp(&a.mesh_default)
+            .then_with(|| b.health.is_healthy().cmp(&a.health.is_healthy()))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    out
+}
+
+/// Fold all Jellyfin gateway registrations into client sources. The same
+/// upstream server dedupes by canonical URL; a healthy gateway wins over
+/// degraded, mesh default wins within the same health tier, and ids provide
+/// deterministic tie-breaks.
+#[must_use]
+pub fn merge_jellyfin_gateway_sources(
+    registrations: &[JellyfinGatewayRegistration],
+) -> Vec<JellyfinGatewaySource> {
+    let mut by_upstream: std::collections::BTreeMap<String, JellyfinGatewaySource> =
+        std::collections::BTreeMap::new();
+    for registration in registrations {
+        let Some(candidate) = source_from_jellyfin_gateway(registration) else {
+            continue;
+        };
+        by_upstream
+            .entry(candidate.upstream_key.clone())
+            .and_modify(|current| {
+                if jellyfin_gateway_source_wins(&candidate, current) {
+                    *current = candidate.clone();
+                }
+            })
+            .or_insert(candidate);
+    }
+
+    let mut out: Vec<_> = by_upstream.into_values().collect();
+    out.sort_by(|a, b| {
+        b.mesh_default
+            .cmp(&a.mesh_default)
+            .then_with(|| b.health.is_healthy().cmp(&a.health.is_healthy()))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    out
+}
+
+/// Select the AirSonic source a Music client should use now: keep the user's
+/// last selected source only while it is healthy, otherwise fall back to the
+/// healthy mesh default, then any healthy source, then visible degraded default.
+#[must_use]
+pub fn select_airsonic_gateway_source<'a>(
+    sources: &'a [AirsonicGatewaySource],
+    last_selected: Option<&str>,
+) -> Option<&'a AirsonicGatewaySource> {
+    if let Some(last_selected) = last_selected.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(source) = sources
+            .iter()
+            .find(|source| source.id == last_selected && source.health.is_healthy())
+        {
+            return Some(source);
+        }
+    }
+
+    sources
+        .iter()
+        .find(|source| source.mesh_default && source.health.is_healthy())
+        .or_else(|| sources.iter().find(|source| source.health.is_healthy()))
+        .or_else(|| sources.iter().find(|source| source.mesh_default))
+        .or_else(|| sources.first())
+}
+
+/// Select the Jellyfin source a Media Workspace client should use now: keep the
+/// user's last selected source only while it is healthy, otherwise fall back to
+/// the healthy mesh default, then any healthy source, then visible degraded
+/// default.
+#[must_use]
+pub fn select_jellyfin_gateway_source<'a>(
+    sources: &'a [JellyfinGatewaySource],
+    last_selected: Option<&str>,
+) -> Option<&'a JellyfinGatewaySource> {
+    if let Some(last_selected) = last_selected.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(source) = sources
+            .iter()
+            .find(|source| source.id == last_selected && source.health.is_healthy())
+        {
+            return Some(source);
+        }
+    }
+
+    sources
+        .iter()
+        .find(|source| source.mesh_default && source.health.is_healthy())
+        .or_else(|| sources.iter().find(|source| source.health.is_healthy()))
+        .or_else(|| sources.iter().find(|source| source.mesh_default))
+        .or_else(|| sources.first())
+}
+
+/// Read all replicated AirSonic gateway declarations from the QNM-Shared plane
+/// and return the deduped, client-facing source list.
+#[must_use]
+pub fn read_airsonic_gateway_sources_from_plane(
+    workgroup_root: &Path,
+) -> Vec<AirsonicGatewaySource> {
+    let entries = match std::fs::read_dir(workgroup_root) {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
+    };
+    let mut registrations = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path().join(AIRSONIC_GATEWAY_REGISTRY_FILE);
+        let Some(body) = read_bounded_media_json(&path, MAX_MEDIA_REGISTRY_BYTES) else {
+            continue;
+        };
+        registrations.extend(parse_airsonic_gateway_registrations(&body));
+    }
+    merge_airsonic_gateway_sources(&registrations)
+}
+
+/// Read all replicated Jellyfin gateway declarations from the QNM-Shared plane
+/// and return the deduped, client-facing source list.
+#[must_use]
+pub fn read_jellyfin_gateway_sources_from_plane(
+    workgroup_root: &Path,
+) -> Vec<JellyfinGatewaySource> {
+    let entries = match std::fs::read_dir(workgroup_root) {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
+    };
+    let mut registrations = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path().join(JELLYFIN_GATEWAY_REGISTRY_FILE);
+        let Some(body) = read_bounded_media_json(&path, MAX_MEDIA_REGISTRY_BYTES) else {
+            continue;
+        };
+        registrations.extend(parse_jellyfin_gateway_registrations(&body));
+    }
+    merge_jellyfin_gateway_sources(&registrations)
+}
+
+fn parse_airsonic_gateway_registrations(body: &str) -> Vec<AirsonicGatewayRegistration> {
+    if let Ok(registrations) = serde_json::from_str::<Vec<AirsonicGatewayRegistration>>(body) {
+        return registrations
+            .into_iter()
+            .filter_map(|registration| registration.validated())
+            .collect();
+    }
+    serde_json::from_str::<AirsonicGatewayRegistration>(body)
+        .ok()
+        .and_then(|registration| registration.validated())
+        .into_iter()
+        .collect()
+}
+
+fn parse_jellyfin_gateway_registrations(body: &str) -> Vec<JellyfinGatewayRegistration> {
+    if let Ok(registrations) = serde_json::from_str::<Vec<JellyfinGatewayRegistration>>(body) {
+        return registrations
+            .into_iter()
+            .filter_map(|registration| registration.validated())
+            .collect();
+    }
+    serde_json::from_str::<JellyfinGatewayRegistration>(body)
+        .ok()
+        .and_then(|registration| registration.validated())
+        .into_iter()
+        .collect()
+}
+
+fn airsonic_gateway_source_wins(
+    candidate: &AirsonicGatewaySource,
+    current: &AirsonicGatewaySource,
+) -> bool {
+    candidate
+        .health
+        .is_healthy()
+        .cmp(&current.health.is_healthy())
+        .then_with(|| candidate.mesh_default.cmp(&current.mesh_default))
+        .then_with(|| current.id.cmp(&candidate.id))
+        .is_gt()
+}
+
+fn jellyfin_gateway_source_wins(
+    candidate: &JellyfinGatewaySource,
+    current: &JellyfinGatewaySource,
+) -> bool {
+    candidate
+        .health
+        .is_healthy()
+        .cmp(&current.health.is_healthy())
+        .then_with(|| candidate.mesh_default.cmp(&current.mesh_default))
+        .then_with(|| current.id.cmp(&candidate.id))
+        .is_gt()
+}
+
+fn canonical_url_host(canonical_url: &str) -> Option<&str> {
+    let (_, rest) = canonical_url.split_once("://")?;
+    let authority = rest.split('/').next().unwrap_or(rest);
+    if let Some(after_bracket) = authority.strip_prefix('[') {
+        return after_bracket.split_once(']').map(|(host, _)| host);
+    }
+    authority
+        .rsplit_once(':')
+        .filter(|(_, port)| port.chars().all(|c| c.is_ascii_digit()))
+        .map(|(host, _)| host)
+        .or(Some(authority))
+}
+
+fn safe_media_token(raw: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in raw.trim().chars() {
+        let mapped = if ch.is_ascii_alphanumeric() {
+            Some(ch.to_ascii_lowercase())
+        } else if matches!(ch, '.' | '-' | '_') {
+            Some(if ch == '_' { '-' } else { ch })
+        } else {
+            None
+        };
+        match mapped {
+            Some(ch) => {
+                out.push(ch);
+                last_dash = false;
+            }
+            None if !last_dash && !out.is_empty() => {
+                out.push('-');
+                last_dash = true;
+            }
+            None => {}
+        }
+    }
+    while out.starts_with(['-', '.']) {
+        out.remove(0);
+    }
+    while out.ends_with(['-', '.']) {
+        out.pop();
+    }
+    if out.is_empty() {
+        "node".to_owned()
+    } else {
+        out
+    }
+}
+
+fn short_hash_hex(parts: &[&str]) -> String {
+    use std::fmt::Write as _;
+
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(part.as_bytes());
+        hasher.update([0]);
+    }
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(16);
+    for byte in digest.iter().take(8) {
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
 }
 
 /// MEDIA-8 — the read-only shared music account a Workstation auto-configures
@@ -636,6 +1325,455 @@ mod tests {
         assert!(!reg.is_up());
     }
 
+    // ── WL-FUNC-014: LAN AirSonic gateways ──
+
+    #[test]
+    fn gateway_health_wire_shape_round_trips() {
+        assert_eq!(
+            serde_json::to_string(&GatewayHealth::Healthy).unwrap(),
+            "\"healthy\""
+        );
+        assert_eq!(
+            serde_json::from_str::<GatewayHealth>("\"degraded\"").unwrap(),
+            GatewayHealth::Degraded
+        );
+    }
+
+    #[test]
+    fn canonical_airsonic_upstream_url_normalizes_scheme_host_and_slash() {
+        assert_eq!(
+            canonical_airsonic_upstream_url("NAS.LAN:4040/"),
+            Some("http://nas.lan:4040".to_owned())
+        );
+        assert_eq!(
+            canonical_airsonic_upstream_url("HTTPS://NAS.LAN:4040/music///"),
+            Some("https://nas.lan:4040/music".to_owned())
+        );
+        assert_eq!(canonical_airsonic_upstream_url("ftp://nas.lan:4040"), None);
+        assert_eq!(
+            canonical_airsonic_upstream_url("http://user:pass@nas.lan:4040"),
+            None
+        );
+        assert_eq!(
+            canonical_airsonic_upstream_url("http://nas.lan:4040?token=x"),
+            None
+        );
+    }
+
+    #[test]
+    fn airsonic_gateway_source_uses_gateway_proxy_not_music_mesh() {
+        let reg = AirsonicGatewayRegistration::new(
+            "Seat-15",
+            "HTTP://NAS.LAN:4040/",
+            "",
+            GatewayHealth::Healthy,
+            true,
+        )
+        .unwrap();
+        let source = source_from_airsonic_gateway(&reg).unwrap();
+
+        assert_eq!(source.kind, KIND_AIRSONIC);
+        assert_eq!(source.gateway_node, "Seat-15");
+        assert_eq!(source.upstream_url, "http://nas.lan:4040");
+        assert_eq!(
+            source.source_url,
+            format!("http://seat-15.mesh:4040/mde/airsonic/{}", source.id)
+        );
+        assert!(!source.source_url.contains(MUSIC_MESH_HOST));
+        assert_ne!(source.source_url, music_mesh_server_url());
+        assert_eq!(
+            source.credential_ref,
+            airsonic_gateway_secret_ref(&source.id)
+        );
+        assert!(source.mesh_default);
+        assert!(source.health.is_healthy());
+    }
+
+    #[test]
+    fn airsonic_gateway_registration_serializes_no_plaintext_secret() {
+        let reg = AirsonicGatewayRegistration::new(
+            "gateway-a",
+            "http://nas.lan:4040",
+            "media/airsonic/shared-readonly",
+            GatewayHealth::Healthy,
+            false,
+        )
+        .unwrap();
+        let json = serde_json::to_string(&reg).unwrap();
+
+        assert!(json.contains("\"credential_ref\":\"media/airsonic/shared-readonly\""));
+        assert!(!json.contains("hunter2"));
+        assert!(!json.contains("password"));
+        assert!(!json.contains("username"));
+    }
+
+    #[test]
+    fn legacy_music_mesh_url_is_not_a_gateway_registration() {
+        assert!(AirsonicGatewayRegistration::new(
+            "gateway-a",
+            &music_mesh_server_url(),
+            "",
+            GatewayHealth::Healthy,
+            true,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn airsonic_gateway_merge_dedupes_same_upstream_and_prefers_healthy_gateway() {
+        let degraded_default = AirsonicGatewayRegistration::new(
+            "gateway-b",
+            "HTTP://NAS.LAN:4040/",
+            "",
+            GatewayHealth::Degraded,
+            true,
+        )
+        .unwrap();
+        let healthy_non_default = AirsonicGatewayRegistration::new(
+            "gateway-a",
+            "http://nas.lan:4040",
+            "",
+            GatewayHealth::Healthy,
+            false,
+        )
+        .unwrap();
+
+        let sources = merge_airsonic_gateway_sources(&[degraded_default, healthy_non_default]);
+
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].gateway_node, "gateway-a");
+        assert!(sources[0].health.is_healthy());
+        assert_eq!(sources[0].upstream_key, "http://nas.lan:4040");
+    }
+
+    #[test]
+    fn airsonic_gateway_select_keeps_healthy_last_then_defaults() {
+        let mesh_default = AirsonicGatewayRegistration::new(
+            "gateway-default",
+            "http://default.lan:4040",
+            "",
+            GatewayHealth::Healthy,
+            true,
+        )
+        .unwrap();
+        let preferred_last = AirsonicGatewayRegistration::new(
+            "gateway-last",
+            "http://last.lan:4040",
+            "",
+            GatewayHealth::Healthy,
+            false,
+        )
+        .unwrap();
+        let degraded_last = AirsonicGatewayRegistration::new(
+            "gateway-degraded",
+            "http://degraded.lan:4040",
+            "",
+            GatewayHealth::Degraded,
+            false,
+        )
+        .unwrap();
+        let default_id = mesh_default.id.clone();
+        let preferred_id = preferred_last.id.clone();
+        let degraded_id = degraded_last.id.clone();
+        let sources =
+            merge_airsonic_gateway_sources(&[mesh_default, preferred_last, degraded_last]);
+
+        assert_eq!(
+            select_airsonic_gateway_source(&sources, Some(&preferred_id))
+                .unwrap()
+                .id,
+            preferred_id
+        );
+        assert_eq!(
+            select_airsonic_gateway_source(&sources, Some(&degraded_id))
+                .unwrap()
+                .id,
+            default_id
+        );
+        assert_eq!(
+            select_airsonic_gateway_source(&sources, None).unwrap().id,
+            default_id
+        );
+    }
+
+    #[test]
+    fn read_airsonic_gateway_sources_from_plane_reads_single_and_list_docs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let single = AirsonicGatewayRegistration::new(
+            "gateway-a",
+            "http://nas-a.lan:4040",
+            "",
+            GatewayHealth::Healthy,
+            true,
+        )
+        .unwrap();
+        seed_airsonic_gateway_doc(
+            tmp.path(),
+            "gateway-a",
+            &serde_json::to_string(&single).unwrap(),
+        );
+
+        let list = vec![
+            AirsonicGatewayRegistration::new(
+                "gateway-b",
+                "http://nas-a.lan:4040/",
+                "",
+                GatewayHealth::Degraded,
+                false,
+            )
+            .unwrap(),
+            AirsonicGatewayRegistration::new(
+                "gateway-c",
+                "http://nas-c.lan:4040",
+                "",
+                GatewayHealth::Healthy,
+                false,
+            )
+            .unwrap(),
+        ];
+        seed_airsonic_gateway_doc(
+            tmp.path(),
+            "gateway-b",
+            &serde_json::to_string(&list).unwrap(),
+        );
+
+        let mut tampered = single.clone();
+        tampered.id = "forged".to_owned();
+        seed_airsonic_gateway_doc(
+            tmp.path(),
+            "tampered",
+            &serde_json::to_string(&tampered).unwrap(),
+        );
+
+        let sources = read_airsonic_gateway_sources_from_plane(tmp.path());
+
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].id, single.id);
+        assert_eq!(sources[0].gateway_node, "gateway-a");
+        assert!(sources
+            .iter()
+            .any(|source| source.gateway_node == "gateway-c"));
+        assert!(!sources.iter().any(|source| source.id == "forged"));
+    }
+
+    // ── WL-FUNC-015: LAN Jellyfin gateways ──
+
+    #[test]
+    fn canonical_jellyfin_upstream_url_normalizes_like_other_gateway_media() {
+        assert_eq!(
+            canonical_jellyfin_upstream_url("JELLYFIN.LAN:8096/"),
+            Some("http://jellyfin.lan:8096".to_owned())
+        );
+        assert_eq!(
+            canonical_jellyfin_upstream_url("HTTPS://JELLYFIN.LAN:8920/base///"),
+            Some("https://jellyfin.lan:8920/base".to_owned())
+        );
+        assert_eq!(canonical_jellyfin_upstream_url("ftp://jellyfin.lan"), None);
+        assert_eq!(
+            canonical_jellyfin_upstream_url("http://token@jellyfin.lan:8096"),
+            None
+        );
+    }
+
+    #[test]
+    fn jellyfin_gateway_source_uses_gateway_proxy_not_direct_lan() {
+        let reg = JellyfinGatewayRegistration::new(
+            "Seat-15",
+            "HTTP://JELLYFIN.LAN:8096/",
+            "",
+            GatewayHealth::Healthy,
+            true,
+        )
+        .unwrap();
+        let source = source_from_jellyfin_gateway(&reg).unwrap();
+
+        assert_eq!(source.kind, KIND_JELLYFIN);
+        assert_eq!(source.gateway_node, "Seat-15");
+        assert_eq!(source.upstream_url, "http://jellyfin.lan:8096");
+        assert_eq!(
+            source.source_url,
+            format!(
+                "http://seat-15.mesh:{JELLYFIN_GATEWAY_PROXY_PORT}/mde/jellyfin/{}",
+                source.id
+            )
+        );
+        assert!(!source.source_url.contains("jellyfin.lan"));
+        assert_eq!(
+            source.credential_ref,
+            jellyfin_gateway_secret_ref(&source.id)
+        );
+        assert!(source.mesh_default);
+        assert!(source.health.is_healthy());
+    }
+
+    #[test]
+    fn jellyfin_gateway_registration_serializes_no_plaintext_token() {
+        let reg = JellyfinGatewayRegistration::new(
+            "gateway-a",
+            "http://jellyfin.lan:8096",
+            "media/jellyfin/shared-readonly",
+            GatewayHealth::Healthy,
+            false,
+        )
+        .unwrap();
+        let json = serde_json::to_string(&reg).unwrap();
+
+        assert!(json.contains("\"credential_ref\":\"media/jellyfin/shared-readonly\""));
+        assert!(!json.contains("hunter2"));
+        assert!(!json.contains("password"));
+        assert!(!json.contains("api_key"));
+        assert!(!json.contains("token"));
+    }
+
+    #[test]
+    fn legacy_music_mesh_url_is_not_a_jellyfin_gateway_registration() {
+        assert!(JellyfinGatewayRegistration::new(
+            "gateway-a",
+            &music_mesh_server_url(),
+            "",
+            GatewayHealth::Healthy,
+            true,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn jellyfin_gateway_merge_dedupes_same_upstream_and_prefers_healthy_gateway() {
+        let degraded_default = JellyfinGatewayRegistration::new(
+            "gateway-b",
+            "HTTP://JELLYFIN.LAN:8096/",
+            "",
+            GatewayHealth::Degraded,
+            true,
+        )
+        .unwrap();
+        let healthy_non_default = JellyfinGatewayRegistration::new(
+            "gateway-a",
+            "http://jellyfin.lan:8096",
+            "",
+            GatewayHealth::Healthy,
+            false,
+        )
+        .unwrap();
+
+        let sources = merge_jellyfin_gateway_sources(&[degraded_default, healthy_non_default]);
+
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].gateway_node, "gateway-a");
+        assert!(sources[0].health.is_healthy());
+        assert_eq!(sources[0].upstream_key, "http://jellyfin.lan:8096");
+    }
+
+    #[test]
+    fn jellyfin_gateway_select_keeps_healthy_last_then_defaults() {
+        let mesh_default = JellyfinGatewayRegistration::new(
+            "gateway-default",
+            "http://default-jellyfin.lan:8096",
+            "",
+            GatewayHealth::Healthy,
+            true,
+        )
+        .unwrap();
+        let preferred_last = JellyfinGatewayRegistration::new(
+            "gateway-last",
+            "http://last-jellyfin.lan:8096",
+            "",
+            GatewayHealth::Healthy,
+            false,
+        )
+        .unwrap();
+        let degraded_last = JellyfinGatewayRegistration::new(
+            "gateway-degraded",
+            "http://degraded-jellyfin.lan:8096",
+            "",
+            GatewayHealth::Degraded,
+            false,
+        )
+        .unwrap();
+        let default_id = mesh_default.id.clone();
+        let preferred_id = preferred_last.id.clone();
+        let degraded_id = degraded_last.id.clone();
+        let sources =
+            merge_jellyfin_gateway_sources(&[mesh_default, preferred_last, degraded_last]);
+
+        assert_eq!(
+            select_jellyfin_gateway_source(&sources, Some(&preferred_id))
+                .unwrap()
+                .id,
+            preferred_id
+        );
+        assert_eq!(
+            select_jellyfin_gateway_source(&sources, Some(&degraded_id))
+                .unwrap()
+                .id,
+            default_id
+        );
+        assert_eq!(
+            select_jellyfin_gateway_source(&sources, None).unwrap().id,
+            default_id
+        );
+    }
+
+    #[test]
+    fn read_jellyfin_gateway_sources_from_plane_reads_single_and_list_docs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let single = JellyfinGatewayRegistration::new(
+            "gateway-a",
+            "http://jellyfin-a.lan:8096",
+            "",
+            GatewayHealth::Healthy,
+            true,
+        )
+        .unwrap();
+        seed_jellyfin_gateway_doc(
+            tmp.path(),
+            "gateway-a",
+            &serde_json::to_string(&single).unwrap(),
+        );
+
+        let list = vec![
+            JellyfinGatewayRegistration::new(
+                "gateway-b",
+                "http://jellyfin-a.lan:8096/",
+                "",
+                GatewayHealth::Degraded,
+                false,
+            )
+            .unwrap(),
+            JellyfinGatewayRegistration::new(
+                "gateway-c",
+                "http://jellyfin-c.lan:8096",
+                "",
+                GatewayHealth::Healthy,
+                false,
+            )
+            .unwrap(),
+        ];
+        seed_jellyfin_gateway_doc(
+            tmp.path(),
+            "gateway-b",
+            &serde_json::to_string(&list).unwrap(),
+        );
+
+        let mut tampered = single.clone();
+        tampered.id = "forged".to_owned();
+        seed_jellyfin_gateway_doc(
+            tmp.path(),
+            "tampered",
+            &serde_json::to_string(&tampered).unwrap(),
+        );
+
+        let sources = read_jellyfin_gateway_sources_from_plane(tmp.path());
+
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].id, single.id);
+        assert_eq!(sources[0].gateway_node, "gateway-a");
+        assert!(sources
+            .iter()
+            .any(|source| source.gateway_node == "gateway-c"));
+        assert!(!sources.iter().any(|source| source.id == "forged"));
+    }
+
     // ── MEDIA-8: the published shared account ──
 
     #[test]
@@ -740,6 +1878,18 @@ ND_ADMIN_PASS='p@ss=word'\n";
             serde_json::to_string(reg).unwrap(),
         )
         .unwrap();
+    }
+
+    fn seed_airsonic_gateway_doc(root: &Path, host: &str, body: &str) {
+        let dir = root.join(host);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(AIRSONIC_GATEWAY_REGISTRY_FILE), body).unwrap();
+    }
+
+    fn seed_jellyfin_gateway_doc(root: &Path, host: &str, body: &str) {
+        let dir = root.join(host);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(JELLYFIN_GATEWAY_REGISTRY_FILE), body).unwrap();
     }
 
     #[test]

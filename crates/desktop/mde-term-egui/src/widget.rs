@@ -2833,6 +2833,10 @@ mod tests {
         })
         .expect("spawn /bin/sh");
         let mut widget = TerminalWidget::new(pty);
+        assert!(
+            !widget.local_pty().expect("local pty").has_repaint_waker(),
+            "the egui repaint waker is installed by show(), not construction"
+        );
 
         let ctx = egui::Context::default();
         Style::install(&ctx);
@@ -2851,6 +2855,10 @@ mod tests {
             prim_count = ctx.tessellate(out.shapes, out.pixels_per_point).len();
         }
         assert!(prim_count > 0, "widget frame produced draw primitives");
+        assert!(
+            widget.local_pty().expect("local pty").has_repaint_waker(),
+            "TerminalWidget::show must wire the LocalPty repaint waker"
+        );
 
         // The resize mapped the rect to a real grid on both the engine and
         // the kernel side (§7: runtime-observable, not a mock).

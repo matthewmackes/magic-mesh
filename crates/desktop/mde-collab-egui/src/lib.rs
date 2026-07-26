@@ -12,13 +12,17 @@
 //!
 //! Every mode renders inside one persistent frame:
 //!
-//! * a **spaces rail** down the left, listing the
+//! * a Teams-like **app rail** down the far left — Activity, Teams, Calls, Files,
+//!   Alerts, Transfers, Clipboard, and Settings — with every click routing
+//!   through one app-selection seam;
+//! * a **Teams + Channels rail** next to it, listing the
 //!   [`SpaceDirectory`](mde_collab_types::SpaceDirectory) with per-space unread
 //!   badges (the selection key for every other pane);
-//! * per-space **mode tabs** across the top — [`Mode::Activity`],
-//!   [`Mode::Messages`], [`Mode::Calls`], [`Mode::Files`], [`Mode::Transfers`],
-//!   [`Mode::Documents`], [`Mode::Alerts`], and [`Mode::Clipboard`] are all
-//!   implemented. Documents
+//! * a channel header across the top. The Teams app exposes Posts / Files /
+//!   Calls channel tabs, while other apps expose a single app header and keep
+//!   their existing bodies. [`Mode::Activity`], [`Mode::Messages`],
+//!   [`Mode::Calls`], [`Mode::Files`], [`Mode::Transfers`], [`Mode::Documents`],
+//!   [`Mode::Alerts`], and [`Mode::Clipboard`] are all implemented. Documents
 //!   (WL-FUNC-011 Phase 3c foundation) embeds the real `mde-editor-egui` editor —
 //!   a Project sub-mode (the full IDE) and a default Document sub-mode (a one-pane
 //!   Markdown editor) — and emits the collab document commands; the CRDT live
@@ -45,7 +49,7 @@
 //! * [`Mode::Messages`] — a Markdown conversation timeline
 //!   ([`ConversationTimeline`](mde_collab_types::ConversationTimeline)) with
 //!   anchored threads ([`ThreadTimeline`](mde_collab_types::ThreadTimeline)), a
-//!   composer whose <kbd>Enter</kbd> emits
+//!   multiline composer whose <kbd>Ctrl</kbd>+<kbd>Enter</kbd> emits
 //!   [`SendMessage`](mde_collab_types::CollabCommand::SendMessage), locally
 //!   persisted drafts, honest delivery state, and an edit/delete affordance that
 //!   reflects the core's five-minute author window (spec §3).
@@ -191,6 +195,132 @@ impl Mode {
     }
 }
 
+/// The Teams-style app rail route. This is the visible Mesh Teams app model;
+/// existing mode bodies remain the implementation behind each app route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MeshTeamsApp {
+    /// Cross-space attention inbox.
+    #[default]
+    Activity,
+    /// Teams/channels conversation workspace.
+    Teams,
+    /// Calls roster and active-call controls.
+    Calls,
+    /// Channel files / document entry points.
+    Files,
+    /// Alert inbox.
+    Alerts,
+    /// Transfer ledger.
+    Transfers,
+    /// Shared clipboard lane.
+    Clipboard,
+    /// Local Mesh Teams preferences.
+    Settings,
+}
+
+impl MeshTeamsApp {
+    /// App rail order locked by WL-UX-010.
+    pub const ALL: [Self; 8] = [
+        Self::Activity,
+        Self::Teams,
+        Self::Calls,
+        Self::Files,
+        Self::Alerts,
+        Self::Transfers,
+        Self::Clipboard,
+        Self::Settings,
+    ];
+
+    /// Rail label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Activity => "Activity",
+            Self::Teams => "Teams",
+            Self::Calls => "Calls",
+            Self::Files => "Files",
+            Self::Alerts => "Alerts",
+            Self::Transfers => "Transfers",
+            Self::Clipboard => "Clipboard",
+            Self::Settings => "Settings",
+        }
+    }
+
+    /// Backing mode, when the app route owns one of the existing bodies.
+    #[must_use]
+    pub const fn mode(self) -> Option<Mode> {
+        match self {
+            Self::Activity => Some(Mode::Activity),
+            Self::Teams => Some(Mode::Messages),
+            Self::Calls => Some(Mode::Calls),
+            Self::Files => Some(Mode::Files),
+            Self::Alerts => Some(Mode::Alerts),
+            Self::Transfers => Some(Mode::Transfers),
+            Self::Clipboard => Some(Mode::Clipboard),
+            Self::Settings => None,
+        }
+    }
+}
+
+/// The Teams app's per-channel tab strip. These are the three channel tabs
+/// required by WL-UX-010 and map onto already-real mode bodies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChannelTab {
+    /// Channel conversation posts.
+    #[default]
+    Posts,
+    /// Files linked to the selected channel.
+    Files,
+    /// Calls in the selected channel.
+    Calls,
+}
+
+impl ChannelTab {
+    /// Channel tab display order.
+    pub const ALL: [Self; 3] = [Self::Posts, Self::Files, Self::Calls];
+
+    /// Tab label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Posts => "Posts",
+            Self::Files => "Files",
+            Self::Calls => "Calls",
+        }
+    }
+
+    /// Backing mode for the tab.
+    #[must_use]
+    pub const fn mode(self) -> Mode {
+        match self {
+            Self::Posts => Mode::Messages,
+            Self::Files => Mode::Files,
+            Self::Calls => Mode::Calls,
+        }
+    }
+}
+
+fn app_for_mode(mode: Mode) -> MeshTeamsApp {
+    match mode {
+        Mode::Activity => MeshTeamsApp::Activity,
+        Mode::Messages => MeshTeamsApp::Teams,
+        Mode::Calls => MeshTeamsApp::Calls,
+        Mode::Files | Mode::Documents => MeshTeamsApp::Files,
+        Mode::Transfers => MeshTeamsApp::Transfers,
+        Mode::Alerts => MeshTeamsApp::Alerts,
+        Mode::Clipboard => MeshTeamsApp::Clipboard,
+    }
+}
+
+fn channel_tab_for_mode(mode: Mode) -> Option<ChannelTab> {
+    match mode {
+        Mode::Messages => Some(ChannelTab::Posts),
+        Mode::Files | Mode::Documents => Some(ChannelTab::Files),
+        Mode::Calls => Some(ChannelTab::Calls),
+        _ => None,
+    }
+}
+
 /// The band an [`ActivityFeed`](mde_collab_types::ActivityFeed) row is filtered
 /// into, grouping the event-kind tags the projection carries. The Activity feed
 /// filters by band; there is deliberately no global search box (spec §2).
@@ -269,6 +399,10 @@ pub struct CommunicationsSurface {
     selected_space: Option<SpaceId>,
     /// The active mode tab.
     mode: Mode,
+    /// The selected Teams-style app rail route.
+    app: MeshTeamsApp,
+    /// The selected tab inside the Teams/channel workspace.
+    channel_tab: ChannelTab,
     /// The active Activity filter band.
     activity_filter: ActivityFilter,
     /// The thread anchored open in Messages mode, if any.
@@ -276,6 +410,13 @@ pub struct CommunicationsSurface {
     /// Per-space main-composer drafts — persist locally across mode/space
     /// switches (a switched-away draft is never lost).
     drafts: HashMap<SpaceId, String>,
+    /// Per-space current-channel find text. This is a local view filter, not a
+    /// collaboration event and not a suite-wide/global search index.
+    channel_find: HashMap<SpaceId, String>,
+    /// Per-message local quick reaction. This is strictly view state for this
+    /// seat; it is never emitted as a collaboration command/event and does not
+    /// imply a mesh-visible reaction system.
+    local_reactions: HashMap<EventId, messages::LocalReaction>,
     /// Per-thread reply-composer drafts.
     thread_drafts: HashMap<ThreadId, String>,
     /// The message being inline-edited (its id + the working buffer), if any.
@@ -385,9 +526,44 @@ impl CommunicationsSurface {
         self.mode
     }
 
+    /// The active Teams-style app rail route.
+    #[must_use]
+    pub fn app(&self) -> MeshTeamsApp {
+        self.app
+    }
+
+    /// The active tab inside the Teams/channel workspace.
+    #[must_use]
+    pub fn channel_tab(&self) -> ChannelTab {
+        self.channel_tab
+    }
+
     /// Switch the active mode tab.
     pub fn set_mode(&mut self, mode: Mode) {
         self.mode = mode;
+        self.app = app_for_mode(mode);
+        if let Some(tab) = channel_tab_for_mode(mode) {
+            self.channel_tab = tab;
+        }
+    }
+
+    /// Switch the Teams-style app route.
+    pub fn set_app(&mut self, app: MeshTeamsApp) {
+        self.app = app;
+        if let Some(mode) = app.mode() {
+            self.mode = if app == MeshTeamsApp::Teams {
+                self.channel_tab.mode()
+            } else {
+                mode
+            };
+        }
+    }
+
+    /// Switch the Teams/channel tab and route to its existing body.
+    pub fn set_channel_tab(&mut self, tab: ChannelTab) {
+        self.channel_tab = tab;
+        self.app = MeshTeamsApp::Teams;
+        self.mode = tab.mode();
     }
 
     /// The active Activity filter band.
@@ -408,6 +584,38 @@ impl CommunicationsSurface {
         self.drafts.insert(space, text.into());
     }
 
+    /// The current-channel find query for `space`.
+    #[must_use]
+    pub fn channel_find(&self, space: SpaceId) -> &str {
+        self.channel_find.get(&space).map_or("", String::as_str)
+    }
+
+    /// Set the current-channel find query for `space`. This is local-only view
+    /// state and never emits a collaboration command.
+    pub fn set_channel_find(&mut self, space: SpaceId, text: impl Into<String>) {
+        self.channel_find.insert(space, text.into());
+    }
+
+    /// The local-only quick reaction this seat has attached to `message`, if any.
+    #[must_use]
+    pub(crate) fn local_reaction(&self, message: EventId) -> Option<messages::LocalReaction> {
+        self.local_reactions.get(&message).copied()
+    }
+
+    /// Toggle this seat's local-only quick reaction for a message. Re-clicking
+    /// the same reaction clears it; choosing a different reaction replaces it.
+    pub(crate) fn toggle_local_reaction(
+        &mut self,
+        message: EventId,
+        reaction: messages::LocalReaction,
+    ) {
+        if self.local_reactions.get(&message).copied() == Some(reaction) {
+            self.local_reactions.remove(&message);
+        } else {
+            self.local_reactions.insert(message, reaction);
+        }
+    }
+
     /// The stable egui id of `space`'s main composer text field — a fixed id so a
     /// caller (or a headless test) can request focus on it deterministically.
     #[must_use]
@@ -415,8 +623,24 @@ impl CommunicationsSurface {
         egui::Id::new(("mde-collab-composer", space.as_uuid()))
     }
 
-    /// Render the whole surface inside `ui`: the spaces rail, the mode tabs, the
-    /// persistent call bar, and the active mode body. Reads projections from
+    /// The stable egui id of `thread`'s reply-composer text field.
+    #[must_use]
+    pub fn thread_composer_edit_id(&self, thread: ThreadId) -> egui::Id {
+        egui::Id::new(("mde-collab-thread-composer", thread.as_uuid()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_thread_for_test(&mut self, thread: ThreadId) {
+        self.open_thread = Some(thread);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn thread_draft_for_test(&self, thread: ThreadId) -> &str {
+        self.thread_drafts.get(&thread).map_or("", String::as_str)
+    }
+
+    /// Render the whole surface inside `ui`: the app rail, Teams + Channels
+    /// rail, channel header, persistent call bar, and active app body. Reads projections from
     /// `data` and pushes every emitted command into `sink`.
     pub fn ui(&mut self, ui: &mut egui::Ui, data: &dyn CollabData, sink: &mut CommandSink) {
         // Default the selection to the first rail row so the frame is usable the
@@ -441,11 +665,23 @@ impl CommunicationsSurface {
             self.car_bias_applied = false;
         }
 
-        egui::SidePanel::left(ui.id().with("collab-rail"))
+        egui::SidePanel::left(ui.id().with("collab-app-rail"))
             .resizable(false)
-            .exact_width(frame::RAIL_W)
+            .exact_width(frame::APP_RAIL_W)
+            .frame(frame::rail_frame())
+            .show_inside(ui, |ui| self.app_rail(ui));
+
+        egui::SidePanel::left(ui.id().with("collab-channel-rail"))
+            .resizable(false)
+            .exact_width(frame::CHANNEL_RAIL_W)
             .frame(frame::rail_frame())
             .show_inside(ui, |ui| self.rail(ui, data, sink));
+
+        egui::SidePanel::right(ui.id().with("collab-details"))
+            .resizable(false)
+            .exact_width(frame::DETAILS_W)
+            .frame(frame::rail_frame())
+            .show_inside(ui, |ui| self.details_pane(ui, data));
 
         // The call bar is added before the tabs + body so it stays pinned to the
         // bottom regardless of which mode is showing — it survives every switch.
@@ -453,9 +689,9 @@ impl CommunicationsSurface {
             .frame(frame::bar_frame())
             .show_inside(ui, |ui| self.call_bar(ui, data, sink));
 
-        egui::TopBottomPanel::top(ui.id().with("collab-tabs"))
+        egui::TopBottomPanel::top(ui.id().with("collab-channel-header"))
             .frame(frame::bar_frame())
-            .show_inside(ui, |ui| self.mode_tabs(ui));
+            .show_inside(ui, |ui| self.channel_header(ui, data));
 
         // The mode body crossfades in on a switch (lock #4) rather than swapping
         // instantly — a distance-independent fade on the shared Page tier, wrapped
@@ -470,6 +706,10 @@ impl CommunicationsSurface {
 
     /// The active mode's central body.
     fn mode_body(&mut self, ui: &mut egui::Ui, data: &dyn CollabData, sink: &mut CommandSink) {
+        if self.app == MeshTeamsApp::Settings {
+            self.settings_body(ui, sink);
+            return;
+        }
         match self.mode {
             Mode::Activity => self.activity_body(ui, data),
             Mode::Messages => self.messages_body(ui, data, sink),
@@ -480,6 +720,42 @@ impl CommunicationsSurface {
             Mode::Alerts => self.alerts_body(ui, data, sink),
             Mode::Clipboard => self.clipboard_body(ui, data, sink),
         }
+    }
+
+    /// Local Mesh Teams settings pane. These are real preferences already wired
+    /// through the Alerts command lane; it is intentionally small until provider
+    /// device enumeration and Discord settings land.
+    fn settings_body(&mut self, ui: &mut egui::Ui, sink: &mut CommandSink) {
+        ui.heading("Mesh Teams Settings");
+        ui.label(
+            egui::RichText::new("Local notification preferences for this seat.")
+                .color(mde_egui::Style::TEXT_DIM),
+        );
+        ui.add_space(mde_egui::Style::SP_S);
+        self.alert_pref_bar(ui, sink);
+        ui.add_space(mde_egui::Style::SP_M);
+        ui.label(
+            egui::RichText::new("Provider devices")
+                .strong()
+                .color(mde_egui::Style::TEXT_STRONG),
+        );
+        ui.label(
+            egui::RichText::new(
+                "Visible but disabled until the live media provider enumerates microphone, \
+                 camera, and screen sources.",
+            )
+            .color(mde_egui::Style::TEXT_DIM),
+        );
+        ui.add_space(mde_egui::Style::SP_S);
+        self.call_device_row(ui);
+        ui.add_space(mde_egui::Style::SP_M);
+        ui.label(
+            egui::RichText::new(
+                "Discord bridge settings appear here when the live bridge provider enumerates; \
+                 no fake servers are shown.",
+            )
+            .color(mde_egui::Style::TEXT_DIM),
+        );
     }
 }
 
@@ -502,11 +778,7 @@ pub(crate) const CAR_GLANCE_LIST_MAX: usize = 6;
 /// Bound one car-path list when the shell has published the live in-motion fold.
 /// A missing fold or non-Car palette leaves desktop behavior unchanged.
 #[must_use]
-pub(crate) const fn bounded_car_list_len(
-    is_car: bool,
-    in_motion: bool,
-    full_len: usize,
-) -> usize {
+pub(crate) const fn bounded_car_list_len(is_car: bool, in_motion: bool, full_len: usize) -> usize {
     if is_car && in_motion {
         if full_len < CAR_GLANCE_LIST_MAX {
             full_len

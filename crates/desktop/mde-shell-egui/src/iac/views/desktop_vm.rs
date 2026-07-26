@@ -8,7 +8,7 @@ use mackes_mesh_types::cloud::{DriftFlag, WorkloadRow};
 use mde_egui::egui::{self, Color32, RichText};
 use mde_egui::{carbon_icon, card, field, muted_note, status_dot, Style, TypographyRole};
 
-use super::super::{row_button, DeliveryView, Panel, WorkloadsState};
+use super::super::{row_button, DeliveryView, WorkloadsRoute, WorkloadsState};
 
 /// The Desktop VM view's own state (U16 owns its fields).
 #[derive(Debug, Default)]
@@ -78,7 +78,10 @@ fn header_row(ui: &mut egui::Ui, row: &WorkloadRow) {
     ui.horizontal(|ui| {
         ui.label(
             RichText::new(&row.name)
-                .font(Style::typography_font_with_size(TypographyRole::Body, Style::BODY))
+                .font(Style::typography_font_with_size(
+                    TypographyRole::Body,
+                    Style::BODY,
+                ))
                 .strong()
                 .color(Style::TEXT),
         );
@@ -87,17 +90,20 @@ fn header_row(ui: &mut egui::Ui, row: &WorkloadRow) {
         status_dot(ui, tone);
         ui.colored_label(
             tone,
-            RichText::new(&row.status)
-                .font(Style::typography_font_with_size(TypographyRole::Label, Style::SMALL)),
+            RichText::new(&row.status).font(Style::typography_font_with_size(
+                TypographyRole::Label,
+                Style::SMALL,
+            )),
         );
         ui.add_space(Style::SP_M);
         drift_chip(ui, row.drift);
         ui.add_space(Style::SP_M);
         ui.colored_label(
             Style::TEXT_DIM,
-            RichText::new(format!("on {}", row.node)).font(
-                Style::typography_font_with_size(TypographyRole::Caption, Style::SMALL),
-            ),
+            RichText::new(format!("on {}", row.node)).font(Style::typography_font_with_size(
+                TypographyRole::Caption,
+                Style::SMALL,
+            )),
         );
     });
 }
@@ -124,8 +130,10 @@ fn drift_chip(ui: &mut egui::Ui, drift: DriftFlag) {
     status_dot(ui, tone);
     ui.colored_label(
         tone,
-        RichText::new(drift_word(drift))
-            .font(Style::typography_font_with_size(TypographyRole::Label, Style::SMALL)),
+        RichText::new(drift_word(drift)).font(Style::typography_font_with_size(
+            TypographyRole::Label,
+            Style::SMALL,
+        )),
     );
 }
 
@@ -139,7 +147,10 @@ fn heading(ui: &mut egui::Ui, title: &str, blurb: &str) {
         ui.add_space(Style::SP_XS);
         ui.label(
             RichText::new(title)
-                .font(Style::typography_font_with_size(TypographyRole::Title, Style::TITLE))
+                .font(Style::typography_font_with_size(
+                    TypographyRole::Title,
+                    Style::TITLE,
+                ))
                 .strong()
                 .color(Style::ACCENT_WORKLOADS),
         );
@@ -149,7 +160,7 @@ fn heading(ui: &mut egui::Ui, title: &str, blurb: &str) {
 }
 
 /// The "provision a workload of this type" affordance — jumps to the Provision
-/// lens (U14 placement + U15 form).
+/// route (U14 placement + U15 form).
 fn provision_cta(ui: &mut egui::Ui, state: &mut WorkloadsState, label: &str) {
     ui.horizontal(|ui| {
         ui.scope(|ui| {
@@ -160,12 +171,15 @@ fn provision_cta(ui: &mut egui::Ui, state: &mut WorkloadsState, label: &str) {
         if ui
             .add(egui::Button::new(
                 RichText::new(label)
-                    .font(Style::typography_font_with_size(TypographyRole::Label, Style::SMALL))
+                    .font(Style::typography_font_with_size(
+                        TypographyRole::Label,
+                        Style::SMALL,
+                    ))
                     .color(Style::ACCENT_WORKLOADS),
             ))
             .clicked()
         {
-            state.set_panel(Panel::Provision);
+            state.set_route(WorkloadsRoute::Provision);
         }
     });
     ui.add_space(Style::SP_S);

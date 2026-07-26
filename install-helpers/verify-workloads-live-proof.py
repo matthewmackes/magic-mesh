@@ -68,6 +68,7 @@ MAX_DROPIN_BYTES = 16 * 1024
 MAX_TOPIC_SCAN_ROWS = 256
 REQUIRED_CLOUD_TOOLS = ("opentofu", "ansible", "libvirt")
 LIFECYCLE_ACTION_FUTURE_SKEW_MS = 30 * 1000
+ONBOARD_ACK_FUTURE_SKEW_MS = 30 * 1000
 
 BAD_REQUIRED_STATUSES = {"blocked", "error"}
 
@@ -124,17 +125,32 @@ def _short_host() -> str:
     return host.split(".", 1)[0] if host else "unknown"
 
 
+def _append_node_candidate(candidates: list[str], value: str) -> None:
+    value = value.strip()
+    if not value:
+        return
+    variants = [value]
+    if value.startswith("peer:"):
+        variants.append(value.removeprefix("peer:"))
+    else:
+        variants.append(f"peer:{value}")
+    for variant in variants:
+        if variant and variant not in candidates:
+            candidates.append(variant)
+
+
 def node_candidates(node: str | None) -> list[str]:
     """Return plausible node ids without inventing evidence."""
+    candidates: list[str] = []
     if node:
-        return [node]
+        _append_node_candidate(candidates, node)
+        return candidates
     host = _short_host()
     fqdn = socket.gethostname().strip()
-    candidates = [host, f"peer:{host}"]
-    if fqdn and fqdn not in candidates:
-        candidates.append(fqdn)
-        candidates.append(f"peer:{fqdn}")
-    return [c for c in candidates if c]
+    _append_node_candidate(candidates, host)
+    if fqdn:
+        _append_node_candidate(candidates, fqdn)
+    return candidates
 
 
 def run_command(argv: list[str], timeout: float) -> CommandResult:
@@ -541,6 +557,161 @@ def _instance_name(action: dict[str, Any]) -> str:
     return ""
 
 
+def _short_json(value: Any, max_chars: int = 160) -> str:
+    try:
+        text = json.dumps(value, sort_keys=True)
+    except (TypeError, ValueError):
+        text = repr(value)
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 1] + "…"
+
+
+def _open_broker_session_ids(applied: Any) -> tuple[list[str], list[str]]:
+    blockers: list[str] = []
+    sessions: list[str] = []
+    if not isinstance(applied, list):
+        return sessions, ["applied is not a list"]
+    non_string = sum(1 for item in applied if not isinstance(item, str))
+    if non_string:
+        suffix = "y" if non_string == 1 else "ies"
+        blockers.append(f"applied contains {non_string} non-string entr{suffix}")
+    for item in applied:
+        if not isinstance(item, str) or not item.startswith("open-broker "):
+            continue
+        session_id = item.removeprefix("open-broker ")
+        if (
+            not session_id
+            or session_id.strip() != session_id
+            or any(ch.isspace() or ord(ch) < 0x20 for ch in session_id)
+        ):
+            blockers.append(
+                f"invalid open-broker session id in applied entry {_short_json(item)!r}"
+            )
+            continue
+        sessions.append(session_id)
+    if not sessions:
+        blockers.append("no open-broker action in applied")
+    return sessions, blockers
+
+
+def _open_broker_session_ids_from_actions(actions: Any) -> list[str]:
+    if not isinstance(actions, list):
+        return []
+    sessions: list[str] = []
+    for action in actions:
+        body = None
+        if isinstance(action, dict):
+            if isinstance(action.get("OpenBroker"), dict):
+                body = action["OpenBroker"]
+            elif all(
+                isinstance(action.get(key), str)
+                for key in ("session_id", "serving_peer", "vm_id", "client_peer")
+            ):
+                body = action
+        if not isinstance(body, dict):
+            continue
+        session_id = body.get("session_id")
+        if isinstance(session_id, str) and session_id:
+            sessions.append(session_id)
+    return sessions
+
+
+def _matching_onboard_apply_action(
+    bus_root: Path,
+    event_index: dict[str, Any],
+    event_payload: dict[str, Any],
+    event_sessions: list[str],
+    args: argparse.Namespace,
+) -> tuple[dict[str, Any] | None, str | None]:
+    rows = read_topic_rows(bus_root, ONBOARD_APPLY_ACTION_TOPIC, args.bus_scan_limit)
+    if not rows:
+        return None, "no retained action/onboard/apply rows"
+
+    event_ts = event_index.get("ts_unix_ms")
+    event_issuer = event_payload.get("issuer")
+    event_target = event_payload.get("target")
+    event_nonce = event_payload.get("nonce")
+    inspected = 0
+    candidates = 0
+    for action_index, _envelope, action_payload, action_digest in rows:
+        inspected += 1
+        if not isinstance(action_payload, dict):
+            continue
+        bundle = action_payload.get("bundle")
+        if not isinstance(bundle, dict):
+            continue
+        if (
+            action_payload.get("issuer") != event_issuer
+            or bundle.get("target_node") != event_target
+            or bundle.get("nonce") != event_nonce
+        ):
+            continue
+        candidates += 1
+        blockers: list[str] = []
+        action_ts = action_index.get("ts_unix_ms")
+        action_age_s: float | None = None
+        if not isinstance(action_ts, int):
+            blockers.append(f"action Bus timestamp is not an integer: {action_ts!r}")
+        else:
+            action_age_ms = now_ms() - action_ts
+            if action_age_ms < -ONBOARD_ACK_FUTURE_SKEW_MS:
+                blockers.append(
+                    f"future action Bus timestamp age={action_age_ms / 1000.0:.1f}s "
+                    f"< -{ONBOARD_ACK_FUTURE_SKEW_MS / 1000.0:.0f}s"
+                )
+            action_age_s = max(0.0, action_age_ms / 1000.0)
+            if action_age_s > args.max_onboard_ack_age_seconds:
+                blockers.append(
+                    f"stale action age={action_age_s:.1f}s > {args.max_onboard_ack_age_seconds}s"
+                )
+            if isinstance(event_ts, int) and action_ts > event_ts:
+                blockers.append("retained action timestamp is after acknowledgement")
+        sig_hex = action_payload.get("sig_hex")
+        if not isinstance(sig_hex, str) or not sig_hex.strip():
+            blockers.append("sig_hex missing")
+        issued_at = bundle.get("issued_at")
+        if not isinstance(issued_at, int):
+            blockers.append("bundle issued_at missing")
+        action_sessions = _open_broker_session_ids_from_actions(bundle.get("actions"))
+        matching_sessions = [
+            session for session in event_sessions if session in set(action_sessions)
+        ]
+        if not matching_sessions:
+            blockers.append(
+                "retained action bundle lacks matching OpenBroker session "
+                f"for {event_sessions}"
+            )
+        evidence = {
+            "action_topic": ONBOARD_APPLY_ACTION_TOPIC,
+            "action_ulid": action_index["ulid"],
+            "action_sha256": action_digest,
+            "action_age_seconds": round(action_age_s, 3)
+            if action_age_s is not None
+            else None,
+            "bundle_issued_at": issued_at,
+            "sig_hex": "present-redacted"
+            if isinstance(sig_hex, str) and sig_hex.strip()
+            else "missing",
+            "action_open_broker_sessions": action_sessions,
+            "matching_open_broker_sessions": matching_sessions,
+        }
+        if blockers:
+            return evidence, "; ".join(blockers)
+        return evidence, None
+
+    return (
+        {
+            "retained_action_count": inspected,
+            "matching_action_candidates": candidates,
+            "event_issuer": event_issuer,
+            "event_target": event_target,
+            "event_nonce": event_nonce,
+        },
+        "no retained action/onboard/apply row matches issuer, target, and nonce",
+    )
+
+
 def check_lifecycle_action(args: argparse.Namespace, checks: list[Check]) -> None:
     required = args.require_all or args.require_lifecycle_action
     bus_root = Path(args.bus_root)
@@ -685,47 +856,114 @@ def check_onboard_open_broker(args: argparse.Namespace, checks: list[Check]) -> 
     candidates = node_candidates(args.node)
     try:
         rows = read_topic_rows(bus_root, ONBOARD_APPLY_EVENT_TOPIC, args.bus_scan_limit)
-        selected: tuple[dict[str, Any], dict[str, Any], str] | None = None
+        selected: tuple[dict[str, Any], dict[str, Any], str, list[str], float] | None = None
+        rejected: tuple[str, dict[str, Any]] | None = None
         for index, _envelope, payload, digest in rows:
             if payload is None:
                 continue
             if payload.get("target") not in candidates:
                 continue
-            applied = payload.get("applied") if isinstance(payload.get("applied"), list) else []
-            if payload.get("error") is None and any(
-                isinstance(item, str) and item.startswith("open-broker ") for item in applied
-            ):
-                selected = (index, payload, digest)
-                break
+            blockers: list[str] = []
+            ts_unix_ms = index.get("ts_unix_ms")
+            age_s: float | None = None
+            if not isinstance(ts_unix_ms, int):
+                blockers.append(f"Bus timestamp is not an integer: {ts_unix_ms!r}")
+            else:
+                age_ms = now_ms() - ts_unix_ms
+                if age_ms < -ONBOARD_ACK_FUTURE_SKEW_MS:
+                    blockers.append(
+                        f"future Bus timestamp age={age_ms / 1000.0:.1f}s "
+                        f"< -{ONBOARD_ACK_FUTURE_SKEW_MS / 1000.0:.0f}s"
+                    )
+                age_s = max(0.0, age_ms / 1000.0)
+                if age_s > args.max_onboard_ack_age_seconds:
+                    blockers.append(
+                        f"stale acknowledgement age={age_s:.1f}s > {args.max_onboard_ack_age_seconds}s"
+                    )
+            issuer = payload.get("issuer")
+            if not isinstance(issuer, str) or not issuer.strip():
+                blockers.append("issuer missing")
+            target = payload.get("target")
+            if not isinstance(target, str):
+                blockers.append("target missing")
+            nonce = payload.get("nonce")
+            if not isinstance(nonce, str) or not nonce.strip():
+                blockers.append("nonce missing")
+            if payload.get("error") is not None:
+                blockers.append(f"event error present: {_short_json(payload.get('error'))}")
+            sessions, applied_blockers = _open_broker_session_ids(payload.get("applied"))
+            blockers.extend(applied_blockers)
+            evidence = {
+                "topic": ONBOARD_APPLY_EVENT_TOPIC,
+                "ulid": index["ulid"],
+                "sha256": digest,
+                "issuer": issuer,
+                "target": target,
+                "nonce": nonce if isinstance(nonce, str) and nonce else None,
+                "age_seconds": round(age_s, 3) if age_s is not None else None,
+                "open_broker_sessions": sessions,
+            }
+            if blockers:
+                if rejected is None:
+                    rejected = ("; ".join(blockers), evidence)
+                continue
+            selected = (index, payload, digest, sessions, age_s or 0.0)
+            break
         if selected is None:
             action_rows = read_topic_rows(bus_root, ONBOARD_APPLY_ACTION_TOPIC, min(args.bus_scan_limit, 16))
             action_hint = f"; retained onboard apply actions={len(action_rows)}" if action_rows else ""
+            evidence: dict[str, Any] = {"candidate_targets": candidates}
+            reject_hint = ""
+            if rejected is not None:
+                reject_hint = f"; newest matching acknowledgement rejected: {rejected[0]}"
+                evidence["rejected_acknowledgement"] = rejected[1]
             checks.append(
                 Check(
                     "onboard open-broker acknowledgement",
                     "blocked" if required else "warn",
-                    f"no successful event/onboard/apply open-broker acknowledgement for {candidates}{action_hint}",
+                    f"no successful event/onboard/apply open-broker acknowledgement for {candidates}{action_hint}{reject_hint}",
                     required,
+                    evidence,
                 )
             )
             return
-        index, payload, digest = selected
+        index, payload, digest, sessions, age_s = selected
         applied = [item for item in payload.get("applied", []) if isinstance(item, str)]
+        action_evidence, action_blocker = _matching_onboard_apply_action(
+            bus_root, index, payload, sessions, args
+        )
+        event_evidence = {
+            "topic": ONBOARD_APPLY_EVENT_TOPIC,
+            "ulid": index["ulid"],
+            "sha256": digest,
+            "issuer": payload.get("issuer"),
+            "target": payload.get("target"),
+            "nonce": payload.get("nonce"),
+            "age_seconds": round(age_s, 3),
+            "applied": applied,
+            "open_broker_sessions": sessions,
+        }
+        if action_evidence:
+            event_evidence["correlated_apply_action"] = action_evidence
+        if action_blocker:
+            checks.append(
+                Check(
+                    "onboard open-broker acknowledgement",
+                    "blocked" if required else "warn",
+                    "fresh open-broker acknowledgement is not tied to a retained signed apply request: "
+                    + action_blocker,
+                    required,
+                    event_evidence,
+                )
+            )
+            return
         checks.append(
             Check(
                 "onboard open-broker acknowledgement",
                 "ok",
-                f"target {payload.get('target')} acknowledged {', '.join(applied)}",
+                f"target {payload.get('target')} acknowledged retained signed open-broker session(s) {', '.join(sessions)}",
                 required,
-                {
-                    "topic": ONBOARD_APPLY_EVENT_TOPIC,
-                    "ulid": index["ulid"],
-                    "sha256": digest,
-                    "issuer": payload.get("issuer"),
-                    "target": payload.get("target"),
-                    "nonce": payload.get("nonce"),
-                    "applied": applied,
-                },
+                event_evidence,
             )
         )
     except ProofError as exc:
@@ -918,6 +1156,8 @@ def _write_bus_message(root: Path, topic: str, ulid: str, payload: dict[str, Any
 def self_test() -> int:
     with tempfile.TemporaryDirectory(prefix="workloads-live-proof.") as temp:
         root = Path(temp)
+        assert node_candidates("node-a") == ["node-a", "peer:node-a"]
+        assert node_candidates("peer:node-a") == ["peer:node-a", "node-a"]
         with sqlite3.connect(root / "index.sqlite") as conn:
             conn.execute(
                 "CREATE TABLE messages("
@@ -1034,6 +1274,141 @@ def self_test() -> int:
         fresh_json = json.dumps(lifecycle_checks[0].to_json(), sort_keys=True)
         assert "new-super-secret-token" not in fresh_json
         assert "present-redacted" in fresh_json
+        _write_bus_message(
+            root,
+            VM_INSTANCES_TOPIC,
+            "ZZZWORKLOADSLIVEPROOF0006",
+            {
+                "host": "peer:node-a",
+                "published_at_ms": now_ms(),
+                "instances": [{"name": "demo-vm", "state": "running"}],
+            },
+            now_ms(),
+        )
+        roster_args = argparse.Namespace(
+            require_all=False,
+            require_vm_roster=True,
+            bus_root=str(root),
+            node="node-a",
+            bus_scan_limit=8,
+            max_roster_age_seconds=120.0,
+            expect_vm="demo-vm",
+            expect_vm_state="running",
+            require_running_vm=True,
+        )
+        roster_checks: list[Check] = []
+        check_vm_roster(roster_args, roster_checks)
+        assert roster_checks[0].status == "ok"
+        assert roster_checks[0].evidence["host"] == "peer:node-a"
+        onboard_args = lambda node: argparse.Namespace(
+            require_all=False,
+            require_onboard_open_broker=True,
+            bus_root=str(root),
+            node=node,
+            bus_scan_limit=8,
+            max_onboard_ack_age_seconds=120.0,
+        )
+        _write_bus_message(
+            root,
+            ONBOARD_APPLY_EVENT_TOPIC,
+            "ZZZWORKLOADSLIVEPROOF0007",
+            {
+                "issuer": "peer:issuer",
+                "target": "node-b",
+                "nonce": "nonce-b",
+                "applied": ["open-broker "],
+                "error": None,
+            },
+            now_ms(),
+        )
+        onboard_checks: list[Check] = []
+        check_onboard_open_broker(onboard_args("node-b"), onboard_checks)
+        assert onboard_checks[0].status == "blocked"
+        assert "invalid open-broker session id" in onboard_checks[0].detail
+        _write_bus_message(
+            root,
+            ONBOARD_APPLY_EVENT_TOPIC,
+            "ZZZWORKLOADSLIVEPROOF0008",
+            {
+                "issuer": "peer:issuer",
+                "target": "node-c",
+                "nonce": "nonce-c",
+                "applied": ["open-broker stale-session"],
+                "error": None,
+            },
+            now_ms() - 200_000,
+        )
+        onboard_checks = []
+        check_onboard_open_broker(onboard_args("node-c"), onboard_checks)
+        assert onboard_checks[0].status == "blocked"
+        assert "stale acknowledgement age" in onboard_checks[0].detail
+        _write_bus_message(
+            root,
+            ONBOARD_APPLY_EVENT_TOPIC,
+            "ZZZWORKLOADSLIVEPROOF0009",
+            {
+                "issuer": "peer:issuer",
+                "target": "node-d",
+                "nonce": "nonce-d",
+                "applied": ["open-broker orphan-session"],
+                "error": None,
+            },
+            now_ms(),
+        )
+        onboard_checks = []
+        check_onboard_open_broker(onboard_args("node-d"), onboard_checks)
+        assert onboard_checks[0].status == "blocked"
+        assert "not tied to a retained signed apply request" in onboard_checks[0].detail
+        valid_action_ts = now_ms()
+        _write_bus_message(
+            root,
+            ONBOARD_APPLY_ACTION_TOPIC,
+            "ZZZWORKLOADSLIVEPROOF0010",
+            {
+                "issuer": "peer:issuer",
+                "bundle": {
+                    "target_node": "peer:node-a",
+                    "actions": [
+                        {
+                            "OpenBroker": {
+                                "session_id": "test-session",
+                                "serving_peer": "peer:node-a",
+                                "vm_id": "demo-vm",
+                                "client_peer": "peer:issuer",
+                            }
+                        }
+                    ],
+                    "issued_at": valid_action_ts // 1000,
+                    "nonce": "nonce-a",
+                },
+                "sig_hex": "present-redacted",
+            },
+            valid_action_ts,
+        )
+        _write_bus_message(
+            root,
+            ONBOARD_APPLY_EVENT_TOPIC,
+            "ZZZWORKLOADSLIVEPROOF0011",
+            {
+                "issuer": "peer:issuer",
+                "target": "peer:node-a",
+                "nonce": "nonce-a",
+                "applied": ["open-broker test-session"],
+                "error": None,
+            },
+            valid_action_ts + 1,
+        )
+        onboard_checks = []
+        check_onboard_open_broker(onboard_args("node-a"), onboard_checks)
+        assert onboard_checks[0].status == "ok"
+        assert onboard_checks[0].evidence["target"] == "peer:node-a"
+        assert onboard_checks[0].evidence["open_broker_sessions"] == ["test-session"]
+        assert (
+            onboard_checks[0].evidence["correlated_apply_action"][
+                "matching_open_broker_sessions"
+            ]
+            == ["test-session"]
+        )
     print("verify-workloads-live-proof: self-test passed")
     return 0
 
@@ -1052,6 +1427,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--expect-vm-state", help="when --expect-vm is set, require this exact virsh state")
     parser.add_argument("--max-cloud-age-seconds", type=float, default=120.0)
     parser.add_argument("--max-lifecycle-action-age-seconds", type=float, default=120.0)
+    parser.add_argument("--max-onboard-ack-age-seconds", type=float, default=120.0)
     parser.add_argument("--max-roster-age-seconds", type=float, default=120.0)
     parser.add_argument("--bus-scan-limit", type=int, default=64)
     parser.add_argument("--command-timeout", type=float, default=5.0)
@@ -1079,6 +1455,8 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         parser.error("--expect-vm-state requires --expect-vm")
     if not args.max_lifecycle_action_age_seconds >= 0:
         parser.error("--max-lifecycle-action-age-seconds must be non-negative")
+    if not args.max_onboard_ack_age_seconds >= 0:
+        parser.error("--max-onboard-ack-age-seconds must be non-negative")
     return args
 
 

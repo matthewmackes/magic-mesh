@@ -3,7 +3,7 @@
 //! by [`mackes_mesh_types::cloud::NodeCapacity`]. Each node card shows its
 //! used/total vCPU + memory as a load-toned bar and whether armed live apply is
 //! available; selecting one returns its host id, which mod.rs stores as the
-//! provision panel's placement target.
+//! shared placement target for Provision, Run, Images, and Containers.
 
 use mde_egui::egui::{self, Color32, RichText, Sense, Stroke};
 use mde_egui::{card, section, status_dot, Style};
@@ -164,7 +164,7 @@ fn node_card(
 
     if is_selected {
         ui.label(
-            RichText::new("Selected \u{2014} the provision form targets this node")
+            RichText::new("Selected \u{2014} node-scoped routes target this node")
                 .size(Style::SMALL)
                 .color(Style::ACCENT_WORKLOADS),
         );

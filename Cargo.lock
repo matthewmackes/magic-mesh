@@ -4672,9 +4672,12 @@ dependencies = [
 name = "mde-media-egui"
 version = "12.1.0"
 dependencies = [
+ "mackes-mesh-types",
+ "mde-bus",
  "mde-egui",
  "mde-jellyfin",
  "mde-media-core",
+ "serde_json",
  "tempfile",
 ]
 

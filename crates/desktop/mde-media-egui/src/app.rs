@@ -9,6 +9,9 @@
 //! of this file. Clicks become [`TransportAction`]s that flow to the core, exactly as
 //! the sibling surfaces drive their daemons.
 
+use std::path::PathBuf;
+
+use mackes_mesh_types::media_sources::{MediaSourcesState, SourceOrigin, MEDIA_SOURCES_TOPIC};
 use mde_egui::eframe::{self, App, CreationContext};
 use mde_egui::egui::{
     self, Align, Align2, Context, CursorIcon, FontId, Layout, Response, RichText, ScrollArea,
@@ -27,8 +30,8 @@ use mde_media_core::{
 use crate::model::{
     capture_detail, format_time, item_title, jellyfin_item_title, library_row_texts,
     now_playing_title, osd_should_show, play_pause_label, progress_fraction, repeat_label,
-    state_word, track_label, MediaController, MediaTab, TransportAction, EBU_R128_DEFAULT,
-    EQ_GAIN_DB_LIMIT,
+    state_word, track_label, MediaController, MediaTab, MeshJellyfinSourceRow, TransportAction,
+    EBU_R128_DEFAULT, EQ_GAIN_DB_LIMIT,
 };
 use crate::Engine;
 
@@ -53,6 +56,10 @@ const SKIP_SECS: f64 = 10.0;
 /// reads the shared session plane, so it runs on a coarse cadence (~1 s at 60 fps),
 /// not every frame — the same human-paced convergence the mesh workers use.
 const ROAM_POLL_INTERVAL_FRAMES: u32 = 60;
+
+/// Mesh media-source roster refresh cadence. Human-paced: this is a retained
+/// local Bus record, not a frame-synchronous source.
+const MESH_SOURCES_POLL_INTERVAL_FRAMES: u32 = 60;
 
 /// Compact icon-only queue action button. Queue rows are not the primary transport
 /// surface, so their visual controls follow the shared refined chrome height
@@ -88,6 +95,10 @@ pub struct MediaApp {
     applied_fullscreen: bool,
     /// Frames since start, gating the MEDIA-16 roaming poll to a coarse cadence.
     roam_poll_frames: u32,
+    /// Frames since start, gating the mesh media-source roster poll.
+    mesh_sources_poll_frames: u32,
+    /// Local Bus reader for `state/media/sources`.
+    mesh_sources: BusMediaSources,
     /// The MEDIA-2 phase-1 frame-sink texture (`docs/gpu_encoder.md`) the Player
     /// tab's stage paints — owned here so it persists across frames instead of
     /// re-uploading a GPU texture every call.
@@ -119,6 +130,8 @@ impl MediaApp {
             controller: crate::real_media(),
             applied_fullscreen: false,
             roam_poll_frames: 0,
+            mesh_sources_poll_frames: 0,
+            mesh_sources: BusMediaSources::from_env(),
             video: VideoTextureCache::default(),
         }
     }
@@ -128,6 +141,12 @@ impl App for MediaApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         accumulate_osd_idle(ctx, &mut self.controller);
         media_pump(&mut self.controller);
+        self.mesh_sources_poll_frames = self.mesh_sources_poll_frames.wrapping_add(1);
+        if self.mesh_sources_poll_frames == 1
+            || self.mesh_sources_poll_frames % MESH_SOURCES_POLL_INTERVAL_FRAMES == 0
+        {
+            self.mesh_sources.refresh_controller(&mut self.controller);
+        }
 
         // MEDIA-16: converge the roaming lease on a coarse cadence — checkpoint this
         // seat's position while it owns the session, or release (pause) when another
@@ -168,6 +187,63 @@ impl App for MediaApp {
 /// `*_pump`). The standalone app calls it each frame; a shell embed would too.
 pub fn media_pump<E: MediaEngine>(controller: &mut MediaController<E>) {
     controller.pump();
+}
+
+/// Local Bus reader for the retained mesh media-source roster.
+///
+/// The reader owns no long-lived SQLite handle; it opens `Persist` per refresh,
+/// matching sibling egui surfaces and avoiding a `Send`/lifetime edge in the UI.
+#[derive(Debug, Clone)]
+pub struct BusMediaSources {
+    bus_root: Option<PathBuf>,
+}
+
+impl BusMediaSources {
+    /// Resolve the Bus spool dir from the environment.
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self {
+            bus_root: mde_bus::client_data_dir(),
+        }
+    }
+
+    /// Construct with an explicit spool root; tests use tempdirs.
+    #[must_use]
+    pub const fn with_root(bus_root: Option<PathBuf>) -> Self {
+        Self { bus_root }
+    }
+
+    /// Read the newest retained `state/media/sources` record.
+    ///
+    /// Missing Bus or no record is not an error; malformed JSON is.
+    pub fn read_latest(&self) -> Result<Option<MediaSourcesState>, String> {
+        let Some(root) = self.bus_root.clone() else {
+            return Ok(None);
+        };
+        let persist = mde_bus::persist::Persist::open(root)
+            .map_err(|e| format!("open Bus media-source store: {e}"))?;
+        let body = persist
+            .list_since(MEDIA_SOURCES_TOPIC, None)
+            .map_err(|e| format!("read {MEDIA_SOURCES_TOPIC}: {e}"))?
+            .into_iter()
+            .filter_map(|message| message.body)
+            .next_back();
+        body.map_or(Ok(None), |json| {
+            serde_json::from_str::<MediaSourcesState>(&json)
+                .map(Some)
+                .map_err(|e| format!("decode {MEDIA_SOURCES_TOPIC}: {e}"))
+        })
+    }
+
+    /// Apply the latest roster to a controller. Errors become visible status, not
+    /// panics; a missing Bus/record leaves the current controller state unchanged.
+    pub fn refresh_controller<E: MediaEngine>(&self, controller: &mut MediaController<E>) {
+        match self.read_latest() {
+            Ok(Some(state)) => controller.set_mesh_media_sources(Some(state)),
+            Ok(None) => {}
+            Err(e) => controller.ui_mut().status = Some(format!("Mesh media sources: {e}")),
+        }
+    }
 }
 
 /// Accumulate pointer-idle time for the OSD auto-hide: reset on any pointer motion or
@@ -571,6 +647,8 @@ fn jellyfin_section<E: MediaEngine>(ui: &mut egui::Ui, controller: &mut MediaCon
         connect_jellyfin(controller, &id);
     }
 
+    mesh_jellyfin_sources_section(ui, controller);
+
     // Browsed titles — a click plays through the core Player; Download caches for
     // offline (MEDIA-11), and a cached title shows an offline badge.
     let items = controller.jellyfin_items().to_vec();
@@ -624,6 +702,131 @@ fn jellyfin_section<E: MediaEngine>(ui: &mut egui::Ui, controller: &mut MediaCon
 
     // The downloaded (offline) list — a click plays with no server (MEDIA-11).
     offline_section(ui, controller);
+}
+
+fn mesh_jellyfin_sources_section<E: MediaEngine>(
+    ui: &mut egui::Ui,
+    controller: &mut MediaController<E>,
+) {
+    let rows = controller.mesh_jellyfin_sources();
+    if rows.is_empty() {
+        return;
+    }
+
+    ui.add_space(Style::SP_S);
+    ui.label(
+        RichText::new("Mesh Jellyfin sources")
+            .size(Style::SMALL)
+            .strong()
+            .color(Style::TEXT_DIM),
+    );
+    ui.add_space(Style::SP_XS);
+
+    let mut select_id: Option<String> = None;
+    let mut connect_id: Option<String> = None;
+    for row in &rows {
+        ui.horizontal(|ui| {
+            status_dot(
+                ui,
+                if row.reachable {
+                    Style::OK
+                } else {
+                    Style::WARN
+                },
+            );
+            let mut label = row.label.clone();
+            if row.mesh_default {
+                label.push_str(" · Default");
+            }
+            if row.selected {
+                label.push_str(" · Selected");
+            } else if row.preferred {
+                label.push_str(" · Preferred");
+            }
+            let label_color = if row.selected {
+                Style::ACCENT
+            } else {
+                Style::TEXT
+            };
+            if ui
+                .label(RichText::new(label).size(Style::BODY).color(label_color))
+                .interact(Sense::click())
+                .on_hover_cursor(CursorIcon::PointingHand)
+                .clicked()
+            {
+                select_id = Some(row.id.clone());
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui
+                    .add_enabled(mesh_jellyfin_can_connect(row), egui::Button::new("Connect"))
+                    .clicked()
+                {
+                    connect_id = Some(row.id.clone());
+                }
+                muted_note(ui, mesh_jellyfin_connect_note(row));
+            });
+        });
+        muted_note(ui, mesh_jellyfin_row_details(row));
+        ui.add_space(Style::SP_XS);
+    }
+
+    if let Some(id) = select_id {
+        if controller.select_mesh_jellyfin_source(&id) {
+            let active = controller
+                .active_mesh_jellyfin_source()
+                .map(|source| source.label)
+                .unwrap_or_else(|| "none".to_owned());
+            controller.ui_mut().status = Some(format!(
+                "Preferred mesh Jellyfin source {id}; active route: {active}."
+            ));
+        }
+    }
+    if let Some(id) = connect_id {
+        connect_mesh_jellyfin(controller, &id);
+    }
+}
+
+fn mesh_jellyfin_can_connect(row: &MeshJellyfinSourceRow) -> bool {
+    row.reachable
+        && row.origin == SourceOrigin::Gateway
+        && row
+            .credential_ref
+            .as_deref()
+            .map(str::trim)
+            .filter(|credential_ref| !credential_ref.is_empty())
+            .is_some()
+}
+
+fn mesh_jellyfin_connect_note(row: &MeshJellyfinSourceRow) -> &'static str {
+    if !row.reachable {
+        "gateway unavailable"
+    } else if row.origin != SourceOrigin::Gateway {
+        "direct mesh source"
+    } else if row
+        .credential_ref
+        .as_deref()
+        .map(str::trim)
+        .filter(|credential_ref| !credential_ref.is_empty())
+        .is_some()
+    {
+        "gateway ready"
+    } else {
+        "credentials missing"
+    }
+}
+
+fn mesh_jellyfin_row_details(row: &MeshJellyfinSourceRow) -> String {
+    let mut parts = vec![row.origin_label.clone(), row.endpoint.clone()];
+    if let Some(reason) = &row.reason {
+        parts.push(reason.clone());
+    }
+    if let Some(credential_ref) = &row.credential_ref {
+        parts.push(format!("credentials: {credential_ref}"));
+    }
+    if let Some(upstream_key) = &row.upstream_key {
+        parts.push(format!("upstream: {upstream_key}"));
+    }
+    parts.join(" · ")
 }
 
 /// The offline (downloaded) titles sub-section: the cache usage, then a row per
@@ -754,6 +957,48 @@ fn connect_jellyfin<E: MediaEngine>(controller: &mut MediaController<E>, server_
         Ok(count) => {
             controller.ui_mut().status =
                 Some(format!("Loaded {count} title(s) from {}.", server.name));
+        }
+        Err(message) => controller.ui_mut().status = Some(message),
+    }
+}
+
+/// Connect through the mesh Jellyfin gateway. The GUI selects a gateway source,
+/// but receives no upstream token/user id; the daemon proxy injects those from
+/// sealed credential material and rewrites the shared user sentinel server-side.
+fn connect_mesh_jellyfin<E: MediaEngine>(controller: &mut MediaController<E>, source_id: &str) {
+    if !controller.select_mesh_jellyfin_source(source_id) {
+        controller.ui_mut().status = Some("Unknown mesh Jellyfin source.".to_owned());
+        return;
+    }
+    let label = controller
+        .active_mesh_jellyfin_source()
+        .map(|source| source.label)
+        .unwrap_or_else(|| source_id.to_owned());
+    let transport =
+        match ReqwestTransport::new().map_err(|e| format!("Jellyfin transport error: {e}")) {
+            Ok(transport) => transport,
+            Err(message) => {
+                controller.ui_mut().status = Some(message);
+                return;
+            }
+        };
+    let client = match controller.mesh_gateway_jellyfin_client(jellyfin_device(), transport) {
+        Ok(client) => client,
+        Err(message) => {
+            controller.ui_mut().status = Some(message);
+            return;
+        }
+    };
+    let query = ItemsQuery::default()
+        .recursive()
+        .include_item_types(["Movie", "Episode", "Audio"])
+        .sort_by(["SortName"])
+        .fields(["Overview", "Genres", "MediaSources"]);
+    match controller.browse_jellyfin(&client, &query) {
+        Ok(count) => {
+            controller.ui_mut().status = Some(format!(
+                "Loaded {count} title(s) through mesh gateway {label}."
+            ));
         }
         Err(message) => controller.ui_mut().status = Some(message),
     }
@@ -3312,6 +3557,152 @@ mod tests {
             .expect("browse");
         assert_eq!(c.jellyfin_items().len(), 1);
         render(&mut c, sources_view);
+    }
+
+    #[test]
+    fn sources_view_renders_mesh_jellyfin_gateway_rows() {
+        let mut c = controller();
+        c.set_mesh_media_sources(Some(mackes_mesh_types::media_sources::MediaSourcesState {
+            node: "seat-15".to_string(),
+            sources: vec![
+                mackes_mesh_types::media_sources::MediaSource {
+                    id: "healthy".to_string(),
+                    name: "Gateway Home".to_string(),
+                    node: "gateway-a".to_string(),
+                    kind: mackes_mesh_types::media_sources::MediaKind::Jellyfin,
+                    host: "gateway-a.mesh".to_string(),
+                    port: Some(8097),
+                    endpoint: "http://gateway-a.mesh:8097/mde/jellyfin/healthy".to_string(),
+                    protocols: vec![mackes_mesh_types::media_sources::MediaProtocol::Jellyfin],
+                    origin: mackes_mesh_types::media_sources::SourceOrigin::Gateway,
+                    reachability: mackes_mesh_types::media_sources::Reachability::Reachable,
+                    reason: None,
+                    gateway_node: Some("gateway-a".to_string()),
+                    upstream_key: Some("http://192.168.1.60:8096".to_string()),
+                    credential_ref: Some("media/jellyfin/shared-readonly".to_string()),
+                    mesh_default: Some(true),
+                },
+                mackes_mesh_types::media_sources::MediaSource {
+                    id: "degraded".to_string(),
+                    name: "Gateway Backup".to_string(),
+                    node: "gateway-b".to_string(),
+                    kind: mackes_mesh_types::media_sources::MediaKind::Jellyfin,
+                    host: "gateway-b.mesh".to_string(),
+                    port: Some(8097),
+                    endpoint: "http://gateway-b.mesh:8097/mde/jellyfin/degraded".to_string(),
+                    protocols: vec![mackes_mesh_types::media_sources::MediaProtocol::Jellyfin],
+                    origin: mackes_mesh_types::media_sources::SourceOrigin::Gateway,
+                    reachability: mackes_mesh_types::media_sources::Reachability::Unreachable,
+                    reason: Some("gateway degraded".to_string()),
+                    gateway_node: Some("gateway-b".to_string()),
+                    upstream_key: Some("http://192.168.1.61:8096".to_string()),
+                    credential_ref: Some("media/jellyfin/backup-readonly".to_string()),
+                    mesh_default: Some(false),
+                },
+            ],
+            lanes: vec![mackes_mesh_types::media_sources::LaneStatus {
+                lane: "gateway".to_string(),
+                status: "ok".to_string(),
+            }],
+            published_at_ms: 1,
+        }));
+
+        assert_eq!(c.mesh_jellyfin_sources().len(), 2);
+        let shapes = render_shapes(&mut c, sources_view);
+        let texts = painted_text(&shapes);
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.contains("Gateway Home · Default · Selected")),
+            "mesh Jellyfin gateway default must render as the selected active route: {texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.contains("gateway unavailable")),
+            "degraded mesh Jellyfin gateways must render an honest unavailable state: {texts:?}"
+        );
+    }
+
+    fn mesh_sources_state() -> mackes_mesh_types::media_sources::MediaSourcesState {
+        mackes_mesh_types::media_sources::MediaSourcesState {
+            node: "seat-15".to_string(),
+            sources: vec![mackes_mesh_types::media_sources::MediaSource {
+                id: "gateway".to_string(),
+                name: "Gateway Home".to_string(),
+                node: "gateway-a".to_string(),
+                kind: mackes_mesh_types::media_sources::MediaKind::Jellyfin,
+                host: "gateway-a.mesh".to_string(),
+                port: Some(8097),
+                endpoint: "http://gateway-a.mesh:8097/mde/jellyfin/gateway".to_string(),
+                protocols: vec![mackes_mesh_types::media_sources::MediaProtocol::Jellyfin],
+                origin: mackes_mesh_types::media_sources::SourceOrigin::Gateway,
+                reachability: mackes_mesh_types::media_sources::Reachability::Reachable,
+                reason: None,
+                gateway_node: Some("gateway-a".to_string()),
+                upstream_key: Some("http://192.168.1.60:8096".to_string()),
+                credential_ref: Some("media/jellyfin/shared-readonly".to_string()),
+                mesh_default: Some(true),
+            }],
+            lanes: vec![mackes_mesh_types::media_sources::LaneStatus {
+                lane: "gateway".to_string(),
+                status: "ok".to_string(),
+            }],
+            published_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn bus_media_sources_reads_latest_roster_record() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let persist = mde_bus::persist::Persist::open(dir.path().to_path_buf()).expect("persist");
+        let state = mesh_sources_state();
+        persist
+            .write(
+                MEDIA_SOURCES_TOPIC,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&serde_json::to_string(&state).expect("json")),
+            )
+            .expect("write");
+
+        let reader = BusMediaSources::with_root(Some(dir.path().to_path_buf()));
+        assert_eq!(reader.read_latest().expect("read"), Some(state));
+    }
+
+    #[test]
+    fn bus_media_sources_missing_bus_is_empty_not_panic() {
+        let reader = BusMediaSources::with_root(None);
+        assert_eq!(reader.read_latest().expect("read"), None);
+    }
+
+    #[test]
+    fn bus_media_sources_malformed_json_reports_status_without_panicking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let persist = mde_bus::persist::Persist::open(dir.path().to_path_buf()).expect("persist");
+        persist
+            .write(
+                MEDIA_SOURCES_TOPIC,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some("{bad json"),
+            )
+            .expect("write");
+
+        let reader = BusMediaSources::with_root(Some(dir.path().to_path_buf()));
+        assert!(reader
+            .read_latest()
+            .expect_err("malformed")
+            .contains("decode"));
+
+        let mut c = controller();
+        reader.refresh_controller(&mut c);
+        assert!(c
+            .ui()
+            .status
+            .as_deref()
+            .unwrap()
+            .contains("Mesh media sources"));
     }
 
     /// A fixture transport serving synthetic media bytes for a download and one

@@ -145,6 +145,20 @@ pub enum CollabCommand {
         /// Markdown body.
         body: MessageBody,
     },
+    /// Mark an existing thread resolved.
+    ResolveThread {
+        /// The space.
+        space: SpaceId,
+        /// The thread.
+        thread: ThreadId,
+    },
+    /// Reopen a resolved thread.
+    ReopenThread {
+        /// The space.
+        space: SpaceId,
+        /// The thread.
+        thread: ThreadId,
+    },
 
     // ---- Alerts --------------------------------------------------------
     /// Acknowledge an alert.
@@ -402,6 +416,8 @@ impl CollabCommand {
             Self::DeleteMessage { .. } => "delete_message",
             Self::StartThread { .. } => "start_thread",
             Self::ReplyInThread { .. } => "reply_in_thread",
+            Self::ResolveThread { .. } => "resolve_thread",
+            Self::ReopenThread { .. } => "reopen_thread",
             Self::AckAlert { .. } => "ack_alert",
             Self::SnoozeAlert { .. } => "snooze_alert",
             Self::RunAlertAction { .. } => "run_alert_action",

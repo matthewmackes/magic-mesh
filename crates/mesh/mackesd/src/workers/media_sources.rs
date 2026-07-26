@@ -3,7 +3,7 @@
 //! Design: `docs/design/mesh-media-player.md` (row 26 "Mesh discovery"). The
 //! `mde-media-egui` Sources panel (MEDIA-8) renders ONE list of every mesh
 //! media source; this worker is the mesh-side (§6) collector that builds it.
-//! Two discovery lanes, folded into one deduped roster published to
+//! Three discovery lanes, folded into one deduped roster published to
 //! [`MEDIA_SOURCES_TOPIC`] (`state/media/sources`):
 //!
 //! 1. **Mesh registry (peer-advertised).** Every node ALREADY advertises the
@@ -15,7 +15,12 @@
 //!    advertisement channel is minted — this is §6 glue over the existing
 //!    plane, reusing the same `read_peers` fold `mesh_media.rs` /
 //!    `desktop_sources.rs` read.
-//! 2. **mDNS (LAN).** Media servers advertised on the local LAN
+//! 2. **Jellyfin gateway registry.** Node-admin registered LAN Jellyfin servers
+//!    are published through QNM-Shared `jellyfin-gateway-registry.json` records
+//!    and lifted as mesh-reachable gateway rows. The upstream URL remains
+//!    admin/diagnostic state; clients receive the gateway proxy URL plus a sealed
+//!    `credential_ref`, so the roster does not leak shared read-only tokens.
+//! 3. **mDNS (LAN).** Media servers advertised on the local LAN
 //!    (`_jellyfin._tcp`) browsed with the SAME `mdns-sd` machinery the
 //!    `mdns_relay` worker uses — including its anti-loop `mde-relay-origin`
 //!    TXT guard, so a peer-republished service never double-counts against the
@@ -43,16 +48,20 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use mackes_mesh_types::media_sources::{
+    LaneStatus, MediaKind, MediaProtocol, MediaSource, MediaSourcesState, Reachability,
+    SourceOrigin, MEDIA_SOURCES_TOPIC,
+};
 use mackes_mesh_types::peers::{peers_dir, read_peers, PeerRecord};
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 
 use super::{ShutdownToken, Worker};
-
-/// The retained-latest state topic the merged source roster is published to.
-/// The Sources panel (MEDIA-8) reads the newest record off this topic.
-pub const MEDIA_SOURCES_TOPIC: &str = "state/media/sources";
+use crate::mesh_media::{
+    canonical_jellyfin_upstream_url, read_jellyfin_gateway_sources_from_plane,
+    JellyfinGatewaySource,
+};
 
 /// Republish cadence. Discovery is human-paced; a 2 s poll keeps a newly
 /// discovered source visible without spinning the peers plane.
@@ -90,35 +99,6 @@ pub const SERVICE_MESH_PLAYER: &str = "mde-media";
 /// [`MediaKind`]. (DLNA/UPnP is SSDP, not mDNS — see the module docs.)
 pub const MEDIA_MDNS_TYPES: &[(&str, MediaKind)] = &[("_jellyfin._tcp", MediaKind::Jellyfin)];
 
-// ───────────────────────────── data model ─────────────────────────────
-
-/// The kind of media source, as the acceptance enumerates them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MediaKind {
-    /// A Jellyfin media server (the MEDIA-9 client's target).
-    Jellyfin,
-    /// A DLNA/UPnP media server.
-    Dlna,
-    /// This-player-as-server — a peer running the MEDIA-15 mesh media server.
-    MeshPlayer,
-    /// A mesh file share (`/mnt/mesh-storage`) browsable for media.
-    FileShare,
-}
-
-impl MediaKind {
-    /// Stable wire/log tag.
-    #[must_use]
-    pub const fn tag(self) -> &'static str {
-        match self {
-            Self::Jellyfin => "jellyfin",
-            Self::Dlna => "dlna",
-            Self::MeshPlayer => "mesh_player",
-            Self::FileShare => "file_share",
-        }
-    }
-}
-
 /// Map an advertised `descriptors.media` service name onto a media-player
 /// source kind. `None` for a service that isn't one of the player's sources
 /// (the music-only `navidrome-airsonic` / `mpd` rows are mde-music's domain,
@@ -132,99 +112,6 @@ pub fn media_kind_from_service(name: &str) -> Option<MediaKind> {
         SERVICE_MESH_PLAYER => Some(MediaKind::MeshPlayer),
         _ => None,
     }
-}
-
-/// A protocol a media source is reached over.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum MediaProtocol {
-    /// The Jellyfin REST API (HTTP).
-    Jellyfin,
-    /// DLNA/UPnP (SOAP over HTTP).
-    Dlna,
-    /// A plain HTTP media endpoint (the mesh media server).
-    Http,
-    /// Browse files over the mesh sshfs mount (FILEMGR-5 mesh-mount).
-    MeshFs,
-}
-
-impl MediaProtocol {
-    /// Stable wire/log tag.
-    #[must_use]
-    pub const fn tag(self) -> &'static str {
-        match self {
-            Self::Jellyfin => "jellyfin",
-            Self::Dlna => "dlna",
-            Self::Http => "http",
-            Self::MeshFs => "mesh-fs",
-        }
-    }
-
-    /// The natural protocol set a source of this kind is dialed over.
-    #[must_use]
-    pub fn for_kind(kind: MediaKind) -> Vec<Self> {
-        match kind {
-            MediaKind::Jellyfin => vec![Self::Jellyfin],
-            MediaKind::Dlna => vec![Self::Dlna],
-            MediaKind::MeshPlayer => vec![Self::Http],
-            MediaKind::FileShare => vec![Self::MeshFs],
-        }
-    }
-}
-
-/// Derived (never live-probed) reachability of a source.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Reachability {
-    /// Roster state says the source should answer.
-    Reachable,
-    /// Roster state says it won't (the pip greys with `reason`).
-    Unreachable,
-    /// Nothing derivable — honest.
-    Unknown,
-}
-
-/// Which discovery lane produced a source.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SourceOrigin {
-    /// Peer-advertised via the replicated peers plane.
-    MeshPeer,
-    /// Discovered on the local LAN via mDNS.
-    Mdns,
-}
-
-/// One merged media source — a row of the published roster.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct MediaSource {
-    /// Stable id (`jellyfin:<node>:<port>` / `dlna:<node>:<port>` /
-    /// `mesh-player:<node>:<port>` / `file-share:<node>` /
-    /// `mdns:<host>:<port>:<kind>`).
-    pub id: String,
-    /// Display name for the Sources panel.
-    pub name: String,
-    /// The node/host the panel groups by.
-    pub node: String,
-    /// The kind of media source.
-    pub kind: MediaKind,
-    /// The address a client dials (overlay IP / `<node>.mesh` / LAN address).
-    pub host: String,
-    /// The advertised/known port, if any (`None` for a file share).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub port: Option<u16>,
-    /// The dialable locator (e.g. `http://<host>:<port>`, `mesh-fs://<host>`).
-    pub endpoint: String,
-    /// Protocols the source is reached over, deduped + sorted.
-    pub protocols: Vec<MediaProtocol>,
-    /// The discovery lane this source came from.
-    pub origin: SourceOrigin,
-    /// Derived reachability (never a blocking probe).
-    pub reachability: Reachability,
-    /// Human-readable reason when not reachable (the greyed pip's caption).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
 }
 
 // ─────────────────── lane 1: mesh-registry (peer-advertised) ───────────────────
@@ -307,6 +194,10 @@ pub fn media_sources_from_peer(rec: &PeerRecord, self_node: &str) -> Vec<MediaSo
             origin: SourceOrigin::MeshPeer,
             reachability,
             reason: reason.clone(),
+            gateway_node: None,
+            upstream_key: None,
+            credential_ref: None,
+            mesh_default: None,
         });
     }
     // A peer that exports the shared /mnt/mesh-storage mount offers a mesh
@@ -324,6 +215,10 @@ pub fn media_sources_from_peer(rec: &PeerRecord, self_node: &str) -> Vec<MediaSo
             origin: SourceOrigin::MeshPeer,
             reachability,
             reason,
+            gateway_node: None,
+            upstream_key: None,
+            credential_ref: None,
+            mesh_default: None,
         });
     }
     out
@@ -409,12 +304,50 @@ pub fn source_from_mdns(ep: &MdnsEndpoint) -> MediaSource {
         origin: SourceOrigin::Mdns,
         reachability: Reachability::Reachable,
         reason: None,
+        gateway_node: None,
+        upstream_key: None,
+        credential_ref: None,
+        mesh_default: None,
+    }
+}
+
+/// Lift a validated Jellyfin gateway contract into the generic Media Sources
+/// roster. The gateway source stays visible when degraded so the Media Workspace
+/// can explain failover and cached-state behavior without pretending the direct
+/// LAN server is reachable from this client.
+#[must_use]
+pub fn source_from_jellyfin_gateway(source: &JellyfinGatewaySource) -> MediaSource {
+    MediaSource {
+        id: source.id.clone(),
+        name: format!("Jellyfin gateway via {}", source.gateway_node),
+        node: source.gateway_node.clone(),
+        kind: MediaKind::Jellyfin,
+        host: gateway_host_from_url(&source.source_url)
+            .unwrap_or_else(|| source.gateway_node.clone()),
+        port: Some(crate::mesh_media::JELLYFIN_GATEWAY_PROXY_PORT),
+        endpoint: source.source_url.clone(),
+        protocols: MediaProtocol::for_kind(MediaKind::Jellyfin),
+        origin: SourceOrigin::Gateway,
+        reachability: if source.health.is_healthy() {
+            Reachability::Reachable
+        } else {
+            Reachability::Unreachable
+        },
+        reason: if source.health.is_healthy() {
+            None
+        } else {
+            Some("gateway degraded".to_string())
+        },
+        gateway_node: Some(source.gateway_node.clone()),
+        upstream_key: Some(source.upstream_key.clone()),
+        credential_ref: Some(source.credential_ref.clone()),
+        mesh_default: Some(source.mesh_default),
     }
 }
 
 // ───────────────────────────── the merge fold ─────────────────────────────
 
-/// Fold the two lanes into ONE deduped, stably-ordered source list — the
+/// Fold the discovery lanes into ONE deduped, stably-ordered source list — the
 /// load-bearing merge the acceptance pins. Rules:
 ///
 /// 1. Peer-advertised sources seed the list (the roster is the reachability
@@ -424,23 +357,36 @@ pub fn source_from_mdns(ep: &MdnsEndpoint) -> MediaSource {
 ///    deduped away — the registry lane already carries it (latest-per-publisher:
 ///    the mesh-authoritative row wins). An unknown LAN endpoint becomes its own
 ///    card.
-/// 3. A final union-by-id pass guarantees no duplicate ids survive.
+/// 3. Gateway rows for the same Jellyfin upstream win over direct/mDNS rows and
+///    stay visible when degraded so default/failover state is explicit.
+/// 4. A final union-by-id pass guarantees no duplicate ids survive.
 ///
-/// Output is sorted `(node, name, id)` case-insensitively so the published
-/// roster is stable across ticks (grouping by node).
+/// Output is sorted by source priority (gateway first, mesh-registry, then mDNS)
+/// and then `(node, name, id)` case-insensitively so the published roster is
+/// stable across ticks while gateway sources remain primary.
 #[must_use]
 pub fn merge_media_sources(
     peer_sources: &[MediaSource],
+    gateway_sources: &[MediaSource],
     mdns: &[MdnsEndpoint],
 ) -> Vec<MediaSource> {
     let mut out: Vec<MediaSource> = peer_sources.to_vec();
 
+    for gateway in gateway_sources {
+        if gateway.origin == SourceOrigin::Gateway {
+            out.retain(|source| !same_jellyfin_upstream(source, gateway));
+        }
+        out.push(gateway.clone());
+    }
+
     for ep in mdns {
+        let mdns_source = source_from_mdns(ep);
         let already = out.iter().any(|s| {
-            s.kind == ep.kind && (s.host == ep.host || s.node.eq_ignore_ascii_case(&ep.instance))
+            (s.kind == ep.kind && (s.host == ep.host || s.node.eq_ignore_ascii_case(&ep.instance)))
+                || same_jellyfin_upstream(s, &mdns_source)
         });
         if !already {
-            out.push(source_from_mdns(ep));
+            out.push(mdns_source);
         }
     }
 
@@ -449,9 +395,9 @@ pub fn merge_media_sources(
         s.protocols.dedup();
     }
     out.sort_by(|a, b| {
-        a.node
-            .to_lowercase()
-            .cmp(&b.node.to_lowercase())
+        source_priority(a)
+            .cmp(&source_priority(b))
+            .then_with(|| a.node.to_lowercase().cmp(&b.node.to_lowercase()))
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
             .then_with(|| a.id.cmp(&b.id))
     });
@@ -461,29 +407,55 @@ pub fn merge_media_sources(
     out
 }
 
-// ───────────────────────── the published record ─────────────────────────
-
-/// One discovery lane's honest status (`ok …` / `gated: …`) — so the Sources
-/// panel can say WHY a lane is empty instead of silently omitting sources (§7).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct LaneStatus {
-    /// Lane name (`mesh-registry` / `mdns`).
-    pub lane: String,
-    /// Status string.
-    pub status: String,
+fn source_priority(source: &MediaSource) -> (u8, u8, u8) {
+    let origin = match source.origin {
+        SourceOrigin::Gateway => 0,
+        SourceOrigin::MeshPeer => 1,
+        SourceOrigin::Mdns => 2,
+    };
+    let default = if source.mesh_default == Some(true) {
+        0
+    } else {
+        1
+    };
+    let reachability = match source.reachability {
+        Reachability::Reachable => 0,
+        Reachability::Unknown => 1,
+        Reachability::Unreachable => 2,
+    };
+    (origin, default, reachability)
 }
 
-/// The full record published to [`MEDIA_SOURCES_TOPIC`].
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct MediaSourcesState {
-    /// Publishing node id.
-    pub node: String,
-    /// The merged, deduped source roster.
-    pub sources: Vec<MediaSource>,
-    /// Per-lane discovery status.
-    pub lanes: Vec<LaneStatus>,
-    /// Wall-clock publish time (ms since the Unix epoch).
-    pub published_at_ms: u64,
+fn same_jellyfin_upstream(a: &MediaSource, b: &MediaSource) -> bool {
+    if a.kind != MediaKind::Jellyfin || b.kind != MediaKind::Jellyfin {
+        return false;
+    }
+    match (source_upstream_key(a), source_upstream_key(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+fn source_upstream_key(source: &MediaSource) -> Option<String> {
+    source
+        .upstream_key
+        .clone()
+        .or_else(|| canonical_jellyfin_upstream_url(&source.endpoint))
+}
+
+fn gateway_host_from_url(url: &str) -> Option<String> {
+    let (_, rest) = url.split_once("://")?;
+    let authority = rest.split('/').next().unwrap_or(rest);
+    if let Some(after_bracket) = authority.strip_prefix('[') {
+        return after_bracket
+            .split_once(']')
+            .map(|(host, _)| host.to_owned());
+    }
+    authority
+        .rsplit_once(':')
+        .filter(|(_, port)| port.chars().all(|c| c.is_ascii_digit()))
+        .map(|(host, _)| host.to_owned())
+        .or_else(|| Some(authority.to_owned()))
 }
 
 // ───────────────────────────── the worker ─────────────────────────────
@@ -578,15 +550,24 @@ impl MediaSourcesWorker {
         for rec in &peers {
             peer_sources.extend(media_sources_from_peer(rec, &self.node_id));
         }
+        let gateway_sources: Vec<MediaSource> =
+            read_jellyfin_gateway_sources_from_plane(&self.workgroup_root)
+                .iter()
+                .map(source_from_jellyfin_gateway)
+                .collect();
         let mut mdns: Vec<MdnsEndpoint> = self.mdns_seen.values().cloned().collect();
         mdns.sort_by(|a, b| a.fullname.cmp(&b.fullname));
-        merge_media_sources(&peer_sources, &mdns)
+        merge_media_sources(&peer_sources, &gateway_sources, &mdns)
     }
 
     fn lanes(&self) -> Vec<LaneStatus> {
         vec![
             LaneStatus {
                 lane: "mesh-registry".to_string(),
+                status: "ok".to_string(),
+            },
+            LaneStatus {
+                lane: "gateway".to_string(),
                 status: "ok".to_string(),
             },
             LaneStatus {
@@ -946,6 +927,97 @@ mod tests {
         }
     }
 
+    fn gateway_source(
+        gateway_node: &str,
+        upstream_url: &str,
+        health: crate::mesh_media::GatewayHealth,
+        mesh_default: bool,
+    ) -> MediaSource {
+        let reg = crate::mesh_media::JellyfinGatewayRegistration::new(
+            gateway_node,
+            upstream_url,
+            "",
+            health,
+            mesh_default,
+        )
+        .unwrap();
+        let mesh_source = crate::mesh_media::source_from_jellyfin_gateway(&reg).unwrap();
+        source_from_jellyfin_gateway(&mesh_source)
+    }
+
+    #[test]
+    fn jellyfin_gateway_source_lifts_as_gateway_origin() {
+        let source = gateway_source(
+            "Seat-15",
+            "http://192.168.1.60:8096/",
+            crate::mesh_media::GatewayHealth::Healthy,
+            true,
+        );
+
+        assert_eq!(source.kind, MediaKind::Jellyfin);
+        assert_eq!(source.origin, SourceOrigin::Gateway);
+        assert_eq!(source.gateway_node.as_deref(), Some("Seat-15"));
+        assert_eq!(
+            source.upstream_key.as_deref(),
+            Some("http://192.168.1.60:8096")
+        );
+        assert!(source
+            .credential_ref
+            .as_deref()
+            .unwrap()
+            .starts_with("media/jellyfin/"));
+        assert_eq!(source.mesh_default, Some(true));
+        assert_eq!(
+            source.endpoint,
+            format!(
+                "http://seat-15.mesh:{}/mde/jellyfin/{}",
+                crate::mesh_media::JELLYFIN_GATEWAY_PROXY_PORT,
+                source.id
+            )
+        );
+        assert!(!source.endpoint.contains("192.168.1.60"));
+        assert_eq!(source.reachability, Reachability::Reachable);
+    }
+
+    #[test]
+    fn jellyfin_gateway_prefers_healthy_default_over_direct_mdns() {
+        let gateway = gateway_source(
+            "gateway-a",
+            "http://192.168.1.60:8096/",
+            crate::mesh_media::GatewayHealth::Healthy,
+            true,
+        );
+
+        let merged = merge_media_sources(
+            &[],
+            &[gateway.clone()],
+            &[ep("Basement", "192.168.1.60", 8096, MediaKind::Jellyfin)],
+        );
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].origin, SourceOrigin::Gateway);
+        assert_eq!(merged[0].id, gateway.id);
+        assert_eq!(merged[0].mesh_default, Some(true));
+    }
+
+    #[test]
+    fn degraded_jellyfin_gateway_stays_visible_with_reason() {
+        let gateway = gateway_source(
+            "gateway-a",
+            "http://192.168.1.60:8096/",
+            crate::mesh_media::GatewayHealth::Degraded,
+            false,
+        );
+
+        let merged = merge_media_sources(&[], &[gateway.clone()], &[]);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].origin, SourceOrigin::Gateway);
+        assert_eq!(merged[0].reachability, Reachability::Unreachable);
+        assert_eq!(merged[0].reason.as_deref(), Some("gateway degraded"));
+        assert_eq!(merged[0].id, gateway.id);
+    }
+
     #[test]
     fn merge_dedups_a_known_peers_mdns_advert() {
         // oak's Jellyfin shows up on the LAN via mDNS at oak's address → the
@@ -962,6 +1034,7 @@ mod tests {
         );
         let merged = merge_media_sources(
             &peer_srcs,
+            &[],
             &[ep("oak", "10.42.0.7", 8096, MediaKind::Jellyfin)],
         );
         assert_eq!(merged.len(), 1);
@@ -971,6 +1044,7 @@ mod tests {
         // Instance-name match (case-insensitive) also dedups.
         let merged = merge_media_sources(
             &peer_srcs,
+            &[],
             &[ep("OAK", "192.168.9.9", 8096, MediaKind::Jellyfin)],
         );
         assert_eq!(merged.len(), 1, "instance-name match against the peer node");
@@ -990,6 +1064,7 @@ mod tests {
         );
         let merged = merge_media_sources(
             &peer_srcs,
+            &[],
             &[ep("Basement", "192.168.1.60", 8096, MediaKind::Jellyfin)],
         );
         assert_eq!(merged.len(), 2);
@@ -1025,7 +1100,7 @@ mod tests {
             ),
             "elm",
         ));
-        let merged = merge_media_sources(&peer_srcs, &[]);
+        let merged = merge_media_sources(&peer_srcs, &[], &[]);
         let order: Vec<&str> = merged.iter().map(|s| s.id.as_str()).collect();
         // ash's DLNA + ash's file-share sort before oak's Jellyfin (by node).
         assert_eq!(
@@ -1049,7 +1124,7 @@ mod tests {
         );
         let mut dupd = one.clone();
         dupd.extend(one);
-        let merged = merge_media_sources(&dupd, &[]);
+        let merged = merge_media_sources(&dupd, &[], &[]);
         assert_eq!(merged.len(), 1);
     }
 
@@ -1133,6 +1208,37 @@ mod tests {
     }
 
     #[test]
+    fn collect_sources_folds_the_jellyfin_gateway_plane() {
+        let wg = tempfile::tempdir().unwrap();
+        let reg = crate::mesh_media::JellyfinGatewayRegistration::new(
+            "gateway-a",
+            "http://192.168.1.60:8096/",
+            "",
+            crate::mesh_media::GatewayHealth::Healthy,
+            true,
+        )
+        .unwrap();
+        let gateway_dir = wg.path().join("gateway-a");
+        std::fs::create_dir_all(&gateway_dir).unwrap();
+        std::fs::write(
+            gateway_dir.join(crate::mesh_media::JELLYFIN_GATEWAY_REGISTRY_FILE),
+            serde_json::to_string(&reg).unwrap(),
+        )
+        .unwrap();
+
+        let w = MediaSourcesWorker::new("elm".to_string(), wg.path().to_path_buf());
+        let sources = w.collect_sources();
+
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].origin, SourceOrigin::Gateway);
+        assert_eq!(sources[0].gateway_node.as_deref(), Some("gateway-a"));
+        assert_eq!(
+            sources[0].upstream_key.as_deref(),
+            Some("http://192.168.1.60:8096")
+        );
+    }
+
+    #[test]
     fn publish_gates_on_change_and_forces_on_heartbeat() {
         let (_bus, persist) = temp_persist();
         let wg = tempfile::tempdir().unwrap();
@@ -1159,6 +1265,6 @@ mod tests {
         assert_eq!(state.node, "elm");
         assert_eq!(state.sources.len(), 1);
         assert_eq!(state.sources[0].id, "jellyfin:oak:8096");
-        assert_eq!(state.lanes.len(), 2);
+        assert_eq!(state.lanes.len(), 3);
     }
 }

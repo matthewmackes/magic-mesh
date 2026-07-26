@@ -95,6 +95,9 @@ fn every_event_kind() -> Vec<CollabEventKind> {
         CollabEventKind::ThreadResolved {
             thread: ThreadId::new(),
         },
+        CollabEventKind::ThreadReopened {
+            thread: ThreadId::new(),
+        },
         CollabEventKind::AlertRaised {
             alert: alert.clone(),
         },
@@ -256,6 +259,14 @@ fn every_command() -> Vec<CollabCommand> {
             thread: ThreadId::new(),
             body: MessageBody::new("+1"),
         },
+        CollabCommand::ResolveThread {
+            space: SpaceId::new(),
+            thread: ThreadId::new(),
+        },
+        CollabCommand::ReopenThread {
+            space: SpaceId::new(),
+            thread: ThreadId::new(),
+        },
         CollabCommand::AckAlert {
             space: SpaceId::new(),
             alert: EventId::new(),
@@ -409,7 +420,7 @@ fn every_event_kind_round_trips_and_has_a_unique_tag() {
         );
     }
     // Guards against a variant being added without an accompanying sample here.
-    assert_eq!(tags.len(), 35, "sample set must cover every event kind");
+    assert_eq!(tags.len(), 36, "sample set must cover every event kind");
 }
 
 #[test]
@@ -422,7 +433,7 @@ fn every_command_round_trips_and_has_a_unique_verb() {
         assert_eq!(*c, back, "round-trip {}", c.verb());
         assert!(verbs.insert(c.verb()), "duplicate verb {}", c.verb());
     }
-    assert_eq!(verbs.len(), 42, "sample set must cover every command");
+    assert_eq!(verbs.len(), 44, "sample set must cover every command");
 }
 
 /// The delivery-lock gate: each of the seven replaced subsystems must have at

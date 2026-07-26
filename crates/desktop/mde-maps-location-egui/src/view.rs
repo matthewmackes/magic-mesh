@@ -3820,8 +3820,23 @@ fn admin_section_button(
         FontId::proportional(Style::SMALL),
         Style::TEXT,
     );
-    let width =
-        (galley.size().x + Style::SP_M + Style::SP_S).clamp(96.0, ui.available_width().max(96.0));
+    // The Admin page is rendered inside the shell-reserved workspace, and on
+    // short/narrow seats the content pane can be smaller than the comfortable
+    // 96 px chip width.  Do not let the chip allocate beyond the current
+    // visible lane: an escaped `interact` rect is exactly how the old
+    // "advanced" menu targets became visible-looking but unclickable.
+    let visible_lane = ui.available_rect_before_wrap().intersect(ui.clip_rect());
+    let screen = ui.ctx().screen_rect();
+    let cursor_left = ui.cursor().left().max(screen.left());
+    let right_edge = visible_lane
+        .right()
+        .min(ui.max_rect().right())
+        .min(screen.right());
+    let available = (right_edge - cursor_left)
+        .max(1.0)
+        .min(ui.available_width().max(1.0));
+    let minimum = 96.0_f32.min(available);
+    let width = (galley.size().x + Style::SP_M + Style::SP_S).clamp(minimum, available);
     let size = egui::vec2(width, Style::SP_XL);
     let (_, rect) = ui.allocate_space(size);
     let response = ui.interact(rect, admin_section_item_id(section), Sense::click());
@@ -4441,8 +4456,8 @@ fn show_mg90_setup(
         .map_or(0, |index| index + 1);
     let total = SetupStep::ALL.len();
 
-    let col_w = split_width(ui, 2);
-    ui.horizontal_top(|ui| {
+    let col_w = responsive_column_width(ui, 2, ADMIN_CARD_MIN_WIDTH);
+    ui.horizontal_wrapped(|ui| {
         ui.scope(|ui| {
             ui.set_width(col_w);
             glyph_card(ui, "view-grid", "Device inventory", Style::ACCENT, |ui| {
@@ -4564,7 +4579,7 @@ fn show_mg90_setup(
         });
     });
     ui.add_space(Style::SP_S);
-    ui.horizontal_top(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.scope(|ui| {
             ui.set_width(col_w);
             glyph_card(
@@ -4818,8 +4833,8 @@ fn show_firmware_recovery(ui: &mut egui::Ui, firmware: &FirmwareWorkflow, device
         Style::DANGER,
     );
     ui.add_space(Style::SP_S);
-    let col_w = split_width(ui, 2);
-    ui.horizontal_top(|ui| {
+    let col_w = responsive_column_width(ui, 2, ADMIN_CARD_MIN_WIDTH);
+    ui.horizontal_wrapped(|ui| {
         ui.scope(|ui| {
             ui.set_width(col_w);
             glyph_card(ui, "download", "Firmware lifecycle", Style::ACCENT, |ui| {
@@ -6232,6 +6247,40 @@ mod tests {
         click_admin_section(&ctx, &mut surface, screen, AdminSection::Mg90Settings);
         assert_eq!(surface.active, WorkspaceTab::Admin);
         assert_eq!(surface.admin_section, AdminSection::Mg90Settings);
+    }
+
+    #[test]
+    fn admin_section_strip_hit_targets_clamp_to_tiny_visible_lane() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        ctx.style_mut(|style| style.animation_time = 0.0);
+
+        // Regresses the off-page "Advanced"/MG90 menu failure: after shell
+        // chrome, rail, and content margins, the Admin section lane can be
+        // narrower than the old hard-coded 96 px chip width. Each registered
+        // hit target must stay inside the lane it paints in.
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(72.0, 760.0));
+        let mut surface = MapsLocationSurface::simulated();
+        surface.active = WorkspaceTab::Admin;
+        surface.admin_section = AdminSection::Vehicle;
+
+        render_admin_frame(&ctx, &mut surface, screen, Vec::new());
+
+        for section in AdminSection::ALL {
+            let target = ctx
+                .read_response(admin_section_item_id(section))
+                .unwrap_or_else(|| panic!("{section:?} admin section should register"));
+            assert!(target.rect.is_positive(), "{section:?} lost its hit target");
+            assert!(
+                screen.contains_rect(target.rect),
+                "{section:?} escaped the visible Admin lane: {:?}",
+                target.rect
+            );
+        }
+
+        click_admin_section(&ctx, &mut surface, screen, AdminSection::FirmwareRecovery);
+        assert_eq!(surface.active, WorkspaceTab::Admin);
+        assert_eq!(surface.admin_section, AdminSection::FirmwareRecovery);
     }
 
     #[test]

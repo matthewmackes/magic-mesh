@@ -2,10 +2,10 @@
 //!
 //! PLATFORM-INTERFACES Q31/Q32: the home is **persistent split cards** — the Nav
 //! card (largest), the Media / now-playing card, and the glance card (vehicle
-//! telematics + comms alerts) — over a compact single-row **six-app strip**:
-//! Nav / Media / Music / Comms / Vehicle / Settings. The Airspace TILE is gone
+//! telematics + Mesh Teams alerts) — over a compact single-row **six-app strip**:
+//! Nav / Media / Music / Mesh Teams / Vehicle / Settings. The Airspace TILE is gone
 //! (the radar stays a Maps tab + keeps its keymap actions); the Phone tile's
-//! calls live in the Communications hub. Everything paints on the kept SYNC3
+//! calls live in the Mesh Teams hub. Everything paints on the kept SYNC3
 //! dark + Ford-blue palette (Q30); glance values are honest — absent data reads
 //! as a plain descriptor, never a fabricated number (Q35/P8).
 //!
@@ -23,7 +23,7 @@ use crate::surfaces::{self, Surface};
 ///
 /// PLATFORM-INTERFACES Q32 — exactly six: the Airspace tile is dropped (the
 /// radar remains a Maps tab reachable from Nav + the keymap), the Phone tile is
-/// folded into Comms (WL-FUNC-011 folded Voice's calls into Communications),
+/// folded into Mesh Teams (WL-FUNC-011 folded Voice's calls into Mesh Teams),
 /// and Music (split from Media) joins the roster.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CarTile {
@@ -33,7 +33,7 @@ pub enum CarTile {
     Media,
     /// Music — the dedicated music surface (Q32: new tile, split from Media).
     Music,
-    /// Communications — calls + alerts + messages (the Phone tile folded in).
+    /// Mesh Teams — calls + alerts + messages (the Phone tile folded in).
     Comms,
     /// Vehicle telematics (opens the Maps surface on its Vehicle tab).
     Vehicle,
@@ -53,7 +53,7 @@ impl CarTile {
             Self::Nav => "Nav",
             Self::Media => "Med",
             Self::Music => "Mus",
-            Self::Comms => "Com",
+            Self::Comms => "Team",
             Self::Vehicle => "Veh",
             Self::Settings => "Set",
         }
@@ -95,7 +95,7 @@ impl CarTile {
             Self::Nav => "Navigation",
             Self::Media => "Media",
             Self::Music => "Music",
-            Self::Comms => "Comms",
+            Self::Comms => "Mesh Teams",
             Self::Vehicle => "Vehicle",
             Self::Settings => "Settings",
         }
@@ -108,7 +108,7 @@ impl CarTile {
             Self::Nav => IconId::MapsLocation,
             Self::Media => IconId::Media,
             Self::Music => IconId::Music,
-            Self::Comms => IconId::Share,
+            Self::Comms => IconId::Teams,
             Self::Vehicle => IconId::HealthStatus,
             Self::Settings => IconId::Settings,
         }
@@ -122,7 +122,7 @@ impl CarTile {
             Self::Media => Surface::Media,
             Self::Music => Surface::Music,
             // WL-FUNC-011 Phase-2 — the retired Voice surface's calls live in the
-            // Communications hub; Q32 folds the old Phone tile in here too.
+            // Mesh Teams hub; Q32 folds the old Phone tile in here too.
             Self::Comms => Surface::Communications,
             Self::Settings => Surface::System,
         }
@@ -136,7 +136,7 @@ impl CarTile {
         match self {
             Self::Nav => Style::ACCENT_MESH,
             Self::Media | Self::Music => Style::ACCENT_MEDIA,
-            Self::Comms => Style::ACCENT,
+            Self::Comms => Style::ACCENT_TEAMS,
             Self::Vehicle => Style::OK,
             Self::Settings => Style::ACCENT_SYSTEM,
         }
@@ -749,8 +749,8 @@ fn paint_glance_card(ui: &mut Ui, painter: &egui::Painter, rect: Rect, g: &CarHo
             ui,
             &p,
             comms_row,
-            IconId::Share,
-            Style::SYNC3_ACCENT,
+            IconId::Teams,
+            Style::ACCENT_TEAMS,
             &g.comms_line(),
             g.comms.is_some_and(|n| n > 0),
         );
@@ -851,6 +851,9 @@ mod tests {
         assert_eq!(CarTile::Media.surface(), Surface::Media);
         assert_eq!(CarTile::Music.surface(), Surface::Music);
         assert_eq!(CarTile::Comms.surface(), Surface::Communications);
+        assert_eq!(CarTile::Comms.label(), "Mesh Teams");
+        assert_eq!(CarTile::Comms.icon(), IconId::Teams);
+        assert_eq!(CarTile::Comms.accent(), Style::ACCENT_TEAMS);
         assert_eq!(CarTile::Vehicle.surface(), Surface::MapsLocation);
         assert_eq!(CarTile::Settings.surface(), Surface::System);
     }

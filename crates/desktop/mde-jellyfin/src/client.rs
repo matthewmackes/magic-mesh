@@ -1204,6 +1204,21 @@ mod tests {
     }
 
     #[test]
+    fn gateway_base_path_is_preserved_for_items_requests() {
+        let req = build_items_request(
+            "http://seat-15.mesh:8097/mde/jellyfin/jellyfin-seat-15-abcd/",
+            "mesh-gateway-user",
+            &ItemsQuery::default().recursive(),
+            &device(),
+            Some("PROXY"),
+        );
+        assert_eq!(
+            req.url,
+            "http://seat-15.mesh:8097/mde/jellyfin/jellyfin-seat-15-abcd/Users/mesh-gateway-user/Items?Recursive=true"
+        );
+    }
+
+    #[test]
     fn search_term_is_percent_encoded() {
         let q = ItemsQuery::default().search_term("the martian");
         let req = build_items_request("https://j.mesh", "u", &q, &device(), None);

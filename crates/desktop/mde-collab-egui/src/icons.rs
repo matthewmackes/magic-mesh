@@ -12,7 +12,7 @@ use mde_egui::egui;
 
 use mde_collab_types::{ClipItemKind, DeliveryState, Severity, SpaceKind};
 
-use crate::{ActivityFilter, Mode};
+use crate::{ActivityFilter, ChannelTab, MeshTeamsApp};
 
 /// The Carbon glyph for a space kind's rail row.
 #[must_use]
@@ -25,18 +25,28 @@ pub const fn space_kind_icon(kind: SpaceKind) -> &'static str {
     }
 }
 
-/// The Carbon glyph for a mode tab.
+/// The Carbon glyph for a Teams-style app-rail route.
 #[must_use]
-pub const fn mode_icon(mode: Mode) -> &'static str {
-    match mode {
-        Mode::Activity => "view",
-        Mode::Messages => "share",
-        Mode::Calls => "audio-volume-high",
-        Mode::Files => "download",
-        Mode::Transfers => "view-refresh",
-        Mode::Documents => "document-edit",
-        Mode::Alerts => "notification",
-        Mode::Clipboard => "text-x-generic",
+pub const fn app_icon(app: MeshTeamsApp) -> &'static str {
+    match app {
+        MeshTeamsApp::Activity => "view",
+        MeshTeamsApp::Teams => "view-grid",
+        MeshTeamsApp::Calls => "audio-volume-high",
+        MeshTeamsApp::Files => "download",
+        MeshTeamsApp::Alerts => "notification",
+        MeshTeamsApp::Transfers => "view-refresh",
+        MeshTeamsApp::Clipboard => "text-x-generic",
+        MeshTeamsApp::Settings => "changes-prevent",
+    }
+}
+
+/// The Carbon glyph for the selected channel's Posts / Files / Calls tab.
+#[must_use]
+pub const fn channel_tab_icon(tab: ChannelTab) -> &'static str {
+    match tab {
+        ChannelTab::Posts => "share",
+        ChannelTab::Files => "download",
+        ChannelTab::Calls => "audio-volume-high",
     }
 }
 
@@ -93,6 +103,10 @@ pub const EDIT: &str = "document-edit";
 pub const DELETE: &str = "list-remove";
 /// Open / anchor a reply thread.
 pub const THREAD: &str = "go-next";
+/// Mark a thread resolved.
+pub const THREAD_RESOLVE: &str = "emblem-ok";
+/// Reopen a resolved thread.
+pub const THREAD_REOPEN: &str = "view-refresh";
 
 /// Start a call in the selected space.
 pub const CALL_START: &str = "media-playback-start";

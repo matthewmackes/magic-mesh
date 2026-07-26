@@ -1,8 +1,8 @@
 //! Keyless NCDOT TIMS traffic-event model and painter (OVERLAY-3).
 
 use mackes_mesh_types::traffic::{TrafficEvent, TrafficSnapshot, ATTRIBUTION};
-use mde_egui::egui::{self, Color32, FontId, Painter, Pos2, Rect, Shape, Stroke};
-use mde_egui::Style;
+use mde_egui::egui::{self, Color32, Painter, Pos2, Rect, Shape, Stroke};
+use mde_egui::{Style, TypographyRole};
 
 /// Five missed one-minute polls make retained traffic visibly stale.
 pub const SNAPSHOT_STALE_AFTER_MS: i64 = 5 * 60 * 1_000;
@@ -30,12 +30,10 @@ impl TrafficLayerState {
     /// Age since the last successful fetch or conditional validation.
     #[must_use]
     pub fn age_ms(&self, now_ms: i64) -> Option<i64> {
-        self.snapshot
-            .as_ref()
-            .and_then(|snapshot| {
-                (!self.future_dated(now_ms))
-                    .then(|| now_ms.saturating_sub(snapshot.fetched_at_ms).max(0))
-            })
+        self.snapshot.as_ref().and_then(|snapshot| {
+            (!self.future_dated(now_ms))
+                .then(|| now_ms.saturating_sub(snapshot.fetched_at_ms).max(0))
+        })
     }
 
     /// Whether the retained fetch timestamp is too far ahead of the consumer
@@ -190,7 +188,7 @@ fn paint_age_badge(painter: &Painter, rect: Rect, layer: &TrafficLayerState, now
         ),
         (Some(_), None) => ("NCDOT traffic · no timestamp".to_string(), Style::WARN),
     };
-    let galley = painter.layout_no_wrap(label, FontId::proportional(Style::SMALL), tone);
+    let galley = painter.layout_job(traffic_badge_layout_job(label, tone));
     let pad = egui::vec2(Style::SP_S, Style::SP_XS);
     let row_height = galley.size().y + pad.y * 2.0 + Style::SP_XS;
     let badge = Rect::from_min_size(
@@ -208,6 +206,10 @@ fn paint_age_badge(painter: &Painter, rect: Rect, layer: &TrafficLayerState, now
         egui::StrokeKind::Inside,
     );
     painter.galley(badge.left_top() + pad, galley, tone);
+}
+
+fn traffic_badge_layout_job(label: String, tone: Color32) -> egui::text::LayoutJob {
+    Style::typography_job(label, TypographyRole::Caption, tone, f32::INFINITY)
 }
 
 fn event_count_label(snapshot: &TrafficSnapshot) -> String {
@@ -252,6 +254,25 @@ mod tests {
             updated_at_ms: Some(now),
         });
         snapshot
+    }
+
+    #[test]
+    fn traffic_badge_uses_shared_caption_typography_contract() {
+        let job = traffic_badge_layout_job("NCDOT traffic · no data".to_string(), Style::TEXT_DIM);
+        let section = job.sections.first().expect("single caption section");
+        assert_eq!(
+            section.format.font_id,
+            Style::typography_font(TypographyRole::Caption)
+        );
+        assert_eq!(
+            section.format.extra_letter_spacing,
+            TypographyRole::Caption.letter_spacing()
+        );
+        assert_eq!(
+            section.format.line_height,
+            Some(TypographyRole::Caption.line_height())
+        );
+        assert_eq!(section.format.color, Style::TEXT_DIM);
     }
 
     #[test]
@@ -353,9 +374,7 @@ mod tests {
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let rect = ui.max_rect();
-                stats = paint_layer(ui.painter(), rect, &layer, now, |_, _| {
-                    Some(rect.center())
-                });
+                stats = paint_layer(ui.painter(), rect, &layer, now, |_, _| Some(rect.center()));
             });
         });
         assert_eq!(stats.markers, 0);

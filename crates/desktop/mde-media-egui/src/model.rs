@@ -13,6 +13,11 @@
 //! the default build — the whole controller is unit-tested below (the transport glue
 //! against the real player, the browse/source/OSD folds as pure functions).
 
+use mackes_mesh_types::media_sources::{
+    MediaKind as MeshMediaKind, MediaSource as MeshMediaSource, MediaSourcesState,
+    Reachability as MeshReachability, SourceOrigin as MeshSourceOrigin,
+    JELLYFIN_GATEWAY_USER_SENTINEL,
+};
 use mde_jellyfin::{
     build_playback_decision, direct_play_url, BaseItemDto, CacheEntry, CacheRequest,
     ClientCapabilities, HttpTransport, ItemsQuery, JellyfinClient, JellyfinError, MediaSourceInfo,
@@ -232,6 +237,39 @@ pub struct JellyfinSourceRow {
     pub profiles: Vec<JellyfinProfileRow>,
 }
 
+/// A Jellyfin source discovered through the mesh `state/media/sources` roster.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeshJellyfinSourceRow {
+    /// The stable mesh roster source id.
+    pub id: String,
+    /// Display label.
+    pub label: String,
+    /// The dialable endpoint published by the mesh roster.
+    pub endpoint: String,
+    /// Human-readable origin label.
+    pub origin_label: String,
+    /// Whether the roster says this source should answer.
+    pub reachable: bool,
+    /// Honest degraded/unreachable reason, if any.
+    pub reason: Option<String>,
+    /// Gateway node, when this row comes from a gateway source.
+    pub gateway_node: Option<String>,
+    /// Whether this source is the mesh-wide default.
+    pub mesh_default: bool,
+    /// The source the controller would use for mesh Jellyfin traffic now after
+    /// applying reachability/default failover.
+    pub selected: bool,
+    /// The user's explicit preferred source, even if it is currently degraded
+    /// and failover is selecting another reachable source.
+    pub preferred: bool,
+    /// Sealed credential reference; never a plaintext token.
+    pub credential_ref: Option<String>,
+    /// Canonical upstream key for dedupe/debug display.
+    pub upstream_key: Option<String>,
+    /// The mesh discovery origin.
+    pub origin: MeshSourceOrigin,
+}
+
 /// One user profile of a Jellyfin server, as a switcher chip (MEDIA-11).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JellyfinProfileRow {
@@ -301,6 +339,13 @@ pub struct JellyfinState {
     /// The managed offline cache (MEDIA-11) — downloaded titles + their manifest,
     /// with the add / evict / size-budget / staleness lifecycle.
     cache: OfflineCache,
+    /// Latest mesh-published media-source roster (`state/media/sources`). This is
+    /// separate from [`ServerStore`]: gateway rows are visible before credential
+    /// materialization exists, but they do not become local saved-token servers.
+    mesh_sources: Option<MediaSourcesState>,
+    /// User-preferred mesh Jellyfin source id. The active route uses this only
+    /// while the roster says it is reachable, otherwise it fails over honestly.
+    selected_mesh_source: Option<String>,
 }
 
 impl Default for JellyfinState {
@@ -312,6 +357,8 @@ impl Default for JellyfinState {
             selected: None,
             session: None,
             cache: OfflineCache::new(),
+            mesh_sources: None,
+            selected_mesh_source: None,
         }
     }
 }
@@ -357,6 +404,12 @@ impl JellyfinState {
     #[must_use]
     pub const fn cache(&self) -> &OfflineCache {
         &self.cache
+    }
+
+    /// Latest mesh-published media-source roster.
+    #[must_use]
+    pub const fn mesh_sources(&self) -> Option<&MediaSourcesState> {
+        self.mesh_sources.as_ref()
     }
 }
 
@@ -1401,6 +1454,131 @@ impl<E: MediaEngine> MediaController<E> {
             .collect()
     }
 
+    /// Replace the mesh-published media-source roster the Sources view projects.
+    ///
+    /// This is a pure state seam. The live Bus reader lands outside the local
+    /// server token store and feeds this method with the decoded
+    /// `state/media/sources` record.
+    pub fn set_mesh_media_sources(&mut self, state: Option<MediaSourcesState>) {
+        self.jellyfin.mesh_sources = state;
+    }
+
+    /// Select a mesh-published Jellyfin source as this user's preference.
+    ///
+    /// This does not materialize credentials or mutate the local Jellyfin
+    /// [`ServerStore`]. The active route still fails over when the preferred row
+    /// is degraded/unreachable.
+    pub fn select_mesh_jellyfin_source(&mut self, id: &str) -> bool {
+        let id = id.trim();
+        if id.is_empty() {
+            return false;
+        }
+        if self
+            .mesh_jellyfin_sources()
+            .iter()
+            .any(|source| source.id == id)
+        {
+            self.jellyfin.selected_mesh_source = Some(id.to_owned());
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Jellyfin rows discovered from the mesh media-source roster. Gateway rows
+    /// sort before direct mesh/mDNS discoveries, while degraded gateways stay
+    /// visible with their reason.
+    #[must_use]
+    pub fn mesh_jellyfin_sources(&self) -> Vec<MeshJellyfinSourceRow> {
+        let Some(state) = self.jellyfin.mesh_sources() else {
+            return Vec::new();
+        };
+        let mut sources: Vec<&MeshMediaSource> = state
+            .sources
+            .iter()
+            .filter(|source| source.kind == MeshMediaKind::Jellyfin)
+            .collect();
+        sources.sort_by(|a, b| {
+            mesh_source_priority(a)
+                .cmp(&mesh_source_priority(b))
+                .then_with(|| a.node.to_lowercase().cmp(&b.node.to_lowercase()))
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        let active_id = select_mesh_jellyfin_source_now(
+            &sources,
+            self.jellyfin.selected_mesh_source.as_deref(),
+        )
+        .map(|source| source.id.clone());
+        let preferred_id = self.jellyfin.selected_mesh_source.as_deref();
+        sources
+            .into_iter()
+            .map(|source| MeshJellyfinSourceRow {
+                id: source.id.clone(),
+                label: source.name.clone(),
+                endpoint: source.endpoint.clone(),
+                origin_label: mesh_source_origin_label(source),
+                reachable: source.reachability == MeshReachability::Reachable,
+                reason: source.reason.clone(),
+                gateway_node: source.gateway_node.clone(),
+                mesh_default: source.mesh_default == Some(true),
+                selected: active_id.as_deref() == Some(source.id.as_str()),
+                preferred: preferred_id == Some(source.id.as_str()),
+                credential_ref: source.credential_ref.clone(),
+                upstream_key: source.upstream_key.clone(),
+                origin: source.origin,
+            })
+            .collect()
+    }
+
+    /// The mesh-published Jellyfin source the controller would use now after
+    /// applying preference/default/failover. This is a pure read over the
+    /// retained roster; credential materialization remains separately gated.
+    #[must_use]
+    pub fn active_mesh_jellyfin_source(&self) -> Option<MeshJellyfinSourceRow> {
+        self.mesh_jellyfin_sources()
+            .into_iter()
+            .find(|source| source.selected)
+    }
+
+    /// Build a gateway-scoped Jellyfin client for the active mesh source.
+    ///
+    /// The client receives only a gateway endpoint, a non-secret placeholder
+    /// token, and [`JELLYFIN_GATEWAY_USER_SENTINEL`]. The real upstream Jellyfin
+    /// token/user id stay sealed in the gateway daemon; this method intentionally
+    /// never writes gateway rows into the local saved-token [`ServerStore`].
+    pub fn mesh_gateway_jellyfin_client<T: HttpTransport>(
+        &self,
+        device: mde_jellyfin::ClientInfo,
+        transport: T,
+    ) -> Result<JellyfinClient<T>, String> {
+        let source = self
+            .active_mesh_jellyfin_source()
+            .ok_or_else(|| "No mesh Jellyfin source is available.".to_string())?;
+        if source.origin != MeshSourceOrigin::Gateway {
+            return Err("Active mesh Jellyfin source is not a gateway route.".to_string());
+        }
+        if !source.reachable {
+            return Err(format!(
+                "Mesh Jellyfin gateway {} is unavailable.",
+                source.label
+            ));
+        }
+        if source
+            .credential_ref
+            .as_deref()
+            .map(str::trim)
+            .filter(|credential_ref| !credential_ref.is_empty())
+            .is_none()
+        {
+            return Err(
+                "Mesh Jellyfin gateway is missing a sealed credential reference.".to_string(),
+            );
+        }
+        Ok(JellyfinClient::new(source.endpoint, device, transport)
+            .with_auth("mde-gateway-proxy", JELLYFIN_GATEWAY_USER_SENTINEL))
+    }
+
     /// The materialized items of the last Jellyfin browse — the playable rows.
     #[must_use]
     pub fn jellyfin_items(&self) -> &[BaseItemDto] {
@@ -1768,6 +1946,73 @@ pub fn profile_label(auth: &ServerAuth) -> String {
         .unwrap_or_else(|| auth.user_id.clone())
 }
 
+fn mesh_source_priority(source: &MeshMediaSource) -> (u8, u8, u8) {
+    let origin = match source.origin {
+        MeshSourceOrigin::Gateway => 0,
+        MeshSourceOrigin::MeshPeer => 1,
+        MeshSourceOrigin::Mdns => 2,
+    };
+    let default = if source.mesh_default == Some(true) {
+        0
+    } else {
+        1
+    };
+    let reachability = match source.reachability {
+        MeshReachability::Reachable => 0,
+        MeshReachability::Unknown => 1,
+        MeshReachability::Unreachable => 2,
+    };
+    (origin, default, reachability)
+}
+
+fn mesh_source_origin_label(source: &MeshMediaSource) -> String {
+    match source.origin {
+        MeshSourceOrigin::Gateway => source.gateway_node.as_deref().map_or_else(
+            || "Gateway".to_string(),
+            |node| format!("Gateway via {node}"),
+        ),
+        MeshSourceOrigin::MeshPeer => "Mesh peer".to_string(),
+        MeshSourceOrigin::Mdns => "LAN mDNS".to_string(),
+    }
+}
+
+fn select_mesh_jellyfin_source_now<'a>(
+    sources: &[&'a MeshMediaSource],
+    last_selected: Option<&str>,
+) -> Option<&'a MeshMediaSource> {
+    if let Some(last_selected) = last_selected.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(source) = sources
+            .iter()
+            .copied()
+            .find(|source| source.id == last_selected && mesh_source_reachable(source))
+        {
+            return Some(source);
+        }
+    }
+
+    sources
+        .iter()
+        .copied()
+        .find(|source| source.mesh_default == Some(true) && mesh_source_reachable(source))
+        .or_else(|| {
+            sources
+                .iter()
+                .copied()
+                .find(|source| mesh_source_reachable(source))
+        })
+        .or_else(|| {
+            sources
+                .iter()
+                .copied()
+                .find(|source| source.mesh_default == Some(true))
+        })
+        .or_else(|| sources.first().copied())
+}
+
+fn mesh_source_reachable(source: &MeshMediaSource) -> bool {
+    source.reachability == MeshReachability::Reachable
+}
+
 /// A compact human byte size (`"0 B"`, `"812 MB"`, `"1.4 GB"`) for the offline
 /// list. Binary units (1024) matching the cache budget; a pure fold, so it is
 /// unit-tested.
@@ -2048,6 +2293,9 @@ pub fn now_playing_title<E: MediaEngine>(player: &Player<E>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mackes_mesh_types::media_sources::{
+        LaneStatus as MeshLaneStatus, MediaProtocol as MeshMediaProtocol,
+    };
     use mde_jellyfin::{ClientInfo, HttpRequest, HttpResponse, MediaStream, TransportError};
     use mde_media_core::{FakeMpv, MediaMetadata};
 
@@ -3189,6 +3437,273 @@ mod tests {
         let b = rows.iter().find(|r| r.id == "b").expect("b row");
         assert!(b.selected);
         assert!(!b.signed_in);
+    }
+
+    fn mesh_jellyfin_source(
+        id: &str,
+        origin: MeshSourceOrigin,
+        reachability: MeshReachability,
+    ) -> MeshMediaSource {
+        MeshMediaSource {
+            id: id.to_string(),
+            name: format!("Jellyfin {id}"),
+            node: match origin {
+                MeshSourceOrigin::Gateway => "gateway-a".to_string(),
+                MeshSourceOrigin::MeshPeer => "peer-a".to_string(),
+                MeshSourceOrigin::Mdns => "192.168.1.60".to_string(),
+            },
+            kind: MeshMediaKind::Jellyfin,
+            host: "gateway-a.mesh".to_string(),
+            port: Some(8097),
+            endpoint: format!("http://gateway-a.mesh:8097/mde/jellyfin/{id}"),
+            protocols: vec![MeshMediaProtocol::Jellyfin],
+            origin,
+            reachability,
+            reason: (reachability == MeshReachability::Unreachable)
+                .then(|| "gateway degraded".to_string()),
+            gateway_node: (origin == MeshSourceOrigin::Gateway).then(|| "gateway-a".to_string()),
+            upstream_key: Some("http://192.168.1.60:8096".to_string()),
+            credential_ref: (origin == MeshSourceOrigin::Gateway)
+                .then(|| "media/jellyfin/shared-readonly".to_string()),
+            mesh_default: (origin == MeshSourceOrigin::Gateway).then_some(true),
+        }
+    }
+
+    fn mesh_jellyfin_state(sources: Vec<MeshMediaSource>) -> MediaSourcesState {
+        MediaSourcesState {
+            node: "seat-15".to_string(),
+            sources,
+            lanes: vec![MeshLaneStatus {
+                lane: "gateway".to_string(),
+                status: "ok".to_string(),
+            }],
+            published_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn mesh_jellyfin_sources_project_gateway_rows_ahead_of_direct_sources() {
+        let mut c = controller();
+        c.set_mesh_media_sources(Some(MediaSourcesState {
+            node: "seat-15".to_string(),
+            sources: vec![
+                mesh_jellyfin_source(
+                    "direct",
+                    MeshSourceOrigin::MeshPeer,
+                    MeshReachability::Reachable,
+                ),
+                mesh_jellyfin_source(
+                    "gateway",
+                    MeshSourceOrigin::Gateway,
+                    MeshReachability::Reachable,
+                ),
+            ],
+            lanes: vec![MeshLaneStatus {
+                lane: "gateway".to_string(),
+                status: "ok".to_string(),
+            }],
+            published_at_ms: 1,
+        }));
+
+        let rows = c.mesh_jellyfin_sources();
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            vec!["gateway", "direct"]
+        );
+        assert_eq!(rows[0].origin, MeshSourceOrigin::Gateway);
+        assert_eq!(rows[0].origin_label, "Gateway via gateway-a");
+        assert!(rows[0].mesh_default);
+        assert_eq!(
+            rows[0].credential_ref.as_deref(),
+            Some("media/jellyfin/shared-readonly")
+        );
+        assert_eq!(c.jellyfin().store().servers.len(), 0);
+    }
+
+    #[test]
+    fn mesh_jellyfin_sources_keep_degraded_gateways_visible() {
+        let mut c = controller();
+        c.set_mesh_media_sources(Some(mesh_jellyfin_state(vec![mesh_jellyfin_source(
+            "gateway",
+            MeshSourceOrigin::Gateway,
+            MeshReachability::Unreachable,
+        )])));
+
+        let rows = c.mesh_jellyfin_sources();
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].reachable);
+        assert_eq!(rows[0].reason.as_deref(), Some("gateway degraded"));
+        assert_eq!(
+            rows[0].upstream_key.as_deref(),
+            Some("http://192.168.1.60:8096")
+        );
+    }
+
+    #[test]
+    fn mesh_jellyfin_selection_keeps_healthy_last_then_fails_over() {
+        let mut c = controller();
+        let mut mesh_default = mesh_jellyfin_source(
+            "default",
+            MeshSourceOrigin::Gateway,
+            MeshReachability::Reachable,
+        );
+        mesh_default.name = "Gateway Default".to_string();
+        mesh_default.mesh_default = Some(true);
+        mesh_default.upstream_key = Some("http://default.lan:8096".to_string());
+
+        let mut preferred = mesh_jellyfin_source(
+            "preferred",
+            MeshSourceOrigin::Gateway,
+            MeshReachability::Reachable,
+        );
+        preferred.name = "Gateway Preferred".to_string();
+        preferred.mesh_default = Some(false);
+        preferred.upstream_key = Some("http://preferred.lan:8096".to_string());
+
+        let mut direct = mesh_jellyfin_source(
+            "direct",
+            MeshSourceOrigin::MeshPeer,
+            MeshReachability::Reachable,
+        );
+        direct.name = "Direct Mesh Jellyfin".to_string();
+        direct.mesh_default = None;
+        direct.upstream_key = Some("http://direct.mesh:8096".to_string());
+
+        c.set_mesh_media_sources(Some(mesh_jellyfin_state(vec![
+            mesh_default.clone(),
+            preferred.clone(),
+        ])));
+        assert_eq!(
+            c.active_mesh_jellyfin_source().map(|row| row.id),
+            Some("default".to_string())
+        );
+
+        assert!(c.select_mesh_jellyfin_source("preferred"));
+        let rows = c.mesh_jellyfin_sources();
+        let preferred_row = rows.iter().find(|row| row.id == "preferred").unwrap();
+        assert!(preferred_row.selected);
+        assert!(preferred_row.preferred);
+        assert_eq!(
+            c.active_mesh_jellyfin_source().map(|row| row.id),
+            Some("preferred".to_string())
+        );
+
+        preferred.reachability = MeshReachability::Unreachable;
+        preferred.reason = Some("gateway degraded".to_string());
+        c.set_mesh_media_sources(Some(mesh_jellyfin_state(vec![
+            mesh_default.clone(),
+            preferred.clone(),
+        ])));
+        let rows = c.mesh_jellyfin_sources();
+        let default_row = rows.iter().find(|row| row.id == "default").unwrap();
+        let preferred_row = rows.iter().find(|row| row.id == "preferred").unwrap();
+        assert!(default_row.selected);
+        assert!(preferred_row.preferred);
+        assert!(!preferred_row.selected);
+        assert_eq!(
+            c.active_mesh_jellyfin_source().map(|row| row.id),
+            Some("default".to_string())
+        );
+
+        mesh_default.reachability = MeshReachability::Unreachable;
+        mesh_default.reason = Some("gateway degraded".to_string());
+        c.set_mesh_media_sources(Some(mesh_jellyfin_state(vec![
+            mesh_default.clone(),
+            direct,
+        ])));
+        assert_eq!(
+            c.active_mesh_jellyfin_source().map(|row| row.id),
+            Some("direct".to_string())
+        );
+
+        c.set_mesh_media_sources(Some(mesh_jellyfin_state(vec![mesh_default])));
+        assert_eq!(
+            c.active_mesh_jellyfin_source().map(|row| row.id),
+            Some("default".to_string())
+        );
+        assert!(!c.select_mesh_jellyfin_source("missing"));
+    }
+
+    #[derive(Debug)]
+    struct MeshGatewayStub;
+    impl HttpTransport for MeshGatewayStub {
+        fn execute(&self, request: &HttpRequest) -> Result<HttpResponse, TransportError> {
+            assert!(
+                request
+                    .url
+                    .contains(&format!("/Users/{JELLYFIN_GATEWAY_USER_SENTINEL}/Items")),
+                "gateway client must use the non-secret user sentinel: {}",
+                request.url
+            );
+            assert!(
+                !request.url.contains("user-1"),
+                "gateway client must not materialize the real Jellyfin user id"
+            );
+            Ok(HttpResponse {
+                status: 200,
+                body: br#"{"Items":[{"Id":"m1","Name":"Movie One","Type":"Movie",
+                    "MediaSources":[{"Id":"s1","Container":"mkv","MediaStreams":[
+                    {"Type":"Video","Codec":"h264","Index":0},
+                    {"Type":"Audio","Codec":"aac","Index":1}]}]}],
+                    "TotalRecordCount":1,"StartIndex":0}"#
+                    .to_vec(),
+            })
+        }
+    }
+
+    #[test]
+    fn mesh_gateway_jellyfin_client_uses_sentinel_without_server_store_materialization() {
+        let mut c = controller();
+        c.set_mesh_media_sources(Some(mesh_jellyfin_state(vec![mesh_jellyfin_source(
+            "gateway",
+            MeshSourceOrigin::Gateway,
+            MeshReachability::Reachable,
+        )])));
+
+        let client = c
+            .mesh_gateway_jellyfin_client(jelly_device(), MeshGatewayStub)
+            .expect("gateway client");
+        assert_eq!(
+            client.base_url(),
+            "http://gateway-a.mesh:8097/mde/jellyfin/gateway"
+        );
+        assert_eq!(client.user_id(), Some(JELLYFIN_GATEWAY_USER_SENTINEL));
+        assert_eq!(c.jellyfin().store().servers.len(), 0);
+
+        let count = c
+            .browse_jellyfin(&client, &ItemsQuery::default().recursive())
+            .expect("browse through gateway");
+        assert_eq!(count, 1);
+        assert_eq!(c.jellyfin_items().len(), 1);
+        assert_eq!(c.jellyfin().store().servers.len(), 0);
+    }
+
+    #[test]
+    fn mesh_gateway_jellyfin_client_reports_unmaterializable_routes() {
+        let mut c = controller();
+        let mut direct = mesh_jellyfin_source(
+            "direct",
+            MeshSourceOrigin::MeshPeer,
+            MeshReachability::Reachable,
+        );
+        direct.mesh_default = None;
+        c.set_mesh_media_sources(Some(mesh_jellyfin_state(vec![direct])));
+        assert!(c
+            .mesh_gateway_jellyfin_client(jelly_device(), MeshGatewayStub)
+            .expect_err("direct is not a gateway")
+            .contains("not a gateway"));
+
+        let mut missing_credential = mesh_jellyfin_source(
+            "gateway",
+            MeshSourceOrigin::Gateway,
+            MeshReachability::Reachable,
+        );
+        missing_credential.credential_ref = None;
+        c.set_mesh_media_sources(Some(mesh_jellyfin_state(vec![missing_credential])));
+        assert!(c
+            .mesh_gateway_jellyfin_client(jelly_device(), MeshGatewayStub)
+            .expect_err("credential ref is required")
+            .contains("missing a sealed credential"));
     }
 
     #[test]

@@ -149,11 +149,12 @@ pub struct LocalPty {
     /// on the [`Self::spawn_argv`] path (`None` until then, and always `None`
     /// on the login-shell path, which never collects one).
     exit: Arc<Mutex<Option<ChildExit>>>,
-    /// A repaint waker the reader pump fires once per read batch, so PTY output
-    /// drives an immediate surface repaint instead of trailing the widget's
-    /// fixed self-timer (the render-lag fix). Shared with the reader thread;
-    /// `None` until a host installs one via [`Self::set_repaint_waker`] — a
-    /// headless [`LocalPty`] (the tests, any egui-free caller) never wakes.
+    /// A repaint waker the reader pump fires once per read batch, and the input
+    /// path fires once per accepted typed chunk, so PTY activity drives an
+    /// immediate surface repaint instead of trailing the widget's fixed
+    /// self-timer (the render-lag fix). Shared with the reader thread; `None`
+    /// until a host installs one via [`Self::set_repaint_waker`] — a headless
+    /// [`LocalPty`] (the tests, any egui-free caller) never wakes.
     /// The boxed `Fn` stays behind `dyn` so this crate keeps `unsafe_code =
     /// "forbid"` and never names an `egui::Context`.
     waker: Arc<Mutex<Option<Box<dyn Fn() + Send + Sync>>>>,
@@ -338,13 +339,21 @@ impl LocalPty {
     }
 
     /// Install a repaint waker the reader pump fires once per read batch, so
-    /// PTY output drives an immediate repaint instead of trailing the widget's
-    /// fixed self-timer. The host passes an `egui::Context::request_repaint`
-    /// closure here — kept behind a boxed `dyn Fn` so this crate never names an
-    /// `egui::Context` and stays `unsafe_code = "forbid"`. Replaces any prior
-    /// waker (the widget installs it once, on its first frame).
+    /// PTY output/input activity drives an immediate repaint instead of
+    /// trailing the widget's fixed self-timer. The host passes an
+    /// `egui::Context::request_repaint` closure here — kept behind a boxed
+    /// `dyn Fn` so this crate never names an `egui::Context` and stays
+    /// `unsafe_code = "forbid"`. Replaces any prior waker (the widget installs
+    /// it once, on its first frame).
     pub fn set_repaint_waker(&self, wake: impl Fn() + Send + Sync + 'static) {
         *lock_unpoisoned(&self.waker) = Some(Box::new(wake));
+    }
+
+    /// Test-only proof that the egui widget actually installed the backing
+    /// waker; production never branches on this private plumbing state.
+    #[cfg(test)]
+    pub(crate) fn has_repaint_waker(&self) -> bool {
+        lock_unpoisoned(&self.waker).is_some()
     }
 
     /// The shared engine state. The reader pump feeds it; the surface (and
@@ -368,10 +377,14 @@ impl LocalPty {
     /// [`ErrorKind::BrokenPipe`] once the session's write side is gone (the
     /// child exited or the session is closing).
     pub fn send_input(&self, bytes: &[u8]) -> io::Result<()> {
-        lock_unpoisoned(&self.input_tx)
+        let queued = lock_unpoisoned(&self.input_tx)
             .as_ref()
             .and_then(|tx| tx.send(bytes.to_vec()).ok())
-            .ok_or_else(|| ErrorKind::BrokenPipe.into())
+            .ok_or_else(|| ErrorKind::BrokenPipe.into());
+        if queued.is_ok() && !bytes.is_empty() {
+            wake_repaint(&self.waker);
+        }
+        queued
     }
 
     /// Resize the session to `cols × rows`: the engine grid reflows, and the
@@ -448,15 +461,21 @@ fn pump_output(
             Ok(0) => break,
             Ok(n) => {
                 lock_unpoisoned(terminal).feed(&buf[..n]);
-                if let Some(wake) = lock_unpoisoned(waker).as_ref() {
-                    wake();
-                }
+                wake_repaint(waker);
             }
             Err(err) if err.kind() == ErrorKind::Interrupted => {}
             Err(_) => break,
         }
     }
     output_closed.store(true, Ordering::Release);
+}
+
+/// Fire the installed repaint waker, if any. Kept as a tiny shared seam so the
+/// reader pump and the accepted-input path use identical locking behaviour.
+fn wake_repaint(waker: &Mutex<Option<Box<dyn Fn() + Send + Sync>>>) {
+    if let Some(wake) = lock_unpoisoned(waker).as_ref() {
+        wake();
+    }
 }
 
 /// The input→PTY pump: drain queued chunks into the master. Ends when the
@@ -756,23 +775,43 @@ mod tests {
     #[test]
     fn the_reader_pump_fires_the_repaint_waker_on_output() {
         use std::sync::atomic::AtomicUsize;
+        let session = LocalPty::spawn_argv(
+            &owned(&["/bin/sh", "-c", "sleep 0.05; printf output-waker-'mark'"]),
+            SpawnOptions::default(),
+        )
+        .expect("spawn delayed output command");
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&ticks);
+        session.set_repaint_waker(move || {
+            seen.fetch_add(1, Ordering::Relaxed);
+        });
+        // Real output through the engine wakes the surface: no input is sent
+        // after the waker is installed, so this cannot be satisfied by the
+        // input-side repaint path.
+        wait_for_text(&session, "output-waker-mark");
+        // The counter advanced — output drove the repaint, not a fixed timer.
+        assert!(
+            ticks.load(Ordering::Relaxed) > 0,
+            "the reader pump must fire the repaint waker when output arrives"
+        );
+    }
+
+    #[test]
+    fn send_input_fires_the_repaint_waker_when_input_is_accepted() {
+        use std::sync::atomic::AtomicUsize;
         let session = spawn_sh();
         let ticks = Arc::new(AtomicUsize::new(0));
         let seen = Arc::clone(&ticks);
         session.set_repaint_waker(move || {
             seen.fetch_add(1, Ordering::Relaxed);
         });
-        // Real output through the engine wakes the surface: the reader pump
-        // fires the installed waker once per read batch after feeding the bytes
-        // (the quoted tail keeps the echoed *input* line from matching first).
-        session
-            .send_input(b"echo waker-'mark'\n")
-            .expect("queue input");
-        wait_for_text(&session, "waker-mark");
-        // The counter advanced — output drove the repaint, not a fixed timer.
+
+        let before = ticks.load(Ordering::Relaxed);
+        session.send_input(b":\n").expect("queue no-op command");
+        let after = ticks.load(Ordering::Relaxed);
         assert!(
-            ticks.load(Ordering::Relaxed) > 0,
-            "the reader pump must fire the repaint waker when output arrives"
+            after > before,
+            "accepted terminal input must request an immediate repaint"
         );
     }
 

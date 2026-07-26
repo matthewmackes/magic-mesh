@@ -226,7 +226,7 @@ impl DomainState {
             CollabEventKind::ThreadStarted { thread, .. } => {
                 self.threads.insert(*thread, space_id);
             }
-            CollabEventKind::ThreadResolved { .. } => {}
+            CollabEventKind::ThreadResolved { .. } | CollabEventKind::ThreadReopened { .. } => {}
             CollabEventKind::AlertRaised { alert } => {
                 let actions = alert
                     .actions

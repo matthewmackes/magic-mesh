@@ -1,4 +1,11 @@
 //! WL-FUNC-012 / OVERLAY-3 — keyless NCDOT TIMS current traffic events.
+//!
+//! Workstations start this keyless public NCDOT producer by default. Operators
+//! can explicitly disable it with `MDE_OVERLAY_NCDOT_TRAFFIC=0/false/no/off`.
+//! A fresh, finite same-host North Carolina vehicle fix drives the ArcGIS TIMS
+//! envelope query. Missing vehicle context publishes an honest empty retained
+//! mirror instead of leaving the catalog topic absent or replaying incident
+//! rows fetched for an old vehicle point.
 
 #![cfg(feature = "async-services")]
 
@@ -15,7 +22,7 @@ use serde::Deserialize;
 
 use super::{ShutdownToken, Worker};
 
-/// Explicit opt-in; unset/false is an idle no-op.
+/// Explicit disable for the keyless default-on NCDOT traffic producer.
 pub const ENABLED_ENV: &str = "MDE_OVERLAY_NCDOT_TRAFFIC";
 /// Official keyless NCDOT TIMS current incident-point service.
 pub const DEFAULT_ENDPOINT: &str = "https://services.arcgis.com/NuWFvHYDMVmmxMeM/ArcGIS/rest/services/NCDOT_TIMS_Incidents/FeatureServer/0/query";
@@ -99,21 +106,13 @@ struct Validator {
 
 /// Production rustls NCDOT ArcGIS client.
 pub struct NcdotHttpProbe {
-    client: Client,
     validator: Mutex<Validator>,
 }
 
 impl NcdotHttpProbe {
     fn new() -> Result<Self, ProbeFailure> {
         validate_endpoint(DEFAULT_ENDPOINT).map_err(ProbeFailure::other)?;
-        let client = Client::builder()
-            .timeout(HTTP_TIMEOUT)
-            .user_agent(USER_AGENT)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(ProbeFailure::other)?;
         Ok(Self {
-            client,
             validator: Mutex::new(Validator::default()),
         })
     }
@@ -122,7 +121,12 @@ impl NcdotHttpProbe {
 impl TrafficProbe for NcdotHttpProbe {
     fn fetch(&self, context: TrafficContext) -> Result<ProbeResponse, ProbeFailure> {
         let url = query_url(context).map_err(ProbeFailure::other)?;
-        let mut request = self.client.get(url);
+        // `reqwest::blocking::Client` owns an internal runtime. Construct and
+        // drop it inside this blocking fetch call; `fetch_async` already runs
+        // this method via `spawn_blocking`, while sync tests call it outside a
+        // Tokio runtime.
+        let client = ncdot_http_client()?;
+        let mut request = client.get(url);
         let mut sent_validator = false;
         {
             let validator = self
@@ -185,6 +189,15 @@ impl TrafficProbe for NcdotHttpProbe {
         };
         Ok(ProbeResponse::Modified(body))
     }
+}
+
+fn ncdot_http_client() -> Result<Client, ProbeFailure> {
+    Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .user_agent(USER_AGENT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(ProbeFailure::other)
 }
 
 fn validate_endpoint(value: &str) -> io::Result<reqwest::Url> {
@@ -648,10 +661,13 @@ pub struct TrafficOverlayWorker {
 }
 
 impl TrafficOverlayWorker {
-    /// Production wiring. Disabled unless explicitly opted in.
+    /// Production wiring. The keyless NCDOT adapter is enabled by default on
+    /// spawned Workstation-tier nodes; an explicit false-y env disables it.
+    /// Missing vehicle context publishes an honest empty mirror instead of
+    /// leaving the catalog topic absent.
     #[must_use]
     pub fn new(host: String) -> Self {
-        let probe = if env_truthy(ENABLED_ENV) {
+        let probe = if env_default_enabled(ENABLED_ENV) {
             match NcdotHttpProbe::new() {
                 Ok(probe) => Some(Arc::new(probe) as Arc<dyn TrafficProbe>),
                 Err(error) => {
@@ -719,10 +735,9 @@ impl TrafficOverlayWorker {
                 .body?;
             serde_json::from_str::<TrafficSnapshot>(&body).ok()
         });
-        let mut degraded = last_good
-            .cloned()
-            .or(persisted)
-            .unwrap_or_else(|| TrafficSnapshot::empty(&self.host, now_ms(), 0.0, 0.0, QUERY_RADIUS_KM));
+        let mut degraded = last_good.cloned().or(persisted).unwrap_or_else(|| {
+            TrafficSnapshot::empty(&self.host, now_ms(), 0.0, 0.0, QUERY_RADIUS_KM)
+        });
         degraded.events.clear();
         degraded.omitted_features = 0;
         degraded.fetched_at_ms = now_ms();
@@ -731,6 +746,33 @@ impl TrafficOverlayWorker {
             .retain(|gap| !gap.starts_with("NCDOT traffic paused:"));
         push_gap(&mut degraded.gaps, format!("NCDOT traffic paused: {error}"));
         degraded
+    }
+
+    fn no_context_snapshot(&self, reason: &str) -> TrafficSnapshot {
+        let mut snapshot = TrafficSnapshot::empty(&self.host, now_ms(), 0.0, 0.0, QUERY_RADIUS_KM);
+        push_gap(
+            &mut snapshot.gaps,
+            format!("NCDOT traffic paused: {reason}"),
+        );
+        snapshot
+    }
+
+    fn publish_no_context_degraded(
+        &self,
+        last_good: &mut Option<TrafficSnapshot>,
+        reason: &str,
+    ) -> ApplyOutcome {
+        tracing::warn!(target: "mackesd::traffic_overlay", host = %self.host, error = reason, "NCDOT traffic has no fresh same-host vehicle context; publishing empty degraded snapshot");
+        let snapshot = self.no_context_snapshot(reason);
+        self.publish(&snapshot);
+        // Vehicle-scoped traffic events are invalid once the same-host fix
+        // disappears. Keep the retained Bus mirror present and licensed, but
+        // do not let later failures replay rows from an old point.
+        *last_good = None;
+        ApplyOutcome {
+            success: false,
+            retry_after: None,
+        }
     }
 
     fn apply_result(
@@ -848,6 +890,7 @@ impl Worker for TrafficOverlayWorker {
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
         let Some(probe) = self.probe.clone() else {
+            tracing::info!(target: "mackesd::traffic_overlay", env = ENABLED_ENV, "NCDOT traffic overlay disabled or unavailable; worker idle");
             shutdown.wait().await;
             return Ok(());
         };
@@ -857,11 +900,9 @@ impl Worker for TrafficOverlayWorker {
         loop {
             let Some(context) = self.current_context() else {
                 if !no_fix_published {
-                    self.apply_result(
-                        Err(ProbeFailure::other(
-                            "fresh same-host North Carolina vehicle fix unavailable",
-                        )),
+                    self.publish_no_context_degraded(
                         &mut last_good,
+                        "fresh same-host North Carolina vehicle fix unavailable",
                     );
                     no_fix_published = true;
                 }
@@ -898,13 +939,15 @@ impl Worker for TrafficOverlayWorker {
     }
 }
 
-fn env_truthy(name: &str) -> bool {
-    std::env::var(name).is_ok_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
+fn env_default_enabled(name: &str) -> bool {
+    overlay_enabled_from_env(std::env::var(name).ok().as_deref())
+}
+
+fn overlay_enabled_from_env(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(|value| value.trim().to_ascii_lowercase()),
+        Some(value) if matches!(value.as_str(), "0" | "false" | "no" | "off")
+    )
 }
 
 fn now_ms() -> i64 {
@@ -1058,6 +1101,20 @@ mod tests {
     }
 
     #[test]
+    fn keyless_ncdot_traffic_producer_defaults_on_with_explicit_false_opt_out() {
+        assert!(overlay_enabled_from_env(None));
+        assert!(overlay_enabled_from_env(Some("")));
+        assert!(overlay_enabled_from_env(Some("1")));
+        assert!(overlay_enabled_from_env(Some("true")));
+        assert!(overlay_enabled_from_env(Some("yes")));
+        assert!(overlay_enabled_from_env(Some("on")));
+        assert!(!overlay_enabled_from_env(Some("0")));
+        assert!(!overlay_enabled_from_env(Some("false")));
+        assert!(!overlay_enabled_from_env(Some("NO")));
+        assert!(!overlay_enabled_from_env(Some(" off ")));
+    }
+
+    #[test]
     fn arcgis_json_429_preserves_retry_after() {
         let body = r#"{"error":{"code":429,"message":"Too many requests","details":["Retry after 240 sec."]}}"#;
         let error = classify_arcgis_error(body).expect("classified");
@@ -1104,23 +1161,77 @@ mod tests {
             .iter()
             .any(|gap| gap.starts_with("NCDOT traffic paused:")));
         assert!(degraded.fetched_at_ms > NOW_MS);
+    }
 
-        // The worker above uses a fresh root, so seed it with the successful
-        // record and then verify a no-cache failure clears that persisted data.
+    #[test]
+    fn no_vehicle_fix_degraded_snapshot_retracts_prior_events_and_query_origin() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().to_path_buf();
+        let worker =
+            TrafficOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+        let original =
+            parse_snapshot("rig-1", context(), &live_geojson(), NOW_MS).expect("snapshot");
+        assert!(!original.events.is_empty());
+        let mut last_good = Some(original);
+
+        let outcome = worker.publish_no_context_degraded(
+            &mut last_good,
+            "fresh same-host North Carolina vehicle fix unavailable",
+        );
+
+        assert!(!outcome.success);
+        assert!(
+            last_good.is_none(),
+            "old vehicle-scoped NCDOT events must not survive fix loss"
+        );
+        let latest: TrafficSnapshot = serde_json::from_str(
+            Persist::open(root)
+                .expect("bus")
+                .read_latest(&traffic_state_topic("rig-1"))
+                .expect("read")
+                .expect("message")
+                .body
+                .as_deref()
+                .expect("body"),
+        )
+        .expect("degraded snapshot");
+        assert_eq!(latest.host, "rig-1");
+        assert!(latest.fetched_at_ms > 0);
+        assert!(latest.events.is_empty());
+        assert_eq!(latest.omitted_features, 0);
+        assert_eq!(latest.query_latitude, 0.0);
+        assert_eq!(latest.query_longitude, 0.0);
+        assert!(latest
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("vehicle fix unavailable")));
+        assert_eq!(latest.license_tier, "open-data-attribution");
+        assert_eq!(latest.attribution, "NCDOT DriveNC / TIMS");
+    }
+
+    #[test]
+    fn no_context_after_restart_clears_persisted_stale_traffic() {
         let restart_root = tempfile::tempdir().expect("restart root");
         let restarted = TrafficOverlayWorker::new("rig-1".to_string())
             .with_bus_root(Some(restart_root.path().to_path_buf()));
         let mut seed_cache = None;
         restarted.apply_result(
-            Ok(PreparedResponse::Modified(retained.clone())),
+            Ok(PreparedResponse::Modified(
+                parse_snapshot("rig-1", context(), &live_geojson(), NOW_MS).expect("snapshot"),
+            )),
             &mut seed_cache,
         );
+        assert!(seed_cache
+            .as_ref()
+            .is_some_and(|snapshot| !snapshot.events.is_empty()));
+
         let mut restart_cache = None;
-        let restarted_failure = restarted.apply_result(
-            Err(ProbeFailure::other("no fresh vehicle fix")),
+        let restarted_failure = restarted.publish_no_context_degraded(
             &mut restart_cache,
+            "fresh same-host North Carolina vehicle fix unavailable after restart",
         );
         assert!(!restarted_failure.success);
+        assert!(restart_cache.is_none());
         let restarted_rows = Persist::open(restart_root.path().to_path_buf())
             .expect("restart bus")
             .list_since(&traffic_state_topic("rig-1"), None)
@@ -1133,6 +1244,9 @@ mod tests {
         )
         .expect("cleared snapshot");
         assert!(cleared.events.is_empty());
+        assert_eq!(cleared.query_latitude, 0.0);
+        assert_eq!(cleared.query_longitude, 0.0);
+        assert!(cleared.gaps.iter().any(|gap| gap.contains("after restart")));
     }
 
     struct SlowProbe;
@@ -1161,5 +1275,55 @@ mod tests {
         .expect("responsive");
         assert!(result.is_none());
         sender.await.expect("sender");
+    }
+
+    #[tokio::test]
+    async fn default_on_worker_publishes_degraded_snapshot_without_vehicle_fix() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().to_path_buf();
+        let mut worker = TrafficOverlayWorker::new("rig-1".to_string())
+            .with_probe(Arc::new(SlowProbe))
+            .with_bus_root(Some(root.clone()));
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let token = ShutdownToken::from_receiver(rx);
+        let handle = tokio::spawn(async move { worker.run(token).await });
+
+        let topic = traffic_state_topic("rig-1");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let body = loop {
+            if let Some(row) = Persist::open(root.clone())
+                .expect("bus")
+                .read_latest(&topic)
+                .expect("read")
+            {
+                break row.body.expect("body");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "default-on NCDOT worker did not publish a degraded no-fix snapshot"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        tx.send(true).expect("shutdown");
+        let joined = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert!(joined.is_ok(), "worker exits promptly after proof");
+        joined
+            .expect("join timeout")
+            .expect("join")
+            .expect("worker ok");
+
+        let snapshot: TrafficSnapshot = serde_json::from_str(&body).expect("snapshot");
+        assert_eq!(snapshot.host, "rig-1");
+        assert!(snapshot.fetched_at_ms > 0);
+        assert!(snapshot.events.is_empty());
+        assert_eq!(snapshot.query_latitude, 0.0);
+        assert_eq!(snapshot.query_longitude, 0.0);
+        assert!(snapshot
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("vehicle fix unavailable")));
+        assert_eq!(snapshot.license_tier, "open-data-attribution");
+        assert_eq!(snapshot.attribution, "NCDOT DriveNC / TIMS");
     }
 }

@@ -27,6 +27,8 @@ EXIT_UNSUPPORTED = 65
 EV_SYN = 0
 EV_KEY = 1
 EV_REL = 2
+EV_ABS = 3
+OP_DELAY = -1
 
 SYN_REPORT = 0
 
@@ -35,9 +37,25 @@ REL_Y = 1
 REL_HWHEEL = 6
 REL_WHEEL = 8
 
+ABS_X = 0
+ABS_Y = 1
+ABS_MT_SLOT = 0x2F
+ABS_MT_POSITION_X = 0x35
+ABS_MT_POSITION_Y = 0x36
+ABS_MT_TRACKING_ID = 0x39
+ABS_PROOF_MAX = 65535
+DEFAULT_BUTTON_HOLD_MS = 50
+DEFAULT_ABSOLUTE_TAP_HOLD_MS = 120
+UINPUT_READY_DELAY_SECONDS = 0.35
+UINPUT_DRAIN_DELAY_SECONDS = 0.15
+
 BTN_LEFT = 0x110
 BTN_RIGHT = 0x111
 BTN_MIDDLE = 0x112
+BTN_TOOL_FINGER = 0x145
+BTN_TOUCH = 0x14A
+
+INPUT_PROP_DIRECT = 0x01
 
 KEY_ESC = 1
 KEY_1 = 2
@@ -158,6 +176,8 @@ UI_DEV_DESTROY = _io("U", 2)
 UI_SET_EVBIT = _iow("U", 100, 4)
 UI_SET_KEYBIT = _iow("U", 101, 4)
 UI_SET_RELBIT = _iow("U", 102, 4)
+UI_SET_ABSBIT = _iow("U", 103, 4)
+UI_SET_PROPBIT = _iow("U", 110, 4)
 
 
 SPECIAL_KEYS = {
@@ -316,6 +336,20 @@ def tap_key(code: int) -> list[Op]:
     return [Op(EV_KEY, code, 1), Op(EV_SYN, SYN_REPORT, 0), Op(EV_KEY, code, 0), Op(EV_SYN, SYN_REPORT, 0)]
 
 
+def hold_delay(ms: int) -> Op:
+    return Op(OP_DELAY, 0, ms)
+
+
+def click_ops(code: int, hold_ms: int) -> list[Op]:
+    return [
+        Op(EV_KEY, code, 1),
+        Op(EV_SYN, SYN_REPORT, 0),
+        hold_delay(hold_ms),
+        Op(EV_KEY, code, 0),
+        Op(EV_SYN, SYN_REPORT, 0),
+    ]
+
+
 def with_modifiers(mods: Iterable[int], body: list[Op]) -> list[Op]:
     mod_list = list(dict.fromkeys(mods))
     ops: list[Op] = []
@@ -336,6 +370,63 @@ def integer_delta(value: object, key: str, *, allow_zero: bool = False) -> int:
     if abs(delta) > 4096:
         unsupported(f"{key} is out of bounds")
     return delta
+
+
+def positive_extent(value: object, key: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        unsupported(f"{key} must be numeric")
+    extent = int(round(float(value)))
+    if extent <= 1 or extent > 32768:
+        unsupported(f"{key} is out of bounds")
+    return extent
+
+
+def hold_millis(value: object, key: str, default: int) -> int:
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        unsupported(f"{key} must be numeric")
+    millis = int(round(float(value)))
+    if millis < 25 or millis > 1000:
+        unsupported(f"{key} is out of bounds")
+    return millis
+
+
+def absolute_coord(value: object, key: str, extent: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        unsupported(f"{key} must be numeric")
+    coord = float(value)
+    if coord < 0.0 or coord > float(extent - 1):
+        unsupported(f"{key} is outside the declared {extent}px extent")
+    return int(round(coord / float(extent - 1) * ABS_PROOF_MAX))
+
+
+def absolute_tap_ops(event: dict) -> list[Op]:
+    # Proof-only path: mackesd's phone protocol does not accept this event kind.
+    # It exists so live seat tests can hit a deterministic painted coordinate
+    # without relative-pointer acceleration or an unknown starting cursor.  Model
+    # it as a direct touchscreen contact because the bare DRM shell already maps
+    # libinput touch down/up into ordinary egui pointer clicks.
+    width = positive_extent(event.get("width"), "width")
+    height = positive_extent(event.get("height"), "height")
+    hold_ms = hold_millis(event.get("hold_ms"), "hold_ms", DEFAULT_ABSOLUTE_TAP_HOLD_MS)
+    x = absolute_coord(event.get("x"), "x", width)
+    y = absolute_coord(event.get("y"), "y", height)
+    return [
+        Op(EV_ABS, ABS_MT_SLOT, 0),
+        Op(EV_ABS, ABS_MT_TRACKING_ID, 1),
+        Op(EV_ABS, ABS_MT_POSITION_X, x),
+        Op(EV_ABS, ABS_MT_POSITION_Y, y),
+        Op(EV_KEY, BTN_TOOL_FINGER, 1),
+        Op(EV_KEY, BTN_TOUCH, 1),
+        Op(EV_SYN, SYN_REPORT, 0),
+        hold_delay(hold_ms),
+        Op(EV_ABS, ABS_MT_SLOT, 0),
+        Op(EV_ABS, ABS_MT_TRACKING_ID, -1),
+        Op(EV_KEY, BTN_TOUCH, 0),
+        Op(EV_KEY, BTN_TOOL_FINGER, 0),
+        Op(EV_SYN, SYN_REPORT, 0),
+    ]
 
 
 def event_to_ops(event: dict) -> list[Op]:
@@ -366,8 +457,10 @@ def event_to_ops(event: dict) -> list[Op]:
             unsupported("clicks must be 1 or 2")
         ops: list[Op] = []
         for _ in range(int(clicks)):
-            ops.extend([Op(EV_KEY, code, 1), Op(EV_SYN, SYN_REPORT, 0), Op(EV_KEY, code, 0), Op(EV_SYN, SYN_REPORT, 0)])
+            ops.extend(click_ops(code, DEFAULT_BUTTON_HOLD_MS))
         return ops
+    if kind == "absolute_tap":
+        return absolute_tap_ops(event)
     if kind == "special_key":
         code = event.get("special_key")
         if not isinstance(code, int):
@@ -404,15 +497,22 @@ def create_device(fd: int, ops: Iterable[Op]) -> None:
     ioctl_set(fd, UI_SET_EVBIT, EV_SYN)
     need_key = False
     need_rel = False
+    need_abs = False
     key_codes = set()
     rel_codes = set()
+    abs_codes = set()
     for op in ops:
+        if op.type == OP_DELAY:
+            continue
         if op.type == EV_KEY:
             need_key = True
             key_codes.add(op.code)
         elif op.type == EV_REL:
             need_rel = True
             rel_codes.add(op.code)
+        elif op.type == EV_ABS:
+            need_abs = True
+            abs_codes.add(op.code)
     if need_key:
         ioctl_set(fd, UI_SET_EVBIT, EV_KEY)
         for code in sorted(key_codes):
@@ -421,6 +521,22 @@ def create_device(fd: int, ops: Iterable[Op]) -> None:
         ioctl_set(fd, UI_SET_EVBIT, EV_REL)
         for code in sorted(rel_codes):
             ioctl_set(fd, UI_SET_RELBIT, code)
+    if need_abs:
+        if BTN_TOUCH in key_codes:
+            ioctl_set(fd, UI_SET_PROPBIT, INPUT_PROP_DIRECT)
+        ioctl_set(fd, UI_SET_EVBIT, EV_ABS)
+        for code in sorted(abs_codes):
+            ioctl_set(fd, UI_SET_ABSBIT, code)
+
+    absmax = [0] * ABS_CNT
+    absmin = [0] * ABS_CNT
+    if need_abs:
+        absmax[ABS_X] = ABS_PROOF_MAX
+        absmax[ABS_Y] = ABS_PROOF_MAX
+        absmax[ABS_MT_SLOT] = 0
+        absmax[ABS_MT_TRACKING_ID] = ABS_PROOF_MAX
+        absmax[ABS_MT_POSITION_X] = ABS_PROOF_MAX
+        absmax[ABS_MT_POSITION_Y] = ABS_PROOF_MAX
 
     name = b"mackesd-seat-remote-input"
     user_dev = struct.pack(
@@ -431,14 +547,25 @@ def create_device(fd: int, ops: Iterable[Op]) -> None:
         0x0006,
         1,
         0,
-        *([0] * (ABS_CNT * 4)),
+        *absmax,
+        *absmin,
+        *([0] * ABS_CNT),
+        *([0] * ABS_CNT),
     )
     os.write(fd, user_dev)
     fcntl.ioctl(fd, UI_DEV_CREATE)
-    time.sleep(0.02)
+    # libinput learns about uinput devices asynchronously through udev.  A very
+    # short sleep is enough for a kernel evdev reader, but the bare DRM shell's
+    # libinput loop can miss a one-shot device that is created, used, and
+    # destroyed in the same scheduler slice.  Hold the proof helper's device
+    # just long enough for udev/libinput discovery before emitting events.
+    time.sleep(UINPUT_READY_DELAY_SECONDS)
 
 
 def emit(fd: int, op: Op) -> None:
+    if op.type == OP_DELAY:
+        time.sleep(op.value / 1000.0)
+        return
     os.write(fd, struct.pack("llHHi", 0, 0, op.type, op.code, op.value))
 
 
@@ -458,6 +585,9 @@ def inject(ops: list[Op]) -> None:
         created = True
         for op in ops:
             emit(fd, op)
+        # Let libinput drain the final SYN_REPORT before destroying the
+        # short-lived proof device.
+        time.sleep(UINPUT_DRAIN_DELAY_SECONDS)
     except OSError as exc:
         unavailable(f"uinput injection failed: {exc}")
     finally:
@@ -487,7 +617,8 @@ def self_test() -> None:
     samples = [
         ({"kind": "move", "dx": 12.4, "dy": -2.0}, [(EV_REL, REL_X, 12), (EV_REL, REL_Y, -2)]),
         ({"kind": "scroll", "delta": -3}, [(EV_REL, REL_WHEEL, -3)]),
-        ({"kind": "button", "button": "secondary", "clicks": 2}, [(EV_KEY, BTN_RIGHT, 1), (EV_KEY, BTN_RIGHT, 0)]),
+        ({"kind": "button", "button": "secondary", "clicks": 2}, [(EV_KEY, BTN_RIGHT, 1), (OP_DELAY, 0, DEFAULT_BUTTON_HOLD_MS), (EV_KEY, BTN_RIGHT, 0)]),
+        ({"kind": "absolute_tap", "x": 120, "y": 640, "width": 1920, "height": 1080}, [(EV_ABS, ABS_MT_TRACKING_ID, 1), (EV_ABS, ABS_MT_POSITION_X, 4098), (EV_KEY, BTN_TOUCH, 1), (OP_DELAY, 0, DEFAULT_ABSOLUTE_TAP_HOLD_MS), (EV_ABS, ABS_MT_TRACKING_ID, -1)]),
         ({"kind": "text", "text": "Az!"}, [(EV_KEY, KEY_LEFTSHIFT, 1), (EV_KEY, KEY_A, 1), (EV_KEY, KEY_Z, 1), (EV_KEY, KEY_1, 1)]),
         ({"kind": "special_key", "special_key": 12, "modifiers": {"ctrl": True}}, [(EV_KEY, KEY_LEFTCTRL, 1), (EV_KEY, KEY_ENTER, 1)]),
     ]

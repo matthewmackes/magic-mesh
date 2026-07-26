@@ -1,8 +1,9 @@
-//! The persistent Communications **frame**: the spaces rail (left), the mode
-//! tabs (top), and the call bar (bottom). Every mode body renders inside it, so
-//! the frame is what makes the surface feel like one place — the rail is the
-//! selection key, the tabs switch the per-space view, and the call bar is pinned
-//! and survives every mode/space switch (spec §1).
+//! The persistent Mesh Teams **frame**: the app rail (far left), Teams +
+//! Channels rail, channel header/tabs, and call bar. Every body renders inside
+//! it, so the frame is what makes the surface feel like one place — the channel
+//! rail is the selection key, the app rail switches global tools, the Teams tab
+//! strip switches Posts / Files / Calls for the selected channel, and the call
+//! bar is pinned and survives every app/channel switch (spec §1).
 //!
 //! PLATFORM-INTERFACES Q19 — the rail is the shared
 //! [`nav_chrome::Sidebar`](mde_egui::nav_chrome::Sidebar) (a pure
@@ -18,13 +19,18 @@ use mde_egui::Style;
 
 use mde_collab_types::{
     CallId, CallKind, CallParticipantState, CallView, CollabCommand, SpaceDirectory, SpaceId,
+    SpaceKind, SpaceRole, SpaceSummary,
 };
 
-use crate::{icons, CommunicationsSurface, Mode};
+use crate::{icons, ChannelTab, CommunicationsSurface, MeshTeamsApp};
 
-/// The spaces rail width — a fixed, non-resizable gutter (~192 px on the 8 px
-/// grid) wide enough for an icon + a space name + an unread badge.
-pub const RAIL_W: f32 = Style::SP_XL * 6.0;
+/// The Teams-style app rail width.
+pub const APP_RAIL_W: f32 = Style::SP_XL * 2.25;
+/// The Teams + Channels rail width — a fixed, non-resizable gutter wide enough
+/// for an icon + a channel name + an unread badge.
+pub const CHANNEL_RAIL_W: f32 = Style::SP_XL * 6.0;
+/// The selected-channel details rail width.
+pub const DETAILS_W: f32 = Style::SP_XL * 6.25;
 
 /// The rail's raised (layer-01) frame.
 pub fn rail_frame() -> egui::Frame {
@@ -50,6 +56,15 @@ pub fn body_frame() -> egui::Frame {
 /// deterministic.
 pub(crate) const RAIL_SIDEBAR_SALT: &str = "collab-rail";
 
+/// Pure app-rail model in the operator-locked WL-UX-010 order.
+#[must_use]
+pub(crate) fn app_rail_model() -> Vec<(MeshTeamsApp, &'static str, &'static str)> {
+    MeshTeamsApp::ALL
+        .iter()
+        .map(|app| (*app, app.label(), icons::app_icon(*app)))
+        .collect()
+}
+
 /// Return the selected space only while it is still present in the current
 /// directory. The read model can advance between frames (for example, after a
 /// membership removal), while the surface deliberately retains view state; a
@@ -62,6 +77,111 @@ pub(crate) fn selected_space_in_directory(
     selected.filter(|selected| directory.spaces.iter().any(|space| space.id == *selected))
 }
 
+fn selected_space_summary(
+    selected: Option<SpaceId>,
+    directory: &SpaceDirectory,
+) -> Option<&SpaceSummary> {
+    selected.and_then(|selected| directory.spaces.iter().find(|space| space.id == selected))
+}
+
+/// Pure model for the selected-channel Details pane.
+///
+/// Every count is read from the existing retained projections. Missing
+/// projections are rendered as zero/none — an honest "not projected yet" state,
+/// not provider-shaped fixture data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChannelDetailsModel {
+    pub(crate) space: SpaceId,
+    pub(crate) name: String,
+    pub(crate) kind: &'static str,
+    pub(crate) role: &'static str,
+    pub(crate) members: u32,
+    pub(crate) unread: u32,
+    pub(crate) last_activity: String,
+    pub(crate) messages: usize,
+    pub(crate) files: usize,
+    pub(crate) transfers: usize,
+    pub(crate) documents: usize,
+    pub(crate) active_calls: usize,
+    pub(crate) clips: usize,
+}
+
+/// Build the Details pane model for the currently selected channel, if that
+/// selection still exists in the live directory.
+#[must_use]
+pub(crate) fn channel_details_model(
+    selected: Option<SpaceId>,
+    data: &dyn crate::CollabData,
+) -> Option<ChannelDetailsModel> {
+    let summary = selected_space_summary(selected, data.space_directory())?;
+    let file_refs = data.file_references(summary.id);
+    let files = file_refs.map_or(0, |refs| refs.files.len());
+    let transfers = match (file_refs, data.transfer_jobs()) {
+        (Some(refs), Some(jobs)) => jobs
+            .jobs
+            .iter()
+            .filter(|job| refs.files.iter().any(|file| file.file == job.file))
+            .count(),
+        _ => 0,
+    };
+
+    Some(ChannelDetailsModel {
+        space: summary.id,
+        name: summary.name.clone(),
+        kind: space_kind_label(summary.kind),
+        role: space_role_label(summary.role),
+        members: summary.members,
+        unread: summary.unread,
+        last_activity: summary.last_activity.to_string(),
+        messages: data
+            .conversation(summary.id)
+            .map_or(0, |timeline| timeline.messages.len()),
+        files,
+        transfers,
+        documents: data
+            .document_sessions(summary.id)
+            .map_or(0, |sessions| sessions.sessions.len()),
+        active_calls: data
+            .call_state()
+            .active
+            .iter()
+            .filter(|call| call.space == summary.id)
+            .count(),
+        clips: data
+            .clipboard_lane(summary.id)
+            .map_or(0, |lane| lane.items.len()),
+    })
+}
+
+const fn space_kind_label(kind: SpaceKind) -> &'static str {
+    match kind {
+        SpaceKind::Direct => "Direct",
+        SpaceKind::Team => "Team",
+        SpaceKind::Incident => "Incident",
+        SpaceKind::Project => "Project",
+    }
+}
+
+const fn space_role_label(role: SpaceRole) -> &'static str {
+    match role {
+        SpaceRole::Owner => "Owner",
+        SpaceRole::Member => "Member",
+    }
+}
+
+const fn short_app_label(app: MeshTeamsApp) -> &'static str {
+    match app {
+        MeshTeamsApp::Activity => "Activity",
+        MeshTeamsApp::Teams => "Teams",
+        MeshTeamsApp::Calls => "Calls",
+        MeshTeamsApp::Files => "Files",
+        MeshTeamsApp::Alerts => "Alerts",
+        MeshTeamsApp::Transfers => "Xfer",
+        MeshTeamsApp::Clipboard => "Clip",
+        MeshTeamsApp::Settings => "Settings",
+    }
+}
+
 /// The rail's pure row model: one row per
 /// [`SpaceSummary`](mde_collab_types::SpaceSummary) in directory order — the
 /// selection id, the drawn name, the kind's Carbon glyph, and the unread count
@@ -69,7 +189,7 @@ pub(crate) fn selected_space_in_directory(
 /// Settings-sidebar idiom), and the render below only translates it.
 pub(crate) fn rail_row_model(
     directory: &SpaceDirectory,
-) -> Vec<(SpaceId, &str, &'static str, u32)> {
+) -> Vec<(SpaceId, &str, &'static str, u32, u32)> {
     directory
         .spaces
         .iter()
@@ -79,16 +199,68 @@ pub(crate) fn rail_row_model(
                 s.name.as_str(),
                 icons::space_kind_icon(s.kind),
                 s.unread,
+                s.members,
             )
         })
         .collect()
 }
 
 impl CommunicationsSurface {
-    /// The persistent spaces rail — the shared Q19 [`Sidebar`]
+    /// The Teams-style app rail. It is separate from the channel list so
+    /// Activity, Teams, Calls, Files, Alerts, Transfers, Clipboard, and Settings
+    /// are always one click away.
+    pub(crate) fn app_rail(&mut self, ui: &mut egui::Ui) {
+        ui.vertical_centered(|ui| {
+            ui.label(
+                egui::RichText::new("Mesh")
+                    .size(Style::SMALL)
+                    .strong()
+                    .color(Style::TEXT_DIM),
+            );
+        });
+        ui.add_space(Style::SP_XS);
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (app, label, glyph) in app_rail_model() {
+                    let selected = self.app() == app;
+                    let tint = if selected {
+                        Style::ACCENT
+                    } else {
+                        Style::TEXT_DIM
+                    };
+                    let clicked = crate::anim::interactive_cell(
+                        ui,
+                        ("mesh-teams-app", label),
+                        selected,
+                        true,
+                        |ui| {
+                            ui.vertical_centered(|ui| {
+                                icons::icon(ui, glyph, Style::SP_M, tint);
+                                ui.label(egui::RichText::new(short_app_label(app)).small().color(
+                                    if selected {
+                                        Style::TEXT_STRONG
+                                    } else {
+                                        Style::TEXT_DIM
+                                    },
+                                ));
+                            });
+                        },
+                    )
+                    .on_hover_text(label)
+                    .clicked();
+                    if clicked {
+                        self.set_app(app);
+                    }
+                    ui.add_space(Style::SP_XS);
+                }
+            });
+    }
+
+    /// The persistent Teams + Channels rail — the shared Q19 [`Sidebar`]
     /// (PLATFORM-INTERFACES Q19): one selectable row per
     /// [`SpaceSummary`](mde_collab_types::SpaceSummary) with the kind's Carbon
-    /// glyph, under a "Spaces" section header, with click / arrow-walk / Enter
+    /// glyph, under a "Teams & Channels" section header, with click / arrow-walk / Enter
     /// all routing through the one [`select_space`](Self::select_space) seam.
     /// The live unread badges ride the **overlay bridge**: each row's count is
     /// painted into the rect the row registered under [`Sidebar::row_id`]
@@ -104,7 +276,7 @@ impl CommunicationsSurface {
         let directory = data.space_directory();
         if directory.spaces.is_empty() {
             ui.label(
-                egui::RichText::new("Spaces")
+                egui::RichText::new("Teams & Channels")
                     .size(Style::SMALL)
                     .strong()
                     .color(Style::TEXT_DIM),
@@ -117,10 +289,10 @@ impl CommunicationsSurface {
         let model = rail_row_model(directory);
         let rows: Vec<SidebarRow<'_, SpaceId>> = model
             .iter()
-            .map(|(id, name, glyph, _)| SidebarRow::new(*id, name).with_icon(glyph))
+            .map(|(id, name, glyph, _, _)| SidebarRow::new(*id, name).with_icon(glyph))
             .collect();
         let sections = [SidebarSection {
-            header: Some("Spaces"),
+            header: Some("Teams & Channels"),
             rows: rows.as_slice(),
         }];
         // `ui()` defaults the selection to the first rail row before the rail
@@ -137,7 +309,7 @@ impl CommunicationsSurface {
                 // The unread-badge overlay pass: paint each row's live count
                 // into the slot its row registered just above, read back
                 // through the Sidebar's deterministic row ids.
-                for (index, (_, _, _, unread)) in model.iter().enumerate() {
+                for (index, (_, _, _, unread, _)) in model.iter().enumerate() {
                     if *unread == 0 {
                         continue;
                     }
@@ -152,42 +324,127 @@ impl CommunicationsSurface {
             });
     }
 
-    /// The per-space mode tabs. Every tab is selectable and implemented; the
-    /// selected tab is accent-tinted, the rest read as dim-but-live.
-    pub(crate) fn mode_tabs(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            for mode in Mode::TABS {
-                let selected = self.mode() == mode;
-                // Every mode is implemented, so the tint reads accent-when-selected
-                // else dim-but-live; the tab itself carries the shared hover / press /
-                // focus motion through the one interactive-cell helper.
-                let tint = if selected {
-                    Style::ACCENT
-                } else {
-                    Style::TEXT_DIM
-                };
-                let label_color = if selected {
-                    Style::TEXT_STRONG
-                } else {
-                    Style::TEXT
-                };
-                let clicked = crate::anim::interactive_cell(
-                    ui,
-                    ("collab-tab", mode.label()),
-                    selected,
-                    false,
-                    |ui| {
-                        icons::icon(ui, icons::mode_icon(mode), Style::SP_M, tint);
-                        ui.label(egui::RichText::new(mode.label()).color(label_color));
-                    },
-                )
-                .clicked();
-                if clicked {
-                    self.set_mode(mode);
+    /// The top channel header. In the Teams app it exposes the required
+    /// Posts/Files/Calls tabs; in other app routes it becomes a compact title
+    /// bar so the old eight-tab strip is not a second navigation model.
+    pub(crate) fn channel_header(&mut self, ui: &mut egui::Ui, data: &dyn crate::CollabData) {
+        let selected = selected_space_summary(self.selected_space(), data.space_directory());
+        ui.horizontal_wrapped(|ui| {
+            let title = if self.app() == MeshTeamsApp::Teams {
+                selected.map_or("No channel selected", |space| space.name.as_str())
+            } else {
+                self.app().label()
+            };
+            ui.label(
+                egui::RichText::new(title)
+                    .strong()
+                    .size(Style::TITLE)
+                    .color(Style::TEXT_STRONG),
+            );
+            if let Some(space) = selected {
+                ui.add_space(Style::SP_S);
+                ui.label(
+                    egui::RichText::new(format!("{} members", space.members))
+                        .small()
+                        .color(Style::TEXT_DIM),
+                );
+            }
+            ui.add_space(Style::SP_M);
+            if self.app() == MeshTeamsApp::Teams {
+                for tab in ChannelTab::ALL {
+                    let selected = self.channel_tab() == tab;
+                    let clicked = crate::anim::interactive_cell(
+                        ui,
+                        ("mesh-teams-channel-tab", tab.label()),
+                        selected,
+                        false,
+                        |ui| {
+                            icons::icon(
+                                ui,
+                                icons::channel_tab_icon(tab),
+                                Style::SP_M,
+                                if selected {
+                                    Style::ACCENT
+                                } else {
+                                    Style::TEXT_DIM
+                                },
+                            );
+                            ui.label(egui::RichText::new(tab.label()).color(if selected {
+                                Style::TEXT_STRONG
+                            } else {
+                                Style::TEXT
+                            }));
+                        },
+                    )
+                    .clicked();
+                    if clicked {
+                        self.set_channel_tab(tab);
+                    }
+                    ui.add_space(Style::SP_XS);
                 }
-                ui.add_space(Style::SP_XS);
+            }
+            if let Some(space) = selected {
+                ui.add_space(Style::SP_M);
+                channel_find_editor(ui, self, space.id);
             }
         });
+    }
+
+    /// The reserved right-side Details pane. It summarizes the selected channel
+    /// from the same read models the bodies use, so it remains accurate while
+    /// the operator switches Posts / Files / Calls or hops between global apps.
+    pub(crate) fn details_pane(&self, ui: &mut egui::Ui, data: &dyn crate::CollabData) {
+        ui.label(
+            egui::RichText::new("Details")
+                .size(Style::BODY)
+                .strong()
+                .color(Style::TEXT_STRONG),
+        );
+        ui.add_space(Style::SP_XS);
+
+        let Some(details) = channel_details_model(self.selected_space(), data) else {
+            ui.label(egui::RichText::new("No channel selected").color(Style::TEXT_DIM));
+            return;
+        };
+
+        ui.label(
+            egui::RichText::new(details.name.as_str())
+                .size(Style::TITLE)
+                .strong()
+                .color(Style::TEXT_STRONG),
+        );
+        ui.label(
+            egui::RichText::new(format!("{} · {}", details.kind, details.role))
+                .small()
+                .color(Style::TEXT_DIM),
+        );
+        ui.add_space(Style::SP_S);
+        ui.separator();
+        ui.add_space(Style::SP_S);
+
+        ui.label(
+            egui::RichText::new("Channel facts")
+                .small()
+                .strong()
+                .color(Style::TEXT_DIM),
+        );
+        detail_row(ui, "Members", details.members);
+        detail_row(ui, "Unread", details.unread);
+        detail_text_row(ui, "Activity clock", details.last_activity.as_str());
+        ui.add_space(Style::SP_S);
+
+        ui.label(
+            egui::RichText::new("Live projections")
+                .small()
+                .strong()
+                .color(Style::TEXT_DIM),
+        );
+        detail_row(ui, "Messages", details.messages);
+        detail_row(ui, "Files", details.files);
+        detail_row(ui, "Transfers", details.transfers);
+        detail_row(ui, "Documents", details.documents);
+        detail_row(ui, "Active calls", details.active_calls);
+        detail_row(ui, "Clip items", details.clips);
     }
 
     /// The persistent call bar: renders the
@@ -303,6 +560,43 @@ impl CommunicationsSurface {
             sink.emit(CollabCommand::HangUpCall { call: call.call });
         }
         ui.add_space(Style::SP_S);
+    }
+}
+
+fn detail_row(ui: &mut egui::Ui, label: &str, value: impl ToString) {
+    detail_text_row(ui, label, value.to_string().as_str());
+}
+
+fn detail_text_row(ui: &mut egui::Ui, label: &str, value: &str) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(label).color(Style::TEXT_DIM));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(
+                egui::RichText::new(value)
+                    .strong()
+                    .color(Style::TEXT_STRONG),
+            );
+        });
+    });
+}
+
+fn channel_find_editor(ui: &mut egui::Ui, surface: &mut CommunicationsSurface, space: SpaceId) {
+    ui.label(
+        egui::RichText::new("Find")
+            .small()
+            .strong()
+            .color(Style::TEXT_DIM),
+    );
+    let mut query = surface.channel_find(space).to_owned();
+    let response = ui.add_sized(
+        [Style::SP_XL * 4.0, Style::SP_L],
+        egui::TextEdit::singleline(&mut query)
+            .id(egui::Id::new(("mesh-teams-channel-find", space.as_uuid())))
+            .hint_text("Current channel")
+            .clip_text(true),
+    );
+    if response.changed() {
+        surface.set_channel_find(space, query);
     }
 }
 

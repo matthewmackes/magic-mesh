@@ -410,23 +410,24 @@ pub mod cloud;
 // genuine no-op on the nodes with no gateway configured (`MDE_VEHICLE_GATEWAY`
 // unset). Mirrors `cloud`'s injectable-transport + bus-mirror lifecycle.
 pub mod vehicle;
-// WL-FUNC-012 / OVERLAY-10 — opt-in workstation-side, keyless USGS earthquake
-// adapter. Polls the all-hour GeoJSON feed over rustls and publishes normalized
-// latest-wins `state/overlay/usgs-earthquakes/<node>` snapshots. Unconfigured is
-// an idle no-op; fetch failures retain the honestly aging last-good snapshot.
+// WL-FUNC-012 / OVERLAY-10 — default-on workstation-side, keyless USGS
+// earthquake adapter. Polls the all-hour GeoJSON feed over rustls and publishes
+// normalized latest-wins `state/overlay/usgs-earthquakes/<node>` snapshots;
+// explicit false-y env disables it.
 pub mod earthquake_overlay;
-// WL-FUNC-012 / OVERLAY-1 — opt-in workstation-side NWS active-alert adapter;
-// resolves null alert geometry through affectedZones and publishes normalized
-// latest-wins `state/overlay/nws-alerts/<node>` snapshots.
+// WL-FUNC-012 / OVERLAY-1 — default-on workstation-side NWS active-alert
+// adapter; resolves null alert geometry through affectedZones and publishes
+// normalized latest-wins `state/overlay/nws-alerts/<node>` snapshots.
 pub mod nws_alert_overlay;
 pub mod nws_forecast_overlay;
-// WL-FUNC-012 / OVERLAY-8 — opt-in, vehicle-scoped adsb.lol point adapter;
-// retains only fresh direct/rebroadcast low-altitude positions and publishes a
-// bounded latest-wins `state/overlay/adsb-aircraft/<node>` snapshot.
+// WL-FUNC-012 / OVERLAY-8 — default-on, vehicle-scoped adsb.lol point adapter;
+// retains only fresh direct/rebroadcast low-altitude positions and otherwise
+// publishes a bounded degraded `state/overlay/adsb-aircraft/<node>` snapshot.
 pub mod aircraft_overlay;
 pub mod caltrans_camera_overlay;
-// WL-FUNC-012 / OVERLAY-9 — opt-in MBTA GTFS-Realtime vehicle positions,
-// filtered against a fresh local vehicle point before latest-wins publication.
+// WL-FUNC-012 / OVERLAY-9 — default-on MBTA GTFS-Realtime vehicle positions,
+// filtered against a fresh local vehicle point before latest-wins publication;
+// no-fix paths publish an empty degraded `state/overlay/gtfs-transit/<node>`.
 pub mod transit_overlay;
 // VIRT-7 (v5.0.0) — per-network firewalld port forwarding. Each
 // peer subscribes to `compute/{expose,unexpose}/<own-peer-addr>`
@@ -530,10 +531,12 @@ pub mod airspace;
 // WL-FUNC-012 / OVERLAY-7 — credential-gated US EPA AirNow AQI stations.
 #[cfg(feature = "async-services")]
 pub mod air_quality_overlay;
-// WL-FUNC-012 / OVERLAY-2 — keyless IEM/NWS animated NEXRAD tiles.
+// WL-FUNC-012 / OVERLAY-2 — default-on keyless IEM/NWS animated NEXRAD tiles.
 #[cfg(feature = "async-services")]
 pub mod iem_radar_overlay;
+// WL-FUNC-012 / OVERLAY-3 — default-on keyless NCDOT TIMS traffic events.
 pub mod traffic_overlay;
+// WL-FUNC-012 / OVERLAY-6 — default-on keyless NIFC WFIGS wildfire perimeters.
 pub mod wildfire_overlay;
 // WL-FUNC-012 / OVERLAY-6 — credential-gated NASA FIRMS near-real-time
 // hotspot points.  This publishes a separate latest-wins snapshot from the
@@ -822,6 +825,12 @@ pub mod console_broker;
 // — never a blocking probe; music-only services (navidrome/mpd) are honestly
 // excluded (mde-music's domain), and SSDP-only DLNA is a `gated:` mDNS-lane note.
 pub mod media_sources;
+// WL-FUNC-015 — Jellyfin gateway proxy: serves
+// `/mde/jellyfin/<source-id>/...` on the gateway node, resolves the registered
+// source from QNM-Shared, materializes the sealed read-only credential through
+// the mesh secret store, and forwards Jellyfin browse/play/progress requests to
+// the LAN upstream without exposing tokens to clients.
+pub mod media_jellyfin_proxy;
 // MEDIA-15 — the media_server worker: the mesh-side (§6) PRODUCER half of the
 // mesh media plane (docs/design/mesh-media-player.md, rows 27 + 30). Scans this
 // node's chosen shared folders into a `media-library.json` share manifest on the

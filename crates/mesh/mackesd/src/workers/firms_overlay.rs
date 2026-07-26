@@ -1,9 +1,10 @@
 //! WL-FUNC-012 / OVERLAY-6 — credential-gated NASA FIRMS hotspots.
 //!
 //! FIRMS is a useful context layer, not a safety-of-life feed.  The worker
-//! therefore requires an explicit opt-in, a sealed MAP_KEY, and a fresh
-//! same-host vehicle fix before it makes a request.  Every response is
-//! bounded, validated, and published as one complete latest-wins snapshot.
+//! therefore publishes an honest retained status by default, but requires a
+//! sealed MAP_KEY and a fresh same-host vehicle fix before it makes a request.
+//! Every response is bounded, validated, and published as one complete
+//! latest-wins snapshot.
 
 #![cfg(feature = "async-services")]
 
@@ -19,7 +20,8 @@ use reqwest::blocking::Client;
 
 use super::{ShutdownToken, Worker};
 
-/// Explicit overlay opt-in. Unset/false is an idle no-op.
+/// Optional overlay opt-out. Unset/unknown truthy values keep the retained
+/// status mirror present; `0|false|no|off` disable it entirely.
 pub const ENABLED_ENV: &str = "MDE_OVERLAY_FIRMS_HOTSPOTS";
 /// Optional official FIRMS source selector (for example `VIIRS_NOAA20_NRT`).
 pub const SOURCE_ENV: &str = "MDE_OVERLAY_FIRMS_SOURCE";
@@ -517,12 +519,14 @@ pub struct FirmsOverlayWorker {
 }
 
 impl FirmsOverlayWorker {
-    /// Production wiring. Disabled unless explicitly opted in.
+    /// Production wiring. Present by default; set
+    /// `MDE_OVERLAY_FIRMS_HOTSPOTS=0` to suppress this optional external-feed
+    /// topic entirely.
     #[must_use]
     pub fn new(host: String) -> Self {
         Self {
             host,
-            enabled: env_truthy(ENABLED_ENV),
+            enabled: env_default_enabled(ENABLED_ENV),
             probe: None,
             key_source: Arc::new(SealedApiKeySource),
             bus_root: crate::bus_publish::default_bus_root(),
@@ -596,23 +600,40 @@ impl FirmsOverlayWorker {
                 (true, None, false)
             }
             Err(error) => {
-                if let Some(snapshot) = last_good {
-                    snapshot.published_at_ms = now_ms();
-                    snapshot
-                        .gaps
-                        .retain(|gap| !gap.starts_with("NASA FIRMS paused:"));
-                    push_gap(&mut snapshot.gaps, format!("NASA FIRMS paused: {error}"));
-                    self.publish(snapshot);
+                let previous_context = last_good.as_ref().and_then(|snapshot| {
+                    Some(FirmsContext {
+                        latitude: snapshot.query_latitude?,
+                        longitude: snapshot.query_longitude?,
+                    })
+                });
+                let reason = if previous_context.is_some_and(|previous| previous != context) {
+                    format!(
+                        "NASA FIRMS paused: prior-location hotspots withheld after refresh failure: {error}"
+                    )
                 } else {
-                    self.publish(&self.status_snapshot(
-                        FirmsAvailability::Ready,
-                        Some(context),
-                        format!("NASA FIRMS paused: {error}"),
-                    ));
-                }
+                    format!("NASA FIRMS paused: refresh unavailable; hotspots withheld: {error}")
+                };
+                self.publish(&self.status_snapshot(
+                    FirmsAvailability::Ready,
+                    Some(context),
+                    reason,
+                ));
+                *last_good = None;
                 (false, error.retry_after, error.reload_key)
             }
         }
+    }
+
+    fn publish_no_context_degraded(&self, last_good: &mut Option<FirmsSnapshot>, reason: &str) {
+        self.publish(&self.status_snapshot(
+            FirmsAvailability::Ready,
+            None,
+            format!("NASA FIRMS paused: {reason}"),
+        ));
+        // Thermal anomalies are vehicle-scoped. Once the same-host fix
+        // disappears, keep the retained Bus topic present but do not allow a
+        // later failure to replay hotspots from the stale prior query origin.
+        *last_good = None;
     }
 
     async fn load_probe(
@@ -741,11 +762,10 @@ impl Worker for FirmsOverlayWorker {
             }
             let Some(context) = self.current_context() else {
                 if !no_fix_published {
-                    self.publish(&self.status_snapshot(
-                        FirmsAvailability::Ready,
-                        None,
+                    self.publish_no_context_degraded(
+                        &mut last_good,
                         "fresh same-host vehicle fix unavailable",
-                    ));
+                    );
                     no_fix_published = true;
                 }
                 tokio::select! {
@@ -789,13 +809,15 @@ impl Worker for FirmsOverlayWorker {
     }
 }
 
-fn env_truthy(name: &str) -> bool {
-    std::env::var(name).is_ok_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
+fn env_default_enabled(name: &str) -> bool {
+    overlay_enabled_from_env(std::env::var(name).ok().as_deref())
+}
+
+fn overlay_enabled_from_env(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(|value| value.trim().to_ascii_lowercase()),
+        Some(value) if matches!(value.as_str(), "0" | "false" | "no" | "off")
+    )
 }
 
 fn now_ms() -> i64 {
@@ -807,6 +829,11 @@ fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use mde_bus::persist::Persist;
+
     use super::*;
 
     const CSV: &str = "latitude,longitude,bright_ti4,frp,acq_date,acq_time,satellite,confidence\n35.78,-78.64,331.2,18.4,2026-07-23,123456,N20,nominal\n35.80,-78.60,,,,2026-07-23,124000,N20,low\n";
@@ -948,5 +975,158 @@ mod tests {
         assert!(validate_api_key("abcdefghijklmnop/secret").is_err());
         assert!(validate_source("VIIRS_NOAA20_NRT").is_ok());
         assert!(validate_source("../../secret").is_err());
+    }
+
+    #[test]
+    fn keyed_firms_producer_defaults_on_with_explicit_false_opt_out() {
+        assert!(overlay_enabled_from_env(None));
+        assert!(overlay_enabled_from_env(Some("")));
+        assert!(overlay_enabled_from_env(Some("1")));
+        assert!(overlay_enabled_from_env(Some("true")));
+        assert!(overlay_enabled_from_env(Some("yes")));
+        assert!(overlay_enabled_from_env(Some("on")));
+        assert!(overlay_enabled_from_env(Some("unexpected")));
+        assert!(!overlay_enabled_from_env(Some("0")));
+        assert!(!overlay_enabled_from_env(Some("false")));
+        assert!(!overlay_enabled_from_env(Some("NO")));
+        assert!(!overlay_enabled_from_env(Some(" off ")));
+    }
+
+    #[test]
+    fn failed_refresh_publishes_empty_degraded_snapshot_without_replaying_hotspots() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().to_path_buf();
+        let worker = FirmsOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+        let original = parse_snapshot(
+            "rig-1",
+            FirmsContext {
+                latitude: 35.78,
+                longitude: -78.64,
+            },
+            CSV,
+            1_800_000_000_000,
+            DEFAULT_SOURCE,
+        )
+        .expect("snapshot");
+        assert_eq!(original.hotspots.len(), 1);
+        let moved = FirmsContext {
+            latitude: 36.10,
+            longitude: -79.00,
+        };
+        let mut last_good = Some(original);
+
+        let (success, retry_after, reload_key) =
+            worker.apply_result(Err(ProbeFailure::other("timeout")), moved, &mut last_good);
+
+        assert!(!success);
+        assert_eq!(retry_after, None);
+        assert!(!reload_key);
+        assert!(
+            last_good.is_none(),
+            "old vehicle-scoped FIRMS hotspot cache must not survive refresh failure"
+        );
+        let body = Persist::open(root)
+            .expect("bus")
+            .read_latest(&firms_state_topic("rig-1"))
+            .expect("read")
+            .expect("message")
+            .body
+            .expect("body");
+        let snapshot: FirmsSnapshot = serde_json::from_str(&body).expect("snapshot");
+        assert_eq!(snapshot.availability, FirmsAvailability::Ready);
+        assert_eq!(snapshot.fetched_at_ms, None);
+        assert_eq!(snapshot.query_latitude, Some(moved.latitude));
+        assert_eq!(snapshot.query_longitude, Some(moved.longitude));
+        assert!(snapshot.hotspots.is_empty());
+        assert!(snapshot.gaps.iter().any(|gap| {
+            gap.contains("prior-location hotspots withheld") && gap.contains("timeout")
+        }));
+    }
+
+    #[test]
+    fn no_vehicle_fix_degraded_snapshot_retracts_prior_hotspots_and_query_origin() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().to_path_buf();
+        let worker = FirmsOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+        let original = parse_snapshot(
+            "rig-1",
+            FirmsContext {
+                latitude: 35.78,
+                longitude: -78.64,
+            },
+            CSV,
+            1_800_000_000_000,
+            DEFAULT_SOURCE,
+        )
+        .expect("snapshot");
+        assert!(!original.hotspots.is_empty());
+        let mut last_good = Some(original);
+
+        worker
+            .publish_no_context_degraded(&mut last_good, "fresh same-host vehicle fix unavailable");
+
+        assert!(
+            last_good.is_none(),
+            "old vehicle-scoped FIRMS hotspot cache must not survive fix loss"
+        );
+        let body = Persist::open(root)
+            .expect("bus")
+            .read_latest(&firms_state_topic("rig-1"))
+            .expect("read")
+            .expect("message")
+            .body
+            .expect("body");
+        let snapshot: FirmsSnapshot = serde_json::from_str(&body).expect("snapshot");
+        assert_eq!(snapshot.availability, FirmsAvailability::Ready);
+        assert_eq!(snapshot.fetched_at_ms, None);
+        assert_eq!(snapshot.query_latitude, None);
+        assert_eq!(snapshot.query_longitude, None);
+        assert!(snapshot.hotspots.is_empty());
+        assert!(snapshot
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("vehicle fix unavailable")));
+    }
+
+    struct MissingKey;
+
+    impl ApiKeySource for MissingKey {
+        fn load(&self) -> Result<Option<String>, String> {
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_sealed_key_publishes_unconfigured_without_fetch_time() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().to_path_buf();
+        let mut worker =
+            FirmsOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+        worker.enabled = true;
+        worker.key_source = Arc::new(MissingKey);
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move { worker.run(ShutdownToken::from_receiver(rx)).await });
+        let topic = firms_state_topic("rig-1");
+        let mut decoded = None;
+        for _ in 0..20 {
+            if let Some(body) = Persist::open(root.clone())
+                .ok()
+                .and_then(|persist| persist.read_latest(&topic).ok().flatten())
+                .and_then(|event| event.body)
+            {
+                decoded = serde_json::from_str::<FirmsSnapshot>(&body).ok();
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tx.send(true).expect("shutdown");
+        task.await.expect("join").expect("worker");
+        let snapshot = decoded.expect("unconfigured snapshot");
+        assert_eq!(snapshot.availability, FirmsAvailability::Unconfigured);
+        assert_eq!(snapshot.fetched_at_ms, None);
+        assert_eq!(snapshot.query_latitude, None);
+        assert_eq!(snapshot.query_longitude, None);
+        assert!(snapshot.hotspots.is_empty());
+        assert!(snapshot.gaps[0].contains("firms-api-key"));
     }
 }

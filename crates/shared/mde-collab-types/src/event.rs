@@ -112,6 +112,11 @@ pub enum CollabEventKind {
         /// The resolved thread.
         thread: ThreadId,
     },
+    /// A resolved thread was reopened.
+    ThreadReopened {
+        /// The reopened thread.
+        thread: ThreadId,
+    },
 
     // ---- Alerts --------------------------------------------------------
     /// An alert was raised (folded from a truthful Bus lane) into the space.
@@ -308,6 +313,7 @@ impl CollabEventKind {
             Self::MessageDeleted { .. } => "message_deleted",
             Self::ThreadStarted { .. } => "thread_started",
             Self::ThreadResolved { .. } => "thread_resolved",
+            Self::ThreadReopened { .. } => "thread_reopened",
             Self::AlertRaised { .. } => "alert_raised",
             Self::AlertAcknowledged { .. } => "alert_acknowledged",
             Self::AlertSnoozed { .. } => "alert_snoozed",

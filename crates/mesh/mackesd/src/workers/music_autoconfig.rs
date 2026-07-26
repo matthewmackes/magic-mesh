@@ -1,19 +1,23 @@
 //! MEDIA-8 — Workstation music auto-config.
 //!
 //! A fresh Workstation should open `mde-music` and browse the mesh library with
-//! ZERO manual connect. This worker is the Workstation half of MEDIA-8: it reads
-//! the published mesh media service (the `shared_account` MEDIA-7's
-//! `media_registry` worker now puts in `mesh/services/media/<peer>` + the
-//! replicated QNM-Shared `<host>/media-registry.json` plane) and idempotently
-//! writes the desktop user's `~/.local/share/mde/airsonic-creds.json`, so the
-//! player auto-browses instead of showing the first-run connect form.
+//! ZERO manual connect. This worker is the Workstation half of MEDIA-8 and, for
+//! WL-FUNC-014, the first controlled gateway credential materializer: it prefers
+//! manually registered LAN AirSonic gateway sources from
+//! `<host>/airsonic-gateway-registry.json`, resolves the selected source's sealed
+//! `credential_ref`, and idempotently writes the desktop user's
+//! `~/.local/share/mde/airsonic-creds.json` with the mesh gateway proxy URL. Only
+//! when no gateway source exists does it fall back to the older shared
+//! `media-registry.json` account path.
 //!
-//! **No mesh age key on Workstations** (binding operator decision): the shared
-//! account flows through the SERVICE REGISTRY, not the secret store. A Workstation
-//! never reads/holds the `media-spaces` secret — only a Lighthouse_Media node does
-//! (the publish side). This worker just reads the already-published account off
-//! the replicated plane, exactly as `app_sync` / `apps::fleet_*` read their
-//! planes.
+//! **No legacy media-spaces secret on Workstations** (binding operator decision):
+//! the fallback shared account flows through the SERVICE REGISTRY, not the secret
+//! store. WL-FUNC-014 gateway registrations are different: the replicated source
+//! carries only a sealed `credential_ref`, and this root-owned worker is the
+//! controlled boundary that resolves it into the seated user's client creds. If a
+//! gateway source exists but its credential is absent or malformed, the worker
+//! reports that honestly and does **not** silently configure the legacy
+//! `music.mesh` account over the operator's gateway intent.
 //!
 //! **Writes to the DESKTOP user's home, not root's.** `mackesd` runs as root, so
 //! `$HOME` is `/root` — useless to the seated user's `mde-music`. The worker
@@ -39,7 +43,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use super::{ShutdownToken, Worker};
-use crate::mesh_media::{self, SharedAccount};
+use crate::ipc::secret_store::{repo_root, SecretStore};
+use crate::mesh_media::{self, AirsonicGatewaySource, SharedAccount};
 
 /// 60 s reconcile tick — matches `app_sync` / `remmina_sync`. The published
 /// account is slow-changing (a shared mesh credential); 60 s picks up a newly
@@ -108,6 +113,84 @@ fn creds_json(account: &SharedAccount) -> String {
     serde_json::to_string_pretty(&v).expect("creds JSON is plain")
 }
 
+/// The plaintext body stored under an AirSonic gateway source's sealed
+/// `credential_ref`. The registry carries the source URL; the secret carries
+/// only the read-only Subsonic auth pair, so a compromised or stale secret cannot
+/// override the selected gateway proxy back to a direct LAN URL or `music.mesh`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SealedAirsonicCreds {
+    /// Subsonic read-only username.
+    username: String,
+    /// Subsonic password. Empty is permitted for open Subsonic-compatible
+    /// servers, matching `mde-musicd::creds::is_valid`.
+    password: String,
+}
+
+/// The materialized `mde-musicd::creds::Creds` body selected from one gateway
+/// source and one decrypted credential body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MaterializedGatewayCreds {
+    /// Pretty-printed `airsonic-creds.json` body.
+    body: String,
+    /// Mesh proxy URL that the client will dial; used in write logs.
+    source_url: String,
+}
+
+/// Build the desktop user's `airsonic-creds.json` from a gateway source and a
+/// decrypted sealed credential body. The source owns the server URL; the secret
+/// owns only username/password.
+fn gateway_creds_json(source: &AirsonicGatewaySource, secret_body: &str) -> Result<String, String> {
+    let sealed: SealedAirsonicCreds = serde_json::from_str(secret_body)
+        .map_err(|e| format!("parse sealed AirSonic credential: {e}"))?;
+    let username = sealed.username.trim();
+    if username.is_empty() || username != sealed.username {
+        return Err(
+            "sealed AirSonic credential username must be non-empty and trimmed".to_string(),
+        );
+    }
+    if source.source_url == mesh_media::music_mesh_server_url() {
+        return Err("AirSonic gateway source resolved to legacy music.mesh URL".to_string());
+    }
+    let v = serde_json::json!({
+        "server_url": source.source_url.as_str(),
+        "username": username,
+        "password": sealed.password,
+    });
+    serde_json::to_string_pretty(&v).map_err(|e| format!("serialize gateway creds: {e}"))
+}
+
+/// Select the best gateway source for this tick and resolve its sealed
+/// credential. `read_secret` is injected so tests can prove the failover and
+/// no-plaintext contract without depending on a live secret backend.
+fn materialized_gateway_creds(
+    sources: &[AirsonicGatewaySource],
+    last_selected: Option<&str>,
+    mut read_secret: impl FnMut(&str) -> Result<Option<String>, String>,
+) -> Result<Option<MaterializedGatewayCreds>, String> {
+    let Some(source) = mesh_media::select_airsonic_gateway_source(sources, last_selected) else {
+        return Ok(None);
+    };
+    let secret_body = read_secret(&source.credential_ref)
+        .map_err(|e| {
+            format!(
+                "read sealed AirSonic credential {}: {e}",
+                source.credential_ref
+            )
+        })?
+        .ok_or_else(|| {
+            format!(
+                "sealed AirSonic credential {} is absent for source {}",
+                source.credential_ref, source.id
+            )
+        })?;
+    let body = gateway_creds_json(source, &secret_body)?;
+    Ok(Some(MaterializedGatewayCreds {
+        body,
+        source_url: source.source_url.clone(),
+    }))
+}
+
 /// What the worker should do with the creds file this tick — computed PURELY so
 /// the no-clobber + idempotency decision is unit-tested apart from any I/O.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,22 +227,23 @@ fn decide(desired: &str, current: Option<&str>, marker: Option<&str>) -> WriteDe
     }
 }
 
-/// One reconcile cycle against `home` (the desktop user's home) + the discovered
-/// `account` (`None` = no service published yet → nothing to do). `owner` chowns
-/// the written files to the desktop user. Returns whether a write happened
-/// (for the worker's log line + the tests). Best-effort: an I/O error is logged,
-/// never fatal.
-fn reconcile(home: &Path, account: Option<&SharedAccount>, owner: Option<(u32, u32)>) -> bool {
-    let Some(account) = account else {
+/// Reconcile an already-built `mde-musicd::creds::Creds` JSON body into the
+/// seated user's home while preserving the existing no-clobber marker discipline.
+fn reconcile_desired(
+    home: &Path,
+    desired: Option<&str>,
+    owner: Option<(u32, u32)>,
+    server: &str,
+) -> bool {
+    let Some(desired) = desired else {
         return false;
     };
     let creds_path = home.join(CREDS_REL_PATH);
     let marker_path = home.join(MARKER_REL_PATH);
-    let desired = creds_json(account);
     let current = std::fs::read_to_string(&creds_path).ok();
     let marker = std::fs::read_to_string(&marker_path).ok();
 
-    match decide(&desired, current.as_deref(), marker.as_deref()) {
+    match decide(desired, current.as_deref(), marker.as_deref()) {
         WriteDecision::Skip => false,
         WriteDecision::Write(body) => {
             if let Some(parent) = creds_path.parent() {
@@ -179,10 +263,52 @@ fn reconcile(home: &Path, account: Option<&SharedAccount>, owner: Option<(u32, u
             chown_owned(&marker_path, owner);
             tracing::info!(
                 target: "mackesd::music_autoconfig",
-                server = %account.server,
-                "auto-configured mde-music with the mesh shared account"
+                server = %server,
+                "auto-configured mde-music credentials"
             );
             true
+        }
+    }
+}
+
+/// One reconcile cycle against `home` (the desktop user's home) + the discovered
+/// `account` (`None` = no service published yet → nothing to do). `owner` chowns
+/// the written files to the desktop user. Returns whether a write happened
+/// (for the worker's log line + the tests). Best-effort: an I/O error is logged,
+/// never fatal.
+fn reconcile(home: &Path, account: Option<&SharedAccount>, owner: Option<(u32, u32)>) -> bool {
+    let Some(account) = account else {
+        return false;
+    };
+    let desired = creds_json(account);
+    reconcile_desired(home, Some(&desired), owner, &account.server)
+}
+
+/// Reconcile AirSonic gateway sources into the desktop user's client creds.
+/// Presence of any gateway source means WL-FUNC-014 owns this tick: missing or
+/// malformed sealed credentials are surfaced and do not fall back to the legacy
+/// `music.mesh` account.
+fn reconcile_gateway_sources(
+    home: &Path,
+    sources: &[AirsonicGatewaySource],
+    owner: Option<(u32, u32)>,
+    read_secret: impl FnMut(&str) -> Result<Option<String>, String>,
+) -> bool {
+    match materialized_gateway_creds(sources, None, read_secret) {
+        Ok(Some(materialized)) => reconcile_desired(
+            home,
+            Some(&materialized.body),
+            owner,
+            &materialized.source_url,
+        ),
+        Ok(None) => false,
+        Err(e) => {
+            tracing::warn!(
+                target: "mackesd::music_autoconfig",
+                error = %e,
+                "AirSonic gateway credential materialization pending"
+            );
+            false
         }
     }
 }
@@ -207,6 +333,13 @@ fn run_once(workgroup_root: &Path) -> bool {
     let Some((uid, gid, home)) = desktop_user() else {
         return false;
     };
+    let gateway_sources = mesh_media::read_airsonic_gateway_sources_from_plane(workgroup_root);
+    if !gateway_sources.is_empty() {
+        let store = SecretStore::resolve(&repo_root(), workgroup_root);
+        return reconcile_gateway_sources(&home, &gateway_sources, Some((uid, gid)), |cred_ref| {
+            store.get(cred_ref)
+        });
+    }
     let account = mesh_media::read_shared_account_from_plane(workgroup_root);
     reconcile(&home, account.as_ref(), Some((uid, gid)))
 }
@@ -284,6 +417,32 @@ mod tests {
         SharedAccount::new(user, pass)
     }
 
+    fn gateway_source(
+        node: &str,
+        upstream: &str,
+        credential_ref: &str,
+        health: mesh_media::GatewayHealth,
+        mesh_default: bool,
+    ) -> AirsonicGatewaySource {
+        let reg = mesh_media::AirsonicGatewayRegistration::new(
+            node,
+            upstream,
+            credential_ref,
+            health,
+            mesh_default,
+        )
+        .unwrap();
+        mesh_media::source_from_airsonic_gateway(&reg).unwrap()
+    }
+
+    fn sealed_airsonic_creds(user: &str, pass: &str) -> String {
+        serde_json::json!({
+            "username": user,
+            "password": pass,
+        })
+        .to_string()
+    }
+
     #[test]
     fn worker_name_is_music_autoconfig() {
         assert_eq!(build().name(), "music_autoconfig");
@@ -317,6 +476,146 @@ mod tests {
         assert_eq!(v["password"], "hunter2");
         // No extra/renamed fields that a strict Creds deserialize would reject.
         assert_eq!(v.as_object().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn gateway_creds_json_uses_proxy_url_and_sealed_pair_only() {
+        let source = gateway_source(
+            "gateway-a",
+            "http://nas.lan:4040",
+            "media/airsonic/shared-readonly",
+            mesh_media::GatewayHealth::Healthy,
+            true,
+        );
+
+        let json = gateway_creds_json(&source, &sealed_airsonic_creds("mesh-readonly", "hunter2"))
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(v["server_url"], source.source_url);
+        assert_eq!(v["username"], "mesh-readonly");
+        assert_eq!(v["password"], "hunter2");
+        assert_eq!(v.as_object().unwrap().len(), 3);
+        assert!(
+            !json.contains("nas.lan"),
+            "client creds must not expose the LAN upstream URL"
+        );
+        assert!(
+            !json.contains("credential_ref"),
+            "client creds must not embed the sealed reference"
+        );
+        assert_ne!(v["server_url"], mesh_media::music_mesh_server_url());
+    }
+
+    #[test]
+    fn gateway_creds_json_rejects_secret_url_override_and_blank_user() {
+        let source = gateway_source(
+            "gateway-a",
+            "http://nas.lan:4040",
+            "media/airsonic/shared-readonly",
+            mesh_media::GatewayHealth::Healthy,
+            true,
+        );
+
+        let override_err = gateway_creds_json(
+            &source,
+            r#"{"username":"mesh-readonly","password":"hunter2","server_url":"http://music.mesh:4533"}"#,
+        )
+        .unwrap_err();
+        assert!(
+            override_err.contains("unknown field"),
+            "secret body must not be allowed to override source_url: {override_err}"
+        );
+
+        let blank_err =
+            gateway_creds_json(&source, &sealed_airsonic_creds(" mesh ", "hunter2")).unwrap_err();
+        assert!(blank_err.contains("username"));
+    }
+
+    #[test]
+    fn materialized_gateway_creds_fails_over_to_healthy_source_before_secret_read() {
+        let degraded_default = gateway_source(
+            "gateway-degraded",
+            "http://default.lan:4040",
+            "media/airsonic/degraded-default",
+            mesh_media::GatewayHealth::Degraded,
+            true,
+        );
+        let healthy = gateway_source(
+            "gateway-healthy",
+            "http://healthy.lan:4040",
+            "media/airsonic/healthy",
+            mesh_media::GatewayHealth::Healthy,
+            false,
+        );
+
+        let materialized = materialized_gateway_creds(
+            &[degraded_default, healthy.clone()],
+            None,
+            |credential_ref| {
+                assert_eq!(
+                    credential_ref, healthy.credential_ref,
+                    "a healthy source should win over a degraded default"
+                );
+                Ok(Some(sealed_airsonic_creds("mesh-readonly", "hunter2")))
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&materialized.body).unwrap();
+
+        assert_eq!(v["server_url"], healthy.source_url);
+        assert_eq!(materialized.source_url, healthy.source_url);
+    }
+
+    #[test]
+    fn reconcile_gateway_sources_writes_proxy_creds_and_marker() {
+        let home = tmp_home("gateway-write");
+        let source = gateway_source(
+            "gateway-a",
+            "http://nas.lan:4040",
+            "media/airsonic/shared-readonly",
+            mesh_media::GatewayHealth::Healthy,
+            true,
+        );
+
+        let wrote = reconcile_gateway_sources(&home, &[source.clone()], None, |credential_ref| {
+            assert_eq!(credential_ref, source.credential_ref);
+            Ok(Some(sealed_airsonic_creds("mesh-readonly", "hunter2")))
+        });
+        let creds = std::fs::read_to_string(home.join(CREDS_REL_PATH)).unwrap();
+        let marker = std::fs::read_to_string(home.join(MARKER_REL_PATH)).unwrap();
+        let _ = std::fs::remove_dir_all(&home);
+        let v: serde_json::Value = serde_json::from_str(&creds).unwrap();
+
+        assert!(wrote, "gateway source materialization should write creds");
+        assert_eq!(v["server_url"], source.source_url);
+        assert_eq!(v["username"], "mesh-readonly");
+        assert_eq!(v["password"], "hunter2");
+        assert_eq!(marker, creds, "marker records the worker-owned write");
+        assert_ne!(v["server_url"], mesh_media::music_mesh_server_url());
+    }
+
+    #[test]
+    fn reconcile_gateway_sources_waits_when_secret_is_absent() {
+        let home = tmp_home("gateway-pending");
+        let source = gateway_source(
+            "gateway-a",
+            "http://nas.lan:4040",
+            "media/airsonic/shared-readonly",
+            mesh_media::GatewayHealth::Healthy,
+            true,
+        );
+
+        let wrote = reconcile_gateway_sources(&home, &[source], None, |_credential_ref| Ok(None));
+        let exists = home.join(CREDS_REL_PATH).exists();
+        let _ = std::fs::remove_dir_all(&home);
+
+        assert!(!wrote, "pending sealed credential must not fake a write");
+        assert!(
+            !exists,
+            "legacy music.mesh fallback must not be materialized"
+        );
     }
 
     // ── the pure write decision (no-clobber + idempotent) ──

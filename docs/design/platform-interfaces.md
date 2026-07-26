@@ -12,15 +12,14 @@
 > Build epics: **WL-UX-006** (Construct) + **WL-UX-007** (Car) in
 > `docs/platform/WORKLIST.md`.
 
-⚠️ **Design-lock reversal, intentional and operator-approved (2026-07-22).**
+⚠️ **Design-lock reversal, intentional and operator-approved.**
 The Win10-structure chrome direction (win10-taskbar.md, itself a reversal of
 VDOCK) is retired by this document. Do **not** re-implement a bottom taskbar,
-tray flyouts, or a Start-style panel. The front-door doc's iPadOS-home locks
-(Q86/89 there) are *revived and re-scoped here* against the live egui shell.
-Two prior locks are explicitly reversed **in lockstep** by this survey:
-front-door Q86/89's "no dock" is **confirmed** (Construct has no dock), and
-NAVBAR-W10's "kill the top status bar" is **reversed** (Construct has a slim
-top status bar).
+tray flyouts, or a Start-style panel. The 2026-07-26 operator survey supersedes
+the earlier 2026-07-22 icon-grid-without-launcher-rail Home lock: Construct now
+has a persistent Springboard Dock and an icon-free Bing-wallpaper Home. NAVBAR-W10's
+"kill the top status bar" remains reversed: Construct has a slim top status
+bar. The Dock is governed launcher chrome, not a taskbar revival.
 
 ---
 
@@ -34,8 +33,9 @@ distillation below is the in-repo statement of the standard; per-requirement
 citations name the HIG section they derive from (survey Q43: both).
 
 **P1 — Hierarchy & deference.** Content first; chrome recedes. Persistent
-chrome earns its pixels (one slim status bar, nothing else). Elevation and
-grouping express hierarchy, not decoration. *(HIG › Foundations › Layout)*
+chrome earns its pixels: one slim status bar and the reserved Springboard Dock.
+Elevation and grouping express hierarchy, not decoration. *(HIG › Foundations ›
+Layout)*
 
 **P2 — Clarity of type.** One semantic type ramp (Large Title → Caption),
 used by role, never by ad-hoc size. Text is legible at its viewing distance —
@@ -68,9 +68,10 @@ Pointing devices, Keyboards)*
 never fabricated. (House rule predating this doc; the HIG's "clarity" applied
 to live systems.)
 
-**P9 — Consistent appearance.** Dark, always (survey Q3). HIG dark-mode
-guidance governs contrast and elevation within the single Quazar-dark
-appearance. *(HIG › Foundations › Dark Mode, Color)*
+**P9 — Consistent appearance.** Quazar Dark and production Quazar Light both
+ship. HIG appearance guidance governs contrast, elevation, and semantic color in
+both schemes; Car remains an explicit always-dark AutoSync3 profile. *(HIG ›
+Foundations › Dark Mode, Color)*
 
 **P10 — Glanceability under motion (Car).** In the vehicle, information is
 consumable in a glance and interaction depth is capped; the interface defers
@@ -82,8 +83,9 @@ to driving. *(HIG › Platforms › Designing for CarPlay — as principles)*
 
 Construct is the seat experience of `mde-shell-egui`: DRM-native, egui-only,
 full-screen-first. Structure is iPadOS-derived; pointer/keyboard manners are
-macOS-derived (Q2). Identity is Quazar-dark (Q1, Q3): `Style::BG #16161A`,
-azure accent `#5B8CFF`, the 8 categorical group accents, Carbon glyphs.
+macOS-derived (Q2). Identity is Quazar: Dark starts from `Style::BG #16161A`,
+Light is a production first-class appearance, both share azure accent
+`#5B8CFF`, the categorical group accents, and Carbon glyphs.
 
 ### 2.1 Foundation locks
 
@@ -91,31 +93,34 @@ azure accent `#5B8CFF`, the 8 categorical group accents, Carbon glyphs.
 |---|---|---|
 | Q1 | HIG as **principles**, not a pixel clone | Foundations (all) |
 | Q2 | **iPadOS structure + macOS pointer manners** | Designing for iPadOS / macOS |
-| Q3 | **Dark-only** appearance (Quazar-dark) | Dark Mode |
+| Q3 | **Quazar Dark + production Quazar Light** appearances | Appearance / Color |
 | Q4 | **Inter** carries the HIG type ramp (SF stand-in); **IBM Plex Mono** for code/terminal content | Typography |
 
 ### 2.2 Home — the springboard (Q5–Q9)
 
-- **Q5 — Persistent home.** One untitled all-icons grid is the **base layer**:
-  the seat boots to it, and leaving any app lands on it. It draws over the
-  existing wallpaper/backdrop. The collapsed "session EmptyState" is retired.
+- **Q5 — Persistent Home.** One untitled icon-free Home is the **base layer**:
+  the seat boots to it, and leaving any app lands on it. It draws the daily
+  Microsoft Bing wallpaper through the platform wallpaper policy/cache with
+  cached and bundled fallbacks. The collapsed "session EmptyState" is retired.
   *(Designing for iPadOS › The Home Screen)*
-- **Q8 — One desktop, taxonomy accents.** The single desktop flattens the 8
-  `LAUNCHER_GROUPS` (Mesh Control · Desktop & Session · Media · Files & Data ·
-  Web · Developer Tools · Comms · System) into one canonical icon list. Groups
-  remain the source of tile accent colors and search grouping; they are not
-  separate pages. **No free arrangement, no folders, no arrangement state.**
-  The compile-time "every Surface exactly once" guard remains the desktop
-  catalog guard.
-- **Q6/Q7/Q9 — No widgets, no live-data cards.** Home is pure icons. Live data
-  lives in the surfaces that own it (Maps, Workbench) — nothing new.
-- **Q10 — No dock.** (Confirms front-door Q86/89.) Pinned-app state
-  (`launcher_pins`) retires with it.
-- Tile treatment (Q22): rounded-rect plate, per-group accent background, white
-  Carbon glyph, label beneath. *(App Icons — as principles: one silhouette
-  language, no photorealism)*
-- No page indicator dots or page swipe; Tab/arrow keys and click open the
-  complete list directly.
+- **Q8 — One desktop, taxonomy accents.** The single Home has no icon grid,
+  pages, free arrangement, folders, or arrangement state. Surface taxonomy still
+  exists as the canonical launcher catalog: it colors Dock cells, Front Door
+  search grouping, switcher affordances, and compile-time "every Surface exactly
+  once" guards.
+- **Q6/Q7/Q9 — No widgets, no live-data cards.** Home is wallpaper plus passive
+  system identity; live data lives in the surfaces that own it (Maps, Workloads,
+  Media, Mesh Teams) and in governed overlays such as Control Center.
+- **Q10 — Persistent Springboard Dock.** A bottom-centered, reserved-space Dock
+  is always visible in Construct except where a focused immersive surface has an
+  explicit full-pixel guarantee (for example focused VDI). Every launchable
+  surface remains reachable from the Dock with shrink-to-fit cells; pinned state
+  is the Dock authority.
+- Dock treatment (Q22): rounded-rect cells, taxonomy/accent treatment, white
+  Carbon glyphs, compact labels as density allows. *(App Icons — as principles:
+  one silhouette language, no photorealism)*
+- No page indicator dots or page swipe; Tab/arrow keys, Dock activation, and
+  Front Door search open the complete launcher set directly.
 
 ### 2.3 Persistent chrome (Q11–Q12)
 
@@ -123,6 +128,9 @@ azure accent `#5B8CFF`, the 8 categorical group accents, Carbon glyphs.
   power, alert count right — fed by the existing `status.rs` StatusSegments
   rollups. Surfaces may declare full-screen auto-hide (VDI always does).
   *(Status Bars)* **This reverses NAVBAR-W10's top-bar kill, deliberately.**
+- **Q12b — Reserved Dock space.** Construct body layout reserves Dock pixels so
+  the Dock never overlays workspace controls. Immersive VDI can still request
+  the full native-resolution exception named in Q28.
 - **Q11 — The system gesture contract, with pointer parity:**
 
 | Intent | Touch | Pointer / keys |
@@ -246,11 +254,11 @@ bindings (`CarAction`) re-map accordingly; Music gains media-transport keys.
 
 ## 4. Acceptance (Q48)
 
-- **Construct (WL-UX-006):** screenshot/pixel proof on the `.15` DRM seat —
-  the untitled all-icons Desktop, status bar, Control Center, Notification
-  Center, Spotlight, app switcher with real snapshots, zoom and navigation-bar
-  transitions, VDI full-resolution with auto-hidden bar. Operator visual
-  signoff.
+- **Construct (WL-UX-006/WL-UX-009):** screenshot/pixel proof on the `.15` DRM
+  seat — the untitled icon-free Bing-wallpaper Home, reserved Springboard Dock,
+  status bar, Control Center, Notification Center, Spotlight, app switcher with
+  real snapshots, zoom and navigation-bar transitions, Quazar Dark and Light,
+  and VDI full-resolution with auto-hidden bar. Operator visual signoff.
 - **Car (WL-UX-007):** live proof with the MG90 vehicle mirror online —
   dashboard cards live, instrument strip **fresh on every Car screen**,
   soft in-motion limits engage above threshold, one-tap toggle. Operator

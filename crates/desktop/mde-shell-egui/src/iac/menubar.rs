@@ -1,12 +1,13 @@
-//! MENUBAR-ALL (Workloads) — the shared bar over the delivery-type cockpit. Every
-//! item is a real seam (§6): the **Cloud** spine (Refresh), the **Provision** +
-//! **Configure** action menus (the plan/apply gate as mouse twins of the body's
-//! own buttons), a **View** menu that jumps to any of the five delivery views, a
-//! **Panels** menu that opens any lens, and **Help**. The status cluster reads the
-//! live `state/cloud` fold (nodes · backend-ready · apply posture). Every entry
-//! maps to a landed seam; nothing is a dead entry (§8).
+//! MENUBAR-ALL (Workloads) — the shared bar over the lifecycle-first Workloads
+//! app. Every item is a real seam (§6): the **Cloud** spine (Refresh), the
+//! **Provision** + **Configure** action menus (the plan/apply gate as mouse
+//! twins of the body's own buttons), a **View** menu that changes the delivery
+//! filter, a **Routes** menu that opens lifecycle routes, and **Help**. The
+//! status cluster reads the live `state/cloud` fold (nodes · backend-ready ·
+//! apply posture). Every entry maps to a landed seam; nothing is a dead entry
+//! (§8).
 
-use super::{DeliveryView, Panel, WorkloadsState, CLOUD_PRODUCT_LABEL};
+use super::{DeliveryView, WorkloadsRoute, WorkloadsState, CLOUD_PRODUCT_LABEL};
 use mde_egui::egui::Ui;
 use mde_egui::menubar::{Entry, Item, Menu, MenuBar, MenuBarModel};
 use mde_egui::{ChipTone, StatusChip, Style};
@@ -16,10 +17,10 @@ use mde_egui::{ChipTone, StatusChip, Style};
 pub(super) enum MenuAction {
     /// Force an immediate re-fold of the `state/cloud` mirror (`Cloud → Refresh`).
     Refresh,
-    /// Jump to a delivery view (`View → <view>`) — snaps the lens to its roster.
+    /// Change the delivery filter (`View → <view>`) without changing route.
     Goto(DeliveryView),
-    /// Open a lens (`Panels → <panel>`).
-    Open(Panel),
+    /// Open a lifecycle route (`Routes → <route>`).
+    Open(WorkloadsRoute),
     /// Emit a provision plan (dry-run) — direct (`Provision → Plan`).
     ProvisionPlan,
     /// Open the typed-confirm for a live provision apply (`Provision → Apply`).
@@ -46,7 +47,7 @@ pub(super) fn show(ui: &mut Ui, state: &WorkloadsState) -> Option<MenuAction> {
     MenuBar::show(ui, &model)
 }
 
-/// Build the Cloud / Provision / Configure / View / Panels / Help menus — every
+/// Build the Cloud / Provision / Configure / View / Routes / Help menus — every
 /// item a real landed seam (§8).
 fn build_menus() -> Vec<Menu<MenuAction>> {
     vec![
@@ -78,13 +79,13 @@ fn build_menus() -> Vec<Menu<MenuAction>> {
             ],
         ),
         build_view_menu(),
-        build_panels_menu(),
+        build_routes_menu(),
         build_help_menu(),
     ]
 }
 
-/// The **View** menu — one jump per delivery view (the mouse twin of the
-/// delivery-view selector).
+/// The **View** menu — one jump per delivery filter (the mouse twin of the
+/// delivery filter sidebar).
 fn build_view_menu() -> Menu<MenuAction> {
     Menu::new(
         "View",
@@ -95,13 +96,14 @@ fn build_view_menu() -> Menu<MenuAction> {
     )
 }
 
-/// The **Panels** menu — one jump per lens (the mouse twin of the lens sub-nav).
-fn build_panels_menu() -> Menu<MenuAction> {
+/// The **Routes** menu — one jump per lifecycle route (the mouse twin of the
+/// sidebar).
+fn build_routes_menu() -> Menu<MenuAction> {
     Menu::new(
-        "Panels",
-        Panel::ALL
+        "Routes",
+        WorkloadsRoute::ALL
             .iter()
-            .map(|panel| Entry::Item(Item::new(MenuAction::Open(*panel), panel.label())))
+            .map(|route| Entry::Item(Item::new(MenuAction::Open(*route), route.label())))
             .collect(),
     )
 }
@@ -113,7 +115,7 @@ fn build_help_menu() -> Menu<MenuAction> {
         "Help",
         vec![
             Entry::Caption(format!(
-                "Workloads \u{2014} the {CLOUD_PRODUCT_LABEL} delivery-type cockpit (OpenTofu + \
+                "Workloads \u{2014} the {CLOUD_PRODUCT_LABEL} lifecycle app (OpenTofu + \
                  Ansible + libvirt + Podman)."
             )),
             Entry::Item(Item::new(
@@ -170,23 +172,22 @@ pub(super) fn apply(state: &mut WorkloadsState, action: MenuAction) {
         MenuAction::Refresh => state.request_refresh(),
         MenuAction::Goto(view) => {
             state.set_view(view);
-            state.set_panel(Panel::Roster);
         }
-        MenuAction::Open(panel) => state.set_panel(panel),
+        MenuAction::Open(route) => state.set_route(route),
         MenuAction::ProvisionPlan => {
-            state.set_panel(Panel::Provision);
+            state.set_route(WorkloadsRoute::Provision);
             state.plan_provision();
         }
         MenuAction::ProvisionApply => {
-            state.set_panel(Panel::Provision);
+            state.set_route(WorkloadsRoute::Provision);
             state.arm_provision();
         }
         MenuAction::ConfigureCheck => {
-            state.set_panel(Panel::Configure);
+            state.set_route(WorkloadsRoute::Run);
             state.check_configure();
         }
         MenuAction::ConfigureApply => {
-            state.set_panel(Panel::Configure);
+            state.set_route(WorkloadsRoute::Run);
             state.arm_configure();
         }
         MenuAction::HelpAbout => state.set_help_note(),
@@ -196,7 +197,7 @@ pub(super) fn apply(state: &mut WorkloadsState, action: MenuAction) {
 #[cfg(test)]
 #[allow(clippy::panic)]
 mod tests {
-    use super::super::{DeliveryView, Panel, WorkloadsState};
+    use super::super::{DeliveryView, WorkloadsRoute, WorkloadsState};
     use super::{apply, build_help_menu, build_menus, build_status, MenuAction};
     use mde_egui::menubar::{Entry, Menu};
     use mde_egui::ChipTone;
@@ -218,7 +219,7 @@ mod tests {
     }
 
     #[test]
-    fn the_bar_carries_the_plan_apply_gate_and_every_view_and_panel_jump() {
+    fn the_bar_carries_the_plan_apply_gate_and_every_view_and_route_jump() {
         let menus = build_menus();
         // The plan/apply gate lives in the Provision menu.
         let provision = menu(&menus, "Provision").expect("Provision menu");
@@ -235,27 +236,30 @@ mod tests {
         for v in DeliveryView::ALL {
             assert!(ids(view).contains(&MenuAction::Goto(v)), "missing {v:?}");
         }
-        // Panels opens every lens.
-        let panels = menu(&menus, "Panels").expect("Panels menu");
-        assert_eq!(ids(panels).len(), Panel::ALL.len());
-        for p in Panel::ALL {
-            assert!(ids(panels).contains(&MenuAction::Open(p)), "missing {p:?}");
+        // Routes opens every lifecycle route.
+        let routes = menu(&menus, "Routes").expect("Routes menu");
+        assert_eq!(ids(routes).len(), WorkloadsRoute::ALL.len());
+        for route in WorkloadsRoute::ALL {
+            assert!(
+                ids(routes).contains(&MenuAction::Open(route)),
+                "missing {route:?}"
+            );
         }
     }
 
     #[test]
     fn apply_drives_the_real_seams() {
         let mut state = WorkloadsState::default();
-        // A view jump switches the view + snaps the lens to the roster.
+        // A view jump switches only the delivery filter.
         apply(&mut state, MenuAction::Goto(DeliveryView::AndroidVm));
         assert_eq!(state.view(), DeliveryView::AndroidVm);
-        assert_eq!(state.panel(), Panel::Roster);
-        // A panel jump opens the lens.
-        apply(&mut state, MenuAction::Open(Panel::Status));
-        assert_eq!(state.panel(), Panel::Status);
+        assert_eq!(state.route(), WorkloadsRoute::Provision);
+        // A route jump opens the lifecycle route.
+        apply(&mut state, MenuAction::Open(WorkloadsRoute::Drift));
+        assert_eq!(state.route(), WorkloadsRoute::Drift);
         // Apply infrastructure fails closed without a selected node capability.
         apply(&mut state, MenuAction::ProvisionApply);
-        assert_eq!(state.panel(), Panel::Provision);
+        assert_eq!(state.route(), WorkloadsRoute::Provision);
         assert!(
             !state.has_arming(),
             "unavailable apply must not open the confirm"

@@ -1,21 +1,20 @@
-//! The **Workloads** cockpit (WL-ARCH-006) — the single workspace for every
+//! The **Workloads** app (WL-ARCH-006) — the single workspace for every
 //! delivery-type workload on the local-first **OpenTofu + Ansible + libvirt +
 //! Podman** backend (WL-ARCH-001).
 //!
-//! The surface is organized around the plan's central metaphor: **five
-//! delivery-type views**, each placeable on an explicit mesh node, over the
-//! Tofu/Ansible/libvirt/Podman substrate. The primary axis is *what a workload
-//! delivers* ([`DeliveryView`]); the secondary axis is *which lens* you view it
-//! through ([`Panel`] — the roster, or one of the provision / configure / status
-//! / images / containers panels).
+//! The surface is organized as a lifecycle-first operations app: a persistent
+//! sidebar opens **Provision**, **Plan**, **Run**, **Drift**, **Audit**,
+//! **Images**, and **Containers** routes; delivery types are filters inside the
+//! resource table and provision form rather than the top-level navigation.
 //!
 //! ## Layout (the U3 seam)
 //!
 //! This module owns the durable seam the six panel workers (U14–U19) plug into:
-//! the nav, the folded `state/cloud` mirror, the typed-arming + audit backend
-//! wiring, and the dispatch to each panel's own render fn. Each panel lives in
-//! its own file and owns its own `State` sub-struct, so a downstream worker adds
-//! panel-specific state + rendering in THEIR file and never edits this one.
+//! the nav, the folded `state/cloud` mirror, the review-sheet arming + audit
+//! backend wiring, and the dispatch to each route's own render fn. Each panel
+//! lives in its own file and owns its own `State` sub-struct, so a downstream
+//! worker adds panel-specific state + rendering in THEIR file and never edits
+//! this one.
 //!
 //! ## How the cloud is consumed (§6)
 //!
@@ -33,19 +32,20 @@
 //! destructive intent passes a typed-confirm echo first (RUN-006), and every
 //! performed op lands in the session audit trail.
 
+use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
 use mde_egui::egui::{self, Color32, RichText, Sense};
-use mde_egui::{carbon_icon, Style};
+use mde_egui::{carbon_icon, card, field, muted_note, Style};
 
 use mackes_mesh_types::cloud::{
     cloud_request_digest, decode_cloud_arm_credential, CloudArmSigner, CloudArmedToken,
-    CloudReply as WireCloudReply, CloudState, ConsoleEndpoint, DeliveryType, WorkloadRow,
-    WorkloadSpec, CLOUD_ACTION_SCHEMA_VERSION, CLOUD_ARM_CREDENTIAL, CLOUD_ARM_NODE_SCOPE,
-    CLOUD_STATE_PREFIX, VERB_ANDROID_PROVISION,
+    CloudReply as WireCloudReply, CloudState, ConsoleEndpoint, DeliveryType, DriftFlag,
+    WorkloadRow, WorkloadSpec, CLOUD_ACTION_SCHEMA_VERSION, CLOUD_ARM_CREDENTIAL,
+    CLOUD_ARM_NODE_SCOPE, CLOUD_STATE_PREFIX, VERB_ANDROID_PROVISION, VERB_PLAN,
 };
 
 use mde_bus::hooks::config::Priority;
@@ -400,60 +400,187 @@ impl DeliveryView {
     }
 }
 
-// ─────────────────────────────── the lens axis ──────────────────────────────
+// ───────────────────────────── the route axis ───────────────────────────────
 
-/// Which lens (panel) the main area shows for the selected [`DeliveryView`] —
-/// the secondary nav axis. `Roster` is the selected view's own workload roster;
-/// the rest are the cross-cutting panels the U14–U19 workers own.
+/// Which lifecycle route the main detail pane shows. Delivery type is no longer
+/// a route axis; [`DeliveryView`] now behaves as a filter / draft type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(super) enum Panel {
-    /// The selected delivery view's live workload roster (the default lens).
-    #[default]
-    Roster,
+pub(super) enum WorkloadsRoute {
     /// Author + place a new workload (U14 placement · U15 form).
+    #[default]
     Provision,
-    /// Run Ansible + the live inventory (U17).
-    Configure,
-    /// Day-2 status, metrics + drift (U18).
-    Status,
+    /// Dry-run plans and resource review.
+    Plan,
+    /// Live runs and day-2 workload actions.
+    Run,
+    /// Desired-vs-actual drift.
+    Drift,
+    /// Local session audit.
+    Audit,
     /// Golden per-type image roster (U19).
     Images,
     /// Podman / Quadlet containers (U19).
     Containers,
 }
 
-impl Panel {
-    /// Every panel lens, in sub-nav order.
-    pub(super) const ALL: [Self; 6] = [
-        Self::Roster,
+impl WorkloadsRoute {
+    /// Every lifecycle route, in sidebar order.
+    pub(super) const ALL: [Self; 7] = [
         Self::Provision,
-        Self::Configure,
-        Self::Status,
+        Self::Plan,
+        Self::Run,
+        Self::Drift,
+        Self::Audit,
         Self::Images,
         Self::Containers,
     ];
 
-    /// The panel sub-nav label.
+    /// The route label.
     pub(super) const fn label(self) -> &'static str {
         match self {
-            Self::Roster => "Roster",
             Self::Provision => "Provision",
-            Self::Configure => "Configure",
-            Self::Status => "Status",
+            Self::Plan => "Plan",
+            Self::Run => "Run",
+            Self::Drift => "Drift",
+            Self::Audit => "Audit",
             Self::Images => "Images",
             Self::Containers => "Containers",
         }
     }
 
-    /// The Mackes-Carbon glyph this panel's tab wears.
+    /// The Mackes-Carbon glyph this route's sidebar row wears.
     pub(super) const fn icon(self) -> &'static str {
         match self {
-            Self::Roster => "view",
             Self::Provision => "list-add",
-            Self::Configure => "document-edit",
-            Self::Status => "emblem-ok",
+            Self::Plan => "document-edit",
+            Self::Run => "go-next",
+            Self::Drift => "view-refresh",
+            Self::Audit => "emblem-ok",
             Self::Images => "camera-photo",
             Self::Containers => "overlay",
+        }
+    }
+
+    /// Short route context for the detail header.
+    const fn blurb(self) -> &'static str {
+        match self {
+            Self::Provision => "Author desired workloads with explicit placement and review.",
+            Self::Plan => "Inspect resources and run dry-run planning before mutation.",
+            Self::Run => "Execute live workload and configuration actions through review.",
+            Self::Drift => "Compare desired state against reported runtime reality.",
+            Self::Audit => "Review this session's requested operations and outcomes.",
+            Self::Images => "Build, list, and promote golden bootc images.",
+            Self::Containers => "Render and deploy Podman Quadlet service containers.",
+        }
+    }
+}
+
+/// Density mode for the resource tables and side rails. Construct Ops defaults
+/// to compact, while comfortable keeps a little more room for tablet use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum DensityMode {
+    #[default]
+    Compact,
+    Comfortable,
+}
+
+impl DensityMode {
+    pub(super) const ALL: [Self; 2] = [Self::Compact, Self::Comfortable];
+
+    pub(super) const fn label(self) -> &'static str {
+        match self {
+            Self::Compact => "Compact",
+            Self::Comfortable => "Comfortable",
+        }
+    }
+
+    pub(super) const fn row_height(self) -> f32 {
+        match self {
+            Self::Compact => 30.0,
+            Self::Comfortable => 42.0,
+        }
+    }
+}
+
+/// Sortable columns in the Plan route's dense resource table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum WorkloadSortColumn {
+    /// Workload name.
+    #[default]
+    Name,
+    /// Placement node.
+    Node,
+    /// Live state word.
+    Status,
+    /// CPU utilization.
+    Cpu,
+    /// Memory usage.
+    Memory,
+    /// Disk allocation.
+    Disk,
+    /// Drift state.
+    Drift,
+}
+
+impl WorkloadSortColumn {
+    /// Human-facing header label.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Name => "Name",
+            Self::Node => "Node",
+            Self::Status => "Status",
+            Self::Cpu => "CPU",
+            Self::Memory => "Mem",
+            Self::Disk => "Disk",
+            Self::Drift => "Drift",
+        }
+    }
+
+    /// Every sortable column, in table order.
+    const ALL: [Self; 7] = [
+        Self::Name,
+        Self::Node,
+        Self::Status,
+        Self::Cpu,
+        Self::Memory,
+        Self::Disk,
+        Self::Drift,
+    ];
+}
+
+/// Current Plan resource-table sort state. `descending == false` is ascending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) struct WorkloadSort {
+    /// Active column.
+    column: WorkloadSortColumn,
+    /// Direction flag.
+    descending: bool,
+}
+
+impl WorkloadSort {
+    /// Toggle a column: same column flips direction; a new column starts ascending.
+    fn toggled(self, column: WorkloadSortColumn) -> Self {
+        if self.column == column {
+            Self {
+                column,
+                descending: !self.descending,
+            }
+        } else {
+            Self {
+                column,
+                descending: false,
+            }
+        }
+    }
+
+    /// Header adornment for the active sort column.
+    fn marker(self, column: WorkloadSortColumn) -> &'static str {
+        if self.column != column {
+            ""
+        } else if self.descending {
+            " ↓"
+        } else {
+            " ↑"
         }
     }
 }
@@ -505,9 +632,9 @@ struct ResolvedConsole {
     endpoint: ConsoleEndpoint,
 }
 
-// ─────────────────────────────── typed arming ───────────────────────────────
+// ───────────────────────────── mutation review ──────────────────────────────
 
-/// What a confirmed typed-arming echo releases onto the Bus (RUN-006 idiom).
+/// What a confirmed review-sheet echo releases onto the Bus (RUN-006 idiom).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ArmAction {
     /// A live `provision` (OpenTofu apply) — echo [`APPLY_ECHO`].
@@ -526,7 +653,7 @@ pub(super) enum ArmAction {
         /// The workload's display name — the required echo.
         name: String,
     },
-    /// A panel-specific live mutation whose complete body is frozen before the
+    /// A route-specific live mutation whose complete body is frozen before the
     /// typed-confirm dialog opens (image build/promote or container deploy).
     Prepared {
         verb: &'static str,
@@ -543,7 +670,6 @@ pub(super) enum ArmAction {
 impl ArmAction {
     /// The `action/cloud/*` verb this action publishes (test seam — the perform
     /// path matches the variant directly).
-    #[cfg(test)]
     const fn verb(&self) -> &'static str {
         match self {
             Self::Provision => "provision",
@@ -571,7 +697,7 @@ impl ArmAction {
         }
     }
 
-    /// What the confirm acts on — the arming copy's subject.
+    /// What the confirm acts on — the review copy's subject.
     fn subject(&self) -> String {
         match self {
             Self::Provision => "the OpenTofu-managed infrastructure (live apply)".to_string(),
@@ -582,22 +708,181 @@ impl ArmAction {
     }
 }
 
-/// A pending typed-arming confirm — the action it releases + the operator's echo
-/// so far. Nothing reaches the Bus until [`armed`] returns true.
+/// A pending mutation review sheet — the action it releases + the operator's
+/// exact echo so far. Nothing reaches the Bus until [`armed`] returns true.
 #[derive(Debug, Clone)]
-pub(super) struct Arming {
+pub(super) struct ReviewSheetState {
     /// What confirming publishes.
     pub(super) action: ArmAction,
     /// The operator's typed echo.
     pub(super) typed: String,
 }
 
-/// The typed-arming gate (RUN-006): the operator's echo, trimmed, must equal the
-/// required echo exactly before the mutation may publish. The one decision the
-/// confirm button + the tests share, so "unconfirmed ⇒ blocked" is proven
-/// without a render.
+/// The review gate (RUN-006): the operator's echo must equal the required echo
+/// byte-for-byte before the mutation may publish. The one decision the confirm
+/// button + the tests share, so "unconfirmed ⇒ blocked" is proven without a
+/// render.
 fn armed(typed: &str, echo: &str) -> bool {
-    typed.trim() == echo
+    typed == echo
+}
+
+/// The immutable facts the review sheet renders before the exact echo can
+/// release an action. This is deliberately derived from the pending
+/// [`ArmAction`], not live form controls, so prepared/lifecycle mutations show
+/// the same command, target, placement, and request digest that will be bound to
+/// the capability token.
+#[derive(Debug, Clone)]
+struct ReviewSheetFacts {
+    command: String,
+    subject: String,
+    target: String,
+    node: String,
+    body_digest: String,
+    body_summary: String,
+    body_preview: String,
+    impact: String,
+}
+
+fn review_sheet_facts(action: &ArmAction, state: &WorkloadsState) -> ReviewSheetFacts {
+    let verb = action.verb();
+    let command = format!("action/cloud/{verb}");
+    let subject = action.subject();
+    match action {
+        ArmAction::Provision => {
+            let node = state
+                .selected_node()
+                .map(str::trim)
+                .filter(|node| !node.is_empty())
+                .unwrap_or("no placement selected");
+            let body = node_request_body(node);
+            request_review_facts(
+                command,
+                subject,
+                CLOUD_ARM_NODE_SCOPE.to_string(),
+                node.to_string(),
+                &body,
+                format!(
+                    "Live OpenTofu apply can change infrastructure on placement node {node}; \
+                     authorization is scoped to {CLOUD_ARM_NODE_SCOPE}."
+                ),
+            )
+        }
+        ArmAction::Configure => {
+            let node = state
+                .selected_node()
+                .map(str::trim)
+                .filter(|node| !node.is_empty())
+                .unwrap_or("no placement selected");
+            let body =
+                configure_request_body(node, &state.configure.playbook, &state.configure.group);
+            request_review_facts(
+                command,
+                subject,
+                CLOUD_ARM_NODE_SCOPE.to_string(),
+                node.to_string(),
+                &body,
+                format!(
+                    "Live Ansible convergence can change workloads on placement node {node}; \
+                     authorization is scoped to {CLOUD_ARM_NODE_SCOPE}."
+                ),
+            )
+        }
+        ArmAction::Lifecycle {
+            verb,
+            node,
+            instance_id,
+            name,
+        } => {
+            let body = lifecycle_request_body(node, instance_id, Some(name));
+            request_review_facts(
+                command,
+                subject,
+                instance_id.clone(),
+                node.clone(),
+                &body,
+                format!(
+                    "{} affects one workload: {name} ({instance_id}) on placement node {node}. \
+                     No other node or workload is authorized by this review.",
+                    verb_label(verb)
+                ),
+            )
+        }
+        ArmAction::Prepared {
+            node,
+            target,
+            body,
+            label,
+            ..
+        } => request_review_facts(
+            command,
+            subject,
+            target.clone(),
+            node.clone(),
+            body,
+            format!(
+                "{label} affects target {target} on placement node {node}; authorization is \
+                 bound to this frozen request body digest."
+            ),
+        ),
+    }
+}
+
+fn request_review_facts(
+    command: String,
+    subject: String,
+    target: String,
+    node: String,
+    body: &str,
+    impact: String,
+) -> ReviewSheetFacts {
+    ReviewSheetFacts {
+        command,
+        subject,
+        target,
+        node,
+        body_digest: cloud_request_digest(body)
+            .map(|digest| format!("sha256:{digest}"))
+            .unwrap_or_else(|error| format!("unavailable: {error}")),
+        body_summary: request_body_summary(body),
+        body_preview: request_body_preview(body),
+        impact,
+    }
+}
+
+fn request_body_summary(body: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(serde_json::Value::Object(map)) => {
+            let mut keys = map.keys().map(String::as_str).collect::<Vec<_>>();
+            keys.sort_unstable();
+            let shown = keys.iter().take(8).copied().collect::<Vec<_>>().join(", ");
+            let suffix = if keys.len() > 8 { ", …" } else { "" };
+            format!(
+                "{} bytes · {} JSON fields: {shown}{suffix}",
+                body.len(),
+                map.len()
+            )
+        }
+        Ok(serde_json::Value::Array(items)) => {
+            format!(
+                "{} bytes · JSON array with {} items",
+                body.len(),
+                items.len()
+            )
+        }
+        Ok(_) => format!("{} bytes · JSON scalar", body.len()),
+        Err(_) => format!("{} bytes · invalid JSON body", body.len()),
+    }
+}
+
+fn request_body_preview(body: &str) -> String {
+    const MAX_PREVIEW_CHARS: usize = 220;
+    let compact = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= MAX_PREVIEW_CHARS {
+        compact
+    } else {
+        let preview = compact.chars().take(MAX_PREVIEW_CHARS).collect::<String>();
+        format!("{preview}…")
+    }
 }
 
 // ─────────────────────────────── the audit trail ────────────────────────────
@@ -652,12 +937,12 @@ pub(super) struct AuditEntry {
 
 // ─────────────────────────────── the surface state ──────────────────────────
 
-/// The **Workloads** cockpit state — the folded `state/cloud` mirror, the active
-/// delivery view + lens, the selected placement node, each panel's own sub-state,
-/// the typed-arming confirm, the one in-flight mutation, and the session audit
+/// The **Workloads** lifecycle state — the folded `state/cloud` mirror, the active
+/// delivery filter + route, the selected placement node, each route's own sub-state,
+/// the review-sheet confirm, the one in-flight mutation, and the session audit
 /// trail. A plain field on the shell's struct, borrowed `&mut` while the surface
 /// is in view. Every panel owns its `State` in its own file, so a downstream
-/// worker adds panel-specific state without touching this struct.
+/// worker adds route-specific state without touching this struct.
 ///
 /// `#[derive(Debug)]` deliberately: it keeps every sub-panel `State` field a live
 /// read (the panel workers fill them incrementally), so the seam compiles clean
@@ -676,8 +961,8 @@ pub struct WorkloadsState {
     loaded_at: Option<Instant>,
     /// A manual refresh is queued — re-reads the mirror on the next poll.
     forced: bool,
-    /// A pending typed-arming confirm for a destructive intent, if any.
-    arming: Option<Arming>,
+    /// A pending review-sheet confirm for a destructive intent, if any.
+    arming: Option<ReviewSheetState>,
     /// The one in-flight mutation — its reply resolves into the note + audit.
     mutation_pending: Option<Pending>,
     /// A transient one-line action note — honest feedback, never a silent op.
@@ -697,11 +982,17 @@ pub struct WorkloadsState {
     #[cfg(test)]
     arm_key_override: Option<Vec<u8>>,
 
-    // ── the cockpit nav ──
-    /// The active delivery-type view (the primary axis).
+    // ── the lifecycle nav ──
+    /// The active delivery-type filter for resource/provision views.
     view: DeliveryView,
-    /// The active lens (the secondary axis).
-    panel: Panel,
+    /// The active lifecycle route.
+    route: WorkloadsRoute,
+    /// Table/sidebar density.
+    density: DensityMode,
+    /// Plan route resource-table sort state.
+    resource_sort: WorkloadSort,
+    /// The expanded Plan route resource row, keyed by delivery type + node + name.
+    expanded_resource: Option<String>,
     /// The placement node the provision panel targets (from the placement
     /// picker); `None` until one is chosen.
     selected_node: Option<String>,
@@ -711,7 +1002,7 @@ pub struct WorkloadsState {
     // `allow(dead_code)`: these are the fan-out seam — each panel worker (U14–U19)
     // reads + fills its own `State` in its own file. They are honestly unread
     // until then; the allow drops off the moment a worker consumes the field.
-    // (`configure` is already consumed by `configure_body` + the Configure lens.)
+    // (`configure` is already consumed by `configure_body` + the Run route.)
     /// U14 — placement picker state.
     #[allow(dead_code)]
     placement: placement::State,
@@ -729,23 +1020,6 @@ pub struct WorkloadsState {
     /// U19 — containers panel state.
     #[allow(dead_code)]
     containers: containers::State,
-
-    // ── the per-delivery-view sub-state (each U16 view worker owns its file) ──
-    /// Desktop VM view state.
-    #[allow(dead_code)]
-    desktop_vm: views::desktop_vm::State,
-    /// Service VM view state.
-    #[allow(dead_code)]
-    service_vm: views::service_vm::State,
-    /// App VM view state.
-    #[allow(dead_code)]
-    app_vm: views::app_vm::State,
-    /// Android VM view state.
-    #[allow(dead_code)]
-    android_vm: views::android_vm::State,
-    /// Service Container view state.
-    #[allow(dead_code)]
-    service_container: views::container::State,
 }
 
 impl Default for WorkloadsState {
@@ -764,7 +1038,10 @@ impl Default for WorkloadsState {
             #[cfg(test)]
             arm_key_override: None,
             view: DeliveryView::default(),
-            panel: Panel::default(),
+            route: WorkloadsRoute::default(),
+            density: DensityMode::default(),
+            resource_sort: WorkloadSort::default(),
+            expanded_resource: None,
             selected_node: None,
             placement: placement::State::default(),
             form: provision_form::State::default(),
@@ -772,11 +1049,6 @@ impl Default for WorkloadsState {
             status: status::State::default(),
             images: images::State::default(),
             containers: containers::State::default(),
-            desktop_vm: views::desktop_vm::State::default(),
-            service_vm: views::service_vm::State::default(),
-            app_vm: views::app_vm::State::default(),
-            android_vm: views::android_vm::State::default(),
-            service_container: views::container::State::default(),
         }
     }
 }
@@ -1009,7 +1281,7 @@ impl WorkloadsState {
         }
     }
 
-    /// The Configure lens's request body — the picked playbook + target group.
+    /// The Run route's configure request body — the picked playbook + target group.
     /// (The worker converges `cloud_vm` on `site.yml`; the selection is honest
     /// operator context the reply echoes.) The inputs live in [`configure::State`]
     /// so the U17 worker owns them without touching this struct.
@@ -1047,7 +1319,7 @@ impl WorkloadsState {
         authorize_body_with_signer(&signer, body, verb, node, target)
     }
 
-    /// Perform a confirmed armed action — called only past the typed-arming gate
+    /// Perform a confirmed action — called only past the review-sheet gate
     /// ([`armed`]).
     fn perform(&mut self, action: ArmAction, typed: &str) {
         let expected = action.echo();
@@ -1125,17 +1397,17 @@ impl WorkloadsState {
 
     // ── the plan/apply gate seams (§6, shared by the body + the menubar) ──
 
-    /// Emit a provision **plan** (dry-run) — direct, no confirm. On a plan-only
+    /// Emit a dedicated **plan** (dry-run) — direct, no confirm. On a plan-only
     /// node the worker stages a `tofu plan` and returns it in the reply.
     pub(super) fn plan_provision(&mut self) {
         let Some(node) = self.require_selected_node("a provision plan") else {
             return;
         };
         let body = node_request_body(&node);
-        self.issue("provision", Some(&body), "provision plan (dry-run)");
+        self.issue(VERB_PLAN, Some(&body), "provision plan (dry-run)");
     }
 
-    /// Open the typed-arming confirm for a live provision **apply** (#RUN-006 —
+    /// Open the review-sheet confirm for a live provision **apply** (#RUN-006 —
     /// nothing publishes until the echo matches).
     pub(super) fn arm_provision(&mut self) {
         if !self.selected_node_apply_armed() {
@@ -1146,7 +1418,7 @@ impl WorkloadsState {
             );
             return;
         }
-        self.arming = Some(Arming {
+        self.arming = Some(ReviewSheetState {
             action: ArmAction::Provision,
             typed: String::new(),
         });
@@ -1159,7 +1431,7 @@ impl WorkloadsState {
         }
     }
 
-    /// Open the typed-arming confirm for a live configuration **apply**.
+    /// Open the review-sheet confirm for a live configuration **apply**.
     pub(super) fn arm_configure(&mut self) {
         if !self.selected_node_apply_armed() {
             self.note = Some(
@@ -1169,13 +1441,13 @@ impl WorkloadsState {
             );
             return;
         }
-        self.arming = Some(Arming {
+        self.arming = Some(ReviewSheetState {
             action: ArmAction::Configure,
             typed: String::new(),
         });
     }
 
-    /// Open typed confirmation for a lifecycle mutation. Even start/stop require
+    /// Open review confirmation for a lifecycle mutation. Even start/stop require
     /// confirmation because minting authority, not destructiveness, is the
     /// security boundary.
     pub(super) fn issue_lifecycle_direct(
@@ -1232,9 +1504,9 @@ impl WorkloadsState {
         );
     }
 
-    /// Open the typed-arming confirm for a destructive lifecycle op
+    /// Open the review-sheet confirm for a destructive lifecycle op
     /// (`instance-reboot` / `instance-delete`) — nothing publishes until the
-    /// workload name is typed (RUN-006). The roster rows drive this seam.
+    /// workload name is typed (RUN-006). The resource rows drive this seam.
     pub(super) fn arm_lifecycle(
         &mut self,
         verb: &'static str,
@@ -1260,7 +1532,7 @@ impl WorkloadsState {
             ));
             return;
         }
-        self.arming = Some(Arming {
+        self.arming = Some(ReviewSheetState {
             action: ArmAction::Lifecycle {
                 verb,
                 node: node.to_string(),
@@ -1271,7 +1543,7 @@ impl WorkloadsState {
         });
     }
 
-    /// Open typed confirmation for a fully prepared panel mutation. The body is
+    /// Open review confirmation for a fully prepared route mutation. The body is
     /// frozen now, preventing form edits from changing what the later token binds.
     pub(super) fn arm_prepared(
         &mut self,
@@ -1284,10 +1556,16 @@ impl WorkloadsState {
         word: &'static str,
         subject: String,
     ) {
-        self.arming = Some(Arming {
+        if node.trim().is_empty() {
+            self.note = Some(format!(
+                "Select a placement node before requesting {label}."
+            ));
+            return;
+        }
+        self.arming = Some(ReviewSheetState {
             action: ArmAction::Prepared {
                 verb,
-                node,
+                node: node.trim().to_string(),
                 target,
                 body,
                 label,
@@ -1331,15 +1609,52 @@ impl WorkloadsState {
         self.view = view;
     }
 
-    /// Which lens is showing (test seam; production reads the field).
+    /// Which lifecycle route is showing.
     #[cfg(test)]
-    pub(super) fn panel(&self) -> Panel {
-        self.panel
+    pub(super) fn route(&self) -> WorkloadsRoute {
+        self.route
     }
 
-    /// Switch the active lens.
-    pub(super) fn set_panel(&mut self, panel: Panel) {
-        self.panel = panel;
+    /// Switch the active lifecycle route.
+    pub(super) fn set_route(&mut self, route: WorkloadsRoute) {
+        self.route = route;
+    }
+
+    /// Current resource table density.
+    #[cfg(test)]
+    pub(super) fn density(&self) -> DensityMode {
+        self.density
+    }
+
+    /// Set resource table density.
+    pub(super) fn set_density(&mut self, density: DensityMode) {
+        self.density = density;
+    }
+
+    /// Current resource table sort.
+    #[cfg(test)]
+    pub(super) fn resource_sort(&self) -> WorkloadSort {
+        self.resource_sort
+    }
+
+    /// Toggle a resource-table sort column.
+    pub(super) fn toggle_resource_sort(&mut self, column: WorkloadSortColumn) {
+        self.resource_sort = self.resource_sort.toggled(column);
+    }
+
+    /// Current expanded resource row key.
+    #[cfg(test)]
+    pub(super) fn expanded_resource(&self) -> Option<&str> {
+        self.expanded_resource.as_deref()
+    }
+
+    /// Toggle the expanded Plan resource row.
+    pub(super) fn toggle_expanded_resource(&mut self, key: String) {
+        if self.expanded_resource.as_deref() == Some(key.as_str()) {
+            self.expanded_resource = None;
+        } else {
+            self.expanded_resource = Some(key);
+        }
     }
 
     /// The placement node the provision panel targets, if one is chosen.
@@ -1375,7 +1690,7 @@ impl WorkloadsState {
         );
     }
 
-    /// Whether a typed-arming confirm is open (test seam).
+    /// Whether a review-sheet confirm is open (test seam).
     #[cfg(test)]
     pub(super) fn has_arming(&self) -> bool {
         self.arming.is_some()
@@ -1463,9 +1778,9 @@ fn verb_label(verb: &str) -> &'static str {
 
 // ───────────────────────────────── the render ───────────────────────────────
 
-/// Render the Workloads cockpit into `ui`: the shared MENUBAR-ALL bar, the
-/// delivery-view selector, the lens sub-nav, the typed-arming confirm + action
-/// note, then the active lens's body.
+/// Render the Workloads app into `ui`: the shared MENUBAR-ALL bar, a native
+/// lifecycle sidebar, a delivery-type filter, the review sheet + action note,
+/// then the active route body with a persistent health rail.
 ///
 /// The name is the stable external entry seam (main.rs binds it); the state type
 /// is [`WorkloadsState`] (aliased as `InfraCodeState`).
@@ -1476,77 +1791,598 @@ pub fn infra_code_panel(ui: &mut egui::Ui, state: &mut WorkloadsState) {
     ui.separator();
     ui.add_space(Style::SP_XS);
 
-    delivery_view_bar(ui, state);
-    ui.add_space(Style::SP_XS);
-    panel_bar(ui, state);
+    ui.horizontal_top(|ui| {
+        ui.set_min_height(560.0);
+        ui.vertical(|ui| {
+            ui.set_width(190.0);
+            route_sidebar(ui, state);
+            ui.add_space(Style::SP_S);
+            ui.separator();
+            ui.add_space(Style::SP_S);
+            delivery_filter_bar(ui, state);
+            ui.add_space(Style::SP_S);
+            density_selector(ui, state);
+        });
+
+        ui.separator();
+
+        ui.vertical(|ui| {
+            ui.set_min_width(560.0);
+            route_header(ui, state.route);
+            ui.add_space(Style::SP_S);
+            render_review_sheet(ui, state);
+            render_note(ui, state);
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| route_body(ui, state));
+        });
+
+        ui.separator();
+
+        ui.vertical(|ui| {
+            ui.set_width(210.0);
+            health_rail(ui, state);
+        });
+    });
+}
+
+fn route_body(ui: &mut egui::Ui, state: &mut WorkloadsState) {
+    match state.route {
+        WorkloadsRoute::Provision => {
+            shared_placement_selector(ui, state);
+            provision_form::provision_form(ui, state);
+        }
+        WorkloadsRoute::Plan => {
+            filtered_resource_route(ui, state);
+        }
+        WorkloadsRoute::Run => {
+            shared_placement_selector(ui, state);
+            configure::configure_panel(ui, state);
+        }
+        WorkloadsRoute::Drift => status::status_panel(ui, state),
+        WorkloadsRoute::Audit => audit_route_panel(ui, state),
+        WorkloadsRoute::Images => {
+            shared_placement_selector(ui, state);
+            images::images_panel(ui, state);
+        }
+        WorkloadsRoute::Containers => {
+            shared_placement_selector(ui, state);
+            containers::containers_panel(ui, state);
+        }
+    }
+}
+
+fn shared_placement_selector(ui: &mut egui::Ui, state: &mut WorkloadsState) {
+    if let Some(node) = placement::placement_picker(ui, state) {
+        state.selected_node = Some(node);
+    }
     ui.add_space(Style::SP_S);
+}
 
-    render_arming(ui, state);
-    render_note(ui, state);
+/// Lifecycle sidebar — the primary navigation axis for WL-UX-008.
+fn route_sidebar(ui: &mut egui::Ui, state: &mut WorkloadsState) {
+    ui.label(
+        RichText::new("Lifecycle")
+            .size(Style::SMALL)
+            .strong()
+            .color(Style::TEXT_DIM),
+    );
+    ui.add_space(Style::SP_XS);
+    for route in WorkloadsRoute::ALL {
+        let selected = state.route == route;
+        if sidebar_row(
+            ui,
+            selected,
+            route.icon(),
+            route.label(),
+            Style::ACCENT_WORKLOADS,
+        )
+        .clicked()
+        {
+            state.set_route(route);
+        }
+    }
+}
 
-    egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .show(ui, |ui| match state.panel {
-            Panel::Roster => {
-                let view = state.view;
-                views::dispatch(ui, state, view);
+/// Delivery types are filters, not route tabs.
+fn delivery_filter_bar(ui: &mut egui::Ui, state: &mut WorkloadsState) {
+    ui.label(
+        RichText::new("Delivery filter")
+            .size(Style::SMALL)
+            .strong()
+            .color(Style::TEXT_DIM),
+    );
+    ui.add_space(Style::SP_XS);
+    for view in DeliveryView::ALL {
+        let selected = state.view == view;
+        if sidebar_row(ui, selected, view.icon(), view.label(), Style::ACCENT).clicked() {
+            state.set_view(view);
+        }
+    }
+}
+
+fn density_selector(ui: &mut egui::Ui, state: &mut WorkloadsState) {
+    ui.label(
+        RichText::new("Density")
+            .size(Style::SMALL)
+            .strong()
+            .color(Style::TEXT_DIM),
+    );
+    ui.add_space(Style::SP_XS);
+    for density in DensityMode::ALL {
+        let selected = state.density == density;
+        if sidebar_row(ui, selected, "view-list", density.label(), Style::ACCENT).clicked() {
+            state.set_density(density);
+        }
+    }
+}
+
+fn route_header(ui: &mut egui::Ui, route: WorkloadsRoute) {
+    ui.horizontal(|ui| {
+        ui.scope(|ui| {
+            ui.visuals_mut().override_text_color = Some(Style::ACCENT_WORKLOADS);
+            carbon_icon(ui, route.icon(), Style::ICON_S);
+        });
+        ui.add_space(Style::SP_XS);
+        ui.label(
+            RichText::new(route.label())
+                .size(Style::TITLE)
+                .strong()
+                .color(Style::ACCENT_WORKLOADS),
+        );
+    });
+    muted_note(ui, route.blurb());
+}
+
+fn filtered_resource_route(ui: &mut egui::Ui, state: &mut WorkloadsState) {
+    mirror_summary(ui, state);
+    ui.add_space(Style::SP_XS);
+    muted_note(
+        ui,
+        format!(
+            "Showing {} resources as the current delivery filter. Row density: {} ({:.0}px).",
+            state.view.label(),
+            state.density.label(),
+            state.density.row_height()
+        ),
+    );
+    ui.add_space(Style::SP_S);
+    plan_resource_table(ui, state);
+    console_section(ui, state);
+}
+
+fn plan_resource_table(ui: &mut egui::Ui, state: &mut WorkloadsState) {
+    let rows = plan_resource_rows(state);
+    if rows.is_empty() {
+        let message = format!(
+            "No {} workloads are present in the folded state/cloud mirror.",
+            state.view.label()
+        );
+        crate::empty_state::show(ui, "No resources for this filter", &message);
+        return;
+    }
+
+    card().show(ui, |ui| {
+        plan_table_header(ui, state);
+        ui.separator();
+        ui.add_space(Style::SP_XS);
+        for row in rows {
+            plan_table_row(ui, state, &row);
+        }
+    });
+}
+
+fn plan_table_header(ui: &mut egui::Ui, state: &mut WorkloadsState) {
+    let header_height = DensityMode::Compact.row_height();
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [78.0, header_height],
+            egui::Label::new(
+                RichText::new("Details")
+                    .size(Style::SMALL)
+                    .color(Style::TEXT_DIM),
+            ),
+        );
+        for column in WorkloadSortColumn::ALL {
+            let label = format!("{}{}", column.label(), state.resource_sort.marker(column));
+            if ui
+                .add_sized(
+                    [column_width(column), header_height],
+                    egui::Button::new(
+                        RichText::new(label)
+                            .size(Style::SMALL)
+                            .color(Style::TEXT_DIM),
+                    ),
+                )
+                .clicked()
+            {
+                state.toggle_resource_sort(column);
             }
-            Panel::Provision => {
-                if let Some(node) = placement::placement_picker(ui, state) {
-                    state.selected_node = Some(node);
-                }
-                provision_form::provision_form(ui, state);
+        }
+        ui.add_sized(
+            [188.0, header_height],
+            egui::Label::new(
+                RichText::new("Actions")
+                    .size(Style::SMALL)
+                    .color(Style::TEXT_DIM),
+            ),
+        );
+    });
+}
+
+fn plan_table_row(ui: &mut egui::Ui, state: &mut WorkloadsState, row: &WorkloadRow) {
+    let key = plan_resource_key(row);
+    let expanded = state.expanded_resource.as_deref() == Some(key.as_str());
+    let row_height = state.density.row_height();
+    ui.horizontal(|ui| {
+        if ui
+            .add_sized(
+                [78.0, row_height],
+                egui::Button::new(
+                    RichText::new(if expanded { "Collapse" } else { "Details" }).size(Style::SMALL),
+                ),
+            )
+            .clicked()
+        {
+            state.toggle_expanded_resource(key.clone());
+        }
+        plan_cell(
+            ui,
+            &row.name,
+            column_width(WorkloadSortColumn::Name),
+            row_height,
+            Style::TEXT,
+        );
+        plan_cell(
+            ui,
+            &row.node,
+            column_width(WorkloadSortColumn::Node),
+            row_height,
+            Style::TEXT_DIM,
+        );
+        plan_cell(
+            ui,
+            &row.status,
+            column_width(WorkloadSortColumn::Status),
+            row_height,
+            status_tone(&row.status),
+        );
+        plan_cell(
+            ui,
+            &format!("{}%", row.cpu_pct),
+            column_width(WorkloadSortColumn::Cpu),
+            row_height,
+            load_tone(row.cpu_pct),
+        );
+        plan_cell(
+            ui,
+            &mem_label(row.mem_mb),
+            column_width(WorkloadSortColumn::Memory),
+            row_height,
+            Style::TEXT,
+        );
+        plan_cell(
+            ui,
+            &format!("{} GiB", row.disk_gb),
+            column_width(WorkloadSortColumn::Disk),
+            row_height,
+            Style::TEXT,
+        );
+        plan_cell(
+            ui,
+            drift_word(row.drift),
+            column_width(WorkloadSortColumn::Drift),
+            row_height,
+            drift_tone(row.drift),
+        );
+        plan_row_actions(ui, state, row);
+    });
+    if expanded {
+        plan_expanded_row(ui, state, row);
+    }
+    ui.add_space(Style::SP_XS);
+}
+
+fn plan_cell(ui: &mut egui::Ui, text: &str, width: f32, height: f32, color: Color32) {
+    ui.add_sized(
+        [width, height],
+        egui::Label::new(RichText::new(text).size(Style::SMALL).color(color)),
+    );
+}
+
+fn plan_row_actions(ui: &mut egui::Ui, state: &mut WorkloadsState, row: &WorkloadRow) {
+    ui.horizontal(|ui| match row.delivery_type {
+        DeliveryType::ServiceContainer => {
+            if row_button(ui, "Restart", false).clicked() {
+                state.issue_lifecycle_direct("container-restart", &row.node, &row.name, &row.name);
             }
-            Panel::Configure => configure::configure_panel(ui, state),
-            Panel::Status => status::status_panel(ui, state),
-            Panel::Images => images::images_panel(ui, state),
-            Panel::Containers => containers::containers_panel(ui, state),
+            if row_button(ui, "Logs", false).clicked() {
+                state.issue_lifecycle_direct("container-logs", &row.node, &row.name, &row.name);
+            }
+            if row_button(ui, "Destroy\u{2026}", true).clicked() {
+                state.issue_lifecycle_direct("container-destroy", &row.node, &row.name, &row.name);
+            }
+        }
+        DeliveryType::ServiceVm => {
+            vm_lifecycle_actions(ui, state, row, false);
+        }
+        DeliveryType::DesktopVm | DeliveryType::AppVm | DeliveryType::AndroidVm => {
+            vm_lifecycle_actions(ui, state, row, true);
+        }
+    });
+}
+
+fn vm_lifecycle_actions(
+    ui: &mut egui::Ui,
+    state: &mut WorkloadsState,
+    row: &WorkloadRow,
+    console: bool,
+) {
+    if console && row_button(ui, "Console", false).clicked() {
+        state.issue_console_attach(&row.node, &row.name, &row.name);
+    }
+    if row_button(ui, "Start", false).clicked() {
+        state.issue_lifecycle_direct("instance-start", &row.node, &row.name, &row.name);
+    }
+    if row_button(ui, "Stop", false).clicked() {
+        state.issue_lifecycle_direct("instance-stop", &row.node, &row.name, &row.name);
+    }
+    if row_button(ui, "Reboot\u{2026}", true).clicked() {
+        state.arm_lifecycle("instance-reboot", &row.node, &row.name, &row.name);
+    }
+    if row_button(ui, "Destroy\u{2026}", true).clicked() {
+        state.arm_lifecycle("instance-delete", &row.node, &row.name, &row.name);
+    }
+}
+
+fn plan_expanded_row(ui: &mut egui::Ui, state: &WorkloadsState, row: &WorkloadRow) {
+    egui::Frame::group(ui.style())
+        .fill(Style::SURFACE_HI)
+        .stroke(egui::Stroke::new(Style::STROKE_HAIRLINE, Style::BORDER))
+        .corner_radius(Style::RADIUS_S)
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                field(
+                    ui,
+                    "delivery",
+                    row.delivery_type.label(),
+                    Style::ACCENT_WORKLOADS,
+                );
+                ui.add_space(Style::SP_M);
+                field(ui, "placement", &row.node, Style::TEXT);
+                ui.add_space(Style::SP_M);
+                field(
+                    ui,
+                    "metrics",
+                    &format!(
+                        "{}% cpu · {} · {} GiB",
+                        row.cpu_pct,
+                        mem_label(row.mem_mb),
+                        row.disk_gb
+                    ),
+                    Style::TEXT,
+                );
+                ui.add_space(Style::SP_M);
+                field(ui, "drift", drift_word(row.drift), drift_tone(row.drift));
+                ui.add_space(Style::SP_M);
+                field(
+                    ui,
+                    "mesh",
+                    if row.reachable {
+                        "reachable"
+                    } else {
+                        "unreachable"
+                    },
+                    if row.reachable {
+                        Style::OK
+                    } else {
+                        Style::WARN
+                    },
+                );
+            });
+            ui.add_space(Style::SP_XS);
+            muted_note(
+                ui,
+                format!(
+                    "Command preview: row actions publish typed Bus lifecycle requests with \
+                     node=`{}` and target=`{}`. Destructive actions require the exact `{}` echo \
+                     before anything is sent; current table density is {}.",
+                    row.node,
+                    row.name,
+                    row.name,
+                    state.density.label()
+                ),
+            );
         });
 }
 
-/// The delivery-view selector — the primary axis. Each tab is a Carbon icon +
-/// label, tinted the Workloads accent when active (§4). Selecting a view snaps
-/// the lens back to its roster.
-fn delivery_view_bar(ui: &mut egui::Ui, state: &mut WorkloadsState) {
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing.x = Style::SP_M;
-        for view in DeliveryView::ALL {
-            let selected = state.view == view;
-            if nav_tab(
-                ui,
-                selected,
-                view.icon(),
-                view.label(),
-                Style::ACCENT_WORKLOADS,
-            )
-            .clicked()
-            {
-                state.set_view(view);
-                state.set_panel(Panel::Roster);
-            }
-        }
-    });
+fn column_width(column: WorkloadSortColumn) -> f32 {
+    match column {
+        WorkloadSortColumn::Name => 132.0,
+        WorkloadSortColumn::Node => 104.0,
+        WorkloadSortColumn::Status => 88.0,
+        WorkloadSortColumn::Cpu => 56.0,
+        WorkloadSortColumn::Memory => 78.0,
+        WorkloadSortColumn::Disk => 68.0,
+        WorkloadSortColumn::Drift => 82.0,
+    }
 }
 
-/// The lens sub-nav — the secondary axis (roster + the cross-cutting panels).
-/// Tinted the blue action accent when active, so it reads as subordinate to the
-/// delivery-view selector above it.
-fn panel_bar(ui: &mut egui::Ui, state: &mut WorkloadsState) {
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing.x = Style::SP_S;
-        for panel in Panel::ALL {
-            let selected = state.panel == panel;
-            if nav_tab(ui, selected, panel.icon(), panel.label(), Style::ACCENT).clicked() {
-                state.set_panel(panel);
-            }
+fn plan_resource_rows(state: &WorkloadsState) -> Vec<WorkloadRow> {
+    let mut rows: Vec<WorkloadRow> = state.workloads_of(state.view).cloned().collect();
+    let sort = state.resource_sort;
+    rows.sort_by(|a, b| {
+        let ordering = compare_workload_rows(a, b, sort.column);
+        if sort.descending {
+            ordering.reverse()
+        } else {
+            ordering
         }
     });
+    rows
 }
 
-/// One nav tab — a clickable icon + label row. The icon is drawn through
-/// [`carbon_icon`] with the tab's accent as the current text color, so the glyph
-/// glows the axis accent when active.
-fn nav_tab(
+fn compare_workload_rows(a: &WorkloadRow, b: &WorkloadRow, column: WorkloadSortColumn) -> Ordering {
+    match column {
+        WorkloadSortColumn::Name => a.name.cmp(&b.name),
+        WorkloadSortColumn::Node => a.node.cmp(&b.node),
+        WorkloadSortColumn::Status => a.status.cmp(&b.status),
+        WorkloadSortColumn::Cpu => a.cpu_pct.cmp(&b.cpu_pct),
+        WorkloadSortColumn::Memory => a.mem_mb.cmp(&b.mem_mb),
+        WorkloadSortColumn::Disk => a.disk_gb.cmp(&b.disk_gb),
+        WorkloadSortColumn::Drift => drift_rank(a.drift).cmp(&drift_rank(b.drift)),
+    }
+}
+
+fn plan_resource_key(row: &WorkloadRow) -> String {
+    format!("{}:{}:{}", row.delivery_type.as_str(), row.node, row.name)
+}
+
+const fn drift_rank(drift: DriftFlag) -> u8 {
+    match drift {
+        DriftFlag::InSync => 0,
+        DriftFlag::Unknown => 1,
+        DriftFlag::Drift => 2,
+    }
+}
+
+/// The Style tone a live workload status paints.
+fn status_tone(status: &str) -> Color32 {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "running" | "active" => Style::SUPPORT_SUCCESS,
+        "paused" | "pmsuspended" => Style::WARN,
+        s if s.contains("error") || s.contains("fail") || s.contains("crash") => Style::DANGER,
+        _ => Style::TEXT_DIM,
+    }
+}
+
+/// The Style tone a drift flag paints.
+const fn drift_tone(drift: DriftFlag) -> Color32 {
+    match drift {
+        DriftFlag::InSync => Style::SUPPORT_SUCCESS,
+        DriftFlag::Drift => Style::SUPPORT_WARNING,
+        DriftFlag::Unknown => Style::TEXT_DIM,
+    }
+}
+
+/// The drift word shown in compact and expanded rows.
+const fn drift_word(drift: DriftFlag) -> &'static str {
+    match drift {
+        DriftFlag::InSync => "in sync",
+        DriftFlag::Drift => "drift",
+        DriftFlag::Unknown => "unplanned",
+    }
+}
+
+/// The Style tone a cpu-load percentage paints (amber past 70, red past 90).
+const fn load_tone(pct: u16) -> Color32 {
+    if pct >= 90 {
+        Style::DANGER
+    } else if pct >= 70 {
+        Style::WARN
+    } else {
+        Style::TEXT
+    }
+}
+
+/// A memory figure as MiB, or one-decimal GiB past a gibibyte.
+fn mem_label(mb: u32) -> String {
+    if mb >= 1024 {
+        format!("{}.{} GiB", mb / 1024, (mb % 1024) * 10 / 1024)
+    } else {
+        format!("{mb} MiB")
+    }
+}
+
+fn audit_route_panel(ui: &mut egui::Ui, state: &WorkloadsState) {
+    mirror_summary(ui, state);
+    ui.add_space(Style::SP_S);
+    if state.audit.is_empty() {
+        crate::empty_state::show(
+            ui,
+            "No audit rows this session",
+            "Plan, Run, Provision, and lifecycle actions append here after a backend reply.",
+        );
+        return;
+    }
+    for entry in state.audit.iter().rev() {
+        card().show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.colored_label(
+                    entry.outcome.color(),
+                    RichText::new(entry.outcome.word())
+                        .size(Style::SMALL)
+                        .strong(),
+                );
+                ui.add_space(Style::SP_S);
+                ui.label(RichText::new(&entry.verb).size(Style::BODY).strong());
+            });
+            ui.label(
+                RichText::new(&entry.detail)
+                    .size(Style::SMALL)
+                    .color(Style::TEXT_DIM),
+            );
+        });
+        ui.add_space(Style::SP_XS);
+    }
+}
+
+fn health_rail(ui: &mut egui::Ui, state: &WorkloadsState) {
+    ui.label(
+        RichText::new("Health")
+            .size(Style::SMALL)
+            .strong()
+            .color(Style::TEXT_DIM),
+    );
+    ui.add_space(Style::SP_XS);
+    let nodes = state.states.len();
+    let ready = state
+        .states
+        .iter()
+        .filter(|state| cloud_state_is_fresh(state) && state.backend_ready())
+        .count();
+    let armed = state
+        .states
+        .iter()
+        .filter(|state| cloud_state_is_fresh(state) && state.apply_armed)
+        .count();
+    let workloads: usize = state.states.iter().map(|state| state.workloads.len()).sum();
+    let stale = state
+        .states
+        .iter()
+        .filter(|state| !cloud_state_is_fresh(state))
+        .count();
+    for (label, value, tone) in [
+        ("nodes", nodes.to_string(), Style::TEXT),
+        (
+            "backend",
+            format!("{ready}/{nodes} ready"),
+            if ready == nodes && nodes > 0 {
+                Style::OK
+            } else {
+                Style::WARN
+            },
+        ),
+        (
+            "apply",
+            format!("{armed}/{nodes} armed"),
+            if armed > 0 { Style::DANGER } else { Style::OK },
+        ),
+        ("workloads", workloads.to_string(), Style::TEXT),
+        (
+            "stale",
+            stale.to_string(),
+            if stale == 0 { Style::OK } else { Style::WARN },
+        ),
+        ("audit", state.audit.len().to_string(), Style::TEXT_DIM),
+    ] {
+        field(ui, label, &value, tone);
+        ui.add_space(Style::SP_XS);
+    }
+}
+
+/// One sidebar row — a clickable icon + label row.
+fn sidebar_row(
     ui: &mut egui::Ui,
     selected: bool,
     icon: &str,
@@ -1594,16 +2430,17 @@ fn render_note(ui: &mut egui::Ui, state: &mut WorkloadsState) {
     ui.add_space(Style::SP_XS);
 }
 
-/// The pending typed-arming confirm (RUN-006) — the operator types the required
-/// echo; the confirm button is disabled (never omitted) until it matches, then
+/// The pending mutation review sheet — the operator types the required echo;
+/// the confirm button is disabled (never omitted) until it matches, then
 /// releases the action. Cancel clears it. Nothing reaches the Bus until armed.
-fn render_arming(ui: &mut egui::Ui, state: &mut WorkloadsState) {
-    let Some(arming) = state.arming.as_mut() else {
+fn render_review_sheet(ui: &mut egui::Ui, state: &mut WorkloadsState) {
+    let Some(snapshot) = state.arming.as_ref() else {
         return;
     };
-    let echo = arming.action.echo();
-    let word = arming.action.confirm_word();
-    let subject = arming.action.subject();
+    let echo = snapshot.action.echo();
+    let word = snapshot.action.confirm_word();
+    let subject = snapshot.action.subject();
+    let facts = review_sheet_facts(&snapshot.action, state);
     let mut confirm = false;
     let mut cancel = false;
 
@@ -1614,7 +2451,7 @@ fn render_arming(ui: &mut egui::Ui, state: &mut WorkloadsState) {
         .show(ui, |ui| {
             ui.label(
                 RichText::new(format!(
-                    "Arming — type \u{201C}{echo}\u{201D} exactly to {} {subject}. Nothing is \
+                    "Review — type \u{201C}{echo}\u{201D} exactly to {} {subject}. Nothing is \
                      sent until it matches.",
                     word.to_lowercase()
                 ))
@@ -1622,6 +2459,26 @@ fn render_arming(ui: &mut egui::Ui, state: &mut WorkloadsState) {
                 .color(Style::TEXT_DIM),
             );
             ui.add_space(Style::SP_XS);
+            ui.horizontal_wrapped(|ui| {
+                field(ui, "Command", &facts.command, Style::DANGER);
+                ui.add_space(Style::SP_M);
+                field(ui, "Subject", &facts.subject, Style::TEXT);
+                ui.add_space(Style::SP_M);
+                field(ui, "Target", &facts.target, Style::TEXT);
+                ui.add_space(Style::SP_M);
+                field(ui, "Placement node", &facts.node, Style::ACCENT_WORKLOADS);
+            });
+            ui.horizontal_wrapped(|ui| {
+                field(ui, "Body digest", &facts.body_digest, Style::TEXT);
+                ui.add_space(Style::SP_M);
+                field(ui, "Body summary", &facts.body_summary, Style::TEXT_DIM);
+            });
+            muted_note(ui, format!("Frozen body: {}", facts.body_preview));
+            muted_note(ui, format!("Blast radius: {}", facts.impact));
+            ui.add_space(Style::SP_XS);
+            let Some(arming) = state.arming.as_mut() else {
+                return;
+            };
             ui.horizontal(|ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut arming.typed)
@@ -1793,8 +2650,6 @@ mod configure;
 mod containers;
 mod images;
 mod status;
-
-mod views;
 
 #[cfg(test)]
 #[allow(clippy::panic)]

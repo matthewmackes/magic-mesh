@@ -65,6 +65,9 @@ pub mod lighthouse;
 // The replicated directory carries only binary health; these live operational
 // facts need a per-lighthouse probe lane (LIGHTHOUSE follow-on, now filled).
 pub mod lighthouse_probe;
+/// WL-FUNC-015 — shared `state/media/sources` wire records published by
+/// `mackesd` and consumed by the Media Workspace without a daemon dependency.
+pub mod media_sources;
 // arch-7 (2026-07-11) — the canonical shared-storage mount constant +
 // the AUDIT-MESH-15 write-safety guard, relocated out of the `mackesd` bin
 // crate so worker crates factored out of the daemon (mde-browser-workers)

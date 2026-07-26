@@ -42,6 +42,8 @@ pub enum Surface {
     Phones,
     /// Collaboration and communications hub.
     Communications,
+    /// Unified node-local settings, storage, and hardware/identity interface.
+    ThisNode,
     /// Host settings and controls.
     System,
     /// Disk and partition management.
@@ -57,7 +59,7 @@ pub enum Surface {
 #[allow(clippy::use_self)]
 impl Surface {
     /// Every Springboard/Spotlight surface in canonical keyboard order.
-    pub(crate) const ALL: [Surface; 15] = [
+    pub(crate) const ALL: [Surface; 13] = [
         Surface::FleetMesh,
         Surface::InfraCode,
         Surface::Desktop,
@@ -69,9 +71,7 @@ impl Surface {
         Surface::MapsLocation,
         Surface::Terminal,
         Surface::Phones,
-        Surface::System,
-        Surface::Storage,
-        Surface::About,
+        Surface::ThisNode,
         Surface::Communications,
     ];
 
@@ -92,8 +92,8 @@ impl Surface {
             Surface::MapsLocation => IconId::MapsLocation,
             Surface::Terminal => IconId::Terminal,
             Surface::Phones => IconId::Phones,
-            Surface::Communications => IconId::Share,
-            Surface::System => IconId::Settings,
+            Surface::Communications => IconId::Teams,
+            Surface::ThisNode | Surface::System => IconId::Settings,
             Surface::Storage => IconId::Storage,
             Surface::About | Surface::Timers => IconId::Mark,
         }
@@ -115,10 +115,8 @@ impl Surface {
             Surface::MapsLocation => "Maps & Location",
             Surface::Terminal => "Terminal",
             Surface::Phones => "Phones",
-            Surface::Communications => "Communications",
-            Surface::System => "System",
-            Surface::Storage => "Storage",
-            Surface::About => "About",
+            Surface::Communications => "Mesh Teams",
+            Surface::ThisNode | Surface::System | Surface::Storage | Surface::About => "This Node",
             Surface::Timers => "Timers & Alarms",
             Surface::AutoHome => "Car Home",
         }
@@ -176,7 +174,7 @@ pub(crate) const LAUNCHER_GROUPS: [LauncherGroup; 8] = [
     LauncherGroup {
         label: "Files & Data",
         accent: Style::ACCENT_SYSTEM,
-        surfaces: &[Surface::Files, Surface::Storage],
+        surfaces: &[Surface::Files],
     },
     LauncherGroup {
         label: "Web",
@@ -189,14 +187,43 @@ pub(crate) const LAUNCHER_GROUPS: [LauncherGroup; 8] = [
         surfaces: &[Surface::Terminal],
     },
     LauncherGroup {
-        label: "Comms",
-        accent: Style::ACCENT_COMMS,
+        label: "Mesh Teams",
+        accent: Style::ACCENT_TEAMS,
         surfaces: &[Surface::Phones, Surface::Communications],
     },
     LauncherGroup {
         label: "System",
         accent: Style::ACCENT_WORKLOADS,
-        surfaces: &[Surface::System, Surface::About],
+        surfaces: &[Surface::ThisNode],
+    },
+];
+
+/// Compact Springboard Dock grouping selected by the operator survey.
+///
+/// This is intentionally narrower than [`LAUNCHER_GROUPS`]: the all-icons
+/// desktop, Spotlight, and switcher retain the complete taxonomy, while the
+/// always-present dock carries only the high-frequency app clusters. The
+/// `Infra` pair is the operator's VM/remote-session launcher plus Terminal;
+/// the broader Workloads control plane stays in the full catalog.
+pub(crate) const DOCK_LAUNCHER_GROUPS: [LauncherGroup; 3] = [
+    LauncherGroup {
+        label: "Infra",
+        accent: Style::ACCENT_TERMINALS,
+        surfaces: &[Surface::Desktop, Surface::Terminal],
+    },
+    LauncherGroup {
+        label: "Ops",
+        accent: Style::ACCENT_MESH,
+        surfaces: &[
+            Surface::MapsLocation,
+            Surface::Communications,
+            Surface::Files,
+        ],
+    },
+    LauncherGroup {
+        label: "Life",
+        accent: Style::ACCENT_MEDIA,
+        surfaces: &[Surface::Music, Surface::Media, Surface::Browser],
     },
 ];
 
@@ -234,6 +261,28 @@ const _: () = {
     }
 };
 
+/// Dock group label for a high-frequency surface, or an empty string for
+/// surfaces that remain launchable from the full Springboard/Spotlight surface.
+pub(crate) fn dock_launcher_group_label(surface: Surface) -> &'static str {
+    DOCK_LAUNCHER_GROUPS
+        .iter()
+        .find(|group| group.surfaces.contains(&surface))
+        .map_or("", |group| group.label)
+}
+
+/// Dock-specific app label for compact operator wording.
+///
+/// The underlying surface labels stay stable for search, switcher, and deep-link
+/// copy. The Dock can still present the survey terms: VMs for the Remote
+/// Sessions launcher and File Manager for the Files surface.
+pub(crate) const fn dock_launcher_surface_label(surface: Surface) -> &'static str {
+    match surface {
+        Surface::Desktop => "VMs",
+        Surface::Files => "File Manager",
+        _ => surface.label(),
+    }
+}
+
 /// Group label for a surface, or an empty string for dedicated-only surfaces.
 pub(crate) fn launcher_group_label(surface: Surface) -> &'static str {
     if matches!(
@@ -241,6 +290,9 @@ pub(crate) fn launcher_group_label(surface: Surface) -> &'static str {
         Surface::Workbench | Surface::MeshView | Surface::Explorer
     ) {
         return "Mesh Control";
+    }
+    if matches!(surface, Surface::System | Surface::Storage | Surface::About) {
+        return "System";
     }
     LAUNCHER_GROUPS
         .iter()
@@ -255,6 +307,9 @@ pub(crate) fn launcher_group_accent(surface: Surface) -> Option<egui::Color32> {
         Surface::Workbench | Surface::MeshView | Surface::Explorer
     ) {
         return Some(Style::ACCENT_MESH);
+    }
+    if matches!(surface, Surface::System | Surface::Storage | Surface::About) {
+        return Some(Style::ACCENT_WORKLOADS);
     }
     LAUNCHER_GROUPS
         .iter()
@@ -451,6 +506,72 @@ mod tests {
         for surface in Surface::ALL {
             assert_eq!(projected.iter().filter(|item| **item == surface).count(), 1);
         }
+        assert!(Surface::ALL.contains(&Surface::ThisNode));
+        assert!(!Surface::ALL.contains(&Surface::System));
+        assert!(!Surface::ALL.contains(&Surface::Storage));
+        assert!(!Surface::ALL.contains(&Surface::About));
+
+        assert_eq!(Surface::Communications.label(), "Mesh Teams");
+        assert_eq!(Surface::Communications.icon_id(), IconId::Teams);
+        assert_eq!(
+            launcher_group_accent(Surface::Communications),
+            Some(Style::ACCENT_TEAMS)
+        );
+    }
+
+    #[test]
+    fn dock_launcher_groups_match_operator_survey() {
+        let projected: Vec<_> = DOCK_LAUNCHER_GROUPS
+            .iter()
+            .map(|group| (group.label, group.surfaces.to_vec()))
+            .collect();
+        assert_eq!(
+            projected,
+            vec![
+                // Operator survey wording: "VMs and Terminal" — the shipped
+                // VM/session launcher is `Surface::Desktop` ("Remote Sessions").
+                ("Infra", vec![Surface::Desktop, Surface::Terminal]),
+                (
+                    "Ops",
+                    vec![
+                        Surface::MapsLocation,
+                        Surface::Communications,
+                        Surface::Files,
+                    ],
+                ),
+                (
+                    "Life",
+                    vec![Surface::Music, Surface::Media, Surface::Browser],
+                ),
+            ]
+        );
+
+        let docked: Vec<_> = DOCK_LAUNCHER_GROUPS
+            .iter()
+            .flat_map(|group| group.surfaces.iter().copied())
+            .collect();
+        for surface in [
+            Surface::FleetMesh,
+            Surface::InfraCode,
+            Surface::Bookmarks,
+            Surface::Phones,
+            Surface::ThisNode,
+        ] {
+            assert!(
+                !docked.contains(&surface),
+                "{surface:?} stays in the full Springboard/Spotlight catalog, not the compact dock"
+            );
+        }
+        assert_eq!(dock_launcher_group_label(Surface::Terminal), "Infra");
+        assert_eq!(dock_launcher_group_label(Surface::Communications), "Ops");
+        assert_eq!(dock_launcher_group_label(Surface::Browser), "Life");
+        assert_eq!(dock_launcher_group_label(Surface::FleetMesh), "");
+        assert_eq!(dock_launcher_surface_label(Surface::Desktop), "VMs");
+        assert_eq!(dock_launcher_surface_label(Surface::Files), "File Manager");
+        assert_eq!(
+            dock_launcher_surface_label(Surface::MapsLocation),
+            "Maps & Location"
+        );
     }
 
     #[test]

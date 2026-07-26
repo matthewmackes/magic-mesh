@@ -1,4 +1,11 @@
 //! WL-FUNC-012 / OVERLAY-9 — keyless MBTA GTFS-Realtime vehicle adapter.
+//!
+//! Workstations start this keyless MassDOT/MBTA producer by default.
+//! Operators can explicitly disable it with `MDE_OVERLAY_MBTA_TRANSIT=0/false/no/off`.
+//! Missing same-host vehicle context publishes an honest empty retained mirror
+//! instead of leaving the catalog topic absent or replaying stale vehicles.
+//! Blocking rustls HTTP and protobuf normalization run away from Tokio worker
+//! threads.
 
 #![cfg(feature = "async-services")]
 
@@ -17,7 +24,7 @@ use reqwest::header::{CONTENT_TYPE, ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST
 
 use super::{ShutdownToken, Worker};
 
-/// Explicit opt-in; unset/false is an idle no-op.
+/// Explicit disable for the keyless default-on MassDOT/MBTA producer.
 pub const ENABLED_ENV: &str = "MDE_OVERLAY_MBTA_TRANSIT";
 /// Optional operator-controlled feed override.
 pub const ENDPOINT_ENV: &str = "MDE_OVERLAY_MBTA_TRANSIT_URL";
@@ -26,6 +33,7 @@ pub const DEFAULT_ENDPOINT: &str = "https://cdn.mbta.com/realtime/VehiclePositio
 /// Feed regeneration/poll cadence.
 pub const POLL: Duration = Duration::from_secs(20);
 const RETRY_MAX: Duration = Duration::from_secs(5 * 60);
+const NO_FIX_RETRY: Duration = Duration::from_secs(20);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(12);
 const MAX_BODY_BYTES: usize = 512 * 1024;
 const MAX_FEED_ENTITIES: usize = 4_096;
@@ -75,7 +83,6 @@ struct Validators {
 
 /// Production rustls probe.
 pub struct MbtaHttpProbe {
-    client: Client,
     endpoint: String,
     validators: Mutex<Validators>,
 }
@@ -87,14 +94,7 @@ impl MbtaHttpProbe {
     }
 
     fn from_endpoint(endpoint: String) -> io::Result<Self> {
-        let client = Client::builder()
-            .timeout(HTTP_TIMEOUT)
-            .user_agent(USER_AGENT)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(io_other)?;
         Ok(Self {
-            client,
             endpoint,
             validators: Mutex::new(Validators::default()),
         })
@@ -109,7 +109,12 @@ impl MbtaHttpProbe {
 impl TransitProbe for MbtaHttpProbe {
     fn fetch(&self, point: TransitPoint) -> io::Result<ProbeResponse> {
         validate_point(point)?;
-        let mut request = self.client.get(&self.endpoint);
+        // `reqwest::blocking::Client` owns an internal runtime. Construct and
+        // drop it inside this blocking fetch call; `fetch_async` runs this
+        // method via `spawn_blocking`, while sync tests call it outside a Tokio
+        // runtime.
+        let client = mbta_http_client()?;
+        let mut request = client.get(&self.endpoint);
         let mut sent_validator = false;
         {
             let validators = self
@@ -183,6 +188,15 @@ impl TransitProbe for MbtaHttpProbe {
         };
         Ok(ProbeResponse::Modified(body))
     }
+}
+
+fn mbta_http_client() -> io::Result<Client> {
+    Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .user_agent(USER_AGENT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(io_other)
 }
 
 fn header_string(
@@ -656,10 +670,13 @@ pub struct TransitOverlayWorker {
 }
 
 impl TransitOverlayWorker {
-    /// Production wiring. Disabled unless explicitly opted in.
+    /// Production wiring. The keyless MassDOT/MBTA adapter is enabled by
+    /// default on spawned Workstation-tier nodes; an explicit false-y env
+    /// disables it. Missing vehicle context publishes an honest empty mirror
+    /// instead of leaving the catalog topic absent.
     #[must_use]
     pub fn new(host: String) -> Self {
-        let probe = if env_truthy(ENABLED_ENV) {
+        let probe = if env_default_enabled(ENABLED_ENV) {
             let endpoint = std::env::var(ENDPOINT_ENV)
                 .ok()
                 .filter(|value| !value.trim().is_empty())
@@ -696,6 +713,13 @@ impl TransitOverlayWorker {
         self
     }
 
+    /// Override cadence for tests.
+    #[must_use]
+    pub const fn with_poll(mut self, poll: Duration) -> Self {
+        self.poll = poll;
+        self
+    }
+
     fn current_point(&self) -> Option<TransitPoint> {
         let root = self.bus_root.clone()?;
         let persist = mde_bus::persist::Persist::open(root).ok()?;
@@ -713,6 +737,12 @@ impl TransitOverlayWorker {
                 snapshot,
             );
         }
+    }
+
+    fn no_context_snapshot(&self, reason: &str) -> TransitSnapshot {
+        let mut snapshot = TransitSnapshot::empty(&self.host, now_ms(), 0, "2.0", 0.0, 0.0);
+        push_gap(&mut snapshot.gaps, reason.to_string());
+        snapshot
     }
 
     fn apply_result(
@@ -754,11 +784,7 @@ impl TransitOverlayWorker {
                 }
             }
             Err(error) => {
-                self.publish_failure(
-                    last_good,
-                    point,
-                    &format!("MBTA refresh failed: {error}"),
-                );
+                self.publish_failure(last_good, point, &format!("MBTA refresh failed: {error}"));
                 false
             }
         }
@@ -806,6 +832,16 @@ impl TransitOverlayWorker {
             push_gap(&mut snapshot.gaps, gap.to_string());
             self.publish(snapshot);
         }
+    }
+
+    fn publish_no_context_degraded(&self, last_good: &mut Option<TransitSnapshot>, reason: &str) {
+        tracing::warn!(target: "mackesd::transit_overlay", host = %self.host, error = reason, "MBTA refresh has no fresh same-host vehicle context; publishing empty degraded snapshot");
+        let snapshot = self.no_context_snapshot(reason);
+        self.publish(&snapshot);
+        // Vehicle-scoped transit rows are invalid once the same-host fix
+        // disappears. Keep the retained Bus topic present and licensed, but do
+        // not let a later failure or 304 replay vehicles from the stale point.
+        *last_good = None;
     }
 
     async fn fetch_async(
@@ -872,14 +908,23 @@ impl Worker for TransitOverlayWorker {
         };
         let mut last_good = None;
         let mut retry = self.poll;
+        let mut no_fix_published = false;
         loop {
             let Some(point) = self.current_point() else {
+                if !no_fix_published {
+                    self.publish_no_context_degraded(
+                        &mut last_good,
+                        "MBTA refresh failed: fresh same-host MG90 vehicle fix unavailable",
+                    );
+                    no_fix_published = true;
+                }
                 tokio::select! {
                     () = shutdown.wait() => break,
-                    () = tokio::time::sleep(self.poll) => {}
+                    () = tokio::time::sleep(NO_FIX_RETRY.min(self.poll)) => {}
                 }
                 continue;
             };
+            no_fix_published = false;
             let Some(result) = self.fetch_async(probe.clone(), point, &mut shutdown).await else {
                 break;
             };
@@ -899,13 +944,15 @@ impl Worker for TransitOverlayWorker {
     }
 }
 
-fn env_truthy(name: &str) -> bool {
-    std::env::var(name).is_ok_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
+fn env_default_enabled(name: &str) -> bool {
+    overlay_enabled_from_env(std::env::var(name).ok().as_deref())
+}
+
+fn overlay_enabled_from_env(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(|value| value.trim().to_ascii_lowercase()),
+        Some(value) if matches!(value.as_str(), "0" | "false" | "no" | "off")
+    )
 }
 
 fn now_ms() -> i64 {
@@ -1128,6 +1175,21 @@ mod tests {
     }
 
     #[test]
+    fn keyless_mbta_producer_defaults_on_with_explicit_false_opt_out() {
+        assert!(overlay_enabled_from_env(None));
+        assert!(overlay_enabled_from_env(Some("")));
+        assert!(overlay_enabled_from_env(Some("1")));
+        assert!(overlay_enabled_from_env(Some("true")));
+        assert!(overlay_enabled_from_env(Some("yes")));
+        assert!(overlay_enabled_from_env(Some("on")));
+        assert!(overlay_enabled_from_env(Some("sure")));
+        assert!(!overlay_enabled_from_env(Some("0")));
+        assert!(!overlay_enabled_from_env(Some("false")));
+        assert!(!overlay_enabled_from_env(Some("NO")));
+        assert!(!overlay_enabled_from_env(Some(" off ")));
+    }
+
+    #[test]
     fn endpoint_requires_the_canonical_https_mbta_feed() {
         assert!(validate_endpoint(DEFAULT_ENDPOINT).is_ok());
         for hostile in [
@@ -1219,7 +1281,10 @@ mod tests {
             longitude: point().longitude,
         };
         assert!(!worker.apply_result(Ok(PreparedResponse::NotModified), moved, &mut last));
-        assert!(last.is_none(), "moved query must clear the retained snapshot");
+        assert!(
+            last.is_none(),
+            "moved query must clear the retained snapshot"
+        );
     }
 
     #[test]
@@ -1236,11 +1301,7 @@ mod tests {
             longitude: point().longitude,
         };
 
-        assert!(!worker.apply_result(
-            Err(io::Error::other("timeout")),
-            moved,
-            &mut last,
-        ));
+        assert!(!worker.apply_result(Err(io::Error::other("timeout")), moved, &mut last,));
         assert!(last.is_none(), "the old snapshot must not remain in memory");
 
         let row = Persist::open(root)
@@ -1258,6 +1319,95 @@ mod tests {
             .gaps
             .iter()
             .any(|gap| gap.contains("retained snapshot cleared") && gap.contains("timeout")));
+    }
+
+    #[test]
+    fn no_fresh_vehicle_fix_publishes_empty_state_before_first_fetch() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().to_path_buf();
+        let worker = TransitOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root));
+        let mut private_cache = None;
+
+        worker.publish_no_context_degraded(
+            &mut private_cache,
+            "MBTA refresh failed: fresh same-host MG90 vehicle fix unavailable",
+        );
+
+        assert!(private_cache.is_none());
+        let snapshot: TransitSnapshot = serde_json::from_str(
+            Persist::open(worker.bus_root.clone().expect("root"))
+                .expect("bus")
+                .read_latest(&transit_state_topic("rig-1"))
+                .expect("read")
+                .expect("message")
+                .body
+                .as_deref()
+                .expect("body"),
+        )
+        .expect("degraded snapshot");
+        assert_eq!(snapshot.host, "rig-1");
+        assert!(snapshot.fetched_at_ms > 0);
+        assert_eq!(snapshot.feed_generated_at_ms, 0);
+        assert_eq!(snapshot.feed_version, "2.0");
+        assert!(snapshot.vehicles.is_empty());
+        assert_eq!(snapshot.query_latitude, 0.0);
+        assert_eq!(snapshot.query_longitude, 0.0);
+        assert!(snapshot
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("vehicle fix unavailable")));
+        assert_eq!(snapshot.license_tier, "open-data-attribution");
+        assert_eq!(snapshot.attribution, "MassDOT · MBTA");
+    }
+
+    #[test]
+    fn no_vehicle_fix_degraded_snapshot_clears_stale_bus_row_and_private_cache() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().to_path_buf();
+        let seed_worker =
+            TransitOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+        let original = build_snapshot("rig-1", point(), &captured_feed(), NOW_MS).expect("parse");
+        assert!(!original.vehicles.is_empty());
+        let mut seed_cache = None;
+        assert!(seed_worker.apply_result(
+            Ok(PreparedResponse::Modified(original.clone())),
+            point(),
+            &mut seed_cache,
+        ));
+
+        let restarted =
+            TransitOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+        let mut private_cache = Some(original);
+        restarted.publish_no_context_degraded(
+            &mut private_cache,
+            "MBTA refresh failed: no fresh vehicle fix after restart",
+        );
+
+        assert!(
+            private_cache.is_none(),
+            "old vehicle-scoped transit cache must not survive fix loss"
+        );
+        let snapshot: TransitSnapshot = serde_json::from_str(
+            Persist::open(root)
+                .expect("bus")
+                .read_latest(&transit_state_topic("rig-1"))
+                .expect("read")
+                .expect("message")
+                .body
+                .as_deref()
+                .expect("body"),
+        )
+        .expect("degraded snapshot");
+        assert!(snapshot.vehicles.is_empty());
+        assert_eq!(snapshot.query_latitude, 0.0);
+        assert_eq!(snapshot.query_longitude, 0.0);
+        assert_eq!(snapshot.feed_generated_at_ms, 0);
+        assert!(snapshot
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("after restart")));
+        assert_eq!(snapshot.license_tier, "open-data-attribution");
+        assert_eq!(snapshot.attribution, "MassDOT · MBTA");
     }
 
     struct SlowProbe;
@@ -1286,5 +1436,57 @@ mod tests {
         .expect("runtime remains responsive");
         assert!(result.is_none());
         sender.await.expect("sender");
+    }
+
+    #[tokio::test]
+    async fn default_on_worker_publishes_degraded_snapshot_without_vehicle_fix() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().to_path_buf();
+        let mut worker = TransitOverlayWorker::new("rig-1".to_string())
+            .with_probe(Arc::new(SlowProbe))
+            .with_bus_root(Some(root.clone()))
+            .with_poll(Duration::from_millis(50));
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let token = ShutdownToken::from_receiver(rx);
+        let handle = tokio::spawn(async move { worker.run(token).await });
+
+        let topic = transit_state_topic("rig-1");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let body = loop {
+            if let Some(row) = Persist::open(root.clone())
+                .expect("bus")
+                .read_latest(&topic)
+                .expect("read")
+            {
+                break row.body.expect("body");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "default-on MBTA worker did not publish a degraded no-fix snapshot"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        tx.send(true).expect("shutdown");
+        let joined = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert!(joined.is_ok(), "worker exits promptly after proof");
+        joined
+            .expect("join timeout")
+            .expect("join")
+            .expect("worker ok");
+
+        let snapshot: TransitSnapshot = serde_json::from_str(&body).expect("snapshot");
+        assert_eq!(snapshot.host, "rig-1");
+        assert!(snapshot.fetched_at_ms > 0);
+        assert_eq!(snapshot.feed_generated_at_ms, 0);
+        assert!(snapshot.vehicles.is_empty());
+        assert_eq!(snapshot.query_latitude, 0.0);
+        assert_eq!(snapshot.query_longitude, 0.0);
+        assert!(snapshot
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("vehicle fix unavailable")));
+        assert_eq!(snapshot.license_tier, "open-data-attribution");
+        assert_eq!(snapshot.attribution, "MassDOT · MBTA");
     }
 }

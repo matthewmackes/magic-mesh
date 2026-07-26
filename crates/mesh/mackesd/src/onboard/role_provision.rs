@@ -326,6 +326,21 @@ mod tests {
             Some("*"),
             "the base RPM must require a default hunspell dictionary"
         );
+        for package in [
+            "pipewire",
+            "wireplumber",
+            "pipewire-alsa",
+            "pipewire-pulseaudio",
+            "alsa-ucm",
+            "alsa-sof-firmware",
+            "alsa-utils",
+        ] {
+            assert_eq!(
+                rpm["requires"][package].as_str(),
+                Some("*"),
+                "the base RPM must require {package} so Workstation audio has a complete PipeWire/Pulse/ALSA-UCM stack"
+            );
+        }
         let base_assets = rpm["assets"].as_array().expect("base assets array");
         assert!(
             base_assets.iter().any(|asset| {
@@ -338,6 +353,10 @@ mod tests {
         assert!(
             post_install.contains("systemctl enable mde-shell-egui.service"),
             "base RPM post-install must enable the self-gated seat unit"
+        );
+        assert!(
+            post_install.contains("usermod -aG audio \"$user\""),
+            "base RPM post-install must grant known non-root seat users the audio group so PipeWire can open /dev/snd on DRM seats without logind ACLs"
         );
         assert!(
             post_install.contains("/etc/systemd/system/mde-shell.service")

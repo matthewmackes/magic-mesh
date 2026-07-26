@@ -10,6 +10,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use mde_egui::egui;
@@ -18,14 +19,17 @@ use mde_theme::brand::icons::IconId;
 use serde::{Deserialize, Serialize};
 
 use crate::status_bar::STATUS_BAR_H;
-use crate::surfaces::icon_texture;
+use crate::surfaces::{
+    dock_launcher_group_label, dock_launcher_surface_label, icon_texture, Surface,
+    DOCK_LAUNCHER_GROUPS,
+};
 
 /// The reserved left-rail width in docked mode.
 pub(crate) const DOCKED_W: f32 = 56.0;
-/// The fixed floating pill width selected in the navigation-bar design review.
-pub(crate) const FLOATING_W: f32 = 240.0;
-/// The fixed floating pill height selected in the navigation-bar design review.
-pub(crate) const FLOATING_H: f32 = 56.0;
+/// The minimum floating dock width for the grouped Springboard launcher row.
+pub(crate) const FLOATING_W: f32 = 640.0;
+/// The fixed floating dock height: caption labels above 48px hit targets.
+pub(crate) const FLOATING_H: f32 = 80.0;
 /// The bottom/left breathing room around the undocked pill.
 const FLOATING_MARGIN: f32 = 16.0;
 /// Bottom space reserved by the horizontal Springboard Dock, including its
@@ -44,6 +48,7 @@ const TRANSITION: Duration = Duration::from_millis(360);
 const CONFIG_FILE: &str = "settings-nav-bar.json";
 /// Keep hostile or stale dock preferences bounded before serde materializes them.
 const MAX_NAV_PREFS_BYTES: usize = 64 * 1024;
+static NAV_LAYER_ID_MAP_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// One action emitted by the painted controls.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +59,8 @@ pub(crate) enum Action {
     Home,
     /// Toggle between the floating pill and the left rail.
     ToggleDock,
+    /// Open one docked app surface.
+    OpenSurface(Surface),
     /// Open a chooser-pinned remote desktop source through the normal chooser
     /// authentication and VDI hand-off path.
     DesktopSource(String),
@@ -224,7 +231,7 @@ impl State {
         }
 
         let mut action = None;
-        egui::Area::new(egui::Id::new("construct-navigation-bar"))
+        let area = egui::Area::new(egui::Id::new("construct-navigation-bar"))
             .order(egui::Order::Foreground)
             // Keep the foreground Area limited to the visible bar footprint.
             // A full-screen interactive Area makes the navigation chrome a
@@ -246,6 +253,9 @@ impl State {
                 ui.set_min_size(geometry.outer.size());
                 let painter = ui.painter().clone();
                 paint_backing(&painter, &geometry);
+                for group in &geometry.group_labels {
+                    paint_group_label(ctx, &painter, *group);
+                }
                 for control in &geometry.controls {
                     // The Area's content UI is created with its absolute screen
                     // rect as max_rect, so these interaction rectangles stay in
@@ -256,6 +266,36 @@ impl State {
                         egui::Sense::click(),
                     );
                     let hovered = response.hovered();
+                    let clicked = response.clicked();
+                    if nav_bar_proof_enabled() {
+                        log_foreground_layer_id_map_once();
+                        let interact_pos = ctx.input(|i| i.pointer.interact_pos());
+                        let top_layer = interact_pos
+                            .and_then(|pos| ctx.layer_id_at(pos))
+                            .map(|layer| format!("{layer:?}"));
+                        let response_layer = format!("{:?}", response.layer_id);
+                        let layer_contains_pointer =
+                            ctx.rect_contains_pointer(response.layer_id, response.interact_rect);
+                        tracing::info!(
+                            target: "mde_shell_egui::nav_bar",
+                            mode = self.mode.id_suffix(),
+                            control = control.kind.id_suffix(),
+                            rect_left = control.rect.left(),
+                            rect_top = control.rect.top(),
+                            rect_right = control.rect.right(),
+                            rect_bottom = control.rect.bottom(),
+                            hovered,
+                            clicked,
+                            interact_x = interact_pos.map(|pos| pos.x),
+                            interact_y = interact_pos.map(|pos| pos.y),
+                            top_layer = top_layer.as_deref(),
+                            response_layer = response_layer.as_str(),
+                            contains_pointer = response.contains_pointer(),
+                            layer_contains_pointer,
+                            enabled = response.enabled(),
+                            "springboard dock control response proof"
+                        );
+                    }
                     if hovered {
                         painter.rect_filled(
                             control.rect.shrink(2.0),
@@ -291,14 +331,21 @@ impl State {
                         label.as_str(),
                         self.is_docked(),
                     );
-                    let response = response.on_hover_ui(move |ui| {
+                    let _response = response.on_hover_ui(move |ui| {
                         nav_bar_tooltip(ui, label.as_str());
                     });
-                    if response.clicked() {
+                    if clicked {
                         action = Some(control_action(*control, pinned_sources));
                     }
                 }
             });
+        // egui retains Area ordering across frames. A foreground scrim or
+        // modal that was previously moved to the top can remain above the
+        // navigation bar even after it no longer visibly covers the dock. Keep
+        // the global Springboard Dock as the top ordinary foreground Area; the
+        // shell still mounts the lock curtain after this and raises it over all
+        // chrome when engaged.
+        ctx.move_to_top(area.response.layer_id);
         action
     }
 
@@ -426,6 +473,7 @@ enum ControlKind {
     Back,
     Home,
     Pin,
+    SurfaceLauncher,
     PinnedDesktop,
 }
 
@@ -435,6 +483,7 @@ impl ControlKind {
             Self::Back => "back",
             Self::Home => "home",
             Self::Pin => "pin",
+            Self::SurfaceLauncher => "surface",
             Self::PinnedDesktop => "pinned-desktop",
         }
     }
@@ -444,6 +493,7 @@ impl ControlKind {
             Self::Back => IconId::ArrowLeft,
             Self::Home => IconId::FileHome,
             Self::Pin => IconId::Pin,
+            Self::SurfaceLauncher => IconId::Mark,
             Self::PinnedDesktop => IconId::Desktop,
         }
     }
@@ -453,6 +503,7 @@ impl ControlKind {
             Self::Back => "Back",
             Self::Home => "Home",
             Self::Pin => "Pin Springboard Dock",
+            Self::SurfaceLauncher => "Open app",
             Self::PinnedDesktop => "Open pinned desktop",
         }
     }
@@ -462,6 +513,7 @@ impl ControlKind {
             Self::Back => Action::Back,
             Self::Home => Action::Home,
             Self::Pin => Action::ToggleDock,
+            Self::SurfaceLauncher => Action::Home,
             Self::PinnedDesktop => Action::Home,
         }
     }
@@ -471,13 +523,22 @@ impl ControlKind {
 struct Control {
     kind: ControlKind,
     rect: egui::Rect,
+    surface: Option<Surface>,
     source_index: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GroupLabel {
+    label: &'static str,
+    rect: egui::Rect,
+    accent: egui::Color32,
 }
 
 #[derive(Debug, Clone)]
 struct Geometry {
     outer: egui::Rect,
     radius: egui::CornerRadius,
+    group_labels: Vec<GroupLabel>,
     controls: Vec<Control>,
     finished: bool,
 }
@@ -486,14 +547,62 @@ fn floating_geometry(screen: egui::Rect) -> Geometry {
     floating_geometry_for(screen, 0)
 }
 
+fn dock_launcher_count() -> usize {
+    DOCK_LAUNCHER_GROUPS
+        .iter()
+        .map(|group| group.surfaces.len())
+        .sum()
+}
+
+fn dock_control_capacity(pinned_count: usize) -> usize {
+    3 + dock_launcher_count() + pinned_count
+}
+
+fn control_span(count: usize, gap: f32) -> f32 {
+    if count == 0 {
+        0.0
+    } else {
+        count as f32 * CONTROL_EDGE + (count - 1) as f32 * gap
+    }
+}
+
+fn docked_pinned_start_y(screen: egui::Rect) -> f32 {
+    let base_gap = Style::SP_XS;
+    let label_h = TypographyRole::Caption.line_height().ceil();
+    let mut y = screen.top() + STATUS_BAR_H + Style::SP_S;
+    y += control_span(3, base_gap) + Style::SP_S;
+    for group in DOCK_LAUNCHER_GROUPS {
+        y += label_h + Style::SP_XS;
+        y += control_span(group.surfaces.len(), base_gap) + Style::SP_S;
+    }
+    y
+}
+
+fn effective_pinned_count(screen: egui::Rect, requested: usize) -> usize {
+    let remaining = (screen.bottom() - Style::SP_S - docked_pinned_start_y(screen)).max(0.0);
+    let step = CONTROL_EDGE + Style::SP_XS;
+    let capacity = ((remaining + Style::SP_XS) / step).floor().max(0.0) as usize;
+    requested.min(capacity)
+}
+
 fn floating_geometry_for(screen: egui::Rect, pinned_count: usize) -> Geometry {
     let gap = 4.0;
-    let base_count = 3.0;
-    let pinned_count_f = pinned_count as f32;
-    let total_controls = base_count + pinned_count_f;
-    let separators = if pinned_count > 0 { 1.0 } else { 0.0 };
-    let content_w = total_controls.mul_add(CONTROL_EDGE, (total_controls - 1.0) * gap)
-        + separators * (Style::SP_S - gap);
+    let pinned_count = effective_pinned_count(screen, pinned_count);
+    let base_w = control_span(3, gap);
+    let group_w: f32 = DOCK_LAUNCHER_GROUPS
+        .iter()
+        .map(|group| control_span(group.surfaces.len(), gap))
+        .sum::<f32>()
+        + (DOCK_LAUNCHER_GROUPS.len().saturating_sub(1) as f32 * Style::SP_S);
+    let pinned_w = control_span(pinned_count, gap);
+    let content_w = base_w
+        + Style::SP_S
+        + group_w
+        + if pinned_count > 0 {
+            Style::SP_S + pinned_w
+        } else {
+            0.0
+        };
     let width = FLOATING_W.max(content_w + Style::SP_L * 2.0);
     let outer = egui::Rect::from_min_size(
         egui::pos2(
@@ -506,38 +615,70 @@ fn floating_geometry_for(screen: egui::Rect, pinned_count: usize) -> Geometry {
         ),
     );
     let first_x = outer.left() + Style::SP_L;
-    let y = outer.center().y - CONTROL_EDGE / 2.0;
-    let mut controls = Vec::with_capacity(3 + pinned_count);
-    for (idx, kind) in [ControlKind::Back, ControlKind::Home, ControlKind::Pin]
-        .into_iter()
-        .enumerate()
-    {
+    let y = outer.bottom() - Style::SP_S - CONTROL_EDGE;
+    let label_top = outer.top() + Style::SP_XS;
+    let label_h = TypographyRole::Caption.line_height().ceil();
+    let mut controls = Vec::with_capacity(dock_control_capacity(pinned_count));
+    let mut group_labels = Vec::with_capacity(DOCK_LAUNCHER_GROUPS.len());
+    let mut cursor_x = first_x;
+    for kind in [ControlKind::Back, ControlKind::Home, ControlKind::Pin] {
         controls.push(Control {
             kind,
             rect: egui::Rect::from_min_size(
-                egui::pos2(first_x + idx as f32 * (CONTROL_EDGE + gap), y),
+                egui::pos2(cursor_x, y),
                 egui::vec2(CONTROL_EDGE, CONTROL_EDGE),
             ),
+            surface: None,
             source_index: None,
         });
+        cursor_x += CONTROL_EDGE + gap;
     }
-    let mut source_x = controls
-        .last()
-        .map_or(first_x, |control| control.rect.right() + Style::SP_S);
+    cursor_x -= gap;
+    cursor_x += Style::SP_S;
+    for group in DOCK_LAUNCHER_GROUPS {
+        let group_start = cursor_x;
+        for surface in group.surfaces {
+            controls.push(Control {
+                kind: ControlKind::SurfaceLauncher,
+                rect: egui::Rect::from_min_size(
+                    egui::pos2(cursor_x, y),
+                    egui::vec2(CONTROL_EDGE, CONTROL_EDGE),
+                ),
+                surface: Some(*surface),
+                source_index: None,
+            });
+            cursor_x += CONTROL_EDGE + gap;
+        }
+        cursor_x -= gap;
+        group_labels.push(GroupLabel {
+            label: group.label,
+            rect: egui::Rect::from_min_max(
+                egui::pos2(group_start, label_top),
+                egui::pos2(cursor_x, label_top + label_h),
+            ),
+            accent: group.accent,
+        });
+        cursor_x += Style::SP_S;
+    }
+    if pinned_count > 0 {
+        cursor_x += Style::SP_S;
+    }
     for source_index in 0..pinned_count {
         controls.push(Control {
             kind: ControlKind::PinnedDesktop,
             rect: egui::Rect::from_min_size(
-                egui::pos2(source_x, y),
+                egui::pos2(cursor_x, y),
                 egui::vec2(CONTROL_EDGE, CONTROL_EDGE),
             ),
+            surface: None,
             source_index: Some(source_index),
         });
-        source_x += CONTROL_EDGE + gap;
+        cursor_x += CONTROL_EDGE + gap;
     }
     Geometry {
         outer,
         radius: egui::CornerRadius::same((FLOATING_H / 2.0) as u8),
+        group_labels,
         controls,
         finished: true,
     }
@@ -549,36 +690,59 @@ fn docked_geometry(screen: egui::Rect) -> Geometry {
 
 fn docked_geometry_for(screen: egui::Rect, pinned_count: usize) -> Geometry {
     let outer = egui::Rect::from_min_size(screen.left_top(), egui::vec2(DOCKED_W, screen.height()));
-    let mut controls = Vec::with_capacity(3 + pinned_count);
-    let first_y = screen.top() + STATUS_BAR_H + Style::SP_S;
-    for (idx, kind) in [ControlKind::Back, ControlKind::Home, ControlKind::Pin]
-        .into_iter()
-        .enumerate()
-    {
+    let pinned_count = effective_pinned_count(screen, pinned_count);
+    let mut controls = Vec::with_capacity(dock_control_capacity(pinned_count));
+    let mut group_labels = Vec::with_capacity(DOCK_LAUNCHER_GROUPS.len());
+    let mut cursor_y = screen.top() + STATUS_BAR_H + Style::SP_S;
+    let label_h = TypographyRole::Caption.line_height().ceil();
+    for kind in [ControlKind::Back, ControlKind::Home, ControlKind::Pin] {
         controls.push(Control {
             kind,
             rect: egui::Rect::from_min_size(
-                egui::pos2(
-                    outer.center().x - CONTROL_EDGE / 2.0,
-                    first_y + idx as f32 * (CONTROL_EDGE + Style::SP_XS),
-                ),
+                egui::pos2(outer.center().x - CONTROL_EDGE / 2.0, cursor_y),
                 egui::vec2(CONTROL_EDGE, CONTROL_EDGE),
             ),
+            surface: None,
             source_index: None,
         });
+        cursor_y += CONTROL_EDGE + Style::SP_XS;
+    }
+    cursor_y += Style::SP_S - Style::SP_XS;
+    for group in DOCK_LAUNCHER_GROUPS {
+        group_labels.push(GroupLabel {
+            label: group.label,
+            rect: egui::Rect::from_min_max(
+                egui::pos2(outer.left() + Style::SP_XS, cursor_y),
+                egui::pos2(outer.right() - Style::SP_XS, cursor_y + label_h),
+            ),
+            accent: group.accent,
+        });
+        cursor_y += label_h + Style::SP_XS;
+        for surface in group.surfaces {
+            controls.push(Control {
+                kind: ControlKind::SurfaceLauncher,
+                rect: egui::Rect::from_min_size(
+                    egui::pos2(outer.center().x - CONTROL_EDGE / 2.0, cursor_y),
+                    egui::vec2(CONTROL_EDGE, CONTROL_EDGE),
+                ),
+                surface: Some(*surface),
+                source_index: None,
+            });
+            cursor_y += CONTROL_EDGE + Style::SP_XS;
+        }
+        cursor_y += Style::SP_S - Style::SP_XS;
     }
     for source_index in 0..pinned_count {
         controls.push(Control {
             kind: ControlKind::PinnedDesktop,
             rect: egui::Rect::from_min_size(
-                egui::pos2(
-                    outer.center().x - CONTROL_EDGE / 2.0,
-                    first_y + (3 + source_index) as f32 * (CONTROL_EDGE + Style::SP_XS),
-                ),
+                egui::pos2(outer.center().x - CONTROL_EDGE / 2.0, cursor_y),
                 egui::vec2(CONTROL_EDGE, CONTROL_EDGE),
             ),
+            surface: None,
             source_index: Some(source_index),
         });
+        cursor_y += CONTROL_EDGE + Style::SP_XS;
     }
     Geometry {
         outer,
@@ -588,6 +752,7 @@ fn docked_geometry_for(screen: egui::Rect, pinned_count: usize) -> Geometry {
             sw: 0,
             se: Style::RADIUS_L as u8,
         },
+        group_labels,
         controls,
         finished: true,
     }
@@ -602,12 +767,24 @@ fn interpolate_geometry(from: &Geometry, to: &Geometry, t: f32, finished: bool) 
         .map(|(from, to)| Control {
             kind: from.kind,
             rect: lerp_rect(from.rect, to.rect, t),
+            surface: from.surface,
             source_index: from.source_index,
+        })
+        .collect();
+    let group_labels = from
+        .group_labels
+        .iter()
+        .zip(&to.group_labels)
+        .map(|(from, to)| GroupLabel {
+            label: from.label,
+            rect: lerp_rect(from.rect, to.rect, t),
+            accent: from.accent,
         })
         .collect();
     Geometry {
         outer,
         radius: lerp_radius(from.radius, to.radius, t),
+        group_labels,
         controls,
         finished,
     }
@@ -624,7 +801,18 @@ fn translate_geometry(geometry: &Geometry, delta: egui::Vec2) -> Geometry {
             .map(|control| Control {
                 kind: control.kind,
                 rect: control.rect.translate(delta),
+                surface: control.surface,
                 source_index: control.source_index,
+            })
+            .collect(),
+        group_labels: geometry
+            .group_labels
+            .iter()
+            .copied()
+            .map(|group| GroupLabel {
+                label: group.label,
+                rect: group.rect.translate(delta),
+                accent: group.accent,
             })
             .collect(),
         finished: geometry.finished,
@@ -635,6 +823,24 @@ fn paint_backing(painter: &egui::Painter, geometry: &Geometry) {
     let shadow = geometry.outer.translate(egui::vec2(0.0, 3.0));
     painter.rect_filled(shadow, geometry.radius, Elevation::Overlay.shadow().umbra);
     painter.rect_filled(geometry.outer, geometry.radius, Style::NAV_BAR_BG);
+}
+
+fn paint_group_label(ctx: &egui::Context, painter: &egui::Painter, group: GroupLabel) {
+    let color = Style::resolve_color(ctx, group.accent);
+    let label = painter.layout_job(Style::typography_job(
+        group.label,
+        TypographyRole::Caption,
+        color,
+        f32::INFINITY,
+    ));
+    painter.galley(
+        egui::pos2(
+            group.rect.center().x - label.size().x / 2.0,
+            group.rect.center().y - label.size().y / 2.0,
+        ),
+        label,
+        color,
+    );
 }
 
 fn nav_bar_tooltip(ui: &mut egui::Ui, text: &str) {
@@ -648,14 +854,20 @@ fn nav_bar_tooltip(ui: &mut egui::Ui, text: &str) {
 }
 
 fn control_id(mode: DockMode, control: Control) -> egui::Id {
-    match control.source_index {
-        Some(index) => egui::Id::new((
+    match (control.source_index, control.surface) {
+        (Some(index), _) => egui::Id::new((
             "construct-navigation-bar",
             mode.id_suffix(),
             "pinned",
             index,
         )),
-        None => egui::Id::new((
+        (None, Some(surface)) => egui::Id::new((
+            "construct-navigation-bar",
+            mode.id_suffix(),
+            "surface",
+            surface,
+        )),
+        (None, None) => egui::Id::new((
             "construct-navigation-bar",
             mode.id_suffix(),
             control.kind.id_suffix(),
@@ -663,7 +875,93 @@ fn control_id(mode: DockMode, control: Control) -> egui::Id {
     }
 }
 
+fn nav_bar_proof_enabled() -> bool {
+    std::env::var_os("MDE_NAV_BAR_PROOF").is_some()
+}
+
+fn log_foreground_layer_id_map_once() {
+    if NAV_LAYER_ID_MAP_LOGGED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let candidates = [
+        (
+            "construct-navigation-bar",
+            egui::Id::new("construct-navigation-bar"),
+        ),
+        (
+            "construct-status-bar",
+            egui::Id::new("construct-status-bar"),
+        ),
+        (
+            "notif-critical-edge-cue",
+            egui::Id::new("notif-critical-edge-cue"),
+        ),
+        (
+            "notif-critical-edge-cue/1",
+            egui::Id::new(("notif-critical-edge-cue", 1_usize)),
+        ),
+        (
+            "notif-critical-edge-cue/2",
+            egui::Id::new(("notif-critical-edge-cue", 2_usize)),
+        ),
+        (
+            "notif-critical-edge-cue/3",
+            egui::Id::new(("notif-critical-edge-cue", 3_usize)),
+        ),
+        (
+            "construct-notification-center",
+            egui::Id::new("construct-notification-center"),
+        ),
+        (
+            "shell-control-center",
+            egui::Id::new("shell-control-center"),
+        ),
+        (
+            "construct-switcher-area",
+            egui::Id::new("construct-switcher-area"),
+        ),
+        (
+            "shell-front-door-omnibox",
+            egui::Id::new("shell-front-door-omnibox"),
+        ),
+        ("mcnf-osk-toggle", egui::Id::new("mcnf-osk-toggle")),
+        ("mcnf-osk", egui::Id::new("mcnf-osk")),
+        ("shell-curtain", egui::Id::new("shell-curtain")),
+        (
+            "shell-layout-profile-button",
+            egui::Id::new("shell-layout-profile-button"),
+        ),
+        (
+            "shell-layout-profile-menu",
+            egui::Id::new("shell-layout-profile-menu"),
+        ),
+        (
+            "shell-remote-sessions-fallback-button",
+            egui::Id::new("shell-remote-sessions-fallback-button"),
+        ),
+        ("vdi-session-overlay", egui::Id::new("vdi-session-overlay")),
+        (
+            "mde-web-omnibox-suggestions-overlay",
+            egui::Id::new("mde-web-omnibox-suggestions-overlay"),
+        ),
+        ("kiron-chyron-area", egui::Id::new("kiron-chyron-area")),
+        ("kiron-osd-area", egui::Id::new("kiron-osd-area")),
+    ];
+    for (candidate, id) in candidates {
+        let layer = egui::LayerId::new(egui::Order::Foreground, id);
+        tracing::info!(
+            target: "mde_shell_egui::nav_bar",
+            candidate,
+            layer = format!("{layer:?}").as_str(),
+            "foreground layer candidate proof"
+        );
+    }
+}
+
 fn control_icon(control: Control) -> IconId {
+    if let Some(surface) = control.surface {
+        return surface.icon_id();
+    }
     control.kind.icon()
 }
 
@@ -671,13 +969,25 @@ fn control_label(
     control: Control,
     pinned_sources: &[crate::surfaces::DesktopRailSource],
 ) -> String {
-    match control
+    if let Some(source) = control
         .source_index
         .and_then(|index| pinned_sources.get(index))
     {
-        Some(source) => format!("Open pinned desktop {} on {}", source.label, source.node),
-        None if control.kind == ControlKind::Pin => "Pin Springboard Dock".to_owned(),
-        None => control.kind.tooltip().to_owned(),
+        return format!("Open pinned desktop {} on {}", source.label, source.node);
+    }
+    if let Some(surface) = control.surface {
+        let group = dock_launcher_group_label(surface);
+        let label = dock_launcher_surface_label(surface);
+        return if group.is_empty() {
+            format!("Open {label}")
+        } else {
+            format!("Open {label} from {group}")
+        };
+    }
+    if control.kind == ControlKind::Pin {
+        "Pin Springboard Dock".to_owned()
+    } else {
+        control.kind.tooltip().to_owned()
     }
 }
 
@@ -685,13 +995,16 @@ fn control_action(
     control: Control,
     pinned_sources: &[crate::surfaces::DesktopRailSource],
 ) -> Action {
-    match control
+    if let Some(source) = control
         .source_index
         .and_then(|index| pinned_sources.get(index))
     {
-        Some(source) => Action::DesktopSource(source.id.clone()),
-        None => control.kind.action(),
+        return Action::DesktopSource(source.id.clone());
     }
+    if let Some(surface) = control.surface {
+        return Action::OpenSurface(surface);
+    }
+    control.kind.action()
 }
 
 fn install_accessibility(
@@ -840,10 +1153,10 @@ mod tests {
     #[test]
     fn defaults_to_an_unpinned_springboard_dock() {
         assert_eq!(State::default().mode, DockMode::Floating);
-        assert_eq!(FLOATING_W, 240.0);
-        assert_eq!(FLOATING_H, 56.0);
+        assert_eq!(FLOATING_W, 640.0);
+        assert_eq!(FLOATING_H, 80.0);
         assert_eq!(DOCKED_W, 56.0);
-        assert_eq!(SPRINGBOARD_DOCK_RESERVED_H, 72.0);
+        assert_eq!(SPRINGBOARD_DOCK_RESERVED_H, 96.0);
     }
 
     #[test]
@@ -857,6 +1170,24 @@ mod tests {
     }
 
     #[test]
+    fn dock_launcher_accessibility_labels_use_operator_terms() {
+        let desktop = Control {
+            kind: ControlKind::SurfaceLauncher,
+            rect: egui::Rect::NOTHING,
+            surface: Some(Surface::Desktop),
+            source_index: None,
+        };
+        let files = Control {
+            kind: ControlKind::SurfaceLauncher,
+            rect: egui::Rect::NOTHING,
+            surface: Some(Surface::Files),
+            source_index: None,
+        };
+        assert_eq!(control_label(desktop, &[]), "Open VMs from Infra");
+        assert_eq!(control_label(files, &[]), "Open File Manager from Ops");
+    }
+
+    #[test]
     fn floating_and_docked_geometry_have_the_locked_edges() {
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
         let floating = floating_geometry(screen);
@@ -865,7 +1196,9 @@ mod tests {
         assert_eq!(docked.outer.width(), DOCKED_W);
         assert_eq!(docked.outer.top(), screen.top());
         assert_eq!(docked.controls[0].rect.top(), STATUS_BAR_H + Style::SP_S);
-        assert_eq!(docked.controls.len(), 3);
+        assert_eq!(docked.controls.len(), dock_control_capacity(0));
+        assert_eq!(floating.group_labels.len(), DOCK_LAUNCHER_GROUPS.len());
+        assert_eq!(docked.group_labels.len(), DOCK_LAUNCHER_GROUPS.len());
     }
 
     #[test]
@@ -1223,6 +1556,163 @@ mod tests {
     }
 
     #[test]
+    fn floating_pin_control_emits_action_after_drm_touch_click() {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0));
+        let mut state = State::with_mode(DockMode::Floating);
+        let ctx = egui::Context::default();
+        let pin = floating_geometry(screen).controls[2].rect.center();
+
+        let input = |events| egui::RawInput {
+            screen_rect: Some(screen),
+            events,
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            let _ = ctx.run(input(Vec::new()), |ctx| {
+                assert_eq!(state.mount(ctx, &[]), None);
+            });
+        }
+
+        let _ = ctx.run(
+            input(vec![
+                egui::Event::Touch {
+                    device_id: egui::TouchDeviceId(0),
+                    id: egui::TouchId(0),
+                    phase: egui::TouchPhase::Start,
+                    pos: pin,
+                    force: None,
+                },
+                egui::Event::PointerMoved(pin),
+                egui::Event::PointerButton {
+                    pos: pin,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]),
+            |ctx| {
+                assert_eq!(state.mount(ctx, &[]), None);
+            },
+        );
+        let mut action = None;
+        let _ = ctx.run(
+            input(vec![
+                egui::Event::Touch {
+                    device_id: egui::TouchDeviceId(0),
+                    id: egui::TouchId(0),
+                    phase: egui::TouchPhase::End,
+                    pos: pin,
+                    force: None,
+                },
+                egui::Event::PointerButton {
+                    pos: pin,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerGone,
+            ]),
+            |ctx| action = state.mount(ctx, &[]),
+        );
+        assert_eq!(action, Some(Action::ToggleDock));
+    }
+
+    #[test]
+    fn floating_pin_recovers_from_stale_foreground_overlay_order() {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0));
+        let mut state = State::with_mode(DockMode::Floating);
+        let ctx = egui::Context::default();
+        let pin = floating_geometry(screen).controls[2].rect.center();
+
+        let input = |events| egui::RawInput {
+            screen_rect: Some(screen),
+            events,
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            let _ = ctx.run(input(Vec::new()), |ctx| {
+                assert_eq!(state.mount(ctx, &[]), None);
+            });
+        }
+
+        let overlay_layer = egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("stale-fullscreen-foreground-overlay"),
+        );
+        let _ = ctx.run(input(Vec::new()), |ctx| {
+            assert_eq!(state.mount(ctx, &[]), None);
+            let overlay = egui::Area::new(overlay_layer.id)
+                .order(overlay_layer.order)
+                .fixed_pos(screen.min)
+                .show(ctx, |ui| {
+                    ui.allocate_exact_size(screen.size(), egui::Sense::click());
+                });
+            ctx.move_to_top(overlay.response.layer_id);
+        });
+        assert_eq!(
+            ctx.layer_id_at(pin),
+            Some(overlay_layer),
+            "fixture must place the stale overlay above the navigation Area before recovery"
+        );
+
+        let nav_layer = egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("construct-navigation-bar"),
+        );
+        let _ = ctx.run(input(Vec::new()), |ctx| {
+            assert_eq!(state.mount(ctx, &[]), None);
+        });
+        assert_eq!(
+            ctx.layer_id_at(pin),
+            Some(nav_layer),
+            "mounting the navigation bar must re-raise its bounded Area above stale overlays"
+        );
+
+        let _ = ctx.run(
+            input(vec![
+                egui::Event::Touch {
+                    device_id: egui::TouchDeviceId(0),
+                    id: egui::TouchId(0),
+                    phase: egui::TouchPhase::Start,
+                    pos: pin,
+                    force: None,
+                },
+                egui::Event::PointerMoved(pin),
+                egui::Event::PointerButton {
+                    pos: pin,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]),
+            |ctx| {
+                assert_eq!(state.mount(ctx, &[]), None);
+            },
+        );
+        let mut action = None;
+        let _ = ctx.run(
+            input(vec![
+                egui::Event::Touch {
+                    device_id: egui::TouchDeviceId(0),
+                    id: egui::TouchId(0),
+                    phase: egui::TouchPhase::End,
+                    pos: pin,
+                    force: None,
+                },
+                egui::Event::PointerButton {
+                    pos: pin,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerGone,
+            ]),
+            |ctx| action = state.mount(ctx, &[]),
+        );
+        assert_eq!(action, Some(Action::ToggleDock));
+    }
+
+    #[test]
     fn non_zero_screen_pointer_hits_each_base_control() {
         // An egui Area's content UI, painter, and widget rectangles all use
         // screen coordinates. Keep the viewport origin non-zero so a local-
@@ -1288,6 +1778,81 @@ mod tests {
                     |ctx| action = state.mount(ctx, &[]),
                 );
                 assert_eq!(action, Some(expected), "{mode:?} {kind:?} target");
+            }
+        }
+    }
+
+    #[test]
+    fn non_zero_screen_pointer_hits_each_grouped_app_control() {
+        let screen = egui::Rect::from_min_size(egui::pos2(73.0, 41.0), egui::vec2(1280.0, 800.0));
+
+        for mode in [DockMode::Floating, DockMode::Docked] {
+            let ctx = egui::Context::default();
+            let mut state = State::with_mode(mode);
+            let geometry = match mode {
+                DockMode::Floating => floating_geometry(screen),
+                DockMode::Docked => docked_geometry(screen),
+            };
+            let input = |events| egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            };
+            for _ in 0..3 {
+                let _ = ctx.run(input(Vec::new()), |ctx| {
+                    assert_eq!(state.mount(ctx, &[]), None);
+                });
+            }
+
+            for surface in [
+                Surface::Desktop,
+                Surface::Terminal,
+                Surface::MapsLocation,
+                Surface::Communications,
+                Surface::Files,
+                Surface::Music,
+                Surface::Media,
+                Surface::Browser,
+            ] {
+                let control = geometry
+                    .controls
+                    .iter()
+                    .find(|control| control.surface == Some(surface))
+                    .copied()
+                    .unwrap_or_else(|| panic!("{mode:?} missing grouped app {surface:?}"));
+                let target = control.rect.center();
+                let _ = ctx.run(
+                    input(vec![
+                        egui::Event::PointerMoved(target),
+                        egui::Event::PointerButton {
+                            pos: target,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ]),
+                    |ctx| {
+                        assert_eq!(state.mount(ctx, &[]), None);
+                    },
+                );
+                let mut action = None;
+                let _ = ctx.run(
+                    input(vec![
+                        egui::Event::PointerMoved(target),
+                        egui::Event::PointerButton {
+                            pos: target,
+                            button: egui::PointerButton::Primary,
+                            pressed: false,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ]),
+                    |ctx| action = state.mount(ctx, &[]),
+                );
+                assert_eq!(
+                    action,
+                    Some(Action::OpenSurface(surface)),
+                    "{mode:?} {surface:?} target"
+                );
             }
         }
     }
@@ -1405,10 +1970,15 @@ mod tests {
             false,
         )];
         let geometry = floating_geometry_for(screen, sources.len());
-        assert_eq!(geometry.controls.len(), 4);
+        assert_eq!(geometry.controls.len(), dock_control_capacity(1));
         assert_eq!(geometry.controls[2].kind, ControlKind::Pin);
-        assert_eq!(geometry.controls[3].kind, ControlKind::PinnedDesktop);
-        assert_eq!(geometry.controls[3].source_index, Some(0));
+        let pinned = geometry
+            .controls
+            .last()
+            .copied()
+            .expect("chooser pin should append a dock target");
+        assert_eq!(pinned.kind, ControlKind::PinnedDesktop);
+        assert_eq!(pinned.source_index, Some(0));
         assert!(
             geometry.outer.width() >= FLOATING_W,
             "the dock must grow to retain the pinned source target"
@@ -1416,7 +1986,7 @@ mod tests {
 
         let ctx = egui::Context::default();
         let mut state = State::with_mode(DockMode::Floating);
-        let target = geometry.controls[3].rect.center();
+        let target = pinned.rect.center();
         let input = |events| egui::RawInput {
             screen_rect: Some(screen),
             events,
@@ -1553,7 +2123,7 @@ mod tests {
 
         assert_eq!(
             floating.outer,
-            egui::Rect::from_min_max(egui::pos2(16.0, 728.0), egui::pos2(256.0, 784.0)),
+            egui::Rect::from_min_max(egui::pos2(16.0, 704.0), egui::pos2(656.0, 784.0)),
             "undocked navigation must be a fixed bottom-left pill"
         );
         assert_eq!(
@@ -1565,6 +2135,7 @@ mod tests {
             floating
                 .controls
                 .iter()
+                .take(3)
                 .map(|control| control.kind)
                 .collect::<Vec<_>>(),
             vec![ControlKind::Back, ControlKind::Home, ControlKind::Pin],
@@ -1574,15 +2145,42 @@ mod tests {
             floating
                 .controls
                 .iter()
-                .map(|control| control.kind.icon())
+                .take(3)
+                .map(|control| control_icon(*control))
                 .collect::<Vec<_>>(),
             vec![IconId::ArrowLeft, IconId::FileHome, IconId::Pin,]
+        );
+        assert_eq!(
+            floating
+                .controls
+                .iter()
+                .filter_map(|control| control.surface)
+                .collect::<Vec<_>>(),
+            vec![
+                Surface::Desktop,
+                Surface::Terminal,
+                Surface::MapsLocation,
+                Surface::Communications,
+                Surface::Files,
+                Surface::Music,
+                Surface::Media,
+                Surface::Browser,
+            ],
+            "the grouped dock must use the operator survey order"
+        );
+        assert_eq!(
+            floating
+                .group_labels
+                .iter()
+                .map(|group| group.label)
+                .collect::<Vec<_>>(),
+            vec!["Infra", "Ops", "Life"]
         );
         assert!(
             floating
                 .controls
                 .iter()
-                .all(|control| control.rect.center().y == floating.outer.center().y),
+                .all(|control| control.rect.center().y == floating.controls[0].rect.center().y),
             "the pill controls must share one horizontal row"
         );
 
@@ -1649,6 +2247,7 @@ mod tests {
             settled
                 .controls
                 .iter()
+                .take(3)
                 .map(|control| control.kind)
                 .collect::<Vec<_>>(),
             vec![ControlKind::Back, ControlKind::Home, ControlKind::Pin]

@@ -41,8 +41,9 @@
 //! progress. The negotiation + report construction are unit-tested; the live
 //! browse / play / report legs are honest-gated to a real server.
 //!
-//! Tier (§6): desktop-shell — it depends only on the harness, the media core, and
-//! the Jellyfin client core (all inward edges), pulling in no mesh-substrate crate.
+//! Tier (§6): desktop-shell — it depends on the harness, the media/Jellyfin cores,
+//! shared mesh wire types, and a local `mde-bus` Persist read for retained
+//! `state/media/sources`; it still does not depend on the daemon crate.
 
 #![allow(clippy::module_name_repetitions, clippy::must_use_candidate)]
 
@@ -53,11 +54,13 @@ mod menubar;
 
 use mde_egui::{eframe, run_client};
 
-pub use app::{media_header, media_panel, media_pump, pip_window, MediaApp, VideoTextureCache};
+pub use app::{
+    media_header, media_panel, media_pump, pip_window, BusMediaSources, MediaApp, VideoTextureCache,
+};
 pub use model::{
     capture_detail, client_capabilities, jellyfin_item_title, stream_media_type, CaptureUiState,
     CastUiState, JellyfinSession, JellyfinSourceRow, JellyfinState, MediaController, MediaTab,
-    SourceRow, TransportAction, UiState,
+    MeshJellyfinSourceRow, SourceRow, TransportAction, UiState,
 };
 
 /// The engine the surface drives (the real mpv engine, under `--features mpv`).

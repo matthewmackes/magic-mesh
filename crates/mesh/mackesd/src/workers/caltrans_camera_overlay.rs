@@ -1,4 +1,10 @@
 //! WL-FUNC-012 / OVERLAY-5 — keyless Caltrans CWWP2 camera adapter.
+//!
+//! Workstations start this keyless, public Caltrans CWWP2 producer by default
+//! when a district is configured. Operators can explicitly disable it with
+//! `MDE_OVERLAY_CALTRANS_CAMERAS=0/false/no/off`. Missing same-host vehicle
+//! context publishes an honest empty retained mirror instead of replaying
+//! cameras fetched for an old vehicle point.
 
 #![cfg(feature = "async-services")]
 
@@ -18,7 +24,7 @@ use serde::Deserialize;
 
 use super::{ShutdownToken, Worker};
 
-/// Explicit opt-in; unset/false is an idle no-op.
+/// Explicit disable for the keyless default-on Caltrans camera producer.
 pub const ENABLED_ENV: &str = "MDE_OVERLAY_CALTRANS_CAMERAS";
 /// Required Caltrans district number (`1` through `12`).
 pub const DISTRICT_ENV: &str = "MDE_OVERLAY_CALTRANS_DISTRICT";
@@ -93,20 +99,12 @@ struct Validators {
 
 /// Production rustls CWWP2 probe.
 pub struct CaltransHttpProbe {
-    client: Client,
     validators: Mutex<Validators>,
 }
 
 impl CaltransHttpProbe {
     fn new() -> io::Result<Self> {
-        let client = Client::builder()
-            .timeout(HTTP_TIMEOUT)
-            .user_agent(USER_AGENT)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(io_other)?;
         Ok(Self {
-            client,
             validators: Mutex::new(Validators::default()),
         })
     }
@@ -117,7 +115,12 @@ impl CaltransCameraProbe for CaltransHttpProbe {
         validate_district(district)?;
         validate_context(point)?;
         let url = catalog_url(district);
-        let mut request = self.client.get(&url);
+        // `reqwest::blocking::Client` owns an internal runtime that must be
+        // dropped outside Tokio async contexts. Build and drop it inside this
+        // blocking fetch call; `fetch_async` already runs the probe via
+        // `spawn_blocking`, while sync tests call it outside an async runtime.
+        let client = caltrans_http_client()?;
+        let mut request = client.get(&url);
         let mut sent_validator = false;
         {
             let validators = self
@@ -172,7 +175,8 @@ impl CaltransCameraProbe for CaltransHttpProbe {
 
     fn fetch_thumbnail(&self, district: u8, url: &str) -> io::Result<ThumbnailResponse> {
         validate_image_url(district, url)?;
-        let response = self.client.get(url).send().map_err(io_other)?;
+        let client = caltrans_http_client()?;
+        let response = client.get(url).send().map_err(io_other)?;
         require_status_and_type(&response, &["image/jpeg"], MAX_THUMBNAIL_BYTES)?;
         let observed_at_ms = header_string(&response, LAST_MODIFIED)
             .as_deref()
@@ -190,6 +194,15 @@ impl CaltransCameraProbe for CaltransHttpProbe {
             observed_at_ms,
         })
     }
+}
+
+fn caltrans_http_client() -> io::Result<Client> {
+    Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .user_agent(USER_AGENT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(io_other)
 }
 
 fn catalog_url(district: u8) -> String {
@@ -654,14 +667,18 @@ pub struct CaltransCameraOverlayWorker {
 }
 
 impl CaltransCameraOverlayWorker {
-    /// Production wiring. Disabled unless explicitly opted in with a district.
+    /// Production wiring. The keyless Caltrans camera adapter is enabled by
+    /// default on spawned Workstation-tier nodes when a district is configured;
+    /// an explicit false-y env disables it. Missing vehicle context publishes
+    /// an honest empty mirror instead of leaving the catalog topic absent.
     #[must_use]
     pub fn new(host: String) -> Self {
         let district = std::env::var(DISTRICT_ENV)
             .ok()
             .and_then(|value| value.trim().parse::<u8>().ok())
             .filter(|district| (1..=12).contains(district));
-        let probe = if env_truthy(ENABLED_ENV) && district.is_some() {
+        let enabled = env_default_enabled(ENABLED_ENV);
+        let probe = if enabled && district.is_some() {
             match CaltransHttpProbe::new() {
                 Ok(probe) => Some(Arc::new(probe) as Arc<dyn CaltransCameraProbe>),
                 Err(error) => {
@@ -670,7 +687,7 @@ impl CaltransCameraOverlayWorker {
                 }
             }
         } else {
-            if env_truthy(ENABLED_ENV) && district.is_none() {
+            if enabled && district.is_none() {
                 tracing::warn!(target: "mackesd::caltrans_camera_overlay", "Caltrans camera overlay requires MDE_OVERLAY_CALTRANS_DISTRICT=1..12; worker idle");
             }
             None
@@ -699,6 +716,13 @@ impl CaltransCameraOverlayWorker {
         self
     }
 
+    /// Override cadence for tests.
+    #[must_use]
+    pub const fn with_poll(mut self, poll: Duration) -> Self {
+        self.poll = poll;
+        self
+    }
+
     fn current_context(&self) -> Option<CameraContext> {
         let root = self.bus_root.clone()?;
         let persist = mde_bus::persist::Persist::open(root).ok()?;
@@ -716,6 +740,29 @@ impl CaltransCameraOverlayWorker {
                 snapshot,
             );
         }
+    }
+
+    fn no_context_snapshot(&self, district: u8, reason: &str) -> CaltransCameraSnapshot {
+        let mut snapshot = CaltransCameraSnapshot::empty(&self.host, district, now_ms(), 0.0, 0.0);
+        push_gap(
+            &mut snapshot.gaps,
+            format!("Caltrans cameras paused: {reason}"),
+        );
+        snapshot
+    }
+
+    fn publish_no_context_degraded(
+        &self,
+        district: u8,
+        reason: &str,
+        last_good: &mut Option<CaltransCameraSnapshot>,
+    ) {
+        let snapshot = self.no_context_snapshot(district, reason);
+        self.publish(&snapshot);
+        // A missing same-host fix invalidates the previous camera relevance
+        // origin. Keep the Bus mirror present and licensed, but do not let
+        // later failures replay camera rows fetched for an old point.
+        *last_good = None;
     }
 
     fn apply_result(
@@ -858,10 +905,9 @@ impl Worker for CaltransCameraOverlayWorker {
         loop {
             let Some(context) = self.current_context() else {
                 if !no_fix_published {
-                    self.apply_result(
-                        Err(io::Error::other(
-                            "fresh same-host California vehicle fix unavailable",
-                        )),
+                    self.publish_no_context_degraded(
+                        district,
+                        "fresh same-host California vehicle fix unavailable",
                         &mut last_good,
                     );
                     no_fix_published = true;
@@ -901,13 +947,15 @@ impl Worker for CaltransCameraOverlayWorker {
     }
 }
 
-fn env_truthy(name: &str) -> bool {
-    std::env::var(name).is_ok_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
+fn env_default_enabled(name: &str) -> bool {
+    overlay_enabled_from_env(std::env::var(name).ok().as_deref())
+}
+
+fn overlay_enabled_from_env(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(|value| value.trim().to_ascii_lowercase()),
+        Some(value) if matches!(value.as_str(), "0" | "false" | "no" | "off")
+    )
 }
 
 fn now_ms() -> i64 {
@@ -1005,6 +1053,20 @@ mod tests {
         assert_eq!(snapshot.relevance_filtered, 1);
         assert!(snapshot.cameras[0].thumbnail.is_some());
         assert_eq!(snapshot.cameras[0].route.as_deref(), Some("I-5"));
+    }
+
+    #[test]
+    fn keyless_caltrans_camera_producer_defaults_on_with_explicit_false_opt_out() {
+        assert!(overlay_enabled_from_env(None));
+        assert!(overlay_enabled_from_env(Some("")));
+        assert!(overlay_enabled_from_env(Some("1")));
+        assert!(overlay_enabled_from_env(Some("true")));
+        assert!(overlay_enabled_from_env(Some("yes")));
+        assert!(overlay_enabled_from_env(Some("on")));
+        assert!(!overlay_enabled_from_env(Some("0")));
+        assert!(!overlay_enabled_from_env(Some("false")));
+        assert!(!overlay_enabled_from_env(Some("NO")));
+        assert!(!overlay_enabled_from_env(Some(" off ")));
     }
 
     #[test]
@@ -1123,6 +1185,58 @@ mod tests {
     }
 
     #[test]
+    fn no_vehicle_fix_degraded_snapshot_is_present_and_retracts_prior_camera_rows() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().to_path_buf();
+        let worker =
+            CaltransCameraOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+        let original = build_snapshot(
+            &FakeProbe,
+            "rig-1",
+            3,
+            context(),
+            &catalog(vec![camera(1, "38.481128", "-121.510528")]),
+            Some(NOW_MS - 60_000),
+            NOW_MS,
+        )
+        .expect("snapshot");
+        assert!(!original.cameras.is_empty());
+        let mut last_good = Some(original);
+
+        worker.publish_no_context_degraded(
+            3,
+            "fresh same-host California vehicle fix unavailable",
+            &mut last_good,
+        );
+
+        assert!(
+            last_good.is_none(),
+            "old vehicle-scoped Caltrans cameras must not survive fix loss"
+        );
+        let body = Persist::open(root)
+            .expect("bus")
+            .read_latest(&caltrans_camera_state_topic("rig-1"))
+            .expect("read")
+            .expect("row")
+            .body
+            .expect("body");
+        let snapshot: CaltransCameraSnapshot = serde_json::from_str(&body).expect("snapshot");
+        assert_eq!(snapshot.host, "rig-1");
+        assert_eq!(snapshot.district, 3);
+        assert!(snapshot.fetched_at_ms > 0);
+        assert_eq!(snapshot.feed_total, 0);
+        assert!(snapshot.cameras.is_empty());
+        assert_eq!(snapshot.query_latitude, 0.0);
+        assert_eq!(snapshot.query_longitude, 0.0);
+        assert!(snapshot
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("vehicle fix unavailable")));
+        assert_eq!(snapshot.license_tier, "public-data-attribution");
+        assert_eq!(snapshot.attribution, "Caltrans CWWP2");
+    }
+
+    #[test]
     fn failed_refresh_retains_timestamp_and_publishes_paused_latest_wins_state() {
         let temp = tempfile::tempdir().expect("temp");
         let root = temp.path().to_path_buf();
@@ -1140,10 +1254,7 @@ mod tests {
         .expect("snapshot");
         let mut last_good = None;
         assert!(worker.apply_result(Ok(PreparedResponse::Modified(original)), &mut last_good,));
-        assert!(!worker.apply_result(
-            Err(io::Error::other("fresh vehicle fix unavailable")),
-            &mut last_good,
-        ));
+        assert!(!worker.apply_result(Err(io::Error::other("catalog timeout")), &mut last_good,));
         let retained = last_good.as_ref().expect("retained");
         assert_eq!(retained.fetched_at_ms, NOW_MS);
         assert!(retained
@@ -1191,5 +1302,56 @@ mod tests {
         .expect("responsive");
         assert!(result.is_none());
         sender.await.expect("sender");
+    }
+
+    #[tokio::test]
+    async fn default_on_worker_publishes_degraded_snapshot_without_vehicle_fix() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().to_path_buf();
+        let mut worker = CaltransCameraOverlayWorker::new("rig-1".to_string())
+            .with_probe(3, Arc::new(FakeProbe))
+            .with_bus_root(Some(root.clone()))
+            .with_poll(Duration::from_millis(50));
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let token = ShutdownToken::from_receiver(rx);
+        let handle = tokio::spawn(async move { worker.run(token).await });
+
+        let topic = caltrans_camera_state_topic("rig-1");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let body = loop {
+            if let Some(row) = Persist::open(root.clone())
+                .expect("bus")
+                .read_latest(&topic)
+                .expect("read")
+            {
+                break row.body.expect("body");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "default-on Caltrans camera worker did not publish a degraded no-fix snapshot"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        tx.send(true).expect("shutdown");
+        let joined = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert!(joined.is_ok(), "worker exits promptly after proof");
+        joined
+            .expect("join timeout")
+            .expect("join")
+            .expect("worker ok");
+
+        let snapshot: CaltransCameraSnapshot = serde_json::from_str(&body).expect("snapshot");
+        assert_eq!(snapshot.host, "rig-1");
+        assert_eq!(snapshot.district, 3);
+        assert!(snapshot.fetched_at_ms > 0);
+        assert_eq!(snapshot.feed_total, 0);
+        assert!(snapshot.cameras.is_empty());
+        assert!(snapshot
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("vehicle fix unavailable")));
+        assert_eq!(snapshot.license_tier, "public-data-attribution");
+        assert_eq!(snapshot.attribution, "Caltrans CWWP2");
     }
 }

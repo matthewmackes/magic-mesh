@@ -399,6 +399,28 @@ pub fn apply_command<S: EventSigner, I: IdSource>(
                 },
             )])
         }
+        CollabCommand::ResolveThread { space, thread } => {
+            require_active_space(state, *space)?;
+            require_member(state, *space, &ctx.actor)?;
+            if state.threads.get(thread) != Some(space) {
+                return Err(CollabError::ThreadNotFound(*thread));
+            }
+            Ok(vec![ctx.emit(
+                *space,
+                CollabEventKind::ThreadResolved { thread: *thread },
+            )])
+        }
+        CollabCommand::ReopenThread { space, thread } => {
+            require_active_space(state, *space)?;
+            require_member(state, *space, &ctx.actor)?;
+            if state.threads.get(thread) != Some(space) {
+                return Err(CollabError::ThreadNotFound(*thread));
+            }
+            Ok(vec![ctx.emit(
+                *space,
+                CollabEventKind::ThreadReopened { thread: *thread },
+            )])
+        }
 
         // ---- Alerts ----------------------------------------------------
         CollabCommand::AckAlert { space, alert } => {
@@ -1078,7 +1100,7 @@ fn would_orphan(state: &DomainState, space: SpaceId, actor: &mde_collab_types::A
 mod tests {
     use super::*;
     use crate::signer::{Ed25519Signer, IdSource};
-    use mde_collab_types::ids::{CallId, EventId, FileRefId, TransferId};
+    use mde_collab_types::ids::{CallId, EventId, FileRefId, ThreadId, TransferId};
     use mde_collab_types::value::{
         CallKind, ClipItemKind, ClipboardItem, FileRef, MessageBody, TransferDirection,
         TransferMethod,
@@ -1493,6 +1515,85 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resolve_and_reopen_thread_emit_convergent_events() {
+        let signer = Ed25519Signer::from_seed([14; 32]);
+        let mut ids = SeqIds(300);
+        let mut alice = ApplyCtx::new(ActorId::new("alice"), 1_000, &signer, &mut ids);
+        let mut events = apply_command(
+            &DomainState::default(),
+            &CollabCommand::CreateSpace {
+                kind: SpaceKind::Team,
+                name: "ops".into(),
+            },
+            &mut alice,
+        )
+        .expect("create space");
+        let space = events[0].space_id;
+
+        let posted = apply_command(
+            &DomainState::from_events(&events),
+            &CollabCommand::SendMessage {
+                space,
+                thread: None,
+                body: MessageBody::new("root"),
+            },
+            &mut alice,
+        )
+        .expect("post root");
+        let root = posted[0].event_id;
+        events.extend(posted);
+
+        let started = apply_command(
+            &DomainState::from_events(&events),
+            &CollabCommand::StartThread {
+                space,
+                root,
+                title: None,
+            },
+            &mut alice,
+        )
+        .expect("start thread");
+        let thread = match started[0].kind {
+            CollabEventKind::ThreadStarted { thread, .. } => thread,
+            ref other => panic!("expected ThreadStarted, got {other:?}"),
+        };
+        events.extend(started);
+
+        let resolved = apply_command(
+            &DomainState::from_events(&events),
+            &CollabCommand::ResolveThread { space, thread },
+            &mut alice,
+        )
+        .expect("resolve thread");
+        assert!(matches!(
+            resolved[0].kind,
+            CollabEventKind::ThreadResolved { thread: t } if t == thread
+        ));
+        events.extend(resolved);
+
+        let reopened = apply_command(
+            &DomainState::from_events(&events),
+            &CollabCommand::ReopenThread { space, thread },
+            &mut alice,
+        )
+        .expect("reopen thread");
+        assert!(matches!(
+            reopened[0].kind,
+            CollabEventKind::ThreadReopened { thread: t } if t == thread
+        ));
+
+        let denied = apply_command(
+            &DomainState::from_events(&events),
+            &CollabCommand::ResolveThread {
+                space,
+                thread: ThreadId::from_uuid(Uuid::from_u128(999)),
+            },
+            &mut alice,
+        );
+        assert!(matches!(denied, Err(CollabError::ThreadNotFound(_))));
+    }
+
     fn state_with_unpinned_clips(
         count: usize,
         alice: &mut ApplyCtx<'_, Ed25519Signer, SeqIds>,
@@ -1567,10 +1668,8 @@ mod tests {
             .expect("the existing 50-entry history remains clearable");
 
         assert_eq!(cleared.len(), MAX_CLEAR_CLIPBOARD_EVENTS);
-        assert!(
-            cleared
-                .iter()
-                .all(|event| matches!(event.kind, CollabEventKind::ClipboardDeleted { .. }))
-        );
+        assert!(cleared
+            .iter()
+            .all(|event| matches!(event.kind, CollabEventKind::ClipboardDeleted { .. })));
     }
 }

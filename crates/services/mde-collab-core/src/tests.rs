@@ -11,22 +11,22 @@ use mde_collab_types::ids::{
     CallId, DocumentId, EventId, FileRefId, SpaceId, ThreadId, TransferId,
 };
 use mde_collab_types::value::{
-    AlertAction, AlertActionKind, AlertPayload, CallKind, CallParticipantState, ClipItemKind,
-    ClipboardItem, DocumentChange, FileRef, MessageBody, PayloadRef, PresenceState, Severity,
-    TransferDirection, TransferMethod, TransferState, sha256_hex,
+    sha256_hex, AlertAction, AlertActionKind, AlertPayload, CallKind, CallParticipantState,
+    ClipItemKind, ClipboardItem, DocumentChange, FileRef, MessageBody, PayloadRef, PresenceState,
+    Severity, TransferDirection, TransferMethod, TransferState,
 };
 use mde_collab_types::{
     ActorClock, ActorId, CollabCommand, CollabEventEnvelope, SpaceKind, SpaceRole, TransferControl,
 };
 use uuid::Uuid;
 
-use crate::CollabEngine;
-use crate::blob::{BlobStore, FsBlobStore, MemoryBlobStore, verify_bytes};
+use crate::blob::{verify_bytes, BlobStore, FsBlobStore, MemoryBlobStore};
 use crate::error::CollabError;
 use crate::log::{ActorLog, FileActorLog, MemoryActorLog};
 use crate::pipeline::EDIT_WINDOW_MS;
 use crate::projection::Projection;
 use crate::signer::{Ed25519Signer, IdSource};
+use crate::CollabEngine;
 
 // ---- deterministic injection helpers --------------------------------------
 
@@ -666,13 +666,12 @@ fn delete_space_is_owner_gated_and_blocks_further_commands() {
     );
     assert!(matches!(after, Err(CollabError::SpaceDeleted(_))));
     // The tombstoned space drops out of the directory.
-    assert!(
-        a.projection()
-            .space_directory(&ActorId::new("alice"))
-            .expect("dir")
-            .spaces
-            .is_empty()
-    );
+    assert!(a
+        .projection()
+        .space_directory(&ActorId::new("alice"))
+        .expect("dir")
+        .spaces
+        .is_empty());
 }
 
 #[test]
@@ -1016,6 +1015,17 @@ fn rich_corpus() -> Vec<CollabEventEnvelope> {
         1750,
     )
     .expect("transfer");
+    a.author(
+        space,
+        CollabEventKind::TransferStateChanged {
+            transfer,
+            state: TransferState::Active,
+        },
+        &sa,
+        &mut ia,
+        1775,
+    )
+    .expect("worker marks transfer active");
     a.apply(
         &CollabCommand::ControlTransfer {
             transfer,
@@ -1757,12 +1767,10 @@ fn start_call_flows_into_the_call_state_projection() {
     ));
     a.merge(b.all_events()).expect("alice syncs bob mute");
     let cs = a.projection().call_state(Some(space)).expect("call_state");
-    assert!(
-        cs.active[0]
-            .participants
-            .iter()
-            .any(|p| p.actor == ActorId::new("bob") && p.muted)
-    );
+    assert!(cs.active[0]
+        .participants
+        .iter()
+        .any(|p| p.actor == ActorId::new("bob") && p.muted));
 
     let dtmf = b
         .apply(

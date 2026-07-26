@@ -118,7 +118,7 @@ impl CarAction {
             Self::GoNav => "Navigation",
             Self::GoMedia => "Media",
             Self::GoMusic => "Music",
-            Self::GoComms => "Comms",
+            Self::GoComms => "Mesh Teams",
             Self::GoVehicle => "Vehicle",
             Self::GoSettings => "Settings",
             Self::GoAirspace => "Airspace",

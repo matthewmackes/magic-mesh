@@ -10,7 +10,7 @@ use mackes_mesh_types::cloud::{DriftFlag, WorkloadRow};
 use mde_egui::egui::{self, Color32, RichText};
 use mde_egui::{carbon_icon, card, field, inset, muted_note, status_dot, Style};
 
-use super::super::{row_button, DeliveryView, Panel, WorkloadsState};
+use super::super::{row_button, DeliveryView, WorkloadsRoute, WorkloadsState};
 
 /// The Service Container view's own state (U16 owns its fields).
 #[derive(Debug, Default)]
@@ -167,7 +167,7 @@ fn heading(ui: &mut egui::Ui, title: &str, blurb: &str) {
     ui.add_space(Style::SP_S);
 }
 
-/// The "deploy a container" affordance — jumps to the Provision lens (U14
+/// The "deploy a container" affordance — jumps to the Provision route (U14
 /// placement + U15 form, which renders the container-deploy path).
 fn provision_cta(ui: &mut egui::Ui, state: &mut WorkloadsState, label: &str) {
     ui.horizontal(|ui| {
@@ -184,7 +184,7 @@ fn provision_cta(ui: &mut egui::Ui, state: &mut WorkloadsState, label: &str) {
             ))
             .clicked()
         {
-            state.set_panel(Panel::Provision);
+            state.set_route(WorkloadsRoute::Provision);
         }
     });
     ui.add_space(Style::SP_S);

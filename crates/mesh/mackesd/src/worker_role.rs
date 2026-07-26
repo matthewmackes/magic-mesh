@@ -411,6 +411,14 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
     // media folders), so Workstation-tier; it idles gracefully on a headless
     // box (empty share manifest, empty aggregated library).
     WorkerSpec::tier("media_server", 1, RestartPolicy::OnFailure),
+    // WL-FUNC-015 — the Jellyfin gateway proxy responder. A desktop/media
+    // gateway feature: it binds the mesh proxy port on a node that has been
+    // registered as a LAN Jellyfin gateway, resolves the sealed read-only token
+    // server-side, and forwards the Jellyfin API without exposing credentials to
+    // clients. Workstation-tier like media_sources/media_server; headless
+    // workstations can still run it, stock lighthouses do not open the media
+    // proxy port.
+    WorkerSpec::tier("media_jellyfin_proxy", 1, RestartPolicy::OnFailure),
     // TERM-7 — the mesh PTY-broker: opens remote shells on peers over the
     // overlay for the mde-term-egui terminal surface. A desktop feature (the
     // seated user opens a terminal on a mesh node), so Workstation-tier; it

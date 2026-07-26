@@ -782,6 +782,17 @@ systemctl enable magic-mesh-selinux-policy.service >/dev/null 2>&1 || :
 # (ExecCondition) + only starts where a user session exists, so enabling it
 # globally is safe: a headless Server/Lighthouse has no session to start it in.
 systemctl --global enable mde-musicd.service >/dev/null 2>&1 || :
+# AUDIO-SEAT — compositor-less DRM Workstations do not have a desktop login
+# manager handing out uaccess ACLs to the long-running mm/mde user audio
+# services. Grant the known seat users the local audio group when present so
+# PipeWire can open /dev/snd and does not fall back to Dummy Output.
+if getent group audio >/dev/null 2>&1; then
+  for user in mm mde; do
+    if id "$user" >/dev/null 2>&1; then
+      usermod -aG audio "$user" >/dev/null 2>&1 || :
+    fi
+  done
+fi
 # SETUP-fix — materialize the shared bus dir now (no reboot needed).
 timeout 60 systemd-tmpfiles --create /usr/lib/tmpfiles.d/magic-mesh.conf >/dev/null 2>&1 || :
 [ -d /etc/mackesd ] || install -d -m 0700 /etc/mackesd
@@ -846,6 +857,12 @@ mc = "*"
 #   · PipeWire + WirePlumber = the audio graph the DAW mixer reads via pw-dump /
 #     drives via wpctl (lock 2); pipewire-alsa keeps the existing ALSA users
 #     (mde-musicd, mde-voice-hud) working on the shim, unchanged.
+#     pipewire-pulseaudio provides the Pulse-compatible user service/socket that
+#     canberra, browser helpers, and third-party desktop audio clients expect;
+#     alsa-ucm supplies laptop codec routing profiles; alsa-sof-firmware covers
+#     the Intel/DSP firmware path common on Dell laptops; alsa-utils gives the
+#     installer/live-support path deterministic hardware diagnostics (`aplay`,
+#     `alsactl`) instead of a silent "no devices" state.
 #   · bluez = the BlueZ system service the pairing manager + BT hotkey talk to.
 #   · upower = the multi-battery telemetry (internal / UPS / BT-peripheral).
 # One RPM serves every role; a headless Lighthouse installs them but the seat
@@ -853,6 +870,10 @@ mc = "*"
 pipewire = "*"
 wireplumber = "*"
 pipewire-alsa = "*"
+pipewire-pulseaudio = "*"
+alsa-ucm = "*"
+alsa-sof-firmware = "*"
+alsa-utils = "*"
 bluez = "*"
 upower = "*"
 # EDTB-6 — offline spell checking shells `hunspell -a`; the checker also needs

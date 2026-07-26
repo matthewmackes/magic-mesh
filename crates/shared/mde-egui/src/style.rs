@@ -9,8 +9,8 @@
 //! are render-agnostic data, so they are unit-tested without a GPU.
 
 use egui::{
-    Color32, Context, FontFamily, FontId, RichText, Stroke, TextStyle,
     epaint::{ClippedShape, ColorMode},
+    Color32, Context, FontFamily, FontId, RichText, Stroke, TextStyle,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -478,6 +478,9 @@ impl Style {
     // single interactive brand [`ACCENT`](Self::ACCENT).
     /// Categorical accent — **Comms** (Carbon cyan).
     pub const ACCENT_COMMS: Color32 = Color32::from_rgb(0x33, 0xB1, 0xFF);
+    /// Categorical accent — **Mesh Teams** (Microsoft Teams blue, used for the
+    /// repo-native Teams-inspired glyph; no external trademark asset is bundled).
+    pub const ACCENT_TEAMS: Color32 = Color32::from_rgb(0x50, 0x5A, 0xC9);
     /// Categorical accent — **Workloads** (Carbon purple).
     pub const ACCENT_WORKLOADS: Color32 = Color32::from_rgb(0xA5, 0x6E, 0xFF);
     /// Categorical accent — **Terminals** (Carbon teal).
@@ -2166,8 +2169,12 @@ mod tests {
             assert_eq!(font.family == egui::FontFamily::Monospace, role.is_mono());
         }
 
-        let job =
-            Style::typography_job("stable callout", TypographyRole::Callout, Style::TEXT, 240.0);
+        let job = Style::typography_job(
+            "stable callout",
+            TypographyRole::Callout,
+            Style::TEXT,
+            240.0,
+        );
         let section = job.sections.first().expect("one typography section");
         assert_eq!(
             section.format.extra_letter_spacing,

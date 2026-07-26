@@ -1,7 +1,7 @@
 //! Messages mode — a Markdown conversation timeline
 //! ([`ConversationTimeline`](mde_collab_types::ConversationTimeline)) with
 //! anchored threads ([`ThreadTimeline`](mde_collab_types::ThreadTimeline)), a
-//! composer whose <kbd>Enter</kbd> emits
+//! multiline composer whose <kbd>Ctrl</kbd>+<kbd>Enter</kbd> emits
 //! [`SendMessage`](mde_collab_types::CollabCommand::SendMessage) with a
 //! locally-persisted draft, honest delivery state, and an edit/delete affordance
 //! that reflects the core's five-minute author window (spec §3).
@@ -9,10 +9,42 @@
 use mde_egui::egui;
 use mde_egui::Style;
 
-use mde_collab_types::{CollabCommand, DeliveryState, MessageBody, MessageView, SpaceId, ThreadId};
+use mde_collab_types::{
+    CollabCommand, DeliveryState, EventId, MessageBody, MessageView, SpaceId, ThreadId,
+};
 
 use crate::icons::CommsHoverExt;
 use crate::{amend_affordance, icons, relative_age, AmendAffordance, CommunicationsSurface};
+
+/// A constrained quick reaction held only in this surface's local view state.
+///
+/// This deliberately is not a command, event, or read-model field: the operator
+/// requested local-only reactions while the larger emoji/GIF/sticker expression
+/// system is out of scope. These three labels cover fast acknowledgement without
+/// introducing a mesh-visible reaction protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalReaction {
+    /// Acknowledge that the message was seen.
+    Ack,
+    /// Mark the message as checked/handled locally.
+    Check,
+    /// Keep watching this message locally.
+    Watch,
+}
+
+impl LocalReaction {
+    /// The compact ordered quick-reaction set.
+    pub(crate) const ALL: [Self; 3] = [Self::Ack, Self::Check, Self::Watch];
+
+    /// User-facing chip label.
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Ack => "Ack",
+            Self::Check => "Check",
+            Self::Watch => "Watch",
+        }
+    }
+}
 
 impl CommunicationsSurface {
     /// Render Messages mode for the selected space: the conversation column,
@@ -50,27 +82,49 @@ impl CommunicationsSurface {
         space: SpaceId,
     ) {
         let composer_h = Style::SP_XL + Style::SP_M;
+        let find_query = self.channel_find(space).trim().to_owned();
+        if !find_query.is_empty() {
+            let matches = data.conversation(space).map_or(0, |conv| {
+                channel_find_messages(&conv.messages, find_query.as_str()).len()
+            });
+            let plural = if matches == 1 { "match" } else { "matches" };
+            ui.label(
+                egui::RichText::new(format!("{matches} current-channel {plural}"))
+                    .small()
+                    .color(Style::TEXT_DIM),
+            );
+            ui.add_space(Style::SP_XS);
+        }
         egui::ScrollArea::vertical()
             .id_salt("collab-timeline")
             .auto_shrink([false, false])
             .max_height((ui.available_height() - composer_h).max(Style::SP_XL))
             .show(ui, |ui| match data.conversation(space) {
                 Some(conv) if !conv.messages.is_empty() => {
+                    let messages = channel_find_messages(&conv.messages, find_query.as_str());
                     // A newly-appearing row fades up on the shared staggered list
                     // entrance (lock #4) — only genuinely new event ids animate; a row
                     // already on screen is settled at full opacity.
-                    for (i, msg) in conv.messages.iter().enumerate() {
+                    for (i, msg) in messages.iter().enumerate() {
                         crate::anim::entrance(ui, "msg", msg.event_id, i, |ui| {
                             self.message_row(ui, data, sink, space, msg);
                         });
                         ui.add_space(Style::SP_XS);
                     }
+                    if messages.is_empty() {
+                        ui.label(
+                            egui::RichText::new("No current-channel matches.")
+                                .color(Style::TEXT_DIM),
+                        );
+                    }
                 }
                 _ => {
-                    ui.label(
-                        egui::RichText::new("No messages in this space yet.")
-                            .color(Style::TEXT_DIM),
-                    );
+                    let empty = if find_query.is_empty() {
+                        "No messages in this space yet."
+                    } else {
+                        "No current-channel matches."
+                    };
+                    ui.label(egui::RichText::new(empty).color(Style::TEXT_DIM));
                 }
             });
         ui.separator();
@@ -184,6 +238,8 @@ impl CommunicationsSurface {
                 });
             }
 
+            self.local_reaction_buttons(ui, msg.event_id);
+
             match affordance {
                 AmendAffordance::Allowed => {
                     if icons::icon_button(ui, icons::EDIT, Style::SP_M, Style::TEXT_DIM, "Edit")
@@ -209,6 +265,35 @@ impl CommunicationsSurface {
                 AmendAffordance::Hidden => {}
             }
         });
+    }
+
+    /// The per-seat quick-reaction chips. These mutate only local view state and
+    /// intentionally take no [`CommandSink`], so they cannot publish mesh state.
+    pub(crate) fn local_reaction_buttons(&mut self, ui: &mut egui::Ui, message: EventId) {
+        ui.separator();
+        ui.label(egui::RichText::new("Local").small().color(Style::TEXT_DIM));
+        let selected = self.local_reaction(message);
+        for reaction in LocalReaction::ALL {
+            let active = selected == Some(reaction);
+            let label = if active {
+                format!("{} ✓", reaction.label())
+            } else {
+                reaction.label().to_owned()
+            };
+            if ui
+                .add(egui::Button::new(egui::RichText::new(label).small().color(
+                    if active {
+                        Style::TEXT_STRONG
+                    } else {
+                        Style::TEXT_DIM
+                    },
+                )))
+                .on_hover_text("Local-only reaction; not sent to the mesh")
+                .clicked()
+            {
+                self.toggle_local_reaction(message, reaction);
+            }
+        }
     }
 
     /// The inline edit editor for the message currently in [`Self::editing`].
@@ -255,7 +340,8 @@ impl CommunicationsSurface {
         }
     }
 
-    /// The main-timeline composer. <kbd>Enter</kbd> (or the Send glyph) emits
+    /// The main-timeline composer. <kbd>Ctrl</kbd>+<kbd>Enter</kbd> (or the Send
+    /// glyph) emits
     /// [`SendMessage`](CollabCommand::SendMessage); the draft persists locally,
     /// keyed by space, so switching away and back never loses it, and it clears
     /// only on a real emit.
@@ -265,15 +351,18 @@ impl CommunicationsSurface {
         let mut input_was_capped = cap_message_input(&mut buf);
         let mut send = false;
         ui.horizontal(|ui| {
+            let newline_count_before = newline_count(&buf);
             let resp = ui.add(
-                egui::TextEdit::singleline(&mut buf)
+                egui::TextEdit::multiline(&mut buf)
                     .id(edit_id)
                     .desired_width(f32::INFINITY)
+                    .desired_rows(3)
                     .char_limit(MAX_MESSAGE_BODY_BYTES)
-                    .hint_text("Message  ·  Enter to send"),
+                    .hint_text("Message  ·  Ctrl+Enter to send"),
             );
-            let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if (resp.lost_focus() || resp.has_focus()) && enter {
+            let (plain_enter, ctrl_enter) = composer_enter_state(ui);
+            insert_newline_if_text_edit_did_not(&resp, plain_enter, newline_count_before, &mut buf);
+            if (resp.lost_focus() || resp.has_focus()) && ctrl_enter {
                 send = true;
             }
             if icons::icon_button(ui, icons::SEND, Style::SP_M, Style::ACCENT, "Send").clicked() {
@@ -310,6 +399,20 @@ impl CommunicationsSurface {
         let mut close = false;
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Thread").strong().color(Style::TEXT));
+            match data.thread(space, thread).map(|timeline| timeline.resolved) {
+                Some(resolved) => {
+                    if thread_resolution_button(ui, resolved).clicked() {
+                        self.set_thread_resolved(sink, space, thread, !resolved);
+                    }
+                }
+                None => {
+                    ui.label(
+                        egui::RichText::new("Status unavailable")
+                            .small()
+                            .color(Style::TEXT_DIM),
+                    );
+                }
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if icons::icon_button(
                     ui,
@@ -359,7 +462,23 @@ impl CommunicationsSurface {
         self.thread_composer(ui, sink, space, thread);
     }
 
-    /// The thread reply composer. <kbd>Enter</kbd> (or the Send glyph) emits
+    /// Emit the convergent thread-resolution command for the caller to route.
+    pub(crate) fn set_thread_resolved(
+        &self,
+        sink: &mut crate::CommandSink,
+        space: SpaceId,
+        thread: ThreadId,
+        resolved: bool,
+    ) {
+        if resolved {
+            sink.emit(CollabCommand::ResolveThread { space, thread });
+        } else {
+            sink.emit(CollabCommand::ReopenThread { space, thread });
+        }
+    }
+
+    /// The thread reply composer. <kbd>Ctrl</kbd>+<kbd>Enter</kbd> (or the Send
+    /// glyph) emits
     /// [`ReplyInThread`](CollabCommand::ReplyInThread) with a per-thread draft.
     fn thread_composer(
         &mut self,
@@ -368,20 +487,23 @@ impl CommunicationsSurface {
         space: SpaceId,
         thread: ThreadId,
     ) {
-        let edit_id = egui::Id::new(("mde-collab-thread-composer", thread.as_uuid()));
+        let edit_id = self.thread_composer_edit_id(thread);
         let mut buf = self.thread_drafts.get(&thread).cloned().unwrap_or_default();
         let mut input_was_capped = cap_message_input(&mut buf);
         let mut send = false;
         ui.horizontal(|ui| {
+            let newline_count_before = newline_count(&buf);
             let resp = ui.add(
-                egui::TextEdit::singleline(&mut buf)
+                egui::TextEdit::multiline(&mut buf)
                     .id(edit_id)
                     .desired_width(f32::INFINITY)
+                    .desired_rows(3)
                     .char_limit(MAX_MESSAGE_BODY_BYTES)
-                    .hint_text("Reply in thread"),
+                    .hint_text("Reply in thread  ·  Ctrl+Enter to send"),
             );
-            let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if (resp.lost_focus() || resp.has_focus()) && enter {
+            let (plain_enter, ctrl_enter) = composer_enter_state(ui);
+            insert_newline_if_text_edit_did_not(&resp, plain_enter, newline_count_before, &mut buf);
+            if (resp.lost_focus() || resp.has_focus()) && ctrl_enter {
                 send = true;
             }
             if icons::icon_button(ui, icons::SEND, Style::SP_M, Style::ACCENT, "Send reply")
@@ -438,6 +560,66 @@ fn message_input_notice(ui: &mut egui::Ui) {
     );
 }
 
+fn composer_enter_state(ui: &egui::Ui) -> (bool, bool) {
+    ui.input(|input| {
+        let enter = input.key_pressed(egui::Key::Enter);
+        let ctrl_enter = enter && input.modifiers.ctrl;
+        let plain_enter = enter && !input.modifiers.ctrl && !input.modifiers.command;
+        (plain_enter, ctrl_enter)
+    })
+}
+
+fn newline_count(value: &str) -> usize {
+    value
+        .as_bytes()
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count()
+}
+
+fn insert_newline_if_text_edit_did_not(
+    response: &egui::Response,
+    plain_enter: bool,
+    newline_count_before: usize,
+    value: &mut String,
+) {
+    if !plain_enter || !(response.has_focus() || response.lost_focus()) {
+        return;
+    }
+    if newline_count(value) <= newline_count_before {
+        value.push('\n');
+    }
+}
+
+/// Whether a main-timeline message should remain visible under the local
+/// current-channel find query. Search is intentionally scoped to the selected
+/// channel and local view state; it does not index every space and does not
+/// publish a collaboration event.
+#[must_use]
+pub(crate) fn message_matches_channel_find(msg: &MessageView, query: &str) -> bool {
+    let query = query.trim();
+    if query.is_empty() {
+        return true;
+    }
+    let needle = query.to_lowercase();
+    msg.author.as_str().to_lowercase().contains(&needle)
+        || (!msg.deleted && msg.body.to_lowercase().contains(&needle))
+}
+
+/// The visible main-timeline messages under the local current-channel find.
+/// Kept as a pure model so render tests can assert filtering without depending
+/// on entrance-animation timing.
+#[must_use]
+pub(crate) fn channel_find_messages<'a>(
+    messages: &'a [MessageView],
+    query: &str,
+) -> Vec<&'a MessageView> {
+    messages
+        .iter()
+        .filter(|msg| message_matches_channel_find(msg, query))
+        .collect()
+}
+
 /// Render one message inside a thread column (read-only: header + body).
 fn thread_message(ui: &mut egui::Ui, msg: &MessageView, now_unix_ms: i64) {
     ui.horizontal(|ui| {
@@ -463,6 +645,36 @@ fn thread_message(ui: &mut egui::Ui, msg: &MessageView, now_unix_ms: i64) {
         render_markdown(ui, msg.body.as_str());
     }
     ui.add_space(Style::SP_XS);
+}
+
+fn thread_resolution_button(ui: &mut egui::Ui, resolved: bool) -> egui::Response {
+    let (label, icon, tint, hint) = if resolved {
+        (
+            "Reopen",
+            icons::THREAD_REOPEN,
+            Style::ACCENT,
+            "Reopen this thread",
+        )
+    } else {
+        (
+            "Resolve",
+            icons::THREAD_RESOLVE,
+            Style::OK,
+            "Mark this thread resolved",
+        )
+    };
+    let response = ui
+        .horizontal(|ui| {
+            let icon = icons::icon_button(ui, icon, Style::SP_M, tint, hint);
+            let text = ui
+                .add(egui::Button::new(
+                    egui::RichText::new(label).small().color(Style::TEXT),
+                ))
+                .on_hover_text(hint);
+            icon | text
+        })
+        .inner;
+    response
 }
 
 /// Keep one hostile line from becoming an unbounded egui layout job. Chunks are
@@ -581,9 +793,11 @@ const fn delivery_label(delivery: DeliveryState) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        cap_message_input, for_each_markdown_chunk, MAX_MARKDOWN_LAYOUT_CHARS,
+        cap_message_input, channel_find_messages, for_each_markdown_chunk,
+        message_matches_channel_find, LocalReaction, MAX_MARKDOWN_LAYOUT_CHARS,
         MAX_MESSAGE_BODY_BYTES,
     };
+    use mde_collab_types::{ActorId, DeliveryState, EventId, MessageView};
 
     #[test]
     fn message_input_cap_is_utf8_safe_at_the_oversized_action_boundary() {
@@ -622,5 +836,73 @@ mod tests {
         for_each_markdown_chunk("", |chunk| chunks.push(chunk.to_owned()));
 
         assert_eq!(chunks, vec![String::new()]);
+    }
+
+    #[test]
+    fn channel_find_matches_author_or_visible_body_only() {
+        let msg = MessageView {
+            event_id: EventId::new(),
+            author: ActorId::new("Falcon"),
+            created_unix_ms: 1_000,
+            body: "Deploy window is green".to_owned(),
+            edited: false,
+            deleted: false,
+            delivery: DeliveryState::Delivered,
+            reply_count: 0,
+        };
+        assert!(message_matches_channel_find(&msg, "deploy"));
+        assert!(message_matches_channel_find(&msg, "falcon"));
+        assert!(!message_matches_channel_find(&msg, "incident"));
+
+        let deleted = MessageView {
+            deleted: true,
+            ..msg
+        };
+        assert!(
+            !message_matches_channel_find(&deleted, "deploy"),
+            "deleted message bodies must not remain searchable"
+        );
+        assert!(
+            message_matches_channel_find(&deleted, "falcon"),
+            "the visible author line remains searchable"
+        );
+    }
+
+    #[test]
+    fn channel_find_message_model_filters_without_global_state() {
+        let peer = ActorId::new("falcon");
+        let deploy = MessageView {
+            event_id: EventId::new(),
+            author: peer.clone(),
+            created_unix_ms: 1_000,
+            body: "Deploy is green.".to_owned(),
+            edited: false,
+            deleted: false,
+            delivery: DeliveryState::Delivered,
+            reply_count: 0,
+        };
+        let incident = MessageView {
+            event_id: EventId::new(),
+            author: peer,
+            created_unix_ms: 1_100,
+            body: "Incident bridge is noisy.".to_owned(),
+            edited: false,
+            deleted: false,
+            delivery: DeliveryState::Delivered,
+            reply_count: 0,
+        };
+        let messages = vec![deploy, incident];
+        let filtered = channel_find_messages(&messages, "deploy");
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].body, "Deploy is green.");
+    }
+
+    #[test]
+    fn local_reaction_labels_are_constrained_and_ordered() {
+        assert_eq!(
+            LocalReaction::ALL.map(LocalReaction::label),
+            ["Ack", "Check", "Watch"]
+        );
     }
 }

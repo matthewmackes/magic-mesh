@@ -42,8 +42,8 @@
 //! follow-up. There is deliberately **no recording and no transcription** anywhere
 //! — not in this UI, not in the commands, not in the worker or its state.
 
-use mde_egui::Style;
 use mde_egui::egui;
+use mde_egui::Style;
 
 use mde_collab_types::{
     ActorId, CallId, CallKind, CallParticipantState, CallParticipantView, CallView, CollabCommand,
@@ -52,7 +52,7 @@ use mde_collab_types::{
 
 use crate::frame::call_kind_label;
 use crate::icons::CommsHoverExt;
-use crate::{CommandSink, CommunicationsSurface, icons, relative_age};
+use crate::{icons, relative_age, CommandSink, CommunicationsSurface};
 
 /// The honest label for the one media device offered today. Live device
 /// enumeration is a marked media-plane follow-up (never a faked device list).
@@ -338,10 +338,10 @@ impl CommunicationsSurface {
         }
     }
 
-    /// The media device row: a labeled mic / camera / screen combo apiece, reusing
-    /// the egui combo shape the voice dialer controls take. The selection is local
+    /// The media device row: visible mic / camera / screen selectors, deliberately
+    /// disabled until a real provider enumerates devices. The values are local
     /// seat state; the live device list + binding is a marked media-plane follow-up.
-    fn call_device_row(&mut self, ui: &mut egui::Ui) {
+    pub(crate) fn call_device_row(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             ui.label(
                 egui::RichText::new("Devices")
@@ -593,19 +593,23 @@ impl CommunicationsSurface {
     }
 }
 
-/// A labeled media device combo — the glyph, then an egui combo of the offered
-/// devices (today only the honest system default). The picked value is written
-/// back into `value`.
+/// A labeled media device combo — the glyph, then a disabled egui combo showing
+/// the honest system default. The real device list comes from the media plane;
+/// until that provider enumerates, this is visible but non-actionable.
 fn device_combo(ui: &mut egui::Ui, label: &str, glyph: &str, value: &mut String) {
     icons::icon(ui, glyph, Style::SP_M, Style::TEXT_DIM).comms_hover_text(label);
-    egui::ComboBox::from_id_salt(("mde-collab-call-device", label))
-        .selected_text(bounded_display_text(value, MAX_CALL_LABEL_CHARS))
-        .show_ui(ui, |ui| {
-            // WL-FUNC-011 media: only the honest system default is offered today; the
-            // real enumerated device list comes from the media plane (WebRTC
-            // getUserMedia / the LiveKit device registry), never a faked list.
-            ui.selectable_value(value, DEFAULT_DEVICE.to_owned(), DEFAULT_DEVICE);
-        });
+    ui.add_enabled_ui(false, |ui| {
+        egui::ComboBox::from_id_salt(("mde-collab-call-device", label))
+            .selected_text(bounded_display_text(value, MAX_CALL_LABEL_CHARS))
+            .show_ui(ui, |ui| {
+                // WL-FUNC-011 media: only the honest system default is shown today;
+                // the real enumerated device list comes from WebRTC getUserMedia /
+                // the LiveKit device registry, never a faked list.
+                ui.label(DEFAULT_DEVICE);
+            });
+    })
+    .response
+    .on_hover_text("Provider device enumeration is not connected yet");
     ui.add_space(Style::SP_S);
 }
 

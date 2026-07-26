@@ -248,6 +248,7 @@ fn surface_by_name(name: &str) -> Option<Surface> {
         "chat" | "notifications" | "clipboard" | "voice" | "editor" | "code" => {
             Some(Surface::Communications)
         }
+        "this-node" | "thisnode" | "node" => Some(Surface::ThisNode),
         "system" => Some(Surface::System),
         "storage" => Some(Surface::Storage),
         // The Timers & Alarms surface — the clock's replacement; the
@@ -264,7 +265,9 @@ fn surface_by_name(name: &str) -> Option<Surface> {
         "about" => Some(Surface::About),
         // The Communications hub (WL-FUNC-011) — an alert/chyron `shell/goto`
         // targeting it now resolves like every other dock surface.
-        "communications" | "comms" => Some(Surface::Communications),
+        "communications" | "comms" | "mesh-teams" | "meshteams" | "teams" => {
+            Some(Surface::Communications)
+        }
         _ => None,
     }
 }
@@ -675,6 +678,8 @@ mod tests {
     #[test]
     fn name_maps_are_case_insensitive() {
         assert_eq!(surface_by_name("SYSTEM"), Some(Surface::System));
+        assert_eq!(surface_by_name("This-Node"), Some(Surface::ThisNode));
+        assert_eq!(surface_by_name("Mesh-Teams"), Some(Surface::Communications));
         assert_eq!(plane_by_name("ThisNode"), Some(Plane::ThisNode));
     }
 
@@ -686,6 +691,8 @@ mod tests {
         assert_eq!(surface_by_name("terminal"), Some(Surface::Terminal));
         assert_eq!(surface_by_name("phones"), Some(Surface::Phones));
         assert_eq!(surface_by_name("about"), Some(Surface::About));
+        assert_eq!(surface_by_name("this-node"), Some(Surface::ThisNode));
+        assert_eq!(surface_by_name("mesh-teams"), Some(Surface::Communications));
         // WL-FUNC-011 Phase-2 — the retired Chat/Voice/Editor verbs fold onto the
         // unified Communications hub.
         assert_eq!(surface_by_name("editor"), Some(Surface::Communications));

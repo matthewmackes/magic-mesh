@@ -279,15 +279,23 @@ impl CriticalEdgeCue {
         let width = EDGE_HELD_W + (EDGE_PULSE_W - EDGE_HELD_W) * intensity;
         let alpha = 110.0 + 125.0 * intensity;
         let color = Style::SUPPORT_ERROR.linear_multiply((alpha / 255.0).clamp(0.0, 1.0));
+        let screen = ctx.screen_rect();
+        install_critical_edge_accessibility(ctx, &active.key, screen);
         let mut clicked = false;
-        egui::Area::new(critical_edge_cue_id())
-            .order(egui::Order::Foreground)
-            .anchor(egui::Align2::LEFT_TOP, egui::Vec2::ZERO)
-            .show(ctx, |ui| {
-                let rect = ui.ctx().screen_rect();
-                install_critical_edge_accessibility(ui.ctx(), &active.key, rect);
-                ui.set_min_size(rect.size());
-                for (index, edge) in edge_rects(rect, width).into_iter().enumerate() {
+        for (index, edge) in edge_rects(screen, width).into_iter().enumerate() {
+            let area_id = critical_edge_area_id(index);
+            egui::Area::new(area_id)
+                .order(egui::Order::Foreground)
+                .fixed_pos(edge.min)
+                .default_size(edge.size())
+                .movable(false)
+                .show(ctx, |ui| {
+                    // Keep each foreground Area bounded to its visible edge
+                    // strip. The previous single full-screen Area painted only
+                    // the edges but still won egui's layer hit-test across the
+                    // whole display, making lower chrome (notably the
+                    // Springboard Dock) visually present but unclickable.
+                    ui.set_min_size(edge.size());
                     ui.painter().rect_filled(edge, 0.0, color);
                     clicked |= ui
                         .interact(
@@ -296,8 +304,8 @@ impl CriticalEdgeCue {
                             egui::Sense::click(),
                         )
                         .clicked();
-                }
-            });
+                });
+        }
         ctx.request_repaint_after(Duration::from_secs_f32(EDGE_PULSE_HALF_CYCLE_SECONDS));
         if clicked {
             self.acknowledge();
@@ -308,6 +316,14 @@ impl CriticalEdgeCue {
 /// Stable id for the foreground critical cue.
 pub fn critical_edge_cue_id() -> egui::Id {
     egui::Id::new("notif-critical-edge-cue")
+}
+
+fn critical_edge_area_id(index: usize) -> egui::Id {
+    if index == 0 {
+        critical_edge_cue_id()
+    } else {
+        egui::Id::new(("notif-critical-edge-cue", index))
+    }
 }
 
 fn critical_edge_key(segments: &StatusSegments, local_host: &str) -> Option<CriticalEdgeKey> {

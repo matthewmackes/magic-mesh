@@ -1,11 +1,14 @@
 //! WL-FUNC-012 / OVERLAY-8 — keyless adsb.lol aircraft adapter.
 //!
-//! Workstations opt in with `MDE_OVERLAY_ADSB_LOL=1`. A fresh, finite local
-//! MG90 fix drives the official ten-nautical-mile point query. The worker keeps
-//! only direct/rebroadcast, position-qualified aircraft estimated below 3,000
-//! feet AGL; MLAT, TIS-B, coarse, stale, ground, and malformed records are
-//! counted or gapped explicitly. Blocking rustls HTTP and JSON normalization
-//! run away from Tokio worker threads.
+//! Workstations start this keyless public adsb.lol producer by default.
+//! Operators can explicitly disable it with `MDE_OVERLAY_ADSB_LOL=0/false/no/off`.
+//! A fresh, finite local MG90 fix drives the official ten-nautical-mile point
+//! query. The worker keeps only direct/rebroadcast, position-qualified aircraft
+//! estimated below 3,000 feet AGL; MLAT, TIS-B, coarse, stale, ground, and
+//! malformed records are counted or gapped explicitly. Missing same-host vehicle
+//! context publishes an honest empty retained mirror instead of leaving the
+//! catalog topic absent or replaying stale aircraft. Blocking rustls HTTP and
+//! JSON normalization run away from Tokio worker threads.
 
 #![cfg(feature = "async-services")]
 
@@ -23,7 +26,7 @@ use serde_json::{Map, Value};
 
 use super::{ShutdownToken, Worker};
 
-/// Explicit opt-in; unset/false is an idle no-op.
+/// Explicit disable for the keyless default-on adsb.lol producer.
 pub const ENABLED_ENV: &str = "MDE_OVERLAY_ADSB_LOL";
 /// Optional operator-controlled point-endpoint base override.
 pub const ENDPOINT_ENV: &str = "MDE_OVERLAY_ADSB_LOL_URL";
@@ -87,21 +90,13 @@ struct Validators {
 
 /// Production rustls probe.
 pub struct AdsbLolHttpProbe {
-    client: Client,
     endpoint: String,
     validators: Mutex<Validators>,
 }
 
 impl AdsbLolHttpProbe {
     fn new(endpoint: String) -> io::Result<Self> {
-        let client = Client::builder()
-            .timeout(HTTP_TIMEOUT)
-            .user_agent(USER_AGENT)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(io_other)?;
         Ok(Self {
-            client,
             endpoint,
             validators: Mutex::new(Validators::default()),
         })
@@ -135,7 +130,12 @@ impl AdsbLolHttpProbe {
 impl AircraftProbe for AdsbLolHttpProbe {
     fn fetch(&self, fix: VehicleFix) -> io::Result<ProbeResponse> {
         let url = self.point_url(fix)?;
-        let mut request = self.client.get(&url);
+        // `reqwest::blocking::Client` owns an internal runtime. Construct and
+        // drop it inside this blocking fetch call; `fetch_async` already runs
+        // this method via `spawn_blocking`, while sync tests call it outside a
+        // Tokio runtime.
+        let client = adsb_lol_http_client()?;
+        let mut request = client.get(&url);
         let mut sent_validator = false;
         {
             let validators = self
@@ -187,6 +187,15 @@ impl AircraftProbe for AdsbLolHttpProbe {
         };
         Ok(ProbeResponse::Modified(body))
     }
+}
+
+fn adsb_lol_http_client() -> io::Result<Client> {
+    Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .user_agent(USER_AGENT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(io_other)
 }
 
 fn validators_match_fix(validators: &Validators, url: &str, fix: VehicleFix) -> bool {
@@ -545,10 +554,13 @@ pub struct AircraftOverlayWorker {
 }
 
 impl AircraftOverlayWorker {
-    /// Production wiring. Disabled unless explicitly opted in.
+    /// Production wiring. The keyless adsb.lol adapter is enabled by default
+    /// on spawned Workstation-tier nodes; an explicit false-y env disables it.
+    /// Missing vehicle context publishes an honest empty mirror instead of
+    /// leaving the catalog topic absent.
     #[must_use]
     pub fn new(host: String) -> Self {
-        let probe = if env_truthy(ENABLED_ENV) {
+        let probe = if env_default_enabled(ENABLED_ENV) {
             let endpoint = std::env::var(ENDPOINT_ENV)
                 .ok()
                 .filter(|value| !value.trim().is_empty())
@@ -645,6 +657,12 @@ impl AircraftOverlayWorker {
         degraded
     }
 
+    fn no_context_snapshot(&self, reason: &str) -> AircraftSnapshot {
+        let mut snapshot = AircraftSnapshot::empty(&self.host, now_ms(), 0.0, 0.0, 0.0);
+        push_gap(&mut snapshot.gaps, reason.to_string());
+        snapshot
+    }
+
     fn apply_result(
         &self,
         result: io::Result<PreparedResponse>,
@@ -690,6 +708,16 @@ impl AircraftOverlayWorker {
         tracing::warn!(target: "mackesd::aircraft_overlay", host = %self.host, error = gap, "aircraft refresh failed; publishing empty degraded snapshot");
         let degraded = self.degraded_snapshot(last_good.as_ref(), gap);
         self.publish(&degraded);
+    }
+
+    fn publish_no_context_degraded(&self, last_good: &mut Option<AircraftSnapshot>, reason: &str) {
+        tracing::warn!(target: "mackesd::aircraft_overlay", host = %self.host, error = reason, "aircraft refresh has no fresh same-host vehicle context; publishing empty degraded snapshot");
+        let degraded = self.no_context_snapshot(reason);
+        self.publish(&degraded);
+        // Vehicle-scoped aircraft are invalid once the same-host fix disappears.
+        // Keep the retained Bus topic present, but do not let a later error or
+        // 304 replay point metadata from the stale position.
+        *last_good = None;
     }
 
     async fn fetch_async(
@@ -760,7 +788,7 @@ impl Worker for AircraftOverlayWorker {
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
         let Some(probe) = self.probe.clone() else {
-            tracing::info!(target: "mackesd::aircraft_overlay", env = ENABLED_ENV, "aircraft overlay not configured; worker idle");
+            tracing::info!(target: "mackesd::aircraft_overlay", env = ENABLED_ENV, "aircraft overlay disabled or unavailable; worker idle");
             shutdown.wait().await;
             return Ok(());
         };
@@ -770,7 +798,7 @@ impl Worker for AircraftOverlayWorker {
         loop {
             let Some(fix) = self.current_vehicle_fix() else {
                 if !no_fix_published {
-                    self.publish_failure(
+                    self.publish_no_context_degraded(
                         &mut last_good,
                         "adsb.lol refresh failed: fresh same-host MG90 vehicle fix unavailable",
                     );
@@ -802,13 +830,15 @@ impl Worker for AircraftOverlayWorker {
     }
 }
 
-fn env_truthy(name: &str) -> bool {
-    std::env::var(name).is_ok_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
+fn env_default_enabled(name: &str) -> bool {
+    overlay_enabled_from_env(std::env::var(name).ok().as_deref())
+}
+
+fn overlay_enabled_from_env(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(|value| value.trim().to_ascii_lowercase()),
+        Some(value) if matches!(value.as_str(), "0" | "false" | "no" | "off")
+    )
 }
 
 fn now_ms() -> i64 {
@@ -950,6 +980,20 @@ mod tests {
     }
 
     #[test]
+    fn keyless_adsb_producer_defaults_on_with_explicit_false_opt_out() {
+        assert!(overlay_enabled_from_env(None));
+        assert!(overlay_enabled_from_env(Some("")));
+        assert!(overlay_enabled_from_env(Some("1")));
+        assert!(overlay_enabled_from_env(Some("true")));
+        assert!(overlay_enabled_from_env(Some("yes")));
+        assert!(overlay_enabled_from_env(Some("on")));
+        assert!(!overlay_enabled_from_env(Some("0")));
+        assert!(!overlay_enabled_from_env(Some("false")));
+        assert!(!overlay_enabled_from_env(Some("NO")));
+        assert!(!overlay_enabled_from_env(Some(" off ")));
+    }
+
+    #[test]
     fn conditional_response_requires_a_sent_validator() {
         assert!(accept_not_modified(false).is_err());
         assert_eq!(
@@ -1042,10 +1086,7 @@ mod tests {
         .expect("degraded snapshot");
         assert!(degraded.aircraft.is_empty());
         assert!(degraded.feed_total.is_none());
-        assert!(degraded
-            .gaps
-            .iter()
-            .any(|gap| gap.contains("timeout")));
+        assert!(degraded.gaps.iter().any(|gap| gap.contains("timeout")));
     }
 
     #[test]
@@ -1058,11 +1099,7 @@ mod tests {
         assert!(worker.apply_result(Ok(PreparedResponse::Modified(original)), fix(), &mut last));
         let mut moved = fix();
         moved.latitude += 1.0;
-        assert!(!worker.apply_result(
-            Ok(PreparedResponse::NotModified),
-            moved,
-            &mut last,
-        ));
+        assert!(!worker.apply_result(Ok(PreparedResponse::NotModified), moved, &mut last,));
 
         let private = last.as_ref().expect("private cache");
         assert!(!private.aircraft.is_empty());
@@ -1086,6 +1123,47 @@ mod tests {
     }
 
     #[test]
+    fn no_vehicle_fix_degraded_snapshot_retracts_prior_aircraft_and_query_origin() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().to_path_buf();
+        let worker = worker().with_bus_root(Some(root.clone()));
+        let original = build_snapshot("rig-1", fix(), CAPTURED_ADSB, FETCHED_AT_MS).expect("parse");
+        assert!(!original.aircraft.is_empty());
+        let mut last = Some(original);
+
+        worker.publish_no_context_degraded(
+            &mut last,
+            "adsb.lol refresh failed: fresh same-host MG90 vehicle fix unavailable",
+        );
+
+        assert!(
+            last.is_none(),
+            "old vehicle-scoped aircraft cache must not survive fix loss"
+        );
+        let latest: AircraftSnapshot = serde_json::from_str(
+            Persist::open(root)
+                .expect("bus")
+                .read_latest(&aircraft_state_topic("rig-1"))
+                .expect("read")
+                .expect("message")
+                .body
+                .as_deref()
+                .expect("body"),
+        )
+        .expect("degraded snapshot");
+        assert!(latest.aircraft.is_empty());
+        assert_eq!(latest.query_latitude, 0.0);
+        assert_eq!(latest.query_longitude, 0.0);
+        assert_eq!(latest.query_altitude_msl_ft, 0.0);
+        assert!(latest
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("vehicle fix unavailable")));
+        assert_eq!(latest.license_tier, "open-data-attribution");
+        assert_eq!(latest.attribution, "adsb.lol · ODbL");
+    }
+
+    #[test]
     fn persisted_stale_record_is_cleared_after_restart() {
         let temp = tempfile::tempdir().expect("temp");
         let root = temp.path().to_path_buf();
@@ -1100,7 +1178,7 @@ mod tests {
 
         let restarted = worker().with_bus_root(Some(root.clone()));
         let mut private_cache = None;
-        restarted.publish_failure(
+        restarted.publish_no_context_degraded(
             &mut private_cache,
             "adsb.lol refresh failed: no fresh vehicle fix after restart",
         );
@@ -1117,10 +1195,9 @@ mod tests {
         )
         .expect("degraded snapshot");
         assert!(latest.aircraft.is_empty());
-        assert!(latest
-            .gaps
-            .iter()
-            .any(|gap| gap.contains("after restart")));
+        assert_eq!(latest.query_latitude, 0.0);
+        assert_eq!(latest.query_longitude, 0.0);
+        assert!(latest.gaps.iter().any(|gap| gap.contains("after restart")));
     }
 
     #[test]
@@ -1129,7 +1206,7 @@ mod tests {
         let root = temp.path().to_path_buf();
         let worker = worker().with_bus_root(Some(root));
         let mut private_cache = None;
-        worker.publish_failure(
+        worker.publish_no_context_degraded(
             &mut private_cache,
             "adsb.lol refresh failed: fresh same-host MG90 vehicle fix unavailable",
         );
@@ -1146,6 +1223,8 @@ mod tests {
         )
         .expect("degraded snapshot");
         assert!(snapshot.aircraft.is_empty());
+        assert_eq!(snapshot.query_latitude, 0.0);
+        assert_eq!(snapshot.query_longitude, 0.0);
         assert!(snapshot
             .gaps
             .iter()
@@ -1178,5 +1257,56 @@ mod tests {
         .expect("runtime remains responsive");
         assert!(result.is_none());
         sender.await.expect("sender");
+    }
+
+    #[tokio::test]
+    async fn default_on_worker_publishes_degraded_snapshot_without_vehicle_fix() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().to_path_buf();
+        let mut worker = AircraftOverlayWorker::new("rig-1".to_string())
+            .with_probe(Arc::new(SlowProbe))
+            .with_bus_root(Some(root.clone()))
+            .with_poll(Duration::from_millis(50));
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let token = ShutdownToken::from_receiver(rx);
+        let handle = tokio::spawn(async move { worker.run(token).await });
+
+        let topic = aircraft_state_topic("rig-1");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let body = loop {
+            if let Some(row) = Persist::open(root.clone())
+                .expect("bus")
+                .read_latest(&topic)
+                .expect("read")
+            {
+                break row.body.expect("body");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "default-on ADS-B worker did not publish a degraded no-fix snapshot"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        tx.send(true).expect("shutdown");
+        let joined = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert!(joined.is_ok(), "worker exits promptly after proof");
+        joined
+            .expect("join timeout")
+            .expect("join")
+            .expect("worker ok");
+
+        let snapshot: AircraftSnapshot = serde_json::from_str(&body).expect("snapshot");
+        assert_eq!(snapshot.host, "rig-1");
+        assert!(snapshot.fetched_at_ms > 0);
+        assert!(snapshot.aircraft.is_empty());
+        assert_eq!(snapshot.query_latitude, 0.0);
+        assert_eq!(snapshot.query_longitude, 0.0);
+        assert!(snapshot
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("vehicle fix unavailable")));
+        assert_eq!(snapshot.license_tier, "open-data-attribution");
+        assert_eq!(snapshot.attribution, "adsb.lol · ODbL");
     }
 }

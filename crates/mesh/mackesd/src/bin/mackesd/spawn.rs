@@ -2600,6 +2600,23 @@ pub(crate) fn spawn_fleet_compute_workers(
         )
     });
 
+    // WL-FUNC-015 — Jellyfin gateway proxy responder. A node-admin registered
+    // LAN Jellyfin source advertises
+    // `http://<gateway>.mesh:<proxy-port>/mde/jellyfin/<source-id>`. This worker
+    // owns that route on the gateway node: it reads the replicated gateway
+    // registry, confirms the source belongs to this node, resolves the sealed
+    // read-only token via SecretStore, strips client auth/hop-by-hop headers, and
+    // forwards Jellyfin API/playback/progress traffic to the LAN upstream. Kept
+    // separate from the direct Jellyfin 8096 descriptor port so a real local
+    // Jellyfin service can coexist without a bind collision.
+    spawn_tiered(sup, worker_names, role_rank, "media_jellyfin_proxy", || {
+        mackesd_core::workers::media_jellyfin_proxy::JellyfinGatewayProxyWorker::new(
+            node_id.clone(),
+            fw_host.clone(),
+            workgroup_root.clone(),
+        )
+    });
+
     // APPS-LIVE-1 — apps_running: mirror this node's set of currently-
     // running launchable apps to <QNM-Shared>/<host>/running-apps.json
     // every 10 s so every node's Applications-menu launcher can badge each

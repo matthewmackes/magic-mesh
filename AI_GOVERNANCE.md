@@ -107,10 +107,13 @@ workload-provider APIs are never exposed as a second public control plane.
   has exactly **two interfaces — Construct (workstation) and Car** — whose
   requirements live in the single authority doc
   **`docs/design/platform-interfaces.md`**. Structure is iPadOS-derived with
-  macOS pointer manners; identity stays Quazar-dark; the **Mackes-Carbon icon
-  set is kept platform-wide**. All other interface-paradigm design docs are
+  macOS pointer manners; identity is Quazar with production Dark and Light
+  appearances; the **Mackes-Carbon icon set is kept platform-wide**. The
+  2026-07-26 operator lock intentionally keeps a Construct **Dock** and an
+  icon-free Bing-wallpaper Home. All other interface-paradigm design docs are
   retired to `docs/design-archive/`. Do not re-introduce a bottom taskbar, tray
-  flyouts, dock, or Start-style panel.
+  flyouts, or Start-style panel; the Dock is the governed launcher chrome, not a
+  taskbar.
 - **The design system is egui-native.** Strict IBM Carbon is **retired**. The
   single source of look is the shared **`Style`/`Visuals` module** in `mde-egui`
   — a Rust module, not a token crate. Surfaces never hand-roll styling; they use

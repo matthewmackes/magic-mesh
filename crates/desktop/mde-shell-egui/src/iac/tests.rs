@@ -113,11 +113,12 @@ fn fixture_state() -> CloudState {
     }
 }
 
-/// A surface state on `(view, panel)` with the fixture mirror folded in.
-fn state_on(view: DeliveryView, panel: Panel) -> WorkloadsState {
+/// A surface state on `(delivery filter, lifecycle route)` with the fixture
+/// mirror folded in.
+fn state_on(view: DeliveryView, route: WorkloadsRoute) -> WorkloadsState {
     let mut state = WorkloadsState::default();
     state.set_view(view);
-    state.set_panel(panel);
+    state.set_route(route);
     state.states = vec![fixture_state()];
     state
 }
@@ -204,6 +205,16 @@ fn emitted_request(state: &WorkloadsState, verb: &str) -> serde_json::Value {
     .expect("request body is JSON")
 }
 
+fn emitted_request_count(state: &WorkloadsState, verb: &str) -> usize {
+    let persist =
+        Persist::open(state.bus_root.clone().expect("fixture bus root")).expect("open fixture bus");
+    let topic = format!("{}{verb}", mackes_mesh_types::cloud::CLOUD_ACTION_PREFIX);
+    persist
+        .list_since(&topic, None)
+        .expect("read request topic")
+        .len()
+}
+
 fn confirm_pending(state: &mut WorkloadsState) {
     let arming = state.arming.take().expect("typed confirmation is pending");
     let echo = arming.action.echo();
@@ -223,64 +234,160 @@ fn the_surface_is_reachable_in_the_dock() {
 }
 
 #[test]
-fn every_delivery_view_roster_renders_headless() {
-    // Every delivery view's roster tessellates over the fixture mirror.
+fn default_state_opens_provision_route() {
+    let state = WorkloadsState::default();
+    assert_eq!(state.route(), WorkloadsRoute::Provision);
+    assert_eq!(state.view(), DeliveryView::DesktopVm);
+    assert_eq!(state.density(), DensityMode::Compact);
+}
+
+#[test]
+fn delivery_filter_renders_plan_without_changing_route() {
+    // Delivery types are filters under the Plan route, not top-level nav.
     for view in DeliveryView::ALL {
-        let mut state = state_on(view, Panel::Roster);
+        let mut state = state_on(view, WorkloadsRoute::Plan);
+        assert_eq!(state.route(), WorkloadsRoute::Plan);
         assert!(
             run_panel(&mut state),
-            "{:?} roster drew nothing",
+            "{:?} Plan filter drew nothing",
             view.label()
         );
+        assert_eq!(state.route(), WorkloadsRoute::Plan);
     }
 }
 
 #[test]
-fn every_lens_renders_headless() {
-    // Every panel lens tessellates over the fixture mirror (each honest stub or
-    // the roster).
-    for panel in Panel::ALL {
-        let mut state = state_on(DeliveryView::DesktopVm, panel);
+fn every_lifecycle_route_renders_headless() {
+    // Every lifecycle route tessellates over the fixture mirror.
+    for route in WorkloadsRoute::ALL {
+        let mut state = state_on(DeliveryView::DesktopVm, route);
         assert!(
             run_panel(&mut state),
-            "{:?} lens drew nothing",
-            panel.label()
+            "{:?} route drew nothing",
+            route.label()
         );
     }
 }
 
 #[test]
-fn switching_views_and_lenses_works() {
-    let mut state = state_on(DeliveryView::DesktopVm, Panel::Roster);
+fn switching_filters_routes_and_density_works() {
+    let mut state = state_on(DeliveryView::DesktopVm, WorkloadsRoute::Plan);
     assert_eq!(state.view(), DeliveryView::DesktopVm);
-    assert_eq!(state.panel(), Panel::Roster);
+    assert_eq!(state.route(), WorkloadsRoute::Plan);
     for view in DeliveryView::ALL {
         state.set_view(view);
         assert_eq!(state.view(), view);
         assert!(run_panel(&mut state), "{:?} render failed", view.label());
     }
-    for panel in Panel::ALL {
-        state.set_panel(panel);
-        assert_eq!(state.panel(), panel);
-        assert!(run_panel(&mut state), "{:?} render failed", panel.label());
+    for route in WorkloadsRoute::ALL {
+        state.set_route(route);
+        assert_eq!(state.route(), route);
+        assert!(run_panel(&mut state), "{:?} render failed", route.label());
+    }
+    for density in DensityMode::ALL {
+        state.set_density(density);
+        assert_eq!(state.density(), density);
+        assert!(state.density().row_height() >= 30.0);
     }
 }
 
 #[test]
+fn plan_resource_rows_filter_and_stably_sort() {
+    let mut state = state_on(DeliveryView::DesktopVm, WorkloadsRoute::Plan);
+    state.states[0].workloads = vec![
+        workload("same", DeliveryType::DesktopVm, "running"),
+        workload("other", DeliveryType::ServiceVm, "running"),
+        workload("same", DeliveryType::DesktopVm, "paused"),
+        workload("alpha", DeliveryType::DesktopVm, "running"),
+    ];
+    state.states[0].workloads[0].node = "node-a".to_string();
+    state.states[0].workloads[0].cpu_pct = 70;
+    state.states[0].workloads[2].node = "node-b".to_string();
+    state.states[0].workloads[2].cpu_pct = 10;
+    state.states[0].workloads[3].node = "node-c".to_string();
+    state.states[0].workloads[3].cpu_pct = 30;
+
+    let rows = plan_resource_rows(&state);
+    assert_eq!(
+        rows.iter()
+            .map(|row| (row.name.as_str(), row.node.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("alpha", "node-c"), ("same", "node-a"), ("same", "node-b")],
+        "name sort is stable for equal names and filters out Service VM rows"
+    );
+
+    state.toggle_resource_sort(WorkloadSortColumn::Cpu);
+    let rows = plan_resource_rows(&state);
+    assert_eq!(
+        rows.iter()
+            .map(|row| (row.name.as_str(), row.cpu_pct))
+            .collect::<Vec<_>>(),
+        vec![("same", 10), ("alpha", 30), ("same", 70)]
+    );
+
+    state.toggle_resource_sort(WorkloadSortColumn::Cpu);
+    let rows = plan_resource_rows(&state);
+    assert_eq!(
+        rows.iter()
+            .map(|row| (row.name.as_str(), row.cpu_pct))
+            .collect::<Vec<_>>(),
+        vec![("same", 70), ("alpha", 30), ("same", 10)]
+    );
+    assert_eq!(
+        state.resource_sort(),
+        WorkloadSort {
+            column: WorkloadSortColumn::Cpu,
+            descending: true,
+        }
+    );
+}
+
+#[test]
+fn expanded_resource_row_is_keyed_by_delivery_node_and_name() {
+    let mut state = state_on(DeliveryView::DesktopVm, WorkloadsRoute::Plan);
+    let key = plan_resource_key(&state.states[0].workloads[0]);
+
+    state.toggle_expanded_resource(key.clone());
+    assert_eq!(state.expanded_resource(), Some(key.as_str()));
+
+    state.toggle_expanded_resource(key);
+    assert_eq!(state.expanded_resource(), None);
+}
+
+#[test]
+fn expanded_plan_row_renders_metrics_drift_and_command_preview() {
+    let mut state = state_on(DeliveryView::DesktopVm, WorkloadsRoute::Plan);
+    let key = plan_resource_key(&state.states[0].workloads[0]);
+    state.toggle_expanded_resource(key);
+
+    let text = rendered_text(|ui| infra_code_panel(ui, &mut state));
+    assert!(text.contains("Details"), "{text}");
+    assert!(text.contains("Actions"), "{text}");
+    assert!(text.contains("Command preview"), "{text}");
+    assert!(text.contains("placement"), "{text}");
+    assert!(text.contains("metrics"), "{text}");
+    assert!(text.contains("in sync"), "{text}");
+}
+
+#[test]
 fn the_empty_mirror_reads_honestly_never_fabricated() {
-    // No mirror published yet → honest empty rosters / stubs per lens, never fake.
-    for panel in [Panel::Roster, Panel::Status, Panel::Provision] {
+    // No mirror published yet → honest empty routes, never fake.
+    for route in [
+        WorkloadsRoute::Plan,
+        WorkloadsRoute::Drift,
+        WorkloadsRoute::Provision,
+    ] {
         let mut state = WorkloadsState::default();
-        state.set_panel(panel);
+        state.set_route(route);
         assert!(
             run_panel(&mut state),
             "{:?} empty state drew nothing",
-            panel.label()
+            route.label()
         );
         assert!(
             state.mutation_pending.is_none() && state.note.is_none(),
             "{:?} must not emit a verb from an empty mirror",
-            panel.label()
+            route.label()
         );
     }
 }
@@ -288,7 +395,7 @@ fn the_empty_mirror_reads_honestly_never_fabricated() {
 #[test]
 fn the_roster_reads_its_workloads_by_delivery_type() {
     // The idiom the U16 views share: filter the mirror's workloads by type.
-    let state = state_on(DeliveryView::DesktopVm, Panel::Roster);
+    let state = state_on(DeliveryView::DesktopVm, WorkloadsRoute::Plan);
     assert_eq!(state.workloads_of(DeliveryView::DesktopVm).count(), 1);
     assert_eq!(state.workloads_of(DeliveryView::ServiceVm).count(), 1);
     assert_eq!(state.workloads_of(DeliveryView::AppVm).count(), 0);
@@ -305,11 +412,11 @@ fn the_roster_reads_its_workloads_by_delivery_type() {
 #[test]
 fn provision_apply_is_typed_confirm_gated_and_emits_provision_only_after_confirm() {
     // Dry-run default: a plan is a direct emit (no confirm). Apply is gated.
-    let mut state = state_on(DeliveryView::DesktopVm, Panel::Provision);
+    let mut state = state_on(DeliveryView::DesktopVm, WorkloadsRoute::Provision);
     state.selected_node = Some("eagle".to_string());
     state.states[0].apply_armed = true;
 
-    // Arming a live apply OPENS the confirm and publishes NOTHING (§ RUN-006).
+    // Reviewing a live apply OPENS the confirm and publishes NOTHING (§ RUN-006).
     state.arm_provision();
     let arming = state.arming.as_ref().expect("apply opens the confirm");
     assert_eq!(arming.action, ArmAction::Provision);
@@ -323,8 +430,8 @@ fn provision_apply_is_typed_confirm_gated_and_emits_provision_only_after_confirm
     // The gate: only the exact echo arms; a partial/empty echo does not.
     assert!(armed("apply", &ArmAction::Provision.echo()));
     assert!(
-        armed("  apply ", &ArmAction::Provision.echo()),
-        "space tolerated"
+        !armed("  apply ", &ArmAction::Provision.echo()),
+        "padded echo is not exact"
     );
     assert!(
         !armed("appl", &ArmAction::Provision.echo()),
@@ -351,8 +458,40 @@ fn provision_apply_is_typed_confirm_gated_and_emits_provision_only_after_confirm
 }
 
 #[test]
+fn provision_plan_emits_dedicated_plan_request_contract() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut state = state_on(DeliveryView::DesktopVm, WorkloadsRoute::Plan);
+    state.bus_root = Some(tmp.path().join("bus"));
+    state.selected_node = Some("eagle".to_string());
+    state.states[0].apply_armed = false;
+
+    state.plan_provision();
+
+    assert!(
+        state.arming.is_none(),
+        "planning does not open the apply review"
+    );
+    assert!(
+        state.mutation_pending.is_some(),
+        "the Plan action tracks the worker reply"
+    );
+    assert_eq!(
+        emitted_request_count(&state, "provision"),
+        0,
+        "Plan must not publish the live provision verb"
+    );
+    let plan = emitted_request(&state, mackes_mesh_types::cloud::VERB_PLAN);
+    assert_eq!(plan["schema_version"], CLOUD_ACTION_SCHEMA_VERSION);
+    assert_eq!(plan["node"], "eagle");
+    assert!(
+        plan.get("armed_token").is_none(),
+        "dry-run plan requests are not armed live-apply mutations"
+    );
+}
+
+#[test]
 fn plan_only_selected_node_cannot_open_live_provision_arm() {
-    let mut state = state_on(DeliveryView::DesktopVm, Panel::Provision);
+    let mut state = state_on(DeliveryView::DesktopVm, WorkloadsRoute::Provision);
     state.selected_node = Some("eagle".to_string());
 
     state.arm_provision();
@@ -375,7 +514,7 @@ fn plan_only_selected_node_cannot_open_live_provision_arm() {
 
 #[test]
 fn configure_apply_refuses_missing_or_plan_only_selected_node() {
-    let mut state = state_on(DeliveryView::DesktopVm, Panel::Provision);
+    let mut state = state_on(DeliveryView::DesktopVm, WorkloadsRoute::Provision);
 
     state.arm_configure();
     assert!(!state.has_arming(), "a missing node must fail closed");
@@ -393,7 +532,7 @@ fn configure_apply_refuses_missing_or_plan_only_selected_node() {
 
 #[test]
 fn armed_selected_node_accepts_configure_confirmation() {
-    let mut state = state_on(DeliveryView::DesktopVm, Panel::Provision);
+    let mut state = state_on(DeliveryView::DesktopVm, WorkloadsRoute::Provision);
     state.selected_node = Some("eagle".to_string());
     state.states[0].apply_armed = true;
 
@@ -408,7 +547,7 @@ fn armed_selected_node_accepts_configure_confirmation() {
 
 #[test]
 fn configure_apply_rechecks_capability_after_confirmation() {
-    let mut state = state_on(DeliveryView::DesktopVm, Panel::Provision);
+    let mut state = state_on(DeliveryView::DesktopVm, WorkloadsRoute::Provision);
     state.selected_node = Some("eagle".to_string());
     state.states[0].apply_armed = true;
     state.arm_configure();
@@ -570,9 +709,244 @@ fn selected_node_forms_do_not_emit_node_agnostic_requests() {
 }
 
 #[test]
+fn run_images_and_containers_share_and_retain_the_placement_selector() {
+    for route in [
+        WorkloadsRoute::Run,
+        WorkloadsRoute::Images,
+        WorkloadsRoute::Containers,
+    ] {
+        let mut state = state_on(DeliveryView::DesktopVm, route);
+        state.selected_node = Some("eagle".to_string());
+
+        let text = rendered_text(|ui| route_body(ui, &mut state));
+
+        assert_eq!(
+            state.selected_node(),
+            Some("eagle"),
+            "{} must retain the shared placement selection",
+            route.label()
+        );
+        assert!(
+            text.contains("Placement") && text.contains("eagle") && text.contains("Selected"),
+            "{} must visibly render the shared placement selector: {text}",
+            route.label()
+        );
+    }
+}
+
+#[test]
+fn node_scoped_routes_without_selection_emit_no_node_agnostic_requests() {
+    for (route, verbs) in [
+        (
+            WorkloadsRoute::Run,
+            &[
+                mackes_mesh_types::cloud::VERB_INVENTORY,
+                mackes_mesh_types::cloud::VERB_OUTPUT,
+                "configure",
+            ][..],
+        ),
+        (
+            WorkloadsRoute::Images,
+            &[mackes_mesh_types::cloud::VERB_IMAGE_BUILD][..],
+        ),
+        (
+            WorkloadsRoute::Containers,
+            &[mackes_mesh_types::cloud::VERB_CONTAINER_DEPLOY][..],
+        ),
+    ] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut state = state_on(DeliveryView::DesktopVm, route);
+        state.bus_root = Some(tmp.path().join("bus"));
+        state.selected_node = None;
+
+        assert!(
+            run_panel(&mut state),
+            "{} route drew nothing",
+            route.label()
+        );
+        assert!(
+            state.mutation_pending.is_none(),
+            "{} must not track a node-agnostic request",
+            route.label()
+        );
+        for verb in verbs {
+            assert_eq!(
+                emitted_request_count(&state, verb),
+                0,
+                "{} must not publish node-agnostic {verb}",
+                route.label()
+            );
+        }
+    }
+}
+
+#[test]
+fn run_and_prepared_route_actions_fail_closed_without_a_selected_node() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut state = state_on(DeliveryView::DesktopVm, WorkloadsRoute::Run);
+    state.bus_root = Some(tmp.path().join("bus"));
+    state.selected_node = None;
+
+    state.check_configure();
+    state.arm_configure();
+
+    assert!(state.mutation_pending.is_none());
+    assert!(!state.has_arming());
+    assert_eq!(emitted_request_count(&state, "configure"), 0);
+
+    state.note = None;
+    state.arm_prepared(
+        mackes_mesh_types::cloud::VERB_CONTAINER_DEPLOY,
+        "  ".to_string(),
+        "web".to_string(),
+        "{}".to_string(),
+        "container deploy (web)".to_string(),
+        "web".to_string(),
+        "Deploy",
+        "container web".to_string(),
+    );
+
+    assert!(
+        !state.has_arming(),
+        "prepared route actions must not open review with a blank node"
+    );
+    assert!(state
+        .note_text()
+        .is_some_and(|note| note.contains("Select a placement node")));
+}
+
+#[test]
+fn prepared_review_sheet_renders_frozen_mutation_facts_before_confirm() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut state = state_on(DeliveryView::ServiceContainer, WorkloadsRoute::Containers);
+    state.bus_root = Some(tmp.path().join("bus"));
+    let body = serde_json::json!({
+        "schema_version": CLOUD_ACTION_SCHEMA_VERSION,
+        "node": "eagle",
+        "name": "web",
+        "image": "registry.example.test/web:1",
+        "rootful": false,
+    })
+    .to_string();
+    let digest = cloud_request_digest(&body).expect("fixture body has a stable digest");
+
+    state.arm_prepared(
+        mackes_mesh_types::cloud::VERB_CONTAINER_DEPLOY,
+        "eagle".to_string(),
+        "web".to_string(),
+        body,
+        "container deploy (web)".to_string(),
+        "web".to_string(),
+        "Deploy",
+        "container web".to_string(),
+    );
+
+    let text = rendered_text(|ui| render_review_sheet(ui, &mut state));
+
+    assert!(
+        text.contains("Command") && text.contains("action/cloud/container-deploy"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Subject") && text.contains("container web"),
+        "{text}"
+    );
+    assert!(text.contains("Target") && text.contains("web"), "{text}");
+    assert!(
+        text.contains("Placement node") && text.contains("eagle"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Body digest") && text.contains(&format!("sha256:{digest}")),
+        "{text}"
+    );
+    assert!(
+        text.contains("Body summary")
+            && text.contains("schema_version")
+            && text.contains("image")
+            && text.contains("name"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Frozen body")
+            && text.contains("registry.example.test/web:1")
+            && text.contains("\"rootful\":false"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Blast radius")
+            && text.contains("target web")
+            && text.contains("placement node eagle"),
+        "{text}"
+    );
+    assert!(state.mutation_pending.is_none());
+    assert_eq!(
+        emitted_request_count(&state, mackes_mesh_types::cloud::VERB_CONTAINER_DEPLOY),
+        0,
+        "review render must not publish before the exact echo confirms"
+    );
+}
+
+#[test]
+fn lifecycle_review_sheet_renders_frozen_mutation_facts_before_confirm() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut state = state_on(DeliveryView::DesktopVm, WorkloadsRoute::Run);
+    state.bus_root = Some(tmp.path().join("bus"));
+    let body = lifecycle_request_body("eagle", "seat-1", Some("seat-1"));
+    let digest = cloud_request_digest(&body).expect("fixture body has a stable digest");
+
+    state.arm_lifecycle("instance-delete", "eagle", "seat-1", "seat-1");
+
+    let text = rendered_text(|ui| render_review_sheet(ui, &mut state));
+
+    assert!(
+        text.contains("Command") && text.contains("action/cloud/instance-delete"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Subject") && text.contains("workload seat-1"),
+        "{text}"
+    );
+    assert!(text.contains("Target") && text.contains("seat-1"), "{text}");
+    assert!(
+        text.contains("Placement node") && text.contains("eagle"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Body digest") && text.contains(&format!("sha256:{digest}")),
+        "{text}"
+    );
+    assert!(
+        text.contains("Body summary")
+            && text.contains("instance")
+            && text.contains("typed_name")
+            && text.contains("schema_version"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Frozen body")
+            && text.contains("\"instance\":\"seat-1\"")
+            && text.contains("\"typed_name\":\"seat-1\""),
+        "{text}"
+    );
+    assert!(
+        text.contains("Blast radius")
+            && text.contains("one workload")
+            && text.contains("No other node or workload"),
+        "{text}"
+    );
+    assert!(state.mutation_pending.is_none());
+    assert_eq!(
+        emitted_request_count(&state, "instance-delete"),
+        0,
+        "review render must not publish before the exact echo confirms"
+    );
+}
+
+#[test]
 fn lifecycle_reboot_and_delete_are_typed_confirm_gated() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let mut state = state_on(DeliveryView::DesktopVm, Panel::Roster);
+    let mut state = state_on(DeliveryView::DesktopVm, WorkloadsRoute::Plan);
     state.bus_root = Some(tmp.path().join("bus"));
     // A destructive lifecycle op arms on the workload name (the roster row seam).
     state.arm_lifecycle("instance-delete", "eagle", "seat-1", "seat-1");
@@ -603,7 +977,7 @@ fn lifecycle_reboot_and_delete_are_typed_confirm_gated() {
 
 #[test]
 fn lifecycle_and_console_actions_reject_incomplete_workload_identity() {
-    let mut state = state_on(DeliveryView::DesktopVm, Panel::Roster);
+    let mut state = state_on(DeliveryView::DesktopVm, WorkloadsRoute::Plan);
 
     state.arm_lifecycle("instance-delete", "eagle", "seat-1", "");
     assert!(
@@ -638,6 +1012,17 @@ fn perform_rechecks_confirmation_and_mints_nothing_on_mismatch() {
     let (_tmp, mut state) = placed_bus_state();
     state.perform(ArmAction::Provision, "appl");
     assert!(state.mutation_pending.is_none());
+    assert!(state
+        .note
+        .as_deref()
+        .is_some_and(|note| note.contains("did not match")));
+
+    state.note = None;
+    state.perform(ArmAction::Provision, " apply ");
+    assert!(
+        state.mutation_pending.is_none(),
+        "padded confirmation must not mint a capability"
+    );
     assert!(state
         .note
         .as_deref()
@@ -677,8 +1062,8 @@ fn fold_mutation_maps_the_reply_tri_state_honestly() {
 }
 
 #[test]
-fn carbon_icons_are_registered_for_every_view_and_lens() {
-    // Every delivery-view tab + every lens tab resolves in the embedded
+fn carbon_icons_are_registered_for_every_view_and_route() {
+    // Every delivery filter + every route resolves in the embedded
     // Mackes-Carbon registry (no glyph text, mesh present).
     for view in DeliveryView::ALL {
         assert!(
@@ -688,12 +1073,12 @@ fn carbon_icons_are_registered_for_every_view_and_lens() {
             view.icon()
         );
     }
-    for panel in Panel::ALL {
+    for route in WorkloadsRoute::ALL {
         assert!(
-            mde_egui::carbon_svg_bytes(panel.icon()).is_some(),
+            mde_egui::carbon_svg_bytes(route.icon()).is_some(),
             "{:?} icon `{}` is not a registered Carbon glyph",
-            panel.label(),
-            panel.icon()
+            route.label(),
+            route.icon()
         );
     }
     // The stub-card glyph resolves too.
@@ -812,12 +1197,16 @@ fn console_attach_decodes_the_endpoint_and_renders_it_honestly() {
 
 #[test]
 fn labels_carry_no_legacy_backend_terminology() {
-    // The cockpit is provider-neutral: zero OpenStack-family terms in its
+    // The lifecycle app is provider-neutral: zero OpenStack-family terms in its
     // user-facing copy (grep-clean, §6).
     let mut labels: Vec<String> =
         vec![CLOUD_PRODUCT_LABEL.to_string(), WORKSPACE_TITLE.to_string()];
     labels.extend(DeliveryView::ALL.iter().map(|v| v.label().to_string()));
-    labels.extend(Panel::ALL.iter().map(|p| p.label().to_string()));
+    labels.extend(
+        WorkloadsRoute::ALL
+            .iter()
+            .map(|route| route.label().to_string()),
+    );
     for label in labels {
         for banned in [
             "OpenStack",

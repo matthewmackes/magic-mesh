@@ -56,7 +56,7 @@ SYNC3_ACCENT_HI = (0x5F, 0xB8, 0xF2)
 CAR_TILE_ACCENTS = (
     (0x42, 0xBE, 0x65),  # ACCENT_MESH, Navigation glyph
     (0xFF, 0x7E, 0xB6),  # ACCENT_MEDIA, Media/Music glyphs
-    (0x5B, 0x8C, 0xFF),  # ACCENT, Communications glyph
+    (0x5B, 0x8C, 0xFF),  # ACCENT, Mesh Teams glyph
     (0x4F, 0xD0, 0x8A),  # OK, Vehicle glyph
     (0xF1, 0xC2, 0x1B),  # ACCENT_SYSTEM, Settings glyph
 )
@@ -540,7 +540,7 @@ def validate_car_home(image: PngImage) -> dict[str, object]:
         "Car Media dashboard card surface", media_surface, media_total, 0.35
     )
     dashboard_glance_card_surface_ratio = _require_ratio(
-        "Car Vehicle/Comms dashboard card surface", glance_surface, glance_total, 0.35
+        "Car Vehicle/Mesh Teams dashboard card surface", glance_surface, glance_total, 0.35
     )
     dashboard_nav_accent_cap_ratio = _require_ratio(
         "Car Navigation Ford-blue card cap", nav_cap_accent, nav_cap_total, 0.55

@@ -38,7 +38,7 @@ use mde_collab_types::value::{
 };
 use mde_collab_types::{ActorClock, ActorId, CollabEventEnvelope, SpaceKind, SpaceRole};
 use rusqlite::types::ValueRef;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::domain::sort_key;
 use crate::error::{CollabError, Result};
@@ -59,6 +59,10 @@ const MAX_READ_MODEL_TEXT_BYTES: usize = 64 * 1024;
 // long history. The query probes one row beyond the accepted count so callers
 // receive an error instead of an arbitrary truncated timeline.
 const MAX_TIMELINE_MESSAGES: usize = 4096;
+// The Activity tab is an operational feed, not a full audit export. Keep the
+// published per-space read model recent and bounded so opening Mesh Teams on a
+// modest seat does not deserialize/render an unbounded event history.
+const MAX_ACTIVITY_ENTRIES: usize = 1024;
 // Media adapters must never be handed an unbounded call roster or participant
 // list. These are readiness rows only; live provider attempts happen elsewhere.
 const MAX_MEDIA_READINESS_SESSIONS: usize = 256;
@@ -632,12 +636,15 @@ impl Projection {
 
     /// A space's chronological Activity feed (newest-last).
     pub fn activity_feed(&self, space: SpaceId) -> Result<ActivityFeed> {
+        let row_limit = i64::try_from(MAX_ACTIVITY_ENTRIES).unwrap_or(i64::MAX);
         let mut stmt = self.conn.prepare(
-            "SELECT event_id, actor, clock_wall, clock_counter, created_ms, kind_tag \
-             FROM collab_event WHERE space_id = ?1 \
-             ORDER BY clock_wall, clock_counter, event_id",
+            "SELECT event_id, actor, clock_wall, clock_counter, created_ms, kind_tag FROM ( \
+                 SELECT event_id, actor, clock_wall, clock_counter, created_ms, kind_tag \
+                 FROM collab_event WHERE space_id = ?1 \
+                 ORDER BY clock_wall DESC, clock_counter DESC, event_id DESC LIMIT ?2 \
+             ) ORDER BY clock_wall, clock_counter, event_id",
         )?;
-        let rows = stmt.query_map(params![space.to_string()], |r| {
+        let rows = stmt.query_map(params![space.to_string(), row_limit], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
@@ -1154,6 +1161,11 @@ impl SpaceFold {
             CollabEventKind::ThreadResolved { thread } => {
                 if let Some(t) = self.threads.get_mut(thread) {
                     t.resolved = true;
+                }
+            }
+            CollabEventKind::ThreadReopened { thread } => {
+                if let Some(t) = self.threads.get_mut(thread) {
+                    t.resolved = false;
                 }
             }
             CollabEventKind::AlertRaised { alert } => {
@@ -1704,9 +1716,9 @@ fn summarize(kind_tag: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_DOCUMENT_PARTICIPANTS, MAX_DOCUMENT_SESSIONS, MAX_ENVELOPE_JSON_BYTES,
-        MAX_MEDIA_READINESS_SESSIONS, MAX_MESSAGE_BODY_BYTES, MAX_TABLE_DUMP_BYTES,
-        MAX_TIMELINE_MESSAGES, Projection,
+        Projection, MAX_ACTIVITY_ENTRIES, MAX_DOCUMENT_PARTICIPANTS, MAX_DOCUMENT_SESSIONS,
+        MAX_ENVELOPE_JSON_BYTES, MAX_MEDIA_READINESS_SESSIONS, MAX_MESSAGE_BODY_BYTES,
+        MAX_TABLE_DUMP_BYTES, MAX_TIMELINE_MESSAGES,
     };
     use crate::error::CollabError;
     use crate::signer::{Ed25519Signer, EventSigner};
@@ -1849,12 +1861,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["first", "second"]
         );
-        assert!(
-            timeline
-                .replies
-                .iter()
-                .all(|message| message.reply_count == 0)
-        );
+        assert!(timeline
+            .replies
+            .iter()
+            .all(|message| message.reply_count == 0));
 
         let main = projection
             .conversation_timeline(space, None)
@@ -1862,6 +1872,45 @@ mod tests {
         assert_eq!(main.messages.len(), 1);
         assert_eq!(main.messages[0].event_id, root);
         assert_eq!(main.messages[0].reply_count, 2);
+    }
+
+    #[test]
+    fn thread_timeline_reopens_after_resolved_event() {
+        let space = space_id(1);
+        let root = event_id(12);
+        let thread = thread_id(4);
+        let mut events = space_setup(space, "ops", 10);
+        events.extend([
+            event(
+                12,
+                space,
+                3,
+                CollabEventKind::MessagePosted {
+                    body: MessageBody::new("root"),
+                    thread: None,
+                },
+            ),
+            event(
+                13,
+                space,
+                4,
+                CollabEventKind::ThreadStarted {
+                    thread,
+                    root,
+                    title: Some("follow-up".into()),
+                },
+            ),
+            event(14, space, 5, CollabEventKind::ThreadResolved { thread }),
+            event(15, space, 6, CollabEventKind::ThreadReopened { thread }),
+        ]);
+
+        let mut projection = Projection::open_in_memory().expect("open projection");
+        projection.project(&events).expect("project thread events");
+
+        let timeline = projection
+            .thread_timeline(space, thread)
+            .expect("thread timeline");
+        assert!(!timeline.resolved);
     }
 
     #[test]
@@ -1961,12 +2010,10 @@ mod tests {
         projection
             .project(std::slice::from_ref(&valid))
             .expect("valid signed event projects");
-        assert!(
-            projection
-                .dump_tables()
-                .expect("projected dump")
-                .contains("signed")
-        );
+        assert!(projection
+            .dump_tables()
+            .expect("projected dump")
+            .contains("signed"));
 
         let mut future_schema = valid;
         future_schema.schema_version = SCHEMA_VERSION + 1;
@@ -2028,6 +2075,42 @@ mod tests {
             error,
             CollabError::Serde(message) if message.contains("table dump exceeds")
         ));
+    }
+
+    #[test]
+    fn activity_feed_is_bounded_to_recent_entries_newest_last() {
+        let projection = Projection::open_in_memory().expect("open projection");
+        let space = space_id(2711);
+        let overflow = 25usize;
+        for index in 0..(MAX_ACTIVITY_ENTRIES + overflow) {
+            projection
+                .connection()
+                .execute(
+                    "INSERT INTO collab_event \
+                     (event_id, space_id, actor, clock_wall, clock_counter, created_ms, kind_tag, envelope_json) \
+                     VALUES (?1, ?2, 'alice', ?3, 0, ?3, 'message_posted', '{}')",
+                    rusqlite::params![
+                        Uuid::from_u128(50_000 + index as u128).to_string(),
+                        space.to_string(),
+                        index as i64,
+                    ],
+                )
+                .expect("insert activity event");
+        }
+
+        let feed = projection.activity_feed(space).expect("activity feed");
+
+        assert_eq!(feed.entries.len(), MAX_ACTIVITY_ENTRIES);
+        assert_eq!(
+            feed.entries.first().unwrap().clock.wall_ms,
+            overflow as u64,
+            "the oldest overflow rows are not published to the GUI feed"
+        );
+        assert_eq!(
+            feed.entries.last().unwrap().clock.wall_ms,
+            (MAX_ACTIVITY_ENTRIES + overflow - 1) as u64,
+            "the feed remains newest-last within the retained recent window"
+        );
     }
 
     #[test]

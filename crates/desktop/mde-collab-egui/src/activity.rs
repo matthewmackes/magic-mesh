@@ -1,34 +1,41 @@
-//! Activity mode — the space's action-oriented chronological feed from the
+//! Activity mode — the action-oriented chronological feed from the
 //! [`ActivityFeed`](mde_collab_types::ActivityFeed) projection, with band
-//! filters. There is deliberately **no** competing global search box here
-//! (spec §2): the rail is the space selector and the chips are the only filter.
+//! filters. In the Activity app it prefers the cross-space feed; when routed as
+//! a selected channel body it falls back to that channel's feed. There is
+//! deliberately **no** competing global search box here (spec §2): the rail is
+//! the space selector and the chips are the only filter.
 
 use mde_egui::egui;
 use mde_egui::Style;
 
 use mde_collab_types::ActivityEntry;
 
-use crate::{icons, relative_age, ActivityFilter, CommunicationsSurface};
+use crate::{icons, relative_age, ActivityFilter, CommunicationsSurface, MeshTeamsApp};
+
+const ACTIVITY_ROW_HEIGHT: f32 = Style::SP_L;
 
 impl CommunicationsSurface {
-    /// Render the Activity feed for the selected space: a row of band-filter
-    /// chips, then the chronological entries the active filter admits.
+    /// Render the Activity feed: the global cross-space attention feed for the
+    /// Activity app, otherwise the selected channel feed. A row of band-filter
+    /// chips sits above the chronological entries the active filter admits.
     pub(crate) fn activity_body(&mut self, ui: &mut egui::Ui, data: &dyn crate::CollabData) {
         self.activity_filter_chips(ui);
         ui.add_space(Style::SP_S);
         ui.separator();
         ui.add_space(Style::SP_S);
 
-        let feed = data.activity(self.selected_space());
+        let feed = if self.app() == MeshTeamsApp::Activity {
+            data.activity(None)
+                .or_else(|| data.activity(self.selected_space()))
+        } else {
+            data.activity(self.selected_space())
+        };
         let entries: &[ActivityEntry] = feed.map_or(&[], |f| f.entries.as_slice());
         let filter = self.activity_filter();
         let now = data.now_unix_ms();
 
-        let admitted = entries
-            .iter()
-            .filter(|e| filter.matches(&e.kind_tag))
-            .count();
-        if admitted == 0 {
+        let admitted = filtered_activity_entries(entries, filter);
+        if admitted.is_empty() {
             ui.label(
                 egui::RichText::new("No activity for this filter yet.").color(Style::TEXT_DIM),
             );
@@ -37,8 +44,8 @@ impl CommunicationsSurface {
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
-            .show(ui, |ui| {
-                for entry in entries.iter().filter(|e| filter.matches(&e.kind_tag)) {
+            .show_rows(ui, ACTIVITY_ROW_HEIGHT, admitted.len(), |ui, row_range| {
+                for entry in &admitted[row_range] {
                     activity_row(ui, entry, now);
                 }
             });
@@ -65,6 +72,16 @@ impl CommunicationsSurface {
             }
         });
     }
+}
+
+pub(crate) fn filtered_activity_entries(
+    entries: &[ActivityEntry],
+    filter: ActivityFilter,
+) -> Vec<&ActivityEntry> {
+    entries
+        .iter()
+        .filter(|entry| filter.matches(&entry.kind_tag))
+        .collect()
 }
 
 /// One Activity row: a band glyph, the actor, the projected summary line, and a

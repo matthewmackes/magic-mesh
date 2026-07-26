@@ -65,6 +65,16 @@ macro_rules! yamis_svg {
     };
 }
 
+/// Repo-native Teams-inspired group/chat glyph. This is not the Microsoft
+/// trademark artwork; callers tint it with the Teams-blue token so Mesh Teams
+/// reads visually close to the familiar app without vendoring an external logo.
+const TEAMS_SVG: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="currentColor">
+  <path d="M11 8.75a3.75 3.75 0 1 1 7.5 0 3.75 3.75 0 0 1-7.5 0Z"/>
+  <path d="M21.25 10.25a3 3 0 1 1 6 0 3 3 0 0 1-6 0Z" opacity=".72"/>
+  <path d="M6 14h12.5A3.5 3.5 0 0 1 22 17.5v5.75A5.75 5.75 0 0 1 16.25 29h-3.5A5.75 5.75 0 0 1 7 23.25V19H6a2 2 0 0 1-2-2v-1a2 2 0 0 1 2-2Zm4.65 3.15v2.05h2.55v6.05h2.35V19.2h2.55v-2.05h-7.45Z"/>
+  <path d="M22.75 15h2.5A3.75 3.75 0 0 1 29 18.75V21a4.5 4.5 0 0 1-6.12 4.2c.41-.78.62-1.66.62-2.57V17.5c0-.9-.27-1.75-.75-2.5Z" opacity=".72"/>
+</svg>"#;
+
 /// Identifier for every embedded product and platform glyph.
 ///
 /// Product marks resolve to the Construct brand assets; surface, role, tray,
@@ -109,6 +119,9 @@ pub enum IconId {
     Editor,
     /// The Chat surface glyph.
     Chat,
+    /// The Mesh Teams collaboration surface glyph — a Teams-inspired group/chat
+    /// mark tinted by the shell with `Style::ACCENT_TEAMS`.
+    Teams,
     /// The Phones hub surface glyph — a smartphone outline (KDC-MESH-9).
     Phones,
     /// The System surface glyph.
@@ -284,7 +297,7 @@ pub enum IconId {
 
 impl IconId {
     /// Every glyph in the set, for exhaustive iteration (dock catalogs, tests).
-    pub const ALL: [Self; 96] = [
+    pub const ALL: [Self; 97] = [
         Self::Mark,
         Self::Wordmark,
         Self::Node,
@@ -301,6 +314,7 @@ impl IconId {
         Self::Terminal,
         Self::Editor,
         Self::Chat,
+        Self::Teams,
         Self::Phones,
         Self::System,
         Self::Storage,
@@ -424,6 +438,7 @@ impl IconId {
             Self::Terminal => yamis_svg!("apps/scalable/utilities-terminal.svg"),
             Self::Editor => yamis_svg!("apps/scalable/code-oss.svg"),
             Self::Chat => yamis_svg!("status/scalable/tray-message.svg"),
+            Self::Teams => TEAMS_SVG,
             Self::Phones => yamis_svg!("devices/scalable/phone.svg"),
             Self::System => yamis_svg!("categories/scalable/preferences-system.svg"),
             Self::Storage => yamis_svg!("devices/scalable/drive-harddisk.svg"),
@@ -535,6 +550,7 @@ impl IconId {
             Self::Terminal => "yamis-utilities-terminal",
             Self::Editor => "yamis-code-oss",
             Self::Chat => "yamis-tray-message",
+            Self::Teams => "mesh-teams",
             Self::Phones => "yamis-phone",
             Self::System => "yamis-preferences-system",
             Self::Storage => "yamis-drive-harddisk",

@@ -938,6 +938,7 @@ mod menubar_coverage {
                          map canvas, driving dashboard, MG90 setup, and simulator \
                          chrome instead of the shared MENUBAR-ALL top strip",
             },
+            Surface::ThisNode => Coverage::Covered { title: "This Node" },
             Surface::System => Coverage::Covered { title: "System" },
             Surface::Storage => Coverage::Covered {
                 title: "Local Cylinders", // MENU-4 (this file)
@@ -1055,9 +1056,9 @@ mod menubar_coverage {
         }
         assert_eq!(covered + first_party + exempt, every_routed().len());
         assert_eq!(
-            covered, 6,
-            "the shared covered set is the five landed bars plus Fleet & Mesh \
-             (WL-FUNC-011 Phase-2 retired the Chat bar)"
+            covered, 4,
+            "the shared covered set is Fleet & Mesh, Workbench, Infra as Code, \
+             and the merged This Node surface"
         );
         assert_eq!(
             first_party, 2,

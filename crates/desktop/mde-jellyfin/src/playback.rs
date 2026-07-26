@@ -624,4 +624,25 @@ mod tests {
             .iter()
             .any(|(k, v)| k == "Authorization" && v.contains("Token=\"T\"")));
     }
+
+    #[test]
+    fn gateway_base_path_is_preserved_for_playback_info() {
+        let device = ClientInfo::new(
+            "mde-media",
+            "workstation",
+            "device-42",
+            env!("CARGO_PKG_VERSION"),
+        );
+        let req = build_playback_info_request(
+            "http://seat-15.mesh:8097/mde/jellyfin/jellyfin-seat-15-abcd/",
+            "mesh-gateway-user",
+            "movie-1",
+            &caps(),
+            &device,
+            Some("PROXY"),
+        );
+        assert!(req.url.starts_with(
+            "http://seat-15.mesh:8097/mde/jellyfin/jellyfin-seat-15-abcd/Items/movie-1/PlaybackInfo?userId=mesh-gateway-user"
+        ));
+    }
 }

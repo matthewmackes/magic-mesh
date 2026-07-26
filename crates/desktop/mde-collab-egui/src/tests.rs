@@ -1,13 +1,13 @@
 //! Headless fixture tests for the Communications surface: the frame renders from
-//! a fixture directory, the Messages composer's <kbd>Enter</kbd> emits a
+//! a fixture directory, the Messages composer's <kbd>Ctrl+Enter</kbd> emits a
 //! `SendMessage`, the amend affordance follows the author window, the Activity
 //! feed filters, and every icon paints as a real Carbon image mesh (not glyph
 //! text) — mirroring the browser chrome's Carbon idiom.
 
 #![allow(clippy::unwrap_used, clippy::panic, clippy::float_cmp)]
 
-use mde_egui::Style;
 use mde_egui::egui;
+use mde_egui::Style;
 
 use std::collections::BTreeMap;
 
@@ -16,25 +16,36 @@ use mde_collab_types::{
     CallId, CallKind, CallParticipantState, CallParticipantView, CallView, ClipItemKind,
     ClipboardLane, ClipboardView, CollabCommand, ConversationTimeline, DeliveryState, DocumentId,
     DocumentSession, DocumentSessions, EventId, FileRef, FileRefId, FileReferenceView,
-    FileReferences, ReviewVerdict, Severity, SpaceId, SpaceKind, SpaceRole, TransferControl,
-    TransferDirection, TransferId, TransferJobView, TransferJobs, TransferMethod, TransferState,
+    FileReferences, ReviewVerdict, Severity, SpaceId, SpaceKind, SpaceRole, ThreadId,
+    ThreadTimeline, TransferControl, TransferDirection, TransferId, TransferJobView, TransferJobs,
+    TransferMethod, TransferState,
 };
 
-use crate::fixture::{FixtureData, activity, message, space_summary};
+use crate::activity::filtered_activity_entries;
+use crate::fixture::{activity, message, space_summary, FixtureData};
 use crate::{
-    ALL_COLLAB_ICONS, ActivityFilter, AmendAffordance, CollabData, CommandSink,
-    CommunicationsSurface, DocSubMode, DocTemplate, DocView, EDIT_WINDOW_MS, Mode,
-    amend_affordance, file_ref_of_path,
+    amend_affordance, file_ref_of_path, ActivityFilter, AmendAffordance, ChannelTab, CollabData,
+    CommandSink, CommunicationsSurface, DocSubMode, DocTemplate, DocView, MeshTeamsApp, Mode,
+    ALL_COLLAB_ICONS, EDIT_WINDOW_MS,
 };
 
 /// A `1000 x 700` headless input with the given events.
 fn sized_input(events: Vec<egui::Event>) -> egui::RawInput {
+    sized_input_with_modifiers(events, egui::Modifiers::default())
+}
+
+/// A `1000 x 700` headless input with explicit currently-held modifiers.
+fn sized_input_with_modifiers(
+    events: Vec<egui::Event>,
+    modifiers: egui::Modifiers,
+) -> egui::RawInput {
     egui::RawInput {
         screen_rect: Some(egui::Rect::from_min_size(
             egui::Pos2::ZERO,
             egui::vec2(1000.0, 700.0),
         )),
         events,
+        modifiers,
         time: Some(0.0),
         ..Default::default()
     }
@@ -49,6 +60,27 @@ fn key(k: egui::Key) -> egui::Event {
         repeat: false,
         modifiers: egui::Modifiers::default(),
     }
+}
+
+/// A pressed key event with explicit modifiers.
+fn modified_key(k: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+    egui::Event::Key {
+        key: k,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers,
+    }
+}
+
+fn ctrl_enter() -> egui::Event {
+    modified_key(
+        egui::Key::Enter,
+        egui::Modifiers {
+            ctrl: true,
+            ..Default::default()
+        },
+    )
 }
 
 /// Render one frame of `surface` against `data` and return the painted shapes.
@@ -251,17 +283,256 @@ fn rail_row_model_maps_the_directory_in_order() {
     assert_eq!(model.len(), directory.spaces.len());
     assert_eq!(model.len(), 2, "the demo fixture populates two rail rows");
 
-    let (id, name, glyph, unread) = model[0];
+    let (id, name, glyph, unread, members) = model[0];
     assert_eq!(id, directory.spaces[0].id);
     assert_eq!(name, "Team Ops");
     assert_eq!(glyph, crate::icons::space_kind_icon(SpaceKind::Team));
     assert_eq!(unread, 3, "Team Ops carries the demo unread count");
+    assert_eq!(members, 4, "Team Ops carries the demo member count");
 
-    let (id, name, glyph, unread) = model[1];
+    let (id, name, glyph, unread, members) = model[1];
     assert_eq!(id, directory.spaces[1].id);
     assert_eq!(name, "Incident 42");
     assert_eq!(glyph, crate::icons::space_kind_icon(SpaceKind::Incident));
     assert_eq!(unread, 0, "Incident 42 is read — no badge to paint");
+    assert_eq!(members, 6, "Incident 42 carries the demo member count");
+}
+
+#[test]
+fn details_pane_model_reads_selected_channel_facts() {
+    // The Details pane is a read-model summary, not a provider stub: each count
+    // comes from the same selected-space projections the existing bodies render.
+    let space = SpaceId::new();
+    let other = SpaceId::new();
+    let file = FileRefId::new();
+    let document = DocumentId::new();
+    let transfer = TransferId::new();
+    let peer = ActorId::new("falcon");
+
+    let data = FixtureData::new("eagle", 1_000_000)
+        .with_space(space_summary(
+            space,
+            SpaceKind::Team,
+            "Team Ops",
+            SpaceRole::Owner,
+            5,
+            4,
+            990_000,
+        ))
+        .with_space(space_summary(
+            other,
+            SpaceKind::Incident,
+            "Incident 42",
+            SpaceRole::Member,
+            0,
+            2,
+            980_000,
+        ))
+        .with_conversation(ConversationTimeline {
+            space,
+            thread: None,
+            messages: vec![
+                message(
+                    EventId::new(),
+                    &peer,
+                    900_000,
+                    "Deploy is green.",
+                    DeliveryState::Delivered,
+                    0,
+                ),
+                message(
+                    EventId::new(),
+                    &peer,
+                    910_000,
+                    "Review is queued.",
+                    DeliveryState::Delivered,
+                    0,
+                ),
+            ],
+        })
+        .with_file_references(FileReferences {
+            space,
+            files: vec![FileReferenceView {
+                file,
+                reference: FileRef {
+                    name: "deploy.log".to_owned(),
+                    size: 2048,
+                    sha256_hex: "a".repeat(64),
+                    mime: Some("text/plain".to_owned()),
+                },
+                linked_by: peer.clone(),
+                linked_unix_ms: 920_000,
+            }],
+        })
+        .with_transfer_jobs(TransferJobs {
+            jobs: vec![TransferJobView {
+                transfer,
+                file,
+                method: TransferMethod::Node,
+                direction: TransferDirection::Outbound,
+                state: TransferState::Active,
+                moved: 1024,
+                total: 2048,
+            }],
+        })
+        .with_document_sessions(
+            space,
+            DocumentSessions {
+                sessions: vec![DocumentSession {
+                    document,
+                    space,
+                    title: "Runbook".to_owned(),
+                    participants: vec![ActorId::new("eagle"), peer.clone()],
+                    call: None,
+                }],
+            },
+        )
+        .with_clipboard_lane(ClipboardLane {
+            space,
+            items: vec![ClipboardView {
+                event_id: EventId::new(),
+                kind: ClipItemKind::Text,
+                preview: "deploy token".to_owned(),
+                sha256_hex: "b".repeat(64),
+                source: "falcon".to_owned(),
+                at_unix_ms: 930_000,
+                pinned: false,
+            }],
+        })
+        .with_call(CallView {
+            call: CallId::new(),
+            space,
+            kind: CallKind::Audio,
+            started_unix_ms: 940_000,
+            participants: vec![CallParticipantView {
+                actor: ActorId::new("eagle"),
+                state: CallParticipantState::Connected,
+                muted: false,
+            }],
+        });
+
+    let details =
+        crate::frame::channel_details_model(Some(space), &data).expect("selected channel details");
+    assert_eq!(details.space, space);
+    assert_eq!(details.name, "Team Ops");
+    assert_eq!(details.kind, "Team");
+    assert_eq!(details.role, "Owner");
+    assert_eq!(details.members, 4);
+    assert_eq!(details.unread, 5);
+    assert_eq!(details.last_activity, "990000:0");
+    assert_eq!(details.messages, 2);
+    assert_eq!(details.files, 1);
+    assert_eq!(details.transfers, 1);
+    assert_eq!(details.documents, 1);
+    assert_eq!(details.active_calls, 1);
+    assert_eq!(details.clips, 1);
+
+    assert!(
+        crate::frame::channel_details_model(Some(other), &data).is_some(),
+        "a selected directory member with sparse projections still gets honest zero counts"
+    );
+    assert!(
+        crate::frame::channel_details_model(Some(SpaceId::new()), &data).is_none(),
+        "a stale selection must not produce a Details pane target"
+    );
+}
+
+#[test]
+fn details_pane_paints_inside_the_frame() {
+    let data = FixtureData::demo();
+    let mut surface = CommunicationsSurface::new();
+    let shapes = render_shapes(&mut surface, &data);
+    let texts = painted_text(&shapes);
+
+    for expected in [
+        "Details",
+        "Channel facts",
+        "Live projections",
+        "Messages",
+        "Files",
+        "Documents",
+        "Active calls",
+        "Clip items",
+    ] {
+        assert!(
+            texts.iter().any(|(text, _)| text == expected),
+            "the Details pane must paint {expected:?}: {texts:?}"
+        );
+    }
+}
+
+#[test]
+fn app_rail_model_exposes_operator_apps_in_order() {
+    let model = crate::frame::app_rail_model();
+    let labels: Vec<_> = model.iter().map(|(_, label, _)| *label).collect();
+    assert_eq!(
+        labels,
+        vec![
+            "Activity",
+            "Teams",
+            "Calls",
+            "Files",
+            "Alerts",
+            "Transfers",
+            "Clipboard",
+            "Settings",
+        ],
+        "the far-left app rail must expose the Teams-like app order"
+    );
+    assert!(
+        model
+            .iter()
+            .all(|(_, _, glyph)| ALL_COLLAB_ICONS.contains(glyph)),
+        "every app-rail glyph must be registered in the surface icon set: {model:?}"
+    );
+}
+
+#[test]
+fn channel_tabs_are_posts_files_calls_only() {
+    let tabs: Vec<_> = ChannelTab::ALL
+        .iter()
+        .map(|tab| {
+            (
+                tab.label(),
+                tab.mode(),
+                crate::icons::channel_tab_icon(*tab),
+            )
+        })
+        .collect();
+    assert_eq!(
+        tabs,
+        vec![
+            ("Posts", Mode::Messages, "share"),
+            ("Files", Mode::Files, "download"),
+            ("Calls", Mode::Calls, "audio-volume-high"),
+        ]
+    );
+}
+
+#[test]
+fn set_app_preserves_channel_selection_and_routes_existing_bodies() {
+    let space = SpaceId::new();
+    let mut surface = CommunicationsSurface::new();
+    surface.select_space(space);
+    surface.set_channel_tab(ChannelTab::Files);
+    surface.set_app(MeshTeamsApp::Calls);
+
+    assert_eq!(surface.selected_space(), Some(space));
+    assert_eq!(surface.app(), MeshTeamsApp::Calls);
+    assert_eq!(surface.mode(), Mode::Calls);
+    assert_eq!(
+        surface.channel_tab(),
+        ChannelTab::Files,
+        "global app hops must not clear the active Teams channel tab"
+    );
+
+    surface.set_app(MeshTeamsApp::Teams);
+    assert_eq!(surface.app(), MeshTeamsApp::Teams);
+    assert_eq!(
+        surface.mode(),
+        Mode::Files,
+        "returning to Teams must restore the remembered channel tab body"
+    );
 }
 
 #[test]
@@ -298,7 +569,7 @@ fn call_bar_rejects_a_selection_removed_from_the_directory() {
 #[test]
 fn rail_paints_the_shared_sidebar_with_the_unread_badge_overlay() {
     // PLATFORM-INTERFACES Q19 — the painted rail is the shared Sidebar: the
-    // "Spaces" section header and both row labels paint, the auto-selected
+    // "Teams & Channels" section header and both row labels paint, the auto-selected
     // first row wears the shared selection plate, and the live unread count
     // rides the overlay bridge as an accent pill with the bright count.
     let data = FixtureData::demo();
@@ -306,7 +577,7 @@ fn rail_paints_the_shared_sidebar_with_the_unread_badge_overlay() {
     let shapes = render_shapes(&mut surface, &data);
 
     let texts = painted_text(&shapes);
-    for expected in ["Spaces", "Team Ops", "Incident 42"] {
+    for expected in ["Teams & Channels", "Team Ops", "Incident 42"] {
         assert!(
             texts.iter().any(|(text, _)| text == expected),
             "the sidebar must paint {expected:?}: {texts:?}"
@@ -474,7 +745,174 @@ fn messages_timeline_renders_a_fixture_conversation() {
 }
 
 #[test]
-fn typing_then_enter_emits_send_message() {
+fn channel_find_is_local_to_each_channel() {
+    let first = SpaceId::new();
+    let second = SpaceId::new();
+    let mut surface = CommunicationsSurface::new();
+
+    surface.set_channel_find(first, "deploy");
+    surface.set_channel_find(second, "incident");
+    surface.select_space(first);
+    assert_eq!(surface.channel_find(first), "deploy");
+
+    surface.select_space(second);
+    assert_eq!(
+        surface.channel_find(second),
+        "incident",
+        "current-channel find must be keyed by channel, not global Mesh Teams state"
+    );
+    assert_eq!(
+        surface.channel_find(first),
+        "deploy",
+        "switching channels must not destroy the prior local find text"
+    );
+}
+
+#[test]
+fn channel_find_filters_the_posts_timeline() {
+    let space = SpaceId::new();
+    let peer = ActorId::new("falcon");
+    let data = FixtureData::new("eagle", 1_000_000)
+        .with_space(space_summary(
+            space,
+            SpaceKind::Team,
+            "Team Ops",
+            SpaceRole::Owner,
+            1,
+            2,
+            1_000_000,
+        ))
+        .with_conversation(ConversationTimeline {
+            space,
+            thread: None,
+            messages: vec![
+                message(
+                    EventId::new(),
+                    &peer,
+                    900_000,
+                    "Deploy is green.",
+                    DeliveryState::Delivered,
+                    0,
+                ),
+                message(
+                    EventId::new(),
+                    &peer,
+                    910_000,
+                    "Incident bridge is noisy.",
+                    DeliveryState::Delivered,
+                    0,
+                ),
+            ],
+        });
+    let mut surface = CommunicationsSurface::new();
+    surface.select_space(space);
+    surface.set_mode(Mode::Messages);
+    surface.set_channel_find(space, "deploy");
+
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let mut sink = CommandSink::new();
+    let mut shapes = Vec::new();
+    for time in [0.0, 1.0] {
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1000.0, 700.0),
+                )),
+                time: Some(time),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    surface.ui(ui, &data, &mut sink);
+                });
+            },
+        );
+        shapes = out.shapes;
+    }
+    let texts = painted_text(&shapes);
+    assert!(
+        texts
+            .iter()
+            .any(|(text, _)| text == "1 current-channel match"),
+        "the current-channel find summary must paint the match count: {texts:?}"
+    );
+    assert!(
+        !texts
+            .iter()
+            .any(|(text, _)| text == "Incident bridge is noisy."),
+        "a non-matching post must be filtered from the visible Posts timeline: {texts:?}"
+    );
+}
+
+#[test]
+fn local_quick_reactions_are_view_state_only() {
+    let message = EventId::new();
+    let mut surface = CommunicationsSurface::new();
+    let sink = CommandSink::new();
+
+    surface.toggle_local_reaction(message, crate::messages::LocalReaction::Ack);
+    assert_eq!(
+        surface.local_reaction(message),
+        Some(crate::messages::LocalReaction::Ack)
+    );
+    assert!(
+        sink.is_empty(),
+        "local reactions must not enqueue any collaboration command"
+    );
+
+    surface.toggle_local_reaction(message, crate::messages::LocalReaction::Check);
+    assert_eq!(
+        surface.local_reaction(message),
+        Some(crate::messages::LocalReaction::Check),
+        "choosing a different quick reaction replaces the local state"
+    );
+
+    surface.toggle_local_reaction(message, crate::messages::LocalReaction::Check);
+    assert_eq!(
+        surface.local_reaction(message),
+        None,
+        "clicking the selected local reaction clears it"
+    );
+}
+
+#[test]
+fn messages_timeline_renders_constrained_local_reaction_chips() {
+    let mut surface = CommunicationsSurface::new();
+    let message = EventId::new();
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let out = ctx.run(sized_input(vec![]), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            surface.local_reaction_buttons(ui, message);
+        });
+    });
+    let texts = painted_text(&out.shapes);
+
+    for expected in ["Local", "Ack", "Check", "Watch"] {
+        assert!(
+            texts.iter().any(|(text, _)| text == expected),
+            "Messages must render constrained local quick reaction chip {expected:?}: {texts:?}"
+        );
+    }
+}
+
+fn focused_messages_surface(
+    ctx: &egui::Context,
+    surface: &mut CommunicationsSurface,
+    data: &FixtureData,
+    edit_id: egui::Id,
+) {
+    let mut sink = CommandSink::new();
+    let _ = ctx.run(sized_input(Vec::new()), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| surface.ui(ui, data, &mut sink));
+    });
+    ctx.memory_mut(|memory| memory.request_focus(edit_id));
+}
+
+#[test]
+fn typing_then_ctrl_enter_emits_send_message() {
     let ctx = egui::Context::default();
     Style::install(&ctx);
 
@@ -499,21 +937,16 @@ fn typing_then_enter_emits_send_message() {
     surface.select_space(space);
     surface.set_mode(Mode::Messages);
     let edit_id = surface.composer_edit_id(space);
+    focused_messages_surface(&ctx, &mut surface, &data, edit_id);
 
-    // Pass 1: lay the composer out, then focus it by its stable id.
+    // Pass 2: type into the focused composer and press Ctrl+Enter.
     let mut sink = CommandSink::new();
-    let _ = ctx.run(sized_input(Vec::new()), |ctx| {
-        egui::CentralPanel::default().show(ctx, |ui| surface.ui(ui, &data, &mut sink));
-    });
-    ctx.memory_mut(|m| m.request_focus(edit_id));
-
-    // Pass 2: type into the focused composer and press Enter.
-    let mut sink = CommandSink::new();
-    let events = vec![
-        egui::Event::Text("hello mesh".to_owned()),
-        key(egui::Key::Enter),
-    ];
-    let _ = ctx.run(sized_input(events), |ctx| {
+    let modifiers = egui::Modifiers {
+        ctrl: true,
+        ..Default::default()
+    };
+    let events = vec![egui::Event::Text("hello mesh".to_owned()), ctrl_enter()];
+    let _ = ctx.run(sized_input_with_modifiers(events, modifiers), |ctx| {
         egui::CentralPanel::default().show(ctx, |ui| surface.ui(ui, &data, &mut sink));
     });
 
@@ -528,8 +961,232 @@ fn typing_then_enter_emits_send_message() {
     assert_eq!(
         sent,
         Some((space, None, "hello mesh".to_owned())),
-        "typing then Enter must emit SendMessage with the typed body in the selected space"
+        "typing then Ctrl+Enter must emit SendMessage with the typed body in the selected space"
     );
+}
+
+#[test]
+fn plain_enter_inserts_newline_without_sending_message() {
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+
+    let space = SpaceId::new();
+    let data = FixtureData::new("eagle", 1_000_000)
+        .with_space(space_summary(
+            space,
+            SpaceKind::Team,
+            "Team Ops",
+            SpaceRole::Owner,
+            0,
+            2,
+            1_000_000,
+        ))
+        .with_conversation(ConversationTimeline {
+            space,
+            thread: None,
+            messages: Vec::new(),
+        });
+
+    let mut surface = CommunicationsSurface::new();
+    surface.select_space(space);
+    surface.set_mode(Mode::Messages);
+    let edit_id = surface.composer_edit_id(space);
+    focused_messages_surface(&ctx, &mut surface, &data, edit_id);
+
+    let mut sink = CommandSink::new();
+    let events = vec![
+        egui::Event::Text("line one".to_owned()),
+        key(egui::Key::Enter),
+        egui::Event::Text("line two".to_owned()),
+    ];
+    let _ = ctx.run(sized_input(events), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| surface.ui(ui, &data, &mut sink));
+    });
+
+    assert!(
+        sink.queued()
+            .iter()
+            .all(|command| !matches!(command, CollabCommand::SendMessage { .. })),
+        "plain Enter must edit the multiline draft, not send: {:?}",
+        sink.queued()
+    );
+    assert_eq!(
+        surface.draft(space),
+        "line one\nline two",
+        "plain Enter must insert a newline in the persisted composer draft"
+    );
+}
+
+#[test]
+fn thread_ctrl_enter_emits_reply() {
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+
+    let space = SpaceId::new();
+    let thread = ThreadId::new();
+    let actor = ActorId::new("eagle");
+    let root = EventId::new();
+    let data = FixtureData::new("eagle", 1_000_000)
+        .with_space(space_summary(
+            space,
+            SpaceKind::Team,
+            "Team Ops",
+            SpaceRole::Owner,
+            0,
+            2,
+            1_000_000,
+        ))
+        .with_conversation(ConversationTimeline {
+            space,
+            thread: None,
+            messages: vec![message(
+                root,
+                &actor,
+                900_000,
+                "Root message",
+                DeliveryState::Sent,
+                1,
+            )],
+        })
+        .with_thread(
+            root,
+            ThreadTimeline {
+                space,
+                thread,
+                root: message(
+                    root,
+                    &actor,
+                    900_000,
+                    "Root message",
+                    DeliveryState::Sent,
+                    1,
+                ),
+                replies: Vec::new(),
+                resolved: false,
+            },
+        );
+    let mut surface = CommunicationsSurface::new();
+    surface.select_space(space);
+    surface.set_mode(Mode::Messages);
+    surface.open_thread_for_test(thread);
+    let edit_id = surface.thread_composer_edit_id(thread);
+    focused_messages_surface(&ctx, &mut surface, &data, edit_id);
+
+    let mut sink = CommandSink::new();
+    let modifiers = egui::Modifiers {
+        ctrl: true,
+        ..Default::default()
+    };
+    let events = vec![egui::Event::Text("thread reply".to_owned()), ctrl_enter()];
+    let _ = ctx.run(sized_input_with_modifiers(events, modifiers), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| surface.ui(ui, &data, &mut sink));
+    });
+
+    let sent = sink.queued().iter().find_map(|command| match command {
+        CollabCommand::ReplyInThread {
+            space: s,
+            thread: t,
+            body,
+        } => Some((*s, *t, body.as_str().to_owned())),
+        _ => None,
+    });
+    assert_eq!(
+        sent,
+        Some((space, thread, "thread reply".to_owned())),
+        "thread composer must use Ctrl+Enter for replies"
+    );
+    assert_eq!(
+        surface.thread_draft_for_test(thread),
+        "",
+        "a successful thread reply clears only that thread draft"
+    );
+}
+
+#[test]
+fn thread_resolution_actions_emit_commands() {
+    let space = SpaceId::new();
+    let thread = ThreadId::new();
+    let surface = CommunicationsSurface::new();
+    let mut sink = CommandSink::new();
+
+    surface.set_thread_resolved(&mut sink, space, thread, true);
+    surface.set_thread_resolved(&mut sink, space, thread, false);
+
+    assert!(matches!(
+        sink.queued().first(),
+        Some(CollabCommand::ResolveThread { space: s, thread: t }) if *s == space && *t == thread
+    ));
+    assert!(matches!(
+        sink.queued().get(1),
+        Some(CollabCommand::ReopenThread { space: s, thread: t }) if *s == space && *t == thread
+    ));
+}
+
+#[test]
+fn thread_resolution_control_reflects_timeline_state() {
+    let space = SpaceId::new();
+    let thread = ThreadId::new();
+    let actor = ActorId::new("eagle");
+    let root = EventId::new();
+    let root_message = message(
+        root,
+        &actor,
+        900_000,
+        "Root message",
+        DeliveryState::Sent,
+        1,
+    );
+    let base = FixtureData::new("eagle", 1_000_000)
+        .with_space(space_summary(
+            space,
+            SpaceKind::Team,
+            "Team Ops",
+            SpaceRole::Owner,
+            0,
+            2,
+            1_000_000,
+        ))
+        .with_conversation(ConversationTimeline {
+            space,
+            thread: None,
+            messages: vec![root_message.clone()],
+        });
+
+    let unresolved = base.clone().with_thread(
+        root,
+        ThreadTimeline {
+            space,
+            thread,
+            root: root_message.clone(),
+            replies: Vec::new(),
+            resolved: false,
+        },
+    );
+    let mut surface = CommunicationsSurface::new();
+    surface.select_space(space);
+    surface.set_mode(Mode::Messages);
+    surface.open_thread_for_test(thread);
+    let texts = painted_text(&render_shapes(&mut surface, &unresolved));
+    assert!(texts.iter().any(|(text, _)| text == "Resolve"));
+    assert!(!texts.iter().any(|(text, _)| text == "Reopen"));
+
+    let resolved = base.with_thread(
+        root,
+        ThreadTimeline {
+            space,
+            thread,
+            root: root_message,
+            replies: Vec::new(),
+            resolved: true,
+        },
+    );
+    let mut surface = CommunicationsSurface::new();
+    surface.select_space(space);
+    surface.set_mode(Mode::Messages);
+    surface.open_thread_for_test(thread);
+    let texts = painted_text(&render_shapes(&mut surface, &resolved));
+    assert!(texts.iter().any(|(text, _)| text == "Reopen"));
+    assert!(texts.iter().any(|(text, _)| text == "Thread resolved"));
 }
 
 #[test]
@@ -649,6 +1306,142 @@ fn activity_body_renders_the_feed() {
     surface.set_mode(Mode::Activity);
     let shapes = render_shapes(&mut surface, &data);
     assert!(!shapes.is_empty(), "the Activity feed painted nothing");
+}
+
+#[test]
+fn activity_app_prefers_cross_space_feed() {
+    let space = SpaceId::new();
+    let actor = ActorId::new("seat-15");
+    let data = FixtureData::new("seat-15", 10_000)
+        .with_space(space_summary(
+            space,
+            SpaceKind::Team,
+            "Operations",
+            SpaceRole::Owner,
+            0,
+            1,
+            10_000,
+        ))
+        .with_activity(
+            None,
+            ActivityFeed {
+                space: None,
+                entries: vec![activity(
+                    EventId::new(),
+                    space,
+                    &actor,
+                    9_000,
+                    "alert_raised",
+                    "global activity",
+                )],
+            },
+        )
+        .with_activity(
+            Some(space),
+            ActivityFeed {
+                space: Some(space),
+                entries: vec![activity(
+                    EventId::new(),
+                    space,
+                    &actor,
+                    9_100,
+                    "message_posted",
+                    "selected-channel activity",
+                )],
+            },
+        );
+    let mut surface = CommunicationsSurface::new();
+    surface.select_space(space);
+    surface.set_app(MeshTeamsApp::Activity);
+
+    let texts = painted_text(&render_shapes(&mut surface, &data));
+
+    assert!(
+        texts.iter().any(|(text, _)| text == "global activity"),
+        "Activity app must read the cross-space feed when present: {texts:?}"
+    );
+    assert!(
+        !texts
+            .iter()
+            .any(|(text, _)| text == "selected-channel activity"),
+        "Activity app must not silently narrow to the selected channel when a cross-space feed exists: {texts:?}"
+    );
+}
+
+#[test]
+fn activity_body_filters_before_virtualized_rows() {
+    let space = SpaceId::new();
+    let actor = ActorId::new("seat-15");
+    let mut entries = Vec::new();
+    for index in 0..2_000 {
+        let kind = if index % 4 == 0 {
+            "alert_raised"
+        } else {
+            "message_posted"
+        };
+        entries.push(activity(
+            EventId::new(),
+            space,
+            &actor,
+            index,
+            kind,
+            "seat 15 activity",
+        ));
+    }
+    let alerts = filtered_activity_entries(&entries, ActivityFilter::Alerts);
+
+    assert_eq!(
+        alerts.len(),
+        500,
+        "filtering builds the virtualized row set without requiring every feed row to paint"
+    );
+    assert!(alerts.iter().all(|entry| entry.kind_tag == "alert_raised"));
+}
+
+#[test]
+fn activity_body_virtualizes_large_feeds() {
+    let space = SpaceId::new();
+    let actor = ActorId::new("seat-15");
+    let entries = (0..2_000)
+        .map(|index| {
+            activity(
+                EventId::new(),
+                space,
+                &actor,
+                index,
+                "message_posted",
+                "seat 15 activity",
+            )
+        })
+        .collect();
+    let data = FixtureData::new("seat-15", 2_000)
+        .with_space(space_summary(
+            space,
+            SpaceKind::Team,
+            "Operations",
+            SpaceRole::Owner,
+            0,
+            1,
+            2_000,
+        ))
+        .with_activity(
+            Some(space),
+            ActivityFeed {
+                space: Some(space),
+                entries,
+            },
+        );
+    let mut surface = CommunicationsSurface::new();
+    surface.select_space(space);
+    surface.set_mode(Mode::Activity);
+
+    let shapes = render_shapes(&mut surface, &data);
+
+    assert!(
+        shapes.len() < 1_000,
+        "Activity should paint only visible virtualized rows, not every retained row; got {} shapes",
+        shapes.len()
+    );
 }
 
 #[test]
@@ -1687,6 +2480,65 @@ fn calls_mode_empty_state_is_honest() {
     surface.set_mode(Mode::Calls);
     let shapes = render_shapes(&mut surface, &data);
     assert!(!shapes.is_empty(), "the empty Calls state painted nothing");
+}
+
+#[test]
+fn call_provider_devices_are_visible_disabled_and_honest() {
+    let space = SpaceId::new();
+    let data = FixtureData::new("eagle", 1_000).with_space(space_summary(
+        space,
+        SpaceKind::Team,
+        "Team Ops",
+        SpaceRole::Owner,
+        0,
+        2,
+        1_000,
+    ));
+    let mut surface = CommunicationsSurface::new();
+    surface.select_space(space);
+    surface.set_mode(Mode::Calls);
+    let texts = painted_text(&render_shapes(&mut surface, &data));
+
+    for expected in [
+        "Devices",
+        "System default",
+        "Showing the system default — live device enumeration and binding a device to the call's media sender arrive with the media plane.",
+    ] {
+        assert!(
+            texts.iter().any(|(text, _)| text == expected),
+            "Calls mode must paint the honest disabled provider device row {expected:?}: {texts:?}"
+        );
+    }
+    for fabricated in ["Fake Microphone", "Built-in Camera", "Screen 1"] {
+        assert!(
+            !texts.iter().any(|(text, _)| text == fabricated),
+            "provider devices must not fabricate enumerated hardware: {texts:?}"
+        );
+    }
+}
+
+#[test]
+fn settings_surface_shows_provider_devices_without_fake_enumeration() {
+    let data = FixtureData::demo();
+    let mut surface = CommunicationsSurface::new();
+    surface.set_app(MeshTeamsApp::Settings);
+    let texts = painted_text(&render_shapes(&mut surface, &data));
+
+    for expected in [
+        "Provider devices",
+        "Visible but disabled until the live media provider enumerates microphone, camera, and screen sources.",
+        "System default",
+        "Discord bridge settings appear here when the live bridge provider enumerates; no fake servers are shown.",
+    ] {
+        assert!(
+            texts.iter().any(|(text, _)| text == expected),
+            "Settings must surface the honest provider state {expected:?}: {texts:?}"
+        );
+    }
+    assert!(
+        !texts.iter().any(|(text, _)| text == "Mock Discord Server"),
+        "Settings must not fabricate a bridge provider"
+    );
 }
 
 #[test]

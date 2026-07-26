@@ -103,6 +103,52 @@ fn egl_err(e: impl std::fmt::Display) -> DrmError {
     DrmError::Egl(e.to_string())
 }
 
+fn drm_input_proof_enabled() -> bool {
+    std::env::var_os("MDE_DRM_INPUT_PROOF").is_some()
+}
+
+fn log_drm_pointer(kind: &str, pos: egui::Pos2, ppp: f32, screen: egui::Rect) {
+    eprintln!(
+        "mde-egui drm-input kind={kind} point_x={:.2} point_y={:.2} ppp={:.3} screen_w={:.2} screen_h={:.2}",
+        pos.x,
+        pos.y,
+        ppp,
+        screen.width(),
+        screen.height()
+    );
+}
+
+fn log_drm_pointer_abs(raw_x: f64, raw_y: f64, pos: egui::Pos2, ppp: f32, screen: egui::Rect) {
+    eprintln!(
+        "mde-egui drm-input kind=pointer_absolute raw_x={raw_x:.2} raw_y={raw_y:.2} point_x={:.2} point_y={:.2} ppp={:.3} screen_w={:.2} screen_h={:.2}",
+        pos.x,
+        pos.y,
+        ppp,
+        screen.width(),
+        screen.height()
+    );
+}
+
+fn log_drm_touch_contact(phase: &str, contact: RawContact, transform: &TouchTransform) {
+    match contact {
+        RawContact::Down { slot, u, v, .. } | RawContact::Move { slot, u, v, .. } => {
+            let pos = transform.to_points(u, v);
+            eprintln!(
+                "mde-egui drm-input kind=touch phase={phase} slot={slot} u={u:.5} v={v:.5} point_x={:.2} point_y={:.2} ppp={:.3} mode_w={} mode_h={} rotation={:?}",
+                pos.x,
+                pos.y,
+                transform.scale,
+                transform.mode_w,
+                transform.mode_h,
+                transform.rotation
+            );
+        }
+        RawContact::Up { slot } | RawContact::Cancel { slot } => {
+            eprintln!("mde-egui drm-input kind=touch phase={phase} slot={slot}");
+        }
+    }
+}
+
 /// A DRM primary node wrapped so it implements the `drm` device traits (KMS).
 ///
 /// Public because it appears in [`set_layout`]'s signature (`gbm::Device<Card>`);
@@ -1335,6 +1381,7 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
     // escape hatch, opt-in via `MDE_DRM_ESC_QUIT`; production leaves it unset so the
     // desktop survives Esc and forwards it to egui like any other key.
     let esc_quits = std::env::var_os("MDE_DRM_ESC_QUIT").is_some();
+    let input_proof = drm_input_proof_enabled();
     // Modifier state: updated on each KeyDown/KeyUp before feeding egui Key events.
     let mut shift = false;
     let mut ctrl = false;
@@ -1434,19 +1481,36 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
                     let scale = policy.pointer_scale();
                     pointer.x = (pointer.x + m.dx() as f32 * scale / ppp).clamp(0.0, pw);
                     pointer.y = (pointer.y + m.dy() as f32 * scale / ppp).clamp(0.0, ph);
+                    if input_proof {
+                        log_drm_pointer("pointer_relative", pointer, ppp, screen);
+                    }
                     events.push(egui::Event::PointerMoved(pointer));
                 }
                 LiEvent::Pointer(PointerEvent::MotionAbsolute(m)) => {
-                    pointer = egui::pos2(
-                        m.absolute_x_transformed(wp) as f32 / ppp,
-                        m.absolute_y_transformed(hp) as f32 / ppp,
-                    );
+                    let raw_x = m.absolute_x_transformed(wp);
+                    let raw_y = m.absolute_y_transformed(hp);
+                    pointer = egui::pos2(raw_x as f32 / ppp, raw_y as f32 / ppp);
+                    if input_proof {
+                        log_drm_pointer_abs(raw_x, raw_y, pointer, ppp, screen);
+                    }
                     events.push(egui::Event::PointerMoved(pointer));
                 }
                 LiEvent::Pointer(PointerEvent::Button(b)) => {
                     if let Some(button) =
                         crate::pointer_button(b.button(), crate::input_policy().left_handed)
                     {
+                        if input_proof {
+                            log_drm_pointer(
+                                if b.button_state() == ButtonState::Pressed {
+                                    "pointer_button_down"
+                                } else {
+                                    "pointer_button_up"
+                                },
+                                pointer,
+                                ppp,
+                                screen,
+                            );
+                        }
                         events.push(egui::Event::PointerButton {
                             pos: pointer,
                             button,
@@ -1530,6 +1594,15 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
                         _ => None,
                     };
                     if let Some(contact) = contact {
+                        if input_proof {
+                            let phase = match contact {
+                                RawContact::Down { .. } => "down",
+                                RawContact::Move { .. } => "move",
+                                RawContact::Up { .. } => "up",
+                                RawContact::Cancel { .. } => "cancel",
+                            };
+                            log_drm_touch_contact(phase, contact, touch.transform());
+                        }
                         // Keep the software cursor in step with a single-finger tap so
                         // the drawn crosshair follows touch too.
                         if let RawContact::Down { u, v, .. } | RawContact::Move { u, v, .. } =
@@ -1739,6 +1812,14 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
         let repaint_due = next_repaint_at.is_some_and(|t| Instant::now() >= t);
         if !wake::should_render(first_frame, !events.is_empty(), force_render, repaint_due) {
             continue;
+        }
+        if input_proof && !events.is_empty() {
+            eprintln!(
+                "mde-egui drm-input kind=egui_frame events={} pointer_x={:.2} pointer_y={:.2}",
+                events.len(),
+                pointer.x,
+                pointer.y
+            );
         }
 
         // 3. run + paint the egui frame

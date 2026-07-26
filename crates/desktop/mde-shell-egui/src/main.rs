@@ -181,6 +181,21 @@ enum FleetMeshTab {
     Explorer,
 }
 
+/// The three node-local views folded into the single This Node interface. The
+/// legacy `Surface::{System,Storage,About}` variants remain internal deep-link
+/// aliases so hotkeys, watermark links, and existing workflows land on the
+/// intended tab while public launchers expose only one icon.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ThisNodeTab {
+    /// Host settings and controls.
+    #[default]
+    System,
+    /// Disk and partition management.
+    Storage,
+    /// Hardware inventory, product identity, and legal information.
+    About,
+}
+
 /// One history point for the navigation bar's Back action. Fleet & Mesh tabs
 /// are first-class points even though they share one launcher surface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -189,6 +204,7 @@ struct NavLocation {
     surface: Surface,
     plane: Plane,
     fleet_mesh_tab: FleetMeshTab,
+    this_node_tab: ThisNodeTab,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -808,6 +824,7 @@ fn surface_needs_remote_sessions_fallback(surface: Surface) -> bool {
         Surface::FleetMesh
         | Surface::Workbench
         | Surface::InfraCode
+        | Surface::ThisNode
         | Surface::System
         | Surface::Storage
         | Surface::About
@@ -1088,6 +1105,8 @@ struct Shell {
     explorer: explorer::ExplorerState,
     /// The selected view inside the unified Fleet & Mesh interface.
     fleet_mesh_tab: FleetMeshTab,
+    /// The selected view inside the unified This Node interface.
+    this_node_tab: ThisNodeTab,
     /// The onboard self-test watch (OW-10) — observes the `event/onboard/self-test`
     /// verdict lane and raises a one-shot edge the instant a node goes all-green, so
     /// the shell auto-opens the Mesh Map. The receive half of a flow whose publish
@@ -1245,6 +1264,7 @@ impl Shell {
             mesh_view: mesh_view::MeshViewState::default(),
             explorer: explorer::ExplorerState::default(),
             fleet_mesh_tab: FleetMeshTab::default(),
+            this_node_tab: ThisNodeTab::default(),
             self_test: mesh_view::SelfTestWatch::default(),
             timers: timers::TimersState::default(),
             power_honor: power_honor::PowerHonor::default(),
@@ -1336,10 +1356,12 @@ impl Shell {
             plane: self.nav.plane,
         };
         let saved_fleet_mesh_tab = self.fleet_mesh_tab;
+        let saved_this_node_tab = self.this_node_tab;
         self.nav.expanded = true;
         self.nav.surface = location.surface;
         self.nav.plane = location.plane;
         self.fleet_mesh_tab = location.fleet_mesh_tab;
+        self.this_node_tab = location.this_node_tab;
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             mde_egui::capture::capture_ui_png(size, ppp, |capture_ctx| {
@@ -1352,6 +1374,7 @@ impl Shell {
 
         self.nav = saved_nav;
         self.fleet_mesh_tab = saved_fleet_mesh_tab;
+        self.this_node_tab = saved_this_node_tab;
 
         match result {
             Ok(Ok(png)) => {
@@ -1396,6 +1419,7 @@ impl Shell {
             surface: self.nav.surface,
             plane: self.nav.plane,
             fleet_mesh_tab: self.fleet_mesh_tab,
+            this_node_tab: self.this_node_tab,
         };
         if let Some(previous) = self.last_nav_location {
             if previous != current {
@@ -1414,12 +1438,34 @@ impl Shell {
         self.nav.surface = location.surface;
         self.nav.plane = location.plane;
         self.fleet_mesh_tab = location.fleet_mesh_tab;
+        self.this_node_tab = location.this_node_tab;
         self.last_nav_location = Some(location);
+    }
+
+    /// Collapse legacy surface aliases into their new public interface while
+    /// preserving the selected internal tab.
+    fn normalize_surface_aliases(&mut self) {
+        match self.nav.surface {
+            Surface::System => {
+                self.this_node_tab = ThisNodeTab::System;
+                self.nav.surface = Surface::ThisNode;
+            }
+            Surface::Storage => {
+                self.this_node_tab = ThisNodeTab::Storage;
+                self.nav.surface = Surface::ThisNode;
+            }
+            Surface::About => {
+                self.this_node_tab = ThisNodeTab::About;
+                self.nav.surface = Surface::ThisNode;
+            }
+            _ => {}
+        }
     }
 
     /// Execute one navigation-bar action. The Auto action uses the same layout
     /// profile seam as Settings and the existing lower-left mode control.
     fn apply_nav_bar_action(&mut self, action: nav_bar::Action, ctx: &egui::Context) {
+        let action_label = nav_bar_action_label(&action);
         match action {
             nav_bar::Action::Back => {
                 if let Some(previous) = self.nav_history.pop() {
@@ -1436,10 +1482,23 @@ impl Shell {
             nav_bar::Action::ToggleDock => {
                 self.nav_bar.toggle(Instant::now(), Motion::mode());
             }
+            nav_bar::Action::OpenSurface(surface) => {
+                self.nav.expanded = true;
+                self.nav.surface = surface;
+                self.normalize_surface_aliases();
+            }
             nav_bar::Action::DesktopSource(id) => {
                 self.connect_front_door_desktop_source(ctx, &id);
             }
         }
+        tracing::info!(
+            target: "mde_shell_egui::nav_bar",
+            action = action_label,
+            docked = self.nav_bar.is_docked(),
+            expanded = self.nav.expanded,
+            surface = self.nav.surface.label(),
+            "springboard dock action applied"
+        );
     }
 
     /// WL-UX-006/U09 — the five Construct chrome mount slots, called in
@@ -1703,6 +1762,57 @@ impl Shell {
         self.fleet_mesh_tab = tab;
     }
 
+    /// Render the unified This Node interface. The formerly separate System,
+    /// Storage, and About surfaces remain real panels, but the public shell now
+    /// exposes one node-local GUI with a compact section rail.
+    fn show_this_node(&mut self, ui: &mut egui::Ui) {
+        self.this_node_tab = match self.nav.surface {
+            Surface::System => ThisNodeTab::System,
+            Surface::Storage => ThisNodeTab::Storage,
+            Surface::About => ThisNodeTab::About,
+            _ => self.this_node_tab,
+        };
+        self.nav.surface = Surface::ThisNode;
+
+        let mut tab = self.this_node_tab;
+        ui.push_id("shell-this-node", |ui| {
+            let _ = mde_egui::nav_chrome::NavigationBar::new("This Node").show(ui);
+            ui.horizontal(|ui| {
+                for (candidate, label) in [
+                    (ThisNodeTab::System, "System"),
+                    (ThisNodeTab::Storage, "Storage"),
+                    (ThisNodeTab::About, "About"),
+                ] {
+                    if ui.selectable_label(tab == candidate, label).clicked() {
+                        tab = candidate;
+                    }
+                }
+            });
+            ui.separator();
+            match tab {
+                ThisNodeTab::System => {
+                    let system = &mut self.system;
+                    ui.push_id("this-node-system", |ui| {
+                        system.show(ui);
+                    });
+                }
+                ThisNodeTab::Storage => {
+                    let storage = &mut self.storage;
+                    ui.push_id("this-node-storage", |ui| {
+                        storage.show(ui);
+                    });
+                }
+                ThisNodeTab::About => {
+                    let dm = &mut self.device_manager;
+                    ui.push_id("this-node-about", |ui| {
+                        dm.show(ui);
+                    });
+                }
+            }
+        });
+        self.this_node_tab = tab;
+    }
+
     /// Render the live topology view inside Fleet & Mesh.
     fn show_mesh_map(&mut self, ui: &mut egui::Ui) {
         ui.push_id("shell-mesh-view", |ui| self.mesh_view.show(ui));
@@ -1947,38 +2057,8 @@ impl Shell {
                 let communications = &mut self.communications;
                 ui.push_id("shell-communications", |ui| communications.show(ui));
             }
-            Surface::System => {
-                // This seat's host controls, folded from the one `mde-seat` Seat
-                // (E12-15). Under SETTINGS-1 the surface is a master-detail shell —
-                // `system.show` draws the left domain-group rail + the wide detail
-                // pane, routing to each existing section body verbatim (§6) and
-                // persisting the rail selection itself. Scoped under its own
-                // `push_id` like every mounted surface so its egui ids can't collide
-                // in the shell's one `Context`. The snapshot is refreshed in
-                // `render` (it also feeds dock status), so the panel
-                // only renders here. The System panel drives Displays + Power live
-                // (E12-18).
-                let system = &mut self.system;
-                ui.push_id("shell-system", |ui| {
-                    system.show(ui);
-                });
-            }
-            Surface::Storage => {
-                // GParted disk/partition management (E12-21) — scoped under its own
-                // `push_id` like every surface; the storage worker owns the walls.
-                let storage = &mut self.storage;
-                ui.push_id("shell-storage", |ui| storage.show(ui));
-            }
-            Surface::About => {
-                // The About surface body is the Device-Manager hardware inspector
-                // (DEVMGR-2, design docs/design/about-device-manager.md): a compact
-                // brand title strip + an ⓘ dialog (the platform-identity screen,
-                // QBRAND-6) over the faithful by-type device tree + rich header card
-                // + menu/toolbar chrome, read from THIS node's published inventory.
-                // Scoped under its own `push_id` like every mounted surface so its
-                // egui ids can't collide in the shell's one `Context`.
-                let dm = &mut self.device_manager;
-                ui.push_id("shell-about", |ui| dm.show(ui));
+            Surface::ThisNode | Surface::System | Surface::Storage | Surface::About => {
+                self.show_this_node(ui);
             }
             Surface::Timers => {
                 // Timers & Alarms — a pure renderer over the
@@ -2127,6 +2207,7 @@ impl Shell {
     /// (`run_drm`), which owns the seat with a bare `Context` and no eframe `Frame`.
     /// The body never touched `Frame`, so both runners render identically.
     fn render(&mut self, ctx: &egui::Context) {
+        self.normalize_surface_aliases();
         self.observe_nav_location(ctx);
         // SURFACE-10: flush any key the OSK queued last frame into THIS frame's input,
         // before the focused field draws, so it consumes them exactly like a hardware
@@ -2256,7 +2337,11 @@ impl Shell {
         // The Storage surface tails the `state/storage/*` mirrors + the selected
         // peer's progress lane while it's in view — a cheap local scan so a UDisks2
         // change on any peer surfaces without operator input (E12-21).
-        if self.nav.expanded && self.nav.surface == Surface::Storage {
+        if self.nav.expanded
+            && (self.nav.surface == Surface::Storage
+                || (self.nav.surface == Surface::ThisNode
+                    && self.this_node_tab == ThisNodeTab::Storage))
+        {
             self.storage.poll(ctx);
         }
 
@@ -2272,7 +2357,11 @@ impl Shell {
         // hardware inventory on its cadence while in view (DEVMGR-2) — a cheap
         // local read of the replicated `device-inventory/<host>.json`, honest
         // pre-poll dim until the `hardware_probe` worker's file lands (§7).
-        if self.nav.expanded && self.nav.surface == Surface::About {
+        if self.nav.expanded
+            && (self.nav.surface == Surface::About
+                || (self.nav.surface == Surface::ThisNode
+                    && self.this_node_tab == ThisNodeTab::About))
+        {
             self.device_manager.poll(ctx);
         }
 
@@ -2328,8 +2417,12 @@ impl Shell {
         // in view: register on entry (once an adapter is present), drop
         // (unregister) on leave. So a pairing PIN/passkey prompt is answered by the
         // panel's modal, and no default agent lingers on the system bus otherwise.
-        self.system
-            .sync_pairing_agent(self.nav.expanded && self.nav.surface == Surface::System);
+        self.system.sync_pairing_agent(
+            self.nav.expanded
+                && (self.nav.surface == Surface::System
+                    || (self.nav.surface == Surface::ThisNode
+                        && self.this_node_tab == ThisNodeTab::System)),
+        );
 
         // The former top strip is retired; its snapshot poll survives as the
         // grade/status mesh fold. ONE self-gating poll per frame (it also keeps the
@@ -3435,6 +3528,16 @@ fn dnd_active() -> bool {
     mde_bus::client_data_dir().is_some_and(|root| mde_bus::dnd::load_default(&root).active)
 }
 
+fn nav_bar_action_label(action: &nav_bar::Action) -> &'static str {
+    match action {
+        nav_bar::Action::Back => "back",
+        nav_bar::Action::Home => "home",
+        nav_bar::Action::ToggleDock => "toggle_dock",
+        nav_bar::Action::OpenSurface(_) => "open_surface",
+        nav_bar::Action::DesktopSource(_) => "desktop_source",
+    }
+}
+
 const fn desktop_reconnect_should_query_recents(has_visible_desktop_session: bool) -> bool {
     !has_visible_desktop_session
 }
@@ -3524,7 +3627,7 @@ mod tests {
         publish_front_door_peer_app_launch_to_bus, publish_front_door_service_lifecycle_to_bus,
         real_media, real_terminal, remote_sessions_fallback_pos, route_file_operation_request,
         screenshot, splash, status, surface_needs_remote_sessions_fallback, terminal_panel, vdi,
-        Boot, MenuBarMinimizeEffect, Nav, Plane, Shell, Surface, VideoTextureCache,
+        Boot, MenuBarMinimizeEffect, Nav, Plane, Shell, Surface, ThisNodeTab, VideoTextureCache,
         LAYOUT_MODE_BUTTON_CONSTRUCT, LAYOUT_MODE_BUTTON_TOUCH, LAYOUT_MODE_HOLD,
         LAYOUT_MODE_HUD_CLEARANCE, MENU_BAR_MINIMIZE_DURATION,
     };
@@ -4364,6 +4467,24 @@ mod tests {
         assert_eq!(bindings.action_for(egui::Key::Z), None);
     }
 
+    #[test]
+    fn legacy_node_surfaces_normalize_into_this_node_tabs() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shell = Shell::new_for_ctx(&ctx);
+
+        for (legacy, expected_tab) in [
+            (Surface::System, ThisNodeTab::System),
+            (Surface::Storage, ThisNodeTab::Storage),
+            (Surface::About, ThisNodeTab::About),
+        ] {
+            shell.nav.surface = legacy;
+            shell.normalize_surface_aliases();
+            assert_eq!(shell.nav.surface, Surface::ThisNode, "{legacy:?} surface");
+            assert_eq!(shell.this_node_tab, expected_tab, "{legacy:?} tab");
+        }
+    }
+
     /// PLATFORM-INTERFACES Q31/Q32 — every surface-jump `CarAction` (plus the
     /// call verbs) lands the shell on its roster surface through
     /// `apply_car_action`, including the new `GoMusic` and the Airspace action
@@ -4732,6 +4853,7 @@ mod tests {
                     | Surface::Workbench
                     | Surface::InfraCode
                     | Surface::Desktop
+                    | Surface::ThisNode
                     | Surface::System
                     | Surface::Storage
                     | Surface::About
@@ -5054,21 +5176,22 @@ mod tests {
         Style::install(&ctx);
         let mut shell = Shell::new_for_ctx(&ctx);
         shell.local_host = "eagle".to_string();
+        let critical_segments = status::StatusSegments {
+            alerts: Some(status::SegmentRollup {
+                segment: "alerts".to_string(),
+                severity: "critical".to_string(),
+                source: "thermal".to_string(),
+                summary: "thermal critical".to_string(),
+                host: "eagle".to_string(),
+                critical_policy: "own-seat-light-show".to_string(),
+                ts_unix_ms: 42,
+            }),
+            seen: true,
+            ..status::StatusSegments::default()
+        };
         shell
             .notify_status
-            .set_segments_for_test(status::StatusSegments {
-                alerts: Some(status::SegmentRollup {
-                    segment: "alerts".to_string(),
-                    severity: "critical".to_string(),
-                    source: "thermal".to_string(),
-                    summary: "thermal critical".to_string(),
-                    host: "eagle".to_string(),
-                    critical_policy: "own-seat-light-show".to_string(),
-                    ts_unix_ms: 42,
-                }),
-                seen: true,
-                ..status::StatusSegments::default()
-            });
+            .set_segments_for_test(critical_segments.clone());
         let input = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(960.0, 640.0))),
             ..Default::default()
@@ -6570,6 +6693,171 @@ mod tests {
         assert_eq!(
             workspace.bottom(),
             screen.bottom() - super::nav_bar::SPRINGBOARD_DOCK_RESERVED_H
+        );
+    }
+
+    /// WL-UX-006 — reproduce the live seat-15 path at the shell boundary:
+    /// Car profile, floating Springboard Dock, and a direct touchscreen tap on
+    /// the Pin control. The isolated nav-bar widget tests prove the control can
+    /// click; this guards the full shell's foreground layer ordering and later
+    /// overlays so the real dock remains reachable on the DRM seat.
+    #[test]
+    fn car_shell_touch_tap_on_floating_nav_pin_docks_the_bar() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        ctx.style_mut(|style| style.animation_time = 0.0);
+
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.curtain = super::curtain::Curtain::default();
+        shell
+            .system
+            .set_layout_profile(mde_egui::LayoutProfile::Car, &ctx);
+        shell.nav_bar = super::nav_bar::State::with_mode(super::nav_bar::DockMode::Floating);
+        shell.nav.expanded = true;
+        shell.nav.surface = Surface::AutoHome;
+
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(1920.0, 1080.0));
+        let pin = pos2(168.0, 1036.0);
+        let input = |events| egui::RawInput {
+            screen_rect: Some(screen),
+            events,
+            ..Default::default()
+        };
+
+        for _ in 0..3 {
+            let _ = ctx.run(input(Vec::new()), |ctx| shell.render(ctx));
+        }
+        let _ = ctx.run(
+            input(vec![
+                egui::Event::Touch {
+                    device_id: egui::TouchDeviceId(0),
+                    id: egui::TouchId(0),
+                    phase: egui::TouchPhase::Start,
+                    pos: pin,
+                    force: None,
+                },
+                egui::Event::PointerMoved(pin),
+                pointer_button(pin, true),
+            ]),
+            |ctx| shell.render(ctx),
+        );
+        let _ = ctx.run(
+            input(vec![
+                egui::Event::Touch {
+                    device_id: egui::TouchDeviceId(0),
+                    id: egui::TouchId(0),
+                    phase: egui::TouchPhase::End,
+                    pos: pin,
+                    force: None,
+                },
+                pointer_button(pin, false),
+                egui::Event::PointerGone,
+            ]),
+            |ctx| shell.render(ctx),
+        );
+
+        assert!(
+            shell.nav_bar.is_docked(),
+            "a direct touchscreen tap at the live seat-15 Pin coordinate must dock the bar"
+        );
+    }
+
+    /// WL-UX-006 — the own-seat critical edge cue is mounted after ordinary
+    /// chrome. It must stay an edge-only hit target; a full-screen invisible
+    /// foreground Area makes the Springboard Dock render but never click on the
+    /// DRM seat.
+    #[test]
+    fn car_shell_critical_edge_does_not_block_floating_nav_pin() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        ctx.style_mut(|style| style.animation_time = 0.0);
+
+        let mut shell = Shell::new_for_ctx(&ctx);
+        shell.local_host = "eagle".to_string();
+        shell.curtain = super::curtain::Curtain::default();
+        shell
+            .system
+            .set_layout_profile(mde_egui::LayoutProfile::Car, &ctx);
+        shell.nav_bar = super::nav_bar::State::with_mode(super::nav_bar::DockMode::Floating);
+        shell.nav.expanded = true;
+        shell.nav.surface = Surface::AutoHome;
+        let critical_segments = status::StatusSegments {
+            alerts: Some(status::SegmentRollup {
+                segment: "alerts".to_string(),
+                severity: "critical".to_string(),
+                source: "thermal".to_string(),
+                summary: "thermal critical".to_string(),
+                host: "eagle".to_string(),
+                critical_policy: "own-seat-light-show".to_string(),
+                ts_unix_ms: 42,
+            }),
+            seen: true,
+            ..status::StatusSegments::default()
+        };
+        shell
+            .notify_status
+            .set_segments_for_test(critical_segments.clone());
+
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(1920.0, 1080.0));
+        let pin = pos2(168.0, 1036.0);
+        let input = |events| egui::RawInput {
+            screen_rect: Some(screen),
+            events,
+            ..Default::default()
+        };
+
+        for _ in 0..3 {
+            shell
+                .notify_status
+                .set_segments_for_test(critical_segments.clone());
+            let _ = ctx.run(input(Vec::new()), |ctx| shell.render(ctx));
+        }
+        shell.notify_status.set_segments_for_test(critical_segments);
+        assert!(
+            shell.critical_edge.visible(),
+            "critical fixture must be active"
+        );
+        assert_eq!(
+            ctx.layer_id_at(pin),
+            Some(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("construct-navigation-bar"),
+            )),
+            "critical edge cue must not own the non-edge Pin coordinate"
+        );
+
+        let _ = ctx.run(
+            input(vec![
+                egui::Event::Touch {
+                    device_id: egui::TouchDeviceId(0),
+                    id: egui::TouchId(0),
+                    phase: egui::TouchPhase::Start,
+                    pos: pin,
+                    force: None,
+                },
+                egui::Event::PointerMoved(pin),
+                pointer_button(pin, true),
+            ]),
+            |ctx| shell.render(ctx),
+        );
+        let _ = ctx.run(
+            input(vec![
+                egui::Event::Touch {
+                    device_id: egui::TouchDeviceId(0),
+                    id: egui::TouchId(0),
+                    phase: egui::TouchPhase::End,
+                    pos: pin,
+                    force: None,
+                },
+                pointer_button(pin, false),
+                egui::Event::PointerGone,
+            ]),
+            |ctx| shell.render(ctx),
+        );
+
+        assert!(
+            shell.nav_bar.is_docked(),
+            "a critical own-seat edge cue must not block the floating nav Pin"
         );
     }
 

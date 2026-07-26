@@ -24,8 +24,9 @@ use serde_json::{Map, Value};
 
 use super::{ShutdownToken, Worker};
 
-/// Explicit overlay opt-in. A true value with no sealed key is visible as
-/// unconfigured, but never contacts AirNow.
+/// Explicit overlay opt-out. Missing or true-ish values keep the worker present
+/// in the catalog; a missing sealed key is visible as unconfigured, but never
+/// contacts AirNow.
 pub const ENABLED_ENV: &str = "MDE_OVERLAY_AIRNOW_AQI";
 /// Stable mde-seal secret reference for the free per-deployment AirNow key.
 pub const API_KEY_SECRET_REF: &str = "airnow-api-key";
@@ -533,12 +534,13 @@ pub struct AirQualityOverlayWorker {
 }
 
 impl AirQualityOverlayWorker {
-    /// Production wiring. Disabled unless explicitly opted in.
+    /// Production wiring. Present by default; set `MDE_OVERLAY_AIRNOW_AQI=0`
+    /// to suppress this optional external-feed topic entirely.
     #[must_use]
     pub fn new(host: String) -> Self {
         Self {
             host,
-            enabled: env_truthy(ENABLED_ENV),
+            enabled: env_default_enabled(ENABLED_ENV),
             probe: None,
             key_source: Arc::new(SealedApiKeySource),
             bus_root: crate::bus_publish::default_bus_root(),
@@ -824,13 +826,15 @@ impl Worker for AirQualityOverlayWorker {
     }
 }
 
-fn env_truthy(name: &str) -> bool {
-    std::env::var(name).is_ok_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
+fn env_default_enabled(name: &str) -> bool {
+    overlay_enabled_from_env(std::env::var(name).ok().as_deref())
+}
+
+fn overlay_enabled_from_env(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(|value| value.trim().to_ascii_lowercase()),
+        Some(value) if matches!(value.as_str(), "0" | "false" | "no" | "off")
+    )
 }
 
 fn now_ms() -> i64 {
@@ -892,6 +896,29 @@ mod tests {
             }
         ])
         .to_string()
+    }
+
+    #[test]
+    fn overlay_enabled_defaults_on_with_false_y_opt_out() {
+        for enabled in [
+            None,
+            Some(""),
+            Some("1"),
+            Some("true"),
+            Some("yes"),
+            Some("on"),
+        ] {
+            assert!(
+                overlay_enabled_from_env(enabled),
+                "{enabled:?} should enable"
+            );
+        }
+        for disabled in [Some("0"), Some("false"), Some("no"), Some("off")] {
+            assert!(
+                !overlay_enabled_from_env(disabled),
+                "{disabled:?} should disable"
+            );
+        }
     }
 
     #[test]
@@ -1026,16 +1053,16 @@ mod tests {
             longitude: -86.78,
         };
         let mut last_good = None;
-        assert!(worker
-            .apply_result(Ok(original), context(), &mut last_good)
-            .success);
-        assert!(!worker
-            .apply_result(
-                Err(ProbeFailure::other("timeout")),
-                moved,
-                &mut last_good,
-            )
-            .success);
+        assert!(
+            worker
+                .apply_result(Ok(original), context(), &mut last_good)
+                .success
+        );
+        assert!(
+            !worker
+                .apply_result(Err(ProbeFailure::other("timeout")), moved, &mut last_good,)
+                .success
+        );
 
         let persisted = Persist::open(root)
             .expect("bus")

@@ -1,10 +1,14 @@
 //! WL-FUNC-012 / OVERLAY-6 — keyless NIFC WFIGS current wildfire perimeters.
 //!
-//! A Workstation opts in with `MDE_OVERLAY_NIFC_WILDFIRE=1`. The adapter makes
-//! a bounded, vehicle-centred query against the official WFIGS current-perimeter
-//! FeatureServer every fifteen minutes, normalizes Polygon/MultiPolygon GeoJSON,
-//! and publishes a complete latest-wins Bus snapshot. NASA FIRMS hotspots remain
-//! a separate optional free-key input and are never fabricated when unconfigured.
+//! Workstations start this keyless public NIFC WFIGS producer by default.
+//! Operators can explicitly disable it with
+//! `MDE_OVERLAY_NIFC_WILDFIRE=0/false/no/off`. The adapter makes a bounded,
+//! vehicle-centred query against the official WFIGS current-perimeter
+//! FeatureServer every fifteen minutes, normalizes Polygon/MultiPolygon
+//! GeoJSON, and publishes a complete latest-wins Bus snapshot. Missing
+//! same-host vehicle context publishes an honest empty mirror instead of
+//! leaving the catalog topic absent. NASA FIRMS hotspots remain a separate
+//! optional free-key input and are never fabricated when unconfigured.
 
 #![cfg(feature = "async-services")]
 
@@ -25,7 +29,7 @@ use serde_json::Value;
 
 use super::{ShutdownToken, Worker};
 
-/// Explicit opt-in. Unset/false is an idle no-op.
+/// Explicit disable for the keyless default-on WFIGS producer.
 pub const ENABLED_ENV: &str = "MDE_OVERLAY_NIFC_WILDFIRE";
 /// Optional official-service URL override for a renamed WFIGS current layer.
 pub const ENDPOINT_ENV: &str = "MDE_OVERLAY_NIFC_WILDFIRE_URL";
@@ -133,7 +137,6 @@ struct Validators {
 
 /// Production rustls client for the official ArcGIS service.
 pub struct WfigsHttpProbe {
-    client: Client,
     endpoint: String,
     validators: Mutex<Validators>,
 }
@@ -141,14 +144,7 @@ pub struct WfigsHttpProbe {
 impl WfigsHttpProbe {
     fn new(endpoint: String) -> Result<Self, ProbeFailure> {
         validate_endpoint(&endpoint).map_err(ProbeFailure::other)?;
-        let client = Client::builder()
-            .timeout(HTTP_TIMEOUT)
-            .user_agent(USER_AGENT)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(ProbeFailure::other)?;
         Ok(Self {
-            client,
             endpoint,
             validators: Mutex::new(Validators::default()),
         })
@@ -159,7 +155,17 @@ impl WildfireProbe for WfigsHttpProbe {
     fn fetch(&self, context: WildfireContext) -> Result<ProbeResponse, ProbeFailure> {
         validate_context(context).map_err(ProbeFailure::other)?;
         let url = query_url(&self.endpoint, context).map_err(ProbeFailure::other)?;
-        let mut request = self.client.get(url);
+        // `reqwest::blocking::Client` owns an internal runtime. Construct and
+        // drop it inside the blocking fetch call; production reaches this method
+        // through `spawn_blocking`, while sync tests call it outside a Tokio
+        // worker thread.
+        let client = Client::builder()
+            .timeout(HTTP_TIMEOUT)
+            .user_agent(USER_AGENT)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(ProbeFailure::other)?;
+        let mut request = client.get(url);
         let mut sent_validator = false;
         {
             let validators = self
@@ -722,12 +728,17 @@ pub struct WildfireOverlayWorker {
 }
 
 impl WildfireOverlayWorker {
-    /// Production wiring. Disabled unless explicitly opted in.
+    /// Production wiring. The keyless WFIGS adapter is enabled by default on
+    /// spawned Workstation-tier nodes; an explicit false-y env disables it.
+    /// Missing vehicle context publishes an honest empty mirror instead of
+    /// leaving the catalog topic absent.
     #[must_use]
     pub fn new(host: String) -> Self {
-        let probe = if env_truthy(ENABLED_ENV) {
-            let endpoint =
-                std::env::var(ENDPOINT_ENV).unwrap_or_else(|_| DEFAULT_ENDPOINT.to_string());
+        let probe = if env_default_enabled(ENABLED_ENV) {
+            let endpoint = std::env::var(ENDPOINT_ENV)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
             match WfigsHttpProbe::new(endpoint) {
                 Ok(probe) => Some(Arc::new(probe) as Arc<dyn WildfireProbe>),
                 Err(error) => {
@@ -760,6 +771,13 @@ impl WildfireOverlayWorker {
         self
     }
 
+    /// Override cadence for tests.
+    #[must_use]
+    pub const fn with_poll(mut self, poll: Duration) -> Self {
+        self.poll = poll;
+        self
+    }
+
     fn current_context(&self) -> Option<WildfireContext> {
         let root = self.bus_root.clone()?;
         let persist = mde_bus::persist::Persist::open(root).ok()?;
@@ -779,9 +797,48 @@ impl WildfireOverlayWorker {
         }
     }
 
+    fn degraded_snapshot(
+        &self,
+        context: Option<WildfireContext>,
+        reason: impl std::fmt::Display,
+    ) -> WildfireSnapshot {
+        let (latitude, longitude, radius) = context
+            .map(|context| (context.latitude, context.longitude, QUERY_RADIUS_KM))
+            .unwrap_or((0.0, 0.0, 0));
+        let mut snapshot =
+            WildfireSnapshot::empty(&self.host, now_ms(), latitude, longitude, radius);
+        push_gap(
+            &mut snapshot.gaps,
+            format!("NIFC wildfire paused: {reason}"),
+        );
+        snapshot
+    }
+
+    fn publish_unavailable(
+        &self,
+        context: Option<WildfireContext>,
+        reason: impl std::fmt::Display,
+    ) {
+        let reason = reason.to_string();
+        tracing::warn!(target: "mackesd::wildfire_overlay", host = %self.host, error = %reason, "WFIGS refresh unavailable; publishing empty degraded snapshot");
+        let degraded = self.degraded_snapshot(context, reason);
+        self.publish(&degraded);
+    }
+
+    fn publish_no_context_degraded(&self, reason: &str, last_good: &mut Option<WildfireSnapshot>) {
+        tracing::warn!(target: "mackesd::wildfire_overlay", host = %self.host, error = reason, "WFIGS refresh has no fresh same-host vehicle context; publishing empty degraded snapshot");
+        let degraded = self.degraded_snapshot(None, reason);
+        self.publish(&degraded);
+        // WFIGS perimeters are vehicle-scoped. Once the same-host fix
+        // disappears, retain the Bus topic but do not allow a later failure or
+        // 304 to replay perimeters from a stale prior point.
+        *last_good = None;
+    }
+
     fn apply_result(
         &self,
         result: Result<PreparedResponse, ProbeFailure>,
+        context: WildfireContext,
         last_good: &mut Option<WildfireSnapshot>,
     ) -> ApplyOutcome {
         match result {
@@ -794,13 +851,7 @@ impl WildfireOverlayWorker {
                 }
             }
             Err(error) => {
-                if let Some(snapshot) = last_good {
-                    snapshot
-                        .gaps
-                        .retain(|gap| !gap.starts_with("NIFC wildfire paused:"));
-                    push_gap(&mut snapshot.gaps, format!("NIFC wildfire paused: {error}"));
-                    self.publish(snapshot);
-                }
+                self.publish_unavailable(Some(context), &error);
                 ApplyOutcome {
                     success: false,
                     retry_after: error.retry_after(),
@@ -915,10 +966,8 @@ impl Worker for WildfireOverlayWorker {
         loop {
             let Some(context) = self.current_context() else {
                 if !no_fix_published {
-                    self.apply_result(
-                        Err(ProbeFailure::other(
-                            "fresh same-host US vehicle fix unavailable",
-                        )),
+                    self.publish_no_context_degraded(
+                        "fresh same-host US vehicle fix unavailable",
                         &mut last_good,
                     );
                     no_fix_published = true;
@@ -936,7 +985,7 @@ impl Worker for WildfireOverlayWorker {
             else {
                 break;
             };
-            let outcome = self.apply_result(result, &mut last_good);
+            let outcome = self.apply_result(result, context, &mut last_good);
             let delay = effective_retry(outcome, retry, self.poll);
             retry = if outcome.success {
                 RETRY_MIN
@@ -952,13 +1001,15 @@ impl Worker for WildfireOverlayWorker {
     }
 }
 
-fn env_truthy(name: &str) -> bool {
-    std::env::var(name).is_ok_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
+fn env_default_enabled(name: &str) -> bool {
+    overlay_enabled_from_env(std::env::var(name).ok().as_deref())
+}
+
+fn overlay_enabled_from_env(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(|value| value.trim().to_ascii_lowercase()),
+        Some(value) if matches!(value.as_str(), "0" | "false" | "no" | "off")
+    )
 }
 
 fn now_ms() -> i64 {
@@ -1100,7 +1151,21 @@ mod tests {
     }
 
     #[test]
-    fn rate_limit_retains_original_fetch_time_and_publishes_paused_last_good() {
+    fn keyless_wfigs_producer_defaults_on_with_explicit_false_opt_out() {
+        assert!(overlay_enabled_from_env(None));
+        assert!(overlay_enabled_from_env(Some("")));
+        assert!(overlay_enabled_from_env(Some("1")));
+        assert!(overlay_enabled_from_env(Some("true")));
+        assert!(overlay_enabled_from_env(Some("yes")));
+        assert!(overlay_enabled_from_env(Some("on")));
+        assert!(!overlay_enabled_from_env(Some("0")));
+        assert!(!overlay_enabled_from_env(Some("false")));
+        assert!(!overlay_enabled_from_env(Some("NO")));
+        assert!(!overlay_enabled_from_env(Some(" off ")));
+    }
+
+    #[test]
+    fn failed_refresh_publishes_empty_degraded_projection_and_retains_private_cache() {
         let temp = tempfile::tempdir().expect("temp");
         let root = temp.path().to_path_buf();
         let worker =
@@ -1108,30 +1173,168 @@ mod tests {
         let original =
             parse_snapshot("rig-1", context(), &captured_geojson(), NOW_MS).expect("snapshot");
         let mut last_good = None;
-        let success = worker.apply_result(Ok(PreparedResponse::Modified(original)), &mut last_good);
+        let success = worker.apply_result(
+            Ok(PreparedResponse::Modified(original)),
+            context(),
+            &mut last_good,
+        );
         assert!(success.success);
         let paused = worker.apply_result(
             Err(ProbeFailure::rate_limited(
                 Duration::from_secs(60),
                 "ArcGIS HTTP 429",
             )),
+            context(),
             &mut last_good,
         );
         assert!(!paused.success);
-        let retained = last_good.as_ref().expect("last good");
+        assert_eq!(paused.retry_after, Some(Duration::from_secs(60)));
+        let retained = last_good.as_ref().expect("private conditional cache");
         assert_eq!(retained.fetched_at_ms, NOW_MS);
-        assert!(retained
+        assert_eq!(retained.perimeters.len(), 1);
+
+        let persist = Persist::open(root).expect("bus");
+        let rows = persist
+            .list_since(&wildfire_state_topic("rig-1"), None)
+            .expect("rows");
+        assert_eq!(rows.len(), 2);
+        let degraded: WildfireSnapshot = serde_json::from_str(
+            rows.last()
+                .and_then(|row| row.body.as_deref())
+                .expect("degraded body"),
+        )
+        .expect("degraded snapshot");
+        assert_eq!(degraded.host, "rig-1");
+        assert!(degraded.fetched_at_ms > 0);
+        assert!(degraded.perimeters.is_empty());
+        assert_eq!(degraded.query_latitude, context().latitude);
+        assert_eq!(degraded.query_longitude, context().longitude);
+        assert!(degraded
             .gaps
             .iter()
-            .any(|gap| gap.starts_with("NIFC wildfire paused:")));
-        let persist = Persist::open(root).expect("bus");
-        assert_eq!(
-            persist
-                .list_since(&wildfire_state_topic("rig-1"), None)
-                .expect("rows")
-                .len(),
-            2
+            .any(|gap| gap.starts_with("NIFC wildfire paused: ArcGIS HTTP 429")));
+        assert_eq!(degraded.license_tier, "public-domain");
+        assert_eq!(degraded.attribution, "NIFC WFIGS");
+    }
+
+    #[test]
+    fn no_fresh_vehicle_fix_publishes_empty_state_before_first_fetch() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().to_path_buf();
+        let worker =
+            WildfireOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+        let mut private_cache = None;
+
+        worker.publish_no_context_degraded(
+            "fresh same-host US vehicle fix unavailable",
+            &mut private_cache,
         );
+
+        assert!(private_cache.is_none());
+        let body = Persist::open(root)
+            .expect("bus")
+            .read_latest(&wildfire_state_topic("rig-1"))
+            .expect("read")
+            .expect("message")
+            .body
+            .expect("body");
+        let snapshot: WildfireSnapshot = serde_json::from_str(&body).expect("snapshot");
+        assert_eq!(snapshot.host, "rig-1");
+        assert!(snapshot.fetched_at_ms > 0);
+        assert!(snapshot.perimeters.is_empty());
+        assert_eq!(snapshot.omitted_features, 0);
+        assert_eq!(snapshot.query_latitude, 0.0);
+        assert_eq!(snapshot.query_longitude, 0.0);
+        assert_eq!(snapshot.query_radius_km, 0);
+        assert!(snapshot
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("vehicle fix unavailable")));
+        assert_eq!(snapshot.license_tier, "public-domain");
+        assert_eq!(snapshot.attribution, "NIFC WFIGS");
+    }
+
+    #[test]
+    fn no_vehicle_fix_degraded_snapshot_retracts_prior_perimeters_and_query_origin() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().to_path_buf();
+        let worker =
+            WildfireOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+        let original =
+            parse_snapshot("rig-1", context(), &captured_geojson(), NOW_MS).expect("snapshot");
+        assert!(!original.perimeters.is_empty());
+        let mut last_good = Some(original);
+
+        worker.publish_no_context_degraded(
+            "fresh same-host US vehicle fix unavailable",
+            &mut last_good,
+        );
+
+        assert!(
+            last_good.is_none(),
+            "old vehicle-scoped perimeter cache must not survive fix loss"
+        );
+        let body = Persist::open(root)
+            .expect("bus")
+            .read_latest(&wildfire_state_topic("rig-1"))
+            .expect("read")
+            .expect("message")
+            .body
+            .expect("body");
+        let snapshot: WildfireSnapshot = serde_json::from_str(&body).expect("snapshot");
+        assert!(snapshot.perimeters.is_empty());
+        assert_eq!(snapshot.query_latitude, 0.0);
+        assert_eq!(snapshot.query_longitude, 0.0);
+        assert_eq!(snapshot.query_radius_km, 0);
+        assert!(snapshot
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("vehicle fix unavailable")));
+    }
+
+    #[test]
+    fn persisted_stale_perimeter_row_is_cleared_after_restart_without_fix() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().to_path_buf();
+        let seed_worker =
+            WildfireOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+        let original =
+            parse_snapshot("rig-1", context(), &captured_geojson(), NOW_MS).expect("snapshot");
+        let mut seed_cache = None;
+        assert!(
+            seed_worker
+                .apply_result(
+                    Ok(PreparedResponse::Modified(original)),
+                    context(),
+                    &mut seed_cache,
+                )
+                .success
+        );
+
+        let restarted =
+            WildfireOverlayWorker::new("rig-1".to_string()).with_bus_root(Some(root.clone()));
+        let mut private_cache = None;
+        restarted.publish_no_context_degraded(
+            "fresh same-host US vehicle fix unavailable after restart",
+            &mut private_cache,
+        );
+
+        assert!(private_cache.is_none());
+        let body = Persist::open(root)
+            .expect("bus")
+            .read_latest(&wildfire_state_topic("rig-1"))
+            .expect("read")
+            .expect("message")
+            .body
+            .expect("body");
+        let snapshot: WildfireSnapshot = serde_json::from_str(&body).expect("snapshot");
+        assert!(snapshot.perimeters.is_empty());
+        assert_eq!(snapshot.query_latitude, 0.0);
+        assert_eq!(snapshot.query_longitude, 0.0);
+        assert!(snapshot
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("after restart")));
     }
 
     #[test]
@@ -1208,5 +1411,57 @@ mod tests {
         .expect("responsive");
         assert!(result.is_none());
         sender.await.expect("sender");
+    }
+
+    #[tokio::test]
+    async fn default_on_worker_publishes_degraded_snapshot_without_vehicle_fix() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().to_path_buf();
+        let mut worker = WildfireOverlayWorker::new("rig-1".to_string())
+            .with_probe(Arc::new(SlowProbe))
+            .with_bus_root(Some(root.clone()))
+            .with_poll(Duration::from_millis(50));
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let token = ShutdownToken::from_receiver(rx);
+        let handle = tokio::spawn(async move { worker.run(token).await });
+
+        let topic = wildfire_state_topic("rig-1");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let body = loop {
+            if let Some(row) = Persist::open(root.clone())
+                .expect("bus")
+                .read_latest(&topic)
+                .expect("read")
+            {
+                break row.body.expect("body");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "default-on WFIGS worker did not publish a degraded no-fix snapshot"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        tx.send(true).expect("shutdown");
+        let joined = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert!(joined.is_ok(), "worker exits promptly after proof");
+        joined
+            .expect("join timeout")
+            .expect("join")
+            .expect("worker ok");
+
+        let snapshot: WildfireSnapshot = serde_json::from_str(&body).expect("snapshot");
+        assert_eq!(snapshot.host, "rig-1");
+        assert!(snapshot.fetched_at_ms > 0);
+        assert!(snapshot.perimeters.is_empty());
+        assert_eq!(snapshot.query_latitude, 0.0);
+        assert_eq!(snapshot.query_longitude, 0.0);
+        assert_eq!(snapshot.query_radius_km, 0);
+        assert!(snapshot
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("vehicle fix unavailable")));
+        assert_eq!(snapshot.license_tier, "public-domain");
+        assert_eq!(snapshot.attribution, "NIFC WFIGS");
     }
 }

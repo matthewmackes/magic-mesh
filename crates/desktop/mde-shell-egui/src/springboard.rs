@@ -49,10 +49,10 @@
 //! for the slot body to apply. State rides egui memory (the switcher/backdrop
 //! pattern), so `main.rs` grows no new fields.
 
-use mde_egui::{Motion, MotionPreset, Style, TypographyRole, egui};
+use mde_egui::{egui, Motion, MotionPreset, Style, TypographyRole};
 
 use crate::construct::{ChromeIntent, ConstructChrome};
-use crate::surfaces::{LAUNCHER_GROUPS, Surface, icon_texture};
+use crate::surfaces::{icon_texture, Surface, LAUNCHER_GROUPS};
 
 /// Stable egui-memory key the per-frame [`SpringboardState`] persists under.
 const STATE_KEY: &str = "construct-springboard-state";
@@ -1087,7 +1087,7 @@ mod tests {
             "Files & Data",
             "Web",
             "Developer Tools",
-            "Comms",
+            "Mesh Teams",
         ] {
             assert!(
                 !texts.iter().any(|text| text == title),

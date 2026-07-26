@@ -18,7 +18,7 @@ instead of leaving closed work in this file.
 
 ## Current Snapshot - 2026-07-26 release gate
 
-- **5 active epics:** 5 `Remaining`, 0 `Blocked`; no `Needs clarification`.
+- **10 active epics:** 10 `Remaining`, 0 `Blocked`; no `Needs clarification`.
 - **Release gate:** the current integrated wave passes the full `mackesd` farm
   suite at **4,124 passed, 0 failed, 1 ignored**. The Fedora 44
   base/browser/thin-lighthouse RPM cut is green at **81.7 / 39.1 / 11.0 MiB**;
@@ -37,13 +37,15 @@ instead of leaving closed work in this file.
   dropped off both LAN and overlay (`172.20.146.13` and `10.42.0.6` unreachable
   from dev, `.15`, Dell, and LH1); Eagle recovery is the current live hardware
   blocker.
-- **P0:** WL-ARCH-007 (authorization mint + direct lifecycle proof) and
-  WL-FUNC-011 (optional real media/LLM evidence remains).
-- **In flight:** WL-FUNC-012 live map feeds, WL-UX-006 Construct, and WL-UX-007
-  Car. The 2026-07-23 thin-lighthouse policy is enforced in role pinning,
-  onboarding, install profiles, directory discovery, DNS, workers, secret
-  scope minting, and both media helpers; no new lighthouse may carry media or
-  file-sharing duties.
+- **P0:** WL-ARCH-007 (authorization mint + direct lifecycle proof),
+  WL-FUNC-011 (optional real media/LLM evidence remains), and WL-UX-010
+  (Mesh Teams near-parity interface redesign).
+- **In flight:** WL-FUNC-012 live map feeds, WL-UX-006 Construct, WL-UX-007
+  Car, WL-UX-009 unified workspace design language, and WL-UX-010 Mesh Teams
+  near-parity UX. The 2026-07-23
+  thin-lighthouse policy is enforced in role pinning, onboarding, install
+  profiles, directory discovery, DNS, workers, secret scope minting, and both
+  media helpers; no new lighthouse may carry media or file-sharing duties.
 - **Non-blocking external evidence:** WL-FUNC-011 still has optional real
   second-peer/SIP and sealed DigitalOcean model demonstrations. These proofs no
   longer block autonomous implementation or the active drain; missing resources
@@ -268,6 +270,53 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-ARCH-007 - Repair Workloads cockpit E2E wire, placement, and authorization
 
 - Status: Remaining
+- Progress (2026-07-26 Workloads Plan verb contract): the Workloads UI
+  `plan_provision` action now publishes the dedicated versioned `plan` Bus
+  request contract for the selected placement node instead of reusing the live
+  `provision` verb. The focused shell test
+  `iac::tests::provision_plan_emits_dedicated_plan_request_contract` proves the
+  request lands on `action/cloud/plan`, carries `schema_version=1` and
+  `node=eagle`, carries no `armed_token`, and emits zero `action/cloud/provision`
+  requests. Evidence: BigBoy farm lane
+  `MCNF_BUILD_HOST=172.20.0.130 MCNF_BUILD_SLOT=workloads-plan
+  install-helpers/xcp-build.sh cargo test -p mde-shell-egui
+  provision_plan_emits_dedicated_plan_request_contract -- --nocapture` passed
+  1/1 test (1827 filtered).
+- Progress (2026-07-26 onboard open-broker proof correlation): the read-only
+  Workloads live-proof helper now treats `event/onboard/apply` open-broker
+  acknowledgements as proof only when the event is fresh, target/issuer/nonce
+  shaped, carries a valid `open-broker <session>` applied entry, and correlates
+  to a retained `action/onboard/apply` request with matching issuer, target,
+  nonce, and `OpenBroker.session_id`. The proof output reports both event and
+  action ULIDs/hashes while still redacting signed material; malformed, stale,
+  orphaned, and action-after-ack cases fail closed. Validation passed local
+  `python3 -m py_compile`, local
+  `install-helpers/verify-workloads-live-proof.py --self-test`, local
+  `git diff --check`, and synced-checkout farm runs on `.50` and `.90` of
+  `python3 -m py_compile install-helpers/verify-workloads-live-proof.py &&
+  install-helpers/verify-workloads-live-proof.py --self-test`. No Bus messages
+  were published and no live host state changed.
+- Progress (2026-07-26 explicit peer placement live-proof): the Workloads
+  live-proof helper now expands an explicit `--node <name>` into both `<name>`
+  and `peer:<name>` candidates, matching the deployed Bus convention on `.15`
+  without broadening beyond the same placement identity. The helper self-test
+  now proves an explicit `node-a` argument accepts a fresh
+  `peer:node-a` `event/vm/instances` roster while still redacting lifecycle
+  tokens. Validation passed local `python3 -m py_compile`, local
+  `install-helpers/verify-workloads-live-proof.py --self-test`, and the focused
+  `.50` synced-checkout helper gate. A patched read-only live run on
+  `Basement-Test-Workstation` (`172.20.0.15`) proves `mackesd` active at
+  `NRestarts=0`, root-only cloud-arm credential/drop-ins OK,
+  `state/cloud/Basement-Test-Workstation` fresh at **14.091 s** with
+  `construct_cloud`, `opentofu=up`, `ansible=up`, `libvirt=up`, and apply
+  armed, Podman `5.8.4` active, bootstrap SSH reachable, and a fresh
+  `event/vm/instances` roster for `peer:Basement-Test-Workstation`
+  **5.330 s** old with zero instances. The run still exits non-zero when
+  lifecycle/onboard proofs are required because `.15` has no retained
+  `action/vm/lifecycle` message and no successful `event/onboard/apply`
+  open-broker acknowledgement for either explicit candidate. KVM remains
+  honestly unclaimed: `/dev/kvm` is absent and CPU `vmx/svm` is absent, while
+  the libvirt `default` network and `mde-vms` pool are active.
 - Progress (2026-07-26 lifecycle op allowlist verifier): the read-only
   Workloads live-proof helper now refuses retained `action/vm/lifecycle`
   evidence whose `op` is outside the real VM lifecycle contract
@@ -743,6 +792,46 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-011 - Communications collaboration suite full replacement
 
 - Status: Remaining
+- Progress (2026-07-26 Mesh Teams near-parity survey lock): the operator
+  re-scoped Communications toward near Microsoft Teams parity for mesh
+  operators under the user-facing `Mesh Teams` name. Locked decisions: a
+  Teams-like visual model, one large integrated push, Teams + Channels as the
+  organizing hierarchy, direct/group messages rendered as channels, a Teams-style
+  app rail with the operator set (Activity, Teams, Calls, Files, Alerts,
+  Transfers, Clipboard, Settings), global Activity as the attention inbox,
+  Alerts folded into Activity while remaining rail-reachable, Transfers and
+  Clipboard available as contextual panels while remaining rail-reachable,
+  channel tabs for Posts/Files/Calls, rich details pane, multi-line rich
+  composer, `Ctrl+Enter` send with Enter newline, composer file/clipboard/
+  document create-and-attach, local-only reactions, local channel find but no
+  global Mesh Teams search, resolve/reopen threads, side thread pane, shared
+  pins plus private saved messages, ad-hoc channel meetings with channel Posts
+  as the meeting discussion, no recording/transcription, WebRTC P2P media first,
+  disabled-but-visible device controls until real providers enumerate, one
+  share flow with remote-control escalation, small-group scale (2-20), transfer-
+  first files, full IDE as the default document experience, real-time document
+  coauthoring required for completion, basic channel tasks/action items, full
+  two-way external Discord server integration, and glance-safe Car Mode limited
+  to alerts and calls. Explicit exclusions: @mentions, message priority,
+  scheduled messages, global search, emoji/GIF/sticker expression, slash/workflow
+  commands, recordings, and transcripts. This lock supersedes older WL-FUNC-011
+  details where they conflict, including flat spaces-only navigation, eight
+  primary mode tabs, Enter-to-send, one-pane Documents default, and suite-wide
+  search language. Linked visible-interface owner: WL-UX-010; this epic remains
+  the backing contract/worker/read-model owner.
+- Progress (2026-07-26 seat .15 Activity-tab performance): Communications /
+  Mesh Teams no longer publishes or paints an unbounded Activity history on
+  open. The core Activity read model now publishes only the newest 1,024
+  per-space rows while preserving newest-last order, and the egui Activity body
+  filters once then renders through `ScrollArea::show_rows` so a large retained
+  feed lays out only visible rows. Regression coverage includes a 2,000-row
+  Activity fixture that must keep painted shapes bounded. Farm evidence is green:
+  `.90` `cargo test -p mde-collab-egui activity -- --nocapture` **4/4**,
+  `.170` `cargo test -p mde-collab-core activity_feed -- --nocapture` **1/1**,
+  `.170` broader `cargo test -p mde-collab-core projection -- --nocapture`
+  **17/17** after updating the stale transfer fixture to mark transfers active
+  before pausing, and `.170` scoped touched-file `rustfmt --edition 2021
+  --check`.
 - Progress (2026-07-26 transfer-control state boundary): collaboration-core
   transfer admission now folds each transfer's current ledger state into the
   domain aggregate and rejects stale or malicious `ControlTransfer` commands
@@ -1136,21 +1225,25 @@ These decisions refine acceptance and sequencing for the active items below.
   collaboration context. The existing implementations contain substantial
   working behavior, so a superficial shell around them would leave competing
   stores, navigation, and ownership boundaries rather than deliver one product.
-- Required outcome: One complete `Communications` surface replaces all seven
-  surfaces without losing existing behavior. Collaboration spaces become the
-  organizing object, with messaging, documents, files, transfers, calls, alerts,
-  clipboard content, search, and assistive AI sharing one durable, offline-first
-  model. The replacement is released only after every surveyed requirement and
-  every current-feature parity row is runtime-reachable, tested, and accepted by
-  the operator.
+- Required outcome: One complete `Mesh Teams` Communications surface replaces
+  all seven surfaces without losing existing behavior. Collaboration teams and
+  channels become the organizing object, with messaging, documents, files,
+  transfers, calls, alerts, clipboard content, local find, basic tasks, Discord
+  bridging, and assistive AI sharing one durable, offline-first model. The
+  replacement is released only after every surveyed requirement and every
+  current-feature parity row is runtime-reachable, tested, and accepted by the
+  operator.
 - Scope: Full subsystem rewrite; shared collaboration contracts; mesh replication;
   one native egui surface; messaging and threads; document editing and review;
   file management and transfer; alerts; clipboard; voice/video/screen calls; SIP
-  interoperability; DigitalOcean-hosted LLM assistance; migration; rollback;
-  removal of superseded surfaces, workers, crates, state writers, routes, and
-  documentation. Recording, transcription, autonomous AI actions, a competing
-  suite-wide omnibox, per-space E2E encryption, partial release, and permanent
-  compatibility shims are out of scope.
+  interoperability; basic channel tasks; full two-way external Discord server
+  bridge; DigitalOcean-hosted LLM assistance; migration; rollback; removal of
+  superseded surfaces, workers, crates, state writers, routes, and documentation.
+  Recording, transcription, autonomous AI actions, @mentions, priority/urgent
+  messages, scheduled messages, emoji/GIF/sticker systems, slash/workflow
+  commands, a competing suite-wide omnibox/global Mesh Teams search, per-space
+  E2E encryption, partial release, and permanent compatibility shims are out of
+  scope.
 - Relevant files/components: new `crates/shared/mde-collab-types/`,
   `crates/services/mde-collab-core/`, and
   `crates/desktop/mde-collab-egui/`; `crates/desktop/mde-shell-egui/`;
@@ -1214,6 +1307,10 @@ These decisions refine acceptance and sequencing for the active items below.
    jobs, alert inbox, clipboard lane, presence, and call state. The egui surface
    reads projections and emits typed commands; it never owns authoritative state
    or calls provider APIs directly.
+6. Extend the contracts for the Teams + Channels hierarchy, channel meeting
+   records, resolve/reopen thread state, shared pinned messages, private saved
+   messages, basic channel tasks/action items, and Discord bridge provenance.
+   Keep message reactions local-only rather than signed collaboration events.
 
 #### Data flow, replication, and deletion
 
@@ -1244,32 +1341,30 @@ These decisions refine acceptance and sequencing for the active items below.
    `Surface::Editor`, and `Surface::Files` only at final parity. Migrate launcher
    pins, Start Search targets, toast routes, status actions, file-open requests,
    call handoffs, and saved last-surface state to Communications.
-2. Use one Office 97 Construct-themed frame built from shared `mde-egui::Style`.
-   A persistent left rail lists spaces. Focused mode tabs expose Activity,
-   Messages, Documents, Files, Transfers, Alerts, and Clipboard. Direct and
-   space-call controls feed one persistent call bar that survives mode and space
-   switches.
-3. First entry to a space opens Activity; later entries restore that space's last
-   focused mode. Activity is an action-oriented chronological feed of meaningful
-   messages, edits, comments, file changes, transfers, calls, and alerts, with
-   filters but no competing global search box.
+2. Use one Teams-familiar frame built from shared `mde-egui::Style`: a
+   Teams-style app rail, a Teams + Channels list, a channel header, contextual
+   channel tabs, a rich details pane, and one persistent call bar that survives
+   app/channel switches.
+3. First entry opens global Activity as the all-Mesh Teams attention inbox. A
+   channel opens Posts by default with contextual Files and Calls tabs; direct
+   and group messages are channels, not a separate Chat app.
 4. Desktop and narrow/tablet layouts keep a fixed split between the rail and
    content. Narrow mode compacts the rail to stable icon-sized geometry instead
    of hiding it. Menus, two-row editor toolbars, tabs, call controls, counters,
    and status areas have bounded dimensions and cannot shift or overlap as state
    changes.
-5. Connect Communications entities and actions to the existing main Start Search
-   index. Panel-local find and filters are allowed; a second suite-wide omnibox
-   is not. Notifications use badge counts plus the existing policy-driven toast
-   path and route into the exact originating space and object.
+5. Connect Communications entities and actions to existing shell launch/toast
+   routes and provide current-channel find. Do not add a global Mesh Teams search
+   surface. Notifications use badge counts plus the existing policy-driven toast
+   path and route into the exact originating channel and object.
 
 #### Messaging, alerting, and clipboard
 
-1. Every space has a Markdown conversation timeline and anchored threads. Enter
-   sends by default, drafts persist locally, delivery state is honest, and edits
-   and deletion are accepted only for the author's message during the first five
-   minutes. A later attempt remains visible as a denied action, not a silent
-   no-op.
+1. Every channel has a Markdown-backed conversation timeline, anchored threads,
+   and a multi-line rich composer. `Ctrl+Enter` sends, Enter inserts a newline,
+   drafts persist locally, delivery state is honest, and edits and deletion are
+   accepted only for the author's message during the first five minutes. A later
+   attempt remains visible as a denied action, not a silent no-op.
 2. Keep message and thread history until explicit deletion. Preserve sender,
    signature, timestamps, edit history, reply anchor, delivery state, and any
    linked document, file, alert, clipboard item, transfer, or call.
@@ -1286,10 +1381,10 @@ These decisions refine acceptance and sequencing for the active items below.
 #### Ultimate editor and document collaboration
 
 1. Markdown is the canonical document format and the original path remains the
-   source of truth. Document mode is the default and provides a one-pane
-   Source/Visual toggle, full block editing, ops-oriented templates, optional
-   outline, and an Office 97 menu plus two toolbars. Markdown is the only export
-   format; print and preview remain available but hidden from the default toolbar.
+   source of truth. The full embedded IDE/editor is the default channel document
+   experience; a lighter one-pane document mode may remain available but is not
+   the primary entry. Markdown is the only export format; print and preview
+   remain available but hidden from the default toolbar.
 2. Preserve every existing editor capability in a separate Project mode:
    rope-backed editing, undo/redo, multicursor and column selection, tree-sitter
    highlighting, LSP diagnostics/navigation/rename/format, tabs and split panes,
@@ -1316,9 +1411,10 @@ These decisions refine acceptance and sequencing for the active items below.
 
 #### Files and transfers
 
-1. Preserve complete local and mesh file-manager parity: list/grid/details,
-   sorting, hidden files, breadcrumbs, editable paths, history, tabs, dual pane,
-   Places/Mesh navigation, selection, drag/drop, previews, archives, search,
+1. Preserve complete local and mesh file-manager parity while presenting channel
+   files as transfer-first operational assets: list/grid/details, sorting, hidden
+   files, breadcrumbs, editable paths, history, tabs, dual pane, Places/Mesh
+   navigation, selection, drag/drop, previews, archives, local search,
    permissions, file operations, and honest degraded states.
 2. A space owns references, not a private folder. `FileRefId` maps a stable logical
    identity to owner node, canonical path, filesystem identity where available,
@@ -1405,10 +1501,12 @@ These decisions refine acceptance and sequencing for the active items below.
   3. Three nodes creating and editing data during partitions converge after
      reconnect without duplicate events, lost acknowledged work, invalid
      signatures, or resurrection of deleted content.
-  4. Markdown messages, threads, five-minute edit/delete, Activity, alert rules,
-     acknowledge/snooze, badges/toasts, and 100 MB arbitrary-MIME clipboard
+  4. Markdown messages, rich multi-line composer, composer file/clipboard/
+     document create-and-attach, local-only reactions, threads with resolve/
+     reopen, five-minute edit/delete, Activity, alert rules, acknowledge/snooze,
+     badges/toasts, local channel find, and 100 MB arbitrary-MIME clipboard
      sharing work with real persisted data and explicit failure states.
-  5. Document and Project modes satisfy every editor requirement, live CRDT
+  5. Full-IDE default document mode satisfies every editor requirement, live CRDT
      sessions converge, external writes produce a three-way review, comments and
      suggestions remain anchored, and history/Git behavior never destroys user
      data.
@@ -1424,9 +1522,9 @@ These decisions refine acceptance and sequencing for the active items below.
   9. DigitalOcean suggestions use only consented bounded context, are never
      applied automatically, retain provider/model attribution, cancel cleanly,
      and fail without impairing local collaboration.
-  10. Office 97 Construct styling, persistent rail, mode tabs, menus, toolbars,
-      call bar, dialogs, and dynamic text render without overlap at supported
-      desktop and narrow/tablet viewports.
+  10. Teams-familiar app rail, Teams + Channels list, channel header tabs, rich
+      Details pane, menus, toolbars, call bar, dialogs, and dynamic text render
+      without overlap at supported desktop and narrow/tablet viewports.
   11. Migration fixtures are repeatable and rollback-safe, the old/new parity
       ledger has no open rows, forbidden dependencies and private D-Bus names are
       absent, and all superseded runtime code is removed after cutover.
@@ -1434,6 +1532,9 @@ These decisions refine acceptance and sequencing for the active items below.
       feature at supported desktop and narrow/tablet sizes; no incomplete,
       disabled, placeholder, or deferred behavior remains. Human visual review
       is informative only and is not a release gate.
+  13. Basic channel tasks/action items and full two-way external Discord server
+      bridging have tested contracts, clear provenance, loop prevention, and
+      honest degraded/offline states.
 - Verification method: Unit and property tests cover event serialization,
   signatures, ordering, deduplication, permissions, message windows, tombstones,
   blob collection, CRDT convergence, three-way merge, file identity, transfer
@@ -1458,6 +1559,83 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-012 - Maps live-data overlays (zero-cost external feeds)
 
 - Status: Remaining
+- Progress (2026-07-26 AirNow/FIRMS default-on degraded mirrors): AirNow and
+  FIRMS now follow the same present-by-default Workstation overlay contract as
+  the other zero-cost feeds. AirNow starts unless
+  `MDE_OVERLAY_AIRNOW_AQI=0|false|no|off`, publishes an honest unconfigured
+  mirror when the sealed key is absent, and keeps prior-location stations out
+  of degraded no-fix/failed-refresh output; `docs/design/maps-live-overlays.md`
+  now documents the false-y opt-out contract instead of the old opt-in wording.
+  FIRMS starts unless explicitly disabled, publishes honest unconfigured/no-fix
+  mirrors, withholds prior-location hotspots on failed refresh, and clears
+  private stale hotspot state so old thermal detections cannot replay as live.
+  Farm evidence is green: `.50` `cargo test -p mackesd --lib --features
+  async-services workers::air_quality_overlay::tests -- --nocapture` at
+  **10/10**, `.90` `cargo test -p mackesd --lib --features async-services
+  workers::firms_overlay::tests -- --nocapture` at **12/12**, `.50`/`.90`
+  scoped rustfmt for the touched AirNow/FIRMS worker files, and local
+  `git diff --check`. Live AirNow/FIRMS credentials and a fresh MG90 fix remain
+  external acceptance evidence, not blockers.
+- Progress (2026-07-26 ADS-B/Caltrans/NWS forecast default-on degraded
+  mirrors): three more zero-cost Workstation overlay producers now publish
+  present retained degraded mirrors instead of leaving catalog topics absent
+  when same-host vehicle context is missing. `aircraft_overlay` now starts by
+  default unless `MDE_OVERLAY_ADSB_LOL=0|false|no|off`, constructs its blocking
+  adsb.lol HTTP client only inside the blocking fetch path, publishes an empty
+  licensed `state/overlay/adsb-aircraft/<node>` snapshot for no fresh MG90 fix,
+  and clears prior vehicle-scoped aircraft/query origin so stale low-altitude
+  tracks cannot replay. `caltrans_camera_overlay` now defaults on when
+  `MDE_OVERLAY_CALTRANS_DISTRICT=1..12` is configured unless
+  `MDE_OVERLAY_CALTRANS_CAMERAS=0|false|no|off`, publishes an empty licensed
+  `state/overlay/caltrans-cameras/<node>` no-fix mirror, clears old
+  vehicle-scoped camera rows, and keeps blocking reqwest clients inside
+  blocking fetch calls. `nws_forecast_overlay` now defaults on unless
+  `MDE_OVERLAY_NWS_FORECAST=0|false|no|off`, publishes a fresh zero-sample
+  public-domain degraded `state/overlay/nws-forecast/<node>` mirror for
+  no-fix/failed-refresh paths, clears query lat/lon/heading/feed time, and
+  drops `last_good` so prior-location forecast rows cannot replay. Focused farm
+  evidence is green on the current integrated tree: `.90`
+  `cargo test -p mackesd --lib --features async-services
+  workers::aircraft_overlay::tests -- --nocapture` at **14/14**, `.170`
+  `cargo test -p mackesd --lib --features async-services
+  workers::caltrans_camera_overlay::tests -- --nocapture` at **10/10**, `.130`
+  `cargo test -p mackesd --lib --features async-services
+  workers::nws_forecast_overlay::tests -- --nocapture` at **11/11**, and `.50`
+  direct `rustfmt --edition 2021 --check` for the three touched worker files.
+  Package-wide `cargo fmt -p mackesd -- --check` still reports unrelated
+  pre-existing formatting drift outside these files, so this slice uses scoped
+  touched-file formatting evidence. Live `.15` package deployment and catalog
+  audit remain follow-up proof before claiming these three topics present on an
+  installed seat.
+- Progress (2026-07-26 NCDOT/MBTA/NIFC default-on degraded mirrors): three
+  additional zero-cost Workstation overlay producers now publish present
+  retained degraded mirrors instead of leaving catalog topics absent when
+  same-host vehicle context is missing. `traffic_overlay` now starts by default
+  unless `MDE_OVERLAY_NCDOT_TRAFFIC=0|false|no|off`, constructs its blocking
+  ArcGIS/reqwest client only inside the blocking fetch path, publishes an empty
+  licensed `state/overlay/ncdot-traffic/<node>` snapshot for no fresh North
+  Carolina vehicle fix, and clears prior vehicle-scoped incident rows/query
+  origin so stale NCDOT events cannot replay. `transit_overlay` now starts by
+  default unless `MDE_OVERLAY_MBTA_TRANSIT=0|false|no|off`, keeps the MBTA
+  blocking client lifetime inside the blocking fetch path, publishes an empty
+  licensed `state/overlay/gtfs-transit/<node>` no-fix mirror, and clears
+  `last_good` so stale prior-location vehicle rows cannot replay.
+  `wildfire_overlay` now starts by default unless
+  `MDE_OVERLAY_NIFC_WILDFIRE=0|false|no|off`, keeps the WFIGS blocking client
+  lifetime inside the blocking fetch path, publishes an empty licensed
+  `state/overlay/nifc-wildfire/<node>` no-fix mirror, and clears stale
+  vehicle-scoped fire perimeters. Focused farm evidence is green on the current
+  integrated tree: `.90`
+  `cargo test -p mackesd --lib --features async-services
+  workers::traffic_overlay::tests -- --nocapture` at **13/13**, `.170`
+  `cargo test -p mackesd --lib --features async-services
+  workers::transit_overlay::tests -- --nocapture` at **16/16**, `.130`
+  `cargo test -p mackesd --lib --features async-services
+  workers::wildfire_overlay::tests -- --nocapture` at **12/12**, farm
+  touched-file rustfmt is green for the three worker files, and local
+  `git diff --check -- crates/mesh/mackesd/src/workers/{traffic_overlay.rs,transit_overlay.rs,wildfire_overlay.rs}`
+  is clean. Live `.15` package deployment and catalog audit remain follow-up
+  proof before claiming these three topics present on an installed seat.
 - Progress (2026-07-26 live `.15` Airspace ready-state correction): live
   MG90 root SSH from `.15` was already reachable on `172.20.0.25:2222`, and
   the configured credential-file path worked without exposing the secret. The
@@ -2027,11 +2205,458 @@ These decisions refine acceptance and sequencing for the active items below.
   (plan help-me-plan-new-hazy-muffin.md; research workflow wf_6731d411-455;
   operator rulings: external-feeds emphasis, vehicle lens, zero-cost only).
 
+### WL-FUNC-014 - Music interface LAN AirSonic mesh gateway
+
+- Status: Remaining
+- Progress (2026-07-26 Music autoconfig gateway credential materialization):
+  `music_autoconfig` now prefers manually registered AirSonic gateway sources
+  over the legacy shared `media-registry.json` account path. When a gateway
+  source exists it selects through the existing healthy/default failover logic,
+  resolves the source's sealed `credential_ref` through `SecretStore`, and
+  writes only the mesh gateway proxy URL plus sealed username/password into the
+  seated user's `airsonic-creds.json`. Secret bodies are constrained to the
+  Subsonic auth pair and reject `server_url` override attempts, so credential
+  material cannot redirect clients back to a direct LAN URL or `music.mesh`.
+  If gateway sources exist but credentials are absent or malformed, the worker
+  reports materialization pending and does not silently configure legacy
+  `music.mesh`. Farm evidence is green: `.50` `cargo test -p mackesd
+  music_autoconfig -- --nocapture` passed **16/16**, `.90` single-file
+  `rustfmt --edition 2021 --check
+  crates/mesh/mackesd/src/workers/music_autoconfig.rs` passed, and scoped
+  `git diff --check` passed. Broad `cargo fmt -p mackesd -- --check` remains
+  blocked by unrelated pre-existing formatting drift outside this slice.
+- Progress (2026-07-26 gateway source model): `mackesd::mesh_media` now has the
+  first durable AirSonic gateway source contract: a replicated
+  `airsonic-gateway-registry.json`, validated `AirsonicGatewayRegistration`,
+  `GatewayHealth`, client-facing `AirsonicGatewaySource`, canonical LAN upstream
+  URL handling, sealed credential references only, explicit rejection of the
+  legacy `music.mesh` URL as a gateway upstream, gateway-proxy source URLs,
+  upstream dedupe, healthy/default tie-breaks, last-selected healthy source
+  selection, and a QNM-Shared plane reader for single or list registry documents.
+  Farm evidence is green: `.50` `cargo test -p mackesd mesh_media --
+  --nocapture` **28/28**, including the new gateway source tests, and `.170`
+  scoped touched-file `rustfmt --edition 2021 --check`.
+- Priority: P1
+- Complexity: Epic
+- Problem: The Music interface's AirSonic/Subsonic method is incomplete and still
+  carries older Navidrome / `music.mesh` assumptions. Mesh users need to use an
+  AirSonic server located on any mesh node's local LAN from every node in the
+  mesh, without requiring each client to be on that LAN.
+- Required outcome: A node admin can manually register a LAN-reachable AirSonic
+  server on the gateway node; the gateway publishes a mesh-reachable
+  proxy/service source; all mesh Music clients can browse and play through that
+  source; multiple servers are supported with one mesh default; last-selected
+  healthy server wins per user; the same upstream server is deduplicated across
+  gateways while gateway health and failover remain visible; and the old
+  Navidrome / `music.mesh` path is replaced rather than kept as the primary
+  Music model.
+- Scope: Native Music interface, `mde-musicd` Subsonic/AirSonic client,
+  `mackesd` media registry/autoconfig/service registration, gateway/proxy
+  publication, sealed credential materialization, role-gated playback/playlist/
+  scan permissions, metadata/audio cache, and live proof helpers. Out of scope:
+  routing whole LAN subnets over Nebula, requiring the AirSonic host itself to
+  join the mesh, and general AirSonic server administration beyond triggering a
+  library scan.
+- Relevant files/components: `crates/desktop/mde-music-egui/`,
+  `crates/services/mde-musicd/`,
+  `crates/mesh/mackesd/src/workers/music_autoconfig.rs`,
+  `crates/mesh/mackesd/src/workers/media_registry.rs`,
+  `crates/mesh/mackesd/src/mesh_media.rs`,
+  `crates/mesh/mackesd/src/workers/app_sync.rs`, and Music/media proof helpers
+  under `install-helpers/`.
+- Acceptance criteria: manual node-admin registration stores URL plus sealed
+  shared read-only credentials; clients materialize credentials through a
+  controlled worker; full Subsonic features are available in the Music UI,
+  including browse, play, search, playlists, internet radio, podcasts, and scan
+  trigger; metadata and recently played audio cache survive temporary AirSonic
+  outages; degraded gateway status is visible and failover selects another
+  healthy gateway/source when available; access to stream, playlist, and scan
+  actions is role/capability gated; and stale Navidrome / `music.mesh`
+  assumptions are removed or archived.
+- Verification method: focused farm tests for Subsonic client features, gateway
+  registry/proxy publication, sealed credential materialization, dedupe/failover,
+  role gates, and cache behavior; integrated Music + `mackesd` media tests;
+  worklist lint; and live proof where one mesh node proxies a LAN AirSonic server
+  for another mesh node.
+- Origin or merged source IDs: 2026-07-26 operator AirSonic survey: gateway
+  proxy, multiple servers plus default, manual registration, node-admin
+  authority, shared read-only sealed credentials, last/default selection,
+  degraded failover, deduped gateway health, full Subsonic feature set,
+  scan-only admin action, metadata plus recently played audio cache, role-based
+  access, replace Navidrome / `music.mesh`, farm plus live LAN proof.
+
+### WL-FUNC-015 - Media Workspace LAN Jellyfin mesh gateway
+
+- Status: Remaining
+- Progress (2026-07-26 live Jellyfin upstream probe): the operator-supplied
+  Jellyfin server at `http://172.20.0.2:8096` is reachable from the dev host and
+  from DELL-LAPTOP through the seat network path. Public server info reports
+  Jellyfin `10.10.5`, server name `fileserver`, server id
+  `91cebca439cd4212a1b82a2fd8ca35ea`, and startup wizard complete. The supplied
+  administrator credentials authenticated successfully from both paths without
+  printing or storing the access token. A read-only library probe returned three
+  views, 50 sampled playable items with 50 media sources, and aggregate counts
+  of 2045 movies, 23 series, and 755 episodes. This proves a real upstream is
+  available for WL-FUNC-015 follow-on gateway/live-stream testing; it does not
+  by itself claim mesh gateway registration, range streaming, or playback-resume
+  role gates complete.
+- Progress (2026-07-26 gateway Connect/user sentinel): Media Workspace gateway
+  rows now have an actionable Connect path for healthy gateway sources that
+  carry a sealed `credential_ref`. The controller builds a gateway-scoped
+  `JellyfinClient` from the active mesh source without adding anything to the
+  local `ServerStore`, using a non-secret placeholder token plus the shared
+  `JELLYFIN_GATEWAY_USER_SENTINEL` instead of materializing the real upstream
+  Jellyfin user id. The `media_jellyfin_proxy` strips client-supplied Jellyfin
+  auth query params before forwarding, injects the server-side
+  `Authorization`, and rewrites the sentinel in upstream paths, query strings,
+  and UTF-8 request bodies from sealed credential material; missing/invalid
+  `user_id` fails as an honest 503. Farm evidence is green: `.170`
+  `cargo test -p mackes-mesh-types media_sources -- --nocapture` **1/1**,
+  `.90` `cargo test -p mackesd --lib --features async-services
+  media_jellyfin_proxy -- --nocapture` **10/10**, `.130`
+  `cargo test -p mde-media-egui sources_view_renders_mesh_jellyfin_gateway_rows
+  -- --nocapture` **1/1**, and `.130` `cargo test -p mde-media-egui
+  mesh_gateway_jellyfin -- --nocapture` **2/2**. A stale `.50`
+  `mesh_gateway_jellyfin` run failed before the fixture added `Debug`; it is
+  superseded by the green `.130` rerun. Remaining WL-FUNC-015 layers are true
+  streaming/range and live cross-node proof, playback-progress/resume role
+  gates, and metadata/artwork/recent-playback cache behavior through outages.
+- Progress (2026-07-26 Media Workspace source preference/failover): the Media
+  Workspace now keeps a user-preferred mesh Jellyfin source outside the local
+  `ServerStore`, marks the active mesh route in Sources, and applies the
+  WL-FUNC-015 failover order without materializing fake credentials: healthy
+  preferred source, healthy mesh default, any healthy source, visible degraded
+  default, then first visible degraded row. Degraded rows remain visible with an
+  honest unavailable state while Connect stays credential-materialization gated.
+  Evidence: `.90` `cargo test -p mde-media-egui mesh_jellyfin_selection -- --
+  nocapture` **1/1**, `.50` `cargo test -p mde-media-egui
+  sources_view_renders_mesh_jellyfin_gateway_rows -- --nocapture` **1/1**,
+  `.170` touched-file `rustfmt --edition 2021 --check`.
+- Progress (2026-07-26 Jellyfin gateway proxy responder): `mackesd` now has a
+  dedicated `media_jellyfin_proxy` worker, spawned and registered alongside the
+  media workers, that serves `/mde/jellyfin/<source-id>/...` for registered
+  gateway sources. Gateway source URLs now use a proxy-specific port `8097`
+  instead of direct Jellyfin `8096`, avoiding bind collisions with a real local
+  Jellyfin server and preventing the descriptor probe from advertising the proxy
+  as a direct Jellyfin instance. The worker reads the replicated
+  `jellyfin-gateway-registry.json` plane, filters sources to this gateway node,
+  rejects unknown/degraded sources honestly, strips the gateway prefix into the
+  LAN upstream path/query, resolves the sealed `credential_ref` through
+  `SecretStore`, accepts minimal JSON or env-style read-only token bodies, strips
+  client auth/hop-by-hop headers, injects server-side Jellyfin
+  `Authorization`, and streams upstream responses back without exposing tokens
+  to clients. `mde-jellyfin` now has fixture proof that gateway base paths are
+  preserved for browse and playback-info request builders. Farm evidence is
+  green: `.50` `cargo test -p mackesd --lib --features async-services jellyfin
+  -- --nocapture` **21/21**, `.90` `cargo test -p mde-jellyfin
+  gateway_base_path -- --nocapture` **2/2**, `.130` `cargo test -p
+  mde-media-egui sources -- --nocapture` **12/12**, `.170` `cargo test -p
+  mackes-mesh-types media_sources -- --nocapture` **1/1**, `.90` direct
+  touched-leaf `rustfmt --check --edition 2021`, and local scoped
+  `git diff --check`. Remaining WL-FUNC-015 layers are Media Workspace gateway
+  Connect/user binding without leaking Jellyfin user ids, true streaming/range
+  and live cross-node proof, playback-progress/resume role gates, and
+  metadata/artwork/recent-playback cache behavior through outages.
+- Progress (2026-07-26 shared wire + Media Workspace visibility): the
+  `state/media/sources` roster now has a shared schema in
+  `mackes_mesh_types::media_sources` instead of living only inside `mackesd`,
+  covering `MEDIA_SOURCES_TOPIC`, `MediaKind`, `MediaProtocol`, `Reachability`,
+  `SourceOrigin`, `MediaSource`, `LaneStatus`, and `MediaSourcesState`. `mackesd`
+  imports that shared schema and still publishes the same gateway/direct/mDNS
+  roster. The Media Workspace now depends on the shared schema plus a local
+  `mde-bus` `Persist` reader, refreshes the retained
+  `state/media/sources` record on a coarse cadence, projects Jellyfin gateway
+  rows separately from the local Jellyfin `ServerStore`, renders healthy/default
+  gateway rows ahead of direct discoveries, keeps degraded gateways visible with
+  their reason, shows proxy endpoint/upstream/sealed `credential_ref`, and leaves
+  Connect disabled with an honest credential-materialization-pending note so no
+  plaintext token or fake saved server is invented. Farm evidence is green:
+  `.90` `cargo test -p mackes-mesh-types media_sources -- --nocapture` **1/1**,
+  `.50` `cargo test -p mackesd --lib --features async-services media_sources --
+  --nocapture` **20/20**, and `.130` `cargo test -p mde-media-egui sources --
+  --nocapture` **12/12**. Superseded remaining layer note: the actual gateway
+  proxy responder has since landed; Media Workspace Connect/user binding and
+  full browse/play/progress proof remain.
+- Progress (2026-07-26 `state/media/sources` gateway bridge): `mackesd` now
+  lifts replicated Jellyfin gateway records into the generic Media Sources
+  roster instead of leaving them only in `mesh_media`. The
+  `media_sources` worker reads `jellyfin-gateway-registry.json` from the
+  QNM-Shared plane, publishes gateway rows with `SourceOrigin::Gateway`,
+  `gateway_node`, canonical `upstream_key`, sealed `credential_ref`, and
+  `mesh_default`, keeps degraded gateways visible with an honest reason, sorts
+  healthy/default gateway rows ahead of direct discoveries, and dedupes direct
+  mDNS rows for the same upstream. The worker now reports an explicit `gateway`
+  lane alongside `mesh-registry` and `mdns`. Farm evidence is green on `.50`:
+  `cargo test -p mackesd --lib --features async-services media_sources --
+  --nocapture` **20/20**, covering gateway projection, default-over-direct mDNS,
+  degraded visibility, and QNM-Shared plane folding. The next implementation
+  layer remains Media Workspace UI consumption of `state/media/sources`, shared
+  wire types, and sealed credential materialization.
+- Progress (2026-07-26 gateway source model): `mackesd::mesh_media` now has the
+  first durable Jellyfin gateway source contract: a replicated
+  `jellyfin-gateway-registry.json`, validated `JellyfinGatewayRegistration`,
+  client-facing `JellyfinGatewaySource`, canonical LAN upstream URL handling
+  shared with AirSonic, sealed credential/token references only, explicit
+  rejection of the legacy `music.mesh` URL as a gateway upstream, gateway-proxy
+  source URLs, upstream dedupe, healthy/default tie-breaks, last-selected
+  healthy source selection, and a QNM-Shared plane reader for single or list
+  registry documents. Farm evidence is green: `.50` `cargo test -p mackesd
+  mesh_media -- --nocapture` **35/35**, including the new Jellyfin gateway
+  source tests, and `.50` scoped touched-file `rustfmt --edition 2021 --check`.
+  The next implementation layer remains `state/media/sources` visibility plus
+  Media Workspace gateway rows and sealed credential materialization.
+- Priority: P1
+- Complexity: Epic
+- Problem: The Media Workspace can already model Jellyfin servers, but its live
+  path still assumes each server is directly mesh/LAN reachable from the client
+  or that each user handles connection state locally. Mesh users need to use a
+  Jellyfin server located on any mesh node's local LAN from every node in the
+  mesh, without requiring the Jellyfin host itself or every client to join that
+  LAN.
+- Required outcome: A node admin can manually register a LAN-reachable Jellyfin
+  server on the gateway node; the gateway publishes a mesh-reachable
+  proxy/service source; the native Media Workspace lists that source as the
+  primary Jellyfin path; all mesh Media clients can browse, play, and resume
+  through it using sealed shared read-only credentials; multiple servers are
+  supported with one mesh default; last-selected healthy server wins per user;
+  direct mDNS/mesh-discovered Jellyfin rows are secondary and merge into the same
+  source model; and the same upstream server is deduplicated across gateways
+  while gateway health and failover remain visible.
+- Scope: Native Media Workspace, `mde-jellyfin`, `mackesd` media
+  registry/source discovery/service registration, gateway/proxy publication,
+  sealed credential materialization, playback/resume state through the shared
+  Jellyfin account, metadata/artwork/recent-playback cache, role-gated playback
+  actions, and live proof helpers. Out of scope: routing whole LAN subnets over
+  Nebula, requiring the Jellyfin host itself to join the mesh, general Jellyfin
+  server administration, full offline downloads, and making external Delfin
+  launchers the primary surface.
+- Relevant files/components: `crates/desktop/mde-media-egui/`,
+  `crates/desktop/mde-jellyfin/`,
+  `crates/mesh/mackesd/src/workers/media_sources.rs`,
+  `crates/mesh/mackesd/src/workers/media_jellyfin_proxy.rs`,
+  `crates/mesh/mackesd/src/workers/media_registry.rs`,
+  `crates/mesh/mackesd/src/mesh_media.rs`,
+  `crates/mesh/mackesd/src/workers/app_sync.rs`, and Media/Jellyfin proof
+  helpers under `install-helpers/`.
+- Acceptance criteria: manual node-admin registration stores URL plus sealed
+  shared read-only Jellyfin credentials/token; clients materialize credentials
+  through a controlled worker; the Media Workspace natively lists gateway
+  Jellyfin sources ahead of direct discoveries while merging/deduplicating both;
+  browse, artwork, play, direct-play/direct-stream/transcode fallback, progress
+  reporting, resume, and watched-state updates work through the published source;
+  metadata, artwork, and recent playback state survive temporary gateway or
+  upstream outages without claiming full offline availability; degraded gateway
+  status is visible and failover selects another healthy gateway/source when
+  available; last-selected healthy server wins per user with a mesh default
+  fallback; access to stream/progress actions is role/capability gated; and no
+  library-admin writes are exposed through the shared account.
+- Verification method: focused farm tests for Jellyfin gateway registration,
+  proxy publication, sealed credential materialization, source merge/dedupe,
+  failover/default selection, Media Workspace native source behavior,
+  playback-sync permissions, role gates, and cache behavior; integrated
+  `mde-media-egui` + `mde-jellyfin` + `mackesd` media tests; worklist lint; and
+  live proof where one mesh node proxies a LAN Jellyfin server for another mesh
+  node.
+- Origin or merged source IDs: 2026-07-26 operator follow-up to mirror
+  WL-FUNC-014 for Jellyfin services and the Media Workspace: LAN gateway proxy,
+  new sibling epic, sealed shared read-only credentials, last-selected healthy
+  defaulting, upstream dedupe across gateways, playback sync/resume allowed,
+  metadata/artwork/recent-playback cache, native Media Workspace exposure,
+  gateway registrations primary over direct discovery, and farm plus live LAN
+  proof.
+
 ## User Interface And Experience
 
 ### WL-UX-006 - Construct interface (Apple-HIG-principled workstation shell)
 
 - Status: Remaining
+- Progress (2026-07-26 Dell all-patches F44 package deployment): BigBoy `.130`
+  slot `dell-all-patches` cut the Fedora 44 base/Browser/thin-lighthouse RPMs
+  with size gates green: base **81.9 MiB**, Browser **39.1 MiB**, and
+  Lighthouse **11.2 MiB**. The Dell-installed artifacts were base sha256
+  `34fa89260f2d06960a6fce42bec82932bff525298ae4f1c4f2aa23e2c9e1a6c7` and
+  Browser sha256
+  `10c751f248316f60c3ada053a4cd3fc300848d098b18078ec288ae7601ca0cac`; both
+  copied through `.15` to
+  `/home/mm/mcnf-rpms/dell-all-patches-20260726-f44/` with matching hashes.
+  Dell passed `rpm -Uvh --test --replacepkgs --force --nosignature`, installed
+  both RPMs, and recovered through the known systemd transport-reset/scriptlet
+  class. `mackesd` hung in `deactivating/stop-sigterm` during restart and was
+  force-cleared with `systemctl kill -s KILL mackesd.service`, then restarted
+  cleanly. Final Dell proof: `rpm -V magic-mesh magic-mesh-browser` emitted no
+  differences; `mackesd`, `mde-shell-egui`, and `nebula` are active with
+  `NRestarts=0`; deployed hashes are `mackesd`
+  `10c9c7df0f44fdd5a107ac226f74eeb61074ff9f19a5eccb96be76a63fe07d4d`,
+  shell `69de7b235c664c400bd9f448c33c853ecc5e59f3165eae797ace29fe1212ebe5`,
+  `mde-web-preview`
+  `01fe978d765c8ccb66598e3117eef09352dfbb6c65094193233af6ed7527e134`,
+  `mde-web-cef`
+  `00a6c9bab50432b589db2725a66c77c2bbfbd2265c6f73458dd6036f4b177aaa`, and
+  CEF renderer
+  `5a310d7fe24f1840f2b5d0e1675750f50ee9b8903720fad0e73633968bbe770e`.
+  Audio post-install proof stayed real, not Dummy Output: `mm` is in `audio`,
+  PipeWire/PipeWire Pulse/WirePlumber are active, `wpctl` reports Built-in Audio
+  Analog Stereo sink/source, `pactl` default sink/source point at
+  `alsa_output.pci-0000_00_1f.3.analog-stereo` and
+  `alsa_input.pci-0000_00_1f.3.analog-stereo`, and `speaker-test -D default -c2
+  -t sine -f 880 -l1` opened Front Left/Front Right successfully. A
+  post-install Jellyfin probe from Dell still authenticated to
+  `fileserver`/Jellyfin `10.10.5` at `172.20.0.2:8096`. The only recent warning
+  in the package recovery window is the intentional KILL used to clear the stuck
+  `mackesd` stop.
+- Progress (2026-07-26 Browser rendered-page duplicate keypress fix): focused
+  rendered Browser pages now suppress plain printable raw `egui::Event::Key`
+  events when the same input frame also carries committed text or an IME commit,
+  leaving the text/IME path as the single source of character insertion while
+  preserving bare-key fallback and browser-reserved shortcuts. Regression proof
+  is green: `.90` `cargo test -p mde-shell-egui
+  browser_body_input_is_localized_and_keyboard_is_focus_gated -- --nocapture`
+  passed **1/1**, proving a focused page forwards bare `Key(A)` when no text
+  accompanies it and does not forward `Key(A)` when `Text("mesh")` is in the
+  same frame; `.50` `cargo test -p mde-shell-egui
+  ctrl_t_opens_a_new_tab_intent_and_never_leaks_into_the_page -- --nocapture`
+  passed **1/1**; BigBoy `.130` file-scoped `rustfmt --edition 2021 --check`
+  passed for the touched Browser files. This is pending Dell RPM deployment and
+  live seat proof.
+- Progress (2026-07-26 Dell audio installer/live remediation): DELL-LAPTOP's
+  "no audio" state was traced to a healthy PipeWire/WirePlumber stack without
+  user access to `/dev/snd` plus missing hard installer requirements for the
+  Pulse compatibility service, UCM profiles, SOF firmware, and ALSA diagnostics.
+  The live seat was remediated by installing `pipewire-pulseaudio`,
+  `pipewire-alsa`, `pipewire-utils`, `pulseaudio-utils`, `alsa-utils`, and
+  `alsa-ucm`, then adding `mm` to the local `audio` group and restarting the
+  user audio graph. Post-fix proof on Dell shows `mm` in `audio`, `pipewire`,
+  `pipewire-pulse`, and `wireplumber` active, `wpctl status` showing
+  `Built-in Audio Analog Stereo` sink/source instead of Dummy Output, `pactl`
+  default sink/source on the HDA Intel PCH/ALC3246 path, and `speaker-test -D
+  default -c2 -t sine -f 880 -l1` opening Front Left/Front Right successfully.
+  The base RPM now hard-requires `pipewire-pulseaudio`, `alsa-ucm`,
+  `alsa-sof-firmware`, and `alsa-utils`, and its post-install grants existing
+  `mm`/`mde` users local `audio` group membership when that group exists. Farm
+  evidence is green: `.170` and `.50` both passed `cargo test -p mackesd
+  base_rpm_ships_and_enables_the_drm_seat_unit --features async-services --
+  --nocapture` **1/1**.
+- Progress (2026-07-26 Terminal input-side repaint fix): the Terminal
+  typing/cursor-lag defect now has input-side repaint coverage in addition to
+  the existing output wake path. `LocalPty::send_input` wakes the installed
+  repaint waker on accepted non-empty input, `TerminalWidget::show` proves it
+  installs the repaint waker, and output wake coverage remains intact. Farm
+  evidence is green: `.50`
+  `send_input_fires_the_repaint_waker_when_input_is_accepted` **1/1**, `.90`
+  output-waker regression **1/1**, `.170` widget repaint-waker test **1/1**, and
+  `.130` `cargo fmt -p mde-term-egui -- --check` clean. Dell package deployment
+  and live seat proof are still pending.
+- Progress (2026-07-26 Springboard Dock Infra/Ops/Life grouping): the operator
+  survey answer for dock grouping is now encoded as a dock-specific contract:
+  **Infra** = VMs (`Remote Sessions`) + Terminal, **Ops** = Maps & Location +
+  Mesh Teams + File Manager (`Files`), and **Life** = Music + Media + Browser.
+  `surfaces.rs` now
+  carries `DOCK_LAUNCHER_GROUPS` separately from the complete Springboard /
+  Spotlight taxonomy, so Fleet & Mesh, Infra as Code, Bookmarks, Phones, and
+  This Node remain reachable from the full launcher/search surfaces without
+  bloating the always-present dock. `nav_bar.rs` paints the three labels in
+  floating and docked modes, preserves Back/Home/Pin first, adds app launcher
+  hit targets with dock-specific VMs/File Manager labels, and emits
+  `Action::OpenSurface` through the existing shell
+  navigation seam. It also keeps chooser-pinned desktop sources visible after
+  the grouped app controls while capping docked pins to the vertical rail's
+  available height. Farm evidence is green: `.130` focused
+  `cargo test -p mde-shell-egui nav_bar -- --nocapture` passed **22/22**
+  including `dock_launcher_accessibility_labels_use_operator_terms` and
+  non-zero-origin grouped-app hit targets; `.50`
+  `cargo test -p mde-shell-egui dock_launcher -- --nocapture` passed **2/2**
+  covering the dock contract and dock-specific VMs/File Manager labels; earlier
+  `.90` evidence remains green for `nav_bar --no-run`, focused `nav_bar`
+  **21/21**, survey contract **1/1**, and scoped `rustfmt --check --edition
+  2021 --config skip_children=true` for `main.rs`, `nav_bar.rs`, and
+  `surfaces.rs`. New regression coverage includes non-zero-origin pointer
+  clicks for every grouped app target, directly covering the prior `.15`
+  nav-pill trigger-offset bug class.
+- Progress (2026-07-26 Terminal typing/cursor lag live bug): the operator
+  reported that Terminal rendering falls behind while typing, leaving the
+  displayed cursor incorrect. This is now a WL-UX-006 live-acceptance defect
+  against the Terminal-in-Construct path. Current source already includes the
+  intended low-latency seams in `mde-term-egui`: `LocalPty` exposes a repaint
+  waker fired once per non-empty PTY output batch, `TerminalWidget::show`
+  installs `egui::Context::request_repaint` on first frame, input is handled
+  before the visible screen snapshot, and local typed bytes are captured as a
+  one-frame `input_echo` for split/broadcast consistency. Remaining acceptance
+  is to verify or patch any missing input-side repaint edge, run focused
+  `mde-term-egui` farm proof, and deploy/prove the corrected package on the
+  affected seat; do not claim the live `.15` symptom fixed until that proof
+  lands.
+- Progress (2026-07-26 Mesh Teams + This Node interface fold): the shell now
+  exposes `Surface::Communications` as the user-facing `Mesh Teams` interface,
+  using a repo-native Teams-inspired group/chat glyph tinted with the shared
+  Teams-blue token `#505AC9`; legacy `communications`/`comms` routes remain
+  accepted and new `mesh-teams`/`teams` routes resolve to the same live surface.
+  System, Storage, and About are removed from the public launcher catalog and
+  folded into one `This Node` interface with System/Storage/About tabs; legacy
+  deep links still normalize into `This Node` with the matching tab selected.
+  Farm evidence is green: `.130`
+  `taxonomy_covers_every_launchable_surface_once` **1/1**, `.170`
+  `legacy_node_surfaces_normalize_into_this_node_tabs` **1/1**, `.90`
+  `car_home_tiles_and_default_key_bindings_cover_the_vehicle_apps` **1/1**,
+  `.130` `reach1_every_surface_has_a_goto_verb` **1/1**, `.170`
+  `every_routed_surface_records_a_menubar_posture` **1/1**, `.90`
+  `mde-theme` icon raster/name gates **2/2**, `.50` scoped rustfmt for touched
+  shell/theme files, `.50` `cargo test -p mde-shell-egui surfaces -- --nocapture`
+  **25/25**, `.90` `cargo test -p mde-theme -- --nocapture` **21/21** plus
+  doc-test ignore, and local `git diff --check`. A follow-up active proof
+  helper audit found no remaining live launcher/car UI label displaying
+  "Communications"; legacy `communications`/`comms` routes remain deliberate,
+  and the stale pixel-proof diagnostics now say Mesh Teams. Live seat visual
+  proof is still separate hardware acceptance evidence.
+- Progress (2026-07-26 iPadOS Desktop Dock execution plan): the operator
+  reversed the previous no-dock/all-icons Springboard direction for WL-UX-006.
+  Execute this as a durable governance/design-lock update, not a prototype:
+  normal Construct surfaces get a bottom-centered always-visible Dock; every
+  current launcher is reachable from that Dock with shrink-to-fit cells; Fleet &
+  Mesh, Infra as Code, Remote Sessions, and Terminal fold into one mesh-accented
+  Ops stack; the Home desktop becomes icon-free and paints the daily Microsoft
+  Bing wallpaper through the existing wallpaper policy/cache with cached and
+  bundled fallbacks; the subtle watermark/About link remains; wallpaper
+  click/tap stays passive; and Super / pull-down remain the Front Door entry
+  points. Completion requires farm tests plus live DRM/Sunshine/pixel proof when
+  hardware is available, while focused immersive VDI keeps its full-screen pixel
+  guarantee unless a later operator lock explicitly reverses it.
+- Progress (2026-07-26 `.15` Springboard Dock package-clean physical replay):
+  live `.15` unclickability was traced to the shell curtain owning the top
+  foreground layer after repeated proof restarts, not to bad touch-coordinate
+  mapping. The non-production test-seat Bus policy at
+  `/run/mde-bus/power-honor.json` now keeps `require_login_at_boot=false`
+  (backup: `/run/mde-bus/power-honor.json.pre-seat15-nav-fix`), so the
+  Springboard Dock can be exercised after shell restarts without the secure
+  curtain consuming every hit. BigBoy `.130` slot
+  `seat15-correction-f44v3` cut the Fedora 44 base/Browser RPMs with payload
+  gates green (base **81.8 MiB**, Browser **39.1 MiB**, Lighthouse **11.1 MiB**);
+  staged hashes were base
+  `781bd1b4c7d0aba81d69a90cde9be8d3b8c5f4218a90eb6c84ee1b404e8305b9`
+  and Browser
+  `7946f4f260ed9ce0d28d7ec9d24d8c3c33c369c8e87052e4f595b62ca3bb40e6`.
+  `.15` passed
+  `rpm -Uvh --test --replacepkgs --force --nosignature` and installed those
+  RPMs without `--nodeps`; the expected transient systemd transport/canceled-job
+  messages were followed by explicit service recovery. Final package proof is
+  clean: `rpm -V magic-mesh magic-mesh-browser` emits no differences,
+  `mde-shell-egui`, `mackesd`, and `nebula` are active with `NRestarts=0`, and
+  deployed executable hashes are shell
+  `49c16d8878a12e308e5ead8b393405c9a6dee95eb957b6fc18d74004962257e0`,
+  daemon `78ca9ac16c89cbfea4821fb60fd47113f1b62dad266e79a1ee9fd629d6cbb36a`,
+  `mde-web-preview`
+  `dc4c25d3d2020a2029f5111e2b8a4fa1700500bbeab146012d051ff7ff02c2cb`,
+  and `mde-web-cef`
+  `00a6c9bab50432b589db2725a66c77c2bbfbd2265c6f73458dd6036f4b177aaa`.
+  Live proof then forced nav mode to floating, enabled temporary
+  `MDE_DRM_INPUT_PROOF`/`MDE_NAV_BAR_PROOF`, and injected a direct touchscreen
+  tap at the known Pin coordinate: DRM logged touch down
+  `point_x=168.08 point_y=1036.94` on the 1920x1080 panel, the Pin rect was
+  `144..192 x 1012..1060`, `top_layer` and `response_layer` were both
+  `LayerId { Foreground F7E3 }`, the Pin reported `hovered=true`,
+  `contains_pointer=true`, `layer_contains_pointer=true`, then `clicked=true`,
+  and the shell applied `action=toggle_dock docked=true surface="Car Home"`.
+  Proof env vars were unset afterward; `.15` remains active with nav prefs
+  `{"mode":"docked"}`.
 - Progress (2026-07-26 Springboard Dock deterministic hit-target proof):
   `nav_bar.rs` now has
   `hit_targets_stay_inside_the_painted_navigation_chrome`, proving the
@@ -2706,50 +3331,84 @@ These decisions refine acceptance and sequencing for the active items below.
   BigBoy Console gate is green at 48/48; no live seat change was made.
 - Priority: P1
 - Complexity: Epic
-- Problem: The workstation chrome is Win10-shaped (48px bottom taskbar + tray
-  flyouts, `src/dock/mod.rs`) with an ephemeral search launcher and no home
-  screen, after three chrome reversals in ten days; no single design standard
-  governs the shell, and the operator's locked direction (ADR-0006: Apple HIG
-  as principles, iPadOS structure + macOS pointer manners) has no
-  implementation.
-- Required outcome: Construct per `docs/design/platform-interfaces.md` Part I -
-  persistent untitled all-icons Desktop (one canonical grid with
-  `LAUNCHER_GROUPS` color accents, no title, no page dots, no dock, no widgets),
-  slim top status bar, Control Center, Notification Center,
-  Spotlight (Front Door engine, keyboard flow byte-identical), card app
-  switcher with snapshot previews, shared
-  NavigationBar/Toolbar/Sidebar/Sheet/Popover components adopted by all
-  canonical surfaces, scrim materials + HIG radii + zoom-from-tile motion, two-profile
-  LayoutProfile (Construct + Car, Tablet folded via serde aliases), and the
-  Win10 chrome DELETED at cutover (no legacy flag).
-- Plan: `/root/.claude/plans/the-workstation-interface-should-cozy-minsky.md`
-  (28-unit + 2-gate fan-out; main.rs serialization queue U25→U08→U09→U27→U29).
-- Relevant files/components: `crates/desktop/mde-shell-egui/src/` (main.rs,
-  dock/ [deleted at cutover], front_door.rs, new springboard.rs / status_bar.rs /
-  control_center.rs / notification_center.rs / switcher.rs / surfaces.rs,
-  curtain.rs, keyboard.rs, system/), `crates/shared/mde-egui/src/` (style.rs,
-  motion.rs, fonts.rs, gestures.rs, new nav_chrome.rs / sheet.rs).
-- Dependencies: WL-FUNC-012 shell-side hooks land before the cutover unit
-  (same-crate serialization); curtain lock security behavior and the VDI
-  full-native-resolution guarantee are sacred (zero logic diffs).
-- Acceptance criteria: machine-captured screenshot/pixel proof on the `.15` DRM seat -
-  the untitled all-icons Desktop, status bar, Control Center, Notification
-  Center, Spotlight, switcher with real snapshots, zoom/navigation-bar
-  transitions, VDI full-res with auto-hidden bar; post-cutover grep gate (zero
-  taskbar identifiers in production code). Human visual review is informative
-  only.
-- Verification method: per-unit farm builds + targeted tests; two integration
-  slots (`cargo build --workspace` + `cargo test --workspace --no-run` + full
-  run + lint-style-leaks/doc-supersession/worklist) after the shared-API units
-  and after cutover; live `.15` deploy with
-  `--features drm,live-helper,live-vdi,media-mpv`.
+- Problem: The workstation Home/chrome target still carries the 2026-07-22
+  all-icons Springboard/no-dock lock, but the operator has now reversed the
+  landing-page direction: Construct should be icon-free on the desktop,
+  wallpaper-led, and navigated through a durable iPadOS-style Dock.
+- Required outcome: Construct boots and returns Home to an empty iPadOS-style
+  desktop with no desktop icons, the policy-gated daily Microsoft Bing
+  wallpaper, and the existing subtle watermark/About link. A bottom-centered
+  Dock remains visible on normal shell surfaces and exposes the operator survey
+  quick-launch groups: Infra (VMs/Remote Sessions, Terminal), Ops (Maps &
+  Location, Mesh Teams, File Manager/Files), and Life (Music, Media, Browser).
+  Surfaces not
+  in the compact dock remain reachable from the full Springboard / Spotlight /
+  Front Door launcher paths. Spotlight / Front Door keeps its byte-identical
+  keyboard/search flow; the top status bar, Control Center, Notification
+  Center, switcher, shared chrome components, and two-profile LayoutProfile work
+  continue; and a connected immersive VDI session retains full-screen pixels
+  unless a later operator lock says otherwise.
+- Scope: `mde-shell-egui` landing/Home, Dock, surface launcher taxonomy,
+  wallpaper policy/rendering, and the live Construct design/worklist docs. Out
+  of scope: Browser/Editor/Terminal internal toolbars, Car UI, per-service
+  auth/control changes, and changing focused VDI guest pixel reservation.
+- Plan: execute the 2026-07-26 iPadOS Desktop Dock survey inside this WL-UX-006
+  epic: reverse stale no-dock/all-icons docs, replace the Springboard grid with
+  an empty wallpaper desktop, expand the shell Dock into the grouped
+  Infra/Ops/Life quick launcher, wire the existing Bing wallpaper policy/cache
+  into the backdrop renderer, and add geometry/render/input regressions before
+  live proof.
+- Relevant files/components: `crates/desktop/mde-shell-egui/src/` (`main.rs`,
+  `springboard.rs`, `nav_bar.rs`, `surfaces.rs`, `backdrop.rs`,
+  `system/mod.rs`, `front_door.rs`, `status_bar.rs`, `control_center.rs`,
+  `notification_center.rs`, `switcher.rs`), `crates/shared/mde-egui/src/`
+  (`style.rs`, `motion.rs`, `fonts.rs`, `gestures.rs`, `nav_chrome.rs`,
+  `sheet.rs`), and the active Construct authority docs under `docs/design/`.
+- Dependencies: WL-FUNC-012 shell-side hooks remain same-crate serialization;
+  curtain lock security behavior and the VDI full-native-resolution guarantee
+  stay protected. The design-doc/governance reversal must land with the code so
+  stale "no dock" authority cannot remain active.
+- Acceptance criteria: farm/render proofs show the Home desktop has no launcher
+  icons/labels and paints Bing/cached/fallback wallpaper with the watermark;
+  the Dock is bottom-centered, always visible on normal surfaces, reserves
+  workspace space, labels Infra/Ops/Life, opens each grouped direct surface, and
+  keeps chooser-pinned desktops visible within the available rail/pill space;
+  Super / pull-down opens Front Door while wallpaper click/tap is inert;
+  immersive VDI remains full-screen; and grep/doc proof shows current authority
+  no longer states that Construct has no Dock or an all-icons Springboard as the
+  active target.
+- Verification method: build-farm `cargo test -p mde-shell-egui` focused and
+  integrated shell suites; targeted backdrop/nav/springboard/front-door tests;
+  `install-helpers/lint-worklist.sh --self-test`,
+  `install-helpers/lint-worklist.sh`, doc-supersession/style lints for docs;
+  live `.15` DRM/Sunshine/pixel capture when hardware is available, noting
+  unavailable hardware explicitly.
 - Origin or merged source IDs: operator 50-Q survey 2026-07-22 (ADR-0006);
-  supersedes WL-UX-001 (retired); absorbs WL-UX-005 (launcher overhaul -
-  Front Door survives as Spotlight; peer-app remote-exec remainder).
+  operator 10-question iPadOS Desktop Dock survey 2026-07-26; supersedes
+  WL-UX-001 (retired); absorbs WL-UX-005 (launcher overhaul - Front Door
+  survives as Spotlight; peer-app remote-exec remainder).
 
 ### WL-UX-007 - Car interface (CarPlay-principled vehicle mode)
 
 - Status: Remaining
+- Progress (2026-07-26 Maps/MG90 Admin advanced-menu viewport regression):
+  the Admin section selector no longer uses an unconditional 96 px minimum that
+  can place its egui `interact` rect outside a shell-reserved/narrow workspace.
+  Each section chip now clamps against the current visible lane, active clip,
+  widget max rect, and raw egui screen rect before allocating its hit target.
+  The MG90 Setup and Firmware & Recovery card groups now use the existing
+  responsive admin-card width helper with wrapped rows, so their two-column
+  layouts stack inside narrow Admin viewports instead of squeezing controls
+  into off-page-looking columns. Focused farm evidence is green on `.90` slot
+  `maps-admin-layout`: `cargo test -p mde-maps-location-egui admin_
+  -- --nocapture` at **12/12**, including the new
+  `admin_section_strip_hit_targets_clamp_to_tiny_visible_lane` regression that
+  click-routes Firmware & Recovery after proving every section target stays
+  inside a 72 px visible lane. Local `git diff --check` for the touched
+  `view.rs` file is clean. Crate-wide `cargo fmt -p mde-maps-location-egui`
+  remains blocked by unrelated pre-existing formatting drift in other Maps
+  files, so no broad fmt claim is made. No live `.15` display capture was
+  collected in this slice.
 - Progress (2026-07-26 Car pixel verifier frame hardening):
   `install-helpers/verify-shell-pixel-proof.py --profile car-home` now verifies
   the full Car frame geometry instead of accepting broad color presence alone:
@@ -3081,6 +3740,370 @@ These decisions refine acceptance and sequencing for the active items below.
 - Origin or merged source IDs: operator 50-Q survey 2026-07-22 (ADR-0006);
   supersedes auto-mode-sync3.md as Car design authority (palette tokens
   survive); stale-telemetry fix hoisted per survey Q33.
+
+### WL-UX-008 - Workloads app lifecycle redesign
+
+- Status: Remaining
+- Priority: P1
+- Complexity: Epic
+- Problem: The Workloads surface still reads as a stacked delivery-type/panel
+  cockpit: delivery types are top-level tabs, resources render as card rosters,
+  health and drift are buried in a lens, and typed mutation confirmation is an
+  inline arming box. That shape makes provision/plan/run/drift/audit work harder
+  to scan than an operator IaC tool should be.
+- Required outcome: Workloads becomes a lifecycle-first Construct Ops app:
+  Provision opens by default; a native sidebar routes Provision, Plan, Run,
+  Drift, Audit, Images, and Containers; delivery types are filters, not top-level
+  navigation; the main pane uses dense sortable resource tables with expandable
+  rows; a persistent health rail shows backend health, drift, active runs, mirror
+  sync, capacity, and latest audit signal; and live/destructive mutation gates
+  use a review sheet with exact-echo confirmation.
+- Scope: `mde-shell-egui` Workloads/IaC UI state, route layout, provisioning
+  form, resource table rendering, health rail, and review-sheet confirmation.
+  Preserve existing Bus request/reply verbs, cloud mirror decoding, arming token
+  minting, delivery types, workload rows, audit trail, and command contracts.
+  Do not revive the superseded OpenStack/Heat design note.
+- Relevant files/components: `crates/desktop/mde-shell-egui/src/iac/`
+  (`mod.rs`, `menubar.rs`, `placement.rs`, `provision_form.rs`, `status.rs`,
+  `images.rs`, `containers.rs`, `views/`, `tests.rs`), shared `mde-egui`
+  style/nav primitives only if existing Workloads styling cannot cover the new
+  layout, and `install-helpers/verify-workloads-live-proof.py` for live proof
+  evidence.
+- Acceptance criteria: default entry is Provision; sidebar navigation changes
+  lifecycle routes; density toggles compact/comfortable table rows; delivery
+  type filters narrow tables without changing route; table sorting is stable;
+  expanded rows expose metrics, placement, drift, command/body preview, and row
+  actions; Provision renders grouped placement, sizing, image/network, HCL, and
+  validation sections with visible plan/provision feedback and sticky actions;
+  review-sheet confirmation shows target, command/diff/body, placement,
+  blast-radius summary, and requires the exact echo before publishing; desktop
+  and tablet-like rendered frames show no overlap, clipping, or hidden health
+  rail.
+- Verification method: focused `mde-shell-egui` Workloads tests for route
+  defaults, sidebar navigation, density, filters/sort, expanded rows, and
+  review gating; build-farm `cargo test -p mde-shell-egui iac -- --nocapture`
+  plus any broader shell gate required by touched shared UI code; worklist lint
+  if this item changes; live or captured Farm + seat proof for desktop and
+  tablet-like sizes, with explicit hardware-unavailable note if no seat is
+  reachable.
+- Progress (2026-07-26 exact review-sheet echo hardening): the Workloads
+  review-sheet confirmation gate now requires the operator echo byte-for-byte.
+  Whitespace-padded input such as `  apply ` no longer arms the review sheet and
+  cannot mint a capability during the final `perform()` recheck. Evidence: `.90`
+  slot `iac-confirm-exact` `cargo test -p mde-shell-egui confirm --
+  --nocapture` passed **21/21**; touched-file `.170` rustfmt passed for
+  `iac/mod.rs` and `iac/tests.rs`; scoped `git diff --check` passed.
+- Progress (2026-07-26 lifecycle-route seam): `crates/desktop/mde-shell-egui/src/iac/`
+  now opens Workloads on `Provision` by default, replaces the legacy panel axis
+  with `WorkloadsRoute::{Provision, Plan, Run, Drift, Audit, Images, Containers}`,
+  renders a native lifecycle sidebar, demotes delivery types to a filter bar,
+  adds compact/comfortable density state, surfaces a right-side health rail, and
+  renames the destructive inline arming copy to a review sheet while preserving
+  the exact-echo Bus gate. `menubar.rs` now opens lifecycle routes instead of
+  old panels; delivery-view resource CTAs return to the Provision route. Focused
+  tests cover default route/filter/density, Plan filters that do not change the
+  active route, every lifecycle route tessellating headlessly, route/filter/density
+  state switches, and route icon/label coverage. Evidence: BigBoy farm lane
+  `MCNF_BUILD_HOST=172.20.0.130 MCNF_BUILD_SLOT=0 install-helpers/xcp-build.sh
+  cargo test -p mde-shell-egui iac -- --nocapture` passed 51/51 tests
+  (1771 filtered); scoped farm `rustfmt --edition 2021 --check` passed for the
+  touched Workloads route/view files.
+- Progress (2026-07-26 Plan resource-table seam): the Plan route now renders a
+  route-native dense resource table instead of dispatching to the legacy
+  per-delivery card-roster modules. `WorkloadsState` owns `WorkloadSort` and an
+  expanded-row key; delivery filters still narrow by `DeliveryType`, density
+  changes row height, column headers toggle stable ascending/descending sorting,
+  rows expose metrics/status/drift/placement, and expanded rows show delivery,
+  placement, metrics, drift, mesh reachability, and a command preview that names
+  the exact node/target used by the preserved Bus lifecycle action seams. The
+  obsolete compiled delivery-view dispatch module/state fields were removed
+  rather than carried as a dead compatibility layer. Evidence: BigBoy farm lane
+  `MCNF_BUILD_HOST=172.20.0.130 MCNF_BUILD_SLOT=0 install-helpers/xcp-build.sh
+  cargo test -p mde-shell-egui iac -- --nocapture` passed 54/54 tests
+  (1771 filtered), including stable sort, expanded-row keying, and rendered
+  expanded command-preview coverage; scoped BigBoy `rustfmt --edition 2021
+  --check crates/desktop/mde-shell-egui/src/iac/mod.rs
+  crates/desktop/mde-shell-egui/src/iac/tests.rs` passed.
+- Progress (2026-07-26 route-persistent placement selector): Run, Images, and
+  Containers now render the same placement picker as Provision and preserve the
+  shared `selected_node` state across route switches. The prepared route
+  mutation seam rejects blank placement before opening a review sheet, and
+  focused tests prove Run/Images/Containers do not publish node-agnostic
+  `inventory`, `output`, `configure`, `image-build`, or `container-deploy`
+  requests when no node is selected. Evidence: BigBoy `.130` slot
+  `workloads-placement` `cargo test -p mde-shell-egui iac -- --nocapture`
+  passed 58/58 tests (1773 filtered), including
+  `run_images_and_containers_share_and_retain_the_placement_selector`,
+  `node_scoped_routes_without_selection_emit_no_node_agnostic_requests`, and
+  `run_and_prepared_route_actions_fail_closed_without_a_selected_node`; scoped
+  `.130` `rustfmt --edition 2021 --check` and local scoped `git diff --check`
+  passed for the touched Workloads iac files.
+- Progress (2026-07-26 review-sheet facts): prepared route mutations and
+  lifecycle mutations now render the frozen review facts before the exact echo
+  can publish anything: `action/cloud/*` command, subject, target, placement
+  node, request body digest, bounded body summary/preview, and blast-radius
+  text. Focused render tests prove the fields are visible for
+  `container-deploy` and `instance-delete` while the fixture Bus still has zero
+  emitted mutation requests. Evidence: BigBoy `.130` slot `workloads-review`
+  `cargo test -p mde-shell-egui review_sheet_renders -- --nocapture` passed 2/2
+  tests (1831 filtered); scoped `.130` `rustfmt --edition 2021 --check
+  crates/desktop/mde-shell-egui/src/iac/mod.rs
+  crates/desktop/mde-shell-egui/src/iac/tests.rs` and local scoped
+  `git diff --check` passed for the touched IAC files. Crate-wide
+  `cargo fmt -p mde-shell-egui -- --check` remains blocked by unrelated
+  pre-existing formatting drift outside `iac/`.
+- Origin or merged source IDs: 2026-07-26 planning handoff, "World-Class Infra
+  as Code / Workloads Redesign"; UX references named in that handoff: Apple HIG
+  sidebars, IBM Carbon data tables/filtering, HCP Terraform workspaces, and
+  Kubernetes Dashboard.
+
+### WL-UX-009 - Unified workspace theme and design language
+
+- Status: Remaining
+- Progress (2026-07-26 governance/design-lock alignment): `AI_GOVERNANCE.md`
+  §4 and `docs/design/platform-interfaces.md` now match the active WL-UX-006 /
+  WL-UX-009 operator lock instead of the stale 2026-07-22 dark-only/no-launcher-
+  rail/all-icons wording. The authority now names Quazar Dark plus production
+  Quazar Light, the persistent Construct Springboard Dock, icon-free
+  Bing-wallpaper Home, Browser's governed Material Design 3 exception, Car's
+  always-dark AutoSync3 exception, and the focused VDI full-pixel carve-out.
+  Verification is green: `install-helpers/lint-doc-supersession.sh`,
+  `install-helpers/lint-worklist.sh --self-test`,
+  `install-helpers/lint-worklist.sh docs/platform/WORKLIST.md`, targeted stale
+  phrase grep across the two authority docs, and scoped `git diff --check`.
+- Priority: P1
+- Complexity: Epic
+- Problem: Construct and Car have active interface epics, and many egui
+  workspaces already use pieces of `mde-egui::Style`, `NavigationBar`,
+  `Sidebar`, `Sheet`, `Popover`, and shared typography, but there is no single
+  worklist owner for a platform-wide theme/design-language pass. The result is
+  design drift across shell chrome, workspace frames, Editor/Terminal internal
+  chrome, state presentations, motion, icon treatment, and light/dark behavior.
+- Required outcome: Every user-facing egui surface reads as one HIG Quazar
+  platform: a dense common app frame with shared top bar, sidebar, state views,
+  sheets/popovers, tooltips, typography, expressive motion, and icon language;
+  Construct keeps the persistent Dock and icon-free Bing-wallpaper Home;
+  Browser keeps its governed Material Design 3 exception while sharing quality
+  gates; Maps keeps explicitly-marked map-content color exemptions; Car receives
+  a full SYNC3/CarPlay-principled pass; and both Quazar Dark and a production
+  Quazar Light theme render cleanly.
+- Scope: Shared `mde-egui` design primitives, `mde-theme` brand/icon assets,
+  `mde-shell-egui` Home/Dock/overlays/switcher/common workspace mount, all
+  launchable `mde-*-egui` workspace chrome, and Editor/Terminal internal tabs,
+  toolbars, popovers, palettes, sidebars, and status rows. Out of scope:
+  changing Bus/control contracts, security/auth behavior, focused VDI
+  full-screen pixel reservation, general native-app hosting, full AccessKit
+  rollout, and forcing Browser off its governed MD3 local chrome.
+- Relevant files/components: `crates/shared/mde-egui/src/` (`style.rs`,
+  `motion.rs`, `fonts.rs`, `widgets.rs`, `nav_chrome.rs`, `sheet.rs`,
+  `menubar.rs`, `toast.rs`, `capture.rs`, `carbon.rs`),
+  `crates/shared/mde-theme/src/brand/icons.rs`,
+  `crates/desktop/mde-shell-egui/src/` (`main.rs`, `springboard.rs`,
+  `nav_bar.rs`, `backdrop.rs`, `status_bar.rs`, `control_center.rs`,
+  `notification_center.rs`, `switcher.rs`, `surfaces.rs`, `car_home.rs`,
+  `web/chrome_ui/`, `iac/`), and the embedded workspace crates listed in
+  `EMBEDDED_SURFACE_CRATES`.
+- Dependencies: Coordinate with WL-UX-006 for Construct Home/Dock authority,
+  WL-UX-007 for Car layout and MG90/live-drive evidence, and WL-UX-008 for the
+  Workloads lifecycle redesign. Update `AI_GOVERNANCE.md` and
+  `docs/design/platform-interfaces.md` where the survey intentionally reverses
+  current authority, especially dark-only Construct and the earlier all-icons
+  Springboard/no-dock language.
+- Acceptance criteria: Quazar Dark and Quazar Light pass palette/contrast,
+  shape-remap, screenshot, and no-overlap tests; canonical chrome uses shared
+  components unless an explicit exception is documented; empty/loading/stale/
+  offline/error/destructive states use shared state components; modal choices
+  use shared Sheet/Popover primitives; Editor and Terminal internal chrome use
+  the common app frame and shared controls; broad Construct custom glyphs are
+  registered, licensed, raster-tested, and cached through the shared icon path;
+  expressive motion is centralized and reduced-motion safe; dense tables/lists
+  are the default data-heavy body idiom; Browser remains MD3 but aligns with
+  shared typography/state/proof standards; Maps UI chrome has no unmarked style
+  leaks; and focused VDI keeps full-screen pixels.
+- Verification method: build-farm focused and integrated tests for `mde-egui`,
+  `mde-theme`, `mde-shell-egui`, and every touched `mde-*-egui` workspace;
+  targeted tests for palette resolution, font binding, icon registry/raster
+  output, shared frame geometry, state components, sheet/popover behavior,
+  Dock/workspace motion, dark/light screenshots, and Car/Construct pixel
+  profiles; `install-helpers/lint-style-leaks.sh`,
+  `install-helpers/lint-doc-supersession.sh`,
+  `install-helpers/lint-worklist.sh --self-test`,
+  `install-helpers/lint-worklist.sh`, and local `git diff --check`; live `.15`
+  DRM/Sunshine/pixel proof for shell, Car, and representative workspaces when
+  hardware is available, with an explicit unavailable-hardware note otherwise.
+- Origin or merged source IDs: 2026-07-26 operator 25-question survey:
+  all egui surfaces, major redesign, HIG Quazar direction, persistent Dock,
+  icon-free Bing-wallpaper Home, Browser MD3 exception kept, full Car pass,
+  Editor/Terminal internal chrome included, strict shared-component adoption,
+  dark plus Quazar Light, bundled OFL display font, broad custom Construct
+  glyph redesign, Dense Ops default, common app frame, sidebar plus top-bar
+  navigation, dense tables/lists, expressive motion, visual-polish-only
+  accessibility, shared state language, sheets/popovers only, and farm plus live
+  proof.
+
+### WL-UX-010 - Mesh Teams near-parity interface redesign
+
+- Status: Remaining
+- Progress (2026-07-26 app/channel navigation seam): the `mde-collab-egui`
+  frame now has the Teams-style far-left app rail, persistent Teams + Channels
+  rail, channel header, and Posts/Files/Calls channel tabs while preserving the
+  existing real mode bodies. Activity prefers the cross-space feed when the
+  Activity app is active; Teams app hops preserve the selected channel and
+  remembered channel tab. Focused farm evidence passed:
+  `.90` `cargo test -p mde-collab-egui rail -- --nocapture` = 4/4,
+  `.50` `activity_app_prefers_cross_space_feed` = 1/1,
+  `.90` `channel_tabs_are_posts_files_calls_only` = 1/1, `.50`
+  `set_app_preserves_channel_selection_and_routes_existing_bodies` = 1/1, and
+  `.170` scoped `rustfmt --check --config skip_children=true` over the touched
+  collab files passed.
+- Progress (2026-07-26 rich multiline composer seam): the main channel composer
+  and thread reply composer now use multiline text edits, plain Enter retains
+  the draft and inserts a newline, and Ctrl+Enter or the Send glyph emits the
+  existing real `SendMessage` / `ReplyInThread` commands. Focused evidence:
+  `.90` `cargo test -p mde-collab-egui enter -- --nocapture` passed 3/3 tests,
+  `.50` `thread_ctrl_enter_emits_reply` passed 1/1, and the warm `.90`
+  `cargo test -p mde-collab-egui -- --nocapture` crate gate passed 85/85 tests
+  plus doc-tests.
+- Progress (2026-07-26 selected-channel Details pane): `mde-collab-egui` now
+  reserves a right-side Details pane inside the Mesh Teams frame. The pane reads
+  only existing selected-channel read models: directory facts, role, member and
+  unread counts, last activity clock, messages, linked files, transfer jobs for
+  those file references, document sessions, active calls, and clipboard items.
+  Missing projections render as honest zero counts, and stale selections do not
+  produce an actionable Details target. Evidence: `.90` slot `collab-details`
+  `cargo test -p mde-collab-egui details -- --nocapture` passed 2/2 tests,
+  BigBoy `.130` slot `collab-full` `cargo test -p mde-collab-egui --
+  --nocapture` passed 87/87 tests plus doc-tests, scoped farm `rustfmt --check
+  --config skip_children=true` passed for `frame.rs`, `lib.rs`, and `tests.rs`,
+  and scoped `git diff --check` passed. Package-wide `cargo fmt --check` remains
+  noisy from unrelated pre-existing import-order drift in other collab modules.
+- Progress (2026-07-26 current-channel find): Mesh Teams now has a local
+  current-channel Find field in the channel header, keyed per selected channel
+  rather than global app state. Posts filtering reads the selected channel's
+  retained conversation only, matches visible author/body text case-insensitively,
+  does not surface deleted message bodies, reports the exact current-channel
+  match count, and emits no Bus/collaboration command. Pure tests cover the
+  filter model and deleted-body boundary; headless UI tests cover per-channel
+  query persistence and Posts match-count/filter behavior. Evidence: `.90` slot
+  `collab-find` `cargo test -p mde-collab-egui channel_find -- --nocapture`
+  passed 4/4 tests, `.170` slot `collab-find-model` focused pure model test
+  passed 1/1, BigBoy `.130` slot `collab-find-full`
+  `cargo test -p mde-collab-egui -- --nocapture` passed 91/91 tests plus
+  doc-tests, scoped farm `rustfmt --check --config skip_children=true` passed
+  for `lib.rs`, `frame.rs`, `messages.rs`, and `tests.rs`, and scoped
+  `git diff --check` passed.
+- Progress (2026-07-26 thread resolve/reopen seam): Mesh Teams thread side panes
+  now expose actionable Resolve/Reopen controls backed by first-class signed
+  `ResolveThread` / `ReopenThread` commands, a convergent `ThreadReopened` event,
+  core pipeline admission, and projection foldback into `ThreadTimeline.resolved`.
+  The UI still reads the selected thread timeline and emits only command intent
+  for the shell Bus route; missing thread projections render non-actionably.
+  Evidence: `.50` `cargo test -p mde-collab-types -- --nocapture` passed 37/37
+  plus doc-tests; `.170` `cargo test -p mde-collab-core -- --nocapture` passed
+  79/79 plus doc-tests; `.90` focused `cargo test -p mde-collab-egui
+  thread_resolution -- --nocapture` passed 2/2; BigBoy `.130`
+  `cargo test -p mde-collab-egui -- --nocapture` passed 93/93 plus doc-tests;
+  `.170` touched-file `rustfmt --edition 2021 --check` and scoped
+  `git diff --check` passed.
+- Progress (2026-07-26 provider device controls visibility): Mesh Teams now keeps
+  microphone, camera, and screen provider controls visible but disabled until a
+  real media provider enumerates devices. Calls mode and Settings both render the
+  honest `System default` state, explain that enumeration/binding is media-plane
+  pending, and avoid fabricated device or Discord provider names. Evidence: `.90`
+  `cargo test -p mde-collab-egui provider -- --nocapture` passed 2/2, BigBoy
+  `.130` `cargo test -p mde-collab-egui -- --nocapture` passed 95/95 plus
+  doc-tests, post-import-order `.130` focused provider recheck passed 2/2,
+  `.130` touched-file `rustfmt --edition 2021 --check --config
+  skip_children=true`, and scoped `git diff --check` passed.
+- Progress (2026-07-26 local-only quick reactions): Mesh Teams Posts now expose
+  a constrained local reaction strip (`Ack`, `Check`, `Watch`) as seat-local
+  view state keyed by message event id. Clicking the current chip clears it;
+  clicking another chip replaces it; no `CommandSink` entry, collaboration
+  command, signed event, or mesh-visible reaction is emitted. This preserves the
+  WL-UX-010 scope boundary that emoji/GIF/sticker systems remain out of scope.
+  Evidence: `.50` slot `collab-local-reactions` focused
+  `cargo test -p mde-collab-egui local_reaction -- --nocapture` passed
+  **2/2**; `.170` slot `collab-full-after-reactions`
+  `cargo test -p mde-collab-egui -- --nocapture` passed **98/98** plus
+  doc-tests; touched-file `.170` rustfmt and scoped `git diff --check` passed.
+- Priority: P0
+- Complexity: Epic
+- Problem: The live Communications surface has a strong Bus-backed foundation,
+  but the interface is still a fixed spaces rail plus eight primary tabs and a
+  bottom call bar. That shape does not match the operator's requested
+  Microsoft-Teams-like product model, makes the capability set feel fragmented,
+  exposes utility modes too prominently, and leaves composer, channel, meeting,
+  file, document, task, Discord, and car-mode workflows below the requested
+  near-parity bar.
+- Required outcome: `Mesh Teams` presents a Teams-familiar, operator-focused
+  workspace: app rail, Teams + Channels list, channel header, Posts/Files/Calls
+  tabs, global Activity inbox, rich Details pane, multi-line rich composer,
+  side-thread pane, pinned/saved message affordances, ad-hoc channel meetings,
+  transfer-first files, full-IDE document collaboration, basic tasks, contextual
+  Clipboard/Transfers, full two-way Discord bridge status, and glance-safe Car
+  Mode. The visual language should read very similar to Teams while using the
+  governed Quazar/Construct tokens and shared components.
+- Scope: `mde-collab-egui` frame/navigation/body renderers, message composer,
+  thread UI, call/device/meeting UI, files/transfers/clipboard panels, document
+  entry points, task panels, Discord bridge surfaces, Car Mode Communications
+  treatment, and the shell Communications mount/launcher/toast routing needed to
+  expose the redesigned experience. Out of scope: recordings/transcripts,
+  @mentions, message priority/urgent labels, scheduled messages, global Mesh
+  Teams search, emoji/GIF/sticker systems, slash/workflow commands, and a generic
+  Teams app/bot platform beyond the explicit Discord bridge.
+- Relevant files/components: `crates/desktop/mde-collab-egui/`,
+  `crates/desktop/mde-shell-egui/src/communications/`,
+  `crates/desktop/mde-shell-egui/src/surfaces.rs`, shared `mde-egui`
+  frame/nav/sheet/popover/tooltip/style primitives, `mde-collab-types` read
+  models and commands owned by WL-FUNC-011, `mde-collab-core` projections,
+  `mackesd` collaboration and future Discord bridge workers, and Car
+  Communications routes.
+- Dependencies: Coordinate with WL-FUNC-011 for backing contracts, worker
+  behavior, media, coauthoring, tasks, and Discord bridge semantics; WL-UX-009
+  for shared Quazar/Construct design language; and WL-UX-007 for glance-safe Car
+  constraints.
+- Acceptance criteria: the eight-tab layout is replaced by an app rail plus
+  Teams + Channels list; direct/group conversations render as channels; global
+  Activity shows unread and alert quick filters; Alerts, Transfers, and Clipboard
+  are both rail-reachable and contextual where appropriate; channels default to
+  Posts/Files/Calls tabs with a rich Details pane; composer supports rich
+  formatting, multiline editing, `Ctrl+Enter` send, file attachment, clipboard
+  attach, and document create/attach; reactions are local-only; current-channel
+  find works without a global search surface; threads resolve/reopen in a side
+  pane; shared pins and private saved messages are reachable; ad-hoc meetings
+  create persistent channel context; device controls are disabled-but-visible
+  until real providers enumerate; screen share can escalate to remote control;
+  files read as transfer-first; Documents opens to the full IDE/editor and live
+  coauthoring state; basic tasks/action items are usable in channel context;
+  Discord bridge UI shows two-way status, provenance, and degraded states; Car
+  Mode exposes only glance-safe alerts and calls; excluded features are absent.
+- Verification method: build-farm focused tests for `mde-collab-egui` route
+  state, channel hierarchy rendering, composer shortcuts/actions, details pane,
+  threads, pins/saved messages, local find, call/device states, tasks, Discord
+  bridge UI, contextual utility panels, and Car Mode limits; contract/projection
+  tests in WL-FUNC-011 for any new read models or commands; `mde-shell-egui`
+  launcher/toast/navigation tests; `install-helpers/lint-style-leaks.sh`,
+  `install-helpers/lint-worklist.sh --self-test`,
+  `install-helpers/lint-worklist.sh`, and `git diff --check`; live or captured
+  DRM/Sunshine proof for desktop, narrow/tablet, and Car profiles when hardware
+  is reachable, with an explicit unavailable-hardware note otherwise.
+- Origin or merged source IDs: 2026-07-26 operator 50-question Mesh Teams survey:
+  near Teams parity, mesh operators, `Mesh Teams` label, very Teams-like visual
+  model, single big push, Teams + Channels hierarchy, direct/group messages as
+  channels, Teams-style app rail, favorites/pins only, global-only Activity,
+  Alerts folded into Activity, contextual Clipboard/Transfers, rich Details pane,
+  Posts/Files/Calls channel tabs, operator rail set, rich multi-line composer,
+  `Ctrl+Enter` send, attachments, clipboard/document composer integration,
+  local-only reactions, no @mentions, no priority/scheduled messages, no global
+  search, current-channel find, unread/alerts quick filters, no read receipts,
+  resolve/reopen side threads, pinned plus saved messages, no slash commands, no
+  emoji/GIF/stickers, ad-hoc meetings only, channel Posts as meeting discussion,
+  no recording/transcription, WebRTC P2P first, disabled provider/device controls
+  until real enumeration, one share flow with remote-control escalation, 2-20
+  participant target, transfer-first files, full IDE default documents, required
+  live coauthoring, basic tasks, full two-way external Discord server
+  integration, glance-safe Car Mode, and worklist placement in both WL-FUNC-011
+  and this linked UX epic.
 
 ## Performance
 

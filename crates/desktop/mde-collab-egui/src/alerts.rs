@@ -155,7 +155,7 @@ impl CommunicationsSurface {
 
     /// The notification-preference bar: the severity-threshold chips + the DND
     /// toggle (both mirrored out as commands, held locally as view state).
-    fn alert_pref_bar(&mut self, ui: &mut egui::Ui, sink: &mut crate::CommandSink) {
+    pub(crate) fn alert_pref_bar(&mut self, ui: &mut egui::Ui, sink: &mut crate::CommandSink) {
         ui.horizontal(|ui| {
             ui.label(
                 egui::RichText::new("Ring at")
