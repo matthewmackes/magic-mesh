@@ -4056,7 +4056,7 @@ mod tests {
     }
 
     #[test]
-    fn files_mime_glyphs_use_yamis_icons() {
+    fn files_mime_glyphs_use_shared_catalog_icons() {
         for (mime, label) in [
             (Mime::Folder, "folder"),
             (Mime::Doc, "document"),
@@ -4067,8 +4067,8 @@ mod tests {
         ] {
             let icon = file_type_icon(mime);
             assert!(
-                icon.name().starts_with("yamis-"),
-                "{label} MIME glyph should resolve through the YAMIS catalog"
+                icon.name().starts_with("yamis-") || icon.name().starts_with("construct-v2-"),
+                "{label} MIME glyph should resolve through the shared icon catalog"
             );
             let img = mde_theme::brand::icons::icon_image(icon, 16, [0xe0, 0xe0, 0xe0, 0xff])
                 .unwrap_or_else(|err| panic!("{label} MIME glyph failed to rasterize: {err}"));
@@ -4080,12 +4080,12 @@ mod tests {
     }
 
     #[test]
-    fn files_local_places_use_yamis_icons() {
+    fn files_local_places_use_shared_catalog_icons() {
         for spot in LOCAL_SPOTS {
             let icon = local_place_icon(spot.path);
             assert!(
-                icon.name().starts_with("yamis-"),
-                "{} place glyph should resolve through the YAMIS catalog",
+                icon.name().starts_with("yamis-") || icon.name().starts_with("construct-v2-"),
+                "{} place glyph should resolve through the shared icon catalog",
                 spot.label
             );
             let img = mde_theme::brand::icons::icon_image(icon, 16, [0xe0, 0xe0, 0xe0, 0xff])

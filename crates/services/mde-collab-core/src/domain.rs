@@ -75,6 +75,15 @@ pub struct MessageAgg {
     pub deleted: bool,
 }
 
+/// A channel task's validation facts.
+#[derive(Debug, Clone)]
+pub struct TaskAgg {
+    /// The space it belongs to.
+    pub space: SpaceId,
+    /// Whether it has been completed.
+    pub completed: bool,
+}
+
 /// A clipboard item's validation facts.
 #[derive(Debug, Clone)]
 pub struct ClipAgg {
@@ -117,6 +126,8 @@ pub struct DomainState {
     pub messages: BTreeMap<EventId, MessageAgg>,
     /// Threads → their space.
     pub threads: BTreeMap<ThreadId, SpaceId>,
+    /// Basic channel tasks/action items by their creation event id.
+    pub tasks: BTreeMap<EventId, TaskAgg>,
     /// Documents → their space.
     pub documents: BTreeMap<DocumentId, SpaceId>,
     /// File references → (space, currently-present).
@@ -227,6 +238,23 @@ impl DomainState {
                 self.threads.insert(*thread, space_id);
             }
             CollabEventKind::ThreadResolved { .. } | CollabEventKind::ThreadReopened { .. } => {}
+            CollabEventKind::TaskCreated { .. } => {
+                self.tasks.insert(
+                    env.event_id,
+                    TaskAgg {
+                        space: space_id,
+                        completed: false,
+                    },
+                );
+            }
+            CollabEventKind::TaskChecked { .. } => {}
+            CollabEventKind::TaskCompleted { task } => {
+                if let Some(t) = self.tasks.get_mut(task) {
+                    if t.space == space_id {
+                        t.completed = true;
+                    }
+                }
+            }
             CollabEventKind::AlertRaised { alert } => {
                 let actions = alert
                     .actions

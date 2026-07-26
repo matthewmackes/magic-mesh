@@ -7,7 +7,6 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ActorId;
 use crate::clock::ActorClock;
 use crate::ids::{CallId, DocumentId, EventId, FileRefId, SpaceId, ThreadId, TransferId};
 use crate::space::{SpaceKind, SpaceRole};
@@ -15,6 +14,7 @@ use crate::value::{
     AiSuggestionKind, AlertPayload, CallKind, CallParticipantState, ClipItemKind, DeliveryState,
     FileRef, PresenceState, Severity, TransferDirection, TransferMethod, TransferState,
 };
+use crate::ActorId;
 
 /// The full set of read-side projections, so a caller can name each shape by
 /// one type. Each variant is an independently-published `state/collab/*` model.
@@ -29,6 +29,8 @@ pub enum CollabReadModel {
     ConversationTimeline(ConversationTimeline),
     /// A thread timeline (root + replies).
     ThreadTimeline(ThreadTimeline),
+    /// Basic channel tasks/action items.
+    ChannelTasks(ChannelTasks),
     /// The live document co-edit sessions.
     DocumentSessions(DocumentSessions),
     /// The files linked into a space.
@@ -49,6 +51,8 @@ pub enum CollabReadModel {
     CallMediaVerification(CallMediaVerification),
     /// DigitalOcean AI suggestion request state.
     AiSuggestionRequests(AiSuggestionRequests),
+    /// External Discord bridge worker status.
+    DiscordBridgeBoard(DiscordBridgeBoard),
 }
 
 /// The rail directory of spaces.
@@ -154,6 +158,43 @@ pub struct ThreadTimeline {
     pub replies: Vec<MessageView>,
     /// Whether the thread is resolved.
     pub resolved: bool,
+}
+
+/// Basic channel tasks/action items for one space.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelTasks {
+    /// The space/channel these tasks belong to.
+    pub space: SpaceId,
+    /// Newest-last task rows.
+    pub tasks: Vec<TaskView>,
+}
+
+/// One channel task/action-item row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskView {
+    /// The task creation event id.
+    pub task: EventId,
+    /// The space/channel that owns the task.
+    pub space: SpaceId,
+    /// Short operator-authored title.
+    pub title: String,
+    /// Who created the task.
+    pub created_by: ActorId,
+    /// When the task was created (epoch ms).
+    pub created_unix_ms: i64,
+    /// Optional message that originated the action item.
+    #[serde(default)]
+    pub source: Option<EventId>,
+    /// Lightweight checked state. Completion is a separate terminal state.
+    pub checked: bool,
+    /// Whether the task is complete.
+    pub completed: bool,
+    /// Who completed the task, when complete.
+    #[serde(default)]
+    pub completed_by: Option<ActorId>,
+    /// When the task was completed, when complete.
+    #[serde(default)]
+    pub completed_unix_ms: Option<i64>,
 }
 
 /// The live document co-edit sessions.
@@ -535,6 +576,100 @@ pub enum AiSuggestionRequestStatus {
     Failed,
 }
 
+/// Worker-owned status for the explicit Discord bridge.
+///
+/// This is not a Discord client and not collaboration history. It is the honest
+/// read-side board a future bridge worker publishes after consuming operator
+/// config/provider state: no row means the surface must render "unconfigured",
+/// while rows distinguish configured bridges from unavailable/degraded provider
+/// state without inventing servers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct DiscordBridgeBoard {
+    /// One row per known Discord bridge binding.
+    pub bridges: Vec<DiscordBridgeView>,
+}
+
+/// One Discord bridge binding or degraded provider row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscordBridgeView {
+    /// Worker-stable opaque bridge id.
+    pub bridge_id: String,
+    /// Mesh channel/space this bridge is scoped to, when configured.
+    #[serde(default)]
+    pub space: Option<SpaceId>,
+    /// Human label supplied by the bridge worker/operator config.
+    pub label: String,
+    /// Overall configuration/provider state.
+    pub status: DiscordBridgeConfigStatus,
+    /// Discord-to-Mesh delivery status.
+    pub inbound: DiscordBridgeFlowStatus,
+    /// Mesh-to-Discord delivery status.
+    pub outbound: DiscordBridgeFlowStatus,
+    /// Where this row came from.
+    pub provenance: DiscordBridgeProvenance,
+    /// Bounded detail for degraded/unavailable rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// Last worker observation/update time (epoch ms).
+    pub updated_unix_ms: i64,
+}
+
+/// Overall status for a Discord bridge row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscordBridgeConfigStatus {
+    /// No operator bridge config exists.
+    Unconfigured,
+    /// Config exists or was expected, but the Discord/provider adapter is unavailable.
+    ProviderUnavailable,
+    /// The worker has a configured bridge row.
+    Configured,
+}
+
+/// Directional bridge health for the two-way contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscordBridgeFlowStatus {
+    /// No mapping/config exists for this direction.
+    NotConfigured,
+    /// The worker cannot evaluate this direction because the provider is unavailable.
+    ProviderUnavailable,
+    /// The direction is configured but degraded.
+    Degraded,
+    /// The direction is configured and ready according to worker state.
+    Ready,
+}
+
+/// Provenance for a Discord bridge row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscordBridgeProvenance {
+    /// The source class that produced the row.
+    pub source: DiscordBridgeProvenanceSource,
+    /// Operator/config authority, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority: Option<String>,
+    /// Worker/node that observed or published this row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_by: Option<String>,
+    /// Config digest/revision, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_digest: Option<String>,
+}
+
+/// Source class for a Discord bridge status row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscordBridgeProvenanceSource {
+    /// The row is the UI's honest "no projection/no config" fallback.
+    None,
+    /// The row came from retained operator configuration.
+    OperatorConfig,
+    /// The row came from bridge worker cached state.
+    WorkerState,
+    /// The row came from a concrete provider adapter observation.
+    ProviderAdapter,
+}
+
 /// The unread/alert badge counters the shell reads for the launcher tile + dock
 /// cell (bounded dimensions; a read-side rollup, not a second authority).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -566,6 +701,10 @@ mod tests {
                 thread: None,
                 messages: Vec::new(),
             }),
+            CollabReadModel::ChannelTasks(ChannelTasks {
+                space: SpaceId::new(),
+                tasks: Vec::new(),
+            }),
             CollabReadModel::DocumentSessions(DocumentSessions::default()),
             CollabReadModel::TransferJobs(TransferJobs::default()),
             CollabReadModel::AlertInbox(AlertInbox::default()),
@@ -580,6 +719,24 @@ mod tests {
                 rows: Vec::new(),
             }),
             CollabReadModel::AiSuggestionRequests(AiSuggestionRequests::default()),
+            CollabReadModel::DiscordBridgeBoard(DiscordBridgeBoard {
+                bridges: vec![DiscordBridgeView {
+                    bridge_id: "bridge-1".to_owned(),
+                    space: Some(SpaceId::new()),
+                    label: "Ops bridge".to_owned(),
+                    status: DiscordBridgeConfigStatus::Configured,
+                    inbound: DiscordBridgeFlowStatus::Ready,
+                    outbound: DiscordBridgeFlowStatus::Ready,
+                    provenance: DiscordBridgeProvenance {
+                        source: DiscordBridgeProvenanceSource::OperatorConfig,
+                        authority: Some("mesh-team-revision:42".to_owned()),
+                        observed_by: Some("seat-15".to_owned()),
+                        config_digest: Some("sha256:bridge".to_owned()),
+                    },
+                    detail: None,
+                    updated_unix_ms: 1_000,
+                }],
+            }),
         ];
         for m in models {
             let json = serde_json::to_string(&m).expect("serialize");
@@ -594,5 +751,65 @@ mod tests {
         assert_eq!(b.unread, 0);
         assert_eq!(b.alerts, 0);
         assert!(b.top_severity.is_none());
+    }
+
+    #[test]
+    fn discord_bridge_board_round_trips_status_provenance_and_directional_flows() {
+        let model = CollabReadModel::DiscordBridgeBoard(DiscordBridgeBoard {
+            bridges: vec![
+                DiscordBridgeView {
+                    bridge_id: "unconfigured".to_owned(),
+                    space: None,
+                    label: "Discord bridge".to_owned(),
+                    status: DiscordBridgeConfigStatus::Unconfigured,
+                    inbound: DiscordBridgeFlowStatus::NotConfigured,
+                    outbound: DiscordBridgeFlowStatus::NotConfigured,
+                    provenance: DiscordBridgeProvenance {
+                        source: DiscordBridgeProvenanceSource::None,
+                        authority: None,
+                        observed_by: None,
+                        config_digest: None,
+                    },
+                    detail: Some("No operator mapping exists.".to_owned()),
+                    updated_unix_ms: 1_000,
+                },
+                DiscordBridgeView {
+                    bridge_id: "configured".to_owned(),
+                    space: Some(SpaceId::new()),
+                    label: "Ops Discord bridge".to_owned(),
+                    status: DiscordBridgeConfigStatus::Configured,
+                    inbound: DiscordBridgeFlowStatus::Ready,
+                    outbound: DiscordBridgeFlowStatus::Ready,
+                    provenance: DiscordBridgeProvenance {
+                        source: DiscordBridgeProvenanceSource::OperatorConfig,
+                        authority: Some("mesh-team-revision:44".to_owned()),
+                        observed_by: Some("seat-15".to_owned()),
+                        config_digest: Some("sha256:configured".to_owned()),
+                    },
+                    detail: None,
+                    updated_unix_ms: 2_000,
+                },
+                DiscordBridgeView {
+                    bridge_id: "provider-unavailable".to_owned(),
+                    space: Some(SpaceId::new()),
+                    label: "Provider unavailable".to_owned(),
+                    status: DiscordBridgeConfigStatus::ProviderUnavailable,
+                    inbound: DiscordBridgeFlowStatus::ProviderUnavailable,
+                    outbound: DiscordBridgeFlowStatus::Degraded,
+                    provenance: DiscordBridgeProvenance {
+                        source: DiscordBridgeProvenanceSource::WorkerState,
+                        authority: Some("mesh-team-revision:45".to_owned()),
+                        observed_by: Some("seat-15".to_owned()),
+                        config_digest: Some("sha256:provider".to_owned()),
+                    },
+                    detail: Some("Discord provider adapter unavailable.".to_owned()),
+                    updated_unix_ms: 3_000,
+                },
+            ],
+        });
+
+        let json = serde_json::to_string(&model).expect("serialize");
+        let back: CollabReadModel = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(model, back);
     }
 }

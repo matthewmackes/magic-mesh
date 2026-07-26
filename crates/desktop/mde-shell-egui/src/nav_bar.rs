@@ -38,6 +38,12 @@ const FLOATING_MARGIN: f32 = 16.0;
 pub(crate) const SPRINGBOARD_DOCK_RESERVED_H: f32 = FLOATING_H + FLOATING_MARGIN;
 /// The icon controls keep a comfortable 48px target in the compact dock.
 const CONTROL_EDGE: f32 = 48.0;
+/// The horizontal Springboard Dock may be narrower than the preferred 640px
+/// pill on small panels. Preserve the full app set by shrinking the bottom row
+/// after chooser pins have been dropped, instead of letting controls escape the
+/// painted backing.
+const FLOATING_MIN_CONTROL_EDGE: f32 = 24.0;
+const FLOATING_GAP: f32 = 4.0;
 /// Maximum number of chooser-pinned sources shown in the dock. The full
 /// chooser remains the unbounded discovery surface; the dock is a quick rail.
 const MAX_PINNED_SOURCES: usize = 8;
@@ -559,43 +565,43 @@ fn dock_control_capacity(pinned_count: usize) -> usize {
     3 + dock_launcher_count() + pinned_count
 }
 
-fn control_span(count: usize, gap: f32) -> f32 {
+fn control_span(count: usize, edge: f32, gap: f32) -> f32 {
     if count == 0 {
         0.0
     } else {
-        count as f32 * CONTROL_EDGE + (count - 1) as f32 * gap
+        count as f32 * edge + (count - 1) as f32 * gap
     }
 }
 
 fn effective_floating_pinned_count(screen: egui::Rect, requested: usize, gap: f32) -> usize {
-    let max_width = floating_available_width(screen);
-    let base = floating_content_width(0, gap);
-    let remaining = max_width - base - Style::SP_S;
-    if remaining < CONTROL_EDGE {
-        return 0;
+    let available = floating_available_width(screen);
+    let requested = requested.min(MAX_PINNED_SOURCES);
+    for pinned_count in (0..=requested).rev() {
+        if floating_content_width(pinned_count, CONTROL_EDGE, gap) <= available {
+            return pinned_count;
+        }
     }
-    let capacity = ((remaining + gap) / (CONTROL_EDGE + gap)).floor().max(0.0) as usize;
-    requested.min(capacity)
+    0
 }
 
 fn floating_available_width(screen: egui::Rect) -> f32 {
     (screen.width() - 2.0 * FLOATING_MARGIN).max(1.0)
 }
 
-fn floating_group_width(gap: f32) -> f32 {
+fn floating_group_width(edge: f32, gap: f32) -> f32 {
     DOCK_LAUNCHER_GROUPS
         .iter()
-        .map(|group| control_span(group.surfaces.len(), gap))
+        .map(|group| control_span(group.surfaces.len(), edge, gap))
         .sum::<f32>()
         + (DOCK_LAUNCHER_GROUPS.len().saturating_sub(1) as f32 * Style::SP_S)
 }
 
-fn floating_content_width(pinned_count: usize, gap: f32) -> f32 {
-    let base_w = control_span(3, gap);
-    let pinned_w = control_span(pinned_count, gap);
+fn floating_content_width(pinned_count: usize, edge: f32, gap: f32) -> f32 {
+    let base_w = control_span(3, edge, gap);
+    let pinned_w = control_span(pinned_count, edge, gap);
     base_w
         + Style::SP_S
-        + floating_group_width(gap)
+        + floating_group_width(edge, gap)
         + if pinned_count > 0 {
             Style::SP_S + pinned_w
         } else {
@@ -604,11 +610,29 @@ fn floating_content_width(pinned_count: usize, gap: f32) -> f32 {
         + Style::SP_L * 2.0
 }
 
+fn floating_control_count(pinned_count: usize) -> usize {
+    3 + dock_launcher_count() + pinned_count
+}
+
+fn floating_control_edge(screen: egui::Rect, pinned_count: usize, gap: f32) -> f32 {
+    let available = floating_available_width(screen);
+    if floating_content_width(pinned_count, CONTROL_EDGE, gap) <= available {
+        return CONTROL_EDGE;
+    }
+
+    let non_control_width = floating_content_width(pinned_count, 0.0, gap);
+    let controls = floating_control_count(pinned_count).max(1) as f32;
+    ((available - non_control_width) / controls)
+        .min(CONTROL_EDGE)
+        .max(FLOATING_MIN_CONTROL_EDGE.min(CONTROL_EDGE))
+}
+
 fn floating_geometry_for(screen: egui::Rect, pinned_count: usize) -> Geometry {
-    let gap = 4.0;
+    let gap = FLOATING_GAP;
     let pinned_count = effective_floating_pinned_count(screen, pinned_count, gap);
+    let edge = floating_control_edge(screen, pinned_count, gap);
     let width = FLOATING_W
-        .max(floating_content_width(pinned_count, gap))
+        .max(floating_content_width(pinned_count, edge, gap))
         .min(floating_available_width(screen));
     let outer = egui::Rect::from_min_size(
         egui::pos2(
@@ -618,7 +642,7 @@ fn floating_geometry_for(screen: egui::Rect, pinned_count: usize) -> Geometry {
         egui::vec2(width, FLOATING_H),
     );
     let first_x = outer.left() + Style::SP_L;
-    let y = outer.bottom() - Style::SP_S - CONTROL_EDGE;
+    let y = outer.bottom() - Style::SP_S - edge;
     let label_top = outer.top() + Style::SP_XS;
     let label_h = TypographyRole::Caption.line_height().ceil();
     let mut controls = Vec::with_capacity(dock_control_capacity(pinned_count));
@@ -627,14 +651,11 @@ fn floating_geometry_for(screen: egui::Rect, pinned_count: usize) -> Geometry {
     for kind in [ControlKind::Back, ControlKind::Home, ControlKind::Pin] {
         controls.push(Control {
             kind,
-            rect: egui::Rect::from_min_size(
-                egui::pos2(cursor_x, y),
-                egui::vec2(CONTROL_EDGE, CONTROL_EDGE),
-            ),
+            rect: egui::Rect::from_min_size(egui::pos2(cursor_x, y), egui::vec2(edge, edge)),
             surface: None,
             source_index: None,
         });
-        cursor_x += CONTROL_EDGE + gap;
+        cursor_x += edge + gap;
     }
     cursor_x -= gap;
     cursor_x += Style::SP_S;
@@ -643,14 +664,11 @@ fn floating_geometry_for(screen: egui::Rect, pinned_count: usize) -> Geometry {
         for surface in group.surfaces {
             controls.push(Control {
                 kind: ControlKind::SurfaceLauncher,
-                rect: egui::Rect::from_min_size(
-                    egui::pos2(cursor_x, y),
-                    egui::vec2(CONTROL_EDGE, CONTROL_EDGE),
-                ),
+                rect: egui::Rect::from_min_size(egui::pos2(cursor_x, y), egui::vec2(edge, edge)),
                 surface: Some(*surface),
                 source_index: None,
             });
-            cursor_x += CONTROL_EDGE + gap;
+            cursor_x += edge + gap;
         }
         cursor_x -= gap;
         group_labels.push(GroupLabel {
@@ -663,20 +681,14 @@ fn floating_geometry_for(screen: egui::Rect, pinned_count: usize) -> Geometry {
         });
         cursor_x += Style::SP_S;
     }
-    if pinned_count > 0 {
-        cursor_x += Style::SP_S;
-    }
     for source_index in 0..pinned_count {
         controls.push(Control {
             kind: ControlKind::PinnedDesktop,
-            rect: egui::Rect::from_min_size(
-                egui::pos2(cursor_x, y),
-                egui::vec2(CONTROL_EDGE, CONTROL_EDGE),
-            ),
+            rect: egui::Rect::from_min_size(egui::pos2(cursor_x, y), egui::vec2(edge, edge)),
             surface: None,
             source_index: Some(source_index),
         });
-        cursor_x += CONTROL_EDGE + gap;
+        cursor_x += edge + gap;
     }
     Geometry {
         outer,
@@ -1251,6 +1263,42 @@ mod tests {
             "bottom dock must drop excess chooser pins instead of painting controls past the pill"
         );
         assert_hit_targets_inside_backing("floating narrow screen".to_string(), &geometry);
+    }
+
+    #[test]
+    fn bottom_dock_shrinks_cells_before_overflowing_the_pill() {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0));
+        let geometry = floating_geometry_for(screen, MAX_PINNED_SOURCES);
+
+        assert_eq!(geometry.outer.center().x, screen.center().x);
+        assert!(geometry.outer.left() >= screen.left() + FLOATING_MARGIN);
+        assert!(geometry.outer.right() <= screen.right() - FLOATING_MARGIN);
+        assert_eq!(
+            geometry
+                .controls
+                .iter()
+                .filter(|control| control.kind == ControlKind::SurfaceLauncher)
+                .count(),
+            dock_launcher_count(),
+            "bottom placement must keep the operator Dock launcher set before spending width on chooser pins"
+        );
+        assert_eq!(
+            geometry
+                .controls
+                .iter()
+                .filter(|control| control.kind == ControlKind::PinnedDesktop)
+                .count(),
+            0,
+            "chooser pins are the first controls dropped on a narrow bottom Dock"
+        );
+        assert!(
+            geometry
+                .controls
+                .iter()
+                .any(|control| control.rect.width() < CONTROL_EDGE),
+            "narrow bottom placement must shrink cells instead of painting past the backing"
+        );
+        assert_hit_targets_inside_backing("floating sub-640 screen".to_string(), &geometry);
     }
 
     #[test]

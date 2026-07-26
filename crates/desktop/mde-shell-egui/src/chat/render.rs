@@ -24,8 +24,8 @@ use mde_theme::brand::icons::IconId;
 
 pub(super) const CHAT_UNMUTE_ICON: IconId = IconId::Notifications;
 pub(super) const CHAT_MUTE_ICON: IconId = IconId::NotificationsMuted;
-pub(super) const CHAT_CALL_ICON: IconId = IconId::Phones;
-pub(super) const CHAT_REMOTE_ICON: IconId = IconId::Sessions;
+pub(super) const CHAT_CALL_ICON: IconId = IconId::Audio;
+pub(super) const CHAT_REMOTE_ICON: IconId = IconId::PictureInPicture;
 pub(super) const CHAT_STATUS_EDIT_ICON: IconId = IconId::TextEdit;
 
 /// Render a conversation's messages with a muted **day separator** whenever the

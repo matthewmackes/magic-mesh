@@ -40,13 +40,14 @@ pub const fn app_icon(app: MeshTeamsApp) -> &'static str {
     }
 }
 
-/// The Carbon glyph for the selected channel's Posts / Files / Calls tab.
+/// The Carbon glyph for the selected channel's Posts / Files / Calls / Tasks tab.
 #[must_use]
 pub const fn channel_tab_icon(tab: ChannelTab) -> &'static str {
     match tab {
         ChannelTab::Posts => "share",
         ChannelTab::Files => "download",
         ChannelTab::Calls => "audio-volume-high",
+        ChannelTab::Tasks => "emblem-ok",
     }
 }
 
@@ -107,6 +108,12 @@ pub const THREAD: &str = "go-next";
 pub const THREAD_RESOLVE: &str = "emblem-ok";
 /// Reopen a resolved thread.
 pub const THREAD_REOPEN: &str = "view-refresh";
+/// Create a basic channel task.
+pub const TASK_CREATE: &str = "list-add";
+/// Toggle a basic channel task's checked state.
+pub const TASK_CHECK: &str = "emblem-ok";
+/// Complete a basic channel task.
+pub const TASK_COMPLETE: &str = "emblem-ok";
 
 /// Start a call in the selected space.
 pub const CALL_START: &str = "media-playback-start";

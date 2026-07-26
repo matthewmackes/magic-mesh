@@ -97,6 +97,24 @@ CREATE TABLE IF NOT EXISTS threads (
     clock_counter INTEGER NOT NULL
 );
 
+-- Basic channel tasks/action items. The task id is the TaskCreated event id.
+CREATE TABLE IF NOT EXISTS tasks (
+    space_id      TEXT NOT NULL,
+    task_event_id TEXT NOT NULL PRIMARY KEY,
+    title         TEXT NOT NULL,
+    created_by    TEXT NOT NULL,
+    created_ms    INTEGER NOT NULL,
+    source_event_id TEXT,
+    checked       INTEGER NOT NULL DEFAULT 0,
+    completed     INTEGER NOT NULL DEFAULT 0,
+    completed_by  TEXT,
+    completed_ms  INTEGER,
+    clock_wall    INTEGER NOT NULL,
+    clock_counter INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tasks_space_order
+    ON tasks (space_id, completed, clock_wall, clock_counter, task_event_id);
+
 -- The alert inbox (folded from AlertRaised, resolved ack/snooze).
 CREATE TABLE IF NOT EXISTS alerts (
     space_id      TEXT NOT NULL,

@@ -159,6 +159,32 @@ pub enum CollabCommand {
         /// The thread.
         thread: ThreadId,
     },
+    /// Create a basic channel task/action item.
+    CreateTask {
+        /// The space/channel that owns the task.
+        space: SpaceId,
+        /// Short operator-authored task title.
+        title: String,
+        /// Optional message that originated the action item.
+        #[serde(default)]
+        source: Option<EventId>,
+    },
+    /// Set a task's lightweight checked state.
+    SetTaskChecked {
+        /// The space/channel that owns the task.
+        space: SpaceId,
+        /// The task creation event id.
+        task: EventId,
+        /// Desired checked state.
+        checked: bool,
+    },
+    /// Mark a channel task complete.
+    CompleteTask {
+        /// The space/channel that owns the task.
+        space: SpaceId,
+        /// The task creation event id.
+        task: EventId,
+    },
 
     // ---- Alerts --------------------------------------------------------
     /// Acknowledge an alert.
@@ -418,6 +444,9 @@ impl CollabCommand {
             Self::ReplyInThread { .. } => "reply_in_thread",
             Self::ResolveThread { .. } => "resolve_thread",
             Self::ReopenThread { .. } => "reopen_thread",
+            Self::CreateTask { .. } => "create_task",
+            Self::SetTaskChecked { .. } => "set_task_checked",
+            Self::CompleteTask { .. } => "complete_task",
             Self::AckAlert { .. } => "ack_alert",
             Self::SnoozeAlert { .. } => "snooze_alert",
             Self::RunAlertAction { .. } => "run_alert_action",

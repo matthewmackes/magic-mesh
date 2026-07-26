@@ -411,4 +411,8 @@ the same `view.rs`/`model.rs` files.
 - Live: deploy to a seat (.15/.138) with real feeds and SSH-verify the
   `state/overlay/*` mirrors carry fresh `fetched_at` stamps + visually confirm
   paint — green unit tests are not "fixed" (live-verify-deploys rule).
+- Proof helper: `install-helpers/verify-live-mirrors.py --require-ready` must
+  fail closed when `fetched_at_ms` is stale or future-dated; a mirror may report
+  provider availability, but the verifier must not label it ready unless the
+  feed timestamp is fresh for the selected acceptance window.
 - License audit: grep the feed config for license tiers; §4 documents the failures.

@@ -270,6 +270,78 @@ fn every_lifecycle_route_renders_headless() {
 }
 
 #[test]
+fn provision_route_renders_grouped_sections_and_sticky_actions() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut state = state_on(DeliveryView::DesktopVm, WorkloadsRoute::Provision);
+    state.bus_root = Some(tmp.path().join("bus"));
+    state.selected_node = Some("eagle".to_string());
+    state.states[0].apply_armed = true;
+    state
+        .form
+        .set_test_draft("seat-1", "construct-desktop", "tags = [\"ops\"]");
+
+    let text = rendered_text(|ui| route_body(ui, &mut state));
+
+    for expected in [
+        "Placement & delivery",
+        "Placement node",
+        "Delivery filter",
+        "Live apply gate",
+        "Armed by current mirror",
+        "Identity",
+        "Sizing",
+        "Image & network",
+        "HCL override",
+        "Validation",
+        "Sticky actions",
+        "Set desired",
+        "Plan",
+        "Provision",
+    ] {
+        assert!(
+            text.contains(expected),
+            "Provision route must render grouped/sticky section {expected:?}: {text}"
+        );
+    }
+    assert_eq!(
+        emitted_request_count(&state, mackes_mesh_types::cloud::VERB_SET_DESIRED),
+        0,
+        "passive Provision render must not publish desired-state writes"
+    );
+    assert_eq!(
+        emitted_request_count(&state, mackes_mesh_types::cloud::VERB_PLAN),
+        0,
+        "passive Provision render must not publish plan requests"
+    );
+    assert_eq!(
+        emitted_request_count(&state, "provision"),
+        0,
+        "passive Provision render must not publish live provision requests"
+    );
+}
+
+#[test]
+fn provision_route_validation_distinguishes_plan_only_nodes() {
+    let mut state = state_on(DeliveryView::DesktopVm, WorkloadsRoute::Provision);
+    state.selected_node = Some("eagle".to_string());
+    state.states[0].apply_armed = false;
+    state.form.set_test_draft("seat-1", "", "");
+
+    let text = rendered_text(|ui| route_body(ui, &mut state));
+
+    assert!(text.contains("Plan-only / not armed"), "{text}");
+    assert!(text.contains("Live apply"), "{text}");
+    assert!(
+        text.contains("Plan remains available; live Provision stays disabled"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Provision is disabled because the selected node is plan-only"),
+        "{text}"
+    );
+}
+
+#[test]
 fn switching_filters_routes_and_density_works() {
     let mut state = state_on(DeliveryView::DesktopVm, WorkloadsRoute::Plan);
     assert_eq!(state.view(), DeliveryView::DesktopVm);

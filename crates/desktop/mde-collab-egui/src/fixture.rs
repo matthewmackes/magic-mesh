@@ -10,9 +10,10 @@ use std::collections::HashMap;
 
 use mde_collab_types::{
     ActivityEntry, ActivityFeed, ActorClock, ActorId, AlertInbox, CallKind, CallParticipantState,
-    CallParticipantView, CallState, CallView, ClipboardLane, ConversationTimeline, DeliveryState,
-    DocumentId, DocumentSessions, EventId, FileReferences, MessageView, SpaceDirectory, SpaceId,
-    SpaceKind, SpaceRole, SpaceSummary, ThreadId, ThreadTimeline, TransferJobs,
+    CallParticipantView, CallState, CallView, ChannelTasks, ClipboardLane, ConversationTimeline,
+    DeliveryState, DiscordBridgeBoard, DocumentId, DocumentSessions, EventId, FileReferences,
+    MessageView, SpaceDirectory, SpaceId, SpaceKind, SpaceRole, SpaceSummary, ThreadId,
+    ThreadTimeline, TransferJobs,
 };
 
 use crate::CollabData;
@@ -27,6 +28,7 @@ pub struct FixtureData {
     conversations: HashMap<SpaceId, ConversationTimeline>,
     threads: HashMap<ThreadId, ThreadTimeline>,
     thread_roots: HashMap<EventId, ThreadId>,
+    channel_tasks: HashMap<SpaceId, ChannelTasks>,
     call_state: CallState,
     file_references: HashMap<SpaceId, FileReferences>,
     transfer_jobs: TransferJobs,
@@ -34,6 +36,7 @@ pub struct FixtureData {
     clipboard_lanes: HashMap<SpaceId, ClipboardLane>,
     document_sessions: HashMap<SpaceId, DocumentSessions>,
     document_bodies: HashMap<DocumentId, String>,
+    discord_bridge_board: Option<DiscordBridgeBoard>,
 }
 
 impl FixtureData {
@@ -49,6 +52,7 @@ impl FixtureData {
             conversations: HashMap::new(),
             threads: HashMap::new(),
             thread_roots: HashMap::new(),
+            channel_tasks: HashMap::new(),
             call_state: CallState::default(),
             file_references: HashMap::new(),
             transfer_jobs: TransferJobs::default(),
@@ -56,6 +60,7 @@ impl FixtureData {
             clipboard_lanes: HashMap::new(),
             document_sessions: HashMap::new(),
             document_bodies: HashMap::new(),
+            discord_bridge_board: None,
         }
     }
 
@@ -87,6 +92,13 @@ impl FixtureData {
     pub fn with_thread(mut self, root: EventId, timeline: ThreadTimeline) -> Self {
         self.thread_roots.insert(root, timeline.thread);
         self.threads.insert(timeline.thread, timeline);
+        self
+    }
+
+    /// Set a space's basic channel tasks/action-items read model.
+    #[must_use]
+    pub fn with_channel_tasks(mut self, tasks: ChannelTasks) -> Self {
+        self.channel_tasks.insert(tasks.space, tasks);
         self
     }
 
@@ -141,6 +153,15 @@ impl FixtureData {
     #[must_use]
     pub fn with_document_body(mut self, document: DocumentId, body: impl Into<String>) -> Self {
         self.document_bodies.insert(document, body.into());
+        self
+    }
+
+    /// Set the Discord bridge status board. Tests use this to exercise the
+    /// read-only UI seam; no Discord provider is called and no server is
+    /// fabricated by default.
+    #[must_use]
+    pub fn with_discord_bridge_board(mut self, board: DiscordBridgeBoard) -> Self {
+        self.discord_bridge_board = Some(board);
         self
     }
 
@@ -344,6 +365,10 @@ impl CollabData for FixtureData {
         self.thread_roots.get(&root).copied()
     }
 
+    fn channel_tasks(&self, space: SpaceId) -> Option<&ChannelTasks> {
+        self.channel_tasks.get(&space)
+    }
+
     fn call_state(&self) -> &CallState {
         &self.call_state
     }
@@ -370,6 +395,10 @@ impl CollabData for FixtureData {
 
     fn document_body(&self, document: DocumentId) -> Option<&str> {
         self.document_bodies.get(&document).map(String::as_str)
+    }
+
+    fn discord_bridge_board(&self) -> Option<&DiscordBridgeBoard> {
+        self.discord_bridge_board.as_ref()
     }
 }
 

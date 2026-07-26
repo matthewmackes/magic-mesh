@@ -98,6 +98,17 @@ fn every_event_kind() -> Vec<CollabEventKind> {
         CollabEventKind::ThreadReopened {
             thread: ThreadId::new(),
         },
+        CollabEventKind::TaskCreated {
+            title: "check the gateway".into(),
+            source: Some(EventId::new()),
+        },
+        CollabEventKind::TaskChecked {
+            task: EventId::new(),
+            checked: true,
+        },
+        CollabEventKind::TaskCompleted {
+            task: EventId::new(),
+        },
         CollabEventKind::AlertRaised {
             alert: alert.clone(),
         },
@@ -267,6 +278,20 @@ fn every_command() -> Vec<CollabCommand> {
             space: SpaceId::new(),
             thread: ThreadId::new(),
         },
+        CollabCommand::CreateTask {
+            space: SpaceId::new(),
+            title: "check the gateway".into(),
+            source: Some(EventId::new()),
+        },
+        CollabCommand::SetTaskChecked {
+            space: SpaceId::new(),
+            task: EventId::new(),
+            checked: true,
+        },
+        CollabCommand::CompleteTask {
+            space: SpaceId::new(),
+            task: EventId::new(),
+        },
         CollabCommand::AckAlert {
             space: SpaceId::new(),
             alert: EventId::new(),
@@ -420,7 +445,7 @@ fn every_event_kind_round_trips_and_has_a_unique_tag() {
         );
     }
     // Guards against a variant being added without an accompanying sample here.
-    assert_eq!(tags.len(), 36, "sample set must cover every event kind");
+    assert_eq!(tags.len(), 39, "sample set must cover every event kind");
 }
 
 #[test]
@@ -433,7 +458,7 @@ fn every_command_round_trips_and_has_a_unique_verb() {
         assert_eq!(*c, back, "round-trip {}", c.verb());
         assert!(verbs.insert(c.verb()), "duplicate verb {}", c.verb());
     }
-    assert_eq!(verbs.len(), 44, "sample set must cover every command");
+    assert_eq!(verbs.len(), 47, "sample set must cover every command");
 }
 
 /// The delivery-lock gate: each of the seven replaced subsystems must have at
@@ -460,6 +485,9 @@ fn ledger_coverage_every_replaced_subsystem_has_covering_event_kinds() {
                 "message_edited",
                 "message_deleted",
                 "thread_started",
+                "task_created",
+                "task_checked",
+                "task_completed",
             ],
         ),
         (

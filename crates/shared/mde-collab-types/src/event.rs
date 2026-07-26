@@ -117,6 +117,26 @@ pub enum CollabEventKind {
         /// The reopened thread.
         thread: ThreadId,
     },
+    /// A basic channel task/action item was created.
+    TaskCreated {
+        /// Short operator-authored task title.
+        title: String,
+        /// Optional source message that produced the action item.
+        #[serde(default)]
+        source: Option<EventId>,
+    },
+    /// A task's lightweight checked state changed.
+    TaskChecked {
+        /// The task creation event id.
+        task: EventId,
+        /// Desired checked state.
+        checked: bool,
+    },
+    /// A task was completed.
+    TaskCompleted {
+        /// The task creation event id.
+        task: EventId,
+    },
 
     // ---- Alerts --------------------------------------------------------
     /// An alert was raised (folded from a truthful Bus lane) into the space.
@@ -314,6 +334,9 @@ impl CollabEventKind {
             Self::ThreadStarted { .. } => "thread_started",
             Self::ThreadResolved { .. } => "thread_resolved",
             Self::ThreadReopened { .. } => "thread_reopened",
+            Self::TaskCreated { .. } => "task_created",
+            Self::TaskChecked { .. } => "task_checked",
+            Self::TaskCompleted { .. } => "task_completed",
             Self::AlertRaised { .. } => "alert_raised",
             Self::AlertAcknowledged { .. } => "alert_acknowledged",
             Self::AlertSnoozed { .. } => "alert_snoozed",

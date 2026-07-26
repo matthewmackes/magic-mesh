@@ -1,11 +1,13 @@
 # Mackes-Carbon — IBM Carbon icon theme for GNOME & XFCE
 
 A [freedesktop.org Icon Theme Specification][spec] theme built from the
-[IBM Carbon Design System][carbon] icon set. Every glyph is a scalable SVG
-carrying `fill="currentColor"`, so the icons recolor with the desktop's GTK/Qt
-style context (light or dark) like any modern symbolic theme.
+[IBM Carbon Design System][carbon] icon set. Most glyphs are scalable SVGs
+carrying `fill="currentColor"`, so actions, status, and file icons recolor with
+the desktop's GTK/Qt style context (light or dark) like any modern symbolic
+theme. The `construct-*` core platform app/service icons are Mackes-Carbon V2:
+simple Carbon-derived linework with exactly three adapted product/service colors.
 
-- **4570 SVGs** across the 8 standard contexts — `actions`, `apps`,
+- **4594 SVGs** across the 8 standard contexts — `actions`, `apps`,
   `categories`, `devices`, `emblems`, `mimetypes`, `places`, `status`.
 - Names follow the [Icon Naming Specification][naming] (`folder`, `user-home`,
   `audio-volume-high`, `text-x-generic`, …), each with a `-symbolic` companion,
@@ -40,10 +42,11 @@ Drop the `Mackes-Carbon/` directory into any XDG icon path
 ## License
 
 The icon geometry is IBM Carbon, **Apache License 2.0** — see `LICENSE` and
-`NOTICE`. The only modification to upstream SVGs is the injection of
-`fill="currentColor"`; files are renamed/reorganized into the freedesktop
-directory layout, with common application aliases copied byte-for-byte from the
-matching Carbon glyph.
+`NOTICE`. The symbolic glyphs only inject `fill="currentColor"`; files are
+renamed/reorganized into the freedesktop directory layout, with common
+application aliases copied byte-for-byte from the matching Carbon glyph. The
+Construct V2 core icons are repo-authored Carbon-derived linework in the same
+theme so the shell and packaged freedesktop assets resolve consistently.
 
 ## Maintenance
 

@@ -32,6 +32,9 @@ pub const EDIT_WINDOW_MS: i64 = 5 * 60 * 1000;
 /// and materialized into an event that the read model would later reject.
 pub const MAX_MESSAGE_BODY_BYTES: usize = 256 * 1024;
 
+/// The maximum UTF-8 byte length of a basic channel task title.
+pub const MAX_TASK_TITLE_BYTES: usize = 512;
+
 /// The maximum number of tombstones one `ClearClipboard` command may author.
 ///
 /// The mesh clipboard history already retains at most 50 unpinned entries, so
@@ -419,6 +422,50 @@ pub fn apply_command<S: EventSigner, I: IdSource>(
             Ok(vec![ctx.emit(
                 *space,
                 CollabEventKind::ThreadReopened { thread: *thread },
+            )])
+        }
+        CollabCommand::CreateTask {
+            space,
+            title,
+            source,
+        } => {
+            require_active_space(state, *space)?;
+            require_member(state, *space, &ctx.actor)?;
+            validate_task_title(title)?;
+            if let Some(source) = source {
+                require_message(state, *space, *source)?;
+            }
+            Ok(vec![ctx.emit(
+                *space,
+                CollabEventKind::TaskCreated {
+                    title: title.trim().to_owned(),
+                    source: *source,
+                },
+            )])
+        }
+        CollabCommand::SetTaskChecked {
+            space,
+            task,
+            checked,
+        } => {
+            require_active_space(state, *space)?;
+            require_member(state, *space, &ctx.actor)?;
+            require_open_task(state, *space, *task)?;
+            Ok(vec![ctx.emit(
+                *space,
+                CollabEventKind::TaskChecked {
+                    task: *task,
+                    checked: *checked,
+                },
+            )])
+        }
+        CollabCommand::CompleteTask { space, task } => {
+            require_active_space(state, *space)?;
+            require_member(state, *space, &ctx.actor)?;
+            require_open_task(state, *space, *task)?;
+            Ok(vec![ctx.emit(
+                *space,
+                CollabEventKind::TaskCompleted { task: *task },
             )])
         }
 
@@ -890,6 +937,20 @@ fn validate_message_body(body: &MessageBody) -> Result<()> {
     Ok(())
 }
 
+/// Reject empty or oversized task titles before an event id/HLC tick is consumed.
+fn validate_task_title(title: &str) -> Result<()> {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return Err(CollabError::Serde("task title is empty".into()));
+    }
+    if trimmed.len() > MAX_TASK_TITLE_BYTES {
+        return Err(CollabError::Serde(format!(
+            "task title exceeds {MAX_TASK_TITLE_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
 /// The actor must be a present member of the space.
 fn require_member(
     state: &DomainState,
@@ -931,6 +992,15 @@ fn require_message(
     match state.messages.get(&target) {
         Some(m) if m.space == space => Ok(m.clone()),
         _ => Err(CollabError::MessageNotFound(target)),
+    }
+}
+
+/// The task must exist in this space and still be open.
+fn require_open_task(state: &DomainState, space: SpaceId, task: EventId) -> Result<()> {
+    match state.tasks.get(&task) {
+        Some(t) if t.space == space && !t.completed => Ok(()),
+        Some(t) if t.space == space => Err(CollabError::TaskAlreadyCompleted(task)),
+        _ => Err(CollabError::TaskNotFound(task)),
     }
 }
 
@@ -1592,6 +1662,116 @@ mod tests {
             &mut alice,
         );
         assert!(matches!(denied, Err(CollabError::ThreadNotFound(_))));
+    }
+
+    #[test]
+    fn channel_task_commands_emit_convergent_lifecycle_events() {
+        let signer = Ed25519Signer::from_seed([15; 32]);
+        let mut ids = SeqIds(400);
+        let mut alice = ApplyCtx::new(ActorId::new("alice"), 1_000, &signer, &mut ids);
+        let mut events = apply_command(
+            &DomainState::default(),
+            &CollabCommand::CreateSpace {
+                kind: SpaceKind::Team,
+                name: "ops".into(),
+            },
+            &mut alice,
+        )
+        .expect("create space");
+        let space = events[0].space_id;
+
+        let created = apply_command(
+            &DomainState::from_events(&events),
+            &CollabCommand::CreateTask {
+                space,
+                title: " check the gateway ".into(),
+                source: None,
+            },
+            &mut alice,
+        )
+        .expect("create task");
+        let task = created[0].event_id;
+        assert!(matches!(
+            &created[0].kind,
+            CollabEventKind::TaskCreated { title, source: None } if title == "check the gateway"
+        ));
+        events.extend(created);
+
+        let checked = apply_command(
+            &DomainState::from_events(&events),
+            &CollabCommand::SetTaskChecked {
+                space,
+                task,
+                checked: true,
+            },
+            &mut alice,
+        )
+        .expect("check task");
+        assert!(matches!(
+            checked[0].kind,
+            CollabEventKind::TaskChecked { task: t, checked: true } if t == task
+        ));
+        events.extend(checked);
+
+        let completed = apply_command(
+            &DomainState::from_events(&events),
+            &CollabCommand::CompleteTask { space, task },
+            &mut alice,
+        )
+        .expect("complete task");
+        assert!(matches!(
+            completed[0].kind,
+            CollabEventKind::TaskCompleted { task: t } if t == task
+        ));
+        events.extend(completed);
+
+        let denied = apply_command(
+            &DomainState::from_events(&events),
+            &CollabCommand::SetTaskChecked {
+                space,
+                task,
+                checked: false,
+            },
+            &mut alice,
+        );
+        assert!(matches!(denied, Err(CollabError::TaskAlreadyCompleted(t)) if t == task));
+    }
+
+    #[test]
+    fn channel_task_title_rejection_does_not_consume_clock_or_id() {
+        let signer = Ed25519Signer::from_seed([16; 32]);
+        let mut ids = SeqIds(500);
+        let mut alice = ApplyCtx::new(ActorId::new("alice"), 1_000, &signer, &mut ids);
+        let events = apply_command(
+            &DomainState::default(),
+            &CollabCommand::CreateSpace {
+                kind: SpaceKind::Team,
+                name: "ops".into(),
+            },
+            &mut alice,
+        )
+        .expect("create space");
+        let space = events[0].space_id;
+        let state = DomainState::from_events(&events);
+        let before_clock = alice.clock;
+        let before_next_id = alice.ids.0;
+
+        let denied = apply_command(
+            &state,
+            &CollabCommand::CreateTask {
+                space,
+                title: " ".into(),
+                source: None,
+            },
+            &mut alice,
+        );
+
+        assert!(matches!(
+            denied,
+            Err(CollabError::Serde(message)) if message == "task title is empty"
+        ));
+        assert_eq!(alice.clock, before_clock);
+        assert_eq!(alice.ids.0, before_next_id);
     }
 
     fn state_with_unpinned_clips(

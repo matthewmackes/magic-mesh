@@ -13,10 +13,12 @@ use std::collections::BTreeMap;
 
 use mde_collab_types::{
     ActivityFeed, ActorId, AlertAction, AlertActionKind, AlertInbox, AlertPayload, AlertView,
-    CallId, CallKind, CallParticipantState, CallParticipantView, CallView, ClipItemKind,
-    ClipboardLane, ClipboardView, CollabCommand, ConversationTimeline, DeliveryState, DocumentId,
+    CallId, CallKind, CallParticipantState, CallParticipantView, CallView, ChannelTasks,
+    ClipItemKind, ClipboardLane, ClipboardView, CollabCommand, ConversationTimeline, DeliveryState,
+    DiscordBridgeBoard, DiscordBridgeConfigStatus, DiscordBridgeFlowStatus,
+    DiscordBridgeProvenance, DiscordBridgeProvenanceSource, DiscordBridgeView, DocumentId,
     DocumentSession, DocumentSessions, EventId, FileRef, FileRefId, FileReferenceView,
-    FileReferences, ReviewVerdict, Severity, SpaceId, SpaceKind, SpaceRole, ThreadId,
+    FileReferences, ReviewVerdict, Severity, SpaceId, SpaceKind, SpaceRole, TaskView, ThreadId,
     ThreadTimeline, TransferControl, TransferDirection, TransferId, TransferJobView, TransferJobs,
     TransferMethod, TransferState,
 };
@@ -88,13 +90,55 @@ fn render_shapes(
     surface: &mut CommunicationsSurface,
     data: &dyn CollabData,
 ) -> Vec<egui::epaint::ClippedShape> {
+    render_shapes_with_size(surface, data, egui::vec2(1000.0, 700.0))
+}
+
+fn render_shapes_with_size(
+    surface: &mut CommunicationsSurface,
+    data: &dyn CollabData,
+    size: egui::Vec2,
+) -> Vec<egui::epaint::ClippedShape> {
     let ctx = egui::Context::default();
     Style::install(&ctx);
     let mut sink = CommandSink::new();
-    let out = ctx.run(sized_input(vec![]), |ctx| {
-        egui::CentralPanel::default().show(ctx, |ui| surface.ui(ui, data, &mut sink));
-    });
+    let out = ctx.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            events: Vec::new(),
+            time: Some(0.0),
+            ..Default::default()
+        },
+        |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| surface.ui(ui, data, &mut sink));
+        },
+    );
     out.shapes
+}
+
+fn render_shapes_after_animation(
+    surface: &mut CommunicationsSurface,
+    data: &dyn CollabData,
+    size: egui::Vec2,
+) -> Vec<egui::epaint::ClippedShape> {
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let mut sink = CommandSink::new();
+    let mut shapes = Vec::new();
+    for time in [0.0, 1.0] {
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                events: Vec::new(),
+                time: Some(time),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| surface.ui(ui, data, &mut sink));
+            },
+        );
+        shapes = out.shapes;
+    }
+    shapes
 }
 
 /// Render one frame with the Ford SYNC 3 **Auto (Car Mode)** skin installed, so
@@ -426,6 +470,10 @@ fn details_pane_model_reads_selected_channel_facts() {
     assert_eq!(details.documents, 1);
     assert_eq!(details.active_calls, 1);
     assert_eq!(details.clips, 1);
+    assert_eq!(details.discord_bridges.len(), 1);
+    assert_eq!(details.discord_bridges[0].status, "Unconfigured");
+    assert_eq!(details.discord_bridges[0].inbound, "Not configured");
+    assert_eq!(details.discord_bridges[0].outbound, "Not configured");
 
     assert!(
         crate::frame::channel_details_model(Some(other), &data).is_some(),
@@ -435,6 +483,91 @@ fn details_pane_model_reads_selected_channel_facts() {
         crate::frame::channel_details_model(Some(SpaceId::new()), &data).is_none(),
         "a stale selection must not produce a Details pane target"
     );
+}
+
+#[test]
+fn details_pane_model_scopes_discord_bridge_to_selected_channel() {
+    let space = SpaceId::new();
+    let other = SpaceId::new();
+    let data = FixtureData::new("eagle", 1_000_000)
+        .with_space(space_summary(
+            space,
+            SpaceKind::Team,
+            "Team Ops",
+            SpaceRole::Owner,
+            0,
+            4,
+            990_000,
+        ))
+        .with_space(space_summary(
+            other,
+            SpaceKind::Incident,
+            "Incident 42",
+            SpaceRole::Member,
+            0,
+            2,
+            980_000,
+        ))
+        .with_discord_bridge_board(DiscordBridgeBoard {
+            bridges: vec![
+                DiscordBridgeView {
+                    bridge_id: "ops-bridge".to_owned(),
+                    space: Some(space),
+                    label: "Ops Discord bridge".to_owned(),
+                    status: DiscordBridgeConfigStatus::Configured,
+                    inbound: DiscordBridgeFlowStatus::Ready,
+                    outbound: DiscordBridgeFlowStatus::Ready,
+                    provenance: DiscordBridgeProvenance {
+                        source: DiscordBridgeProvenanceSource::OperatorConfig,
+                        authority: Some("mesh-team-revision:42".to_owned()),
+                        observed_by: Some("seat-15".to_owned()),
+                        config_digest: Some("sha256:ops".to_owned()),
+                    },
+                    detail: None,
+                    updated_unix_ms: 995_000,
+                },
+                DiscordBridgeView {
+                    bridge_id: "incident-provider".to_owned(),
+                    space: Some(other),
+                    label: "Incident Discord bridge".to_owned(),
+                    status: DiscordBridgeConfigStatus::ProviderUnavailable,
+                    inbound: DiscordBridgeFlowStatus::ProviderUnavailable,
+                    outbound: DiscordBridgeFlowStatus::Degraded,
+                    provenance: DiscordBridgeProvenance {
+                        source: DiscordBridgeProvenanceSource::WorkerState,
+                        authority: Some("mesh-team-revision:43".to_owned()),
+                        observed_by: Some("seat-15".to_owned()),
+                        config_digest: Some("sha256:incident".to_owned()),
+                    },
+                    detail: Some("Discord provider adapter unavailable.".to_owned()),
+                    updated_unix_ms: 996_000,
+                },
+            ],
+        });
+
+    let details =
+        crate::frame::channel_details_model(Some(space), &data).expect("selected channel details");
+    assert_eq!(details.discord_bridges.len(), 1);
+    assert_eq!(details.discord_bridges[0].label, "Ops Discord bridge");
+    assert_eq!(details.discord_bridges[0].status, "Configured");
+    assert_eq!(details.discord_bridges[0].inbound, "Ready");
+    assert_eq!(details.discord_bridges[0].outbound, "Ready");
+    assert!(
+        details.discord_bridges[0]
+            .provenance
+            .contains("Operator config"),
+        "configured rows must expose provenance: {:?}",
+        details.discord_bridges[0]
+    );
+
+    let other_details =
+        crate::frame::channel_details_model(Some(other), &data).expect("other channel details");
+    assert_eq!(other_details.discord_bridges.len(), 1);
+    assert_eq!(
+        other_details.discord_bridges[0].status,
+        "Provider unavailable"
+    );
+    assert_eq!(other_details.discord_bridges[0].outbound, "Degraded");
 }
 
 #[test]
@@ -453,6 +586,10 @@ fn details_pane_paints_inside_the_frame() {
         "Documents",
         "Active calls",
         "Clip items",
+        "Discord bridge",
+        "Discord → Mesh",
+        "Mesh → Discord",
+        "Provenance",
     ] {
         assert!(
             texts.iter().any(|(text, _)| text == expected),
@@ -488,7 +625,7 @@ fn app_rail_model_exposes_operator_apps_in_order() {
 }
 
 #[test]
-fn channel_tabs_are_posts_files_calls_only() {
+fn channel_tabs_include_posts_files_calls_and_tasks() {
     let tabs: Vec<_> = ChannelTab::ALL
         .iter()
         .map(|tab| {
@@ -505,7 +642,123 @@ fn channel_tabs_are_posts_files_calls_only() {
             ("Posts", Mode::Messages, "share"),
             ("Files", Mode::Files, "download"),
             ("Calls", Mode::Calls, "audio-volume-high"),
+            ("Tasks", Mode::Tasks, "emblem-ok"),
         ]
+    );
+}
+
+#[test]
+fn channel_tasks_mode_renders_projected_rows() {
+    let space = SpaceId::new();
+    let task = EventId::new();
+    let data = FixtureData::new("eagle", 1_000_000)
+        .with_space(space_summary(
+            space,
+            SpaceKind::Team,
+            "Team Ops",
+            SpaceRole::Owner,
+            0,
+            4,
+            990_000,
+        ))
+        .with_channel_tasks(ChannelTasks {
+            space,
+            tasks: vec![TaskView {
+                task,
+                space,
+                title: "Rotate gateway".to_owned(),
+                created_by: ActorId::new("falcon"),
+                created_unix_ms: 990_000,
+                source: None,
+                checked: false,
+                completed: false,
+                completed_by: None,
+                completed_unix_ms: None,
+            }],
+        });
+    let mut surface = CommunicationsSurface::new();
+    surface.select_space(space);
+    surface.set_channel_tab(ChannelTab::Tasks);
+
+    let texts = painted_text(&render_shapes_after_animation(
+        &mut surface,
+        &data,
+        egui::vec2(1000.0, 700.0),
+    ));
+    for expected in [
+        "Tasks",
+        "Channel tasks",
+        "operator-authored action items",
+        "Rotate gateway",
+    ] {
+        assert!(
+            texts.iter().any(|(text, _)| text == expected),
+            "Tasks mode must paint {expected:?}: {texts:?}"
+        );
+    }
+    assert!(
+        texts
+            .iter()
+            .any(|(text, _)| text.starts_with("by falcon ·")),
+        "Tasks mode must paint task authorship metadata: {texts:?}"
+    );
+}
+
+#[test]
+fn channel_task_actions_emit_create_check_and_complete_commands() {
+    let space = SpaceId::new();
+    let task = EventId::new();
+    let mut surface = CommunicationsSurface::new();
+    surface.select_space(space);
+
+    let mut sink = CommandSink::new();
+    surface.set_task_draft(space, " rotate gateway ");
+    surface.create_task_from_draft(&mut sink, space);
+    assert!(
+        matches!(
+            sink.queued().first(),
+            Some(CollabCommand::CreateTask {
+                space: command_space,
+                title,
+                source
+            }) if *command_space == space && title == "rotate gateway" && source.is_none()
+        ),
+        "creating a task must emit a typed CreateTask command: {:?}",
+        sink.queued()
+    );
+    assert_eq!(
+        surface.task_draft(space),
+        "",
+        "the draft clears after a successful create"
+    );
+
+    let mut sink = CommandSink::new();
+    surface.set_task_checked(&mut sink, space, task, true);
+    assert!(
+        matches!(
+            sink.queued().first(),
+            Some(CollabCommand::SetTaskChecked {
+                space: command_space,
+                task: command_task,
+                checked: true
+            }) if *command_space == space && *command_task == task
+        ),
+        "checking a task must emit a typed SetTaskChecked command: {:?}",
+        sink.queued()
+    );
+
+    let mut sink = CommandSink::new();
+    surface.complete_task(&mut sink, space, task);
+    assert!(
+        matches!(
+            sink.queued().first(),
+            Some(CollabCommand::CompleteTask {
+                space: command_space,
+                task: command_task
+            }) if *command_space == space && *command_task == task
+        ),
+        "completing a task must emit a typed CompleteTask command: {:?}",
+        sink.queued()
     );
 }
 
@@ -2618,7 +2871,9 @@ fn settings_surface_shows_provider_devices_without_fake_enumeration() {
         "Provider devices",
         "Visible but disabled until the live media provider enumerates microphone, camera, and screen sources.",
         "System default",
-        "Discord bridge settings appear here when the live bridge provider enumerates; no fake servers are shown.",
+        "Discord bridge",
+        "Unconfigured",
+        "No bridge projection",
     ] {
         assert!(
             texts.iter().any(|(text, _)| text == expected),
@@ -2629,6 +2884,107 @@ fn settings_surface_shows_provider_devices_without_fake_enumeration() {
         !texts.iter().any(|(text, _)| text == "Mock Discord Server"),
         "Settings must not fabricate a bridge provider"
     );
+}
+
+#[test]
+fn settings_surface_shows_discord_bridge_rows_without_provider_calls_or_fake_servers() {
+    let space = SpaceId::new();
+    let data = FixtureData::new("eagle", 1_000_000)
+        .with_space(space_summary(
+            space,
+            SpaceKind::Team,
+            "Team Ops",
+            SpaceRole::Owner,
+            0,
+            4,
+            990_000,
+        ))
+        .with_discord_bridge_board(DiscordBridgeBoard {
+            bridges: vec![
+                DiscordBridgeView {
+                    bridge_id: "unconfigured-row".to_owned(),
+                    space: None,
+                    label: "Discord bridge not configured".to_owned(),
+                    status: DiscordBridgeConfigStatus::Unconfigured,
+                    inbound: DiscordBridgeFlowStatus::NotConfigured,
+                    outbound: DiscordBridgeFlowStatus::NotConfigured,
+                    provenance: DiscordBridgeProvenance {
+                        source: DiscordBridgeProvenanceSource::None,
+                        authority: None,
+                        observed_by: None,
+                        config_digest: None,
+                    },
+                    detail: Some("No operator bridge mapping exists.".to_owned()),
+                    updated_unix_ms: 990_000,
+                },
+                DiscordBridgeView {
+                    bridge_id: "provider-unavailable-row".to_owned(),
+                    space: Some(space),
+                    label: "Ops Discord bridge provider".to_owned(),
+                    status: DiscordBridgeConfigStatus::ProviderUnavailable,
+                    inbound: DiscordBridgeFlowStatus::ProviderUnavailable,
+                    outbound: DiscordBridgeFlowStatus::Degraded,
+                    provenance: DiscordBridgeProvenance {
+                        source: DiscordBridgeProvenanceSource::WorkerState,
+                        authority: Some("mesh-team-revision:43".to_owned()),
+                        observed_by: Some("seat-15".to_owned()),
+                        config_digest: Some("sha256:provider".to_owned()),
+                    },
+                    detail: Some("Discord provider adapter unavailable.".to_owned()),
+                    updated_unix_ms: 995_000,
+                },
+                DiscordBridgeView {
+                    bridge_id: "configured-row".to_owned(),
+                    space: Some(space),
+                    label: "Ops Discord bridge".to_owned(),
+                    status: DiscordBridgeConfigStatus::Configured,
+                    inbound: DiscordBridgeFlowStatus::Ready,
+                    outbound: DiscordBridgeFlowStatus::Ready,
+                    provenance: DiscordBridgeProvenance {
+                        source: DiscordBridgeProvenanceSource::OperatorConfig,
+                        authority: Some("mesh-team-revision:44".to_owned()),
+                        observed_by: Some("seat-15".to_owned()),
+                        config_digest: Some("sha256:configured".to_owned()),
+                    },
+                    detail: None,
+                    updated_unix_ms: 999_000,
+                },
+            ],
+        });
+    let mut surface = CommunicationsSurface::new();
+    surface.set_app(MeshTeamsApp::Settings);
+    let texts = painted_text(&render_shapes_with_size(
+        &mut surface,
+        &data,
+        egui::vec2(1000.0, 1200.0),
+    ));
+
+    for expected in [
+        "Discord bridge",
+        "Discord bridge not configured",
+        "Provider unavailable",
+        "Configured",
+        "Discord → Mesh",
+        "Mesh → Discord",
+        "Provenance",
+        "Operator config · authority mesh-team-revision:44 · observed by seat-15 · config sha256:configured",
+        "Discord provider adapter unavailable.",
+    ] {
+        assert!(
+            texts.iter().any(|(text, _)| text == expected),
+            "Settings must render the Discord bridge seam row {expected:?}: {texts:?}"
+        );
+    }
+    for fabricated in [
+        "Mock Discord Server",
+        "Fake Discord Server",
+        "General Discord Server",
+    ] {
+        assert!(
+            !texts.iter().any(|(text, _)| text == fabricated),
+            "Discord settings must not fabricate external servers: {texts:?}"
+        );
+    }
 }
 
 #[test]

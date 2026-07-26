@@ -11,9 +11,9 @@
 //! [`FixtureData`](crate::FixtureData).
 
 use mde_collab_types::{
-    ActivityFeed, ActorId, AlertInbox, CallState, ClipboardLane, CollabCommand,
-    ConversationTimeline, DocumentId, DocumentSessions, EventId, FileReferences, MessageView,
-    SpaceDirectory, SpaceId, ThreadId, ThreadTimeline, TransferJobs,
+    ActivityFeed, ActorId, AlertInbox, CallState, ChannelTasks, ClipboardLane, CollabCommand,
+    ConversationTimeline, DiscordBridgeBoard, DocumentId, DocumentSessions, EventId,
+    FileReferences, MessageView, SpaceDirectory, SpaceId, ThreadId, ThreadTimeline, TransferJobs,
 };
 
 /// The message **edit/delete window** in milliseconds: an author may amend
@@ -65,6 +65,14 @@ pub trait CollabData {
     #[must_use]
     fn thread_for_root(&self, space: SpaceId, root: EventId) -> Option<ThreadId> {
         let _ = (space, root);
+        None
+    }
+
+    /// A space's basic channel tasks/action items. `None` means no retained task
+    /// projection has arrived yet; the surface renders an honest empty state.
+    #[must_use]
+    fn channel_tasks(&self, space: SpaceId) -> Option<&ChannelTasks> {
+        let _ = space;
         None
     }
 
@@ -144,6 +152,16 @@ pub trait CollabData {
     #[must_use]
     fn document_body(&self, document: DocumentId) -> Option<&str> {
         let _ = document;
+        None
+    }
+
+    /// External Discord bridge worker status.
+    ///
+    /// `None` means the read-side provider has not published a bridge board. The
+    /// UI must render that as an honest unconfigured state, not as a fake server
+    /// or a silent omission.
+    #[must_use]
+    fn discord_bridge_board(&self) -> Option<&DiscordBridgeBoard> {
         None
     }
 }

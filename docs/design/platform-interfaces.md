@@ -28,7 +28,11 @@ bar. The Dock is governed launcher chrome, not a taskbar revival.
 The HIG is applied as **principles, not pixels** (survey Q1). We do not imitate
 Apple's appearance; we hold every surface to the HIG's quality bar, implemented
 through the shared `mde-egui` `Style`/`Motion` modules (the sole look source,
-§4) and the Mackes-Carbon icon set (kept, operator lock). The airgapped-safe
+§4) and the Mackes-Carbon icon set (kept, operator lock). The 2026-07-26 icon
+V2 survey sets the icon treatment: core platform app/service/role icons use
+simple Carbon-derived linework with exactly three adapted
+product/service-associated colors and no plates; toolbar/action/status icons
+remain monochrome and are color-coded by semantic state. The airgapped-safe
 distillation below is the in-repo statement of the standard; per-requirement
 citations name the HIG section they derive from (survey Q43: both).
 
@@ -116,8 +120,9 @@ Light is a production first-class appearance, both share azure accent
   explicit full-pixel guarantee (for example focused VDI). Every launchable
   surface remains reachable from the Dock with shrink-to-fit cells; pinned state
   is the Dock authority.
-- Dock treatment (Q22): rounded-rect cells, taxonomy/accent treatment, white
-  Carbon glyphs, compact labels as density allows. *(App Icons — as principles:
+- Dock treatment (Q22): rounded-rect cells, taxonomy/accent treatment,
+  Mackes-Carbon V2 tri-color linework surface glyphs with no icon plate inside
+  the artwork, compact labels as density allows. *(App Icons — as principles:
   one silhouette language, no photorealism)*
 - No page indicator dots or page swipe; Tab/arrow keys, Dock activation, and
   Front Door search open the complete launcher set directly.

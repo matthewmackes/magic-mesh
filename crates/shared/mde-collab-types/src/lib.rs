@@ -66,15 +66,17 @@ pub use read_model::{
     AiSuggestionRequests, AlertInbox, AlertView, CallMediaAdapter, CallMediaAdmission,
     CallMediaFrameEvidence, CallMediaReadiness, CallMediaRequirement, CallMediaSession,
     CallMediaVerification, CallMediaVerificationRow, CallMediaVerificationStatus,
-    CallParticipantView, CallState, CallView, ClipboardLane, ClipboardView, CollabReadModel,
-    CommsBadges, ConversationTimeline, DocumentSession, DocumentSessions, FileReferenceView,
-    FileReferences, MessageView, PresenceBoard, PresenceView, SpaceDirectory, SpaceSummary,
-    ThreadTimeline, TransferJobView, TransferJobs,
+    CallParticipantView, CallState, CallView, ChannelTasks, ClipboardLane, ClipboardView,
+    CollabReadModel, CommsBadges, ConversationTimeline, DiscordBridgeBoard,
+    DiscordBridgeConfigStatus, DiscordBridgeFlowStatus, DiscordBridgeProvenance,
+    DiscordBridgeProvenanceSource, DiscordBridgeView, DocumentSession, DocumentSessions,
+    FileReferenceView, FileReferences, MessageView, PresenceBoard, PresenceView, SpaceDirectory,
+    SpaceSummary, TaskView, ThreadTimeline, TransferJobView, TransferJobs,
 };
 pub use space::{SpaceKind, SpaceRole};
 pub use value::{
-    AiSuggestion, AiSuggestionKind, AlertAction, AlertActionKind, AlertPayload, CallKind,
-    CallParticipantState, ClipItemKind, ClipboardItem, DeliveryState, DocumentChange, FileRef,
-    MessageBody, PayloadRef, PresenceState, ReviewVerdict, Severity, TransferDirection,
-    TransferMethod, TransferState, sha256_hex,
+    sha256_hex, AiSuggestion, AiSuggestionKind, AlertAction, AlertActionKind, AlertPayload,
+    CallKind, CallParticipantState, ClipItemKind, ClipboardItem, DeliveryState, DocumentChange,
+    FileRef, MessageBody, PayloadRef, PresenceState, ReviewVerdict, Severity, TransferDirection,
+    TransferMethod, TransferState,
 };

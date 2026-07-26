@@ -2,10 +2,10 @@
 //! specific, human-legible variant — a denied action is *visible* (an `Err`),
 //! never a silent no-op (the epic's "denied actions stay visible" rule).
 
-use mde_collab_types::ActorId;
 use mde_collab_types::ids::{
     CallId, DocumentId, EventId, FileRefId, SpaceId, ThreadId, TransferId,
 };
+use mde_collab_types::ActorId;
 use mde_collab_types::{TransferControl, TransferState};
 use thiserror::Error;
 
@@ -29,6 +29,12 @@ pub enum CollabError {
     /// The referenced thread does not exist.
     #[error("thread {0} does not exist")]
     ThreadNotFound(ThreadId),
+    /// The referenced channel task does not exist.
+    #[error("task {0} does not exist")]
+    TaskNotFound(EventId),
+    /// The referenced channel task is already complete.
+    #[error("task {0} is already complete")]
+    TaskAlreadyCompleted(EventId),
     /// The referenced document does not exist.
     #[error("document {0} does not exist")]
     DocumentNotFound(DocumentId),

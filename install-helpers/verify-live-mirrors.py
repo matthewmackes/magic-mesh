@@ -456,6 +456,7 @@ def validate_overlay(
         errors.append(
             f"payload host {payload.get('host')!r} does not match vehicle host {expected_host!r}"
         )
+    age_errors: list[str] = []
     fetched_at = payload.get("fetched_at_ms")
     if fetched_at is None:
         errors.append("missing fetched_at_ms; publication alone is not feed evidence")
@@ -465,7 +466,9 @@ def validate_overlay(
         errors.extend(age_errors)
     availability = payload.get("availability")
     availability_text = availability if isinstance(availability, str) else None
-    ready = fetched_at is not None and availability_text not in {"unconfigured", "secret_store_error", "error", "paused"}
+    fresh = fetched_at is not None and not age_errors
+    available = availability_text not in {"unconfigured", "secret_store_error", "error", "paused"}
+    ready = fresh and available
     license_tier_errors = _license_tier_errors(payload)
     errors.extend(license_tier_errors)
     catalog_feed = _overlay_catalog_feed(topic)
@@ -480,7 +483,8 @@ def validate_overlay(
         {
             "kind": "overlay",
             "age_ms": age_ms,
-            "fresh": fetched_at is not None and not any("stale" in error or "future" in error for error in errors),
+            "fresh": fresh,
+            "available": available,
             "ready": ready,
             "availability": availability_text,
             "fetched_at_ms": fetched_at,
@@ -1494,6 +1498,9 @@ def _self_test() -> None:
             root, "state/overlay/usgs-earthquakes/test-node", now_ms, 1_000, True, False
         )
         assert stale["errors"], stale
+        assert stale["fresh"] is False, stale
+        assert stale["ready"] is False, stale
+        assert any("overlay is not ready" in error for error in stale["errors"]), stale
 
         symlink_topic = "state/overlay/symlink/test-node"
         outside = root.parent / f"{root.name}-outside.json"

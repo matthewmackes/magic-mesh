@@ -2,7 +2,7 @@
 //! Channels rail, channel header/tabs, and call bar. Every body renders inside
 //! it, so the frame is what makes the surface feel like one place — the channel
 //! rail is the selection key, the app rail switches global tools, the Teams tab
-//! strip switches Posts / Files / Calls for the selected channel, and the call
+//! strip switches Posts / Files / Calls / Tasks for the selected channel, and the call
 //! bar is pinned and survives every app/channel switch (spec §1).
 //!
 //! PLATFORM-INTERFACES Q19 — the rail is the shared
@@ -18,8 +18,10 @@ use mde_egui::nav_chrome::{Sidebar, SidebarRow, SidebarSection};
 use mde_egui::Style;
 
 use mde_collab_types::{
-    CallId, CallKind, CallParticipantState, CallView, CollabCommand, SpaceDirectory, SpaceId,
-    SpaceKind, SpaceRole, SpaceSummary,
+    CallId, CallKind, CallParticipantState, CallView, CollabCommand, DiscordBridgeBoard,
+    DiscordBridgeConfigStatus, DiscordBridgeFlowStatus, DiscordBridgeProvenance,
+    DiscordBridgeProvenanceSource, DiscordBridgeView, SpaceDirectory, SpaceId, SpaceKind,
+    SpaceRole, SpaceSummary,
 };
 
 use crate::{icons, ChannelTab, CommunicationsSurface, MeshTeamsApp};
@@ -84,6 +86,121 @@ fn selected_space_summary(
     selected.and_then(|selected| directory.spaces.iter().find(|space| space.id == selected))
 }
 
+/// Pure UI row for Discord bridge state.
+///
+/// It is deliberately derived from a read model or from the explicit
+/// "unconfigured" fallback. It never names a fake server and never calls a
+/// provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DiscordBridgeRowModel {
+    pub(crate) label: String,
+    pub(crate) status: &'static str,
+    pub(crate) inbound: &'static str,
+    pub(crate) outbound: &'static str,
+    pub(crate) provenance: String,
+    pub(crate) detail: Option<String>,
+}
+
+/// Build Settings-pane Discord bridge rows. Missing/empty read models become one
+/// honest unconfigured row so the operator sees the seam without a fake server.
+#[must_use]
+pub(crate) fn discord_bridge_rows_for_settings(
+    board: Option<&DiscordBridgeBoard>,
+) -> Vec<DiscordBridgeRowModel> {
+    match board {
+        Some(board) if !board.bridges.is_empty() => {
+            board.bridges.iter().map(discord_bridge_row_model).collect()
+        }
+        _ => vec![discord_bridge_unconfigured_row()],
+    }
+}
+
+/// Build selected-channel Discord bridge rows. Rows scoped to another channel do
+/// not leak into this channel's Details pane; sparse/missing projections render
+/// an honest unconfigured row.
+#[must_use]
+pub(crate) fn discord_bridge_rows_for_space(
+    space: SpaceId,
+    board: Option<&DiscordBridgeBoard>,
+) -> Vec<DiscordBridgeRowModel> {
+    let rows: Vec<_> = board
+        .into_iter()
+        .flat_map(|board| board.bridges.iter())
+        .filter(|row| row.space == Some(space))
+        .map(discord_bridge_row_model)
+        .collect();
+    if rows.is_empty() {
+        vec![discord_bridge_unconfigured_row()]
+    } else {
+        rows
+    }
+}
+
+fn discord_bridge_unconfigured_row() -> DiscordBridgeRowModel {
+    DiscordBridgeRowModel {
+        label: "Discord bridge".to_owned(),
+        status: discord_bridge_status_label(DiscordBridgeConfigStatus::Unconfigured),
+        inbound: discord_bridge_flow_label(DiscordBridgeFlowStatus::NotConfigured),
+        outbound: discord_bridge_flow_label(DiscordBridgeFlowStatus::NotConfigured),
+        provenance: discord_bridge_provenance_label(&DiscordBridgeProvenance {
+            source: DiscordBridgeProvenanceSource::None,
+            authority: None,
+            observed_by: None,
+            config_digest: None,
+        }),
+        detail: Some(
+            "No Discord bridge configuration has been projected for this channel.".to_owned(),
+        ),
+    }
+}
+
+fn discord_bridge_row_model(row: &DiscordBridgeView) -> DiscordBridgeRowModel {
+    DiscordBridgeRowModel {
+        label: row.label.clone(),
+        status: discord_bridge_status_label(row.status),
+        inbound: discord_bridge_flow_label(row.inbound),
+        outbound: discord_bridge_flow_label(row.outbound),
+        provenance: discord_bridge_provenance_label(&row.provenance),
+        detail: row.detail.clone(),
+    }
+}
+
+const fn discord_bridge_status_label(status: DiscordBridgeConfigStatus) -> &'static str {
+    match status {
+        DiscordBridgeConfigStatus::Unconfigured => "Unconfigured",
+        DiscordBridgeConfigStatus::ProviderUnavailable => "Provider unavailable",
+        DiscordBridgeConfigStatus::Configured => "Configured",
+    }
+}
+
+const fn discord_bridge_flow_label(status: DiscordBridgeFlowStatus) -> &'static str {
+    match status {
+        DiscordBridgeFlowStatus::NotConfigured => "Not configured",
+        DiscordBridgeFlowStatus::ProviderUnavailable => "Provider unavailable",
+        DiscordBridgeFlowStatus::Degraded => "Degraded",
+        DiscordBridgeFlowStatus::Ready => "Ready",
+    }
+}
+
+fn discord_bridge_provenance_label(provenance: &DiscordBridgeProvenance) -> String {
+    let mut parts = vec![match provenance.source {
+        DiscordBridgeProvenanceSource::None => "No bridge projection".to_owned(),
+        DiscordBridgeProvenanceSource::OperatorConfig => "Operator config".to_owned(),
+        DiscordBridgeProvenanceSource::WorkerState => "Bridge worker state".to_owned(),
+        DiscordBridgeProvenanceSource::ProviderAdapter => "Provider adapter".to_owned(),
+    }];
+    if let Some(authority) = provenance.authority.as_deref() {
+        parts.push(format!("authority {authority}"));
+    }
+    if let Some(observed_by) = provenance.observed_by.as_deref() {
+        parts.push(format!("observed by {observed_by}"));
+    }
+    if let Some(digest) = provenance.config_digest.as_deref() {
+        parts.push(format!("config {digest}"));
+    }
+    parts.join(" · ")
+}
+
 /// Pure model for the selected-channel Details pane.
 ///
 /// Every count is read from the existing retained projections. Missing
@@ -99,11 +216,13 @@ pub(crate) struct ChannelDetailsModel {
     pub(crate) unread: u32,
     pub(crate) last_activity: String,
     pub(crate) messages: usize,
+    pub(crate) tasks: usize,
     pub(crate) files: usize,
     pub(crate) transfers: usize,
     pub(crate) documents: usize,
     pub(crate) active_calls: usize,
     pub(crate) clips: usize,
+    pub(crate) discord_bridges: Vec<DiscordBridgeRowModel>,
 }
 
 /// Build the Details pane model for the currently selected channel, if that
@@ -136,6 +255,9 @@ pub(crate) fn channel_details_model(
         messages: data
             .conversation(summary.id)
             .map_or(0, |timeline| timeline.messages.len()),
+        tasks: data
+            .channel_tasks(summary.id)
+            .map_or(0, |tasks| tasks.tasks.len()),
         files,
         transfers,
         documents: data
@@ -150,6 +272,7 @@ pub(crate) fn channel_details_model(
         clips: data
             .clipboard_lane(summary.id)
             .map_or(0, |lane| lane.items.len()),
+        discord_bridges: discord_bridge_rows_for_space(summary.id, data.discord_bridge_board()),
     })
 }
 
@@ -325,7 +448,7 @@ impl CommunicationsSurface {
     }
 
     /// The top channel header. In the Teams app it exposes the required
-    /// Posts/Files/Calls tabs; in other app routes it becomes a compact title
+    /// Posts/Files/Calls/Tasks tabs; in other app routes it becomes a compact title
     /// bar so the old eight-tab strip is not a second navigation model.
     pub(crate) fn channel_header(&mut self, ui: &mut egui::Ui, data: &dyn crate::CollabData) {
         let selected = selected_space_summary(self.selected_space(), data.space_directory());
@@ -392,7 +515,7 @@ impl CommunicationsSurface {
 
     /// The reserved right-side Details pane. It summarizes the selected channel
     /// from the same read models the bodies use, so it remains accurate while
-    /// the operator switches Posts / Files / Calls or hops between global apps.
+    /// the operator switches Posts / Files / Calls / Tasks or hops between global apps.
     pub(crate) fn details_pane(&self, ui: &mut egui::Ui, data: &dyn crate::CollabData) {
         ui.label(
             egui::RichText::new("Details")
@@ -440,11 +563,23 @@ impl CommunicationsSurface {
                 .color(Style::TEXT_DIM),
         );
         detail_row(ui, "Messages", details.messages);
+        detail_row(ui, "Tasks", details.tasks);
         detail_row(ui, "Files", details.files);
         detail_row(ui, "Transfers", details.transfers);
         detail_row(ui, "Documents", details.documents);
         detail_row(ui, "Active calls", details.active_calls);
         detail_row(ui, "Clip items", details.clips);
+        ui.add_space(Style::SP_S);
+
+        ui.label(
+            egui::RichText::new("Discord bridge")
+                .small()
+                .strong()
+                .color(Style::TEXT_DIM),
+        );
+        for bridge in &details.discord_bridges {
+            discord_bridge_detail_row(ui, bridge);
+        }
     }
 
     /// The persistent call bar: renders the
@@ -578,6 +713,22 @@ fn detail_text_row(ui: &mut egui::Ui, label: &str, value: &str) {
             );
         });
     });
+}
+
+fn discord_bridge_detail_row(ui: &mut egui::Ui, bridge: &DiscordBridgeRowModel) {
+    ui.add_space(Style::SP_XS);
+    ui.label(
+        egui::RichText::new(bridge.label.as_str())
+            .strong()
+            .color(Style::TEXT),
+    );
+    detail_text_row(ui, "Status", bridge.status);
+    detail_text_row(ui, "Discord → Mesh", bridge.inbound);
+    detail_text_row(ui, "Mesh → Discord", bridge.outbound);
+    detail_text_row(ui, "Provenance", bridge.provenance.as_str());
+    if let Some(detail) = bridge.detail.as_deref() {
+        ui.label(egui::RichText::new(detail).small().color(Style::TEXT_DIM));
+    }
 }
 
 fn channel_find_editor(ui: &mut egui::Ui, surface: &mut CommunicationsSurface, space: SpaceId) {

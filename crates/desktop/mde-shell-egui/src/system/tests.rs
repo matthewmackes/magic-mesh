@@ -876,7 +876,7 @@ fn every_section_is_reachable_exactly_once() {
 }
 
 #[test]
-fn every_settings_section_has_a_yamis_backed_icon() {
+fn every_settings_section_has_a_shared_catalog_icon() {
     let all: Vec<SettingsSection> = SettingsGroup::ALL
         .iter()
         .flat_map(|g| g.sections().iter().copied())
@@ -886,8 +886,8 @@ fn every_settings_section_has_a_yamis_backed_icon() {
     for section in all {
         let icon = section.icon_id();
         assert!(
-            icon.name().starts_with("yamis-"),
-            "{} should use the shared YAMIS platform icon catalog, got {}",
+            icon.name().starts_with("yamis-") || icon.name().starts_with("construct-v2-"),
+            "{} should use the shared platform icon catalog, got {}",
             section.label(),
             icon.name()
         );

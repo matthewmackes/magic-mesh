@@ -312,12 +312,19 @@ fn chat_hover_tooltip_uses_themed_text_and_surface() {
 }
 
 #[test]
-fn chat_action_buttons_use_yamis_icons_instead_of_emoji_pseudo_icons() {
+fn chat_action_buttons_use_mono_icons_instead_of_emoji_pseudo_icons() {
     use mde_egui::egui::{pos2, vec2, Rect};
 
-    assert_eq!(CHAT_CALL_ICON, IconId::Phones);
-    assert_eq!(CHAT_REMOTE_ICON, IconId::Sessions);
+    assert_eq!(CHAT_CALL_ICON, IconId::Audio);
+    assert_eq!(CHAT_REMOTE_ICON, IconId::PictureInPicture);
     assert_eq!(CHAT_STATUS_EDIT_ICON, IconId::TextEdit);
+    for icon in [CHAT_CALL_ICON, CHAT_REMOTE_ICON, CHAT_STATUS_EDIT_ICON] {
+        assert!(
+            icon.name().starts_with("yamis-"),
+            "chat action icon should stay on the mono catalog, got {}",
+            icon.name()
+        );
+    }
 
     let ctx = egui::Context::default();
     Style::install(&ctx);

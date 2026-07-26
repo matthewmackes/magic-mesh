@@ -9,9 +9,9 @@
 //! * **Live signed events** — `collab/event/<space>/<actor>` (the signed
 //!   [`CollabEventEnvelope`] delivery lane).
 
-use crate::ActorId;
 use crate::command::CollabCommand;
 use crate::ids::SpaceId;
+use crate::ActorId;
 
 /// Prefix for command topics.
 pub const ACTION_PREFIX: &str = "action/collab/";
@@ -31,6 +31,8 @@ pub mod projection {
     pub const CONVERSATION: &str = "conversation";
     /// A thread timeline.
     pub const THREAD: &str = "thread";
+    /// Basic channel tasks/action items.
+    pub const CHANNEL_TASKS: &str = "channel-tasks";
     /// Live document co-edit sessions.
     pub const DOCUMENT_SESSIONS: &str = "document-sessions";
     /// A space's linked file references.

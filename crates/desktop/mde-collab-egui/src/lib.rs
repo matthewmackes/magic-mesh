@@ -19,7 +19,7 @@
 //!   [`SpaceDirectory`](mde_collab_types::SpaceDirectory) with per-space unread
 //!   badges (the selection key for every other pane);
 //! * a channel header across the top. The Teams app exposes Posts / Files /
-//!   Calls channel tabs, while other apps expose a single app header and keep
+//!   Calls / Tasks channel tabs, while other apps expose a single app header and keep
 //!   their existing bodies. [`Mode::Activity`], [`Mode::Messages`],
 //!   [`Mode::Calls`], [`Mode::Files`], [`Mode::Transfers`], [`Mode::Documents`],
 //!   [`Mode::Alerts`], and [`Mode::Clipboard`] are all implemented. Documents
@@ -62,6 +62,9 @@
 //!   ([`StartTransfer`](mde_collab_types::CollabCommand::StartTransfer) /
 //!   [`ControlTransfer`](mde_collab_types::CollabCommand::ControlTransfer)) whose
 //!   state is read from the WL-FUNC-006 ledger mirror (no second authority).
+//! * [`Mode::Tasks`] — basic channel tasks/action items read from
+//!   [`ChannelTasks`](mde_collab_types::ChannelTasks), with create/check/complete
+//!   controls emitting typed collaboration commands.
 //!
 //! # Data + commands
 //!
@@ -123,6 +126,8 @@ pub enum Mode {
     /// [`CallState`](mde_collab_types::CallState): start / answer / decline /
     /// mute / DTMF / hang up. The live media transport is a marked follow-up.
     Calls,
+    /// Basic channel tasks/action items.
+    Tasks,
     /// The files linked into a space (their references + shared transfers).
     Files,
     /// The shared transfer jobs (the WL-FUNC-006 ledger mirror) + their controls.
@@ -138,10 +143,11 @@ pub enum Mode {
 
 impl Mode {
     /// The tabs in display order.
-    pub const TABS: [Self; 8] = [
+    pub const TABS: [Self; 9] = [
         Self::Activity,
         Self::Messages,
         Self::Calls,
+        Self::Tasks,
         Self::Files,
         Self::Transfers,
         Self::Documents,
@@ -156,6 +162,7 @@ impl Mode {
             Self::Activity => "Activity",
             Self::Messages => "Messages",
             Self::Calls => "Calls",
+            Self::Tasks => "Tasks",
             Self::Files => "Files",
             Self::Transfers => "Transfers",
             Self::Documents => "Documents",
@@ -173,6 +180,7 @@ impl Mode {
             Self::Activity
             | Self::Messages
             | Self::Calls
+            | Self::Tasks
             | Self::Files
             | Self::Transfers
             | Self::Documents
@@ -190,7 +198,7 @@ impl Mode {
     pub const fn is_dense(self) -> bool {
         matches!(
             self,
-            Self::Messages | Self::Files | Self::Documents | Self::Clipboard
+            Self::Messages | Self::Tasks | Self::Files | Self::Documents | Self::Clipboard
         )
     }
 }
@@ -262,8 +270,7 @@ impl MeshTeamsApp {
     }
 }
 
-/// The Teams app's per-channel tab strip. These are the three channel tabs
-/// required by WL-UX-010 and map onto already-real mode bodies.
+/// The Teams app's per-channel tab strip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChannelTab {
     /// Channel conversation posts.
@@ -273,11 +280,13 @@ pub enum ChannelTab {
     Files,
     /// Calls in the selected channel.
     Calls,
+    /// Basic channel tasks/action items.
+    Tasks,
 }
 
 impl ChannelTab {
     /// Channel tab display order.
-    pub const ALL: [Self; 3] = [Self::Posts, Self::Files, Self::Calls];
+    pub const ALL: [Self; 4] = [Self::Posts, Self::Files, Self::Calls, Self::Tasks];
 
     /// Tab label.
     #[must_use]
@@ -286,6 +295,7 @@ impl ChannelTab {
             Self::Posts => "Posts",
             Self::Files => "Files",
             Self::Calls => "Calls",
+            Self::Tasks => "Tasks",
         }
     }
 
@@ -296,6 +306,7 @@ impl ChannelTab {
             Self::Posts => Mode::Messages,
             Self::Files => Mode::Files,
             Self::Calls => Mode::Calls,
+            Self::Tasks => Mode::Tasks,
         }
     }
 }
@@ -305,6 +316,7 @@ fn app_for_mode(mode: Mode) -> MeshTeamsApp {
         Mode::Activity => MeshTeamsApp::Activity,
         Mode::Messages => MeshTeamsApp::Teams,
         Mode::Calls => MeshTeamsApp::Calls,
+        Mode::Tasks => MeshTeamsApp::Teams,
         Mode::Files | Mode::Documents => MeshTeamsApp::Files,
         Mode::Transfers => MeshTeamsApp::Transfers,
         Mode::Alerts => MeshTeamsApp::Alerts,
@@ -317,6 +329,7 @@ fn channel_tab_for_mode(mode: Mode) -> Option<ChannelTab> {
         Mode::Messages => Some(ChannelTab::Posts),
         Mode::Files | Mode::Documents => Some(ChannelTab::Files),
         Mode::Calls => Some(ChannelTab::Calls),
+        Mode::Tasks => Some(ChannelTab::Tasks),
         _ => None,
     }
 }
@@ -410,6 +423,8 @@ pub struct CommunicationsSurface {
     /// Per-space main-composer drafts — persist locally across mode/space
     /// switches (a switched-away draft is never lost).
     drafts: HashMap<SpaceId, String>,
+    /// Per-space task composer drafts.
+    task_drafts: HashMap<SpaceId, String>,
     /// Per-space current-channel find text. This is a local view filter, not a
     /// collaboration event and not a suite-wide/global search index.
     channel_find: HashMap<SpaceId, String>,
@@ -584,6 +599,17 @@ impl CommunicationsSurface {
         self.drafts.insert(space, text.into());
     }
 
+    /// The task-composer draft for `space` (empty when there is none).
+    #[must_use]
+    pub fn task_draft(&self, space: SpaceId) -> &str {
+        self.task_drafts.get(&space).map_or("", String::as_str)
+    }
+
+    /// Set the task-composer draft for `space`.
+    pub fn set_task_draft(&mut self, space: SpaceId, text: impl Into<String>) {
+        self.task_drafts.insert(space, text.into());
+    }
+
     /// The current-channel find query for `space`.
     #[must_use]
     pub fn channel_find(&self, space: SpaceId) -> &str {
@@ -707,13 +733,14 @@ impl CommunicationsSurface {
     /// The active mode's central body.
     fn mode_body(&mut self, ui: &mut egui::Ui, data: &dyn CollabData, sink: &mut CommandSink) {
         if self.app == MeshTeamsApp::Settings {
-            self.settings_body(ui, sink);
+            self.settings_body(ui, data, sink);
             return;
         }
         match self.mode {
             Mode::Activity => self.activity_body(ui, data),
             Mode::Messages => self.messages_body(ui, data, sink),
             Mode::Calls => self.calls_body(ui, data, sink),
+            Mode::Tasks => self.tasks_body(ui, data, sink),
             Mode::Files => self.files_body(ui, data, sink),
             Mode::Transfers => self.transfers_body(ui, data, sink),
             Mode::Documents => self.documents_body(ui, data, sink),
@@ -723,39 +750,110 @@ impl CommunicationsSurface {
     }
 
     /// Local Mesh Teams settings pane. These are real preferences already wired
-    /// through the Alerts command lane; it is intentionally small until provider
-    /// device enumeration and Discord settings land.
-    fn settings_body(&mut self, ui: &mut egui::Ui, sink: &mut CommandSink) {
-        ui.heading("Mesh Teams Settings");
+    /// through the Alerts command lane plus read-only provider/bridge status
+    /// seams. It never calls a provider or invents device/server rows.
+    fn settings_body(&mut self, ui: &mut egui::Ui, data: &dyn CollabData, sink: &mut CommandSink) {
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.heading("Mesh Teams Settings");
+                ui.label(
+                    egui::RichText::new("Local notification preferences for this seat.")
+                        .color(mde_egui::Style::TEXT_DIM),
+                );
+                ui.add_space(mde_egui::Style::SP_S);
+                self.alert_pref_bar(ui, sink);
+                ui.add_space(mde_egui::Style::SP_M);
+                ui.label(
+                    egui::RichText::new("Provider devices")
+                        .strong()
+                        .color(mde_egui::Style::TEXT_STRONG),
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "Visible but disabled until the live media provider enumerates microphone, \
+                         camera, and screen sources.",
+                    )
+                    .color(mde_egui::Style::TEXT_DIM),
+                );
+                ui.add_space(mde_egui::Style::SP_S);
+                self.call_device_row(ui);
+                ui.add_space(mde_egui::Style::SP_M);
+                discord_bridge_settings(ui, data);
+            });
+    }
+}
+
+fn discord_bridge_settings(ui: &mut egui::Ui, data: &dyn CollabData) {
+    ui.label(
+        egui::RichText::new("Discord bridge")
+            .strong()
+            .color(mde_egui::Style::TEXT_STRONG),
+    );
+    ui.label(
+        egui::RichText::new(
+            "Read-only bridge status from the mesh worker. No Discord provider is called here, \
+             and no server is shown unless a bridge row was projected.",
+        )
+        .color(mde_egui::Style::TEXT_DIM),
+    );
+    ui.add_space(mde_egui::Style::SP_S);
+    for row in crate::frame::discord_bridge_rows_for_settings(data.discord_bridge_board()) {
+        egui::Frame::NONE
+            .fill(mde_egui::Style::LAYER_01)
+            .stroke(egui::Stroke::new(
+                mde_egui::Style::STROKE_HAIRLINE,
+                mde_egui::Style::BORDER,
+            ))
+            .inner_margin(mde_egui::Style::SP_S)
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new(row.label.as_str())
+                            .strong()
+                            .color(mde_egui::Style::TEXT),
+                    );
+                    ui.label(
+                        egui::RichText::new(row.status)
+                            .small()
+                            .color(discord_bridge_status_color(row.status)),
+                    );
+                });
+                bridge_status_line(ui, "Discord → Mesh", row.inbound);
+                bridge_status_line(ui, "Mesh → Discord", row.outbound);
+                bridge_status_line(ui, "Provenance", row.provenance.as_str());
+                if let Some(detail) = row.detail.as_deref() {
+                    ui.label(
+                        egui::RichText::new(detail)
+                            .small()
+                            .color(mde_egui::Style::TEXT_DIM),
+                    );
+                }
+            });
+        ui.add_space(mde_egui::Style::SP_XS);
+    }
+}
+
+fn bridge_status_line(ui: &mut egui::Ui, label: &str, value: &str) {
+    ui.horizontal_wrapped(|ui| {
         ui.label(
-            egui::RichText::new("Local notification preferences for this seat.")
+            egui::RichText::new(label)
+                .small()
                 .color(mde_egui::Style::TEXT_DIM),
         );
-        ui.add_space(mde_egui::Style::SP_S);
-        self.alert_pref_bar(ui, sink);
-        ui.add_space(mde_egui::Style::SP_M);
         ui.label(
-            egui::RichText::new("Provider devices")
-                .strong()
-                .color(mde_egui::Style::TEXT_STRONG),
+            egui::RichText::new(value)
+                .small()
+                .color(mde_egui::Style::TEXT),
         );
-        ui.label(
-            egui::RichText::new(
-                "Visible but disabled until the live media provider enumerates microphone, \
-                 camera, and screen sources.",
-            )
-            .color(mde_egui::Style::TEXT_DIM),
-        );
-        ui.add_space(mde_egui::Style::SP_S);
-        self.call_device_row(ui);
-        ui.add_space(mde_egui::Style::SP_M);
-        ui.label(
-            egui::RichText::new(
-                "Discord bridge settings appear here when the live bridge provider enumerates; \
-                 no fake servers are shown.",
-            )
-            .color(mde_egui::Style::TEXT_DIM),
-        );
+    });
+}
+
+fn discord_bridge_status_color(status: &str) -> egui::Color32 {
+    match status {
+        "Configured" => mde_egui::Style::OK,
+        "Provider unavailable" => mde_egui::Style::WARN,
+        _ => mde_egui::Style::TEXT_DIM,
     }
 }
 

@@ -27,10 +27,10 @@ use mde_collab_types::ids::{
 };
 use mde_collab_types::read_model::{
     ActivityEntry, ActivityFeed, AlertInbox, AlertView, CallMediaAdapter, CallMediaReadiness,
-    CallMediaRequirement, CallMediaSession, CallParticipantView, CallState, CallView,
+    CallMediaRequirement, CallMediaSession, CallParticipantView, CallState, CallView, ChannelTasks,
     ClipboardLane, ClipboardView, ConversationTimeline, DocumentSession, DocumentSessions,
     FileReferenceView, FileReferences, MessageView, PresenceBoard, PresenceView, SpaceDirectory,
-    SpaceSummary, ThreadTimeline, TransferJobView, TransferJobs,
+    SpaceSummary, TaskView, ThreadTimeline, TransferJobView, TransferJobs,
 };
 use mde_collab_types::value::{
     AlertPayload, CallKind, CallParticipantState, ClipItemKind, DeliveryState, FileRef,
@@ -81,6 +81,7 @@ const SPACE_TABLES: &[&str] = &[
     "members",
     "messages",
     "threads",
+    "tasks",
     "alerts",
     "clipboard",
     "file_refs",
@@ -255,6 +256,57 @@ impl Projection {
             replies,
             resolved: resolved != 0,
         })
+    }
+
+    /// A space's basic channel tasks/action items.
+    pub fn channel_tasks(&self, space: SpaceId) -> Result<ChannelTasks> {
+        let mut stmt = self.conn.prepare(
+            "SELECT task_event_id, title, created_by, created_ms, source_event_id, checked, \
+             completed, completed_by, completed_ms \
+             FROM tasks WHERE space_id = ?1 \
+             ORDER BY completed, clock_wall, clock_counter, task_event_id",
+        )?;
+        let rows = stmt.query_map(params![space.to_string()], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, i64>(6)?,
+                r.get::<_, Option<String>>(7)?,
+                r.get::<_, Option<i64>>(8)?,
+            ))
+        })?;
+        let mut tasks = Vec::new();
+        for row in rows {
+            let (
+                task,
+                title,
+                created_by,
+                created_ms,
+                source,
+                checked,
+                completed,
+                completed_by,
+                completed_ms,
+            ) = row?;
+            ensure_read_model_text("task title", &title)?;
+            tasks.push(TaskView {
+                task: parse_event(&task)?,
+                space,
+                title,
+                created_by: ActorId::new(created_by),
+                created_unix_ms: created_ms,
+                source: source.as_deref().map(parse_event).transpose()?,
+                checked: checked != 0,
+                completed: completed != 0,
+                completed_by: completed_by.map(ActorId::new),
+                completed_unix_ms: completed_ms,
+            });
+        }
+        Ok(ChannelTasks { space, tasks })
     }
 
     /// The global alert inbox, newest-first.
@@ -979,6 +1031,7 @@ struct SpaceFold {
     members: BTreeMap<String, (SpaceRole, bool)>, // actor -> (role, present)
     messages: BTreeMap<EventId, MessageRow>,
     threads: BTreeMap<ThreadId, ThreadRow>,
+    tasks: BTreeMap<EventId, TaskRow>,
     alerts: BTreeMap<EventId, AlertRow>,
     clipboard: BTreeMap<EventId, ClipRow>,
     files: BTreeMap<FileRefId, FileRow>,
@@ -1007,6 +1060,17 @@ struct ThreadRow {
     root: EventId,
     title: Option<String>,
     resolved: bool,
+    clock: ActorClock,
+}
+struct TaskRow {
+    title: String,
+    created_by: ActorId,
+    created_ms: i64,
+    source: Option<EventId>,
+    checked: bool,
+    completed: bool,
+    completed_by: Option<ActorId>,
+    completed_ms: Option<i64>,
     clock: ActorClock,
 }
 struct AlertRow {
@@ -1166,6 +1230,41 @@ impl SpaceFold {
             CollabEventKind::ThreadReopened { thread } => {
                 if let Some(t) = self.threads.get_mut(thread) {
                     t.resolved = false;
+                }
+            }
+            CollabEventKind::TaskCreated { title, source } => {
+                self.tasks.insert(
+                    env.event_id,
+                    TaskRow {
+                        title: title.clone(),
+                        created_by: env.actor.clone(),
+                        created_ms: env.created_unix_ms,
+                        source: *source,
+                        checked: false,
+                        completed: false,
+                        completed_by: None,
+                        completed_ms: None,
+                        clock: env.clock,
+                    },
+                );
+            }
+            CollabEventKind::TaskChecked { task, checked } => {
+                if let Some(t) = self.tasks.get_mut(task) {
+                    if !t.completed {
+                        t.checked = *checked;
+                        t.clock = env.clock;
+                    }
+                }
+            }
+            CollabEventKind::TaskCompleted { task } => {
+                if let Some(t) = self.tasks.get_mut(task) {
+                    if !t.completed {
+                        t.checked = true;
+                        t.completed = true;
+                        t.completed_by = Some(env.actor.clone());
+                        t.completed_ms = Some(env.created_unix_ms);
+                        t.clock = env.clock;
+                    }
                 }
             }
             CollabEventKind::AlertRaised { alert } => {
@@ -1433,6 +1532,26 @@ impl SpaceFold {
                 ],
             )?;
         }
+        for (id, t) in &self.tasks {
+            tx.execute(
+                "INSERT INTO tasks (space_id, task_event_id, title, created_by, created_ms, source_event_id, checked, completed, completed_by, completed_ms, clock_wall, clock_counter) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    sid,
+                    id.to_string(),
+                    t.title,
+                    t.created_by.0,
+                    t.created_ms,
+                    t.source.map(|source| source.to_string()),
+                    i64::from(t.checked),
+                    i64::from(t.completed),
+                    t.completed_by.as_ref().map(|actor| actor.0.clone()),
+                    t.completed_ms,
+                    cw(t.clock),
+                    cc(t.clock),
+                ],
+            )?;
+        }
         for (id, a) in &self.alerts {
             tx.execute(
                 "INSERT INTO alerts (space_id, event_id, severity, source, headline, fields_json, actions_json, goto, acknowledged, snoozed_until, clock_wall, clock_counter) \
@@ -1581,6 +1700,7 @@ fn order_for(table: &str) -> String {
         "members" => "space_id, actor".into(),
         "messages" | "alerts" | "clipboard" => "event_id".into(),
         "threads" => "thread_id".into(),
+        "tasks" => "task_event_id".into(),
         "file_refs" => "file_ref_id".into(),
         "transfers" => "transfer_id".into(),
         "documents" => "document_id".into(),

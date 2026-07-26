@@ -13,11 +13,13 @@ use mde_egui::egui;
 use mde_egui::Style;
 
 use mde_collab_types::{
-    CollabCommand, DeliveryState, EventId, MessageBody, MessageView, SpaceId, ThreadId,
+    CollabCommand, DeliveryState, EventId, MessageBody, MessageView, SpaceId, TaskView, ThreadId,
 };
 
 use crate::icons::CommsHoverExt;
 use crate::{amend_affordance, icons, relative_age, AmendAffordance, CommunicationsSurface};
+
+const MAX_TASK_TITLE_BYTES: usize = 512;
 
 /// A constrained quick reaction held only in this surface's local view state.
 ///
@@ -73,6 +75,219 @@ impl CommunicationsSurface {
             }
             None => self.conversation_column(ui, data, sink, space),
         }
+    }
+
+    /// Render the basic channel Tasks / action-items pane for the selected space.
+    pub(crate) fn tasks_body(
+        &mut self,
+        ui: &mut egui::Ui,
+        data: &dyn crate::CollabData,
+        sink: &mut crate::CommandSink,
+    ) {
+        let Some(space) = self.selected_space() else {
+            ui.label(
+                egui::RichText::new("Select a space to open its channel tasks.")
+                    .color(Style::TEXT_DIM),
+            );
+            return;
+        };
+
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("Channel tasks")
+                    .strong()
+                    .color(Style::TEXT_STRONG),
+            );
+            ui.label(
+                egui::RichText::new("operator-authored action items")
+                    .small()
+                    .color(Style::TEXT_DIM),
+            );
+        });
+        ui.add_space(Style::SP_XS);
+        self.task_composer(ui, sink, space);
+        ui.separator();
+
+        match data.channel_tasks(space) {
+            Some(tasks) if !tasks.tasks.is_empty() => {
+                egui::ScrollArea::vertical()
+                    .id_salt("collab-channel-tasks")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for (i, task) in tasks.tasks.iter().enumerate() {
+                            crate::anim::entrance(ui, "task", task.task, i, |ui| {
+                                self.task_row(ui, sink, task, data.now_unix_ms());
+                            });
+                            ui.add_space(Style::SP_XS);
+                        }
+                    });
+            }
+            _ => {
+                ui.label(
+                    egui::RichText::new("No tasks in this channel yet.").color(Style::TEXT_DIM),
+                );
+            }
+        }
+    }
+
+    fn task_composer(&mut self, ui: &mut egui::Ui, sink: &mut crate::CommandSink, space: SpaceId) {
+        let mut buf = self.task_drafts.get(&space).cloned().unwrap_or_default();
+        let mut input_was_capped = cap_task_title_input(&mut buf);
+        let mut create = false;
+        ui.horizontal(|ui| {
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut buf)
+                    .desired_width(f32::INFINITY)
+                    .char_limit(MAX_TASK_TITLE_BYTES)
+                    .hint_text("Add a channel task"),
+            );
+            if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                create = true;
+            }
+            if icons::icon_button(
+                ui,
+                icons::TASK_CREATE,
+                Style::SP_M,
+                Style::ACCENT,
+                "Create task",
+            )
+            .clicked()
+            {
+                create = true;
+            }
+        });
+        input_was_capped |= cap_task_title_input(&mut buf);
+        self.task_drafts.insert(space, buf);
+        if create && !input_was_capped {
+            self.create_task_from_draft(sink, space);
+        }
+        if input_was_capped {
+            task_title_notice(ui);
+        }
+    }
+
+    fn task_row(
+        &self,
+        ui: &mut egui::Ui,
+        sink: &mut crate::CommandSink,
+        task: &TaskView,
+        now_unix_ms: i64,
+    ) {
+        ui.group(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                let check_hint = if task.checked {
+                    "Clear task check"
+                } else {
+                    "Check task"
+                };
+                if !task.completed
+                    && icons::icon_button(
+                        ui,
+                        icons::TASK_CHECK,
+                        Style::SP_M,
+                        if task.checked {
+                            Style::OK
+                        } else {
+                            Style::TEXT_DIM
+                        },
+                        check_hint,
+                    )
+                    .clicked()
+                {
+                    self.set_task_checked(sink, task.space, task.task, !task.checked);
+                }
+                ui.label(egui::RichText::new(task.title.as_str()).strong().color(
+                    if task.completed {
+                        Style::TEXT_DIM
+                    } else {
+                        Style::TEXT
+                    },
+                ));
+                ui.label(
+                    egui::RichText::new(format!(
+                        "by {} · {}",
+                        task.created_by.as_str(),
+                        relative_age(now_unix_ms, task.created_unix_ms)
+                    ))
+                    .small()
+                    .color(Style::TEXT_DIM),
+                );
+                if let Some(source) = task.source {
+                    ui.label(
+                        egui::RichText::new(format!("source {source}"))
+                            .small()
+                            .color(Style::TEXT_DIM),
+                    );
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if task.completed {
+                        let who = task
+                            .completed_by
+                            .as_ref()
+                            .map_or("unknown", mde_collab_types::ActorId::as_str);
+                        ui.label(
+                            egui::RichText::new(format!("Completed by {who}"))
+                                .small()
+                                .color(Style::OK),
+                        );
+                    } else if icons::icon_button(
+                        ui,
+                        icons::TASK_COMPLETE,
+                        Style::SP_M,
+                        Style::OK,
+                        "Complete task",
+                    )
+                    .clicked()
+                    {
+                        self.complete_task(sink, task.space, task.task);
+                    }
+                });
+            });
+        });
+    }
+
+    /// Emit `CreateTask` from this channel's local draft.
+    pub(crate) fn create_task_from_draft(&mut self, sink: &mut crate::CommandSink, space: SpaceId) {
+        let title = self
+            .task_drafts
+            .get(&space)
+            .map_or("", String::as_str)
+            .trim()
+            .to_owned();
+        if title.is_empty() || title.len() > MAX_TASK_TITLE_BYTES {
+            return;
+        }
+        sink.emit(CollabCommand::CreateTask {
+            space,
+            title,
+            source: None,
+        });
+        self.task_drafts.insert(space, String::new());
+    }
+
+    /// Emit the explicit checked-state command the caller routes to the worker.
+    pub(crate) fn set_task_checked(
+        &self,
+        sink: &mut crate::CommandSink,
+        space: SpaceId,
+        task: EventId,
+        checked: bool,
+    ) {
+        sink.emit(CollabCommand::SetTaskChecked {
+            space,
+            task,
+            checked,
+        });
+    }
+
+    /// Emit the explicit task-completion command the caller routes to the worker.
+    pub(crate) fn complete_task(
+        &self,
+        sink: &mut crate::CommandSink,
+        space: SpaceId,
+        task: EventId,
+    ) {
+        sink.emit(CollabCommand::CompleteTask { space, task });
     }
 
     /// The main conversation column: the scrolling timeline over a reserved
@@ -593,6 +808,30 @@ fn cap_message_input(value: &mut String) -> bool {
 fn message_input_notice(ui: &mut egui::Ui) {
     ui.label(
         egui::RichText::new("Message limited to 256 KiB — review before sending.")
+            .small()
+            .color(Style::WARN),
+    );
+}
+
+fn cap_task_title_input(value: &mut String) -> bool {
+    if value.len() <= MAX_TASK_TITLE_BYTES {
+        return false;
+    }
+
+    let boundary = value
+        .char_indices()
+        .take_while(|(offset, character)| {
+            offset.saturating_add(character.len_utf8()) <= MAX_TASK_TITLE_BYTES
+        })
+        .last()
+        .map_or(0, |(offset, character)| offset + character.len_utf8());
+    value.truncate(boundary);
+    true
+}
+
+fn task_title_notice(ui: &mut egui::Ui) {
+    ui.label(
+        egui::RichText::new("Task titles are limited to 512 bytes.")
             .small()
             .color(Style::WARN),
     );

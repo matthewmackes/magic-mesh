@@ -55,7 +55,10 @@ delete a prior entry; supersede it with a newer one.
   components, scrim materials, dark-only, Inter type ramp) and **Car** (CarPlay-principled:
   SYNC3 dark palette kept, Dashboard-cards home, six apps, always-visible left instrument
   strip with per-frame telemetry fold, glance rules + soft in-motion limits, one-tap
-  toggle). Mackes-Carbon icons kept platform-wide. Authority doc:
+  toggle). Mackes-Carbon icons kept platform-wide; the 2026-07-26 icon V2 survey
+  makes core platform app/service/role icons tri-color Carbon-derived linework
+  with no icon plates, while toolbar/action/status icons stay monochrome and
+  semantic-color-coded. Authority doc:
   `docs/design/platform-interfaces.md`. Interface-paradigm docs retired to
   `docs/design-archive/`. Win10 chrome code is deleted at cutover (no legacy flag).
   Epics: WL-UX-006 (Construct) + WL-UX-007 (Car); WL-UX-001 superseded-retired;

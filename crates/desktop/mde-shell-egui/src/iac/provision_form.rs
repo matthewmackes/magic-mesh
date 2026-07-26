@@ -9,7 +9,7 @@
 //! apply (§7): a live apply only ever reaches the Bus past the arming gate.
 
 use mde_egui::egui::{self, Color32, Response, RichText};
-use mde_egui::{card, section, Style, TypographyRole};
+use mde_egui::{card, field, section, Style, TypographyRole};
 
 use mackes_mesh_types::cloud::WorkloadSpec;
 
@@ -71,6 +71,15 @@ impl State {
     fn is_valid(&self) -> bool {
         !self.name.trim().is_empty()
     }
+
+    /// Test seam for headless render fixtures that need a valid draft without
+    /// synthesizing keyboard input through egui.
+    #[cfg(test)]
+    pub(super) fn set_test_draft(&mut self, name: &str, image: &str, raw_hcl: &str) {
+        self.name = name.to_string();
+        self.image = image.to_string();
+        self.raw_hcl = raw_hcl.to_string();
+    }
 }
 
 /// The live provision affordance requires both a valid draft and positive
@@ -120,13 +129,225 @@ pub(super) fn provision_form(ui: &mut egui::Ui, state: &mut WorkloadsState) {
         return;
     };
 
-    mde_egui::field(ui, "Node", &node, Style::ACCENT_WORKLOADS);
-    mde_egui::field(ui, "Delivery type", view.label(), Style::TEXT);
+    let valid = state.form.is_valid();
+    let live_apply_available = state.selected_node_apply_armed();
+    provision_target_summary(ui, view, &node, live_apply_available);
     ui.add_space(Style::SP_S);
 
-    card().show(ui, |ui| {
-        let form = &mut state.form;
+    let android_name = state.form.name.trim().to_string();
 
+    let mut set_desired = false;
+    let mut plan = false;
+    let mut provision = false;
+    let mut android_prepare = false;
+    provision_workspace(
+        ui,
+        view,
+        &mut state.form,
+        valid,
+        live_apply_available,
+        &mut set_desired,
+        &mut plan,
+        &mut provision,
+        &mut android_prepare,
+    );
+
+    // Dispatch past the form's `&mut` borrow — one distinct emit per button, so no
+    // two mutations race the single in-flight reply slot.
+    if set_desired {
+        let spec = state.form.build_spec(view, &node);
+        state.set_desired(&spec);
+    }
+    if plan {
+        state.plan_provision();
+    }
+    if provision {
+        state.arm_provision();
+    }
+    if android_prepare {
+        state.arm_android_provision(&android_name);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn provision_workspace(
+    ui: &mut egui::Ui,
+    view: DeliveryView,
+    form: &mut State,
+    valid: bool,
+    live_apply_available: bool,
+    set_desired: &mut bool,
+    plan: &mut bool,
+    provision: &mut bool,
+    android_prepare: &mut bool,
+) {
+    let width = ui.available_width();
+    if width >= 760.0 {
+        ui.horizontal_top(|ui| {
+            let total = ui.available_width();
+            let left_w = (total * 0.58).clamp(420.0, (total - 300.0).max(420.0));
+            ui.vertical(|ui| {
+                ui.set_width(left_w);
+                provision_editor(ui, form);
+            });
+            ui.add_space(Style::SP_S);
+            ui.vertical(|ui| {
+                ui.set_min_width((total - left_w - Style::SP_M).max(280.0));
+                hcl_override_section(ui, form, true);
+                ui.add_space(Style::SP_S);
+                validation_section(ui, form, live_apply_available, true);
+                ui.add_space(Style::SP_S);
+                sticky_action_tray(ui, view, valid, live_apply_available, true, |ui| {
+                    provision_action_controls(
+                        ui,
+                        view,
+                        valid,
+                        live_apply_available,
+                        set_desired,
+                        plan,
+                        provision,
+                        android_prepare,
+                    );
+                });
+            });
+        });
+    } else {
+        provision_editor(ui, form);
+        ui.add_space(Style::SP_S);
+        hcl_override_section(ui, form, false);
+        ui.add_space(Style::SP_S);
+        validation_section(ui, form, live_apply_available, false);
+        ui.add_space(Style::SP_S);
+        sticky_action_tray(ui, view, valid, live_apply_available, false, |ui| {
+            provision_action_controls(
+                ui,
+                view,
+                valid,
+                live_apply_available,
+                set_desired,
+                plan,
+                provision,
+                android_prepare,
+            );
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn provision_action_controls(
+    ui: &mut egui::Ui,
+    view: DeliveryView,
+    valid: bool,
+    live_apply_available: bool,
+    set_desired: &mut bool,
+    plan: &mut bool,
+    provision: &mut bool,
+    android_prepare: &mut bool,
+) {
+    if action_button(ui, valid, "Set desired", Style::ACCENT_WORKLOADS).clicked() {
+        *set_desired = true;
+    }
+    ui.add_space(Style::SP_S);
+    if action_button(ui, valid, "Plan", Style::ACCENT).clicked() {
+        *plan = true;
+    }
+    ui.add_space(Style::SP_S);
+    if action_button(
+        ui,
+        live_provision_enabled(valid, live_apply_available),
+        "Provision\u{2026}",
+        Style::DANGER,
+    )
+    .clicked()
+    {
+        *provision = true;
+    }
+    if view == DeliveryView::AndroidVm
+        && action_button(
+            ui,
+            true,
+            "Prepare Android VM\u{2026}",
+            Style::ACCENT_WORKLOADS,
+        )
+        .clicked()
+    {
+        *android_prepare = true;
+    }
+}
+
+fn provision_target_summary(
+    ui: &mut egui::Ui,
+    view: DeliveryView,
+    node: &str,
+    live_apply_available: bool,
+) {
+    let compact = ui.available_width() >= 760.0;
+    card().show(ui, |ui| {
+        ui.label(
+            RichText::new("Placement & delivery")
+                .size(Style::SMALL)
+                .strong()
+                .color(Style::TEXT_DIM),
+        );
+        if compact {
+            ui.horizontal_wrapped(|ui| {
+                inline_summary_field(ui, "Placement node", node, Style::ACCENT_WORKLOADS);
+                inline_summary_field(ui, "Delivery filter", view.label(), Style::TEXT);
+                inline_summary_field(
+                    ui,
+                    "Live apply gate",
+                    if live_apply_available {
+                        "Armed by current mirror"
+                    } else {
+                        "Plan-only / not armed"
+                    },
+                    if live_apply_available {
+                        Style::ACCENT
+                    } else {
+                        Style::TEXT_DIM
+                    },
+                );
+            });
+        } else {
+            ui.add_space(Style::SP_XS);
+            field(ui, "Placement node", node, Style::ACCENT_WORKLOADS);
+            field(ui, "Delivery filter", view.label(), Style::TEXT);
+            field(
+                ui,
+                "Live apply gate",
+                if live_apply_available {
+                    "Armed by current mirror"
+                } else {
+                    "Plan-only / not armed"
+                },
+                if live_apply_available {
+                    Style::ACCENT
+                } else {
+                    Style::TEXT_DIM
+                },
+            );
+        }
+    });
+}
+
+fn inline_summary_field(ui: &mut egui::Ui, label: &str, value: &str, tone: Color32) {
+    ui.label(
+        RichText::new(label)
+            .size(Style::SMALL)
+            .color(Style::TEXT_DIM),
+    );
+    ui.label(RichText::new(value).size(Style::SMALL).color(tone));
+    ui.add_space(Style::SP_M);
+}
+
+fn provision_editor(ui: &mut egui::Ui, form: &mut State) {
+    card().show(ui, |ui| {
+        ui.label(
+            RichText::new("Identity")
+                .size(Style::SMALL)
+                .strong()
+                .color(Style::TEXT_DIM),
+        );
         labelled(ui, "Name", |ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut form.name)
@@ -134,7 +355,17 @@ pub(super) fn provision_form(ui: &mut egui::Ui, state: &mut WorkloadsState) {
                     .desired_width(Style::SP_XL * 6.0),
             );
         });
+    });
+    ui.add_space(Style::SP_S);
 
+    card().show(ui, |ui| {
+        ui.label(
+            RichText::new("Sizing")
+                .size(Style::SMALL)
+                .strong()
+                .color(Style::TEXT_DIM),
+        );
+        ui.add_space(Style::SP_XS);
         ui.horizontal(|ui| {
             size_field(ui, "vCPU");
             ui.add(egui::DragValue::new(&mut form.vcpu).range(1..=256));
@@ -153,8 +384,16 @@ pub(super) fn provision_form(ui: &mut egui::Ui, state: &mut WorkloadsState) {
                     .suffix(" GiB"),
             );
         });
-        ui.add_space(Style::SP_XS);
+    });
+    ui.add_space(Style::SP_S);
 
+    card().show(ui, |ui| {
+        ui.label(
+            RichText::new("Image & network")
+                .size(Style::SMALL)
+                .strong()
+                .color(Style::TEXT_DIM),
+        );
         labelled(ui, "Image", |ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut form.image)
@@ -162,117 +401,185 @@ pub(super) fn provision_form(ui: &mut egui::Ui, state: &mut WorkloadsState) {
                     .desired_width(Style::SP_XL * 6.0),
             );
         });
-
         ui.checkbox(
             &mut form.network_isolation,
             RichText::new("Isolated network segment")
                 .size(Style::SMALL)
                 .color(Style::TEXT),
         );
-        ui.add_space(Style::SP_S);
+    });
+}
 
+fn hcl_override_section(ui: &mut egui::Ui, form: &mut State, compact: bool) {
+    card().show(ui, |ui| {
         ui.label(
-            RichText::new("Raw HCL (advanced)")
+            RichText::new("HCL override")
                 .size(Style::SMALL)
+                .strong()
                 .color(Style::TEXT_DIM),
         );
-        mde_egui::muted_note(
-            ui,
-            "Merged into the rendered tfvars and validated before tofu. Leave blank for pure form \
-             authoring.",
-        );
-        mde_egui::inset().show(ui, |ui| {
+        if compact {
             ui.add(
                 egui::TextEdit::multiline(&mut form.raw_hcl)
                     .font(Style::typography_font(TypographyRole::Mono))
-                    .desired_rows(4)
+                    .desired_rows(1)
                     .desired_width(f32::INFINITY)
                     .hint_text("# optional HCL fragment"),
             );
+        } else {
+            mde_egui::muted_note(
+                ui,
+                "Advanced raw-HCL fragment. It is merged into rendered tfvars and validated before tofu; \
+                 leave blank for pure form authoring.",
+            );
+            mde_egui::inset().show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::multiline(&mut form.raw_hcl)
+                        .font(Style::typography_font(TypographyRole::Mono))
+                        .desired_rows(4)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("# optional HCL fragment"),
+                );
+            });
+        }
+    });
+}
+
+fn validation_section(ui: &mut egui::Ui, form: &State, live_apply_available: bool, compact: bool) {
+    card().show(ui, |ui| {
+        ui.label(
+            RichText::new("Validation")
+                .size(Style::SMALL)
+                .strong()
+                .color(Style::TEXT_DIM),
+        );
+        validation_row(
+            ui,
+            form.is_valid(),
+            "Name",
+            if form.is_valid() {
+                "ready"
+            } else {
+                "required before Set desired, Plan, or Provision"
+            },
+        );
+        validation_row(
+            ui,
+            true,
+            "Sizing",
+            if compact {
+                "bounded"
+            } else {
+                "bounded to the Workloads contract before request emission"
+            },
+        );
+        validation_row(
+            ui,
+            live_apply_available,
+            "Live apply",
+            if live_apply_available {
+                "selected node reports an armed apply capability"
+            } else {
+                "Plan remains available; live Provision stays disabled"
+            },
+        );
+    });
+}
+
+fn validation_row(ui: &mut egui::Ui, ok: bool, label: &str, detail: &str) {
+    ui.horizontal_wrapped(|ui| {
+        let (glyph, tone) = if ok {
+            ("✓", Style::ACCENT)
+        } else {
+            ("!", Style::DANGER)
+        };
+        ui.label(RichText::new(glyph).size(Style::SMALL).color(tone).strong());
+        ui.label(
+            RichText::new(label)
+                .size(Style::SMALL)
+                .color(Style::TEXT)
+                .strong(),
+        );
+        ui.label(
+            RichText::new(detail)
+                .size(Style::SMALL)
+                .color(Style::TEXT_DIM),
+        );
+    });
+}
+
+fn sticky_action_tray(
+    ui: &mut egui::Ui,
+    view: DeliveryView,
+    valid: bool,
+    live_apply_available: bool,
+    compact: bool,
+    add_actions: impl FnOnce(&mut egui::Ui),
+) {
+    ui.scope(|ui| {
+        ui.visuals_mut().widgets.noninteractive.bg_fill = Style::SURFACE_HI;
+        card().show(ui, |ui| {
+            if compact {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new("Sticky actions")
+                            .size(Style::SMALL)
+                            .strong()
+                            .color(Style::TEXT_DIM),
+                    );
+                    add_actions(ui);
+                    if !valid {
+                        ui.label(
+                            RichText::new("A workload name is required.")
+                                .size(Style::SMALL)
+                                .color(Style::DANGER),
+                        );
+                    } else if !live_apply_available {
+                        ui.label(
+                            RichText::new(
+                                "Provision is disabled because the selected node is plan-only.",
+                            )
+                            .size(Style::SMALL)
+                            .color(Style::TEXT_DIM),
+                        );
+                    }
+                });
+                return;
+            }
+            ui.label(
+                RichText::new("Sticky actions")
+                    .size(Style::SMALL)
+                    .strong()
+                    .color(Style::TEXT_DIM),
+            );
+            ui.horizontal_wrapped(add_actions);
+            mde_egui::muted_note(
+                ui,
+                "Set desired persists the spec; Plan is a dry-run (counts only); Provision opens a \
+                 typed review sheet before any live apply.",
+            );
+            if !valid {
+                mde_egui::muted_note(
+                    ui,
+                    "A workload name is required before any action can publish.",
+                );
+            } else if !live_apply_available {
+                mde_egui::muted_note(
+                    ui,
+                    "Provision is disabled because the selected node is plan-only or no longer \
+                     reports an armed-apply capability.",
+                );
+            }
+            if view == DeliveryView::AndroidVm {
+                mde_egui::muted_note(
+                    ui,
+                    "Prepare Android VM uses the dedicated android-provision contract and saves a \
+                     Cuttlefish-sized desired spec; it does not claim the VM is live until \
+                     Provision runs.",
+                );
+            }
         });
     });
-
-    ui.add_space(Style::SP_S);
-    let valid = state.form.is_valid();
-    let live_apply_available = state.selected_node_apply_armed();
-    let android_name = state.form.name.trim().to_string();
-    if !valid {
-        mde_egui::muted_note(
-            ui,
-            "A workload name is required before it can be set desired, planned, or provisioned.",
-        );
-    } else if !live_apply_available {
-        mde_egui::muted_note(
-            ui,
-            "Live provision is unavailable: the selected node is plan-only or no longer reports \
-             an armed-apply capability.",
-        );
-    }
-
-    let mut set_desired = false;
-    let mut plan = false;
-    let mut provision = false;
-    let mut android_prepare = false;
-    ui.horizontal(|ui| {
-        if action_button(ui, valid, "Set desired", Style::ACCENT_WORKLOADS).clicked() {
-            set_desired = true;
-        }
-        ui.add_space(Style::SP_S);
-        if action_button(ui, valid, "Plan", Style::ACCENT).clicked() {
-            plan = true;
-        }
-        ui.add_space(Style::SP_S);
-        if action_button(
-            ui,
-            live_provision_enabled(valid, live_apply_available),
-            "Provision\u{2026}",
-            Style::DANGER,
-        )
-        .clicked()
-        {
-            provision = true;
-        }
-        if view == DeliveryView::AndroidVm
-            && action_button(
-                ui,
-                true,
-                "Prepare Android VM\u{2026}",
-                Style::ACCENT_WORKLOADS,
-            )
-            .clicked()
-        {
-            android_prepare = true;
-        }
-    });
-    mde_egui::muted_note(
-        ui,
-        "Set desired persists the spec; Plan is a dry-run (counts only); Provision opens a \
-         typed-arm before any live apply.",
-    );
-    if view == DeliveryView::AndroidVm {
-        mde_egui::muted_note(
-            ui,
-            "Prepare Android VM uses the dedicated android-provision contract and saves a \
-             Cuttlefish-sized desired spec; it does not claim the VM is live until Provision \
-             runs.",
-        );
-    }
-
-    // Dispatch past the form's `&mut` borrow — one distinct emit per button, so no
-    // two mutations race the single in-flight reply slot.
-    if set_desired {
-        let spec = state.form.build_spec(view, &node);
-        state.set_desired(&spec);
-    }
-    if plan {
-        state.plan_provision();
-    }
-    if provision {
-        state.arm_provision();
-    }
-    if android_prepare {
-        state.arm_android_provision(&android_name);
-    }
 }
 
 /// A dim caption for a sizing control (the shared `vCPU`/`Memory`/`Disk` label).

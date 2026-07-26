@@ -108,7 +108,11 @@ workload-provider APIs are never exposed as a second public control plane.
   requirements live in the single authority doc
   **`docs/design/platform-interfaces.md`**. Structure is iPadOS-derived with
   macOS pointer manners; identity is Quazar with production Dark and Light
-  appearances; the **Mackes-Carbon icon set is kept platform-wide**. The
+  appearances; the **Mackes-Carbon icon set is kept platform-wide**. **Icon V2
+  lock (operator survey 2026-07-26):** core platform app/service/role icons use
+  Carbon-derived simple linework with exactly three adapted product/service
+  colors and no icon plates; toolbar/action/status icons remain monochrome and
+  are color-coded by semantic state. The
   2026-07-26 operator lock intentionally keeps a Construct **Dock** and an
   icon-free Bing-wallpaper Home. All other interface-paradigm design docs are
   retired to `docs/design-archive/`. Do not re-introduce a bottom taskbar, tray

@@ -819,6 +819,17 @@ These decisions refine acceptance and sequencing for the active items below.
   primary mode tabs, Enter-to-send, one-pane Documents default, and suite-wide
   search language. Linked visible-interface owner: WL-UX-010; this epic remains
   the backing contract/worker/read-model owner.
+- Progress (2026-07-26 Discord bridge status read-model seam): the shared
+  Communications read side now has a typed `DiscordBridgeBoard` with bounded
+  bridge rows carrying overall configuration state, Discord-to-Mesh and
+  Mesh-to-Discord directional flow status, provenance, and degraded detail. The
+  model distinguishes unconfigured, provider-unavailable/degraded, and
+  configured rows without calling Discord or fabricating external servers.
+  Evidence: `.50` slot `discord-types-rerun` focused `cargo test -p
+  mde-collab-types discord_bridge -- --nocapture` passed **1/1**; `.90` slot
+  `discord-ui-rerun` focused `cargo test -p mde-collab-egui discord_bridge --
+  --nocapture` passed **2/2**; `.170` slot `discord-fmt-rerun` touched-file
+  `rustfmt --edition 2021 --check --config skip_children=true` passed.
 - Progress (2026-07-26 seat .15 Activity-tab performance): Communications /
   Mesh Teams no longer publishes or paints an unbounded Activity history on
   open. The core Activity read model now publishes only the newest 1,024
@@ -1559,6 +1570,23 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-012 - Maps live-data overlays (zero-cost external feeds)
 
 - Status: Remaining
+- Progress (2026-07-26 live-overlay verifier no-stale-as-ready hardening):
+  `install-helpers/verify-live-mirrors.py` now fails closed on overlay readiness:
+  `--require-ready` can no longer report a stale or future-dated `fetched_at_ms`
+  mirror as `ready=true` just because the provider availability field is not a
+  degraded state. The verifier now separates feed freshness from provider
+  availability, returns `fresh=false`, `available=<bool>`, `ready=false`, and
+  the raw `availability` string for stale/future snapshots, and its self-test
+  covers the stale USGS fixture. `docs/design/maps-live-overlays.md` now records
+  this acceptance rule so installed-seat catalog proofs cannot treat aged
+  retained mirrors as live data. Focused verification is green on `.90` slot
+  `wl-func-012-verifier-ready` after syncing the tree and running
+  `python3 -m py_compile install-helpers/verify-live-mirrors.py &&
+  install-helpers/verify-live-mirrors.py --self-test`; local
+  `install-helpers/lint-worklist.sh --self-test`,
+  `install-helpers/lint-worklist.sh docs/platform/WORKLIST.md`, and
+  `git diff --check` also pass. No external feeds, paid APIs, credentials,
+  synthetic data, or live MG90 motion were used.
 - Progress (2026-07-26 AirNow/FIRMS default-on degraded mirrors): AirNow and
   FIRMS now follow the same present-by-default Workstation overlay contract as
   the other zero-cost feeds. AirNow starts unless
@@ -2663,6 +2691,17 @@ These decisions refine acceptance and sequencing for the active items below.
   green after the later worklist integrations: `.90` slot
   `nav-bottom-current-proof` `cargo test -p mde-shell-egui nav_bar --
   --nocapture` passed **24/24**.
+- Progress (2026-07-26 Springboard bottom-width fit): the latest bottom-Dock bug
+  was traced to the case where the screen is narrower than the preferred 640px
+  pill. `nav_bar.rs` now drops chooser pins before shrinking controls, preserves
+  the operator Dock launcher set, and constrains every bottom placement hit
+  target inside the black pill instead of painting controls past the reserved
+  backing. New regression `bottom_dock_shrinks_cells_before_overflowing_the_pill`
+  covers a 640x480 panel with requested chooser pins. Farm evidence is green:
+  `.90` slot `nav-bottom-render` `cargo test -p mde-shell-egui nav_bar --
+  --nocapture` passed **25/25**, and `.170` slot `nav-bottom-render-fmt` passed
+  touched-file `rustfmt --edition 2021 --check
+  crates/desktop/mde-shell-egui/src/nav_bar.rs`.
 - Progress (2026-07-26 Terminal typing/cursor lag live bug): the operator
   reported that Terminal rendering falls behind while typing, leaving the
   displayed cursor incorrect. This is now a WL-UX-006 live-acceptance defect
@@ -3968,6 +4007,20 @@ These decisions refine acceptance and sequencing for the active items below.
   `workloads-audit-containers-fmt` passed touched-file `rustfmt --edition 2021
   --check crates/desktop/mde-shell-egui/src/iac/mod.rs
   crates/desktop/mde-shell-egui/src/iac/tests.rs`.
+- Progress (2026-07-26 Provision viewport reachability): the Provision route now
+  keeps grouped placement, identity, sizing, image/network, HCL override,
+  validation, and sticky actions reachable inside the desktop-width headless
+  viewport. The wide layout uses a compact summary strip and right-side rail for
+  HCL/validation/sticky controls; the narrow layout keeps the full vertical HCL
+  editor. This fixed the regression where `HCL override` or the sticky action
+  buttons fell below the rendered capture after the lifecycle redesign. Evidence:
+  `.90` slot `workloads-provision-integrated-r2` `cargo test -p
+  mde-shell-egui provision_route -- --nocapture` passed 3/3 tests, including
+  `provision_route_renders_grouped_sections_and_sticky_actions` and
+  `provision_route_validation_distinguishes_plan_only_nodes`; `.170` slot
+  `workloads-provision-fmt-r6` passed touched-file `rustfmt --edition 2021
+  --check crates/desktop/mde-shell-egui/src/iac/provision_form.rs
+  crates/desktop/mde-shell-egui/src/iac/tests.rs`.
 - Origin or merged source IDs: 2026-07-26 planning handoff, "World-Class Infra
   as Code / Workloads Redesign"; UX references named in that handoff: Apple HIG
   sidebars, IBM Carbon data tables/filtering, HCP Terraform workspaces, and
@@ -4131,6 +4184,17 @@ These decisions refine acceptance and sequencing for the active items below.
   doc-tests, post-import-order `.130` focused provider recheck passed 2/2,
   `.130` touched-file `rustfmt --edition 2021 --check --config
   skip_children=true`, and scoped `git diff --check` passed.
+- Progress (2026-07-26 Discord bridge UI seam): Mesh Teams Settings now renders
+  a scrollable, read-only Discord bridge status board, while the selected-channel
+  Details pane renders channel-scoped bridge rows. The UI shows honest
+  unconfigured, provider-unavailable/degraded, and configured states with
+  provenance and two-way Discord/Mesh flow status; it emits no commands, calls no
+  Discord provider, and does not invent server names. Evidence: `.90` slot
+  `discord-ui-rerun` focused `cargo test -p mde-collab-egui discord_bridge --
+  --nocapture` passed **2/2**; `.50` slot `discord-types-rerun` focused `cargo
+  test -p mde-collab-types discord_bridge -- --nocapture` passed **1/1**;
+  `.170` slot `discord-fmt-rerun` touched-file `rustfmt --edition 2021 --check
+  --config skip_children=true` passed.
 - Progress (2026-07-26 local-only quick reactions): Mesh Teams Posts now expose
   a constrained local reaction strip (`Ack`, `Check`, `Watch`) as seat-local
   view state keyed by message event id. Clicking the current chip clears it;

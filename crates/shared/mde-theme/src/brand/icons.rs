@@ -2,13 +2,14 @@
 //!
 //! The platform glyphs embedded as inline SVG consts behind [`IconId`], plus
 //! the SVG→raster loader ([`icon_image`]) every surface draws them through. The
-//! product mark / wordmark resolve to the Construct brand assets; the default platform
-//! surface, status, and tray glyphs now resolve to the YAMIS monochrome theme
-//! under `assets/icons/YAMIS/YAMIS/`. The SVGs use `currentColor` through the
-//! freedesktop ColorScheme classes, so ONE embedded set serves every tint: the
-//! loader substitutes the caller's color pre-parse and rasterizes with `resvg`
-//! at the exact requested pixel size — DPI-crisp at any scale, no pre-baked PNG
-//! ladder.
+//! product mark / wordmark resolve to the Construct brand assets. Core platform
+//! app/service glyphs resolve to the Mackes-Carbon V2 SVGs under
+//! `assets/icons/Mackes-Carbon/scalable/apps/`: simple Carbon-derived linework
+//! with tri-color, product/service-associated accents adapted to Construct.
+//! Toolbar/action/status/file glyphs remain monochrome YAMIS/Carbon-compatible
+//! artwork so callers can color-code them semantically. The SVGs still route
+//! through one `resvg` raster path at the exact requested pixel size —
+//! DPI-crisp at any scale, no pre-baked PNG ladder.
 //!
 //! ## Toolkit-free by design
 //!
@@ -65,20 +66,22 @@ macro_rules! yamis_svg {
     };
 }
 
-/// Repo-native Teams-inspired group/chat glyph. This is not the Microsoft
-/// trademark artwork; callers tint it with the Teams-blue token so Mesh Teams
-/// reads visually close to the familiar app without vendoring an external logo.
-const TEAMS_SVG: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="currentColor">
-  <path d="M11 8.75a3.75 3.75 0 1 1 7.5 0 3.75 3.75 0 0 1-7.5 0Z"/>
-  <path d="M21.25 10.25a3 3 0 1 1 6 0 3 3 0 0 1-6 0Z" opacity=".72"/>
-  <path d="M6 14h12.5A3.5 3.5 0 0 1 22 17.5v5.75A5.75 5.75 0 0 1 16.25 29h-3.5A5.75 5.75 0 0 1 7 23.25V19H6a2 2 0 0 1-2-2v-1a2 2 0 0 1 2-2Zm4.65 3.15v2.05h2.55v6.05h2.35V19.2h2.55v-2.05h-7.45Z"/>
-  <path d="M22.75 15h2.5A3.75 3.75 0 0 1 29 18.75V21a4.5 4.5 0 0 1-6.12 4.2c.41-.78.62-1.66.62-2.57V17.5c0-.9-.27-1.75-.75-2.5Z" opacity=".72"/>
-</svg>"#;
+/// Embed one Mackes-Carbon V2 core-platform SVG from the packaged icon theme.
+macro_rules! carbon_v2_svg {
+    ($file:literal) => {
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../assets/icons/Mackes-Carbon/scalable/",
+            $file
+        ))
+    };
+}
 
 /// Identifier for every embedded product and platform glyph.
 ///
-/// Product marks resolve to the Construct brand assets; surface, role, tray,
-/// and shared UI action glyphs resolve to the bundled YAMIS theme. Call
+/// Product marks resolve to the Construct brand assets; core app/service/role
+/// glyphs resolve to Mackes-Carbon V2; compact shared action/status glyphs keep
+/// the tintable monochrome path. Call
 /// [`IconId::svg`] for the embedded source and [`IconId::name`] for a stable
 /// cache/debug identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -120,7 +123,7 @@ pub enum IconId {
     /// The Chat surface glyph.
     Chat,
     /// The Mesh Teams collaboration surface glyph — a Teams-inspired group/chat
-    /// mark tinted by the shell with `Style::ACCENT_TEAMS`.
+    /// mark with V2 tri-color linework; no Microsoft trademark asset is bundled.
     Teams,
     /// The Phones hub surface glyph — a smartphone outline (KDC-MESH-9).
     Phones,
@@ -424,26 +427,26 @@ impl IconId {
         match self {
             Self::Mark => construct_svg!("mark.svg"),
             Self::Wordmark => construct_svg!("wordmark.svg"),
-            Self::Node => yamis_svg!("devices/scalable/network-workgroup.svg"),
-            Self::Workbench => yamis_svg!("categories/scalable/applications-system.svg"),
-            Self::Instances => yamis_svg!("devices/scalable/computer.svg"),
-            Self::Desktop => yamis_svg!("devices/scalable/video-display.svg"),
-            Self::Music => yamis_svg!("places/scalable/folder-music.svg"),
-            Self::Media => yamis_svg!("categories/scalable/applications-multimedia.svg"),
-            Self::Files => yamis_svg!("apps/scalable/system-file-manager.svg"),
-            Self::Voice => yamis_svg!("devices/scalable/audio-input-microphone.svg"),
-            Self::Browser => yamis_svg!("apps/scalable/chromium.svg"),
-            Self::MapsLocation => yamis_svg!("apps/scalable/maps.svg"),
-            Self::Bookmarks => yamis_svg!("emblems/scalable/emblem-favorite.svg"),
-            Self::Terminal => yamis_svg!("apps/scalable/utilities-terminal.svg"),
-            Self::Editor => yamis_svg!("apps/scalable/code-oss.svg"),
-            Self::Chat => yamis_svg!("status/scalable/tray-message.svg"),
-            Self::Teams => TEAMS_SVG,
-            Self::Phones => yamis_svg!("devices/scalable/phone.svg"),
-            Self::System => yamis_svg!("categories/scalable/preferences-system.svg"),
-            Self::Storage => yamis_svg!("devices/scalable/drive-harddisk.svg"),
-            Self::MeshView => yamis_svg!("devices/scalable/network-card.svg"),
-            Self::Settings => yamis_svg!("apps/scalable/systemsettings.svg"),
+            Self::Node => carbon_v2_svg!("apps/construct-node.svg"),
+            Self::Workbench => carbon_v2_svg!("apps/construct-workbench.svg"),
+            Self::Instances => carbon_v2_svg!("apps/construct-instances.svg"),
+            Self::Desktop => carbon_v2_svg!("apps/construct-desktop.svg"),
+            Self::Music => carbon_v2_svg!("apps/construct-music.svg"),
+            Self::Media => carbon_v2_svg!("apps/construct-media.svg"),
+            Self::Files => carbon_v2_svg!("apps/construct-files.svg"),
+            Self::Voice => carbon_v2_svg!("apps/construct-voice.svg"),
+            Self::Browser => carbon_v2_svg!("apps/construct-browser.svg"),
+            Self::MapsLocation => carbon_v2_svg!("apps/construct-maps-location.svg"),
+            Self::Bookmarks => carbon_v2_svg!("apps/construct-bookmarks.svg"),
+            Self::Terminal => carbon_v2_svg!("apps/construct-terminal.svg"),
+            Self::Editor => carbon_v2_svg!("apps/construct-editor.svg"),
+            Self::Chat => carbon_v2_svg!("apps/construct-chat.svg"),
+            Self::Teams => carbon_v2_svg!("apps/construct-teams.svg"),
+            Self::Phones => carbon_v2_svg!("apps/construct-phones.svg"),
+            Self::System => carbon_v2_svg!("apps/construct-system.svg"),
+            Self::Storage => carbon_v2_svg!("apps/construct-storage.svg"),
+            Self::MeshView => carbon_v2_svg!("apps/construct-mesh-view.svg"),
+            Self::Settings => carbon_v2_svg!("apps/construct-settings.svg"),
             Self::DisplaySettings => yamis_svg!("apps/16/preferences-displays.svg"),
             Self::Mouse => yamis_svg!("apps/16/preferences-mouse.svg"),
             Self::Touchpad => yamis_svg!("apps/16/preferences-touchpad.svg"),
@@ -506,13 +509,11 @@ impl IconId {
             Self::NotificationsMuted => {
                 yamis_svg!("status/scalable/notification-disabled-symbolic.svg")
             }
-            Self::Workstation => yamis_svg!("apps/scalable/helio-workstation.svg"),
-            Self::Server => yamis_svg!("devices/scalable/network-server.svg"),
-            Self::Lighthouse => {
-                yamis_svg!("preferences/scalable/preferences-system-network-server.svg")
-            }
+            Self::Workstation => carbon_v2_svg!("apps/construct-workstation.svg"),
+            Self::Server => carbon_v2_svg!("apps/construct-server.svg"),
+            Self::Lighthouse => carbon_v2_svg!("apps/construct-lighthouse.svg"),
             Self::Signal => yamis_svg!("status/scalable/network-wireless-100.svg"),
-            Self::Sessions => yamis_svg!("preferences/scalable/window-duplicate.svg"),
+            Self::Sessions => carbon_v2_svg!("apps/construct-sessions.svg"),
             Self::Start => construct_svg!("mark.svg"),
             Self::Pin => yamis_svg!("actions/16/window-pin.svg"),
             Self::ChevronUp => yamis_svg!("actions/16/arrow-up.svg"),
@@ -536,26 +537,26 @@ impl IconId {
         match self {
             Self::Mark => "mark",
             Self::Wordmark => "wordmark",
-            Self::Node => "yamis-network-workgroup",
-            Self::Workbench => "yamis-applications-system",
-            Self::Instances => "yamis-computer",
-            Self::Desktop => "yamis-video-display",
-            Self::Music => "yamis-folder-music",
-            Self::Media => "yamis-applications-multimedia",
-            Self::Files => "yamis-system-file-manager",
-            Self::Voice => "yamis-audio-input-microphone",
-            Self::Browser => "yamis-chromium",
-            Self::MapsLocation => "yamis-maps-location",
-            Self::Bookmarks => "yamis-emblem-favorite",
-            Self::Terminal => "yamis-utilities-terminal",
-            Self::Editor => "yamis-code-oss",
-            Self::Chat => "yamis-tray-message",
-            Self::Teams => "mesh-teams",
-            Self::Phones => "yamis-phone",
-            Self::System => "yamis-preferences-system",
-            Self::Storage => "yamis-drive-harddisk",
-            Self::MeshView => "yamis-network-card",
-            Self::Settings => "yamis-systemsettings",
+            Self::Node => "construct-v2-node",
+            Self::Workbench => "construct-v2-workbench",
+            Self::Instances => "construct-v2-instances",
+            Self::Desktop => "construct-v2-desktop",
+            Self::Music => "construct-v2-music",
+            Self::Media => "construct-v2-media",
+            Self::Files => "construct-v2-files",
+            Self::Voice => "construct-v2-voice",
+            Self::Browser => "construct-v2-browser",
+            Self::MapsLocation => "construct-v2-maps-location",
+            Self::Bookmarks => "construct-v2-bookmarks",
+            Self::Terminal => "construct-v2-terminal",
+            Self::Editor => "construct-v2-editor",
+            Self::Chat => "construct-v2-chat",
+            Self::Teams => "construct-v2-teams",
+            Self::Phones => "construct-v2-phones",
+            Self::System => "construct-v2-system",
+            Self::Storage => "construct-v2-storage",
+            Self::MeshView => "construct-v2-mesh-view",
+            Self::Settings => "construct-v2-settings",
             Self::DisplaySettings => "yamis-preferences-displays",
             Self::Mouse => "yamis-preferences-mouse",
             Self::Touchpad => "yamis-preferences-touchpad",
@@ -614,11 +615,11 @@ impl IconId {
             Self::DarkMode => "yamis-weather-clear-night",
             Self::Notifications => "yamis-notification-active",
             Self::NotificationsMuted => "yamis-notification-disabled",
-            Self::Workstation => "yamis-helio-workstation",
-            Self::Server => "yamis-network-server",
-            Self::Lighthouse => "yamis-preferences-system-network-server",
+            Self::Workstation => "construct-v2-workstation",
+            Self::Server => "construct-v2-server",
+            Self::Lighthouse => "construct-v2-lighthouse",
             Self::Signal => "yamis-network-wireless-100",
-            Self::Sessions => "yamis-window-duplicate",
+            Self::Sessions => "construct-v2-sessions",
             Self::Start => "construct-start-menu-mark",
             Self::Pin => "yamis-window-pin",
             Self::ChevronUp => "yamis-arrow-up",
@@ -779,6 +780,7 @@ fn scale_alpha(coverage: u8, tint_alpha: u8) -> u8 {
 #[allow(clippy::panic)] // tests fail by panicking, with per-glyph context
 mod tests {
     use super::{icon_image, IconError, IconId};
+    use std::collections::BTreeSet;
 
     /// A light Gray-10-ish tint used across the raster tests.
     const TINT: [u8; 4] = [0xe0, 0xe0, 0xe0, 0xff];
@@ -792,6 +794,17 @@ mod tests {
     /// low-opacity shell many YAMIS status icons use for the unfilled portion.
     fn strong_pixels(rgba: &[u8]) -> usize {
         rgba.chunks_exact(4).filter(|px| px[3] >= 192).count()
+    }
+
+    fn explicit_hex_colors(svg: &str) -> BTreeSet<&str> {
+        let bytes = svg.as_bytes();
+        let mut colors = BTreeSet::new();
+        for idx in 0..bytes.len().saturating_sub(6) {
+            if bytes[idx] == b'#' && bytes[idx + 1..idx + 7].iter().all(u8::is_ascii_hexdigit) {
+                colors.insert(&svg[idx..idx + 7]);
+            }
+        }
+        colors
     }
 
     /// Byte index of the strongest-coverage pixel — a geometry-independent
@@ -887,6 +900,61 @@ mod tests {
             0,
             "text lockup unexpectedly rendered without a fontdb"
         );
+    }
+
+    #[test]
+    fn core_platform_icons_use_mackes_carbon_v2_tricolor_linework() {
+        let core = [
+            IconId::Node,
+            IconId::Workbench,
+            IconId::Instances,
+            IconId::Desktop,
+            IconId::Music,
+            IconId::Media,
+            IconId::Files,
+            IconId::Voice,
+            IconId::Browser,
+            IconId::MapsLocation,
+            IconId::Bookmarks,
+            IconId::Terminal,
+            IconId::Editor,
+            IconId::Chat,
+            IconId::Teams,
+            IconId::Phones,
+            IconId::System,
+            IconId::Storage,
+            IconId::MeshView,
+            IconId::Settings,
+            IconId::Workstation,
+            IconId::Server,
+            IconId::Lighthouse,
+            IconId::Sessions,
+        ];
+        for id in core {
+            assert!(
+                id.name().starts_with("construct-v2-"),
+                "{id:?} should use the Construct V2 asset namespace, got {}",
+                id.name()
+            );
+            let svg = id.svg();
+            assert!(
+                svg.contains("data-mcnf-icon=\"carbon-v2\""),
+                "{id:?} should embed a Mackes-Carbon V2 SVG"
+            );
+            assert!(
+                svg.contains("fill=\"none\""),
+                "{id:?} should stay linework-first"
+            );
+            assert!(
+                !svg.contains("currentColor"),
+                "{id:?} should carry adapted tri-color artwork, not caller tint"
+            );
+            assert_eq!(
+                explicit_hex_colors(svg).len(),
+                3,
+                "{id:?} should carry exactly three explicit colors"
+            );
+        }
     }
 
     #[test]
