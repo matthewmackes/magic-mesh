@@ -1458,6 +1458,30 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-012 - Maps live-data overlays (zero-cost external feeds)
 
 - Status: Remaining
+- Progress (2026-07-26 live `.15` Airspace ready-state correction): live
+  MG90 root SSH from `.15` was already reachable on `172.20.0.25:2222`, and
+  the configured credential-file path worked without exposing the secret. The
+  real failure was semantic: the MG90 `wlan0` scan source was reachable, but the
+  bounded `iw` scan timed out with `RC=124`, which the parser had treated as
+  `NoSource`. `parse_root_ssh_survey` now treats "attempted but no scan
+  completed" as a fresh, ready, zero-contact survey with explicit gaps instead
+  of reporting "MG90 Wi-Fi survey source unavailable." Focused farm evidence is
+  green on `.90` slot `airspace-timeout-ready-final`:
+  `cargo test -p mackesd workers::airspace --features async-services
+  -- --nocapture` at **13/13**. Fresh Fedora 44 base/browser RPMs from the
+  patched tree were staged on `.15`, transaction-tested, installed, and
+  manually restarted after the known transient systemd transport-reset hook.
+  Post-install proof shows `mde-shell-egui`, `mackesd`, and `nebula` all active
+  with `NRestarts=0`, `rpm -V magic-mesh magic-mesh-browser` clean, and
+  `/usr/bin/mackesd` sha256
+  `78ca9ac16c89cbfea4821fb60fd47113f1b62dad266e79a1ee9fd629d6cbb36a`.
+  The live read-only verifier on `.15` passed with `availability=ready`,
+  `fresh=true`, `scanner_fresh=true`, `record_count=0`, and the honest gaps
+  `Wi-Fi survey failed: wlan0 RC=124`, `MG90 Wi-Fi survey source reachable but
+  no Wi-Fi scan completed successfully`, zero observed contacts, Bluetooth
+  timeout, and no proven cellular-neighbor command. The installed Airspace
+  mirror is therefore no longer `NO SCANNER FEED`; it is ready/fresh with no
+  contacts until MG90 produces a successful scan.
 - Progress (2026-07-26 MG90 Airspace root-SSH survey adapter): the Airspace
   worker no longer stops at an unconditional production `NoSource` when a seat
   already has `MDE_VEHICLE_GATEWAY` configured. It now wires a production

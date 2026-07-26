@@ -517,11 +517,18 @@ fn parse_root_ssh_survey(output: &str, scanned_at_ms: i64) -> io::Result<Airspac
     }
     finish_wifi(&mut current_wifi, &mut contacts, &mut gaps);
 
-    if wifi_attempts == 0 || wifi_successes == 0 {
+    if wifi_attempts == 0 {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             "MG90 Wi-Fi survey source unavailable",
         ));
+    }
+    if wifi_successes == 0 {
+        push_gap(
+            &mut gaps,
+            "MG90 Wi-Fi survey source reachable but no Wi-Fi scan completed successfully"
+                .to_string(),
+        );
     }
     if contacts.is_empty() {
         push_gap(
@@ -767,6 +774,37 @@ END_BT_INQUIRY RC=0
         .expect("empty scan is a successful survey");
 
         assert!(survey.contacts.is_empty());
+        assert!(survey
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("observed zero contacts")));
+    }
+
+    #[test]
+    fn root_ssh_survey_ready_when_reachable_wifi_scan_times_out() {
+        let survey = parse_root_ssh_survey(
+            r#"MDE_AIRSPACE_SURVEY_V1
+BEGIN_WIFI_IFACE wlan0
+END_WIFI_IFACE wlan0 RC=124
+BEGIN_BT_INQUIRY
+Scanning ...
+END_BT_INQUIRY RC=0
+GAP cellular: no MG90 root-SSH cellular-neighbor survey command is proven
+"#,
+            10_000,
+        )
+        .expect("reachable MG90 with scan timeout still proves a fresh source");
+
+        assert_eq!(survey.scanned_at_ms, Some(10_000));
+        assert!(survey.contacts.is_empty());
+        assert!(survey
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("Wi-Fi survey failed: wlan0 RC=124")));
+        assert!(survey
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("source reachable")));
         assert!(survey
             .gaps
             .iter()
