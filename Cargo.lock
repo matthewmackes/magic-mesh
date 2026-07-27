@@ -4772,6 +4772,7 @@ name = "mde-shell-egui"
 version = "12.1.1"
 dependencies = [
  "base64",
+ "chrono",
  "mackes-mesh-types",
  "mde-bookmarks",
  "mde-bookmarks-egui",
