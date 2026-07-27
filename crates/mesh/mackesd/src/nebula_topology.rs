@@ -145,7 +145,13 @@ pub fn read_adverts(root: &Path) -> Vec<HopAdvert> {
 
     by_hop
         .into_iter()
-        .filter_map(|(_, mut adverts)| (adverts.len() == 1).then(|| adverts.pop().unwrap()))
+        .filter_map(|(_, adverts)| {
+            if adverts.len() == 1 {
+                adverts.into_iter().next()
+            } else {
+                None
+            }
+        })
         .collect()
 }
 
