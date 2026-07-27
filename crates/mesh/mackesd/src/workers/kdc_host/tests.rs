@@ -56,7 +56,7 @@ fn fanout_classify_maps_only_follow_everywhere_packets() {
         None
     );
     assert_eq!(
-        fanout_action_for_packet("kdeconnect.notification", &json!({ "ticker": "x" })),
+        fanout_action_for_packet("kdeconnect.notification", &json!({ "ticker": "x" }), "moto"),
         None
     );
 }

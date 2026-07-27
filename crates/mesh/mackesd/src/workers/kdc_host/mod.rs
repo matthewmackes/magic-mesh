@@ -1022,7 +1022,7 @@ fn fanout_action_for_packet(kind: &str, body: &Value, peer: &str) -> Option<Fano
 /// clipboard/ring is byte-identical to a directly-received one.
 fn apply_fanout_action(action: &FanoutAction) -> String {
     match action {
-        FanoutAction::Clipboard { content } => {
+        FanoutAction::Clipboard { content, .. } => {
             apply_clipboard(content);
             format!("clipboard set ({} bytes)", content.len())
         }
