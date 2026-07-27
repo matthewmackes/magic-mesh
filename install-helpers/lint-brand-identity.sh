@@ -5,7 +5,7 @@
 # product name. This gate prevents the two superseded legacy spellings from
 # returning to current source, generated-user-facing metadata, install helpers,
 # and current docs.
-# The governed `Quazar-dark` palette identifier, historical archives, and
+# The governed `Quazar` palette/interface identity, historical archives, and
 # lower-case asset paths such as assets/brand/construct are intentionally
 # outside this check.
 #
@@ -13,7 +13,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SUPERSEDED='Qua[sz]ar'
+SUPERSEDED='Quasar'
 
 default_paths() {
   local p
@@ -32,9 +32,6 @@ default_paths() {
 
 allowed_hit() {
   local path="$1" text="$2"
-  # `Quazar-dark` is the canonical palette identifier in every governed file;
-  # it is not a visible-product-name exception tied to one documentation path.
-  [[ "$text" == *'Quazar-dark'* ]] && return 0
   case "$path" in
     */install-helpers/lint-brand-identity.sh)
       # The guard itself must name the token it rejects and plant it in
