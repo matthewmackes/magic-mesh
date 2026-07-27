@@ -317,6 +317,7 @@ fn every_command() -> Vec<CollabCommand> {
         CollabCommand::SetDoNotDisturb { enabled: true },
         CollabCommand::PublishClipboard {
             space: SpaceId::new(),
+            text: "https://example".into(),
             item: ClipboardItem {
                 kind: ClipItemKind::Uri,
                 preview: "https://…".into(),

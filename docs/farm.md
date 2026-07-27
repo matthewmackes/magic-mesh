@@ -18,7 +18,7 @@ it is, how it's automated, and how to recover it.
 
 | Host | IP | Role | Notes |
 |---|---|---|---|
-| `rocky9-kvm2` (dev) | `172.20.145.192` | Orchestration + local builds + podman | Rocky 9.8; full GUI toolchain installed (below); runs XO + tofu/ansible/packer |
+| `rocky9-kvm2` (dev) | `172.20.145.192` | Orchestration only | Rocky 9.8; repo checkout and farm dispatch; builds and Podman workloads run on farm VMs |
 | `XEN-HOME-SERVICES` | `172.20.0.9` | XCP-ng 8.3 dom0 — build host (4c/24G) | local SR is **`ext`** (not "Local storage"); build VM `mcnf-build-home-services` → `172.20.0.50` (4 vCPU/12 GiB, cap 2) |
 | `KVM-XCP1` | `172.20.145.193` | XCP-ng 8.3 dom0 — test bed (4c/23G) | build VM `mcnf-build-kvm-xcp1` → `172.20.0.90` (4 vCPU/12 GiB, cap 2); spin throwaway test nodes here |
 | `XEN-BIGBOY` | `172.20.145.165` | XCP-ng 8.3 dom0 — high-capacity (**12c/32G**, 398G SR) | build VM `mcnf-build-52` → `172.20.0.130` (**12 vCPU**/20 GiB, cap 3 — the long-pole node); room for several more build VMs |
@@ -57,7 +57,7 @@ committed `.cargo/config.toml`), so use `RUSTFLAGS="-C link-arg=-fuse-ld=gold"`
 | Toolchain / config (idempotent) | **Ansible** (`infra/ansible/`) | `setup-build-vm-toolchain.sh`, `xcp-authorize-farm-key.sh` |
 | Golden image build | **Packer** | `setup-xcp-golden-template.sh` + farm template bake helpers |
 | Parallel build CI | **Forgejo Actions** / Woodpecker (planned) | `xcp-build.sh` + ad-hoc parallelism |
-| Local parallel slots | **podman** | — |
+| Local parallel slots | **farm VM slots via `xcp-build.sh`** | — |
 
 **Why IaC over bash:** the bash path hit (and this doc records) a string of XCP
 foot-guns — `xe`-over-ssh re-splitting spaced values, SR/template name divergence

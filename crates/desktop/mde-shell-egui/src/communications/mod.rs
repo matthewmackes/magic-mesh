@@ -61,6 +61,12 @@ const MAX_ACTIVITY_FEED_ENTRIES: usize = 1024;
 /// this seat, not a collaboration event or a remote read receipt.
 const LOCAL_READ_CURSORS_TOPIC: &str = "local/collab/read-cursors";
 
+/// The canonical mesh clipboard responder namespace. Communications still emits
+/// typed `action/collab/*` commands for its signed projection, but row
+/// pin/delete/clear controls must also hit this lane so Mesh Teams edits the
+/// same clipboard history as the Clipboard Viewer.
+const CLIPBOARD_ACTION_PREFIX: &str = "action/clipboard/";
+
 /// The local seat's wall time in epoch milliseconds (the collab worker's
 /// `now_unix_ms` shape). Injected into [`CollabData::now_unix_ms`] so the surface
 /// evaluates the message edit/delete window + relative ages against a real clock.
@@ -477,15 +483,23 @@ impl CommunicationsState {
         if let Some(space) = self.surface.selected_space() {
             self.data.mark_space_read(space);
         }
-        drain_to_bus(&mut sink, self.bus_root.as_deref());
+        drain_to_bus(&mut sink, self.bus_root.as_deref(), &self.data);
     }
 }
 
 /// Drain every command the surface emitted this frame onto `action/collab/*`. A
 /// publish failure is logged (visible) and dropped — never a silent swallow, and
 /// never a faked local apply (the worker is the one authority).
-fn drain_to_bus(sink: &mut CommandSink, bus_root: Option<&Path>) {
+fn drain_to_bus(sink: &mut CommandSink, bus_root: Option<&Path>, data: &dyn CollabData) {
     for command in sink.drain() {
+        if let Err(e) = publish_canonical_clipboard_action(bus_root, data, &command) {
+            tracing::debug!(
+                target: "shell::communications",
+                verb = command.verb(),
+                error = %e,
+                "canonical clipboard action publish failed",
+            );
+        }
         let topic = topics::command_topic_for(&command);
         if let Err(e) = publish_command(bus_root, &topic, &command) {
             tracing::debug!(
@@ -496,6 +510,105 @@ fn drain_to_bus(sink: &mut CommandSink, bus_root: Option<&Path>) {
             );
         }
     }
+}
+
+/// Mirror Communications clipboard row mutations to the canonical
+/// `action/clipboard/*` responder. The collab command remains the signed
+/// projection authority; this companion request keeps the mesh-global
+/// `clipboard/history.json` action semantics from drifting into a parallel
+/// Communications-only store.
+fn publish_canonical_clipboard_action(
+    bus_root: Option<&Path>,
+    data: &dyn CollabData,
+    command: &CollabCommand,
+) -> Result<(), String> {
+    match command {
+        CollabCommand::PinClipboard { space, clip } => {
+            let id = clipboard_history_id_for(data, *space, *clip)?;
+            publish_clipboard_action_request(bus_root, "pin", Some(&id))
+        }
+        CollabCommand::UnpinClipboard { space, clip } => {
+            let id = clipboard_history_id_for(data, *space, *clip)?;
+            publish_clipboard_action_request(bus_root, "unpin", Some(&id))
+        }
+        CollabCommand::DeleteClipboard { space, clip } => {
+            let id = clipboard_history_id_for(data, *space, *clip)?;
+            publish_clipboard_action_request(bus_root, "delete", Some(&id))
+        }
+        CollabCommand::ClearClipboard { .. } => {
+            publish_clipboard_action_request(bus_root, "clear", None)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn clipboard_history_id_for(
+    data: &dyn CollabData,
+    space: SpaceId,
+    clip: EventId,
+) -> Result<String, String> {
+    let item = data
+        .clipboard_lane(space)
+        .and_then(|lane| lane.items.iter().find(|item| item.event_id == clip))
+        .ok_or_else(|| format!("clipboard item {clip} is not in the folded lane for {space}"))?;
+    clipboard_history_id(&item.sha256_hex).ok_or_else(|| {
+        format!(
+            "clipboard item {clip} has an invalid content hash for canonical history addressing"
+        )
+    })
+}
+
+/// `clipboard_sync::clip_id` is the first 16 lower-hex chars of the full SHA-256.
+/// The Communications read model carries the full content address, so the shell
+/// can address canonical history rows without linking the daemon worker crate.
+fn clipboard_history_id(sha256_hex: &str) -> Option<String> {
+    let id = sha256_hex.get(..16)?;
+    if id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some(id.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+fn clipboard_action_topic(verb: &str) -> String {
+    format!("{CLIPBOARD_ACTION_PREFIX}{verb}")
+}
+
+fn publish_clipboard_action_request(
+    bus_root: Option<&Path>,
+    verb: &str,
+    id: Option<&str>,
+) -> Result<(), String> {
+    let Some(root) = bus_root else {
+        return Err("No local Bus — the mesh daemon may be down.".to_string());
+    };
+    let unsigned = match id {
+        Some(id) => serde_json::json!({
+            "id": id,
+            "schema_version": CLOUD_ACTION_SCHEMA_VERSION,
+        }),
+        None => serde_json::json!({
+            "schema_version": CLOUD_ACTION_SCHEMA_VERSION,
+        }),
+    }
+    .to_string();
+    let auth_verb = format!("clipboard-{verb}");
+    let target = id
+        .map(|id| format!("entry:{id}"))
+        .unwrap_or_else(|| "all-unpinned".to_string());
+    let authorized =
+        crate::iac::authorize_root_mutation_body(&unsigned, &auth_verb, "clipboard", &target)?;
+    let persist = Persist::open(root.to_path_buf())
+        .map_err(|e| format!("Couldn't open the local Bus: {e}"))?;
+    mde_bus::rpc::publish_request(
+        &persist,
+        &clipboard_action_topic(verb),
+        Priority::Default,
+        None,
+        Some(&authorized),
+    )
+    .map_err(|e| format!("Bus write failed: {e}"))?;
+    Ok(())
 }
 
 /// Publish one [`CollabCommand`] on `topic` (`action/collab/<verb>`) through the
@@ -532,10 +645,10 @@ fn publish_command(
 mod tests {
     use super::*;
 
-    use mde_collab_types::value::{CallKind, DeliveryState, MessageBody};
+    use mde_collab_types::value::{sha256_hex, CallKind, ClipItemKind, DeliveryState, MessageBody};
     use mde_collab_types::{
-        ActivityEntry, ActorClock, CallParticipantState, CallParticipantView, CallView, EventId,
-        MessageView, SpaceKind, SpaceRole, SpaceSummary,
+        ActivityEntry, ActorClock, CallParticipantState, CallParticipantView, CallView,
+        ClipboardView, EventId, MessageView, SpaceKind, SpaceRole, SpaceSummary,
     };
 
     fn persist_at(root: &Path) -> Persist {
@@ -977,7 +1090,8 @@ mod tests {
             body: MessageBody::new("hello **mesh**"),
         });
 
-        drain_to_bus(&mut sink, Some(dir.path()));
+        let data = LiveCollabData::new(Some(dir.path().to_path_buf()));
+        drain_to_bus(&mut sink, Some(dir.path()), &data);
         assert!(sink.is_empty(), "the sink was drained");
 
         // The command landed on the canonical `action/collab/send` topic.
@@ -1028,5 +1142,106 @@ mod tests {
         )
         .expect_err("no spool must be an error");
         assert!(err.contains("No local Bus"), "explains the down mesh");
+    }
+
+    #[test]
+    fn clipboard_pin_publishes_collab_command_and_canonical_clipboard_action() {
+        // Mesh Teams renders the collab read model, but a row pin must also hit
+        // the canonical action/clipboard responder. The responder addresses rows
+        // by clipboard_sync's 16-hex content id, not the collab EventId.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let persist = persist_at(dir.path());
+        let ops = SpaceId::new();
+        let clip = EventId::new();
+        let text = b"canonical mesh clip";
+        let full_hash = sha256_hex(text);
+        let history_id = full_hash[..16].to_string();
+
+        write_state(
+            &persist,
+            &topics::state_topic(proj::SPACE_DIRECTORY),
+            &SpaceDirectory {
+                spaces: vec![space_summary(ops, "Team Ops")],
+            },
+        );
+        write_state(
+            &persist,
+            &topics::space_state_topic(proj::CLIPBOARD_LANE, ops),
+            &ClipboardLane {
+                space: ops,
+                items: vec![ClipboardView {
+                    event_id: clip,
+                    kind: ClipItemKind::Text,
+                    preview: "canonical mesh clip".to_string(),
+                    sha256_hex: full_hash,
+                    source: "falcon".to_string(),
+                    at_unix_ms: 1_700_000_000_000,
+                    pinned: false,
+                }],
+            },
+        );
+
+        let mut data = LiveCollabData::new(Some(dir.path().to_path_buf()));
+        data.refresh_for(Some(ops));
+        let mut sink = CommandSink::new();
+        sink.emit(CollabCommand::PinClipboard { space: ops, clip });
+
+        drain_to_bus(&mut sink, Some(dir.path()), &data);
+
+        let collab = persist
+            .read_latest(&topics::command_topic("pin_clipboard"))
+            .expect("read collab command")
+            .expect("collab command published");
+        let collab_body: serde_json::Value =
+            serde_json::from_str(collab.body.as_deref().expect("collab body"))
+                .expect("decode collab command");
+        assert_eq!(collab_body["schema_version"], 1);
+        assert!(
+            collab_body["armed_token"].as_str().is_some(),
+            "collab projection command remains capability-gated"
+        );
+
+        let canonical = persist
+            .read_latest(&clipboard_action_topic("pin"))
+            .expect("read canonical clipboard action")
+            .expect("canonical clipboard action published");
+        let action_body: serde_json::Value =
+            serde_json::from_str(canonical.body.as_deref().expect("action body"))
+                .expect("decode canonical action");
+        assert_eq!(action_body["schema_version"], 1);
+        assert_eq!(action_body["id"], history_id);
+        assert!(
+            action_body["armed_token"].as_str().is_some(),
+            "canonical clipboard mutation carries the responder capability"
+        );
+    }
+
+    #[test]
+    fn clear_clipboard_publishes_canonical_clear_request() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let persist = persist_at(dir.path());
+        let ops = SpaceId::new();
+        let data = LiveCollabData::new(Some(dir.path().to_path_buf()));
+        let mut sink = CommandSink::new();
+        sink.emit(CollabCommand::ClearClipboard { space: ops });
+
+        drain_to_bus(&mut sink, Some(dir.path()), &data);
+
+        let canonical = persist
+            .read_latest(&clipboard_action_topic("clear"))
+            .expect("read canonical clipboard action")
+            .expect("canonical clipboard clear published");
+        let action_body: serde_json::Value =
+            serde_json::from_str(canonical.body.as_deref().expect("action body"))
+                .expect("decode canonical action");
+        assert_eq!(action_body["schema_version"], 1);
+        assert!(
+            action_body.get("id").is_none(),
+            "clear targets all unpinned history, not a row id"
+        );
+        assert!(
+            action_body["armed_token"].as_str().is_some(),
+            "canonical clear carries the responder capability"
+        );
     }
 }

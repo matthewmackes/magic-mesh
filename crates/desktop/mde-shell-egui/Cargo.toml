@@ -71,6 +71,7 @@ mde-bus = { path = "../../platform/mde-bus" }
 serde      = { workspace = true }
 serde_json = { workspace = true }
 rand = "0.8"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 rustix = { version = "0.38", features = ["process"] }
 
 # CHOOSER-9 — the Desktop Chooser's mesh-synced favorites/recents/manual sources

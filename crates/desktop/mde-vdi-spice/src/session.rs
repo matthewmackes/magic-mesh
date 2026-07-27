@@ -22,13 +22,23 @@
 //! integration-gated layer ([`crate::connect`]) — it calls these same methods, so
 //! the tested path and the shipped path do not diverge.
 
-use spice_client::DisplaySurface;
-
 use crate::config::{ConfigError, SpiceConfig};
 use crate::egui::{ColorImage, Event};
 use crate::input::{map_event, ModifierState, SpiceInputEvent};
 use crate::pixel::{Framebuffer, FramebufferError, SurfaceFormat};
+use mackes_mesh_types::vdi_clipboard::VdiClipboardStatus;
 use mde_vdi_core::{DamageLog, FrameDamage};
+use spice_client::DisplaySurface;
+
+/// Current SPICE text clipboard capability.
+///
+/// The backend wires main/display/inputs for rendering and input, but it does not
+/// yet drive SPICE vdagent clipboard messages. WL-FUNC-016 requires this to be
+/// reported explicitly instead of silently dropping copy/paste requests.
+#[must_use]
+pub fn spice_clipboard_status() -> VdiClipboardStatus {
+    VdiClipboardStatus::spice_unsupported()
+}
 
 /// The egui-facing SPICE desktop: a framebuffer the shell renders + an input
 /// queue the transport drains.
@@ -98,6 +108,12 @@ impl SpiceSession {
     #[must_use]
     pub const fn pointer_position(&self) -> (u16, u16) {
         self.pointer
+    }
+
+    /// Current text clipboard capability for this session.
+    #[must_use]
+    pub fn clipboard_status(&self) -> VdiClipboardStatus {
+        spice_clipboard_status()
     }
 
     // ── Decode side (fed by the transport or by tests) ──────────────────────
@@ -211,6 +227,7 @@ mod tests {
     use crate::config::SpiceConfig;
     use crate::egui::{Color32, Event, Key, Modifiers, PointerButton, Pos2};
     use crate::input::{Scancode, SpiceInputEvent};
+    use mackes_mesh_types::vdi_clipboard::VdiClipboardLaneStatus;
     use spice_client::DisplaySurface;
 
     fn session() -> SpiceSession {
@@ -237,6 +254,21 @@ mod tests {
     #[test]
     fn new_rejects_invalid_config() {
         assert!(SpiceSession::new(SpiceConfig::new("")).is_err());
+    }
+
+    #[test]
+    fn clipboard_status_reports_explicit_vdagent_unsupported() {
+        let status = session().clipboard_status();
+        assert!(!status.is_bidirectional());
+        for lane in [status.host_to_guest, status.guest_to_host] {
+            match lane {
+                VdiClipboardLaneStatus::Unsupported { reason } => {
+                    assert!(reason.contains("vdagent"));
+                    assert!(reason.contains("mde-vdi-spice"));
+                }
+                other => panic!("expected unsupported SPICE clipboard lane, got {other:?}"),
+            }
+        }
     }
 
     #[test]

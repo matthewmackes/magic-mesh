@@ -2442,11 +2442,19 @@ fn publishing_a_clip_emits_publish_clipboard_with_the_real_hash() {
     let mut sink = CommandSink::new();
     surface.publish_clip_text(&mut sink, space, "https://example.test/page", "eagle");
     let published = sink.queued().iter().find_map(|c| match c {
-        CollabCommand::PublishClipboard { space: s, item } => Some((*s, item.clone())),
+        CollabCommand::PublishClipboard {
+            space: s,
+            text,
+            item,
+        } => Some((*s, text.clone(), item.clone())),
         _ => None,
     });
-    let (s, item) = published.expect("PublishClipboard emitted");
+    let (s, text, item) = published.expect("PublishClipboard emitted");
     assert_eq!(s, space);
+    assert_eq!(
+        text, "https://example.test/page",
+        "PublishClipboard carries the bounded full text for the canonical clipboard event",
+    );
     assert_eq!(item.kind, ClipItemKind::Uri, "an http(s) clip is a URI");
     assert_eq!(item.source, "eagle");
     assert_eq!(

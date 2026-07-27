@@ -16,6 +16,7 @@
 #   xcp-build.sh gates                sync + fmt-check + clippy + test (the ship/release gates)
 #   xcp-build.sh coverage             sync + the canonical 80% llvm-cov floor
 #   xcp-build.sh rpm                  sync + release build + base/browser RPMs; pull them local
+#   xcp-build.sh container-rpm [args] sync + Fedora container RPM cut on the farm
 #   xcp-build.sh pull <remote-glob>   rsync artifacts back (relative to the remote repo)
 #   xcp-build.sh shell                interactive ssh into the build VM
 #   xcp-build.sh route <cargo args>   print the shape-routed host + reason (dry; no sync/build)
@@ -88,6 +89,15 @@ do_sync() {
 # (mold linker, CMAKE policy) already present via the synced .cargo/config.toml.
 remote() {
   "${SSH[@]}" "$DEST" "source \$HOME/.cargo/env 2>/dev/null; cd $REMOTE_DIR && $*"
+}
+
+quote_args() {
+  local arg quoted out=""
+  for arg in "$@"; do
+    printf -v quoted '%q' "$arg"
+    out+=" $quoted"
+  done
+  printf '%s' "$out"
 }
 
 # ============================================================================
@@ -423,6 +433,7 @@ esac
 case "${1:-}" in
   cargo) resolve_host "${@:2}" ;;
   rpm)   resolve_host rpm ;;               # release cut → big
+  container-rpm) resolve_host rpm ;;       # Fedora container cut → big
   # gates = fmt + clippy --all-targets + test --workspace: a heavy WHOLE-WORKSPACE
   # job (it compiles every crate twice over), so it claims the big VM like a
   # workspace build, NOT a small pool node (design L1 "whole-workspace → big").
@@ -536,6 +547,14 @@ case "${1:-}" in
       "$REPO/install-helpers/verify-rpm-payload.sh" size "$rpm"
     done
     ls -la "$ARTIFACTS"/*.rpm
+    ;;
+
+  container-rpm)
+    shift
+    do_sync
+    log "Fedora container RPM cut on $BUILD_HOST (Podman stays on the farm)"
+    args="$(quote_args "$@")"
+    remote "MCNF_FARM_REMOTE=1 bash install-helpers/build-rpm-fedora43.sh$args"
     ;;
 
   pull)

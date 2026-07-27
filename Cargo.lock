@@ -4219,6 +4219,7 @@ dependencies = [
  "mackes-transport",
  "mackes-xcp",
  "magic-fleet",
+ "md5",
  "mde-adblock",
  "mde-bookmarks",
  "mde-browser-workers",
@@ -4855,6 +4856,7 @@ dependencies = [
  "ironrdp-session",
  "ironrdp-tls",
  "ironrdp-tokio",
+ "mackes-mesh-types",
  "mde-egui",
  "mde-vdi-core",
  "sha2 0.10.9",
@@ -4866,6 +4868,7 @@ dependencies = [
 name = "mde-vdi-spice"
 version = "12.1.0"
 dependencies = [
+ "mackes-mesh-types",
  "mde-egui",
  "mde-vdi-core",
  "spice-client",

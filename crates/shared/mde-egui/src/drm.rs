@@ -654,6 +654,66 @@ fn drm_char(code: u32, shift: bool) -> Option<char> {
     })
 }
 
+fn drm_modifiers(alt: bool, ctrl: bool, shift: bool) -> egui::Modifiers {
+    egui::Modifiers {
+        alt,
+        ctrl,
+        shift,
+        // The DRM runner is Linux-only. egui's text shortcuts are written against
+        // `command` so Ctrl+C/X/V and Ctrl+A behave like the winit backend.
+        command: ctrl,
+        ..Default::default()
+    }
+}
+
+fn drm_clipboard_text_for_paste(text: &str) -> Option<String> {
+    let text = text.replace("\r\n", "\n");
+    (!text.is_empty()).then_some(text)
+}
+
+fn push_drm_clipboard_shortcut(
+    events: &mut Vec<egui::Event>,
+    modifiers: egui::Modifiers,
+    key: egui::Key,
+    clipboard_text: &str,
+) -> bool {
+    if !modifiers.command {
+        return false;
+    }
+    match key {
+        egui::Key::X => {
+            events.push(egui::Event::Cut);
+            true
+        }
+        egui::Key::C => {
+            events.push(egui::Event::Copy);
+            true
+        }
+        egui::Key::V => {
+            if let Some(text) = drm_clipboard_text_for_paste(clipboard_text) {
+                events.push(egui::Event::Paste(text));
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+fn drm_clipboard_output_text(output: &egui::PlatformOutput) -> Option<String> {
+    #![allow(deprecated)]
+
+    let mut text = None;
+    for command in &output.commands {
+        if let egui::OutputCommand::CopyText(next) = command {
+            text = Some(next.clone());
+        }
+    }
+    if !output.copied_text.is_empty() {
+        text = Some(output.copied_text.clone());
+    }
+    text
+}
+
 /// The bare-seat present loop's **wake policy** (perf-1), factored out pure so it can
 /// be unit-tested headlessly — the live present path itself can only be exercised on
 /// a real seat.
@@ -1126,7 +1186,25 @@ const GESTURE_TICK_INTERVAL: Duration = Duration::from_millis(33);
 /// [`DrmError::NoDrmMaster`] when no DRM master is available (headless/CI) so the
 /// caller can fall back to [`crate::run_client`]; the other variants on a seat that
 /// can't be driven / presented.
-pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), DrmError> {
+pub fn run_drm(app_id: &str, ui: impl FnMut(&egui::Context)) -> Result<(), DrmError> {
+    let mut clipboard = crate::MemoryTextClipboard::new();
+    run_drm_with_clipboard(app_id, &mut clipboard, ui)
+}
+
+/// Run an MCNF egui surface with an injected text clipboard provider.
+///
+/// The provider is refreshed when Ctrl+V is pressed and receives every egui
+/// [`egui::OutputCommand::CopyText`]. This keeps the direct-DRM input/output loop
+/// compositor-free while allowing the owning shell to connect clipboard state to
+/// the mesh Bus.
+///
+/// # Errors
+/// The same seat acquisition and presentation failures as [`run_drm`].
+pub fn run_drm_with_clipboard(
+    app_id: &str,
+    clipboard: &mut dyn crate::TextClipboard,
+    mut ui: impl FnMut(&egui::Context),
+) -> Result<(), DrmError> {
     let _ = app_id;
     let (_node, file) = open_primary_node()?;
     let card = Card(file);
@@ -1386,6 +1464,7 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
     let mut shift = false;
     let mut ctrl = false;
     let mut alt = false;
+    let mut clipboard_text = String::new();
 
     // SURFACE-8 (lock 13): the touchscreen shares this one input pipeline. The
     // translator maps libinput's normalized multitouch contacts through the active
@@ -1647,13 +1726,23 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
                         // shell to dispatch them (launcher/media keys) even when idle.
                         force_render = true;
                     }
-                    let modifiers = egui::Modifiers {
-                        alt,
-                        ctrl,
-                        shift,
-                        ..Default::default()
-                    };
+                    let modifiers = drm_modifiers(alt, ctrl, shift);
                     if let Some(key) = drm_key(code) {
+                        if pressed && modifiers.command && key == egui::Key::V {
+                            if let Some(text) = clipboard.read_text() {
+                                clipboard_text = text;
+                            }
+                        }
+                        if pressed
+                            && push_drm_clipboard_shortcut(
+                                &mut events,
+                                modifiers,
+                                key,
+                                &clipboard_text,
+                            )
+                        {
+                            continue;
+                        }
                         events.push(egui::Event::Key {
                             key,
                             physical_key: None,
@@ -1846,6 +1935,10 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
         // below; it only takes `platform_output.accesskit_update`, leaving the rest of
         // `full_output` intact.
         a11y.drain(&mut full_output);
+        if let Some(text) = drm_clipboard_output_text(&full_output.platform_output) {
+            clipboard.write_text(&text);
+            clipboard_text = text;
+        }
         // eframe's contract: egui reports how long until it next needs to paint via the
         // root viewport's `repaint_delay` (`Duration::MAX` == idle). Arm the next wake
         // from it (perf-1) — this is what gives request_repaint_after teeth. Read before
@@ -2330,7 +2423,8 @@ pub fn probe_prime_import_liveness() -> Result<PrimeImportLiveness, DrmError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        explicit_modifier, open_primary_node, probe_prime_import_liveness, DrmError,
+        drm_clipboard_output_text, drm_clipboard_text_for_paste, drm_modifiers, explicit_modifier,
+        open_primary_node, probe_prime_import_liveness, push_drm_clipboard_shortcut, DrmError,
         ReimportedGemBuffer,
     };
     use drm::buffer::{Handle as GemHandle, PlanarBuffer};
@@ -2345,6 +2439,104 @@ mod tests {
             Err(DrmError::NoDrmMaster(_)) => {}
             Err(other) => panic!("expected a clean NoDrmMaster fallback, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn drm_clipboard_modifiers_mark_ctrl_as_linux_command() {
+        let modifiers = drm_modifiers(false, true, false);
+        assert!(modifiers.ctrl);
+        assert!(modifiers.command);
+        assert!(!modifiers.mac_cmd);
+    }
+
+    #[test]
+    fn drm_clipboard_shortcuts_synthesize_egui_events() {
+        let modifiers = drm_modifiers(false, true, false);
+        let mut events = Vec::new();
+
+        assert!(push_drm_clipboard_shortcut(
+            &mut events,
+            modifiers,
+            egui::Key::C,
+            "ignored",
+        ));
+        assert_eq!(events, vec![egui::Event::Copy]);
+
+        events.clear();
+        assert!(push_drm_clipboard_shortcut(
+            &mut events,
+            modifiers,
+            egui::Key::X,
+            "ignored",
+        ));
+        assert_eq!(events, vec![egui::Event::Cut]);
+
+        events.clear();
+        assert!(push_drm_clipboard_shortcut(
+            &mut events,
+            modifiers,
+            egui::Key::V,
+            "first\r\nsecond",
+        ));
+        assert_eq!(events, vec![egui::Event::Paste("first\nsecond".to_owned())]);
+
+        events.clear();
+        assert!(push_drm_clipboard_shortcut(
+            &mut events,
+            modifiers,
+            egui::Key::V,
+            "",
+        ));
+        assert!(events.is_empty());
+
+        let no_command = drm_modifiers(false, false, false);
+        assert!(!push_drm_clipboard_shortcut(
+            &mut events,
+            no_command,
+            egui::Key::C,
+            "ignored",
+        ));
+    }
+
+    #[test]
+    fn drm_clipboard_paste_normalizes_crlf_and_skips_empty_text() {
+        assert_eq!(
+            drm_clipboard_text_for_paste("one\r\ntwo"),
+            Some("one\ntwo".to_owned())
+        );
+        assert!(drm_clipboard_text_for_paste("").is_none());
+    }
+
+    #[test]
+    fn drm_clipboard_output_captures_copy_text_commands() {
+        let mut output = egui::PlatformOutput::default();
+        output
+            .commands
+            .push(egui::OutputCommand::CopyText("first".to_owned()));
+        output
+            .commands
+            .push(egui::OutputCommand::CopyText("second".to_owned()));
+
+        assert_eq!(
+            drm_clipboard_output_text(&output),
+            Some("second".to_owned())
+        );
+    }
+
+    #[test]
+    fn drm_clipboard_output_keeps_legacy_copied_text_compatibility() {
+        #![allow(deprecated)]
+
+        let mut output = egui::PlatformOutput::default();
+        output
+            .commands
+            .push(egui::OutputCommand::CopyText("command".to_owned()));
+        output.copied_text = "legacy".to_owned();
+
+        assert_eq!(
+            drm_clipboard_output_text(&output),
+            Some("legacy".to_owned())
+        );
     }
 
     // ── QC-23 Tier 1: PRIME-import liveness ──

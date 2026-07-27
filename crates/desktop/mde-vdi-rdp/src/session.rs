@@ -34,7 +34,18 @@ use crate::link::{
 };
 use crate::pixel::{Framebuffer, FramebufferError, PixelFormat};
 use crate::tier::RdpTierSettings;
+use mackes_mesh_types::vdi_clipboard::VdiClipboardStatus;
 use mde_vdi_core::{DamageLog, DamageRect, FrameDamage};
+
+/// Current RDP text clipboard capability.
+///
+/// The backend wires display, framebuffer decode, and input, but it does not yet
+/// open RDP's real CLIPRDR virtual channel. WL-FUNC-016 requires this to be
+/// reported explicitly instead of silently dropping copy/paste requests.
+#[must_use]
+pub fn rdp_clipboard_status() -> VdiClipboardStatus {
+    VdiClipboardStatus::rdp_unsupported()
+}
 
 /// The egui-facing RDP desktop: a framebuffer the shell renders + an input queue
 /// the wire pump drains.
@@ -111,6 +122,12 @@ impl RdpSession {
     #[must_use]
     pub const fn pointer_position(&self) -> (u16, u16) {
         self.pointer
+    }
+
+    /// Current text clipboard capability for this session.
+    #[must_use]
+    pub fn clipboard_status(&self) -> VdiClipboardStatus {
+        rdp_clipboard_status()
     }
 
     // ── Decode side (fed by the wire pump or by tests) ──────────────────────
@@ -370,6 +387,7 @@ mod tests {
     use crate::input::{RdpInputEvent, Scancode};
     use crate::link::{QualityMode, QualityTier};
     use crate::pixel::PixelFormat;
+    use mackes_mesh_types::vdi_clipboard::VdiClipboardLaneStatus;
 
     // The smallest RDP-legal desktop (validate() enforces a 200px minimum); tests
     // paint a tiny rect at the origin and assert on the first row's pixels.
@@ -381,6 +399,21 @@ mod tests {
     #[test]
     fn new_rejects_invalid_config() {
         assert!(RdpSession::new(RdpConfig::new("", "u", "p")).is_err());
+    }
+
+    #[test]
+    fn clipboard_status_reports_explicit_cliprdr_unsupported() {
+        let status = session().clipboard_status();
+        assert!(!status.is_bidirectional());
+        for lane in [status.host_to_guest, status.guest_to_host] {
+            match lane {
+                VdiClipboardLaneStatus::Unsupported { reason } => {
+                    assert!(reason.contains("CLIPRDR"));
+                    assert!(reason.contains("mde-vdi-rdp"));
+                }
+                other => panic!("expected unsupported RDP clipboard lane, got {other:?}"),
+            }
+        }
     }
 
     #[test]

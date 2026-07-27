@@ -695,6 +695,7 @@ fn clear_clipboard_spares_pinned_items() {
         .apply(
             &CollabCommand::PublishClipboard {
                 space,
+                text: "keep me".into(),
                 item: clip("keep me"),
             },
             &sa,
@@ -706,6 +707,7 @@ fn clear_clipboard_spares_pinned_items() {
     a.apply(
         &CollabCommand::PublishClipboard {
             space,
+            text: "drop me".into(),
             item: clip("drop me"),
         },
         &sa,
@@ -940,6 +942,7 @@ fn rich_corpus() -> Vec<CollabEventEnvelope> {
         .apply(
             &CollabCommand::PublishClipboard {
                 space,
+                text: "ssh key".into(),
                 item: clip("ssh key"),
             },
             &sa,

@@ -12,6 +12,10 @@
 //!   [`RfbClientMessage`]s (pointer mask / keysym / wheel / text), synthesising
 //!   modifier-key transitions from egui's modifier snapshot, and queues them for
 //!   the transport.
+//! * [`VncSession::send_clipboard_to_guest`] queues a bounded RFB
+//!   `ClientCutText`; [`VncSession::receive_server_cut_text`] accepts bounded
+//!   `ServerCutText` from the transport while suppressing echoes of our own
+//!   outbound cut text.
 //! * The **adaptive-codec surface (E12-10)**: the transport feeds link probes
 //!   ([`VncSession::record_rtt`] / [`VncSession::record_stall`] /
 //!   [`VncSession::record_frame`]), [`VncSession::autotune`] steps the
@@ -39,7 +43,7 @@ use crate::link::{
 };
 use crate::pixel::{Framebuffer, PixelFormat};
 use crate::tier::VncTierSettings;
-use crate::wire::{RfbClientMessage, RfbControlMessage};
+use crate::wire::{RfbClientMessage, RfbControlMessage, RfbCutText, RfbCutTextError};
 use mde_vdi_core::{DamageLog, DamageRect, FrameDamage};
 
 /// The egui-facing RFB desktop: a framebuffer the shell renders + an input queue
@@ -57,6 +61,15 @@ pub struct VncSession {
     damage: DamageLog,
     /// Wire-ready input messages awaiting the transport, in arrival order.
     pending: Vec<RfbClientMessage>,
+    /// Bounded guest→host clipboard text received from RFB `ServerCutText` and
+    /// awaiting the shell/mesh clipboard publisher.
+    pending_guest_clipboard: Vec<RfbCutText>,
+    /// Last host→guest clipboard payload sent as `ClientCutText`; used to
+    /// suppress server echo of our own materialization.
+    last_client_cut_text: Option<RfbCutText>,
+    /// Last accepted/suppressed server clipboard payload; used to debounce
+    /// duplicate guest cut-text events.
+    last_server_cut_text: Option<RfbCutText>,
     /// Last absolute pointer position pushed (framebuffer pixels).
     pointer: (u16, u16),
     /// Live pointer button mask pushed to the guest (RFB sends it in full).
@@ -103,6 +116,9 @@ impl VncSession {
             dirty: true,
             damage: DamageLog::new(),
             pending: Vec::new(),
+            pending_guest_clipboard: Vec::new(),
+            last_client_cut_text: None,
+            last_server_cut_text: None,
             pointer: (0, 0),
             buttons: 0,
             modifiers: ModifierState::default(),
@@ -351,6 +367,57 @@ impl VncSession {
         std::mem::take(&mut self.pending)
     }
 
+    // ── Clipboard side (real RFB ClientCutText / ServerCutText) ─────────────
+
+    /// Queue host clipboard text for materialization into the guest through the
+    /// real RFB `ClientCutText` message.
+    ///
+    /// This only affects the outgoing RFB queue. It does not publish a
+    /// guest→host clipboard event, which keeps directionality explicit.
+    ///
+    /// # Errors
+    /// [`RfbCutTextError::TooLarge`] if the UTF-8 payload exceeds the governed
+    /// 1 MiB guest transport cap.
+    pub fn send_clipboard_to_guest(
+        &mut self,
+        text: impl Into<String>,
+    ) -> Result<(), RfbCutTextError> {
+        let cut_text = RfbCutText::new(text)?;
+        self.last_client_cut_text = Some(cut_text.clone());
+        self.pending.push(RfbClientMessage::ClientCutText(cut_text));
+        Ok(())
+    }
+
+    /// Apply a bounded guest clipboard payload decoded from RFB `ServerCutText`.
+    ///
+    /// Echoes of our last `ClientCutText` and duplicate guest payloads are
+    /// suppressed here so the shell publishes only real guest→host clipboard
+    /// changes onto the mesh lane.
+    pub fn receive_server_cut_text(&mut self, cut_text: RfbCutText) -> VncClipboardStatus {
+        if self.last_client_cut_text.as_ref() == Some(&cut_text) {
+            self.last_server_cut_text = Some(cut_text);
+            return VncClipboardStatus::EchoSuppressed;
+        }
+        if self.last_server_cut_text.as_ref() == Some(&cut_text) {
+            return VncClipboardStatus::DuplicateSuppressed;
+        }
+        self.last_server_cut_text = Some(cut_text.clone());
+        self.pending_guest_clipboard.push(cut_text);
+        VncClipboardStatus::GuestTextQueued
+    }
+
+    /// Borrow guest clipboard events waiting for the shell/mesh publisher.
+    #[must_use]
+    pub fn pending_guest_clipboard(&self) -> &[RfbCutText] {
+        &self.pending_guest_clipboard
+    }
+
+    /// Drain guest clipboard events waiting for the shell/mesh publisher.
+    #[must_use]
+    pub fn take_guest_clipboard(&mut self) -> Vec<RfbCutText> {
+        std::mem::take(&mut self.pending_guest_clipboard)
+    }
+
     // ── Adaptive quality (E12-10) ───────────────────────────────────────────
     //
     // RFB is client-steered at runtime (see `crate::tier`): a tier change
@@ -487,6 +554,17 @@ impl VncSession {
     }
 }
 
+/// Result of handling a guest→host RFB `ServerCutText` payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VncClipboardStatus {
+    /// The guest text was accepted and queued for the shell/mesh clipboard lane.
+    GuestTextQueued,
+    /// The server echoed our last host→guest `ClientCutText`; no publication.
+    EchoSuppressed,
+    /// The guest repeated the last `ServerCutText`; no duplicate publication.
+    DuplicateSuppressed,
+}
+
 #[cfg(test)]
 mod tests {
     use super::VncSession;
@@ -497,7 +575,8 @@ mod tests {
     use crate::link::{QualityMode, QualityTier};
     use crate::pixel::PixelFormat;
     use crate::tier::PREFERRED_ENCODINGS;
-    use crate::wire::{RfbClientMessage, RfbControlMessage};
+    use crate::wire::{RfbClientMessage, RfbControlMessage, RfbCutText, RFB_CUT_TEXT_MAX_BYTES};
+    use crate::VncClipboardStatus;
 
     fn session() -> VncSession {
         VncSession::new(VncConfig::new("host").with_size(16, 16)).expect("valid config")
@@ -724,6 +803,85 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn host_clipboard_queues_only_client_cut_text() {
+        let mut s = session();
+        s.send_clipboard_to_guest("host→guest")
+            .expect("bounded clipboard text");
+        assert_eq!(
+            s.pending_input(),
+            &[RfbClientMessage::ClientCutText(
+                RfbCutText::new("host→guest").expect("bounded text")
+            )],
+            "host clipboard materialization must be a real RFB ClientCutText"
+        );
+        assert!(
+            s.pending_guest_clipboard().is_empty(),
+            "host→guest must not fabricate a guest→host clipboard event"
+        );
+    }
+
+    #[test]
+    fn host_clipboard_respects_the_one_mib_guest_cap() {
+        let mut s = session();
+        let too_big = "x".repeat(RFB_CUT_TEXT_MAX_BYTES + 1);
+        assert!(
+            s.send_clipboard_to_guest(too_big).is_err(),
+            "over-cap guest clipboard materialization must fail"
+        );
+        assert!(
+            s.pending_input().is_empty(),
+            "failed materialization must not leave a partial RFB message queued"
+        );
+    }
+
+    #[test]
+    fn guest_clipboard_queues_inbound_text_without_outbound_echo() {
+        let mut s = session();
+        let status = s.receive_server_cut_text(RfbCutText::new("guest→host").expect("bounded"));
+        assert_eq!(status, VncClipboardStatus::GuestTextQueued);
+        assert!(
+            s.pending_input().is_empty(),
+            "guest→host must not queue a ClientCutText echo"
+        );
+        assert_eq!(
+            s.take_guest_clipboard()
+                .into_iter()
+                .map(RfbCutText::into_text)
+                .collect::<Vec<_>>(),
+            vec!["guest→host".to_string()]
+        );
+    }
+
+    #[test]
+    fn server_echo_of_last_host_clipboard_is_suppressed() {
+        let mut s = session();
+        s.send_clipboard_to_guest("same text")
+            .expect("bounded clipboard text");
+        let _ = s.take_input();
+        let status = s.receive_server_cut_text(RfbCutText::new("same text").expect("bounded"));
+        assert_eq!(status, VncClipboardStatus::EchoSuppressed);
+        assert!(
+            s.pending_guest_clipboard().is_empty(),
+            "server echo of our ClientCutText must not publish back to host"
+        );
+    }
+
+    #[test]
+    fn duplicate_guest_clipboard_is_suppressed() {
+        let mut s = session();
+        assert_eq!(
+            s.receive_server_cut_text(RfbCutText::new("guest").expect("bounded")),
+            VncClipboardStatus::GuestTextQueued
+        );
+        let _ = s.take_guest_clipboard();
+        assert_eq!(
+            s.receive_server_cut_text(RfbCutText::new("guest").expect("bounded")),
+            VncClipboardStatus::DuplicateSuppressed
+        );
+        assert!(s.pending_guest_clipboard().is_empty());
     }
 
     #[test]

@@ -16,8 +16,10 @@
 //!
 //! ```text
 //!   egui::Event ──▶ input::map_event ──▶ VncInputEvent ─▶ session ─▶ RfbClientMessage ─▶ wire bytes
-//!                                                            ▲                                │
-//!   VncSession ─────────────────────────────────────────────┘                                ▼
+//!   host clipboard ─────────────────────────────────────────┘          │
+//!                                                                      ▼
+//!   VncSession ◀── RFB ServerCutText ── wire decode       RFB ClientCutText
+//!       │
 //!       │  apply_framebuffer_update / apply_rect  ◀── encoding::decode ◀── RFB FramebufferUpdate
 //!       ▼
 //!   frame() ──▶ egui::ColorImage ──▶ shell TextureHandle
@@ -32,8 +34,9 @@
 //!   decoders and the `FramebufferUpdate` parser.
 //! * [`input`] — the [`egui::Event`] → [`VncInputEvent`] mapping (X11 keysyms +
 //!   the pointer button model).
-//! * [`wire`] — the [`RfbClientMessage`] (`PointerEvent` / `KeyEvent`) and
-//!   [`RfbControlMessage`] (`SetPixelFormat` / `SetEncodings`) byte encoders.
+//! * [`wire`] — the [`RfbClientMessage`] (`PointerEvent` / `KeyEvent` /
+//!   `ClientCutText`) and [`RfbControlMessage`] (`SetPixelFormat` /
+//!   `SetEncodings`) byte encoders, plus bounded `ServerCutText` decoding.
 //! * [`des`] — the pure-Rust single-DES + RFB "VNC Authentication" (security
 //!   type 2) challenge/response, so a password-protected endpoint can complete
 //!   the handshake without any external crypto dependency.
@@ -95,6 +98,9 @@ pub use link::{
     QualityMode, QualityTier, TierApplication, TierChange,
 };
 pub use pixel::{Framebuffer, FramebufferError, PixelFormat};
-pub use session::VncSession;
+pub use session::{VncClipboardStatus, VncSession};
 pub use tier::{VncTierSettings, PREFERRED_ENCODINGS};
-pub use wire::{RfbClientMessage, RfbControlMessage};
+pub use wire::{
+    decode_server_cut_text_body, RfbClientMessage, RfbControlMessage, RfbCutText, RfbCutTextError,
+    RFB_CUT_TEXT_MAX_BYTES,
+};

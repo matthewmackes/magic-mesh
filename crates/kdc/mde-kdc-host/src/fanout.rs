@@ -101,6 +101,10 @@ pub enum FanoutAction {
     Clipboard {
         /// The copied text to place on each node's clipboard.
         content: String,
+        /// The original clipboard source (`kdc:<phone>`). Defaulted so older
+        /// replicated rows that predate source attribution still deserialize.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        source: String,
     },
     /// A find-my-device ring → every desktop rings audibly (#10).
     Ring,
@@ -448,6 +452,7 @@ mod tests {
     fn request_id_is_stable_and_distinguishes_actions() {
         let clip = FanoutAction::Clipboard {
             content: "hi".into(),
+            source: "kdc:moto".into(),
         };
         let ring = FanoutAction::Ring;
         assert_eq!(request_id("eagle", 10, &clip), "eagle:10:clipboard");
@@ -465,6 +470,7 @@ mod tests {
         // The endpoint (eagle) relays a clipboard action.
         let action = FanoutAction::Clipboard {
             content: "shared text".into(),
+            source: "kdc:moto".into(),
         };
         let id = request_id("eagle", 1_000, &action);
         publish_request(

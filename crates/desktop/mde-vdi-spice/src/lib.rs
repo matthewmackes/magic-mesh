@@ -66,4 +66,4 @@ pub use config::{ConfigError, SpiceConfig};
 pub use connect::{BlockingSpiceTransport, ConnectError, SpiceTransport};
 pub use input::{map_event, scancode_for, MouseButton, Scancode, SpiceInputEvent};
 pub use pixel::{Framebuffer, FramebufferError, SurfaceFormat};
-pub use session::SpiceSession;
+pub use session::{spice_clipboard_status, SpiceSession};

@@ -255,7 +255,7 @@ pub fn poll_once(persist: &Persist, svc: &ClipboardService, cursors: &mut HashMa
 mod tests {
     use super::*;
     use crate::ipc::action_auth::{authorize_test_body, ActionAuthorizer};
-    use crate::workers::clipboard_sync::{apply_clip, clip_id};
+    use crate::workers::clipboard_sync::{apply_clip, apply_clip_event, clip_id, ClipEventBody};
 
     const AUTH_KEY: &[u8] = b"clipboard-action-auth-test-key";
     const AUTH_NOW: i64 = 1_700_000_000_000;
@@ -292,6 +292,37 @@ mod tests {
         assert_eq!(v["entries"].as_array().unwrap().len(), 2);
         // Newest-first: "b" is the front.
         assert_eq!(v["entries"][0]["text"], "b");
+    }
+
+    #[test]
+    fn canonical_clip_events_remain_compatible_with_action_verbs() {
+        let (_t, s) = svc();
+        let path = history_path(&s.workgroup_root);
+        let body = ClipEventBody::from_text("lane text", "seat/node-a", "2026-07-26T11:00:00Z");
+        let mut h = History::default();
+        assert!(apply_clip_event(&mut h, &body));
+        write_history(&path, &h).unwrap();
+
+        let listed: serde_json::Value =
+            serde_json::from_str(&build_reply(&s, "list", None)).unwrap();
+        assert_eq!(listed["ok"], true);
+        assert_eq!(listed["entries"][0]["id"], body.id.as_str());
+        assert_eq!(listed["entries"][0]["text"], "lane text");
+        assert_eq!(listed["entries"][0]["source"], "seat/node-a");
+        assert_eq!(listed["entries"][0]["time"], "2026-07-26T11:00:00Z");
+
+        let pin = build_reply(&s, "pin", Some(&body.id));
+        assert!(pin.contains("\"changed\":true"), "{pin}");
+        let clear = build_reply(&s, "clear", None);
+        assert!(clear.contains("\"cleared\":0"), "{clear}");
+        assert_eq!(
+            read_history(&path).entries.len(),
+            1,
+            "pinned event-body rows survive clear"
+        );
+        let delete = build_reply(&s, "delete", Some(&body.id));
+        assert!(delete.contains("\"changed\":true"), "{delete}");
+        assert!(read_history(&path).entries.is_empty());
     }
 
     #[test]
@@ -380,6 +411,25 @@ mod tests {
     fn unknown_verb_errors() {
         let (_t, s) = svc();
         assert!(build_reply(&s, "bogus", None).contains("unknown clipboard verb"));
+    }
+
+    #[test]
+    fn materialize_action_is_not_accidentally_supported_without_seat_writer() {
+        let (_t, s) = svc();
+        seed(&s, &["keep"]);
+        let before = read_history(&history_path(&s.workgroup_root));
+        assert!(!ACTION_VERBS.contains(&"materialize"));
+        let reply = build_authorized_reply(
+            &s,
+            "materialize",
+            Some(r#"{"id":"ignored","target":"seat0","schema_version":1}"#),
+        );
+        assert!(reply.contains("unknown clipboard verb"), "{reply}");
+        assert_eq!(
+            read_history(&history_path(&s.workgroup_root)),
+            before,
+            "unsupported materialization must not mutate history"
+        );
     }
 
     fn authorized_service(root: &std::path::Path) -> ClipboardService {

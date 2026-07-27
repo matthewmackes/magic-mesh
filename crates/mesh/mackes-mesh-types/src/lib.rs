@@ -113,6 +113,7 @@ pub mod transit;
 // `discovery` / `session_rail` mirrors reuse the one type instead of maintaining
 // byte-compatible copies. Lands here (like `mesh_storage` / `device_control`) so
 // the desktop tier never depends on the heavy daemon crate.
+pub mod vdi_clipboard;
 pub mod vdi_session;
 /// Rolling Node — the provider-neutral vehicle-gateway (`state/vehicle/<node>`) mirror
 /// + `action/vehicle/*` command contract + a pure NMEA GGA parser. A workstation-side

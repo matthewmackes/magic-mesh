@@ -18,7 +18,7 @@ instead of leaving closed work in this file.
 
 ## Current Snapshot - 2026-07-26 release gate
 
-- **11 active epics:** 11 `Remaining`, 0 `Blocked`; no `Needs clarification`.
+- **12 active epics:** 12 `Remaining`, 0 `Blocked`; no `Needs clarification`.
 - **Release gate:** the current integrated wave passes the full `mackesd` farm
   suite at **4,124 passed, 0 failed, 1 ignored**. The Fedora 44
   base/browser/thin-lighthouse RPM cut is green at **81.7 / 39.1 / 11.0 MiB**;
@@ -39,11 +39,13 @@ instead of leaving closed work in this file.
   blocker.
 - **P0:** WL-ARCH-007 (authorization mint + direct lifecycle proof),
   WL-FUNC-011 (optional real media/LLM evidence remains), WL-FUNC-016
-  (native mesh clipboard lanes for seat/browser/VDI), and WL-UX-010
-  (Mesh Teams near-parity interface redesign).
+  (native mesh clipboard lanes for seat/browser/VDI), WL-UX-010
+  (Mesh Teams near-parity interface redesign), and WL-UX-011 (unified local
+  hardware and connectivity controls).
 - **In flight:** WL-FUNC-012 live map feeds, WL-UX-006 Construct, WL-UX-007
   Car, WL-UX-009 unified workspace design language, and WL-UX-010 Mesh Teams
-  near-parity UX. The 2026-07-23
+  near-parity UX. WL-UX-011 owns the newly reviewed This Node hardware-center
+  consolidation and missing workstation/laptop controls. The 2026-07-23
   thin-lighthouse policy is enforced in role pinning, onboarding, install
   profiles, directory discovery, DNS, workers, secret scope minting, and both
   media helpers; no new lighthouse may carry media or file-sharing duties.
@@ -4538,6 +4540,121 @@ These decisions refine acceptance and sequencing for the active items below.
   live coauthoring, basic tasks, full two-way external Discord server
   integration, glance-safe Car Mode, and worklist placement in both WL-FUNC-011
   and this linked UX epic.
+
+### WL-UX-011 - Unified This Node hardware center
+
+- Status: Remaining
+- Priority: P0
+- Complexity: Epic
+- Problem: Local-node controls are fragmented across This Node, System,
+  Storage, Device Manager, About, the status bar, and Control Center. The
+  existing Bluetooth, display, power, and input pages have useful foundations,
+  but workstation Wi-Fi is absent, keyboard backlight has no backend or GUI,
+  the detailed sound page is read-only, and tap-to-click is exposed without a
+  real direct-seat apply path. The shell also lacks one coherent laptop and
+  hardware-management experience for batteries, thermals, docks, firmware,
+  privacy devices, and safe manufacturer controls.
+- Required outcome: `This Node` is the one searchable, HIG-principled,
+  progressively disclosed hardware center for the local machine. Its grouped
+  sidebar exposes Overview; Connectivity (Wi-Fi & Ethernet, Cellular, Hotspot,
+  VPN, DNS & Proxy, Bluetooth); Display & Sound (Displays & LCD, Sound, Camera
+  & Privacy); Input (Keyboard & Backlight, Mouse & Touch, Pen & Gestures);
+  Power & Performance (Power & Battery, Thermals & Fans, CPU & GPU); Hardware
+  (Devices & Drivers, Firmware & Docking, Storage); Personalization (Appearance
+  & Wallpaper); and Mesh & System (Identity & Role, Mesh Pairing & Network,
+  Remote Proofing, About). Every page remains discoverable on unsupported
+  hardware and shows an honest unavailable or degraded state instead of
+  disappearing or fabricating data.
+- Scope: Consolidate the durable local-node destinations currently exposed by
+  This Node/System, Storage, Device Manager, About, and Surface enablement into
+  the one This Node route, while preserving legacy deep links by normalizing
+  them to the corresponding page. Implement local-only control and telemetry
+  for NetworkManager/ModemManager connectivity; BlueZ; displays and LCD/DDC
+  brightness; PipeWire/WirePlumber sound; keyboard, pointer, touch, pen, and
+  gesture devices; UPower/logind/power profiles; thermals, fans, CPU/GPU
+  profiles; devices, drivers, firmware, docks, storage, and supported OEM
+  controls. Keep Control Center as a transient quick-controls overlay and the
+  status bar as glanceable chrome, with no second durable settings hierarchy.
+  Remote hardware mutation, generic arbitrary sysfs/path writes, raw MSR/SMI or
+  `/dev/mem` access, lock/PAM replacement, and a host application ecosystem are
+  out of scope.
+- Relevant files/components: `crates/desktop/mde-shell-egui/src/system/`,
+  `crates/desktop/mde-shell-egui/src/device_manager/`,
+  `crates/desktop/mde-shell-egui/src/storage/`,
+  `crates/desktop/mde-shell-egui/src/about.rs`,
+  `crates/desktop/mde-shell-egui/src/control_center.rs`,
+  `crates/desktop/mde-shell-egui/src/status_bar.rs`,
+  `crates/desktop/mde-shell-egui/src/hotkeys.rs`,
+  `crates/desktop/mde-shell-egui/src/surfaces.rs`,
+  `crates/desktop/mde-shell-egui/src/seat_pump.rs`,
+  `crates/desktop/mde-seat/`, direct DRM/libinput support in
+  `crates/shared/mde-egui/`, typed local-control contracts in
+  `crates/mesh/mackes-mesh-types/`, `mackesd` hardware/firmware workers under
+  `crates/mesh/mackesd/src/`, RPM/package service dependencies, and the current
+  interface/host-control design notes under `docs/design/`.
+- Acceptance criteria: one public This Node route owns all durable local
+  settings, diagnostics, and storage/about/device views; the sidebar hierarchy,
+  search results, compact/narrow layout, advanced disclosures, and legacy-route
+  normalization are covered by tests. Wi-Fi supports radio state, scan,
+  WPA2/WPA3 and hidden/802.1X joins, saved-network priority/forget, and honest
+  signal/security state; Ethernet, cellular/APN, hotspot, DNS, proxy, and
+  imported WireGuard/OpenVPN activation are functional when their system
+  providers exist. Connectivity changes preserve `nebula1`, mesh DNS, overlay
+  routes, and lighthouse reachability, warn before disconnecting the sole
+  uplink or taking it over for a hotspot, handle credentials through an
+  in-process SecretAgent, and never place credentials in Bus payloads, logs,
+  shell arguments, or serialized GUI state. Bluetooth retains adapter
+  power/discoverability/pairability, scan, PIN handling, pair, connect, trust,
+  and forget behavior. Local state and changes use typed
+  `SeatSnapshot`/`SeatEvent` and hardware-control contracts rather than direct
+  shell writes from the GUI. Displays support enablement, mode, refresh,
+  arrangement, scale/rotation, and internal/DDC brightness; keyboard-backlight
+  devices support level changes, multiple-device selection, brightness hotkeys,
+  and OSD feedback. Sound exposes selectable/default outputs and inputs, ports,
+  profiles, application/VM/mesh strips, mute, volume, solo, and real peak
+  levels through a long-lived PipeWire adapter, with an explicitly labeled
+  no-meter fallback when only compatibility tools are available. Mouse, touch,
+  keyboard, pen, and gesture policy is per-device and applied through the real
+  udev/libinput direct-seat path, including functional tap-to-click rather than
+  a presentation-only toggle. Control Center offers the safe quick subset for
+  connectivity, Bluetooth, sound, LCD/keyboard brightness, and power; status
+  chrome distinguishes underlay connectivity from mesh state and adds numeric
+  battery plus microphone/camera privacy indicators. Camera and microphone
+  devices enumerate with real privacy/policy state; fingerprint capability is
+  diagnostic-only and does not change the existing curtain or PAM boundary.
+  Battery pages show charge, health, source, time estimates, charge limits,
+  profiles, idle/lid behavior, and supported sleep/power actions; thermals,
+  fans, CPU/GPU, docks, devices, drivers, firmware, and storage use live typed
+  state. A privileged hardware-control worker accepts only explicit action
+  classes for platform profile, fan mode/curve, bounded CPU power limits, GPU
+  profile, device enablement, and Thunderbolt authorization. Standard kernel
+  interfaces plus Microsoft Surface, Dell, Lenovo, HP, and ASUS adapters are
+  capability-detected; unsupported or unsafe controls stay visible but disabled
+  with a reason. Manufacturer writes are bounded, armed/audited, thermally
+  constrained, watchdog-protected, and automatically return to a safe profile.
+  Existing fwupd and Surface enablement behavior is generalized without
+  regressing Surface-specific support, and all actions remain node-local.
+- Verification method: fixture and contract tests cover This Node routing and
+  search, progressive disclosure, unavailable/degraded states, NetworkManager,
+  ModemManager, BlueZ, PipeWire, UPower/logind, fwupd, libinput, sysfs/backlight,
+  DDC, hwmon, docks, and each OEM capability adapter. Run focused
+  `mde-shell-egui`, `mde-seat`, `mackes-mesh-types`, and `mackesd` tests plus
+  workspace build/clippy/fmt gates on the build farm, placing the longest shell
+  or workspace job on BigBoy; run worklist, style, architecture-boundary, secret,
+  and documentation-supersession lints. Render dark, light, narrow, large-text,
+  unsupported-hardware, and destructive-confirmation states. Complete final
+  direct-DRM/Sunshine captures and physical control proofs on available
+  workstation/laptop hardware for connectivity, audio I/O, LCD and keyboard
+  brightness, mouse/touch, battery/power, firmware/dock, and one safe control
+  for each reachable OEM; record explicit hardware-unavailable evidence for
+  capabilities that cannot be exercised.
+- Origin or merged source IDs: 2026-07-26 local-node GUI audit and operator
+  decisions: close gaps plus polish; full connectivity including hotspot,
+  proxy, DNS, and VPN; one large This Node hardware center; progressive
+  disclosure; full laptop depth; OEM writes; first-class Microsoft Surface,
+  Dell, Lenovo, HP, and ASUS support. Coordinates with WL-UX-006 for Construct
+  shell chrome and with WL-UX-009 for the shared Quazar/HIG design language
+  without creating a competing interface workstream.
 
 ## Performance
 

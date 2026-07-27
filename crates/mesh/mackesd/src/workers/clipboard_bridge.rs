@@ -22,10 +22,10 @@
 //! - The sole outward seam is the injectable [`ClipboardAccess`] trait
 //!   (`read_local` / `write_local`). Production wires [`OsClipboardAccess`], whose
 //!   methods return a typed [`ClipboardAccessError::IntegrationGated`] naming
-//!   exactly what the live call needs (the SPICE/RDP vdagent or `wl-clipboard`
-//!   bridge into the connected VM desktop) — never a fake success (§7-legal, exactly
-//!   like [`super::session_broker::MeshSessionStore`]). A test fake drives the whole
-//!   drain → policy → relay pipeline without a live guest.
+//!   exactly what the live call needs (the VM protocol clipboard channel, such as
+//!   SPICE/RDP agent support or VNC cut-text plumbing) — never a fake success
+//!   (§7-legal, exactly like [`super::session_broker::MeshSessionStore`]). A test
+//!   fake drives the whole drain → policy → relay pipeline without a live guest.
 //!
 //! ## Not leader-gated (unlike the broker)
 //!
@@ -497,11 +497,12 @@ pub trait ClipboardAccess {
 
 /// Production [`ClipboardAccess`]: the live OS/guest clipboard channel.
 ///
-/// This slice (E12-9) delivers the pure bridge + the seam; the live executor (the
-/// SPICE/RDP clipboard vdagent, or the `wl-clipboard` bridge into the connected VM
-/// desktop, reached over the Nebula overlay) is wired by a later E12 unit. Until then
-/// each method returns a typed [`ClipboardAccessError::IntegrationGated`] naming
-/// exactly what the live call needs — never a fake success (§7).
+/// This slice (E12-9) delivers the pure bridge + the seam; the live executor (a
+/// real VM protocol clipboard channel, such as SPICE/RDP agent support or VNC
+/// cut-text plumbing, reached over the Nebula overlay) is wired by a later E12
+/// unit. Until then each method returns a typed
+/// [`ClipboardAccessError::IntegrationGated`] naming exactly what the live call
+/// needs — never a fake success (§7).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OsClipboardAccess;
 
@@ -510,9 +511,9 @@ impl ClipboardAccess for OsClipboardAccess {
         Err(ClipboardAccessError::IntegrationGated {
             op: "read_local",
             reason: format!(
-                "session {session_id} → needs the live OS/guest clipboard channel (the SPICE/RDP \
-                 clipboard vdagent or the wl-clipboard bridge into the connected VM desktop); the \
-                 guest clipboard link isn't wired yet"
+                "session {session_id} → needs the live OS/guest clipboard channel (a VM protocol \
+                 clipboard channel such as SPICE/RDP agent support or VNC cut-text plumbing); the \
+                 guest clipboard link is not wired here yet"
             ),
         })
     }
@@ -525,9 +526,9 @@ impl ClipboardAccess for OsClipboardAccess {
         Err(ClipboardAccessError::IntegrationGated {
             op: "write_local",
             reason: format!(
-                "session {session_id} → needs the live OS/guest clipboard channel (the SPICE/RDP \
-                 clipboard vdagent or the wl-clipboard bridge into the connected VM desktop); the \
-                 guest clipboard link isn't wired yet"
+                "session {session_id} → needs the live OS/guest clipboard channel (a VM protocol \
+                 clipboard channel such as SPICE/RDP agent support or VNC cut-text plumbing); the \
+                 guest clipboard link is not wired here yet"
             ),
         })
     }

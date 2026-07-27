@@ -237,6 +237,12 @@ pub enum CollabCommand {
     PublishClipboard {
         /// The space.
         space: SpaceId,
+        /// The bounded full text captured by the producer. The signed
+        /// `ClipboardPublished` event stores only the metadata in `item`; shell
+        /// producers use this text to publish the canonical
+        /// `event/clipboard/clip` body for durable mesh history.
+        #[serde(default)]
+        text: String,
         /// The captured clip.
         item: ClipboardItem,
     },

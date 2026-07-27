@@ -1,34 +1,23 @@
-//! CLIP-SYNC-1 — mesh clipboard sync worker.
+//! CLIP-SYNC-1 — mesh clipboard history worker.
 //!
-//! Watches the local Wayland clipboard for text changes, broadcasts every
-//! clip on the Mackes Bus (`event/clipboard/clip`), and appends it to ONE
-//! mesh-global history file on the QNM-Shared replicated root
-//! (`<root>/clipboard/history.json`). Every peer runs this worker; the
-//! single shared file is the mesh-global clipboard (no per-user/per-node
-//! partition — the single-operator model, design lock O8).
+//! Consumes canonical text-clipboard events from the Mackes Bus
+//! (`event/clipboard/clip`) and appends them to ONE mesh-global history file on
+//! the QNM-Shared replicated root (`<root>/clipboard/history.json`). Every peer
+//! runs this worker; the single shared file is the mesh-global clipboard (no
+//! per-user/per-node partition — the single-operator model, design lock O8).
 //!
-//! Operator locks (design `docs/design/notify-hub-redesign.md`, survey
-//! round 1, 2026-06-18):
-//!   * O1 capture — the Cosmic clipboard-manager exposes the wlroots
-//!     data-control protocol, so `wl-paste --watch` IS the integration
-//!     hook on Cosmic; it is also the explicit fallback elsewhere. One
-//!     subprocess streams a fresh copy of the selection on every change.
+//! The canonical event body is `{ id, text, source, time }`. `id` is the stable
+//! content fingerprint, `source` is the producer node/lane, and `time` is an
+//! RFC3339 timestamp. The worker deliberately does not read the OS clipboard or
+//! shell out to compositor-specific tools; seat, browser, KDC/mobile, and VDI
+//! producers publish the shared lane and this worker folds that lane into
+//! durable history.
 //!
-//! **System-daemon session attach (CLIP-SYNC-2).** `mackesd` runs as a root
-//! system service with **no `$WAYLAND_DISPLAY`** — it is not in any user's
-//! graphical session. The capture (`wl-paste --watch`) needs one, so when the
-//! worker has no inherited display it discovers the active seat0 graphical
-//! session via logind (`workers::clipboard_sync::session`) and spawns the
-//! capture as that user with its `XDG_RUNTIME_DIR`/`WAYLAND_DISPLAY`. Without
-//! this the worker idled forever and the Notification-Center Clipboard Viewer
-//! showed "Clipboard history is empty." on every Workstation (found live on
-//! Eagle, 2026-06-24). A genuinely headless node has no graphical session, so
-//! discovery returns `None` and the worker idles quietly (no error spam).
+//! Operator locks (design `docs/design/notify-hub-redesign.md`, survey round 1,
+//! 2026-06-18):
 //!   * O2 echo-loop — **debounce identical content**: a copy whose text
 //!     equals the most-recent applied clip is dropped. This is what kills
-//!     the click-to-load echo (the viewer `wl-copy`s an entry back onto
-//!     this node, which `wl-paste --watch` re-emits — we drop it) without
-//!     origin-tagging the selection.
+//!     the click-to-load echo without origin-tagging the selection.
 //!   * O3 dedup — **move-to-top**: re-copying existing text bumps the one
 //!     entry to the front instead of duplicating.
 //!   * O4 no size cap — any text length syncs (the bus-retention worker
@@ -38,11 +27,11 @@
 //!   * O7 pins — pinned entries are **exempt from the 50-cap and
 //!     unlimited**; only unpinned entries are trimmed.
 //!
-//! The history mutations (`apply_clip`) are pure + fully unit-tested; the
-//! worker body is the I/O glue (spawn `wl-paste`, read/merge/write the
-//! shared file under the meshfs-mount guard, publish to the bus). The
-//! `action/clipboard/*` IPC responder (`ipc::clipboard`) edits the same
-//! file for the viewer's delete/pin/clear verbs.
+//! The history mutations (`apply_clip` / `apply_clip_event`) are pure + fully
+//! unit-tested; the worker body is the I/O glue (tail the Bus lane and
+//! read/merge/write the shared file under the shared-root guard). The
+//! `action/clipboard/*` IPC responder (`ipc::clipboard`) edits the same file for
+//! the viewer's delete/pin/clear verbs.
 //!
 //! **Concurrency.** Each writer (this worker, the IPC responder, every
 //! peer) does an unlocked read → mutate → atomic-`rename` write of the one
@@ -57,29 +46,13 @@
 #![cfg(feature = "async-services")]
 
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
 
+use mde_bus::persist::Persist;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
 use tracing::{debug, info, warn};
 
 pub mod session;
-
-/// The capture command: `wl-paste --watch` runs the given command on every
-/// selection change. We frame each selection with a trailing NUL
-/// (`cat; printf '\0'`) so a clip containing embedded newlines is read back
-/// as ONE record (`read_until(0)`), not split per line — the multi-line
-/// fidelity the history needs.
-const WATCH_ARGS: &[&str] = &["--watch", "sh", "-c", "cat; printf '\\0'"];
-
-/// The capture binary. `wl-paste` is wlroots/Cosmic's data-control client;
-/// it is the Cosmic clipboard-manager hook (O1) and the explicit fallback.
-const WL_PASTE: &str = "wl-paste";
-
-/// NUL byte — the per-selection frame delimiter (see [`WATCH_ARGS`]).
-const NUL: u8 = 0;
 
 use super::{ShutdownToken, Worker};
 
@@ -92,16 +65,8 @@ pub const HISTORY_CAP: usize = 50;
 /// the history file.
 pub const CLIP_TOPIC: &str = "event/clipboard/clip";
 
-/// How long to wait before re-spawning `wl-paste --watch` after it exits
-/// (compositor restart, display coming up late). Paced so a missing
-/// display doesn't busy-loop.
-const RESPAWN_COOLDOWN: Duration = Duration::from_secs(3);
-
-/// CLIP-SYNC-2 — how long the system daemon waits before re-probing for an
-/// active graphical session when none is found yet (headless node, or the
-/// desktop still coming up). Slower than [`RESPAWN_COOLDOWN`] so a genuinely
-/// headless Lighthouse/Server doesn't shell `loginctl` every few seconds.
-const NO_SESSION_POLL: Duration = Duration::from_secs(20);
+/// Bus-drain cadence for the canonical clipboard event lane.
+pub const CLIP_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(400);
 
 /// One clipboard entry in the mesh-global history. `id` is a stable
 /// content fingerprint so the viewer/IPC can address an entry (pin/delete)
@@ -119,6 +84,36 @@ pub struct ClipEntry {
     /// O7 — pinned entries survive the cap + a mesh-wide clear.
     #[serde(default)]
     pub pinned: bool,
+}
+
+/// Canonical `event/clipboard/clip` Bus body.
+///
+/// Keep this shape compatible with existing producers and consumers: exactly the
+/// public clipboard event fields `{ id, text, source, time }`. Durable history
+/// adds `pinned` locally, but event producers cannot set it through this body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipEventBody {
+    /// Stable id (content fingerprint) — addresses the entry for pin/delete.
+    pub id: String,
+    /// The clip text (verbatim; O4 — no size cap, no secret filtering).
+    pub text: String,
+    /// Producer node/lane that emitted the event.
+    pub source: String,
+    /// RFC3339 capture timestamp.
+    pub time: String,
+}
+
+impl ClipEventBody {
+    /// Build the canonical event body from local text/source/time inputs.
+    #[must_use]
+    pub fn from_text(text: &str, source: &str, time: &str) -> Self {
+        Self {
+            id: clip_id(text),
+            text: text.to_string(),
+            source: source.to_string(),
+            time: time.to_string(),
+        }
+    }
 }
 
 /// The mesh-global clipboard history (newest first). Serialized as the
@@ -150,46 +145,94 @@ pub fn clip_id(text: &str) -> String {
 /// Apply a freshly captured clip to the history (pure — the whole O2/O3/O7
 /// policy lives here, unit-tested without any I/O).
 ///
-/// Returns `true` when the history changed (the caller then persists +
-/// publishes); `false` when the clip was debounced away (O2) and nothing
-/// should be written or broadcast.
+/// Returns `true` when the history changed (the caller then persists);
+/// `false` when the clip was debounced away (O2) and nothing should be
+/// written.
 ///
 ///   * **O2 debounce** — if `text` equals the current top entry's text, it
 ///     is a no-op (drops the click-to-load echo + a redundant re-copy of
 ///     the same already-top clip).
 ///   * **O3 dedup move-to-top** — if `text` matches a *lower* existing
-///     entry, that entry is moved to the front (its pinned flag + original
-///     id preserved) rather than duplicated.
+///     entry, that entry is moved to the front (its pinned flag preserved)
+///     rather than duplicated.
 ///   * **new** — otherwise a fresh entry is pushed to the front.
 ///   * **O7 cap** — after insertion, unpinned entries beyond
 ///     [`HISTORY_CAP`] are trimmed (oldest first); pinned entries are
 ///     never counted nor trimmed.
 pub fn apply_clip(history: &mut History, text: &str, source: &str, now: &str) -> bool {
+    let clip = ClipEventBody::from_text(text, source, now);
+    apply_clip_event(history, &clip)
+}
+
+/// Apply a canonical `event/clipboard/clip` body to the history.
+///
+/// Preserves the event's `{ id, text, source, time }` fields and keeps `pinned`
+/// as durable history-only state: moving an existing entry preserves its pin,
+/// while a new event is always inserted unpinned.
+#[must_use]
+pub fn apply_clip_event(history: &mut History, clip: &ClipEventBody) -> bool {
+    if clip.text.trim().is_empty() {
+        return false;
+    }
     // O2 — identical to the current top → debounce (no change, no echo).
-    if history.entries.first().is_some_and(|e| e.text == text) {
+    if history.entries.first().is_some_and(|e| e.text == clip.text) {
         return false;
     }
     // O3 — same text lower in the list → move it to the top, keeping its
     // pin + id, refreshing source/time to the capture that re-surfaced it.
-    if let Some(pos) = history.entries.iter().position(|e| e.text == text) {
+    if let Some(pos) = history
+        .entries
+        .iter()
+        .position(|e| e.id == clip.id || e.text == clip.text)
+    {
         let mut existing = history.entries.remove(pos);
-        existing.source = source.to_string();
-        existing.time = now.to_string();
+        existing.id = clip.id.clone();
+        existing.text = clip.text.clone();
+        existing.source = clip.source.clone();
+        existing.time = clip.time.clone();
         history.entries.insert(0, existing);
     } else {
         history.entries.insert(
             0,
             ClipEntry {
-                id: clip_id(text),
-                text: text.to_string(),
-                source: source.to_string(),
-                time: now.to_string(),
+                id: clip.id.clone(),
+                text: clip.text.clone(),
+                source: clip.source.clone(),
+                time: clip.time.clone(),
                 pinned: false,
             },
         );
     }
     trim_unpinned(history, HISTORY_CAP);
     true
+}
+
+/// Parse the canonical `event/clipboard/clip` Bus body.
+///
+/// # Errors
+/// Human-readable validation error for malformed JSON, missing required fields,
+/// or a non-RFC3339 timestamp.
+pub fn parse_clip_event_body(body: &str) -> Result<ClipEventBody, String> {
+    let clip: ClipEventBody =
+        serde_json::from_str(body).map_err(|e| format!("malformed clipboard clip body: {e}"))?;
+    if clip.id.trim().is_empty() {
+        return Err("clipboard clip body missing `id`".to_string());
+    }
+    if clip.text.trim().is_empty() {
+        return Err("clipboard clip body missing non-blank `text`".to_string());
+    }
+    if clip.source.trim().is_empty() {
+        return Err("clipboard clip body missing `source`".to_string());
+    }
+    let expected_id = clip_id(&clip.text);
+    if clip.id != expected_id {
+        return Err(format!(
+            "clipboard clip body `id` must match content fingerprint {expected_id}"
+        ));
+    }
+    chrono::DateTime::parse_from_rfc3339(&clip.time)
+        .map_err(|e| format!("clipboard clip body `time` must be RFC3339: {e}"))?;
+    Ok(clip)
 }
 
 /// O7 — keep at most `cap` unpinned entries (oldest unpinned trimmed
@@ -295,141 +338,39 @@ pub fn clip_share_writable(workgroup_root: &Path) -> bool {
     clip_share_writable_core(workgroup_root, workgroup_root.is_dir())
 }
 
-/// This node's short hostname — the O6 source stamp.
-fn local_hostname() -> String {
-    std::fs::read_to_string("/proc/sys/kernel/hostname")
-        .map(|s| s.trim().split('.').next().unwrap_or("").to_string())
-        .unwrap_or_default()
-}
-
-/// Broadcast one clip on the bus (best-effort, fire-and-forget shell-out —
-/// same `mde-bus publish` bridge shape). The durable
-/// record is the history file; the bus event is the real-time nudge.
-fn publish_clip(entry: &ClipEntry) {
-    let body = serde_json::json!({
-        "id": entry.id,
-        "text": entry.text,
-        "source": entry.source,
-        "time": entry.time,
-    })
-    .to_string();
-    publish_clip_to(crate::bus_publish::default_bus_root().as_deref(), &body);
-}
-
-/// Root-injectable in-process write for [`publish_clip`] (perf-10 / arch-6) — no
-/// fork+exec of the `mde-bus` CLI per clip. The old shell-out passed
-/// `--no-broker` (persist-only, so a clip is recorded + audited without the
-/// broker up), which is EXACTLY what the in-process
-/// [`crate::bus_publish::publish_body`] does — a bare `Persist::write`, no broker
-/// POST — so this is byte-identical AND broker-semantics-identical. Targets
-/// [`crate::bus_publish::default_bus_root`] (honours `MDE_BUS_ROOT`).
-/// Best-effort; tests pass a temp root.
-fn publish_clip_to(bus_root: Option<&std::path::Path>, body: &str) {
-    if let Some(mut persist) =
-        crate::bus_publish::open_bus(bus_root.map(std::path::Path::to_path_buf))
-    {
-        crate::bus_publish::publish_body(&mut persist, CLIP_TOPIC, body);
-    }
-}
-
-/// The clipboard-sync worker. Holds the replicated root + this node's
-/// source stamp; the run loop spawns `wl-paste --watch` and folds every
-/// emitted clip through [`apply_clip`].
+/// The clipboard-sync worker. Holds the replicated root and folds canonical
+/// `event/clipboard/clip` Bus bodies through [`apply_clip_event`].
 pub struct ClipboardSyncWorker {
     workgroup_root: PathBuf,
-    source: String,
-    /// CLIP-SYNC-2 — the discovered graphical session, cached across respawns.
-    /// `loginctl` discovery is only re-run when this is `None` or its socket
-    /// has vanished, so a flapping `wl-paste` doesn't fork `loginctl` on every
-    /// 3 s respawn tick. `None` on the dev-box path (inherited `$WAYLAND_DISPLAY`).
-    session: Option<session::GraphicalSession>,
-    /// CLIP-SYNC-2 — was discovery in a steady "headless / no desktop" miss on
-    /// the previous probe? Used to log that verdict only on the EDGE into it,
-    /// so a genuinely headless node (which re-probes every 20 s forever) logs it
-    /// once rather than every poll. `false` after a successful discovery.
-    headless_logged: bool,
+    /// Bus root override (tests). `None` ⇒ [`crate::bus_publish::default_bus_root`].
+    bus_root_override: Option<PathBuf>,
+    /// Bus drain cadence.
+    poll: Duration,
 }
 
 impl ClipboardSyncWorker {
-    /// Build the worker rooted at the replicated workgroup root, stamping
-    /// captures with this node's hostname.
+    /// Build the worker rooted at the replicated workgroup root.
     #[must_use]
     pub fn new(workgroup_root: PathBuf) -> Self {
         Self {
             workgroup_root,
-            source: local_hostname(),
-            session: None,
-            headless_logged: false,
+            bus_root_override: None,
+            poll: CLIP_EVENT_POLL_INTERVAL,
         }
     }
 
-    /// Test seam — pin the source node label explicitly.
+    /// Override the Bus root (tests).
+    #[cfg(test)]
     #[must_use]
-    pub fn with_source(mut self, source: String) -> Self {
-        self.source = source;
+    fn with_bus_root(mut self, root: PathBuf) -> Self {
+        self.bus_root_override = Some(root);
         self
     }
 
-    /// CLIP-SYNC-2 — resolve the graphical session to spawn the capture into,
-    /// reusing the cached one when its Wayland socket still exists and only
-    /// re-running the (blocking) `loginctl` discovery when there is no live
-    /// cached session. This keeps a flapping `wl-paste` from forking `loginctl`
-    /// on every respawn tick. The blocking discovery runs on a `spawn_blocking`
-    /// thread so it never parks a tokio worker.
-    ///
-    /// Logs the discovery outcome so the worker is never silent about why it
-    /// isn't capturing (the CLIP bug): a successful pick at INFO (uid + display);
-    /// a steady headless miss ONCE on the edge into it (a headless node re-probes
-    /// every 20 s — we don't re-log each poll); an anomalous miss (socket not up
-    /// / uid absent) at WARN every recurrence.
-    ///
-    /// Returns a reference to the live session, or `None` when none is available
-    /// (headless node / desktop not up yet).
-    async fn resolve_session(&mut self) -> Option<&session::GraphicalSession> {
-        let cached_live = self
-            .session
-            .as_ref()
-            .is_some_and(|s| s.runtime_dir.join(&s.wayland_display).exists());
-        if !cached_live {
-            // Cache empty or its socket vanished (compositor restart / logout) —
-            // re-discover off the tokio worker threads.
-            match tokio::task::spawn_blocking(session::discover).await {
-                Ok(Ok(found)) => {
-                    info!(
-                        target: "clipboard_sync", source = %self.source,
-                        uid = found.uid, display = %found.wayland_display,
-                        runtime_dir = %found.runtime_dir.display(),
-                        "discovered active graphical session to drive wl-paste into"
-                    );
-                    self.headless_logged = false;
-                    self.session = Some(found);
-                }
-                Ok(Err(miss)) => {
-                    self.session = None;
-                    match miss.kind {
-                        // Steady headless/pre-desktop state — log once on the
-                        // edge in, then stay quiet across the 20 s re-probes.
-                        session::MissKind::Steady => {
-                            if !self.headless_logged {
-                                info!(target: "clipboard_sync", "{}", miss.reason);
-                                self.headless_logged = true;
-                            }
-                        }
-                        // A session resolved but isn't drivable yet — unexpected,
-                        // so surface it every recurrence (and re-arm the steady
-                        // edge so a later drop back to headless re-logs).
-                        session::MissKind::Anomalous => {
-                            warn!(target: "clipboard_sync", "{}", miss.reason);
-                            self.headless_logged = false;
-                        }
-                    }
-                }
-                // spawn_blocking itself failed (panic/cancel) — keep the prior
-                // cache decision; surface it so it isn't silent.
-                Err(e) => warn!(target: "clipboard_sync", "session discovery task failed: {e}"),
-            }
-        }
-        self.session.as_ref()
+    fn bus_root(&self) -> Option<PathBuf> {
+        self.bus_root_override
+            .clone()
+            .or_else(crate::bus_publish::default_bus_root)
     }
 
     /// Whether it is safe to write `clipboard/history.json` under the shared
@@ -451,37 +392,58 @@ impl ClipboardSyncWorker {
         clip_share_writable(&self.workgroup_root)
     }
 
-    /// Fold one captured clip into the shared history + broadcast it. Skips
-    /// blank captures and debounced echoes (O2); persists + publishes only
-    /// on a real change. Best-effort + logged so a transient write/probe
-    /// failure never kills the capture stream.
-    fn handle_clip(&self, text: &str) {
-        // Skip empty / whitespace-only selections (a cleared clipboard, or
-        // the blank middle of a framing artifact) — they'd otherwise consume
-        // a 50-cap slot and broadcast noise. The stored text stays VERBATIM
-        // (we only trim for the keep/skip decision, not the content).
-        if text.trim().is_empty() {
-            return;
-        }
+    /// Fold one canonical Bus clip into the shared history.
+    fn handle_clip_event(&self, clip: &ClipEventBody) -> Result<bool, String> {
         if !self.share_writable() {
-            debug!(target: "clipboard_sync", "shared root not writable; dropping clip");
-            return;
+            return Ok(false);
         }
         let path = history_path(&self.workgroup_root);
         let mut history = read_history(&path);
-        if !apply_clip(&mut history, text, &self.source, &now_rfc3339()) {
-            // O2 — debounced echo; nothing changed.
-            return;
+        if !apply_clip_event(&mut history, clip) {
+            return Ok(false);
         }
-        if let Err(e) = write_history(&path, &history) {
-            warn!(target: "clipboard_sync", "history write failed: {e}");
-            return;
+        write_history(&path, &history)?;
+        Ok(true)
+    }
+
+    /// Drain new canonical `event/clipboard/clip` messages since `cursor`.
+    fn drain_clip_events(&self, persist: &mut Persist, cursor: &mut Option<String>) -> usize {
+        persist.reopen_if_index_changed();
+        let msgs = match persist.list_since(CLIP_TOPIC, cursor.as_deref()) {
+            Ok(msgs) => msgs,
+            Err(e) => {
+                debug!(target: "clipboard_sync", error = %e, "clipboard event drain failed");
+                return 0;
+            }
+        };
+        let mut applied = 0;
+        for msg in msgs {
+            *cursor = Some(msg.ulid.clone());
+            let body = msg.body.as_deref().unwrap_or("");
+            let clip = match parse_clip_event_body(body) {
+                Ok(clip) => clip,
+                Err(e) => {
+                    warn!(target: "clipboard_sync", ulid = %msg.ulid, error = %e, "bad clipboard event body");
+                    continue;
+                }
+            };
+            match self.handle_clip_event(&clip) {
+                Ok(true) => {
+                    applied += 1;
+                    debug!(
+                        target: "clipboard_sync",
+                        source = %clip.source,
+                        "folded clipboard event ({} bytes)",
+                        clip.text.len()
+                    );
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    warn!(target: "clipboard_sync", ulid = %msg.ulid, "history write failed: {e}");
+                }
+            }
         }
-        // The just-applied clip is the front entry — broadcast it.
-        if let Some(top) = history.entries.first() {
-            publish_clip(top);
-            debug!(target: "clipboard_sync", source = %self.source, "synced clip ({} bytes)", text.len());
-        }
+        applied
     }
 }
 
@@ -492,137 +454,29 @@ impl Worker for ClipboardSyncWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        // `wl-paste --watch <cmd>` runs <cmd> once per selection change. We
-        // frame each selection with a trailing NUL (WATCH_ARGS) and read it
-        // back with `read_until(NUL)`, so a multi-line clip arrives as ONE
-        // record rather than being split per line (the fidelity bug a naive
-        // `--watch cat` + line reader would have).
+        let Some(bus_root) = self.bus_root() else {
+            debug!("clipboard_sync: no bus root; worker idle");
+            return Ok(());
+        };
+        let mut persist = match Persist::open(bus_root) {
+            Ok(persist) => persist,
+            Err(e) => {
+                warn!(target: "clipboard_sync", error = %e, "bus open failed; worker idle");
+                return Ok(());
+            }
+        };
+        // Existing retained clipboard events may predate this daemon instance and
+        // could resurrect a user-deleted/cleared history row. Start at the tail and
+        // consume newly published lane events from here.
+        let mut cursor = persist.latest_ulid(CLIP_TOPIC).ok().flatten();
+        info!(target: "clipboard_sync", "watching canonical clipboard bus lane");
+        let mut tick = tokio::time::interval(self.poll);
+        tick.tick().await;
         loop {
-            // CLIP-SYNC-2 — resolve the Wayland session to attach to. With an
-            // inherited `$WAYLAND_DISPLAY` (a dev box / a per-session launch) we
-            // spawn against the inherited env and skip discovery. As the system
-            // daemon (`mackesd.service`, root, no graphical session)
-            // `$WAYLAND_DISPLAY` is unset, so we DISCOVER the active seat0
-            // graphical session via logind and spawn the capture as that user
-            // with its env — otherwise the worker idled forever and the Hub's
-            // clipboard stayed empty (found live on Eagle 2026-06-24). The
-            // session is cloned out so the `&mut self` discovery borrow is
-            // released before we read `self.source`; `resolve_session` already
-            // logged the outcome (success / headless / anomalous).
-            let attach: Option<session::GraphicalSession> =
-                if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-                    None
-                } else {
-                    let Some(s) = self.resolve_session().await.cloned() else {
-                        // Genuinely headless (Lighthouse/Server, or a Workstation
-                        // before the desktop is up) — idle. `resolve_session`
-                        // logged the reason (edge-triggered, no per-poll spam).
-                        tokio::select! {
-                            () = tokio::time::sleep(NO_SESSION_POLL) => continue,
-                            () = shutdown.wait() => return Ok(()),
-                        }
-                    };
-                    Some(s)
-                };
-
-            let mut cmd = Command::new(WL_PASTE);
-            cmd.args(WATCH_ARGS)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .kill_on_drop(true);
-            if let Some(s) = &attach {
-                // Spawn as the desktop user with a COMPLETE credential drop +
-                // its session env. `uid`/`gid` (tokio's `Command` exposes both
-                // inherently) drop from root to the operator — uid alone would
-                // leave the child in root's group, so we set the gid too. HOME +
-                // XDG_RUNTIME_DIR + WAYLAND_DISPLAY point `wl-paste`'s socket and
-                // config lookups at the operator's session, not root's `/root`
-                // (XDG_CONFIG_HOME is cleared so it derives from the new HOME).
-                cmd.uid(s.uid)
-                    .gid(s.gid)
-                    .env("HOME", &s.home)
-                    .env("XDG_RUNTIME_DIR", &s.runtime_dir)
-                    .env("WAYLAND_DISPLAY", &s.wayland_display)
-                    .env_remove("XDG_CONFIG_HOME");
-            }
-            let mut child = match cmd.spawn() {
-                Ok(c) => c,
-                Err(e) => {
-                    debug!(target: "clipboard_sync", "{WL_PASTE} unavailable: {e}; retrying");
-                    tokio::select! {
-                        () = tokio::time::sleep(RESPAWN_COOLDOWN) => continue,
-                        () = shutdown.wait() => return Ok(()),
-                    }
-                }
-            };
-            if let Some(s) = &attach {
-                info!(
-                    target: "clipboard_sync", source = %self.source, uid = s.uid,
-                    display = %s.wayland_display,
-                    "watching clipboard via {WL_PASTE} --watch (discovered graphical session)"
-                );
-            } else {
-                info!(
-                    target: "clipboard_sync", source = %self.source,
-                    "watching clipboard via {WL_PASTE} --watch"
-                );
-            }
-            // stdout is configured `Stdio::piped()` above, so `take()` is
-            // Some on the first read; tolerate None defensively (respawn)
-            // rather than panic the worker.
-            let Some(stdout) = child.stdout.take() else {
-                warn!(target: "clipboard_sync", "no piped stdout; respawning");
-                let _ = child.kill().await;
-                continue;
-            };
-            let mut reader = BufReader::new(stdout);
-            let mut buf: Vec<u8> = Vec::new();
-            loop {
-                buf.clear();
-                tokio::select! {
-                    read = reader.read_until(NUL, &mut buf) => {
-                        match read {
-                            Ok(0) => break, // EOF — child closed stdout → respawn
-                            Ok(_) => {
-                                // Drop the trailing NUL frame byte, then decode.
-                                if buf.last() == Some(&NUL) {
-                                    buf.pop();
-                                }
-                                match std::str::from_utf8(&buf) {
-                                    Ok(text) => self.handle_clip(text),
-                                    // Non-UTF-8 selection (an image / binary
-                                    // target) — clipboard sync is text-only, skip.
-                                    Err(_) => debug!(target: "clipboard_sync", "non-utf8 selection; skipped"),
-                                }
-                            }
-                            Err(e) => {
-                                warn!(target: "clipboard_sync", "read error: {e}");
-                                break;
-                            }
-                        }
-                    }
-                    () = shutdown.wait() => {
-                        let _ = child.kill().await;
-                        return Ok(());
-                    }
-                }
-            }
-            // Child exited / stdout closed — reap, log the exit (so a flapping
-            // capture is never silent — the CLIP bug was a worker that captured
-            // nothing without a trace), + pace the respawn.
-            match child.wait().await {
-                Ok(status) => info!(
-                    target: "clipboard_sync",
-                    source = %self.source,
-                    "{WL_PASTE} --watch exited ({status}); respawning after cooldown"
-                ),
-                Err(e) => warn!(
-                    target: "clipboard_sync",
-                    "reaping {WL_PASTE} --watch failed: {e}; respawning after cooldown"
-                ),
-            }
             tokio::select! {
-                () = tokio::time::sleep(RESPAWN_COOLDOWN) => {}
+                _ = tick.tick() => {
+                    self.drain_clip_events(&mut persist, &mut cursor);
+                }
                 () = shutdown.wait() => return Ok(()),
             }
         }
@@ -638,6 +492,7 @@ pub fn build(workgroup_root: PathBuf) -> ClipboardSyncWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mde_bus::hooks::config::Priority;
 
     fn entry(text: &str, pinned: bool) -> ClipEntry {
         ClipEntry {
@@ -651,7 +506,7 @@ mod tests {
 
     #[test]
     fn worker_name_is_stable() {
-        let w = ClipboardSyncWorker::new(PathBuf::from("/tmp")).with_source("box".into());
+        let w = ClipboardSyncWorker::new(PathBuf::from("/tmp"));
         assert_eq!(w.name(), "clipboard_sync");
     }
 
@@ -783,6 +638,55 @@ mod tests {
     }
 
     #[test]
+    fn canonical_clip_event_body_shape_is_locked() {
+        let body = ClipEventBody::from_text("from bus", "seat/node-a", "2026-07-26T10:30:00Z");
+        let encoded = serde_json::to_value(&body).unwrap();
+        let obj = encoded.as_object().unwrap();
+        let keys: std::collections::BTreeSet<&str> = obj.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            ["id", "source", "text", "time"]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "event/clipboard/clip stays compatible with {{ id, text, source, time }}"
+        );
+        assert_eq!(body.id, clip_id("from bus"));
+        assert_eq!(parse_clip_event_body(&encoded.to_string()).unwrap(), body);
+    }
+
+    #[test]
+    fn canonical_event_body_does_not_grant_pin_state() {
+        let id = clip_id("pinned?");
+        let parsed = parse_clip_event_body(
+            &format!(
+                r#"{{"id":"{id}","text":"pinned?","source":"remote","time":"2026-07-26T10:30:00Z","pinned":true}}"#
+            ),
+        )
+        .unwrap();
+        let mut h = History::default();
+        assert!(apply_clip_event(&mut h, &parsed));
+        assert_eq!(h.entries[0].id, id);
+        assert!(!h.entries[0].pinned, "pin state is history-only");
+    }
+
+    #[test]
+    fn malformed_clip_event_bodies_are_rejected() {
+        for body in [
+            "not json",
+            r#"{"id":"","text":"x","source":"n","time":"2026-07-26T10:30:00Z"}"#,
+            r#"{"id":"i","text":"   ","source":"n","time":"2026-07-26T10:30:00Z"}"#,
+            r#"{"id":"i","text":"x","source":"","time":"2026-07-26T10:30:00Z"}"#,
+            r#"{"id":"wrong","text":"x","source":"n","time":"2026-07-26T10:30:00Z"}"#,
+            r#"{"id":"i","text":"x","source":"n","time":"today"}"#,
+        ] {
+            assert!(
+                parse_clip_event_body(body).is_err(),
+                "body should be rejected: {body}"
+            );
+        }
+    }
+
+    #[test]
     fn read_history_tolerates_missing_and_corrupt() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("clipboard/history.json");
@@ -829,16 +733,31 @@ mod tests {
     }
 
     #[test]
-    fn handle_clip_writes_and_dedups_end_to_end() {
-        // Drive the worker's fold path against a tempdir root (writable → the
-        // share guard passes for a non-canonical path).
-        let dir = tempfile::tempdir().unwrap();
-        let w = ClipboardSyncWorker::new(dir.path().to_path_buf()).with_source("nodeA".into());
-        w.handle_clip("first");
-        w.handle_clip("second");
-        w.handle_clip("first"); // re-copy → move-to-top, no dup
-        w.handle_clip(""); // blank → ignored
-        let h = read_history(&history_path(dir.path()));
+    fn bus_clip_events_write_and_dedup_history_end_to_end() {
+        let history_dir = tempfile::tempdir().unwrap();
+        let bus_dir = tempfile::tempdir().unwrap();
+        let mut persist = Persist::open(bus_dir.path().to_path_buf()).unwrap();
+        let bodies = [
+            ClipEventBody::from_text("first", "nodeA", "2026-07-26T10:00:00Z"),
+            ClipEventBody::from_text("second", "nodeB", "2026-07-26T10:01:00Z"),
+            ClipEventBody::from_text("first", "nodeA", "2026-07-26T10:02:00Z"),
+        ];
+        for body in &bodies {
+            persist
+                .write(
+                    CLIP_TOPIC,
+                    Priority::Default,
+                    None,
+                    Some(&serde_json::to_string(body).unwrap()),
+                )
+                .unwrap();
+        }
+
+        let w = ClipboardSyncWorker::new(history_dir.path().to_path_buf())
+            .with_bus_root(bus_dir.path().to_path_buf());
+        let mut cursor = None;
+        assert_eq!(w.drain_clip_events(&mut persist, &mut cursor), 3);
+        let h = read_history(&history_path(history_dir.path()));
         assert_eq!(
             h.entries
                 .iter()
@@ -847,18 +766,15 @@ mod tests {
             vec!["first", "second"]
         );
         assert_eq!(h.entries[0].source, "nodeA");
+        assert_eq!(h.entries[0].time, "2026-07-26T10:02:00Z");
     }
 
     #[test]
     fn multi_line_clip_is_one_verbatim_entry() {
-        // The NUL-framed capture path delivers a multi-line selection as ONE
-        // string; it must store as ONE entry with the newlines intact (not
-        // split per line). This guards the framing contract at the fold layer.
-        let dir = tempfile::tempdir().unwrap();
-        let w = ClipboardSyncWorker::new(dir.path().to_path_buf()).with_source("n".into());
+        let mut h = History::default();
         let snippet = "line one\nline two\nline three";
-        w.handle_clip(snippet);
-        let h = read_history(&history_path(dir.path()));
+        let body = ClipEventBody::from_text(snippet, "n", "2026-07-26T10:30:00Z");
+        assert!(apply_clip_event(&mut h, &body));
         assert_eq!(h.entries.len(), 1);
         assert_eq!(h.entries[0].text, snippet, "newlines preserved, one entry");
     }
@@ -896,11 +812,14 @@ mod tests {
 
     #[test]
     fn whitespace_only_clip_is_skipped() {
-        let dir = tempfile::tempdir().unwrap();
-        let w = ClipboardSyncWorker::new(dir.path().to_path_buf());
-        w.handle_clip("   ");
-        w.handle_clip("\n\t\n");
-        let h = read_history(&history_path(dir.path()));
+        let mut h = History::default();
+        let body = ClipEventBody {
+            id: "blank".into(),
+            text: "   ".into(),
+            source: "n".into(),
+            time: "2026-07-26T10:30:00Z".into(),
+        };
+        assert!(!apply_clip_event(&mut h, &body));
         assert!(h.entries.is_empty(), "blank/whitespace selections skipped");
     }
 }

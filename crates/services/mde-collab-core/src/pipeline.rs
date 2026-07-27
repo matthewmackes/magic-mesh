@@ -541,7 +541,7 @@ pub fn apply_command<S: EventSigner, I: IdSource>(
         }
 
         // ---- Clipboard -------------------------------------------------
-        CollabCommand::PublishClipboard { space, item } => {
+        CollabCommand::PublishClipboard { space, item, .. } => {
             require_active_space(state, *space)?;
             require_member(state, *space, &ctx.actor)?;
             Ok(vec![ctx.emit(
@@ -1795,6 +1795,7 @@ mod tests {
                 &state,
                 &CollabCommand::PublishClipboard {
                     space,
+                    text: format!("clip-{index}"),
                     item: ClipboardItem {
                         kind: ClipItemKind::Text,
                         preview: format!("clip-{index}"),

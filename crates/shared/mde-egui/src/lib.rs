@@ -32,6 +32,7 @@
 pub mod a11y;
 pub mod capture;
 pub mod carbon;
+pub mod clipboard;
 pub mod code;
 pub mod display;
 pub mod focus;
@@ -60,6 +61,7 @@ pub use carbon::{
     carbon_icon, carbon_names, carbon_raster, carbon_svg_bytes, carbon_texture, paint_carbon,
     CarbonRaster,
 };
+pub use clipboard::{MemoryTextClipboard, TextClipboard};
 pub use code::CodeToken;
 pub use display::{
     build_mode_list, fractional_scale, panel_dpi, parse_edid, scale_for_panel, select_mode,
@@ -112,7 +114,7 @@ pub use widgets::{
 #[cfg(feature = "drm")]
 pub use drm::{
     probe_primary_video_plane, probe_prime_import_liveness, probe_video_plane, run_drm,
-    DrmVideoScanout, PrimeImportLiveness,
+    run_drm_with_clipboard, DrmVideoScanout, PrimeImportLiveness,
 };
 
 // Re-export the toolkit so surfaces depend on `mde-egui` alone and share one

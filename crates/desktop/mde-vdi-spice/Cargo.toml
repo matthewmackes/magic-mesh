@@ -25,6 +25,10 @@ mde-egui = { path = "../../shared/mde-egui" }
 # + scancode wire packing on top.
 mde-vdi-core = { path = "../mde-vdi-core" }
 
+# Shared VDI status contracts. SPICE exposes WL-FUNC-016's explicit unsupported
+# clipboard report here until a real vdagent clipboard path is wired.
+mackes-mesh-types = { path = "../../mesh/mackes-mesh-types" }
+
 # Structured logs in the workspace JSON-line format.
 tracing = "0.1"
 

@@ -229,7 +229,11 @@ impl CommunicationsSurface {
             len: text.len() as u64,
             source: source.to_owned(),
         };
-        sink.emit(CollabCommand::PublishClipboard { space, item });
+        sink.emit(CollabCommand::PublishClipboard {
+            space,
+            text: text.to_owned(),
+            item,
+        });
     }
 
     /// Emit [`AttachClipboard`](CollabCommand::AttachClipboard) — re-share `clip`

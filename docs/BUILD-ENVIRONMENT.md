@@ -286,7 +286,7 @@ user). Secrets are **off-repo** — see "Credentials" below.
 
 | Host | IP | OS | Cores / RAM | Role |
 |---|---|---|---|---|
-| `rocky9-kvm2` (dev) | `172.20.145.192` | Rocky 9.8 | — | Orchestration + **local builds** + podman; runs XO + tofu/ansible/packer; this is where Claude Code + `/root/magic-mesh` live |
+| `rocky9-kvm2` (dev) | `172.20.145.192` | Rocky 9.8 | — | Orchestration only; farm dispatch via `xcp-build.sh`; builds and Podman workloads run on farm VMs; this is where Claude Code + `/root/magic-mesh` live |
 | `XEN-HOME-SERVICES` | `172.20.0.9` | XCP-ng 8.3 dom0 | 4c / 24 GiB | hypervisor — build VM `mcnf-build-home-services` (172.20.0.50, 4 vCPU/12 GiB); local SR is `ext` ("Local storage") |
 | `KVM-XCP1` | `172.20.145.193` | XCP-ng 8.3 dom0 | 4c / 23 GiB | hypervisor — build VM `mcnf-build-kvm-xcp1` (172.20.0.90, 4 vCPU/12 GiB) |
 | `XEN-BIGBOY` | `172.20.145.165` | XCP-ng 8.3 dom0 | **12c / 32 GiB** | hypervisor — build VM `mcnf-build-52` (172.20.0.130, **12 vCPU/20 GiB**); 398 GiB SR; the high-capacity node (room for several more build VMs) |

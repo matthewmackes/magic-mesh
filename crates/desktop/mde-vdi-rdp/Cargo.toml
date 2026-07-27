@@ -25,6 +25,10 @@ mde-egui = { path = "../../shared/mde-egui" }
 # across mde-vdi-{rdp,vnc,spice} (arch-8).
 mde-vdi-core = { path = "../mde-vdi-core" }
 
+# Shared VDI status contracts. RDP exposes WL-FUNC-016's explicit unsupported
+# clipboard report here until a real CLIPRDR channel is wired.
+mackes-mesh-types = { path = "../../mesh/mackes-mesh-types" }
+
 # Structured logs in the workspace JSON-line format.
 tracing = "0.1"
 

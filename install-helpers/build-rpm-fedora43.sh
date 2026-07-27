@@ -32,6 +32,13 @@
 #        install-helpers/build-rpm-fedora43.sh --lighthouse # thin DO RPM, F43
 set -euo pipefail
 
+# The container RPM lane is farm-only. Keep direct invocations convenient, but
+# dispatch them through xcp-build so Podman and its storage never run locally.
+if [ "${MCNF_FARM_REMOTE:-0}" != 1 ]; then
+  SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+  exec "$SCRIPT_DIR/xcp-build.sh" container-rpm "$@"
+fi
+
 # XPA-6/DO-LIGHTHOUSE-THIN — parse the optional mode flag (position-independent) so the
 # remaining positional arg stays the Fedora version (back-compat with the
 # original `[fedora_version]` calling convention).

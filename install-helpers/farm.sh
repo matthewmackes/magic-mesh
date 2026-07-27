@@ -15,7 +15,7 @@
 #
 # Fleet (override via env or ~/.config/mcnf-farm.conf — `dom0_ip|label|buildvm_ip`):
 # Canonical dom0/build-VM roster (4 dom0s / 9 heavy slots): install-helpers/farm-topology.sh.
-#   172.20.145.192  the dev/orchestration host (this box; local builds + podman)
+#   172.20.145.192  the dev/orchestration host (this box; orchestration only)
 #   172.20.0.9      XEN-HOME-SERVICES  → build VM 172.20.0.50
 #   172.20.145.193  KVM-XCP1           → build VM 172.20.0.90
 #   172.20.145.165  XEN-BIGBOY         → build VM 172.20.0.130
@@ -75,7 +75,7 @@ cmd_status() {
     if reachable "$vmip" 22; then vm="up"; toolchained "$vmip" && tc="ready" || tc="bare"; fi
     printf '  %-16s %-20s %-8s %-16s %-7s %s\n' "$ip" "$label" "$d0" "$vmip" "$vm" "$tc"
   done < <(fleet)
-  echo "  dev host (local): $(command -v cargo >/dev/null && echo 'cargo ok' || echo 'no cargo'); podman $(command -v podman >/dev/null && echo present || echo absent)"
+  echo "  dev host (local): orchestration only; build/container runtime intentionally farm-only"
 }
 
 cmd_key()       { XCP_PW="${XCP_PASS:-}" "$HERE/xcp-authorize-farm-key.sh" --host "$1" --key "$KEY.pub"; }

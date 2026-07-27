@@ -58,6 +58,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mackes_mesh_types::cloud::CloudArmedToken;
+use mackes_mesh_types::vdi_clipboard::VdiClipboardStatus;
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 
@@ -121,6 +122,9 @@ pub enum ConsoleStatus {
         host: String,
         /// The overlay port the relay listens on.
         port: u16,
+        /// Text clipboard capability for this non-VNC protocol, when known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        clipboard: Option<VdiClipboardStatus>,
     },
     /// No reachable endpoint could be brokered — the honest reason (VM off, no
     /// graphics, no `socat`, overlay down, …). The shell greys the lane; it NEVER
@@ -129,6 +133,16 @@ pub enum ConsoleStatus {
         /// Human-readable reason surfaced on the greyed card.
         reason: String,
     },
+}
+
+/// Current text clipboard status for non-VNC desktop protocols.
+#[must_use]
+fn clipboard_status_for_protocol(protocol: DesktopProtocol) -> Option<VdiClipboardStatus> {
+    match protocol {
+        DesktopProtocol::Rdp => Some(VdiClipboardStatus::rdp_unsupported()),
+        DesktopProtocol::Spice => Some(VdiClipboardStatus::spice_unsupported()),
+        DesktopProtocol::Vnc => None,
+    }
 }
 
 /// One brokered-console record — published to [`CONSOLE_TOPIC`], resolved by the
@@ -494,6 +508,7 @@ pub fn broker_console(
                 protocol: console.protocol,
                 host: console.host.clone(),
                 port: console.port,
+                clipboard: clipboard_status_for_protocol(console.protocol),
             },
             Some(RelayHandle::detached()),
         );
@@ -514,6 +529,7 @@ pub fn broker_console(
                 protocol: console.protocol,
                 host: overlay,
                 port: overlay_port,
+                clipboard: clipboard_status_for_protocol(console.protocol),
             },
             Some(handle),
         ),
@@ -1037,10 +1053,12 @@ mod tests {
                 protocol,
                 host,
                 port,
+                clipboard,
             } => {
                 assert_eq!(protocol, DesktopProtocol::Spice);
                 assert_eq!(host, "10.42.0.7", "the overlay addr, not loopback");
                 assert_eq!(port, 5900);
+                assert_eq!(clipboard, Some(VdiClipboardStatus::spice_unsupported()));
             }
             other => panic!("expected Brokered, got {other:?}"),
         }
@@ -1070,6 +1088,19 @@ mod tests {
             relay.started.lock().unwrap().is_empty(),
             "no relay started for an already-reachable console"
         );
+    }
+
+    #[test]
+    fn rdp_spice_console_records_report_clipboard_unsupported_and_vnc_omits_it() {
+        assert_eq!(
+            clipboard_status_for_protocol(DesktopProtocol::Rdp),
+            Some(VdiClipboardStatus::rdp_unsupported())
+        );
+        assert_eq!(
+            clipboard_status_for_protocol(DesktopProtocol::Spice),
+            Some(VdiClipboardStatus::spice_unsupported())
+        );
+        assert_eq!(clipboard_status_for_protocol(DesktopProtocol::Vnc), None);
     }
 
     #[test]
@@ -1329,12 +1360,15 @@ mod tests {
                 protocol: DesktopProtocol::Spice,
                 host: "10.42.0.7".into(),
                 port: 5900,
+                clipboard: Some(VdiClipboardStatus::spice_unsupported()),
             },
         };
         let body = serde_json::to_string(&rec).expect("serialize");
         assert!(body.contains(r#""session_id":"vdi-1-win11""#));
         assert!(body.contains(r#""state":"brokered""#));
         assert!(body.contains(r#""host":"10.42.0.7""#));
+        assert!(body.contains(r#""clipboard":{"host_to_guest":{"state":"unsupported""#));
+        assert!(body.contains("vdagent"));
         let back: BrokeredConsole = serde_json::from_str(&body).expect("round-trip");
         assert_eq!(back, rec);
     }

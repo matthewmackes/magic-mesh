@@ -4,8 +4,10 @@
 //! `ProtocolVersion`, security negotiation, `ClientInit`, and `ServerInit`.
 //! [`VncConnection::pump_once`] then requests one framebuffer update, decodes the
 //! server's rectangles through [`VncSession`], and lets the shell upload the
-//! resulting `ColorImage`. Input is flushed from the same session queue the
-//! unit-tested egui input mapper fills.
+//! resulting `ColorImage`; it also routes `ServerCutText` into the session's
+//! bounded guest clipboard queue. Input and host→guest `ClientCutText` are
+//! flushed from the same session queue the unit-tested egui/clipboard mapper
+//! fills.
 //!
 //! The transport supports the encodings this crate decodes (`Raw`, `CopyRect`,
 //! `RRE`, `Hextile`). Two RFB security types are negotiated: type `None` (1) —
@@ -24,7 +26,10 @@ use std::time::{Duration, Instant};
 use crate::config::{ConfigError, VncConfig};
 use crate::encoding::{parse_pixel_format, parse_rectangle_header, DecodeError, Encoding, Reader};
 use crate::session::VncSession;
-use crate::wire::{RfbClientMessage, RfbControlMessage};
+use crate::wire::{
+    decode_server_cut_text_body, RfbClientMessage, RfbControlMessage, RfbCutTextError,
+    RFB_CUT_TEXT_MAX_BYTES,
+};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_PUMP_TIMEOUT: Duration = Duration::from_millis(50);
@@ -66,6 +71,8 @@ pub enum ConnectError {
     Security(String),
     /// A framebuffer rectangle could not be decoded.
     Decode(DecodeError),
+    /// A VNC guest clipboard payload could not be encoded or decoded safely.
+    Clipboard(RfbCutTextError),
 }
 
 impl fmt::Display for ConnectError {
@@ -87,6 +94,7 @@ impl fmt::Display for ConnectError {
             ),
             Self::Security(reason) => write!(f, "RFB security failed: {reason}"),
             Self::Decode(e) => write!(f, "RFB framebuffer decode failed: {e}"),
+            Self::Clipboard(e) => write!(f, "RFB clipboard failed: {e}"),
         }
     }
 }
@@ -97,6 +105,7 @@ impl std::error::Error for ConnectError {
             Self::Config(e) => Some(e),
             Self::Io { source, .. } => Some(source),
             Self::Decode(e) => Some(e),
+            Self::Clipboard(e) => Some(e),
             _ => None,
         }
     }
@@ -114,6 +123,12 @@ impl From<DecodeError> for ConnectError {
     }
 }
 
+impl From<RfbCutTextError> for ConnectError {
+    fn from(value: RfbCutTextError) -> Self {
+        Self::Clipboard(value)
+    }
+}
+
 /// What one [`VncConnection::pump_once`] call observed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PumpOutcome {
@@ -123,6 +138,13 @@ pub enum PumpOutcome {
         rects: u16,
         /// Bytes read for rectangle payloads.
         payload_bytes: usize,
+    },
+    /// A bounded RFB `ServerCutText` message was decoded and applied to the
+    /// session clipboard state.
+    Clipboard {
+        /// Whether the payload became a guest→host clipboard event or was
+        /// suppressed by the echo/duplicate guard.
+        status: crate::session::VncClipboardStatus,
     },
     /// No server message arrived before the requested timeout.
     TimedOut,
@@ -266,7 +288,11 @@ impl VncConnection {
                 }
                 1 => self.skip_colour_map()?,
                 2 => {}
-                3 => self.skip_cut_text()?,
+                3 => {
+                    let cut_text = self.read_cut_text()?;
+                    let status = session.receive_server_cut_text(cut_text);
+                    return Ok(PumpOutcome::Clipboard { status });
+                }
                 other => {
                     return Err(ConnectError::Protocol(format!(
                         "unexpected server message type {other}"
@@ -285,6 +311,22 @@ impl VncConnection {
         let count = queued.len();
         write_client_messages(&mut self.stream, &queued)?;
         Ok(count)
+    }
+
+    /// Send host clipboard text to the guest through RFB `ClientCutText` and
+    /// flush it immediately on the live socket.
+    ///
+    /// # Errors
+    /// [`ConnectError::Clipboard`] for over-cap text; [`ConnectError::Io`] if the
+    /// socket write fails.
+    pub fn send_clipboard_to_guest(
+        &mut self,
+        session: &mut VncSession,
+        text: impl Into<String>,
+    ) -> Result<(), ConnectError> {
+        session.send_clipboard_to_guest(text)?;
+        self.flush_input(session)?;
+        Ok(())
     }
 
     /// Close the socket. RFB has no required graceful shutdown message.
@@ -352,11 +394,19 @@ impl VncConnection {
         Ok(())
     }
 
-    fn skip_cut_text(&mut self) -> Result<(), ConnectError> {
+    fn read_cut_text(&mut self) -> Result<crate::wire::RfbCutText, ConnectError> {
         let head = read_n(&mut self.stream, 7, "ServerCutText header")?;
         let len = be32(&head[3..7]) as usize;
-        let _ = read_n(&mut self.stream, len, "cut-text payload")?;
-        Ok(())
+        if len > RFB_CUT_TEXT_MAX_BYTES {
+            return Err(ConnectError::Clipboard(RfbCutTextError::TooLarge {
+                len,
+                max: RFB_CUT_TEXT_MAX_BYTES,
+            }));
+        }
+        let payload = read_n(&mut self.stream, len, "cut-text payload")?;
+        let mut body = head;
+        body.extend_from_slice(&payload);
+        decode_server_cut_text_body(&body).map_err(ConnectError::Clipboard)
     }
 
     fn elapsed_ms(&self) -> u64 {
@@ -726,7 +776,7 @@ fn is_timeout(e: &io::Error) -> bool {
 mod tests {
     use super::{ConnectError, PumpOutcome, VncConnection};
     use crate::pixel::PixelFormat;
-    use crate::{egui, VncConfig, VncSession};
+    use crate::{egui, VncClipboardStatus, VncConfig, VncSession};
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::thread;
@@ -749,6 +799,14 @@ mod tests {
             },
             PumpOutcome::Terminated {
                 reason: "closed".to_string()
+            }
+        );
+        assert_eq!(
+            PumpOutcome::Clipboard {
+                status: VncClipboardStatus::GuestTextQueued
+            },
+            PumpOutcome::Clipboard {
+                status: VncClipboardStatus::GuestTextQueued
             }
         );
     }
@@ -879,6 +937,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn live_connection_round_trips_rfb_cut_text_with_echo_guard() {
+        let (config, server) = spawn_clipboard_rfb_server();
+        let mut session = VncSession::new(config).expect("test config is valid");
+        let mut conn = VncConnection::connect(&mut session).expect("RFB handshake succeeds");
+
+        conn.send_clipboard_to_guest(&mut session, "host→guest")
+            .expect("ClientCutText writes to the guest");
+        let outcome = conn
+            .pump_once(&mut session, Duration::from_millis(250))
+            .expect("ServerCutText decodes");
+        assert_eq!(
+            outcome,
+            PumpOutcome::Clipboard {
+                status: VncClipboardStatus::GuestTextQueued
+            }
+        );
+        assert_eq!(
+            session
+                .take_guest_clipboard()
+                .into_iter()
+                .map(crate::RfbCutText::into_text)
+                .collect::<Vec<_>>(),
+            vec!["guest→host".to_string()]
+        );
+
+        // The same content sent back by the server is a protocol-level echo of
+        // the last ClientCutText and must not publish to the guest→host lane.
+        let outcome = conn
+            .pump_once(&mut session, Duration::from_millis(250))
+            .expect("echo ServerCutText decodes");
+        assert_eq!(
+            outcome,
+            PumpOutcome::Clipboard {
+                status: VncClipboardStatus::EchoSuppressed
+            }
+        );
+        assert!(session.pending_guest_clipboard().is_empty());
+        conn.shutdown();
+
+        let captured = server.join().expect("test RFB server exits cleanly");
+        assert!(
+            captured
+                .windows(client_cut_text("host→guest").len())
+                .any(|w| w == client_cut_text("host→guest")),
+            "client never sent real RFB ClientCutText: {captured:?}"
+        );
+    }
+
     fn spawn_raw_rfb_server() -> (VncConfig, thread::JoinHandle<Vec<u8>>) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind test RFB listener");
         let port = listener.local_addr().expect("read listener address").port();
@@ -906,6 +1013,45 @@ mod tests {
                 .write_all(&raw_framebuffer_update())
                 .expect("write raw framebuffer update");
             read_one_client_message(&mut stream, &mut captured);
+            captured
+        });
+        (
+            VncConfig::new("127.0.0.1").with_port(port).shared(true),
+            handle,
+        )
+    }
+
+    fn spawn_clipboard_rfb_server() -> (VncConfig, thread::JoinHandle<Vec<u8>>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind test RFB listener");
+        let port = listener.local_addr().expect("read listener address").port();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept RFB client");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set server read timeout");
+            let mut captured = Vec::new();
+
+            stream
+                .write_all(b"RFB 003.008\n")
+                .expect("write protocol banner");
+            captured.extend(read_exact(&mut stream, 12));
+            stream.write_all(&[1, 1]).expect("offer security type None");
+            captured.extend(read_exact(&mut stream, 1));
+            stream
+                .write_all(&0u32.to_be_bytes())
+                .expect("write security success");
+            captured.extend(read_exact(&mut stream, 1));
+            stream.write_all(&server_init()).expect("write ServerInit");
+
+            read_until_client_cut_text(&mut stream, &mut captured);
+            read_until_framebuffer_request(&mut stream, &mut captured);
+            stream
+                .write_all(&server_cut_text("guest→host"))
+                .expect("write ServerCutText");
+            read_until_framebuffer_request(&mut stream, &mut captured);
+            stream
+                .write_all(&server_cut_text("host→guest"))
+                .expect("write echoed ServerCutText");
             captured
         });
         (
@@ -970,6 +1116,14 @@ mod tests {
         }
     }
 
+    fn read_until_client_cut_text(stream: &mut TcpStream, captured: &mut Vec<u8>) {
+        loop {
+            if read_one_client_message(stream, captured) == Some(6) {
+                return;
+            }
+        }
+    }
+
     fn read_one_client_message(stream: &mut TcpStream, captured: &mut Vec<u8>) -> Option<u8> {
         let mut kind = [0];
         if stream.read_exact(&mut kind).is_err() {
@@ -987,6 +1141,12 @@ mod tests {
             3 => captured.extend(read_exact(stream, 9)),
             4 => captured.extend(read_exact(stream, 7)),
             5 => captured.extend(read_exact(stream, 5)),
+            6 => {
+                let head = read_exact(stream, 7);
+                let len = u32::from_be_bytes([head[3], head[4], head[5], head[6]]);
+                captured.extend_from_slice(&head);
+                captured.extend(read_exact(stream, len as usize));
+            }
             _ => {}
         }
         Some(kind[0])
@@ -1012,6 +1172,20 @@ mod tests {
         msg.extend_from_slice(&0i32.to_be_bytes());
         msg.extend_from_slice(&[0, 0, 255, 0]);
         msg.extend_from_slice(&[0, 255, 0, 0]);
+        msg
+    }
+
+    fn server_cut_text(text: &str) -> Vec<u8> {
+        let mut msg = vec![3, 0, 0, 0];
+        msg.extend_from_slice(&(text.len() as u32).to_be_bytes());
+        msg.extend_from_slice(text.as_bytes());
+        msg
+    }
+
+    fn client_cut_text(text: &str) -> Vec<u8> {
+        let mut msg = vec![6, 0, 0, 0];
+        msg.extend_from_slice(&(text.len() as u32).to_be_bytes());
+        msg.extend_from_slice(text.as_bytes());
         msg
     }
 
