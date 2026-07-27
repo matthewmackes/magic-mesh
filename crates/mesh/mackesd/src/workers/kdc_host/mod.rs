@@ -1001,13 +1001,14 @@ fn parse_inbound_notification(
 /// the two v1 follow-everywhere actions are fanned out — a clipboard copy and a
 /// find-my-device ring — so a copy / ring on the single "Construct Mesh" device
 /// reaches EVERY desktop, not just the endpoint one.
-fn fanout_action_for_packet(kind: &str, body: &Value) -> Option<FanoutAction> {
+fn fanout_action_for_packet(kind: &str, body: &Value, peer: &str) -> Option<FanoutAction> {
     match kind {
         "kdeconnect.clipboard" | "kdeconnect.clipboard.connect" => {
             let content = body.get("content").and_then(Value::as_str)?;
             // An empty clipboard push isn't worth fanning out.
             (!content.is_empty()).then(|| FanoutAction::Clipboard {
                 content: content.to_string(),
+                source: format!("kdc:{peer}"),
             })
         }
         "kdeconnect.findmyphone.request" => Some(FanoutAction::Ring),
@@ -1778,7 +1779,9 @@ async fn run_host(
                     // device reaches the whole mesh (#6/#10). The endpoint remembers
                     // the request id to aggregate the responses on the shunt tick.
                     if is_endpoint {
-                        if let Some(action) = fanout_action_for_packet(&packet.kind, &packet.body) {
+                        if let Some(action) =
+                            fanout_action_for_packet(&packet.kind, &packet.body, peer.as_str())
+                        {
                             if let Some(id) = relay_fanout_action(&shunt_root, &shunt_host, &action) {
                                 fanout_recent.push_back(id);
                                 while fanout_recent.len() > FANOUT_SEEN_CAP {

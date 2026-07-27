@@ -21,32 +21,38 @@ fn worker_name_matches_module() {
 fn fanout_classify_maps_only_follow_everywhere_packets() {
     // A clipboard copy → a Clipboard fanout action.
     assert_eq!(
-        fanout_action_for_packet("kdeconnect.clipboard", &json!({ "content": "hi" })),
+        fanout_action_for_packet("kdeconnect.clipboard", &json!({ "content": "hi" }), "moto"),
         Some(FanoutAction::Clipboard {
-            content: "hi".into()
+            content: "hi".into(),
+            source: "kdc:moto".into()
         })
     );
     // The connection-time clipboard push is fanned out too.
     assert_eq!(
-        fanout_action_for_packet("kdeconnect.clipboard.connect", &json!({ "content": "x" })),
+        fanout_action_for_packet(
+            "kdeconnect.clipboard.connect",
+            &json!({ "content": "x" }),
+            "moto",
+        ),
         Some(FanoutAction::Clipboard {
-            content: "x".into()
+            content: "x".into(),
+            source: "kdc:moto".into()
         })
     );
     // An empty clipboard push isn't worth fanning out.
     assert_eq!(
-        fanout_action_for_packet("kdeconnect.clipboard", &json!({ "content": "" })),
+        fanout_action_for_packet("kdeconnect.clipboard", &json!({ "content": "" }), "moto"),
         None
     );
     // A find-my-device ring → a Ring fanout action.
     assert_eq!(
-        fanout_action_for_packet("kdeconnect.findmyphone.request", &json!({})),
+        fanout_action_for_packet("kdeconnect.findmyphone.request", &json!({}), "moto"),
         Some(FanoutAction::Ring)
     );
     // Everything else is NOT a follow-everywhere action (node-specific / not
     // fanned out) — e.g. a run-command or a notification.
     assert_eq!(
-        fanout_action_for_packet("kdeconnect.runcommand.request", &json!({})),
+        fanout_action_for_packet("kdeconnect.runcommand.request", &json!({}), "moto"),
         None
     );
     assert_eq!(
