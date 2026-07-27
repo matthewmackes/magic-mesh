@@ -339,7 +339,12 @@ pub fn write_sealed_if_absent(path: &Path, bytes: &[u8]) -> Result<bool, CaError
                 )))),
             }
         })
-        .unwrap_or_else(|| Err(CaError::Io(format!("tempfile collisions for {}", path.display()))))?;
+        .unwrap_or_else(|| {
+            Err(CaError::Io(format!(
+                "tempfile collisions for {}",
+                path.display()
+            )))
+        })?;
 
     let result = (|| {
         file.write_all(bytes)

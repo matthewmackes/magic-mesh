@@ -819,8 +819,8 @@ fn paint_osd(ui: &Ui, level: OsdLevel, t: f32) {
 #[cfg(test)]
 #[allow(clippy::float_cmp)]
 mod tests {
-    use crate::egui::FontFamily;
     use super::*;
+    use crate::egui::FontFamily;
 
     fn info(host: &str) -> Toast {
         Toast::alert(Severity::Info, host, "CHAT", "a message arrived")
@@ -1151,8 +1151,14 @@ mod tests {
     #[test]
     fn banner_type_reads_body_over_footnote() {
         // Q14: the HIG type ladder — Body title over Label detail.
-        assert_eq!(banner_title_font(), Style::typography_font(TypographyRole::Body));
-        assert_eq!(banner_detail_font(), Style::typography_font(TypographyRole::Label));
+        assert_eq!(
+            banner_title_font(),
+            Style::typography_font(TypographyRole::Body)
+        );
+        assert_eq!(
+            banner_detail_font(),
+            Style::typography_font(TypographyRole::Label)
+        );
     }
 
     #[test]

@@ -80,8 +80,7 @@ pub(crate) fn render_sshd_block(host_key_path: &str, authorized_pubkey: &str, po
     let Some(host_key_path) = safe_yaml_scalar(host_key_path, MAX_PATH_CHARS) else {
         return String::new();
     };
-    let Some(authorized_pubkey) = safe_yaml_scalar(authorized_pubkey, MAX_PUBLIC_KEY_CHARS)
-    else {
+    let Some(authorized_pubkey) = safe_yaml_scalar(authorized_pubkey, MAX_PUBLIC_KEY_CHARS) else {
         return String::new();
     };
     format!(
@@ -116,8 +115,12 @@ pub(crate) fn ensure_sshd_keys(config_dir: &Path) -> Result<String, String> {
     let bytes = read_bounded_file(&pub_path, MAX_PUBLIC_KEY_BYTES)?;
     let public_key = String::from_utf8(bytes)
         .map_err(|_| format!("read {}: public key is not UTF-8", pub_path.display()))?;
-    safe_yaml_scalar(&public_key, MAX_PUBLIC_KEY_CHARS)
-        .ok_or_else(|| format!("read {}: public key is invalid or oversized", pub_path.display()))
+    safe_yaml_scalar(&public_key, MAX_PUBLIC_KEY_CHARS).ok_or_else(|| {
+        format!(
+            "read {}: public key is invalid or oversized",
+            pub_path.display()
+        )
+    })
 }
 
 fn keygen_if_absent(key_path: &Path, comment: &str) -> Result<(), String> {
@@ -374,10 +377,7 @@ fn safe_yaml_scalar(value: &str, max_chars: usize) -> Option<String> {
     let value = bounded_text(value, max_chars)?;
     // Keep the existing unquoted YAML shape, but reject characters that can
     // turn a local path/key into a second scalar, comment, or escape sequence.
-    if value
-        .chars()
-        .any(|ch| matches!(ch, '"' | '\\' | '#'))
-    {
+    if value.chars().any(|ch| matches!(ch, '"' | '\\' | '#')) {
         return None;
     }
     Some(value)
@@ -456,9 +456,12 @@ mod tests {
     #[test]
     fn bounded_reader_rejects_oversized_input() {
         let exact = vec![b'k'; MAX_PUBLIC_KEY_BYTES];
-        assert_eq!(read_bounded(std::io::Cursor::new(exact), MAX_PUBLIC_KEY_BYTES)
-            .unwrap()
-            .len(), MAX_PUBLIC_KEY_BYTES);
+        assert_eq!(
+            read_bounded(std::io::Cursor::new(exact), MAX_PUBLIC_KEY_BYTES)
+                .unwrap()
+                .len(),
+            MAX_PUBLIC_KEY_BYTES
+        );
 
         let oversized = vec![b'k'; MAX_PUBLIC_KEY_BYTES + 1];
         let error = read_bounded(std::io::Cursor::new(oversized), MAX_PUBLIC_KEY_BYTES)

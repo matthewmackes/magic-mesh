@@ -13,15 +13,15 @@
 //! Arbitrary MIME up to 100 MB rides the clipboard lane; anything larger is a
 //! Transfer, not a clip (the worker routes it there rather than truncating).
 
-use mde_egui::Style;
 use mde_egui::egui;
+use mde_egui::Style;
 
 use mde_collab_types::{
     ClipItemKind, ClipboardItem, ClipboardView, CollabCommand, EventId, SpaceId,
 };
 
 use crate::files::short_hash;
-use crate::{CommunicationsSurface, icons, relative_age};
+use crate::{icons, relative_age, CommunicationsSurface};
 
 /// The lane row preview cap — a clip's preview is a recognisable head, never the
 /// full (possibly large) content pasted into the row.
@@ -298,7 +298,7 @@ fn clip_preview(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_CLIP_BYTES, PREVIEW_MAX, clip_fits_lane, clip_preview};
+    use super::{clip_fits_lane, clip_preview, MAX_CLIP_BYTES, PREVIEW_MAX};
     use crate::{CommandSink, CommunicationsSurface};
     use mde_collab_types::SpaceId;
 

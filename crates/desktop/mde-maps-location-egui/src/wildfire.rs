@@ -97,9 +97,10 @@ where
     if !rect.is_finite() || rect.width() <= 0.0 || rect.height() <= 0.0 {
         return PaintStats::default();
     }
-    let future_dated = layer.snapshot.as_ref().is_some_and(|snapshot| {
-        snapshot.fetched_at_ms > now_ms
-    });
+    let future_dated = layer
+        .snapshot
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.fetched_at_ms > now_ms);
     let dimmed = layer.stale(now_ms) || layer.paused();
     let mut stats = PaintStats::default();
     if !future_dated {
@@ -107,16 +108,8 @@ where
             let clip = rect.intersect(painter.clip_rect());
             let perimeter_painter = painter.with_clip_rect(clip);
             let mut point_budget = MAX_PAINTABLE_POINTS;
-            for perimeter in snapshot
-                .perimeters
-                .iter()
-                .take(MAX_PAINTABLE_PERIMETERS)
-            {
-                for polygon in perimeter
-                    .polygons
-                    .iter()
-                    .take(MAX_PAINTABLE_POLYGONS)
-                {
+            for perimeter in snapshot.perimeters.iter().take(MAX_PAINTABLE_PERIMETERS) {
+                for polygon in perimeter.polygons.iter().take(MAX_PAINTABLE_POLYGONS) {
                     if paint_polygon(
                         &perimeter_painter,
                         rect,
@@ -510,9 +503,7 @@ mod tests {
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let rect = ui.max_rect();
-                stats = paint_layer(ui.painter(), rect, &layer, now, |_, _| {
-                    Some(rect.center())
-                });
+                stats = paint_layer(ui.painter(), rect, &layer, now, |_, _| Some(rect.center()));
             });
         });
 
@@ -541,9 +532,7 @@ mod tests {
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let rect = ui.max_rect();
-                stats = paint_layer(ui.painter(), rect, &layer, now, |_, _| {
-                    Some(rect.center())
-                });
+                stats = paint_layer(ui.painter(), rect, &layer, now, |_, _| Some(rect.center()));
             });
         });
 

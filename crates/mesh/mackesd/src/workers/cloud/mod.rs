@@ -850,8 +850,7 @@ mod tests {
         assert!(
             prepared.ok,
             "gated: {:?} error: {:?}",
-            prepared.gated,
-            prepared.error
+            prepared.gated, prepared.error
         );
         assert_eq!(
             reconcile::read_desired_slice(tmp.path(), "me")[0].delivery_type,
@@ -871,8 +870,7 @@ mod tests {
         assert!(
             applied.ok,
             "gated: {:?} error: {:?}",
-            applied.gated,
-            applied.error
+            applied.gated, applied.error
         );
 
         let rendered = runner.provision_tfvars.lock().unwrap();
@@ -1191,12 +1189,10 @@ mod tests {
         let reply = worker.handle("instance-delete", &body);
 
         assert!(!reply.ok);
-        assert!(
-            reply
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("without applying"))
-        );
+        assert!(reply
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("without applying")));
         assert!(reply.audited, "the rejected destructive outcome is audited");
         assert_eq!(reconcile::read_desired_slice(tmp.path(), "me").len(), 1);
         assert_eq!(
@@ -1740,7 +1736,10 @@ mod tests {
             .error
             .as_deref()
             .is_some_and(|error| error == "cloud action body is missing"));
-        assert!(reply.instances.is_none(), "missing bodies must not disclose reads");
+        assert!(
+            reply.instances.is_none(),
+            "missing bodies must not disclose reads"
+        );
         assert!(reply.gated.is_none());
     }
 

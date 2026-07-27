@@ -163,7 +163,7 @@ fn storage_icon_label_button(ui: &mut egui::Ui, icon: IconId, label: &str) -> eg
                 image,
                 RichText::new(label).font(Style::typography_font(TypographyRole::Caption)),
             )
-                .min_size(egui::vec2(0.0, STORAGE_ACTION_BUTTON_H)),
+            .min_size(egui::vec2(0.0, STORAGE_ACTION_BUTTON_H)),
         )
     });
     response.widget_info(|| {

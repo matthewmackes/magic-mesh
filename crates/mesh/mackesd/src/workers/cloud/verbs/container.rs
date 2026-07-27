@@ -92,9 +92,7 @@ pub(crate) fn handle(w: &CloudWorker, verb_name: &str, raw: &str) -> CloudReply 
     if image.len() > MAX_CONTAINER_VALUE_BYTES {
         return reject(
             verb_name,
-            &format!(
-                "container image reference exceeds {MAX_CONTAINER_VALUE_BYTES}-byte limit"
-            ),
+            &format!("container image reference exceeds {MAX_CONTAINER_VALUE_BYTES}-byte limit"),
         );
     }
     if let Err(error) = validate_values("ports", &body.ports)
@@ -292,29 +290,28 @@ fn stage_unit(root: &Path, node: &str, name: &str, unit: &str) -> Result<StagedU
     // traversed if it was replaced while the directory was being prepared.
     reject_symlinked_stage_directories(&dir)?;
     let path = dir.join(format!("{name}{QUADLET_SUFFIX}"));
-    let previous =
-        match std::fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(format!(
-                    "refusing symlinked quadlet stage {}",
-                    path.display()
-                ));
-            }
-            Ok(metadata) if !metadata.is_file() => {
-                return Err(format!(
-                    "quadlet stage is not a regular file {}",
-                    path.display()
-                ));
-            }
-            Ok(_) => Some(read_existing_stage(&path)?),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => {
-                return Err(format!(
-                    "read existing quadlet stage {}: {error}",
-                    path.display()
-                ));
-            }
-        };
+    let previous = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(format!(
+                "refusing symlinked quadlet stage {}",
+                path.display()
+            ));
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(format!(
+                "quadlet stage is not a regular file {}",
+                path.display()
+            ));
+        }
+        Ok(_) => Some(read_existing_stage(&path)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(format!(
+                "read existing quadlet stage {}: {error}",
+                path.display()
+            ));
+        }
+    };
     write_stage_atomic(&path, unit.as_bytes())?;
     Ok(StagedUnit { path, previous })
 }
@@ -340,9 +337,12 @@ fn read_existing_stage(path: &Path) -> Result<Vec<u8>, String> {
     let file = std::fs::File::open(path)
         .map_err(|error| format!("read existing quadlet stage {}: {error}", path.display()))?;
 
-    let metadata = file
-        .metadata()
-        .map_err(|error| format!("metadata existing quadlet stage {}: {error}", path.display()))?;
+    let metadata = file.metadata().map_err(|error| {
+        format!(
+            "metadata existing quadlet stage {}: {error}",
+            path.display()
+        )
+    })?;
     if !metadata.is_file() {
         return Err(format!(
             "existing quadlet stage is not a regular file {}",
@@ -557,7 +557,10 @@ fn validate_values(label: &str, values: &[String]) -> Result<(), String> {
             "container {label} list exceeds {MAX_CONTAINER_LIST_ITEMS} entries"
         ));
     }
-    if values.iter().any(|value| value.len() > MAX_CONTAINER_VALUE_BYTES) {
+    if values
+        .iter()
+        .any(|value| value.len() > MAX_CONTAINER_VALUE_BYTES)
+    {
         return Err(format!(
             "container {label} entry exceeds {MAX_CONTAINER_VALUE_BYTES}-byte limit"
         ));
@@ -952,7 +955,10 @@ mod tests {
         std::fs::write(&exact, vec![b'x'; MAX_STAGED_UNIT_BYTES]).unwrap();
         std::fs::write(&oversized, vec![b'x'; MAX_STAGED_UNIT_BYTES + 1]).unwrap();
 
-        assert_eq!(read_existing_stage(&exact).unwrap().len(), MAX_STAGED_UNIT_BYTES);
+        assert_eq!(
+            read_existing_stage(&exact).unwrap().len(),
+            MAX_STAGED_UNIT_BYTES
+        );
         let error = read_existing_stage(&oversized).expect_err("oversized prior unit");
         assert!(error.contains("exceeds"));
         assert!(error.contains(&MAX_STAGED_UNIT_BYTES.to_string()));

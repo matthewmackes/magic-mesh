@@ -1042,16 +1042,11 @@ mod tests {
         );
         let status: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(status["accepted-count"].as_u64(), Some(total as u64));
-        assert_eq!(
-            status["pending-mint-count"].as_u64(),
-            Some(total as u64)
-        );
+        assert_eq!(status["pending-mint-count"].as_u64(), Some(total as u64));
         assert!(status["accepted-truncated"].as_bool().unwrap());
         assert!(status["pending-mints-truncated"].as_bool().unwrap());
         assert!(status["accepted"].as_array().unwrap().len() <= MAX_STATUS_ROWS);
-        assert!(
-            status["pending-mints"].as_array().unwrap().len() <= MAX_STATUS_ROWS
-        );
+        assert!(status["pending-mints"].as_array().unwrap().len() <= MAX_STATUS_ROWS);
     }
 
     #[test]

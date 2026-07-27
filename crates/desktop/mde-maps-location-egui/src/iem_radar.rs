@@ -4,11 +4,11 @@ use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
 
 use base64::Engine as _;
-use mackes_mesh_types::iem_radar::{ATTRIBUTION, IemRadarFrame, IemRadarSnapshot, IemRadarTile};
-use mde_egui::Style;
+use mackes_mesh_types::iem_radar::{IemRadarFrame, IemRadarSnapshot, IemRadarTile, ATTRIBUTION};
 use mde_egui::egui::{
     self, Color32, FontId, Painter, Pos2, Rect, Stroke, TextureHandle, TextureOptions,
 };
+use mde_egui::Style;
 
 /// Radar producer time older than twenty minutes is never painted as live.
 pub const SNAPSHOT_STALE_AFTER_MS: i64 = 20 * 60 * 1_000;

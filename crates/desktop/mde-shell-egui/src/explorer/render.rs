@@ -134,8 +134,11 @@ pub(super) fn chip(
     accent: Color32,
     rest: Color32,
 ) -> bool {
-    let text = Style::typography_text(label, TypographyRole::Caption)
-        .color(if active { Style::BG } else { rest });
+    let text = Style::typography_text(label, TypographyRole::Caption).color(if active {
+        Style::BG
+    } else {
+        rest
+    });
     let button = egui::Button::new(text)
         .fill(if active { accent } else { Style::SURFACE })
         .stroke(Stroke::new(
@@ -165,19 +168,14 @@ pub(super) fn search_hit_row(ui: &mut egui::Ui, unit: &Unit, selected: bool) -> 
                 unit.kind,
                 cat.accent(),
             );
-            ui.label(
-                Style::typography_text(&unit.name, TypographyRole::Body).color(Style::TEXT),
-            );
+            ui.label(Style::typography_text(&unit.name, TypographyRole::Body).color(Style::TEXT));
             ui.label(
                 Style::typography_text(unit.kind.label(), TypographyRole::Caption)
                     .color(cat.accent()),
             );
             ui.label(
                 Style::typography_text(
-                    reachability_line(
-                        &unit.reachability,
-                        unit.address.as_deref(),
-                    ),
+                    reachability_line(&unit.reachability, unit.address.as_deref()),
                     TypographyRole::Caption,
                 )
                 .color(Style::TEXT_DIM),
@@ -277,7 +275,8 @@ pub(super) fn filmstrip_divider(ui: &mut egui::Ui, cluster: Cluster) {
     ui.vertical(|ui| {
         ui.add_space(Style::SP_XS);
         ui.label(
-            Style::typography_text(cluster.label(), TypographyRole::Caption).color(cluster.accent()),
+            Style::typography_text(cluster.label(), TypographyRole::Caption)
+                .color(cluster.accent()),
         );
         let (rect, _) =
             ui.allocate_exact_size(Vec2::new(Style::SP_XS, THUMB_H * 0.6), Sense::hover());

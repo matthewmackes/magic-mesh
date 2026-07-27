@@ -656,7 +656,10 @@ mod tests {
         // this node is a DIFFERENT peer ⇒ ignored, nothing applied
         let ev = resolve(&action, "peer:other", &resolver(&k), now, &mut guard, &app);
         assert!(ev.error.is_some());
-        assert_eq!(ev.nonce, b.nonce, "rejection echoes the signed bundle nonce");
+        assert_eq!(
+            ev.nonce, b.nonce,
+            "rejection echoes the signed bundle nonce"
+        );
         assert!(app.applied.lock().expect("mutex").is_empty());
     }
 
@@ -787,7 +790,10 @@ mod tests {
             r#"{"issuer":"peer:lh","target":"peer:me","applied":[],"error":null}"#,
         )
         .expect("legacy event parses");
-        assert!(event.nonce.is_empty(), "missing legacy nonce uses the default");
+        assert!(
+            event.nonce.is_empty(),
+            "missing legacy nonce uses the default"
+        );
     }
 
     #[test]

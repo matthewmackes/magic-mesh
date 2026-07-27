@@ -45,15 +45,15 @@
 //! 4. **autosave versioned snapshots** + a rendered word-diff timeline + git
 //!    integration.
 
-use mde_egui::Style;
 use mde_egui::egui;
+use mde_egui::Style;
 
 use mde_collab_types::{
     CollabCommand, DocumentChange, DocumentId, PayloadRef, ReviewVerdict, SpaceId,
 };
-use mde_editor_egui::{EditorSurface, editor_panel, markdown, real_editor};
+use mde_editor_egui::{editor_panel, markdown, real_editor, EditorSurface};
 
-use crate::{CollabData, CommandSink, CommunicationsSurface, frame, icons};
+use crate::{frame, icons, CollabData, CommandSink, CommunicationsSurface};
 
 /// The content-type the Documents mode stamps on its canonical export/update
 /// payload — Markdown is the source of truth, so an `UpdateDocument` change always
@@ -829,9 +829,9 @@ fn first_nonblank_line(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
+        bounded_document_display, cap_review_comment, first_nonblank_line, markdown_preview,
         MAX_DOCUMENT_PREVIEW_CHARS, MAX_DOCUMENT_SUMMARY_CHARS, MAX_DOCUMENT_TITLE_CHARS,
-        MAX_REVIEW_COMMENT_CHARS, bounded_document_display, cap_review_comment,
-        first_nonblank_line, markdown_preview,
+        MAX_REVIEW_COMMENT_CHARS,
     };
 
     #[test]

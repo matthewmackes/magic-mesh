@@ -1,8 +1,8 @@
 //! adsb.lol low-altitude aircraft layer model and painter.
 
-use mackes_mesh_types::aircraft::{ATTRIBUTION, AircraftSnapshot, AircraftTrack};
-use mde_egui::Style;
+use mackes_mesh_types::aircraft::{AircraftSnapshot, AircraftTrack, ATTRIBUTION};
 use mde_egui::egui::{self, Color32, FontId, Painter, Pos2, Rect, Shape, Stroke};
+use mde_egui::Style;
 
 /// Five missed three-second polls make the layer visibly stale.
 pub const SNAPSHOT_STALE_AFTER_MS: i64 = 15_000;
@@ -536,11 +536,9 @@ mod tests {
         let bounded = bounded_callsign(&oversized).expect("non-empty callsign");
         assert_eq!(bounded.chars().count(), MAX_CALLSIGN_CHARS + 1);
         assert!(bounded.ends_with('\u{2026}'));
-        assert!(
-            bounded
-                .chars()
-                .all(|character| !character.is_whitespace() && !character.is_control())
-        );
+        assert!(bounded
+            .chars()
+            .all(|character| !character.is_whitespace() && !character.is_control()));
     }
 
     #[test]

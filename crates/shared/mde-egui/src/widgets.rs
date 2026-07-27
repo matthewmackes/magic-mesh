@@ -145,10 +145,7 @@ pub fn status_dot(ui: &mut Ui, color: Color32) {
 /// byte-identically. `tone` is a `Style` palette token (never a raw literal).
 pub fn field(ui: &mut Ui, label: &str, value: &str, tone: Color32) {
     ui.horizontal(|ui| {
-        ui.label(
-            Style::typography_text(label, TypographyRole::Caption)
-                .color(Style::TEXT_DIM)
-        );
+        ui.label(Style::typography_text(label, TypographyRole::Caption).color(Style::TEXT_DIM));
         ui.add_space(Style::SP_S);
         ui.colored_label(tone, Style::typography_text(value, TypographyRole::Caption));
     });

@@ -747,9 +747,6 @@ mod tests {
             pending_expiry_label(0, Some(1_000)),
             "expiry unavailable — degraded"
         );
-        assert_eq!(
-            pending_expiry_state(2_000, None),
-            PendingExpiry::Unknown
-        );
+        assert_eq!(pending_expiry_state(2_000, None), PendingExpiry::Unknown);
     }
 }

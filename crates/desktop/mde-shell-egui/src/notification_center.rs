@@ -40,9 +40,7 @@ use mde_egui::egui::{
     self, pos2, vec2, Align, CornerRadius, Frame, Layout, Rect, RichText, Sense, UiKind,
 };
 use mde_egui::motion::Spring;
-use mde_egui::{
-    paint_carbon, Elevation, Motion, Severity, Style, TypographyRole,
-};
+use mde_egui::{paint_carbon, Elevation, Motion, Severity, Style, TypographyRole};
 
 use crate::construct::{ChromeIntent, ConstructChrome};
 use crate::status::{SegmentRollup, StatusSegments};
@@ -432,8 +430,7 @@ fn group_header(ui: &mut egui::Ui, topic: &str, clearable: bool) -> bool {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 clicked = ui
                     .button(
-                        RichText::new("Clear")
-                            .font(Style::typography_font(TypographyRole::Label)),
+                        RichText::new("Clear").font(Style::typography_font(TypographyRole::Label)),
                     )
                     .clicked();
             });

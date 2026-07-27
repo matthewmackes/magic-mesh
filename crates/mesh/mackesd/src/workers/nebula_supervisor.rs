@@ -1938,12 +1938,10 @@ mod tests {
         .expect_err("an unsafe existing identity root must fail closed");
         assert!(error.contains("unsafe Nebula identity directory"));
         assert!(!config_dir.join("ca.crt").exists());
-        assert!(
-            std::fs::read_dir(&identity_dir)
-                .expect("identity directory")
-                .next()
-                .is_none()
-        );
+        assert!(std::fs::read_dir(&identity_dir)
+            .expect("identity directory")
+            .next()
+            .is_none());
     }
 
     #[test]
@@ -2126,11 +2124,9 @@ mod tests {
             std::fs::read_link(tmp.path().join("host.key")).unwrap(),
             std::path::PathBuf::from("identity/current/host.key")
         );
-        assert!(
-            std::fs::read_to_string(tmp.path().join("config.yaml"))
-                .unwrap()
-                .contains("key: /etc/nebula/identity/current/host.key")
-        );
+        assert!(std::fs::read_to_string(tmp.path().join("config.yaml"))
+            .unwrap()
+            .contains("key: /etc/nebula/identity/current/host.key"));
     }
 
     #[test]
@@ -2333,15 +2329,13 @@ mod tests {
     #[test]
     fn unsigned_lighthouse_never_gets_local_https_proxy_endpoint() {
         let bundle = sample_bundle();
-        assert!(
-            https_proxy_endpoint_for(
-                &bundle,
-                &bundle.lighthouses[0],
-                Some("lh1.example.com"),
-                Some("127.0.0.1:4244"),
-            )
-            .is_none()
-        );
+        assert!(https_proxy_endpoint_for(
+            &bundle,
+            &bundle.lighthouses[0],
+            Some("lh1.example.com"),
+            Some("127.0.0.1:4244"),
+        )
+        .is_none());
     }
 
     #[test]

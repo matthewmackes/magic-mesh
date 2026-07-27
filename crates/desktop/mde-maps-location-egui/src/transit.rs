@@ -245,11 +245,8 @@ fn paint_age_badge(painter: &Painter, rect: Rect, layer: &TransitLayerState, now
         ),
         (Some(_), None) => ("MBTA transit · no timestamp".to_string(), Style::WARN),
     };
-    let galley = painter.layout_no_wrap(
-        label,
-        Style::typography_font(TypographyRole::Caption),
-        tone,
-    );
+    let galley =
+        painter.layout_no_wrap(label, Style::typography_font(TypographyRole::Caption), tone);
     let pad = egui::vec2(Style::SP_S, Style::SP_XS);
     let row_height = galley.size().y + pad.y * 2.0 + Style::SP_XS;
     let badge = Rect::from_min_size(

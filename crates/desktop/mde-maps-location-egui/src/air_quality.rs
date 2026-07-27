@@ -1,10 +1,10 @@
 //! Credential-gated US EPA AirNow AQI model and painter (OVERLAY-7).
 
 use mackes_mesh_types::air_quality::{
-    ATTRIBUTION, AirNowAvailability, AirQualitySnapshot, AirQualityStation,
+    AirNowAvailability, AirQualitySnapshot, AirQualityStation, ATTRIBUTION,
 };
-use mde_egui::Style;
 use mde_egui::egui::{self, Align2, Color32, FontId, Painter, Pos2, Rect, Stroke};
+use mde_egui::Style;
 
 /// AirNow updates hourly; observations become visibly stale after two hours.
 pub const SNAPSHOT_STALE_AFTER_MS: i64 = 2 * 60 * 60 * 1_000;
@@ -461,10 +461,9 @@ mod tests {
         assert_eq!(stats.markers, 1);
         assert!(stats.alert_banner);
         assert!(stats.badge);
-        assert!(
-            !ctx.tessellate(output.shapes, output.pixels_per_point)
-                .is_empty()
-        );
+        assert!(!ctx
+            .tessellate(output.shapes, output.pixels_per_point)
+            .is_empty());
     }
 
     #[test]

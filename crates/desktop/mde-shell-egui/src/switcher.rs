@@ -50,10 +50,10 @@
 use std::collections::HashMap;
 
 use mde_egui::motion::Spring;
-use mde_egui::{Motion, MotionPreset, Style, TypographyRole, egui};
+use mde_egui::{egui, Motion, MotionPreset, Style, TypographyRole};
 
 use crate::construct::{ChromeIntent, ConstructChrome};
-use crate::surfaces::{LAUNCHER_GROUPS, Surface, icon_texture};
+use crate::surfaces::{icon_texture, Surface, LAUNCHER_GROUPS};
 
 /// Per-surface snapshot textures captured from the real shell body on leave.
 /// The map is bounded by the canonical surface catalog because callers only
@@ -319,13 +319,11 @@ fn grid_layout(screen: egui::Rect, n: usize) -> (usize, Vec<egui::Rect>) {
     let cols = fit.min(square).min(n).max(1);
     let rows = n.div_ceil(cols);
     let grid_w = (cols as f32).mul_add(CARD_W, (cols - 1) as f32 * GRID_GAP);
-    let preferred_grid_h =
-        (rows as f32).mul_add(CARD_H, (rows - 1) as f32 * GRID_GAP);
-    let available_card_h = ((screen.height()
-        - 2.0 * GRID_MARGIN
-        - (rows.saturating_sub(1) as f32) * GRID_GAP)
-        / rows as f32)
-        .max(HEADER_H + 2.0 * Style::SP_S);
+    let preferred_grid_h = (rows as f32).mul_add(CARD_H, (rows - 1) as f32 * GRID_GAP);
+    let available_card_h =
+        ((screen.height() - 2.0 * GRID_MARGIN - (rows.saturating_sub(1) as f32) * GRID_GAP)
+            / rows as f32)
+            .max(HEADER_H + 2.0 * Style::SP_S);
     let card_h = CARD_H.min(available_card_h);
     let grid_h = if preferred_grid_h > screen.height() - 2.0 * GRID_MARGIN {
         (rows as f32).mul_add(card_h, (rows - 1) as f32 * GRID_GAP)
@@ -674,10 +672,8 @@ fn card(ui: &mut egui::Ui, paint: CardPaint<'_>, state: &mut SwitcherState) -> O
             Style::resolve_color(&ctx, Style::BG),
         );
         let scale = (preview_rect.width() / tw).min(preview_rect.height() / th);
-        let draw = egui::Rect::from_center_size(
-            preview_rect.center(),
-            egui::vec2(tw * scale, th * scale),
-        );
+        let draw =
+            egui::Rect::from_center_size(preview_rect.center(), egui::vec2(tw * scale, th * scale));
         painter.image(tex.id(), draw, uv, egui::Color32::WHITE);
     } else {
         // PLATFORM-INTERFACES Q16/Q22 — the locked fallback plate: the group
@@ -1030,7 +1026,11 @@ mod tests {
             egui::ColorImage::new([0, 0], egui::Color32::WHITE),
             egui::TextureOptions::LINEAR,
         );
-        assert_eq!(invalid.size(), [0, 0], "fixture must model an invalid handle");
+        assert_eq!(
+            invalid.size(),
+            [0, 0],
+            "fixture must model an invalid handle"
+        );
         snapshots.insert(Surface::Files, invalid);
 
         let (_, out) = frame_with_snapshots(
@@ -1305,7 +1305,10 @@ mod tests {
         construct.switcher_open = true;
         frame(&ctx, &mut construct, Surface::ALL[0], true, Vec::new());
         frame(&ctx, &mut construct, Surface::ALL[0], true, Vec::new());
-        let target = rects.last().expect("the full ring has a last card").center();
+        let target = rects
+            .last()
+            .expect("the full ring has a last card")
+            .center();
         frame(
             &ctx,
             &mut construct,
