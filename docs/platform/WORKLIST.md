@@ -2695,6 +2695,14 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-006 - Construct interface (Apple-HIG-principled workstation shell)
 
 - Status: Remaining
+- Progress (2026-07-27 DRM shell cursor-trail fix): the bare-seat EGL/GBM
+  presenter now clears each recycled framebuffer to the active Construct capture
+  palette before painting egui, preventing the software cursor from leaving stale
+  pixels when crossing sparsely painted areas such as the bottom Dock. Pointer
+  motion remains an explicit render trigger. Focused BigBoy farm verification is
+  green: `mde-egui --features drm` DRM tests **29/29**, `mde-shell-egui` nav-bar
+  tests **25/25**, and workspace rustfmt check clean. Live `.15`/Dell DRM pixel
+  capture and physical mouse replay remain outstanding acceptance evidence.
 - Progress (2026-07-26 Dell all-patches F44 package deployment): BigBoy `.130`
   slot `dell-all-patches` cut the Fedora 44 base/Browser/thin-lighthouse RPMs
   with size gates green: base **81.9 MiB**, Browser **39.1 MiB**, and

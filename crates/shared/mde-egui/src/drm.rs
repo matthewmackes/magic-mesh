@@ -714,6 +714,16 @@ fn drm_clipboard_output_text(output: &egui::PlatformOutput) -> Option<String> {
     text
 }
 
+fn clear_rgba(color: egui::Color32) -> [f32; 4] {
+    let [r, g, b, a] = color.to_array();
+    [
+        f32::from(r) / 255.0,
+        f32::from(g) / 255.0,
+        f32::from(b) / 255.0,
+        f32::from(a) / 255.0,
+    ]
+}
+
 /// The bare-seat present loop's **wake policy** (perf-1), factored out pure so it can
 /// be unit-tested headlessly — the live present path itself can only be exercised on
 /// a real seat.
@@ -995,6 +1005,13 @@ mod wake {
             assert!(should_render(false, true, false, false)); // input event
             assert!(should_render(false, false, true, false)); // rotation/formfactor/host-key
             assert!(should_render(false, false, false, true)); // repaint deadline elapsed
+        }
+
+        #[test]
+        fn pointer_motion_repaints_the_frame() {
+            // PointerMoved is input, so a software cursor never leaves stale pixels
+            // behind while the event-driven DRM loop is otherwise idle.
+            assert!(should_render(false, true, false, false));
         }
 
         #[test]
@@ -1359,12 +1376,12 @@ pub fn run_drm_with_clipboard(
         .map_err(|e| DrmError::Egl(format!("eglMakeCurrent: {e}")))?;
 
     // --- glow + egui_glow on the EGL context ---
-    let gl = unsafe {
+    let gl = Arc::new(unsafe {
         glow::Context::from_loader_function(|s| {
             egl.get_proc_address(s)
                 .map_or(std::ptr::null(), |f| f as *const c_void)
         })
-    };
+    });
     // PERF-2: surface a SILENT software-rasterizer fallback. A DRM seat that lost
     // its GPU driver drops to llvmpipe/swrast (Mesa software GL) with no trace today
     // — the worst case for "match native" perf. Read GL_RENDERER once (setup, not
@@ -1383,7 +1400,7 @@ pub fn run_drm_with_clipboard(
              node permissions."
         );
     }
-    let mut painter = egui_glow::Painter::new(Arc::new(gl), "", None, false)
+    let mut painter = egui_glow::Painter::new(gl.clone(), "", None, false)
         .map_err(|e| DrmError::Gl(e.to_string()))?;
 
     // --- the present loop: pump the seat, render, scan out, repeat (Esc quits) ---
@@ -1954,6 +1971,14 @@ pub fn run_drm_with_clipboard(
             crate::Style::color_scheme(&egui_ctx),
         );
         let clipped = egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
+        let clear = clear_rgba(crate::Style::current_palette(&egui_ctx).capture_clear);
+        // The software cursor is part of the egui frame. Clear each recycled GBM
+        // buffer before painting so pixels from its previous cursor position cannot
+        // survive when the pointer moves across sparsely painted areas such as the dock.
+        unsafe {
+            gl.clear_color(clear[0], clear[1], clear[2], clear[3]);
+            gl.clear(glow::COLOR_BUFFER_BIT);
+        }
         painter.paint_and_update_textures(
             [wp, hp],
             full_output.pixels_per_point,
@@ -2423,11 +2448,36 @@ pub fn probe_prime_import_liveness() -> Result<PrimeImportLiveness, DrmError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        drm_clipboard_output_text, drm_clipboard_text_for_paste, drm_modifiers, explicit_modifier,
-        open_primary_node, probe_prime_import_liveness, push_drm_clipboard_shortcut, DrmError,
-        ReimportedGemBuffer,
+        clear_rgba, drm_clipboard_output_text, drm_clipboard_text_for_paste, drm_modifiers,
+        explicit_modifier, open_primary_node, probe_prime_import_liveness,
+        push_drm_clipboard_shortcut, DrmError, ReimportedGemBuffer,
     };
     use drm::buffer::{Handle as GemHandle, PlanarBuffer};
+
+    #[test]
+    fn clear_color_matches_the_active_capture_palette() {
+        let dark = crate::Style::palette_for(crate::StyleColorScheme::Dark);
+        let light = crate::Style::palette_for(crate::StyleColorScheme::Light);
+
+        assert_eq!(
+            clear_rgba(dark.capture_clear),
+            [
+                0x12 as f32 / 255.0,
+                0x12 as f32 / 255.0,
+                0x12 as f32 / 255.0,
+                1.0,
+            ]
+        );
+        assert_eq!(
+            clear_rgba(light.capture_clear),
+            [
+                0xF4 as f32 / 255.0,
+                0xF6 as f32 / 255.0,
+                0xFA as f32 / 255.0,
+                1.0,
+            ]
+        );
+    }
 
     #[test]
     fn headless_degrades_cleanly() {
