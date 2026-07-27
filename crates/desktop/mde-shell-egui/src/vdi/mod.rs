@@ -843,6 +843,7 @@ fn run_live_vnc(
                     }
                 }
             }
+            Ok(VncPumpOutcome::Clipboard { .. }) => {}
             Ok(VncPumpOutcome::TimedOut) => {}
             Ok(VncPumpOutcome::Terminated { reason }) => {
                 let _ = event_tx.send(LiveVncEvent::Ended(reason));
