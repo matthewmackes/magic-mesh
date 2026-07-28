@@ -239,9 +239,16 @@ fn show_with_status_anchor(
 ) {
     let free = ui.max_rect();
 
-    // The Carbon §4 field is the background. No wallpaper image is painted here.
     let painter = ui.painter().clone();
     painter.rect_filled(free, 0.0, Style::BG);
+    if let Some(texture) = wallpaper_texture(ui.ctx()) {
+        painter.image(
+            texture.id(),
+            free,
+            cover_uv(free.size(), texture.size_vec2()),
+            egui::Color32::WHITE,
+        );
+    }
 
     // Ease the cover scrim toward the coverage target (a continuous crossfade across
     // every empty↔covered transition).
@@ -850,9 +857,9 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_desktop_paints_the_shell_color_without_wallpaper_cache() {
-        // The empty path: the shell field fills + a status block below. No
-        // wallpaper image is decoded or cached for the background.
+    fn an_empty_desktop_paints_wallpaper_with_status_over_it() {
+        // Home is a wallpaper-backed canvas; the status block remains layered
+        // over the image and the bundled fallback makes this deterministic.
         let (drew, cached) = run(
             Coverage::Empty,
             Some((
@@ -865,23 +872,22 @@ mod tests {
             "the empty shell-colour backdrop produced no draw primitives"
         );
         assert!(
-            !cached,
-            "the shell-colour background must not cache a wallpaper texture"
+            cached,
+            "the wallpaper-backed Home must cache its fallback texture"
         );
     }
 
     #[test]
     fn a_covered_desktop_still_paints_shell_color_under_the_scrim() {
-        // The covered path: the shell field still fills behind whatever content
-        // covers the display, with no status block or wallpaper cache.
+        // The covered path retains the wallpaper beneath the cover scrim.
         let (drew, cached) = run(Coverage::Covered, None);
         assert!(
             drew,
             "the covered shell-colour backdrop produced no draw primitives"
         );
         assert!(
-            !cached,
-            "the covered shell-colour backdrop must not cache a wallpaper texture"
+            cached,
+            "the covered backdrop must retain its wallpaper texture"
         );
     }
 

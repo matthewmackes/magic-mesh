@@ -1,35 +1,13 @@
-//! `springboard` — WL-UX-006/U10: the **Construct desktop** — the persistent
-//! all-app icon grid that IS the shell's base layer, mounted from the U09
-//! scaffold's reserved `mount_springboard_slot` and rendered by the collapsed
-//! central view in place of the retired session EmptyState.
+//! `springboard` — WL-UX-006/U10: the **Construct Home gesture layer** over the
+//! wallpaper-backed desktop. Home is intentionally quiet; app discovery lives
+//! in Spotlight/Front Door while this module owns the pull-down gesture.
 //!
-// PLATFORM-INTERFACES Q5/Q8/Q22 — the locked home: one all-app icon grid is
-// the base layer the seat boots to and every app leaves onto, drawn over the
-// existing wallpaper backdrop (Q5). The grid keeps the canonical launcher
-// order, uses the taxonomy group's accent as the tile color, and has no
-// desktop heading, folders, arrangement state, dock, widgets, or page dots;
-// a tile is a rounded-rect plate with a white Carbon glyph and a label beneath
-// (Q22).
-//!
-//! ## One desktop, honestly
-//!
-//! The desktop is not springboard state — it is a **pure projection of
-//! [`Surface::ALL`]**. The taxonomy groups remain the source of tile colors and
-//! Spotlight grouping. The shared compile-time guard still guarantees every
-//! launchable surface appears exactly once; this module's tests add the runtime
-//! twin (one desktop, tile sum == `Surface::ALL` len, every surface exactly
-//! once).
-//! No recents, no badges, no live data — pure icons (Q6/Q7/Q9).
+// PLATFORM-INTERFACES Q5/Q8/Q22 — the locked home is a wallpaper-backed free
+// canvas with no desktop title or app tile labels. The bottom Dock is the
+// compact launch rail; deeper app discovery remains in Spotlight.
 //!
 //! ## Input
 //!
-//! * **Selection**: `Tab`/`Shift+Tab` and arrow keys walk the complete icon
-//!   list in **lock-step with this module's own selection model** — keys are
-//!   consumed up front and there is deliberately NO `request_focus` (driving
-//!   egui's focus a second time is the double-step desync
-//!   `mde_egui::nav_chrome` documents). `ArrowUp`/`Down` move by grid row.
-//!   `PageUp`/`PageDown` are harmless no-ops on the single desktop.
-//!   `Enter`/click opens the surface.
 //! * **Pull-down → Spotlight** (Q11 "pull-down on home grid"): a downward
 //!   drag beginning in the grid's upper region past a threshold queues the
 //!   distinct [`SpringboardAction::Spotlight`]; the slot body lands it on the
@@ -43,7 +21,7 @@
 //! ## The mount seam
 //!
 //! `main.rs` calls exactly two functions: [`show`] from the collapsed central
-//! view (the base-layer paint) and [`mount`] from the U09 slot, which drains
+//! view (the gesture layer) and [`mount`] from the U09 slot, which drains
 //! the interactions [`show`] queued — plus the `ChromeIntent::Home` this slot
 //! remains the ONE consumer of — into a single typed [`SpringboardAction`]
 //! for the slot body to apply. State rides egui memory (the switcher/backdrop
@@ -372,21 +350,30 @@ pub(crate) fn mount(
 /// over the wallpaper backdrop exactly where the session EmptyState drew.
 /// `overlay_above` is true while any Construct overlay / the Front Door is
 /// open above — the keyboard then stays theirs (module doc).
-pub(crate) fn show(ui: &mut egui::Ui, overlay_above: bool) {
+pub(crate) fn show(ui: &mut egui::Ui, _overlay_above: bool) {
+    let ctx = ui.ctx().clone();
+    let state_key = egui::Id::new(STATE_KEY);
+    let mut state = ctx
+        .data_mut(|d| d.get_temp::<SpringboardState>(state_key))
+        .unwrap_or_default();
+    handle_drag(ui, &mut state, ui.max_rect());
+
+    ctx.data_mut(|d| d.insert_temp(state_key, state));
+}
+
+#[cfg(test)]
+fn show_grid(ui: &mut egui::Ui, overlay_above: bool) {
     let ctx = ui.ctx().clone();
     let state_key = egui::Id::new(STATE_KEY);
     let mut state = ctx
         .data_mut(|d| d.get_temp::<SpringboardState>(state_key))
         .unwrap_or_default();
     state.clamp_selected();
-
-    let rect = ui.max_rect();
-    let page_rect = rect;
+    let page_rect = ui.max_rect();
     handle_keys(&ctx, &mut state, page_rect, overlay_above);
     handle_drag(ui, &mut state, page_rect);
     paint_desktop(ui, &mut state, page_rect);
     paint_zoom_ghost(ui, &mut state);
-
     ctx.data_mut(|d| d.insert_temp(state_key, state));
 }
 
@@ -624,7 +611,7 @@ mod tests {
         let out = ctx.run(raw(events), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 inner = ui.max_rect();
-                show(ui, overlay_above);
+                show_grid(ui, overlay_above);
             });
         });
         (inner, out)
@@ -968,20 +955,13 @@ mod tests {
     }
 
     #[test]
-    fn production_pointer_click_selects_the_canonical_fleet_mesh_tile() {
+    fn production_home_does_not_route_pointer_clicks_to_launcher_tiles() {
         let ctx = ctx();
         let mut construct = ConstructChrome::default();
         let (inner, _) = production_frame(&ctx, Vec::new());
         let (inner2, _) = production_frame(&ctx, Vec::new());
         assert_eq!(inner, inner2, "the production panel rect is stable");
-
-        let tile_idx = desktop_tiles()
-            .iter()
-            .position(|surface| *surface == Surface::FleetMesh)
-            .expect("Fleet & Mesh must remain a canonical desktop tile");
-        let (_, cells) = grid_layout(inner, desktop_tiles().len());
-        let target = plate_rect(cells[tile_idx]).center();
-
+        let target = inner.center();
         production_frame(
             &ctx,
             vec![
@@ -994,26 +974,7 @@ mod tests {
                 },
             ],
         );
-        production_frame(
-            &ctx,
-            vec![egui::Event::PointerButton {
-                pos: target,
-                button: egui::PointerButton::Primary,
-                pressed: false,
-                modifiers: egui::Modifiers::default(),
-            }],
-        );
-
-        assert_eq!(
-            mount(&ctx, &mut construct),
-            Some(SpringboardAction::Open(Surface::FleetMesh)),
-            "a real once-per-frame tile click must select Fleet & Mesh"
-        );
-        assert_eq!(
-            mount(&ctx, &mut construct),
-            None,
-            "the pointer action must drain exactly once"
-        );
+        assert_eq!(mount(&ctx, &mut construct), None);
     }
 
     #[test]
@@ -1056,28 +1017,24 @@ mod tests {
     // --- the collapsed base layer paints honestly -----------------------------------
 
     #[test]
-    fn the_collapsed_view_paints_all_color_coded_tiles_without_a_desktop_title() {
+    fn the_production_home_has_no_launcher_titles_or_tile_plates() {
         let ctx = ctx();
-        // Two settle frames (the curtain-test idiom; the live DRM loop
-        // repaints continuously so both are long gone before a human looks).
-        frame(&ctx, Vec::new());
-        let (_, out) = frame(&ctx, Vec::new());
+        production_frame(&ctx, Vec::new());
+        let (_, out) = production_frame(&ctx, Vec::new());
         let fills = painted_fills(&out.shapes);
-        let accent = LAUNCHER_GROUPS[0].accent;
         assert!(
-            fills.contains(&Style::tile_plate_fill(accent)),
-            "the Q22 accent plates must paint through the ONE shared \
-             derivation: {fills:?}"
+            !fills.iter().any(|fill| {
+                LAUNCHER_GROUPS
+                    .iter()
+                    .any(|group| *fill == Style::tile_plate_fill(group.accent))
+            }),
+            "the production Home must not paint launcher plates: {fills:?}"
         );
         let texts = painted_texts(&out.shapes);
-        assert!(
-            texts.iter().any(|t| t == desktop_tiles()[0].label()),
-            "tile labels paint beneath the plates: {texts:?}"
-        );
         for surface in desktop_tiles() {
             assert!(
-                texts.iter().any(|text| text == surface.label()),
-                "every desktop icon label must paint: {}",
+                !texts.iter().any(|text| text == surface.label()),
+                "launcher title leaked into Home: {}",
                 surface.label()
             );
         }

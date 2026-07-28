@@ -179,11 +179,17 @@ fn storage_icon_button(
     enabled: bool,
 ) -> egui::Response {
     let response = scope_storage_action_button(ui, |ui| {
-        ui.add_enabled(
-            enabled,
-            egui::Button::new("")
-                .min_size(egui::vec2(STORAGE_ACTION_BUTTON_H, STORAGE_ACTION_BUTTON_H)),
-        )
+        // Allocate the icon-only target explicitly. An empty Button rounds
+        // its implicit text line one pixel taller than the adjacent label
+        // action, which makes the compact row visibly misalign.
+        ui.add_enabled_ui(enabled, |ui| {
+            ui.allocate_exact_size(
+                egui::vec2(STORAGE_ACTION_BUTTON_H, STORAGE_ACTION_BUTTON_H),
+                egui::Sense::click(),
+            )
+            .1
+        })
+        .inner
     });
     let tint = if enabled {
         Style::TEXT

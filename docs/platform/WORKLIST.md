@@ -2695,6 +2695,30 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-006 - Construct interface (Apple-HIG-principled workstation shell)
 
 - Status: Remaining
+- Progress (2026-07-28 Construct Home redesign): production Home now paints the
+  cached/bundled wallpaper with cover-cropping and no longer renders the legacy
+  all-app tile grid or its titles; the existing pull-down gesture still routes
+  to Front Door/Spotlight. The floating Dock is thinner at **64px** with **40px**
+  controls and a top divider line; the storage icon-only action target was made
+  explicitly size-stable. BigBoy farm verification is green: focused Home and
+  backdrop tests **22/22**, nav-bar tests **25/25**, shell Pin-layer tests **2/2**,
+  storage-height regression **1/1**, full `mde-shell-egui` suite **1850/1850**,
+  and workspace rustfmt check clean. This is source/test evidence only; the new
+  GUI has not yet been live-pixel verified or deployed to Dell/.15, so
+  WL-UX-006 remains open.
+- Progress (2026-07-28 Construct Home acceptance attempt): the complete Fedora
+  44 `12.1.1-1` RPM was built on BigBoy with all payload gates green; pulled
+  artifact sha256 is
+  `412ec6e34d706b05e2f753a885b4b36228c36a9ee9b4ec91a1a92e9b3b365a48`.
+  The package installed and verified on acceptance seat `.15` with
+  `mde-shell-egui`, `mackesd`, and `nebula` active and zero shell restarts.
+  Dell `172.20.146.225` still returns `No route to host`, so no Dell deployment
+  is claimed. The first `.15` KMS frame was corrupted by scanout artifacts; the
+  linear-scanout retry produced a valid 1920x1080 PNG but remained on the
+  Construct splash and failed `verify-shell-pixel-proof.py` (`tile plate paint
+  ratio 0.0003 < 0.0040`). The temporary linear override and Sunshine session
+  were removed after capture. Live Home pixel proof and physical mouse replay
+  remain outstanding; WL-UX-006 stays open.
 - Progress (2026-07-28 terminal text-sync fix): accepted terminal input now
   requests an immediate repaint and a bounded 8 ms follow-up repaint while the
   PTY writer/reader completes the echo round-trip. Rendered text remains sourced

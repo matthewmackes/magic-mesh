@@ -3351,6 +3351,7 @@ impl Shell {
                         || self.construct.switcher_open
                         || self.construct.control_center_open
                         || self.construct.notification_center_open;
+                    backdrop::show(ui, backdrop::Coverage::Empty, None);
                     springboard::show(ui, overlay_above);
                 } else {
                     let a = (t * 2.0 - 1.0).clamp(0.0, 1.0);
@@ -6717,7 +6718,7 @@ mod tests {
         shell.nav.surface = Surface::AutoHome;
 
         let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(1920.0, 1080.0));
-        let pin = pos2(168.0, 1036.0);
+        let pin = super::nav_bar::floating_pin_center(screen);
         let input = |events| egui::RawInput {
             screen_rect: Some(screen),
             events,
@@ -6799,7 +6800,7 @@ mod tests {
             .set_segments_for_test(critical_segments.clone());
 
         let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(1920.0, 1080.0));
-        let pin = pos2(168.0, 1036.0);
+        let pin = super::nav_bar::floating_pin_center(screen);
         let input = |events| egui::RawInput {
             screen_rect: Some(screen),
             events,

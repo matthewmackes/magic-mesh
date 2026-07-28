@@ -29,15 +29,15 @@ use crate::surfaces::{
 pub(crate) const DOCKED_W: f32 = 56.0;
 /// The minimum floating dock width for the grouped Springboard launcher row.
 pub(crate) const FLOATING_W: f32 = 640.0;
-/// The fixed floating dock height: caption labels above 48px hit targets.
-pub(crate) const FLOATING_H: f32 = 80.0;
+/// The fixed floating dock height: compact caption labels above 40px targets.
+pub(crate) const FLOATING_H: f32 = 64.0;
 /// The bottom/left breathing room around the undocked pill.
 const FLOATING_MARGIN: f32 = 16.0;
-/// Bottom space reserved by the horizontal Springboard Dock, including its
-/// breathing room below the black pill.
+/// Bottom space reserved by the horizontal Springboard Dock, including the
+/// breathing room below the black pill and its divider.
 pub(crate) const SPRINGBOARD_DOCK_RESERVED_H: f32 = FLOATING_H + FLOATING_MARGIN;
-/// The icon controls keep a comfortable 48px target in the compact dock.
-const CONTROL_EDGE: f32 = 48.0;
+/// The icon controls keep a compact 40px target in the thin dock.
+const CONTROL_EDGE: f32 = 40.0;
 /// The horizontal Springboard Dock may be narrower than the preferred 640px
 /// pill on small panels. Preserve the full app set by shrinking the bottom row
 /// after chooser pins have been dropped, instead of letting controls escape the
@@ -866,6 +866,15 @@ fn paint_backing(painter: &egui::Painter, geometry: &Geometry) {
     let shadow = geometry.outer.translate(egui::vec2(0.0, 3.0));
     painter.rect_filled(shadow, geometry.radius, Elevation::Overlay.shadow().umbra);
     painter.rect_filled(geometry.outer, geometry.radius, Style::NAV_BAR_BG);
+    painter.line_segment(
+        [geometry.outer.left_top(), geometry.outer.right_top()],
+        Style::hairline(),
+    );
+}
+
+#[cfg(test)]
+pub(crate) fn floating_pin_center(screen: egui::Rect) -> egui::Pos2 {
+    floating_geometry_for(screen, 0).controls[2].rect.center()
 }
 
 fn paint_group_label(ctx: &egui::Context, painter: &egui::Painter, group: GroupLabel) {
@@ -1197,9 +1206,9 @@ mod tests {
     fn defaults_to_an_unpinned_springboard_dock() {
         assert_eq!(State::default().mode, DockMode::Floating);
         assert_eq!(FLOATING_W, 640.0);
-        assert_eq!(FLOATING_H, 80.0);
+        assert_eq!(FLOATING_H, 64.0);
         assert_eq!(DOCKED_W, 56.0);
-        assert_eq!(SPRINGBOARD_DOCK_RESERVED_H, 96.0);
+        assert_eq!(SPRINGBOARD_DOCK_RESERVED_H, 80.0);
     }
 
     #[test]
@@ -1267,7 +1276,7 @@ mod tests {
 
     #[test]
     fn bottom_dock_shrinks_cells_before_overflowing_the_pill() {
-        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0));
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(480.0, 480.0));
         let geometry = floating_geometry_for(screen, MAX_PINNED_SOURCES);
 
         assert_eq!(geometry.outer.center().x, screen.center().x);
@@ -1303,7 +1312,7 @@ mod tests {
 
     #[test]
     fn docked_rail_drops_launcher_overflow_on_short_screens() {
-        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 400.0));
         let geometry = docked_geometry_for(screen, MAX_PINNED_SOURCES);
 
         assert_eq!(
@@ -2251,7 +2260,7 @@ mod tests {
 
         assert_eq!(
             floating.outer,
-            egui::Rect::from_min_max(egui::pos2(320.0, 704.0), egui::pos2(960.0, 784.0)),
+            egui::Rect::from_min_max(egui::pos2(320.0, 720.0), egui::pos2(960.0, 784.0)),
             "undocked navigation must be a bottom-centered pill"
         );
         assert_eq!(
