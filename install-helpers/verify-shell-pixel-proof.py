@@ -6,9 +6,9 @@ operator acceptance from a file existing.  It reads one already-captured PNG,
 decodes it with the Python standard library, and checks for the stable pixel
 features that make the current shell profile recognizable:
 
-* Construct home: the 24 px top status rail, several shared springboard tile
-  plate colours, enough white glyph/text paint, and the bounded floating
-  navigation pill rather than a full-width bottom taskbar-shaped bar.
+* Construct home: the 24 px top status rail, visible wallpaper variation, the
+  centered compact floating navigation pill with its divider, and no legacy
+  springboard tile plates.
 * Car screen: the Ford SYNC3 near-black ground plus a populated left driver
   instrument strip in the reserved Car frame.
 * Car home: the Car-screen guard, raised dashboard cards in the right
@@ -45,6 +45,7 @@ MAX_PNG_BYTES = 128 * 1024 * 1024
 # Keep these constants synchronized with `crates/shared/mde-egui/src/style.rs`.
 STYLE_BG = (0x16, 0x16, 0x1A)
 STYLE_SURFACE = (0x1F, 0x1F, 0x25)
+STYLE_BORDER = (0x33, 0x33, 0x3D)
 STYLE_TEXT = (0xE6, 0xE6, 0xEC)
 STYLE_TEXT_STRONG = (0xF4, 0xF4, 0xF4)
 STYLE_NAV_BAR_BG = (0x00, 0x00, 0x00)
@@ -75,10 +76,9 @@ CONSTRUCT_ACCENTS = (
 )
 TILE_PLATE_ALPHA = 0.38
 STATUS_BAR_H = 24
-FLOATING_NAV_X = 16
 FLOATING_NAV_BOTTOM_MARGIN = 16
-FLOATING_NAV_W = 240
-FLOATING_NAV_H = 56
+FLOATING_NAV_W = 640
+FLOATING_NAV_H = 64
 CAR_INSTRUMENT_FRACTION = 1.0 / 3.0
 CAR_PANEL_PAD = 24
 CAR_HEADER_H = 26 + 16  # Style::DISPLAY + Style::SP_M
@@ -796,11 +796,14 @@ def validate_construct_home(image: PngImage) -> dict[str, object]:
     luma_min, luma_max = _sample_luma_spread(image)
     rail_h = min(STATUS_BAR_H, image.height)
     top_rail = (0, 0, image.width, rail_h)
-    content = (0, rail_h, image.width, image.height - (FLOATING_NAV_H + FLOATING_NAV_BOTTOM_MARGIN))
+    nav_top = image.height - FLOATING_NAV_BOTTOM_MARGIN - FLOATING_NAV_H
+    content = (0, rail_h, image.width, nav_top)
+    nav_left = max(0, (image.width - FLOATING_NAV_W) // 2)
+    nav_right = min(image.width, nav_left + FLOATING_NAV_W)
     pill = (
-        FLOATING_NAV_X,
-        image.height - FLOATING_NAV_BOTTOM_MARGIN - FLOATING_NAV_H,
-        min(image.width, FLOATING_NAV_X + FLOATING_NAV_W),
+        nav_left,
+        nav_top,
+        nav_right,
         image.height - FLOATING_NAV_BOTTOM_MARGIN,
     )
     bottom_band = (
@@ -813,15 +816,23 @@ def validate_construct_home(image: PngImage) -> dict[str, object]:
     top_bg = _count_where(image, top_rail, _near_any((STYLE_BG,), 8))
     plate_colors = _construct_tile_plate_colors()
     tile_plate_total = _count_where(image, content, _near_any(plate_colors, 10))
-    tile_families = {
-        f"plate_{idx}": _count_where(image, content, _near_any((color,), 10))
-        for idx, color in enumerate(plate_colors)
-    }
-    visible_tile_families = sum(1 for count in tile_families.values() if count >= 120)
+    wallpaper_non_carbon = _count_where(
+        image,
+        content,
+        lambda color: not any(
+            _near(color, target, 10)
+            for target in (STYLE_BG, STYLE_SURFACE, STYLE_NAV_BAR_BG)
+        ),
+    )
     text = _count_where(
         image, (0, rail_h, image.width, image.height), _near_any((STYLE_TEXT, STYLE_TEXT_STRONG, STYLE_TILE_GLYPH), 18)
     )
     pill_black = _count_where(image, pill, _near_any((STYLE_NAV_BAR_BG,), 4))
+    divider = _count_where(
+        image,
+        (nav_left + 32, nav_top, max(nav_left + 32, nav_right - 32), nav_top + 2),
+        _near_any((STYLE_BORDER,), 18),
+    )
 
     wide_black_rows = 0
     x0, y0, x1, y1 = _clamp_rect(image, bottom_band)
@@ -837,6 +848,15 @@ def validate_construct_home(image: PngImage) -> dict[str, object]:
     top_total = _rect_pixels(image, top_rail)
     content_total = _rect_pixels(image, content)
     pill_total = _rect_pixels(image, pill)
+    divider_total = _rect_pixels(
+        image, (nav_left + 32, nav_top, max(nav_left + 32, nav_right - 32), nav_top + 2)
+    )
+    tile_plate_ratio = _fraction(tile_plate_total, content_total)
+    if tile_plate_ratio >= 0.004:
+        raise ProofError(
+            "Construct Home still contains legacy springboard tile plates: "
+            f"ratio {tile_plate_ratio:.4f} >= 0.0040"
+        )
     metrics = {
         "profile": "construct-home",
         "width": image.width,
@@ -845,15 +865,21 @@ def validate_construct_home(image: PngImage) -> dict[str, object]:
         "luma_min": luma_min,
         "luma_max": luma_max,
         "top_status_rail_bg_ratio": _require_ratio("top status rail BG", top_bg, top_total, 0.70),
-        "tile_plate_ratio": _require_ratio("Construct tile plate paint", tile_plate_total, content_total, 0.004),
-        "tile_plate_families": visible_tile_families,
+        "wallpaper_non_carbon_ratio": _require_ratio(
+            "Construct wallpaper variation", wallpaper_non_carbon, content_total, 0.02
+        ),
+        "legacy_tile_plate_ratio": tile_plate_ratio,
         "text_glyph_pixels": text,
+        "floating_nav_width": nav_right - nav_left,
+        "floating_nav_height": FLOATING_NAV_H,
+        "floating_nav_divider_ratio": _require_ratio(
+            "floating navigation divider", divider, divider_total, 0.35
+        ),
         "floating_nav_pill_black_ratio": _require_ratio(
             "floating navigation pill black", pill_black, pill_total, 0.45
         ),
         "wide_bottom_black_rows": wide_black_rows,
     }
-    _require_minimum("distinct Construct tile plate families", visible_tile_families, 3)
     _require_minimum("Construct text/glyph pixels", text, max(300, image.pixels // 1800))
     return metrics
 
@@ -892,32 +918,38 @@ def _fixture_construct(path: Path, *, taskbar: bool = False) -> None:
     width, height = 1280, 720
     buf = bytearray(bytes(STYLE_BG) * width * height)
     _fill_rect(buf, width, height, (0, 0, width, STATUS_BAR_H), STYLE_BG)
-    plate_colors = _construct_tile_plate_colors()
-    tile_w = tile_h = 88
-    start_x, start_y = 260, 220
-    for index, color in enumerate(plate_colors):
-        x = start_x + (index % 4) * 128
-        y = start_y + (index // 4) * 136
-        _fill_rect(buf, width, height, (x, y, x + tile_w, y + tile_h), color)
-        _fill_rect(buf, width, height, (x + 28, y + 28, x + 60, y + 60), STYLE_TILE_GLYPH)
-        _fill_rect(buf, width, height, (x + 12, y + tile_h + 10, x + 72, y + tile_h + 14), STYLE_TEXT)
+    # A quiet wallpaper field: enough tonal variation to prove the backdrop is
+    # present, without recreating the retired launcher grid in the fixture.
+    for y in range(STATUS_BAR_H, height - FLOATING_NAV_H - FLOATING_NAV_BOTTOM_MARGIN):
+        color = (0x18 + (y % 48), 0x1A + (y % 32), 0x28 + (y % 40))
+        _fill_rect(buf, width, height, (0, y, width, y + 1), color)
     if taskbar:
         _fill_rect(buf, width, height, (0, height - 56, width, height - 8), STYLE_NAV_BAR_BG)
     else:
+        nav_left = (width - FLOATING_NAV_W) // 2
+        nav_top = height - FLOATING_NAV_BOTTOM_MARGIN - FLOATING_NAV_H
         _fill_rect(
             buf,
             width,
             height,
             (
-                FLOATING_NAV_X,
-                height - FLOATING_NAV_BOTTOM_MARGIN - FLOATING_NAV_H,
-                FLOATING_NAV_X + FLOATING_NAV_W,
+                nav_left,
+                nav_top,
+                nav_left + FLOATING_NAV_W,
                 height - FLOATING_NAV_BOTTOM_MARGIN,
             ),
             STYLE_NAV_BAR_BG,
         )
-        for x in (56, 112, 168):
-            _fill_rect(buf, width, height, (x, height - 48, x + 24, height - 24), STYLE_TILE_GLYPH)
+        _fill_rect(
+            buf,
+            width,
+            height,
+            (nav_left + 32, nav_top, nav_left + FLOATING_NAV_W - 32, nav_top + 1),
+            STYLE_BORDER,
+        )
+        for x in (nav_left + 48, nav_left + 96, nav_left + 144):
+            _fill_rect(buf, width, height, (x, nav_top + 16, x + 24, nav_top + 40), STYLE_TILE_GLYPH)
+        _fill_rect(buf, width, height, (width - 160, height - 42, width - 24, height - 38), STYLE_TEXT)
     _write_png(path, width, height, bytes(buf))
 
 

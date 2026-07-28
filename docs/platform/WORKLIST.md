@@ -2719,6 +2719,23 @@ These decisions refine acceptance and sequencing for the active items below.
   ratio 0.0003 < 0.0040`). The temporary linear override and Sunshine session
   were removed after capture. Live Home pixel proof and physical mouse replay
   remain outstanding; WL-UX-006 stays open.
+- Progress (2026-07-28 Construct Home live proof): the pixel verifier was updated
+  to match the icon-free Home contract: it now requires wallpaper variation, a
+  centered **640x64** floating Dock, the Dock's top divider, and rejects legacy
+  launcher plates/full-width taskbars. Farm `.50` slot
+  `wl006-pixel-proof-final-20260728` passed the verifier self-test and Python
+  compilation. With the test-seat boot curtain temporarily disabled and the
+  linear scanout path active, `.15` produced a valid 1920x1080 DRM capture while
+  Sunshine was active; `verify-shell-pixel-proof.py --profile construct-home`
+  passed with sha256
+  `04034219f0d08cb47b6892ead8b0b0ee2961fc1c40baea1c735689ebdc97885c`.
+  The seat's uinput/libinput path also accepted a real absolute touch tap at
+  the Dock Pin target and logged DRM touch down/up, egui frames, and
+  `action=toggle_dock`; the host was restored to secure boot-lock defaults,
+  floating Dock preference, no temporary override, Sunshine stopped, and
+  `mde-shell-egui`/`mackesd`/`nebula` active with `NRestarts=0`. Dell remains
+  unreachable directly and from `.15` (`No route to host`), so no Dell
+  deployment is claimed.
 - Progress (2026-07-28 terminal text-sync fix): accepted terminal input now
   requests an immediate repaint and a bounded 8 ms follow-up repaint while the
   PTY writer/reader completes the echo round-trip. Rendered text remains sourced
