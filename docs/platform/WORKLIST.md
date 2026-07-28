@@ -2695,6 +2695,20 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-006 - Construct interface (Apple-HIG-principled workstation shell)
 
 - Status: Remaining
+- Progress (2026-07-28 GUI deployment and farm verification): the cursor-trail
+  fix is deployed as `magic-mesh-12.1.1-1.x86_64` on Dell `172.20.146.225`
+  and the non-production acceptance seat `.15`; the Dell payload hash is
+  `c897f0652c3944b4cfae19bf03252f8f21caab68f87548a054d42c7a06d0b250`, both
+  seats pass RPM verification, and shell/daemon/network services are active
+  with zero restarts. The focused DRM presenter farm gate is green at **29/29**,
+  including the active-palette clear and pointer-motion repaint tests. The full
+  shell suite reached **1846 passed / 4 failed**; the four failures are the
+  existing springboard color assertion, storage chrome-height assertion, and
+  two car-shell floating-pin assertions, rather than this DRM change. A live
+  `.15` KMS capture was attempted with the connected HDMI CRTC and `kmsgrab`
+  but produced no valid PNG because the active seat owns the DRM path; no
+  physical mouse replay or valid live pixel artifact is claimed. WL-UX-006
+  therefore remains open for that hardware acceptance evidence.
 - Progress (2026-07-27 DRM shell cursor-trail fix): the bare-seat EGL/GBM
   presenter now clears each recycled framebuffer to the active Construct capture
   palette before painting egui, preventing the software cursor from leaving stale
