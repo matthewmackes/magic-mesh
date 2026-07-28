@@ -2695,6 +2695,18 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-UX-006 - Construct interface (Apple-HIG-principled workstation shell)
 
 - Status: Remaining
+- Progress (2026-07-28 terminal text-sync fix): accepted terminal input now
+  requests an immediate repaint and a bounded 8 ms follow-up repaint while the
+  PTY writer/reader completes the echo round-trip. Rendered text remains sourced
+  exclusively from PTY output, so this closes the stale-frame window without
+  fabricating local echo. Farm verification passed rustfmt and the focused
+  `mde-term-egui` input-activity test; the full terminal suite reached **396
+  passed / 1 failed**, with the remaining failure being the unrelated farm cwd
+  timing test. A Fedora 44 `12.1.1-1` RPM was built on BigBoy with payload gates
+  green and sha256
+  `afc2717bbaaeed724d915f1d3d8f0c91c5421b441ffc7a57d2b385de300dca38`.
+  Deployment to Dell `172.20.146.225` is pending because the host currently
+  returns `No route to host`; no Dell deployment is claimed.
 - Progress (2026-07-28 GUI deployment and farm verification): the cursor-trail
   fix is deployed as `magic-mesh-12.1.1-1.x86_64` on Dell `172.20.146.225`
   and the non-production acceptance seat `.15`; the Dell payload hash is

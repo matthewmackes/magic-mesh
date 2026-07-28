@@ -70,6 +70,12 @@ const BLINK_HALF_PERIOD: f64 = 0.5;
 /// blink-off frame that makes the cursor look one input behind.
 const INPUT_CURSOR_GRACE: Duration = Duration::from_millis(450);
 
+/// Keep the widget repainting briefly after accepted input while the PTY
+/// writer and reader complete the echo round-trip. The PTY remains the only
+/// source of rendered text; this closes the stale-frame window without
+/// fabricating local terminal output.
+const INPUT_REPAINT_STEP: Duration = Duration::from_millis(8);
+
 /// Height of the per-pane title strip (TERM-12) — a compact caption bar above
 /// the grid (`SMALL` type padded on the 4px half-step).
 const TITLE_STRIP_H: f32 = Style::SMALL + Style::SP_XS * 2.0;
@@ -913,6 +919,11 @@ impl TerminalWidget {
         self.input_cursor_visible_until = now + INPUT_CURSOR_GRACE.as_secs_f64();
     }
 
+    fn request_input_repaint(ctx: &Context) {
+        ctx.request_repaint();
+        ctx.request_repaint_after(INPUT_REPAINT_STEP);
+    }
+
     /// Pure cursor-paint decision, split out so the typing-lag edge is
     /// regression-tested without constructing an egui [`Response`].
     fn cursor_paint_mode(
@@ -1183,6 +1194,7 @@ impl TerminalWidget {
                 Event::Text(text) => {
                     if self.send(text.as_bytes()) {
                         self.mark_input_activity(now);
+                        Self::request_input_repaint(ui.ctx());
                     }
                 }
                 Event::Key {
@@ -1193,11 +1205,13 @@ impl TerminalWidget {
                 } => {
                     if self.on_key(ui.ctx(), key, modifiers, rows, history) {
                         self.mark_input_activity(now);
+                        Self::request_input_repaint(ui.ctx());
                     }
                 }
                 Event::Paste(text) => {
                     if self.send(&paste_bytes(&text)) {
                         self.mark_input_activity(now);
+                        Self::request_input_repaint(ui.ctx());
                     }
                 }
                 // winit folds BOTH Ctrl+C and Ctrl+Shift+C into `Copy` (the raw
@@ -1209,6 +1223,7 @@ impl TerminalWidget {
                     } else {
                         if self.send(&[0x03]) {
                             self.mark_input_activity(now);
+                            Self::request_input_repaint(ui.ctx());
                         }
                     }
                 }
@@ -1216,6 +1231,7 @@ impl TerminalWidget {
                 Event::Cut => {
                     if self.send(&[0x18]) {
                         self.mark_input_activity(now);
+                        Self::request_input_repaint(ui.ctx());
                     }
                 }
                 _ => {}
