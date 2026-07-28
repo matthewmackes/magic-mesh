@@ -63,7 +63,7 @@ log() { echo "==> $*"; }
 USERDATA="$(mktemp)"; trap 'rm -f "$USERDATA"' EXIT
 sed -e "s|@JOIN_TOKEN@|$JOIN_TOKEN|g" \
     -e "s|@REPO_BASEURL@|$REPO_BASEURL|g" \
-    -e "s|@RPM_URL@|${RPM_URL:-@RPM_URL@}|g" \
+    -e "s|@RPM_URL_VALUE@|${RPM_URL:-@RPM_URL@}|g" \
     "$TEMPLATE" >"$USERDATA"
 
 # 2. Ensure the DO Cloud Firewall for the lighthouse ports (idempotent, by tag).

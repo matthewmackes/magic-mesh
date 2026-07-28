@@ -19,7 +19,7 @@ set -euo pipefail
 MESH_ID="@MESH_ID@"
 ROLE="@ROLE@"                       # lighthouse|server|workstation
 REPO_BASEURL="@REPO_BASEURL@"       # gh-pages dnf channel base (no trailing /)
-RPM_URL="@RPM_URL@"                 # optional direct RPM URL (overrides the repo)
+RPM_URL="@RPM_URL_VALUE@"           # optional direct RPM URL (overrides the repo)
 ENROLL_PORT="@ENROLL_PORT@"         # /enroll HTTPS port (default 4243)
 # ---------------------------------------------------------------------------
 

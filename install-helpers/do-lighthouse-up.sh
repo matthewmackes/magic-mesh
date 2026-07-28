@@ -79,7 +79,7 @@ USERDATA="$(mktemp)"; trap 'rm -f "$USERDATA"' EXIT
 sed -e "s|@MESH_ID@|$MESH_ID|g" \
     -e "s|@ROLE@|$ROLE|g" \
     -e "s|@REPO_BASEURL@|$REPO_BASEURL|g" \
-    -e "s|@RPM_URL@|${RPM_URL:-@RPM_URL@}|g" \
+    -e "s|@RPM_URL_VALUE@|${RPM_URL:-@RPM_URL@}|g" \
     -e "s|@ENROLL_PORT@|$ENROLL_PORT|g" \
     "$TEMPLATE" >"$USERDATA"
 

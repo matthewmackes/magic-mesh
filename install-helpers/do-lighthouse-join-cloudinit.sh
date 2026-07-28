@@ -21,7 +21,7 @@ set -euo pipefail
 # ---- substituted by do-lighthouse-join.sh ---------------------------------
 JOIN_TOKEN="@JOIN_TOKEN@"            # v3 token from `mackesd add-peer --role lighthouse`
 REPO_BASEURL="@REPO_BASEURL@"       # gh-pages dnf channel base (no trailing /)
-RPM_URL="@RPM_URL@"                 # optional direct RPM URL (overrides the repo)
+RPM_URL="@RPM_URL_VALUE@"           # optional direct RPM URL (overrides the repo)
 # ---------------------------------------------------------------------------
 
 STATUS_FILE="/root/mesh-join-status.txt"
