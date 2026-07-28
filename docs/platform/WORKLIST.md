@@ -2736,6 +2736,11 @@ These decisions refine acceptance and sequencing for the active items below.
   `mde-shell-egui`/`mackesd`/`nebula` active with `NRestarts=0`. Dell remains
   unreachable directly and from `.15` (`No route to host`), so no Dell
   deployment is claimed.
+- Progress (2026-07-28 Dell route audit): the same target `172.20.146.225:22`
+  was checked from farm hosts `.50`, `.90`, `.130`, and `.170`; each host has a
+  local route entry but the connection fails with `No route to host`. This is a
+  network-path condition, not a package or SSH-key failure, and WL-UX-006
+  remains open for that explicitly requested Dell deployment evidence.
 - Progress (2026-07-28 terminal text-sync fix): accepted terminal input now
   requests an immediate repaint and a bounded 8 ms follow-up repaint while the
   PTY writer/reader completes the echo round-trip. Rendered text remains sourced
