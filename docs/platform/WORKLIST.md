@@ -19,24 +19,22 @@ instead of leaving closed work in this file.
 ## Current Snapshot - 2026-07-28 release gate
 
 - **11 active epics:** 11 `Remaining`, 0 `Blocked`; no `Needs clarification`.
-- **Release gate:** the current integrated wave passes the full `mackesd` farm
+- **Release gate (last integrated wave):** the 2026-07-28 integrated wave passes the full `mackesd` farm
   suite at **4,124 passed, 0 failed, 1 ignored**. The Fedora 44
   base/browser/thin-lighthouse RPM cut is green at **81.7 / 39.1 / 11.0 MiB**;
   the exact base RPM requires the F44 FFmpeg ABI (`libavcodec.so.62`,
   `libswresample.so.6`, `libswscale.so.9`).
-- **Live public mesh:** `ephemeral-public-20260725` now has three thin public
-  DigitalOcean lighthouses on the canonical smallest droplet shape and DNS
-  names `lighthouse1.ephemeral.team` through `lighthouse3.ephemeral.team`.
-  Lighthouses are `magic-mesh-lighthouse` only, small profile, and form a
-  healthy three-member etcd quorum at `10.42.0.1` through `10.42.0.3`.
-- **Seats:** Dell (`172.20.146.2`, overlay `10.42.0.4`) and `.15`
-  (`172.20.0.15`, overlay `10.42.0.5`) are enrolled in the new mesh with
-  `root` and `mm` key access, active `nebula`, `mackesd`, and shell services,
-  and a passing five-node overlay ping matrix against the three lighthouses.
-  Eagle was enrolled at `10.42.0.6`, but after the coordinated seat reboot it
-  dropped off both LAN and overlay (`172.20.146.13` and `10.42.0.6` unreachable
-  from dev, `.15`, Dell, and LH1); Eagle recovery is the current live hardware
-  blocker.
+- **Live public mesh:** `mcnf-clean-20260728` has three thin public
+  DigitalOcean lighthouses at `104.236.118.177`, `46.101.219.245`, and
+  `64.23.131.57`. Lighthouses are `magic-mesh-lighthouse` only, use the small
+  profile, run `12.1.1`, and form a healthy three-member etcd quorum at
+  `10.42.0.1` through `10.42.0.3`.
+- **Seats:** Dell (`172.20.146.225`, overlay `10.42.0.4`), seat 15
+  (`172.20.0.15`, overlay `10.42.0.5`), and Eagle (`172.20.146.145`, overlay
+  `10.42.0.6`) are enrolled in the new mesh. All three run `magic-mesh-12.1.1`
+  with active `nebula` and `mackesd`; a founder-side overlay ping matrix
+  reaches all six overlay members. Seat 15's lighthouse mappings were
+  refreshed to the new public endpoints after enrollment.
 - **P0:** WL-ARCH-007 (authorization mint + direct lifecycle proof),
   WL-FUNC-011 (optional real media/LLM evidence remains), WL-FUNC-016
   (native mesh clipboard lanes for seat/browser/VDI), WL-UX-010
@@ -1585,6 +1583,13 @@ These decisions refine acceptance and sequencing for the active items below.
 ### WL-FUNC-012 - Maps live-data overlays (zero-cost external feeds)
 
 - Status: Remaining
+- Progress (2026-07-28 installed-seat gap): the read-only verifier on seat 15
+  (`Basement-Test-Workstation`, overlay `10.42.0.5`) found 2 of 11 locked
+  default-on overlay topics installed (`nws-alerts` and `usgs-earthquakes`),
+  with 9 absent. No Bus publications, provider calls, or live writes were
+  performed. The seat is running the older `12.1.1-1` package; current source
+  wiring includes the absent worker families, so a current farm RPM and a
+  repeat installed-catalog proof are required before this epic can close.
 - Progress (2026-07-26 installed overlay catalog verifier): the live-mirror
   verifier now has an installed-seat catalog gate:
   `--require-installed-overlay-catalog` requires `--catalog-overlay-node` and
