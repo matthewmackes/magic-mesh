@@ -200,7 +200,9 @@ remains here under a completed status.
   `install-helpers/`, alongside the 2026-07-28 archive snapshot. The typed
   `browser-provision` seam declares a fail-closed DesktopVm desired workload
   with the 4-vCPU/8192-MiB/64-GiB baseline, strict node/name validation, and
-  deterministic daemon tests; live realization and extraction remain open.
+  deterministic daemon tests. Front Door now exposes a Browser VM workflow
+  card routed to `Surface::Browser` with guest-owned execution, VDI unavailable
+  state, and 81 focused shell tests passing; live realization and extraction remain open.
 - Remaining work:
 
   1. Re-run and review the source commit, workspace/package/process inventory,
@@ -365,9 +367,10 @@ remains here under a completed status.
   are implemented. Shared pin/save commands, events, projections, persistence,
   and projected UI affordances now have focused farm coverage. Completed
   task/action-item update, complete, reopen, membership, bounded-read, and
-  projected UI slices now also have focused farm coverage. Completed evidence
-  is in the pre-rework archive; the parity source is
-  `docs/platform/WL-FUNC-011-parity-ledger.md`.
+  projected UI slices now also have focused farm coverage. Severity-aware
+  Activity coalescing, truthful repeat counts, and visible pause/resume now
+  have nine focused tests passing. Completed evidence is in the pre-rework archive;
+  the parity source is `docs/platform/WL-FUNC-011-parity-ledger.md`.
 - Remaining work:
 
   1. Reconcile the parity ledger against current runtime/tests and leave only
@@ -587,7 +590,10 @@ remains here under a completed status.
   identity/radio/freshness/provenance baseline dual-publishes beside v1, with
   11 mesh-type and 69 worker tests passing. Maps/Car now projects bounded radio
   presence, operation, GNSS/radio freshness, and retained age; four consumer
-  tests pass. Multiple MG90s, live adapters, and route/render cutover remain.
+  tests pass. The vehicle worker now also has a bounded MG90/manager roster
+  with independent poll/heartbeat plans, deterministic latest-wins selection,
+  and explicit no-source results; the complete vehicle gate has 42 passing
+  tests. Multiple live adapters and route/render cutover remain.
 - Remaining work:
   1. Consume WL-UX-009's platform-wide Carbon-requirement retirement and update
      the Maps/Car-specific authority while retaining egui, shared `Style`,
@@ -877,6 +883,9 @@ remains here under a completed status.
   docks, and OEM capabilities. This Node now has a governed eight-section
   catalog, persistent section/search navigation, legacy route normalization,
   and visibly unavailable provider states, with focused farm coverage.
+  Its live mesh-status read model now also projects a bounded typed capability/
+  action catalog with explicit unavailable/degraded states and fail-closed
+  mutation rows; 12 focused tests pass.
 - Remaining work:
 
   1. Finish the durable This Node sidebar and search index across every
@@ -983,11 +992,13 @@ remains here under a completed status.
 - Current state: `nav_bar.rs` now owns persisted `Floating`/`Docked` placement,
   a full-width 48px Bottom taskbar with fixed 40px targets, left Start/Back/
   Home controls, a centered launcher/pin strip, right placement control,
-  overflow bounds, and a tested slide/melt transition. Start dispatches to the
+  overflow bounds, versioned ordered pin persistence, canonical focused-surface
+  underlining, and a tested slide/melt transition. Start dispatches to the
   existing Front Door search/focus path, and the old group labels/pill geometry
-  are gone. `springboard.rs` still owns grid layout, labels, keyboard selection,
-  zoom ghosts, and tile activation; pin catalog/schema/underline persistence
-  and Fleet & Mesh/Workloads exposure remain open.
+  are gone. The taskbar persistence and geometry slice has 26 focused tests
+  passing. `springboard.rs` still owns grid layout, labels, keyboard selection,
+  zoom ghosts, and tile activation; first-boot selection, pin/unpin controls,
+  overflow flyout, and Fleet & Mesh/Workloads exposure remain open.
   `Surface::FleetMesh` exists; Workloads retains the internal
   `Surface::InfraCode` identifier and an obsolete public label.
 - Remaining work:

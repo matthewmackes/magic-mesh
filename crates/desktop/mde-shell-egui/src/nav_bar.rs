@@ -46,6 +46,8 @@ const TRANSITION: Duration = Duration::from_millis(360);
 const CONFIG_FILE: &str = "settings-nav-bar.json";
 /// Keep hostile or stale dock preferences bounded before serde materializes them.
 const MAX_NAV_PREFS_BYTES: usize = 64 * 1024;
+const NAV_PREFS_SCHEMA_VERSION: u16 = 1;
+const MAX_PINNED_SURFACES: usize = Surface::ALL.len();
 static NAV_LAYER_ID_MAP_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// One action emitted by the painted controls.
@@ -92,16 +94,91 @@ impl DockMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+fn default_taskbar_pins() -> Vec<Surface> {
+    DOCK_LAUNCHER_GROUPS
+        .iter()
+        .flat_map(|group| group.surfaces.iter().copied())
+        .collect()
+}
+
+fn surface_key(surface: Surface) -> &'static str {
+    match surface {
+        Surface::FleetMesh => "fleet-mesh",
+        Surface::InfraCode => "workloads",
+        Surface::Desktop => "desktop",
+        Surface::Music => "music",
+        Surface::Media => "media",
+        Surface::Files => "files",
+        Surface::Browser => "browser",
+        Surface::Bookmarks => "bookmarks",
+        Surface::MapsLocation => "maps-location",
+        Surface::Terminal => "terminal",
+        Surface::Phones => "phones",
+        Surface::ThisNode => "this-node",
+        Surface::Communications => "mesh-teams",
+        Surface::Workbench => "workbench",
+        Surface::MeshView => "mesh-view",
+        Surface::Explorer => "explorer",
+        Surface::System => "system",
+        Surface::Storage => "storage",
+        Surface::About => "about",
+        Surface::Timers => "timers",
+        Surface::AutoHome => "auto-home",
+    }
+}
+
+fn surface_from_key(key: &str) -> Option<Surface> {
+    Surface::ALL
+        .into_iter()
+        .find(|surface| surface_key(*surface) == key)
+}
+
+fn canonical_taskbar_surface(surface: Surface) -> Option<Surface> {
+    match surface {
+        Surface::FleetMesh | Surface::Workbench | Surface::MeshView | Surface::Explorer => {
+            Some(Surface::FleetMesh)
+        }
+        Surface::ThisNode | Surface::System | Surface::Storage | Surface::About => {
+            Some(Surface::ThisNode)
+        }
+        Surface::AutoHome | Surface::Timers => None,
+        surface if Surface::ALL.contains(&surface) => Some(surface),
+        _ => None,
+    }
+}
+
+fn decode_pinned_surfaces(keys: &[String]) -> Vec<Surface> {
+    let mut surfaces = Vec::with_capacity(keys.len().min(MAX_PINNED_SURFACES));
+    for surface in keys.iter().filter_map(|key| surface_from_key(key)) {
+        if !surfaces.contains(&surface) {
+            surfaces.push(surface);
+        }
+        if surfaces.len() == MAX_PINNED_SURFACES {
+            break;
+        }
+    }
+    surfaces
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct NavBarPrefs {
     #[serde(default)]
+    schema_version: u16,
+    #[serde(default)]
     mode: DockMode,
+    #[serde(default)]
+    pinned_surfaces: Vec<String>,
 }
 
 impl Default for NavBarPrefs {
     fn default() -> Self {
         Self {
+            schema_version: NAV_PREFS_SCHEMA_VERSION,
             mode: DockMode::Floating,
+            pinned_surfaces: default_taskbar_pins()
+                .iter()
+                .map(|surface| surface_key(*surface).to_owned())
+                .collect(),
         }
     }
 }
@@ -118,6 +195,7 @@ struct TransitionState {
 pub(crate) struct State {
     mode: DockMode,
     transition: Option<TransitionState>,
+    pinned_surfaces: Vec<Surface>,
 }
 
 impl Default for State {
@@ -125,6 +203,7 @@ impl Default for State {
         Self {
             mode: DockMode::Floating,
             transition: None,
+            pinned_surfaces: default_taskbar_pins(),
         }
     }
 }
@@ -136,10 +215,11 @@ impl State {
     /// tests can exercise the docked rail without inheriting an operator's
     /// persisted navigation choice.
     #[must_use]
-    pub(crate) const fn with_mode(mode: DockMode) -> Self {
+    pub(crate) fn with_mode(mode: DockMode) -> Self {
         Self {
             mode,
             transition: None,
+            pinned_surfaces: default_taskbar_pins(),
         }
     }
 
@@ -148,13 +228,22 @@ impl State {
     #[must_use]
     pub(crate) fn load() -> Self {
         Self::default_path().map_or_else(Self::default, |path| {
-            let mode = read_bounded_config(&path)
+            let prefs = read_bounded_config(&path)
                 .ok()
                 .and_then(|json| serde_json::from_str::<NavBarPrefs>(&json).ok())
-                .map_or(DockMode::Floating, |prefs| prefs.mode);
+                .unwrap_or_default();
+            let pinned_surfaces = if prefs.schema_version == NAV_PREFS_SCHEMA_VERSION {
+                decode_pinned_surfaces(&prefs.pinned_surfaces)
+            } else {
+                // Schema zero was the placement-only format. Preserve its
+                // usable launch catalog rather than silently loading an empty
+                // taskbar when upgrading an existing seat.
+                default_taskbar_pins()
+            };
             Self {
-                mode,
+                mode: prefs.mode,
                 transition: None,
+                pinned_surfaces,
             }
         })
     }
@@ -218,6 +307,19 @@ impl State {
         ctx: &egui::Context,
         pinned_sources: &[crate::surfaces::DesktopRailSource],
     ) -> Option<Action> {
+        self.mount_with_active(ctx, pinned_sources, None)
+    }
+
+    /// Paint the dock and underline the currently focused surface when the
+    /// shell supplies one. The wrapper above keeps headless callers and older
+    /// chrome tests independent of the shell's navigation state.
+    pub(crate) fn mount_with_active(
+        &mut self,
+        ctx: &egui::Context,
+        pinned_sources: &[crate::surfaces::DesktopRailSource],
+        active_surface: Option<Surface>,
+    ) -> Option<Action> {
+        let active_surface = active_surface.and_then(canonical_taskbar_surface);
         if ctx.cumulative_pass_nr() == 0 {
             return None;
         }
@@ -323,6 +425,16 @@ impl State {
                             Style::NAV_BAR_ICON,
                         );
                     }
+                    if control.surface == active_surface {
+                        let underline = egui::Rect::from_min_max(
+                            egui::pos2(
+                                control.rect.left() + Style::SP_XS,
+                                control.rect.bottom() - 2.0,
+                            ),
+                            egui::pos2(control.rect.right() - Style::SP_XS, control.rect.bottom()),
+                        );
+                        painter.rect_filled(underline, egui::CornerRadius::ZERO, Style::ACCENT);
+                    }
                     let label = control_label(*control, pinned_sources);
                     install_accessibility(
                         ctx,
@@ -354,8 +466,8 @@ impl State {
     }
 
     fn geometry_for(&self, screen: egui::Rect, now: Instant, pinned_count: usize) -> Geometry {
-        let floating = floating_geometry_for(screen, pinned_count);
-        let docked = docked_geometry_for(screen, pinned_count);
+        let floating = floating_geometry_for_catalog(screen, pinned_count, &self.pinned_surfaces);
+        let docked = docked_geometry_for_catalog(screen, pinned_count, &self.pinned_surfaces);
         let Some(transition) = self.transition else {
             return match self.mode {
                 DockMode::Floating => floating,
@@ -395,7 +507,15 @@ impl State {
 
     fn save(&self) {
         if let Some(path) = Self::default_path() {
-            let prefs = NavBarPrefs { mode: self.mode };
+            let prefs = NavBarPrefs {
+                schema_version: NAV_PREFS_SCHEMA_VERSION,
+                mode: self.mode,
+                pinned_surfaces: self
+                    .pinned_surfaces
+                    .iter()
+                    .map(|surface| surface_key(*surface).to_owned())
+                    .collect(),
+            };
             let _ = save_to(&path, prefs);
         }
     }
@@ -553,14 +673,15 @@ fn floating_geometry(screen: egui::Rect) -> Geometry {
 }
 
 fn dock_launcher_count() -> usize {
-    DOCK_LAUNCHER_GROUPS
-        .iter()
-        .map(|group| group.surfaces.len())
-        .sum()
+    default_taskbar_pins().len()
 }
 
 fn dock_control_capacity(pinned_count: usize) -> usize {
     4 + dock_launcher_count() + pinned_count
+}
+
+fn dock_control_capacity_for(pinned_count: usize, surface_count: usize) -> usize {
+    4 + surface_count + pinned_count
 }
 
 fn control_span(count: usize, edge: f32, gap: f32) -> f32 {
@@ -571,9 +692,14 @@ fn control_span(count: usize, edge: f32, gap: f32) -> f32 {
     }
 }
 
-fn effective_floating_pinned_count(screen: egui::Rect, requested: usize, gap: f32) -> usize {
+fn effective_floating_pinned_count_for(
+    screen: egui::Rect,
+    requested: usize,
+    gap: f32,
+    surface_count: usize,
+) -> usize {
     let requested = requested.min(MAX_PINNED_SOURCES);
-    let visible_surfaces = effective_floating_surface_count(screen, gap);
+    let visible_surfaces = effective_floating_surface_count_for(screen, gap, surface_count);
     let center_capacity = floating_center_capacity(screen, gap);
     let available_pins = center_capacity.saturating_sub(visible_surfaces);
     for pinned_count in (0..=requested).rev() {
@@ -584,8 +710,12 @@ fn effective_floating_pinned_count(screen: egui::Rect, requested: usize, gap: f3
     0
 }
 
-fn effective_floating_surface_count(screen: egui::Rect, gap: f32) -> usize {
-    floating_center_capacity(screen, gap).min(dock_launcher_count())
+fn effective_floating_surface_count_for(
+    screen: egui::Rect,
+    gap: f32,
+    surface_count: usize,
+) -> usize {
+    floating_center_capacity(screen, gap).min(surface_count)
 }
 
 fn floating_center_bounds(screen: egui::Rect, gap: f32) -> (f32, f32) {
@@ -601,9 +731,18 @@ fn floating_center_capacity(screen: egui::Rect, gap: f32) -> usize {
 }
 
 fn floating_geometry_for(screen: egui::Rect, pinned_count: usize) -> Geometry {
+    floating_geometry_for_catalog(screen, pinned_count, &default_taskbar_pins())
+}
+
+fn floating_geometry_for_catalog(
+    screen: egui::Rect,
+    pinned_count: usize,
+    surfaces: &[Surface],
+) -> Geometry {
     let gap = FLOATING_GAP;
-    let surface_count = effective_floating_surface_count(screen, gap);
-    let pinned_count = effective_floating_pinned_count(screen, pinned_count, gap);
+    let surface_count = effective_floating_surface_count_for(screen, gap, surfaces.len());
+    let pinned_count =
+        effective_floating_pinned_count_for(screen, pinned_count, gap, surfaces.len());
     let edge = CONTROL_EDGE;
     let outer = egui::Rect::from_min_size(
         egui::pos2(screen.left(), screen.bottom() - TASKBAR_H),
@@ -612,7 +751,7 @@ fn floating_geometry_for(screen: egui::Rect, pinned_count: usize) -> Geometry {
     let y = outer.top() + (TASKBAR_H - edge) / 2.0;
     let left_start = outer.left() + Style::SP_L;
     let right_x = outer.right() - Style::SP_L - edge;
-    let mut controls = Vec::with_capacity(dock_control_capacity(pinned_count));
+    let mut controls = Vec::with_capacity(dock_control_capacity_for(pinned_count, surface_count));
     let group_labels = Vec::new();
     let mut cursor_x = left_start;
     for kind in [ControlKind::Start, ControlKind::Back, ControlKind::Home] {
@@ -629,11 +768,7 @@ fn floating_geometry_for(screen: egui::Rect, pinned_count: usize) -> Geometry {
     let (center_left, center_right) = floating_center_bounds(screen, gap);
     let center_start = (center_left + center_right) / 2.0 - center_span / 2.0;
     cursor_x = center_start;
-    for surface in DOCK_LAUNCHER_GROUPS
-        .iter()
-        .flat_map(|group| group.surfaces.iter().copied())
-        .take(surface_count)
-    {
+    for surface in surfaces.iter().copied().take(surface_count) {
         controls.push(Control {
             kind: ControlKind::SurfaceLauncher,
             rect: egui::Rect::from_min_size(egui::pos2(cursor_x, y), egui::vec2(edge, edge)),
@@ -685,17 +820,20 @@ fn docked_control_fits(screen: egui::Rect, cursor_y: f32) -> bool {
     cursor_y + CONTROL_EDGE <= docked_content_bottom(screen)
 }
 
-fn docked_group_fits_one_control(screen: egui::Rect, cursor_y: f32, label_h: f32) -> bool {
-    cursor_y + label_h + Style::SP_XS + CONTROL_EDGE <= docked_content_bottom(screen)
+fn docked_geometry_for(screen: egui::Rect, pinned_count: usize) -> Geometry {
+    docked_geometry_for_catalog(screen, pinned_count, &default_taskbar_pins())
 }
 
-fn docked_geometry_for(screen: egui::Rect, pinned_count: usize) -> Geometry {
+fn docked_geometry_for_catalog(
+    screen: egui::Rect,
+    pinned_count: usize,
+    surfaces: &[Surface],
+) -> Geometry {
     let outer = egui::Rect::from_min_size(screen.left_top(), egui::vec2(DOCKED_W, screen.height()));
     let pinned_count = pinned_count.min(MAX_PINNED_SOURCES);
-    let mut controls = Vec::with_capacity(dock_control_capacity(pinned_count));
-    let mut group_labels = Vec::with_capacity(DOCK_LAUNCHER_GROUPS.len());
+    let mut controls = Vec::with_capacity(dock_control_capacity_for(pinned_count, surfaces.len()));
+    let group_labels = Vec::new();
     let mut cursor_y = screen.top() + STATUS_BAR_H + Style::SP_S;
-    let label_h = TypographyRole::Caption.line_height().ceil();
     for kind in [ControlKind::Start, ControlKind::Back, ControlKind::Home] {
         controls.push(Control {
             kind,
@@ -709,35 +847,20 @@ fn docked_geometry_for(screen: egui::Rect, pinned_count: usize) -> Geometry {
         cursor_y += CONTROL_EDGE + Style::SP_XS;
     }
     cursor_y += Style::SP_S - Style::SP_XS;
-    for group in DOCK_LAUNCHER_GROUPS {
-        if !docked_group_fits_one_control(screen, cursor_y, label_h) {
+    for surface in surfaces.iter().copied() {
+        if !docked_control_fits(screen, cursor_y) {
             break;
         }
-        group_labels.push(GroupLabel {
-            label: group.label,
-            rect: egui::Rect::from_min_max(
-                egui::pos2(outer.left() + Style::SP_XS, cursor_y),
-                egui::pos2(outer.right() - Style::SP_XS, cursor_y + label_h),
+        controls.push(Control {
+            kind: ControlKind::SurfaceLauncher,
+            rect: egui::Rect::from_min_size(
+                egui::pos2(outer.center().x - CONTROL_EDGE / 2.0, cursor_y),
+                egui::vec2(CONTROL_EDGE, CONTROL_EDGE),
             ),
-            accent: group.accent,
+            surface: Some(surface),
+            source_index: None,
         });
-        cursor_y += label_h + Style::SP_XS;
-        for surface in group.surfaces {
-            if !docked_control_fits(screen, cursor_y) {
-                break;
-            }
-            controls.push(Control {
-                kind: ControlKind::SurfaceLauncher,
-                rect: egui::Rect::from_min_size(
-                    egui::pos2(outer.center().x - CONTROL_EDGE / 2.0, cursor_y),
-                    egui::vec2(CONTROL_EDGE, CONTROL_EDGE),
-                ),
-                surface: Some(*surface),
-                source_index: None,
-            });
-            cursor_y += CONTROL_EDGE + Style::SP_XS;
-        }
-        cursor_y += Style::SP_S - Style::SP_XS;
+        cursor_y += CONTROL_EDGE + Style::SP_XS;
     }
     for source_index in 0..pinned_count {
         if !docked_control_fits(screen, cursor_y) {
@@ -1187,7 +1310,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_to_an_unpinned_springboard_dock() {
+    fn defaults_to_catalogued_springboard_dock() {
         assert_eq!(State::default().mode, DockMode::Floating);
         assert_eq!(TASKBAR_H, 48.0);
         assert_eq!(DOCKED_W, 56.0);
@@ -1236,7 +1359,7 @@ mod tests {
         assert_eq!(docked.controls[0].rect.top(), STATUS_BAR_H + Style::SP_S);
         assert_eq!(docked.controls.len(), dock_control_capacity(0));
         assert!(floating.group_labels.is_empty());
-        assert_eq!(docked.group_labels.len(), DOCK_LAUNCHER_GROUPS.len());
+        assert!(docked.group_labels.is_empty());
     }
 
     #[test]
@@ -1357,6 +1480,7 @@ mod tests {
                             to,
                             started: start,
                         }),
+                        pinned_surfaces: default_taskbar_pins(),
                     };
                     for offset in transition_offsets {
                         assert_hit_targets_inside_backing(
@@ -1386,6 +1510,7 @@ mod tests {
             &path,
             NavBarPrefs {
                 mode: DockMode::Docked,
+                ..NavBarPrefs::default()
             },
         )
         .expect("write nav-bar prefs");
@@ -1399,6 +1524,34 @@ mod tests {
             .map_or(DockMode::Floating, |prefs| prefs.mode);
         assert_eq!(fallback, DockMode::Floating);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn taskbar_surface_preferences_are_versioned_and_fail_closed() {
+        let keys = vec![
+            "browser".to_owned(),
+            "browser".to_owned(),
+            "not-a-surface".to_owned(),
+            "maps-location".to_owned(),
+            "this-node".to_owned(),
+        ];
+        assert_eq!(
+            decode_pinned_surfaces(&keys),
+            vec![Surface::Browser, Surface::MapsLocation, Surface::ThisNode]
+        );
+
+        let prefs = NavBarPrefs {
+            schema_version: NAV_PREFS_SCHEMA_VERSION,
+            mode: DockMode::Docked,
+            pinned_surfaces: vec!["browser".to_owned(), "maps-location".to_owned()],
+        };
+        let json = serde_json::to_string(&prefs).expect("encode taskbar preferences");
+        let decoded: NavBarPrefs = serde_json::from_str(&json).expect("decode taskbar preferences");
+        assert_eq!(decoded.schema_version, NAV_PREFS_SCHEMA_VERSION);
+        assert_eq!(
+            decode_pinned_surfaces(&decoded.pinned_surfaces),
+            vec![Surface::Browser, Surface::MapsLocation]
+        );
     }
 
     #[test]
@@ -1446,6 +1599,7 @@ mod tests {
             &link,
             NavBarPrefs {
                 mode: DockMode::Docked,
+                ..NavBarPrefs::default()
             },
         )
         .expect("replace preference symlink atomically");
@@ -1476,6 +1630,7 @@ mod tests {
             &parent.join(CONFIG_FILE),
             NavBarPrefs {
                 mode: DockMode::Docked,
+                ..NavBarPrefs::default()
             },
         );
 
@@ -1501,6 +1656,7 @@ mod tests {
             let mut state = State {
                 mode,
                 transition: None,
+                pinned_surfaces: default_taskbar_pins(),
             };
 
             // The production mount waits for egui's initial pass, and Area adds
@@ -2200,6 +2356,7 @@ mod tests {
                 to: DockMode::Docked,
                 started: transition_started,
             }),
+            pinned_surfaces: default_taskbar_pins(),
         };
         let ctx = egui::Context::default();
         let input = |events| egui::RawInput {

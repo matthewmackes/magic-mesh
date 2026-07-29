@@ -1542,7 +1542,10 @@ impl Shell {
     /// app overlays, but before the lock curtain's absolute top layer.
     fn mount_navigation_bar(&mut self, ctx: &egui::Context) {
         let pinned_sources = self.chooser.pinned_rail_sources();
-        if let Some(action) = self.nav_bar.mount(ctx, &pinned_sources) {
+        if let Some(action) =
+            self.nav_bar
+                .mount_with_active(ctx, &pinned_sources, Some(self.nav.surface))
+        {
             self.apply_nav_bar_action(action, ctx);
         }
     }

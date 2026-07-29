@@ -94,8 +94,8 @@ fn reject(verb_name: &str, reason: String) -> CloudReply {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mackes_mesh_types::cloud::DeliveryType;
     use crate::workers::cloud::reconcile;
+    use mackes_mesh_types::cloud::DeliveryType;
     use tempfile::tempdir;
 
     fn body(node: &str, name: Option<&str>) -> CloudActionBody {

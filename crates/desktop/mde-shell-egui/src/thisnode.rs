@@ -283,6 +283,275 @@ impl NodeStatus {
             format!("{}h ago", secs / 3600)
         })
     }
+
+    /// Project the bounded, read-only capabilities this snapshot can support.
+    ///
+    /// The snapshot is an observation boundary, not a provider registry. A
+    /// capability is therefore only `Available` when the corresponding fact is
+    /// actually present; missing node-local providers are represented as typed
+    /// unavailable states instead of becoming speculative controls.
+    fn capability_projection(&self) -> [CapabilityProjection; CAPABILITY_CATALOG.len()] {
+        CAPABILITY_CATALOG.map(|capability| CapabilityProjection {
+            capability,
+            availability: self.capability_availability(capability),
+        })
+    }
+
+    fn capability_availability(&self, capability: NodeCapability) -> CapabilityAvailability {
+        match capability {
+            NodeCapability::MeshSnapshot => {
+                if self.seen {
+                    CapabilityAvailability::Available(
+                        "Live world-readable mesh-status snapshot is present.",
+                    )
+                } else {
+                    CapabilityAvailability::Unavailable(
+                        "The mesh-status snapshot has not arrived or is unreadable.",
+                    )
+                }
+            }
+            NodeCapability::NodeIdentity => {
+                if !self.seen {
+                    CapabilityAvailability::Unavailable(
+                        "Identity is unavailable until the mesh-status snapshot is read.",
+                    )
+                } else if self.in_directory {
+                    CapabilityAvailability::Available(
+                        "Hostname, role, overlay address, and presence are live snapshot facts.",
+                    )
+                } else {
+                    CapabilityAvailability::Degraded(
+                        "The snapshot names this node, but its peer-directory row is not present.",
+                    )
+                }
+            }
+            NodeCapability::ServiceHealth => {
+                if !self.seen {
+                    CapabilityAvailability::Unavailable(
+                        "Service health is unavailable until the mesh-status snapshot is read.",
+                    )
+                } else if !self.services.is_empty() {
+                    CapabilityAvailability::Available(
+                        "Published daemon health is available for the reported services.",
+                    )
+                } else if self.in_directory {
+                    CapabilityAvailability::Degraded(
+                        "This node is in the directory, but it has not reported service health.",
+                    )
+                } else {
+                    CapabilityAvailability::Unavailable(
+                        "This node has no directory row from which to read service health.",
+                    )
+                }
+            }
+            NodeCapability::MeshContext => {
+                if self.seen {
+                    CapabilityAvailability::Available(
+                        "Peer counts and leader state are read from the live snapshot.",
+                    )
+                } else {
+                    CapabilityAvailability::Unavailable(
+                        "Mesh context is unavailable until the mesh-status snapshot is read.",
+                    )
+                }
+            }
+            NodeCapability::UpdateStatus => {
+                if !self.seen {
+                    CapabilityAvailability::Unavailable(
+                        "Version posture is unavailable until the mesh-status snapshot is read.",
+                    )
+                } else if self.version.is_some() {
+                    CapabilityAvailability::Available(
+                        "Installed version and the mesh update target are read-only snapshot facts.",
+                    )
+                } else {
+                    CapabilityAvailability::Degraded(
+                        "The snapshot has no installed version for this node.",
+                    )
+                }
+            }
+            NodeCapability::LocalTelemetry => CapabilityAvailability::Unavailable(
+                "CPU, memory, and disk telemetry is not published to this snapshot surface.",
+            ),
+            NodeCapability::MutationProviders => CapabilityAvailability::Unavailable(
+                "No typed node-local mutation provider is advertised by mesh-status.",
+            ),
+        }
+    }
+
+    /// Project every mutation/provider action through the same fail-closed
+    /// boundary. The snapshot can expose an update target or service health,
+    /// but it cannot authorize a write and it does not name a provider that can
+    /// execute one. Keeping these as typed rows makes that boundary visible and
+    /// prevents a future button from silently turning a read model into a writer.
+    fn action_projection(&self) -> [ActionProjection; ACTION_CATALOG.len()] {
+        ACTION_CATALOG.map(|action| ActionProjection {
+            action,
+            availability: self.action_availability(action),
+        })
+    }
+
+    fn action_availability(&self, action: ThisNodeAction) -> CapabilityAvailability {
+        match action {
+            ThisNodeAction::RestartService => {
+                if self.services.is_empty() {
+                    CapabilityAvailability::Unavailable(
+                        "No reported service target is available for a restart request.",
+                    )
+                } else {
+                    CapabilityAvailability::Unavailable(
+                        "Service health is read-only here; no typed service-control provider is connected.",
+                    )
+                }
+            }
+            ThisNodeAction::ApplyUpdate => {
+                if self.update_available {
+                    CapabilityAvailability::Unavailable(
+                        "An update target is visible, but no typed update provider is connected.",
+                    )
+                } else {
+                    CapabilityAvailability::Unavailable(
+                        "No pending update action is advertised by the live snapshot.",
+                    )
+                }
+            }
+            ThisNodeAction::ChangeConnectivity => CapabilityAvailability::Unavailable(
+                "NetworkManager/ModemManager mutation is not connected to This Node.",
+            ),
+            ThisNodeAction::ChangePowerProfile => CapabilityAvailability::Unavailable(
+                "Power-profile mutation is not connected to a typed local provider.",
+            ),
+            ThisNodeAction::ConfigureHardware => CapabilityAvailability::Unavailable(
+                "Hardware/OEM mutation is not connected to a typed, bounded provider.",
+            ),
+        }
+    }
+}
+
+/// Fixed capability identifiers for the This Node read model. Keep this catalog
+/// finite: a remote snapshot may describe services, but it cannot create an
+/// unbounded set of UI capabilities or privileged operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeCapability {
+    MeshSnapshot,
+    NodeIdentity,
+    ServiceHealth,
+    MeshContext,
+    UpdateStatus,
+    LocalTelemetry,
+    MutationProviders,
+}
+
+impl NodeCapability {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::MeshSnapshot => "Mesh status snapshot",
+            Self::NodeIdentity => "Node identity",
+            Self::ServiceHealth => "Service health",
+            Self::MeshContext => "Mesh context",
+            Self::UpdateStatus => "Version posture",
+            Self::LocalTelemetry => "Node telemetry",
+            Self::MutationProviders => "Mutation providers",
+        }
+    }
+
+    const fn description(self) -> &'static str {
+        match self {
+            Self::MeshSnapshot => "Bounded source for this surface",
+            Self::NodeIdentity => "Hostname, role, overlay, and presence",
+            Self::ServiceHealth => "Published daemon health rows",
+            Self::MeshContext => "Peer count and elected leader",
+            Self::UpdateStatus => "Installed version and update target",
+            Self::LocalTelemetry => "CPU, memory, and disk readings",
+            Self::MutationProviders => "Typed local control backends",
+        }
+    }
+}
+
+const CAPABILITY_CATALOG: [NodeCapability; 7] = [
+    NodeCapability::MeshSnapshot,
+    NodeCapability::NodeIdentity,
+    NodeCapability::ServiceHealth,
+    NodeCapability::MeshContext,
+    NodeCapability::UpdateStatus,
+    NodeCapability::LocalTelemetry,
+    NodeCapability::MutationProviders,
+];
+
+/// A capability's honest state and the reason the UI can show to an operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CapabilityAvailability {
+    Available(&'static str),
+    Degraded(&'static str),
+    Unavailable(&'static str),
+}
+
+impl CapabilityAvailability {
+    const fn tone(self) -> Color32 {
+        match self {
+            Self::Available(_) => Style::OK,
+            Self::Degraded(_) => Style::WARN,
+            Self::Unavailable(_) => Style::TEXT_DIM,
+        }
+    }
+
+    const fn word(self) -> &'static str {
+        match self {
+            Self::Available(_) => "available",
+            Self::Degraded(_) => "degraded",
+            Self::Unavailable(_) => "unavailable",
+        }
+    }
+
+    const fn detail(self) -> &'static str {
+        match self {
+            Self::Available(detail) | Self::Degraded(detail) | Self::Unavailable(detail) => detail,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CapabilityProjection {
+    capability: NodeCapability,
+    availability: CapabilityAvailability,
+}
+
+/// Typed actions that this read-only snapshot may describe, but not execute.
+/// The fixed list is intentionally small and provider-neutral; arbitrary verbs,
+/// paths, shell commands, and guessed targets never enter the UI model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThisNodeAction {
+    RestartService,
+    ApplyUpdate,
+    ChangeConnectivity,
+    ChangePowerProfile,
+    ConfigureHardware,
+}
+
+impl ThisNodeAction {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::RestartService => "Restart a service",
+            Self::ApplyUpdate => "Apply node update",
+            Self::ChangeConnectivity => "Change connectivity",
+            Self::ChangePowerProfile => "Change power profile",
+            Self::ConfigureHardware => "Configure hardware",
+        }
+    }
+}
+
+const ACTION_CATALOG: [ThisNodeAction; 5] = [
+    ThisNodeAction::RestartService,
+    ThisNodeAction::ApplyUpdate,
+    ThisNodeAction::ChangeConnectivity,
+    ThisNodeAction::ChangePowerProfile,
+    ThisNodeAction::ConfigureHardware,
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ActionProjection {
+    action: ThisNodeAction,
+    availability: CapabilityAvailability,
 }
 
 /// Directory presence tier → tone: online is healthy, idle warns, offline is a
@@ -383,6 +652,7 @@ fn show_status(ui: &mut egui::Ui, status: &NodeStatus) {
             .color(Style::TEXT_DIM)
             .size(Style::SMALL),
         );
+        show_capability_surface(ui, status);
         return;
     }
 
@@ -415,7 +685,100 @@ fn show_status(ui: &mut egui::Ui, status: &NodeStatus) {
                 "Live CPU, memory, and disk aren't published to this surface — the shell \
                      reads the mesh directory, not node-local telemetry.",
             );
+            show_capability_surface(ui, status);
         });
+}
+
+/// Render the bounded This Node capability/action surface. Capability rows are
+/// projections of the live snapshot; action rows are deliberately disabled
+/// because this state path has no provider or mutation writer. That distinction
+/// is visible in the UI rather than being hidden behind a no-op button.
+fn show_capability_surface(ui: &mut egui::Ui, status: &NodeStatus) {
+    ui.add_space(Style::SP_S);
+    ui.label(
+        RichText::new("Capabilities")
+            .color(Style::TEXT_DIM)
+            .size(Style::SMALL),
+    );
+    ui.group(|ui| {
+        for projection in status.capability_projection() {
+            show_capability_row(ui, projection);
+        }
+    });
+
+    ui.add_space(Style::SP_S);
+    ui.label(
+        RichText::new("Typed node actions")
+            .color(Style::TEXT_DIM)
+            .size(Style::SMALL),
+    );
+    ui.group(|ui| {
+        for projection in status.action_projection() {
+            show_action_row(ui, projection);
+        }
+        ui.add_space(Style::SP_XS);
+        mde_egui::muted_note(
+            ui,
+            "Actions stay disabled: this snapshot is read-only and advertises no \
+             typed provider or authorization lane for local mutation.",
+        );
+    });
+}
+
+fn show_capability_row(ui: &mut egui::Ui, projection: CapabilityProjection) {
+    let availability = projection.availability;
+    ui.horizontal_wrapped(|ui| {
+        ui.label(
+            RichText::new(DOT)
+                .color(availability.tone())
+                .size(Style::SMALL),
+        );
+        ui.add_space(Style::SP_XS);
+        ui.label(
+            RichText::new(projection.capability.label())
+                .color(Style::TEXT)
+                .size(Style::SMALL)
+                .strong(),
+        );
+        ui.add_space(Style::SP_S);
+        ui.colored_label(
+            availability.tone(),
+            RichText::new(availability.word()).size(Style::SMALL),
+        );
+        ui.add_space(Style::SP_S);
+        ui.colored_label(
+            Style::TEXT_DIM,
+            RichText::new(projection.capability.description()).size(Style::SMALL),
+        );
+    });
+    ui.label(
+        RichText::new(availability.detail())
+            .color(Style::TEXT_DIM)
+            .size(Style::SMALL),
+    );
+}
+
+fn show_action_row(ui: &mut egui::Ui, projection: ActionProjection) {
+    let availability = projection.availability;
+    ui.horizontal_wrapped(|ui| {
+        // This is intentionally disabled unconditionally. No current action has
+        // a writer seam, and a future read-model change must not accidentally
+        // turn `Available` into an unaudited mutation from this `&self` path.
+        let response = ui.add_enabled(
+            false,
+            egui::Button::new(RichText::new(projection.action.label()).size(Style::SMALL)),
+        );
+        response.on_hover_text(availability.detail());
+        ui.colored_label(
+            availability.tone(),
+            RichText::new(availability.word()).size(Style::SMALL),
+        );
+        ui.add_space(Style::SP_XS);
+        ui.colored_label(
+            Style::TEXT_DIM,
+            RichText::new(availability.detail()).size(Style::SMALL),
+        );
+    });
 }
 
 /// The identity card: hostname + role + a leader marker, then overlay IP, cipher,
@@ -680,6 +1043,72 @@ mod tests {
             renders(&s),
             "the live ThisNode panel produced no draw primitives"
         );
+    }
+
+    #[test]
+    fn capability_projection_is_fixed_and_snapshot_driven() {
+        let unseen = NodeStatus::default();
+        let unseen_caps = unseen.capability_projection();
+        assert_eq!(unseen_caps.len(), CAPABILITY_CATALOG.len());
+        assert!(matches!(
+            unseen_caps[0].availability,
+            CapabilityAvailability::Unavailable(_)
+        ));
+        assert!(matches!(
+            unseen_caps[5].availability,
+            CapabilityAvailability::Unavailable(_)
+        ));
+
+        let live = NodeStatus::project(&snapshot("this-node", "lh-01"), "fallback");
+        let caps = live.capability_projection();
+        assert!(matches!(
+            caps.iter()
+                .find(|projection| projection.capability == NodeCapability::MeshSnapshot)
+                .expect("mesh snapshot capability")
+                .availability,
+            CapabilityAvailability::Available(_)
+        ));
+        assert!(matches!(
+            caps.iter()
+                .find(|projection| projection.capability == NodeCapability::ServiceHealth)
+                .expect("service health capability")
+                .availability,
+            CapabilityAvailability::Available(_)
+        ));
+        assert!(matches!(
+            caps.iter()
+                .find(|projection| projection.capability == NodeCapability::LocalTelemetry)
+                .expect("local telemetry capability")
+                .availability,
+            CapabilityAvailability::Unavailable(_)
+        ));
+        assert!(matches!(
+            caps.iter()
+                .find(|projection| projection.capability == NodeCapability::MutationProviders)
+                .expect("mutation provider capability")
+                .availability,
+            CapabilityAvailability::Unavailable(_)
+        ));
+    }
+
+    #[test]
+    fn typed_mutation_actions_remain_fail_closed_with_live_facts() {
+        let live = NodeStatus::project(&snapshot("this-node", "lh-01"), "fallback");
+        let actions = live.action_projection();
+        assert_eq!(actions.len(), ACTION_CATALOG.len());
+        assert!(actions.iter().all(|projection| matches!(
+            projection.availability,
+            CapabilityAvailability::Unavailable(_)
+        )));
+
+        let update = actions
+            .iter()
+            .find(|projection| projection.action == ThisNodeAction::ApplyUpdate)
+            .expect("update action");
+        assert!(update.availability.detail().contains("update target"));
+        assert!(actions
+            .iter()
+            .any(|projection| projection.action == ThisNodeAction::ChangeConnectivity));
     }
 
     #[test]

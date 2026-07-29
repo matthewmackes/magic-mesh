@@ -53,14 +53,15 @@
 
 #![cfg(feature = "async-services")]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, UdpSocket};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mackes_mesh_types::vehicle::{
     parse_gpgga, vehicle_state_topic, vehicle_state_v2_topic, CellLink, GpsFix, ImuSample,
@@ -681,6 +682,676 @@ fn parse_endpoint(raw: &str) -> (String, u16) {
     }
 }
 
+// ─────────────────────── bounded multi-source roster seam ───────────────────────
+
+/// Maximum number of distinct MG90 source identities in one roster.
+///
+/// This is a scheduler/read-model seam, not a general fleet-management store. A
+/// bounded roster keeps a bad or untrusted discovery input from turning one worker
+/// into an unbounded collection of probes or retained snapshots.
+pub const MAX_VEHICLE_ROSTER_SOURCES: usize = 16;
+
+/// Maximum number of management nodes represented by one roster.
+pub const MAX_VEHICLE_ROSTER_MANAGERS: usize = 8;
+
+/// Maximum number of `(MG90, manager)` assignments retained by one roster.
+pub const MAX_VEHICLE_ROSTER_ASSIGNMENTS: usize = 32;
+
+/// The default heartbeat for an opt-in multi-source roster. The legacy single-
+/// gateway worker continues to use [`POLL`] for both its poll and heartbeat.
+pub const ROSTER_HEARTBEAT: Duration = Duration::from_secs(2);
+
+const MIN_ROSTER_INTERVAL: Duration = Duration::from_millis(1);
+const MAX_ROSTER_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+const MAX_ROSTER_ID_BYTES: usize = 128;
+
+/// Stable identity for one MG90 source.
+///
+/// This is deliberately separate from a gateway endpoint and from the manager
+/// node. In production it is the confirmed MG90 ESN; an endpoint, host name, or
+/// vector position is not a stable source identity and cannot be substituted.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct VehicleSourceId(String);
+
+impl VehicleSourceId {
+    /// Validate and construct a source identity. The restricted token shape is
+    /// suitable for the identity-addressed Bus topic and prevents path-like ids.
+    pub fn new(value: impl Into<String>) -> Result<Self, VehicleRosterError> {
+        let value = value.into();
+        validate_roster_id(&value, "source", VehicleRosterError::InvalidSourceId)?;
+        Ok(Self(value))
+    }
+
+    /// Borrow the stable identity token.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for VehicleSourceId {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl fmt::Display for VehicleSourceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Errors from configuring or ingesting the bounded vehicle roster seam.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VehicleRosterError {
+    /// A source identity was empty, oversized, or path-like.
+    InvalidSourceId(String),
+    /// A manager identity was empty, oversized, or path-like.
+    InvalidManagerId(String),
+    /// A poll or heartbeat interval was outside the bounded scheduler range.
+    InvalidPollPlan(String),
+    /// The source-count bound was reached.
+    SourceCapacity,
+    /// The manager-count bound was reached.
+    ManagerCapacity,
+    /// The assignment-count bound was reached.
+    AssignmentCapacity,
+    /// The same source is already assigned to this manager.
+    DuplicateAssignment {
+        /// Stable MG90 source identity.
+        source_id: VehicleSourceId,
+        /// Management node identity.
+        manager_id: String,
+    },
+    /// An observation was received for an assignment not present in the roster.
+    UnregisteredAssignment {
+        /// Stable MG90 source identity.
+        source_id: VehicleSourceId,
+        /// Management node identity.
+        manager_id: String,
+    },
+    /// The confirmed identity in a snapshot did not match the roster key.
+    IdentityMismatch {
+        /// Stable MG90 source identity expected by the roster.
+        expected: VehicleSourceId,
+        /// Identity reported by the snapshot.
+        reported: String,
+        /// Management node that supplied the snapshot.
+        manager_id: String,
+    },
+}
+
+impl fmt::Display for VehicleRosterError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidSourceId(detail) => write!(f, "invalid vehicle source id: {detail}"),
+            Self::InvalidManagerId(detail) => write!(f, "invalid vehicle manager id: {detail}"),
+            Self::InvalidPollPlan(detail) => write!(f, "invalid vehicle poll plan: {detail}"),
+            Self::SourceCapacity => write!(f, "vehicle source roster capacity reached"),
+            Self::ManagerCapacity => write!(f, "vehicle manager roster capacity reached"),
+            Self::AssignmentCapacity => write!(f, "vehicle roster assignment capacity reached"),
+            Self::DuplicateAssignment {
+                source_id,
+                manager_id,
+            } => write!(
+                f,
+                "vehicle source {source_id} already assigned to manager {manager_id}"
+            ),
+            Self::UnregisteredAssignment {
+                source_id,
+                manager_id,
+            } => write!(
+                f,
+                "vehicle source {source_id} is not assigned to manager {manager_id}"
+            ),
+            Self::IdentityMismatch {
+                expected,
+                reported,
+                manager_id,
+            } => write!(
+                f,
+                "vehicle source {expected} reported identity {reported} from manager {manager_id}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for VehicleRosterError {}
+
+/// Per-assignment polling and heartbeat cadence.
+///
+/// `poll` is the full existing [`VehicleWorker`] fold. `heartbeat` only governs
+/// when a previously accepted snapshot may be emitted again; it never authorizes
+/// fabricating a fresh state when no accepted snapshot exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VehiclePollPlan {
+    /// Full source poll interval.
+    pub poll: Duration,
+    /// Independent latest-snapshot heartbeat interval.
+    pub heartbeat: Duration,
+}
+
+impl VehiclePollPlan {
+    /// Build a plan and reject zero, sub-millisecond, or excessively long periods.
+    pub fn new(poll: Duration, heartbeat: Duration) -> Result<Self, VehicleRosterError> {
+        let plan = Self { poll, heartbeat };
+        plan.validate()?;
+        Ok(plan)
+    }
+
+    /// The compatibility plan for the existing one-gateway worker.
+    #[must_use]
+    pub const fn single_gateway(poll: Duration) -> Self {
+        Self {
+            poll,
+            heartbeat: poll,
+        }
+    }
+
+    /// A multi-source default with the worker's normal poll and a separate
+    /// two-second heartbeat.
+    #[must_use]
+    pub const fn multi_source(poll: Duration) -> Self {
+        Self {
+            poll,
+            heartbeat: ROSTER_HEARTBEAT,
+        }
+    }
+
+    fn validate(self) -> Result<(), VehicleRosterError> {
+        for (name, interval) in [("poll", self.poll), ("heartbeat", self.heartbeat)] {
+            if interval < MIN_ROSTER_INTERVAL || interval > MAX_ROSTER_INTERVAL {
+                return Err(VehicleRosterError::InvalidPollPlan(format!(
+                    "{name} must be between {:?} and {:?}",
+                    MIN_ROSTER_INTERVAL, MAX_ROSTER_INTERVAL
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Default for VehiclePollPlan {
+    fn default() -> Self {
+        Self::single_gateway(POLL)
+    }
+}
+
+/// One scheduled action returned by [`VehicleRoster::take_due`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum VehicleScheduleKind {
+    /// Run the full real probe fold for the assignment.
+    Poll,
+    /// Emit the already accepted latest snapshot, if one exists.
+    Heartbeat,
+}
+
+/// A source/manager assignment due for a poll or heartbeat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VehicleScheduledWork {
+    /// Stable MG90 identity.
+    pub source_id: VehicleSourceId,
+    /// Management node that owns this assignment.
+    pub manager_id: String,
+    /// Work to perform.
+    pub kind: VehicleScheduleKind,
+}
+
+/// Why the roster has no publishable source snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VehicleNoSourceReason {
+    /// No assignments have been registered.
+    EmptyRoster,
+    /// The requested source is not in this roster.
+    SourceNotRegistered,
+    /// The assignment exists, but has no local probe and has not received a
+    /// remote manager snapshot.
+    NoAcceptedSnapshot,
+    /// A local assignment exists without a configured probe.
+    ProbeUnavailable,
+    /// A reachable poll did not report a stable MG90 identity.
+    IdentityUnconfirmed,
+    /// A poll reported an identity different from the stable roster identity.
+    IdentityMismatch {
+        /// Identity reported by the attempted source.
+        reported: String,
+    },
+}
+
+/// An explicit latest-wins result. `NoSource` is intentionally not converted to
+/// [`VehicleState::offline`]: absence of a source is not evidence that a gateway
+/// is reachable and offline.
+#[derive(Debug, Clone, PartialEq)]
+pub enum VehicleRosterSelection {
+    /// The freshest valid snapshot across all registered managers for one MG90.
+    Selected(VehicleRosterSnapshot),
+    /// Nothing valid may be published for the requested source.
+    NoSource {
+        /// Requested source, when selection was source-specific.
+        source_id: Option<VehicleSourceId>,
+        /// Explicit reason for the absence.
+        reason: VehicleNoSourceReason,
+    },
+}
+
+/// One identity-checked snapshot retained by the bounded roster.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VehicleRosterSnapshot {
+    source_id: VehicleSourceId,
+    manager_id: String,
+    snapshot: VehicleStateV2,
+}
+
+impl VehicleRosterSnapshot {
+    /// Accept a v2 snapshot only when its confirmed MG90 and manager identities
+    /// agree with the roster assignment. No telemetry is changed or synthesized.
+    pub fn from_v2(
+        source_id: VehicleSourceId,
+        manager_id: impl Into<String>,
+        snapshot: VehicleStateV2,
+    ) -> Result<Self, VehicleRosterError> {
+        let manager_id = validate_manager_id(&manager_id.into())?;
+        if snapshot.mg90.id != source_id.as_str() || snapshot.mg90.esn != source_id.as_str() {
+            return Err(VehicleRosterError::IdentityMismatch {
+                expected: source_id,
+                reported: snapshot.mg90.id,
+                manager_id,
+            });
+        }
+        if snapshot.management_node_id != manager_id {
+            return Err(VehicleRosterError::IdentityMismatch {
+                expected: source_id,
+                reported: format!(
+                    "manager {} reported snapshot from {}",
+                    manager_id, snapshot.management_node_id
+                ),
+                manager_id,
+            });
+        }
+        Ok(Self {
+            source_id,
+            manager_id,
+            snapshot,
+        })
+    }
+
+    /// Stable MG90 identity.
+    #[must_use]
+    pub fn source_id(&self) -> &VehicleSourceId {
+        &self.source_id
+    }
+
+    /// Management node identity.
+    #[must_use]
+    pub fn manager_id(&self) -> &str {
+        &self.manager_id
+    }
+
+    /// Borrow the accepted v2 snapshot for publication or read-only rendering.
+    #[must_use]
+    pub fn snapshot(&self) -> &VehicleStateV2 {
+        &self.snapshot
+    }
+
+    fn freshness_cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.snapshot
+            .observed_at_ms
+            .cmp(&other.snapshot.observed_at_ms)
+            .then_with(|| {
+                self.snapshot
+                    .published_at_ms
+                    .cmp(&other.snapshot.published_at_ms)
+            })
+            .then_with(|| self.snapshot.sequence.cmp(&other.snapshot.sequence))
+            // A tie between managers is still deterministic. The lexical manager
+            // id is only a tie-breaker; it never beats a newer observation.
+            .then_with(|| self.manager_id.cmp(&other.manager_id))
+    }
+}
+
+/// A configured source/manager assignment in the opt-in roster.
+pub struct VehicleRosterSource {
+    source_id: VehicleSourceId,
+    manager_id: String,
+    worker: Option<Arc<VehicleWorker>>,
+    plan: VehiclePollPlan,
+}
+
+impl VehicleRosterSource {
+    /// Configure one assignment. `worker: None` is useful for a remote manager
+    /// whose snapshots arrive through the already-typed Bus/mesh ingest seam.
+    pub fn new(
+        source_id: VehicleSourceId,
+        manager_id: impl Into<String>,
+        worker: Option<Arc<VehicleWorker>>,
+        plan: VehiclePollPlan,
+    ) -> Result<Self, VehicleRosterError> {
+        let manager_id = validate_manager_id(&manager_id.into())?;
+        plan.validate()?;
+        Ok(Self {
+            source_id,
+            manager_id,
+            worker,
+            plan,
+        })
+    }
+
+    /// Configure a source with a local real [`VehicleWorker`] probe.
+    pub fn local(
+        source_id: VehicleSourceId,
+        manager_id: impl Into<String>,
+        worker: Arc<VehicleWorker>,
+        plan: VehiclePollPlan,
+    ) -> Result<Self, VehicleRosterError> {
+        Self::new(source_id, manager_id, Some(worker), plan)
+    }
+
+    /// Configure a source assignment that receives snapshots from another
+    /// manager. It does not claim that manager or gateway is reachable.
+    pub fn remote(
+        source_id: VehicleSourceId,
+        manager_id: impl Into<String>,
+        plan: VehiclePollPlan,
+    ) -> Result<Self, VehicleRosterError> {
+        Self::new(source_id, manager_id, None, plan)
+    }
+}
+
+struct VehicleRosterAssignment {
+    source: VehicleRosterSource,
+    next_poll: Instant,
+    next_heartbeat: Instant,
+    latest: Option<VehicleRosterSnapshot>,
+}
+
+/// Bounded scheduler and latest-wins read model around one or more
+/// [`VehicleWorker`] instances.
+///
+/// The existing worker remains the production single-gateway path. This seam is
+/// opt-in: callers register one stable MG90 id per manager, schedule each
+/// assignment independently, feed local polls through [`Self::poll_source`],
+/// and ingest already-typed remote-manager snapshots through [`Self::ingest`].
+/// It retains at most one accepted snapshot per assignment and selects the
+/// freshest valid one for an MG90 without inventing an offline state.
+pub struct VehicleRoster {
+    assignments: BTreeMap<(VehicleSourceId, String), VehicleRosterAssignment>,
+    started_at: Instant,
+}
+
+impl VehicleRoster {
+    /// Start an empty roster. All newly registered assignments are immediately
+    /// due once, making the first poll deterministic for tests and callers.
+    #[must_use]
+    pub fn new(started_at: Instant) -> Self {
+        Self {
+            assignments: BTreeMap::new(),
+            started_at,
+        }
+    }
+
+    /// Register one `(MG90, manager)` assignment.
+    pub fn register(&mut self, source: VehicleRosterSource) -> Result<(), VehicleRosterError> {
+        let key = (source.source_id.clone(), source.manager_id.clone());
+        if self.assignments.contains_key(&key) {
+            return Err(VehicleRosterError::DuplicateAssignment {
+                source_id: source.source_id,
+                manager_id: source.manager_id,
+            });
+        }
+        let source_already_registered = self
+            .assignments
+            .keys()
+            .any(|(source_id, _)| source_id == &source.source_id);
+        if !source_already_registered
+            && self
+                .assignments
+                .keys()
+                .map(|(source_id, _)| source_id)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                >= MAX_VEHICLE_ROSTER_SOURCES
+        {
+            return Err(VehicleRosterError::SourceCapacity);
+        }
+        if self
+            .assignments
+            .values()
+            .map(|assignment| assignment.source.manager_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            >= MAX_VEHICLE_ROSTER_MANAGERS
+            && !self
+                .assignments
+                .values()
+                .any(|assignment| assignment.source.manager_id == source.manager_id)
+        {
+            return Err(VehicleRosterError::ManagerCapacity);
+        }
+        if self.assignments.len() >= MAX_VEHICLE_ROSTER_ASSIGNMENTS {
+            return Err(VehicleRosterError::AssignmentCapacity);
+        }
+        self.assignments.insert(
+            key,
+            VehicleRosterAssignment {
+                source,
+                next_poll: self.started_at,
+                next_heartbeat: self.started_at,
+                latest: None,
+            },
+        );
+        Ok(())
+    }
+
+    /// Number of configured source/manager assignments.
+    #[must_use]
+    pub fn assignment_count(&self) -> usize {
+        self.assignments.len()
+    }
+
+    /// Return the registered stable source identities in deterministic order.
+    #[must_use]
+    pub fn source_ids(&self) -> Vec<VehicleSourceId> {
+        let mut ids = self
+            .assignments
+            .keys()
+            .map(|(source_id, _)| source_id.clone())
+            .collect::<Vec<_>>();
+        ids.dedup();
+        ids
+    }
+
+    /// Return all currently due poll/heartbeat work in stable source/manager
+    /// order. Missed intervals coalesce to one next deadline; the roster never
+    /// emits an unbounded catch-up burst.
+    pub fn take_due(&mut self, now: Instant) -> Vec<VehicleScheduledWork> {
+        let mut due = Vec::new();
+        for assignment in self.assignments.values_mut() {
+            if now >= assignment.next_poll {
+                due.push(VehicleScheduledWork {
+                    source_id: assignment.source.source_id.clone(),
+                    manager_id: assignment.source.manager_id.clone(),
+                    kind: VehicleScheduleKind::Poll,
+                });
+                assignment.next_poll = next_deadline(now, assignment.source.plan.poll);
+            }
+            if now >= assignment.next_heartbeat {
+                due.push(VehicleScheduledWork {
+                    source_id: assignment.source.source_id.clone(),
+                    manager_id: assignment.source.manager_id.clone(),
+                    kind: VehicleScheduleKind::Heartbeat,
+                });
+                assignment.next_heartbeat = next_deadline(now, assignment.source.plan.heartbeat);
+            }
+        }
+        due.sort_by(|a, b| {
+            a.source_id
+                .cmp(&b.source_id)
+                .then_with(|| a.manager_id.cmp(&b.manager_id))
+                .then_with(|| a.kind.cmp(&b.kind))
+        });
+        due
+    }
+
+    /// Run one configured local worker poll and retain it only if its confirmed
+    /// MG90 identity matches the stable roster identity. A missing probe or
+    /// unconfirmed identity is an explicit no-source result and does not erase a
+    /// previously accepted snapshot.
+    pub fn poll_source(
+        &mut self,
+        source_id: &VehicleSourceId,
+        manager_id: &str,
+    ) -> VehicleRosterPollResult {
+        let key = (source_id.clone(), manager_id.to_string());
+        let Some(assignment) = self.assignments.get(&key) else {
+            return VehicleRosterPollResult::NoSource {
+                source_id: Some(source_id.clone()),
+                reason: VehicleNoSourceReason::SourceNotRegistered,
+            };
+        };
+        let Some(worker) = assignment.source.worker.clone() else {
+            return VehicleRosterPollResult::NoSource {
+                source_id: Some(source_id.clone()),
+                reason: VehicleNoSourceReason::ProbeUnavailable,
+            };
+        };
+        let snapshot = match worker.build_roster_snapshot(source_id) {
+            Ok(snapshot) => snapshot,
+            Err(reason) => {
+                return VehicleRosterPollResult::NoSource {
+                    source_id: Some(source_id.clone()),
+                    reason,
+                }
+            }
+        };
+        match self.ingest(snapshot) {
+            Ok(_) => VehicleRosterPollResult::Updated(self.select_latest(source_id)),
+            Err(error) => VehicleRosterPollResult::NoSource {
+                source_id: Some(source_id.clone()),
+                reason: no_source_reason_from_roster_error(error),
+            },
+        }
+    }
+
+    /// Ingest one identity-checked snapshot from a local or remote manager.
+    /// Older observations never replace a newer one for the same assignment.
+    /// Returns whether the retained assignment snapshot changed.
+    pub fn ingest(&mut self, snapshot: VehicleRosterSnapshot) -> Result<bool, VehicleRosterError> {
+        let key = (snapshot.source_id.clone(), snapshot.manager_id.clone());
+        let Some(assignment) = self.assignments.get_mut(&key) else {
+            return Err(VehicleRosterError::UnregisteredAssignment {
+                source_id: snapshot.source_id,
+                manager_id: snapshot.manager_id,
+            });
+        };
+        let replace = assignment
+            .latest
+            .as_ref()
+            .is_none_or(|current| snapshot.freshness_cmp(current).is_gt());
+        if replace {
+            assignment.latest = Some(snapshot);
+        }
+        Ok(replace)
+    }
+
+    /// Select the freshest valid snapshot across all registered managers for one
+    /// stable MG90 source. The manager id is only a deterministic tie-breaker.
+    #[must_use]
+    pub fn select_latest(&self, source_id: &VehicleSourceId) -> VehicleRosterSelection {
+        let mut found_assignment = false;
+        let mut selected: Option<&VehicleRosterSnapshot> = None;
+        for ((candidate_source, _), assignment) in &self.assignments {
+            if candidate_source != source_id {
+                continue;
+            }
+            found_assignment = true;
+            if let Some(candidate) = assignment.latest.as_ref() {
+                if selected.is_none_or(|current| candidate.freshness_cmp(current).is_gt()) {
+                    selected = Some(candidate);
+                }
+            }
+        }
+        if let Some(snapshot) = selected {
+            VehicleRosterSelection::Selected(snapshot.clone())
+        } else {
+            VehicleRosterSelection::NoSource {
+                source_id: Some(source_id.clone()),
+                reason: if found_assignment {
+                    VehicleNoSourceReason::NoAcceptedSnapshot
+                } else if self.assignments.is_empty() {
+                    VehicleNoSourceReason::EmptyRoster
+                } else {
+                    VehicleNoSourceReason::SourceNotRegistered
+                },
+            }
+        }
+    }
+
+    /// Select the source snapshot that a heartbeat may repeat. No accepted
+    /// snapshot means no publication, even when a heartbeat deadline is due.
+    #[must_use]
+    pub fn heartbeat(&self, source_id: &VehicleSourceId) -> VehicleRosterSelection {
+        self.select_latest(source_id)
+    }
+}
+
+/// Result of one local roster poll.
+#[derive(Debug, Clone, PartialEq)]
+pub enum VehicleRosterPollResult {
+    /// The poll was accepted and the resulting selected snapshot is returned.
+    Updated(VehicleRosterSelection),
+    /// No real source snapshot was available; nothing was fabricated.
+    NoSource {
+        /// Source involved in the attempted poll.
+        source_id: Option<VehicleSourceId>,
+        /// Explicit no-source reason.
+        reason: VehicleNoSourceReason,
+    },
+}
+
+fn validate_manager_id(value: &str) -> Result<String, VehicleRosterError> {
+    validate_roster_id(value, "manager", VehicleRosterError::InvalidManagerId)
+}
+
+fn validate_roster_id<F>(
+    value: &str,
+    kind: &str,
+    make_error: F,
+) -> Result<String, VehicleRosterError>
+where
+    F: FnOnce(String) -> VehicleRosterError,
+{
+    if value.is_empty() {
+        return Err(make_error(format!("{kind} id is empty")));
+    }
+    if value.len() > MAX_ROSTER_ID_BYTES {
+        return Err(make_error(format!(
+            "{kind} id exceeds {MAX_ROSTER_ID_BYTES} bytes"
+        )));
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(make_error(format!(
+            "{kind} id contains a path or unsafe character"
+        )));
+    }
+    Ok(value.to_string())
+}
+
+fn next_deadline(now: Instant, interval: Duration) -> Instant {
+    now.checked_add(interval).unwrap_or(now)
+}
+
+fn no_source_reason_from_roster_error(error: VehicleRosterError) -> VehicleNoSourceReason {
+    match error {
+        VehicleRosterError::IdentityMismatch { reported, .. } => {
+            VehicleNoSourceReason::IdentityMismatch { reported }
+        }
+        _ => VehicleNoSourceReason::NoAcceptedSnapshot,
+    }
+}
+
 // ─────────────────────────── the worker ───────────────────────────
 
 /// The `vehicle` worker (per-node, rank-0 universal — but a genuine no-op on the
@@ -924,6 +1595,24 @@ impl VehicleWorker {
     pub fn build_state_v2(&self, probe: &dyn VehicleProbe) -> VehicleStateV2 {
         let state = self.build_state(probe);
         self.snapshot_v2(&state)
+    }
+
+    /// Build one roster snapshot from this worker's real configured probe. A
+    /// source without a probe, or a poll that cannot confirm the MG90 ESN, is
+    /// returned as no-source and never converted into synthetic telemetry.
+    fn build_roster_snapshot(
+        &self,
+        source_id: &VehicleSourceId,
+    ) -> Result<VehicleRosterSnapshot, VehicleNoSourceReason> {
+        let Some(probe) = self.probe.clone() else {
+            return Err(VehicleNoSourceReason::ProbeUnavailable);
+        };
+        let snapshot = self.build_state_v2(probe.as_ref());
+        if snapshot.mg90.id.trim().is_empty() || snapshot.mg90.esn.trim().is_empty() {
+            return Err(VehicleNoSourceReason::IdentityUnconfirmed);
+        }
+        VehicleRosterSnapshot::from_v2(source_id.clone(), self.host.clone(), snapshot)
+            .map_err(no_source_reason_from_roster_error)
     }
 
     fn snapshot_v2(&self, state: &VehicleState) -> VehicleStateV2 {
@@ -2550,6 +3239,273 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         let joined = tokio::time::timeout(Duration::from_secs(2), handle).await;
         assert!(joined.is_ok(), "the idle worker still exits promptly");
         assert!(joined.unwrap().expect("join").is_ok());
+    }
+
+    fn roster_source_id() -> VehicleSourceId {
+        VehicleSourceId::new("ND84720078011035").unwrap()
+    }
+
+    fn roster_snapshot(
+        source_id: &VehicleSourceId,
+        manager_id: &str,
+        observed_at_ms: i64,
+        published_at_ms: i64,
+        sequence: u64,
+    ) -> VehicleRosterSnapshot {
+        let mut snapshot = VehicleWorker::new(manager_id.to_string())
+            .with_bus_root(None)
+            .with_probe(Arc::new(FakeProbe::real()))
+            .build_state_v2(&FakeProbe::real());
+        snapshot.observed_at_ms = observed_at_ms;
+        snapshot.published_at_ms = published_at_ms;
+        snapshot.sequence = sequence;
+        VehicleRosterSnapshot::from_v2(source_id.clone(), manager_id, snapshot).unwrap()
+    }
+
+    #[test]
+    fn roster_keeps_source_identity_separate_from_endpoint_and_manager() {
+        let source = roster_source_id();
+        assert_eq!(source.as_str(), "ND84720078011035");
+        assert!(VehicleSourceId::new("192.168.13.31:2222").is_err());
+
+        let t0 = Instant::now();
+        let mut roster = VehicleRoster::new(t0);
+        roster
+            .register(
+                VehicleRosterSource::remote(
+                    source.clone(),
+                    "manager-a",
+                    VehiclePollPlan::new(Duration::from_secs(5), ROSTER_HEARTBEAT).unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        roster
+            .register(
+                VehicleRosterSource::remote(
+                    source.clone(),
+                    "manager-b",
+                    VehiclePollPlan::new(Duration::from_secs(7), Duration::from_secs(3)).unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(roster.assignment_count(), 2);
+        assert_eq!(roster.source_ids(), vec![source]);
+    }
+
+    #[test]
+    fn roster_schedules_each_manager_assignment_with_independent_cadences() {
+        let source_a = VehicleSourceId::new("mg90-a").unwrap();
+        let source_b = VehicleSourceId::new("mg90-b").unwrap();
+        let t0 = Instant::now();
+        let mut roster = VehicleRoster::new(t0);
+        roster
+            .register(
+                VehicleRosterSource::remote(
+                    source_a.clone(),
+                    "manager-a",
+                    VehiclePollPlan::new(Duration::from_secs(5), Duration::from_secs(2)).unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        roster
+            .register(
+                VehicleRosterSource::remote(
+                    source_b.clone(),
+                    "manager-b",
+                    VehiclePollPlan::new(Duration::from_secs(7), Duration::from_secs(3)).unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            roster.take_due(t0),
+            vec![
+                VehicleScheduledWork {
+                    source_id: source_a.clone(),
+                    manager_id: "manager-a".to_string(),
+                    kind: VehicleScheduleKind::Poll,
+                },
+                VehicleScheduledWork {
+                    source_id: source_a.clone(),
+                    manager_id: "manager-a".to_string(),
+                    kind: VehicleScheduleKind::Heartbeat,
+                },
+                VehicleScheduledWork {
+                    source_id: source_b.clone(),
+                    manager_id: "manager-b".to_string(),
+                    kind: VehicleScheduleKind::Poll,
+                },
+                VehicleScheduledWork {
+                    source_id: source_b.clone(),
+                    manager_id: "manager-b".to_string(),
+                    kind: VehicleScheduleKind::Heartbeat,
+                },
+            ]
+        );
+        assert_eq!(
+            roster.take_due(t0 + Duration::from_secs(2)),
+            vec![VehicleScheduledWork {
+                source_id: source_a.clone(),
+                manager_id: "manager-a".to_string(),
+                kind: VehicleScheduleKind::Heartbeat,
+            }]
+        );
+        assert_eq!(
+            roster.take_due(t0 + Duration::from_secs(3)),
+            vec![VehicleScheduledWork {
+                source_id: source_b.clone(),
+                manager_id: "manager-b".to_string(),
+                kind: VehicleScheduleKind::Heartbeat,
+            }]
+        );
+        assert_eq!(
+            roster.take_due(t0 + Duration::from_secs(4)),
+            vec![VehicleScheduledWork {
+                source_id: source_a.clone(),
+                manager_id: "manager-a".to_string(),
+                kind: VehicleScheduleKind::Heartbeat,
+            }]
+        );
+        assert_eq!(
+            roster.take_due(t0 + Duration::from_secs(5)),
+            vec![VehicleScheduledWork {
+                source_id: source_a,
+                manager_id: "manager-a".to_string(),
+                kind: VehicleScheduleKind::Poll,
+            }]
+        );
+    }
+
+    #[test]
+    fn roster_selects_freshest_manager_snapshot_deterministically() {
+        let source = roster_source_id();
+        let plan = VehiclePollPlan::new(Duration::from_secs(5), ROSTER_HEARTBEAT).unwrap();
+        let t0 = Instant::now();
+        let mut roster = VehicleRoster::new(t0);
+        roster
+            .register(VehicleRosterSource::remote(source.clone(), "manager-a", plan).unwrap())
+            .unwrap();
+        roster
+            .register(VehicleRosterSource::remote(source.clone(), "manager-b", plan).unwrap())
+            .unwrap();
+
+        assert!(roster
+            .ingest(roster_snapshot(&source, "manager-a", 100, 100, 1))
+            .unwrap());
+        assert!(roster
+            .ingest(roster_snapshot(&source, "manager-b", 200, 200, 1))
+            .unwrap());
+        match roster.select_latest(&source) {
+            VehicleRosterSelection::Selected(snapshot) => {
+                assert_eq!(snapshot.manager_id(), "manager-b");
+                assert_eq!(snapshot.snapshot().observed_at_ms, 200);
+            }
+            other => panic!("expected selected source, got {other:?}"),
+        }
+
+        assert!(!roster
+            .ingest(roster_snapshot(&source, "manager-b", 150, 150, 99))
+            .unwrap());
+        assert!(roster
+            .ingest(roster_snapshot(&source, "manager-a", 300, 300, 9))
+            .unwrap());
+        assert!(roster
+            .ingest(roster_snapshot(&source, "manager-b", 300, 300, 9))
+            .unwrap());
+        match roster.select_latest(&source) {
+            VehicleRosterSelection::Selected(snapshot) => {
+                assert_eq!(snapshot.manager_id(), "manager-b");
+                assert_eq!(snapshot.snapshot().observed_at_ms, 300);
+            }
+            other => panic!("expected selected source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roster_no_source_is_explicit_and_does_not_publish_offline_telemetry() {
+        let source = roster_source_id();
+        let t0 = Instant::now();
+        let empty = VehicleRoster::new(t0);
+        assert!(matches!(
+            empty.select_latest(&source),
+            VehicleRosterSelection::NoSource {
+                reason: VehicleNoSourceReason::EmptyRoster,
+                ..
+            }
+        ));
+
+        let mut remote_only = VehicleRoster::new(t0);
+        remote_only
+            .register(
+                VehicleRosterSource::remote(
+                    source.clone(),
+                    "manager-a",
+                    VehiclePollPlan::default(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            remote_only.heartbeat(&source),
+            VehicleRosterSelection::NoSource {
+                reason: VehicleNoSourceReason::NoAcceptedSnapshot,
+                ..
+            }
+        ));
+
+        let mut no_probe_worker = worker();
+        no_probe_worker.probe = None;
+        let mut local_no_source = VehicleRoster::new(t0);
+        local_no_source
+            .register(
+                VehicleRosterSource::local(
+                    source.clone(),
+                    "rig-1",
+                    Arc::new(no_probe_worker),
+                    VehiclePollPlan::default(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            local_no_source.poll_source(&source, "rig-1"),
+            VehicleRosterPollResult::NoSource {
+                reason: VehicleNoSourceReason::ProbeUnavailable,
+                ..
+            }
+        ));
+
+        let wrong_source = VehicleSourceId::new("wrong-source").unwrap();
+        let mut mismatch = VehicleRoster::new(t0);
+        mismatch
+            .register(
+                VehicleRosterSource::local(
+                    wrong_source.clone(),
+                    "rig-1",
+                    Arc::new(worker().with_probe(Arc::new(FakeProbe::real()))),
+                    VehiclePollPlan::default(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            mismatch.poll_source(&wrong_source, "rig-1"),
+            VehicleRosterPollResult::NoSource {
+                reason: VehicleNoSourceReason::IdentityMismatch { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            mismatch.select_latest(&wrong_source),
+            VehicleRosterSelection::NoSource {
+                reason: VehicleNoSourceReason::NoAcceptedSnapshot,
+                ..
+            }
+        ));
     }
 
     // ─────────────────────── Change 1 · per-modem cellular A/B parser ───────────────────────

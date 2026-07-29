@@ -396,10 +396,20 @@ impl FrontDoorWorkflowKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrontDoorWorkflowExecution {
+    ShellOwned,
+    VdiGuest {
+        workload: &'static str,
+        guest_execution: &'static str,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FrontDoorWorkflowCard {
     pub(crate) kind: FrontDoorWorkflowKind,
     pub(crate) surface: Surface,
     pub(crate) workbench_plane: Option<Plane>,
+    execution: FrontDoorWorkflowExecution,
     title: &'static str,
     target: &'static str,
     terms: &'static [&'static str],
@@ -431,11 +441,12 @@ struct FrontDoorServiceLifecycleArm {
     op: FrontDoorServiceLifecycleOp,
 }
 
-const WORKLOAD_CARDS: [FrontDoorWorkflowCard; 2] = [
+const WORKLOAD_CARDS: [FrontDoorWorkflowCard; 3] = [
     FrontDoorWorkflowCard {
         kind: FrontDoorWorkflowKind::Workload,
         surface: Surface::InfraCode,
         workbench_plane: None,
+        execution: FrontDoorWorkflowExecution::ShellOwned,
         title: "Cloud workloads",
         target: "Instances, volumes, networks",
         terms: &[
@@ -452,6 +463,10 @@ const WORKLOAD_CARDS: [FrontDoorWorkflowCard; 2] = [
         kind: FrontDoorWorkflowKind::Workload,
         surface: Surface::Desktop,
         workbench_plane: None,
+        execution: FrontDoorWorkflowExecution::VdiGuest {
+            workload: "desktop-vm",
+            guest_execution: "Desktop session",
+        },
         title: "Desktop sessions",
         target: "Virtual desktops, remote seats, VDI",
         terms: &[
@@ -464,6 +479,31 @@ const WORKLOAD_CARDS: [FrontDoorWorkflowCard; 2] = [
         ],
         icon: IconId::Desktop,
     },
+    FrontDoorWorkflowCard {
+        kind: FrontDoorWorkflowKind::Workload,
+        surface: Surface::Browser,
+        workbench_plane: None,
+        execution: FrontDoorWorkflowExecution::VdiGuest {
+            workload: "browser-vm",
+            guest_execution: "Chromium/page execution",
+        },
+        title: "Browser VM",
+        target: "Guest-owned Chromium/page execution · VDI connection required · no host-browser fallback",
+        terms: &[
+            "workloads",
+            "browser",
+            "browser vm",
+            "browser-vm",
+            "chromium",
+            "guest",
+            "vdi",
+            "connection",
+            "unavailable",
+            "page execution",
+            "no host browser",
+        ],
+        icon: IconId::Browser,
+    },
 ];
 
 const SERVICE_CARDS: [FrontDoorWorkflowCard; 2] = [
@@ -471,6 +511,7 @@ const SERVICE_CARDS: [FrontDoorWorkflowCard; 2] = [
         kind: FrontDoorWorkflowKind::Service,
         surface: Surface::Workbench,
         workbench_plane: Some(Plane::Provisioning),
+        execution: FrontDoorWorkflowExecution::ShellOwned,
         title: "Mesh services",
         target: "Fleet service health and controls",
         terms: &[
@@ -482,6 +523,7 @@ const SERVICE_CARDS: [FrontDoorWorkflowCard; 2] = [
         kind: FrontDoorWorkflowKind::Service,
         surface: Surface::InfraCode,
         workbench_plane: None,
+        execution: FrontDoorWorkflowExecution::ShellOwned,
         title: "Cloud API services",
         target: "Service catalog, endpoints, health",
         terms: &[
@@ -726,6 +768,28 @@ fn workflow_search_item(card: FrontDoorWorkflowCard, rank: usize) -> SearchItem<
             .chain([card.kind.label(), card.surface.label()]),
     )
     .with_source_rank(rank)
+}
+
+fn workflow_accessibility_value(card: FrontDoorWorkflowCard) -> String {
+    match card.execution {
+        FrontDoorWorkflowExecution::ShellOwned => {
+            format!("Workflow: shell-owned; {}", card.target)
+        }
+        FrontDoorWorkflowExecution::VdiGuest {
+            workload,
+            guest_execution,
+        } => {
+            let fallback = if card.surface == Surface::Browser {
+                "no host-browser fallback"
+            } else {
+                "no host-desktop fallback"
+            };
+            format!(
+                "Workflow: VDI guest {workload}; connection required; unavailable when guest source is missing; {guest_execution} stays guest-owned; {fallback}; {}",
+                card.target
+            )
+        }
+    }
 }
 
 pub(crate) fn console_command_search_item(
@@ -2057,7 +2121,7 @@ fn install_primary_action_accessibility(
         node.set_value(format!(
             "Primary action: {}, {}",
             result_domain_label(hit),
-            hit.item.target
+            result_accessibility_target(hit)
         ));
         node.set_bounds(accesskit_rect(rect));
         node.add_action(egui::accesskit::Action::Click);
@@ -3029,8 +3093,15 @@ fn result_accesskit_value(hit: &SearchHit<FrontDoorTarget>, index: usize, total:
         "Result {} of {total}: {}, {}",
         index + 1,
         result_domain_label(hit),
-        hit.item.target
+        result_accessibility_target(hit)
     )
+}
+
+fn result_accessibility_target(hit: &SearchHit<FrontDoorTarget>) -> String {
+    match &hit.item.payload {
+        FrontDoorTarget::Workflow(card) => workflow_accessibility_value(*card),
+        _ => hit.item.target.clone(),
+    }
 }
 
 fn install_result_accessibility(
@@ -3746,7 +3817,7 @@ mod tests {
     #[test]
     fn workflow_search_items_expose_real_owner_cards_without_duplicating_apps() {
         let items = workflow_search_items(40);
-        assert_eq!(items.len(), 4);
+        assert_eq!(items.len(), 5);
         assert!(items.iter().any(|item| {
             item.title == "Cloud workloads"
                 && item.target == "Instances, volumes, networks"
@@ -3772,12 +3843,64 @@ mod tests {
                     })
                 )
         }));
+        assert!(items.iter().any(|item| {
+            item.title == "Browser VM"
+                && item.target
+                    == "Guest-owned Chromium/page execution · VDI connection required · no host-browser fallback"
+                && matches!(
+                    item.payload,
+                    FrontDoorTarget::Workflow(FrontDoorWorkflowCard {
+                        kind: FrontDoorWorkflowKind::Workload,
+                        surface: Surface::Browser,
+                        workbench_plane: None,
+                        execution: FrontDoorWorkflowExecution::VdiGuest {
+                            workload: "browser-vm",
+                            guest_execution: "Chromium/page execution",
+                        },
+                        ..
+                    })
+                )
+        }));
         assert!(
             items
                 .iter()
                 .all(|item| !matches!(item.payload, FrontDoorTarget::App(_))),
             "workflow cards must be distinct payloads, not renamed app shortcuts"
         );
+    }
+
+    #[test]
+    fn browser_vm_workflow_is_a_distinct_guest_route_without_host_fallback() {
+        let hit = ranked_front_door_hits("browser-vm", workflow_search_items(40))
+            .into_iter()
+            .find(|hit| hit.item.title == "Browser VM")
+            .expect("Browser VM workflow card");
+        let FrontDoorTarget::Workflow(card) = &hit.item.payload else {
+            panic!("Browser VM must remain a workflow target, not an app shortcut");
+        };
+
+        assert_eq!(card.kind, FrontDoorWorkflowKind::Workload);
+        assert_eq!(card.surface, Surface::Browser);
+        assert_eq!(card.workbench_plane, None);
+        assert_eq!(
+            card.execution,
+            FrontDoorWorkflowExecution::VdiGuest {
+                workload: "browser-vm",
+                guest_execution: "Chromium/page execution",
+            }
+        );
+        assert!(hit.item.terms.iter().any(|term| *term == "unavailable"));
+        assert!(hit.item.target.contains("connection required"));
+        assert!(hit.item.target.contains("no host-browser fallback"));
+        assert_eq!(primary_action_label(&hit), "Open");
+        assert_eq!(
+            activation_request_for_hit(&hit),
+            FrontDoorRequest::Activate(FrontDoorTarget::Workflow(*card))
+        );
+        assert!(!matches!(
+            activation_request_for_hit(&hit),
+            FrontDoorRequest::Activate(FrontDoorTarget::App(Surface::Browser))
+        ));
     }
 
     #[test]
@@ -3843,7 +3966,7 @@ mod tests {
             .collect();
         assert_eq!(
             workload_titles,
-            vec!["Cloud workloads", "Desktop sessions"],
+            vec!["Cloud workloads", "Desktop sessions", "Browser VM"],
             "Workloads filter should expose current local workload cards"
         );
         assert!(workload_hits.iter().all(|hit| {
@@ -5550,6 +5673,66 @@ mod tests {
             Some("Workflow action: Workbench Fleet plane; Fleet service health and controls")
         );
         assert!(fleet.supports_action(egui::accesskit::Action::Click));
+    }
+
+    #[test]
+    fn front_door_browser_vm_accesskit_exposes_guest_connection_state() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        mde_egui::fonts::install(&ctx);
+
+        let out = render_front_door_accesskit_frame_with_filter(
+            &ctx,
+            "browser-vm",
+            0,
+            egui::vec2(900.0, 640.0),
+            workflow_search_items(0),
+            FrontDoorFilter::Workloads,
+        );
+        let nodes = accesskit_nodes(&out);
+        let browser_vm = nodes
+            .iter()
+            .map(|(_, node)| node)
+            .find(|node| node.label() == Some("Browser VM"))
+            .expect("Browser VM workflow row should be reachable in Workloads");
+        let row_value = browser_vm.value().expect("Browser VM result value");
+        assert!(row_value.contains("VDI guest browser-vm"), "{row_value}");
+        assert!(row_value.contains("connection required"), "{row_value}");
+        assert!(
+            row_value.contains("unavailable when guest source is missing"),
+            "{row_value}"
+        );
+        assert!(
+            row_value.contains("Chromium/page execution stays guest-owned"),
+            "{row_value}"
+        );
+        assert!(
+            row_value.contains("no host-browser fallback"),
+            "{row_value}"
+        );
+
+        let action = nodes
+            .iter()
+            .map(|(_, node)| node)
+            .find(|node| node.label() == Some("Open Browser VM"))
+            .expect("Browser VM workflow should expose an Open action");
+        assert_eq!(action.role(), egui::accesskit::Role::Button);
+        assert!(action.supports_action(egui::accesskit::Action::Click));
+        assert!(
+            action
+                .value()
+                .is_some_and(|value| value.contains("VDI guest browser-vm")
+                    && value.contains("no host-browser fallback")),
+            "the Browser VM action must preserve VDI ownership in its accessible value: {:?}",
+            action.value()
+        );
+        assert!(
+            !nodes
+                .iter()
+                .map(|(_, node)| node)
+                .any(|node| node.label() == Some("Launch Browser")),
+            "the Browser VM workflow must not expose the host Browser app action"
+        );
     }
 
     #[test]
