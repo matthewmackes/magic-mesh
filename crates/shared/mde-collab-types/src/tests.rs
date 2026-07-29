@@ -87,6 +87,18 @@ fn every_event_kind() -> Vec<CollabEventKind> {
         CollabEventKind::MessageDeleted {
             target: EventId::new(),
         },
+        CollabEventKind::MessagePinned {
+            target: EventId::new(),
+        },
+        CollabEventKind::MessageUnpinned {
+            target: EventId::new(),
+        },
+        CollabEventKind::MessageSaved {
+            target: EventId::new(),
+        },
+        CollabEventKind::MessageUnsaved {
+            target: EventId::new(),
+        },
         CollabEventKind::ThreadStarted {
             thread: ThreadId::new(),
             root: EventId::new(),
@@ -257,6 +269,22 @@ fn every_command() -> Vec<CollabCommand> {
             body: MessageBody::new("hello!"),
         },
         CollabCommand::DeleteMessage {
+            space: SpaceId::new(),
+            target: EventId::new(),
+        },
+        CollabCommand::PinMessage {
+            space: SpaceId::new(),
+            target: EventId::new(),
+        },
+        CollabCommand::UnpinMessage {
+            space: SpaceId::new(),
+            target: EventId::new(),
+        },
+        CollabCommand::SaveMessage {
+            space: SpaceId::new(),
+            target: EventId::new(),
+        },
+        CollabCommand::UnsaveMessage {
             space: SpaceId::new(),
             target: EventId::new(),
         },
@@ -446,7 +474,7 @@ fn every_event_kind_round_trips_and_has_a_unique_tag() {
         );
     }
     // Guards against a variant being added without an accompanying sample here.
-    assert_eq!(tags.len(), 39, "sample set must cover every event kind");
+    assert_eq!(tags.len(), 43, "sample set must cover every event kind");
 }
 
 #[test]
@@ -459,7 +487,7 @@ fn every_command_round_trips_and_has_a_unique_verb() {
         assert_eq!(*c, back, "round-trip {}", c.verb());
         assert!(verbs.insert(c.verb()), "duplicate verb {}", c.verb());
     }
-    assert_eq!(verbs.len(), 47, "sample set must cover every command");
+    assert_eq!(verbs.len(), 51, "sample set must cover every command");
 }
 
 /// The delivery-lock gate: each of the seven replaced subsystems must have at
@@ -485,6 +513,10 @@ fn ledger_coverage_every_replaced_subsystem_has_covering_event_kinds() {
                 "message_posted",
                 "message_edited",
                 "message_deleted",
+                "message_pinned",
+                "message_unpinned",
+                "message_saved",
+                "message_unsaved",
                 "thread_started",
                 "task_created",
                 "task_checked",

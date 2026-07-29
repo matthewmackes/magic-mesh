@@ -369,6 +369,54 @@ pub fn apply_command<S: EventSigner, I: IdSource>(
                 CollabEventKind::MessageDeleted { target: *target },
             )])
         }
+        CollabCommand::PinMessage { space, target } => {
+            require_active_space(state, *space)?;
+            require_member(state, *space, &ctx.actor)?;
+            let message = require_message(state, *space, *target)?;
+            if message.deleted {
+                return Err(CollabError::TargetDeleted(*target));
+            }
+            Ok(vec![ctx.emit(
+                *space,
+                CollabEventKind::MessagePinned { target: *target },
+            )])
+        }
+        CollabCommand::UnpinMessage { space, target } => {
+            require_active_space(state, *space)?;
+            require_member(state, *space, &ctx.actor)?;
+            require_message(state, *space, *target)?;
+            Ok(vec![ctx.emit(
+                *space,
+                CollabEventKind::MessageUnpinned { target: *target },
+            )])
+        }
+        CollabCommand::SaveMessage { space, target } => {
+            require_active_space(state, *space)?;
+            require_member(state, *space, &ctx.actor)?;
+            let message = require_message(state, *space, *target)?;
+            if message.deleted {
+                return Err(CollabError::TargetDeleted(*target));
+            }
+            if state.is_message_saved(&ctx.actor, *target) {
+                return Err(CollabError::MessageAlreadySaved(*target));
+            }
+            Ok(vec![ctx.emit(
+                *space,
+                CollabEventKind::MessageSaved { target: *target },
+            )])
+        }
+        CollabCommand::UnsaveMessage { space, target } => {
+            require_active_space(state, *space)?;
+            require_member(state, *space, &ctx.actor)?;
+            require_message(state, *space, *target)?;
+            if !state.is_message_saved(&ctx.actor, *target) {
+                return Err(CollabError::MessageNotSaved(*target));
+            }
+            Ok(vec![ctx.emit(
+                *space,
+                CollabEventKind::MessageUnsaved { target: *target },
+            )])
+        }
         CollabCommand::StartThread { space, root, title } => {
             require_active_space(state, *space)?;
             require_member(state, *space, &ctx.actor)?;

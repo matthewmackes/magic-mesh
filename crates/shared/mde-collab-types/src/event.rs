@@ -97,6 +97,26 @@ pub enum CollabEventKind {
         /// The deleted message's event id.
         target: EventId,
     },
+    /// A message was pinned for the whole space.
+    MessagePinned {
+        /// The pinned message's event id.
+        target: EventId,
+    },
+    /// A shared message pin was removed.
+    MessageUnpinned {
+        /// The unpinned message's event id.
+        target: EventId,
+    },
+    /// A message was saved for the event author only; this is not a team pin.
+    MessageSaved {
+        /// The saved message's event id.
+        target: EventId,
+    },
+    /// A private saved-message mark was removed.
+    MessageUnsaved {
+        /// The message whose private save was removed.
+        target: EventId,
+    },
     /// A reply thread was started, rooted at a message.
     ThreadStarted {
         /// The new thread's id.
@@ -331,6 +351,10 @@ impl CollabEventKind {
             Self::MessagePosted { .. } => "message_posted",
             Self::MessageEdited { .. } => "message_edited",
             Self::MessageDeleted { .. } => "message_deleted",
+            Self::MessagePinned { .. } => "message_pinned",
+            Self::MessageUnpinned { .. } => "message_unpinned",
+            Self::MessageSaved { .. } => "message_saved",
+            Self::MessageUnsaved { .. } => "message_unsaved",
             Self::ThreadStarted { .. } => "thread_started",
             Self::ThreadResolved { .. } => "thread_resolved",
             Self::ThreadReopened { .. } => "thread_reopened",

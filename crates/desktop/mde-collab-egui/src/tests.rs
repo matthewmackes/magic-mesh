@@ -18,9 +18,9 @@ use mde_collab_types::{
     DiscordBridgeBoard, DiscordBridgeConfigStatus, DiscordBridgeFlowStatus,
     DiscordBridgeProvenance, DiscordBridgeProvenanceSource, DiscordBridgeView, DocumentId,
     DocumentSession, DocumentSessions, EventId, FileRef, FileRefId, FileReferenceView,
-    FileReferences, ReviewVerdict, Severity, SpaceId, SpaceKind, SpaceRole, TaskView, ThreadId,
-    ThreadTimeline, TransferControl, TransferDirection, TransferId, TransferJobView, TransferJobs,
-    TransferMethod, TransferState,
+    FileReferences, MessagePins, ReviewVerdict, SavedMessageView, SavedMessages, Severity, SpaceId,
+    SpaceKind, SpaceRole, TaskView, ThreadId, ThreadTimeline, TransferControl, TransferDirection,
+    TransferId, TransferJobView, TransferJobs, TransferMethod, TransferState,
 };
 
 use crate::activity::{activity_rows, filtered_activity_entries};
@@ -1152,9 +1152,10 @@ fn messages_timeline_renders_constrained_local_reaction_chips() {
 }
 
 #[test]
-fn message_pin_save_affordances_are_visible_but_contract_pending() {
+fn message_pin_save_affordances_render_projected_state() {
     let space = SpaceId::new();
     let peer = ActorId::new("falcon");
+    let message_id = EventId::new();
     let data = FixtureData::new("eagle", 1_000_000)
         .with_space(space_summary(
             space,
@@ -1169,13 +1170,25 @@ fn message_pin_save_affordances_are_visible_but_contract_pending() {
             space,
             thread: None,
             messages: vec![message(
-                EventId::new(),
+                message_id,
                 &peer,
                 900_000,
                 "Pin this once the real contract lands.",
                 DeliveryState::Delivered,
                 0,
             )],
+        })
+        .with_message_pins(MessagePins {
+            space,
+            messages: vec![message_id],
+        })
+        .with_saved_messages(SavedMessages {
+            actor: ActorId::new("eagle"),
+            messages: vec![SavedMessageView {
+                space,
+                message: message_id,
+                saved_unix_ms: 950_000,
+            }],
         });
     let mut surface = CommunicationsSurface::new();
     surface.select_space(space);
@@ -1203,15 +1216,50 @@ fn message_pin_save_affordances_are_visible_but_contract_pending() {
     }
     let texts = painted_text(&shapes);
 
-    for expected in ["Keep", "Pin", "Save", "pending read model"] {
+    for expected in ["Keep", "Unpin", "Unsave"] {
         assert!(
             texts.iter().any(|(text, _)| text == expected),
-            "Messages must paint the honest pin/save seam text {expected:?}: {texts:?}"
+            "Messages must paint projected pin/save state {expected:?}: {texts:?}"
         );
     }
     assert!(
         sink.is_empty(),
-        "pending pin/save affordances must not fabricate or enqueue collaboration commands"
+        "rendering must not emit commands without a click"
+    );
+}
+
+#[test]
+fn message_pin_save_toggles_emit_typed_commands() {
+    let surface = CommunicationsSurface::new();
+    let mut sink = CommandSink::new();
+    let space = SpaceId::new();
+    let message = EventId::new();
+
+    surface.toggle_message_pin(&mut sink, space, message, false);
+    surface.toggle_message_save(&mut sink, space, message, false);
+    surface.toggle_message_pin(&mut sink, space, message, true);
+    surface.toggle_message_save(&mut sink, space, message, true);
+
+    assert_eq!(
+        sink.drain(),
+        vec![
+            CollabCommand::PinMessage {
+                space,
+                target: message,
+            },
+            CollabCommand::SaveMessage {
+                space,
+                target: message,
+            },
+            CollabCommand::UnpinMessage {
+                space,
+                target: message,
+            },
+            CollabCommand::UnsaveMessage {
+                space,
+                target: message,
+            },
+        ]
     );
 }
 

@@ -29,6 +29,10 @@ pub mod projection {
     pub const ACTIVITY: &str = "activity";
     /// A conversation timeline.
     pub const CONVERSATION: &str = "conversation";
+    /// Shared message pins for one space.
+    pub const MESSAGE_PINS: &str = "message-pins";
+    /// The local actor's private saved messages.
+    pub const SAVED_MESSAGES: &str = "saved-messages";
     /// A thread timeline.
     pub const THREAD: &str = "thread";
     /// Basic channel tasks/action items.

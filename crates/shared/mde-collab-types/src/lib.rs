@@ -70,8 +70,9 @@ pub use read_model::{
     CollabReadModel, CommsBadges, ConversationTimeline, DiscordBridgeBoard,
     DiscordBridgeConfigStatus, DiscordBridgeFlowStatus, DiscordBridgeProvenance,
     DiscordBridgeProvenanceSource, DiscordBridgeView, DocumentSession, DocumentSessions,
-    FileReferenceView, FileReferences, MessageView, PresenceBoard, PresenceView, SpaceDirectory,
-    SpaceSummary, TaskView, ThreadTimeline, TransferJobView, TransferJobs,
+    FileReferenceView, FileReferences, MessagePins, MessageView, PresenceBoard, PresenceView,
+    SavedMessageView, SavedMessages, SpaceDirectory, SpaceSummary, TaskView, ThreadTimeline,
+    TransferJobView, TransferJobs,
 };
 pub use space::{SpaceKind, SpaceRole};
 pub use value::{

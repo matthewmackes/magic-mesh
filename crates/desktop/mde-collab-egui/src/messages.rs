@@ -5,9 +5,8 @@
 //! [`SendMessage`](mde_collab_types::CollabCommand::SendMessage) with a
 //! locally-persisted draft, honest delivery state, and an edit/delete affordance
 //! that reflects the core's five-minute author window (spec §3). Shared message
-//! pins and private saved-message controls are visible but disabled until the
-//! backing read model / command contract exists, so this UI never fabricates
-//! mesh-pinned or locally-saved message state.
+//! pins and private saved-message controls read their retained projections and
+//! emit typed commands; no mesh or private state is fabricated locally.
 
 use mde_egui::egui;
 use mde_egui::Style;
@@ -457,7 +456,7 @@ impl CommunicationsSurface {
             }
 
             self.local_reaction_buttons(ui, msg.event_id);
-            self.message_keep_affordances(ui);
+            self.message_keep_affordances(ui, data, sink, space, msg.event_id);
 
             match affordance {
                 AmendAffordance::Allowed => {
@@ -486,30 +485,98 @@ impl CommunicationsSurface {
         });
     }
 
-    /// Visible, honest keep controls for the operator-requested shared pins and
-    /// private saved messages slice. The read model currently carries no
-    /// message-level pinned/saved facts and [`CollabCommand`] has no matching
-    /// verbs, so the controls are deliberately disabled and this helper takes no
-    /// [`CommandSink`]. Once WL-FUNC-011 adds the backing contract, this is the
-    /// single row to make actionable.
-    pub(crate) fn message_keep_affordances(&self, ui: &mut egui::Ui) {
+    /// Render shared pin and actor-private save controls from the retained
+    /// projections and emit the corresponding typed command on activation.
+    pub(crate) fn message_keep_affordances(
+        &self,
+        ui: &mut egui::Ui,
+        data: &dyn crate::CollabData,
+        sink: &mut crate::CommandSink,
+        space: SpaceId,
+        message: EventId,
+    ) {
+        let pinned = data.message_pinned(space, message);
+        let saved = data.message_saved(space, message);
         ui.separator();
         ui.label(egui::RichText::new("Keep").small().color(Style::TEXT_DIM));
-        disabled_keep_button(
-            ui,
-            "Pin",
-            "Shared message pins are pending the real message-pin read model.",
-        );
-        disabled_keep_button(
-            ui,
-            "Save",
-            "Private saved messages are pending the local saved-message read model.",
-        );
-        ui.label(
-            egui::RichText::new("pending read model")
-                .small()
-                .color(Style::TEXT_DIM),
-        );
+        if ui
+            .add(
+                egui::Button::new(
+                    egui::RichText::new(if pinned { "Unpin" } else { "Pin" })
+                        .small()
+                        .color(if pinned { Style::WARN } else { Style::TEXT_DIM }),
+                )
+                .sense(egui::Sense::click()),
+            )
+            .on_hover_text(if pinned {
+                "Remove the shared pin"
+            } else {
+                "Pin for everyone in this space"
+            })
+            .clicked()
+        {
+            self.toggle_message_pin(sink, space, message, pinned);
+        }
+        if ui
+            .add(
+                egui::Button::new(
+                    egui::RichText::new(if saved { "Unsave" } else { "Save" })
+                        .small()
+                        .color(if saved { Style::WARN } else { Style::TEXT_DIM }),
+                )
+                .sense(egui::Sense::click()),
+            )
+            .on_hover_text(if saved {
+                "Remove your private saved mark"
+            } else {
+                "Save privately for this seat"
+            })
+            .clicked()
+        {
+            self.toggle_message_save(sink, space, message, saved);
+        }
+    }
+
+    /// Emit the shared pin toggle selected by the current read model.
+    pub(crate) fn toggle_message_pin(
+        &self,
+        sink: &mut crate::CommandSink,
+        space: SpaceId,
+        message: EventId,
+        pinned: bool,
+    ) {
+        sink.emit(if pinned {
+            CollabCommand::UnpinMessage {
+                space,
+                target: message,
+            }
+        } else {
+            CollabCommand::PinMessage {
+                space,
+                target: message,
+            }
+        });
+    }
+
+    /// Emit the local private-save toggle selected by the current read model.
+    pub(crate) fn toggle_message_save(
+        &self,
+        sink: &mut crate::CommandSink,
+        space: SpaceId,
+        message: EventId,
+        saved: bool,
+    ) {
+        sink.emit(if saved {
+            CollabCommand::UnsaveMessage {
+                space,
+                target: message,
+            }
+        } else {
+            CollabCommand::SaveMessage {
+                space,
+                target: message,
+            }
+        });
     }
 
     /// The per-seat quick-reaction chips. These mutate only local view state and
@@ -772,14 +839,6 @@ impl CommunicationsSurface {
         }
         self.thread_drafts.insert(thread, buf);
     }
-}
-
-fn disabled_keep_button(ui: &mut egui::Ui, label: &str, hint: &'static str) -> egui::Response {
-    ui.add_enabled(
-        false,
-        egui::Button::new(egui::RichText::new(label).small().color(Style::DISABLED)),
-    )
-    .on_disabled_hover_ui(move |ui| icons::comms_tooltip(ui, hint))
 }
 
 /// Match the command pipeline's 256 KiB UTF-8 body contract at the visible

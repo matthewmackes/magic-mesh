@@ -79,12 +79,28 @@ CREATE TABLE IF NOT EXISTS messages (
     body         TEXT NOT NULL,
     edited       INTEGER NOT NULL DEFAULT 0,
     deleted      INTEGER NOT NULL DEFAULT 0,
+    pinned       INTEGER NOT NULL DEFAULT 0,
     delivery     TEXT NOT NULL DEFAULT 'sent',
     clock_wall   INTEGER NOT NULL,
     clock_counter INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_space_order
     ON messages (space_id, clock_wall, clock_counter, event_id);
+
+-- Private saved-message marks. The actor key is part of the primary key and
+-- read-side queries always scope by it, so a saved mark never becomes a team
+-- visible message property.
+CREATE TABLE IF NOT EXISTS saved_messages (
+    space_id    TEXT NOT NULL,
+    actor       TEXT NOT NULL,
+    message_id  TEXT NOT NULL,
+    saved_ms    INTEGER NOT NULL,
+    clock_wall  INTEGER NOT NULL,
+    clock_counter INTEGER NOT NULL,
+    PRIMARY KEY (actor, message_id)
+);
+CREATE INDEX IF NOT EXISTS idx_saved_messages_actor_order
+    ON saved_messages (actor, clock_wall, clock_counter, message_id);
 
 -- Reply threads.
 CREATE TABLE IF NOT EXISTS threads (

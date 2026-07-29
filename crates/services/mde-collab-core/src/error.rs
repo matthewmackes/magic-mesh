@@ -121,6 +121,12 @@ pub enum CollabError {
     /// The message has already been deleted (tombstoned); no further edits.
     #[error("message {0} has been deleted")]
     TargetDeleted(EventId),
+    /// The message does not have a private saved mark for this actor.
+    #[error("message {0} is not privately saved")]
+    MessageNotSaved(EventId),
+    /// The actor already has a private saved mark for this message.
+    #[error("message {0} is already privately saved")]
+    MessageAlreadySaved(EventId),
 
     // ---- Validation: call media controls -------------------------------
     /// The requested DTMF tone is not representable as an RFC 4733 telephone

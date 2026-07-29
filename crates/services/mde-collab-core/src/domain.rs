@@ -8,7 +8,7 @@
 //! decision is deterministic across the mesh. This aggregate carries only what
 //! validation needs; the rendered read-models are the SQLite projection's job.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use mde_collab_types::event::CollabEventKind;
 use mde_collab_types::ids::{
@@ -73,6 +73,8 @@ pub struct MessageAgg {
     pub created_ms: i64,
     /// Whether it has been deleted (tombstoned).
     pub deleted: bool,
+    /// Whether the message has a shared team pin.
+    pub pinned: bool,
 }
 
 /// A channel task's validation facts.
@@ -124,6 +126,8 @@ pub struct DomainState {
     pub spaces: BTreeMap<SpaceId, SpaceAgg>,
     /// Messages by their event id.
     pub messages: BTreeMap<EventId, MessageAgg>,
+    /// Private saved-message marks, keyed by the actor who owns them.
+    pub saved_messages: BTreeMap<ActorId, BTreeSet<EventId>>,
     /// Threads → their space.
     pub threads: BTreeMap<ThreadId, SpaceId>,
     /// Basic channel tasks/action items by their creation event id.
@@ -222,6 +226,7 @@ impl DomainState {
                         author: env.actor.clone(),
                         created_ms: env.created_unix_ms,
                         deleted: false,
+                        pinned: false,
                     },
                 );
             }
@@ -231,6 +236,43 @@ impl DomainState {
                 if let Some(m) = self.messages.get_mut(target) {
                     if m.author == env.actor {
                         m.deleted = true;
+                        m.pinned = false;
+                    }
+                }
+            }
+            CollabEventKind::MessagePinned { target } => {
+                let authorized = self.is_member(space_id, &env.actor);
+                if let Some(m) = self.messages.get_mut(target) {
+                    if authorized && m.space == space_id && !m.deleted {
+                        m.pinned = true;
+                    }
+                }
+            }
+            CollabEventKind::MessageUnpinned { target } => {
+                let authorized = self.is_member(space_id, &env.actor);
+                if let Some(m) = self.messages.get_mut(target) {
+                    if authorized && m.space == space_id {
+                        m.pinned = false;
+                    }
+                }
+            }
+            CollabEventKind::MessageSaved { target } => {
+                let authorized = self.is_member(space_id, &env.actor)
+                    && self
+                        .messages
+                        .get(target)
+                        .is_some_and(|m| m.space == space_id && !m.deleted);
+                if authorized {
+                    self.saved_messages
+                        .entry(env.actor.clone())
+                        .or_default()
+                        .insert(*target);
+                }
+            }
+            CollabEventKind::MessageUnsaved { target } => {
+                if self.is_member(space_id, &env.actor) {
+                    if let Some(saved) = self.saved_messages.get_mut(&env.actor) {
+                        saved.remove(target);
                     }
                 }
             }
@@ -394,6 +436,14 @@ impl DomainState {
     #[must_use]
     pub fn is_owner(&self, space: SpaceId, actor: &ActorId) -> bool {
         matches!(self.role(space, actor), Some(SpaceRole::Owner))
+    }
+
+    /// Whether `actor` currently has a private saved mark for `message`.
+    #[must_use]
+    pub fn is_message_saved(&self, actor: &ActorId, message: EventId) -> bool {
+        self.saved_messages
+            .get(actor)
+            .is_some_and(|messages| messages.contains(&message))
     }
 }
 

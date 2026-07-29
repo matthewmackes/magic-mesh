@@ -126,6 +126,34 @@ pub enum CollabCommand {
         /// The message to delete.
         target: EventId,
     },
+    /// Pin a message for every member of the space.
+    PinMessage {
+        /// The space.
+        space: SpaceId,
+        /// The message to pin.
+        target: EventId,
+    },
+    /// Remove a shared pin from a message.
+    UnpinMessage {
+        /// The space.
+        space: SpaceId,
+        /// The message to unpin.
+        target: EventId,
+    },
+    /// Save a message for the issuing actor only.
+    SaveMessage {
+        /// The space.
+        space: SpaceId,
+        /// The message to save privately.
+        target: EventId,
+    },
+    /// Remove the issuing actor's private saved-message mark.
+    UnsaveMessage {
+        /// The space.
+        space: SpaceId,
+        /// The message to remove from private saves.
+        target: EventId,
+    },
     /// Start a reply thread rooted at a message.
     StartThread {
         /// The space.
@@ -446,6 +474,10 @@ impl CollabCommand {
             Self::SendMessage { .. } => "send_message",
             Self::EditMessage { .. } => "edit_message",
             Self::DeleteMessage { .. } => "delete_message",
+            Self::PinMessage { .. } => "pin_message",
+            Self::UnpinMessage { .. } => "unpin_message",
+            Self::SaveMessage { .. } => "save_message",
+            Self::UnsaveMessage { .. } => "unsave_message",
             Self::StartThread { .. } => "start_thread",
             Self::ReplyInThread { .. } => "reply_in_thread",
             Self::ResolveThread { .. } => "resolve_thread",

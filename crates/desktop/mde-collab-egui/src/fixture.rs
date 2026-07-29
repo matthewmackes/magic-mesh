@@ -12,8 +12,8 @@ use mde_collab_types::{
     ActivityEntry, ActivityFeed, ActorClock, ActorId, AlertInbox, CallKind, CallParticipantState,
     CallParticipantView, CallState, CallView, ChannelTasks, ClipboardLane, ConversationTimeline,
     DeliveryState, DiscordBridgeBoard, DocumentId, DocumentSessions, EventId, FileReferences,
-    MessageView, SpaceDirectory, SpaceId, SpaceKind, SpaceRole, SpaceSummary, ThreadId,
-    ThreadTimeline, TransferJobs,
+    MessagePins, MessageView, SavedMessages, SpaceDirectory, SpaceId, SpaceKind, SpaceRole,
+    SpaceSummary, ThreadId, ThreadTimeline, TransferJobs,
 };
 
 use crate::CollabData;
@@ -26,6 +26,8 @@ pub struct FixtureData {
     directory: SpaceDirectory,
     activity: HashMap<Option<SpaceId>, ActivityFeed>,
     conversations: HashMap<SpaceId, ConversationTimeline>,
+    message_pins: HashMap<SpaceId, MessagePins>,
+    saved_messages: SavedMessages,
     threads: HashMap<ThreadId, ThreadTimeline>,
     thread_roots: HashMap<EventId, ThreadId>,
     channel_tasks: HashMap<SpaceId, ChannelTasks>,
@@ -44,12 +46,18 @@ impl FixtureData {
     /// spaces or projections yet — build them up with the `with_*` methods.
     #[must_use]
     pub fn new(me: impl Into<ActorId>, now_unix_ms: i64) -> Self {
+        let me = me.into();
         Self {
-            me: me.into(),
+            me: me.clone(),
             now_unix_ms,
             directory: SpaceDirectory::default(),
             activity: HashMap::new(),
             conversations: HashMap::new(),
+            message_pins: HashMap::new(),
+            saved_messages: SavedMessages {
+                actor: me,
+                messages: Vec::new(),
+            },
             threads: HashMap::new(),
             thread_roots: HashMap::new(),
             channel_tasks: HashMap::new(),
@@ -82,6 +90,20 @@ impl FixtureData {
     #[must_use]
     pub fn with_conversation(mut self, timeline: ConversationTimeline) -> Self {
         self.conversations.insert(timeline.space, timeline);
+        self
+    }
+
+    /// Set the shared message pins for one space.
+    #[must_use]
+    pub fn with_message_pins(mut self, pins: MessagePins) -> Self {
+        self.message_pins.insert(pins.space, pins);
+        self
+    }
+
+    /// Set the local actor's private saved-message projection.
+    #[must_use]
+    pub fn with_saved_messages(mut self, saved: SavedMessages) -> Self {
+        self.saved_messages = saved;
         self
     }
 
@@ -355,6 +377,21 @@ impl CollabData for FixtureData {
 
     fn conversation(&self, space: SpaceId) -> Option<&ConversationTimeline> {
         self.conversations.get(&space)
+    }
+
+    fn message_pinned(&self, space: SpaceId, message: EventId) -> bool {
+        self.message_pins
+            .get(&space)
+            .is_some_and(|pins| pins.messages.contains(&message))
+    }
+
+    fn message_saved(&self, space: SpaceId, message: EventId) -> bool {
+        self.saved_messages.actor == self.me
+            && self
+                .saved_messages
+                .messages
+                .iter()
+                .any(|saved| saved.space == space && saved.message == message)
     }
 
     fn thread(&self, space: SpaceId, thread: ThreadId) -> Option<&ThreadTimeline> {

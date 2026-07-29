@@ -611,6 +611,235 @@ fn author_delete_within_window_tombstones_the_message() {
 }
 
 #[test]
+fn message_pin_and_private_save_round_trip_with_permissions() {
+    let mut alice = engine("alice");
+    let sa = sig(1);
+    let sb = sig(2);
+    let mut ia = SeqIds::new(1);
+    let mut ib = SeqIds::new(10_000);
+    let space = alice
+        .apply(
+            &CollabCommand::CreateSpace {
+                kind: SpaceKind::Team,
+                name: "ops".into(),
+            },
+            &sa,
+            &mut ia,
+            1_000,
+        )
+        .expect("create")[0]
+        .space_id;
+    alice
+        .apply(
+            &CollabCommand::AddMember {
+                space,
+                actor: ActorId::new("bob"),
+                role: SpaceRole::Member,
+            },
+            &sa,
+            &mut ia,
+            1_100,
+        )
+        .expect("add bob");
+    let message = alice
+        .apply(
+            &CollabCommand::SendMessage {
+                space,
+                thread: None,
+                body: MessageBody::new("keep this operational note"),
+            },
+            &sa,
+            &mut ia,
+            1_200,
+        )
+        .expect("post")[0]
+        .event_id;
+    alice
+        .apply(
+            &CollabCommand::PinMessage {
+                space,
+                target: message,
+            },
+            &sa,
+            &mut ia,
+            1_300,
+        )
+        .expect("pin");
+    alice
+        .apply(
+            &CollabCommand::SaveMessage {
+                space,
+                target: message,
+            },
+            &sa,
+            &mut ia,
+            1_400,
+        )
+        .expect("private save");
+
+    let pins = alice.projection().message_pins(space).expect("pins");
+    assert_eq!(pins.messages, vec![message]);
+    let alice_saved = alice
+        .projection()
+        .saved_messages(&ActorId::new("alice"))
+        .expect("alice saves");
+    assert_eq!(alice_saved.messages.len(), 1);
+    assert_eq!(alice_saved.messages[0].message, message);
+    assert!(alice
+        .projection()
+        .saved_messages(&ActorId::new("bob"))
+        .expect("bob saves")
+        .messages
+        .is_empty());
+
+    let duplicate_save = alice.apply(
+        &CollabCommand::SaveMessage {
+            space,
+            target: message,
+        },
+        &sa,
+        &mut ia,
+        1_500,
+    );
+    assert!(matches!(duplicate_save, Err(CollabError::MessageAlreadySaved(id)) if id == message));
+
+    let mut bob = engine("bob");
+    bob.merge(alice.all_events()).expect("bob syncs");
+    bob.apply(
+        &CollabCommand::SaveMessage {
+            space,
+            target: message,
+        },
+        &sb,
+        &mut ib,
+        1_600,
+    )
+    .expect("bob private save");
+    bob.apply(
+        &CollabCommand::UnpinMessage {
+            space,
+            target: message,
+        },
+        &sb,
+        &mut ib,
+        1_700,
+    )
+    .expect("bob unpins");
+    alice.merge(bob.all_events()).expect("alice converges");
+    assert!(alice
+        .projection()
+        .message_pins(space)
+        .expect("pins after unpin")
+        .messages
+        .is_empty());
+    assert_eq!(
+        alice
+            .projection()
+            .saved_messages(&ActorId::new("bob"))
+            .expect("bob saved projection")
+            .messages
+            .len(),
+        1
+    );
+
+    let mut mallory = engine("mallory");
+    mallory.merge(alice.all_events()).expect("mallory sees log");
+    let denied = mallory.apply(
+        &CollabCommand::PinMessage {
+            space,
+            target: message,
+        },
+        &sig(3),
+        &mut SeqIds::new(20_000),
+        1_800,
+    );
+    assert!(matches!(denied, Err(CollabError::NotMember { .. })));
+}
+
+#[test]
+fn message_pin_and_save_projection_converges_under_reordering() {
+    let mut alice = engine("alice");
+    let sa = sig(1);
+    let mut ia = SeqIds::new(1);
+    let space = alice
+        .apply(
+            &CollabCommand::CreateSpace {
+                kind: SpaceKind::Team,
+                name: "ops".into(),
+            },
+            &sa,
+            &mut ia,
+            1_000,
+        )
+        .expect("create")[0]
+        .space_id;
+    let message = alice
+        .apply(
+            &CollabCommand::SendMessage {
+                space,
+                thread: None,
+                body: MessageBody::new("convergent keep"),
+            },
+            &sa,
+            &mut ia,
+            1_100,
+        )
+        .expect("post")[0]
+        .event_id;
+    alice
+        .apply(
+            &CollabCommand::PinMessage {
+                space,
+                target: message,
+            },
+            &sa,
+            &mut ia,
+            1_200,
+        )
+        .expect("pin");
+    alice
+        .apply(
+            &CollabCommand::SaveMessage {
+                space,
+                target: message,
+            },
+            &sa,
+            &mut ia,
+            1_300,
+        )
+        .expect("save");
+    let corpus = alice.all_events();
+    let mut reference = engine("reference");
+    reference.merge(corpus.clone()).expect("reference merge");
+    let want = reference
+        .projection()
+        .dump_tables()
+        .expect("reference dump");
+
+    for seed in 1..12 {
+        let mut node = engine("offline");
+        for env in shuffle(&corpus, seed) {
+            node.merge(vec![env]).expect("offline event");
+        }
+        assert_eq!(
+            node.projection().dump_tables().expect("offline dump"),
+            want,
+            "pin/save projection diverged for shuffle seed {seed}"
+        );
+        assert_eq!(
+            node.projection()
+                .saved_messages(&ActorId::new("alice"))
+                .expect("offline saved projection")
+                .messages
+                .iter()
+                .map(|row| row.message)
+                .collect::<Vec<_>>(),
+            vec![message]
+        );
+    }
+}
+
+#[test]
 fn delete_space_is_owner_gated_and_blocks_further_commands() {
     let mut a = engine("alice");
     let sa = sig(1);

@@ -81,6 +81,7 @@ mod surface_card;
 mod surfaces;
 mod switcher;
 mod system;
+mod this_node_catalog;
 mod thisnode;
 mod timers;
 mod toast_bridge;
@@ -205,6 +206,7 @@ struct NavLocation {
     plane: Plane,
     fleet_mesh_tab: FleetMeshTab,
     this_node_tab: ThisNodeTab,
+    this_node_section: this_node_catalog::Section,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1107,6 +1109,10 @@ struct Shell {
     fleet_mesh_tab: FleetMeshTab,
     /// The selected view inside the unified This Node interface.
     this_node_tab: ThisNodeTab,
+    /// Search-selected section in the governed This Node hierarchy.
+    this_node_section: this_node_catalog::Section,
+    /// Persistent query for the This Node section search.
+    this_node_search: String,
     /// The onboard self-test watch (OW-10) — observes the `event/onboard/self-test`
     /// verdict lane and raises a one-shot edge the instant a node goes all-green, so
     /// the shell auto-opens the Mesh Map. The receive half of a flow whose publish
@@ -1265,6 +1271,8 @@ impl Shell {
             explorer: explorer::ExplorerState::default(),
             fleet_mesh_tab: FleetMeshTab::default(),
             this_node_tab: ThisNodeTab::default(),
+            this_node_section: this_node_catalog::Section::default(),
+            this_node_search: String::new(),
             self_test: mesh_view::SelfTestWatch::default(),
             timers: timers::TimersState::default(),
             power_honor: power_honor::PowerHonor::default(),
@@ -1357,11 +1365,14 @@ impl Shell {
         };
         let saved_fleet_mesh_tab = self.fleet_mesh_tab;
         let saved_this_node_tab = self.this_node_tab;
+        let saved_this_node_section = self.this_node_section;
+        let saved_this_node_search = self.this_node_search.clone();
         self.nav.expanded = true;
         self.nav.surface = location.surface;
         self.nav.plane = location.plane;
         self.fleet_mesh_tab = location.fleet_mesh_tab;
         self.this_node_tab = location.this_node_tab;
+        self.this_node_section = location.this_node_section;
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             mde_egui::capture::capture_ui_png(size, ppp, |capture_ctx| {
@@ -1375,6 +1386,8 @@ impl Shell {
         self.nav = saved_nav;
         self.fleet_mesh_tab = saved_fleet_mesh_tab;
         self.this_node_tab = saved_this_node_tab;
+        self.this_node_section = saved_this_node_section;
+        self.this_node_search = saved_this_node_search;
 
         match result {
             Ok(Ok(png)) => {
@@ -1420,6 +1433,7 @@ impl Shell {
             plane: self.nav.plane,
             fleet_mesh_tab: self.fleet_mesh_tab,
             this_node_tab: self.this_node_tab,
+            this_node_section: self.this_node_section,
         };
         if let Some(previous) = self.last_nav_location {
             if previous != current {
@@ -1439,6 +1453,7 @@ impl Shell {
         self.nav.plane = location.plane;
         self.fleet_mesh_tab = location.fleet_mesh_tab;
         self.this_node_tab = location.this_node_tab;
+        self.this_node_section = location.this_node_section;
         self.last_nav_location = Some(location);
     }
 
@@ -1448,14 +1463,17 @@ impl Shell {
         match self.nav.surface {
             Surface::System => {
                 self.this_node_tab = ThisNodeTab::System;
+                self.this_node_section = this_node_catalog::Section::Overview;
                 self.nav.surface = Surface::ThisNode;
             }
             Surface::Storage => {
                 self.this_node_tab = ThisNodeTab::Storage;
+                self.this_node_section = this_node_catalog::Section::Hardware;
                 self.nav.surface = Surface::ThisNode;
             }
             Surface::About => {
                 self.this_node_tab = ThisNodeTab::About;
+                self.this_node_section = this_node_catalog::Section::Hardware;
                 self.nav.surface = Surface::ThisNode;
             }
             _ => {}
@@ -1772,11 +1790,51 @@ impl Shell {
             Surface::About => ThisNodeTab::About,
             _ => self.this_node_tab,
         };
+        if self.nav.surface == Surface::System {
+            self.this_node_section = this_node_catalog::Section::Overview;
+        } else if self.nav.surface == Surface::Storage || self.nav.surface == Surface::About {
+            self.this_node_section = this_node_catalog::Section::Hardware;
+        }
         self.nav.surface = Surface::ThisNode;
 
         let mut tab = self.this_node_tab;
+        let mut section = self.this_node_section;
         ui.push_id("shell-this-node", |ui| {
             let _ = mde_egui::nav_chrome::NavigationBar::new("This Node").show(ui);
+            ui.horizontal(|ui| {
+                ui.label("Find a section");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.this_node_search)
+                        .hint_text("Search hardware, sound, mesh…")
+                        .desired_width(240.0),
+                );
+                if !self.this_node_search.is_empty() && ui.button("Clear").clicked() {
+                    self.this_node_search.clear();
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                for candidate in this_node_catalog::search(&self.this_node_search) {
+                    if ui
+                        .selectable_label(section == candidate, candidate.label())
+                        .on_hover_text(candidate.description())
+                        .clicked()
+                    {
+                        section = candidate;
+                    }
+                }
+            });
+            ui.separator();
+            if let Some(reason) = section.unavailable_reason() {
+                ui.group(|ui| {
+                    ui.label(egui::RichText::new(section.label()).strong());
+                    ui.label(section.description());
+                    ui.colored_label(Style::resolve_color(ui.ctx(), Style::TEXT_DIM), reason);
+                    ui.label(
+                        "No control is reported as successful until its provider is available.",
+                    );
+                });
+                return;
+            }
             ui.horizontal(|ui| {
                 for (candidate, label) in [
                     (ThisNodeTab::System, "System"),
@@ -1785,32 +1843,47 @@ impl Shell {
                 ] {
                     if ui.selectable_label(tab == candidate, label).clicked() {
                         tab = candidate;
+                        section = match candidate {
+                            ThisNodeTab::System => this_node_catalog::Section::Overview,
+                            ThisNodeTab::Storage | ThisNodeTab::About => {
+                                this_node_catalog::Section::Hardware
+                            }
+                        };
                     }
                 }
             });
             ui.separator();
-            match tab {
-                ThisNodeTab::System => {
-                    let system = &mut self.system;
-                    ui.push_id("this-node-system", |ui| {
-                        system.show(ui);
-                    });
-                }
-                ThisNodeTab::Storage => {
+            match (section, tab) {
+                (this_node_catalog::Section::Hardware, ThisNodeTab::Storage) => {
                     let storage = &mut self.storage;
-                    ui.push_id("this-node-storage", |ui| {
-                        storage.show(ui);
-                    });
+                    ui.push_id("this-node-storage", |ui| storage.show(ui));
                 }
-                ThisNodeTab::About => {
+                (this_node_catalog::Section::Hardware, _) => {
+                    tab = ThisNodeTab::About;
                     let dm = &mut self.device_manager;
-                    ui.push_id("this-node-about", |ui| {
-                        dm.show(ui);
-                    });
+                    ui.push_id("this-node-about", |ui| dm.show(ui));
                 }
+                (
+                    this_node_catalog::Section::Overview
+                    | this_node_catalog::Section::PowerPerformance
+                    | this_node_catalog::Section::MeshSystem,
+                    _,
+                ) => {
+                    tab = ThisNodeTab::System;
+                    let system = &mut self.system;
+                    ui.push_id("this-node-system", |ui| system.show(ui));
+                }
+                (
+                    this_node_catalog::Section::Connectivity
+                    | this_node_catalog::Section::DisplaySound
+                    | this_node_catalog::Section::Input
+                    | this_node_catalog::Section::Personalization,
+                    _,
+                ) => unreachable!("unavailable This Node section returned early"),
             }
         });
         self.this_node_tab = tab;
+        self.this_node_section = section;
     }
 
     /// Render the live topology view inside Fleet & Mesh.

@@ -27,6 +27,10 @@ pub enum CollabReadModel {
     Activity(ActivityFeed),
     /// A conversation or thread timeline.
     ConversationTimeline(ConversationTimeline),
+    /// Shared message pins for one space.
+    MessagePins(MessagePins),
+    /// Private saved messages for one local actor.
+    SavedMessages(SavedMessages),
     /// A thread timeline (root + replies).
     ThreadTimeline(ThreadTimeline),
     /// Basic channel tasks/action items.
@@ -143,6 +147,35 @@ pub struct MessageView {
     /// Reply count, when this message roots a thread.
     #[serde(default)]
     pub reply_count: u32,
+}
+
+/// The currently pinned messages in one space.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessagePins {
+    /// The space whose shared pins are listed.
+    pub space: SpaceId,
+    /// Pinned message ids in canonical message order.
+    pub messages: Vec<EventId>,
+}
+
+/// The private saved-message projection for one actor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedMessages {
+    /// The actor whose private marks are represented.
+    pub actor: ActorId,
+    /// Saved messages in canonical save order.
+    pub messages: Vec<SavedMessageView>,
+}
+
+/// One actor-scoped private saved-message row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedMessageView {
+    /// The space containing the saved message.
+    pub space: SpaceId,
+    /// The saved message id.
+    pub message: EventId,
+    /// When the current save mark was authored.
+    pub saved_unix_ms: i64,
 }
 
 /// A thread's root + replies.

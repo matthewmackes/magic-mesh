@@ -29,8 +29,9 @@ use mde_collab_types::read_model::{
     ActivityEntry, ActivityFeed, AlertInbox, AlertView, CallMediaAdapter, CallMediaReadiness,
     CallMediaRequirement, CallMediaSession, CallParticipantView, CallState, CallView, ChannelTasks,
     ClipboardLane, ClipboardView, ConversationTimeline, DocumentSession, DocumentSessions,
-    FileReferenceView, FileReferences, MessageView, PresenceBoard, PresenceView, SpaceDirectory,
-    SpaceSummary, TaskView, ThreadTimeline, TransferJobView, TransferJobs,
+    FileReferenceView, FileReferences, MessagePins, MessageView, PresenceBoard, PresenceView,
+    SavedMessageView, SavedMessages, SpaceDirectory, SpaceSummary, TaskView, ThreadTimeline,
+    TransferJobView, TransferJobs,
 };
 use mde_collab_types::value::{
     AlertPayload, CallKind, CallParticipantState, ClipItemKind, DeliveryState, FileRef,
@@ -59,6 +60,8 @@ const MAX_READ_MODEL_TEXT_BYTES: usize = 64 * 1024;
 // long history. The query probes one row beyond the accepted count so callers
 // receive an error instead of an arbitrary truncated timeline.
 const MAX_TIMELINE_MESSAGES: usize = 4096;
+const MAX_MESSAGE_PINS: usize = 4096;
+const MAX_SAVED_MESSAGES: usize = 4096;
 // The Activity tab is an operational feed, not a full audit export. Keep the
 // published per-space read model recent and bounded so opening Mesh Teams on a
 // modest seat does not deserialize/render an unbounded event history.
@@ -80,6 +83,7 @@ const SPACE_TABLES: &[&str] = &[
     "spaces",
     "members",
     "messages",
+    "saved_messages",
     "threads",
     "tasks",
     "alerts",
@@ -113,6 +117,7 @@ impl Projection {
 
     fn init(conn: Connection) -> Result<Self> {
         conn.execute_batch(SCHEMA)?;
+        ensure_message_pin_column(&conn)?;
         Ok(Self { conn })
     }
 
@@ -229,6 +234,64 @@ impl Projection {
             space,
             thread,
             messages,
+        })
+    }
+
+    /// The currently pinned messages for one space.
+    pub fn message_pins(&self, space: SpaceId) -> Result<MessagePins> {
+        let limit = MAX_MESSAGE_PINS + 1;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT event_id FROM messages WHERE space_id = ?1 AND pinned = 1 AND deleted = 0 \
+             ORDER BY clock_wall, clock_counter, event_id LIMIT {limit}"
+        ))?;
+        let rows = stmt.query_map(params![space.to_string()], |r| r.get::<_, String>(0))?;
+        let ids = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        if ids.len() > MAX_MESSAGE_PINS {
+            return Err(CollabError::Serde(format!(
+                "message pin read model exceeds {MAX_MESSAGE_PINS} rows"
+            )));
+        }
+        Ok(MessagePins {
+            space,
+            messages: ids
+                .into_iter()
+                .map(|id| parse_event(&id))
+                .collect::<Result<Vec<_>>>()?,
+        })
+    }
+
+    /// The private saved-message projection for `actor`.
+    pub fn saved_messages(&self, actor: &ActorId) -> Result<SavedMessages> {
+        let limit = MAX_SAVED_MESSAGES + 1;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT space_id, message_id, saved_ms FROM saved_messages \
+             WHERE actor = ?1 ORDER BY clock_wall, clock_counter, message_id LIMIT {limit}"
+        ))?;
+        let rows = stmt.query_map(params![actor.as_str()], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?;
+        let rows = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        if rows.len() > MAX_SAVED_MESSAGES {
+            return Err(CollabError::Serde(format!(
+                "saved-message read model exceeds {MAX_SAVED_MESSAGES} rows"
+            )));
+        }
+        Ok(SavedMessages {
+            actor: actor.clone(),
+            messages: rows
+                .into_iter()
+                .map(|(space, message, saved_unix_ms)| {
+                    Ok(SavedMessageView {
+                        space: parse_space(&space)?,
+                        message: parse_event(&message)?,
+                        saved_unix_ms,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
         })
     }
 
@@ -913,7 +976,17 @@ impl Projection {
         append_dump_text(out, "== ")?;
         append_dump_text(out, table)?;
         append_dump_text(out, "\n")?;
-        let sql = format!("SELECT * FROM {table} ORDER BY {order_by}");
+        // Keep the fingerprint stable across the narrow legacy migration that
+        // appends `messages.pinned` to an already-created SQLite table. An
+        // explicit column order avoids physical SQLite column order becoming a
+        // false convergence difference between old and new nodes.
+        let sql = if table == "messages" {
+            format!(
+                "SELECT space_id, event_id, author, created_ms, thread_id, body, edited, deleted, pinned, delivery, clock_wall, clock_counter FROM messages ORDER BY {order_by}"
+            )
+        } else {
+            format!("SELECT * FROM {table} ORDER BY {order_by}")
+        };
         let mut stmt = self.conn.prepare(&sql)?;
         let cols: Vec<String> = stmt
             .column_names()
@@ -934,6 +1007,28 @@ impl Projection {
         }
         Ok(())
     }
+}
+
+/// Add the message-pin column when opening a projection created before the
+/// pin/save slice landed. The migration is deliberately narrow: no existing
+/// message data is rewritten and unrelated schema errors still surface.
+fn ensure_message_pin_column(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(messages)")?;
+    let mut rows = stmt.query([])?;
+    let mut has_pinned = false;
+    while let Some(row) = rows.next()? {
+        if row.get::<_, String>(1)? == "pinned" {
+            has_pinned = true;
+            break;
+        }
+    }
+    if !has_pinned {
+        conn.execute(
+            "ALTER TABLE messages ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 // ---- The per-space + presence fold (the convergent rebuild) ---------------
@@ -1030,6 +1125,7 @@ struct SpaceFold {
     space: Option<SpaceRow>,
     members: BTreeMap<String, (SpaceRole, bool)>, // actor -> (role, present)
     messages: BTreeMap<EventId, MessageRow>,
+    saved_messages: BTreeMap<(ActorId, EventId), SavedMessageRow>,
     threads: BTreeMap<ThreadId, ThreadRow>,
     tasks: BTreeMap<EventId, TaskRow>,
     alerts: BTreeMap<EventId, AlertRow>,
@@ -1054,6 +1150,12 @@ struct MessageRow {
     body: String,
     edited: bool,
     deleted: bool,
+    pinned: bool,
+    clock: ActorClock,
+}
+struct SavedMessageRow {
+    space: SpaceId,
+    saved_ms: i64,
     clock: ActorClock,
 }
 struct ThreadRow {
@@ -1186,6 +1288,7 @@ impl SpaceFold {
                         body: body.0.clone(),
                         edited: false,
                         deleted: false,
+                        pinned: false,
                         clock: env.clock,
                     },
                 );
@@ -1204,7 +1307,43 @@ impl SpaceFold {
                     if m.author == env.actor {
                         m.deleted = true;
                         m.body = String::new();
+                        m.pinned = false;
                     }
+                }
+            }
+            CollabEventKind::MessagePinned { target } => {
+                let authorized = self.is_present_member(&env.actor);
+                if let Some(m) = self.messages.get_mut(target) {
+                    if authorized && !m.deleted {
+                        m.pinned = true;
+                    }
+                }
+            }
+            CollabEventKind::MessageUnpinned { target } => {
+                let authorized = self.is_present_member(&env.actor);
+                if let Some(m) = self.messages.get_mut(target) {
+                    if authorized {
+                        m.pinned = false;
+                    }
+                }
+            }
+            CollabEventKind::MessageSaved { target } => {
+                let authorized = self.is_present_member(&env.actor)
+                    && self.messages.get(target).is_some_and(|m| !m.deleted);
+                if authorized {
+                    self.saved_messages.insert(
+                        (env.actor.clone(), *target),
+                        SavedMessageRow {
+                            space,
+                            saved_ms: env.created_unix_ms,
+                            clock: env.clock,
+                        },
+                    );
+                }
+            }
+            CollabEventKind::MessageUnsaved { target } => {
+                if self.is_present_member(&env.actor) {
+                    self.saved_messages.remove(&(env.actor.clone(), *target));
                 }
             }
             CollabEventKind::ThreadStarted {
@@ -1470,6 +1609,12 @@ impl SpaceFold {
             .is_some_and(|(role, present)| *present && matches!(*role, SpaceRole::Owner))
     }
 
+    fn is_present_member(&self, actor: &ActorId) -> bool {
+        self.members
+            .get(actor.as_str())
+            .is_some_and(|(_, present)| *present)
+    }
+
     #[allow(clippy::too_many_lines)]
     fn write(&self, tx: &rusqlite::Transaction<'_>, space: SpaceId) -> Result<()> {
         let sid = space.to_string();
@@ -1501,8 +1646,8 @@ impl SpaceFold {
         }
         for (id, m) in &self.messages {
             tx.execute(
-                "INSERT INTO messages (space_id, event_id, author, created_ms, thread_id, body, edited, deleted, delivery, clock_wall, clock_counter) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'sent', ?9, ?10)",
+                "INSERT INTO messages (space_id, event_id, author, created_ms, thread_id, body, edited, deleted, pinned, delivery, clock_wall, clock_counter) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'sent', ?10, ?11)",
                 params![
                     sid,
                     id.to_string(),
@@ -1512,8 +1657,23 @@ impl SpaceFold {
                     m.body,
                     i64::from(m.edited),
                     i64::from(m.deleted),
+                    i64::from(m.pinned),
                     cw(m.clock),
                     cc(m.clock),
+                ],
+            )?;
+        }
+        for ((actor, message), row) in &self.saved_messages {
+            tx.execute(
+                "INSERT INTO saved_messages (space_id, actor, message_id, saved_ms, clock_wall, clock_counter) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    row.space.to_string(),
+                    actor.as_str(),
+                    message.to_string(),
+                    row.saved_ms,
+                    cw(row.clock),
+                    cc(row.clock),
                 ],
             )?;
         }
@@ -1699,6 +1859,7 @@ fn order_for(table: &str) -> String {
         "spaces" => "space_id".into(),
         "members" => "space_id, actor".into(),
         "messages" | "alerts" | "clipboard" => "event_id".into(),
+        "saved_messages" => "actor, message_id".into(),
         "threads" => "thread_id".into(),
         "tasks" => "task_event_id".into(),
         "file_refs" => "file_ref_id".into(),

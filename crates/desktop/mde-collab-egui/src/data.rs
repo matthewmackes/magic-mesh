@@ -55,6 +55,24 @@ pub trait CollabData {
     /// A space's main conversation timeline. `None` until one is projected.
     fn conversation(&self, space: SpaceId) -> Option<&ConversationTimeline>;
 
+    /// Whether the shared message-pin projection marks `message` in `space`.
+    /// Defaults to false for older data sources, which keeps the UI honest until
+    /// the source has supplied the real retained projection.
+    #[must_use]
+    fn message_pinned(&self, space: SpaceId, message: EventId) -> bool {
+        let _ = (space, message);
+        false
+    }
+
+    /// Whether the local actor privately saved `message` in `space`.
+    /// Defaults to false; a source must opt into the actor-scoped projection to
+    /// expose a saved mark.
+    #[must_use]
+    fn message_saved(&self, space: SpaceId, message: EventId) -> bool {
+        let _ = (space, message);
+        false
+    }
+
     /// A thread's root + replies, addressed by `thread` within `space`. `None`
     /// until the thread has been projected.
     fn thread(&self, space: SpaceId, thread: ThreadId) -> Option<&ThreadTimeline>;

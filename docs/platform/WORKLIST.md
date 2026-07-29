@@ -198,12 +198,14 @@ remains here under a completed status.
   already supports RDP/VNC/SPICE sessions and damage-aware texture uploads.
   RDP audio playback is currently disabled. The full pre-rework Browser
   inventory and decision record is preserved in the 2026-07-28 archive
-  snapshot.
+  snapshot. A current 199-path source/destination inventory, provenance
+  record, and fail-closed verifier now live under
+  `docs/design/browser-stack-extraction/` and `install-helpers/`.
 - Remaining work:
 
-  1. Record the source commit, workspace/package/process inventory, persistent
-     Browser data locations, focused test baseline, and a source-to-destination
-     path map. Classify components as Browser-owned, mixed-purpose, or shared.
+  1. Re-run and review the source commit, workspace/package/process inventory,
+     persistent Browser data locations, focused test baseline, and
+     source-to-destination path map before each extraction batch.
   2. Create a disposable history-filtered clone and publish
      `matthewmackes/magic-mesh-browser-stack` before deleting source from
      `magic-mesh`. Preserve attribution, relevant history, `LICENSE`, `NOTICE`,
@@ -360,8 +362,10 @@ remains here under a completed status.
   Activity, rich multiline composition, Details, local find, thread
   resolve/reopen, local reactions, provider placeholders, Discord status
   presentation, bounded Activity folds, and many signed/persistence boundaries
-  are implemented. Completed evidence is in the pre-rework archive; the parity
-  source is `docs/platform/WL-FUNC-011-parity-ledger.md`.
+  are implemented. Shared pin/save commands, events, projections, persistence,
+  and projected UI affordances now have focused farm coverage. Completed
+  evidence is in the pre-rework archive; the parity source is
+  `docs/platform/WL-FUNC-011-parity-ledger.md`.
 - Remaining work:
 
   1. Reconcile the parity ledger against current runtime/tests and leave only
@@ -370,9 +374,9 @@ remains here under a completed status.
      explicit surveyed retirement. Validate the combined etcd/overlay roster
      before publishing membership and populate the named system channel for
      every enrolled workstation.
-  2. Add shared pin and private saved-message commands, events, projections,
-     persistence, permissions, and active UI. Replace the current disabled
-     affordances; no pending control may remain at release.
+  2. Extend the landed shared pin/private-save baseline through the real Mesh
+     Teams runtime adapter and release acceptance; no pending control may
+     remain at release.
   3. Add basic channel task/action-item contracts, projections, ownership,
      completion state, offline convergence, and Posts/Details presentation.
      Bound the Notification Stream with severity-aware coalescing, virtualization,
@@ -489,7 +493,9 @@ remains here under a completed status.
   `action/clipboard/{list,pin,unpin,delete,clear}` verbs exist. Daemon history
   and bridge code, Mesh Teams presentation, and VNC cut-text primitives provide
   partial foundations, but the direct DRM seat path and complete bidirectional
-  protocol integration are not production-complete.
+  protocol integration are not production-complete. DRM/VNC clipboard state
+  handling and explicit RDP/SPICE capability reporting now have focused farm
+  coverage; real RDP/SPICE text channels remain unsupported.
 - Remaining work:
 
   1. Map direct-seat shortcuts into `egui::Event::{Copy,Cut,Paste}`, consume
@@ -502,9 +508,9 @@ remains here under a completed status.
      new entries, and disabling local publishing leaves remote history visible.
   4. Complete KDC/mobile inbound validation, authorization, size bounds,
      attribution, and active-seat materialization.
-  5. Prove bidirectional VNC `ClientCutText`/`ServerCutText`. Add real RDP and
-     SPICE text channels where supported; otherwise expose explicit protocol
-     capability status instead of fake success.
+  5. Complete bidirectional VNC `ClientCutText`/`ServerCutText` integration and
+     add real RDP/SPICE text channels where supported; retain explicit
+     unsupported capability status instead of fake success.
   6. Route Mesh Teams clipboard UI/actions to the same lane. Persist team
      history/actions for the session only, support per-user opt-out, and keep
      remote history visible when local publishing is disabled. Route Browser
@@ -577,33 +583,21 @@ remains here under a completed status.
   is absent. Raster MBTiles and an FTS5 gazetteer are installed for one small
   region. Maps owns real basemap/search seams, but Valhalla is explicitly
   unwired, route/lane/speed helpers are synthetic, Airspace lacks bearing, and
-  several administration controls do not execute a backend action.
+  several administration controls do not execute a backend action. A typed v2
+  identity/radio/freshness/provenance baseline now dual-publishes beside v1,
+  with 11 mesh-type and 69 worker tests passing on the farm.
 - Remaining work:
   1. Consume WL-UX-009's platform-wide Carbon-requirement retirement and update
      the Maps/Car-specific authority while retaining egui, shared `Style`,
      Construct/Car, HIG principles, and Car Dark/Light modes. Inspect governance
      history first, leave `AGENTS.md` untouched, and do not create a repo-root
      `CLAUDE.md`.
-  2. Add versioned `VehicleState` v2. Include `schema_version`, monotonic
-     `sequence`, `observed_at_ms`, `published_at_ms`, `expected_interval_ms`,
-     MG90 ESN/alias, `management_node_id`, approval/share state, manager set,
-     source/relay provenance, bounded radio inventory, feed health, and
-     per-domain freshness. Publish at
-     `state/vehicle/<management-node>/<mg90-id>`; accept v1 for one rolling
-     upgrade release, map missing fields to `Unknown`, then remove the reader.
-  3. Define stable `RadioId` values for Cellular A/B, Wi-Fi A/B, Bluetooth, and
-     GNSS plus bounded extensions. Add `Installed`/`NotInstalled`/`Unknown`
-     presence and `Active`/`Standby`/`Acquiring`/`Degraded`/`Fault`/`Disabled`/
-     `Stale` operation, with reason code, age, configured role, and active-path
-     flag.
-  4. Add typed radio metrics and SKU discovery. Cellular carries SIM,
-     registration, carrier, technology, reported RSSI/RSRP/RSRQ/SINR, address,
-     and role; Wi-Fi carries WAN/AP role, association, SSID, band/channel, RSSI,
-     clients, and backhaul; Bluetooth carries powered/scan/discoverable and
-     bounded device counts; GNSS carries fix, satellites, HDOP/accuracy, dead
-     reckoning, rate, and age. Cellular B is `NotInstalled` only when proven;
-     antenna state appears only when reported. Ethernet/VPN are paths, not
-     radios; LMR/satellite appear only after a typed probe detects them.
+  2. Extend the landed versioned `VehicleState` v2 baseline to multiple MG90s,
+     multiple managers, and the full rolling-upgrade removal plan.
+  3. Extend the landed bounded `RadioId`/health inventory with live SKU
+     discovery, multiple-manager routing, and consumer-side stale/resync state.
+  4. Extend the landed typed radio metrics with proven device discovery and
+     live adapter coverage; never infer absent hardware or zero-fill telemetry.
   5. Refactor the vehicle worker into independent schedulers for multiple MG90s
      and multiple managers: fast status, slow enrichers, direct-Ethernet-first
      transport, authorized mesh fallback, and a publisher that emits on change
@@ -878,12 +872,14 @@ remains here under a completed status.
   partial UI and provider foundations. Several controls are read-only or
   presentation-only, durable routes are duplicated, and no unified typed
   hardware action boundary covers connectivity, audio, input, performance,
-  docks, and OEM capabilities.
+  docks, and OEM capabilities. This Node now has a governed eight-section
+  catalog, persistent section/search navigation, legacy route normalization,
+  and visibly unavailable provider states, with focused farm coverage.
 - Remaining work:
 
-  1. Consolidate durable routes into one This Node sidebar and search index.
-     Normalize legacy deep links to the corresponding page; keep Control Center
-     transient and status chrome glanceable.
+  1. Finish the durable This Node sidebar and search index across every
+     provider-backed page; keep Control Center transient and status chrome
+     glanceable.
   2. Implement NetworkManager/ModemManager connectivity: Wi-Fi, Ethernet,
      cellular/APN, hotspot, DNS/proxy, and imported WireGuard/OpenVPN. Preserve
      `nebula1`, mesh DNS/routes, and lighthouse reachability; use an in-process
