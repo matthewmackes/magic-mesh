@@ -27,10 +27,135 @@ reconciliation text, is preserved at
   against the shared clipboard/theme contracts; complete the real navigation
   and offline-map cutover; complete This Node using the same state and visual
   primitives; and cut Construct over to the full-width search-first taskbar.
-- **Evidence policy:** unavailable hardware, stale installed packages, rendered
-  screenshots, and external-provider demonstrations are recorded honestly but
-  do not keep implementation-complete epics active. Runtime claims still require
-  live evidence or an explicit unavailable-hardware note.
+- **Delivery policy:** build one integrated engineering-preview release from the
+  seven epics. Publish the preview with unavailable live evidence documented;
+  production promotion is a separate decision and requires every selected live
+  gate to pass. The preview is not a production-readiness claim.
+- **Rollout policy:** deploy the preview to Dell, Eagle, and seat 15
+  simultaneously, using seat 15 for observation. Require all three lighthouses
+  and the complete six-node substrate before production promotion. Do not rely
+  on rollback; a failed node is repaired by re-enrollment and corrected forward
+  deployment.
+- **Repository policy:** the local GitHub checkout is authoritative for commits
+  and pushes. Farm lanes fetch the pushed revision; BigBoy runs the longest
+  build/test gate. Heavy build and release validation remains farm-only.
+- **Evidence policy:** implementation metrics and deterministic tests remain
+  required for acceptance, but no new post-release monitoring surface is added.
+  Human GUI review is the required visual signoff. Missing live hardware,
+  external providers, or stale installed packages are recorded honestly for the
+  preview and remain hard gates for production promotion.
+
+## Survey Decision Register - 2026-07-29
+
+The following decisions are normative modifications to the active epics below.
+The latest survey answer wins when it conflicts with an older planning note;
+the current code, governance, and archive remain evidence sources. These are
+implementation instructions, not a second worklist.
+
+### Integrated release actions
+
+1. Keep the seven active epics separate for ownership and acceptance, but build
+   one integrated engineering-preview release. Do not mark an epic complete or
+   promote the platform to production until its stated production gates pass.
+2. Use the local checkout as the source of truth. Commit and push the selected
+   revision directly to `master`; farm jobs fetch that exact GitHub revision.
+   No additional review guard is required by this operator decision, but farm
+   gates remain mandatory.
+3. Keep Fedora 43 thin-lighthouse packages separate from Fedora 44 workstation
+   packages. Auto-upgrade role-package drift during deployment and verify the
+   resulting role contract before declaring a node healthy.
+4. Deploy the preview to Dell, Eagle, and seat 15 simultaneously; use seat 15
+   as the observation seat rather than a pre-rollout canary. Require all three
+   lighthouses, canonical substrate completeness, hard resource budgets, and a
+   hard free-space floor for production promotion.
+5. If an upgrade fails, stop promotion, preserve diagnostics, re-enroll the
+   failed node, and deploy a corrected revision forward. Do not make rollback a
+   required recovery path. Preserve prior signed artifacts for provenance only.
+6. Record the operator decisions in this file and keep dated archive snapshots
+   immutable. Completed implementation with missing live proof is archived with
+   the evidence gap for the preview, while production promotion remains gated.
+
+### Cross-epic contract actions
+
+1. Make the public `magic-mesh-browser-stack` repository history-bearing and
+   independently buildable before deleting the host Browser. Browser VM sizing
+   is hardware-adaptive with safe operator bounds; RDP and Sunshine/Moonlight
+   are equal first-class display paths with explicit health and selection.
+2. Make Mesh Teams the single collaboration destination. Use named node channels
+   (`System · Dell`, `System · Eagle`, and `System · 15`), combined etcd/overlay
+   roster validation, deterministic last-writer-wins offline conflict handling,
+   per-user saved messages plus team pins, minimal channel tasks, disabled-until-
+   configured Discord, trusted-session remote control, and separate reference
+   removal versus permanent deletion.
+3. Make Mesh Teams the owner of persisted team clipboard history/actions. The
+   clipboard epic owns the transport and seat/VDI contract; use UTF-8 text,
+   same-team synchronization, mesh-membership trust, and session-only retention.
+   Files/Transfers remains the path for non-text or oversized content.
+4. Make Maps offline-capable with a native local routing engine and open or
+   zero-cost feeds. Show source age and disable unsafe actions for stale data.
+   Use the retained MG90 mirror with direct polling as a stale-data fallback,
+   enable GPS when Maps opens, retain no additional motion policy, and support
+   Quazar Dark/Light in Car. Live MG90 proof is a production gate, not a preview
+   blocker.
+5. Make This Node the only durable local settings route without retaining
+   legacy aliases. Keep Control Center transient. Allow typed, admin-authorized
+   remote hardware actions, use trusted-session authorization, expose unsupported
+   capabilities visibly, auto-recover unsafe profiles, warn before network
+   disruption, and require all named OEM adapters for production.
+6. Make Quazar the only platform visual language with Dark and Light modes,
+   balanced information density, licensed shared icons, expressive shared motion
+   with reduced-motion substitutions, the Terminal-pattern top bar with the
+   previously approved exemptions, and a 25%-thinner two-row zebra side tab bar.
+   Preserve the governed Maps content-color and focused-VDI exceptions; guest
+   Browser chrome remains outside Construct styling.
+7. Make the taskbar full-width with 40px targets, Front Door search as Start,
+   user-selected first-boot pins, pin/unpin personalization without reordering,
+   one focus underline, icon-only overflow, physical-screen centering, shared
+   Bottom/Left order, deleted App Grid, and focused-VDI auto-hide.
+
+### MG90 ownership, sharing, and cache contract
+
+1. Treat an MG90 as a network device attached to a workstation, not as a mesh
+   node or lighthouse. MG90-local state includes its radios, GNSS, IMU, WAN,
+   Ethernet, power, vehicle I/O, firmware, capabilities, and diagnostics.
+   Workstation-local state includes management credentials, the typed vehicle
+   worker, Bus publication, authorization, and audit. `management_node_id` is
+   the assignment; a workstation may manage multiple MG90 devices.
+2. Give every MG90 an independent snapshot and stable identity using ESN plus
+   operator alias. Permit multiple active workstation managers after discovery
+   and explicit approval. One approval covers all enrolled workstations; any
+   enrolled node may revoke immediately, revocation removes every assignment,
+   and re-sharing requires fresh approval. Only workstation roles may manage.
+3. Publish snapshots at
+   `state/vehicle/<management-node>/<mg90-id>`. Deduplicate competing manager
+   publications to the freshest valid complete snapshot, retain only the latest
+   stale manager snapshot for diagnostics, and show MG90 identity, management
+   node, source, age, and sharing state in normal Maps, Car, This Node, and
+   other relevant views. Remote views render the same reported domains as
+   read-only remote data; they never invent local hardware state.
+4. Use direct Ethernet first, then an authorized mesh path. Lighthouses are
+   transparent Nebula relays only: they never manage or store MG90 snapshots.
+   Fall back automatically to the healthy lowest-latency lighthouse, migrate
+   streams to a better relay, pause for a full snapshot resync, render the last
+   values with an explicit resyncing state, queue actions during resync, expire
+   queued actions with a visible failure, and reject duplicate queued writes for
+   the same setting while one is pending.
+5. Allow any active authorized manager to issue idempotent MG90 actions. Order
+   concurrent actions by mesh arrival time using last-accepted-action-wins;
+   actions already in flight may finish after revocation. A failed manager
+   triggers automatic takeover by another manager, the returning original
+   manager resumes automatically, queued actions are discarded during takeover,
+   and all nodes receive ephemeral takeover notifications. MG90 availability
+   is optional for workstation mesh readiness; all nodes retain the last shared
+   telemetry as stale when managers are offline.
+6. Keep stale data in a viewer-local, OS-protected cache for 24 hours. Cache
+   telemetry, redacted raw diagnostics, and action outcomes but never
+   credentials. Any local user may view or purge one MG90 or the whole cache;
+   revocation clears it immediately. Show alias/ESN, management node, last-seen
+   time, stale age, and relay path. Stale views are read-only. Under disk
+   pressure disable caching while live telemetry/actions continue with an
+   affected-view warning; automatic expiry and manual purge restore normal
+   behavior when space is available.
 
 ## Status Vocabulary
 
@@ -59,7 +184,7 @@ remains here under a completed status.
   mixed-purpose files, so deleting only the helper crates would leave reachable
   runtime and package seams.
 - Required outcome: The complete old host Browser stack is preserved in an
-  independent, history-bearing, clean-clone-buildable repository at
+  public, history-bearing, clean-clone-buildable repository at
   `matthewmackes/magic-mesh-browser-stack`. Construct ships no CEF/Servo host
   engine, helper, Browser worker family, Browser RPM, or Browser runtime
   installer. `Surface::Browser` remains, but it only starts or resumes a
@@ -104,14 +229,20 @@ remains here under a completed status.
      dependencies, binaries, runtime/model installers, policies, units, hooks,
      payload expectations, tests, and active host-Browser documentation.
   7. Add a reusable `browser-vm` profile using the existing
-     `DeliveryType::DesktopVm` contract. Defaults are 4 vCPU, 8 GiB RAM, and
-     64 GiB disk, operator-tunable through Workloads. The image contains
-     Chromium, supported GPU/video acceleration, PipeWire integration, guest
-     agents, and a supported RDP service.
+     `DeliveryType::DesktopVm` contract. Size it from host capabilities within
+     safe operator bounds, retaining 4 vCPU, 8 GiB RAM, and 64 GiB disk as the
+     baseline profile. The image contains Chromium, supported GPU/video
+     acceleration, PipeWire integration, and guest agents.
   8. Replace shell `web` state with a small VM controller. Browser activation
      resolves and starts/resumes the stable workload, waits for its advertised
-     desktop source, and attaches over RDP. SPICE then VNC are explicit degraded
-     fallbacks, never silent substitutes for the primary performance proof.
+     desktop source, and exposes RDP and Sunshine/Moonlight as equal first-class
+     display paths with explicit transport health and user-visible selection.
+     Sunshine/Moonlight is the default; unavailable default transport requires
+     an explicit one-time RDP choice rather than silent switching. Store the
+     mesh-wide preference in replicated settings, expose it in Browser settings
+     and This Node, and apply changes on the next Browser launch. If the selected
+     path is unavailable, offer the alternate path and a preference change; if
+     Sunshine/Moonlight audio fails, offer RDP.
   9. Preserve damage rectangles through VDI decode/apply/upload and add metrics
      for frame cadence, full/partial uploads, decode/apply/upload time,
      reconnects, shell repaint, and host CPU/GPU load. Enable RDP audio into
@@ -124,14 +255,15 @@ remains here under a completed status.
   11. Remove the stale host Browser visual exception from current authority.
       Guest Chromium owns its UI; only Construct-owned VM connection,
       unavailable, and diagnostic states use the shared Quazar language.
-  12. Cut over packages and upgrades only after the remote repository and clean
-      clone are proven. Remove obsolete services without deleting user data and
-      retain prior signed OSTree/RPM deployment as emergency rollback, not an
-      in-tree host Browser fallback.
+  12. Cut over packages and upgrades only after the public repository and clean
+      clone are proven. Remove obsolete services without deleting user data.
+      Preserve prior signed artifacts for provenance, but recover failed
+      upgrades by re-enrollment and corrected forward deployment rather than a
+      required rollback path.
 - Scope: This epic owns old-stack preservation, standalone buildability,
   user-state migration, complete Construct host-stack removal, Browser VM image
   and workload wiring, shell VDI behavior, guest audio/video quality,
-  install/upgrade cleanup, docs, and rollback. It does not mirror guest tabs,
+  install/upgrade cleanup, docs, and forward recovery. It does not mirror guest tabs,
   omnibox, extensions, or browser chrome into Construct v1, and it does not add
   a Browser-specific Workloads delivery type.
 - Relevant files/components: root workspace and packaging manifests;
@@ -159,9 +291,10 @@ remains here under a completed status.
      idempotent and reports imported/skipped/failed rows; downloads survive;
      secret material is never silently exposed.
   5. Opening Browser starts or resumes `browser-vm` through typed Workloads,
-     displays live Chromium over RDP, forwards focused input, and leaves shell
-     navigation usable. Missing sources and VM/transport crashes degrade only
-     the viewport.
+     displays live Chromium over RDP or Sunshine/Moonlight, forwards focused
+     input, and leaves shell navigation usable. Missing sources and VM/transport
+     crashes degrade only the viewport. Switching transport preserves the same
+     VM session and never silently changes the global preference.
   6. Switching away stops unnecessary host texture work without killing the
      guest; returning resumes the same session; no old Browser helper process is
      present on the host.
@@ -175,8 +308,10 @@ remains here under a completed status.
      100 ms p95 with no measured response over 250 ms; RDP damage produces
      partial uploads; hidden Browser state does not continuously repaint.
   10. Guest audio appears in the host PipeWire VM/application mixer path and
-      follows mute/volume policy. A silent fallback is explicitly degraded and
-      cannot satisfy release acceptance.
+      follows mute/volume policy. A silent fallback cannot satisfy production
+      acceptance; the engineering preview may record unavailable audio evidence.
+      Preview transport failure must show an explicit degraded warning and
+      production promotion requires working audio on the selected path.
   11. Clean install and upgrade remove obsolete runtime/package state without
       deleting user data. Current docs describe only the VM Browser; historical
       host Browser evidence remains archived.
@@ -217,8 +352,9 @@ remains here under a completed status.
   without losing accepted behavior. Teams/channels organize signed,
   offline-first messaging, threads, documents, files, transfers, calls, alerts,
   text clipboard history, tasks, Discord provenance, and assistive
-  DigitalOcean AI. One epic owns contracts, workers, projections, UI, migration,
-  package removal, and final acceptance.
+  DigitalOcean AI. Every enrolled workstation has a named system channel:
+  `System · Dell`, `System · Eagle`, and `System · 15`. One epic owns contracts,
+  workers, projections, UI, migration, package removal, and final acceptance.
 - Current state: `mde-collab-types`, `mde-collab-core`, `mde-collab-egui`, and
   shell/daemon integration exist. App/channel rails, Posts/Files/Calls,
   Activity, rich multiline composition, Details, local find, thread
@@ -231,19 +367,26 @@ remains here under a completed status.
   1. Reconcile the parity ledger against current runtime/tests and leave only
      open rows. Every accepted legacy command, route, hotkey, state writer,
      migration source, package entry, and workflow must map to Mesh Teams or an
-     explicit surveyed retirement.
+     explicit surveyed retirement. Validate the combined etcd/overlay roster
+     before publishing membership and populate the named system channel for
+     every enrolled workstation.
   2. Add shared pin and private saved-message commands, events, projections,
      persistence, permissions, and active UI. Replace the current disabled
      affordances; no pending control may remain at release.
   3. Add basic channel task/action-item contracts, projections, ownership,
      completion state, offline convergence, and Posts/Details presentation.
+     Bound the Notification Stream with severity-aware coalescing, virtualization,
+     and a visible pause/resume control so notification volume cannot hold the
+     interface down.
   4. Complete the real two-way Discord bridge: sealed configuration, channel
      mapping, inbound/outbound provenance, loop prevention, replay/idempotence,
-     bounded attachments, health/degraded state, and worker supervision.
+     bounded attachments, health/degraded state, and worker supervision. Keep
+     Discord disabled and visibly unconfigured until its provider is configured.
   5. Bind real microphone/camera/screen providers and finish direct WebRTC P2P,
      elected LiveKit SFU fallback/failover, SIP ingress/egress, advancing media,
      device switching, call controls, screen share, and remote-control
-     escalation. Recording and transcription remain absent.
+     escalation. Remote control requires a trusted-session approval. Recording
+     and transcription remain absent.
   6. Complete full-IDE Markdown document entry, Yrs coauthoring, anchored review
      threads, shared presence/follow mode, external-write three-way review,
      version history, and safe Git behavior.
@@ -258,7 +401,7 @@ remains here under a completed status.
      bounded consented context, cancellation/rate-limit behavior, suggestion
      attribution, and explicit user-apply flow. AI never mutates canonical
      state autonomously.
-  10. Add an idempotent, rollback-safe importer for legacy collaboration,
+  10. Add an idempotent, failure-safe importer for legacy collaboration,
       alert, clipboard-history, editor, file, transfer, SIP, launcher, and route
       state. Run parity comparison before cutover.
   11. When all parity rows pass, remove superseded routes, workers, state
@@ -287,9 +430,11 @@ remains here under a completed status.
   2. Signed two/three-node partition, replay, membership, tombstone, blob,
      backfill, and migration fixtures converge without loss, duplication,
      invalid authority, or resurrection.
-  3. Teams/channels, Activity, Posts/Files/Calls, Details, rich composition,
-     local find, threads, pins, saved messages, tasks, alerts, and contextual
+  3. Teams/channels, including each enrolled workstation's named system
+     channel, Activity, Posts/Files/Calls, Details, rich composition, local
+     find, threads, pins, saved messages, tasks, alerts, and contextual
      clipboard/transfer actions work with durable state and honest failures.
+     Notification floods remain bounded and cannot monopolize rendering.
   4. Documents provide the accepted full IDE, live coauthoring, anchored
      review, safe external-write merge, version history, and non-destructive Git
      behavior.
@@ -299,10 +444,11 @@ remains here under a completed status.
   6. Direct and SFU-relayed calls carry advancing audio/video/screen frames;
      SIP ingress/egress, device controls, failover, and remote-control
      escalation work; no recording/transcription artifact exists.
-  7. Discord is genuinely two-way with provenance and loop prevention.
+  7. Discord is genuinely two-way with provenance and loop prevention only
+     after sealed provider configuration; otherwise it is visibly disabled.
      DigitalOcean suggestions use consented bounded context, never auto-apply,
      and fail without impairing local collaboration.
-  8. Migration is repeatable and rollback-safe, the parity ledger has no open
+  8. Migration is repeatable and failure-safe, the parity ledger has no open
      row, and old runtime/package/doc surfaces are removed after cutover.
   9. Desktop, narrow/tablet, and Car render and interaction tests show no
      overlap, unbounded feeds, hidden commands, placeholders, or fabricated
@@ -336,7 +482,9 @@ remains here under a completed status.
   mesh/KDC producers, Mesh Teams history, and VDI guests through one canonical
   text lane. The active seat can publish and materialize clipboard rows without
   `wl-copy`/`wl-paste`; guests use real protocol channels or report explicit
-  unsupported status. Browser participates only as the `browser-vm` VDI guest.
+  unsupported status. Mesh Teams owns persisted team clipboard history/actions;
+  this epic owns transport and seat/VDI behavior. Browser participates only as
+  the `browser-vm` VDI guest.
 - Current state: The canonical `event/clipboard/clip` body and
   `action/clipboard/{list,pin,unpin,delete,clear}` verbs exist. Daemon history
   and bridge code, Mesh Teams presentation, and VNC cut-text primitives provide
@@ -349,20 +497,24 @@ remains here under a completed status.
   2. Publish local copies through `event/clipboard/clip` with stable content ID,
      source identity, RFC3339 time, size bounds, and echo/dedup guards.
   3. Fold that lane into daemon history and implement authorized target-seat
-     materialization without polling Wayland tools.
+     materialization without polling Wayland tools. Local publishing is automatic
+     for opted-in users; new users default to disabled, enabling publishes only
+     new entries, and disabling local publishing leaves remote history visible.
   4. Complete KDC/mobile inbound validation, authorization, size bounds,
      attribution, and active-seat materialization.
   5. Prove bidirectional VNC `ClientCutText`/`ServerCutText`. Add real RDP and
      SPICE text channels where supported; otherwise expose explicit protocol
      capability status instead of fake success.
-  6. Route Mesh Teams clipboard UI/actions to the same lane. Route Browser copy
-     and paste solely through its VDI protocol after WL-ARCH-008 removes host
-     Browser mediation.
+  6. Route Mesh Teams clipboard UI/actions to the same lane. Persist team
+     history/actions for the session only, support per-user opt-out, and keep
+     remote history visible when local publishing is disabled. Route Browser
+     copy and paste solely through its VDI protocol after WL-ARCH-008 removes
+     host Browser mediation.
 - Scope: UTF-8 text clipboard up to the existing 1 MiB guest transport cap,
-  direct DRM seat integration, canonical mesh history/actions, KDC/mobile
-  inbound materialization, and VDI host/guest channels. Arbitrary MIME, images,
-  secret classification/filtering, and direct guest access to host memory are
-  out of scope; Files/Transfers owns larger content.
+  direct DRM seat integration, Mesh Teams-owned session history/actions,
+  KDC/mobile inbound materialization, and VDI host/guest channels. Arbitrary
+  MIME, images, secret classification/filtering, and direct guest access to host
+  memory are out of scope; Files/Transfers owns larger content.
 - Relevant files/components: direct DRM handling in `mde-egui` and the shell;
   daemon clipboard sync/IPC/bridge workers; Mesh Teams clipboard presentation;
   `mde-vdi-rdp`, `mde-vdi-vnc`, and `mde-vdi-spice`.
@@ -373,8 +525,10 @@ remains here under a completed status.
 
   1. Copy/cut/paste works among local egui Editor, Terminal, and other text
      surfaces on the direct DRM seat without Wayland tools.
-  2. Every accepted producer emits the canonical body, history consumes that
-     lane, and authorized rows materialize on the target seat without loops.
+  2. Every accepted producer emits the canonical body, Mesh Teams history
+     consumes that lane for the session, and authorized rows materialize on the
+     target seat without loops. Local publish defaults off for new users and
+     opt-out never hides remote history.
   3. KDC/mobile ingress rejects malformed, oversized, unauthorized, duplicate,
      and echo payloads while preserving honest source attribution.
   4. VNC text is bidirectional over real RFB messages; RDP/SPICE use real
@@ -407,30 +561,36 @@ remains here under a completed status.
   cannot distinguish missing, failed, disabled, stale, or standby radios.
 - Required outcome: Maps is a production offline mapping and turn-by-turn
   product in Construct and Car. MG90 remains a Workstation-attached vehicle
-  gateway, never a node role. One typed snapshot accounts for Cellular A/B,
-  Wi-Fi A/B, Bluetooth, GNSS, and detected LMR/satellite extensions. A
-  persistent accessible health rail and gateway console expose honest
+  gateway, never a node role. Each MG90 has an independent, versioned snapshot
+  with ESN/alias identity, `management_node_id`, source/provenance, approval and
+  sharing state, and complete radio/GNSS/vehicle domains. Multiple workstation
+  managers may publish and issue authorized idempotent actions; remote nodes
+  render the freshest valid snapshot read-only, with stale/resync/cache state.
+  A persistent accessible health rail and gateway console expose honest
   per-radio state/freshness. Real route, maneuver, map, trip, and vehicle data
   replace placeholders. Carbon requirements retire while egui, shared `Style`,
   Construct, Car, and direct DRM remain governed.
 - Current state: `mackesd` publishes `state/vehicle/<node>` with online, GNSS,
   dual-cellular, one collapsed Wi-Fi string, Ethernet/VPN, power, ignition, and
-  partial airspace state. The live MG90 reports LTE/WAN and power but no GNSS
-  fix; OBD parsing is absent. Raster MBTiles and an FTS5 gazetteer are installed
-  for one small region. Maps owns real basemap/search seams, but Valhalla is
-  explicitly unwired, route/lane/speed helpers are synthetic, Airspace lacks
-  bearing, and several administration controls do not execute a backend action.
+  partial airspace state. The worker still assumes one managed MG90 and direct
+  Ethernet. The live MG90 reports LTE/WAN and power but no GNSS fix; OBD parsing
+  is absent. Raster MBTiles and an FTS5 gazetteer are installed for one small
+  region. Maps owns real basemap/search seams, but Valhalla is explicitly
+  unwired, route/lane/speed helpers are synthetic, Airspace lacks bearing, and
+  several administration controls do not execute a backend action.
 - Remaining work:
   1. Consume WL-UX-009's platform-wide Carbon-requirement retirement and update
      the Maps/Car-specific authority while retaining egui, shared `Style`,
-     Construct/Car, HIG principles, and always-dark Car. Inspect governance
+     Construct/Car, HIG principles, and Car Dark/Light modes. Inspect governance
      history first, leave `AGENTS.md` untouched, and do not create a repo-root
      `CLAUDE.md`.
   2. Add versioned `VehicleState` v2. Include `schema_version`, monotonic
      `sequence`, `observed_at_ms`, `published_at_ms`, `expected_interval_ms`,
-     gateway identity/capabilities, bounded radio inventory, feed health, and
-     per-domain source/provenance. Accept v1 for one rolling-upgrade release,
-     map its missing fields to `Unknown`, then delete the compatibility reader.
+     MG90 ESN/alias, `management_node_id`, approval/share state, manager set,
+     source/relay provenance, bounded radio inventory, feed health, and
+     per-domain freshness. Publish at
+     `state/vehicle/<management-node>/<mg90-id>`; accept v1 for one rolling
+     upgrade release, map missing fields to `Unknown`, then remove the reader.
   3. Define stable `RadioId` values for Cellular A/B, Wi-Fi A/B, Bluetooth, and
      GNSS plus bounded extensions. Add `Installed`/`NotInstalled`/`Unknown`
      presence and `Active`/`Standby`/`Acquiring`/`Degraded`/`Fault`/`Disabled`/
@@ -444,29 +604,35 @@ remains here under a completed status.
      reckoning, rate, and age. Cellular B is `NotInstalled` only when proven;
      antenna state appears only when reported. Ethernet/VPN are paths, not
      radios; LMR/satellite appear only after a typed probe detects them.
-  5. Refactor the vehicle worker into independent schedulers: a fast status
-     broadcast/lightweight-status receiver, slow LCI/SSH enrichers, and a
-     publisher that emits immediately on change plus a heartbeat at most every
-     2 seconds. Slow probes may time out without delaying the heartbeat or
-     erasing fresher fields. Consumers mark a domain stale after three declared
-     intervals and preserve the last sample only with a visible stale state.
+  5. Refactor the vehicle worker into independent schedulers for multiple MG90s
+     and multiple managers: fast status, slow enrichers, direct-Ethernet-first
+     transport, authorized mesh fallback, and a publisher that emits on change
+     plus a heartbeat at most every 2 seconds. Deduplicate to the freshest
+     complete snapshot. Slow probes may time out without delaying heartbeats or
+     erasing fresher fields; consumers mark domains stale after three intervals.
+     Lighthouses relay transparently without storing snapshots; relay migration
+     pauses for full resync and renders last values with a resyncing state.
   6. Complete proven MG90 adapters for identity, radio state, GNSS, power,
      GPIO, WAN policy, VPN, and device temperature. Decode OBD/HDOBD only from
      captured, sanitized, versioned fixtures that prove the payload schema and
-     units. Report `Unsupported`, `NotInstalled`, or a specific probe failure
-     instead of zero-filled telemetry.
+     units. Discovery requires explicit approval; report `Unsupported`,
+     `NotInstalled`, or a specific probe failure instead of zero-filled
+     telemetry, and never place credentials in snapshots, logs, or cache.
   7. Add a persistent Radio Health Rail to Free Drive and Active Route. Keep
      stable positions for the six native interfaces so every radio is
      accounted for. Use color plus shape/text: green check active, blue ring
      standby, amber triangle acquiring/degraded, red crossed link fault, gray
      pause disabled, gray slash not installed, and clock outline stale/unknown.
-     Keep signal strength and active-uplink selection separate. While moving,
-     the rail and its bounded detail sheet are read-only; parked Car and
-     Construct expose metrics, age, handoffs, failures, and diagnostics.
+     Keep signal strength and active-uplink selection separate. Car and
+     Construct expose metrics, age, handoffs, failures, diagnostics, management
+     node, source, relay, stale, and resync state without a motion-based policy.
   8. Replace MG90 administration with Overview, Radios & GNSS, Vehicle I/O, and
-     parked-only Maintenance, all driven by v2. Each enabled control uses an
-     allowlisted typed `action/vehicle/*` request with reply, timeout, audit,
-     confirmation, and in-motion gate; delete unsupported controls.
+     Maintenance, all driven by v2. Any active approved workstation manager may
+     issue an idempotent allowlisted typed `action/vehicle/*` request. Order
+     concurrent actions by mesh arrival time with last-accepted-action-wins;
+     queue during resync, expire failed queues, reject duplicate pending writes,
+     discard queues during takeover, and keep typed reply, timeout, audit, and
+     revocation behavior visible. Delete unsupported controls.
   9. Add typed route/session/maneuver/lane/limit/voice/reroute/cancel contracts
      and supervise local Valhalla over Bus request/reply. Disable Start until a
      route and compatible region are ready. Render only provider-returned
@@ -517,8 +683,9 @@ remains here under a completed status.
   Airspace source truth; Maps/Car icon and typography migration; rollout,
   cleanup, and proof. It does not create an MG90 node role, infer unreported
   antenna faults, configure carrier service, add paid map/feed providers,
-  mutate radios while moving, build a general fleet-management product, or
-  restyle unrelated Construct surfaces.
+  expose credentials, build a general fleet-management product, or restyle
+  unrelated Construct surfaces. Typed authorized actions are not blocked by a
+  motion policy; stale, unavailable, and unapproved actions remain disabled.
 - Relevant files/components:
   `crates/mesh/mackes-mesh-types/src/{vehicle,airspace}.rs`,
   `crates/mesh/mackesd/src/workers/{vehicle,airspace}.rs`,
@@ -546,12 +713,15 @@ remains here under a completed status.
      correct units, source, and observation age. GNSS no-fix shows satellites
      and freshness without claiming an antenna fault or usable position.
   5. Car shows the complete health rail on Free Drive and Active Route without
-     covering maneuver/ETA content. In-motion interaction is read-only and
-     bounded; parked and Construct diagnostics expose the full matrix.
+     covering maneuver/ETA content. Car and Construct expose the same bounded
+     matrix, including manager/source/stale/resync state, without a motion-based
+     policy.
   6. MG90 Overview, Radios & GNSS, Vehicle I/O, and Maintenance consume the
-     same snapshot. Every enabled control produces a real typed, authorized,
-     audited reply; no UI-only toggle, dead button, or unbounded command input
-     remains.
+     same snapshot. Multiple approved workstation managers, takeover,
+     revocation, idempotency, mesh-arrival ordering, resync queue expiry, and
+     read-only stale-cache behavior are covered. Every enabled control produces
+     a real typed, authorized, audited reply; no UI-only toggle, dead button, or
+     unbounded command input remains.
   7. OBD values appear only for a verified supported payload. Absent,
      unsupported, malformed, and stale OBD sources remain distinct and never
      produce zero-filled RPM, speed, fuel, temperature, or odometer readings.
@@ -576,18 +746,10 @@ remains here under a completed status.
       confirmed deletion.
   14. Bearing-less Airspace contacts never appear directional; scan source,
       radio health, age, and disruptive-scan gates are visible and tested.
-  15. Maps/Car uses no Carbon-required asset, identifier, or styling rule.
-      Current governance no longer mandates Carbon; shared `Style`, Construct,
-      Car, HIG principles, and direct DRM remain intact.
-  16. Vehicle v1-to-v2 rolling upgrade is tested in both orders, then the v1
-      reader and migration-only code are removed after the support window.
-  17. Installed MG90 radio/GNSS behavior and final Car/Construct workflows have
-      timestamped live/render evidence. Unavailable optional hardware is named
-      without weakening fixture, contract, or no-fabrication gates.
 - Verification method: Add bounded contract/property tests for vehicle v2,
   radio inventory/states, parser fixtures, cadence, time skew, and v1 rollout;
   deterministic worker tests with delayed/failed probes; route/maneuver,
-  map-render, region-integrity, trip, Airspace, in-motion, dead-control, and
+  map-render, region-integrity, trip, Airspace, dead-control, and
   screenshot tests. Run independent focused farm jobs for mesh types, `mackesd`,
   Maps, shell/Car, and packaging; put
   `@farm:{cargo test --workspace --all-targets}` and
@@ -621,11 +783,14 @@ remains here under a completed status.
 - Required outcome: Every Construct-owned egui surface reads as one dense,
   HIG-principled Quazar platform in Dark and Light: common app frame,
   navigation, state components, sheets/popovers, typography, icons, motion, and
-  data presentation. Car keeps its governed always-dark vehicle treatment;
-  focused VDI preserves full-screen pixels; guest applications, including
+  data presentation. Car supports governed Dark and Light modes; focused VDI
+  preserves full-screen pixels; guest applications, including
   Chromium in `browser-vm`, remain outside Construct styling. Carbon is not a
   theme or icon requirement; all retained or replacement assets use the shared
-  registry, have clear licensing, and form one coherent visual language.
+  registry, have clear licensing, and form one coherent visual language. The
+  Terminal-pattern unified top bar is shared across workspaces, with approved
+  exemptions recorded individually; the side tab bar is 25% thinner, two-row,
+  and zebra-striped for differentiation.
 - Current state: Kdam Thmor Pro, Quazar Light, shared typography/palette
   projection, themed tooltip cleanup, and governance alignment have landed.
   Core `mde-egui` navigation, sheet, popover, motion, style, and capture
@@ -640,13 +805,16 @@ remains here under a completed status.
      launchable egui surface and classify raw styling, one-off app frames,
      navigation, state views, dialogs, hover text, icons, motion, tables/lists,
      licensing, and dark/light gaps.
-  2. Finish the shared app-frame, top-bar/sidebar, loading/empty/stale/offline/
+  2. Finish the shared app-frame and Terminal-pattern unified top bar, including
+     the per-workspace exemption review. Complete loading/empty/stale/offline/
      error/destructive states, sheets, popovers, tooltips, table/list density,
      icon registry/cache, and centralized reduced-motion-safe primitives.
   3. Migrate shell chrome and every launchable workspace to those primitives,
-     preserving explicit Maps content-color and focused-VDI pixel exceptions.
+     matching Terminal's top-of-space pattern and preserving only explicitly
+     approved Maps content-color and focused-VDI pixel exceptions.
   4. Migrate Editor and Terminal internal tabs, toolbars, palettes, sidebars,
-     popovers, and status rows without changing editor/terminal behavior.
+     popovers, and status rows without changing editor/terminal behavior. Make
+     the side tab bar 25% thinner, two-row, and zebra-striped without clipping.
   5. Apply the shared language to Mesh Teams, This Node, and Construct-owned
      `browser-vm` connection/unavailable/diagnostic states. Do not style the
      guest Chromium viewport or reintroduce host Browser chrome.
@@ -672,7 +840,8 @@ remains here under a completed status.
   3. Editor and Terminal internal chrome is migrated; dense tables/lists are the
      default operational idiom; motion is centralized and reduced-motion safe.
   4. Maps content exceptions are marked, focused VDI retains full-screen pixels,
-     Car stays always dark, and guest Chromium receives no Construct chrome.
+     Car Dark/Light behavior is tested, and guest Chromium receives no
+     Construct chrome.
   5. Desktop, narrow, large-text, loading/error, and dynamic-data states render
      without overlap, clipping, hidden controls, or unstable geometry.
 - Verification method: Run focused and integrated farm tests for `mde-egui`,
@@ -700,9 +869,10 @@ remains here under a completed status.
 - Required outcome: `This Node` is the single searchable, progressively
   disclosed hardware center. Its hierarchy owns Overview; Connectivity;
   Display & Sound; Input; Power & Performance; Hardware; Personalization; and
-  Mesh & System. Controls operate through typed node-local contracts, preserve
-  mesh reachability, expose honest unavailable/degraded states, and bound
-  privileged/OEM writes with confirmation, audit, safety limits, and recovery.
+  Mesh & System. Controls operate through typed node-local contracts plus
+  admin-authorized trusted-session remote actions, preserve mesh reachability,
+  expose honest unavailable/degraded states, and bound privileged/OEM writes
+  with confirmation, audit, safety limits, and recovery.
 - Current state: Existing System, Storage, Device Manager, About, Control
   Center, status, BlueZ, display, power, firmware, and input code supplies
   partial UI and provider foundations. Several controls are read-only or
@@ -733,13 +903,14 @@ remains here under a completed status.
      unsupported states.
   7. Add a privileged node-local hardware worker with explicit actions for
      platform profile, bounded fan mode/curve, CPU power limit, GPU profile,
-     device enablement, and Thunderbolt authorization. Support standard kernel
-     interfaces plus capability-detected Microsoft Surface, Dell, Lenovo, HP,
-     and ASUS adapters.
+     device enablement, and Thunderbolt authorization. Permit only typed,
+     admin-authorized actions from trusted sessions when the target is remote.
+     Support standard kernel interfaces plus capability-detected Microsoft
+     Surface, Dell, Lenovo, HP, and ASUS adapters.
   8. Bound manufacturer writes with arming, confirmation, audit, thermal limits,
      watchdog recovery, and automatic safe-profile fallback. Never expose
-     arbitrary sysfs paths, raw MSR/SMI, `/dev/mem`, remote mutation, or shell
-     command composition from the UI.
+     arbitrary sysfs paths, raw MSR/SMI, `/dev/mem`, untyped remote mutation,
+     or shell command composition from the UI.
   9. Reconcile Control Center and status chrome with the same typed state:
      connectivity, Bluetooth, sound, LCD/keyboard brightness, power, underlay
      versus mesh health, numeric battery, and microphone/camera indicators.
@@ -747,10 +918,10 @@ remains here under a completed status.
       failure, destructive confirmation, and physical-device proof using
       WL-UX-009 components.
 - Scope: Local workstation hardware state, typed node-local mutation,
-  diagnostics, settings consolidation, capability discovery, quick controls,
-  and safe OEM adapters. Remote hardware mutation, arbitrary path writes,
-  lock/PAM replacement, raw privileged interfaces, and host application
-  ecosystems are out of scope.
+  admin-authorized trusted-session remote mutation, diagnostics, settings
+  consolidation, capability discovery, quick controls, and safe OEM adapters.
+  Arbitrary path writes, lock/PAM replacement, raw privileged interfaces, and
+  host application ecosystems are out of scope.
 - Relevant files/components: shell This Node/System/Storage/Device Manager/
   Control Center/status/direct-seat modules; `mde-seat` and shared `mde-egui`;
   typed mesh contracts, daemon hardware/firmware workers, and package/provider
@@ -768,7 +939,8 @@ remains here under a completed status.
      reachability, and keep credentials out of observable state.
   3. Keyboard backlight, tap-to-click, device policy, battery/power, thermals,
      fans, CPU/GPU, firmware, docks, storage, and supported OEM controls perform
-     real bounded node-local actions.
+     real bounded node-local actions. Typed remote actions require admin
+     authorization and a trusted session and never expose arbitrary paths.
   4. Unsupported capabilities stay visible but disabled with a reason; provider
      loss/stale data never appears successful.
   5. Privileged actions are allowlisted, armed, audited, thermally constrained,
@@ -805,10 +977,11 @@ remains here under a completed status.
 - Required outcome: Construct Bottom mode is a full-width, Windows 11-inspired
   taskbar with icon-only navigation left, a geometrically centered
   user-managed workspace strip, and placement utility right. Start opens and
-  focuses Front Door search. New and migrated profiles begin with Fleet & Mesh,
-  Workloads, VMs, Terminal, Maps, Mesh Teams, Files, Music, Media, and Browser.
-  Exactly one underline identifies the focused workspace; no running/open
-  indicator exists. Home is an icon-free wallpaper and the App Grid is deleted.
+  focuses Front Door search. New profiles choose their initial pins during
+  first boot; migrated profiles preserve valid existing pins and never silently
+  restore a default list. Exactly one underline identifies the focused
+  workspace; no running/open indicator exists. Home is an icon-free wallpaper
+  and the App Grid is deleted.
 - Current state: `nav_bar.rs` owns persisted `Floating`/`Docked` placement, a
   640x64 bottom pill, grouped launchers, chooser-pinned desktops, 24px minimum
   shrink behavior, and a slide/melt transition. `front_door.rs` already has
@@ -838,22 +1011,23 @@ remains here under a completed status.
      focus. Clicking while visible refocuses the same overlay; it never creates
      a Start menu or second search path. Use the tooltip/accessibility name
      `Start - Search`.
-  5. Replace `DOCK_LAUNCHER_GROUPS` with ordered `DEFAULT_TASKBAR_PINS`:
+  5. Replace `DOCK_LAUNCHER_GROUPS` with a searchable pin catalog containing
      `FleetMesh`, `InfraCode`, `Desktop`, `Terminal`, `MapsLocation`,
      `Communications`, `Files`, `Music`, `Media`, and `Browser`. Present
      `InfraCode` as `Workloads` without renaming its internal enum or breaking
      persisted/deep-link compatibility. Present `FleetMesh` as `Fleet & Mesh`.
+     Use a first-boot pin selector for new profiles rather than auto-pinning
+     the catalog.
   6. Version `settings-nav-bar.json` with `schema_version`, existing serialized
-     placement, and ordered `pinned_surfaces`. Migrate a legacy mode-only file
-     to the ten defaults while preserving placement. Retain the first duplicate,
+     placement, and ordered `pinned_surfaces`. Preserve valid existing pins,
      discard unknown surfaces, bound the list to the searchable catalog, and
-     fall back only when no valid versioned pin list exists. After migration,
-     user choices are authoritative and defaults are not silently restored.
-  7. Add personalization. Front Door app results expose `Pin to taskbar` or
-     `Unpin from taskbar`. Taskbar icons expose `Move left`, `Move right`, and
-     `Unpin from taskbar`; pointer drag reorders the same list. Persist context
-     actions and completed drops immediately. Start, Back, Home, overflow, and
-     placement controls cannot be pinned, moved, or removed.
+     send new profiles through first-boot selection. Never silently restore a
+     default list after migration; user choices remain authoritative.
+  7. Add pin/unpin personalization only. Front Door app results expose `Pin to
+     taskbar` or `Unpin from taskbar`; taskbar icons expose `Unpin from taskbar`.
+     Do not implement drag, move-left, move-right, or reorder actions. Persist
+     pin changes immediately. Start, Back, Home, overflow, and placement
+     controls cannot be pinned or removed.
   8. Add icon-only responsive overflow without recreating an App Grid. Keep
      40px targets and move excess pins into a `MoreHorizontal` single-column
      flyout with tooltips/accessibility names. Close it on activation, Escape,
@@ -896,9 +1070,11 @@ remains here under a completed status.
      not move the centered strip.
   3. Start opens and focuses Front Door without a Start menu, duplicate search
      engine, or duplicate overlay.
-  4. Fresh and legacy profiles show all ten defaults, including Fleet & Mesh
-     and Workloads. Pin, unpin, drag/context reorder, restart persistence,
-     malformed recovery, and placement preservation are tested.
+  4. New profiles complete first-boot pin selection; migrated profiles preserve
+     valid pins without silently restoring defaults. Fleet & Mesh and Workloads
+     are available in the searchable catalog. Pin, unpin, restart persistence,
+     malformed recovery, and placement preservation are tested; no reorder or
+     drag path exists.
   5. Exactly one focus underline appears for Home, every pinned surface, Fleet
      & Mesh aliases, Workloads, and matching pinned desktops. No open/running
      marker or taskbar Close action exists.
@@ -916,7 +1092,7 @@ remains here under a completed status.
       and this worklist consistently describe the taskbar and contain no stale
       pill/App Grid lock.
 - Verification method: Run worklist, doc-supersession, diff, and focused
-  preference/geometry/action/search/context/drag/focus/overflow/Home tests. Run
+  preference/geometry/action/search/context/pin/focus/overflow/Home tests. Run
   complete `mde-shell-egui`, `mde-egui`, and `mde-theme` tests on the build
   farm, with the longest shell gate on BigBoy. Produce deterministic Dark/Light
   captures at 480x480, 800x600, 1280x800, and 1920x1080 covering normal,
