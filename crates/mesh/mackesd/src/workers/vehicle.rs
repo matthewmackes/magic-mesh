@@ -58,12 +58,14 @@ use std::io::{self, Read, Write};
 use std::net::{IpAddr, UdpSocket};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use mackes_mesh_types::vehicle::{
-    parse_gpgga, vehicle_state_topic, CellLink, GpsFix, ImuSample, VehicleReply, VehicleState,
-    VehicleTelem, WanStatus, VEHICLE_ACTION_PREFIX,
+    parse_gpgga, vehicle_state_topic, vehicle_state_v2_topic, CellLink, GpsFix, ImuSample,
+    SnapshotProvenance, SnapshotSource, VehicleReply, VehicleState, VehicleStateV2, VehicleTelem,
+    WanStatus, VEHICLE_ACTION_PREFIX,
 };
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
@@ -699,6 +701,8 @@ pub struct VehicleWorker {
     db_path: PathBuf,
     /// Poll + heartbeat cadence.
     poll: Duration,
+    /// Per-management-node monotonic v2 snapshot sequence.
+    sequence: AtomicU64,
     /// Shared, fail-closed authorization gate for destructive Bus mutations.
     authorizer: Arc<ActionAuthorizer>,
 }
@@ -719,6 +723,7 @@ impl VehicleWorker {
             bus_root: crate::bus_publish::default_bus_root(),
             db_path: crate::default_db_path(),
             poll: POLL,
+            sequence: AtomicU64::new(0),
             authorizer: Arc::new(ActionAuthorizer::production()),
         }
     }
@@ -911,11 +916,52 @@ impl VehicleWorker {
         }
     }
 
-    /// Publish the current mirror to `state/vehicle/<host>` (best-effort, exactly
-    /// like the `cloud` worker's `publish_state`).
+    /// Build the additive v2 snapshot from the same probe fold as the v1
+    /// compatibility mirror. The sequence is allocated only here/publish, so
+    /// every worker instance has a monotonic stream without fabricating device
+    /// timestamps or telemetry.
+    #[must_use]
+    pub fn build_state_v2(&self, probe: &dyn VehicleProbe) -> VehicleStateV2 {
+        let state = self.build_state(probe);
+        self.snapshot_v2(&state)
+    }
+
+    fn snapshot_v2(&self, state: &VehicleState) -> VehicleStateV2 {
+        let published_at_ms = now_ms();
+        VehicleStateV2::from_v1(
+            state,
+            self.host.clone(),
+            self.sequence.fetch_add(1, Ordering::Relaxed) + 1,
+            self.poll.as_millis().try_into().unwrap_or(u64::MAX),
+            published_at_ms,
+            SnapshotProvenance {
+                source: SnapshotSource::DirectGateway,
+                source_id: Some(self.host.clone()),
+                relay: None,
+            },
+        )
+    }
+
+    /// Publish the v1 compatibility mirror and, when the gateway ESN is
+    /// confirmed, the identity-addressed v2 mirror. An unknown ESN is never
+    /// replaced with a synthetic topic segment.
     fn publish(&self, state: &VehicleState) {
         if let Some(mut persist) = crate::bus_publish::open_bus(self.bus_root.clone()) {
             crate::bus_publish::publish_json(&mut persist, &vehicle_state_topic(&self.host), state);
+            let v2 = self.snapshot_v2(state);
+            if !v2.mg90.id.is_empty() {
+                crate::bus_publish::publish_json(
+                    &mut persist,
+                    &vehicle_state_v2_topic(&v2.management_node_id, &v2.mg90.id),
+                    &v2,
+                );
+            } else {
+                tracing::debug!(
+                    target: "mackesd::vehicle",
+                    host = %self.host,
+                    "v2 vehicle snapshot withheld until MG90 ESN is confirmed"
+                );
+            }
         }
     }
 
@@ -1991,6 +2037,79 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         );
         assert!(!state.telem.obd_present);
         assert!(state.telem.ignition_on);
+    }
+
+    #[test]
+    fn builds_versioned_v2_snapshot_with_radio_health_and_monotonic_sequence() {
+        let w = worker();
+        let first = w.build_state_v2(&FakeProbe::real());
+        let second = w.build_state_v2(&FakeProbe::real());
+
+        assert_eq!(first.schema_version, 2);
+        assert_eq!(first.sequence, 1);
+        assert_eq!(second.sequence, 2);
+        assert_eq!(first.management_node_id, "rig-1");
+        assert_eq!(first.mg90.id, "ND84720078011035");
+        assert_eq!(first.expected_interval_ms, POLL.as_millis() as u64);
+        assert_eq!(first.radios.len(), 6);
+
+        let cellular_a = &first.radios.as_slice()[0];
+        assert_eq!(cellular_a.id.as_str(), "cellular-a");
+        assert_eq!(
+            cellular_a.operation,
+            mackes_mesh_types::vehicle::RadioOperation::Active
+        );
+        assert_eq!(
+            cellular_a.presence,
+            mackes_mesh_types::vehicle::RadioPresence::Installed
+        );
+        match &cellular_a.metrics {
+            mackes_mesh_types::vehicle::RadioMetrics::Cellular(metrics) => {
+                assert_eq!(metrics.rssi_dbm, Some(-72));
+                assert_eq!(metrics.rsrp_dbm, None, "unreported RSRP stays absent");
+            }
+            other => panic!("unexpected cellular metrics: {other:?}"),
+        }
+        assert_eq!(
+            first.radios.as_slice()[4].operation,
+            mackes_mesh_types::vehicle::RadioOperation::Unknown
+        );
+        assert_eq!(
+            first.radios.as_slice()[5].operation,
+            mackes_mesh_types::vehicle::RadioOperation::Acquiring
+        );
+        assert_eq!(
+            first.freshness.radios.state,
+            mackes_mesh_types::vehicle::FreshnessState::Fresh
+        );
+        assert_eq!(
+            first.freshness.vehicle.state,
+            mackes_mesh_types::vehicle::FreshnessState::Unknown,
+            "OBD remains an explicit unavailable domain"
+        );
+    }
+
+    #[test]
+    fn publishes_legacy_and_identity_addressed_v2_topics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let w = worker().with_bus_root(Some(tmp.path().to_path_buf()));
+        let state = w.build_state(&FakeProbe::real());
+        w.publish(&state);
+
+        let persist = Persist::open(tmp.path().to_path_buf()).unwrap();
+        let legacy = persist
+            .list_since(&vehicle_state_topic("rig-1"), None)
+            .unwrap();
+        assert_eq!(legacy.len(), 1);
+        let v2_topic =
+            mackes_mesh_types::vehicle::vehicle_state_v2_topic("rig-1", "ND84720078011035");
+        let v2 = persist.list_since(&v2_topic, None).unwrap();
+        assert_eq!(v2.len(), 1);
+        let snapshot: mackes_mesh_types::vehicle::VehicleStateV2 =
+            serde_json::from_str(v2[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!(snapshot.schema_version, 2);
+        assert_eq!(snapshot.management_node_id, "rig-1");
+        assert_eq!(snapshot.mg90.esn, "ND84720078011035");
     }
 
     #[test]
