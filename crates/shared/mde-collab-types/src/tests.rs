@@ -114,11 +114,18 @@ fn every_event_kind() -> Vec<CollabEventKind> {
             title: "check the gateway".into(),
             source: Some(EventId::new()),
         },
+        CollabEventKind::TaskUpdated {
+            task: EventId::new(),
+            title: "check the gateway twice".into(),
+        },
         CollabEventKind::TaskChecked {
             task: EventId::new(),
             checked: true,
         },
         CollabEventKind::TaskCompleted {
+            task: EventId::new(),
+        },
+        CollabEventKind::TaskReopened {
             task: EventId::new(),
         },
         CollabEventKind::AlertRaised {
@@ -311,12 +318,21 @@ fn every_command() -> Vec<CollabCommand> {
             title: "check the gateway".into(),
             source: Some(EventId::new()),
         },
+        CollabCommand::UpdateTask {
+            space: SpaceId::new(),
+            task: EventId::new(),
+            title: "check the gateway twice".into(),
+        },
         CollabCommand::SetTaskChecked {
             space: SpaceId::new(),
             task: EventId::new(),
             checked: true,
         },
         CollabCommand::CompleteTask {
+            space: SpaceId::new(),
+            task: EventId::new(),
+        },
+        CollabCommand::ReopenTask {
             space: SpaceId::new(),
             task: EventId::new(),
         },
@@ -474,7 +490,7 @@ fn every_event_kind_round_trips_and_has_a_unique_tag() {
         );
     }
     // Guards against a variant being added without an accompanying sample here.
-    assert_eq!(tags.len(), 43, "sample set must cover every event kind");
+    assert_eq!(tags.len(), 45, "sample set must cover every event kind");
 }
 
 #[test]
@@ -487,7 +503,7 @@ fn every_command_round_trips_and_has_a_unique_verb() {
         assert_eq!(*c, back, "round-trip {}", c.verb());
         assert!(verbs.insert(c.verb()), "duplicate verb {}", c.verb());
     }
-    assert_eq!(verbs.len(), 51, "sample set must cover every command");
+    assert_eq!(verbs.len(), 53, "sample set must cover every command");
 }
 
 /// The delivery-lock gate: each of the seven replaced subsystems must have at

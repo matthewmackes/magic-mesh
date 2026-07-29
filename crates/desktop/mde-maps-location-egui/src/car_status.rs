@@ -49,9 +49,11 @@ pub enum CarStatusItem {
     AltitudeFt,
     UpdateRate,
     FixAge,
+    GnssFreshness,
     LocationSource,
     // ── Connectivity (MG90 WAN) ──────────────────────────────────────────
     ActiveWan,
+    RadioHealth,
     CellASignal,
     CellABars,
     CellACarrier,
@@ -82,7 +84,7 @@ pub enum CarStatusItem {
 
 impl CarStatusItem {
     /// The full catalog, in menu order (grouped by domain).
-    pub const ALL: [Self; 48] = [
+    pub const ALL: [Self; 51] = [
         Self::SpeedMph,
         Self::SpeedKph,
         Self::Heading,
@@ -106,8 +108,10 @@ impl CarStatusItem {
         Self::AltitudeFt,
         Self::UpdateRate,
         Self::FixAge,
+        Self::GnssFreshness,
         Self::LocationSource,
         Self::ActiveWan,
+        Self::RadioHealth,
         Self::CellASignal,
         Self::CellABars,
         Self::CellACarrier,
@@ -131,6 +135,7 @@ impl CarStatusItem {
         Self::TelemetrySource,
         Self::TelemetryAge,
         Self::NavEta,
+        Self::NavSummary,
     ];
 
     /// The short label shown above the value in the strip tile.
@@ -160,8 +165,10 @@ impl CarStatusItem {
             Self::AltitudeFt => "ALT FT",
             Self::UpdateRate => "GPS RATE",
             Self::FixAge => "FIX AGE",
+            Self::GnssFreshness => "GNSS FRESH",
             Self::LocationSource => "SOURCE",
             Self::ActiveWan => "WAN",
+            Self::RadioHealth => "RADIO HEALTH",
             Self::CellASignal => "CELL A",
             Self::CellABars => "SIGNAL A",
             Self::CellACarrier => "CARRIER A",
@@ -276,8 +283,15 @@ impl CarStatusItem {
             // fix gate like the other GPS-derived tiles.
             Self::UpdateRate => gf(|x| format!("{:.0} Hz", x.update_rate_hz)),
             Self::FixAge => gf(|x| format!("{:.0} s", x.update_age_s)),
+            Self::GnssFreshness => s
+                .vehicle_radio_health
+                .gnss_freshness
+                .state
+                .label()
+                .to_string(),
             Self::LocationSource => s.locations.primary.label().to_string(),
             Self::ActiveWan => empty_dash(&w.active_wan),
+            Self::RadioHealth => s.vehicle_radio_health.summary(),
             Self::CellASignal => signal_dbm(w.cellular_a.signal_dbm),
             Self::CellABars => bars(w.cellular_a.signal_dbm),
             Self::CellACarrier => empty_dash(&w.cellular_a.carrier),
@@ -455,9 +469,11 @@ impl CarStatusSelection {
             slots: vec![
                 CarStatusItem::HeadingCardinal,
                 CarStatusItem::GpsFix,
+                CarStatusItem::GnssFreshness,
                 CarStatusItem::Satellites,
                 CarStatusItem::BatteryV,
                 CarStatusItem::ActiveWan,
+                CarStatusItem::RadioHealth,
                 CarStatusItem::CellABars,
                 CarStatusItem::LinkQuality,
                 CarStatusItem::LatencyMs,
@@ -919,5 +935,34 @@ mod tests {
         assert_eq!(CarStatusItem::LatencyMs.value(&s), "—");
         assert_eq!(CarStatusItem::PacketLoss.value(&s), "—");
         assert_eq!(CarStatusItem::CellABars.value(&s), "▯▯▯▯▯");
+    }
+
+    #[test]
+    fn typed_radio_tiles_show_unavailable_then_typed_unknown_state() {
+        use mackes_mesh_types::vehicle::{
+            SnapshotProvenance, VehicleState as WireVehicleState, VehicleStateV2,
+        };
+
+        let empty = MapsLocationSurface::live();
+        assert_eq!(CarStatusItem::RadioHealth.value(&empty), "unavailable");
+        assert_eq!(CarStatusItem::GnssFreshness.value(&empty), "Unknown");
+
+        let mut legacy = WireVehicleState::offline("rig-1");
+        legacy.online = true;
+        legacy.model = "MG90".to_string();
+        legacy.esn = "ESN-TEST".to_string();
+        legacy.published_at_ms = test_now_ms();
+        let snapshot = VehicleStateV2::from_v1(
+            &legacy,
+            "rig-1",
+            1,
+            5_000,
+            legacy.published_at_ms,
+            SnapshotProvenance::default(),
+        );
+        let mut typed = MapsLocationSurface::live();
+        typed.refresh_from_vehicle_v2(&snapshot);
+        assert_eq!(CarStatusItem::RadioHealth.value(&typed), "degraded");
+        assert_eq!(CarStatusItem::GnssFreshness.value(&typed), "Unknown");
     }
 }

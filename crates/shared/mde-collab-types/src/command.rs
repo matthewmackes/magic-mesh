@@ -197,6 +197,15 @@ pub enum CollabCommand {
         #[serde(default)]
         source: Option<EventId>,
     },
+    /// Update an open channel task/action-item title.
+    UpdateTask {
+        /// The space/channel that owns the task.
+        space: SpaceId,
+        /// The task creation event id.
+        task: EventId,
+        /// The replacement short operator-authored title.
+        title: String,
+    },
     /// Set a task's lightweight checked state.
     SetTaskChecked {
         /// The space/channel that owns the task.
@@ -208,6 +217,13 @@ pub enum CollabCommand {
     },
     /// Mark a channel task complete.
     CompleteTask {
+        /// The space/channel that owns the task.
+        space: SpaceId,
+        /// The task creation event id.
+        task: EventId,
+    },
+    /// Reopen a completed channel task/action item.
+    ReopenTask {
         /// The space/channel that owns the task.
         space: SpaceId,
         /// The task creation event id.
@@ -483,8 +499,10 @@ impl CollabCommand {
             Self::ResolveThread { .. } => "resolve_thread",
             Self::ReopenThread { .. } => "reopen_thread",
             Self::CreateTask { .. } => "create_task",
+            Self::UpdateTask { .. } => "update_task",
             Self::SetTaskChecked { .. } => "set_task_checked",
             Self::CompleteTask { .. } => "complete_task",
+            Self::ReopenTask { .. } => "reopen_task",
             Self::AckAlert { .. } => "ack_alert",
             Self::SnoozeAlert { .. } => "snooze_alert",
             Self::RunAlertAction { .. } => "run_alert_action",

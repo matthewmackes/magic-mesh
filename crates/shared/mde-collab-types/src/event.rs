@@ -145,6 +145,13 @@ pub enum CollabEventKind {
         #[serde(default)]
         source: Option<EventId>,
     },
+    /// An open task's title was updated.
+    TaskUpdated {
+        /// The task creation event id.
+        task: EventId,
+        /// The replacement short operator-authored title.
+        title: String,
+    },
     /// A task's lightweight checked state changed.
     TaskChecked {
         /// The task creation event id.
@@ -154,6 +161,11 @@ pub enum CollabEventKind {
     },
     /// A task was completed.
     TaskCompleted {
+        /// The task creation event id.
+        task: EventId,
+    },
+    /// A completed task was reopened.
+    TaskReopened {
         /// The task creation event id.
         task: EventId,
     },
@@ -359,8 +371,10 @@ impl CollabEventKind {
             Self::ThreadResolved { .. } => "thread_resolved",
             Self::ThreadReopened { .. } => "thread_reopened",
             Self::TaskCreated { .. } => "task_created",
+            Self::TaskUpdated { .. } => "task_updated",
             Self::TaskChecked { .. } => "task_checked",
             Self::TaskCompleted { .. } => "task_completed",
+            Self::TaskReopened { .. } => "task_reopened",
             Self::AlertRaised { .. } => "alert_raised",
             Self::AlertAcknowledged { .. } => "alert_acknowledged",
             Self::AlertSnoozed { .. } => "alert_snoozed",

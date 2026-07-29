@@ -5,9 +5,9 @@
 //! verbs (list/status/provision/configure/instance-*) keep their behavior; legacy
 //! workspace-wide destroy is explicitly refused;
 //! the U1a Workloads verbs (set-desired/plan/inventory/output/image-build/
-//! container-deploy/console-attach/android-provision) land here as honest
-//! `not-yet-wired` skeletons — recognized + routed, never faked (§7). U4–U10 each
-//! own one skeleton handler, so this dispatch is the worker's serialize point.
+//! container-deploy/console-attach/android-provision/browser-provision) land here as
+//! typed handlers or honest gates — recognized + routed, never faked (§7). U4–U10
+//! each own one handler, so this dispatch is the worker's serialize point.
 //!
 //! The armed-token gate ([`super::gate`]) is applied here at APPLY time for the
 //! implemented mutations; placement routing (which node dispatches at all) is the
@@ -21,8 +21,8 @@ use serde::Deserialize;
 
 use mackes_mesh_types::cloud::{
     CloudReply, LifecycleAction, CLOUD_ACTION_SCHEMA_VERSION, CLOUD_ARM_NODE_SCOPE,
-    VERB_ANDROID_PROVISION, VERB_CONSOLE_ATTACH, VERB_CONTAINER_DEPLOY, VERB_IMAGE_BUILD,
-    VERB_INVENTORY, VERB_OUTPUT, VERB_PLAN, VERB_SET_DESIRED,
+    VERB_ANDROID_PROVISION, VERB_BROWSER_PROVISION, VERB_CONSOLE_ATTACH, VERB_CONTAINER_DEPLOY,
+    VERB_IMAGE_BUILD, VERB_INVENTORY, VERB_OUTPUT, VERB_PLAN, VERB_SET_DESIRED,
 };
 
 use super::runner::CloudRunOutcome;
@@ -38,6 +38,7 @@ mod container_lifecycle;
 mod image;
 // Disjoint per-verb handler modules (one unit each owns its file).
 mod android; // U9 · android-provision
+mod browser; // WL-ARCH-008 · browser-provision
 mod console; // U8 · console-attach
 mod inventory; // U10 · inventory + output
 
@@ -87,6 +88,8 @@ pub(crate) enum CloudVerb {
     ConsoleAttach,
     /// `android-provision` — the two-layer Cuttlefish path (MUTATION; skeleton, U10).
     AndroidProvision,
+    /// `browser-provision` — declare the dedicated Desktop VM browser workload.
+    BrowserProvision,
 }
 
 impl CloudVerb {
@@ -123,6 +126,7 @@ impl CloudVerb {
             "container-destroy" => Self::ContainerDestroy,
             v if v == VERB_CONSOLE_ATTACH => Self::ConsoleAttach,
             v if v == VERB_ANDROID_PROVISION => Self::AndroidProvision,
+            v if v == VERB_BROWSER_PROVISION => Self::BrowserProvision,
             _ => return None,
         })
     }
@@ -147,6 +151,7 @@ impl CloudVerb {
                 | Self::ContainerDestroy
                 | Self::ConsoleAttach
                 | Self::AndroidProvision
+                | Self::BrowserProvision
         )
     }
 
@@ -329,7 +334,8 @@ pub(crate) fn dispatch(w: &CloudWorker, verb_name: &str, body_str: &str) -> Clou
             container_lifecycle::handle_destroy(w, verb_name, &body, raw)
         }
 
-        // ── wired MUTATIONS — console-attach (U8) + android-provision (U9) ──
+        // ── wired MUTATIONS — console-attach (U8), android-provision (U9),
+        // browser-provision (WL-ARCH-008) ──
         CloudVerb::ConsoleAttach => {
             let Some(target) = console::authorization_target(&body) else {
                 return console::handle(verb_name, &body);
@@ -345,6 +351,23 @@ pub(crate) fn dispatch(w: &CloudWorker, verb_name: &str, body_str: &str) -> Clou
                 return reply;
             }
             android::handle(w, verb_name, &body)
+        }
+        CloudVerb::BrowserProvision => {
+            let target = match browser::authorization_target(&body) {
+                Ok(target) => target,
+                Err(error) => {
+                    return CloudReply {
+                        ok: false,
+                        verb: verb_name.to_string(),
+                        error: Some(error),
+                        ..Default::default()
+                    }
+                }
+            };
+            if let Some(reply) = authorization_refusal(w, verb_name, &body, target, raw) {
+                return reply;
+            }
+            browser::handle(w, verb_name, &body)
         }
 
         // ── implemented MUTATIONS — the armed-token gate ──
@@ -710,6 +733,10 @@ mod tests {
             Some(CloudVerb::AndroidProvision)
         );
         assert_eq!(
+            CloudVerb::from_verb("browser-provision"),
+            Some(CloudVerb::BrowserProvision)
+        );
+        assert_eq!(
             CloudVerb::from_verb("container-restart"),
             Some(CloudVerb::ContainerRestart)
         );
@@ -735,6 +762,7 @@ mod tests {
         assert!(CloudVerb::Provision.is_mutation());
         assert!(CloudVerb::SetDesired.is_mutation());
         assert!(CloudVerb::AndroidProvision.is_mutation());
+        assert!(CloudVerb::BrowserProvision.is_mutation());
         assert!(CloudVerb::ContainerRestart.is_mutation());
         assert!(!CloudVerb::ContainerLogs.is_mutation());
         assert!(CloudVerb::ContainerDestroy.is_mutation());

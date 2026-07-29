@@ -60,6 +60,10 @@ const MAX_READ_MODEL_TEXT_BYTES: usize = 64 * 1024;
 // long history. The query probes one row beyond the accepted count so callers
 // receive an error instead of an arbitrary truncated timeline.
 const MAX_TIMELINE_MESSAGES: usize = 4096;
+// A channel task list is a bounded operational read, not an unbounded audit
+// export. Probe one row beyond the accepted count and fail closed.
+const MAX_CHANNEL_TASKS: usize = 4096;
+const MAX_TASK_TITLE_BYTES: usize = 512;
 const MAX_MESSAGE_PINS: usize = 4096;
 const MAX_SAVED_MESSAGES: usize = 4096;
 // The Activity tab is an operational feed, not a full audit export. Keep the
@@ -323,12 +327,13 @@ impl Projection {
 
     /// A space's basic channel tasks/action items.
     pub fn channel_tasks(&self, space: SpaceId) -> Result<ChannelTasks> {
-        let mut stmt = self.conn.prepare(
+        let limit = MAX_CHANNEL_TASKS + 1;
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT task_event_id, title, created_by, created_ms, source_event_id, checked, \
-             completed, completed_by, completed_ms \
-             FROM tasks WHERE space_id = ?1 \
-             ORDER BY completed, clock_wall, clock_counter, task_event_id",
-        )?;
+                 completed, completed_by, completed_ms \
+                 FROM tasks WHERE space_id = ?1 \
+                 ORDER BY completed, clock_wall, clock_counter, task_event_id LIMIT {limit}"
+        ))?;
         let rows = stmt.query_map(params![space.to_string()], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -342,7 +347,13 @@ impl Projection {
                 r.get::<_, Option<i64>>(8)?,
             ))
         })?;
-        let mut tasks = Vec::new();
+        let rows = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        if rows.len() > MAX_CHANNEL_TASKS {
+            return Err(CollabError::Serde(format!(
+                "channel task read model exceeds {MAX_CHANNEL_TASKS} rows"
+            )));
+        }
+        let mut tasks = Vec::with_capacity(rows.len());
         for row in rows {
             let (
                 task,
@@ -354,7 +365,7 @@ impl Projection {
                 completed,
                 completed_by,
                 completed_ms,
-            ) = row?;
+            ) = row;
             ensure_read_model_text("task title", &title)?;
             tasks.push(TaskView {
                 task: parse_event(&task)?,
@@ -1227,6 +1238,7 @@ impl SpaceFold {
     #[allow(clippy::too_many_lines)]
     fn apply(&mut self, space: SpaceId, env: &CollabEventEnvelope) {
         let _ = space;
+        let previous_last_clock = self.last_clock;
         if env.clock > self.last_clock {
             self.last_clock = env.clock;
         }
@@ -1372,6 +1384,13 @@ impl SpaceFold {
                 }
             }
             CollabEventKind::TaskCreated { title, source } => {
+                let source_valid = source
+                    .is_none_or(|message| self.messages.get(&message).is_some_and(|m| !m.deleted));
+                if !self.is_present_member(&env.actor) || !source_valid || !valid_task_title(title)
+                {
+                    self.last_clock = previous_last_clock;
+                    return;
+                }
                 self.tasks.insert(
                     env.event_id,
                     TaskRow {
@@ -1387,23 +1406,66 @@ impl SpaceFold {
                     },
                 );
             }
+            CollabEventKind::TaskUpdated { task, title } => {
+                if !self.is_present_member(&env.actor) || !valid_task_title(title) {
+                    self.last_clock = previous_last_clock;
+                    return;
+                }
+                let Some(t) = self.tasks.get_mut(task) else {
+                    self.last_clock = previous_last_clock;
+                    return;
+                };
+                if !t.completed {
+                    t.title.clone_from(title);
+                    t.clock = env.clock;
+                }
+            }
             CollabEventKind::TaskChecked { task, checked } => {
-                if let Some(t) = self.tasks.get_mut(task) {
-                    if !t.completed {
-                        t.checked = *checked;
-                        t.clock = env.clock;
-                    }
+                if !self.is_present_member(&env.actor) {
+                    self.last_clock = previous_last_clock;
+                    return;
+                }
+                let Some(t) = self.tasks.get_mut(task) else {
+                    self.last_clock = previous_last_clock;
+                    return;
+                };
+                if !t.completed {
+                    t.checked = *checked;
+                    t.clock = env.clock;
                 }
             }
             CollabEventKind::TaskCompleted { task } => {
-                if let Some(t) = self.tasks.get_mut(task) {
-                    if !t.completed {
-                        t.checked = true;
-                        t.completed = true;
-                        t.completed_by = Some(env.actor.clone());
-                        t.completed_ms = Some(env.created_unix_ms);
-                        t.clock = env.clock;
-                    }
+                if !self.is_present_member(&env.actor) {
+                    self.last_clock = previous_last_clock;
+                    return;
+                }
+                let Some(t) = self.tasks.get_mut(task) else {
+                    self.last_clock = previous_last_clock;
+                    return;
+                };
+                if !t.completed {
+                    t.checked = true;
+                    t.completed = true;
+                    t.completed_by = Some(env.actor.clone());
+                    t.completed_ms = Some(env.created_unix_ms);
+                    t.clock = env.clock;
+                }
+            }
+            CollabEventKind::TaskReopened { task } => {
+                if !self.is_present_member(&env.actor) {
+                    self.last_clock = previous_last_clock;
+                    return;
+                }
+                let Some(t) = self.tasks.get_mut(task) else {
+                    self.last_clock = previous_last_clock;
+                    return;
+                };
+                if t.completed {
+                    t.checked = false;
+                    t.completed = false;
+                    t.completed_by = None;
+                    t.completed_ms = None;
+                    t.clock = env.clock;
                 }
             }
             CollabEventKind::AlertRaised { alert } => {
@@ -1988,6 +2050,11 @@ fn ensure_read_model_text(field: &str, value: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn valid_task_title(title: &str) -> bool {
+    let trimmed = title.trim();
+    !trimmed.is_empty() && trimmed.len() <= MAX_TASK_TITLE_BYTES
 }
 
 fn summarize(kind_tag: &str) -> String {

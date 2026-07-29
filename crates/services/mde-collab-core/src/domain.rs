@@ -82,6 +82,8 @@ pub struct MessageAgg {
 pub struct TaskAgg {
     /// The space it belongs to.
     pub space: SpaceId,
+    /// The member who created/owns the action item.
+    pub created_by: ActorId,
     /// Whether it has been completed.
     pub completed: bool,
 }
@@ -280,20 +282,49 @@ impl DomainState {
                 self.threads.insert(*thread, space_id);
             }
             CollabEventKind::ThreadResolved { .. } | CollabEventKind::ThreadReopened { .. } => {}
-            CollabEventKind::TaskCreated { .. } => {
-                self.tasks.insert(
-                    env.event_id,
-                    TaskAgg {
-                        space: space_id,
-                        completed: false,
-                    },
-                );
+            CollabEventKind::TaskCreated { source, .. } => {
+                // A valid signature is not sufficient authority to publish a
+                // task.  The event must be authored by a current channel
+                // member, and an optional source message must belong to this
+                // channel and still be visible at this canonical point.
+                let source_valid = source.is_none_or(|message| {
+                    self.messages
+                        .get(&message)
+                        .is_some_and(|m| m.space == space_id && !m.deleted)
+                });
+                if self.is_member(space_id, &env.actor) && source_valid {
+                    self.tasks.insert(
+                        env.event_id,
+                        TaskAgg {
+                            space: space_id,
+                            created_by: env.actor.clone(),
+                            completed: false,
+                        },
+                    );
+                }
             }
-            CollabEventKind::TaskChecked { .. } => {}
+            CollabEventKind::TaskUpdated { task, .. }
+            | CollabEventKind::TaskChecked { task, .. } => {
+                // Title/check state is projection-only validation data. The
+                // membership and task lifecycle checks below keep forged
+                // signed events from affecting later command decisions.
+                let _ = (task, self.is_member(space_id, &env.actor));
+            }
             CollabEventKind::TaskCompleted { task } => {
-                if let Some(t) = self.tasks.get_mut(task) {
-                    if t.space == space_id {
-                        t.completed = true;
+                if self.is_member(space_id, &env.actor) {
+                    if let Some(t) = self.tasks.get_mut(task) {
+                        if t.space == space_id && !t.completed {
+                            t.completed = true;
+                        }
+                    }
+                }
+            }
+            CollabEventKind::TaskReopened { task } => {
+                if self.is_member(space_id, &env.actor) {
+                    if let Some(t) = self.tasks.get_mut(task) {
+                        if t.space == space_id && t.completed {
+                            t.completed = false;
+                        }
                     }
                 }
             }

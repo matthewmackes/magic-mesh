@@ -481,13 +481,29 @@ pub fn apply_command<S: EventSigner, I: IdSource>(
             require_member(state, *space, &ctx.actor)?;
             validate_task_title(title)?;
             if let Some(source) = source {
-                require_message(state, *space, *source)?;
+                let source_message = require_message(state, *space, *source)?;
+                if source_message.deleted {
+                    return Err(CollabError::TargetDeleted(*source));
+                }
             }
             Ok(vec![ctx.emit(
                 *space,
                 CollabEventKind::TaskCreated {
                     title: title.trim().to_owned(),
                     source: *source,
+                },
+            )])
+        }
+        CollabCommand::UpdateTask { space, task, title } => {
+            require_active_space(state, *space)?;
+            require_member(state, *space, &ctx.actor)?;
+            require_open_task(state, *space, *task)?;
+            validate_task_title(title)?;
+            Ok(vec![ctx.emit(
+                *space,
+                CollabEventKind::TaskUpdated {
+                    task: *task,
+                    title: title.trim().to_owned(),
                 },
             )])
         }
@@ -514,6 +530,15 @@ pub fn apply_command<S: EventSigner, I: IdSource>(
             Ok(vec![ctx.emit(
                 *space,
                 CollabEventKind::TaskCompleted { task: *task },
+            )])
+        }
+        CollabCommand::ReopenTask { space, task } => {
+            require_active_space(state, *space)?;
+            require_member(state, *space, &ctx.actor)?;
+            require_completed_task(state, *space, *task)?;
+            Ok(vec![ctx.emit(
+                *space,
+                CollabEventKind::TaskReopened { task: *task },
             )])
         }
 
@@ -1048,6 +1073,15 @@ fn require_open_task(state: &DomainState, space: SpaceId, task: EventId) -> Resu
     match state.tasks.get(&task) {
         Some(t) if t.space == space && !t.completed => Ok(()),
         Some(t) if t.space == space => Err(CollabError::TaskAlreadyCompleted(task)),
+        _ => Err(CollabError::TaskNotFound(task)),
+    }
+}
+
+/// The task must exist in this space and currently be complete.
+fn require_completed_task(state: &DomainState, space: SpaceId, task: EventId) -> Result<()> {
+    match state.tasks.get(&task) {
+        Some(t) if t.space == space && t.completed => Ok(()),
+        Some(t) if t.space == space => Err(CollabError::TaskAlreadyOpen(task)),
         _ => Err(CollabError::TaskNotFound(task)),
     }
 }
@@ -1745,6 +1779,23 @@ mod tests {
         ));
         events.extend(created);
 
+        let updated = apply_command(
+            &DomainState::from_events(&events),
+            &CollabCommand::UpdateTask {
+                space,
+                task,
+                title: " inspect the gateway ".into(),
+            },
+            &mut alice,
+        )
+        .expect("update task");
+        assert!(matches!(
+            &updated[0].kind,
+            CollabEventKind::TaskUpdated { task: t, title } if *t == task && title == "inspect the gateway"
+        ));
+        assert!(updated[0].verify(), "task updates remain signed events");
+        events.extend(updated);
+
         let checked = apply_command(
             &DomainState::from_events(&events),
             &CollabCommand::SetTaskChecked {
@@ -1771,6 +1822,10 @@ mod tests {
             completed[0].kind,
             CollabEventKind::TaskCompleted { task: t } if t == task
         ));
+        assert!(
+            completed[0].verify(),
+            "task completions remain signed events"
+        );
         events.extend(completed);
 
         let denied = apply_command(
@@ -1783,6 +1838,32 @@ mod tests {
             &mut alice,
         );
         assert!(matches!(denied, Err(CollabError::TaskAlreadyCompleted(t)) if t == task));
+
+        let reopened = apply_command(
+            &DomainState::from_events(&events),
+            &CollabCommand::ReopenTask { space, task },
+            &mut alice,
+        )
+        .expect("reopen task");
+        assert!(matches!(
+            reopened[0].kind,
+            CollabEventKind::TaskReopened { task: t } if t == task
+        ));
+        assert!(reopened[0].verify(), "task reopens remain signed events");
+
+        let open_again = DomainState::from_events(
+            &events
+                .iter()
+                .cloned()
+                .chain(reopened.iter().cloned())
+                .collect::<Vec<_>>(),
+        );
+        let already_open = apply_command(
+            &open_again,
+            &CollabCommand::ReopenTask { space, task },
+            &mut alice,
+        );
+        assert!(matches!(already_open, Err(CollabError::TaskAlreadyOpen(t)) if t == task));
     }
 
     #[test]

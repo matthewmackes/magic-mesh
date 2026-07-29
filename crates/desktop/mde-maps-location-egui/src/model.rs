@@ -101,6 +101,426 @@ pub enum AdminSection {
     FirmwareRecovery,
 }
 
+/// Coarse availability of the typed MG90 radio inventory presented to Car.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VehicleRadioAvailability {
+    /// A fresh, complete inventory with no degraded rows.
+    Available,
+    /// A typed inventory exists, but one or more rows or freshness domains need
+    /// operator attention.
+    Degraded,
+    /// No valid typed inventory is available for this vehicle.
+    Unavailable,
+}
+
+impl VehicleRadioAvailability {
+    /// Operator-facing status label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::Degraded => "degraded",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// Hardware presence as proven by the typed inventory probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VehicleRadioPresence {
+    /// The probe reported the interface fitted.
+    Installed,
+    /// The probe proved the interface is not fitted.
+    NotInstalled,
+    /// The source did not prove either condition.
+    Unknown,
+}
+
+impl VehicleRadioPresence {
+    /// Operator-facing presence label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Installed => "Installed",
+            Self::NotInstalled => "Not Installed",
+            Self::Unknown => "Unknown",
+        }
+    }
+}
+
+/// Operation state copied from the typed radio contract, including consumer
+/// freshness state when a retained row has aged past its budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VehicleRadioOperation {
+    /// Selected active uplink or service.
+    Active,
+    /// Fitted standby path.
+    Standby,
+    /// Searching for service or a GNSS fix.
+    Acquiring,
+    /// Producer-reported degradation.
+    Degraded,
+    /// Producer-reported fault.
+    Fault,
+    /// Explicitly disabled by the gateway.
+    Disabled,
+    /// The producer did not report an operation state.
+    Unknown,
+    /// Consumer-retained row is past its freshness budget.
+    Stale,
+}
+
+impl VehicleRadioOperation {
+    /// Operator-facing operation label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Active => "Active",
+            Self::Standby => "Standby",
+            Self::Acquiring => "Acquiring",
+            Self::Degraded => "Degraded",
+            Self::Fault => "Fault",
+            Self::Disabled => "Disabled",
+            Self::Unknown => "Unknown",
+            Self::Stale => "Stale",
+        }
+    }
+}
+
+/// Effective freshness state for a typed vehicle domain after the consumer
+/// accounts for time spent retained on the Bus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VehicleFreshnessState {
+    /// The producer and consumer both consider the domain current.
+    Fresh,
+    /// The retained observation is past its consumer freshness budget.
+    Stale,
+    /// The producer did not establish freshness or the timestamp was unusable.
+    Unknown,
+}
+
+impl VehicleFreshnessState {
+    /// Operator-facing freshness label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Fresh => "Fresh",
+            Self::Stale => "Stale",
+            Self::Unknown => "Unknown",
+        }
+    }
+}
+
+/// One bounded radio row prepared for the Maps/Car renderer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VehicleRadioRow {
+    /// Stable typed identifier (`cellular-a`, `gnss`, or bounded `ext-*`).
+    pub id: String,
+    /// Proven hardware presence.
+    pub presence: VehicleRadioPresence,
+    /// Effective operation after freshness evaluation.
+    pub operation: VehicleRadioOperation,
+    /// Typed reason code, or `None` when the source reported no reason.
+    pub reason: Option<String>,
+    /// Effective source age, including time retained on the Bus.
+    pub age_ms: Option<u64>,
+    /// Whether this row is the selected uplink path.
+    pub active_path: bool,
+    /// Typed configured role.
+    pub role: String,
+}
+
+impl VehicleRadioRow {
+    /// Human-readable age that never turns a missing timestamp into zero.
+    #[must_use]
+    pub fn age_label(&self) -> String {
+        self.age_ms.map_or_else(
+            || "age unknown".to_string(),
+            |age| {
+                if age < 1_000 {
+                    format!("{age} ms")
+                } else {
+                    format!("{:.1} s", age as f32 / 1_000.0)
+                }
+            },
+        )
+    }
+}
+
+/// Freshness state for one typed vehicle domain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VehicleFreshness {
+    /// Effective state after the consumer's retention-age check.
+    pub state: VehicleFreshnessState,
+    /// Effective age, if either producer or consumer had a usable timestamp.
+    pub age_ms: Option<u64>,
+    /// Stable producer/consumer reason, when present.
+    pub reason: Option<String>,
+}
+
+impl VehicleFreshness {
+    /// Human-readable age that preserves an unknown timestamp as unknown.
+    #[must_use]
+    pub fn age_label(&self) -> String {
+        self.age_ms.map_or_else(
+            || "age unknown".to_string(),
+            |age| {
+                if age < 1_000 {
+                    format!("{age} ms")
+                } else {
+                    format!("{:.1} s", age as f32 / 1_000.0)
+                }
+            },
+        )
+    }
+}
+
+/// Bounded, no-fabrication radio/GNSS projection consumed by the Car view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VehicleRadioHealth {
+    /// Overall availability of the typed v2 inventory.
+    pub availability: VehicleRadioAvailability,
+    /// Why the inventory is unavailable or degraded, when there is a reason.
+    pub availability_reason: Option<String>,
+    /// At most the wire contract's bounded radio inventory is retained.
+    pub radios: Vec<VehicleRadioRow>,
+    /// Effective radio-domain freshness.
+    pub radios_freshness: VehicleFreshness,
+    /// Effective GNSS-domain freshness.
+    pub gnss_freshness: VehicleFreshness,
+    /// Age of the v2 snapshot itself, when its publish timestamp was usable.
+    pub snapshot_age_ms: Option<u64>,
+    /// Accepted wire schema version, or `None` for unavailable data.
+    pub schema_version: Option<u16>,
+}
+
+impl VehicleRadioHealth {
+    /// An explicit unavailable state used before v2 data arrives or after a
+    /// malformed/unsupported payload. It contains no synthetic radio rows.
+    #[must_use]
+    pub fn unavailable(reason: impl Into<String>) -> Self {
+        let reason = Some(bounded_vehicle_text(&reason.into()));
+        Self {
+            availability: VehicleRadioAvailability::Unavailable,
+            availability_reason: reason.clone(),
+            radios: Vec::new(),
+            radios_freshness: VehicleFreshness {
+                state: VehicleFreshnessState::Unknown,
+                age_ms: None,
+                reason: reason.clone(),
+            },
+            gnss_freshness: VehicleFreshness {
+                state: VehicleFreshnessState::Unknown,
+                age_ms: None,
+                reason,
+            },
+            snapshot_age_ms: None,
+            schema_version: None,
+        }
+    }
+
+    /// Short strip value used by the driver's status catalog.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        self.availability.label().to_string()
+    }
+
+    fn from_v2_at(v: &mackes_mesh_types::vehicle::VehicleStateV2, now_ms: i64) -> Self {
+        use mackes_mesh_types::vehicle::{
+            RadioOperation, RadioPresence, RadioReasonCode, VEHICLE_STATE_V2_SCHEMA_VERSION,
+        };
+
+        if v.schema_version != VEHICLE_STATE_V2_SCHEMA_VERSION {
+            return Self::unavailable(format!(
+                "unsupported vehicle snapshot schema {}",
+                v.schema_version
+            ));
+        }
+
+        let snapshot_age_ms = effective_age_ms(v.published_at_ms, now_ms);
+        let stale_after_ms = v.expected_interval_ms.saturating_mul(2).max(5_000);
+        let radios_freshness =
+            effective_freshness(&v.freshness.radios, snapshot_age_ms, stale_after_ms);
+        let gnss_freshness =
+            effective_freshness(&v.freshness.gnss, snapshot_age_ms, stale_after_ms);
+        let mut radios = Vec::with_capacity(v.radios.len());
+        for row in v.radios.as_slice() {
+            let age_ms = max_age(row.age_ms, snapshot_age_ms);
+            let mut operation = match row.operation {
+                RadioOperation::Active => VehicleRadioOperation::Active,
+                RadioOperation::Standby => VehicleRadioOperation::Standby,
+                RadioOperation::Acquiring => VehicleRadioOperation::Acquiring,
+                RadioOperation::Degraded => VehicleRadioOperation::Degraded,
+                RadioOperation::Fault => VehicleRadioOperation::Fault,
+                RadioOperation::Disabled => VehicleRadioOperation::Disabled,
+                RadioOperation::Unknown => VehicleRadioOperation::Unknown,
+                RadioOperation::Stale => VehicleRadioOperation::Stale,
+            };
+            if age_ms.is_some_and(|age| age > stale_after_ms) {
+                operation = VehicleRadioOperation::Stale;
+            }
+            let presence = match row.presence {
+                RadioPresence::Installed => VehicleRadioPresence::Installed,
+                RadioPresence::NotInstalled => VehicleRadioPresence::NotInstalled,
+                RadioPresence::Unknown => VehicleRadioPresence::Unknown,
+            };
+            let reason = row.reason_code.map(|code| {
+                match code {
+                    RadioReasonCode::NoFix => "no-fix",
+                    RadioReasonCode::NotReported => "not-reported",
+                    RadioReasonCode::DisabledByGateway => "disabled-by-gateway",
+                    RadioReasonCode::WeakSignal => "weak-signal",
+                    RadioReasonCode::GatewayOffline => "gateway-offline",
+                    RadioReasonCode::NotInstalled => "not-installed",
+                    RadioReasonCode::Unknown => "unknown",
+                }
+                .to_string()
+            });
+            radios.push(VehicleRadioRow {
+                id: bounded_vehicle_text(row.id.as_str()),
+                presence,
+                operation,
+                reason,
+                age_ms,
+                active_path: row.active_path,
+                role: match row.configured_role {
+                    mackes_mesh_types::vehicle::RadioRole::Wan => "WAN",
+                    mackes_mesh_types::vehicle::RadioRole::AccessPoint => "access point",
+                    mackes_mesh_types::vehicle::RadioRole::Backhaul => "backhaul",
+                    mackes_mesh_types::vehicle::RadioRole::Bluetooth => "Bluetooth",
+                    mackes_mesh_types::vehicle::RadioRole::Gnss => "GNSS",
+                    mackes_mesh_types::vehicle::RadioRole::Unknown => "unknown",
+                }
+                .to_string(),
+            });
+        }
+
+        if !v.online {
+            return Self {
+                availability: VehicleRadioAvailability::Unavailable,
+                availability_reason: Some("gateway-offline".to_string()),
+                radios,
+                radios_freshness,
+                gnss_freshness,
+                snapshot_age_ms,
+                schema_version: Some(v.schema_version),
+            };
+        }
+        if radios.is_empty() {
+            return Self {
+                availability: VehicleRadioAvailability::Unavailable,
+                availability_reason: Some("radio-inventory-not-reported".to_string()),
+                radios,
+                radios_freshness,
+                gnss_freshness,
+                snapshot_age_ms,
+                schema_version: Some(v.schema_version),
+            };
+        }
+
+        let degraded = radios_freshness.state != VehicleFreshnessState::Fresh
+            || gnss_freshness.state != VehicleFreshnessState::Fresh
+            || radios.iter().any(|row| {
+                matches!(
+                    row.operation,
+                    VehicleRadioOperation::Degraded
+                        | VehicleRadioOperation::Fault
+                        | VehicleRadioOperation::Unknown
+                        | VehicleRadioOperation::Stale
+                ) || row.presence == VehicleRadioPresence::Unknown
+            });
+        let availability = if degraded {
+            VehicleRadioAvailability::Degraded
+        } else {
+            VehicleRadioAvailability::Available
+        };
+        let availability_reason = (availability == VehicleRadioAvailability::Degraded)
+            .then(|| "radio or GNSS freshness/health needs attention".to_string());
+        // The producer's gap text is evidence, but cap it before it reaches a
+        // persistent UI model. It never creates a row or substitutes a value.
+        let availability_reason =
+            availability_reason.or_else(|| v.gaps.first().map(|gap| bounded_vehicle_text(gap)));
+        Self {
+            availability,
+            availability_reason,
+            radios,
+            radios_freshness,
+            gnss_freshness,
+            snapshot_age_ms,
+            schema_version: Some(v.schema_version),
+        }
+    }
+}
+
+impl Default for VehicleRadioHealth {
+    fn default() -> Self {
+        Self::unavailable("typed v2 radio inventory unavailable")
+    }
+}
+
+const MAX_VEHICLE_TEXT_BYTES: usize = 256;
+
+fn bounded_vehicle_text(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        if out.len() + ch.len_utf8() > MAX_VEHICLE_TEXT_BYTES {
+            out.push('\u{2026}');
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn max_age(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(age), None) | (None, Some(age)) => Some(age),
+        (None, None) => None,
+    }
+}
+
+fn effective_age_ms(published_at_ms: i64, now_ms: i64) -> Option<u64> {
+    (published_at_ms > 0 && now_ms >= published_at_ms)
+        .then(|| u64::try_from(now_ms - published_at_ms).ok())
+        .flatten()
+}
+
+fn effective_freshness(
+    source: &mackes_mesh_types::vehicle::DomainFreshness,
+    snapshot_age_ms: Option<u64>,
+    stale_after_ms: u64,
+) -> VehicleFreshness {
+    use mackes_mesh_types::vehicle::FreshnessState;
+    let age_ms = max_age(source.age_ms, snapshot_age_ms);
+    let state = match source.state {
+        FreshnessState::Unknown => VehicleFreshnessState::Unknown,
+        FreshnessState::Stale => VehicleFreshnessState::Stale,
+        FreshnessState::Fresh if age_ms.is_none() => VehicleFreshnessState::Unknown,
+        FreshnessState::Fresh if age_ms.is_some_and(|age| age > stale_after_ms) => {
+            VehicleFreshnessState::Stale
+        }
+        FreshnessState::Fresh => VehicleFreshnessState::Fresh,
+    };
+    let reason = source
+        .reason
+        .as_deref()
+        .map(bounded_vehicle_text)
+        .or_else(|| {
+            (state == VehicleFreshnessState::Stale)
+                .then(|| "retained snapshot exceeded freshness budget".to_string())
+        })
+        .or_else(|| {
+            (state == VehicleFreshnessState::Unknown)
+                .then(|| "freshness-not-established".to_string())
+        });
+    VehicleFreshness {
+        state,
+        age_ms,
+        reason,
+    }
+}
+
 impl AdminSection {
     /// Stable section order inside the single Admin interface.
     pub const ALL: [Self; 7] = [
@@ -194,6 +614,8 @@ pub struct MapsLocationSurface {
     pub dead_zones: DeadZoneState,
     /// Vehicle profile and telemetry.
     pub vehicle: VehicleState,
+    /// Typed v2 radio inventory and effective GNSS/radio freshness for Car.
+    pub vehicle_radio_health: VehicleRadioHealth,
     /// GPIO/CAN/USB/serial device state.
     pub devices: DeviceIoState,
     /// Firmware lifecycle model.
@@ -254,6 +676,7 @@ impl MapsLocationSurface {
             trips: TripRecorderState::live(),
             dead_zones: DeadZoneState::live(),
             vehicle: VehicleState::awaiting_gateway(),
+            vehicle_radio_health: VehicleRadioHealth::default(),
             devices: DeviceIoState::live(),
             firmware: FirmwareWorkflow::live(),
             vault: EncryptedVaultState::ready_for_local_admin(),
@@ -302,6 +725,7 @@ impl MapsLocationSurface {
             trips: TripRecorderState::simulated(),
             dead_zones: DeadZoneState::simulated(),
             vehicle: VehicleState::ford_interceptor_2020(),
+            vehicle_radio_health: VehicleRadioHealth::default(),
             devices: DeviceIoState::simulated(),
             firmware: FirmwareWorkflow::simulated(),
             vault: EncryptedVaultState::ready_for_local_admin(),
@@ -719,6 +1143,28 @@ impl MapsLocationSurface {
         }
     }
 
+    /// Fold the identity-addressed typed v2 vehicle snapshot. The legacy
+    /// fields remain populated through the compatibility projection, while
+    /// radio/GNSS health is taken only from the v2 inventory and freshness
+    /// domains. No v1 field is used to invent a v2 radio row.
+    pub fn refresh_from_vehicle_v2(&mut self, v: &mackes_mesh_types::vehicle::VehicleStateV2) {
+        let legacy = mackes_mesh_types::vehicle::VehicleState {
+            host: v.management_node_id.clone(),
+            model: v.mg90.model.clone(),
+            esn: v.mg90.esn.clone(),
+            mgos_version: v.mg90.firmware.clone(),
+            online: v.online,
+            gps: v.gps.clone(),
+            imu: v.imu.clone(),
+            wan: v.wan.clone(),
+            telem: v.telem.clone(),
+            gaps: v.gaps.clone(),
+            published_at_ms: v.published_at_ms,
+        };
+        self.refresh_from_vehicle(&legacy);
+        self.vehicle_radio_health = VehicleRadioHealth::from_v2_at(v, unix_now_ms());
+    }
+
     /// Read retained vehicle + overlay mirrors off the Bus (fail-soft, honest
     /// off-mesh no-op) and fold them into the cockpit.
     ///
@@ -770,8 +1216,16 @@ impl MapsLocationSurface {
         node: &str,
     ) {
         let reader = PersistedMirrorReader { persist, bus_root };
-        if let Some(mirror) = read_vehicle_mirror(&reader, node) {
+        if let Some(mirror) = read_vehicle_v2_mirror(&reader, node) {
+            self.refresh_from_vehicle_v2(&mirror);
+        } else if let Some(mirror) = read_vehicle_mirror(&reader, node) {
             self.refresh_from_vehicle(&mirror);
+            self.vehicle_radio_health = VehicleRadioHealth::unavailable(
+                "typed v2 radio inventory unavailable; using legacy vehicle mirror",
+            );
+        } else {
+            self.vehicle_radio_health =
+                VehicleRadioHealth::unavailable("typed v2 radio inventory unavailable");
         }
         if let Some(snapshot) = read_earthquake_mirror(&reader, node) {
             self.refresh_from_earthquakes(snapshot);
@@ -988,6 +1442,15 @@ fn cellular_link_from_wire(link: &mackes_mesh_types::vehicle::CellLink) -> Cellu
     }
 }
 
+fn unix_now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+        })
+}
+
 /// Wall-clock age of a `published_at_ms` mirror stamp, seconds. Falls back to
 /// `0.0` if the system clock is somehow before the stamp — never panics.
 fn mirror_age_s(published_at_ms: i64) -> f32 {
@@ -1020,6 +1483,66 @@ fn read_vehicle_mirror(
 ) -> Option<mackes_mesh_types::vehicle::VehicleState> {
     let topic = mackes_mesh_types::vehicle::vehicle_state_topic(node);
     read_latest_json_for_node(reader, &topic, node)
+}
+
+/// Read the newest valid identity-addressed v2 snapshot for one management
+/// node. Topics are bounded before decoding, and each payload must agree with
+/// both its topic identity and the selected node. A malformed v2 row is
+/// skipped; it can never become a synthetic "unknown radio" record.
+const MAX_VEHICLE_V2_TOPICS: usize = 32;
+
+fn read_vehicle_v2_mirror(
+    reader: &PersistedMirrorReader<'_>,
+    node: &str,
+) -> Option<mackes_mesh_types::vehicle::VehicleStateV2> {
+    let prefix = format!("{}/", mackes_mesh_types::vehicle::vehicle_state_topic(node));
+    let topics = reader.persist.list_topics().ok()?;
+    let mut best: Option<(i64, u64, mackes_mesh_types::vehicle::VehicleStateV2)> = None;
+    for topic in topics
+        .into_iter()
+        .filter(|topic| topic.starts_with(&prefix))
+        .take(MAX_VEHICLE_V2_TOPICS)
+    {
+        let Some(mg90_id) = topic.strip_prefix(&prefix) else {
+            continue;
+        };
+        if mg90_id.is_empty()
+            || mg90_id.contains('/')
+            || mg90_id.len() > 128
+            || !mg90_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        {
+            continue;
+        }
+        let Some(body) = retained_overlay_body(reader, &topic) else {
+            continue;
+        };
+        let Some(snapshot) = decode_vehicle_v2_payload(&body) else {
+            continue;
+        };
+        if snapshot.management_node_id != node || snapshot.mg90.id != mg90_id {
+            continue;
+        }
+        let key = (snapshot.published_at_ms, snapshot.sequence);
+        if best
+            .as_ref()
+            .is_none_or(|(published_at_ms, sequence, _)| key > (*published_at_ms, *sequence))
+        {
+            best = Some((key.0, key.1, snapshot));
+        }
+    }
+    best.map(|(_, _, snapshot)| snapshot)
+}
+
+fn decode_vehicle_v2_payload(body: &str) -> Option<mackes_mesh_types::vehicle::VehicleStateV2> {
+    const MAX_VEHICLE_V2_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
+    if body.len() > MAX_VEHICLE_V2_PAYLOAD_BYTES {
+        return None;
+    }
+    let snapshot: mackes_mesh_types::vehicle::VehicleStateV2 = serde_json::from_str(body).ok()?;
+    (snapshot.schema_version == mackes_mesh_types::vehicle::VEHICLE_STATE_V2_SCHEMA_VERSION)
+        .then_some(snapshot)
 }
 
 /// Decode the retained keyless-USGS overlay snapshot, fail-soft when the adapter
@@ -5572,6 +6095,153 @@ mod tests {
             .stale());
         assert!(!state.moving(), "stale motion must fail safe to parked");
         assert_eq!(state.vehicle_glance(), None);
+    }
+
+    fn typed_vehicle_snapshot(published_at_ms: i64) -> mackes_mesh_types::vehicle::VehicleStateV2 {
+        use mackes_mesh_types::vehicle::{
+            DomainFreshness, FreshnessState, RadioHealth, RadioId, RadioInventory, RadioMetrics,
+            RadioOperation, RadioPresence, RadioRole, SnapshotProvenance, SnapshotSource,
+            VehicleDomainFreshness, VehicleState, VehicleStateV2,
+        };
+
+        let mut legacy = VehicleState::offline("rig-1");
+        legacy.online = true;
+        legacy.model = "MG90".to_string();
+        legacy.esn = "ESN-TEST".to_string();
+        legacy.mgos_version = "4.3.0.1".to_string();
+        let mut snapshot = VehicleStateV2::from_v1(
+            &legacy,
+            "rig-1",
+            7,
+            1_000,
+            published_at_ms,
+            SnapshotProvenance {
+                source: SnapshotSource::DirectGateway,
+                source_id: Some("rig-1".to_string()),
+                relay: None,
+            },
+        );
+        let fresh = DomainFreshness {
+            state: FreshnessState::Fresh,
+            age_ms: Some(0),
+            reason: None,
+        };
+        snapshot.freshness = VehicleDomainFreshness {
+            identity: fresh.clone(),
+            radios: fresh.clone(),
+            gnss: fresh.clone(),
+            vehicle: fresh.clone(),
+            power: fresh,
+        };
+        let row = |id, presence, operation, age_ms| RadioHealth {
+            id,
+            presence,
+            operation,
+            reason_code: None,
+            age_ms,
+            configured_role: RadioRole::Wan,
+            active_path: operation == RadioOperation::Active,
+            metrics: RadioMetrics::Unknown,
+        };
+        snapshot.radios = RadioInventory::new(vec![
+            row(
+                RadioId::Gnss,
+                RadioPresence::Unknown,
+                RadioOperation::Unknown,
+                None,
+            ),
+            row(
+                RadioId::CellularA,
+                RadioPresence::Installed,
+                RadioOperation::Active,
+                Some(12),
+            ),
+            row(
+                RadioId::WifiA,
+                RadioPresence::NotInstalled,
+                RadioOperation::Disabled,
+                Some(12),
+            ),
+        ])
+        .expect("test inventory is bounded");
+        snapshot
+    }
+
+    #[test]
+    fn typed_radio_projection_preserves_contract_order_and_presence_states() {
+        let now = 1_700_000_000_000;
+        let health = VehicleRadioHealth::from_v2_at(&typed_vehicle_snapshot(now), now);
+
+        assert_eq!(
+            health
+                .radios
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["gnss", "cellular-a", "wifi-a"],
+            "the Car model preserves the typed inventory order"
+        );
+        assert_eq!(health.radios[0].presence, VehicleRadioPresence::Unknown);
+        assert_eq!(health.radios[1].presence, VehicleRadioPresence::Installed);
+        assert_eq!(
+            health.radios[2].presence,
+            VehicleRadioPresence::NotInstalled
+        );
+        assert_eq!(health.radios[1].operation, VehicleRadioOperation::Active);
+        assert_eq!(health.radios[1].age_label(), "12 ms");
+        assert_eq!(health.availability, VehicleRadioAvailability::Degraded);
+    }
+
+    #[test]
+    fn typed_radio_projection_marks_retained_rows_and_gnss_stale() {
+        let health = VehicleRadioHealth::from_v2_at(
+            &typed_vehicle_snapshot(1_700_000_000_000),
+            1_700_000_006_000,
+        );
+
+        assert_eq!(health.snapshot_age_ms, Some(6_000));
+        assert_eq!(health.radios_freshness.state, VehicleFreshnessState::Stale);
+        assert_eq!(health.gnss_freshness.state, VehicleFreshnessState::Stale);
+        assert!(health
+            .radios
+            .iter()
+            .all(|row| row.operation == VehicleRadioOperation::Stale));
+        assert_eq!(health.availability, VehicleRadioAvailability::Degraded);
+    }
+
+    #[test]
+    fn typed_radio_projection_keeps_unknown_timestamp_and_payload_unknown() {
+        use mackes_mesh_types::vehicle::FreshnessState;
+
+        let mut snapshot = typed_vehicle_snapshot(0);
+        snapshot.freshness.radios.state = FreshnessState::Unknown;
+        snapshot.freshness.gnss.state = FreshnessState::Unknown;
+        let health = VehicleRadioHealth::from_v2_at(&snapshot, 1_700_000_000_000);
+
+        assert_eq!(health.snapshot_age_ms, None);
+        assert_eq!(
+            health.radios_freshness.state,
+            VehicleFreshnessState::Unknown
+        );
+        assert_eq!(health.gnss_freshness.state, VehicleFreshnessState::Unknown);
+        assert_eq!(health.radios[0].presence, VehicleRadioPresence::Unknown);
+        assert_eq!(health.radios[0].operation, VehicleRadioOperation::Unknown);
+        assert_eq!(health.radios[0].age_label(), "age unknown");
+        assert_eq!(health.availability, VehicleRadioAvailability::Degraded);
+    }
+
+    #[test]
+    fn malformed_typed_vehicle_payload_fails_closed_before_projection() {
+        assert!(decode_vehicle_v2_payload("not-json").is_none());
+        assert!(decode_vehicle_v2_payload(r#"{"schema_version":99,"radios":[]}"#).is_none());
+        let oversized = "{".repeat(4 * 1024 * 1024 + 1);
+        assert!(decode_vehicle_v2_payload(&oversized).is_none());
+        let unavailable = VehicleRadioHealth::unavailable("malformed typed snapshot");
+        assert_eq!(
+            unavailable.availability,
+            VehicleRadioAvailability::Unavailable
+        );
+        assert!(unavailable.radios.is_empty());
     }
 
     #[test]

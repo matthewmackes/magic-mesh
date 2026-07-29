@@ -1802,6 +1802,8 @@ pub const VERB_CONTAINER_DEPLOY: &str = "container-deploy";
 pub const VERB_CONSOLE_ATTACH: &str = "console-attach";
 /// `android-provision` — the two-layer Cuttlefish path (Linux VM then `cvd`).
 pub const VERB_ANDROID_PROVISION: &str = "android-provision";
+/// `browser-provision` — declare the dedicated Chromium browser VM workload.
+pub const VERB_BROWSER_PROVISION: &str = "browser-provision";
 
 /// What a workload *delivers* — the cockpit's primary organizing axis (delivery type
 /// × placement). Each maps to a provision + configure recipe under the hood.
@@ -1884,6 +1886,50 @@ pub struct WorkloadSpec {
     /// rendered tfvars (validated before `tofu`). `None` = pure form authoring.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_hcl: Option<String>,
+}
+
+/// The baseline profile for the dedicated Browser VM.
+///
+/// This is a desired-state profile, not a claim that a VM is already running.
+/// The typed `browser-provision` verb persists the resulting [`WorkloadSpec`];
+/// the separately armed `provision` verb is responsible for asking the backend
+/// to realize the node's complete desired slice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BrowserVmProfile {
+    /// Virtual CPUs allocated to the Browser VM.
+    pub vcpu: u16,
+    /// Memory allocated to the Browser VM, in MiB.
+    pub memory_mb: u32,
+    /// Root disk allocated to the Browser VM, in GiB.
+    pub disk_gb: u32,
+}
+
+impl Default for BrowserVmProfile {
+    fn default() -> Self {
+        Self {
+            vcpu: 4,
+            memory_mb: 8192,
+            disk_gb: 64,
+        }
+    }
+}
+
+impl BrowserVmProfile {
+    /// Turn this baseline into the existing Desktop VM desired-state contract.
+    #[must_use]
+    pub fn workload_spec(self, node: &str, name: &str) -> WorkloadSpec {
+        WorkloadSpec {
+            name: name.to_string(),
+            delivery_type: DeliveryType::DesktopVm,
+            node: node.to_string(),
+            vcpu: self.vcpu,
+            memory_mb: self.memory_mb,
+            disk_gb: self.disk_gb,
+            image: None,
+            network_isolation: false,
+            raw_hcl: None,
+        }
+    }
 }
 
 /// The `tofu plan` change counts — the lean, counts-only preview the surface renders
@@ -2060,6 +2106,22 @@ pub struct NodeCapacity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_vm_profile_defaults_to_the_arch008_baseline() {
+        let profile = BrowserVmProfile::default();
+        assert_eq!(profile.vcpu, 4);
+        assert_eq!(profile.memory_mb, 8192);
+        assert_eq!(profile.disk_gb, 64);
+
+        let spec = profile.workload_spec("eagle", "browser-eagle");
+        assert_eq!(spec.delivery_type, DeliveryType::DesktopVm);
+        assert_eq!(spec.node, "eagle");
+        assert_eq!(spec.name, "browser-eagle");
+        assert_eq!(spec.vcpu, 4);
+        assert_eq!(spec.memory_mb, 8192);
+        assert_eq!(spec.disk_gb, 64);
+    }
 
     #[test]
     fn cloud_request_digest_is_canonical_and_excludes_only_the_token() {

@@ -667,7 +667,10 @@ fn drm_modifiers(alt: bool, ctrl: bool, shift: bool) -> egui::Modifiers {
 }
 
 fn drm_clipboard_text_for_paste(text: &str) -> Option<String> {
-    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    let text = crate::clipboard::normalize_and_bound_text(
+        text,
+        crate::clipboard::MAX_CLIPBOARD_TEXT_BYTES,
+    );
     (!text.is_empty()).then_some(text)
 }
 
@@ -720,7 +723,33 @@ fn drm_clipboard_output_text(output: &egui::PlatformOutput) -> Option<String> {
     if !output.copied_text.is_empty() {
         text = Some(output.copied_text.clone());
     }
-    text
+    text.map(|text| {
+        crate::clipboard::normalize_and_bound_text(
+            &text,
+            crate::clipboard::MAX_CLIPBOARD_TEXT_BYTES,
+        )
+    })
+}
+
+/// Apply the text part of one egui platform output to the injected provider.
+///
+/// `false` means this frame had no text clipboard output. An explicit empty
+/// `CopyText` is still an output and clears the provider. Non-text commands are
+/// intentionally ignored: this seam advertises text support only and must not
+/// claim that image/rich-text clipboard integration exists.
+fn store_drm_clipboard_output(
+    clipboard: &mut dyn crate::TextClipboard,
+    cached_text: &mut String,
+    output: &egui::PlatformOutput,
+) -> bool {
+    let Some(text) = drm_clipboard_output_text(output) else {
+        return false;
+    };
+    clipboard.write_text(&text);
+    // `drm_clipboard_output_text` already applied the provider-facing bound. Keep
+    // the paste cache on that same value rather than the raw egui command.
+    *cached_text = text;
+    true
 }
 
 fn clear_rgba(color: egui::Color32) -> [f32; 4] {
@@ -1959,10 +1988,11 @@ pub fn run_drm_with_clipboard(
         // below; it only takes `platform_output.accesskit_update`, leaving the rest of
         // `full_output` intact.
         a11y.drain(&mut full_output);
-        if let Some(text) = drm_clipboard_output_text(&full_output.platform_output) {
-            clipboard.write_text(&text);
-            clipboard_text = text;
-        }
+        let _ = store_drm_clipboard_output(
+            clipboard,
+            &mut clipboard_text,
+            &full_output.platform_output,
+        );
         // eframe's contract: egui reports how long until it next needs to paint via the
         // root viewport's `repaint_delay` (`Duration::MAX` == idle). Arm the next wake
         // from it (perf-1) — this is what gives request_repaint_after teeth. Read before
@@ -2457,8 +2487,10 @@ mod tests {
     use super::{
         clear_rgba, drm_clipboard_output_text, drm_clipboard_text_for_paste, drm_modifiers,
         explicit_modifier, open_primary_node, probe_prime_import_liveness,
-        push_drm_clipboard_shortcut, refresh_drm_clipboard_text, DrmError, ReimportedGemBuffer,
+        push_drm_clipboard_shortcut, refresh_drm_clipboard_text, store_drm_clipboard_output,
+        DrmError, ReimportedGemBuffer,
     };
+    use crate::{MemoryTextClipboard, TextClipboard};
     use drm::buffer::{Handle as GemHandle, PlanarBuffer};
 
     #[test]
@@ -2566,7 +2598,7 @@ mod tests {
 
     #[test]
     fn drm_clipboard_provider_clear_drops_the_cached_paste_value() {
-        let mut provider = crate::MemoryTextClipboard::new();
+        let mut provider = MemoryTextClipboard::new();
         let mut cached = String::new();
 
         provider.write_text("remote text");
@@ -2608,6 +2640,84 @@ mod tests {
             drm_clipboard_output_text(&output),
             Some("legacy".to_owned())
         );
+    }
+
+    #[test]
+    fn drm_clipboard_output_is_bounded_before_provider_and_cache() {
+        let mut provider = MemoryTextClipboard::new();
+        let mut cached = String::new();
+        let mut output = egui::PlatformOutput::default();
+        output.commands.push(egui::OutputCommand::CopyText(format!(
+            "{}é",
+            "x".repeat(crate::clipboard::MAX_CLIPBOARD_TEXT_BYTES - 1)
+        )));
+
+        assert!(store_drm_clipboard_output(
+            &mut provider,
+            &mut cached,
+            &output
+        ));
+        assert_eq!(cached.len(), crate::clipboard::MAX_CLIPBOARD_TEXT_BYTES - 1);
+        assert_eq!(provider.read_text().as_deref(), Some(cached.as_str()));
+    }
+
+    #[test]
+    fn drm_clipboard_empty_output_clears_provider_and_cache() {
+        let mut provider = MemoryTextClipboard::new();
+        provider.write_text("stale");
+        let mut cached = String::from("stale");
+        let mut output = egui::PlatformOutput::default();
+        output
+            .commands
+            .push(egui::OutputCommand::CopyText(String::new()));
+
+        assert!(store_drm_clipboard_output(
+            &mut provider,
+            &mut cached,
+            &output
+        ));
+        assert!(cached.is_empty());
+        assert!(provider.read_text().is_none());
+    }
+
+    #[test]
+    fn drm_clipboard_unavailable_provider_does_not_get_a_fake_paste_or_output() {
+        #[derive(Default)]
+        struct UnsupportedClipboard;
+
+        impl TextClipboard for UnsupportedClipboard {
+            fn read_text(&mut self) -> Option<String> {
+                None
+            }
+
+            fn write_text(&mut self, _text: &str) {}
+        }
+
+        let mut provider = UnsupportedClipboard;
+        let mut cached = String::from("stale");
+        refresh_drm_clipboard_text(&mut provider, &mut cached);
+        assert!(cached.is_empty());
+
+        let modifiers = drm_modifiers(false, true, false);
+        let mut events = Vec::new();
+        assert!(push_drm_clipboard_shortcut(
+            &mut events,
+            modifiers,
+            egui::Key::V,
+            &cached
+        ));
+        assert!(
+            events.is_empty(),
+            "unsupported paste must not be fabricated"
+        );
+
+        let output = egui::PlatformOutput::default();
+        assert!(!store_drm_clipboard_output(
+            &mut provider,
+            &mut cached,
+            &output
+        ));
+        assert!(cached.is_empty());
     }
 
     // ── QC-23 Tier 1: PRIME-import liveness ──

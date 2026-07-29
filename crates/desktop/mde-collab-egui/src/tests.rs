@@ -705,7 +705,7 @@ fn channel_tasks_mode_renders_projected_rows() {
 }
 
 #[test]
-fn channel_task_actions_emit_create_check_and_complete_commands() {
+fn channel_task_actions_emit_create_update_check_complete_and_reopen_commands() {
     let space = SpaceId::new();
     let task = EventId::new();
     let mut surface = CommunicationsSurface::new();
@@ -730,6 +730,21 @@ fn channel_task_actions_emit_create_check_and_complete_commands() {
         surface.task_draft(space),
         "",
         "the draft clears after a successful create"
+    );
+
+    let mut sink = CommandSink::new();
+    surface.update_task(&mut sink, space, task, " rotate gateway v2 ");
+    assert!(
+        matches!(
+            sink.queued().first(),
+            Some(CollabCommand::UpdateTask {
+                space: command_space,
+                task: command_task,
+                title
+            }) if *command_space == space && *command_task == task && title == "rotate gateway v2"
+        ),
+        "updating a task must emit a bounded typed UpdateTask command: {:?}",
+        sink.queued()
     );
 
     let mut sink = CommandSink::new();
@@ -758,6 +773,20 @@ fn channel_task_actions_emit_create_check_and_complete_commands() {
             }) if *command_space == space && *command_task == task
         ),
         "completing a task must emit a typed CompleteTask command: {:?}",
+        sink.queued()
+    );
+
+    let mut sink = CommandSink::new();
+    surface.reopen_task(&mut sink, space, task);
+    assert!(
+        matches!(
+            sink.queued().first(),
+            Some(CollabCommand::ReopenTask {
+                space: command_space,
+                task: command_task
+            }) if *command_space == space && *command_task == task
+        ),
+        "reopening a task must emit a typed ReopenTask command: {:?}",
         sink.queued()
     );
 }

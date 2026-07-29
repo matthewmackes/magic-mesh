@@ -1,9 +1,8 @@
 //! The Construct Springboard Dock: persistent shell navigation plus chooser pins.
 //!
 //! The dock is shell-owned and always reserves its footprint. In the default
-//! bottom placement it is a solid-black, bottom-centered springboard pill; Pin
-//! moves it into the 56px left rail that the central layout reserves below the
-//! top strip.
+//! bottom placement it is a solid-black, full-width 48px taskbar; Pin moves it
+//! into the 56px left rail that the central layout reserves below the top strip.
 //! Placement is persisted per seat, while the visual transition is kept in
 //! memory so a restart never waits on animation state. Chooser-pinned remote
 //! desktop sources are rendered as additional dock targets from the chooser's
@@ -27,22 +26,14 @@ use crate::surfaces::{
 
 /// The reserved left-rail width in docked mode.
 pub(crate) const DOCKED_W: f32 = 56.0;
-/// The minimum floating dock width for the grouped Springboard launcher row.
-pub(crate) const FLOATING_W: f32 = 640.0;
-/// The fixed floating dock height: compact caption labels above 40px targets.
-pub(crate) const FLOATING_H: f32 = 64.0;
-/// The bottom/left breathing room around the undocked pill.
-const FLOATING_MARGIN: f32 = 16.0;
-/// Bottom space reserved by the horizontal Springboard Dock, including the
-/// breathing room below the black pill and its divider.
-pub(crate) const SPRINGBOARD_DOCK_RESERVED_H: f32 = FLOATING_H + FLOATING_MARGIN;
+/// The full-width Construct taskbar height in Bottom mode.
+pub(crate) const TASKBAR_H: f32 = 48.0;
+/// Bottom space reserved by the horizontal taskbar in normal workspace layout.
+pub(crate) const SPRINGBOARD_DOCK_RESERVED_H: f32 = TASKBAR_H;
 /// The icon controls keep a compact 40px target in the thin dock.
 const CONTROL_EDGE: f32 = 40.0;
-/// The horizontal Springboard Dock may be narrower than the preferred 640px
-/// pill on small panels. Preserve the full app set by shrinking the bottom row
-/// after chooser pins have been dropped, instead of letting controls escape the
-/// painted backing.
-const FLOATING_MIN_CONTROL_EDGE: f32 = 24.0;
+/// The horizontal taskbar keeps fixed-size targets and drops lower-priority
+/// chooser pins and launchers when a panel cannot fit the whole catalog.
 const FLOATING_GAP: f32 = 4.0;
 /// Maximum number of chooser-pinned sources shown in the dock. The full
 /// chooser remains the unbounded discovery surface; the dock is a quick rail.
@@ -60,11 +51,13 @@ static NAV_LAYER_ID_MAP_LOGGED: AtomicBool = AtomicBool::new(false);
 /// One action emitted by the painted controls.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Action {
+    /// Open and focus the existing Front Door search overlay.
+    OpenSearch,
     /// Return to the previously active app or Fleet & Mesh tab.
     Back,
     /// Open the untitled all-icons Desktop.
     Home,
-    /// Toggle between the floating pill and the left rail.
+    /// Toggle between the bottom taskbar and the left rail.
     ToggleDock,
     /// Open one docked app surface.
     OpenSurface(Surface),
@@ -76,7 +69,7 @@ pub(crate) enum Action {
 /// The persisted placement choice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum DockMode {
-    /// The undocked bottom-centered pill.
+    /// The undocked bottom taskbar.
     #[serde(rename = "floating")]
     Floating,
     /// The reserved left rail below the status bar.
@@ -477,6 +470,7 @@ fn read_bounded_config(path: &Path) -> std::io::Result<String> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ControlKind {
+    Start,
     Back,
     Home,
     Pin,
@@ -487,6 +481,7 @@ enum ControlKind {
 impl ControlKind {
     const fn id_suffix(self) -> &'static str {
         match self {
+            Self::Start => "start",
             Self::Back => "back",
             Self::Home => "home",
             Self::Pin => "pin",
@@ -497,6 +492,7 @@ impl ControlKind {
 
     const fn icon(self) -> IconId {
         match self {
+            Self::Start => IconId::Mark,
             Self::Back => IconId::ArrowLeft,
             Self::Home => IconId::FileHome,
             Self::Pin => IconId::Pin,
@@ -507,9 +503,10 @@ impl ControlKind {
 
     const fn tooltip(self) -> &'static str {
         match self {
+            Self::Start => "Start - Search",
             Self::Back => "Back",
             Self::Home => "Home",
-            Self::Pin => "Pin Springboard Dock",
+            Self::Pin => "Taskbar placement",
             Self::SurfaceLauncher => "Open app",
             Self::PinnedDesktop => "Open pinned desktop",
         }
@@ -517,6 +514,7 @@ impl ControlKind {
 
     const fn action(self) -> Action {
         match self {
+            Self::Start => Action::OpenSearch,
             Self::Back => Action::Back,
             Self::Home => Action::Home,
             Self::Pin => Action::ToggleDock,
@@ -562,7 +560,7 @@ fn dock_launcher_count() -> usize {
 }
 
 fn dock_control_capacity(pinned_count: usize) -> usize {
-    3 + dock_launcher_count() + pinned_count
+    4 + dock_launcher_count() + pinned_count
 }
 
 fn control_span(count: usize, edge: f32, gap: f32) -> f32 {
@@ -574,81 +572,50 @@ fn control_span(count: usize, edge: f32, gap: f32) -> f32 {
 }
 
 fn effective_floating_pinned_count(screen: egui::Rect, requested: usize, gap: f32) -> usize {
-    let available = floating_available_width(screen);
     let requested = requested.min(MAX_PINNED_SOURCES);
+    let visible_surfaces = effective_floating_surface_count(screen, gap);
+    let center_capacity = floating_center_capacity(screen, gap);
+    let available_pins = center_capacity.saturating_sub(visible_surfaces);
     for pinned_count in (0..=requested).rev() {
-        if floating_content_width(pinned_count, CONTROL_EDGE, gap) <= available {
+        if pinned_count <= available_pins {
             return pinned_count;
         }
     }
     0
 }
 
-fn floating_available_width(screen: egui::Rect) -> f32 {
-    (screen.width() - 2.0 * FLOATING_MARGIN).max(1.0)
+fn effective_floating_surface_count(screen: egui::Rect, gap: f32) -> usize {
+    floating_center_capacity(screen, gap).min(dock_launcher_count())
 }
 
-fn floating_group_width(edge: f32, gap: f32) -> f32 {
-    DOCK_LAUNCHER_GROUPS
-        .iter()
-        .map(|group| control_span(group.surfaces.len(), edge, gap))
-        .sum::<f32>()
-        + (DOCK_LAUNCHER_GROUPS.len().saturating_sub(1) as f32 * Style::SP_S)
+fn floating_center_bounds(screen: egui::Rect, gap: f32) -> (f32, f32) {
+    let left_start = screen.left() + Style::SP_L;
+    let left_cluster_end = left_start + control_span(3, CONTROL_EDGE, gap);
+    let right_start = screen.right() - Style::SP_L - CONTROL_EDGE;
+    (left_cluster_end + gap, right_start - gap)
 }
 
-fn floating_content_width(pinned_count: usize, edge: f32, gap: f32) -> f32 {
-    let base_w = control_span(3, edge, gap);
-    let pinned_w = control_span(pinned_count, edge, gap);
-    base_w
-        + Style::SP_S
-        + floating_group_width(edge, gap)
-        + if pinned_count > 0 {
-            Style::SP_S + pinned_w
-        } else {
-            0.0
-        }
-        + Style::SP_L * 2.0
-}
-
-fn floating_control_count(pinned_count: usize) -> usize {
-    3 + dock_launcher_count() + pinned_count
-}
-
-fn floating_control_edge(screen: egui::Rect, pinned_count: usize, gap: f32) -> f32 {
-    let available = floating_available_width(screen);
-    if floating_content_width(pinned_count, CONTROL_EDGE, gap) <= available {
-        return CONTROL_EDGE;
-    }
-
-    let non_control_width = floating_content_width(pinned_count, 0.0, gap);
-    let controls = floating_control_count(pinned_count).max(1) as f32;
-    ((available - non_control_width) / controls)
-        .min(CONTROL_EDGE)
-        .max(FLOATING_MIN_CONTROL_EDGE.min(CONTROL_EDGE))
+fn floating_center_capacity(screen: egui::Rect, gap: f32) -> usize {
+    let (center_left, center_right) = floating_center_bounds(screen, gap);
+    (((center_right - center_left).max(0.0) + gap) / (CONTROL_EDGE + gap)).floor() as usize
 }
 
 fn floating_geometry_for(screen: egui::Rect, pinned_count: usize) -> Geometry {
     let gap = FLOATING_GAP;
+    let surface_count = effective_floating_surface_count(screen, gap);
     let pinned_count = effective_floating_pinned_count(screen, pinned_count, gap);
-    let edge = floating_control_edge(screen, pinned_count, gap);
-    let width = FLOATING_W
-        .max(floating_content_width(pinned_count, edge, gap))
-        .min(floating_available_width(screen));
+    let edge = CONTROL_EDGE;
     let outer = egui::Rect::from_min_size(
-        egui::pos2(
-            screen.center().x - width / 2.0,
-            screen.bottom() - FLOATING_MARGIN - FLOATING_H,
-        ),
-        egui::vec2(width, FLOATING_H),
+        egui::pos2(screen.left(), screen.bottom() - TASKBAR_H),
+        egui::vec2(screen.width(), TASKBAR_H),
     );
-    let first_x = outer.left() + Style::SP_L;
-    let y = outer.bottom() - Style::SP_S - edge;
-    let label_top = outer.top() + Style::SP_XS;
-    let label_h = TypographyRole::Caption.line_height().ceil();
+    let y = outer.top() + (TASKBAR_H - edge) / 2.0;
+    let left_start = outer.left() + Style::SP_L;
+    let right_x = outer.right() - Style::SP_L - edge;
     let mut controls = Vec::with_capacity(dock_control_capacity(pinned_count));
-    let mut group_labels = Vec::with_capacity(DOCK_LAUNCHER_GROUPS.len());
-    let mut cursor_x = first_x;
-    for kind in [ControlKind::Back, ControlKind::Home, ControlKind::Pin] {
+    let group_labels = Vec::new();
+    let mut cursor_x = left_start;
+    for kind in [ControlKind::Start, ControlKind::Back, ControlKind::Home] {
         controls.push(Control {
             kind,
             rect: egui::Rect::from_min_size(egui::pos2(cursor_x, y), egui::vec2(edge, edge)),
@@ -657,29 +624,23 @@ fn floating_geometry_for(screen: egui::Rect, pinned_count: usize) -> Geometry {
         });
         cursor_x += edge + gap;
     }
-    cursor_x -= gap;
-    cursor_x += Style::SP_S;
-    for group in DOCK_LAUNCHER_GROUPS {
-        let group_start = cursor_x;
-        for surface in group.surfaces {
-            controls.push(Control {
-                kind: ControlKind::SurfaceLauncher,
-                rect: egui::Rect::from_min_size(egui::pos2(cursor_x, y), egui::vec2(edge, edge)),
-                surface: Some(*surface),
-                source_index: None,
-            });
-            cursor_x += edge + gap;
-        }
-        cursor_x -= gap;
-        group_labels.push(GroupLabel {
-            label: group.label,
-            rect: egui::Rect::from_min_max(
-                egui::pos2(group_start, label_top),
-                egui::pos2(cursor_x, label_top + label_h),
-            ),
-            accent: group.accent,
+    let center_count = surface_count + pinned_count;
+    let center_span = control_span(center_count, edge, gap);
+    let (center_left, center_right) = floating_center_bounds(screen, gap);
+    let center_start = (center_left + center_right) / 2.0 - center_span / 2.0;
+    cursor_x = center_start;
+    for surface in DOCK_LAUNCHER_GROUPS
+        .iter()
+        .flat_map(|group| group.surfaces.iter().copied())
+        .take(surface_count)
+    {
+        controls.push(Control {
+            kind: ControlKind::SurfaceLauncher,
+            rect: egui::Rect::from_min_size(egui::pos2(cursor_x, y), egui::vec2(edge, edge)),
+            surface: Some(surface),
+            source_index: None,
         });
-        cursor_x += Style::SP_S;
+        cursor_x += edge + gap;
     }
     for source_index in 0..pinned_count {
         controls.push(Control {
@@ -690,9 +651,15 @@ fn floating_geometry_for(screen: egui::Rect, pinned_count: usize) -> Geometry {
         });
         cursor_x += edge + gap;
     }
+    controls.push(Control {
+        kind: ControlKind::Pin,
+        rect: egui::Rect::from_min_size(egui::pos2(right_x, y), egui::vec2(edge, edge)),
+        surface: None,
+        source_index: None,
+    });
     Geometry {
         outer,
-        radius: egui::CornerRadius::same((FLOATING_H / 2.0) as u8),
+        radius: egui::CornerRadius::ZERO,
         group_labels,
         controls,
         finished: true,
@@ -729,7 +696,7 @@ fn docked_geometry_for(screen: egui::Rect, pinned_count: usize) -> Geometry {
     let mut group_labels = Vec::with_capacity(DOCK_LAUNCHER_GROUPS.len());
     let mut cursor_y = screen.top() + STATUS_BAR_H + Style::SP_S;
     let label_h = TypographyRole::Caption.line_height().ceil();
-    for kind in [ControlKind::Back, ControlKind::Home, ControlKind::Pin] {
+    for kind in [ControlKind::Start, ControlKind::Back, ControlKind::Home] {
         controls.push(Control {
             kind,
             rect: egui::Rect::from_min_size(
@@ -786,6 +753,17 @@ fn docked_geometry_for(screen: egui::Rect, pinned_count: usize) -> Geometry {
             source_index: Some(source_index),
         });
         cursor_y += CONTROL_EDGE + Style::SP_XS;
+    }
+    if docked_control_fits(screen, cursor_y) {
+        controls.push(Control {
+            kind: ControlKind::Pin,
+            rect: egui::Rect::from_min_size(
+                egui::pos2(outer.center().x - CONTROL_EDGE / 2.0, cursor_y),
+                egui::vec2(CONTROL_EDGE, CONTROL_EDGE),
+            ),
+            surface: None,
+            source_index: None,
+        });
     }
     Geometry {
         outer,
@@ -874,7 +852,13 @@ fn paint_backing(painter: &egui::Painter, geometry: &Geometry) {
 
 #[cfg(test)]
 pub(crate) fn floating_pin_center(screen: egui::Rect) -> egui::Pos2 {
-    floating_geometry_for(screen, 0).controls[2].rect.center()
+    floating_geometry_for(screen, 0)
+        .controls
+        .iter()
+        .find(|control| control.kind == ControlKind::Pin)
+        .expect("floating taskbar placement control")
+        .rect
+        .center()
 }
 
 fn paint_group_label(ctx: &egui::Context, painter: &egui::Painter, group: GroupLabel) {
@@ -1037,7 +1021,7 @@ fn control_label(
         };
     }
     if control.kind == ControlKind::Pin {
-        "Pin Springboard Dock".to_owned()
+        "Taskbar placement".to_owned()
     } else {
         control.kind.tooltip().to_owned()
     }
@@ -1205,10 +1189,9 @@ mod tests {
     #[test]
     fn defaults_to_an_unpinned_springboard_dock() {
         assert_eq!(State::default().mode, DockMode::Floating);
-        assert_eq!(FLOATING_W, 640.0);
-        assert_eq!(FLOATING_H, 64.0);
+        assert_eq!(TASKBAR_H, 48.0);
         assert_eq!(DOCKED_W, 56.0);
-        assert_eq!(SPRINGBOARD_DOCK_RESERVED_H, 80.0);
+        assert_eq!(SPRINGBOARD_DOCK_RESERVED_H, 48.0);
     }
 
     #[test]
@@ -1244,13 +1227,15 @@ mod tests {
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
         let floating = floating_geometry(screen);
         let docked = docked_geometry(screen);
-        assert_eq!(floating.outer.size(), egui::vec2(FLOATING_W, FLOATING_H));
-        assert_eq!(floating.outer.center().x, screen.center().x);
+        assert_eq!(floating.outer.size(), egui::vec2(screen.width(), TASKBAR_H));
+        assert_eq!(floating.outer.left(), screen.left());
+        assert_eq!(floating.outer.right(), screen.right());
+        assert_eq!(floating.outer.bottom(), screen.bottom());
         assert_eq!(docked.outer.width(), DOCKED_W);
         assert_eq!(docked.outer.top(), screen.top());
         assert_eq!(docked.controls[0].rect.top(), STATUS_BAR_H + Style::SP_S);
         assert_eq!(docked.controls.len(), dock_control_capacity(0));
-        assert_eq!(floating.group_labels.len(), DOCK_LAUNCHER_GROUPS.len());
+        assert!(floating.group_labels.is_empty());
         assert_eq!(docked.group_labels.len(), DOCK_LAUNCHER_GROUPS.len());
     }
 
@@ -1259,8 +1244,8 @@ mod tests {
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
         let geometry = floating_geometry_for(screen, MAX_PINNED_SOURCES);
 
-        assert!(geometry.outer.left() >= screen.left() + FLOATING_MARGIN);
-        assert!(geometry.outer.right() <= screen.right() - FLOATING_MARGIN);
+        assert_eq!(geometry.outer.left(), screen.left());
+        assert_eq!(geometry.outer.right(), screen.right());
         assert_eq!(geometry.outer.center().x, screen.center().x);
         assert!(
             geometry
@@ -1269,27 +1254,27 @@ mod tests {
                 .filter(|control| control.kind == ControlKind::PinnedDesktop)
                 .count()
                 < MAX_PINNED_SOURCES,
-            "bottom dock must drop excess chooser pins instead of painting controls past the pill"
+            "bottom taskbar must drop excess chooser pins instead of painting controls past the screen"
         );
         assert_hit_targets_inside_backing("floating narrow screen".to_string(), &geometry);
     }
 
     #[test]
-    fn bottom_dock_shrinks_cells_before_overflowing_the_pill() {
+    fn bottom_taskbar_keeps_fixed_targets_before_overflowing_the_catalog() {
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(480.0, 480.0));
         let geometry = floating_geometry_for(screen, MAX_PINNED_SOURCES);
 
         assert_eq!(geometry.outer.center().x, screen.center().x);
-        assert!(geometry.outer.left() >= screen.left() + FLOATING_MARGIN);
-        assert!(geometry.outer.right() <= screen.right() - FLOATING_MARGIN);
-        assert_eq!(
+        assert_eq!(geometry.outer.left(), screen.left());
+        assert_eq!(geometry.outer.right(), screen.right());
+        assert!(
             geometry
                 .controls
                 .iter()
                 .filter(|control| control.kind == ControlKind::SurfaceLauncher)
-                .count(),
-            dock_launcher_count(),
-            "bottom placement must keep the operator Dock launcher set before spending width on chooser pins"
+                .count()
+                < dock_launcher_count(),
+            "bottom placement must retain the launcher set when chooser pins are dropped"
         );
         assert_eq!(
             geometry
@@ -1300,13 +1285,10 @@ mod tests {
             0,
             "chooser pins are the first controls dropped on a narrow bottom Dock"
         );
-        assert!(
-            geometry
-                .controls
-                .iter()
-                .any(|control| control.rect.width() < CONTROL_EDGE),
-            "narrow bottom placement must shrink cells instead of painting past the backing"
-        );
+        assert!(geometry
+            .controls
+            .iter()
+            .all(|control| { (control.rect.width() - CONTROL_EDGE).abs() < f32::EPSILON }));
         assert_hit_targets_inside_backing("floating sub-640 screen".to_string(), &geometry);
     }
 
@@ -1322,7 +1304,7 @@ mod tests {
                 .take(3)
                 .map(|control| control.kind)
                 .collect::<Vec<_>>(),
-            vec![ControlKind::Back, ControlKind::Home, ControlKind::Pin],
+            vec![ControlKind::Start, ControlKind::Back, ControlKind::Home],
             "rail safety controls must remain first even when app launchers overflow"
         );
         assert!(
@@ -1557,9 +1539,10 @@ mod tests {
                 .as_ref()
                 .expect("headless navigation bar should publish an AccessKit tree");
             for (kind, expected_label) in [
+                (ControlKind::Start, "Start - Search"),
                 (ControlKind::Back, "Back"),
                 (ControlKind::Home, "Home"),
-                (ControlKind::Pin, "Pin Springboard Dock"),
+                (ControlKind::Pin, "Taskbar placement"),
             ] {
                 let node = update
                     .nodes
@@ -1652,7 +1635,13 @@ mod tests {
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
         let mut state = State::with_mode(DockMode::Floating);
         let ctx = egui::Context::default();
-        let home = floating_geometry(screen).controls[1].rect.center();
+        let home = floating_geometry(screen)
+            .controls
+            .iter()
+            .find(|control| control.kind == ControlKind::Home)
+            .expect("floating Home control")
+            .rect
+            .center();
 
         let base = || egui::RawInput {
             screen_rect: Some(screen),
@@ -1697,7 +1686,13 @@ mod tests {
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0));
         let mut state = State::with_mode(DockMode::Floating);
         let ctx = egui::Context::default();
-        let pin = floating_geometry(screen).controls[2].rect.center();
+        let pin = floating_geometry(screen)
+            .controls
+            .iter()
+            .find(|control| control.kind == ControlKind::Pin)
+            .expect("floating taskbar placement control")
+            .rect
+            .center();
 
         let input = |events| egui::RawInput {
             screen_rect: Some(screen),
@@ -1759,7 +1754,13 @@ mod tests {
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0));
         let mut state = State::with_mode(DockMode::Floating);
         let ctx = egui::Context::default();
-        let pin = floating_geometry(screen).controls[2].rect.center();
+        let pin = floating_geometry(screen)
+            .controls
+            .iter()
+            .find(|control| control.kind == ControlKind::Pin)
+            .expect("floating taskbar placement control")
+            .rect
+            .center();
 
         let input = |events| egui::RawInput {
             screen_rect: Some(screen),
@@ -1876,6 +1877,7 @@ mod tests {
             }
 
             for (kind, expected) in [
+                (ControlKind::Start, Action::OpenSearch),
                 (ControlKind::Back, Action::Back),
                 (ControlKind::Home, Action::Home),
                 (ControlKind::Pin, Action::ToggleDock),
@@ -2000,15 +2002,25 @@ mod tests {
         // frame, then reports `clicked()` on the current-frame widget with the
         // same ID. The Springboard Dock reuses Back/Home/Pin semantics in both
         // placements, so the IDs must include the placement: otherwise the old
-        // top-left rail buttons can complete a click on the new bottom pill.
+        // top-left rail buttons can complete a click on the new bottom taskbar.
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
-        let stale_home = docked_geometry(screen).controls[1].rect.center();
-        let floating_home = floating_geometry(screen).controls[1].rect.center();
+        let stale_home = docked_geometry(screen)
+            .controls
+            .iter()
+            .find(|control| control.kind == ControlKind::Home)
+            .expect("docked Home control")
+            .rect
+            .center();
+        let floating = floating_geometry(screen);
+        let floating_home_control = floating
+            .controls
+            .iter()
+            .find(|control| control.kind == ControlKind::Home)
+            .expect("floating Home control");
+        let floating_home = floating_home_control.rect.center();
         assert!(
-            !floating_geometry(screen).controls[1]
-                .rect
-                .contains(stale_home),
-            "the stale top-left Home target must be outside the floating pill"
+            !floating_home_control.rect.contains(stale_home),
+            "the stale top-left Home target must be outside the floating taskbar"
         );
 
         let ctx = egui::Context::default();
@@ -2057,7 +2069,7 @@ mod tests {
         );
         assert_eq!(
             action, None,
-            "a stale top-left rail hit box must not activate the bottom floating pill"
+            "a stale top-left rail hit box must not activate the bottom taskbar"
         );
 
         let _ = ctx.run(
@@ -2090,7 +2102,7 @@ mod tests {
         assert_eq!(
             action,
             Some(Action::Home),
-            "the actual bottom pill Home target must remain clickable"
+            "the actual bottom taskbar Home target must remain clickable"
         );
     }
 
@@ -2108,18 +2120,22 @@ mod tests {
         )];
         let geometry = floating_geometry_for(screen, sources.len());
         assert_eq!(geometry.controls.len(), dock_control_capacity(1));
-        assert_eq!(geometry.controls[2].kind, ControlKind::Pin);
+        let placement = geometry
+            .controls
+            .iter()
+            .find(|control| control.kind == ControlKind::Pin)
+            .copied()
+            .expect("taskbar placement control");
         let pinned = geometry
             .controls
-            .last()
+            .iter()
+            .find(|control| control.kind == ControlKind::PinnedDesktop)
             .copied()
             .expect("chooser pin should append a dock target");
         assert_eq!(pinned.kind, ControlKind::PinnedDesktop);
         assert_eq!(pinned.source_index, Some(0));
-        assert!(
-            geometry.outer.width() >= FLOATING_W,
-            "the dock must grow to retain the pinned source target"
-        );
+        assert_eq!(placement.rect.right(), screen.right() - Style::SP_L);
+        assert_eq!(geometry.outer.width(), screen.width());
 
         let ctx = egui::Context::default();
         let mut state = State::with_mode(DockMode::Floating);
@@ -2253,21 +2269,17 @@ mod tests {
     }
 
     #[test]
-    fn headless_geometry_proves_black_pill_and_slide_then_melt_rail() {
+    fn headless_geometry_proves_black_taskbar_and_slide_then_melt_rail() {
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
         let floating = floating_geometry(screen);
         let docked = docked_geometry(screen);
 
         assert_eq!(
             floating.outer,
-            egui::Rect::from_min_max(egui::pos2(320.0, 720.0), egui::pos2(960.0, 784.0)),
-            "undocked navigation must be a bottom-centered pill"
+            egui::Rect::from_min_max(egui::pos2(0.0, 752.0), egui::pos2(1280.0, 800.0)),
+            "bottom navigation must be a full-width taskbar"
         );
-        assert_eq!(
-            floating.radius,
-            egui::CornerRadius::same((FLOATING_H / 2.0) as u8),
-            "the undocked backing must stay pill-shaped"
-        );
+        assert_eq!(floating.radius, egui::CornerRadius::ZERO);
         assert_eq!(
             floating
                 .controls
@@ -2275,8 +2287,8 @@ mod tests {
                 .take(3)
                 .map(|control| control.kind)
                 .collect::<Vec<_>>(),
-            vec![ControlKind::Back, ControlKind::Home, ControlKind::Pin],
-            "the dock order must remain Back, Home, Pin"
+            vec![ControlKind::Start, ControlKind::Back, ControlKind::Home],
+            "the taskbar must lead with Start, Back, Home"
         );
         assert_eq!(
             floating
@@ -2285,7 +2297,7 @@ mod tests {
                 .take(3)
                 .map(|control| control_icon(*control))
                 .collect::<Vec<_>>(),
-            vec![IconId::ArrowLeft, IconId::FileHome, IconId::Pin,]
+            vec![IconId::Mark, IconId::ArrowLeft, IconId::FileHome,]
         );
         assert_eq!(
             floating
@@ -2305,20 +2317,13 @@ mod tests {
             ],
             "the grouped dock must use the operator survey order"
         );
-        assert_eq!(
-            floating
-                .group_labels
-                .iter()
-                .map(|group| group.label)
-                .collect::<Vec<_>>(),
-            vec!["Infra", "Ops", "Life"]
-        );
+        assert!(floating.group_labels.is_empty());
         assert!(
             floating
                 .controls
                 .iter()
                 .all(|control| control.rect.center().y == floating.controls[0].rect.center().y),
-            "the pill controls must share one horizontal row"
+            "the taskbar controls must share one horizontal row"
         );
 
         // Exercise the actual backing painter through egui's CPU tessellator so
@@ -2349,7 +2354,7 @@ mod tests {
                     }
                     egui::epaint::Primitive::Callback(_) => false,
                 }),
-            "the undocked pill backing must paint an opaque black mesh"
+            "the taskbar backing must paint an opaque black mesh"
         );
 
         let start = Instant::now();
@@ -2361,9 +2366,9 @@ mod tests {
         assert_eq!(at_start.radius, floating.radius);
 
         // The first phase is a horizontal slide into the left edge: size,
-        // vertical position, and pill radius are unchanged before the melt.
+        // vertical position, and corner radius are unchanged before the melt.
         let during_slide = state.geometry(screen, start + Duration::from_millis(90));
-        assert!(during_slide.outer.left() < floating.outer.left());
+        assert_eq!(during_slide.outer.left(), floating.outer.left());
         assert_eq!(during_slide.outer.width(), floating.outer.width());
         assert_eq!(during_slide.outer.top(), floating.outer.top());
         assert_eq!(during_slide.radius, floating.radius);
@@ -2375,7 +2380,7 @@ mod tests {
         assert!(during_melt.outer.width() < floating.outer.width());
         assert!(during_melt.outer.top() < during_slide.outer.top());
         assert!(during_melt.outer.height() > floating.outer.height());
-        assert!(during_melt.radius.nw < floating.radius.nw);
+        assert!(during_melt.radius.nw <= floating.radius.nw);
         assert!(during_melt.controls[0].rect.top() < during_slide.controls[0].rect.top());
 
         let settled = state.geometry(screen, start + TRANSITION);
@@ -2387,11 +2392,11 @@ mod tests {
                 .take(3)
                 .map(|control| control.kind)
                 .collect::<Vec<_>>(),
-            vec![ControlKind::Back, ControlKind::Home, ControlKind::Pin]
+            vec![ControlKind::Start, ControlKind::Back, ControlKind::Home]
         );
         assert!(settled.controls[0].rect.top() < settled.controls[1].rect.top());
         assert!(settled.controls[1].rect.top() < settled.controls[2].rect.top());
-        assert_eq!(settled.controls[2].kind, ControlKind::Pin);
+        assert_eq!(settled.controls[2].kind, ControlKind::Home);
     }
 
     fn tempfile_dir() -> PathBuf {

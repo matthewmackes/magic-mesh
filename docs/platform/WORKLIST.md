@@ -191,16 +191,16 @@ remains here under a completed status.
   dedicated `browser-vm`, attaches through VDI, renders the guest framebuffer,
   and forwards focused input. Chromium, browser chrome, tabs, page execution,
   media decode, and page failures remain inside the guest.
-- Current state: The old shell Browser, helper engines, wire/client bridge,
-  worker family, RPM variant, CEF/Widevine/model setup, SELinux units, and
-  Browser-specific daemon integrations remain in `magic-mesh`. Existing
-  Workloads contracts can provision `DeliveryType::DesktopVm`; the VDI stack
-  already supports RDP/VNC/SPICE sessions and damage-aware texture uploads.
-  RDP audio playback is currently disabled. The full pre-rework Browser
-  inventory and decision record is preserved in the 2026-07-28 archive
-  snapshot. A current 199-path source/destination inventory, provenance
-  record, and fail-closed verifier now live under
-  `docs/design/browser-stack-extraction/` and `install-helpers/`.
+- Current state: The old shell Browser, helper engines, worker/package seams,
+  and Browser-specific daemon integrations remain in `magic-mesh`. Existing
+  Workloads contracts provision `DeliveryType::DesktopVm`; the VDI stack
+  supports RDP/VNC/SPICE and damage-aware texture uploads, with RDP audio
+  disabled. The 199-path source/destination inventory, provenance record, and
+  fail-closed verifier live under `docs/design/browser-stack-extraction/` and
+  `install-helpers/`, alongside the 2026-07-28 archive snapshot. The typed
+  `browser-provision` seam declares a fail-closed DesktopVm desired workload
+  with the 4-vCPU/8192-MiB/64-GiB baseline, strict node/name validation, and
+  deterministic daemon tests; live realization and extraction remain open.
 - Remaining work:
 
   1. Re-run and review the source commit, workspace/package/process inventory,
@@ -364,7 +364,9 @@ remains here under a completed status.
   presentation, bounded Activity folds, and many signed/persistence boundaries
   are implemented. Shared pin/save commands, events, projections, persistence,
   and projected UI affordances now have focused farm coverage. Completed
-  evidence is in the pre-rework archive; the parity source is
+  task/action-item update, complete, reopen, membership, bounded-read, and
+  projected UI slices now also have focused farm coverage. Completed evidence
+  is in the pre-rework archive; the parity source is
   `docs/platform/WL-FUNC-011-parity-ledger.md`.
 - Remaining work:
 
@@ -494,8 +496,9 @@ remains here under a completed status.
   and bridge code, Mesh Teams presentation, and VNC cut-text primitives provide
   partial foundations, but the direct DRM seat path and complete bidirectional
   protocol integration are not production-complete. DRM/VNC clipboard state
-  handling and explicit RDP/SPICE capability reporting now have focused farm
-  coverage; real RDP/SPICE text channels remain unsupported.
+  handling, a bounded UTF-8-safe local text provider, and explicit RDP/SPICE
+  capability reporting now have focused farm coverage; real mesh history/KDC
+  materialization and RDP/SPICE text channels remain unsupported.
 - Remaining work:
 
   1. Map direct-seat shortcuts into `egui::Event::{Copy,Cut,Paste}`, consume
@@ -576,16 +579,15 @@ remains here under a completed status.
   per-radio state/freshness. Real route, maneuver, map, trip, and vehicle data
   replace placeholders. Carbon requirements retire while egui, shared `Style`,
   Construct, Car, and direct DRM remain governed.
-- Current state: `mackesd` publishes `state/vehicle/<node>` with online, GNSS,
-  dual-cellular, one collapsed Wi-Fi string, Ethernet/VPN, power, ignition, and
-  partial airspace state. The worker still assumes one managed MG90 and direct
-  Ethernet. The live MG90 reports LTE/WAN and power but no GNSS fix; OBD parsing
-  is absent. Raster MBTiles and an FTS5 gazetteer are installed for one small
-  region. Maps owns real basemap/search seams, but Valhalla is explicitly
-  unwired, route/lane/speed helpers are synthetic, Airspace lacks bearing, and
-  several administration controls do not execute a backend action. A typed v2
-  identity/radio/freshness/provenance baseline now dual-publishes beside v1,
-  with 11 mesh-type and 69 worker tests passing on the farm.
+- Current state: `mackesd` still assumes one managed MG90/direct Ethernet and
+  publishes collapsed legacy radio state; the live unit reports LTE/WAN and
+  power but no GNSS fix, and OBD parsing is absent. Raster MBTiles/FTS5 search
+  serve one region. Maps owns basemap/search seams, but Valhalla, route/lane/
+  speed helpers, bearing, and several admin actions remain unwired. A typed v2
+  identity/radio/freshness/provenance baseline dual-publishes beside v1, with
+  11 mesh-type and 69 worker tests passing. Maps/Car now projects bounded radio
+  presence, operation, GNSS/radio freshness, and retained age; four consumer
+  tests pass. Multiple MG90s, live adapters, and route/render cutover remain.
 - Remaining work:
   1. Consume WL-UX-009's platform-wide Carbon-requirement retirement and update
      the Maps/Car-specific authority while retaining egui, shared `Style`,
@@ -978,11 +980,14 @@ remains here under a completed status.
   restore a default list. Exactly one underline identifies the focused
   workspace; no running/open indicator exists. Home is an icon-free wallpaper
   and the App Grid is deleted.
-- Current state: `nav_bar.rs` owns persisted `Floating`/`Docked` placement, a
-  640x64 bottom pill, grouped launchers, chooser-pinned desktops, 24px minimum
-  shrink behavior, and a slide/melt transition. `front_door.rs` already has
-  complete search and focus-on-open. `springboard.rs` still owns grid layout,
-  labels, keyboard selection, zoom ghosts, and tile activation.
+- Current state: `nav_bar.rs` now owns persisted `Floating`/`Docked` placement,
+  a full-width 48px Bottom taskbar with fixed 40px targets, left Start/Back/
+  Home controls, a centered launcher/pin strip, right placement control,
+  overflow bounds, and a tested slide/melt transition. Start dispatches to the
+  existing Front Door search/focus path, and the old group labels/pill geometry
+  are gone. `springboard.rs` still owns grid layout, labels, keyboard selection,
+  zoom ghosts, and tile activation; pin catalog/schema/underline persistence
+  and Fleet & Mesh/Workloads exposure remain open.
   `Surface::FleetMesh` exists; Workloads retains the internal
   `Surface::InfraCode` identifier and an obsolete public label.
 - Remaining work:

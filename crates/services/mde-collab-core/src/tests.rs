@@ -27,6 +27,7 @@ use crate::pipeline::EDIT_WINDOW_MS;
 use crate::projection::Projection;
 use crate::signer::{Ed25519Signer, IdSource};
 use crate::CollabEngine;
+use rusqlite::params;
 
 // ---- deterministic injection helpers --------------------------------------
 
@@ -837,6 +838,175 @@ fn message_pin_and_save_projection_converges_under_reordering() {
             vec![message]
         );
     }
+}
+
+#[test]
+fn channel_task_lifecycle_is_signed_permissioned_and_convergent() {
+    let mut alice = engine("alice");
+    let signer = sig(31);
+    let mut ids = SeqIds::new(31_000);
+    let space = alice
+        .apply(
+            &CollabCommand::CreateSpace {
+                kind: SpaceKind::Team,
+                name: "ops".into(),
+            },
+            &signer,
+            &mut ids,
+            1_000,
+        )
+        .expect("create space")[0]
+        .space_id;
+    let task = alice
+        .apply(
+            &CollabCommand::CreateTask {
+                space,
+                title: " rotate the gateway ".into(),
+                source: None,
+            },
+            &signer,
+            &mut ids,
+            1_100,
+        )
+        .expect("create task")[0]
+        .event_id;
+    alice
+        .apply(
+            &CollabCommand::UpdateTask {
+                space,
+                task,
+                title: " inspect the gateway ".into(),
+            },
+            &signer,
+            &mut ids,
+            1_200,
+        )
+        .expect("update task");
+    alice
+        .apply(
+            &CollabCommand::CompleteTask { space, task },
+            &signer,
+            &mut ids,
+            1_300,
+        )
+        .expect("complete task");
+    alice
+        .apply(
+            &CollabCommand::ReopenTask { space, task },
+            &signer,
+            &mut ids,
+            1_400,
+        )
+        .expect("reopen task");
+    alice
+        .apply(
+            &CollabCommand::UpdateTask {
+                space,
+                task,
+                title: " inspect the gateway after reboot ".into(),
+            },
+            &signer,
+            &mut ids,
+            1_500,
+        )
+        .expect("update reopened task");
+
+    let view = alice
+        .projection()
+        .channel_tasks(space)
+        .expect("task read model");
+    assert_eq!(view.tasks.len(), 1);
+    assert_eq!(view.tasks[0].task, task);
+    assert_eq!(view.tasks[0].title, "inspect the gateway after reboot");
+    assert_eq!(view.tasks[0].created_by, ActorId::new("alice"));
+    assert!(!view.tasks[0].checked);
+    assert!(!view.tasks[0].completed);
+    assert!(view.tasks[0].completed_by.is_none());
+    assert!(alice.all_events().iter().all(CollabEventEnvelope::verify));
+
+    {
+        let mut node = engine("mallory");
+        node.merge(alice.all_events()).expect("sync outsider");
+        let denied = node.apply(
+            &CollabCommand::UpdateTask {
+                space,
+                task,
+                title: "forged update".into(),
+            },
+            &sig(32),
+            &mut SeqIds::new(32_000),
+            1_600,
+        );
+        assert!(matches!(denied, Err(CollabError::NotMember { .. })));
+        node.author(
+            space,
+            CollabEventKind::TaskCompleted { task },
+            &sig(33),
+            &mut SeqIds::new(33_000),
+            1_700,
+        )
+        .expect("signed forged event is still ingestible for replay testing");
+        assert!(
+            !node
+                .projection()
+                .channel_tasks(space)
+                .expect("permissioned task read model")
+                .tasks[0]
+                .completed,
+            "a signed non-member task event must not change the projection"
+        );
+    }
+
+    let corpus = alice.all_events();
+    let mut reference = engine("reference");
+    reference.merge(corpus.clone()).expect("reference sync");
+    let expected = reference
+        .projection()
+        .dump_tables()
+        .expect("reference converged dump");
+    for seed in 1..12 {
+        let mut node = engine("offline");
+        for event in shuffle(&corpus, seed) {
+            node.merge(vec![event]).expect("offline task event");
+        }
+        assert_eq!(
+            node.projection().dump_tables().expect("task dump"),
+            expected,
+            "task projection diverged for shuffle seed {seed}"
+        );
+        let row = &node
+            .projection()
+            .channel_tasks(space)
+            .expect("offline task read model")
+            .tasks[0];
+        assert_eq!(row.title, "inspect the gateway after reboot");
+        assert!(!row.completed);
+    }
+}
+
+#[test]
+fn channel_task_read_rejects_an_unbounded_projection() {
+    let projection = Projection::open_in_memory().expect("projection");
+    let space = SpaceId::new();
+    for index in 0..=4096_u128 {
+        projection
+            .connection()
+            .execute(
+                "INSERT INTO tasks (space_id, task_event_id, title, created_by, created_ms, \
+                 source_event_id, checked, completed, completed_by, completed_ms, clock_wall, \
+                 clock_counter) VALUES (?1, ?2, 'task', 'alice', 1, NULL, 0, 0, NULL, NULL, ?3, 0)",
+                params![
+                    space.to_string(),
+                    Uuid::from_u128(100_000 + index).to_string(),
+                    i64::try_from(index).expect("test clock fits")
+                ],
+            )
+            .expect("insert bounded-read fixture");
+    }
+    let error = projection
+        .channel_tasks(space)
+        .expect_err("oversized task reads must fail closed");
+    assert!(matches!(error, CollabError::Serde(message) if message.contains("4096")));
 }
 
 #[test]

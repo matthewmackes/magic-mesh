@@ -172,6 +172,14 @@ impl CommunicationsSurface {
         task: &TaskView,
         now_unix_ms: i64,
     ) {
+        let title_id = ui.make_persistent_id(("collab-task-title", task.task));
+        let mut title = ui
+            .ctx()
+            .data_mut(|data| data.get_temp::<String>(title_id))
+            .unwrap_or_else(|| task.title.clone());
+        let mut title_was_capped = false;
+        let mut update = false;
+        let mut reopen = false;
         ui.group(|ui| {
             ui.horizontal_wrapped(|ui| {
                 let check_hint = if task.checked {
@@ -195,13 +203,32 @@ impl CommunicationsSurface {
                 {
                     self.set_task_checked(sink, task.space, task.task, !task.checked);
                 }
-                ui.label(egui::RichText::new(task.title.as_str()).strong().color(
-                    if task.completed {
-                        Style::TEXT_DIM
-                    } else {
-                        Style::TEXT
-                    },
-                ));
+                if task.completed {
+                    ui.label(
+                        egui::RichText::new(task.title.as_str())
+                            .strong()
+                            .color(Style::TEXT_DIM),
+                    );
+                } else {
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut title)
+                            .desired_width(220.0)
+                            .char_limit(MAX_TASK_TITLE_BYTES),
+                    );
+                    title_was_capped |= cap_task_title_input(&mut title);
+                    if response.changed() {
+                        ui.ctx().data_mut(|data| {
+                            data.insert_temp(title_id, title.clone());
+                        });
+                    }
+                    if ui
+                        .button("Update")
+                        .on_hover_text("Publish the updated task title")
+                        .clicked()
+                    {
+                        update = true;
+                    }
+                }
                 ui.label(
                     egui::RichText::new(format!(
                         "by {} · {}",
@@ -240,9 +267,32 @@ impl CommunicationsSurface {
                     {
                         self.complete_task(sink, task.space, task.task);
                     }
+                    if task.completed
+                        && icons::icon_button(
+                            ui,
+                            icons::THREAD_REOPEN,
+                            Style::SP_M,
+                            Style::ACCENT,
+                            "Reopen task",
+                        )
+                        .clicked()
+                    {
+                        reopen = true;
+                    }
                 });
             });
         });
+        if title_was_capped {
+            task_title_notice(ui);
+        }
+        if update {
+            self.update_task(sink, task.space, task.task, title.as_str());
+            ui.ctx()
+                .data_mut(|data| data.remove_temp::<String>(title_id));
+        }
+        if reopen {
+            self.reopen_task(sink, task.space, task.task);
+        }
     }
 
     /// Emit `CreateTask` from this channel's local draft.
@@ -279,6 +329,25 @@ impl CommunicationsSurface {
         });
     }
 
+    /// Emit a bounded title update for an open channel task.
+    pub(crate) fn update_task(
+        &self,
+        sink: &mut crate::CommandSink,
+        space: SpaceId,
+        task: EventId,
+        title: &str,
+    ) {
+        let title = title.trim();
+        if title.is_empty() || title.len() > MAX_TASK_TITLE_BYTES {
+            return;
+        }
+        sink.emit(CollabCommand::UpdateTask {
+            space,
+            task,
+            title: title.to_owned(),
+        });
+    }
+
     /// Emit the explicit task-completion command the caller routes to the worker.
     pub(crate) fn complete_task(
         &self,
@@ -287,6 +356,11 @@ impl CommunicationsSurface {
         task: EventId,
     ) {
         sink.emit(CollabCommand::CompleteTask { space, task });
+    }
+
+    /// Emit the explicit task-reopen command the caller routes to the worker.
+    pub(crate) fn reopen_task(&self, sink: &mut crate::CommandSink, space: SpaceId, task: EventId) {
+        sink.emit(CollabCommand::ReopenTask { space, task });
     }
 
     /// The main conversation column: the scrolling timeline over a reserved

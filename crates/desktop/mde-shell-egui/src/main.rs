@@ -1485,6 +1485,9 @@ impl Shell {
     fn apply_nav_bar_action(&mut self, action: nav_bar::Action, ctx: &egui::Context) {
         let action_label = nav_bar_action_label(&action);
         match action {
+            nav_bar::Action::OpenSearch => {
+                self.open_front_door_panel();
+            }
             nav_bar::Action::Back => {
                 if let Some(previous) = self.nav_history.pop() {
                     self.apply_nav_location(previous);
@@ -3604,6 +3607,7 @@ fn dnd_active() -> bool {
 
 fn nav_bar_action_label(action: &nav_bar::Action) -> &'static str {
     match action {
+        nav_bar::Action::OpenSearch => "open_search",
         nav_bar::Action::Back => "back",
         nav_bar::Action::Home => "home",
         nav_bar::Action::ToggleDock => "toggle_dock",

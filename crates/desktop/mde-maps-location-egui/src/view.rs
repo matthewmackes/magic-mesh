@@ -12,7 +12,8 @@ use crate::model::{
     LocationSource, LocationSourceKind, MapViewState, Mg90ManagementMethod, Mg90SettingCategory,
     Mg90SettingDescriptor, Mg90State, OfflineMapManagerState, OfflineNavigationReadiness,
     OfflineNavigationStatus, ProviderContract, RouteOption, RoutePlan, RouteTraffic,
-    SettingValueType, SetupStep, SourceStatus, TripRecorderState, VehicleState, WorkspaceTab,
+    SettingValueType, SetupStep, SourceStatus, TripRecorderState, VehicleRadioAvailability,
+    VehicleRadioHealth, VehicleRadioOperation, VehicleRadioPresence, VehicleState, WorkspaceTab,
 };
 use crate::MapsLocationSurface;
 
@@ -3753,7 +3754,7 @@ fn show_admin(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
     ui.add_space(Style::SP_S);
 
     match state.admin_section {
-        AdminSection::Vehicle => show_vehicle(ui, &state.vehicle),
+        AdminSection::Vehicle => show_vehicle(ui, &state.vehicle, &state.vehicle_radio_health),
         AdminSection::Connectivity => show_connectivity(ui, &state.mg90),
         AdminSection::DevicesIo => show_devices_io(ui, &mut state.devices),
         AdminSection::LocationSources => show_location_sources(ui, &mut state.locations),
@@ -3876,7 +3877,7 @@ fn admin_section_item_id(section: AdminSection) -> egui::Id {
     egui::Id::new(("maps-location-admin-section", section.label()))
 }
 
-fn show_vehicle(ui: &mut egui::Ui, vehicle: &VehicleState) {
+fn show_vehicle(ui: &mut egui::Ui, vehicle: &VehicleState, radio_health: &VehicleRadioHealth) {
     let telem = &vehicle.telemetry;
     // Every telemetry readout rides the live-mirror gate (Q33): a surface with
     // no telemetry source dashes — 0 rpm / 0.0 V / "OFF" are readings, and a
@@ -4021,6 +4022,144 @@ fn show_vehicle(ui: &mut egui::Ui, vehicle: &VehicleState) {
             }
         },
     );
+    ui.add_space(Style::SP_S);
+    radio_health_card(ui, radio_health);
+}
+
+fn radio_health_card(ui: &mut egui::Ui, health: &VehicleRadioHealth) {
+    let tone = match health.availability {
+        VehicleRadioAvailability::Available => Style::OK,
+        VehicleRadioAvailability::Degraded => Style::WARN,
+        VehicleRadioAvailability::Unavailable => Style::TEXT_DIM,
+    };
+    glyph_card(ui, "globe", "Typed radio health", tone, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            pill(ui, health.availability.label(), tone);
+            if let Some(version) = health.schema_version {
+                pill(ui, &format!("schema v{version}"), Style::ACCENT_MESH);
+            }
+            if let Some(reason) = health.availability_reason.as_deref() {
+                ui.label(
+                    RichText::new(reason)
+                        .size(Style::SMALL)
+                        .color(Style::TEXT_DIM),
+                );
+            }
+        });
+        ui.add_space(Style::SP_XS);
+        if health.availability == VehicleRadioAvailability::Unavailable && health.radios.is_empty()
+        {
+            mde_egui::widgets::muted_note(
+                ui,
+                "No valid typed radio inventory is available. No radio state is inferred from the legacy mirror.",
+            );
+        } else {
+            let width = ui.available_width().max(1.0);
+            for row in &health.radios {
+                let row_tone = match row.operation {
+                    VehicleRadioOperation::Active => Style::OK,
+                    VehicleRadioOperation::Standby | VehicleRadioOperation::Acquiring => {
+                        Style::ACCENT
+                    }
+                    VehicleRadioOperation::Degraded | VehicleRadioOperation::Stale => Style::WARN,
+                    VehicleRadioOperation::Fault => Style::DANGER,
+                    VehicleRadioOperation::Disabled | VehicleRadioOperation::Unknown => {
+                        Style::TEXT_DIM
+                    }
+                };
+                ui.horizontal(|ui| {
+                    ui.set_width(width);
+                    ui.label(
+                        RichText::new(&row.id)
+                            .size(Style::SMALL)
+                            .color(Style::TEXT_STRONG)
+                            .monospace(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        if row.active_path {
+                            pill(ui, "ACTIVE", Style::ACCENT);
+                        }
+                        pill(ui, row.presence.label(), presence_tone(row.presence));
+                        pill(ui, row.operation.label(), row_tone);
+                    });
+                });
+                readout(ui, "role", &row.role, Style::TEXT_DIM);
+                readout(
+                    ui,
+                    "reason",
+                    row.reason.as_deref().unwrap_or("not reported"),
+                    if row.reason.is_some() {
+                        Style::WARN
+                    } else {
+                        Style::TEXT_DIM
+                    },
+                );
+                readout(ui, "age", &row.age_label(), row_tone);
+            }
+        }
+        ui.add_space(Style::SP_XS);
+        divider(ui);
+        ui.add_space(Style::SP_XS);
+        readout(
+            ui,
+            "Radio freshness",
+            &format_freshness(&health.radios_freshness),
+            freshness_tone(health.radios_freshness.state),
+        );
+        readout(
+            ui,
+            "GNSS freshness",
+            &format_freshness(&health.gnss_freshness),
+            freshness_tone(health.gnss_freshness.state),
+        );
+        readout(
+            ui,
+            "Snapshot age",
+            &health
+                .snapshot_age_ms
+                .map_or_else(|| "age unknown".to_string(), format_age_ms),
+            if health.snapshot_age_ms.is_some() {
+                Style::TEXT_DIM
+            } else {
+                Style::WARN
+            },
+        );
+    });
+}
+
+fn presence_tone(presence: VehicleRadioPresence) -> Color32 {
+    match presence {
+        VehicleRadioPresence::Installed => Style::OK,
+        VehicleRadioPresence::NotInstalled => Style::TEXT_DIM,
+        VehicleRadioPresence::Unknown => Style::WARN,
+    }
+}
+
+fn freshness_tone(state: crate::model::VehicleFreshnessState) -> Color32 {
+    match state {
+        crate::model::VehicleFreshnessState::Fresh => Style::OK,
+        crate::model::VehicleFreshnessState::Stale => Style::WARN,
+        crate::model::VehicleFreshnessState::Unknown => Style::TEXT_DIM,
+    }
+}
+
+fn format_freshness(freshness: &crate::model::VehicleFreshness) -> String {
+    match freshness.reason.as_deref() {
+        Some(reason) => format!(
+            "{} · {} · {reason}",
+            freshness.state.label(),
+            freshness.age_label()
+        ),
+        None => format!("{} · {}", freshness.state.label(), freshness.age_label()),
+    }
+}
+
+fn format_age_ms(age_ms: u64) -> String {
+    if age_ms < 1_000 {
+        format!("{age_ms} ms")
+    } else {
+        format!("{:.1} s", age_ms as f32 / 1_000.0)
+    }
 }
 
 fn show_connectivity(ui: &mut egui::Ui, mg90: &Mg90State) {
@@ -6697,7 +6836,7 @@ mod tests {
     }
 
     /// Every string painted by the Vehicle tab body without workspace scrolling.
-    fn vehicle_texts(vehicle: &VehicleState) -> Vec<String> {
+    fn vehicle_texts(vehicle: &VehicleState, radio_health: &VehicleRadioHealth) -> Vec<String> {
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let input = egui::RawInput {
@@ -6708,7 +6847,7 @@ mod tests {
             ..Default::default()
         };
         let out = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| show_vehicle(ui, vehicle));
+            egui::CentralPanel::default().show(ctx, |ui| show_vehicle(ui, vehicle, radio_health));
         });
         let mut texts = Vec::new();
         for clipped in &out.shapes {
@@ -6724,7 +6863,7 @@ mod tests {
         // The fixture profile remains explicitly identified, but none of its
         // numeric CAN/OBD seed values may look like live instruments.
         let simulated = MapsLocationSurface::simulated();
-        let simulated_texts = vehicle_texts(&simulated.vehicle);
+        let simulated_texts = vehicle_texts(&simulated.vehicle, &simulated.vehicle_radio_health);
         assert!(simulated_texts
             .iter()
             .any(|text| text == "simulated CAN/OBD profile"));
@@ -6758,7 +6897,7 @@ mod tests {
         mirror.published_at_ms = test_now_ms();
         let mut live = MapsLocationSurface::live();
         live.refresh_from_vehicle(&mirror);
-        let fresh_texts = vehicle_texts(&live.vehicle);
+        let fresh_texts = vehicle_texts(&live.vehicle, &live.vehicle_radio_health);
         for reading in ["62", "2100", "91", "13.9", "64%", "78214 mi", "42 min"] {
             assert!(
                 fresh_texts.iter().any(|text| text == reading),
@@ -6770,7 +6909,7 @@ mod tests {
         // disappear, but confidence + a warning-age remain diagnostic evidence.
         mirror.published_at_ms = test_now_ms() - 6_000;
         live.refresh_from_vehicle(&mirror);
-        let stale_texts = vehicle_texts(&live.vehicle);
+        let stale_texts = vehicle_texts(&live.vehicle, &live.vehicle_radio_health);
         assert!(stale_texts
             .iter()
             .any(|text| text.starts_with("live vehicle-gateway mirror")));
@@ -6783,6 +6922,47 @@ mod tests {
                 "stale reading {stale:?} must be dashed: {stale_texts:?}"
             );
         }
+    }
+
+    #[test]
+    fn vehicle_view_renders_typed_presence_operation_reason_and_freshness() {
+        use mackes_mesh_types::vehicle::{
+            VehicleState as WireVehicleState, VehicleStateV2, VehicleTelem,
+        };
+
+        let mut legacy = WireVehicleState::offline("rig-1");
+        legacy.online = true;
+        legacy.model = "MG90".to_string();
+        legacy.esn = "ESN-TEST".to_string();
+        legacy.mgos_version = "4.3.0.1".to_string();
+        legacy.wan.active_wan = "Cellular A".to_string();
+        legacy.wan.cellular_a.sim_state = "ready".to_string();
+        legacy.telem = VehicleTelem::default();
+        legacy.published_at_ms = test_now_ms();
+        let snapshot = VehicleStateV2::from_v1(
+            &legacy,
+            "rig-1",
+            3,
+            5_000,
+            legacy.published_at_ms,
+            mackes_mesh_types::vehicle::SnapshotProvenance::default(),
+        );
+
+        let mut surface = MapsLocationSurface::live();
+        surface.refresh_from_vehicle_v2(&snapshot);
+        let texts = vehicle_texts(&surface.vehicle, &surface.vehicle_radio_health);
+        assert!(texts.iter().any(|text| text == "Installed"));
+        assert!(texts.iter().any(|text| text == "Unknown"));
+        assert!(texts.iter().any(|text| text == "Active"));
+        assert!(texts.iter().any(|text| text == "GNSS freshness"));
+        assert!(texts.iter().any(|text| text == "degraded"));
+
+        let empty = MapsLocationSurface::live();
+        let unavailable = vehicle_texts(&empty.vehicle, &empty.vehicle_radio_health);
+        assert!(unavailable.iter().any(|text| text == "unavailable"));
+        assert!(unavailable
+            .iter()
+            .any(|text| text.contains("No valid typed radio inventory")));
     }
 
     #[test]

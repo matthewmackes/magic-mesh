@@ -35,6 +35,9 @@ pub enum CollabError {
     /// The referenced channel task is already complete.
     #[error("task {0} is already complete")]
     TaskAlreadyCompleted(EventId),
+    /// The referenced channel task is already open.
+    #[error("task {0} is already open")]
+    TaskAlreadyOpen(EventId),
     /// The referenced document does not exist.
     #[error("document {0} does not exist")]
     DocumentNotFound(DocumentId),
