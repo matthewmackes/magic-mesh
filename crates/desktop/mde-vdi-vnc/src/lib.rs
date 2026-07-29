@@ -98,7 +98,10 @@ pub use link::{
     QualityMode, QualityTier, TierApplication, TierChange,
 };
 pub use pixel::{Framebuffer, FramebufferError, PixelFormat};
-pub use session::{VncClipboardStatus, VncSession};
+pub use session::{
+    vnc_clipboard_status, VncClipboardCapability, VncClipboardChannel, VncClipboardStatus,
+    VncSession,
+};
 pub use tier::{VncTierSettings, PREFERRED_ENCODINGS};
 pub use wire::{
     decode_server_cut_text_body, RfbClientMessage, RfbControlMessage, RfbCutText, RfbCutTextError,

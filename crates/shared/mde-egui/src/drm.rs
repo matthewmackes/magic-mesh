@@ -667,8 +667,17 @@ fn drm_modifiers(alt: bool, ctrl: bool, shift: bool) -> egui::Modifiers {
 }
 
 fn drm_clipboard_text_for_paste(text: &str) -> Option<String> {
-    let text = text.replace("\r\n", "\n");
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
     (!text.is_empty()).then_some(text)
+}
+
+fn refresh_drm_clipboard_text(clipboard: &mut dyn crate::TextClipboard, cached_text: &mut String) {
+    // A failed/empty provider read is authoritative: retaining the previous
+    // value would paste stale mesh or guest text after the clipboard was cleared.
+    *cached_text = clipboard
+        .read_text()
+        .and_then(|text| drm_clipboard_text_for_paste(&text))
+        .unwrap_or_default();
 }
 
 fn push_drm_clipboard_shortcut(
@@ -1746,9 +1755,7 @@ pub fn run_drm_with_clipboard(
                     let modifiers = drm_modifiers(alt, ctrl, shift);
                     if let Some(key) = drm_key(code) {
                         if pressed && modifiers.command && key == egui::Key::V {
-                            if let Some(text) = clipboard.read_text() {
-                                clipboard_text = text;
-                            }
+                            refresh_drm_clipboard_text(clipboard, &mut clipboard_text);
                         }
                         if pressed
                             && push_drm_clipboard_shortcut(
@@ -2450,7 +2457,7 @@ mod tests {
     use super::{
         clear_rgba, drm_clipboard_output_text, drm_clipboard_text_for_paste, drm_modifiers,
         explicit_modifier, open_primary_node, probe_prime_import_liveness,
-        push_drm_clipboard_shortcut, DrmError, ReimportedGemBuffer,
+        push_drm_clipboard_shortcut, refresh_drm_clipboard_text, DrmError, ReimportedGemBuffer,
     };
     use drm::buffer::{Handle as GemHandle, PlanarBuffer};
 
@@ -2551,10 +2558,24 @@ mod tests {
     #[test]
     fn drm_clipboard_paste_normalizes_crlf_and_skips_empty_text() {
         assert_eq!(
-            drm_clipboard_text_for_paste("one\r\ntwo"),
-            Some("one\ntwo".to_owned())
+            drm_clipboard_text_for_paste("one\r\ntwo\rthree"),
+            Some("one\ntwo\nthree".to_owned())
         );
         assert!(drm_clipboard_text_for_paste("").is_none());
+    }
+
+    #[test]
+    fn drm_clipboard_provider_clear_drops_the_cached_paste_value() {
+        let mut provider = crate::MemoryTextClipboard::new();
+        let mut cached = String::new();
+
+        provider.write_text("remote text");
+        refresh_drm_clipboard_text(&mut provider, &mut cached);
+        assert_eq!(cached, "remote text");
+
+        provider.write_text("");
+        refresh_drm_clipboard_text(&mut provider, &mut cached);
+        assert!(cached.is_empty());
     }
 
     #[test]
