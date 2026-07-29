@@ -236,6 +236,11 @@ discover_candidates() {
     crates/services/mde-adblock crates/services/mde-bookmarks \
     crates/desktop/mde-bookmarks-egui packaging install-helpers \
     > "$content_paths" || :
+  # This verifier necessarily contains the Browser vocabulary it scans for;
+  # it is extraction governance, not a Browser-stack source candidate.
+  grep -v -F -- 'install-helpers/verify-browser-extraction.sh' "$content_paths" \
+    > "$content_paths.filtered" || :
+  mv -- "$content_paths.filtered" "$content_paths"
   cat "$content_paths" >> "$discovered"
 
   while IFS= read -r path; do
