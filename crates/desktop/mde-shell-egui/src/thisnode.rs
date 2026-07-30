@@ -134,6 +134,10 @@ const SERVICE_CATALOG: [(&str, &str); 9] = [
     ("workbench", "Workbench"),
 ];
 
+/// Keep list-valued connectivity facts small even when a faulty or newer
+/// snapshot carries more entries than this surface can render usefully.
+const MAX_CONNECTIVITY_FACTS: usize = 8;
+
 // ──────────────────────────── projected view ────────────────────────────
 
 /// This node's live status, folded from the mesh-status snapshot. Pure data
@@ -178,6 +182,9 @@ struct NodeStatus {
     leader: Option<String>,
     /// The Nebula tunnel cipher label, when nebula is up.
     cipher: Option<String>,
+    /// Read-only interface, route, lighthouse, and resolver facts published by
+    /// the network section of mesh-status.
+    connectivity: ConnectivityFacts,
 }
 
 /// Read a non-empty string field off a JSON object, or `None`.
@@ -205,6 +212,142 @@ fn parse_services(services: Option<&Value>) -> Vec<(&'static str, bool)> {
                 .map(|up| (*label, up))
         })
         .collect()
+}
+
+/// The read-only connectivity facts this node can prove from mesh-status.
+/// Empty fields stay empty so the renderer can say exactly which observation
+/// is unavailable instead of filling a gap with local guesses.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ConnectivityFacts {
+    interface: Option<String>,
+    cidr: Option<String>,
+    default_route: Option<String>,
+    lighthouses: Vec<String>,
+    dns_servers: Vec<String>,
+}
+
+impl ConnectivityFacts {
+    fn from_network(network: Option<&Value>) -> Self {
+        let interface = first_network_string(network, &["overlay_if", "interface", "ifname"])
+            .or_else(|| first_interface_entry_string(network, &["name", "interface", "ifname"]));
+        let cidr = first_network_string(network, &["overlay_cidr", "cidr"])
+            .or_else(|| first_interface_entry_string(network, &["cidr", "ip_cidr"]));
+        let default_route =
+            first_network_string(network, &["default_gw", "default_route", "default_gateway"]);
+
+        Self {
+            interface,
+            cidr,
+            default_route,
+            lighthouses: network_fact_list(network, &["lighthouse_ips", "lighthouses"]),
+            dns_servers: network_fact_list(
+                network,
+                &["dns_servers", "nameservers", "resolvers", "dns"],
+            ),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.interface.is_none()
+            && self.cidr.is_none()
+            && self.default_route.is_none()
+            && self.lighthouses.is_empty()
+            && self.dns_servers.is_empty()
+    }
+}
+
+/// A connectivity card's state is separate from the broader capability list:
+/// a readable snapshot can still have no published node-local network facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectivityAvailability {
+    Available(&'static str),
+    Degraded(&'static str),
+    Unavailable(&'static str),
+}
+
+impl ConnectivityAvailability {
+    const fn tone(self) -> Color32 {
+        match self {
+            Self::Available(_) => Style::OK,
+            Self::Degraded(_) => Style::WARN,
+            Self::Unavailable(_) => Style::TEXT_DIM,
+        }
+    }
+
+    const fn word(self) -> &'static str {
+        match self {
+            Self::Available(_) => "available",
+            Self::Degraded(_) => "degraded",
+            Self::Unavailable(_) => "unavailable",
+        }
+    }
+
+    const fn detail(self) -> &'static str {
+        match self {
+            Self::Available(detail) | Self::Degraded(detail) | Self::Unavailable(detail) => detail,
+        }
+    }
+}
+
+fn first_network_string(network: Option<&Value>, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| network.and_then(|value| nonempty(value, key)))
+}
+
+fn first_interface_entry_string(network: Option<&Value>, keys: &[&str]) -> Option<String> {
+    network
+        .and_then(|value| value.get("interfaces"))
+        .and_then(Value::as_array)
+        .and_then(|interfaces| {
+            interfaces
+                .iter()
+                .find_map(|interface| keys.iter().find_map(|key| nonempty(interface, key)))
+        })
+}
+
+fn bounded_strings(value: &Value) -> Vec<String> {
+    match value {
+        Value::Array(values) => values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .take(MAX_CONNECTIVITY_FACTS)
+            .map(str::to_string)
+            .collect(),
+        Value::String(value) => value
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .take(MAX_CONNECTIVITY_FACTS)
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn network_fact_list(network: Option<&Value>, keys: &[&str]) -> Vec<String> {
+    for key in keys {
+        let Some(value) = network.and_then(|network| network.get(*key)) else {
+            continue;
+        };
+        let direct = bounded_strings(value);
+        if !direct.is_empty() {
+            return direct;
+        }
+        if let Some(object) = value.as_object() {
+            for nested_key in ["servers", "nameservers", "resolvers", "ips"] {
+                let nested = object
+                    .get(nested_key)
+                    .map(bounded_strings)
+                    .unwrap_or_default();
+                if !nested.is_empty() {
+                    return nested;
+                }
+            }
+        }
+    }
+    Vec::new()
 }
 
 impl NodeStatus {
@@ -256,8 +399,35 @@ impl NodeStatus {
             peers_total: v.get("total").and_then(Value::as_u64).unwrap_or(0),
             leader: network.and_then(|n| nonempty(n, "leader")),
             cipher: network.and_then(|n| nonempty(n, "cipher")),
+            connectivity: ConnectivityFacts::from_network(network),
             hostname,
         }
+    }
+
+    fn connectivity_availability(&self) -> ConnectivityAvailability {
+        if !self.seen {
+            return ConnectivityAvailability::Unavailable(
+                "Connectivity facts are unavailable until the mesh-status snapshot is read.",
+            );
+        }
+        if self.connectivity.is_empty() {
+            return ConnectivityAvailability::Unavailable(
+                "No interface, route, lighthouse, or DNS facts are published by mesh-status.",
+            );
+        }
+        if self.connectivity.interface.is_none()
+            || self.connectivity.cidr.is_none()
+            || self.connectivity.default_route.is_none()
+            || (self.connectivity.lighthouses.is_empty()
+                && self.connectivity.dns_servers.is_empty())
+        {
+            return ConnectivityAvailability::Degraded(
+                "Only partial connectivity facts are published; missing values are not inferred.",
+            );
+        }
+        ConnectivityAvailability::Available(
+            "Interface, CIDR, default route, and mesh reachability or DNS facts are published.",
+        )
     }
 
     /// `true` when this node holds the mesh leader lease.
@@ -663,6 +833,14 @@ fn show_status(ui: &mut egui::Ui, status: &NodeStatus) {
             ui.add_space(Style::SP_S);
 
             ui.label(
+                RichText::new("Connectivity")
+                    .color(Style::TEXT_DIM)
+                    .size(Style::SMALL),
+            );
+            ui.group(|ui| show_connectivity(ui, status));
+            ui.add_space(Style::SP_S);
+
+            ui.label(
                 RichText::new("Node services")
                     .color(Style::TEXT_DIM)
                     .size(Style::SMALL),
@@ -723,6 +901,51 @@ fn show_capability_surface(ui: &mut egui::Ui, status: &NodeStatus) {
              typed provider or authorization lane for local mutation.",
         );
     });
+}
+
+/// Render only the network facts explicitly published by mesh-status. This is
+/// deliberately a read-only projection; missing interface, route, lighthouse,
+/// or DNS values remain visible as unavailable instead of becoming guesses.
+fn show_connectivity(ui: &mut egui::Ui, status: &NodeStatus) {
+    let availability = status.connectivity_availability();
+    ui.horizontal_wrapped(|ui| {
+        ui.label(
+            RichText::new(DOT)
+                .color(availability.tone())
+                .size(Style::SMALL),
+        );
+        ui.add_space(Style::SP_XS);
+        ui.colored_label(
+            availability.tone(),
+            RichText::new(availability.word()).size(Style::SMALL),
+        );
+        ui.add_space(Style::SP_S);
+        ui.colored_label(
+            Style::TEXT_DIM,
+            RichText::new(availability.detail()).size(Style::SMALL),
+        );
+    });
+
+    let facts = &status.connectivity;
+    connectivity_field(ui, "Interface", facts.interface.as_deref());
+    connectivity_field(ui, "CIDR", facts.cidr.as_deref());
+    connectivity_field(ui, "Default route", facts.default_route.as_deref());
+    let lighthouses = (!facts.lighthouses.is_empty()).then(|| facts.lighthouses.join(", "));
+    connectivity_field(ui, "Lighthouses", lighthouses.as_deref());
+    let dns_servers = (!facts.dns_servers.is_empty()).then(|| facts.dns_servers.join(", "));
+    connectivity_field(ui, "DNS", dns_servers.as_deref());
+    mde_egui::muted_note(
+        ui,
+        "Connectivity is read-only here; no NetworkManager, ModemManager, DNS, or route mutation is enabled.",
+    );
+}
+
+fn connectivity_field(ui: &mut egui::Ui, label: &str, value: Option<&str>) {
+    let Some(value) = value else {
+        mde_egui::field(ui, label, "not published", Style::TEXT_DIM);
+        return;
+    };
+    mde_egui::field(ui, label, value, Style::TEXT);
 }
 
 fn show_capability_row(ui: &mut egui::Ui, projection: CapabilityProjection) {
@@ -968,6 +1191,14 @@ mod tests {
         )
     }
 
+    fn connectivity_snapshot(network: &str) -> String {
+        format!(
+            r#"{{"generated_ms":1000000,"self":"this-node",
+              "nodes":[{{"hostname":"this-node","presence":"online"}}],
+              "network":{network}}}"#
+        )
+    }
+
     /// Drive one headless 960×640 frame of `show_status` and tessellate it on the
     /// CPU — the same `Context::run` → `tessellate` path the DRM runner drives minus
     /// the GPU. Returns whether it produced any draw primitives.
@@ -1043,6 +1274,49 @@ mod tests {
             renders(&s),
             "the live ThisNode panel produced no draw primitives"
         );
+    }
+
+    #[test]
+    fn connectivity_fixture_projects_and_renders_published_facts() {
+        let s = NodeStatus::project(
+            &connectivity_snapshot(
+                r#"{"overlay_if":"nebula1","overlay_cidr":"10.42.0.7/16",
+                   "default_gw":"192.168.1.1","lighthouse_ips":["10.42.0.1"],
+                   "dns_servers":["10.42.0.1","1.1.1.1"]}"#,
+            ),
+            "fallback",
+        );
+
+        assert_eq!(s.connectivity.interface.as_deref(), Some("nebula1"));
+        assert_eq!(s.connectivity.cidr.as_deref(), Some("10.42.0.7/16"));
+        assert_eq!(s.connectivity.default_route.as_deref(), Some("192.168.1.1"));
+        assert_eq!(s.connectivity.lighthouses, vec!["10.42.0.1"]);
+        assert_eq!(s.connectivity.dns_servers, vec!["10.42.0.1", "1.1.1.1"]);
+        assert!(matches!(
+            s.connectivity_availability(),
+            ConnectivityAvailability::Available(_)
+        ));
+        assert!(renders(&s), "published connectivity facts must render");
+    }
+
+    #[test]
+    fn connectivity_absence_and_partial_facts_render_honest_states() {
+        let absent = NodeStatus::project(&connectivity_snapshot(r#"{}"#), "fallback");
+        assert!(matches!(
+            absent.connectivity_availability(),
+            ConnectivityAvailability::Unavailable(_)
+        ));
+        assert!(renders(&absent), "absent connectivity state must render");
+
+        let partial = NodeStatus::project(
+            &connectivity_snapshot(r#"{"overlay_if":"nebula1","overlay_cidr":"10.42.0.7/16"}"#),
+            "fallback",
+        );
+        assert!(matches!(
+            partial.connectivity_availability(),
+            ConnectivityAvailability::Degraded(_)
+        ));
+        assert!(renders(&partial), "partial connectivity state must render");
     }
 
     #[test]
