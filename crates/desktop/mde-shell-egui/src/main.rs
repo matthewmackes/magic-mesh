@@ -862,6 +862,13 @@ fn remote_sessions_fallback_pos(screen: egui::Rect) -> egui::Pos2 {
     )
 }
 
+const THIS_NODE_SEARCH_MAX_WIDTH: f32 = Style::SP_XL * 7.5;
+
+fn this_node_search_is_compact(available_width: f32, zoom_factor: f32) -> bool {
+    let zoom = zoom_factor.max(1.0);
+    available_width < THIS_NODE_SEARCH_MAX_WIDTH + Style::SP_XL * 6.0 * zoom
+}
+
 /// The whole shell: the nav state, the live chrome/Fleet Bus state, and the three
 /// embedded mesh-control surfaces it owns and drives per frame (E12-3b EMBED).
 struct Shell {
@@ -1828,17 +1835,7 @@ impl Shell {
         let mut section = self.this_node_section;
         ui.push_id("shell-this-node", |ui| {
             let _ = mde_egui::nav_chrome::NavigationBar::new("This Node").show(ui);
-            ui.horizontal(|ui| {
-                ui.label("Find a section");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.this_node_search)
-                        .hint_text("Search hardware, sound, mesh…")
-                        .desired_width(240.0),
-                );
-                if !self.this_node_search.is_empty() && ui.button("Clear").clicked() {
-                    self.this_node_search.clear();
-                }
-            });
+            Self::show_this_node_search(ui, &mut self.this_node_search);
             ui.horizontal_wrapped(|ui| {
                 for candidate in this_node_catalog::search(&self.this_node_search) {
                     if ui
@@ -1911,6 +1908,41 @@ impl Shell {
         });
         self.this_node_tab = tab;
         self.this_node_section = section;
+    }
+
+    /// The search row is a durable navigation affordance, so it must remain
+    /// reachable when the This Node pane is narrow or the accessibility zoom is
+    /// large. At those sizes the label, editor, and Clear action stack instead of
+    /// competing for one fixed-width line.
+    fn show_this_node_search(ui: &mut egui::Ui, query: &mut String) {
+        if this_node_search_is_compact(ui.available_width(), ui.ctx().zoom_factor()) {
+            ui.vertical(|ui| {
+                ui.label("Find a section");
+                ui.horizontal_wrapped(|ui| {
+                    let width = ui.available_width().min(THIS_NODE_SEARCH_MAX_WIDTH);
+                    ui.add(
+                        egui::TextEdit::singleline(query)
+                            .hint_text("Search hardware, sound, mesh…")
+                            .desired_width(width),
+                    );
+                    if !query.is_empty() && ui.button("Clear").clicked() {
+                        query.clear();
+                    }
+                });
+            });
+        } else {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Find a section");
+                ui.add(
+                    egui::TextEdit::singleline(query)
+                        .hint_text("Search hardware, sound, mesh…")
+                        .desired_width(THIS_NODE_SEARCH_MAX_WIDTH),
+                );
+                if !query.is_empty() && ui.button("Clear").clicked() {
+                    query.clear();
+                }
+            });
+        }
     }
 
     /// Render the live topology view inside Fleet & Mesh.
@@ -3741,10 +3773,10 @@ mod tests {
         paint_car_status_tile, publish_front_door_instance_lifecycle_to_bus,
         publish_front_door_peer_app_launch_to_bus, publish_front_door_service_lifecycle_to_bus,
         real_media, real_terminal, remote_sessions_fallback_pos, route_file_operation_request,
-        screenshot, splash, status, surface_needs_remote_sessions_fallback, terminal_panel, vdi,
-        Boot, MenuBarMinimizeEffect, Nav, Plane, Shell, Surface, ThisNodeTab, VideoTextureCache,
-        LAYOUT_MODE_BUTTON_CONSTRUCT, LAYOUT_MODE_BUTTON_TOUCH, LAYOUT_MODE_HOLD,
-        LAYOUT_MODE_HUD_CLEARANCE, MENU_BAR_MINIMIZE_DURATION,
+        screenshot, splash, status, surface_needs_remote_sessions_fallback, terminal_panel,
+        this_node_search_is_compact, vdi, Boot, MenuBarMinimizeEffect, Nav, Plane, Shell, Surface,
+        ThisNodeTab, VideoTextureCache, LAYOUT_MODE_BUTTON_CONSTRUCT, LAYOUT_MODE_BUTTON_TOUCH,
+        LAYOUT_MODE_HOLD, LAYOUT_MODE_HUD_CLEARANCE, MENU_BAR_MINIMIZE_DURATION,
     };
     use mde_bus::hooks::config::Priority;
     use mde_bus::persist::Persist;
@@ -3871,6 +3903,17 @@ mod tests {
         );
         assert_eq!(n.surface, Surface::Desktop);
         assert_eq!(n.plane, Plane::ThisNode);
+    }
+
+    #[test]
+    fn this_node_search_stacks_before_narrow_or_large_text_can_overlap() {
+        assert!(!this_node_search_is_compact(960.0, 1.0));
+        assert!(this_node_search_is_compact(320.0, 1.0));
+        assert!(
+            this_node_search_is_compact(500.0, 1.5),
+            "large text needs the stacked search row even on a medium pane"
+        );
+        assert!(!this_node_search_is_compact(960.0, 1.5));
     }
 
     fn accesskit_nodes(

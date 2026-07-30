@@ -907,6 +907,13 @@ fn show_capability_surface(ui: &mut egui::Ui, status: &NodeStatus) {
 /// deliberately a read-only projection; missing interface, route, lighthouse,
 /// or DNS values remain visible as unavailable instead of becoming guesses.
 fn show_connectivity(ui: &mut egui::Ui, status: &NodeStatus) {
+    // egui's zoom scales painted geometry after layout. Reduce the logical child
+    // width by that same factor so a narrow large-text card wraps against the
+    // painted viewport rather than laying out one line that later overflows it.
+    let zoom = ui.ctx().zoom_factor().max(1.0);
+    if zoom > 1.0 {
+        ui.set_max_width(ui.available_width() / zoom);
+    }
     let availability = status.connectivity_availability();
     ui.horizontal_wrapped(|ui| {
         ui.label(
@@ -919,12 +926,16 @@ fn show_connectivity(ui: &mut egui::Ui, status: &NodeStatus) {
             availability.tone(),
             RichText::new(availability.word()).size(Style::SMALL),
         );
-        ui.add_space(Style::SP_S);
-        ui.colored_label(
-            Style::TEXT_DIM,
-            RichText::new(availability.detail()).size(Style::SMALL),
-        );
     });
+    ui.add_space(Style::SP_XS);
+    ui.add(
+        egui::Label::new(
+            RichText::new(availability.detail())
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+        )
+        .wrap(),
+    );
 
     let facts = &status.connectivity;
     connectivity_field(ui, "Interface", facts.interface.as_deref());
@@ -934,18 +945,34 @@ fn show_connectivity(ui: &mut egui::Ui, status: &NodeStatus) {
     connectivity_field(ui, "Lighthouses", lighthouses.as_deref());
     let dns_servers = (!facts.dns_servers.is_empty()).then(|| facts.dns_servers.join(", "));
     connectivity_field(ui, "DNS", dns_servers.as_deref());
-    mde_egui::muted_note(
-        ui,
-        "Connectivity is read-only here; no NetworkManager, ModemManager, DNS, or route mutation is enabled.",
+    ui.add(
+        egui::Label::new(
+            RichText::new("Read-only: no connectivity mutation provider is connected.")
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+        )
+        .wrap(),
     );
 }
 
 fn connectivity_field(ui: &mut egui::Ui, label: &str, value: Option<&str>) {
-    let Some(value) = value else {
-        mde_egui::field(ui, label, "not published", Style::TEXT_DIM);
-        return;
-    };
-    mde_egui::field(ui, label, value, Style::TEXT);
+    let (value, tone) = value.map_or(("not published", Style::TEXT_DIM), |value| {
+        (value, Style::TEXT)
+    });
+    // Connectivity values are provider output, not fixed copy: DNS and
+    // lighthouse lists can be long, while the unavailable state is deliberately
+    // verbose. Keep the label/value relationship accessible, but let the value
+    // wrap inside the card instead of allowing the shared single-line `field`
+    // primitive to paint past a narrow or large-text pane.
+    ui.horizontal_wrapped(|ui| {
+        ui.label(
+            RichText::new(label)
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+        );
+        ui.add_space(Style::SP_S);
+        ui.add(egui::Label::new(RichText::new(value).color(tone).size(Style::SMALL)).wrap());
+    });
 }
 
 fn show_capability_row(ui: &mut egui::Ui, projection: CapabilityProjection) {
@@ -1203,16 +1230,59 @@ mod tests {
     /// CPU — the same `Context::run` → `tessellate` path the DRM runner drives minus
     /// the GPU. Returns whether it produced any draw primitives.
     fn renders(status: &NodeStatus) -> bool {
+        renders_at(status, 960.0, 1.0)
+    }
+
+    fn renders_at(status: &NodeStatus, width: f32, zoom: f32) -> bool {
         let ctx = egui::Context::default();
         Style::install(&ctx);
+        ctx.set_zoom_factor(zoom);
         let input = egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(960.0, 640.0))),
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(width, 640.0))),
             ..Default::default()
         };
         let out = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| show_status(ui, status));
         });
         !ctx.tessellate(out.shapes, out.pixels_per_point).is_empty()
+    }
+
+    fn connectivity_text_bounds(
+        status: &NodeStatus,
+        width: f32,
+        zoom: f32,
+    ) -> Vec<(String, egui::Rect)> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    out.push((text.galley.text().to_owned(), text.visual_bounding_rect()));
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        ctx.set_zoom_factor(zoom);
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(width, 640.0))),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| show_connectivity(ui, status));
+            },
+        );
+        let mut bounds = Vec::new();
+        for clipped in &out.shapes {
+            walk(&clipped.shape, &mut bounds);
+        }
+        bounds
     }
 
     #[test]
@@ -1317,6 +1387,45 @@ mod tests {
             ConnectivityAvailability::Degraded(_)
         ));
         assert!(renders(&partial), "partial connectivity state must render");
+    }
+
+    #[test]
+    fn connectivity_fields_reflow_inside_a_narrow_large_text_card() {
+        let s = NodeStatus::project(
+            &connectivity_snapshot(
+                r#"{"overlay_if":"nebula1","overlay_cidr":"10.42.0.7/16",
+                   "default_gw":"192.168.1.1",
+                   "lighthouse_ips":["10.42.0.1","10.42.0.2","10.42.0.3","10.42.0.4"],
+                   "dns_servers":["10.42.0.1","1.1.1.1","9.9.9.9"]}"#,
+            ),
+            "fallback",
+        );
+        let bounds = connectivity_text_bounds(&s, 240.0, 1.5);
+        assert!(!bounds.is_empty(), "the connectivity card must paint text");
+        for (text, rect) in bounds {
+            assert!(
+                rect.left() >= -0.5 && rect.right() <= 240.0 * 1.5 + 0.5,
+                "{text:?} escaped the narrow card: {rect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn status_card_keeps_unavailable_provider_states_visible_at_small_sizes() {
+        let unseen = NodeStatus::default();
+        for (width, zoom) in [(240.0, 1.0), (320.0, 1.5)] {
+            assert!(
+                renders_at(&unseen, width, zoom),
+                "the unavailable status must remain painted at {width}x{zoom}"
+            );
+        }
+        assert!(
+            matches!(
+                unseen.connectivity_availability(),
+                ConnectivityAvailability::Unavailable(_)
+            ),
+            "missing hardware/provider facts remain explicitly unavailable"
+        );
     }
 
     #[test]
