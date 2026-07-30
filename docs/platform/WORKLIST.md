@@ -368,8 +368,8 @@ remains here under a completed status.
   and projected UI affordances now have focused farm coverage. Completed
   task/action-item update, complete, reopen, membership, bounded-read, and
   projected UI slices now also have focused farm coverage. Severity-aware
-  Activity coalescing, truthful repeat counts, and visible pause/resume now
-  have nine focused tests passing. Completed evidence is in the pre-rework archive;
+  Activity coalescing, truthful repeat counts, visible pause/resume, keyboard
+  posting, and AccessKit send labels now have focused farm coverage. Completed evidence is in the pre-rework archive;
   the parity source is `docs/platform/WL-FUNC-011-parity-ledger.md`.
 - Remaining work:
 
