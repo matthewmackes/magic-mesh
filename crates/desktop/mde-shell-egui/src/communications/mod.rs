@@ -33,15 +33,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION;
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
-use mde_egui::egui;
+use mde_egui::{egui, TextClipboard};
 use serde::de::DeserializeOwned;
 
 use mde_collab_egui::{CollabData, CommandSink, CommunicationsSurface};
 use mde_collab_types::topics::{self, projection as proj};
 use mde_collab_types::{
-    ActivityFeed, ActorId, AlertInbox, CallState, ClipboardLane, CollabCommand,
-    ConversationTimeline, DocumentSessions, EventId, FileReferences, SpaceDirectory, SpaceId,
-    ThreadId, ThreadTimeline, TransferJobs,
+    clipboard_clip_id, ActivityFeed, ActorId, AlertInbox, CallState, ClipboardClipBody,
+    ClipboardLane, CollabCommand, ConversationTimeline, DocumentSessions, EventId, FileReferences,
+    SpaceDirectory, SpaceId, ThreadId, ThreadTimeline, TransferJobs, MAX_CLIPBOARD_TEXT_BYTES,
 };
 
 use crate::bus_reader::BusReader;
@@ -60,6 +60,12 @@ const MAX_ACTIVITY_FEED_ENTRIES: usize = 1024;
 /// replicated `state/collab/*` namespace: read position is a UI preference for
 /// this seat, not a collaboration event or a remote read receipt.
 const LOCAL_READ_CURSORS_TOPIC: &str = "local/collab/read-cursors";
+
+/// The canonical direct-seat capture/materialization lane. Its body is the
+/// existing `{ id, text, source, time }` event contract; do not put an action
+/// capability in this body because the event consumers require this exact
+/// shape. Mutating action lanes below remain capability-gated.
+const CLIPBOARD_CAPTURE_TOPIC: &str = "event/clipboard/clip";
 
 /// The canonical mesh clipboard responder namespace. Communications still emits
 /// typed `action/collab/*` commands for its signed projection, but row
@@ -83,6 +89,222 @@ fn now_unix_ms() -> i64 {
 fn read_state<T: DeserializeOwned>(persist: &Persist, topic: &str) -> Option<T> {
     let msg = persist.read_latest(topic).ok().flatten()?;
     serde_json::from_str(&msg.body?).ok()
+}
+
+/// Normalize line endings and bound one native clipboard value at a UTF-8
+/// character boundary. This mirrors the DRM provider's contract at the shell
+/// boundary without making the shell depend on private mde-egui helpers.
+fn normalize_clipboard_text(text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+
+    let mut bounded = String::with_capacity(text.len().min(MAX_CLIPBOARD_TEXT_BYTES));
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        let normalized = if ch == '\r' {
+            if chars.peek() == Some(&'\n') {
+                let _ = chars.next();
+            }
+            '\n'
+        } else {
+            ch
+        };
+        if bounded.len() + normalized.len_utf8() > MAX_CLIPBOARD_TEXT_BYTES {
+            break;
+        }
+        bounded.push(normalized);
+    }
+    bounded
+}
+
+/// Read and validate the newest canonical event, retaining its Bus ULID so a
+/// local clear can suppress exactly that event without suppressing a later
+/// event carrying the same text.
+fn read_latest_clipboard_event(
+    persist: &Persist,
+) -> Result<Option<(String, ClipboardClipBody)>, String> {
+    let Some(message) = persist
+        .read_latest(CLIPBOARD_CAPTURE_TOPIC)
+        .map_err(|error| format!("clipboard Bus read failed: {error}"))?
+    else {
+        return Ok(None);
+    };
+    let Some(body) = message.body.as_deref() else {
+        return Err("clipboard event has no body".to_string());
+    };
+    let clip: ClipboardClipBody = serde_json::from_str(body)
+        .map_err(|error| format!("malformed clipboard event body: {error}"))?;
+    clip.validate()
+        .map_err(|error| format!("clipboard event validation failed: {error:?}"))?;
+    chrono::DateTime::parse_from_rfc3339(&clip.time)
+        .map_err(|error| format!("clipboard event time is not RFC3339: {error}"))?;
+    Ok(Some((message.ulid, clip)))
+}
+
+/// The shell-owned text provider for the direct DRM runner.
+///
+/// A local `CopyText` output enters this provider through [`TextClipboard`], is
+/// bounded and content-addressed, and is published to the canonical Bus event
+/// lane. A later paste reads the newest validated event, so mesh-originated
+/// text materializes into the same provider without `wl-copy`/`wl-paste`.
+///
+/// The provider keeps a small local pending cache only while the Bus is absent
+/// or a write is failing; it never fabricates a successful mesh publication.
+/// Row mutations remain on the existing authorized `action/clipboard/*` path.
+#[derive(Debug, Clone)]
+pub(crate) struct BusTextClipboard {
+    bus_root: Option<PathBuf>,
+    source: String,
+    cached_text: Option<String>,
+    local_write_pending: bool,
+    suppressed_bus_ulid: Option<String>,
+    last_error: Option<String>,
+}
+
+impl BusTextClipboard {
+    /// Construct a provider with an explicit source identity (useful for
+    /// deterministic tests and for a caller that already owns seat identity).
+    pub(crate) fn new(bus_root: Option<PathBuf>, source: impl Into<String>) -> Self {
+        Self {
+            bus_root,
+            source: source.into(),
+            cached_text: None,
+            local_write_pending: false,
+            suppressed_bus_ulid: None,
+            last_error: None,
+        }
+    }
+
+    /// Construct the production seat provider using the shell's canonical local
+    /// hostname identity.
+    pub(crate) fn for_shell(bus_root: Option<PathBuf>) -> Self {
+        Self::new(
+            bus_root,
+            format!("seat:{}", crate::explorer::local_hostname()),
+        )
+    }
+
+    /// The most recent provider-side error, if the mesh or event body was
+    /// unavailable. The DRM trait is intentionally infallible, so callers use
+    /// this for an honest diagnostic surface after a failed frame write/read.
+    pub(crate) fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
+    }
+
+    /// Read and materialize the newest valid Bus event.
+    fn read_text_checked(&mut self) -> Result<Option<String>, String> {
+        let Some(root) = self.bus_root.as_deref() else {
+            return Ok(self
+                .local_write_pending
+                .then(|| self.cached_text.clone())
+                .flatten());
+        };
+        let persist = Persist::open(root.to_path_buf())
+            .map_err(|error| format!("could not open clipboard Bus: {error}"))?;
+        let Some((ulid, clip)) = read_latest_clipboard_event(&persist)? else {
+            return Ok(self
+                .local_write_pending
+                .then(|| self.cached_text.clone())
+                .flatten());
+        };
+
+        if self.suppressed_bus_ulid.as_deref() == Some(ulid.as_str()) {
+            return Ok(None);
+        }
+
+        self.suppressed_bus_ulid = None;
+        self.cached_text = Some(clip.text.clone());
+        self.local_write_pending = false;
+        Ok(Some(clip.text))
+    }
+
+    /// Publish one local copy, returning whether a new Bus event was written.
+    /// The latest event is checked first so the provider itself participates in
+    /// the existing content dedup/echo guard; the worker remains the mesh-wide
+    /// move-to-top/debounce authority.
+    fn write_text_checked(&mut self, text: &str) -> Result<bool, String> {
+        let text = normalize_clipboard_text(text);
+        if text.is_empty() {
+            let latest = self
+                .bus_root
+                .as_deref()
+                .and_then(|root| Persist::open(root.to_path_buf()).ok())
+                .and_then(|persist| read_latest_clipboard_event(&persist).ok().flatten());
+            self.suppressed_bus_ulid = latest.map(|(ulid, _)| ulid);
+            self.cached_text = None;
+            self.local_write_pending = false;
+            self.last_error = None;
+            return Ok(false);
+        }
+
+        let clip = ClipboardClipBody::from_text(
+            text.clone(),
+            self.source.clone(),
+            chrono::Utc::now().to_rfc3339(),
+        );
+        clip.validate()
+            .map_err(|error| format!("clipboard copy refused: {error:?}"))?;
+        let expected_id = clipboard_clip_id(&text);
+
+        self.cached_text = Some(text);
+        self.local_write_pending = true;
+
+        let Some(root) = self.bus_root.as_deref() else {
+            return Err("No local Bus — the mesh daemon may be down.".to_string());
+        };
+        let persist = Persist::open(root.to_path_buf())
+            .map_err(|error| format!("could not open clipboard Bus: {error}"))?;
+        if let Some((_ulid, latest)) = read_latest_clipboard_event(&persist)? {
+            if latest.id == expected_id && latest.text == clip.text {
+                // This is a content-deduplicated copy, not a clear. Keep the
+                // current event materializable for the subsequent Paste.
+                self.suppressed_bus_ulid = None;
+                self.local_write_pending = false;
+                return Ok(false);
+            }
+        }
+
+        // This event lane's exact four-field body is the existing producer
+        // contract. It is not an action request and must not be wrapped with an
+        // `armed_token`; the existing authorized action lanes remain separate.
+        let body = serde_json::to_string(&clip)
+            .map_err(|error| format!("serialize clipboard event: {error}"))?;
+        persist
+            .write(
+                CLIPBOARD_CAPTURE_TOPIC,
+                Priority::Default,
+                None,
+                Some(&body),
+            )
+            .map_err(|error| format!("clipboard Bus write failed: {error}"))?;
+        self.suppressed_bus_ulid = None;
+        self.local_write_pending = false;
+        self.last_error = None;
+        Ok(true)
+    }
+}
+
+impl TextClipboard for BusTextClipboard {
+    fn read_text(&mut self) -> Option<String> {
+        match self.read_text_checked() {
+            Ok(text) => {
+                self.last_error = None;
+                text
+            }
+            Err(error) => {
+                self.last_error = Some(error);
+                None
+            }
+        }
+    }
+
+    fn write_text(&mut self, text: &str) {
+        match self.write_text_checked(text) {
+            Ok(_) => self.last_error = None,
+            Err(error) => self.last_error = Some(error),
+        }
+    }
 }
 
 /// Keep only the newest Activity rows from a retained Bus mirror. Activity feeds
@@ -437,6 +659,11 @@ pub(crate) struct CommunicationsState {
     surface: CommunicationsSurface,
     /// The Bus-backed projection source the widget renders.
     data: LiveCollabData,
+    /// The shell-owned native text clipboard seam. The direct DRM runner can
+    /// borrow this provider; while its runner wiring remains outside this
+    /// slice's permitted files, Communications still keeps remote Bus
+    /// materialization live whenever the hub is open.
+    clipboard: BusTextClipboard,
     /// The resolved spool path commands are published through (kept alongside the
     /// reader's copy because publishing needs the open/write error text; the
     /// fail-soft `BusReader` swallows it).
@@ -457,6 +684,7 @@ impl CommunicationsState {
         Self {
             surface: CommunicationsSurface::new(),
             data: LiveCollabData::new(bus_root.clone()),
+            clipboard: BusTextClipboard::for_shell(bus_root.clone()),
             bus_root,
         }
     }
@@ -464,7 +692,19 @@ impl CommunicationsState {
     /// Re-fold the `state/collab/*` mirrors on the poll cadence (the shell calls
     /// this while Communications is the surface in view).
     pub(crate) fn poll(&mut self, ctx: &egui::Context) {
+        // Materialize the newest canonical event into the shell-owned provider
+        // while Communications is live. This is deliberately read-only with
+        // respect to the Bus; local publication occurs only on a DRM CopyText
+        // write through `drm_clipboard`.
+        let _ = self.clipboard.read_text();
         self.data.poll(ctx, self.surface.selected_space());
+    }
+
+    /// Borrow the production text provider for the direct DRM runner. The
+    /// caller owns the runner lifetime; no compositor clipboard tools are
+    /// involved.
+    pub(crate) fn drm_clipboard(&mut self) -> &mut dyn TextClipboard {
+        &mut self.clipboard
     }
 
     /// Render the surface and route the frame's emitted commands. The widget reads
@@ -1243,5 +1483,130 @@ mod tests {
             action_body["armed_token"].as_str().is_some(),
             "canonical clear carries the responder capability"
         );
+    }
+
+    #[test]
+    fn bus_clipboard_copy_publishes_exact_event_and_remote_paste_materializes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let persist = persist_at(dir.path());
+        let mut local = BusTextClipboard::new(Some(dir.path().to_path_buf()), "seat:dell");
+
+        local.write_text("one\r\ntwo");
+        assert!(local.last_error().is_none(), "local copy should publish");
+
+        let message = persist
+            .read_latest(CLIPBOARD_CAPTURE_TOPIC)
+            .expect("read canonical clipboard event")
+            .expect("clipboard event published");
+        let body_text = message.body.as_deref().expect("event body");
+        let body: serde_json::Value = serde_json::from_str(body_text).expect("event json");
+        let keys = body
+            .as_object()
+            .expect("event object")
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            ["id", "source", "text", "time"]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "the shell must preserve the existing event wire contract"
+        );
+        assert_eq!(body["text"], "one\ntwo");
+        assert_eq!(body["id"], mde_collab_types::clipboard_clip_id("one\ntwo"));
+        assert_eq!(body["source"], "seat:dell");
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(body["time"].as_str().unwrap()).is_ok(),
+            "the event timestamp is RFC3339"
+        );
+
+        let mut remote_seat = BusTextClipboard::new(Some(dir.path().to_path_buf()), "seat:other");
+        assert_eq!(
+            remote_seat.read_text().as_deref(),
+            Some("one\ntwo"),
+            "a valid mesh event materializes into the native provider"
+        );
+    }
+
+    #[test]
+    fn bus_clipboard_deduplicates_copies_and_clear_suppresses_only_current_event() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let persist = persist_at(dir.path());
+        let mut clipboard = BusTextClipboard::new(Some(dir.path().to_path_buf()), "seat:dell");
+
+        clipboard.write_text("same text");
+        let first = persist
+            .read_latest(CLIPBOARD_CAPTURE_TOPIC)
+            .expect("read first event")
+            .expect("first event");
+        clipboard.write_text("same text");
+        let all = persist
+            .list_since(CLIPBOARD_CAPTURE_TOPIC, None)
+            .expect("list events");
+        assert_eq!(all.len(), 1, "same content does not echo onto the Bus");
+        assert_eq!(clipboard.read_text().as_deref(), Some("same text"));
+
+        clipboard.write_text("");
+        assert!(
+            clipboard.read_text().is_none(),
+            "an explicit local clear must not paste the stale Bus event"
+        );
+        assert_eq!(
+            persist
+                .read_latest(CLIPBOARD_CAPTURE_TOPIC)
+                .expect("read after clear")
+                .expect("event retained")
+                .ulid,
+            first.ulid,
+            "clear is local provider state, not a malformed canonical event"
+        );
+
+        let next =
+            ClipboardClipBody::from_text("new remote text", "seat:other", "2026-07-30T12:00:00Z");
+        persist
+            .write(
+                CLIPBOARD_CAPTURE_TOPIC,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&next).expect("encode next clip")),
+            )
+            .expect("write remote event");
+        assert_eq!(
+            clipboard.read_text().as_deref(),
+            Some("new remote text"),
+            "a later Bus event clears the suppression guard"
+        );
+    }
+
+    #[test]
+    fn bus_clipboard_bounds_utf8_without_splitting_and_rejects_bad_remote_events() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let persist = persist_at(dir.path());
+        let prefix = "a".repeat(MAX_CLIPBOARD_TEXT_BYTES - 1);
+        let mut clipboard = BusTextClipboard::new(Some(dir.path().to_path_buf()), "seat:dell");
+
+        clipboard.write_text(&format!("{prefix}é"));
+        let materialized = clipboard.read_text().expect("bounded local text");
+        assert_eq!(materialized.len(), MAX_CLIPBOARD_TEXT_BYTES - 1);
+        assert!(materialized.is_char_boundary(materialized.len()));
+
+        let mut bad = ClipboardClipBody::from_text("remote", "seat:other", "2026-07-30T12:00:00Z");
+        bad.id = "wrong".to_string();
+        persist
+            .write(
+                CLIPBOARD_CAPTURE_TOPIC,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&bad).expect("encode bad event")),
+            )
+            .expect("write bad event");
+
+        let mut fresh = BusTextClipboard::new(Some(dir.path().to_path_buf()), "seat:fresh");
+        assert!(
+            fresh.read_text().is_none(),
+            "malformed remote text is not materialized"
+        );
+        assert!(fresh.last_error().is_some());
     }
 }

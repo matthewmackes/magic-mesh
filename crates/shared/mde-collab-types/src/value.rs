@@ -208,6 +208,109 @@ pub struct ClipboardItem {
     pub source: String,
 }
 
+/// Maximum UTF-8 byte length accepted by the native text clipboard lane.
+///
+/// This is the existing guest/seat transport bound. It is measured in encoded
+/// bytes, so callers must bound at a character boundary before publishing or
+/// materializing a value.
+pub const MAX_CLIPBOARD_TEXT_BYTES: usize = 1024 * 1024;
+
+/// The canonical body on `event/clipboard/clip`.
+///
+/// Keep this shape exactly compatible with the mesh clipboard worker and its
+/// existing producers. Durable history adds pin state separately; an event
+/// producer may publish only these four fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipboardClipBody {
+    /// The short, content-derived identifier used for deduplication.
+    pub id: String,
+    /// The full UTF-8 text value.
+    pub text: String,
+    /// The producer's source identity (for example `seat:dell`).
+    pub source: String,
+    /// RFC3339 capture timestamp.
+    pub time: String,
+}
+
+impl ClipboardClipBody {
+    /// Build the canonical body without changing the supplied text. Callers
+    /// that own a platform boundary should normalize and bound before calling
+    /// this constructor; preserving the bytes here keeps the wire contract
+    /// compatible with existing producers.
+    #[must_use]
+    pub fn from_text(
+        text: impl Into<String>,
+        source: impl Into<String>,
+        time: impl Into<String>,
+    ) -> Self {
+        let text = text.into();
+        Self {
+            id: clipboard_clip_id(&text),
+            text,
+            source: source.into(),
+            time: time.into(),
+        }
+    }
+
+    /// Validate the fields that are common to every text-lane consumer.
+    /// Timestamp syntax is checked by the protocol boundary that already owns
+    /// the chrono dependency; this leaf contract only requires it to be
+    /// present and non-blank.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable reason when the body cannot be admitted to the native
+    /// clipboard lane.
+    pub fn validate(&self) -> Result<(), ClipboardClipValidationError> {
+        if self.text.trim().is_empty() {
+            return Err(ClipboardClipValidationError::BlankText);
+        }
+        if self.text.len() > MAX_CLIPBOARD_TEXT_BYTES {
+            return Err(ClipboardClipValidationError::TextTooLarge {
+                bytes: self.text.len(),
+            });
+        }
+        if self.source.trim().is_empty() {
+            return Err(ClipboardClipValidationError::MissingSource);
+        }
+        if self.time.trim().is_empty() {
+            return Err(ClipboardClipValidationError::MissingTime);
+        }
+        let expected = clipboard_clip_id(&self.text);
+        if self.id != expected {
+            return Err(ClipboardClipValidationError::IdMismatch { expected });
+        }
+        Ok(())
+    }
+}
+
+/// Why a canonical clipboard event was refused before materialization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClipboardClipValidationError {
+    /// Empty/whitespace-only text is not a clipboard event.
+    BlankText,
+    /// The text exceeds the native lane's byte bound.
+    TextTooLarge {
+        /// Actual UTF-8 byte length.
+        bytes: usize,
+    },
+    /// The producer did not identify its source.
+    MissingSource,
+    /// The producer did not provide a timestamp.
+    MissingTime,
+    /// The id is not the content fingerprint of `text`.
+    IdMismatch {
+        /// The expected short lower-hex fingerprint.
+        expected: String,
+    },
+}
+
+/// The canonical 16-character lower-hex content id for a clipboard value.
+#[must_use]
+pub fn clipboard_clip_id(text: &str) -> String {
+    sha256_hex(text.as_bytes()).chars().take(16).collect()
+}
+
 /// A file reference linked into a space (the File-offer / `FileRefId` successor).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FileRef {
@@ -388,6 +491,45 @@ mod tests {
         assert_eq!(r.len, 3);
         assert_eq!(r.sha256_hex, sha256_hex(b"abc"));
         assert_eq!(r.content_type.as_deref(), Some("text/plain"));
+    }
+
+    #[test]
+    fn canonical_clip_body_keeps_the_existing_four_field_wire_shape() {
+        let body = ClipboardClipBody::from_text("hello mesh", "seat:dell", "2026-07-30T12:00:00Z");
+        let encoded = serde_json::to_value(&body).expect("encode clip body");
+        let object = encoded.as_object().expect("clip body object");
+        assert_eq!(
+            object
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["id", "source", "text", "time"]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        assert_eq!(body.id, clipboard_clip_id("hello mesh"));
+        assert!(body.validate().is_ok());
+    }
+
+    #[test]
+    fn canonical_clip_body_rejects_mismatched_id_and_overlarge_utf8() {
+        let mut body = ClipboardClipBody::from_text("hello", "seat:dell", "2026-07-30T12:00:00Z");
+        body.id = "not-the-content-id".to_string();
+        assert!(matches!(
+            body.validate(),
+            Err(ClipboardClipValidationError::IdMismatch { .. })
+        ));
+
+        let oversized = ClipboardClipBody::from_text(
+            "x".repeat(MAX_CLIPBOARD_TEXT_BYTES + 1),
+            "seat:dell",
+            "2026-07-30T12:00:00Z",
+        );
+        assert!(matches!(
+            oversized.validate(),
+            Err(ClipboardClipValidationError::TextTooLarge { bytes })
+                if bytes == MAX_CLIPBOARD_TEXT_BYTES + 1
+        ));
     }
 
     #[test]

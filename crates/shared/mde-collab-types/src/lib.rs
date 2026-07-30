@@ -76,8 +76,9 @@ pub use read_model::{
 };
 pub use space::{SpaceKind, SpaceRole};
 pub use value::{
-    sha256_hex, AiSuggestion, AiSuggestionKind, AlertAction, AlertActionKind, AlertPayload,
-    CallKind, CallParticipantState, ClipItemKind, ClipboardItem, DeliveryState, DocumentChange,
-    FileRef, MessageBody, PayloadRef, PresenceState, ReviewVerdict, Severity, TransferDirection,
-    TransferMethod, TransferState,
+    clipboard_clip_id, sha256_hex, AiSuggestion, AiSuggestionKind, AlertAction, AlertActionKind,
+    AlertPayload, CallKind, CallParticipantState, ClipItemKind, ClipboardClipBody,
+    ClipboardClipValidationError, ClipboardItem, DeliveryState, DocumentChange, FileRef,
+    MessageBody, PayloadRef, PresenceState, ReviewVerdict, Severity, TransferDirection,
+    TransferMethod, TransferState, MAX_CLIPBOARD_TEXT_BYTES,
 };
