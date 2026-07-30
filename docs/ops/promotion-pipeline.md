@@ -75,6 +75,21 @@ audit/soak green after that candidate, and an operator-authored
 through `automation/promotion/live-fd-soak.sh`. The former media-lighthouse
 verification and playlist mutation stages are retired.
 
+2026-07-30 Dell GUI Alpha proof evidence: BigBoy slot
+`alpha-dell-12-1-6` built Fedora 44 packages from release commit
+`5ee166c3` with base `magic-mesh-12.1.6-1.x86_64.rpm` (82.3 MiB,
+sha256 `c2af231716d3973dcd5dfb81eadd8647b10c431d0f046cdc0f0742a27b646ba4`),
+browser `magic-mesh-browser-12.1.6-1.x86_64.rpm` (39.0 MiB, sha256
+`a29f21ef77e9ec222dd727a98e8677560f8a2206d9e1ae40007b0950ecc20475`), and
+lighthouse `magic-mesh-lighthouse-12.1.6-1.x86_64.rpm` (11.3 MiB, sha256
+`4e1e3b6be87768f409df0b69088b8d3b8005985e90e484f584dfbc1811cc8124`).
+All three passed the Fedora 44 payload-size guard. On Dell-LAPTOP
+(`172.20.146.225`), the base/browser pair passed `rpm -Uvh --test`, installed
+over 12.1.5, passed `rpm -V`, reported 12.1.6 through `mackesd`,
+`mde-shell-egui`, and `mesh-help`, and left `mde-shell-egui.service` active
+after restart. This is a Dell proofing Alpha, not a production promotion:
+the candidate was unsigned and no live fleet promotion was attempted.
+
 2026-07-07 production-candidate evidence: latest rebuilt
 `magic-mesh-12.0.0-1.x86_64` (`/root/mcnf-release-artifacts`, 112291230
 bytes, built 13:19 EDT, sha256

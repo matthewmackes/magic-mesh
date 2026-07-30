@@ -999,6 +999,7 @@ remains here under a completed status.
   `springboard.rs` still owns grid/selection/tile presentation; first-boot
   selection and Fleet & Mesh/Workloads exposure remain open
   (`Surface::FleetMesh` exists; Workloads retains internal `Surface::InfraCode`).
+  Dell Alpha proof: Fedora 44 12.1.6-1 base/browser RPMs installed on Dell-LAPTOP; `rpm -V`, CLI/help, and active shell restart passed (full hashes in promotion evidence).
 - Remaining work:
 
   1. Reconcile taskbar-specific authority after WL-UX-009 retires the global
