@@ -2993,7 +2993,10 @@ fn call_provider_devices_are_visible_disabled_and_honest() {
     for expected in [
         "Devices",
         "System default",
-        "Showing the system default — live device enumeration and binding a device to the call's media sender arrive with the media plane.",
+        "Provider devices unavailable: no live media provider has published device inventory to this Calls surface yet, so these selectors remain disabled.",
+        "Microphone",
+        "Camera",
+        "Screen",
     ] {
         assert!(
             texts.iter().any(|(text, _)| text == expected),
@@ -3006,6 +3009,38 @@ fn call_provider_devices_are_visible_disabled_and_honest() {
             "provider devices must not fabricate enumerated hardware: {texts:?}"
         );
     }
+}
+
+#[test]
+fn calls_empty_state_explains_peer_gated_actions_without_faking_a_provider() {
+    let space = SpaceId::new();
+    let data = FixtureData::new("eagle", 1_000).with_space(space_summary(
+        space,
+        SpaceKind::Team,
+        "Solo Ops",
+        SpaceRole::Owner,
+        0,
+        1,
+        1_000,
+    ));
+    let mut surface = CommunicationsSurface::new();
+    surface.select_space(space);
+    surface.set_mode(Mode::Calls);
+    let texts = painted_text(&render_shapes(&mut surface, &data));
+
+    for expected in [
+        "Call actions unavailable: no other current members",
+        "Provider devices unavailable: no live media provider has published device inventory to this Calls surface yet, so these selectors remain disabled.",
+    ] {
+        assert!(
+            texts.iter().any(|(text, _)| text == expected),
+            "Calls empty state must explain the disabled presentation {expected:?}: {texts:?}"
+        );
+    }
+    assert!(
+        data.call_state().active.is_empty(),
+        "the unavailable state must not fabricate an active call"
+    );
 }
 
 #[test]

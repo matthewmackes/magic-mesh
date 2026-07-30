@@ -282,7 +282,7 @@ impl CommunicationsSurface {
         let hint = if can_start {
             None
         } else {
-            Some("Unavailable: no other members are currently in this space")
+            Some("Unavailable: this space has no other current members")
         };
         let tint = if can_start {
             None
@@ -294,43 +294,61 @@ impl CommunicationsSurface {
         // tint. This makes the no-peer state non-activatable for pointer and
         // keyboard input, rather than relying on a colour-only affordance.
         ui.add_enabled_ui(can_start, |ui| {
-            if icons::icon_button(
+            let screen = icons::icon_button(
                 ui,
                 icons::CALL_SCREEN,
                 Style::SP_M,
                 tint.unwrap_or(Style::TEXT_DIM),
-                hint.unwrap_or("Start a screen share"),
-            )
-            .clicked()
-            {
+                call_start_hint(CallKind::Screen, can_start),
+            );
+            screen.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::Button,
+                    ui.is_enabled(),
+                    call_start_hint(CallKind::Screen, can_start),
+                )
+            });
+            if screen.clicked() {
                 self.start_call(sink, space, CallKind::Screen);
             }
-            if icons::icon_button(
+            let video = icons::icon_button(
                 ui,
                 icons::CALL_VIDEO,
                 Style::SP_M,
                 tint.unwrap_or(Style::ACCENT),
-                hint.unwrap_or("Start a video call"),
-            )
-            .clicked()
-            {
+                call_start_hint(CallKind::Video, can_start),
+            );
+            video.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::Button,
+                    ui.is_enabled(),
+                    call_start_hint(CallKind::Video, can_start),
+                )
+            });
+            if video.clicked() {
                 self.start_call(sink, space, CallKind::Video);
             }
-            if icons::icon_button(
+            let audio = icons::icon_button(
                 ui,
                 icons::CALL_AUDIO,
                 Style::SP_M,
                 tint.unwrap_or(Style::OK),
-                hint.unwrap_or("Start an audio call"),
-            )
-            .clicked()
-            {
+                call_start_hint(CallKind::Audio, can_start),
+            );
+            audio.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::Button,
+                    ui.is_enabled(),
+                    call_start_hint(CallKind::Audio, can_start),
+                )
+            });
+            if audio.clicked() {
                 self.start_call(sink, space, CallKind::Audio);
             }
         });
         if let Some(hint) = hint {
             ui.label(
-                egui::RichText::new("No peers")
+                egui::RichText::new("Call actions unavailable: no other current members")
                     .small()
                     .color(Style::TEXT_DIM),
             )
@@ -350,29 +368,14 @@ impl CommunicationsSurface {
                     .color(Style::TEXT_DIM),
             );
             ui.add_space(Style::SP_S);
-            device_combo(
-                ui,
-                "Microphone",
-                icons::CALL_AUDIO,
-                &mut self.call_media.mic,
-            );
-            device_combo(
-                ui,
-                "Camera",
-                icons::CALL_CAMERA,
-                &mut self.call_media.camera,
-            );
-            device_combo(
-                ui,
-                "Screen",
-                icons::CALL_SHARE_SCREEN,
-                &mut self.call_media.screen,
-            );
+            device_combo(ui, CallDevice::Microphone, &mut self.call_media.mic);
+            device_combo(ui, CallDevice::Camera, &mut self.call_media.camera);
+            device_combo(ui, CallDevice::Screen, &mut self.call_media.screen);
         });
         ui.label(
             egui::RichText::new(
-                "Showing the system default — live device enumeration and binding a device to \
-                 the call's media sender arrive with the media plane.",
+                "Provider devices unavailable: no live media provider has published device \
+                 inventory to this Calls surface yet, so these selectors remain disabled.",
             )
             .small()
             .color(Style::TEXT_DIM),
@@ -593,24 +596,114 @@ impl CommunicationsSurface {
     }
 }
 
+/// The media device selectors remain visible while the provider/device read-model
+/// contract is absent. Keeping the selector present makes the missing capability
+/// actionable to an operator without inventing hardware or a live media route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallDevice {
+    Microphone,
+    Camera,
+    Screen,
+}
+
+impl CallDevice {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Microphone => "Microphone",
+            Self::Camera => "Camera",
+            Self::Screen => "Screen",
+        }
+    }
+
+    const fn glyph(self) -> &'static str {
+        match self {
+            Self::Microphone => icons::CALL_AUDIO,
+            Self::Camera => icons::CALL_CAMERA,
+            Self::Screen => icons::CALL_SHARE_SCREEN,
+        }
+    }
+
+    const fn unavailable_reason(self) -> &'static str {
+        match self {
+            Self::Microphone => {
+                "Unavailable: no live media provider has published microphone devices to this Calls surface yet"
+            }
+            Self::Camera => {
+                "Unavailable: no live media provider has published camera devices to this Calls surface yet"
+            }
+            Self::Screen => {
+                "Unavailable: no live media provider has published screen-capture sources to this Calls surface yet"
+            }
+        }
+    }
+
+    fn accessible_label(self) -> String {
+        format!(
+            "{} device selector, disabled. {}",
+            self.label(),
+            self.unavailable_reason()
+        )
+    }
+}
+
 /// A labeled media device combo — the glyph, then a disabled egui combo showing
 /// the honest system default. The real device list comes from the media plane;
-/// until that provider enumerates, this is visible but non-actionable.
-fn device_combo(ui: &mut egui::Ui, label: &str, glyph: &str, value: &mut String) {
-    icons::icon(ui, glyph, Style::SP_M, Style::TEXT_DIM).comms_hover_text(label);
-    ui.add_enabled_ui(false, |ui| {
-        egui::ComboBox::from_id_salt(("mde-collab-call-device", label))
-            .selected_text(bounded_display_text(value, MAX_CALL_LABEL_CHARS))
-            .show_ui(ui, |ui| {
-                // WL-FUNC-011 media: only the honest system default is shown today;
-                // the real enumerated device list comes from WebRTC getUserMedia /
-                // the LiveKit device registry, never a faked list.
-                ui.label(DEFAULT_DEVICE);
-            });
-    })
-    .response
-    .comms_hover_text("Provider device enumeration is not connected yet");
+/// until that provider enumerates, this is visible but non-actionable and has a
+/// device-specific disabled reason for hover and assistive technology.
+fn device_combo(ui: &mut egui::Ui, device: CallDevice, value: &mut String) {
+    icons::icon(ui, device.glyph(), Style::SP_M, Style::TEXT_DIM).comms_hover_text(device.label());
+    let accessible_label = device.accessible_label();
+    let response = ui
+        .add_enabled_ui(false, |ui| {
+            egui::ComboBox::new(("mde-collab-call-device", device.label()), device.label())
+                .selected_text(bounded_display_text(value, MAX_CALL_LABEL_CHARS))
+                .show_ui(ui, |ui| {
+                    // WL-FUNC-011 media: only the honest system default is shown today;
+                    // the real enumerated device list comes from WebRTC getUserMedia /
+                    // the LiveKit device registry, never a faked list.
+                    ui.label(DEFAULT_DEVICE);
+                })
+        })
+        .inner
+        .response;
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, false, accessible_label.as_str())
+    });
+    response.comms_hover_text(accessible_label);
     ui.add_space(Style::SP_S);
+}
+
+/// The accessible/hover name for each peer-gated start action. The typed command
+/// seam remains unchanged; this is only presentation metadata for the no-peer
+/// state.
+const fn call_start_hint(kind: CallKind, can_start: bool) -> &'static str {
+    if can_start {
+        match kind {
+            CallKind::Audio => "Start an audio call",
+            CallKind::Video => "Start a video call",
+            CallKind::Screen => "Start a screen share",
+            CallKind::CoEdit => "Start a co-edit session",
+            CallKind::RemoteDesktop => "Start a remote desktop session",
+        }
+    } else {
+        match kind {
+            CallKind::Audio => {
+                "Start an audio call — unavailable: this space has no other current members"
+            }
+            CallKind::Video => {
+                "Start a video call — unavailable: this space has no other current members"
+            }
+            CallKind::Screen => {
+                "Start a screen share — unavailable: this space has no other current members"
+            }
+            CallKind::CoEdit => {
+                "Start a co-edit session — unavailable: this space has no other current members"
+            }
+            CallKind::RemoteDesktop => {
+                "Start a remote desktop session — unavailable: this space has no other current members"
+            }
+        }
+    }
 }
 
 /// Whether the selected directory row has at least one other member to receive
@@ -753,9 +846,9 @@ const fn participant_view(
 
 #[cfg(test)]
 mod tests {
-    use super::{bounded_display_text, call_start_enabled};
+    use super::{bounded_display_text, call_start_enabled, call_start_hint, CallDevice};
     use mde_collab_types::{
-        ActorClock, SpaceDirectory, SpaceId, SpaceKind, SpaceRole, SpaceSummary,
+        ActorClock, CallKind, SpaceDirectory, SpaceId, SpaceKind, SpaceRole, SpaceSummary,
     };
 
     #[test]
@@ -806,5 +899,47 @@ mod tests {
             !call_start_enabled(&directory, SpaceId::new()),
             "a stale or unknown space id must never become a call target"
         );
+    }
+
+    #[test]
+    fn unavailable_devices_have_specific_reasons_and_accessible_labels() {
+        let devices = [
+            CallDevice::Microphone,
+            CallDevice::Camera,
+            CallDevice::Screen,
+        ];
+        let reasons: Vec<_> = devices
+            .iter()
+            .map(|device| device.unavailable_reason())
+            .collect();
+
+        assert_eq!(reasons.len(), 3);
+        assert!(reasons.iter().all(|reason| {
+            reason.starts_with("Unavailable: no live media provider has published")
+        }));
+        assert!(reasons.iter().all(|reason| reason.ends_with("yet")));
+        assert_ne!(reasons[0], reasons[1]);
+        assert_ne!(reasons[1], reasons[2]);
+        for device in devices {
+            let label = device.accessible_label();
+            assert!(label.starts_with(device.label()));
+            assert!(label.contains("device selector, disabled."));
+            assert!(label.contains(device.unavailable_reason()));
+        }
+    }
+
+    #[test]
+    fn peer_gated_call_actions_keep_the_action_name_in_the_disabled_label() {
+        for (kind, action) in [
+            (CallKind::Audio, "audio call"),
+            (CallKind::Video, "video call"),
+            (CallKind::Screen, "screen share"),
+        ] {
+            let hint = call_start_hint(kind, false);
+            assert!(hint.starts_with("Start "));
+            assert!(hint.contains(action));
+            assert!(hint.contains("unavailable: this space has no other current members"));
+            assert!(!call_start_hint(kind, true).contains("unavailable"));
+        }
     }
 }
