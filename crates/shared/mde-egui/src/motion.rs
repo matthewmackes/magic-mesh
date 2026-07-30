@@ -84,6 +84,10 @@ pub enum MotionPreset {
     Layout,
     /// Release/snap/cancel settling after direct manipulation.
     DragSettle,
+    /// Playful but bounded chrome choreography, such as the taskbar/tray
+    /// moving between its bottom and side placements. Reduced motion keeps a
+    /// short ease; disabled motion still lands at the endpoint immediately.
+    Whimsy,
 }
 
 /// Easing curve used by a [`MotionSpec`].
@@ -174,6 +178,13 @@ impl MotionSpec {
                 preset,
                 0.24,
                 0.0,
+                MotionEasing::SmoothStep,
+                Some(Spring::SNAPPY),
+            ),
+            MotionPreset::Whimsy => Self::new(
+                preset,
+                0.28,
+                0.05,
                 MotionEasing::SmoothStep,
                 Some(Spring::SNAPPY),
             ),
@@ -1116,6 +1127,7 @@ mod tests {
             MotionPreset::ZoomTile,
             MotionPreset::Layout,
             MotionPreset::DragSettle,
+            MotionPreset::Whimsy,
         ] {
             let spec = Motion::spec(preset);
             assert_eq!(spec.preset, preset);
@@ -1141,6 +1153,31 @@ mod tests {
             Motion::spec(MotionPreset::DragSettle).spring.is_some(),
             "drag release has a spring settle option"
         );
+    }
+
+    #[test]
+    fn whimsy_taskbar_transition_respects_all_motion_modes() {
+        let spec = Motion::spec(MotionPreset::Whimsy);
+
+        assert_eq!(spec.preset, MotionPreset::Whimsy);
+        assert_eq!(spec.spring, Some(Spring::SNAPPY));
+        assert!(spec.duration_for(MotionMode::Normal) > spec.duration_for(MotionMode::Reduced));
+        assert!(spec.duration_for(MotionMode::Reduced) > 0.0);
+
+        let normal_progress = spec.progress_at(0.14, MotionMode::Normal);
+        assert!(
+            normal_progress > 0.0 && normal_progress < 1.0,
+            "normal mode should animate through the placement transition"
+        );
+
+        let reduced_progress = spec.progress_at(0.025, MotionMode::Reduced);
+        assert!(
+            reduced_progress > 0.0 && reduced_progress < 1.0,
+            "reduced mode should retain only a brief, bounded ease"
+        );
+
+        assert_eq!(spec.duration_for(MotionMode::Disabled), 0.0);
+        assert_eq!(spec.progress_at(0.0, MotionMode::Disabled), 1.0);
     }
 
     #[test]
