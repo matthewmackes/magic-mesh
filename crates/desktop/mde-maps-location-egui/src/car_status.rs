@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::Path;
 
+use mde_egui::{egui::Color32, Style};
+
 use crate::MapsLocationSurface;
 
 /// The file (under the client data dir) the strip selection persists to.
@@ -18,6 +20,48 @@ const CAR_STATUS_CONFIG_FILE: &str = "settings-car-status.json";
 /// A car-status selection is a small enum list; keep hostile/stale local JSON
 /// bounded before it reaches serde's materializer.
 const MAX_CAR_STATUS_CONFIG_BYTES: u64 = 64 * 1024;
+
+/// Semantic tone for a car-status tile.  The renderer can map this directly to
+/// the shared Quazar palette without inventing a per-screen color decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CarStatusTone {
+    /// A current, healthy reading.
+    Positive,
+    /// A retained, stale, degraded, or attention-needed reading.
+    Warning,
+    /// A reported fault.
+    Critical,
+    /// No trustworthy observation is available.
+    Muted,
+}
+
+impl CarStatusTone {
+    /// Resolve the semantic tone through the shared Quazar tokens.
+    #[must_use]
+    pub const fn color(self) -> Color32 {
+        match self {
+            Self::Positive => Style::OK,
+            Self::Warning => Style::WARN,
+            Self::Critical => Style::DANGER,
+            Self::Muted => Style::TEXT_DIM,
+        }
+    }
+}
+
+/// Scan-ready status data shared by the driver's strip and assistive labels.
+/// Keeping the label, value, tone, and spoken description together prevents a
+/// renderer from dropping the reason that distinguishes stale from unavailable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CarStatusDisplay {
+    /// Compact catalog label.
+    pub label: &'static str,
+    /// Compact visible value, including a bounded reason when useful.
+    pub value: String,
+    /// Shared Quazar semantic color.
+    pub tone: CarStatusTone,
+    /// Full scan/assistive description of the same reading.
+    pub accessibility_label: String,
+}
 
 /// One selectable readout in the driver's status strip. Serialized by its
 /// `snake_case` name so the persisted selection is stable across reordering.
@@ -196,6 +240,96 @@ impl CarStatusItem {
         }
     }
 
+    /// Resolve a complete scan-ready presentation for this tile.
+    ///
+    /// The visible value stays compact, while the accessibility label retains
+    /// an explicit unavailable/stale reason.  This matters on a narrow Car
+    /// strip where a bare dash is easy to miss and indistinguishable states are
+    /// operationally different.
+    #[must_use]
+    pub fn display(self, s: &MapsLocationSurface) -> CarStatusDisplay {
+        let value = self.value(s);
+        let tone = self.tone(s);
+        let accessibility_label = match self {
+            Self::GnssFreshness => freshness_accessibility_label(
+                self.label(),
+                &s.vehicle_radio_health.gnss_freshness,
+                &value,
+            ),
+            Self::TelemetryAge if s.vehicle.telemetry.has_live_gateway_source() => {
+                let state = if telemetry_is_live(s) {
+                    "current"
+                } else {
+                    "stale"
+                };
+                format!("{}: {}; {}", self.label(), state, value)
+            }
+            _ if value == "—" => format!("{}: unavailable", self.label()),
+            _ => format!("{}: {}", self.label(), value),
+        };
+        CarStatusDisplay {
+            label: self.label(),
+            value,
+            tone,
+            accessibility_label,
+        }
+    }
+
+    /// Select a shared Quazar tone from the typed state, never from a guessed
+    /// value.  This is intentionally data-only so each renderer can apply the
+    /// same semantic color in Dark, Quazar Light, or Sync-3.
+    #[must_use]
+    pub fn tone(self, s: &MapsLocationSurface) -> CarStatusTone {
+        use crate::model::{VehicleFreshnessState, VehicleRadioAvailability};
+
+        match self {
+            Self::RadioHealth => match s.vehicle_radio_health.availability {
+                VehicleRadioAvailability::Available => CarStatusTone::Positive,
+                VehicleRadioAvailability::Degraded => CarStatusTone::Warning,
+                VehicleRadioAvailability::Unavailable => CarStatusTone::Muted,
+            },
+            Self::GnssFreshness => match s.vehicle_radio_health.gnss_freshness.state {
+                VehicleFreshnessState::Fresh => CarStatusTone::Positive,
+                VehicleFreshnessState::Stale => CarStatusTone::Warning,
+                VehicleFreshnessState::Unknown => CarStatusTone::Muted,
+            },
+            Self::TelemetryAge => {
+                if !s.vehicle.telemetry.has_live_gateway_source() {
+                    CarStatusTone::Muted
+                } else if telemetry_is_live(s) {
+                    CarStatusTone::Positive
+                } else {
+                    CarStatusTone::Warning
+                }
+            }
+            Self::FaultCodes => {
+                if !telemetry_is_live(s) {
+                    CarStatusTone::Muted
+                } else if s.vehicle.telemetry.dtc_count > 0 {
+                    CarStatusTone::Critical
+                } else {
+                    CarStatusTone::Positive
+                }
+            }
+            Self::CellAHealth | Self::CellBHealth => {
+                let healthy = match self {
+                    Self::CellAHealth => s.mg90.status.cellular_a.healthy,
+                    Self::CellBHealth => s.mg90.status.cellular_b.healthy,
+                    _ => unreachable!(),
+                };
+                if s.mg90.status.active_wan.trim().is_empty() {
+                    CarStatusTone::Muted
+                } else if healthy {
+                    CarStatusTone::Positive
+                } else {
+                    CarStatusTone::Critical
+                }
+            }
+            _ if self.value(s) == "—" => CarStatusTone::Muted,
+            _ => CarStatusTone::Positive,
+        }
+    }
+
     /// Resolve the live display value from the surface fold. Honest empty ("—")
     /// when the source is not present — never fabricated.
     #[must_use]
@@ -291,7 +425,7 @@ impl CarStatusItem {
                 .to_string(),
             Self::LocationSource => s.locations.primary.label().to_string(),
             Self::ActiveWan => empty_dash(&w.active_wan),
-            Self::RadioHealth => s.vehicle_radio_health.summary(),
+            Self::RadioHealth => radio_health_scan_value(&s.vehicle_radio_health),
             Self::CellASignal => signal_dbm(w.cellular_a.signal_dbm),
             Self::CellABars => bars(w.cellular_a.signal_dbm),
             Self::CellACarrier => empty_dash(&w.cellular_a.carrier),
@@ -411,6 +545,49 @@ fn empty_dash(s: &str) -> String {
     } else {
         s.to_string()
     }
+}
+
+/// Keep a typed reason visible in a narrow strip without allowing hostile or
+/// unexpectedly verbose producer text to dominate the tile.
+fn compact_reason(reason: &str) -> String {
+    let normalized = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = normalized.chars();
+    let compact: String = chars.by_ref().take(48).collect();
+    if chars.next().is_some() {
+        format!("{compact}…")
+    } else {
+        compact
+    }
+}
+
+/// Preserve the distinction between stale, unsupported, offline, and generic
+/// unavailable inventory in the glanceable Radio Health tile.
+fn radio_health_scan_value(health: &crate::model::VehicleRadioHealth) -> String {
+    let stale = health.availability == crate::model::VehicleRadioAvailability::Degraded
+        && (health.radios_freshness.state == crate::model::VehicleFreshnessState::Stale
+            || health.gnss_freshness.state == crate::model::VehicleFreshnessState::Stale);
+    let state = if stale {
+        "stale".to_string()
+    } else {
+        health.summary()
+    };
+    health.availability_reason.as_deref().map_or_else(
+        || state.clone(),
+        |reason| format!("{state} · {}", compact_reason(reason)),
+    )
+}
+
+fn freshness_accessibility_label(
+    label: &'static str,
+    freshness: &crate::model::VehicleFreshness,
+    value: &str,
+) -> String {
+    let reason = freshness
+        .reason
+        .as_deref()
+        .map(compact_reason)
+        .map_or_else(String::new, |reason| format!("; reason {reason}"));
+    format!("{label}: {}; age {}{reason}", value, freshness.age_label(),)
 }
 
 /// Cellular signal readout. A real reading is negative dBm; `0` (or any
@@ -941,10 +1118,16 @@ mod tests {
     fn typed_radio_tiles_show_unavailable_then_typed_unknown_state() {
         use mackes_mesh_types::vehicle::{
             SnapshotProvenance, VehicleState as WireVehicleState, VehicleStateV2,
+            VEHICLE_STATE_V2_SCHEMA_VERSION,
         };
 
         let empty = MapsLocationSurface::live();
-        assert_eq!(CarStatusItem::RadioHealth.value(&empty), "unavailable");
+        let unavailable = CarStatusItem::RadioHealth.display(&empty);
+        assert!(unavailable
+            .value
+            .starts_with("unavailable · typed v2 radio inventory unavailable"));
+        assert_eq!(unavailable.tone, CarStatusTone::Muted);
+        assert!(unavailable.accessibility_label.contains("unavailable"));
         assert_eq!(CarStatusItem::GnssFreshness.value(&empty), "Unknown");
 
         let mut legacy = WireVehicleState::offline("rig-1");
@@ -962,7 +1145,53 @@ mod tests {
         );
         let mut typed = MapsLocationSurface::live();
         typed.refresh_from_vehicle_v2(&snapshot);
-        assert_eq!(CarStatusItem::RadioHealth.value(&typed), "degraded");
+        let degraded = CarStatusItem::RadioHealth.display(&typed);
+        assert!(degraded
+            .value
+            .starts_with("degraded · radio or GNSS freshness/health"));
+        assert_eq!(degraded.tone, CarStatusTone::Warning);
         assert_eq!(CarStatusItem::GnssFreshness.value(&typed), "Unknown");
+
+        let mut unsupported = snapshot;
+        unsupported.schema_version = VEHICLE_STATE_V2_SCHEMA_VERSION.saturating_add(1);
+        let mut unsupported_surface = MapsLocationSurface::live();
+        unsupported_surface.refresh_from_vehicle_v2(&unsupported);
+        let unsupported_display = CarStatusItem::RadioHealth.display(&unsupported_surface);
+        assert!(unsupported_display
+            .value
+            .starts_with("unavailable · unsupported vehicle snapshot schema"));
+        assert_eq!(unsupported_display.tone, CarStatusTone::Muted);
+        assert!(unsupported_display
+            .accessibility_label
+            .contains("unsupported vehicle snapshot schema"));
+    }
+
+    #[test]
+    fn stale_telemetry_gets_warning_tone_and_explicit_scan_label() {
+        use mackes_mesh_types::vehicle::{VehicleState as WireVehicleState, VehicleTelem};
+
+        let mut mirror = WireVehicleState::offline("rig-1");
+        mirror.online = true;
+        mirror.model = "MG90".to_string();
+        mirror.published_at_ms = test_now_ms() - 6_000;
+        mirror.telem = VehicleTelem {
+            speed_mph: 42.0,
+            ..VehicleTelem::default()
+        };
+        let mut surface = MapsLocationSurface::live();
+        surface.refresh_from_vehicle(&mirror);
+
+        let display = CarStatusItem::TelemetryAge.display(&surface);
+        assert_eq!(display.tone, CarStatusTone::Warning);
+        assert!(display.accessibility_label.contains("stale"));
+        assert!(display.accessibility_label.contains("TELEM AGE"));
+    }
+
+    #[test]
+    fn semantic_tones_resolve_through_shared_quazar_tokens() {
+        assert_eq!(CarStatusTone::Positive.color(), Style::OK);
+        assert_eq!(CarStatusTone::Warning.color(), Style::WARN);
+        assert_eq!(CarStatusTone::Critical.color(), Style::DANGER);
+        assert_eq!(CarStatusTone::Muted.color(), Style::TEXT_DIM);
     }
 }
