@@ -1,18 +1,20 @@
-//! `status_bar` — WL-UX-006/U11: the **Construct slim top status bar**.
+//! `status_bar` — WL-UX-006/U11: Construct's responsive clock/status chrome.
 //!
 //! Authority: `docs/design/platform-interfaces.md` §2.3 (Q12): a ~24px
-//! HIG-style strip — a centered clock, the mesh/system rollups, and compact
-//! system-control glyphs on the right — fed by the existing
+//! HIG-style side-rail strip — a centered clock, the mesh/system rollups, and
+//! compact system-control glyphs on the right — plus a Windows-style bottom
+//! clock/tray when the taskbar is in Bottom mode. Both are fed by the existing
 //! [`crate::status`] `StatusSegments` read-model.
 //! **This deliberately REVERSES the old NAVBAR-W10 "no top bar" decision**
 //! (Q12 says so in as many words).
 //!
 //! ## Paint layer and reserved layout band
 //!
-//! The strip paints as a foreground [`egui::Area`] pinned to the top edge, while
-//! `main.rs::central_view` reserves the matching [`STATUS_BAR_H`] band before
-//! laying out every workspace. This keeps the strip's fixed chrome interaction
-//! model without allowing app content to slide underneath it.
+//! The side strip paints as a foreground [`egui::Area`] pinned to the top edge,
+//! while `main.rs::central_view` reserves the matching [`STATUS_BAR_H`] band
+//! only in the side-rail phase. The bottom tray lives in the full-width taskbar
+//! lane, so the two treatments never compete for the same clock or workspace
+//! pixels.
 //!
 //! ## Auto-hide (Q12/Q28)
 //!
@@ -55,6 +57,10 @@ use crate::surfaces::icon_texture;
 
 /// The locked strip height (Q12: "~24px").
 pub(crate) const STATUS_BAR_H: f32 = 24.0;
+/// Width reserved by the bottom taskbar for the Windows-style system tray.
+/// The navigation bar keeps this lane free of app pins so the clock and
+/// controls remain visually stable while the center cluster changes.
+pub(crate) const BOTTOM_TRAY_W: f32 = 196.0;
 
 /// The daemon rollup segments the right cluster surfaces, left→right —
 /// Q12's "mesh grade, network, power, alert count" mapped onto what the
@@ -409,6 +415,20 @@ pub fn mount(
     grades: &NodeGrades,
     env: StatusBarEnv,
 ) {
+    mount_top(ctx, construct, segments, grades, env, 1.0);
+}
+
+/// Mount the current top-strip treatment with an explicit cross-fade weight.
+/// The dock owns the eased transition between this strip and the bottom tray;
+/// the legacy [`mount`] wrapper keeps standalone status-bar callers unchanged.
+pub(crate) fn mount_top(
+    ctx: &egui::Context,
+    construct: &mut ConstructChrome,
+    segments: &StatusSegments,
+    grades: &NodeGrades,
+    env: StatusBarEnv,
+    opacity: f32,
+) {
     let visible = status_bar_visible(env);
     // The U09 chrome-contract tests drive all mount slots on a bare Context to
     // prove intent routing without opening a frame. Keep this persistent
@@ -421,10 +441,11 @@ pub fn mount(
     // The central workspace releases its reserved band when the target state
     // becomes hidden. Do not leave a fading foreground Area over those pixels;
     // the workspace must remain clear for the entire hidden state transition.
-    if !visible {
+    if !visible || opacity <= 0.0 {
         return;
     }
-    let t = Motion::animate(ctx, "construct-status-bar-visible", visible, Motion::BASE);
+    let t = Motion::animate(ctx, "construct-status-bar-visible", visible, Motion::BASE)
+        * opacity.clamp(0.0, 1.0);
     if t <= 0.0 {
         return;
     }
@@ -451,6 +472,188 @@ pub fn mount(
             ui.set_opacity(t);
             strip(ui, bar, construct, segments, grades);
         });
+}
+
+/// Mount the Windows 11-inspired bottom tray used while the taskbar is in its
+/// bottom configuration. It deliberately has no A–F grade text: the mesh
+/// health state is a compact honest dot, while the existing top strip remains
+/// the detailed grade/status treatment in the side-rail configuration.
+pub(crate) fn mount_bottom(
+    ctx: &egui::Context,
+    construct: &mut ConstructChrome,
+    segments: &StatusSegments,
+    opacity: f32,
+    env: StatusBarEnv,
+) {
+    if ctx.cumulative_pass_nr() == 0 || opacity <= 0.0 || !status_bar_visible(env) {
+        return;
+    }
+    let screen = ctx.screen_rect();
+    let tray = egui::Rect::from_min_max(
+        egui::pos2(
+            (screen.right() - BOTTOM_TRAY_W - Style::SP_S).max(screen.left()),
+            screen.bottom() - crate::nav_bar::TASKBAR_H,
+        ),
+        egui::pos2(screen.right() - Style::SP_S, screen.bottom()),
+    );
+    egui::Area::new(egui::Id::new("construct-bottom-system-tray"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(tray.min)
+        .default_size(tray.size())
+        .movable(false)
+        .sense(egui::Sense::hover())
+        .show(ctx, |ui| {
+            ui.set_min_size(tray.size());
+            ui.set_clip_rect(tray);
+            ui.set_opacity(opacity.clamp(0.0, 1.0));
+            bottom_tray(ui, tray, construct, segments);
+        });
+}
+
+fn bottom_tray(
+    ui: &egui::Ui,
+    tray: egui::Rect,
+    construct: &mut ConstructChrome,
+    segments: &StatusSegments,
+) {
+    let painter = ui.painter().clone();
+    let panel = tray.shrink2(egui::vec2(2.0, 4.0));
+    let surface = Style::resolve_color(ui.ctx(), Style::SURFACE).gamma_multiply(0.96);
+    let surface_hi = Style::resolve_color(ui.ctx(), Style::SURFACE_HI);
+    let text = Style::resolve_color(ui.ctx(), Style::TEXT);
+    let text_dim = Style::resolve_color(ui.ctx(), Style::TEXT_DIM);
+    painter.rect_filled(panel, Style::RADIUS_M, surface);
+    painter.line_segment(
+        [panel.left_top(), panel.left_bottom()],
+        egui::Stroke::new(1.0, Style::resolve_color(ui.ctx(), Style::BORDER)),
+    );
+
+    let now = crate::timers::now_unix();
+    let time = crate::timers::hhmm(now);
+    let (year, month, day) = crate::chat::civil_from_days(now.div_euclid(86_400));
+    let date = format!("{month:02}/{day:02}/{year:04}");
+    let clock_width = 78.0_f32.min((panel.width() * 0.42).max(36.0));
+    let clock = egui::Rect::from_min_max(
+        egui::pos2(panel.right() - clock_width, panel.top()),
+        panel.right_bottom(),
+    );
+    let clock_response = ui.interact(
+        clock,
+        egui::Id::new(("construct-bottom-system-tray", "clock")),
+        egui::Sense::click(),
+    );
+    clock_response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            format!("Clock {time} — Notification Center"),
+        )
+    });
+    if clock_response.hovered() {
+        painter.rect_filled(clock.shrink(2.0), Style::RADIUS_S, surface_hi);
+    }
+    let time_galley = painter.layout_job(status_text_job(
+        time.clone(),
+        TypographyRole::Label,
+        text,
+        clock.width(),
+    ));
+    let date_galley = painter.layout_job(status_text_job(
+        date,
+        TypographyRole::Caption,
+        text_dim,
+        clock.width(),
+    ));
+    painter.galley(
+        egui::pos2(
+            clock.center().x - time_galley.size().x / 2.0,
+            clock.center().y - time_galley.size().y - 1.0,
+        ),
+        time_galley,
+        text,
+    );
+    painter.galley(
+        egui::pos2(
+            clock.center().x - date_galley.size().x / 2.0,
+            clock.center().y + 1.0,
+        ),
+        date_galley,
+        text_dim,
+    );
+    if clock_response.clicked() {
+        construct.notification_center_open = !construct.notification_center_open;
+    }
+
+    let health = egui::pos2(panel.left() + 14.0, panel.center().y);
+    let mesh_color = severity_color(segments.get(StatusSegment::Mesh));
+    painter.circle_filled(health, 4.0, mesh_color);
+    let health_response = ui.interact(
+        egui::Rect::from_center_size(health, egui::vec2(24.0, 32.0)),
+        egui::Id::new(("construct-bottom-system-tray", "mesh-health")),
+        egui::Sense::hover(),
+    );
+    health_response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Label,
+            ui.is_enabled(),
+            format!(
+                "Mesh health: {}",
+                severity_label(segments.get(StatusSegment::Mesh))
+            ),
+        )
+    });
+
+    let icon_right = clock.left() - Style::SP_XS;
+    let icon_left = health.x + 10.0;
+    let icon_space = icon_right - icon_left - Style::SP_XS * 2.0;
+    if icon_space > 0.0 {
+        let icon_width = (icon_space / 3.0).max(1.0);
+        for control in StatusControl::ALL {
+            let left = icon_left + control.index() as f32 * (icon_width + Style::SP_XS);
+            let rect = egui::Rect::from_min_max(
+                egui::pos2(left, panel.top()),
+                egui::pos2(
+                    (left + icon_width).min(icon_right).max(left),
+                    panel.bottom(),
+                ),
+            );
+            let response = ui.interact(
+                rect,
+                egui::Id::new(("construct-bottom-system-tray", control.index())),
+                egui::Sense::click(),
+            );
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::Button,
+                    ui.is_enabled(),
+                    format!("{} — Control Center", control.label()),
+                )
+            });
+            if response.hovered() {
+                painter.rect_filled(rect.shrink(2.0), Style::RADIUS_S, surface_hi);
+            }
+            if let Some(texture) = icon_texture(ui.ctx(), control.icon(), STATUS_CONTROL_ICON, text)
+            {
+                let draw = egui::Rect::from_center_size(
+                    rect.center(),
+                    egui::vec2(STATUS_CONTROL_ICON, STATUS_CONTROL_ICON),
+                );
+                painter.image(
+                    texture.id(),
+                    draw,
+                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            }
+            if response.clicked() {
+                construct.control_center_open = !construct.control_center_open;
+            }
+        }
+    }
+
+    ui.ctx().request_repaint_after(Duration::from_secs(
+        crate::timers::secs_to_next_minute(now).max(1),
+    ));
 }
 
 /// Paint + interact the strip body. Absolute screen-space rects throughout
@@ -811,6 +1014,99 @@ mod tests {
     fn the_status_bar_is_the_locked_24px_strip() {
         // Q12 — "~24px". Pinned so a future change is a conscious edit here.
         assert!((STATUS_BAR_H - 24.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn bottom_tray_uses_clock_and_icon_health_without_a_grade_label() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut construct = ConstructChrome::default();
+        let segments = StatusSegments::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
+        let mut output = egui::FullOutput::default();
+        for _ in 0..3 {
+            output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ctx| mount_bottom(ctx, &mut construct, &segments, 1.0, visible_env()),
+            );
+        }
+        let texts = frame_texts(&output);
+        assert!(texts.iter().any(|text| text.contains(':')));
+        assert!(texts.iter().any(|text| text.contains('/')));
+        assert!(
+            !texts
+                .iter()
+                .any(|text| ["A", "B", "C", "D", "F"].contains(&text.as_str())),
+            "the bottom tray must not list the node grade: {texts:?}"
+        );
+        assert!(
+            ctx.read_response(egui::Id::new(("construct-bottom-system-tray", "clock")))
+                .is_some(),
+            "the Windows-style clock must remain a reachable tray target"
+        );
+    }
+
+    #[test]
+    fn bottom_tray_clamps_narrow_layouts_and_honors_visibility() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut construct = ConstructChrome::default();
+        let segments = StatusSegments::default();
+        for size in [egui::vec2(320.0, 240.0), egui::vec2(96.0, 80.0)] {
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+            for _ in 0..3 {
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        ..Default::default()
+                    },
+                    |ctx| mount_bottom(ctx, &mut construct, &segments, 1.0, visible_env()),
+                );
+            }
+            let clock = ctx
+                .read_response(egui::Id::new(("construct-bottom-system-tray", "clock")))
+                .expect("narrow tray keeps a clock target");
+            assert!(clock.rect.width() >= 0.0 && clock.rect.height() >= 0.0);
+            for control in StatusControl::ALL {
+                if let Some(response) = ctx.read_response(egui::Id::new((
+                    "construct-bottom-system-tray",
+                    control.index(),
+                ))) {
+                    assert!(response.rect.width() >= 0.0 && response.rect.height() >= 0.0);
+                }
+            }
+        }
+
+        let hidden_ctx = egui::Context::default();
+        Style::install(&hidden_ctx);
+        let hidden_output = hidden_ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(320.0, 240.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                mount_bottom(
+                    ctx,
+                    &mut construct,
+                    &segments,
+                    1.0,
+                    StatusBarEnv {
+                        curtain_engaged: true,
+                        ..visible_env()
+                    },
+                );
+            },
+        );
+        assert!(
+            hidden_output.shapes.is_empty(),
+            "hidden status chrome must not paint a bottom tray"
+        );
     }
 
     #[test]

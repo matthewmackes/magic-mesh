@@ -1212,7 +1212,7 @@ fn floating_geometry_for_catalog(
     );
     let y = outer.top() + (TASKBAR_H - edge) / 2.0;
     let left_start = outer.left() + Style::SP_L;
-    let right_x = outer.right() - Style::SP_L - edge;
+    let right_x = outer.right() - Style::SP_L - BOTTOM_TRAY_W - BOTTOM_TRAY_GAP - edge;
     let mut controls = Vec::with_capacity(dock_control_capacity_for(pinned_count, surface_count));
     let group_labels = Vec::new();
     let mut cursor_x = left_start;
@@ -1300,7 +1300,10 @@ fn docked_geometry_for_catalog(
     pinned_count: usize,
     surfaces: &[Surface],
 ) -> Geometry {
-    let outer = egui::Rect::from_min_size(screen.left_top(), egui::vec2(DOCKED_W, screen.height()));
+    let outer = egui::Rect::from_min_size(
+        egui::pos2(screen.left(), screen.top() + STATUS_BAR_H),
+        egui::vec2(DOCKED_W, (screen.height() - STATUS_BAR_H).max(0.0)),
+    );
     let mut controls = Vec::with_capacity(dock_control_capacity_for(pinned_count, surfaces.len()));
     let group_labels = Vec::new();
     let mut cursor_y = screen.top() + STATUS_BAR_H + Style::SP_S;
@@ -2012,6 +2015,25 @@ mod tests {
     }
 
     #[test]
+    fn chrome_alphas_crossfade_the_top_strip_and_bottom_tray() {
+        let started = Instant::now();
+        let state = State {
+            mode: DockMode::Docked,
+            transition: Some(TransitionState {
+                from: DockMode::Floating,
+                to: DockMode::Docked,
+                started,
+            }),
+            ..State::default()
+        };
+        let (bottom, top) = state.chrome_alphas(started + TRANSITION / 2);
+        assert!((bottom - 0.5).abs() < 0.01);
+        assert!((top - 0.5).abs() < 0.01);
+        assert_eq!(state.chrome_alphas(started), (1.0, 0.0));
+        assert_eq!(state.chrome_alphas(started + TRANSITION), (0.0, 1.0));
+    }
+
+    #[test]
     fn dock_launcher_accessibility_labels_use_operator_terms() {
         let desktop = Control {
             kind: ControlKind::SurfaceLauncher,
@@ -2039,7 +2061,7 @@ mod tests {
         assert_eq!(floating.outer.right(), screen.right());
         assert_eq!(floating.outer.bottom(), screen.bottom());
         assert_eq!(docked.outer.width(), DOCKED_W);
-        assert_eq!(docked.outer.top(), screen.top());
+        assert_eq!(docked.outer.top(), screen.top() + STATUS_BAR_H);
         assert_eq!(docked.controls[0].rect.top(), STATUS_BAR_H + Style::SP_S);
         assert_eq!(docked.controls.len(), dock_control_capacity(0));
         assert!(floating.group_labels.is_empty());
@@ -3107,7 +3129,11 @@ mod tests {
             .expect("chooser pin should append a dock target");
         assert_eq!(pinned.kind, ControlKind::PinnedDesktop);
         assert_eq!(pinned.source_index, Some(0));
-        assert_eq!(placement.rect.right(), screen.right() - Style::SP_L);
+        assert!(
+            placement.rect.right()
+                <= screen.right() - Style::SP_L - BOTTOM_TRAY_W - BOTTOM_TRAY_GAP,
+            "placement control must remain left of the bottom system tray"
+        );
         assert_eq!(geometry.outer.width(), screen.width());
 
         let ctx = egui::Context::default();

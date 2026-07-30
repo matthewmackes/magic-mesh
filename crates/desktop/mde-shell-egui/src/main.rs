@@ -1554,6 +1554,19 @@ impl Shell {
         {
             self.apply_nav_bar_action(action, ctx);
         }
+        let (bottom_alpha, _) = self.nav_bar.chrome_alphas(Instant::now());
+        let env = status_bar::StatusBarEnv {
+            curtain_engaged: self.curtain.engaged(),
+            car: self.system.layout_profile() == LayoutProfile::Car,
+            immersive_app: self.immersive_vdi() || self.nav.surface == Surface::MapsLocation,
+        };
+        status_bar::mount_bottom(
+            ctx,
+            &mut self.construct,
+            self.notify_status.segments(),
+            bottom_alpha,
+            env,
+        );
     }
 
     /// U10 — the Construct springboard home (`springboard.rs`, §2.2 — the
@@ -1580,7 +1593,8 @@ impl Shell {
     /// `construct` queue — the §2.3 pointer rows — not a second dispatch path.
     fn mount_status_bar_slot(&mut self, ctx: &egui::Context) {
         let immersive_vdi = self.immersive_vdi();
-        status_bar::mount(
+        let (_, top_alpha) = self.nav_bar.chrome_alphas(Instant::now());
+        status_bar::mount_top(
             ctx,
             &mut self.construct,
             self.notify_status.segments(),
@@ -1590,6 +1604,7 @@ impl Shell {
                 car: self.system.layout_profile() == LayoutProfile::Car,
                 immersive_app: immersive_vdi || self.nav.surface == Surface::MapsLocation,
             },
+            top_alpha,
         );
     }
 
@@ -3382,11 +3397,14 @@ impl Shell {
         // panel is laid out. The bar still paints in its own foreground Area, but
         // every surface now starts below the same 24 px band instead of letting
         // content slide underneath the clock/status chrome.
-        if status_bar::status_bar_visible(status_bar::StatusBarEnv {
-            curtain_engaged: self.curtain.engaged(),
-            car: is_car,
-            immersive_app: self.immersive_vdi() || self.nav.surface == Surface::MapsLocation,
-        }) {
+        let (_, top_alpha) = self.nav_bar.chrome_alphas(Instant::now());
+        if top_alpha > 0.01
+            && status_bar::status_bar_visible(status_bar::StatusBarEnv {
+                curtain_engaged: self.curtain.engaged(),
+                car: is_car,
+                immersive_app: self.immersive_vdi() || self.nav.surface == Surface::MapsLocation,
+            })
+        {
             construct::reserve_top_rail(ctx);
         }
         if self.nav_bar.reserves_bottom_space() && !self.immersive_vdi() {
@@ -6786,7 +6804,11 @@ mod tests {
             .expect("central_view must record the workspace rect");
         assert_eq!(workspace.left(), screen.left());
         assert_eq!(workspace.right(), screen.right());
-        assert_eq!(workspace.top(), super::status_bar::STATUS_BAR_H);
+        assert_eq!(
+            workspace.top(),
+            0.0,
+            "the bottom taskbar configuration moves the clock/tray out of the top rail"
+        );
         assert_eq!(
             workspace.bottom(),
             screen.bottom() - super::nav_bar::SPRINGBOARD_DOCK_RESERVED_H
