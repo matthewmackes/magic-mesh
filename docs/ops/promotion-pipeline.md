@@ -90,6 +90,26 @@ over 12.1.5, passed `rpm -V`, reported 12.1.6 through `mackesd`,
 after restart. This is a Dell proofing Alpha, not a production promotion:
 the candidate was unsigned and no live fleet promotion was attempted.
 
+2026-07-29 Dell GUI Alpha proof evidence: source tip `247db21d` (wallpaper
+enable/selection, animated responsive tray, native DRM clipboard clear,
+route-readiness gating, and This Node narrow/large-text wrapping) was cut in
+BigBoy slot `alpha-dell-gui-wave-f44-20260730` using the Fedora 44 container
+lane. Base `magic-mesh-12.1.6-1.x86_64.rpm` (82.3 MiB, sha256
+`5492561ab3fcaa97a1f72922141f4b9e38842b156bb43168ad711c3863d6dbe6`), browser
+`magic-mesh-browser-12.1.6-1.x86_64.rpm` (39.1 MiB, sha256
+`7819c9423907ea2b08f0a85671c397720c5336f1188bdb18824465e939d29c56`), and
+lighthouse `magic-mesh-lighthouse-12.1.6-1.x86_64.rpm` (11.3 MiB, sha256
+`b336256288536ac99aa87d450f872a3262e135c03b60881392b7f47afa8254dc`) all
+passed the 90 MiB payload guard. On Fedora 44 Dell-LAPTOP
+(`172.20.146.225`), the base/browser transaction test passed, installation
+with `--replacepkgs` completed, `rpm -V` was clean, `mackesd --help` and
+`mesh-help --help` passed, and `mde-shell-egui.service` was active with
+`NRestarts=0` and a live `mde-shell-egui` process. The first restart was
+canceled by the known tty/getty handoff; a separate `systemctl start` restored
+the service. The GUI binary's headless `--help` probe is not counted because
+Winit requires a display. This remains a Dell proofing Alpha, not a production
+promotion; artifacts are unsigned and no fleet promotion was attempted.
+
 2026-07-07 production-candidate evidence: latest rebuilt
 `magic-mesh-12.0.0-1.x86_64` (`/root/mcnf-release-artifacts`, 112291230
 bytes, built 13:19 EDT, sha256

@@ -499,8 +499,9 @@ remains here under a completed status.
   and bridge code, Mesh Teams presentation, and VNC cut-text primitives provide
   partial foundations, but the direct DRM seat path and complete bidirectional
   protocol integration are not production-complete. DRM/VNC clipboard state
-  handling, a bounded UTF-8-safe local text provider, and explicit RDP/SPICE
-  capability reporting now have focused farm coverage. KDC/mobile ingress now
+  handling, a bounded UTF-8-safe local text provider, explicit RDP/SPICE
+  capability reporting, and the DRM CopyText-clear/native-paste round-trip now
+  have focused farm coverage (15 tests). KDC/mobile ingress now
   has typed authorization, UTF-8/1 MiB bounds, peer-scoped deduplication, and
   honest metadata with 22 focused farm tests; real mesh history/materialization
   and RDP/SPICE text channels remain unsupported.
@@ -591,11 +592,11 @@ remains here under a completed status.
   identity/radio/freshness/provenance baseline dual-publishes beside v1, with
   11 mesh-type and 69 worker tests passing. Maps/Car now projects bounded radio
   presence, operation, GNSS/radio freshness, retained age, provenance, and
-  typed Current/Stale/Resyncing/Unavailable mirror state; 13 consumer tests
-  pass. The bounded MG90/manager roster has independent poll/heartbeat plans,
+  typed Current/Stale/Resyncing/Unavailable mirror state; 13 consumer tests pass. The bounded MG90/manager roster has independent poll/heartbeat plans,
   latest-wins/no-source behavior, and 42 vehicle tests passing. Maps HUD now
   removes road-name speed/lane heuristics and paints explicit unavailable states;
-  focused render proof passes. Live adapters and route/render cutover remain.
+  focused render and route-readiness proof passes; Start is disabled when
+  routing is unavailable. Live adapters and route/render cutover remain.
 - Remaining work:
   1. Consume WL-UX-009's platform-wide Carbon-requirement retirement and update
      the Maps/Car-specific authority while retaining egui, shared `Style`,
@@ -887,7 +888,8 @@ remains here under a completed status.
   hardware aliases, legacy normalization, and unavailable provider states.
   Its mesh-status model projects bounded typed capability/action rows with
   fail-closed mutations plus truthful interface/CIDR/route/lighthouse/DNS
-  connectivity facts; focused This Node tests pass.
+  connectivity facts; focused This Node tests pass, including narrow and
+  large-text reflow coverage (16 focused tests).
 - Remaining work:
 
   1. Finish the durable This Node sidebar and search index across every
@@ -1000,8 +1002,9 @@ remains here under a completed status.
   search; old group labels/pill geometry are gone. `springboard.rs` still owns
   grid/tile presentation and Fleet & Mesh/Workloads cutover remains open
   (`Surface::FleetMesh` exists; Workloads retains `Surface::InfraCode`). Dell
-  Alpha proof: Fedora 44 12.1.6-1 base/browser RPMs installed on Dell-LAPTOP;
-  `rpm -V`, CLI/help, and active shell restart passed (hashes in evidence).
+  Alpha proof: Fedora 44 12.1.6-1 base/browser RPMs from source tip
+  `247db21d` installed on Dell-LAPTOP; transaction test, `rpm -V`, daemon/help,
+  and active shell service with zero restarts passed (hashes in evidence).
 - Remaining work:
 
   1. Reconcile taskbar-specific authority after WL-UX-009 retires the global
