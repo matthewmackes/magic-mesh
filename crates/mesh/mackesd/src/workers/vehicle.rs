@@ -1286,6 +1286,26 @@ impl VehicleRoster {
         }
     }
 
+    /// Select the freshest accepted snapshot for every registered MG90 source
+    /// in stable source-id order. Each source remains explicit: a registered
+    /// source without an accepted snapshot returns `NoSource` rather than an
+    /// invented offline state. An empty roster returns one roster-level
+    /// `NoSource` result so callers do not mistake an empty result for a
+    /// successful empty read model.
+    #[must_use]
+    pub fn select_latest_all(&self) -> Vec<VehicleRosterSelection> {
+        if self.assignments.is_empty() {
+            return vec![VehicleRosterSelection::NoSource {
+                source_id: None,
+                reason: VehicleNoSourceReason::EmptyRoster,
+            }];
+        }
+        self.source_ids()
+            .iter()
+            .map(|source_id| self.select_latest(source_id))
+            .collect()
+    }
+
     /// Select the source snapshot that a heartbeat may repeat. No accepted
     /// snapshot means no publication, even when a heartbeat deadline is due.
     #[must_use]
@@ -3256,6 +3276,8 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
             .with_bus_root(None)
             .with_probe(Arc::new(FakeProbe::real()))
             .build_state_v2(&FakeProbe::real());
+        snapshot.mg90.id = source_id.as_str().to_string();
+        snapshot.mg90.esn = source_id.as_str().to_string();
         snapshot.observed_at_ms = observed_at_ms;
         snapshot.published_at_ms = published_at_ms;
         snapshot.sequence = sequence;
@@ -3423,6 +3445,95 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
             }
             other => panic!("expected selected source, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn roster_select_latest_all_returns_each_source_in_stable_order() {
+        let source_a = VehicleSourceId::new("mg90-a").unwrap();
+        let source_b = VehicleSourceId::new("mg90-b").unwrap();
+        let plan = VehiclePollPlan::new(Duration::from_secs(5), ROSTER_HEARTBEAT).unwrap();
+        let mut roster = VehicleRoster::new(Instant::now());
+        // Register in reverse source order to prove the read model is not
+        // dependent on discovery or manager insertion order.
+        for (source, manager) in [
+            (&source_b, "manager-c"),
+            (&source_b, "manager-a"),
+            (&source_a, "manager-b"),
+            (&source_a, "manager-a"),
+        ] {
+            roster
+                .register(VehicleRosterSource::remote(source.clone(), manager, plan).unwrap())
+                .unwrap();
+        }
+
+        assert!(roster
+            .ingest(roster_snapshot(&source_a, "manager-a", 200, 200, 4))
+            .unwrap());
+        assert!(roster
+            .ingest(roster_snapshot(&source_a, "manager-b", 200, 200, 4))
+            .unwrap());
+        assert!(roster
+            .ingest(roster_snapshot(&source_b, "manager-a", 100, 100, 1))
+            .unwrap());
+        assert!(roster
+            .ingest(roster_snapshot(&source_b, "manager-c", 300, 300, 1))
+            .unwrap());
+
+        let selections = roster.select_latest_all();
+        assert_eq!(selections.len(), 2);
+        match &selections[0] {
+            VehicleRosterSelection::Selected(snapshot) => {
+                assert_eq!(snapshot.source_id(), &source_a);
+                assert_eq!(snapshot.manager_id(), "manager-b");
+                assert_eq!(snapshot.snapshot().observed_at_ms, 200);
+            }
+            other => panic!("expected source-a selection, got {other:?}"),
+        }
+        match &selections[1] {
+            VehicleRosterSelection::Selected(snapshot) => {
+                assert_eq!(snapshot.source_id(), &source_b);
+                assert_eq!(snapshot.manager_id(), "manager-c");
+                assert_eq!(snapshot.snapshot().observed_at_ms, 300);
+            }
+            other => panic!("expected source-b selection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roster_select_latest_all_reports_empty_and_unaccepted_sources() {
+        let source_a = VehicleSourceId::new("mg90-a").unwrap();
+        let source_b = VehicleSourceId::new("mg90-b").unwrap();
+        let empty = VehicleRoster::new(Instant::now());
+        assert_eq!(
+            empty.select_latest_all(),
+            vec![VehicleRosterSelection::NoSource {
+                source_id: None,
+                reason: VehicleNoSourceReason::EmptyRoster,
+            }]
+        );
+
+        let plan = VehiclePollPlan::default();
+        let mut roster = VehicleRoster::new(Instant::now());
+        roster
+            .register(VehicleRosterSource::remote(source_b, "manager-b", plan).unwrap())
+            .unwrap();
+        roster
+            .register(VehicleRosterSource::remote(source_a.clone(), "manager-a", plan).unwrap())
+            .unwrap();
+
+        assert_eq!(
+            roster.select_latest_all(),
+            vec![
+                VehicleRosterSelection::NoSource {
+                    source_id: Some(source_a),
+                    reason: VehicleNoSourceReason::NoAcceptedSnapshot,
+                },
+                VehicleRosterSelection::NoSource {
+                    source_id: Some(VehicleSourceId::new("mg90-b").unwrap()),
+                    reason: VehicleNoSourceReason::NoAcceptedSnapshot,
+                },
+            ]
+        );
     }
 
     #[test]
