@@ -1,7 +1,7 @@
 //! Messages mode — a Markdown conversation timeline
 //! ([`ConversationTimeline`](mde_collab_types::ConversationTimeline)) with
 //! anchored threads ([`ThreadTimeline`](mde_collab_types::ThreadTimeline)), a
-//! multiline composer whose <kbd>Ctrl</kbd>+<kbd>Enter</kbd> emits
+//! multiline composer whose <kbd>Ctrl</kbd>/<kbd>Command</kbd>+<kbd>Enter</kbd> emits
 //! [`SendMessage`](mde_collab_types::CollabCommand::SendMessage) with a
 //! locally-persisted draft, honest delivery state, and an edit/delete affordance
 //! that reflects the core's five-minute author window (spec §3). Shared message
@@ -827,7 +827,7 @@ impl CommunicationsSurface {
         }
     }
 
-    /// The main-timeline composer. <kbd>Ctrl</kbd>+<kbd>Enter</kbd> (or the Send
+    /// The main-timeline composer. <kbd>Ctrl</kbd>/<kbd>Command</kbd>+<kbd>Enter</kbd> (or the Send
     /// glyph) emits
     /// [`SendMessage`](CollabCommand::SendMessage); the draft persists locally,
     /// keyed by space, so switching away and back never loses it, and it clears
@@ -845,14 +845,19 @@ impl CommunicationsSurface {
                     .desired_width(f32::INFINITY)
                     .desired_rows(3)
                     .char_limit(MAX_MESSAGE_BODY_BYTES)
-                    .hint_text("Message  ·  Ctrl+Enter to send"),
+                    .hint_text("Message  ·  Ctrl/Command+Enter to send"),
             );
             let (plain_enter, ctrl_enter) = composer_enter_state(ui);
             insert_newline_if_text_edit_did_not(&resp, plain_enter, newline_count_before, &mut buf);
             if (resp.lost_focus() || resp.has_focus()) && ctrl_enter {
                 send = true;
             }
-            if icons::icon_button(ui, icons::SEND, Style::SP_M, Style::ACCENT, "Send").clicked() {
+            let send_response =
+                icons::icon_button(ui, icons::SEND, Style::SP_M, Style::ACCENT, "Send message");
+            send_response.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), "Send message")
+            });
+            if send_response.clicked() {
                 send = true;
             }
         });
@@ -964,7 +969,7 @@ impl CommunicationsSurface {
         }
     }
 
-    /// The thread reply composer. <kbd>Ctrl</kbd>+<kbd>Enter</kbd> (or the Send
+    /// The thread reply composer. <kbd>Ctrl</kbd>/<kbd>Command</kbd>+<kbd>Enter</kbd> (or the Send
     /// glyph) emits
     /// [`ReplyInThread`](CollabCommand::ReplyInThread) with a per-thread draft.
     fn thread_composer(
@@ -986,16 +991,19 @@ impl CommunicationsSurface {
                     .desired_width(f32::INFINITY)
                     .desired_rows(3)
                     .char_limit(MAX_MESSAGE_BODY_BYTES)
-                    .hint_text("Reply in thread  ·  Ctrl+Enter to send"),
+                    .hint_text("Reply in thread  ·  Ctrl/Command+Enter to send"),
             );
             let (plain_enter, ctrl_enter) = composer_enter_state(ui);
             insert_newline_if_text_edit_did_not(&resp, plain_enter, newline_count_before, &mut buf);
             if (resp.lost_focus() || resp.has_focus()) && ctrl_enter {
                 send = true;
             }
-            if icons::icon_button(ui, icons::SEND, Style::SP_M, Style::ACCENT, "Send reply")
-                .clicked()
-            {
+            let send_response =
+                icons::icon_button(ui, icons::SEND, Style::SP_M, Style::ACCENT, "Send reply");
+            send_response.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), "Send reply")
+            });
+            if send_response.clicked() {
                 send = true;
             }
         });
@@ -1072,12 +1080,17 @@ fn task_title_notice(ui: &mut egui::Ui) {
 }
 
 fn composer_enter_state(ui: &egui::Ui) -> (bool, bool) {
-    ui.input(|input| {
-        let enter = input.key_pressed(egui::Key::Enter);
-        let ctrl_enter = enter && input.modifiers.ctrl;
-        let plain_enter = enter && !input.modifiers.ctrl && !input.modifiers.command;
-        (plain_enter, ctrl_enter)
-    })
+    ui.input(|input| composer_enter_state_for(input.key_pressed(egui::Key::Enter), input.modifiers))
+}
+
+/// Resolve the platform's primary Enter shortcut without changing the typed
+/// command contract: Ctrl+Enter remains the Dell/Linux path and Command+Enter
+/// is its native macOS equivalent. Plain Enter always remains a newline in the
+/// multiline composer.
+fn composer_enter_state_for(enter: bool, modifiers: egui::Modifiers) -> (bool, bool) {
+    let primary_enter = enter && (modifiers.ctrl || modifiers.command);
+    let plain_enter = enter && !modifiers.ctrl && !modifiers.command;
+    (plain_enter, primary_enter)
 }
 
 fn newline_count(value: &str) -> usize {
@@ -1304,11 +1317,12 @@ const fn delivery_label(delivery: DeliveryState) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        cap_message_input, channel_find_messages, for_each_markdown_chunk,
-        message_matches_channel_find, LocalReaction, MAX_MARKDOWN_LAYOUT_CHARS,
-        MAX_MESSAGE_BODY_BYTES,
+        cap_message_input, channel_find_messages, composer_enter_state_for,
+        for_each_markdown_chunk, message_matches_channel_find, LocalReaction,
+        MAX_MARKDOWN_LAYOUT_CHARS, MAX_MESSAGE_BODY_BYTES,
     };
     use mde_collab_types::{ActorId, DeliveryState, EventId, MessageView};
+    use mde_egui::egui;
 
     #[test]
     fn message_input_cap_is_utf8_safe_at_the_oversized_action_boundary() {
@@ -1414,6 +1428,42 @@ mod tests {
         assert_eq!(
             LocalReaction::ALL.map(LocalReaction::label),
             ["Ack", "Check", "Watch"]
+        );
+    }
+
+    #[test]
+    fn composer_primary_enter_sends_for_ctrl_and_command_but_plain_enter_newlines() {
+        assert_eq!(
+            composer_enter_state_for(true, egui::Modifiers::default()),
+            (true, false),
+            "plain Enter remains the multiline newline action"
+        );
+        assert_eq!(
+            composer_enter_state_for(
+                true,
+                egui::Modifiers {
+                    ctrl: true,
+                    ..Default::default()
+                }
+            ),
+            (false, true),
+            "Ctrl+Enter remains the desktop send shortcut"
+        );
+        assert_eq!(
+            composer_enter_state_for(
+                true,
+                egui::Modifiers {
+                    command: true,
+                    ..Default::default()
+                }
+            ),
+            (false, true),
+            "Command+Enter is the native primary send shortcut"
+        );
+        assert_eq!(
+            composer_enter_state_for(false, egui::Modifiers::default()),
+            (false, false),
+            "an unrelated frame cannot activate either Enter action"
         );
     }
 }
