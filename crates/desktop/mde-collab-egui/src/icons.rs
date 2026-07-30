@@ -1,12 +1,11 @@
-//! The Communications surface's **Mackes-Carbon** icon standard.
+//! The Communications surface's registry-backed icon mappings.
 //!
-//! Carbon is the canonical platform icon set (see [`mde_egui::carbon`]); this
-//! surface paints *every* glyph through the shared loader — no glyph text, no
-//! hand-stroked vectors. This module is the single place each surface concept
-//! (a space kind, a mode tab, a delivery state, a call control) is mapped to a
-//! registered Carbon glyph name, so a test can iterate [`ALL_COLLAB_ICONS`] and
-//! assert the whole set is embedded + rasterizes (mirroring the browser chrome's
-//! `every_chrome_icon_maps_to_a_registered_carbon_glyph`).
+//! Carbon is not required; retained compatible SVGs and replacements share the
+//! same loader. This surface paints *every* glyph through the shared registry —
+//! no glyph text, no hand-stroked vectors. This module is the single place each
+//! surface concept (a space kind, a mode tab, a delivery state, a call control)
+//! is mapped to a registered name, so tests can assert the whole set is embedded
+//! and rasterizes.
 
 use mde_egui::egui;
 

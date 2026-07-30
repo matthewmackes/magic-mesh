@@ -1,8 +1,9 @@
-//! **Mackes-Carbon** — the shared SVG icon loader for every E12 surface.
+//! **Registry-backed SVG icons** — the shared loader for every E12 surface.
 //!
-//! Mackes-Carbon is the canonical platform icon set: IBM Carbon repackaged as a
-//! freedesktop SVG theme (`assets/icons/Mackes-Carbon`, freedesktop
-//! Icon-Naming-Spec names — `go-previous`, `view-refresh`, `bookmark-new`, …).
+//! The registry retains Mackes-Carbon-compatible artwork where it is useful and
+//! license-cleared, but Carbon is not a platform requirement. Assets are
+//! addressed by freedesktop Icon-Naming-Spec names — `go-previous`,
+//! `view-refresh`, `bookmark-new`, … — so replacements can use the same seam.
 //! Every glyph is authored `fill="currentColor"`, so one embedded glyph serves
 //! every tint: this loader rasterizes the vector artwork to a coverage **alpha
 //! mask** and multiplies that mask by the caller's [`Color32`], the classic
@@ -11,7 +12,7 @@
 //! # Why a shared loader
 //!
 //! The shell used to PAINT its chrome icons procedurally (one hand-rolled
-//! `match` arm per glyph). That does not scale to a platform-wide icon standard.
+//! `match` arm per glyph). That does not scale to a platform-wide icon registry.
 //! This module is the reusable foundation every surface builds on:
 //!
 //! - a central **name → SVG bytes** registry ([`carbon_svg_bytes`]) of the
@@ -31,7 +32,7 @@
 //! are flat single-color `<path>` artwork with no `<text>`, so `resvg` is built
 //! without its `text`/`fontdb` features.
 
-// The public entry points intentionally repeat the module name (`carbon_icon`,
+// The public entry points retain the compatibility module name (`carbon_icon`,
 // `carbon_texture`, `paint_carbon`): they are the platform icon-standard API and
 // read best fully qualified from another crate (`mde_egui::carbon::carbon_icon`)
 // or through the re-exports.
@@ -42,7 +43,8 @@ use egui::{
 };
 use resvg::{tiny_skia, usvg};
 
-/// The curated Mackes-Carbon subset embedded into the binary, as a
+/// The curated registry subset embedded into the binary, including retained
+/// Mackes-Carbon-compatible artwork, as a
 /// `name → SVG bytes` registry. `name` is the freedesktop
 /// (or, for a handful sourced from the raw Carbon library, the Carbon) glyph
 /// name; the bytes are the exact `currentColor` SVG source. Extend this table as
@@ -193,7 +195,7 @@ static REGISTRY: &[(&str, &[u8])] = &[
     ),
 ];
 
-/// Look up the embedded SVG source for a Mackes-Carbon glyph `name`.
+/// Look up the embedded SVG source for a registry glyph `name`.
 ///
 /// Returns `None` for a name that is not in the curated embedded subset — the
 /// caller falls back (e.g. a procedural draw) rather than panicking, which keeps
@@ -213,7 +215,7 @@ pub fn carbon_names() -> impl Iterator<Item = &'static str> {
     REGISTRY.iter().map(|(key, _)| *key)
 }
 
-/// A rasterized Carbon glyph — plain RGBA8 with *straight* (unmultiplied) alpha,
+/// A rasterized registry glyph — plain RGBA8 with *straight* (unmultiplied) alpha,
 /// row-major, sized for [`egui::ColorImage::from_rgba_unmultiplied`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CarbonRaster {
@@ -237,7 +239,7 @@ impl CarbonRaster {
     }
 }
 
-/// Rasterize a Mackes-Carbon glyph to a `color`-tinted RGBA buffer `size_px`
+/// Rasterize a registry glyph to a `color`-tinted RGBA buffer `size_px`
 /// tall (width follows the source aspect ratio).
 ///
 /// **Tinting is an alpha-mask multiply.** The glyph's `currentColor` is

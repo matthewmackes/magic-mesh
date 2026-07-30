@@ -500,8 +500,10 @@ remains here under a completed status.
   partial foundations, but the direct DRM seat path and complete bidirectional
   protocol integration are not production-complete. DRM/VNC clipboard state
   handling, a bounded UTF-8-safe local text provider, and explicit RDP/SPICE
-  capability reporting now have focused farm coverage; real mesh history/KDC
-  materialization and RDP/SPICE text channels remain unsupported.
+  capability reporting now have focused farm coverage. KDC/mobile ingress now
+  has typed authorization, UTF-8/1 MiB bounds, peer-scoped deduplication, and
+  honest metadata with 22 focused farm tests; real mesh history/materialization
+  and RDP/SPICE text channels remain unsupported.
 - Remaining work:
 
   1. Map direct-seat shortcuts into `egui::Event::{Copy,Cut,Paste}`, consume
@@ -583,14 +585,14 @@ remains here under a completed status.
   replace placeholders. Carbon requirements retire while egui, shared `Style`,
   Construct, Car, and direct DRM remain governed.
 - Current state: `mackesd` still assumes one managed MG90/direct Ethernet and
-  publishes collapsed legacy radio state; the live unit reports LTE/WAN and
-  power but no GNSS fix, and OBD parsing is absent. Raster MBTiles/FTS5 search
+  publishes collapsed legacy radio state; the live unit reports LTE/WAN and power but no GNSS fix; OBD parsing is absent. Raster MBTiles/FTS5 search
   serve one region. Maps owns basemap/search seams, but Valhalla, route/lane/
   speed helpers, bearing, and several admin actions remain unwired. A typed v2
   identity/radio/freshness/provenance baseline dual-publishes beside v1, with
   11 mesh-type and 69 worker tests passing. Maps/Car now projects bounded radio
-  presence, operation, GNSS/radio freshness, and retained age; four consumer
-  tests pass. The vehicle worker now also has a bounded MG90/manager roster
+  presence, operation, GNSS/radio freshness, retained age, provenance, and
+  typed Current/Stale/Resyncing/Unavailable mirror state; 13 consumer tests
+  pass. The vehicle worker now also has a bounded MG90/manager roster
   with independent poll/heartbeat plans, deterministic latest-wins selection,
   and explicit no-source results; the complete vehicle gate has 42 passing
   tests. Multiple live adapters and route/render cutover remain.
@@ -778,10 +780,8 @@ remains here under a completed status.
 - Problem: Shared Quazar fonts, light/dark palettes, style primitives, and some
   surface migrations exist, but user-facing egui workspaces still drift in app
   frames, navigation, state presentation, sheets/popovers, tooltips, motion,
-  icons, tables, and internal Editor/Terminal chrome. Current authority still
-  mandates Carbon-derived platform icons after the operator retired that
-  requirement. Older scope also assumes a host Browser chrome exception that
-  conflicts with WL-ARCH-008.
+  icons, tables, and internal Editor/Terminal chrome. Older scope also assumes
+  a host Browser chrome exception that conflicts with WL-ARCH-008.
 - Required outcome: Every Construct-owned egui surface reads as one dense,
   HIG-principled Quazar platform in Dark and Light: common app frame,
   navigation, state components, sheets/popovers, typography, icons, motion, and
@@ -796,9 +796,10 @@ remains here under a completed status.
 - Current state: Kdam Thmor Pro, Quazar Light, shared typography/palette
   projection, themed tooltip cleanup, and governance alignment have landed.
   Core `mde-egui` navigation, sheet, popover, motion, style, and capture
-  primitives exist. The governance and icon-registry comments still carry a
-  Mackes-Carbon V2 lock. The archived progress ledger records completed slices;
-  an authority cleanup and full surface/internal-chrome adoption sweep remain.
+  primitives exist. Current authority now makes Carbon optional and requires a
+  shared registry/license audit; the `mde-egui` farm gate has 257 tests passing.
+  The archived progress ledger records completed slices; full
+  surface/internal-chrome adoption remains.
 - Remaining work:
 
   1. Reconcile `AI_GOVERNANCE.md` and the current platform-interface authority
@@ -995,12 +996,12 @@ remains here under a completed status.
   overflow bounds, versioned ordered pin persistence, canonical focused-surface
   underlining, and a tested slide/melt transition. Start dispatches to the
   existing Front Door search/focus path, and the old group labels/pill geometry
-  are gone. The taskbar persistence and geometry slice has 26 focused tests
-  passing. `springboard.rs` still owns grid layout, labels, keyboard selection,
-  zoom ghosts, and tile activation; first-boot selection, pin/unpin controls,
-  overflow flyout, and Fleet & Mesh/Workloads exposure remain open.
-  `Surface::FleetMesh` exists; Workloads retains the internal
-  `Surface::InfraCode` identifier and an obsolete public label.
+  are gone. The taskbar persistence and geometry slice has 27 focused navigation
+  tests plus one Front Door pin test passing. `springboard.rs` still owns grid/
+  selection/tile presentation; first-boot selection, overflow flyout, and
+  Fleet & Mesh/Workloads exposure remain open; `Surface::FleetMesh` exists while
+  Workloads retains the internal `Surface::InfraCode` identifier and an obsolete
+  public label.
 - Remaining work:
 
   1. Reconcile taskbar-specific authority after WL-UX-009 retires the global

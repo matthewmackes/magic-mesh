@@ -108,11 +108,14 @@ workload-provider APIs are never exposed as a second public control plane.
   requirements live in the single authority doc
   **`docs/design/platform-interfaces.md`**. Structure is iPadOS-derived with
   macOS pointer manners; identity is Quazar with production Dark and Light
-  appearances; the **Mackes-Carbon icon set is kept platform-wide**. **Icon V2
+  appearances; iconography is governed by the shared registry, semantic state,
+  and license audit. **Carbon is neither a theme nor an icon requirement.**
+  Retained Mackes-Carbon-compatible SVGs remain available as one registry source,
+  but replacements may use any license-cleared, legible linework. **Icon V2
   lock (operator survey 2026-07-26):** core platform app/service/role icons use
-  Carbon-derived simple linework with exactly three adapted product/service
-  colors and no icon plates; toolbar/action/status icons remain monochrome and
-  are color-coded by semantic state. The
+  simple linework with at most three adapted product/service colors and no icon
+  plates; toolbar/action/status icons remain monochrome and are color-coded by
+  semantic state. The
   2026-07-26 operator lock intentionally keeps a Construct **Dock** and an
   icon-free Bing-wallpaper Home. All other interface-paradigm design docs are
   retired to `docs/design-archive/`. Do not re-introduce a bottom taskbar, tray
@@ -125,7 +128,7 @@ workload-provider APIs are never exposed as a second public control plane.
   Carbon-token lint gate — the shared `Style` module is the discipline.)*
 - **Browser workspace exception (operator 2026-07-15).** Browser chrome,
   Bookmarks, engine controls, tabs, toolbar, menus, and Browser page/action
-  surfaces are **not** constrained by Carbon wording and should apply Material
+  surfaces may apply Material
   Design 3 principles locally: adaptive layouts, clear top-app-bar/tab hierarchy,
   tonal surfaces/elevation, explicit interaction states, accessible focus/contrast,
   and purposeful motion. This is a Browser-only design direction, not permission
@@ -239,7 +242,7 @@ when it is **runtime-reachable and observably works** — no `todo!()`/
 `unimplemented!()`, no stub match arms, no `pub mod` with zero external refs, no
 mockups/`demo_data` passing as features. Builds clean, tests green, clippy + fmt
 clean. *(The E11 visual-confirmation gate was already lifted; under E12 the
-look-source is the shared egui `Style` module rather than Carbon tokens, but the
+  look-source is the shared egui `Style` module rather than a legacy token set, but the
 runtime-reachability bar is unchanged — `/preview` stays optional/best-effort.)*
 
 ## §8 — Positioning & trust envelope

@@ -1,7 +1,8 @@
 # PLATFORM-INTERFACES — Construct + Car, the two platform interfaces (Apple-HIG-principled)
 
 > **THE interface design authority.** Design locks from the 50-question operator
-> survey, 2026-07-22. This document defines the requirements for the platform's
+> survey, 2026-07-22, amended by the 2026-07-26/29 authority cleanup. This
+> document defines the requirements for the platform's
 > only two interfaces — **Construct** (the workstation) and **Car** — under the
 > platform design standard, **Apple's Human Interface Guidelines applied as
 > principles** (<https://developer.apple.com/design/human-interface-guidelines>).
@@ -28,11 +29,13 @@ bar. The Dock is governed launcher chrome, not a taskbar revival.
 The HIG is applied as **principles, not pixels** (survey Q1). We do not imitate
 Apple's appearance; we hold every surface to the HIG's quality bar, implemented
 through the shared `mde-egui` `Style`/`Motion` modules (the sole look source,
-§4) and the Mackes-Carbon icon set (kept, operator lock). The 2026-07-26 icon
-V2 survey sets the icon treatment: core platform app/service/role icons use
-simple Carbon-derived linework with exactly three adapted
-product/service-associated colors and no plates; toolbar/action/status icons
-remain monochrome and are color-coded by semantic state. The airgapped-safe
+§4) and the shared icon registry. Carbon is neither a theme nor an icon
+requirement; retained Mackes-Carbon-compatible SVGs are one optional registry
+source, alongside license-cleared replacements. The 2026-07-26 icon V2 survey
+sets the icon treatment: core platform app/service/role icons use simple
+linework with at most three adapted product/service-associated colors and no
+plates; toolbar/action/status icons remain monochrome and are color-coded by
+semantic state. The airgapped-safe
 distillation below is the in-repo statement of the standard; per-requirement
 citations name the HIG section they derive from (survey Q43: both).
 
@@ -89,7 +92,7 @@ Construct is the seat experience of `mde-shell-egui`: DRM-native, egui-only,
 full-screen-first. Structure is iPadOS-derived; pointer/keyboard manners are
 macOS-derived (Q2). Identity is Quazar: Dark starts from `Style::BG #16161A`,
 Light is a production first-class appearance, both share azure accent
-`#5B8CFF`, the categorical group accents, and Carbon glyphs.
+`#5B8CFF`, the categorical group accents, and registry-backed glyphs.
 
 ### 2.1 Foundation locks
 
@@ -289,7 +292,9 @@ bindings (`CarAction`) re-map accordingly; Music gains media-transport keys.
   the Browser remains the one Material island; HIG principles govern
   everything else.
 - **Governance (Q41):** §4 names the HIG-principles standard and this doc;
-  ADR appended to `docs/DECISIONS.md`. Carbon **icon set** kept platform-wide.
+  ADR appended to `docs/DECISIONS.md`. Carbon is not a required theme or icon
+  source; every retained or replacement asset goes through the shared registry
+  and license audit.
 
 ## 6. Delivery (Q45–Q49)
 

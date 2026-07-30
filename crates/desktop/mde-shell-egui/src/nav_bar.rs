@@ -63,6 +63,10 @@ pub(crate) enum Action {
     ToggleDock,
     /// Open one docked app surface.
     OpenSurface(Surface),
+    /// Add a catalogued surface to the taskbar, preserving existing order.
+    PinSurface(Surface),
+    /// Remove a catalogued surface from the taskbar, preserving the survivors' order.
+    UnpinSurface(Surface),
     /// Open a chooser-pinned remote desktop source through the normal chooser
     /// authentication and VDI hand-off path.
     DesktopSource(String),
@@ -284,6 +288,47 @@ impl State {
         self.save();
     }
 
+    /// The current ordered taskbar catalog, suitable for the Front Door's
+    /// personalization affordance. The slice is always bounded by the
+    /// catalog decoder and the mutation methods below.
+    pub(crate) fn pinned_surfaces(&self) -> &[Surface] {
+        &self.pinned_surfaces
+    }
+
+    /// Pin one launchable catalog surface at the end of the existing order.
+    /// Non-catalog surfaces (including protected chrome aliases) are rejected
+    /// before they can reach persistence or geometry.
+    pub(crate) fn pin_surface(&mut self, surface: Surface) -> bool {
+        if !Surface::ALL.contains(&surface)
+            || self.pinned_surfaces.contains(&surface)
+            || self.pinned_surfaces.len() >= MAX_PINNED_SURFACES
+        {
+            return false;
+        }
+        self.pinned_surfaces.push(surface);
+        self.save();
+        true
+    }
+
+    /// Unpin one launchable catalog surface. Start/Back/Home/placement are
+    /// represented by controls rather than surfaces, so they have no mutation
+    /// path and cannot be removed by accident.
+    pub(crate) fn unpin_surface(&mut self, surface: Surface) -> bool {
+        if !Surface::ALL.contains(&surface) {
+            return false;
+        }
+        let Some(index) = self
+            .pinned_surfaces
+            .iter()
+            .position(|item| *item == surface)
+        else {
+            return false;
+        };
+        self.pinned_surfaces.remove(index);
+        self.save();
+        true
+    }
+
     fn toggle_mode(&mut self, now: Instant, motion: MotionMode) {
         let from = self.mode;
         let to = match from {
@@ -443,11 +488,16 @@ impl State {
                         label.as_str(),
                         self.is_docked(),
                     );
-                    let _response = response.on_hover_ui(move |ui| {
+                    let _response = response.clone().on_hover_ui(move |ui| {
                         nav_bar_tooltip(ui, label.as_str());
                     });
                     if clicked {
                         action = Some(control_action(*control, pinned_sources));
+                    }
+                    if let Some(menu_action) =
+                        taskbar_context_menu(&response, *control, &self.pinned_surfaces)
+                    {
+                        action = Some(menu_action);
                     }
                 }
             });
@@ -1166,6 +1216,49 @@ fn control_action(
     control.kind.action()
 }
 
+fn taskbar_context_menu(
+    response: &egui::Response,
+    control: Control,
+    pinned_surfaces: &[Surface],
+) -> Option<Action> {
+    let mut action = None;
+    response.context_menu(|ui| {
+        if control.kind == ControlKind::Pin {
+            ui.label(Style::typography_text(
+                "Taskbar apps",
+                TypographyRole::Label,
+            ));
+            for surface in Surface::ALL {
+                let pinned = pinned_surfaces.contains(&surface);
+                let label = if pinned {
+                    format!("Unpin {} from taskbar", surface.label())
+                } else {
+                    format!("Pin {} to taskbar", surface.label())
+                };
+                if ui.button(label).clicked() {
+                    action = Some(if pinned {
+                        Action::UnpinSurface(surface)
+                    } else {
+                        Action::PinSurface(surface)
+                    });
+                    ui.close_menu();
+                }
+            }
+        } else if let Some(surface) = control.surface {
+            if Surface::ALL.contains(&surface) && pinned_surfaces.contains(&surface) {
+                if ui
+                    .button(format!("Unpin {} from taskbar", surface.label()))
+                    .clicked()
+                {
+                    action = Some(Action::UnpinSurface(surface));
+                    ui.close_menu();
+                }
+            }
+        }
+    });
+    action
+}
+
 fn install_accessibility(
     ctx: &egui::Context,
     mode: DockMode,
@@ -1552,6 +1645,21 @@ mod tests {
             decode_pinned_surfaces(&decoded.pinned_surfaces),
             vec![Surface::Browser, Surface::MapsLocation]
         );
+    }
+
+    #[test]
+    fn taskbar_pin_actions_are_bounded_ordered_and_reject_non_catalog_surfaces() {
+        let mut state = State::default();
+        let original = state.pinned_surfaces().to_vec();
+        assert!(state.pin_surface(Surface::FleetMesh));
+        assert_eq!(state.pinned_surfaces().last(), Some(&Surface::FleetMesh));
+        assert!(!state.pin_surface(Surface::FleetMesh));
+        assert!(!state.pin_surface(Surface::Workbench));
+        assert!(!state.pin_surface(Surface::AutoHome));
+        assert!(state.unpin_surface(Surface::FleetMesh));
+        assert_eq!(state.pinned_surfaces(), original.as_slice());
+        assert!(!state.unpin_surface(Surface::Workbench));
+        assert!(!state.unpin_surface(Surface::AutoHome));
     }
 
     #[test]

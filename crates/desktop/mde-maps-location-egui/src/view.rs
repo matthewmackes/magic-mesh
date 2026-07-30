@@ -12,8 +12,9 @@ use crate::model::{
     LocationSource, LocationSourceKind, MapViewState, Mg90ManagementMethod, Mg90SettingCategory,
     Mg90SettingDescriptor, Mg90State, OfflineMapManagerState, OfflineNavigationReadiness,
     OfflineNavigationStatus, ProviderContract, RouteOption, RoutePlan, RouteTraffic,
-    SettingValueType, SetupStep, SourceStatus, TripRecorderState, VehicleRadioAvailability,
-    VehicleRadioHealth, VehicleRadioOperation, VehicleRadioPresence, VehicleState, WorkspaceTab,
+    SettingValueType, SetupStep, SourceStatus, TripRecorderState, VehicleMirrorState,
+    VehicleMirrorStatus, VehicleRadioAvailability, VehicleRadioHealth, VehicleRadioOperation,
+    VehicleRadioPresence, VehicleState, WorkspaceTab,
 };
 use crate::MapsLocationSurface;
 
@@ -3754,7 +3755,12 @@ fn show_admin(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
     ui.add_space(Style::SP_S);
 
     match state.admin_section {
-        AdminSection::Vehicle => show_vehicle(ui, &state.vehicle, &state.vehicle_radio_health),
+        AdminSection::Vehicle => show_vehicle(
+            ui,
+            &state.vehicle,
+            &state.vehicle_radio_health,
+            &state.vehicle_mirror_status,
+        ),
         AdminSection::Connectivity => show_connectivity(ui, &state.mg90),
         AdminSection::DevicesIo => show_devices_io(ui, &mut state.devices),
         AdminSection::LocationSources => show_location_sources(ui, &mut state.locations),
@@ -3877,12 +3883,17 @@ fn admin_section_item_id(section: AdminSection) -> egui::Id {
     egui::Id::new(("maps-location-admin-section", section.label()))
 }
 
-fn show_vehicle(ui: &mut egui::Ui, vehicle: &VehicleState, radio_health: &VehicleRadioHealth) {
+fn show_vehicle(
+    ui: &mut egui::Ui,
+    vehicle: &VehicleState,
+    radio_health: &VehicleRadioHealth,
+    mirror_status: &VehicleMirrorStatus,
+) {
     let telem = &vehicle.telemetry;
     // Every telemetry readout rides the live-mirror gate (Q33): a surface with
     // no telemetry source dashes — 0 rpm / 0.0 V / "OFF" are readings, and a
     // sourceless surface has none to report.
-    let live = telem.is_live();
+    let live = mirror_status.state.is_current() && telem.is_live();
     // Vehicle identity header.
     ui.horizontal(|ui| {
         let (rect, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
@@ -3894,6 +3905,8 @@ fn show_vehicle(ui: &mut egui::Ui, vehicle: &VehicleState, radio_health: &Vehicl
                 .color(Style::TEXT_STRONG),
         );
     });
+    ui.add_space(Style::SP_S);
+    vehicle_mirror_status_card(ui, mirror_status);
     ui.add_space(Style::SP_S);
     // Hero gauges — the four live readouts that matter at a glance.
     let tile_w = split_width(ui, 4);
@@ -4024,6 +4037,87 @@ fn show_vehicle(ui: &mut egui::Ui, vehicle: &VehicleState, radio_health: &Vehicl
     );
     ui.add_space(Style::SP_S);
     radio_health_card(ui, radio_health);
+}
+
+fn vehicle_mirror_status_card(ui: &mut egui::Ui, status: &VehicleMirrorStatus) {
+    let tone = mirror_status_tone(status.state);
+    glyph_card(
+        ui,
+        "cloud-service-management",
+        "Vehicle mirror",
+        tone,
+        |ui| {
+            ui.horizontal_wrapped(|ui| {
+                pill(ui, status.state.label(), tone);
+                if status.has_retained_snapshot() && !status.state.is_current() {
+                    pill(ui, "cached values retained", Style::WARN);
+                }
+            });
+            if let Some(provenance) = status.provenance.as_ref() {
+                readout(
+                    ui,
+                    "Management node",
+                    &provenance.management_node_id,
+                    Style::TEXT,
+                );
+                if let Some(mg90_id) = provenance.mg90_id.as_deref() {
+                    readout(ui, "MG90", mg90_id, Style::TEXT);
+                }
+                readout(
+                    ui,
+                    "Source",
+                    snapshot_source_label(provenance.source),
+                    Style::TEXT_DIM,
+                );
+                if let Some(source_id) = provenance.source_id.as_deref() {
+                    readout(ui, "Source ID", source_id, Style::TEXT_DIM);
+                }
+                if let Some(relay) = provenance.relay.as_deref() {
+                    readout(ui, "Relay", relay, Style::TEXT_DIM);
+                }
+            }
+            readout(
+                ui,
+                "Snapshot age",
+                &status.age_label(),
+                freshness_tone_for_mirror(status.state),
+            );
+            if let Some(sequence) = status.sequence {
+                readout(ui, "Sequence", &sequence.to_string(), Style::TEXT_DIM);
+            }
+            if let Some(reason) = status.reason.as_deref() {
+                readout(ui, "Reason", reason, tone);
+            }
+            if !status.state.is_current() {
+                mde_egui::widgets::muted_note(
+                ui,
+                "Retained vehicle values are diagnostic only; live telemetry is unavailable until a current snapshot arrives.",
+            );
+            }
+        },
+    );
+}
+
+fn snapshot_source_label(source: mackes_mesh_types::vehicle::SnapshotSource) -> &'static str {
+    match source {
+        mackes_mesh_types::vehicle::SnapshotSource::DirectGateway => "Direct gateway",
+        mackes_mesh_types::vehicle::SnapshotSource::MeshRelay => "Mesh relay",
+        mackes_mesh_types::vehicle::SnapshotSource::Unknown => "Unknown",
+    }
+}
+
+fn mirror_status_tone(state: VehicleMirrorState) -> Color32 {
+    match state {
+        VehicleMirrorState::Current => Style::OK,
+        VehicleMirrorState::StaleRetained | VehicleMirrorState::ResyncingNoFreshSnapshot => {
+            Style::WARN
+        }
+        VehicleMirrorState::UnavailableMalformed => Style::TEXT_DIM,
+    }
+}
+
+fn freshness_tone_for_mirror(state: VehicleMirrorState) -> Color32 {
+    mirror_status_tone(state)
 }
 
 fn radio_health_card(ui: &mut egui::Ui, health: &VehicleRadioHealth) {
@@ -6836,18 +6930,24 @@ mod tests {
     }
 
     /// Every string painted by the Vehicle tab body without workspace scrolling.
-    fn vehicle_texts(vehicle: &VehicleState, radio_health: &VehicleRadioHealth) -> Vec<String> {
+    fn vehicle_texts(
+        vehicle: &VehicleState,
+        radio_health: &VehicleRadioHealth,
+        mirror_status: &VehicleMirrorStatus,
+    ) -> Vec<String> {
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let input = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(
                 egui::pos2(0.0, 0.0),
-                egui::vec2(1280.0, 1200.0),
+                egui::vec2(1280.0, 2400.0),
             )),
             ..Default::default()
         };
         let out = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| show_vehicle(ui, vehicle, radio_health));
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_vehicle(ui, vehicle, radio_health, mirror_status);
+            });
         });
         let mut texts = Vec::new();
         for clipped in &out.shapes {
@@ -6863,7 +6963,11 @@ mod tests {
         // The fixture profile remains explicitly identified, but none of its
         // numeric CAN/OBD seed values may look like live instruments.
         let simulated = MapsLocationSurface::simulated();
-        let simulated_texts = vehicle_texts(&simulated.vehicle, &simulated.vehicle_radio_health);
+        let simulated_texts = vehicle_texts(
+            &simulated.vehicle,
+            &simulated.vehicle_radio_health,
+            &simulated.vehicle_mirror_status,
+        );
         assert!(simulated_texts
             .iter()
             .any(|text| text == "simulated CAN/OBD profile"));
@@ -6897,7 +7001,11 @@ mod tests {
         mirror.published_at_ms = test_now_ms();
         let mut live = MapsLocationSurface::live();
         live.refresh_from_vehicle(&mirror);
-        let fresh_texts = vehicle_texts(&live.vehicle, &live.vehicle_radio_health);
+        let fresh_texts = vehicle_texts(
+            &live.vehicle,
+            &live.vehicle_radio_health,
+            &live.vehicle_mirror_status,
+        );
         for reading in ["62", "2100", "91", "13.9", "64%", "78214 mi", "42 min"] {
             assert!(
                 fresh_texts.iter().any(|text| text == reading),
@@ -6909,10 +7017,18 @@ mod tests {
         // disappear, but confidence + a warning-age remain diagnostic evidence.
         mirror.published_at_ms = test_now_ms() - 6_000;
         live.refresh_from_vehicle(&mirror);
-        let stale_texts = vehicle_texts(&live.vehicle, &live.vehicle_radio_health);
+        let stale_texts = vehicle_texts(
+            &live.vehicle,
+            &live.vehicle_radio_health,
+            &live.vehicle_mirror_status,
+        );
         assert!(stale_texts
             .iter()
             .any(|text| text.starts_with("live vehicle-gateway mirror")));
+        assert!(stale_texts.iter().any(|text| text == "Stale retained"));
+        assert!(stale_texts
+            .iter()
+            .any(|text| text == "cached values retained"));
         assert!(stale_texts
             .iter()
             .any(|text| text.ends_with(" s ago") && text != "0.0 s ago"));
@@ -6927,7 +7043,8 @@ mod tests {
     #[test]
     fn vehicle_view_renders_typed_presence_operation_reason_and_freshness() {
         use mackes_mesh_types::vehicle::{
-            VehicleState as WireVehicleState, VehicleStateV2, VehicleTelem,
+            SnapshotProvenance, SnapshotSource, VehicleState as WireVehicleState, VehicleStateV2,
+            VehicleTelem,
         };
 
         let mut legacy = WireVehicleState::offline("rig-1");
@@ -6937,6 +7054,7 @@ mod tests {
         legacy.mgos_version = "4.3.0.1".to_string();
         legacy.wan.active_wan = "Cellular A".to_string();
         legacy.wan.cellular_a.sim_state = "ready".to_string();
+        legacy.wan.cellular_a.healthy = true;
         legacy.telem = VehicleTelem::default();
         legacy.published_at_ms = test_now_ms();
         let snapshot = VehicleStateV2::from_v1(
@@ -6945,12 +7063,23 @@ mod tests {
             3,
             5_000,
             legacy.published_at_ms,
-            mackes_mesh_types::vehicle::SnapshotProvenance::default(),
+            SnapshotProvenance {
+                source: SnapshotSource::DirectGateway,
+                source_id: Some("rig-1".to_string()),
+                relay: None,
+            },
         );
 
         let mut surface = MapsLocationSurface::live();
         surface.refresh_from_vehicle_v2(&snapshot);
-        let texts = vehicle_texts(&surface.vehicle, &surface.vehicle_radio_health);
+        let texts = vehicle_texts(
+            &surface.vehicle,
+            &surface.vehicle_radio_health,
+            &surface.vehicle_mirror_status,
+        );
+        assert!(texts.iter().any(|text| text == "Current"));
+        assert!(texts.iter().any(|text| text == "Management node"));
+        assert!(texts.iter().any(|text| text == "Direct gateway"));
         assert!(texts.iter().any(|text| text == "Installed"));
         assert!(texts.iter().any(|text| text == "Unknown"));
         assert!(texts.iter().any(|text| text == "Active"));
@@ -6958,7 +7087,11 @@ mod tests {
         assert!(texts.iter().any(|text| text == "degraded"));
 
         let empty = MapsLocationSurface::live();
-        let unavailable = vehicle_texts(&empty.vehicle, &empty.vehicle_radio_health);
+        let unavailable = vehicle_texts(
+            &empty.vehicle,
+            &empty.vehicle_radio_health,
+            &empty.vehicle_mirror_status,
+        );
         assert!(unavailable.iter().any(|text| text == "unavailable"));
         assert!(unavailable
             .iter()

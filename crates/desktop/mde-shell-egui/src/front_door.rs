@@ -251,6 +251,8 @@ pub(crate) enum FrontDoorTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FrontDoorRequest {
     Activate(FrontDoorTarget),
+    PinSurface(Surface),
+    UnpinSurface(Surface),
     LaunchPeerApp(FrontDoorPeerAppTarget),
     ConnectDesktopSource(String),
     InstanceLifecycle {
@@ -550,6 +552,7 @@ pub(crate) struct FrontDoorState {
     suppress_click_away_once: bool,
     lifecycle_arm: Option<FrontDoorLifecycleArm>,
     service_lifecycle_arm: Option<FrontDoorServiceLifecycleArm>,
+    taskbar_pins: Option<Vec<Surface>>,
 }
 
 impl FrontDoorState {
@@ -582,6 +585,25 @@ impl FrontDoorState {
 
     pub(crate) fn query(&self) -> &str {
         bounded_front_door_query(&self.query)
+    }
+
+    /// Supply the shell-owned ordered taskbar catalog for this frame. Keeping
+    /// the copy in the ephemeral Front Door state avoids a second persistence
+    /// model while allowing a selected catalog app to expose a real pin toggle.
+    pub(crate) fn set_taskbar_pins(&mut self, pins: &[Surface]) {
+        self.taskbar_pins = Some(
+            pins.iter()
+                .copied()
+                .filter(|surface| Surface::ALL.contains(surface))
+                .take(Surface::ALL.len())
+                .collect(),
+        );
+    }
+
+    fn taskbar_surface_is_pinned(&self, surface: Surface) -> Option<bool> {
+        self.taskbar_pins
+            .as_ref()
+            .map(|pins| pins.contains(&surface))
     }
 
     pub(crate) fn selected_peer_node(
@@ -1188,7 +1210,7 @@ pub(crate) fn front_door_panel_with_sources(
                                         state.selected = idx;
                                     }
                                     if let Some(request) =
-                                        result_context_menu_request(&response, hit)
+                                        result_context_menu_request(&response, hit, state)
                                     {
                                         action = Some(request);
                                     }
@@ -1211,6 +1233,8 @@ pub(crate) fn front_door_panel_with_sources(
         action,
         Some(
             FrontDoorRequest::Activate(_)
+                | FrontDoorRequest::PinSurface(_)
+                | FrontDoorRequest::UnpinSurface(_)
                 | FrontDoorRequest::LaunchPeerApp(_)
                 | FrontDoorRequest::ConnectDesktopSource(_)
                 | FrontDoorRequest::OpenWorkbenchPlane(_)
@@ -1918,6 +1942,32 @@ fn activation_request_for_hit(hit: &SearchHit<FrontDoorTarget>) -> FrontDoorRequ
     match &hit.item.payload {
         FrontDoorTarget::PeerApp(target) => FrontDoorRequest::LaunchPeerApp(target.clone()),
         _ => FrontDoorRequest::Activate(hit.item.payload.clone()),
+    }
+}
+
+fn taskbar_surface_for_hit(hit: &SearchHit<FrontDoorTarget>) -> Option<Surface> {
+    match hit.item.payload {
+        FrontDoorTarget::App(surface) if Surface::ALL.contains(&surface) => Some(surface),
+        // Workflow cards, peer apps, files, commands, and Browser content are
+        // not taskbar catalog entries. Keeping this match narrow makes their
+        // pin affordance impossible to manufacture from untrusted search data.
+        _ => None,
+    }
+}
+
+fn taskbar_surface_action(surface: Surface, pinned: bool) -> FrontDoorRequest {
+    if pinned {
+        FrontDoorRequest::UnpinSurface(surface)
+    } else {
+        FrontDoorRequest::PinSurface(surface)
+    }
+}
+
+fn taskbar_surface_action_label(surface: Surface, pinned: bool) -> String {
+    if pinned {
+        format!("Unpin {} from taskbar", surface.label())
+    } else {
+        format!("Pin {} to taskbar", surface.label())
     }
 }
 
@@ -2710,6 +2760,7 @@ enum ResultContextItem {
     Open,
     WorkflowPlane,
     ConnectDesktop,
+    Taskbar,
 }
 
 fn result_context_item_id(hit: &SearchHit<FrontDoorTarget>, item: ResultContextItem) -> egui::Id {
@@ -2757,6 +2808,7 @@ fn install_context_menu_row_accessibility(
 fn result_context_menu_request(
     response: &egui::Response,
     hit: &SearchHit<FrontDoorTarget>,
+    state: &FrontDoorState,
 ) -> Option<FrontDoorRequest> {
     let mut request = None;
     let _ = front_door_context_menu(response, |ui| {
@@ -2787,6 +2839,23 @@ fn result_context_menu_request(
             ) {
                 request = Some(FrontDoorRequest::ConnectDesktopSource(source_id.to_owned()));
                 ui.close_menu();
+            }
+        }
+        if let Some(surface) = taskbar_surface_for_hit(hit) {
+            if let Some(pinned) = state.taskbar_surface_is_pinned(surface) {
+                let label = if pinned {
+                    taskbar_surface_action_label(surface, true)
+                } else {
+                    taskbar_surface_action_label(surface, false)
+                };
+                if context_menu_row(
+                    ui,
+                    result_context_item_id(hit, ResultContextItem::Taskbar),
+                    &label,
+                ) {
+                    request = Some(taskbar_surface_action(surface, pinned));
+                    ui.close_menu();
+                }
             }
         }
     });
@@ -3736,6 +3805,7 @@ mod tests {
         );
         action.and_then(|request| match request {
             FrontDoorRequest::Activate(target) => Some(target),
+            FrontDoorRequest::PinSurface(_) | FrontDoorRequest::UnpinSurface(_) => None,
             FrontDoorRequest::LaunchPeerApp(_)
             | FrontDoorRequest::ConnectDesktopSource(_)
             | FrontDoorRequest::InstanceLifecycle { .. }
@@ -3812,6 +3882,42 @@ mod tests {
         assert_eq!(actual, expected);
         assert_eq!(actual[0], FrontDoorTarget::App(Surface::FleetMesh));
         assert_eq!(actual[1], FrontDoorTarget::App(Surface::InfraCode));
+    }
+
+    #[test]
+    fn front_door_taskbar_actions_are_catalogued_and_truthful() {
+        let hits = ranked_front_door_hits("browser", app_search_items());
+        let browser = hits
+            .iter()
+            .find(|hit| hit.item.payload == FrontDoorTarget::App(Surface::Browser))
+            .expect("Browser app result");
+        assert_eq!(taskbar_surface_for_hit(browser), Some(Surface::Browser));
+        assert_eq!(
+            taskbar_surface_action(Surface::Browser, false),
+            FrontDoorRequest::PinSurface(Surface::Browser)
+        );
+        assert_eq!(
+            taskbar_surface_action(Surface::Browser, true),
+            FrontDoorRequest::UnpinSurface(Surface::Browser)
+        );
+        assert_eq!(
+            taskbar_surface_action_label(Surface::Browser, false),
+            "Pin Browser to taskbar"
+        );
+        assert_eq!(
+            taskbar_surface_action_label(Surface::Browser, true),
+            "Unpin Browser from taskbar"
+        );
+
+        let workflow_item = workflow_search_items(0)
+            .into_iter()
+            .find(|item| matches!(item.payload, FrontDoorTarget::Workflow(_)))
+            .expect("workflow result");
+        let workflow_hit = ranked_front_door_hits("workloads", vec![workflow_item])
+            .into_iter()
+            .next()
+            .expect("workflow hit");
+        assert_eq!(taskbar_surface_for_hit(&workflow_hit), None);
     }
 
     #[test]

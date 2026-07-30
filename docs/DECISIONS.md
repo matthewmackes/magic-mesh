@@ -55,10 +55,11 @@ delete a prior entry; supersede it with a newer one.
   components, scrim materials, dark-only, Kdam Thmor Pro type ramp) and **Car** (CarPlay-principled:
   SYNC3 dark palette kept, Dashboard-cards home, six apps, always-visible left instrument
   strip with per-frame telemetry fold, glance rules + soft in-motion limits, one-tap
-  toggle). Mackes-Carbon icons kept platform-wide; the 2026-07-26 icon V2 survey
-  makes core platform app/service/role icons tri-color Carbon-derived linework
-  with no icon plates, while toolbar/action/status icons stay monochrome and
-  semantic-color-coded. Authority doc:
+  toggle). Carbon is neither a theme nor an icon requirement; the shared icon
+  registry accepts retained Mackes-Carbon-compatible SVGs and license-cleared
+  replacements. The 2026-07-26 icon V2 survey keeps core platform app/service/
+  role icons as simple tri-color linework with no icon plates, while toolbar/
+  action/status icons stay monochrome and semantic-color-coded. Authority doc:
   `docs/design/platform-interfaces.md`. Interface-paradigm docs retired to
   `docs/design-archive/`. Win10 chrome code is deleted at cutover (no legacy flag).
   Epics: WL-UX-006 (Construct) + WL-UX-007 (Car); WL-UX-001 superseded-retired;

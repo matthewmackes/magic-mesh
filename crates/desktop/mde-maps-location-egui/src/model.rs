@@ -275,6 +275,211 @@ impl VehicleFreshness {
     }
 }
 
+/// Consumer-side state of the retained typed vehicle mirror.
+///
+/// This is intentionally separate from [`VehicleFreshnessState`]: the radio
+/// and GNSS domains already have their own freshness projection, while Car
+/// also needs to say whether the complete vehicle snapshot is current, being
+/// resynchronized, or simply unavailable. A retained snapshot never becomes
+/// [`Self::Current`] merely because its last payload is still in memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VehicleMirrorState {
+    /// A valid snapshot is online and its vehicle domain is within budget.
+    Current,
+    /// A valid last-known snapshot remains available, but is not live.
+    StaleRetained,
+    /// No fresh snapshot arrived for this refresh; a previously valid cache is
+    /// retained while the consumer waits for a full resynchronization.
+    ResyncingNoFreshSnapshot,
+    /// No valid typed snapshot is available, or the retained payload failed
+    /// validation/decoding.
+    UnavailableMalformed,
+}
+
+impl VehicleMirrorState {
+    /// Operator-facing state label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Current => "Current",
+            Self::StaleRetained => "Stale retained",
+            Self::ResyncingNoFreshSnapshot => "Resyncing · no fresh snapshot",
+            Self::UnavailableMalformed => "Unavailable / malformed",
+        }
+    }
+
+    /// Whether cached vehicle values may be used as live readings.
+    #[must_use]
+    pub const fn is_current(self) -> bool {
+        matches!(self, Self::Current)
+    }
+}
+
+/// Bounded identity and transport provenance retained beside a vehicle cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VehicleMirrorProvenance {
+    /// Workstation management assignment that owns this snapshot stream.
+    pub management_node_id: String,
+    /// MG90 identity from the v2 topic, when present.
+    pub mg90_id: Option<String>,
+    /// Typed snapshot transport/source class.
+    pub source: mackes_mesh_types::vehicle::SnapshotSource,
+    /// Gateway/source identifier, when the producer reported one.
+    pub source_id: Option<String>,
+    /// Transparent mesh relay, when the snapshot was relayed.
+    pub relay: Option<String>,
+}
+
+impl VehicleMirrorProvenance {
+    fn from_v2(v: &mackes_mesh_types::vehicle::VehicleStateV2) -> Self {
+        Self {
+            management_node_id: bounded_vehicle_text(&v.management_node_id),
+            mg90_id: (!v.mg90.id.trim().is_empty()).then(|| bounded_vehicle_text(&v.mg90.id)),
+            source: v.provenance.source,
+            source_id: v.provenance.source_id.as_deref().map(bounded_vehicle_text),
+            relay: v.provenance.relay.as_deref().map(bounded_vehicle_text),
+        }
+    }
+
+    fn from_legacy(v: &mackes_mesh_types::vehicle::VehicleState) -> Self {
+        Self {
+            management_node_id: bounded_vehicle_text(&v.host),
+            mg90_id: (!v.esn.trim().is_empty()).then(|| bounded_vehicle_text(&v.esn)),
+            source: mackes_mesh_types::vehicle::SnapshotSource::Unknown,
+            source_id: None,
+            relay: None,
+        }
+    }
+}
+
+/// Explicit consumer status for the Maps/Car vehicle mirror and its retained
+/// last-known values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VehicleMirrorStatus {
+    /// Current consumer state; only `Current` authorizes live readouts.
+    pub state: VehicleMirrorState,
+    /// Last accepted snapshot identity and source provenance, if any.
+    pub provenance: Option<VehicleMirrorProvenance>,
+    /// Producer sequence of the last accepted snapshot, when typed v2 data was
+    /// available.
+    pub sequence: Option<u64>,
+    /// Effective age of the last accepted snapshot, including cache retention.
+    pub snapshot_age_ms: Option<u64>,
+    /// Bounded reason for the state, when the producer or consumer supplied one.
+    pub reason: Option<String>,
+    published_at_ms: Option<i64>,
+}
+
+impl VehicleMirrorStatus {
+    /// Construct an explicit unavailable/malformed state with no synthetic
+    /// identity or telemetry.
+    #[must_use]
+    pub fn unavailable(reason: impl Into<String>) -> Self {
+        Self {
+            state: VehicleMirrorState::UnavailableMalformed,
+            provenance: None,
+            sequence: None,
+            snapshot_age_ms: None,
+            reason: Some(bounded_vehicle_text(&reason.into())),
+            published_at_ms: None,
+        }
+    }
+
+    /// Whether this status still has a valid last-known snapshot to display as
+    /// retained diagnostics while it is not live.
+    #[must_use]
+    pub fn has_retained_snapshot(&self) -> bool {
+        self.provenance.is_some()
+    }
+
+    /// Human-readable age that never turns an unknown timestamp into zero.
+    #[must_use]
+    pub fn age_label(&self) -> String {
+        self.snapshot_age_ms.map_or_else(
+            || "age unknown".to_string(),
+            |age| {
+                if age < 1_000 {
+                    format!("{age} ms")
+                } else {
+                    format!("{:.1} s", age as f32 / 1_000.0)
+                }
+            },
+        )
+    }
+
+    fn from_v2_at(v: &mackes_mesh_types::vehicle::VehicleStateV2, now_ms: i64) -> Self {
+        if v.schema_version != mackes_mesh_types::vehicle::VEHICLE_STATE_V2_SCHEMA_VERSION {
+            return Self::unavailable(format!(
+                "unsupported vehicle snapshot schema {}",
+                v.schema_version
+            ));
+        }
+        let snapshot_age_ms = effective_age_ms(v.published_at_ms, now_ms);
+        let stale_after_ms = v.expected_interval_ms.saturating_mul(2).max(5_000);
+        // Reuse the existing domain projection for the vehicle domain. Radio
+        // and GNSS freshness remain owned by VehicleRadioHealth; this status
+        // does not recalculate either radio policy.
+        let vehicle_freshness =
+            effective_freshness(&v.freshness.vehicle, snapshot_age_ms, stale_after_ms);
+        let state = if v.online && vehicle_freshness.state == VehicleFreshnessState::Fresh {
+            VehicleMirrorState::Current
+        } else {
+            VehicleMirrorState::StaleRetained
+        };
+        let reason = if !v.online {
+            Some("gateway-offline".to_string())
+        } else {
+            vehicle_freshness.reason.clone()
+        };
+        Self {
+            state,
+            provenance: Some(VehicleMirrorProvenance::from_v2(v)),
+            sequence: Some(v.sequence),
+            snapshot_age_ms,
+            reason,
+            published_at_ms: Some(v.published_at_ms),
+        }
+    }
+
+    fn from_legacy_at(v: &mackes_mesh_types::vehicle::VehicleState, now_ms: i64) -> Self {
+        let snapshot_age_ms = effective_age_ms(v.published_at_ms, now_ms);
+        let current = v.online
+            && snapshot_age_ms
+                .is_some_and(|age| age <= (VEHICLE_TELEMETRY_STALE_AFTER_S * 1_000.0) as u64);
+        Self {
+            state: if current {
+                VehicleMirrorState::Current
+            } else {
+                VehicleMirrorState::StaleRetained
+            },
+            provenance: Some(VehicleMirrorProvenance::from_legacy(v)),
+            sequence: None,
+            snapshot_age_ms,
+            reason: (!current).then(|| {
+                if !v.online {
+                    "gateway-offline".to_string()
+                } else {
+                    "retained legacy snapshot exceeded freshness budget".to_string()
+                }
+            }),
+            published_at_ms: Some(v.published_at_ms),
+        }
+    }
+
+    fn resyncing_no_fresh_snapshot(&self, now_ms: i64) -> Self {
+        if !self.has_retained_snapshot() {
+            return Self::unavailable("no valid vehicle snapshot available");
+        }
+        let mut next = self.clone();
+        next.state = VehicleMirrorState::ResyncingNoFreshSnapshot;
+        next.snapshot_age_ms = next
+            .published_at_ms
+            .and_then(|published| effective_age_ms(published, now_ms));
+        next.reason = Some("no fresh vehicle snapshot; full resync in progress".to_string());
+        next
+    }
+}
+
 /// Bounded, no-fabrication radio/GNSS projection consumed by the Car view.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VehicleRadioHealth {
@@ -616,6 +821,9 @@ pub struct MapsLocationSurface {
     pub vehicle: VehicleState,
     /// Typed v2 radio inventory and effective GNSS/radio freshness for Car.
     pub vehicle_radio_health: VehicleRadioHealth,
+    /// Consumer-side freshness/cache state for the complete vehicle mirror.
+    /// Only `Current` permits cached vehicle values to be rendered as live.
+    pub vehicle_mirror_status: VehicleMirrorStatus,
     /// GPIO/CAN/USB/serial device state.
     pub devices: DeviceIoState,
     /// Firmware lifecycle model.
@@ -677,6 +885,9 @@ impl MapsLocationSurface {
             dead_zones: DeadZoneState::live(),
             vehicle: VehicleState::awaiting_gateway(),
             vehicle_radio_health: VehicleRadioHealth::default(),
+            vehicle_mirror_status: VehicleMirrorStatus::unavailable(
+                "no valid typed vehicle snapshot available",
+            ),
             devices: DeviceIoState::live(),
             firmware: FirmwareWorkflow::live(),
             vault: EncryptedVaultState::ready_for_local_admin(),
@@ -726,6 +937,9 @@ impl MapsLocationSurface {
             dead_zones: DeadZoneState::simulated(),
             vehicle: VehicleState::ford_interceptor_2020(),
             vehicle_radio_health: VehicleRadioHealth::default(),
+            vehicle_mirror_status: VehicleMirrorStatus::unavailable(
+                "simulator fixture has no live vehicle snapshot",
+            ),
             devices: DeviceIoState::simulated(),
             firmware: FirmwareWorkflow::simulated(),
             vault: EncryptedVaultState::ready_for_local_admin(),
@@ -984,8 +1198,11 @@ impl MapsLocationSurface {
         self.locations
             .primary_sample()
             .is_some_and(|sample| !sample.stale() && sample.moving())
-            || (self.vehicle.telemetry.is_live() && self.vehicle.telemetry.moving)
-            || self.mg90.ignition_on
+            && self.vehicle_mirror_status.state.is_current()
+            || (self.vehicle_mirror_status.state.is_current()
+                && self.vehicle.telemetry.is_live()
+                && self.vehicle.telemetry.moving)
+            || (self.vehicle_mirror_status.state.is_current() && self.mg90.ignition_on)
     }
 
     /// Build the setting-change execution plan used by MG90 Settings.
@@ -1141,6 +1358,39 @@ impl MapsLocationSurface {
                     .push(VEHICLE_GAPS_CAPPED_NOTE.to_string());
             }
         }
+
+        // The legacy path remains a compatibility reader during the rolling
+        // upgrade. It still gets an explicit mirror status, but carries the
+        // wire contract's honest Unknown provenance rather than inventing a
+        // typed v2 source or sequence.
+        self.set_vehicle_mirror_status(VehicleMirrorStatus::from_legacy_at(v, unix_now_ms()));
+    }
+
+    fn set_vehicle_mirror_status(&mut self, status: VehicleMirrorStatus) {
+        if !status.state.is_current() {
+            let age_s = status
+                .snapshot_age_ms
+                .map(|age| age as f32 / 1_000.0)
+                .filter(|age| age.is_finite())
+                .unwrap_or(VEHICLE_TELEMETRY_STALE_AFTER_S + 1.0);
+            let not_live_age = age_s.max(VEHICLE_TELEMETRY_STALE_AFTER_S + 0.001);
+            self.vehicle.telemetry.last_update_age_s =
+                if self.vehicle.telemetry.last_update_age_s.is_finite() {
+                    self.vehicle.telemetry.last_update_age_s.max(not_live_age)
+                } else {
+                    not_live_age
+                };
+            if let Some(source) = self
+                .locations
+                .sources
+                .iter_mut()
+                .find(|source| source.kind == LocationSourceKind::Mg90Gnss)
+            {
+                source.status = SourceStatus::Stale;
+                source.sample.update_age_s = source.sample.update_age_s.max(not_live_age);
+            }
+        }
+        self.vehicle_mirror_status = status;
     }
 
     /// Fold the identity-addressed typed v2 vehicle snapshot. The legacy
@@ -1148,6 +1398,21 @@ impl MapsLocationSurface {
     /// radio/GNSS health is taken only from the v2 inventory and freshness
     /// domains. No v1 field is used to invent a v2 radio row.
     pub fn refresh_from_vehicle_v2(&mut self, v: &mackes_mesh_types::vehicle::VehicleStateV2) {
+        let now_ms = unix_now_ms();
+        if v.schema_version != mackes_mesh_types::vehicle::VEHICLE_STATE_V2_SCHEMA_VERSION {
+            // Reject before the compatibility projection. An unsupported v2
+            // payload must never overwrite legacy telemetry with values that
+            // the consumer has not accepted as a valid snapshot.
+            self.vehicle_radio_health = VehicleRadioHealth::unavailable(format!(
+                "unsupported vehicle snapshot schema {}",
+                v.schema_version
+            ));
+            self.set_vehicle_mirror_status(VehicleMirrorStatus::unavailable(format!(
+                "unsupported vehicle snapshot schema {}",
+                v.schema_version
+            )));
+            return;
+        }
         let legacy = mackes_mesh_types::vehicle::VehicleState {
             host: v.management_node_id.clone(),
             model: v.mg90.model.clone(),
@@ -1162,7 +1427,8 @@ impl MapsLocationSurface {
             published_at_ms: v.published_at_ms,
         };
         self.refresh_from_vehicle(&legacy);
-        self.vehicle_radio_health = VehicleRadioHealth::from_v2_at(v, unix_now_ms());
+        self.vehicle_radio_health = VehicleRadioHealth::from_v2_at(v, now_ms);
+        self.set_vehicle_mirror_status(VehicleMirrorStatus::from_v2_at(v, now_ms));
     }
 
     /// Read retained vehicle + overlay mirrors off the Bus (fail-soft, honest
@@ -1193,9 +1459,17 @@ impl MapsLocationSurface {
         // smallest workstation instances).  A single borrowed handle keeps
         // the fail-soft behavior while making the fold genuinely cheap.
         let Some(root) = mde_bus::client_data_dir() else {
+            let status = self
+                .vehicle_mirror_status
+                .resyncing_no_fresh_snapshot(unix_now_ms());
+            self.set_vehicle_mirror_status(status);
             return;
         };
         let Ok(persist) = mde_bus::persist::Persist::open(root.clone()) else {
+            let status = self
+                .vehicle_mirror_status
+                .resyncing_no_fresh_snapshot(unix_now_ms());
+            self.set_vehicle_mirror_status(status);
             return;
         };
 
@@ -1226,6 +1500,10 @@ impl MapsLocationSurface {
         } else {
             self.vehicle_radio_health =
                 VehicleRadioHealth::unavailable("typed v2 radio inventory unavailable");
+            let status = self
+                .vehicle_mirror_status
+                .resyncing_no_fresh_snapshot(unix_now_ms());
+            self.set_vehicle_mirror_status(status);
         }
         if let Some(snapshot) = read_earthquake_mirror(&reader, node) {
             self.refresh_from_earthquakes(snapshot);
@@ -1386,6 +1664,7 @@ impl MapsLocationSurface {
     #[must_use]
     pub fn vehicle_glance(&self) -> Option<String> {
         if self.locations.primary != LocationSourceKind::Mg90Gnss
+            || !self.vehicle_mirror_status.state.is_current()
             || !self.vehicle.telemetry.is_live()
         {
             return None;
@@ -6242,6 +6521,115 @@ mod tests {
             VehicleRadioAvailability::Unavailable
         );
         assert!(unavailable.radios.is_empty());
+    }
+
+    #[test]
+    fn unsupported_v2_schema_cannot_project_vehicle_values_or_glance() {
+        use mackes_mesh_types::vehicle::VehicleTelem;
+
+        let now = test_now_ms();
+        let mut valid = typed_vehicle_snapshot(now);
+        valid.telem = VehicleTelem {
+            speed_mph: 31.0,
+            battery_v: 13.7,
+            moving: true,
+            obd_present: true,
+            ..VehicleTelem::default()
+        };
+        let mut state = MapsLocationSurface::live();
+        state.refresh_from_vehicle_v2(&valid);
+        assert_eq!(
+            state.vehicle_mirror_status.state,
+            VehicleMirrorState::Current
+        );
+        assert_eq!(state.vehicle_glance().as_deref(), Some("31 mph"));
+
+        let mut unsupported = valid.clone();
+        unsupported.schema_version =
+            mackes_mesh_types::vehicle::VEHICLE_STATE_V2_SCHEMA_VERSION.saturating_add(1);
+        unsupported.telem.speed_mph = 99.0;
+        state.refresh_from_vehicle_v2(&unsupported);
+
+        assert_eq!(
+            state.vehicle_mirror_status.state,
+            VehicleMirrorState::UnavailableMalformed
+        );
+        assert_eq!(
+            state.vehicle_radio_health.availability,
+            VehicleRadioAvailability::Unavailable
+        );
+        assert!(!state.vehicle.telemetry.is_live());
+        assert_eq!(state.vehicle_glance(), None);
+        assert_eq!(
+            state.vehicle.telemetry.speed_mph, 31.0,
+            "unsupported v2 must not overwrite the last accepted telemetry"
+        );
+    }
+
+    #[test]
+    fn vehicle_mirror_status_transitions_retain_provenance_without_live_cache_reads() {
+        let now = test_now_ms();
+        let mut state = MapsLocationSurface::live();
+        let mut snapshot = typed_vehicle_snapshot(now);
+        snapshot.telem.speed_mph = 44.0;
+        snapshot.telem.moving = true;
+        state.refresh_from_vehicle_v2(&snapshot);
+
+        assert_eq!(
+            state.vehicle_mirror_status.state,
+            VehicleMirrorState::Current
+        );
+        let provenance = state
+            .vehicle_mirror_status
+            .provenance
+            .clone()
+            .expect("current snapshot provenance");
+        assert_eq!(provenance.management_node_id, "rig-1");
+        assert_eq!(
+            provenance.source,
+            mackes_mesh_types::vehicle::SnapshotSource::DirectGateway
+        );
+        assert!(state.vehicle.telemetry.is_live());
+
+        snapshot.published_at_ms = now - 6_000;
+        state.refresh_from_vehicle_v2(&snapshot);
+        assert_eq!(
+            state.vehicle_mirror_status.state,
+            VehicleMirrorState::StaleRetained
+        );
+        assert_eq!(
+            state
+                .vehicle_mirror_status
+                .provenance
+                .as_ref()
+                .expect("stale provenance")
+                .management_node_id,
+            "rig-1"
+        );
+        assert!(!state.vehicle.telemetry.is_live());
+        assert_eq!(state.vehicle_glance(), None);
+
+        let resyncing = state
+            .vehicle_mirror_status
+            .resyncing_no_fresh_snapshot(now + 7_000);
+        state.set_vehicle_mirror_status(resyncing);
+        assert_eq!(
+            state.vehicle_mirror_status.state,
+            VehicleMirrorState::ResyncingNoFreshSnapshot
+        );
+        assert!(state.vehicle_mirror_status.has_retained_snapshot());
+        assert!(!state.vehicle.telemetry.is_live());
+        assert_eq!(state.vehicle_glance(), None);
+
+        state.set_vehicle_mirror_status(VehicleMirrorStatus::unavailable(
+            "malformed retained vehicle snapshot",
+        ));
+        assert_eq!(
+            state.vehicle_mirror_status.state,
+            VehicleMirrorState::UnavailableMalformed
+        );
+        assert!(!state.vehicle.telemetry.is_live());
+        assert_eq!(state.vehicle_glance(), None);
     }
 
     #[test]

@@ -1508,6 +1508,12 @@ impl Shell {
                 self.nav.surface = surface;
                 self.normalize_surface_aliases();
             }
+            nav_bar::Action::PinSurface(surface) => {
+                self.nav_bar.pin_surface(surface);
+            }
+            nav_bar::Action::UnpinSurface(surface) => {
+                self.nav_bar.unpin_surface(surface);
+            }
             nav_bar::Action::DesktopSource(id) => {
                 self.connect_front_door_desktop_source(ctx, &id);
             }
@@ -3244,6 +3250,12 @@ impl Shell {
             front_door::FrontDoorRequest::Activate(target) => {
                 self.activate_front_door_target(target)
             }
+            front_door::FrontDoorRequest::PinSurface(surface) => {
+                self.nav_bar.pin_surface(surface);
+            }
+            front_door::FrontDoorRequest::UnpinSurface(surface) => {
+                self.nav_bar.unpin_surface(surface);
+            }
             front_door::FrontDoorRequest::LaunchPeerApp(target) => {
                 if let Err(err) = self.publish_front_door_peer_app_launch(&target) {
                     tracing::warn!(
@@ -3297,6 +3309,8 @@ impl Shell {
             return;
         }
         let sources = self.front_door_source_status();
+        self.front_door
+            .set_taskbar_pins(self.nav_bar.pinned_surfaces());
         let base_items = self.front_door_base_items();
         self.drive_front_door_peer_apps(&base_items, sources);
         let items = self.front_door_items();
@@ -3615,6 +3629,8 @@ fn nav_bar_action_label(action: &nav_bar::Action) -> &'static str {
         nav_bar::Action::Home => "home",
         nav_bar::Action::ToggleDock => "toggle_dock",
         nav_bar::Action::OpenSurface(_) => "open_surface",
+        nav_bar::Action::PinSurface(_) => "pin_surface",
+        nav_bar::Action::UnpinSurface(_) => "unpin_surface",
         nav_bar::Action::DesktopSource(_) => "desktop_source",
     }
 }
