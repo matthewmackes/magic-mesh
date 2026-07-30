@@ -1007,7 +1007,7 @@ remains here under a completed status.
   14 shell/front-door tests pass. The taskbar consumes the searchable catalog
   directly, with Fleet & Mesh/Workloads aliases and no retired group geometry;
   first-boot selection and responsive proof remain open. A fresh unsigned Alpha
-  from integrated tip `03d5084d` is staged for Dell proofing; evidence is in
+  from integrated tip `b77a82de` is staged for Dell proofing; evidence is in
   `docs/ops/promotion-pipeline.md`.
 - Remaining work:
 
