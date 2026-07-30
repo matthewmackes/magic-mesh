@@ -391,22 +391,47 @@ fn rail_item_id(label: &str) -> egui::Id {
     egui::Id::new(("maps-location-tab-rail-item", label))
 }
 
-/// Normalized (u right, v down) route polyline the synthetic HUD scene follows.
-/// `v == 1.0` is the near edge (bottom) so road/route ribbons taper wider there.
-const ROUTE_UV: &[(f32, f32)] = &[
-    (0.50, 1.05),
-    (0.50, 0.62),
-    (0.52, 0.46),
-    (0.585, 0.32),
-    (0.64, 0.22),
-    (0.68, 0.14),
-];
-
-/// Normalized alternate-route polyline (drawn dimmer than the active route).
-const ALT_UV: &[(f32, f32)] = &[(0.50, 0.62), (0.40, 0.50), (0.34, 0.38), (0.30, 0.28)];
-
 /// Fixed screen anchor for the driver's vehicle chevron (not panned/zoomed).
 const VEHICLE_UV: (f32, f32) = (0.50, 0.62);
+
+/// One geographic point returned by the route provider.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ProviderRoutePoint {
+    latitude: f64,
+    longitude: f64,
+}
+
+/// Provider-owned route geometry consumed by the map renderer.
+///
+/// The model currently has no route-geometry field, so production call sites
+/// pass `None` until the routing adapter can return this payload. Keeping the
+/// seam typed here prevents the renderer from manufacturing a path meanwhile.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct ProviderRouteGeometry {
+    primary: Vec<ProviderRoutePoint>,
+    alternate: Vec<ProviderRoutePoint>,
+    maneuver: Option<ProviderRoutePoint>,
+}
+
+impl ProviderRoutePoint {
+    fn is_valid(self) -> bool {
+        self.latitude.is_finite()
+            && self.longitude.is_finite()
+            && (-90.0..=90.0).contains(&self.latitude)
+            && (-180.0..=180.0).contains(&self.longitude)
+    }
+}
+
+impl ProviderRouteGeometry {
+    fn is_renderable(&self) -> bool {
+        self.primary.len() >= 2
+            && self
+                .primary
+                .iter()
+                .copied()
+                .all(ProviderRoutePoint::is_valid)
+    }
+}
 
 /// A single turn instruction reduced to a direction for the painted arrow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -648,6 +673,7 @@ fn drive_hud(
             .local_navigation
             .active_destination()
             .and_then(Destination::geo),
+        None,
     );
 
     let route = &state.local_navigation.active_route;
@@ -906,6 +932,7 @@ fn show_route_preview(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
             .local_navigation
             .active_destination()
             .and_then(Destination::geo),
+        None,
     );
     // Gentle scrim so the sheet + chrome read cleanly over the map.
     painter.rect_filled(rect, Style::RADIUS_L, Color32::BLACK.gamma_multiply(0.18));
@@ -1464,6 +1491,7 @@ fn show_destination_search(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
             .local_navigation
             .active_destination()
             .and_then(Destination::geo),
+        None,
     );
     painter.rect_filled(rect, Style::RADIUS_L, Color32::BLACK.gamma_multiply(0.5));
 
@@ -1993,6 +2021,7 @@ fn show_arrival(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
             .local_navigation
             .active_destination()
             .and_then(Destination::geo),
+        None,
     );
     painter.rect_filled(rect, Style::RADIUS_L, Color32::BLACK.gamma_multiply(0.5));
 
@@ -2366,6 +2395,7 @@ fn paint_map_scene(
     route_live: bool,
     route_planned: bool,
     destination: Option<(f64, f64)>,
+    route_geometry: Option<&ProviderRouteGeometry>,
 ) {
     let bg = if map.dark_mode {
         MAP_DARK_BG
@@ -2543,12 +2573,19 @@ fn paint_map_scene(
     // the real NWS layer above; no provider backs a generic weather or traffic
     // visualization, so none is fabricated (P8/Q33).
 
-    // Route — the layered GMaps look (casing + bright core, rounded joints).
-    // A dimmed grey line when not live (no fix, or off-route recalculating), and
-    // ONLY when an actual route plan exists — an unplanned surface paints no
-    // fabricated ribbon.
+    // Route — provider geometry only. A planned route without a provider path
+    // keeps the map honest with an explicit unavailable state; no normalized
+    // fallback or fixed maneuver marker is painted.
     if map.route_visible && route_planned {
-        paint_route(painter, rect, map, route_live);
+        let painted = match (projection.as_ref(), route_geometry) {
+            (Some(projection), Some(geometry)) => {
+                paint_route(painter, projection, map, geometry, route_live)
+            }
+            _ => false,
+        };
+        if !painted {
+            paint_route_unavailable(painter, rect);
+        }
     }
 
     // Vehicle — fixed driver anchor (map moves under it, like a real nav app).
@@ -2693,25 +2730,6 @@ fn fill_quad(painter: &Painter, corners: [Pos2; 4], colors: [Color32; 4]) {
     painter.add(mesh);
 }
 
-/// Build ribbon points (screen pos + width) for a normalized polyline, tapered
-/// so the near (high-`v`) end is `w_near` wide and the far end `w_far`.
-fn ribbon_points(
-    rect: Rect,
-    map: &MapViewState,
-    uv: &[(f32, f32)],
-    w_near: f32,
-    w_far: f32,
-) -> Vec<(Pos2, f32)> {
-    let z = zoom_scale(map);
-    uv.iter()
-        .map(|&(u, v)| {
-            let p = scene_point(rect, map, u, v);
-            let w = w_far + (w_near - w_far) * v.clamp(0.0, 1.0);
-            (p, (w * z).max(1.0))
-        })
-        .collect()
-}
-
 /// Paint a variable-width ribbon (quad per segment + round joints) in `color`.
 fn paint_ribbon(painter: &Painter, pts: &[(Pos2, f32)], color: Color32) {
     for pair in pts.windows(2) {
@@ -2741,27 +2759,98 @@ fn paint_ribbon(painter: &Painter, pts: &[(Pos2, f32)], color: Color32) {
     }
 }
 
-fn paint_route(painter: &Painter, rect: Rect, map: &MapViewState, active: bool) {
-    if !active {
-        // Planned but not active — a dim grey line, no glow.
-        let dim = ribbon_points(rect, map, ROUTE_UV, 10.0, 4.0);
-        paint_ribbon(painter, &dim, Style::TEXT_DIM.gamma_multiply(0.5));
-        return;
+fn projected_route_path(
+    projection: &crate::basemap::Projection,
+    points: &[ProviderRoutePoint],
+) -> Option<Vec<Pos2>> {
+    if points.len() < 2 || points.iter().copied().any(|point| !point.is_valid()) {
+        return None;
     }
-    let glow = ribbon_points(rect, map, ROUTE_UV, 30.0, 12.0);
-    paint_ribbon(painter, &glow, ROUTE_BLUE.gamma_multiply(0.16));
-    let casing = ribbon_points(rect, map, ROUTE_UV, 20.0, 8.0);
-    paint_ribbon(painter, &casing, ROUTE_CASING);
-    let core = ribbon_points(rect, map, ROUTE_UV, 13.0, 5.0);
-    paint_ribbon(painter, &core, ROUTE_BLUE);
-    let alt = ribbon_points(rect, map, ALT_UV, 9.0, 4.0);
-    paint_ribbon(painter, &alt, ROUTE_ALT.gamma_multiply(0.8));
+    let projected: Vec<Pos2> = points
+        .iter()
+        .map(|point| projection.project(point.latitude, point.longitude))
+        .collect();
+    projected
+        .iter()
+        .all(|point| !point.any_nan())
+        .then_some(projected)
+}
 
-    // Turn marker where the next maneuver happens.
+/// Add a gentle near-to-far taper to provider-projected route geometry.
+fn provider_ribbon_points(
+    points: &[Pos2],
+    map: &MapViewState,
+    near: f32,
+    far: f32,
+) -> Vec<(Pos2, f32)> {
+    let last = points.len().saturating_sub(1).max(1) as f32;
     let z = zoom_scale(map);
-    let m = scene_point(rect, map, ROUTE_UV[3].0, ROUTE_UV[3].1);
-    painter.circle_filled(m, 7.0 * z, Color32::WHITE);
-    painter.circle_filled(m, 4.5 * z, ROUTE_BLUE);
+    points
+        .iter()
+        .enumerate()
+        .map(|(index, point)| {
+            let progress = index as f32 / last;
+            let width = near + (far - near) * progress;
+            (*point, (width * z).max(1.0))
+        })
+        .collect()
+}
+
+fn paint_route(
+    painter: &Painter,
+    projection: &crate::basemap::Projection,
+    map: &MapViewState,
+    geometry: &ProviderRouteGeometry,
+    active: bool,
+) -> bool {
+    if !geometry.is_renderable() {
+        return false;
+    }
+    let Some(primary) = projected_route_path(projection, &geometry.primary) else {
+        return false;
+    };
+
+    if !active {
+        // Planned but not active — a dim grey provider line, no glow.
+        let dim = provider_ribbon_points(&primary, map, 10.0, 4.0);
+        paint_ribbon(painter, &dim, Style::TEXT_DIM.gamma_multiply(0.5));
+    } else {
+        let glow = provider_ribbon_points(&primary, map, 30.0, 12.0);
+        paint_ribbon(painter, &glow, ROUTE_BLUE.gamma_multiply(0.16));
+        let casing = provider_ribbon_points(&primary, map, 20.0, 8.0);
+        paint_ribbon(painter, &casing, ROUTE_CASING);
+        let core = provider_ribbon_points(&primary, map, 13.0, 5.0);
+        paint_ribbon(painter, &core, ROUTE_BLUE);
+    }
+
+    if let Some(alternate) = projected_route_path(projection, &geometry.alternate) {
+        let alt = provider_ribbon_points(&alternate, map, 9.0, 4.0);
+        paint_ribbon(painter, &alt, ROUTE_ALT.gamma_multiply(0.8));
+    }
+
+    // A maneuver marker is painted only at the provider-returned geographic
+    // point; absent marker geometry means no marker, never a guessed anchor.
+    if let Some(maneuver) = geometry.maneuver.filter(|point| point.is_valid()) {
+        let marker = projection.project(maneuver.latitude, maneuver.longitude);
+        if !marker.any_nan() {
+            let z = zoom_scale(map);
+            painter.circle_filled(marker, 7.0 * z, Color32::WHITE);
+            painter.circle_filled(marker, 4.5 * z, ROUTE_BLUE);
+        }
+    }
+    true
+}
+
+fn paint_route_unavailable(painter: &Painter, rect: Rect) {
+    let width = (rect.width() - 2.0 * Style::SP_M).clamp(1.0, 320.0);
+    let status = safe_rect(
+        rect.left() + Style::SP_M,
+        rect.top() + Style::SP_M,
+        width,
+        48.0,
+    );
+    paint_soft_shadow(painter, status, HUD_RADIUS_S);
+    paint_provider_unavailable(painter, status, "Route geometry unavailable");
 }
 
 /// A heading-aware vehicle chevron with an optional soft accent glow.
@@ -5068,6 +5157,7 @@ fn map_canvas(
         has_fix,
         route_planned,
         None,
+        None,
     );
     painter.rect_stroke(
         rect,
@@ -7114,6 +7204,105 @@ mod tests {
         assert_eq!(format_distance(0.4), "0.4 mi");
         assert_eq!(format_distance(0.1), "550 ft");
         assert_eq!(format_distance(f32::NAN), "0 ft");
+    }
+
+    #[test]
+    fn planned_route_without_provider_geometry_paints_unavailable_state() {
+        let mut surface = MapsLocationSurface::simulated();
+        surface.active = WorkspaceTab::Drive;
+        surface.map.route_visible = true;
+        let texts = painted_texts(&mut surface);
+
+        assert!(
+            texts
+                .iter()
+                .any(|text| text == "Route geometry unavailable"),
+            "a planned route without provider geometry must be explicit: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn provider_route_geometry_model_requires_a_valid_primary_path() {
+        let point = ProviderRoutePoint {
+            latitude: 32.168,
+            longitude: -95.849,
+        };
+        let mut geometry = ProviderRouteGeometry::default();
+        assert!(!geometry.is_renderable());
+
+        geometry.primary = vec![point];
+        assert!(!geometry.is_renderable());
+
+        geometry.primary.push(ProviderRoutePoint {
+            latitude: 32.17,
+            longitude: -95.847,
+        });
+        assert!(geometry.is_renderable());
+
+        geometry.primary[1].latitude = f64::NAN;
+        assert!(!geometry.is_renderable());
+    }
+
+    #[test]
+    fn provider_route_geometry_present_projects_and_paints_provider_path() {
+        let rect = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1024.0, 768.0));
+        let map = MapViewState::simulated();
+        let projection =
+            crate::basemap::Projection::vehicle_centered(rect, &map, (32.168, -95.849))
+                .expect("valid provider projection");
+        let geometry = ProviderRouteGeometry {
+            primary: vec![
+                ProviderRoutePoint {
+                    latitude: 32.168,
+                    longitude: -95.849,
+                },
+                ProviderRoutePoint {
+                    latitude: 32.17,
+                    longitude: -95.847,
+                },
+                ProviderRoutePoint {
+                    latitude: 32.173,
+                    longitude: -95.843,
+                },
+            ],
+            alternate: vec![
+                ProviderRoutePoint {
+                    latitude: 32.168,
+                    longitude: -95.849,
+                },
+                ProviderRoutePoint {
+                    latitude: 32.169,
+                    longitude: -95.844,
+                },
+            ],
+            maneuver: Some(ProviderRoutePoint {
+                latitude: 32.17,
+                longitude: -95.847,
+            }),
+        };
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(rect),
+            ..Default::default()
+        };
+        let mut painted = false;
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let painter = ui.painter_at(rect);
+                painted = paint_route(&painter, &projection, &map, &geometry, true);
+            });
+        });
+
+        assert!(
+            painted,
+            "provider geometry should be accepted by the route painter"
+        );
+        assert!(
+            !out.shapes.is_empty(),
+            "provider geometry should produce route shapes"
+        );
     }
 
     #[test]
