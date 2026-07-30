@@ -28,12 +28,165 @@ fn mesh_reading(ui: &mut egui::Ui) {
     muted_note(ui, SYSTEM_MESH_READING_COPY);
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MeshConnectivity {
+    Unavailable,
+    Unknown,
+    Offline,
+    Degraded,
+    Connected,
+}
+
+impl MeshConnectivity {
+    fn tone(self) -> egui::Color32 {
+        match self {
+            Self::Unavailable | Self::Unknown => Style::TEXT_DIM,
+            Self::Offline | Self::Degraded => Style::WARN,
+            Self::Connected => Style::OK,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MeshSystemSummary {
+    connectivity: MeshConnectivity,
+    connectivity_value: String,
+    role_value: String,
+    reason: String,
+}
+
+impl MeshSystemSummary {
+    fn accessibility_value(&self) -> String {
+        format!(
+            "Connectivity: {}. Role: {}. {}",
+            self.connectivity_value, self.role_value, self.reason
+        )
+    }
+}
+
+fn mesh_system_summary(mesh: &MeshFacts) -> MeshSystemSummary {
+    let (connectivity, connectivity_value, connectivity_reason) = if !mesh.seen {
+        (
+            MeshConnectivity::Unavailable,
+            "unavailable — no mesh status snapshot".to_owned(),
+            "The mesh status snapshot has not arrived, so connectivity is unknown.",
+        )
+    } else if mesh.peers_total == 0 {
+        (
+            MeshConnectivity::Unknown,
+            "unknown — no peer directory rows".to_owned(),
+            "The snapshot has no peer directory rows, so connectivity cannot be determined.",
+        )
+    } else if mesh.peers_online > mesh.peers_total {
+        (
+            MeshConnectivity::Unknown,
+            format!(
+                "unknown — inconsistent peer count ({}/{} live)",
+                mesh.peers_online, mesh.peers_total
+            ),
+            "The snapshot reports more online peers than total peers, so connectivity is unknown.",
+        )
+    } else if mesh.peers_online == 0 {
+        (
+            MeshConnectivity::Offline,
+            format!("offline — 0/{} peers live", mesh.peers_total),
+            "The peer directory reports no online peers.",
+        )
+    } else if mesh.peers_online < mesh.peers_total {
+        (
+            MeshConnectivity::Degraded,
+            format!(
+                "degraded — {}/{} peers live",
+                mesh.peers_online, mesh.peers_total
+            ),
+            "Some peer directory entries are not online.",
+        )
+    } else {
+        (
+            MeshConnectivity::Connected,
+            format!(
+                "connected — {}/{} peers live",
+                mesh.peers_online, mesh.peers_total
+            ),
+            "Every peer directory entry is online.",
+        )
+    };
+
+    let (role_value, role_reason) = match mesh.role.as_deref() {
+        Some(role) => (
+            role.to_owned(),
+            "The role is pinned in this node's peer-directory row.".to_owned(),
+        ),
+        None => (
+            "unknown — no pinned directory role".to_owned(),
+            "This node has no pinned role in the peer directory.".to_owned(),
+        ),
+    };
+
+    MeshSystemSummary {
+        connectivity,
+        connectivity_value,
+        role_value,
+        reason: format!("{connectivity_reason} {role_reason}"),
+    }
+}
+
+fn mesh_summary_accesskit_id() -> egui::Id {
+    egui::Id::new("shell-settings-mesh-system-summary")
+}
+
+fn install_mesh_summary_accessibility(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    summary: &MeshSystemSummary,
+) {
+    let _ = ui
+        .ctx()
+        .accesskit_node_builder(mesh_summary_accesskit_id(), |node| {
+            node.set_role(egui::accesskit::Role::Status);
+            node.set_live(egui::accesskit::Live::Polite);
+            node.set_label("This node mesh summary");
+            node.set_value(summary.accessibility_value());
+            node.set_bounds(egui::accesskit::Rect {
+                x0: rect.min.x.into(),
+                y0: rect.min.y.into(),
+                x1: rect.max.x.into(),
+                y1: rect.max.y.into(),
+            });
+        });
+}
+
+fn mesh_summary(ui: &mut egui::Ui, mesh: &MeshFacts) {
+    let summary = mesh_system_summary(mesh);
+    tile(ui, |ui| {
+        ui.label(
+            RichText::new("This node at a glance")
+                .color(Style::TEXT)
+                .size(Style::BODY)
+                .strong(),
+        );
+        ui.add_space(Style::SP_XS);
+        field(
+            ui,
+            "Connectivity",
+            &summary.connectivity_value,
+            summary.connectivity.tone(),
+        );
+        field(ui, "Role", &summary.role_value, Style::TEXT);
+        ui.add_space(Style::SP_XS);
+        muted_note(ui, &summary.reason);
+    });
+    install_mesh_summary_accessibility(ui, ui.min_rect(), &summary);
+    ui.add_space(Style::SP_S);
+}
+
 /// The Identity section (SETTINGS-4) — this node's mesh identity name + overlay
 /// address + tunnel cipher, folded from the world-readable snapshot. The Nebula
 /// certificate fingerprint is honestly `unknown`: the shell reads the world-readable
 /// mesh-status surface, not the root-only cert (§6/§7 — the same honest boundary the
 /// This Node plane draws for node-local telemetry).
 pub(super) fn identity_section(ui: &mut egui::Ui, mesh: &MeshFacts) {
+    mesh_summary(ui, mesh);
     if !mesh.seen {
         mesh_reading(ui);
         return;
@@ -105,6 +258,71 @@ fn role_description(role: &str) -> &'static str {
         "server" => "A headless mesh member running shared workloads and services.",
         "workstation" => "An interactive seat — this desktop rides the mesh as a workstation.",
         _ => "A pinned mesh member.",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mesh_summary_is_explicit_before_the_first_snapshot() {
+        let summary = mesh_system_summary(&MeshFacts::default());
+
+        assert_eq!(summary.connectivity, MeshConnectivity::Unavailable);
+        assert_eq!(
+            summary.connectivity_value,
+            "unavailable — no mesh status snapshot"
+        );
+        assert_eq!(summary.role_value, "unknown — no pinned directory role");
+        assert!(summary
+            .accessibility_value()
+            .contains("connectivity is unknown"));
+        assert!(summary
+            .accessibility_value()
+            .contains("no pinned role in the peer directory"));
+    }
+
+    #[test]
+    fn mesh_summary_reports_truthful_connectivity_and_role_states() {
+        let connected = MeshFacts {
+            seen: true,
+            peers_online: 2,
+            peers_total: 2,
+            role: Some("workstation".to_owned()),
+            ..MeshFacts::default()
+        };
+        let summary = mesh_system_summary(&connected);
+        assert_eq!(summary.connectivity, MeshConnectivity::Connected);
+        assert_eq!(summary.connectivity_value, "connected — 2/2 peers live");
+        assert_eq!(summary.role_value, "workstation");
+
+        let degraded = MeshFacts {
+            seen: true,
+            peers_online: 1,
+            peers_total: 2,
+            ..MeshFacts::default()
+        };
+        let summary = mesh_system_summary(&degraded);
+        assert_eq!(summary.connectivity, MeshConnectivity::Degraded);
+        assert_eq!(summary.connectivity_value, "degraded — 1/2 peers live");
+        assert!(summary.reason.contains("no pinned role"));
+    }
+
+    #[test]
+    fn mesh_summary_does_not_treat_inconsistent_counts_as_connected() {
+        let summary = mesh_system_summary(&MeshFacts {
+            seen: true,
+            peers_online: 3,
+            peers_total: 2,
+            ..MeshFacts::default()
+        });
+
+        assert_eq!(summary.connectivity, MeshConnectivity::Unknown);
+        assert!(summary
+            .connectivity_value
+            .contains("inconsistent peer count"));
+        assert!(summary.reason.contains("connectivity is unknown"));
     }
 }
 
