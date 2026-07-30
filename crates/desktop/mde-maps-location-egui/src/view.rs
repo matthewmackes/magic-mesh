@@ -12,9 +12,10 @@ use crate::model::{
     LocationSource, LocationSourceKind, MapViewState, Mg90ManagementMethod, Mg90SettingCategory,
     Mg90SettingDescriptor, Mg90State, OfflineMapManagerState, OfflineNavigationReadiness,
     OfflineNavigationStatus, ProviderContract, RouteOption, RoutePlan, RouteTraffic,
-    SettingValueType, SetupStep, SourceStatus, TripRecorderState, VehicleMirrorState,
-    VehicleMirrorStatus, VehicleRadioAvailability, VehicleRadioHealth, VehicleRadioOperation,
-    VehicleRadioPresence, VehicleState, WorkspaceTab,
+    SettingValueType, SetupStep, SourceStatus, TripRecorderState, VehicleHealthRail,
+    VehicleHealthRailSlot, VehicleHealthRailState, VehicleMirrorState, VehicleMirrorStatus,
+    VehicleRadioAvailability, VehicleRadioHealth, VehicleRadioOperation, VehicleRadioPresence,
+    VehicleState, WorkspaceTab,
 };
 use crate::MapsLocationSurface;
 
@@ -713,6 +714,19 @@ fn drive_hud(
         paint_idle_banner(&painter, banner);
     }
 
+    // Keep the six native MG90 positions visible in both Free Drive and active
+    // guidance. This rail is derived only from the accepted v2 projection; it
+    // never falls back to legacy signal values or manufactures missing rows.
+    let rail_height = if width < 520.0 { 132.0 } else { 104.0 };
+    let health_rail_rect = safe_rect(
+        rect.left() + margin,
+        below_banner,
+        width - 2.0 * margin,
+        rail_height,
+    );
+    paint_health_rail(ui, health_rail_rect, &state.vehicle_health_rail());
+    below_banner = health_rail_rect.bottom() + Style::SP_S;
+
     // Alert pills. Acquiring-GPS + offline-blocked are system-level (both states);
     // traffic + weather belong to an active route (guidance only).
     let pill_x = rect.left() + margin;
@@ -787,6 +801,224 @@ fn drive_hud(
         if let Some((center, hovered, pressed)) = fab_states[idx] {
             paint_fab(&painter, center, fab_r, hovered, pressed, key, muted);
         }
+    }
+}
+
+fn paint_health_rail(ui: &mut egui::Ui, rect: Rect, rail: &VehicleHealthRail) {
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::top_down(Align::Min)),
+    );
+    egui::Frame::NONE
+        .fill(HUD_CARD_BG.gamma_multiply(0.96))
+        .inner_margin(egui::Margin::symmetric(
+            Style::SP_S as i8,
+            Style::SP_XS as i8,
+        ))
+        .corner_radius(HUD_RADIUS_S)
+        .stroke(Stroke::new(1.0, health_rail_tone(rail.state)))
+        .show(&mut child, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Radio & GNSS health")
+                        .size(Style::SMALL)
+                        .strong()
+                        .color(Style::TEXT_STRONG),
+                );
+                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                    pill(ui, rail.state.label(), health_rail_tone(rail.state));
+                });
+            });
+            ui.add_space(Style::SP_XS);
+            ui.horizontal_top(|ui| {
+                let gap = Style::SP_XS;
+                let slot_width = ((ui.available_width() - gap * 5.0) / 6.0).max(1.0);
+                let slot_height = ui.available_height().max(30.0);
+                for slot in &rail.slots {
+                    let response = ui
+                        .allocate_ui_with_layout(
+                            Vec2::new(slot_width, slot_height),
+                            egui::Layout::top_down(Align::Center),
+                            |slot_ui| {
+                                let tile = slot_ui.max_rect();
+                                slot_ui
+                                    .painter()
+                                    .rect_filled(tile, HUD_RADIUS_S, HUD_CARD_HI);
+                                slot_ui.painter().rect_stroke(
+                                    tile,
+                                    HUD_RADIUS_S,
+                                    Stroke::new(1.0, Style::BORDER),
+                                    egui::StrokeKind::Inside,
+                                );
+                                let (icon_rect, _) = slot_ui.allocate_exact_size(
+                                    Vec2::new(slot_width.min(24.0), 22.0),
+                                    Sense::hover(),
+                                );
+                                paint_health_slot_glyph(
+                                    slot_ui.painter(),
+                                    icon_rect.center(),
+                                    slot,
+                                );
+                                slot_ui.add(
+                                    egui::Label::new(
+                                        RichText::new(slot.label)
+                                            .size(Style::SMALL)
+                                            .color(Style::TEXT_STRONG),
+                                    )
+                                    .wrap(),
+                                );
+                                slot_ui.add(
+                                    egui::Label::new(
+                                        RichText::new(slot.state.label())
+                                            .size(Style::SMALL)
+                                            .color(health_slot_tone(slot)),
+                                    )
+                                    .wrap(),
+                                );
+                                let operation = slot
+                                    .operation
+                                    .map_or("not reported", VehicleRadioOperation::label);
+                                slot_ui.add(
+                                    egui::Label::new(
+                                        RichText::new(operation)
+                                            .size(Style::SMALL)
+                                            .color(health_slot_tone(slot)),
+                                    )
+                                    .wrap(),
+                                );
+                            },
+                        )
+                        .response;
+                    response.on_hover_text(slot.accessibility_label());
+                    ui.add_space(gap);
+                }
+            });
+        });
+}
+
+fn health_rail_tone(state: VehicleHealthRailState) -> Color32 {
+    match state {
+        VehicleHealthRailState::Current => Style::OK,
+        VehicleHealthRailState::Stale => Style::WARN,
+        VehicleHealthRailState::Resyncing => Style::ACCENT,
+        VehicleHealthRailState::Unavailable => Style::TEXT_DIM,
+    }
+}
+
+fn health_slot_tone(slot: &VehicleHealthRailSlot) -> Color32 {
+    match slot.state {
+        VehicleHealthRailState::Stale => Style::WARN,
+        VehicleHealthRailState::Resyncing => Style::ACCENT,
+        VehicleHealthRailState::Unavailable => Style::TEXT_DIM,
+        VehicleHealthRailState::Current => match slot.operation {
+            Some(VehicleRadioOperation::Active) => Style::OK,
+            Some(VehicleRadioOperation::Standby) => Style::ACCENT,
+            Some(VehicleRadioOperation::Acquiring | VehicleRadioOperation::Degraded) => Style::WARN,
+            Some(VehicleRadioOperation::Fault) => Style::DANGER,
+            Some(VehicleRadioOperation::Disabled) | Some(VehicleRadioOperation::Unknown) | None => {
+                Style::TEXT_DIM
+            }
+            Some(VehicleRadioOperation::Stale) => Style::WARN,
+        },
+    }
+}
+
+fn paint_health_slot_glyph(painter: &Painter, center: Pos2, slot: &VehicleHealthRailSlot) {
+    let tone = health_slot_tone(slot);
+    let radius = 7.0;
+    let stroke = Stroke::new(1.8, tone);
+    match slot.state {
+        VehicleHealthRailState::Stale => {
+            painter.circle_stroke(center, radius, stroke);
+            painter.line_segment([center, center + Vec2::new(0.0, -4.0)], stroke);
+            painter.line_segment([center, center + Vec2::new(3.0, 2.0)], stroke);
+        }
+        VehicleHealthRailState::Resyncing => {
+            painter.circle_stroke(center, radius, stroke);
+            let arc_points = (0..=12)
+                .map(|index| {
+                    let angle = 0.4 + (4.2 * index as f32 / 12.0);
+                    center + Vec2::new(angle.cos(), angle.sin()) * (radius + 2.0)
+                })
+                .collect();
+            painter.line(arc_points, Stroke::new(1.4, tone));
+        }
+        VehicleHealthRailState::Unavailable => {
+            painter.circle_stroke(center, radius, stroke);
+            painter.line_segment(
+                [center + Vec2::new(-5.0, 5.0), center + Vec2::new(5.0, -5.0)],
+                stroke,
+            );
+        }
+        VehicleHealthRailState::Current => match slot.presence {
+            Some(VehicleRadioPresence::NotInstalled) => {
+                painter.circle_stroke(center, radius, Stroke::new(1.4, tone));
+                painter.line_segment(
+                    [center + Vec2::new(-5.0, 5.0), center + Vec2::new(5.0, -5.0)],
+                    stroke,
+                );
+            }
+            _ => match slot.operation {
+                Some(VehicleRadioOperation::Active) => {
+                    painter.circle_filled(center, radius, tone.gamma_multiply(0.2));
+                    painter.line_segment(
+                        [center + Vec2::new(-4.0, 0.0), center + Vec2::new(-1.0, 3.0)],
+                        stroke,
+                    );
+                    painter.line_segment(
+                        [center + Vec2::new(-1.0, 3.0), center + Vec2::new(5.0, -4.0)],
+                        stroke,
+                    );
+                }
+                Some(VehicleRadioOperation::Standby) => {
+                    painter.circle_stroke(center, radius, stroke);
+                }
+                Some(VehicleRadioOperation::Acquiring | VehicleRadioOperation::Degraded) => {
+                    painter.add(Shape::convex_polygon(
+                        vec![
+                            center + Vec2::new(0.0, -radius),
+                            center + Vec2::new(radius, radius),
+                            center + Vec2::new(-radius, radius),
+                        ],
+                        tone.gamma_multiply(0.18),
+                        stroke,
+                    ));
+                }
+                Some(VehicleRadioOperation::Fault) => {
+                    painter.circle_stroke(center, radius, stroke);
+                    painter.line_segment(
+                        [center + Vec2::new(-5.0, -5.0), center + Vec2::new(5.0, 5.0)],
+                        stroke,
+                    );
+                    painter.line_segment(
+                        [center + Vec2::new(-5.0, 5.0), center + Vec2::new(5.0, -5.0)],
+                        stroke,
+                    );
+                }
+                Some(VehicleRadioOperation::Disabled) => {
+                    painter.line_segment(
+                        [
+                            center + Vec2::new(-5.0, -4.0),
+                            center + Vec2::new(-5.0, 4.0),
+                        ],
+                        stroke,
+                    );
+                    painter.line_segment(
+                        [center + Vec2::new(5.0, -4.0), center + Vec2::new(5.0, 4.0)],
+                        stroke,
+                    );
+                    painter.line_segment(
+                        [center + Vec2::new(-5.0, 0.0), center + Vec2::new(5.0, 0.0)],
+                        stroke,
+                    );
+                }
+                Some(VehicleRadioOperation::Unknown | VehicleRadioOperation::Stale) | None => {
+                    painter.circle_stroke(center, radius, stroke);
+                    painter.line_segment([center, center + Vec2::new(0.0, -4.0)], stroke);
+                }
+            },
+        },
     }
 }
 
@@ -6782,6 +7014,77 @@ mod tests {
     }
 
     #[test]
+    fn drive_health_rail_renders_absent_stale_and_current_domains() {
+        let mut absent = MapsLocationSurface::live();
+        absent.active = WorkspaceTab::Drive;
+        let absent_texts = painted_texts(&mut absent);
+        assert!(absent_texts
+            .iter()
+            .any(|text| text == "Radio & GNSS health"));
+        assert!(absent_texts.iter().any(|text| text == "Unavailable"));
+        for label in [
+            "Cell A",
+            "Cell B",
+            "Wi-Fi A",
+            "Wi-Fi B",
+            "Bluetooth",
+            "GNSS",
+        ] {
+            assert!(
+                absent_texts.iter().any(|text| text == label),
+                "absent rail must keep the {label} position: {absent_texts:?}"
+            );
+        }
+
+        let now = test_now_ms();
+        let mut stale = MapsLocationSurface::live();
+        let mut stale_snapshot = healthy_v2_snapshot(now);
+        stale_snapshot.published_at_ms = now - 6_000;
+        stale.refresh_from_vehicle_v2(&stale_snapshot);
+        stale.active = WorkspaceTab::Drive;
+        let stale_texts = painted_texts(&mut stale);
+        assert!(stale_texts.iter().any(|text| text == "Stale"));
+        assert!(stale_texts.iter().any(|text| text == "Cell A"));
+        assert!(stale_texts.iter().any(|text| text == "GNSS"));
+
+        let mut healthy = MapsLocationSurface::live();
+        healthy.refresh_from_vehicle_v2(&healthy_v2_snapshot(now));
+        healthy.active = WorkspaceTab::Drive;
+        let healthy_texts = painted_texts(&mut healthy);
+        assert!(healthy_texts.iter().any(|text| text == "Current"));
+        assert!(healthy_texts.iter().any(|text| text == "Active"));
+        assert!(healthy_texts.iter().any(|text| text == "Standby"));
+        let positions: Vec<usize> = [
+            "Cell A",
+            "Cell B",
+            "Wi-Fi A",
+            "Wi-Fi B",
+            "Bluetooth",
+            "GNSS",
+        ]
+        .iter()
+        .map(|label| {
+            healthy_texts
+                .iter()
+                .position(|text| text == label)
+                .unwrap_or_else(|| panic!("healthy rail missing {label}: {healthy_texts:?}"))
+        })
+        .collect();
+        assert!(
+            positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "native health positions must remain ordered: {positions:?}"
+        );
+
+        // The same rail remains in place once guidance is active.
+        healthy.local_navigation.navigating = true;
+        let active_route_texts = painted_texts(&mut healthy);
+        assert!(active_route_texts
+            .iter()
+            .any(|text| text == "Radio & GNSS health"));
+        assert!(active_route_texts.iter().any(|text| text == "Current"));
+    }
+
+    #[test]
     fn hostile_map_attribution_is_bounded_before_layout() {
         let hostile = "untrusted-provider-label-".repeat(MAX_MAP_ATTRIBUTION_CHARS * 4);
         let bounded = bounded_map_attribution(&hostile);
@@ -6912,6 +7215,93 @@ mod tests {
             }
             _ => {}
         }
+    }
+
+    fn healthy_v2_snapshot(published_at_ms: i64) -> mackes_mesh_types::vehicle::VehicleStateV2 {
+        use mackes_mesh_types::vehicle::{
+            DomainFreshness, FreshnessState, RadioHealth, RadioId, RadioInventory, RadioMetrics,
+            RadioOperation, RadioPresence, RadioRole, SnapshotProvenance, SnapshotSource,
+            VehicleDomainFreshness, VehicleState, VehicleStateV2,
+        };
+
+        let mut legacy = VehicleState::offline("rig-1");
+        legacy.online = true;
+        legacy.model = "MG90".to_string();
+        legacy.esn = "ESN-TEST".to_string();
+        let mut snapshot = VehicleStateV2::from_v1(
+            &legacy,
+            "rig-1",
+            9,
+            1_000,
+            published_at_ms,
+            SnapshotProvenance {
+                source: SnapshotSource::DirectGateway,
+                source_id: Some("rig-1".to_string()),
+                relay: None,
+            },
+        );
+        let fresh = DomainFreshness {
+            state: FreshnessState::Fresh,
+            age_ms: Some(0),
+            reason: None,
+        };
+        snapshot.freshness = VehicleDomainFreshness {
+            identity: fresh.clone(),
+            radios: fresh.clone(),
+            gnss: fresh.clone(),
+            vehicle: fresh.clone(),
+            power: fresh,
+        };
+        let row = |id, role, operation, active_path| RadioHealth {
+            id,
+            presence: RadioPresence::Installed,
+            operation,
+            reason_code: None,
+            age_ms: Some(12),
+            configured_role: role,
+            active_path,
+            metrics: RadioMetrics::Unknown,
+        };
+        snapshot.radios = RadioInventory::new(vec![
+            row(
+                RadioId::CellularA,
+                RadioRole::Wan,
+                RadioOperation::Active,
+                true,
+            ),
+            row(
+                RadioId::CellularB,
+                RadioRole::Wan,
+                RadioOperation::Standby,
+                false,
+            ),
+            row(
+                RadioId::WifiA,
+                RadioRole::AccessPoint,
+                RadioOperation::Standby,
+                false,
+            ),
+            row(
+                RadioId::WifiB,
+                RadioRole::Backhaul,
+                RadioOperation::Standby,
+                false,
+            ),
+            row(
+                RadioId::Bluetooth,
+                RadioRole::Bluetooth,
+                RadioOperation::Standby,
+                false,
+            ),
+            row(
+                RadioId::Gnss,
+                RadioRole::Gnss,
+                RadioOperation::Active,
+                false,
+            ),
+        ])
+        .expect("six native rows fit the bounded inventory");
+        snapshot
     }
 
     /// Every text string painted by one frame of the panel, recursively.

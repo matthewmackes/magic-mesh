@@ -657,6 +657,193 @@ impl VehicleRadioHealth {
     }
 }
 
+/// The six native MG90 interfaces have fixed positions in the driver-facing
+/// health rail.  A missing row is deliberately not converted to
+/// `NotInstalled`: the v2 inventory only proves hardware state when it reports
+/// one explicitly.
+pub const VEHICLE_HEALTH_RAIL_SLOTS: [(&str, &str); 6] = [
+    ("cellular-a", "Cell A"),
+    ("cellular-b", "Cell B"),
+    ("wifi-a", "Wi-Fi A"),
+    ("wifi-b", "Wi-Fi B"),
+    ("bluetooth", "Bluetooth"),
+    ("gnss", "GNSS"),
+];
+
+/// Freshness state shown by the persistent Maps/Car radio health rail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VehicleHealthRailState {
+    /// A current snapshot backs the rail's domain observations.
+    Current,
+    /// Retained observations are past their freshness budget.
+    Stale,
+    /// The consumer is waiting for a complete fresh snapshot.
+    Resyncing,
+    /// No valid typed observation is available.
+    Unavailable,
+}
+
+impl VehicleHealthRailState {
+    /// Stable operator-facing label used by both the renderer and tests.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Current => "Current",
+            Self::Stale => "Stale",
+            Self::Resyncing => "Resyncing",
+            Self::Unavailable => "Unavailable",
+        }
+    }
+}
+
+/// One stable position in the persistent radio/GNSS health rail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VehicleHealthRailSlot {
+    /// Stable v2 identifier for this position.
+    pub id: &'static str,
+    /// Compact visible label for this position.
+    pub label: &'static str,
+    /// Consumer freshness state for the observed row.
+    pub state: VehicleHealthRailState,
+    /// Producer operation, when this interface was observed.
+    pub operation: Option<VehicleRadioOperation>,
+    /// Producer-proven hardware presence, when this interface was observed.
+    pub presence: Option<VehicleRadioPresence>,
+    /// Effective source age, preserving unknown as `None`.
+    pub age_ms: Option<u64>,
+    /// Typed producer reason, when present.
+    pub reason: Option<String>,
+    /// Whether the observed interface carries the selected uplink.
+    pub active_path: bool,
+}
+
+impl VehicleHealthRailSlot {
+    fn missing(id: &'static str, label: &'static str, state: VehicleHealthRailState) -> Self {
+        Self {
+            id,
+            label,
+            state,
+            operation: None,
+            presence: None,
+            age_ms: None,
+            reason: None,
+            active_path: false,
+        }
+    }
+
+    /// A complete label for assistive technology and hover descriptions.
+    #[must_use]
+    pub fn accessibility_label(&self) -> String {
+        let operation = self.operation.map_or("not reported", |op| op.label());
+        let presence = self
+            .presence
+            .map_or("not observed", |presence| presence.label());
+        let path = if self.active_path {
+            "; selected uplink"
+        } else {
+            ""
+        };
+        format!(
+            "{}: {}; {}; {}; age {}{}",
+            self.label,
+            self.state.label(),
+            presence,
+            operation,
+            self.age_ms
+                .map_or_else(|| "unknown".to_string(), format_age_ms),
+            path,
+        )
+    }
+}
+
+/// Fixed-position, no-fabrication health projection for the Maps/Car HUD.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VehicleHealthRail {
+    /// Overall freshness state of the projected rail.
+    pub state: VehicleHealthRailState,
+    /// Exactly six native positions, in contract order.
+    pub slots: [VehicleHealthRailSlot; 6],
+}
+
+impl VehicleHealthRail {
+    fn from_projected(health: &VehicleRadioHealth, mirror: VehicleMirrorState) -> Self {
+        let state = match mirror {
+            VehicleMirrorState::Current => {
+                if health.availability == VehicleRadioAvailability::Unavailable {
+                    VehicleHealthRailState::Unavailable
+                } else if health.radios_freshness.state == VehicleFreshnessState::Stale
+                    || health.gnss_freshness.state == VehicleFreshnessState::Stale
+                {
+                    VehicleHealthRailState::Stale
+                } else if health.radios_freshness.state != VehicleFreshnessState::Fresh
+                    || health.gnss_freshness.state != VehicleFreshnessState::Fresh
+                {
+                    VehicleHealthRailState::Unavailable
+                } else {
+                    VehicleHealthRailState::Current
+                }
+            }
+            VehicleMirrorState::StaleRetained => VehicleHealthRailState::Stale,
+            VehicleMirrorState::ResyncingNoFreshSnapshot => VehicleHealthRailState::Resyncing,
+            VehicleMirrorState::UnavailableMalformed => VehicleHealthRailState::Unavailable,
+        };
+
+        let slots = std::array::from_fn(|index| {
+            let (id, label) = VEHICLE_HEALTH_RAIL_SLOTS[index];
+            let Some(row) = health.radios.iter().find(|row| row.id == id) else {
+                return VehicleHealthRailSlot::missing(
+                    id,
+                    label,
+                    VehicleHealthRailState::Unavailable,
+                );
+            };
+            let domain_freshness = if id == "gnss" {
+                health.gnss_freshness.state
+            } else {
+                health.radios_freshness.state
+            };
+            let slot_state = match state {
+                VehicleHealthRailState::Current => {
+                    if domain_freshness == VehicleFreshnessState::Stale
+                        || row.operation == VehicleRadioOperation::Stale
+                    {
+                        VehicleHealthRailState::Stale
+                    } else if domain_freshness != VehicleFreshnessState::Fresh
+                        || row.operation == VehicleRadioOperation::Unknown
+                    {
+                        VehicleHealthRailState::Unavailable
+                    } else {
+                        VehicleHealthRailState::Current
+                    }
+                }
+                VehicleHealthRailState::Stale => VehicleHealthRailState::Stale,
+                VehicleHealthRailState::Resyncing => VehicleHealthRailState::Resyncing,
+                VehicleHealthRailState::Unavailable => VehicleHealthRailState::Unavailable,
+            };
+            VehicleHealthRailSlot {
+                id,
+                label,
+                state: slot_state,
+                operation: Some(row.operation),
+                presence: Some(row.presence),
+                age_ms: row.age_ms,
+                reason: row.reason.clone(),
+                active_path: row.active_path,
+            }
+        });
+
+        Self { state, slots }
+    }
+}
+
+fn format_age_ms(age_ms: u64) -> String {
+    if age_ms < 1_000 {
+        format!("{age_ms} ms")
+    } else {
+        format!("{:.1} s", age_ms as f32 / 1_000.0)
+    }
+}
+
 impl Default for VehicleRadioHealth {
     fn default() -> Self {
         Self::unavailable("typed v2 radio inventory unavailable")
@@ -1446,6 +1633,17 @@ impl MapsLocationSurface {
         self.set_vehicle_mirror_status(VehicleMirrorStatus::from_v2_at(v, now_ms));
     }
 
+    /// Project the currently accepted v2 facts into the fixed-position
+    /// Maps/Car health rail. The rail never consults legacy WAN fields or
+    /// creates rows for interfaces absent from the typed inventory.
+    #[must_use]
+    pub fn vehicle_health_rail(&self) -> VehicleHealthRail {
+        VehicleHealthRail::from_projected(
+            &self.vehicle_radio_health,
+            self.vehicle_mirror_status.state,
+        )
+    }
+
     /// Read retained vehicle + overlay mirrors off the Bus (fail-soft, honest
     /// off-mesh no-op) and fold them into the cockpit.
     ///
@@ -1513,8 +1711,10 @@ impl MapsLocationSurface {
                 "typed v2 radio inventory unavailable; using legacy vehicle mirror",
             );
         } else {
-            self.vehicle_radio_health =
-                VehicleRadioHealth::unavailable("typed v2 radio inventory unavailable");
+            // Keep the last accepted typed projection while the Bus is missing
+            // a fresh payload. The rail labels observed rows Resyncing (and
+            // missing positions Unavailable) rather than erasing honest
+            // retained facts or inventing hardware state.
             let status = self
                 .vehicle_mirror_status
                 .resyncing_no_fresh_snapshot(unix_now_ms());
@@ -6461,6 +6661,67 @@ mod tests {
         snapshot
     }
 
+    fn complete_healthy_vehicle_snapshot(
+        published_at_ms: i64,
+    ) -> mackes_mesh_types::vehicle::VehicleStateV2 {
+        use mackes_mesh_types::vehicle::{
+            RadioHealth, RadioId, RadioInventory, RadioMetrics, RadioOperation, RadioPresence,
+            RadioRole,
+        };
+
+        let mut snapshot = typed_vehicle_snapshot(published_at_ms);
+        let row = |id, role, operation, active_path| RadioHealth {
+            id,
+            presence: RadioPresence::Installed,
+            operation,
+            reason_code: None,
+            age_ms: Some(12),
+            configured_role: role,
+            active_path,
+            metrics: RadioMetrics::Unknown,
+        };
+        snapshot.radios = RadioInventory::new(vec![
+            row(
+                RadioId::CellularA,
+                RadioRole::Wan,
+                RadioOperation::Active,
+                true,
+            ),
+            row(
+                RadioId::CellularB,
+                RadioRole::Wan,
+                RadioOperation::Standby,
+                false,
+            ),
+            row(
+                RadioId::WifiA,
+                RadioRole::AccessPoint,
+                RadioOperation::Standby,
+                false,
+            ),
+            row(
+                RadioId::WifiB,
+                RadioRole::Backhaul,
+                RadioOperation::Standby,
+                false,
+            ),
+            row(
+                RadioId::Bluetooth,
+                RadioRole::Bluetooth,
+                RadioOperation::Standby,
+                false,
+            ),
+            row(
+                RadioId::Gnss,
+                RadioRole::Gnss,
+                RadioOperation::Active,
+                false,
+            ),
+        ])
+        .expect("six native rows fit the bounded inventory");
+        snapshot
+    }
+
     #[test]
     fn typed_radio_projection_preserves_contract_order_and_presence_states() {
         let now = 1_700_000_000_000;
@@ -6522,6 +6783,77 @@ mod tests {
         assert_eq!(health.radios[0].operation, VehicleRadioOperation::Unknown);
         assert_eq!(health.radios[0].age_label(), "age unknown");
         assert_eq!(health.availability, VehicleRadioAvailability::Degraded);
+    }
+
+    #[test]
+    fn health_rail_absent_keeps_six_positions_without_inventing_hardware() {
+        let rail = MapsLocationSurface::live().vehicle_health_rail();
+
+        assert_eq!(rail.state, VehicleHealthRailState::Unavailable);
+        assert_eq!(
+            rail.slots.iter().map(|slot| slot.id).collect::<Vec<_>>(),
+            vec![
+                "cellular-a",
+                "cellular-b",
+                "wifi-a",
+                "wifi-b",
+                "bluetooth",
+                "gnss"
+            ]
+        );
+        assert!(rail.slots.iter().all(|slot| {
+            slot.state == VehicleHealthRailState::Unavailable
+                && slot.presence.is_none()
+                && slot.operation.is_none()
+        }));
+    }
+
+    #[test]
+    fn health_rail_healthy_domains_are_current_in_contract_order() {
+        let now = test_now_ms();
+        let mut surface = MapsLocationSurface::live();
+        surface.refresh_from_vehicle_v2(&complete_healthy_vehicle_snapshot(now));
+        let rail = surface.vehicle_health_rail();
+
+        assert_eq!(rail.state, VehicleHealthRailState::Current);
+        assert!(rail.slots.iter().all(|slot| {
+            slot.state == VehicleHealthRailState::Current
+                && slot.presence == Some(VehicleRadioPresence::Installed)
+        }));
+        assert_eq!(rail.slots[0].operation, Some(VehicleRadioOperation::Active));
+        assert_eq!(
+            rail.slots[1].operation,
+            Some(VehicleRadioOperation::Standby)
+        );
+        assert!(rail.slots[0].active_path);
+        assert!(!rail.slots[1].active_path);
+    }
+
+    #[test]
+    fn health_rail_stale_and_resyncing_preserve_observed_rows_explicitly() {
+        let now = 1_700_000_000_000;
+        let mut surface = MapsLocationSurface::live();
+        let mut snapshot = complete_healthy_vehicle_snapshot(now);
+        snapshot.published_at_ms = now - 6_000;
+        surface.refresh_from_vehicle_v2(&snapshot);
+        let stale = surface.vehicle_health_rail();
+        assert_eq!(stale.state, VehicleHealthRailState::Stale);
+        assert!(stale
+            .slots
+            .iter()
+            .all(|slot| slot.state == VehicleHealthRailState::Stale));
+
+        let resyncing = surface
+            .vehicle_mirror_status
+            .resyncing_no_fresh_snapshot(now + 7_000);
+        surface.set_vehicle_mirror_status(resyncing);
+        let resync = surface.vehicle_health_rail();
+        assert_eq!(resync.state, VehicleHealthRailState::Resyncing);
+        assert!(resync
+            .slots
+            .iter()
+            .all(|slot| slot.state == VehicleHealthRailState::Resyncing));
+        assert!(resync.slots.iter().all(|slot| slot.presence.is_some()));
     }
 
     #[test]
