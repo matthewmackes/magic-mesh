@@ -192,17 +192,16 @@ remains here under a completed status.
   and forwards focused input. Chromium, browser chrome, tabs, page execution,
   media decode, and page failures remain inside the guest.
 - Current state: The old shell Browser, helper engines, worker/package seams,
-  and Browser-specific daemon integrations remain in `magic-mesh`. Existing
-  Workloads contracts provision `DeliveryType::DesktopVm`; the VDI stack
-  supports RDP/VNC/SPICE and damage-aware texture uploads, with RDP audio
-  disabled. The 199-path source/destination inventory, provenance record, and
-  fail-closed verifier live under `docs/design/browser-stack-extraction/` and
-  `install-helpers/`, alongside the 2026-07-28 archive snapshot. The typed
-  `browser-provision` seam declares a fail-closed DesktopVm desired workload
-  with the 4-vCPU/8192-MiB/64-GiB baseline, strict node/name validation, and
-  deterministic daemon tests. Front Door now exposes a Browser VM workflow
-  card routed to `Surface::Browser` with guest-owned execution, VDI unavailable
-  state, and 81 focused shell tests passing; live realization and extraction remain open.
+  and Browser-specific daemon integrations remain in `magic-mesh`. Workloads
+  provision `DeliveryType::DesktopVm`; VDI supports RDP/VNC/SPICE and
+  damage-aware texture uploads, with RDP audio disabled. The 199-path
+  source/destination inventory and fail-closed verifier remain under
+  `docs/design/browser-stack-extraction/` and `install-helpers/`. The typed
+  `browser-provision` seam has the 4-vCPU/8192-MiB/64-GiB baseline and tests;
+  Front Door routes a guest-owned Browser VM workflow with VDI-unavailable
+  state. Browser VM now exposes truthful AccessKit unavailable/connecting/
+  connected/shell-owned/disconnected states; 84 focused shell tests pass, while
+  live realization and extraction remain open.
 - Remaining work:
 
   1. Re-run and review the source commit, workspace/package/process inventory,
@@ -503,8 +502,9 @@ remains here under a completed status.
   capability reporting, CopyText-clear/native-paste round-trip, and rejection
   of no-op provider writes now have focused farm coverage. KDC/mobile ingress now
   has typed authorization, UTF-8/1 MiB bounds, peer-scoped deduplication, and
-  honest metadata with 22 focused farm tests; real mesh history/materialization
-  and RDP/SPICE text channels remain unsupported.
+  honest metadata with 22 focused farm tests. Mesh Teams now shows Local/Remote/
+  Source unavailable provenance with action hints and 5 clipboard tests; real
+  mesh materialization and RDP/SPICE text channels remain unsupported.
 - Remaining work:
 
   1. Map direct-seat shortcuts into `egui::Event::{Copy,Cut,Paste}`, consume
@@ -585,18 +585,18 @@ remains here under a completed status.
   per-radio state/freshness. Real route, maneuver, map, trip, and vehicle data
   replace placeholders. Carbon requirements retire while egui, shared `Style`,
   Construct, Car, and direct DRM remain governed.
-- Current state: `mackesd` still assumes one managed MG90/direct Ethernet and
-  publishes collapsed legacy radio state; the live unit reports LTE/WAN and power but no GNSS fix; OBD parsing is absent. Raster MBTiles/FTS5 search
-  serve one region. Maps owns basemap/search seams, but Valhalla, route/lane/
-  speed helpers, bearing, and several admin actions remain unwired. A typed v2
-  identity/radio/freshness/provenance baseline dual-publishes beside v1, with
-  11 mesh-type and 69 worker tests passing. Maps/Car now projects bounded radio
-  presence, operation, GNSS/radio freshness, retained age, provenance, and
-  typed Current/Stale/Resyncing/Unavailable mirror state; 13 consumer tests pass. The bounded MG90/manager roster has independent poll/heartbeat plans,
-  latest-wins/no-source behavior, deterministic all-source selection, and 44
-  vehicle tests pass. Maps HUD removes road-name speed/lane heuristics and
-  paints explicit unavailable states; Airspace distinguishes unconfigured,
-  offline, fresh, and stale scanner data with 17 focused tests; routing Start remains disabled when unavailable. Live adapters and route/render cutover remain.
+- Current state: `mackesd` still assumes one managed MG90/direct Ethernet; the live unit reports LTE/WAN and power but no GNSS fix, and OBD parsing is absent.
+  Raster MBTiles/FTS5 serves one region; Maps owns basemap/search, while
+  Valhalla, route/lane/speed helpers, bearing, and admin actions remain unwired.
+  Typed v2 identity/radio/freshness/provenance dual-publishes beside v1, with
+  11 mesh-type and 69 worker tests passing. Maps/Car projects bounded radio
+  presence, operation, freshness, age, provenance, and mirror states; 13 consumer
+  tests pass. Car status tiles expose compact shared tones and explicit
+  stale/unavailable accessibility labels. The bounded MG90/manager roster has
+  independent poll/heartbeat plans, latest-wins/no-source behavior, deterministic
+  all-source selection, and 44 vehicle tests pass. Maps HUD and Airspace expose
+  honest unavailable/stale states with 17 focused tests; live adapters and
+  route/render cutover remain.
 - Remaining work:
   1. Consume WL-UX-009's platform-wide Carbon-requirement retirement and update
      the Maps/Car-specific authority while retaining egui, shared `Style`,
