@@ -110,6 +110,22 @@ the service. The GUI binary's headless `--help` probe is not counted because
 Winit requires a display. This remains a Dell proofing Alpha, not a production
 promotion; artifacts are unsigned and no fleet promotion was attempted.
 
+2026-07-30 integrated engineering Alpha cut for Dell proofing: source tip
+`49839583` (live Communications projections, native DRM/VNC text clipboard,
+MG90 health rail, provider-aware This Node, overlay-safe Home gestures, and
+bounded animated taskbar/tray geometry) was built on BigBoy through
+`install-helpers/xcp-build.sh rpm`. Base
+`magic-mesh-12.1.6-1.x86_64.rpm` (82.2 MiB, sha256
+`d87c787cb4e97bcb5987996f03a7e03207c4d08a5c61a5b1f4028740ae979537`), browser
+`magic-mesh-browser-12.1.6-1.x86_64.rpm` (38.9 MiB, sha256
+`65e5b6dd9d48820d0f67f60db4a1fb8ddae5f26491062987e07cbee05fbfff6e`), and
+lighthouse `magic-mesh-lighthouse-12.1.6-1.x86_64.rpm` (11.2 MiB, sha256
+`c2f616fc31b3b323bb2f47a558c85412908bb990206c2b1144ea298375ebd5bb`) all
+passed the 90 MiB payload guard. The cut is staged in
+`/root/mcnf-release-artifacts` for Dell proofing. It is unsigned and has not
+been promoted to the fleet; live Dell installation and GUI visual signoff
+remain the next proofing action.
+
 2026-07-07 production-candidate evidence: latest rebuilt
 `magic-mesh-12.0.0-1.x86_64` (`/root/mcnf-release-artifacts`, 112291230
 bytes, built 13:19 EDT, sha256
