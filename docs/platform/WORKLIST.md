@@ -993,18 +993,17 @@ remains here under a completed status.
   restore a default list. Exactly one underline identifies the focused
   workspace; no running/open indicator exists. Home is an icon-free wallpaper
   and the App Grid is deleted.
-- Current state: `nav_bar.rs` now owns persisted `Floating`/`Docked` placement,
-  a full-width 48px Bottom taskbar with fixed 40px targets, centered pins,
-  overflow bounds, ordered pin persistence, focused-surface underlining,
-  searchable first-boot pin selection, and a tested slide/melt transition.
-  Bottom mode reserves an animated Windows-style clock/icon tray without grade
-  text; side mode retains the detailed top status strip. Start uses Front Door
-  search; old group labels/pill geometry are gone. `springboard.rs` still owns
-  grid/tile presentation and Fleet & Mesh/Workloads cutover remains open
-  (`Surface::FleetMesh` exists; Workloads retains `Surface::InfraCode`). Dell
-  Alpha proof: Fedora 44 12.1.6-1 base/browser RPMs from source tip
-  `247db21d` installed on Dell-LAPTOP; transaction test, `rpm -V`, daemon/help,
-  and active shell service with zero restarts passed (hashes in evidence).
+- Current state: `nav_bar.rs` owns persisted `Floating`/`Docked` placement,
+  full-width 48px Bottom geometry, fixed 40px targets, centered pins, overflow
+  bounds, pin persistence, focus underlining, first-boot search, and tested
+  slide/melt motion. Bottom reserves an animated clock/icon tray without grade
+  text; side retains the detailed top strip; Start uses Front Door search.
+  `springboard.rs` is gesture-only: the retired App Grid painter,
+  selection/open path, zoom ghost, and grid tests are deleted; 14 focused
+  shell/front-door tests pass. Fleet & Mesh/Workloads remains open. Prior Dell
+  proof used `247db21d`; a fresh unsigned Alpha from integrated tip `49839583`
+  is staged for Dell proofing with artifact/hash evidence in
+  `docs/ops/promotion-pipeline.md`.
 - Remaining work:
 
   1. Reconcile taskbar-specific authority after WL-UX-009 retires the global
