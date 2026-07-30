@@ -35,7 +35,69 @@ use crate::link::{
 use crate::pixel::{Framebuffer, FramebufferError, PixelFormat};
 use crate::tier::RdpTierSettings;
 use mackes_mesh_types::vdi_clipboard::VdiClipboardStatus;
+use mde_egui::clipboard::TextClipboard;
 use mde_vdi_core::{DamageLog, DamageRect, FrameDamage};
+
+/// Why an RDP text clipboard operation could not be completed.
+///
+/// CLIPRDR is not wired into the pinned IronRDP session yet. Keeping this error
+/// distinct from a successful empty clipboard prevents a caller from treating a
+/// missing channel as a valid clear/read result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RdpClipboardError {
+    /// The RDP connection has no CLIPRDR processor in this backend.
+    Unsupported,
+}
+
+impl core::fmt::Display for RdpClipboardError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Unsupported => f.write_str("RDP CLIPRDR clipboard is unsupported"),
+        }
+    }
+}
+
+impl std::error::Error for RdpClipboardError {}
+
+/// Text-clipboard adapter for an RDP session whose CLIPRDR channel is absent.
+///
+/// This is the native seam future CLIPRDR wiring will replace. Reads return no
+/// text and writes return/record [`RdpClipboardError::Unsupported`]; neither
+/// operation is reported as successful while the protocol channel is missing.
+#[derive(Debug, Default)]
+pub struct RdpTextClipboard {
+    last_error: Option<RdpClipboardError>,
+}
+
+impl RdpTextClipboard {
+    /// Create an adapter for the currently unsupported CLIPRDR path.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { last_error: None }
+    }
+
+    /// Attempt to send text through CLIPRDR.
+    pub fn write_text_checked(&mut self, _text: &str) -> Result<(), RdpClipboardError> {
+        Err(RdpClipboardError::Unsupported)
+    }
+
+    /// Take the error captured by the infallible shared trait callback.
+    pub fn take_error(&mut self) -> Option<RdpClipboardError> {
+        self.last_error.take()
+    }
+}
+
+impl TextClipboard for RdpTextClipboard {
+    fn read_text(&mut self) -> Option<String> {
+        None
+    }
+
+    fn write_text(&mut self, text: &str) {
+        if let Err(error) = self.write_text_checked(text) {
+            self.last_error = Some(error);
+        }
+    }
+}
 
 /// Current RDP text clipboard capability.
 ///
@@ -128,6 +190,12 @@ impl RdpSession {
     #[must_use]
     pub fn clipboard_status(&self) -> VdiClipboardStatus {
         rdp_clipboard_status()
+    }
+
+    /// Create the honest shared text-clipboard seam for this session.
+    #[must_use]
+    pub fn text_clipboard(&self) -> RdpTextClipboard {
+        RdpTextClipboard::new()
     }
 
     // ── Decode side (fed by the wire pump or by tests) ──────────────────────
@@ -381,13 +449,14 @@ impl RdpSession {
 
 #[cfg(test)]
 mod tests {
-    use super::RdpSession;
+    use super::{RdpClipboardError, RdpSession, RdpTextClipboard};
     use crate::config::RdpConfig;
     use crate::egui::{Color32, Event, Key, Modifiers, Pos2};
     use crate::input::{RdpInputEvent, Scancode};
     use crate::link::{QualityMode, QualityTier};
     use crate::pixel::PixelFormat;
     use mackes_mesh_types::vdi_clipboard::VdiClipboardLaneStatus;
+    use mde_egui::clipboard::TextClipboard;
 
     // The smallest RDP-legal desktop (validate() enforces a 200px minimum); tests
     // paint a tiny rect at the origin and assert on the first row's pixels.
@@ -414,6 +483,19 @@ mod tests {
                 other => panic!("expected unsupported RDP clipboard lane, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn text_clipboard_seam_does_not_claim_unsupported_operations_succeeded() {
+        let mut clipboard = RdpTextClipboard::new();
+        assert!(clipboard.read_text().is_none());
+        assert_eq!(
+            clipboard.write_text_checked("hello"),
+            Err(RdpClipboardError::Unsupported)
+        );
+        clipboard.write_text("hello");
+        assert_eq!(clipboard.take_error(), Some(RdpClipboardError::Unsupported));
+        assert!(clipboard.read_text().is_none());
     }
 
     #[test]

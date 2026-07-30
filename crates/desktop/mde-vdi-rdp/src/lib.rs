@@ -70,5 +70,5 @@ pub use link::{
 };
 pub use pin::{pin_action, pin_decision, Fingerprint, PinAction, PinOutcome, PinStore};
 pub use pixel::{Framebuffer, FramebufferError, PixelFormat};
-pub use session::{rdp_clipboard_status, RdpSession};
+pub use session::{rdp_clipboard_status, RdpClipboardError, RdpSession, RdpTextClipboard};
 pub use tier::RdpTierSettings;

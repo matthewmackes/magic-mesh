@@ -27,8 +27,69 @@ use crate::egui::{ColorImage, Event};
 use crate::input::{map_event, ModifierState, SpiceInputEvent};
 use crate::pixel::{Framebuffer, FramebufferError, SurfaceFormat};
 use mackes_mesh_types::vdi_clipboard::VdiClipboardStatus;
+use mde_egui::clipboard::TextClipboard;
 use mde_vdi_core::{DamageLog, FrameDamage};
 use spice_client::DisplaySurface;
+
+/// Why a SPICE text clipboard operation could not be completed.
+///
+/// The pinned `spice-client` does not expose the vdagent clipboard messages, so
+/// an empty read or clear must not be used to imply that a channel exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpiceClipboardError {
+    /// The SPICE vdagent clipboard path is not present in this backend.
+    Unsupported,
+}
+
+impl core::fmt::Display for SpiceClipboardError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Unsupported => f.write_str("SPICE vdagent clipboard is unsupported"),
+        }
+    }
+}
+
+impl std::error::Error for SpiceClipboardError {}
+
+/// Text-clipboard adapter for a SPICE session whose vdagent channel is absent.
+///
+/// This is the native seam future vdagent wiring will replace. Reads return no
+/// text and writes return/record [`SpiceClipboardError::Unsupported`]; no fake
+/// success is exposed to the shared seat clipboard contract.
+#[derive(Debug, Default)]
+pub struct SpiceTextClipboard {
+    last_error: Option<SpiceClipboardError>,
+}
+
+impl SpiceTextClipboard {
+    /// Create an adapter for the currently unsupported vdagent path.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { last_error: None }
+    }
+
+    /// Attempt to send text through the vdagent clipboard channel.
+    pub fn write_text_checked(&mut self, _text: &str) -> Result<(), SpiceClipboardError> {
+        Err(SpiceClipboardError::Unsupported)
+    }
+
+    /// Take the error captured by the infallible shared trait callback.
+    pub fn take_error(&mut self) -> Option<SpiceClipboardError> {
+        self.last_error.take()
+    }
+}
+
+impl TextClipboard for SpiceTextClipboard {
+    fn read_text(&mut self) -> Option<String> {
+        None
+    }
+
+    fn write_text(&mut self, text: &str) {
+        if let Err(error) = self.write_text_checked(text) {
+            self.last_error = Some(error);
+        }
+    }
+}
 
 /// Current SPICE text clipboard capability.
 ///
@@ -114,6 +175,12 @@ impl SpiceSession {
     #[must_use]
     pub fn clipboard_status(&self) -> VdiClipboardStatus {
         spice_clipboard_status()
+    }
+
+    /// Create the honest shared text-clipboard seam for this session.
+    #[must_use]
+    pub fn text_clipboard(&self) -> SpiceTextClipboard {
+        SpiceTextClipboard::new()
     }
 
     // ── Decode side (fed by the transport or by tests) ──────────────────────
@@ -223,11 +290,12 @@ impl SpiceSession {
 
 #[cfg(test)]
 mod tests {
-    use super::SpiceSession;
+    use super::{SpiceClipboardError, SpiceSession, SpiceTextClipboard};
     use crate::config::SpiceConfig;
     use crate::egui::{Color32, Event, Key, Modifiers, PointerButton, Pos2};
     use crate::input::{Scancode, SpiceInputEvent};
     use mackes_mesh_types::vdi_clipboard::VdiClipboardLaneStatus;
+    use mde_egui::clipboard::TextClipboard;
     use spice_client::DisplaySurface;
 
     fn session() -> SpiceSession {
@@ -269,6 +337,22 @@ mod tests {
                 other => panic!("expected unsupported SPICE clipboard lane, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn text_clipboard_seam_does_not_claim_unsupported_operations_succeeded() {
+        let mut clipboard = SpiceTextClipboard::new();
+        assert!(clipboard.read_text().is_none());
+        assert_eq!(
+            clipboard.write_text_checked("hello"),
+            Err(SpiceClipboardError::Unsupported)
+        );
+        clipboard.write_text("hello");
+        assert_eq!(
+            clipboard.take_error(),
+            Some(SpiceClipboardError::Unsupported)
+        );
+        assert!(clipboard.read_text().is_none());
     }
 
     #[test]
