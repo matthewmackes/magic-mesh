@@ -1045,11 +1045,26 @@ impl MapsLocationSurface {
     /// route, leaves the preview, and marks guidance as running so the Drive HUD
     /// paints the maneuver banner / ETA sheet / speed sign (not the idle prompt).
     ///
-    /// Honest no-op when no route options exist: without a routing engine there
-    /// is no route, so guidance never starts on a fabricated empty maneuver
-    /// banner (PLATFORM-INTERFACES Q33).
+    /// Whether the current preview has a real route and may begin guidance.
+    ///
+    /// The route options and current destination must still exist, and the
+    /// current offline-navigation readiness must not be blocked. Keeping this
+    /// predicate on the model lets the view disable the action before a click;
+    /// [`Self::start_navigation`] repeats the guard at the mutation boundary.
+    #[must_use]
+    pub fn can_start_navigation(&self) -> bool {
+        !self.local_navigation.route_options.is_empty()
+            && self.local_navigation.active_destination().is_some()
+            && self.offline_navigation_status().can_claim_turn_by_turn()
+    }
+
+    /// Begin turn-by-turn guidance for the selected route.
+    ///
+    /// Honest no-op when no route options exist or readiness is blocked: without
+    /// a routing engine there is no route, so guidance never starts on a
+    /// fabricated empty maneuver banner (PLATFORM-INTERFACES Q33).
     pub fn start_navigation(&mut self) {
-        if self.local_navigation.route_options.is_empty() {
+        if !self.can_start_navigation() {
             return;
         }
         let selected = self.local_navigation.selected_route;
@@ -6638,9 +6653,29 @@ mod tests {
         // HUD into guidance over a fabricated empty maneuver banner.
         let mut s = MapsLocationSurface::live();
         s.route_preview = true;
+        assert!(!s.can_start_navigation());
         s.start_navigation();
         assert!(!s.local_navigation.navigating);
         assert!(s.route_preview, "stays on the preview, honestly routeless");
+    }
+
+    #[test]
+    fn start_navigation_is_disabled_when_readiness_is_blocked() {
+        // Retained route options must not override a current source/map
+        // blocker. The preview stays open and guidance remains idle.
+        let mut s = MapsLocationSurface::simulated();
+        s.route_preview = true;
+        s.simulate_no_offline_maps();
+        assert_eq!(
+            s.offline_navigation_status().readiness,
+            OfflineNavigationReadiness::Blocked
+        );
+        assert!(!s.can_start_navigation());
+
+        s.start_navigation();
+
+        assert!(!s.local_navigation.navigating);
+        assert!(s.route_preview);
     }
 
     #[test]

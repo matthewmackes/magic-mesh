@@ -897,12 +897,17 @@ fn show_route_preview(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
         option_states.push((resp.hovered(), resp.is_pointer_button_down_on()));
     }
 
+    let can_start = state.can_start_navigation();
     let start_resp = ui.interact(
         layout.start,
         egui::Id::new("maps-preview-start"),
-        Sense::click(),
+        if can_start {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
     );
-    if start_resp.clicked() {
+    if can_start && start_resp.clicked() {
         state.start_navigation();
     }
     let start_hovered = start_resp.hovered();
@@ -1001,6 +1006,7 @@ fn show_route_preview(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
         start_hovered,
         start_pressed,
         has_fix,
+        can_start,
     );
 }
 
@@ -1204,9 +1210,18 @@ fn paint_route_option_card(
 }
 
 /// The full-width GMaps-blue Start button that begins turn-by-turn guidance.
-fn paint_start_button(painter: &Painter, rect: Rect, hovered: bool, pressed: bool, has_fix: bool) {
+fn paint_start_button(
+    painter: &Painter,
+    rect: Rect,
+    hovered: bool,
+    pressed: bool,
+    has_fix: bool,
+    enabled: bool,
+) {
     paint_soft_shadow(painter, rect, HUD_RADIUS_S);
-    let base = if !has_fix {
+    let base = if !enabled {
+        HUD_CARD_HI.gamma_multiply(0.72)
+    } else if !has_fix {
         MANEUVER_BLUE.gamma_multiply(0.7)
     } else if pressed {
         MANEUVER_BLUE_DEEP
@@ -1226,16 +1241,31 @@ fn paint_start_button(painter: &Painter, rect: Rect, hovered: bool, pressed: boo
     painter.rect_stroke(
         rect,
         HUD_RADIUS_S,
-        Stroke::new(1.0, MANEUVER_BLUE_HI),
+        Stroke::new(
+            1.0,
+            if enabled {
+                MANEUVER_BLUE_HI
+            } else {
+                Style::BORDER
+            },
+        ),
         StrokeKind::Inside,
     );
 
     // Nav-arrow glyph + "Start", centered as a group.
-    let label = "Start";
+    let label = if enabled {
+        "Start"
+    } else {
+        "Routing unavailable"
+    };
     let g = painter.layout_no_wrap(
         label.to_string(),
         Style::typography_font(TypographyRole::Headline),
-        Color32::WHITE,
+        if enabled {
+            Color32::WHITE
+        } else {
+            Style::TEXT_DIM
+        },
     );
     let gw = g.size().x;
     let glyph_w = 22.0;
@@ -1246,7 +1276,11 @@ fn paint_start_button(painter: &Painter, rect: Rect, hovered: bool, pressed: boo
             painter,
             egui::pos2(start_x + glyph_w * 0.5, rect.center().y),
             0.0,
-            Color32::WHITE,
+            if enabled {
+                Color32::WHITE
+            } else {
+                Style::TEXT_DIM
+            },
             false,
         );
     }
@@ -1256,7 +1290,11 @@ fn paint_start_button(painter: &Painter, rect: Rect, hovered: bool, pressed: boo
             rect.center().y - g.size().y * 0.5,
         ),
         g,
-        Color32::WHITE,
+        if enabled {
+            Color32::WHITE
+        } else {
+            Style::TEXT_DIM
+        },
     );
 }
 
@@ -6723,6 +6761,24 @@ mod tests {
         search.active = WorkspaceTab::Drive;
         search.destination_search = true;
         assert!(tessellate(&mut search) > 0);
+    }
+
+    #[test]
+    fn live_route_preview_marks_start_unavailable_without_a_route() {
+        let mut preview = MapsLocationSurface::live();
+        preview.active = WorkspaceTab::Drive;
+        preview.route_preview = true;
+
+        let texts = painted_texts(&mut preview);
+
+        assert!(
+            texts.iter().any(|text| text == "Routing unavailable"),
+            "the route preview must disclose why Start cannot run: {texts:?}"
+        );
+        assert!(
+            !preview.can_start_navigation(),
+            "the rendered disabled action must share the model predicate"
+        );
     }
 
     #[test]
