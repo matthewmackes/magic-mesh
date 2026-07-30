@@ -481,6 +481,8 @@ pub(crate) fn take_nav_request(ctx: &egui::Context) -> Option<Surface> {
 struct WallpaperCache {
     /// The selection this texture was decoded for.
     choice: Wallpaper,
+    /// Whether the operator enabled the wallpaper backdrop.
+    enabled: bool,
     /// The decoded, uploaded texture, or `None` on a total decode failure (§7).
     texture: Option<TextureHandle>,
     /// When the selection was last re-read off disk — the [`PREF_REFRESH`] clock.
@@ -511,15 +513,21 @@ fn wallpaper_texture(ctx: &egui::Context) -> Option<TextureHandle> {
     // read-locks the context that `data_mut` write-locks (the known `parking_lot`
     // trap; cf. `chooser::ThumbnailCache`), so we resolve first, then cache.
     let choice = resolve_choice();
-    let texture = match &cached {
-        Some(c) if c.choice == choice => c.texture.clone(),
-        _ => decode_wallpaper(ctx, choice),
+    let enabled = resolve_enabled();
+    let texture = if !enabled {
+        None
+    } else {
+        match &cached {
+            Some(c) if c.choice == choice && c.enabled == enabled => c.texture.clone(),
+            _ => decode_wallpaper(ctx, choice),
+        }
     };
     ctx.data_mut(|d| {
         d.insert_temp(
             id,
             WallpaperCache {
                 choice,
+                enabled,
                 texture: texture.clone(),
                 checked_at: now,
             },
@@ -555,6 +563,14 @@ fn resolve_choice() -> Wallpaper {
         .unwrap_or(Wallpaper::DEFAULT)
 }
 
+/// Whether the operator enabled the wallpaper backdrop, defaulting on for
+/// migrated/absent records so the existing desktop remains wallpaper-backed.
+fn resolve_enabled() -> bool {
+    WallpaperStore::open_default()
+        .load_record()
+        .map_or(true, |record| record.enabled)
+}
+
 /// Select `choice` as the desktop wallpaper: persist it (a no-op when the workgroup
 /// volume isn't provisioned) and update the live egui-memory cache immediately so the
 /// desktop reflects it this session even offline. The System surface's picker drives
@@ -562,19 +578,48 @@ fn resolve_choice() -> Wallpaper {
 pub(crate) fn select_wallpaper(ctx: &egui::Context, choice: Wallpaper) {
     // Persist — inert when the workgroup root isn't provisioned (honest offline); the
     // cache update below still makes the choice hold session-local.
-    let _ = WallpaperStore::open_default().save(choice, unix_millis());
-    let texture = decode_wallpaper(ctx, choice);
+    let enabled = wallpaper_enabled(ctx);
+    let _ = WallpaperStore::open_default().save(choice, enabled, unix_millis());
+    let texture = enabled.then(|| decode_wallpaper(ctx, choice)).flatten();
     ctx.data_mut(|d| {
         d.insert_temp(
             egui::Id::new(WALLPAPER_CACHE_KEY),
             WallpaperCache {
                 choice,
+                enabled,
                 texture,
                 checked_at: Instant::now(),
             },
         );
     });
     ctx.request_repaint();
+}
+
+/// Set whether Home paints the selected wallpaper and persist the choice. The
+/// texture cache is updated immediately so the setting is visible without a
+/// shell restart, including when the mesh preference volume is unavailable.
+pub(crate) fn set_wallpaper_enabled(ctx: &egui::Context, enabled: bool) {
+    let choice = selected_wallpaper(ctx);
+    let _ = WallpaperStore::open_default().save(choice, enabled, unix_millis());
+    let texture = enabled.then(|| decode_wallpaper(ctx, choice)).flatten();
+    ctx.data_mut(|d| {
+        d.insert_temp(
+            egui::Id::new(WALLPAPER_CACHE_KEY),
+            WallpaperCache {
+                choice,
+                enabled,
+                texture,
+                checked_at: Instant::now(),
+            },
+        );
+    });
+    ctx.request_repaint();
+}
+
+/// The persisted/session-local enable state used by the Settings picker.
+pub(crate) fn wallpaper_enabled(ctx: &egui::Context) -> bool {
+    ctx.data_mut(|d| d.get_temp::<WallpaperCache>(egui::Id::new(WALLPAPER_CACHE_KEY)))
+        .map_or_else(resolve_enabled, |cache| cache.enabled)
 }
 
 /// The currently-selected wallpaper — the live cache when the desktop has painted,
@@ -595,9 +640,16 @@ struct WallpaperRecord {
     seat: String,
     /// The selected wallpaper's 1-based index (1–5).
     choice: u8,
+    /// Whether the wallpaper backdrop is enabled. Missing legacy field means on.
+    #[serde(default = "default_true")]
+    enabled: bool,
     /// Wall-clock epoch millis of the write — the newest across seats wins the fold.
     #[serde(default)]
     updated_ms: u64,
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 /// The mesh-synced wallpaper store — one JSON file per seat under the workgroup root,
@@ -639,9 +691,9 @@ impl WallpaperStore {
     /// The folded selection across every seat file: the record with the newest
     /// `updated_ms` wins (id tiebreak by later iteration). Malformed / half-written /
     /// temp files are skipped (never fatal), and a missing directory yields `None`.
-    fn load(&self) -> Option<Wallpaper> {
+    fn load_record(&self) -> Option<WallpaperRecord> {
         let entries = fs::read_dir(self.identity_dir()).ok()?;
-        let mut best: Option<(u64, u8)> = None;
+        let mut best: Option<WallpaperRecord> = None;
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
@@ -660,11 +712,24 @@ impl WallpaperStore {
             let Ok(rec) = serde_json::from_str::<WallpaperRecord>(&data) else {
                 continue;
             };
-            if best.is_none_or(|(ms, _)| rec.updated_ms >= ms) {
-                best = Some((rec.updated_ms, rec.choice));
+            if Wallpaper::from_index(rec.choice).is_none() {
+                continue;
+            }
+            if best
+                .as_ref()
+                .is_none_or(|previous| rec.updated_ms >= previous.updated_ms)
+            {
+                best = Some(rec);
             }
         }
-        best.and_then(|(_, choice)| Wallpaper::from_index(choice))
+        best
+    }
+
+    /// Fold the newest valid persisted selection, retaining the legacy API used
+    /// by the backdrop resolver and tests.
+    fn load(&self) -> Option<Wallpaper> {
+        self.load_record()
+            .and_then(|record| Wallpaper::from_index(record.choice))
     }
 
     /// Write this seat's selection (atomic temp + rename). A silent `Ok(())` no-op
@@ -673,7 +738,7 @@ impl WallpaperStore {
     /// # Errors
     /// The [`io::Error`] if the directory cannot be created or the file cannot be
     /// written / renamed.
-    fn save(&self, choice: Wallpaper, now_ms: u64) -> io::Result<()> {
+    fn save(&self, choice: Wallpaper, enabled: bool, now_ms: u64) -> io::Result<()> {
         if !self.is_ready() {
             return Ok(());
         }
@@ -686,6 +751,7 @@ impl WallpaperStore {
         let rec = WallpaperRecord {
             seat,
             choice: choice.index(),
+            enabled,
             updated_ms: now_ms,
         };
         let json = serde_json::to_string_pretty(&rec)
@@ -997,11 +1063,13 @@ mod tests {
             "no record yet → the default resolves"
         );
 
-        store.save(Wallpaper::Three, 1_000).expect("save three");
+        store
+            .save(Wallpaper::Three, true, 1_000)
+            .expect("save three");
         assert_eq!(store.load(), Some(Wallpaper::Three));
 
         // The same seat re-saves; the newer write wins (its file is overwritten).
-        store.save(Wallpaper::One, 2_000).expect("save one");
+        store.save(Wallpaper::One, true, 2_000).expect("save one");
         assert_eq!(store.load(), Some(Wallpaper::One));
 
         let _ = fs::remove_dir_all(&dir);
@@ -1045,7 +1113,9 @@ mod tests {
     fn an_unprovisioned_store_is_inert() {
         let store = WallpaperStore::new(PathBuf::from("/no/such/mesh/root"));
         assert!(!store.is_ready());
-        store.save(Wallpaper::Two, 1).expect("inert save is Ok");
+        store
+            .save(Wallpaper::Two, true, 1)
+            .expect("inert save is Ok");
         assert!(store.load().is_none(), "nothing folded from a missing root");
     }
 
@@ -1059,6 +1129,31 @@ mod tests {
         assert_eq!(selected_wallpaper(&ctx), Wallpaper::Two);
         select_wallpaper(&ctx, Wallpaper::Five);
         assert_eq!(selected_wallpaper(&ctx), Wallpaper::Five);
+    }
+
+    #[test]
+    fn wallpaper_enable_state_round_trips_and_updates_the_live_cache() {
+        let dir = temp_root("enabled");
+        fs::create_dir_all(&dir).expect("mkroot");
+        let store = WallpaperStore::new(dir.clone());
+        store
+            .save(Wallpaper::Two, false, 1_000)
+            .expect("save disabled");
+        assert_eq!(store.load(), Some(Wallpaper::Two));
+        assert_eq!(
+            store.load_record().map(|record| record.enabled),
+            Some(false)
+        );
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        set_wallpaper_enabled(&ctx, false);
+        assert!(!wallpaper_enabled(&ctx));
+        set_wallpaper_enabled(&ctx, true);
+        assert!(wallpaper_enabled(&ctx));
+        assert_eq!(selected_wallpaper(&ctx), Wallpaper::DEFAULT);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     // ──────────────────── NAVBAR-W10-3 — the brand watermark ────────────────────

@@ -55,6 +55,7 @@ use mde_seat::{
     PairingAgent, PowerCaps, PowerVerb, Probe, Seat, SeatError, SeatSnapshot, HOTKEYS,
 };
 
+use crate::backdrop::{self, Wallpaper};
 use crate::bt_pairing::{pairing_dialog, PairingBridge};
 use crate::power_honor::PowerHonorConfig;
 use crate::power_settings;
@@ -4484,9 +4485,9 @@ const fn power_verb_deferred(verb: PowerVerb, in_motion: bool) -> bool {
 }
 
 /// The Wallpaper section: policy for the chromeless desktop page and Bing
-/// image-of-the-day fallback. The static Construct wallpaper gallery is retired
-/// because the current shell backdrop is a solid shell-colour field; this panel now
-/// controls the service that supplies the future desktop/background image.
+/// image-of-the-day fallback. The Construct backdrop picker and the optional
+/// service controls share this compact section so both local and network-backed
+/// wallpaper paths remain visible without scrolling past the fallback toggles.
 fn wallpaper_section(
     ui: &mut egui::Ui,
     config: &mut WallpaperServiceConfig,
@@ -4494,6 +4495,46 @@ fn wallpaper_section(
     actions: &mut Vec<SysAction>,
 ) {
     *config = config.clone().normalized();
+    let ctx = ui.ctx().clone();
+    let selected = backdrop::selected_wallpaper(&ctx);
+    let mut enabled = backdrop::wallpaper_enabled(&ctx);
+    ui.label(
+        RichText::new("Construct wallpaper")
+            .color(Style::TEXT_DIM)
+            .size(Style::SMALL),
+    );
+    ui.add_space(Style::SP_XS);
+    if ui
+        .checkbox(
+            &mut enabled,
+            RichText::new("Show wallpaper on Home").size(Style::BODY),
+        )
+        .changed()
+    {
+        backdrop::set_wallpaper_enabled(&ctx, enabled);
+    }
+    ui.horizontal_wrapped(|ui| {
+        for choice in Wallpaper::ALL {
+            let is_selected = choice == selected;
+            if ui
+                .selectable_label(
+                    is_selected,
+                    RichText::new(choice.label()).size(Style::SMALL),
+                )
+                .clicked()
+                && !is_selected
+            {
+                backdrop::select_wallpaper(&ctx, choice);
+            }
+        }
+    });
+    ui.add_space(Style::SP_S);
+    muted_note(
+        ui,
+        "Choose a Construct backdrop or disable it for a plain Home field. The selection is persisted per seat and updates immediately.",
+    );
+    ui.separator();
+    ui.add_space(Style::SP_S);
     ui.label(
         RichText::new("Desktop background service")
             .color(Style::TEXT_DIM)
@@ -4523,14 +4564,16 @@ fn wallpaper_section(
     }
     ui.add_space(Style::SP_S);
 
-    ui.checkbox(
-        &mut config.network_fetch_enabled,
-        RichText::new("Allow daily picture downloads").size(Style::BODY),
-    );
-    ui.checkbox(
-        &mut config.bing_daily_enabled,
-        RichText::new("Use Bing image of the day as fallback").size(Style::BODY),
-    );
+    ui.horizontal_wrapped(|ui| {
+        ui.checkbox(
+            &mut config.network_fetch_enabled,
+            RichText::new("Allow daily picture downloads").size(Style::BODY),
+        );
+        ui.checkbox(
+            &mut config.bing_daily_enabled,
+            RichText::new("Use Bing image of the day as fallback").size(Style::BODY),
+        );
+    });
     ui.add_space(Style::SP_S);
 
     let download_enabled =

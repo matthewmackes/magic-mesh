@@ -130,7 +130,7 @@ fn render_settings_choice_frame(ctx: &egui::Context, selected: bool) -> egui::Fu
 fn render_wallpaper_section_frame(ctx: &egui::Context) -> egui::FullOutput {
     ctx.run(
         egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(520.0, 280.0))),
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(520.0, 520.0))),
             ..Default::default()
         },
         |ctx| {
@@ -352,7 +352,7 @@ fn bing_daily_archive_parser_resolves_relative_image_url() {
 }
 
 #[test]
-fn wallpaper_section_renders_bing_service_instead_of_static_gallery() {
+fn wallpaper_section_renders_selectable_backdrop_and_bing_service() {
     let ctx = egui::Context::default();
     Style::install(&ctx);
     mde_egui::fonts::install(&ctx);
@@ -360,6 +360,13 @@ fn wallpaper_section_renders_bing_service_instead_of_static_gallery() {
     let texts = painted_text(&out.shapes);
 
     for label in [
+        "Construct wallpaper",
+        "Show wallpaper on Home",
+        "Wallpaper 1",
+        "Wallpaper 2",
+        "Wallpaper 3",
+        "Wallpaper 4 (default)",
+        "Wallpaper 5",
         "Desktop background service",
         "Allow daily picture downloads",
         "Use Bing image of the day as fallback",
@@ -370,14 +377,6 @@ fn wallpaper_section_renders_bing_service_instead_of_static_gallery() {
             "Wallpaper service label {label:?} was not painted: {texts:?}"
         );
     }
-    assert!(
-        !texts.iter().any(|(text, _)| text.starts_with("Wallpaper 1")
-            || text.starts_with("Wallpaper 2")
-            || text.starts_with("Wallpaper 3")
-            || text.starts_with("Wallpaper 4")
-            || text.starts_with("Wallpaper 5")),
-        "retired static wallpaper gallery labels should not render: {texts:?}"
-    );
 }
 
 #[test]
