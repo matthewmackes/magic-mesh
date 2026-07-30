@@ -595,8 +595,8 @@ remains here under a completed status.
   typed Current/Stale/Resyncing/Unavailable mirror state; 13 consumer tests pass. The bounded MG90/manager roster has independent poll/heartbeat plans,
   latest-wins/no-source behavior, deterministic all-source selection, and 44
   vehicle tests pass. Maps HUD removes road-name speed/lane heuristics and
-  paints explicit unavailable states; Start is disabled when routing is
-  unavailable. Live adapters and route/render cutover remain.
+  paints explicit unavailable states; Airspace distinguishes unconfigured,
+  offline, fresh, and stale scanner data with 17 focused tests; routing Start remains disabled when unavailable. Live adapters and route/render cutover remain.
 - Remaining work:
   1. Consume WL-UX-009's platform-wide Carbon-requirement retirement and update
      the Maps/Car-specific authority while retaining egui, shared `Style`,
@@ -798,7 +798,8 @@ remains here under a completed status.
   projection, themed tooltip cleanup, and governance alignment have landed.
   Core `mde-egui` navigation, sheet, popover, motion, style, and capture
   primitives exist. Current authority now makes Carbon optional and requires a
-  shared registry/license audit; the `mde-egui` farm gate has 257 tests passing.
+  shared registry/license audit; per-theme disabled ink now remaps through the
+  palette with 54 focused style tests passing (257 `mde-egui` tests overall).
   Shell chrome now has a responsive Windows-style bottom clock/tray with
   dot-only mesh health, a cross-faded side-rail top strip, and a selectable,
   persisted Home wallpaper/enable path; full surface/internal-chrome adoption
