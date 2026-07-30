@@ -1424,7 +1424,14 @@ fn show_action_row(ui: &mut egui::Ui, projection: ActionProjection) {
             false,
             egui::Button::new(RichText::new(projection.action.label()).size(Style::SMALL)),
         );
-        response.on_hover_text(availability.detail());
+        let response = response.on_hover_text(availability.detail());
+        install_action_accessibility(
+            ui.ctx(),
+            response.id,
+            response.rect,
+            projection.action,
+            availability,
+        );
         ui.colored_label(
             availability.tone(),
             RichText::new(availability.word()).size(Style::SMALL),
@@ -1435,6 +1442,40 @@ fn show_action_row(ui: &mut egui::Ui, projection: ActionProjection) {
             RichText::new(availability.detail()).size(Style::SMALL),
         );
     });
+}
+
+/// Keep the typed action boundary visible to assistive technology as well as to
+/// sighted operators. These controls remain disabled because the snapshot is a
+/// read-only observation; the value carries the exact provider/authorization
+/// reason instead of making a screen reader guess from a dim button.
+fn install_action_accessibility(
+    ctx: &egui::Context,
+    id: egui::Id,
+    rect: egui::Rect,
+    action: ThisNodeAction,
+    availability: CapabilityAvailability,
+) {
+    let _ = ctx.accesskit_node_builder(id, |node| {
+        node.set_role(egui::accesskit::Role::Button);
+        node.set_label(action.label());
+        node.set_value(format!(
+            "{}: {}",
+            availability.word(),
+            availability.detail()
+        ));
+        node.set_bounds(accesskit_rect(rect));
+        node.set_disabled();
+        node.clear_actions();
+    });
+}
+
+fn accesskit_rect(rect: egui::Rect) -> egui::accesskit::Rect {
+    egui::accesskit::Rect {
+        x0: rect.min.x.into(),
+        y0: rect.min.y.into(),
+        x1: rect.max.x.into(),
+        y1: rect.max.y.into(),
+    }
 }
 
 /// The identity card: hostname + role + a leader marker, then overlay IP, cipher,
@@ -1651,6 +1692,28 @@ mod tests {
             egui::CentralPanel::default().show(ctx, |ui| show_status(ui, status));
         });
         !ctx.tessellate(out.shapes, out.pixels_per_point).is_empty()
+    }
+
+    fn accesskit_nodes(status: &NodeStatus) -> Vec<egui::accesskit::Node> {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        ctx.enable_accesskit();
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(960.0, 640.0))),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| show_status(ui, status));
+            },
+        );
+        out.platform_output
+            .accesskit_update
+            .expect("This Node accesskit update")
+            .nodes
+            .into_iter()
+            .map(|(_, node)| node)
+            .collect()
     }
 
     fn connectivity_text_bounds(
@@ -2000,6 +2063,24 @@ mod tests {
         assert!(actions
             .iter()
             .any(|projection| projection.action == ThisNodeAction::ChangeConnectivity));
+    }
+
+    #[test]
+    fn typed_actions_export_disabled_accessibility_reasons() {
+        let live = NodeStatus::project(&snapshot("this-node", "lh-01"), "fallback");
+        let nodes = accesskit_nodes(&live);
+        let restart = nodes
+            .iter()
+            .find(|node| node.label() == Some("Restart a service"))
+            .expect("This Node action should be discoverable to assistive technology");
+
+        assert_eq!(restart.role(), egui::accesskit::Role::Button);
+        assert!(restart.is_disabled());
+        assert!(!restart.supports_action(egui::accesskit::Action::Click));
+        assert!(restart
+            .value()
+            .expect("disabled action reason")
+            .contains("no typed service-control provider"));
     }
 
     #[test]
