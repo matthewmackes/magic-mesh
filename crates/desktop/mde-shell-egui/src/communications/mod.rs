@@ -1004,7 +1004,7 @@ mod tests {
         let persist = persist_at(dir.path());
 
         let ops = SpaceId::new();
-        let me = ActorId::new("eagle");
+        let me = ActorId::new(crate::explorer::local_hostname());
         let peer = ActorId::new("falcon");
 
         write_state(
