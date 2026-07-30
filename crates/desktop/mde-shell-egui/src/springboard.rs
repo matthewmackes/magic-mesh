@@ -1051,11 +1051,7 @@ mod tests {
                 },
             ],
         );
-        production_frame_with_overlay(
-            &ctx,
-            true,
-            vec![egui::Event::PointerMoved(pulled)],
-        );
+        production_frame_with_overlay(&ctx, true, vec![egui::Event::PointerMoved(pulled)]);
         production_frame_with_overlay(
             &ctx,
             true,

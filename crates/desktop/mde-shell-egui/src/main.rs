@@ -3743,8 +3743,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // CopyText/Paste event reaches the canonical mesh lane. The windowed
         // fallback retains eframe's platform adapter; only this direct-seat
         // path must not regress to the process-local compatibility provider.
-        let mut clipboard =
-            communications::BusTextClipboard::for_shell(mde_bus::client_data_dir());
+        let mut clipboard = communications::BusTextClipboard::for_shell(mde_bus::client_data_dir());
         match mde_egui::run_drm_with_clipboard("org.magicmesh.Shell", &mut clipboard, |ctx| {
             boot.frame(ctx)
         }) {
