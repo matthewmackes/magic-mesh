@@ -1459,6 +1459,52 @@ impl BrowserEngine {
     }
 }
 
+/// The shell-visible connection posture for the guest Browser session.
+///
+/// `Connected` is deliberately stricter than “a [`WebSession`] exists”: the
+/// guest must have produced a real page frame before the shell claims that the
+/// Browser VM is ready. This keeps the Construct boundary honest while still
+/// giving assistive technology a useful transition through unavailable,
+/// connecting, and disconnected states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserVmConnectionState {
+    /// No guest session is attached, or the live-helper gate has refused one.
+    Unavailable,
+    /// A session is present but has not produced a first usable frame yet.
+    Connecting,
+    /// A real guest frame is available to the shell.
+    Connected,
+    /// The guest session crashed and needs an explicit reload/respawn.
+    Disconnected,
+    /// The visible page is shell-owned (for example Browser Options), not a
+    /// guest Chromium/Servo page.
+    ShellOwned,
+}
+
+impl BrowserVmConnectionState {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Unavailable => "Unavailable",
+            Self::Connecting => "Connecting",
+            Self::Connected => "Connected",
+            Self::Disconnected => "Disconnected",
+            Self::ShellOwned => "Shell-owned",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowserVmDiagnostic {
+    state: BrowserVmConnectionState,
+    detail: String,
+}
+
+impl BrowserVmDiagnostic {
+    fn summary(&self) -> String {
+        format!("{}: {}", self.state.label(), self.detail)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BrowserPolicySourceKind {
     FilterLists,
@@ -4685,6 +4731,58 @@ impl WebState {
         })
     }
 
+    /// Return the truthful shell-visible posture of the active Browser VM seam.
+    /// A live session without a decoded frame is still connecting; claiming
+    /// readiness before the first frame would make the Construct boundary lie.
+    fn browser_vm_diagnostic(&self) -> BrowserVmDiagnostic {
+        let Some(tab) = self.tabs.get(self.active) else {
+            #[cfg(feature = "live-helper")]
+            if let Some(notice) = self.gate_notice.as_deref() {
+                return BrowserVmDiagnostic {
+                    state: BrowserVmConnectionState::Unavailable,
+                    detail: notice.to_owned(),
+                };
+            }
+
+            return BrowserVmDiagnostic {
+                state: BrowserVmConnectionState::Unavailable,
+                detail: chrome_ui::BROWSER_NO_LIVE_PAGE_NOTICE.to_owned(),
+            };
+        };
+
+        if tab.internal_page.is_some() {
+            return BrowserVmDiagnostic {
+                state: BrowserVmConnectionState::ShellOwned,
+                detail: "The visible Browser page is provided by Construct".to_owned(),
+            };
+        }
+
+        if tab.session.is_crashed() {
+            let reason = crash_reason(&tab.session);
+            let detail = if reason.trim().is_empty() {
+                "The guest page stopped; reload to reconnect".to_owned()
+            } else {
+                format!("The guest page stopped: {}", reason.trim())
+            };
+            return BrowserVmDiagnostic {
+                state: BrowserVmConnectionState::Disconnected,
+                detail,
+            };
+        }
+
+        if tab.last_frame.is_some() {
+            BrowserVmDiagnostic {
+                state: BrowserVmConnectionState::Connected,
+                detail: "A guest page frame is available".to_owned(),
+            }
+        } else {
+            BrowserVmDiagnostic {
+                state: BrowserVmConnectionState::Connecting,
+                detail: "Waiting for the guest page to paint its first frame".to_owned(),
+            }
+        }
+    }
+
     fn capture_active_viewport(&mut self) {
         match self.capture_active_viewport_to_dir(browser_capture_dir()) {
             Ok(path) => {
@@ -7694,6 +7792,7 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
     state.upload_media_pip_frame(ui.ctx());
     state.request_browser_frame_repaint(ui.ctx());
     chrome_ui::install_browser_accessibility(ui.ctx(), ui.max_rect(), state);
+    install_browser_vm_accessibility(ui.ctx(), ui.max_rect(), state);
 
     // Immersive/fullscreen mode: only the page body renders — no tab strip, nav bar,
     // bookmarks, or drawers. Triggered by F11 (manual, state.fullscreen) OR the page
@@ -7816,6 +7915,29 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
             chrome_ui::media_pip_overlay(&mut panel_ui, state);
         }
     }
+}
+
+/// Publish the guest-session posture separately from the general Browser status.
+///
+/// This is intentionally derived from the same evidence the body renderer uses:
+/// a session object alone is only `Connecting`, and `Connected` requires a real
+/// decoded frame. Shell-owned pages never claim guest readiness. Keeping this
+/// node here avoids making the accessibility layer infer VM state from chrome
+/// labels or helper implementation details.
+fn install_browser_vm_accessibility(ctx: &egui::Context, rect: egui::Rect, state: &WebState) {
+    let diagnostic = state.browser_vm_diagnostic();
+    let _ = ctx.accesskit_node_builder(egui::Id::new("browser-vm-connection"), |node| {
+        node.set_role(egui::accesskit::Role::Status);
+        node.set_live(egui::accesskit::Live::Polite);
+        node.set_label("Browser VM connection");
+        node.set_value(diagnostic.summary());
+        node.set_bounds(egui::accesskit::Rect {
+            x0: rect.min.x.into(),
+            y0: rect.min.y.into(),
+            x1: rect.max.x.into(),
+            y1: rect.max.y.into(),
+        });
+    });
 }
 
 fn ellipsize(s: &str, max_chars: usize) -> String {
@@ -10163,6 +10285,18 @@ mod tests {
         assert!(browser_value.contains("Work browsing profile"));
         assert!(browser_value.contains("opens on secondary display"));
 
+        let vm = nodes
+            .iter()
+            .map(|(_, node)| node)
+            .find(|node| node.label() == Some("Browser VM connection"))
+            .expect("browser VM connection accesskit node");
+        assert_eq!(vm.role(), egui::accesskit::Role::Status);
+        assert_eq!(vm.live(), Some(egui::accesskit::Live::Polite));
+        assert_eq!(
+            vm.value(),
+            Some("Connected: A guest page frame is available")
+        );
+
         let page = nodes
             .iter()
             .map(|(_, node)| node)
@@ -10214,6 +10348,15 @@ mod tests {
             !value.contains("Untitled") && !value.contains("about:blank"),
             "Options AccessKit summary must not leak the inert helper session: {value}"
         );
+        let vm = nodes
+            .iter()
+            .map(|(_, node)| node)
+            .find(|node| node.label() == Some("Browser VM connection"))
+            .expect("browser VM connection accesskit node");
+        assert_eq!(
+            vm.value(),
+            Some("Shell-owned: The visible Browser page is provided by Construct")
+        );
     }
 
     #[test]
@@ -10239,6 +10382,15 @@ mod tests {
                 && !value.contains("Servo")
                 && !value.contains("BOOKMARKS"),
             "empty Browser AccessKit status must not expose helper internals: {value}"
+        );
+        let vm = nodes
+            .iter()
+            .map(|(_, node)| node)
+            .find(|node| node.label() == Some("Browser VM connection"))
+            .expect("browser VM connection accesskit node");
+        assert_eq!(
+            vm.value(),
+            Some("Unavailable: No live browser page is available on this device")
         );
     }
 
@@ -10280,10 +10432,36 @@ mod tests {
                 .any(|(_, node)| node.label() == Some("Browser loading globe")),
             "loading body/toolbar should expose the Browser loading globe status"
         );
+        let nodes = accesskit_nodes(&out);
+        let vm = nodes
+            .iter()
+            .map(|(_, node)| node)
+            .find(|node| node.label() == Some("Browser VM connection"))
+            .expect("browser VM connection accesskit node");
+        assert_eq!(
+            vm.value(),
+            Some("Connecting: Waiting for the guest page to paint its first frame")
+        );
         assert!(
             chrome_ui::loading_globe_painted_shape_count() > 0,
             "Netscape-style loading globe must paint real shapes"
         );
+    }
+
+    #[test]
+    fn browser_vm_diagnostic_marks_a_crashed_guest_disconnected() {
+        let (session, helper) = testkit::connect().expect("connect");
+        let mut state = WebState::default();
+        state.push_session(session);
+        run_until_texture(&mut state);
+
+        helper.crash();
+        assert!(run_panel(&mut state));
+
+        let diagnostic = state.browser_vm_diagnostic();
+        assert_eq!(diagnostic.state, BrowserVmConnectionState::Disconnected);
+        assert!(diagnostic.detail.starts_with("The guest page stopped"));
+        assert!(!diagnostic.summary().contains("Connected"));
     }
 
     fn write_helper_event(stream: &UnixStream, msg: &mde_web_preview_client::EventMsg) {
