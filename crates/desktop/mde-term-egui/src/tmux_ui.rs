@@ -56,6 +56,7 @@ use mde_egui::egui::{
     self, pos2, Align2, Button, CursorIcon, FontId, Key, Modifiers, Pos2, Rect, RichText,
     ScrollArea, Sense, Stroke, StrokeKind, Ui, UiBuilder, Vec2,
 };
+use mde_egui::nav_chrome::{Toolbar, ToolbarItem};
 use mde_egui::Style;
 
 use crate::mesh_tmux::MeshControlChannel;
@@ -1873,100 +1874,94 @@ const TOOLBAR_OPS: [(&str, &str, TmuxMenuChoice); 7] = [
     ),
 ];
 
+/// The shared registry glyph for each primary tmux operation, in the same
+/// order as [`TOOLBAR_OPS`]. The labels live in the shared toolbar's
+/// accessibility metadata and are repeated in the local hover cards below, so
+/// the compact icon row remains discoverable without growing a second visual
+/// vocabulary.
+const TOOLBAR_OP_ICONS: [&str; 7] = [
+    "go-next",
+    "go-down",
+    "view",
+    "overlay",
+    "list-remove",
+    "list-add",
+    "window-close",
+];
+
+/// The secondary tmux chrome actions, kept as a trailing group so the primary
+/// pane/window operations retain their left-to-right order. `Toolbar` owns the
+/// palette-resolved surface, shared hover motion, focus ring, and AccessKit
+/// label for every item; this table only supplies terminal behavior metadata.
+const TOOLBAR_AUX: [(&str, &str, &str); 6] = [
+    (
+        "system-search",
+        "Commands\u{2026}",
+        "The tmux command palette (fuzzy, ~30 curated ops)",
+    ),
+    (
+        "document-open-recent",
+        "Projects\u{2026}",
+        "Saved session templates (TMUX-FC-5)",
+    ),
+    (
+        "globe",
+        "Mesh\u{2026}",
+        "Attach tmux on a mesh node (TMUX-FC-6)",
+    ),
+    ("open-menu", "Config\u{2026}", TMUX_CONFIG_TOOLTIP),
+    ("view-grid", "Tree", "Show/hide the session tree sidebar"),
+    (
+        "process-stop",
+        "Detach",
+        "Detach this control client (detach-client) \u{2014} the session keeps running",
+    ),
+];
+
 /// FC-4 — the toolbar between the tab strip and the mounted view: one-click
 /// pane/window ops (each resolving its target through [`op_intents`], exactly
 /// as the Tmux menu does) plus the palette, sidebar and detach affordances.
 /// All `Style` tokens (§4); every button's hover text names its tmux command.
 fn toolbar(ui: &mut Ui, model: &TmuxModel, state: &mut ChromeUi, intents: &mut Vec<TmuxIntent>) {
-    ui.horizontal_wrapped(|ui| {
-        ui.add_space(Style::SP_XS);
-        for (label, hint, op) in TOOLBAR_OPS {
-            let resp = ui.add(Button::new(
-                RichText::new(label).size(Style::SMALL).color(Style::TEXT),
-            ));
-            let resp = terminal_hover_text(resp, hint);
-            if resp.clicked() {
-                intents.extend(op_intents(model, op));
-            }
-        }
-        ui.add_space(Style::SP_S);
-        if terminal_hover_text(
-            ui.add(Button::new(
-                RichText::new("Commands\u{2026}")
-                    .size(Style::SMALL)
-                    .color(Style::ACCENT_TERMINALS),
-            )),
-            "The tmux command palette (fuzzy, ~30 curated ops)",
-        )
-        .clicked()
-        {
-            state.open_palette();
-        }
-        if terminal_hover_text(
-            ui.add(Button::new(
-                RichText::new("Projects\u{2026}")
-                    .size(Style::SMALL)
-                    .color(Style::TEXT_DIM),
-            )),
-            "Saved session templates (TMUX-FC-5)",
-        )
-        .clicked()
-        {
-            state.templates_open = true;
-        }
-        if terminal_hover_text(
-            ui.add(Button::new(
-                RichText::new("Mesh\u{2026}")
-                    .size(Style::SMALL)
-                    .color(Style::TEXT_DIM),
-            )),
-            "Attach tmux on a mesh node (TMUX-FC-6)",
-        )
-        .clicked()
-        {
-            state.mesh_open = true;
-        }
-        if terminal_hover_text(
-            ui.add(Button::new(
-                RichText::new("Config\u{2026}")
-                    .size(Style::SMALL)
-                    .color(Style::TEXT_DIM),
-            )),
-            TMUX_CONFIG_TOOLTIP,
-        )
-        .clicked()
-        {
-            state.settings_open = true;
-        }
-        if terminal_hover_text(
-            ui.add(Button::new(
-                RichText::new(if state.tree_open {
-                    "Tree \u{25C0}"
-                } else {
-                    "Tree \u{25B6}"
-                })
-                .size(Style::SMALL)
-                .color(Style::TEXT_DIM),
-            )),
-            "Show/hide the session tree sidebar",
-        )
-        .clicked()
-        {
-            state.tree_open = !state.tree_open;
-        }
-        if terminal_hover_text(
-            ui.add(Button::new(
-                RichText::new("Detach")
-                    .size(Style::SMALL)
-                    .color(Style::TEXT_DIM),
-            )),
-            "Detach this control client (detach-client) \u{2014} the session keeps running",
-        )
-        .clicked()
-        {
-            intents.push(TmuxIntent::Detach);
-        }
+    let primary: [ToolbarItem<'static>; 7] = std::array::from_fn(|index| {
+        ToolbarItem::icon(TOOLBAR_OP_ICONS[index], TOOLBAR_OPS[index].1)
     });
+    let auxiliary: [ToolbarItem<'static>; 6] =
+        std::array::from_fn(|index| ToolbarItem::icon(TOOLBAR_AUX[index].0, TOOLBAR_AUX[index].1));
+    let response = Toolbar::new()
+        .leading(&primary)
+        .trailing(&auxiliary)
+        .at_top()
+        .show(ui);
+
+    // `Toolbar` has already registered each item with the shared accessibility
+    // tree and has resolved the palette/motion/focus treatment. Keep the
+    // terminal's richer command hints as a local tooltip layer, without
+    // replacing the shared widget primitive.
+    let hints = TOOLBAR_OPS
+        .iter()
+        .map(|(_, hint, _)| *hint)
+        .chain(TOOLBAR_AUX.iter().map(|(_, _, hint)| *hint));
+    for (response, hint) in response.items.iter().zip(hints) {
+        let _ = terminal_hover_text(response.clone(), hint);
+    }
+
+    let Some(index) = response.activated else {
+        return;
+    };
+    if let Some((_, _, op)) = TOOLBAR_OPS.get(index) {
+        intents.extend(op_intents(model, *op));
+        return;
+    }
+    match index - TOOLBAR_OPS.len() {
+        0 => state.open_palette(),
+        1 => state.templates_open = true,
+        2 => state.mesh_open = true,
+        3 => state.settings_open = true,
+        4 => state.tree_open = !state.tree_open,
+        5 => intents.push(TmuxIntent::Detach),
+        _ => {}
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3548,6 +3543,53 @@ mod tests {
         assert!(prims > 0, "the FC-4 chrome did not tessellate");
         // Rendering alone raises no intents — only real clicks do.
         assert!(intents.is_empty(), "no phantom intents: {intents:?}");
+    }
+
+    #[test]
+    fn tmux_toolbar_uses_registry_icons_and_resolved_dark_light_surfaces() {
+        for icon in TOOLBAR_OP_ICONS
+            .iter()
+            .copied()
+            .chain(TOOLBAR_AUX.iter().map(|(icon, _, _)| *icon))
+        {
+            assert!(
+                mde_egui::carbon_svg_bytes(icon).is_some(),
+                "tmux toolbar icon {icon:?} must come from the shared registry"
+            );
+        }
+
+        let model = two_window_model();
+        for scheme in [StyleColorScheme::Dark, StyleColorScheme::Light] {
+            let ctx = Context::default();
+            Style::install_color_scheme_with_density(&ctx, scheme, Density::Mouse);
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(480.0, 640.0))),
+                ..Default::default()
+            };
+            let out = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let mut state = ChromeUi::default();
+                    let mut intents = Vec::new();
+                    toolbar(ui, &model, &mut state, &mut intents);
+                    assert!(intents.is_empty());
+                });
+            });
+            let palette = Style::current_palette(&ctx);
+            assert!(
+                out.shapes.iter().any(|shape| match &shape.shape {
+                    egui::Shape::Rect(rect) => rect.fill == palette.surface,
+                    egui::Shape::Vec(shapes) => shapes.iter().any(|shape| {
+                        matches!(shape, egui::Shape::Rect(rect) if rect.fill == palette.surface)
+                    }),
+                    _ => false,
+                }),
+                "shared toolbar must resolve its surface in {scheme:?}"
+            );
+            assert!(
+                !ctx.tessellate(out.shapes, out.pixels_per_point).is_empty(),
+                "toolbar must tessellate in {scheme:?}"
+            );
+        }
     }
 
     #[test]
