@@ -3056,6 +3056,9 @@ fn install_search_accessibility(ctx: &egui::Context, rect: egui::Rect, query: &s
     let _ = ctx.accesskit_node_builder(search_accesskit_id(), |node| {
         node.set_role(egui::accesskit::Role::SearchInput);
         node.set_label("Shell search");
+        // Keep the visible empty-state hint available to screen readers too;
+        // the value is intentionally still just the user's ephemeral query.
+        node.set_description(SEARCH_HINT);
         node.set_value(query);
         node.set_bounds(accesskit_rect(rect));
     });
@@ -5233,6 +5236,7 @@ mod tests {
             .find(|node| node.label() == Some("Shell search"))
             .expect("front-door search input AccessKit node");
         assert_eq!(search.role(), egui::accesskit::Role::SearchInput);
+        assert_eq!(search.description(), Some(SEARCH_HINT));
         assert_eq!(search.value(), Some("browser"));
 
         let results = nodes
