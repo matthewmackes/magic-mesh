@@ -41,12 +41,7 @@ const TRAFFIC: Color32 = Color32::from_rgb(0xFF, 0xB4, 0x54); // style-leak-ok: 
 const MANEUVER_BLUE: Color32 = Color32::from_rgb(0x1A, 0x66, 0xE0); // style-leak-ok: map-content-color
 const MANEUVER_BLUE_HI: Color32 = Color32::from_rgb(0x3E, 0x86, 0xFF); // style-leak-ok: map-content-color
 const MANEUVER_BLUE_DEEP: Color32 = Color32::from_rgb(0x11, 0x4C, 0xB6); // style-leak-ok: map-content-color
-const LANE_BG: Color32 = Color32::from_rgb(0x0E, 0x2A, 0x54); // style-leak-ok: map-content-color
-const LANE_DIM: Color32 = Color32::from_rgb(0x6A, 0x7E, 0xA2); // style-leak-ok: map-content-color
 const ROUTE_CASING: Color32 = Color32::from_rgb(0x14, 0x4C, 0x92); // style-leak-ok: map-content-color
-const SIGN_WHITE: Color32 = Color32::from_rgb(0xF4, 0xF6, 0xFA); // style-leak-ok: map-content-color
-const SIGN_RED: Color32 = Color32::from_rgb(0xD4, 0x2A, 0x2A); // style-leak-ok: map-content-color
-const SIGN_INK: Color32 = Color32::from_rgb(0x15, 0x17, 0x1D); // style-leak-ok: map-content-color
 const HUD_CARD_BG: Color32 = Color32::from_rgb(0x1A, 0x1B, 0x22); // style-leak-ok: map-content-color
 const HUD_CARD_HI: Color32 = Color32::from_rgb(0x24, 0x26, 0x30); // style-leak-ok: map-content-color
 
@@ -455,75 +450,6 @@ fn maneuver_kind(text: &str) -> ManeuverKind {
     }
 }
 
-/// One lane in the lane-guidance strip: the arrow it shows and whether it is a
-/// recommended lane for the upcoming maneuver.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct LaneCue {
-    dir: ManeuverKind,
-    recommended: bool,
-}
-
-/// Mock a lane set for the upcoming maneuver (Waze / Google-Maps lane guidance).
-/// Turn maneuvers get a small bank of lanes with the turn lane(s) highlighted;
-/// non-turn maneuvers return an empty set so the strip stays hidden.
-fn mock_lanes(kind: ManeuverKind) -> Vec<LaneCue> {
-    let lane = |dir, recommended| LaneCue { dir, recommended };
-    match kind {
-        ManeuverKind::Right => vec![
-            lane(ManeuverKind::Straight, false),
-            lane(ManeuverKind::Straight, false),
-            lane(ManeuverKind::Right, true),
-        ],
-        ManeuverKind::SlightRight | ManeuverKind::Merge => vec![
-            lane(ManeuverKind::Straight, false),
-            lane(ManeuverKind::Straight, false),
-            lane(ManeuverKind::SlightRight, true),
-        ],
-        ManeuverKind::Left => vec![
-            lane(ManeuverKind::Left, true),
-            lane(ManeuverKind::Straight, false),
-            lane(ManeuverKind::Straight, false),
-        ],
-        ManeuverKind::SlightLeft => vec![
-            lane(ManeuverKind::SlightLeft, true),
-            lane(ManeuverKind::Straight, false),
-            lane(ManeuverKind::Straight, false),
-        ],
-        ManeuverKind::UTurn => vec![
-            lane(ManeuverKind::UTurn, true),
-            lane(ManeuverKind::Straight, false),
-        ],
-        // Straight / Roundabout / Arrive: no lane strip.
-        _ => Vec::new(),
-    }
-}
-
-/// Whether the lane-guidance strip should show: a live fix, a lane set exists for
-/// the maneuver, and the maneuver is near (within a half mile). A non-finite
-/// distance hides the strip (crash-safe).
-fn lane_guidance_active(route: &RoutePlan, kind: ManeuverKind, has_fix: bool) -> bool {
-    has_fix
-        && finite_or(route.distance_to_maneuver_mi, f32::INFINITY) <= 0.5
-        && !mock_lanes(kind).is_empty()
-}
-
-/// Mock a posted speed limit from the road classification (no live sign data in
-/// the simulator slice); the HUD keys the over-limit colour off this.
-fn mock_speed_limit(route: &RoutePlan) -> u32 {
-    let r = route.current_road.to_ascii_uppercase();
-    if r.starts_with("I-") || r.contains("INTERSTATE") || r.contains("FWY") || r.contains("FREEWAY")
-    {
-        65
-    } else if r.starts_with("US-") || r.starts_with("US ") || r.contains("HWY") || r.contains("SR-")
-    {
-        55
-    } else if r.contains("AVE") || r.contains("BLVD") || r.contains("PKWY") {
-        40
-    } else {
-        35
-    }
-}
-
 /// Colour the arrival/ETA readout by how the route is running.
 fn eta_tone(route: &RoutePlan, offline: &OfflineNavigationStatus) -> Color32 {
     if offline.readiness == OfflineNavigationReadiness::Blocked {
@@ -748,16 +674,13 @@ fn drive_hud(
             paint_maneuver_banner(&painter, banner, route, kind, has_fix);
         }
 
-        // Lane-guidance strip directly under the banner (only when a turn is near
-        // and we are on route).
-        if !off_route && lane_guidance_active(route, kind, has_fix) {
-            let lanes = mock_lanes(kind);
-            // Never exceed the banner width; `paint_lane_guidance` skips a
-            // too-narrow strip, so a tiny viewport simply drops the lanes.
-            let lane_w = (lanes.len() as f32 * 56.0).min(banner.width().max(1.0));
-            let lane_rect = safe_rect(banner.left(), below_banner, lane_w, 48.0);
+        // Lane-level data is not part of the trusted route-provider contract.
+        // Keep the existing strip footprint, but say so instead of deriving
+        // lanes from the maneuver words.
+        if !off_route {
+            let lane_rect = safe_rect(banner.left(), below_banner, banner.width().min(360.0), 48.0);
             paint_soft_shadow(&painter, lane_rect, HUD_RADIUS_S);
-            paint_lane_guidance(&painter, lane_rect, &lanes);
+            paint_provider_unavailable(&painter, lane_rect, "Lane guidance unavailable");
             below_banner = lane_rect.bottom() + Style::SP_S;
         }
     } else {
@@ -813,8 +736,7 @@ fn drive_hud(
         paint_eta_bar(&painter, eta, route, eta_tone(route, offline));
     }
 
-    // Bottom-left speedometer (live vehicle speed — honest in both states). The
-    // round speed-limit sign is route-derived, so it only shows while guiding.
+    // Bottom-left speedometer (live vehicle speed — honest in both states).
     let speed_d = 88.0;
     let speedo = safe_rect(
         rect.left() + margin,
@@ -822,16 +744,16 @@ fn drive_hud(
         speed_d,
         speed_d,
     );
-    let limit = if navigating {
-        mock_speed_limit(route)
-    } else {
-        0
-    };
-    paint_speedometer(&painter, speedo, primary, has_fix, limit);
+    paint_speedometer(&painter, speedo, primary, has_fix);
     if navigating {
-        let sign_r = 32.0;
-        let sign_center = egui::pos2(speedo.right() + Style::SP_S + sign_r, speedo.center().y);
-        paint_speed_limit_sign(&painter, sign_center, sign_r, limit);
+        let limit_status = safe_rect(
+            speedo.right() + Style::SP_S,
+            speedo.top() + 20.0,
+            152.0,
+            48.0,
+        );
+        paint_soft_shadow(&painter, limit_status, HUD_RADIUS_S);
+        paint_provider_unavailable(&painter, limit_status, "Speed limit unavailable");
     }
 
     // Floating action buttons (painted last so they float above everything).
@@ -3121,13 +3043,14 @@ fn paint_maneuver_arrow(painter: &Painter, rect: Rect, kind: ManeuverKind, color
     }
 }
 
-/// Paint the lane-guidance strip: a row of lane cells, recommended lane(s)
-/// bright over a soft accent pill, the rest dimmed (Waze / Google-Maps grammar).
-fn paint_lane_guidance(painter: &Painter, rect: Rect, lanes: &[LaneCue]) {
-    if lanes.is_empty() || !rect.width().is_finite() || rect.width() < 8.0 {
+/// Preserve the route HUD footprint while making unavailable provider data
+/// explicit. This deliberately paints no lane arrows, route-derived numbers,
+/// or other inferred guidance.
+fn paint_provider_unavailable(painter: &Painter, rect: Rect, label: &str) {
+    if !rect.width().is_finite() || !rect.height().is_finite() || rect.width() < 48.0 {
         return;
     }
-    painter.rect_filled(rect, HUD_RADIUS_S, LANE_BG);
+    painter.rect_filled(rect, HUD_RADIUS_S, HUD_CARD_BG);
     paint_card_sheen(
         painter,
         rect,
@@ -3141,46 +3064,16 @@ fn paint_lane_guidance(painter: &Painter, rect: Rect, lanes: &[LaneCue]) {
         Stroke::new(1.0, MANEUVER_BLUE_HI.gamma_multiply(0.4)),
         StrokeKind::Inside,
     );
-
-    let n = lanes.len().max(1);
-    let cell_w = rect.width() / n as f32;
-    for (i, lane) in lanes.iter().enumerate() {
-        let cx = rect.left() + (i as f32 + 0.5) * cell_w;
-        if !cx.is_finite() {
-            continue;
-        }
-        let cell_c = egui::pos2(cx, rect.center().y);
-        let arrow_side = rect.height().min(cell_w) * 0.72;
-        let arrow_rect = safe_rect(
-            cell_c.x - arrow_side * 0.5,
-            cell_c.y - arrow_side * 0.5,
-            arrow_side,
-            arrow_side,
-        );
-        if lane.recommended {
-            painter.rect_filled(
-                arrow_rect.expand(3.0),
-                HUD_RADIUS_S,
-                ROUTE_BLUE.gamma_multiply(0.22),
-            );
-        }
-        let color = if lane.recommended {
-            Color32::WHITE
-        } else {
-            LANE_DIM
-        };
-        paint_maneuver_arrow(painter, arrow_rect, lane.dir, color);
-        if i > 0 {
-            let sx = rect.left() + i as f32 * cell_w;
-            painter.line_segment(
-                [
-                    egui::pos2(sx, rect.top() + 6.0),
-                    egui::pos2(sx, rect.bottom() - 6.0),
-                ],
-                Stroke::new(1.0, MANEUVER_BLUE_HI.gamma_multiply(0.18)),
-            );
-        }
-    }
+    let badge = egui::pos2(rect.left() + Style::SP_M, rect.center().y);
+    let badge_rect = egui::Rect::from_center_size(badge, egui::vec2(22.0, 22.0));
+    let _ = paint_carbon(painter, badge_rect, "dialog-warning", Style::WARN);
+    painter.text(
+        egui::pos2(badge.x + 18.0, badge.y),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(Style::SMALL),
+        Style::TEXT_DIM,
+    );
 }
 
 fn paint_eta_bar(painter: &Painter, rect: Rect, route: &RoutePlan, tone: Color32) {
@@ -3257,7 +3150,6 @@ fn paint_speedometer(
     rect: Rect,
     primary: Option<&LocationSample>,
     has_fix: bool,
-    limit: u32,
 ) {
     let r = rect.width().min(rect.height()) * 0.5;
     let c = rect.center();
@@ -3270,18 +3162,7 @@ fn paint_speedometer(
     painter.circle_stroke(c, r, Stroke::new(1.5, Style::BORDER));
     let speed = primary.map(|s| s.speed_mph).filter(|v| v.is_finite());
     let (num, tone) = match (has_fix, speed) {
-        (true, Some(v)) => {
-            let over = limit > 0 && v > limit as f32 + 0.5;
-            let far_over = limit > 0 && v > limit as f32 + 8.0;
-            let tone = if far_over {
-                Style::DANGER
-            } else if over {
-                Style::WARN
-            } else {
-                Style::TEXT_STRONG
-            };
-            (format!("{:.0}", v.max(0.0)), tone)
-        }
+        (true, Some(v)) => (format!("{:.0}", v.max(0.0)), Style::TEXT_STRONG),
         _ => ("--".to_string(), Style::TEXT_DIM),
     };
     painter.text(
@@ -3297,27 +3178,6 @@ fn paint_speedometer(
         "mph",
         FontId::proportional(Style::SMALL),
         Style::TEXT_DIM,
-    );
-}
-
-/// A round Waze/EU-style speed-limit sign: white face, red ring, black number.
-fn paint_speed_limit_sign(painter: &Painter, center: Pos2, radius: f32, limit: u32) {
-    if limit == 0 {
-        return;
-    }
-    painter.circle_filled(
-        center + egui::vec2(0.0, 2.5),
-        radius,
-        Color32::BLACK.gamma_multiply(0.35),
-    );
-    painter.circle_filled(center, radius, SIGN_WHITE);
-    painter.circle_stroke(center, radius, Stroke::new(radius * 0.16, SIGN_RED));
-    painter.text(
-        center,
-        Align2::CENTER_CENTER,
-        &limit.to_string(),
-        FontId::proportional(radius * 0.92),
-        SIGN_INK,
     );
 }
 
@@ -7249,28 +7109,6 @@ mod tests {
         assert_eq!(maneuver_kind("Continue straight"), ManeuverKind::Straight);
     }
 
-    fn route_on(road: &str) -> RoutePlan {
-        RoutePlan {
-            current_road: road.to_string(),
-            next_maneuver: String::new(),
-            distance_to_maneuver_mi: 0.0,
-            eta: String::new(),
-            remaining_time_min: 0,
-            remaining_distance_mi: 0.0,
-            alternatives: 0,
-            traffic_alert: String::new(),
-            weather_alert: String::new(),
-        }
-    }
-
-    #[test]
-    fn mock_speed_limit_keys_off_road_class() {
-        assert_eq!(mock_speed_limit(&route_on("I-79 N")), 65);
-        assert_eq!(mock_speed_limit(&route_on("US-30 W")), 55);
-        assert_eq!(mock_speed_limit(&route_on("Grant Ave")), 40);
-        assert_eq!(mock_speed_limit(&route_on("2nd St")), 35);
-    }
-
     #[test]
     fn format_distance_switches_to_feet_when_close() {
         assert_eq!(format_distance(0.4), "0.4 mi");
@@ -7278,64 +7116,43 @@ mod tests {
         assert_eq!(format_distance(f32::NAN), "0 ft");
     }
 
-    fn route_near(maneuver: &str, dist_mi: f32) -> RoutePlan {
-        RoutePlan {
-            current_road: "US-30 W".to_string(),
-            next_maneuver: maneuver.to_string(),
-            distance_to_maneuver_mi: dist_mi,
-            eta: "14:32".to_string(),
-            remaining_time_min: 18,
-            remaining_distance_mi: 11.6,
-            alternatives: 2,
-            traffic_alert: String::new(),
-            weather_alert: String::new(),
-        }
-    }
-
     #[test]
-    fn mock_lanes_highlights_the_turn_lane() {
-        let right = mock_lanes(ManeuverKind::Right);
-        assert_eq!(right.len(), 3);
-        let last = right.last().expect("lane present");
-        assert!(last.recommended);
-        assert_eq!(last.dir, ManeuverKind::Right);
-        assert!(!right[0].recommended);
-
-        assert!(
-            mock_lanes(ManeuverKind::Left)
-                .first()
-                .expect("lane present")
-                .recommended
-        );
-        assert!(mock_lanes(ManeuverKind::Straight).is_empty());
-        assert!(mock_lanes(ManeuverKind::Roundabout).is_empty());
-        assert!(mock_lanes(ManeuverKind::Arrive).is_empty());
-    }
-
-    #[test]
-    fn lane_guidance_shows_only_near_a_turn_with_fix() {
-        let near = route_near("Turn right onto Main St", 0.3);
-        assert!(lane_guidance_active(&near, ManeuverKind::Right, true));
-        // Far away, no fix, non-finite distance, and non-turn maneuvers all hide it.
-        let far = route_near("Turn right onto Main St", 1.4);
-        assert!(!lane_guidance_active(&far, ManeuverKind::Right, true));
-        assert!(!lane_guidance_active(&near, ManeuverKind::Right, false));
-        let nan = route_near("Turn right", f32::NAN);
-        assert!(!lane_guidance_active(&nan, ManeuverKind::Right, true));
-        assert!(!lane_guidance_active(&near, ManeuverKind::Straight, true));
-    }
-
-    #[test]
-    fn drive_hud_renders_lane_guidance_near_a_turn() {
+    fn drive_hud_shows_unknown_guidance_without_road_heuristics() {
         let mut surface = MapsLocationSurface::simulated();
         surface.active = WorkspaceTab::Drive;
         surface.local_navigation.navigating = true;
+        surface.local_navigation.active_route.current_road = "I-79 N".to_string();
         surface.local_navigation.active_route.next_maneuver = "Turn right onto Main St".to_string();
         surface
             .local_navigation
             .active_route
             .distance_to_maneuver_mi = 0.2;
-        assert!(tessellate(&mut surface) > 0);
+        let texts = painted_texts(&mut surface);
+
+        assert!(
+            texts.iter().any(|text| text == "Lane guidance unavailable"),
+            "lane status must be explicit: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text == "Speed limit unavailable"),
+            "speed-limit status must be explicit: {texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.contains("Turn right onto Main St")),
+            "real maneuver text must remain: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text.contains("on I-79 N")),
+            "real current-road text must remain: {texts:?}"
+        );
+        for fabricated in ["65", "55", "40", "35"] {
+            assert!(
+                !texts.iter().any(|text| text == fabricated),
+                "road-name heuristic must not paint fabricated value {fabricated}: {texts:?}"
+            );
+        }
     }
 
     #[test]

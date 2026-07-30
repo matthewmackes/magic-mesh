@@ -592,10 +592,10 @@ remains here under a completed status.
   11 mesh-type and 69 worker tests passing. Maps/Car now projects bounded radio
   presence, operation, GNSS/radio freshness, retained age, provenance, and
   typed Current/Stale/Resyncing/Unavailable mirror state; 13 consumer tests
-  pass. The vehicle worker now also has a bounded MG90/manager roster
-  with independent poll/heartbeat plans, deterministic latest-wins selection,
-  and explicit no-source results; the complete vehicle gate has 42 passing
-  tests. Multiple live adapters and route/render cutover remain.
+  pass. The bounded MG90/manager roster has independent poll/heartbeat plans,
+  latest-wins/no-source behavior, and 42 vehicle tests passing. Maps HUD now
+  removes road-name speed/lane heuristics and paints explicit unavailable states;
+  focused render proof passes. Live adapters and route/render cutover remain.
 - Remaining work:
   1. Consume WL-UX-009's platform-wide Carbon-requirement retirement and update
      the Maps/Car-specific authority while retaining egui, shared `Style`,
@@ -877,16 +877,14 @@ remains here under a completed status.
   expose honest unavailable/degraded states, and bound privileged/OEM writes
   with confirmation, audit, safety limits, and recovery.
 - Current state: Existing System, Storage, Device Manager, About, Control
-  Center, status, BlueZ, display, power, firmware, and input code supplies
-  partial UI and provider foundations. Several controls are read-only or
-  presentation-only, durable routes are duplicated, and no unified typed
-  hardware action boundary covers connectivity, audio, input, performance,
-  docks, and OEM capabilities. This Node now has a governed eight-section
-  catalog, persistent section/search navigation, legacy route normalization,
-  and visibly unavailable provider states, with focused farm coverage.
-  Its live mesh-status read model now also projects a bounded typed capability/
-  action catalog with explicit unavailable/degraded states and fail-closed
-  mutation rows; 12 focused tests pass.
+  Center, status, BlueZ, display, power, firmware, and input code provide
+  partial foundations; controls remain read-only in places, routes are
+  duplicated, and no unified typed action boundary covers connectivity, audio,
+  input, performance, docks, or OEM capabilities. This Node now has a governed
+  eight-section catalog, persistent section/search navigation with operator
+  hardware aliases, legacy normalization, and unavailable provider states.
+  Its mesh-status model projects bounded typed capability/action rows with
+  fail-closed mutations; 14 focused tests pass.
 - Remaining work:
 
   1. Finish the durable This Node sidebar and search index across every
@@ -996,12 +994,11 @@ remains here under a completed status.
   overflow bounds, versioned ordered pin persistence, canonical focused-surface
   underlining, and a tested slide/melt transition. Start dispatches to the
   existing Front Door search/focus path, and the old group labels/pill geometry
-  are gone. The taskbar persistence and geometry slice has 27 focused navigation
-  tests plus one Front Door pin test passing. `springboard.rs` still owns grid/
-  selection/tile presentation; first-boot selection, overflow flyout, and
-  Fleet & Mesh/Workloads exposure remain open; `Surface::FleetMesh` exists while
-  Workloads retains the internal `Surface::InfraCode` identifier and an obsolete
-  public label.
+  are gone. Persistence/geometry and overflow have 27 focused navigation tests,
+  one Front Door pin test, and two direct overflow geometry/order tests passing.
+  `springboard.rs` still owns grid/selection/tile presentation; first-boot
+  selection and Fleet & Mesh/Workloads exposure remain open
+  (`Surface::FleetMesh` exists; Workloads retains internal `Surface::InfraCode`).
 - Remaining work:
 
   1. Reconcile taskbar-specific authority after WL-UX-009 retires the global
@@ -1036,29 +1033,20 @@ remains here under a completed status.
      discard unknown surfaces, bound the list to the searchable catalog, and
      send new profiles through first-boot selection. Never silently restore a
      default list after migration; user choices remain authoritative.
-  7. Add pin/unpin personalization only. Front Door app results expose `Pin to
-     taskbar` or `Unpin from taskbar`; taskbar icons expose `Unpin from taskbar`.
-     Do not implement drag, move-left, move-right, or reorder actions. Persist
-     pin changes immediately. Start, Back, Home, overflow, and placement
-     controls cannot be pinned or removed.
-  8. Add icon-only responsive overflow without recreating an App Grid. Keep
-     40px targets and move excess pins into a `MoreHorizontal` single-column
-     flyout with tooltips/accessibility names. Close it on activation, Escape,
-     or click-away. If focus would be hidden, promote that icon into the final
-     visible slot for the frame without changing persisted order.
+  7. Finish first-boot pin selection for new profiles and Fleet & Mesh/
+     Workloads exposure without renaming the internal `Surface::InfraCode`
+     identifier. Keep pin changes immediate and reject pinning Start, Back,
+     Home, overflow, and placement controls.
+  8. Delete Springboard tile plates, labels, grid layout, keyboard selection,
+     tile activation, open-presence zoom ghosts, and their tests. Preserve the
+     wallpaper Home, Home intent, and pull-down-to-search gesture in a reduced
+     Home gesture layer.
   9. Pass a focused target to the taskbar: `Home`, `Surface(Surface)`, or
      `DesktopSource(id)`. Paint exactly one centered 18x3 accent underline 2px
      above the bottom. Normalize Workbench, Mesh Map, and Explorer aliases to
      Fleet & Mesh; match active VDI sources to their pinned desktop icon; mark
      Home on wallpaper. Search leaves the underlying marker unchanged. Never
      paint running/open/recent markers or expose taskbar Close actions.
-  10. Delete all taskbar grouping labels, label geometry, headings, group gaps,
-      and group-aware tooltip wording in Bottom and Left modes. Retain taxonomy
-      only where search or compile-time surface coverage consumes it. Delete
-      Springboard tile plates, labels, grid layout, keyboard selection, tile
-      activation, open-presence zoom ghosts, and their tests. Preserve the
-      wallpaper Home, Home intent, and pull-down-to-search gesture in a reduced
-      Home gesture layer.
 - Scope: Construct taskbar geometry, appearance, focus state, Start/Search,
   default and user pins, overflow, preference migration, Bottom/Left
   compatibility, icon-free Home, and App Grid removal. Car chrome, top-status

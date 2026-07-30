@@ -32,9 +32,14 @@ pub(crate) const TASKBAR_H: f32 = 48.0;
 pub(crate) const SPRINGBOARD_DOCK_RESERVED_H: f32 = TASKBAR_H;
 /// The icon controls keep a compact 40px target in the thin dock.
 const CONTROL_EDGE: f32 = 40.0;
-/// The horizontal taskbar keeps fixed-size targets and drops lower-priority
-/// chooser pins and launchers when a panel cannot fit the whole catalog.
+/// The horizontal taskbar keeps fixed-size targets and moves lower-priority
+/// chooser pins and launchers into the More flyout when a panel cannot fit the
+/// whole catalog.
 const FLOATING_GAP: f32 = 4.0;
+/// Width of the single-column taskbar overflow surface before screen clamping.
+const OVERFLOW_W: f32 = 256.0;
+/// Gap between the More anchor and its overflow surface.
+const OVERFLOW_GAP: f32 = 4.0;
 /// Maximum number of chooser-pinned sources shown in the dock. The full
 /// chooser remains the unbounded discovery surface; the dock is a quick rail.
 const MAX_PINNED_SOURCES: usize = 8;
@@ -378,6 +383,8 @@ impl State {
         }
 
         let mut action = None;
+        let overflow_popup_id = overflow_popup_id(self.mode);
+        let mut overflow_response = None;
         let area = egui::Area::new(egui::Id::new("construct-navigation-bar"))
             .order(egui::Order::Foreground)
             // Keep the foreground Area limited to the visible bar footprint.
@@ -480,7 +487,14 @@ impl State {
                         );
                         painter.rect_filled(underline, egui::CornerRadius::ZERO, Style::ACCENT);
                     }
-                    let label = control_label(*control, pinned_sources);
+                    let label = if control.kind == ControlKind::Overflow {
+                        geometry.overflow.as_ref().map_or_else(
+                            || "More taskbar apps".to_owned(),
+                            |overflow| overflow_label(overflow.items.len()),
+                        )
+                    } else {
+                        control_label(*control, pinned_sources)
+                    };
                     install_accessibility(
                         ctx,
                         self.mode,
@@ -491,14 +505,50 @@ impl State {
                     let _response = response.clone().on_hover_ui(move |ui| {
                         nav_bar_tooltip(ui, label.as_str());
                     });
-                    if clicked {
+                    let keyboard_toggle = response.has_focus()
+                        && ctx.input(|input| {
+                            input.key_pressed(egui::Key::Enter)
+                                || input.key_pressed(egui::Key::Space)
+                        });
+                    if control.kind == ControlKind::Overflow {
+                        overflow_response = Some(response.clone());
+                        if clicked || keyboard_toggle {
+                            ctx.memory_mut(|memory| memory.toggle_popup(overflow_popup_id));
+                        }
+                    } else if clicked {
                         action = Some(control_action(*control, pinned_sources));
                     }
-                    if let Some(menu_action) =
-                        taskbar_context_menu(&response, *control, &self.pinned_surfaces)
-                    {
-                        action = Some(menu_action);
+                    if control.kind != ControlKind::Overflow {
+                        if let Some(menu_action) =
+                            taskbar_context_menu(&response, *control, &self.pinned_surfaces)
+                        {
+                            action = Some(menu_action);
+                        }
                     }
+                }
+
+                if let (Some(anchor), Some(overflow)) =
+                    (overflow_response.as_ref(), geometry.overflow.as_ref())
+                {
+                    let items = overflow.items.clone();
+                    let mode = self.mode;
+                    let _ = egui::popup::popup_above_or_below_widget(
+                        ui,
+                        overflow_popup_id,
+                        anchor,
+                        egui::AboveOrBelow::Above,
+                        egui::popup::PopupCloseBehavior::CloseOnClickOutside,
+                        |ui| {
+                            paint_overflow_popup(
+                                ui,
+                                mode,
+                                anchor.rect,
+                                &items,
+                                pinned_sources,
+                                &mut action,
+                            );
+                        },
+                    );
                 }
             });
         // egui retains Area ordering across frames. A foreground scrim or
@@ -644,6 +694,7 @@ enum ControlKind {
     Back,
     Home,
     Pin,
+    Overflow,
     SurfaceLauncher,
     PinnedDesktop,
 }
@@ -655,6 +706,7 @@ impl ControlKind {
             Self::Back => "back",
             Self::Home => "home",
             Self::Pin => "pin",
+            Self::Overflow => "overflow",
             Self::SurfaceLauncher => "surface",
             Self::PinnedDesktop => "pinned-desktop",
         }
@@ -666,6 +718,7 @@ impl ControlKind {
             Self::Back => IconId::ArrowLeft,
             Self::Home => IconId::FileHome,
             Self::Pin => IconId::Pin,
+            Self::Overflow => IconId::MoreHorizontal,
             Self::SurfaceLauncher => IconId::Mark,
             Self::PinnedDesktop => IconId::Desktop,
         }
@@ -677,6 +730,7 @@ impl ControlKind {
             Self::Back => "Back",
             Self::Home => "Home",
             Self::Pin => "Taskbar placement",
+            Self::Overflow => "More taskbar apps",
             Self::SurfaceLauncher => "Open app",
             Self::PinnedDesktop => "Open pinned desktop",
         }
@@ -688,6 +742,9 @@ impl ControlKind {
             Self::Back => Action::Back,
             Self::Home => Action::Home,
             Self::Pin => Action::ToggleDock,
+            // The More control is handled by the popup toggle in `mount`; it
+            // never reaches this action mapping.
+            Self::Overflow => Action::Home,
             Self::SurfaceLauncher => Action::Home,
             Self::PinnedDesktop => Action::Home,
         }
@@ -700,6 +757,23 @@ struct Control {
     rect: egui::Rect,
     surface: Option<Surface>,
     source_index: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverflowItem {
+    Surface(Surface),
+    PinnedDesktop(usize),
+}
+
+#[derive(Debug, Clone)]
+struct OverflowGeometry {
+    items: Vec<OverflowItem>,
+}
+
+#[derive(Debug, Clone)]
+struct OverflowLayout {
+    outer: egui::Rect,
+    rows: Vec<egui::Rect>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -715,6 +789,7 @@ struct Geometry {
     radius: egui::CornerRadius,
     group_labels: Vec<GroupLabel>,
     controls: Vec<Control>,
+    overflow: Option<OverflowGeometry>,
     finished: bool,
 }
 
@@ -742,32 +817,6 @@ fn control_span(count: usize, edge: f32, gap: f32) -> f32 {
     }
 }
 
-fn effective_floating_pinned_count_for(
-    screen: egui::Rect,
-    requested: usize,
-    gap: f32,
-    surface_count: usize,
-) -> usize {
-    let requested = requested.min(MAX_PINNED_SOURCES);
-    let visible_surfaces = effective_floating_surface_count_for(screen, gap, surface_count);
-    let center_capacity = floating_center_capacity(screen, gap);
-    let available_pins = center_capacity.saturating_sub(visible_surfaces);
-    for pinned_count in (0..=requested).rev() {
-        if pinned_count <= available_pins {
-            return pinned_count;
-        }
-    }
-    0
-}
-
-fn effective_floating_surface_count_for(
-    screen: egui::Rect,
-    gap: f32,
-    surface_count: usize,
-) -> usize {
-    floating_center_capacity(screen, gap).min(surface_count)
-}
-
 fn floating_center_bounds(screen: egui::Rect, gap: f32) -> (f32, f32) {
     let left_start = screen.left() + Style::SP_L;
     let left_cluster_end = left_start + control_span(3, CONTROL_EDGE, gap);
@@ -780,6 +829,41 @@ fn floating_center_capacity(screen: egui::Rect, gap: f32) -> usize {
     (((center_right - center_left).max(0.0) + gap) / (CONTROL_EDGE + gap)).floor() as usize
 }
 
+/// Select the catalog entries that remain in the fixed rail and preserve the
+/// rest, in catalog order, for the More flyout. The overflow control itself
+/// consumes one center slot, so the visible entries remain centered with the
+/// existing taskbar pin order intact.
+fn catalog_selection(
+    surfaces: &[Surface],
+    pinned_count: usize,
+    capacity: usize,
+) -> (usize, usize, Option<OverflowGeometry>) {
+    let pinned_count = pinned_count.min(MAX_PINNED_SOURCES);
+    let total = surfaces.len() + pinned_count;
+    let has_overflow = total > capacity && capacity > 0;
+    let visible_capacity = capacity.saturating_sub(usize::from(has_overflow));
+    let visible_surface_count = surfaces.len().min(visible_capacity);
+    let visible_pinned_count = pinned_count.min(visible_capacity - visible_surface_count);
+
+    let mut overflow_items = Vec::new();
+    overflow_items.extend(
+        surfaces
+            .iter()
+            .copied()
+            .skip(visible_surface_count)
+            .map(OverflowItem::Surface),
+    );
+    overflow_items.extend((visible_pinned_count..pinned_count).map(OverflowItem::PinnedDesktop));
+
+    (
+        visible_surface_count,
+        visible_pinned_count,
+        (!overflow_items.is_empty()).then_some(OverflowGeometry {
+            items: overflow_items,
+        }),
+    )
+}
+
 fn floating_geometry_for(screen: egui::Rect, pinned_count: usize) -> Geometry {
     floating_geometry_for_catalog(screen, pinned_count, &default_taskbar_pins())
 }
@@ -790,9 +874,11 @@ fn floating_geometry_for_catalog(
     surfaces: &[Surface],
 ) -> Geometry {
     let gap = FLOATING_GAP;
-    let surface_count = effective_floating_surface_count_for(screen, gap, surfaces.len());
-    let pinned_count =
-        effective_floating_pinned_count_for(screen, pinned_count, gap, surfaces.len());
+    let (surface_count, pinned_count, overflow) = catalog_selection(
+        surfaces,
+        pinned_count,
+        floating_center_capacity(screen, gap),
+    );
     let edge = CONTROL_EDGE;
     let outer = egui::Rect::from_min_size(
         egui::pos2(screen.left(), screen.bottom() - TASKBAR_H),
@@ -813,7 +899,7 @@ fn floating_geometry_for_catalog(
         });
         cursor_x += edge + gap;
     }
-    let center_count = surface_count + pinned_count;
+    let center_count = surface_count + pinned_count + usize::from(overflow.is_some());
     let center_span = control_span(center_count, edge, gap);
     let (center_left, center_right) = floating_center_bounds(screen, gap);
     let center_start = (center_left + center_right) / 2.0 - center_span / 2.0;
@@ -836,6 +922,14 @@ fn floating_geometry_for_catalog(
         });
         cursor_x += edge + gap;
     }
+    if overflow.is_some() {
+        controls.push(Control {
+            kind: ControlKind::Overflow,
+            rect: egui::Rect::from_min_size(egui::pos2(cursor_x, y), egui::vec2(edge, edge)),
+            surface: None,
+            source_index: None,
+        });
+    }
     controls.push(Control {
         kind: ControlKind::Pin,
         rect: egui::Rect::from_min_size(egui::pos2(right_x, y), egui::vec2(edge, edge)),
@@ -847,6 +941,7 @@ fn floating_geometry_for_catalog(
         radius: egui::CornerRadius::ZERO,
         group_labels,
         controls,
+        overflow,
         finished: true,
     }
 }
@@ -880,7 +975,6 @@ fn docked_geometry_for_catalog(
     surfaces: &[Surface],
 ) -> Geometry {
     let outer = egui::Rect::from_min_size(screen.left_top(), egui::vec2(DOCKED_W, screen.height()));
-    let pinned_count = pinned_count.min(MAX_PINNED_SOURCES);
     let mut controls = Vec::with_capacity(dock_control_capacity_for(pinned_count, surfaces.len()));
     let group_labels = Vec::new();
     let mut cursor_y = screen.top() + STATUS_BAR_H + Style::SP_S;
@@ -897,7 +991,16 @@ fn docked_geometry_for_catalog(
         cursor_y += CONTROL_EDGE + Style::SP_XS;
     }
     cursor_y += Style::SP_S - Style::SP_XS;
-    for surface in surfaces.iter().copied() {
+    let mut available_slots: usize = 0;
+    let mut slot_y = cursor_y;
+    while docked_control_fits(screen, slot_y) {
+        available_slots += 1;
+        slot_y += CONTROL_EDGE + Style::SP_XS;
+    }
+    // Keep the placement control available when the rail has room for it.
+    let (surface_count, pinned_count, overflow) =
+        catalog_selection(surfaces, pinned_count, available_slots.saturating_sub(1));
+    for surface in surfaces.iter().copied().take(surface_count) {
         if !docked_control_fits(screen, cursor_y) {
             break;
         }
@@ -927,6 +1030,18 @@ fn docked_geometry_for_catalog(
         });
         cursor_y += CONTROL_EDGE + Style::SP_XS;
     }
+    if overflow.is_some() && docked_control_fits(screen, cursor_y) {
+        controls.push(Control {
+            kind: ControlKind::Overflow,
+            rect: egui::Rect::from_min_size(
+                egui::pos2(outer.center().x - CONTROL_EDGE / 2.0, cursor_y),
+                egui::vec2(CONTROL_EDGE, CONTROL_EDGE),
+            ),
+            surface: None,
+            source_index: None,
+        });
+        cursor_y += CONTROL_EDGE + Style::SP_XS;
+    }
     if docked_control_fits(screen, cursor_y) {
         controls.push(Control {
             kind: ControlKind::Pin,
@@ -948,6 +1063,7 @@ fn docked_geometry_for_catalog(
         },
         group_labels,
         controls,
+        overflow,
         finished: true,
     }
 }
@@ -980,6 +1096,11 @@ fn interpolate_geometry(from: &Geometry, to: &Geometry, t: f32, finished: bool) 
         radius: lerp_radius(from.radius, to.radius, t),
         group_labels,
         controls,
+        overflow: if t < 0.5 {
+            from.overflow.clone()
+        } else {
+            to.overflow.clone()
+        },
         finished,
     }
 }
@@ -1009,6 +1130,7 @@ fn translate_geometry(geometry: &Geometry, delta: egui::Vec2) -> Geometry {
                 accent: group.accent,
             })
             .collect(),
+        overflow: geometry.overflow.clone(),
         finished: geometry.finished,
     }
 }
@@ -1081,6 +1203,143 @@ fn control_id(mode: DockMode, control: Control) -> egui::Id {
             mode.id_suffix(),
             control.kind.id_suffix(),
         )),
+    }
+}
+
+fn overflow_popup_id(mode: DockMode) -> egui::Id {
+    egui::Id::new(("construct-navigation-bar", mode.id_suffix(), "overflow"))
+}
+
+fn overflow_label(item_count: usize) -> String {
+    match item_count {
+        1 => "More taskbar apps (1 hidden)".to_owned(),
+        count => format!("More taskbar apps ({count} hidden)"),
+    }
+}
+
+fn overflow_item_control(item: OverflowItem, rect: egui::Rect) -> Control {
+    match item {
+        OverflowItem::Surface(surface) => Control {
+            kind: ControlKind::SurfaceLauncher,
+            rect,
+            surface: Some(surface),
+            source_index: None,
+        },
+        OverflowItem::PinnedDesktop(source_index) => Control {
+            kind: ControlKind::PinnedDesktop,
+            rect,
+            surface: None,
+            source_index: Some(source_index),
+        },
+    }
+}
+
+/// Preferred geometry for the More surface. The popup container may flip below
+/// the anchor when a display is too short; rows remain one 40px target column
+/// and the whole preferred surface stays clamped inside the screen margins.
+fn overflow_layout_for(
+    anchor: egui::Rect,
+    screen: egui::Rect,
+    item_count: usize,
+) -> OverflowLayout {
+    let width = OVERFLOW_W.min((screen.width() - 2.0 * Style::SP_S).max(CONTROL_EDGE));
+    let row_gap = Style::SP_XS;
+    let height = 2.0 * Style::SP_S
+        + item_count as f32 * CONTROL_EDGE
+        + item_count.saturating_sub(1) as f32 * row_gap;
+    let top_margin = Style::SP_S;
+    let bottom_margin = Style::SP_S;
+    let preferred_top = anchor.top() - OVERFLOW_GAP - height;
+    let max_top = (screen.bottom() - bottom_margin - height).max(top_margin);
+    let top = preferred_top.clamp(top_margin, max_top);
+    let max_left = (screen.right() - Style::SP_S - width).max(screen.left() + Style::SP_S);
+    let left = anchor.left().clamp(screen.left() + Style::SP_S, max_left);
+    let outer = egui::Rect::from_min_size(egui::pos2(left, top), egui::vec2(width, height));
+    let rows = (0..item_count)
+        .map(|index| {
+            egui::Rect::from_min_size(
+                egui::pos2(
+                    outer.left() + Style::SP_S,
+                    outer.top() + Style::SP_S + index as f32 * (CONTROL_EDGE + row_gap),
+                ),
+                egui::vec2((width - 2.0 * Style::SP_S).max(CONTROL_EDGE), CONTROL_EDGE),
+            )
+        })
+        .collect();
+    OverflowLayout { outer, rows }
+}
+
+fn paint_overflow_popup(
+    ui: &mut egui::Ui,
+    mode: DockMode,
+    anchor: egui::Rect,
+    items: &[OverflowItem],
+    pinned_sources: &[crate::surfaces::DesktopRailSource],
+    action: &mut Option<Action>,
+) {
+    let layout = overflow_layout_for(anchor, ui.ctx().screen_rect(), items.len());
+    ui.set_min_width(layout.outer.width());
+    ui.set_min_height(layout.outer.height() - 2.0 * Style::SP_S);
+    let text = Style::resolve_color(ui.ctx(), Style::TEXT);
+    let hover = Style::resolve_color(ui.ctx(), Style::SURFACE_HI);
+
+    for (item, row) in items.iter().copied().zip(layout.rows) {
+        let (row, response) = ui.allocate_exact_size(row.size(), egui::Sense::click());
+        let control = overflow_item_control(item, row);
+        let label = control_label(control, pinned_sources);
+        if response.hovered() {
+            ui.painter()
+                .rect_filled(row, egui::CornerRadius::same(Style::RADIUS_S as u8), hover);
+        }
+        if let Some(texture) = icon_texture(
+            ui.ctx(),
+            control_icon(control),
+            row.height().min(24.0),
+            text,
+        ) {
+            let icon_rect = egui::Rect::from_center_size(
+                egui::pos2(row.left() + Style::SP_L, row.center().y),
+                egui::vec2(row.height().min(24.0), row.height().min(24.0)),
+            );
+            ui.painter().image(
+                texture.id(),
+                icon_rect,
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                text,
+            );
+        }
+        let galley = ui.painter().layout_job(Style::typography_job(
+            label.as_str(),
+            TypographyRole::Label,
+            text,
+            (row.width() - Style::SP_XL * 2.0).max(0.0),
+        ));
+        ui.painter().galley(
+            egui::pos2(
+                row.left() + Style::SP_XL,
+                row.center().y - galley.size().y / 2.0,
+            ),
+            galley,
+            text,
+        );
+        install_accessibility(
+            ui.ctx(),
+            mode,
+            control,
+            label.as_str(),
+            mode == DockMode::Docked,
+        );
+        let _response = response.clone().on_hover_ui(move |ui| {
+            nav_bar_tooltip(ui, label.as_str());
+        });
+        let keyboard_activate = response.has_focus()
+            && ui.input(|input| {
+                input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Space)
+            });
+        if response.clicked() || keyboard_activate {
+            *action = Some(control_action(control, pinned_sources));
+            ui.memory_mut(|memory| memory.close_popup());
+        }
     }
 }
 
@@ -1533,6 +1792,41 @@ mod tests {
             "short vertical rails must omit lower-priority app launchers instead of painting below the rail"
         );
         assert_hit_targets_inside_backing("docked narrow screen".to_string(), &geometry);
+    }
+
+    #[test]
+    fn overflow_preserves_catalog_order_after_visible_targets() {
+        let surfaces = [Surface::Browser, Surface::Files, Surface::Terminal];
+        let (visible_surfaces, visible_pins, overflow) = catalog_selection(&surfaces, 2, 2);
+        assert_eq!(visible_surfaces, 1);
+        assert_eq!(visible_pins, 0);
+        assert_eq!(surfaces[0], Surface::Browser);
+        let items = overflow.expect("overflow control").items;
+        assert_eq!(
+            items,
+            vec![
+                OverflowItem::Surface(Surface::Files),
+                OverflowItem::Surface(Surface::Terminal),
+                OverflowItem::PinnedDesktop(0),
+                OverflowItem::PinnedDesktop(1),
+            ]
+        );
+    }
+
+    #[test]
+    fn overflow_layout_keeps_rows_inside_the_screen_at_40px() {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 240.0));
+        let anchor = egui::Rect::from_min_size(egui::pos2(272.0, 192.0), egui::vec2(40.0, 40.0));
+        let layout = overflow_layout_for(anchor, screen, 3);
+        assert!(screen.contains(layout.outer.min));
+        assert!(screen.contains(layout.outer.max));
+        assert_eq!(layout.rows.len(), 3);
+        assert!(layout.rows.iter().all(|row| {
+            (row.width() - (OVERFLOW_W - 2.0 * Style::SP_S)).abs() < f32::EPSILON
+                && (row.height() - CONTROL_EDGE).abs() < f32::EPSILON
+                && layout.outer.contains(row.min)
+                && layout.outer.contains(row.max)
+        }));
     }
 
     #[test]

@@ -57,6 +57,99 @@ impl Section {
         }
     }
 
+    /// Operator vocabulary used by the hardware center search.
+    ///
+    /// Keep this list descriptive: these are navigation aliases, not claims
+    /// that a provider-backed control is available on this node.
+    const KEYWORDS: [&'static [&'static str]; 8] = [
+        &["node", "this node", "status", "identity", "overview"],
+        &[
+            "wi-fi",
+            "wifi",
+            "wireless",
+            "bluetooth",
+            "bt",
+            "hotspot",
+            "hot spot",
+            "tethering",
+            "network",
+            "networking",
+            "ethernet",
+            "cellular",
+            "vpn",
+            "dns",
+            "proxy",
+        ],
+        &[
+            "audio",
+            "sound",
+            "speaker",
+            "microphone",
+            "mic",
+            "display",
+            "monitor",
+            "screen",
+            "brightness",
+            "volume",
+        ],
+        &[
+            "keyboard",
+            "pointer",
+            "mouse",
+            "touch",
+            "touchscreen",
+            "touch screen",
+            "pen",
+            "stylus",
+            "trackpad",
+            "touchpad",
+        ],
+        &[
+            "battery",
+            "charging",
+            "charger",
+            "thermal",
+            "thermals",
+            "temperature",
+            "gpu",
+            "performance",
+            "sleep",
+            "power",
+        ],
+        &[
+            "device",
+            "devices",
+            "firmware",
+            "storage",
+            "disk",
+            "drive",
+            "dock",
+            "docking",
+            "usb",
+            "capabilities",
+        ],
+        &[
+            "theme",
+            "themes",
+            "wallpaper",
+            "background",
+            "appearance",
+            "layout",
+            "dark mode",
+            "light mode",
+        ],
+        &[
+            "nebula",
+            "mesh",
+            "service",
+            "services",
+            "update",
+            "updates",
+            "diagnostics",
+            "system",
+        ],
+    ];
+
     /// Search the label and description while treating punctuation and spacing
     /// as presentation details (`wifi` matches `Wi-Fi`).
     pub(crate) fn matches(self, query: &str) -> bool {
@@ -64,6 +157,9 @@ impl Section {
         normalized.is_empty()
             || search_key(self.label()).contains(&normalized)
             || search_key(self.description()).contains(&normalized)
+            || Self::KEYWORDS[self as usize]
+                .iter()
+                .any(|keyword| search_key(keyword).contains(&normalized))
     }
 
     pub(crate) const fn unavailable_reason(self) -> Option<&'static str> {
@@ -117,5 +213,37 @@ mod tests {
         assert_eq!(search("wifi"), vec![Section::Connectivity]);
         assert_eq!(search(""), Section::ALL.to_vec());
         assert!(Section::Connectivity.unavailable_reason().is_some());
+    }
+
+    #[test]
+    fn search_covers_hardware_center_operator_aliases() {
+        let aliases = [
+            ("bluetooth", Section::Connectivity),
+            ("hotspot", Section::Connectivity),
+            ("brightness", Section::DisplaySound),
+            ("audio", Section::DisplaySound),
+            ("touchscreen", Section::Input),
+            ("stylus", Section::Input),
+            ("thermal", Section::PowerPerformance),
+            ("gpu", Section::PowerPerformance),
+            ("firmware", Section::Hardware),
+            ("dock", Section::Hardware),
+            ("wallpaper", Section::Personalization),
+            ("theme", Section::Personalization),
+            ("nebula", Section::MeshSystem),
+            ("updates", Section::MeshSystem),
+        ];
+
+        for (query, section) in aliases {
+            assert_eq!(search(query), vec![section], "query: {query}");
+        }
+    }
+
+    #[test]
+    fn search_normalizes_alias_punctuation_and_spacing() {
+        assert_eq!(search("Wi-Fi"), vec![Section::Connectivity]);
+        assert_eq!(search("wi fi"), vec![Section::Connectivity]);
+        assert_eq!(search("Touch-Screen"), vec![Section::Input]);
+        assert_eq!(search("dark-mode"), vec![Section::Personalization]);
     }
 }
