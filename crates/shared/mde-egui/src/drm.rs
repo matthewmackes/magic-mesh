@@ -749,9 +749,13 @@ fn store_drm_clipboard_output(
         return false;
     };
     clipboard.write_text(&text);
-    // `drm_clipboard_output_text` already applied the provider-facing bound. Keep
-    // the paste cache on that same value rather than the raw egui command.
-    *cached_text = text;
+    // Do not promote the egui command directly into the paste cache. The trait's
+    // write callback is intentionally infallible, so an unsupported/no-op
+    // provider could otherwise make Ctrl+V appear to work without any native,
+    // mesh, or guest clipboard accepting the text. Ctrl+V refreshes from the
+    // provider before synthesizing Paste, making the provider the only source of
+    // truth for a successful write.
+    cached_text.clear();
     true
 }
 
@@ -2696,7 +2700,7 @@ mod tests {
     }
 
     #[test]
-    fn drm_clipboard_output_is_bounded_before_provider_and_cache() {
+    fn drm_clipboard_output_is_bounded_before_provider_and_not_cached_as_success() {
         let mut provider = MemoryTextClipboard::new();
         let mut cached = String::new();
         let mut output = egui::PlatformOutput::default();
@@ -2710,8 +2714,12 @@ mod tests {
             &mut cached,
             &output
         ));
-        assert_eq!(cached.len(), crate::clipboard::MAX_CLIPBOARD_TEXT_BYTES - 1);
-        assert_eq!(provider.read_text().as_deref(), Some(cached.as_str()));
+        assert!(cached.is_empty());
+        let provider_text = provider.read_text().expect("bounded provider text");
+        assert_eq!(
+            provider_text.len(),
+            crate::clipboard::MAX_CLIPBOARD_TEXT_BYTES - 1
+        );
     }
 
     #[test]
@@ -2771,6 +2779,47 @@ mod tests {
             &output
         ));
         assert!(cached.is_empty());
+    }
+
+    #[test]
+    fn drm_clipboard_unsupported_write_cannot_seed_a_fake_paste() {
+        #[derive(Default)]
+        struct UnsupportedClipboard;
+
+        impl TextClipboard for UnsupportedClipboard {
+            fn read_text(&mut self) -> Option<String> {
+                None
+            }
+
+            fn write_text(&mut self, _text: &str) {}
+        }
+
+        let mut provider = UnsupportedClipboard;
+        let mut cached = String::from("stale");
+        let mut output = egui::PlatformOutput::default();
+        output
+            .commands
+            .push(egui::OutputCommand::CopyText("unsupported".to_owned()));
+
+        assert!(store_drm_clipboard_output(
+            &mut provider,
+            &mut cached,
+            &output
+        ));
+        assert!(cached.is_empty());
+
+        refresh_drm_clipboard_text(&mut provider, &mut cached);
+        let mut events = Vec::new();
+        assert!(push_drm_clipboard_shortcut(
+            &mut events,
+            drm_modifiers(false, true, false),
+            egui::Key::V,
+            &cached,
+        ));
+        assert!(
+            events.is_empty(),
+            "unsupported write must not fabricate paste"
+        );
     }
 
     // ── QC-23 Tier 1: PRIME-import liveness ──
