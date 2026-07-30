@@ -1,7 +1,7 @@
 # PLATFORM-INTERFACES — Construct + Car, the two platform interfaces (Apple-HIG-principled)
 
 > **THE interface design authority.** Design locks from the 50-question operator
-> survey, 2026-07-22, amended by the 2026-07-26/29 authority cleanup. This
+> survey, 2026-07-22, amended by the 2026-07-26/30 authority cleanup. This
 > document defines the requirements for the platform's
 > only two interfaces — **Construct** (the workstation) and **Car** — under the
 > platform design standard, **Apple's Human Interface Guidelines applied as
@@ -10,17 +10,19 @@
 > No-Fixed-Center), §7 (Definition of Done). Supersedes `win10-taskbar.md`
 > (WIN10-HYBRID chrome), `auto-mode-sync3.md` (SYNC 3 Car look), and the
 > paradigm docs listed in §5 — all bannered + archived to `docs/design-archive/`.
-> Build epics: **WL-UX-006** (Construct) + **WL-UX-007** (Car) in
-> `docs/platform/WORKLIST.md`.
+> Active build epics: **WL-UX-009** (shared Construct language),
+> **WL-UX-012** (Construct taskbar/Home), and **WL-FUNC-017** (Maps/Car) in
+> `docs/platform/WORKLIST.md`; WL-UX-006/007 are archived predecessors.
 
-⚠️ **Design-lock reversal, intentional and operator-approved.**
-The Win10-structure chrome direction (win10-taskbar.md, itself a reversal of
-VDOCK) is retired by this document. Do **not** re-implement a bottom taskbar,
-tray flyouts, or a Start-style panel. The 2026-07-26 operator survey supersedes
-the earlier 2026-07-22 icon-grid-without-launcher-rail Home lock: Construct now
-has a persistent Springboard Dock and an icon-free Bing-wallpaper Home. NAVBAR-W10's
-"kill the top status bar" remains reversed: Construct has a slim top status
-bar. The Dock is governed launcher chrome, not a taskbar revival.
+⚠️ **Construct chrome authority update, intentional and operator-directed.**
+The 2026-07-29/30 operator taskbar review, recorded in WL-UX-012, supersedes
+the bottom-centered Dock prohibition for **Construct only**. Construct now has
+a full-width, 48px, Windows 11-inspired taskbar: icon-only Start/Search, Back,
+and Home controls at left; user-managed workspace pins centered on the physical
+screen; and placement at right. Start opens the existing Front Door search and
+is not a Start menu. The taskbar is not a tray flyout or a second launcher
+surface. Car chrome and focused-VDI full-pixel behavior remain unchanged. The
+icon-free Bing-wallpaper Home and the slim top status bar remain authoritative.
 
 ---
 
@@ -40,7 +42,8 @@ distillation below is the in-repo statement of the standard; per-requirement
 citations name the HIG section they derive from (survey Q43: both).
 
 **P1 — Hierarchy & deference.** Content first; chrome recedes. Persistent
-chrome earns its pixels: one slim status bar and the reserved Springboard Dock.
+chrome earns its pixels: one slim status bar and the reserved Construct
+taskbar (or the Left rail while taskbar placement is moved).
 Elevation and grouping express hierarchy, not decoration. *(HIG › Foundations ›
 Layout)*
 
@@ -112,22 +115,24 @@ Light is a production first-class appearance, both share azure accent
   *(Designing for iPadOS › The Home Screen)*
 - **Q8 — One desktop, taxonomy accents.** The single Home has no icon grid,
   pages, free arrangement, folders, or arrangement state. Surface taxonomy still
-  exists as the canonical launcher catalog: it colors Dock cells, Front Door
+  exists as the canonical launcher catalog: it colors taskbar cells, Front Door
   search grouping, switcher affordances, and compile-time "every Surface exactly
   once" guards.
 - **Q6/Q7/Q9 — No widgets, no live-data cards.** Home is wallpaper plus passive
   system identity; live data lives in the surfaces that own it (Maps, Workloads,
   Media, Mesh Teams) and in governed overlays such as Control Center.
-- **Q10 — Persistent Springboard Dock.** A bottom-centered, reserved-space Dock
-  is always visible in Construct except where a focused immersive surface has an
-  explicit full-pixel guarantee (for example focused VDI). Every launchable
-  surface remains reachable from the Dock with shrink-to-fit cells; pinned state
-  is the Dock authority.
-- Dock treatment (Q22): rounded-rect cells, taxonomy/accent treatment,
-  Mackes-Carbon V2 tri-color linework surface glyphs with no icon plate inside
-  the artwork, compact labels as density allows. *(App Icons — as principles:
-  one silhouette language, no photorealism)*
-- No page indicator dots or page swipe; Tab/arrow keys, Dock activation, and
+- **Q10 — Persistent Construct taskbar.** A full-width, 48px, reserved-space
+  taskbar is always visible in Construct except where a focused immersive surface
+  has an explicit full-pixel guarantee (for example focused VDI). Start opens
+  Front Door search; it never opens a Start menu. Every launchable surface remains
+  reachable through the searchable pin catalog and overflow; user pin order is
+  authoritative.
+- Taskbar treatment (Q22): square screen-edge geometry, 40px targets, icon-only
+  persistent controls, a single focused-workspace underline, shared Dark/Light
+  material, and the Windows-style clock/icon tray. The optional Left placement
+  keeps the same pin order and detailed top status strip. *(App Icons — as
+  principles: one silhouette language, no photorealism)*
+- No page indicator dots or page swipe; Tab/arrow keys, taskbar activation, and
   Front Door search open the complete launcher set directly.
 
 ### 2.3 Persistent chrome (Q11–Q12)
@@ -136,9 +141,10 @@ Light is a production first-class appearance, both share azure accent
   power, alert count right — fed by the existing `status.rs` StatusSegments
   rollups. Surfaces may declare full-screen auto-hide (VDI always does).
   *(Status Bars)* **This reverses NAVBAR-W10's top-bar kill, deliberately.**
-- **Q12b — Reserved Dock space.** Construct body layout reserves Dock pixels so
-  the Dock never overlays workspace controls. Immersive VDI can still request
-  the full native-resolution exception named in Q28.
+- **Q12b — Reserved taskbar/rail space.** Construct body layout reserves exactly
+  48px for the Bottom taskbar or the Left rail width so navigation never overlays
+  workspace controls. Immersive VDI can still request the full native-resolution
+  exception named in Q28.
 - **Q11 — The system gesture contract, with pointer parity:**
 
 | Intent | Touch | Pointer / keys |
@@ -262,17 +268,18 @@ bindings (`CarAction`) re-map accordingly; Music gains media-transport keys.
 
 ## 4. Acceptance (Q48)
 
-- **Construct (WL-UX-006/WL-UX-009):** screenshot/pixel proof on the `.15` DRM
-  seat — the untitled icon-free Bing-wallpaper Home, reserved Springboard Dock,
+- **Construct (WL-UX-009/WL-UX-012):** screenshot/pixel proof on the `.15` DRM
+  seat — the untitled icon-free Bing-wallpaper Home, reserved full-width taskbar,
   status bar, Control Center, Notification Center, Spotlight, app switcher with
   real snapshots, zoom and navigation-bar transitions, Quazar Dark and Light,
   and VDI full-resolution with auto-hidden bar. Operator visual signoff.
-- **Car (WL-UX-007):** live proof with the MG90 vehicle mirror online —
+- **Car (WL-FUNC-017):** live proof with the MG90 vehicle mirror online —
   dashboard cards live, instrument strip **fresh on every Car screen**,
   soft in-motion limits engage above threshold, one-tap toggle. Operator
   signoff.
 - Both: workspace build + tests + clippy/fmt green; post-cutover grep gate
-  (zero `taskbar` identifiers in production code); `lint-style-leaks`,
+  (zero retired Win10-taskbar compatibility identifiers and no duplicate Start
+  menu); `lint-style-leaks`,
   `lint-doc-supersession`, `lint-worklist` green.
 
 ## 5. Supersessions & the design-reference purge (Q37–Q41, Q44)
@@ -298,10 +305,9 @@ bindings (`CarAction`) re-map accordingly; Music gains media-transport keys.
 
 ## 6. Delivery (Q45–Q49)
 
-Full implementation fan-out (Q45): epics **WL-UX-006/007** (Q46), 28 units + 2
-operator gates — plan of record
-`/root/.claude/plans/the-workstation-interface-should-cozy-minsky.md`.
-Parallel tracks (Q49): docs + `mde-egui` foundation immediately; the atomic
-shell cutover (which **deletes** the Win10 chrome, Q47 — no legacy flag) waits
-for in-flight same-crate work to land. WL-UX-001 is superseded-retired;
-WL-UX-005 folds into WL-UX-006.
+Full implementation fan-out (Q45) now follows the active worklist epics
+**WL-UX-009/WL-UX-012/WL-FUNC-017**, with the archived WL-UX-006/007 plan used
+only as historical evidence. Parallel tracks keep the shared `mde-egui`
+foundation, taskbar/Home cutover, and Car/MG90 work independently verifiable;
+the current Construct taskbar has no legacy Win10 compatibility flag or second
+Start-menu path. WL-UX-001/005 are superseded-retired predecessors.

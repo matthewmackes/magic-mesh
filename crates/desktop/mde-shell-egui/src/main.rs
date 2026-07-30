@@ -3738,7 +3738,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // init milestone lands and the artwork's bar fills; the first dock
         // frame then replaces it. `Boot::frame` drives the whole sequence.
         let mut boot = Boot::default();
-        match mde_egui::run_drm("org.magicmesh.Shell", |ctx| boot.frame(ctx)) {
+        // WL-FUNC-016 — the direct DRM seat has no compositor clipboard. Keep
+        // one Bus-backed provider alive for the whole runner lifetime so every
+        // CopyText/Paste event reaches the canonical mesh lane. The windowed
+        // fallback retains eframe's platform adapter; only this direct-seat
+        // path must not regress to the process-local compatibility provider.
+        let mut clipboard =
+            communications::BusTextClipboard::for_shell(mde_bus::client_data_dir());
+        match mde_egui::run_drm_with_clipboard("org.magicmesh.Shell", &mut clipboard, |ctx| {
+            boot.frame(ctx)
+        }) {
             Ok(()) => return Ok(()),
             Err(mde_egui::drm::DrmError::NoDrmMaster(why)) => {
                 tracing::warn!(

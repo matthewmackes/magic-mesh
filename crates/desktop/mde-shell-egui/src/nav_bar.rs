@@ -18,7 +18,7 @@ use mde_egui::{Elevation, MotionMode, Style, TypographyRole};
 use mde_theme::brand::icons::IconId;
 use serde::{Deserialize, Serialize};
 
-use crate::status_bar::{BOTTOM_TRAY_W, STATUS_BAR_H};
+use crate::status_bar::{bottom_tray_rect, BOTTOM_TRAY_GAP, STATUS_BAR_H};
 use crate::surfaces::{
     dock_launcher_group_label, dock_launcher_surface_label, icon_texture, Surface,
     DOCK_LAUNCHER_GROUPS,
@@ -38,7 +38,6 @@ const CONTROL_EDGE: f32 = 40.0;
 const FLOATING_GAP: f32 = 4.0;
 /// Reserved right-side lane for the Windows-style clock and icon tray when the
 /// taskbar is in its bottom configuration.
-const BOTTOM_TRAY_GAP: f32 = 8.0;
 /// Width of the single-column taskbar overflow surface before screen clamping.
 const OVERFLOW_W: f32 = 256.0;
 /// Gap between the More anchor and its overflow surface.
@@ -1146,7 +1145,10 @@ fn control_span(count: usize, edge: f32, gap: f32) -> f32 {
 fn floating_center_bounds(screen: egui::Rect, gap: f32) -> (f32, f32) {
     let left_start = screen.left() + Style::SP_L;
     let left_cluster_end = left_start + control_span(3, CONTROL_EDGE, gap);
-    let right_start = screen.right() - Style::SP_L - CONTROL_EDGE - BOTTOM_TRAY_GAP - BOTTOM_TRAY_W;
+    let right_start = bottom_tray_rect(screen).left()
+        - BOTTOM_TRAY_GAP
+        - CONTROL_EDGE
+        - (Style::SP_L - Style::SP_S).max(0.0);
     (left_cluster_end + gap, right_start - gap)
 }
 
@@ -1212,7 +1214,7 @@ fn floating_geometry_for_catalog(
     );
     let y = outer.top() + (TASKBAR_H - edge) / 2.0;
     let left_start = outer.left() + Style::SP_L;
-    let right_x = outer.right() - Style::SP_L - BOTTOM_TRAY_W - BOTTOM_TRAY_GAP - edge;
+    let right_x = (bottom_tray_rect(screen).left() - BOTTOM_TRAY_GAP - edge).max(outer.left());
     let mut controls = Vec::with_capacity(dock_control_capacity_for(pinned_count, surface_count));
     let group_labels = Vec::new();
     let mut cursor_x = left_start;
@@ -3129,11 +3131,12 @@ mod tests {
             .expect("chooser pin should append a dock target");
         assert_eq!(pinned.kind, ControlKind::PinnedDesktop);
         assert_eq!(pinned.source_index, Some(0));
+        let tray = bottom_tray_rect(screen);
         assert!(
-            placement.rect.right()
-                <= screen.right() - Style::SP_L - BOTTOM_TRAY_W - BOTTOM_TRAY_GAP,
+            placement.rect.right() + BOTTOM_TRAY_GAP <= tray.left(),
             "placement control must remain left of the bottom system tray"
         );
+        assert!(!placement.rect.intersects(tray));
         assert_eq!(geometry.outer.width(), screen.width());
 
         let ctx = egui::Context::default();

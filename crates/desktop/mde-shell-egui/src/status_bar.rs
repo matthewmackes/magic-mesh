@@ -61,6 +61,8 @@ pub(crate) const STATUS_BAR_H: f32 = 24.0;
 /// The navigation bar keeps this lane free of app pins so the clock and
 /// controls remain visually stable while the center cluster changes.
 pub(crate) const BOTTOM_TRAY_W: f32 = 196.0;
+/// Clear space between the taskbar placement control and the tray.
+pub(crate) const BOTTOM_TRAY_GAP: f32 = 8.0;
 
 /// The daemon rollup segments the right cluster surfaces, left→right —
 /// Q12's "mesh grade, network, power, alert count" mapped onto what the
@@ -488,14 +490,7 @@ pub(crate) fn mount_bottom(
     if ctx.cumulative_pass_nr() == 0 || opacity <= 0.0 || !status_bar_visible(env) {
         return;
     }
-    let screen = ctx.screen_rect();
-    let tray = egui::Rect::from_min_max(
-        egui::pos2(
-            (screen.right() - BOTTOM_TRAY_W - Style::SP_S).max(screen.left()),
-            screen.bottom() - crate::nav_bar::TASKBAR_H,
-        ),
-        egui::pos2(screen.right() - Style::SP_S, screen.bottom()),
-    );
+    let tray = bottom_tray_rect(ctx.screen_rect());
     egui::Area::new(egui::Id::new("construct-bottom-system-tray"))
         .order(egui::Order::Foreground)
         .fixed_pos(tray.min)
@@ -508,6 +503,19 @@ pub(crate) fn mount_bottom(
             ui.set_opacity(opacity.clamp(0.0, 1.0));
             bottom_tray(ui, tray, construct, segments);
         });
+}
+
+/// Return the tray's screen-space footprint. Keeping this in the status-bar
+/// module gives the navigation geometry one source of truth for the reserved
+/// right-side lane and prevents hit-target overlap during animation.
+pub(crate) fn bottom_tray_rect(screen: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_max(
+        egui::pos2(
+            (screen.right() - BOTTOM_TRAY_W - Style::SP_S).max(screen.left()),
+            screen.bottom() - crate::nav_bar::TASKBAR_H,
+        ),
+        egui::pos2(screen.right() - Style::SP_S, screen.bottom()),
+    )
 }
 
 fn bottom_tray(
@@ -590,11 +598,11 @@ fn bottom_tray(
     let health_response = ui.interact(
         egui::Rect::from_center_size(health, egui::vec2(24.0, 32.0)),
         egui::Id::new(("construct-bottom-system-tray", "mesh-health")),
-        egui::Sense::hover(),
+        egui::Sense::click(),
     );
     health_response.widget_info(|| {
         egui::WidgetInfo::labeled(
-            egui::WidgetType::Label,
+            egui::WidgetType::Button,
             ui.is_enabled(),
             format!(
                 "Mesh health: {}",
@@ -602,6 +610,9 @@ fn bottom_tray(
             ),
         )
     });
+    if health_response.clicked() {
+        construct.control_center_open = true;
+    }
 
     let icon_right = clock.left() - Style::SP_XS;
     let icon_left = health.x + 10.0;
@@ -1047,6 +1058,28 @@ mod tests {
                 .is_some(),
             "the Windows-style clock must remain a reachable tray target"
         );
+        assert!(
+            ctx.read_response(egui::Id::new((
+                "construct-bottom-system-tray",
+                "mesh-health"
+            )))
+            .is_some(),
+            "mesh health must remain a keyboard/click reachable target"
+        );
+    }
+
+    #[test]
+    fn bottom_tray_footprint_stays_inside_the_taskbar_at_small_widths() {
+        for width in [96.0, 160.0, 320.0, 1280.0] {
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 240.0));
+            let tray = bottom_tray_rect(screen);
+            assert!(tray.left() >= screen.left());
+            assert!(tray.right() <= screen.right());
+            assert!(tray.top() >= screen.top());
+            assert!(tray.bottom() <= screen.bottom());
+            assert!(tray.width() <= screen.width());
+            assert!(tray.height() >= 0.0);
+        }
     }
 
     #[test]

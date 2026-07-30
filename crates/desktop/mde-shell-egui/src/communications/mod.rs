@@ -39,9 +39,10 @@ use serde::de::DeserializeOwned;
 use mde_collab_egui::{CollabData, CommandSink, CommunicationsSurface};
 use mde_collab_types::topics::{self, projection as proj};
 use mde_collab_types::{
-    clipboard_clip_id, ActivityFeed, ActorId, AlertInbox, CallState, ClipboardClipBody,
-    ClipboardLane, CollabCommand, ConversationTimeline, DocumentSessions, EventId, FileReferences,
-    SpaceDirectory, SpaceId, ThreadId, ThreadTimeline, TransferJobs, MAX_CLIPBOARD_TEXT_BYTES,
+    clipboard_clip_id, ActivityFeed, ActorId, AlertInbox, CallState, ChannelTasks,
+    ClipboardClipBody, ClipboardLane, CollabCommand, ConversationTimeline, DocumentSessions,
+    EventId, FileReferences, MessagePins, SavedMessages, SpaceDirectory, SpaceId, ThreadId,
+    ThreadTimeline, TransferJobs, MAX_CLIPBOARD_TEXT_BYTES,
 };
 
 use crate::bus_reader::BusReader;
@@ -345,6 +346,12 @@ pub(crate) struct LiveCollabData {
     /// Per-space conversation timelines (folded from
     /// `state/collab/conversation/<space>`).
     conversations: HashMap<SpaceId, ConversationTimeline>,
+    /// Per-space shared message-pin projections.
+    message_pins: HashMap<SpaceId, MessagePins>,
+    /// The local actor's private saved-message projection.
+    saved_messages: Option<SavedMessages>,
+    /// Per-space channel task projections.
+    channel_tasks: HashMap<SpaceId, ChannelTasks>,
     /// Retained thread timelines, keyed by their typed thread id. The worker's
     /// per-space thread topic carries one typed timeline, so the root index is
     /// built at the same time for the message-row reply affordance.
@@ -387,6 +394,9 @@ impl LiveCollabData {
             directory: SpaceDirectory::default(),
             activity: HashMap::new(),
             conversations: HashMap::new(),
+            message_pins: HashMap::new(),
+            saved_messages: None,
+            channel_tasks: HashMap::new(),
             threads: HashMap::new(),
             thread_roots: HashMap::new(),
             call_state: CallState::default(),
@@ -431,6 +441,9 @@ impl LiveCollabData {
             self.directory = SpaceDirectory::default();
             self.activity.clear();
             self.conversations.clear();
+            self.message_pins.clear();
+            self.saved_messages = None;
+            self.channel_tasks.clear();
             self.threads.clear();
             self.thread_roots.clear();
             self.call_state = CallState::default();
@@ -457,6 +470,10 @@ impl LiveCollabData {
 
         let mut activity = HashMap::new();
         let mut conversations = HashMap::new();
+        let mut message_pins = HashMap::new();
+        let saved_messages =
+            read_state::<SavedMessages>(&persist, &topics::state_topic(proj::SAVED_MESSAGES));
+        let mut channel_tasks = HashMap::new();
         let mut threads = HashMap::new();
         let mut thread_roots = HashMap::new();
         let mut call_state = CallState::default();
@@ -477,6 +494,18 @@ impl LiveCollabData {
                     &topics::space_state_topic(proj::CONVERSATION, space),
                 ) {
                     conversations.insert(space, convo);
+                }
+                if let Some(pins) = read_state::<MessagePins>(
+                    &persist,
+                    &topics::space_state_topic(proj::MESSAGE_PINS, space),
+                ) {
+                    message_pins.insert(space, pins);
+                }
+                if let Some(tasks) = read_state::<ChannelTasks>(
+                    &persist,
+                    &topics::space_state_topic(proj::CHANNEL_TASKS, space),
+                ) {
+                    channel_tasks.insert(space, tasks);
                 }
                 if let Some(thread) = read_state::<ThreadTimeline>(
                     &persist,
@@ -537,6 +566,9 @@ impl LiveCollabData {
             read_state::<AlertInbox>(&persist, &topics::state_topic(proj::ALERT_INBOX));
         self.activity = activity;
         self.conversations = conversations;
+        self.message_pins = message_pins;
+        self.saved_messages = saved_messages;
+        self.channel_tasks = channel_tasks;
         self.threads = threads;
         self.thread_roots = thread_roots;
         self.call_state = call_state;
@@ -617,6 +649,24 @@ impl CollabData for LiveCollabData {
         self.conversations.get(&space)
     }
 
+    fn message_pinned(&self, space: SpaceId, message: EventId) -> bool {
+        self.message_pins
+            .get(&space)
+            .is_some_and(|pins| pins.messages.contains(&message))
+    }
+
+    fn message_saved(&self, space: SpaceId, message: EventId) -> bool {
+        self.saved_messages
+            .as_ref()
+            .filter(|saved| saved.actor == self.me)
+            .is_some_and(|saved| {
+                saved
+                    .messages
+                    .iter()
+                    .any(|row| row.space == space && row.message == message)
+            })
+    }
+
     fn thread(&self, space: SpaceId, thread: ThreadId) -> Option<&ThreadTimeline> {
         self.threads
             .get(&thread)
@@ -625,6 +675,10 @@ impl CollabData for LiveCollabData {
 
     fn thread_for_root(&self, space: SpaceId, root: EventId) -> Option<ThreadId> {
         self.thread_roots.get(&(space, root)).copied()
+    }
+
+    fn channel_tasks(&self, space: SpaceId) -> Option<&ChannelTasks> {
+        self.channel_tasks.get(&space)
     }
 
     fn call_state(&self) -> &CallState {
@@ -888,7 +942,8 @@ mod tests {
     use mde_collab_types::value::{sha256_hex, CallKind, ClipItemKind, DeliveryState, MessageBody};
     use mde_collab_types::{
         ActivityEntry, ActorClock, CallParticipantState, CallParticipantView, CallView,
-        ClipboardView, EventId, MessageView, SpaceKind, SpaceRole, SpaceSummary,
+        ChannelTasks, ClipboardView, EventId, MessagePins, MessageView, SavedMessageView,
+        SavedMessages, SpaceKind, SpaceRole, SpaceSummary, TaskView,
     };
 
     fn persist_at(root: &Path) -> Persist {
@@ -959,16 +1014,53 @@ mod tests {
                 spaces: vec![space_summary(ops, "Team Ops")],
             },
         );
+        let first_message = message(&peer, "deploy is green");
         write_state(
             &persist,
             &topics::space_state_topic(proj::CONVERSATION, ops),
             &ConversationTimeline {
                 space: ops,
                 thread: None,
-                messages: vec![
-                    message(&peer, "deploy is green"),
-                    message(&me, "shipped the rail"),
-                ],
+                messages: vec![first_message.clone(), message(&me, "shipped the rail")],
+            },
+        );
+        write_state(
+            &persist,
+            &topics::space_state_topic(proj::MESSAGE_PINS, ops),
+            &MessagePins {
+                space: ops,
+                messages: vec![first_message.event_id],
+            },
+        );
+        write_state(
+            &persist,
+            &topics::state_topic(proj::SAVED_MESSAGES),
+            &SavedMessages {
+                actor: me.clone(),
+                messages: vec![SavedMessageView {
+                    space: ops,
+                    message: first_message.event_id,
+                    saved_unix_ms: 1_001,
+                }],
+            },
+        );
+        write_state(
+            &persist,
+            &topics::space_state_topic(proj::CHANNEL_TASKS, ops),
+            &ChannelTasks {
+                space: ops,
+                tasks: vec![TaskView {
+                    task: EventId::new(),
+                    space: ops,
+                    title: "Review deployment".to_owned(),
+                    created_by: me.clone(),
+                    created_unix_ms: 1_002,
+                    source: Some(first_message.event_id),
+                    checked: false,
+                    completed: false,
+                    completed_by: None,
+                    completed_unix_ms: None,
+                }],
             },
         );
         write_state(
@@ -1062,6 +1154,12 @@ mod tests {
         assert_eq!(convo.messages.len(), 2);
         assert_eq!(convo.messages[0].body, "deploy is green");
         assert_eq!(convo.messages[1].author, me);
+        assert!(data.message_pinned(ops, first_message.event_id));
+        assert!(data.message_saved(ops, first_message.event_id));
+        assert_eq!(
+            data.channel_tasks(ops).expect("tasks folded").tasks.len(),
+            1
+        );
 
         // Activity folded, keyed Some(space) as the surface reads it.
         let feed = data.activity(Some(ops)).expect("activity folded");

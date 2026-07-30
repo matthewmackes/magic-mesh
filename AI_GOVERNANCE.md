@@ -116,11 +116,14 @@ workload-provider APIs are never exposed as a second public control plane.
   simple linework with at most three adapted product/service colors and no icon
   plates; toolbar/action/status icons remain monochrome and are color-coded by
   semantic state. The
-  2026-07-26 operator lock intentionally keeps a Construct **Dock** and an
-  icon-free Bing-wallpaper Home. All other interface-paradigm design docs are
-  retired to `docs/design-archive/`. Do not re-introduce a bottom taskbar, tray
-  flyouts, or Start-style panel; the Dock is the governed launcher chrome, not a
-  taskbar.
+  2026-07-30 operator taskbar lock intentionally keeps a Construct **full-width
+  taskbar** and an icon-free Bing-wallpaper Home. The taskbar is 48px high with
+  icon-only Start/Search, Back, Home, user-managed centered pins, and a right
+  placement control; Start opens Front Door search and is not a Start menu. Its
+  Bottom/Left placement and clock/icon tray are governed by WL-UX-012. Car and
+  focused-VDI chrome remain separate. All other interface-paradigm design docs
+  are retired to `docs/design-archive/`; do not add tray flyouts or a second
+  launcher surface.
 - **The design system is egui-native.** Strict IBM Carbon is **retired**. The
   single source of look is the shared **`Style`/`Visuals` module** in `mde-egui`
   — a Rust module, not a token crate. Surfaces never hand-roll styling; they use
