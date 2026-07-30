@@ -311,6 +311,18 @@ impl VdiProtocol {
             Self::Spice => "Spice",
         }
     }
+
+    /// Operator-facing text for the text-clipboard lane behind this protocol.
+    /// Keep this beside the routing label so the chooser/connecting surface
+    /// cannot imply that every decoder has the same guest integration. RFB
+    /// cut-text is wired; RDP CLIPRDR and SPICE vdagent remain explicit gaps.
+    pub(crate) const fn clipboard_summary(self) -> &'static str {
+        match self {
+            Self::Rdp => "clipboard unavailable: RDP CLIPRDR is not implemented",
+            Self::Vnc => "clipboard: bidirectional RFB cut text",
+            Self::Spice => "clipboard unavailable: SPICE vdagent is not implemented",
+        }
+    }
 }
 
 /// Fullscreen under the thin chrome bar (the E12 VDI idiom) or a windowed desktop
@@ -1990,11 +2002,12 @@ pub(crate) fn vdi_panel(ui: &mut egui::Ui, state: &mut VdiState) {
                         }
                     };
                     let detail = format!(
-                        "Brokering the {} desktop from {} ({} \u{00B7} {} \u{00B7} {auth}) — {live_status}.",
+                        "Brokering the {} desktop from {} ({} \u{00B7} {} \u{00B7} {auth}) — {live_status}; {}.",
                         req.protocol.client_crate(),
                         endpoint,
                         req.display.label(),
                         req.monitors.label(),
+                        req.protocol.clipboard_summary(),
                     );
                     crate::backdrop::show(
                         ui,
@@ -2007,7 +2020,7 @@ pub(crate) fn vdi_panel(ui: &mut egui::Ui, state: &mut VdiState) {
                     crate::backdrop::Coverage::Empty,
                     Some((
                         "No desktop connected",
-                        "Broker a VM desktop (RDP / VNC) — it renders here in the shell.",
+                        "Broker a VM desktop (RDP / VNC / Spice) — it renders here in the shell. Clipboard capability is reported per protocol.",
                     )),
                 ),
             }

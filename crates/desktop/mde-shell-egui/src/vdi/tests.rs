@@ -115,6 +115,23 @@ fn the_vdi_protocol_routes_map_to_the_right_client_crate() {
 }
 
 #[test]
+fn vdi_protocol_clipboard_summary_is_truthful_per_backend() {
+    assert!(
+        VdiProtocol::Rdp.clipboard_summary().contains("CLIPRDR")
+            && VdiProtocol::Rdp.clipboard_summary().contains("unavailable")
+    );
+    assert!(
+        VdiProtocol::Spice.clipboard_summary().contains("vdagent")
+            && VdiProtocol::Spice
+                .clipboard_summary()
+                .contains("unavailable")
+    );
+    assert!(VdiProtocol::Vnc
+        .clipboard_summary()
+        .contains("bidirectional RFB cut text"));
+}
+
+#[test]
 fn a_connect_request_carries_the_three_display_choices() {
     // The request-construction fold: the picked target + the three choices
     // land on the request verbatim.

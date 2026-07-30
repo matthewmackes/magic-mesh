@@ -369,7 +369,9 @@ remains here under a completed status.
   projected UI slices now also have focused farm coverage. Severity-aware
   Activity coalescing, truthful repeat counts, visible pause/resume, keyboard
   posting, and AccessKit send labels now have focused farm coverage. Completed evidence is in the pre-rework archive;
-  the parity source is `docs/platform/WL-FUNC-011-parity-ledger.md`.
+  the parity source is `docs/platform/WL-FUNC-011-parity-ledger.md`. Calls now
+  explain peer-gated actions and per-device media-provider absence through
+  accessible disabled labels; 19 focused Calls tests pass at `76dd2457`.
 - Remaining work:
 
   1. Reconcile the parity ledger against current runtime/tests and leave only
@@ -504,7 +506,11 @@ remains here under a completed status.
   has typed authorization, UTF-8/1 MiB bounds, peer-scoped deduplication, and
   honest metadata with 22 focused farm tests. Mesh Teams now shows Local/Remote/
   Source unavailable provenance with action hints and 5 clipboard tests; real
-  mesh materialization and RDP/SPICE text channels remain unsupported.
+  mesh materialization and RDP/SPICE text channels remain unsupported. The
+  shell VDI connecting state now names the selected protocol's clipboard
+  capability (VNC RFB is bidirectional; RDP CLIPRDR and SPICE vdagent are
+  explicitly unavailable), with focused VDI coverage in the pending integrated
+  change.
 - Remaining work:
 
   1. Map direct-seat shortcuts into `egui::Event::{Copy,Cut,Paste}`, consume
@@ -595,8 +601,10 @@ remains here under a completed status.
   stale/unavailable accessibility labels. The bounded MG90/manager roster has
   independent poll/heartbeat plans, latest-wins/no-source behavior, deterministic
   all-source selection, and 44 vehicle tests pass. Maps HUD and Airspace expose
-  honest unavailable/stale states with 17 focused tests; live adapters and
-  route/render cutover remain.
+  honest unavailable/stale states with 17 focused tests. Route preview Start now
+  distinguishes missing route, blocked offline readiness, and missing GPS with
+  truthful labels/tooltips while preserving the guard; 7 focused route-preview
+  tests pass at `05ba6870`. Live adapters and route/render cutover remain.
 - Remaining work:
   1. Consume WL-UX-009's platform-wide Carbon-requirement retirement and update
      the Maps/Car-specific authority while retaining egui, shared `Style`,
