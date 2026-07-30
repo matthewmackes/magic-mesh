@@ -19,10 +19,7 @@ use mde_theme::brand::icons::IconId;
 use serde::{Deserialize, Serialize};
 
 use crate::status_bar::{bottom_tray_rect, BOTTOM_TRAY_GAP, STATUS_BAR_H};
-use crate::surfaces::{
-    dock_launcher_group_label, dock_launcher_surface_label, icon_texture, Surface,
-    DOCK_LAUNCHER_GROUPS,
-};
+use crate::surfaces::{icon_texture, Surface};
 
 /// The reserved left-rail width in docked mode.
 pub(crate) const DOCKED_W: f32 = 56.0;
@@ -128,10 +125,10 @@ impl DockMode {
 }
 
 fn default_taskbar_pins() -> Vec<Surface> {
-    DOCK_LAUNCHER_GROUPS
-        .iter()
-        .flat_map(|group| group.surfaces.iter().copied())
-        .collect()
+    // This fallback is used only by deterministic headless/default state. A
+    // new runtime profile starts empty and goes through the selector; a
+    // migrated profile keeps its decoded ordered pins.
+    PIN_CATALOG[..10].to_vec()
 }
 
 fn surface_key(surface: Surface) -> &'static str {
@@ -586,9 +583,6 @@ impl State {
                 ui.set_min_size(geometry.outer.size());
                 let painter = ui.painter().clone();
                 paint_backing(&painter, &geometry);
-                for group in &geometry.group_labels {
-                    paint_group_label(ctx, &painter, *group);
-                }
                 for control in &geometry.controls {
                     // The Area's content UI is created with its absolute screen
                     // rect as max_rect, so these interaction rectangles stay in
@@ -1101,18 +1095,10 @@ struct OverflowLayout {
     rows: Vec<egui::Rect>,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct GroupLabel {
-    label: &'static str,
-    rect: egui::Rect,
-    accent: egui::Color32,
-}
-
 #[derive(Debug, Clone)]
 struct Geometry {
     outer: egui::Rect,
     radius: egui::CornerRadius,
-    group_labels: Vec<GroupLabel>,
     controls: Vec<Control>,
     overflow: Option<OverflowGeometry>,
     finished: bool,
@@ -1216,7 +1202,6 @@ fn floating_geometry_for_catalog(
     let left_start = outer.left() + Style::SP_L;
     let right_x = (bottom_tray_rect(screen).left() - BOTTOM_TRAY_GAP - edge).max(outer.left());
     let mut controls = Vec::with_capacity(dock_control_capacity_for(pinned_count, surface_count));
-    let group_labels = Vec::new();
     let mut cursor_x = left_start;
     for kind in [ControlKind::Start, ControlKind::Back, ControlKind::Home] {
         controls.push(Control {
@@ -1267,7 +1252,6 @@ fn floating_geometry_for_catalog(
     Geometry {
         outer,
         radius: egui::CornerRadius::ZERO,
-        group_labels,
         controls,
         overflow,
         finished: true,
@@ -1307,7 +1291,6 @@ fn docked_geometry_for_catalog(
         egui::vec2(DOCKED_W, (screen.height() - STATUS_BAR_H).max(0.0)),
     );
     let mut controls = Vec::with_capacity(dock_control_capacity_for(pinned_count, surfaces.len()));
-    let group_labels = Vec::new();
     let mut cursor_y = screen.top() + STATUS_BAR_H + Style::SP_S;
     for kind in [ControlKind::Start, ControlKind::Back, ControlKind::Home] {
         controls.push(Control {
@@ -1392,7 +1375,6 @@ fn docked_geometry_for_catalog(
             sw: 0,
             se: Style::RADIUS_L as u8,
         },
-        group_labels,
         controls,
         overflow,
         finished: true,
@@ -1412,20 +1394,9 @@ fn interpolate_geometry(from: &Geometry, to: &Geometry, t: f32, finished: bool) 
             source_index: from.source_index,
         })
         .collect();
-    let group_labels = from
-        .group_labels
-        .iter()
-        .zip(&to.group_labels)
-        .map(|(from, to)| GroupLabel {
-            label: from.label,
-            rect: lerp_rect(from.rect, to.rect, t),
-            accent: from.accent,
-        })
-        .collect();
     Geometry {
         outer,
         radius: lerp_radius(from.radius, to.radius, t),
-        group_labels,
         controls,
         overflow: if t < 0.5 {
             from.overflow.clone()
@@ -1449,16 +1420,6 @@ fn translate_geometry(geometry: &Geometry, delta: egui::Vec2) -> Geometry {
                 rect: control.rect.translate(delta),
                 surface: control.surface,
                 source_index: control.source_index,
-            })
-            .collect(),
-        group_labels: geometry
-            .group_labels
-            .iter()
-            .copied()
-            .map(|group| GroupLabel {
-                label: group.label,
-                rect: group.rect.translate(delta),
-                accent: group.accent,
             })
             .collect(),
         overflow: geometry.overflow.clone(),
@@ -1485,24 +1446,6 @@ pub(crate) fn floating_pin_center(screen: egui::Rect) -> egui::Pos2 {
         .expect("floating taskbar placement control")
         .rect
         .center()
-}
-
-fn paint_group_label(ctx: &egui::Context, painter: &egui::Painter, group: GroupLabel) {
-    let color = Style::resolve_color(ctx, group.accent);
-    let label = painter.layout_job(Style::typography_job(
-        group.label,
-        TypographyRole::Caption,
-        color,
-        f32::INFINITY,
-    ));
-    painter.galley(
-        egui::pos2(
-            group.rect.center().x - label.size().x / 2.0,
-            group.rect.center().y - label.size().y / 2.0,
-        ),
-        label,
-        color,
-    );
 }
 
 fn nav_bar_tooltip(ui: &mut egui::Ui, text: &str) {
@@ -1781,13 +1724,7 @@ fn control_label(
         return format!("Open pinned desktop {} on {}", source.label, source.node);
     }
     if let Some(surface) = control.surface {
-        let group = dock_launcher_group_label(surface);
-        let label = dock_launcher_surface_label(surface);
-        return if group.is_empty() {
-            format!("Open {label}")
-        } else {
-            format!("Open {label} from {group}")
-        };
+        return format!("Open {}", taskbar_surface_label(surface));
     }
     if control.kind == ControlKind::Pin {
         "Taskbar placement".to_owned()
@@ -2049,8 +1986,8 @@ mod tests {
             surface: Some(Surface::Files),
             source_index: None,
         };
-        assert_eq!(control_label(desktop, &[]), "Open VMs from Infra");
-        assert_eq!(control_label(files, &[]), "Open File Manager from Ops");
+        assert_eq!(control_label(desktop, &[]), "Open Remote Sessions");
+        assert_eq!(control_label(files, &[]), "Open Files");
     }
 
     #[test]
@@ -2066,8 +2003,6 @@ mod tests {
         assert_eq!(docked.outer.top(), screen.top() + STATUS_BAR_H);
         assert_eq!(docked.controls[0].rect.top(), STATUS_BAR_H + Style::SP_S);
         assert_eq!(docked.controls.len(), dock_control_capacity(0));
-        assert!(floating.group_labels.is_empty());
-        assert!(docked.group_labels.is_empty());
     }
 
     #[test]
@@ -2380,7 +2315,7 @@ mod tests {
 
     #[test]
     fn taskbar_pin_actions_are_bounded_ordered_and_reject_non_catalog_surfaces() {
-        let mut state = State::default();
+        let mut state = State::new_profile(DockMode::Floating);
         let original = state.pinned_surfaces().to_vec();
         assert!(state.pin_surface(Surface::FleetMesh));
         assert_eq!(state.pinned_surfaces().last(), Some(&Surface::FleetMesh));
@@ -3311,6 +3246,8 @@ mod tests {
                 .filter_map(|control| control.surface)
                 .collect::<Vec<_>>(),
             vec![
+                Surface::FleetMesh,
+                Surface::InfraCode,
                 Surface::Desktop,
                 Surface::Terminal,
                 Surface::MapsLocation,
@@ -3320,9 +3257,8 @@ mod tests {
                 Surface::Media,
                 Surface::Browser,
             ],
-            "the grouped dock must use the operator survey order"
+            "the taskbar must use the searchable pin catalog order"
         );
-        assert!(floating.group_labels.is_empty());
         assert!(
             floating
                 .controls
