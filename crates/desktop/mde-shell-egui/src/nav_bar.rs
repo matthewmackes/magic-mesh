@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use mde_egui::egui;
-use mde_egui::{Elevation, MotionMode, Style, TypographyRole};
+use mde_egui::{Elevation, Motion, MotionMode, MotionPreset, Style, TypographyRole};
 use mde_theme::brand::icons::IconId;
 use serde::{Deserialize, Serialize};
 
@@ -44,8 +44,9 @@ const OVERFLOW_GAP: f32 = 4.0;
 const MAX_PINNED_SOURCES: usize = 8;
 /// The transition first slides left, then melts into the vertical rail.
 const SLIDE_FRACTION: f32 = 0.34;
-/// Total transition length: short enough to feel direct, long enough to read.
-const TRANSITION: Duration = Duration::from_millis(360);
+/// Total normal-mode transition length: short enough to feel direct, long enough
+/// to read. The authoritative semantic timing lives in `MotionPreset::Whimsy`.
+const TRANSITION: Duration = Duration::from_millis(280);
 /// Persisted per-seat preference.
 const CONFIG_FILE: &str = "settings-nav-bar.json";
 /// Keep hostile or stale dock preferences bounded before serde materializes them.
@@ -284,6 +285,7 @@ struct TransitionState {
     from: DockMode,
     to: DockMode,
     started: Instant,
+    motion: MotionMode,
 }
 
 /// Shell-owned state for the bar's persisted placement and transient motion.
@@ -424,12 +426,8 @@ impl State {
                 DockMode::Docked => (0.0, 1.0),
             };
         };
-        let raw = (now
-            .saturating_duration_since(transition.started)
-            .as_secs_f32()
-            / TRANSITION.as_secs_f32())
-        .clamp(0.0, 1.0);
-        let t = smoothstep(raw);
+        let elapsed = now.saturating_duration_since(transition.started);
+        let t = transition_progress(elapsed, transition.motion);
         match (transition.from, transition.to) {
             (DockMode::Floating, DockMode::Docked) => (1.0 - t, t),
             (DockMode::Docked, DockMode::Floating) => (t, 1.0 - t),
@@ -517,14 +515,12 @@ impl State {
             DockMode::Docked => DockMode::Floating,
         };
         self.mode = to;
-        self.transition =
-            (motion != MotionMode::Disabled && motion != MotionMode::Reduced).then(|| {
-                TransitionState {
-                    from,
-                    to,
-                    started: now,
-                }
-            });
+        self.transition = (motion != MotionMode::Disabled).then(|| TransitionState {
+            from,
+            to,
+            started: now,
+            motion,
+        });
     }
 
     /// Paint the dock and return the first clicked action, if any.
@@ -893,7 +889,8 @@ impl State {
             };
         };
         let elapsed = now.saturating_duration_since(transition.started);
-        let raw = (elapsed.as_secs_f32() / TRANSITION.as_secs_f32()).clamp(0.0, 1.0);
+        let raw = (elapsed.as_secs_f32() / transition_duration(transition.motion).as_secs_f32())
+            .clamp(0.0, 1.0);
         if raw >= 1.0 {
             return match transition.to {
                 DockMode::Floating => floating,
@@ -903,18 +900,42 @@ impl State {
         if transition.from == DockMode::Floating && transition.to == DockMode::Docked {
             let staging = floating_left_edge_staging(screen, &floating);
             if raw < SLIDE_FRACTION {
-                let t = smoothstep(raw / SLIDE_FRACTION);
+                let t = transition_progress(
+                    Duration::from_secs_f32(
+                        (raw / SLIDE_FRACTION)
+                            * transition_duration(transition.motion).as_secs_f32(),
+                    ),
+                    transition.motion,
+                );
                 return interpolate_geometry(&floating, &staging, t, false);
             }
-            let t = smoothstep((raw - SLIDE_FRACTION) / (1.0 - SLIDE_FRACTION));
+            let t = transition_progress(
+                Duration::from_secs_f32(
+                    ((raw - SLIDE_FRACTION) / (1.0 - SLIDE_FRACTION))
+                        * transition_duration(transition.motion).as_secs_f32(),
+                ),
+                transition.motion,
+            );
             return interpolate_geometry(&staging, &docked, t, false);
         }
         let staging = floating_left_edge_staging(screen, &floating);
         if raw < 1.0 - SLIDE_FRACTION {
-            let t = smoothstep(raw / (1.0 - SLIDE_FRACTION));
+            let t = transition_progress(
+                Duration::from_secs_f32(
+                    (raw / (1.0 - SLIDE_FRACTION))
+                        * transition_duration(transition.motion).as_secs_f32(),
+                ),
+                transition.motion,
+            );
             interpolate_geometry(&docked, &staging, t, false)
         } else {
-            let t = smoothstep((raw - (1.0 - SLIDE_FRACTION)) / SLIDE_FRACTION);
+            let t = transition_progress(
+                Duration::from_secs_f32(
+                    ((raw - (1.0 - SLIDE_FRACTION)) / SLIDE_FRACTION)
+                        * transition_duration(transition.motion).as_secs_f32(),
+                ),
+                transition.motion,
+            );
             interpolate_geometry(&staging, &floating, t, false)
         }
     }
@@ -1826,6 +1847,14 @@ fn lerp_radius(from: egui::CornerRadius, to: egui::CornerRadius, t: f32) -> egui
     }
 }
 
+fn transition_duration(mode: MotionMode) -> Duration {
+    Duration::from_secs_f32(Motion::spec(MotionPreset::Whimsy).duration_for(mode))
+}
+
+fn transition_progress(elapsed: Duration, mode: MotionMode) -> f32 {
+    Motion::spec(MotionPreset::Whimsy).progress_at(elapsed.as_secs_f32(), mode)
+}
+
 fn smoothstep(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
@@ -1954,6 +1983,17 @@ mod tests {
     }
 
     #[test]
+    fn reduced_motion_keeps_a_brief_taskbar_transition() {
+        let mut state = State::default();
+        let now = Instant::now();
+        state.toggle_mode(now, MotionMode::Reduced);
+        assert!(state.is_docked());
+        assert_eq!(state.chrome_alphas(now), (1.0, 0.0));
+        let settled = now + Duration::from_millis(50);
+        assert_eq!(state.chrome_alphas(settled), (0.0, 1.0));
+    }
+
+    #[test]
     fn chrome_alphas_crossfade_the_top_strip_and_bottom_tray() {
         let started = Instant::now();
         let state = State {
@@ -1962,6 +2002,7 @@ mod tests {
                 from: DockMode::Floating,
                 to: DockMode::Docked,
                 started,
+                motion: MotionMode::Normal,
             }),
             ..State::default()
         };
@@ -2235,6 +2276,7 @@ mod tests {
                             from,
                             to,
                             started: start,
+                            motion: MotionMode::Normal,
                         }),
                         pinned_surfaces: default_taskbar_pins(),
                         profile_state: ProfileState::Configured,
@@ -3136,6 +3178,7 @@ mod tests {
                 from: DockMode::Floating,
                 to: DockMode::Docked,
                 started: transition_started,
+                motion: MotionMode::Normal,
             }),
             pinned_surfaces: default_taskbar_pins(),
             profile_state: ProfileState::Configured,
