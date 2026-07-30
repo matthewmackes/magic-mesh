@@ -593,10 +593,10 @@ remains here under a completed status.
   11 mesh-type and 69 worker tests passing. Maps/Car now projects bounded radio
   presence, operation, GNSS/radio freshness, retained age, provenance, and
   typed Current/Stale/Resyncing/Unavailable mirror state; 13 consumer tests pass. The bounded MG90/manager roster has independent poll/heartbeat plans,
-  latest-wins/no-source behavior, and 42 vehicle tests passing. Maps HUD now
-  removes road-name speed/lane heuristics and paints explicit unavailable states;
-  focused render and route-readiness proof passes; Start is disabled when
-  routing is unavailable. Live adapters and route/render cutover remain.
+  latest-wins/no-source behavior, deterministic all-source selection, and 44
+  vehicle tests pass. Maps HUD removes road-name speed/lane heuristics and
+  paints explicit unavailable states; Start is disabled when routing is
+  unavailable. Live adapters and route/render cutover remain.
 - Remaining work:
   1. Consume WL-UX-009's platform-wide Carbon-requirement retirement and update
      the Maps/Car-specific authority while retaining egui, shared `Style`,
