@@ -18,7 +18,7 @@ use mde_egui::{Elevation, MotionMode, Style, TypographyRole};
 use mde_theme::brand::icons::IconId;
 use serde::{Deserialize, Serialize};
 
-use crate::status_bar::STATUS_BAR_H;
+use crate::status_bar::{BOTTOM_TRAY_W, STATUS_BAR_H};
 use crate::surfaces::{
     dock_launcher_group_label, dock_launcher_surface_label, icon_texture, Surface,
     DOCK_LAUNCHER_GROUPS,
@@ -36,6 +36,9 @@ const CONTROL_EDGE: f32 = 40.0;
 /// chooser pins and launchers into the More flyout when a panel cannot fit the
 /// whole catalog.
 const FLOATING_GAP: f32 = 4.0;
+/// Reserved right-side lane for the Windows-style clock and icon tray when the
+/// taskbar is in its bottom configuration.
+const BOTTOM_TRAY_GAP: f32 = 8.0;
 /// Width of the single-column taskbar overflow surface before screen clamping.
 const OVERFLOW_W: f32 = 256.0;
 /// Gap between the More anchor and its overflow surface.
@@ -51,9 +54,31 @@ const TRANSITION: Duration = Duration::from_millis(360);
 const CONFIG_FILE: &str = "settings-nav-bar.json";
 /// Keep hostile or stale dock preferences bounded before serde materializes them.
 const MAX_NAV_PREFS_BYTES: usize = 64 * 1024;
-const NAV_PREFS_SCHEMA_VERSION: u16 = 1;
+const NAV_PREFS_SCHEMA_VERSION: u16 = 2;
 const MAX_PINNED_SURFACES: usize = Surface::ALL.len();
+const MAX_PIN_SELECTOR_QUERY_CHARS: usize = 128;
+const FIRST_BOOT_SELECTOR_W: f32 = 560.0;
+const FIRST_BOOT_SELECTOR_H: f32 = 720.0;
 static NAV_LAYER_ID_MAP_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Ordered first-boot and personalization catalog. The public labels for the
+/// two consolidated surfaces deliberately differ from their internal enum
+/// names so migrated/deep-link compatibility never leaks into the taskbar UI.
+const PIN_CATALOG: [Surface; 13] = [
+    Surface::FleetMesh,
+    Surface::InfraCode,
+    Surface::Desktop,
+    Surface::Terminal,
+    Surface::MapsLocation,
+    Surface::Communications,
+    Surface::Files,
+    Surface::Music,
+    Surface::Media,
+    Surface::Browser,
+    Surface::Bookmarks,
+    Surface::Phones,
+    Surface::ThisNode,
+];
 
 /// One action emitted by the painted controls.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,7 +162,7 @@ fn surface_key(surface: Surface) -> &'static str {
 }
 
 fn surface_from_key(key: &str) -> Option<Surface> {
-    Surface::ALL
+    PIN_CATALOG
         .into_iter()
         .find(|surface| surface_key(*surface) == key)
 }
@@ -169,6 +194,69 @@ fn decode_pinned_surfaces(keys: &[String]) -> Vec<Surface> {
     surfaces
 }
 
+fn taskbar_surface_label(surface: Surface) -> &'static str {
+    match surface {
+        Surface::FleetMesh => "Fleet & Mesh",
+        Surface::InfraCode => "Workloads",
+        surface => surface.label(),
+    }
+}
+
+fn pin_catalog_index(surface: Surface) -> Option<usize> {
+    PIN_CATALOG
+        .iter()
+        .position(|candidate| *candidate == surface)
+}
+
+fn pin_catalog_contains(surface: Surface) -> bool {
+    pin_catalog_index(surface).is_some()
+}
+
+fn taskbar_surface_search_terms(surface: Surface) -> &'static str {
+    match surface {
+        Surface::FleetMesh => "fleet mesh fleet & mesh",
+        Surface::InfraCode => "infra code infra-code workloads",
+        _ => "",
+    }
+}
+
+fn filtered_pin_catalog(query: &str) -> Vec<Surface> {
+    let query = query.trim().to_ascii_lowercase().replace('-', " ");
+    PIN_CATALOG
+        .into_iter()
+        .filter(|surface| {
+            query.is_empty()
+                || taskbar_surface_label(*surface)
+                    .to_ascii_lowercase()
+                    .contains(&query)
+                || surface_key(*surface).replace('-', " ").contains(&query)
+                || taskbar_surface_search_terms(*surface).contains(&query)
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum ProfileState {
+    /// A seat with no navigation preference has not completed first boot.
+    #[serde(rename = "new")]
+    New,
+    /// A migrated or completed seat has an authoritative ordered pin list.
+    #[serde(rename = "configured")]
+    Configured,
+}
+
+fn default_persisted_profile_state() -> ProfileState {
+    // Existing settings files predate this field and are migrated profiles;
+    // absence must never be mistaken for a new profile during deserialization.
+    ProfileState::Configured
+}
+
+#[derive(Debug, Clone, Default)]
+struct PinSelectorState {
+    query: String,
+    selected: Vec<Surface>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct NavBarPrefs {
     #[serde(default)]
@@ -177,6 +265,8 @@ struct NavBarPrefs {
     mode: DockMode,
     #[serde(default)]
     pinned_surfaces: Vec<String>,
+    #[serde(default = "default_persisted_profile_state")]
+    profile_state: ProfileState,
 }
 
 impl Default for NavBarPrefs {
@@ -188,6 +278,7 @@ impl Default for NavBarPrefs {
                 .iter()
                 .map(|surface| surface_key(*surface).to_owned())
                 .collect(),
+            profile_state: ProfileState::Configured,
         }
     }
 }
@@ -205,6 +296,8 @@ pub(crate) struct State {
     mode: DockMode,
     transition: Option<TransitionState>,
     pinned_surfaces: Vec<Surface>,
+    profile_state: ProfileState,
+    pin_selector: PinSelectorState,
 }
 
 impl Default for State {
@@ -213,6 +306,8 @@ impl Default for State {
             mode: DockMode::Floating,
             transition: None,
             pinned_surfaces: default_taskbar_pins(),
+            profile_state: ProfileState::Configured,
+            pin_selector: PinSelectorState::default(),
         }
     }
 }
@@ -229,6 +324,33 @@ impl State {
             mode,
             transition: None,
             pinned_surfaces: default_taskbar_pins(),
+            profile_state: ProfileState::Configured,
+            pin_selector: PinSelectorState::default(),
+        }
+    }
+
+    fn new_profile(mode: DockMode) -> Self {
+        Self {
+            mode,
+            transition: None,
+            pinned_surfaces: Vec::new(),
+            profile_state: ProfileState::New,
+            pin_selector: PinSelectorState::default(),
+        }
+    }
+
+    fn from_prefs(prefs: NavBarPrefs) -> Self {
+        let pinned_surfaces = decode_pinned_surfaces(&prefs.pinned_surfaces);
+        let pin_selector = PinSelectorState {
+            query: String::new(),
+            selected: pinned_surfaces.clone(),
+        };
+        Self {
+            mode: prefs.mode,
+            transition: None,
+            pinned_surfaces,
+            profile_state: prefs.profile_state,
+            pin_selector,
         }
     }
 
@@ -236,25 +358,33 @@ impl State {
     /// floating default.
     #[must_use]
     pub(crate) fn load() -> Self {
-        Self::default_path().map_or_else(Self::default, |path| {
-            let prefs = read_bounded_config(&path)
-                .ok()
-                .and_then(|json| serde_json::from_str::<NavBarPrefs>(&json).ok())
-                .unwrap_or_default();
-            let pinned_surfaces = if prefs.schema_version == NAV_PREFS_SCHEMA_VERSION {
-                decode_pinned_surfaces(&prefs.pinned_surfaces)
-            } else {
-                // Schema zero was the placement-only format. Preserve its
-                // usable launch catalog rather than silently loading an empty
-                // taskbar when upgrading an existing seat.
-                default_taskbar_pins()
-            };
-            Self {
-                mode: prefs.mode,
-                transition: None,
-                pinned_surfaces,
+        let Some(path) = Self::default_path() else {
+            return Self::new_profile(DockMode::Floating);
+        };
+        match read_bounded_config(&path) {
+            Ok(json) => serde_json::from_str::<NavBarPrefs>(&json)
+                .map(Self::from_prefs)
+                .unwrap_or_else(|_| {
+                    Self::from_prefs(NavBarPrefs {
+                        profile_state: ProfileState::Configured,
+                        pinned_surfaces: Vec::new(),
+                        ..NavBarPrefs::default()
+                    })
+                }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Self::new_profile(DockMode::Floating)
             }
-        })
+            Err(_) => Self::from_prefs(NavBarPrefs {
+                profile_state: ProfileState::Configured,
+                pinned_surfaces: Vec::new(),
+                ..NavBarPrefs::default()
+            }),
+        }
+    }
+
+    #[must_use]
+    fn is_new_profile(&self) -> bool {
+        self.profile_state == ProfileState::New
     }
 
     /// Whether the layout should reserve the left rail this frame.
@@ -287,6 +417,30 @@ impl State {
             })
     }
 
+    /// Return the cross-fade weights for the two chrome treatments. The bottom
+    /// tray and the top status strip share the same eased timeline as the
+    /// navigation geometry, so the layout never snaps while the bar is moving.
+    #[must_use]
+    pub(crate) fn chrome_alphas(&self, now: Instant) -> (f32, f32) {
+        let Some(transition) = self.transition else {
+            return match self.mode {
+                DockMode::Floating => (1.0, 0.0),
+                DockMode::Docked => (0.0, 1.0),
+            };
+        };
+        let raw = (now
+            .saturating_duration_since(transition.started)
+            .as_secs_f32()
+            / TRANSITION.as_secs_f32())
+        .clamp(0.0, 1.0);
+        let t = smoothstep(raw);
+        match (transition.from, transition.to) {
+            (DockMode::Floating, DockMode::Docked) => (1.0 - t, t),
+            (DockMode::Docked, DockMode::Floating) => (t, 1.0 - t),
+            _ => (1.0, 0.0),
+        }
+    }
+
     /// Toggle placement and start the slide/melt transition.
     pub(crate) fn toggle(&mut self, now: Instant, motion: MotionMode) {
         self.toggle_mode(now, motion);
@@ -304,7 +458,7 @@ impl State {
     /// Non-catalog surfaces (including protected chrome aliases) are rejected
     /// before they can reach persistence or geometry.
     pub(crate) fn pin_surface(&mut self, surface: Surface) -> bool {
-        if !Surface::ALL.contains(&surface)
+        if !pin_catalog_contains(surface)
             || self.pinned_surfaces.contains(&surface)
             || self.pinned_surfaces.len() >= MAX_PINNED_SURFACES
         {
@@ -319,7 +473,7 @@ impl State {
     /// represented by controls rather than surfaces, so they have no mutation
     /// path and cannot be removed by accident.
     pub(crate) fn unpin_surface(&mut self, surface: Surface) -> bool {
-        if !Surface::ALL.contains(&surface) {
+        if !pin_catalog_contains(surface) {
             return false;
         }
         let Some(index) = self
@@ -332,6 +486,32 @@ impl State {
         self.pinned_surfaces.remove(index);
         self.save();
         true
+    }
+
+    fn toggle_pin_selector_surface(&mut self, surface: Surface) {
+        if !pin_catalog_contains(surface) {
+            return;
+        }
+        if let Some(index) = self
+            .pin_selector
+            .selected
+            .iter()
+            .position(|item| *item == surface)
+        {
+            self.pin_selector.selected.remove(index);
+        } else {
+            self.pin_selector.selected.push(surface);
+        }
+        self.pin_selector
+            .selected
+            .sort_by_key(|item| pin_catalog_index(*item).unwrap_or(PIN_CATALOG.len()));
+    }
+
+    fn complete_first_boot(&mut self) {
+        self.pinned_surfaces = self.pin_selector.selected.clone();
+        self.profile_state = ProfileState::Configured;
+        self.pin_selector = PinSelectorState::default();
+        self.save();
     }
 
     fn toggle_mode(&mut self, now: Instant, motion: MotionMode) {
@@ -558,7 +738,152 @@ impl State {
         // shell still mounts the lock curtain after this and raises it over all
         // chrome when engaged.
         ctx.move_to_top(area.response.layer_id);
+        if self.is_new_profile() {
+            self.mount_first_boot_selector(ctx);
+            action = None;
+        }
         action
+    }
+
+    fn mount_first_boot_selector(&mut self, ctx: &egui::Context) {
+        let screen = ctx.screen_rect();
+        let card = first_boot_selector_rect(screen);
+        let mut query = self.pin_selector.query.clone();
+        query = query.chars().take(MAX_PIN_SELECTOR_QUERY_CHARS).collect();
+        let selected = self.pin_selector.selected.clone();
+        let mut toggled = None;
+        let mut complete = false;
+
+        let area = egui::Area::new(egui::Id::new("construct-first-boot-pin-selector"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.min)
+            .default_size(screen.size())
+            .movable(false)
+            .sense(egui::Sense::hover())
+            .show(ctx, |ui| {
+                ui.set_min_size(screen.size());
+                ui.painter().rect_filled(
+                    screen,
+                    egui::CornerRadius::ZERO,
+                    Style::resolve_color(ctx, Style::SCRIM_REGULAR),
+                );
+                let _ = ui.interact(
+                    screen,
+                    egui::Id::new("construct-first-boot-pin-selector-scrim"),
+                    egui::Sense::click(),
+                );
+                ui.painter().rect_filled(
+                    card,
+                    egui::CornerRadius::same(Style::RADIUS_L as u8),
+                    Style::resolve_color(ctx, Style::SURFACE),
+                );
+                ui.scope_builder(egui::UiBuilder::new().max_rect(card), |ui| {
+                    ui.add_space(Style::SP_L);
+                    ui.label(
+                        Style::typography_text("Choose your taskbar apps", TypographyRole::Title)
+                            .color(Style::resolve_color(ctx, Style::TEXT)),
+                    );
+                    ui.label(
+                        Style::typography_text(
+                            "Select the surfaces you want pinned on this profile. You can change them later from the taskbar.",
+                            TypographyRole::Body,
+                        )
+                        .color(Style::resolve_color(ctx, Style::TEXT_DIM)),
+                    );
+                    ui.add_space(Style::SP_S);
+                    ui.add_sized(
+                        egui::vec2(card.width() - 2.0 * Style::SP_L, 40.0),
+                        egui::TextEdit::singleline(&mut query)
+                            .hint_text("Search taskbar apps"),
+                    );
+                    ui.add_space(Style::SP_XS);
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .max_height(card.height() - 190.0)
+                        .show(ui, |ui| {
+                            for surface in filtered_pin_catalog(&query) {
+                                let selected_row = selected.contains(&surface);
+                                let (rect, response) = ui.allocate_exact_size(
+                                    egui::vec2(ui.available_width(), CONTROL_EDGE),
+                                    egui::Sense::click(),
+                                );
+                                if selected_row {
+                                    ui.painter().rect_filled(
+                                        rect,
+                                        egui::CornerRadius::same(Style::RADIUS_S as u8),
+                                        Style::resolve_color(ctx, Style::SURFACE_HI),
+                                    );
+                                }
+                                if let Some(texture) = icon_texture(
+                                    ctx,
+                                    surface.icon_id(),
+                                    24.0,
+                                    Style::resolve_color(ctx, Style::TEXT),
+                                ) {
+                                    let icon_rect = egui::Rect::from_center_size(
+                                        egui::pos2(rect.left() + Style::SP_L, rect.center().y),
+                                        egui::vec2(24.0, 24.0),
+                                    );
+                                    ui.painter().image(
+                                        texture.id(),
+                                        icon_rect,
+                                        egui::Rect::from_min_max(
+                                            egui::Pos2::ZERO,
+                                            egui::pos2(1.0, 1.0),
+                                        ),
+                                        Style::resolve_color(ctx, Style::TEXT),
+                                    );
+                                }
+                                let label = taskbar_surface_label(surface);
+                                let galley = ui.painter().layout_job(Style::typography_job(
+                                    label,
+                                    TypographyRole::Label,
+                                    Style::resolve_color(ctx, Style::TEXT),
+                                    f32::INFINITY,
+                                ));
+                                ui.painter().galley(
+                                    egui::pos2(
+                                        rect.left() + Style::SP_XL,
+                                        rect.center().y - galley.size().y / 2.0,
+                                    ),
+                                    galley,
+                                    Style::resolve_color(ctx, Style::TEXT),
+                                );
+                                let control = Control {
+                                    kind: ControlKind::SurfaceLauncher,
+                                    rect,
+                                    surface: Some(surface),
+                                    source_index: None,
+                                };
+                                install_accessibility(ctx, self.mode, control, label, self.is_docked());
+                                let _response = response.clone().on_hover_ui(|ui| {
+                                    nav_bar_tooltip(ui, label);
+                                });
+                                if response.clicked() {
+                                    toggled = Some(surface);
+                                }
+                            }
+                        });
+                    ui.add_space(Style::SP_S);
+                    if ui
+                        .add_sized(
+                            egui::vec2(card.width() - 2.0 * Style::SP_L, 40.0),
+                            egui::Button::new("Continue with selected pins"),
+                        )
+                        .clicked()
+                    {
+                        complete = true;
+                    }
+                });
+            });
+        ctx.move_to_top(area.response.layer_id);
+        self.pin_selector.query = query;
+        if let Some(surface) = toggled {
+            self.toggle_pin_selector_surface(surface);
+        }
+        if complete {
+            self.complete_first_boot();
+        }
     }
 
     fn geometry(&self, screen: egui::Rect, now: Instant) -> Geometry {
@@ -615,6 +940,7 @@ impl State {
                     .iter()
                     .map(|surface| surface_key(*surface).to_owned())
                     .collect(),
+                profile_state: self.profile_state,
             };
             let _ = save_to(&path, prefs);
         }
@@ -820,7 +1146,7 @@ fn control_span(count: usize, edge: f32, gap: f32) -> f32 {
 fn floating_center_bounds(screen: egui::Rect, gap: f32) -> (f32, f32) {
     let left_start = screen.left() + Style::SP_L;
     let left_cluster_end = left_start + control_span(3, CONTROL_EDGE, gap);
-    let right_start = screen.right() - Style::SP_L - CONTROL_EDGE;
+    let right_start = screen.right() - Style::SP_L - CONTROL_EDGE - BOTTOM_TRAY_GAP - BOTTOM_TRAY_W;
     (left_cluster_end + gap, right_start - gap)
 }
 
@@ -1210,6 +1536,12 @@ fn overflow_popup_id(mode: DockMode) -> egui::Id {
     egui::Id::new(("construct-navigation-bar", mode.id_suffix(), "overflow"))
 }
 
+fn first_boot_selector_rect(screen: egui::Rect) -> egui::Rect {
+    let width = FIRST_BOOT_SELECTOR_W.min((screen.width() - 2.0 * Style::SP_XL).max(280.0));
+    let height = FIRST_BOOT_SELECTOR_H.min((screen.height() - 2.0 * Style::SP_XL).max(240.0));
+    egui::Rect::from_center_size(screen.center(), egui::vec2(width, height))
+}
+
 fn overflow_label(item_count: usize) -> String {
     match item_count {
         1 => "More taskbar apps (1 hidden)".to_owned(),
@@ -1487,7 +1819,7 @@ fn taskbar_context_menu(
                 "Taskbar apps",
                 TypographyRole::Label,
             ));
-            for surface in Surface::ALL {
+            for surface in PIN_CATALOG {
                 let pinned = pinned_surfaces.contains(&surface);
                 let label = if pinned {
                     format!("Unpin {} from taskbar", surface.label())
@@ -1830,6 +2162,84 @@ mod tests {
     }
 
     #[test]
+    fn first_boot_catalog_is_ordered_and_uses_operator_aliases() {
+        assert_eq!(
+            PIN_CATALOG[..10],
+            [
+                Surface::FleetMesh,
+                Surface::InfraCode,
+                Surface::Desktop,
+                Surface::Terminal,
+                Surface::MapsLocation,
+                Surface::Communications,
+                Surface::Files,
+                Surface::Music,
+                Surface::Media,
+                Surface::Browser,
+            ]
+        );
+        assert_eq!(taskbar_surface_label(Surface::FleetMesh), "Fleet & Mesh");
+        assert_eq!(taskbar_surface_label(Surface::InfraCode), "Workloads");
+        assert_eq!(
+            filtered_pin_catalog("fleet & mesh"),
+            vec![Surface::FleetMesh]
+        );
+        assert_eq!(filtered_pin_catalog("workloads"), vec![Surface::InfraCode]);
+        assert_eq!(filtered_pin_catalog("infra-code"), vec![Surface::InfraCode]);
+    }
+
+    #[test]
+    fn new_profile_selection_is_empty_and_commits_in_catalog_order() {
+        let mut state = State::new_profile(DockMode::Floating);
+        assert!(state.is_new_profile());
+        assert!(state.pinned_surfaces().is_empty());
+        assert!(state.pin_selector.selected.is_empty());
+
+        state.toggle_pin_selector_surface(Surface::InfraCode);
+        state.toggle_pin_selector_surface(Surface::FleetMesh);
+        assert_eq!(
+            state.pin_selector.selected,
+            vec![Surface::FleetMesh, Surface::InfraCode]
+        );
+
+        state.complete_first_boot();
+        assert!(!state.is_new_profile());
+        assert_eq!(
+            state.pinned_surfaces(),
+            &[Surface::FleetMesh, Surface::InfraCode]
+        );
+        assert!(state.pin_selector.selected.is_empty());
+    }
+
+    #[test]
+    fn migrated_preferences_preserve_pins_without_restoring_defaults() {
+        let state = State::from_prefs(NavBarPrefs {
+            schema_version: 1,
+            mode: DockMode::Docked,
+            pinned_surfaces: vec!["browser".to_owned(), "maps-location".to_owned()],
+            profile_state: ProfileState::Configured,
+        });
+        assert!(!state.is_new_profile());
+        assert_eq!(
+            state.pinned_surfaces(),
+            &[Surface::Browser, Surface::MapsLocation]
+        );
+        assert_eq!(state.mode, DockMode::Docked);
+        assert!(!state.pinned_surfaces().contains(&Surface::Desktop));
+
+        let legacy_without_pins = State::from_prefs(NavBarPrefs {
+            schema_version: 0,
+            mode: DockMode::Floating,
+            pinned_surfaces: Vec::new(),
+            profile_state: ProfileState::Configured,
+        });
+        assert!(legacy_without_pins.pinned_surfaces().is_empty());
+        assert!(!legacy_without_pins
+            .pinned_surfaces()
+            .contains(&Surface::Desktop));
+    }
+
+    #[test]
     fn hit_targets_stay_inside_the_painted_navigation_chrome() {
         let screens = [
             egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0)),
@@ -1868,6 +2278,8 @@ mod tests {
                             started: start,
                         }),
                         pinned_surfaces: default_taskbar_pins(),
+                        profile_state: ProfileState::Configured,
+                        pin_selector: PinSelectorState::default(),
                     };
                     for offset in transition_offsets {
                         assert_hit_targets_inside_backing(
@@ -1931,6 +2343,7 @@ mod tests {
             schema_version: NAV_PREFS_SCHEMA_VERSION,
             mode: DockMode::Docked,
             pinned_surfaces: vec!["browser".to_owned(), "maps-location".to_owned()],
+            profile_state: ProfileState::Configured,
         };
         let json = serde_json::to_string(&prefs).expect("encode taskbar preferences");
         let decoded: NavBarPrefs = serde_json::from_str(&json).expect("decode taskbar preferences");
@@ -2059,6 +2472,8 @@ mod tests {
                 mode,
                 transition: None,
                 pinned_surfaces: default_taskbar_pins(),
+                profile_state: ProfileState::Configured,
+                pin_selector: PinSelectorState::default(),
             };
 
             // The production mount waits for egui's initial pass, and Area adds
@@ -2759,6 +3174,8 @@ mod tests {
                 started: transition_started,
             }),
             pinned_surfaces: default_taskbar_pins(),
+            profile_state: ProfileState::Configured,
+            pin_selector: PinSelectorState::default(),
         };
         let ctx = egui::Context::default();
         let input = |events| egui::RawInput {
