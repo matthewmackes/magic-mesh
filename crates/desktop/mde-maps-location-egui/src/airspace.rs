@@ -70,6 +70,23 @@ pub enum SignalKind {
     Bluetooth,
 }
 
+/// Truthful health projection for the typed MG90 mirror at this UI boundary.
+///
+/// `AirspaceAvailability` describes the producer's current claim. This local
+/// projection retains the consumer's freshness verdict so an expired Ready
+/// envelope cannot look identical to a source that is explicitly offline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AirspaceFeedHealth {
+    /// No scanner provider has been configured for this seat.
+    Unconfigured,
+    /// The provider is configured but currently reports no connection.
+    Offline,
+    /// The latest Ready envelope passed publication and observation freshness.
+    Fresh,
+    /// A Ready envelope expired before it reached this consumer.
+    Stale,
+}
+
 impl SignalKind {
     /// The type accent (WiFi cyan, cell mesh-green, BT media-pink).
     pub const fn color(self) -> Color32 {
@@ -154,6 +171,8 @@ pub struct AirspaceState {
     repaint_context: Option<egui::Context>,
     /// Availability reported by the daemon-side typed scanner mirror.
     pub source_status: mackes_mesh_types::airspace::AirspaceAvailability,
+    /// Consumer-side freshness projection used by the honest empty state.
+    pub source_health: AirspaceFeedHealth,
     pub show_wifi: bool,
     pub show_cell: bool,
     pub show_bt: bool,
@@ -181,6 +200,7 @@ impl AirspaceState {
             signals: Vec::new(),
             repaint_context: None,
             source_status: mackes_mesh_types::airspace::AirspaceAvailability::NoSource,
+            source_health: AirspaceFeedHealth::Unconfigured,
             show_wifi: true,
             show_cell: true,
             show_bt: true,
@@ -565,6 +585,7 @@ impl AirspaceState {
             signals,
             repaint_context: None,
             source_status: mackes_mesh_types::airspace::AirspaceAvailability::Ready,
+            source_health: AirspaceFeedHealth::Fresh,
             show_wifi: true,
             show_cell: true,
             show_bt: true,
@@ -615,10 +636,20 @@ impl AirspaceState {
             || observation_expired;
 
         self.source_status = snapshot.availability;
+        self.source_health = match snapshot.availability {
+            mackes_mesh_types::airspace::AirspaceAvailability::NoSource => {
+                AirspaceFeedHealth::Unconfigured
+            }
+            mackes_mesh_types::airspace::AirspaceAvailability::Offline => {
+                AirspaceFeedHealth::Offline
+            }
+            mackes_mesh_types::airspace::AirspaceAvailability::Ready => AirspaceFeedHealth::Fresh,
+        };
         if expired
             && snapshot.availability == mackes_mesh_types::airspace::AirspaceAvailability::Ready
         {
             self.source_status = mackes_mesh_types::airspace::AirspaceAvailability::Offline;
+            self.source_health = AirspaceFeedHealth::Stale;
             self.signals.clear();
             self.selected = None;
             self.request_repaint();
@@ -927,14 +958,13 @@ fn paint_radar_scope(ui: &mut Ui, rect: Rect, state: &mut AirspaceState, t: f32)
     // distinguishes an unconfigured scanner from an attempted/offline one.
     if state.signals.is_empty() {
         stats.empty_badge = true;
-        let detail = match state.source_status {
-            mackes_mesh_types::airspace::AirspaceAvailability::NoSource => {
-                "MG90 scanner source not configured"
+        let (detail, detail_color) = match state.source_health {
+            AirspaceFeedHealth::Unconfigured => {
+                ("MG90 scanner source not configured", Style::TEXT_DIM)
             }
-            mackes_mesh_types::airspace::AirspaceAvailability::Offline => "MG90 scanner is offline",
-            mackes_mesh_types::airspace::AirspaceAvailability::Ready => {
-                "MG90 scanner returned no contacts"
-            }
+            AirspaceFeedHealth::Offline => ("MG90 scanner is offline", Style::DANGER),
+            AirspaceFeedHealth::Fresh => ("MG90 scanner returned no contacts", Style::TEXT_DIM),
+            AirspaceFeedHealth::Stale => ("MG90 scanner data is stale", Style::WARN),
         };
         p.text(
             center + Vec2::new(0.0, radius * 0.45),
@@ -948,7 +978,7 @@ fn paint_radar_scope(ui: &mut Ui, rect: Rect, state: &mut AirspaceState, t: f32)
             Align2::CENTER_CENTER,
             detail,
             FontId::proportional(Style::SMALL),
-            Style::TEXT_DIM,
+            detail_color,
         );
     }
     stats
@@ -1237,8 +1267,47 @@ mod tests {
             state.source_status,
             mackes_mesh_types::airspace::AirspaceAvailability::Offline
         );
+        assert_eq!(state.source_health, AirspaceFeedHealth::Offline);
         assert!(state.signals.is_empty());
         assert!(state.selected.is_none());
+    }
+
+    #[test]
+    fn stale_ready_mirror_paints_stale_health_instead_of_offline_detail() {
+        let mut state = AirspaceState::live();
+        let snapshot = mackes_mesh_types::airspace::AirspaceSnapshot::from_survey(
+            "mg90-live",
+            10_000,
+            mackes_mesh_types::airspace::AirspaceSurvey {
+                scanned_at_ms: Some(9_999),
+                contacts: Vec::new(),
+                gaps: Vec::new(),
+            },
+        );
+        state.refresh_from_wire_at(&snapshot, 10_000 + AIRSPACE_SNAPSHOT_MAX_AGE_MS + 1);
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 820.0))),
+                events: Vec::new(),
+                time: Some(1.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    airspace_panel(ui, &mut state);
+                });
+            },
+        );
+
+        assert_eq!(state.source_health, AirspaceFeedHealth::Stale);
+        let texts = painted_texts(&out.shapes);
+        assert!(texts
+            .iter()
+            .any(|text| text == "MG90 scanner data is stale"));
+        assert!(!texts.iter().any(|text| text == "MG90 scanner is offline"));
     }
 
     #[test]
@@ -1271,6 +1340,7 @@ mod tests {
             state.source_status,
             mackes_mesh_types::airspace::AirspaceAvailability::Offline
         );
+        assert_eq!(state.source_health, AirspaceFeedHealth::Stale);
         assert!(state.signals.is_empty());
         assert!(state.selected.is_none());
     }
