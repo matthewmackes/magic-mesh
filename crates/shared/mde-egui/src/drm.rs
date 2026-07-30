@@ -720,7 +720,10 @@ fn drm_clipboard_output_text(output: &egui::PlatformOutput) -> Option<String> {
             text = Some(next.clone());
         }
     }
-    if !output.copied_text.is_empty() {
+    // `commands` is the current egui output contract. The deprecated field is
+    // only a fallback for older callers; it must not override an explicit
+    // `CopyText("")`, which is the canonical clear operation.
+    if text.is_none() && !output.copied_text.is_empty() {
         text = Some(output.copied_text.clone());
     }
     text.map(|text| {
@@ -2631,14 +2634,64 @@ mod tests {
         #![allow(deprecated)]
 
         let mut output = egui::PlatformOutput::default();
-        output
-            .commands
-            .push(egui::OutputCommand::CopyText("command".to_owned()));
         output.copied_text = "legacy".to_owned();
 
         assert_eq!(
             drm_clipboard_output_text(&output),
             Some("legacy".to_owned())
+        );
+    }
+
+    #[test]
+    fn drm_clipboard_output_clear_command_wins_over_legacy_text() {
+        #![allow(deprecated)]
+
+        let mut output = egui::PlatformOutput::default();
+        output
+            .commands
+            .push(egui::OutputCommand::CopyText(String::new()));
+        output.copied_text = "stale legacy text".to_owned();
+
+        let mut provider = MemoryTextClipboard::new();
+        provider.write_text("old local text");
+        let mut cached = String::from("old local text");
+
+        assert_eq!(drm_clipboard_output_text(&output), Some(String::new()));
+        assert!(store_drm_clipboard_output(
+            &mut provider,
+            &mut cached,
+            &output
+        ));
+        assert!(cached.is_empty());
+        assert!(provider.read_text().is_none());
+    }
+
+    #[test]
+    fn drm_clipboard_copy_output_round_trips_into_native_paste_event() {
+        let mut provider = MemoryTextClipboard::new();
+        let mut cached = String::new();
+        let mut output = egui::PlatformOutput::default();
+        output
+            .commands
+            .push(egui::OutputCommand::CopyText("copied\r\ntext é".to_owned()));
+
+        assert!(store_drm_clipboard_output(
+            &mut provider,
+            &mut cached,
+            &output
+        ));
+        refresh_drm_clipboard_text(&mut provider, &mut cached);
+
+        let mut events = Vec::new();
+        assert!(push_drm_clipboard_shortcut(
+            &mut events,
+            drm_modifiers(false, true, false),
+            egui::Key::V,
+            &cached,
+        ));
+        assert_eq!(
+            events,
+            vec![egui::Event::Paste("copied\ntext é".to_owned())]
         );
     }
 
