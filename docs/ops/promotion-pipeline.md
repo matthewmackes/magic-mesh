@@ -140,6 +140,20 @@ passed the 90 MiB payload guard. Artifacts are staged in
 `/root/mcnf-release-artifacts` for Dell proofing. This Alpha is unsigned and
 not fleet-promoted; live Dell installation and GUI visual signoff remain.
 
+2026-07-30 refreshed integrated engineering Alpha cut for Dell proofing: source
+tip `5086861f` (searchable taskbar catalog without retired launcher groups,
+DRM clipboard no-op rejection, and This Node disabled-action accessibility
+reasons) was rebuilt on BigBoy through `install-helpers/xcp-build.sh rpm`.
+Base `magic-mesh-12.1.6-1.x86_64.rpm` (82.2 MiB, sha256
+`2b083cd680990eddafe75d9313901338e1f674cf4061aaef7b3759d354c1a95d`), browser
+`magic-mesh-browser-12.1.6-1.x86_64.rpm` (38.9 MiB, sha256
+`f5f2444a962da692aaf508933e6cc8732e310d682d5a4cc7d66ef58d2fa54c00`), and
+lighthouse `magic-mesh-lighthouse-12.1.6-1.x86_64.rpm` (11.2 MiB, sha256
+`1c8afe79ab12a766b36db8ef16b3330e9ee27cc6b87b6204c1718d154ac339a5`) all
+passed the 90 MiB payload guard. Artifacts are staged in
+`/root/mcnf-release-artifacts` for Dell proofing. This Alpha is unsigned and
+not fleet-promoted; live Dell installation and GUI visual signoff remain.
+
 2026-07-07 production-candidate evidence: latest rebuilt
 `magic-mesh-12.0.0-1.x86_64` (`/root/mcnf-release-artifacts`, 112291230
 bytes, built 13:19 EDT, sha256
