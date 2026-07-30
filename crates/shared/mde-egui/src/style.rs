@@ -287,6 +287,8 @@ pub struct StylePalette {
     pub text_dim: Color32,
     /// Strong/emphasis text.
     pub text_strong: Color32,
+    /// Disabled control text/icon ink, intentionally quieter than secondary text.
+    pub disabled: Color32,
 }
 
 /// The shared egui design system. All fields are `const` so they are usable in
@@ -319,6 +321,9 @@ impl Style {
     pub const QUAZAR_LIGHT_TEXT_DIM: Color32 = Color32::from_rgb(0x55, 0x5D, 0x6B);
     /// Quazar Light strong text.
     pub const QUAZAR_LIGHT_TEXT_STRONG: Color32 = Color32::from_rgb(0x0B, 0x0D, 0x12);
+    /// Quazar Light disabled ink — readable on white, but visibly quieter than
+    /// [`QUAZAR_LIGHT_TEXT_DIM`](Self::QUAZAR_LIGHT_TEXT_DIM).
+    pub const QUAZAR_LIGHT_DISABLED: Color32 = Color32::from_rgb(0x7A, 0x83, 0x90);
     /// Quazar Light default interactive accent.
     pub const QUAZAR_LIGHT_ACCENT: Color32 = Color32::from_rgb(0x0B, 0x57, 0xD0);
     /// Quazar Light active/pressed control face.
@@ -345,6 +350,9 @@ impl Style {
     pub const SYNC3_TEXT_DIM: Color32 = Color32::from_rgb(0xA6, 0xB4, 0xC2);
     /// Sync-3 emphasis text — pure white.
     pub const SYNC3_TEXT_STRONG: Color32 = Color32::from_rgb(0xFF, 0xFF, 0xFF);
+    /// Sync-3 disabled ink — subdued against the near-black ground while still
+    /// surviving glanceable in-vehicle rendering.
+    pub const SYNC3_DISABLED: Color32 = Color32::from_rgb(0x6E, 0x7A, 0x88);
     /// Sync-3 signature accent — a bright sky/cyan Ford SYNC blue.
     pub const SYNC3_ACCENT: Color32 = Color32::from_rgb(0x2E, 0x9B, 0xE6);
     /// Sync-3 accent highlight — one rung brighter for pressed rings.
@@ -856,6 +864,7 @@ impl Style {
                 text: Self::TEXT,
                 text_dim: Self::TEXT_DIM,
                 text_strong: Self::TEXT_STRONG,
+                disabled: Self::DISABLED,
             },
             StyleColorScheme::Light => StylePalette {
                 bg: Self::QUAZAR_LIGHT_BG,
@@ -866,6 +875,7 @@ impl Style {
                 text: Self::QUAZAR_LIGHT_TEXT,
                 text_dim: Self::QUAZAR_LIGHT_TEXT_DIM,
                 text_strong: Self::QUAZAR_LIGHT_TEXT_STRONG,
+                disabled: Self::QUAZAR_LIGHT_DISABLED,
             },
             StyleColorScheme::AutoSync3 => StylePalette {
                 bg: Self::SYNC3_BG,
@@ -876,6 +886,7 @@ impl Style {
                 text: Self::SYNC3_TEXT,
                 text_dim: Self::SYNC3_TEXT_DIM,
                 text_strong: Self::SYNC3_TEXT_STRONG,
+                disabled: Self::SYNC3_DISABLED,
             },
         }
     }
@@ -903,6 +914,7 @@ impl Style {
             Self::TEXT => p.text,
             Self::TEXT_DIM => p.text_dim,
             Self::TEXT_STRONG => p.text_strong,
+            Self::DISABLED => p.disabled,
             Self::ACCENT => match scheme {
                 StyleColorScheme::AutoSync3 => Self::SYNC3_ACCENT,
                 _ => Self::QUAZAR_LIGHT_ACCENT,
@@ -2271,6 +2283,16 @@ mod tests {
             "Quazar Light dim text/BG contrast must clear AA: {:.2}",
             wcag_contrast_ratio(p.text_dim, p.bg)
         );
+        assert_eq!(p.disabled, Style::QUAZAR_LIGHT_DISABLED);
+        assert!(
+            wcag_contrast_ratio(p.disabled, p.bg) >= 3.0,
+            "Quazar Light disabled ink must remain readable: {:.2}",
+            wcag_contrast_ratio(p.disabled, p.bg)
+        );
+        assert!(
+            wcag_contrast_ratio(p.disabled, p.bg) < wcag_contrast_ratio(p.text_dim, p.bg),
+            "disabled ink must be quieter than secondary text"
+        );
         assert!(
             wcag_contrast_ratio(
                 Style::QUAZAR_LIGHT_TEXT_STRONG,
@@ -2330,6 +2352,16 @@ mod tests {
         assert_eq!(
             Style::resolve_color_for_scheme(StyleColorScheme::AutoSync3, Style::TEXT),
             Style::SYNC3_TEXT
+        );
+        assert_eq!(p.disabled, Style::SYNC3_DISABLED);
+        assert!(
+            wcag_contrast_ratio(p.disabled, p.bg) >= 3.0,
+            "Sync-3 disabled ink must remain glanceable: {:.2}",
+            wcag_contrast_ratio(p.disabled, p.bg)
+        );
+        assert!(
+            wcag_contrast_ratio(p.disabled, p.bg) < wcag_contrast_ratio(p.text_dim, p.bg),
+            "Sync-3 disabled ink must be quieter than secondary text"
         );
 
         // AutoSync3 is mode-derived, never an operator-pickable Personalization theme.
@@ -2415,6 +2447,22 @@ mod tests {
             }
             other => panic!("unexpected mesh shape: {other:?}"),
         }
+    }
+
+    #[test]
+    fn color_scheme_remaps_disabled_token_with_quiet_readable_ink() {
+        assert_eq!(
+            Style::resolve_color_for_scheme(StyleColorScheme::Dark, Style::DISABLED),
+            Style::DISABLED
+        );
+        assert_eq!(
+            Style::resolve_color_for_scheme(StyleColorScheme::Light, Style::DISABLED),
+            Style::QUAZAR_LIGHT_DISABLED
+        );
+        assert_eq!(
+            Style::resolve_color_for_scheme(StyleColorScheme::AutoSync3, Style::DISABLED),
+            Style::SYNC3_DISABLED
+        );
     }
 
     #[test]
