@@ -100,7 +100,7 @@ pub use link::{
 pub use pixel::{Framebuffer, FramebufferError, PixelFormat};
 pub use session::{
     vnc_clipboard_status, VncClipboardCapability, VncClipboardChannel, VncClipboardStatus,
-    VncSession,
+    VncSession, VncTextClipboard,
 };
 pub use tier::{VncTierSettings, PREFERRED_ENCODINGS};
 pub use wire::{

@@ -44,6 +44,7 @@ use crate::link::{
 use crate::pixel::{Framebuffer, PixelFormat};
 use crate::tier::VncTierSettings;
 use crate::wire::{RfbClientMessage, RfbControlMessage, RfbCutText, RfbCutTextError};
+use mde_egui::clipboard::TextClipboard;
 use mde_vdi_core::{DamageLog, DamageRect, FrameDamage};
 use std::time::{Duration, Instant};
 
@@ -104,6 +105,60 @@ pub struct VncSession {
     pending_format: Option<PixelFormat>,
     /// Minimum `FramebufferUpdateRequest` spacing of the effective tier.
     update_interval_ms: u64,
+}
+
+/// The direct-seat text clipboard view of a VNC session.
+///
+/// The shared [`TextClipboard`] trait deliberately has no error return because
+/// a local clipboard provider may be temporarily unavailable. VNC still keeps
+/// its protocol error observable: [`Self::write_text_checked`] returns the
+/// bounded RFB error, while the trait implementation records it for
+/// [`Self::take_error`]. A successful write queues a real `ClientCutText`; the
+/// live connection flushes that queue through [`crate::connect::VncConnection`].
+/// Guest `ServerCutText` values are consumed from the same latest-value-wins
+/// queue, so no second clipboard store or Wayland helper is involved.
+pub struct VncTextClipboard<'a> {
+    session: &'a mut VncSession,
+    last_error: Option<RfbCutTextError>,
+}
+
+impl<'a> VncTextClipboard<'a> {
+    /// Borrow the VNC session's native text clipboard seam.
+    #[must_use]
+    pub(crate) fn new(session: &'a mut VncSession) -> Self {
+        Self {
+            session,
+            last_error: None,
+        }
+    }
+
+    /// Queue host/seat text for the guest and return the real RFB validation
+    /// result. Nothing is queued when the UTF-8 payload exceeds the 1 MiB cap.
+    pub fn write_text_checked(&mut self, text: &str) -> Result<(), RfbCutTextError> {
+        self.session.send_clipboard_to_guest(text)
+    }
+
+    /// Take an error captured by the infallible [`TextClipboard::write_text`]
+    /// callback, if the caller did not use [`Self::write_text_checked`].
+    pub fn take_error(&mut self) -> Option<RfbCutTextError> {
+        self.last_error.take()
+    }
+}
+
+impl TextClipboard for VncTextClipboard<'_> {
+    fn read_text(&mut self) -> Option<String> {
+        self.session
+            .take_guest_clipboard()
+            .into_iter()
+            .last()
+            .map(RfbCutText::into_text)
+    }
+
+    fn write_text(&mut self, text: &str) {
+        if let Err(error) = self.write_text_checked(text) {
+            self.last_error = Some(error);
+        }
+    }
 }
 
 impl VncSession {
@@ -519,6 +574,15 @@ impl VncSession {
         self.update_interval_ms
     }
 
+    /// Borrow the native VNC clipboard through the shared direct-seat contract.
+    ///
+    /// The returned adapter queues host text in this session and consumes guest
+    /// text delivered by `ServerCutText`. Drop it before borrowing the session
+    /// again to flush input or inspect the queue.
+    pub fn text_clipboard(&mut self) -> VncTextClipboard<'_> {
+        VncTextClipboard::new(self)
+    }
+
     /// Pin a tier or return to auto, reporting the tier change if any.
     ///
     /// VNC applies tiers **live** ([`VncTierSettings::APPLICATION`]): a change
@@ -697,6 +761,7 @@ mod tests {
     use crate::pixel::PixelFormat;
     use crate::tier::PREFERRED_ENCODINGS;
     use crate::wire::{RfbClientMessage, RfbControlMessage, RfbCutText, RFB_CUT_TEXT_MAX_BYTES};
+    use mde_egui::clipboard::TextClipboard;
     use std::time::{Duration, Instant};
 
     fn session() -> VncSession {
@@ -965,6 +1030,59 @@ mod tests {
         assert!(
             s.pending_input().is_empty(),
             "failed materialization must not leave a partial RFB message queued"
+        );
+    }
+
+    #[test]
+    fn shared_seat_clipboard_adapter_round_trips_native_utf8() {
+        let mut s = session();
+        {
+            let mut clipboard = s.text_clipboard();
+            clipboard.write_text("seat→guest\r\n日本語");
+            assert!(
+                clipboard.take_error().is_none(),
+                "valid UTF-8 must be accepted by the native RFB path"
+            );
+        }
+        assert_eq!(
+            s.take_input(),
+            vec![RfbClientMessage::ClientCutText(
+                RfbCutText::new("seat→guest\r\n日本語").expect("bounded UTF-8")
+            )]
+        );
+
+        let status = s
+            .receive_server_cut_text(RfbCutText::new("guest→seat\n日本語").expect("bounded UTF-8"));
+        assert_eq!(status, VncClipboardStatus::GuestTextQueued);
+        let mut clipboard = s.text_clipboard();
+        assert_eq!(clipboard.read_text().as_deref(), Some("guest→seat\n日本語"));
+        assert_eq!(clipboard.read_text(), None, "guest text is consumed once");
+    }
+
+    #[test]
+    fn shared_seat_clipboard_adapter_surfaces_rfb_errors_without_queueing() {
+        let mut s = session();
+        let too_big = "x".repeat(RFB_CUT_TEXT_MAX_BYTES + 1);
+        let mut clipboard = s.text_clipboard();
+        clipboard.write_text(&too_big);
+        assert!(
+            clipboard.take_error().is_some(),
+            "the infallible seat callback must retain an observable RFB error"
+        );
+        assert!(
+            clipboard.write_text_checked(&too_big).is_err(),
+            "checked callers receive the protocol error directly"
+        );
+        drop(clipboard);
+        assert!(
+            s.pending_input().is_empty(),
+            "rejected text must not queue a partial ClientCutText"
+        );
+        let mut clipboard = s.text_clipboard();
+        assert_eq!(
+            clipboard.read_text(),
+            None,
+            "no guest text is honest absence"
         );
     }
 
