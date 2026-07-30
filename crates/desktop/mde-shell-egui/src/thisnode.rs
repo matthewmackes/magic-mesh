@@ -138,6 +138,14 @@ const SERVICE_CATALOG: [(&str, &str); 9] = [
 /// snapshot carries more entries than this surface can render usefully.
 const MAX_CONNECTIVITY_FACTS: usize = 8;
 
+const CONNECTIVITY_PROVIDER_CATALOG: [ConnectivityProvider; 5] = [
+    ConnectivityProvider::Wifi,
+    ConnectivityProvider::Ethernet,
+    ConnectivityProvider::Cellular,
+    ConnectivityProvider::Mesh,
+    ConnectivityProvider::DnsLighthouse,
+];
+
 // ──────────────────────────── projected view ────────────────────────────
 
 /// This node's live status, folded from the mesh-status snapshot. Pure data
@@ -224,6 +232,10 @@ struct ConnectivityFacts {
     default_route: Option<String>,
     lighthouses: Vec<String>,
     dns_servers: Vec<String>,
+    /// Explicit underlay observations are optional because the current
+    /// mesh-status writer only publishes the overlay. Never infer a provider
+    /// from an interface prefix or from the presence of a default route.
+    interfaces: [Option<InterfaceProviderFacts>; 3],
 }
 
 impl ConnectivityFacts {
@@ -244,6 +256,7 @@ impl ConnectivityFacts {
                 network,
                 &["dns_servers", "nameservers", "resolvers", "dns"],
             ),
+            interfaces: interface_provider_facts(network),
         }
     }
 
@@ -253,6 +266,74 @@ impl ConnectivityFacts {
             && self.default_route.is_none()
             && self.lighthouses.is_empty()
             && self.dns_servers.is_empty()
+            && self.interfaces.iter().all(Option::is_none)
+    }
+
+    fn has_underlay_observation(&self) -> bool {
+        self.interfaces.iter().any(Option::is_some)
+    }
+
+    fn provider_projection(&self) -> [ConnectivityProviderProjection; 5] {
+        CONNECTIVITY_PROVIDER_CATALOG.map(|provider| match provider {
+            ConnectivityProvider::Wifi => {
+                interface_provider_projection(provider, self.interfaces[0].as_ref())
+            }
+            ConnectivityProvider::Ethernet => {
+                interface_provider_projection(provider, self.interfaces[1].as_ref())
+            }
+            ConnectivityProvider::Cellular => {
+                interface_provider_projection(provider, self.interfaces[2].as_ref())
+            }
+            ConnectivityProvider::Mesh => ConnectivityProviderProjection {
+                provider,
+                availability: self.mesh_provider_availability(),
+                interface: self.interface.clone(),
+                cidr: self.cidr.clone(),
+            },
+            ConnectivityProvider::DnsLighthouse => ConnectivityProviderProjection {
+                provider,
+                availability: self.dns_lighthouse_availability(),
+                interface: None,
+                cidr: None,
+            },
+        })
+    }
+
+    fn mesh_provider_availability(&self) -> ConnectivityAvailability {
+        if self.interface.is_none() && self.cidr.is_none() {
+            return ConnectivityAvailability::Unavailable(
+                "No explicit mesh overlay interface or CIDR is published.",
+            );
+        }
+        if self.interface.is_some()
+            && self.cidr.is_some()
+            && (!self.lighthouses.is_empty() || !self.dns_servers.is_empty())
+        {
+            ConnectivityAvailability::Available(
+                "Mesh overlay interface and CIDR are published with reachability evidence.",
+            )
+        } else {
+            ConnectivityAvailability::Degraded(
+                "Mesh overlay facts are partial; interface, CIDR, and reachability are not all published.",
+            )
+        }
+    }
+
+    fn dns_lighthouse_availability(&self) -> ConnectivityAvailability {
+        match (self.dns_servers.is_empty(), self.lighthouses.is_empty()) {
+            (false, false) => ConnectivityAvailability::Available(
+                "Mesh DNS and lighthouse endpoints are published by the snapshot.",
+            ),
+            (false, true) => ConnectivityAvailability::Available(
+                "Mesh DNS resolvers are published; lighthouse endpoints are not published.",
+            ),
+            (true, false) => ConnectivityAvailability::Available(
+                "Lighthouse endpoints are published; mesh DNS resolvers are not published.",
+            ),
+            (true, true) => ConnectivityAvailability::Unavailable(
+                "No DNS resolver or lighthouse endpoint is published.",
+            ),
+        }
     }
 }
 
@@ -287,6 +368,64 @@ impl ConnectivityAvailability {
             Self::Available(detail) | Self::Degraded(detail) | Self::Unavailable(detail) => detail,
         }
     }
+}
+
+/// Provider kinds are accepted only when the snapshot names them explicitly.
+/// In particular, `wlan*`, `en*`, and `wwan*` prefixes are not evidence of a
+/// backend and therefore never select a provider here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectivityProvider {
+    Wifi,
+    Ethernet,
+    Cellular,
+    Mesh,
+    DnsLighthouse,
+}
+
+impl ConnectivityProvider {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Wifi => "Wi-Fi",
+            Self::Ethernet => "Ethernet",
+            Self::Cellular => "Cellular",
+            Self::Mesh => "Mesh overlay",
+            Self::DnsLighthouse => "DNS / lighthouse",
+        }
+    }
+
+    const fn index(self) -> Option<usize> {
+        match self {
+            Self::Wifi => Some(0),
+            Self::Ethernet => Some(1),
+            Self::Cellular => Some(2),
+            Self::Mesh | Self::DnsLighthouse => None,
+        }
+    }
+}
+
+/// The only underlay state admitted into the read model. Raw NetworkManager /
+/// ModemManager payloads, SSIDs, APNs, passwords, and PSKs are intentionally not
+/// represented here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderLinkState {
+    Connected,
+    Degraded,
+    Disconnected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InterfaceProviderFacts {
+    state: ProviderLinkState,
+    interface: Option<String>,
+    cidr: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConnectivityProviderProjection {
+    provider: ConnectivityProvider,
+    availability: ConnectivityAvailability,
+    interface: Option<String>,
+    cidr: Option<String>,
 }
 
 fn first_network_string(network: Option<&Value>, keys: &[&str]) -> Option<String> {
@@ -348,6 +487,168 @@ fn network_fact_list(network: Option<&Value>, keys: &[&str]) -> Vec<String> {
         }
     }
     Vec::new()
+}
+
+/// Read the optional typed underlay observations from `network.interfaces[]`.
+/// Only the provider kind, link state, interface name, and CIDR cross the
+/// snapshot boundary. The array is bounded and duplicate provider entries are
+/// ignored deterministically, so a newer writer cannot create an unbounded UI
+/// surface or smuggle credentials into the read model.
+fn interface_provider_facts(network: Option<&Value>) -> [Option<InterfaceProviderFacts>; 3] {
+    let mut facts = [None, None, None];
+    let Some(interfaces) = network
+        .and_then(|network| network.get("interfaces"))
+        .and_then(Value::as_array)
+    else {
+        return facts;
+    };
+
+    for interface in interfaces.iter().take(MAX_CONNECTIVITY_FACTS) {
+        let Some(provider) = explicit_interface_provider(interface) else {
+            continue;
+        };
+        let Some(index) = provider.index() else {
+            continue;
+        };
+        if facts[index].is_some() {
+            continue;
+        }
+        facts[index] = Some(InterfaceProviderFacts {
+            state: interface_link_state(interface),
+            interface: ["name", "interface", "ifname"]
+                .iter()
+                .find_map(|key| nonempty(interface, key)),
+            cidr: ["cidr", "ip_cidr"]
+                .iter()
+                .find_map(|key| nonempty(interface, key)),
+        });
+    }
+    facts
+}
+
+fn explicit_interface_provider(interface: &Value) -> Option<ConnectivityProvider> {
+    ["provider", "kind", "type", "technology", "transport"]
+        .iter()
+        .filter_map(|key| nonempty(interface, key))
+        .find_map(|value| match value.to_ascii_lowercase().as_str() {
+            "wifi" | "wi-fi" | "wireless" => Some(ConnectivityProvider::Wifi),
+            "ethernet" | "wired" => Some(ConnectivityProvider::Ethernet),
+            "cellular" | "mobile" | "wwan" => Some(ConnectivityProvider::Cellular),
+            _ => None,
+        })
+}
+
+fn interface_link_state(interface: &Value) -> ProviderLinkState {
+    if let Some(connected) = interface.get("connected").and_then(Value::as_bool) {
+        return if connected {
+            ProviderLinkState::Connected
+        } else {
+            ProviderLinkState::Disconnected
+        };
+    }
+    let Some(state) = ["state", "status", "operstate"]
+        .iter()
+        .find_map(|key| nonempty(interface, key))
+    else {
+        return ProviderLinkState::Degraded;
+    };
+    match state.to_ascii_lowercase().as_str() {
+        "connected" | "up" | "online" | "activated" | "ready" => ProviderLinkState::Connected,
+        "disconnected" | "down" | "offline" | "unavailable" | "disabled" => {
+            ProviderLinkState::Disconnected
+        }
+        _ => ProviderLinkState::Degraded,
+    }
+}
+
+fn interface_provider_projection(
+    provider: ConnectivityProvider,
+    facts: Option<&InterfaceProviderFacts>,
+) -> ConnectivityProviderProjection {
+    let (availability, interface, cidr) = match facts {
+        None => (
+            match provider {
+                ConnectivityProvider::Wifi => ConnectivityAvailability::Unavailable(
+                    "No explicit Wi-Fi provider observation is published.",
+                ),
+                ConnectivityProvider::Ethernet => ConnectivityAvailability::Unavailable(
+                    "No explicit Ethernet provider observation is published.",
+                ),
+                ConnectivityProvider::Cellular => ConnectivityAvailability::Unavailable(
+                    "No explicit cellular provider observation is published.",
+                ),
+                ConnectivityProvider::Mesh | ConnectivityProvider::DnsLighthouse => {
+                    ConnectivityAvailability::Unavailable(
+                        "This provider is projected from the mesh-status overlay facts.",
+                    )
+                }
+            },
+            None,
+            None,
+        ),
+        Some(facts) => (
+            match (provider, facts.state) {
+                (ConnectivityProvider::Wifi, ProviderLinkState::Connected) => {
+                    ConnectivityAvailability::Available(
+                        "A typed Wi-Fi observation reports a connected link.",
+                    )
+                }
+                (ConnectivityProvider::Wifi, ProviderLinkState::Degraded) => {
+                    ConnectivityAvailability::Degraded(
+                        "A typed Wi-Fi observation is present, but link state is incomplete or degraded.",
+                    )
+                }
+                (ConnectivityProvider::Wifi, ProviderLinkState::Disconnected) => {
+                    ConnectivityAvailability::Unavailable(
+                        "A typed Wi-Fi observation reports no connected link.",
+                    )
+                }
+                (ConnectivityProvider::Ethernet, ProviderLinkState::Connected) => {
+                    ConnectivityAvailability::Available(
+                        "A typed Ethernet observation reports a connected link.",
+                    )
+                }
+                (ConnectivityProvider::Ethernet, ProviderLinkState::Degraded) => {
+                    ConnectivityAvailability::Degraded(
+                        "A typed Ethernet observation is present, but link state is incomplete or degraded.",
+                    )
+                }
+                (ConnectivityProvider::Ethernet, ProviderLinkState::Disconnected) => {
+                    ConnectivityAvailability::Unavailable(
+                        "A typed Ethernet observation reports no connected link.",
+                    )
+                }
+                (ConnectivityProvider::Cellular, ProviderLinkState::Connected) => {
+                    ConnectivityAvailability::Available(
+                        "A typed cellular observation reports a connected link.",
+                    )
+                }
+                (ConnectivityProvider::Cellular, ProviderLinkState::Degraded) => {
+                    ConnectivityAvailability::Degraded(
+                        "A typed cellular observation is present, but link state is incomplete or degraded.",
+                    )
+                }
+                (ConnectivityProvider::Cellular, ProviderLinkState::Disconnected) => {
+                    ConnectivityAvailability::Unavailable(
+                        "A typed cellular observation reports no connected link.",
+                    )
+                }
+                (ConnectivityProvider::Mesh | ConnectivityProvider::DnsLighthouse, _) => {
+                    ConnectivityAvailability::Degraded(
+                        "This provider is projected from the mesh-status overlay facts.",
+                    )
+                }
+            },
+            facts.interface.clone(),
+            facts.cidr.clone(),
+        ),
+    };
+    ConnectivityProviderProjection {
+        provider,
+        availability,
+        interface,
+        cidr,
+    }
 }
 
 impl NodeStatus {
@@ -412,21 +713,30 @@ impl NodeStatus {
         }
         if self.connectivity.is_empty() {
             return ConnectivityAvailability::Unavailable(
-                "No interface, route, lighthouse, or DNS facts are published by mesh-status.",
+                "No interface, route, provider, lighthouse, or DNS facts are published by mesh-status.",
             );
         }
-        if self.connectivity.interface.is_none()
-            || self.connectivity.cidr.is_none()
-            || self.connectivity.default_route.is_none()
-            || (self.connectivity.lighthouses.is_empty()
-                && self.connectivity.dns_servers.is_empty())
-        {
-            return ConnectivityAvailability::Degraded(
-                "Only partial connectivity facts are published; missing values are not inferred.",
+
+        let providers = self.connectivity.provider_projection();
+        let mesh_ready = matches!(
+            providers[3].availability,
+            ConnectivityAvailability::Available(_)
+        );
+        let underlay_ready = providers[..3].iter().any(|projection| {
+            matches!(
+                projection.availability,
+                ConnectivityAvailability::Available(_)
+            )
+        }) && self.connectivity.default_route.is_some()
+            && (!self.connectivity.lighthouses.is_empty()
+                || !self.connectivity.dns_servers.is_empty());
+        if mesh_ready || underlay_ready {
+            return ConnectivityAvailability::Available(
+                "A typed connectivity provider and mesh reachability or DNS facts are published.",
             );
         }
-        ConnectivityAvailability::Available(
-            "Interface, CIDR, default route, and mesh reachability or DNS facts are published.",
+        ConnectivityAvailability::Degraded(
+            "Only partial connectivity/provider facts are published; missing values are not inferred.",
         )
     }
 
@@ -525,6 +835,38 @@ impl NodeStatus {
                     )
                 }
             }
+            NodeCapability::ConnectivityProviders => {
+                if !self.seen {
+                    CapabilityAvailability::Unavailable(
+                        "Connectivity providers are unavailable until the mesh-status snapshot is read.",
+                    )
+                } else {
+                    let providers = self.connectivity.provider_projection();
+                    if providers.iter().any(|projection| {
+                        matches!(
+                            projection.availability,
+                            ConnectivityAvailability::Available(_)
+                        )
+                    }) {
+                        CapabilityAvailability::Available(
+                            "Typed Wi-Fi, Ethernet, cellular, mesh, and DNS/lighthouse observations are projected read-only.",
+                        )
+                    } else if providers.iter().any(|projection| {
+                        matches!(
+                            projection.availability,
+                            ConnectivityAvailability::Degraded(_)
+                        )
+                    }) {
+                        CapabilityAvailability::Degraded(
+                            "Connectivity providers are partially observed; missing backend facts remain unavailable.",
+                        )
+                    } else {
+                        CapabilityAvailability::Unavailable(
+                            "No typed connectivity provider observation is published by mesh-status.",
+                        )
+                    }
+                }
+            }
             NodeCapability::UpdateStatus => {
                 if !self.seen {
                     CapabilityAvailability::Unavailable(
@@ -585,9 +927,17 @@ impl NodeStatus {
                     )
                 }
             }
-            ThisNodeAction::ChangeConnectivity => CapabilityAvailability::Unavailable(
-                "NetworkManager/ModemManager mutation is not connected to This Node.",
-            ),
+            ThisNodeAction::ChangeConnectivity => {
+                if self.connectivity.has_underlay_observation() {
+                    CapabilityAvailability::Unavailable(
+                        "Connectivity provider state is visible, but no typed NetworkManager/ModemManager mutation provider is connected.",
+                    )
+                } else {
+                    CapabilityAvailability::Unavailable(
+                        "NetworkManager/ModemManager observation and mutation providers are not connected to This Node.",
+                    )
+                }
+            }
             ThisNodeAction::ChangePowerProfile => CapabilityAvailability::Unavailable(
                 "Power-profile mutation is not connected to a typed local provider.",
             ),
@@ -607,6 +957,7 @@ enum NodeCapability {
     NodeIdentity,
     ServiceHealth,
     MeshContext,
+    ConnectivityProviders,
     UpdateStatus,
     LocalTelemetry,
     MutationProviders,
@@ -619,6 +970,7 @@ impl NodeCapability {
             Self::NodeIdentity => "Node identity",
             Self::ServiceHealth => "Service health",
             Self::MeshContext => "Mesh context",
+            Self::ConnectivityProviders => "Connectivity providers",
             Self::UpdateStatus => "Version posture",
             Self::LocalTelemetry => "Node telemetry",
             Self::MutationProviders => "Mutation providers",
@@ -631,6 +983,9 @@ impl NodeCapability {
             Self::NodeIdentity => "Hostname, role, overlay, and presence",
             Self::ServiceHealth => "Published daemon health rows",
             Self::MeshContext => "Peer count and elected leader",
+            Self::ConnectivityProviders => {
+                "Wi-Fi, Ethernet, cellular, mesh, and DNS/lighthouse state"
+            }
             Self::UpdateStatus => "Installed version and update target",
             Self::LocalTelemetry => "CPU, memory, and disk readings",
             Self::MutationProviders => "Typed local control backends",
@@ -638,11 +993,12 @@ impl NodeCapability {
     }
 }
 
-const CAPABILITY_CATALOG: [NodeCapability; 7] = [
+const CAPABILITY_CATALOG: [NodeCapability; 8] = [
     NodeCapability::MeshSnapshot,
     NodeCapability::NodeIdentity,
     NodeCapability::ServiceHealth,
     NodeCapability::MeshContext,
+    NodeCapability::ConnectivityProviders,
     NodeCapability::UpdateStatus,
     NodeCapability::LocalTelemetry,
     NodeCapability::MutationProviders,
@@ -945,6 +1301,19 @@ fn show_connectivity(ui: &mut egui::Ui, status: &NodeStatus) {
     connectivity_field(ui, "Lighthouses", lighthouses.as_deref());
     let dns_servers = (!facts.dns_servers.is_empty()).then(|| facts.dns_servers.join(", "));
     connectivity_field(ui, "DNS", dns_servers.as_deref());
+
+    ui.add_space(Style::SP_XS);
+    ui.label(
+        RichText::new("Provider state")
+            .color(Style::TEXT_DIM)
+            .size(Style::SMALL),
+    );
+    ui.group(|ui| {
+        for projection in facts.provider_projection() {
+            show_connectivity_provider_row(ui, projection);
+        }
+    });
+
     ui.add(
         egui::Label::new(
             RichText::new("Read-only: no connectivity mutation provider is connected.")
@@ -953,6 +1322,43 @@ fn show_connectivity(ui: &mut egui::Ui, status: &NodeStatus) {
         )
         .wrap(),
     );
+}
+
+fn show_connectivity_provider_row(ui: &mut egui::Ui, projection: ConnectivityProviderProjection) {
+    let availability = projection.availability;
+    ui.horizontal_wrapped(|ui| {
+        ui.label(
+            RichText::new(DOT)
+                .color(availability.tone())
+                .size(Style::SMALL),
+        );
+        ui.add_space(Style::SP_XS);
+        ui.label(
+            RichText::new(projection.provider.label())
+                .color(Style::TEXT)
+                .size(Style::SMALL)
+                .strong(),
+        );
+        ui.add_space(Style::SP_S);
+        ui.colored_label(
+            availability.tone(),
+            RichText::new(availability.word()).size(Style::SMALL),
+        );
+    });
+    ui.add(
+        egui::Label::new(
+            RichText::new(availability.detail())
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+        )
+        .wrap(),
+    );
+    if let Some(interface) = projection.interface.as_deref() {
+        connectivity_field(ui, "Interface", Some(interface));
+    }
+    if let Some(cidr) = projection.cidr.as_deref() {
+        connectivity_field(ui, "CIDR", Some(cidr));
+    }
 }
 
 fn connectivity_field(ui: &mut egui::Ui, label: &str, value: Option<&str>) {
@@ -1366,7 +1772,109 @@ mod tests {
             s.connectivity_availability(),
             ConnectivityAvailability::Available(_)
         ));
+        let providers = s.connectivity.provider_projection();
+        assert!(matches!(
+            providers
+                .iter()
+                .find(|projection| projection.provider == ConnectivityProvider::Mesh)
+                .expect("mesh provider")
+                .availability,
+            ConnectivityAvailability::Available(_)
+        ));
+        assert!(matches!(
+            providers
+                .iter()
+                .find(|projection| projection.provider == ConnectivityProvider::DnsLighthouse)
+                .expect("DNS/lighthouse provider")
+                .availability,
+            ConnectivityAvailability::Available(_)
+        ));
+        assert!(matches!(
+            providers
+                .iter()
+                .find(|projection| projection.provider == ConnectivityProvider::Wifi)
+                .expect("Wi-Fi provider")
+                .availability,
+            ConnectivityAvailability::Unavailable(_)
+        ));
+        assert!(matches!(
+            s.capability_projection()
+                .iter()
+                .find(|projection| {
+                    projection.capability == NodeCapability::ConnectivityProviders
+                })
+                .expect("connectivity provider capability")
+                .availability,
+            CapabilityAvailability::Available(_)
+        ));
         assert!(renders(&s), "published connectivity facts must render");
+    }
+
+    #[test]
+    fn explicit_underlay_provider_states_are_typed_and_credentials_are_not_projected() {
+        let s = NodeStatus::project(
+            &connectivity_snapshot(
+                r#"{
+                    "interfaces":[
+                      {"kind":"wifi","name":"wlan0","state":"connected",
+                       "cidr":"192.0.2.20/24","ssid":"private-network","psk":"do-not-store"},
+                      {"type":"ethernet","ifname":"enp1s0","state":"down"},
+                      {"provider":"cellular","interface":"wwan0","status":"connecting",
+                       "apn":"private-apn","password":"do-not-store"}
+                    ]
+                }"#,
+            ),
+            "fallback",
+        );
+        let providers = s.connectivity.provider_projection();
+
+        let wifi = providers
+            .iter()
+            .find(|projection| projection.provider == ConnectivityProvider::Wifi)
+            .expect("Wi-Fi provider");
+        assert!(matches!(
+            wifi.availability,
+            ConnectivityAvailability::Available(_)
+        ));
+        assert_eq!(wifi.interface.as_deref(), Some("wlan0"));
+        assert_eq!(wifi.cidr.as_deref(), Some("192.0.2.20/24"));
+
+        let ethernet = providers
+            .iter()
+            .find(|projection| projection.provider == ConnectivityProvider::Ethernet)
+            .expect("Ethernet provider");
+        assert!(matches!(
+            ethernet.availability,
+            ConnectivityAvailability::Unavailable(_)
+        ));
+        assert_eq!(ethernet.interface.as_deref(), Some("enp1s0"));
+
+        let cellular = providers
+            .iter()
+            .find(|projection| projection.provider == ConnectivityProvider::Cellular)
+            .expect("cellular provider");
+        assert!(matches!(
+            cellular.availability,
+            ConnectivityAvailability::Degraded(_)
+        ));
+        assert_eq!(cellular.interface.as_deref(), Some("wwan0"));
+
+        assert!(matches!(
+            s.connectivity_availability(),
+            ConnectivityAvailability::Degraded(_)
+        ));
+        let change = s
+            .action_projection()
+            .into_iter()
+            .find(|projection| projection.action == ThisNodeAction::ChangeConnectivity)
+            .expect("connectivity action");
+        assert!(change.availability.detail().contains("provider state"));
+
+        let debug = format!("{s:?}");
+        assert!(!debug.contains("private-network"));
+        assert!(!debug.contains("do-not-store"));
+        assert!(!debug.contains("private-apn"));
+        assert!(renders(&s), "typed underlay provider rows must render");
     }
 
     #[test]
