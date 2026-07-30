@@ -1129,7 +1129,23 @@ fn show_route_preview(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
         option_states.push((resp.hovered(), resp.is_pointer_button_down_on()));
     }
 
-    let can_start = state.can_start_navigation();
+    let has_fix = state
+        .locations
+        .primary_sample()
+        .is_some_and(LocationSample::has_fix);
+    let offline_status = state.offline_navigation_status();
+    let route_selected = state
+        .local_navigation
+        .route_options
+        .get(state.local_navigation.selected_route)
+        .is_some();
+    let has_destination = state.local_navigation.active_destination().is_some();
+    let start_readiness =
+        route_preview_start_readiness(route_selected, has_destination, has_fix, &offline_status);
+    // Keep the model predicate as the final authority. The view adds the
+    // explicit GPS-fix guard so a connected-but-acquiring source cannot make
+    // the Start affordance look actionable.
+    let can_start = start_readiness.can_start && state.can_start_navigation();
     let start_resp = ui.interact(
         layout.start,
         egui::Id::new("maps-preview-start"),
@@ -1139,6 +1155,7 @@ fn show_route_preview(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
             Sense::hover()
         },
     );
+    let start_resp = start_resp.on_hover_text(start_readiness.tooltip.clone());
     if can_start && start_resp.clicked() {
         state.start_navigation();
     }
@@ -1147,7 +1164,6 @@ fn show_route_preview(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
 
     // --- Paint. -------------------------------------------------------------
     let primary = state.locations.primary_sample();
-    let has_fix = primary.is_some_and(LocationSample::has_fix);
     let painter = ui.painter_at(rect);
 
     // Overview map showing the whole route (does not touch persistent view state).
@@ -1239,7 +1255,72 @@ fn show_route_preview(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
         start_pressed,
         has_fix,
         can_start,
+        start_readiness.button_label,
     );
+}
+
+/// Render-agnostic explanation for why route-preview Start is or is not
+/// actionable. This deliberately consumes the existing route/readiness model
+/// rather than inventing a route or relaxing the navigation guards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RoutePreviewStartReadiness {
+    can_start: bool,
+    button_label: &'static str,
+    tooltip: String,
+}
+
+fn route_preview_start_readiness(
+    route_selected: bool,
+    has_destination: bool,
+    has_gps_fix: bool,
+    offline: &OfflineNavigationStatus,
+) -> RoutePreviewStartReadiness {
+    let mut reasons = Vec::new();
+    if !route_selected {
+        reasons.push("No route is available to start.".to_string());
+    }
+    if !has_destination {
+        reasons.push("No destination is selected.".to_string());
+    }
+    if !has_gps_fix {
+        reasons.push(format!(
+            "{} has no GPS fix.",
+            offline.primary_source.label()
+        ));
+    }
+    if offline.readiness == OfflineNavigationReadiness::Blocked {
+        if offline.blockers.is_empty() {
+            reasons.push("Offline navigation readiness is blocked.".to_string());
+        } else {
+            reasons.extend(offline.blockers.iter().cloned());
+        }
+    }
+
+    let can_start = reasons.is_empty() && offline.can_claim_turn_by_turn();
+    let button_label = if can_start {
+        "Start"
+    } else if !route_selected {
+        "No route available"
+    } else if !has_destination {
+        "Choose a destination"
+    } else if !has_gps_fix {
+        "Waiting for GPS"
+    } else if offline.readiness == OfflineNavigationReadiness::Blocked {
+        "Navigation blocked"
+    } else {
+        "Start unavailable"
+    };
+    let tooltip = if can_start {
+        "Start turn-by-turn guidance on the selected route.".to_string()
+    } else {
+        format!("Start unavailable: {}", reasons.join(" "))
+    };
+
+    RoutePreviewStartReadiness {
+        can_start,
+        button_label,
+        tooltip,
+    }
 }
 
 /// A circular chrome button (back / close), matching the FAB elevation language.
@@ -1449,6 +1530,7 @@ fn paint_start_button(
     pressed: bool,
     has_fix: bool,
     enabled: bool,
+    label: &str,
 ) {
     paint_soft_shadow(painter, rect, HUD_RADIUS_S);
     let base = if !enabled {
@@ -1484,12 +1566,9 @@ fn paint_start_button(
         StrokeKind::Inside,
     );
 
-    // Nav-arrow glyph + "Start", centered as a group.
-    let label = if enabled {
-        "Start"
-    } else {
-        "Routing unavailable"
-    };
+    // Nav-arrow glyph + the truthful action/readiness label, centered as a
+    // group. Disabled labels are intentionally specific; the full blocker
+    // explanation is attached to the interaction as a tooltip by the caller.
     let g = painter.layout_no_wrap(
         label.to_string(),
         Style::typography_font(TypographyRole::Headline),
@@ -7004,13 +7083,76 @@ mod tests {
         let texts = painted_texts(&mut preview);
 
         assert!(
-            texts.iter().any(|text| text == "Routing unavailable"),
+            texts.iter().any(|text| text == "No route available"),
             "the route preview must disclose why Start cannot run: {texts:?}"
         );
         assert!(
             !preview.can_start_navigation(),
             "the rendered disabled action must share the model predicate"
         );
+    }
+
+    #[test]
+    fn route_preview_start_readiness_distinguishes_route_blocker_and_gps() {
+        let fixture = MapsLocationSurface::simulated();
+        let ready_status = fixture.offline_navigation_status();
+        let missing_route = route_preview_start_readiness(false, true, true, &ready_status);
+        assert_eq!(missing_route.button_label, "No route available");
+        assert!(!missing_route.can_start);
+        assert!(missing_route.tooltip.contains("No route is available"));
+
+        let mut blocked_fixture = MapsLocationSurface::simulated();
+        blocked_fixture
+            .local_navigation
+            .routing
+            .graceful_unavailable = true;
+        let blocked_status = blocked_fixture.offline_navigation_status();
+        let blocked = route_preview_start_readiness(true, true, true, &blocked_status);
+        assert_eq!(blocked.button_label, "Navigation blocked");
+        assert!(!blocked.can_start);
+        assert!(blocked.tooltip.contains("Routing API is not ready"));
+
+        let no_gps = route_preview_start_readiness(false, true, false, &ready_status);
+        assert_eq!(no_gps.button_label, "No route available");
+        assert!(!no_gps.can_start);
+        assert!(no_gps.tooltip.contains("MG90 GNSS has no GPS fix"));
+
+        let no_gps_with_route = route_preview_start_readiness(true, true, false, &ready_status);
+        assert_eq!(no_gps_with_route.button_label, "Waiting for GPS");
+        assert!(!no_gps_with_route.can_start);
+        assert!(no_gps_with_route
+            .tooltip
+            .contains("MG90 GNSS has no GPS fix"));
+    }
+
+    #[test]
+    fn route_preview_render_labels_blocked_readiness_and_missing_gps() {
+        let mut blocked = MapsLocationSurface::simulated();
+        blocked.active = WorkspaceTab::Drive;
+        blocked.route_preview = true;
+        blocked.local_navigation.routing.graceful_unavailable = true;
+        let primary_kind = blocked.locations.primary;
+        if let Some(source) = blocked
+            .locations
+            .sources
+            .iter_mut()
+            .find(|source| source.kind == primary_kind)
+        {
+            source.sample.fix_type = "3D".to_string();
+            source.sample.latitude = 40.4406;
+            source.sample.longitude = -79.9959;
+        }
+        let blocked_texts = painted_texts(&mut blocked);
+        assert!(blocked_texts
+            .iter()
+            .any(|text| text == "Navigation blocked"));
+
+        let mut no_gps = MapsLocationSurface::simulated();
+        no_gps.active = WorkspaceTab::Drive;
+        no_gps.route_preview = true;
+        let no_gps_texts = painted_texts(&mut no_gps);
+        assert!(no_gps_texts.iter().any(|text| text == "Waiting for GPS"));
+        assert!(!no_gps_texts.iter().any(|text| text == "Navigation blocked"));
     }
 
     #[test]
