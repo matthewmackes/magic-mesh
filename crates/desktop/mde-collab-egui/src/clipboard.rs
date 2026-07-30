@@ -69,12 +69,13 @@ impl CommunicationsSurface {
         match data.clipboard_lane(space) {
             Some(lane) if !lane.items.is_empty() => {
                 let now = data.now_unix_ms();
+                let local_source = data.me().as_str();
                 egui::ScrollArea::vertical()
                     .id_salt("collab-clipboard")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         for item in &lane.items {
-                            self.clip_row(ui, sink, space, item, now);
+                            self.clip_row(ui, sink, space, item, now, local_source);
                             ui.add_space(Style::SP_XS);
                         }
                     });
@@ -147,7 +148,9 @@ impl CommunicationsSurface {
         space: SpaceId,
         item: &ClipboardView,
         now_unix_ms: i64,
+        local_source: &str,
     ) {
+        let origin = clipboard_origin(&item.source, local_source);
         mde_egui::card().show(ui, |ui| {
             ui.horizontal(|ui| {
                 icons::icon(
@@ -157,13 +160,18 @@ impl CommunicationsSurface {
                     Style::ACCENT,
                 );
                 ui.label(egui::RichText::new(clip_preview(&item.preview)).color(Style::TEXT));
+                ui.label(
+                    egui::RichText::new(origin.label(&item.source))
+                        .small()
+                        .color(origin.color()),
+                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if icons::icon_button(
                         ui,
                         icons::CLIP_DELETE,
                         Style::SP_M,
                         Style::DANGER,
-                        "Delete clip",
+                        &origin.action_hint("Delete clip"),
                     )
                     .clicked()
                     {
@@ -174,7 +182,7 @@ impl CommunicationsSurface {
                         icons::CLIP_ATTACH,
                         Style::SP_M,
                         Style::TEXT_DIM,
-                        "Attach to a message in this space",
+                        &origin.action_hint("Attach to a message in this space"),
                     )
                     .clicked()
                     {
@@ -182,11 +190,11 @@ impl CommunicationsSurface {
                     }
                     // Pin toggle — a pinned clip survives the cap + clear.
                     let (tint, hint) = if item.pinned {
-                        (Style::WARN, "Unpin")
+                        (Style::WARN, origin.action_hint("Unpin"))
                     } else {
-                        (Style::TEXT_DIM, "Pin")
+                        (Style::TEXT_DIM, origin.action_hint("Pin"))
                     };
-                    if icons::icon_button(ui, icons::CLIP_PIN, Style::SP_M, tint, hint).clicked() {
+                    if icons::icon_button(ui, icons::CLIP_PIN, Style::SP_M, tint, &hint).clicked() {
                         self.toggle_clip_pin(sink, space, item.event_id, item.pinned);
                     }
                 });
@@ -273,6 +281,60 @@ const fn clip_fits_lane(len: usize) -> bool {
     len <= MAX_CLIP_BYTES
 }
 
+/// The provenance visible at the UI boundary. An empty source is retained as
+/// an explicit unknown rather than being guessed as local or remote; older
+/// projections can therefore stay visible without fabricating attribution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipboardOrigin {
+    Local,
+    Remote,
+    Unattributed,
+}
+
+impl ClipboardOrigin {
+    /// Renderable provenance label, including the source when the projection
+    /// supplied one. This is intentionally text, not colour-only state.
+    fn label(self, source: &str) -> String {
+        match self {
+            Self::Local => format!("Local · {source}"),
+            Self::Remote => format!("Remote · {source}"),
+            Self::Unattributed => "Source unavailable".to_owned(),
+        }
+    }
+
+    /// Quazar token for the provenance label.
+    const fn color(self) -> egui::Color32 {
+        match self {
+            Self::Local => Style::ACCENT,
+            Self::Remote => Style::TEXT_DIM,
+            Self::Unattributed => Style::DISABLED,
+        }
+    }
+
+    /// Add provenance to command hints so keyboard/accessibility users can
+    /// distinguish local and remote actions without changing command semantics.
+    fn action_hint(self, action: &str) -> String {
+        match self {
+            Self::Local => format!("{action} local clipboard clip"),
+            Self::Remote => format!("{action} remote clipboard clip"),
+            Self::Unattributed => format!("{action} clipboard clip with unavailable source"),
+        }
+    }
+}
+
+/// Compare the projected source with the local actor identity. Remote rows are
+/// never filtered here: visibility is a read-side property of the lane, while
+/// this helper only makes attribution explicit in the presentation.
+fn clipboard_origin(source: &str, local_source: &str) -> ClipboardOrigin {
+    if source.is_empty() {
+        ClipboardOrigin::Unattributed
+    } else if source == local_source {
+        ClipboardOrigin::Local
+    } else {
+        ClipboardOrigin::Remote
+    }
+}
+
 /// Classify a clip's content: an `http(s)://` head is a shared URI, everything
 /// else is text (an honest, conservative guess — never a faked MIME).
 fn detect_kind(text: &str) -> ClipItemKind {
@@ -298,7 +360,10 @@ fn clip_preview(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{clip_fits_lane, clip_preview, MAX_CLIP_BYTES, PREVIEW_MAX};
+    use super::{
+        clip_fits_lane, clip_preview, clipboard_origin, ClipboardOrigin, MAX_CLIP_BYTES,
+        PREVIEW_MAX,
+    };
     use crate::{CommandSink, CommunicationsSurface};
     use mde_collab_types::SpaceId;
 
@@ -328,5 +393,29 @@ mod tests {
 
         let long = "a".repeat(PREVIEW_MAX + 1);
         assert_eq!(clip_preview(&long), format!("{}…", "a".repeat(PREVIEW_MAX)));
+    }
+
+    #[test]
+    fn clipboard_origin_keeps_local_remote_and_unknown_attribution_explicit() {
+        assert_eq!(clipboard_origin("eagle", "eagle"), ClipboardOrigin::Local);
+        assert_eq!(clipboard_origin("falcon", "eagle"), ClipboardOrigin::Remote);
+        assert_eq!(
+            clipboard_origin("", "eagle"),
+            ClipboardOrigin::Unattributed,
+            "missing source must not be guessed as local or remote"
+        );
+    }
+
+    #[test]
+    fn clipboard_origin_labels_and_action_hints_are_textual() {
+        assert_eq!(ClipboardOrigin::Local.label("eagle"), "Local · eagle");
+        assert_eq!(
+            ClipboardOrigin::Remote.action_hint("Attach to a message"),
+            "Attach to a message remote clipboard clip"
+        );
+        assert_eq!(
+            ClipboardOrigin::Unattributed.label(""),
+            "Source unavailable"
+        );
     }
 }
