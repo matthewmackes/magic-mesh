@@ -324,6 +324,65 @@ mod tests {
             .contains("inconsistent peer count"));
         assert!(summary.reason.contains("connectivity is unknown"));
     }
+
+    #[test]
+    fn remote_proofing_states_name_the_provider_and_capability() {
+        let disabled = RemoteProofingConfig::default().service_plan(&MeshFacts::default());
+        assert_eq!(
+            proofing_service_value(disabled.enabled),
+            "disabled — Sunshine/Moonlight provider policy off"
+        );
+        assert_eq!(
+            proofing_bind_scope_value(&disabled),
+            "unavailable — Sunshine/Moonlight provider is disabled"
+        );
+        assert_eq!(
+            proofing_bind_address_value(&disabled),
+            "unavailable — Sunshine/Moonlight provider is disabled"
+        );
+        assert_eq!(
+            proofing_vnc_value(false),
+            "disabled — VNC rescue/admin provider not selected"
+        );
+        assert_eq!(
+            proofing_remote_input_value(false),
+            "blocked — remote keyboard/mouse capability disabled"
+        );
+        assert_eq!(
+            proofing_indicator_value(false),
+            "off — remote shadowing indicator capability disabled"
+        );
+    }
+
+    #[test]
+    fn remote_proofing_missing_mesh_address_is_not_rendered_as_resolved() {
+        let plan = RemoteProofingConfig {
+            enabled: true,
+            exposure: RemoteProofingExposure::MeshOnly,
+            ..RemoteProofingConfig::default()
+        }
+        .service_plan(&MeshFacts {
+            seen: true,
+            ..MeshFacts::default()
+        });
+
+        assert_eq!(
+            proofing_bind_scope_value(&plan),
+            "Mesh overlay — encrypted mesh capability"
+        );
+        assert_eq!(
+            proofing_bind_address_value(&plan),
+            "unavailable — mesh overlay address is not published"
+        );
+        assert_eq!(
+            proofing_capture_value(plan.sunshine_capture),
+            "DRM/KMS — Sunshine capture capability"
+        );
+        assert_eq!(
+            proofing_encoder_value(plan.sunshine_encoder),
+            "Auto — Sunshine encoder provider selects at runtime"
+        );
+    }
 }
 
 /// The Pairing section (SETTINGS-4) — folds in the pairing responder the surface
@@ -490,6 +549,95 @@ fn proofing_choice_tile(ui: &mut egui::Ui, selected: bool, label: &str, descript
     )
 }
 
+fn proofing_service_value(enabled: bool) -> &'static str {
+    if enabled {
+        "enabled — Sunshine/Moonlight provider policy active"
+    } else {
+        "disabled — Sunshine/Moonlight provider policy off"
+    }
+}
+
+fn proofing_bind_scope_value(plan: &RemoteProofingServicePlan) -> String {
+    match plan.bind_scope {
+        RemoteProofingBindScope::Disabled => {
+            format!(
+                "unavailable — Sunshine/Moonlight provider is {}",
+                plan.bind_scope.label().to_lowercase()
+            )
+        }
+        RemoteProofingBindScope::MeshOnly => {
+            format!("{} — encrypted mesh capability", plan.bind_scope.label())
+        }
+        RemoteProofingBindScope::Lan => {
+            format!("{} — local network capability", plan.bind_scope.label())
+        }
+        RemoteProofingBindScope::Public => {
+            format!("{} — public bind capability", plan.bind_scope.label())
+        }
+    }
+}
+
+fn proofing_bind_address_value(plan: &RemoteProofingServicePlan) -> String {
+    match plan.bind_address.as_deref() {
+        Some(address) => address.to_owned(),
+        None if matches!(plan.bind_scope, RemoteProofingBindScope::Disabled) => {
+            "unavailable — Sunshine/Moonlight provider is disabled".to_owned()
+        }
+        None if matches!(plan.bind_scope, RemoteProofingBindScope::MeshOnly) => {
+            "unavailable — mesh overlay address is not published".to_owned()
+        }
+        None if matches!(plan.bind_scope, RemoteProofingBindScope::Lan) => {
+            "unavailable — trusted LAN interface is not published".to_owned()
+        }
+        None => "unavailable — provider did not publish a bind address".to_owned(),
+    }
+}
+
+fn proofing_capture_value(value: &str) -> &'static str {
+    match value {
+        "auto" => "Auto — Sunshine capture provider selects at runtime",
+        "kms" => "DRM/KMS — Sunshine capture capability",
+        "wlr" => "Wayland DMA-BUF — Sunshine capture capability",
+        "x11" => "X11 fallback — Sunshine capture capability",
+        _ => "unknown — Sunshine capture capability is not recognized",
+    }
+}
+
+fn proofing_encoder_value(value: &str) -> &'static str {
+    match value {
+        "auto" => "Auto — Sunshine encoder provider selects at runtime",
+        "vaapi" => "Intel VAAPI — Sunshine encoder capability",
+        "nvenc" => "NVIDIA NVENC — Sunshine encoder capability",
+        "amdvce" => "AMD VCE — Sunshine encoder capability",
+        "software" => "Software — Sunshine CPU encoder capability",
+        _ => "unknown — Sunshine encoder capability is not recognized",
+    }
+}
+
+fn proofing_vnc_value(available: bool) -> &'static str {
+    if available {
+        "available — VNC rescue/admin provider"
+    } else {
+        "disabled — VNC rescue/admin provider not selected"
+    }
+}
+
+fn proofing_remote_input_value(allowed: bool) -> &'static str {
+    if allowed {
+        "authorized after approval — remote keyboard/mouse capability"
+    } else {
+        "blocked — remote keyboard/mouse capability disabled"
+    }
+}
+
+fn proofing_indicator_value(visible: bool) -> &'static str {
+    if visible {
+        "visible — remote shadowing indicator capability"
+    } else {
+        "off — remote shadowing indicator capability disabled"
+    }
+}
+
 /// Mesh & System → Remote Proofing — the single Settings workspace for
 /// Sunshine/Moonlight console shadowing and VNC fallback. It intentionally keeps the
 /// whole operator policy together: service enablement, exposure, capture, encoder,
@@ -527,9 +675,9 @@ pub(super) fn remote_proofing_section(
             ui,
             "Fallback",
             if config.vnc_fallback {
-                "VNC admin channel retained"
+                "available — VNC rescue/admin provider"
             } else {
-                "VNC fallback disabled"
+                "disabled — VNC rescue/admin provider not selected"
             },
             Style::TEXT_DIM,
         );
@@ -655,9 +803,21 @@ pub(super) fn remote_proofing_section(
             !public_exposure,
             egui::Checkbox::new(
                 &mut approval,
-                RichText::new("Require local approval").size(Style::SMALL),
+                RichText::new(if public_exposure {
+                    "Require local approval (forced on — all-interfaces Sunshine exposure)"
+                } else {
+                    "Require local approval"
+                })
+                .size(Style::SMALL),
             ),
         );
+        let approval_response = if public_exposure {
+            approval_response.on_hover_text(
+                "This toggle is unavailable independently: the Sunshine provider is bound to all interfaces, so local approval is forced on.",
+            )
+        } else {
+            approval_response
+        };
         if approval_response.changed() {
             config.require_local_approval = approval;
         }
@@ -671,9 +831,21 @@ pub(super) fn remote_proofing_section(
             !public_exposure,
             egui::Checkbox::new(
                 &mut indicator,
-                RichText::new("Show on-seat shadowing indicator").size(Style::SMALL),
+                RichText::new(if public_exposure {
+                    "Show on-seat shadowing indicator (forced on — public Sunshine exposure)"
+                } else {
+                    "Show on-seat shadowing indicator"
+                })
+                .size(Style::SMALL),
             ),
         );
+        let indicator_response = if public_exposure {
+            indicator_response.on_hover_text(
+                "This toggle is unavailable independently: public Sunshine proofing forces the on-seat shadowing indicator visible.",
+            )
+        } else {
+            indicator_response
+        };
         if indicator_response.changed() {
             config.show_shadowing_indicator = indicator;
         }
@@ -723,20 +895,20 @@ pub(super) fn remote_proofing_section(
         field(
             ui,
             "Service",
-            if plan.enabled { "enabled" } else { "disabled" },
+            proofing_service_value(plan.enabled),
             if plan.enabled {
                 Style::OK
             } else {
                 Style::TEXT_DIM
             },
         );
-        field(ui, "Bind scope", plan.bind_scope.label(), Style::TEXT);
+        let bind_scope = proofing_bind_scope_value(&plan);
+        field(ui, "Bind scope", &bind_scope, Style::TEXT);
+        let bind_address = proofing_bind_address_value(&plan);
         field(
             ui,
             "Bind address",
-            plan.bind_address
-                .as_deref()
-                .unwrap_or("resolved by service"),
+            &bind_address,
             if plan.bind_address.is_some() {
                 Style::TEXT
             } else {
@@ -744,8 +916,18 @@ pub(super) fn remote_proofing_section(
             },
         );
         field(ui, "Firewall", plan.firewall.label(), Style::TEXT);
-        field(ui, "Capture", plan.sunshine_capture, Style::TEXT);
-        field(ui, "Encoder", plan.sunshine_encoder, Style::TEXT);
+        field(
+            ui,
+            "Capture",
+            proofing_capture_value(plan.sunshine_capture),
+            Style::TEXT,
+        );
+        field(
+            ui,
+            "Encoder",
+            proofing_encoder_value(plan.sunshine_encoder),
+            Style::TEXT,
+        );
         field(
             ui,
             "Frame target",
@@ -779,21 +961,13 @@ pub(super) fn remote_proofing_section(
         field(
             ui,
             "Remote input",
-            if plan.allow_remote_input {
-                "authorized after approval"
-            } else {
-                "view only"
-            },
+            proofing_remote_input_value(plan.allow_remote_input),
             Style::TEXT,
         );
         field(
             ui,
             "On-seat indicator",
-            if plan.show_shadowing_indicator {
-                "visible"
-            } else {
-                "off"
-            },
+            proofing_indicator_value(plan.show_shadowing_indicator),
             if plan.show_shadowing_indicator {
                 Style::OK
             } else {
@@ -803,11 +977,7 @@ pub(super) fn remote_proofing_section(
         field(
             ui,
             "VNC fallback",
-            if plan.vnc_fallback {
-                "available"
-            } else {
-                "disabled"
-            },
+            proofing_vnc_value(plan.vnc_fallback),
             Style::TEXT_DIM,
         );
         for warning in &plan.warnings {
