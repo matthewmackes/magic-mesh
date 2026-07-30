@@ -500,8 +500,8 @@ remains here under a completed status.
   partial foundations, but the direct DRM seat path and complete bidirectional
   protocol integration are not production-complete. DRM/VNC clipboard state
   handling, a bounded UTF-8-safe local text provider, explicit RDP/SPICE
-  capability reporting, and the DRM CopyText-clear/native-paste round-trip now
-  have focused farm coverage (15 tests). KDC/mobile ingress now
+  capability reporting, CopyText-clear/native-paste round-trip, and rejection
+  of no-op provider writes now have focused farm coverage. KDC/mobile ingress now
   has typed authorization, UTF-8/1 MiB bounds, peer-scoped deduplication, and
   honest metadata with 22 focused farm tests; real mesh history/materialization
   and RDP/SPICE text channels remain unsupported.
@@ -888,8 +888,8 @@ remains here under a completed status.
   hardware aliases, legacy normalization, and unavailable provider states.
   Its mesh-status model projects bounded typed capability/action rows with
   fail-closed mutations plus truthful interface/CIDR/route/lighthouse/DNS
-  connectivity facts; focused This Node tests pass, including narrow and
-  large-text reflow coverage (16 focused tests).
+  connectivity facts; focused This Node tests pass, including narrow,
+  large-text reflow, and disabled-action accessibility coverage (18 tests).
 - Remaining work:
 
   1. Finish the durable This Node sidebar and search index across every
