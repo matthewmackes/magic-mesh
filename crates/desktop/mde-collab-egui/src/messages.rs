@@ -115,7 +115,7 @@ impl CommunicationsSurface {
                     .show(ui, |ui| {
                         for (i, task) in tasks.tasks.iter().enumerate() {
                             crate::anim::entrance(ui, "task", task.task, i, |ui| {
-                                self.task_row(ui, sink, task, data.now_unix_ms());
+                                self.task_row(ui, data, sink, task, data.now_unix_ms());
                             });
                             ui.add_space(Style::SP_XS);
                         }
@@ -133,6 +133,13 @@ impl CommunicationsSurface {
         let mut buf = self.task_drafts.get(&space).cloned().unwrap_or_default();
         let mut input_was_capped = cap_task_title_input(&mut buf);
         let mut create = false;
+        if self.task_sources.contains_key(&space) {
+            ui.label(
+                egui::RichText::new("Sourced from a post")
+                    .small()
+                    .color(Style::ACCENT),
+            );
+        }
         ui.horizontal(|ui| {
             let response = ui.add(
                 egui::TextEdit::singleline(&mut buf)
@@ -166,8 +173,9 @@ impl CommunicationsSurface {
     }
 
     fn task_row(
-        &self,
+        &mut self,
         ui: &mut egui::Ui,
+        data: &dyn crate::CollabData,
         sink: &mut crate::CommandSink,
         task: &TaskView,
         now_unix_ms: i64,
@@ -239,11 +247,26 @@ impl CommunicationsSurface {
                     .color(Style::TEXT_DIM),
                 );
                 if let Some(source) = task.source {
-                    ui.label(
-                        egui::RichText::new(format!("source {source}"))
-                            .small()
-                            .color(Style::TEXT_DIM),
-                    );
+                    let source_present = data.conversation(task.space).is_some_and(|timeline| {
+                        timeline
+                            .messages
+                            .iter()
+                            .any(|message| message.event_id == source)
+                    });
+                    if source_present {
+                        if ui
+                            .small_button("Open post")
+                            .on_hover_text("Open the projected source post")
+                            .clicked()
+                        {
+                            self.focus_task_source(task.space, source);
+                        }
+                    } else {
+                        ui.add_enabled(false, egui::Button::new("Post unavailable"))
+                            .on_hover_text(
+                                "The source post is outside the current retained projection.",
+                            );
+                    }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if task.completed {
@@ -306,12 +329,33 @@ impl CommunicationsSurface {
         if title.is_empty() || title.len() > MAX_TASK_TITLE_BYTES {
             return;
         }
+        let source = self.task_sources.get(&space).copied();
         sink.emit(CollabCommand::CreateTask {
             space,
             title,
-            source: None,
+            source,
         });
         self.task_drafts.insert(space, String::new());
+        self.task_sources.remove(&space);
+    }
+
+    /// Seed a bounded task title from a post without rewriting the canonical
+    /// Markdown body. The first non-empty line is the operator-visible title;
+    /// the command still carries the post event as its authoritative source.
+    pub(crate) fn task_title_from_message(body: &str) -> Option<String> {
+        let line = body
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())?
+            .trim_start_matches('#')
+            .trim_start_matches(['-', '*'])
+            .trim();
+        if line.is_empty() {
+            return None;
+        }
+        let mut title = line.to_owned();
+        cap_task_title_input(&mut title);
+        (!title.is_empty()).then_some(title)
     }
 
     /// Emit the explicit checked-state command the caller routes to the worker.
@@ -398,7 +442,17 @@ impl CommunicationsSurface {
                     // already on screen is settled at full opacity.
                     for (i, msg) in messages.iter().enumerate() {
                         crate::anim::entrance(ui, "msg", msg.event_id, i, |ui| {
-                            self.message_row(ui, data, sink, space, msg);
+                            if self.focused_message == Some((space, msg.event_id)) {
+                                let focused = egui::Frame::NONE
+                                    .stroke(egui::Stroke::new(1.0, Style::ACCENT))
+                                    .inner_margin(Style::SP_XS)
+                                    .show(ui, |ui| {
+                                        self.message_row(ui, data, sink, space, msg);
+                                    });
+                                ui.scroll_to_rect(focused.response.rect, Some(egui::Align::Center));
+                            } else {
+                                self.message_row(ui, data, sink, space, msg);
+                            }
                         });
                         ui.add_space(Style::SP_XS);
                     }
@@ -531,6 +585,7 @@ impl CommunicationsSurface {
 
             self.local_reaction_buttons(ui, msg.event_id);
             self.message_keep_affordances(ui, data, sink, space, msg.event_id);
+            self.message_task_affordance(ui, data, space, msg);
 
             match affordance {
                 AmendAffordance::Allowed => {
@@ -651,6 +706,52 @@ impl CommunicationsSurface {
                 target: message,
             }
         });
+    }
+
+    /// Offer the real channel-task path from a projected post. The first title
+    /// line is only a draft; the operator still reviews/edits it in Tasks before
+    /// the signed `CreateTask` command is emitted with this post as `source`.
+    fn message_task_affordance(
+        &mut self,
+        ui: &mut egui::Ui,
+        data: &dyn crate::CollabData,
+        space: SpaceId,
+        message: &MessageView,
+    ) {
+        ui.separator();
+        let linked = data.channel_tasks(space).map(|tasks| {
+            tasks
+                .tasks
+                .iter()
+                .filter(|task| task.source == Some(message.event_id))
+                .count()
+        });
+        if let Some(count) = linked.filter(|count| *count > 0) {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{count} linked task{}",
+                    if count == 1 { "" } else { "s" }
+                ))
+                .small()
+                .color(Style::ACCENT),
+            );
+        }
+        let Some(title) = Self::task_title_from_message(message.body.as_str()) else {
+            icons::icon(ui, icons::TASK_CREATE, Style::SP_M, Style::DISABLED)
+                .comms_hover_text("This post has no usable task title");
+            return;
+        };
+        if icons::icon_button(
+            ui,
+            icons::TASK_CREATE,
+            Style::SP_M,
+            Style::ACCENT,
+            "Create a task from this post",
+        )
+        .clicked()
+        {
+            self.begin_task_from_message(space, message.event_id, title);
+        }
     }
 
     /// The per-seat quick-reaction chips. These mutate only local view state and

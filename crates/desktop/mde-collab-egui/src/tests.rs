@@ -651,6 +651,7 @@ fn channel_tabs_include_posts_files_calls_and_tasks() {
 fn channel_tasks_mode_renders_projected_rows() {
     let space = SpaceId::new();
     let task = EventId::new();
+    let source = EventId::new();
     let data = FixtureData::new("eagle", 1_000_000)
         .with_space(space_summary(
             space,
@@ -669,7 +670,7 @@ fn channel_tasks_mode_renders_projected_rows() {
                 title: "Rotate gateway".to_owned(),
                 created_by: ActorId::new("falcon"),
                 created_unix_ms: 990_000,
-                source: None,
+                source: Some(source),
                 checked: false,
                 completed: false,
                 completed_by: None,
@@ -701,6 +702,10 @@ fn channel_tasks_mode_renders_projected_rows() {
             .iter()
             .any(|(text, _)| text.starts_with("by falcon ·")),
         "Tasks mode must paint task authorship metadata: {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|(text, _)| text == "Post unavailable"),
+        "Tasks mode must distinguish a source outside the retained Posts projection: {texts:?}"
     );
 }
 
@@ -789,6 +794,64 @@ fn channel_task_actions_emit_create_update_check_complete_and_reopen_commands() 
         "reopening a task must emit a typed ReopenTask command: {:?}",
         sink.queued()
     );
+}
+
+#[test]
+fn post_task_bridge_keeps_source_until_explicit_create() {
+    let space = SpaceId::new();
+    let message = EventId::new();
+    let mut surface = CommunicationsSurface::new();
+
+    surface.begin_task_from_message(space, message, "Rotate gateway");
+    assert_eq!(surface.channel_tab(), ChannelTab::Tasks);
+    assert_eq!(surface.mode(), Mode::Tasks);
+    assert_eq!(surface.task_draft(space), "Rotate gateway");
+
+    let mut sink = CommandSink::new();
+    surface.create_task_from_draft(&mut sink, space);
+    assert!(matches!(
+        sink.queued().first(),
+        Some(CollabCommand::CreateTask {
+            space: command_space,
+            title,
+            source: Some(command_source),
+        }) if *command_space == space
+            && title == "Rotate gateway"
+            && *command_source == message
+    ));
+    assert_eq!(surface.task_draft(space), "");
+
+    // A caller that seeds a normal task draft has no implicit source event.
+    surface.set_task_draft(space, "No source");
+    let mut sink = CommandSink::new();
+    surface.create_task_from_draft(&mut sink, space);
+    assert!(matches!(
+        sink.queued().first(),
+        Some(CollabCommand::CreateTask { source: None, .. })
+    ));
+}
+
+#[test]
+fn task_title_from_post_is_bounded_and_ignores_markdown_prefixes() {
+    assert_eq!(
+        CommunicationsSurface::task_title_from_message("\n## Rotate gateway\nmore detail"),
+        Some("Rotate gateway".to_owned())
+    );
+    let long = format!("* {}", "x".repeat(600));
+    let title = CommunicationsSurface::task_title_from_message(&long)
+        .expect("long post still has a bounded title");
+    assert_eq!(title.len(), 512);
+}
+
+#[test]
+fn task_source_jump_keeps_unavailable_projection_honest() {
+    let space = SpaceId::new();
+    let message = EventId::new();
+    let mut surface = CommunicationsSurface::new();
+    surface.focus_task_source(space, message);
+    assert_eq!(surface.channel_tab(), ChannelTab::Posts);
+    assert_eq!(surface.mode(), Mode::Messages);
+    assert_eq!(surface.focused_message_for_test(), Some((space, message)));
 }
 
 #[test]

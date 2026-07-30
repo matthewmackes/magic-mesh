@@ -425,9 +425,16 @@ pub struct CommunicationsSurface {
     drafts: HashMap<SpaceId, String>,
     /// Per-space task composer drafts.
     task_drafts: HashMap<SpaceId, String>,
+    /// The source post attached to a per-space task draft. This is view state
+    /// until the user submits the draft; the signed task command carries the
+    /// source event only after that explicit action.
+    task_sources: HashMap<SpaceId, EventId>,
     /// Per-space current-channel find text. This is a local view filter, not a
     /// collaboration event and not a suite-wide/global search index.
     channel_find: HashMap<SpaceId, String>,
+    /// A task's source post to bring into view after the Tasks → Posts jump.
+    /// The source remains a projection lookup, never a locally fabricated post.
+    focused_message: Option<(SpaceId, EventId)>,
     /// Per-message local quick reaction. This is strictly view state for this
     /// seat; it is never emitted as a collaboration command/event and does not
     /// imply a mesh-visible reaction system.
@@ -517,6 +524,7 @@ impl CommunicationsSurface {
             // (both are per-space intents); the drafts (keyed by space/thread)
             // deliberately survive.
             self.open_thread = None;
+            self.focused_message = None;
             self.editing = None;
             self.file_picker = None;
             self.files_confirm_delete = None;
@@ -576,6 +584,7 @@ impl CommunicationsSurface {
 
     /// Switch the Teams/channel tab and route to its existing body.
     pub fn set_channel_tab(&mut self, tab: ChannelTab) {
+        self.focused_message = None;
         self.channel_tab = tab;
         self.app = MeshTeamsApp::Teams;
         self.mode = tab.mode();
@@ -608,6 +617,34 @@ impl CommunicationsSurface {
     /// Set the task-composer draft for `space`.
     pub fn set_task_draft(&mut self, space: SpaceId, text: impl Into<String>) {
         self.task_drafts.insert(space, text.into());
+        self.task_sources.remove(&space);
+    }
+
+    /// Seed the task composer from a projected post and retain its source event
+    /// until the operator explicitly submits the bounded draft.
+    pub(crate) fn begin_task_from_message(
+        &mut self,
+        space: SpaceId,
+        message: EventId,
+        title: impl Into<String>,
+    ) {
+        self.task_drafts.insert(space, title.into());
+        self.task_sources.insert(space, message);
+        self.set_channel_tab(ChannelTab::Tasks);
+    }
+
+    /// Return the post focus requested by a task source jump.
+    #[cfg(test)]
+    pub(crate) fn focused_message_for_test(&self) -> Option<(SpaceId, EventId)> {
+        self.focused_message
+    }
+
+    /// Move from a projected task back to its source post. The post is only
+    /// focused; the next render still resolves it from the retained projection.
+    pub(crate) fn focus_task_source(&mut self, space: SpaceId, message: EventId) {
+        self.select_space(space);
+        self.set_channel_tab(ChannelTab::Posts);
+        self.focused_message = Some((space, message));
     }
 
     /// The current-channel find query for `space`.
