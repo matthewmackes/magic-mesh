@@ -800,10 +800,12 @@ remains here under a completed status.
   primitives exist. Current authority now makes Carbon optional and requires a
   shared registry/license audit; per-theme disabled ink now remaps through the
   palette with 54 focused style tests passing (257 `mde-egui` tests overall).
+  The centralized `Whimsy` preset now gives taskbar transitions a bounded
+  280ms/50ms normal/reduced path plus 31 focused motion tests; full
+  surface/internal-chrome adoption remains.
   Shell chrome now has a responsive Windows-style bottom clock/tray with
   dot-only mesh health, a cross-faded side-rail top strip, and a selectable,
-  persisted Home wallpaper/enable path; full surface/internal-chrome adoption
-  remains.
+  persisted Home wallpaper/enable path.
 - Remaining work:
 
   1. Reconcile `AI_GOVERNANCE.md` and the current platform-interface authority
@@ -889,8 +891,9 @@ remains here under a completed status.
   hardware aliases, legacy normalization, and unavailable provider states.
   Its mesh-status model projects bounded typed capability/action rows with
   fail-closed mutations plus truthful interface/CIDR/route/lighthouse/DNS
-  connectivity facts; focused This Node tests pass, including narrow,
-  large-text reflow, and disabled-action accessibility coverage (18 tests).
+  connectivity facts; focused This Node tests pass, including narrow, large-text reflow and disabled-action accessibility coverage (18 tests).
+  Mesh & System now adds a truthful unavailable/unknown/offline/degraded/connected
+  summary with AccessKit status and 3 focused tests.
 - Remaining work:
 
   1. Finish the durable This Node sidebar and search index across every
@@ -997,15 +1000,15 @@ remains here under a completed status.
 - Current state: `nav_bar.rs` owns persisted `Floating`/`Docked` placement,
   full-width 48px Bottom geometry, fixed 40px targets, centered pins, overflow
   bounds, pin persistence, focus underlining, first-boot search, and tested
-  slide/melt motion. Bottom reserves an animated clock/icon tray without grade
+  slide/melt/Whimsy motion. Bottom reserves an animated clock/icon tray without grade
   text; side retains the detailed top strip; Start uses Front Door search.
   `springboard.rs` is gesture-only: the retired App Grid painter,
-  selection/open path, zoom ghost, and grid tests are deleted; 14 focused
-  shell/front-door tests pass. The taskbar now consumes the searchable
-  catalog directly, with Fleet & Mesh/Workloads aliases and no retired group
-  label geometry; first-boot selection and responsive proof remain open. A
-  fresh unsigned Alpha from integrated tip `03d5084d` is staged for Dell
-  proofing; artifact/hash evidence is in `docs/ops/promotion-pipeline.md`.
+  selection/open path, zoom ghost, and grid tests are deleted; 34 nav-bar plus
+  14 shell/front-door tests pass. The taskbar consumes the searchable catalog
+  directly, with Fleet & Mesh/Workloads aliases and no retired group geometry;
+  first-boot selection and responsive proof remain open. A fresh unsigned Alpha
+  from integrated tip `03d5084d` is staged for Dell proofing; evidence is in
+  `docs/ops/promotion-pipeline.md`.
 - Remaining work:
 
   1. Reconcile taskbar-specific authority after WL-UX-009 retires the global
