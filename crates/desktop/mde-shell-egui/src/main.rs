@@ -1578,16 +1578,11 @@ impl Shell {
 
     /// U10 — the Construct springboard home (`springboard.rs`, §2.2 — the
     /// persistent base layer, no open flag): the module consumes the Home
-    /// intent + the all-app grid's queued interactions and returns ONE typed
-    /// action for this slot to apply — a chosen tile routes the nav, Home
+    /// intent and returns ONE typed action for this slot to apply. Home
     /// collapses to the base (this slot stays the single Home consumer), and
     /// the Q11 on-home pull-down lands on the existing Spotlight toggle.
     fn mount_springboard_slot(&mut self, ctx: &egui::Context) {
         match springboard::mount(ctx, &mut self.construct) {
-            Some(springboard::SpringboardAction::Open(surface)) => {
-                self.nav.surface = surface;
-                self.nav.expanded = true;
-            }
             Some(springboard::SpringboardAction::Home) => self.nav.expanded = false,
             Some(springboard::SpringboardAction::Spotlight) => self.toggle_front_door_panel(),
             None => {}
