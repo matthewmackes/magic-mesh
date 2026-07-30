@@ -798,8 +798,10 @@ remains here under a completed status.
   Core `mde-egui` navigation, sheet, popover, motion, style, and capture
   primitives exist. Current authority now makes Carbon optional and requires a
   shared registry/license audit; the `mde-egui` farm gate has 257 tests passing.
-  The archived progress ledger records completed slices; full
-  surface/internal-chrome adoption remains.
+  Shell chrome now has a responsive Windows-style bottom clock/tray with
+  dot-only mesh health, a cross-faded side-rail top strip, and a selectable,
+  persisted Home wallpaper/enable path; full surface/internal-chrome adoption
+  remains.
 - Remaining work:
 
   1. Reconcile `AI_GOVERNANCE.md` and the current platform-interface authority
@@ -884,7 +886,8 @@ remains here under a completed status.
   eight-section catalog, persistent section/search navigation with operator
   hardware aliases, legacy normalization, and unavailable provider states.
   Its mesh-status model projects bounded typed capability/action rows with
-  fail-closed mutations; 14 focused tests pass.
+  fail-closed mutations plus truthful interface/CIDR/route/lighthouse/DNS
+  connectivity facts; focused This Node tests pass.
 - Remaining work:
 
   1. Finish the durable This Node sidebar and search index across every
@@ -989,17 +992,16 @@ remains here under a completed status.
   workspace; no running/open indicator exists. Home is an icon-free wallpaper
   and the App Grid is deleted.
 - Current state: `nav_bar.rs` now owns persisted `Floating`/`Docked` placement,
-  a full-width 48px Bottom taskbar with fixed 40px targets, left Start/Back/
-  Home controls, a centered launcher/pin strip, right placement control,
-  overflow bounds, versioned ordered pin persistence, canonical focused-surface
-  underlining, and a tested slide/melt transition. Start dispatches to the
-  existing Front Door search/focus path, and the old group labels/pill geometry
-  are gone. Persistence/geometry and overflow have 27 focused navigation tests,
-  one Front Door pin test, and two direct overflow geometry/order tests passing.
-  `springboard.rs` still owns grid/selection/tile presentation; first-boot
-  selection and Fleet & Mesh/Workloads exposure remain open
-  (`Surface::FleetMesh` exists; Workloads retains internal `Surface::InfraCode`).
-  Dell Alpha proof: Fedora 44 12.1.6-1 base/browser RPMs installed on Dell-LAPTOP; `rpm -V`, CLI/help, and active shell restart passed (full hashes in promotion evidence).
+  a full-width 48px Bottom taskbar with fixed 40px targets, centered pins,
+  overflow bounds, ordered pin persistence, focused-surface underlining,
+  searchable first-boot pin selection, and a tested slide/melt transition.
+  Bottom mode reserves an animated Windows-style clock/icon tray without grade
+  text; side mode retains the detailed top status strip. Start uses Front Door
+  search; old group labels/pill geometry are gone. `springboard.rs` still owns
+  grid/tile presentation and Fleet & Mesh/Workloads cutover remains open
+  (`Surface::FleetMesh` exists; Workloads retains `Surface::InfraCode`). Dell
+  Alpha proof: Fedora 44 12.1.6-1 base/browser RPMs installed on Dell-LAPTOP;
+  `rpm -V`, CLI/help, and active shell restart passed (hashes in evidence).
 - Remaining work:
 
   1. Reconcile taskbar-specific authority after WL-UX-009 retires the global
