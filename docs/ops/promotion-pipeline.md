@@ -192,6 +192,20 @@ through `install-helpers/xcp-build.sh rpm`. Base
 `a4ae1aa5bc1b1a11cd034cfc9af6e3b26eeeb61ec5ec8e794ef2d8904a693a9e`), and
 lighthouse `magic-mesh-lighthouse-12.1.6-1.x86_64.rpm` (11.2 MiB, sha256
 `4600c720467041dbbd004abddc80d370a75200acfeb9c71e07257368765492ce`) all
+ passed the 90 MiB payload guard. Artifacts are staged in
+ `/root/mcnf-release-artifacts` for Dell proofing. This Alpha is unsigned and
+ not fleet-promoted; live Dell installation and GUI visual signoff remain.
+
+2026-07-30 refreshed integrated engineering Alpha cut for Dell proofing: source
+tip `cffd7266` (truthful Maps route-preview blockers, Mesh Teams Calls provider
+labels, and VDI protocol-specific clipboard capability presentation) was built
+on BigBoy through `install-helpers/xcp-build.sh rpm`. Base
+`magic-mesh-12.1.6-1.x86_64.rpm` (82.2 MiB, sha256
+`a862081bbdef0539929146f8c06fd1b4ccee34d38770fdbe4ee718374a3c2005`), browser
+`magic-mesh-browser-12.1.6-1.x86_64.rpm` (38.9 MiB, sha256
+`31f43862ff9ae0757e95d1973d6b419b9e80002de6a611e3ee728d92fb4963ea`), and
+lighthouse `magic-mesh-lighthouse-12.1.6-1.x86_64.rpm` (11.2 MiB, sha256
+`3696dd01c0e4a000ecd99067d410bf2485ef8851e824708320e39a3d76ee9f29`) all
 passed the 90 MiB payload guard. Artifacts are staged in
 `/root/mcnf-release-artifacts` for Dell proofing. This Alpha is unsigned and
 not fleet-promoted; live Dell installation and GUI visual signoff remain.
