@@ -1000,10 +1000,11 @@ remains here under a completed status.
   text; side retains the detailed top strip; Start uses Front Door search.
   `springboard.rs` is gesture-only: the retired App Grid painter,
   selection/open path, zoom ghost, and grid tests are deleted; 14 focused
-  shell/front-door tests pass. Fleet & Mesh/Workloads remains open. Prior Dell
-  proof used `247db21d`; a fresh unsigned Alpha from integrated tip `49839583`
-  is staged for Dell proofing with artifact/hash evidence in
-  `docs/ops/promotion-pipeline.md`.
+  shell/front-door tests pass. The taskbar now consumes the searchable
+  catalog directly, with Fleet & Mesh/Workloads aliases and no retired group
+  label geometry; first-boot selection and responsive proof remain open. A
+  fresh unsigned Alpha from integrated tip `5c894463` is staged for Dell
+  proofing; artifact/hash evidence is in `docs/ops/promotion-pipeline.md`.
 - Remaining work:
 
   1. Reconcile taskbar-specific authority after WL-UX-009 retires the global
