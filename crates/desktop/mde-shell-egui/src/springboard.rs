@@ -350,13 +350,21 @@ pub(crate) fn mount(
 /// over the wallpaper backdrop exactly where the session EmptyState drew.
 /// `overlay_above` is true while any Construct overlay / the Front Door is
 /// open above — the keyboard then stays theirs (module doc).
-pub(crate) fn show(ui: &mut egui::Ui, _overlay_above: bool) {
+pub(crate) fn show(ui: &mut egui::Ui, overlay_above: bool) {
     let ctx = ui.ctx().clone();
     let state_key = egui::Id::new(STATE_KEY);
     let mut state = ctx
         .data_mut(|d| d.get_temp::<SpringboardState>(state_key))
         .unwrap_or_default();
-    handle_drag(ui, &mut state, ui.max_rect());
+    // Front Door/search and the other Construct overlays own the pointer while
+    // open.  The Home layer is still mounted underneath them for the cross-fade,
+    // but it must not accept a pull-down through the overlay and produce a
+    // second, hidden launcher/search transition.
+    if overlay_above {
+        state.gesture = None;
+    } else {
+        handle_drag(ui, &mut state, ui.max_rect());
+    }
 
     ctx.data_mut(|d| d.insert_temp(state_key, state));
 }
@@ -625,18 +633,26 @@ mod tests {
     /// this calls [`show`] exactly once: `central_view` owns one CentralPanel
     /// pass per egui frame, so pointer regressions must not rely on a doubled
     /// test mount.
-    fn production_frame(
+    fn production_frame_with_overlay(
         ctx: &egui::Context,
+        overlay_above: bool,
         events: Vec<egui::Event>,
     ) -> (egui::Rect, egui::FullOutput) {
         let mut inner = egui::Rect::from_min_size(egui::Pos2::ZERO, SCREEN);
         let out = ctx.run(raw(events), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 inner = ui.max_rect();
-                show(ui, false);
+                show(ui, overlay_above);
             });
         });
         (inner, out)
+    }
+
+    fn production_frame(
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+    ) -> (egui::Rect, egui::FullOutput) {
+        production_frame_with_overlay(ctx, false, events)
     }
 
     fn state_of(ctx: &egui::Context) -> SpringboardState {
@@ -1011,6 +1027,50 @@ mod tests {
             mount(&ctx, &mut construct),
             Some(SpringboardAction::Spotlight),
             "the Q11 on-home pull-down reaches the slot as the Spotlight seam"
+        );
+    }
+
+    #[test]
+    fn production_home_overlay_blocks_the_hidden_launcher_pull_gesture() {
+        let ctx = ctx();
+        let mut construct = ConstructChrome::default();
+        let (inner, _) = production_frame(&ctx, Vec::new());
+        let start = egui::pos2(inner.center().x, inner.top() + inner.height() * 0.1);
+        let pulled = egui::pos2(start.x, start.y + PULL_FIRE + 40.0);
+
+        production_frame_with_overlay(
+            &ctx,
+            true,
+            vec![
+                egui::Event::PointerMoved(start),
+                egui::Event::PointerButton {
+                    pos: start,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+        );
+        production_frame_with_overlay(
+            &ctx,
+            true,
+            vec![egui::Event::PointerMoved(pulled)],
+        );
+        production_frame_with_overlay(
+            &ctx,
+            true,
+            vec![egui::Event::PointerButton {
+                pos: pulled,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+
+        assert_eq!(
+            mount(&ctx, &mut construct),
+            None,
+            "Front Door/search must own the pointer; Home cannot fire a hidden second launcher"
         );
     }
 
