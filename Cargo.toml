@@ -97,7 +97,7 @@ members = [
 # PLATFORM RELEASE SSoT — every crate, RPM, CLI, shell welcome, watermark, and
 # About surface derives its platform version from this one semver value. Never
 # duplicate the version in a UI, install helper, or packaging manifest.
-version      = "12.1.1"
+version      = "12.1.6"
 edition      = "2021"
 # EFF-33 — the MSRV floor, enforced by CI (every ci.yml job builds the
 # full workspace on pinned 1.85). The dev/build ceiling (1.94, the
