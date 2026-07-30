@@ -365,13 +365,11 @@ remains here under a completed status.
   presentation, bounded Activity folds, and many signed/persistence boundaries
   are implemented. Shared pin/save commands, events, projections, persistence,
   and projected UI affordances now have focused farm coverage. Completed
-  task/action-item update, complete, reopen, membership, bounded-read, and
-  projected UI slices now also have focused farm coverage. Severity-aware
+  task/action-item update, complete, reopen, membership, bounded-read, and projected UI slices now also have focused farm coverage. Severity-aware
   Activity coalescing, truthful repeat counts, visible pause/resume, keyboard
-  posting, and AccessKit send labels now have focused farm coverage. Completed evidence is in the pre-rework archive;
-  the parity source is `docs/platform/WL-FUNC-011-parity-ledger.md`. Calls now
-  explain peer-gated actions and per-device media-provider absence through
-  accessible disabled labels; 19 focused Calls tests pass at `76dd2457`.
+  posting, and AccessKit send labels now have focused farm coverage. Completed
+  evidence is in the pre-rework archive; parity source is `docs/platform/WL-FUNC-011-parity-ledger.md`; Calls unavailable-state
+  semantics have accessible labels and 19 focused tests pass at `76dd2457`.
 - Remaining work:
 
   1. Reconcile the parity ledger against current runtime/tests and leave only
@@ -502,15 +500,11 @@ remains here under a completed status.
   protocol integration are not production-complete. DRM/VNC clipboard state
   handling, a bounded UTF-8-safe local text provider, explicit RDP/SPICE
   capability reporting, CopyText-clear/native-paste round-trip, and rejection
-  of no-op provider writes now have focused farm coverage. KDC/mobile ingress now
-  has typed authorization, UTF-8/1 MiB bounds, peer-scoped deduplication, and
-  honest metadata with 22 focused farm tests. Mesh Teams now shows Local/Remote/
-  Source unavailable provenance with action hints and 5 clipboard tests; real
-  mesh materialization and RDP/SPICE text channels remain unsupported. The
-  shell VDI connecting state now names the selected protocol's clipboard
-  capability (VNC RFB is bidirectional; RDP CLIPRDR and SPICE vdagent are
-  explicitly unavailable), with focused VDI coverage in the pending integrated
-  change.
+  of no-op provider writes now have focused farm coverage. KDC/mobile ingress now has typed authorization, UTF-8/1 MiB bounds, peer-scoped deduplication, and
+  honest metadata with 22 focused farm tests. Mesh Teams shows Local/Remote/Source unavailable provenance with action hints and 5 clipboard tests; real
+  mesh materialization remains open. VNC is bidirectional while RDP CLIPRDR and
+  SPICE vdagent remain unsupported, and the shell VDI state now exposes that
+  protocol capability with focused coverage in the integrated change.
 - Remaining work:
 
   1. Map direct-seat shortcuts into `egui::Event::{Copy,Cut,Paste}`, consume
@@ -592,19 +586,15 @@ remains here under a completed status.
   replace placeholders. Carbon requirements retire while egui, shared `Style`,
   Construct, Car, and direct DRM remain governed.
 - Current state: `mackesd` still assumes one managed MG90/direct Ethernet; the live unit reports LTE/WAN and power but no GNSS fix, and OBD parsing is absent.
-  Raster MBTiles/FTS5 serves one region; Maps owns basemap/search, while
-  Valhalla, route/lane/speed helpers, bearing, and admin actions remain unwired.
-  Typed v2 identity/radio/freshness/provenance dual-publishes beside v1, with
-  11 mesh-type and 69 worker tests passing. Maps/Car projects bounded radio
+  Raster MBTiles/FTS5 serves one region; Maps owns basemap/search, while Valhalla, route/lane/speed helpers, bearing, and admin actions remain unwired.
+  Typed v2 identity/radio/freshness/provenance dual-publishes beside v1, with 11 mesh-type and 69 worker tests passing. Maps/Car projects bounded radio
   presence, operation, freshness, age, provenance, and mirror states; 13 consumer
-  tests pass. Car status tiles expose compact shared tones and explicit
-  stale/unavailable accessibility labels. The bounded MG90/manager roster has
+  tests pass. Car status tiles expose compact shared tones and explicit stale/unavailable accessibility labels. The bounded MG90/manager roster has
   independent poll/heartbeat plans, latest-wins/no-source behavior, deterministic
-  all-source selection, and 44 vehicle tests pass. Maps HUD and Airspace expose
-  honest unavailable/stale states with 17 focused tests. Route preview Start now
+  all-source selection, and 44 vehicle tests pass. Maps HUD/Airspace expose honest unavailable/stale states with 17 focused tests; route preview Start
   distinguishes missing route, blocked offline readiness, and missing GPS with
-  truthful labels/tooltips while preserving the guard; 7 focused route-preview
-  tests pass at `05ba6870`. Live adapters and route/render cutover remain.
+  7 focused route-preview tests at `05ba6870`. Live adapters and route/render
+  cutover remain.
 - Remaining work:
   1. Consume WL-UX-009's platform-wide Carbon-requirement retirement and update
      the Maps/Car-specific authority while retaining egui, shared `Style`,
