@@ -19,6 +19,7 @@
 
 use std::hash::Hash;
 
+use egui::text::{LayoutJob, TextFormat};
 use egui::{
     Align2, Color32, Key, Modifiers, Rect, Response, Sense, Ui, Vec2, WidgetInfo, WidgetType,
 };
@@ -44,6 +45,98 @@ const NAV_STRIP_H: f32 = Style::CONTROL_H_L + Style::SP_M;
 /// The [`Toolbar`] base height — a standard control row
 /// ([`Style::CONTROL_H_M`]) plus one base gutter ([`Style::SP_S`]).
 const TOOLBAR_BASE_H: f32 = Style::CONTROL_H_M + Style::SP_S;
+
+/// The responsive arrangement for a Construct workspace frame. A regular
+/// desktop keeps its navigation rail beside content; constrained windows fold
+/// that rail into the surface's existing menu or picker rather than squeezing
+/// controls below their usable width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppFrameLayout {
+    /// A persistent sidebar/rail can sit alongside the workspace body.
+    Split,
+    /// The body takes the full width; navigation is exposed by the caller's
+    /// compact picker, menu, or sheet.
+    Compact,
+}
+
+/// The minimum useful width for a persistent workspace rail plus readable
+/// detail content, derived from the existing spacing grid.
+const SPLIT_FRAME_MIN_W: f32 = Style::SP_XL * 24.0;
+
+/// Choose the workspace-frame arrangement for `width` and `density`.
+#[must_use]
+pub fn app_frame_layout(width: f32, density: Density) -> AppFrameLayout {
+    if width >= SPLIT_FRAME_MIN_W * density.spacing_scale() {
+        AppFrameLayout::Split
+    } else {
+        AppFrameLayout::Compact
+    }
+}
+
+/// A shared Construct workspace frame header. It composes the standard
+/// [`NavigationBar`] with a responsive layout decision, leaving the domain
+/// surface in control of navigation routing and body content.
+#[derive(Debug, Clone, Copy)]
+pub struct AppFrame<'a> {
+    navigation: NavigationBar<'a>,
+    toolbar: Option<Toolbar<'a>>,
+}
+
+impl<'a> AppFrame<'a> {
+    /// Create a workspace frame with the standard titled navigation header.
+    #[must_use]
+    pub const fn new(title: &'a str) -> Self {
+        Self {
+            navigation: NavigationBar::new(title),
+            toolbar: None,
+        }
+    }
+
+    /// Add the standard back affordance to the workspace header.
+    #[must_use]
+    pub const fn with_back(mut self, previous: &'a str) -> Self {
+        self.navigation = self.navigation.with_back(previous);
+        self
+    }
+
+    /// Add trailing actions to the workspace header.
+    #[must_use]
+    pub const fn with_actions(mut self, actions: &'a [NavAction<'a>]) -> Self {
+        self.navigation = self.navigation.with_actions(actions);
+        self
+    }
+
+    /// Place a shared action row directly below the navigation header.
+    ///
+    /// This keeps dense workspace controls in one frame without asking each
+    /// surface to hand-compose a second, near-identical strip.
+    #[must_use]
+    pub const fn with_toolbar(mut self, toolbar: Toolbar<'a>) -> Self {
+        self.toolbar = Some(toolbar.at_top());
+        self
+    }
+
+    /// Render the shared header, optional action row, and responsive arrangement.
+    pub fn show(self, ui: &mut Ui) -> AppFrameResponse {
+        let layout = app_frame_layout(ui.available_width(), Style::density(ui.ctx()));
+        AppFrameResponse {
+            layout,
+            navigation: self.navigation.show(ui),
+            toolbar: self.toolbar.map(|toolbar| toolbar.show(ui)),
+        }
+    }
+}
+
+/// What an [`AppFrame`] reports for one frame.
+#[derive(Debug, Clone)]
+pub struct AppFrameResponse {
+    /// The arrangement appropriate for the available width.
+    pub layout: AppFrameLayout,
+    /// The shared navigation-header interactions.
+    pub navigation: NavBarResponse,
+    /// The optional action-row interactions.
+    pub toolbar: Option<ToolbarResponse>,
+}
 
 /// [`NavigationBar`] height for `density` — the comfortable strip, grown only
 /// when the density's hit target plus a scaled gutter no longer fits.
@@ -788,11 +881,20 @@ impl Sidebar {
                     Style::TEXT
                 },
             );
-            ui.painter().text(
-                egui::pos2(text_x, plate.center().y),
-                Align2::LEFT_CENTER,
-                row.label,
-                Style::typography_font(TypographyRole::Body),
+            // A node/channel name is live operator data and may be much longer
+            // than the rail, especially at the Largest text scale. Lay it out
+            // as one bounded row so it elides inside the selected plate instead
+            // of painting over the next pane.
+            let max_text_width = (plate.right() - text_x - Style::SP_S).max(1.0);
+            let font = Style::typography_font(TypographyRole::Body);
+            let mut job =
+                LayoutJob::single_section(row.label.to_owned(), TextFormat::simple(font, color));
+            job.wrap.max_width = max_text_width;
+            job.wrap.max_rows = 1;
+            let galley = ui.fonts(|fonts| fonts.layout_job(job));
+            ui.painter().galley(
+                egui::pos2(text_x, plate.center().y - galley.size().y * 0.5),
+                galley,
                 color,
             );
             paint_focus_ring(ui.painter(), plate, response.has_focus());
@@ -1067,6 +1169,68 @@ mod tests {
         assert!(
             sidebar_row_height(Density::Touch) >= Density::Touch.min_hit_target(),
             "touch rows must reach the finger target"
+        );
+    }
+
+    #[test]
+    fn app_frame_layout_preserves_readable_detail_on_desktop_and_narrow_widths() {
+        assert_eq!(
+            app_frame_layout(1280.0, Density::Mouse),
+            AppFrameLayout::Split
+        );
+        assert_eq!(
+            app_frame_layout(480.0, Density::Mouse),
+            AppFrameLayout::Compact
+        );
+        assert_eq!(
+            app_frame_layout(960.0, Density::Touch),
+            AppFrameLayout::Compact
+        );
+    }
+
+    #[test]
+    fn app_frame_renders_a_shared_header_at_large_text_density() {
+        let ctx = egui::Context::default();
+        Style::install_with_density(&ctx, Density::Touch);
+        let out = ctx.run(RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let response = AppFrame::new("Terminal").show(ui);
+                assert_eq!(response.layout, AppFrameLayout::Split);
+                assert!(response.navigation.bar.rect.height() >= Density::Touch.min_hit_target());
+            });
+        });
+        assert!(
+            !out.shapes.is_empty(),
+            "app frame must render visible chrome"
+        );
+    }
+
+    #[test]
+    fn app_frame_composes_an_optional_top_toolbar_at_large_text_density() {
+        let ctx = egui::Context::default();
+        Style::install_with_density(&ctx, Density::Touch);
+        let actions = [ToolbarItem::icon("view-refresh", "Refresh")];
+        let out = ctx.run(RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let response = AppFrame::new("Fleet")
+                    .with_toolbar(Toolbar::new().trailing(&actions))
+                    .show(ui);
+                let toolbar = response
+                    .toolbar
+                    .expect("frame should return its toolbar response");
+                assert!(
+                    toolbar.bar.rect.top() >= response.navigation.bar.rect.bottom(),
+                    "the action row must follow the shared navigation header"
+                );
+                assert!(
+                    toolbar.bar.rect.height() >= Density::Touch.min_hit_target(),
+                    "large-text/touch density must preserve action-row hit targets"
+                );
+            });
+        });
+        assert!(
+            !out.shapes.is_empty(),
+            "composed app frame must render visible chrome"
         );
     }
 }

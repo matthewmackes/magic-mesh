@@ -889,10 +889,10 @@ remains here under a completed status.
   and no-public-remote policy are implemented. Session retries preserve
   catalog/capability/resume intent while rejecting retargets; 20 App VM and
   guest-runtime readiness tests plus 39 broker tests pass. Guest rows use
-  distinct `Guest App`/`Guest Flatpak` accessibility language. App VM image
-  build carries immutable labels and defaults to Fedora 44; farm contract and
-  registry-unavailable refusal checks pass. Full provision/guest/VDI
-  convergence remains open.
+  distinct `Guest App`/`Guest Flatpak` accessibility language. On farm `.170`,
+  the Fedora 44 RPM-backed image passed all static checks with profile
+  `wayland-standard-v1`, image `6e16ff...6044c54`, and immutable base
+  `sha256:4bd2...faa3b5`; full provision/guest/VDI convergence remains open.
 - Remaining work:
 
   1. Complete the Front Door catalog experience around the validated projection:
@@ -1063,8 +1063,9 @@ remains here under a completed status.
   non-green, unobserved, stale, or unbound farm results and requires matching
   `github-required=pass`. A fail-closed six-node verifier requires exactly three
   lighthouses, three workstations, fresh artifact-bound recovery evidence, and
-  `--require-live`; no real bundle exists. Farm-to-GitHub publication, six-node/
-  live gates, and operator-key publication remain outstanding.
+  `--require-live`; no real bundle exists. Farm `.90` slot 118 passes both
+  `ci-gate.sh --self-test` and `release-evidence.sh --self-test`. Farm-to-GitHub
+  publication, six-node/live gates, and operator-key publication remain open.
 - Remaining work:
 
   1. Make GitHub required checks the promotion authority and connect the farm as
@@ -1161,15 +1162,15 @@ remains here under a completed status.
   and zebra-striped for differentiation.
 - Current state: Shared Quazar typography, palettes, chrome primitives, state
   panels, menubars, dense lists, and most Construct-owned route migrations are
-  landed. Farm suites cover shell, Editor, Teams, Maps, Files, Bookmarks, Music,
-  Device, Storage, and This Node. Dell is unreachable; Dark/Light, narrow,
-  no-overlap, licensing, and production DRM matrix proof remains incomplete.
-  Corrected `12.1.6-1` base/browser RPMs are installed on `.138`; the current
-  farm-built shell hash is `3e14be22a7c12fe41e8fa4a8386a7c1287a5d6b532ae69e3b3bbd94bad873594`,
-  service active, `NRestarts=0`. Direct-DRM Light/Largest Editor and Files
-  captures show the full taskbar and wrapped commands; This Node now exposes
-  Clock & Date with Eastern Standard Time default and `.138` is `America/New_York`.
-  Readiness is not claimed pending narrow no-overlap and remaining route proof.
+  landed; farm suites cover shell, Editor, Teams, Maps, Files, Bookmarks, Music,
+  Device, Storage, and This Node. The 2026-07-31 MenuBar/Sidebar fixes and
+  direct-DRM capture attempts are recorded in
+  [`WL-UX-009-DRM-EVIDENCE-2026-07-31.md`](WL-UX-009-DRM-EVIDENCE-2026-07-31.md).
+  `.138` is active with `NRestarts=0`; the exact current artifact's Dark desktop,
+  Dark narrow, and Light/Largest KMS captures were rejected as corrupted
+  scanout-line artifacts, so no visual pass is claimed. `.15` is SSH-reachable
+  with `NRestarts=0`, but its Intel compressed KMS capture is also corrupted and
+  is not counted as visual proof; Dell and full readiness remain open.
 - Remaining work:
 
   1. Finish the shared app-frame and Terminal-pattern unified top bar, including
@@ -1439,17 +1440,17 @@ remains here under a completed status.
   workspace; no running/open indicator exists. Home is an icon-free wallpaper
   and the App Grid is deleted.
 - Current state: `nav_bar.rs` owns persisted `Floating`/`Docked` placement,
-  full-width 48px Bottom geometry, fixed 40px targets, centered pins, overflow
-  bounds, pin persistence, focus underlining, first-boot search, and tested
-  slide/melt/Whimsy motion. Bottom reserves an animated clock/icon tray without grade
-  text; side retains the detailed top strip; Start uses Front Door search.
+  full-width 48px Bottom geometry, fixed 40px targets, centered pins, overflow bounds,
+  pin persistence, focus underlining, first-boot search, and tested
+  slide/melt/Whimsy motion. Bottom reserves an animated clock/icon tray; Start uses
+  Front Door search and the side retains its detailed top strip.
   `springboard.rs` is gesture-only: the retired App Grid painter,
-  selection/open path, zoom ghost, and grid tests are deleted; 34 nav-bar plus
+  selection/open path, zoom ghost, and grid tests are deleted; 37 nav-bar plus
   14 shell/front-door tests pass. The taskbar consumes the searchable catalog
   directly, with Fleet & Mesh/Workloads aliases and no retired group geometry;
-  first-boot selection and responsive proof remain open. A fresh unsigned Alpha
-  from integrated tip `b77a82de` is staged for Dell proofing; evidence is in
-  `docs/ops/promotion-pipeline.md`.
+  narrow first-boot controls now have 37/37 farm tests, while full first-boot
+  selection remains open. A fresh unsigned Alpha from integrated tip `b77a82de`
+  is staged for Dell proofing; evidence is in `docs/ops/promotion-pipeline.md`.
 - Remaining work:
 
   1. Reconcile taskbar-specific authority after WL-UX-009 retires the global
