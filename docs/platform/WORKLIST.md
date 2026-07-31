@@ -8,16 +8,18 @@ The complete pre-rework worklist, including all progress records and historical
 reconciliation text, is preserved at
 `docs/worklist-archive/2026-07-28-platform-worklist-pre-rework.md`.
 
-## Current Snapshot - 2026-07-29 execution-first rework
+## Current Snapshot - 2026-07-30 fit-for-purpose audit integration
 
-- **7 active epics:** 7 `Remaining`, 0 `Blocked`, 0 `Needs clarification`.
+- **9 active epics:** 9 `Remaining`, 0 `Blocked`, 0 `Needs clarification`.
 - **P0:** WL-ARCH-008 (standalone old Browser repo plus VM Browser cutover),
   WL-FUNC-011 (Mesh Teams completion and one-product cutover), WL-FUNC-016
   (native text clipboard across seat/mesh/VDI), WL-FUNC-017 (complete Maps,
-  navigation, and MG90 radio health), and WL-UX-011 (unified This Node hardware
-  center).
-- **P1:** WL-UX-009 (shared Quazar theme and design-language completion) and
-  WL-UX-012 (full-width Construct taskbar and search-first Home).
+  navigation, and MG90 radio health), WL-UX-011 (unified This Node hardware
+  center), and WL-CRIT-006 (production evidence, six-node acceptance, and
+  corrected-forward recovery).
+- **P1:** WL-UX-009 (shared Quazar theme and design-language completion),
+  WL-UX-012 (full-width Construct taskbar and search-first Home), and
+  WL-FUNC-018 (seamless Flatpak Front Door backed by App VMs).
 - **First parallel wave:** preserve/extract the old Browser stack; implement the
   DRM/mesh/VDI clipboard foundation; repair MG90 cadence and introduce the
   complete radio-health contract; finish shared visual primitives and taskbar
@@ -26,9 +28,10 @@ reconciliation text, is preserved at
 - **Integration wave:** cut Construct over to `browser-vm`; finish Mesh Teams
   against the shared clipboard/theme contracts; complete the real navigation
   and offline-map cutover; complete This Node using the same state and visual
-  primitives; and cut Construct over to the full-width search-first taskbar.
+  primitives; cut Construct over to the full-width search-first taskbar; and
+  make Flatpak applications appear as Front Door apps backed by App VMs.
 - **Delivery policy:** build one integrated engineering-preview release from the
-  seven epics. Publish the preview with unavailable live evidence documented;
+  nine epics. Publish the preview with unavailable live evidence documented;
   production promotion is a separate decision and requires every selected live
   gate to pass. The preview is not a production-readiness claim.
 - **Rollout policy:** deploy the preview to Dell, Eagle, and seat 15
@@ -44,6 +47,11 @@ reconciliation text, is preserved at
   Human GUI review is the required visual signoff. Missing live hardware,
   external providers, or stale installed packages are recorded honestly for the
   preview and remain hard gates for production promotion.
+- **Audit record:** the 2026-07-30 fit-for-purpose finding and all 25 selected
+  actions are recorded in
+  [`docs/platform/FIT-FOR-PURPOSE-AUDIT-2026-07-30.md`](FIT-FOR-PURPOSE-AUDIT-2026-07-30.md).
+  `AUD-*` labels there are evidence references, not a parallel tracker; action
+  ownership is this file's active epics.
 
 ## Survey Decision Register - 2026-07-29
 
@@ -103,8 +111,8 @@ implementation instructions, not a second worklist.
    capabilities visibly, auto-recover unsafe profiles, warn before network
    disruption, and require all named OEM adapters for production.
 6. Make Quazar the only platform visual language with Dark and Light modes,
-   balanced information density, licensed shared icons, expressive shared motion
-   with reduced-motion substitutions, the Terminal-pattern top bar with the
+   balanced information density, licensed shared icons, expressive Apple-like
+   shared motion as the default, the Terminal-pattern top bar with the
    previously approved exemptions, and a 25%-thinner two-row zebra side tab bar.
    Preserve the governed Maps content-color and focused-VDI exceptions; guest
    Browser chrome remains outside Construct styling.
@@ -112,6 +120,51 @@ implementation instructions, not a second worklist.
    user-selected first-boot pins, pin/unpin personalization without reordering,
    one focus underline, icon-only overflow, physical-screen centering, shared
    Bottom/Left order, deleted App Grid, and focused-VDI auto-hide.
+
+### Operator decisions - 2026-07-31
+
+1. Remove OpenStack/Nova references and implementation code completely. The
+   provider-neutral replacement path is the required destination; do not retain
+   OpenStack compatibility or user-facing terminology.
+2. Fleet-wide search/index access is authorized with a seven-day retention
+   window. Expired data must be removed and access remains subject to the
+   existing mesh trust and authorization model.
+3. A real screen-reader/TTS consumer is not required for the current scope.
+   Retain accessible touch interaction as a requirement for tablet surfaces.
+4. Resolve the Browser chrome visual ruling using platform best practice:
+   conform it to the Quazar dark/light design tokens, with touch-sized tablet
+   controls where applicable.
+5. Integrate LibreOffice as a dedicated App VM, not as a host-native or
+   in-process dependency. Expose Writer, Calc, and Impress through the
+   Workspace shortcut group; launch and reconnect through the existing VDI
+   session path. Files must offer the appropriate LibreOffice association for
+   supported office formats.
+6. Printing is a Construct-owned, world-class workflow over the App VM:
+   printer discovery and health, local/mesh printer selection, live
+   page-faithful preview, paper/tray/orientation/margins, duplex/binding,
+   color, copies, collation, ranges, scaling, N-up/booklet, PDF output,
+   presets, progress, cancel, retry, and tablet-sized touch controls.
+
+### Unified This Node survey completion - 2026-07-31
+
+The operator requested completion at the 50-question cap. Questions 45-50
+were closed with the recommended defaults below so the resulting decisions are
+recorded before implementation. These choices extend WL-UX-011 and do not
+close it or imply production readiness.
+
+45. A critical health state opens an urgent alert with affected components,
+    current impact, and guided recovery actions.
+46. Notifications are configurable and persistent, support severity,
+    acknowledgement, snooze, and escalation, and remain linked to the owning
+    health item.
+47. Health views provide safe, guided recovery actions with explicit impact
+    and confirmation before mutation.
+48. All operators may view health; only privileged roles may configure health
+    policy or override a reported state, with every change audited.
+49. Health refresh is live or on demand according to the view, and every
+    stale or unavailable interval is explicit rather than silently inferred.
+50. Health and This Node history can be exported as operator-readable,
+    audit-backed evidence without exporting credentials or secret material.
 
 ### MG90 ownership, sharing, and cache contract
 
@@ -157,6 +210,50 @@ implementation instructions, not a second worklist.
    affected-view warning; automatic expiry and manual purge restore normal
    behavior when space is available.
 
+### Fit-for-purpose audit actions - 2026-07-30
+
+The operator selected the following cross-cutting decisions. They are owned by
+`WL-CRIT-006` unless an existing feature epic is named; do not create duplicate
+epics for these rows. The complete rationale and interface requirements are in
+[`docs/platform/FIT-FOR-PURPOSE-AUDIT-2026-07-30.md`](FIT-FOR-PURPOSE-AUDIT-2026-07-30.md).
+
+1. GitHub required checks are authoritative; the build farm is the heavy
+   self-hosted execution backend and publishes signed evidence.
+2. Production requires three lighthouses and three workstations.
+3. Failed nodes recover through corrected-forward re-enrollment; rollback is
+   not a required recovery path.
+4. Flat trust gains capability quarantine, default-deny workload exposure, and
+   explicit blast-radius diagnostics.
+5. Enrollment becomes one-time, scope-bound, guided, approved, and auditable.
+6. Readiness becomes capability-based rather than one all-or-nothing verdict.
+7. Every replicated domain declares its deterministic merge and provenance rule.
+8. The host Browser is removed in favor of the dedicated Browser VM.
+9. VDI sessions receive stable workload identity and resume/reconnect behavior.
+10. Clipboard uses one bounded UTF-8 text contract; Files/Transfers owns larger
+    or non-text content.
+11. Mesh Teams is the sole collaboration destination.
+12. This Node is the only durable local-settings authority.
+13. Hardware mutations use typed, allowlisted, audited adapters with safe
+    fallback and watchdog recovery.
+14. Maps is offline-first and MG90 state is typed, fresh, sourced, and honest.
+15. Quazar owns shared Dark/Light tokens, typography, icons, motion, and states.
+16. The taskbar is full-width and Start opens focused Front Door search.
+17. Releases publish an explicit Fedora compatibility matrix using the oldest
+    supported ABI.
+18. Signed provenance binds source, artifacts, SBOM, static gates, and live
+    evidence.
+19. Incident bundles correlate health, audit, worker, transport, workload, and
+    operator events.
+20. Replicated live state is the target recovery model; current encrypted
+    backups remain mandatory until peer-recovery proof passes.
+21. Lighthouse failover is automatic and visibly degraded while recovering.
+22. Workloads require capability and resource-budget admission.
+23. Data uses minimal retention with explicit replication, TTL, redaction, and
+    purge rules.
+24. The immutable image exposes bounded capability profiles rather than one
+    unqualified all-in-one contract.
+25. A permanent six-node integration and chaos testbed is a production gate.
+
 ## Status Vocabulary
 
 - `Remaining` - unfinished implementation that can proceed.
@@ -192,16 +289,17 @@ remains here under a completed status.
   and forwards focused input. Chromium, browser chrome, tabs, page execution,
   media decode, and page failures remain inside the guest.
 - Current state: The old shell Browser, helper engines, worker/package seams,
-  and Browser-specific daemon integrations remain in `magic-mesh`. Workloads
-  provision `DeliveryType::DesktopVm`; VDI supports RDP/VNC/SPICE and
-  damage-aware texture uploads, with RDP audio disabled. The 199-path
-  source/destination inventory and fail-closed verifier remain under
-  `docs/design/browser-stack-extraction/` and `install-helpers/`. The typed
-  `browser-provision` seam has the 4-vCPU/8192-MiB/64-GiB baseline and tests;
-  Front Door routes a guest-owned Browser VM workflow with VDI-unavailable
-  state. Browser VM now exposes truthful AccessKit unavailable/connecting/
-  connected/shell-owned/disconnected states; 84 focused shell tests pass, while
-  live realization and extraction remain open.
+  and Browser-specific daemon integrations remain in `magic-mesh`; Workloads
+  provision `DeliveryType::DesktopVm`, while VDI supports RDP/VNC/SPICE and
+  damage-aware texture uploads. The 199-path source/destination inventory and
+  fail-closed verifier remain under `docs/design/browser-stack-extraction/` and
+  `install-helpers/`. Typed `browser-provision` has the 4-vCPU/8192-MiB/64-GiB
+  baseline and tests; `packaging/browser-vm/profile.env` fixes guest identity,
+  provenance, Chromium/Sway ownership, transport preference, and the resource
+  floor with a fail-closed verifier. Front Door/AccessKit expose truthful guest
+  states; the image-owned validator admits only bounded identity/digest/transport
+  records and rejects commands, URLs, paths, symlinks, and extra inputs. Its farm
+  contract suite passes; live realization and extraction remain open.
 - Remaining work:
 
   1. Re-run and review the source commit, workspace/package/process inventory,
@@ -234,8 +332,10 @@ remains here under a completed status.
   7. Add a reusable `browser-vm` profile using the existing
      `DeliveryType::DesktopVm` contract. Size it from host capabilities within
      safe operator bounds, retaining 4 vCPU, 8 GiB RAM, and 64 GiB disk as the
-     baseline profile. The image contains Chromium, supported GPU/video
-     acceleration, PipeWire integration, and guest agents.
+     baseline profile. The new repository-owned profile contract fixes the
+     guest identity, Chromium/Sway ownership, Sunshine default, RDP alternate,
+     and `host_browser=false`; the image still must contain Chromium, supported
+     GPU/video acceleration, PipeWire integration, and guest agents.
   8. Replace shell `web` state with a small VM controller. Browser activation
      resolves and starts/resumes the stable workload, waits for its advertised
      desktop source, and exposes RDP and Sunshine/Moonlight as equal first-class
@@ -493,34 +593,25 @@ remains here under a completed status.
   unsupported status. Mesh Teams owns persisted team clipboard history/actions;
   this epic owns transport and seat/VDI behavior. Browser participates only as
   the `browser-vm` VDI guest.
-- Current state: The canonical `event/clipboard/clip` body and
-  `action/clipboard/{list,pin,unpin,delete,clear}` verbs exist. Daemon history
-  and bridge code, Mesh Teams presentation, and VNC cut-text primitives provide
-  partial foundations, but the direct DRM seat path and complete bidirectional
-  protocol integration are not production-complete. DRM/VNC clipboard state
-  handling, a bounded UTF-8-safe local text provider, explicit RDP/SPICE
-  capability reporting, CopyText-clear/native-paste round-trip, and rejection
-  of no-op provider writes now have focused farm coverage. KDC/mobile ingress now has typed authorization, UTF-8/1 MiB bounds, peer-scoped deduplication, and
-  honest metadata with 22 focused farm tests. Mesh Teams shows Local/Remote/Source unavailable provenance with action hints and 5 clipboard tests; real
-  mesh materialization remains open. VNC is bidirectional while RDP CLIPRDR and
-  SPICE vdagent remain unsupported, and the shell VDI state now exposes that
-  protocol capability with focused coverage in the integrated change.
+- Current state: Canonical `event/clipboard/clip` and action verbs exist. DRM
+  Copy/Cut/Paste, bounded `CopyText`, shell materialization, VNC state,
+  RDP/SPICE capability reporting, KDC/mobile authorization, bounds,
+  deduplication, and attribution have focused coverage. Local publishing is
+  session-scoped opt-in in Mesh Teams Settings; daemon history has a durable
+  cursor and retry-safe acknowledgement. Signed VDI events authorize the exact
+  target seat and leave failed writes retryable. KDC has 31 focused tests; VNC
+  has a verified ClientCutText/ServerCutText round trip; the shell adapter has
+  58 VDI tests. The daemon bridge validates serving peer and target seat with
+  source attribution, deduplication, and retryability (27 bridge + 43 sync
+  tests). RDP CLIPRDR/SPICE vdagent remain typed unsupported and gated.
 - Remaining work:
 
-  1. Map direct-seat shortcuts into `egui::Event::{Copy,Cut,Paste}`, consume
-     platform `CopyText`, and maintain bounded local text clipboard state.
-  2. Publish local copies through `event/clipboard/clip` with stable content ID,
-     source identity, RFC3339 time, size bounds, and echo/dedup guards.
-  3. Fold that lane into daemon history and implement authorized target-seat
-     materialization without polling Wayland tools. Local publishing is automatic
-     for opted-in users; new users default to disabled, enabling publishes only
-     new entries, and disabling local publishing leaves remote history visible.
-  4. Complete KDC/mobile inbound validation, authorization, size bounds,
-     attribution, and active-seat materialization.
-  5. Complete bidirectional VNC `ClientCutText`/`ServerCutText` integration and
-     add real RDP/SPICE text channels where supported; retain explicit
-     unsupported capability status instead of fake success.
-  6. Route Mesh Teams clipboard UI/actions to the same lane. Persist team
+  1. Wire the production OS/guest clipboard adapter for the signed target-seat
+     handoff, preserving bounded retry and explicit unavailable-state reporting;
+     do not reintroduce Wayland polling.
+  2. Connect the completed KDC/mobile active-seat materialization queue to the
+     production OS/guest adapter without losing remote history or attribution.
+  3. Route Mesh Teams clipboard UI/actions to the same lane. Persist team
      history/actions for the session only, support per-user opt-out, and keep
      remote history visible when local publishing is disabled. Route Browser
      copy and paste solely through its VDI protocol after WL-ARCH-008 removes
@@ -594,7 +685,9 @@ remains here under a completed status.
   all-source selection, and 44 vehicle tests pass. Maps HUD/Airspace expose honest unavailable/stale states with 17 focused tests; route preview Start
   distinguishes missing route, blocked offline readiness, and missing GPS with
   7 focused route-preview tests at `05ba6870`. Live adapters and route/render
-  cutover remain.
+  cutover remain. Navigation start now has typed readiness gating that rejects
+  malformed or stale selections without mutating navigation state; the farm
+  Maps model suite passes 76 tests.
 - Remaining work:
   1. Consume WL-UX-009's platform-wide Carbon-requirement retirement and update
      the Maps/Car-specific authority while retaining egui, shared `Style`,
@@ -769,6 +862,280 @@ remains here under a completed status.
   `docs/design/maps-live-overlays.md`, the official MG90 hardware/setup
   inventory, and Apple/Google in-vehicle navigation guidance.
 
+### WL-FUNC-018 - Seamless Flatpak Front Door backed by App VMs
+
+- Status: Remaining
+- Priority: P1
+- Complexity: Epic
+- Problem: Construct has no supported way to discover or launch Wayland
+  Flatpak applications. The host deliberately owns the DRM seat directly,
+  ships no compositor, and does not run native host applications, so adding a
+  normal Flatpak launcher would silently violate the thin-client boundary.
+  Flatpak applications also need a real Wayland session, portal services,
+  runtimes, GPU/audio policy, and durable application identity; none of those
+  contracts currently connect the Front Door catalog to App VM provisioning.
+- Required outcome: A user searches Front Door, selects a Flatpak app, and
+  sees it launch as a Construct application without managing or seeing the
+  underlying VM. Construct owns catalog, favorites, permissions explanation,
+  launch state, stop/resume, reconnect, and honest failure presentation.
+  `mackesd` places or resumes a Wayland-enabled App VM through the existing
+  Workloads/session-broker/VDI planes; the guest owns Flatpak, its compositor,
+  portals, app files, and app execution. No host compositor, host Flatpak
+  sandbox, arbitrary host D-Bus access, or native-app fallback is introduced.
+- Current state: Front Door validates signed catalog rows and honest unavailable,
+  stale, unsigned, and non-launchable states; typed App VM declarations and
+  `OpenApp` cross Workloads/session-broker/VDI. The bounded Sway profile,
+  lifecycle reasons, admission-gated favorites, immutable runtime verifier,
+  and no-public-remote policy are implemented. Session retries preserve
+  catalog/capability/resume intent while rejecting retargets; 20 App VM and
+  guest-runtime readiness tests plus 39 broker tests pass. Guest rows use
+  distinct `Guest App`/`Guest Flatpak` accessibility language. App VM image
+  build carries immutable labels and defaults to Fedora 44; farm contract and
+  registry-unavailable refusal checks pass. Full provision/guest/VDI
+  convergence remains open.
+- Remaining work:
+
+  1. Complete the Front Door catalog experience around the validated projection:
+     finish permission explanation and launch-state/reconnect presentation.
+     Preserve unavailable, stale, unsigned, and not-installed states instead of
+     presenting a launchable card for missing guest content.
+  2. Finish integration of the typed App VM launch/session contract across the
+     Workloads and `action/vdi/session` seams, including app identity, catalog
+     revision, guest profile, placement constraints, session identity, requested
+     capabilities, and resume/reconnect intent without raw command, mount,
+     environment, or socket input.
+  3. Complete `mackesd` reconciliation for App VM images and app declarations:
+     the typed desired-state and dedicated image-selection/build lane now land;
+     signed-image admission now distinguishes unavailable, unsigned, stale,
+     and fresh matching evidence before declaration; still required are
+     idempotent provision/resume now requires fresh matching guest-runtime evidence;
+     full guest install/update execution through the admitted
+     `curated` remote, and complete daemon-published readiness. The guest unit
+     now reports bounded install/start/failure evidence and the broker consumes
+     it; the guest image validates every identity before admission. The image
+     now has a fixed compositor/app supervisor; full process convergence remains
+     required. Repeated launches must converge
+     on one app session, not duplicate VMs or processes.
+  4. Finish the hardened App VM profile: the image definition now pins the
+     supported Wayland compositor, portal frontend/backends, Flatpak, PipeWire,
+     input, and deny-by-default profile, while the new static built-image
+     verifier now checks those contents and requires immutable image provenance;
+     remote signing and bounded writable app-data policy remain to be
+     implemented and inspected in a built image.
+     The image-owned launcher binds app process lifetime to the
+     guest compositor and emits terminal failure evidence. Portal prompts and file access remain guest-scoped; the host
+     does not proxy arbitrary portal requests or grant unrestricted host paths.
+  5. Complete VDI app-mode presentation so the shell renders the application
+     surface with Construct chrome, forwards keyboard/pointer/touch/text input,
+     preserves focus, and handles resize, close, suspend, reconnect, and
+     compositor/app crash separately. A full guest desktop may be a diagnostic
+     recovery view only; it is not the normal Flatpak UX. The Workloads-side
+     launch action and typed session handoff are now landed; Construct-owned
+     app identity chrome, close, input routing, and bounded reconnect/failure
+     presentation are covered by focused tests. Focusing the resulting
+     broker-visible App VM rail entry now routes the typed session into the
+     existing VDI console resolver once; live guest-backed rendering, resize,
+     reconnect, and compositor/app crash proof remain required.
+  7. Add explicit user-facing permission and lifecycle states: installing,
+     waiting for placement, starting guest, starting app, connected, paused,
+     reconnecting, unavailable, denied, stale catalog, and failed with retry
+     guidance. Destructive actions (remove app/data, stop guest, reset guest)
+     require typed confirmation and explain their scope. The shared lifecycle
+     enum now enforces legal forward/retry edges and idempotent repeated states
+     in the daemon broker. The serving daemon also emits a signed
+     `starting_guest` handoff while the session is still waiting, without
+     rewinding later evidence; guest runtime probes, publication of later
+     transitions, and shell consumption of connected/reconnecting states remain
+     required.
+  8. Integrate app data, updates, favorites, recents, and removal with the
+     existing replicated-state and retention rules. Keep app data in the guest
+     profile, distinguish app reset from VM reset, and make purge behavior
+     explicit; never replicate secrets or silently expose guest home data to
+     the Construct host.
+  9. Add admission and security policy: default-deny network/host exposure,
+     capability and resource-budget checks, signed image/catalog provenance,
+     audit records for install/launch/permission/reset, and blast-radius
+     diagnostics. Reuse WL-CRIT-006 Workloads admission and provenance rather
+     than creating a second authorization plane.
+  10. Provide a staged migration and rollout: catalog-only records first,
+      one curated Flatpak in one App VM profile second, then updates,
+      favorites, roaming, remote placement, and broader catalog coverage.
+      Existing Construct surfaces and the Browser VM route remain unchanged;
+      an unavailable provider produces an honest disabled state.
+  11. Add a curated LibreOffice App VM profile using the same App VM/VDI
+      contract. Support Writer, Calc, and Impress, typed application identity,
+      document associations, and Workspace shortcut-group presentation. The
+      normal UX must not expose the guest desktop.
+  12. Add Construct-owned printing for the LibreOffice profile: printer
+      discovery/health, local and mesh printer selection, page-faithful preview,
+      paper/tray/orientation/margins, duplex/binding, color, copies/collation,
+      page ranges, scaling, N-up/booklet, PDF output, presets, progress,
+      cancel/retry, explicit offline/error states, and touch-sized tablet
+      controls. Print and preview must share pagination/rendering semantics.
+- Scope: Flatpak catalog/discovery, Front Door UX, App VM lifecycle and
+  placement, guest Wayland/portal/runtime image, VDI app-mode display/input,
+  permissions, app data, updates, roaming, resource admission, audit, recovery,
+  the curated LibreOffice App VM, and its printing workflow. Native host
+  Wayland mode, a host compositor, arbitrary user-built Flatpak manifests,
+  unrestricted host filesystem/D-Bus access, and a general host desktop/window
+  manager are out of scope.
+- Relevant files/components:
+  `crates/desktop/mde-shell-egui/src/front_door.rs`,
+  `crates/desktop/mde-shell-egui/src/front_door_peer_apps.rs`,
+  `crates/desktop/mde-shell-egui/src/iac/views/app_vm.rs`,
+  `crates/desktop/mde-shell-egui/src/{discovery,session_rail,vdi}/`,
+  `crates/mesh/mackesd/src/workers/{session_broker,vm_lifecycle,desktop_sources}.rs`,
+  `crates/mesh/mackes-mesh-types/src/cloud.rs`, and App VM/bootc packaging.
+- Dependencies: Coordinate guest ownership and app-mode behavior with
+  WL-ARCH-008; use WL-FUNC-016 for bounded text clipboard across VDI; use
+  WL-CRIT-006 for resource admission, provenance, retention, and production
+  evidence. Reuse the existing Workloads Bus contracts and session identity;
+  do not create a Flatpak-specific control plane or a second active worklist.
+- Acceptance criteria:
+
+  1. A signed curated Flatpak catalog appears in Front Door with stable app
+     IDs, icons, metadata, source/revision, install state, and accessible
+     search results. Malformed, duplicate, stale, and unsigned records are
+     non-launchable and explain why.
+  2. Selecting an installed app creates or resumes exactly one admitted App VM
+     session through typed Workloads plus `action/vdi/session`; no shell code
+     executes a catalog-provided command or opens an arbitrary host path.
+  3. The guest boots a supported Wayland session and portal stack; the selected
+     Flatpak renders through VDI app-mode, receives focused input, and supports
+     close, pause/resume, reconnect, resize, and app-crash recovery states.
+  4. The normal user experience shows an app surface with Construct chrome,
+     not a host window and not an unmanaged guest desktop. No host compositor
+     or native host Flatpak path is required.
+  5. Guest portal requests are bounded and auditable. File chooser, OpenURI,
+     settings, notifications, audio, clipboard, and screen/input capabilities
+     either work through the declared guest policy or show an honest reason
+     they are unavailable; no unrestricted host access is granted.
+  6. Install, update, launch, stop, resume, remove, reset, and purge behavior
+     is idempotent, authorized, auditable, and tested across local placement,
+     remote placement, node loss, VM restart, app crash, and reconnect.
+  7. App data and credentials remain guest-scoped with explicit retention and
+     purge semantics; favorites/recents replicate only approved metadata.
+  8. Resource admission rejects unsafe CPU, memory, storage, GPU, network, or
+     capability requests before provisioning and exposes the rejection reason.
+  9. A curated end-to-end proof passes on the build farm plus a reachable
+     VDI/guest seat; missing live Wayland, portal, GPU, audio, or hardware
+     evidence is recorded as unavailable rather than implied by unit tests.
+- Verification method: Add pure catalog, identity, ranking, permission,
+  lifecycle, migration, and malformed-input tests; Bus contract tests for
+  typed App VM launch/session records; deterministic `mackesd` reconciliation
+  and idempotency tests; VDI frame/input/reconnect tests; guest-image and
+  portal-policy inspection; package/signature/provenance/resource-admission
+  gates. Run focused shell, mesh-types, `mackesd`, VDI, and packaging tests on
+  independent farm slots, with the longest App VM/guest build on BigBoy, plus
+  workspace clippy/fmt and worklist/doc/architecture/secret gates. Finish with
+  a live curated-app launch, portal file-selection, audio/input, app-crash,
+  suspend/resume, reconnect, and corrected-forward recovery capture when the
+  seat and guest provider are available.
+- Origin or merged source IDs: 2026-07-31 operator brainstorm: “Flatpak Front
+  Door backed by App VMs” — combines the Flatpak catalog/control-plane path
+  with the existing App VM/VDI runtime path. Evidence sources are the current
+  Construct no-host-app/no-compositor governance, App VM view, Front Door
+  provider, Workloads contracts, session broker, VDI transport, and Flatpak /
+  Wayland / xdg-desktop-portal upstream contracts.
+
+### WL-CRIT-006 - Production evidence, six-node acceptance, and corrected-forward recovery
+
+- Status: Remaining
+- Priority: P0
+- Complexity: Epic
+- Problem: Construct has strong static engineering evidence but no single
+  authoritative production-readiness contract. GitHub CI, farm execution,
+  package compatibility, live hardware, multi-node recovery, and operator
+  evidence are described in separate places. The platform therefore risks a
+  static-green release being mistaken for a production-ready release.
+- Required outcome: GitHub required checks are authoritative, the farm is the
+  heavy self-hosted backend, and every release emits a signed evidence bundle.
+  Production promotion requires a verified three-lighthouse/three-workstation
+  topology, capability-based readiness, corrected-forward recovery, automatic
+  lighthouse failover, resource admission, minimal-retention policy, and a
+  permanent six-node integration/chaos gate.
+- Current state: The repository has static build/test/clippy/fmt/coverage,
+  policy, SBOM, package, health, audit, encrypted-backup, farm, and live-proof
+  foundations; preview remains distinct from promotion and needs three
+  lighthouses plus the six-node substrate. `release-evidence.sh` emits
+  schema-v2 source/artifact/SBOM/gate bindings; `sign-release.sh --evidence`
+  publishes signed provenance and checksums. `ci-gate.sh verify` rejects
+  non-green, unobserved, stale, or unbound farm results and requires matching
+  `github-required=pass`. A fail-closed six-node verifier requires exactly three
+  lighthouses, three workstations, fresh artifact-bound recovery evidence, and
+  `--require-live`; no real bundle exists. Farm-to-GitHub publication, six-node/
+  live gates, and operator-key publication remain outstanding.
+- Remaining work:
+
+  1. Make GitHub required checks the promotion authority and connect the farm as
+     the heavy self-hosted execution backend. The release envelope now consumes
+     `ci-gate.sh verify` as a fail-closed farm-result check and requires the
+     matching `github-required` result; complete the operational publication
+     of that GitHub/farm association. Until that path is operational,
+     production promotion remains blocked.
+  2. Define and verify the fixed six-node topology: three lighthouses and three
+     workstations, with explicit degraded and recovery states.
+  3. Implement guided scope-bound enrollment, capability quarantine, typed
+     readiness, per-domain merge/provenance contracts, and automatic lighthouse
+     failover.
+  4. Implement corrected-forward re-enrollment and preserve current encrypted
+     backups until replicated-live-state recovery has passed destructive drills.
+  5. Add typed workload resource admission, profile activation, retention rules,
+     redaction/purge behavior, and incident evidence bundles.
+  6. Maintain a permanent six-node testbed with nightly failure injection,
+     lighthouse loss, re-enrollment, VDI reconnect, workload pressure, and
+     state-convergence scenarios.
+  7. Reconcile normative guidance and historical banners across root, help,
+     operations, design, and tracked agent-skill docs; keep the canonical
+     worklist pointer and current gate list synchronized with dated evidence.
+- Scope: Cross-cutting release authority, topology, enrollment/recovery,
+  readiness, failover, state convergence, workload admission, retention,
+  provenance, incident evidence, and multi-node acceptance. Feature behavior
+  remains owned by WL-ARCH-008, WL-FUNC-011, WL-FUNC-016, WL-FUNC-017,
+  WL-UX-009, WL-UX-011, and WL-UX-012. Current encrypted backups remain in
+  service during the transition; this epic does not authorize disabling them.
+- Relevant files/components: `AI_GOVERNANCE.md`; `.github/workflows/ci.yml`;
+  `install-helpers/ci-gate.sh`; `install-helpers/xcp-build.sh`;
+  `docs/farm.md`; `docs/BUILD-ENVIRONMENT.md`; packaging/release helpers;
+  enrollment, health, audit, workload, and recovery contracts.
+- Dependencies: Coordinate Browser, Teams, clipboard, Maps, This Node, theme,
+  and taskbar acceptance with their existing epics. Use the existing Bus,
+  healthz, audit, CA, Workloads, and farm contracts rather than creating a
+  second authority.
+- Acceptance criteria:
+
+  1. A GitHub required-check result and signed release-evidence artifact exist
+     for every candidate release; farm execution is traceable by job and slot.
+  2. A release cannot receive a production verdict when a required static,
+     compatibility, topology, recovery, live, or hardware gate is missing,
+     stale, unavailable, or manually asserted.
+  3. Three lighthouses and three workstations pass join, steady-state, loss,
+     failover, re-enrollment, and corrected-forward recovery drills.
+  4. Node and capability readiness distinguish healthy, degraded, stale,
+     unavailable, blocked, and recovering without hiding unaffected services.
+  5. Workload placement explains resource/capability decisions and preserves
+     control-plane headroom; retention and purge rules are enforced.
+  6. Replicated domains expose deterministic merge rules, source identity,
+     revision provenance, conflict behavior, and bounded recovery.
+  7. Incident bundles correlate health, audit, worker, transport, workload,
+     certificate, and operator events without including secrets.
+  8. Existing encrypted backups remain verified until peer-replication recovery
+     is proven; the transition has an explicit evidence record.
+  9. The six-node testbed runs repeatable chaos and recovery scenarios and
+     publishes artifacts suitable for production promotion review.
+  10. Normative guidance names only current commands, roles, boundaries, and
+      gates; retired architecture docs are bannered; documentation and
+      worklist lints pass.
+- Verification method: Run worklist, governance, documentation, secret,
+  package, compatibility, and provenance lints; run GitHub required checks and
+  farm gates with BigBoy carrying the long pole; run parallel six-node tests for
+  join, failover, recovery, state convergence, resource pressure, retention,
+  and VDI reconnect; perform signed-artifact and Fedora transaction checks;
+  preserve live evidence bundles and explicit unavailable-hardware notes.
+- Origin or merged source IDs: Fit-for-purpose audit 2026-07-30 (`AUD-01`
+  through `AUD-07`, `AUD-09`, and `AUD-17` through `AUD-25`); operator-selected
+  production gate, topology, recovery, trust, retention, and testbed decisions.
+
 ## User Interface And Experience
 
 ### WL-UX-009 - Complete the shared Quazar workspace design language
@@ -792,41 +1159,38 @@ remains here under a completed status.
   Terminal-pattern unified top bar is shared across workspaces, with approved
   exemptions recorded individually; the side tab bar is 25% thinner, two-row,
   and zebra-striped for differentiation.
-- Current state: Kdam Thmor Pro, Quazar Light, shared typography/palette
-  projection, themed tooltip cleanup, and governance alignment have landed.
-  Core `mde-egui` navigation, sheet, popover, motion, style, and capture
-  primitives exist. Current authority now makes Carbon optional and requires a
-  shared registry/license audit; per-theme disabled ink now remaps through the
-  palette with 54 focused style tests passing (257 `mde-egui` tests overall).
-  The centralized `Whimsy` preset now gives taskbar transitions a bounded
-  280ms/50ms normal/reduced path plus 31 focused motion tests; full
-  surface/internal-chrome adoption remains.
-  Shell chrome now has a responsive Windows-style bottom clock/tray with
-  dot-only mesh health, a cross-faded side-rail top strip, and a selectable,
-  persisted Home wallpaper/enable path.
+- Current state: Shared Quazar typography, palettes, chrome primitives, state
+  panels, menubars, dense lists, and most Construct-owned route migrations are
+  landed. Farm suites cover shell, Editor, Teams, Maps, Files, Bookmarks, Music,
+  Device, Storage, and This Node. Dell is unreachable; Dark/Light, narrow,
+  no-overlap, licensing, and production DRM matrix proof remains incomplete.
+  Corrected `12.1.6-1` base/browser RPMs are installed on `.138`; the current
+  farm-built shell hash is `3e14be22a7c12fe41e8fa4a8386a7c1287a5d6b532ae69e3b3bbd94bad873594`,
+  service active, `NRestarts=0`. Direct-DRM Light/Largest Editor and Files
+  captures show the full taskbar and wrapped commands; This Node now exposes
+  Clock & Date with Eastern Standard Time default and `.138` is `America/New_York`.
+  Readiness is not claimed pending narrow no-overlap and remaining route proof.
 - Remaining work:
 
-  1. Reconcile `AI_GOVERNANCE.md` and the current platform-interface authority
-     to retire Carbon theme/icon requirements while preserving egui, shared
-     `Style`, Construct/Car, HIG principles, and direct DRM. Then inventory every
-     launchable egui surface and classify raw styling, one-off app frames,
-     navigation, state views, dialogs, hover text, icons, motion, tables/lists,
-     licensing, and dark/light gaps.
-  2. Finish the shared app-frame and Terminal-pattern unified top bar, including
+  1. Finish the shared app-frame and Terminal-pattern unified top bar, including
      the per-workspace exemption review. Complete loading/empty/stale/offline/
      error/destructive states, sheets, popovers, tooltips, table/list density,
-     icon registry/cache, and centralized reduced-motion-safe primitives.
-  3. Migrate shell chrome and every launchable workspace to those primitives,
+     icon registry/cache, and centralized expressive motion primitives;
+     reduced-motion substitutions are optional compatibility work, not a core
+     feature.
+  2. Migrate shell chrome and every launchable workspace to those primitives,
      matching Terminal's top-of-space pattern and preserving only explicitly
      approved Maps content-color and focused-VDI pixel exceptions.
-  4. Migrate Editor and Terminal internal tabs, toolbars, palettes, sidebars,
-     popovers, and status rows without changing editor/terminal behavior. Make
+  3. Migrate Editor and Terminal internal tabs, toolbars, palettes, sidebars,
+     popovers, and status rows without changing editor/terminal behavior. Direct
+     Editor entry now collapses both optional sidebars, covered by the focused
+     farm test `direct_entry_collapses_all_optional_sidebars`; make
      the side tab bar 25% thinner, two-row, and zebra-striped without clipping.
-  5. Apply the shared language to Mesh Teams, This Node, and Construct-owned
+  4. Apply the shared language to Mesh Teams, This Node, and Construct-owned
      `browser-vm` connection/unavailable/diagnostic states. Do not style the
      guest Chromium viewport or reintroduce host Browser chrome.
-  6. Complete Dark/Light, desktop/narrow/large-text, reduced-motion, no-overlap,
-     icon licensing/raster, and representative live DRM proof.
+  5. Complete Dark/Light, desktop/narrow/large-text, no-overlap, icon
+     licensing/raster, expressive motion, and representative live DRM proof.
 - Scope: Current design authority, shared `mde-egui` and brand/icon primitives,
   shell-owned chrome, launchable egui workspace frames, and Editor/Terminal
   internal chrome. Behavior contracts, security/auth, full AccessKit rollout,
@@ -835,8 +1199,12 @@ remains here under a completed status.
   `crates/shared/mde-theme/`, shell chrome, and all crates registered in the
   embedded surface inventory.
 - Dependencies: Coordinate adoption with WL-ARCH-008, WL-FUNC-011, and
-  WL-UX-011. Shared visual work may proceed independently and must not block
-  functional contracts or create a second product epic.
+  WL-UX-011. WL-UX-011 owns This Node behavior, typed actions, health-score
+  integration, auditability, and vendor-pack contracts; WL-UX-009 owns only
+  shared visual adoption and render proof. WL-UX-012 owns taskbar chrome,
+  WL-FUNC-017 owns MG90 telemetry semantics, and WL-CRIT-006 owns integrated
+  production evidence. Shared visual work may proceed independently and must
+  not block functional contracts or create a second product epic.
 - Acceptance criteria:
 
   1. Current authority contains no Carbon theme/icon requirement. Quazar
@@ -845,7 +1213,7 @@ remains here under a completed status.
   2. Construct-owned surfaces use shared frames/navigation/state/dialog/tooltip
      primitives unless an explicit governed exception is documented.
   3. Editor and Terminal internal chrome is migrated; dense tables/lists are the
-     default operational idiom; motion is centralized and reduced-motion safe.
+     default operational idiom; expressive motion is centralized and tested.
   4. Maps content exceptions are marked, focused VDI retains full-screen pixels,
      Car Dark/Light behavior is tested, and guest Chromium receives no
      Construct chrome.
@@ -879,7 +1247,34 @@ remains here under a completed status.
   Mesh & System. Controls operate through typed node-local contracts plus
   admin-authorized trusted-session remote actions, preserve mesh reachability,
   expose honest unavailable/degraded states, and bound privileged/OEM writes
-  with confirmation, audit, safety limits, and recovery.
+  with confirmation, audit, safety limits, and recovery. The operator-facing
+  experience follows a Windows 10-style Device Manager model: a unified
+  expandable tree, a health-dashboard landing view, and focused detail views
+  for technical operators/admins. The existing top-rail health score remains
+  the single health authority; selecting it opens this tree with unhealthy
+  items highlighted. Monitoring and configuration have equal priority. The
+  landing view leads with critical alerts and affected components; a healthy
+  node presents a calm all-systems-operational summary. Health severity uses
+  color, icon, label, and text. The tree includes Hardware, Services, Storage,
+  Network, Users, and System, with persistent badges tied to the existing
+  score. Selecting an item opens a dedicated full-page detail view. Actions
+  live in a dedicated Actions tab; risky operations show expected impact and
+  require confirmation; restart-required changes warn before applying.
+  Recent events use compact expandable summaries. Storage uses capacity bars
+  with detailed tables in the detail view; Network uses an interface summary
+  with topology on demand; Performance uses live charts. Refresh is on demand
+  with stale indicators. Unavailable data shows a recovery error. Auditability
+  includes per-item operator, timestamp, and outcome history. Permission
+  management is role-first, with users grouped under roles. Long-term design
+  must remain extensible for future hardware, services, node types, and
+  installed vendor packs, which expose clearly separated, discoverable,
+  versioned vendor-specific settings in the owning detail view.
+  The center also covers the complete OS-management layer expected by mature
+  workstation settings surfaces: updates and lifecycle, recovery/reset,
+  security/privacy, accounts/sign-in, applications and services, backup/restore,
+  diagnostics/logs, printers and peripherals, accessibility, time/language/
+  region, and virtualization/remote access. These domains remain under the
+  same node authority and must not recreate legacy settings routes.
 - Current state: Existing System, Storage, Device Manager, About, Control
   Center, status, BlueZ, display, power, firmware, and input code provide
   partial foundations; controls remain read-only in places, routes are
@@ -930,6 +1325,34 @@ remains here under a completed status.
   10. Finish desktop/narrow/large-text, unsupported-hardware, stale/provider
       failure, destructive confirmation, and physical-device proof using
       WL-UX-009 components.
+  11. Replace the current section catalog presentation with the surveyed
+      Device Manager-style hierarchy and health-dashboard landing view. Wire
+      the existing top-rail score to highlighted unhealthy tree nodes without
+      introducing a second score, and provide dedicated full-page details with
+      Actions, Events, Performance, Audit, and vendor-pack sections.
+  12. Implement the surveyed data states and operator workflows: on-demand
+      refresh/stale indicators; prominent unavailable recovery; compact
+      expandable events; capacity bars plus detailed storage tables; interface
+      summary plus on-demand topology; live resource charts; role-first users;
+      per-item audit records; restart warnings; and confirmation dialogs that
+      show expected impact.
+  13. Define and implement the vendor-pack extension contract. Discover
+      installed packs, version and capability status, expose vendor-specific
+      settings beside the owning hardware/service, keep standard and vendor
+      controls distinct, and fail visibly when a pack is missing, outdated, or
+      unavailable. Vendor writes must use the same typed authorization, safety,
+      audit, and recovery boundaries as platform controls.
+  14. Add the OS-management layer: update/lifecycle status, recovery/reset,
+      security/privacy and encryption posture, accounts/sign-in, applications
+      and services, backup/restore, diagnostics/logs, printers/peripherals,
+      accessibility, time/language/region, and virtualization/remote access.
+      Each provider must expose capability, freshness, safe actions, failure
+      recovery, and audit state through the unified authority.
+  15. Complete the final survey decisions: urgent critical-health alerts;
+      configurable persistent notifications with acknowledgement, snooze, and
+      escalation; guided recovery actions with expected-impact confirmation;
+      role-gated health policy and overrides; explicit live/on-demand refresh
+      and stale intervals; and redacted, audit-backed history export.
 - Scope: Local workstation hardware state, typed node-local mutation,
   admin-authorized trusted-session remote mutation, diagnostics, settings
   consolidation, capability discovery, quick controls, and safe OEM adapters.
@@ -963,6 +1386,26 @@ remains here under a completed status.
   7. Desktop, narrow, large-text, degraded, and confirmation states have no
      overlap/clipping; available physical controls pass direct-seat proof and
      unavailable hardware is recorded honestly.
+  8. The surveyed Device Manager hierarchy, health-dashboard landing view,
+     existing top-rail health-score drill-down, dedicated full-page details,
+     Actions/Events/Performance/Audit sections, and role-first Users view are
+     implemented without creating a second settings or health authority.
+  9. On-demand refresh, stale indicators, recovery errors, expandable event
+     summaries, capacity bars plus detail tables, interface summary plus
+     topology, live resource charts, restart warnings, and expected-impact
+     confirmations are tested at desktop, narrow, and large-text sizes.
+  10. Vendor packs are discoverable, versioned, capability-aware, and visibly
+      separated from standard controls; missing, outdated, or unavailable
+      packs fail honestly, and vendor actions use typed authorization, safety,
+      audit, and recovery boundaries.
+  11. Updates, recovery, security/privacy, accounts, applications/services,
+      backup/restore, diagnostics, peripherals, accessibility, time/language,
+      and virtualization/remote access are represented in the unified tree and
+      tested for capability discovery, unavailable states, safe actions, audit,
+      and responsive rendering.
+  12. Critical alerts, notification acknowledgement/snooze/escalation,
+      guided recovery, role-gated health policy, explicit refresh/stale
+      intervals, and redacted evidence export are tested and audited.
 - Verification method: Run fixture/contract tests for routing/search and every
   provider/capability adapter; focused farm tests for shell, seat, typed
   contracts, daemon workers, package dependencies, architecture/secret/style
