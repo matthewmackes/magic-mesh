@@ -7,18 +7,22 @@ workspace frame. It does not close WL-UX-009 or claim production readiness.
 
 - Seat: `.138` (`172.20.146.138`), physical Fedora 44 DRM seat.
 - Connector: `card1-eDP-1`, connected; capture mode `1920x1080`.
-- Shell artifact: `4ba0b2f74db60894527bdd0866c62a3646d26330dcc98a8132777cb1e3610cd1`.
+- Shell artifact: `bea573f929239e819eeeca2425ad8f1132485fadb1f8fb010f9ed97376dab8b7`.
 - Build: BigBoy farm `172.20.0.130`, slot 11, release shell with
   `drm,live-helper,live-vdi,media-mpv`.
 - Runtime: `mde-shell-egui.service` active, `NRestarts=0` after deployment.
+- Dell deployment: `172.20.146.225` (`DELL-LAPTOP`) received the same artifact;
+  service active with `NRestarts=0`.
 
 ## Captures
 
 The previous `2f427f…` artifact had representative captures reviewed during
 the earlier pass, but those files are not retained as current proof. A fresh
-capture attempt for the exact `4ba0b2f…` artifact produced scanout-corrupted
-line artifacts on all three profiles, so those PNGs are explicitly rejected
-and do not count as visual evidence.
+capture attempts for the exact `bea573f9…` artifact produced scanout-corrupted
+line artifacts on both `.138` and Dell. An A/B run with the earlier 12.1.6
+artifact reproduced the same corruption on Dell, so the failure is independent
+of the deployed shell binary. Those PNGs are explicitly rejected and do not
+count as visual evidence.
 
 | Profile | Route | Result |
 | --- | --- | --- |

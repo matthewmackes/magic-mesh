@@ -686,8 +686,8 @@ remains here under a completed status.
   distinguishes missing route, blocked offline readiness, and missing GPS with
   7 focused route-preview tests at `05ba6870`. Live adapters and route/render
   cutover remain. Navigation start now has typed readiness gating that rejects
-  malformed or stale selections without mutating navigation state; the farm
-  Maps model suite passes 76 tests.
+  malformed or stale selections without mutating navigation state; fresh farm
+  full-crate Maps suite passes 264 tests with no failures.
 - Remaining work:
   1. Consume WL-UX-009's platform-wide Carbon-requirement retirement and update
      the Maps/Car-specific authority while retaining egui, shared `Style`,
@@ -1168,9 +1168,10 @@ remains here under a completed status.
   [`WL-UX-009-DRM-EVIDENCE-2026-07-31.md`](WL-UX-009-DRM-EVIDENCE-2026-07-31.md).
   `.138` is active with `NRestarts=0`; the exact current artifact's Dark desktop,
   Dark narrow, and Light/Largest KMS captures were rejected as corrupted
-  scanout-line artifacts, so no visual pass is claimed. `.15` is SSH-reachable
-  with `NRestarts=0`, but its Intel compressed KMS capture is also corrupted and
-  is not counted as visual proof; Dell and full readiness remain open.
+  scanout-line artifacts, so no visual pass is claimed. Dell
+  (`172.20.146.225`) is now reachable and has the same artifact deployed with
+  `NRestarts=0`, but its A/B KMS captures are also corrupted and are not counted
+  as visual proof. `.15` remains open, as do the full matrix and readiness.
 - Remaining work:
 
   1. Finish the shared app-frame and Terminal-pattern unified top bar, including
