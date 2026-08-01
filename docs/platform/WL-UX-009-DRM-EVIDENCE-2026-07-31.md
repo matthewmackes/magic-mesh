@@ -48,6 +48,9 @@ normal secure runtime settings.
 | Dell Dark Files (payload `44296eee`) | Files | native `1366x768` direct-DRM capture; shared MenuBar, sidebar, file list, preview pane, and status strip remain separated | `25aadf12b0dd4255feb1eed7d9890f3fbcefc646f2074695b9325cfb89da3fc7` |
 | Dell Dark narrow Files (payload `44296eee`) | Files | `800` logical width; file toolbar, sidebar, list, preview boundary, and bottom status remain readable without horizontal overlap | `ff6e00b5d23cba1c8948f7c7c7841b20649b26e727444a9c9ed612cf61ff7ed1` |
 | Dell Light / Largest Files (payload `44296eee`) | Files | native `1366x768` direct-DRM capture; large-text sidebar state rows are fully visible above the bottom status strip | `2f528d356901b79be899217a48e72a7a689cb5811cdd8139751ff7095e0febb9` |
+| Dell Dark Mesh Teams (payload `44296eee`) | Mesh Teams → Activity | native `1366x768` direct-DRM capture; shared workspace title, channel header, activity feed, detail rail, and call bar remain separated | `58d722ba2f90a84f50b6d1f300b1fcd5da4aad5f2a97af63765834f1b280840c` |
+| Dell Dark narrow Mesh Teams (payload `44296eee`) | Mesh Teams → Activity | `800` logical width; compact channel tabs and live activity feed remain readable with governed side rails omitted | `d3264288d33c5f6eb3765b42c345fc1d1e3eccc70e35eed6efc94cc5a4ec3911` |
+| Dell Light / Largest Mesh Teams (payload `44296eee`) | Mesh Teams → Activity | native `1366x768` direct-DRM capture; large-text activity rows, channel tabs, and bottom taskbar remain readable without clipping | `b3f8b80240d8ea70830d0fc77db022f34535c8a7607d4c7e55987c145c0388db` |
 
 | Dell Dark Phones (`AppFrame`, payload `035c4f3a`) | Phones | native `1366x768` direct-DRM capture; centered shared frame title and paired-device card render without overlap | `d8e3c1ef03adc371e424372846ce0fc44ff4351d1f100fc555049ab2c65e115f` |
 | Dell Dark narrow Phones (`AppFrame`, payload `035c4f3a`) | Phones | `800` logical width; centered frame title, status row, and clipboard field remain unobstructed | `6d203641bf923fb3b09c5f47512e5c3c947d06b121ca0c0155dcf8d2f469dc46` |
@@ -62,7 +65,9 @@ Dark/Light palettes, and large-text containment without the
 previous body collapse or scanout corruption. Phones and Timers now also have direct Dark,
 Dark narrow, and Light/Largest proof; Files now also has current-payload direct
 Dark, Dark narrow, and Light/Largest proof after tightening its large-text sidebar
-gaps; Phones uses the shared `AppFrame`, and the
+gaps; Mesh Teams now has current-payload direct Dark, Dark narrow, and
+Light/Largest proof while retaining its domain channel/call chrome; Phones uses
+the shared `AppFrame`, and the
 narrow layout keeps the workspace field clear by delegating the profile toggle to
 Control Center. The narrow capture intentionally
 uses an 800-point logical viewport on the 1920-pixel panel; the unused right

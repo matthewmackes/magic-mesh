@@ -1160,8 +1160,8 @@ remains here under a completed status.
   cover the shell and major workspaces. Direct-DRM evidence and hashes are in
   [`WL-UX-009-DRM-EVIDENCE-2026-07-31.md`](WL-UX-009-DRM-EVIDENCE-2026-07-31.md).
   `.138` has Editor Dark desktop/narrow and Light/Largest proof. Dell has clean
-  Editor/System/Bookmarks/Storage/Files/Phones/Timers Dark, narrow, and
-  Light/Largest proof with `NRestarts=0`; latest Files payload is `44296eee`.
+  Editor/System/Bookmarks/Storage/Files/Mesh Teams/Phones/Timers Dark, narrow,
+  and Light/Largest proof with `NRestarts=0`; latest payload is `44296eee`.
   The full RPM
   dependency transaction, `.15`, remaining routes/states, full matrix, and
   production readiness remain open.
