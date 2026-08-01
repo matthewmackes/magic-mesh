@@ -2863,6 +2863,12 @@ impl Shell {
         if !layout_mode_control_visible(ctx.screen_rect()) {
             return;
         }
+        // A docked left rail does not reserve a bottom taskbar band. The
+        // floating copy would otherwise land over large-text workspace content;
+        // Control Center remains the shared profile-toggle owner in this layout.
+        if !self.nav_bar.reserves_bottom_space() {
+            return;
+        }
         let profile = self.system.layout_profile();
         // (The Car-Mode instrument readout is now the left driver's strip reserved
         // in `central_view` — see `car_instrument_strip` — not a floating overlay.)

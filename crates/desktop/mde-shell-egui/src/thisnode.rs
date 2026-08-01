@@ -1645,6 +1645,7 @@ mod tests {
               "latest_version": "11.2.0",
               "online": 2,
               "total": 3,
+              "power_profile":{{"active":"balanced","available":["balanced","performance","power-saver"]}},
               "nodes": [
                 {{"hostname":"this-node","overlay_ip":"10.42.0.7","presence":"online",
                   "last_seen_ms":990000,"version":"11.1.0",

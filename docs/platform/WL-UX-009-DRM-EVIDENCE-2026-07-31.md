@@ -49,11 +49,14 @@ normal secure runtime settings.
 | Dell Dark Phones (compact-profile fix payload `34ebaac4`) | Phones | native `1366x768` direct-DRM capture; paired-device card and clipboard field visible without floating-control overlap | `fc3942c8f4fb4223aa3ff56c6131a220e47a9e659551d4513972e50ac48692e1` |
 | Dell Dark narrow Phones (compact-profile fix payload `34ebaac4`) | Phones | `800` logical width; the floating layout-profile control is suppressed and the clipboard field remains unobstructed | `9127359c41417b241fe52a9e633b833a7f1cf815bf1c34552260bfbe07a93118` |
 | Dell Light / Largest Phones (compact-profile fix payload `34ebaac4`) | Phones | native `1366x768` direct-DRM capture; large-text controls remain legible and the body continues through its scroll boundary | `684ce97789c0a91c8190963b9792d69926ec368f6479e7a9aa32e853132b9fc3` |
+| Dell Dark Timers (AppFrame payload `f49ae072`) | Timers & Alarms | native `1366x768` direct-DRM capture; timer/alarm controls and taskbar remain separated | `7b60a2b6fd3b27f2b6e7eff978efd1bd6ce431f727f36e8e922c098a06d6b183` |
+| Dell Dark narrow Timers (AppFrame payload `f49ae072`) | Timers & Alarms | `800` logical width; controls remain readable with no horizontal overflow or floating-control overlap | `5fa6d47f3c22bc3f75d62bfbed954508ffdf96a0b275ea301a990e02e63ae272` |
+| Dell Light / Largest Timers (AppFrame payload `f49ae072`) | Timers & Alarms | native `1366x768` direct-DRM capture; large-text timer/alarm body is readable and the profile control is absent when no bottom taskbar band is reserved | `a4dd2eed3cf376d3532772c8638bb6da0565839560dd0bf1584c847e6ec16218` |
 
 The captures show the shared MenuBar, AppFrame detail header, Editor,
 Bookmarks, and Storage workspace bodies, toolbars, side rails, taskbar,
 Dark/Light palettes, and large-text containment without the
-previous body collapse or scanout corruption. Phones now also has direct Dark,
+previous body collapse or scanout corruption. Phones and Timers now also have direct Dark,
 Dark narrow, and Light/Largest proof; the narrow layout keeps the workspace
 field clear by delegating the profile toggle to Control Center. The narrow capture intentionally
 uses an 800-point logical viewport on the 1920-pixel panel; the unused right
@@ -73,6 +76,7 @@ side is outside the proof viewport, not an overlap.
   selected-section title count; `system::tests::a_narrowed_sidebar` — 1 passed.
 - `mde-shell-egui::tests::layout_profile_button_sits_in_the_taskbar_gap_clear_of_surface_content` — passed.
 - `mde-shell-egui::tests::compact_width_uses_control_center_for_the_layout_toggle` — passed.
+- `mde-shell-egui::timers::tests::the_panel_renders_headless_over_real_state` — passed after the Timers `AppFrame` migration.
 - Worklist acceptance remains open for the full workspace matrix, remaining
   Construct-owned routes/states, and final production evidence. This is clean
   representative proof, not a claim that every route is production-ready.

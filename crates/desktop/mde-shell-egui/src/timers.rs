@@ -32,11 +32,13 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_egui::egui::{self, RichText};
+use mde_egui::nav_chrome::AppFrame;
 use mde_egui::Style;
 use serde::{Deserialize, Serialize};
 
@@ -57,6 +59,96 @@ const TIMERS_TOOLTIP_MAX_W: f32 = Style::SP_XL * 12.0;
 
 /// Seconds per day — the alarm schedule's civil-day modulus.
 const DAY_SECS: i64 = 86_400;
+
+/// The user-facing clock zone used by Construct chrome and the clock face.
+/// Eastern Standard Time is the deterministic platform default; mesh and audit
+/// timestamps remain UTC and are not rewritten by this display preference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ClockZone {
+    /// UTC−05:00.
+    EasternStandard,
+    /// UTC−06:00.
+    CentralStandard,
+    /// UTC−07:00.
+    MountainStandard,
+    /// UTC−08:00.
+    PacificStandard,
+    /// UTC±00:00.
+    Utc,
+}
+
+impl Default for ClockZone {
+    fn default() -> Self {
+        Self::EasternStandard
+    }
+}
+
+impl ClockZone {
+    pub(crate) const ALL: [Self; 5] = [
+        Self::EasternStandard,
+        Self::CentralStandard,
+        Self::MountainStandard,
+        Self::PacificStandard,
+        Self::Utc,
+    ];
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::EasternStandard => "Eastern Standard Time",
+            Self::CentralStandard => "Central Standard Time",
+            Self::MountainStandard => "Mountain Standard Time",
+            Self::PacificStandard => "Pacific Standard Time",
+            Self::Utc => "Coordinated Universal Time",
+        }
+    }
+
+    pub(crate) const fn short_label(self) -> &'static str {
+        match self {
+            Self::EasternStandard => "EST (UTC−05:00)",
+            Self::CentralStandard => "CST (UTC−06:00)",
+            Self::MountainStandard => "MST (UTC−07:00)",
+            Self::PacificStandard => "PST (UTC−08:00)",
+            Self::Utc => "UTC (UTC±00:00)",
+        }
+    }
+
+    const fn offset_seconds(self) -> i64 {
+        match self {
+            Self::EasternStandard => -5 * 3600,
+            Self::CentralStandard => -6 * 3600,
+            Self::MountainStandard => -7 * 3600,
+            Self::PacificStandard => -8 * 3600,
+            Self::Utc => 0,
+        }
+    }
+}
+
+static CLOCK_OFFSET_SECS: AtomicI64 = AtomicI64::new(-5 * 3600);
+
+/// Apply the persisted display zone to every visible Construct clock.
+pub(crate) fn set_clock_zone(zone: ClockZone) {
+    CLOCK_OFFSET_SECS.store(zone.offset_seconds(), Ordering::Relaxed);
+}
+
+/// Current Unix time shifted into the configured display zone.
+pub(crate) fn display_unix() -> i64 {
+    now_unix().saturating_add(CLOCK_OFFSET_SECS.load(Ordering::Relaxed))
+}
+
+pub(crate) fn display_offset_seconds() -> i64 {
+    CLOCK_OFFSET_SECS.load(Ordering::Relaxed)
+}
+
+pub(crate) fn display_zone_label() -> &'static str {
+    match CLOCK_OFFSET_SECS.load(Ordering::Relaxed) {
+        -18_000 => ClockZone::EasternStandard.label(),
+        -21_600 => ClockZone::CentralStandard.label(),
+        -25_200 => ClockZone::MountainStandard.label(),
+        -28_800 => ClockZone::PacificStandard.label(),
+        _ => ClockZone::Utc.label(),
+    }
+}
 
 // ──────────────────────────── the one clock (§6) ────────────────────────────
 
@@ -544,7 +636,10 @@ enum RowAction {
 /// nothing here is load-bearing for firing (§7: closing the surface never
 /// silences an alarm).
 pub fn timers_panel(ui: &mut egui::Ui, state: &mut TimersState) {
-    let now = now_unix();
+    let _ = AppFrame::new("Timers & Alarms").show(ui);
+    ui.add_space(Style::SP_S);
+
+    let now = display_unix();
     clock_header(ui, now);
 
     let mut action: Option<RowAction> = None;

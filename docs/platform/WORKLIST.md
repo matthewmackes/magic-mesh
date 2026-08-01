@@ -1155,23 +1155,15 @@ remains here under a completed status.
   Terminal-pattern unified top bar is shared across workspaces, with approved
   exemptions recorded individually; the side tab bar is 25% thinner, two-row,
   and zebra-striped for differentiation.
-- Current state: Shared Quazar typography, palettes, chrome primitives, state
-  panels, menubars, dense lists, and most Construct-owned route migrations are
-  landed; farm suites cover shell, Editor, Teams, Maps, Files, Bookmarks, Music,
-  Device, Storage, and This Node. Workbench and System now consume the shared
-  `AppFrame` primitive, covered by focused shell tests. The 2026-08-01 direct-DRM
-  captures and deployment details are recorded in
+- Current state: Shared Quazar primitives and most Construct-owned route migrations
+  are landed; Workbench, System, and Timers now consume `AppFrame`. Farm suites
+  cover the shell and major workspaces. Direct-DRM evidence and hashes are in
   [`WL-UX-009-DRM-EVIDENCE-2026-07-31.md`](WL-UX-009-DRM-EVIDENCE-2026-07-31.md).
-  The verified shell payload is active on `.138` and Dell with `NRestarts=0`;
-  `.138` has Dark desktop/narrow and Light/Largest Editor proof; Dell has clean
-  Dark Editor/System/Bookmarks/Storage/Phones frames, Dell narrow
-  Bookmarks/Storage/Phones proof, and Light/Largest System/Bookmarks/Storage/
-  Phones proof. The latest Dell shell payload is `34ebaac4` and its compact
-  profile control is suppressed at narrow widths so Control Center owns that
-  toggle without covering workspace fields.
-  The full RPM dependency transaction remains
-  open because its Fedora runtime dependencies do not match the seats; `.15`,
-  the remaining routes/states, full matrix, and production readiness remain open.
+  `.138` has Editor Dark desktop/narrow and Light/Largest proof. Dell has clean
+  Editor/System/Bookmarks/Storage/Phones/Timers Dark, narrow, and Light/Largest
+  proof with `NRestarts=0`; latest Timers payload is `f49ae072`. The full RPM
+  dependency transaction, `.15`, remaining routes/states, full matrix, and
+  production readiness remain open.
 - Remaining work:
 
   1. Finish the shared app-frame and Terminal-pattern unified top bar, including
