@@ -45,10 +45,17 @@ normal secure runtime settings.
 | Dell Dark Storage | This Node → Storage | native desktop capture, `1366x768`; disk body continues below scroll boundary | `d8a7d843f6071d9041ab1f863e1050115f18c5d7fdadff8b2f20a1ccaa5fa453` |
 | Dell Dark narrow Storage | This Node → Storage | `800` logical width; unused right side is intentional and disk body scrolls vertically | `8cd8f3d7882c54bf3bdfd30d51178b8b42d1840d41f402bb4d1c881a7e81a321` |
 | Dell Light / Largest Storage | This Node → Storage | native desktop capture, `1366x768`; large-text disk body continues below scroll boundary | `06e2fa4bb72088f74f39008434ed06ba4ea6e932faf72f7e7a060a24f976c0bd` |
+
+| Dell Dark Phones (compact-profile fix payload `34ebaac4`) | Phones | native `1366x768` direct-DRM capture; paired-device card and clipboard field visible without floating-control overlap | `fc3942c8f4fb4223aa3ff56c6131a220e47a9e659551d4513972e50ac48692e1` |
+| Dell Dark narrow Phones (compact-profile fix payload `34ebaac4`) | Phones | `800` logical width; the floating layout-profile control is suppressed and the clipboard field remains unobstructed | `9127359c41417b241fe52a9e633b833a7f1cf815bf1c34552260bfbe07a93118` |
+| Dell Light / Largest Phones (compact-profile fix payload `34ebaac4`) | Phones | native `1366x768` direct-DRM capture; large-text controls remain legible and the body continues through its scroll boundary | `684ce97789c0a91c8190963b9792d69926ec368f6479e7a9aa32e853132b9fc3` |
+
 The captures show the shared MenuBar, AppFrame detail header, Editor,
 Bookmarks, and Storage workspace bodies, toolbars, side rails, taskbar,
 Dark/Light palettes, and large-text containment without the
-previous body collapse or scanout corruption. The narrow capture intentionally
+previous body collapse or scanout corruption. Phones now also has direct Dark,
+Dark narrow, and Light/Largest proof; the narrow layout keeps the workspace
+field clear by delegating the profile toggle to Control Center. The narrow capture intentionally
 uses an 800-point logical viewport on the 1920-pixel panel; the unused right
 side is outside the proof viewport, not an overlap.
 
@@ -64,6 +71,8 @@ side is outside the proof viewport, not an overlap.
   rendering through the shared `AppFrame` primitive.
 - `mde-shell-egui system::tests::the_sidebar` — 3 passed, including the
   selected-section title count; `system::tests::a_narrowed_sidebar` — 1 passed.
+- `mde-shell-egui::tests::layout_profile_button_sits_in_the_taskbar_gap_clear_of_surface_content` — passed.
+- `mde-shell-egui::tests::compact_width_uses_control_center_for_the_layout_toggle` — passed.
 - Worklist acceptance remains open for the full workspace matrix, remaining
   Construct-owned routes/states, and final production evidence. This is clean
   representative proof, not a claim that every route is production-ready.

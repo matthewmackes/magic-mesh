@@ -144,11 +144,11 @@ const LAYOUT_MODE_BUTTON_TOUCH: f32 = 56.0;
 const LAYOUT_MODE_MENU_W: f32 = Style::SP_XL * 8.0;
 const LAYOUT_MODE_ROW_H: f32 = 56.0;
 const LAYOUT_MODE_GAP: f32 = Style::SP_S;
-/// Vertical lift for the lower-LEFT mode toggle so it clears the Car-HUD's
-/// bottom-left speedometer band (≈ margin + an 88pt gauge). Combined with the
-/// left-edge anchor this keeps the shell mode button clear of both the maps
-/// Drive-HUD FAB cluster (lower-RIGHT edge) and the speedometer (P0 de-conflict).
-const LAYOUT_MODE_HUD_CLEARANCE: f32 = Style::SP_XL * 3.0;
+/// The bottom taskbar is one shared chrome surface; keep the profile control in
+/// its reserved right-side gap so it never floats over a workspace card or field.
+const LAYOUT_MODE_TASKBAR_H: f32 = 48.0;
+const LAYOUT_MODE_TASKBAR_RIGHT_RESERVE: f32 = Style::SP_XL * 10.0;
+const LAYOUT_MODE_MIN_FLOATING_W: f32 = 500.0;
 
 /// The shell's pure navigation state: whether the shell body (the active
 /// surface) is showing over the session view, and which plane the Workbench has
@@ -329,14 +329,17 @@ fn layout_mode_button_size(profile: LayoutProfile) -> f32 {
 fn layout_mode_button_rect(screen: egui::Rect, profile: LayoutProfile) -> egui::Rect {
     let size = layout_mode_button_size(profile);
     let margin = Style::SP_M;
-    // Lower-LEFT edge, lifted above the Car-HUD speedometer band: the maps
-    // Drive-HUD FAB cluster owns the lower-RIGHT corner, so anchoring the shell
-    // mode toggle to the opposite edge (and clear of the bottom-left gauge) stops
-    // taps meant for "switch mode" from landing on a maps FAB (P0).
-    let left = (screen.left() + margin).min(screen.right() - Style::SP_XS - size);
-    let bottom = (screen.bottom() - margin - LAYOUT_MODE_HUD_CLEARANCE)
-        .max(screen.top() + Style::SP_XS + size);
-    egui::Rect::from_min_size(egui::pos2(left, bottom - size), egui::vec2(size, size))
+    // Reserve a gap immediately before the clock/tray side of the taskbar.
+    // The control remains discoverable and keyboard/accessibility-addressable,
+    // while the active workspace owns every pixel above the taskbar.
+    let left = (screen.right() - margin - LAYOUT_MODE_TASKBAR_RIGHT_RESERVE - size)
+        .max(screen.left() + margin);
+    let top = (screen.bottom() - size).max(screen.top() + margin);
+    egui::Rect::from_min_size(egui::pos2(left, top), egui::vec2(size, size))
+}
+
+fn layout_mode_control_visible(screen: egui::Rect) -> bool {
+    screen.width() >= LAYOUT_MODE_MIN_FLOATING_W
 }
 
 fn layout_mode_menu_rect(button: egui::Rect, screen: egui::Rect) -> egui::Rect {
@@ -2855,6 +2858,11 @@ impl Shell {
         if self.curtain.engaged() || self.front_door.is_open() {
             return;
         }
+        // At compact logical widths the Control Center owns the same toggle;
+        // suppressing this floating copy keeps narrow workspace fields clear.
+        if !layout_mode_control_visible(ctx.screen_rect()) {
+            return;
+        }
         let profile = self.system.layout_profile();
         // (The Car-Mode instrument readout is now the left driver's strip reserved
         // in `central_view` — see `car_instrument_strip` — not a floating overlay.)
@@ -3770,7 +3778,8 @@ mod tests {
         construct, datacenter, desktop_reconnect_should_query_recents, files_panel, front_door,
         front_door_peer_apps, install_layout_mode_button_accessibility,
         install_layout_profile_row_accessibility, layout_mode_button_accesskit_value,
-        layout_mode_button_rect, layout_mode_menu_rect, layout_mode_primary_toggle,
+        layout_mode_button_rect, layout_mode_control_visible, layout_mode_menu_rect,
+        layout_mode_primary_toggle,
         layout_profile_row_accesskit_value, layout_profile_tooltip, media_header, media_panel,
         menu_bar_shuffle_cards, menu_bar_shuffle_paint_order, paint_car_speedometer,
         paint_car_status_tile, publish_front_door_instance_lifecycle_to_bus,
@@ -3779,7 +3788,9 @@ mod tests {
         screenshot, splash, status, surface_needs_remote_sessions_fallback, terminal_panel,
         this_node_search_is_compact, vdi, Boot, MenuBarMinimizeEffect, Nav, Plane, Shell, Surface,
         ThisNodeTab, VideoTextureCache, LAYOUT_MODE_BUTTON_CONSTRUCT, LAYOUT_MODE_BUTTON_TOUCH,
-        LAYOUT_MODE_HOLD, LAYOUT_MODE_HUD_CLEARANCE, MENU_BAR_MINIMIZE_DURATION,
+        LAYOUT_MODE_MIN_FLOATING_W,
+        LAYOUT_MODE_HOLD, LAYOUT_MODE_TASKBAR_H, LAYOUT_MODE_TASKBAR_RIGHT_RESERVE,
+        MENU_BAR_MINIMIZE_DURATION,
     };
     use mde_bus::hooks::config::Priority;
     use mde_bus::persist::Persist;
@@ -4310,25 +4321,27 @@ mod tests {
     }
 
     #[test]
-    fn layout_profile_button_sits_lower_left_clear_of_the_maps_fabs() {
+    fn layout_profile_button_sits_in_the_taskbar_gap_clear_of_surface_content() {
         let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0));
         let rect = layout_mode_button_rect(screen, LayoutProfile::Construct);
-        // Left edge — the maps Drive-HUD FAB cluster owns the lower-RIGHT corner,
-        // so the shell mode toggle lives on the opposite edge (P0 de-conflict).
         assert!(
-            rect.left() >= screen.left() - f32::EPSILON,
-            "layout button must stay inside the left edge: {rect:?}"
+            rect.left() >= screen.left() - f32::EPSILON
+                && rect.right()
+                    <= screen.right() - Style::SP_M - LAYOUT_MODE_TASKBAR_RIGHT_RESERVE
+                        + f32::EPSILON,
+            "layout button must stay in the taskbar's reserved gap: {rect:?}"
         );
         assert!(
-            rect.right() < screen.center().x,
-            "layout button must sit in the left half, clear of the right-edge maps FABs: {rect:?}"
+            rect.bottom() <= screen.bottom() + f32::EPSILON,
+            "layout button must remain on-screen: {rect:?}"
         );
-        // Lifted above the bottom Car-HUD band (speedometer) rather than the
-        // bottom-most corner.
         assert!(
-            rect.bottom()
-                <= screen.bottom() - Style::SP_M - LAYOUT_MODE_HUD_CLEARANCE + f32::EPSILON,
-            "layout button must clear the bottom Car-HUD band: {rect:?}"
+            rect.top()
+                >= screen.bottom()
+                    - LAYOUT_MODE_TASKBAR_H
+                    - (rect.height() - LAYOUT_MODE_TASKBAR_H).max(0.0)
+                    - f32::EPSILON,
+            "layout button must occupy the taskbar band: {rect:?}"
         );
         assert_eq!(
             rect.size(),
@@ -4341,6 +4354,14 @@ mod tests {
             vec2(LAYOUT_MODE_BUTTON_TOUCH, LAYOUT_MODE_BUTTON_TOUCH),
             "Car uses a touch-sized lower-left control"
         );
+    }
+
+    #[test]
+    fn compact_width_uses_control_center_for_the_layout_toggle() {
+        let narrow = Rect::from_min_size(pos2(0.0, 0.0), vec2(480.0, 800.0));
+        let desktop = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 800.0));
+        assert!(!layout_mode_control_visible(narrow));
+        assert!(layout_mode_control_visible(desktop));
     }
 
     #[test]
