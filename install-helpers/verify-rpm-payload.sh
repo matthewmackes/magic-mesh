@@ -47,7 +47,7 @@
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # DRY-RUN semantics (no RPM):
-#   payload  : lists the expected base + Browser + thin-lighthouse asset sets;
+#   payload  : lists the expected base + thin-lighthouse asset sets;
 #              for every asset SOURCE it asserts —
 #              * target/…            → some workspace crate builds a bin of that
 #                                      name (the static proxy for "the build will
@@ -56,9 +56,8 @@
 #              * anything else       → the file/glob exists in the tree now; a
 #                                      missing packaging source FAILs.
 #              Extra hard emphasis on the base replacement bins (mde-shell-egui,
-#              mackesd) and the Browser helper bins (mde-web-preview,
-#              mde-web-cef, cef-verify): each MUST appear as a target/release
-#              asset across the base + Browser package asset sets.
+#              mackesd): each MUST appear as a target/release asset in the base
+#              asset set.
 #   surfaces : every mde-*-egui crate under crates/desktop (minus the shell host
 #              and the documented EXEMPT list) MUST be BOTH catalog-mounted (named in
 #              the shell's surfaces.rs catalog) AND shipped (a path-dep of
@@ -75,7 +74,7 @@
 # measures the COMPRESSED .rpm file (wc -c — the bytes actually pushed, not the
 # uncompressed payload) and
 # FAILs if it exceeds MCNF_RPM_SIZE_LIMIT_MIB (default 90 MiB — headroom under even
-# the strict 100 MB=95.37 MiB reading). Both base and Browser RPM cuts call it so
+# the strict 100 MB=95.37 MiB reading). Both base and lighthouse RPM cuts call it so
 # the channel cannot be silently broken.
 #
 # ─────────────────────────────────────────────────────────────────────────────
@@ -111,11 +110,7 @@ DESKTOP_DIR="${DESKTOP_DIR:-$REPO_ROOT/crates/desktop}"
 readonly SHELL_HOST_CRATE="mde-shell-egui"
 EXEMPT_SURFACES=("mde-panel-egui")
 
-# The replacement binaries the (a)-class regression is really about. Browser
-# helpers now live in the co-installable magic-mesh-browser package, so dry-run
-# validation checks the union while real-RPM validation checks the package shape.
 readonly BASE_KEY_BINS=("mde-shell-egui" "mackesd")
-readonly BROWSER_KEY_BINS=("mde-web-preview" "mde-web-cef" "cef-verify")
 readonly SERVER_KEY_BINS=("mackesd")
 readonly LIGHTHOUSE_KEY_BINS=("mackesd")
 
@@ -151,15 +146,13 @@ parse_assets_for() {
   ' section="$2" "$1"
 }
 
-# Main/base, browser subpackage, server variant, and thin lighthouse variant
+# Main/base, server variant, and thin lighthouse variant
 # asset readers.
 parse_assets() { parse_assets_for "$1" "package.metadata.generate-rpm"; }
-parse_browser_assets() { parse_assets_for "$1" "package.metadata.generate-rpm.variants.browser"; }
 parse_server_assets() { parse_assets_for "$1" "package.metadata.generate-rpm.variants.server"; }
 parse_lighthouse_assets() { parse_assets_for "$1" "package.metadata.generate-rpm.variants.lighthouse"; }
 parse_all_shipped_assets() {
   parse_assets "$1"
-  parse_browser_assets "$1"
   parse_lighthouse_assets "$1"
 }
 
@@ -236,11 +229,11 @@ check_payload_dryrun() {
     esac
   done < <(parse_all_shipped_assets "$CARGO_TOML")
 
-  info "parsed $total asset entries from the base + browser + thin lighthouse generate-rpm arrays"
+  info "parsed $total asset entries from the base + thin lighthouse generate-rpm arrays"
 
   hdr "key replacement binaries (must be shipped)"
   local kb
-  for kb in "${BASE_KEY_BINS[@]}" "${BROWSER_KEY_BINS[@]}"; do
+  for kb in "${BASE_KEY_BINS[@]}"; do
     if [ -n "${src_seen["target/release/$kb"]:-}" ]; then
       ok "key-bin        target/release/$kb  is in the asset set"
     else
@@ -295,7 +288,6 @@ check_payload_rpm() {
 
   local shape="base"
   case "${rpm##*/}" in
-    magic-mesh-browser-*) shape="browser" ;;
     magic-mesh-server-*) shape="server" ;;
     magic-mesh-lighthouse-*) shape="lighthouse" ;;
   esac
@@ -305,16 +297,12 @@ check_payload_rpm() {
   local kb want
   local -a key_bins=()
   case "$shape" in
-    browser) key_bins=("${BROWSER_KEY_BINS[@]}") ;;
     server)  key_bins=("${SERVER_KEY_BINS[@]}") ;;
     lighthouse) key_bins=("${LIGHTHOUSE_KEY_BINS[@]}") ;;
     *)       key_bins=("${BASE_KEY_BINS[@]}") ;;
   esac
   for kb in "${key_bins[@]}"; do
-    case "$kb" in
-      cef-verify) want="/usr/libexec/mackesd/cef-verify" ;;
-      *)          want="/usr/bin/$kb" ;;
-    esac
+    want="/usr/bin/$kb"
     if grep -Fxq "$want" <<<"$listing"; then
       ok "key-bin        $want present in ${shape} rpm -qlp"
     else
@@ -326,7 +314,6 @@ check_payload_rpm() {
   local src dst
   local asset_stream
   case "$shape" in
-    browser) asset_stream="parse_browser_assets" ;;
     server)  asset_stream="parse_server_assets" ;;
     lighthouse) asset_stream="parse_lighthouse_assets" ;;
     *)       asset_stream="parse_assets" ;;
@@ -472,7 +459,6 @@ TOML
 name = "fixture"
 assets = [
     { source = "target/release/mackesd",         dest = "/usr/bin/mackesd",         mode = "755" },
-    { source = "target/release/mde-web-preview",  dest = "/usr/bin/mde-web-preview",  mode = "755" },
     { source = "target/release/mde-ghost-bin",    dest = "/usr/bin/mde-ghost-bin",    mode = "755" },
     { source = "packaging/definitely-missing.service", dest = "/usr/lib/systemd/system/definitely-missing.service", mode = "644" },
 ]

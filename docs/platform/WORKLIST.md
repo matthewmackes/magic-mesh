@@ -1402,9 +1402,10 @@ remains here under a completed status.
   large/largest text; 267 focused Maps tests pass on farm `.90`.
   The current Dell proof slice initially appeared to show retained boot-splash
   pixels in the first proof frame. Direct comparison against the live
-  `CONSTRUCT-WALLPAPER1.png` asset shows that the Construct/Software Studio/
-  Release lockup is the selected wallpaper, not stale scanout; the chooser route
-  and current empty-state copy render above it. Keep the proof-only direct-DRM
+  `CONSTRUCT-WALLPAPER1.png` asset remains the Construct/Software Studio/
+  Release boot-splash/brand asset, not a selectable wallpaper choice or stale
+  scanout; Bing daily picture is the sole supported desktop wallpaper provider.
+  The chooser route and current empty-state copy render above it. Keep the proof-only direct-DRM
   handoff path under validation, but do not classify the wallpaper lockup as a
   handoff failure.
   The current dirty validation tree also requires a small compile-integrity repair:
@@ -1486,6 +1487,60 @@ remains here under a completed status.
   the runtime surface. This proof-only readback must not alter normal scanout,
   must reject incomplete/blank output, and must be visually inspected before
   any Maps Light/Largest or narrow row is accepted.
+  The first EGL-readback Light/Largest frame is now valid pixel evidence but
+  remains a failed visual proof: Maps' intentionally dark HUD cards inherited
+  Light-mode dark text from the shared remapper. The follow-up Maps content
+  palette change uses explicit high-contrast map-content text tokens for HUD,
+  health rail, alert, speedometer, and FAB labels while leaving shell/sidebar
+  Light palette tokens unchanged. Those content tokens must remain distinct
+  from shared static token values so the global Light remapper cannot rewrite
+  them; it requires a fresh farm build and visual recapture before acceptance.
+  The follow-up release payload
+  `36bf4864dbae392b3153b2ebf120c5acd09ad05ee58890be5a02cf7659250766` is now
+  installed on Dell and `.138` with active services and `NRestarts=0`. Direct
+  EGL readback produced visually inspected, non-striped Maps Dark desktop,
+  Light/Largest desktop, Dark narrow, and Light/Largest narrow frames; their
+  hashes are in the DRM evidence ledger. The responsive banner fix derives
+  safe height/text geometry from the live zoom and available width, and the
+  `.138` Light/Largest narrow frame was visually inspected and accepted. `.138`
+  was restored to `require_login_at_boot:true` after capture. The broader
+  workspace matrix and remaining Construct-owned routes remain open.
+  The proof-only settle-window follow-up payload
+  `9cdc8f1f2f340b493e341c424a0d5c86521179ea4fa15521cc637cfce04b0488` was
+  built on farm `.90` (`wl-ux-009-proof-settle-20260801`) and deployed to Dell
+  and `.138`; both services reported active with `NRestarts=0`. A 2.5-second
+  settled Mesh Teams frame and a 5-second settled Music unavailable frame were
+  visually inspected and added to the evidence ledger. The settle window is
+  proof-only; normal production timing is unchanged. `.138` was restored to
+  `require_login_at_boot:true` after each capture.
+  The follow-up Light/Largest narrow slice on the same payload also passed
+  visual inspection for Mesh Teams, Music, Terminal, and This Node. These are
+  bounded 800-logical-width frames with explicit unavailable/idle states where
+  the seat lacks live backend data; their hashes are recorded in the evidence
+  ledger. This expands the matrix but does not close the remaining desktop,
+  narrow, and large-text coverage for every Construct-owned route.
+- Live-render finding (2026-08-01): Workbench Light/Largest narrow proof exposed
+  an orphaned duplicate `View` button at the top-left. The shell's Fleet & Mesh
+  wrapper had rendered its legacy `ui.menu_button("View")` above the Workbench
+  shared MenuBar; the initial frame was rejected and the duplicate was removed
+  before recapture.
+- Live-render resolution (2026-08-01): removed the wrapper-level duplicate,
+  farm-tested the Workbench menubar suite (15 passed), deployed payload
+  `333503d01d85534c929ef05600d7ba5b12194f16f1324a0c5e0a0cc3ce345879` to Dell
+  and `.138`, and visually accepted the replacement Workbench Light/Largest
+  narrow frame. Both seats remained active with zero restarts; `.138` was
+  restored to secure login-at-boot.
+- Live-render finding (2026-08-01): current-payload Phones Light/Largest narrow
+  proof shows the paired/online header and tabs, but the shared `AppFrame`
+  title is absent from the entire top strip in both the Light narrow frame and
+  the earlier Dark frame. The frame is rejected until Phones exposes a visible
+  shared title/navigation header and is recaptured on the current payload.
+- Live-render resolution (2026-08-01): added the shared `AppFrame::leading_title`
+  option, used it for Phones, passed the focused Phones suite (25 tests), built
+  and deployed payload `3bd01985a670c723b87eefc5a1230344ead763d4b97c7fbb9401ee0b02ff91c8`
+  to Dell and `.138`, and visually accepted the replacement Light/Largest
+  narrow frame. Both seats remained active with zero restarts; `.138` was
+  restored to secure login-at-boot.
 - Backdrop validation update (2026-08-01): palette-resolved status backing,
   large-text anchoring, wallpaper selection/cache, and watermark routing pass
   24 focused shell tests with 1,920 filtered on `.90` slot
@@ -1497,6 +1552,23 @@ remains here under a completed status.
   `ux009-bing-only-247`.
 - Remaining work:
 
+  - Execution update (2026-08-01): host Browser packaging/runtime payloads were
+    removed from the working tree and the VM-only activation guard now evicts
+    stale host-helper tabs before selecting `browser-vm`. The local candidate
+    standalone tree remains audit-only: it lacks a root workspace, clean-clone
+    build proof, and complete dependency closure. Cargo/workspace and release
+    build cleanup, accepted standalone publication, host-source removal, and
+    live VDI framebuffer proof remain open.
+
+  0. Re-run the direct-DRM EGL-readback matrix against the current installed
+     payload `3bd01985…` for every Construct-owned route that still relies on
+     representative or older-payload evidence (Editor, Terminal, Phones, Car,
+     and any remaining Workbench/Infra, Music, Media, Browser boundary, Mesh
+     Teams, or This Node cells). Inspect Dark desktop, Light desktop, narrow,
+     and Light/Largest frames, retain only non-overlapping readable captures,
+     and restore secure login-at-boot state after each proof batch. The
+     proof-only settle window is implemented and farm-tested; retain it for
+     asynchronous/expressive routes, with normal production timing unchanged.
   1. Finish the shared app-frame and Terminal-pattern unified top bar, including
      the per-workspace exemption review. Complete loading/empty/stale/offline/
      error/destructive states, sheets, popovers, tooltips, table/list density,

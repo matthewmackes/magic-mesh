@@ -7,6 +7,7 @@ BROWSER_VM="$ROOT/packaging/browser-vm"
 PROFILE="$BROWSER_VM/profile.env"
 PROFILE_VERIFY="$BROWSER_VM/verify-profile.sh"
 VALIDATOR="$BROWSER_VM/validate-runtime-inputs.sh"
+ACTIVATION_VERIFY="$BROWSER_VM/verify-activation-contract.sh"
 
 fail() {
     echo "verify-browser-vm-contract: $*" >&2
@@ -15,8 +16,10 @@ fail() {
 
 [ -x "$PROFILE_VERIFY" ] || fail "profile verifier is not executable"
 [ -x "$VALIDATOR" ] || fail "runtime validator is not executable"
-bash -n "$PROFILE_VERIFY" "$VALIDATOR" "$0"
+[ -x "$ACTIVATION_VERIFY" ] || fail "activation verifier is not executable"
+bash -n "$PROFILE_VERIFY" "$VALIDATOR" "$ACTIVATION_VERIFY" "$0"
 "$PROFILE_VERIFY" "$PROFILE" >/dev/null
+"$ACTIVATION_VERIFY" >/dev/null
 
 profile_fixture=$(mktemp)
 trap 'rm -rf "$fixture" "$profile_fixture"' EXIT

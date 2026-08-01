@@ -12,8 +12,7 @@
 # rustup toolchain (rust-toolchain.toml → 1.94.0), builds the full workspace
 # release, and runs cargo-generate-rpm. Reuses the host's ~/.cargo crate caches.
 # Output for the default full mode: target-f43/generate-rpm/magic-mesh-*.rpm plus
-# magic-mesh-browser-*.rpm and magic-mesh-lighthouse-*.rpm (host-owned,
-# rootless).
+# magic-mesh-lighthouse-*.rpm (host-owned, rootless).
 #
 # XPA-6 — the GUI-less headless package. With `--server` this builds ONLY the
 # daemon + mesh-substrate crates (mackesd/magic-fleet/mde-enroll/mde-bus — none
@@ -21,9 +20,9 @@
 # music/voice-hud/applet GUI compile entirely, then rolls the `server` variant
 # (`cargo generate-rpm --variant server`) → a small `magic-mesh-server-*.rpm`
 # with no GUI bins and no gtk3/libcosmic ELF Requires. The default (no flag)
-# builds the full workspace and emits the base `magic-mesh` RPM plus the
-# co-installable `magic-mesh-browser` RPM. `--lighthouse` is the thin DO lane:
-# it compiles only mackesd/meshctl and emits `magic-mesh-lighthouse`, whose
+# builds the full workspace and emits the base `magic-mesh` RPM. `--lighthouse`
+# is the thin DO lane: it compiles only mackesd/meshctl and emits
+# `magic-mesh-lighthouse`, whose
 # manifest intentionally excludes media and Syncthing file-sharing assets.
 #
 # Usage: install-helpers/build-rpm-fedora43.sh [--server|--lighthouse] [fedora_version]
@@ -187,53 +186,10 @@ elif [ "${MODE:-full}" = "server" ]; then
 else
   echo "[f43] building workspace (release) — this is the long part"
   cargo build --workspace --release $MDE_RPM_LOCKED
-  # BOOKMARKS-9 — the Servo browser helper (mde-web-preview) is its OWN workspace
-  # root (excluded from the parent workspace: Servo drags a conflicting native
-  # sqlite link — see the crate manifest), so `--workspace` above did NOT build it.
-  # Build it here into the SAME CARGO_TARGET_DIR so it lands at
-  # $CARGO_TARGET_DIR/release/mde-web-preview, which the generate-rpm asset
-  # `target/release/mde-web-preview` resolves to (cargo-generate-rpm rewrites the
-  # `target/` prefix to the active target dir). Servo needs the system graphics/
-  # text -devel headers + libclang (mozjs bindgen) at build time; the container has
-  # network here, so its crates fetch. A hard step: the split Browser RPM ships it.
-  echo "[f43] installing the Servo browser-helper build deps"
-  dnf install -y --setopt=install_weak_deps=False \
-      clang llvm python3 \
-      fontconfig-devel freetype-devel harfbuzz-devel \
-      mesa-libEGL-devel mesa-libGL-devel mesa-libgbm-devel \
-      libxkbcommon-devel >/tmp/dnf-servo.log 2>&1 || { tail -20 /tmp/dnf-servo.log; exit 1; }
-  echo "[f43] building the Servo browser helper (mde-web-preview) — heavy; needs network"
-  cargo build --release $MDE_RPM_LOCKED \
-      --manifest-path crates/desktop/mde-web-preview/Cargo.toml || {
-    echo "GATED[BOOKMARKS-9/servo]: mde-web-preview (Servo) failed to build."
-    echo "  The full magic-mesh RPM ships the browser helper, so this is a hard stop."
-    echo "  The builder needs egress to crates.io for the servo crate tree + the"
-    echo "  graphics/text -devel headers installed above; point at a LAN mirror on"
-    echo "  an airgapped builder. (A headless RPM has no browser: use --server.)"
-    exit 1; }
-  # BROWSER-DD-1 - the Chromium/CEF helper is another workspace-excluded browser
-  # root. This first slice is a lean scaffold with the shared BOOKMARKS-6 wire
-  # protocol and an honest CEF_MISSING runtime gate; build it now so the Browser
-  # RPM installs /usr/bin/mde-web-cef and the shell Engine -> CEF selection resolves
-  # to the real helper path once a pinned CEF bundle is present. The same crate
-  # also emits mde-web-cef-renderer, the native bridge process shipped under
-  # /usr/libexec/mackesd for the Chrome-engine handoff.
-  echo "[f43] building the Chromium/CEF browser helper + renderer bridge (mde-web-cef)"
-  cargo build --release $MDE_RPM_LOCKED \
-      --manifest-path crates/desktop/mde-web-cef/Cargo.toml
-  # BROWSER-CHROME — ship the shell-equivalent CEF wire verifier. This is not a
-  # browser engine; it is the operational proof harness for `mde-web-cef tab`
-  # through the same mde-web-preview-client live-helper socket path the shell uses.
-  echo "[f43] building the CEF browser wire verifier (cef-verify)"
-  cargo build --release $MDE_RPM_LOCKED \
-      -p mde-web-preview-client --features live-helper --bin cef-verify
-  # E12-3 DRM + BOOKMARKS-6 live path — re-link the ONE shell binary with the
-  # features the shipped seat needs: `drm` so it owns the bare KMS/DRM seat,
-  # `live-helper` so the Browser surface really spawns the sandboxed
-  # `mde-web-preview` shipped right above (without it the surface is permanently
-  # the gated EmptyState — the RPM would ship a browser helper no shell can ever
-  # start), `live-vdi` so the Desktop surface can pump live RDP in-shell, and
-  # `media-mpv` (BUG-VIDEO-1 / MEDIA-2 phase 1, docs/gpu_encoder.md) so the
+  # E12-3 DRM + E12-5 live-vdi + BUG-VIDEO-1 media-mpv — re-link the ONE shell
+  # binary with the features the shipped seat needs: `drm` so it owns the bare
+  # KMS/DRM seat, `live-vdi` so the Desktop surface can pump live RDP in-shell,
+  # and `media-mpv` (BUG-VIDEO-1 / MEDIA-2 phase 1, docs/gpu_encoder.md) so the
   # embedded Media surface links the real mpv engine instead of silently
   # shipping FakeMpv (simulated playback, no real A/V — the live-verified
   # 2026-07-03 Eagle finding). The workspace build compiled all deps; this
@@ -242,12 +198,9 @@ else
   cargo build --release $MDE_RPM_LOCKED -p mde-shell-egui --features "$MDE_RPM_SHELL_FEATURES"
   echo "[f43] generating base RPM"
   cargo generate-rpm -p crates/mesh/mackesd
-  echo "[f43] generating browser RPM (--variant browser)"
-  cargo generate-rpm -p crates/mesh/mackesd --variant browser
   echo "[f43] generating thin lighthouse RPM (--variant lighthouse)"
   cargo generate-rpm -p crates/mesh/mackesd --variant lighthouse
   /src/install-helpers/verify-rpm-payload.sh size /src/target-f43/generate-rpm/magic-mesh-[0-9]*.rpm
-  /src/install-helpers/verify-rpm-payload.sh size /src/target-f43/generate-rpm/magic-mesh-browser-*.rpm
   /src/install-helpers/verify-rpm-payload.sh size /src/target-f43/generate-rpm/magic-mesh-lighthouse-*.rpm
 fi
 
@@ -271,7 +224,7 @@ podman run --rm \
     -w /src \
     "$IMAGE" bash -c "$IN_CONTAINER"
 
-# XPA-6 / BROWSER-SPLIT / DO-LIGHTHOUSE-THIN — pick the artifacts for THIS
+# XPA-6 / DO-LIGHTHOUSE-THIN — pick the artifacts for THIS
 # mode. Exact prefixes avoid `magic-mesh-*` catching a sibling variant.
 if [ "$MODE" = "lighthouse" ]; then
   GLOB="$REPO/target-f43/generate-rpm/magic-mesh-lighthouse-*.rpm"
@@ -295,23 +248,18 @@ elif [ "$MODE" = "server" ]; then
   echo "   (DO lighthouses use --lighthouse, not this server variant)"
 else
   BASE_GLOB="$REPO/target-f43/generate-rpm/magic-mesh-[0-9]*.rpm"
-  BROWSER_GLOB="$REPO/target-f43/generate-rpm/magic-mesh-browser-*.rpm"
   LIGHTHOUSE_GLOB="$REPO/target-f43/generate-rpm/magic-mesh-lighthouse-*.rpm"
   # shellcheck disable=SC2086,SC2012
   BASE_RPM="$(ls -1t $BASE_GLOB 2>/dev/null | head -1 || true)"
   # shellcheck disable=SC2086,SC2012
-  BROWSER_RPM="$(ls -1t $BROWSER_GLOB 2>/dev/null | head -1 || true)"
   LIGHTHOUSE_RPM="$(ls -1t $LIGHTHOUSE_GLOB 2>/dev/null | head -1 || true)"
   [ -n "$BASE_RPM" ] || { echo "!! no base RPM produced (mode=$MODE)" >&2; exit 1; }
-  [ -n "$BROWSER_RPM" ] || { echo "!! no browser RPM produced (mode=$MODE)" >&2; exit 1; }
   [ -n "$LIGHTHOUSE_RPM" ] || { echo "!! no thin lighthouse RPM produced (mode=$MODE)" >&2; exit 1; }
   "$REPO/install-helpers/verify-rpm-payload.sh" size "$BASE_RPM"
-  "$REPO/install-helpers/verify-rpm-payload.sh" size "$BROWSER_RPM"
   "$REPO/install-helpers/verify-rpm-payload.sh" size "$LIGHTHOUSE_RPM"
   echo
   echo "✅ Fedora $FEDORA RPMs (mode=$MODE):"
   echo "   base:    $BASE_RPM"
-  echo "   browser: $BROWSER_RPM"
   echo "   lighthouse: $LIGHTHOUSE_RPM"
-  echo "   install on F$FEDORA:  sudo dnf install $BASE_RPM $BROWSER_RPM"
+  echo "   install on F$FEDORA:  sudo dnf install $BASE_RPM"
 fi

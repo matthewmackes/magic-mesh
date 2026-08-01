@@ -44,6 +44,13 @@ Workloads/session-broker plane remains the single authority for placement,
 capabilities, and lifecycle; the guest validator is only an admission check and
 does not create a second control plane.
 
+The contract also runs `verify-activation-contract.sh`. It binds
+`Surface::Browser` to the typed `browser-vm` route, its Sunshine/RDP VDI
+transports, the guest visual boundary, and the Workloads `DesktopVm` delivery
+type. It checks that tab and reload actions clear or defer to the guest route
+instead of creating an unguarded host helper session. This is a source-seam
+guard, not live VDI proof.
+
 The source URL and path are deliberately recorded now so a later standalone
 Browser-stack extraction can bind the guest profile to an immutable source
 record rather than silently reusing a host image.

@@ -15,7 +15,7 @@
 #   xcp-build.sh cargo <args...>      sync + run `cargo <args>` on the VM
 #   xcp-build.sh gates                sync + fmt-check + clippy + test (the ship/release gates)
 #   xcp-build.sh coverage             sync + the canonical 80% llvm-cov floor
-#   xcp-build.sh rpm                  sync + release build + base/browser RPMs; pull them local
+#   xcp-build.sh rpm                  sync + release build + base/lighthouse RPMs; pull them local
 #   xcp-build.sh container-rpm [args] sync + Fedora container RPM cut on the farm
 #   xcp-build.sh pull <remote-glob>   rsync artifacts back (relative to the remote repo)
 #   xcp-build.sh shell                interactive ssh into the build VM
@@ -503,14 +503,6 @@ case "${1:-}" in
     log "vendoring birthright blobs on the VM (off the local host)"
     remote "./install-helpers/vendor-birthright-blobs.sh"
     log "release build + generate-rpm on the VM (heavy — runs on XCP, not local)"
-    # BOOKMARKS-9 — mde-web-preview is intentionally excluded from the parent
-    # workspace because Servo's sqlite dependency conflicts with the mesh lock.
-    # BROWSER-DD-1 — mde-web-cef is also workspace-excluded and emits both the
-    # helper and renderer bridge. BROWSER-CHROME additionally ships `cef-verify`,
-    # a shell-equivalent wire verifier built from mde-web-preview-client with
-    # live-helper enabled. The split Browser RPM ships all browser helpers and
-    # diagnostics, so build those separate targets into the same target/release
-    # directory before generate-rpm.
     # + BUG-VIDEO-1 / MEDIA-2 phase 1 `mpv-libs-devel` (docs/gpu_encoder.md):
     # links the real libmpv2 engine for the `media-mpv` re-link below —
     # without it the shell would silently fall back to FakeMpv.
@@ -524,9 +516,6 @@ case "${1:-}" in
     # E12-3 DRM: after the workspace build, re-link mde-shell-egui with --features drm
     # so it owns the bare KMS/DRM seat (no Wayland compositor). The workspace build
     # compiles all dependencies; this one-crate rebuild only re-links the final binary.
-    # + BOOKMARKS-6 `live-helper`: the RPM ships /usr/bin/mde-web-preview, so the
-    # shipped shell must be able to spawn it — without this feature the Browser
-    # surface is permanently the gated EmptyState (the live 2026-07-05 finding).
     # + E12-5 `live-vdi`: the RPM shell must also carry the in-shell IronRDP
     # transport, otherwise Desktop connects stay at the honest gated caption.
     # + BUG-VIDEO-1 `media-mpv`: the RPM shell must link the real mpv engine, or
@@ -537,7 +526,7 @@ case "${1:-}" in
     # build-deploy-3 — feature list + --locked come from rpm-features.sh (sourced
     # above); $MDE_RPM_* expand HERE on the local host, so the literal flags land
     # in the remote command string identical to build-rpm-fedora43.sh's.
-    remote "mkdir -p target/generate-rpm && rm -f target/generate-rpm/magic-mesh*.rpm && cargo build --workspace --release $MDE_RPM_LOCKED && CARGO_TARGET_DIR=\"\$PWD/target\" cargo build --release $MDE_RPM_LOCKED --manifest-path crates/desktop/mde-web-preview/Cargo.toml && CARGO_TARGET_DIR=\"\$PWD/target\" cargo build --release $MDE_RPM_LOCKED --manifest-path crates/desktop/mde-web-cef/Cargo.toml && cargo build --release $MDE_RPM_LOCKED -p mde-web-preview-client --features live-helper --bin cef-verify && cargo build --release $MDE_RPM_LOCKED -p mde-shell-egui --features $MDE_RPM_SHELL_FEATURES && cargo generate-rpm -p crates/mesh/mackesd && cargo generate-rpm -p crates/mesh/mackesd --variant browser && cargo generate-rpm -p crates/mesh/mackesd --variant lighthouse && ./install-helpers/verify-rpm-payload.sh size target/generate-rpm/magic-mesh-[0-9]*.rpm && ./install-helpers/verify-rpm-payload.sh size target/generate-rpm/magic-mesh-browser-*.rpm && ./install-helpers/verify-rpm-payload.sh size target/generate-rpm/magic-mesh-lighthouse-*.rpm"
+    remote "mkdir -p target/generate-rpm && rm -f target/generate-rpm/magic-mesh*.rpm && cargo build --workspace --release $MDE_RPM_LOCKED && cargo build --release $MDE_RPM_LOCKED -p mde-shell-egui --features $MDE_RPM_SHELL_FEATURES && cargo generate-rpm -p crates/mesh/mackesd && cargo generate-rpm -p crates/mesh/mackesd --variant lighthouse && ./install-helpers/verify-rpm-payload.sh size target/generate-rpm/magic-mesh-[0-9]*.rpm && ./install-helpers/verify-rpm-payload.sh size target/generate-rpm/magic-mesh-lighthouse-*.rpm"
     mkdir -p "$ARTIFACTS"
     rm -f "$ARTIFACTS"/magic-mesh*.rpm
     log "pulling RPM(s) → $ARTIFACTS"

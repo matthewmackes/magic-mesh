@@ -380,26 +380,22 @@ no-default-features = true
 [lints]
 workspace = true
 
-# PKG-1/3/6 (W71/72/75/76/86) — the base MCNF RPM plus split Browser RPM.
+# PKG-1/3/6 (W71/72/75/76/86) — the base MCNF RPM plus role variants.
 # `cargo generate-rpm -p mackesd` (operator-gated via /release) packages
 # all common app/daemon binaries (incl. the ENT-15 meshctl facade) + the
 # packaging/ assets into the base
-# `magic-mesh` RPM; `cargo generate-rpm --variant browser` emits the
-# co-installable `magic-mesh-browser` RPM for the heavy browser engines, and
-# `cargo generate-rpm --variant lighthouse` emits the thin DO control-plane RPM.
+# `magic-mesh` RPM; `cargo generate-rpm --variant lighthouse` emits the thin DO
+# control-plane RPM.
 # The
 # install-time role chooser (PKG-5) + the
 # self-gating mackesd.service (PKG-3) decide what actually runs per node.
-# Workstations use the base + optional Browser package; compute nodes use the
-# GUI-less Server variant; DigitalOcean lighthouses use the dedicated
-# control-plane-only Lighthouse variant. RPM GPG signing + the ISO stay
-# operator-gated.
+# Workstations use the base package; compute nodes use the GUI-less Server
+# variant; DigitalOcean lighthouses use the dedicated control-plane-only
+# Lighthouse variant. RPM GPG signing + the ISO stay operator-gated.
 [package.metadata.generate-rpm]
 name = "magic-mesh"
-# PKG — payload codec. The Browser engines now ship as a separate
-# `magic-mesh-browser` RPM so both public-channel artifacts stay below GitHub's
-# 100 MiB file limit. Keep xz until release evidence proves zstd has enough
-# headroom for each split artifact.
+# PKG — payload codec. Keep xz until release evidence proves zstd has enough
+# headroom for the public-channel artifact.
 payload_compress = "xz"
 # EFF-40 — the NEVRA release field: bump THIS (not the workspace
 # version) for asset-only/packaging-only changes so `dnf upgrade`
@@ -527,6 +523,7 @@ assets = [
     # desktop GUIs share one bus (tmpfiles makes the sticky dir; environment.d
     # gives the user session the same MDE_BUS_ROOT the unit sets).
     { source = "packaging/tmpfiles/magic-mesh.conf",     dest = "/usr/lib/tmpfiles.d/magic-mesh.conf",          mode = "644" },
+    { source = "packaging/systemd/journald.conf.d/90-mcnf-retention.conf", dest = "/usr/lib/systemd/journald.conf.d/90-mcnf-retention.conf", mode = "644" },
     { source = "packaging/environment.d/90-mde-bus.conf", dest = "/usr/lib/environment.d/90-mde-bus.conf",       mode = "644" },
     # Same split-brain fix for the QNM-Shared mount: the user session gets the
     # MDE_WORKGROUP_ROOT the unit sets, so GUI panels read the daemon's mount.
@@ -606,10 +603,10 @@ assets = [
     # autostart .desktop no longer ships, so nothing invoked it; the egui shell draws
     # its own wallpaper from /usr/share/backgrounds/magic-mesh/CONSTRUCT-WALLPAPER*.png
     # (backdrop.rs), never mcnf-11-winter.
-    # QBRAND-11 (packaging half) — the five generated Construct wallpapers ship as
-    # a selectable set (design lock #12: WALLPAPER4 is the default desktop,
-    # WALLPAPER1 doubles as the DRM boot-splash art); the egui shell loads
-    # them from this dir at runtime.
+    # QBRAND-11 (packaging half) — keep the Construct wallpaper artwork available
+    # for the DRM boot-splash/brand asset path (WALLPAPER1 is the splash source).
+    # Bing daily picture is the sole supported desktop wallpaper provider; these
+    # Construct files are not a selectable wallpaper set.
     { source = "assets/brand/CONSTRUCT-WALLPAPER*.png", dest = "/usr/share/backgrounds/magic-mesh/", mode = "644" },
     # MESHSHELL SHELL-1 — the mesh-status snapshot data plane (all roles).
     { source = "install-helpers/mesh-status-snapshot.sh", dest = "/usr/libexec/mackesd/mesh-status-snapshot", mode = "755" },
@@ -659,9 +656,6 @@ assets = [
     { source = "install-helpers/selinux/*.cil", dest = "/usr/share/magic-mesh/selinux/", mode = "644" },
     { source = "install-helpers/setup-selinux-policy.sh", dest = "/usr/libexec/mackesd/setup-selinux-policy", mode = "755" },
     { source = "packaging/systemd/magic-mesh-selinux-policy.service", dest = "/usr/lib/systemd/system/magic-mesh-selinux-policy.service", mode = "644" },
-    # Browser helper SELinux domains and inspectable adblock seed files ship in
-    # the co-installable magic-mesh-browser package, keeping the base channel
-    # artifact below the public 100 MiB ceiling.
     # DAR-46 — DEVOPS-AUTOMATION-REBUILD: ship the backoffice/control-VM plane so a
     # rebuilt/rebooted control VM re-converges with no manual step (the deploy root
     # is /opt/mcnf — the mcnf-* units WorkingDirectory + cmd_found's MCNF_REPO
@@ -1011,10 +1005,6 @@ genisoimage = "*"
 virtiofsd = "*"
 
 [package.metadata.generate-rpm.recommends]
-# BROWSER-SPLIT — default Workstation installs still pull the production Browser
-# engines, but as a separate public-channel artifact that can be size-gated and
-# removed independently from the base desktop.
-magic-mesh-browser = "*"
 ansible-core = "*"
 # KIRON / NOTIF-7 — `mde-shell-egui`'s single notification-sound seam shells
 # `canberra-gtk-play` for freedesktop event sounds. Fedora provides that binary
@@ -1082,122 +1072,6 @@ mde-core = "*"
 # between roles explicit. (Harmless when the subpackage isn't present.)
 [package.metadata.generate-rpm.conflicts]
 magic-mesh-server = "*"
-
-# BROWSER-SPLIT — co-installable browser package. This is intentionally NOT a
-# role variant like `magic-mesh-server`: default Workstation installs get it via
-# the base package's weak dependency, but it can be removed independently when a
-# node must keep the desktop without the heavy Browser engines.
-[package.metadata.generate-rpm.variants.browser]
-name = "magic-mesh-browser"
-summary = "MCNF Browser engines — Servo fallback, Chromium/CEF helper, verifier, and browser runtime provisioning"
-payload_compress = "xz"
-release = "1"
-license = "GPL-3.0-or-later AND MPL-2.0"
-assets = [
-    # BOOKMARKS-9 — the out-of-process, OS-sandboxed Servo browser helper
-    # (BOOKMARKS-5). It is its OWN workspace root (Servo drags a conflicting
-    # native sqlite link), so the cut scripts build it standalone before this
-    # variant is generated.
-    { source = "target/release/mde-web-preview",     dest = "/usr/bin/mde-web-preview",     mode = "755" },
-    # BROWSER-DD-1 — Chromium/CEF browser helper plus renderer bridge.
-    { source = "target/release/mde-web-cef",         dest = "/usr/bin/mde-web-cef",         mode = "755" },
-    { source = "target/release/mde-web-cef-renderer", dest = "/usr/libexec/mackesd/mde-web-cef-renderer", mode = "755" },
-    # BROWSER-CHROME — shell-equivalent verifier for the CEF tab helper wire.
-    { source = "target/release/cef-verify",          dest = "/usr/libexec/mackesd/cef-verify", mode = "755" },
-    { source = "install-helpers/browser-verify-engines.sh", dest = "/usr/libexec/mackesd/browser-verify-engines", mode = "755" },
-    # BROWSER-DD-1 — pinned Chromium/CEF runtime provisioning. The 311 MB CEF
-    # runtime is fetched/verified at first boot, not embedded in this RPM.
-    { source = "install-helpers/install-cef-runtime.sh", dest = "/usr/libexec/mackesd/install-cef-runtime", mode = "755" },
-    { source = "packaging/browser/cef-linux64-minimal.env", dest = "/usr/share/magic-mesh/browser/cef-linux64-minimal.env", mode = "644" },
-    { source = "packaging/systemd/mde-cef-runtime-setup.service", dest = "/usr/lib/systemd/system/mde-cef-runtime-setup.service", mode = "644" },
-    # BROWSER-DD-5 — curated WebExtensions templates plus explicit lab smoke fixture.
-    { source = "install-helpers/browser-cef-webextension-smoke.sh", dest = "/usr/libexec/mackesd/browser-cef-webextension-smoke", mode = "755" },
-    { source = "packaging/browser/webextensions-allowlist.env", dest = "/usr/share/magic-mesh/browser/webextensions-allowlist.env", mode = "644" },
-    { source = "packaging/browser/webextensions-smoke.env", dest = "/usr/share/magic-mesh/browser/webextensions-smoke.env", mode = "644" },
-    { source = "packaging/browser/smoke-extension/manifest.json", dest = "/usr/share/magic-mesh/browser/smoke-extension/manifest.json", mode = "644" },
-    { source = "packaging/browser/smoke-extension/smoke.js", dest = "/usr/share/magic-mesh/browser/smoke-extension/smoke.js", mode = "644" },
-    # BROWSER-DD-4 — optional Widevine CDM provisioning contract.
-    { source = "install-helpers/install-widevine-cdm.sh", dest = "/usr/libexec/mackesd/install-widevine-cdm", mode = "755" },
-    { source = "packaging/browser/widevine-linux64.env", dest = "/usr/share/magic-mesh/browser/widevine-linux64.env", mode = "644" },
-    { source = "packaging/systemd/mde-widevine-cdm-setup.service", dest = "/usr/lib/systemd/system/mde-widevine-cdm-setup.service", mode = "644" },
-    # BROWSER-DD-11/12 — Browser TTS, STT, and translation command wrappers plus
-    # optional model/voice provisioning contracts.
-    { source = "install-helpers/browser-read-aloud-tts.sh", dest = "/usr/libexec/mackesd/browser-read-aloud-tts", mode = "755" },
-    { source = "install-helpers/browser-voice-command-stt.sh", dest = "/usr/libexec/mackesd/browser-voice-command-stt", mode = "755" },
-    { source = "install-helpers/browser-translate.sh", dest = "/usr/libexec/mackesd/browser-translate", mode = "755" },
-    { source = "install-helpers/install-browser-tts-voice.sh", dest = "/usr/libexec/mackesd/install-browser-tts-voice", mode = "755" },
-    { source = "packaging/browser/browser-read-aloud-voice.env", dest = "/usr/share/magic-mesh/browser/browser-read-aloud-voice.env", mode = "644" },
-    { source = "packaging/systemd/mde-browser-tts-voice-setup.service", dest = "/usr/lib/systemd/system/mde-browser-tts-voice-setup.service", mode = "644" },
-    { source = "install-helpers/install-browser-stt-model.sh", dest = "/usr/libexec/mackesd/install-browser-stt-model", mode = "755" },
-    { source = "packaging/browser/browser-voice-command-stt.env", dest = "/usr/share/magic-mesh/browser/browser-voice-command-stt.env", mode = "644" },
-    { source = "packaging/systemd/mde-browser-stt-model-setup.service", dest = "/usr/lib/systemd/system/mde-browser-stt-model-setup.service", mode = "644" },
-    { source = "install-helpers/install-browser-translate-model.sh", dest = "/usr/libexec/mackesd/install-browser-translate-model", mode = "755" },
-    { source = "packaging/browser/browser-translate.env", dest = "/usr/share/magic-mesh/browser/browser-translate.env", mode = "644" },
-    { source = "packaging/systemd/mde-browser-translate-model-setup.service", dest = "/usr/lib/systemd/system/mde-browser-translate-model-setup.service", mode = "644" },
-    # Browser helper SELinux domains.
-    { source = "packaging/selinux/mde-web-preview.te", dest = "/usr/share/magic-mesh/selinux/mde-web-preview/mde-web-preview.te", mode = "644" },
-    { source = "packaging/selinux/mde-web-preview.fc", dest = "/usr/share/magic-mesh/selinux/mde-web-preview/mde-web-preview.fc", mode = "644" },
-    { source = "install-helpers/setup-selinux-web-preview.sh", dest = "/usr/libexec/mackesd/setup-selinux-web-preview", mode = "755" },
-    { source = "packaging/systemd/mde-web-preview-selinux.service", dest = "/usr/lib/systemd/system/mde-web-preview-selinux.service", mode = "644" },
-    { source = "packaging/selinux/mde-web-cef.te", dest = "/usr/share/magic-mesh/selinux/mde-web-cef/mde-web-cef.te", mode = "644" },
-    { source = "packaging/selinux/mde-web-cef.fc", dest = "/usr/share/magic-mesh/selinux/mde-web-cef/mde-web-cef.fc", mode = "644" },
-    { source = "install-helpers/setup-selinux-web-cef.sh", dest = "/usr/libexec/mackesd/setup-selinux-web-cef", mode = "755" },
-    { source = "packaging/systemd/mde-web-cef-selinux.service", dest = "/usr/lib/systemd/system/mde-web-cef-selinux.service", mode = "644" },
-    # BOOKMARKS-9 — inspectable ad-filter seed files, same bytes embedded by mde-adblock.
-    { source = "crates/services/mde-adblock/seed/*.txt", dest = "/usr/share/magic-mesh/adblock/", mode = "644" },
-    { source = "LICENSE", dest = "/usr/share/licenses/magic-mesh-browser/LICENSE", mode = "644" },
-    { source = "NOTICE",  dest = "/usr/share/licenses/magic-mesh-browser/NOTICE",  mode = "644" },
-]
-post_install_script = """
-systemctl daemon-reload >/dev/null 2>&1 || :
-BROWSER_UNITS="mde-web-preview-selinux.service mde-web-cef-selinux.service mde-cef-runtime-setup.service mde-widevine-cdm-setup.service mde-browser-tts-voice-setup.service mde-browser-stt-model-setup.service mde-browser-translate-model-setup.service"
-BROWSER_RETRYABLE_UNITS="mde-widevine-cdm-setup.service mde-browser-tts-voice-setup.service mde-browser-stt-model-setup.service mde-browser-translate-model-setup.service"
-systemctl unmask $BROWSER_UNITS >/dev/null 2>&1 || :
-systemctl enable $BROWSER_UNITS >/dev/null 2>&1 || :
-for unit in $BROWSER_RETRYABLE_UNITS; do
-  if [ "$(systemctl show "$unit" -p ExecMainStatus --value 2>/dev/null || :)" = "78" ]; then
-    systemctl stop "$unit" >/dev/null 2>&1 || :
-  fi
-done
-systemctl start --no-block $BROWSER_UNITS >/dev/null 2>&1 || :
-"""
-pre_uninstall_script = """
-if [ "$1" = 0 ]; then
-  systemctl --no-reload disable --now mde-web-preview-selinux.service mde-web-cef-selinux.service mde-cef-runtime-setup.service mde-widevine-cdm-setup.service mde-browser-tts-voice-setup.service mde-browser-stt-model-setup.service mde-browser-translate-model-setup.service >/dev/null 2>&1 || :
-fi
-"""
-post_uninstall_script = """
-systemctl daemon-reload >/dev/null 2>&1 || :
-if [ "$1" = 0 ]; then
-  semodule -r mde_web_preview mde_web_cef >/dev/null 2>&1 || :
-fi
-"""
-
-[package.metadata.generate-rpm.variants.browser.requires]
-magic-mesh = "*"
-# BROWSER-DD-1 — the CEF runtime is distributed as `.tar.bz2`; the installer
-# extracts it with `tar -xjf`, which needs the external bzip2 helper on Fedora
-# minimal images.
-bzip2 = "*"
-# BOOKMARKS-9 — Servo dynamically links the system graphics/text stack. The leaf
-# soname deps (expat/libpng/zlib for fontconfig/freetype) resolve transitively.
-fontconfig = "*"
-freetype = "*"
-harfbuzz = "*"
-mesa-libEGL = "*"
-mesa-libGL = "*"
-mesa-libGLES = "*"
-mesa-libgbm = "*"
-mesa-dri-drivers = "*"
-mesa-vulkan-drivers = "*"
-vulkan-loader = "*"
-libxkbcommon = "*"
-# Browser SELinux loaders compile .te/.fc policy sources on Enforcing seats.
-# Keep the toolchain as a hard Browser dependency so a default Workstation
-# Browser install does not silently skip the mde_web_preview_t/mde_web_cef_t
-# domains after the loader units start.
-selinux-policy-devel = "*"
-checkpolicy = "*"
 
 # DO-LIGHTHOUSE-THIN — the only RPM a DigitalOcean lighthouse may install.
 # This is deliberately a separate variant rather than a role flag on the full

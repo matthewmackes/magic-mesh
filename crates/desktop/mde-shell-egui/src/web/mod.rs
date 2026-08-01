@@ -7704,9 +7704,22 @@ impl WebState {
     /// `browser-vm` route and waits for VDI rather than starting a host engine.
     pub(crate) fn ensure_live_tab(&mut self, seat_present: bool) {
         let _ = seat_present;
-        if !self.tabs.is_empty() || self.browser_vm_route.is_some() {
+        if self.browser_vm_route.is_some() {
             return;
         }
+
+        // Browser activation is VM-only. A tab left by an older host-helper
+        // lifetime must not win the route selection simply because it is still
+        // present in the in-memory tab list. Drop those sessions directly (so
+        // their helper processes are torn down) instead of sending them through
+        // the user-facing reopen stack, which could otherwise recreate a host
+        // page after the VM route is selected.
+        if !self.tabs.is_empty() {
+            self.tabs.clear();
+            self.active = 0;
+            self.closed_tabs.clear();
+        }
+        self.open_requested.clear();
         self.browser_vm_route = Some(BrowserVmRoute::select_resume());
         self.spawn_attempted = true;
         self.gate_notice =
@@ -10633,6 +10646,26 @@ mod tests {
             state.browser_vm_diagnostic().state,
             BrowserVmConnectionState::TransportUnavailable
         );
+    }
+
+    #[cfg(feature = "live-helper")]
+    #[test]
+    fn browser_activation_evicts_a_stale_host_tab_before_selecting_guest_route() {
+        let (session, helper) = testkit::connect().expect("connect");
+        let mut state = WebState::default();
+        state.push_session(session);
+        state.request_new_tab(BrowserEngine::Cef);
+
+        state.ensure_live_tab(false);
+
+        assert!(state.tabs.is_empty(), "VM activation must not retain host tabs");
+        assert!(state.closed_tabs.is_empty(), "VM activation must not queue host tabs for reopen");
+        assert!(state.open_requested.is_empty(), "VM activation must discard host opens");
+        assert_eq!(
+            state.browser_vm_route,
+            Some(BrowserVmRoute::select_resume())
+        );
+        drop(helper);
     }
 
     #[test]

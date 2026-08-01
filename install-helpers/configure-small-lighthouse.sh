@@ -72,7 +72,7 @@ cat >/etc/systemd/journald.conf.d/20-mcnf-small-lighthouse.conf <<'CONF'
 [Journal]
 SystemMaxUse=64M
 RuntimeMaxUse=16M
-MaxRetentionSec=7day
+MaxRetentionSec=24h
 CONF
 
 cat >/etc/sysctl.d/20-mcnf-small-lighthouse.conf <<'CONF'

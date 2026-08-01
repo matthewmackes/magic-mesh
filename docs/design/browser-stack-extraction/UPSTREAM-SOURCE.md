@@ -22,9 +22,14 @@ and the later removal/cutover remain operator-gated work.
   immutable source blob, and verifies clean worktree bytes exactly. A dirty
   mixed/shared row is required to remain divergent from the source snapshot,
   while its recorded worktree hash remains an audit-time observation.
-- Current safety posture: no clone, filter operation, GitHub publication, or
-  source deletion has been performed. The verifier rejects untracked Browser
-  candidates and Browser paths changed since the anchored source snapshot.
+- Current safety posture: no accepted history-filtered extraction, GitHub
+  publication, or source deletion has been performed. A local candidate at
+  `/root/magic-mesh-browser-stack` was audited on 2026-08-01 and is incomplete:
+  it has only a local `/root/magic-mesh` remote, lacks root workspace/build
+  metadata, and has no clean-clone proof. Treat it as disposable audit
+  material, not as the standalone destination. The verifier rejects untracked
+  Browser candidates and Browser paths changed since the anchored source
+  snapshot.
 
 The manifest has three classes:
 
