@@ -41,6 +41,7 @@ normal secure runtime settings.
 | Dell Dark Bookmarks (AppFrame detail payload) | Bookmarks → Details | native desktop capture, `1366x768` | `a74b0d78cba9b2b01059740573c68f5b5d9ac88971ab2153d055dc4dad652c42` |
 | Dell Light / Largest Bookmarks | Bookmarks → Details | native desktop capture, `1366x768`; large text and scrollable body | `e7f7d1dc2ca4d880fbbe19d0fbb0225a738f2500fa42d837d4e0ab151e953742` |
 
+| Dell Dark narrow Bookmarks | Bookmarks → Details | `800` logical width on native scanout; unused right side is intentional | `2db329f128c6d8d7af8e948b2bd5481bba8a3a93e1242a5fa1d73866ea953bed` |
 The captures show the shared MenuBar, AppFrame detail header, Editor and
 Bookmarks workspace bodies, toolbars, side rails, taskbar, Dark/Light palettes,
 and large-text containment without the
