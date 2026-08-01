@@ -18,7 +18,7 @@
 use mde_egui::egui::{
     self, Align, Align2, CursorIcon, Layout, Response, RichText, ScrollArea, Sense, TextEdit,
 };
-use mde_egui::nav_chrome::NavigationBar;
+use mde_egui::nav_chrome::AppFrame;
 use mde_egui::{Motion, Style};
 
 use mde_bookmarks::{Bookmark, Folder, Item, Source};
@@ -496,10 +496,10 @@ fn detail_pane(ui: &mut egui::Ui, m: &mut Manager, actions: &mut Vec<Action>) {
         .default_width(Style::SP_XL * 8.0)
         .show_inside(ui, |ui| {
             // PLATFORM-INTERFACES Q19 — the pane's hand-rolled strong label +
-            // separator header becomes the shared [`NavigationBar`] (centered
+            // separator header becomes the shared [`AppFrame`] (centered
             // Title3 rung, standard strip, its own bottom hairline): the same
             // detail-pane top bar the System surface's Settings panes wear.
-            let _ = NavigationBar::new("Details").show(ui);
+            let _ = AppFrame::new("Details").show(ui);
             ui.add_space(Style::SP_S);
             match m.detail() {
                 None => {

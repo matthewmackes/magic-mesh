@@ -38,9 +38,11 @@ normal secure runtime settings.
 | Dell Dark desktop (new shell payload) | Mesh Teams → Files → Editor | native desktop capture, `1366x768` | `1577918fe3f6477080c0ec6712391f2eb3018214e190908bebd0e944240f35b6` |
 | Dell Dark System (new AppFrame payload) | System → Wallpaper | native desktop capture, `1366x768` | `f2a9d743deca96566651f0ac8caae3a0d313bd56c045aad10e92d70956c48958` |
 | Dell Light / Largest System | System → Wallpaper | native `1366x768`; large text continues in the scrollable settings body | `35e20f37fc4685baf8edd4594d9789dd8ffd491edb8441f7d70c860a99170238` |
+| Dell Dark Bookmarks (AppFrame detail payload) | Bookmarks → Details | native desktop capture, `1366x768` | `a74b0d78cba9b2b01059740573c68f5b5d9ac88971ab2153d055dc4dad652c42` |
 
-The captures show the shared MenuBar, Editor workspace body, toolbars, side
-rails, taskbar, Dark/Light palettes, and large-text containment without the
+The captures show the shared MenuBar, AppFrame detail header, Editor and
+Bookmarks workspace bodies, toolbars, side rails, taskbar, Dark/Light palettes,
+and large-text containment without the
 previous body collapse or scanout corruption. The narrow capture intentionally
 uses an 800-point logical viewport on the 1920-pixel panel; the unused right
 side is outside the proof viewport, not an overlap.
