@@ -241,6 +241,12 @@ unless a reboot is genuinely required for the test or recovery path.
 Basement seat. It is a test seat, not a farm worker: do not add it to
 `install-helpers/farm.sh`, and do not use it for heavy build/test gates.
 
+**Active Workstation seat inventory (operator 2026-08-01):** use all four
+enrolled seats for workstation deployment and seat verification: T480
+`172.20.146.138`, T470S Eagle `172.20.146.145`, Basement seat `172.20.0.15`,
+and Dell `172.20.146.225`. The historical Eagle address `172.20.146.13` is
+not a current deployment target.
+
 ---
 
 ## 1. Quick start — build right now
