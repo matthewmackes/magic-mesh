@@ -46,9 +46,9 @@ normal secure runtime settings.
 | Dell Dark narrow Storage | This Node → Storage | `800` logical width; unused right side is intentional and disk body scrolls vertically | `8cd8f3d7882c54bf3bdfd30d51178b8b42d1840d41f402bb4d1c881a7e81a321` |
 | Dell Light / Largest Storage | This Node → Storage | native desktop capture, `1366x768`; large-text disk body continues below scroll boundary | `06e2fa4bb72088f74f39008434ed06ba4ea6e932faf72f7e7a060a24f976c0bd` |
 
-| Dell Dark Phones (compact-profile fix payload `34ebaac4`) | Phones | native `1366x768` direct-DRM capture; paired-device card and clipboard field visible without floating-control overlap | `fc3942c8f4fb4223aa3ff56c6131a220e47a9e659551d4513972e50ac48692e1` |
-| Dell Dark narrow Phones (compact-profile fix payload `34ebaac4`) | Phones | `800` logical width; the floating layout-profile control is suppressed and the clipboard field remains unobstructed | `9127359c41417b241fe52a9e633b833a7f1cf815bf1c34552260bfbe07a93118` |
-| Dell Light / Largest Phones (compact-profile fix payload `34ebaac4`) | Phones | native `1366x768` direct-DRM capture; large-text controls remain legible and the body continues through its scroll boundary | `684ce97789c0a91c8190963b9792d69926ec368f6479e7a9aa32e853132b9fc3` |
+| Dell Dark Phones (`AppFrame`, payload `035c4f3a`) | Phones | native `1366x768` direct-DRM capture; centered shared frame title and paired-device card render without overlap | `d8e3c1ef03adc371e424372846ce0fc44ff4351d1f100fc555049ab2c65e115f` |
+| Dell Dark narrow Phones (`AppFrame`, payload `035c4f3a`) | Phones | `800` logical width; centered frame title, status row, and clipboard field remain unobstructed | `6d203641bf923fb3b09c5f47512e5c3c947d06b121ca0c0155dcf8d2f469dc46` |
+| Dell Light / Largest Phones (`AppFrame`, payload `035c4f3a`) | Phones | native `1366x768` direct-DRM capture; large-text frame, status row, and scrollable body remain readable | `457f62ce0e861feba10a50cc331cb5207cc0eb12482979d8f4e79e2bebffddff` |
 | Dell Dark Timers (AppFrame payload `f49ae072`) | Timers & Alarms | native `1366x768` direct-DRM capture; timer/alarm controls and taskbar remain separated | `7b60a2b6fd3b27f2b6e7eff978efd1bd6ce431f727f36e8e922c098a06d6b183` |
 | Dell Dark narrow Timers (AppFrame payload `f49ae072`) | Timers & Alarms | `800` logical width; controls remain readable with no horizontal overflow or floating-control overlap | `5fa6d47f3c22bc3f75d62bfbed954508ffdf96a0b275ea301a990e02e63ae272` |
 | Dell Light / Largest Timers (AppFrame payload `f49ae072`) | Timers & Alarms | native `1366x768` direct-DRM capture; large-text timer/alarm body is readable and the profile control is absent when no bottom taskbar band is reserved | `a4dd2eed3cf376d3532772c8638bb6da0565839560dd0bf1584c847e6ec16218` |
@@ -57,8 +57,9 @@ The captures show the shared MenuBar, AppFrame detail header, Editor,
 Bookmarks, and Storage workspace bodies, toolbars, side rails, taskbar,
 Dark/Light palettes, and large-text containment without the
 previous body collapse or scanout corruption. Phones and Timers now also have direct Dark,
-Dark narrow, and Light/Largest proof; the narrow layout keeps the workspace
-field clear by delegating the profile toggle to Control Center. The narrow capture intentionally
+Dark narrow, and Light/Largest proof; Phones uses the shared `AppFrame`, and the
+narrow layout keeps the workspace field clear by delegating the profile toggle to
+Control Center. The narrow capture intentionally
 uses an 800-point logical viewport on the 1920-pixel panel; the unused right
 side is outside the proof viewport, not an overlap.
 

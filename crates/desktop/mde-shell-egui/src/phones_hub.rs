@@ -32,6 +32,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use mde_egui::egui::{self, RichText};
+use mde_egui::nav_chrome::AppFrame;
 use mde_egui::Style;
 use qrcode::{types::Color, EcLevel, QrCode};
 
@@ -664,25 +665,21 @@ impl PhonesHubState {
         let name = self.endpoint_name();
         let paired = self.devices.len();
         let online = self.devices.iter().filter(|d| d.online).count();
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("Phones")
-                    .size(Style::HEADING)
-                    .color(Style::TEXT_STRONG)
-                    .strong(),
-            );
-            ui.add_space(Style::SP_M);
+        let _ = AppFrame::new("Phones").show(ui);
+        ui.horizontal_wrapped(|ui| {
             ui.colored_label(
                 Style::ACCENT_COMMS,
-                RichText::new(format!(
-                    "this mesh appears to your phone as \u{201C}{name}\u{201D}"
-                ))
-                .size(Style::SMALL),
+                RichText::new(format!("{paired} paired")).size(Style::SMALL),
+            );
+            ui.colored_label(
+                Style::OK,
+                RichText::new(format!("{online} online")).size(Style::SMALL),
             );
         });
         ui.colored_label(
             Style::TEXT_DIM,
-            RichText::new(format!("{paired} paired \u{00B7} {online} online")).size(Style::SMALL),
+            RichText::new(format!("this mesh appears to your phone as \u{201C}{name}\u{201D}"))
+                .size(Style::SMALL),
         );
     }
 

@@ -1156,12 +1156,12 @@ remains here under a completed status.
   exemptions recorded individually; the side tab bar is 25% thinner, two-row,
   and zebra-striped for differentiation.
 - Current state: Shared Quazar primitives and most Construct-owned route migrations
-  are landed; Workbench, System, and Timers now consume `AppFrame`. Farm suites
+  are landed; Workbench, System, Timers, and Phones now consume `AppFrame`. Farm suites
   cover the shell and major workspaces. Direct-DRM evidence and hashes are in
   [`WL-UX-009-DRM-EVIDENCE-2026-07-31.md`](WL-UX-009-DRM-EVIDENCE-2026-07-31.md).
   `.138` has Editor Dark desktop/narrow and Light/Largest proof. Dell has clean
   Editor/System/Bookmarks/Storage/Phones/Timers Dark, narrow, and Light/Largest
-  proof with `NRestarts=0`; latest Timers payload is `f49ae072`. The full RPM
+  proof with `NRestarts=0`; latest Phones payload is `035c4f3a`. The full RPM
   dependency transaction, `.15`, remaining routes/states, full matrix, and
   production readiness remain open.
 - Remaining work:
