@@ -1011,6 +1011,7 @@ mod tests {
                     image: None,
                     network_isolation: false,
                     raw_hcl: None,
+                    app: None,
                 },
             )
             .unwrap();
@@ -1168,6 +1169,7 @@ mod tests {
                 image: None,
                 network_isolation: false,
                 raw_hcl: None,
+                app: None,
             },
         )
         .unwrap();
@@ -1444,6 +1446,7 @@ mod tests {
             image: None,
             network_isolation: false,
             raw_hcl: None,
+            app: None,
         };
         super::reconcile::write_desired_doc(tmp.path(), &spec).unwrap();
         // A plan that reports pending changes ⇒ the workload is drifted.

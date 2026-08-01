@@ -15,12 +15,14 @@ readonly SIGNAL_RE='mde-web|mde-browser|Surface::Browser|BrowserEngine|MDE_(WEB|
 
 usage() {
   cat <<'EOF'
-usage: install-helpers/verify-browser-extraction.sh [--check|--write]
+usage: install-helpers/verify-browser-extraction.sh [--check|--write|--self-test]
 
   --check  verify the recorded source commit, blob IDs, classifications, and
            generated candidate set (the default)
   --write  regenerate manifest.tsv from the current committed source snapshot
            after refusing untracked Browser candidates
+  --self-test  exercise the classification and derived provenance rules without
+               requiring a standalone repository or Git history
 EOF
 }
 
@@ -216,6 +218,39 @@ candidate_scope() {
   return 1
 }
 
+is_content_candidate() {
+  local path="$1"
+  candidate_scope "$path" \
+    && [ -f "$ROOT/$path" ] \
+    && grep -Il -E "$SIGNAL_RE" -- "$ROOT/$path" >/dev/null 2>&1
+}
+
+is_browser_candidate_path() {
+  path_is_named_candidate "$1" || is_content_candidate "$1"
+}
+
+filter_browser_candidates() {
+  local paths="$1" discovered="$2" path
+  : > "$discovered"
+  while IFS= read -r path; do
+    if is_browser_candidate_path "$path"; then
+      printf '%s\n' "$path" >> "$discovered"
+    fi
+  done < "$paths"
+  sort -u "$discovered" -o "$discovered"
+}
+
+refuse_ignored_browser_candidates() {
+  local ignored_paths="$1" ignored_candidates="$2"
+  git_cmd ls-files --others --ignored --exclude-standard > "$ignored_paths"
+  filter_browser_candidates "$ignored_paths" "$ignored_candidates"
+  if [ -s "$ignored_candidates" ]; then
+    echo "ignored Browser candidates are not history-bearing:" >&2
+    sed 's/^/  /' "$ignored_candidates" >&2
+    exit 1
+  fi
+}
+
 discover_candidates() {
   local all_paths="$1" discovered="$2" content_paths="$3" path
   : > "$discovered"
@@ -244,7 +279,7 @@ discover_candidates() {
   cat "$content_paths" >> "$discovered"
 
   while IFS= read -r path; do
-    if candidate_scope "$path" && grep -Il -E "$SIGNAL_RE" "$ROOT/$path" >/dev/null 2>&1; then
+    if is_content_candidate "$path"; then
       printf '%s\n' "$path" >> "$discovered"
     fi
   done < "$all_paths"
@@ -260,11 +295,22 @@ make_all_paths() {
   } | sort -u > "$out"
 }
 
+worktree_evidence_is_consistent() {
+  local recorded_blob="$1" worktree_blob="$2" worktree_state="$3" actual_blob="$4"
+  [[ "$actual_blob" == "$worktree_blob" ]] || return 1
+  case "$worktree_state" in
+    clean) [[ "$actual_blob" == "$recorded_blob" ]] ;;
+    dirty) [[ "$actual_blob" != "$recorded_blob" ]] ;;
+    *) return 1 ;;
+  esac
+}
+
 validate_manifest_rows() {
-  local rows="$1" path class recorded_blob worktree_blob worktree_state actual_blob source_commit
+  local rows="$1" path class destination reason recorded_blob worktree_blob worktree_state actual_blob source_commit expected_destination expected_reason
   source_commit="$2"
   while IFS=$'\t' read -r class path destination reason recorded_blob worktree_blob worktree_state; do
     [[ -n "$path" ]] || die "manifest contains an empty source path"
+    [[ "$path" != *$'\t'* && "$path" != *$'\n'* ]] || die "manifest source path contains a control character"
     case "$class" in browser-owned|mixed-purpose|shared) ;; *) die "unclassified manifest row: $path ($class)" ;; esac
     [[ -n "$destination" && -n "$reason" && -n "$recorded_blob" && -n "$worktree_blob" ]] || die "incomplete manifest row: $path"
     case "$worktree_state" in
@@ -276,15 +322,22 @@ validate_manifest_rows() {
     esac
     class_for_path "$path" >/dev/null || die "manifest path is not classified by verifier: $path"
     [[ "$(class_for_path "$path")" == "$class" ]] || die "manifest class drift for $path"
+    expected_destination="$(destination_for "$path")" || die "manifest path has no destination rule: $path"
+    expected_reason="$(reason_for_path "$path")"
+    [[ "$destination" == "$expected_destination" ]] || die "manifest destination drift for $path"
+    [[ "$reason" == "$expected_reason" ]] || die "manifest reason drift for $path"
     git_cmd ls-files --error-unmatch -- "$path" >/dev/null 2>&1 || die "manifest source is not tracked: $path"
     git_cmd cat-file -e "${source_commit}:$path" 2>/dev/null || die "source commit is missing $path"
     actual_blob="$(git_cmd rev-parse "${source_commit}:$path")"
     [[ "$actual_blob" == "$recorded_blob" ]] || die "recorded source blob drift for $path"
     actual_blob="$(git_cmd hash-object --no-filters -- "$ROOT/$path")"
-    if [[ "$worktree_state" == clean ]]; then
-      [[ "$actual_blob" == "$worktree_blob" ]] || die "current clean worktree blob drift for $path"
-    else
-      [[ "$actual_blob" != "$recorded_blob" ]] || die "dirty mixed/shared path returned clean: $path"
+    if ! worktree_evidence_is_consistent "$recorded_blob" "$worktree_blob" "$worktree_state" "$actual_blob"; then
+      [[ "$actual_blob" == "$worktree_blob" ]] || die "recorded current worktree blob drift for $path"
+      if [[ "$worktree_state" == clean ]]; then
+        die "current clean worktree blob drift for $path"
+      else
+        die "dirty mixed/shared path returned clean: $path"
+      fi
     fi
   done < "$rows"
 }
@@ -324,8 +377,14 @@ generate_manifest() {
 }
 
 check_manifest() {
-  local tmp="$1" source_commit rows manifest_paths candidates missing extra untracked candidate_count row_count head
+  local tmp="$1" source_commit rows manifest_paths candidates missing extra untracked candidate_count row_count head header
   [[ -f "$MANIFEST" ]] || die "manifest is missing: $MANIFEST"
+  header="$(sed -n '1p' "$MANIFEST")"
+  [[ "$header" == '# browser-stack-extraction-manifest v1' ]] || die "manifest schema header is missing or unsupported"
+  header="$(sed -n '7p' "$MANIFEST")"
+  [[ "$header" == '# generation=git-ls-files plus scoped host-Browser signal scan' ]] || die "manifest generation evidence header is missing or unsupported"
+  header="$(sed -n '8p' "$MANIFEST")"
+  [[ "$header" == $'# columns=class\tsource_path\tdestination\treason\tsource_blob_sha\tworktree_blob_sha\tworktree_state' ]] || die "manifest column header is missing or unsupported"
   source_commit="$(awk -F= '/^# source_commit=/{print $2; exit}' "$MANIFEST")"
   [[ "$source_commit" =~ ^[0-9a-f]{40}$ ]] || die "manifest has no valid immutable source_commit"
   git_cmd cat-file -e "${source_commit}^{commit}" 2>/dev/null || die "source commit is unavailable: $source_commit"
@@ -363,11 +422,84 @@ check_manifest() {
   echo "  classes: $(awk -F $'\t' '{count[$1]++} END {printf "browser-owned=%d mixed-purpose=%d shared=%d", count["browser-owned"], count["mixed-purpose"], count["shared"]}' "$rows")"
 }
 
+self_test() {
+  local failures=0 actual expected path test_paths test_candidates
+  check() {
+    actual="$1"
+    expected="$2"
+    if [[ "$actual" != "$expected" ]]; then
+      echo "FAIL: got [$actual], want [$expected]" >&2
+      failures=$((failures + 1))
+    fi
+  }
+
+  path='crates/desktop/mde-web-preview/src/lib.rs'
+  check "$(class_for_path "$path")" browser-owned
+  check "$(destination_for "$path")" "magic-mesh-browser-stack:$path"
+  check "$(reason_for_path "$path")" browser-helper-crate
+
+  path='crates/desktop/mde-shell-egui/src/web/mod.rs'
+  check "$(class_for_path "$path")" browser-owned
+  check "$(destination_for "$path")" "magic-mesh-browser-stack:$path"
+  check "$(reason_for_path "$path")" host-browser-shell
+
+  path='crates/desktop/mde-shell-egui/src/main.rs'
+  check "$(class_for_path "$path")" mixed-purpose
+  check "$(destination_for "$path")" "split-in-magic-mesh-browser-stack:$path#browser-sections"
+  check "$(reason_for_path "$path")" shell-route-or-shared-state
+
+  path='crates/services/mde-bookmarks/src/lib.rs'
+  check "$(class_for_path "$path")" shared
+  check "$(destination_for "$path")" "retain-in-magic-mesh:$path#shared-contract-or-reference"
+  check "$(reason_for_path "$path")" shared-bookmark-contract
+
+  if path_is_named_candidate install-helpers/verify-browser-extraction.sh; then
+    echo 'FAIL: verifier classified itself as a source candidate' >&2
+    failures=$((failures + 1))
+  fi
+
+  if ! worktree_evidence_is_consistent source source clean source; then
+    echo 'FAIL: clean worktree evidence was rejected' >&2
+    failures=$((failures + 1))
+  fi
+  if ! worktree_evidence_is_consistent source current dirty current; then
+    echo 'FAIL: current dirty worktree evidence was rejected' >&2
+    failures=$((failures + 1))
+  fi
+  if worktree_evidence_is_consistent source recorded dirty current; then
+    echo 'FAIL: stale dirty worktree evidence was accepted' >&2
+    failures=$((failures + 1))
+  fi
+
+  test_paths="$(mktemp)"
+  test_candidates="$(mktemp)"
+  printf '%s\n' \
+    install-helpers/install-browser-stt-model.sh \
+    target/browser-cache-note.txt \
+    > "$test_paths"
+  filter_browser_candidates "$test_paths" "$test_candidates"
+  if ! grep -Fxq install-helpers/install-browser-stt-model.sh "$test_candidates"; then
+    echo 'FAIL: named Browser candidate was not detected' >&2
+    failures=$((failures + 1))
+  fi
+  if grep -Fxq target/browser-cache-note.txt "$test_candidates"; then
+    echo 'FAIL: non-candidate path was detected as Browser source' >&2
+    failures=$((failures + 1))
+  fi
+  rm -f "$test_paths" "$test_candidates"
+
+  if [[ "$failures" -ne 0 ]]; then
+    return 1
+  fi
+  echo 'Browser extraction verifier self-test: PASS'
+}
+
 main() {
   local mode="--check" tmp source_commit
   case "${1:-}" in
     "") ;;
     --check|--write) mode="$1" ;;
+    --self-test) self_test; return $? ;;
     -h|--help) usage; return 0 ;;
     *) usage >&2; return 2 ;;
   esac
@@ -376,6 +508,7 @@ main() {
   trap 'rm -rf "${tmp:-}"' EXIT
   make_all_paths "$tmp/all-paths"
   discover_candidates "$tmp/all-paths" "$tmp/discovered" "$tmp/content-paths" > "$tmp/candidates"
+  refuse_ignored_browser_candidates "$tmp/ignored-paths" "$tmp/ignored-candidates"
 
   if [[ "$mode" == --write ]]; then
     source_commit="$(git_cmd rev-parse HEAD)"

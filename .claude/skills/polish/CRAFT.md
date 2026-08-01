@@ -5,11 +5,12 @@ egui surface — shell chrome, panels, windows, menus, dialogs, popups, HUD
 overlays, or any custom widget.
 
 **Authority (read this first):** Subordinate to the root **`AI_GOVERNANCE.md`**
-and to the **operator-locked Quasar dark design language** in
-`SKILL.md` (20-Q survey, 2026-07-03). Where the locks speak — dark-only,
+and to the **operator-locked Quazar Dark/Light design language** in
+`SKILL.md` (20-Q survey, 2026-07-03). Where the locks speak — Dark + Light,
 mono-first IBM Plex typography, `mde_egui::motion` FAST/BASE/SLOW, spring
 physics for panel/sheet transitions, press-scale micro-interactions, 2 px
-focus ring, Carbon icons, density-scales-spacing-only — **the locks win**.
+focus ring, shared registry icons, density-scales-spacing-only, and expressive
+Apple-like motion — **the locks win**.
 This file fills in craft detail only where the locks are silent: geometry
 discipline, window/menu construction, interaction-state completeness, and the
 per-unit review pass. It introduces no new gates; the single hard rule and the
@@ -160,7 +161,7 @@ deliberately.
 - Hierarchy through size/weight/color from the shared ramp, not scattered
   inline boldface. Secondary text uses the theme's weak color, never a local
   gray.
-- Dark only (lock #1). Contrast held on every pair (a11y lock #5): body text
+- Dark and Light (lock #1). Contrast held on every pair (a11y lock #5): body text
   ≥ 4.5:1 against its surface tier.
 - One accent, used only for primary actions, selection, focus, and progress.
   If everything is accented, nothing is.

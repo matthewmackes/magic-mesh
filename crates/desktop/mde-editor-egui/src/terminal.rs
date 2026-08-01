@@ -20,8 +20,8 @@
 
 use std::path::Path;
 
-use mde_egui::egui::{Context, RichText, Ui};
-use mde_egui::Style;
+use mde_egui::egui::{Context, Ui};
+use mde_egui::{Style, WorkspaceState, WorkspaceStatePanel};
 use mde_term_egui::{SpawnOptions, TabbedTerminal};
 
 /// The embedded integrated terminal (EDITOR-10).
@@ -150,14 +150,12 @@ impl TerminalDock {
 /// docked terminal never dead-ends (§7 honest empty state, not a blank surface);
 /// mirrors `terminal_panel`'s own empty state.
 fn empty_state(ui: &mut Ui, term: &mut TabbedTerminal) {
-    ui.vertical_centered(|ui| {
-        ui.add_space(Style::SP_XL);
-        ui.label(
-            RichText::new("No terminal sessions")
-                .size(Style::BODY)
-                .color(Style::TEXT_DIM),
-        );
-        ui.add_space(Style::SP_S);
+    WorkspaceStatePanel::new(
+        WorkspaceState::Empty,
+        "No terminal sessions",
+        "Open a fresh terminal tab to continue working in this project.",
+    )
+    .show(ui, |ui| {
         if ui.button("New terminal").clicked() {
             term.new_tab();
         }

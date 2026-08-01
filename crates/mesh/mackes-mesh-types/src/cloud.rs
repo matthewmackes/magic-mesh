@@ -1804,6 +1804,8 @@ pub const VERB_CONSOLE_ATTACH: &str = "console-attach";
 pub const VERB_ANDROID_PROVISION: &str = "android-provision";
 /// `browser-provision` — declare the dedicated Chromium browser VM workload.
 pub const VERB_BROWSER_PROVISION: &str = "browser-provision";
+/// `app-provision` — declare one admitted guest-owned Flatpak App VM.
+pub const VERB_APP_PROVISION: &str = "app-provision";
 
 /// What a workload *delivers* — the cockpit's primary organizing axis (delivery type
 /// × placement). Each maps to a provision + configure recipe under the hood.
@@ -1886,6 +1888,224 @@ pub struct WorkloadSpec {
     /// rendered tfvars (validated before `tofu`). `None` = pure form authoring.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_hcl: Option<String>,
+    /// Guest-owned App VM identity and policy, present only for `AppVm` rows.
+    /// This is a typed declaration, never a command, path, environment, or
+    /// socket description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<crate::vdi_session::AppVmLaunchRequest>,
+}
+
+/// The conservative resource profile for one guest-owned Flatpak App VM.
+/// Placement and admission remain the scheduler's responsibility; this profile
+/// only provides the bounded baseline used by the typed cloud declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppVmProfile {
+    /// Virtual CPUs allocated to the guest.
+    pub vcpu: u16,
+    /// Guest memory in MiB.
+    pub memory_mb: u32,
+    /// Root disk in GiB.
+    pub disk_gb: u32,
+    /// App VMs must remain on the isolated guest network segment.
+    pub network_isolation: bool,
+}
+
+/// Conservative App VM resource limits. These are policy bounds, not a claim
+/// that every placement node can satisfy the request; the scheduler still
+/// performs node-capacity admission after this local contract passes.
+pub const APP_VM_MIN_VCPU: u16 = 1;
+/// Maximum virtual CPUs admitted for one App VM.
+pub const APP_VM_MAX_VCPU: u16 = 8;
+/// Minimum memory admitted for one App VM, in MiB.
+pub const APP_VM_MIN_MEMORY_MB: u32 = 1024;
+/// Maximum memory admitted for one App VM, in MiB.
+pub const APP_VM_MAX_MEMORY_MB: u32 = 32 * 1024;
+/// Minimum root disk admitted for one App VM, in GiB.
+pub const APP_VM_MIN_DISK_GB: u32 = 16;
+/// Maximum root disk admitted for one App VM, in GiB.
+pub const APP_VM_MAX_DISK_GB: u32 = 256;
+/// Maximum number of capabilities admitted in one App VM request.
+pub const APP_VM_MAX_CAPABILITIES: usize = 8;
+
+/// Capabilities exposed by the supported Wayland App VM profile. Host access,
+/// GPU passthrough, arbitrary networking, mounts, and sockets are deliberately
+/// absent: an unknown capability is not safe to infer or silently downgrade.
+pub const APP_VM_ALLOWED_CAPABILITIES: &[&str] = &[
+    "audio",
+    "clipboard",
+    "file_chooser",
+    "open_uri",
+    "settings",
+    "notifications",
+    "screen",
+    "input",
+];
+
+/// Why an App VM declaration was refused before it can enter desired state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppVmAdmissionError {
+    /// The requested vCPU count is outside the App VM policy range.
+    VcpuOutOfRange {
+        /// Requested virtual CPU count.
+        requested: u16,
+        /// Inclusive lower policy bound.
+        min: u16,
+        /// Inclusive upper policy bound.
+        max: u16,
+    },
+    /// The requested memory is outside the App VM policy range.
+    MemoryOutOfRange {
+        /// Requested memory in MiB.
+        requested: u32,
+        /// Inclusive lower policy bound.
+        min: u32,
+        /// Inclusive upper policy bound.
+        max: u32,
+    },
+    /// The requested root disk is outside the App VM policy range.
+    DiskOutOfRange {
+        /// Requested root disk in GiB.
+        requested: u32,
+        /// Inclusive lower policy bound.
+        min: u32,
+        /// Inclusive upper policy bound.
+        max: u32,
+    },
+    /// App VMs may not be placed on the shared network.
+    NetworkIsolationRequired,
+    /// The declaration asks for more policy capabilities than this profile
+    /// can audit as one bounded request.
+    TooManyCapabilities {
+        /// Number of requested capabilities.
+        requested: usize,
+        /// Maximum admitted capability count.
+        max: usize,
+    },
+    /// The guest profile does not implement this capability safely.
+    UnsupportedCapability {
+        /// Capability that is outside the profile allow-list.
+        capability: String,
+    },
+    /// The nested lifecycle request itself failed its wire-contract checks.
+    InvalidRequest(crate::vdi_session::AppVmLaunchRequestError),
+}
+
+impl core::fmt::Display for AppVmAdmissionError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::VcpuOutOfRange {
+                requested, min, max,
+            } => write!(f, "vcpu {requested} is outside the admitted range {min}..={max}"),
+            Self::MemoryOutOfRange {
+                requested,
+                min,
+                max,
+            } => write!(
+                f,
+                "memory_mb {requested} is outside the admitted range {min}..={max}"
+            ),
+            Self::DiskOutOfRange {
+                requested, min, max
+            } => write!(f, "disk_gb {requested} is outside the admitted range {min}..={max}"),
+            Self::NetworkIsolationRequired => {
+                f.write_str("network isolation is required for App VMs")
+            }
+            Self::TooManyCapabilities { requested, max } => write!(
+                f,
+                "requested capability count {requested} exceeds the admitted maximum {max}"
+            ),
+            Self::UnsupportedCapability { capability } => {
+                write!(f, "capability `{capability}` is not admitted by the App VM profile")
+            }
+            Self::InvalidRequest(error) => write!(f, "invalid App VM request: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for AppVmAdmissionError {}
+
+impl Default for AppVmProfile {
+    fn default() -> Self {
+        Self {
+            vcpu: 2,
+            memory_mb: 4096,
+            disk_gb: 32,
+            network_isolation: true,
+        }
+    }
+}
+
+impl AppVmProfile {
+    /// Admit one typed App VM request against this resource and capability
+    /// profile. This is deliberately pure so every provisioning boundary can
+    /// apply the same fail-closed policy before writing desired state.
+    pub fn admit(
+        &self,
+        app: &crate::vdi_session::AppVmLaunchRequest,
+    ) -> Result<(), AppVmAdmissionError> {
+        if !(APP_VM_MIN_VCPU..=APP_VM_MAX_VCPU).contains(&self.vcpu) {
+            return Err(AppVmAdmissionError::VcpuOutOfRange {
+                requested: self.vcpu,
+                min: APP_VM_MIN_VCPU,
+                max: APP_VM_MAX_VCPU,
+            });
+        }
+        if !(APP_VM_MIN_MEMORY_MB..=APP_VM_MAX_MEMORY_MB).contains(&self.memory_mb) {
+            return Err(AppVmAdmissionError::MemoryOutOfRange {
+                requested: self.memory_mb,
+                min: APP_VM_MIN_MEMORY_MB,
+                max: APP_VM_MAX_MEMORY_MB,
+            });
+        }
+        if !(APP_VM_MIN_DISK_GB..=APP_VM_MAX_DISK_GB).contains(&self.disk_gb) {
+            return Err(AppVmAdmissionError::DiskOutOfRange {
+                requested: self.disk_gb,
+                min: APP_VM_MIN_DISK_GB,
+                max: APP_VM_MAX_DISK_GB,
+            });
+        }
+        if !self.network_isolation {
+            return Err(AppVmAdmissionError::NetworkIsolationRequired);
+        }
+        app.validate().map_err(AppVmAdmissionError::InvalidRequest)?;
+        if app.requested_capabilities.len() > APP_VM_MAX_CAPABILITIES {
+            return Err(AppVmAdmissionError::TooManyCapabilities {
+                requested: app.requested_capabilities.len(),
+                max: APP_VM_MAX_CAPABILITIES,
+            });
+        }
+        for capability in &app.requested_capabilities {
+            if !APP_VM_ALLOWED_CAPABILITIES.contains(&capability.as_str()) {
+                return Err(AppVmAdmissionError::UnsupportedCapability {
+                    capability: capability.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Turn an admitted App VM launch into the existing Workloads desired-state
+    /// contract. The caller must supply an already validated request.
+    #[must_use]
+    pub fn workload_spec(
+        self,
+        node: &str,
+        name: &str,
+        app: crate::vdi_session::AppVmLaunchRequest,
+    ) -> WorkloadSpec {
+        WorkloadSpec {
+            name: name.to_string(),
+            delivery_type: DeliveryType::AppVm,
+            node: node.to_string(),
+            vcpu: self.vcpu,
+            memory_mb: self.memory_mb,
+            disk_gb: self.disk_gb,
+            image: Some("app-vm-wayland-standard".to_owned()),
+            network_isolation: self.network_isolation,
+            raw_hcl: None,
+            app: Some(app),
+        }
+    }
 }
 
 /// The baseline profile for the dedicated Browser VM.
@@ -1928,6 +2148,7 @@ impl BrowserVmProfile {
             image: None,
             network_isolation: false,
             raw_hcl: None,
+            app: None,
         }
     }
 }
@@ -2079,6 +2300,9 @@ pub struct WorkloadRow {
     /// Desired-vs-actual drift.
     #[serde(default)]
     pub drift: DriftFlag,
+    /// The admitted guest application declaration for an App VM row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<crate::vdi_session::AppVmLaunchRequest>,
 }
 
 /// Drift rollup for a node's `state/cloud` mirror.
@@ -2121,6 +2345,92 @@ mod tests {
         assert_eq!(spec.vcpu, 4);
         assert_eq!(spec.memory_mb, 8192);
         assert_eq!(spec.disk_gb, 64);
+    }
+
+    fn app_request() -> crate::vdi_session::AppVmLaunchRequest {
+        crate::vdi_session::AppVmLaunchRequest::new(
+            "org.example.Writer",
+            "catalog-7",
+            "wayland-standard",
+            vec!["audio".into(), "clipboard".into()],
+            "session-7",
+            true,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn app_vm_default_profile_is_admitted_and_isolated() {
+        let profile = AppVmProfile::default();
+        let request = app_request();
+        assert_eq!(profile.admit(&request), Ok(()));
+
+        let spec = profile.workload_spec("eagle", "writer", request);
+        assert_eq!(spec.vcpu, 2);
+        assert_eq!(spec.memory_mb, 4096);
+        assert_eq!(spec.disk_gb, 32);
+        assert!(spec.network_isolation);
+    }
+
+    #[test]
+    fn app_vm_admission_rejects_unsafe_cpu_memory_storage_and_network() {
+        let request = app_request();
+
+        let profile = AppVmProfile {
+            vcpu: 0,
+            ..AppVmProfile::default()
+        };
+        assert!(matches!(
+            profile.admit(&request),
+            Err(AppVmAdmissionError::VcpuOutOfRange { requested: 0, .. })
+        ));
+
+        let profile = AppVmProfile {
+            memory_mb: APP_VM_MAX_MEMORY_MB + 1,
+            ..AppVmProfile::default()
+        };
+        assert!(matches!(
+            profile.admit(&request),
+            Err(AppVmAdmissionError::MemoryOutOfRange { .. })
+        ));
+
+        let profile = AppVmProfile {
+            disk_gb: APP_VM_MIN_DISK_GB - 1,
+            ..AppVmProfile::default()
+        };
+        assert!(matches!(
+            profile.admit(&request),
+            Err(AppVmAdmissionError::DiskOutOfRange { .. })
+        ));
+
+        let profile = AppVmProfile {
+            network_isolation: false,
+            ..AppVmProfile::default()
+        };
+        assert_eq!(
+            profile.admit(&request),
+            Err(AppVmAdmissionError::NetworkIsolationRequired)
+        );
+    }
+
+    #[test]
+    fn app_vm_admission_rejects_unsafe_capabilities_with_explicit_reasons() {
+        let mut request = app_request();
+        request.requested_capabilities = vec!["gpu".into()];
+        assert_eq!(
+            AppVmProfile::default().admit(&request),
+            Err(AppVmAdmissionError::UnsupportedCapability {
+                capability: "gpu".into()
+            })
+        );
+
+        request.requested_capabilities = (0..=APP_VM_MAX_CAPABILITIES)
+            .map(|index| format!("capability_{index}"))
+            .collect();
+        assert!(matches!(
+            AppVmProfile::default().admit(&request),
+            Err(AppVmAdmissionError::TooManyCapabilities { .. })
+        ));
     }
 
     #[test]

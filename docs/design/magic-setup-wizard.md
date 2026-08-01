@@ -24,7 +24,7 @@ and add/remove peers — narrating every step in real time. Fedora-idiomatic
 | 1 | TUI shape | **One `magic-setup` binary** (grown from the ONBOARD-5 `mde-enroll` ratatui code). Top menu: Create mesh / Join mesh / Manage peers / Status. `mde-enroll` becomes the join-only shim that calls into it. |
 | 2 | First-run | **Console first-run unit + MOTD.** `magic-setup.service` launches the wizard on the console when the node is **unconfigured** (Fedora initial-setup/firstboot pattern), self-disables once a role is pinned; an MOTD/login banner shows `sudo magic-setup` as the fallback. |
 | 3 | Config method | **Hybrid: imperative verbs bootstrap, Ansible converges.** First bring-up uses the live verbs/scripts (`found`/`join`/`setup-qnm-shared`/`systemctl` — they need interactive IO + fp pinning). The wizard then emits `/etc/mackesd/site.yml` and runs it via the platform's `ansible_pull` for reproducible steady-state convergence + every later change. |
-| 4 | Lighthouses | **Up to 3** (overrides §8 single-lighthouse). LH1 = founding CA holder + etcd anchor (was the LizardFS master) + `/enroll`. LH2/LH3 = additional **public** lighthouses for NAT relay/discovery redundancy + etcd quorum members + Syncthing file peers (was LizardFS metalogger + QNM-Shared replica). One CA (on LH1) keeps ≤8-peer signing simple; the bundle roster lists all live lighthouses. |
+| 4 | Lighthouses | **Up to 3**. LH1 = founding CA holder + etcd anchor + `/enroll`. LH2/LH3 = additional public lighthouses for NAT relay/discovery redundancy, etcd quorum, and Syncthing file service. The supported infrastructure envelope is up to 12 nodes (3 lighthouses + 9 peers); the bundle roster lists all live lighthouses. |
 | 5 | Mesh identity | **By lighthouse IP.** Join keys on a lighthouse IP (the v3 token carries `mesh:<id>@<ip>:<port>#<bearer>?fp=`); a peer may join via **any** of the 1–3 lighthouse IPs. The mesh-id + CA fingerprint disambiguate. |
 | 6 | NAT posture | **All Full + most Headless nodes are behind hostile NAT.** Only lighthouses need public IPs. Peers dial lighthouses **outbound** (`/enroll` over TLS, then nebula UDP); nebula hole-punches + relays via the lighthouses (`am_relay`), so 2–3 lighthouses materially raise reachability. |
 
@@ -32,10 +32,10 @@ and add/remove peers — narrating every step in real time. Fedora-idiomatic
 - **Lighthouse** — public IP, no desktop; nebula lighthouse + relay, `/enroll`
   endpoint, etcd anchor (was LizardFS master/metalogger), Syncthing file peer (was
   QNM-Shared replica).
-- **Headless (Server)** — behind NAT; full mackesd workers, etcd member + Syncthing
-  peer (was QNM-Shared client), no desktop GUIs.
-- **Full (Workstation)** — behind NAT; everything Headless has + the Cosmic
-  desktop GUIs (workbench/files/applet/wallpaper).
+- **Workstation (headless capability)** — behind NAT; full mackesd workers, etcd
+  member + Syncthing peer, and no local display when headless.
+- **Workstation (display capability)** — the same role plus the Construct egui/DRM
+  desktop surfaces.
 
 ## Wizard flow (each screen verbose, real-time log pane)
 1. **Detect state** — unconfigured (no role pinned) vs configured (show Status).

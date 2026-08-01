@@ -1,5 +1,10 @@
 # On-demand DigitalOcean lighthouses (Option A: doctl + cloud-init)
 
+> **HISTORICAL / SUPERSEDED (2026-07-30):** This DO-specific bootstrap recipe
+> predates the current provider-neutral Workloads and up-to-12-node operating
+> model. Retain it as deployment history; use current enrollment and farm
+> guidance for supported operations.
+
 Stand up a MCNF founding lighthouse on a fresh DO Fedora droplet with one
 command. Each droplet founds its **own** mesh — `AI_GOVERNANCE.md` §8 (one
 founding lighthouse per mesh, ≤8 flat-trust peers). "Replicate lighthouses on

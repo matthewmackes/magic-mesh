@@ -2,9 +2,9 @@
 //! `docs/design/about-device-manager.md`; locks #1/#2/#18/#19/#20/#24).
 //!
 //! The About surface body is a faithful Windows-Device-Manager **by-type** tree,
-//! rendered entirely in `mde_egui::Style` dark tokens (§4): a compact brand title
-//! strip (the brand shrinks off the body, #2/#24) with an ⓘ button that opens the
-//! license / credits / mesh-identity dialog; a full menu bar + toolbar (#19); a
+//! rendered entirely in `mde_egui::Style` dark tokens (§4): a full shared menu
+//! bar + toolbar (#19) with Help opening the license / credits / mesh-identity
+//! dialog; a
 //! rich per-host header card (#20); and the all-collapsed category tree (#1/#18).
 //!
 //! It is a pure **consumer** of the §6 JSON contract in
@@ -1755,14 +1755,11 @@ impl DeviceManagerState {
 
     /// Render the whole surface into `ui` (the body of `Surface::About`).
     ///
-    /// Layout (#2/#5/#9): the compact brand strip (#24), the shared MENUBAR-ALL
-    /// bar, then **rail │ tree │ (bottom drawer)** — the persistent left host rail
+    /// Layout (#2/#5/#9): the shared MENUBAR-ALL bar, then **rail │ tree │
+    /// (bottom drawer)** — the persistent left host rail
     /// (DEVMGR-4) reserved first so it spans full height, then the bottom **detail
     /// drawer** (DEVMGR-3), then the tree + header card fill the remainder.
     pub(crate) fn show(&mut self, ui: &mut egui::Ui) {
-        // The brand identity strip (#24) — kept beside the shared MenuBar so the
-        // product mark + the ⓘ button stay always-visible.
-        self.title_strip(ui);
         // MENUBAR-ALL: the shared top bar replaces DEVMGR-2's bespoke Action/View/
         // Help chrome (About is the 14th / last surface onto the shared component).
         if let Some(action) = self.chrome_bar(ui) {
@@ -1957,43 +1954,6 @@ impl DeviceManagerState {
         self.inventory
             .as_ref()
             .map_or(self.selected_host.as_str(), |inv| inv.host.as_str())
-    }
-
-    /// The compact brand title strip (#2/#24): the `◈` mark + product name +
-    /// version on the left, the ⓘ button on the right. Single-sourced from
-    /// [`mde_theme::brand`] (§4/§6) so it can never drift from `--version`.
-    fn title_strip(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("\u{25C8}") // ◈ — the mesh-node mark
-                    .color(Style::ACCENT)
-                    .size(Style::TITLE),
-            );
-            ui.add_space(Style::SP_XS);
-            ui.label(
-                RichText::new(brand::logo::PRODUCT_NAME)
-                    .color(Style::TEXT)
-                    .size(Style::BODY)
-                    .strong(),
-            );
-            ui.label(
-                RichText::new(brand::logo::PRODUCT_RELEASE)
-                    .color(Style::TEXT_DIM)
-                    .size(Style::SMALL),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let about = ui.button(
-                    RichText::new("\u{24D8}") // ⓘ
-                        .size(Style::BODY)
-                        .color(Style::TEXT),
-                );
-                if devmgr_hover_text(about, "About \u{2014} license, credits, mesh identity")
-                    .clicked()
-                {
-                    self.show_about = true;
-                }
-            });
-        });
     }
 
     /// MENUBAR-ALL (About) — the **shared top bar** that replaces DEVMGR-2's bespoke
@@ -2385,7 +2345,7 @@ impl DeviceManagerState {
         // (confirmed) captured so the arming borrow drops before the seam is driven.
         let mut act: Option<bool> = None;
         if let Some(arming) = self.arming.as_mut() {
-            egui::Frame::group(ui.style()).show(ui, |ui| {
+            mde_egui::card().show(ui, |ui| {
                 ui.colored_label(
                     Style::WARN,
                     RichText::new(format!("Confirm: {}", arming.op.label()))
@@ -2555,7 +2515,7 @@ impl DeviceManagerState {
         // §7 — an unmanaged router has no sealed credential, so no mutation is
         // possible; say so plainly rather than offer a placebo composer.
         if !mirror.managed {
-            egui::Frame::group(ui.style()).show(ui, |ui| {
+            mde_egui::card().show(ui, |ui| {
                 ui.colored_label(
                     Style::TEXT_DIM,
                     RichText::new("Firewall edit").size(Style::BODY).strong(),
@@ -2578,7 +2538,7 @@ impl DeviceManagerState {
 
         let mut submit = false;
         if let Some(d) = self.router_edit.as_mut() {
-            egui::Frame::group(ui.style()).show(ui, |ui| {
+            mde_egui::card().show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.colored_label(
                         Style::ACCENT,
@@ -3051,7 +3011,7 @@ impl DeviceManagerState {
 /// The rich per-host header card (#20): the hostname, the device count + problem
 /// badge, and the summary fields — over a [`Style`]-token group.
 fn header_card(ui: &mut egui::Ui, inv: &DeviceInventory) {
-    ui.group(|ui| {
+    mde_egui::card().show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(&inv.host)
@@ -3829,7 +3789,7 @@ fn fleet_header(ui: &mut egui::Ui, tree: &NodeTree) {
     let problem_hosts = tree.hosts.iter().filter(|h| h.problem_count > 0).count();
     let devices: usize = tree.hosts.iter().map(|h| h.device_count).sum();
     let problems: usize = tree.hosts.iter().map(|h| h.problem_count).sum();
-    ui.group(|ui| {
+    mde_egui::card().show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new("Cross-fleet")

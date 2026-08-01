@@ -10,6 +10,16 @@ rebuilding when none does.
 > node to Lighthouse. With two, the loss of one is a non-event — the survivor
 > keeps relaying, signing, and leading.
 
+## Production recovery contract
+
+The production baseline is three lighthouses and three workstations. Losing one
+lighthouse must trigger automatic relay/path failover and a visible degraded
+state; it must not require routine operator promotion. Manual promotion below
+is the recovery fallback when automatic failover or leadership cannot complete.
+Failed nodes are repaired forward: revoke the failed identity, preserve its
+diagnostics, re-enroll a corrected node, and verify the role/topology contract.
+Rollback is not a required recovery path.
+
 ## Triage
 
 ```bash
@@ -20,15 +30,19 @@ meshctl doctor              # on each surviving node
 
 If peers still reach each other (a second lighthouse or direct paths exist), you
 are not in a hard outage — go to **Case A**. If nothing reaches anything and your
-only lighthouse is gone, go to **Case B**.
+only lighthouse is gone, go to **Case B**. In either case, record the incident
+with `meshctl doctor`, `meshctl fleet status`, and the audit timeline before
+making corrective changes.
 
 ## Case A — a second lighthouse exists (or you can promote one)
 
-1. Confirm a survivor is acting as leader/CA:
+1. Confirm automatic re-home and that a survivor is acting as leader/CA:
    ```bash
    meshctl fleet status
+   meshctl test connectivity
    ```
-2. If no surviving node is a lighthouse, promote a healthy Workstation:
+2. If automatic failover did not establish a surviving lighthouse, promote a
+   healthy Workstation as the documented fallback:
    ```bash
    # On the chosen node:
    meshctl install --role lighthouse
@@ -56,7 +70,7 @@ you're restoring is the **CA**.
 2. **Restore the CA** from the most recent `state-backup.enc` that replicated off
    the dead node into the local store:
    ```bash
-   mackesd state-restore <path/to/state-backup.enc>
+   mackesd state-restore --passphrase-stdin <path/to/state-backup.enc>
    ```
    The files on `/mnt/mesh-storage` need no restore step — they live on every
    surviving peer and re-converge over Syncthing once the new lighthouse is up.
@@ -78,9 +92,15 @@ you're restoring is the **CA**.
    meshctl test connectivity
    ```
 
+5. **Correct forward:** replace any failed or untrusted node from the corrected
+   artifact, revoke its old certificate, and enroll it with a fresh one-time
+   token. Do not restore an old node into the production topology without
+   checking its role, capability tags, package compatibility, and health state.
+
 ## After recovery
 
-- **Add a second lighthouse now** so you never repeat Case B.
+- **Complete the three-lighthouse baseline** before declaring production
+  readiness; two lighthouses are a degraded recovery posture, not the target.
 - Confirm Syncthing replication health (`systemctl status syncthing` on each peer;
   the mesh-health watchdog also alerts on an out-of-sync file plane).
 - The lifecycle operations (re-mint, re-enroll, leadership change) are recorded

@@ -144,6 +144,14 @@ implementation instructions, not a second worklist.
    page-faithful preview, paper/tray/orientation/margins, duplex/binding,
    color, copies, collation, ranges, scaling, N-up/booklet, PDF output,
    presets, progress, cancel, retry, and tablet-sized touch controls.
+7. Audio is a first-class production requirement across seats, App VMs,
+   Browser VMs, VDI, Mesh Teams, and node-to-node streaming. PulseAudio
+   compatibility must be present through PipeWire's Pulse server; ALSA,
+   PipeWire, WirePlumber, UCM, codecs, permissions, services, device
+   discovery, microphones, speakers, HDMI/Bluetooth, VM audio, and remote
+   audio transport must all be installed, routed, observable, recoverable,
+   and proven live. Audio may not be marked optional or unavailable for
+   production promotion.
 
 ### Unified This Node survey completion - 2026-07-31
 
@@ -296,10 +304,44 @@ remains here under a completed status.
   `install-helpers/`. Typed `browser-provision` has the 4-vCPU/8192-MiB/64-GiB
   baseline and tests; `packaging/browser-vm/profile.env` fixes guest identity,
   provenance, Chromium/Sway ownership, transport preference, and the resource
-  floor with a fail-closed verifier. Front Door/AccessKit expose truthful guest
+  floor with a fail-closed verifier; its source provenance now requires a pinned
+  40-character commit, explicit fail-closed runtime policy, and terminal
+  `failed`/`unavailable` guest states; the profile verifier passes once and the
+  focused runtime contract passes 17 assertions on farm `.90`. Front Door/AccessKit expose truthful guest
   states; the image-owned validator admits only bounded identity/digest/transport
   records and rejects commands, URLs, paths, symlinks, and extra inputs. Its farm
-  contract suite passes; live realization and extraction remain open.
+  contract suite passes; live realization and extraction remain open. The
+  extraction verifier now also rejects ignored Browser candidates and requires
+  dirty manifest rows to match the current worktree blob, with clean/valid-dirty/
+  stale-dirty self-tests passing on farm `.90`. Browser activation now selects
+  and resumes a typed `browser-vm` route with explicit transport-unavailable
+  state and no host-helper fallback; the focused live-feature and transport
+  diagnostic gates each pass 1/1 on the farm. Actual VDI attachment and guest
+  framebuffer realization remain open. The guest runtime contract now requires
+  bounded typed `transport-health` evidence (`connected`, `reconnecting`,
+  `failed`, or `unavailable`) and rejects missing, malformed, path-shaped,
+  symlinked, or extra inputs; its farm contract suite passes on `.50` slot
+  `browser-contract-230`. The new `install-helpers/verify-vdi-live-proof.py`
+  runner invokes only the approved ignored live VNC/SPICE worker tests through
+  an explicit farm host/slot and records `observed` only for an exact
+  non-empty guest `FRAME OK` marker, with bounded dimensions/hash and no ticket
+  or raw-log retention. Its self-test and farm syntax/self-test pass on `.50`
+  slot `vdi-proof-helper-231`; actual target execution remains unavailable
+  until a real guest endpoint is supplied. Live read-only audit on 2026-08-01
+  found `.15` healthy but with no VM and no VNC/RDP/SPICE listener; Dell
+  `.225` has shell services but no VDI listener, Eagle is unreachable, and
+  `.138` has a host-key conflict requiring operator resolution.
+- Operator-path update (2026-08-01): `verify-vdi-live-proof.py discover` now
+  delegates to the bounded approved-seat inventory and validates its schema;
+  Python/self-tests and farm shell verification pass on `.50` slot
+  `vdi-discovery-proof-241`.
+- Provenance hardening update (2026-08-01): the Browser VM profile verifier
+  rejects the all-zero source revision and its contract covers null provenance;
+  the focused contract passes on `.50` slot `browser-runtime-provenance-241`.
+- Runtime-integrity update (2026-08-01): browser guest runtime input files now
+  require root ownership and reject group/other-writable or executable modes;
+  insecure ownership/mode fixtures and the full browser profile contract pass
+  on `.50` slot `browser-runtime-mode-232`.
 - Remaining work:
 
   1. Re-run and review the source commit, workspace/package/process inventory,
@@ -411,10 +453,12 @@ remains here under a completed status.
      100 ms p95 with no measured response over 250 ms; RDP damage produces
      partial uploads; hidden Browser state does not continuously repaint.
   10. Guest audio appears in the host PipeWire VM/application mixer path and
-      follows mute/volume policy. A silent fallback cannot satisfy production
-      acceptance; the engineering preview may record unavailable audio evidence.
-      Preview transport failure must show an explicit degraded warning and
-      production promotion requires working audio on the selected path.
+      follows mute/volume policy. PulseAudio compatibility, PipeWire,
+      WirePlumber, ALSA/UCM, device permissions, VM audio, and the selected
+      VDI transport must all be live. A silent fallback or unavailable audio
+      evidence fails production acceptance; the engineering preview may not
+      promote until `.15` and the six-node testbed pass playback, capture,
+      reconnect, and recovery.
   11. Clean install and upgrade remove obsolete runtime/package state without
       deleting user data. Current docs describe only the VM Browser; historical
       host Browser evidence remains archived.
@@ -470,6 +514,17 @@ remains here under a completed status.
   posting, and AccessKit send labels now have focused farm coverage. Completed
   evidence is in the pre-rework archive; parity source is `docs/platform/WL-FUNC-011-parity-ledger.md`; Calls unavailable-state
   semantics have accessible labels and 19 focused tests pass at `76dd2457`.
+  The clipboard composer now uses the canonical text-size bound, preserves
+  meaningful leading/trailing whitespace, rejects blank/invalid attribution
+  without queueing, and retains rejected drafts; 11 focused tests pass on farm
+  `.50`.
+- Task convergence update (2026-08-01): completion authored by a departed
+  member is covered by an offline convergence regression; the focused farm
+  gate passes 1 test with 87 filtered on `.50` slot `func011-task-departed-241`.
+- Membership authorization update (2026-08-01): cross-member removal events
+  now require the target member or a present owner in both the domain and
+  SQLite projection paths; the focused farm gate passes 1 test with 88
+  filtered on `.90` slot `func011-membership-removal-243`.
 - Remaining work:
 
   1. Reconcile the parity ledger against current runtime/tests and leave only
@@ -494,7 +549,10 @@ remains here under a completed status.
      elected LiveKit SFU fallback/failover, SIP ingress/egress, advancing media,
      device switching, call controls, screen share, and remote-control
      escalation. Remote control requires a trusted-session approval. Recording
-     and transcription remain absent.
+     and transcription remain absent. Audio must stream between enrolled
+     Mesh nodes over the direct path and the elected relay path with bounded
+     jitter, loss recovery, mute/volume state, device changes, authorization,
+     and reconnect behavior.
   6. Complete full-IDE Markdown document entry, Yrs coauthoring, anchored review
      threads, shared presence/follow mode, external-write three-way review,
      version history, and safe Git behavior.
@@ -551,7 +609,11 @@ remains here under a completed status.
      report through the shared progress projection.
   6. Direct and SFU-relayed calls carry advancing audio/video/screen frames;
      SIP ingress/egress, device controls, failover, and remote-control
-     escalation work; no recording/transcription artifact exists.
+     escalation work; no recording/transcription artifact exists. Node-to-node
+     audio streaming is independently proven on direct and relay paths,
+     including microphone capture, speaker playback, mute/volume propagation,
+     device switching, packet-loss/jitter handling, authorization, and
+     reconnect after node or route loss.
   7. Discord is genuinely two-way with provenance and loop prevention only
      after sealed provider configuration; otherwise it is visibly disabled.
      DigitalOcean suggestions use consented bounded context, never auto-apply,
@@ -602,16 +664,48 @@ remains here under a completed status.
   target seat and leave failed writes retryable. KDC has 31 focused tests; VNC
   has a verified ClientCutText/ServerCutText round trip; the shell adapter has
   58 VDI tests. The daemon bridge validates serving peer and target seat with
-  source attribution, deduplication, and retryability (27 bridge + 43 sync
-  tests). RDP CLIPRDR/SPICE vdagent remain typed unsupported and gated.
+  source attribution, deduplication, and retryability (28 bridge + 44 sync
+  tests). The production adapter now consumes a bounded Bus handoff for
+  guest-to-client materialization at the exact signed seat, while client-to-
+  guest remains explicitly gated behind ownership of the live VDI protocol
+  session; bridge and sync focused suites pass on farm `.130`/`.90`. RDP
+  CLIPRDR/SPICE vdagent remain typed unsupported and gated. The shell adapter
+  now scans a bounded materialization tail for the exact target seat, exposes
+  retryable unavailable state, retains authorized handoffs across repeated
+  reads, and keeps local publication opt-in off by default; 16 focused
+  communications tests pass on farm `.90` slot `func016-shell-adapter-159`.
+  The live KDC worker now owns `ClipboardPlugin`, admits paired clipboard and
+  `.connect` packets, drains active-seat materializations, and publishes the
+  canonical `state/clipboard/materialize` Bus handoff with peer/packet
+  attribution. Direct and fanout paths no longer invoke `wl-copy`; unavailable
+  Bus writes remain queued for retry. The plugin suite passes 31 tests on farm
+  `.50`; the daemon `kdc_host` gate passes 70 tests on BigBoy, including a
+  direct plugin-to-Bus assertion for exact seat, whitespace, and source/packet
+  attribution plus honest fanout application status when the Bus is unavailable.
+  Mesh Teams clipboard UI/action routing now gates local publication behind the
+  session opt-in while keeping remote history visible, preserves exact bounded
+  text/hash/source data, retains rejected drafts, and emits typed attach,
+  pin/unpin, and delete commands; its focused UI gate passes 15 tests plus one
+  action-command regression on farm `.50` slot `func016-collab-ui-207`. The
+  shell Communications mount now renders retryable target-seat materialization
+  failures visibly in Clipboard mode; its focused communications gate passes
+  17 tests on farm `.50` slot `func016-shell-notice-209`.
+- VDI ingress hardening update (2026-08-01): Mesh Teams now rejects unsupported
+  or malformed VDI clipboard capability reports before command materialization,
+  while explicitly bidirectional text remains bounded and admissible; 17
+  focused tests pass on `.50` slot `func016-collab-vdi-cap-240`.
+- RDP capability update (2026-08-01): the typed RDP clipboard adapter now
+  exposes an explicit unsupported status and latches failed legacy reads; the
+  focused farm gate passes 1 test with 71 filtered on `.90` slot
+  `rdp-clipboard-224`. IronRDP's pinned release still has no CLIPRDR
+  implementation, so real RDP clipboard transport remains intentionally open
+  rather than falsely reporting success.
 - Remaining work:
 
   1. Wire the production OS/guest clipboard adapter for the signed target-seat
      handoff, preserving bounded retry and explicit unavailable-state reporting;
      do not reintroduce Wayland polling.
-  2. Connect the completed KDC/mobile active-seat materialization queue to the
-     production OS/guest adapter without losing remote history or attribution.
-  3. Route Mesh Teams clipboard UI/actions to the same lane. Persist team
+  2. Route Mesh Teams clipboard UI/actions to the same lane. Persist team
      history/actions for the session only, support per-user opt-out, and keep
      remote history visible when local publishing is disabled. Route Browser
      copy and paste solely through its VDI protocol after WL-ARCH-008 removes
@@ -680,9 +774,33 @@ remains here under a completed status.
   Raster MBTiles/FTS5 serves one region; Maps owns basemap/search, while Valhalla, route/lane/speed helpers, bearing, and admin actions remain unwired.
   Typed v2 identity/radio/freshness/provenance dual-publishes beside v1; Maps/Car project bounded radio and mirror states, with 13 consumer tests passing.
   The MG90/manager roster has independent poll/heartbeat plans, latest-wins/no-source behavior, and 44 vehicle tests pass. Cached observations heartbeat every
-  two seconds without resetting v2 age. Maps HUD/Airspace expose honest unavailable/stale states; route preview has 7 focused tests at `05ba6870`.
+  two seconds without resetting v2 age; the reusable default roster plan carries
+  that independent heartbeat as well. Maps HUD/Airspace expose honest unavailable/stale states; route preview has 7 focused tests at `05ba6870`.
   Navigation start rejects malformed or stale selections without mutation; the fresh farm full-crate Maps suite passes 264 tests with no failures. Live adapters
-  and route/render cutover remain.
+  and route/render cutover remain. Multi-device roster admission now rejects
+  unsupported `VehicleStateV2` schema versions before identity acceptance, and
+  the vehicle-worker suite passes 76 tests on farm `.50`. The Maps consumer now
+  folds a bounded multi-manager MG90 roster with identity/schema/manager-set
+  admission, latest-wins selection, retained typed cache, and explicit
+  `ResyncingNoFreshSnapshot` when a refresh has no valid fresh row; the full
+  Maps suite passes 268 tests on farm `.130`.
+  The typed telemetry boundary now distinguishes `NotInstalled`, `Unsupported`,
+  and `Failed` OBD/HDOBD probe outcomes, preserves gateway observations, and
+  never treats an unverified payload as typed vehicle telemetry; the mesh-types
+  focused gate passes 14 tests on farm `.50`, and the daemon vehicle gate passes
+  77 vehicle-focused tests with zero failures on farm `.90` slot
+  `func017-worker-208`. Offline-region manifests now validate bounded revision,
+  artifact identity, size, digest, and traversal safety before atomic activation;
+  the focused Maps gate passes 3 tests with 269 filtered on `.90` slot
+  `maps-manifest-225`.
+- Radio-inventory update (2026-08-01): the v2 inventory now rejects duplicate
+  identities and exposes an explicit six-position native layout without
+  converting missing rows into installed hardware. The focused mesh-types
+  test passes on `.50` slot `func017-radio-slots-233`; direct live adapter and
+  multi-manager rollout evidence remain open.
+- Vehicle-worker gate update (2026-08-01): the current identity-addressed,
+  schema-gated manager route passes 80 vehicle-focused tests with 4,238
+  filtered and zero failures on `.90` slot `func017-vehicle-current-243`.
 - Remaining work:
   1. Consume WL-UX-009's platform-wide Carbon-requirement retirement and update
      the Maps/Car-specific authority while retaining egui, shared `Style`,
@@ -692,7 +810,13 @@ remains here under a completed status.
   2. Extend the landed versioned `VehicleState` v2 baseline to multiple MG90s,
      multiple managers, and the full rolling-upgrade removal plan.
   3. Extend the landed bounded `RadioId`/health inventory with live SKU
-     discovery, multiple-manager routing, and consumer-side stale/resync state.
+     discovery and multiple-manager routing. Consumer-side stale/resync/cache
+  behavior is now covered for the Maps roster fold; live adapter evidence and
+  cross-surface rollout remain.
+  The vehicle worker now rejects unsupported v2 schemas before acceptance and
+  exposes a typed manager route that skips revoked or unenrolled suppliers while
+  preserving an honest no-source/rejected result; its focused farm gate passes
+  79 tests with 4,238 filtered on `.90` slot `func017-vehicle-review-239`.
   4. Extend the landed typed radio metrics with proven device discovery and
      live adapter coverage; never infer absent hardware or zero-fill telemetry.
   5. Refactor the vehicle worker into independent schedulers for multiple MG90s
@@ -887,7 +1011,38 @@ remains here under a completed status.
   distinct `Guest App`/`Guest Flatpak` accessibility language. On farm `.170`,
   the Fedora 44 RPM-backed image passed all static checks with profile
   `wayland-standard-v1`, image `6e16ff...6044c54`, and immutable base
-  `sha256:4bd2...faa3b5`; full provision/guest/VDI convergence remains open.
+  `sha256:4bd2...faa3b5`; full provision/guest/VDI convergence remains open. Front Door now bounds versioned Flatpak favorites, explains requested guest permissions, and presents explicit installing/placement/start/reconnect/unavailable states with disabled primary actions; five focused peer-app presentation/favorite tests pass on farm `.50` slot 156. The daemon launch seam now rejects guest-owned Flatpaks at the legacy host launcher and maps fully identified guest requests to typed `OpenApp` session requests without command/path fallback; 12 focused daemon tests and 33 focused mesh-type tests pass on farm `.50`. The App VM image contract requires a complete immutable `sha256:` base-image digest; image provenance self-tests and the full App VM contract suite pass on farm `.90`. Catalog admission now rejects capabilities outside the supported App VM allow-list before a row can be launchable; four catalog policy tests pass on farm `.90` slot `func018-catalog-policy-192`. The immutable guest validator now applies the same reverse-DNS Flatpak identity rule at image runtime, rejecting single-component and empty-component IDs; the App VM image contract suite passes on farm `.50` slot `func018-guest-identity-214`. The session broker now rejects terminal stale/replayed AppState evidence atomically; its focused farm gate passes 1 test with 4,307 filtered on `.90` slot `appvm-terminal-evidence-214`. The shell App VM rail now suppresses focus/handoff for failed, unavailable, reconnecting, and not-ready states while keeping paused sessions resumable; 8 focused tests pass on `.50` slot `appvm-session-rail-214`. App VM runtime evidence and AppState now carry a backward-compatible monotonic `generation` field; legacy zero-generation JSON still decodes, and the wire slice passes 8 tests on `.50` slot `appvm-generation-wire-215`. The broker integrates strict ordering for numbered evidence while preserving legacy zero-generation behavior; its combined session-broker gate passes 40 tests with 4,270 filtered on `.90` slot `appvm-generation-broker-216`.
+- Evidence update (2026-08-01): the generation ordering broker gate now passes
+  41 tests with 4,270 filtered on `.90` slot `appvm-generation-broker-218`,
+  including atomic rejection of replayed same-identity generations.
+- Runtime-admission update (2026-08-01): App VM evidence lookup now selects
+  the newest valid record for the exact session/app identity, so unrelated
+  session heartbeats cannot block a resume while stale, malformed, and
+  terminal matching evidence remain fail-closed; the focused farm gate passes
+  9 tests with 4,303 filtered on `.50` slot `appvm-runtime-admission-221`.
+- Front Door update (2026-08-01): peer catalog discovery now preserves signed
+  permission/lifecycle metadata through bounded retries and reconnecting state,
+  rejects cross-node replies, and keeps unsigned/not-installed rows visibly
+  unavailable; the focused farm gate passes 11 tests with 1,932 filtered on
+  `.90`.
+- Guest publisher update (2026-08-01): the App VM cloud-init and image-owned
+  launcher now persist a bounded durable generation counter and include it in
+  every runtime evidence publication; shell syntax and the full App VM contract
+  suite pass on `.90` slot `appvm-generation-guest-223`.
+- Terminal evidence update (2026-08-01): the App VM contract suite now exercises
+  connected, reconnecting, failed, and unavailable guest-runtime evidence with
+  monotonic-generation and replay rejection plus command/path/host-fallback
+  refusal; the farm verifier passes on `.90` slot `app-contract-230`.
+- Lifecycle hardening update (2026-08-01): the guest launcher now traps
+  TERM/INT/HUP, terminates and waits for its Flatpak child, publishes terminal
+  failed evidence, and exits the guest compositor to prevent stale VDI paint;
+  the contract suite passes on `.50` slot `app-contract-232`.
+- Live-seat audit (2026-08-01): `.15` is healthy but has no VM or VDI listener;
+  `.225` has no App VM role or VDI listener, so guest realization remains
+  unproven.
+- Identity-continuity update (2026-08-01): connected, reconnecting, unavailable,
+  and terminal App VM evidence is now bound to the admitted session/VM/app
+  tuple; the farm contract suite passes on `.50` slot `func018-app-identity-243`.
 - Remaining work:
 
   1. Complete the Front Door catalog experience around the validated projection:
@@ -951,7 +1106,15 @@ remains here under a completed status.
      capability and resource-budget checks, signed image/catalog provenance,
      audit records for install/launch/permission/reset, and blast-radius
      diagnostics. Reuse WL-CRIT-006 Workloads admission and provenance rather
-     than creating a second authorization plane.
+     than creating a second authorization plane. The typed App VM profile now
+     enforces bounded vCPU (1..=8), memory (1..=32768 MiB), disk (16..=256
+     GiB), mandatory network isolation, an eight-capability maximum, and an
+     explicit allow-list before image admission or desired-state persistence;
+     the pure mesh-type contract and nine daemon provisioning regressions pass
+     on farm `.90` slot `func018-app-daemon-191`. Individual catalog rows also
+     fail closed when `is_launchable()` is called before catalog projection;
+     five catalog policy tests pass on farm `.50` slot
+     `func018-catalog-launchable-194`.
   10. Provide a staged migration and rollout: catalog-only records first,
       one curated Flatpak in one App VM profile second, then updates,
       favorites, roaming, remote placement, and broader catalog coverage.
@@ -1003,8 +1166,9 @@ remains here under a completed status.
      or native host Flatpak path is required.
   5. Guest portal requests are bounded and auditable. File chooser, OpenURI,
      settings, notifications, audio, clipboard, and screen/input capabilities
-     either work through the declared guest policy or show an honest reason
-     they are unavailable; no unrestricted host access is granted.
+     work through the declared guest policy; audio is mandatory and must reach
+     the host/VDI mixer with working capture and playback. No unrestricted host
+     access is granted.
   6. Install, update, launch, stop, resume, remove, reset, and purge behavior
      is idempotent, authorized, auditable, and tested across local placement,
      remote placement, node loss, VM restart, app crash, and reconnect.
@@ -1053,14 +1217,66 @@ remains here under a completed status.
   policy, SBOM, package, health, audit, encrypted-backup, farm, and live-proof
   foundations; preview remains distinct from promotion and needs three
   lighthouses plus the six-node substrate. `release-evidence.sh` emits
-  schema-v2 source/artifact/SBOM/gate bindings; `sign-release.sh --evidence`
+  schema-4 source/artifact/SBOM/gate/topology/VDI bindings; `sign-release.sh --evidence`
   publishes signed provenance and checksums. `ci-gate.sh verify` rejects
   non-green, unobserved, stale, or unbound farm results and requires matching
   `github-required=pass`. A fail-closed six-node verifier requires exactly three
   lighthouses, three workstations, fresh artifact-bound recovery evidence, and
-  `--require-live`; no real bundle exists. Farm `.90` slot 118 passes both
-  `ci-gate.sh --self-test` and `release-evidence.sh --self-test`. Farm-to-GitHub
-  publication, six-node/live gates, and operator-key publication remain open.
+  `--require-live`; live sources now also require node-bound, digest-verified
+  SSH/console attestation; no real bundle exists. Farm `.90` slot 118 passes both
+  `ci-gate.sh --self-test` and `release-evidence.sh --self-test`. The workflow
+  now declares a labeled `mcnf-farm` backend plus a digest-verifying
+  `github-required` check; runner registration, six-node/live gates, and
+  operator-key publication remain open. `release-evidence.sh` is now schema 4:
+  any production-pass envelope must include a digest-bound, verifier-produced
+  six-node topology descriptor with `live_required=true`; validation reruns the
+  live verifier before accepting the envelope and requires the topology
+  revision to equal the release source commit. Preview envelopes may carry
+  farm-only topology evidence; production envelopes cannot. Production
+  envelopes now additionally require source-bound observed VDI framebuffer
+  evidence validated by `verify-vdi-live-proof.py`; its release integration
+  self-test passes locally and on farm `.50` slots `crit006-vdi-release-236`
+  and `crit006-vdi-proof-237`. Farm self-test
+  passes, but no real live bundle exists yet. `ci-gate.sh verify` also requires
+  a completed green summary with all stage pass records, matching test counts,
+  job/slot identity, and an unchanged gate-log digest. The gate now binds the
+  status artifact's job ID, build host, and slot to the exact gate-log header,
+  rejects control-character identities, and covers mismatched-slot tampering in
+  its farm self-test on `.90`. The CI evidence self-test now also rejects
+  incomplete green logs, identity mismatches, symlinks, path escapes, and log
+  tampering; it passes on farm `.90` slot `crit006-gate-selftest-2`. No live
+  GitHub Actions artifact upload/download or branch-protection publication has
+  been exercised from this workspace. The six-node verifier now requires
+  `healthy → degraded → recovering → healthy`, automatic lighthouse failover,
+  node-bound digest-verified attestations, and corrected-forward re-enrollment
+  with rollback disabled; its farm self-test passes 2 positive and 14 negative
+  cases on `.90` slot `crit006-topology-recovery-209`. The verifier also rejects
+  cross-node reuse of one evidence artifact while allowing related claims for
+  the same node to share a capture; the expanded self-test passes 2 positive and
+  15 negative cases on `.90` slot `crit006-topology-artifact-binding-212`. No
+  real six-node bundle exists yet. Live-attestation records now require an
+  exact node/transport/revision/timestamp/source-bound JSON marker; relabeled
+  farm markers are rejected. The verifier self-test passes 2 positive and 16
+  negative cases on `.50` slot `topology-verifier-234`. The stale
+  Six-node evidence artifacts are now bounded to 8 MiB before digest reads;
+  the expanded verifier self-test passes 2 positive and 17 negative cases on
+  `.50` slot `crit006-artifact-bound-242`. The stale
+  release-evidence self-test fixture was corrected to use
+  the short-SHA gate-log header binding; the full determinism/fail-closed suite
+  now passes on farm `.90` slot `crit006-release-fixture-211`. Release evidence
+  now rejects symlinked artifacts, manifests, and evidence envelopes; the
+  expanded self-test passes on farm `.50` slot `release-evidence-selftest-232`.
+  The GitHub farm artifact now includes a byte-size/SHA-256 manifest, and the
+  downstream `github-required` verifier checks its revision, job/slot identity,
+  symlink safety, and downloaded-file digests before accepting the farm result.
+  CI gate hardening now rejects digest-valid green logs containing contradictory
+  failed-stage records and requires exactly one green summary; the focused
+  self-test passes on `.90` slot `crit006-ci-gate-242`.
+  YAML/shell checks and `git diff --check` pass; live GitHub publication remains
+  unexercised. Live read-only proof-seat audit on 2026-08-01 found no VDI
+  endpoint on `.15` or `.225`; Eagle was unreachable and `.138` requires
+  host-key conflict resolution, so no observed production VDI or six-node
+  evidence is claimed.
 - Remaining work:
 
   1. Make GitHub required checks the promotion authority and connect the farm as
@@ -1084,6 +1300,11 @@ remains here under a completed status.
   7. Reconcile normative guidance and historical banners across root, help,
      operations, design, and tracked agent-skill docs; keep the canonical
      worklist pointer and current gate list synchronized with dated evidence.
+  8. Make audio a hard release gate: every production candidate proves local
+     PulseAudio-compatible playback/capture, PipeWire/WirePlumber graph health,
+     VM/VDI audio, Mesh Teams calls, and node-to-node direct/relay streaming
+     on the six-node testbed. `.15` must pass the same gate; a missing or
+     broken PulseAudio compatibility layer fails promotion.
 - Scope: Cross-cutting release authority, topology, enrollment/recovery,
   readiness, failover, state convergence, workload admission, retention,
   provenance, incident evidence, and multi-node acceptance. Feature behavior
@@ -1122,6 +1343,12 @@ remains here under a completed status.
   10. Normative guidance names only current commands, roles, boundaries, and
       gates; retired architecture docs are bannered; documentation and
       worklist lints pass.
+  11. Audio passes on all six nodes: `pactl`/PulseAudio compatibility,
+       `pw-cli`/PipeWire graph, WirePlumber policy, ALSA/UCM device discovery,
+       speaker playback, microphone capture, HDMI/Bluetooth where present,
+       Browser/App VM/VDI audio, Mesh Teams calls, and direct plus relayed
+       node-to-node streams. The `.15` evidence bundle includes live playback,
+       capture, reconnect, and recovery proof.
 - Verification method: Run worklist, governance, documentation, secret,
   package, compatibility, and provenance lints; run GitHub required checks and
   farm gates with BigBoy carrying the long pole; run parallel six-node tests for
@@ -1159,16 +1386,115 @@ remains here under a completed status.
   are landed; Workbench, System, Timers, and Phones now consume `AppFrame`. Farm suites
   cover the shell and major workspaces. Direct-DRM evidence and hashes are in
   [`WL-UX-009-DRM-EVIDENCE-2026-07-31.md`](WL-UX-009-DRM-EVIDENCE-2026-07-31.md).
-  `.138` has Editor Dark desktop/narrow and Light/Largest proof. Dell has clean
+  `.138` has Editor Dark desktop/narrow and Light/Largest proof, plus current-payload
+  This Node/About Dark, narrow, and Light/Largest proof. Dell has clean
   Editor/System/Bookmarks/Storage/Files/Mesh Teams/Maps/Phones/Timers Dark,
-  narrow, and Light/Largest proof with `NRestarts=0`; latest payload is
-  `b88b6b88`.
+  narrow, and Light/Largest proof with `NRestarts=0`; Dell's current installed
+  payload is `703d3477ce574e30abda5f1d7bdc46834ad16881db8d3a1d727b794fc1222919`.
   The full RPM
   dependency transaction, `.15`, remaining routes/states, full matrix, and
-  production readiness remain open.
+  production readiness remain open. The latest proof-only telemetry payload is
+  `f69e42551724fae346b91bb4965194905d6583f62cf4265394f0fa49a8a8fc7e` on both
+  seats; the earlier `703d3477...` hash remains the basis of the already
+  accepted representative screenshots.
   The Maps Drive HUD now reserves the painter-positioned FAB lane before laying
   out the radio/GNSS health rail and selects a fixed multi-row grid for
   large/largest text; 267 focused Maps tests pass on farm `.90`.
+  The current Dell proof slice initially appeared to show retained boot-splash
+  pixels in the first proof frame. Direct comparison against the live
+  `CONSTRUCT-WALLPAPER1.png` asset shows that the Construct/Software Studio/
+  Release lockup is the selected wallpaper, not stale scanout; the chooser route
+  and current empty-state copy render above it. Keep the proof-only direct-DRM
+  handoff path under validation, but do not classify the wallpaper lockup as a
+  handoff failure.
+  The current dirty validation tree also requires a small compile-integrity repair:
+  the `SessionRequest::AppState` matcher must explicitly ignore its newer
+  generation field before farm shell tests can run.
+  Dell Light/Largest live proof also exposed a palette-resolution defect in the
+  wallpaper-backed empty state: Light text was rendered over a backing derived
+  from the dark `BG` token, reducing contrast. The backing must resolve through
+  the active palette before alpha is applied.
+  After resolving palette contrast, the same Light/Largest frame shows the
+  large-text status anchor is too low for wallpapers whose lower brand lockup
+  occupies the bottom band. Move that anchor into the clear band below the hero
+  mark and above the lockup, then recapture the live frame.
+  The earlier style-leak finding at `mde-collab-egui/src/lib.rs:914` is resolved
+  through the shared tooltip primitive; the style-leak gate is now zero.
+  The earlier Device Manager/This Node duplicate title-strip finding is resolved;
+  the shared MenuBar remains and the redundant strip is gone, with 81 focused
+  Device Manager tests passing.
+  The proof-only path now requests `Modifier::Linear`, records the actual locked
+  front-buffer object's format/modifier/stride, and fails closed when the driver
+  returns a non-linear BO; the production allocation path remains unchanged.
+  The earlier dirty Maps compile-integrity finding is resolved with no-behavior-
+  change type repairs; the current release payload builds and the focused Maps
+  suite remains farm-verified.
+  The proof-only DRM telemetry/fail-closed change and Maps compile-integrity
+  repairs build as release payload
+  `f69e42551724fae346b91bb4965194905d6583f62cf4265394f0fa49a8a8fc7e`.
+  This exact payload is installed on Dell and `.138`; both services are active
+  with `NRestarts=0`.
+  Live Maps Light/Largest and narrow proof for this new payload is still
+  required before accepting the fix as validated.
+  The current direct-DRM proof captures XR30 as native `x2rgb10le` before PNG
+  conversion. On `.138`, the proof allocator rejected linear allocation and
+  the actual locked front buffer reported `I915_x_tiled` with stride `7680`;
+  the fail-closed guard rejected the run before any screenshot could be
+  accepted. Current `.138` Dark desktop, Dark narrow, and Light/Largest About frames were
+  visually inspected. Both the proof drop-in and temporary appearance settings
+  were removed afterward; `.138` is back on `require_login_at_boot:true` with
+  `NRestarts=0`.
+  The current `.138` Browser boundary proof also renders the Construct-owned
+  connection/unavailable state and preserves the guest boundary; the frame
+  contains no claimed Chromium/page pixels. Its inspected PNG and hash are in
+  the DRM evidence ledger. The proof seat was restored to secure runtime after
+  capture.
+  The current `.138` Explorer/Mesh-lens proof shows the shared workspace title
+  and menu above Explorer's domain mode/filter controls, with the discovered
+  unit card and taskbar separated; the inspected PNG and hash are in the DRM
+  evidence ledger. The proof seat was restored to secure runtime afterward.
+  The current `.138` Music proof renders the shared MUSIC menu/status chrome and
+  an honest unavailable state because no Airsonic credentials are installed;
+  this is visual/state evidence only and does not claim that the Subsonic server
+  at `172.20.0.2` is connected or listed.
+  The current `.138` Media Sources proof renders the shared MEDIA menu, source
+  tabs, local-capture/Jellyfin controls, and honest empty-source state without
+  overlap; it does not claim a live media backend or Jellyfin source.
+  The current `.138` Files proof covers Dark desktop, Light/Largest, and Dark
+  narrow on the same release payload; the dense sidebar/list/preview/status
+  geometry remains bounded in all three inspected frames. The focused Files
+  suite passes 165 tests.
+  The current `.138` Maps proof found two render-validation failures before
+  evidence could be accepted: Light/Largest remapped the dark map canvas text
+  to dark ink, and the first 800-logical-width capture was effectively blank.
+  Keep Maps open until the canvas contrast is corrected and a fresh narrow DRM
+  frame is captured and visually inspected; do not add those failed frames as
+  passing evidence. The replacement-payload attempt on both `.138` and Dell
+  then captured the direct DRM plane with Intel X-tiled modifier
+  `0x100000000000001`; the converted PNGs showed scanline striping and are also
+  invalid proof. Both seats were restored to secure runtime with the new binary
+  installed, but no replacement Maps frame is accepted yet.
+  The next validation task is a proof-compatible direct-DRM capture path for
+  this Intel driver (for example, a verified detile/readback route); until that
+  is implemented and visually inspected, Maps Light/Largest and narrow proof
+  remain open. This is diagnostic hardening, not a production scanout-policy
+  change.
+  Record the next proof implementation before source changes: when
+  `MDE_DRM_PROOF_READBACK` is set, read the rendered EGL framebuffer with
+  `glReadPixels` into a CPU-linear RGBA buffer, emit a PNG plus dimensions,
+  format, and source metadata, and retain the actual direct-DRM/KMS frame as
+  the runtime surface. This proof-only readback must not alter normal scanout,
+  must reject incomplete/blank output, and must be visually inspected before
+  any Maps Light/Largest or narrow row is accepted.
+- Backdrop validation update (2026-08-01): palette-resolved status backing,
+  large-text anchoring, wallpaper selection/cache, and watermark routing pass
+  24 focused shell tests with 1,920 filtered on `.90` slot
+  `ux009-backdrop-palette-244`; live DRM Maps recapture remains open.
+- Wallpaper policy update (2026-08-01): the Settings surface now exposes Bing
+  daily picture as the sole wallpaper provider, clears legacy custom-page
+  configuration during normalization, and forces Bing on for migrated settings;
+  the focused normalization test passes on farm `.90` slot
+  `ux009-bing-only-247`.
 - Remaining work:
 
   1. Finish the shared app-frame and Terminal-pattern unified top bar, including
@@ -1190,9 +1516,10 @@ remains here under a completed status.
      guest Chromium viewport or reintroduce host Browser chrome.
   5. Complete Dark/Light, desktop/narrow/large-text, no-overlap, icon
      licensing/raster, expressive motion, and representative live DRM proof.
-  6. Repair the Maps Drive HUD at large text: reserve the floating-action-button
-     lane and increase the health-rail geometry so radio/GNSS status remains
-     readable and unobscured in Light/Largest proof.
+  Maps Drive HUD large-text geometry is now evidence-backed: the floating-action-
+  button lane is reserved and the health rail uses the fixed multi-row layout;
+  focused Maps tests and Light/Largest DRM evidence cover this slice. Broader
+  Maps state and full-route matrix coverage remain in items 2 and 5.
 - Scope: Current design authority, shared `mde-egui` and brand/icon primitives,
   shell-owned chrome, launchable egui workspace frames, and Editor/Terminal
   internal chrome. Behavior contracts, security/auth, full AccessKit rollout,
@@ -1286,9 +1613,52 @@ remains here under a completed status.
   hardware aliases, legacy normalization, and unavailable provider states.
   Its mesh-status model projects bounded typed capability/action rows with
   fail-closed mutations plus truthful interface/CIDR/route/lighthouse/DNS
-  connectivity facts; focused This Node tests pass, including narrow, large-text reflow and disabled-action accessibility coverage (18 tests).
+  connectivity facts; provider loss now retains the last valid projection with an explicit stale banner and bounded reason instead of silently
+  dropping the node; readable snapshots older than 90 seconds are also marked stale; stale capability and action rows are degraded until refresh; the Workbench now exposes a real on-demand `Refresh now` control over the same bounded poll seam; focused This Node tests pass, including narrow, large-text reflow and disabled-action accessibility coverage (21 tests, farm `.90` slot 143).
+  Workbench rendering and refresh affordance coverage passes 15 tests on farm `.90` slot 143.
   Mesh & System now adds a truthful unavailable/unknown/offline/degraded/connected
   summary with AccessKit status and 3 focused tests.
+  The mesh-status writer now adds bounded NetworkManager/ModemManager link
+  observations (provider, interface, state, and up only) without serializing
+  connection profiles, SSIDs, APNs, SIM/operator data, or credentials; shell
+  and embedded-Python syntax checks pass.
+  The same writer now publishes only bounded active/advertised power-profile
+  names from `powerprofilesctl`; This Node renders the observation and keeps
+  profile mutation explicitly unavailable until the trusted System provider
+  authorization path is unified. Focused This Node (21 tests) and Workbench
+  (15 tests) suites pass on farm `.90` slot 150.
+  The landing surface now presents a typed Device Manager-style Status/Devices
+  & Peripherals/System tree and health dashboard using the existing snapshot
+  authority, with expanded operator search vocabulary and explicit stale/
+  unavailable details; the focused shell This Node filter passes 13 tests on
+  farm `.50`. Connectivity projections now carry typed, read-only recovery
+  guidance (`refresh snapshot` or `await provider publication`); stale retained
+  rows are prevented from appearing actionable; the focused This Node filter
+  passes 23 tests with zero failures on farm `.50` slot
+  `ux011-recovery-206`. The typed NetworkManager/ModemManager boundary now
+  rejects malformed or credential-shaped interface/device identifiers, filters
+  unsafe externally supplied observations during merge, and correctly maps
+  disconnected cellular state; focused type tests pass 1/1 on `.90` slot
+  `network-observation-types-215`, with rustfmt passing on
+  `network-observation-rustfmt-216`; the daemon-focused gate passes 6/6 with
+  4,305 filtered on `.90` slot `network-observation-daemon-220` after the
+  `.50` lane exhausted its 424 MiB free farm disk during linking.
+  The durable This Node index now exposes 16 stable provider-aware routes with
+  deterministic child-page search ranking and explicit unavailable reasons;
+  its focused catalog gate passes 8 tests on farm `.90`. The This Node Display &
+  Sound surface now folds bounded credential-free PulseAudio-compatibility,
+  PipeWire graph, WirePlumber, ALSA/UCM, playback, capture, and recovery facts,
+  rendering missing providers as unavailable and failed lanes as attention;
+  its focused audio projection gate passes 1 test with 1,943 filtered on farm
+  `.90` slot `ux011-audio-shell-227`. The daemon's bounded audio collector now
+  covers PulseAudio compatibility, PipeWire, WirePlumber, ALSA/UCM, playback,
+  capture, and recovery with 9 focused tests passing and 4,306 filtered on
+  `.90`; the mesh-status writer publishes the flattened credential-free
+  projection consumed by This Node.
+- Provider-state update (2026-08-01): This Node now exposes typed recovery
+  guidance for stale/unavailable providers and preserves bounded credential-free
+  audio facts without fabricating healthy hardware; 24 focused tests pass on
+  farm `.90`.
 - Remaining work:
 
   1. Finish the durable This Node sidebar and search index across every
@@ -1441,17 +1811,34 @@ remains here under a completed status.
   workspace; no running/open indicator exists. Home is an icon-free wallpaper
   and the App Grid is deleted.
 - Current state: `nav_bar.rs` owns persisted `Floating`/`Docked` placement,
-  full-width 48px Bottom geometry, fixed 40px targets, centered pins, overflow bounds,
+  full-width 48px Bottom geometry, fixed 40px targets, 24px icons, 4px gaps,
+  centered pins, overflow bounds,
   pin persistence, focus underlining, first-boot search, and tested
   slide/melt/Whimsy motion. Bottom reserves an animated clock/icon tray; Start uses
   Front Door search and the side retains its detailed top strip.
   `springboard.rs` is gesture-only: the retired App Grid painter,
   selection/open path, zoom ghost, and grid tests are deleted; 37 nav-bar plus
-  14 shell/front-door tests pass. The taskbar consumes the searchable catalog
+  14 shell/front-door tests pass in the earlier shell slice. The taskbar consumes the searchable catalog
   directly, with Fleet & Mesh/Workloads aliases and no retired group geometry;
-  narrow first-boot controls now have 37/37 farm tests, while full first-boot
-  selection remains open. A fresh unsigned Alpha from integrated tip `b77a82de`
+  narrow first-boot controls now have 37/37 farm tests (farm `.90` slot 132),
+  and first-boot selection now bounds persisted order, preserves intentional
+  empty selections, and rejects duplicate/unsupported transient entries (six
+  focused tests pass on farm `.50` slot 153). The focused workspace marker is now a centered 18x3
+  accent with a 2px bottom gap; the latest aliases, Start/Search, first-boot,
+  and singular-focus slice passes 43 focused nav-bar tests on farm `.90` slot
+  `ux012-taskbar-focus-193`. In the Fleet & Mesh workspace, Workbench, Mesh Map, and Explorer are
+  now selected through a checked View menu instead of a persistent top selector
+  rail; farm compilation passed for `mde-shell-egui`. The latest focused taskbar
+  slice covers aliases, Start/Search, first-boot selection, and singular focus
+  underlining with 43 nav-bar tests passing on farm `.90` slot
+  `ux012-taskbar-focus-193`. A fresh unsigned Alpha from integrated tip `b77a82de`
   is staged for Dell proofing; evidence is in `docs/ops/promotion-pipeline.md`.
+  The latest farm review recompiles the shell and passes all 43 focused nav-bar
+  tests on `.50` slot `ux012-nav-review-238`, including centered focus, bounded
+  first-boot selection, catalog aliases, and full-width tray composition.
+  Legacy pin aliases now migrate to canonical Fleet & Mesh and This Node pins
+  while preserving order and intentional empty selections; 44 nav-bar tests
+  pass on `.50` slot `ux012-nav-migration-245`.
 - Remaining work:
 
   1. Reconcile taskbar-specific authority after WL-UX-009 retires the global
@@ -1486,10 +1873,11 @@ remains here under a completed status.
      discard unknown surfaces, bound the list to the searchable catalog, and
      send new profiles through first-boot selection. Never silently restore a
      default list after migration; user choices remain authoritative.
-  7. Finish first-boot pin selection for new profiles and Fleet & Mesh/
-     Workloads exposure without renaming the internal `Surface::InfraCode`
-     identifier. Keep pin changes immediate and reject pinning Start, Back,
-     Home, overflow, and placement controls.
+  7. Integrate the bounded first-boot pin selection into the remaining
+     profile/persistence acceptance path and Fleet & Mesh/Workloads exposure
+     without renaming the internal `Surface::InfraCode` identifier. Keep pin
+     changes immediate and reject pinning Start, Back, Home, overflow, and
+     placement controls.
   8. Delete Springboard tile plates, labels, grid layout, keyboard selection,
      tile activation, open-presence zoom ghosts, and their tests. Preserve the
      wallpaper Home, Home intent, and pull-down-to-search gesture in a reduced
@@ -1635,3 +2023,13 @@ dated archive snapshot. Active epics are limited to 220 physical lines.
   `install-helpers/lint-worklist.sh`,
   `install-helpers/lint-doc-supersession.sh`, and `git diff --check` for every
   worklist structure change.
+### Current validation note — Mesh Teams responsive test contract
+
+The Mesh Teams surface intentionally omits its nested app/channel rails, Details
+pane, and channel header below the 1024px workspace breakpoint. The existing
+headless tests rendered at 1000px while asserting desktop-only rail/Details
+content, so their failures are stale test fixtures rather than a Dell runtime
+regression. The Tasks body likewise now presents the specific `Channel tasks`
+heading and no longer paints a redundant standalone `Tasks` label. Reconcile
+those tests to their intended desktop/narrow contracts before the next farm
+gate; no production readiness claim follows from this correction.

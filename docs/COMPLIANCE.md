@@ -1,5 +1,11 @@
 # MCNF — Compliance & Integrity Sweep
 
+> **HISTORICAL / SUPERSEDED (2026-07-30):** This dated audit ledger is retained
+> as evidence, not as current architecture or gate guidance. Current policy and
+> gates are defined by `AI_GOVERNANCE.md` and
+> `install-helpers/ci-gate.sh policy`; the active tracker is
+> `docs/platform/WORKLIST.md`.
+
 **Date:** 2026-06-12 · **Scope:** 22 crates · **Rulebook:** `AI_GOVERNANCE.md` (E11 "MCNF" pivot) · **Lens:** post-hardening integrity — does the code shipped by the AUD-1..21 + EFF drain hold to §7 "marked done = reachable + correct"?
 
 Verdicts are binary: **FINISH** (make it real / wire it / fix the doc) or **REMOVE** (delete the dead surface). Report-only — nothing was modified by this sweep. Three parallel sub-audits (unreachable+stubs · mockups+conventions · doc-drift+packaging).

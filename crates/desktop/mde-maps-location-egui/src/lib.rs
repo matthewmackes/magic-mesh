@@ -99,6 +99,9 @@ impl Default for MapsLocationApp {
 impl eframe::App for MapsLocationApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
+            // Maps owns its cartographic content palette. Its normal Construct
+            // workspace chrome is rendered by the panel's shared MenuBar; Car
+            // remains a distinct, full-bleed interface with no Construct header.
             maps_location_panel(ui, &mut self.surface);
         });
     }

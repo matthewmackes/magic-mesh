@@ -90,8 +90,8 @@ is pinned to `/var/lib/mde/role.toml`; `mde-shell-egui.service` (ordered
 `After=magic-setup.service`, `ConditionPathExists=/var/lib/mde/role.toml`,
 `ExecCondition` = role `"workstation"`) then takes the VT and the egui shell
 takes DRM master directly (the RPM links `mde-shell-egui` with
-`--features drm`). If the shell hits its start limit, `ExecStopPost` restores
-`getty@tty1` so the console is never lost.
+`--features drm`). If the shell hits its start limit, `OnFailure` restores
+`getty@tty1` so the console is never lost without racing a normal shell restart.
 
 ## Roles (the §5 config flag)
 

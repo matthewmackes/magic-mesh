@@ -71,45 +71,34 @@ fn mesh_system_summary(mesh: &MeshFacts) -> MeshSystemSummary {
             "unavailable — no mesh status snapshot".to_owned(),
             "The mesh status snapshot has not arrived, so connectivity is unknown.",
         )
-    } else if mesh.peers_total == 0 {
-        (
-            MeshConnectivity::Unknown,
-            "unknown — no peer directory rows".to_owned(),
-            "The snapshot has no peer directory rows, so connectivity cannot be determined.",
-        )
-    } else if mesh.peers_online > mesh.peers_total {
-        (
-            MeshConnectivity::Unknown,
-            format!(
-                "unknown — inconsistent peer count ({}/{} live)",
-                mesh.peers_online, mesh.peers_total
-            ),
-            "The snapshot reports more online peers than total peers, so connectivity is unknown.",
-        )
-    } else if mesh.peers_online == 0 {
-        (
-            MeshConnectivity::Offline,
-            format!("offline — 0/{} peers live", mesh.peers_total),
-            "The peer directory reports no online peers.",
-        )
-    } else if mesh.peers_online < mesh.peers_total {
-        (
-            MeshConnectivity::Degraded,
-            format!(
-                "degraded — {}/{} peers live",
-                mesh.peers_online, mesh.peers_total
-            ),
-            "Some peer directory entries are not online.",
-        )
     } else {
-        (
-            MeshConnectivity::Connected,
-            format!(
-                "connected — {}/{} peers live",
-                mesh.peers_online, mesh.peers_total
+        match mesh.peer_counts {
+            None => (
+                MeshConnectivity::Unknown,
+                "unknown — peer count unavailable".to_owned(),
+                "The snapshot does not publish a complete valid peer count, so connectivity is unknown.",
             ),
-            "Every peer directory entry is online.",
-        )
+            Some((_online, total)) if total == 0 => (
+                MeshConnectivity::Unknown,
+                "unknown — no peer directory rows".to_owned(),
+                "The snapshot has no peer directory rows, so connectivity cannot be determined.",
+            ),
+            Some((online, total)) if online == 0 => (
+                MeshConnectivity::Offline,
+                format!("offline — 0/{total} peers live"),
+                "The peer directory reports no online peers.",
+            ),
+            Some((online, total)) if online < total => (
+                MeshConnectivity::Degraded,
+                format!("degraded — {online}/{total} peers live"),
+                "Some peer directory entries are not online.",
+            ),
+            Some((online, total)) => (
+                MeshConnectivity::Connected,
+                format!("connected — {online}/{total} peers live"),
+                "Every peer directory entry is online.",
+            ),
+        }
     };
 
     let (role_value, role_reason) = match mesh.role.as_deref() {
@@ -287,8 +276,7 @@ mod tests {
     fn mesh_summary_reports_truthful_connectivity_and_role_states() {
         let connected = MeshFacts {
             seen: true,
-            peers_online: 2,
-            peers_total: 2,
+            peer_counts: Some((2, 2)),
             role: Some("workstation".to_owned()),
             ..MeshFacts::default()
         };
@@ -299,8 +287,7 @@ mod tests {
 
         let degraded = MeshFacts {
             seen: true,
-            peers_online: 1,
-            peers_total: 2,
+            peer_counts: Some((1, 2)),
             ..MeshFacts::default()
         };
         let summary = mesh_system_summary(&degraded);
@@ -310,19 +297,31 @@ mod tests {
     }
 
     #[test]
-    fn mesh_summary_does_not_treat_inconsistent_counts_as_connected() {
+    fn mesh_summary_keeps_missing_counts_unknown_without_fabricating_zero_zero() {
         let summary = mesh_system_summary(&MeshFacts {
             seen: true,
-            peers_online: 3,
-            peers_total: 2,
             ..MeshFacts::default()
         });
 
         assert_eq!(summary.connectivity, MeshConnectivity::Unknown);
-        assert!(summary
-            .connectivity_value
-            .contains("inconsistent peer count"));
+        assert_eq!(
+            summary.connectivity_value,
+            "unknown — peer count unavailable"
+        );
+        assert!(!summary.connectivity_value.contains("0/0"));
         assert!(summary.reason.contains("connectivity is unknown"));
+    }
+
+    #[test]
+    fn mesh_summary_rejects_inconsistent_counts_before_rendering_them() {
+        let summary = mesh_system_summary(&MeshFacts {
+            seen: true,
+            peer_counts: None,
+            ..MeshFacts::default()
+        });
+
+        assert_eq!(summary.connectivity, MeshConnectivity::Unknown);
+        assert!(!summary.connectivity_value.contains("peers live"));
     }
 
     #[test]
@@ -485,20 +484,33 @@ pub(super) fn network_section(ui: &mut egui::Ui, mesh: &MeshFacts) {
         mesh_field(ui, "Cipher", mesh.cipher.as_deref());
     };
     let links = |ui: &mut egui::Ui| {
-        // Live peer count — green when all live, warn when some are down.
-        let tone = if mesh.peers_total == 0 {
-            Style::TEXT_DIM
-        } else if mesh.peers_online == mesh.peers_total {
-            Style::OK
-        } else {
-            Style::WARN
-        };
-        field(
-            ui,
-            "Peers",
-            &format!("{}/{} live", mesh.peers_online, mesh.peers_total),
-            tone,
-        );
+        // Live peer count — only render a ratio when the snapshot supplied a
+        // complete valid pair; missing or malformed counts remain unknown.
+        match mesh.peer_counts {
+            Some((online, total)) => {
+                if total == 0 {
+                    field(
+                        ui,
+                        "Peers",
+                        "unknown — no peer directory rows",
+                        Style::TEXT_DIM,
+                    );
+                } else {
+                    let tone = if online == total {
+                        Style::OK
+                    } else {
+                        Style::WARN
+                    };
+                    field(ui, "Peers", &format!("{online}/{total} live"), tone);
+                }
+            }
+            None => field(
+                ui,
+                "Peers",
+                "unknown — peer count unavailable",
+                Style::TEXT_DIM,
+            ),
+        }
         // The elected leader (with a this-node marker when we hold the lease).
         match mesh.leader.as_deref() {
             Some(leader) if mesh.is_leader() => {
@@ -812,7 +824,8 @@ pub(super) fn remote_proofing_section(
             ),
         );
         let approval_response = if public_exposure {
-            approval_response.on_hover_text(
+            mde_egui::widgets::hover_text(
+                approval_response,
                 "This toggle is unavailable independently: the Sunshine provider is bound to all interfaces, so local approval is forced on.",
             )
         } else {
@@ -840,7 +853,8 @@ pub(super) fn remote_proofing_section(
             ),
         );
         let indicator_response = if public_exposure {
-            indicator_response.on_hover_text(
+            mde_egui::widgets::hover_text(
+                indicator_response,
                 "This toggle is unavailable independently: public Sunshine proofing forces the on-seat shadowing indicator visible.",
             )
         } else {

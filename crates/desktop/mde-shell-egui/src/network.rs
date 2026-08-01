@@ -495,7 +495,7 @@ fn show_status(ui: &mut egui::Ui, status: &NetStatus, vehicles: &[VehicleState])
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            ui.group(|ui| show_overlay(ui, status));
+            mde_egui::card().show(ui, |ui| show_overlay(ui, status));
             ui.add_space(Style::SP_S);
 
             ui.label(
@@ -503,7 +503,7 @@ fn show_status(ui: &mut egui::Ui, status: &NetStatus, vehicles: &[VehicleState])
                     .color(Style::TEXT_DIM)
                     .size(Style::SMALL),
             );
-            ui.group(|ui| show_links(ui, status));
+            mde_egui::card().show(ui, |ui| show_links(ui, status));
             ui.add_space(Style::SP_S);
 
             ui.label(
@@ -511,7 +511,7 @@ fn show_status(ui: &mut egui::Ui, status: &NetStatus, vehicles: &[VehicleState])
                     .color(Style::TEXT_DIM)
                     .size(Style::SMALL),
             );
-            ui.group(|ui| show_services(ui, status));
+            mde_egui::card().show(ui, |ui| show_services(ui, status));
             ui.add_space(Style::SP_S);
 
             ui.label(
@@ -519,7 +519,7 @@ fn show_status(ui: &mut egui::Ui, status: &NetStatus, vehicles: &[VehicleState])
                     .color(Style::TEXT_DIM)
                     .size(Style::SMALL),
             );
-            ui.group(|ui| show_routing(ui, status));
+            mde_egui::card().show(ui, |ui| show_routing(ui, status));
             ui.add_space(Style::SP_S);
 
             // Vehicle gateways — folded from the `state/vehicle/<node>` Bus
@@ -532,7 +532,7 @@ fn show_status(ui: &mut egui::Ui, status: &NetStatus, vehicles: &[VehicleState])
                         .color(Style::TEXT_DIM)
                         .size(Style::SMALL),
                 );
-                ui.group(|ui| show_vehicle_gateways(ui, vehicles));
+                mde_egui::card().show(ui, |ui| show_vehicle_gateways(ui, vehicles));
                 ui.add_space(Style::SP_S);
             }
 

@@ -529,6 +529,8 @@ mod tests {
             "openvswitch.service",
             "single kernel modules tree present",
             "surface kernel is the bootc kernel",
+            "seat unit restores tty1 only after terminal failure",
+            "seat unit does not race normal restarts with getty",
         ] {
             assert!(
                 verifier.contains(needle),
@@ -1116,6 +1118,10 @@ mod tests {
         assert!(
             unit.contains("Environment=MDE_MAPS_DIR=/var/lib/mde/maps"),
             "the DRM shell unit must pin Maps to persistent storage, not /run/mde-bus"
+        );
+        assert!(
+            unit.contains("OnFailure=getty@tty1.service") && !unit.contains("ExecStopPost="),
+            "the DRM shell must recover tty1 only after terminal failure, never race a normal restart with getty"
         );
 
         let helper = include_str!("../../../../../install-helpers/install-offline-map-region.sh");

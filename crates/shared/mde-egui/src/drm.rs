@@ -149,6 +149,97 @@ fn log_drm_touch_contact(phase: &str, contact: RawContact, transform: &TouchTran
     }
 }
 
+/// Return the logical viewport for the scale currently installed in egui.
+///
+/// The DRM framebuffer is fixed in physical pixels, but Construct may change
+/// egui's `pixels_per_point` at runtime for accessibility text scaling. Keeping
+/// the raw input viewport at the startup scale makes every foreground surface
+/// drift outside the scanout when that happens (most visibly the bottom taskbar).
+fn drm_screen_for_scale(width_px: u32, height_px: u32, pixels_per_point: f32) -> egui::Rect {
+    let scale = pixels_per_point.max(f32::EPSILON);
+    egui::Rect::from_min_size(
+        egui::Pos2::ZERO,
+        egui::vec2(width_px as f32 / scale, height_px as f32 / scale),
+    )
+}
+
+/// Optional direct-DRM responsive-layout proof width. This is deliberately a
+/// logical viewport override: the real physical scanout, KMS mode, and input
+/// devices remain unchanged while a reachable seat exercises narrow geometry.
+/// Production never sets this proof-only variable.
+fn drm_proof_logical_width() -> Option<f32> {
+    let width = std::env::var("MDE_DRM_PROOF_LOGICAL_WIDTH")
+        .ok()?
+        .parse::<f32>()
+        .ok()?;
+    (width.is_finite() && width >= 320.0).then_some(width)
+}
+
+/// Capture the actual EGL back buffer as CPU-linear RGBA for direct-DRM proof.
+///
+/// This is deliberately opt-in and runs before `eglSwapBuffers`: the pixels are
+/// read from the same live EGL framebuffer that is about to become the KMS
+/// front buffer, so a tiled GBM scanout object cannot corrupt the proof image.
+/// Production never sets `MDE_DRM_PROOF_READBACK`.
+fn drm_proof_readback(
+    gl: &glow::Context,
+    width: u32,
+    height: u32,
+    path: &Path,
+    gbm_format: gbm::Format,
+) -> Result<(), DrmError> {
+    use glow::HasContext as _;
+
+    let mut rgba = vec![0_u8; width as usize * height as usize * 4];
+    unsafe {
+        gl.read_pixels(
+            0,
+            0,
+            i32::try_from(width).map_err(|_| DrmError::Present("proof width overflow".into()))?,
+            i32::try_from(height)
+                .map_err(|_| DrmError::Present("proof height overflow".into()))?,
+            glow::RGBA,
+            glow::UNSIGNED_BYTE,
+            glow::PixelPackData::Slice(Some(&mut rgba)),
+        );
+        let error = gl.get_error();
+        if error != glow::NO_ERROR {
+            return Err(DrmError::Present(format!(
+                "DRM proof EGL readback returned GL error 0x{error:04x}"
+            )));
+        }
+    }
+
+    if rgba.chunks_exact(4).all(|pixel| pixel == [0, 0, 0, 0])
+        || rgba.windows(4).all(|window| window == &rgba[0..4])
+    {
+        return Err(DrmError::Present(
+            "DRM proof EGL readback is blank or uniform".into(),
+        ));
+    }
+
+    let mut image = image::RgbaImage::from_raw(width, height, rgba)
+        .ok_or_else(|| DrmError::Present("DRM proof EGL readback dimensions mismatch".into()))?;
+    image::imageops::flip_vertical_in_place(&mut image);
+    image
+        .save_with_format(path, image::ImageFormat::Png)
+        .map_err(|e| DrmError::Present(format!("DRM proof PNG write: {e}")))?;
+
+    let metadata = path.with_extension("json");
+    let metadata_body = format!(
+        "{{\"source\":\"direct-drm-egl-readback\",\"width\":{width},\"height\":{height},\"gbm_format\":\"{gbm_format:?}\"}}\n"
+    );
+    std::fs::write(&metadata, metadata_body)
+        .map_err(|e| DrmError::Present(format!("DRM proof metadata write: {e}")))?;
+    eprintln!(
+        "mde-egui: DRM proof EGL readback wrote {} ({}x{}, format={gbm_format:?})",
+        path.display(),
+        width,
+        height
+    );
+    Ok(())
+}
+
 /// A DRM primary node wrapped so it implements the `drm` device traits (KMS).
 ///
 /// Public because it appears in [`set_layout`]'s signature (`gbm::Device<Card>`);
@@ -1387,10 +1478,15 @@ pub fn run_drm_with_clipboard(
     // for a valid linear-pixel proof.
     let base_surface_flags = gbm::BufferObjectFlags::SCANOUT | gbm::BufferObjectFlags::RENDERING;
     let gbm_surface = if std::env::var_os("MDE_DRM_LINEAR_SCANOUT").is_some() {
-        match gbm.create_surface::<()>(
+        // The usage flag is only a preference on some GBM drivers: Intel may
+        // still choose a tiled modifier for an ordinary `create_surface`.
+        // Ask for the linear modifier explicitly in the proof-only path so a
+        // KMS capture can read the scanout bytes without a detiler.
+        match gbm.create_surface_with_modifiers2::<()>(
             wp,
             hp,
             gbm_format,
+            std::iter::once(gbm::Modifier::Linear),
             base_surface_flags | gbm::BufferObjectFlags::LINEAR,
         ) {
             Ok(surface) => surface,
@@ -1470,13 +1566,13 @@ pub fn run_drm_with_clipboard(
     // — its headless arm returns an honest gated error and the running loop's live
     // surface-rebuild switch is the hardware-gated follow-up, so the seat starts at
     // native (no faked hot-switch). `gbm` also speaks KMS, so it reads the connector.
-    let ppp = gbm
+    let native_ppp = gbm
         .get_connector(heads[0].connector, false)
         .ok()
         .and_then(|conn| panel_from_connector(&conn))
         .map_or(1.0, |panel| panel.scale());
-    if (ppp - 1.0).abs() > f32::EPSILON {
-        egui_ctx.set_pixels_per_point(ppp);
+    if (native_ppp - 1.0).abs() > f32::EPSILON {
+        egui_ctx.set_pixels_per_point(native_ppp);
     }
 
     let mut libinput = Libinput::new_with_udev(SeatInterface);
@@ -1488,9 +1584,9 @@ pub fn run_drm_with_clipboard(
     // physical pixels; the layout + pointer live in points, so a fractional scale
     // sizes the UI correctly. With ppp == 1.0 this is byte-identical to the old
     // pixel-space path.
-    let (pw, ph) = (wp as f32 / ppp, hp as f32 / ppp);
-    let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(pw, ph));
+    let (pw, ph) = (wp as f32 / native_ppp, hp as f32 / native_ppp);
     let mut pointer = egui::pos2(pw / 2.0, ph / 2.0);
+    let mut input_ppp = native_ppp;
     let start = std::time::Instant::now();
     // The previous frame's scanout buffer, released back to the surface ring only after
     // the next flip completes (GBM hands out a small ring of buffers). Its framebuffer is
@@ -1512,6 +1608,15 @@ pub fn run_drm_with_clipboard(
     // asked for no repaint). Seeded to "now" so the first iteration renders immediately
     // (the modeset frame) without blocking in poll.
     let mut next_repaint_at: Option<Instant> = Some(Instant::now());
+    // A newly acquired DRM seat must give its first app enough actual frames to finish
+    // staged startup (the Construct splash builds surfaces across successive frames and
+    // eases into the desktop). Some drivers can report an idle viewport output during
+    // that handoff even though the app requested the following frame. Keep this bounded
+    // warm-up at roughly one second; after it is spent the normal event-driven policy
+    // below owns every wake again.
+    const STARTUP_WARMUP_FRAMES: u8 = 60;
+    const STARTUP_WARMUP_INTERVAL: Duration = Duration::from_millis(16);
+    let mut startup_warmup_frames = STARTUP_WARMUP_FRAMES;
     // Count of down touch contacts — while > 0 the loop wakes on a short cadence so a
     // held-still finger's long-press still fires (`gestures.tick`) with no new events.
     let mut touch_active: u32 = 0;
@@ -1522,6 +1627,9 @@ pub fn run_drm_with_clipboard(
     // desktop survives Esc and forwards it to egui like any other key.
     let esc_quits = std::env::var_os("MDE_DRM_ESC_QUIT").is_some();
     let input_proof = drm_input_proof_enabled();
+    let proof_logical_width = drm_proof_logical_width();
+    let proof_readback_path = std::env::var_os("MDE_DRM_PROOF_READBACK").map(PathBuf::from);
+    let mut proof_readback_written = false;
     // Modifier state: updated on each KeyDown/KeyUp before feeding egui Key events.
     let mut shift = false;
     let mut ctrl = false;
@@ -1535,7 +1643,7 @@ pub fn run_drm_with_clipboard(
     // pure transform + translation are unit-tested in `crate::touch`; this is the live
     // libinput read that only a real seat exercises (the farm compiles it, no
     // touchscreen — the honest hardware gate).
-    let mut touch = TouchTranslator::new(TouchTransform::new(wp, hp, ppp));
+    let mut touch = TouchTranslator::new(TouchTransform::new(wp, hp, native_ppp));
 
     // SURFACE-11 (lock 16): fold the SAME multitouch contact stream into gestures —
     // two-finger scroll, pinch-zoom, long-press → secondary click, and edge-swipes.
@@ -1572,6 +1680,25 @@ pub fn run_drm_with_clipboard(
     let mut last_accel = std::time::Instant::now();
 
     while !quit {
+        // Appearance text scaling changes egui's live pixels-per-point. Rebuild
+        // the logical viewport and input transform from that current value so
+        // the fixed physical framebuffer remains fully addressable.
+        let ppp = egui_ctx.pixels_per_point().max(f32::EPSILON);
+        if (ppp - input_ppp).abs() > f32::EPSILON {
+            let physical_pointer = pointer * input_ppp;
+            pointer = egui::pos2(physical_pointer.x / ppp, physical_pointer.y / ppp);
+            input_ppp = ppp;
+        }
+        let mut screen = drm_screen_for_scale(wp, hp, ppp);
+        if let Some(width) = proof_logical_width {
+            screen.set_right(screen.left() + width.min(screen.width()));
+        }
+        let pw = screen.width();
+        let ph = screen.height();
+        pointer.x = pointer.x.clamp(0.0, pw);
+        pointer.y = pointer.y.clamp(0.0, ph);
+        touch.set_transform(TouchTransform::new(wp, hp, ppp));
+
         // 0. perf-1 WAKE GATE — block until there is a reason to wake, instead of
         //    spinning at refresh rate. Sleep until: input is readable on the libinput
         //    fd, egui's repaint deadline expires, or a periodic task (accel sample /
@@ -1579,7 +1706,17 @@ pub fn run_drm_with_clipboard(
         //    pending, this blocks indefinitely and the CPU reaches ~0 (eframe's
         //    ControlFlow::Wait). The present path below still paces rendering to vblank.
         let now = Instant::now();
-        let until_repaint = next_repaint_at.map(|t| t.saturating_duration_since(now));
+        // Startup is the one phase where the app may not yet have an egui repaint
+        // request to carry the loop: the shell constructs and reveals its first
+        // desktop across several frames. Make the bounded warm-up an explicit
+        // render reason rather than merely clamping a deadline emitted by the
+        // previous viewport output (which can report idle after the modeset).
+        let startup_warmup_active = startup_warmup_frames > 0;
+        let until_repaint = if startup_warmup_active {
+            Some(Duration::ZERO)
+        } else {
+            next_repaint_at.map(|t| t.saturating_duration_since(now))
+        };
         let until_accel = accel
             .as_ref()
             .map(|_| ACCEL_SAMPLE_INTERVAL.saturating_sub(last_accel.elapsed()));
@@ -1959,7 +2096,12 @@ pub fn run_drm_with_clipboard(
 
         let first_frame = prev.is_none();
         let repaint_due = next_repaint_at.is_some_and(|t| Instant::now() >= t);
-        if !wake::should_render(first_frame, !events.is_empty(), force_render, repaint_due) {
+        if !wake::should_render(
+            first_frame,
+            !events.is_empty(),
+            force_render || startup_warmup_active,
+            repaint_due,
+        ) {
             continue;
         }
         if input_proof && !events.is_empty() {
@@ -2009,6 +2151,14 @@ pub fn run_drm_with_clipboard(
             .viewport_output
             .get(&egui::ViewportId::ROOT)
             .map_or(Duration::ZERO, |vo| vo.repaint_delay);
+        if startup_warmup_active {
+            startup_warmup_frames -= 1;
+        }
+        let repaint_delay = if startup_warmup_frames > 0 {
+            repaint_delay.min(STARTUP_WARMUP_INTERVAL)
+        } else {
+            repaint_delay
+        };
         next_repaint_at = wake::repaint_deadline_at(repaint_delay, Instant::now());
         crate::Style::remap_clipped_shapes_for_color_scheme(
             &mut full_output.shapes,
@@ -2029,6 +2179,12 @@ pub fn run_drm_with_clipboard(
             &clipped,
             &full_output.textures_delta,
         );
+        if let Some(path) = proof_readback_path.as_deref() {
+            if !proof_readback_written {
+                drm_proof_readback(&gl, wp, hp, path, gbm_format)?;
+                proof_readback_written = true;
+            }
+        }
         egl.swap_buffers(display, surface).map_err(egl_err)?;
 
         // 4. scan the new front buffer out — set_crtc on the first frame, page-flip
@@ -2038,6 +2194,26 @@ pub fn run_drm_with_clipboard(
                 .lock_front_buffer()
                 .map_err(|e| DrmError::Present(format!("lock_front_buffer: {e}")))?
         };
+        // A proof-only surface is useful only if the BO actually handed to KMS
+        // is linear. Some Intel/libgbm combinations accept the explicit linear
+        // surface request but still return a tiled front buffer; kmsgrab then
+        // produces scanline-striped pixels when it is asked to download that
+        // buffer without a detiler. Report the real BO contract and fail closed
+        // instead of allowing an invalid proof frame to look successful.
+        if std::env::var_os("MDE_DRM_LINEAR_SCANOUT").is_some() {
+            let modifier = bo.modifier();
+            eprintln!(
+                "mde-egui: DRM proof front buffer format={:?} modifier={:?} stride={}",
+                bo.format(),
+                modifier,
+                bo.stride()
+            );
+            if modifier != gbm::Modifier::Linear {
+                return Err(DrmError::Present(format!(
+                    "DRM proof front buffer is non-linear ({modifier:?}); refusing invalid pixel proof"
+                )));
+            }
+        }
         // perf-1: reuse the framebuffer already built for this buffer-object (the surface
         // recycles a small ring of BOs; their `gbm_bo` pointers are stable), rather than
         // add_framebuffer/rm_framebuffer every frame. The FB stays valid for the BO's
@@ -2493,12 +2669,22 @@ pub fn probe_prime_import_liveness() -> Result<PrimeImportLiveness, DrmError> {
 mod tests {
     use super::{
         clear_rgba, drm_clipboard_output_text, drm_clipboard_text_for_paste, drm_modifiers,
-        explicit_modifier, open_primary_node, probe_prime_import_liveness,
+        drm_screen_for_scale, explicit_modifier, open_primary_node, probe_prime_import_liveness,
         push_drm_clipboard_shortcut, refresh_drm_clipboard_text, store_drm_clipboard_output,
         DrmError, ReimportedGemBuffer,
     };
     use crate::{MemoryTextClipboard, TextClipboard};
     use drm::buffer::{Handle as GemHandle, PlanarBuffer};
+
+    #[test]
+    fn drm_viewport_tracks_runtime_text_scale() {
+        let native = drm_screen_for_scale(1920, 1080, 1.25);
+        let largest = drm_screen_for_scale(1920, 1080, 1.875);
+
+        assert_eq!(native.size(), egui::vec2(1536.0, 864.0));
+        assert_eq!(largest.size(), egui::vec2(1024.0, 576.0));
+        assert!(largest.bottom() < native.bottom());
+    }
 
     #[test]
     fn clear_color_matches_the_active_capture_palette() {

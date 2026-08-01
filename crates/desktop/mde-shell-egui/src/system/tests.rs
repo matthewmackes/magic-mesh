@@ -361,12 +361,14 @@ fn wallpaper_section_renders_selectable_backdrop_and_bing_service() {
 
     for label in [
         "Construct wallpaper",
-        "Show wallpaper on Home",
-        "Wallpaper 1",
-        "Wallpaper 2",
-        "Wallpaper 3",
-        "Wallpaper 4 (default)",
-        "Wallpaper 5",
+        "Home wallpaper",
+        "Enable wallpaper on Home",
+        "Current selection: Wallpaper 4 (default)",
+        "Set Wallpaper 1",
+        "Set Wallpaper 2",
+        "Set Wallpaper 3",
+        "✓ Wallpaper 4 (default)",
+        "Set Wallpaper 5",
         "Desktop background service",
         "Allow daily picture downloads",
         "Use Bing image of the day as fallback",
@@ -852,6 +854,7 @@ fn every_section_is_reachable_exactly_once() {
         SettingsSection::Wallpaper,
         SettingsSection::Hotkeys,
         SettingsSection::Theme,
+        SettingsSection::Clock,
         SettingsSection::Identity,
         SettingsSection::Role,
         SettingsSection::Pairing,
@@ -866,11 +869,11 @@ fn every_section_is_reachable_exactly_once() {
             section.label()
         );
     }
-    // The whole taxonomy is exactly those fourteen sections (no orphan leaf).
+    // The whole taxonomy is exactly those fifteen sections (no orphan leaf).
     assert_eq!(
         all.len(),
-        14,
-        "the taxonomy lists exactly fourteen sections"
+        15,
+        "the taxonomy lists exactly fifteen sections"
     );
 }
 
@@ -990,7 +993,7 @@ fn painted_frame(st: &mut SystemState, size: egui::Vec2) -> Vec<(String, egui::C
 #[test]
 fn the_sidebar_model_lists_every_section_exactly_once_under_its_group() {
     // The unfiltered sidebar row model is EXACTLY the taxonomy: the three domain
-    // groups in order, each listing its own sections in order, fourteen rows in
+    // groups in order, each listing its own sections in order, fifteen rows in
     // all, no duplicate and no orphan (the Q27 shape the rail renders from).
     let groups = sidebar_rows("");
     assert_eq!(
@@ -1002,7 +1005,7 @@ fn the_sidebar_model_lists_every_section_exactly_once_under_its_group() {
         .iter()
         .flat_map(|(_, sections)| sections.iter().copied())
         .collect();
-    assert_eq!(flat.len(), 14, "the unfiltered sidebar lists fourteen rows");
+    assert_eq!(flat.len(), 15, "the unfiltered sidebar lists fifteen rows");
     for &section in &flat {
         assert_eq!(
             flat.iter().filter(|&&s| s == section).count(),
@@ -1068,8 +1071,8 @@ fn the_sidebar_search_narrows_by_label_and_clearing_restores_the_taxonomy() {
     for cleared in ["", "   "] {
         assert_eq!(
             sidebar_rows(cleared).iter().flat_map(|(_, s)| s).count(),
-            14,
-            "clearing the filter must restore all fourteen rows"
+            15,
+            "clearing the filter must restore all fifteen rows"
         );
     }
 }
@@ -2452,7 +2455,7 @@ fn mesh_facts_fold_this_nodes_real_identity_role_and_network() {
     assert_eq!(mesh.lighthouses, vec!["10.42.0.1".to_owned()]);
     assert_eq!(mesh.gateways, vec!["203.0.113.9:4242".to_owned()]);
     assert_eq!(mesh.default_gw.as_deref(), Some("172.20.0.1"));
-    assert_eq!((mesh.peers_online, mesh.peers_total), (2, 3));
+    assert_eq!(mesh.peer_counts, Some((2, 3)));
     assert!(!mesh.is_leader(), "the leader is a peer, not this node");
 
     // When this node holds the lease, is_leader flips.
@@ -2467,6 +2470,29 @@ fn mesh_facts_stay_unseen_on_a_garbage_or_fragment_snapshot() {
         assert!(!mesh.seen, "{bad:?} must not read as a live snapshot");
         assert!(mesh.identity.is_none());
         assert!(mesh.lighthouses.is_empty());
+    }
+}
+
+#[test]
+fn mesh_facts_reject_missing_wrong_typed_and_inconsistent_peer_counts() {
+    for snapshot in [
+        r#"{"self":"this-node","nodes":[]}"#,
+        r#"{"self":"this-node","nodes":[],"online":2}"#,
+        r#"{"self":"this-node","nodes":[],"online":"2","total":3}"#,
+        r#"{"self":"this-node","nodes":[],"online":3,"total":2}"#,
+    ] {
+        let mesh = MeshFacts::project(snapshot);
+        assert!(mesh.seen, "the snapshot itself is valid: {snapshot}");
+        assert_eq!(mesh.peer_counts, None, "invalid count must stay absent");
+        let mut state = SystemState {
+            nav: SettingsNav::at(SettingsSection::Network),
+            mesh,
+            ..SystemState::default()
+        };
+        assert!(
+            renders_at(&mut state, 1440.0),
+            "the honest unavailable peer state must still render"
+        );
     }
 }
 

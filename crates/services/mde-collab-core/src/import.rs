@@ -455,15 +455,18 @@ impl<'a, S: EventSigner> Importer<'a, S> {
             sink,
         )?;
         let mut count = 0_usize;
-        for (idx, doc) in source.documents.iter().enumerate() {
-            // A stable per-document source key: the caller-supplied id if any,
-            // else the title, else the ordinal — so a re-run maps to the same doc.
-            let doc_source = doc
-                .id
-                .clone()
-                .filter(|s| !s.is_empty())
-                .or_else(|| (!doc.title.is_empty()).then(|| doc.title.clone()))
-                .unwrap_or_else(|| format!("doc-{idx}"));
+        // Keep the historical key for the first occurrence, but disambiguate
+        // repeated legacy identities. Without this, two accepted records with
+        // the same title (or the same legacy id) shared one ImportMap key and
+        // the later document was silently dropped as an apparent replay.
+        let source_bases: Vec<String> = source
+            .documents
+            .iter()
+            .enumerate()
+            .map(|(idx, doc)| editor_document_source_base(doc, idx))
+            .collect();
+        let source_keys = unique_editor_document_source_keys(&source_bases);
+        for (doc, doc_source) in source.documents.iter().zip(source_keys) {
             let source_id = format!("doc|{doc_source}");
             if map.contains(&source_id) {
                 continue;
@@ -917,6 +920,57 @@ struct EditorDocument {
     /// The document title.
     #[serde(default)]
     title: String,
+}
+
+/// Return the source identity that the legacy importer historically used for
+/// one editor record. Keeping this base unchanged preserves replay compatibility
+/// for documents whose identity was already unique.
+fn editor_document_source_base(doc: &EditorDocument, idx: usize) -> String {
+    doc.id
+        .clone()
+        .filter(|s| !s.is_empty())
+        .or_else(|| (!doc.title.is_empty()).then(|| doc.title.clone()))
+        .unwrap_or_else(|| format!("doc-{idx}"))
+}
+
+/// Make editor source identities unique without discarding duplicate records.
+///
+/// The reserved first-occurrence ids prevent a generated duplicate suffix from
+/// colliding with a later user-provided id/title that happens to contain the
+/// same suffix. The result depends only on source order and content, so reruns
+/// produce the same ids and remain idempotent.
+fn unique_editor_document_source_keys(source_bases: &[String]) -> Vec<String> {
+    let reserved_source_ids: BTreeSet<String> = source_bases
+        .iter()
+        .map(|base| format!("doc|{base}"))
+        .collect();
+    let mut occurrences = BTreeMap::<&str, usize>::new();
+    let mut allocated_source_ids = BTreeSet::new();
+
+    source_bases
+        .iter()
+        .map(|base| {
+            let occurrence = occurrences.entry(base.as_str()).or_insert(0);
+            let key = if *occurrence == 0 {
+                base.clone()
+            } else {
+                let mut duplicate = *occurrence;
+                loop {
+                    let candidate = format!("{base}|duplicate-{duplicate}");
+                    let candidate_id = format!("doc|{candidate}");
+                    if !reserved_source_ids.contains(&candidate_id)
+                        && !allocated_source_ids.contains(&candidate_id)
+                    {
+                        break candidate;
+                    }
+                    duplicate += 1;
+                }
+            };
+            *occurrence += 1;
+            allocated_source_ids.insert(format!("doc|{key}"));
+            key
+        })
+        .collect()
 }
 
 /// Read + decode the editor autosave file, or `None` when it is absent/corrupt.
@@ -1472,5 +1526,48 @@ mod tests {
             .expect("docs");
         assert_eq!(docs.sessions.len(), 1);
         assert_eq!(docs.sessions[0].title, "Runbook");
+    }
+
+    #[test]
+    fn duplicate_editor_identities_are_preserved_and_replay_idempotently() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("editor-egui.json");
+        // These are four accepted source records: two title-derived identities
+        // and two id-derived identities, each with a collision. None may be
+        // mistaken for a replay of the other record.
+        std::fs::write(
+            &path,
+            r#"{"documents":[
+                {"title":"Runbook"},
+                {"title":"Runbook"},
+                {"id":"legacy-1","title":"First"},
+                {"id":"legacy-1","title":"Second"}
+            ]}"#,
+        )
+        .expect("write");
+        let signer = signer();
+        let importer = Importer::new(&signer, "eagle");
+        let mut map = ImportMap::new();
+        let mut sink = MemorySink::new();
+
+        let first = importer
+            .import_editor_autosave(&path, &mut map, &mut sink, 1)
+            .expect("first");
+        assert_eq!(first, EditorImport::Migrated { count: 4 });
+        assert_eq!(
+            sink.events()
+                .iter()
+                .filter(|event| matches!(event.kind, CollabEventKind::DocumentCreated { .. }))
+                .count(),
+            4,
+            "every accepted document was migrated"
+        );
+        let after_first = sink.len();
+
+        let second = importer
+            .import_editor_autosave(&path, &mut map, &mut sink, 2)
+            .expect("second");
+        assert_eq!(second, EditorImport::NothingToMigrate);
+        assert_eq!(sink.len(), after_first, "replay added no events");
     }
 }

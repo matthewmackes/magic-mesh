@@ -822,16 +822,22 @@ impl Style {
             s.spacing.interact_size.y = density.min_hit_target();
         });
         ctx.data_mut(|d| {
-            d.insert_temp(Self::color_scheme_id(), scheme);
-            d.insert_temp(Self::density_id(), density);
+            // The direct-DRM runner remaps static token-coloured shapes after
+            // `Context::run` returns.  `insert_temp` is discarded at that frame
+            // boundary, which made that post-frame pass fall back to Dark even
+            // though the frame itself had installed Light.  These are context
+            // configuration values, not per-frame UI scratch, so retain them
+            // until the next style installation replaces them.
+            d.insert_persisted(Self::color_scheme_id(), scheme);
+            d.insert_persisted(Self::density_id(), density);
         });
     }
 
     /// The current colour mode installed on `ctx`.
     #[must_use]
     pub fn color_scheme(ctx: &Context) -> StyleColorScheme {
-        ctx.data(|d| {
-            d.get_temp::<StyleColorScheme>(Self::color_scheme_id())
+        ctx.data_mut(|d| {
+            d.get_persisted::<StyleColorScheme>(Self::color_scheme_id())
                 .unwrap_or_default()
         })
     }
@@ -839,8 +845,8 @@ impl Style {
     /// The current density installed on `ctx`.
     #[must_use]
     pub fn density(ctx: &Context) -> Density {
-        ctx.data(|d| {
-            d.get_temp::<Density>(Self::density_id())
+        ctx.data_mut(|d| {
+            d.get_persisted::<Density>(Self::density_id())
                 .unwrap_or_default()
         })
     }
@@ -2304,6 +2310,22 @@ mod tests {
                 Style::QUAZAR_LIGHT_PRESSED_FACE
             )
         );
+    }
+
+    #[test]
+    fn installed_scheme_survives_the_egui_frame_boundary() {
+        let ctx = egui::Context::default();
+
+        // DRM resolves the active palette after `Context::run` returns, while it
+        // turns egui shapes into KMS primitives. The shell applies this from its
+        // per-frame settings poll, so the install must happen *inside* the frame
+        // to cover the production timing.
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            Style::install_color_scheme_with_density(ctx, StyleColorScheme::Light, Density::Touch);
+        });
+
+        assert_eq!(Style::color_scheme(&ctx), StyleColorScheme::Light);
+        assert_eq!(Style::density(&ctx), Density::Touch);
     }
 
     #[test]

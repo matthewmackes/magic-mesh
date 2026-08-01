@@ -657,8 +657,13 @@ fn wall_now_ms() -> i64 {
 /// what the verifier authenticates.
 fn session_auth_target(request: &SessionRequest) -> (&'static str, String) {
     match request {
-        SessionRequest::Open { id, .. } => ("vdi-session-open", format!("session:{id}")),
+        SessionRequest::Open { id, .. } | SessionRequest::OpenApp { id, .. } => {
+            ("vdi-session-open", format!("session:{id}"))
+        }
         SessionRequest::Active { id } => ("vdi-session-active", format!("session:{id}")),
+        SessionRequest::AppState { id, .. } => {
+            ("vdi-session-app-state", format!("session:{id}"))
+        }
         SessionRequest::Disconnect { id } => ("vdi-session-disconnect", format!("session:{id}")),
         SessionRequest::Close { id } => ("vdi-session-close", format!("session:{id}")),
     }
@@ -805,6 +810,12 @@ impl ConsoleBrokerWorker {
                 serving_peer,
                 vm_id,
                 ..
+            }
+            | SessionRequest::OpenApp {
+                id,
+                serving_peer,
+                vm_id,
+                ..
             } => {
                 if self.brokered.contains_key(id) || !self.serves(serving_peer) {
                     return false;
@@ -837,7 +848,9 @@ impl ConsoleBrokerWorker {
             // A closed session's relay is torn down (its handle is dropped) and the
             // record retired. `Active`/`Disconnect` don't change the console.
             SessionRequest::Close { id } => self.brokered.remove(id).is_some(),
-            SessionRequest::Active { .. } | SessionRequest::Disconnect { .. } => false,
+            SessionRequest::Active { .. }
+            | SessionRequest::AppState { .. }
+            | SessionRequest::Disconnect { .. } => false,
         }
     }
 

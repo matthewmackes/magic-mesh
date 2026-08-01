@@ -49,6 +49,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use mde_bus::persist::Persist;
+use mackes_mesh_types::vdi_clipboard::{
+    ClipboardMaterialization, VdiClipboardText, CLIPBOARD_MATERIALIZATION_MAX_AGE_SECS,
+    CLIPBOARD_MATERIALIZATION_TOPIC,
+};
 
 use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
 
@@ -243,10 +247,18 @@ impl ClipPayload {
 pub struct ClipboardEvent {
     /// The session this clip belongs to (a broker [`SessionId`]).
     pub session_id: SessionId,
+    /// The exact local seat/guest endpoint that must receive the clip. This is
+    /// part of the signed capability target; a session alone is not sufficient
+    /// authorization for cross-seat materialization.
+    pub target_seat: String,
     /// Which way the clip is flowing.
     pub direction: ClipDirection,
     /// The clip content.
     pub payload: ClipPayload,
+    /// Producer attribution, retained when a canonical VNC capture is promoted
+    /// into the signed daemon action lane. Older action producers may omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// Parse + validate a [`ClipboardEvent`] body off the bus.
@@ -260,10 +272,26 @@ pub struct ClipboardEvent {
 pub fn parse_event(body: &str) -> Result<ClipboardEvent, String> {
     let ev: ClipboardEvent =
         serde_json::from_str(body).map_err(|e| format!("malformed clipboard event: {e}"))?;
+    validate_target_seat(&ev.target_seat)?;
     ev.payload
         .ensure_within_ceiling()
         .map_err(|e| format!("clipboard event rejected: {e}"))?;
     Ok(ev)
+}
+
+pub(super) fn validate_target_seat(target_seat: &str) -> Result<(), String> {
+    let target_seat = target_seat.trim();
+    if target_seat.is_empty() {
+        return Err("clipboard event missing target_seat".to_owned());
+    }
+    if target_seat.len() > 128
+        || target_seat.bytes().any(|byte| {
+            !byte.is_ascii_alphanumeric() && !matches!(byte, b'.' | b'_' | b'-' | b':' | b'@')
+        })
+    {
+        return Err("clipboard event target_seat is unsafe or too long".to_owned());
+    }
+    Ok(())
 }
 
 // ───────────────────────────── policy ─────────────────────────────
@@ -476,62 +504,167 @@ impl std::error::Error for ClipboardAccessError {}
 /// guest's change signal doesn't loop) and, once wired, the guest→client capture
 /// half. Production wires [`OsClipboardAccess`]; the tests drive an in-memory fake.
 pub trait ClipboardAccess {
-    /// Read the current local clipboard for `session_id` (`None` = empty).
+    /// Read the current local clipboard for the exact signed `target_seat`
+    /// endpoint (`None` = empty).
     ///
     /// # Errors
     /// A [`ClipboardAccessError`] — `IntegrationGated` until the live vdagent bridge
     /// lands, else `Failed`.
-    fn read_local(&self, session_id: &str) -> Result<Option<ClipPayload>, ClipboardAccessError>;
+    fn read_local(&self, target_seat: &str) -> Result<Option<ClipPayload>, ClipboardAccessError>;
 
-    /// Apply `payload` to the local clipboard for `session_id`.
+    /// Apply `payload` to the exact signed `target_seat` endpoint.
     ///
     /// # Errors
     /// A [`ClipboardAccessError`] — `IntegrationGated` until the live vdagent bridge
     /// lands, else `Failed`.
     fn write_local(
         &self,
-        session_id: &str,
+        target_seat: &str,
+        direction: ClipDirection,
         payload: &ClipPayload,
     ) -> Result<(), ClipboardAccessError>;
 }
 
-/// Production [`ClipboardAccess`]: the live OS/guest clipboard channel.
+/// Production [`ClipboardAccess`] for the direct DRM seat.
 ///
-/// This slice (E12-9) delivers the pure bridge + the seam; the live executor (a
-/// real VM protocol clipboard channel, such as SPICE/RDP agent support or VNC
-/// cut-text plumbing, reached over the Nebula overlay) is wired by a later E12
-/// unit. Until then each method returns a typed
-/// [`ClipboardAccessError::IntegrationGated`] naming exactly what the live call
-/// needs — never a fake success (§7).
-#[derive(Debug, Clone, Copy, Default)]
-pub struct OsClipboardAccess;
+/// The daemon cannot safely borrow a shell-owned VNC/RDP/SPICE session. For the
+/// guest→client direction it therefore writes a bounded, target-seat handoff to
+/// the node-local Bus; the shell consumes that handoff in its existing DRM
+/// provider. Client→guest remains explicitly gated until a protocol owner is
+/// attached to the serving VDI session. No Wayland helper or fake success is
+/// introduced.
+#[derive(Debug, Clone, Default)]
+pub struct OsClipboardAccess {
+    bus_root: Option<PathBuf>,
+}
+
+impl OsClipboardAccess {
+    /// Construct an adapter against an explicit Bus root (tests and operators
+    /// using an isolated local spool).
+    #[must_use]
+    pub fn for_bus(bus_root: PathBuf) -> Self {
+        Self {
+            bus_root: Some(bus_root),
+        }
+    }
+
+    fn root(&self) -> Option<PathBuf> {
+        self.bus_root.clone().or_else(mde_bus::default_data_dir)
+    }
+}
 
 impl ClipboardAccess for OsClipboardAccess {
-    fn read_local(&self, session_id: &str) -> Result<Option<ClipPayload>, ClipboardAccessError> {
-        Err(ClipboardAccessError::IntegrationGated {
+    fn read_local(&self, target_seat: &str) -> Result<Option<ClipPayload>, ClipboardAccessError> {
+        let Some(root) = self.root() else {
+            return Ok(None);
+        };
+        let persist = Persist::open(root).map_err(|error| ClipboardAccessError::Failed {
             op: "read_local",
-            reason: format!(
-                "session {session_id} → needs the live OS/guest clipboard channel (a VM protocol \
-                 clipboard channel such as SPICE/RDP agent support or VNC cut-text plumbing); the \
-                 guest clipboard link is not wired here yet"
-            ),
-        })
+            reason: format!("open local clipboard Bus: {error}"),
+        })?;
+        let Some(message) = persist
+            .read_latest(CLIPBOARD_MATERIALIZATION_TOPIC)
+            .map_err(|error| ClipboardAccessError::Failed {
+                op: "read_local",
+                reason: format!("read local clipboard handoff: {error}"),
+            })?
+        else {
+            return Ok(None);
+        };
+        let Some(body) = message.body.as_deref() else {
+            return Ok(None);
+        };
+        let handoff: ClipboardMaterialization = serde_json::from_str(body).map_err(|error| {
+            ClipboardAccessError::Failed {
+                op: "read_local",
+                reason: format!("decode local clipboard handoff: {error}"),
+            }
+        })?;
+        if handoff.target_seat != target_seat {
+            return Ok(None);
+        }
+        handoff
+            .validate()
+            .map_err(|reason| ClipboardAccessError::Failed {
+                op: "read_local",
+                reason,
+            })?;
+        let issued = chrono::DateTime::parse_from_rfc3339(&handoff.time).map_err(|error| {
+            ClipboardAccessError::Failed {
+                op: "read_local",
+                reason: format!("invalid local clipboard handoff time: {error}"),
+            }
+        })?;
+        let age = chrono::Utc::now()
+            .signed_duration_since(issued)
+            .num_seconds();
+        if !(0..=CLIPBOARD_MATERIALIZATION_MAX_AGE_SECS).contains(&age) {
+            return Ok(None);
+        }
+        Ok(Some(ClipPayload::text(String::from(handoff.text))))
     }
 
     fn write_local(
         &self,
-        session_id: &str,
-        _payload: &ClipPayload,
+        target_seat: &str,
+        direction: ClipDirection,
+        payload: &ClipPayload,
     ) -> Result<(), ClipboardAccessError> {
-        Err(ClipboardAccessError::IntegrationGated {
+        if direction != ClipDirection::GuestToClient {
+            return Err(ClipboardAccessError::IntegrationGated {
+                op: "write_local",
+                reason: "client→guest still requires ownership of the live VDI protocol session (VNC/RFB is shell-owned; RDP CLIPRDR and SPICE vdagent remain unsupported)".to_owned(),
+            });
+        }
+        let text = VdiClipboardText::new(payload.content.clone()).map_err(|error| {
+            ClipboardAccessError::Failed {
+                op: "write_local",
+                reason: error.to_string(),
+            }
+        })?;
+        let handoff = ClipboardMaterialization::new(
+            target_seat,
+            text,
+            payload_source(target_seat),
+            chrono::Utc::now().to_rfc3339(),
+        );
+        handoff
+            .validate()
+            .map_err(|reason| ClipboardAccessError::Failed {
+                op: "write_local",
+                reason,
+            })?;
+        let Some(root) = self.root() else {
+            return Err(ClipboardAccessError::Failed {
+                op: "write_local",
+                reason: "local clipboard Bus is unavailable".to_owned(),
+            });
+        };
+        let persist = Persist::open(root).map_err(|error| ClipboardAccessError::Failed {
             op: "write_local",
-            reason: format!(
-                "session {session_id} → needs the live OS/guest clipboard channel (a VM protocol \
-                 clipboard channel such as SPICE/RDP agent support or VNC cut-text plumbing); the \
-                 guest clipboard link is not wired here yet"
-            ),
-        })
+            reason: format!("open local clipboard Bus: {error}"),
+        })?;
+        let body = serde_json::to_string(&handoff).map_err(|error| ClipboardAccessError::Failed {
+            op: "write_local",
+            reason: format!("encode local clipboard handoff: {error}"),
+        })?;
+        persist
+            .write(
+                CLIPBOARD_MATERIALIZATION_TOPIC,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&body),
+            )
+            .map(|_| ())
+            .map_err(|error| ClipboardAccessError::Failed {
+                op: "write_local",
+                reason: format!("write local clipboard handoff: {error}"),
+            })
     }
+}
+
+fn payload_source(target_seat: &str) -> String {
+    format!("vdi-action:{target_seat}")
 }
 
 // ───────────────────────────── bus + worker ─────────────────────────────
@@ -539,7 +672,7 @@ impl ClipboardAccess for OsClipboardAccess {
 /// Read new [`ACTION_TOPIC`] messages since `cursor`, advancing it. A short sync
 /// open-read-drop (never crosses an `.await`), mirroring [`super::session_broker`].
 fn clipboard_auth_target(event: &ClipboardEvent) -> String {
-    format!("session:{}", event.session_id)
+    format!("session:{}:seat:{}", event.session_id, event.target_seat)
 }
 
 /// Verify the exact bus body before the event can reach the OS/guest write seam.
@@ -636,7 +769,7 @@ impl ClipboardBridgeWorker {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            access: Box::new(OsClipboardAccess),
+            access: Box::new(OsClipboardAccess::default()),
             policy: ClipboardPolicy::allow_all(),
             poll: DEFAULT_POLL_INTERVAL,
             bus_root_override: None,
@@ -688,7 +821,11 @@ impl ClipboardBridgeWorker {
     /// the resulting payload through the seam. `latest` carries the last-relayed clip
     /// per session (the incremental [`fold_latest`]); it doubles as the in-memory echo
     /// guard so a re-sent clip isn't re-applied even when `read_local` is gated.
-    fn relay_event(&self, event: &ClipboardEvent, latest: &mut BTreeMap<SessionId, ClipPayload>) {
+    fn relay_event(
+        &self,
+        event: &ClipboardEvent,
+        latest: &mut BTreeMap<SessionId, ClipPayload>,
+    ) -> bool {
         let payload = match relay(event, &self.policy) {
             RelayDecision::Forward(p) => p,
             RelayDecision::Truncate(p) => {
@@ -697,35 +834,45 @@ impl ClipboardBridgeWorker {
             }
             RelayDecision::Drop(reason) => {
                 tracing::debug!(session = %event.session_id, ?reason, "clipboard_bridge: policy dropped a clip");
-                return;
+                return true;
             }
         };
-        // Track the latest clip per session; keep the prior value to guard against echo.
-        let prev = latest.insert(event.session_id.clone(), payload.clone());
-        // Echo guard 1 — in-memory: a clip identical to the last one we relayed for
-        // this session is a no-op (re-applying it would re-fire the guest's change
-        // signal → an echo storm). Works even when read_local is integration-gated.
-        if prev.as_ref() == Some(&payload) {
+        // Echo guard 1 — in-memory: a clip identical to the last *successfully
+        // materialized* clip for this session is a no-op. Do not insert the
+        // candidate before the write succeeds: an integration-gated or failed
+        // write must remain retryable on the next event/adapter attempt.
+        if latest.get(&event.session_id) == Some(&payload) {
             tracing::debug!(session = %event.session_id, "clipboard_bridge: clip already current (in-memory); skipping echo");
-            return;
+            return true;
         }
         // Echo guard 2 — live: if the endpoint already holds this exact clip, skip.
         // A gated / failed read falls through to the write (honest — the write is the
         // real relay, itself gated in this slice, and defers with a log).
-        if let Ok(Some(current)) = self.access.read_local(&event.session_id) {
+        if let Ok(Some(current)) = self.access.read_local(&event.target_seat) {
             if current == payload {
+                latest.insert(event.session_id.clone(), payload);
                 tracing::debug!(session = %event.session_id, "clipboard_bridge: clip already current (endpoint); skipping echo");
-                return;
+                return true;
             }
         }
-        if let Err(e) = self.access.write_local(&event.session_id, &payload) {
-            match e {
-                ClipboardAccessError::IntegrationGated { .. } => {
-                    tracing::info!(error = %e, "clipboard_bridge: clipboard access integration-gated; deferring relay");
+        match self
+            .access
+            .write_local(&event.target_seat, event.direction, &payload)
+        {
+            Ok(()) => {
+                latest.insert(event.session_id.clone(), payload);
+                true
+            }
+            Err(e) => {
+                match e {
+                    ClipboardAccessError::IntegrationGated { .. } => {
+                        tracing::info!(error = %e, "clipboard_bridge: clipboard access integration-gated; deferring relay");
+                    }
+                    ClipboardAccessError::Failed { .. } => {
+                        tracing::warn!(error = %e, "clipboard_bridge: clipboard write failed; retaining retry eligibility");
+                    }
                 }
-                ClipboardAccessError::Failed { .. } => {
-                    tracing::warn!(error = %e, "clipboard_bridge: clipboard write failed");
-                }
+                false
             }
         }
     }
@@ -737,9 +884,18 @@ impl ClipboardBridgeWorker {
         bus_root: &Path,
         cursor: &mut Option<String>,
         latest: &mut BTreeMap<SessionId, ClipPayload>,
+        pending: &mut Vec<ClipboardEvent>,
     ) {
+        let mut retry = std::mem::take(pending);
+        for event in retry.drain(..) {
+            if !self.relay_event(&event, latest) {
+                pending.push(event);
+            }
+        }
         for event in read_new_events(bus_root, cursor, self.authorizer.as_ref()) {
-            self.relay_event(&event, latest);
+            if !self.relay_event(&event, latest) {
+                pending.push(event);
+            }
         }
     }
 }
@@ -759,12 +915,13 @@ impl Worker for ClipboardBridgeWorker {
         // re-apply a stale clipboard (unlike the broker's fold-from-genesis roster).
         let mut cursor = prime_cursor(&bus_root);
         let mut latest: BTreeMap<SessionId, ClipPayload> = BTreeMap::new();
+        let mut pending = Vec::new();
         let mut tick = tokio::time::interval(self.poll);
         tick.tick().await; // consume the immediate first tick
         loop {
             tokio::select! {
                 _ = tick.tick() => {
-                    self.drain_and_relay(&bus_root, &mut cursor, &mut latest);
+                    self.drain_and_relay(&bus_root, &mut cursor, &mut latest, &mut pending);
                 }
                 () = shutdown.wait() => break,
             }
@@ -777,7 +934,7 @@ impl Worker for ClipboardBridgeWorker {
 mod tests {
     use super::*;
     use crate::ipc::action_auth::{authorize_test_body, ActionAuthorizer, MutationContext};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
     const AUTH_KEY: &[u8] = b"clipboard-bridge-action-auth-test-key";
@@ -793,8 +950,10 @@ mod tests {
     fn event(session: &str, direction: ClipDirection, content: &str) -> ClipboardEvent {
         ClipboardEvent {
             session_id: session.to_string(),
+            target_seat: session.to_string(),
             direction,
             payload: ClipPayload::text(content),
+            source: None,
         }
     }
 
@@ -861,14 +1020,17 @@ mod tests {
     #[test]
     fn parse_event_round_trips_and_rejects_malformed() {
         let ev = parse_event(
-            r#"{"session_id":"s1","direction":"client_to_guest","payload":{"format":"text","content":"hi"}}"#,
+            r#"{"session_id":"s1","target_seat":"seat:dell","direction":"client_to_guest","payload":{"format":"text","content":"hi"}}"#,
         )
         .expect("valid event parses");
         assert_eq!(ev.session_id, "s1");
+        assert_eq!(ev.target_seat, "seat:dell");
         assert_eq!(ev.direction, ClipDirection::ClientToGuest);
         assert_eq!(ev.payload.content, "hi");
         assert!(parse_event("nonsense").is_err());
         assert!(parse_event(r#"{"session_id":"s1","direction":"sideways","payload":{"format":"text","content":"x"}}"#).is_err());
+        assert!(parse_event(r#"{"session_id":"s1","direction":"client_to_guest","payload":{"format":"text","content":"x"}}"#).is_err());
+        assert!(parse_event(r#"{"session_id":"s1","target_seat":"../../host","direction":"client_to_guest","payload":{"format":"text","content":"x"}}"#).is_err());
     }
 
     #[test]
@@ -877,8 +1039,10 @@ mod tests {
         // never relays it. Serialize a real event with a >ceiling payload and re-parse.
         let ev = ClipboardEvent {
             session_id: "s1".into(),
+            target_seat: "seat:dell".into(),
             direction: ClipDirection::ClientToGuest,
             payload: ClipPayload::text("a".repeat(MAX_CLIP_BYTES + 8)),
+            source: None,
         };
         let body = serde_json::to_string(&ev).unwrap();
         let err = parse_event(&body).unwrap_err();
@@ -983,31 +1147,35 @@ mod tests {
     // ── the access seam ──
 
     #[test]
-    fn os_clipboard_access_is_integration_gated_not_faked() {
-        let access = OsClipboardAccess;
-        for (label, err) in [
-            (
-                "read_local",
-                access.read_local("s1").map(|_| ()).unwrap_err(),
-            ),
-            (
-                "write_local",
-                access
-                    .write_local("s1", &ClipPayload::text("x"))
-                    .unwrap_err(),
-            ),
-        ] {
-            match err {
-                ClipboardAccessError::IntegrationGated { op, reason } => {
-                    assert_eq!(op, label);
-                    assert!(
-                        reason.contains("clipboard"),
-                        "names the missing live channel: {reason}"
-                    );
-                }
-                ClipboardAccessError::Failed { op, reason } => {
-                    panic!("expected integration-gated, got Failed {{{op}: {reason}}}")
-                }
+    fn os_clipboard_access_handoffs_guest_text_to_the_exact_seat() {
+        let dir = tempfile::tempdir().expect("clipboard Bus tempdir");
+        let access = OsClipboardAccess::for_bus(dir.path().to_path_buf());
+        access
+            .write_local("seat:dell", ClipDirection::GuestToClient, &ClipPayload::text("x"))
+            .expect("guest text handoff");
+        assert_eq!(
+            access.read_local("seat:dell").expect("read handoff"),
+            Some(ClipPayload::text("x"))
+        );
+        assert!(
+            access.read_local("seat:other").expect("read other seat").is_none(),
+            "a target-seat handoff must not cross seats"
+        );
+    }
+
+    #[test]
+    fn os_clipboard_access_keeps_client_to_guest_explicitly_gated() {
+        let access = OsClipboardAccess::for_bus(tempfile::tempdir().unwrap().path().to_path_buf());
+        let error = access
+            .write_local("seat:dell", ClipDirection::ClientToGuest, &ClipPayload::text("x"))
+            .expect_err("daemon does not own the live guest protocol session");
+        match error {
+            ClipboardAccessError::IntegrationGated { op, reason } => {
+                assert_eq!(op, "write_local");
+                assert!(reason.contains("VNC/RFB"), "explicit protocol blocker: {reason}");
+            }
+            ClipboardAccessError::Failed { op, reason } => {
+                panic!("expected integration-gated, got Failed {{{op}: {reason}}}")
             }
         }
     }
@@ -1035,6 +1203,7 @@ mod tests {
         fn write_local(
             &self,
             session_id: &str,
+            _direction: ClipDirection,
             payload: &ClipPayload,
         ) -> Result<(), ClipboardAccessError> {
             self.rows
@@ -1049,11 +1218,47 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct FailFirstClipboard {
+        writes: Arc<Mutex<Vec<(SessionId, ClipPayload)>>>,
+        fail_first: Arc<AtomicBool>,
+    }
+
+    impl ClipboardAccess for FailFirstClipboard {
+        fn read_local(
+            &self,
+            _target_seat: &str,
+        ) -> Result<Option<ClipPayload>, ClipboardAccessError> {
+            Ok(None)
+        }
+
+        fn write_local(
+            &self,
+            target_seat: &str,
+            _direction: ClipDirection,
+            payload: &ClipPayload,
+        ) -> Result<(), ClipboardAccessError> {
+            if self.fail_first.swap(false, Ordering::SeqCst) {
+                return Err(ClipboardAccessError::Failed {
+                    op: "write_local",
+                    reason: "injected first-write failure".to_owned(),
+                });
+            }
+            self.writes
+                .lock()
+                .expect("writes mutex")
+                .push((target_seat.to_owned(), payload.clone()));
+            Ok(())
+        }
+    }
+
     #[test]
     fn fake_clipboard_round_trips() {
         let access = FakeClipboard::default();
         assert!(access.read_local("s1").unwrap().is_none());
-        access.write_local("s1", &ClipPayload::text("hi")).unwrap();
+        access
+            .write_local("s1", ClipDirection::GuestToClient, &ClipPayload::text("hi"))
+            .unwrap();
         assert_eq!(
             access.read_local("s1").unwrap(),
             Some(ClipPayload::text("hi"))
@@ -1146,7 +1351,7 @@ mod tests {
 
         let mut cursor = None;
         let mut latest = BTreeMap::new();
-        w.drain_and_relay(&bus, &mut cursor, &mut latest);
+        w.drain_and_relay(&bus, &mut cursor, &mut latest, &mut Vec::new());
 
         assert_eq!(
             rows.lock().expect("rows mutex").get("s1"),
@@ -1155,6 +1360,31 @@ mod tests {
         );
         // …and the latest-per-session fold tracked it.
         assert_eq!(latest["s1"], ClipPayload::text("copied text"));
+        let _ = std::fs::remove_dir_all(&bus);
+    }
+
+    #[tokio::test]
+    async fn worker_materializes_only_into_the_signed_target_seat() {
+        let mut target = event("session-1", ClipDirection::ClientToGuest, "seat-bound");
+        target.target_seat = "seat:dell".to_owned();
+        let bus = seed_bus(&[target]);
+        let access = FakeClipboard::default();
+        let rows = access.rows.clone();
+        let w = ClipboardBridgeWorker::new()
+            .with_access(Box::new(access))
+            .with_bus_root(bus.clone())
+            .with_authorizer(test_authorizer(&bus));
+        let mut cursor = None;
+        let mut latest = BTreeMap::new();
+
+        w.drain_and_relay(&bus, &mut cursor, &mut latest, &mut Vec::new());
+
+        let rows = rows.lock().expect("rows mutex");
+        assert_eq!(
+            rows.get("seat:dell"),
+            Some(&ClipPayload::text("seat-bound"))
+        );
+        assert!(!rows.contains_key("session-1"));
         let _ = std::fs::remove_dir_all(&bus);
     }
 
@@ -1171,7 +1401,7 @@ mod tests {
 
         let mut cursor = None;
         let mut latest = BTreeMap::new();
-        w.drain_and_relay(&bus, &mut cursor, &mut latest);
+        w.drain_and_relay(&bus, &mut cursor, &mut latest, &mut Vec::new());
 
         assert!(
             writes.lock().expect("writes mutex").is_empty(),
@@ -1197,7 +1427,7 @@ mod tests {
 
         let mut cursor = None;
         let mut latest = BTreeMap::new();
-        w.drain_and_relay(&bus, &mut cursor, &mut latest);
+        w.drain_and_relay(&bus, &mut cursor, &mut latest, &mut Vec::new());
 
         assert_eq!(
             writes.lock().expect("writes mutex").len(),
@@ -1207,6 +1437,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&bus);
     }
 
+    #[test]
+    fn failed_materialization_remains_retryable() {
+        let access = FailFirstClipboard {
+            writes: Arc::new(Mutex::new(Vec::new())),
+            fail_first: Arc::new(AtomicBool::new(true)),
+        };
+        let writes = access.writes.clone();
+        let w = ClipboardBridgeWorker::new().with_access(Box::new(access));
+        let clip = event("s1", ClipDirection::ClientToGuest, "retry me");
+        let mut latest = BTreeMap::new();
+
+        w.relay_event(&clip, &mut latest);
+        assert!(
+            latest.is_empty(),
+            "failed writes must not enter the echo fold"
+        );
+        w.relay_event(&clip, &mut latest);
+
+        assert_eq!(writes.lock().expect("writes mutex").len(), 1);
+        assert_eq!(latest.get("s1"), Some(&ClipPayload::text("retry me")));
+    }
+
     #[tokio::test]
     async fn worker_echo_guard_skips_a_clip_the_endpoint_already_holds() {
         // A fresh worker (empty in-memory fold) whose endpoint already holds the clip
@@ -1214,7 +1466,7 @@ mod tests {
         let bus = seed_bus(&[event("s1", ClipDirection::ClientToGuest, "current")]);
         let access = FakeClipboard::default();
         access
-            .write_local("s1", &ClipPayload::text("current"))
+            .write_local("s1", ClipDirection::ClientToGuest, &ClipPayload::text("current"))
             .unwrap();
         let writes = access.writes.clone();
         let baseline = writes.lock().expect("writes mutex").len(); // 1 (the seed write)
@@ -1225,7 +1477,7 @@ mod tests {
 
         let mut cursor = None;
         let mut latest = BTreeMap::new();
-        w.drain_and_relay(&bus, &mut cursor, &mut latest);
+        w.drain_and_relay(&bus, &mut cursor, &mut latest, &mut Vec::new());
 
         assert_eq!(
             writes.lock().expect("writes mutex").len(),
@@ -1278,7 +1530,7 @@ mod tests {
 
         let mut cursor = None;
         let mut latest = BTreeMap::new();
-        w.drain_and_relay(&bus, &mut cursor, &mut latest);
+        w.drain_and_relay(&bus, &mut cursor, &mut latest, &mut Vec::new());
 
         assert!(
             writes.lock().expect("writes mutex").is_empty(),
@@ -1302,7 +1554,7 @@ mod tests {
 
         let mut cursor = None;
         let mut latest = BTreeMap::new();
-        w.drain_and_relay(&bus, &mut cursor, &mut latest);
+        w.drain_and_relay(&bus, &mut cursor, &mut latest, &mut Vec::new());
 
         assert_eq!(
             writes.lock().expect("writes mutex").len(),

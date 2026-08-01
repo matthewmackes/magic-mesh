@@ -12,7 +12,11 @@ locals {
   # exactly that workload on this placement node.
   vm_workloads = {
     for name, w in var.vms : name => w
-    if contains(["desktop_vm", "service_vm", "app_vm"], w.delivery_type)
+    if contains(["desktop_vm", "service_vm"], w.delivery_type)
+  }
+  app_workloads = {
+    for name, w in var.vms : name => w
+    if w.delivery_type == "app_vm"
   }
   android_workloads = {
     for name, w in var.vms : name => w
@@ -27,12 +31,13 @@ locals {
   # The join token is the sensitive value the mde-seal bridge (secrets.tf) unsealed
   # at apply time.
   domain_user_data = {
-    for name, w in merge(local.vm_workloads, local.android_workloads) :
+    for name, w in merge(local.vm_workloads, local.app_workloads, local.android_workloads) :
     name => templatefile("${path.module}/cloud-init/mesh-join.yaml.tftpl", {
       hostname              = name
       ssh_authorized_key    = var.mesh_join.ssh_authorized_key
       lighthouse_overlay_ip = var.mesh_join.lighthouse_overlay_ip
       join_token            = local.join_token
+      app                   = try(w.app, null)
     })
   }
 }
@@ -57,6 +62,18 @@ resource "libvirt_volume" "base" {
   name   = "${var.network.name}-base.qcow2"
   pool   = var.pool
   source = var.base_image_source
+  format = "qcow2"
+}
+
+# App VMs use a separate signed guest image. It carries the compositor, portal,
+# Flatpak remote policy, PipeWire, and the VDI app-mode runtime; they must never
+# silently boot the generic desktop base.
+resource "libvirt_volume" "app_base" {
+  count = length(local.app_workloads) > 0 ? 1 : 0
+
+  name   = "${var.network.name}-app-wayland-base.qcow2"
+  pool   = var.pool
+  source = var.app_base_image_source
   format = "qcow2"
 }
 
@@ -87,6 +104,22 @@ module "vm" {
   user_data      = local.domain_user_data[each.key]
 }
 
+# One dedicated App VM domain per typed guest-owned application declaration.
+module "app_vm" {
+  source   = "./modules/vm"
+  for_each = local.app_workloads
+
+  name           = each.key
+  vcpu           = each.value.vcpu
+  memory_mb      = each.value.memory_mb
+  disk_gb        = each.value.disk_gb
+  pool           = var.pool
+  base_volume_id = one(libvirt_volume.app_base[*].id)
+  network_id     = module.network.network_id
+  user_data      = local.domain_user_data[each.key]
+  app            = each.value.app
+}
+
 # One Cuttlefish L1 VM per declared android_vm workload — a nested-virt-capable
 # Debian host that runs `cvd` (the Android guest lives in crosvm inside it). The
 # module raises the size to its nested-virt floor (>=8G / >=4 vcpu / >=80G).
@@ -102,6 +135,7 @@ module "android" {
   base_volume_id    = one(libvirt_volume.android_base[*].id)
   network_id        = module.network.network_id
   user_data         = local.domain_user_data[each.key]
+  app              = each.value.app
   network_isolation = each.value.network_isolation
 }
 

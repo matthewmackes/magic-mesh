@@ -57,8 +57,11 @@ pub mod value;
 mod tests;
 
 pub use clock::{ActorClock, ActorId};
-pub use command::{CollabCommand, TransferControl};
-pub use envelope::{CollabEventEnvelope, EventSignature, SCHEMA_VERSION};
+pub use command::{
+    CollabCommand, TaskAction, TaskActionValidationError, TransferControl,
+    MAX_TASK_TITLE_BYTES,
+};
+pub use envelope::{last_writer_wins, CollabEventEnvelope, EventSignature, SCHEMA_VERSION};
 pub use event::CollabEventKind;
 pub use ids::{CallId, DocumentId, EventId, FileRefId, SpaceId, ThreadId, TransferId};
 pub use read_model::{

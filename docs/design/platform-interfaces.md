@@ -65,8 +65,10 @@ by gesture/Escape. Sheets for scoped tasks, popovers for transient choices,
 alerts only for consequences. *(HIG › Patterns › Modality)*
 
 **P6 — Fluid, honest motion.** Motion clarifies spatial relationships
-(zoom-from-tile says "this app came from here"). Springs are interruptible;
-reduced-motion is respected; nothing animates that carries no meaning.
+(zoom-from-tile says "this app came from here"). Apple-like springs are
+interruptible, expressive motion is the default, and nothing animates that
+carries no meaning. Reduced-motion handling is optional compatibility work, not
+a core product feature.
 *(HIG › Foundations › Motion)*
 
 **P7 — Input parity.** Touch and pointer/keyboard are both first-class
@@ -196,7 +198,8 @@ Light is a production first-class appearance, both share azure accent
 - **Q23 — Radii ladder** ~6/10/16/26 with a concentric-nesting rule.
 - **Q24 — Full HIG transitions:** zoom-from-tile open/close, the navigation-bar
   slide/melt morph, and sheet detent physics — on the existing MOTION-DRM spring
-  substrate. Reduced-motion respected throughout. *(Motion)*
+  substrate. Expressive Apple-like motion is the normal path; reduced-motion is
+  optional compatibility work. *(Motion)*
 
 ### 2.7 System surfaces (Q25–Q28, Q50)
 
@@ -295,9 +298,11 @@ bindings (`CarAction`) re-map accordingly; Music gains media-transport keys.
 - **Re-anchored:** chrome-shaped feature docs keep their feature content and
   gain banners pointing their look-and-feel sections here. Subsystem docs lose
   foreign-paradigm framing opportunistically as they are next touched.
-- **Kept (Q40):** the Browser Material-3 carve-out in `AI_GOVERNANCE.md` §4 —
-  the Browser remains the one Material island; HIG principles govern
-  everything else.
+- **Browser boundary (Q40):** the temporary host Browser controller may retain
+  its local Material-3 direction while WL-ARCH-008 moves it to `browser-vm`.
+  Construct owns the connection, unavailable, and diagnostic surfaces around
+  the VM only; guest Chromium pixels and chrome receive no Construct styling.
+  HIG principles govern every other Construct-owned surface.
 - **Governance (Q41):** §4 names the HIG-principles standard and this doc;
   ADR appended to `docs/DECISIONS.md`. Carbon is not a required theme or icon
   source; every retained or replacement asset goes through the shared registry
@@ -311,3 +316,55 @@ only as historical evidence. Parallel tracks keep the shared `mde-egui`
 foundation, taskbar/Home cutover, and Car/MG90 work independently verifiable;
 the current Construct taskbar has no legacy Win10 compatibility flag or second
 Start-menu path. WL-UX-001/005 are superseded-retired predecessors.
+
+### 6.1 WL-UX-009 launchable-egui visual inventory
+
+This is a design-authority evidence snapshot, not a second worklist. Its
+machine-checked source is `Surface::ALL` and `SURFACE_VISUAL_INVENTORY` in
+`crates/desktop/mde-shell-egui/src/surfaces.rs`: a new launchable surface cannot
+skip this classification. `Adopted` means a governed primitive is in use;
+`Partial` and `Gap` are remaining work, not completion claims. Shared tooltip
+use is `Adopted` across the catalog because the style-leak gate forbids raw egui
+hover text. Registry licensing remains a `Gap` until the shared asset audit is
+complete, and Dark/Light proof remains `Partial` until deterministic renders
+cover every listed surface.
+
+| Launchable surface | Frame / nav / states / dialogs | Tooltips / icons / motion / lists | Appearance, licensing, and governed boundary |
+|---|---|---|---|
+| Fleet & Mesh | Shared app frame adopted; other chrome partial | Tooltip adopted; icon, motion, and dense-list migration partial | Dark/Light partial; licensing gap; normal Construct workspace |
+| Infra as Code | Shared app frame adopted; other chrome partial | Tooltip adopted; icon, motion, and dense-list migration partial | Dark/Light partial; licensing gap; normal Construct workspace |
+| Remote Sessions | Frame exception while focused | Tooltip adopted; picker/state/motion/list migration partial | Focused VDI keeps full guest pixels; Dark/Light and licensing proof partial/gap |
+| Music | Shared app frame adopted; other chrome partial | Tooltip adopted; icon, motion, and dense-list migration partial | Dark/Light partial; licensing gap; normal Construct workspace |
+| Media | Shared app frame adopted; other chrome partial | Tooltip adopted; icon, motion, and dense-list migration partial | Dark/Light partial; licensing gap; normal Construct workspace |
+| Files | Shared app frame adopted; other chrome partial | Tooltip adopted; icon, motion, and dense-list migration partial | Dark/Light partial; licensing gap; normal Construct workspace |
+| Browser | Shared app frame adopted; guest viewport boundary retained | Tooltip adopted; local controller states/icons/motion/lists partial | Construct owns Browser connection/unavailable/diagnostic chrome; `browser-vm` Chromium remains outside Construct styling |
+| Bookmarks | Shared app frame adopted; other chrome partial | Tooltip adopted; icon, motion, and dense-list migration partial | Dark/Light partial; licensing gap; normal Construct workspace |
+| Maps & Location | Shared app frame adopted; content-color exception | Tooltip adopted; shell chrome, motion, and lists partial | Maps content may retain its palette; Car and Dark/Light proof partial; licensing gap |
+| Terminal | Shared app frame adopted; internal chrome partial | Tooltip adopted; tabs/toolbars/palettes/motion/lists partial | Dark/Light partial; licensing gap; normal Construct workspace |
+| Phones | Shared app frame adopted; other chrome partial | Tooltip adopted; icon, motion, and dense-list migration partial | Dark/Light partial; licensing gap; normal Construct workspace |
+| This Node | Shared app frame adopted; other chrome partial | Tooltip adopted; state/dialog/motion/list migration partial | Dark/Light partial; licensing gap; normal Construct workspace |
+| Mesh Teams | Shared app frame adopted; other chrome partial | Tooltip adopted; frame/state/dialog/motion/list migration partial | Dark/Light partial; licensing gap; normal Construct workspace |
+
+`System`, `Storage`, and `About` are legacy aliases that normalize to `This
+Node`; they are not separate launchable surfaces. The Editor is a Documents-mode
+embed in Mesh Teams, exposed through the always-visible shared Editor taskbar icon
+as a direct launcher alias rather than a second surface authority. The inventory names only
+the three approved rendering boundaries: focused VDI pixels, Maps content color,
+and the Browser VM guest. No other row may claim an exception without updating
+this authority, the registry, and its focused test.
+
+### 6.2 Approved Construct / guest rendering boundaries
+
+These are rendering ownership boundaries, not carve-outs from the shared
+Construct language. Every non-exempt Construct-owned control still uses the
+shared frame, typography, state, tooltip, icon, and motion primitives.
+
+| Surface | Construct owns | Boundary owner | Guardrail |
+|---|---|---|---|
+| Focused VDI | Session picker, attach/reconnect flow, unavailable and diagnostic states, and input/session policy before focus | The attached guest framebuffer | Once focused, guest pixels are full-screen. Construct does not place a frame, status strip, taskbar, tint, or overlay over the guest image; the taskbar auto-hides. |
+| Maps & Location | Workspace frame, rails, controls, sheets, alerts, and provider-state presentation | Map, route, and data-content colours | Cartographic/content colours remain legible and semantically truthful. This does not exempt Maps chrome or its loading, stale, offline, error, and destructive states from Construct primitives. |
+| Browser VM | Browser VM launch/resume, connection, unavailable, reconnect, and diagnostics states | Chromium inside `browser-vm` | Construct never wraps, restyles, or recreates the guest viewport, tabs, toolbar, page UI, media, or dialogs. No host Browser engine/chrome is reintroduced. |
+
+`SurfaceVisualInventory` is the machine-checked companion to this table. Any
+new exception must update both it and the focused test; otherwise it is a normal
+Construct-owned workspace and must converge on the shared primitives.

@@ -31,12 +31,16 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION;
+use mackes_mesh_types::vdi_clipboard::{
+    ClipboardMaterialization, CLIPBOARD_MATERIALIZATION_MAX_AGE_SECS,
+    CLIPBOARD_MATERIALIZATION_TOPIC,
+};
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_egui::{egui, TextClipboard};
 use serde::de::DeserializeOwned;
 
-use mde_collab_egui::{CollabData, CommandSink, CommunicationsSurface};
+use mde_collab_egui::{CollabData, CommandSink, CommunicationsSurface, Mode};
 use mde_collab_types::topics::{self, projection as proj};
 use mde_collab_types::{
     clipboard_clip_id, ActivityFeed, ActorId, AlertInbox, CallState, ChannelTasks,
@@ -73,6 +77,12 @@ const CLIPBOARD_CAPTURE_TOPIC: &str = "event/clipboard/clip";
 /// pin/delete/clear controls must also hit this lane so Mesh Teams edits the
 /// same clipboard history as the Clipboard Viewer.
 const CLIPBOARD_ACTION_PREFIX: &str = "action/clipboard/";
+
+/// The materialization lane is transient and target-seat scoped. Keep the
+/// shell read bounded even if retention has not yet reclaimed old handoffs;
+/// a missing match remains an explicit retryable unavailable state rather than
+/// turning one clipboard read into a full retained-topic scan.
+const MAX_MATERIALIZATION_TAIL: usize = 256;
 
 /// The local seat's wall time in epoch milliseconds (the collab worker's
 /// `now_unix_ms` shape). Injected into [`CollabData::now_unix_ms`] so the surface
@@ -143,6 +153,104 @@ fn read_latest_clipboard_event(
     Ok(Some((message.ulid, clip)))
 }
 
+/// The shell-consumable state of the daemon-authorized target-seat handoff.
+///
+/// `Unavailable` is deliberately not folded into an empty clipboard: the DRM
+/// provider is infallible, but its owner can use `retryable` to distinguish a
+/// handoff that has not arrived (or whose Bus is temporarily unavailable) from
+/// a successfully consumed materialization. No protocol support is implied by
+/// this status; RDP CLIPRDR and SPICE vdagent remain outside this adapter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ClipboardMaterializationStatus {
+    /// A fresh handoff was found for the exact target seat.
+    Available { ulid: String },
+    /// No handoff can currently be consumed by this seat.
+    Unavailable { retryable: bool, reason: String },
+}
+
+impl ClipboardMaterializationStatus {
+    fn unavailable(retryable: bool, reason: impl Into<String>) -> Self {
+        Self::Unavailable {
+            retryable,
+            reason: reason.into(),
+        }
+    }
+}
+
+/// Operator-facing recovery guidance for clipboard mode. A missing or stale
+/// handoff remains visibly unavailable; it is never presented as an empty
+/// clipboard value.
+fn clipboard_materialization_notice(status: &ClipboardMaterializationStatus) -> Option<String> {
+    match status {
+        ClipboardMaterializationStatus::Available { .. } => None,
+        ClipboardMaterializationStatus::Unavailable { retryable, reason } => Some(if *retryable {
+            format!("Clipboard delivery unavailable — retry: {reason}")
+        } else {
+            format!("Clipboard delivery unavailable: {reason}")
+        }),
+    }
+}
+
+/// Read the newest daemon-authorized target-seat handoff. This is a transient
+/// local delivery record, not the replicated clipboard history event; keeping
+/// it on a separate topic prevents a guest→seat paste from being sent back to
+/// every attached VDI session.
+///
+/// The topic is shared by all seats on the node, so `read_latest` is not enough:
+/// a newer handoff for another seat must not hide a still-fresh handoff for this
+/// seat. Scan newest-to-oldest and stop at the newest matching seat record.
+fn read_latest_clipboard_materialization(
+    persist: &Persist,
+    target_seat: &str,
+) -> Result<(Option<(String, String)>, ClipboardMaterializationStatus), String> {
+    let messages = persist
+        .read_tail(CLIPBOARD_MATERIALIZATION_TOPIC, MAX_MATERIALIZATION_TAIL)
+        .map_err(|error| format!("clipboard materialization read failed: {error}"))?;
+    for message in messages.iter().rev() {
+        let Some(body) = message.body.as_deref() else {
+            continue;
+        };
+        let handoff: ClipboardMaterialization = serde_json::from_str(body)
+            .map_err(|error| format!("malformed clipboard materialization: {error}"))?;
+        handoff
+            .validate()
+            .map_err(|error| format!("clipboard materialization validation failed: {error}"))?;
+        let target_matches = handoff.target_seat == target_seat
+            || target_seat
+                .strip_prefix("seat:")
+                .is_some_and(|seat| handoff.target_seat == seat);
+        if !target_matches {
+            continue;
+        }
+        let issued = chrono::DateTime::parse_from_rfc3339(&handoff.time)
+            .map_err(|error| format!("clipboard materialization time is invalid: {error}"))?;
+        let age = chrono::Utc::now()
+            .signed_duration_since(issued)
+            .num_seconds();
+        if !(0..=CLIPBOARD_MATERIALIZATION_MAX_AGE_SECS).contains(&age) {
+            return Ok((
+                None,
+                ClipboardMaterializationStatus::unavailable(
+                    true,
+                    "target-seat clipboard materialization is stale",
+                ),
+            ));
+        }
+        let ulid = message.ulid.clone();
+        return Ok((
+            Some((ulid.clone(), handoff.text.into())),
+            ClipboardMaterializationStatus::Available { ulid },
+        ));
+    }
+    Ok((
+        None,
+        ClipboardMaterializationStatus::unavailable(
+            true,
+            "no fresh target-seat clipboard materialization is available",
+        ),
+    ))
+}
+
 /// The shell-owned text provider for the direct DRM runner.
 ///
 /// A local `CopyText` output enters this provider through [`TextClipboard`], is
@@ -157,9 +265,15 @@ fn read_latest_clipboard_event(
 pub(crate) struct BusTextClipboard {
     bus_root: Option<PathBuf>,
     source: String,
+    /// Session-scoped privacy gate for local → mesh publication. Reads are
+    /// intentionally independent: turning this off never hides or deletes a
+    /// remote event already retained on the canonical lane.
+    local_publishing_enabled: bool,
     cached_text: Option<String>,
     local_write_pending: bool,
     suppressed_bus_ulid: Option<String>,
+    consumed_materialization_ulid: Option<String>,
+    materialization_status: ClipboardMaterializationStatus,
     last_error: Option<String>,
 }
 
@@ -170,9 +284,15 @@ impl BusTextClipboard {
         Self {
             bus_root,
             source: source.into(),
+            local_publishing_enabled: false,
             cached_text: None,
             local_write_pending: false,
             suppressed_bus_ulid: None,
+            consumed_materialization_ulid: None,
+            materialization_status: ClipboardMaterializationStatus::unavailable(
+                true,
+                "clipboard materialization has not been checked",
+            ),
             last_error: None,
         }
     }
@@ -193,16 +313,67 @@ impl BusTextClipboard {
         self.last_error.as_deref()
     }
 
+    /// The last exact-target materialization result observed by the shell.
+    /// `Unavailable { retryable: true, .. }` is the explicit contract for a
+    /// later frame/Bus retry; it is not represented as a clipboard clear.
+    pub(crate) fn materialization_status(&self) -> &ClipboardMaterializationStatus {
+        &self.materialization_status
+    }
+
+    /// Whether this session has explicitly opted into local clipboard
+    /// publication. The default is deliberately off for a new provider.
+    pub(crate) fn local_publishing_enabled(&self) -> bool {
+        self.local_publishing_enabled
+    }
+
+    /// Change the session-only local publication preference. This is a
+    /// control-plane choice, not a clipboard event, so it does not replay the
+    /// current event or create a second wire lane.
+    pub(crate) fn set_local_publishing_enabled(&mut self, enabled: bool) {
+        self.local_publishing_enabled = enabled;
+        self.last_error = None;
+    }
+
     /// Read and materialize the newest valid Bus event.
     fn read_text_checked(&mut self) -> Result<Option<String>, String> {
         let Some(root) = self.bus_root.as_deref() else {
+            self.materialization_status = ClipboardMaterializationStatus::unavailable(
+                true,
+                "local clipboard Bus is unavailable",
+            );
             return Ok(self
                 .local_write_pending
                 .then(|| self.cached_text.clone())
                 .flatten());
         };
-        let persist = Persist::open(root.to_path_buf())
-            .map_err(|error| format!("could not open clipboard Bus: {error}"))?;
+        let persist = match Persist::open(root.to_path_buf()) {
+            Ok(persist) => persist,
+            Err(error) => {
+                self.materialization_status = ClipboardMaterializationStatus::unavailable(
+                    true,
+                    format!("could not open clipboard Bus: {error}"),
+                );
+                return Err(format!("could not open clipboard Bus: {error}"));
+            }
+        };
+
+        let (materialization, status) =
+            read_latest_clipboard_materialization(&persist, &self.source)?;
+        self.materialization_status = status;
+        if let Some((ulid, text)) = materialization {
+            if self.consumed_materialization_ulid.as_deref() != Some(ulid.as_str()) {
+                self.consumed_materialization_ulid = Some(ulid);
+                self.cached_text = (!text.is_empty()).then_some(text.clone());
+                self.local_write_pending = false;
+                return Ok(Some(text));
+            }
+            // A signed handoff is the current clipboard value for this exact
+            // seat, not a one-frame notification. Keep the authorized value
+            // available to repeated DRM paste reads until a newer event or
+            // handoff supersedes it.
+            return Ok(self.cached_text.clone());
+        }
+
         let Some((ulid, clip)) = read_latest_clipboard_event(&persist)? else {
             return Ok(self
                 .local_write_pending
@@ -226,6 +397,13 @@ impl BusTextClipboard {
     /// move-to-top/debounce authority.
     fn write_text_checked(&mut self, text: &str) -> Result<bool, String> {
         let text = normalize_clipboard_text(text);
+        if !self.local_publishing_enabled {
+            // A disabled session must not publish, deduplicate against, or
+            // otherwise rewrite the canonical event. Reads remain fully live,
+            // so remote history is still materialized by `read_text_checked`.
+            self.last_error = None;
+            return Ok(false);
+        }
         if text.is_empty() {
             let latest = self
                 .bus_root
@@ -743,6 +921,13 @@ impl CommunicationsState {
         }
     }
 
+    /// Focus the embedded editor without creating a second editor surface. The
+    /// taskbar's Editor icon is therefore a direct route to the real Documents
+    /// mode and preserves the existing Communications ownership boundary.
+    pub(crate) fn open_editor(&mut self) {
+        self.surface.open_editor();
+    }
+
     /// Re-fold the `state/collab/*` mirrors on the poll cadence (the shell calls
     /// this while Communications is the surface in view).
     pub(crate) fn poll(&mut self, ctx: &egui::Context) {
@@ -761,6 +946,25 @@ impl CommunicationsState {
         &mut self.clipboard
     }
 
+    /// Expose the target-seat handoff result to the shell owner. A caller can
+    /// render `Unavailable { retryable: true, .. }` as a retry affordance
+    /// without treating the infallible [`TextClipboard`] read as a successful
+    /// empty paste.
+    pub(crate) fn clipboard_materialization_status(&self) -> &ClipboardMaterializationStatus {
+        self.clipboard.materialization_status()
+    }
+
+    /// Read the session-scoped local clipboard publication preference.
+    pub(crate) fn clipboard_publishing_enabled(&self) -> bool {
+        self.clipboard.local_publishing_enabled()
+    }
+
+    /// Opt this session into or out of local clipboard publication. Disabling
+    /// only gates future local writes; it never clears the remote read model.
+    pub(crate) fn set_clipboard_publishing_enabled(&mut self, enabled: bool) {
+        self.clipboard.set_local_publishing_enabled(enabled);
+    }
+
     /// Render the surface and route the frame's emitted commands. The widget reads
     /// [`self.data`](LiveCollabData) and pushes intent into a per-frame
     /// [`CommandSink`]; this drains the sink and publishes each command onto
@@ -768,7 +972,21 @@ impl CommunicationsState {
     pub(crate) fn show(&mut self, ui: &mut egui::Ui) {
         let mut sink = CommandSink::new();
         let selected_before = self.surface.selected_space();
+        self.surface
+            .set_clipboard_publishing_enabled(self.clipboard_publishing_enabled());
+        if self.surface.mode() == Mode::Clipboard {
+            if let Some(notice) =
+                clipboard_materialization_notice(self.clipboard_materialization_status())
+            {
+                ui.colored_label(mde_egui::Style::WARN, notice);
+                ui.add_space(mde_egui::Style::SP_S);
+            }
+        }
         self.surface.ui(ui, &self.data, &mut sink);
+        let surface_clipboard_preference = self.surface.clipboard_publishing_enabled();
+        if surface_clipboard_preference != self.clipboard_publishing_enabled() {
+            self.set_clipboard_publishing_enabled(surface_clipboard_preference);
+        }
         let selected_after = self.surface.selected_space();
         if selected_after != selected_before {
             self.data.refresh_for(selected_after);
@@ -1588,6 +1806,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let persist = persist_at(dir.path());
         let mut local = BusTextClipboard::new(Some(dir.path().to_path_buf()), "seat:dell");
+        local.set_local_publishing_enabled(true);
 
         local.write_text("one\r\ntwo");
         assert!(local.last_error().is_none(), "local copy should publish");
@@ -1632,6 +1851,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let persist = persist_at(dir.path());
         let mut clipboard = BusTextClipboard::new(Some(dir.path().to_path_buf()), "seat:dell");
+        clipboard.set_local_publishing_enabled(true);
 
         clipboard.write_text("same text");
         let first = persist
@@ -1683,6 +1903,7 @@ mod tests {
         let persist = persist_at(dir.path());
         let prefix = "a".repeat(MAX_CLIPBOARD_TEXT_BYTES - 1);
         let mut clipboard = BusTextClipboard::new(Some(dir.path().to_path_buf()), "seat:dell");
+        clipboard.set_local_publishing_enabled(true);
 
         clipboard.write_text(&format!("{prefix}é"));
         let materialized = clipboard.read_text().expect("bounded local text");
@@ -1706,5 +1927,161 @@ mod tests {
             "malformed remote text is not materialized"
         );
         assert!(fresh.last_error().is_some());
+    }
+
+    #[test]
+    fn clipboard_publishing_is_opt_in_and_does_not_replay_or_hide_remote_history() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let persist = persist_at(dir.path());
+        let mut clipboard = BusTextClipboard::new(Some(dir.path().to_path_buf()), "seat:dell");
+
+        assert!(!clipboard.local_publishing_enabled());
+        clipboard.write_text("local before opt-in");
+        assert!(
+            persist
+                .read_latest(CLIPBOARD_CAPTURE_TOPIC)
+                .expect("read disabled lane")
+                .is_none(),
+            "a new session must not publish local clipboard text by default"
+        );
+
+        let remote = ClipboardClipBody::from_text(
+            "remote history",
+            "seat:other",
+            "2026-07-30T12:00:00Z",
+        );
+        persist
+            .write(
+                CLIPBOARD_CAPTURE_TOPIC,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&remote).expect("encode remote event")),
+            )
+            .expect("write remote event");
+        assert_eq!(
+            clipboard.read_text().as_deref(),
+            Some("remote history"),
+            "disabling local publication must not hide remote clipboard history"
+        );
+
+        clipboard.set_local_publishing_enabled(true);
+        assert!(clipboard.local_publishing_enabled());
+        clipboard.write_text("new local entry");
+        let events = persist
+            .list_since(CLIPBOARD_CAPTURE_TOPIC, None)
+            .expect("list clipboard events");
+        assert_eq!(events.len(), 2, "opt-in publishes only the new local entry");
+
+        clipboard.set_local_publishing_enabled(false);
+        clipboard.write_text("local after opt-out");
+        let events_after_disable = persist
+            .list_since(CLIPBOARD_CAPTURE_TOPIC, None)
+            .expect("list events after opt-out");
+        assert_eq!(
+            events_after_disable.len(),
+            2,
+            "disabling stops future local publication without rewriting history"
+        );
+        assert_eq!(
+            clipboard.read_text().as_deref(),
+            Some("new local entry"),
+            "the retained remote event remains readable after opt-out"
+        );
+    }
+
+    #[test]
+    fn daemon_materialization_is_targeted_bounded_and_retained_until_superseded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let persist = persist_at(dir.path());
+        let handoff = ClipboardMaterialization::new(
+            "eagle",
+            mackes_mesh_types::vdi_clipboard::VdiClipboardText::new("guest→seat")
+                .expect("bounded text"),
+            "vdi-action:eagle",
+            chrono::Utc::now().to_rfc3339(),
+        );
+        persist
+            .write(
+                CLIPBOARD_MATERIALIZATION_TOPIC,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&handoff).expect("encode handoff")),
+            )
+            .expect("write handoff");
+
+        let mut clipboard = BusTextClipboard::new(Some(dir.path().to_path_buf()), "seat:eagle");
+        assert_eq!(clipboard.read_text().as_deref(), Some("guest→seat"));
+        assert!(matches!(
+            clipboard.materialization_status(),
+            ClipboardMaterializationStatus::Available { .. }
+        ));
+        assert_eq!(
+            clipboard.read_text().as_deref(),
+            Some("guest→seat"),
+            "the authorized target-seat value remains the current clipboard across DRM frames"
+        );
+        let mut other = BusTextClipboard::new(Some(dir.path().to_path_buf()), "seat:other");
+        assert_eq!(other.read_text(), None, "handoff must not cross target seats");
+    }
+
+    #[test]
+    fn newer_other_seat_materialization_does_not_hide_target_seat_handoff() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let persist = persist_at(dir.path());
+        for (seat, text) in [("eagle", "for eagle"), ("other", "for other")] {
+            let handoff = ClipboardMaterialization::new(
+                seat,
+                mackes_mesh_types::vdi_clipboard::VdiClipboardText::new(text)
+                    .expect("bounded text"),
+                format!("vdi-action:{seat}"),
+                chrono::Utc::now().to_rfc3339(),
+            );
+            persist
+                .write(
+                    CLIPBOARD_MATERIALIZATION_TOPIC,
+                    Priority::Default,
+                    None,
+                    Some(&serde_json::to_string(&handoff).expect("encode handoff")),
+                )
+                .expect("write handoff");
+        }
+
+        let mut clipboard = BusTextClipboard::new(Some(dir.path().to_path_buf()), "seat:eagle");
+        assert_eq!(clipboard.read_text().as_deref(), Some("for eagle"));
+        assert!(matches!(
+            clipboard.materialization_status(),
+            ClipboardMaterializationStatus::Available { .. }
+        ));
+    }
+
+    #[test]
+    fn missing_materialization_exposes_retryable_shell_status() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut clipboard = BusTextClipboard::new(Some(dir.path().to_path_buf()), "seat:eagle");
+        assert_eq!(clipboard.read_text(), None);
+        assert!(matches!(
+            clipboard.materialization_status(),
+            ClipboardMaterializationStatus::Unavailable {
+                retryable: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn materialization_notice_is_silent_when_available_and_actionable_when_missing() {
+        assert_eq!(
+            clipboard_materialization_notice(&ClipboardMaterializationStatus::Available {
+                ulid: "01J00000000000000000000000".to_string(),
+            }),
+            None
+        );
+        assert_eq!(
+            clipboard_materialization_notice(&ClipboardMaterializationStatus::Unavailable {
+                retryable: true,
+                reason: "no fresh target-seat clipboard materialization is available".to_string(),
+            }),
+            Some("Clipboard delivery unavailable — retry: no fresh target-seat clipboard materialization is available".to_string())
+        );
     }
 }

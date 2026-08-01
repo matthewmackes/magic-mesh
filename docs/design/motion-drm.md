@@ -6,6 +6,11 @@ drag-release settle slices, 2026-07-16. This note reconciles the operator's
 questionnaire-complete motion direction in `docs/WORKLIST.md` with the current
 egui/DRM code before invasive edits.
 
+**Current motion direction (2026-07-30):** Apple-like expressive effects,
+interruptible springs, spatial transitions, and polished feedback are the normal
+product path. `Reduced` and `Disabled` modes remain implementation compatibility
+paths, but reduced motion is not a core feature, design axis, or acceptance gate.
+
 ## Current Map
 
 The production shell is a single egui app on the DRM/KMS seat. The render loop is
@@ -18,12 +23,14 @@ return to idle.
 Shared motion lives in `crates/shared/mde-egui/src/motion.rs`. It already has:
 
 - Duration constants: `FAST = 0.08`, `BASE = 0.18`, `SLOW = 0.32`.
-- Runtime modes: `MotionMode::{Normal, Reduced, Disabled}`, with the older
-  boolean reduce-motion setter kept as compatibility.
+- Runtime modes: `MotionMode::{Normal, Reduced, Disabled}`. `Normal` is the
+  product default; `Reduced`/`Disabled` and the older boolean setter remain
+  compatibility paths rather than core design requirements.
 - Named production presets: `Control`, `Panel`, `Popover`, `Dialog`, `Page`,
   `Layout`, and `DragSettle`.
 - `MotionSpec`, `MotionEasing`, `Phase`, and `Animated<T>` carriers for scalar,
-  2D, size, rect, opacity, scale, and color interpolation.
+  2D, size, rect, opacity, scale, and color interpolation, including
+  expressive spring/effect combinations.
 - `animate`, `animate_value`, and typed stable-ID drivers that request repaint
   while active and stop once settled.
 - `Spring::{SNAPPY,GENTLE}`, `spring_to`, rest detection, and frame-delta clamping.

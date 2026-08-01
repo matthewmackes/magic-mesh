@@ -424,7 +424,7 @@ fn show_status(ui: &mut egui::Ui, status: &CtrlStatus) {
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            ui.group(|ui| show_controller(ui, status));
+            mde_egui::card().show(ui, |ui| show_controller(ui, status));
             ui.add_space(Style::SP_S);
 
             ui.label(
@@ -432,7 +432,7 @@ fn show_status(ui: &mut egui::Ui, status: &CtrlStatus) {
                     .color(Style::TEXT_DIM)
                     .size(Style::SMALL),
             );
-            ui.group(|ui| show_control_services(ui, status));
+            mde_egui::card().show(ui, |ui| show_control_services(ui, status));
             ui.add_space(Style::SP_S);
 
             // Honest boundary (§6/§7): live consensus telemetry isn't on this

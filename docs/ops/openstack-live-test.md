@@ -1,5 +1,11 @@
 # OpenStack create→verify→delete live test (WL-TEST-001)
 
+> **HISTORICAL / SUPERSEDED (2026-07-30):** Do not run this retired OpenStack
+> live test. It is retained as evidence of the former backend contract. Current
+> VM lifecycle verification uses typed Workloads contracts and the local
+> libvirt/QEMU-KVM path; see `docs/design/platform-interfaces.md` and the active
+> `WL-CRIT-006` evidence plan.
+
 The offline OpenStack contract tests
 (`crates/mesh/mackesd/src/workers/openstack/client/contract.rs`) pin the client's
 request shapes and response parsers against canonical fixtures — they never touch

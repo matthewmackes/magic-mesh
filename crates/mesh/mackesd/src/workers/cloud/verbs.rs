@@ -23,6 +23,7 @@ use mackes_mesh_types::cloud::{
     CloudReply, LifecycleAction, CLOUD_ACTION_SCHEMA_VERSION, CLOUD_ARM_NODE_SCOPE,
     VERB_ANDROID_PROVISION, VERB_BROWSER_PROVISION, VERB_CONSOLE_ATTACH, VERB_CONTAINER_DEPLOY,
     VERB_IMAGE_BUILD, VERB_INVENTORY, VERB_OUTPUT, VERB_PLAN, VERB_SET_DESIRED,
+    VERB_APP_PROVISION,
 };
 
 use super::runner::CloudRunOutcome;
@@ -36,9 +37,11 @@ pub(crate) const MAX_CLOUD_ACTION_BODY_BYTES: usize = crate::ipc::MAX_RPC_BODY_B
 mod container;
 mod container_lifecycle;
 mod image;
+mod app_image;
 // Disjoint per-verb handler modules (one unit each owns its file).
 mod android; // U9 · android-provision
 mod browser; // WL-ARCH-008 · browser-provision
+mod app; // WL-FUNC-018 · app-provision
 mod console; // U8 · console-attach
 mod inventory; // U10 · inventory + output
 
@@ -90,6 +93,8 @@ pub(crate) enum CloudVerb {
     AndroidProvision,
     /// `browser-provision` — declare the dedicated Desktop VM browser workload.
     BrowserProvision,
+    /// `app-provision` — declare one admitted guest-owned Flatpak App VM.
+    AppProvision,
 }
 
 impl CloudVerb {
@@ -127,6 +132,7 @@ impl CloudVerb {
             v if v == VERB_CONSOLE_ATTACH => Self::ConsoleAttach,
             v if v == VERB_ANDROID_PROVISION => Self::AndroidProvision,
             v if v == VERB_BROWSER_PROVISION => Self::BrowserProvision,
+            v if v == VERB_APP_PROVISION => Self::AppProvision,
             _ => return None,
         })
     }
@@ -152,6 +158,7 @@ impl CloudVerb {
                 | Self::ConsoleAttach
                 | Self::AndroidProvision
                 | Self::BrowserProvision
+                | Self::AppProvision
         )
     }
 
@@ -201,6 +208,24 @@ pub(crate) struct CloudActionBody {
     /// A verb-specific workload name (Android provision and console attach).
     #[serde(default)]
     pub name: Option<String>,
+    /// Stable reverse-DNS Flatpak identity for `app-provision`.
+    #[serde(default)]
+    pub app_id: Option<String>,
+    /// Signed catalog revision selected for the launch.
+    #[serde(default)]
+    pub catalog_revision: Option<String>,
+    /// Approved named guest profile.
+    #[serde(default)]
+    pub guest_profile: Option<String>,
+    /// Capabilities requested by the app declaration.
+    #[serde(default)]
+    pub requested_capabilities: Vec<String>,
+    /// Stable session identity used to converge repeated launches.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Resume an existing guest session when available.
+    #[serde(default)]
+    pub resume: bool,
     /// The armed-token capability authorizing a live mutation (mesh-identity-signed).
     #[serde(default)]
     pub armed_token: Option<String>,
@@ -368,6 +393,23 @@ pub(crate) fn dispatch(w: &CloudWorker, verb_name: &str, body_str: &str) -> Clou
                 return reply;
             }
             browser::handle(w, verb_name, &body)
+        }
+        CloudVerb::AppProvision => {
+            let target = match app::authorization_target(&body) {
+                Ok(target) => target,
+                Err(error) => {
+                    return CloudReply {
+                        ok: false,
+                        verb: verb_name.to_string(),
+                        error: Some(error),
+                        ..Default::default()
+                    }
+                }
+            };
+            if let Some(reply) = authorization_refusal(w, verb_name, &body, &target, raw) {
+                return reply;
+            }
+            app::handle(w, verb_name, &body)
         }
 
         // ── implemented MUTATIONS — the armed-token gate ──
@@ -737,6 +779,10 @@ mod tests {
             Some(CloudVerb::BrowserProvision)
         );
         assert_eq!(
+            CloudVerb::from_verb("app-provision"),
+            Some(CloudVerb::AppProvision)
+        );
+        assert_eq!(
             CloudVerb::from_verb("container-restart"),
             Some(CloudVerb::ContainerRestart)
         );
@@ -763,6 +809,7 @@ mod tests {
         assert!(CloudVerb::SetDesired.is_mutation());
         assert!(CloudVerb::AndroidProvision.is_mutation());
         assert!(CloudVerb::BrowserProvision.is_mutation());
+        assert!(CloudVerb::AppProvision.is_mutation());
         assert!(CloudVerb::ContainerRestart.is_mutation());
         assert!(!CloudVerb::ContainerLogs.is_mutation());
         assert!(CloudVerb::ContainerDestroy.is_mutation());

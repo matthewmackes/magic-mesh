@@ -81,6 +81,7 @@ fn workload(name: &str, delivery_type: DeliveryType, status: &str) -> WorkloadRo
         disk_gb: 40,
         reachable: true,
         drift: DriftFlag::InSync,
+        app: None,
     }
 }
 
@@ -841,6 +842,7 @@ fn set_desired_emits_the_worker_envelope_instead_of_a_bare_spec() {
         image: Some("construct-desktop".to_string()),
         network_isolation: true,
         raw_hcl: None,
+        app: None,
     };
 
     state.set_desired(&spec);

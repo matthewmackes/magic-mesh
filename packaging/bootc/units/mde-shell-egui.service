@@ -33,9 +33,11 @@ Wants=mackesd.service
 Conflicts=getty@tty1.service
 Before=getty.target
 # The shell IS the UI — keep bringing it back, but don't tight-loop a broken
-# GPU stack forever; the getty ExecStopPost below restores a console either way.
+# GPU stack forever. Console recovery runs only after systemd declares this
+# unit failed; it must not race a normal automatic restart for tty1.
 StartLimitIntervalSec=60
 StartLimitBurst=5
+OnFailure=getty@tty1.service
 
 [Service]
 Type=simple
@@ -73,9 +75,9 @@ DelegateSubgroup=shell
 Environment=MDE_WEB_SANDBOX_DELEGATE_SUBGROUP=shell
 Restart=always
 RestartSec=2
-# If the shell gives up (start-limit hit / GPU dead), hand the VT to a getty so
-# the box is still administrable at the console.
-ExecStopPost=-/usr/bin/systemctl start getty@tty1.service
+# `OnFailure=getty@tty1.service` above restores the console only after the
+# restart policy is exhausted. Do not use ExecStopPost here: it runs on every
+# Ctrl-C/SIGTERM exit and can race the restarting DRM shell for tty1/input.
 
 [Install]
 WantedBy=multi-user.target graphical.target

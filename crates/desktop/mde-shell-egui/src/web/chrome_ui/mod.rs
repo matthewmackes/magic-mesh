@@ -5080,6 +5080,11 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                             tab_label(tab)
                         };
                         let status_chips = tab_status_chips(tab);
+                        // Reserve the fill before either card row paints, so the
+                        // alternating band remains behind its controls and never
+                        // changes the existing click/drag ownership.
+                        let zebra_band = ui.painter().add(egui::Shape::Noop);
+                        let mut card_rect: Option<egui::Rect> = None;
                         ui.horizontal(|ui| {
                             let width = if tab.pinned {
                                 CHROME_TAB_PINNED_W
@@ -5096,6 +5101,7 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                                 favicon.as_ref(),
                                 &status_chips,
                             );
+                            card_rect = Some(resp.rect);
                             let settle_motion =
                                 tab_drag_settle_motion(ui.ctx(), tab.id, TabAxis::Vertical);
                             pill_rects.push((idx, resp.rect));
@@ -5313,6 +5319,42 @@ fn vertical_tab_strip(ui: &mut egui::Ui, state: &mut WebState) {
                                 close = Some(idx);
                             }
                         });
+                        // The secondary row carries truthful live state rather
+                        // than duplicating the tab model or inventing an action.
+                        // It gives the narrower rail a stable two-row rhythm.
+                        let (summary_rect, _) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), CHROME_TAB_H),
+                            egui::Sense::hover(),
+                        );
+                        let summary = if tab.pinned {
+                            "Pinned"
+                        } else if tab.session.audible() {
+                            "Playing audio"
+                        } else {
+                            "Ready"
+                        };
+                        ui.painter().text(
+                            egui::pos2(
+                                summary_rect.left() + CHROME_GAP * 2.0,
+                                summary_rect.center().y,
+                            ),
+                            egui::Align2::LEFT_CENTER,
+                            summary,
+                            font_id(CHROME_FONT - 1.0),
+                            CHROME_TEXT_DIM,
+                        );
+                        if let Some(top) = card_rect {
+                            let card = top.union(summary_rect);
+                            let fill = if idx % 2 == 0 {
+                                state_layer(CHROME_SURFACE, CHROME_PRIMARY, 18)
+                            } else {
+                                CHROME_SURFACE_CONTAINER
+                            };
+                            ui.painter().set(
+                                zebra_band,
+                                egui::Shape::rect_filled(card, CHROME_TAB_RADIUS, fill),
+                            );
+                        }
                     }
                     tab_search_menu(ui, state);
                 });
@@ -8950,7 +8992,7 @@ pub(super) fn cached_offline_body(
                         .color(CHROME_TEXT),
                 );
                 ui.label(
-                    RichText::new("Ready")
+                    RichText::new("Cached · not live")
                         .size(Style::SMALL)
                         .color(CHROME_TEXT_DIM),
                 );
@@ -14158,12 +14200,21 @@ mod tests {
         mde_egui::fonts::install(&ctx);
         let result = offline_cache_result_fixture();
         let out = render_body_frame(&ctx, |ui| {
-            cached_offline_body(ui, &result, None);
+            cached_offline_body(ui, &result, Some("guest page stopped"));
         });
         let texts = painted_text(&out.shapes);
 
         assert_painted_text_color(&texts, "Offline copy", CHROME_TEXT);
-        assert_painted_text_color(&texts, "Ready", CHROME_TEXT_DIM);
+        assert_painted_text_color(&texts, "Cached · not live", CHROME_TEXT_DIM);
+        assert_painted_text_color(
+            &texts,
+            "Live page unavailable: guest page stopped",
+            CHROME_WARN,
+        );
+        assert!(
+            !texts.iter().any(|(text, _)| text == "Ready"),
+            "guest-unavailable cached body must not claim readiness: {texts:?}"
+        );
         assert_painted_text_color(&texts, "Example archive", CHROME_TEXT_DIM);
         assert_painted_text_color(&texts, "Text 15 chars", CHROME_TEXT_DIM);
         assert_painted_text_color(&texts, "Saved now", CHROME_TEXT_DIM);
@@ -14174,7 +14225,7 @@ mod tests {
                 let lower = text.to_ascii_lowercase();
                 !lower.contains("mhtml")
                     && !lower.contains("01harchivecopy")
-                    && !lower.contains("cached ")
+                    && !lower.contains("cache-")
                     && !lower.contains("tab ")
                     && !lower.contains("cef")
                     && !lower.contains("servo")

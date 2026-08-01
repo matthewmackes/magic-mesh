@@ -2,7 +2,8 @@
 //!
 //! The shell's unified Front Door lets an operator pick an app a *peer* node
 //! advertises and launch it there. Front Door only PUBLISHES that intent — a
-//! fire-and-forget `action/apps/launch` message carrying `{node, app_id, name}`
+//! fire-and-forget `action/apps/launch` message carrying `{node, app_id, name,
+//! source, mode}`
 //! (`front_door::peer_app_launch_wire`). Before this worker nothing on the target
 //! node consumed it, so the request was inert. This worker is the missing
 //! consumer: it runs on **every workstation node**, drains `action/apps/launch`,
@@ -47,6 +48,7 @@ use mde_bus::persist::Persist;
 
 use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
 use crate::ipc::apps::{default_app_dirs, scan_local_apps, AppEntry};
+use mackes_mesh_types::vdi_session::{AppVmLaunchRequest, SessionRequest};
 
 use super::{ShutdownToken, Worker};
 
@@ -63,12 +65,73 @@ pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// may resolve) and the requested catalog id.
 const PEER_APP_LAUNCH_AUTH_VERB: &str = "peer-app-launch";
 
+/// Stable audit reason for refusing a guest-owned Flatpak at this legacy host
+/// launcher. Keep this machine-readable so operators can distinguish policy
+/// refusal from a missing catalog entry or a failed process spawn.
+pub const FLATPAK_LEGACY_LAUNCH_REFUSAL_REASON: &str =
+    "guest-owned-flatpak-cannot-use-legacy-host-launcher";
+
+/// The catalog provenance carried on the launch wire. `Flatpak` is guest-owned
+/// and must never be handed to this worker's host `.desktop` launcher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchSource {
+    /// A normal host/XDG `.desktop` application.
+    Xdg,
+    /// A guest-owned Flatpak application.
+    Flatpak,
+}
+
+impl LaunchSource {
+    fn parse(raw: Option<&str>) -> Option<Self> {
+        match raw?.trim().to_ascii_lowercase().as_str() {
+            "xdg" => Some(Self::Xdg),
+            "flatpak" => Some(Self::Flatpak),
+            _ => None,
+        }
+    }
+
+    const fn wire(self) -> &'static str {
+        match self {
+            Self::Xdg => "xdg",
+            Self::Flatpak => "flatpak",
+        }
+    }
+}
+
+/// The execution plane requested by Front Door. This worker implements only
+/// the legacy host plane; guest App VM execution belongs to a later worker and
+/// must not silently fall through here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchMode {
+    /// Execute a validated host `.desktop` entry through this worker.
+    LegacyHost,
+    /// Route a guest-owned app through an App VM launcher (not implemented here).
+    GuestAppVm,
+}
+
+impl LaunchMode {
+    fn parse(raw: Option<&str>) -> Option<Self> {
+        match raw?.trim().to_ascii_lowercase().as_str() {
+            "legacy-host" => Some(Self::LegacyHost),
+            "guest-app-vm" => Some(Self::GuestAppVm),
+            _ => None,
+        }
+    }
+
+    const fn wire(self) -> &'static str {
+        match self {
+            Self::LegacyHost => "legacy-host",
+            Self::GuestAppVm => "guest-app-vm",
+        }
+    }
+}
+
 // ───────────────────────────── request model ─────────────────────────────
 
-/// A parsed `action/apps/launch` request. Only the three wire fields the shell's
-/// `front_door::peer_app_launch_wire` publishes; `app_id` is an opaque catalog id,
-/// NEVER a command line.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// A parsed `action/apps/launch` request. `app_id` is an opaque catalog id,
+/// NEVER a command line. `source` and `mode` are policy fields, not hints: they
+/// determine which execution plane may receive the request.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchRequest {
     /// The target node this launch is addressed to.
     pub node: String,
@@ -76,6 +139,24 @@ pub struct LaunchRequest {
     pub app_id: String,
     /// The display name (advisory — for logs only; never used to resolve).
     pub name: String,
+    /// The catalog provenance asserted by the publisher.
+    pub source: LaunchSource,
+    /// The execution plane asserted by the publisher.
+    pub mode: LaunchMode,
+    /// Stable session identity required for a guest App VM launch.
+    pub session_id: Option<String>,
+    /// Explicit admitted App VM identity; placement is never guessed here.
+    pub vm_id: Option<String>,
+    /// Signed catalog revision required for guest resolution.
+    pub catalog_revision: Option<String>,
+    /// Named guest profile, never an image path or command.
+    pub guest_profile: Option<String>,
+    /// Capabilities requested by the catalog/policy.
+    pub requested_capabilities: Vec<String>,
+    /// Whether the guest session should resume when available.
+    pub resume: bool,
+    /// Shell peer that will drive the application surface.
+    pub client_peer: Option<String>,
 }
 
 impl LaunchRequest {
@@ -87,8 +168,11 @@ impl LaunchRequest {
     }
 }
 
-/// Parse one `action/apps/launch` body. `None` for non-JSON or a request missing a
-/// `node` or `app_id` — a malformed request is refused, never guessed.
+/// Parse one `action/apps/launch` body. `None` for non-JSON, an unknown explicit
+/// source/mode, or a request missing a `node` or `app_id` — a malformed request
+/// is refused, never guessed. Missing source/mode remain temporarily compatible
+/// with older normal catalog publishers as `xdg` + `legacy-host`; catalog-source
+/// matching below still prevents a Flatpak from using that compatibility path.
 #[must_use]
 pub fn parse_launch_request(body: &str) -> Option<LaunchRequest> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
@@ -107,10 +191,104 @@ pub fn parse_launch_request(body: &str) -> Option<LaunchRequest> {
         .unwrap_or("")
         .trim()
         .to_owned();
+    let source = v
+        .get("source")
+        .and_then(serde_json::Value::as_str)
+        .map_or(Some(LaunchSource::Xdg), |raw| {
+            LaunchSource::parse(Some(raw))
+        })?;
+    let mode = v
+        .get("mode")
+        .and_then(serde_json::Value::as_str)
+        .map_or(Some(LaunchMode::LegacyHost), |raw| {
+            LaunchMode::parse(Some(raw))
+        })?;
     Some(LaunchRequest {
         node: node.to_owned(),
         app_id: app_id.to_owned(),
         name,
+        source,
+        mode,
+        session_id: v
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned),
+        vm_id: v
+            .get("vm_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned),
+        catalog_revision: v
+            .get("catalog_revision")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned),
+        guest_profile: v
+            .get("guest_profile")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned),
+        requested_capabilities: v
+            .get("requested_capabilities")
+            .and_then(serde_json::Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        resume: v
+            .get("resume")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        client_peer: v
+            .get("client_peer")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned),
+    })
+}
+
+/// Convert an authorized guest launch envelope into the existing VDI session
+/// verb. No placement is selected and no Bus write occurs here; callers must
+/// publish the returned request through the normal signed session-action path.
+#[must_use]
+pub fn app_vm_session_request(req: &LaunchRequest) -> Option<SessionRequest> {
+    if req.source != LaunchSource::Flatpak || req.mode != LaunchMode::GuestAppVm {
+        return None;
+    }
+    let session_id = req.session_id.clone()?;
+    let vm_id = req.vm_id.clone()?;
+    let catalog_revision = req.catalog_revision.clone()?;
+    let guest_profile = req.guest_profile.clone()?;
+    let client_peer = req.client_peer.clone()?;
+    AppVmLaunchRequest::new(
+        req.app_id.clone(),
+        catalog_revision.clone(),
+        guest_profile.clone(),
+        req.requested_capabilities.clone(),
+        session_id.clone(),
+        req.resume,
+    )
+    .ok()?;
+    Some(SessionRequest::OpenApp {
+        id: session_id,
+        serving_peer: req.node.clone(),
+        vm_id,
+        client_peer,
+        app_id: req.app_id.clone(),
+        catalog_revision,
+        guest_profile,
+        requested_capabilities: req.requested_capabilities.clone(),
+        resume: req.resume,
     })
 }
 
@@ -296,6 +474,64 @@ impl PeerAppLaunchWorker {
             .find(|entry| entry.id == app_id)
     }
 
+    /// Enforce the legacy launcher's source/mode boundary before it can reach
+    /// [`AppLauncher`]. Flatpak is guest-owned even when a matching exported
+    /// `.desktop` file is visible on the host, so it is never resolved into a
+    /// host process here.
+    fn legacy_launch_allowed(&self, req: &LaunchRequest, app: &AppEntry) -> bool {
+        if req.source == LaunchSource::Flatpak {
+            tracing::warn!(
+                target: "mackesd::peer_app_launch",
+                node = %req.node,
+                app_id = %req.app_id,
+                source = req.source.wire(),
+                mode = req.mode.wire(),
+                reason = FLATPAK_LEGACY_LAUNCH_REFUSAL_REASON,
+                "peer_app_launch: REFUSED — {FLATPAK_LEGACY_LAUNCH_REFUSAL_REASON}",
+            );
+            return false;
+        }
+        if req.mode != LaunchMode::LegacyHost {
+            tracing::warn!(
+                target: "mackesd::peer_app_launch",
+                node = %req.node,
+                app_id = %req.app_id,
+                source = req.source.wire(),
+                mode = req.mode.wire(),
+                reason = "unsupported-launch-mode-on-legacy-host",
+                "peer_app_launch: REFUSED — launch mode is not supported by the legacy host launcher",
+            );
+            return false;
+        }
+        if app.source.trim().eq_ignore_ascii_case("flatpak") {
+            tracing::warn!(
+                target: "mackesd::peer_app_launch",
+                node = %req.node,
+                app_id = %req.app_id,
+                request_source = req.source.wire(),
+                catalog_source = %app.source,
+                mode = req.mode.wire(),
+                reason = FLATPAK_LEGACY_LAUNCH_REFUSAL_REASON,
+                "peer_app_launch: REFUSED — catalog source is guest-owned Flatpak, not a host app",
+            );
+            return false;
+        }
+        if !app.source.trim().eq_ignore_ascii_case(req.source.wire()) {
+            tracing::warn!(
+                target: "mackesd::peer_app_launch",
+                node = %req.node,
+                app_id = %req.app_id,
+                request_source = req.source.wire(),
+                catalog_source = %app.source,
+                mode = req.mode.wire(),
+                reason = "launch-source-does-not-match-catalog",
+                "peer_app_launch: REFUSED — request source does not match the advertised catalog entry",
+            );
+            return false;
+        }
+        true
+    }
+
     /// Handle one parsed request: enforce the node-target gate and the catalog
     /// allowlist, then launch. Returns `true` iff an app was actually launched.
     /// Pure over the injected launcher, so it is fully unit-tested.
@@ -315,6 +551,9 @@ impl PeerAppLaunchWorker {
             );
             return false;
         };
+        if !self.legacy_launch_allowed(req, &app) {
+            return false;
+        }
         let Some(argv) = launch_argv(&app.exec) else {
             tracing::warn!(
                 target: "mackesd::peer_app_launch",
@@ -454,6 +693,18 @@ mod tests {
         .unwrap();
     }
 
+    fn seed_flatpak_app(home: &Path, id: &str, exec: &str) {
+        let dir = home
+            .join(".local")
+            .join("share/flatpak/exports/share/applications");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{id}.desktop")),
+            format!("[Desktop Entry]\nType=Application\nName={id}\nExec={exec}\n"),
+        )
+        .unwrap();
+    }
+
     fn worker_with(home: PathBuf, launcher: Arc<RecordingLauncher>) -> PeerAppLaunchWorker {
         PeerAppLaunchWorker::new("node-a".to_string())
             .with_home(home)
@@ -462,8 +713,9 @@ mod tests {
 
     fn launch_body(app_id: &str, nonce: &str) -> (String, tempfile::TempDir) {
         let auth_root = tempfile::tempdir().unwrap();
-        let unsigned =
-            format!(r#"{{"node":"node-a","app_id":"{app_id}","name":"Test","schema_version":1}}"#);
+        let unsigned = format!(
+            r#"{{"node":"node-a","app_id":"{app_id}","name":"Test","source":"xdg","mode":"legacy-host","schema_version":1}}"#
+        );
         let armed = authorize_test_body(
             AUTH_KEY,
             &unsigned,
@@ -496,11 +748,16 @@ mod tests {
         assert!(parse_launch_request(r#"{"node":"node-a"}"#).is_none());
         assert!(parse_launch_request(r#"{"app_id":"firefox"}"#).is_none());
         assert!(parse_launch_request(r#"{"node":"","app_id":"firefox"}"#).is_none());
-        let ok = parse_launch_request(r#"{"node":"node-a","app_id":"firefox","name":"Firefox"}"#)
+        let ok = parse_launch_request(
+            r#"{"node":"node-a","app_id":"firefox","name":"Firefox","source":"xdg","mode":"legacy-host"}"#,
+        )
             .expect("valid request parses");
         assert_eq!(ok.node, "node-a");
         assert_eq!(ok.app_id, "firefox");
         assert_eq!(ok.name, "Firefox");
+        assert_eq!(ok.source, LaunchSource::Xdg);
+        assert_eq!(ok.mode, LaunchMode::LegacyHost);
+        assert!(ok.session_id.is_none());
     }
 
     #[test]
@@ -526,11 +783,111 @@ mod tests {
             node: "node-a".to_string(),
             app_id: "firefox".to_string(),
             name: "Firefox".to_string(),
+            source: LaunchSource::Xdg,
+            mode: LaunchMode::LegacyHost,
+            session_id: None,
+            vm_id: None,
+            catalog_revision: None,
+            guest_profile: None,
+            requested_capabilities: Vec::new(),
+            resume: false,
+            client_peer: None,
         };
         assert!(
             worker.handle_request(&req),
             "a known advertised app launches"
         );
+        let calls = launcher.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0], vec!["firefox".to_string()]);
+    }
+
+    #[test]
+    fn legacy_host_launcher_rejects_guest_owned_flatpak() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        seed_flatpak_app(&home, "org.example.Guest", "flatpak run org.example.Guest");
+        let launcher = Arc::new(RecordingLauncher::default());
+        let worker = worker_with(home, Arc::clone(&launcher));
+
+        let req = LaunchRequest {
+            node: "node-a".to_string(),
+            app_id: "org.example.Guest".to_string(),
+            name: "Guest app".to_string(),
+            source: LaunchSource::Flatpak,
+            mode: LaunchMode::GuestAppVm,
+            session_id: None,
+            vm_id: None,
+            catalog_revision: None,
+            guest_profile: None,
+            requested_capabilities: Vec::new(),
+            resume: false,
+            client_peer: None,
+        };
+        assert!(
+            !worker.handle_request(&req),
+            "guest-owned Flatpak must not fall through to the host launcher"
+        );
+        assert!(
+            launcher.calls.lock().unwrap().is_empty(),
+            "Flatpak policy refusal must happen before process spawn"
+        );
+    }
+
+    #[test]
+    fn guest_launch_maps_to_typed_app_vm_session_without_host_fallback() {
+        let req = parse_launch_request(
+            r#"{"node":"node-a","app_id":"org.example.Guest","name":"Guest","source":"flatpak","mode":"guest-app-vm","session_id":"sess-1","vm_id":"vm-1","catalog_revision":"catalog-7","guest_profile":"wayland-standard","requested_capabilities":["audio"],"client_peer":"peer:seat","resume":true}"#,
+        )
+        .expect("guest launch parses");
+        assert_eq!(
+            app_vm_session_request(&req),
+            Some(SessionRequest::OpenApp {
+                id: "sess-1".into(),
+                serving_peer: "node-a".into(),
+                vm_id: "vm-1".into(),
+                client_peer: "peer:seat".into(),
+                app_id: "org.example.Guest".into(),
+                catalog_revision: "catalog-7".into(),
+                guest_profile: "wayland-standard".into(),
+                requested_capabilities: vec!["audio".into()],
+                resume: true,
+            })
+        );
+    }
+
+    #[test]
+    fn guest_launch_requires_explicit_lifecycle_identity() {
+        let req = parse_launch_request(
+            r#"{"node":"node-a","app_id":"org.example.Guest","source":"flatpak","mode":"guest-app-vm"}"#,
+        )
+        .expect("source and mode still parse");
+        assert!(app_vm_session_request(&req).is_none());
+    }
+
+    #[test]
+    fn legacy_host_launcher_preserves_xdg_catalog_allowlist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        seed_desktop_app(&home, "firefox", "firefox %U");
+        let launcher = Arc::new(RecordingLauncher::default());
+        let worker = worker_with(home, Arc::clone(&launcher));
+
+        let req = LaunchRequest {
+            node: "node-a".to_string(),
+            app_id: "firefox".to_string(),
+            name: "Firefox".to_string(),
+            source: LaunchSource::Xdg,
+            mode: LaunchMode::LegacyHost,
+            session_id: None,
+            vm_id: None,
+            catalog_revision: None,
+            guest_profile: None,
+            requested_capabilities: Vec::new(),
+            resume: false,
+            client_peer: None,
+        };
+        assert!(worker.handle_request(&req));
         let calls = launcher.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0], vec!["firefox".to_string()]);
@@ -549,6 +906,15 @@ mod tests {
             node: "node-a".to_string(),
             app_id: "rm-rf-everything".to_string(),
             name: "totally legit".to_string(),
+            source: LaunchSource::Xdg,
+            mode: LaunchMode::LegacyHost,
+            session_id: None,
+            vm_id: None,
+            catalog_revision: None,
+            guest_profile: None,
+            requested_capabilities: Vec::new(),
+            resume: false,
+            client_peer: None,
         };
         assert!(
             !worker.handle_request(&req),
@@ -572,6 +938,15 @@ mod tests {
             node: "some-other-node".to_string(),
             app_id: "firefox".to_string(),
             name: "Firefox".to_string(),
+            source: LaunchSource::Xdg,
+            mode: LaunchMode::LegacyHost,
+            session_id: None,
+            vm_id: None,
+            catalog_revision: None,
+            guest_profile: None,
+            requested_capabilities: Vec::new(),
+            resume: false,
+            client_peer: None,
         };
         assert!(
             !worker.handle_request(&req),
@@ -596,6 +971,15 @@ mod tests {
             node: "node-a".to_string(),
             app_id: "safe-app".to_string(),
             name: "rm -rf / ; evil".to_string(),
+            source: LaunchSource::Xdg,
+            mode: LaunchMode::LegacyHost,
+            session_id: None,
+            vm_id: None,
+            catalog_revision: None,
+            guest_profile: None,
+            requested_capabilities: Vec::new(),
+            resume: false,
+            client_peer: None,
         };
         assert!(worker.handle_request(&req));
         let calls = launcher.calls.lock().unwrap();

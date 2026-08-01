@@ -838,22 +838,21 @@ fn surface_needs_remote_sessions_fallback(surface: Surface) -> bool {
         | Surface::Music
         | Surface::Media
         | Surface::Files
-        | Surface::Terminal => false,
+        | Surface::Terminal
+        | Surface::Timers
+        | Surface::Communications
+        | Surface::Explorer
+        | Surface::Phones
+        | Surface::Bookmarks => false,
         // Menubar-LESS surfaces: they draw no shared MenuBar, so the shell's
         // top-right remote-sessions fallback Area is their only such control and
         // is drawn exactly once (Foreground) — no Background twin, no collision.
         // Browser renders its own web chrome (not the shared MenuBar), so it too
-        // carries only the single Foreground copy. MapsLocation (its own
-        // header/tab-rail), Phones, Communications (plain `.show(ui)`), Timers,
-        // Explorer, Bookmarks, and the Auto Mode home (car_home_panel) likewise
-        // have no shared menubar.
-        Surface::Explorer
-        | Surface::Browser
-        | Surface::Bookmarks
+        // carries only the single Foreground copy. MapsLocation keeps the
+        // fallback only for its governed Car full-bleed path, and AutoHome
+        // likewise has no shared menubar.
+        Surface::Browser
         | Surface::MapsLocation
-        | Surface::Phones
-        | Surface::Communications
-        | Surface::Timers
         | Surface::AutoHome => true,
     }
 }
@@ -1226,6 +1225,15 @@ impl Shell {
     /// E12-3b. Called mid-boot by [`Boot::frame`] (the QBRAND-4 `Surfaces`
     /// milestone), on the DRM seat and the windowed fallback alike.
     fn new_for_ctx(ctx: &egui::Context) -> Self {
+        // The direct-DRM proof harness must render the routed workspace in its
+        // first frame. An idle bare seat has no compositor wake for the normal
+        // expand tween, which otherwise leaves evidence on the wallpaper
+        // midpoint. Ordinary boots retain the expressive motion curve.
+        if std::env::var_os("MDE_DRM_LINEAR_SCANOUT").is_some()
+            || std::env::var_os("MDE_DRM_PROOF_READBACK").is_some()
+        {
+            ctx.style_mut(|style| style.animation_time = 0.0);
+        }
         let mut shell = Self {
             nav: Nav::default(),
             nav_history: Vec::new(),
@@ -1309,6 +1317,34 @@ impl Shell {
         if shell.system.layout_profile() == LayoutProfile::Car {
             shell.nav.surface = Surface::AutoHome;
             shell.nav.expanded = true;
+        }
+        // WL-UX-009 live-render proof: the direct-DRM capture harness may select a
+        // real Construct route before the first frame. Keep this seam inert unless
+        // an approved direct-DRM proof environment is present; ordinary boots
+        // remain governed by persisted navigation and user input. Reuse the one
+        // production shell/goto grammar so proof cannot invent an unlaunchable route.
+        if std::env::var_os("MDE_DRM_LINEAR_SCANOUT").is_some()
+            || std::env::var_os("MDE_DRM_PROOF_READBACK").is_some()
+        {
+            if let Ok(target) = std::env::var("MDE_DRM_PROOF_SURFACE") {
+                if let Some(nav) = toast_bridge::resolve_action(&format!("shell/goto/{target}"))
+                {
+                    shell.nav.expanded = true;
+                    match nav {
+                        toast_bridge::Navigate::Surface(surface) => {
+                            shell.nav.surface = surface;
+                            if target.eq_ignore_ascii_case("editor") {
+                                shell.nav.surface = Surface::Communications;
+                                shell.communications.open_editor();
+                            }
+                        }
+                        toast_bridge::Navigate::Plane(plane) => {
+                            shell.nav.surface = Surface::Workbench;
+                            shell.nav.plane = plane;
+                        }
+                    }
+                }
+            }
         }
         shell
     }
@@ -1510,6 +1546,11 @@ impl Shell {
                 self.nav.expanded = false;
                 self.nav.surface = Surface::Desktop;
             }
+            nav_bar::Action::OpenEditor => {
+                self.nav.expanded = true;
+                self.nav.surface = Surface::Communications;
+                self.communications.open_editor();
+            }
             nav_bar::Action::ToggleDock => {
                 self.nav_bar.toggle(Instant::now(), Motion::mode());
             }
@@ -1558,25 +1599,23 @@ impl Shell {
     /// app overlays, but before the lock curtain's absolute top layer.
     fn mount_navigation_bar(&mut self, ctx: &egui::Context) {
         let pinned_sources = self.chooser.pinned_rail_sources();
-        if let Some(action) =
-            self.nav_bar
-                .mount_with_active(ctx, &pinned_sources, Some(self.nav.surface))
-        {
-            self.apply_nav_bar_action(action, ctx);
-        }
         let (bottom_alpha, _) = self.nav_bar.chrome_alphas(Instant::now());
         let env = status_bar::StatusBarEnv {
             curtain_engaged: self.curtain.engaged(),
             car: self.system.layout_profile() == LayoutProfile::Car,
             immersive_app: self.immersive_vdi() || self.nav.surface == Surface::MapsLocation,
         };
-        status_bar::mount_bottom(
+        if let Some(action) = self.nav_bar.mount_with_active_and_bottom_tray(
             ctx,
+            &pinned_sources,
+            Some(self.nav.surface),
             &mut self.construct,
             self.notify_status.segments(),
             bottom_alpha,
             env,
-        );
+        ) {
+            self.apply_nav_bar_action(action, ctx);
+        }
     }
 
     /// U10 — the Construct springboard home (`springboard.rs`, §2.2 — the
@@ -1662,6 +1701,22 @@ impl Shell {
                 local_host: &self.local_host,
             },
         );
+
+        // A focused App VM rail entry is a typed handoff into the existing VDI
+        // surface. Keep this after the Control Center mount so the action is
+        // consumed exactly once and the Desktop surface owns the connection
+        // lifecycle from this point onward.
+        if let Some(handoff) = self.session_rail.take_app_handoff() {
+            self.vdi.request_app_connect(
+                handoff,
+                &self.local_host,
+                mde_bus::client_data_dir(),
+                Some(vdi::body_device_px(ctx)),
+            );
+            self.nav.surface = Surface::Desktop;
+            self.nav.expanded = true;
+            self.construct.control_center_open = false;
+        }
     }
 
     /// Apply one dispatched hotkey action (E12-19). Hardware actions act on the ONE
@@ -1777,17 +1832,21 @@ impl Shell {
 
         let mut tab = self.fleet_mesh_tab;
         ui.push_id("shell-fleet-mesh", |ui| {
-            let _ = mde_egui::nav_chrome::NavigationBar::new("Fleet & Mesh").show(ui);
+            // The three shell views are workspace navigation, not a second
+            // content rail. Keep them available from the shared View menu so
+            // the State of the Mesh surface has one clear top-level hierarchy.
             ui.horizontal(|ui| {
-                for (candidate, label) in [
-                    (FleetMeshTab::Workbench, "Workbench"),
-                    (FleetMeshTab::MeshMap, "Mesh Map"),
-                    (FleetMeshTab::Explorer, "Explorer"),
-                ] {
-                    if ui.selectable_label(tab == candidate, label).clicked() {
-                        tab = candidate;
+                ui.menu_button("View", |ui| {
+                    for (candidate, label) in [
+                        (FleetMeshTab::Workbench, "Workbench"),
+                        (FleetMeshTab::MeshMap, "Mesh Map"),
+                        (FleetMeshTab::Explorer, "Explorer"),
+                    ] {
+                        if ui.radio_value(&mut tab, candidate, label).clicked() {
+                            ui.close_menu();
+                        }
                     }
-                }
+                });
             });
             ui.separator();
             match tab {
@@ -1796,7 +1855,7 @@ impl Shell {
                         ui,
                         &mut self.nav.plane,
                         &mut self.datacenter,
-                        &self.thisnode,
+                        &mut self.thisnode,
                         &mut self.surface_card,
                         &self.network,
                         &self.controller,
@@ -1832,14 +1891,14 @@ impl Shell {
         let mut tab = self.this_node_tab;
         let mut section = self.this_node_section;
         ui.push_id("shell-this-node", |ui| {
-            let _ = mde_egui::nav_chrome::NavigationBar::new("This Node").show(ui);
             Self::show_this_node_search(ui, &mut self.this_node_search);
             ui.horizontal_wrapped(|ui| {
                 for candidate in this_node_catalog::search(&self.this_node_search) {
-                    if ui
-                        .selectable_label(section == candidate, candidate.label())
-                        .on_hover_text(candidate.description())
-                        .clicked()
+                    if mde_egui::widgets::hover_text(
+                        ui.selectable_label(section == candidate, candidate.label()),
+                        candidate.description(),
+                    )
+                    .clicked()
                     {
                         section = candidate;
                     }
@@ -1847,7 +1906,7 @@ impl Shell {
             });
             ui.separator();
             if let Some(reason) = section.unavailable_reason() {
-                ui.group(|ui| {
+                mde_egui::card().show(ui, |ui| {
                     ui.label(egui::RichText::new(section.label()).strong());
                     ui.label(section.description());
                     ui.colored_label(Style::resolve_color(ui.ctx(), Style::TEXT_DIM), reason);
@@ -1956,6 +2015,16 @@ impl Shell {
     /// `Context`. Polled while in view by [`Self::render`]; the Mesh Map's Explorer
     /// lens stays as a second, side-by-side path (the node-focus deep-link's home).
     fn show_explorer(&mut self, ui: &mut egui::Ui) {
+        let menus: &[mde_egui::menubar::Menu<&'static str>] = &[];
+        let status: &[mde_egui::menubar::StatusChip] = &[];
+        let model = mde_egui::menubar::MenuBarModel {
+            title: "Explorer",
+            accent: Style::ACCENT,
+            menus,
+            status,
+        };
+        let _ = mde_egui::menubar::MenuBar::show(ui, &model);
+        ui.add_space(Style::SP_S);
         let explorer = &mut self.explorer;
         ui.push_id("shell-explorer", |ui| {
             explorer.show(ui);
@@ -2108,6 +2177,8 @@ impl Shell {
                 }
                 let web = &mut self.web;
                 ui.push_id("shell-web", |ui| {
+                    // Construct owns the browser connection/unavailable and
+                    // diagnostic boundary; the guest viewport remains guest-owned.
                     web::web_panel(ui, web);
                 });
                 if self.web.take_bookmarks_manager_request() {
@@ -2174,7 +2245,9 @@ impl Shell {
                 // poll is driven in `render` while in view. Scoped under its own
                 // `push_id` like every mounted surface.
                 let phones = &mut self.phones_hub;
-                ui.push_id("shell-phones", |ui| phones.show(ui));
+                ui.push_id("shell-phones", |ui| {
+                    phones.show(ui);
+                });
             }
             Surface::Communications => {
                 // The unified Communications hub (WL-FUNC-011) — the
@@ -2185,7 +2258,9 @@ impl Shell {
                 // commands. Scoped under its own `push_id` like every mounted surface
                 // so its egui ids can't collide in the shell's one `Context`.
                 let communications = &mut self.communications;
-                ui.push_id("shell-communications", |ui| communications.show(ui));
+                ui.push_id("shell-communications", |ui| {
+                    communications.show(ui);
+                });
             }
             Surface::ThisNode | Surface::System | Surface::Storage | Surface::About => {
                 self.show_this_node(ui);
@@ -2282,9 +2357,22 @@ struct Boot {
     splash: splash::Splash,
     /// The shell, built once mid-boot (the `Surfaces` milestone).
     shell: Option<Shell>,
+    /// Frames allowed for the completed progress bar to settle before the real
+    /// desktop takes over. This is intentionally frame-based: a direct DRM seat
+    /// can have no further OS wake after startup, while normal motion still needs
+    /// a handful of displayed frames to feel deliberate rather than abrupt.
+    splash_settle_frames: u8,
+    /// Makes the desktop handoff observable once per process without turning
+    /// the normal frame loop into a log source.
+    handoff_logged: bool,
 }
 
 impl Boot {
+    /// The completed splash gets this many normal-motion frames before handoff.
+    /// The Page curve settles in 220 ms; 18 vblank-paced frames leave a small
+    /// visual margin without making a ready desktop wait perceptibly longer.
+    const SPLASH_SETTLE_FRAMES: u8 = 18;
+
     /// Drive one frame. While the splash owns the screen it paints FIRST — so
     /// the frame on display while a slow init step runs shows the progress
     /// already banked — then exactly one real milestone advances; the next
@@ -2292,19 +2380,34 @@ impl Boot {
     /// the eased bar settled), the shell renders — the first dock frame
     /// replaces the splash.
     fn frame(&mut self, ctx: &egui::Context) {
-        if !self.splash.dismissed() {
+        // WL-UX-009 direct-DRM proof owns the first scanout frame. Do not paint
+        // the transient boot lockup before the routed workspace: a bare DRM
+        // seat can retain that first buffer when the shell takes over, making
+        // stale splash pixels look like live workspace content in evidence.
+        // Ordinary boots keep the branded splash and its normal handoff.
+        if std::env::var_os("MDE_DRM_LINEAR_SCANOUT").is_some()
+            || std::env::var_os("MDE_DRM_PROOF_READBACK").is_some()
+        {
+            self.shell
+                .get_or_insert_with(|| Shell::new_for_ctx(ctx))
+                .render(ctx);
+            return;
+        }
+        if !self.splash.dismissed() && self.splash_settle_frames < Self::SPLASH_SETTLE_FRAMES {
             self.splash.show(ctx);
             if !self.splash.is_complete(splash::Milestone::Seat) {
                 // This callback running at all proves the seat came up — the
                 // runner (DRM/KMS + wgpu, or the windowed client) finishes
                 // that init before it can call back.
                 self.splash.complete(splash::Milestone::Seat);
+                tracing::info!(target: "shell::boot", milestone = "seat", "boot milestone completed");
             } else if self.shell.is_none() {
                 // Surface construction — every backend the shell owns (music
                 // worker, media core, files browser, voice SIP agent, the
                 // terminal's real PTY, …) built once.
                 self.shell = Some(Shell::new_for_ctx(ctx));
                 self.splash.complete(splash::Milestone::Surfaces);
+                tracing::info!(target: "shell::boot", milestone = "surfaces", "boot milestone completed");
             } else if !self.splash.is_complete(splash::Milestone::MeshSnapshot) {
                 // The shell's FIRST mesh-status snapshot poll — the same
                 // world-readable fold the dock grade/status chrome renders on its
@@ -2314,10 +2417,26 @@ impl Boot {
                     shell.chrome.poll(ctx);
                 }
                 self.splash.complete(splash::Milestone::MeshSnapshot);
+                tracing::info!(target: "shell::boot", milestone = "mesh_snapshot", "boot milestone completed");
             }
-            // Keep boot frames flowing while the eased bar plays out.
-            ctx.request_repaint();
+            if self.splash.finished() {
+                self.splash_settle_frames = self.splash_settle_frames.saturating_add(1);
+            }
+            // Keep boot frames flowing while the eased bar plays out. A finite
+            // deadline is important for the DRM runner: unlike an eframe event
+            // loop it has no external wake handle for an immediate repaint, but
+            // it does poll the root viewport's requested deadline.
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
             return;
+        }
+        if !self.handoff_logged {
+            tracing::info!(
+                target: "shell::boot",
+                settle_frames = self.splash_settle_frames,
+                splash_dismissed = self.splash.dismissed(),
+                "boot splash handed off to desktop"
+            );
+            self.handoff_logged = true;
         }
         self.shell
             .get_or_insert_with(|| Shell::new_for_ctx(ctx))
@@ -3112,7 +3231,11 @@ impl Shell {
         let mut items = front_door::app_search_items();
         let mut rank = items.len();
 
-        items.extend(front_door::peer_app_search_items(peer_apps, rank));
+        items.extend(front_door::peer_app_search_items_with_favorites(
+            peer_apps,
+            rank,
+            self.nav_bar.peer_app_favorites(),
+        ));
         rank = items.len();
 
         items.extend(front_door::workflow_search_items(rank));
@@ -3324,6 +3447,9 @@ impl Shell {
                 }
                 self.connect_front_door_desktop_source(ctx, &target.desktop_source_id());
             }
+            front_door::FrontDoorRequest::TogglePeerAppFavorite(target) => {
+                self.nav_bar.toggle_peer_app_favorite(&target);
+            }
             front_door::FrontDoorRequest::ConnectDesktopSource(id) => {
                 self.connect_front_door_desktop_source(ctx, &id);
             }
@@ -3367,6 +3493,8 @@ impl Shell {
         let sources = self.front_door_source_status();
         self.front_door
             .set_taskbar_pins(self.nav_bar.pinned_surfaces());
+        self.front_door
+            .set_peer_app_favorites(self.nav_bar.peer_app_favorites());
         let base_items = self.front_door_base_items();
         self.drive_front_door_peer_apps(&base_items, sources);
         let items = self.front_door_items();
@@ -3652,12 +3780,16 @@ fn publish_front_door_peer_app_launch_to_bus(
     bus_root: &std::path::Path,
     target: &front_door::FrontDoorPeerAppTarget,
 ) -> Result<String, String> {
-    let (topic, body) = front_door::peer_app_launch_wire(target).ok_or_else(|| {
-        format!(
-            "Front Door peer app launch target is incomplete: node='{}' app_id='{}'",
-            target.node, target.app_id
-        )
-    })?;
+    let (topic, body) = if target.source.trim().eq_ignore_ascii_case("flatpak") {
+        front_door::peer_app_provision_wire(target)?
+    } else {
+        front_door::peer_app_launch_wire(target).ok_or_else(|| {
+            format!(
+                "Front Door peer app launch target is incomplete: node='{}' app_id='{}'",
+                target.node, target.app_id
+            )
+        })?
+    };
     let persist =
         mde_bus::persist::Persist::open(bus_root.to_path_buf()).map_err(|err| err.to_string())?;
     mde_bus::rpc::publish_request(
@@ -3686,6 +3818,7 @@ fn nav_bar_action_label(action: &nav_bar::Action) -> &'static str {
         nav_bar::Action::OpenSearch => "open_search",
         nav_bar::Action::Back => "back",
         nav_bar::Action::Home => "home",
+        nav_bar::Action::OpenEditor => "open_editor",
         nav_bar::Action::ToggleDock => "toggle_dock",
         nav_bar::Action::OpenSurface(_) => "open_surface",
         nav_bar::Action::PinSurface(_) => "pin_surface",
@@ -5052,6 +5185,11 @@ mod tests {
                     | Surface::Media
                     | Surface::Files
                     | Surface::Terminal
+                    | Surface::Bookmarks
+                    | Surface::Timers
+                    | Surface::Communications
+                    | Surface::Explorer
+                    | Surface::Phones
             );
             assert_eq!(
                 surface_needs_remote_sessions_fallback(surface),
@@ -5060,8 +5198,8 @@ mod tests {
             );
         }
         assert!(
-            surface_needs_remote_sessions_fallback(Surface::Timers),
-            "the clock-routed Timers surface (no menubar) needs the shell fallback"
+            !surface_needs_remote_sessions_fallback(Surface::Timers),
+            "the Timers surface owns a shared menubar and must not double-mount the fallback"
         );
         assert!(
             !surface_needs_remote_sessions_fallback(Surface::Media),
@@ -5350,6 +5488,14 @@ mod tests {
         assert!(
             boot.shell.is_none(),
             "surfaces must build on a later frame, behind the splash"
+        );
+        assert!(
+            out.viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .expect("root viewport output")
+                .repaint_delay
+                <= std::time::Duration::from_millis(16),
+            "the boot splash must give the event-driven DRM runner an immediate or finite frame deadline"
         );
         assert!(!boot.splash.dismissed(), "dismissed before init completed");
     }
@@ -5765,8 +5911,10 @@ mod tests {
             ..Default::default()
         };
         let out = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                ui.push_id("shell-files", |ui| files_panel(ui, &mut files));
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.push_id("shell-files", |ui| {
+                    files_panel(ui, &mut files);
+                });
             });
         });
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
@@ -5774,6 +5922,40 @@ mod tests {
             !prims.is_empty(),
             "the mounted surface produced no draw primitives"
         );
+    }
+
+    #[test]
+    fn shell_files_shared_frame_survives_desktop_narrow_and_large_text() {
+        for (width, zoom) in [(960.0, 1.0), (480.0, 1.0), (960.0, 1.5)] {
+            let ctx = egui::Context::default();
+            Style::install(&ctx);
+            ctx.set_zoom_factor(zoom);
+            let mut files = mde_files_egui::real_browser();
+            let out = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(width, 640.0))),
+                    ..Default::default()
+                },
+                |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            ui.push_id("shell-files", |ui| {
+                            files_panel(ui, &mut files);
+                        });
+                    });
+                },
+            );
+            let primitives = ctx.tessellate(out.shapes.clone(), out.pixels_per_point);
+            assert!(
+                !primitives.is_empty(),
+                "Files shared frame did not paint at width={width}, zoom={zoom}"
+            );
+            assert!(
+                painted_text(&out.shapes)
+                    .iter()
+                    .any(|(text, _)| text == "Files"),
+                "Files shared frame title is missing at width={width}, zoom={zoom}"
+            );
+        }
     }
 
     #[test]
@@ -6636,20 +6818,25 @@ mod tests {
     }
 
     #[test]
-    fn front_door_peer_app_launch_request_publishes_app_launch_body() {
+    fn front_door_flatpak_selection_publishes_authorized_app_provision_body() {
         let dir = tempfile::tempdir().expect("temp bus");
         let target = front_door::FrontDoorPeerAppTarget {
             node: "oak".to_owned(),
             app_id: "org.mozilla.Firefox.desktop".to_owned(),
             name: "Firefox".to_owned(),
+            source: "flatpak".to_owned(),
+            catalog_revision: Some("catalog-test".to_owned()),
+            guest_profile: Some("wayland-standard".to_owned()),
+            requested_capabilities: Vec::new(),
+            launch_blocked_reason: None,
         };
 
         let ulid =
             publish_front_door_peer_app_launch_to_bus(dir.path(), &target).expect("publish launch");
         let persist = Persist::open(dir.path().to_path_buf()).expect("open bus");
         let requests = persist
-            .list_since("action/apps/launch", None)
-            .expect("app launch requests");
+            .list_since("action/cloud/app-provision", None)
+            .expect("app provision requests");
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].ulid, ulid);
         let body: serde_json::Value =
@@ -6657,7 +6844,18 @@ mod tests {
                 .expect("request json");
         assert_eq!(body["node"], "oak");
         assert_eq!(body["app_id"], "org.mozilla.Firefox.desktop");
-        assert_eq!(body["name"], "Firefox");
+        assert_eq!(body["name"], "appvm-oak-org.mozilla.Firefox.desktop");
+        assert_eq!(body["catalog_revision"], "catalog-test");
+        assert_eq!(body["guest_profile"], "wayland-standard");
+        assert_eq!(
+            body["session_id"],
+            "app-session-oak-org.mozilla.Firefox.desktop"
+        );
+        assert_eq!(
+            body["schema_version"],
+            mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION
+        );
+        assert!(body["armed_token"].as_str().is_some());
     }
 
     #[test]
@@ -6768,8 +6966,8 @@ mod tests {
             ..Default::default()
         };
         let out = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                ui.push_id("shell-media", |ui| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.push_id("shell-media", |ui| {
                     media_header(ui, &mut media);
                     ui.separator();
                     media_panel(ui, &mut media, &mut media_video);

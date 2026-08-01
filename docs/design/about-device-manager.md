@@ -18,7 +18,7 @@ Phase 2) drives real device actions over the overlay.
 | 3 | View modes | **By type + By connection + By node** — the two classic MDM modes plus a mesh-native "By node" mode that flattens every host's devices into one cross-fleet tree. |
 | 4 | Categories | **Full Linux taxonomy** — CPU, Memory, Disk drives + storage controllers, Network adapters, Display/GPU, USB controllers, PCI/system devices, Audio, Input, Sensors/thermal, Bluetooth, Battery/power. |
 | 5 | Host picker | **Left host rail + tree on the right** — a persistent left column lists all hosts (status dots); selecting one shows its device tree. Layout = rail │ tree │ (bottom drawer). |
-| 6 | Host types | **Mesh peer nodes + Cloud/Nova instances + paired phones + LAN-discovered hosts + VyOS/router devices** (local always included). |
+| 6 | Host types | **Mesh peer nodes + Workloads VM instances + paired phones + LAN-discovered hosts + VyOS/router devices** (local always included). |
 | 7 | Data path | **Hybrid: published snapshot + live refresh** — instant load from each node's published inventory, plus an on-demand "refresh live" per host. |
 | 8 | Freshness | **Snapshot + Scan action + ~30s auto-refresh** — a "Scan for hardware changes" button (MDM's scan) + periodic republish; not a live stream. |
 | 9 | Properties | **Bottom detail drawer** — selecting a device slides a detail drawer up from the bottom; the tree stays full-width above it. |
@@ -34,7 +34,7 @@ Phase 2) drives real device actions over the overlay.
 | 19 | Chrome | **Full menu bar (Action / View / Help) + toolbar** — the faithful MDM chrome. |
 | 20 | Summary | **Rich per-host header card** — hostname, OS/kernel, uptime, CPU/RAM/disk totals, device count + problem badge, above the tree. |
 | 21 | Notify | **Yes — fleet-wide fault notify** — a device faulting on ANY node posts to the mesh notify feed (→ Chat + phone), debounced (mirrors node_grade's D/F alert). |
-| 22 | Non-PC hosts | **Same tree, applicable categories only** — a VyOS router shows Network/System/Firmware; a phone shows Power/Sensors/Radios; a Nova instance shows virtio devices; a LAN host shows what's remotely detectable. No empty categories. |
+| 22 | Non-PC hosts | **Same tree, applicable categories only** — a VyOS router shows Network/System/Firmware; a phone shows Power/Sensors/Radios; a Workloads VM shows virtio devices; a LAN host shows what's remotely detectable. No empty categories. |
 | 23 | Export | **JSON + Markdown report + clipboard** — export the current host's inventory as machine JSON and a human-readable report. |
 | 24 | About info | **Title strip + ⓘ button** — a compact `◈ Magic-Mesh Construct v<ver>` strip always visible; an ⓘ button opens license/credits/mesh-identity in a dialog. The tree fills the body. |
 | 25 | Phasing | **Inspector first, actions + reach next** — P1 = a complete READ-ONLY inspector across local + mesh nodes; P2 = actions (armed, any-host), fleet notify, By-node view, non-PC host types, cross-fleet reach. |
@@ -107,7 +107,7 @@ In `mde-shell-egui`, a new `device_manager.rs` module rendered as the body of
   **MDM problem codes** + tree badges.
 - **Export** produces JSON + a Markdown report. (P2) **Actions** fire on local + remote
   hosts, destructive ones typed-armed; a device fault on any node **posts to the notify
-  feed**; **non-PC hosts** (Nova/phone/LAN/VyOS) render with only applicable categories.
+  feed**; **non-PC hosts** (Workloads VM/phone/LAN/VyOS) render with only applicable categories.
 - Everything through `mde_egui` `Style`/`Motion` tokens (§4); the worker is rank-0; the
   shell↔worker contract is the published JSON (§6, no cross-boundary crate dep).
 

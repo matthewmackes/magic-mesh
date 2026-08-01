@@ -25,6 +25,16 @@ variable "base_image_source" {
   default     = "/var/lib/libvirt/images/mde-base.qcow2"
 }
 
+variable "app_base_image_source" {
+  description = <<-EOT
+    Signed, curated App VM base image containing the wayland-standard compositor,
+    portal, Flatpak, PipeWire, and VDI runtime. App VM workloads never fall back
+    to the generic desktop base.
+  EOT
+  type    = string
+  default = "/var/lib/libvirt/images/app-vm-wayland-standard.qcow2"
+}
+
 variable "android_base_image_source" {
   description = <<-EOT
     Source of the Debian base image the Android (Cuttlefish) L1 VMs clone from
@@ -62,6 +72,15 @@ variable "network" {
     condition     = contains(["nat", "bridge", "none", "route"], var.network.mode)
     error_message = "network.mode must be one of nat|bridge|none|route."
   }
+
+  validation {
+    condition = alltrue([
+      for v in values(var.vms) : v.delivery_type != "app_vm" || (
+        v.app != null && v.app.guest_profile == "wayland-standard"
+      )
+    ])
+    error_message = "app_vm workloads require the typed wayland-standard guest declaration."
+  }
 }
 
 variable "vms" {
@@ -75,6 +94,7 @@ variable "vms" {
         vcpu, memory_mb, disk_gb
         image             = "" (use the delivery type's golden base) | "<name>"
         network_isolation = false (shared managed mesh net) | true (own segment)
+        app               = null for non-App VMs, or the typed guest-owned App VM declaration
       }
 
     OpenTofu partitions this map by delivery_type (main.tf) and converges the local
@@ -88,6 +108,14 @@ variable "vms" {
     disk_gb           = number
     image             = optional(string, "")
     network_isolation = optional(bool, false)
+    app = optional(object({
+      app_id                 = string
+      catalog_revision       = string
+      guest_profile          = string
+      requested_capabilities = list(string)
+      session_id             = string
+      resume                 = bool
+    }), null)
   }))
   default = {}
 

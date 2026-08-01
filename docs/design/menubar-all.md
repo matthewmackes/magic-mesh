@@ -12,7 +12,7 @@ right — one shared `mde-egui` component so all 15 surfaces read as one platfor
 > **The menu bar's job is to surface to the operator ALL controls — including the
 > advanced and complex ones — not just the common actions.** It is the operator's
 > complete, discoverable control surface for each workspace. This is **especially
-> critical for the OpenStack component interfaces** (the IaC workspace), where the
+> critical for the Workloads component interfaces** (the IaC workspace), where the
 > menus carry the full standard-API verb set. Every control a surface can perform
 > should be reachable from its menus; nothing important lives only behind an
 > undiscoverable chord. (Still bound by §7 — an item ships only when its real seam
@@ -33,7 +33,7 @@ right — one shared `mde-egui` component so all 15 surfaces read as one platfor
 | 9 | Keyboard | **Alt-mnemonics + live shortcut hints** — Alt+F opens File, underlined mnemonics, each item shows its live keymap-resolved shortcut (like Terminal's bar). |
 | 10 | Title action | **Decorative identity only** — the title is not clickable (the dock handles surface switching). |
 | 11 | Placement | **Slim top bar inside each surface panel** — fixed consistent height at the top of each surface's panel area (right of the vertical dock). |
-| 12 | Motion | **Shared `mde_egui::motion`** — hover highlight, dropdown open-spring, item press feedback; reduce-motion aware. |
+| 12 | Motion | **Shared `mde_egui::motion`** — hover highlight, dropdown open-spring, item press feedback; expressive Apple-like motion by default, with optional compatibility handling. |
 | 13 | Non-app surfaces | **Their real seams, honestly** — viewers/settings get menus for what they genuinely do (Mesh-View→View/Node; Desktop→Session/Display/Input; Instances→Instance/Power; System/Storage→the settings categories; Workbench→Plane/View); spine where it fits, no invented menus. |
 | 14 | Title text | **UPPERCASE** — VOICE, BROWSER, FILES, MESH VIEW, WORKBENCH. |
 | 15 | Phasing | **One big wave** — build the shared component + all 15 surfaces' bars together (each surface a file-disjoint unit within the wave). |
@@ -53,7 +53,7 @@ A new module in `crates/shared/mde-egui`:
   keymap so a rebind reflects).
 - **The status cluster** — a caller-supplied `Vec<StatusChip>` (icon/text/tone) rendered
   right-aligned; the surface fills it from its live state each frame.
-- **Reduce-motion aware**, DPI-crisp, focus-ring on every menu item (a11y, lock 5 of Construct).
+- **Expressive by default**, DPI-crisp, focus-ring on every menu item; reduced-motion compatibility is optional (a11y, lock 5 of Construct).
 
 ### Per-surface embedding (MENUBAR-ALL-2..16, one big wave)
 Each surface crate embeds `MenuBar` at the top of its panel, passing:
@@ -67,7 +67,7 @@ Each surface crate embeds `MenuBar` at the top of its panel, passing:
 **Terminal** (`mde-term-egui/menubar.rs`, now carrying TERM-MENUBAR-1 + the TMUX-FC-2 Tmux
 menu) and **Editor** (the Word-97 bar) **refactor onto the shared component** — same menus +
 seams, unified look. The **IaC workspace** (see `iac-workspace.md`) is the extreme case: its
-menu bar is **dynamic per-service menus from the OpenStack catalog** carrying the full
+menu bar is **dynamic per-service menus from the Workloads catalog** carrying the full
 standard-API verb set — the governing principle's headline use.
 
 ## Acceptance (runtime-observable; per task — §7)

@@ -1280,8 +1280,13 @@ impl SpaceFold {
                 self.members.insert(actor.0.clone(), (*role, true));
             }
             CollabEventKind::MemberLeft { actor } => {
-                if let Some(m) = self.members.get_mut(&actor.0) {
-                    m.1 = false;
+                // `LeaveSpace` is self-authored, while `RemoveMember` is
+                // owner-authored. Do not let a signed ordinary-member event
+                // remove a different member during replay.
+                if actor == &env.actor || self.is_present_owner(&env.actor) {
+                    if let Some(m) = self.members.get_mut(&actor.0) {
+                        m.1 = false;
+                    }
                 }
             }
             CollabEventKind::MemberRoleChanged { actor, role } => {

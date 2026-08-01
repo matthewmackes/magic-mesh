@@ -29,6 +29,121 @@ pub enum TransferControl {
     Cancel,
 }
 
+/// The bounded task/action-item operations exposed by Mesh Teams.
+///
+/// Keeping this intermediate contract separate from the wire command lets UI,
+/// keyboard, and future worker adapters share title normalization and rejection
+/// rules before anything is queued or signed. It is intentionally not a second
+/// event model: [`TaskAction::into_command`] produces the existing canonical
+/// [`CollabCommand`] variants.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskAction {
+    /// Create a task, optionally retaining its originating post.
+    Create {
+        /// The owning channel.
+        space: SpaceId,
+        /// The operator-authored title.
+        title: String,
+        /// The post that originated this action item, if any.
+        source: Option<EventId>,
+    },
+    /// Replace an open task's title.
+    Update {
+        /// The owning channel.
+        space: SpaceId,
+        /// The task creation event.
+        task: EventId,
+        /// The replacement title.
+        title: String,
+    },
+    /// Set the lightweight checked state.
+    SetChecked {
+        /// The owning channel.
+        space: SpaceId,
+        /// The task creation event.
+        task: EventId,
+        /// The desired state.
+        checked: bool,
+    },
+    /// Mark a task complete.
+    Complete {
+        /// The owning channel.
+        space: SpaceId,
+        /// The task creation event.
+        task: EventId,
+    },
+    /// Reopen a completed task.
+    Reopen {
+        /// The owning channel.
+        space: SpaceId,
+        /// The task creation event.
+        task: EventId,
+    },
+}
+
+/// The maximum UTF-8 byte length of a task/action-item title.
+pub const MAX_TASK_TITLE_BYTES: usize = 512;
+
+/// Why a [`TaskAction`] was rejected before entering the command sink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskActionValidationError {
+    /// The title was empty after trimming.
+    EmptyTitle,
+    /// The title exceeded [`MAX_TASK_TITLE_BYTES`].
+    TitleTooLong,
+}
+
+impl TaskAction {
+    /// Validate, normalize, and lower the action into the canonical wire shape.
+    ///
+    /// Title-bearing actions trim surrounding whitespace and reject blank or
+    /// oversized values. Non-title actions cannot fail validation.
+    pub fn into_command(self) -> Result<CollabCommand, TaskActionValidationError> {
+        match self {
+            Self::Create {
+                space,
+                title,
+                source,
+            } => Ok(CollabCommand::CreateTask {
+                space,
+                title: normalize_task_title(title)?,
+                source,
+            }),
+            Self::Update {
+                space,
+                task,
+                title,
+            } => Ok(CollabCommand::UpdateTask {
+                space,
+                task,
+                title: normalize_task_title(title)?,
+            }),
+            Self::SetChecked {
+                space,
+                task,
+                checked,
+            } => Ok(CollabCommand::SetTaskChecked {
+                space,
+                task,
+                checked,
+            }),
+            Self::Complete { space, task } => Ok(CollabCommand::CompleteTask { space, task }),
+            Self::Reopen { space, task } => Ok(CollabCommand::ReopenTask { space, task }),
+        }
+    }
+}
+
+fn normalize_task_title(title: String) -> Result<String, TaskActionValidationError> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err(TaskActionValidationError::EmptyTitle);
+    }
+    if title.len() > MAX_TASK_TITLE_BYTES {
+        return Err(TaskActionValidationError::TitleTooLong);
+    }
+    Ok(title.to_owned())
+}
+
 /// A typed Communications operation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

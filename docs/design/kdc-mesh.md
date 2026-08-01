@@ -34,11 +34,11 @@ features online; **C** mesh-aware — the phone reaches every node's services.
 | 9 | Notifications | **Bidirectional, mesh-wide** — phone notifications appear on every desktop AND the mesh/system notify feed (CHAT-FIX-2) pushes to the phone; reply-from-desktop where supported. |
 | 10 | Remote/media | **Both** — the phone is a touchpad + keyboard for the active desktop (remote input) AND controls media (play/pause/next/vol) + presenter on whichever node plays. |
 | 11 | Files | **Both directions, any node** — send/receive (done) + browse the phone's FS from a desktop (SFTP) + browse any node's shared files from the phone (via the Q7 directory). |
-| 12 | More features | **All** — run-commands (incl. **a series of OpenStack lifecycle commands across all nodes** — start/stop/reboot/etc. from the phone), battery + connectivity report, telephony (call/SMS alerts), find-my-devices (both ways). |
-| 13 | Phone hub | **A 'Phones' hub in the shell** — lists paired phone(s), mesh identity, battery/signal, per-feature toggles, the file browser, the run-command editor (incl. the OpenStack set), and pairing. Folds in the existing phone-hub/kdc pieces (§6). |
+| 12 | More features | **All** — typed Workloads lifecycle verbs across nodes (start/stop/reboot/etc. from the phone), battery + connectivity report, telephony (call/SMS alerts), find-my-devices (both ways). |
+| 13 | Phone hub | **A 'Phones' hub in the shell** — lists paired phone(s), mesh identity, battery/signal, per-feature toggles, the file browser, the typed Workloads action editor, and pairing. Folds in the existing phone-hub/kdc pieces (§6). |
 | 14 | Pairing UX | **QR from the shell, pair-to-mesh** — the hub shows a QR encoding the mesh enroll + a KDC pairing token; one phone scan enrolls onto Nebula AND pairs to the mesh. |
 | 15 | Which nodes | **Every node (universal, rank-0)** — `kdc_host` runs on ALL nodes (lighthouses + headless included) so any-node + all-nodes-simultaneously actually work. Overlay-only transport means NO public port opens (it binds the overlay iface, not the public NIC). |
-| 16 | Security | **Pairing is enough** — a paired, mesh-enrolled phone can trigger anything (the Nebula cert + the KDC pairing IS the authorization; no per-command confirm). Every action is still recorded in the KDC hash-chained audit log (`events::append_event`). |
+| 16 | Security | **Pairing plus typed authorization** — a paired, mesh-enrolled phone may request typed Workloads verbs, with explicit confirmation for destructive actions. Every action is recorded in the KDC hash-chained audit log (`events::append_event`). |
 
 ## The Android-side constraint (key architectural note)
 The phone runs the **stock** Android Nebula client + the **stock** KDE Connect Android app
@@ -71,7 +71,7 @@ each host as a separate device. So **lock #8 ("one Mesh device")** is realized h
 - **Feature workers** (complete the set, §7 each): bidirectional notifications wired into the
   CHAT-FIX-2 notify producer (#9); remote input via the shell's evdev/input injection (#10);
   media control via the media surface transport seam (#10); SFTP both ways (#11);
-  run-commands incl. the OpenStack lifecycle set driving the QC `state/openstack` verbs (#12);
+  typed Workloads lifecycle verbs (#12), never raw shell commands or provider-specific APIs;
   battery/connectivity/telephony/find-my-devices (#12) — all over the overlay transport, all
   audited (`events::append_event`, #16).
 - **Phones hub surface** (`mde-shell-egui`): the desktop-side management surface (#13).
@@ -82,7 +82,7 @@ each host as a separate device. So **lock #8 ("one Mesh device")** is realized h
   bound on the overlay IP, nothing on the public NIC).
 - A phone notification appears on every desktop; the mesh notify feed reaches the phone;
   clipboard/media/remote-input work follow-everywhere; the phone browses any node's files
-  and triggers run-commands (incl. an OpenStack instance reboot) on a chosen node.
+  and requests a typed Workloads reboot on a chosen node.
 - `kdc_host` runs on every node (census rank-0); the public boundary stays default-deny
   (overlay-only bind — asserted).
 - Every phone-triggered action lands in the hash-chained audit log.
@@ -92,10 +92,9 @@ each host as a separate device. So **lock #8 ("one Mesh device")** is realized h
   single device; a fork is the only way to a fully-unified Android UX (out of scope).
 - **All-nodes-simultaneously noise** — a notification on every desktop can be duplicative;
   needs de-dup/coalescing so one phone notification isn't N desktop toasts unpleasantly.
-- **"Pairing is enough" blast radius** (#16) — a paired phone can drive OpenStack lifecycle
-  across the fleet with no per-command confirm; the audit log is the only brake. Flag this
-  posture in the hub; a lost/stolen paired phone = fleet control until unpaired (make unpair
-  fast + mesh-wide).
+- **Paired-phone blast radius** (#16) — a paired phone can request Workloads lifecycle
+  across the fleet, so typed authorization, destructive confirmation, and the audit log
+  remain mandatory. A lost/stolen paired phone must be unpaired quickly and mesh-wide.
 - **Overlay-only + big file transfers** — SFTP/large shares over the overlay (no LAN
   shortcut) may be slower on the same segment; acceptable per #3, note it.
 - **Mesh-wide pairing replication** — the shared pairing record must converge before a new
@@ -103,7 +102,8 @@ each host as a separate device. So **lock #8 ("one Mesh device")** is realized h
 
 ## Out of scope (v1)
 - A mesh-aware KDE Connect Android fork (stock apps + host fanout only).
-- Per-command arming / per-node RBAC for the phone (pairing-is-enough, #16).
+- Provider-specific APIs or raw shell commands from the phone; all actions use typed
+  Workloads verbs and the platform's authorization/confirmation path.
 - Non-Nebula transports (overlay-only, #3).
 
 ## Tasks → `docs/WORKLIST.md` KDC-MESH-1..N.

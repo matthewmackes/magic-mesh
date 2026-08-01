@@ -64,6 +64,7 @@ impl State {
             image: non_empty(&self.image),
             network_isolation: self.network_isolation,
             raw_hcl: non_empty(&self.raw_hcl),
+            app: None,
         }
     }
 

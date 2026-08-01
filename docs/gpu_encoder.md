@@ -77,7 +77,7 @@ Minimum viable real playback:
 2. `mde-media-egui` issues `Player::load`.
 3. real `MpvEngine` opens the URL/path and emits state plus decoded frame events.
 4. the frame sink uploads the newest frame to an egui texture.
-5. `player_stage` paints the texture with Carbon OSD above it.
+5. `player_stage` paints the texture with the Quazar/Construct OSD above it.
 6. audio goes through mpv/PipeWire.
 
 Overlay playback:

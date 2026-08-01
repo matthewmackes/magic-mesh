@@ -27,7 +27,11 @@ pub mod sms;
 pub mod telephony;
 
 pub use battery::{battery_packet, BatteryBody, BatteryPlugin};
-pub use clipboard::{clipboard_packet, from_packet_body, ClipboardBody, ClipboardPlugin};
+pub use clipboard::{
+    clipboard_packet, from_packet_body, validate_clipboard_seat, ClipboardBody,
+    ClipboardMaterialization, ClipboardPlugin, ClipboardRejection, ClipboardSeatError,
+    MAX_CLIPBOARD_BODY_BYTES, MAX_CLIPBOARD_SEAT_BYTES, MAX_CLIPBOARD_TEXT_BYTES,
+};
 pub use findmyphone::{find_my_phone_packet, FindMyPhoneBody, FindMyPhonePlugin};
 pub use mousepad::{mousepad_packet, MouseButton, MouseModifiers, MousepadBody, MousepadEvent};
 pub use mpris::{mpris_command_packet, MprisBody, MprisKind, MprisPlugin, MprisRequestBody};

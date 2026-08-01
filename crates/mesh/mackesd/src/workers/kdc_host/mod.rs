@@ -66,6 +66,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use mackes_mesh_types::peers::default_workgroup_root;
+use mackes_mesh_types::vdi_clipboard::{
+    ClipboardMaterialization as VdiClipboardMaterialization, VdiClipboardText,
+    CLIPBOARD_MATERIALIZATION_TOPIC,
+};
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_bus::rpc::{publish_request, reply_topic};
@@ -78,6 +82,8 @@ use mde_kdc_host::sftp::{SftpMount, SshfsMount};
 use mde_kdc_host::{EventStream, HostEvent, MeshPairing, OverlayTransport, PeerId, Transport};
 use mde_kdc_proto::discovery::{Announce, DeviceType};
 use mde_kdc_proto::plugins::battery::BatteryBody;
+use mde_kdc_proto::plugins::{ClipboardMaterialization as KdcClipboardMaterialization,
+    ClipboardPlugin, Plugin, PluginContext};
 use mde_kdc_proto::plugins::mousepad::{MouseModifiers, MousepadBody, MousepadEvent};
 use mde_kdc_proto::plugins::mpris::{MprisBody, MprisKind, MprisRequestBody};
 use mde_kdc_proto::plugins::notification::{notification_packet, NotificationBody};
@@ -1016,19 +1022,47 @@ fn fanout_action_for_packet(kind: &str, body: &Value, peer: &str) -> Option<Fano
     }
 }
 
-/// Apply one fanned-out action on THIS node (design #6/#10) and return a short
-/// human detail for the response row. Reuses the same local seams the direct
-/// receive path drives (`apply_clipboard` / `ring_local_device`), so a fanned-out
-/// clipboard/ring is byte-identical to a directly-received one.
-fn apply_fanout_action(action: &FanoutAction) -> String {
+/// Apply one fanned-out action on THIS node (design #6/#10), returning whether
+/// it actually reached its local seam plus a short human detail. Clipboard
+/// fanout uses the same canonical target-seat Bus handoff as direct KDC packets;
+/// it never invokes `wl-copy` or reports success when the Bus is unavailable.
+fn apply_fanout_action(action: &FanoutAction) -> (bool, String) {
     match action {
-        FanoutAction::Clipboard { content, .. } => {
-            apply_clipboard(content);
-            format!("clipboard set ({} bytes)", content.len())
+        FanoutAction::Clipboard { content, source } => {
+            let Some(root) = mde_bus::default_data_dir() else {
+                return (false, "clipboard unavailable (local Bus unavailable)".to_string());
+            };
+            let Ok(persist) = Persist::open(root) else {
+                return (false, "clipboard unavailable (local Bus unavailable)".to_string());
+            };
+            let Ok(text) = VdiClipboardText::new(content.clone()) else {
+                return (false, "clipboard rejected (text exceeds canonical bound)".to_string());
+            };
+            let handoff = VdiClipboardMaterialization::new(
+                kdc_clipboard_target_seat(),
+                text,
+                format!("{source}:fanout"),
+                chrono::Utc::now().to_rfc3339(),
+            );
+            let Ok(body) = serde_json::to_string(&handoff) else {
+                return (false, "clipboard unavailable (handoff serialization failed)".to_string());
+            };
+            if persist
+                .write(
+                    CLIPBOARD_MATERIALIZATION_TOPIC,
+                    Priority::Default,
+                    None,
+                    Some(&body),
+                )
+                .is_err()
+            {
+                return (false, "clipboard unavailable (handoff write failed)".to_string());
+            }
+            (true, format!("clipboard set ({} bytes)", content.len()))
         }
         FanoutAction::Ring => {
             ring_local_device();
-            "rang".to_string()
+            (true, "rang".to_string())
         }
     }
 }
@@ -1076,11 +1110,11 @@ fn drain_fanout_requests(shunt_root: &std::path::Path, host: &str, seen: &mut No
         if !seen.admit(&req.id) {
             continue;
         }
-        let detail = apply_fanout_action(&req.action);
+        let (applied, detail) = apply_fanout_action(&req.action);
         let resp = FanoutResponse {
             request_id: req.id.clone(),
             node_host: host.to_string(),
-            applied: true,
+            applied,
             detail: detail.clone(),
             ts_ms: now_ms(),
         };
@@ -1301,7 +1335,8 @@ fn local_announce() -> Announce {
         // answered with THIS host's battery (handle_battery_request).
         "kdeconnect.battery",
         "kdeconnect.battery.request",
-        // Clipboard copy + the connection-time push, applied via wl-copy.
+        // Clipboard copy + the connection-time push, admitted into the
+        // canonical target-seat Bus handoff.
         "kdeconnect.clipboard",
         "kdeconnect.clipboard.connect",
         // Peer notifications, mirrored to the Alert Center.
@@ -1478,6 +1513,18 @@ async fn run_host(
     // the roster (above) so the mesh can dial us; `None` only if the transport
     // somehow reported unresolved after a successful start (defensive).
     let host_overlay_ip = transport.overlay_status().await.overlay_ip();
+    // WL-FUNC-016 — the live KDC worker owns the protocol plugin and feeds its
+    // accepted active-seat materializations into the canonical local Bus lane.
+    // The shell owns the final DRM clipboard read; this worker never invokes a
+    // compositor helper or reports a fake local success.
+    let mut clipboard_plugin = ClipboardPlugin::new();
+    let clipboard_target_seat = kdc_clipboard_target_seat();
+    if let Err(error) = clipboard_plugin.set_active_seat(Some(clipboard_target_seat.clone())) {
+        warn!(%error, "kdc-host: clipboard active-seat setup refused");
+    }
+    let mut pending_clipboard_materializations: VecDeque<KdcClipboardMaterialization> =
+        VecDeque::new();
+    let clipboard_bus_root = mde_bus::default_data_dir();
     // SEC-5 — the mesh-shunt: publish this peer's paired phones to the replicated
     // volume + relay neighbors' phones into the roster, so a phone paired on another
     // peer shows up here (and is outbound-pairable) without a direct LAN broadcast.
@@ -1757,17 +1804,28 @@ async fn run_host(
                         }
                     }
                     // KDC-PLUGINS / KDC-MESH-8 — Clipboard: a peer's copy (live or the
-                    // connection-time `.connect` push) is applied to THIS host's
-                    // Wayland clipboard via `wl-copy` when present; audited (#16).
+                    // connection-time `.connect` push) is admitted by the canonical
+                    // typed plugin and published to the exact local seat handoff;
+                    // the shell consumes that Bus row in its DRM clipboard provider.
                     if packet.kind == "kdeconnect.clipboard"
                         || packet.kind == "kdeconnect.clipboard.connect"
                     {
-                        if let Some(content) = packet.body.get("content").and_then(Value::as_str) {
-                            apply_clipboard(content);
+                        let context = PluginContext::new(
+                            peer.as_str(),
+                            pairing.is_paired(peer.as_str()),
+                        );
+                        let _ = clipboard_plugin.process(packet, &context);
+                        pending_clipboard_materializations
+                            .extend(clipboard_plugin.take_materializations());
+                        let published = publish_pending_kdc_clipboard(
+                            clipboard_bus_root.as_ref(),
+                            &mut pending_clipboard_materializations,
+                        );
+                        if published > 0 {
                             audit_kdc_action(json!({
-                                "action": "kdc_clipboard_apply",
+                                "action": "kdc_clipboard_materialize",
                                 "phone": peer.as_str(),
-                                "bytes": content.len(),
+                                "target_seat": clipboard_target_seat,
                             }));
                         }
                     }
@@ -1879,6 +1937,12 @@ async fn run_host(
                 notify_ctx.forward_to_phones(&transport, &pairing, &mut notify_cursors).await;
             }
             _ = drain_tick.tick() => {
+                // Retry a retained handoff when the local Bus was temporarily
+                // unavailable; an unavailable Bus must not discard accepted text.
+                let _ = publish_pending_kdc_clipboard(
+                    clipboard_bus_root.as_ref(),
+                    &mut pending_clipboard_materializations,
+                );
                 for send in outbound.take_all() {
                     let peer = PeerId::from(send.device_id.as_str());
                     if let Err(e) = transport.send_to(&peer, send.packet).await {
@@ -2241,29 +2305,74 @@ fn ring_local_device() {
 // ───────────────────────── KDC-PLUGINS: Clipboard ────────────────────────
 //
 // A peer's clipboard copy (a live `kdeconnect.clipboard` or the connection-time
-// `kdeconnect.clipboard.connect` push) is applied to THIS host's Wayland
-// clipboard via `wl-copy`. Best-effort: a host without wl-clipboard installed
-// (or no Wayland session) simply skips — no error surfaced to the peer.
+// `kdeconnect.clipboard.connect` push) is admitted by `ClipboardPlugin` and
+// published to the canonical target-seat Bus handoff. The direct DRM shell owns
+// the final local clipboard operation; this worker does not require a compositor.
 
-/// Apply inbound clipboard `content` to this host's Wayland clipboard via
-/// `wl-copy`. Pipes the content over stdin (no shell-quoting hazard) and
-/// detaches; silently no-ops when `wl-copy` is absent.
-fn apply_clipboard(content: &str) {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-    let child = Command::new("wl-copy")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-    let Ok(mut child) = child else {
-        return; // wl-copy not installed / no Wayland — skip cleanly
+/// Resolve the exact target-seat identity shared by the daemon and shell.
+/// `BusTextClipboard::for_shell` uses the same hostname-backed identity, while
+/// the `seat:` prefix prevents a hostname from being confused with a raw Bus
+/// node id at the materialization boundary.
+fn kdc_clipboard_target_seat() -> String {
+    format!("seat:{}", hostname_for_shunt())
+}
+
+/// Publish accepted KDC clipboard materializations to the canonical local Bus.
+/// The queue is intentionally retained when the Bus is unavailable or a write
+/// fails; the next packet/tick retries without losing remote history or source
+/// attribution.
+fn publish_pending_kdc_clipboard(
+    bus_root: Option<&PathBuf>,
+    pending: &mut VecDeque<KdcClipboardMaterialization>,
+) -> usize {
+    let Some(root) = bus_root else {
+        return 0;
     };
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(content.as_bytes());
+    let Ok(persist) = Persist::open(root.clone()) else {
+        return 0;
+    };
+    let mut published = 0;
+    loop {
+        let Some(item) = pending.front().cloned() else {
+            return published;
+        };
+        let Ok(text) = VdiClipboardText::new(item.body.content.clone()) else {
+            // `ClipboardPlugin` already validates this body. Retain the safety
+            // boundary if a future plugin implementation violates that contract.
+            let _ = pending.pop_front();
+            warn!("kdc-host: dropped invalid plugin clipboard materialization");
+            continue;
+        };
+        let peer = item
+            .metadata
+            .peer_id
+            .as_deref()
+            .filter(|peer| !peer.is_empty())
+            .unwrap_or("unknown");
+        let packet_id = item.metadata.packet_id.unwrap_or_default();
+        let handoff = VdiClipboardMaterialization::new(
+            item.target_seat,
+            text,
+            format!("kdc:{peer}:packet:{packet_id}"),
+            chrono::Utc::now().to_rfc3339(),
+        );
+        let Ok(body) = serde_json::to_string(&handoff) else {
+            return published;
+        };
+        if persist
+            .write(
+                CLIPBOARD_MATERIALIZATION_TOPIC,
+                Priority::Default,
+                None,
+                Some(&body),
+            )
+            .is_err()
+        {
+            return published;
+        }
+        let _ = pending.pop_front();
+        published += 1;
     }
-    // Don't block the event loop waiting on wl-copy; it exits promptly.
-    drop(child);
 }
 
 /// This peer's hostname for the shunt's published filename.

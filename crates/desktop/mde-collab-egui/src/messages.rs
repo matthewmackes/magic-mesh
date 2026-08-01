@@ -12,13 +12,12 @@ use mde_egui::egui;
 use mde_egui::Style;
 
 use mde_collab_types::{
-    CollabCommand, DeliveryState, EventId, MessageBody, MessageView, SpaceId, TaskView, ThreadId,
+    CollabCommand, DeliveryState, EventId, MessageBody, MessageView, SpaceId, TaskAction,
+    TaskView, ThreadId, MAX_TASK_TITLE_BYTES,
 };
 
 use crate::icons::CommsHoverExt;
 use crate::{amend_affordance, icons, relative_age, AmendAffordance, CommunicationsSurface};
-
-const MAX_TASK_TITLE_BYTES: usize = 512;
 
 /// A constrained quick reaction held only in this surface's local view state.
 ///
@@ -188,7 +187,7 @@ impl CommunicationsSurface {
         let mut title_was_capped = false;
         let mut update = false;
         let mut reopen = false;
-        ui.group(|ui| {
+        mde_egui::card().show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 let check_hint = if task.checked {
                     "Clear task check"
@@ -229,10 +228,11 @@ impl CommunicationsSurface {
                             data.insert_temp(title_id, title.clone());
                         });
                     }
-                    if ui
-                        .button("Update")
-                        .on_hover_text("Publish the updated task title")
-                        .clicked()
+                    if mde_egui::widgets::hover_text(
+                        ui.button("Update"),
+                        "Publish the updated task title",
+                    )
+                    .clicked()
                     {
                         update = true;
                     }
@@ -254,18 +254,19 @@ impl CommunicationsSurface {
                             .any(|message| message.event_id == source)
                     });
                     if source_present {
-                        if ui
-                            .small_button("Open post")
-                            .on_hover_text("Open the projected source post")
-                            .clicked()
+                        if mde_egui::widgets::hover_text(
+                            ui.small_button("Open post"),
+                            "Open the projected source post",
+                        )
+                        .clicked()
                         {
                             self.focus_task_source(task.space, source);
                         }
                     } else {
-                        ui.add_enabled(false, egui::Button::new("Post unavailable"))
-                            .on_hover_text(
-                                "The source post is outside the current retained projection.",
-                            );
+                        mde_egui::widgets::disabled_hover_text(
+                            ui.add_enabled(false, egui::Button::new("Post unavailable")),
+                            "The source post is outside the current retained projection.",
+                        );
                     }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -324,19 +325,18 @@ impl CommunicationsSurface {
             .task_drafts
             .get(&space)
             .map_or("", String::as_str)
-            .trim()
             .to_owned();
-        if title.is_empty() || title.len() > MAX_TASK_TITLE_BYTES {
-            return;
-        }
         let source = self.task_sources.get(&space).copied();
-        sink.emit(CollabCommand::CreateTask {
+        let action = TaskAction::Create {
             space,
             title,
             source,
-        });
-        self.task_drafts.insert(space, String::new());
-        self.task_sources.remove(&space);
+        };
+        if let Ok(command) = action.into_command() {
+            sink.emit(command);
+            self.task_drafts.insert(space, String::new());
+            self.task_sources.remove(&space);
+        }
     }
 
     /// Seed a bounded task title from a post without rewriting the canonical
@@ -366,11 +366,14 @@ impl CommunicationsSurface {
         task: EventId,
         checked: bool,
     ) {
-        sink.emit(CollabCommand::SetTaskChecked {
+        let action = TaskAction::SetChecked {
             space,
             task,
             checked,
-        });
+        };
+        if let Ok(command) = action.into_command() {
+            sink.emit(command);
+        }
     }
 
     /// Emit a bounded title update for an open channel task.
@@ -381,15 +384,14 @@ impl CommunicationsSurface {
         task: EventId,
         title: &str,
     ) {
-        let title = title.trim();
-        if title.is_empty() || title.len() > MAX_TASK_TITLE_BYTES {
-            return;
-        }
-        sink.emit(CollabCommand::UpdateTask {
+        let action = TaskAction::Update {
             space,
             task,
             title: title.to_owned(),
-        });
+        };
+        if let Ok(command) = action.into_command() {
+            sink.emit(command);
+        }
     }
 
     /// Emit the explicit task-completion command the caller routes to the worker.
@@ -399,12 +401,16 @@ impl CommunicationsSurface {
         space: SpaceId,
         task: EventId,
     ) {
-        sink.emit(CollabCommand::CompleteTask { space, task });
+        if let Ok(command) = (TaskAction::Complete { space, task }).into_command() {
+            sink.emit(command);
+        }
     }
 
     /// Emit the explicit task-reopen command the caller routes to the worker.
     pub(crate) fn reopen_task(&self, sink: &mut crate::CommandSink, space: SpaceId, task: EventId) {
-        sink.emit(CollabCommand::ReopenTask { space, task });
+        if let Ok(command) = (TaskAction::Reopen { space, task }).into_command() {
+            sink.emit(command);
+        }
     }
 
     /// The main conversation column: the scrolling timeline over a reserved
@@ -628,39 +634,41 @@ impl CommunicationsSurface {
         let saved = data.message_saved(space, message);
         ui.separator();
         ui.label(egui::RichText::new("Keep").small().color(Style::TEXT_DIM));
-        if ui
-            .add(
+        if mde_egui::widgets::hover_text(
+            ui.add(
                 egui::Button::new(
                     egui::RichText::new(if pinned { "Unpin" } else { "Pin" })
                         .small()
                         .color(if pinned { Style::WARN } else { Style::TEXT_DIM }),
                 )
                 .sense(egui::Sense::click()),
-            )
-            .on_hover_text(if pinned {
+            ),
+            if pinned {
                 "Remove the shared pin"
             } else {
                 "Pin for everyone in this space"
-            })
-            .clicked()
+            },
+        )
+        .clicked()
         {
             self.toggle_message_pin(sink, space, message, pinned);
         }
-        if ui
-            .add(
+        if mde_egui::widgets::hover_text(
+            ui.add(
                 egui::Button::new(
                     egui::RichText::new(if saved { "Unsave" } else { "Save" })
                         .small()
                         .color(if saved { Style::WARN } else { Style::TEXT_DIM }),
                 )
                 .sense(egui::Sense::click()),
-            )
-            .on_hover_text(if saved {
+            ),
+            if saved {
                 "Remove your private saved mark"
             } else {
                 "Save privately for this seat"
-            })
-            .clicked()
+            },
+        )
+        .clicked()
         {
             self.toggle_message_save(sink, space, message, saved);
         }

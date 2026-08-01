@@ -12,7 +12,7 @@
 //! design's "mesh-synced": no file to replicate, no drift between peers.
 //!
 //! The seeded commands are the real mesh tools (`meshctl status` /
-//! `meshctl fleet status` / `meshctl logs --follow`, `openstack …`, `btop`,
+//! `meshctl fleet status` / `meshctl logs --follow`, `virsh`, `podman`, `btop`,
 //! `journalctl -f`, the AI CLIs). A preset is a **starting point**: a tool a given
 //! node lacks simply prints "command not found" in its pane (honest, never a
 //! crash), and the layout is the operator's to reshape.
@@ -28,7 +28,7 @@ pub enum MeshPreset {
     MeshOps,
     /// `btop` · `journalctl -f` · disk usage · a shell (per-node health).
     NodeWatch,
-    /// `OpenStack` instances · Heat stacks · service logs · a shell.
+    /// Local libvirt workloads · Podman workloads · mesh logs · a shell.
     Cloud,
     /// An editor · a build/test shell · a run/logs shell · git.
     DevBuild,
@@ -52,7 +52,7 @@ impl MeshPreset {
         match self {
             Self::MeshOps => "Mesh Ops",
             Self::NodeWatch => "Node Watch",
-            Self::Cloud => "Cloud / OpenStack",
+            Self::Cloud => "Workloads / Local Mesh",
             Self::DevBuild => "Dev / Build",
             Self::AiCli => "AI CLI",
         }
@@ -92,9 +92,9 @@ impl MeshPreset {
             Self::Cloud => one_window(
                 "cloud",
                 &[
-                    Some("openstack server list"),
-                    Some("openstack stack list"),
-                    Some("journalctl -f"),
+                    Some("virsh list --all"),
+                    Some("podman ps --all"),
+                    Some("meshctl logs --follow"),
                     None,
                 ],
                 StockLayout::Tiled,
@@ -195,6 +195,27 @@ mod tests {
                 assert_ne!(labels[i], labels[j], "duplicate label");
                 assert_ne!(sessions[i], sessions[j], "duplicate session");
             }
+        }
+    }
+
+    #[test]
+    fn workloads_preset_uses_provider_neutral_local_mesh_tools() {
+        let preset = MeshPreset::Cloud;
+        assert_eq!(preset.label(), "Workloads / Local Mesh");
+
+        let joined = preset
+            .blueprint()
+            .commands(preset.session_name())
+            .join("\n");
+        for command in [
+            "virsh list --all",
+            "podman ps --all",
+            "meshctl logs --follow",
+        ] {
+            assert!(
+                joined.contains(command),
+                "Workloads preset is missing {command:?}"
+            );
         }
     }
 }

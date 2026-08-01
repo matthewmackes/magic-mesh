@@ -618,6 +618,17 @@ impl Default for EditorSurface {
     }
 }
 
+impl EditorSurface {
+    /// Enter the editor as a focused workspace: hide optional project and
+    /// symbol sidebars so a direct launch starts with the document canvas at
+    /// full width. The panels remain available through the editor's View menu
+    /// and commands after entry.
+    pub fn collapse_sidebars(&mut self) {
+        self.show_tree = false;
+        self.show_outline = false;
+    }
+}
+
 /// The `F7` spelling-walk dialog state (EDTB-6): whether it is shown and which
 /// visible miss it is parked on. The misses themselves live on the focused
 /// [`Doc`]'s [`SpellChecker`]; this holds only the modal's own cursor.

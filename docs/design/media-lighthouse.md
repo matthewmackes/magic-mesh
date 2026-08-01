@@ -5,6 +5,10 @@
 
 # MEDIA-LIGHTHOUSE — retired Navidrome service on `Lighthouse_Media` nodes
 
+> **HISTORICAL / SUPERSEDED (2026-07-30):** Lighthouse media/file-sharing roles
+> are retired. Lighthouses are control-plane relay/CA/leader nodes only; retain
+> this document as historical evidence and do not implement its role model.
+
 **Status:** design locked 2026-06-20 (10-question operator survey).
 **Epic prefix:** `MEDIA-` in `docs/WORKLIST.md`.
 

@@ -377,7 +377,7 @@ fn sources_view<E: MediaEngine>(ui: &mut egui::Ui, controller: &mut MediaControl
                 );
             } else {
                 for row in &rows {
-                    let resp = ui.group(|ui| {
+                    let resp = mde_egui::card().show(ui, |ui| {
                         ui.set_min_width(ui.available_width());
                         ui.horizontal(|ui| {
                             status_dot(ui, Style::OK);
@@ -2259,7 +2259,7 @@ fn queue_view<E: MediaEngine>(ui: &mut egui::Ui, controller: &mut MediaControlle
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for (index, item) in items.iter().enumerate() {
-                    ui.group(|ui| {
+                    mde_egui::card().show(ui, |ui| {
                         ui.set_min_width(ui.available_width());
                         ui.horizontal(|ui| {
                             let is_current = current == Some(index);

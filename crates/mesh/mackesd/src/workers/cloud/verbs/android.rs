@@ -112,6 +112,7 @@ pub(super) fn android_spec(node: &str, name: &str) -> WorkloadSpec {
         image: None,
         network_isolation: false,
         raw_hcl: None,
+        app: None,
     }
 }
 

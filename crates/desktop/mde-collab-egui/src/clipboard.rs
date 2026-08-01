@@ -10,8 +10,9 @@
 //! **attach** it to the space, **pin/unpin** it, or **delete** it — each a typed
 //! [`CollabCommand`].
 //!
-//! Arbitrary MIME up to 100 MB rides the clipboard lane; anything larger is a
-//! Transfer, not a clip (the worker routes it there rather than truncating).
+//! Text up to the shared canonical clipboard bound rides the clipboard lane;
+//! anything larger is a Transfer, not a clip (the worker routes it there rather
+//! than truncating).
 
 use mde_egui::egui;
 use mde_egui::Style;
@@ -27,10 +28,10 @@ use crate::{icons, relative_age, CommunicationsSurface};
 /// full (possibly large) content pasted into the row.
 const PREVIEW_MAX: usize = 160;
 
-/// The clipboard lane's content ceiling, matching the collab worker's fold gate.
+/// The clipboard lane's content ceiling, shared with the canonical event body.
 /// Larger content belongs on the Transfer lane and must not reach the publish
 /// command's preview/hash materialization path.
-const MAX_CLIP_BYTES: usize = 100 * 1024 * 1024;
+const MAX_CLIP_BYTES: usize = mde_collab_types::MAX_CLIPBOARD_TEXT_BYTES;
 
 impl CommunicationsSurface {
     /// Render Clipboard mode for the selected space: the publish composer, then
@@ -63,7 +64,14 @@ impl CommunicationsSurface {
         });
         ui.separator();
 
-        self.clip_publish_composer(ui, sink, space, data.me().as_str());
+        let publishing_enabled = self.clipboard_publishing_enabled;
+        self.clip_publish_composer(
+            ui,
+            sink,
+            space,
+            data.me().as_str(),
+            publishing_enabled,
+        );
         ui.separator();
 
         match data.clipboard_lane(space) {
@@ -105,38 +113,57 @@ impl CommunicationsSurface {
         sink: &mut crate::CommandSink,
         space: SpaceId,
         me: &str,
+        publishing_enabled: bool,
     ) {
         let mut buf = self.clip_drafts.get(&space).cloned().unwrap_or_default();
         let mut publish = false;
-        ui.horizontal(|ui| {
-            let resp = ui.add(
-                egui::TextEdit::singleline(&mut buf)
-                    .id(egui::Id::new(("mde-collab-clip-composer", space.as_uuid())))
-                    .desired_width(f32::INFINITY)
-                    .hint_text("Publish a clip  ·  Enter to share"),
-            );
-            let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if (resp.lost_focus() || resp.has_focus()) && enter {
-                publish = true;
-            }
-            if icons::icon_button(
-                ui,
-                icons::CLIP_PUBLISH,
-                Style::SP_M,
-                Style::ACCENT,
-                "Publish clip",
-            )
-            .clicked()
-            {
-                publish = true;
-            }
+        ui.add_enabled_ui(publishing_enabled, |ui| {
+            ui.horizontal(|ui| {
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut buf)
+                        .id(egui::Id::new(("mde-collab-clip-composer", space.as_uuid())))
+                        .desired_width(f32::INFINITY)
+                        .hint_text("Publish a clip  ·  Enter to share"),
+                );
+                let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if (resp.lost_focus() || resp.has_focus()) && enter {
+                    publish = true;
+                }
+                if icons::icon_button(
+                    ui,
+                    icons::CLIP_PUBLISH,
+                    Style::SP_M,
+                    Style::ACCENT,
+                    "Publish clip",
+                )
+                .clicked()
+                {
+                    publish = true;
+                }
+            });
         });
-        let text = buf.trim();
-        if publish && !text.is_empty() {
-            self.publish_clip_text(sink, space, text, me);
-            buf.clear();
+        // Whitespace is meaningful clipboard content. Use trimming only to
+        // identify an all-blank draft; the canonical clipboard contract hashes
+        // and preserves the exact supplied bytes.
+        let text = buf.as_str();
+        if publishing_enabled && publish && !text.trim().is_empty() {
+            // Keep the session-scoped draft when canonical admission refuses the
+            // value; losing a user's bounded-text correction target would make a
+            // rejected publish look like a successful action.
+            if self.publish_clip_text(sink, space, text, me) {
+                buf.clear();
+            }
         }
         self.clip_drafts.insert(space, buf);
+        if !publishing_enabled {
+            ui.label(
+                egui::RichText::new(
+                    "Local clipboard publishing is off for this session. Remote history remains visible below.",
+                )
+                .small()
+                .color(Style::TEXT_DIM),
+            );
+        }
     }
 
     /// One clipboard-lane row: the kind glyph, the preview, the source + content
@@ -219,15 +246,79 @@ impl CommunicationsSurface {
     /// Build a [`ClipboardItem`] from `text` (detecting a URI, hashing the real
     /// content address, attributing it to `source`) and emit
     /// [`PublishClipboard`](CollabCommand::PublishClipboard) into `space`.
+    ///
+    /// This seam honors the session-scoped local-publish preference before
+    /// constructing any command. The same boundary protects the widget and
+    /// future callers from bypassing the opt-in, while the read-side lane keeps
+    /// remote rows visible when local publishing is disabled.
+    ///
+    /// Returns `true` only when the command was admitted by the canonical text
+    /// lane's local boundary. Callers use this to retain a rejected
+    /// session-scoped draft for correction.
     pub(crate) fn publish_clip_text(
         &self,
         sink: &mut crate::CommandSink,
         space: SpaceId,
         text: &str,
         source: &str,
-    ) {
-        if !clip_fits_lane(text.len()) {
-            return;
+    ) -> bool {
+        self.publish_clip_text_from_ingress(
+            sink,
+            space,
+            text,
+            source,
+            ClipboardIngress::LocalSeat,
+        )
+    }
+
+    /// Admit a guest-originated clipboard value only when the VDI session has
+    /// explicitly declared a real, bidirectional text channel.  This is kept
+    /// separate from the local-seat composer so a missing, unsupported, or
+    /// malformed capability can never be mistaken for local consent.
+    ///
+    /// The shell/VDI mount must translate its protocol-specific capability into
+    /// [`VdiClipboardCapability`] before calling this seam.  In particular,
+    /// unsupported RDP/SPICE reports and an unreadable capability record must
+    /// use their corresponding fail-closed variants rather than a best guess.
+    #[allow(dead_code)]
+    pub(crate) fn publish_vdi_clip_text(
+        &self,
+        sink: &mut crate::CommandSink,
+        space: SpaceId,
+        text: &str,
+        source: &str,
+        capability: VdiClipboardCapability,
+    ) -> bool {
+        self.publish_clip_text_from_ingress(
+            sink,
+            space,
+            text,
+            source,
+            ClipboardIngress::Vdi(capability),
+        )
+    }
+
+    fn publish_clip_text_from_ingress(
+        &self,
+        sink: &mut crate::CommandSink,
+        space: SpaceId,
+        text: &str,
+        source: &str,
+        ingress: ClipboardIngress,
+    ) -> bool {
+        // Match the canonical event validator before constructing metadata:
+        // blank text or attribution would be discarded downstream, while a
+        // value over the shared UTF-8 byte ceiling must never be truncated here.
+        // The local session privacy gate is checked at this seam as well as at
+        // the widget boundary so test callers and future UI affordances cannot
+        // bypass the opt-in by constructing a command directly.
+        if !ingress.is_admitted()
+            || !self.clipboard_publishing_enabled
+            || text.trim().is_empty()
+            || source.trim().is_empty()
+            || !clip_fits_lane(text.len())
+        {
+            return false;
         }
 
         let item = ClipboardItem {
@@ -242,6 +333,7 @@ impl CommunicationsSurface {
             text: text.to_owned(),
             item,
         });
+        true
     }
 
     /// Emit [`AttachClipboard`](CollabCommand::AttachClipboard) — re-share `clip`
@@ -271,6 +363,38 @@ impl CommunicationsSurface {
     /// clip from the lane.
     pub(crate) fn delete_clip(&self, sink: &mut crate::CommandSink, space: SpaceId, clip: EventId) {
         sink.emit(CollabCommand::DeleteClipboard { space, clip });
+    }
+}
+
+/// Capability supplied by a VDI protocol adapter at the guest-to-mesh ingress.
+///
+/// This deliberately has no permissive default.  A backend must make a positive
+/// bidirectional assertion after validating its own protocol status; an absent
+/// or malformed record is kept distinct from a protocol that explicitly reports
+/// itself unsupported, and both are rejected before clipboard item hashing or
+/// command emission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VdiClipboardCapability {
+    /// Both host-to-guest and guest-to-host lanes have real protocol channels.
+    Bidirectional,
+    /// The backend explicitly reports that one or both lanes are unavailable.
+    Unsupported,
+    /// The backend record was absent, incomplete, or otherwise invalid.
+    Malformed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipboardIngress {
+    LocalSeat,
+    Vdi(VdiClipboardCapability),
+}
+
+impl ClipboardIngress {
+    const fn is_admitted(self) -> bool {
+        matches!(
+            self,
+            Self::LocalSeat | Self::Vdi(VdiClipboardCapability::Bidirectional)
+        )
     }
 }
 
@@ -326,7 +450,7 @@ impl ClipboardOrigin {
 /// never filtered here: visibility is a read-side property of the lane, while
 /// this helper only makes attribution explicit in the presentation.
 fn clipboard_origin(source: &str, local_source: &str) -> ClipboardOrigin {
-    if source.is_empty() {
+    if source.trim().is_empty() {
         ClipboardOrigin::Unattributed
     } else if source == local_source {
         ClipboardOrigin::Local
@@ -361,15 +485,16 @@ fn clip_preview(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        clip_fits_lane, clip_preview, clipboard_origin, ClipboardOrigin, MAX_CLIP_BYTES,
-        PREVIEW_MAX,
+        clip_fits_lane, clip_preview, clipboard_origin, ClipboardOrigin, VdiClipboardCapability,
+        MAX_CLIP_BYTES, PREVIEW_MAX,
     };
     use crate::{CommandSink, CommunicationsSurface};
     use mde_collab_types::SpaceId;
 
     #[test]
     fn oversized_clip_is_rejected_before_publish_command_materialization() {
-        let surface = CommunicationsSurface::new();
+        let mut surface = CommunicationsSurface::new();
+        surface.set_clipboard_publishing_enabled(true);
         let mut sink = CommandSink::new();
         let oversized = "x".repeat(MAX_CLIP_BYTES + 1);
 
@@ -385,6 +510,151 @@ mod tests {
     fn clip_lane_boundary_is_inclusive() {
         assert!(clip_fits_lane(MAX_CLIP_BYTES));
         assert!(!clip_fits_lane(MAX_CLIP_BYTES + 1));
+    }
+
+    #[test]
+    fn publish_clip_text_accepts_the_shared_canonical_limit() {
+        let mut surface = CommunicationsSurface::new();
+        surface.set_clipboard_publishing_enabled(true);
+        let mut sink = CommandSink::new();
+        let text = "x".repeat(mde_collab_types::MAX_CLIPBOARD_TEXT_BYTES);
+
+        assert!(surface.publish_clip_text(&mut sink, SpaceId::new(), &text, "eagle"));
+
+        let Some(mde_collab_types::CollabCommand::PublishClipboard {
+            text: published,
+            item,
+            ..
+        }) = sink.queued().first()
+        else {
+            panic!("canonical-bound clipboard text must become a publish command");
+        };
+        assert_eq!(published.len(), mde_collab_types::MAX_CLIPBOARD_TEXT_BYTES);
+        assert_eq!(item.len, published.len() as u64);
+        assert_eq!(item.source, "eagle");
+    }
+
+    #[test]
+    fn publish_clip_text_preserves_whitespace_in_canonical_payload() {
+        let mut surface = CommunicationsSurface::new();
+        surface.set_clipboard_publishing_enabled(true);
+        let mut sink = CommandSink::new();
+        let text = "  keep these bytes  ";
+
+        assert!(surface.publish_clip_text(&mut sink, SpaceId::new(), text, "eagle"));
+
+        let Some(mde_collab_types::CollabCommand::PublishClipboard {
+            text: published,
+            item,
+            ..
+        }) = sink.queued().first()
+        else {
+            panic!("clipboard payload must become a publish command");
+        };
+        assert_eq!(published, text);
+        assert_eq!(item.len, text.len() as u64);
+        assert_eq!(
+            item.sha256_hex,
+            mde_collab_types::value::sha256_hex(text.as_bytes())
+        );
+    }
+
+    #[test]
+    fn canonical_rejection_reports_failure_without_queueing_or_truncating() {
+        let mut surface = CommunicationsSurface::new();
+        surface.set_clipboard_publishing_enabled(true);
+        let mut sink = CommandSink::new();
+        let oversized = format!(
+            "{}é",
+            "x".repeat(mde_collab_types::MAX_CLIPBOARD_TEXT_BYTES - 1)
+        );
+
+        assert!(!surface.publish_clip_text(&mut sink, SpaceId::new(), &oversized, "seat:eagle"));
+        assert!(sink.queued().is_empty());
+    }
+
+    #[test]
+    fn canonical_rejection_reports_failure_for_blank_text_or_attribution() {
+        let mut surface = CommunicationsSurface::new();
+        surface.set_clipboard_publishing_enabled(true);
+        for (text, source) in [("  \n", "seat:eagle"), ("real text", "  ")] {
+            let mut sink = CommandSink::new();
+            assert!(!surface.publish_clip_text(&mut sink, SpaceId::new(), text, source));
+            assert!(sink.queued().is_empty());
+        }
+    }
+
+    #[test]
+    fn local_publish_is_opt_in_at_the_command_seam() {
+        let surface = CommunicationsSurface::new();
+        let mut sink = CommandSink::new();
+
+        assert!(!surface.clipboard_publishing_enabled());
+        assert!(
+            !surface.publish_clip_text(&mut sink, SpaceId::new(), "remote history stays", "eagle")
+        );
+        assert!(sink.is_empty());
+
+        let mut enabled = CommunicationsSurface::new();
+        enabled.set_clipboard_publishing_enabled(true);
+        assert!(enabled.clipboard_publishing_enabled());
+        assert!(enabled.publish_clip_text(
+            &mut sink,
+            SpaceId::new(),
+            "explicit opt-in publish",
+            "eagle"
+        ));
+        assert!(matches!(
+            sink.queued().first(),
+            Some(mde_collab_types::CollabCommand::PublishClipboard { .. })
+        ));
+    }
+
+    #[test]
+    fn unsupported_or_malformed_vdi_capability_never_materializes_a_publish_command() {
+        let mut surface = CommunicationsSurface::new();
+        surface.set_clipboard_publishing_enabled(true);
+
+        for capability in [
+            VdiClipboardCapability::Unsupported,
+            VdiClipboardCapability::Malformed,
+        ] {
+            let mut sink = CommandSink::new();
+            assert!(
+                !surface.publish_vdi_clip_text(
+                    &mut sink,
+                    SpaceId::new(),
+                    "guest clipboard must not cross an unverified boundary",
+                    "vdi:guest",
+                    capability,
+                ),
+                "{capability:?} VDI capability must fail closed"
+            );
+            assert!(
+                sink.is_empty(),
+                "{capability:?} VDI capability must not materialize a PublishClipboard command"
+            );
+        }
+    }
+
+    #[test]
+    fn explicitly_bidirectional_vdi_capability_uses_the_existing_bounded_publish_boundary() {
+        let mut surface = CommunicationsSurface::new();
+        surface.set_clipboard_publishing_enabled(true);
+        let mut sink = CommandSink::new();
+
+        assert!(surface.publish_vdi_clip_text(
+            &mut sink,
+            SpaceId::new(),
+            "guest clipboard",
+            "vdi:guest",
+            VdiClipboardCapability::Bidirectional,
+        ));
+        assert!(matches!(
+            sink.queued().first(),
+            Some(mde_collab_types::CollabCommand::PublishClipboard { text, item, .. })
+                if text == "guest clipboard" && item.source == "vdi:guest"
+        ));
     }
 
     #[test]
@@ -417,5 +687,44 @@ mod tests {
             ClipboardOrigin::Unattributed.label(""),
             "Source unavailable"
         );
+    }
+
+    #[test]
+    fn whitespace_only_source_is_unavailable_without_rewriting_attribution() {
+        assert_eq!(
+            clipboard_origin(" \t\n", "eagle"),
+            ClipboardOrigin::Unattributed,
+            "blank legacy attribution must not be presented as a remote source"
+        );
+    }
+
+    #[test]
+    fn explicit_publish_keeps_session_capture_opt_in_unchanged() {
+        let mut surface = CommunicationsSurface::new();
+        let mut sink = CommandSink::new();
+
+        assert!(!surface.clipboard_publishing_enabled());
+        assert!(!surface.publish_clip_text(
+            &mut sink,
+            SpaceId::new(),
+            "intentional Mesh Teams publish",
+            "eagle",
+        ));
+        assert!(sink.is_empty());
+        surface.set_clipboard_publishing_enabled(true);
+        assert!(surface.publish_clip_text(
+            &mut sink,
+            SpaceId::new(),
+            "intentional Mesh Teams publish",
+            "eagle",
+        ));
+        assert!(
+            surface.clipboard_publishing_enabled(),
+            "publishing must require and preserve the explicit session opt-in"
+        );
+        assert!(matches!(
+            sink.queued().first(),
+            Some(mde_collab_types::CollabCommand::PublishClipboard { .. })
+        ));
     }
 }

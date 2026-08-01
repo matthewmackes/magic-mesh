@@ -30,8 +30,6 @@ use mde_egui::Style;
 use crate::menu_bar::{Gate, MenuAction, MenuContext, OVERFLOW_GLYPH};
 use crate::tooltip::editor_menu_button;
 
-const EDITOR_TOOLBAR_TOOLTIP_MAX_W: f32 = Style::SP_XL * 12.0;
-
 /// The Word-97 zoom steps the dropdown offers.
 pub const ZOOM_STEPS: [u16; 6] = [50, 75, 100, 125, 150, 200];
 
@@ -195,7 +193,9 @@ pub const STRIP: [StripEntry; 19] = [
 /// (§7 — relocated, never lost). At full width every control renders in line.
 pub fn show(ui: &mut Ui, cx: &MenuContext, compact: bool) -> Option<MenuAction> {
     let mut action = None;
-    ui.horizontal(|ui| {
+    // The toolbar is allowed to grow vertically at large text scales; a
+    // single fixed row would clip commands on a direct-DRM seat.
+    ui.horizontal_wrapped(|ui| {
         ui.add_space(Style::SP_S);
         for entry in &STRIP {
             // Compact folds the width-heavy controls into the `»` overflow
@@ -322,30 +322,12 @@ fn overflow_contents(ui: &mut Ui, percent: u16, action: &mut Option<MenuAction>)
 }
 
 fn editor_toolbar_tooltip(ui: &mut Ui, text: &str) {
-    let ctx = ui.ctx().clone();
-    let surface = Style::resolve_color(&ctx, Style::SURFACE);
-    let border = Style::resolve_color(&ctx, Style::BORDER);
-    let text_color = Style::resolve_color(&ctx, Style::TEXT);
-    egui::Frame::NONE
-        .fill(surface)
-        .stroke(egui::Stroke::new(Style::STROKE_HAIRLINE, border))
-        .corner_radius(mde_egui::corner(Style::RADIUS_M))
-        .inner_margin(Style::tooltip_margin())
-        .show(ui, |ui| {
-            ui.set_max_width(EDITOR_TOOLBAR_TOOLTIP_MAX_W);
-            ui.add(
-                egui::Label::new(RichText::new(text).size(Style::SMALL).color(text_color)).wrap(),
-            );
-        });
+    mde_egui::tooltip(ui, text);
 }
 
 fn editor_toolbar_hover_text(response: egui::Response, text: impl Into<String>) -> egui::Response {
     let text = text.into();
-    response
-        .on_hover_ui({
-            let text = text.clone();
-            move |ui| editor_toolbar_tooltip(ui, text.as_str())
-        })
+    mde_egui::hover_text(response, text.clone())
         .on_disabled_hover_ui(move |ui| editor_toolbar_tooltip(ui, text.as_str()))
 }
 

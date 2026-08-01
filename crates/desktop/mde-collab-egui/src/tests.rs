@@ -33,18 +33,26 @@ use crate::{
 
 /// A `1000 x 700` headless input with the given events.
 fn sized_input(events: Vec<egui::Event>) -> egui::RawInput {
-    sized_input_with_modifiers(events, egui::Modifiers::default())
+    sized_input_with_size(events, egui::vec2(1000.0, 700.0))
 }
 
-/// A `1000 x 700` headless input with explicit currently-held modifiers.
-fn sized_input_with_modifiers(
+fn sized_input_with_modifiers(events: Vec<egui::Event>, modifiers: egui::Modifiers) -> egui::RawInput {
+    sized_input_with_size_and_modifiers(events, egui::vec2(1000.0, 700.0), modifiers)
+}
+
+fn sized_input_with_size(events: Vec<egui::Event>, size: egui::Vec2) -> egui::RawInput {
+    sized_input_with_size_and_modifiers(events, size, egui::Modifiers::default())
+}
+
+fn sized_input_with_size_and_modifiers(
     events: Vec<egui::Event>,
+    size: egui::Vec2,
     modifiers: egui::Modifiers,
 ) -> egui::RawInput {
     egui::RawInput {
         screen_rect: Some(egui::Rect::from_min_size(
             egui::Pos2::ZERO,
-            egui::vec2(1000.0, 700.0),
+            size,
         )),
         events,
         modifiers,
@@ -343,6 +351,50 @@ fn rail_row_model_maps_the_directory_in_order() {
 }
 
 #[test]
+fn selected_space_converges_when_the_live_directory_removes_it() {
+    let retained = SpaceId::new();
+    let removed = SpaceId::new();
+    let initial = FixtureData::new("eagle", 1_000_000)
+        .with_space(space_summary(
+            retained,
+            SpaceKind::Team,
+            "Retained",
+            SpaceRole::Owner,
+            0,
+            2,
+            900_000,
+        ))
+        .with_space(space_summary(
+            removed,
+            SpaceKind::Incident,
+            "Removed",
+            SpaceRole::Member,
+            0,
+            2,
+            901_000,
+        ));
+    let current = FixtureData::new("eagle", 1_001_000).with_space(space_summary(
+        retained,
+        SpaceKind::Team,
+        "Retained",
+        SpaceRole::Owner,
+        0,
+        2,
+        900_000,
+    ));
+
+    let mut surface = CommunicationsSurface::new();
+    let _ = render_shapes(&mut surface, &initial);
+    surface.select_space(removed);
+    assert_eq!(surface.selected_space(), Some(removed));
+
+    // The next frame is the convergence boundary: the rail may only expose
+    // `retained`, and every other pane must follow that same live key.
+    let _ = render_shapes(&mut surface, &current);
+    assert_eq!(surface.selected_space(), Some(retained));
+}
+
+#[test]
 fn details_pane_model_reads_selected_channel_facts() {
     // The Details pane is a read-model summary, not a provider stub: each count
     // comes from the same selected-space projections the existing bodies render.
@@ -574,7 +626,9 @@ fn details_pane_model_scopes_discord_bridge_to_selected_channel() {
 fn details_pane_paints_inside_the_frame() {
     let data = FixtureData::demo();
     let mut surface = CommunicationsSurface::new();
-    let shapes = render_shapes(&mut surface, &data);
+    // The shared Construct menubar is real vertical chrome; give the full
+    // Details contract enough headroom to verify every live projection row.
+    let shapes = render_shapes_with_size(&mut surface, &data, egui::vec2(1200.0, 800.0));
     let texts = painted_text(&shapes);
 
     for expected in [
@@ -687,7 +741,6 @@ fn channel_tasks_mode_renders_projected_rows() {
         egui::vec2(1000.0, 700.0),
     ));
     for expected in [
-        "Tasks",
         "Channel tasks",
         "operator-authored action items",
         "Rotate gateway",
@@ -919,7 +972,7 @@ fn rail_paints_the_shared_sidebar_with_the_unread_badge_overlay() {
     // rides the overlay bridge as an accent pill with the bright count.
     let data = FixtureData::demo();
     let mut surface = CommunicationsSurface::new();
-    let shapes = render_shapes(&mut surface, &data);
+    let shapes = render_shapes_with_size(&mut surface, &data, egui::vec2(1200.0, 700.0));
 
     let texts = painted_text(&shapes);
     for expected in ["Teams & Channels", "Team Ops", "Incident 42"] {
@@ -959,9 +1012,12 @@ fn rail_click_routes_through_the_shared_sidebar() {
     let mut sink = CommandSink::new();
 
     // Frame 1 registers the rows (and auto-selects the first space).
-    let _ = ctx.run(sized_input(vec![]), |ctx| {
+    let _ = ctx.run(
+        sized_input_with_size(vec![], egui::vec2(1200.0, 700.0)),
+        |ctx| {
         egui::CentralPanel::default().show(ctx, |ui| surface.ui(ui, &data, &mut sink));
-    });
+        },
+    );
     let first = data.space_directory().spaces[0].id;
     let second = data.space_directory().spaces[1].id;
     assert_eq!(surface.selected_space(), Some(first));
@@ -976,7 +1032,7 @@ fn rail_click_routes_through_the_shared_sidebar() {
 
     // Frame 2 clicks the second row.
     let _ = ctx.run(
-        sized_input(vec![
+        sized_input_with_size(vec![
             egui::Event::PointerMoved(at),
             egui::Event::PointerButton {
                 pos: at,
@@ -990,7 +1046,7 @@ fn rail_click_routes_through_the_shared_sidebar() {
                 pressed: false,
                 modifiers: egui::Modifiers::default(),
             },
-        ]),
+        ], egui::vec2(1200.0, 700.0)),
         |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| surface.ui(ui, &data, &mut sink));
         },
@@ -2573,12 +2629,69 @@ fn clipboard_mode_renders_a_fixture_lane() {
         image_mesh_count(&shapes) > 0,
         "the Clipboard mode must paint Carbon icons as image meshes"
     );
+    let texts = painted_text(&shapes);
+    assert!(
+        texts.iter().any(|(text, _)| text == "Remote · falcon"),
+        "remote clipboard history remains visible with local publishing opt-in off: {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|(text, _)| {
+            text.starts_with("Local clipboard publishing is off for this session.")
+                && text.contains("Remote history remains visible")
+        }),
+        "the session-scoped opt-in state must be explicit in the Clipboard surface: {texts:?}"
+    );
+}
+
+#[test]
+fn clipboard_opt_out_keeps_remote_history_and_attribution_visible() {
+    let space = SpaceId::new();
+    let data = FixtureData::new("eagle", 1_000_000)
+        .with_space(space_summary(
+            space,
+            SpaceKind::Team,
+            "Team Ops",
+            SpaceRole::Owner,
+            0,
+            2,
+            1_000_000,
+        ))
+        .with_clipboard_lane(ClipboardLane {
+            space,
+            items: vec![ClipboardView {
+                event_id: EventId::new(),
+                kind: ClipItemKind::Text,
+                preview: "remote note".to_owned(),
+                sha256_hex: "c".repeat(64),
+                source: "falcon".to_owned(),
+                at_unix_ms: 900_000,
+                pinned: false,
+            }],
+        });
+    let mut surface = CommunicationsSurface::new();
+    surface.select_space(space);
+    surface.set_mode(Mode::Clipboard);
+    let texts = painted_text(&render_shapes(&mut surface, &data));
+    let text_values: Vec<&str> = texts.iter().map(|(text, _)| text.as_str()).collect();
+
+    assert!(
+        text_values.contains(&"Remote · falcon"),
+        "turning off local publication must not hide remote clipboard attribution: {text_values:?}"
+    );
+    assert!(
+        text_values.iter().any(|text| {
+            text.starts_with("Local clipboard publishing is off for this session.")
+                && text.contains("Remote history remains visible")
+        }),
+        "the opt-out must be explicit at the composer boundary: {text_values:?}"
+    );
 }
 
 #[test]
 fn publishing_a_clip_emits_publish_clipboard_with_the_real_hash() {
     let space = SpaceId::new();
-    let surface = CommunicationsSurface::new();
+    let mut surface = CommunicationsSurface::new();
+    surface.set_clipboard_publishing_enabled(true);
     let mut sink = CommandSink::new();
     surface.publish_clip_text(&mut sink, space, "https://example.test/page", "eagle");
     let published = sink.queued().iter().find_map(|c| match c {

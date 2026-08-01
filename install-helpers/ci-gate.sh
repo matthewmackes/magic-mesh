@@ -22,6 +22,11 @@
 #   ci-gate.sh [run]     run the full gate on the CURRENT checkout, publish result
 #   ci-gate.sh policy    run the maintained policy-lint suite only (no farm I/O)
 #   ci-gate.sh --self-test  prove policy-stage failures propagate (no farm I/O)
+#   ci-gate.sh verify FILE [EXPECTATION ...]
+#                        verify a completed green status artifact and its log
+#                        (expectations: --expected-revision SHA
+#                         --expected-job-id ID --expected-build-host HOST
+#                         --expected-build-slot SLOT)
 #   ci-gate.sh poll      run only if origin/master advanced past the last-gated SHA
 #                        (the master-push trigger — cheap no-op when unchanged)
 #   ci-gate.sh liveness  alert if the gate hasn't produced a result within N days
@@ -35,6 +40,7 @@
 #   MCNF_CI_BUS_PASS_FILE  password file for the fallback  (default /root/.mcnf-xapi-cred)
 #   MCNF_CI_MAX_STALE_DAYS staleness threshold for liveness (default 2)
 #   MCNF_FARM_STATE      state dir                         (default $REPO/automation/.state)
+#   MCNF_BUILD_JOB_ID    upstream farm/job identity (optional; timer fallback is revision-scoped)
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -92,7 +98,7 @@ POLICY_SELF_TESTS=(
 POLICY_ROOT="$HERE"
 
 # ── result state (globals; filled by cmd_run, read by finish) ────────────────
-SHA="" ; SHORT="" ; STARTED="" ; FINISHED=""
+SHA="" ; SHORT="" ; STARTED="" ; FINISHED="" ; JOB_ID="" ; LOG_SHA256=""
 STAGE_POLICY="skipped" ; STAGE_FMT="skipped" ; STAGE_CLIPPY="skipped" ; STAGE_TEST="skipped" ; STAGE_COVERAGE="skipped"
 FAILED_STAGE="" ; OVERALL="green"
 TESTS_PASSED=0 ; TESTS_FAILED=0
@@ -100,6 +106,18 @@ TESTS_PASSED=0 ; TESTS_FAILED=0
 ts()  { date -u +%Y-%m-%dT%H:%M:%SZ; }
 say() { echo "==> ci-gate: $*"; }
 json_escape() { local s="${1//\\/\\\\}"; s="${s//\"/\\\"}"; printf '%s' "$s"; }
+file_sha256() { sha256sum -- "$1" | awk '{print $1}'; }
+
+# A timer-driven gate has no GitHub run number or queue record. Keep that case
+# traceable by deriving a stable identity from the gated revision and farm slot;
+# an upstream dispatcher may provide its stronger canonical ID explicitly.
+derive_job_id() {
+  if [ -n "${MCNF_BUILD_JOB_ID:-}" ]; then
+    printf '%s\n' "$MCNF_BUILD_JOB_ID"
+  else
+    printf 'ci-gate:%s:%s:%s\n' "$SHA" "$MCNF_BUILD_HOST" "$MCNF_BUILD_SLOT"
+  fi
+}
 
 # bus_publish <topic> <json-body> — best-effort, identical contract to
 # nightly.sh: publish locally if `mde-bus` is on PATH, else ssh to the shell node
@@ -211,6 +229,21 @@ finish() {
   OVERALL="green"; [ -z "$FAILED_STAGE" ] || OVERALL="RED"
   local alert=false; [ "$OVERALL" = green ] || alert=true
 
+  {
+    echo
+    echo "=== CI GATE SUMMARY $FINISHED → $OVERALL ==="
+    printf '  %-8s %s\n' policy "$STAGE_POLICY"
+    printf '  %-8s %s\n' fmt "$STAGE_FMT"
+    printf '  %-8s %s\n' clippy "$STAGE_CLIPPY"
+    printf '  %-8s %s  (%s passed, %s failed)\n' test "$STAGE_TEST" "$TESTS_PASSED" "$TESTS_FAILED"
+    printf '  %-8s %s\n' coverage "$STAGE_COVERAGE"
+    printf '  %-8s %s\n' sha "$SHORT"
+    printf '  %-8s %s\n' job "$JOB_ID"
+  } | tee -a "$LOG"
+  # Hash only after the completed summary is in the log, so the evidence
+  # fingerprint covers the exact artifact a reviewer receives.
+  LOG_SHA256="$(file_sha256 "$LOG")"
+
   cat > "$STATUS_JSON" <<JSON
 {
   "overall": "$OVERALL",
@@ -221,7 +254,13 @@ finish() {
   "tests_failed": $TESTS_FAILED,
   "sha": "$SHA",
   "short_sha": "$SHORT",
-  "build_host": "$MCNF_BUILD_HOST",
+  "job_id": "$(json_escape "$JOB_ID")",
+  "build_host": "$(json_escape "$MCNF_BUILD_HOST")",
+  "build_slot": "$(json_escape "$MCNF_BUILD_SLOT")",
+  "evidence": {
+    "revision": "$SHA",
+    "gate_log": { "path": "$(json_escape "$(basename "$LOG")")", "sha256": "$LOG_SHA256" }
+  },
   "started": "$STARTED",
   "finished": "$FINISHED",
   "source": "ci-gate"
@@ -231,20 +270,9 @@ JSON
   # MARKER mtime IS the last-run time the liveness check reads.
   printf 'ci-gate last run %s  sha=%s  overall=%s\n' "$FINISHED" "$SHORT" "$OVERALL" > "$MARKER"
 
-  {
-    echo
-    echo "=== CI GATE SUMMARY $FINISHED → $OVERALL ==="
-    printf '  %-8s %s\n' policy "$STAGE_POLICY"
-    printf '  %-8s %s\n' fmt "$STAGE_FMT"
-    printf '  %-8s %s\n' clippy "$STAGE_CLIPPY"
-    printf '  %-8s %s  (%s passed, %s failed)\n' test "$STAGE_TEST" "$TESTS_PASSED" "$TESTS_FAILED"
-    printf '  %-8s %s\n' coverage "$STAGE_COVERAGE"
-    printf '  %-8s %s\n' sha "$SHORT"
-  } | tee -a "$LOG"
-
   # Machine-readable result lane (mirrors event/test/nightly): every run, green or red.
   bus_publish event/ci/gate \
-    "{\"overall\":\"$OVERALL\",\"policy\":\"$STAGE_POLICY\",\"fmt\":\"$STAGE_FMT\",\"clippy\":\"$STAGE_CLIPPY\",\"test\":\"$STAGE_TEST\",\"coverage\":\"$STAGE_COVERAGE\",\"tests_passed\":$TESTS_PASSED,\"tests_failed\":$TESTS_FAILED,\"sha\":\"$SHORT\",\"finished\":\"$FINISHED\",\"source\":\"ci-gate\",\"alert\":$alert}"
+    "{\"overall\":\"$OVERALL\",\"policy\":\"$STAGE_POLICY\",\"fmt\":\"$STAGE_FMT\",\"clippy\":\"$STAGE_CLIPPY\",\"test\":\"$STAGE_TEST\",\"coverage\":\"$STAGE_COVERAGE\",\"tests_passed\":$TESTS_PASSED,\"tests_failed\":$TESTS_FAILED,\"sha\":\"$SHORT\",\"revision\":\"$SHA\",\"job_id\":\"$(json_escape "$JOB_ID")\",\"build_host\":\"$(json_escape "$MCNF_BUILD_HOST")\",\"build_slot\":\"$(json_escape "$MCNF_BUILD_SLOT")\",\"artifact\":{\"path\":\"$(json_escape "$LOG")\",\"sha256\":\"$LOG_SHA256\"},\"finished\":\"$FINISHED\",\"source\":\"ci-gate\",\"alert\":$alert}"
 
   # RED → KIRON operator toast (critical breaks through suppression); GREEN is a
   # quiet heartbeat (the result lane above), no toast spam.
@@ -258,11 +286,12 @@ JSON
 cmd_run() {
   SHA="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
   SHORT="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  JOB_ID="$(derive_job_id)"
   STARTED="$(ts)"
   : > "$LOG"
   {
     echo "MCNF CI gate — $STARTED"
-    echo "  sha=$SHORT  host=$MCNF_BUILD_HOST (slot=$MCNF_BUILD_SLOT)"
+    echo "  sha=$SHORT  revision=$SHA  job_id=$JOB_ID  host=$MCNF_BUILD_HOST (slot=$MCNF_BUILD_SLOT)"
   } | tee "$LOG"
 
   if run_policy_stage; then
@@ -298,6 +327,163 @@ cmd_policy() {
   run_policy_stage
 }
 
+# verify_status — validate the promotion-facing artifact emitted by finish.
+# A status file is not authoritative merely because it is parseable: it must
+# describe a green result for every stage, include observed test output, bind to
+# a revision/job/farm slot, and point at an unchanged log. This is intentionally
+# stricter than liveness, which reports stale or red results without rejecting
+# them; callers using this command are asking whether the result is usable as a
+# required-check input.
+verify_status() {
+  local file expected_revision="" expected_job_id="" expected_build_host="" expected_build_slot=""
+  local log expected actual sha_prefix sha file_dir log_name test_summary
+  local log_passed log_failed stage recorded_short_sha recorded_job_id recorded_host recorded_slot
+  [ "$#" -ge 1 ] || {
+    echo "ci-gate: verify requires a status artifact path" >&2
+    return 1
+  }
+  file="$1"
+  shift
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --expected-revision)
+        [ "$#" -ge 2 ] && [ -n "$2" ] || { echo "ci-gate: --expected-revision requires a value" >&2; return 1; }
+        expected_revision="$2"
+        shift 2
+        ;;
+      --expected-job-id)
+        [ "$#" -ge 2 ] && [ -n "$2" ] || { echo "ci-gate: --expected-job-id requires a value" >&2; return 1; }
+        expected_job_id="$2"
+        shift 2
+        ;;
+      --expected-build-host)
+        [ "$#" -ge 2 ] && [ -n "$2" ] || { echo "ci-gate: --expected-build-host requires a value" >&2; return 1; }
+        expected_build_host="$2"
+        shift 2
+        ;;
+      --expected-build-slot)
+        [ "$#" -ge 2 ] && [ -n "$2" ] || { echo "ci-gate: --expected-build-slot requires a value" >&2; return 1; }
+        expected_build_slot="$2"
+        shift 2
+        ;;
+      *)
+        echo "ci-gate: unknown verify expectation: $1" >&2
+        return 1
+        ;;
+    esac
+  done
+  [ -f "$file" ] && [ ! -L "$file" ] || {
+    echo "ci-gate: status artifact is not a regular, non-symlink file: $file" >&2
+    return 1
+  }
+  command -v jq >/dev/null 2>&1 || {
+    echo "ci-gate: verify requires jq" >&2
+    return 1
+  }
+  sha_prefix="$(jq -r '.sha[0:7]' "$file" 2>/dev/null || true)"
+  sha="$(jq -r '.sha' "$file" 2>/dev/null || true)"
+  jq -e '
+    (type == "object") and
+    (keys == ["alert", "build_host", "build_slot", "evidence", "failed_stage", "finished", "job_id", "overall", "sha", "short_sha", "source", "stages", "started", "tests_failed", "tests_passed"]) and
+    (.overall == "green") and (.alert == false) and (.failed_stage == "") and
+    (.source == "ci-gate") and
+    (.sha | type == "string" and test("^[0-9a-fA-F]{40,64}$")) and
+    (.short_sha | type == "string" and length >= 7 and startswith($sha_prefix)) and
+    (.job_id | type == "string" and test("^[^[:space:][:cntrl:]]+$")) and
+    (.build_host | type == "string" and test("^[^[:space:][:cntrl:]]+$")) and
+    (.build_slot | type == "string" and test("^[^[:space:][:cntrl:]]+$")) and
+    (.stages | type == "object" and (keys == ["clippy", "coverage", "fmt", "policy", "test"]) and all(.[]; . == "pass")) and
+    (.tests_passed | type == "number" and floor == . and . > 0) and
+    (.tests_failed == 0) and
+    (.evidence | type == "object" and (keys == ["gate_log", "revision"]) and .revision == $sha and
+      (.gate_log | type == "object" and (keys == ["path", "sha256"]) and
+        (.path | type == "string" and length > 0) and
+        (.sha256 | type == "string" and test("^[0-9a-f]{64}$"))))
+  ' --arg sha_prefix "$sha_prefix" --arg sha "$sha" "$file" >/dev/null || {
+    echo "ci-gate: invalid, incomplete, or non-green status artifact: $file" >&2
+    return 1
+  }
+  if [ -n "$expected_revision" ] && [ "$sha" != "$expected_revision" ]; then
+    echo "ci-gate: status revision does not match expected source revision" >&2
+    return 1
+  fi
+  file_dir="$(cd -- "$(dirname -- "$file")" && pwd -P)" || return 1
+  log_name="$(jq -r '.evidence.gate_log.path' "$file")"
+  case "$log_name" in
+    ci-gate.log) ;;
+    *)
+      echo "ci-gate: evidence log must be the sibling ci-gate.log: $log_name" >&2
+      return 1
+      ;;
+  esac
+  log="$file_dir/$log_name"
+  expected="$(jq -r '.evidence.gate_log.sha256' "$file")"
+  [ -f "$log" ] && [ ! -L "$log" ] || {
+    echo "ci-gate: referenced gate log is not a regular, non-symlink file: $log" >&2
+    return 1
+  }
+  actual="$(file_sha256 "$log")" || return 1
+  [ "$actual" = "$expected" ] || {
+    echo "ci-gate: referenced gate log digest does not match status artifact: $log" >&2
+    return 1
+  }
+  recorded_short_sha="$(jq -r '.short_sha' "$file")"
+  recorded_job_id="$(jq -r '.job_id' "$file")"
+  recorded_host="$(jq -r '.build_host' "$file")"
+  recorded_slot="$(jq -r '.build_slot' "$file")"
+  if [ -n "$expected_job_id" ] && [ "$recorded_job_id" != "$expected_job_id" ]; then
+    echo "ci-gate: status job identity does not match expected GitHub farm job" >&2
+    return 1
+  fi
+  if [ -n "$expected_build_host" ] && [ "$recorded_host" != "$expected_build_host" ]; then
+    echo "ci-gate: status build host does not match expected farm host" >&2
+    return 1
+  fi
+  if [ -n "$expected_build_slot" ] && [ "$recorded_slot" != "$expected_build_slot" ]; then
+    echo "ci-gate: status build slot does not match expected farm slot" >&2
+    return 1
+  fi
+  grep -Fq "revision=$sha" "$log" || {
+    echo "ci-gate: gate log is not bound to the recorded revision" >&2
+    return 1
+  }
+  grep -Fqx -- "  sha=$recorded_short_sha  revision=$sha  job_id=$recorded_job_id  host=$recorded_host (slot=$recorded_slot)" "$log" || {
+    echo "ci-gate: gate log is not bound to the recorded job, host, and slot" >&2
+    return 1
+  }
+  [ "$(grep -Ec '^=== CI GATE SUMMARY .+ → green ===$' "$log")" -eq 1 ] || {
+    echo "ci-gate: gate log has no completed green summary" >&2
+    return 1
+  }
+  if grep -Eq '^=== CI GATE SUMMARY .+ → RED ===$|^  (policy|fmt|clippy|test|coverage)[[:space:]]+fail([[:space:]]|$)' "$log"; then
+    echo "ci-gate: gate log contains a contradictory failed result" >&2
+    return 1
+  fi
+  for stage in policy fmt clippy coverage; do
+    grep -Eq "^  ${stage}[[:space:]]+pass$" "$log" || {
+      echo "ci-gate: gate log is missing the completed pass record for $stage" >&2
+      return 1
+    }
+  done
+  test_summary="$(grep -E '^  test[[:space:]]+pass[[:space:]]+\([0-9]+ passed, [0-9]+ failed\)$' "$log" | tail -n 1)" || true
+  if [[ "$test_summary" =~ ^[[:space:]]+test[[:space:]]+pass[[:space:]]+\(([0-9]+)[[:space:]]+passed,[[:space:]]+([0-9]+)[[:space:]]+failed\)$ ]]; then
+    log_passed="${BASH_REMATCH[1]}"
+    log_failed="${BASH_REMATCH[2]}"
+  else
+    echo "ci-gate: gate log is missing the completed test pass record" >&2
+    return 1
+  fi
+  [ "$log_passed" = "$(jq -r '.tests_passed' "$file")" ] || {
+    echo "ci-gate: gate log test count does not match status artifact" >&2
+    return 1
+  }
+  [ "$log_failed" = "$(jq -r '.tests_failed' "$file")" ] || {
+    echo "ci-gate: gate log failure count does not match status artifact" >&2
+    return 1
+  }
+  echo "ci-gate: verified green status for $(jq -r '.sha' "$file") on $(jq -r '.build_host' "$file")/$(jq -r '.build_slot' "$file")"
+}
+
 # cmd_self_test — prove the policy-stage aggregator returns failure when any
 # constituent check fails and success only when all checks pass. Coreutils
 # true/false make this deterministic without modifying the checkout.
@@ -315,7 +501,157 @@ cmd_self_test() {
     echo "ci-gate.sh: SELF-TEST FAILED — an all-green policy stage failed" >&2
     return 1
   fi
-  echo "ci-gate.sh: self-test passed — policy failures propagate"
+
+  local work status log log_digest rc
+  work="$(mktemp -d "${TMPDIR:-/tmp}/ci-gate-self-test.XXXXXX")"
+  trap 'rm -rf -- "$work"' RETURN
+  status="$work/status.json"
+  log="$work/ci-gate.log"
+cat >"$log" <<'EOF'
+MCNF CI gate — self-test
+  sha=0123456  revision=0123456789abcdef0123456789abcdef01234567  job_id=self-test-job  host=172.20.0.130 (slot=self-test-slot)
+=== CI GATE SUMMARY self-test → green ===
+  policy   pass
+  fmt      pass
+  clippy   pass
+  test     pass  (1 passed, 0 failed)
+  coverage pass
+EOF
+  log_digest="$(file_sha256 "$log")"
+  jq -n \
+    --arg sha 0123456789abcdef0123456789abcdef01234567 \
+    --arg log "$log" --arg digest "$log_digest" \
+    '{overall:"green",alert:false,failed_stage:"",stages:{policy:"pass",fmt:"pass",clippy:"pass",test:"pass",coverage:"pass"},tests_passed:1,tests_failed:0,sha:$sha,short_sha:($sha[0:7]),job_id:"self-test-job",build_host:"172.20.0.130",build_slot:"self-test-slot",evidence:{revision:$sha,gate_log:{path:"ci-gate.log",sha256:$digest}},started:"self-test",finished:"self-test",source:"ci-gate"}' \
+    >"$status"
+  verify_status "$status" >/dev/null || {
+    echo "ci-gate.sh: SELF-TEST FAILED — valid green status was rejected" >&2
+    return 1
+  }
+  set +e
+  verify_status "$status" --expected-revision different-source-revision >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || {
+    echo "ci-gate.sh: SELF-TEST FAILED — mismatched expected revision was accepted" >&2
+    return 1
+  }
+  verify_status "$status" \
+    --expected-revision 0123456789abcdef0123456789abcdef01234567 \
+    --expected-job-id self-test-job \
+    --expected-build-host 172.20.0.130 \
+    --expected-build-slot self-test-slot >/dev/null || {
+    echo "ci-gate.sh: SELF-TEST FAILED — matching farm identity was rejected" >&2
+    return 1
+  }
+  "$HERE/ci-gate.sh" verify "$status" \
+    --expected-revision 0123456789abcdef0123456789abcdef01234567 \
+    --expected-job-id self-test-job \
+    --expected-build-host 172.20.0.130 \
+    --expected-build-slot self-test-slot >/dev/null || {
+    echo "ci-gate.sh: SELF-TEST FAILED — CLI verify rejected matching farm identity" >&2
+    return 1
+  }
+  set +e
+  "$HERE/ci-gate.sh" verify "$status" --expected-build-host wrong-host >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || {
+    echo "ci-gate.sh: SELF-TEST FAILED — CLI accepted mismatched farm host" >&2
+    return 1
+  }
+  set +e
+  verify_status "$status" --expected-job-id wrong-job >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || {
+    echo "ci-gate.sh: SELF-TEST FAILED — mismatched expected job was accepted" >&2
+    return 1
+  }
+  set +e
+  verify_status "$status" --expected-build-slot wrong-slot >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || {
+    echo "ci-gate.sh: SELF-TEST FAILED — mismatched expected farm slot was accepted" >&2
+    return 1
+  }
+  set +e
+  verify_status "$status" --expected-build-host wrong-host >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || {
+    echo "ci-gate.sh: SELF-TEST FAILED — mismatched expected farm host was accepted" >&2
+    return 1
+  }
+  ln -s -- "$status" "$work/status-symlink.json"
+  set +e
+  verify_status "$work/status-symlink.json" >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || {
+    echo "ci-gate.sh: SELF-TEST FAILED — status symlink was accepted" >&2
+    return 1
+  }
+  jq '.evidence.gate_log.path = "../ci-gate.log"' "$status" >"$work/path-status.json"
+  set +e
+  verify_status "$work/path-status.json" >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || {
+    echo "ci-gate.sh: SELF-TEST FAILED — escaping evidence path was accepted" >&2
+    return 1
+  }
+  local incomplete incomplete_digest
+  incomplete="$work/incomplete"
+  mkdir -p -- "$incomplete"
+  cp -- "$log" "$incomplete/ci-gate.log"
+  sed -i '/^  coverage[[:space:]]\+pass$/d' "$incomplete/ci-gate.log"
+  incomplete_digest="$(file_sha256 "$incomplete/ci-gate.log")"
+  jq --arg digest "$incomplete_digest" '.evidence.gate_log.sha256 = $digest' \
+    "$status" >"$incomplete/status.json"
+  set +e
+  verify_status "$incomplete/status.json" >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || {
+    echo "ci-gate.sh: SELF-TEST FAILED — incomplete green log was accepted" >&2
+    return 1
+  }
+  local contradictory contradictory_digest
+  contradictory="$work/contradictory"
+  mkdir -p -- "$contradictory"
+  cp -- "$log" "$contradictory/ci-gate.log"
+  printf '  fmt      fail\n' >>"$contradictory/ci-gate.log"
+  contradictory_digest="$(file_sha256 "$contradictory/ci-gate.log")"
+  jq --arg digest "$contradictory_digest" '.evidence.gate_log.sha256 = $digest' \
+    "$status" >"$contradictory/status.json"
+  set +e
+  verify_status "$contradictory/status.json" >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || {
+    echo "ci-gate.sh: SELF-TEST FAILED — contradictory failed log was accepted" >&2
+    return 1
+  }
+  jq '.build_slot = "wrong-slot"' "$status" >"$work/identity-status.json"
+  set +e
+  verify_status "$work/identity-status.json" >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || {
+    echo "ci-gate.sh: SELF-TEST FAILED — mismatched farm slot was accepted" >&2
+    return 1
+  }
+  printf 'tampered\n' >>"$log"
+  set +e
+  verify_status "$status" >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || {
+    echo "ci-gate.sh: SELF-TEST FAILED — tampered gate log was accepted" >&2
+    return 1
+  }
+  echo "ci-gate.sh: self-test passed — policy failures and evidence tampering propagate"
 }
 
 # cmd_poll — the master-push trigger. Run the gate only when origin/master has
@@ -373,6 +709,9 @@ case "${1:-run}" in
   run)      cmd_run ;;
   policy)   cmd_policy ;;
   --self-test) cmd_self_test ;;
+  verify)
+    verify_status "${@:2}"
+    ;;
   poll)     cmd_poll ;;
   liveness) cmd_liveness ;;
   -h | --help | help) usage ;;

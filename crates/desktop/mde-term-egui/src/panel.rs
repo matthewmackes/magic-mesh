@@ -22,8 +22,8 @@
 //! UI; it is the mount seam the shell drives, the same way the standalone
 //! `mde-term-egui` binary drives it in its own window.
 
-use mde_egui::egui::{Context, RichText, Ui};
-use mde_egui::Style;
+use mde_egui::egui::{Context, Ui};
+use mde_egui::{Style, WorkspaceState, WorkspaceStatePanel};
 
 use crate::{MenuBar, SpawnOptions, TabbedTerminal, TmuxChrome};
 
@@ -179,18 +179,15 @@ pub fn terminal_panel(ui: &mut Ui, surface: &mut TerminalSurface) {
 /// The "no session" face — the last tab closed. Offers a fresh shell so a docked
 /// terminal never dead-ends (§7 honest empty state, not a blank surface).
 fn empty_state(ui: &mut Ui, term: &mut TabbedTerminal) {
-    ui.vertical_centered(|ui| {
-        ui.add_space(Style::SP_XL);
-        ui.label(
-            RichText::new("No terminal sessions")
-                .size(Style::BODY)
-                .color(Style::TEXT_DIM),
-        );
-        ui.add_space(Style::SP_S);
-        if ui.button("New terminal").clicked() {
-            term.new_tab();
-        }
-    });
+    let response = WorkspaceStatePanel::new(
+        WorkspaceState::Empty,
+        "No terminal sessions",
+        "Start a new shell when you are ready.",
+    )
+    .show(ui, |ui| ui.button("New terminal"));
+    if response.inner.clicked() {
+        term.new_tab();
+    }
 }
 
 #[cfg(test)]

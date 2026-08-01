@@ -431,7 +431,7 @@ fn show_status(ui: &mut egui::Ui, status: &ProvStatus) {
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            ui.group(|ui| show_posture(ui, status));
+            mde_egui::card().show(ui, |ui| show_posture(ui, status));
             ui.add_space(Style::SP_S);
 
             ui.label(
@@ -439,7 +439,7 @@ fn show_status(ui: &mut egui::Ui, status: &ProvStatus) {
                     .color(Style::TEXT_DIM)
                     .size(Style::SMALL),
             );
-            ui.group(|ui| show_versions(ui, status));
+            mde_egui::card().show(ui, |ui| show_versions(ui, status));
             ui.add_space(Style::SP_S);
 
             ui.label(
@@ -447,7 +447,7 @@ fn show_status(ui: &mut egui::Ui, status: &ProvStatus) {
                     .color(Style::TEXT_DIM)
                     .size(Style::SMALL),
             );
-            ui.group(|ui| show_nodes(ui, status));
+            mde_egui::card().show(ui, |ui| show_nodes(ui, status));
             ui.add_space(Style::SP_S);
 
             // Honest boundary (§6/§7): a live onboarding wizard's state / in-progress

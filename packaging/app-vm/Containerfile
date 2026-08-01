@@ -1,0 +1,56 @@
+# WL-FUNC-018 — immutable guest profile for the curated App VM path.
+#
+# This is intentionally separate from the DRM-native Construct host image. The
+# guest owns the Wayland compositor, portals, Flatpak runtime, PipeWire, and
+# application surface; the host never installs or launches the app.
+
+ARG APP_VM_BASE=quay.io/fedora/fedora-bootc:44
+FROM ${APP_VM_BASE}
+
+ARG MCNF_RPM_LANE=repo
+
+COPY packaging/app-vm/rpms/ /tmp/mcnf-rpms/
+COPY packaging/app-vm/validate-runtime-inputs.sh /tmp/mcnf-app-vm-validate
+COPY packaging/app-vm/mcnf-app-vm-launch.sh /tmp/mcnf-app-vm-launch
+COPY packaging/repo/magic-mesh.repo /etc/yum.repos.d/magic-mesh.repo
+
+RUN set -eux; \
+    install -D -m 0755 /tmp/mcnf-app-vm-validate /usr/local/libexec/mcnf-app-vm-validate; \
+    install -D -m 0755 /tmp/mcnf-app-vm-launch /usr/local/libexec/mcnf-app-vm-launch; \
+    if [ "${MCNF_RPM_LANE}" = "local" ]; then \
+        ls /tmp/mcnf-rpms/magic-mesh-*.rpm >/dev/null 2>&1 || { \
+            echo "FATAL: local App VM image lane needs a magic-mesh RPM"; exit 1; }; \
+        dnf -y install /tmp/mcnf-rpms/magic-mesh-*.rpm; \
+    else \
+        dnf -y install magic-mesh; \
+    fi; \
+    dnf -y install \
+        dbus-daemon dbus-tools \
+        flatpak \
+        sway \
+        xdg-desktop-portal xdg-desktop-portal-wlr xdg-desktop-portal-gtk \
+        pipewire pipewire-pulseaudio wireplumber \
+        mesa-dri-drivers mesa-libEGL mesa-libGL mesa-libgbm \
+        libinput libxkbcommon; \
+    install -d -m 0755 /usr/share/mcnf/app-vm; \
+    printf '%s\n' \
+        'profile=wayland-standard' \
+        'compositor=sway' \
+        'portal_frontend=xdg-desktop-portal' \
+        'portal_backend=xdg-desktop-portal-wlr,xdg-desktop-portal-gtk' \
+        'audio=pipewire' \
+        'flatpak_remote=curated' \
+        'network=deny-by-default' \
+        > /usr/share/mcnf/app-vm/wayland-standard.profile; \
+    printf '%s\n' \
+        '{"schema_version":1,"profile":"wayland-standard","compositor":"sway",' \
+        '"portal_frontend":"xdg-desktop-portal",' \
+        '"portal_backends":["xdg-desktop-portal-wlr","xdg-desktop-portal-gtk"],' \
+        '"flatpak_remote":"curated","network":"deny-by-default"}' \
+        > /usr/share/mcnf/app-vm/image-contract.json; \
+    rm -rf /tmp/mcnf-rpms /tmp/mcnf-app-vm-validate /tmp/mcnf-app-vm-launch; \
+    dnf clean all
+
+# The curated Flatpak remote is deliberately not created here. Its signed
+# remote metadata is deployment-owned; the App VM first-boot runtime checks for
+# the exact `curated` remote and refuses to install an app when it is absent.

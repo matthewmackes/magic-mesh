@@ -1,0 +1,4 @@
+# WL-FUNC-018 — App VM Containerfile only copies packaging inputs. Keep crates,
+# target trees, docs, and VCS metadata out of the build context.
+*
+!packaging

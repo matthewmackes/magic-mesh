@@ -12,7 +12,6 @@ use mde_egui::eframe::{self, App, CreationContext};
 use mde_egui::egui::{
     self, Align, Context, CursorIcon, Layout, Response, RichText, ScrollArea, Sense,
 };
-use mde_egui::nav_chrome::NavigationBar;
 use mde_egui::{Motion, Style};
 
 use mde_musicd::airsonic::{Album, Client, Song};
@@ -156,13 +155,6 @@ impl MusicApp {
 
     /// The album library listing (or its loading/empty/error state).
     fn render_library(&mut self, ui: &mut egui::Ui) {
-        // PLATFORM-INTERFACES Q19 — the listing's title rides the shared
-        // [`NavigationBar`] (centered Title3 rung, standard strip, its own
-        // bottom hairline) instead of a hand-rolled HEADING label over a
-        // separator, so both top-level views wear the ONE platform top bar.
-        let _ = NavigationBar::new("Library").show(ui);
-        ui.add_space(Style::SP_S);
-
         let mut to_open: Option<Album> = None;
         match &self.state.albums {
             Fetch::Idle | Fetch::Loading => {
@@ -201,17 +193,19 @@ impl MusicApp {
         let mut to_play: Option<Song> = None;
 
         if let Some(open) = &self.state.open_album {
-            // PLATFORM-INTERFACES Q19 — the open album's back affordance + title
-            // are the shared [`NavigationBar`] (accent chevron + previous title,
-            // centered Title3 album name) instead of a hand-rolled button over a
-            // HEADING label; back drives the SAME [`MusicState::close`] seam the
-            // old button (and the View menu's Back to Library) drives.
-            let bar = NavigationBar::new(&open.album.name)
-                .with_back("Library")
-                .show(ui);
-            if bar.back_activated {
-                go_back = true;
-            }
+            // The shared Music MenuBar owns workspace identity. Album title and
+            // return navigation are domain content below it, so this view does
+            // not create a second host title strip in either runner.
+            ui.horizontal(|ui| {
+                if ui.button("‹ Library").clicked() {
+                    go_back = true;
+                }
+                ui.label(
+                    RichText::new(&open.album.name)
+                        .size(Style::TYPE_TITLE3)
+                        .color(Style::TEXT),
+                );
+            });
             let subtitle = album_subtitle(&open.album);
             if !subtitle.is_empty() {
                 ui.add_space(Style::SP_XS);
@@ -505,7 +499,7 @@ fn track_row(ui: &mut egui::Ui, index: usize, song: &Song) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{hover_tab_rect, music_panel, MusicApp};
+    use super::{hover_tab_rect, music_header, music_panel, MusicApp};
     use crate::menubar::MenuAction;
     use crate::model::{Fetch, MusicState, Update};
     use mde_egui::egui::{self, pos2, vec2, Rect};
@@ -570,6 +564,23 @@ mod tests {
         });
         let prims = ctx.tessellate(out.shapes.clone(), out.pixels_per_point);
         assert!(!prims.is_empty(), "frame produced no draw primitives");
+        out.shapes
+    }
+
+    fn render_full_shapes(app: &mut MusicApp) -> Vec<egui::epaint::ClippedShape> {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(640.0, 480.0))),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::TopBottomPanel::top("music-header-test")
+                .show(ctx, |ui| music_header(ui, app));
+            egui::CentralPanel::default().show(ctx, |ui| music_panel(ui, app));
+        });
+        let prims = ctx.tessellate(out.shapes.clone(), out.pixels_per_point);
+        assert!(!prims.is_empty(), "full music frame produced no draw primitives");
         out.shapes
     }
 
@@ -651,49 +662,35 @@ mod tests {
         render(&mut app_with(state, None));
     }
 
-    /// PLATFORM-INTERFACES Q19 (WL-UX-006/U21): both top-level views ride the
-    /// shared NavigationBar — the listing's "Library" title and the open album's
-    /// title both paint on the Title3 rung (never the old hand-rolled HEADING),
-    /// and the album bar carries the back affordance's previous-title text in
-    /// place of the retired "Back to library" button.
+    /// The shared Music MenuBar owns the host title. Album identity and its
+    /// domain return affordance remain below it without a second AppFrame.
     #[test]
-    fn view_headers_ride_the_shared_navigation_bar() {
-        // The listing: "Library" is the bar title on the Title3 rung.
+    fn view_headers_avoid_a_second_app_frame() {
+        // The listing: the shared host bar owns the Music title.
         let mut ready = MusicState::new();
         ready.albums = Fetch::Ready(vec![album("1")]);
-        let texts = painted_text(&render_shapes(&mut app_with(ready, None)));
+        let texts = painted_text(&render_full_shapes(&mut app_with(ready, None)));
         assert!(
             texts
                 .iter()
-                .any(|(t, s)| t == "Library" && (*s - Style::TYPE_TITLE3).abs() < f32::EPSILON),
-            "the listing title must render on the shared bar's Title3 rung: {texts:?}"
-        );
-        assert!(
-            !texts
-                .iter()
-                .any(|(t, s)| t == "Library" && (*s - Style::HEADING).abs() < f32::EPSILON),
-            "the old hand-rolled HEADING title must be gone: {texts:?}"
+                .any(|(t, _)| t == "MUSIC"),
+            "the workspace title must render on the shared bar: {texts:?}"
         );
 
-        // The open album: the bar centers the album title on Title3 and carries
-        // the back affordance's previous title instead of the old button.
+        // The open album: its title is domain content below the shared bar.
         let mut state = MusicState::new();
         state.open(album("7"));
         state.open_album.as_mut().expect("an album is open").tracks = Fetch::Ready(vec![song("a")]);
-        let texts = painted_text(&render_shapes(&mut app_with(state, None)));
+        let texts = painted_text(&render_full_shapes(&mut app_with(state, None)));
         assert!(
             texts
                 .iter()
                 .any(|(t, s)| t == "Album 7" && (*s - Style::TYPE_TITLE3).abs() < f32::EPSILON),
-            "the album title must render on the shared bar's Title3 rung: {texts:?}"
+            "the album title must render below the shared bar: {texts:?}"
         );
         assert!(
-            texts.iter().any(|(t, _)| t == "Library"),
-            "the bar's back affordance must carry the previous title: {texts:?}"
-        );
-        assert!(
-            !texts.iter().any(|(t, _)| t == "Back to library"),
-            "the hand-rolled back button is retired in favour of the bar: {texts:?}"
+            texts.iter().any(|(t, _)| t.contains("Library")),
+            "the domain back affordance must remain visible: {texts:?}"
         );
     }
 

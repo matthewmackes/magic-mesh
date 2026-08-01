@@ -1,0 +1,49 @@
+# Browser VM guest profile
+
+`profile.env` is the small, reviewable contract at the Construct/Browser VM
+boundary. It identifies the guest image and immutable source provenance
+(repository, path, and pinned commit), fixes the Arch-008
+baseline (4 vCPU, 8 GiB RAM, 64 GiB disk), and declares the only supported
+display transports. The host is explicitly forbidden from owning a Browser
+engine; Chromium, browser chrome, page execution, media decode, and failures
+remain inside the guest.
+
+The profile verifier admits only a root-owned regular file: symlinked,
+group/other-writable, and executable profile inputs are rejected before the
+profile is parsed. This keeps a mutable or redirected profile from changing
+the guest identity or source provenance after the caller selects it.
+
+This file is a profile contract, not proof that an image has been built or a VM
+is running. Image publication still needs signed artifact evidence and live VDI
+acceptance. Run `verify-profile.sh` before handing the profile to an image or
+Workloads adapter. The verifier parses the file as data, never sources it as
+shell, and rejects missing/duplicate/unknown fields, weak resource values,
+unsupported transport claims, host-engine names, missing provenance, or the
+all-zero Git revision placeholder.
+
+The guest launch boundary is equally fail-closed. Workloads writes only
+`profile-id`, `image-id`, `image-digest`, `session-id`, and `transport` under
+`/etc/mackesd/browser-vm`; the image runs `validate-runtime-inputs.sh` before
+starting Sway or a VDI endpoint. It requires the admitted Browser VM identity,
+a 64-byte hexadecimal SHA-256 image reference, a bounded identity token, and
+`sunshine` or `rdp`. Extra files, symlinks, commands, URLs, paths, and shell
+syntax are rejected. No launch command, host-browser fallback, or
+host-supplied lifecycle state is accepted from the host. The profile explicitly
+declares `fail-closed` runtime behavior and `failed,unavailable` guest terminal
+states; Workloads/session-broker owns publication of those states, and a guest
+that cannot pass admission remains unavailable rather than starting a fallback.
+The provisioning directory and every admitted record must be root-owned; the
+directory may be traversable, but records may not be writable by group/other or
+executable. This prevents a second process from replacing an identity after
+the admission check while keeping the record format non-executable.
+
+Run `verify-contract.sh` for the focused contract tests. These tests exercise
+both the static profile and the guest launch admission boundary; they do not
+claim that an image has been built or that a live guest is ready. The
+Workloads/session-broker plane remains the single authority for placement,
+capabilities, and lifecycle; the guest validator is only an admission check and
+does not create a second control plane.
+
+The source URL and path are deliberately recorded now so a later standalone
+Browser-stack extraction can bind the guest profile to an immutable source
+record rather than silently reusing a host image.

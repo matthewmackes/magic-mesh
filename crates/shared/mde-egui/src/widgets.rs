@@ -4,9 +4,10 @@
 //! these instead of re-typing the same idiom, so a look lives in ONE place
 //! (§6 glue; `/polish` axis 7 — component reuse & consolidation).
 
-use egui::{Color32, CornerRadius, Frame, Margin, Response, Sense, Ui};
+use egui::{Color32, CornerRadius, Frame, InnerResponse, Margin, Response, Sense, Stroke, Ui};
 
 use crate::{
+    carbon::paint_carbon,
     style::{Elevation, TypographyRole},
     Style,
 };
@@ -107,6 +108,35 @@ pub fn overlay() -> Frame {
         .shadow(Elevation::Overlay.egui_shadow())
 }
 
+/// Paint a shared tooltip surface using the current Quazar appearance.
+///
+/// Tooltip content is deliberately rendered through the shared overlay frame
+/// rather than egui's default `on_hover_text` popup, so Dark/Light surfaces,
+/// typography, padding, border, and expressive motion stay centralized.
+pub fn tooltip(ui: &mut Ui, text: &str) {
+    let surface = Style::resolve_color(ui.ctx(), Style::SURFACE);
+    let border = Style::resolve_color(ui.ctx(), Style::BORDER);
+    overlay()
+        .fill(surface)
+        .stroke(Stroke::new(Style::STROKE_HAIRLINE, border))
+        .show(ui, |ui| {
+            let text_color = Style::resolve_color(ui.ctx(), Style::TEXT);
+            ui.label(Style::typography_text(text, TypographyRole::Caption).color(text_color));
+        });
+}
+
+/// Attach a shared tooltip to a response.
+pub fn hover_text(response: Response, text: impl Into<String>) -> Response {
+    let text = text.into();
+    response.on_hover_ui(move |ui| tooltip(ui, text.as_str()))
+}
+
+/// Attach a shared tooltip to a disabled response.
+pub fn disabled_hover_text(response: Response, text: impl Into<String>) -> Response {
+    let text = text.into();
+    response.on_disabled_hover_ui(move |ui| tooltip(ui, text.as_str()))
+}
+
 /// A **muted note** — a dim, small-caption label — returning its [`Response`].
 ///
 /// This is the single source for the "honestly empty / not-yet-reported" panel
@@ -123,6 +153,176 @@ pub fn muted_note(ui: &mut Ui, msg: impl Into<String>) -> Response {
         Style::TEXT_DIM,
         Style::typography_text(msg, TypographyRole::Caption),
     )
+}
+
+/// The height of one dense operational list or table row for `density`.
+///
+/// Dense does not mean undersized: pointer surfaces keep the compact control
+/// rung, while touch and large-text configurations grow to their minimum hit
+/// target. Tables and palettes therefore remain scannable without creating
+/// separate per-workspace row metrics.
+#[must_use]
+pub fn dense_row_height(density: crate::Density) -> f32 {
+    Style::CONTROL_H_M.max(density.min_hit_target())
+}
+
+/// Render one zebra-striped row in a dense operational list or table.
+///
+/// `index` is the stable visual row index (including rows filtered from a
+/// palette), so alternating treatment stays deterministic across repaint. The
+/// closure owns the row's real controls and routing; this helper owns only the
+/// shared density, surface treatment, and horizontal rhythm.
+pub fn striped_row<R>(
+    ui: &mut Ui,
+    index: usize,
+    add_contents: impl FnOnce(&mut Ui) -> R,
+) -> InnerResponse<R> {
+    let fill = if index.is_multiple_of(2) {
+        Style::resolve_color(ui.ctx(), Style::SURFACE)
+    } else {
+        Style::resolve_color(ui.ctx(), Style::SURFACE_HI).gamma_multiply(0.45)
+    };
+    Frame::NONE
+        .fill(fill)
+        .inner_margin(Margin::symmetric(Style::SP_S as i8, Style::SP_XS as i8))
+        .show(ui, |ui| {
+            ui.set_min_height(dense_row_height(Style::density(ui.ctx())));
+            add_contents(ui)
+        })
+}
+
+/// The shared dense data-presentation scaffold. It carries a deterministic
+/// zebra index for tables, palettes, and operational lists while callers retain
+/// their own columns, selection, and data models.
+#[derive(Debug, Default)]
+pub struct DenseList {
+    next_row: usize,
+}
+
+impl DenseList {
+    /// Start an empty dense list.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { next_row: 0 }
+    }
+
+    /// Render a caller-owned header above the striped rows.
+    pub fn header<R>(&mut self, ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
+        let response = toolbar().show(ui, |ui| {
+            ui.set_min_height(dense_row_height(Style::density(ui.ctx())));
+            add_contents(ui)
+        });
+        response.inner
+    }
+
+    /// Render the next deterministic striped row.
+    pub fn row<R>(
+        &mut self,
+        ui: &mut Ui,
+        add_contents: impl FnOnce(&mut Ui) -> R,
+    ) -> InnerResponse<R> {
+        let response = striped_row(ui, self.next_row, add_contents);
+        self.next_row = self.next_row.saturating_add(1);
+        response
+    }
+}
+
+/// The semantic condition a workspace-state panel communicates. State is not
+/// inferred from colour alone: each variant supplies explicit copy, while the
+/// caller retains its real retry, reconnect, or confirmation action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceState {
+    /// Work is in progress and no stable result is available yet.
+    Loading,
+    /// The source answered successfully but contains no items.
+    Empty,
+    /// The view is usable but backed by an older snapshot.
+    Stale,
+    /// The live source cannot currently be reached.
+    Offline,
+    /// The requested operation failed.
+    Error,
+    /// An irreversible or high-impact action needs deliberate confirmation.
+    Destructive,
+}
+
+impl WorkspaceState {
+    fn icon(self) -> &'static str {
+        match self {
+            Self::Loading => "process-stop",
+            Self::Empty => "text-x-generic",
+            Self::Stale => "view-refresh",
+            Self::Offline => "changes-prevent",
+            Self::Error | Self::Destructive => "dialog-warning",
+        }
+    }
+
+    fn tone(self) -> Color32 {
+        match self {
+            Self::Loading | Self::Empty | Self::Stale => Style::TEXT_DIM,
+            Self::Offline | Self::Error | Self::Destructive => Style::DANGER,
+        }
+    }
+}
+
+/// A centered, semantic workspace state with optional caller-owned actions.
+///
+/// The shared kit owns visual hierarchy, icon treatment, and density-aware
+/// spacing; each workspace keeps its behavioral contract and action routing.
+pub struct WorkspaceStatePanel<'a> {
+    state: WorkspaceState,
+    title: &'a str,
+    detail: &'a str,
+}
+
+impl<'a> WorkspaceStatePanel<'a> {
+    /// Create a state panel with explicit operator-facing copy.
+    #[must_use]
+    pub const fn new(state: WorkspaceState, title: &'a str, detail: &'a str) -> Self {
+        Self {
+            state,
+            title,
+            detail,
+        }
+    }
+
+    /// Render the panel and the caller-owned action area.
+    pub fn show<R>(self, ui: &mut Ui, add_actions: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R> {
+        let width = ui.available_width().min(Style::SP_XL * 16.0);
+        ui.vertical_centered(|ui| {
+            ui.add_space(Style::SP_XL);
+            card()
+                .show(ui, |ui| {
+                    ui.set_max_width(width);
+                    ui.vertical_centered(|ui| {
+                        let (icon_rect, _) = ui.allocate_exact_size(
+                            egui::vec2(Style::ICON_XL, Style::ICON_XL),
+                            Sense::hover(),
+                        );
+                        let _ = paint_carbon(
+                            ui.painter(),
+                            icon_rect,
+                            self.state.icon(),
+                            self.state.tone(),
+                        );
+                        ui.add_space(Style::SP_S);
+                        ui.label(
+                            Style::typography_text(self.title, TypographyRole::Headline)
+                                .color(Style::TEXT_STRONG),
+                        );
+                        ui.add_space(Style::SP_XS);
+                        ui.label(
+                            Style::typography_text(self.detail, TypographyRole::Body)
+                                .color(Style::TEXT_DIM),
+                        );
+                        ui.add_space(Style::SP_M);
+                        add_actions(ui)
+                    })
+                    .inner
+                })
+                .inner
+        })
+    }
 }
 
 /// A small filled **status dot** — a [`Style::SP_S`]-sized circle in `color` —
@@ -296,12 +496,16 @@ pub fn paint_operation_progress_badge(
         egui::Stroke::new(1.0, Style::BORDER),
         egui::StrokeKind::Inside,
     );
-    let (fraction, color) = progress
-        .fraction
-        .map_or((0.14, Style::TEXT_DIM), |f| (f, Style::ACCENT));
-    let fill_w = (bar.width() * fraction.clamp(0.0, 1.0)).max(Style::SP_XS);
-    let filled = egui::Rect::from_min_size(bar.min, egui::vec2(fill_w, bar.height()));
-    painter.rect_filled(filled, Style::RADIUS_S, color);
+    // A queued operation has no measured progress yet. Keep the track visible,
+    // but do not paint a guessed fill: any non-zero fill would make the pending
+    // state look as though work had already completed in part.
+    if let Some(fraction) = progress.fraction {
+        let fill_w = bar.width() * fraction.clamp(0.0, 1.0);
+        if fill_w > 0.0 {
+            let filled = egui::Rect::from_min_size(bar.min, egui::vec2(fill_w, bar.height()));
+            painter.rect_filled(filled, Style::RADIUS_S, Style::ACCENT);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -342,6 +546,63 @@ mod tests {
     }
 
     #[test]
+    fn workspace_states_render_all_honest_conditions() {
+        let ctx = egui::Context::default();
+        Style::install_with_density(&ctx, crate::Density::Touch);
+        let out = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                for state in [
+                    WorkspaceState::Loading,
+                    WorkspaceState::Empty,
+                    WorkspaceState::Stale,
+                    WorkspaceState::Offline,
+                    WorkspaceState::Error,
+                    WorkspaceState::Destructive,
+                ] {
+                    WorkspaceStatePanel::new(state, "Status", "An honest workspace condition")
+                        .show(ui, |ui| ui.button("Retry"));
+                }
+            });
+        });
+        assert!(
+            !out.shapes.is_empty(),
+            "state panels must paint in a headless frame"
+        );
+    }
+
+    #[test]
+    fn dense_list_keeps_zebra_rows_usable_at_desktop_narrow_and_large_text_sizes() {
+        for (size, density) in [
+            (egui::vec2(1280.0, 800.0), crate::Density::Mouse),
+            (egui::vec2(480.0, 800.0), crate::Density::Mouse),
+            (egui::vec2(800.0, 600.0), crate::Density::Touch),
+        ] {
+            let ctx = egui::Context::default();
+            Style::install_with_density(&ctx, density);
+            let out = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let mut list = DenseList::new();
+                        list.header(ui, |ui| ui.label("Command"));
+                        for label in ["New window", "Split pane", "Detach"] {
+                            let response = list.row(ui, |ui| ui.selectable_label(false, label));
+                            assert!(
+                                response.response.rect.height() >= dense_row_height(density),
+                                "dense row must keep its target at {size:?}"
+                            );
+                        }
+                    });
+                },
+            );
+            assert!(!out.shapes.is_empty(), "dense list must render at {size:?}");
+        }
+    }
+
+    #[test]
     fn operation_progress_badge_uses_shared_text_value_and_paints_shapes() {
         let progress = OperationProgressView::new(2, Some(0.42), "2 browser downloads");
         let progress_text = operation_progress_text(progress);
@@ -370,6 +631,33 @@ mod tests {
         assert!(
             !out.shapes.is_empty(),
             "operation progress badge must paint visible shapes"
+        );
+    }
+
+    #[test]
+    fn pending_operation_progress_has_no_fabricated_fill() {
+        let pending = OperationProgressView::new(1, None, "Copy report.txt");
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(180.0, 36.0), Sense::hover());
+                paint_operation_progress_badge(ui, rect, pending, false, false);
+            });
+        });
+
+        fn contains_fill(shape: &egui::Shape, color: egui::Color32) -> bool {
+            match shape {
+                egui::Shape::Rect(rect) => rect.fill == color,
+                egui::Shape::Vec(shapes) => shapes.iter().any(|shape| contains_fill(shape, color)),
+                _ => false,
+            }
+        }
+
+        assert!(
+            !out.shapes
+                .iter()
+                .any(|clipped| contains_fill(&clipped.shape, Style::TEXT_DIM)),
+            "pending progress must leave the track empty instead of painting a guessed fill"
         );
     }
 
@@ -524,5 +812,20 @@ mod tests {
             !out.shapes.is_empty(),
             "surface primitives must paint visible shapes"
         );
+    }
+
+    #[test]
+    fn tooltip_uses_the_shared_overlay_and_typography() {
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                tooltip(ui, "Shared tooltip");
+            });
+        });
+        assert!(!out.shapes.is_empty(), "tooltip must paint visible shapes");
+        let frame = overlay();
+        assert_eq!(frame.fill, Style::SURFACE);
+        assert_eq!(frame.stroke, Style::hairline());
+        assert_eq!(frame.corner_radius, corner(Style::RADIUS_M));
     }
 }

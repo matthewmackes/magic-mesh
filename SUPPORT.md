@@ -8,15 +8,15 @@ go for help.
 
 | Dimension | Supported | Notes |
 |-----------|-----------|-------|
-| Peers | **1–8 in one mesh** | The §8 trust-envelope lock. Split larger fleets into separate workgroups. |
+| Infrastructure | **Up to 12 nodes** | Three lighthouses plus up to nine peers; split larger fleets into separate workgroups. |
 | Roles | Lighthouse, Workstation (2 roles) | One signed RPM; role is a config flag chosen at install (`meshctl install --role <r>`). A headless box is a Workstation without a local display. |
-| OS | Fedora | The Quasar ISO / immutable bootc image + the GitHub-hosted RPM (Releases asset / GitHub Pages dnf repo) are the supported install paths. |
+| OS | Fedora | The Quazar/Construct ISO / immutable bootc image + the GitHub-hosted RPM (Releases asset / GitHub Pages dnf repo) are the supported install paths. |
 | Transport | Nebula overlay only | No unencrypted fallback; underlay stays firewalled. |
 | Storage | Syncthing replicated volume | Backups remain the operator's responsibility. |
 | Desktop | egui thin-client VDI shell | A single egui shell owns the DRM/KMS seat directly (no Wayland compositor); the desktop you use is a VM brokered over the mesh. |
-| Language | **en-US only** | All GUIs, CLI output, logs, and docs are English. Localization is deliberately out of envelope for a ≤8-peer workgroup product (EFF-49); revisit only if the envelope ever widens. |
+| Language | **en-US only** | All GUIs, CLI output, logs, and docs are English. Localization is deliberately out of envelope for this workgroup product (EFF-49). |
 
-Running **beyond 8 peers**, on non-Fedora hosts, or in regulated / safety-critical
+Running beyond the 12-node infrastructure envelope, on non-Fedora hosts, or in regulated / safety-critical
 / high-availability settings is **out of envelope** and unsupported without
 independent review.
 
@@ -42,7 +42,7 @@ independent review.
 
 ## Reporting a security issue
 
-The open-mesh trust model (flat trust among ≤8 peers) is documented in
+The open-mesh trust model (flat trust among up to 12 infrastructure nodes) is documented in
 `DISCLAIMER.md` as an accepted trade-off, not a bug. Genuine vulnerabilities
 (cert/enrollment bypass, crypto downgrade, revocation that doesn't evict) should
 be reported privately to the maintainers before public disclosure.

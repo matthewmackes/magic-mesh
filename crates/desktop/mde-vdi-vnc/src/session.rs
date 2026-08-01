@@ -439,6 +439,19 @@ impl VncSession {
         std::mem::take(&mut self.pending)
     }
 
+    /// Put messages back at the front of the transport queue after a failed
+    /// socket write.  The live connector uses this to make `ClientCutText`
+    /// retry-safe: a transient TCP error must not acknowledge a clipboard
+    /// materialization that never reached the guest.
+    #[allow(
+        dead_code,
+        reason = "the live-connect transport calls this helper when its feature is enabled"
+    )]
+    pub(crate) fn requeue_input(&mut self, mut messages: Vec<RfbClientMessage>) {
+        messages.append(&mut self.pending);
+        self.pending = messages;
+    }
+
     // ── Clipboard side (real RFB ClientCutText / ServerCutText) ─────────────
 
     /// Queue host clipboard text for materialization into the guest through the
@@ -1083,6 +1096,33 @@ mod tests {
             clipboard.read_text(),
             None,
             "no guest text is honest absence"
+        );
+    }
+
+    #[test]
+    fn failed_transport_requeue_preserves_client_cut_text_order() {
+        let mut s = session();
+        s.send_clipboard_to_guest("first")
+            .expect("bounded clipboard text");
+        s.send_clipboard_to_guest("second")
+            .expect("bounded clipboard text");
+        let queued = s.take_input();
+
+        s.send_input(&Event::Text("third".to_owned()));
+        s.requeue_input(queued);
+
+        let drained = s.take_input();
+        assert!(matches!(
+            &drained[0],
+            RfbClientMessage::ClientCutText(text) if text.text() == "first"
+        ));
+        assert!(matches!(
+            &drained[1],
+            RfbClientMessage::ClientCutText(text) if text.text() == "second"
+        ));
+        assert!(
+            drained.len() > 2,
+            "new text input remains queued after the requeued clipboard messages"
         );
     }
 

@@ -37,6 +37,16 @@ pub struct ClipboardBody {
 /// to carry through the JSON/KDC text lane without silently truncating UTF-8.
 pub const MAX_CLIPBOARD_TEXT_BYTES: usize = 1024 * 1024;
 
+/// Maximum serialized JSON body inspected by the clipboard admission gate.
+///
+/// The text limit is the authoritative content bound. This smaller framing
+/// allowance prevents an attacker from presenting an arbitrarily large JSON
+/// object to the plugin before the typed body can be decoded.
+pub const MAX_CLIPBOARD_BODY_BYTES: usize = MAX_CLIPBOARD_TEXT_BYTES * 6 + 256;
+
+/// Maximum UTF-8 bytes in a local seat identifier.
+pub const MAX_CLIPBOARD_SEAT_BYTES: usize = 128;
+
 /// A typed reason why clipboard text was not admitted to a queue.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClipboardRejection {
@@ -53,6 +63,27 @@ pub enum ClipboardRejection {
         bytes: usize,
         /// Bound that was exceeded.
         max_bytes: usize,
+    },
+    /// The serialized packet body is larger than the clipboard admission
+    /// framing allowance.
+    BodyTooLarge {
+        /// Actual serialized JSON byte length.
+        bytes: usize,
+        /// Bound that was exceeded.
+        max_bytes: usize,
+    },
+    /// A clipboard packet attempted to use a secondary payload channel.
+    /// Clipboard ingress is text-only; files and other binary data use share.
+    UnexpectedPayload,
+    /// The packet kind was sent directly to this plugin without registry
+    /// dispatch, or was otherwise not one of the two supported clipboard kinds.
+    UnexpectedKind,
+    /// The packet was identified as an echo of text this plugin queued locally.
+    Echo {
+        /// Envelope id of the locally-originated packet.
+        packet_id: i64,
+        /// Peer that returned the locally-originated packet.
+        peer_id: String,
     },
     /// The packet body was not the KDE Connect clipboard body shape.
     MalformedBody,
@@ -75,6 +106,18 @@ impl fmt::Display for ClipboardRejection {
             Self::TooLarge { bytes, max_bytes } => {
                 write!(f, "clipboard text is {bytes} bytes; maximum is {max_bytes}")
             }
+            Self::BodyTooLarge { bytes, max_bytes } => write!(
+                f,
+                "clipboard packet body is {bytes} bytes; maximum is {max_bytes}"
+            ),
+            Self::UnexpectedPayload => {
+                f.write_str("clipboard packets cannot carry a secondary payload")
+            }
+            Self::UnexpectedKind => f.write_str("packet kind is not a clipboard kind"),
+            Self::Echo { packet_id, peer_id } => write!(
+                f,
+                "clipboard packet {packet_id} from {peer_id:?} is an echo"
+            ),
             Self::MalformedBody => f.write_str("clipboard packet body is malformed"),
             Self::Duplicate { packet_id, peer_id } => write!(
                 f,
@@ -108,6 +151,58 @@ pub fn validate_clipboard_text(content: &str) -> Result<(), ClipboardRejection> 
     }
     Ok(())
 }
+
+/// Validate a local seat identifier before it becomes a materialization
+/// destination. Seat names are opaque to the protocol, but rejecting control
+/// characters, separators, and empty values prevents a peer- or config-derived
+/// value from being interpreted as a path or command fragment downstream.
+pub fn validate_clipboard_seat(seat: &str) -> Result<(), ClipboardSeatError> {
+    if seat.is_empty() {
+        return Err(ClipboardSeatError::Empty);
+    }
+    if seat.len() > MAX_CLIPBOARD_SEAT_BYTES {
+        return Err(ClipboardSeatError::TooLong {
+            bytes: seat.len(),
+            max_bytes: MAX_CLIPBOARD_SEAT_BYTES,
+        });
+    }
+    if !seat.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':' | b'@')
+    }) {
+        return Err(ClipboardSeatError::InvalidCharacters);
+    }
+    Ok(())
+}
+
+/// Configuration error for an active-seat destination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClipboardSeatError {
+    /// No seat was supplied.
+    Empty,
+    /// The seat exceeds [`MAX_CLIPBOARD_SEAT_BYTES`].
+    TooLong {
+        /// Actual UTF-8 byte length.
+        bytes: usize,
+        /// Bound that was exceeded.
+        max_bytes: usize,
+    },
+    /// The seat contains a separator, control character, or other unsafe byte.
+    InvalidCharacters,
+}
+
+impl fmt::Display for ClipboardSeatError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => f.write_str("clipboard seat is empty"),
+            Self::TooLong { bytes, max_bytes } => {
+                write!(f, "clipboard seat is {bytes} bytes; maximum is {max_bytes}")
+            }
+            Self::InvalidCharacters => f.write_str("clipboard seat contains invalid characters"),
+        }
+    }
+}
+
+impl std::error::Error for ClipboardSeatError {}
 
 /// Source and dedup/echo facts retained for an admitted clipboard item.
 ///
@@ -164,6 +259,21 @@ pub struct ReceivedClipboard {
     pub body: ClipboardBody,
     /// Packet and dispatch facts associated with the body.
     pub metadata: ClipboardMetadata,
+}
+
+/// An accepted inbound clipboard item targeted at the active local seat.
+///
+/// This is deliberately a separate queue from [`ReceivedClipboard`]: disabling
+/// local publishing or losing the active seat must not hide or discard remote
+/// clipboard history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipboardMaterialization {
+    /// Validated clipboard body.
+    pub body: ClipboardBody,
+    /// Honest source and packet attribution.
+    pub metadata: ClipboardMetadata,
+    /// Exact local seat selected when the packet was admitted.
+    pub target_seat: String,
 }
 
 /// One outbound KDE Connect packet together with its available metadata.
@@ -587,6 +697,133 @@ mod tests {
         assert_eq!(records[0].metadata.is_echo, Some(false));
         assert_eq!(records[0].packet.kind, "kdeconnect.clipboard");
     }
+
+    #[test]
+    fn active_seat_materialization_is_separate_and_attributed() {
+        let mut plugin = ClipboardPlugin::new();
+        plugin
+            .set_active_seat(Some("seat:dell".to_string()))
+            .unwrap();
+        let ctx = PluginContext::new("paired-phone", true);
+        plugin.process(&clipboard_packet(101, "remote copy".into()), &ctx);
+
+        let history = plugin.take_received_with_metadata();
+        assert_eq!(history.len(), 1);
+        assert_eq!(plugin.pending_count(), 0);
+        let materialized = plugin.take_materializations();
+        assert_eq!(materialized.len(), 1);
+        assert_eq!(materialized[0].target_seat, "seat:dell");
+        assert_eq!(materialized[0].body.content, "remote copy");
+        assert_eq!(
+            materialized[0].metadata.peer_id.as_deref(),
+            Some("paired-phone")
+        );
+        assert_eq!(materialized[0].metadata.packet_id, Some(101));
+    }
+
+    #[test]
+    fn no_active_seat_keeps_history_without_claiming_materialization() {
+        let mut plugin = ClipboardPlugin::new();
+        plugin.process(
+            &clipboard_packet(102, "remote history".into()),
+            &PluginContext::new("paired-phone", true),
+        );
+        assert_eq!(plugin.pending_count(), 1);
+        assert!(plugin.take_materializations().is_empty());
+    }
+
+    #[test]
+    fn active_seat_rejects_path_like_and_oversized_values() {
+        let mut plugin = ClipboardPlugin::new();
+        assert_eq!(
+            plugin.set_active_seat(Some("../seat".into())),
+            Err(ClipboardSeatError::InvalidCharacters)
+        );
+        assert_eq!(
+            plugin.set_active_seat(Some("x".repeat(MAX_CLIPBOARD_SEAT_BYTES + 1))),
+            Err(ClipboardSeatError::TooLong {
+                bytes: MAX_CLIPBOARD_SEAT_BYTES + 1,
+                max_bytes: MAX_CLIPBOARD_SEAT_BYTES,
+            })
+        );
+        assert_eq!(plugin.active_seat(), None);
+    }
+
+    #[test]
+    fn locally_queued_packet_returned_by_peer_is_rejected_as_echo() {
+        let mut plugin = ClipboardPlugin::new();
+        plugin.try_push_clipboard("local copy".into()).unwrap();
+        let packet = plugin.take_outbound().pop().unwrap();
+        plugin.process(&packet, &PluginContext::new("paired-phone", true));
+        assert_eq!(plugin.pending_count(), 0);
+        assert!(matches!(
+            plugin.last_rejection().map(|record| &record.reason),
+            Some(ClipboardRejection::Echo { packet_id: _, peer_id }) if peer_id == "paired-phone"
+        ));
+    }
+
+    #[test]
+    fn secondary_payload_and_wrong_kind_are_rejected_before_body_admission() {
+        let mut plugin = ClipboardPlugin::new();
+        let mut packet = clipboard_packet(103, "text".into());
+        packet.payload_size = Some(1);
+        plugin.process(&packet, &PluginContext::new("paired-phone", true));
+        assert_eq!(plugin.pending_count(), 0);
+        assert_eq!(
+            plugin.last_rejection().map(|record| &record.reason),
+            Some(&ClipboardRejection::UnexpectedPayload)
+        );
+
+        let mut packet = clipboard_packet(104, "text".into());
+        packet.kind = "kdeconnect.ping".into();
+        plugin.process(&packet, &PluginContext::new("paired-phone", true));
+        assert_eq!(
+            plugin.last_rejection().map(|record| &record.reason),
+            Some(&ClipboardRejection::UnexpectedKind)
+        );
+    }
+
+    #[test]
+    fn unpaired_oversized_body_is_rejected_before_deserialization() {
+        let mut plugin = ClipboardPlugin::new();
+        let packet = Packet {
+            id: 105,
+            kind: "kdeconnect.clipboard".into(),
+            body: serde_json::json!({ "content": "x" }),
+            mde_caps: None,
+            payload_size: None,
+            payload_transfer_info: None,
+        };
+        plugin.process(&packet, &PluginContext::new("unpaired-phone", false));
+        assert_eq!(plugin.pending_count(), 0);
+        assert!(matches!(
+            plugin.last_rejection().map(|record| &record.reason),
+            Some(ClipboardRejection::Unauthorized { peer_id }) if peer_id == "unpaired-phone"
+        ));
+    }
+
+    #[test]
+    fn oversized_serialized_body_is_rejected_even_when_content_field_is_small() {
+        let mut plugin = ClipboardPlugin::new();
+        let packet = Packet {
+            id: 106,
+            kind: "kdeconnect.clipboard".into(),
+            body: serde_json::json!({
+                "content": "small",
+                "unexpected": "x".repeat(MAX_CLIPBOARD_BODY_BYTES + 1)
+            }),
+            mde_caps: None,
+            payload_size: None,
+            payload_transfer_info: None,
+        };
+        plugin.process(&packet, &PluginContext::new("paired-phone", true));
+        assert_eq!(plugin.pending_count(), 0);
+        assert!(matches!(
+            plugin.last_rejection().map(|record| &record.reason),
+            Some(ClipboardRejection::BodyTooLarge { bytes, max_bytes })
+                if *bytes > MAX_CLIPBOARD_BODY_BYTES && *max_bytes == MAX_CLIPBOARD_BODY_BYTES
+        ));
+    }
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -607,12 +844,16 @@ mod tests {
 #[derive(Debug)]
 pub struct ClipboardPlugin {
     received: Vec<ReceivedClipboard>,
+    materializations: Vec<ClipboardMaterialization>,
+    active_seat: Option<String>,
     /// Proactive outbound packets queued for the paired phone
     /// (mesh clipboard → phone). Drained by the host on each tick.
     outbound: Vec<OutboundClipboard>,
     handles: [&'static str; 2],
     seen_inbound: VecDeque<(String, i64)>,
+    seen_outbound: VecDeque<i64>,
     rejections: VecDeque<ClipboardRejectionRecord>,
+    last_outbound_id: i64,
 }
 
 impl Default for ClipboardPlugin {
@@ -634,10 +875,14 @@ impl ClipboardPlugin {
     pub const fn new() -> Self {
         Self {
             received: Vec::new(),
+            materializations: Vec::new(),
+            active_seat: None,
             outbound: Vec::new(),
             handles: ["kdeconnect.clipboard", "kdeconnect.clipboard.connect"],
             seen_inbound: VecDeque::new(),
+            seen_outbound: VecDeque::new(),
             rejections: VecDeque::new(),
+            last_outbound_id: 0,
         }
     }
 
@@ -654,6 +899,34 @@ impl ClipboardPlugin {
     #[must_use]
     pub fn take_received_with_metadata(&mut self) -> Vec<ReceivedClipboard> {
         std::mem::take(&mut self.received)
+    }
+
+    /// Drain accepted clipboard items that were targeted at the active seat.
+    ///
+    /// Remote history remains available through [`Self::take_received`]. An
+    /// absent active seat therefore produces no materialization rather than a
+    /// fake success or an accidental write to an arbitrary seat.
+    #[must_use]
+    pub fn take_materializations(&mut self) -> Vec<ClipboardMaterialization> {
+        std::mem::take(&mut self.materializations)
+    }
+
+    /// Select the local seat for future inbound materialization.
+    ///
+    /// Passing `None` explicitly disables seat delivery while retaining remote
+    /// history. The destination is validated before it is stored.
+    pub fn set_active_seat(&mut self, seat: Option<String>) -> Result<(), ClipboardSeatError> {
+        if let Some(ref seat) = seat {
+            validate_clipboard_seat(seat)?;
+        }
+        self.active_seat = seat;
+        Ok(())
+    }
+
+    /// The currently selected local seat, if materialization is available.
+    #[must_use]
+    pub fn active_seat(&self) -> Option<&str> {
+        self.active_seat.as_deref()
     }
 
     /// Items currently queued (phone → mesh).
@@ -686,10 +959,19 @@ impl ClipboardPlugin {
             self.record_rejection(reason.clone(), ClipboardMetadata::local_rejection());
         })?;
 
-        let id_ms = SystemTime::now()
+        let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
             .unwrap_or(0);
+        // KDE Connect uses the envelope id for deduplication. A wall-clock
+        // millisecond alone can collide when two local copies happen in one
+        // tick, so make the local sequence strictly monotonic.
+        let id_ms = now_ms.max(self.last_outbound_id.saturating_add(1));
+        self.last_outbound_id = id_ms;
+        if self.seen_outbound.len() == MAX_SEEN_INBOUND {
+            let _ = self.seen_outbound.pop_front();
+        }
+        self.seen_outbound.push_back(id_ms);
         self.outbound.push(OutboundClipboard {
             packet: clipboard_packet(id_ms, content),
             metadata: ClipboardMetadata::outbound(id_ms),
@@ -747,13 +1029,6 @@ impl ClipboardPlugin {
         ctx: &crate::plugins::PluginContext,
     ) -> Result<(), ClipboardRejection> {
         let metadata = ClipboardMetadata::inbound(packet, ctx);
-        if !ctx.paired {
-            let reason = ClipboardRejection::Unauthorized {
-                peer_id: ctx.peer_id.clone(),
-            };
-            self.record_rejection(reason.clone(), metadata);
-            return Err(reason);
-        }
         validate_clipboard_text(&body.content).inspect_err(|reason| {
             self.record_rejection(reason.clone(), metadata.clone());
         })?;
@@ -771,7 +1046,17 @@ impl ClipboardPlugin {
             let _ = self.seen_inbound.pop_front();
         }
         self.seen_inbound.push_back(dedup_key);
-        self.received.push(ReceivedClipboard { body, metadata });
+        self.received.push(ReceivedClipboard {
+            body: body.clone(),
+            metadata: metadata.clone(),
+        });
+        if let Some(target_seat) = self.active_seat.clone() {
+            self.materializations.push(ClipboardMaterialization {
+                body,
+                metadata,
+                target_seat,
+            });
+        }
         Ok(())
     }
 }
@@ -790,6 +1075,54 @@ impl crate::plugins::Plugin for ClipboardPlugin {
         packet: &crate::wire::Packet,
         ctx: &crate::plugins::PluginContext,
     ) -> Vec<crate::wire::Packet> {
+        let metadata = ClipboardMetadata::inbound(packet, ctx);
+        // Apply the trust gate before body deserialization. This keeps an
+        // unpaired peer from purchasing CPU/memory with an otherwise valid or
+        // oversized clipboard body.
+        if !ctx.paired || ctx.peer_id.is_empty() || ctx.peer_id.len() > MAX_CLIPBOARD_SEAT_BYTES {
+            self.record_rejection(
+                ClipboardRejection::Unauthorized {
+                    peer_id: ctx.peer_id.clone(),
+                },
+                metadata,
+            );
+            return Vec::new();
+        }
+        if !self.handles.contains(&packet.kind.as_str()) {
+            self.record_rejection(ClipboardRejection::UnexpectedKind, metadata);
+            return Vec::new();
+        }
+        if packet.payload_size.is_some() || packet.payload_transfer_info.is_some() {
+            self.record_rejection(ClipboardRejection::UnexpectedPayload, metadata);
+            return Vec::new();
+        }
+        if self.seen_outbound.iter().any(|id| *id == packet.id) {
+            self.record_rejection(
+                ClipboardRejection::Echo {
+                    packet_id: packet.id,
+                    peer_id: ctx.peer_id.clone(),
+                },
+                metadata,
+            );
+            return Vec::new();
+        }
+        let body_bytes = match serde_json::to_vec(&packet.body) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                self.record_rejection(ClipboardRejection::MalformedBody, metadata);
+                return Vec::new();
+            }
+        };
+        if body_bytes.len() > MAX_CLIPBOARD_BODY_BYTES {
+            self.record_rejection(
+                ClipboardRejection::BodyTooLarge {
+                    bytes: body_bytes.len(),
+                    max_bytes: MAX_CLIPBOARD_BODY_BYTES,
+                },
+                metadata,
+            );
+            return Vec::new();
+        }
         match from_packet_body::<ClipboardBody>(packet) {
             Ok(body) => {
                 let _ = self.admit_inbound(packet, body, ctx);

@@ -80,6 +80,8 @@ const ROW_H: f32 = 44.0;
 const TILE_H: f32 = 64.0;
 /// One VDI session row.
 const SESSION_ROW_H: f32 = 36.0;
+/// A lifecycle row with a reason/guidance line.
+const SESSION_DETAIL_ROW_H: f32 = 52.0;
 /// The footnote header above the session list.
 const HEADER_H: f32 = 18.0;
 /// Gap between grid cells / list rows.
@@ -181,6 +183,8 @@ struct SessionRow {
     label: String,
     /// The `VDI` / `LIVE` / `DISC` badge.
     badge: &'static str,
+    /// Bounded App VM reason plus honest recovery guidance.
+    detail: Option<String>,
 }
 
 /// The rail entries → glanceable rows (capped at [`MAX_SESSION_ROWS`]).
@@ -192,6 +196,7 @@ fn session_rows(entries: &[SessionRailEntry]) -> Vec<SessionRow> {
             id: e.session_id().map(str::to_owned),
             label: e.label().to_owned(),
             badge: e.protocol(),
+            detail: e.status_detail(),
         })
         .collect()
 }
@@ -456,8 +461,7 @@ impl PanelModel {
             h += rows as f32 * TILE_H + rows.saturating_sub(1) as f32 * GRID_GAP;
         }
         if !self.sessions.is_empty() {
-            let rows = self.sessions.len();
-            h += HEADER_H + rows as f32 * SESSION_ROW_H + rows.saturating_sub(1) as f32 * GRID_GAP;
+            h += HEADER_H + session_rows_height(&self.sessions);
         }
         if self.file_ops.is_some() {
             h += ROW_H;
@@ -1075,9 +1079,14 @@ fn session_list(
     let mut y = top + HEADER_H;
     let mut action = None;
     for (idx, session) in sessions.iter().enumerate() {
+        let row_height = if session.detail.is_some() {
+            SESSION_DETAIL_ROW_H
+        } else {
+            SESSION_ROW_H
+        };
         let rect = egui::Rect::from_min_size(
             egui::pos2(inner.left(), y),
-            egui::vec2(inner.width(), SESSION_ROW_H),
+            egui::vec2(inner.width(), row_height),
         );
         let id = egui::Id::new(("shell-cc-session", idx));
         let resp = ui.interact(rect, id, egui::Sense::click());
@@ -1093,14 +1102,34 @@ fn session_list(
             egui::vec2(Style::SP_M, Style::SP_M),
         );
         paint_glyph(ui, glyph_rect, Glyph::Carbon("view"), text);
+        let text_x = glyph_rect.right() + Style::SP_S;
+        let label_y = if session.detail.is_some() {
+            rect.top() + Style::SP_S
+        } else {
+            rect.center().y
+        };
         paint_typography(
             ui.painter(),
-            egui::pos2(glyph_rect.right() + Style::SP_S, rect.center().y),
-            egui::Align2::LEFT_CENTER,
+            egui::pos2(text_x, label_y),
+            if session.detail.is_some() {
+                egui::Align2::LEFT_TOP
+            } else {
+                egui::Align2::LEFT_CENTER
+            },
             &session.label,
             TypographyRole::Label,
             text,
         );
+        if let Some(detail) = &session.detail {
+            paint_typography(
+                ui.painter(),
+                egui::pos2(text_x, rect.bottom() - Style::SP_S),
+                egui::Align2::LEFT_BOTTOM,
+                detail,
+                TypographyRole::Caption,
+                Style::resolve_color(ctx, Style::TEXT_DIM),
+            );
+        }
         paint_typography(
             ui.painter(),
             egui::pos2(rect.right() - Style::SP_S, rect.center().y),
@@ -1123,6 +1152,20 @@ fn session_list(
         y = rect.bottom() + GRID_GAP;
     }
     (action, y - GRID_GAP)
+}
+
+fn session_rows_height(sessions: &[SessionRow]) -> f32 {
+    sessions
+        .iter()
+        .map(|session| {
+            if session.detail.is_some() {
+                SESSION_DETAIL_ROW_H
+            } else {
+                SESSION_ROW_H
+            }
+        })
+        .sum::<f32>()
+        + sessions.len().saturating_sub(1) as f32 * GRID_GAP
 }
 
 /// The file-operation progress row (present only while jobs are active).
@@ -1791,6 +1834,7 @@ mod tests {
                 id: Some("s1".to_owned()),
                 label: "oak win11".to_owned(),
                 badge: "VDI",
+                detail: None,
             }],
             "the list is the session rail's exact projection"
         );

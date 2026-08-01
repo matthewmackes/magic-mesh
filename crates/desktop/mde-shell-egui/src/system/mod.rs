@@ -55,7 +55,7 @@ use mde_seat::{
     PairingAgent, PowerCaps, PowerVerb, Probe, Seat, SeatError, SeatSnapshot, HOTKEYS,
 };
 
-use crate::backdrop::{self, Wallpaper};
+use crate::backdrop;
 use crate::bt_pairing::{pairing_dialog, PairingBridge};
 use crate::power_honor::PowerHonorConfig;
 use crate::power_settings;
@@ -153,6 +153,20 @@ fn read_bounded_local_config(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod persisted_config_tests {
     use super::*;
+
+    #[test]
+    fn wallpaper_normalization_keeps_bing_as_the_only_provider() {
+        let config = WallpaperServiceConfig {
+            network_fetch_enabled: true,
+            bing_daily_enabled: false,
+            desktop_page_url: "http://127.0.0.1:8787/".to_owned(),
+            ..WallpaperServiceConfig::default()
+        }
+        .normalized();
+
+        assert!(config.bing_daily_enabled);
+        assert!(config.desktop_page_url.is_empty());
+    }
 
     #[test]
     fn oversized_local_config_keeps_every_loader_on_safe_defaults() {
@@ -306,6 +320,8 @@ pub(crate) struct SystemState {
     /// a pick, and applied live to the context every frame by
     /// [`Self::apply_appearance`] (the [`SettingsNav`] client-data-dir JSON idiom).
     appearance: AppearanceConfig,
+    /// This Node → Clock & Date display zone, defaulting to Eastern Standard Time.
+    clock: ClockConfig,
     /// The seat's last-reported debounced hardware formfactor (SURFACE-9), mirrored
     /// in by the shell's formfactor pump. PLATFORM-INTERFACES Q42: formfactor ≠
     /// profile — a hardware Tablet↔Laptop flip adjusts the live density WITHIN
@@ -364,6 +380,7 @@ impl Default for SystemState {
             wallpaper_service: WallpaperServiceConfig::load(),
             wallpaper_download: WallpaperDownloadRuntime::default(),
             appearance: AppearanceConfig::load(),
+            clock: ClockConfig::load(),
             formfactor: None,
             car_keys: crate::car_keymap::CarKeyBindings::load(),
             zoom_base: None,
@@ -403,6 +420,13 @@ pub(crate) enum SysAction {
     /// Set the battery charge-stop cap 0–100 (POWER-4) — routed to
     /// [`Seat::set_charge_threshold`].
     SetChargeThreshold(u8),
+    /// Set one PipeWire mixer strip's volume (0–100) through the single seat
+    /// authority. The strip id is the provider-issued node id, never a path or
+    /// shell fragment.
+    SetMixerVolume { id: String, volume: u8 },
+    /// Set one PipeWire mixer strip's mute state through the single seat
+    /// authority.
+    SetMixerMuted { id: String, muted: bool },
     /// Persist the POWER-5 idle/lid policy after a picker change — the config has
     /// already been mutated in place; this writes it to disk.
     SavePowerHonorConfig,
@@ -474,6 +498,7 @@ impl SystemState {
         // live context every frame (poll runs unconditionally in both runners, so this
         // is honored globally + restored on start — not just while Settings is open).
         self.apply_appearance(ctx);
+        crate::timers::set_clock_zone(self.clock.zone);
         // Devices → Mouse & Touch: publish the persisted input policy to the bare DRM
         // seat and egui input options every frame, so a restart restores pointer speed
         // and double-click timing before the operator reopens Settings.
@@ -510,6 +535,14 @@ impl SystemState {
             || Style::density(ctx) != want_density
             || ctx.style().visuals.hyperlink_color != want_live_accent
         {
+            tracing::info!(
+                target: "shell::appearance",
+                scheme = ?want_scheme,
+                density = ?want_density,
+                text_scale = ?self.appearance.text_scale,
+                motion = ?self.appearance.motion_mode,
+                "applied persisted appearance to live shell context"
+            );
             Style::install_color_scheme_with_density(ctx, want_scheme, want_density);
             Style::set_accent(ctx, want_accent);
         }
@@ -717,6 +750,7 @@ impl SystemState {
         // it can be detected + persisted afterwards (SETTINGS-5 — the same collect-
         // then-apply idiom `nav` uses; the live re-tint/zoom happens in the poll).
         let appearance_before = self.appearance;
+        let clock_before = self.clock;
         let remote_proofing_before = self.remote_proofing;
         let mouse_touch_before = self.mouse_touch;
         let wallpaper_service_before = self.wallpaper_service.clone();
@@ -744,6 +778,7 @@ impl SystemState {
                 wallpaper_service,
                 wallpaper_download,
                 appearance,
+                clock,
                 car_keys,
                 federation,
                 ..
@@ -808,6 +843,7 @@ impl SystemState {
                                 wallpaper_service,
                                 wallpaper_download,
                                 appearance,
+                                clock,
                                 car_keys,
                                 agent_active,
                                 prompt_in_flight,
@@ -843,6 +879,10 @@ impl SystemState {
         // real change writes; the live re-tint/zoom lands on the next poll.
         if self.appearance != appearance_before {
             self.appearance.save();
+        }
+        if self.clock != clock_before {
+            self.clock.save();
+            crate::timers::set_clock_zone(self.clock.zone);
         }
         // Persist Remote Proofing policy changes from Mesh & System. The live
         // Sunshine/service bridge consumes this config; Settings owns the operator
@@ -975,6 +1015,24 @@ impl SystemState {
                 // success (§7).
                 SysAction::SetPowerProfile(name) => self.drive_power_profile(name),
                 SysAction::SetChargeThreshold(pct) => self.drive_charge_threshold(pct),
+                SysAction::SetMixerVolume { id, volume } => {
+                    match self.seat.set_strip_volume(&id, volume) {
+                        Ok(()) => {
+                            self.update_mixer_strip(&id, |strip| strip.volume = volume);
+                            self.error = None;
+                        }
+                        Err(e) => self.error = Some(format!("audio volume: {e}")),
+                    }
+                }
+                SysAction::SetMixerMuted { id, muted } => {
+                    match self.seat.set_strip_muted(&id, muted) {
+                        Ok(()) => {
+                            self.update_mixer_strip(&id, |strip| strip.muted = muted);
+                            self.error = None;
+                        }
+                        Err(e) => self.error = Some(format!("audio mute: {e}")),
+                    }
+                }
                 // POWER-5: persist the idle/lid policy the picker just mutated.
                 SysAction::SavePowerHonorConfig => self.power_honor_config.save(),
                 // ── Bluetooth writes (E12-17) — each drives the ONE seat's BlueZ
@@ -1342,6 +1400,22 @@ impl SystemState {
         }
     }
 
+    /// Update only the cached strip that accepted a successful PipeWire write.
+    /// A provider failure leaves the snapshot untouched, so the Audio page never
+    /// reports a value that the adapter did not accept.
+    fn update_mixer_strip(&mut self, id: &str, update: impl FnOnce(&mut MixerStrip)) {
+        let Some(Probe::Present(mixer)) = self.snapshot.as_mut().map(|s| &mut s.mixer) else {
+            return;
+        };
+        if mixer.master.id == id {
+            update(&mut mixer.master);
+            return;
+        }
+        if let Some(strip) = mixer.strips.iter_mut().find(|strip| strip.id == id) {
+            update(strip);
+        }
+    }
+
     /// The first backlight panel's `(name, max, seed %)`, if the probe answered.
     fn first_backlight(&self) -> Option<(String, u32, u8)> {
         match self.snapshot.as_ref()?.backlights {
@@ -1394,6 +1468,8 @@ pub(crate) enum SettingsSection {
     KeyMapping,
     /// Appearance — accent + text-scale (`theme_section`, SETTINGS-5).
     Theme,
+    /// Clock and date display zone (`clock_section`).
+    Clock,
     /// Mesh identity name + overlay/cipher (`identity_section`, SETTINGS-4).
     Identity,
     /// The pinned deployment role (`role_section`, SETTINGS-4).
@@ -1420,6 +1496,7 @@ impl SettingsSection {
             Self::Hotkeys => "Hotkeys",
             Self::KeyMapping => "Key Mapping",
             Self::Theme => "Theme",
+            Self::Clock => "Clock & Date",
             Self::Identity => "Identity",
             Self::Role => "Role",
             Self::Pairing => "Pairing",
@@ -1441,6 +1518,7 @@ impl SettingsSection {
             Self::Hotkeys => IconId::Keyboard,
             Self::KeyMapping => IconId::Keyboard,
             Self::Theme => IconId::Appearance,
+            Self::Clock => IconId::History,
             Self::Identity => IconId::Node,
             Self::Role => IconId::Workstation,
             Self::Pairing => IconId::Share,
@@ -1456,7 +1534,11 @@ impl SettingsSection {
             Self::Displays | Self::Mouse | Self::Audio | Self::Bluetooth | Self::Power => {
                 SettingsGroup::Devices
             }
-            Self::Wallpaper | Self::Hotkeys | Self::KeyMapping | Self::Theme => {
+            Self::Wallpaper
+            | Self::Hotkeys
+            | Self::KeyMapping
+            | Self::Theme
+            | Self::Clock => {
                 SettingsGroup::Personalization
             }
             Self::Identity | Self::Role | Self::Pairing | Self::Network | Self::RemoteProofing => {
@@ -1474,7 +1556,7 @@ enum SettingsGroup {
     /// Displays · Mouse & Touch · Audio · Bluetooth · Power & Battery.
     #[default]
     Devices,
-    /// Wallpaper · Hotkeys · Theme.
+    /// Wallpaper · Hotkeys · Theme · Clock & Date.
     Personalization,
     /// Identity · Role · Pairing · Network · Remote Proofing (SETTINGS-4).
     MeshSystem,
@@ -1527,6 +1609,7 @@ impl SettingsGroup {
                 SettingsSection::Hotkeys,
                 SettingsSection::KeyMapping,
                 SettingsSection::Theme,
+                SettingsSection::Clock,
             ],
             Self::MeshSystem => &[
                 SettingsSection::Identity,
@@ -1825,12 +1908,13 @@ struct WallpaperServiceConfig {
     /// for airgapped deployments.
     #[serde(default = "default_true")]
     network_fetch_enabled: bool,
-    /// Use Bing's image of the day as fallback when the configured desktop page is
-    /// absent/unreachable.
+    /// Keep the Bing image-of-the-day provider enabled. The field remains
+    /// deserializable for older settings files, but normalization pins the
+    /// supported provider to Bing.
     #[serde(default = "default_true")]
     bing_daily_enabled: bool,
-    /// Optional local/chromeless desktop page URL served by the separate desktop
-    /// project. Empty means "not configured".
+    /// Retained only to read older settings files; non-Bing providers are removed
+    /// during normalization and are never rendered or launched.
     #[serde(default)]
     desktop_page_url: String,
     /// Last downloaded daily picture path.
@@ -1863,7 +1947,11 @@ impl Default for WallpaperServiceConfig {
 
 impl WallpaperServiceConfig {
     fn normalized(mut self) -> Self {
-        self.desktop_page_url = sanitize_wallpaper_service_url(&self.desktop_page_url);
+        // The wallpaper system has one supported provider: Bing's daily picture.
+        // Clear legacy custom-page configuration instead of silently preserving a
+        // second provider that the UI no longer exposes.
+        self.desktop_page_url.clear();
+        self.bing_daily_enabled = true;
         self.last_image_title = self.last_image_title.trim().chars().take(160).collect();
         self.last_image_copyright = self.last_image_copyright.trim().chars().take(240).collect();
         self
@@ -1912,14 +2000,6 @@ impl WallpaperServiceConfig {
         self.last_image_copyright = result.copyright.clone();
         self.last_updated_ms = result.fetched_at_ms;
     }
-}
-
-fn sanitize_wallpaper_service_url(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    trimmed.chars().take(2048).collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2787,6 +2867,51 @@ impl AppearanceConfig {
     }
 }
 
+/// The client-data-dir file for the This Node → Clock & Date preference.
+const CLOCK_CONFIG_FILE: &str = "settings-clock.json";
+
+/// Persisted user-facing clock zone. Event, audit, and mesh timestamps remain
+/// UTC; only human-readable clocks and dates use this display preference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+struct ClockConfig {
+    #[serde(default)]
+    zone: crate::timers::ClockZone,
+}
+
+impl ClockConfig {
+    fn default_path() -> Option<PathBuf> {
+        mde_bus::client_data_dir().map(|d| d.join(CLOCK_CONFIG_FILE))
+    }
+
+    fn load() -> Self {
+        Self::default_path()
+            .and_then(|path| {
+                read_bounded_local_config(&path)
+                    .and_then(|s| serde_json::from_str::<Self>(&s).ok())
+            })
+            .unwrap_or_default()
+    }
+
+    fn save(self) {
+        let Some(path) = Self::default_path() else {
+            return;
+        };
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        if fs::create_dir_all(parent).is_err() {
+            return;
+        }
+        let Ok(json) = serde_json::to_string_pretty(&self) else {
+            return;
+        };
+        let tmp = path.with_extension("json.tmp");
+        if fs::write(&tmp, json).is_ok() {
+            let _ = fs::rename(tmp, path);
+        }
+    }
+}
+
 // ──────────────────────────── render ────────────────────────────
 
 /// The one id salt the Settings sidebar renders under — shared by the rail, its
@@ -3134,6 +3259,7 @@ fn settings_detail(
     wallpaper_service: &mut WallpaperServiceConfig,
     wallpaper_download: &mut WallpaperDownloadRuntime,
     appearance: &mut AppearanceConfig,
+    clock: &mut ClockConfig,
     car_keys: &mut crate::car_keymap::CarKeyBindings,
     agent_active: bool,
     prompt_in_flight: bool,
@@ -3147,7 +3273,7 @@ fn settings_detail(
             displays_section(ui, snap, layout, panel_brightness, ddc_brightness, actions)
         }
         SettingsSection::Mouse => mouse_touch_section(ui, mouse_touch),
-        SettingsSection::Audio => mixer_section(ui, snap),
+        SettingsSection::Audio => mixer_section(ui, snap, actions),
         SettingsSection::Bluetooth => bluetooth_section(ui, snap, actions),
         SettingsSection::Power => power_section(
             ui,
@@ -3163,6 +3289,7 @@ fn settings_detail(
         SettingsSection::Hotkeys => hotkeys_section(ui),
         SettingsSection::KeyMapping => key_mapping_section(ui, car_keys),
         SettingsSection::Theme => theme_section(ui, appearance),
+        SettingsSection::Clock => clock_section(ui, clock),
         SettingsSection::Identity => identity_section(ui, mesh),
         SettingsSection::Role => role_section(ui, mesh),
         SettingsSection::Pairing => {
@@ -3477,17 +3604,21 @@ fn mouse_touch_section(ui: &mut egui::Ui, config: &mut MouseTouchConfig) {
     );
 }
 
-/// The Audio / Mixer section — read-only status (fader/mute/solo interaction is
-/// E12-16). The master output is the emphasized channel spanning the pane; the
-/// playback strips spread **across** the wide detail pane as channel tiles
-/// (SETTINGS-3), not a stacked column.
-fn mixer_section(ui: &mut egui::Ui, snap: Option<&SeatSnapshot>) {
+/// The Audio / Mixer section — live PipeWire volume/mute controls over the
+/// existing typed [`Seat`] action seam. The master output is the emphasized
+/// channel spanning the pane; playback strips spread **across** the wide detail
+/// pane as channel tiles (SETTINGS-3), not a stacked column.
+fn mixer_section(
+    ui: &mut egui::Ui,
+    snap: Option<&SeatSnapshot>,
+    actions: &mut Vec<SysAction>,
+) {
     probe_section(
         ui,
         snap,
         |s| &s.mixer,
         |ui, m: &MixerStatus| {
-            tile(ui, |ui| strip_channel(ui, &m.master, true));
+            tile(ui, |ui| strip_channel(ui, &m.master, true, actions));
             if m.strips.is_empty() {
                 ui.add_space(Style::SP_S);
                 muted_note(ui, "No channel strips.");
@@ -3496,53 +3627,90 @@ fn mixer_section(ui: &mut egui::Ui, snap: Option<&SeatSnapshot>) {
             ui.add_space(Style::SP_S);
             // The channel strips laid across the wide pane, up to four to a row.
             across_grid(ui, &m.strips, 4, |ui, strip| {
-                tile(ui, |ui| strip_channel(ui, strip, false));
+                tile(ui, |ui| strip_channel(ui, strip, false, actions));
             });
         },
     );
 }
 
-/// One mixer channel as a read-only tile: a status dot + name, then the level (and an
-/// honest "muted" flag). The across-the-width channel the Audio section lays in a row
-/// (SETTINGS-3), replacing the old stacked [`field`] row.
-fn strip_channel(ui: &mut egui::Ui, strip: &MixerStrip, master: bool) {
+/// One mixer channel as a live tile: a status dot + name, then a bounded volume
+/// slider and mute switch. Changes are collected as typed actions and applied after
+/// rendering, so a refused or unavailable provider write cannot masquerade as
+/// successful local state.
+fn strip_channel(
+    ui: &mut egui::Ui,
+    strip: &MixerStrip,
+    master: bool,
+    actions: &mut Vec<SysAction>,
+) {
     let tone = if strip.muted { Style::WARN } else { Style::OK };
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(DOT)
-                .color(tone)
-                .font(Style::typography_font(TypographyRole::Caption)),
-        );
-        ui.add_space(Style::SP_XS);
-        let name = if master {
-            "Master"
-        } else {
-            strip.name.as_str()
-        };
-        ui.label(
-            RichText::new(name)
-                .color(Style::TEXT)
-                .font(Style::typography_font(TypographyRole::Caption))
-                .strong(),
-        );
+    ui.push_id(("mixer-strip", strip.id.as_str()), |ui| {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(DOT)
+                    .color(tone)
+                    .font(Style::typography_font(TypographyRole::Caption)),
+            );
+            ui.add_space(Style::SP_XS);
+            let name = if master {
+                "Master"
+            } else {
+                strip.name.as_str()
+            };
+            ui.label(
+                RichText::new(name)
+                    .color(Style::TEXT)
+                    .font(Style::typography_font(TypographyRole::Caption))
+                    .strong(),
+            );
+        });
+
+        let mut volume = i32::from(strip.volume);
+        if ui
+            .add(Slider::new(&mut volume, 0..=100).text("Volume").suffix("%"))
+            .changed()
+        {
+            actions.push(SysAction::SetMixerVolume {
+                id: strip.id.clone(),
+                volume: bounded_mixer_volume(volume),
+            });
+        }
+        let mut muted = strip.muted;
+        if ui.checkbox(&mut muted, "Mute").changed() {
+            actions.push(SysAction::SetMixerMuted {
+                id: strip.id.clone(),
+                muted,
+            });
+        }
+        if strip.muted {
+            muted_note(ui, "muted");
+        }
     });
-    let level_tone = if strip.muted {
-        Style::WARN
+}
+
+/// Keep the UI-to-provider boundary total and bounded even if a future caller
+/// supplies a value outside the slider's inclusive range.
+fn bounded_mixer_volume(value: i32) -> u8 {
+    if value < 0 {
+        0
+    } else if value > 100 {
+        100
     } else {
-        Style::TEXT
-    };
-    let role = if master {
-        TypographyRole::Body
-    } else {
-        TypographyRole::Caption
-    };
-    ui.label(
-        RichText::new(format!("{}%", strip.volume))
-            .color(level_tone)
-            .font(Style::typography_font(role)),
-    );
-    if strip.muted {
-        muted_note(ui, "muted");
+        value as u8
+    }
+}
+
+#[cfg(test)]
+mod mixer_control_tests {
+    use super::bounded_mixer_volume;
+
+    #[test]
+    fn mixer_volume_boundary_is_clamped_before_provider_action() {
+        assert_eq!(bounded_mixer_volume(-1), 0);
+        assert_eq!(bounded_mixer_volume(0), 0);
+        assert_eq!(bounded_mixer_volume(37), 37);
+        assert_eq!(bounded_mixer_volume(100), 100);
+        assert_eq!(bounded_mixer_volume(101), 100);
     }
 }
 
@@ -4484,10 +4652,7 @@ const fn power_verb_deferred(verb: PowerVerb, in_motion: bool) -> bool {
     in_motion && verb.needs_confirm()
 }
 
-/// The Wallpaper section: policy for the chromeless desktop page and Bing
-/// image-of-the-day fallback. The Construct backdrop picker and the optional
-/// service controls share this compact section so both local and network-backed
-/// wallpaper paths remain visible without scrolling past the fallback toggles.
+/// The Wallpaper section: the single supported Bing image-of-the-day provider.
 fn wallpaper_section(
     ui: &mut egui::Ui,
     config: &mut WallpaperServiceConfig,
@@ -4496,84 +4661,47 @@ fn wallpaper_section(
 ) {
     *config = config.clone().normalized();
     let ctx = ui.ctx().clone();
-    let selected = backdrop::selected_wallpaper(&ctx);
     let mut enabled = backdrop::wallpaper_enabled(&ctx);
     ui.label(
-        RichText::new("Construct wallpaper")
+        RichText::new("Bing wallpaper")
             .color(Style::TEXT_DIM)
             .size(Style::SMALL),
+    );
+    ui.add_space(Style::SP_XS);
+    field(
+        ui,
+        "Home wallpaper",
+        if enabled { "Enabled" } else { "Disabled" },
+        if enabled { Style::OK } else { Style::TEXT_DIM },
     );
     ui.add_space(Style::SP_XS);
     if ui
         .checkbox(
             &mut enabled,
-            RichText::new("Show wallpaper on Home").size(Style::BODY),
+            RichText::new("Enable wallpaper on Home").size(Style::BODY),
         )
         .changed()
     {
         backdrop::set_wallpaper_enabled(&ctx, enabled);
     }
-    ui.horizontal_wrapped(|ui| {
-        for choice in Wallpaper::ALL {
-            let is_selected = choice == selected;
-            if ui
-                .selectable_label(
-                    is_selected,
-                    RichText::new(choice.label()).size(Style::SMALL),
-                )
-                .clicked()
-                && !is_selected
-            {
-                backdrop::select_wallpaper(&ctx, choice);
-            }
-        }
-    });
-    ui.add_space(Style::SP_S);
+    ui.add_space(Style::SP_XS);
     muted_note(
         ui,
-        "Choose a Construct backdrop or disable it for a plain Home field. The selection is persisted per seat and updates immediately.",
+        "Bing's current daily picture is the only supported wallpaper provider. Disable the Home wallpaper to use a plain field.",
     );
     ui.separator();
     ui.add_space(Style::SP_S);
     ui.label(
-        RichText::new("Desktop background service")
+        RichText::new("Bing image of the day")
             .color(Style::TEXT_DIM)
             .size(Style::SMALL),
     );
     ui.add_space(Style::SP_S);
 
-    field(
-        ui,
-        "Desktop page",
-        if config.desktop_page_url.is_empty() {
-            "Not configured"
-        } else {
-            "Configured"
-        },
-        Style::TEXT,
+    ui.checkbox(
+        &mut config.network_fetch_enabled,
+        RichText::new("Allow Bing daily picture downloads").size(Style::BODY),
     );
-    ui.add_space(Style::SP_XS);
-    let edit = ui.add(
-        egui::TextEdit::singleline(&mut config.desktop_page_url)
-            .hint_text("http://127.0.0.1:8787/")
-            .desired_width(f32::INFINITY)
-            .font(egui::TextStyle::Body),
-    );
-    if edit.changed() {
-        config.desktop_page_url = sanitize_wallpaper_service_url(&config.desktop_page_url);
-    }
-    ui.add_space(Style::SP_S);
-
-    ui.horizontal_wrapped(|ui| {
-        ui.checkbox(
-            &mut config.network_fetch_enabled,
-            RichText::new("Allow daily picture downloads").size(Style::BODY),
-        );
-        ui.checkbox(
-            &mut config.bing_daily_enabled,
-            RichText::new("Use Bing image of the day as fallback").size(Style::BODY),
-        );
-    });
     ui.add_space(Style::SP_S);
 
     let download_enabled =
@@ -4611,7 +4739,7 @@ fn wallpaper_section(
     }
     muted_note(
         ui,
-        "The shell uses the configured desktop page first. When it is unavailable, this service can cache Bing's current daily picture for the background. Disable downloads for airgapped seats.",
+        "Bing downloads are enabled by default and can be disabled for air-gapped seats. No custom wallpaper page or alternate provider is supported.",
     );
 }
 
@@ -4623,8 +4751,6 @@ fn wallpaper_download_status(
         WallpaperDownloadStatus::Idle => {
             if !config.network_fetch_enabled {
                 ("Downloads disabled".to_owned(), Style::TEXT_DIM)
-            } else if !config.bing_daily_enabled {
-                ("Bing fallback disabled".to_owned(), Style::TEXT_DIM)
             } else if config.last_image_title.is_empty() {
                 ("No daily picture cached".to_owned(), Style::TEXT_DIM)
             } else {
@@ -4872,6 +4998,41 @@ fn theme_section(ui: &mut egui::Ui, appearance: &mut AppearanceConfig) {
     );
 }
 
+/// Personalization → Clock & Date: the visible shell clock's fixed-offset
+/// display zone. Persisted selection applies to the taskbar, clock face, and
+/// message timestamps; machine/mesh event timestamps remain UTC.
+fn clock_section(ui: &mut egui::Ui, clock: &mut ClockConfig) {
+    ui.label(
+        RichText::new("Display time zone")
+            .color(Style::TEXT_DIM)
+            .size(Style::SMALL)
+            .strong(),
+    );
+    ui.add_space(Style::SP_XS);
+    across_grid(ui, &crate::timers::ClockZone::ALL, 2, |ui, &zone| {
+        let selected = clock.zone == zone;
+        if settings_choice_tile(
+            ui,
+            selected,
+            zone.label(),
+            Some(zone.short_label()),
+            SettingsGroup::Personalization.accent(),
+            Style::SP_XL,
+        ) {
+            clock.zone = zone;
+        }
+    });
+    ui.add_space(Style::SP_S);
+    muted_note(
+        ui,
+        format!(
+            "Construct defaults to Eastern Standard Time (EST, UTC−05:00). Current: {}. \
+             Mesh and audit timestamps remain UTC.",
+            clock.zone.short_label()
+        ),
+    );
+}
+
 // ──────────────────────────── Mesh & System (SETTINGS-4) ────────────────────────────
 
 /// This node's mesh facts (SETTINGS-4), folded from the world-readable mesh-status
@@ -4907,10 +5068,12 @@ struct MeshFacts {
     gateways: Vec<String>,
     /// The node's underlay default gateway, when known.
     default_gw: Option<String>,
-    /// Peers currently `online` in the directory.
-    peers_online: u64,
-    /// Peers in the directory (every node the snapshot names).
-    peers_total: u64,
+    /// The directory's explicit `(online, total)` peer counts.
+    ///
+    /// This stays absent when either field is missing, has the wrong JSON type,
+    /// or the writer emits an impossible pair. A missing pair must not become a
+    /// fabricated `0/0` live count in the Mesh & System view.
+    peer_counts: Option<(u64, u64)>,
 }
 
 impl MeshFacts {
@@ -4929,6 +5092,13 @@ impl MeshFacts {
             return Self::default();
         }
         let network = v.get("network");
+        let peer_counts = match (
+            v.get("online").and_then(Value::as_u64),
+            v.get("total").and_then(Value::as_u64),
+        ) {
+            (Some(online), Some(total)) if online <= total => Some((online, total)),
+            _ => None,
+        };
         // This node's own directory row (the role / overlay source), matched by the
         // `self` identity — honestly absent when the node hasn't published a row yet.
         let own = identity.as_deref().and_then(|host| {
@@ -4952,8 +5122,7 @@ impl MeshFacts {
             lighthouses: str_array(network, "lighthouse_ips"),
             gateways: str_array(network, "gateway_endpoints"),
             default_gw: network.and_then(|n| nonempty(n, "default_gw")),
-            peers_online: v.get("online").and_then(Value::as_u64).unwrap_or(0),
-            peers_total: v.get("total").and_then(Value::as_u64).unwrap_or(0),
+            peer_counts,
             identity,
         }
     }

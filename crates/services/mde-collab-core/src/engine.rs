@@ -37,9 +37,30 @@ use crate::signer::{EventSigner, IdSource};
 /// accepted events.
 const MAX_MERGE_BATCH_EVENTS: usize = 4096;
 
+/// Why a replicated event was rejected before it could enter the convergent
+/// event set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeRejectionReason {
+    /// The envelope uses a schema version this engine does not understand.
+    UnsupportedSchema,
+    /// The envelope is unsigned, malformed, or its signature does not verify.
+    InvalidSignature,
+}
+
+/// An event rejected during [`CollabEngine::merge`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MergeRejection {
+    /// The stable id of the rejected envelope.
+    pub event_id: EventId,
+    /// The fail-closed reason the envelope was rejected.
+    pub reason: MergeRejectionReason,
+}
+
 /// The outcome of a [`merge`](CollabEngine::merge): how many incoming events
-/// were newly accepted, dropped for a bad/absent signature, or already held.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// were newly accepted, rejected for validation, or already held. Rejections
+/// are retained as bounded per-event diagnostics so a replication worker can
+/// report or schedule a resync without guessing from an aggregate count.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MergeOutcome {
     /// Newly accepted (valid signature, not a duplicate).
     pub accepted: usize,
@@ -47,6 +68,8 @@ pub struct MergeOutcome {
     pub dropped_invalid: usize,
     /// Skipped: already present (idempotent duplicate delivery).
     pub duplicates: usize,
+    /// Per-event diagnostics for the rejected envelopes, in incoming order.
+    pub rejected: Vec<MergeRejection>,
 }
 
 /// The headless collaboration engine for one local actor.
@@ -179,8 +202,20 @@ impl CollabEngine {
         let mut outcome = MergeOutcome::default();
         let mut accept: Vec<CollabEventEnvelope> = Vec::new();
         for env in incoming {
-            if env.schema_version != SCHEMA_VERSION || !env.verify() {
+            if env.schema_version != SCHEMA_VERSION {
                 outcome.dropped_invalid += 1;
+                outcome.rejected.push(MergeRejection {
+                    event_id: env.event_id,
+                    reason: MergeRejectionReason::UnsupportedSchema,
+                });
+                continue;
+            }
+            if !env.verify() {
+                outcome.dropped_invalid += 1;
+                outcome.rejected.push(MergeRejection {
+                    event_id: env.event_id,
+                    reason: MergeRejectionReason::InvalidSignature,
+                });
                 continue;
             }
             if self.events.contains_key(&env.event_id) {
@@ -307,5 +342,39 @@ mod tests {
         assert_eq!(outcome.duplicates, 0);
         assert_eq!(outcome.dropped_invalid, MAX_MERGE_BATCH_EVENTS - 1);
         assert_eq!(engine.all_events(), vec![event]);
+    }
+
+    #[test]
+    fn merge_reports_rejection_reason_without_retaining_or_advancing() {
+        let mut engine = CollabEngine::in_memory("viewer").expect("engine");
+        let mut unsupported = signed_event();
+        unsupported.event_id = EventId::from_uuid(Uuid::from_u128(3));
+        unsupported.schema_version = SCHEMA_VERSION + 1;
+        let mut unsigned = signed_event();
+        unsigned.event_id = EventId::from_uuid(Uuid::from_u128(4));
+        unsigned.signature = None;
+
+        let outcome = engine
+            .merge(vec![unsupported, unsigned])
+            .expect("invalid events are reported, not fatal to the batch");
+
+        assert_eq!(outcome.accepted, 0);
+        assert_eq!(outcome.duplicates, 0);
+        assert_eq!(outcome.dropped_invalid, 2);
+        assert_eq!(
+            outcome.rejected,
+            vec![
+                MergeRejection {
+                    event_id: EventId::from_uuid(Uuid::from_u128(3)),
+                    reason: MergeRejectionReason::UnsupportedSchema,
+                },
+                MergeRejection {
+                    event_id: EventId::from_uuid(Uuid::from_u128(4)),
+                    reason: MergeRejectionReason::InvalidSignature,
+                },
+            ]
+        );
+        assert!(engine.all_events().is_empty());
+        assert_eq!(engine.clock(), ActorClock::zero());
     }
 }

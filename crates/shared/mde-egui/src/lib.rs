@@ -106,9 +106,10 @@ pub use video_plane::{
     VideoPlaneError, VideoPlanePlan, VideoScanout,
 };
 pub use widgets::{
-    card, corner, dialog, field, inset, muted_note, operation_progress_text,
-    operation_progress_value, overlay, paint_operation_progress_badge, section, status_dot,
-    toolbar, OperationProgressView,
+    card, corner, dense_row_height, dialog, disabled_hover_text, field, hover_text, inset,
+    muted_note, operation_progress_text, operation_progress_value, overlay,
+    paint_operation_progress_badge, section, status_dot, striped_row, toolbar, tooltip, DenseList,
+    OperationProgressView, WorkspaceState, WorkspaceStatePanel,
 };
 
 #[cfg(feature = "drm")]

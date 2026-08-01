@@ -209,12 +209,17 @@ pub fn mesh_init<B: NebulaCertBackend>(
         };
         #[cfg(feature = "async-services")]
         {
-            crate::workers::nebula_supervisor::materialize_config(
+            // A rerun replaces this founder's requester-owned identity.  Use
+            // the node-aware entry point so that rotation is authenticated and
+            // the superseded certificate is blocklisted before its generation
+            // is pruned.
+            crate::workers::nebula_supervisor::materialize_config_for_node(
                 config_dir,
                 &bundle,
                 crate::workers::nebula_supervisor::ConfigRole::Host,
                 &[],
                 workgroup_root,
+                node_id,
                 Some(&requester_private_key),
             )
             .map_err(|e| anyhow::anyhow!("mesh-init step 3 (activate requester identity): {e}"))?;

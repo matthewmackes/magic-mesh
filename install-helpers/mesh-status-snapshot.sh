@@ -60,6 +60,42 @@ if [ -n "$NET_IF" ]; then
     NET_ROUTES="$(ip route show dev "$NET_IF" 2>/dev/null | awk '$1 ~ /\//{print $1}' | sort -u | head -12 | paste -sd, -)"
 fi
 NET_DEFGW="$(ip route show default 2>/dev/null | awk '{print $3; exit}')"
+# This is deliberately the provider's terse device state only.  Do not ask
+# NetworkManager for CONNECTION/SSID/profile fields and do not put modem
+# bearer/APN/SIM data on the world-readable snapshot boundary.
+NM_PROVIDER_STATUS="$(nmcli -t -f DEVICE,TYPE,STATE device status 2>/dev/null || true)"
+MM_PROVIDER_STATUS="$(mmcli --modem=0 --output-keyvalue 2>/dev/null || true)"
+PP_ACTIVE="$(powerprofilesctl get 2>/dev/null || true)"
+PP_LIST="$(powerprofilesctl list 2>/dev/null || true)"
+# AUDIO-RELEASE-GATE — publish only typed provider availability/counts.  Never
+# cross raw pactl/pw-cli/wpctl output, device names, profiles, or usernames over
+# the world-readable snapshot boundary.
+AUDIO_PULSE=false
+if command -v pactl >/dev/null 2>&1 && pactl info 2>/dev/null | grep -Eiq 'server name:.*(pulseaudio|pipewire)'; then
+    AUDIO_PULSE=true
+fi
+AUDIO_PIPEWIRE=false
+if command -v pw-cli >/dev/null 2>&1 && [ -n "$(pw-cli ls Node 2>/dev/null | head -c 65536)" ]; then
+    AUDIO_PIPEWIRE=true
+fi
+AUDIO_WIREPLUMBER=false
+if command -v wpctl >/dev/null 2>&1 && [ -n "$(wpctl status 2>/dev/null | head -c 65536)" ]; then
+    AUDIO_WIREPLUMBER=true
+fi
+AUDIO_ALSA=0
+if command -v aplay >/dev/null 2>&1; then
+    AUDIO_ALSA="$(aplay -l 2>/dev/null | awk '/^card [0-9]+:/{count++} END{print count+0}')"
+fi
+AUDIO_PLAYBACK=false
+[ "$AUDIO_ALSA" -gt 0 ] 2>/dev/null && AUDIO_PLAYBACK=true
+AUDIO_CAPTURE=false
+if command -v arecord >/dev/null 2>&1 && arecord -l 2>/dev/null | grep -q '^card [0-9]\+:'; then
+    AUDIO_CAPTURE=true
+fi
+AUDIO_RECOVERY=""
+if [ "$AUDIO_PULSE" = false ] && [ "$AUDIO_PIPEWIRE" = false ] && [ "$AUDIO_WIREPLUMBER" = false ]; then
+    AUDIO_RECOVERY="Audio providers unavailable; refresh after PipeWire and WirePlumber start."
+fi
 # LIGHTHOUSE-9 / data accuracy — nebula loads a DIRECTORY config (`-config
 # /etc/nebula`), merging the stock-RPM EXAMPLE `config.yml` (192.168.100.1 /
 # 100.64.22.11) with mackesd's rendered REAL `config.yaml`. Reading both leaked
@@ -107,6 +143,12 @@ WG="$WG" SELF="$SELF" SELF_VER="$VER" PLATFORM_VERSION="$VER" \
 ETCD_MODE="$ETCD_MODE" ETCD_PEERS="$ETCD_PEERS" ETCD_LEADER="$ETCD_LEADER" \
 NET_IF="$NET_IF" NET_IP="$NET_IP" NET_CIDR="$NET_CIDR" NET_ROUTES="$NET_ROUTES" \
 NET_DEFGW="$NET_DEFGW" NET_GWEPS="$NET_GWEPS" NET_CIPHER="$NET_CIPHER" NET_LHIPS="$NET_LHIPS" \
+NM_PROVIDER_STATUS="$NM_PROVIDER_STATUS" MM_PROVIDER_STATUS="$MM_PROVIDER_STATUS" \
+PP_ACTIVE="$PP_ACTIVE" PP_LIST="$PP_LIST" \
+AUDIO_PULSE="$AUDIO_PULSE" AUDIO_PIPEWIRE="$AUDIO_PIPEWIRE" \
+AUDIO_WIREPLUMBER="$AUDIO_WIREPLUMBER" AUDIO_ALSA="$AUDIO_ALSA" \
+AUDIO_PLAYBACK="$AUDIO_PLAYBACK" AUDIO_CAPTURE="$AUDIO_CAPTURE" \
+AUDIO_RECOVERY="$AUDIO_RECOVERY" \
 python3 - "$OUT" <<'PY' || true
 import json, os, sys, glob, time
 wg=os.environ.get("WG","/mnt/mesh-storage"); self_host=os.environ.get("SELF","")
@@ -182,10 +224,78 @@ network={"overlay_if":os.environ.get("NET_IF","") or "",
          "gateway_endpoints":_split("NET_GWEPS"),
          "lighthouse_ips":_split("NET_LHIPS"),
          "cipher":os.environ.get("NET_CIPHER","") or ""}
+# SHELL-NET provider observations — retain only typed link facts.  In
+# particular, the raw NetworkManager/ModemManager output is never serialized;
+# profile names, SSIDs, APNs, SIM/operator data, and credentials are dropped.
+provider_map={"wifi":"wifi", "wlan":"wifi", "ethernet":"ethernet",
+              "802-3-ethernet":"ethernet", "gsm":"cellular",
+              "cdma":"cellular", "wwan":"cellular"}
+state_map={"connected":"connected", "100 (connected)":"connected",
+           "connecting":"connecting", "config":"connecting",
+           "disconnected":"disconnected", "deactivating":"disconnected",
+           "unavailable":"unavailable", "unmanaged":"unavailable"}
+interfaces=[]
+for line in (os.environ.get("NM_PROVIDER_STATUS","") or "").splitlines()[:8]:
+    fields=[]
+    for field in line.split(":"):
+        if fields and fields[-1].endswith("\\"):
+            fields[-1]=fields[-1][:-1]+":"+field
+        else:
+            fields.append(field)
+    if len(fields)<3: continue
+    name, kind, raw_state=(x.strip() for x in fields[:3])
+    provider=provider_map.get(kind.lower())
+    if not provider or not name or len(name)>128: continue
+    normalized=raw_state.lower()
+    status=state_map.get(normalized)
+    if status is None:
+        status="connecting" if ("connecting" in normalized or "config" in normalized) else "unknown"
+    interfaces.append({"provider":provider,"name":name,"status":status,
+                       "up":status=="connected"})
+if not any(item["provider"]=="cellular" for item in interfaces):
+    modem_state=""; modem_device=""
+    for line in (os.environ.get("MM_PROVIDER_STATUS","") or "").splitlines():
+        key, sep, value=line.partition("=")
+        if not sep: continue
+        if key.strip()=="modem.generic.state": modem_state=value.strip().lower()
+        elif key.strip()=="modem.generic.device" and value.strip().startswith("/dev/"):
+            modem_device=value.strip()[:128]
+    if modem_state:
+        status={"connected":"connected", "registered":"connecting",
+                "connecting":"connecting", "disabled":"disconnected",
+                "locked":"disconnected", "failed":"unavailable",
+                "unknown":"unavailable"}.get(modem_state,"unknown")
+        interfaces.append({"provider":"cellular","name":modem_device,
+                           "status":status,"up":status=="connected"})
+network["interfaces"]=interfaces[:8]
+profiles=[]
+for line in (os.environ.get("PP_LIST", "") or "").splitlines()[:16]:
+    line=line.strip().lstrip("*").strip()
+    if not line or ":" in line or len(line)>32: continue
+    if all(ch.isalnum() or ch in "-_" for ch in line):
+        profiles.append(line)
+active=(os.environ.get("PP_ACTIVE", "") or "").strip()
+if active and len(active)>32 or (active and not all(ch.isalnum() or ch in "-_" for ch in active)):
+    active=""
+power_profile={"active":active, "available":sorted(set(profiles))}
+def env_bool(name):
+    return os.environ.get(name, "false").lower() == "true"
+try:
+    alsa_devices=max(0, min(256, int(os.environ.get("AUDIO_ALSA", "0"))))
+except ValueError:
+    alsa_devices=0
+audio={"pulse_available":env_bool("AUDIO_PULSE"),
+       "pipewire_graph":env_bool("AUDIO_PIPEWIRE"),
+       "wireplumber_policy":env_bool("AUDIO_WIREPLUMBER"),
+       "alsa_devices":alsa_devices,
+       "playback":env_bool("AUDIO_PLAYBACK"),
+       "capture":env_bool("AUDIO_CAPTURE"),
+       "recovery":os.environ.get("AUDIO_RECOVERY", "")[:160]}
 platform_version=os.environ.get("PLATFORM_VERSION") or "unknown"
 snap={"generated_ms":int(time.time()*1000),"self":self_host,
       "platform_version":platform_version,"latest_version":latest,
       "online":sum(1 for n in nodes if n["presence"]=="online"),"total":len(nodes),
+      "power_profile":power_profile,"audio":audio,
       "nodes":nodes,"network":network}
 tmp=out+".tmp"
 json.dump(snap,open(tmp,"w")); os.replace(tmp,out)

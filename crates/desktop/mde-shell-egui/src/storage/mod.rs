@@ -1459,7 +1459,7 @@ impl StorageState {
         };
 
         if let BackendStatus::Unavailable { reason } = &node.backend {
-            ui.group(|ui| {
+            mde_egui::card().show(ui, |ui| {
                 ui.colored_label(
                     Style::WARN,
                     RichText::new("Storage backend unavailable").strong(),

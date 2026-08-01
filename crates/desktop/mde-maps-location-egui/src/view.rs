@@ -62,8 +62,6 @@ const DRIVE_FAB_LANE_SEPARATION: f32 = Style::SP_XS;
 
 /// Render the complete native Maps & Location workspace.
 pub fn maps_location_panel(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
-    ui.visuals_mut().override_text_color = Some(Style::TEXT);
-
     // Auto Mode (Car): the cockpit is on a dash — drop the header + tab rail so the
     // active tab (the Drive HUD by default) is edge-to-edge full-bleed. Tab
     // switching in Car Mode is driven by the Auto Home tiles / bound keys (Nav →
@@ -996,17 +994,59 @@ fn health_slot_tone(slot: &VehicleHealthRailSlot) -> Color32 {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HealthSlotGlyph {
+    ActiveCheck,
+    StandbyRing,
+    AttentionTriangle,
+    FaultCross,
+    DisabledPause,
+    NotInstalledSlash,
+    Clock,
+    ResyncingArc,
+    UnavailableSlash,
+}
+
+/// Resolve the color-independent shape semantics before painting. Presence and
+/// freshness deliberately take precedence over producer operation: an absent,
+/// retained, or unavailable interface must never look active merely because an
+/// older operation value remains attached to the row.
+fn health_slot_glyph(slot: &VehicleHealthRailSlot) -> HealthSlotGlyph {
+    match slot.state {
+        VehicleHealthRailState::Stale => HealthSlotGlyph::Clock,
+        VehicleHealthRailState::Resyncing => HealthSlotGlyph::ResyncingArc,
+        VehicleHealthRailState::Unavailable => HealthSlotGlyph::UnavailableSlash,
+        VehicleHealthRailState::Current => {
+            if slot.presence == Some(VehicleRadioPresence::NotInstalled) {
+                return HealthSlotGlyph::NotInstalledSlash;
+            }
+            match slot.operation {
+                Some(VehicleRadioOperation::Active) => HealthSlotGlyph::ActiveCheck,
+                Some(VehicleRadioOperation::Standby) => HealthSlotGlyph::StandbyRing,
+                Some(VehicleRadioOperation::Acquiring | VehicleRadioOperation::Degraded) => {
+                    HealthSlotGlyph::AttentionTriangle
+                }
+                Some(VehicleRadioOperation::Fault) => HealthSlotGlyph::FaultCross,
+                Some(VehicleRadioOperation::Disabled) => HealthSlotGlyph::DisabledPause,
+                Some(VehicleRadioOperation::Unknown | VehicleRadioOperation::Stale) | None => {
+                    HealthSlotGlyph::Clock
+                }
+            }
+        }
+    }
+}
+
 fn paint_health_slot_glyph(painter: &Painter, center: Pos2, slot: &VehicleHealthRailSlot) {
     let tone = health_slot_tone(slot);
     let radius = 7.0;
     let stroke = Stroke::new(1.8, tone);
-    match slot.state {
-        VehicleHealthRailState::Stale => {
+    match health_slot_glyph(slot) {
+        HealthSlotGlyph::Clock => {
             painter.circle_stroke(center, radius, stroke);
             painter.line_segment([center, center + Vec2::new(0.0, -4.0)], stroke);
             painter.line_segment([center, center + Vec2::new(3.0, 2.0)], stroke);
         }
-        VehicleHealthRailState::Resyncing => {
+        HealthSlotGlyph::ResyncingArc => {
             painter.circle_stroke(center, radius, stroke);
             let arc_points = (0..=12)
                 .map(|index| {
@@ -1016,81 +1056,62 @@ fn paint_health_slot_glyph(painter: &Painter, center: Pos2, slot: &VehicleHealth
                 .collect();
             painter.line(arc_points, Stroke::new(1.4, tone));
         }
-        VehicleHealthRailState::Unavailable => {
+        HealthSlotGlyph::UnavailableSlash | HealthSlotGlyph::NotInstalledSlash => {
             painter.circle_stroke(center, radius, stroke);
             painter.line_segment(
                 [center + Vec2::new(-5.0, 5.0), center + Vec2::new(5.0, -5.0)],
                 stroke,
             );
         }
-        VehicleHealthRailState::Current => match slot.presence {
-            Some(VehicleRadioPresence::NotInstalled) => {
-                painter.circle_stroke(center, radius, Stroke::new(1.4, tone));
-                painter.line_segment(
-                    [center + Vec2::new(-5.0, 5.0), center + Vec2::new(5.0, -5.0)],
-                    stroke,
-                );
-            }
-            _ => match slot.operation {
-                Some(VehicleRadioOperation::Active) => {
-                    painter.circle_filled(center, radius, tone.gamma_multiply(0.2));
-                    painter.line_segment(
-                        [center + Vec2::new(-4.0, 0.0), center + Vec2::new(-1.0, 3.0)],
-                        stroke,
-                    );
-                    painter.line_segment(
-                        [center + Vec2::new(-1.0, 3.0), center + Vec2::new(5.0, -4.0)],
-                        stroke,
-                    );
-                }
-                Some(VehicleRadioOperation::Standby) => {
-                    painter.circle_stroke(center, radius, stroke);
-                }
-                Some(VehicleRadioOperation::Acquiring | VehicleRadioOperation::Degraded) => {
-                    painter.add(Shape::convex_polygon(
-                        vec![
-                            center + Vec2::new(0.0, -radius),
-                            center + Vec2::new(radius, radius),
-                            center + Vec2::new(-radius, radius),
-                        ],
-                        tone.gamma_multiply(0.18),
-                        stroke,
-                    ));
-                }
-                Some(VehicleRadioOperation::Fault) => {
-                    painter.circle_stroke(center, radius, stroke);
-                    painter.line_segment(
-                        [center + Vec2::new(-5.0, -5.0), center + Vec2::new(5.0, 5.0)],
-                        stroke,
-                    );
-                    painter.line_segment(
-                        [center + Vec2::new(-5.0, 5.0), center + Vec2::new(5.0, -5.0)],
-                        stroke,
-                    );
-                }
-                Some(VehicleRadioOperation::Disabled) => {
-                    painter.line_segment(
-                        [
-                            center + Vec2::new(-5.0, -4.0),
-                            center + Vec2::new(-5.0, 4.0),
-                        ],
-                        stroke,
-                    );
-                    painter.line_segment(
-                        [center + Vec2::new(5.0, -4.0), center + Vec2::new(5.0, 4.0)],
-                        stroke,
-                    );
-                    painter.line_segment(
-                        [center + Vec2::new(-5.0, 0.0), center + Vec2::new(5.0, 0.0)],
-                        stroke,
-                    );
-                }
-                Some(VehicleRadioOperation::Unknown | VehicleRadioOperation::Stale) | None => {
-                    painter.circle_stroke(center, radius, stroke);
-                    painter.line_segment([center, center + Vec2::new(0.0, -4.0)], stroke);
-                }
-            },
-        },
+        HealthSlotGlyph::ActiveCheck => {
+            painter.circle_filled(center, radius, tone.gamma_multiply(0.2));
+            painter.line_segment(
+                [center + Vec2::new(-4.0, 0.0), center + Vec2::new(-1.0, 3.0)],
+                stroke,
+            );
+            painter.line_segment(
+                [center + Vec2::new(-1.0, 3.0), center + Vec2::new(5.0, -4.0)],
+                stroke,
+            );
+        }
+        HealthSlotGlyph::StandbyRing => {
+            painter.circle_stroke(center, radius, stroke);
+        }
+        HealthSlotGlyph::AttentionTriangle => {
+            painter.add(Shape::convex_polygon(
+                vec![
+                    center + Vec2::new(0.0, -radius),
+                    center + Vec2::new(radius, radius),
+                    center + Vec2::new(-radius, radius),
+                ],
+                tone.gamma_multiply(0.18),
+                stroke,
+            ));
+        }
+        HealthSlotGlyph::FaultCross => {
+            painter.circle_stroke(center, radius, stroke);
+            painter.line_segment(
+                [center + Vec2::new(-5.0, -5.0), center + Vec2::new(5.0, 5.0)],
+                stroke,
+            );
+            painter.line_segment(
+                [center + Vec2::new(-5.0, 5.0), center + Vec2::new(5.0, -5.0)],
+                stroke,
+            );
+        }
+        HealthSlotGlyph::DisabledPause => {
+            painter.line_segment(
+                [
+                    center + Vec2::new(-5.0, -4.0),
+                    center + Vec2::new(-5.0, 4.0),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [center + Vec2::new(5.0, -4.0), center + Vec2::new(5.0, 4.0)],
+                stroke,
+            );
+        }
     }
 }
 
@@ -7355,6 +7376,83 @@ mod tests {
             .iter()
             .any(|text| text == "Radio & GNSS health"));
         assert!(active_route_texts.iter().any(|text| text == "Current"));
+    }
+
+    #[test]
+    fn health_rail_glyph_semantics_cover_every_operation_and_freshness_override() {
+        let slot = |state, presence, operation| VehicleHealthRailSlot {
+            id: "cellular-a",
+            label: "Cell A",
+            state,
+            operation,
+            presence,
+            age_ms: Some(12),
+            reason: None,
+            active_path: false,
+        };
+        let current = |operation| {
+            slot(
+                VehicleHealthRailState::Current,
+                Some(VehicleRadioPresence::Installed),
+                Some(operation),
+            )
+        };
+
+        for (operation, expected) in [
+            (VehicleRadioOperation::Active, HealthSlotGlyph::ActiveCheck),
+            (VehicleRadioOperation::Standby, HealthSlotGlyph::StandbyRing),
+            (
+                VehicleRadioOperation::Acquiring,
+                HealthSlotGlyph::AttentionTriangle,
+            ),
+            (
+                VehicleRadioOperation::Degraded,
+                HealthSlotGlyph::AttentionTriangle,
+            ),
+            (VehicleRadioOperation::Fault, HealthSlotGlyph::FaultCross),
+            (
+                VehicleRadioOperation::Disabled,
+                HealthSlotGlyph::DisabledPause,
+            ),
+            (VehicleRadioOperation::Unknown, HealthSlotGlyph::Clock),
+            (VehicleRadioOperation::Stale, HealthSlotGlyph::Clock),
+        ] {
+            assert_eq!(health_slot_glyph(&current(operation)), expected);
+        }
+
+        let not_installed = slot(
+            VehicleHealthRailState::Current,
+            Some(VehicleRadioPresence::NotInstalled),
+            Some(VehicleRadioOperation::Active),
+        );
+        assert_eq!(
+            health_slot_glyph(&not_installed),
+            HealthSlotGlyph::NotInstalledSlash,
+            "presence must override a retained active operation"
+        );
+
+        for (state, expected) in [
+            (VehicleHealthRailState::Stale, HealthSlotGlyph::Clock),
+            (
+                VehicleHealthRailState::Resyncing,
+                HealthSlotGlyph::ResyncingArc,
+            ),
+            (
+                VehicleHealthRailState::Unavailable,
+                HealthSlotGlyph::UnavailableSlash,
+            ),
+        ] {
+            let retained_active = slot(
+                state,
+                Some(VehicleRadioPresence::Installed),
+                Some(VehicleRadioOperation::Active),
+            );
+            assert_eq!(
+                health_slot_glyph(&retained_active),
+                expected,
+                "freshness state must override a retained active operation"
+            );
+        }
     }
 
     #[test]

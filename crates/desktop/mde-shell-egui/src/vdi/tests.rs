@@ -83,6 +83,111 @@ fn a_requested_connect_paints_the_connecting_caption() {
 }
 
 #[test]
+fn app_handoff_uses_the_existing_brokered_vdi_path_and_keeps_catalog_identity_typed() {
+    let mut state = VdiState::default();
+    state.request_app_connect(
+        crate::session_rail::AppSessionHandoff {
+            id: "app-session-1".to_owned(),
+            serving_peer: "oak".to_owned(),
+            vm_id: "appvm-writer".to_owned(),
+            app_id: "org.example.Writer".to_owned(),
+        },
+        "eagle",
+        None,
+        Some((1280, 720)),
+    );
+
+    let request = state.requested.as_ref().expect("app request retained");
+    assert_eq!(request.app_id.as_deref(), Some("org.example.Writer"));
+    assert_eq!(request.broker_session.as_ref().map(|b| b.id.as_str()), Some("app-session-1"));
+    assert_eq!(request.target.serving_peer, "oak");
+    assert_eq!(request.target.name, "appvm-writer");
+    assert_eq!(request.protocol, VdiProtocol::Vnc);
+    assert_eq!(request.display, DisplayMode::Fullscreen);
+    assert_eq!(request.monitors, MonitorSpan::Single);
+    assert!(request.target.endpoint.is_none());
+    assert_eq!(request.preferred_size, Some((1280, 720)));
+}
+
+#[test]
+fn app_surface_close_returns_to_chrome_and_clears_the_typed_request() {
+    // Exercise the Construct-owned close affordance through the same private
+    // paint seam used by vdi_panel. A real app request is required so the
+    // surface is labelled with the catalog identity rather than a generic
+    // desktop caption.
+    let mut state = VdiState::default();
+    state.request_app_connect(
+        crate::session_rail::AppSessionHandoff {
+            id: "app-session-close".to_owned(),
+            serving_peer: "oak".to_owned(),
+            vm_id: "appvm-writer".to_owned(),
+            app_id: "org.example.Writer".to_owned(),
+        },
+        "eagle",
+        None,
+        Some((1280, 720)),
+    );
+
+    let ctx = egui::Context::default();
+    Style::install(&ctx);
+    let paint = |events| {
+        let mut close = false;
+        let _output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(960.0, 640.0))),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    close = paint_app_surface_chrome(
+                        ui,
+                        Rect::from_min_size(pos2(0.0, 0.0), vec2(960.0, 640.0)),
+                        "org.example.Writer",
+                    );
+                });
+            },
+        );
+        close
+    };
+
+    // Lay out the area, then click the Close app button. Scan the small fixed
+    // chrome bounds instead of baking in a font-dependent text width.
+    assert!(!paint(Vec::new()));
+    let mut close_clicked = false;
+    'scan: for y in (12..48).step_by(4) {
+        for x in (16..360).step_by(4) {
+            let pos = pos2(x as f32, y as f32);
+            if paint(vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ]) {
+                close_clicked = true;
+                break 'scan;
+            }
+        }
+    }
+    assert!(close_clicked, "the app-surface Close app affordance was not clickable");
+
+    state.clear_target();
+    state.request_return_to_chrome();
+    assert!(state.requested_target().is_none());
+    assert!(state.take_return_to_chrome());
+    assert!(!state.take_return_to_chrome());
+}
+
+#[test]
 fn a_spice_connect_without_an_endpoint_paints_without_faking_a_session() {
     // A Spice request is constructed honestly. Without a published endpoint,
     // the live transport gates before dialing, and the surface never fakes a
@@ -129,6 +234,85 @@ fn vdi_protocol_clipboard_summary_is_truthful_per_backend() {
     assert!(VdiProtocol::Vnc
         .clipboard_summary()
         .contains("bidirectional RFB cut text"));
+}
+
+#[cfg(feature = "live-vdi")]
+#[test]
+fn vnc_clipboard_event_is_canonical_and_session_attributed() {
+    let dir = tempfile::tempdir().expect("clipboard Bus tempdir");
+    let request = ConnectRequest::new(
+        RequestedTarget::new("oak", "win11"),
+        VdiProtocol::Vnc,
+        DisplayMode::Fullscreen,
+        MonitorSpan::Single,
+        DesktopAuth::mesh_identity("oak"),
+    )
+    .with_broker_session(BrokerSessionLifecycle::new(
+        "vnc-session-1",
+        Some(dir.path().to_path_buf()),
+    ));
+    let source = super::vnc_clipboard_source(&request);
+    assert_eq!(source, "vnc:oak:vnc-session-1");
+
+    let clip = mde_collab_types::ClipboardClipBody::from_text(
+        "guest → host",
+        source.clone(),
+        "2026-07-31T12:00:00Z",
+    );
+    super::publish_vnc_clipboard_event(Some(dir.path()), &clip);
+
+    let persist =
+        mde_bus::persist::Persist::open(dir.path().to_path_buf()).expect("open clipboard Bus");
+    let message = persist
+        .read_latest("event/clipboard/clip")
+        .expect("read canonical event")
+        .expect("guest event published");
+    let body: serde_json::Value =
+        serde_json::from_str(message.body.as_deref().expect("event body")).expect("canonical JSON");
+    assert_eq!(
+        body.as_object()
+            .expect("canonical object")
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        ["id", "source", "text", "time"]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+    );
+    assert_eq!(body["source"], source);
+    assert_eq!(body["text"], "guest → host");
+
+    let read =
+        super::read_latest_vnc_host_clipboard(dir.path(), &source).expect("read canonical event");
+    assert!(
+        read.is_none(),
+        "a VNC guest event must not loop back to itself"
+    );
+}
+
+#[cfg(feature = "live-vdi")]
+#[test]
+fn vnc_host_clipboard_reader_rejects_oversized_utf8_before_client_cut_text() {
+    let dir = tempfile::tempdir().expect("clipboard Bus tempdir");
+    let oversized = mde_collab_types::ClipboardClipBody::from_text(
+        "x".repeat(mde_collab_types::MAX_CLIPBOARD_TEXT_BYTES + 1),
+        "seat:host",
+        "2026-07-31T12:00:00Z",
+    );
+    let persist =
+        mde_bus::persist::Persist::open(dir.path().to_path_buf()).expect("open clipboard Bus");
+    persist
+        .write(
+            "event/clipboard/clip",
+            mde_bus::hooks::config::Priority::Default,
+            None,
+            Some(&serde_json::to_string(&oversized).expect("encode oversized event")),
+        )
+        .expect("write oversized event");
+
+    let error = super::read_latest_vnc_host_clipboard(dir.path(), "vnc:oak:session")
+        .expect_err("oversized canonical event must fail closed");
+    assert!(error.contains("TextTooLarge"));
 }
 
 #[test]

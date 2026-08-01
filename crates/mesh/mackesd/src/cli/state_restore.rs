@@ -9,17 +9,15 @@ use crate::*;
 pub fn run(
     bundle: std::path::PathBuf,
     verify: bool,
-    passphrase_env: String,
+    passphrase_stdin: bool,
     db_path: PathBuf,
 ) -> anyhow::Result<()> {
     {
         // EFF-28 / MESHFS-14.1 — bundle decode + CA restore.
-        let passphrase = std::env::var(&passphrase_env).with_context(|| {
-            format!(
-                "passphrase env-var {passphrase_env} unset — \
-                     export it before running state restore",
-            )
-        })?;
+        if !passphrase_stdin {
+            anyhow::bail!("state-restore: pass --passphrase-stdin; secrets must not be supplied through argv or the environment");
+        }
+        let passphrase = read_secret_line("state-restore --passphrase-stdin")?;
         let armored = std::fs::read_to_string(&bundle)
             .with_context(|| format!("reading bundle {}", bundle.display()))?;
         let sealed = mackesd_core::ca::backup::dearmor(&armored).context("ASCII-armor decode")?;

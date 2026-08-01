@@ -136,11 +136,17 @@ workload-provider APIs are never exposed as a second public control plane.
   tonal surfaces/elevation, explicit interaction states, accessible focus/contrast,
   and purposeful motion. This is a Browser-only design direction, not permission
   to migrate unrelated shell/workspace surfaces away from `mde-egui::Style`.
+  It is a temporary host-controller boundary while WL-ARCH-008 cuts over to
+  `browser-vm`: Construct styles only the connection, unavailable, and
+  diagnostic surfaces around that guest. Guest Chromium pixels and chrome are
+  outside Construct styling and must never be wrapped or restyled.
 - **Motion** is governed by the operator-locked **MOTION-DRM** epic
   (2026-07-15). The old `animate_bool`-only guidance is superseded: `mde-egui`
-  may own a small centralized, DRM-aware motion subsystem with shared durations,
-  easing, spring presets, animated values, lifecycle phases, reduced-motion
-  handling, and repaint scheduling for the production egui_glow/EGL/GBM/DRM path.
+  owns a centralized, DRM-aware motion subsystem with shared durations, easing,
+  spring presets, expressive animated values, lifecycle phases, and repaint
+  scheduling for the production egui_glow/EGL/GBM/DRM path. Apple-like motion
+  and effects are the default product experience; reduced-motion handling is an
+  optional compatibility path, not a core feature or acceptance gate.
   Compositor-provided animation, Wayland/Xorg dependencies, a renderer rewrite,
   and scattered per-widget timing literals remain out of bounds.
 - **Accessibility is deferred** for the 12.0 cutover (egui/eframe carries an
@@ -246,7 +252,17 @@ when it is **runtime-reachable and observably works** — no `todo!()`/
 mockups/`demo_data` passing as features. Builds clean, tests green, clippy + fmt
 clean. *(The E11 visual-confirmation gate was already lifted; under E12 the
   look-source is the shared egui `Style` module rather than a legacy token set, but the
-runtime-reachability bar is unchanged — `/preview` stays optional/best-effort.)*
+  runtime-reachability bar is unchanged — `/preview` stays optional/best-effort.)*
+
+**Fit-for-purpose release gate (2026-07-30).** Static correctness is not
+production evidence. An engineering preview may ship with unavailable live
+hardware or external-provider evidence explicitly recorded; a production
+promotion may not. Every candidate must have a versioned, signed release-
+evidence record binding the GitHub required checks, farm job/artifact identity,
+SBOM, target compatibility, live topology, recovery, and hardware results.
+GitHub required checks are the release authority; the farm is the heavy
+self-hosted execution backend. A missing, stale, unavailable, or manually
+asserted required gate is a production block.
 
 ## §8 — Positioning & trust envelope
 
@@ -257,6 +273,20 @@ service; no per-service ACL) — the §0 "Simple" lever, accepted because the en
 is a small trusted workgroup; the blast radius is documented for operators. Security
 controls are **enforced in code + covered by tests** (single-use enrollment bearer;
 revocation evicts the data plane; unpinned node fails closed; hash-chain audit).
+
+**Fit boundary (2026-07-30).** The supported product purpose is a small,
+mutually trusted workgroup: encrypted mesh transport, headless control-plane
+services, fleet convergence, and VM-based thin-client desktops. The production
+baseline is exactly **three lighthouses + three workstations**. The platform is
+not a zero-trust, multi-tenant, hyperscale, or general consumer desktop system;
+those are out of purpose, not missing roadmap features.
+
+Flat certificate trust remains the architectural simplicity lever, but new
+work must add capability quarantine, default-deny workload exposure, explicit
+trust-boundary diagnostics, typed resource admission, and minimal-retention
+rules. VM guests and optional devices must not silently become fully trusted
+mesh peers. Existing encrypted control-plane backups remain mandatory until a
+replicated-live-state recovery design has passed destructive multi-node drills.
 
 > **VDI revision (2026-06-30 — `quasar-vdi-desktop.md` locks 46/47).** **VM desktop
 > guests are first-class mesh members** — each dual-homed (its own Nebula cert + a
@@ -277,11 +307,11 @@ revocation evicts the data plane; unpinned node fails closed; hash-chain audit).
 ## §9 — The five planes
 
 *(Carried forward from E11, restated for egui.)* The Workbench's mesh IA is **five
-planes**: **This Node** · **Controller** · **Network** · **Fleet** ·
+planes**: **This Node** · **Cloud** · **Network** · **Fleet** ·
 **Provisioning** — with the **Peers directory as the Front Door** and
 desktop-personal panels grouped below. Locks: **no RBAC** (access to the mesh IS
 the control plane) · **2 roles + capability tags** (hop/execution/headless) ·
-**the Controller is a plane, not a place** (etcd + Syncthing; the elected leader
+**Cloud is a plane, not a place** (etcd + Syncthing; the elected leader
 only coordinates) · **remote execution is typed verbs + signed job bundles only**
 (no raw shell) · **one state doctrine** (etcd + TOML/YAML on Syncthing + typed
 `mackesd` Bus verbs; GUIs are renderers; CLI parity) · **mesh tooling first**
@@ -290,7 +320,7 @@ the renderers-not-authorities doctrine are unchanged. **E12 adds** the desktop
 plane's per-peer workspace + mesh-overlay state to the one-state doctrine
 (etcd/Syncthing-backed).
 
-> **CONSTRUCT-CLOUD amendment (newest lock 2026-07-22).** The Controller plane's
+> **CONSTRUCT-CLOUD amendment (newest lock 2026-07-22).** The Cloud plane's
 > workload functions are exposed as provider-neutral Construct Cloud contracts:
 > workloads, images, networks, containers, configuration, lifecycle, and status.
 > GUIs remain renderers; typed `mackesd` verbs own validation, placement,
@@ -323,6 +353,16 @@ the **GitOps reconciler on a timer** is the canonical build lane (no AI in the
 build loop). **E12 note:** the GUI build is now an **egui/eframe** compile over
 the direct DRM/GBM runner; update the farm's GUI build expectations accordingly
 (libcosmic and the forked compositor are gone).
+
+**§10.0.2 — Release authority (fit audit 2026-07-30).** GitHub required checks
+are the authoritative release status. The build farm remains the authoritative
+execution backend for heavy builds, tests, packaging, and live fixtures, and
+must report traceable job/artifact evidence back to the GitHub candidate. The
+farm `ci-gate.sh` path is a backend/reporting mechanism during this transition,
+not a second release authority. Until the GitHub-to-farm required-check path is
+operational and the signed release-evidence bundle is published, production
+promotion is blocked; an engineering preview may still be published with its
+evidence gaps recorded.
 
 **§10.0.1 — BigBoy takes the longest / most-complex build (standing rule, operator
 2026-06-30).** The single heaviest job always routes to **XEN-BIGBOY**

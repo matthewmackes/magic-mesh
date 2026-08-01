@@ -28,6 +28,10 @@ mde-egui = { path = "../../shared/mde-egui" }
 # from RDP/SPICE, not duplication), but shares the rest (arch-8).
 mde-vdi-core = { path = "../mde-vdi-core" }
 
+# Canonical bounded UTF-8 text contract shared by every native VDI clipboard
+# transport (WL-FUNC-016).
+mackes-mesh-types = { path = "../../mesh/mackes-mesh-types" }
+
 [features]
 default = []
 # E12-6: the live RFB transport (TCP handshake + framebuffer update pump). The

@@ -78,10 +78,9 @@ impl Default for FilesApp {
 
 impl eframe::App for FilesApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Thin frame wrapper (E12-3, EMBED): the binary only owns the window
-        // `CentralPanel`; the surface itself renders through the shared
-        // [`files_panel`] fn — the exact same call the E12 shell makes to mount
-        // Files as an embedded panel, so standalone and embedded are identical.
+        // The surface owns its shared MenuBar and body. The standalone binary
+        // supplies only the window CentralPanel, matching the shell's embedded
+        // mount without adding a second title strip.
         egui::CentralPanel::default().show(ctx, |ui| {
             files_panel(ui, &mut self.browser);
         });

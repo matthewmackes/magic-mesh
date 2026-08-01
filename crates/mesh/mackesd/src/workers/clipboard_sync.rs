@@ -48,13 +48,28 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use mackes_mesh_types::cloud::{cloud_request_digest, CloudArmSigner, CloudArmedToken};
 use mde_bus::persist::Persist;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 pub mod session;
 
+use super::clipboard_bridge::{ClipDirection, ClipPayload, ClipboardEvent};
+use super::session_broker::{EtcdSessionStore, MeshSessionStore, SessionState, SessionStore};
 use super::{ShutdownToken, Worker};
+use crate::ipc::action_auth::{production_action_signer, ACTION_SCHEMA_VERSION, MAX_AUTH_TTL_MS};
+
+/// The daemon-owned VNC-to-seat handoff is deliberately narrower than the
+/// general clipboard action lane: only the shell's truthful VNC source form is
+/// eligible for conversion, and only an active session record can supply the
+/// destination seat.
+const VNC_SOURCE_PREFIX: &str = "vnc:";
+
+/// The shared text-only clipboard ceiling. Keep mesh history on the same
+/// bounded contract as the VDI bridge; oversized payloads must never become
+/// durable replicated state.
+const MAX_CLIP_BYTES: usize = super::clipboard_bridge::MAX_CLIP_BYTES;
 
 /// Non-pinned entries kept in the shared history (O7: pins are exempt +
 /// unlimited, so the real file can be longer than this).
@@ -64,6 +79,11 @@ pub const HISTORY_CAP: usize = 50;
 /// consumer subscribe here for real-time updates; the durable record is
 /// the history file.
 pub const CLIP_TOPIC: &str = "event/clipboard/clip";
+
+/// Per-daemon cursor file kept beside the local Bus log. It is deliberately
+/// not stored under the replicated workgroup root: each daemon must acknowledge
+/// the canonical lane independently, while the history itself is mesh-global.
+const CURSOR_FILE_NAME: &str = "clipboard-sync.cursor.json";
 
 /// Bus-drain cadence for the canonical clipboard event lane.
 pub const CLIP_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(400);
@@ -171,7 +191,7 @@ pub fn apply_clip(history: &mut History, text: &str, source: &str, now: &str) ->
 /// while a new event is always inserted unpinned.
 #[must_use]
 pub fn apply_clip_event(history: &mut History, clip: &ClipEventBody) -> bool {
-    if clip.text.trim().is_empty() {
+    if clip.text.trim().is_empty() || clip.text.len() > MAX_CLIP_BYTES {
         return false;
     }
     // O2 — identical to the current top → debounce (no change, no echo).
@@ -223,6 +243,11 @@ pub fn parse_clip_event_body(body: &str) -> Result<ClipEventBody, String> {
     }
     if clip.source.trim().is_empty() {
         return Err("clipboard clip body missing `source`".to_string());
+    }
+    if clip.text.len() > MAX_CLIP_BYTES {
+        return Err(format!(
+            "clipboard clip body `text` exceeds {MAX_CLIP_BYTES} byte limit"
+        ));
     }
     let expected_id = clip_id(&clip.text);
     if clip.id != expected_id {
@@ -315,6 +340,46 @@ pub fn write_history(path: &Path, history: &History) -> Result<(), String> {
         .map_err(|e| format!("rename {} → {}: {e}", tmp.display(), path.display()))
 }
 
+/// The durable acknowledgement for one daemon's clipboard event lane.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CursorRecord {
+    topic: String,
+    ulid: String,
+}
+
+/// Locate the local cursor, next to the Bus data rather than in shared history.
+#[must_use]
+fn cursor_path(bus_root: &Path) -> PathBuf {
+    bus_root.join(CURSOR_FILE_NAME)
+}
+
+/// Read a cursor only when it is for this exact lane. A malformed or foreign
+/// record is treated as absent so a damaged local cursor cannot suppress new
+/// events or make the worker consume an unrelated topic.
+#[must_use]
+fn read_cursor(path: &Path) -> Option<String> {
+    let record: CursorRecord = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    (record.topic == CLIP_TOPIC && !record.ulid.trim().is_empty()).then_some(record.ulid)
+}
+
+/// Atomically persist the lane acknowledgement after its history mutation has
+/// succeeded. A failed checkpoint is reported to the caller; the in-memory
+/// cursor is intentionally not advanced, so the event is safely replayable.
+fn write_cursor(path: &Path, ulid: &str) -> Result<(), String> {
+    let record = CursorRecord {
+        topic: CLIP_TOPIC.to_string(),
+        ulid: ulid.to_string(),
+    };
+    let body = serde_json::to_vec(&record).map_err(|e| format!("encode cursor: {e}"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, body).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .map_err(|e| format!("rename {} → {}: {e}", tmp.display(), path.display()))
+}
+
 /// Writability for the shared clipboard history.
 ///
 /// Pure core — `root_is_dir` is injected so it unit-tests without touching the
@@ -346,6 +411,10 @@ pub struct ClipboardSyncWorker {
     bus_root_override: Option<PathBuf>,
     /// Bus drain cadence.
     poll: Duration,
+    /// Root-only signer for the daemon-authored VNC guest→seat handoff. A
+    /// missing credential disables this handoff honestly; it never publishes
+    /// an unsigned action body.
+    vnc_action_signer: Option<CloudArmSigner>,
 }
 
 impl ClipboardSyncWorker {
@@ -356,6 +425,7 @@ impl ClipboardSyncWorker {
             workgroup_root,
             bus_root_override: None,
             poll: CLIP_EVENT_POLL_INTERVAL,
+            vnc_action_signer: production_action_signer().ok(),
         }
     }
 
@@ -371,6 +441,154 @@ impl ClipboardSyncWorker {
         self.bus_root_override
             .clone()
             .or_else(crate::bus_publish::default_bus_root)
+    }
+
+    /// Inject the daemon action signer in unit tests. Production obtains it
+    /// from the root-only systemd credential in [`Self::new`].
+    #[cfg(test)]
+    #[must_use]
+    fn with_vnc_action_signer(mut self, signer: CloudArmSigner) -> Self {
+        self.vnc_action_signer = Some(signer);
+        self
+    }
+
+    /// Decode the shell VNC source identity without trusting it as a route.
+    /// The returned `(serving_peer, session_id)` is checked against the
+    /// authoritative session records before it can become a target seat.
+    fn parse_vnc_source(source: &str) -> Option<(&str, &str)> {
+        let rest = source.strip_prefix(VNC_SOURCE_PREFIX)?;
+        let (serving_peer, session_id) = rest.split_once(':')?;
+        if serving_peer.trim().is_empty() || session_id.trim().is_empty() {
+            return None;
+        }
+        Some((serving_peer, session_id))
+    }
+
+    /// Select the same etcd-first / replicated-file fallback store as the
+    /// session broker. Clipboard routing must not read a different authority
+    /// when the lease-backed session plane is enabled.
+    fn session_store(&self) -> Box<dyn SessionStore + Send + Sync> {
+        let endpoints = crate::substrate::etcd::default_endpoints();
+        if endpoints.is_empty() {
+            Box::new(MeshSessionStore::new(self.workgroup_root.clone()))
+        } else {
+            Box::new(EtcdSessionStore::new(endpoints))
+        }
+    }
+
+    /// Resolve a VNC guest event to the active client's exact local target.
+    /// The canonical event is not itself an authorization envelope, so the
+    /// source is only a lookup hint; the active session roster is the authority.
+    fn vnc_target_seat(&self, clip: &ClipEventBody) -> Result<Option<(String, String)>, String> {
+        let Some((serving_peer, session_id)) = Self::parse_vnc_source(&clip.source) else {
+            return Ok(None);
+        };
+        let sessions = self
+            .session_store()
+            .list()
+            .map_err(|error| format!("read VDI session roster for VNC clipboard: {error}"))?;
+        let Some(session) = sessions.into_iter().find(|session| {
+            session.id == session_id
+                && session.serving_peer == serving_peer
+                && session.state == SessionState::Active
+        }) else {
+            // A stale/disconnected VNC event must never be guessed onto a seat.
+            return Ok(Some((String::new(), String::new())));
+        };
+        super::clipboard_bridge::validate_target_seat(&session.client_peer).map_err(|error| {
+            format!("VNC session client peer is not a safe target seat: {error}")
+        })?;
+        Ok(Some((session.id, session.client_peer)))
+    }
+
+    /// Mint the exact-body capability consumed by `clipboard_bridge` for one
+    /// VNC guest→client event. Each publication attempt gets a fresh nonce:
+    /// authorization consumes a nonce before the adapter write, so retrying a
+    /// failed adapter must be able to obtain a new capability. The bridge's
+    /// session/payload echo guard handles duplicate successful publications.
+    fn signed_vnc_action(
+        clip: &ClipEventBody,
+        session_id: &str,
+        target_seat: &str,
+        signer: &CloudArmSigner,
+    ) -> Result<String, String> {
+        let event = ClipboardEvent {
+            session_id: session_id.to_owned(),
+            target_seat: target_seat.to_owned(),
+            direction: ClipDirection::GuestToClient,
+            payload: ClipPayload::checked(
+                super::clipboard_bridge::ClipFormat::Text,
+                clip.text.clone(),
+            )
+            .map_err(|error| format!("VNC clipboard payload rejected: {error}"))?,
+            source: Some(clip.source.clone()),
+        };
+        let mut document = serde_json::to_value(event)
+            .map_err(|error| format!("serialize VNC clipboard action: {error}"))?;
+        document
+            .as_object_mut()
+            .ok_or_else(|| "VNC clipboard action is not a JSON object".to_string())?
+            .insert(
+                "schema_version".to_string(),
+                serde_json::Value::from(ACTION_SCHEMA_VERSION),
+            );
+        let unsigned = document.to_string();
+        let target = format!("session:{session_id}:seat:{target_seat}");
+        let nonce = uuid::Uuid::new_v4().to_string();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| "system clock is before the Unix epoch".to_string())
+            .and_then(|duration| {
+                i64::try_from(duration.as_millis())
+                    .map_err(|_| "system clock is beyond the capability range".to_string())
+            })?;
+        let token = CloudArmedToken::mint(
+            signer,
+            &nonce,
+            now_ms.saturating_add(MAX_AUTH_TTL_MS),
+            super::clipboard_bridge::ACTION_AUTH_VERB,
+            super::clipboard_bridge::ACTION_AUTH_NODE_SCOPE,
+            &target,
+            &cloud_request_digest(&unsigned).map_err(str::to_string)?,
+        )
+        .encode();
+        document
+            .as_object_mut()
+            .ok_or_else(|| "VNC clipboard action is not a JSON object".to_string())?
+            .insert("armed_token".to_string(), serde_json::Value::String(token));
+        serde_json::to_string(&document)
+            .map_err(|error| format!("serialize signed VNC clipboard action: {error}"))
+    }
+
+    /// Convert one accepted canonical VNC event into the signed action lane.
+    /// `Ok(true)` means the event may be acknowledged; `Ok(false)` is reserved
+    /// for a future deferred route. A missing/stale session is acknowledged but
+    /// never guessed onto another seat.
+    fn publish_vnc_action(
+        &self,
+        persist: &mut Persist,
+        clip: &ClipEventBody,
+    ) -> Result<bool, String> {
+        let Some((session_id, target_seat)) = self.vnc_target_seat(clip)? else {
+            return Ok(true);
+        };
+        if session_id.is_empty() {
+            warn!(source = %clip.source, "discarding VNC clipboard event without an active matching session");
+            return Ok(true);
+        }
+        let Some(signer) = self.vnc_action_signer.as_ref() else {
+            return Err("VNC clipboard action signer is unavailable".to_string());
+        };
+        let body = Self::signed_vnc_action(clip, &session_id, &target_seat, signer)?;
+        persist
+            .write(
+                super::clipboard_bridge::ACTION_TOPIC,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&body),
+            )
+            .map(|_| true)
+            .map_err(|error| format!("publish signed VNC clipboard action: {error}"))
     }
 
     /// Whether it is safe to write `clipboard/history.json` under the shared
@@ -407,7 +625,12 @@ impl ClipboardSyncWorker {
     }
 
     /// Drain new canonical `event/clipboard/clip` messages since `cursor`.
-    fn drain_clip_events(&self, persist: &mut Persist, cursor: &mut Option<String>) -> usize {
+    fn drain_clip_events(
+        &self,
+        persist: &mut Persist,
+        cursor: &mut Option<String>,
+        checkpoint: Option<&Path>,
+    ) -> usize {
         persist.reopen_if_index_changed();
         let msgs = match persist.list_since(CLIP_TOPIC, cursor.as_deref()) {
             Ok(msgs) => msgs,
@@ -418,17 +641,42 @@ impl ClipboardSyncWorker {
         };
         let mut applied = 0;
         for msg in msgs {
-            *cursor = Some(msg.ulid.clone());
             let body = msg.body.as_deref().unwrap_or("");
             let clip = match parse_clip_event_body(body) {
                 Ok(clip) => clip,
                 Err(e) => {
                     warn!(target: "clipboard_sync", ulid = %msg.ulid, error = %e, "bad clipboard event body");
+                    if let Some(path) = checkpoint {
+                        if let Err(checkpoint_error) = write_cursor(path, &msg.ulid) {
+                            warn!(target: "clipboard_sync", ulid = %msg.ulid, error = %checkpoint_error, "clipboard cursor checkpoint failed");
+                            continue;
+                        }
+                    }
+                    *cursor = Some(msg.ulid.clone());
                     continue;
                 }
             };
+            // VNC guest copies are canonical history events first, then become
+            // signed target-seat mutations. Do the conversion before the
+            // cursor can acknowledge the source event so a publish failure is
+            // retryable rather than silently losing the guest copy.
+            match self.publish_vnc_action(persist, &clip) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    warn!(target: "clipboard_sync", ulid = %msg.ulid, %error, "VNC clipboard action publish deferred");
+                    continue;
+                }
+            }
             match self.handle_clip_event(&clip) {
                 Ok(true) => {
+                    if let Some(path) = checkpoint {
+                        if let Err(checkpoint_error) = write_cursor(path, &msg.ulid) {
+                            warn!(target: "clipboard_sync", ulid = %msg.ulid, error = %checkpoint_error, "clipboard cursor checkpoint failed; event will be replayed");
+                            continue;
+                        }
+                    }
+                    *cursor = Some(msg.ulid.clone());
                     applied += 1;
                     debug!(
                         target: "clipboard_sync",
@@ -437,7 +685,22 @@ impl ClipboardSyncWorker {
                         clip.text.len()
                     );
                 }
-                Ok(false) => {}
+                Ok(false) => {
+                    // A non-applied valid event is either the O2 debounce or a
+                    // non-writable shared root. Only the former is safe to
+                    // acknowledge; handle_clip_event returns false for both,
+                    // so leave the cursor unchanged and let the next tick
+                    // retry until the shared history is writable.
+                    if self.share_writable() {
+                        if let Some(path) = checkpoint {
+                            if let Err(checkpoint_error) = write_cursor(path, &msg.ulid) {
+                                warn!(target: "clipboard_sync", ulid = %msg.ulid, error = %checkpoint_error, "clipboard cursor checkpoint failed");
+                                continue;
+                            }
+                        }
+                        *cursor = Some(msg.ulid.clone());
+                    }
+                }
                 Err(e) => {
                     warn!(target: "clipboard_sync", ulid = %msg.ulid, "history write failed: {e}");
                 }
@@ -458,7 +721,7 @@ impl Worker for ClipboardSyncWorker {
             debug!("clipboard_sync: no bus root; worker idle");
             return Ok(());
         };
-        let mut persist = match Persist::open(bus_root) {
+        let mut persist = match Persist::open(bus_root.clone()) {
             Ok(persist) => persist,
             Err(e) => {
                 warn!(target: "clipboard_sync", error = %e, "bus open failed; worker idle");
@@ -468,14 +731,25 @@ impl Worker for ClipboardSyncWorker {
         // Existing retained clipboard events may predate this daemon instance and
         // could resurrect a user-deleted/cleared history row. Start at the tail and
         // consume newly published lane events from here.
-        let mut cursor = persist.latest_ulid(CLIP_TOPIC).ok().flatten();
+        let checkpoint = cursor_path(&bus_root);
+        let mut cursor = read_cursor(&checkpoint);
+        if cursor.is_none() {
+            // First boot is intentionally forward-only: retained pre-daemon
+            // events must not resurrect a user's deleted/cleared history.
+            cursor = persist.latest_ulid(CLIP_TOPIC).ok().flatten();
+            if let Some(ulid) = cursor.as_deref() {
+                if let Err(e) = write_cursor(&checkpoint, ulid) {
+                    warn!(target: "clipboard_sync", error = %e, "initial clipboard cursor checkpoint failed");
+                }
+            }
+        }
         info!(target: "clipboard_sync", "watching canonical clipboard bus lane");
         let mut tick = tokio::time::interval(self.poll);
         tick.tick().await;
         loop {
             tokio::select! {
                 _ = tick.tick() => {
-                    self.drain_clip_events(&mut persist, &mut cursor);
+                    self.drain_clip_events(&mut persist, &mut cursor, Some(&checkpoint));
                 }
                 () = shutdown.wait() => return Ok(()),
             }
@@ -492,6 +766,8 @@ pub fn build(workgroup_root: PathBuf) -> ClipboardSyncWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::action_auth::{ActionAuthorizer, MutationContext};
+    use mackes_mesh_types::cloud::CloudArmSigner;
     use mde_bus::hooks::config::Priority;
 
     fn entry(text: &str, pinned: bool) -> ClipEntry {
@@ -508,6 +784,119 @@ mod tests {
     fn worker_name_is_stable() {
         let w = ClipboardSyncWorker::new(PathBuf::from("/tmp"));
         assert_eq!(w.name(), "clipboard_sync");
+    }
+
+    #[test]
+    fn vnc_promotion_is_bounded_attributed_and_signed_for_exact_seat() {
+        let key = b"clipboard-sync-vnc-action-test-key";
+        let signer = CloudArmSigner::new(key.to_vec()).expect("test signer");
+        let auth_root = tempfile::tempdir().expect("auth root");
+        let clip = ClipEventBody::from_text(
+            "guest copy",
+            "vnc:serving-peer:session-1",
+            "2026-07-31T12:00:00Z",
+        );
+        let body = ClipboardSyncWorker::signed_vnc_action(&clip, "session-1", "seat:dell", &signer)
+            .expect("signed VNC action");
+        let event: ClipboardEvent = serde_json::from_str(&body).expect("action event");
+        assert_eq!(event.direction, ClipDirection::GuestToClient);
+        assert_eq!(event.target_seat, "seat:dell");
+        assert_eq!(event.source.as_deref(), Some("vnc:serving-peer:session-1"));
+        assert!(event.payload.len() <= MAX_CLIP_BYTES);
+
+        let signed_now = CloudArmedToken::parse(
+            serde_json::from_str::<serde_json::Value>(&body).expect("action JSON")["armed_token"]
+                .as_str()
+                .expect("armed token"),
+        )
+        .expect("parse armed token")
+        .expires_at_ms
+        .saturating_sub(MAX_AUTH_TTL_MS);
+        let authorizer =
+            ActionAuthorizer::for_test(key, auth_root.path().to_path_buf(), signed_now);
+        authorizer
+            .authorize(
+                &body,
+                MutationContext {
+                    verb: super::super::clipboard_bridge::ACTION_AUTH_VERB,
+                    node: super::super::clipboard_bridge::ACTION_AUTH_NODE_SCOPE,
+                    target: "session:session-1:seat:seat:dell",
+                },
+            )
+            .expect("exact target-seat capability verifies");
+        assert!(authorizer
+            .authorize(
+                &body,
+                MutationContext {
+                    verb: super::super::clipboard_bridge::ACTION_AUTH_VERB,
+                    node: super::super::clipboard_bridge::ACTION_AUTH_NODE_SCOPE,
+                    target: "session:session-1:seat:seat:other",
+                },
+            )
+            .is_err());
+
+        // Authorization is consumed before the adapter write. A second
+        // publication therefore needs a fresh nonce so a failed first write
+        // remains retryable; the bridge's payload echo guard handles the
+        // duplicate if the first write actually succeeded.
+        let retry_body =
+            ClipboardSyncWorker::signed_vnc_action(&clip, "session-1", "seat:dell", &signer)
+                .expect("retry action is signed");
+        let retry_now_ms = CloudArmedToken::parse(
+            serde_json::from_str::<serde_json::Value>(&retry_body).expect("retry action JSON")
+                ["armed_token"]
+                .as_str()
+                .expect("retry armed token"),
+        )
+        .expect("parse retry armed token")
+        .expires_at_ms
+        .saturating_sub(MAX_AUTH_TTL_MS);
+        ActionAuthorizer::for_test(key, auth_root.path().to_path_buf(), retry_now_ms)
+            .authorize(
+                &retry_body,
+                MutationContext {
+                    verb: super::super::clipboard_bridge::ACTION_AUTH_VERB,
+                    node: super::super::clipboard_bridge::ACTION_AUTH_NODE_SCOPE,
+                    target: "session:session-1:seat:seat:dell",
+                },
+            )
+            .expect("retry gets a fresh capability nonce");
+    }
+
+    #[test]
+    fn vnc_source_routes_only_through_matching_active_session() {
+        let root = tempfile::tempdir().expect("session root");
+        let requested = super::super::session_broker::open_session(
+            "session-1".to_owned(),
+            "serving-peer".to_owned(),
+            "vm-1".to_owned(),
+            "seat:dell".to_owned(),
+            1,
+        );
+        let active =
+            super::super::session_broker::mark_active(&requested, 2).expect("active session");
+        MeshSessionStore::new(root.path().to_path_buf())
+            .publish(&active)
+            .expect("persist active session");
+        let worker = ClipboardSyncWorker::new(root.path().to_path_buf());
+        let clip = ClipEventBody::from_text(
+            "guest copy",
+            "vnc:serving-peer:session-1",
+            "2026-07-31T12:00:00Z",
+        );
+        assert_eq!(
+            worker.vnc_target_seat(&clip).expect("route lookup"),
+            Some(("session-1".to_owned(), "seat:dell".to_owned()))
+        );
+        let stale = ClipEventBody::from_text(
+            "guest copy",
+            "vnc:other-peer:session-1",
+            "2026-07-31T12:00:00Z",
+        );
+        assert_eq!(
+            worker.vnc_target_seat(&stale).expect("stale lookup"),
+            Some((String::new(), String::new()))
+        );
     }
 
     #[test]
@@ -687,6 +1076,20 @@ mod tests {
     }
 
     #[test]
+    fn oversized_clip_event_is_rejected_before_history_persistence() {
+        let text = "x".repeat(MAX_CLIP_BYTES + 1);
+        let body = ClipEventBody::from_text(&text, "remote", "2026-07-26T10:30:00Z");
+        let encoded = serde_json::to_string(&body).unwrap();
+        assert!(parse_clip_event_body(&encoded)
+            .expect_err("oversized text must be rejected")
+            .contains("byte limit"));
+
+        let mut history = History::default();
+        assert!(!apply_clip_event(&mut history, &body));
+        assert!(history.entries.is_empty());
+    }
+
+    #[test]
     fn read_history_tolerates_missing_and_corrupt() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("clipboard/history.json");
@@ -756,7 +1159,7 @@ mod tests {
         let w = ClipboardSyncWorker::new(history_dir.path().to_path_buf())
             .with_bus_root(bus_dir.path().to_path_buf());
         let mut cursor = None;
-        assert_eq!(w.drain_clip_events(&mut persist, &mut cursor), 3);
+        assert_eq!(w.drain_clip_events(&mut persist, &mut cursor, None), 3);
         let h = read_history(&history_path(history_dir.path()));
         assert_eq!(
             h.entries
@@ -767,6 +1170,100 @@ mod tests {
         );
         assert_eq!(h.entries[0].source, "nodeA");
         assert_eq!(h.entries[0].time, "2026-07-26T10:02:00Z");
+    }
+
+    #[test]
+    fn durable_cursor_resumes_after_restart_without_replaying_retained_lane() {
+        let history_dir = tempfile::tempdir().unwrap();
+        let bus_dir = tempfile::tempdir().unwrap();
+        let mut persist = Persist::open(bus_dir.path().to_path_buf()).unwrap();
+        let first = ClipEventBody::from_text("first", "nodeA", "2026-07-26T10:00:00Z");
+        persist
+            .write(
+                CLIP_TOPIC,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&first).unwrap()),
+            )
+            .unwrap();
+
+        let checkpoint = cursor_path(bus_dir.path());
+        let w = ClipboardSyncWorker::new(history_dir.path().to_path_buf());
+        let mut cursor = None;
+        assert_eq!(
+            w.drain_clip_events(&mut persist, &mut cursor, Some(&checkpoint)),
+            1
+        );
+        let saved = read_cursor(&checkpoint).expect("successful fold is checkpointed");
+        assert_eq!(cursor.as_deref(), Some(saved.as_str()));
+
+        // A restarted daemon loads the durable acknowledgement and consumes
+        // only the event published after it, while the retained first event is
+        // not folded a second time.
+        let second = ClipEventBody::from_text("second", "nodeB", "2026-07-26T10:01:00Z");
+        persist
+            .write(
+                CLIP_TOPIC,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&second).unwrap()),
+            )
+            .unwrap();
+        let mut restarted_cursor = read_cursor(&checkpoint);
+        assert_eq!(
+            w.drain_clip_events(&mut persist, &mut restarted_cursor, Some(&checkpoint)),
+            1
+        );
+        assert_eq!(
+            read_history(&history_path(history_dir.path()))
+                .entries
+                .iter()
+                .map(|entry| entry.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["second", "first"]
+        );
+    }
+
+    #[test]
+    fn failed_history_write_does_not_acknowledge_event_and_retries() {
+        let history_dir = tempfile::tempdir().unwrap();
+        let bus_dir = tempfile::tempdir().unwrap();
+        let mut persist = Persist::open(bus_dir.path().to_path_buf()).unwrap();
+        let body = ClipEventBody::from_text("retry me", "nodeA", "2026-07-26T10:00:00Z");
+        persist
+            .write(
+                CLIP_TOPIC,
+                Priority::Default,
+                None,
+                Some(&serde_json::to_string(&body).unwrap()),
+            )
+            .unwrap();
+
+        // Make the history parent unusable. The event must remain unacked.
+        std::fs::write(history_dir.path().join("clipboard"), b"not a directory").unwrap();
+        let checkpoint = cursor_path(bus_dir.path());
+        let w = ClipboardSyncWorker::new(history_dir.path().to_path_buf());
+        let mut cursor = None;
+        assert_eq!(
+            w.drain_clip_events(&mut persist, &mut cursor, Some(&checkpoint)),
+            0
+        );
+        assert!(cursor.is_none());
+        assert!(!checkpoint.exists());
+
+        // Repair the destination and drain again: the same retained event is
+        // now applied because the failed attempt never advanced the cursor.
+        std::fs::remove_file(history_dir.path().join("clipboard")).unwrap();
+        std::fs::create_dir(history_dir.path().join("clipboard")).unwrap();
+        assert_eq!(
+            w.drain_clip_events(&mut persist, &mut cursor, Some(&checkpoint)),
+            1
+        );
+        assert_eq!(
+            read_history(&history_path(history_dir.path())).entries[0].text,
+            "retry me"
+        );
+        assert!(read_cursor(&checkpoint).is_some());
     }
 
     #[test]

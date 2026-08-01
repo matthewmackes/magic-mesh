@@ -28,7 +28,9 @@
 use std::path::Path;
 
 use mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION;
-use mackes_mesh_types::vdi_session::SessionRequest;
+use mackes_mesh_types::vdi_session::{
+    AppVmLaunchRequest, AppVmLifecycleState, SessionRequest,
+};
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 
@@ -153,11 +155,50 @@ pub(crate) fn publish_open_record(
     OpenPublication { id, body }
 }
 
+/// Build + publish an App VM `OpenApp` request after validating every guest
+/// identity and the explicit placement supplied by the caller.  App placement
+/// is deliberately not inferred from a peer-app row: until a scheduler has
+/// selected a `vm_id`, a Flatpak launch must remain unavailable rather than
+/// silently falling back to a host `.desktop` execution path.
+pub(crate) fn publish_app_vm_open(
+    bus_root: Option<&Path>,
+    last_error: &mut Option<String>,
+    serving_peer: &str,
+    vm_id: &str,
+    client_peer: &str,
+    request: AppVmLaunchRequest,
+) -> Result<OpenPublication, String> {
+    request.validate().map_err(|error| error.to_string())?;
+    if serving_peer.trim().is_empty() || vm_id.trim().is_empty() || client_peer.trim().is_empty() {
+        return Err("App VM open requires explicit serving, VM, and client peers.".to_owned());
+    }
+    let id = request.session_id.clone();
+    let broker_request = SessionRequest::OpenApp {
+        id: id.clone(),
+        serving_peer: serving_peer.to_string(),
+        vm_id: vm_id.to_string(),
+        client_peer: client_peer.to_string(),
+        app_id: request.app_id,
+        catalog_revision: request.catalog_revision,
+        guest_profile: request.guest_profile,
+        requested_capabilities: request.requested_capabilities,
+        resume: request.resume,
+    };
+    let body = broker_request.to_body();
+    publish(bus_root, last_error, &broker_request);
+    Ok(OpenPublication { id, body })
+}
+
 /// Return the broker's exact capability context for one session transition.
 fn session_auth_context(request: &SessionRequest) -> (&'static str, String) {
     match request {
-        SessionRequest::Open { id, .. } => ("vdi-session-open", format!("session:{id}")),
+        SessionRequest::Open { id, .. } | SessionRequest::OpenApp { id, .. } => {
+            ("vdi-session-open", format!("session:{id}"))
+        }
         SessionRequest::Active { id } => ("vdi-session-active", format!("session:{id}")),
+        SessionRequest::AppState { id, .. } => {
+            ("vdi-session-app-state", format!("session:{id}"))
+        }
         SessionRequest::Disconnect { id } => ("vdi-session-disconnect", format!("session:{id}")),
         SessionRequest::Close { id } => ("vdi-session-close", format!("session:{id}")),
     }
@@ -233,6 +274,30 @@ pub(crate) fn publish_close(
     )
 }
 
+/// Publish a guest-owned App VM readiness update. This is intentionally a
+/// separate lifecycle record: a healthy VDI transport may still be waiting for
+/// placement, boot, portal startup, or application recovery.
+#[cfg(any(test, feature = "live-vdi"))]
+pub(crate) fn publish_app_state(
+    bus_root: Option<&Path>,
+    last_error: &mut Option<String>,
+    id: &str,
+    generation: u64,
+    state: AppVmLifecycleState,
+    reason: Option<String>,
+) -> String {
+    publish_lifecycle(
+        bus_root,
+        last_error,
+        SessionRequest::AppState {
+            id: id.to_owned(),
+            generation,
+            state,
+            reason,
+        },
+    )
+}
+
 /// NOTIFY-CHAT-4 — the Chat surface's per-contact **Remote Control** reuses this
 /// exact broker `Open` wire path (§6, no second copy of the shape): open `host`'s
 /// desktop by naming the contact host as both the serving peer and the target.
@@ -292,6 +357,16 @@ mod tests {
             }
             .to_body(),
             r#"{"op":"close","id":"vdi-1-web"}"#
+        );
+        assert_eq!(
+            SessionRequest::AppState {
+                id: "app-session-1".to_owned(),
+                generation: 3,
+                state: AppVmLifecycleState::StartingApp,
+                reason: Some("portal ready".to_owned()),
+            }
+            .to_body(),
+            r#"{"op":"app_state","id":"app-session-1","generation":3,"state":"starting_app","reason":"portal ready"}"#
         );
     }
 
@@ -355,6 +430,73 @@ mod tests {
         assert!(signed["armed_token"].as_str().is_some());
         assert_eq!(signed["id"], publication.id);
         assert_eq!(signed["op"], "open");
+    }
+
+    #[test]
+    fn publish_app_vm_open_uses_explicit_placement_and_signed_lifecycle_wire() {
+        let bus = tempfile::tempdir().unwrap();
+        let request = AppVmLaunchRequest::new(
+            "org.example.Writer",
+            "catalog-7",
+            "wayland-standard",
+            vec!["clipboard".to_owned()],
+            "app-session-7",
+            true,
+        )
+        .unwrap();
+        let mut last_error = None;
+        let publication = publish_app_vm_open(
+            Some(bus.path()),
+            &mut last_error,
+            "oak",
+            "app-vm-7",
+            "eagle",
+            request,
+        )
+        .unwrap();
+        assert!(last_error.is_none());
+        assert_eq!(publication.id, "app-session-7");
+        let rows = Persist::open(bus.path().to_path_buf())
+            .unwrap()
+            .list_since(ACTION_TOPIC, None)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let signed: serde_json::Value =
+            serde_json::from_str(rows[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!(signed["op"], "open_app");
+        assert_eq!(signed["vm_id"], "app-vm-7");
+        assert_eq!(signed["app_id"], "org.example.Writer");
+        assert_eq!(signed["armed_token"].as_str().is_some(), true);
+    }
+
+    #[test]
+    fn publish_app_vm_open_rejects_missing_placement_without_bus_write() {
+        let bus = tempfile::tempdir().unwrap();
+        let request = AppVmLaunchRequest::new(
+            "org.example.Writer",
+            "catalog-7",
+            "wayland-standard",
+            Vec::new(),
+            "app-session-7",
+            false,
+        )
+        .unwrap();
+        let mut last_error = None;
+        let error = publish_app_vm_open(
+            Some(bus.path()),
+            &mut last_error,
+            "oak",
+            "",
+            "eagle",
+            request,
+        )
+        .expect_err("placement must be explicit");
+        assert!(error.contains("explicit serving, VM, and client peers"));
+        assert!(Persist::open(bus.path().to_path_buf())
+            .unwrap()
+            .list_since(ACTION_TOPIC, None)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

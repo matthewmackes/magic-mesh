@@ -132,6 +132,10 @@ pub(crate) enum Coverage {
 enum StatusAnchor {
     Low,
     Center,
+    /// Keep large-text empty-state copy below the hero mark. The direct-DRM
+    /// viewport can be substantially shorter in logical points, which makes a
+    /// geometrically centered status block collide with the wallpaper mark.
+    LowerCenter,
 }
 
 /// One of the five generated Construct wallpapers (placement lock #12). `Four` is the
@@ -228,7 +232,15 @@ pub(crate) fn show_centered_status(
     coverage: Coverage,
     status: Option<(&str, &str)>,
 ) {
-    show_with_status_anchor(ui, coverage, status, StatusAnchor::Center);
+    // At accessibility zoom the logical viewport is shorter while the
+    // wallpaper's hero remains in the same visual band. Move the honest status
+    // below that mark instead of allowing large text to tessellate through it.
+    let anchor = if ui.ctx().zoom_factor() > 1.25 {
+        StatusAnchor::LowerCenter
+    } else {
+        StatusAnchor::Center
+    };
+    show_with_status_anchor(ui, coverage, status, anchor);
 }
 
 fn show_with_status_anchor(
@@ -237,9 +249,22 @@ fn show_with_status_anchor(
     status: Option<(&str, &str)>,
     status_anchor: StatusAnchor,
 ) {
-    let free = ui.max_rect();
+    // Clear the complete logical scanout, not only the current CentralPanel
+    // allocation. Direct DRM retains the prior boot-splash buffer until every
+    // pixel it occupied is repainted; using the panel allocation can leave the
+    // large splash lockup ghosted behind the empty VDI chooser at large text.
+    let free = ui.ctx().screen_rect();
 
-    let painter = ui.painter().clone();
+    // `ui.painter()` retains the CentralPanel clip even when the target rect is
+    // the complete screen. Paint through the middle layer so the first real
+    // desktop frame is above the retained boot splash layer but below the
+    // foreground Construct chrome.
+    let painter = ui
+        .ctx()
+        .layer_painter(egui::LayerId::new(
+            egui::Order::Middle,
+            egui::Id::new("construct-desktop-backdrop"),
+        ));
     painter.rect_filled(free, 0.0, Style::BG);
     if let Some(texture) = wallpaper_texture(ui.ctx()) {
         painter.image(
@@ -268,7 +293,7 @@ fn show_with_status_anchor(
     // Any honest status (the empty-desktop copy, a gated-transport note) — a small
     // block low on the field, over a subtle backing so it reads over the artwork.
     if let Some((title, detail)) = status {
-        paint_status(&painter, free, title, detail, status_anchor);
+        paint_status(ui.ctx(), &painter, free, title, detail, status_anchor);
     }
 
     // Keep the frame alive while the cover-scrim crossfade is mid-flight.
@@ -305,6 +330,7 @@ const fn cover_uv(free: Vec2, tex: Vec2) -> Rect {
 /// backing so the honest status stays legible over any wallpaper region (§4). The
 /// detail wraps to the free width so a long caption never runs off-panel.
 fn paint_status(
+    ctx: &egui::Context,
     painter: &egui::Painter,
     free: Rect,
     title: &str,
@@ -312,17 +338,18 @@ fn paint_status(
     anchor: StatusAnchor,
 ) {
     let center_x = free.center().x;
+    let palette = Style::current_palette(ctx);
     let title_galley = painter.layout_job(Style::typography_job(
         title,
         TypographyRole::Body,
-        Style::TEXT,
+        palette.text,
         f32::INFINITY,
     ));
     let wrap = Style::SP_XL.mul_add(-2.0, free.width()).max(Style::SP_XL);
     let detail_galley = painter.layout_job(Style::typography_job(
         detail,
         TypographyRole::Caption,
-        Style::TEXT_DIM,
+        palette.text_dim,
         wrap,
     ));
 
@@ -331,6 +358,10 @@ fn paint_status(
     let top = match anchor {
         StatusAnchor::Low => free.height().mul_add(STATUS_Y_FRAC, free.top()),
         StatusAnchor::Center => free.center().y - block_h / 2.0,
+        // The large-text band sits between the centred hero mark and the
+        // wallpaper's lower brand lockup. Keeping it above the lockup avoids
+        // composing live empty-state copy into the selected artwork.
+        StatusAnchor::LowerCenter => free.height().mul_add(0.60, free.top()) - block_h / 2.0,
     };
     let backing = Rect::from_center_size(
         egui::pos2(center_x, top + block_h / 2.0),
@@ -342,7 +373,7 @@ fn paint_status(
     painter.rect_filled(
         backing,
         Style::RADIUS,
-        Style::BG.gamma_multiply(STATUS_BACKING_ALPHA),
+        palette.bg.gamma_multiply(STATUS_BACKING_ALPHA),
     );
 
     let title_pos = egui::pos2(center_x - title_galley.size().x / 2.0, top);
@@ -350,8 +381,8 @@ fn paint_status(
         center_x - detail_galley.size().x / 2.0,
         top + title_galley.size().y + Style::SP_XS,
     );
-    painter.galley(title_pos, title_galley, Style::TEXT);
-    painter.galley(detail_pos, detail_galley, Style::TEXT_DIM);
+    painter.galley(title_pos, title_galley, palette.text);
+    painter.galley(detail_pos, detail_galley, palette.text_dim);
 }
 
 /// NAVBAR-W10-3 (lock W12) — paint the brand watermark: the Win10-activation-style
@@ -994,6 +1025,18 @@ mod tests {
         assert!(
             centered_y + 100.0 < low_y,
             "centered status should move up from the old low anchor: centered={centered_y}, low={low_y}"
+        );
+
+        ctx.set_zoom_factor(1.5);
+        let large = ctx.run(input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_centered_status(ui, Coverage::Empty, status);
+            });
+        });
+        let large_y = title_y(&large);
+        assert!(
+            large_y < centered_y - 20.0,
+            "large-text empty status should move into the clear band above the lower lockup: normal={centered_y}, large={large_y}"
         );
     }
 

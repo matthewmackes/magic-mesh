@@ -94,11 +94,12 @@ pub fn show(
     ui: &mut egui::Ui,
     selected: &mut Plane,
     datacenter: &mut crate::datacenter::DatacenterState,
-    // Read-only: the This Node / Network / Provisioning planes only render
-    // their polled status (`&self`), unlike the Fleet plane whose `datacenter`
+    // The This Node plane owns an on-demand refresh affordance over its bounded
+    // snapshot poll seam. Network and Provisioning remain read-only here,
+    // unlike the Fleet plane whose `datacenter`
     // publishes lifecycle actions. `controller` is read-only too — the Cloud
     // plane embeds its view and keeps its own mutable state in egui memory.
-    thisnode: &crate::thisnode::ThisNodeState,
+    thisnode: &mut crate::thisnode::ThisNodeState,
     // Mutable: the SURFACE-6 card reads the surface workers' typed state off the
     // Bus and publishes typed enable / fw-apply requests (it holds the in-flight
     // arm inputs + the in-process display controller).
@@ -602,7 +603,7 @@ mod tests {
         Style::install(&ctx);
         let mut selected = Plane::ThisNode;
         let mut datacenter = crate::datacenter::DatacenterState::default();
-        let thisnode = crate::thisnode::ThisNodeState::default();
+        let mut thisnode = crate::thisnode::ThisNodeState::default();
         let mut surface_card = crate::surface_card::SurfaceCardState::default();
         let network = crate::network::NetworkState::default();
         let controller = crate::controller::ControllerState::default();
@@ -620,7 +621,7 @@ mod tests {
                     ui,
                     &mut selected,
                     &mut datacenter,
-                    &thisnode,
+                    &mut thisnode,
                     &mut surface_card,
                     &network,
                     &controller,
@@ -636,6 +637,10 @@ mod tests {
                 && (size - Style::TYPE_TITLE3).abs() < f32::EPSILON),
             "the pane title must paint on the shared NavigationBar Title3 rung; \
              painted runs: {runs:?}"
+        );
+        assert!(
+            runs.iter().any(|(text, _)| text == "Refresh now"),
+            "This Node must expose its on-demand refresh affordance; painted runs: {runs:?}"
         );
     }
 }

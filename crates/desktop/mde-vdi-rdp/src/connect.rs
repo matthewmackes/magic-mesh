@@ -71,8 +71,9 @@ use crate::input::{MouseButton, RdpInputEvent};
 use crate::link::QualityTier;
 use crate::pin::{self, Fingerprint, PinAction, PinOutcome};
 use crate::pixel::{FramebufferError, PixelFormat};
-use crate::session::RdpSession;
+use crate::session::{rdp_clipboard_status, RdpSession};
 use crate::tier::RdpTierSettings;
+use mackes_mesh_types::vdi_clipboard::VdiClipboardStatus;
 
 /// Hard ceiling on the whole connection sequence (TCP + TLS + RDP handshake).
 /// A peer that cannot finish negotiating in this window is not going to.
@@ -216,6 +217,11 @@ pub struct Negotiated {
     pub io_channel_id: u16,
     /// The MCS user channel id (diagnostic evidence).
     pub user_channel_id: u16,
+    /// The text-clipboard capability that was actually available alongside
+    /// this connection. A successful RDP desktop handshake does not imply
+    /// CLIPRDR is active; this remains an explicit typed unsupported report
+    /// until the wire processor is present.
+    pub clipboard: VdiClipboardStatus,
 }
 
 /// A detected TLS-certificate change for a host that was already pinned
@@ -489,6 +495,7 @@ impl RdpConnection {
             tier,
             io_channel_id: connection_result.io_channel_id,
             user_channel_id: connection_result.user_channel_id,
+            clipboard: rdp_clipboard_status(),
         };
         tracing::info!(
             desktop_width = negotiated.desktop_size.0,
@@ -670,7 +677,8 @@ impl RdpConnection {
         }
     }
 
-    /// What the server actually granted (geometry, compression, tier).
+    /// What the server actually granted (geometry, compression, tier), plus
+    /// the capability report for optional channels such as CLIPRDR.
     #[must_use]
     pub const fn negotiated(&self) -> &Negotiated {
         &self.negotiated

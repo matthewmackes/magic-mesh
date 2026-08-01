@@ -467,9 +467,7 @@ fn face_lines(unix_secs: i64) -> (String, String) {
 /// Seconds since the Unix epoch (0 on a pre-epoch clock — same guard as the
 /// tray's clock cell).
 fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+    crate::timers::display_unix()
 }
 
 /// Fade a face colour toward faint for the idle dim (`dim` in `0.0..=1.0`).

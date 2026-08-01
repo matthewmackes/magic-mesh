@@ -985,6 +985,98 @@ fn channel_task_lifecycle_is_signed_permissioned_and_convergent() {
 }
 
 #[test]
+fn channel_task_completion_from_departed_member_is_ignored_during_offline_replay() {
+    let mut alice = engine("alice");
+    let mut alice_ids = SeqIds::new(41_000);
+    let alice_signer = sig(41);
+    let space = alice
+        .apply(
+            &CollabCommand::CreateSpace {
+                kind: SpaceKind::Team,
+                name: "ops".into(),
+            },
+            &alice_signer,
+            &mut alice_ids,
+            1_000,
+        )
+        .expect("create space")[0]
+        .space_id;
+    alice
+        .apply(
+            &CollabCommand::AddMember {
+                space,
+                actor: ActorId::new("bob"),
+                role: SpaceRole::Member,
+            },
+            &alice_signer,
+            &mut alice_ids,
+            1_100,
+        )
+        .expect("add bob");
+    let task = alice
+        .apply(
+            &CollabCommand::CreateTask {
+                space,
+                title: "rotate gateway".into(),
+                source: None,
+            },
+            &alice_signer,
+            &mut alice_ids,
+            1_200,
+        )
+        .expect("create task")[0]
+        .event_id;
+
+    let mut bob = engine("bob");
+    bob.merge(alice.all_events().to_vec()).expect("sync bob");
+    let departed = alice
+        .author(
+            space,
+            CollabEventKind::MemberLeft {
+                actor: ActorId::new("bob"),
+            },
+            &alice_signer,
+            &mut alice_ids,
+            1_300,
+        )
+        .expect("remove bob");
+    let stale_completion = bob
+        .author(
+            space,
+            CollabEventKind::TaskCompleted { task },
+            &sig(42),
+            &mut SeqIds::new(42_000),
+            1_400,
+        )
+        .expect("sign bob's offline completion");
+
+    let mut corpus = alice.all_events().to_vec();
+    corpus.push(stale_completion);
+    let mut reference = engine("reference");
+    reference.merge(corpus.clone()).expect("reference replay");
+    assert!(!reference
+        .projection()
+        .channel_tasks(space)
+        .expect("reference task read model")
+        .tasks[0]
+        .completed);
+    assert!(!reference.state().tasks[&task].completed);
+
+    for seed in 1..=8 {
+        let mut offline = engine("offline");
+        offline
+            .merge(shuffle(&corpus, seed))
+            .expect("offline replay");
+        assert_eq!(
+            offline.projection().dump_tables().expect("offline dump"),
+            reference.projection().dump_tables().expect("reference dump"),
+            "departed-member task replay diverged for shuffle seed {seed}"
+        );
+    }
+    assert!(departed.verify(), "membership removal remains signed");
+}
+
+#[test]
 fn channel_task_read_rejects_an_unbounded_projection() {
     let projection = Projection::open_in_memory().expect("projection");
     let space = SpaceId::new();
@@ -1746,6 +1838,65 @@ fn replay_does_not_accept_non_owner_cross_actor_membership_grant() {
             .present_owner_count(),
         1
     );
+}
+
+#[test]
+fn replay_does_not_accept_non_owner_cross_member_removal() {
+    let mut alice = engine("alice");
+    let alice_signer = sig(3);
+    let space = alice
+        .apply(
+            &CollabCommand::CreateSpace {
+                kind: SpaceKind::Team,
+                name: "ops".into(),
+            },
+            &alice_signer,
+            &mut SeqIds::new(3),
+            1000,
+        )
+        .expect("create space")[0]
+        .space_id;
+    alice
+        .apply(
+            &CollabCommand::AddMember {
+                space,
+                actor: ActorId::new("bob"),
+                role: SpaceRole::Member,
+            },
+            &alice_signer,
+            &mut SeqIds::new(300),
+            1100,
+        )
+        .expect("add bob");
+
+    let mut bob = engine("bob");
+    bob.merge(alice.all_events()).expect("bob syncs");
+    let forged = bob
+        .author(
+            space,
+            CollabEventKind::MemberLeft {
+                actor: ActorId::new("alice"),
+            },
+            &sig(4),
+            &mut SeqIds::new(400),
+            1200,
+        )
+        .expect("signed event is ingested for replay validation");
+
+    assert!(bob.state().is_member(space, &ActorId::new("alice")));
+    assert_eq!(
+        bob.state()
+            .space(space)
+            .expect("space")
+            .present_owner_count(),
+        1
+    );
+    let directory = bob
+        .projection()
+        .space_directory(&ActorId::new("bob"))
+        .expect("directory");
+    assert_eq!(directory.spaces[0].members, 2);
+    assert!(forged.verify());
 }
 
 // ---- tombstones -----------------------------------------------------------

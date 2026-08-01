@@ -19,8 +19,9 @@
 //! honest "page crashed" state for THAT tab only (respawn-on-reload) and never
 //! touches the others (per-session isolation). Spawning a live page engine is the
 //! client crate's `live-helper` path, honest-gated to a GPU seat; with no live
-//! session attached this surface shows an honest gated `EmptyState`, never a fake
-//! page (§7).
+//! session attached this surface selects the typed `browser-vm` guest route and
+//! shows an explicit transport-unavailable state; it never falls back to a host
+//! page engine (§7).
 
 use crate::bus_reader::BusReader;
 use base64::Engine as _;
@@ -173,7 +174,10 @@ const CHROME_FONT: f32 = 11.0;
 const CHROME_BUTTON: f32 = 21.0;
 const CHROME_TAB_H: f32 = 22.0;
 const CHROME_TAB_W: f32 = 140.0;
-const CHROME_TAB_RAIL_W: f32 = 172.0;
+/// The vertical Browser tab rail is deliberately 25% narrower than its former
+/// 172 pt presentation. Its two-row cards keep title and state readable while
+/// returning that space to the page viewport.
+const CHROME_TAB_RAIL_W: f32 = 129.0;
 /// The floor a horizontal tab pill shrinks to once the strip is crowded. Below
 /// this the strip stops shrinking and scrolls horizontally instead of wrapping
 /// onto a second row (the standard desktop-browser overflow behaviour).
@@ -461,9 +465,16 @@ fn initial_loading_fast_repaint_deadline(session: &WebSession, now: Instant) -> 
 }
 
 fn start_tab_load(tab: &mut Tab, url: String) {
+    // A navigation makes the previous guest frame stale immediately. Retaining
+    // it while the helper loads the new document would make the shell paint the
+    // old page under the new address and report a misleadingly ready Browser VM.
+    // Clear both CPU and GPU copies so the body takes the honest loading path
+    // until the guest publishes a frame for this navigation.
+    tab.texture = None;
+    tab.last_frame = None;
+    tab.last_frame_uploaded_at = None;
     tab.session.load(url);
     tab.loading_fast_repaint_until = Some(loading_fast_repaint_deadline(Instant::now()));
-    tab.last_frame_uploaded_at = None;
 }
 
 fn sync_tab_loading_repaint_budget(tab: &mut Tab, now: Instant) {
@@ -1465,17 +1476,22 @@ impl BrowserEngine {
 /// guest must have produced a real page frame before the shell claims that the
 /// Browser VM is ready. This keeps the Construct boundary honest while still
 /// giving assistive technology a useful transition through unavailable,
-/// connecting, and disconnected states.
+/// connecting, blocked, and disconnected states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BrowserVmConnectionState {
     /// No guest session is attached, or the live-helper gate has refused one.
     Unavailable,
+    /// The typed Browser VM route was selected, but no VDI transport is attached.
+    TransportUnavailable,
     /// A session is present but has not produced a first usable frame yet.
     Connecting,
     /// A real guest frame is available to the shell.
     Connected,
     /// The guest session crashed and needs an explicit reload/respawn.
     Disconnected,
+    /// The guest session is present but the current navigation is blocked before
+    /// a usable page can be presented (for example by a certificate error).
+    Blocked,
     /// The visible page is shell-owned (for example Browser Options), not a
     /// guest Chromium/Servo page.
     ShellOwned,
@@ -1485,9 +1501,11 @@ impl BrowserVmConnectionState {
     const fn label(self) -> &'static str {
         match self {
             Self::Unavailable => "Unavailable",
+            Self::TransportUnavailable => "Transport unavailable",
             Self::Connecting => "Connecting",
             Self::Connected => "Connected",
             Self::Disconnected => "Disconnected",
+            Self::Blocked => "Blocked",
             Self::ShellOwned => "Shell-owned",
         }
     }
@@ -1497,6 +1515,68 @@ impl BrowserVmConnectionState {
 struct BrowserVmDiagnostic {
     state: BrowserVmConnectionState,
     detail: String,
+}
+
+/// The only route a Browser activation is allowed to select. Keeping the
+/// workload and transport as types makes it impossible for this seam to drift
+/// back to an arbitrary host URL or helper executable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserVmWorkload {
+    BrowserVm,
+}
+
+impl BrowserVmWorkload {
+    const fn wire(self) -> &'static str {
+        match self {
+            Self::BrowserVm => "browser-vm",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserVmTransport {
+    SunshineMoonlight,
+    Rdp,
+}
+
+impl BrowserVmTransport {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::SunshineMoonlight => "Sunshine/Moonlight",
+            Self::Rdp => "RDP",
+        }
+    }
+}
+
+/// A selected guest route. `resume` is intentional: activation targets the
+/// existing named VM/session when present and does not request a host Browser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BrowserVmRoute {
+    workload: BrowserVmWorkload,
+    transport: BrowserVmTransport,
+    alternate_transport: BrowserVmTransport,
+    resume: bool,
+}
+
+impl BrowserVmRoute {
+    const fn select_resume() -> Self {
+        Self {
+            workload: BrowserVmWorkload::BrowserVm,
+            transport: BrowserVmTransport::SunshineMoonlight,
+            alternate_transport: BrowserVmTransport::Rdp,
+            resume: true,
+        }
+    }
+
+    fn summary(self) -> String {
+        format!(
+            "{} via {} (alternate={}, resume={})",
+            self.workload.wire(),
+            self.transport.label(),
+            self.alternate_transport.label(),
+            self.resume
+        )
+    }
 }
 
 impl BrowserVmDiagnostic {
@@ -2078,6 +2158,10 @@ pub(crate) struct WebState {
     /// never runs; this drives surface-level occlusion (see
     /// [`Self::note_surface_foreground`]). Starts `true`.
     surface_foreground: bool,
+    /// The guest route selected by Browser activation. A route is recorded even
+    /// while transport is unavailable so the UI can distinguish “not opened”
+    /// from “the requested guest cannot currently be reached”.
+    browser_vm_route: Option<BrowserVmRoute>,
     /// An honest gated notice shown in place of the `EmptyState` when a `live-helper`
     /// open couldn't proceed (no seat · helper binary absent · spawn failed). `None`
     /// = the default gated caption. Only ever set on the live path — a named reason,
@@ -2209,6 +2293,7 @@ impl Default for WebState {
             download_opener: Box::<XdgDownloadOpener>::default(),
             perf_sampler: PerfSampler::from_env(),
             surface_foreground: true,
+            browser_vm_route: None,
             download_jobs: Vec::new(),
             notified_downloads: BTreeSet::new(),
             power_mode: false,
@@ -4727,7 +4812,16 @@ impl WebState {
 
     fn active_tab_has_frame(&self) -> bool {
         self.tabs.get(self.active).is_some_and(|tab| {
-            tab.internal_page.is_none() && tab.last_frame.is_some() && !tab.session.is_crashed()
+            tab.internal_page.is_none()
+                && tab.last_frame.is_some()
+                && !tab.session.is_crashed()
+                // A retained frame is not a usable guest page while the
+                // current navigation is blocked. The body replaces it with
+                // an interstitial, so frame-dependent actions must agree.
+                && tab.session.cert_error().is_none()
+                && tab.session.managed_policy_block().is_none()
+                && tab.session.safe_browsing_block().is_none()
+                && self.managed_policy_block.is_none()
         })
     }
 
@@ -4736,6 +4830,16 @@ impl WebState {
     /// readiness before the first frame would make the Construct boundary lie.
     fn browser_vm_diagnostic(&self) -> BrowserVmDiagnostic {
         let Some(tab) = self.tabs.get(self.active) else {
+            if let Some(route) = self.browser_vm_route {
+                return BrowserVmDiagnostic {
+                    state: BrowserVmConnectionState::TransportUnavailable,
+                    detail: format!(
+                        "The selected guest route {} has no attached VDI transport",
+                        route.summary()
+                    ),
+                };
+            }
+
             #[cfg(feature = "live-helper")]
             if let Some(notice) = self.gate_notice.as_deref() {
                 return BrowserVmDiagnostic {
@@ -4757,6 +4861,13 @@ impl WebState {
             };
         }
 
+        if let Some(block) = self.managed_policy_block.as_ref() {
+            return BrowserVmDiagnostic {
+                state: BrowserVmConnectionState::Blocked,
+                detail: format!("The guest page is blocked by managed policy: {}", block.url),
+            };
+        }
+
         if tab.session.is_crashed() {
             let reason = crash_reason(&tab.session);
             let detail = if reason.trim().is_empty() {
@@ -4767,6 +4878,30 @@ impl WebState {
             return BrowserVmDiagnostic {
                 state: BrowserVmConnectionState::Disconnected,
                 detail,
+            };
+        }
+
+        if let Some(error) = tab.session.cert_error() {
+            return BrowserVmDiagnostic {
+                state: BrowserVmConnectionState::Blocked,
+                detail: format!(
+                    "The guest page is blocked by a certificate error for {}",
+                    chrome_ui::cert_error_host(error)
+                ),
+            };
+        }
+
+        if let Some(url) = tab.session.managed_policy_block() {
+            return BrowserVmDiagnostic {
+                state: BrowserVmConnectionState::Blocked,
+                detail: format!("The guest page is blocked by managed policy: {url}"),
+            };
+        }
+
+        if let Some(url) = tab.session.safe_browsing_block() {
+            return BrowserVmDiagnostic {
+                state: BrowserVmConnectionState::Blocked,
+                detail: format!("The guest page is blocked by safe browsing: {url}"),
             };
         }
 
@@ -7563,34 +7698,29 @@ impl WebState {
         self.seat_px = (clamp(size.x), clamp(size.y));
     }
 
-    /// Ensure a live browser tab exists — spawn the sandboxed helper on first open.
-    /// The shell's Browser arm calls this each frame with the live seat verdict. A
-    /// no-op once a tab is open, and the real `Command::spawn` is attempted at most
-    /// once (a failure surfaces an honest notice, never a per-frame spawn-storm).
+    /// Activate the Browser's dedicated guest route. The shell's Browser arm calls
+    /// this each frame with the live seat verdict, but activation is deliberately
+    /// independent of host seat/helper availability: it selects/resumes the typed
+    /// `browser-vm` route and waits for VDI rather than starting a host engine.
     pub(crate) fn ensure_live_tab(&mut self, seat_present: bool) {
-        if !self.tabs.is_empty() || self.spawn_attempted {
+        let _ = seat_present;
+        if !self.tabs.is_empty() || self.browser_vm_route.is_some() {
             return;
         }
-        self.restore_startup_session_once();
-        self.drain_incoming_send_tabs();
-        self.cap_eager_startup_open_requests();
-        if !self.open_requested.is_empty() {
-            self.spawn_attempted = true;
-            self.drain_live_tab_requests(seat_present);
-            return;
-        }
+        self.browser_vm_route = Some(BrowserVmRoute::select_resume());
         self.spawn_attempted = true;
-        self.open_with(
-            seat_present,
-            self.engine,
-            START_URL.to_owned(),
-            helper_bin_path(self.engine),
-            WebSession::spawn,
-        );
+        self.gate_notice =
+            Some("Browser VM transport unavailable: waiting for the guest VDI route.".to_owned());
     }
 
     /// Drain the visible tab strip's new-tab request into a real helper spawn.
     pub(crate) fn drain_live_tab_requests(&mut self, seat_present: bool) {
+        if self.browser_vm_route.is_some() {
+            // A Browser VM activation owns this surface. Do not turn a tab-strip
+            // action into a host-helper fallback while VDI is unavailable.
+            self.open_requested.clear();
+            return;
+        }
         while let Some(intent) = self.take_open_request() {
             match intent {
                 TabOpenIntent::NewForeground(engine) => {
@@ -7630,6 +7760,13 @@ impl WebState {
     /// drained by the Browser arm when [`Self::take_respawn_request`] fires. Driven
     /// by an explicit user Reload, so it is not rate-limited by the one-shot latch.
     pub(crate) fn respawn_live(&mut self) {
+        if self.browser_vm_route.is_some() {
+            // Guest recovery belongs to the VM/VDI lifecycle. The Browser shell
+            // must not respawn a host engine after a guest transport loss.
+            self.gate_notice =
+                Some("Browser VM transport unavailable: guest recovery is pending.".to_owned());
+            return;
+        }
         // A tab was already open, so the seat gate is already proven live.
         let engine = self
             .tabs
@@ -10462,6 +10599,109 @@ mod tests {
         assert_eq!(diagnostic.state, BrowserVmConnectionState::Disconnected);
         assert!(diagnostic.detail.starts_with("The guest page stopped"));
         assert!(!diagnostic.summary().contains("Connected"));
+    }
+
+    #[test]
+    fn selected_browser_vm_route_reports_transport_unavailable_without_host_fallback() {
+        let mut state = WebState::default();
+        state.browser_vm_route = Some(BrowserVmRoute::select_resume());
+
+        let diagnostic = state.browser_vm_diagnostic();
+        assert_eq!(
+            diagnostic.state,
+            BrowserVmConnectionState::TransportUnavailable
+        );
+        assert!(diagnostic.detail.contains("browser-vm via Sunshine/Moonlight"));
+        assert!(diagnostic.detail.contains("no attached VDI transport"));
+        assert!(state.tabs.is_empty(), "no host page session may be created");
+    }
+
+    #[cfg(feature = "live-helper")]
+    #[test]
+    fn browser_activation_selects_resumable_guest_route_without_spawning_host_helper() {
+        let mut state = WebState::default();
+
+        state.ensure_live_tab(false);
+
+        assert_eq!(
+            state.browser_vm_route,
+            Some(BrowserVmRoute::select_resume())
+        );
+        assert!(state.tabs.is_empty());
+        assert!(state.spawn_attempted);
+        assert_eq!(
+            state.browser_vm_diagnostic().state,
+            BrowserVmConnectionState::TransportUnavailable
+        );
+    }
+
+    #[test]
+    fn blocked_guest_navigation_does_not_report_a_stale_frame_as_connected() {
+        let (session, helper, _writer) = live_page_session();
+        let mut state = WebState::default();
+        state.push_session(session);
+        assert!(run_until_texture(&mut state), "initial guest frame missing");
+        assert!(
+            state.active_tab_has_frame(),
+            "initial guest frame should be usable"
+        );
+
+        // A blocked navigation can arrive after the previous page painted. The
+        // retained pixels are useful for diagnostics, but they are not the
+        // current guest page and must not advertise Browser readiness.
+        write_helper_event(
+            &helper,
+            &mde_web_preview_client::EventMsg::CertError {
+                url: "https://bad.example.test/".to_owned(),
+                code: -202,
+                message: "certificate is not trusted".to_owned(),
+            },
+        );
+        assert!(run_panel(&mut state), "blocked navigation produced no draw");
+        assert!(
+            state.tabs[0].last_frame.is_some(),
+            "the regression requires the stale frame to remain retained"
+        );
+        assert!(
+            !state.active_tab_has_frame(),
+            "blocked guest navigation must disable frame-dependent actions"
+        );
+
+        let diagnostic = state.browser_vm_diagnostic();
+        assert_eq!(diagnostic.state, BrowserVmConnectionState::Blocked);
+        assert!(diagnostic.detail.contains("certificate error"));
+        assert!(!diagnostic.summary().contains("Connected"));
+    }
+
+    #[test]
+    fn navigation_drops_stale_guest_frame_until_new_page_paints() {
+        let (session, _helper) = testkit::connect().expect("connect");
+        let mut state = WebState::default();
+        state.push_session(session);
+        assert!(
+            run_until_texture(&mut state),
+            "initial guest frame should arrive"
+        );
+        assert!(state.tabs[0].texture.is_some());
+        assert!(state.tabs[0].last_frame.is_some());
+
+        state.load_target("https://next.example/".to_owned());
+
+        let tab = &state.tabs[0];
+        assert!(tab.session.nav().loading);
+        assert!(
+            tab.texture.is_none(),
+            "old GPU pixels must not remain paintable"
+        );
+        assert!(
+            tab.last_frame.is_none(),
+            "old CPU pixels must not be treated as the new page"
+        );
+        assert_eq!(
+            state.browser_vm_diagnostic().state,
+            BrowserVmConnectionState::Connecting,
+            "readiness must wait for a frame from the requested navigation"
+        );
     }
 
     fn write_helper_event(stream: &UnixStream, msg: &mde_web_preview_client::EventMsg) {
@@ -16183,6 +16423,36 @@ mod tests {
         );
         assert_eq!(state.tabs.len(), 2);
         assert!(state.vertical_tabs);
+    }
+
+    #[test]
+    fn vertical_tab_rail_is_quarter_narrower_with_two_row_zebra_cards() {
+        assert!(
+            (CHROME_TAB_RAIL_W - 172.0 * 0.75).abs() < f32::EPSILON,
+            "the host-side rail must remain exactly 25% narrower"
+        );
+
+        let (first, _helper1) = testkit::connect().expect("connect 1");
+        let (second, _helper2) = testkit::connect().expect("connect 2");
+        let mut state = WebState::default();
+        state.push_session(first);
+        state.push_session(second);
+        state.set_vertical_tabs(true);
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        run_tab_strip_frame(&ctx, &mut state, body_input());
+        let centers = tab_pill_centers(&ctx);
+        assert_eq!(
+            centers.len(),
+            2,
+            "two session pills should remain reachable"
+        );
+        let measured_pitch = centers[1].y - centers[0].y;
+        assert!(
+            measured_pitch >= CHROME_TAB_H * 2.0,
+            "each vertical tab card must occupy a tab row and a live-state row: \
+             measured={measured_pitch}"
+        );
     }
 
     #[test]

@@ -7,7 +7,7 @@ workspace frame. It does not close WL-UX-009 or claim production readiness.
 
 - Seat: `.138` (`172.20.146.138`), physical Fedora 44 DRM seat.
 - Connector: `card1-eDP-1`, connected; capture mode `1920x1080`.
-- Shell payload: `a40013fc62162da957e9e0df3619b0ddb1b3262cd36b8d077843a38c14f0399c`.
+- Shell payload for the current proof rows: `703d3477ce574e30abda5f1d7bdc46834ad16881db8d3a1d727b794fc1222919`.
 - Farm RPM: `magic-mesh-12.1.6-1.x86_64.rpm`, SHA-256
   `53835242591b1d3217fc2d83f14021f9cba41fb68a86c295d7c7373ffbee4d75`.
 - Build: BigBoy farm `172.20.0.130`, slot 11, release shell with
@@ -16,6 +16,34 @@ workspace frame. It does not close WL-UX-009 or claim production readiness.
 - Dell deployment: `172.20.146.225` (`DELL-LAPTOP`) received the same extracted
   shell payload; service active with `NRestarts=0`. The final Maps validation
   payload is `b88b6b8877a1fcf9ab441156a50c620b6e48ed1c244df56ceb0c036d38205f52`.
+- Dell current shell proof payload: `703d3477ce574e30abda5f1d7bdc46834ad16881db8d3a1d727b794fc1222919`;
+  service active with `NRestarts=0` during the final direct-DRM captures below.
+- New Maps contrast-fix candidate payload: `8e35703c40721f9e0f031b93f3b48202a97cffcd366192135c7518df5cd83c23`;
+  built on farm `.90` and deployed to Dell and `.138` on 2026-08-01. Both
+  services report active with `NRestarts=0`; no live render pass is claimed
+  until the replacement Maps frames are visually inspected.
+- Replacement Maps capture attempt (2026-08-01): both seats returned an Intel
+  X-tiled primary-plane modifier (`0x100000000000001` on `.138`; Dell's XR30
+  frame also converted to visibly striped scanlines). These PNGs are invalid
+  proof and are intentionally excluded from the passing capture table below.
+  The temporary proof drop-ins and appearance overrides were removed; both
+  seats are back to `require_login_at_boot:true` with `NRestarts=0`.
+- Dell Device Manager strip-removal payload: `02bceab53a5b8fb48391f9f4cbe047cae2b6c37dd9d6972dc96c5083eabcb1d9`;
+  service active with `NRestarts=0` after deployment. The KMS capture device
+  acquired a real scanout frame (`ffmpeg -f kmsgrab ... -f null -` exit 0),
+  but this seat's FFmpeg build could not convert its DRM-prime frame to PNG;
+  no visual screenshot claim is made for this route yet.
+- Prior proof allocator / Maps compile-integrity payload: `703d3477ce574e30abda5f1d7bdc46834ad16881db8d3a1d727b794fc1222919`;
+  deployed to Dell and `.138` on 2026-08-01. Both services reported active with
+  `NRestarts=0`. The `.138` proof retry still exposed XR30 scanout and failed
+  FFmpeg DRM-prime-to-RGBA conversion, so no new visual screenshot claim is
+  made. `.138` was restored to the secure login-at-boot runtime afterward.
+- Proof telemetry/fail-closed payload `f69e42551724fae346b91bb4965194905d6583f62cf4265394f0fa49a8a8fc7e`
+  was built cleanly on farm `.90` and installed on Dell and `.138`; both
+  services are active with `NRestarts=0`. On `.138`, the proof-only linear
+  allocation failed with `EINVAL`; the actual locked front buffer was logged
+  as `XR30`, modifier `I915_x_tiled`, stride `7680`, and the application
+  rejected it as non-linear. No screenshot was accepted from this run.
 - The complete RPM was not installed on either seat because its Fedora build
   dependency set does not match the installed seat runtime. The verified shell
   payload was deployed directly for GUI proof, with the prior binary preserved
@@ -62,6 +90,19 @@ normal secure runtime settings.
 | Dell Dark Timers (AppFrame payload `f49ae072`) | Timers & Alarms | native `1366x768` direct-DRM capture; timer/alarm controls and taskbar remain separated | `7b60a2b6fd3b27f2b6e7eff978efd1bd6ce431f727f36e8e922c098a06d6b183` |
 | Dell Dark narrow Timers (AppFrame payload `f49ae072`) | Timers & Alarms | `800` logical width; controls remain readable with no horizontal overflow or floating-control overlap | `5fa6d47f3c22bc3f75d62bfbed954508ffdf96a0b275ea301a990e02e63ae272` |
 | Dell Light / Largest Timers (AppFrame payload `f49ae072`) | Timers & Alarms | native `1366x768` direct-DRM capture; large-text timer/alarm body is readable and the profile control is absent when no bottom taskbar band is reserved | `a4dd2eed3cf376d3532772c8638bb6da0565839560dd0bf1584c847e6ec16218` |
+| Dell Dark desktop (current payload `285a5b35`) | VDI chooser / Desktop | native `1366x768` direct-DRM capture; current empty-state copy, wallpaper, taskbar, and shared chrome render without stale splash pixels | `a671ff1827bbfba525d3d3fd8f141c30ecd492b2970ae0692f990bf18d39ceac` |
+| Dell Dark narrow (current payload `285a5b35`) | VDI chooser / Desktop | `800` logical width on native scanout; chooser copy and taskbar remain bounded, with unused right scanout intentional | `19d8cf7c12e2c562a62e5edb898145f0bc85079a5d15ddfe520bfc9d14dfcd72` |
+| Dell Light / Largest (current payload `285a5b35`) | VDI chooser / Desktop | native `1366x768` direct-DRM capture; palette-resolved status card sits above the wallpaper lockup and remains readable at largest text | `1d4c327ec3e2df50d8e9ac7b5a43b3b88f69be48da0f18268883b1f71e93540b` |
+| `.138` Dark desktop (current payload `703d3477`) | This Node → About | native `1920x1080` direct-DRM capture; unified MenuBar, Device Manager body, health rail, and bottom taskbar render without the retired title strip | `126629c02077edb6b7af58c93b88d0da6ca70b6a38ad1e598c120e77facde301` |
+| `.138` Dark narrow (current payload `703d3477`) | This Node → About | `800` logical width on native scanout; workspace content stays bounded and the unused right scanout is intentional | `9e7a274021964e0b20242e65fa9994e9222794fe4c00abd700a377add249b1cc` |
+| `.138` Light / Largest (current payload `703d3477`) | This Node → About | native `1920x1080` direct-DRM capture; Light palette and largest text remain readable with the body continuing below the scroll boundary | `1d29672b6863e46ed17162ec137d9716ab3d0d933c0a0ba964ecd6f3e7d0f760` |
+| `.138` Browser boundary (current payload `703d3477`) | Browser VM connection/unavailable state | native `1920x1080` direct-DRM capture; Construct-owned browser controls and honest “No live browser page is available on this device” state render without claiming guest Chromium pixels | `43d776385fd789c343e914aecce70d37c045c198fa56f9d1d5ff351da319ae9d` |
+| `.138` Explorer / Mesh lens (current payload `703d3477`) | Fleet & Mesh → Explorer | native `1920x1080` direct-DRM capture; shared workspace title/menu, mode chips, health rollup, and honest discovered-unit card remain separated above the taskbar | `f9734fa487007bfba16a899f7cb0670bb3e07e7d40a0930e1db70257b9632963` |
+| `.138` Music unavailable state (current payload `703d3477`) | Music | native `1920x1080` direct-DRM capture; shared MUSIC menu/status chrome and honest missing-credentials state render; no Subsonic connectivity claim is made | `3a91b021177cb328cdcd5d854e38f1246623dd048e6421f4b5e777592a91853b` |
+| `.138` Media sources state (current payload `703d3477`) | Media → Sources | native `1920x1080` direct-DRM capture; shared MEDIA menu, source tabs, capture/Jellyfin controls, and honest empty-source copy remain bounded above the taskbar | `d542a3e5c6444e7c51a860c5dc990199b24a0beaa24a33911cc242726c591a6a` |
+| `.138` Files Dark desktop (current payload `703d3477`) | Files | native `1920x1080` direct-DRM capture; shared FILES menu, sidebar, list, preview pane, mesh destinations, and status strip remain separated | `a756678488efca1f5a908a787cae4ccf5002e6338e9f1d061a0fa48db008fff5` |
+| `.138` Files Light / Largest (current payload `703d3477`) | Files | native `1920x1080` direct-DRM capture; large-text palette and dense file controls remain readable with the list/preview boundary intact | `1e32d9d96544b7b54b847b1dddbd9c7306431325202a8bf618205703464104ad` |
+| `.138` Files Dark narrow (current payload `703d3477`) | Files | `800` logical width on native scanout; sidebar, list, preview, and bottom status remain bounded, with unused right scanout intentional | `a164abc361114a37a337deebd2de2162019c122ff56dfa8e45ffcbe1e1a2abf7` |
 
 The captures show the shared MenuBar, AppFrame detail header, Editor,
 Bookmarks, and Storage workspace bodies, toolbars, side rails, taskbar,
@@ -99,6 +140,12 @@ side is outside the proof viewport, not an overlap.
 - Worklist acceptance remains open for the full workspace matrix, remaining
   Construct-owned routes/states, and final production evidence. This is clean
   representative proof, not a claim that every route is production-ready.
+
+The latest proof attempt is intentionally absent from the passing table: the
+Intel direct-DRM path returned an X-tiled BO despite the linear request, and
+the fail-closed guard prevented another striped PNG from being mistaken for
+pixel evidence. A detile/readback capture path and fresh Maps Light/Largest and
+narrow visual inspection are still required.
 
 ## Boundary authority
 

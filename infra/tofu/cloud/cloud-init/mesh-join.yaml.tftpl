@@ -10,6 +10,11 @@ ssh_authorized_keys:
   - ${ssh_authorized_key}
 %{ endif ~}
 
+%{ if app != null ~}
+bootcmd:
+  - [mkdir, -p, /etc/mackesd/app-vm]
+%{ endif ~}
+
 write_files:
   - path: /etc/mackesd/join-token
     permissions: "0600"
@@ -20,7 +25,158 @@ write_files:
     owner: root:root
     content: ${lighthouse_overlay_ip}
 
+%{ if app != null ~}
+  # App VM runtime inputs are identities and policy only. The guest image owns
+  # the curated Flatpak remote; no catalog command, host path, or host socket is
+  # injected into the guest.
+  - path: /etc/mackesd/app-vm/app-id
+    permissions: "0644"
+    owner: root:root
+    content: ${jsonencode(app.app_id)}
+  - path: /etc/mackesd/app-vm/catalog-revision
+    permissions: "0644"
+    owner: root:root
+    content: ${jsonencode(app.catalog_revision)}
+  - path: /etc/mackesd/app-vm/guest-profile
+    permissions: "0644"
+    owner: root:root
+    content: ${jsonencode(app.guest_profile)}
+  - path: /etc/mackesd/app-vm/session-id
+    permissions: "0644"
+    owner: root:root
+    content: ${jsonencode(app.session_id)}
+  - path: /etc/mackesd/app-vm/capabilities
+    permissions: "0644"
+    owner: root:root
+    content: ${jsonencode(join(app.requested_capabilities, "\n"))}
+  - path: /etc/systemd/system/mcnf-app-vm-runtime.service
+    permissions: "0644"
+    owner: root:root
+    content: |
+      [Unit]
+      Description=MCNF guest-owned App VM runtime
+      Wants=network-online.target
+      After=network-online.target
+
+      [Service]
+      Type=simple
+      ExecStart=/usr/local/libexec/mcnf-app-vm-runtime
+
+      [Install]
+      WantedBy=multi-user.target
+  - path: /usr/local/libexec/mcnf-app-vm-runtime
+    permissions: "0755"
+    owner: root:root
+    content: |
+      #!/bin/sh
+      set -eu
+      profile=$(cat /etc/mackesd/app-vm/guest-profile)
+      app_id=$(cat /etc/mackesd/app-vm/app-id)
+      app_id=$${app_id#\"}
+      app_id=$${app_id%\"}
+      session_id=$(cat /etc/mackesd/app-vm/session-id)
+      session_id=$${session_id#\"}
+      session_id=$${session_id%\"}
+      vm_id=$(cat /etc/hostname)
+
+      generation_file=/var/lib/mackesd/app-vm/generation
+      mkdir -p "$${generation_file%/*}"
+      next_generation() {
+        current=0
+        if test -r "$generation_file"; then current=$(cat "$generation_file"); fi
+        case "$current" in ''|*[!0-9]*) current=0 ;; esac
+        if [ "$${#current}" -gt 18 ]; then
+          echo "FATAL: App VM runtime generation is invalid" >&2
+          exit 1
+        fi
+        if [ "$current" -ge 9223372036854775806 ] 2>/dev/null; then
+          echo "FATAL: App VM runtime generation exhausted" >&2
+          exit 1
+        fi
+        generation=$((current + 1))
+        printf '%s\n' "$generation" > "$generation_file.tmp"
+        mv -f "$generation_file.tmp" "$generation_file"
+      }
+
+      publish_runtime() {
+        state=$1
+        reason=$${2:-}
+        next_generation
+        if command -v mde-bus >/dev/null 2>&1; then
+          body=$(printf '{"session_id":"%s","vm_id":"%s","app_id":"%s","generation":%s,"state":"%s","reason":"%s"}' \
+            "$session_id" "$vm_id" "$app_id" "$generation" "$state" "$reason")
+          mde-bus publish state/vdi/app-runtime --body-flag "$body" >/dev/null 2>&1 || true
+        fi
+      }
+
+      # Validation is image-owned and runs before any catalog identity reaches
+      # Flatpak or the bus JSON envelope. An absent validator is a failed image
+      # contract, not a reason to fall back to permissive parsing.
+      if ! /usr/local/libexec/mcnf-app-vm-validate; then
+        echo "FATAL: App VM image validator rejected the guest declaration" >&2
+        exit 1
+      fi
+      # The cloud-init declaration is not sufficient evidence of the guest
+      # image. Require the immutable image-owned profile contract before any
+      # Flatpak admission or compositor launch; never fall back to a generic
+      # desktop image with a copied launcher.
+      contract=/usr/share/mcnf/app-vm/image-contract.json
+      if ! test -r "$contract" \
+        || ! /usr/bin/grep -Fq '"schema_version":1' "$contract" \
+        || ! /usr/bin/grep -Fq '"profile":"wayland-standard"' "$contract" \
+        || ! /usr/bin/grep -Fq '"compositor":"sway"' "$contract" \
+        || ! /usr/bin/grep -Fq '"flatpak_remote":"curated"' "$contract"; then
+        publish_runtime unavailable "App VM image profile contract is unavailable"
+        echo "FATAL: App VM image profile contract is missing or invalid" >&2
+        exit 1
+      fi
+      profile=$${profile#\"}
+      profile=$${profile%\"}
+      test "$profile" = "wayland-standard"
+      publish_runtime installing "guest application admission in progress"
+      # The curated remote is image policy, never catalog input. Refuse to
+      # broaden provenance implicitly when the hardened image is absent.
+      if ! /usr/bin/flatpak remotes --system --columns=name | /usr/bin/grep -Fxq curated; then
+        publish_runtime unavailable "curated Flatpak remote is unavailable"
+        exit 1
+      fi
+      # App identity is validated before it reaches this guest declaration;
+      # install only that identity from the pre-admitted remote.
+      if ! /usr/bin/flatpak install --system --noninteractive curated "$app_id"; then
+        publish_runtime failed "curated Flatpak installation failed"
+        exit 1
+      fi
+      publish_runtime starting_app "guest application installed; compositor launch pending"
+      # The guest owns the compositor and launches the one admitted app from a
+      # fixed image-owned helper. No catalog field becomes a shell command.
+      mkdir -p /run/mcnf-app-vm
+      cat > /run/mcnf-app-vm/sway.conf <<'EOF'
+      default_border none
+      default_floating_border none
+      exec /usr/local/libexec/mcnf-app-vm-launch
+      EOF
+      exec /usr/bin/dbus-run-session -- /usr/bin/sway --config /run/mcnf-app-vm/sway.conf
+%{ endif ~}
+
+%{ if app != null && app.guest_profile == "wayland-standard" ~}
+package_update: true
+packages:
+  # Fixed image profile: the guest owns compositor, portals, Flatpak, audio,
+  # and input. These packages are never selected by catalog data.
+  - flatpak
+  - sway
+  - xdg-desktop-portal
+  - xdg-desktop-portal-wlr
+  - pipewire
+  - pipewire-pulseaudio
+%{ endif ~}
+
 runcmd:
   # SEC-001 join: mackesd reads /etc/mackesd/join-token + the lighthouse address
   # and enrolls into the Nebula overlay on first boot, then converges site.yml.
   - [systemctl, enable, --now, mackesd]
+%{ if app != null && app.guest_profile == "wayland-standard" ~}
+  # The image's fixed App VM unit consumes the identity files above and starts
+  # the guest-owned runtime. It must refuse absent curated-image provenance.
+  - [systemctl, enable, --now, mcnf-app-vm-runtime]
+%{ endif ~}

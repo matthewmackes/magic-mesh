@@ -21,7 +21,7 @@ driven bidirectionally by rich GUI chrome, mesh-aware, persistent.
 | 10 | Copy/scroll | **Native GUI scrollback + selection + search** (TERM's own), NOT tmux copy-mode; yank into tmux buffers + the mesh clipboard. |
 | 11 | Layouts | **5 custom mesh-styled layout presets** (below), not the stock tmux five; mesh-synced. |
 | 12 | Keys | **Both** — the tmux prefix (Ctrl-B/configured) still works inside panes AND native GUI chords (remappable). |
-| 13 | Presets | **Mesh Ops · Node Watch · Cloud/OpenStack · Dev/Build · AI-CLI (Claude + Codex)** (see below). |
+| 13 | Presets | **Mesh Ops · Node Watch · Workloads · Dev/Build · AI-CLI (Claude + Codex)** (see below). |
 | 14 | Config | **Platform-managed tmux config** (a Construct default, mesh-synced; no per-user file hand-editing). |
 | 15 | Palette | **Curated common commands** (~30 most-used tmux actions), fuzzy-searchable. |
 | 16 | Default | **Opt-in per tab** — plain shells by default; "New tmux session" opens a tmux-backed tab. |
@@ -30,7 +30,7 @@ driven bidirectionally by rich GUI chrome, mesh-aware, persistent.
 Each = a named tmux window/pane layout + seeded commands, in the Construct style:
 1. **Mesh Ops** — `meshctl status` · peers roll-up · mesh log follow · a control shell.
 2. **Node Watch** — `btop` · `journalctl -f` · disk/SMART · a shell (per-node health).
-3. **Cloud / OpenStack** — `openstack` ops · Heat/instances · service logs · a shell.
+3. **Workloads** — typed VM lifecycle and placement operations · service logs · a shell.
 4. **Dev / Build** — an editor pane · a build/test shell · a run/logs pane · git.
 5. **AI-CLI** — the **Claude CLI** + **Codex CLI** side by side + a work shell (+ logs).
 

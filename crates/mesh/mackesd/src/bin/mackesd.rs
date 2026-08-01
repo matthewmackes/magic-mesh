@@ -385,11 +385,10 @@ enum Cmd {
         /// real restore.
         #[clap(long)]
         verify: bool,
-        /// Passphrase env-var. Defaults to
-        /// `MDE_BACKUP_PASSPHRASE` (same as the daily backup
-        /// worker's env).
-        #[clap(long, default_value = "MDE_BACKUP_PASSPHRASE")]
-        passphrase_env: String,
+        /// Read the passphrase from stdin so it never appears in argv or the
+        /// inherited environment. This is the only supported restore input.
+        #[clap(long, default_value_t = false)]
+        passphrase_stdin: bool,
     },
 
     /// Generate a fresh 16-char URL-safe passcode (Phase 12.10.1).
@@ -2076,8 +2075,8 @@ fn main() -> anyhow::Result<()> {
         Cmd::StateRestore {
             bundle,
             verify,
-            passphrase_env,
-        } => cli::state_restore::run(bundle, verify, passphrase_env, db_path)?,
+            passphrase_stdin,
+        } => cli::state_restore::run(bundle, verify, passphrase_stdin, db_path)?,
         Cmd::GeneratePasscode { store, cred_path } => {
             cli::generate_passcode::run(store, cred_path)?
         }

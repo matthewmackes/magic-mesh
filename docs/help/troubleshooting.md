@@ -81,4 +81,5 @@ That's the one case with a dedicated runbook — see `mesh-recovery.md`.
 ## When you file an issue
 
 Attach the output of `meshctl doctor` and `meshctl logs --since 1h`. Note your
-node's role and how many peers are in the mesh (the envelope is ≤8).
+node's role and how many infrastructure nodes are in the mesh (the envelope is
+up to 12 nodes: 3 lighthouses plus 9 peers).

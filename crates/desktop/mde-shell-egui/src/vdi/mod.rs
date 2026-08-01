@@ -32,6 +32,9 @@ use std::path::PathBuf;
 
 #[cfg(feature = "live-vdi")]
 use {
+    mde_bus::hooks::config::Priority,
+    mde_bus::persist::Persist,
+    mde_collab_types::{ClipboardClipBody, MAX_CLIPBOARD_TEXT_BYTES},
     mde_vdi_rdp::{PumpOutcome, RdpConfig, RdpConnection},
     mde_vdi_spice::{BlockingSpiceTransport, SpiceConfig},
     mde_vdi_vnc::{PumpOutcome as VncPumpOutcome, VncConfig, VncConnection},
@@ -390,6 +393,10 @@ pub(crate) struct ConnectRequest {
     /// secret is redacted from `Debug` ([`DesktopAuth`]), so this request is
     /// log-safe.
     pub auth: DesktopAuth,
+    /// Optional catalog identity for an App VM handoff. This is presentation
+    /// metadata only; the broker session id remains the authority for routing.
+    /// `None` preserves the ordinary whole-desktop chooser path.
+    pub app_id: Option<String>,
     /// Optional broker lifecycle handle for mesh-rostered sessions. Direct
     /// off-mesh endpoints leave this empty.
     pub broker_session: Option<BrokerSessionLifecycle>,
@@ -431,6 +438,7 @@ impl ConnectRequest {
             display,
             monitors,
             auth,
+            app_id: None,
             broker_session: None,
             preferred_size: None,
         }
@@ -439,6 +447,14 @@ impl ConnectRequest {
     /// Attach the broker session lifecycle id minted by discovery.
     pub(crate) fn with_broker_session(mut self, broker: BrokerSessionLifecycle) -> Self {
         self.broker_session = Some(broker);
+        self
+    }
+
+    /// Mark this brokered desktop as a catalog-backed App VM surface. The app
+    /// identity is bounded and display-only here; provisioning and admission
+    /// already happened through the typed Workloads declaration.
+    pub(crate) fn with_app_id(mut self, app_id: impl Into<String>) -> Self {
+        self.app_id = Some(app_id.into());
         self
     }
 
@@ -474,6 +490,7 @@ struct LiveRdpHandle {
 enum LiveVncEvent {
     Connected(String),
     Frame(egui::ColorImage, FrameDamage),
+    Clipboard(ClipboardClipBody),
     Error(String),
     Ended(String),
 }
@@ -548,13 +565,28 @@ impl LiveRdpHandle {
 impl LiveVncHandle {
     fn spawn(request: &ConnectRequest) -> Result<Self, String> {
         let config = live_vnc_config(request)?;
+        let clipboard_root = request
+            .broker_session
+            .as_ref()
+            .and_then(|broker| broker.bus_root.clone())
+            .or_else(mde_bus::client_data_dir);
+        let clipboard_source = vnc_clipboard_source(request);
         let (input_tx, input_rx) = mpsc::channel();
         let (stop_tx, stop_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();
 
         thread::Builder::new()
             .name(format!("mde-live-vnc-{}", request.target.name))
-            .spawn(move || run_live_vnc(config, input_rx, stop_rx, event_tx))
+            .spawn(move || {
+                run_live_vnc(
+                    config,
+                    input_rx,
+                    stop_rx,
+                    event_tx,
+                    clipboard_root,
+                    clipboard_source,
+                )
+            })
             .map_err(|e| format!("failed to spawn live VNC worker: {e}"))?;
 
         Ok(Self {
@@ -642,6 +674,74 @@ fn live_vnc_config(request: &ConnectRequest) -> Result<VncConfig, String> {
         }
     }
     Ok(config)
+}
+
+#[cfg(feature = "live-vdi")]
+const CLIPBOARD_CAPTURE_TOPIC: &str = "event/clipboard/clip";
+
+/// Stable source identity for one attached VNC desktop. Including the broker
+/// lifecycle id prevents a guest cut from being mistaken for a host/seat copy
+/// and makes a reconnect of the same desktop retain truthful attribution.
+#[cfg(feature = "live-vdi")]
+fn vnc_clipboard_source(request: &ConnectRequest) -> String {
+    let session = request
+        .broker_session
+        .as_ref()
+        .map(|broker| broker.id.as_str())
+        .unwrap_or(request.target.name.as_str());
+    format!("vnc:{}:{session}", request.target.serving_peer)
+}
+
+/// Read the newest canonical host clipboard event for a VNC worker. Events
+/// emitted by this same VNC session are intentionally not sent back to the
+/// guest: they are the guest→host direction and would otherwise form a loop.
+#[cfg(feature = "live-vdi")]
+fn read_latest_vnc_host_clipboard(
+    root: &std::path::Path,
+    session_source: &str,
+) -> Result<Option<(String, ClipboardClipBody)>, String> {
+    let persist = Persist::open(root.to_path_buf())
+        .map_err(|error| format!("could not open clipboard Bus: {error}"))?;
+    let Some(message) = persist
+        .read_latest(CLIPBOARD_CAPTURE_TOPIC)
+        .map_err(|error| format!("clipboard Bus read failed: {error}"))?
+    else {
+        return Ok(None);
+    };
+    let Some(body) = message.body.as_deref() else {
+        return Ok(None);
+    };
+    let clip: ClipboardClipBody = serde_json::from_str(body)
+        .map_err(|error| format!("malformed clipboard event body: {error}"))?;
+    clip.validate()
+        .map_err(|error| format!("clipboard event validation failed: {error:?}"))?;
+    if clip.source == session_source || clip.text.len() > MAX_CLIPBOARD_TEXT_BYTES {
+        return Ok(None);
+    }
+    Ok(Some((message.ulid, clip)))
+}
+
+/// Publish one accepted guest `ServerCutText` value on the canonical event
+/// lane. The body is deliberately the existing `{id,text,source,time}` shape;
+/// the VNC session source carries the protocol/session attribution without
+/// inventing a second clipboard topic.
+#[cfg(feature = "live-vdi")]
+fn publish_vnc_clipboard_event(root: Option<&std::path::Path>, clip: &ClipboardClipBody) {
+    let Some(root) = root else {
+        return;
+    };
+    let Ok(persist) = Persist::open(root.to_path_buf()) else {
+        return;
+    };
+    let Ok(body) = serde_json::to_string(clip) else {
+        return;
+    };
+    let _ = persist.write(
+        CLIPBOARD_CAPTURE_TOPIC,
+        Priority::Default,
+        None,
+        Some(&body),
+    );
 }
 
 #[cfg(feature = "live-vdi")]
@@ -804,6 +904,8 @@ fn run_live_vnc(
     input_rx: mpsc::Receiver<egui::Event>,
     stop_rx: mpsc::Receiver<()>,
     event_tx: mpsc::Sender<LiveVncEvent>,
+    clipboard_root: Option<PathBuf>,
+    clipboard_source: String,
 ) {
     let target = format!("{}:{}", config.host, config.port);
     let mut session = match VncSession::new(config) {
@@ -829,10 +931,40 @@ fn run_live_vnc(
         let _ = event_tx.send(LiveVncEvent::Frame(frame, damage));
     }
 
+    // The canonical event lane is latest-value-wins. Keep the Bus ULID only
+    // after the corresponding ClientCutText has actually flushed: a failed
+    // write leaves the VNC session queue intact and the same event eligible
+    // for retry on the next connection.
+    let mut consumed_host_clipboard = None::<(String, String)>;
+    let mut pending_host_clipboard = None::<(String, String, String)>;
+
     loop {
         if stop_rx.try_recv().is_ok() {
             conn.shutdown();
             return;
+        }
+
+        if pending_host_clipboard.is_none() {
+            if let Some(root) = clipboard_root.as_deref() {
+                if let Ok(Some((ulid, clip))) =
+                    read_latest_vnc_host_clipboard(root, &clipboard_source)
+                {
+                    let already_consumed = consumed_host_clipboard.as_ref().is_some_and(
+                        |(consumed_ulid, consumed_id)| {
+                            consumed_ulid == &ulid || consumed_id == &clip.id
+                        },
+                    );
+                    if !already_consumed {
+                        if let Err(error) = session.send_clipboard_to_guest(clip.text.clone()) {
+                            let _ = event_tx.send(LiveVncEvent::Error(format!(
+                                "VNC host clipboard refused: {error}"
+                            )));
+                            return;
+                        }
+                        pending_host_clipboard = Some((ulid, clip.id, clip.text));
+                    }
+                }
+            }
         }
 
         let mut had_input = false;
@@ -840,10 +972,13 @@ fn run_live_vnc(
             session.send_input(&event);
             had_input = true;
         }
-        if had_input {
+        if had_input || pending_host_clipboard.is_some() {
             if let Err(e) = conn.flush_input(&mut session) {
                 let _ = event_tx.send(LiveVncEvent::Error(format!("VNC input failed: {e}")));
                 return;
+            }
+            if let Some((ulid, id, _)) = pending_host_clipboard.take() {
+                consumed_host_clipboard = Some((ulid, id));
             }
         }
 
@@ -855,7 +990,27 @@ fn run_live_vnc(
                     }
                 }
             }
-            Ok(VncPumpOutcome::Clipboard { .. }) => {}
+            Ok(VncPumpOutcome::Clipboard { .. }) => {
+                // `VncSession` has already performed bounded UTF-8 admission,
+                // echo suppression, and duplicate suppression. Drain only the
+                // accepted latest value and attach the VNC session source here,
+                // before the UI publishes the canonical four-field event.
+                if let Some(text) = session
+                    .take_guest_clipboard()
+                    .into_iter()
+                    .last()
+                    .map(mde_vdi_vnc::RfbCutText::into_text)
+                {
+                    let clip = ClipboardClipBody::from_text(
+                        text,
+                        clipboard_source.clone(),
+                        chrono::Utc::now().to_rfc3339(),
+                    );
+                    if clip.validate().is_ok() {
+                        let _ = event_tx.send(LiveVncEvent::Clipboard(clip));
+                    }
+                }
+            }
             Ok(VncPumpOutcome::TimedOut) => {}
             Ok(VncPumpOutcome::Terminated { reason }) => {
                 let _ = event_tx.send(LiveVncEvent::Ended(reason));
@@ -1274,6 +1429,30 @@ impl VdiState {
         self.requested = Some(request);
     }
 
+    /// Attach a focused App VM rail session to the existing brokered VDI path.
+    /// App sessions use VNC as the universal console fallback while the serving
+    /// console broker resolves the actual endpoint; this does not expose the
+    /// guest desktop as a separate host window or execute a catalog command.
+    pub(crate) fn request_app_connect(
+        &mut self,
+        handoff: crate::session_rail::AppSessionHandoff,
+        client_peer: &str,
+        bus_root: Option<PathBuf>,
+        preferred_size: Option<(u16, u16)>,
+    ) {
+        let request = ConnectRequest::new(
+            RequestedTarget::new(handoff.serving_peer, handoff.vm_id),
+            VdiProtocol::Vnc,
+            DisplayMode::Fullscreen,
+            MonitorSpan::Single,
+            DesktopAuth::mesh_identity(client_peer),
+        )
+        .with_app_id(handoff.app_id)
+        .with_broker_session(BrokerSessionLifecycle::new(handoff.id, bus_root))
+        .with_preferred_size(preferred_size);
+        self.request_connect(request);
+    }
+
     /// Spawn the live decoder transport for `request` (RDP / VNC / SPICE), routing
     /// the honest gate into `live_status` on failure. Shared by the direct-endpoint
     /// path ([`Self::request_connect`]) and the brokered-endpoint resolve path
@@ -1679,6 +1858,7 @@ impl VdiState {
         let mut publish_active = false;
         let mut got_frame = false;
         let mut drop_reason = None;
+        let mut clipboard_events = Vec::new();
         while let Ok(event) = live.event_rx.try_recv() {
             match event {
                 LiveVncEvent::Connected(target) => {
@@ -1690,6 +1870,7 @@ impl VdiState {
                     self.incoming_damage = Some(damage);
                     got_frame = true;
                 }
+                LiveVncEvent::Clipboard(clip) => clipboard_events.push(clip),
                 LiveVncEvent::Error(reason) => {
                     self.live_status = Some(reason.clone());
                     drop_reason = Some(reason);
@@ -1698,6 +1879,17 @@ impl VdiState {
                     self.live_status = Some(format!("VNC session ended: {reason}"));
                     drop_reason = Some(reason);
                 }
+            }
+        }
+        if !clipboard_events.is_empty() {
+            let root = self
+                .requested
+                .as_ref()
+                .and_then(|request| request.broker_session.as_ref())
+                .and_then(|broker| broker.bus_root.clone())
+                .or_else(mde_bus::client_data_dir);
+            for clip in &clipboard_events {
+                publish_vnc_clipboard_event(root.as_deref(), clip);
             }
         }
         if got_frame {
@@ -1961,6 +2153,21 @@ pub(crate) fn vdi_panel(ui: &mut egui::Ui, state: &mut VdiState) {
                     None => {}
                 }
             }
+
+            // App VM sessions retain Construct ownership of the visible surface:
+            // expose the app identity and an explicit close affordance over the
+            // guest framebuffer instead of making the operator manage a guest
+            // desktop window.
+            let app_id = state
+                .requested
+                .as_ref()
+                .and_then(|request| request.app_id.clone());
+            if let Some(app_id) = app_id {
+                if paint_app_surface_chrome(ui, rect, &app_id) {
+                    state.clear_target();
+                    state.return_to_chrome = true;
+                }
+            }
         }
         None => {
             // No live desktop texture: the empty Desktop surface paints the BRAND-1
@@ -1974,10 +2181,9 @@ pub(crate) fn vdi_panel(ui: &mut egui::Ui, state: &mut VdiState) {
                 // names the desktop + the chosen protocol/display below the logo,
                 // never a placeholder render (§7).
                 Some(req) => {
-                    let title = format!(
-                        "Connecting to {} via {}",
-                        req.target.name,
-                        req.protocol.label()
+                    let title = req.app_id.as_ref().map_or_else(
+                        || format!("Connecting to {} via {}", req.target.name, req.protocol.label()),
+                        |app_id| format!("Opening {app_id} via {}", req.protocol.label()),
                     );
                     // CHOOSER-6 — name the auth mode honestly (SSO vs sealed cred);
                     // `auth.summary()` is log-safe and never carries the secret.
@@ -2026,6 +2232,51 @@ pub(crate) fn vdi_panel(ui: &mut egui::Ui, state: &mut VdiState) {
             }
         }
     }
+}
+
+/// Paint the minimal Construct-owned chrome for a catalog-backed app surface.
+/// The guest compositor remains inside the framebuffer; the shell owns the
+/// identity and close action so the app is never presented as an unmanaged
+/// host window.
+fn paint_app_surface_chrome(ui: &mut egui::Ui, body: egui::Rect, app_id: &str) -> bool {
+    use egui::RichText;
+    use mde_egui::Style;
+
+    let mut close = false;
+    egui::Area::new(egui::Id::new(("vdi-app-surface-chrome", app_id)))
+        .order(egui::Order::Foreground)
+        .fixed_pos(body.min + egui::vec2(Style::SP_M, Style::SP_S))
+        .show(ui.ctx(), |ui| {
+            egui::Frame::default()
+                .fill(Style::SURFACE)
+                .corner_radius(egui::CornerRadius::same(Style::RADIUS_M as u8))
+                .inner_margin(egui::Margin::symmetric(
+                    Style::SP_S as i8,
+                    Style::SP_XS as i8,
+                ))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!("App VM · {app_id}"))
+                                .size(Style::SMALL)
+                                .strong()
+                                .color(Style::TEXT),
+                        );
+                        ui.add_space(Style::SP_S);
+                        if ui
+                            .add(egui::Button::new(
+                                RichText::new("Close app")
+                                    .size(Style::SMALL)
+                                    .color(Style::TEXT_DIM),
+                            ))
+                            .clicked()
+                        {
+                            close = true;
+                        }
+                    });
+                });
+        });
+    close
 }
 
 /// shell-ux-1 — paint the honest reconnect / failure overlay OVER the (frozen) last
@@ -2194,7 +2445,10 @@ fn accesskit_rect(rect: egui::Rect) -> egui::accesskit::Rect {
 /// desktop" when no request record is retained (a bus-driven session).
 fn desktop_a11y_value(state: &VdiState) -> String {
     match state.requested.as_ref() {
-        Some(req) => format!("{} via {}", req.target.name, req.protocol.label()),
+        Some(req) => req.app_id.as_ref().map_or_else(
+            || format!("{} via {}", req.target.name, req.protocol.label()),
+            |app_id| format!("{app_id} on {} via {}", req.target.name, req.protocol.label()),
+        ),
         None => "Connected desktop".to_string(),
     }
 }

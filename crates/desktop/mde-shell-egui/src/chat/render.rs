@@ -61,29 +61,30 @@ pub(super) fn day_separator(ui: &mut egui::Ui, date: &str) {
     ui.add_space(Style::SP_XS);
 }
 
-/// Compact wall-clock `HH:MM` (UTC) for a message's injected send time. Pure — no
-/// external time crate (there is none in this DRM seat's deps); UTC so it never
-/// claims a local zone it can't know. A non-positive timestamp yields "".
+/// Compact wall-clock `HH:MM` for a message's UTC send time, shifted into the
+/// configured This Node display zone. A non-positive timestamp yields "".
 pub(super) fn fmt_hh_mm(ts_unix_ms: i64) -> String {
     if ts_unix_ms <= 0 {
         return String::new();
     }
-    let tod = (ts_unix_ms / 1000).rem_euclid(86_400);
+    let secs = (ts_unix_ms / 1000).saturating_add(crate::timers::display_offset_seconds());
+    let tod = secs.rem_euclid(86_400);
     format!("{:02}:{:02}", tod / 3600, (tod % 3600) / 60)
 }
 
-/// A full `YYYY-MM-DD HH:MM UTC` stamp — the message-row hover.
+/// A full local `YYYY-MM-DD HH:MM zone` stamp — the message-row hover.
 pub(super) fn fmt_full_datetime(ts_unix_ms: i64) -> String {
     if ts_unix_ms <= 0 {
         return "unknown time".to_string();
     }
-    let secs = ts_unix_ms / 1000;
+    let secs = (ts_unix_ms / 1000).saturating_add(crate::timers::display_offset_seconds());
     let tod = secs.rem_euclid(86_400);
     let (year, month, day) = civil_from_days(secs.div_euclid(86_400));
     format!(
-        "{year:04}-{month:02}-{day:02} {:02}:{:02} UTC",
+        "{year:04}-{month:02}-{day:02} {:02}:{:02} {}",
         tod / 3600,
-        (tod % 3600) / 60
+        (tod % 3600) / 60,
+        crate::timers::display_zone_label()
     )
 }
 
@@ -92,7 +93,8 @@ pub(super) fn fmt_date(ts_unix_ms: i64) -> String {
     if ts_unix_ms <= 0 {
         return "unknown date".to_string();
     }
-    let (year, month, day) = civil_from_days((ts_unix_ms / 1000).div_euclid(86_400));
+    let secs = (ts_unix_ms / 1000).saturating_add(crate::timers::display_offset_seconds());
+    let (year, month, day) = civil_from_days(secs.div_euclid(86_400));
     format!("{year:04}-{month:02}-{day:02}")
 }
 
@@ -167,42 +169,40 @@ pub(super) fn message_row(
     let mine = msg.sender == self_host;
     // The stock group frame, lifted by the shared Raised depth token — same
     // fill/stroke/padding (no layout change), the card just casts the soft shadow.
-    egui::Frame::group(ui.style())
-        .shadow(card_shadow())
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let who = if mine { "you" } else { msg.sender.as_str() };
-                ui.label(
-                    RichText::new(who)
-                        .color(if mine { Style::ACCENT } else { Style::TEXT })
-                        .size(Style::SMALL)
-                        .strong(),
-                );
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if mine && matches!(&msg.kind, MessageKind::Text(_)) {
-                        let delivery = Delivery::for_recipient(recipient);
-                        let delivery_resp = ui.colored_label(
-                            delivery.color(),
-                            RichText::new(delivery.label()).size(Style::SMALL),
-                        );
-                        let _ = chat_hover_text(delivery_resp, delivery.hover_text());
-                    }
-                    // Compact HH:MM (UTC) send time, token-muted, full date on hover —
-                    // every message carries its injected timestamp (lock 22), so the
-                    // row is no longer time-blind (the biggest "looks incomplete" tell).
-                    let hhmm = fmt_hh_mm(msg.ts_unix_ms);
-                    if !hhmm.is_empty() {
-                        let time_resp = ui.label(
-                            RichText::new(hhmm)
-                                .color(Style::TEXT_DIM)
-                                .size(Style::SMALL),
-                        );
-                        let _ = chat_hover_text(time_resp, fmt_full_datetime(msg.ts_unix_ms));
-                    }
-                });
+    mde_egui::card().shadow(card_shadow()).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            let who = if mine { "you" } else { msg.sender.as_str() };
+            ui.label(
+                RichText::new(who)
+                    .color(if mine { Style::ACCENT } else { Style::TEXT })
+                    .size(Style::SMALL)
+                    .strong(),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if mine && matches!(&msg.kind, MessageKind::Text(_)) {
+                    let delivery = Delivery::for_recipient(recipient);
+                    let delivery_resp = ui.colored_label(
+                        delivery.color(),
+                        RichText::new(delivery.label()).size(Style::SMALL),
+                    );
+                    let _ = chat_hover_text(delivery_resp, delivery.hover_text());
+                }
+                // Compact HH:MM (UTC) send time, token-muted, full date on hover —
+                // every message carries its injected timestamp (lock 22), so the
+                // row is no longer time-blind (the biggest "looks incomplete" tell).
+                let hhmm = fmt_hh_mm(msg.ts_unix_ms);
+                if !hhmm.is_empty() {
+                    let time_resp = ui.label(
+                        RichText::new(hhmm)
+                            .color(Style::TEXT_DIM)
+                            .size(Style::SMALL),
+                    );
+                    let _ = chat_hover_text(time_resp, fmt_full_datetime(msg.ts_unix_ms));
+                }
             });
-            message_body(ui, msg, bus_root);
         });
+        message_body(ui, msg, bus_root);
+    });
 }
 
 /// The body of a message row, by kind — each kind now *acts*, not just renders
@@ -334,54 +334,52 @@ pub(super) fn notification_row(
         .map_or(flag.as_str(), String::as_str);
     // Same Raised lift as a message card — the stock group frame + the shared
     // depth token's soft shadow, nothing else changed.
-    egui::Frame::group(ui.style())
-        .shadow(card_shadow())
-        .show(ui, |ui| {
+    mde_egui::card().shadow(card_shadow()).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(item.host)
+                    .color(Style::TEXT)
+                    .size(Style::SMALL)
+                    .strong(),
+            );
+            ui.colored_label(
+                severity_color(*severity),
+                RichText::new(flag).size(Style::SMALL).strong(),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let hhmm = fmt_hh_mm(item.msg.ts_unix_ms);
+                if !hhmm.is_empty() {
+                    let time_resp = ui.label(
+                        RichText::new(hhmm)
+                            .color(Style::TEXT_DIM)
+                            .size(Style::SMALL),
+                    );
+                    let _ = chat_hover_text(time_resp, fmt_full_datetime(item.msg.ts_unix_ms));
+                }
+            });
+        });
+        ui.colored_label(
+            severity_color(*severity),
+            RichText::new(title).size(Style::BODY).strong(),
+        );
+        for (k, v) in fields {
+            if k == "summary" || k == "title" {
+                continue;
+            }
+            mde_egui::field(ui, k, v, Style::TEXT_DIM);
+        }
+        if let Some(verb) = alert_nav_verb(action_verb.as_deref()) {
             ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(item.host)
-                        .color(Style::TEXT)
-                        .size(Style::SMALL)
-                        .strong(),
-                );
-                ui.colored_label(
-                    severity_color(*severity),
-                    RichText::new(flag).size(Style::SMALL).strong(),
-                );
+                mde_egui::muted_note(ui, "actions");
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let hhmm = fmt_hh_mm(item.msg.ts_unix_ms);
-                    if !hhmm.is_empty() {
-                        let time_resp = ui.label(
-                            RichText::new(hhmm)
-                                .color(Style::TEXT_DIM)
-                                .size(Style::SMALL),
-                        );
-                        let _ = chat_hover_text(time_resp, fmt_full_datetime(item.msg.ts_unix_ms));
+                    if ui.button(CHAT_ALERT_GO_TO_LABEL).clicked() {
+                        navigate_via_toast(bus_root, "chat", title, &verb);
                     }
                 });
             });
-            ui.colored_label(
-                severity_color(*severity),
-                RichText::new(title).size(Style::BODY).strong(),
-            );
-            for (k, v) in fields {
-                if k == "summary" || k == "title" {
-                    continue;
-                }
-                mde_egui::field(ui, k, v, Style::TEXT_DIM);
-            }
-            if let Some(verb) = alert_nav_verb(action_verb.as_deref()) {
-                ui.horizontal(|ui| {
-                    mde_egui::muted_note(ui, "actions");
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.button(CHAT_ALERT_GO_TO_LABEL).clicked() {
-                            navigate_via_toast(bus_root, "chat", title, &verb);
-                        }
-                    });
-                });
-            }
-            alert_action_buttons(ui, bus_root, item.msg, actions);
-        });
+        }
+        alert_action_buttons(ui, bus_root, item.msg, actions);
+    });
 }
 
 pub(super) fn alert_action_buttons(

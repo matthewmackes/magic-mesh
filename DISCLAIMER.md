@@ -3,8 +3,9 @@
 MCNF is an open-source, secure, no-fixed-center **workgroup** platform: a
 small set of trusted machines (a household, a lab, a small team) joined into one
 encrypted Nebula overlay with replicated storage (Syncthing), peer-to-peer fleet
-automation (Ansible-on-each-node), and a Cosmic desktop. Its mission is to make a
-**production-grade private workgroup of up to 12 nodes (3 lighthouses + 9 peers)** something one operator
+automation (Ansible-on-each-node), and the Construct egui thin-client desktop.
+Its mission is to make a **production-grade private workgroup of up to 12
+infrastructure nodes (3 lighthouses + 9 peers)** something one operator
 can stand up, run, and recover — without a cloud control plane, a central server,
 or a fixed point of failure.
 
@@ -12,18 +13,17 @@ or a fixed point of failure.
 
 MCNF is **production workgroup-grade within a stated envelope**:
 
-- **Scale:** up to **12 nodes — 3 lighthouses + 9 Headless/Full peers** — in one
-  trust envelope (the §8 lock, raised from the prior ≤8-peer / single-lighthouse cap
-  by the 2026-06-14 operator directive; `ca/sign.rs` `MAX_PEER_CAP` follows). Beyond
+- **Scale:** up to **12 infrastructure nodes — 3 lighthouses + 9 peers** — in one
+  trust envelope. Beyond
   that, split into multiple workgroups.
 - **Trust model:** a **flat, open mesh** — every enrolled peer fully trusts every
   other peer at the network layer (one open Nebula firewall rule). Membership is
   gated by an Ed25519/Nebula cert issued at enrollment; revocation is immediate
   and fleet-wide via the CA blocklist. There is **no per-peer network
   segmentation inside the overlay** — see "Blast radius" below.
-- **Roles:** every node is a Lighthouse, Server, or Workstation
-  (Lighthouse ⊂ Server ⊂ Workstation by capability). One signed RPM; the
-  install-time role chooser decides what runs.
+- **Roles:** every node is a Lighthouse or Workstation. A headless node is a
+  Workstation without a local display. One signed RPM; the install-time role
+  chooser decides what runs.
 - **Crypto floor:** Ed25519 signing, AES-256-GCM / ChaCha20-Poly1305 transport,
   RSA-4096 for the KDC. Nebula is the only overlay transport; there is no
   fallback to an unencrypted path.
@@ -46,28 +46,18 @@ membership on a per-node cert, (c) making revocation immediate and fleet-wide, a
 peer-to-peer network isolation *within* the group, MCNF is not the right
 tool — run it only among machines you would trust on the same LAN.
 
-### Cloud instances are inside the radius (QUASAR-CLOUD extension)
+### Workloads are inside the radius
 
-With the mesh cloud (`docs/design/quasar-cloud.md`), self-served VM instances
-are **"inside" the trust envelope without their own mesh certs**: every instance
-lands on one flat Neutron/OVN provider network bridged into the overlay, with
-**default-open security groups**. An instance is peer-equivalent — it can reach
-every peer and every peer can reach it — so whatever guest OS a member boots is
-inside the radius, exactly like a node. Only two guardrails temper this:
+Self-served VM instances are **inside the trust envelope without their own mesh
+certs**. Workloads are launched through typed, provider-neutral lifecycle
+contracts; the supported local execution path is libvirt/QEMU-KVM. A guest is
+peer-equivalent for the purposes of the flat overlay, so whatever OS a member
+boots is inside the radius, exactly like a node. The Workloads authorization,
+placement, and audit contracts are the guardrails; there is no default-open
+OpenStack/Neutron/Keystone cloud boundary in the supported architecture.
 
-- **Hard per-user Keystone quotas** — capacity-derived, enforced per member; the
-  mesh's first hard authorization boundary, a documented departure from the
-  no-RBAC doctrine. Quotas bound how *much* a member can run, not what a running
-  instance can reach.
-- **The public boundary is unchanged** — instances are mesh-only (no web
-  exposure), the host firewalld keeps the public boundary, and floating IPs come
-  only from each site's LAN.
-
-The supported envelope is **raised for compute**: the control plane stays
-workgroup-small (the 12-node infrastructure cap above), while compute nodes may
-scale to dozens — a carve-out like the VDI one — so the count of machines inside
-the radius is no longer bounded by the node cap. Boot only images and workloads
-you would trust on the same LAN.
+The control plane remains workgroup-small (the 12-node infrastructure cap
+above). Boot only images and workloads you would trust on the same LAN.
 
 ## Data, replication, and recovery
 

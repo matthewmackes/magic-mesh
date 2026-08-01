@@ -77,14 +77,54 @@ whole class of bugs.
 - `xcp-build.sh` — rsync the tree to a build VM + run cargo there, pull artifacts.
 - `ci-gate.sh` / `enable-ci-gate.sh` — the always-on farm CI gate (see below).
 
-## Continuous integration — the always-on farm CI gate
+## Continuous integration — GitHub authority, farm execution
 
-The workspace's ONLY real build path is this farm (`xcp-build.sh`); local `cargo`
-is a no-op shim, and the old GitHub Actions runner (`.github/workflows/ci.yml`)
-has been dead for weeks because it cannot build the workspace without the farm.
-That left **no always-on gate** for the ~41 crates / ~8,400 tests — the root of
-the recurring "green-tests-but-shipped-broken" pattern (review finding
-`test-obs-1`, P0). `install-helpers/ci-gate.sh` is that gate.
+The fit-for-purpose audit selected GitHub required checks as the authoritative
+release status and the farm as the heavy self-hosted execution backend. Local
+heavy Cargo remains disabled; `xcp-build.sh` continues to route builds, tests,
+packaging, and live fixtures to the farm. The historical GitHub-hosted workflow
+could not build this workspace reliably without the farm, so the required-check
+integration is a work item, not an assumption. Until GitHub receives traceable
+farm results and a signed release-evidence bundle, production promotion is
+blocked; `install-helpers/ci-gate.sh` is the current farm-side backend/reporting
+path.
+
+This arrangement prevents the recurring "green-tests-but-shipped-broken"
+pattern (`test-obs-1`) without creating two competing release authorities.
+
+## Six-node topology evidence gate
+
+The production topology is a separate six-node claim: three lighthouses and
+three workstations. Build-farm capacity or a four-VM farm roster is not that
+claim. `install-helpers/verify-six-node-topology.py` is the fail-closed
+evidence boundary. It validates one schema-versioned bundle containing all six
+node identities, each role, and per-node `join`, `steady_state`, `loss`,
+`failover`, `re_enrollment`, and `corrected_forward_recovery` observations.
+Every observation must carry a bounded timestamp, the command that produced it,
+a relative artifact path, and its SHA-256 digest. The verifier resolves each
+path beneath the bundle directory, rejects traversal and symlink escapes, and
+recomputes the digest from the regular file; a declared hash alone is not
+evidence.
+
+Use the farm for deterministic schema/negative checks while preparing a bundle:
+
+```sh
+MCNF_BUILD_HOST=172.20.0.90 MCNF_BUILD_SLOT=<free-slot> \
+  install-helpers/xcp-build.sh sync
+ssh mm@172.20.0.90 \
+  'cd ~/magic-mesh-farm-<free-slot> && \
+   python3 install-helpers/verify-six-node-topology.py --self-test'
+```
+
+The verifier accepts `source: "farm"` for pre-live evidence, but production
+promotion must invoke it with `--require-live`; that rejects farm-only records.
+Schema-3 `release-evidence.sh` envelopes bind the topology bundle digest and
+verifier summary, require its `revision` to equal `source_commit`, and rerun the
+verifier during validation. Preview envelopes may carry farm-only topology
+evidence; production envelopes cannot. The helper does not probe nodes,
+manufacture observations, or turn unavailable hardware into a pass. No
+six-node or live result is valid until a real bundle is supplied and the same
+helper exits zero under the promotion freshness policy.
 
 **What it runs** (routed to BigBoy `172.20.0.130`, the long-pole node, on a
 dedicated warm slot `magic-mesh-farm-ci`), fail-fast like `xcp-build.sh gates`:
@@ -96,7 +136,7 @@ dedicated warm slot `magic-mesh-farm-ci`), fail-fast like `xcp-build.sh gates`:
    a time with `-- --test-threads=1` (those two carry real-PTY suites that hang
    under cargo's default parallelism on the farm).
 
-**Where the result goes** (best-effort Bus publish, same helper as
+**Where the farm result goes** (best-effort Bus publish, same helper as
 `automation/testbed/nightly.sh` — local `mde-bus` else sshpass to the shell node;
 a publish miss never fails the gate, the result is always in
 `automation/.state/ci-gate-status.json`):

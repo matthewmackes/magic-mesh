@@ -1745,6 +1745,10 @@ mod tests {
             state,
             opened_at_ms: 100,
             updated_at_ms: 100,
+            app: None,
+            app_state: None,
+            app_state_reason: None,
+            app_state_generation: 0,
         }
     }
 

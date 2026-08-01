@@ -275,3 +275,150 @@ jobs:
 
       - name: Test (terminal, serial)
         run: cargo test -p mde-term-egui --locked -- --test-threads=1
+
+  # AUD-01 / WL-CRIT-006 — the farm is the heavy backend for the authoritative
+  # GitHub result. This runner label is intentionally explicit: silently
+  # falling back to a hosted runner would turn the farm evidence contract into
+  # an assertion. The job uploads the status/log pair together so the required
+  # job can verify the digest, revision, and farm-identity binding.
+  farm-gate:
+    name: farm gate (authoritative backend)
+    runs-on: [self-hosted, linux, x64, mcnf-farm]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify candidate revision
+        env:
+          EXPECTED_REVISION: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          actual_revision="$(git rev-parse HEAD)"
+          test "$actual_revision" = "$EXPECTED_REVISION" || {
+            echo "farm checkout revision $actual_revision does not match candidate $EXPECTED_REVISION" >&2
+            exit 1
+          }
+
+      - name: Run the farm gate
+        env:
+          MCNF_BUILD_HOST: 172.20.0.130
+          MCNF_BUILD_SLOT: github-${{ github.run_id }}-${{ github.run_attempt }}
+          MCNF_BUILD_JOB_ID: github-ci:${{ github.run_id }}:${{ github.run_attempt }}
+        run: ./install-helpers/ci-gate.sh run
+
+      # Do not publish a superficially successful producer result. Verify the
+      # exact candidate and farm identity while the producer's local evidence
+      # is still together; github-required repeats this check after download.
+      - name: Verify farm evidence before publication
+        env:
+          EXPECTED_REVISION: ${{ github.sha }}
+          EXPECTED_JOB_ID: github-ci:${{ github.run_id }}:${{ github.run_attempt }}
+          EXPECTED_FARM_HOST: 172.20.0.130
+          EXPECTED_FARM_SLOT: github-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          test -f automation/.state/ci-gate-status.json
+          test -f automation/.state/ci-gate.log
+          test ! -L automation/.state/ci-gate-status.json
+          test ! -L automation/.state/ci-gate.log
+          ./install-helpers/ci-gate.sh verify automation/.state/ci-gate-status.json \
+            --expected-revision "$EXPECTED_REVISION" \
+            --expected-job-id "$EXPECTED_JOB_ID" \
+            --expected-build-host "$EXPECTED_FARM_HOST" \
+            --expected-build-slot "$EXPECTED_FARM_SLOT"
+
+      # Keep a byte-level receipt beside the evidence. The required verifier
+      # checks this receipt after artifact download, so an artifact cannot be
+      # silently substituted or partially reconstructed between jobs.
+      - name: Create farm evidence manifest
+        env:
+          EXPECTED_REVISION: ${{ github.sha }}
+          EXPECTED_JOB_ID: github-ci:${{ github.run_id }}:${{ github.run_attempt }}
+          EXPECTED_FARM_HOST: 172.20.0.130
+          EXPECTED_FARM_SLOT: github-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          status_file=automation/.state/ci-gate-status.json
+          log_file=automation/.state/ci-gate.log
+          manifest=automation/.state/ci-gate-manifest.txt
+          {
+            printf '%s\n' 'schema=1'
+            printf 'revision=%s\n' "$EXPECTED_REVISION"
+            printf 'job_id=%s\n' "$EXPECTED_JOB_ID"
+            printf 'build_host=%s\n' "$EXPECTED_FARM_HOST"
+            printf 'build_slot=%s\n' "$EXPECTED_FARM_SLOT"
+            printf 'status_bytes=%s\n' "$(stat -c '%s' "$status_file")"
+            printf 'status_sha256=%s\n' "$(sha256sum "$status_file" | cut -d ' ' -f1)"
+            printf 'log_bytes=%s\n' "$(stat -c '%s' "$log_file")"
+            printf 'log_sha256=%s\n' "$(sha256sum "$log_file" | cut -d ' ' -f1)"
+          } > "$manifest"
+
+      - name: Upload farm evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-gate-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            automation/.state/ci-gate-status.json
+            automation/.state/ci-gate.log
+            automation/.state/ci-gate-manifest.txt
+          if-no-files-found: error
+
+  # This is the branch-protection-facing check. It must remain a separate
+  # verifier: a successful farm runner is not enough unless its evidence is
+  # present, digest-valid, revision-bound, and all required workflow jobs pass.
+  github-required:
+    name: github-required
+    if: always()
+    needs: [gates, coverage, ignored-tests, supply-chain, fedora, farm-gate]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download farm evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-gate-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: farm-evidence
+
+      - name: Verify authoritative results
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EXPECTED_REVISION: ${{ github.sha }}
+          EXPECTED_JOB_ID: github-ci:${{ github.run_id }}:${{ github.run_attempt }}
+          EXPECTED_FARM_HOST: 172.20.0.130
+          EXPECTED_FARM_SLOT: github-${{ github.run_id }}-${{ github.run_attempt }}
+          GATES_RESULT: ${{ needs.gates.result }}
+          COVERAGE_RESULT: ${{ needs.coverage.result }}
+          SUPPLY_CHAIN_RESULT: ${{ needs.supply-chain.result }}
+          FEDORA_RESULT: ${{ needs.fedora.result }}
+          FARM_RESULT: ${{ needs.farm-gate.result }}
+          IGNORED_RESULT: ${{ needs.ignored-tests.result }}
+        run: |
+          set -euo pipefail
+          for result in "$GATES_RESULT" "$COVERAGE_RESULT" "$SUPPLY_CHAIN_RESULT" "$FEDORA_RESULT" "$FARM_RESULT"; do
+            test "$result" = success || { echo "required upstream result was $result" >&2; exit 1; }
+          done
+          if [ "$EVENT_NAME" = schedule ] || [ "$EVENT_NAME" = workflow_dispatch ]; then
+            test "$IGNORED_RESULT" = success || { echo "scheduled ignored-tests result was $IGNORED_RESULT" >&2; exit 1; }
+          fi
+          test -f farm-evidence/ci-gate-status.json
+          test -f farm-evidence/ci-gate.log
+          test -f farm-evidence/ci-gate-manifest.txt
+          test ! -L farm-evidence/ci-gate-status.json
+          test ! -L farm-evidence/ci-gate.log
+          test ! -L farm-evidence/ci-gate-manifest.txt
+          manifest=farm-evidence/ci-gate-manifest.txt
+          grep -Fqx 'schema=1' "$manifest"
+          grep -Fqx "revision=$EXPECTED_REVISION" "$manifest"
+          grep -Fqx "job_id=$EXPECTED_JOB_ID" "$manifest"
+          grep -Fqx "build_host=$EXPECTED_FARM_HOST" "$manifest"
+          grep -Fqx "build_slot=$EXPECTED_FARM_SLOT" "$manifest"
+          grep -Fqx "status_bytes=$(stat -c '%s' farm-evidence/ci-gate-status.json)" "$manifest"
+          grep -Fqx "status_sha256=$(sha256sum farm-evidence/ci-gate-status.json | cut -d ' ' -f1)" "$manifest"
+          grep -Fqx "log_bytes=$(stat -c '%s' farm-evidence/ci-gate.log)" "$manifest"
+          grep -Fqx "log_sha256=$(sha256sum farm-evidence/ci-gate.log | cut -d ' ' -f1)" "$manifest"
+          ./install-helpers/ci-gate.sh verify farm-evidence/ci-gate-status.json \
+            --expected-revision "$EXPECTED_REVISION" \
+            --expected-job-id "$EXPECTED_JOB_ID" \
+            --expected-build-host "$EXPECTED_FARM_HOST" \
+            --expected-build-slot "$EXPECTED_FARM_SLOT"

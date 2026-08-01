@@ -55,7 +55,7 @@ mod tests;
 
 pub use blob::{default_root, verify_bytes, BlobStore, FsBlobStore, MemoryBlobStore};
 pub use domain::{canonical_sort, sort_key, DomainState};
-pub use engine::{CollabEngine, MergeOutcome};
+pub use engine::{CollabEngine, MergeOutcome, MergeRejection, MergeRejectionReason};
 pub use error::{CollabError, Result};
 pub use import::{
     EditorImport, EventSink, ImportMap, ImportReport, Importer, LogSink, MemorySink,

@@ -344,6 +344,128 @@ pub(super) fn read_desired_slice_strict(
     Ok(specs)
 }
 
+/// Read one canonical desired document for a replay-sensitive mutation.
+///
+/// Unlike [`read_desired_slice`], this helper does not silently skip a malformed
+/// or foreign document. Callers that are deciding whether a new declaration may
+/// replace an existing one must fail closed: otherwise a stale request could
+/// overwrite evidence that the current workload is owned by another identity.
+pub(crate) fn read_desired_doc_strict(
+    state_root: &Path,
+    node: &str,
+    name: &str,
+) -> Result<Option<WorkloadSpec>, String> {
+    let Some(dir) = checked_desired_dir(state_root, node, false)? else {
+        return Ok(None);
+    };
+    let name = path_key::file_stem("name", name, DESIRED_DOC_SUFFIX)?;
+    let path = dir.join(format!("{name}{DESIRED_DOC_SUFFIX}"));
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "inspect desired document {}: {error}",
+                path.display()
+            ))
+        }
+    };
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "refusing non-regular desired document {}",
+            path.display()
+        ));
+    }
+    let body = read_desired_doc_bounded(&path)
+        .map_err(|error| format!("read desired document {}: {error}", path.display()))?;
+    let spec = serde_json::from_str::<WorkloadSpec>(&body)
+        .map_err(|error| format!("malformed desired document {}: {error}", path.display()))?;
+    let expected_stem = path_key::file_stem("name", &spec.name, DESIRED_DOC_SUFFIX)
+        .map_err(|error| format!("invalid desired document {}: {error}", path.display()))?;
+    let requested_stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or_else(|| format!("desired document has no valid filename: {}", path.display()))?;
+    if spec.node != node || requested_stem != expected_stem {
+        return Err(format!(
+            "desired document {} does not match node `{node}` and workload `{name}`",
+            path.display()
+        ));
+    }
+    Ok(Some(spec))
+}
+
+/// Find an App VM declaration that already owns `session_id`.
+///
+/// Session identity is the guest lifecycle key, not merely a field local to a
+/// workload filename.  A second desired document for the same identity would
+/// let two placements race to resume one guest.  Walk every placement slice
+/// strictly so malformed or foreign state cannot be treated as an empty store
+/// while deciding whether a new owner may be written.
+pub(crate) fn app_session_owner(
+    state_root: &Path,
+    session_id: &str,
+) -> Result<Option<(String, String)>, String> {
+    let desired_root = state_root.join(DESIRED_SUBTREE);
+    let metadata = match std::fs::symlink_metadata(&desired_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "inspect desired state root {}: {error}",
+                desired_root.display()
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "desired state root {} is not a real directory",
+            desired_root.display()
+        ));
+    }
+
+    let entries = std::fs::read_dir(&desired_root).map_err(|error| {
+        format!(
+            "read desired state root {}: {error}",
+            desired_root.display()
+        )
+    })?;
+    for entry in entries {
+        let path = entry
+            .map_err(|error| {
+                format!(
+                    "read desired state root {}: {error}",
+                    desired_root.display()
+                )
+            })?
+            .path();
+        let node = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| format!("desired node has no valid name: {}", path.display()))?;
+        path_key::segment("node", node)?;
+        let node_metadata = std::fs::symlink_metadata(&path)
+            .map_err(|error| format!("inspect desired node {}: {error}", path.display()))?;
+        if node_metadata.file_type().is_symlink() || !node_metadata.is_dir() {
+            return Err(format!(
+                "desired node {} is not a real directory",
+                path.display()
+            ));
+        }
+        for spec in read_desired_slice_strict(state_root, node)? {
+            if spec.delivery_type == mackes_mesh_types::cloud::DeliveryType::AppVm
+                && spec
+                    .app
+                    .as_ref()
+                    .is_some_and(|app| app.session_id == session_id)
+            {
+                return Ok(Some((node.to_owned(), spec.name)));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Persist workload `spec`'s desired-state doc under its placement node's desired
 /// dir (creating the tree). The stable key is `spec.node` / `spec.name`.
 ///
@@ -482,6 +604,7 @@ pub(crate) fn fold_workload_rows(
                 disk_gb: spec.disk_gb,
                 reachable,
                 drift: row_drift,
+                app: spec.app.clone(),
             }
         })
         .collect()
@@ -548,6 +671,7 @@ mod tests {
             image: None,
             network_isolation: false,
             raw_hcl: None,
+            app: None,
         }
     }
 

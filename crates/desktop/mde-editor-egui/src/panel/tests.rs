@@ -322,6 +322,21 @@ fn toggle_outline_command_flips_the_panel() {
 }
 
 #[test]
+fn direct_entry_collapses_all_optional_sidebars() {
+    let mut surface = real_editor();
+    surface.show_tree = true;
+    surface.show_outline = true;
+
+    surface.collapse_sidebars();
+
+    assert!(!surface.show_tree, "direct Editor entry hides the project tree");
+    assert!(
+        !surface.show_outline,
+        "direct Editor entry hides the symbol outline"
+    );
+}
+
+#[test]
 fn open_folder_sets_the_project_root_and_shows_the_tree() {
     let d = TempDir::new("folder");
     std::fs::write(d.join("a.rs"), b"fn main() {}").expect("write");

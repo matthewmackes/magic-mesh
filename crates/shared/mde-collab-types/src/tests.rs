@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
-use crate::command::TransferControl;
+use crate::command::{TaskAction, TaskActionValidationError, TransferControl};
 use crate::ids::{CallId, DocumentId, EventId, FileRefId, SpaceId, ThreadId, TransferId};
 use crate::space::{SpaceKind, SpaceRole};
 use crate::value::{
@@ -16,6 +16,76 @@ use crate::value::{
     PayloadRef, PresenceState, ReviewVerdict, Severity, TransferDirection, TransferMethod,
 };
 use crate::{ActorId, CollabCommand, CollabEventKind};
+
+#[test]
+fn task_actions_normalize_titles_and_lower_to_existing_commands() {
+    let space = SpaceId::new();
+    let task = EventId::new();
+    let source = EventId::new();
+
+    assert_eq!(
+        TaskAction::Create {
+            space,
+            title: "  Rotate gateway  ".into(),
+            source: Some(source),
+        }
+        .into_command(),
+        Ok(CollabCommand::CreateTask {
+            space,
+            title: "Rotate gateway".into(),
+            source: Some(source),
+        })
+    );
+    assert_eq!(
+        TaskAction::Update {
+            space,
+            task,
+            title: "  New title ".into(),
+        }
+        .into_command(),
+        Ok(CollabCommand::UpdateTask {
+            space,
+            task,
+            title: "New title".into(),
+        })
+    );
+    assert_eq!(
+        TaskAction::SetChecked {
+            space,
+            task,
+            checked: true,
+        }
+        .into_command(),
+        Ok(CollabCommand::SetTaskChecked {
+            space,
+            task,
+            checked: true,
+        })
+    );
+}
+
+#[test]
+fn task_actions_reject_blank_and_oversized_titles_before_queueing() {
+    let space = SpaceId::new();
+    assert_eq!(
+        TaskAction::Create {
+            space,
+            title: " \n\t ".into(),
+            source: None,
+        }
+        .into_command(),
+        Err(TaskActionValidationError::EmptyTitle)
+    );
+    assert_eq!(
+        TaskAction::Update {
+            space,
+            task: EventId::new(),
+            title: "x".repeat(crate::MAX_TASK_TITLE_BYTES + 1),
+        }
+        .into_command(),
+        Err(TaskActionValidationError::TitleTooLong)
+    );
+}
 
 /// One instance of every [`CollabEventKind`] variant. Exhaustive by
 /// construction — adding a variant without adding it here makes the

@@ -305,26 +305,24 @@ fn chat_metric_columns(ui: &mut egui::Ui, metrics: &[ChatMetric<'_>]) {
 }
 
 fn chat_metric_tile(ui: &mut egui::Ui, label: &str, value: &str, detail: &str, tone: Color32) {
-    egui::Frame::group(ui.style())
-        .shadow(card_shadow())
-        .show(ui, |ui| {
-            ui.set_min_height(Style::SP_XL * 3.0);
-            ui.label(
-                RichText::new(label)
-                    .color(Style::TEXT_DIM)
-                    .size(Style::SMALL)
-                    .strong(),
-            );
-            ui.add_space(Style::SP_XS);
-            ui.label(
-                RichText::new(value)
-                    .color(tone)
-                    .size(Style::HEADING)
-                    .strong(),
-            );
-            ui.add_space(Style::SP_XS);
-            mde_egui::muted_note(ui, detail);
-        });
+    mde_egui::card().shadow(card_shadow()).show(ui, |ui| {
+        ui.set_min_height(Style::SP_XL * 3.0);
+        ui.label(
+            RichText::new(label)
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL)
+                .strong(),
+        );
+        ui.add_space(Style::SP_XS);
+        ui.label(
+            RichText::new(value)
+                .color(tone)
+                .size(Style::HEADING)
+                .strong(),
+        );
+        ui.add_space(Style::SP_XS);
+        mde_egui::muted_note(ui, detail);
+    });
 }
 
 /// The ICQ self-presence picker options (lock 5) — the operator-settable subset
@@ -823,52 +821,50 @@ impl ChatState {
     fn waiting_pane(&self, ui: &mut egui::Ui) {
         let (title, subtitle) = empty_copy(self.bus_root.is_some());
         ui.add_space(Style::SP_L);
-        egui::Frame::group(ui.style())
-            .shadow(card_shadow())
-            .show(ui, |ui| {
-                ui.vertical(|ui| {
-                    ui.label(
-                        RichText::new(title)
-                            .color(Style::TEXT)
-                            .size(CHAT_PANE_TITLE)
-                            .strong(),
-                    );
-                    ui.add_space(Style::SP_XS);
-                    mde_egui::muted_note(ui, subtitle);
-                    ui.add_space(Style::SP_M);
-                    chat_metric_columns(
-                        ui,
-                        &[
-                            ChatMetric {
-                                label: "Bus",
-                                value: if self.bus_root.is_some() {
-                                    "visible".to_string()
-                                } else {
-                                    "missing".to_string()
-                                },
-                                detail: "local read path".to_string(),
-                                tone: if self.bus_root.is_some() {
-                                    Style::OK
-                                } else {
-                                    Style::SUPPORT_WARNING
-                                },
+        mde_egui::card().shadow(card_shadow()).show(ui, |ui| {
+            ui.vertical(|ui| {
+                ui.label(
+                    RichText::new(title)
+                        .color(Style::TEXT)
+                        .size(CHAT_PANE_TITLE)
+                        .strong(),
+                );
+                ui.add_space(Style::SP_XS);
+                mde_egui::muted_note(ui, subtitle);
+                ui.add_space(Style::SP_M);
+                chat_metric_columns(
+                    ui,
+                    &[
+                        ChatMetric {
+                            label: "Bus",
+                            value: if self.bus_root.is_some() {
+                                "visible".to_string()
+                            } else {
+                                "missing".to_string()
                             },
-                            ChatMetric {
-                                label: "Roster",
-                                value: "waiting".to_string(),
-                                detail: ROSTER_TOPIC.to_string(),
-                                tone: Style::TEXT_DIM,
+                            detail: "local read path".to_string(),
+                            tone: if self.bus_root.is_some() {
+                                Style::OK
+                            } else {
+                                Style::SUPPORT_WARNING
                             },
-                            ChatMetric {
-                                label: "Alerts",
-                                value: "waiting".to_string(),
-                                detail: NOTIFY_TOPIC.to_string(),
-                                tone: Style::TEXT_DIM,
-                            },
-                        ],
-                    );
-                });
+                        },
+                        ChatMetric {
+                            label: "Roster",
+                            value: "waiting".to_string(),
+                            detail: ROSTER_TOPIC.to_string(),
+                            tone: Style::TEXT_DIM,
+                        },
+                        ChatMetric {
+                            label: "Alerts",
+                            value: "waiting".to_string(),
+                            detail: NOTIFY_TOPIC.to_string(),
+                            tone: Style::TEXT_DIM,
+                        },
+                    ],
+                );
             });
+        });
     }
 
     /// The default right-side message browser for the loaded-roster/no-selection

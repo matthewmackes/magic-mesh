@@ -14,9 +14,9 @@
 ## The three pillars locked here
 
 1. **Hypervisor = Fedora + KVM, not XCP-ng (Option B).** The host hypervisor is
-   **libvirt/QEMU-KVM on Fedora** (CONSTRUCT-CLOUD Q32; `cloud-hypervisor` is
-   retired), so one OS family runs every role while the VM plane is the same
-   stack Nova drives. **XCP-ng is demoted from a role to a day-2 "adopt external
+   **libvirt/QEMU-KVM on Fedora** (provider-neutral Workloads; `cloud-hypervisor`
+   is retired), so one OS family runs every role while the VM plane is driven by
+   the same typed Workloads contracts. **XCP-ng is demoted from a role to a day-2 "adopt external
    hypervisor capacity" action** — magic-mesh can still enroll + drive an existing
    XCP-ng host (as the live build farm does via `xe`/tofu), but our installer never
    produces one. *(XCP-ng is its own XenServer-lineage OS; our Fedora ISO can't make

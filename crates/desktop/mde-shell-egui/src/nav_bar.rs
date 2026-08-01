@@ -18,7 +18,10 @@ use mde_egui::{Elevation, Motion, MotionMode, MotionPreset, Style, TypographyRol
 use mde_theme::brand::icons::IconId;
 use serde::{Deserialize, Serialize};
 
-use crate::status_bar::{bottom_tray_rect, BOTTOM_TRAY_GAP, STATUS_BAR_H};
+use crate::construct::ConstructChrome;
+use crate::front_door::{FrontDoorPeerAppFavorites, FrontDoorPeerAppTarget};
+use crate::status::StatusSegments;
+use crate::status_bar::{self, bottom_tray_rect, StatusBarEnv, BOTTOM_TRAY_GAP, STATUS_BAR_H};
 use crate::surfaces::{icon_texture, Surface};
 
 /// The reserved left-rail width in docked mode.
@@ -27,8 +30,14 @@ pub(crate) const DOCKED_W: f32 = 56.0;
 pub(crate) const TASKBAR_H: f32 = 48.0;
 /// Bottom space reserved by the horizontal taskbar in normal workspace layout.
 pub(crate) const SPRINGBOARD_DOCK_RESERVED_H: f32 = TASKBAR_H;
-/// The icon controls keep a compact 40px target in the thin dock.
+/// The icon controls use the taskbar's fixed 40px touch/keyboard target.
 const CONTROL_EDGE: f32 = 40.0;
+/// The focused workspace marker is deliberately smaller than its 40px target:
+/// one centered accent, with a clear bottom breathing room, is the only
+/// persistent focus signal in the taskbar.
+const FOCUS_UNDERLINE_W: f32 = 18.0;
+const FOCUS_UNDERLINE_H: f32 = 3.0;
+const FOCUS_UNDERLINE_BOTTOM_GAP: f32 = 2.0;
 /// The horizontal taskbar keeps fixed-size targets and moves lower-priority
 /// chooser pins and launchers into the More flyout when a panel cannot fit the
 /// whole catalog.
@@ -86,6 +95,9 @@ pub(crate) enum Action {
     Back,
     /// Open the untitled all-icons Desktop.
     Home,
+    /// Open the real editor through Communications' Documents mode. The editor
+    /// remains one owned workspace; this is its always-visible launch affordance.
+    OpenEditor,
     /// Toggle between the bottom taskbar and the left rail.
     ToggleDock,
     /// Open one docked app surface.
@@ -97,6 +109,15 @@ pub(crate) enum Action {
     /// Open a chooser-pinned remote desktop source through the normal chooser
     /// authentication and VDI hand-off path.
     DesktopSource(String),
+}
+
+/// Borrowed bottom-tray state painted inside the taskbar's foreground Area.
+/// Navigation owns the one bar; status keeps its existing data and actions.
+struct BottomTray<'a> {
+    construct: &'a mut ConstructChrome,
+    segments: &'a StatusSegments,
+    opacity: f32,
+    env: StatusBarEnv,
 }
 
 /// The persisted placement choice.
@@ -159,9 +180,22 @@ fn surface_key(surface: Surface) -> &'static str {
 }
 
 fn surface_from_key(key: &str) -> Option<Surface> {
+    // Persisted profiles can predate the consolidated Fleet & Mesh and This
+    // Node entries. Decode through the full enum, then canonicalize aliases,
+    // so migration preserves those pins instead of silently dropping them.
     PIN_CATALOG
         .into_iter()
         .find(|surface| surface_key(*surface) == key)
+        .or_else(|| match key {
+            "workbench" => Some(Surface::Workbench),
+            "mesh-view" => Some(Surface::MeshView),
+            "explorer" => Some(Surface::Explorer),
+            "system" => Some(Surface::System),
+            "storage" => Some(Surface::Storage),
+            "about" => Some(Surface::About),
+            _ => None,
+        })
+        .and_then(canonical_taskbar_surface)
 }
 
 fn canonical_taskbar_surface(surface: Surface) -> Option<Surface> {
@@ -211,7 +245,13 @@ fn pin_catalog_contains(surface: Surface) -> bool {
 
 fn taskbar_surface_search_terms(surface: Surface) -> &'static str {
     match surface {
-        Surface::FleetMesh => "fleet mesh fleet & mesh",
+        // These are navigation aliases, not additional taskbar entries. Keep
+        // them on the canonical Fleet & Mesh result so a Start search or the
+        // first-boot selector cannot strand the operator on a legacy deep link.
+        // Query hyphens are normalized to spaces by `filtered_pin_catalog`.
+        Surface::FleetMesh => {
+            "fleet mesh fleet & mesh workbench mesh map mesh view meshmap meshview explorer"
+        }
         Surface::InfraCode => "infra code infra-code workloads",
         _ => "",
     }
@@ -264,6 +304,8 @@ struct NavBarPrefs {
     pinned_surfaces: Vec<String>,
     #[serde(default = "default_persisted_profile_state")]
     profile_state: ProfileState,
+    #[serde(default)]
+    peer_app_favorites: FrontDoorPeerAppFavorites,
 }
 
 impl Default for NavBarPrefs {
@@ -276,6 +318,7 @@ impl Default for NavBarPrefs {
                 .map(|surface| surface_key(*surface).to_owned())
                 .collect(),
             profile_state: ProfileState::Configured,
+            peer_app_favorites: FrontDoorPeerAppFavorites::empty(),
         }
     }
 }
@@ -295,6 +338,7 @@ pub(crate) struct State {
     transition: Option<TransitionState>,
     pinned_surfaces: Vec<Surface>,
     profile_state: ProfileState,
+    peer_app_favorites: FrontDoorPeerAppFavorites,
     pin_selector: PinSelectorState,
 }
 
@@ -305,6 +349,7 @@ impl Default for State {
             transition: None,
             pinned_surfaces: default_taskbar_pins(),
             profile_state: ProfileState::Configured,
+            peer_app_favorites: FrontDoorPeerAppFavorites::empty(),
             pin_selector: PinSelectorState::default(),
         }
     }
@@ -323,6 +368,7 @@ impl State {
             transition: None,
             pinned_surfaces: default_taskbar_pins(),
             profile_state: ProfileState::Configured,
+            peer_app_favorites: FrontDoorPeerAppFavorites::empty(),
             pin_selector: PinSelectorState::default(),
         }
     }
@@ -333,6 +379,7 @@ impl State {
             transition: None,
             pinned_surfaces: Vec::new(),
             profile_state: ProfileState::New,
+            peer_app_favorites: FrontDoorPeerAppFavorites::empty(),
             pin_selector: PinSelectorState::default(),
         }
     }
@@ -348,6 +395,7 @@ impl State {
             transition: None,
             pinned_surfaces,
             profile_state: prefs.profile_state,
+            peer_app_favorites: prefs.peer_app_favorites.bounded(),
             pin_selector,
         }
     }
@@ -448,6 +496,15 @@ impl State {
         &self.pinned_surfaces
     }
 
+    pub(crate) fn peer_app_favorites(&self) -> &FrontDoorPeerAppFavorites {
+        &self.peer_app_favorites
+    }
+
+    pub(crate) fn toggle_peer_app_favorite(&mut self, target: &FrontDoorPeerAppTarget) {
+        self.peer_app_favorites.toggle_target(target);
+        self.save();
+    }
+
     /// Pin one launchable catalog surface at the end of the existing order.
     /// Non-catalog surfaces (including protected chrome aliases) are rejected
     /// before they can reach persistence or geometry.
@@ -501,8 +558,30 @@ impl State {
             .sort_by_key(|item| pin_catalog_index(*item).unwrap_or(PIN_CATALOG.len()));
     }
 
+    /// Return the user's first-boot selection in persisted order. The selector
+    /// normally reaches this boundary only through `toggle_pin_selector_surface`,
+    /// but canonicalizing again keeps a partially written or stale transient
+    /// buffer from restoring defaults or persisting unsupported surfaces.
+    fn bounded_first_boot_selection(&self) -> Vec<Surface> {
+        self.pin_selector
+            .selected
+            .iter()
+            .copied()
+            .filter(|surface| pin_catalog_contains(*surface))
+            .fold(Vec::with_capacity(MAX_PINNED_SURFACES), |mut selected, surface| {
+                if selected.len() < MAX_PINNED_SURFACES && !selected.contains(&surface) {
+                    selected.push(surface);
+                }
+                selected
+            })
+    }
+
     fn complete_first_boot(&mut self) {
-        self.pinned_surfaces = self.pin_selector.selected.clone();
+        // An empty result is an explicit user choice. Never substitute the
+        // deterministic headless defaults here: migrated pins remain intact
+        // when carried through the selector, while a new profile may choose
+        // no taskbar apps at all.
+        self.pinned_surfaces = self.bounded_first_boot_selection();
         self.profile_state = ProfileState::Configured;
         self.pin_selector = PinSelectorState::default();
         self.save();
@@ -541,13 +620,61 @@ impl State {
         pinned_sources: &[crate::surfaces::DesktopRailSource],
         active_surface: Option<Surface>,
     ) -> Option<Action> {
+        self.mount_with_active_inner(ctx, pinned_sources, active_surface, None)
+    }
+
+    /// Render bottom-placement navigation and the clock/tray as one taskbar.
+    pub(crate) fn mount_with_active_and_bottom_tray(
+        &mut self,
+        ctx: &egui::Context,
+        pinned_sources: &[crate::surfaces::DesktopRailSource],
+        active_surface: Option<Surface>,
+        construct: &mut ConstructChrome,
+        segments: &StatusSegments,
+        tray_opacity: f32,
+        tray_env: StatusBarEnv,
+    ) -> Option<Action> {
+        self.mount_with_active_inner(
+            ctx,
+            pinned_sources,
+            active_surface,
+            Some(BottomTray {
+                construct,
+                segments,
+                opacity: tray_opacity,
+                env: tray_env,
+            }),
+        )
+    }
+
+    fn mount_with_active_inner(
+        &mut self,
+        ctx: &egui::Context,
+        pinned_sources: &[crate::surfaces::DesktopRailSource],
+        active_surface: Option<Surface>,
+        mut bottom_tray: Option<BottomTray<'_>>,
+    ) -> Option<Action> {
         let active_surface = active_surface.and_then(canonical_taskbar_surface);
         if ctx.cumulative_pass_nr() == 0 {
             return None;
         }
         let screen = ctx.screen_rect();
+        if nav_bar_proof_enabled() {
+            tracing::info!(
+                target: "mde_shell_egui::nav_bar",
+                screen_width = screen.width(),
+                screen_height = screen.height(),
+                pixels_per_point = ctx.pixels_per_point(),
+                zoom_factor = ctx.zoom_factor(),
+                "springboard dock viewport proof"
+            );
+        }
         let pinned_sources = &pinned_sources[..pinned_sources.len().min(MAX_PINNED_SOURCES)];
         let geometry = self.geometry_for(screen, Instant::now(), pinned_sources.len());
+        // Resolve focus once against the rendered controls. This makes the
+        // underline a singular semantic marker even if stale/corrupt state
+        // ever presents duplicate canonical entries during a frame.
+        let focused_index = focused_control_index(&geometry.controls, active_surface);
         if geometry.finished {
             self.transition = None;
         } else {
@@ -579,7 +706,7 @@ impl State {
                 ui.set_min_size(geometry.outer.size());
                 let painter = ui.painter().clone();
                 paint_backing(&painter, &geometry);
-                for control in &geometry.controls {
+                for (control_index, control) in geometry.controls.iter().enumerate() {
                     // The Area's content UI is created with its absolute screen
                     // rect as max_rect, so these interaction rectangles stay in
                     // the same screen space as the painter and AccessKit tree.
@@ -626,19 +753,19 @@ impl State {
                             Style::NAV_BAR_HOVER,
                         );
                     }
+                    let icon_rect = egui::Rect::from_center_size(
+                        control.rect.center(),
+                        egui::vec2(
+                            control.rect.height().min(24.0),
+                            control.rect.height().min(24.0),
+                        ),
+                    );
                     if let Some(texture) = icon_texture(
                         ctx,
                         control_icon(*control),
                         control.rect.height().min(24.0),
                         Style::NAV_BAR_ICON,
                     ) {
-                        let icon_rect = egui::Rect::from_center_size(
-                            control.rect.center(),
-                            egui::vec2(
-                                control.rect.height().min(24.0),
-                                control.rect.height().min(24.0),
-                            ),
-                        );
                         painter.image(
                             texture.id(),
                             icon_rect,
@@ -646,14 +773,8 @@ impl State {
                             Style::NAV_BAR_ICON,
                         );
                     }
-                    if control.surface == active_surface {
-                        let underline = egui::Rect::from_min_max(
-                            egui::pos2(
-                                control.rect.left() + Style::SP_XS,
-                                control.rect.bottom() - 2.0,
-                            ),
-                            egui::pos2(control.rect.right() - Style::SP_XS, control.rect.bottom()),
-                        );
+                    if focused_index == Some(control_index) {
+                        let underline = focus_underline_rect(control.rect);
                         painter.rect_filled(underline, egui::CornerRadius::ZERO, Style::ACCENT);
                     }
                     let label = if control.kind == ControlKind::Overflow {
@@ -694,6 +815,20 @@ impl State {
                             action = Some(menu_action);
                         }
                     }
+                }
+
+                // The tray is painted in this same Area after app controls, so
+                // its clock and system targets remain anchored in the bar and
+                // take the final hit-test priority in their reserved lane.
+                if let Some(tray) = bottom_tray.as_mut() {
+                    status_bar::paint_bottom_tray(
+                        ui,
+                        screen,
+                        tray.construct,
+                        tray.segments,
+                        tray.opacity,
+                        tray.env,
+                    );
                 }
 
                 if let (Some(anchor), Some(overflow)) =
@@ -781,14 +916,17 @@ impl State {
                     );
                     ui.add_space(Style::SP_S);
                     ui.add_sized(
-                        egui::vec2(card.width() - 2.0 * Style::SP_L, 40.0),
+                        egui::vec2(
+                            (card.width() - 2.0 * Style::SP_L).max(1.0),
+                            40.0,
+                        ),
                         egui::TextEdit::singleline(&mut query)
                             .hint_text("Search taskbar apps"),
                     );
                     ui.add_space(Style::SP_XS);
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
-                        .max_height(card.height() - 190.0)
+                        .max_height((card.height() - 190.0).max(40.0))
                         .show(ui, |ui| {
                             for surface in filtered_pin_catalog(&query) {
                                 let selected_row = selected.contains(&surface);
@@ -856,7 +994,10 @@ impl State {
                     ui.add_space(Style::SP_S);
                     if ui
                         .add_sized(
-                            egui::vec2(card.width() - 2.0 * Style::SP_L, 40.0),
+                            egui::vec2(
+                                (card.width() - 2.0 * Style::SP_L).max(1.0),
+                                40.0,
+                            ),
                             egui::Button::new("Continue with selected pins"),
                         )
                         .clicked()
@@ -955,6 +1096,7 @@ impl State {
                     .map(|surface| surface_key(*surface).to_owned())
                     .collect(),
                 profile_state: self.profile_state,
+                peer_app_favorites: self.peer_app_favorites.clone(),
             };
             let _ = save_to(&path, prefs);
         }
@@ -1033,6 +1175,9 @@ enum ControlKind {
     Start,
     Back,
     Home,
+    /// The Documents editor lives in the Workspace lane, not as a separate
+    /// top-level surface.
+    Editor,
     Pin,
     Overflow,
     SurfaceLauncher,
@@ -1045,6 +1190,7 @@ impl ControlKind {
             Self::Start => "start",
             Self::Back => "back",
             Self::Home => "home",
+            Self::Editor => "editor",
             Self::Pin => "pin",
             Self::Overflow => "overflow",
             Self::SurfaceLauncher => "surface",
@@ -1057,6 +1203,7 @@ impl ControlKind {
             Self::Start => IconId::Mark,
             Self::Back => IconId::ArrowLeft,
             Self::Home => IconId::FileHome,
+            Self::Editor => IconId::Editor,
             Self::Pin => IconId::Pin,
             Self::Overflow => IconId::MoreHorizontal,
             Self::SurfaceLauncher => IconId::Mark,
@@ -1069,6 +1216,7 @@ impl ControlKind {
             Self::Start => "Start - Search",
             Self::Back => "Back",
             Self::Home => "Home",
+            Self::Editor => "Editor - Workspace",
             Self::Pin => "Taskbar placement",
             Self::Overflow => "More taskbar apps",
             Self::SurfaceLauncher => "Open app",
@@ -1081,6 +1229,7 @@ impl ControlKind {
             Self::Start => Action::OpenSearch,
             Self::Back => Action::Back,
             Self::Home => Action::Home,
+            Self::Editor => Action::OpenEditor,
             Self::Pin => Action::ToggleDock,
             // The More control is handled by the popup toggle in `mount`; it
             // never reaches this action mapping.
@@ -1134,11 +1283,11 @@ fn dock_launcher_count() -> usize {
 }
 
 fn dock_control_capacity(pinned_count: usize) -> usize {
-    4 + dock_launcher_count() + pinned_count
+    5 + dock_launcher_count() + pinned_count
 }
 
 fn dock_control_capacity_for(pinned_count: usize, surface_count: usize) -> usize {
-    4 + surface_count + pinned_count
+    5 + surface_count + pinned_count
 }
 
 fn control_span(count: usize, edge: f32, gap: f32) -> f32 {
@@ -1151,7 +1300,7 @@ fn control_span(count: usize, edge: f32, gap: f32) -> f32 {
 
 fn floating_center_bounds(screen: egui::Rect, gap: f32) -> (f32, f32) {
     let left_start = screen.left() + Style::SP_L;
-    let left_cluster_end = left_start + control_span(3, CONTROL_EDGE, gap);
+    let left_cluster_end = left_start + control_span(4, CONTROL_EDGE, gap);
     let right_start = bottom_tray_rect(screen).left()
         - BOTTOM_TRAY_GAP
         - CONTROL_EDGE
@@ -1212,7 +1361,7 @@ fn floating_geometry_for_catalog(
     let (surface_count, pinned_count, overflow) = catalog_selection(
         surfaces,
         pinned_count,
-        floating_center_capacity(screen, gap),
+        floating_center_capacity(screen, gap).saturating_sub(1),
     );
     let edge = CONTROL_EDGE;
     let outer = egui::Rect::from_min_size(
@@ -1224,6 +1373,9 @@ fn floating_geometry_for_catalog(
     let right_x = (bottom_tray_rect(screen).left() - BOTTOM_TRAY_GAP - edge).max(outer.left());
     let mut controls = Vec::with_capacity(dock_control_capacity_for(pinned_count, surface_count));
     let mut cursor_x = left_start;
+    // Search is the first affordance in the left cluster. Keep the same
+    // semantic order in Bottom and Left modes so the taskbar is predictable
+    // across placement changes and Home remains the third, icon-only control.
     for kind in [ControlKind::Start, ControlKind::Back, ControlKind::Home] {
         controls.push(Control {
             kind,
@@ -1233,11 +1385,18 @@ fn floating_geometry_for_catalog(
         });
         cursor_x += edge + gap;
     }
-    let center_count = surface_count + pinned_count + usize::from(overflow.is_some());
+    let center_count = 1 + surface_count + pinned_count + usize::from(overflow.is_some());
     let center_span = control_span(center_count, edge, gap);
     let (center_left, center_right) = floating_center_bounds(screen, gap);
     let center_start = (center_left + center_right) / 2.0 - center_span / 2.0;
     cursor_x = center_start;
+    controls.push(Control {
+        kind: ControlKind::Editor,
+        rect: egui::Rect::from_min_size(egui::pos2(cursor_x, y), egui::vec2(edge, edge)),
+        surface: None,
+        source_index: None,
+    });
+    cursor_x += edge + gap;
     for surface in surfaces.iter().copied().take(surface_count) {
         controls.push(Control {
             kind: ControlKind::SurfaceLauncher,
@@ -1334,7 +1493,19 @@ fn docked_geometry_for_catalog(
     }
     // Keep the placement control available when the rail has room for it.
     let (surface_count, pinned_count, overflow) =
-        catalog_selection(surfaces, pinned_count, available_slots.saturating_sub(1));
+        catalog_selection(surfaces, pinned_count, available_slots.saturating_sub(2));
+    if docked_control_fits(screen, cursor_y) {
+        controls.push(Control {
+            kind: ControlKind::Editor,
+            rect: egui::Rect::from_min_size(
+                egui::pos2(outer.center().x - CONTROL_EDGE / 2.0, cursor_y),
+                egui::vec2(CONTROL_EDGE, CONTROL_EDGE),
+            ),
+            surface: None,
+            source_index: None,
+        });
+        cursor_y += CONTROL_EDGE + Style::SP_XS;
+    }
     for surface in surfaces.iter().copied().take(surface_count) {
         if !docked_control_fits(screen, cursor_y) {
             break;
@@ -1506,8 +1677,16 @@ fn overflow_popup_id(mode: DockMode) -> egui::Id {
 }
 
 fn first_boot_selector_rect(screen: egui::Rect) -> egui::Rect {
-    let width = FIRST_BOOT_SELECTOR_W.min((screen.width() - 2.0 * Style::SP_XL).max(280.0));
-    let height = FIRST_BOOT_SELECTOR_H.min((screen.height() - 2.0 * Style::SP_XL).max(240.0));
+    // Keep the preferred inset and minimum card size when the viewport can
+    // support them, but never let first boot create an off-screen modal on a
+    // narrow seat or a small render target. The card may use the full viewport
+    // at the smallest sizes; its controls remain bounded below as well.
+    let width = FIRST_BOOT_SELECTOR_W
+        .min((screen.width() - 2.0 * Style::SP_XL).max(280.0))
+        .min(screen.width().max(1.0));
+    let height = FIRST_BOOT_SELECTOR_H
+        .min((screen.height() - 2.0 * Style::SP_XL).max(240.0))
+        .min(screen.height().max(1.0));
     egui::Rect::from_center_size(screen.center(), egui::vec2(width, height))
 }
 
@@ -1516,6 +1695,19 @@ fn overflow_label(item_count: usize) -> String {
         1 => "More taskbar apps (1 hidden)".to_owned(),
         count => format!("More taskbar apps ({count} hidden)"),
     }
+}
+
+/// Return the single focused-workspace marker required by the Construct
+/// taskbar contract. Keep this geometry independent of theme spacing so a
+/// change to global padding cannot silently turn the marker into a bar.
+fn focus_underline_rect(target: egui::Rect) -> egui::Rect {
+    egui::Rect::from_center_size(
+        egui::pos2(
+            target.center().x,
+            target.bottom() - FOCUS_UNDERLINE_BOTTOM_GAP - FOCUS_UNDERLINE_H / 2.0,
+        ),
+        egui::vec2(FOCUS_UNDERLINE_W, FOCUS_UNDERLINE_H),
+    )
 }
 
 fn overflow_item_control(item: OverflowItem, rect: egui::Rect) -> Control {
@@ -1732,6 +1924,17 @@ fn control_icon(control: Control) -> IconId {
         return surface.icon_id();
     }
     control.kind.icon()
+}
+
+/// Return the one rendered taskbar control that represents the active shell
+/// surface. Legacy Fleet & Mesh views canonicalize to the same pinned entry;
+/// choosing by position guarantees one underline rather than one per stale
+/// duplicate in a malformed in-memory catalog.
+fn focused_control_index(controls: &[Control], active_surface: Option<Surface>) -> Option<usize> {
+    let active_surface = active_surface.and_then(canonical_taskbar_surface)?;
+    controls
+        .iter()
+        .position(|control| control.surface == Some(active_surface))
 }
 
 fn control_label(
@@ -1967,9 +2170,9 @@ mod tests {
     #[test]
     fn defaults_to_catalogued_springboard_dock() {
         assert_eq!(State::default().mode, DockMode::Floating);
-        assert_eq!(TASKBAR_H, 48.0);
+        assert!((TASKBAR_H - 48.0).abs() < f32::EPSILON);
         assert_eq!(DOCKED_W, 56.0);
-        assert_eq!(SPRINGBOARD_DOCK_RESERVED_H, 48.0);
+        assert!((SPRINGBOARD_DOCK_RESERVED_H - 48.0).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -2032,11 +2235,31 @@ mod tests {
     }
 
     #[test]
+    fn start_search_uses_the_construct_mark_glyph() {
+        let start = Control {
+            kind: ControlKind::Start,
+            rect: egui::Rect::NOTHING,
+            surface: None,
+            source_index: None,
+        };
+        let home = Control {
+            kind: ControlKind::Home,
+            rect: egui::Rect::NOTHING,
+            surface: None,
+            source_index: None,
+        };
+        assert_eq!(control_icon(start), IconId::Mark);
+        assert_eq!(control_icon(home), IconId::FileHome);
+        assert_eq!(control_action(start, &[]), Action::OpenSearch);
+    }
+
+    #[test]
     fn floating_and_docked_geometry_have_the_locked_edges() {
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
         let floating = floating_geometry(screen);
         let docked = docked_geometry(screen);
-        assert_eq!(floating.outer.size(), egui::vec2(screen.width(), TASKBAR_H));
+        assert!((floating.outer.width() - screen.width()).abs() < 0.001);
+        assert!((floating.outer.height() - TASKBAR_H).abs() < 0.001);
         assert_eq!(floating.outer.left(), screen.left());
         assert_eq!(floating.outer.right(), screen.right());
         assert_eq!(floating.outer.bottom(), screen.bottom());
@@ -2100,6 +2323,83 @@ mod tests {
     }
 
     #[test]
+    fn focused_taskbar_marker_is_one_centered_18_by_3_accent_with_bottom_gap() {
+        let target = egui::Rect::from_min_size(egui::pos2(120.0, 752.0), egui::vec2(40.0, 40.0));
+        let marker = focus_underline_rect(target);
+
+        assert_eq!(marker.size(), egui::vec2(18.0, 3.0));
+        assert_eq!(marker.center().x, target.center().x);
+        assert_eq!(marker.bottom(), target.bottom() - 2.0);
+        assert_eq!(target.bottom() - marker.top(), 5.0);
+        assert!(target.contains(marker.min));
+        assert!(target.contains(marker.max));
+    }
+
+    #[test]
+    fn taskbar_catalog_aliases_focus_the_canonical_fleet_mesh_entry() {
+        for query in [
+            "Fleet & Mesh",
+            "Workbench",
+            "Mesh Map",
+            "mesh-view",
+            "Explorer",
+        ] {
+            assert_eq!(
+                filtered_pin_catalog(query),
+                vec![Surface::FleetMesh],
+                "{query:?} must resolve to the single Fleet & Mesh catalog entry"
+            );
+        }
+        for surface in [
+            Surface::FleetMesh,
+            Surface::Workbench,
+            Surface::MeshView,
+            Surface::Explorer,
+        ] {
+            assert_eq!(
+                canonical_taskbar_surface(surface),
+                Some(Surface::FleetMesh),
+                "{surface:?} must preserve the canonical taskbar focus"
+            );
+        }
+    }
+
+    #[test]
+    fn focused_taskbar_control_is_canonical_and_singular() {
+        let controls = [
+            Control {
+                kind: ControlKind::SurfaceLauncher,
+                rect: egui::Rect::NOTHING,
+                surface: Some(Surface::FleetMesh),
+                source_index: None,
+            },
+            Control {
+                kind: ControlKind::SurfaceLauncher,
+                rect: egui::Rect::NOTHING,
+                surface: Some(Surface::FleetMesh),
+                source_index: None,
+            },
+            Control {
+                kind: ControlKind::SurfaceLauncher,
+                rect: egui::Rect::NOTHING,
+                surface: Some(Surface::Browser),
+                source_index: None,
+            },
+        ];
+
+        for alias in [
+            Surface::FleetMesh,
+            Surface::Workbench,
+            Surface::MeshView,
+            Surface::Explorer,
+        ] {
+            assert_eq!(focused_control_index(&controls, Some(alias)), Some(0));
+        }
+        assert_eq!(focused_control_index(&controls, Some(Surface::Browser)), Some(2));
+        assert_eq!(focused_control_index(&controls, Some(Surface::MapsLocation)), None);
+    }
+
+    #[test]
     fn docked_rail_drops_launcher_overflow_on_short_screens() {
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 400.0));
         let geometry = docked_geometry_for(screen, MAX_PINNED_SOURCES);
@@ -2111,8 +2411,8 @@ mod tests {
                 .take(3)
                 .map(|control| control.kind)
                 .collect::<Vec<_>>(),
-            vec![ControlKind::Start, ControlKind::Back, ControlKind::Home],
-            "rail safety controls must remain first even when app launchers overflow"
+            vec![ControlKind::Start, ControlKind::Back, ControlKind::Home,],
+            "search, back, and Home must remain first even when app launchers overflow"
         );
         assert!(
             geometry
@@ -2212,12 +2512,95 @@ mod tests {
     }
 
     #[test]
+    fn first_boot_keeps_existing_pins_when_selection_is_unchanged() {
+        let mut state = State::from_prefs(NavBarPrefs {
+            pinned_surfaces: vec!["browser".to_owned(), "maps-location".to_owned()],
+            profile_state: ProfileState::New,
+            ..NavBarPrefs::default()
+        });
+
+        assert!(state.is_new_profile());
+        assert_eq!(
+            state.pin_selector.selected,
+            vec![Surface::Browser, Surface::MapsLocation]
+        );
+
+        state.complete_first_boot();
+
+        assert!(!state.is_new_profile());
+        assert_eq!(
+            state.pinned_surfaces(),
+            &[Surface::Browser, Surface::MapsLocation]
+        );
+    }
+
+    #[test]
+    fn first_boot_empty_selection_does_not_restore_defaults() {
+        let mut state = State::new_profile(DockMode::Floating);
+        state.complete_first_boot();
+
+        assert!(!state.is_new_profile());
+        assert!(state.pinned_surfaces().is_empty());
+        assert_ne!(state.pinned_surfaces(), default_taskbar_pins().as_slice());
+    }
+
+    #[test]
+    fn first_boot_commit_rejects_duplicate_and_unsupported_transient_entries() {
+        let mut state = State::new_profile(DockMode::Floating);
+        state.pin_selector.selected = vec![
+            Surface::Browser,
+            Surface::Workbench,
+            Surface::Browser,
+            Surface::MapsLocation,
+            Surface::AutoHome,
+        ];
+
+        state.complete_first_boot();
+
+        assert_eq!(
+            state.pinned_surfaces(),
+            &[Surface::Browser, Surface::MapsLocation]
+        );
+    }
+
+    #[test]
+    fn first_boot_selector_stays_inside_narrow_viewports() {
+        for (screen, expected_size) in [
+            (
+                egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(240.0, 160.0)),
+                egui::vec2(240.0, 160.0),
+            ),
+            (
+                egui::Rect::from_min_size(egui::pos2(17.0, 11.0), egui::vec2(320.0, 180.0)),
+                egui::vec2(280.0, 180.0),
+            ),
+        ] {
+            let card = first_boot_selector_rect(screen);
+            assert_eq!(card.size(), expected_size);
+            assert!(card.left() >= screen.left());
+            assert!(card.right() <= screen.right());
+            assert!(card.top() >= screen.top());
+            assert!(card.bottom() <= screen.bottom());
+        }
+
+        let desktop = first_boot_selector_rect(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1280.0, 800.0),
+        ));
+        assert_eq!(
+            desktop.size(),
+            egui::vec2(FIRST_BOOT_SELECTOR_W, FIRST_BOOT_SELECTOR_H)
+        );
+    }
+
+    #[test]
     fn migrated_preferences_preserve_pins_without_restoring_defaults() {
         let state = State::from_prefs(NavBarPrefs {
             schema_version: 1,
             mode: DockMode::Docked,
             pinned_surfaces: vec!["browser".to_owned(), "maps-location".to_owned()],
             profile_state: ProfileState::Configured,
+            ..NavBarPrefs::default()
         });
         assert!(!state.is_new_profile());
         assert_eq!(
@@ -2232,6 +2615,7 @@ mod tests {
             mode: DockMode::Floating,
             pinned_surfaces: Vec::new(),
             profile_state: ProfileState::Configured,
+            ..NavBarPrefs::default()
         });
         assert!(legacy_without_pins.pinned_surfaces().is_empty());
         assert!(!legacy_without_pins
@@ -2280,6 +2664,7 @@ mod tests {
                         }),
                         pinned_surfaces: default_taskbar_pins(),
                         profile_state: ProfileState::Configured,
+                        peer_app_favorites: FrontDoorPeerAppFavorites::empty(),
                         pin_selector: PinSelectorState::default(),
                     };
                     for offset in transition_offsets {
@@ -2345,6 +2730,7 @@ mod tests {
             mode: DockMode::Docked,
             pinned_surfaces: vec!["browser".to_owned(), "maps-location".to_owned()],
             profile_state: ProfileState::Configured,
+            ..NavBarPrefs::default()
         };
         let json = serde_json::to_string(&prefs).expect("encode taskbar preferences");
         let decoded: NavBarPrefs = serde_json::from_str(&json).expect("decode taskbar preferences");
@@ -2353,6 +2739,33 @@ mod tests {
             decode_pinned_surfaces(&decoded.pinned_surfaces),
             vec![Surface::Browser, Surface::MapsLocation]
         );
+    }
+
+    #[test]
+    fn migrated_alias_pins_canonicalize_without_reordering_or_restoring_defaults() {
+        let state = State::from_prefs(NavBarPrefs {
+            schema_version: 1,
+            mode: DockMode::Floating,
+            pinned_surfaces: vec![
+                "workbench".to_owned(),
+                "browser".to_owned(),
+                "mesh-view".to_owned(),
+                "system".to_owned(),
+                "storage".to_owned(),
+            ],
+            profile_state: ProfileState::Configured,
+            ..NavBarPrefs::default()
+        });
+
+        // Legacy Fleet & Mesh and This Node aliases collapse to one canonical
+        // entry each, while the user's order and intentional profile state
+        // remain authoritative.
+        assert_eq!(
+            state.pinned_surfaces(),
+            &[Surface::FleetMesh, Surface::Browser, Surface::ThisNode]
+        );
+        assert!(!state.is_new_profile());
+        assert_ne!(state.pinned_surfaces(), default_taskbar_pins().as_slice());
     }
 
     #[test]
@@ -2474,6 +2887,7 @@ mod tests {
                 transition: None,
                 pinned_surfaces: default_taskbar_pins(),
                 profile_state: ProfileState::Configured,
+                peer_app_favorites: FrontDoorPeerAppFavorites::empty(),
                 pin_selector: PinSelectorState::default(),
             };
 
@@ -2502,9 +2916,24 @@ mod tests {
                 DockMode::Floating => floating_geometry(screen).outer,
                 DockMode::Docked => docked_geometry(screen).outer,
             };
-            assert_eq!(
-                area_response.rect, expected_outer,
-                "the navigation Area must shield only the bar, not the home/workspace"
+            let rect_diffs = (
+                area_response.rect.min.x - expected_outer.min.x,
+                area_response.rect.min.y - expected_outer.min.y,
+                area_response.rect.max.x - expected_outer.max.x,
+                area_response.rect.max.y - expected_outer.max.y,
+            );
+            // egui snaps an Area to its pixel grid; the resulting sub-pixel
+            // edge adjustment is not a change to the taskbar footprint.
+            const EDGE_TOLERANCE: f32 = 0.05;
+            assert!(
+                rect_diffs.0.abs() <= EDGE_TOLERANCE
+                    && rect_diffs.1.abs() <= EDGE_TOLERANCE
+                    && rect_diffs.2.abs() <= EDGE_TOLERANCE
+                    && rect_diffs.3.abs() <= EDGE_TOLERANCE,
+                "the navigation Area must shield only the bar, not the home/workspace: mode={mode:?} actual={:?} expected={:?} diffs={:?}",
+                area_response.rect,
+                expected_outer,
+                rect_diffs,
             );
 
             let update = output
@@ -2540,6 +2969,74 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn bottom_taskbar_composes_the_clock_tray_on_its_foreground_layer() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
+        let input = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        let mut state = State {
+            mode: DockMode::Floating,
+            transition: None,
+            pinned_surfaces: default_taskbar_pins(),
+            profile_state: ProfileState::Configured,
+            peer_app_favorites: FrontDoorPeerAppFavorites::empty(),
+            pin_selector: PinSelectorState::default(),
+        };
+        let mut construct = ConstructChrome::default();
+        let segments = StatusSegments::default();
+        let env = StatusBarEnv {
+            curtain_engaged: false,
+            car: false,
+            immersive_app: false,
+        };
+
+        let mut output = egui::FullOutput::default();
+        for _ in 0..3 {
+            output = ctx.run(input.clone(), |ctx| {
+                assert_eq!(
+                    state.mount_with_active_and_bottom_tray(
+                        ctx,
+                        &[],
+                        None,
+                        &mut construct,
+                        &segments,
+                        1.0,
+                        env,
+                    ),
+                    None
+                );
+            });
+        }
+
+        assert!(
+            !ctx.tessellate(output.shapes, output.pixels_per_point)
+                .is_empty(),
+            "the unified taskbar must paint in a headless frame"
+        );
+        let taskbar = ctx
+            .read_response(egui::Id::new("construct-navigation-bar").with("move"))
+            .expect("taskbar Area response");
+        let clock = ctx
+            .read_response(egui::Id::new(("construct-bottom-system-tray", "clock")))
+            .expect("clock remains reachable within the taskbar");
+        let health = ctx
+            .read_response(egui::Id::new((
+                "construct-bottom-system-tray",
+                "mesh-health",
+            )))
+            .expect("mesh health remains reachable within the taskbar");
+        assert_eq!(clock.layer_id, taskbar.layer_id);
+        assert_eq!(health.layer_id, taskbar.layer_id);
+        assert!(
+            bottom_tray_rect(screen).intersects(taskbar.rect),
+            "the tray footprint must be part of the taskbar footprint"
+        );
     }
 
     #[test]
@@ -3182,6 +3679,7 @@ mod tests {
             }),
             pinned_surfaces: default_taskbar_pins(),
             profile_state: ProfileState::Configured,
+            peer_app_favorites: FrontDoorPeerAppFavorites::empty(),
             pin_selector: PinSelectorState::default(),
         };
         let ctx = egui::Context::default();
@@ -3270,8 +3768,8 @@ mod tests {
                 .take(3)
                 .map(|control| control.kind)
                 .collect::<Vec<_>>(),
-            vec![ControlKind::Start, ControlKind::Back, ControlKind::Home],
-            "the taskbar must lead with Start, Back, Home"
+            vec![ControlKind::Start, ControlKind::Back, ControlKind::Home,],
+            "the taskbar must lead with search-first navigation controls"
         );
         assert_eq!(
             floating
@@ -3376,7 +3874,7 @@ mod tests {
                 .take(3)
                 .map(|control| control.kind)
                 .collect::<Vec<_>>(),
-            vec![ControlKind::Start, ControlKind::Back, ControlKind::Home]
+            vec![ControlKind::Start, ControlKind::Back, ControlKind::Home,]
         );
         assert!(settled.controls[0].rect.top() < settled.controls[1].rect.top());
         assert!(settled.controls[1].rect.top() < settled.controls[2].rect.top());

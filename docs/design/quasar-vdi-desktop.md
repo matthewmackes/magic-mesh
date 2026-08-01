@@ -4,7 +4,7 @@
 
 > **Status:** LOCKED (design) · 2026-06-30 · 50-question `/plan` survey.
 > **Series:** MCNF **12.0 "Construct"** (package/repo id stays `magic-mesh`).
-> **Authority:** Memory > `AI_GOVERNANCE.md` > this doc > `docs/WORKLIST.md` body.
+> **Authority:** `AI_GOVERNANCE.md` > this doc > `docs/platform/WORKLIST.md` body.
 > **Supersedes (in part):** `docs/design/cosmic-magic-mesh-egui.md` — the
 > **forked-compositor** desktop model (its locks 1/5/6/12: fork `cosmic-comp`,
 > compositor-up desktop, two-bucket boundary, mesh-aware compositor) is
@@ -12,19 +12,17 @@
 > (lock 2), the **fresh egui-native design / `Style` source** (locks 3/9), and
 > **egui built-in motion** (lock 10) — i.e. the `mde-egui` harness (E12-1, landed).
 >
-> **Revision 2026-07-03 — CONSTRUCT-CLOUD supersession.** `docs/design/quasar-cloud.md`
-> and `AI_GOVERNANCE.md §5` replace the local cloud-hypervisor target with
-> **Nova/libvirt/QEMU-KVM + OVN**. The cloud-hypervisor/`mde-kvm` text below is
-> preserved as the 2026-06-30 survey record and cutover context only; current
-> implementation and packaging work targets libvirt/QEMU-KVM, and QC-15 owns
-> deletion of the replaced stack.
+> **Revision 2026-07-30 — provider-neutral Workloads.** The retired
+> OpenStack/Nova framing below is historical context only. Current implementation
+> and packaging use typed Workloads contracts over OpenTofu + Ansible and local
+> libvirt/QEMU-KVM; no OpenStack compatibility backend is required.
 
 ## What this is
 
 MCNF 12.0 is a **mesh-native thin-client desktop OS** whose entire interface is
 **egui**. The host is not a general Linux desktop that runs native apps — it is a
 single egui shell that **brokers and displays full OS desktops** (Windows / Ubuntu
-/ etc.) running either **locally on Nova/libvirt/QEMU-KVM** or **remotely on any
+/ etc.) running either **locally through typed Workloads on libvirt/QEMU-KVM** or **remotely on any
 mesh peer**, reached over the Nebula overlay.
 
 The decisive insight: **a web browser, office suite, or game is never a host app —
@@ -57,12 +55,12 @@ adopted capacity, never an install-time role.
 ### Round 2 — Local KVM (Workstation-local VMs)
 | # | Decision | Lock |
 |---|---|---|
-| 11 | VMM | **Superseded by CONSTRUCT-CLOUD:** Nova/libvirt/QEMU-KVM + OVN replace the original cloud-hypervisor target. |
+| 11 | VMM | **Typed Workloads:** local libvirt/QEMU-KVM is the supported execution path; provider details stay behind the Workloads contract. |
 | 12 | Local display | **virtio-gpu zero-copy** (dmabuf → wgpu texture) fast path; RDP/VNC fallback. |
 | 13 | GPU | **Operator choice per host** — shared virtio-gpu (virgl/venus) *or* dGPU passthrough (VFIO). |
 | 14 | Guest images | **Mesh-distributed golden images** (Syncthing) + operator ISOs. |
 | 15 | Windows tooling | Golden Windows image **pre-tooled**: virtio drivers (net/disk/gpu) + RDP enabled + guest agent. |
-| 16 | Lifecycle UI | **Extend the existing DATACENTER/Instances surface** to local libvirt/Nova instances (one VM UI, local + remote). |
+| 16 | Lifecycle UI | **Extend the existing Workloads surface** to local VM instances (one VM UI, local + remote). |
 | 17 | Resources | **Reserved fixed slice for the shell** + operator-capped per VM. |
 | 18 | Disk storage | **Running disks local** (`~/Local`, never mesh-synced, §1); only golden bases are mesh-distributed. |
 | 19 | Guest network | **Dual-homed: every VM is its own Nebula mesh peer AND has a virtual NIC on the host's LAN.** |
@@ -102,7 +100,7 @@ adopted capacity, never an install-time role.
 | 41 | Identity | **Keep E12 "Construct"; revise the design** (this doc + governance §4/§5/§6) to the VDI/egui-DRM model. |
 | 42 | Packaging | **Immutable bootc/ostree image** for the Workstation (image-based, appliance-style updates). |
 | 43 | Crate structure | **Many small crates** (granular: shell, chrome, each panel, RDP, VNC, KVM-broker, session-broker). |
-| 44 | Roles | **Lighthouse · XCP-NG · Workstation** (XCP-NG renamed from Server — the Xen host mirroring the xcp-ng toolstack) **+ a `desktop-host` capability tag** for peers that serve VMs. |
+| 44 | Roles | **Lighthouse · Workstation** plus a `desktop-host` capability tag for peers that serve VMs; XCP-ng is optional day-2 adopted capacity. |
 | 45 | VDI control | **mackesd workers** — a session-broker worker + a vm-lifecycle worker. The shell renders; mackesd brokers (§1/§9). |
 | 46 | §8 envelope | **Raise the envelope** — VM desktop guests are first-class nodes; the supported node count grows to accommodate them. |
 | 47 | Guest security | **Full flat-trust mesh members** — guests are full peers (§0-Simple). The widened blast radius is documented for operators. |
@@ -125,7 +123,7 @@ adopted capacity, never an install-time role.
   │                              │  deps point inward  ▼                       │
   ├──────────────────────────────────────────────────────────────────────────┤
   │  platform-services    mackesd:  session-broker worker · vm-lifecycle       │
-  │    local VMs: Nova/libvirt/QEMU-KVM + OVN provider network                 │
+  │    local VMs: typed Workloads → libvirt/QEMU-KVM                           │
   │    remote: typed verbs to the hosting peer; leader coordinates             │
   │                              │  deps point inward  ▼                       │
   ├──────────────────────────────────────────────────────────────────────────┤
@@ -147,18 +145,20 @@ adopted capacity, never an install-time role.
 | `mde-panel-*` | The mesh-native panels (Workbench/Files/Music/Voice) as in-shell modules reusing today's non-GUI logic. |
 | `mackesd` *(extend)* | `session_broker` + `vm_lifecycle` workers; the `desktop-host` capability. |
 | Reuse | `mde-bus`, `mackes-xcp` + the DATACENTER VM verbs (remote lifecycle/console), `mackes-mesh-types`, Nebula/etcd/Syncthing substrate. |
-| Retire | the iced/libcosmic GUI crates, `mde-theme` (Carbon), `mde-card`; the cosmic-comp fork is **never created**. |
+| Retire | the iced/libcosmic GUI crates and retired token-gate code; retain `mde-theme` only for licensed brand assets if needed. |
 
 ## Acceptance criteria (epic-level, runtime-observable per §7)
 
 1. The Workstation **boots (bootc image) straight to the egui shell on the DRM seat** — no Wayland compositor, no X — and the shell renders through the shared `Style`.
 2. The **thin chrome bar** lists mesh peers + sessions + status and **expands into the full Workbench**; the mesh-control panels (Workbench/Files/Music/Voice) work live over the Bus.
-3. A **remote desktop** on another mesh peer (XCP-ng or Server) is **discovered**, connected over **Nebula via RDP (ironrdp)**, **rendered as an egui texture**, and is **interactive** (input forwarded; reserved escape chord returns to the shell). VNC/XAPI fallback works for a guest with no RDP.
-4. A **local QEMU/KVM desktop instance** runs through the libvirt/Nova host stack, uses the QEMU display path selected by CONSTRUCT-CLOUD, and its desktop renders in the shell.
+3. A **remote desktop** on another mesh peer (Workstation or optional adopted XCP-ng capacity) is **discovered**, connected over **Nebula via RDP (ironrdp)**, **rendered as an egui texture**, and is **interactive** (input forwarded; reserved escape chord returns to the shell). VNC/XAPI fallback works for a guest with no RDP.
+4. A **local QEMU/KVM desktop instance** runs through the typed Workloads host stack and its desktop renders in the shell.
 5. **Sessions roam:** open sessions + layout persist to mesh state and reappear on a second Workstation; a disconnected VM **keeps running** and reconnects.
 6. **Clipboard + the mesh-share folder** move data host⇄guest⇄mesh; **audio** plays (virtio-sound local / protocol remote).
 7. `mackesd` runs the **session-broker + vm-lifecycle** workers; remote VM actions go through **typed verbs** to the hosting peer (no push-SSH); the leader coordinates.
-8. The **layered-tiers lint** passes and fails on a planted outward edge; **no libcosmic/iced/`mde-theme`** remains (`grep` empty); About/greeter reads `MCNF 12.0 "Construct"`.
+8. The **layered-tiers lint** passes and fails on a planted outward edge; no
+   retired libcosmic/iced GUI stack or `mde-theme` token authority remains;
+   About/greeter reads `MCNF 12.0 "Construct"`.
 9. v1 includes **GPU passthrough, USB redirection, per-monitor-different-VM, and live migration** (lock 48) — each runtime-demonstrated.
 
 ## Risks
@@ -184,14 +184,15 @@ adopted capacity, never an install-time role.
 2. **`mde-shell-egui`** on the DRM seat — chrome bar + the Workbench panel + login/lock + systemd boot-to-seat. *(First visible milestone.)*
 3. **`mde-vdi`** — `mde-vdi-rdp` (ironrdp→egui texture + input) + `mde-vdi-core` (session model) + the `mackesd` session-broker.
 4. **Remote desktop over the mesh** — discover (registry+DATACENTER) → connect over Nebula → render → interact. **(Lock 49: the first end-to-end milestone.)** Add `mde-vdi-vnc` fallback.
-5. **Local libvirt/QEMU-KVM** — Nova/libvirt lifecycle + OVN provider networking + the VDI broker overlay; fold into Cloud/Instances.
+5. **Local libvirt/QEMU-KVM** — typed Workloads lifecycle + the VDI broker overlay; fold into the Workloads surface.
 6. **Advanced (fan out):** GPU passthrough · USB redirection · per-monitor VM · live migration · adaptive codec · clipboard/audio/mesh-share bridges.
 7. **Port the panels** — Files/Music/Voice as in-shell modules over their existing non-GUI logic.
 8. **Packaging** — the immutable **bootc** Workstation image; mesh-only set for headless roles; gh-pages channel.
-9. **Decommission** — remove libcosmic/iced + `mde-theme`/`mde-card`; strike the abandoned iced GUI + the retired cosmic-comp tasks; revise `AI_GOVERNANCE.md` §4/§5/§6/§8 + the About/version to 12.0 "Construct".
+9. **Decommission** — remove libcosmic/iced and retired token-gate tasks; preserve any licensed `mde-theme` brand assets; revise the About/version to 12.0 "Construct".
 
 ## Open items — resolved
 
 - All 50 survey questions are locked (above). `E12-0` (governance lock) and `E12-1`
   (the `mde-egui` harness) have landed; this doc **re-scopes E12-2…E12-12** into the
-  thin-client VDI execution backlog in `docs/WORKLIST.md` (`## E12` section).
+  thin-client VDI execution backlog in `docs/platform/WORKLIST.md` under the
+  owning `WL-*` epics (primarily `WL-ARCH-008` and `WL-CRIT-006`).

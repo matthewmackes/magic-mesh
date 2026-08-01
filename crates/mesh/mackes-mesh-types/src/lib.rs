@@ -20,6 +20,8 @@ pub mod air_quality;
 /// WL-FUNC-012 / OVERLAY-8 — point-scoped adsb.lol aircraft snapshots shared
 /// by the workstation adapter and Maps & Location.
 pub mod aircraft;
+/// WL-FUNC-018 — versioned, signed-provenance Flatpak catalog records for App VMs.
+pub mod app_catalog;
 /// WL-FUNC-012 / OVERLAY-5 — Caltrans CWWP2 camera snapshots shared by the
 /// workstation adapter and Maps & Location.
 pub mod caltrans_camera;
@@ -68,6 +70,9 @@ pub mod lighthouse_probe;
 /// WL-FUNC-015 — shared `state/media/sources` wire records published by
 /// `mackesd` and consumed by the Media Workspace without a daemon dependency.
 pub mod media_sources;
+/// Typed, credential-free NetworkManager/ModemManager link observations for
+/// the additive `network.interfaces[]` mesh-status field.
+pub mod network_status;
 // arch-7 (2026-07-11) — the canonical shared-storage mount constant +
 // the AUDIT-MESH-15 write-safety guard, relocated out of the `mackesd` bin
 // crate so worker crates factored out of the daemon (mde-browser-workers)

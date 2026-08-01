@@ -15,8 +15,9 @@
 //! cert TLS is a deferred follow-on before any non-overlay exposure.
 
 use std::path::Path;
+use std::time::Duration;
 
-use etcd_client::{Client, Error, WatchOptions, WatchStream};
+use etcd_client::{Client, ConnectOptions, Error, WatchOptions, WatchStream};
 
 /// Where `setup-etcd.sh` records the comma/newline-separated client URLs this
 /// node connects to (its own member on an anchor, the anchors on a workstation).
@@ -50,6 +51,12 @@ pub const PEER_LEASE_TTL_S: i64 = 90;
 /// times per lease window), yet short enough that a crashed converging node's
 /// sessions free within roughly a poll-and-a-lease-window.
 pub const SESSION_LEASE_TTL_S: i64 = 30;
+
+/// Bound each coordination-plane dial and request so callers can degrade to
+/// their filesystem-backed path when a configured etcd endpoint is offline.
+/// In particular, enrollment must never hold its short-lived TLS connection
+/// indefinitely while probing an unavailable overlay anchor.
+const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// etcd key for a peer's directory entry.
 #[must_use]
@@ -114,7 +121,15 @@ pub fn default_endpoints() -> Vec<String> {
 /// # Errors
 /// An [`etcd_client::Error`] when no endpoint is reachable.
 pub async fn connect(endpoints: &[String]) -> Result<Client, Error> {
-    Client::connect(endpoints, None).await
+    Client::connect(
+        endpoints,
+        Some(
+            ConnectOptions::default()
+                .with_connect_timeout(CLIENT_TIMEOUT)
+                .with_timeout(CLIENT_TIMEOUT),
+        ),
+    )
+    .await
 }
 
 /// Open an etcd v3 **watch stream** on `key` with `options`. The returned

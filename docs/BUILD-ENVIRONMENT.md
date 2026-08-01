@@ -6,6 +6,29 @@
 > `AI_GOVERNANCE.md §10`) rather than relearning it from scratch. Every item below
 > was learned the hard way; the "Gotchas index" exists so no one repeats that.
 
+## Release authority and compatibility contract
+
+The 2026-07-30 fit-for-purpose decision makes **GitHub required checks** the
+release authority and the farm the heavy self-hosted execution backend. Farm
+jobs must return traceable job IDs, artifact digests, and gate results to the
+GitHub candidate. `install-helpers/ci-gate.sh` is the farm-side backend and
+reporting path, not a competing release authority. Until that integration and
+the signed release-evidence bundle are operational, production promotion is
+blocked; engineering previews must disclose unavailable live evidence.
+
+The workflow's authoritative backend is the explicit self-hosted runner label
+`[self-hosted, linux, x64, mcnf-farm]`. That runner must have the repository
+checkout, the farm SSH key, `jq`, and the `mm` account's access to
+`install-helpers/xcp-build.sh`; a hosted runner or an unlabeled machine must
+not satisfy `farm-gate`. The follow-on `github-required` job verifies the
+uploaded `ci-gate-status.json` and sibling log before the check can pass.
+
+Every release must publish a compatibility matrix covering the oldest supported
+ABI and each target role. The matrix must name the bootc image baseline,
+lighthouse package target, workstation package target, farm-native target, and
+channel transaction targets. RPM dependency and transaction checks are part of
+the release evidence; a successful compile alone is not compatibility proof.
+
 There are **two surfaces**, but only one does heavy builds:
 
 1. **The build farm** (four **Fedora 42** VMs across four dom0s — real IPs `172.20.0.50` / `.90` / `.130` / `.170`; descriptive hostnames except BigBoy's `mcnf-build-52`, see §3) — the **only** real path for heavy `cargo` (`build`/`test`/`check`/`clippy`), the release gates, and native farm RPM cuts. Fully OpenTofu/Ansible-managed (see "Build farm" §). Drive it with `install-helpers/xcp-build.sh`; route a job with `MCNF_BUILD_HOST`. gcc 15 there, so `mold` works as-is.
@@ -68,16 +91,15 @@ clicked page, add
 before doing manual Google/News smoke on `.15`; it exercises the same helper
 wire with a deterministic clicked-link navigation target.
 
-**DRM shell live-restart note (learned 2026-07-15):** `mde-shell-egui.service`
-conflicts with `getty@tty1.service` and has an `ExecStopPost` that starts getty
-again for console recovery. A remote `systemctl restart mde-shell-egui.service`
-can cancel the start during the tty1 handoff and leave the shell unit inactive
-but not failed. For live `.15` deploys over SSH, check state after any restart;
-if the unit is inactive, issue a clean `systemctl start mde-shell-egui.service`
-as a separate command and let systemd resolve the getty conflict. Then confirm
-`systemctl is-active mde-shell-egui.service`, `MainPID`, `ExecMainStartTimestamp`,
-`NRestarts=0`, and the installed `/usr/bin/mde-shell-egui` hash. This is a
-service orchestration gotcha, not a Browser helper/runtime failure.
+**DRM shell live-restart note (updated 2026-07-30):**
+`mde-shell-egui.service` conflicts with `getty@tty1.service`, but console
+recovery is now `OnFailure=getty@tty1.service`, not an unconditional
+`ExecStopPost`. That avoids a Ctrl-C/SIGTERM restart racing getty for tty1 and
+leaving the relaunched lock curtain without input. For live `.15` deploys over
+SSH, still check `systemctl is-active mde-shell-egui.service`, `MainPID`,
+`ExecMainStartTimestamp`, `NRestarts=0`, and the installed
+`/usr/bin/mde-shell-egui` hash after any restart. This is service orchestration,
+not a Browser helper/runtime failure.
 
 **CEF sandbox live-inspection note (learned 2026-07-15):** when proving CEF OS
 confinement on a live seat, do not use the `/usr/bin/mde-web-cef` launcher PID
@@ -212,6 +234,13 @@ testing. Use the other two available bench seats for bench verification. Those
 seats have encrypted disks and require a key at boot, so do not reboot them
 unless a reboot is genuinely required for the test or recovery path.
 
+**Direct-DRM validation seat (onboarded 2026-07-30):** `172.20.146.138`
+(`test-seat-172-20-146-138`, Fedora 44) is an enrolled Workstation with
+`/dev/dri/card1`, the Construct DRM shell, and a Nebula overlay address of
+`10.42.0.7`. Include it in direct-render validation alongside the primary
+Basement seat. It is a test seat, not a farm worker: do not add it to
+`install-helpers/farm.sh`, and do not use it for heavy build/test gates.
+
 ---
 
 ## 1. Quick start — build right now
@@ -225,6 +254,25 @@ install-helpers/xcp-build.sh gates                    # fmt + clippy + test
 MCNF_BUILD_HOST=172.20.0.130 \
   install-helpers/xcp-build.sh cargo build --workspace   # long pole → BigBoy (.130)
 install-helpers/farm-topology.sh table                # all 4 nodes: verified util table
+```
+
+The four build VMs are not the production six-node topology. Validate a
+schema-versioned six-node evidence bundle with
+`install-helpers/verify-six-node-topology.py`; use `--require-live` for the
+production gate. The helper fails closed when any lighthouse/workstation,
+join/steady-state/loss/failover/re-enrollment/corrected-forward observation,
+fresh timestamp, command, artifact digest, or live source is missing. A node
+marked `source: live` must additionally carry an artifact-bound
+`live_attestation` record naming the node and `ssh`/`console` capture
+transport; the source label alone is never live proof. A passing farm self-test
+proves only the validator and its negative paths, never live hardware:
+
+```sh
+MCNF_BUILD_HOST=172.20.0.90 MCNF_BUILD_SLOT=<free-slot> \
+  install-helpers/xcp-build.sh sync
+ssh mm@172.20.0.90 \
+  'cd ~/magic-mesh-farm-<free-slot> && \
+   python3 install-helpers/verify-six-node-topology.py --self-test'
 ```
 
 Heavy local `cargo` (`build`/`test`/`check`/`clippy`/`run`) is **guard-disabled**

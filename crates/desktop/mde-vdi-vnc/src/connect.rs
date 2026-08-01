@@ -309,8 +309,16 @@ impl VncConnection {
     pub fn flush_input(&mut self, session: &mut VncSession) -> Result<usize, ConnectError> {
         let queued = session.take_input();
         let count = queued.len();
-        write_client_messages(&mut self.stream, &queued)?;
-        Ok(count)
+        match write_client_messages(&mut self.stream, &queued) {
+            Ok(()) => Ok(count),
+            Err(error) => {
+                // A failed write is not an acknowledgement.  Restore the
+                // exact queue, including ClientCutText, so callers can
+                // reconnect/retry without silently losing clipboard state.
+                session.requeue_input(queued);
+                Err(error)
+            }
+        }
     }
 
     /// Send host clipboard text to the guest through RFB `ClientCutText` and

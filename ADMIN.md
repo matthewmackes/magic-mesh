@@ -17,6 +17,19 @@ Workstation** (upgrade-only, never downgrade; a headless box is a Workstation
 without a display). Per-role expectations:
 [`docs/help/node-setup.md`](docs/help/node-setup.md).
 
+### Production boundary
+
+Construct's supported production purpose is a small, mutually trusted workgroup
+mesh with headless control-plane services and VM-based desktops. It is not a
+zero-trust, multi-tenant, hyperscale, or general consumer desktop platform.
+
+Production promotion requires the fixed six-node baseline: **three
+lighthouses plus three workstations**. A static GitHub check result is necessary
+but not sufficient; signed release evidence must also contain successful farm,
+Fedora compatibility, mesh join, failover, recovery, workload, VDI, and
+required hardware gates. A missing or unavailable gate means engineering
+preview, not production-ready.
+
 ## 1. Stand up the mesh + enroll peers
 
 ```bash
@@ -36,21 +49,29 @@ sequence: [`packaging/ENROLLMENT.md`](packaging/ENROLLMENT.md).
 ## 2. Provision the backup — do this on day one
 
 ```bash
-# Export in the daemon's environment (systemd drop-in or /etc/mackesd env):
-export MDE_BACKUP_PASSPHRASE='<8+ random chars, stored in your password manager>'
+# Provision the CA-backup passphrase as a root-only systemd credential.
+# The lighthouse join path provisions this automatically; for manual setup,
+# follow the systemd-creds + LoadCredentialEncrypted example in
+# packaging/systemd/mackesd.service. Never export the passphrase or put it in
+# a unit Environment= setting or command argument.
 ```
 
-With the passphrase set, the daily backup worker writes an encrypted
+With the credential provisioned, the daily backup worker writes an encrypted
 (XChaCha20-Poly1305 + Argon2id) `state-backup.enc` to the replicated volume.
 **Unset, the backup is disabled** — and the daemon tells you so: the alert
 `MDE_BACKUP_PASSPHRASE unset` repeats in the journal and
 `mackesd_backup_passphrase_set 0` shows in the metrics. Staleness (>48 h)
 also alerts.
 
+The current encrypted backup remains mandatory while the selected future
+recovery model moves toward replicated live state. Do not disable it until the
+peer-replication recovery drill is complete and its signed evidence is attached
+to the release record.
+
 Off-cluster copy (recommended, monthly + after CA rotation):
 
 ```bash
-mackesd ca export --output /safe/offsite/ca-bundle.enc   # same passphrase env
+mackesd ca export --passphrase-stdin --output /safe/offsite/ca-bundle.enc
 ```
 
 ## 3. Watch it
@@ -87,9 +108,9 @@ mackesd ca export --output /safe/offsite/ca-bundle.enc   # same passphrase env
 lighthouse-loss runbook)
 
 ```bash
-mackesd state-restore <path/to/state-backup.enc>   # MDE_BACKUP_PASSPHRASE set
+mackesd state-restore --passphrase-stdin <path/to/state-backup.enc>
 # or, for the off-cluster CA bundle:
-mackesd ca import --input /safe/offsite/ca-bundle.enc
+mackesd ca import --passphrase-stdin --input /safe/offsite/ca-bundle.enc
 ```
 
 Then re-mint enroll tokens for peers that need to rejoin

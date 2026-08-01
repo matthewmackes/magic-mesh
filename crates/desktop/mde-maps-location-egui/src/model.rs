@@ -1053,6 +1053,10 @@ pub struct MapsLocationSurface {
     /// Consumer-side freshness/cache state for the complete vehicle mirror.
     /// Only `Current` permits cached vehicle values to be rendered as live.
     pub vehicle_mirror_status: VehicleMirrorStatus,
+    /// Last accepted identity-checked v2 snapshot for the multi-manager
+    /// consumer fold. Keeping the typed row lets a repeated Bus refresh
+    /// recompute age without allowing an older manager row to replace it.
+    vehicle_roster_cache: Option<mackes_mesh_types::vehicle::VehicleStateV2>,
     /// GPIO/CAN/USB/serial device state.
     pub devices: DeviceIoState,
     /// Firmware lifecycle model.
@@ -1117,6 +1121,7 @@ impl MapsLocationSurface {
             vehicle_mirror_status: VehicleMirrorStatus::unavailable(
                 "no valid typed vehicle snapshot available",
             ),
+            vehicle_roster_cache: None,
             devices: DeviceIoState::live(),
             firmware: FirmwareWorkflow::live(),
             vault: EncryptedVaultState::ready_for_local_admin(),
@@ -1169,6 +1174,7 @@ impl MapsLocationSurface {
             vehicle_mirror_status: VehicleMirrorStatus::unavailable(
                 "simulator fixture has no live vehicle snapshot",
             ),
+            vehicle_roster_cache: None,
             devices: DeviceIoState::simulated(),
             firmware: FirmwareWorkflow::simulated(),
             vault: EncryptedVaultState::ready_for_local_admin(),
@@ -1727,6 +1733,7 @@ impl MapsLocationSurface {
             )));
             return;
         }
+        self.vehicle_roster_cache = Some(v.clone());
         let legacy = mackes_mesh_types::vehicle::VehicleState {
             host: v.management_node_id.clone(),
             model: v.mg90.model.clone(),
@@ -1743,6 +1750,105 @@ impl MapsLocationSurface {
         self.refresh_from_vehicle(&legacy);
         self.vehicle_radio_health = VehicleRadioHealth::from_v2_at(v, now_ms);
         self.set_vehicle_mirror_status(VehicleMirrorStatus::from_v2_at(v, now_ms));
+    }
+
+    /// Fold a bounded set of identity-addressed MG90 snapshots from multiple
+    /// management nodes.
+    ///
+    /// The consumer accepts at most eight rows, requires a confirmed MG90
+    /// identity and non-empty manager identity, and permits a manager only
+    /// when an explicit complete manager set names it. For duplicate manager
+    /// rows, the newest `(observed, published, sequence)` tuple wins; across
+    /// managers the same ordering selects one projection for Car/Maps. An
+    /// older row can therefore never roll a live cache backward. An empty or
+    /// wholly invalid refresh retains the last accepted typed row but marks
+    /// the mirror `ResyncingNoFreshSnapshot`; without a cache it is explicitly
+    /// unavailable. No manager reachability or telemetry is inferred here.
+    pub fn refresh_from_vehicle_v2_managers(
+        &mut self,
+        snapshots: &[mackes_mesh_types::vehicle::VehicleStateV2],
+    ) {
+        use std::collections::BTreeMap;
+        use mackes_mesh_types::vehicle::{ManagerSetState, VEHICLE_STATE_V2_MAX_MANAGERS};
+
+        let mut by_manager: BTreeMap<
+            String,
+            &mackes_mesh_types::vehicle::VehicleStateV2,
+        > = BTreeMap::new();
+        let mut accepted_mg90: Option<&str> = None;
+        for snapshot in snapshots.iter().take(VEHICLE_STATE_V2_MAX_MANAGERS) {
+            if snapshot.schema_version
+                != mackes_mesh_types::vehicle::VEHICLE_STATE_V2_SCHEMA_VERSION
+                || snapshot.management_node_id.trim().is_empty()
+                || snapshot.mg90.id.trim().is_empty()
+                || snapshot.mg90.id != snapshot.mg90.esn
+            {
+                continue;
+            }
+            if let Some(expected) = accepted_mg90 {
+                if expected != snapshot.mg90.id {
+                    continue;
+                }
+            } else {
+                accepted_mg90 = Some(&snapshot.mg90.id);
+            }
+            if snapshot.managers.state == ManagerSetState::Complete
+                && !snapshot
+                    .managers
+                    .ids
+                    .iter()
+                    .any(|manager| manager == &snapshot.management_node_id)
+            {
+                continue;
+            }
+            let manager = snapshot.management_node_id.clone();
+            let is_newer = by_manager
+                .get(&manager)
+                .is_none_or(|current: &&mackes_mesh_types::vehicle::VehicleStateV2| {
+                (snapshot.observed_at_ms, snapshot.published_at_ms, snapshot.sequence)
+                    > (current.observed_at_ms, current.published_at_ms, current.sequence)
+            });
+            if is_newer {
+                by_manager.insert(manager, snapshot);
+            }
+        }
+
+        let selected = by_manager.values().copied().max_by_key(|snapshot| {
+            (
+                snapshot.observed_at_ms,
+                snapshot.published_at_ms,
+                snapshot.sequence,
+                snapshot.management_node_id.as_str(),
+            )
+        });
+
+        let Some(selected) = selected else {
+            if let Some(cached) = self.vehicle_roster_cache.clone() {
+                let status = VehicleMirrorStatus::from_v2_at(&cached, unix_now_ms())
+                    .resyncing_no_fresh_snapshot(unix_now_ms());
+                self.set_vehicle_mirror_status(status);
+            } else {
+                self.set_vehicle_mirror_status(VehicleMirrorStatus::unavailable(
+                    "no valid multi-manager vehicle snapshot available",
+                ));
+            }
+            return;
+        };
+
+        if let Some(cached) = self.vehicle_roster_cache.as_ref() {
+            let same_source = cached.mg90.id == selected.mg90.id;
+            let selected_is_newer = (
+                selected.observed_at_ms,
+                selected.published_at_ms,
+                selected.sequence,
+            ) >= (cached.observed_at_ms, cached.published_at_ms, cached.sequence);
+            if !same_source || !selected_is_newer {
+                let retained = cached.clone();
+                self.refresh_from_vehicle_v2(&retained);
+                return;
+            }
+        }
+        self.refresh_from_vehicle_v2(selected);
     }
 
     /// Project the currently accepted v2 facts into the fixed-position
@@ -1816,7 +1922,7 @@ impl MapsLocationSurface {
     ) {
         let reader = PersistedMirrorReader { persist, bus_root };
         if let Some(mirror) = read_vehicle_v2_mirror(&reader, node) {
-            self.refresh_from_vehicle_v2(&mirror);
+            self.refresh_from_vehicle_v2_managers(std::slice::from_ref(&mirror));
         } else if self.vehicle_mirror_status.sequence.is_some() {
             // Once a typed v2 snapshot has been accepted, a temporarily empty
             // v2 topic is a resync gap, not permission to replace the richer
@@ -2528,6 +2634,10 @@ impl OfflineNavigationStatus {
             blockers.push("No loaded offline map region is available.".to_string());
         }
 
+        if !surface.simulator_enabled && !surface.offline_maps.manifest.readiness.ready {
+            blockers.push("Offline region manifest is not atomically ready.".to_string());
+        }
+
         if surface.offline_maps.used_gb > surface.offline_maps.storage_cap_gb as f32 {
             blockers.push(format!(
                 "Offline maps use {:.1} GB, above the {} GB cap.",
@@ -2866,6 +2976,289 @@ impl MapViewState {
     }
 }
 
+/// Maximum number of font files accepted by one offline region manifest.
+const MAX_OFFLINE_MANIFEST_FONTS: usize = 8;
+/// Maximum path length accepted from a manifest, in bytes.
+const MAX_OFFLINE_MANIFEST_PATH_BYTES: usize = 256;
+/// Maximum artifact size the model will read while validating a manifest.
+const MAX_OFFLINE_MANIFEST_ARTIFACT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// One content-addressed file in an offline region bundle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfflineManifestArtifact {
+    /// Path relative to the region root. Absolute paths and traversal are rejected.
+    pub relative_path: String,
+    /// Exact byte length expected on disk.
+    pub size_bytes: u64,
+    /// Lower-case SHA-256 of the exact file bytes.
+    pub sha256: String,
+    /// Artifact revision bound to [`OfflineRegionManifest::revision`].
+    pub revision: String,
+}
+
+/// Typed, bounded contract for one atomically activatable offline region.
+///
+/// The model validates every required artifact before replacing the active
+/// readiness state. Activation is only a capability/readiness result; it does
+/// not create route options or claim that a route is available.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfflineRegionManifest {
+    /// Stable region identifier.
+    pub region_id: String,
+    /// Revision shared by every artifact in the bundle.
+    pub revision: String,
+    /// Vector-tile package.
+    pub vector_tiles: OfflineManifestArtifact,
+    /// Map style document.
+    pub style: OfflineManifestArtifact,
+    /// Glyph/font package entries.
+    pub fonts: Vec<OfflineManifestArtifact>,
+    /// Offline gazetteer database.
+    pub gazetteer: OfflineManifestArtifact,
+    /// Valhalla graph package.
+    pub valhalla_graph: OfflineManifestArtifact,
+}
+
+/// Result of validating or activating a region manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfflineManifestReadiness {
+    /// Whether all required artifacts passed validation.
+    pub ready: bool,
+    /// Stable validation failures, empty when ready.
+    pub blockers: Vec<String>,
+    /// Manifest retained only after successful atomic activation.
+    pub active_manifest: Option<OfflineRegionManifest>,
+}
+
+impl OfflineManifestReadiness {
+    fn blocked(blockers: Vec<String>) -> Self {
+        Self {
+            ready: false,
+            blockers,
+            active_manifest: None,
+        }
+    }
+
+    fn ready(manifest: OfflineRegionManifest) -> Self {
+        Self {
+            ready: true,
+            blockers: Vec::new(),
+            active_manifest: Some(manifest),
+        }
+    }
+}
+
+impl OfflineRegionManifest {
+    /// Validate all artifacts against `region_root` without mutating any
+    /// caller-owned state. Every artifact must share the manifest revision.
+    #[must_use]
+    pub fn validate_at(&self, region_root: &std::path::Path) -> OfflineManifestReadiness {
+        let mut blockers = Vec::new();
+        if self.region_id.trim().is_empty() || self.region_id.len() > 128 {
+            blockers.push("region id is empty or exceeds 128 bytes".to_string());
+        }
+        if self.revision.trim().is_empty() || self.revision.len() > 128 {
+            blockers.push("manifest revision is empty or exceeds 128 bytes".to_string());
+        }
+        if self.fonts.is_empty() {
+            blockers.push("manifest has no font artifact".to_string());
+        } else if self.fonts.len() > MAX_OFFLINE_MANIFEST_FONTS {
+            blockers.push(format!(
+                "manifest has more than {MAX_OFFLINE_MANIFEST_FONTS} font artifacts"
+            ));
+        }
+
+        let mut artifacts = vec![
+            ("vector tiles", &self.vector_tiles),
+            ("style", &self.style),
+            ("gazetteer", &self.gazetteer),
+            ("Valhalla graph", &self.valhalla_graph),
+        ];
+        artifacts.extend(self.fonts.iter().enumerate().map(|(index, artifact)| {
+            (if index == usize::MAX { "font" } else { "font" }, artifact)
+        }));
+        for (kind, artifact) in artifacts {
+            validate_offline_manifest_artifact(
+                kind,
+                artifact,
+                &self.revision,
+                region_root,
+                &mut blockers,
+            );
+        }
+        if blockers.is_empty() {
+            OfflineManifestReadiness::ready(self.clone())
+        } else {
+            OfflineManifestReadiness::blocked(blockers)
+        }
+    }
+
+    /// Validate and atomically replace `active` only when the whole manifest
+    /// is ready. A failed candidate cannot clear or partially replace `active`.
+    pub fn activate_at(
+        &self,
+        region_root: &std::path::Path,
+        active: &mut Option<Self>,
+    ) -> OfflineManifestReadiness {
+        let readiness = self.validate_at(region_root);
+        if readiness.ready {
+            *active = Some(self.clone());
+        }
+        OfflineManifestReadiness {
+            active_manifest: active.clone(),
+            ..readiness
+        }
+    }
+}
+
+fn validate_offline_manifest_artifact(
+    kind: &str,
+    artifact: &OfflineManifestArtifact,
+    manifest_revision: &str,
+    region_root: &std::path::Path,
+    blockers: &mut Vec<String>,
+) {
+    let path = std::path::Path::new(&artifact.relative_path);
+    if artifact.relative_path.is_empty()
+        || artifact.relative_path.len() > MAX_OFFLINE_MANIFEST_PATH_BYTES
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(component, std::path::Component::ParentDir)
+        })
+    {
+        blockers.push(format!("{kind} path is unsafe or exceeds the bounded length"));
+        return;
+    }
+    if artifact.revision != manifest_revision {
+        blockers.push(format!("{kind} revision is not bound to manifest revision"));
+    }
+    if artifact.size_bytes == 0 || artifact.size_bytes > MAX_OFFLINE_MANIFEST_ARTIFACT_BYTES {
+        blockers.push(format!("{kind} size is outside the bounded non-zero range"));
+        return;
+    }
+    if !is_sha256_hex(&artifact.sha256) {
+        blockers.push(format!("{kind} digest is not a lower-case SHA-256"));
+        return;
+    }
+    let full_path = region_root.join(path);
+    let metadata = match std::fs::metadata(&full_path) {
+        Ok(metadata) => metadata,
+        Err(_) => {
+            blockers.push(format!("{kind} is missing or unreadable"));
+            return;
+        }
+    };
+    if !metadata.is_file() || metadata.len() > MAX_OFFLINE_MANIFEST_ARTIFACT_BYTES {
+        blockers.push(format!("{kind} exceeds the bounded file size or is not a file"));
+        return;
+    }
+    if metadata.len() != artifact.size_bytes {
+        blockers.push(format!("{kind} size does not match manifest"));
+    }
+    let bytes = match std::fs::read(&full_path) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            blockers.push(format!("{kind} is missing or unreadable"));
+            return;
+        }
+    };
+    if sha256_hex(&bytes) != artifact.sha256 {
+        blockers.push(format!("{kind} digest does not match manifest"));
+    }
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+/// Small dependency-free SHA-256 implementation for bounded local artifact
+/// validation. It hashes only after the manifest has limited the file size.
+fn sha256_hex(bytes: &[u8]) -> String {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
+        0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+        0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
+        0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
+        0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+        0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
+        0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+        0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    ];
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c,
+        0x1f83d9ab, 0x5be0cd19,
+    ];
+    let bit_len = (bytes.len() as u64).wrapping_mul(8);
+    let mut padded = bytes.to_vec();
+    padded.push(0x80);
+    while padded.len() % 64 != 56 { padded.push(0); }
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+    for chunk in padded.chunks_exact(64) {
+        let mut w = [0u32; 64];
+        for (i, word) in w[..16].iter_mut().enumerate() {
+            *word = u32::from_be_bytes(chunk[i * 4..i * 4 + 4].try_into().unwrap());
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+        }
+        let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) =
+            (h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = hh.wrapping_add(s1).wrapping_add(ch).wrapping_add(K[i]).wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+            (hh, g, f, e, d, c, b, a) = (g, f, e, d.wrapping_add(temp1), c, b, a, temp1.wrapping_add(temp2));
+        }
+        for (value, add) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) { *value = (*value).wrapping_add(add); }
+    }
+    h.iter().map(|word| format!("{word:08x}")).collect()
+}
+
+/// Runtime state for an offline region manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfflineRegionManifestState {
+    /// Manifest that was atomically activated, if any.
+    pub active: Option<OfflineRegionManifest>,
+    /// Last readiness result.
+    pub readiness: OfflineManifestReadiness,
+}
+
+impl OfflineRegionManifestState {
+    fn empty() -> Self {
+        Self {
+            active: None,
+            readiness: OfflineManifestReadiness::blocked(vec![
+                "offline region manifest has not been activated".to_string(),
+            ]),
+        }
+    }
+
+    fn activate(&mut self, manifest: &OfflineRegionManifest, root: &std::path::Path) {
+        let readiness = manifest.activate_at(root, &mut self.active);
+        self.readiness = readiness;
+    }
+
+    #[cfg(any(test, feature = "sim-fixture"))]
+    fn simulated() -> Self {
+        Self {
+            active: None,
+            readiness: OfflineManifestReadiness {
+                ready: true,
+                blockers: Vec::new(),
+                active_manifest: None,
+            },
+        }
+    }
+}
+
 /// Offline map manager first-slice state.
 #[derive(Debug, Clone)]
 pub struct OfflineMapManagerState {
@@ -2879,6 +3272,8 @@ pub struct OfflineMapManagerState {
     pub installed_regions: Vec<OfflineMapRegion>,
     /// Pending/downloadable regions.
     pub available_regions: Vec<String>,
+    /// Typed artifact contract for atomic region activation.
+    pub manifest: OfflineRegionManifestState,
     /// OpenStreetMap-derived provider contract.
     pub map_provider: ProviderContract,
 }
@@ -2902,6 +3297,7 @@ impl OfflineMapManagerState {
             used_gb: 0.0,
             installed_regions: Vec::new(),
             available_regions: Vec::new(),
+            manifest: OfflineRegionManifestState::empty(),
             map_provider: ProviderContract {
                 abstraction: "Map Provider API".to_string(),
                 first_backend: "OpenStreetMap-derived data".to_string(),
@@ -2931,6 +3327,16 @@ impl OfflineMapManagerState {
         state
     }
 
+    /// Validate and atomically activate a complete region contract. A failed
+    /// candidate leaves the previously active manifest untouched.
+    pub fn activate_manifest(
+        &mut self,
+        manifest: &OfflineRegionManifest,
+        region_root: &std::path::Path,
+    ) {
+        self.manifest.activate(manifest, region_root);
+    }
+
     /// TEST FIXTURE ONLY.
     #[cfg(any(test, feature = "sim-fixture"))]
     fn simulated_default() -> Self {
@@ -2949,6 +3355,7 @@ impl OfflineMapManagerState {
                 "Neighboring state/province".to_string(),
                 "Cross-border corridor".to_string(),
             ],
+            manifest: OfflineRegionManifestState::simulated(),
             map_provider: ProviderContract {
                 abstraction: "Map Provider API".to_string(),
                 first_backend: "OpenStreetMap-derived data".to_string(),
@@ -6690,6 +7097,80 @@ mod tests {
         assert_eq!(installed.installed_regions[0].status, RegionStatus::Loaded);
     }
 
+    fn test_offline_manifest(root: &std::path::Path) -> OfflineRegionManifest {
+        let entries = [
+            ("tiles.mbtiles", b"vector tiles".as_slice()),
+            ("style.json", b"style".as_slice()),
+            ("fonts.pbf", b"font".as_slice()),
+            ("gazetteer.sqlite", b"gazetteer".as_slice()),
+            ("valhalla.tar", b"graph".as_slice()),
+        ];
+        for (name, bytes) in entries {
+            std::fs::write(root.join(name), bytes).expect("manifest fixture");
+        }
+        let artifact = |name: &str, bytes: &[u8]| OfflineManifestArtifact {
+            relative_path: name.to_string(),
+            size_bytes: bytes.len() as u64,
+            sha256: sha256_hex(bytes),
+            revision: "rev-7".to_string(),
+        };
+        OfflineRegionManifest {
+            region_id: "east-texas".to_string(),
+            revision: "rev-7".to_string(),
+            vector_tiles: artifact("tiles.mbtiles", b"vector tiles"),
+            style: artifact("style.json", b"style"),
+            fonts: vec![artifact("fonts.pbf", b"font")],
+            gazetteer: artifact("gazetteer.sqlite", b"gazetteer"),
+            valhalla_graph: artifact("valhalla.tar", b"graph"),
+        }
+    }
+
+    #[test]
+    fn offline_region_manifest_binds_all_artifacts_and_validates_digest_and_size() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = test_offline_manifest(dir.path());
+        let readiness = manifest.validate_at(dir.path());
+        assert!(readiness.ready, "{readiness:?}");
+        assert_eq!(readiness.active_manifest, Some(manifest.clone()));
+
+        let mut bad_digest = manifest.clone();
+        bad_digest.style.sha256 = "0".repeat(64);
+        assert!(!bad_digest.validate_at(dir.path()).ready);
+
+        let mut bad_size = manifest;
+        bad_size.gazetteer.size_bytes += 1;
+        assert!(!bad_size.validate_at(dir.path()).ready);
+    }
+
+    #[test]
+    fn offline_region_manifest_activation_is_atomic_and_does_not_create_routes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = test_offline_manifest(dir.path());
+        let mut maps = OfflineMapManagerState::from_installed(None);
+        maps.activate_manifest(&manifest, dir.path());
+        assert!(maps.manifest.readiness.ready);
+        assert_eq!(maps.manifest.active, Some(manifest.clone()));
+
+        let mut rejected = manifest.clone();
+        rejected.valhalla_graph.revision = "rev-6".to_string();
+        maps.activate_manifest(&rejected, dir.path());
+        assert!(!maps.manifest.readiness.ready);
+        assert_eq!(maps.manifest.active, Some(manifest));
+        assert!(maps.installed_regions.is_empty());
+        assert!(maps.available_regions.is_empty());
+    }
+
+    #[test]
+    fn offline_region_manifest_rejects_traversal_and_uppercase_digest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut manifest = test_offline_manifest(dir.path());
+        manifest.style.relative_path = "../style.json".to_string();
+        assert!(!manifest.validate_at(dir.path()).ready);
+        manifest.style.relative_path = "style.json".to_string();
+        manifest.style.sha256 = manifest.style.sha256.to_uppercase();
+        assert!(!manifest.validate_at(dir.path()).ready);
+    }
+
     #[test]
     fn live_mirror_fold_goes_live_from_the_live_seed() {
         use mackes_mesh_types::vehicle::{
@@ -6868,6 +7349,54 @@ mod tests {
         ])
         .expect("test inventory is bounded");
         snapshot
+    }
+
+    #[test]
+    fn multi_manager_vehicle_fold_is_latest_wins_and_resyncs_retained_cache() {
+        let now = test_now_ms();
+        let mut manager_a = typed_vehicle_snapshot(now - 2_000);
+        manager_a.management_node_id = "manager-a".to_string();
+        manager_a.sequence = 10;
+        let mut manager_b = manager_a.clone();
+        manager_b.management_node_id = "manager-b".to_string();
+        manager_b.published_at_ms = now - 500;
+        manager_b.observed_at_ms = now - 500;
+        manager_b.sequence = 11;
+
+        let mut surface = MapsLocationSurface::live();
+        surface.refresh_from_vehicle_v2_managers(&[manager_a, manager_b.clone()]);
+        assert_eq!(
+            surface
+                .vehicle_mirror_status
+                .provenance
+                .as_ref()
+                .map(|provenance| provenance.management_node_id.as_str()),
+            Some("manager-b")
+        );
+
+        // A late manager row cannot roll the accepted cache back to manager-a.
+        let mut older = manager_b.clone();
+        older.management_node_id = "manager-a".to_string();
+        older.published_at_ms = now - 3_000;
+        older.observed_at_ms = now - 3_000;
+        older.sequence = 1;
+        surface.refresh_from_vehicle_v2_managers(&[older]);
+        assert_eq!(
+            surface
+                .vehicle_mirror_status
+                .provenance
+                .as_ref()
+                .map(|provenance| provenance.management_node_id.as_str()),
+            Some("manager-b")
+        );
+
+        surface.refresh_from_vehicle_v2_managers(&[]);
+        assert_eq!(
+            surface.vehicle_mirror_status.state,
+            VehicleMirrorState::ResyncingNoFreshSnapshot
+        );
+        assert!(surface.vehicle_mirror_status.has_retained_snapshot());
+        assert!(!surface.vehicle_mirror_status.state.is_current());
     }
 
     fn complete_healthy_vehicle_snapshot(

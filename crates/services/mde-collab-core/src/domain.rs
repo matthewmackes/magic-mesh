@@ -205,9 +205,14 @@ impl DomainState {
                 }
             }
             CollabEventKind::MemberLeft { actor } => {
-                if let Some(s) = self.spaces.get_mut(&space_id) {
-                    if let Some(m) = s.members.get_mut(actor) {
-                        m.present = false;
+                // `LeaveSpace` is self-authored, while `RemoveMember` is
+                // owner-authored. A valid signature from an ordinary member
+                // must not let replay accept a cross-member removal.
+                if actor == &env.actor || self.is_owner(space_id, &env.actor) {
+                    if let Some(s) = self.spaces.get_mut(&space_id) {
+                        if let Some(m) = s.members.get_mut(actor) {
+                            m.present = false;
+                        }
                     }
                 }
             }

@@ -1,32 +1,12 @@
-use mde_egui::egui::{self, RichText, Stroke, Ui};
+use mde_egui::egui::{self, Stroke, Ui};
 use mde_egui::Style;
-
-const EDITOR_TOOLTIP_MAX_W: f32 = Style::SP_XL * 12.0;
-
-pub(crate) fn editor_tooltip(ui: &mut Ui, text: &str) {
-    let ctx = ui.ctx().clone();
-    let surface = Style::resolve_color(&ctx, Style::SURFACE);
-    let border = Style::resolve_color(&ctx, Style::BORDER);
-    let text_color = Style::resolve_color(&ctx, Style::TEXT);
-    egui::Frame::NONE
-        .fill(surface)
-        .stroke(egui::Stroke::new(Style::STROKE_HAIRLINE, border))
-        .corner_radius(mde_egui::corner(Style::RADIUS_S))
-        .inner_margin(Style::tooltip_margin())
-        .show(ui, |ui| {
-            ui.set_max_width(EDITOR_TOOLTIP_MAX_W);
-            ui.add(
-                egui::Label::new(RichText::new(text).size(Style::SMALL).color(text_color)).wrap(),
-            );
-        });
-}
 
 pub(crate) fn editor_hover_text(
     response: egui::Response,
     text: impl Into<String>,
 ) -> egui::Response {
     let text = text.into();
-    response.on_hover_ui(move |ui| editor_tooltip(ui, text.as_str()))
+    mde_egui::hover_text(response, text)
 }
 
 pub(crate) fn editor_menu_button<R>(
@@ -105,7 +85,7 @@ fn apply_editor_popup_style(ctx: &egui::Context, style: &mut egui::Style) {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_editor_popup_style, editor_tooltip};
+    use super::apply_editor_popup_style;
     use mde_egui::{egui, Density, Style, StyleColorScheme};
 
     fn painted_text_colors(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Color32)> {
@@ -180,7 +160,7 @@ mod tests {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::NONE)
                     .show(ctx, |ui| {
-                        editor_tooltip(ui, text);
+                        mde_egui::tooltip(ui, text);
                     });
             },
         )

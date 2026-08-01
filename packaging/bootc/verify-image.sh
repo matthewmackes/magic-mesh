@@ -78,6 +78,12 @@ grep -q '^Environment=MDE_WEB_SANDBOX_DELEGATE_SUBGROUP=shell$' /usr/lib/systemd
 grep -q '^Environment=MDE_MAPS_DIR=/var/lib/mde/maps$' /usr/lib/systemd/system/mde-shell-egui.service \
     && ok "seat unit pins offline Maps data to persistent storage" \
     || bad "seat unit missing persistent offline Maps data root env"
+grep -q '^OnFailure=getty@tty1.service$' /usr/lib/systemd/system/mde-shell-egui.service \
+    && ok "seat unit restores tty1 only after terminal failure" \
+    || bad "seat unit missing terminal-failure tty1 recovery"
+! grep -q '^ExecStopPost=' /usr/lib/systemd/system/mde-shell-egui.service \
+    && ok "seat unit does not race normal restarts with getty" \
+    || bad "seat unit still has unconditional ExecStopPost recovery"
 
 # Enablement symlinks (systemctl reads links; no running systemd needed).
 for u in mde-shell-egui.service podman.socket mackesd.service nebula.service \

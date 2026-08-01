@@ -44,8 +44,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use etcd_client::{GetOptions, PutOptions};
+use mackes_mesh_types::cloud::{
+    cloud_request_digest, CloudArmedToken, CloudArmSigner, CLOUD_ACTION_SCHEMA_VERSION,
+};
+use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
+
+use etcd_client::{GetOptions, PutOptions};
 
 use super::scheduler::NodeId;
 use super::{ShutdownToken, Worker};
@@ -138,6 +143,21 @@ pub struct VdiSession {
     pub opened_at_ms: u64,
     /// When the state last changed (ms since the Unix epoch, passed in).
     pub updated_at_ms: u64,
+    /// Guest-owned application identity, present only for App VM sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<mackes_mesh_types::vdi_session::AppVmLaunchRequest>,
+    /// Guest/application readiness, present only for App VM sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_state: Option<mackes_mesh_types::vdi_session::AppVmLifecycleState>,
+    /// Optional bounded context attached to a non-ready App VM state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_state_reason: Option<String>,
+    /// Highest guest runtime generation accepted for this App VM session.
+    ///
+    /// A zero value preserves compatibility with pre-generation snapshots;
+    /// the first explicitly numbered runtime report must be greater than it.
+    #[serde(default)]
+    pub app_state_generation: u64,
 }
 
 /// A session lifecycle request drained off [`ACTION_TOPIC`] — the wire verb the
@@ -150,7 +170,10 @@ pub struct VdiSession {
 /// `onboard::first_desktop`) keep resolving unchanged. The wire shape is
 /// byte-identical: the broker's [`SessionId`] / [`NodeId`] / [`VmId`] are all
 /// `= String` aliases, so the shared `String`-typed fields serialise the same.
-pub use mackes_mesh_types::vdi_session::SessionRequest;
+pub use mackes_mesh_types::vdi_session::{
+    AppVmLaunchRequest, AppVmLifecycleState, AppVmRuntimeEvidence, SessionRequest,
+    APP_VM_RUNTIME_TOPIC,
+};
 
 /// Parse a [`SessionRequest`] body.
 ///
@@ -173,6 +196,29 @@ pub enum SessionError {
     },
     /// A transition op named a session id the roster doesn't hold.
     UnknownSession(SessionId),
+    /// An App VM open carried invalid untrusted catalog/session data.
+    InvalidAppVm(mackes_mesh_types::vdi_session::AppVmLaunchRequestError),
+    /// An App VM readiness update attempted an invalid lifecycle jump.
+    IllegalAppState {
+        /// Current readiness state.
+        from: AppVmLifecycleState,
+        /// Requested readiness state.
+        to: AppVmLifecycleState,
+    },
+    /// A guest readiness report was older than the last accepted generation.
+    StaleAppState {
+        /// The rejected guest generation.
+        generation: u64,
+    },
+    /// A repeated App VM open tried to retarget an already admitted session.
+    /// Session identity is the idempotency key; changing its guest or serving
+    /// route would create split-brain ownership rather than a resume.
+    ConflictingAppSession {
+        /// The stable session identity being protected.
+        id: SessionId,
+        /// The bounded reason for refusing the replay.
+        reason: &'static str,
+    },
 }
 
 impl std::fmt::Display for SessionError {
@@ -182,6 +228,16 @@ impl std::fmt::Display for SessionError {
                 write!(f, "illegal session transition {from:?} → {to:?}")
             }
             Self::UnknownSession(id) => write!(f, "unknown session {id}"),
+            Self::InvalidAppVm(error) => write!(f, "invalid App VM session: {error}"),
+            Self::IllegalAppState { from, to } => {
+                write!(f, "illegal App VM readiness transition {from:?} → {to:?}")
+            }
+            Self::StaleAppState { generation } => {
+                write!(f, "stale App VM readiness generation {generation}")
+            }
+            Self::ConflictingAppSession { id, reason } => {
+                write!(f, "conflicting App VM session `{id}`: {reason}")
+            }
         }
     }
 }
@@ -208,7 +264,47 @@ pub const fn open_session(
         state: SessionState::Requested,
         opened_at_ms: now_ms,
         updated_at_ms: now_ms,
+        app: None,
+        app_state: None,
+        app_state_reason: None,
+        app_state_generation: 0,
     }
+}
+
+/// Build a fresh validated App VM session in [`SessionState::Requested`].
+pub fn open_app_session(
+    id: SessionId,
+    serving_peer: NodeId,
+    vm_id: VmId,
+    client_peer: NodeId,
+    app_id: String,
+    catalog_revision: String,
+    guest_profile: String,
+    requested_capabilities: Vec<String>,
+    resume: bool,
+    now_ms: u64,
+) -> Result<VdiSession, mackes_mesh_types::vdi_session::AppVmLaunchRequestError> {
+    let app = AppVmLaunchRequest::new(
+        app_id,
+        catalog_revision,
+        guest_profile,
+        requested_capabilities,
+        id.clone(),
+        resume,
+    )?;
+    Ok(VdiSession {
+        id,
+        serving_peer,
+        vm_id,
+        client_peer,
+        state: SessionState::Requested,
+        opened_at_ms: now_ms,
+        updated_at_ms: now_ms,
+        app: Some(app),
+        app_state: Some(AppVmLifecycleState::WaitingForPlacement),
+        app_state_reason: None,
+        app_state_generation: 0,
+    })
 }
 
 /// Clone `session` with a new `state` + refreshed `updated_at_ms`.
@@ -266,12 +362,16 @@ pub fn close_session(session: &VdiSession, now_ms: u64) -> VdiSession {
 
 /// Apply one drained [`SessionRequest`] to the in-memory `roster` (latest-wins by
 /// id — the incremental fold the worker runs per drained message, the session
-/// analogue of `scheduler`'s `fold_capacity`).
+/// analogue of `scheduler`'s `fold_capacity`). Repeated `OpenApp` requests for
+/// one admitted identity are idempotent and preserve readiness; a replay cannot
+/// retarget the session to another VM or serving/client peer.
 ///
 /// # Errors
-/// [`SessionError::UnknownSession`] when a transition op names an absent id, or
-/// [`SessionError::IllegalTransition`] when the transition is forbidden. `Open`
-/// never errors (it mints / overwrites the row).
+/// [`SessionError::UnknownSession`] when a transition op names an absent id,
+/// [`SessionError::IllegalTransition`] when the transition is forbidden, or
+/// [`SessionError::ConflictingAppSession`] when an App VM replay would retarget
+/// an admitted session. Plain `Open` retains its legacy replace behavior;
+/// `OpenApp` is identity-bound and does not overwrite an existing session.
 pub fn apply_request(
     roster: &mut BTreeMap<SessionId, VdiSession>,
     req: SessionRequest,
@@ -287,6 +387,130 @@ pub fn apply_request(
             let session = open_session(id.clone(), serving_peer, vm_id, client_peer, now_ms);
             roster.insert(id, session);
             Ok(())
+        }
+        SessionRequest::OpenApp {
+            id,
+            serving_peer,
+            vm_id,
+            client_peer,
+            app_id,
+            catalog_revision,
+            guest_profile,
+            requested_capabilities,
+            resume,
+        } => {
+            let session = open_app_session(
+                id.clone(),
+                serving_peer,
+                vm_id,
+                client_peer,
+                app_id,
+                catalog_revision,
+                guest_profile,
+                requested_capabilities,
+                resume,
+                now_ms,
+            )
+            .map_err(SessionError::InvalidAppVm)?;
+            let Some(existing) = roster.get(&id).cloned() else {
+                roster.insert(id, session);
+                return Ok(());
+            };
+            let Some(existing_app) = existing.app.as_ref() else {
+                return Err(SessionError::ConflictingAppSession {
+                    id,
+                    reason: "session id is already owned by a non-App VM session",
+                });
+            };
+            let requested_app = session
+                .app
+                .as_ref()
+                .expect("open_app_session always carries an App VM declaration");
+            if existing.state.is_terminal() {
+                return Err(SessionError::ConflictingAppSession {
+                    id,
+                    reason: "the existing App VM session is closed; use a new session id",
+                });
+            }
+            if existing.vm_id != session.vm_id
+                || existing.serving_peer != session.serving_peer
+                || existing.client_peer != session.client_peer
+            {
+                return Err(SessionError::ConflictingAppSession {
+                    id,
+                    reason: "VM or serving/client peer changed",
+                });
+            }
+            if existing_app.session_id != requested_app.session_id
+                || existing_app.app_id != requested_app.app_id
+                || existing_app.guest_profile != requested_app.guest_profile
+            {
+                return Err(SessionError::ConflictingAppSession {
+                    id,
+                    reason: "app identity, guest profile, or session identity changed",
+                });
+            }
+            // A retry may refresh catalog/capability/resume intent, but it must
+            // retain the already observed VDI and guest lifecycle states. This
+            // is the key property that makes reconnect/retry converge on one
+            // guest instead of briefly advertising a false cold launch.
+            if existing_app != requested_app {
+                let mut refreshed = existing;
+                refreshed.app = session.app;
+                refreshed.updated_at_ms = now_ms;
+                roster.insert(id, refreshed);
+            }
+            Ok(())
+        }
+        SessionRequest::AppState {
+            id,
+            state,
+            reason,
+            generation,
+        } => {
+            transition(roster, &id, |session| {
+                // The VDI session identity is its lifetime boundary. Once that
+                // identity is closed, a delayed guest observation or replayed
+                // signed AppState action belongs to the retired incarnation and
+                // must not mutate its readiness, reason, or update timestamp.
+                if session.state.is_terminal() {
+                    return Err(SessionError::IllegalTransition {
+                        from: session.state,
+                        to: session.state,
+                    });
+                }
+                if session.app.is_none() {
+                    return Err(SessionError::IllegalTransition {
+                        from: session.state,
+                        to: session.state,
+                    });
+                }
+                let generation_is_stale = if generation == 0 {
+                    session.app_state_generation != 0
+                } else {
+                    generation <= session.app_state_generation
+                };
+                if generation_is_stale {
+                    return Err(SessionError::StaleAppState { generation });
+                }
+                let current = session
+                    .app_state
+                    .unwrap_or(AppVmLifecycleState::WaitingForPlacement);
+                if !current.can_transition_to(state) {
+                    return Err(SessionError::IllegalAppState {
+                        from: current,
+                        to: state,
+                    });
+                }
+                let mut next = session.clone();
+                next.app_state = Some(state);
+                next.app_state_reason = reason.map(|value| value.chars().take(255).collect());
+                if generation != 0 {
+                    next.app_state_generation = generation;
+                }
+                next.updated_at_ms = now_ms;
+                Ok(next)
+            })
         }
         SessionRequest::Active { id } => transition(roster, &id, |s| mark_active(s, now_ms)),
         SessionRequest::Disconnect { id } => {
@@ -1012,8 +1236,11 @@ fn read_new_actions(
 /// valid capability for one session/op from being retargeted semantically.
 fn session_auth_target(request: &SessionRequest) -> (&'static str, String) {
     match request {
-        SessionRequest::Open { id, .. } => ("vdi-session-open", format!("session:{id}")),
+        SessionRequest::Open { id, .. } | SessionRequest::OpenApp { id, .. } => {
+            ("vdi-session-open", format!("session:{id}"))
+        }
         SessionRequest::Active { id } => ("vdi-session-active", format!("session:{id}")),
+        SessionRequest::AppState { id, .. } => ("vdi-session-app-state", format!("session:{id}")),
         SessionRequest::Disconnect { id } => ("vdi-session-disconnect", format!("session:{id}")),
         SessionRequest::Close { id } => ("vdi-session-close", format!("session:{id}")),
     }
@@ -1047,12 +1274,180 @@ fn drain(
     cursor: &mut Option<String>,
     roster: &mut BTreeMap<SessionId, VdiSession>,
     authorizer: &ActionAuthorizer,
-) {
+) -> Vec<SessionRequest> {
+    let mut requests = Vec::new();
     for req in read_new_actions(bus_root, cursor, authorizer) {
-        if let Err(e) = apply_request(roster, req, now_ms()) {
+        if let Err(e) = apply_request(roster, req.clone(), now_ms()) {
             tracing::warn!(error = %e, "session_broker: dropping unresolvable session op");
+        } else {
+            requests.push(req);
         }
     }
+    requests
+}
+
+/// Read guest runtime observations from the replicated state topic. Malformed,
+/// oversized, or invalid records advance the cursor but never reach the session
+/// roster. Identity matching happens separately against the admitted session.
+fn read_runtime_evidence(
+    bus_root: &Path,
+    cursor: &mut Option<String>,
+) -> Vec<AppVmRuntimeEvidence> {
+    let Ok(persist) = Persist::open(bus_root.to_path_buf()) else {
+        return Vec::new();
+    };
+    let Ok(messages) = persist.list_since(APP_VM_RUNTIME_TOPIC, cursor.as_deref()) else {
+        return Vec::new();
+    };
+    let mut evidence = Vec::new();
+    for message in messages {
+        *cursor = Some(message.ulid);
+        let Some(body) = message.body.as_deref() else {
+            continue;
+        };
+        if !crate::ipc::body_within_cap(Some(body)) {
+            tracing::warn!("session_broker: oversized App VM runtime evidence refused");
+            continue;
+        }
+        let Ok(record) = serde_json::from_str::<AppVmRuntimeEvidence>(body) else {
+            tracing::warn!("session_broker: malformed App VM runtime evidence refused");
+            continue;
+        };
+        if let Err(error) = record.validate() {
+            tracing::warn!(%error, "session_broker: invalid App VM runtime evidence refused");
+            continue;
+        }
+        evidence.push(record);
+    }
+    evidence
+}
+
+/// Apply one validated guest observation only when it identifies the exact
+/// admitted session hosted by this serving node. The signed action publication
+/// keeps the shell's public lifecycle rail and the daemon roster on one wire.
+fn apply_runtime_evidence(
+    roster: &mut BTreeMap<SessionId, VdiSession>,
+    evidence: AppVmRuntimeEvidence,
+    node_id: &str,
+    bus_root: &Path,
+    signer: Option<&CloudArmSigner>,
+) {
+    let Some(session) = roster.get(&evidence.session_id) else {
+        return;
+    };
+    let Some(app) = session.app.as_ref() else {
+        return;
+    };
+    if session.serving_peer != node_id
+        || app.session_id != evidence.session_id
+        || app.app_id != evidence.app_id
+        || session.vm_id != evidence.vm_id
+    {
+        tracing::warn!(
+            session = %evidence.session_id,
+            "session_broker: App VM runtime evidence identity mismatch refused"
+        );
+        return;
+    }
+    let state = evidence.state.lifecycle_state();
+    let request = SessionRequest::AppState {
+        id: evidence.session_id.clone(),
+        generation: evidence.generation,
+        state,
+        reason: evidence.reason.clone(),
+    };
+    let Some(signer) = signer else {
+        tracing::debug!(session = %evidence.session_id, "session_broker: runtime evidence waiting for action signer");
+        return;
+    };
+    let mut candidate = roster.clone();
+    if let Err(error) = apply_request(&mut candidate, request, now_ms()) {
+        tracing::warn!(session = %evidence.session_id, %error, "session_broker: runtime readiness transition refused");
+        return;
+    }
+    if let Err(error) = publish_app_state(
+        bus_root,
+        signer,
+        &evidence.session_id,
+        evidence.generation,
+        state,
+        evidence.reason.as_deref(),
+    ) {
+        tracing::debug!(session = %evidence.session_id, %error, "session_broker: runtime readiness publication deferred");
+        return;
+    }
+    *roster = candidate;
+}
+
+/// Build the daemon-authenticated readiness event that follows an App VM open.
+/// The exact body is HMAC-bound before the token is inserted, matching the
+/// shell's `action/vdi/session` producer contract.
+fn signed_app_state_body(
+    signer: &CloudArmSigner,
+    id: &str,
+    generation: u64,
+    state: AppVmLifecycleState,
+    reason: Option<&str>,
+) -> Result<String, String> {
+    let request = SessionRequest::AppState {
+        id: id.to_owned(),
+        generation,
+        state,
+        reason: reason.map(str::to_owned),
+    };
+    let mut document: serde_json::Value = serde_json::from_str(&request.to_body())
+        .map_err(|error| format!("serialize app readiness request: {error}"))?;
+    document
+        .as_object_mut()
+        .ok_or_else(|| "app readiness request is not a JSON object".to_string())?
+        .insert(
+            "schema_version".to_string(),
+            serde_json::Value::from(CLOUD_ACTION_SCHEMA_VERSION),
+        );
+    let unsigned = document.to_string();
+    let digest = cloud_request_digest(&unsigned).map_err(str::to_string)?;
+    let nonce = uuid::Uuid::new_v4().to_string();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "system clock is before the Unix epoch".to_string())
+        .and_then(|duration| {
+            i64::try_from(duration.as_millis())
+                .map_err(|_| "system clock is beyond the capability range".to_string())
+        })?;
+    let token = CloudArmedToken::mint(
+        signer,
+        &nonce,
+        now.saturating_add(30_000),
+        "vdi-session-app-state",
+        "vdi-session",
+        &format!("session:{id}"),
+        &digest,
+    )
+    .encode();
+    document
+        .as_object_mut()
+        .ok_or_else(|| "app readiness request is not a JSON object".to_string())?
+        .insert("armed_token".to_string(), serde_json::Value::String(token));
+    Ok(document.to_string())
+}
+
+/// Publish one daemon-owned app readiness event. A missing Bus or signer is an
+/// honest no-op; the caller retries while the session remains at the initial
+/// waiting state.
+fn publish_app_state(
+    bus_root: &Path,
+    signer: &CloudArmSigner,
+    id: &str,
+    generation: u64,
+    state: AppVmLifecycleState,
+    reason: Option<&str>,
+) -> Result<(), String> {
+    let body = signed_app_state_body(signer, id, generation, state, reason)?;
+    Persist::open(bus_root.to_path_buf())
+        .map_err(|error| format!("open session Bus: {error}"))?
+        .write(ACTION_TOPIC, Priority::Default, None, Some(&body))
+        .map(|_| ())
+        .map_err(|error| format!("publish app readiness: {error}"))
 }
 
 fn default_bus_root() -> Option<PathBuf> {
@@ -1079,6 +1474,8 @@ pub struct SessionBrokerWorker {
     /// Exact-body capability verifier for the privileged session-action lane.
     /// Missing production credentials install a fail-closed verifier.
     authorizer: Arc<ActionAuthorizer>,
+    /// Root-only signer used for daemon-authored readiness transitions.
+    app_state_signer: Option<CloudArmSigner>,
     /// Bus root override (tests). `None` ⇒ [`default_bus_root`].
     bus_root_override: Option<PathBuf>,
 }
@@ -1098,6 +1495,7 @@ impl SessionBrokerWorker {
             leader_lock,
             poll: DEFAULT_POLL_INTERVAL,
             authorizer: Arc::new(ActionAuthorizer::production()),
+            app_state_signer: crate::ipc::action_auth::production_action_signer().ok(),
             bus_root_override: None,
         }
     }
@@ -1212,6 +1610,7 @@ impl Worker for SessionBrokerWorker {
         // past the backlog): a session's state is a fold of the whole log, so a
         // (re)start must rebuild the complete roster before it converges.
         let mut cursor: Option<String> = None;
+        let mut runtime_cursor: Option<String> = None;
         let mut roster: BTreeMap<SessionId, VdiSession> = BTreeMap::new();
         let mut tick = tokio::time::interval(self.poll);
         tick.tick().await; // consume the immediate first tick
@@ -1219,7 +1618,34 @@ impl Worker for SessionBrokerWorker {
             tokio::select! {
                 _ = tick.tick() => {
                     // Fold the whole session log into the roster, then converge.
-                    drain(&bus_root, &mut cursor, &mut roster, self.authorizer.as_ref());
+                    let _ = drain(&bus_root, &mut cursor, &mut roster, self.authorizer.as_ref());
+                    if let Some(signer) = self.app_state_signer.as_ref() {
+                        for session in roster.values().filter(|session| {
+                            session.app.is_some()
+                                && session.serving_peer == self.node_id
+                                && session.app_state == Some(AppVmLifecycleState::WaitingForPlacement)
+                        }) {
+                            if let Err(error) = publish_app_state(
+                                &bus_root,
+                                signer,
+                                &session.id,
+                                session.app_state_generation.saturating_add(1),
+                                AppVmLifecycleState::StartingGuest,
+                                Some("App VM declaration admitted; waiting for guest boot evidence"),
+                            ) {
+                                tracing::debug!(session = %session.id, %error, "session_broker: app readiness publication deferred");
+                            }
+                        }
+                    }
+                    for evidence in read_runtime_evidence(&bus_root, &mut runtime_cursor) {
+                        apply_runtime_evidence(
+                            &mut roster,
+                            evidence,
+                            &self.node_id,
+                            &bus_root,
+                            self.app_state_signer.as_ref(),
+                        );
+                    }
                     self.converge(&mut roster);
                 }
                 () = shutdown.wait() => break,
@@ -1247,6 +1673,10 @@ mod tests {
             state,
             opened_at_ms: 100,
             updated_at_ms: 100,
+            app: None,
+            app_state: None,
+            app_state_reason: None,
+            app_state_generation: 0,
         }
     }
 
@@ -1388,6 +1818,380 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn apply_request_opens_validated_app_vm_session() {
+        let mut roster = BTreeMap::new();
+        apply_request(
+            &mut roster,
+            SessionRequest::OpenApp {
+                id: "app-s".into(),
+                serving_peer: "peer:host".into(),
+                vm_id: "app-vm".into(),
+                client_peer: "peer:seat".into(),
+                app_id: "org.example.Editor".into(),
+                catalog_revision: "catalog-1".into(),
+                guest_profile: "wayland-standard".into(),
+                requested_capabilities: vec!["audio".into()],
+                resume: true,
+            },
+            42,
+        )
+        .expect("valid App VM open");
+        let session = &roster["app-s"];
+        assert_eq!(session.vm_id, "app-vm");
+        assert_eq!(
+            session.app.as_ref().map(|app| app.app_id.as_str()),
+            Some("org.example.Editor")
+        );
+        assert!(session.app.as_ref().is_some_and(|app| app.resume));
+    }
+
+    #[test]
+    fn repeated_app_open_preserves_guest_readiness_and_refreshes_intent() {
+        let mut roster = BTreeMap::new();
+        let open = |catalog_revision: &str, resume: bool| SessionRequest::OpenApp {
+            id: "app-s".into(),
+            serving_peer: "peer:host".into(),
+            vm_id: "app-vm".into(),
+            client_peer: "peer:seat".into(),
+            app_id: "org.example.Editor".into(),
+            catalog_revision: catalog_revision.into(),
+            guest_profile: "wayland-standard".into(),
+            requested_capabilities: vec!["audio".into()],
+            resume,
+        };
+        apply_request(&mut roster, open("catalog-1", false), 42).expect("initial open");
+        apply_request(
+            &mut roster,
+            SessionRequest::AppState {
+                id: "app-s".into(),
+                generation: 0,
+                state: AppVmLifecycleState::Installing,
+                reason: Some("image admitted".into()),
+            },
+            43,
+        )
+        .expect("installing");
+        apply_request(
+            &mut roster,
+            SessionRequest::AppState {
+                id: "app-s".into(),
+                generation: 0,
+                state: AppVmLifecycleState::StartingGuest,
+                reason: None,
+            },
+            43,
+        )
+        .expect("guest boot");
+        apply_request(
+            &mut roster,
+            SessionRequest::AppState {
+                id: "app-s".into(),
+                generation: 0,
+                state: AppVmLifecycleState::StartingApp,
+                reason: Some("compositor ready".into()),
+            },
+            43,
+        )
+        .expect("app start");
+
+        apply_request(&mut roster, open("catalog-2", true), 44).expect("idempotent retry");
+        let session = &roster["app-s"];
+        assert_eq!(session.state, SessionState::Requested);
+        assert_eq!(session.app_state, Some(AppVmLifecycleState::StartingApp));
+        assert_eq!(session.app_state_reason.as_deref(), Some("compositor ready"));
+        assert_eq!(session.updated_at_ms, 44);
+        let app = session.app.as_ref().expect("app declaration");
+        assert_eq!(app.catalog_revision, "catalog-2");
+        assert!(app.resume, "retry carries the new resume intent");
+    }
+
+    #[test]
+    fn app_open_retarget_is_rejected_without_mutating_the_admitted_session() {
+        let mut roster = BTreeMap::new();
+        let initial = SessionRequest::OpenApp {
+            id: "app-s".into(),
+            serving_peer: "peer:host".into(),
+            vm_id: "app-vm".into(),
+            client_peer: "peer:seat".into(),
+            app_id: "org.example.Editor".into(),
+            catalog_revision: "catalog-1".into(),
+            guest_profile: "wayland-standard".into(),
+            requested_capabilities: Vec::new(),
+            resume: true,
+        };
+        apply_request(&mut roster, initial, 42).expect("initial open");
+        apply_request(
+            &mut roster,
+            SessionRequest::AppState {
+                id: "app-s".into(),
+                generation: 0,
+                state: AppVmLifecycleState::Installing,
+                reason: None,
+            },
+            43,
+        )
+        .expect("installing");
+        let before = roster.clone();
+
+        let result = apply_request(
+            &mut roster,
+            SessionRequest::OpenApp {
+                id: "app-s".into(),
+                serving_peer: "peer:other-host".into(),
+                vm_id: "other-vm".into(),
+                client_peer: "peer:seat".into(),
+                app_id: "org.example.Editor".into(),
+                catalog_revision: "catalog-1".into(),
+                guest_profile: "wayland-standard".into(),
+                requested_capabilities: Vec::new(),
+                resume: true,
+            },
+            44,
+        );
+        assert_eq!(
+            result,
+            Err(SessionError::ConflictingAppSession {
+                id: "app-s".into(),
+                reason: "VM or serving/client peer changed",
+            })
+        );
+        assert_eq!(roster, before, "replay rejection is atomic");
+    }
+
+    #[test]
+    fn closed_app_session_cannot_be_resurrected_by_a_replay() {
+        let mut roster = BTreeMap::new();
+        let request = SessionRequest::OpenApp {
+            id: "app-s".into(),
+            serving_peer: "peer:host".into(),
+            vm_id: "app-vm".into(),
+            client_peer: "peer:seat".into(),
+            app_id: "org.example.Editor".into(),
+            catalog_revision: "catalog-1".into(),
+            guest_profile: "wayland-standard".into(),
+            requested_capabilities: Vec::new(),
+            resume: true,
+        };
+        apply_request(&mut roster, request.clone(), 42).expect("initial open");
+        apply_request(
+            &mut roster,
+            SessionRequest::Close { id: "app-s".into() },
+            43,
+        )
+        .expect("close");
+        let result = apply_request(&mut roster, request, 44);
+        assert!(matches!(
+            result,
+            Err(SessionError::ConflictingAppSession { reason, .. })
+                if reason.contains("closed")
+        ));
+        assert_eq!(roster["app-s"].state, SessionState::Closed);
+    }
+
+    #[test]
+    fn apply_request_rejects_invalid_app_vm_before_roster_mutation() {
+        let mut roster = BTreeMap::new();
+        let result = apply_request(
+            &mut roster,
+            SessionRequest::OpenApp {
+                id: "app-s".into(),
+                serving_peer: "peer:host".into(),
+                vm_id: "app-vm".into(),
+                client_peer: "peer:seat".into(),
+                app_id: "org.example.Editor".into(),
+                catalog_revision: "catalog-1".into(),
+                guest_profile: "/tmp/image".into(),
+                requested_capabilities: Vec::new(),
+                resume: false,
+            },
+            42,
+        );
+        assert!(matches!(result, Err(SessionError::InvalidAppVm(_))));
+        assert!(roster.is_empty());
+    }
+
+    #[test]
+    fn app_state_rejects_false_jump_and_accepts_idempotent_retry() {
+        let mut roster = BTreeMap::new();
+        apply_request(
+            &mut roster,
+            SessionRequest::OpenApp {
+                id: "app-s".into(),
+                serving_peer: "peer:host".into(),
+                vm_id: "app-vm".into(),
+                client_peer: "peer:seat".into(),
+                app_id: "org.example.Editor".into(),
+                catalog_revision: "catalog-1".into(),
+                guest_profile: "wayland-standard".into(),
+                requested_capabilities: Vec::new(),
+                resume: false,
+            },
+            42,
+        )
+        .expect("open app");
+
+        assert!(matches!(
+            apply_request(
+                &mut roster,
+                SessionRequest::AppState {
+                    id: "app-s".into(),
+                    generation: 0,
+                    state: AppVmLifecycleState::Connected,
+                    reason: None,
+                },
+                43,
+            ),
+            Err(SessionError::IllegalAppState {
+                from: AppVmLifecycleState::WaitingForPlacement,
+                to: AppVmLifecycleState::Connected,
+            })
+        ));
+        apply_request(
+            &mut roster,
+            SessionRequest::AppState {
+                id: "app-s".into(),
+                generation: 0,
+                state: AppVmLifecycleState::Installing,
+                reason: Some("image admission pending".into()),
+            },
+            44,
+        )
+        .expect("installing is a legal first transition");
+        apply_request(
+            &mut roster,
+            SessionRequest::AppState {
+                id: "app-s".into(),
+                generation: 0,
+                state: AppVmLifecycleState::Installing,
+                reason: Some("retrying image admission".into()),
+            },
+            45,
+        )
+        .expect("same state is an idempotent retry");
+        assert_eq!(
+            roster["app-s"].app_state,
+            Some(AppVmLifecycleState::Installing)
+        );
+    }
+
+    #[test]
+    fn closed_app_session_rejects_stale_app_state_without_mutation() {
+        let mut roster = BTreeMap::new();
+        apply_request(
+            &mut roster,
+            SessionRequest::OpenApp {
+                id: "app-s".into(),
+                serving_peer: "peer:host".into(),
+                vm_id: "app-vm".into(),
+                client_peer: "peer:seat".into(),
+                app_id: "org.example.Editor".into(),
+                catalog_revision: "catalog-1".into(),
+                guest_profile: "wayland-standard".into(),
+                requested_capabilities: Vec::new(),
+                resume: false,
+            },
+            42,
+        )
+        .expect("open app");
+        apply_request(
+            &mut roster,
+            SessionRequest::AppState {
+                id: "app-s".into(),
+                generation: 0,
+                state: AppVmLifecycleState::Installing,
+                reason: Some("admitted before close".into()),
+            },
+            43,
+        )
+        .expect("installing");
+        apply_request(
+            &mut roster,
+            SessionRequest::Close { id: "app-s".into() },
+            44,
+        )
+        .expect("close");
+        let before = roster.clone();
+
+        let result = apply_request(
+            &mut roster,
+            SessionRequest::AppState {
+                id: "app-s".into(),
+                generation: 0,
+                state: AppVmLifecycleState::Installing,
+                reason: Some("stale retry after close".into()),
+            },
+            45,
+        );
+
+        assert_eq!(
+            result,
+            Err(SessionError::IllegalTransition {
+                from: SessionState::Closed,
+                to: SessionState::Closed,
+            })
+        );
+        assert_eq!(roster, before, "stale AppState rejection is atomic");
+    }
+
+    #[test]
+    fn app_state_rejects_replayed_generation_without_mutation() {
+        let mut roster = BTreeMap::new();
+        apply_request(
+            &mut roster,
+            SessionRequest::OpenApp {
+                id: "app-s".into(),
+                serving_peer: "peer:host".into(),
+                vm_id: "app-vm".into(),
+                client_peer: "peer:seat".into(),
+                app_id: "org.example.Editor".into(),
+                catalog_revision: "catalog-1".into(),
+                guest_profile: "wayland-standard".into(),
+                requested_capabilities: Vec::new(),
+                resume: false,
+            },
+            42,
+        )
+        .expect("open app");
+        apply_request(
+            &mut roster,
+            SessionRequest::AppState {
+                id: "app-s".into(),
+                generation: 1,
+                state: AppVmLifecycleState::Installing,
+                reason: Some("image admitted".into()),
+            },
+            43,
+        )
+        .expect("generation one");
+        apply_request(
+            &mut roster,
+            SessionRequest::AppState {
+                id: "app-s".into(),
+                generation: 2,
+                state: AppVmLifecycleState::StartingGuest,
+                reason: Some("guest boot".into()),
+            },
+            44,
+        )
+        .expect("generation two");
+        let before = roster.clone();
+
+        let result = apply_request(
+            &mut roster,
+            SessionRequest::AppState {
+                id: "app-s".into(),
+                generation: 1,
+                state: AppVmLifecycleState::StartingGuest,
+                reason: Some("replayed guest boot".into()),
+            },
+            45,
+        );
+
+        assert_eq!(result, Err(SessionError::StaleAppState { generation: 1 }));
+        assert_eq!(roster, before, "generation rejection is atomic");
+    }
+
     // ── reconcile (leader convergence) ──
 
     #[test]
@@ -1496,6 +2300,219 @@ mod tests {
         );
         assert!(parse_request("nonsense").is_err());
         assert!(parse_request(r#"{"op":"teleport","id":"s1"}"#).is_err());
+    }
+
+    #[test]
+    fn daemon_app_readiness_body_is_signed_for_the_exact_session() {
+        let signer = CloudArmSigner::new(b"session-broker-test-key".to_vec()).unwrap();
+        let body = signed_app_state_body(
+            &signer,
+            "app-s1",
+            1,
+            AppVmLifecycleState::StartingGuest,
+            Some("guest boot pending"),
+        )
+        .expect("signed readiness body");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(value["op"], "app_state");
+        assert_eq!(value["id"], "app-s1");
+        assert_eq!(value["state"], "starting_guest");
+        assert_eq!(value["schema_version"], CLOUD_ACTION_SCHEMA_VERSION);
+        let token = value["armed_token"].as_str().expect("armed token");
+        let parsed = CloudArmedToken::parse(token).expect("token shape");
+        assert_eq!(parsed.verb, "vdi-session-app-state");
+        assert_eq!(parsed.node, "vdi-session");
+        assert_eq!(parsed.target, "session:app-s1");
+        let unsigned = serde_json::json!({
+            "op": "app_state",
+            "id": "app-s1",
+            "generation": 1,
+            "state": "starting_guest",
+            "reason": "guest boot pending",
+            "schema_version": CLOUD_ACTION_SCHEMA_VERSION,
+        })
+        .to_string();
+        assert_eq!(
+            parsed.request_sha256,
+            cloud_request_digest(&unsigned).expect("digest")
+        );
+        assert!(signer.verify_payload(&parsed.signing_payload(), &parsed.signature));
+    }
+
+    #[test]
+    fn guest_runtime_evidence_advances_only_the_matching_session() {
+        let bus = tempfile::tempdir().expect("runtime bus");
+        let signer = CloudArmSigner::new(b"runtime-evidence-test-key".to_vec()).unwrap();
+        let mut roster = BTreeMap::new();
+        apply_request(
+            &mut roster,
+            SessionRequest::OpenApp {
+                id: "app-s1".into(),
+                serving_peer: "node-a".into(),
+                vm_id: "app-vm-1".into(),
+                client_peer: "seat-a".into(),
+                app_id: "org.example.Editor".into(),
+                catalog_revision: "catalog-1".into(),
+                guest_profile: "wayland-standard".into(),
+                requested_capabilities: Vec::new(),
+                resume: false,
+            },
+            1,
+        )
+        .expect("open app");
+        apply_request(
+            &mut roster,
+            SessionRequest::AppState {
+                id: "app-s1".into(),
+                generation: 0,
+                state: AppVmLifecycleState::StartingGuest,
+                reason: None,
+            },
+            2,
+        )
+        .expect("guest starts");
+
+        apply_runtime_evidence(
+            &mut roster,
+            AppVmRuntimeEvidence {
+                session_id: "app-s1".into(),
+                vm_id: "app-vm-1".into(),
+                app_id: "org.example.Editor".into(),
+                generation: 1,
+                state: mackes_mesh_types::vdi_session::AppVmRuntimeState::StartingApp,
+                reason: Some("portal ready".into()),
+            },
+            "node-a",
+            bus.path(),
+            Some(&signer),
+        );
+        assert_eq!(
+            roster["app-s1"].app_state,
+            Some(AppVmLifecycleState::StartingApp)
+        );
+        let actions = Persist::open(bus.path().to_path_buf())
+            .expect("open action bus")
+            .list_since(ACTION_TOPIC, None)
+            .expect("read actions");
+        assert_eq!(actions.len(), 1);
+        assert!(actions[0]
+            .body
+            .as_deref()
+            .is_some_and(|body| body.contains("starting_app") && body.contains("armed_token")));
+
+        apply_runtime_evidence(
+            &mut roster,
+            AppVmRuntimeEvidence {
+                session_id: "app-s1".into(),
+                vm_id: "other-vm".into(),
+                app_id: "org.example.Editor".into(),
+                generation: 2,
+                state: mackes_mesh_types::vdi_session::AppVmRuntimeState::Connected,
+                reason: None,
+            },
+            "node-a",
+            bus.path(),
+            Some(&signer),
+        );
+        assert_eq!(
+            roster["app-s1"].app_state,
+            Some(AppVmLifecycleState::StartingApp),
+            "mismatched guest identity cannot advance the session"
+        );
+    }
+
+    #[test]
+    fn guest_crash_is_recorded_but_illegal_runtime_recovery_is_atomic() {
+        let bus = tempfile::tempdir().expect("runtime bus");
+        let signer = CloudArmSigner::new(b"runtime-crash-test-key".to_vec()).unwrap();
+        let mut roster = BTreeMap::new();
+        apply_request(
+            &mut roster,
+            SessionRequest::OpenApp {
+                id: "app-crash".into(),
+                serving_peer: "node-a".into(),
+                vm_id: "app-vm-crash".into(),
+                client_peer: "seat-a".into(),
+                app_id: "org.example.Editor".into(),
+                catalog_revision: "catalog-1".into(),
+                guest_profile: "wayland-standard".into(),
+                requested_capabilities: Vec::new(),
+                resume: false,
+            },
+            1,
+        )
+        .expect("open app");
+        for state in [
+            AppVmLifecycleState::StartingGuest,
+            AppVmLifecycleState::StartingApp,
+            AppVmLifecycleState::Connected,
+        ] {
+            apply_request(
+                &mut roster,
+                SessionRequest::AppState {
+                    id: "app-crash".into(),
+                    generation: 0,
+                    state,
+                    reason: None,
+                },
+                2,
+            )
+            .expect("valid readiness transition");
+        }
+
+        apply_runtime_evidence(
+            &mut roster,
+            AppVmRuntimeEvidence {
+                session_id: "app-crash".into(),
+                vm_id: "app-vm-crash".into(),
+                app_id: "org.example.Editor".into(),
+                generation: 1,
+                state: mackes_mesh_types::vdi_session::AppVmRuntimeState::Failed,
+                reason: Some("guest app process exited".into()),
+            },
+            "node-a",
+            bus.path(),
+            Some(&signer),
+        );
+        assert_eq!(
+            roster["app-crash"].app_state,
+            Some(AppVmLifecycleState::Failed),
+            "a connected guest process crash must enter the explicit failed state"
+        );
+        assert_eq!(
+            roster["app-crash"].app_state_reason.as_deref(),
+            Some("guest app process exited")
+        );
+        let actions_before_recovery = Persist::open(bus.path().to_path_buf())
+            .expect("open action bus")
+            .list_since(ACTION_TOPIC, None)
+            .expect("read crash action");
+        assert_eq!(actions_before_recovery.len(), 1);
+        let roster_before_recovery = roster.clone();
+
+        // A stale guest report cannot jump directly from Failed to Connected.
+        // The candidate fold and signed publication must both be absent, so a
+        // malformed recovery report cannot mutate either local or shared state.
+        apply_runtime_evidence(
+            &mut roster,
+            AppVmRuntimeEvidence {
+                session_id: "app-crash".into(),
+                vm_id: "app-vm-crash".into(),
+                app_id: "org.example.Editor".into(),
+                generation: 1,
+                state: mackes_mesh_types::vdi_session::AppVmRuntimeState::Connected,
+                reason: Some("stale connected report".into()),
+            },
+            "node-a",
+            bus.path(),
+            Some(&signer),
+        );
+        assert_eq!(roster, roster_before_recovery);
+        let actions_after_recovery = Persist::open(bus.path().to_path_buf())
+            .expect("reopen action bus")
+            .list_since(ACTION_TOPIC, None)
+            .expect("read action bus after rejected recovery");
+        assert_eq!(actions_after_recovery, actions_before_recovery);
     }
 
     #[test]

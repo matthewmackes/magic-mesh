@@ -24,6 +24,7 @@ use crate::card::probe::{
     host_card, host_facts, service_card, service_facts, HostFacts, HostSource, ServiceFacts,
 };
 use crate::card::Card;
+use crate::mesh_media::AIRSONIC_PORT;
 
 /// Curated port set both profiles scan. Union of the media ports the
 /// EPIC-SYNC-APP-CONFIG discovery needs (Airsonic 4040, Jellyfin
@@ -171,10 +172,19 @@ pub fn parse_nmap_xml(xml: &str, source: HostSource, now_ts: u64) -> Vec<Card> {
                 continue;
             };
             let svc = port.children().find(|n| n.has_tag_name("service"));
-            let service_kind = svc
+            let detected_service_kind = svc
                 .and_then(|s| s.attribute("name"))
                 .unwrap_or("")
                 .to_owned();
+            // Nmap fingerprints the Subsonic/Airsonic port as the unrelated
+            // historical `yo-main` service on some hosts. The platform owns
+            // 4040 as its Airsonic discovery port, so preserve that canonical
+            // identity for filters and media consumers.
+            let service_kind = if portid == AIRSONIC_PORT {
+                "airsonic".to_owned()
+            } else {
+                detected_service_kind
+            };
             let product = svc
                 .and_then(|s| s.attribute("product"))
                 .unwrap_or("")
@@ -286,6 +296,31 @@ pub fn scan(
         );
     }
     cards
+}
+
+/// Backfill a deep probe host that timed out during service identification with
+/// the matching fast probe's open-port cards. `-sV --version-all` can spend an
+/// entire host budget fingerprinting one service (the Subsonic server is a
+/// real-world example), while the curated fast scan still knows which ports
+/// are open. Keep successful deep metadata authoritative; only fill an empty
+/// service list so a reachable service does not disappear from the platform.
+fn backfill_empty_deep_services(deep_cards: &mut [Card], fast_cards: &[Card]) {
+    for deep_host in deep_cards {
+        if !deep_host.children.is_empty() {
+            continue;
+        }
+        let Some(deep_facts) = host_facts(deep_host) else {
+            continue;
+        };
+        let Some(fast_host) = fast_cards.iter().find(|fast_host| {
+            host_facts(fast_host).is_some_and(|fast_facts| fast_facts.ip == deep_facts.ip)
+        }) else {
+            continue;
+        };
+        if !fast_host.children.is_empty() {
+            deep_host.children.clone_from(&fast_host.children);
+        }
+    }
 }
 
 // ── Probe cycle orchestration (MESH-PROBE-4) ─────────────────────────
@@ -848,7 +883,7 @@ pub fn run_probe_cycle_with(
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let profile = if deep { Profile::Deep } else { Profile::Fast };
-    let cards = scan(
+    let mut cards = scan(
         binary,
         profile,
         &targets.targets,
@@ -857,6 +892,18 @@ pub fn run_probe_cycle_with(
         HostSource::Mesh,
         now,
     );
+    if deep {
+        let fast_cards = scan(
+            binary,
+            Profile::Fast,
+            &targets.targets,
+            &targets.excludes,
+            nse_dir,
+            HostSource::Mesh,
+            now,
+        );
+        backfill_empty_deep_services(&mut cards, &fast_cards);
+    }
     let payload = serialize_inventory(&cards);
     let path = inventory_path(workgroup_root, self_node_id);
     if write_inventory_if_changed(&path, &payload) {
@@ -1021,6 +1068,51 @@ mod tests {
         assert_eq!(svc.service_kind, "http");
         assert_eq!(svc.product, "Jellyfin");
         assert_eq!(svc.version, "10.9");
+    }
+
+    #[test]
+    fn parse_normalizes_the_subsonic_port_when_nmap_reports_yo_main() {
+        let cards = parse_nmap_xml(NMAP_XML, HostSource::Lan, 1);
+        let svc = cards[0]
+            .children
+            .iter()
+            .find_map(|card| service_facts(card).filter(|facts| facts.port == AIRSONIC_PORT))
+            .expect("open Subsonic port");
+        assert_eq!(svc.service_kind, "airsonic");
+    }
+
+    #[test]
+    fn deep_timeout_backfills_open_ports_from_the_fast_probe() {
+        let facts = HostFacts {
+            ip: "172.20.0.2".into(),
+            hostname: String::new(),
+            source: HostSource::Lan,
+            trust_state: String::new(),
+            last_seen: 1,
+        };
+        let mut deep = vec![host_card(&facts, vec![], 1)];
+        let fast = vec![host_card(
+            &facts,
+            vec![service_card(
+                &ServiceFacts {
+                    port: AIRSONIC_PORT,
+                    service_kind: "airsonic".into(),
+                    product: String::new(),
+                    version: String::new(),
+                    fingerprint: String::new(),
+                },
+                1,
+            )],
+            1,
+        )];
+
+        backfill_empty_deep_services(&mut deep, &fast);
+
+        assert_eq!(deep[0].children.len(), 1);
+        assert_eq!(
+            service_facts(&deep[0].children[0]).map(|service| service.service_kind),
+            Some("airsonic".into())
+        );
     }
 
     #[test]

@@ -57,7 +57,7 @@ use mde_egui::egui::{
     ScrollArea, Sense, Stroke, StrokeKind, Ui, UiBuilder, Vec2,
 };
 use mde_egui::nav_chrome::{Toolbar, ToolbarItem};
-use mde_egui::Style;
+use mde_egui::{DenseList, Style, WorkspaceState, WorkspaceStatePanel};
 
 use crate::mesh_tmux::MeshControlChannel;
 use crate::remote::PtyBus;
@@ -1170,26 +1170,15 @@ fn render_tree(
 /// The honest "no tmux session" state — a single start affordance (the opt-in
 /// attach), plus the last channel's exit reason if it just detached/died (§7).
 fn no_session(ui: &mut Ui, controller: Option<&TmuxController>, intents: &mut Vec<TmuxIntent>) {
-    ui.add_space(Style::SP_S);
-    ui.label(
-        RichText::new("No tmux session")
-            .size(Style::BODY)
-            .color(Style::TEXT_DIM),
-    );
-    if let Some(Status::Exited(reason)) = controller.map(TmuxController::status) {
-        if !reason.is_empty() {
-            ui.add_space(Style::SP_XS);
-            ui.label(
-                RichText::new(reason.as_str())
-                    .size(Style::SMALL)
-                    .color(Style::TEXT_DIM),
-            );
+    let detail = match controller.map(TmuxController::status) {
+        Some(Status::Exited(reason)) if !reason.is_empty() => reason.as_str(),
+        _ => "Attach a tmux session to begin working.",
+    };
+    WorkspaceStatePanel::new(WorkspaceState::Empty, "No tmux session", detail).show(ui, |ui| {
+        if ui.button("New tmux session").clicked() {
+            intents.push(TmuxIntent::StartClient);
         }
-    }
-    ui.add_space(Style::SP_S);
-    if ui.button("New tmux session").clicked() {
-        intents.push(TmuxIntent::StartClient);
-    }
+    });
 }
 
 /// The current session header (with the inline rename + kill) and its windows.
@@ -2340,12 +2329,17 @@ fn render_palette(ui: &Ui, model: &TmuxModel, state: &mut ChromeUi, intents: &mu
             ScrollArea::vertical()
                 .max_height(Style::SP_XL * 8.0)
                 .show(ui, |ui| {
+                    let mut list = DenseList::new();
                     for (row, &idx) in filtered.iter().enumerate() {
                         let (label, op) = PALETTE_COMMANDS[idx];
-                        let resp = ui.selectable_label(
-                            row == state.palette.sel,
-                            RichText::new(label).size(Style::SMALL),
-                        );
+                        let resp = list
+                            .row(ui, |ui| {
+                                ui.selectable_label(
+                                    row == state.palette.sel,
+                                    RichText::new(label).size(Style::SMALL),
+                                )
+                            })
+                            .inner;
                         if resp.clicked() {
                             chosen = Some(op);
                         }
@@ -2605,7 +2599,7 @@ fn render_template_editor(ui: &Ui, edit: &mut TemplateEdit) -> Option<EditorActi
                 .max_height(Style::SP_XL * 9.0)
                 .show(ui, |ui| {
                     for (wi, window) in edit.windows.iter_mut().enumerate() {
-                        ui.group(|ui| {
+                        mde_egui::card().show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 ui.label(
                                     RichText::new(format!("Window {}", wi + 1))

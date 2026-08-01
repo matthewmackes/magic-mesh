@@ -316,6 +316,14 @@ impl std::fmt::Debug for DocumentsState {
 }
 
 impl DocumentsState {
+    /// Prepare both embedded editor routes for a direct Editor launch. The
+    /// Project editor and the one-pane document editor retain their documents,
+    /// but optional sidebars never steal the initial canvas width.
+    pub(crate) fn prepare_direct_entry(&mut self) {
+        self.editor.collapse_sidebars();
+        self.project_editor.collapse_sidebars();
+    }
+
     /// Reset the picked-document state on a space switch — the active document is a
     /// per-space intent. The next Document-mode render re-seeds a blank buffer or
     /// loads the newly-picked document; the editor content is replaced on load, so
@@ -352,13 +360,9 @@ impl CommunicationsSurface {
             return;
         };
 
-        egui::TopBottomPanel::top(ui.id().with("collab-doc-strip"))
-            .frame(frame::bar_frame())
-            .show_inside(ui, |ui| self.documents_strip(ui, data, sink, space));
+        frame::bar_frame().show(ui, |ui| self.documents_strip(ui, data, sink, space));
 
-        egui::CentralPanel::default()
-            .frame(egui::Frame::NONE)
-            .show_inside(ui, |ui| match self.doc_submode() {
+        egui::Frame::NONE.show(ui, |ui| match self.doc_submode() {
                 DocSubMode::Document => self.documents_pane(ui, data),
                 // WL-FUNC-011 Phase 3c: the Project editor is a distinct embedded
                 // `EditorSurface`; a follow-up may join a mesh co-edit session on

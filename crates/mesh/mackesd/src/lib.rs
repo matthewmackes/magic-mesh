@@ -87,6 +87,9 @@ pub mod nebula_roster;
 // PLANES-17 — Nebula topology as fleet state: hop subnet routes, exit
 // nodes (validation-gated), and external VPN client profiles.
 pub mod nebula_topology;
+/// Typed, credential-free NetworkManager/ModemManager observations and the
+/// additive mesh-status `network.interfaces[]` merge seam.
+pub mod network_status;
 // PLANES-20 / ENT-8 — fleet rollup aggregation (roster grouped by role +
 // worst-health) behind `mackesd fleet-status`.
 pub mod fleet_rollup;

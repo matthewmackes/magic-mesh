@@ -1,4 +1,4 @@
-# SETTINGS — the world-class Settings redesign (master–detail, tinted, Carbon)
+# SETTINGS — the world-class Settings redesign (master–detail, tinted, Quazar)
 
 > **Design-standard note (2026-07-22):** look-and-feel guidance in this doc is subordinate to the platform interface standard — see [platform-interfaces.md](platform-interfaces.md) (Apple-HIG-principled Construct + Car). Feature/behavior content remains authoritative.
 
@@ -7,8 +7,9 @@ Operator-locked 2026-07-04 (5-Q `/plan` survey). The Settings surface (`Surface:
 today it is a **single vertical column** of stacked titled cards — Mixer, Bluetooth,
 Displays, Power & Battery, Wallpaper, Hotkeys — that wastes the page width and gives no
 visual separation between unrelated areas. This epic makes it **world-class**: a
-master–detail layout that uses the full width, with per-domain color tint + Carbon
-elevation for separation, all on Carbon Design rules (§4 tokens, no raw hex).
+master–detail layout that uses the full width, with per-domain semantic tint and
+shared `mde-egui::Style` elevation for separation, using Quazar Dark/Light and
+Apple-HIG interaction principles.
 
 ## Locked decisions (5)
 

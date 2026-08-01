@@ -49,11 +49,11 @@ Each row: the old queue ID (left) is now tracked by the WL-\* epic (right). A
 
 ### Archived with a disposition (no owning epic)
 
-- **E12-9 remote audio** — WON'T-DO (operator 2026-07-03): avoids an ironrdp bump
-  on a pinned dep. The local-audio remainder (QEMU/libvirt `<audio type='pipewire'>`
-  into the E12-16 mixer) is a design-doc item in
-  [`docs/design/e12-9-10-libvirt-rescope.md`](design/e12-9-10-libvirt-rescope.md),
-  not an active WL epic.
+- **E12-9 remote audio** — superseded by the 2026-07-31 operator decision:
+  audio is a first-class production requirement, including node-to-node
+  streaming. The former WON'T-DO disposition is historical evidence only; the
+  active requirements live under `WL-FUNC-011` and `WL-CRIT-006` in
+  [`docs/platform/WORKLIST.md`](platform/WORKLIST.md).
 - **MOTION-TRANS-4 / MOTION-PERF-4** — WON'T-DO (operator 2026-07-03): their
   acceptance targets the retired iced/Cosmic compositor; re-doing the polish on the
   egui/Construct shell would be net-new work, not completion.
@@ -70,10 +70,10 @@ Units the drain loop parked automatically (a live-infra/artifact/gate blocker it
 could not clear from a build). Each needs an operator/live action; each is worked
 under the WL-\* epic named in the re-key map above, not as an independent ID.
 
-- **E12-9-audio** (parked 2026-07-01) — remote audio needs an ironrdp RDPSND/audio
-  virtual-channel API the pinned version doesn't expose. Disposition: WON'T-DO for
-  remote audio (see "Archived with a disposition" above); local-audio path lives in
-  `docs/design/e12-9-10-libvirt-rescope.md`.
+- **E12-9-audio** (parked 2026-07-01) — historical parked item superseded by the
+  2026-07-31 first-class audio requirement. The implementation must select a
+  supported VDI/mesh audio transport and close the live `.15` playback/capture
+  and node-to-node streaming gates; it is no longer a WON'T-DO requirement.
 
 - **mde-shell-egui pre-existing test reds** (recorded 2026-07-21, WL-FUNC-011
   Phase-2) — 4 `cargo test -p mde-shell-egui` tests fail on the branch base

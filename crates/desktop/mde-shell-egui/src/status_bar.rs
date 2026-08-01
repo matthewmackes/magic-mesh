@@ -60,9 +60,9 @@ pub(crate) const STATUS_BAR_H: f32 = 24.0;
 /// Width reserved by the bottom taskbar for the Windows-style system tray.
 /// The navigation bar keeps this lane free of app pins so the clock and
 /// controls remain visually stable while the center cluster changes.
-pub(crate) const BOTTOM_TRAY_W: f32 = 196.0;
+pub(crate) const BOTTOM_TRAY_W: f32 = 215.6;
 /// Clear space between the taskbar placement control and the tray.
-pub(crate) const BOTTOM_TRAY_GAP: f32 = 8.0;
+pub(crate) const BOTTOM_TRAY_GAP: f32 = 8.8;
 
 /// The daemon rollup segments the right cluster surfaces, left→right —
 /// Q12's "mesh grade, network, power, alert count" mapped onto what the
@@ -476,10 +476,10 @@ pub(crate) fn mount_top(
         });
 }
 
-/// Mount the Windows 11-inspired bottom tray used while the taskbar is in its
-/// bottom configuration. It deliberately has no A–F grade text: the mesh
-/// health state is a compact honest dot, while the existing top strip remains
-/// the detailed grade/status treatment in the side-rail configuration.
+/// Mount the Windows-style bottom tray used while the taskbar is in its bottom
+/// configuration. The shell normally calls [`paint_bottom_tray`] from inside
+/// the taskbar's own Area so clock/tray and app controls are one bar; this Area
+/// wrapper remains for focused status-bar tests and standalone callers.
 pub(crate) fn mount_bottom(
     ctx: &egui::Context,
     construct: &mut ConstructChrome,
@@ -500,9 +500,25 @@ pub(crate) fn mount_bottom(
         .show(ctx, |ui| {
             ui.set_min_size(tray.size());
             ui.set_clip_rect(tray);
-            ui.set_opacity(opacity.clamp(0.0, 1.0));
-            bottom_tray(ui, tray, construct, segments);
+            paint_bottom_tray(ui, ctx.screen_rect(), construct, segments, opacity, env);
         });
+}
+
+/// Paint the bottom clock/tray inside the taskbar's existing foreground area.
+/// Keeping this as paint-only composition prevents a second foreground bar
+/// from covering the taskbar when Bottom placement is active.
+pub(crate) fn paint_bottom_tray(
+    ui: &egui::Ui,
+    screen: egui::Rect,
+    construct: &mut ConstructChrome,
+    segments: &StatusSegments,
+    opacity: f32,
+    env: StatusBarEnv,
+) {
+    if opacity <= 0.0 || !status_bar_visible(env) {
+        return;
+    }
+    bottom_tray(ui, bottom_tray_rect(screen), construct, segments, opacity);
 }
 
 /// Return the tray's screen-space footprint. Keeping this in the status-bar
@@ -523,24 +539,22 @@ fn bottom_tray(
     tray: egui::Rect,
     construct: &mut ConstructChrome,
     segments: &StatusSegments,
+    opacity: f32,
 ) {
     let painter = ui.painter().clone();
-    let panel = tray.shrink2(egui::vec2(2.0, 4.0));
-    let surface = Style::resolve_color(ui.ctx(), Style::SURFACE).gamma_multiply(0.96);
+    // This is a lane within the taskbar, not a second raised card layered over
+    // it. The taskbar already paints the shared backing and top hairline.
+    let panel = tray;
     let surface_hi = Style::resolve_color(ui.ctx(), Style::SURFACE_HI);
     let text = Style::resolve_color(ui.ctx(), Style::TEXT);
     let text_dim = Style::resolve_color(ui.ctx(), Style::TEXT_DIM);
-    painter.rect_filled(panel, Style::RADIUS_M, surface);
-    painter.line_segment(
-        [panel.left_top(), panel.left_bottom()],
-        egui::Stroke::new(1.0, Style::resolve_color(ui.ctx(), Style::BORDER)),
-    );
+    let opacity = opacity.clamp(0.0, 1.0);
 
-    let now = crate::timers::now_unix();
+    let now = crate::timers::display_unix();
     let time = crate::timers::hhmm(now);
     let (year, month, day) = crate::chat::civil_from_days(now.div_euclid(86_400));
     let date = format!("{month:02}/{day:02}/{year:04}");
-    let clock_width = 78.0_f32.min((panel.width() * 0.42).max(36.0));
+    let clock_width = 85.8_f32.min((panel.width() * 0.42).max(39.6));
     let clock = egui::Rect::from_min_max(
         egui::pos2(panel.right() - clock_width, panel.top()),
         panel.right_bottom(),
@@ -558,18 +572,22 @@ fn bottom_tray(
         )
     });
     if clock_response.hovered() {
-        painter.rect_filled(clock.shrink(2.0), Style::RADIUS_S, surface_hi);
+        painter.rect_filled(
+            clock.shrink(2.0),
+            Style::RADIUS_S,
+            surface_hi.gamma_multiply(opacity),
+        );
     }
     let time_galley = painter.layout_job(status_text_job(
         time.clone(),
         TypographyRole::Label,
-        text,
+        text.gamma_multiply(opacity),
         clock.width(),
     ));
     let date_galley = painter.layout_job(status_text_job(
         date,
         TypographyRole::Caption,
-        text_dim,
+        text_dim.gamma_multiply(opacity),
         clock.width(),
     ));
     painter.galley(
@@ -578,7 +596,7 @@ fn bottom_tray(
             clock.center().y - time_galley.size().y - 1.0,
         ),
         time_galley,
-        text,
+        text.gamma_multiply(opacity),
     );
     painter.galley(
         egui::pos2(
@@ -586,17 +604,17 @@ fn bottom_tray(
             clock.center().y + 1.0,
         ),
         date_galley,
-        text_dim,
+        text_dim.gamma_multiply(opacity),
     );
     if clock_response.clicked() {
         construct.notification_center_open = !construct.notification_center_open;
     }
 
-    let health = egui::pos2(panel.left() + 14.0, panel.center().y);
+    let health = egui::pos2(panel.left() + 15.4, panel.center().y);
     let mesh_color = severity_color(segments.get(StatusSegment::Mesh));
-    painter.circle_filled(health, 4.0, mesh_color);
+    painter.circle_filled(health, 4.4, mesh_color.gamma_multiply(opacity));
     let health_response = ui.interact(
-        egui::Rect::from_center_size(health, egui::vec2(24.0, 32.0)),
+        egui::Rect::from_center_size(health, egui::vec2(26.4, 35.2)),
         egui::Id::new(("construct-bottom-system-tray", "mesh-health")),
         egui::Sense::click(),
     );
@@ -615,12 +633,12 @@ fn bottom_tray(
     }
 
     let icon_right = clock.left() - Style::SP_XS;
-    let icon_left = health.x + 10.0;
-    let icon_space = icon_right - icon_left - Style::SP_XS * 2.0;
+    let icon_left = health.x + 11.0;
+    let icon_space = icon_right - icon_left - Style::SP_XS * 2.2;
     if icon_space > 0.0 {
         let icon_width = (icon_space / 3.0).max(1.0);
         for control in StatusControl::ALL {
-            let left = icon_left + control.index() as f32 * (icon_width + Style::SP_XS);
+            let left = icon_left + control.index() as f32 * (icon_width + Style::SP_XS * 1.1);
             let rect = egui::Rect::from_min_max(
                 egui::pos2(left, panel.top()),
                 egui::pos2(
@@ -641,7 +659,11 @@ fn bottom_tray(
                 )
             });
             if response.hovered() {
-                painter.rect_filled(rect.shrink(2.0), Style::RADIUS_S, surface_hi);
+                painter.rect_filled(
+                    rect.shrink(2.0),
+                    Style::RADIUS_S,
+                    surface_hi.gamma_multiply(opacity),
+                );
             }
             if let Some(texture) = icon_texture(ui.ctx(), control.icon(), STATUS_CONTROL_ICON, text)
             {
@@ -653,7 +675,7 @@ fn bottom_tray(
                     texture.id(),
                     draw,
                     egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-                    egui::Color32::WHITE,
+                    egui::Color32::WHITE.gamma_multiply(opacity),
                 );
             }
             if response.clicked() {
@@ -690,7 +712,7 @@ fn strip(
     let time_role = TypographyRole::Label;
     // ── Center cluster: the one authoritative clock ────────────────────────
     let controls_rect = status_controls_rect(bar);
-    let now = crate::timers::now_unix();
+    let now = crate::timers::display_unix();
     let time = crate::timers::hhmm(now);
     let time_galley = painter.layout_job(status_text_job(
         time.clone(),
@@ -838,7 +860,7 @@ fn strip(
         {
             let draw = egui::Rect::from_center_size(
                 rect.center(),
-                egui::vec2(STATUS_CONTROL_ICON, STATUS_CONTROL_ICON),
+                egui::vec2(STATUS_CONTROL_ICON * 1.1, STATUS_CONTROL_ICON * 1.1),
             );
             painter.image(
                 texture.id(),

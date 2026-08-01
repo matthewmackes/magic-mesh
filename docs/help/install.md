@@ -40,9 +40,9 @@ meshctl install --role lighthouse   # or: workstation
 then runs `meshctl doctor` to preflight the prerequisites (nebula, nebula-cert,
 ansible, firewalld, libvirt). There are **two roles**:
 
-- **Lighthouse** — the always-on relay + Nebula CA/signer + leader control plane
-  (and media server). No local desktop. Start here: the first node in a new mesh
-  is a lighthouse.
+- **Lighthouse** — the always-on relay + Nebula CA/signer + leader control plane.
+  No local desktop, media server, or file-sharing role is implied. Start here:
+  the first node in a new mesh is a lighthouse.
 - **Workstation** — the full Construct egui thin client: it brokers and displays VM
   desktops and runs libvirt/QEMU-KVM + Podman. A **headless** box is a
   Workstation with no local display (daemon stack only, serving VMs/containers to

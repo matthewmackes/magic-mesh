@@ -627,8 +627,8 @@ fn mpris_request_command_reuses_the_transport_allowlist() {
 fn fanout_drain_applies_a_peer_request_once_and_responds() {
     // The relay/aggregate substrate is exercised end-to-end via the worker glue:
     // a peer's request is drained (applied once, then de-duped) and a response
-    // row is written the endpoint can aggregate. `apply_fanout_action` shells out
-    // to wl-copy/canberra which are absent in CI — it must still no-op cleanly.
+    // row is written the endpoint can aggregate. The ring path is best-effort
+    // and must remain non-blocking in CI where no audio player is installed.
     let tmp = tempdir().unwrap();
     let root = tmp.path();
     // An endpoint (eagle) relayed a ring; a peer (oak) drains it.
@@ -684,10 +684,44 @@ fn local_battery_body_is_serializable_and_sane() {
 
 #[test]
 fn ring_and_clipboard_helpers_never_panic_when_tools_absent() {
-    // Best-effort host actions: with no audio player / wl-copy present (CI),
-    // these spawn-or-skip without panicking or blocking.
+    // Best-effort host actions: with no audio player or local Bus (CI), these
+    // skip honestly without panicking or blocking.
     ring_local_device();
-    apply_clipboard("test clipboard content");
+    let _ = apply_fanout_action(&FanoutAction::Clipboard {
+        content: "test clipboard content".to_owned(),
+        source: "kdc:test".to_owned(),
+    });
+}
+
+#[test]
+fn kdc_clipboard_plugin_materializes_to_the_canonical_bus() {
+    let dir = tempdir().expect("clipboard Bus tempdir");
+    let mut plugin = ClipboardPlugin::new();
+    plugin
+        .set_active_seat(Some("seat:eagle".to_owned()))
+        .expect("valid target seat");
+    let packet = mde_kdc_proto::plugins::clipboard_packet(42, "  preserve me  ".to_owned());
+    let context = PluginContext::new("phone-1", true);
+
+    let _ = plugin.process(&packet, &context);
+    let mut pending = plugin.take_materializations().into_iter().collect();
+    assert_eq!(
+        publish_pending_kdc_clipboard(Some(&dir.path().to_path_buf()), &mut pending),
+        1
+    );
+    assert!(pending.is_empty());
+
+    let persist = Persist::open(dir.path().to_path_buf()).expect("open clipboard Bus");
+    let message = persist
+        .read_latest(CLIPBOARD_MATERIALIZATION_TOPIC)
+        .expect("read materialization")
+        .expect("materialization published");
+    let body: VdiClipboardMaterialization =
+        serde_json::from_str(message.body.as_deref().expect("body"))
+            .expect("decode materialization");
+    assert_eq!(body.target_seat, "seat:eagle");
+    assert_eq!(String::from(body.text), "  preserve me  ");
+    assert_eq!(body.source, "kdc:phone-1:packet:42");
 }
 
 #[test]

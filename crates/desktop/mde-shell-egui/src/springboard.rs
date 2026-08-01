@@ -227,6 +227,7 @@ pub(crate) fn show(ui: &mut egui::Ui, overlay_above: bool) {
         state.gesture = None;
     } else {
         handle_drag(ui, &mut state, ui.max_rect());
+        install_home_accessibility(ui.ctx(), ui.max_rect());
     }
 
     ctx.data_mut(|d| d.insert_temp(state_key, state));
@@ -238,8 +239,24 @@ fn handle_drag(ui: &egui::Ui, state: &mut SpringboardState, page_rect: egui::Rec
     let bg = ui.interact(
         page_rect,
         egui::Id::new(SPRINGBOARD_BG),
-        egui::Sense::drag(),
+        egui::Sense::click_and_drag(),
     );
+    // Ordinary pointer clicks remain inert: Home is a quiet canvas. An
+    // AccessKit Click (or Space/Enter after the named node receives focus)
+    // explicitly invokes the same Spotlight route as the pull-down gesture.
+    let keyboard_activation = ui.ctx().input(|input| {
+        (input.key_pressed(egui::Key::Space) || input.key_pressed(egui::Key::Enter))
+            && ui.ctx().memory(|memory| memory.has_focus(bg.id))
+    });
+    let accesskit_activation = ui.ctx().input(|input| {
+        input.has_accesskit_action_request(
+            egui::Id::new(SPRINGBOARD_BG),
+            egui::accesskit::Action::Click,
+        )
+    });
+    if bg.clicked() && (accesskit_activation || keyboard_activation) {
+        state.actions.push(SpringboardAction::Spotlight);
+    }
     if bg.drag_started() {
         let frac = bg.interact_pointer_pos().map_or(1.0, |pos| {
             ((pos.y - page_rect.top()) / page_rect.height().max(1.0)).clamp(0.0, 1.0)
@@ -253,6 +270,27 @@ fn handle_drag(ui: &egui::Ui, state: &mut SpringboardState, page_rect: egui::Rec
     if bg.drag_stopped() {
         state.release_drag();
     }
+}
+
+/// Give the wallpaper-backed Home canvas a discoverable, actionable semantic
+/// node without adding a second visible launcher control. The action is
+/// deliberately named after its destination so a screen reader can explain
+/// what activating Home does under the search-first Home contract.
+fn install_home_accessibility(ctx: &egui::Context, rect: egui::Rect) {
+    let id = egui::Id::new(SPRINGBOARD_BG);
+    let _ = ctx.accesskit_node_builder(id, |node| {
+        node.set_role(egui::accesskit::Role::Button);
+        node.set_label("Home");
+        node.set_value("Open Front Door search");
+        node.set_bounds(egui::accesskit::Rect {
+            x0: rect.left().into(),
+            y0: rect.top().into(),
+            x1: rect.right().into(),
+            y1: rect.bottom().into(),
+        });
+        node.add_action(egui::accesskit::Action::Focus);
+        node.add_action(egui::accesskit::Action::Click);
+    });
 }
 
 #[cfg(test)]
@@ -422,6 +460,61 @@ mod tests {
             ],
         );
         assert_eq!(mount(&ctx, &mut construct), None);
+    }
+
+    #[test]
+    fn home_exports_an_accessible_front_door_action() {
+        let ctx = ctx();
+        ctx.enable_accesskit();
+        production_frame(&ctx, Vec::new());
+        let (_, out) = production_frame(&ctx, Vec::new());
+        let node = out
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("Home should export an AccessKit update")
+            .nodes
+            .iter()
+            .map(|(_, node)| node)
+            .find(|node| node.label() == Some("Home"))
+            .expect("Home should be discoverable to assistive technology");
+        assert_eq!(node.role(), egui::accesskit::Role::Button);
+        assert_eq!(node.value(), Some("Open Front Door search"));
+        let bounds = node.bounds().expect("Home action should have screen bounds");
+        assert!(bounds.x1 > bounds.x0 && bounds.y1 > bounds.y0);
+    }
+
+    #[test]
+    fn accessible_home_action_routes_the_existing_spotlight_seam() {
+        let ctx = ctx();
+        ctx.enable_accesskit();
+        let mut construct = ConstructChrome::default();
+        let (_, initial) = production_frame(&ctx, Vec::new());
+        let target = initial
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("Home should export an AccessKit update")
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Home"))
+            .map(|(id, _)| *id)
+            .expect("Home node should have a stable AccessKit target");
+        production_frame(
+            &ctx,
+            vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Click,
+                    target,
+                    data: None,
+                },
+            )],
+        );
+        assert_eq!(
+            mount(&ctx, &mut construct),
+            Some(SpringboardAction::Spotlight),
+            "Home's accessible action must route through the existing Front Door seam"
+        );
     }
 
     #[test]

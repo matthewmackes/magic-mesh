@@ -9,6 +9,9 @@
 //! Bus idiom as the `cloud` mirror. This crate stays pure data + a pure NMEA parser; the
 //! worker owns the SSH/HTTP transport.
 
+use std::collections::HashSet;
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Topic prefix for the per-node vehicle-gateway mirror.
@@ -23,6 +26,12 @@ pub const VEHICLE_STATE_V2_SCHEMA_VERSION: u16 = 2;
 /// for bounded,
 /// explicitly named extension radios discovered by a typed probe.
 pub const VEHICLE_STATE_V2_MAX_RADIOS: usize = 16;
+
+/// Maximum number of approved management nodes carried by one MG90 snapshot.
+///
+/// This matches the bounded multi-source worker roster while keeping the wire
+/// contract safe for multiple workstation managers.
+pub const VEHICLE_STATE_V2_MAX_MANAGERS: usize = 8;
 
 /// The `state/vehicle/<node>` mirror topic for a node.
 #[must_use]
@@ -141,10 +150,55 @@ impl WanStatus {
     }
 }
 
-/// Vehicle power + OBD/CAN telemetry (mirrors the cockpit `VehicleTelemetry`, plus the
+/// The typed result of an optional vehicle-device probe.
 ///
+/// This is deliberately separate from [`RadioPresence`]: a probe can be absent
+/// without proving that the device itself is absent, and a reachable endpoint
+/// can still be unsupported when its payload schema is not admitted. The
+/// worker uses these states instead of turning a missing or failed probe into
+/// zero-filled telemetry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum DeviceProbeStatus {
+    /// A typed, verified device payload is available.
+    Supported,
+    /// No device probe is installed or configured for this adapter.
+    NotInstalled,
+    /// The endpoint answered, but this adapter does not support its payload or
+    /// protocol well enough to expose typed values.
+    Unsupported {
+        /// Safe operator-facing explanation; never raw device payload.
+        reason: String,
+    },
+    /// The configured probe was attempted but failed before producing a typed
+    /// observation.
+    Failed {
+        /// Safe transport/configuration failure detail.
+        reason: String,
+    },
+    /// Legacy snapshots did not carry a probe verdict.
+    #[default]
+    Unknown,
+}
+
+impl DeviceProbeStatus {
+    /// Whether this status is the legacy no-verdict value.
+    #[must_use]
+    pub const fn is_unknown(&self) -> bool {
+        matches!(self, Self::Unknown)
+    }
+
+    /// Whether this status authorizes the OBD fields as typed observations.
+    #[must_use]
+    pub const fn is_supported(&self) -> bool {
+        matches!(self, Self::Supported)
+    }
+}
+
+/// Vehicle power + OBD/CAN telemetry (mirrors the cockpit `VehicleTelemetry`, plus the
 /// MCU-sourced board temp). Power fields (`battery_v`/`internal_temp_c`/`ignition_on`)
-/// come from the gateway MCU; the rest from OBD-II when `obd_present`.
+/// come from the gateway MCU; the rest from OBD-II when `obd_present` and the
+/// [`DeviceProbeStatus`] is [`DeviceProbeStatus::Supported`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct VehicleTelem {
     /// Main/charging bus voltage, volts (MCU).
@@ -157,6 +211,10 @@ pub struct VehicleTelem {
     pub moving: bool,
     /// Whether an OBD-II source is present (the fields below are meaningful).
     pub obd_present: bool,
+    /// Typed verdict for the optional OBD/HDOBD/device probe. This is kept
+    /// alongside the legacy boolean so old readers remain wire-compatible.
+    #[serde(default, skip_serializing_if = "DeviceProbeStatus::is_unknown")]
+    pub obd_probe_status: DeviceProbeStatus,
     /// Vehicle speed, mph (OBD).
     pub speed_mph: f32,
     /// Engine RPM (OBD).
@@ -554,6 +612,12 @@ impl RadioInventory {
                 VEHICLE_STATE_V2_MAX_RADIOS
             ));
         }
+        let mut seen = HashSet::with_capacity(entries.len());
+        for entry in &entries {
+            if !seen.insert(entry.id.clone()) {
+                return Err(format!("radio inventory repeats id {}", entry.id.as_str()));
+            }
+        }
         Ok(Self(entries))
     }
 
@@ -573,6 +637,30 @@ impl RadioInventory {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    /// Return the six native rows in their stable UI/wire positions.
+    ///
+    /// A missing row remains `None`: consumers must render an honest unknown
+    /// or unavailable state rather than treating a sparse remote inventory as
+    /// proof that hardware is absent. Extension rows are intentionally not
+    /// included in this fixed native layout.
+    #[must_use]
+    pub fn native_slots(&self) -> [Option<&RadioHealth>; 6] {
+        [
+            self.by_id(&RadioId::CellularA),
+            self.by_id(&RadioId::CellularB),
+            self.by_id(&RadioId::WifiA),
+            self.by_id(&RadioId::WifiB),
+            self.by_id(&RadioId::Bluetooth),
+            self.by_id(&RadioId::Gnss),
+        ]
+    }
+
+    /// Find one row by its stable identity without inferring presence.
+    #[must_use]
+    pub fn by_id(&self, id: &RadioId) -> Option<&RadioHealth> {
+        self.0.iter().find(|entry| &entry.id == id)
     }
 }
 
@@ -659,13 +747,121 @@ pub enum ManagerSetState {
     Unknown,
 }
 
+/// Validation failures for an approved MG90 manager set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagerSetValidationError {
+    /// A manager identifier contained no non-whitespace characters.
+    BlankId {
+        /// Position of the blank identifier in the input list.
+        index: usize,
+    },
+    /// The same manager identifier appeared more than once.
+    DuplicateId(String),
+    /// The manager set exceeded [`VEHICLE_STATE_V2_MAX_MANAGERS`].
+    Capacity {
+        /// Number of identifiers supplied.
+        len: usize,
+        /// Maximum permitted number of identifiers.
+        max: usize,
+    },
+}
+
+impl std::fmt::Display for ManagerSetValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BlankId { index } => write!(f, "manager id at index {index} is blank"),
+            Self::DuplicateId(id) => write!(f, "manager id {id:?} is duplicated"),
+            Self::Capacity { len, max } => {
+                write!(f, "manager set has {len} ids; maximum is {max}")
+            }
+        }
+    }
+}
+
 /// Authorized managers of a gateway.
 #[allow(missing_docs, reason = "v2 wire contract")]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ManagerSet {
     pub state: ManagerSetState,
-    #[serde(default)]
     pub ids: Vec<String>,
+}
+
+impl ManagerSet {
+    /// Construct an authoritative, ordered set of approved manager IDs.
+    ///
+    /// IDs are retained exactly as supplied and in stable order. Blank IDs,
+    /// duplicates, and sets larger than [`VEHICLE_STATE_V2_MAX_MANAGERS`] are
+    /// rejected before they can enter the wire model.
+    pub fn approved(ids: Vec<String>) -> Result<Self, ManagerSetValidationError> {
+        Self::validate_ids(&ids)?;
+        Ok(Self {
+            state: ManagerSetState::Complete,
+            ids,
+        })
+    }
+
+    /// Construct an authoritative manager set; equivalent to [`Self::approved`].
+    pub fn new(ids: Vec<String>) -> Result<Self, ManagerSetValidationError> {
+        Self::approved(ids)
+    }
+
+    fn validate_ids(ids: &[String]) -> Result<(), ManagerSetValidationError> {
+        if ids.len() > VEHICLE_STATE_V2_MAX_MANAGERS {
+            return Err(ManagerSetValidationError::Capacity {
+                len: ids.len(),
+                max: VEHICLE_STATE_V2_MAX_MANAGERS,
+            });
+        }
+        for (index, id) in ids.iter().enumerate() {
+            if id.trim().is_empty() {
+                return Err(ManagerSetValidationError::BlankId { index });
+            }
+            if ids[..index].iter().any(|previous| previous == id) {
+                return Err(ManagerSetValidationError::DuplicateId(id.clone()));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Serialize for ManagerSet {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        #[derive(Serialize)]
+        struct WireManagerSet<'a> {
+            state: &'a ManagerSetState,
+            ids: &'a [String],
+        }
+
+        WireManagerSet {
+            state: &self.state,
+            ids: &self.ids,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ManagerSet {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WireManagerSet {
+            state: ManagerSetState,
+            #[serde(default)]
+            ids: Vec<String>,
+        }
+
+        let wire = WireManagerSet::deserialize(deserializer)?;
+        Self::validate_ids(&wire.ids).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            state: wire.state,
+            ids: wire.ids,
+        })
+    }
 }
 
 /// Freshness of one logical vehicle domain.
@@ -1045,6 +1241,17 @@ fn normalize_wan_label(label: &str) -> String {
 }
 
 fn freshness_from_v1(legacy: &VehicleState, _published_at_ms: i64) -> VehicleDomainFreshness {
+    let observation_age_ms = || {
+        let observed = u64::try_from(legacy.published_at_ms).ok()?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_millis();
+        Some(
+            now.saturating_sub(u128::from(observed))
+                .min(u128::from(u64::MAX)) as u64,
+        )
+    };
     let unknown = |reason: &str| DomainFreshness {
         state: FreshnessState::Unknown,
         age_ms: None,
@@ -1056,7 +1263,7 @@ fn freshness_from_v1(legacy: &VehicleState, _published_at_ms: i64) -> VehicleDom
         } else {
             FreshnessState::Unknown
         },
-        age_ms: legacy.online.then_some(0),
+        age_ms: legacy.online.then(observation_age_ms).flatten(),
         reason: (!legacy.online).then(|| "gateway-offline".to_string()),
     };
     let has_gap = |needle: &str| legacy.gaps.iter().any(|gap| gap.contains(needle));
@@ -1334,9 +1541,66 @@ mod tests {
     }
 
     #[test]
+    fn approved_manager_set_preserves_order() {
+        let managers = ManagerSet::approved(vec!["manager-b".into(), "manager-a".into()])
+            .expect("valid manager set");
+        assert_eq!(managers.state, ManagerSetState::Complete);
+        assert_eq!(managers.ids, vec!["manager-b", "manager-a"]);
+
+        let json = serde_json::to_string(&managers).unwrap();
+        assert_eq!(
+            json,
+            r#"{"state":"complete","ids":["manager-b","manager-a"]}"#
+        );
+        assert_eq!(serde_json::from_str::<ManagerSet>(&json).unwrap(), managers);
+    }
+
+    #[test]
+    fn approved_manager_set_rejects_blank_duplicate_and_over_capacity_ids() {
+        assert_eq!(
+            ManagerSet::approved(vec!["manager-a".into(), "  ".into()]),
+            Err(ManagerSetValidationError::BlankId { index: 1 })
+        );
+        assert_eq!(
+            ManagerSet::approved(vec!["manager-a".into(), "manager-a".into()]),
+            Err(ManagerSetValidationError::DuplicateId("manager-a".into()))
+        );
+        assert_eq!(
+            ManagerSet::approved(
+                (0..=VEHICLE_STATE_V2_MAX_MANAGERS)
+                    .map(|index| format!("manager-{index}"))
+                    .collect()
+            ),
+            Err(ManagerSetValidationError::Capacity {
+                len: VEHICLE_STATE_V2_MAX_MANAGERS + 1,
+                max: VEHICLE_STATE_V2_MAX_MANAGERS,
+            })
+        );
+    }
+
+    #[test]
+    fn manager_set_deserialization_rejects_invalid_ids() {
+        let duplicate = r#"{"state":"complete","ids":["manager-a","manager-a"]}"#;
+        assert!(serde_json::from_str::<ManagerSet>(duplicate).is_err());
+
+        let too_many = serde_json::json!({
+            "state": "complete",
+            "ids": (0..=VEHICLE_STATE_V2_MAX_MANAGERS)
+                .map(|index| format!("manager-{index}"))
+                .collect::<Vec<_>>()
+        });
+        assert!(serde_json::from_value::<ManagerSet>(too_many).is_err());
+    }
+
+    #[test]
     fn v2_conversion_preserves_v1_data_and_marks_omissions_unknown() {
         let mut legacy = VehicleState::offline("rig-1");
         legacy.online = true;
+        legacy.published_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_millis()
+            .saturating_sub(2_000) as i64;
         legacy.model = "MG90".to_string();
         legacy.esn = "ND84720078011035".to_string();
         legacy.mgos_version = "4.3.0.1".to_string();
@@ -1392,6 +1656,7 @@ mod tests {
             RadioOperation::Active
         );
         assert_eq!(snapshot.freshness.gnss.state, FreshnessState::Fresh);
+        assert!(snapshot.freshness.identity.age_ms.unwrap_or_default() >= 1_000);
 
         let json = serde_json::to_string(&snapshot).unwrap();
         let round_trip: VehicleStateV2 = serde_json::from_str(&json).unwrap();
@@ -1441,5 +1706,41 @@ mod tests {
         )
         .unwrap();
         assert!(serde_json::from_str::<RadioInventory>(&encoded).is_err());
+    }
+
+    #[test]
+    fn radio_inventory_rejects_duplicate_ids_and_exposes_sparse_native_slots() {
+        let row = |id: RadioId| RadioHealth {
+            id,
+            presence: RadioPresence::Unknown,
+            operation: RadioOperation::Unknown,
+            reason_code: Some(RadioReasonCode::NotReported),
+            age_ms: None,
+            configured_role: RadioRole::Unknown,
+            active_path: false,
+            metrics: RadioMetrics::Unknown,
+        };
+        assert!(
+            RadioInventory::new(vec![row(RadioId::CellularA), row(RadioId::CellularA),]).is_err()
+        );
+
+        let inventory = RadioInventory::new(vec![
+            row(RadioId::Gnss),
+            row(RadioId::WifiB),
+            row(RadioId::extension("ext-lmr").unwrap()),
+        ])
+        .unwrap();
+        let slots = inventory.native_slots();
+        assert!(slots[0].is_none(), "missing cellular A remains unknown");
+        assert!(slots[3].is_some(), "wifi B is in its stable slot");
+        assert!(slots[5].is_some(), "GNSS is in its stable slot");
+        assert_eq!(
+            inventory
+                .by_id(&RadioId::extension("ext-lmr").unwrap())
+                .unwrap()
+                .id
+                .as_str(),
+            "ext-lmr"
+        );
     }
 }

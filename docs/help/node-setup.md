@@ -23,10 +23,16 @@ leader. For resilience, promote a second node to Lighthouse once the mesh has a
 few peers (losing your only lighthouse is the one painful case — see
 `mesh-recovery.md`).
 
+The production target is three lighthouses and three workstations. One or two
+lighthouses may be used for development or degraded operation, but that state
+must not be reported as production-ready. Lighthouse loss should normally be
+handled by automatic relay failover; manual promotion is the recovery fallback.
+
 ## Add a Workstation
 
 A Workstation is the full Construct egui thin client. It brokers and displays VM
-desktops (libvirt/QEMU-KVM through Nova), runs Podman, and carries fleet
+desktops through the provider-neutral Workloads contracts (local libvirt/QEMU-KVM
+is the supported execution path), runs Podman, and carries fleet
 automation (Ansible-on-each-node, jobs, netstate/firewall convergence) plus a
 Syncthing replicated-storage replica. Enroll it with a single-use token:
 

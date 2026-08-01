@@ -39,7 +39,8 @@
 text
 lang en_US.UTF-8
 keyboard us
-timezone UTC --utc
+# Platform default: Eastern Standard Time display; keep the RTC in UTC.
+timezone America/New_York --utc
 # Mesh-administered fleet, platform standard: no interactive root login — the box
 # onboards over the mesh and magic-setup.service owns first-run. Mirrors heritage.
 rootpw --lock

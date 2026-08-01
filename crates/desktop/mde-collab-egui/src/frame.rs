@@ -79,6 +79,21 @@ pub(crate) fn selected_space_in_directory(
     selected.filter(|selected| directory.spaces.iter().any(|space| space.id == *selected))
 }
 
+/// Reconcile the surface's retained selection with the newest directory.
+///
+/// Membership removal can advance the read model between frames. The rail must
+/// not merely paint a fallback row while the rest of the surface still carries
+/// the removed id; every pane and space-scoped intent needs the same live key.
+/// An empty directory intentionally resolves to no selection.
+#[must_use]
+pub(crate) fn reconciled_selected_space(
+    selected: Option<SpaceId>,
+    directory: &SpaceDirectory,
+) -> Option<SpaceId> {
+    selected_space_in_directory(selected, directory)
+        .or_else(|| directory.spaces.first().map(|space| space.id))
+}
+
 fn selected_space_summary(
     selected: Option<SpaceId>,
     directory: &SpaceDirectory,
@@ -517,6 +532,9 @@ impl CommunicationsSurface {
     /// from the same read models the bodies use, so it remains accurate while
     /// the operator switches Posts / Files / Calls / Tasks or hops between global apps.
     pub(crate) fn details_pane(&self, ui: &mut egui::Ui, data: &dyn crate::CollabData) {
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
         ui.label(
             egui::RichText::new("Details")
                 .size(Style::BODY)
@@ -580,6 +598,7 @@ impl CommunicationsSurface {
         for bridge in &details.discord_bridges {
             discord_bridge_detail_row(ui, bridge);
         }
+            });
     }
 
     /// The persistent call bar: renders the

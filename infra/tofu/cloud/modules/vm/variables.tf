@@ -38,3 +38,16 @@ variable "user_data" {
   type        = string
   sensitive   = true
 }
+
+variable "app" {
+  description = "Typed guest-owned App VM declaration; null for normal VM workloads."
+  type = object({
+    app_id                 = string
+    catalog_revision       = string
+    guest_profile          = string
+    requested_capabilities = list(string)
+    session_id             = string
+    resume                 = bool
+  })
+  default = null
+}

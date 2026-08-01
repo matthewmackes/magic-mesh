@@ -34,7 +34,7 @@ use crate::link::{
 };
 use crate::pixel::{Framebuffer, FramebufferError, PixelFormat};
 use crate::tier::RdpTierSettings;
-use mackes_mesh_types::vdi_clipboard::VdiClipboardStatus;
+use mackes_mesh_types::vdi_clipboard::{VdiClipboardStatus, RDP_CLIPBOARD_UNSUPPORTED_REASON};
 use mde_egui::clipboard::TextClipboard;
 use mde_vdi_core::{DamageLog, DamageRect, FrameDamage};
 
@@ -52,7 +52,7 @@ pub enum RdpClipboardError {
 impl core::fmt::Display for RdpClipboardError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Unsupported => f.write_str("RDP CLIPRDR clipboard is unsupported"),
+            Self::Unsupported => f.write_str(RDP_CLIPBOARD_UNSUPPORTED_REASON),
         }
     }
 }
@@ -76,6 +76,24 @@ impl RdpTextClipboard {
         Self { last_error: None }
     }
 
+    /// Return the same explicit capability report exposed by the owning
+    /// session. Keeping this on the operation adapter prevents callers from
+    /// treating the trait's `Option<String>` read result as a successful empty
+    /// clipboard when CLIPRDR is absent.
+    #[must_use]
+    pub fn status(&self) -> VdiClipboardStatus {
+        rdp_clipboard_status()
+    }
+
+    /// Attempt to read text through CLIPRDR.
+    ///
+    /// The shared [`TextClipboard`] trait uses `Option<String>` and therefore
+    /// cannot distinguish an unavailable channel from an empty clipboard. Use
+    /// this checked seam at protocol boundaries that need that distinction.
+    pub fn read_text_checked(&mut self) -> Result<String, RdpClipboardError> {
+        Err(RdpClipboardError::Unsupported)
+    }
+
     /// Attempt to send text through CLIPRDR.
     pub fn write_text_checked(&mut self, _text: &str) -> Result<(), RdpClipboardError> {
         Err(RdpClipboardError::Unsupported)
@@ -89,6 +107,11 @@ impl RdpTextClipboard {
 
 impl TextClipboard for RdpTextClipboard {
     fn read_text(&mut self) -> Option<String> {
+        // `TextClipboard::read_text` predates the typed VDI capability contract
+        // and uses `None` for both "empty" and "unavailable".  Preserve that
+        // trait surface for callers that need it, but latch the typed failure
+        // so a read cannot be mistaken for a successful empty clipboard.
+        self.last_error = Some(RdpClipboardError::Unsupported);
         None
     }
 
@@ -449,13 +472,15 @@ impl RdpSession {
 
 #[cfg(test)]
 mod tests {
-    use super::{RdpClipboardError, RdpSession, RdpTextClipboard};
+    use super::{rdp_clipboard_status, RdpClipboardError, RdpSession, RdpTextClipboard};
     use crate::config::RdpConfig;
     use crate::egui::{Color32, Event, Key, Modifiers, Pos2};
     use crate::input::{RdpInputEvent, Scancode};
     use crate::link::{QualityMode, QualityTier};
     use crate::pixel::PixelFormat;
-    use mackes_mesh_types::vdi_clipboard::VdiClipboardLaneStatus;
+    use mackes_mesh_types::vdi_clipboard::{
+        VdiClipboardLaneStatus, RDP_CLIPBOARD_UNSUPPORTED_REASON,
+    };
     use mde_egui::clipboard::TextClipboard;
 
     // The smallest RDP-legal desktop (validate() enforces a 200px minimum); tests
@@ -477,8 +502,7 @@ mod tests {
         for lane in [status.host_to_guest, status.guest_to_host] {
             match lane {
                 VdiClipboardLaneStatus::Unsupported { reason } => {
-                    assert!(reason.contains("CLIPRDR"));
-                    assert!(reason.contains("mde-vdi-rdp"));
+                    assert_eq!(reason, RDP_CLIPBOARD_UNSUPPORTED_REASON);
                 }
                 other => panic!("expected unsupported RDP clipboard lane, got {other:?}"),
             }
@@ -488,7 +512,13 @@ mod tests {
     #[test]
     fn text_clipboard_seam_does_not_claim_unsupported_operations_succeeded() {
         let mut clipboard = RdpTextClipboard::new();
+        assert_eq!(clipboard.status(), rdp_clipboard_status());
+        assert_eq!(
+            clipboard.read_text_checked(),
+            Err(RdpClipboardError::Unsupported)
+        );
         assert!(clipboard.read_text().is_none());
+        assert_eq!(clipboard.take_error(), Some(RdpClipboardError::Unsupported));
         assert_eq!(
             clipboard.write_text_checked("hello"),
             Err(RdpClipboardError::Unsupported)

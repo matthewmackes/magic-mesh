@@ -2,8 +2,8 @@
 //! into the MDE desktop (VDI **app-mode** via `session_broker`). Rather than a
 //! full seat, the operator runs single apps from the VM windowed into their own
 //! desktop. The roster carries the same live status · drift · metrics, a lead
-//! `app-mode` tag, whole-VM console + lifecycle verbs, and an honest note on the
-//! per-app forwarding leg.
+//! `app-mode` tag, explicit per-app launch, whole-VM console + lifecycle verbs,
+//! and honest readiness text.
 
 use mackes_mesh_types::cloud::{DriftFlag, WorkloadRow};
 use mde_egui::egui::{self, Color32, RichText};
@@ -39,9 +39,9 @@ pub(super) fn view(ui: &mut egui::Ui, state: &mut WorkloadsState) {
     }
     muted_note(
         ui,
-        "Console attaches the whole app VM's display; forwarding an individual app into your \
-         desktop rides session_broker (VDI app-mode) and is not yet a distinct cloud verb — that \
-         per-app launch leg lands with the app-mode forwarding unit.",
+        "Launch app opens the admitted catalog identity through session_broker (VDI app-mode). \
+         Console remains the whole-VM fallback; guest readiness and reconnect state stay separate \
+         from the transport link.",
     );
     super::super::console_section(ui, state);
 }
@@ -54,6 +54,9 @@ fn app_card(ui: &mut egui::Ui, state: &mut WorkloadsState, row: &WorkloadRow) {
         metrics_line(ui, row);
         ui.add_space(Style::SP_XS);
         ui.horizontal(|ui| {
+            if row.app.is_some() && row_button(ui, "Launch app", false).clicked() {
+                state.issue_app_launch(row);
+            }
             if row_button(ui, "Console", false).clicked() {
                 state.issue_console_attach(&row.node, &row.name, &row.name);
             }

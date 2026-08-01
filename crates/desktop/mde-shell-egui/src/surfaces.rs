@@ -2,7 +2,7 @@
 //!
 //! This module is deliberately chrome-neutral: Springboard, Spotlight, the app
 //! switcher, Car, and tests all consume the same surface order, grouping, labels,
-//! Carbon glyph loader, and session-summary types.
+//! shared icon-registry loader, and session-summary types.
 
 use mde_egui::egui::{self, TextureHandle, TextureOptions};
 use mde_egui::Style;
@@ -75,7 +75,7 @@ impl Surface {
         Surface::Communications,
     ];
 
-    /// The shared Carbon glyph for this surface.
+    /// The shared icon-registry glyph for this surface.
     pub(crate) const fn icon_id(self) -> IconId {
         match self {
             Surface::FleetMesh | Surface::Workbench | Surface::MeshView | Surface::Explorer => {
@@ -139,6 +139,154 @@ pub(crate) const EMBEDDED_SURFACE_CRATES: [&str; 8] = [
     "mde-media-egui",
     "mde-music-egui",
     "mde-term-egui",
+];
+
+/// Adoption state of one visual-system concern in the WL-UX-009 inventory.
+///
+/// This is an audit state rather than a product-health verdict: it makes
+/// remaining migration visible without calling a surface production-ready.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VisualAdoption {
+    /// The surface consumes the governed shared primitive for this concern.
+    Adopted,
+    /// The surface consumes part of the shared system; migration remains.
+    Partial,
+    /// The concern has no governed implementation yet.
+    Gap,
+    /// A documented rendering boundary changes the normal Construct rule.
+    Exception,
+}
+
+/// Deliberate visual boundary for a launchable surface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VisualBoundary {
+    /// A normal Construct workspace must converge on shared primitives.
+    Construct,
+    /// A focused remote desktop preserves every guest pixel without shell chrome.
+    FocusedVdiPixels,
+    /// Map content may retain a content-specific palette.
+    MapsContentColour,
+    /// The Browser migration ends at the VM guest; guest Chromium is not Construct UI.
+    BrowserVmGuest,
+}
+
+/// Complete visual-system classification for one launchable Construct surface.
+///
+/// The human-readable findings and migration order live in
+/// `docs/design/platform-interfaces.md`; this table is the mechanically checked
+/// companion tied to [`Surface::ALL`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SurfaceVisualInventory {
+    /// Launchable surface being classified.
+    pub(crate) surface: Surface,
+    /// The only governed rendering-boundary exception, if any.
+    pub(crate) boundary: VisualBoundary,
+    /// Common app frame and chrome.
+    pub(crate) app_frame: VisualAdoption,
+    /// Navigation bar, sidebar, and route hierarchy.
+    pub(crate) navigation: VisualAdoption,
+    /// Loading, empty, stale, offline, error, and destructive states.
+    pub(crate) states: VisualAdoption,
+    /// Sheets, popovers, and destructive confirmations.
+    pub(crate) dialogs: VisualAdoption,
+    /// Themed hover and disabled-control help.
+    pub(crate) tooltips: VisualAdoption,
+    /// Shared registry glyphs and semantic icon treatment.
+    pub(crate) icons: VisualAdoption,
+    /// Centralized expressive motion and effects.
+    pub(crate) motion: VisualAdoption,
+    /// Dense operational table/list presentation.
+    pub(crate) lists: VisualAdoption,
+    /// Registry provenance and asset-license audit.
+    pub(crate) licensing: VisualAdoption,
+    /// Quazar Dark and Light appearance proof.
+    pub(crate) dark_light: VisualAdoption,
+}
+
+const PARTIAL_CONSTRUCT_VISUAL: SurfaceVisualInventory = SurfaceVisualInventory {
+    surface: Surface::FleetMesh,
+    boundary: VisualBoundary::Construct,
+    // Every normal Construct surface now uses the shared workspace chrome. The
+    // remaining Partial fields below are independent concerns (states,
+    // dialogs, icons, motion, lists, and licensing).
+    app_frame: VisualAdoption::Adopted,
+    navigation: VisualAdoption::Partial,
+    states: VisualAdoption::Partial,
+    dialogs: VisualAdoption::Partial,
+    // `lint-style-leaks.sh` mechanically rejects raw egui hover text.
+    tooltips: VisualAdoption::Adopted,
+    icons: VisualAdoption::Partial,
+    motion: VisualAdoption::Partial,
+    lists: VisualAdoption::Partial,
+    licensing: VisualAdoption::Gap,
+    dark_light: VisualAdoption::Partial,
+};
+
+/// The complete WL-UX-009 launchable-egui visual inventory.
+///
+/// `Partial` and `Gap` are evidence of remaining work, not permission to bypass
+/// the shared system. Only the three named visual boundaries depart from the
+/// normal Construct workspace rule.
+#[allow(dead_code)]
+pub(crate) const SURFACE_VISUAL_INVENTORY: [SurfaceVisualInventory; 13] = [
+    PARTIAL_CONSTRUCT_VISUAL,
+    SurfaceVisualInventory {
+        surface: Surface::InfraCode,
+        ..PARTIAL_CONSTRUCT_VISUAL
+    },
+    SurfaceVisualInventory {
+        surface: Surface::Desktop,
+        boundary: VisualBoundary::FocusedVdiPixels,
+        app_frame: VisualAdoption::Exception,
+        ..PARTIAL_CONSTRUCT_VISUAL
+    },
+    SurfaceVisualInventory {
+        surface: Surface::Music,
+        ..PARTIAL_CONSTRUCT_VISUAL
+    },
+    SurfaceVisualInventory {
+        surface: Surface::Media,
+        ..PARTIAL_CONSTRUCT_VISUAL
+    },
+    SurfaceVisualInventory {
+        surface: Surface::Files,
+        ..PARTIAL_CONSTRUCT_VISUAL
+    },
+    SurfaceVisualInventory {
+        surface: Surface::Browser,
+        boundary: VisualBoundary::BrowserVmGuest,
+        // Construct owns the Browser VM connection, unavailable, and
+        // diagnostic boundary; only the guest viewport stops at the VM edge.
+        // Host controller/navigation adoption remains partial.
+        app_frame: VisualAdoption::Adopted,
+        navigation: VisualAdoption::Partial,
+        ..PARTIAL_CONSTRUCT_VISUAL
+    },
+    SurfaceVisualInventory {
+        surface: Surface::Bookmarks,
+        ..PARTIAL_CONSTRUCT_VISUAL
+    },
+    SurfaceVisualInventory {
+        surface: Surface::MapsLocation,
+        boundary: VisualBoundary::MapsContentColour,
+        ..PARTIAL_CONSTRUCT_VISUAL
+    },
+    SurfaceVisualInventory {
+        surface: Surface::Terminal,
+        ..PARTIAL_CONSTRUCT_VISUAL
+    },
+    SurfaceVisualInventory {
+        surface: Surface::Phones,
+        ..PARTIAL_CONSTRUCT_VISUAL
+    },
+    SurfaceVisualInventory {
+        surface: Surface::ThisNode,
+        ..PARTIAL_CONSTRUCT_VISUAL
+    },
+    SurfaceVisualInventory {
+        surface: Surface::Communications,
+        ..PARTIAL_CONSTRUCT_VISUAL
+    },
 ];
 
 /// One launcher taxonomy group used for color coding and Spotlight grouping.
@@ -317,7 +465,7 @@ pub(crate) fn launcher_group_accent(surface: Surface) -> Option<egui::Color32> {
         .map(|group| group.accent)
 }
 
-/// Rasterize and cache a tinted Carbon glyph at the requested logical size.
+/// Rasterize and cache a tinted registry glyph at the requested logical size.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub fn icon_texture(
     ctx: &egui::Context,
@@ -345,6 +493,8 @@ pub struct SessionRailEntry {
     id: Option<String>,
     label: String,
     protocol: &'static str,
+    reason: Option<String>,
+    retry_guidance: Option<&'static str>,
 }
 
 impl SessionRailEntry {
@@ -367,7 +517,23 @@ impl SessionRailEntry {
             id,
             label: truncate_session_label(&label.into()),
             protocol,
+            reason: None,
+            retry_guidance: None,
         }
+    }
+
+    /// Attach a bounded App VM diagnostic and honest next-step guidance.
+    ///
+    /// This is presentation state only: the guidance deliberately does not
+    /// claim that a retry or transport transition has happened.
+    pub(crate) fn with_app_status(
+        mut self,
+        reason: Option<String>,
+        retry_guidance: Option<&'static str>,
+    ) -> Self {
+        self.reason = reason;
+        self.retry_guidance = retry_guidance;
+        self
     }
 
     /// Broker session id, when present.
@@ -386,6 +552,29 @@ impl SessionRailEntry {
     #[must_use]
     pub const fn protocol(&self) -> &'static str {
         self.protocol
+    }
+
+    /// Bounded diagnostic supplied by the App VM lifecycle event.
+    #[must_use]
+    pub fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
+    }
+
+    /// Honest user-facing next step, when the lifecycle state needs recovery.
+    #[must_use]
+    pub const fn retry_guidance(&self) -> Option<&'static str> {
+        self.retry_guidance
+    }
+
+    /// The compact secondary line shown by the control center.
+    #[must_use]
+    pub fn status_detail(&self) -> Option<String> {
+        match (self.reason(), self.retry_guidance()) {
+            (Some(reason), Some(guidance)) => Some(format!("{reason} · {guidance}")),
+            (Some(reason), None) => Some(reason.to_owned()),
+            (None, Some(guidance)) => Some(guidance.to_owned()),
+            (None, None) => None,
+        }
     }
 }
 
@@ -520,6 +709,47 @@ mod tests {
     }
 
     #[test]
+    fn visual_inventory_covers_every_launchable_surface_and_only_allows_governed_boundaries() {
+        assert_eq!(SURFACE_VISUAL_INVENTORY.len(), Surface::ALL.len());
+        for surface in Surface::ALL {
+            assert_eq!(
+                SURFACE_VISUAL_INVENTORY
+                    .iter()
+                    .filter(|item| item.surface == surface)
+                    .count(),
+                1,
+                "{surface:?} needs a complete WL-UX-009 visual classification"
+            );
+        }
+
+        let exceptions: Vec<_> = SURFACE_VISUAL_INVENTORY
+            .iter()
+            .filter(|item| item.boundary != VisualBoundary::Construct)
+            .map(|item| (item.surface, item.boundary))
+            .collect();
+        assert_eq!(
+            exceptions,
+            vec![
+                (Surface::Desktop, VisualBoundary::FocusedVdiPixels),
+                (Surface::Browser, VisualBoundary::BrowserVmGuest),
+                (Surface::MapsLocation, VisualBoundary::MapsContentColour),
+            ]
+        );
+        let browser = SURFACE_VISUAL_INVENTORY
+            .iter()
+            .find(|item| item.surface == Surface::Browser)
+            .expect("Browser must remain in the launchable surface inventory");
+        assert_eq!(browser.app_frame, VisualAdoption::Adopted);
+        assert_eq!(browser.navigation, VisualAdoption::Partial);
+        assert!(SURFACE_VISUAL_INVENTORY
+            .iter()
+            .all(|item| item.tooltips == VisualAdoption::Adopted));
+        assert!(SURFACE_VISUAL_INVENTORY
+            .iter()
+            .all(|item| item.licensing == VisualAdoption::Gap));
+    }
+
+    #[test]
     fn dock_launcher_groups_match_operator_survey() {
         let projected: Vec<_> = DOCK_LAUNCHER_GROUPS
             .iter()
@@ -589,9 +819,9 @@ mod tests {
         let context = egui::Context::default();
         Style::install(&context);
         let first = icon_texture(&context, IconId::Browser, 24.0, Style::TEXT)
-            .expect("Browser Carbon glyph must rasterize");
+            .expect("Browser registry glyph must rasterize");
         let second = icon_texture(&context, IconId::Browser, 24.0, Style::TEXT)
-            .expect("cached Browser Carbon glyph must remain available");
+            .expect("cached Browser registry glyph must remain available");
         assert_eq!(first.id(), second.id());
     }
 
@@ -599,5 +829,15 @@ mod tests {
     fn session_labels_remain_bounded_ascii() {
         let entry = SessionRailEntry::new("abcdefghijklmnopqrstuvwxyz", "RDP");
         assert_eq!(entry.label(), "abcdefghijklmnopqrstuvwx...");
+    }
+
+    #[test]
+    fn app_status_keeps_reason_and_guidance_separate_from_transport_badge() {
+        let entry = SessionRailEntry::with_session_id("s1", "Writer", "OFFLINE")
+            .with_app_status(Some("guest is unavailable".to_owned()), Some("Retry from Desktop"));
+        assert_eq!(entry.protocol(), "OFFLINE");
+        assert_eq!(entry.reason(), Some("guest is unavailable"));
+        assert_eq!(entry.retry_guidance(), Some("Retry from Desktop"));
+        assert_eq!(entry.status_detail().as_deref(), Some("guest is unavailable · Retry from Desktop"));
     }
 }

@@ -11,7 +11,8 @@
 text
 lang en_US.UTF-8
 keyboard us
-timezone UTC --utc
+# Platform default: Eastern Standard Time display; keep the RTC in UTC.
+timezone America/New_York --utc
 rootpw --lock
 firstboot --enable
 selinux --enforcing

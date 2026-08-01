@@ -11,6 +11,7 @@ use mde_egui::style::Elevation;
 use mde_egui::{Motion, MotionPreset, Style, TypographyRole};
 use mde_files_egui::model::FileSearchTarget;
 use mde_theme::brand::icons::IconId;
+use serde::{Deserialize, Serialize};
 
 use crate::console::ConsoleSearchHit;
 use crate::datacenter::{FrontDoorLifecycleCandidate, FrontDoorLifecycleKind};
@@ -254,6 +255,7 @@ pub(crate) enum FrontDoorRequest {
     PinSurface(Surface),
     UnpinSurface(Surface),
     LaunchPeerApp(FrontDoorPeerAppTarget),
+    TogglePeerAppFavorite(FrontDoorPeerAppTarget),
     ConnectDesktopSource(String),
     InstanceLifecycle {
         unit_id: String,
@@ -266,6 +268,219 @@ pub(crate) enum FrontDoorRequest {
     OpenWorkbenchPlane(Plane),
 }
 
+/// The stable identity of a guest-owned Flatpak application.
+///
+/// Flatpak IDs are untrusted catalog data at this boundary. Keep the accepted
+/// grammar deliberately narrow: reverse-DNS components made only from ASCII
+/// letters, digits, and interior hyphens. This is an identity value, not a
+/// command, path, socket, or environment fragment.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub(crate) struct FlatpakAppId(String);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FlatpakAppIdError {
+    Blank,
+    TooLong,
+    InvalidGrammar,
+}
+
+impl FlatpakAppId {
+    const MAX_BYTES: usize = 255;
+
+    pub(crate) fn parse(raw: &str) -> Result<Self, FlatpakAppIdError> {
+        let value = raw.trim();
+        if value.is_empty() {
+            return Err(FlatpakAppIdError::Blank);
+        }
+        if value.len() > Self::MAX_BYTES {
+            return Err(FlatpakAppIdError::TooLong);
+        }
+        let components: Vec<&str> = value.split('.').collect();
+        if components.len() < 2
+            || components.iter().any(|component| {
+                let bytes = component.as_bytes();
+                bytes.is_empty()
+                    || !bytes[0].is_ascii_alphabetic()
+                    || bytes.last() == Some(&b'-')
+                    || bytes
+                        .iter()
+                        .any(|byte| !byte.is_ascii_alphanumeric() && *byte != b'-')
+            })
+        {
+            return Err(FlatpakAppIdError::InvalidGrammar);
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for FlatpakAppIdError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::Blank => "the Flatpak app ID is blank",
+            Self::TooLong => "the Flatpak app ID exceeds 255 bytes",
+            Self::InvalidGrammar => "the Flatpak app ID is not valid reverse-DNS identity",
+        };
+        f.write_str(message)
+    }
+}
+
+impl std::error::Error for FlatpakAppIdError {}
+
+/// Versioned, persistable identity for a Front Door favorite.
+///
+/// This is deliberately not a [`Surface`] and cannot be converted into one:
+/// a favorite names an admitted guest catalog row by its serving peer and
+/// typed Flatpak identity. It is suitable for a future owner of the existing
+/// profile preference store to persist without giving shell actions an
+/// arbitrary command or desktop ID.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub(crate) struct FrontDoorPeerAppFavorite {
+    node: String,
+    app_id: FlatpakAppId,
+}
+
+impl FrontDoorPeerAppFavorite {
+    const MAX_NODE_BYTES: usize = 128;
+
+    pub(crate) fn for_app(app: &FrontDoorPeerApp) -> Option<Self> {
+        if !app.is_admitted_flatpak() {
+            return None;
+        }
+        let node = bounded_peer_app_node(&app.node)?;
+        Some(Self {
+            node,
+            app_id: app.flatpak_id().ok()??,
+        })
+    }
+
+    fn matches(&self, app: &FrontDoorPeerApp) -> bool {
+        Self::for_app(app).as_ref() == Some(self)
+    }
+}
+
+/// The only durable shape Front Door may hand to a profile preference owner.
+/// Mutation is bounded and fail-closed; catalog refreshes do not silently
+/// rewrite or promote IDs that are absent from the current admitted catalog.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FrontDoorPeerAppFavorites {
+    pub(crate) schema_version: u16,
+    entries: Vec<FrontDoorPeerAppFavorite>,
+}
+
+impl FrontDoorPeerAppFavorites {
+    pub(crate) const SCHEMA_VERSION: u16 = 1;
+    pub(crate) const MAX_ENTRIES: usize = 24;
+
+    pub(crate) fn empty() -> Self {
+        Self {
+            schema_version: Self::SCHEMA_VERSION,
+            entries: Vec::new(),
+        }
+    }
+
+    /// Sanitize decoded profile data before it is used for ranking. Unknown
+    /// schema versions, duplicate identities, malformed node names, and
+    /// excess entries are rejected or dropped without affecting launch data.
+    pub(crate) fn bounded(self) -> Self {
+        if self.schema_version != Self::SCHEMA_VERSION {
+            return Self::empty();
+        }
+        let mut entries = Vec::with_capacity(Self::MAX_ENTRIES);
+        for entry in self.entries {
+            if FlatpakAppId::parse(entry.app_id.as_str()).is_err()
+                || bounded_peer_app_node(&entry.node).as_deref() != Some(entry.node.as_str())
+                || entries.contains(&entry)
+            {
+                continue;
+            }
+            if entries.len() == Self::MAX_ENTRIES {
+                break;
+            }
+            entries.push(entry);
+        }
+        Self {
+            schema_version: Self::SCHEMA_VERSION,
+            entries,
+        }
+    }
+
+    pub(crate) fn entries(&self) -> &[FrontDoorPeerAppFavorite] {
+        &self.entries
+    }
+
+    pub(crate) fn contains(&self, app: &FrontDoorPeerApp) -> bool {
+        self.entries.iter().any(|entry| entry.matches(app))
+    }
+
+    pub(crate) fn contains_target(&self, target: &FrontDoorPeerAppTarget) -> bool {
+        self.entries.iter().any(|entry| {
+            entry.node == target.node
+                && entry.app_id.as_str() == target.app_id
+        })
+    }
+
+    pub(crate) fn toggle_target(&mut self, target: &FrontDoorPeerAppTarget) -> bool {
+        if !target.source.eq_ignore_ascii_case("flatpak")
+            || FlatpakAppId::parse(&target.app_id).is_err()
+            || bounded_peer_app_node(&target.node).is_none()
+        {
+            return false;
+        }
+        let entry = FrontDoorPeerAppFavorite {
+            node: target.node.clone(),
+            app_id: FlatpakAppId::parse(&target.app_id).expect("validated above"),
+        };
+        if let Some(index) = self.entries.iter().position(|current| current == &entry) {
+            self.entries.remove(index);
+            return false;
+        }
+        if self.entries.len() >= Self::MAX_ENTRIES {
+            return false;
+        }
+        self.schema_version = Self::SCHEMA_VERSION;
+        self.entries.push(entry);
+        true
+    }
+
+    /// Toggle only an admitted Flatpak row. Returns `true` when the row is
+    /// pinned after the operation and `false` when it is unpinned or rejected.
+    pub(crate) fn toggle(&mut self, app: &FrontDoorPeerApp) -> bool {
+        let Some(entry) = FrontDoorPeerAppFavorite::for_app(app) else {
+            return false;
+        };
+        if let Some(index) = self.entries.iter().position(|current| current == &entry) {
+            self.entries.remove(index);
+            return false;
+        }
+        if self.entries.len() >= Self::MAX_ENTRIES {
+            return false;
+        }
+        self.schema_version = Self::SCHEMA_VERSION;
+        self.entries.push(entry);
+        true
+    }
+}
+
+fn bounded_peer_app_node(raw: &str) -> Option<String> {
+    let node = raw.trim();
+    if node.is_empty()
+        || node.len() > FrontDoorPeerAppFavorite::MAX_NODE_BYTES
+        || node == "."
+        || node == ".."
+        || node
+            .bytes()
+            .any(|byte| !byte.is_ascii_alphanumeric() && !matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        return None;
+    }
+    Some(node.to_owned())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FrontDoorPeerApp {
     pub(crate) id: String,
@@ -275,6 +490,39 @@ pub(crate) struct FrontDoorPeerApp {
     pub(crate) icon: String,
     pub(crate) health: String,
     pub(crate) state: String,
+    /// Signed catalog revision carried by a validated Flatpak catalog.
+    pub(crate) catalog_revision: Option<String>,
+    /// Approved guest profile carried by the catalog row.
+    pub(crate) guest_profile: Option<String>,
+    /// Policy capabilities carried by the catalog row.
+    pub(crate) requested_capabilities: Vec<String>,
+}
+
+impl FrontDoorPeerApp {
+    /// Validate the identity when this catalog row claims to be Flatpak.
+    /// Non-Flatpak peer rows remain discoverable through their existing path;
+    /// a malformed Flatpak row is not promoted to a launchable search result.
+    pub(crate) fn flatpak_id(&self) -> Result<Option<FlatpakAppId>, FlatpakAppIdError> {
+        if self.source.trim().eq_ignore_ascii_case("flatpak") {
+            FlatpakAppId::parse(&self.id).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn is_admitted_flatpak(&self) -> bool {
+        self.source.trim().eq_ignore_ascii_case("flatpak")
+            && self.state.trim().eq_ignore_ascii_case("installed")
+            && self
+                .catalog_revision
+                .as_deref()
+                .is_some_and(|revision| !revision.trim().is_empty())
+            && self
+                .guest_profile
+                .as_deref()
+                .is_some_and(|profile| !profile.trim().is_empty())
+            && self.flatpak_id().is_ok_and(|id| id.is_some())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -282,11 +530,48 @@ pub(crate) struct FrontDoorPeerAppTarget {
     pub(crate) node: String,
     pub(crate) app_id: String,
     pub(crate) name: String,
+    /// Catalog provenance. Flatpak targets are guest-owned and must use the
+    /// guest App VM mode; they must never be treated as host `.desktop` apps.
+    pub(crate) source: String,
+    /// Signed catalog revision required for App VM provisioning.
+    pub(crate) catalog_revision: Option<String>,
+    /// Approved guest profile required for App VM provisioning.
+    pub(crate) guest_profile: Option<String>,
+    /// Policy capabilities requested by the admitted catalog row.
+    pub(crate) requested_capabilities: Vec<String>,
+    /// Honest reason this catalog row is visible but not launchable. Keeping
+    /// this on the target lets Front Door preserve install/admission state
+    /// without manufacturing a launch action.
+    pub(crate) launch_blocked_reason: Option<String>,
 }
 
 impl FrontDoorPeerAppTarget {
     pub(crate) fn desktop_source_id(&self) -> String {
         format!("peer:{}", self.node)
+    }
+
+    /// Derive stable bounded identities for the Workloads desired record and
+    /// the session broker. The identity contains no executable data and is
+    /// rejected when catalog metadata is incomplete or the resulting filename
+    /// would exceed the platform's bounded key contract.
+    pub(crate) fn app_vm_identity(&self) -> Option<(String, String)> {
+        if !self.source.trim().eq_ignore_ascii_case("flatpak")
+            || self.catalog_revision.as_deref()?.trim().is_empty()
+            || self.guest_profile.as_deref()?.trim().is_empty()
+        {
+            return None;
+        }
+        let node = self.node.trim();
+        let app_id = self.app_id.trim();
+        if node.is_empty() || app_id.is_empty() || !safe_peer_app_id(app_id) {
+            return None;
+        }
+        let workload = format!("appvm-{node}-{app_id}");
+        let session = format!("app-session-{node}-{app_id}");
+        if workload.len() > 251 || session.len() > 255 {
+            return None;
+        }
+        Some((workload, session))
     }
 }
 
@@ -553,6 +838,7 @@ pub(crate) struct FrontDoorState {
     lifecycle_arm: Option<FrontDoorLifecycleArm>,
     service_lifecycle_arm: Option<FrontDoorServiceLifecycleArm>,
     taskbar_pins: Option<Vec<Surface>>,
+    peer_app_favorites: FrontDoorPeerAppFavorites,
 }
 
 impl FrontDoorState {
@@ -600,10 +886,18 @@ impl FrontDoorState {
         );
     }
 
+    pub(crate) fn set_peer_app_favorites(&mut self, favorites: &FrontDoorPeerAppFavorites) {
+        self.peer_app_favorites = favorites.clone().bounded();
+    }
+
     fn taskbar_surface_is_pinned(&self, surface: Surface) -> Option<bool> {
         self.taskbar_pins
             .as_ref()
             .map(|pins| pins.contains(&surface))
+    }
+
+    fn peer_app_is_favorite(&self, target: &FrontDoorPeerAppTarget) -> bool {
+        self.peer_app_favorites.contains_target(target)
     }
 
     pub(crate) fn selected_peer_node(
@@ -693,7 +987,185 @@ pub(crate) fn peer_app_search_items(
     apps: impl IntoIterator<Item = FrontDoorPeerApp>,
     rank_offset: usize,
 ) -> Vec<SearchItem<FrontDoorTarget>> {
-    apps.into_iter()
+    peer_app_search_items_with_favorites(apps, rank_offset, &FrontDoorPeerAppFavorites::empty())
+}
+
+fn peer_app_launch_block_reason(app: &FrontDoorPeerApp) -> Option<String> {
+    if !app.source.trim().eq_ignore_ascii_case("flatpak") {
+        return None;
+    }
+    if !app.state.trim().eq_ignore_ascii_case("installed") {
+        let state = if app.state.trim().is_empty() {
+            "availability unknown"
+        } else {
+            app.state.trim()
+        };
+        return Some(format!("not launchable: {state}"));
+    }
+    if app.catalog_revision.as_deref().is_none_or(|value| value.trim().is_empty())
+        || app.guest_profile.as_deref().is_none_or(|value| value.trim().is_empty())
+    {
+        return Some("not launchable: admission pending".to_owned());
+    }
+    None
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrontDoorPeerAppLaunchState {
+    Ready,
+    Installing,
+    WaitingForPlacement,
+    StartingGuest,
+    StartingApp,
+    Connected,
+    Paused,
+    Reconnecting,
+    NotInstalled,
+    Denied,
+    StaleCatalog,
+    UnsignedCatalog,
+    Unavailable,
+    Failed,
+}
+
+impl FrontDoorPeerAppLaunchState {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Ready => "Ready to launch",
+            Self::Installing => "Installing",
+            Self::WaitingForPlacement => "Waiting for placement",
+            Self::StartingGuest => "Starting guest",
+            Self::StartingApp => "Starting app",
+            Self::Connected => "Connected",
+            Self::Paused => "Paused",
+            Self::Reconnecting => "Reconnecting",
+            Self::NotInstalled => "Not installed",
+            Self::Denied => "Launch denied",
+            Self::StaleCatalog => "Stale catalog",
+            Self::UnsignedCatalog => "Unsigned catalog",
+            Self::Unavailable => "Unavailable",
+            Self::Failed => "Launch failed",
+        }
+    }
+
+    const fn action_label(self) -> &'static str {
+        match self {
+            Self::Ready => "Launch",
+            Self::Paused => "Resume",
+            Self::Reconnecting => "Reconnect",
+            Self::NotInstalled => "Install",
+            Self::StaleCatalog => "Refresh",
+            Self::Installing
+            | Self::WaitingForPlacement
+            | Self::StartingGuest
+            | Self::StartingApp
+            | Self::Connected
+            | Self::Denied
+            | Self::UnsignedCatalog
+            | Self::Unavailable
+            | Self::Failed => "Unavailable",
+        }
+    }
+
+    const fn guidance(self) -> &'static str {
+        match self {
+            Self::Ready => "Construct will place or resume one guest App VM session.",
+            Self::Installing => "Guest content is being installed; launch will remain disabled until it is ready.",
+            Self::WaitingForPlacement => "The admitted guest is waiting for a permitted mesh placement.",
+            Self::StartingGuest => "The guest is booting; Construct will keep the same session identity.",
+            Self::StartingApp => "The guest compositor is ready and the application is starting.",
+            Self::Connected => "The application session is connected; use Desktop to focus it.",
+            Self::Paused => "The guest session is paused; resume it from the existing Desktop session.",
+            Self::Reconnecting => "The same guest session is reconnecting; no new VM will be created.",
+            Self::NotInstalled => "Guest content is not installed; no host fallback is available.",
+            Self::Denied => "The catalog or guest policy denied this launch.",
+            Self::StaleCatalog => "Refresh the signed catalog before launching this revision.",
+            Self::UnsignedCatalog => "A signed catalog is required before this app can launch.",
+            Self::Unavailable => "The guest provider is unavailable; retry when it recovers.",
+            Self::Failed => "The guest session failed; retry keeps the app identity and placement intent.",
+        }
+    }
+}
+
+fn peer_app_launch_state(target: &FrontDoorPeerAppTarget) -> FrontDoorPeerAppLaunchState {
+    let Some(reason) = target.launch_blocked_reason.as_deref() else {
+        return FrontDoorPeerAppLaunchState::Ready;
+    };
+    let state = reason
+        .strip_prefix("not launchable:")
+        .unwrap_or(reason)
+        .trim()
+        .to_ascii_lowercase();
+    match state.as_str() {
+        "installing" => FrontDoorPeerAppLaunchState::Installing,
+        "waiting_for_placement" | "waiting for placement" => {
+            FrontDoorPeerAppLaunchState::WaitingForPlacement
+        }
+        "starting_guest" | "starting guest" => FrontDoorPeerAppLaunchState::StartingGuest,
+        "starting_app" | "starting app" => FrontDoorPeerAppLaunchState::StartingApp,
+        "connected" => FrontDoorPeerAppLaunchState::Connected,
+        "paused" => FrontDoorPeerAppLaunchState::Paused,
+        "reconnecting" => FrontDoorPeerAppLaunchState::Reconnecting,
+        "available" | "not_installed" | "not installed" => {
+            FrontDoorPeerAppLaunchState::NotInstalled
+        }
+        "denied" => FrontDoorPeerAppLaunchState::Denied,
+        "stale" | "stale_catalog" | "stale catalog" => {
+            FrontDoorPeerAppLaunchState::StaleCatalog
+        }
+        "unsigned" | "unsigned catalog" => FrontDoorPeerAppLaunchState::UnsignedCatalog,
+        "failed" => FrontDoorPeerAppLaunchState::Failed,
+        "unavailable" | "availability unknown" => FrontDoorPeerAppLaunchState::Unavailable,
+        _ => FrontDoorPeerAppLaunchState::Unavailable,
+    }
+}
+
+fn bounded_front_door_permission(value: &str) -> String {
+    const MAX_PERMISSION_CHARS: usize = 40;
+    let mut value = value.trim().chars().take(MAX_PERMISSION_CHARS).collect::<String>();
+    if value.chars().count() == MAX_PERMISSION_CHARS {
+        value.push_str("...");
+    }
+    value
+}
+
+fn peer_app_permission_explanation(target: &FrontDoorPeerAppTarget) -> String {
+    const MAX_PERMISSION_SUMMARY_CHARS: usize = 180;
+    let permissions = target
+        .requested_capabilities
+        .iter()
+        .filter_map(|capability| {
+            let capability = bounded_front_door_permission(capability);
+            (!capability.is_empty()).then_some(capability)
+        })
+        .take(4)
+        .collect::<Vec<_>>();
+    let requested = if permissions.is_empty() {
+        "no extra guest permissions declared".to_owned()
+    } else {
+        format!("requested guest permissions: {}", permissions.join(", "))
+    };
+    let mut summary = format!(
+        "{requested}; launch stays inside the App VM (isolated App VM); host files, host D-Bus, and host compositor access remain blocked"
+    );
+    if summary.chars().count() > MAX_PERMISSION_SUMMARY_CHARS {
+        summary = summary.chars().take(MAX_PERMISSION_SUMMARY_CHARS).collect();
+        summary.push_str("...");
+    }
+    summary
+}
+
+/// Project admitted peer apps with persistable catalog favorites first while
+/// retaining the existing stable order within each group. The favorite set is
+/// only a typed ranking input; it never changes the launch target or creates a
+/// host taskbar [`Surface`].
+pub(crate) fn peer_app_search_items_with_favorites(
+    apps: impl IntoIterator<Item = FrontDoorPeerApp>,
+    rank_offset: usize,
+    favorites: &FrontDoorPeerAppFavorites,
+) -> Vec<SearchItem<FrontDoorTarget>> {
+    let mut candidates = apps
+        .into_iter()
         .enumerate()
         .filter_map(|(idx, app)| {
             let node = app.node.trim();
@@ -702,12 +1174,43 @@ pub(crate) fn peer_app_search_items(
             if node.is_empty() || name.is_empty() || id.is_empty() {
                 return None;
             }
+            // Catalog data is untrusted. A malformed Flatpak identity is
+            // omitted before it can become a Front Door launch target.
+            app.flatpak_id().ok()?;
+            Some((idx, app))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|(idx, app)| (!favorites.contains(app), *idx));
+
+    candidates
+        .into_iter()
+        .enumerate()
+        .map(|(display_idx, (_, app))| {
+            let node = app.node.trim();
+            let name = app.name.trim();
+            let id = app.id.trim();
+            let launch_blocked_reason = peer_app_launch_block_reason(&app);
             let target = FrontDoorPeerAppTarget {
                 node: node.to_owned(),
                 app_id: id.to_owned(),
                 name: name.to_owned(),
+                source: app.source.trim().to_ascii_lowercase(),
+                catalog_revision: app.catalog_revision,
+                guest_profile: app.guest_profile,
+                requested_capabilities: app.requested_capabilities,
+                launch_blocked_reason,
             };
-            let target_line = format!("on {} · {}", node, peer_app_source_label(&app.source));
+            let status = target
+                .launch_blocked_reason
+                .as_deref()
+                .map(|reason| format!(" · {reason}"))
+                .unwrap_or_default();
+            let target_line = format!(
+                "Guest {} · on {}{}",
+                peer_app_source_label(&app.source),
+                node,
+                status
+            );
             let mut terms = vec![
                 "peer app".to_owned(),
                 "remote app".to_owned(),
@@ -722,16 +1225,14 @@ pub(crate) fn peer_app_search_items(
             if !app.state.trim().is_empty() {
                 terms.push(app.state);
             }
-            Some(
-                SearchItem::new(
-                    SearchDomain::App,
-                    name.to_owned(),
-                    target_line,
-                    FrontDoorTarget::PeerApp(target),
-                )
-                .with_terms(terms)
-                .with_source_rank(rank_offset + idx),
+            SearchItem::new(
+                SearchDomain::App,
+                name.to_owned(),
+                target_line,
+                FrontDoorTarget::PeerApp(target),
             )
+            .with_terms(terms)
+            .with_source_rank(rank_offset + display_idx)
         })
         .collect()
 }
@@ -1236,6 +1737,7 @@ pub(crate) fn front_door_panel_with_sources(
                 | FrontDoorRequest::PinSurface(_)
                 | FrontDoorRequest::UnpinSurface(_)
                 | FrontDoorRequest::LaunchPeerApp(_)
+                | FrontDoorRequest::TogglePeerAppFavorite(_)
                 | FrontDoorRequest::ConnectDesktopSource(_)
                 | FrontDoorRequest::OpenWorkbenchPlane(_)
         )
@@ -1928,7 +2430,7 @@ fn action_button_label_visible(button_width: f32) -> bool {
 fn primary_action_label(hit: &SearchHit<FrontDoorTarget>) -> &'static str {
     match &hit.item.payload {
         FrontDoorTarget::App(_) => "Launch",
-        FrontDoorTarget::PeerApp(_) => "Launch",
+        FrontDoorTarget::PeerApp(target) => peer_app_launch_state(target).action_label(),
         FrontDoorTarget::Workflow(_) | FrontDoorTarget::ServiceLifecycle(_) => "Open",
         FrontDoorTarget::File(_)
         | FrontDoorTarget::Browser(_)
@@ -2137,18 +2639,111 @@ fn service_lifecycle_wire_with(
 }
 
 pub(crate) fn peer_app_launch_wire(target: &FrontDoorPeerAppTarget) -> Option<(String, String)> {
+    if target.launch_blocked_reason.is_some() {
+        return None;
+    }
     let node = target.node.trim();
     let app_id = target.app_id.trim();
-    if node.is_empty() || app_id.is_empty() {
+    let source = target.source.trim().to_ascii_lowercase();
+    let mode = match source.as_str() {
+        "xdg" => "legacy-host",
+        "flatpak" => {
+            // A Flatpak identity is guest-owned even if an exported desktop
+            // file is visible on the host. The wire records the future guest
+            // plane explicitly; the legacy worker will fail closed until that
+            // plane exists.
+            FlatpakAppId::parse(app_id).ok()?;
+            "guest-app-vm"
+        }
+        _ => return None,
+    };
+    if node.is_empty() || app_id.is_empty() || !safe_peer_app_id(app_id) {
         return None;
     }
     let body = serde_json::json!({
         "node": node,
         "app_id": app_id,
         "name": target.name.trim(),
+        "source": source,
+        "mode": mode,
     })
     .to_string();
     Some(("action/apps/launch".to_owned(), body))
+}
+
+/// Build the authorized Workloads declaration for a catalog-backed Flatpak.
+/// XDG targets deliberately remain on [`peer_app_launch_wire`]; a Flatpak
+/// target reaches the cloud desired-state plane only when its signed catalog
+/// policy is present and its bounded App VM identities can be derived.
+pub(crate) fn peer_app_provision_wire(
+    target: &FrontDoorPeerAppTarget,
+) -> Result<(String, String), String> {
+    peer_app_provision_wire_with(target, crate::iac::authorize_root_mutation_body)
+}
+
+fn peer_app_provision_wire_with(
+    target: &FrontDoorPeerAppTarget,
+    authorize: impl FnOnce(&str, &str, &str, &str) -> Result<String, String>,
+) -> Result<(String, String), String> {
+    let node = target.node.trim();
+    if node.is_empty()
+        || node.len() > 255
+        || !node.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')
+        })
+    {
+        return Err("Flatpak App VM placement node is incomplete or unsafe.".to_owned());
+    }
+    let app_id = FlatpakAppId::parse(target.app_id.trim())
+        .map_err(|error| format!("Flatpak App VM identity is invalid: {error}"))?;
+    let (name, session_id) = target
+        .app_vm_identity()
+        .ok_or_else(|| "Flatpak App VM catalog metadata is incomplete.".to_owned())?;
+    let catalog_revision = target
+        .catalog_revision
+        .as_deref()
+        .ok_or_else(|| "Flatpak App VM catalog revision is missing.".to_owned())?;
+    let guest_profile = target
+        .guest_profile
+        .as_deref()
+        .ok_or_else(|| "Flatpak App VM guest profile is missing.".to_owned())?;
+    let request = mackes_mesh_types::vdi_session::AppVmLaunchRequest::new(
+        app_id.as_str(),
+        catalog_revision,
+        guest_profile,
+        target.requested_capabilities.clone(),
+        session_id,
+        true,
+    )
+    .map_err(|error| format!("Flatpak App VM declaration is invalid: {error}"))?;
+    let capability_target = format!(
+        "app-vm:{node}:{name}:{}:{}",
+        request.app_id, request.catalog_revision
+    );
+    let body = serde_json::json!({
+        "schema_version": mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION,
+        "node": node,
+        "name": name,
+        "app_id": request.app_id,
+        "catalog_revision": request.catalog_revision,
+        "guest_profile": request.guest_profile,
+        "requested_capabilities": request.requested_capabilities,
+        "session_id": request.session_id,
+        "resume": request.resume,
+    })
+    .to_string();
+    let body = authorize(&body, "app-provision", node, &capability_target)?;
+    Ok(("action/cloud/app-provision".to_owned(), body))
+}
+
+/// Final wire-boundary guard for targets assembled outside the catalog fold.
+/// It rejects control/path delimiters without interpreting the value as an
+/// executable string. Flatpak rows have already passed [`FlatpakAppId`].
+fn safe_peer_app_id(value: &str) -> bool {
+    value.len() <= FlatpakAppId::MAX_BYTES
+        && !value.chars().any(|ch| {
+            ch.is_control() || ch.is_whitespace() || matches!(ch, '/' | '\\' | ':' | '|')
+        })
 }
 
 fn primary_action_accesskit_id(hit: &SearchHit<FrontDoorTarget>) -> egui::Id {
@@ -2166,7 +2761,15 @@ fn install_primary_action_accessibility(
     rect: egui::Rect,
 ) {
     let _ = ctx.accesskit_node_builder(primary_action_accesskit_id(hit), |node| {
-        node.set_role(egui::accesskit::Role::Button);
+        let blocked = matches!(
+            &hit.item.payload,
+            FrontDoorTarget::PeerApp(target) if target.launch_blocked_reason.is_some()
+        );
+        node.set_role(if blocked {
+            egui::accesskit::Role::Status
+        } else {
+            egui::accesskit::Role::Button
+        });
         node.set_label(format!("{} {}", primary_action_label(hit), hit.item.title));
         node.set_value(format!(
             "Primary action: {}, {}",
@@ -2174,7 +2777,9 @@ fn install_primary_action_accessibility(
             result_accessibility_target(hit)
         ));
         node.set_bounds(accesskit_rect(rect));
-        node.add_action(egui::accesskit::Action::Click);
+        if !blocked {
+            node.add_action(egui::accesskit::Action::Click);
+        }
     });
 }
 
@@ -2462,10 +3067,21 @@ fn action_button(
     label: &str,
     icon: IconId,
     selected: bool,
+    enabled: bool,
 ) -> egui::Response {
-    let response = ui.interact(rect, id, egui::Sense::click());
+    let response = ui.interact(
+        rect,
+        id,
+        if enabled {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        },
+    );
     let show_label = action_button_label_visible(rect.width());
-    let button_fill = if response.hovered() {
+    let button_fill = if !enabled {
+        Style::SURFACE_HI
+    } else if response.hovered() {
         Style::ACCENT.linear_multiply(0.28)
     } else if selected {
         Style::ACCENT.linear_multiply(0.22)
@@ -2476,7 +3092,7 @@ fn action_button(
     ui.painter().rect_stroke(
         rect,
         5.0,
-        egui::Stroke::new(1.0, Style::ACCENT),
+        egui::Stroke::new(1.0, if enabled { Style::ACCENT } else { Style::BORDER }),
         egui::StrokeKind::Inside,
     );
 
@@ -2487,7 +3103,12 @@ fn action_button(
         rect.center()
     };
     let icon_rect = egui::Rect::from_center_size(icon_center, egui::vec2(icon_size, icon_size));
-    if let Some(tex) = icon_texture(ui.ctx(), icon, icon_size, Style::TEXT) {
+    if let Some(tex) = icon_texture(
+        ui.ctx(),
+        icon,
+        icon_size,
+        if enabled { Style::TEXT } else { Style::TEXT_DIM },
+    ) {
         let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
         ui.painter()
             .image(tex.id(), icon_rect, uv, egui::Color32::WHITE);
@@ -2505,7 +3126,7 @@ fn action_button(
                 egui::Align2::CENTER_CENTER,
                 label,
                 Style::typography_font(TypographyRole::Label),
-                Style::TEXT,
+                if enabled { Style::TEXT } else { Style::TEXT_DIM },
             );
         response
     } else {
@@ -2546,6 +3167,10 @@ fn result_action_panel(
         primary_action_label(hit),
         result_icon_id(hit),
         false,
+        !matches!(
+            &hit.item.payload,
+            FrontDoorTarget::PeerApp(target) if target.launch_blocked_reason.is_some()
+        ),
     );
 
     let mut connect_response = None;
@@ -2575,6 +3200,7 @@ fn result_action_panel(
                 service_lifecycle_action_label(state, service_target, *op),
                 op.icon(),
                 armed,
+                true,
             );
             install_service_lifecycle_action_accessibility(
                 ui.ctx(),
@@ -2615,6 +3241,7 @@ fn result_action_panel(
                 lifecycle_action_label(state, &lifecycle_target, op),
                 op.icon(),
                 armed,
+                true,
             );
             install_instance_lifecycle_action_accessibility(
                 ui.ctx(),
@@ -2646,6 +3273,7 @@ fn result_action_panel(
                 "Connect",
                 IconId::Desktop,
                 false,
+                true,
             );
             install_connect_desktop_action_accessibility(ui.ctx(), hit, connect_rect, &source_id);
             connect_response = Some((source_id.to_owned(), response));
@@ -2670,6 +3298,7 @@ fn result_action_panel(
                 workflow_action.label,
                 workflow_action.icon,
                 false,
+                true,
             );
             install_workflow_quick_action_accessibility(ui.ctx(), hit, workflow_action, quick_rect);
             workflow_quick_response = Some((workflow_action, response));
@@ -2711,15 +3340,36 @@ fn result_action_panel(
                 })
         });
         let lifecycle_note = service_lifecycle_note.or(instance_lifecycle_note);
-        let (text, color) = lifecycle_note
-            .as_deref()
-            .map_or((hit.item.target.as_str(), Style::TEXT_DIM), |note| {
-                (note, Style::WARN)
-            });
+        let peer_app_note = match &hit.item.payload {
+            FrontDoorTarget::PeerApp(target) => Some(format!(
+                "{} · {}",
+                peer_app_launch_state(target).guidance(),
+                peer_app_permission_explanation(target)
+            )),
+            _ => None,
+        };
+        let (text, color) = if let Some(note) = lifecycle_note {
+            (note, Style::WARN)
+        } else if let Some(note) = peer_app_note {
+            (
+                note,
+                if matches!(
+                    &hit.item.payload,
+                    FrontDoorTarget::PeerApp(target)
+                        if target.launch_blocked_reason.is_some()
+                ) {
+                    Style::WARN
+                } else {
+                    Style::TEXT_DIM
+                },
+            )
+        } else {
+            (hit.item.target.clone(), Style::TEXT_DIM)
+        };
         ui.painter().with_clip_rect(text_rect).text(
             egui::pos2(text_rect.left(), text_rect.center().y),
             egui::Align2::LEFT_CENTER,
-            text,
+            &text,
             Style::typography_font(TypographyRole::Caption),
             color,
         );
@@ -2750,9 +3400,16 @@ fn result_action_panel(
             return Some(FrontDoorRequest::OpenWorkbenchPlane(workflow_action.plane));
         }
     }
-    primary_response
-        .clicked()
-        .then(|| activation_request_for_hit(hit))
+    primary_response.clicked().then(|| {
+        if matches!(
+            &hit.item.payload,
+            FrontDoorTarget::PeerApp(target) if target.launch_blocked_reason.is_some()
+        ) {
+            None
+        } else {
+            Some(activation_request_for_hit(hit))
+        }
+    })?
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -2761,6 +3418,7 @@ enum ResultContextItem {
     WorkflowPlane,
     ConnectDesktop,
     Taskbar,
+    Favorite,
 }
 
 fn result_context_item_id(hit: &SearchHit<FrontDoorTarget>, item: ResultContextItem) -> egui::Id {
@@ -2812,11 +3470,17 @@ fn result_context_menu_request(
 ) -> Option<FrontDoorRequest> {
     let mut request = None;
     let _ = front_door_context_menu(response, |ui| {
-        if context_menu_row(
-            ui,
-            result_context_item_id(hit, ResultContextItem::Open),
-            primary_action_label(hit),
-        ) {
+        let peer_app_blocked = matches!(
+            &hit.item.payload,
+            FrontDoorTarget::PeerApp(target) if target.launch_blocked_reason.is_some()
+        );
+        if !peer_app_blocked
+            && context_menu_row(
+                ui,
+                result_context_item_id(hit, ResultContextItem::Open),
+                primary_action_label(hit),
+            )
+        {
             request = Some(activation_request_for_hit(hit));
             ui.close_menu();
         }
@@ -2856,6 +3520,21 @@ fn result_context_menu_request(
                     request = Some(taskbar_surface_action(surface, pinned));
                     ui.close_menu();
                 }
+            }
+        }
+        if let FrontDoorTarget::PeerApp(target) = &hit.item.payload {
+            let label = if state.peer_app_is_favorite(target) {
+                "Remove from Front Door favorites"
+            } else {
+                "Pin to Front Door favorites"
+            };
+            if context_menu_row(
+                ui,
+                result_context_item_id(hit, ResultContextItem::Favorite),
+                label,
+            ) {
+                request = Some(FrontDoorRequest::TogglePeerAppFavorite(target.clone()));
+                ui.close_menu();
             }
         }
     });
@@ -3172,8 +3851,37 @@ fn result_accesskit_value(hit: &SearchHit<FrontDoorTarget>, index: usize, total:
 fn result_accessibility_target(hit: &SearchHit<FrontDoorTarget>) -> String {
     match &hit.item.payload {
         FrontDoorTarget::Workflow(card) => workflow_accessibility_value(*card),
+        FrontDoorTarget::PeerApp(target) => peer_app_accessibility_value(target),
         _ => hit.item.target.clone(),
     }
+}
+
+fn peer_app_accessibility_value(target: &FrontDoorPeerAppTarget) -> String {
+    peer_app_accessibility_value_with_favorite(target, false)
+}
+
+pub(crate) fn peer_app_accessibility_value_with_favorite(
+    target: &FrontDoorPeerAppTarget,
+    favorite: bool,
+) -> String {
+    let source = if target.source.trim().eq_ignore_ascii_case("flatpak") {
+        "guest Flatpak application"
+    } else {
+        "guest peer application"
+    };
+    let favorite = if favorite {
+        "; favorite, ranked before other admitted peer apps"
+    } else {
+        ""
+    };
+    let launch_state = peer_app_launch_state(target);
+    format!(
+        "{source}; node {}; {}; {} — {}{favorite}; desktop connection is separate",
+        target.node,
+        launch_state.label(),
+        launch_state.guidance(),
+        peer_app_permission_explanation(target),
+    )
 }
 
 fn install_result_accessibility(
@@ -3212,7 +3920,7 @@ fn result_domain_label(hit: &SearchHit<FrontDoorTarget>) -> &'static str {
     match &hit.item.payload {
         FrontDoorTarget::ConsoleCommand(_) => "Command",
         FrontDoorTarget::Workflow(card) => card.kind.label(),
-        FrontDoorTarget::PeerApp(_) => "Peer App",
+        FrontDoorTarget::PeerApp(_) => "Guest App",
         FrontDoorTarget::ServiceLifecycle(_) => "Service",
         _ => domain_label(hit.item.domain),
     }
@@ -3810,6 +4518,7 @@ mod tests {
             FrontDoorRequest::Activate(target) => Some(target),
             FrontDoorRequest::PinSurface(_) | FrontDoorRequest::UnpinSurface(_) => None,
             FrontDoorRequest::LaunchPeerApp(_)
+            | FrontDoorRequest::TogglePeerAppFavorite(_)
             | FrontDoorRequest::ConnectDesktopSource(_)
             | FrontDoorRequest::InstanceLifecycle { .. }
             | FrontDoorRequest::ServiceLifecycle { .. }
@@ -5883,6 +6592,257 @@ mod tests {
     }
 
     #[test]
+    fn flatpak_app_id_is_typed_and_fail_closed() {
+        let id = FlatpakAppId::parse("org.mozilla.Firefox.desktop").expect("valid Flatpak ID");
+        assert_eq!(id.as_str(), "org.mozilla.Firefox.desktop");
+        for invalid in [
+            "",
+            "Firefox",
+            "org..Firefox",
+            "org.mozilla.Firefox/desktop",
+            "org.mozilla.-Firefox",
+            "org.mozilla.Firefox-",
+            "org.mozilla.Firefox\n.desktop",
+        ] {
+            assert!(
+                FlatpakAppId::parse(invalid).is_err(),
+                "malformed ID should be rejected: {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_flatpak_peer_rows_never_become_front_door_targets() {
+        let items = peer_app_search_items(
+            [
+                FrontDoorPeerApp {
+                    id: "org.example.Good".to_owned(),
+                    name: "Good".to_owned(),
+                    node: "oak".to_owned(),
+                    source: "flatpak".to_owned(),
+                    icon: String::new(),
+                    health: String::new(),
+                    state: "installed".to_owned(),
+                    catalog_revision: Some("catalog-test".to_owned()),
+                    guest_profile: Some("wayland-standard".to_owned()),
+                    requested_capabilities: Vec::new(),
+                },
+                FrontDoorPeerApp {
+                    id: "org.example.Bad/Path".to_owned(),
+                    name: "Bad".to_owned(),
+                    node: "oak".to_owned(),
+                    source: "flatpak".to_owned(),
+                    icon: String::new(),
+                    health: String::new(),
+                    state: "installed".to_owned(),
+                    catalog_revision: Some("catalog-test".to_owned()),
+                    guest_profile: Some("wayland-standard".to_owned()),
+                    requested_capabilities: Vec::new(),
+                },
+            ],
+            0,
+        );
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title, "Good");
+    }
+
+    fn admitted_peer_app(id: &str, name: &str, node: &str) -> FrontDoorPeerApp {
+        FrontDoorPeerApp {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            node: node.to_owned(),
+            source: "flatpak".to_owned(),
+            icon: String::new(),
+            health: "ready".to_owned(),
+            state: "installed".to_owned(),
+            catalog_revision: Some("catalog-test".to_owned()),
+            guest_profile: Some("wayland-standard".to_owned()),
+            requested_capabilities: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn peer_app_favorites_are_versioned_bounded_and_admission_gated() {
+        let good = admitted_peer_app("org.example.Editor", "Editor", "oak");
+        let not_admitted = FrontDoorPeerApp {
+            state: "available".to_owned(),
+            ..good.clone()
+        };
+        let host_row = FrontDoorPeerApp {
+            source: "desktop".to_owned(),
+            ..good.clone()
+        };
+        let mut favorites = FrontDoorPeerAppFavorites::empty();
+
+        assert!(favorites.toggle(&good));
+        assert!(favorites.contains(&good));
+        assert!(!favorites.toggle(&not_admitted));
+        assert!(!favorites.toggle(&host_row));
+        assert_eq!(favorites.entries().len(), 1);
+        assert!(!favorites.toggle(&good));
+        assert!(favorites.entries().is_empty());
+
+        let mut decoded = FrontDoorPeerAppFavorites {
+            schema_version: FrontDoorPeerAppFavorites::SCHEMA_VERSION,
+            entries: vec![FrontDoorPeerAppFavorite {
+                node: "oak/escape".to_owned(),
+                app_id: FlatpakAppId("org.example.Bad/Path".to_owned()),
+            }],
+        };
+        decoded.entries.push(FrontDoorPeerAppFavorite {
+            node: "oak".to_owned(),
+            app_id: FlatpakAppId("org.example.Editor".to_owned()),
+        });
+        let bounded = decoded.bounded();
+        assert_eq!(
+            bounded.entries(),
+            &[FrontDoorPeerAppFavorite {
+                node: "oak".to_owned(),
+                app_id: FlatpakAppId("org.example.Editor".to_owned()),
+            }]
+        );
+
+        let mut full = FrontDoorPeerAppFavorites::empty();
+        for index in 0..FrontDoorPeerAppFavorites::MAX_ENTRIES {
+            assert!(full.toggle(&admitted_peer_app(
+                &format!("org.example.App{index}"),
+                "App",
+                "oak",
+            )));
+        }
+        assert!(!full.toggle(&admitted_peer_app(
+            "org.example.Overflow",
+            "Overflow",
+            "oak"
+        )));
+        assert_eq!(full.entries().len(), FrontDoorPeerAppFavorites::MAX_ENTRIES);
+    }
+
+    #[test]
+    fn peer_app_favorites_round_trip_and_rank_without_host_surface_conversion() {
+        let first = admitted_peer_app("org.example.First", "First", "oak");
+        let second = admitted_peer_app("org.example.Second", "Second", "oak");
+        let mut favorites = FrontDoorPeerAppFavorites::empty();
+        assert!(favorites.toggle(&second));
+
+        let encoded = serde_json::to_string(&favorites).expect("encode favorites");
+        let decoded: FrontDoorPeerAppFavorites =
+            serde_json::from_str::<FrontDoorPeerAppFavorites>(&encoded)
+                .expect("decode favorites")
+                .bounded();
+        let items = peer_app_search_items_with_favorites([first, second], 0, &decoded);
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Second", "First"]
+        );
+        assert!(matches!(items[0].payload, FrontDoorTarget::PeerApp(_)));
+        assert!(
+            taskbar_surface_for_hit(&ranked_front_door_hits("second", items.clone())[0]).is_none()
+        );
+
+        let FrontDoorTarget::PeerApp(target) = &items[0].payload else {
+            panic!("favorite must remain a peer-app target")
+        };
+        let accessible = peer_app_accessibility_value_with_favorite(target, true);
+        assert!(accessible.contains("favorite, ranked before other admitted peer apps"));
+        assert!(accessible.contains("launch stays inside the App VM"));
+    }
+
+    #[test]
+    fn peer_app_launch_wire_rejects_path_like_identity() {
+        let target = FrontDoorPeerAppTarget {
+            node: "oak".to_owned(),
+            app_id: "org.example.Bad/Path".to_owned(),
+            name: "Bad".to_owned(),
+            source: "flatpak".to_owned(),
+            catalog_revision: Some("catalog-test".to_owned()),
+            guest_profile: Some("wayland-standard".to_owned()),
+            requested_capabilities: Vec::new(),
+            launch_blocked_reason: None,
+        };
+        assert!(peer_app_launch_wire(&target).is_none());
+    }
+
+    #[test]
+    fn peer_app_search_preserves_non_launchable_guest_state_without_launch_wire() {
+        let items = peer_app_search_items(
+            [FrontDoorPeerApp {
+                id: "org.example.Editor".to_owned(),
+                name: "Editor".to_owned(),
+                node: "oak".to_owned(),
+                source: "flatpak".to_owned(),
+                icon: "editor".to_owned(),
+                health: "online".to_owned(),
+                state: "stale".to_owned(),
+                catalog_revision: Some("catalog-test".to_owned()),
+                guest_profile: Some("wayland-standard".to_owned()),
+                requested_capabilities: Vec::new(),
+            }],
+            0,
+        );
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].target, "Guest Flatpak · on oak · not launchable: stale");
+        let FrontDoorTarget::PeerApp(target) = &items[0].payload else {
+            panic!("guest state should remain a peer-app result");
+        };
+        assert!(target.launch_blocked_reason.is_some());
+        assert!(peer_app_launch_wire(target).is_none());
+        assert!(peer_app_accessibility_value(target).contains("Stale catalog"));
+        assert!(peer_app_accessibility_value(target).contains("Refresh the signed catalog"));
+    }
+
+    #[test]
+    fn peer_app_presentation_explains_permissions_and_preserves_reconnect_states() {
+        let mut target = FrontDoorPeerAppTarget {
+            node: "oak".to_owned(),
+            app_id: "org.example.Editor".to_owned(),
+            name: "Editor".to_owned(),
+            source: "flatpak".to_owned(),
+            catalog_revision: Some("catalog-test".to_owned()),
+            guest_profile: Some("wayland-standard".to_owned()),
+            requested_capabilities: vec![
+                "audio".to_owned(),
+                "network".to_owned(),
+                "x".repeat(200),
+            ],
+            launch_blocked_reason: None,
+        };
+
+        assert_eq!(peer_app_launch_state(&target), FrontDoorPeerAppLaunchState::Ready);
+        let explanation = peer_app_permission_explanation(&target);
+        assert!(explanation.contains("requested guest permissions: audio, network"));
+        assert!(explanation.contains("isolated App VM"));
+        assert!(explanation.chars().count() <= 183);
+
+        for (raw_state, expected, action) in [
+            (
+                "reconnecting",
+                FrontDoorPeerAppLaunchState::Reconnecting,
+                "Reconnect",
+            ),
+            ("paused", FrontDoorPeerAppLaunchState::Paused, "Resume"),
+            (
+                "starting_guest",
+                FrontDoorPeerAppLaunchState::StartingGuest,
+                "Unavailable",
+            ),
+            (
+                "stale",
+                FrontDoorPeerAppLaunchState::StaleCatalog,
+                "Refresh",
+            ),
+        ] {
+            target.launch_blocked_reason = Some(format!("not launchable: {raw_state}"));
+            assert_eq!(peer_app_launch_state(&target), expected);
+            assert_eq!(expected.action_label(), action);
+            assert!(peer_app_permission_explanation(&target).contains("isolated App VM"));
+        }
+    }
+
+    #[test]
     fn front_door_selected_peer_app_reports_owning_node_for_lazy_load_context() {
         let mut state = FrontDoorState::default();
         state.open();
@@ -5895,6 +6855,9 @@ mod tests {
                 icon: "firefox".to_owned(),
                 health: "online".to_owned(),
                 state: "installed".to_owned(),
+                catalog_revision: Some("catalog-test".to_owned()),
+                guest_profile: Some("wayland-standard".to_owned()),
+                requested_capabilities: Vec::new(),
             }],
             0,
         );
@@ -5916,6 +6879,9 @@ mod tests {
                 icon: "firefox".to_owned(),
                 health: "online".to_owned(),
                 state: "installed".to_owned(),
+                catalog_revision: Some("catalog-test".to_owned()),
+                guest_profile: Some("wayland-standard".to_owned()),
+                requested_capabilities: Vec::new(),
             }],
             0,
         );
@@ -5939,6 +6905,9 @@ mod tests {
         assert_eq!(body["node"], "oak");
         assert_eq!(body["app_id"], "org.mozilla.Firefox.desktop");
         assert_eq!(body["name"], "Firefox");
+        assert_eq!(body["source"], "flatpak");
+        assert_eq!(body["mode"], "guest-app-vm");
+        assert_eq!(items[0].target, "Guest Flatpak · on oak");
 
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -5951,6 +6920,15 @@ mod tests {
             items,
         );
         let nodes = accesskit_nodes(&out);
+        let result = nodes
+            .iter()
+            .map(|(_, node)| node)
+            .find(|node| node.label() == Some("Firefox"))
+            .expect("selected peer app should expose a distinct result");
+        assert_eq!(
+            result.value(),
+            Some("Result 1 of 1: Guest App, guest Flatpak application; node oak; Ready to launch; no extra guest permissions declared; runs in an isolated App VM; host files, host D-Bus, and host compositor access remain blocked; desktop connection is separate")
+        );
         let launch = nodes
             .iter()
             .map(|(_, node)| node)

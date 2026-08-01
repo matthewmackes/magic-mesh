@@ -105,6 +105,17 @@ impl CollabEventEnvelope {
         self
     }
 
+    /// The deterministic last-writer-wins key for this event.
+    ///
+    /// Callers must provide events for one logical entity (for example, one
+    /// presence row or one task field). The causal clock is the primary
+    /// ordering component; the event id makes concurrent equal-clock writes
+    /// resolve identically on every node, regardless of arrival order.
+    #[must_use]
+    pub fn lww_key(&self) -> (ActorClock, EventId) {
+        (self.clock, self.event_id)
+    }
+
     /// The canonical bytes that are signed and verified.
     ///
     /// Deterministic by construction: a fixed domain tag, then every signed
@@ -198,6 +209,17 @@ impl CollabEventEnvelope {
         let bytes = hex_to_bytes::<32>(&sig.pubkey_hex)?;
         VerifyingKey::from_bytes(&bytes).ok()
     }
+}
+
+/// Select the deterministic last writer from events for one logical entity.
+///
+/// The result is independent of input order. An empty slice has no winner.
+/// This helper only resolves the winner; the caller remains responsible for
+/// validating signatures, entity scope, and whether a fact is LWW-resolved
+/// rather than monotonic (such as a deletion tombstone).
+#[must_use]
+pub fn last_writer_wins(events: &[CollabEventEnvelope]) -> Option<&CollabEventEnvelope> {
+    events.iter().max_by_key(|event| event.lww_key())
 }
 
 /// Lower-hex encode bytes (the mackesd CA-blocklist / mde-chat convention — no
@@ -365,6 +387,40 @@ mod tests {
             sig.pubkey_hex = bytes_to_hex(other.verifying_key().as_bytes());
         }
         assert!(!env.verify());
+    }
+
+    #[test]
+    fn last_writer_wins_is_empty_safe() {
+        assert!(last_writer_wins(&[]).is_none());
+    }
+
+    #[test]
+    fn last_writer_wins_prefers_clock_then_event_id() {
+        let mut earlier = sample();
+        earlier.event_id = EventId::from_uuid(uuid::Uuid::from_u128(2));
+        earlier.clock = ActorClock::at(10, 9);
+
+        let mut later = sample();
+        later.event_id = EventId::from_uuid(uuid::Uuid::from_u128(1));
+        later.clock = ActorClock::at(11, 0);
+
+        assert_eq!(last_writer_wins(&[later.clone(), earlier]), Some(&later));
+    }
+
+    #[test]
+    fn last_writer_wins_tie_breaks_concurrent_writes_by_event_id() {
+        let mut low = sample();
+        low.event_id = EventId::from_uuid(uuid::Uuid::from_u128(1));
+        low.clock = ActorClock::at(10, 0);
+
+        let mut high = sample();
+        high.event_id = EventId::from_uuid(uuid::Uuid::from_u128(2));
+        high.clock = low.clock;
+
+        let concurrent = [high.clone(), low.clone()];
+        let winner = last_writer_wins(&concurrent).expect("winner");
+        assert_eq!(winner.event_id, high.event_id);
+        assert_eq!(last_writer_wins(&[low, high.clone()]), Some(&high));
     }
 
     #[test]

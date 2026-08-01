@@ -17,7 +17,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use mde_egui::egui::{self, Color32, RichText, Ui};
-use mde_egui::Style;
+use mde_egui::{DenseList, Style};
 
 /// One child row of a directory: a real filesystem entry (its absolute path, its
 /// display name, and whether it is itself a directory). Sorted dirs-first.
@@ -195,10 +195,11 @@ pub(crate) fn show(ui: &mut Ui, tree: &mut ProjectTree) -> Option<PathBuf> {
     ui.separator();
 
     let mut opened: Option<PathBuf> = None;
+    let mut rows = DenseList::new();
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            render_dir(ui, tree, &root, Style::SP_S, &mut opened);
+            render_dir(ui, tree, &root, Style::SP_S, &mut rows, &mut opened);
         });
     opened
 }
@@ -210,11 +211,12 @@ fn render_dir(
     tree: &mut ProjectTree,
     dir: &Path,
     indent: f32,
+    rows: &mut DenseList,
     opened: &mut Option<PathBuf>,
 ) {
     if let Some(err) = tree.read_error(dir) {
         // The honest unreadable-directory face (§7) — a muted note, no panic.
-        tree_note(ui, indent, &format!("\u{26A0} {err}"));
+        tree_note(rows, ui, indent, &format!("\u{26A0} {err}"));
         return;
     }
     // Snapshot the children (owned) so the recursive `&mut tree` mutation (a
@@ -227,36 +229,47 @@ fn render_dir(
             } else {
                 '\u{25B8}' // ▸ closed
             };
-            if tree_row(ui, indent, &format!("{marker} {}", entry.name), Style::TEXT) {
+            if tree_row(
+                rows,
+                ui,
+                indent,
+                &format!("{marker} {}", entry.name),
+                Style::TEXT,
+            ) {
                 tree.toggle(&entry.path);
             }
             if tree.is_expanded(&entry.path) {
-                render_dir(ui, tree, &entry.path, indent + Style::SP_M, opened);
+                render_dir(ui, tree, &entry.path, indent + Style::SP_M, rows, opened);
             }
-        } else if tree_row(ui, indent + Style::SP_M, &entry.name, Style::TEXT) {
+        } else if tree_row(rows, ui, indent + Style::SP_M, &entry.name, Style::TEXT) {
             *opened = Some(entry.path.clone());
         }
     }
 }
 
 /// One clickable tree row at `indent`. Returns `true` when it was clicked.
-fn tree_row(ui: &mut Ui, indent: f32, text: &str, color: Color32) -> bool {
-    ui.horizontal(|ui| {
-        ui.add_space(indent);
-        ui.add(
-            egui::Label::new(RichText::new(text).size(Style::SMALL).color(color))
-                .sense(egui::Sense::click()),
-        )
-        .clicked()
+fn tree_row(rows: &mut DenseList, ui: &mut Ui, indent: f32, text: &str, color: Color32) -> bool {
+    rows.row(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.add_space(indent);
+            ui.add(
+                egui::Label::new(RichText::new(text).size(Style::SMALL).color(color))
+                    .sense(egui::Sense::click()),
+            )
+            .clicked()
+        })
+        .inner
     })
     .inner
 }
 
 /// A muted, non-interactive note at `indent` (the unreadable-directory state).
-fn tree_note(ui: &mut Ui, indent: f32, text: &str) {
-    ui.horizontal(|ui| {
-        ui.add_space(indent);
-        ui.label(RichText::new(text).size(Style::SMALL).color(Style::WARN));
+fn tree_note(rows: &mut DenseList, ui: &mut Ui, indent: f32, text: &str) {
+    rows.row(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.add_space(indent);
+            ui.colored_label(Style::WARN, RichText::new(text).size(Style::SMALL));
+        });
     });
 }
 

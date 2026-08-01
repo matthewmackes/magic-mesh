@@ -64,9 +64,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mackes_mesh_types::vehicle::{
-    parse_gpgga, vehicle_state_topic, vehicle_state_v2_topic, CellLink, GpsFix, ImuSample,
-    SnapshotProvenance, SnapshotSource, VehicleReply, VehicleState, VehicleStateV2, VehicleTelem,
-    WanStatus, VEHICLE_ACTION_PREFIX,
+    parse_gpgga, vehicle_state_topic, vehicle_state_v2_topic, CellLink, DeviceProbeStatus,
+    GpsFix, ImuSample, ManagerSetState, SnapshotProvenance, SnapshotSource, VehicleReply,
+    VehicleState, VehicleStateV2, VehicleTelem, WanStatus, VEHICLE_ACTION_PREFIX,
+    VEHICLE_STATE_V2_SCHEMA_VERSION,
 };
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
@@ -158,8 +159,8 @@ const KNOWN_HOSTS_FILE_PACKAGED: &str = "/usr/share/magic-mesh/mg90-known-hosts"
 const VEHICLE_REBOOT_AUTH_VERB: &str = "vehicle-reboot";
 const VEHICLE_REBOOT_AUTH_TARGET: &str = "gateway";
 
-/// Poll cadence — build + publish a fresh mirror every ~5 s. Doubles as the
-/// latest-wins heartbeat (a stale consumer always sees a recent stamp).
+/// Poll cadence for a fresh MG90 observation. Heartbeats are independent and
+/// use [`ROSTER_HEARTBEAT`] so a slow gateway probe cannot make consumers stale.
 pub const POLL: Duration = Duration::from_secs(5);
 
 /// The oMG GNSS/IMU NMEA blob the SSH read `cat`s.
@@ -538,7 +539,7 @@ impl VehicleProbe for SshHttpProbe {
             }
         };
         let path = parse_obd_status_path(&raw)
-            .map_err(|detail| io::Error::new(io::ErrorKind::InvalidInput, detail))?;
+            .map_err(|detail| io::Error::new(io::ErrorKind::Unsupported, detail))?;
         self.http_app_authed_get(path).map(Some)
     }
 
@@ -609,7 +610,7 @@ fn parse_status_port(raw: &str) -> Result<u16, String> {
     Ok(port)
 }
 
-/// Accept only the two MG90 OBD application paths documented by the repository's
+    /// Accept only the two MG90 OBD application paths documented by the repository's
 /// access contract. A free-form URL here would turn a diagnostic opt-in into an
 /// arbitrary authenticated HTTP fetch.
 fn parse_obd_status_path(raw: &str) -> Result<&'static str, String> {
@@ -697,8 +698,8 @@ pub const MAX_VEHICLE_ROSTER_MANAGERS: usize = 8;
 /// Maximum number of `(MG90, manager)` assignments retained by one roster.
 pub const MAX_VEHICLE_ROSTER_ASSIGNMENTS: usize = 32;
 
-/// The default heartbeat for an opt-in multi-source roster. The legacy single-
-/// gateway worker continues to use [`POLL`] for both its poll and heartbeat.
+/// The default heartbeat for both the single-gateway worker and the opt-in
+/// multi-source roster. A slow poll must never make a retained snapshot stale.
 pub const ROSTER_HEARTBEAT: Duration = Duration::from_secs(2);
 
 const MIN_ROSTER_INTERVAL: Duration = Duration::from_millis(1);
@@ -779,6 +780,13 @@ pub enum VehicleRosterError {
         /// Management node that supplied the snapshot.
         manager_id: String,
     },
+    /// The snapshot uses a schema version this roster cannot safely interpret.
+    UnsupportedSchemaVersion {
+        /// Schema version understood by this binary.
+        expected: u16,
+        /// Schema version carried by the incoming snapshot.
+        actual: u16,
+    },
 }
 
 impl fmt::Display for VehicleRosterError {
@@ -812,6 +820,10 @@ impl fmt::Display for VehicleRosterError {
                 f,
                 "vehicle source {expected} reported identity {reported} from manager {manager_id}"
             ),
+            Self::UnsupportedSchemaVersion { expected, actual } => write!(
+                f,
+                "vehicle snapshot schema version {actual} is unsupported (expected {expected})"
+            ),
         }
     }
 }
@@ -839,12 +851,12 @@ impl VehiclePollPlan {
         Ok(plan)
     }
 
-    /// The compatibility plan for the existing one-gateway worker.
+    /// The compatibility plan for one gateway with an independent heartbeat.
     #[must_use]
     pub const fn single_gateway(poll: Duration) -> Self {
         Self {
             poll,
-            heartbeat: poll,
+            heartbeat: ROSTER_HEARTBEAT,
         }
     }
 
@@ -873,7 +885,7 @@ impl VehiclePollPlan {
 
 impl Default for VehiclePollPlan {
     fn default() -> Self {
-        Self::single_gateway(POLL)
+        Self::multi_source(POLL)
     }
 }
 
@@ -934,6 +946,98 @@ pub enum VehicleRosterSelection {
     },
 }
 
+/// Why a typed snapshot was not eligible for manager-routed publication.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VehicleManagerRouteRejection {
+    /// The gateway revoked management approval after this snapshot was emitted.
+    ApprovalRevoked,
+    /// The snapshot carries an authoritative manager set that excludes the
+    /// manager which supplied it.
+    ManagerNotEnrolled,
+}
+
+/// A typed, identity-addressed publication route selected from the roster.
+///
+/// The route owns the exact v2 snapshot and Bus topic together so callers cannot
+/// accidentally publish telemetry under a different manager/source pair. The
+/// snapshot remains read-only here; action authorization is a separate seam.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VehicleManagerRoute {
+    source_id: VehicleSourceId,
+    manager_id: String,
+    topic: String,
+    snapshot: VehicleStateV2,
+}
+
+impl VehicleManagerRoute {
+    /// Stable MG90 identity carried by this route.
+    #[must_use]
+    pub fn source_id(&self) -> &VehicleSourceId {
+        &self.source_id
+    }
+
+    /// Manager that supplied and is authorized for this route.
+    #[must_use]
+    pub fn manager_id(&self) -> &str {
+        &self.manager_id
+    }
+
+    /// Identity-addressed Bus topic for this exact snapshot.
+    #[must_use]
+    pub fn topic(&self) -> &str {
+        &self.topic
+    }
+
+    /// Borrow the typed telemetry snapshot without projecting or fabricating
+    /// any of its domains.
+    #[must_use]
+    pub fn snapshot(&self) -> &VehicleStateV2 {
+        &self.snapshot
+    }
+}
+
+/// Result of manager-routing one source's latest accepted telemetry.
+#[derive(Debug, Clone, PartialEq)]
+pub enum VehicleManagerRouteSelection {
+    /// The freshest eligible snapshot and its bound publication topic.
+    Routed(VehicleManagerRoute),
+    /// No accepted source snapshot exists.
+    NoSource {
+        /// Requested source.
+        source_id: VehicleSourceId,
+        /// Honest reason no source can be routed.
+        reason: VehicleNoSourceReason,
+    },
+    /// Accepted snapshots exist, but none is eligible for publication by its
+    /// supplying manager.
+    Rejected {
+        /// Requested source.
+        source_id: VehicleSourceId,
+        /// Manager associated with the deterministically freshest rejected row.
+        manager_id: String,
+        /// Why that manager cannot route this snapshot.
+        reason: VehicleManagerRouteRejection,
+    },
+}
+
+fn manager_route_rejection(
+    snapshot: &VehicleStateV2,
+    manager_id: &str,
+) -> Option<VehicleManagerRouteRejection> {
+    if matches!(snapshot.approval, mackes_mesh_types::vehicle::ApprovalState::Revoked) {
+        return Some(VehicleManagerRouteRejection::ApprovalRevoked);
+    }
+    // An unknown manager set is not proof that this manager is enrolled. Keep
+    // the route fail-closed during legacy/partial snapshots rather than
+    // allowing an un-enrolled manager to regain publication rights.
+    if snapshot.managers.state != ManagerSetState::Complete
+        || !snapshot.managers.ids.iter().any(|id| id == manager_id)
+    {
+        return Some(VehicleManagerRouteRejection::ManagerNotEnrolled);
+    }
+    None
+}
+
 /// One identity-checked snapshot retained by the bounded roster.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VehicleRosterSnapshot {
@@ -951,6 +1055,12 @@ impl VehicleRosterSnapshot {
         snapshot: VehicleStateV2,
     ) -> Result<Self, VehicleRosterError> {
         let manager_id = validate_manager_id(&manager_id.into())?;
+        if snapshot.schema_version != VEHICLE_STATE_V2_SCHEMA_VERSION {
+            return Err(VehicleRosterError::UnsupportedSchemaVersion {
+                expected: VEHICLE_STATE_V2_SCHEMA_VERSION,
+                actual: snapshot.schema_version,
+            });
+        }
         if snapshot.mg90.id != source_id.as_str() || snapshot.mg90.esn != source_id.as_str() {
             return Err(VehicleRosterError::IdentityMismatch {
                 expected: source_id,
@@ -1286,6 +1396,83 @@ impl VehicleRoster {
         }
     }
 
+    /// Select the freshest snapshot whose supplying manager is still eligible
+    /// to route it. A newer revoked or un-enrolled row is skipped in favor of an
+    /// older eligible manager snapshot, which keeps deduplication honest during
+    /// approval changes and manager takeover.
+    #[must_use]
+    pub fn route_latest(&self, source_id: &VehicleSourceId) -> VehicleManagerRouteSelection {
+        let mut found_assignment = false;
+        let mut selected: Option<&VehicleRosterSnapshot> = None;
+        let mut rejected: Option<(&VehicleRosterSnapshot, VehicleManagerRouteRejection)> = None;
+
+        for ((candidate_source, _), assignment) in &self.assignments {
+            if candidate_source != source_id {
+                continue;
+            }
+            found_assignment = true;
+            let Some(candidate) = assignment.latest.as_ref() else {
+                continue;
+            };
+            if let Some(reason) = manager_route_rejection(&candidate.snapshot, &candidate.manager_id)
+            {
+                if rejected
+                    .as_ref()
+                    .is_none_or(|(current, _)| candidate.freshness_cmp(current).is_gt())
+                {
+                    rejected = Some((candidate, reason));
+                }
+                continue;
+            }
+            if selected.is_none_or(|current| candidate.freshness_cmp(current).is_gt()) {
+                selected = Some(candidate);
+            }
+        }
+
+        if let Some(snapshot) = selected {
+            return VehicleManagerRouteSelection::Routed(VehicleManagerRoute {
+                source_id: snapshot.source_id.clone(),
+                manager_id: snapshot.manager_id.clone(),
+                topic: vehicle_state_v2_topic(
+                    &snapshot.snapshot.management_node_id,
+                    &snapshot.snapshot.mg90.id,
+                ),
+                snapshot: snapshot.snapshot.clone(),
+            });
+        }
+        if let Some((snapshot, reason)) = rejected {
+            return VehicleManagerRouteSelection::Rejected {
+                source_id: source_id.clone(),
+                manager_id: snapshot.manager_id.clone(),
+                reason,
+            };
+        }
+        VehicleManagerRouteSelection::NoSource {
+            source_id: source_id.clone(),
+            reason: if found_assignment {
+                VehicleNoSourceReason::NoAcceptedSnapshot
+            } else if self.assignments.is_empty() {
+                VehicleNoSourceReason::EmptyRoster
+            } else {
+                VehicleNoSourceReason::SourceNotRegistered
+            },
+        }
+    }
+
+    /// Route every registered source in stable source-id order. No-source and
+    /// rejected results stay explicit so consumers cannot turn them into an
+    /// offline or fabricated telemetry row.
+    #[must_use]
+    pub fn route_latest_all(&self) -> Vec<VehicleManagerRouteSelection> {
+        if self.assignments.is_empty() {
+            return Vec::new();
+        }
+        self.source_ids()
+            .iter()
+            .map(|source_id| self.route_latest(source_id))
+            .collect()
+    }
+
     /// Select the freshest accepted snapshot for every registered MG90 source
     /// in stable source-id order. Each source remains explicit: a registered
     /// source without an accepted snapshot returns `NoSource` rather than an
@@ -1562,33 +1749,58 @@ impl VehicleWorker {
         // OBD-II is a separate application plane. The optional app read below is
         // deliberately diagnostic-only: the repository documents the page paths
         // but not a stable payload schema, so no OBD field is inferred here.
-        match probe.read_obd_status() {
-            Ok(Some(raw)) if raw.trim().is_empty() => gaps.push(
-                "OBD application returned an empty response; typed OBD telemetry remains unavailable"
-                    .to_string(),
-            ),
-            Ok(Some(_)) => gaps.push(
-                "OBD application HTTP response received; payload schema is not verified, so typed OBD telemetry remains unavailable"
-                    .to_string(),
-            ),
-            Ok(None) => gaps.push(format!(
-                "OBD not wired; set {OBD_STATUS_PATH_ENV} to /obdii_status/ or /hdobd_status/ for a diagnostic read"
-            )),
+        let obd_probe_status = match probe.read_obd_status() {
+            Ok(Some(raw)) if raw.trim().is_empty() => {
+                gaps.push(
+                    "OBD application returned an empty response; typed OBD telemetry remains unavailable"
+                        .to_string(),
+                );
+                DeviceProbeStatus::Unsupported {
+                    reason: "OBD/HDOBD response schema is not verified".to_string(),
+                }
+            }
+            Ok(Some(_)) => {
+                gaps.push(
+                    "OBD application HTTP response received; payload schema is not verified, so typed OBD telemetry remains unavailable"
+                        .to_string(),
+                );
+                DeviceProbeStatus::Unsupported {
+                    reason: "OBD/HDOBD response schema is not verified".to_string(),
+                }
+            }
+            Ok(None) => {
+                gaps.push(format!(
+                    "OBD not wired; set {OBD_STATUS_PATH_ENV} to /obdii_status/ or /hdobd_status/ for a diagnostic read"
+                ));
+                DeviceProbeStatus::NotInstalled
+            }
             Err(e) => {
-                let reason = if e.kind() == io::ErrorKind::InvalidInput {
+                let reason = if e.kind() == io::ErrorKind::Unsupported {
+                    "unsupported"
+                } else if e.kind() == io::ErrorKind::InvalidInput {
                     "configuration error"
                 } else {
                     "unavailable"
                 };
                 gaps.push(format!("OBD application {reason} (HTTP): {e}"));
+                if e.kind() == io::ErrorKind::Unsupported {
+                    DeviceProbeStatus::Unsupported {
+                        reason: e.to_string(),
+                    }
+                } else {
+                    DeviceProbeStatus::Failed {
+                        reason: e.to_string(),
+                    }
+                }
             }
-        }
+        };
         let telem = VehicleTelem {
             battery_v,
             internal_temp_c,
             ignition_on,
             moving: gps.speed_mph > 0.5,
-            obd_present: false,
+            obd_present: obd_probe_status.is_supported(),
+            obd_probe_status,
             ..Default::default()
         };
 
@@ -1635,13 +1847,17 @@ impl VehicleWorker {
             .map_err(no_source_reason_from_roster_error)
     }
 
-    fn snapshot_v2(&self, state: &VehicleState) -> VehicleStateV2 {
+    fn snapshot_v2_with_interval(
+        &self,
+        state: &VehicleState,
+        expected_interval: Duration,
+    ) -> VehicleStateV2 {
         let published_at_ms = now_ms();
         VehicleStateV2::from_v1(
             state,
             self.host.clone(),
             self.sequence.fetch_add(1, Ordering::Relaxed) + 1,
-            self.poll.as_millis().try_into().unwrap_or(u64::MAX),
+            expected_interval.as_millis().try_into().unwrap_or(u64::MAX),
             published_at_ms,
             SnapshotProvenance {
                 source: SnapshotSource::DirectGateway,
@@ -1651,13 +1867,21 @@ impl VehicleWorker {
         )
     }
 
+    fn snapshot_v2(&self, state: &VehicleState) -> VehicleStateV2 {
+        self.snapshot_v2_with_interval(state, self.poll)
+    }
+
     /// Publish the v1 compatibility mirror and, when the gateway ESN is
     /// confirmed, the identity-addressed v2 mirror. An unknown ESN is never
     /// replaced with a synthetic topic segment.
-    fn publish(&self, state: &VehicleState) {
+    fn publish_pair(&self, legacy: &VehicleState, observed: &VehicleState, interval: Duration) {
         if let Some(mut persist) = crate::bus_publish::open_bus(self.bus_root.clone()) {
-            crate::bus_publish::publish_json(&mut persist, &vehicle_state_topic(&self.host), state);
-            let v2 = self.snapshot_v2(state);
+            crate::bus_publish::publish_json(
+                &mut persist,
+                &vehicle_state_topic(&self.host),
+                legacy,
+            );
+            let v2 = self.snapshot_v2_with_interval(observed, interval);
             if !v2.mg90.id.is_empty() {
                 crate::bus_publish::publish_json(
                     &mut persist,
@@ -1672,6 +1896,19 @@ impl VehicleWorker {
                 );
             }
         }
+    }
+
+    fn publish(&self, state: &VehicleState) {
+        self.publish_pair(state, state, self.poll);
+    }
+
+    /// Republish a cached observation without pretending that the gateway was
+    /// polled again. The v1 compatibility mirror receives a current transport
+    /// stamp, while v2 retains the original observation timestamp for freshness.
+    fn publish_heartbeat(&self, observed: &VehicleState) {
+        let mut legacy = observed.clone();
+        legacy.published_at_ms = now_ms();
+        self.publish_pair(&legacy, observed, ROSTER_HEARTBEAT);
     }
 
     // ─────────────────────── Phase 4 · action/vehicle/* control drain ───────────────────────
@@ -1998,14 +2235,26 @@ impl Worker for VehicleWorker {
         // Seed the action cursors so a (re)start doesn't replay a backlog of verbs.
         let mut cursors: HashMap<String, String> = HashMap::new();
         self.prime_cursors(&mut cursors);
+        // Preserve the existing immediate first observation, then keep polling
+        // and heartbeat deadlines independent. A heartbeat never invokes the
+        // slow gateway probe or refreshes the observation timestamp.
+        self.drain_actions(&mut cursors);
+        let mut cached = self.build_state(probe.as_ref());
+        self.publish(&cached);
+        let now = tokio::time::Instant::now();
+        let mut poll_tick = tokio::time::interval_at(now + self.poll, self.poll);
+        let mut heartbeat_tick = tokio::time::interval_at(now + ROSTER_HEARTBEAT, ROSTER_HEARTBEAT);
         loop {
-            // Phase 4 — drain any queued `action/vehicle/*` control verbs first.
-            self.drain_actions(&mut cursors);
-            let state = self.build_state(probe.as_ref());
-            self.publish(&state);
             tokio::select! {
                 () = shutdown.wait() => return Ok(()),
-                () = tokio::time::sleep(self.poll) => {}
+                _ = poll_tick.tick() => {
+                    self.drain_actions(&mut cursors);
+                    cached = self.build_state(probe.as_ref());
+                    self.publish(&cached);
+                }
+                _ = heartbeat_tick.tick() => {
+                    self.publish_heartbeat(&cached);
+                }
             }
         }
     }
@@ -2745,6 +2994,11 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
             state.gaps
         );
         assert!(!state.telem.obd_present);
+        assert_eq!(
+            state.telem.obd_probe_status,
+            DeviceProbeStatus::NotInstalled,
+            "no configured probe is not a fabricated OBD reading"
+        );
         assert!(state.telem.ignition_on);
     }
 
@@ -2835,6 +3089,11 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
             !state.telem.obd_present,
             "unknown app fields must not become telemetry"
         );
+        assert!(matches!(
+            state.telem.obd_probe_status,
+            DeviceProbeStatus::Unsupported { ref reason }
+                if reason.contains("schema is not verified")
+        ));
         assert!(state.gaps.iter().any(|gap| {
             gap.contains("OBD application HTTP response received")
                 && gap.contains("payload schema is not verified")
@@ -2854,11 +3113,58 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
             "the LCI anchor still makes the gateway reachable"
         );
         assert!(!state.telem.obd_present);
+        assert!(matches!(
+            state.telem.obd_probe_status,
+            DeviceProbeStatus::Failed { ref reason }
+                if reason == "connection refused"
+        ));
         assert!(state
             .gaps
             .iter()
             .any(|gap| gap.contains("OBD application unavailable")
                 && gap.contains("connection refused")));
+    }
+
+    #[test]
+    fn obd_probe_verdicts_survive_v2_wire_without_fabricating_telemetry() {
+        let cases = vec![
+            (
+                FakeProbe::real(),
+                DeviceProbeStatus::NotInstalled,
+            ),
+            (
+                FakeProbe {
+                    obd_status: Ok(Some(r#"{"currentStatus":{"rpm":1800}}"#.to_string())),
+                    ..FakeProbe::real()
+                },
+                DeviceProbeStatus::Unsupported {
+                    reason: "OBD/HDOBD response schema is not verified".to_string(),
+                },
+            ),
+            (
+                FakeProbe {
+                    obd_status: Err("connection refused".to_string()),
+                    ..FakeProbe::real()
+                },
+                DeviceProbeStatus::Failed {
+                    reason: "connection refused".to_string(),
+                },
+            ),
+        ];
+
+        for (probe, expected) in cases {
+            let snapshot = worker().build_state_v2(&probe);
+            assert_eq!(snapshot.telem.obd_probe_status, expected);
+            assert!(!snapshot.telem.obd_present);
+            assert_eq!(snapshot.telem.rpm, 0);
+            assert_eq!(snapshot.telem.speed_mph, 0.0);
+
+            let json = serde_json::to_string(&snapshot).expect("v2 snapshot serializes");
+            let round_trip: VehicleStateV2 =
+                serde_json::from_str(&json).expect("v2 snapshot deserializes");
+            assert_eq!(round_trip.telem.obd_probe_status, expected);
+            assert!(!round_trip.telem.obd_present);
+        }
     }
 
     #[test]
@@ -3317,6 +3623,26 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
     }
 
     #[test]
+    fn roster_rejects_unsupported_snapshot_schema_before_acceptance() {
+        let source = roster_source_id();
+        let mut snapshot = VehicleWorker::new("manager-a".to_string())
+            .with_bus_root(None)
+            .with_probe(Arc::new(FakeProbe::real()))
+            .build_state_v2(&FakeProbe::real());
+        snapshot.mg90.id = source.as_str().to_string();
+        snapshot.mg90.esn = source.as_str().to_string();
+        snapshot.schema_version = VEHICLE_STATE_V2_SCHEMA_VERSION + 1;
+
+        assert_eq!(
+            VehicleRosterSnapshot::from_v2(source, "manager-a", snapshot),
+            Err(VehicleRosterError::UnsupportedSchemaVersion {
+                expected: VEHICLE_STATE_V2_SCHEMA_VERSION,
+                actual: VEHICLE_STATE_V2_SCHEMA_VERSION + 1,
+            })
+        );
+    }
+
+    #[test]
     fn roster_schedules_each_manager_assignment_with_independent_cadences() {
         let source_a = VehicleSourceId::new("mg90-a").unwrap();
         let source_b = VehicleSourceId::new("mg90-b").unwrap();
@@ -3445,6 +3771,97 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
             }
             other => panic!("expected selected source, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn roster_routes_freshest_eligible_manager_and_binds_topic_to_snapshot() {
+        let source = roster_source_id();
+        let plan = VehiclePollPlan::default();
+        let mut roster = VehicleRoster::new(Instant::now());
+        roster
+            .register(VehicleRosterSource::remote(source.clone(), "manager-a", plan).unwrap())
+            .unwrap();
+        roster
+            .register(VehicleRosterSource::remote(source.clone(), "manager-b", plan).unwrap())
+            .unwrap();
+
+        let mut eligible = roster_snapshot(&source, "manager-a", 100, 100, 1);
+        eligible.snapshot.managers =
+            mackes_mesh_types::vehicle::ManagerSet::approved(vec!["manager-a".to_string()])
+                .unwrap();
+        let mut newer_but_unenrolled = roster_snapshot(&source, "manager-b", 200, 200, 2);
+        newer_but_unenrolled.snapshot.managers =
+            mackes_mesh_types::vehicle::ManagerSet::approved(vec!["manager-c".to_string()])
+                .unwrap();
+        roster.ingest(eligible).unwrap();
+        roster.ingest(newer_but_unenrolled).unwrap();
+
+        match roster.route_latest(&source) {
+            VehicleManagerRouteSelection::Routed(route) => {
+                assert_eq!(route.manager_id(), "manager-a");
+                assert_eq!(route.source_id(), &source);
+                assert_eq!(route.topic(), "state/vehicle/manager-a/ND84720078011035");
+                assert_eq!(route.snapshot().observed_at_ms, 100);
+                assert_eq!(route.snapshot().mg90.esn, source.as_str());
+            }
+            other => panic!("expected eligible manager route, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roster_rejects_revoked_or_unenrolled_manager_without_fabricating_telemetry() {
+        let source = roster_source_id();
+        let plan = VehiclePollPlan::default();
+        let mut roster = VehicleRoster::new(Instant::now());
+        roster
+            .register(VehicleRosterSource::remote(source.clone(), "manager-a", plan).unwrap())
+            .unwrap();
+
+        let mut snapshot = roster_snapshot(&source, "manager-a", 300, 300, 3);
+        snapshot.snapshot.managers =
+            mackes_mesh_types::vehicle::ManagerSet::approved(vec!["manager-a".to_string()])
+                .unwrap();
+        snapshot.snapshot.approval = mackes_mesh_types::vehicle::ApprovalState::Revoked;
+        roster.ingest(snapshot).unwrap();
+        assert_eq!(
+            roster.route_latest(&source),
+            VehicleManagerRouteSelection::Rejected {
+                source_id: source,
+                manager_id: "manager-a".to_string(),
+                reason: VehicleManagerRouteRejection::ApprovalRevoked,
+            }
+        );
+    }
+
+    #[test]
+    fn roster_rejects_manager_when_enrollment_is_not_authoritative() {
+        let source = roster_source_id();
+        let mut roster = VehicleRoster::new(Instant::now());
+        roster
+            .register(
+                VehicleRosterSource::remote(
+                    source.clone(),
+                    "manager-a",
+                    VehiclePollPlan::default(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        // The default v2 snapshot has an unknown manager set. That must not
+        // be treated as implicit enrollment for manager-routed publication.
+        roster
+            .ingest(roster_snapshot(&source, "manager-a", 400, 400, 4))
+            .unwrap();
+
+        assert_eq!(
+            roster.route_latest(&source),
+            VehicleManagerRouteSelection::Rejected {
+                source_id: source,
+                manager_id: "manager-a".to_string(),
+                reason: VehicleManagerRouteRejection::ManagerNotEnrolled,
+            }
+        );
     }
 
     #[test]

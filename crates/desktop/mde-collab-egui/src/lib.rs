@@ -87,6 +87,7 @@ mod files;
 mod fixture;
 mod frame;
 mod icons;
+use crate::icons::CommsHoverExt;
 mod messages;
 mod transfers;
 
@@ -499,6 +500,9 @@ pub struct CommunicationsSurface {
     /// it leaves — so a driver lands on the alert inbox but can still navigate to
     /// any mode afterward (the bias is a default, never a lock).
     car_bias_applied: bool,
+    /// Session-scoped local clipboard publication preference. The shell owns
+    /// the provider; this mirrors the setting into the Mesh Teams Settings UI.
+    clipboard_publishing_enabled: bool,
 }
 
 impl CommunicationsSurface {
@@ -509,6 +513,18 @@ impl CommunicationsSurface {
         Self::default()
     }
 
+    /// Update the session-scoped clipboard publication preference shown by
+    /// Mesh Teams Settings.
+    pub fn set_clipboard_publishing_enabled(&mut self, enabled: bool) {
+        self.clipboard_publishing_enabled = enabled;
+    }
+
+    /// Read the session-scoped clipboard publication preference.
+    #[must_use]
+    pub fn clipboard_publishing_enabled(&self) -> bool {
+        self.clipboard_publishing_enabled
+    }
+
     /// The space currently shown in the panes.
     #[must_use]
     pub fn selected_space(&self) -> Option<SpaceId> {
@@ -517,30 +533,37 @@ impl CommunicationsSurface {
 
     /// Show `space` in the panes.
     pub fn select_space(&mut self, space: SpaceId) {
-        if self.selected_space != Some(space) {
-            self.selected_space = Some(space);
-            // A space switch closes any anchored thread + cancels an inline edit,
-            // and closes the file picker + any pending permanent-delete confirm
-            // (both are per-space intents); the drafts (keyed by space/thread)
-            // deliberately survive.
-            self.open_thread = None;
-            self.focused_message = None;
-            self.editing = None;
-            self.file_picker = None;
-            self.files_confirm_delete = None;
-            self.files_notice = None;
-            // A pending armed destructive alert action is a per-view intent — a
-            // space switch disarms it (it must be re-armed deliberately).
-            self.alert_arming = None;
-            // The open in-call DTMF keypad is a per-view intent — a space switch
-            // closes it. The seat-level media device prefs (mic/camera/screen)
-            // deliberately survive: they are the seat's, not the space's.
-            self.dtmf_pad = None;
-            // The picked document is a per-space intent — reset it (the editor
-            // content is replaced on the next load, so nothing stale leaks across
-            // spaces). The embedded editors themselves survive as scratch state.
-            self.documents.on_space_switch();
+        self.set_selected_space(Some(space));
+    }
+
+    /// Apply a live directory selection, clearing space-scoped view intents when
+    /// membership convergence changes the selected key or removes it entirely.
+    fn set_selected_space(&mut self, selected: Option<SpaceId>) {
+        if self.selected_space == selected {
+            return;
         }
+        self.selected_space = selected;
+        // A space switch closes any anchored thread + cancels an inline edit,
+        // and closes the file picker + any pending permanent-delete confirm
+        // (both are per-space intents); the drafts (keyed by space/thread)
+        // deliberately survive.
+        self.open_thread = None;
+        self.focused_message = None;
+        self.editing = None;
+        self.file_picker = None;
+        self.files_confirm_delete = None;
+        self.files_notice = None;
+        // A pending armed destructive alert action is a per-view intent — a
+        // space switch disarms it (it must be re-armed deliberately).
+        self.alert_arming = None;
+        // The open in-call DTMF keypad is a per-view intent — a space switch
+        // closes it. The seat-level media device prefs (mic/camera/screen)
+        // deliberately survive: they are the seat's, not the space's.
+        self.dtmf_pad = None;
+        // The picked document is a per-space intent — reset it (the editor
+        // content is replaced on the next load, so nothing stale leaks across
+        // spaces). The embedded editors themselves survive as scratch state.
+        self.documents.on_space_switch();
     }
 
     /// The active mode tab.
@@ -568,6 +591,14 @@ impl CommunicationsSurface {
         if let Some(tab) = channel_tab_for_mode(mode) {
             self.channel_tab = tab;
         }
+    }
+
+    /// Route the taskbar's direct Editor launch into Documents with a clean,
+    /// full-width editor canvas. Optional project/outline sidebars can still be
+    /// reopened from the editor View menu once the workspace is open.
+    pub fn open_editor(&mut self) {
+        self.documents.prepare_direct_entry();
+        self.set_mode(Mode::Documents);
     }
 
     /// Switch the Teams-style app route.
@@ -706,10 +737,31 @@ impl CommunicationsSurface {
     /// rail, channel header, persistent call bar, and active app body. Reads projections from
     /// `data` and pushes every emitted command into `sink`.
     pub fn ui(&mut self, ui: &mut egui::Ui, data: &dyn CollabData, sink: &mut CommandSink) {
-        // Default the selection to the first rail row so the frame is usable the
-        // moment a directory exists.
-        if self.selected_space.is_none() {
-            self.selected_space = data.space_directory().spaces.first().map(|s| s.id);
+        if std::env::var_os("MDE_DRM_LINEAR_SCANOUT").is_some() {
+            let rect = ui.max_rect();
+            eprintln!(
+                "communications viewport proof: available={}x{}, rect=({}, {})..({}, {})",
+                ui.available_width(),
+                ui.available_height(),
+                rect.min.x,
+                rect.min.y,
+                rect.max.x,
+                rect.max.y
+            );
+        }
+        // Reconcile the retained selection with the newest directory so every
+        // pane follows the same key when membership removal or re-enrollment
+        // advances the read model between frames.
+        let selected =
+            frame::reconciled_selected_space(self.selected_space, data.space_directory());
+        if selected != self.selected_space {
+            self.set_selected_space(selected);
+        }
+        if std::env::var_os("MDE_DRM_LINEAR_SCANOUT").is_some() {
+            eprintln!(
+                "communications state proof: mode={:?}, app={:?}, selected_space={:?}",
+                self.mode, self.app, self.selected_space
+            );
         }
 
         // Auto Mode (Car Mode): on entering the Ford SYNC 3 car dash, land a driver
@@ -728,43 +780,93 @@ impl CommunicationsSurface {
             self.car_bias_applied = false;
         }
 
-        egui::SidePanel::left(ui.id().with("collab-app-rail"))
-            .resizable(false)
-            .exact_width(frame::APP_RAIL_W)
-            .frame(frame::rail_frame())
-            .show_inside(ui, |ui| self.app_rail(ui));
+        // Construct owns one shared workspace identity strip. The channel/app
+        // header below remains Mesh Teams domain chrome; it must not also carry
+        // the host workspace title or shell session control.
+        let menus: &[mde_egui::menubar::Menu<&'static str>] = &[];
+        let status: &[mde_egui::menubar::StatusChip] = &[];
+        let model = mde_egui::menubar::MenuBarModel {
+            title: "Mesh Teams",
+            accent: mde_egui::Style::ACCENT,
+            menus,
+            status,
+        };
+        let _ = mde_egui::menubar::MenuBar::show(ui, &model);
+        ui.add_space(mde_egui::Style::SP_S);
 
-        egui::SidePanel::left(ui.id().with("collab-channel-rail"))
-            .resizable(false)
-            .exact_width(frame::CHANNEL_RAIL_W)
-            .frame(frame::rail_frame())
-            .show_inside(ui, |ui| self.rail(ui, data, sink));
+        // Keep the workspace body usable on narrow direct-DRM seats. The
+        // Communications rails are supporting navigation; the shell's shared
+        // dock remains available for route changes while a narrow workspace
+        // gives the active document canvas the full width. Without this
+        // breakpoint, the nested fixed panels consume the available width and
+        // egui quietly collapses the editor body to zero.
+        let narrow = ui.available_width() < 1024.0;
+        if !narrow {
+            egui::SidePanel::left(ui.id().with("collab-app-rail"))
+                .resizable(false)
+                .exact_width(frame::APP_RAIL_W)
+                .frame(frame::rail_frame())
+                .show_inside(ui, |ui| self.app_rail(ui));
 
-        egui::SidePanel::right(ui.id().with("collab-details"))
-            .resizable(false)
-            .exact_width(frame::DETAILS_W)
-            .frame(frame::rail_frame())
-            .show_inside(ui, |ui| self.details_pane(ui, data));
+            egui::SidePanel::left(ui.id().with("collab-channel-rail"))
+                .resizable(false)
+                .exact_width(frame::CHANNEL_RAIL_W)
+                .frame(frame::rail_frame())
+                .show_inside(ui, |ui| self.rail(ui, data, sink));
 
-        // The call bar is added before the tabs + body so it stays pinned to the
-        // bottom regardless of which mode is showing — it survives every switch.
-        egui::TopBottomPanel::bottom(ui.id().with("collab-callbar"))
-            .frame(frame::bar_frame())
-            .show_inside(ui, |ui| self.call_bar(ui, data, sink));
+            egui::SidePanel::right(ui.id().with("collab-details"))
+                .resizable(false)
+                .exact_width(frame::DETAILS_W)
+                .frame(frame::rail_frame())
+                .show_inside(ui, |ui| self.details_pane(ui, data));
+        }
 
-        egui::TopBottomPanel::top(ui.id().with("collab-channel-header"))
-            .frame(frame::bar_frame())
-            .show_inside(ui, |ui| self.channel_header(ui, data));
+        if !narrow {
+            // The call bar is added before the tabs + body so it stays pinned to
+            // the bottom regardless of which mode is showing — it survives
+            // every switch. At narrow widths the shell dock/status chrome is
+            // the compact interaction surface and these nested bars are
+            // omitted so they cannot consume the active canvas height.
+            egui::TopBottomPanel::bottom(ui.id().with("collab-callbar"))
+                .frame(frame::bar_frame())
+                .show_inside(ui, |ui| self.call_bar(ui, data, sink));
+
+            egui::TopBottomPanel::top(ui.id().with("collab-channel-header"))
+                .frame(frame::bar_frame())
+                .show_inside(ui, |ui| self.channel_header(ui, data));
+        }
 
         // The mode body crossfades in on a switch (lock #4) rather than swapping
         // instantly — a distance-independent fade on the shared Page tier, wrapped
         // around the same per-mode body render.
         let mode_slot = anim::mode_index(self.mode);
-        egui::CentralPanel::default()
-            .frame(frame::body_frame())
-            .show_inside(ui, |ui| {
+        let body_size = ui.available_size();
+        if std::env::var_os("MDE_DRM_LINEAR_SCANOUT").is_some() {
+            eprintln!(
+                "communications prebody proof: available={}x{}, rect={:?}",
+                body_size.x,
+                body_size.y,
+                ui.max_rect()
+            );
+        }
+        ui.allocate_ui_with_layout(
+            body_size,
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_min_size(body_size);
+                frame::body_frame().show(ui, |ui| {
+                if std::env::var_os("MDE_DRM_LINEAR_SCANOUT").is_some() {
+                    eprintln!(
+                        "communications central proof: available={}x{}, rect={:?}",
+                        ui.available_width(),
+                        ui.available_height(),
+                        ui.max_rect()
+                    );
+                }
                 anim::switch_body(ui, mode_slot, |ui| self.mode_body(ui, data, sink));
-            });
+                });
+            },
+        );
     }
 
     /// The active mode's central body.
@@ -800,6 +902,24 @@ impl CommunicationsSurface {
                 );
                 ui.add_space(mde_egui::Style::SP_S);
                 self.alert_pref_bar(ui, sink);
+                ui.add_space(mde_egui::Style::SP_M);
+                ui.label(
+                    egui::RichText::new("Clipboard privacy")
+                        .strong()
+                        .color(mde_egui::Style::TEXT_STRONG),
+                );
+                let response = ui.checkbox(
+                    &mut self.clipboard_publishing_enabled,
+                    "Publish local clipboard copies to Mesh Teams",
+                );
+                let _ = response.comms_hover_text(
+                    "Off by default for new sessions. Remote clipboard history remains visible when off; enabling publishes only new local copies.",
+                );
+                ui.label(
+                    egui::RichText::new("This setting applies only to the current session.")
+                        .small()
+                        .color(mde_egui::Style::TEXT_DIM),
+                );
                 ui.add_space(mde_egui::Style::SP_M);
                 ui.label(
                     egui::RichText::new("Provider devices")

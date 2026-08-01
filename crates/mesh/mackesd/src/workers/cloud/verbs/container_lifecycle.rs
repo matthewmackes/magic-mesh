@@ -386,6 +386,7 @@ mod tests {
                 image: None,
                 network_isolation: false,
                 raw_hcl: None,
+                app: None,
             },
         )
         .unwrap();

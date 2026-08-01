@@ -1,5 +1,11 @@
 # NAVBAR — bottom nav taskbar (relocate the shell dock, Carbon icon-first)
 
+> **HISTORICAL / SUPERSEDED (2026-07-30):** This survey records an earlier
+> grouped-label dock proposal. Current taskbar authority is
+> [`platform-interfaces.md`](platform-interfaces.md) and `WL-UX-012`: full-width,
+> icon-only, search-first, with no second launcher or tray flyout. Retain this
+> file as design history only.
+
 > **Design-standard note (2026-07-22):** look-and-feel guidance in this doc is subordinate to the platform interface standard — see [platform-interfaces.md](platform-interfaces.md) (Apple-HIG-principled Construct + Car). Feature/behavior content remains authoritative.
 
 Operator-locked 2026-07-03 (15-question `/plan` survey). Moves the shell's surface

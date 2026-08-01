@@ -24,13 +24,16 @@ use std::fmt;
 
 use crate::encoding::Encoding;
 use crate::pixel::PixelFormat;
+use mackes_mesh_types::vdi_clipboard::{
+    VdiClipboardText, VdiClipboardTextValidationError, MAX_VDI_CLIPBOARD_TEXT_BYTES,
+};
 
 /// Maximum VNC guest clipboard payload we will accept or send.
 ///
 /// This is the governed WL-FUNC-016 transport cap for guest text clipboard
 /// traffic. It keeps RFB cut-text payloads bounded before the shell can publish
 /// them onto the mesh clipboard lane.
-pub const RFB_CUT_TEXT_MAX_BYTES: usize = 1024 * 1024;
+pub const RFB_CUT_TEXT_MAX_BYTES: usize = MAX_VDI_CLIPBOARD_TEXT_BYTES;
 
 /// A validated RFB cut-text payload.
 ///
@@ -39,7 +42,7 @@ pub const RFB_CUT_TEXT_MAX_BYTES: usize = 1024 * 1024;
 /// transport cap at construction/decoding time.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RfbCutText {
-    text: String,
+    text: VdiClipboardText,
 }
 
 impl RfbCutText {
@@ -49,15 +52,9 @@ impl RfbCutText {
     /// [`RfbCutTextError::TooLarge`] if the UTF-8 payload exceeds
     /// [`RFB_CUT_TEXT_MAX_BYTES`].
     pub fn new(text: impl Into<String>) -> Result<Self, RfbCutTextError> {
-        let text = text.into();
-        let len = text.len();
-        if len > RFB_CUT_TEXT_MAX_BYTES {
-            return Err(RfbCutTextError::TooLarge {
-                len,
-                max: RFB_CUT_TEXT_MAX_BYTES,
-            });
-        }
-        Ok(Self { text })
+        VdiClipboardText::new(text)
+            .map(|text| Self { text })
+            .map_err(RfbCutTextError::from_validation)
     }
 
     /// Decode a bounded UTF-8 RFB cut-text payload.
@@ -80,19 +77,19 @@ impl RfbCutText {
     /// Borrow the validated clipboard text.
     #[must_use]
     pub fn text(&self) -> &str {
-        &self.text
+        self.text.as_str()
     }
 
     /// Borrow the UTF-8 bytes that ride the RFB wire.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
-        self.text.as_bytes()
+        self.text.as_str().as_bytes()
     }
 
     /// Consume this payload into its text.
     #[must_use]
     pub fn into_text(self) -> String {
-        self.text
+        self.text.into()
     }
 }
 
@@ -110,6 +107,22 @@ pub enum RfbCutTextError {
     UnexpectedEof,
     /// The guest sent bytes that are not valid UTF-8 text.
     InvalidUtf8(std::string::FromUtf8Error),
+}
+
+impl RfbCutTextError {
+    fn from_validation(error: VdiClipboardTextValidationError) -> Self {
+        match error {
+            VdiClipboardTextValidationError::TooLarge { bytes, max_bytes } => Self::TooLarge {
+                len: bytes,
+                max: max_bytes,
+            },
+            // `VdiClipboardText::new` receives a Rust String, so invalid UTF-8
+            // cannot occur on this construction path.
+            VdiClipboardTextValidationError::InvalidUtf8 => {
+                unreachable!("owned Rust strings cannot fail VDI clipboard UTF-8 validation")
+            }
+        }
+    }
 }
 
 impl fmt::Display for RfbCutTextError {
@@ -313,7 +326,7 @@ impl RfbControlMessage {
 mod tests {
     use super::{
         decode_server_cut_text_body, RfbClientMessage, RfbControlMessage, RfbCutText,
-        RfbCutTextError, RFB_CUT_TEXT_MAX_BYTES,
+        RfbCutTextError, MAX_VDI_CLIPBOARD_TEXT_BYTES, RFB_CUT_TEXT_MAX_BYTES,
     };
     use crate::encoding::{parse_pixel_format, Encoding, Reader};
     use crate::pixel::PixelFormat;
@@ -409,6 +422,15 @@ mod tests {
             ),
             "expected over-cap error, got {err:?}"
         );
+    }
+
+    #[test]
+    fn cut_text_uses_the_shared_vdi_utf8_boundary() {
+        let text = "é".repeat(MAX_VDI_CLIPBOARD_TEXT_BYTES / 2);
+        let cut = RfbCutText::new(text.clone()).expect("exact shared byte boundary");
+
+        assert_eq!(cut.text(), text);
+        assert_eq!(cut.as_bytes().len(), MAX_VDI_CLIPBOARD_TEXT_BYTES);
     }
 
     #[test]

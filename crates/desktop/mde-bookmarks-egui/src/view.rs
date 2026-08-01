@@ -18,6 +18,7 @@
 use mde_egui::egui::{
     self, Align, Align2, CursorIcon, Layout, Response, RichText, ScrollArea, Sense, TextEdit,
 };
+use mde_egui::menubar::{Menu, MenuBar, MenuBarModel};
 use mde_egui::nav_chrome::AppFrame;
 use mde_egui::{Motion, Style};
 
@@ -30,7 +31,6 @@ use crate::model::{ActionOutcome, LinkCheckRecord, LinkHealth, Manager, SortBy};
 #[derive(Clone, Copy)]
 struct DragItem(uuid::Uuid);
 
-const BOOKMARKS_HEADER_TITLE: f32 = Style::HEADING - 2.0;
 const BOOKMARKS_ACTION_BUTTON_H: f32 = Style::TOOLBAR_CONTROL_H;
 
 /// A user intent captured during a render, applied after the frame.
@@ -154,16 +154,21 @@ fn handle_keys(ui: &egui::Ui, m: &Manager, actions: &mut Vec<Action>) {
 
 fn header(ui: &mut egui::Ui, m: &mut Manager, actions: &mut Vec<Action>) {
     egui::TopBottomPanel::top("bm-header").show_inside(ui, |ui| {
-        ui.add_space(Style::TOOLBAR_INSET_Y);
+        // The workspace begins with the shared Construct menubar. The
+        // search/sort/location strip below is intentionally domain-specific:
+        // it is the Bookmarks query control, not a second navigation system.
+        let menus: &[Menu<&'static str>] = &[];
+        let model = MenuBarModel {
+            title: "Bookmarks",
+            accent: Style::ACCENT,
+            menus,
+            status: &[],
+        };
+        let _ = MenuBar::show(ui, &model);
+        ui.add_space(Style::SP_S);
         ui.scope(|ui| {
             scope_bookmarks_toolbar_ui(ui);
             ui.horizontal(|ui| {
-                ui.heading(
-                    RichText::new("Bookmarks")
-                        .color(Style::TEXT)
-                        .size(BOOKMARKS_HEADER_TITLE),
-                );
-                ui.add_space(Style::SP_M);
                 ui.colored_label(Style::TEXT_DIM, location_line(m));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     sort_selector(ui, m, actions);
@@ -1065,12 +1070,12 @@ fn author_line(author: &mde_bookmarks::Author) -> String {
 mod tests {
     use super::{
         bookmarks_panel, empty_state_copy, scope_bookmarks_toolbar_ui, tree_chevron_icon,
-        BOOKMARKS_ACTION_BUTTON_H, BOOKMARKS_HEADER_TITLE,
+        BOOKMARKS_ACTION_BUTTON_H,
     };
     use crate::model::Manager;
     use mde_bookmarks::Author;
     use mde_egui::egui::{self, pos2, vec2, Rect};
-    use mde_egui::Style;
+    use mde_egui::{Density, Style};
 
     /// A manager under a fixed test author (no env reads).
     fn manager() -> Manager {
@@ -1084,10 +1089,21 @@ mod tests {
     /// panel is embeddable exactly as the E12 shell mounts it (E12-3b). Returns
     /// the frame's shapes so presentation tests can assert off what painted.
     fn render_shapes(m: &mut Manager) -> Vec<egui::epaint::ClippedShape> {
+        render_shapes_at(m, vec2(1100.0, 700.0), Density::Mouse)
+    }
+
+    /// Render the embedded surface at an explicit viewport and density. This
+    /// exercises the same UI composition the DRM runner receives while keeping
+    /// responsive geometry testable without a display server.
+    fn render_shapes_at(
+        m: &mut Manager,
+        viewport: egui::Vec2,
+        density: Density,
+    ) -> Vec<egui::epaint::ClippedShape> {
         let ctx = egui::Context::default();
-        Style::install(&ctx);
+        Style::install_with_density(&ctx, density);
         let input = egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1100.0, 700.0))),
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), viewport)),
             ..Default::default()
         };
         let out = ctx.run(input, |ctx| {
@@ -1135,15 +1151,6 @@ mod tests {
 
     #[test]
     fn bookmarks_header_and_toolbar_use_refined_chrome_metrics() {
-        assert_eq!(
-            BOOKMARKS_HEADER_TITLE,
-            Style::HEADING - 2.0,
-            "Bookmarks top-left header title should be two points smaller"
-        );
-        assert!(
-            BOOKMARKS_HEADER_TITLE < Style::HEADING,
-            "Bookmarks header title must not use the old oversized heading rung"
-        );
         assert_eq!(
             BOOKMARKS_ACTION_BUTTON_H,
             Style::TOOLBAR_CONTROL_H,
@@ -1209,22 +1216,44 @@ mod tests {
         );
     }
 
-    /// PLATFORM-INTERFACES Q19 (WL-UX-006/U21): the detail pane's header is the
-    /// shared NavigationBar — "Details" paints on the bar's Title3 rung, not the
-    /// old hand-rolled strong body label over a separator. (The main surface
-    /// header deliberately keeps its fused search field / sort combo / live
-    /// location rollup — controls the icon-slot bar cannot carry — per the U20
-    /// skip doctrine.)
+    /// PLATFORM-INTERFACES Q19: the main workspace and detail pane both use the
+    /// shared navigation frame. Bookmarks keeps its fused query/sort/location
+    /// strip below that frame because it is domain content, not duplicate chrome.
     #[test]
-    fn detail_pane_header_rides_the_shared_navigation_bar() {
+    fn bookmarks_workspace_and_detail_headers_ride_shared_navigation() {
         let mut m = manager();
         let texts = painted_text(&render_shapes(&mut m));
+        assert!(
+            texts
+                .iter()
+                .any(|(t, s)| {
+                    t == "BOOKMARKS"
+                        && (*s - mde_egui::menubar::TITLE_FONT_SIZE).abs() < f32::EPSILON
+                }),
+            "the workspace title must render on the shared MenuBar rung: {texts:?}"
+        );
         assert!(
             texts
                 .iter()
                 .any(|(t, s)| t == "Details" && (*s - Style::TYPE_TITLE3).abs() < f32::EPSILON),
             "the detail pane title must render on the shared bar's Title3 rung: {texts:?}"
         );
+    }
+
+    #[test]
+    fn bookmarks_workspace_frame_tessellates_on_desktop_narrow_and_large_text() {
+        for (viewport, density) in [
+            (vec2(1100.0, 700.0), Density::Mouse),
+            (vec2(480.0, 800.0), Density::Mouse),
+            (vec2(800.0, 700.0), Density::Touch),
+        ] {
+            let mut m = manager();
+            let shapes = render_shapes_at(&mut m, viewport, density);
+            assert!(
+                !shapes.is_empty(),
+                "Bookmarks frame must paint at {viewport:?} / {density:?}"
+            );
+        }
     }
 
     #[test]

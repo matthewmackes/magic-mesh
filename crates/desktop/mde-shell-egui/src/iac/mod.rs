@@ -1585,6 +1585,48 @@ impl WorkloadsState {
         );
     }
 
+    /// Publish the admitted App VM declaration through the existing session
+    /// broker. An incomplete mirror row fails closed; it never falls back to a
+    /// host-side desktop launch.
+    pub(super) fn issue_app_launch(&mut self, row: &WorkloadRow) {
+        let Some(request) = row.app.clone() else {
+            self.note = Some(format!(
+                "Could not launch an app from {}: no admitted app declaration is available. Nothing was sent.",
+                row.name
+            ));
+            return;
+        };
+        let Some(bus_root) = self.bus_root.as_deref() else {
+            self.note = Some(
+                "Could not launch the App VM application: no mesh Bus directory is configured. Nothing was sent."
+                    .to_string(),
+            );
+            return;
+        };
+        let mut last_error = None;
+        match crate::discovery::publish_app_vm_open(
+            Some(bus_root),
+            &mut last_error,
+            &row.node,
+            &row.name,
+            // The placement node serves the guest, but this shell is the
+            // client that owns the rail/VDI surface. Using the placement here
+            // made remote App VM launches invisible to the local session rail.
+            &crate::discovery::local_peer(),
+            request,
+        ) {
+            Ok(publication) => {
+                self.note = Some(format!(
+                    "App launch requested for {} (session {}). Waiting for guest readiness.",
+                    row.name, publication.id
+                ));
+            }
+            Err(error) => {
+                self.note = Some(format!("App launch was not sent: {error}"));
+            }
+        }
+    }
+
     /// Open the review-sheet confirm for a destructive lifecycle op
     /// (`instance-reboot` / `instance-delete`) — nothing publishes until the
     /// workload name is typed (RUN-006). The resource rows drive this seam.

@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
+use mackes_mesh_types::app_catalog::FlatpakAppCatalog;
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_bus::rpc::reply_topic;
@@ -523,6 +524,34 @@ pub fn read_peer_installed(workgroup_root: &Path, node: &str) -> Vec<AppEntry> {
         .unwrap_or_default()
 }
 
+/// Read the signed Flatpak catalog replicated beside a peer's installed-app
+/// projection. Catalogs are optional for backwards compatibility, but an
+/// invalid or unsigned catalog is rejected rather than forwarded to the shell.
+#[must_use]
+pub fn read_peer_flatpak_catalog(
+    workgroup_root: &Path,
+    node: &str,
+) -> Option<FlatpakAppCatalog> {
+    let path = workgroup_root.join(node).join("flatpak-catalog.json");
+    read_bounded_app_record(&path)
+        .and_then(|body| serde_json::from_str::<FlatpakAppCatalog>(&body).ok())
+        .and_then(|catalog| catalog.admitted().ok())
+}
+
+/// Read this node's catalog from the user-owned projection consumed by the
+/// local Front Door. The file is data only; admission validates every field
+/// before it can cross the Bus boundary.
+#[must_use]
+pub fn read_local_flatpak_catalog(home: &Path) -> Option<FlatpakAppCatalog> {
+    let path = home
+        .join(".config")
+        .join("magic-mesh")
+        .join("flatpak-catalog.json");
+    read_bounded_app_record(&path)
+        .and_then(|body| serde_json::from_str::<FlatpakAppCatalog>(&body).ok())
+        .and_then(|catalog| catalog.admitted().ok())
+}
+
 /// APPLAUNCH-5 — build the `action/apps/peer-list` reply: a focused peer's
 /// installed app set. An empty/self `node` answers THIS node's live local scan
 /// (so the verb works mesh-down for the local box too); any other node reads the
@@ -530,17 +559,24 @@ pub fn read_peer_installed(workgroup_root: &Path, node: &str) -> Vec<AppEntry> {
 /// an empty list, not an error (the Front Door simply shows "no apps discovered").
 #[must_use]
 pub fn build_peer_list(svc: &AppsService, node: &str) -> String {
-    let entries = if node.is_empty() || node == svc.node_id {
+    let local = node.is_empty() || node == svc.node_id;
+    let entries = if local {
         // Self / unscoped → the live local scan (works with the mesh down).
         scan_local_apps(&default_app_dirs(&svc.home))
     } else {
         read_peer_installed(&svc.workgroup_root, node)
+    };
+    let catalog = if local {
+        read_local_flatpak_catalog(&svc.home)
+    } else {
+        read_peer_flatpak_catalog(&svc.workgroup_root, node)
     };
     json!({
         "ok": true,
         "node": node,
         "entries": entries,
         "count": entries.len(),
+        "catalog": catalog,
     })
     .to_string()
 }
@@ -1523,6 +1559,55 @@ mod tests {
         assert!(read_peer_installed(root, "ghost").is_empty());
         // An empty node selector → empty (the verb routes self elsewhere).
         assert!(read_peer_installed(root, "").is_empty());
+    }
+
+    #[test]
+    fn peer_list_forwards_only_an_admitted_flatpak_catalog() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let peer_dir = root.join("anvil");
+        std::fs::create_dir_all(&peer_dir).unwrap();
+        let catalog = serde_json::json!({
+            "schema_version": 1,
+            "revision": "catalog-42",
+            "entries": [{
+                "app_id": "org.example.Editor",
+                "display_name": "Editor",
+                "summary": "Guest editor",
+                "icon_reference": "icon:editor",
+                "source_revision": "curated-42",
+                "declared_capabilities": ["audio"],
+                "guest_profile": "wayland-standard",
+                "supported_actions": ["launch"],
+                "provenance": {"source": "curated", "signature": "sig-42"},
+                "state": "installed"
+            }]
+        });
+        std::fs::write(
+            peer_dir.join("flatpak-catalog.json"),
+            serde_json::to_vec(&catalog).unwrap(),
+        )
+        .unwrap();
+        let admitted = read_peer_flatpak_catalog(root, "anvil").expect("catalog admitted");
+        assert_eq!(admitted.revision, "catalog-42");
+
+        let home = root.join("home");
+        let svc = AppsService::new(root, "me", &home);
+        let reply: serde_json::Value =
+            serde_json::from_str(&build_peer_list(&svc, "anvil")).unwrap();
+        assert_eq!(reply["catalog"]["revision"], "catalog-42");
+
+        let mut invalid = catalog;
+        invalid["entries"][0]["app_id"] = serde_json::json!("not-an-app-id");
+        std::fs::write(
+            peer_dir.join("flatpak-catalog.json"),
+            serde_json::to_vec(&invalid).unwrap(),
+        )
+        .unwrap();
+        assert!(read_peer_flatpak_catalog(root, "anvil").is_none());
+        let rejected: serde_json::Value =
+            serde_json::from_str(&build_peer_list(&svc, "anvil")).unwrap();
+        assert!(rejected["catalog"].is_null());
     }
 
     #[test]

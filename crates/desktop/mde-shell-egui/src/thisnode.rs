@@ -222,12 +222,91 @@ struct NodeStatus {
     connectivity: ConnectivityFacts,
     /// Credential-free power-profile observation from the root snapshot writer.
     power_profile: PowerProfileFacts,
+    /// Credential-free PipeWire/Pulse/WirePlumber observation from the node
+    /// status writer. Missing fields remain unknown rather than becoming a
+    /// fabricated healthy audio stack.
+    audio: AudioFacts,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct PowerProfileFacts {
     active: Option<String>,
     available: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct AudioFacts {
+    pulse_available: Option<bool>,
+    pipewire_graph: Option<bool>,
+    wireplumber_policy: Option<bool>,
+    alsa_devices: Option<u64>,
+    playback: Option<bool>,
+    capture: Option<bool>,
+    recovery: Option<String>,
+}
+
+fn audio_facts(value: Option<&Value>) -> AudioFacts {
+    let Some(object) = value.and_then(Value::as_object) else {
+        return AudioFacts::default();
+    };
+    let component_available = |flat_key: &str, typed_key: &str| {
+        object
+            .get(flat_key)
+            .and_then(Value::as_bool)
+            .or_else(|| {
+                object
+                    .get(typed_key)
+                    .and_then(Value::as_object)
+                    .and_then(|component| component.get("availability"))
+                    .and_then(Value::as_str)
+                    .map(|state| state == "available")
+            })
+    };
+    let typed_pulse = object
+        .get("pulse_audio_compatibility")
+        .and_then(Value::as_object);
+    let recovery = object
+        .get("recovery")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= 160)
+        .map(str::to_owned);
+    let recovery = recovery.or_else(|| {
+        object
+            .get("recovery")
+            .and_then(Value::as_object)
+            .and_then(|component| component.get("availability"))
+            .and_then(Value::as_str)
+            .filter(|state| *state != "available")
+            .map(|_| "Audio recovery provider is unavailable; refresh the snapshot.".to_owned())
+    });
+    AudioFacts {
+        pulse_available: object
+            .get("pulse_available")
+            .and_then(Value::as_bool)
+            .or_else(|| {
+                typed_pulse
+                    .and_then(|pulse| pulse.get("compatibility"))
+                    .and_then(Value::as_str)
+                    .map(|compatibility| compatibility == "compatible")
+            }),
+        pipewire_graph: component_available("pipewire_graph", "pipewire_graph"),
+        wireplumber_policy: component_available("wireplumber_policy", "wireplumber_policy"),
+        alsa_devices: object
+            .get("alsa_devices")
+            .and_then(Value::as_u64)
+            .or_else(|| {
+                object
+                    .get("alsa_ucm_discovery")
+                    .and_then(Value::as_object)
+                    .and_then(|component| component.get("observed_items"))
+                    .and_then(Value::as_u64)
+            })
+            .filter(|value| *value <= 256),
+        playback: component_available("playback", "playback"),
+        capture: component_available("capture", "capture"),
+        recovery,
+    }
 }
 
 /// Read a non-empty string field off a JSON object, or `None`.
@@ -357,12 +436,22 @@ impl ConnectivityFacts {
             ConnectivityProvider::Mesh => ConnectivityProviderProjection {
                 provider,
                 availability: self.mesh_provider_availability(),
+                recovery: match self.mesh_provider_availability() {
+                    ConnectivityAvailability::Available(_) => ProviderRecovery::None,
+                    ConnectivityAvailability::Degraded(_) => ProviderRecovery::RefreshSnapshot,
+                    ConnectivityAvailability::Unavailable(_) => ProviderRecovery::AwaitProvider,
+                },
                 interface: self.interface.clone(),
                 cidr: self.cidr.clone(),
             },
             ConnectivityProvider::DnsLighthouse => ConnectivityProviderProjection {
                 provider,
                 availability: self.dns_lighthouse_availability(),
+                recovery: match self.dns_lighthouse_availability() {
+                    ConnectivityAvailability::Available(_) => ProviderRecovery::None,
+                    ConnectivityAvailability::Degraded(_) => ProviderRecovery::RefreshSnapshot,
+                    ConnectivityAvailability::Unavailable(_) => ProviderRecovery::AwaitProvider,
+                },
                 interface: None,
                 cidr: None,
             },
@@ -494,8 +583,33 @@ struct InterfaceProviderFacts {
 struct ConnectivityProviderProjection {
     provider: ConnectivityProvider,
     availability: ConnectivityAvailability,
+    recovery: ProviderRecovery,
     interface: Option<String>,
     cidr: Option<String>,
+}
+
+/// The only recovery actions this read-only provider boundary may advertise.
+///
+/// These are recovery guidance, not mutation verbs: the snapshot can request a
+/// bounded re-read, but it cannot authorize reconnecting a link, changing a
+/// profile, or supplying credentials. Keeping the distinction typed prevents a
+/// future provider row from turning an unavailable observation into an implicit
+/// network write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderRecovery {
+    None,
+    RefreshSnapshot,
+    AwaitProvider,
+}
+
+impl ProviderRecovery {
+    const fn label(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::RefreshSnapshot => Some("Recovery: refresh provider snapshot"),
+            Self::AwaitProvider => Some("Recovery: await provider publication"),
+        }
+    }
 }
 
 fn first_network_string(network: Option<&Value>, keys: &[&str]) -> Option<String> {
@@ -635,7 +749,7 @@ fn interface_provider_projection(
     provider: ConnectivityProvider,
     facts: Option<&InterfaceProviderFacts>,
 ) -> ConnectivityProviderProjection {
-    let (availability, interface, cidr) = match facts {
+    let (availability, interface, cidr, recovery) = match facts {
         None => (
             match provider {
                 ConnectivityProvider::Wifi => ConnectivityAvailability::Unavailable(
@@ -655,6 +769,7 @@ fn interface_provider_projection(
             },
             None,
             None,
+            ProviderRecovery::AwaitProvider,
         ),
         Some(facts) => (
             match (provider, facts.state) {
@@ -711,11 +826,17 @@ fn interface_provider_projection(
             },
             facts.interface.clone(),
             facts.cidr.clone(),
+            match facts.state {
+                ProviderLinkState::Connected => ProviderRecovery::None,
+                ProviderLinkState::Degraded
+                | ProviderLinkState::Disconnected => ProviderRecovery::RefreshSnapshot,
+            },
         ),
     };
     ConnectivityProviderProjection {
         provider,
         availability,
+        recovery,
         interface,
         cidr,
     }
@@ -780,6 +901,7 @@ impl NodeStatus {
             cipher: network.and_then(|n| nonempty(n, "cipher")),
             connectivity: ConnectivityFacts::from_network(network),
             power_profile: power_profile_facts(v.get("power_profile")),
+            audio: audio_facts(v.get("audio")),
             hostname,
         }
     }
@@ -806,7 +928,7 @@ impl NodeStatus {
             );
         }
 
-        let providers = self.connectivity.provider_projection();
+        let providers = self.provider_projection();
         let mesh_ready = matches!(
             providers[3].availability,
             ConnectivityAvailability::Available(_)
@@ -827,6 +949,20 @@ impl NodeStatus {
         ConnectivityAvailability::Degraded(
             "Only partial connectivity/provider facts are published; missing values are not inferred.",
         )
+    }
+
+    /// Apply snapshot freshness to each provider row. A retained projection is
+    /// never allowed to look freshly actionable merely because its last known
+    /// link state was connected.
+    fn provider_projection(&self) -> [ConnectivityProviderProjection; 5] {
+        let mut projections = self.connectivity.provider_projection();
+        if self.stale {
+            for projection in &mut projections {
+                projection.availability = stale_provider_availability(projection.availability);
+                projection.recovery = ProviderRecovery::RefreshSnapshot;
+            }
+        }
+        projections
     }
 
     /// `true` when this node holds the mesh leader lease.
@@ -917,7 +1053,25 @@ impl NodeStatus {
                 ConnectivityAvailability::Degraded(_) => SectionHealth::Attention,
                 ConnectivityAvailability::Unavailable(_) => SectionHealth::Unavailable,
             },
-            Section::DisplaySound | Section::Input | Section::Personalization => {
+            Section::DisplaySound => {
+                if self.audio == AudioFacts::default() {
+                    SectionHealth::Unavailable
+                } else if [
+                    self.audio.pulse_available,
+                    self.audio.pipewire_graph,
+                    self.audio.wireplumber_policy,
+                    self.audio.playback,
+                    self.audio.capture,
+                ]
+                .into_iter()
+                .any(|state| state == Some(false))
+                {
+                    SectionHealth::Attention
+                } else {
+                    SectionHealth::Healthy
+                }
+            }
+            Section::Input | Section::Personalization => {
                 if section.unavailable_reason().is_some() {
                     SectionHealth::Unavailable
                 } else {
@@ -1053,7 +1207,7 @@ impl NodeStatus {
                         "Connectivity providers are unavailable until the mesh-status snapshot is read.",
                     )
                 } else {
-                    let providers = self.connectivity.provider_projection();
+                    let providers = self.provider_projection();
                     if providers.iter().any(|projection| {
                         matches!(
                             projection.availability,
@@ -1165,6 +1319,25 @@ impl NodeStatus {
             ThisNodeAction::ConfigureHardware => CapabilityAvailability::Unavailable(
                 "Hardware/OEM mutation is not connected to a typed, bounded provider.",
             ),
+        }
+    }
+}
+
+/// Retained provider facts must not continue to announce current availability
+/// after the source snapshot goes stale. Preserve an actually-unavailable state
+/// (there is still no observation to degrade), but make every observed state
+/// visibly stale in the row itself rather than relying on the banner above it.
+fn stale_provider_availability(
+    availability: ConnectivityAvailability,
+) -> ConnectivityAvailability {
+    match availability {
+        ConnectivityAvailability::Available(_) | ConnectivityAvailability::Degraded(_) => {
+            ConnectivityAvailability::Degraded(
+                "The last provider observation is stale; refresh before relying on it.",
+            )
+        }
+        ConnectivityAvailability::Unavailable(detail) => {
+            ConnectivityAvailability::Unavailable(detail)
         }
     }
 }
@@ -1564,6 +1737,14 @@ fn show_status(ui: &mut egui::Ui, status: &NodeStatus) {
             ui.add_space(Style::SP_S);
 
             ui.label(
+                RichText::new("Display & sound")
+                    .color(Style::TEXT_DIM)
+                    .size(Style::SMALL),
+            );
+            mde_egui::card().show(ui, |ui| show_audio(ui, status));
+            ui.add_space(Style::SP_S);
+
+            ui.label(
                 RichText::new("Node services")
                     .color(Style::TEXT_DIM)
                     .size(Style::SMALL),
@@ -1839,6 +2020,52 @@ fn show_power_profile(ui: &mut egui::Ui, status: &NodeStatus) {
     );
 }
 
+fn show_audio(ui: &mut egui::Ui, status: &NodeStatus) {
+    let facts = &status.audio;
+    if facts == &AudioFacts::default() {
+        ui.colored_label(Style::TEXT_DIM, "Audio provider not observed");
+        ui.label(
+            RichText::new(
+                "PipeWire, PulseAudio compatibility, WirePlumber, and ALSA/UCM facts are not published by mesh-status.",
+            )
+            .color(Style::TEXT_DIM)
+            .size(Style::SMALL),
+        );
+        return;
+    }
+    let rows = [
+        ("PulseAudio compatibility", facts.pulse_available),
+        ("PipeWire graph", facts.pipewire_graph),
+        ("WirePlumber policy", facts.wireplumber_policy),
+        ("Playback", facts.playback),
+        ("Capture", facts.capture),
+    ];
+    for (label, value) in rows {
+        ui.horizontal(|ui| {
+            ui.label(label);
+            match value {
+                Some(true) => ui.colored_label(Style::OK, "available"),
+                Some(false) => ui.colored_label(Style::WARN, "unavailable"),
+                None => ui.colored_label(Style::TEXT_DIM, "unknown"),
+            };
+        });
+    }
+    if let Some(count) = facts.alsa_devices {
+        ui.label(
+            RichText::new(format!("ALSA/UCM devices discovered: {count}"))
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+        );
+    }
+    if let Some(recovery) = &facts.recovery {
+        ui.label(
+            RichText::new(format!("Recovery: {recovery}"))
+                .color(Style::WARN)
+                .size(Style::SMALL),
+        );
+    }
+}
+
 /// Render the bounded This Node capability/action surface. Capability rows are
 /// projections of the live snapshot; action rows are deliberately disabled
 /// because this state path has no provider or mutation writer. That distinction
@@ -1928,7 +2155,7 @@ fn show_connectivity(ui: &mut egui::Ui, status: &NodeStatus) {
     );
     mde_egui::card().show(ui, |ui| {
         let mut rows = DenseList::new();
-        for projection in facts.provider_projection() {
+        for projection in status.provider_projection() {
             rows.row(ui, |ui| show_connectivity_provider_row(ui, projection));
         }
     });
@@ -1977,6 +2204,9 @@ fn show_connectivity_provider_row(ui: &mut egui::Ui, projection: ConnectivityPro
     }
     if let Some(cidr) = projection.cidr.as_deref() {
         connectivity_field(ui, "CIDR", Some(cidr));
+    }
+    if let Some(recovery) = projection.recovery.label() {
+        connectivity_field(ui, "Next safe step", Some(recovery));
     }
 }
 
@@ -2269,6 +2499,9 @@ mod tests {
               "online": 2,
               "total": 3,
               "power_profile":{{"active":"balanced","available":["balanced","performance","power-saver"]}},
+              "audio":{{"pulse_available":true,"pipewire_graph":true,
+                "wireplumber_policy":true,"alsa_devices":2,"playback":true,
+                "capture":true,"recovery":""}},
               "nodes": [
                 {{"hostname":"this-node","overlay_ip":"10.42.0.7","presence":"online",
                   "last_seen_ms":990000,"version":"11.1.0",
@@ -2436,12 +2669,61 @@ mod tests {
             s.power_profile.available,
             vec!["balanced", "performance", "power-saver"]
         );
+        assert_eq!(s.audio.pulse_available, Some(true));
+        assert_eq!(s.audio.pipewire_graph, Some(true));
+        assert_eq!(s.audio.alsa_devices, Some(2));
+        assert_eq!(s.audio.playback, Some(true));
+        assert_eq!(s.audio.capture, Some(true));
 
         // And the whole live panel tessellates.
         assert!(
             renders(&s),
             "the live ThisNode panel produced no draw primitives"
         );
+    }
+
+    #[test]
+    fn audio_projection_is_bounded_and_does_not_invent_provider_health() {
+        let value = serde_json::json!({
+            "pulse_available": false,
+            "pipewire_graph": true,
+            "wireplumber_policy": null,
+            "alsa_devices": 999,
+            "playback": false,
+            "capture": true,
+            "recovery": "  restart PipeWire and refresh the snapshot  ",
+        });
+        let facts = audio_facts(Some(&value));
+        assert_eq!(facts.pulse_available, Some(false));
+        assert_eq!(facts.pipewire_graph, Some(true));
+        assert_eq!(facts.wireplumber_policy, None);
+        assert_eq!(facts.alsa_devices, None);
+        assert_eq!(facts.playback, Some(false));
+        assert_eq!(facts.capture, Some(true));
+        assert_eq!(facts.recovery.as_deref(), Some("restart PipeWire and refresh the snapshot"));
+        assert_eq!(audio_facts(None), AudioFacts::default());
+
+        let typed = serde_json::json!({
+            "availability": "available",
+            "pulse_audio_compatibility": {
+                "availability": "available",
+                "compatibility": "compatible"
+            },
+            "pipewire_graph": {"availability": "available"},
+            "wireplumber_policy": {"availability": "unavailable"},
+            "alsa_ucm_discovery": {"availability": "available", "observed_items": 3},
+            "playback": {"availability": "available"},
+            "capture": {"availability": "unavailable"},
+            "recovery": {"availability": "unavailable"}
+        });
+        let typed_facts = audio_facts(Some(&typed));
+        assert_eq!(typed_facts.pulse_available, Some(true));
+        assert_eq!(typed_facts.pipewire_graph, Some(true));
+        assert_eq!(typed_facts.wireplumber_policy, Some(false));
+        assert_eq!(typed_facts.alsa_devices, Some(3));
+        assert_eq!(typed_facts.playback, Some(true));
+        assert_eq!(typed_facts.capture, Some(false));
+        assert!(typed_facts.recovery.is_some());
     }
 
     #[test]
@@ -2461,7 +2743,7 @@ mod tests {
         );
         assert_eq!(
             dashboard.health(Section::DisplaySound),
-            SectionHealth::Unavailable
+            SectionHealth::Healthy
         );
         assert_eq!(
             dashboard.health(Section::PowerPerformance),
@@ -2501,6 +2783,10 @@ mod tests {
                 .contains("provider stopped publishing")
         );
         assert!(renders(&s), "stale dashboard rows must remain renderable");
+        assert!(s
+            .provider_projection()
+            .iter()
+            .all(|projection| projection.recovery == ProviderRecovery::RefreshSnapshot));
     }
 
     #[test]
@@ -2548,6 +2834,22 @@ mod tests {
                 .availability,
             ConnectivityAvailability::Unavailable(_)
         ));
+        assert_eq!(
+            providers
+                .iter()
+                .find(|projection| projection.provider == ConnectivityProvider::Wifi)
+                .expect("Wi-Fi provider")
+                .recovery,
+            ProviderRecovery::AwaitProvider
+        );
+        assert_eq!(
+            providers
+                .iter()
+                .find(|projection| projection.provider == ConnectivityProvider::Mesh)
+                .expect("mesh provider")
+                .recovery,
+            ProviderRecovery::None
+        );
         assert!(matches!(
             s.capability_projection()
                 .iter()
@@ -2630,6 +2932,7 @@ mod tests {
             ConnectivityAvailability::Unavailable(_)
         ));
         assert_eq!(ethernet.interface.as_deref(), Some("enp1s0"));
+        assert_eq!(ethernet.recovery, ProviderRecovery::RefreshSnapshot);
 
         let cellular = providers
             .iter()
@@ -2640,6 +2943,7 @@ mod tests {
             ConnectivityAvailability::Degraded(_)
         ));
         assert_eq!(cellular.interface.as_deref(), Some("wwan0"));
+        assert_eq!(cellular.recovery, ProviderRecovery::RefreshSnapshot);
 
         assert!(matches!(
             s.connectivity_availability(),
@@ -2867,6 +3171,28 @@ mod tests {
             projection.availability,
             CapabilityAvailability::Degraded(_)
         )));
+        assert!(s.provider_projection().iter().all(|projection| {
+            !matches!(
+                projection.availability,
+                ConnectivityAvailability::Available(_)
+            )
+        }));
+        let mesh = s
+            .provider_projection()
+            .into_iter()
+            .find(|projection| projection.provider == ConnectivityProvider::Mesh)
+            .expect("mesh provider projection");
+        assert!(matches!(
+            mesh.availability,
+            ConnectivityAvailability::Degraded(
+                "The last provider observation is stale; refresh before relying on it."
+            )
+        ));
+        assert_eq!(
+            mesh.recovery,
+            ProviderRecovery::RefreshSnapshot,
+            "stale provider rows must expose refresh as the safe next step"
+        );
         assert!(s.action_projection().iter().all(|projection| matches!(
             projection.availability,
             CapabilityAvailability::Degraded(_)

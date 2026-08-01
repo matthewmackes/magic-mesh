@@ -4,8 +4,9 @@ The operational rulebook is [`AI_GOVERNANCE.md`](AI_GOVERNANCE.md) — read its
 locks (§1–§8) before changing anything load-bearing. The short version: the
 substrate (Nebula / etcd / Syncthing / Bus / max-crypto) is **locked**, and the UI
 is **egui-native** — one shell that owns the DRM/KMS seat directly (no Wayland
-compositor); the single source of look is the shared `Style` in `mde-egui` plus
-`mde-theme::brand` (QBRAND), and strict IBM Carbon as a token/lint gate is retired
+compositor); the single source of look is the shared `Style` in `mde-egui`, with
+`mde-theme::brand` limited to licensed brand assets. Strict IBM Carbon as a
+token/lint gate is retired
 (§4). New code is glue over the existing crates, and a feature isn't done until
 it's runtime-reachable with no stubs (§7).
 
@@ -59,9 +60,9 @@ cargo test -p mackesd --features async-services -- --test-threads=1
 `environ` and hangs (tracked: EFF-18). `--features async-services` is the
 superset (compiles + runs the daemon-worker suites).
 
-Carbon token / palette / metric changes additionally require
-`cargo test -p mde-theme` — a token value changes only with a matching test
-assertion (§4).
+Shared visual-token changes additionally require the relevant `mde-egui` tests;
+brand-asset changes may run `cargo test -p mde-theme`. A token value changes
+only with a matching test assertion (§4).
 
 ## Gates (all must pass before a commit lands)
 
@@ -74,21 +75,20 @@ the `lint-*.sh` / `cargo deny` steps run locally. The always-on
 cargo build --workspace --locked
 cargo clippy --workspace --all-targets     # crypto/unwrap lints are deny-level
 cargo fmt --all -- --check
-./install-helpers/lint-mesh-boundary.sh    # §6 — no mesh→desktop-shell dep
-./install-helpers/lint-carbon-tokens.sh    # §4 — no raw colour outside mde-theme
-./install-helpers/lint-motion.sh           # §4 — no bespoke animation duration outside mde-theme
-./install-helpers/lint-bus-names.sh        # §2 — no private D-Bus names
-cargo deny check                           # EFF-16 — advisories/licenses/bans/sources
+./install-helpers/ci-gate.sh policy        # maintained repository policy suite
+./install-helpers/lint-doc-supersession.sh # current-vs-historical guidance
+./install-helpers/lint-worklist.sh         # canonical WL-* worklist shape
 ```
 
-CI (`.github/workflows/ci.yml`) runs all of the above on pinned 1.85, plus a
-nightly `--include-ignored` job, a Fedora-native container job, a coverage
-floor, and a CycloneDX SBOM artifact.
+CI (`.github/workflows/ci.yml`) remains the hosted required-check surface for
+static repository gates. AI-run heavy builds, tests, and release evidence must
+run through the farm with explicit host/slot provenance; the farm-to-GitHub
+traceability work is tracked by `WL-CRIT-006`.
 
 ## Conventions that will bite you if skipped
 
-- **No raw hex / scattered metric literals** outside
-  `crates/shared/mde-theme` (§4). Use tokens; the lint gate catches colours,
+- **No raw hex / scattered metric literals** outside the shared `mde-egui::Style`
+  path (§4). Use tokens; the maintained policy gate catches colours,
   review catches metrics.
 - **No new MDE-private D-Bus names** (§2). MDE-internal IPC rides `mde-bus`
   (`action/<prefix>/<verb>` → `reply/<ulid>`); only FDO `org.freedesktop.*`
@@ -100,7 +100,7 @@ floor, and a CycloneDX SBOM artifact.
   hangs (EFF-20).
 - **UI is egui-native** — surfaces render through `mde-egui` (eframe/wgpu; the
   shell owns the DRM/KMS seat directly, no Wayland compositor) using the shared
-  `Style` + `mde-theme::brand`. The two excluded browser engines (`mde-web-cef`
+  `Style`; use `mde-theme::brand` only for licensed brand assets. The two excluded browser engines (`mde-web-cef`
   CEF/Chromium, `mde-web-preview` Servo) are pinned in their own workspaces and
   bumped on their own cadence (Servo tracked monthly).
 - **Crypto floor** (§3): Ed25519 / AES-256-GCM / ChaCha20-Poly1305 / RSA-4096
@@ -121,6 +121,6 @@ automation; RPM cuts stay operator-gated.
 | Architecture map | [`docs/architecture.md`](docs/architecture.md) |
 | Operator day-2 guide | [`ADMIN.md`](ADMIN.md) |
 | Operator runbooks | [`docs/help/`](docs/help/) |
-| Worklist (single tracker) | [`docs/WORKLIST.md`](docs/WORKLIST.md) |
+| Worklist (single tracker) | [`docs/platform/WORKLIST.md`](docs/platform/WORKLIST.md) |
 | Audit reports | [`docs/COMPLIANCE.md`](docs/COMPLIANCE.md) |
 | Design archive (historical) | [`docs/design/`](docs/design/) |

@@ -51,8 +51,6 @@ use mde_egui::Style;
 use crate::menu_bar::{ListStyle, MenuAction, MenuContext, WrapMarker, OVERFLOW_GLYPH};
 use crate::tooltip::editor_menu_button;
 
-const FORMAT_BAR_TOOLTIP_MAX_W: f32 = Style::SP_XL * 12.0;
-
 /// The Style dropdown's labels, indexed by heading level (0 = Normal body text).
 pub const STYLE_LABELS: [&str; 7] = [
     "Normal",
@@ -88,7 +86,9 @@ fn tool(ui: &mut Ui, face: RichText, tip: &'static str, enabled: bool) -> bool {
 pub fn show(ui: &mut Ui, cx: &MenuContext, compact: bool) -> Option<MenuAction> {
     let mut action = None;
     let enabled = cx.has_doc;
-    ui.horizontal(|ui| {
+    // Preserve every formatting command while allowing the row to wrap for
+    // large-text accessibility profiles.
+    ui.horizontal_wrapped(|ui| {
         ui.add_space(Style::SP_S);
 
         // The paragraph Style dropdown is the one width-heavy control (its text
@@ -245,30 +245,12 @@ fn overflow_contents(ui: &mut Ui, level: usize, action: &mut Option<MenuAction>)
 }
 
 fn format_bar_tooltip(ui: &mut Ui, text: &str) {
-    let ctx = ui.ctx().clone();
-    let surface = Style::resolve_color(&ctx, Style::SURFACE);
-    let border = Style::resolve_color(&ctx, Style::BORDER);
-    let text_color = Style::resolve_color(&ctx, Style::TEXT);
-    egui::Frame::NONE
-        .fill(surface)
-        .stroke(egui::Stroke::new(Style::STROKE_HAIRLINE, border))
-        .corner_radius(mde_egui::corner(Style::RADIUS_M))
-        .inner_margin(Style::tooltip_margin())
-        .show(ui, |ui| {
-            ui.set_max_width(FORMAT_BAR_TOOLTIP_MAX_W);
-            ui.add(
-                egui::Label::new(RichText::new(text).size(Style::SMALL).color(text_color)).wrap(),
-            );
-        });
+    mde_egui::tooltip(ui, text);
 }
 
 fn format_bar_hover_text(response: egui::Response, text: impl Into<String>) -> egui::Response {
     let text = text.into();
-    response
-        .on_hover_ui({
-            let text = text.clone();
-            move |ui| format_bar_tooltip(ui, text.as_str())
-        })
+    mde_egui::hover_text(response, text.clone())
         .on_disabled_hover_ui(move |ui| format_bar_tooltip(ui, text.as_str()))
 }
 

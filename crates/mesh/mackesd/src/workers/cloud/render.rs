@@ -48,6 +48,19 @@ pub(crate) fn render_tfvars(node: &str, specs: &[WorkloadSpec], libvirt_uri: &st
         if name.is_empty() {
             continue;
         }
+        let app = (spec.delivery_type == mackes_mesh_types::cloud::DeliveryType::AppVm)
+            .then(|| spec.app.as_ref())
+            .flatten()
+            .map(|app| {
+            serde_json::json!({
+                "app_id": app.app_id,
+                "catalog_revision": app.catalog_revision,
+                "guest_profile": app.guest_profile,
+                "requested_capabilities": app.requested_capabilities,
+                "session_id": app.session_id,
+                "resume": app.resume,
+            })
+        });
         vms.insert(
             name.to_string(),
             serde_json::json!({
@@ -57,6 +70,7 @@ pub(crate) fn render_tfvars(node: &str, specs: &[WorkloadSpec], libvirt_uri: &st
                 "disk_gb": spec.disk_gb,
                 "image": spec.image.clone().unwrap_or_default(),
                 "network_isolation": spec.network_isolation,
+                "app": app,
             }),
         );
     }
@@ -137,6 +151,7 @@ mod tests {
             image: None,
             network_isolation: false,
             raw_hcl: None,
+            app: None,
         }
     }
 
@@ -179,6 +194,34 @@ mod tests {
             render_tfvars("n", &b, "qemu:///system"),
             "the map is name-sorted so a re-render is byte-identical"
         );
+    }
+
+    #[test]
+    fn render_preserves_typed_app_vm_guest_declaration() {
+        let app = mackes_mesh_types::vdi_session::AppVmLaunchRequest::new(
+            "org.example.Writer",
+            "catalog-7",
+            "wayland-standard",
+            vec!["audio".into(), "clipboard".into()],
+            "app-session-7",
+            true,
+        )
+        .expect("valid app declaration");
+        let spec = mackes_mesh_types::cloud::AppVmProfile::default().workload_spec(
+            "eagle",
+            "appvm-writer",
+            app,
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(&render_tfvars("eagle", &[spec], "qemu:///system"))
+                .expect("valid tfvars");
+        let app = &value[TFVARS_VMS]["appvm-writer"]["app"];
+        assert_eq!(app["app_id"], "org.example.Writer");
+        assert_eq!(app["guest_profile"], "wayland-standard");
+        assert_eq!(app["requested_capabilities"][0], "audio");
+        assert_eq!(app["session_id"], "app-session-7");
+        assert_eq!(app["resume"], true);
+        assert_eq!(value[TFVARS_VMS]["appvm-writer"]["image"], "app-vm-wayland-standard");
     }
 
     #[test]
