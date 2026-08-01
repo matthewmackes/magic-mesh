@@ -14,7 +14,8 @@ workspace frame. It does not close WL-UX-009 or claim production readiness.
   `drm,live-helper,live-vdi,media-mpv`.
 - Runtime: `mde-shell-egui.service` active, `NRestarts=0` after deployment.
 - Dell deployment: `172.20.146.225` (`DELL-LAPTOP`) received the same extracted
-  shell payload; service active with `NRestarts=0`.
+  shell payload; service active with `NRestarts=0`. The final Maps validation
+  payload is `b88b6b8877a1fcf9ab441156a50c620b6e48ed1c244df56ceb0c036d38205f52`.
 - The complete RPM was not installed on either seat because its Fedora build
   dependency set does not match the installed seat runtime. The verified shell
   payload was deployed directly for GUI proof, with the prior binary preserved
@@ -51,6 +52,9 @@ normal secure runtime settings.
 | Dell Dark Mesh Teams (payload `44296eee`) | Mesh Teams → Activity | native `1366x768` direct-DRM capture; shared workspace title, channel header, activity feed, detail rail, and call bar remain separated | `58d722ba2f90a84f50b6d1f300b1fcd5da4aad5f2a97af63765834f1b280840c` |
 | Dell Dark narrow Mesh Teams (payload `44296eee`) | Mesh Teams → Activity | `800` logical width; compact channel tabs and live activity feed remain readable with governed side rails omitted | `d3264288d33c5f6eb3765b42c345fc1d1e3eccc70e35eed6efc94cc5a4ec3911` |
 | Dell Light / Largest Mesh Teams (payload `44296eee`) | Mesh Teams → Activity | native `1366x768` direct-DRM capture; large-text activity rows, channel tabs, and bottom taskbar remain readable without clipping | `b3f8b80240d8ea70830d0fc77db022f34535c8a7607d4c7e55987c145c0388db` |
+| Dell Dark Maps (payload `b88b6b88`) | Maps & Location → Drive | native `1366x768` direct-DRM capture; six radio/GNSS slots, alert state, map content boundary, FAB lane, and taskbar remain separated | `e96231b7377e7eaa2b1ef06f6c2d54413bb31dd2e20b6f1d644ec4743a821f06` |
+| Dell Dark narrow Maps (payload `b88b6b88`) | Maps & Location → Drive | `800` logical-width proof route; the map HUD remains bounded with the radio rail separated from the FAB lane and alerts | `e96231b7377e7eaa2b1ef06f6c2d54413bb31dd2e20b6f1d644ec4743a821f06` |
+| Dell Light / Largest Maps (payload `b88b6b88`) | Maps & Location → Drive | native `1366x768` direct-DRM capture; compact two-row health slots, large text, alert state, map content boundary, FAB lane, and taskbar remain readable without clipping | `6528918ade3d11abc1c2ef4afe4f0dade1b4e2d3eae0cb61af20edd9373b5749` |
 
 | Dell Dark Phones (`AppFrame`, payload `035c4f3a`) | Phones | native `1366x768` direct-DRM capture; centered shared frame title and paired-device card render without overlap | `d8e3c1ef03adc371e424372846ce0fc44ff4351d1f100fc555049ab2c65e115f` |
 | Dell Dark narrow Phones (`AppFrame`, payload `035c4f3a`) | Phones | `800` logical width; centered frame title, status row, and clipboard field remain unobstructed | `6d203641bf923fb3b09c5f47512e5c3c947d06b121ca0c0155dcf8d2f469dc46` |
@@ -90,6 +94,8 @@ side is outside the proof viewport, not an overlap.
 - `mde-shell-egui::timers::tests::the_panel_renders_headless_over_real_state` — passed after the Timers `AppFrame` migration.
 - `mde-files-egui` full package suite — 165 passed, 0 failed, including the
   real Files sidebar and large-text-compatible rendering fixtures.
+- `mde-maps-location-egui` full package suite — 267 passed, 0 failed,
+  including the fixed health-rail grid and large-text tessellation coverage.
 - Worklist acceptance remains open for the full workspace matrix, remaining
   Construct-owned routes/states, and final production evidence. This is clean
   representative proof, not a claim that every route is production-ready.

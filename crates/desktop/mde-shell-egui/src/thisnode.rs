@@ -30,10 +30,13 @@
 //! only IO is the snapshot read in [`ThisNodeState::poll`].
 
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 use std::time::{Duration, Instant};
 
 use mde_egui::egui::{self, Color32, RichText};
-use mde_egui::Style;
+use mde_egui::{DenseList, Style};
+
+use crate::this_node_catalog::{Section, SectionGroup};
 
 use serde_json::Value;
 
@@ -45,6 +48,11 @@ const SNAPSHOT_PATH: &str = "/run/mde/mesh-status.json";
 /// this window. Matches the chrome bar + the Fleet datacenter poll; the read is a
 /// cheap local file scan, so the cadence can stay tight.
 const REFRESH: Duration = Duration::from_secs(5);
+
+/// The snapshot writer normally runs every ~30 seconds. Treat a readable but
+/// older snapshot as degraded too: a provider that stopped updating must not
+/// look current merely because the last file remains parseable.
+const MAX_SNAPSHOT_AGE_MS: u64 = 90_000;
 
 /// Keep the world-readable mesh snapshot bounded before `serde_json` walks its
 /// peer directory and service maps. The writer is local, but the desktop tier
@@ -112,6 +120,18 @@ fn read_bounded_snapshot(path: &Path) -> Option<String> {
         return None;
     }
     String::from_utf8(bytes).ok()
+}
+
+fn unix_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0)
+}
+
+fn snapshot_age_ms(generated_ms: u64, now_ms: u64) -> Option<u64> {
+    (generated_ms > 0).then(|| now_ms.saturating_sub(generated_ms))
 }
 
 /// A filled-circle status dot — the shared glyph the datacenter rows / chrome pip
@@ -182,17 +202,32 @@ struct NodeStatus {
     latest_version: Option<String>,
     /// This node's own daemon health, in catalog order (label, up).
     services: Vec<(&'static str, bool)>,
-    /// Peers in the directory currently `online`.
-    peers_online: u64,
-    /// Peers in the directory (every node the snapshot names).
-    peers_total: u64,
+    /// The directory's explicit `(online, total)` peer counts.
+    ///
+    /// This stays absent when either field is missing or when the writer emits
+    /// an impossible pair. A missing pair must not become a fabricated `0/0`
+    /// live count in the hardware center.
+    peer_counts: Option<(u64, u64)>,
     /// The elected mesh leader's hostname, when one holds the lease.
     leader: Option<String>,
+    /// Whether the last valid projection is retained after a provider read
+    /// failure. Retained values remain diagnostic-only until refreshed.
+    stale: bool,
+    /// Bounded explanation for the retained stale projection.
+    stale_reason: Option<String>,
     /// The Nebula tunnel cipher label, when nebula is up.
     cipher: Option<String>,
     /// Read-only interface, route, lighthouse, and resolver facts published by
     /// the network section of mesh-status.
     connectivity: ConnectivityFacts,
+    /// Credential-free power-profile observation from the root snapshot writer.
+    power_profile: PowerProfileFacts,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PowerProfileFacts {
+    active: Option<String>,
+    available: Vec<String>,
 }
 
 /// Read a non-empty string field off a JSON object, or `None`.
@@ -220,6 +255,41 @@ fn parse_services(services: Option<&Value>) -> Vec<(&'static str, bool)> {
                 .map(|up| (*label, up))
         })
         .collect()
+}
+
+fn power_profile_facts(value: Option<&Value>) -> PowerProfileFacts {
+    let Some(object) = value.and_then(Value::as_object) else {
+        return PowerProfileFacts::default();
+    };
+    let active = object
+        .get("active")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= 32)
+        .filter(|value| {
+            value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte))
+        })
+        .map(str::to_owned);
+    let mut available = object
+        .get("available")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= 32)
+        .filter(|value| {
+            value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte))
+        })
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    available.sort();
+    available.dedup();
+    PowerProfileFacts { active, available }
 }
 
 /// The read-only connectivity facts this node can prove from mesh-status.
@@ -671,6 +741,13 @@ impl NodeStatus {
 
         let hostname = self_host.unwrap_or_else(|| fallback_host.to_string());
         let network = v.get("network");
+        let peer_counts = match (
+            v.get("online").and_then(Value::as_u64),
+            v.get("total").and_then(Value::as_u64),
+        ) {
+            (Some(online), Some(total)) if online <= total => Some((online, total)),
+            _ => None,
+        };
         let own = nodes.and_then(|arr| {
             arr.iter()
                 .find(|n| n.get("hostname").and_then(Value::as_str) == Some(hostname.as_str()))
@@ -696,19 +773,31 @@ impl NodeStatus {
             services: parse_services(own.and_then(|n| n.get("services"))),
             generated_ms: v.get("generated_ms").and_then(Value::as_u64).unwrap_or(0),
             latest_version: nonempty(&v, "latest_version"),
-            peers_online: v.get("online").and_then(Value::as_u64).unwrap_or(0),
-            peers_total: v.get("total").and_then(Value::as_u64).unwrap_or(0),
+            peer_counts,
             leader: network.and_then(|n| nonempty(n, "leader")),
+            stale: false,
+            stale_reason: None,
             cipher: network.and_then(|n| nonempty(n, "cipher")),
             connectivity: ConnectivityFacts::from_network(network),
+            power_profile: power_profile_facts(v.get("power_profile")),
             hostname,
         }
+    }
+
+    fn mark_stale(&mut self, reason: impl Into<String>) {
+        self.stale = true;
+        self.stale_reason = Some(reason.into());
     }
 
     fn connectivity_availability(&self) -> ConnectivityAvailability {
         if !self.seen {
             return ConnectivityAvailability::Unavailable(
                 "Connectivity facts are unavailable until the mesh-status snapshot is read.",
+            );
+        }
+        if self.stale {
+            return ConnectivityAvailability::Degraded(
+                "Connectivity facts are retained from a stale snapshot; refresh before relying on them.",
             );
         }
         if self.connectivity.is_empty() {
@@ -764,6 +853,116 @@ impl NodeStatus {
         })
     }
 
+    /// Fold the existing read model into the fixed eight-section dashboard.
+    /// There is intentionally no local score calculation here: the top rail's
+    /// mesh-status authority remains the source of health facts, while this
+    /// method only assigns a presentational state to each governed destination.
+    fn health_dashboard(&self) -> HealthDashboard {
+        let states = Section::ALL.map(|section| (section, self.section_health(section)));
+        let overall = if self.stale {
+            SectionHealth::Stale
+        } else if states
+            .iter()
+            .any(|(_, health)| *health == SectionHealth::Unhealthy)
+        {
+            SectionHealth::Unhealthy
+        } else if states
+            .iter()
+            .any(|(_, health)| *health == SectionHealth::Attention)
+        {
+            SectionHealth::Attention
+        } else if states
+            .iter()
+            .all(|(_, health)| *health == SectionHealth::Unavailable)
+        {
+            SectionHealth::Unavailable
+        } else if states
+            .iter()
+            .any(|(_, health)| *health == SectionHealth::Unavailable)
+        {
+            SectionHealth::Attention
+        } else {
+            SectionHealth::Healthy
+        };
+        HealthDashboard { states, overall }
+    }
+
+    fn section_health(&self, section: Section) -> SectionHealth {
+        if self.stale {
+            return SectionHealth::Stale;
+        }
+        if !self.seen {
+            return SectionHealth::Unavailable;
+        }
+
+        match section {
+            Section::Overview => {
+                if self.presence.as_deref() == Some("offline")
+                    || self.services.iter().any(|(_, up)| !up)
+                {
+                    SectionHealth::Unhealthy
+                } else if self.presence.as_deref() == Some("idle")
+                    || self.update_available
+                    || !self.in_directory
+                {
+                    SectionHealth::Attention
+                } else if self.services.is_empty() {
+                    SectionHealth::Unavailable
+                } else {
+                    SectionHealth::Healthy
+                }
+            }
+            Section::Connectivity => match self.connectivity_availability() {
+                ConnectivityAvailability::Available(_) => SectionHealth::Healthy,
+                ConnectivityAvailability::Degraded(_) => SectionHealth::Attention,
+                ConnectivityAvailability::Unavailable(_) => SectionHealth::Unavailable,
+            },
+            Section::DisplaySound | Section::Input | Section::Personalization => {
+                if section.unavailable_reason().is_some() {
+                    SectionHealth::Unavailable
+                } else {
+                    SectionHealth::Healthy
+                }
+            }
+            Section::PowerPerformance => {
+                if self.power_profile.active.is_some() && !self.power_profile.available.is_empty() {
+                    SectionHealth::Healthy
+                } else if !self.power_profile.available.is_empty() {
+                    SectionHealth::Attention
+                } else {
+                    SectionHealth::Unavailable
+                }
+            }
+            Section::Hardware => {
+                // Hardware telemetry and mutation providers are not published
+                // by this read boundary. Do not turn the absence into a fake
+                // healthy device tree or an invented device count.
+                SectionHealth::Unavailable
+            }
+            Section::MeshSystem => {
+                let mesh = self
+                    .capability_projection()
+                    .into_iter()
+                    .find(|projection| projection.capability == NodeCapability::MeshContext)
+                    .map(|projection| projection.availability);
+                if self.services.iter().any(|(_, up)| !up) {
+                    SectionHealth::Unhealthy
+                } else if matches!(mesh, Some(CapabilityAvailability::Degraded(_)))
+                    || matches!(mesh, Some(CapabilityAvailability::Available(_)))
+                        && self.services.is_empty()
+                {
+                    SectionHealth::Attention
+                } else if matches!(mesh, Some(CapabilityAvailability::Available(_)))
+                    && !self.services.is_empty()
+                {
+                    SectionHealth::Healthy
+                } else {
+                    SectionHealth::Unavailable
+                }
+            }
+        }
+    }
+
     /// Project the bounded, read-only capabilities this snapshot can support.
     ///
     /// The snapshot is an observation boundary, not a provider registry. A
@@ -778,6 +977,11 @@ impl NodeStatus {
     }
 
     fn capability_availability(&self, capability: NodeCapability) -> CapabilityAvailability {
+        if self.stale {
+            return CapabilityAvailability::Degraded(
+                "The last valid provider projection is stale; refresh before relying on this state.",
+            );
+        }
         match capability {
             NodeCapability::MeshSnapshot => {
                 if self.seen {
@@ -825,13 +1029,21 @@ impl NodeStatus {
                 }
             }
             NodeCapability::MeshContext => {
-                if self.seen {
+                if !self.seen {
+                    CapabilityAvailability::Unavailable(
+                        "Mesh context is unavailable until the mesh-status snapshot is read.",
+                    )
+                } else if self.peer_counts.is_some() && self.leader.is_some() {
                     CapabilityAvailability::Available(
                         "Peer counts and leader state are read from the live snapshot.",
                     )
+                } else if self.peer_counts.is_some() || self.leader.is_some() {
+                    CapabilityAvailability::Degraded(
+                        "The snapshot exposes only part of mesh context; missing facts remain unavailable.",
+                    )
                 } else {
                     CapabilityAvailability::Unavailable(
-                        "Mesh context is unavailable until the mesh-status snapshot is read.",
+                        "The snapshot has no peer counts or elected leader to report.",
                     )
                 }
             }
@@ -904,6 +1116,11 @@ impl NodeStatus {
     }
 
     fn action_availability(&self, action: ThisNodeAction) -> CapabilityAvailability {
+        if self.stale {
+            return CapabilityAvailability::Degraded(
+                "The provider projection is stale; refresh before requesting an action.",
+            );
+        }
         match action {
             ThisNodeAction::RestartService => {
                 if self.services.is_empty() {
@@ -938,9 +1155,13 @@ impl NodeStatus {
                     )
                 }
             }
-            ThisNodeAction::ChangePowerProfile => CapabilityAvailability::Unavailable(
-                "Power-profile mutation is not connected to a typed local provider.",
-            ),
+            ThisNodeAction::ChangePowerProfile => {
+                CapabilityAvailability::Unavailable(if self.power_profile.available.is_empty() {
+                    "No power-profile provider observation is published by mesh-status."
+                } else {
+                    "Power-profile state is observed read-only; typed local mutation still requires the System provider authorization path."
+                })
+            }
             ThisNodeAction::ConfigureHardware => CapabilityAvailability::Unavailable(
                 "Hardware/OEM mutation is not connected to a typed, bounded provider.",
             ),
@@ -1091,6 +1312,90 @@ fn presence_tone(presence: &str) -> Color32 {
     }
 }
 
+/// Presentation severity for a governed This Node section.
+///
+/// This is deliberately not a second numeric health score. The dashboard folds
+/// the same snapshot/provider observations that the top rail already exposes:
+/// explicit down/offline facts become unhealthy, partial facts become attention,
+/// missing facts remain unavailable, and a retained projection remains stale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SectionHealth {
+    Healthy,
+    Attention,
+    Unhealthy,
+    Unavailable,
+    Stale,
+}
+
+impl SectionHealth {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Healthy => "Healthy",
+            Self::Attention => "Attention",
+            Self::Unhealthy => "Unhealthy",
+            Self::Unavailable => "Unavailable",
+            Self::Stale => "Stale",
+        }
+    }
+
+    const fn glyph(self) -> &'static str {
+        match self {
+            Self::Healthy => "●",
+            Self::Attention => "▲",
+            Self::Unhealthy => "■",
+            Self::Unavailable => "—",
+            Self::Stale => "◌",
+        }
+    }
+
+    const fn tone(self) -> Color32 {
+        match self {
+            Self::Healthy => Style::OK,
+            Self::Attention => Style::WARN,
+            Self::Unhealthy => Style::DANGER,
+            Self::Unavailable | Self::Stale => Style::TEXT_DIM,
+        }
+    }
+
+    const fn is_alert(self) -> bool {
+        matches!(self, Self::Attention | Self::Unhealthy | Self::Stale)
+    }
+}
+
+/// The fixed health projection used by the landing view and its tree.
+///
+/// Keeping the section/state pairs together makes it impossible for the
+/// dashboard and hierarchy to silently disagree about which governed section
+/// is affected. `states` is populated from `Section::ALL`, not provider data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HealthDashboard {
+    states: [(Section, SectionHealth); 8],
+    overall: SectionHealth,
+}
+
+impl HealthDashboard {
+    fn health(self, section: Section) -> SectionHealth {
+        self.states
+            .iter()
+            .find_map(|(candidate, health)| (*candidate == section).then_some(*health))
+            .unwrap_or(SectionHealth::Unavailable)
+    }
+
+    fn count(self, health: SectionHealth) -> usize {
+        self.states
+            .iter()
+            .filter(|(_, candidate)| *candidate == health)
+            .count()
+    }
+
+    fn alert_count(self) -> usize {
+        self.states
+            .iter()
+            .filter(|(_, health)| health.is_alert())
+            .count()
+    }
+}
+
 // ──────────────────────────── the ThisNode state ────────────────────────────
 
 /// The This Node plane's live state: the projected status plus the small IO
@@ -1123,19 +1428,56 @@ impl ThisNodeState {
     /// The poll seam: refresh the projection from the snapshot when the cadence has
     /// elapsed, then keep the repaint heartbeat alive so a heartbeat / service flip
     /// surfaces without input. Cheap enough to call every frame — it self-gates. A
-    /// missing / unreadable snapshot yields the unseen status, never a panic.
+    /// missing / unreadable snapshot retains a previously valid projection as
+    /// stale; before the first valid snapshot it yields the unseen status.
     pub(crate) fn poll(&mut self, ctx: &egui::Context) {
         let due = self.last_poll.is_none_or(|t| t.elapsed() >= REFRESH);
         if due {
             self.last_poll = Some(Instant::now());
-            let snapshot = read_bounded_snapshot(&self.snapshot_path).unwrap_or_default();
-            self.status = NodeStatus::project(&snapshot, &self.local_host);
+            match read_bounded_snapshot(&self.snapshot_path) {
+                Some(snapshot) => {
+                    let projected = NodeStatus::project(&snapshot, &self.local_host);
+                    if projected.seen || !self.status.seen {
+                        self.status = projected;
+                        if let Some(age_ms) =
+                            snapshot_age_ms(self.status.generated_ms, unix_epoch_ms())
+                        {
+                            if age_ms > MAX_SNAPSHOT_AGE_MS {
+                                self.status.mark_stale(format!(
+                                    "The mesh-status snapshot is {} seconds old; retained values may be outdated.",
+                                    age_ms / 1_000
+                                ));
+                            }
+                        }
+                    } else {
+                        self.status.mark_stale(
+                            "The latest mesh-status snapshot was malformed; retained values are stale.",
+                        );
+                    }
+                }
+                None if self.status.seen => self.status.mark_stale(
+                    "The mesh-status provider is unavailable; retained values are stale.",
+                ),
+                None => self.status = NodeStatus::default(),
+            }
         }
         ctx.request_repaint_after(REFRESH);
     }
 
     /// Render the plane's live content into `ui`.
-    pub(crate) fn show(&self, ui: &mut egui::Ui) {
+    pub(crate) fn show(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new("Provider snapshot")
+                    .color(Style::TEXT_DIM)
+                    .size(Style::SMALL),
+            );
+            if ui.button("Refresh now").clicked() {
+                self.last_poll = None;
+                self.poll(ui.ctx());
+            }
+        });
+        ui.add_space(Style::SP_XS);
         show_status(ui, &self.status);
     }
 }
@@ -1178,6 +1520,10 @@ fn show_status(ui: &mut egui::Ui, status: &NodeStatus) {
             .color(Style::TEXT_DIM)
             .size(Style::SMALL),
         );
+        let dashboard = status.health_dashboard();
+        show_health_dashboard(ui, status, dashboard);
+        ui.add_space(Style::SP_S);
+        show_section_hierarchy(ui, status, dashboard);
         show_capability_surface(ui, status);
         return;
     }
@@ -1185,7 +1531,28 @@ fn show_status(ui: &mut egui::Ui, status: &NodeStatus) {
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            ui.group(|ui| show_identity(ui, status));
+            if status.stale {
+                mde_egui::card().show(ui, |ui| {
+                    ui.colored_label(Style::WARN, "This Node status is stale");
+                    ui.label(
+                        RichText::new(
+                            status
+                                .stale_reason
+                                .as_deref()
+                                .unwrap_or("The provider did not return a fresh snapshot."),
+                        )
+                        .color(Style::TEXT_DIM)
+                        .size(Style::SMALL),
+                    );
+                });
+                ui.add_space(Style::SP_S);
+            }
+            let dashboard = status.health_dashboard();
+            show_health_dashboard(ui, status, dashboard);
+            ui.add_space(Style::SP_S);
+            show_section_hierarchy(ui, status, dashboard);
+            ui.add_space(Style::SP_S);
+            mde_egui::card().show(ui, |ui| show_identity(ui, status));
             ui.add_space(Style::SP_S);
 
             ui.label(
@@ -1193,7 +1560,7 @@ fn show_status(ui: &mut egui::Ui, status: &NodeStatus) {
                     .color(Style::TEXT_DIM)
                     .size(Style::SMALL),
             );
-            ui.group(|ui| show_connectivity(ui, status));
+            mde_egui::card().show(ui, |ui| show_connectivity(ui, status));
             ui.add_space(Style::SP_S);
 
             ui.label(
@@ -1201,7 +1568,7 @@ fn show_status(ui: &mut egui::Ui, status: &NodeStatus) {
                     .color(Style::TEXT_DIM)
                     .size(Style::SMALL),
             );
-            ui.group(|ui| show_services(ui, status));
+            mde_egui::card().show(ui, |ui| show_services(ui, status));
             ui.add_space(Style::SP_S);
 
             ui.label(
@@ -1209,7 +1576,15 @@ fn show_status(ui: &mut egui::Ui, status: &NodeStatus) {
                     .color(Style::TEXT_DIM)
                     .size(Style::SMALL),
             );
-            ui.group(|ui| show_mesh(ui, status));
+            mde_egui::card().show(ui, |ui| show_mesh(ui, status));
+            ui.add_space(Style::SP_S);
+
+            ui.label(
+                RichText::new("Power & performance")
+                    .color(Style::TEXT_DIM)
+                    .size(Style::SMALL),
+            );
+            mde_egui::card().show(ui, |ui| show_power_profile(ui, status));
             ui.add_space(Style::SP_S);
 
             // Honest boundary (§6/§7): node-local hardware telemetry isn't on this
@@ -1223,6 +1598,247 @@ fn show_status(ui: &mut egui::Ui, status: &NodeStatus) {
         });
 }
 
+fn show_health_dashboard(ui: &mut egui::Ui, status: &NodeStatus, dashboard: HealthDashboard) {
+    mde_egui::card().show(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Health dashboard").strong());
+            ui.colored_label(
+                dashboard.overall.tone(),
+                RichText::new(format!(
+                    "{} {}",
+                    dashboard.overall.glyph(),
+                    dashboard.overall.label()
+                ))
+                .strong(),
+            );
+        });
+
+        if dashboard.overall == SectionHealth::Healthy {
+            ui.label(
+                RichText::new("All systems operational")
+                    .color(Style::OK)
+                    .size(Style::BODY),
+            );
+            ui.label(
+                RichText::new(
+                    "The current mesh-status projection reports healthy facts for every governed section.",
+                )
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+            );
+        } else if dashboard.alert_count() > 0 {
+            let heading = if dashboard.count(SectionHealth::Unhealthy) > 0 {
+                "Critical alerts"
+            } else if dashboard.overall == SectionHealth::Stale {
+                "Status requires refresh"
+            } else {
+                "Attention needed"
+            };
+            ui.label(RichText::new(heading).color(dashboard.overall.tone()).strong());
+            let mut rows = DenseList::new();
+            for (section, health) in dashboard.states {
+                if !health.is_alert() {
+                    continue;
+                }
+                rows.row(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.colored_label(
+                            health.tone(),
+                            RichText::new(format!("{} {}", health.glyph(), health.label()))
+                                .size(Style::SMALL),
+                        );
+                        ui.label(RichText::new(section.label()).strong().size(Style::SMALL));
+                        ui.label(
+                            RichText::new(section_health_detail(section, health, status))
+                                .color(Style::TEXT_DIM)
+                                .size(Style::SMALL),
+                        );
+                    });
+                });
+            }
+        } else {
+            ui.colored_label(
+                Style::TEXT_DIM,
+                format!(
+                    "Health data is unavailable for {} governed sections.",
+                    dashboard.count(SectionHealth::Unavailable)
+                ),
+            );
+            ui.label(
+                RichText::new(
+                    "This Node will show provider-backed health when the shared snapshot publishes it.",
+                )
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+            );
+        }
+
+        if dashboard.count(SectionHealth::Unavailable) > 0
+            && dashboard.overall != SectionHealth::Unavailable
+        {
+            ui.label(
+                RichText::new(format!(
+                    "{} sections have no published provider observation.",
+                    dashboard.count(SectionHealth::Unavailable)
+                ))
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+            );
+        }
+    });
+}
+
+fn show_section_hierarchy(ui: &mut egui::Ui, status: &NodeStatus, dashboard: HealthDashboard) {
+    ui.label(RichText::new("This Node hierarchy").strong());
+    ui.label(
+        RichText::new(
+            "Expand a governed section to inspect its current detail availability. Badges use the same live health authority as the dashboard.",
+        )
+        .color(Style::TEXT_DIM)
+        .size(Style::SMALL),
+    );
+    ui.add_space(Style::SP_XS);
+
+    for group in SectionGroup::ALL {
+        let group_health = group_health(dashboard, group);
+        egui::CollapsingHeader::new(
+            RichText::new(format!(
+                "{}   {} {}",
+                group.label(),
+                group_health.glyph(),
+                group_health.label()
+            ))
+            .color(group_health.tone()),
+        )
+        .id_salt(("this-node-hierarchy", group.label()))
+        .open(Some(true))
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new(group.description())
+                    .color(Style::TEXT_DIM)
+                    .size(Style::SMALL),
+            );
+            let mut rows = DenseList::new();
+            for section in group.sections() {
+                let health = dashboard.health(*section);
+                rows.row(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.colored_label(
+                            health.tone(),
+                            RichText::new(format!("{} {}", health.glyph(), health.label()))
+                                .size(Style::SMALL),
+                        );
+                        ui.label(RichText::new(section.label()).strong().size(Style::SMALL));
+                        ui.label(
+                            RichText::new(section.description())
+                                .color(Style::TEXT_DIM)
+                                .size(Style::SMALL),
+                        );
+                    });
+                    if health != SectionHealth::Healthy {
+                        ui.label(
+                            RichText::new(section_health_detail(*section, health, status))
+                                .color(health.tone())
+                                .size(Style::SMALL),
+                        );
+                    }
+                });
+            }
+        });
+    }
+}
+
+fn group_health(dashboard: HealthDashboard, group: SectionGroup) -> SectionHealth {
+    let mut has_attention = false;
+    let mut has_unavailable = false;
+    for section in group.sections() {
+        match dashboard.health(*section) {
+            SectionHealth::Unhealthy => return SectionHealth::Unhealthy,
+            SectionHealth::Stale => return SectionHealth::Stale,
+            SectionHealth::Attention => has_attention = true,
+            SectionHealth::Unavailable => has_unavailable = true,
+            SectionHealth::Healthy => {}
+        }
+    }
+    if has_attention {
+        SectionHealth::Attention
+    } else if has_unavailable {
+        SectionHealth::Unavailable
+    } else {
+        SectionHealth::Healthy
+    }
+}
+
+fn section_health_detail(section: Section, health: SectionHealth, status: &NodeStatus) -> String {
+    match health {
+        SectionHealth::Healthy => "Current provider facts are available.".to_string(),
+        SectionHealth::Stale => status
+            .stale_reason
+            .clone()
+            .unwrap_or_else(|| "The retained provider projection is stale; refresh first.".into()),
+        SectionHealth::Unavailable => section
+            .unavailable_reason()
+            .map(str::to_owned)
+            .unwrap_or_else(|| "No provider observation for this section is published yet.".into()),
+        SectionHealth::Attention => match section {
+            Section::Connectivity => status.connectivity_availability().detail().to_string(),
+            Section::Overview => {
+                if !status.in_directory {
+                    "This node is named by the snapshot but has no directory row yet.".into()
+                } else if status.update_available {
+                    "A newer mesh version is visible; update execution remains provider-gated."
+                        .into()
+                } else {
+                    "The node is present but its health facts are only partially reported.".into()
+                }
+            }
+            Section::PowerPerformance => {
+                "Power-profile facts are partial; missing telemetry is not inferred.".into()
+            }
+            Section::MeshSystem => {
+                "Mesh context or service health is only partially reported.".into()
+            }
+            _ => {
+                "This section has partial provider facts; missing values remain unavailable.".into()
+            }
+        },
+        SectionHealth::Unhealthy => {
+            if status.presence.as_deref() == Some("offline") {
+                "The node's published presence is offline.".into()
+            } else {
+                "One or more published service rows report down.".into()
+            }
+        }
+    }
+}
+
+fn show_power_profile(ui: &mut egui::Ui, status: &NodeStatus) {
+    if status.power_profile.available.is_empty() {
+        ui.colored_label(Style::TEXT_DIM, "Power-profile provider not observed");
+        ui.label(
+            RichText::new("No profile names crossed the credential-free mesh-status boundary.")
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+        );
+        return;
+    }
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Active:");
+        ui.colored_label(
+            if status.stale { Style::WARN } else { Style::OK },
+            status.power_profile.active.as_deref().unwrap_or("unknown"),
+        );
+    });
+    ui.label(
+        RichText::new(format!(
+            "Advertised profiles: {}",
+            status.power_profile.available.join(", ")
+        ))
+        .color(Style::TEXT_DIM)
+        .size(Style::SMALL),
+    );
+}
+
 /// Render the bounded This Node capability/action surface. Capability rows are
 /// projections of the live snapshot; action rows are deliberately disabled
 /// because this state path has no provider or mutation writer. That distinction
@@ -1234,9 +1850,10 @@ fn show_capability_surface(ui: &mut egui::Ui, status: &NodeStatus) {
             .color(Style::TEXT_DIM)
             .size(Style::SMALL),
     );
-    ui.group(|ui| {
+    mde_egui::card().show(ui, |ui| {
+        let mut rows = DenseList::new();
         for projection in status.capability_projection() {
-            show_capability_row(ui, projection);
+            rows.row(ui, |ui| show_capability_row(ui, projection));
         }
     });
 
@@ -1246,9 +1863,10 @@ fn show_capability_surface(ui: &mut egui::Ui, status: &NodeStatus) {
             .color(Style::TEXT_DIM)
             .size(Style::SMALL),
     );
-    ui.group(|ui| {
+    mde_egui::card().show(ui, |ui| {
+        let mut rows = DenseList::new();
         for projection in status.action_projection() {
-            show_action_row(ui, projection);
+            rows.row(ui, |ui| show_action_row(ui, projection));
         }
         ui.add_space(Style::SP_XS);
         mde_egui::muted_note(
@@ -1308,9 +1926,10 @@ fn show_connectivity(ui: &mut egui::Ui, status: &NodeStatus) {
             .color(Style::TEXT_DIM)
             .size(Style::SMALL),
     );
-    ui.group(|ui| {
+    mde_egui::card().show(ui, |ui| {
+        let mut rows = DenseList::new();
         for projection in facts.provider_projection() {
-            show_connectivity_provider_row(ui, projection);
+            rows.row(ui, |ui| show_connectivity_provider_row(ui, projection));
         }
     });
 
@@ -1424,7 +2043,7 @@ fn show_action_row(ui: &mut egui::Ui, projection: ActionProjection) {
             false,
             egui::Button::new(RichText::new(projection.action.label()).size(Style::SMALL)),
         );
-        let response = response.on_hover_text(availability.detail());
+        let response = mde_egui::widgets::hover_text(response, availability.detail());
         install_action_accessibility(
             ui.ctx(),
             response.id,
@@ -1580,18 +2199,21 @@ fn show_services(ui: &mut egui::Ui, status: &NodeStatus) {
         mde_egui::muted_note(ui, msg);
         return;
     }
+    let mut rows = DenseList::new();
     for (label, up) in &status.services {
-        ui.horizontal(|ui| {
-            let (dot, word, tone) = if *up {
-                (Style::OK, "up", Style::TEXT_DIM)
-            } else {
-                (Style::TEXT_DIM, "down", Style::WARN)
-            };
-            ui.label(RichText::new(DOT).color(dot).size(Style::SMALL));
-            ui.add_space(Style::SP_XS);
-            ui.label(RichText::new(*label).color(Style::TEXT).size(Style::SMALL));
-            ui.add_space(Style::SP_XS);
-            ui.colored_label(tone, RichText::new(word).size(Style::SMALL));
+        rows.row(ui, |ui| {
+            ui.horizontal(|ui| {
+                let (dot, word, tone) = if *up {
+                    (Style::OK, "up", Style::TEXT_DIM)
+                } else {
+                    (Style::TEXT_DIM, "down", Style::WARN)
+                };
+                ui.label(RichText::new(DOT).color(dot).size(Style::SMALL));
+                ui.add_space(Style::SP_XS);
+                ui.label(RichText::new(*label).color(Style::TEXT).size(Style::SMALL));
+                ui.add_space(Style::SP_XS);
+                ui.colored_label(tone, RichText::new(word).size(Style::SMALL));
+            });
         });
     }
 }
@@ -1599,29 +2221,30 @@ fn show_services(ui: &mut egui::Ui, status: &NodeStatus) {
 /// The mesh-context card: the live peer count (online / total) and the elected
 /// leader.
 fn show_mesh(ui: &mut egui::Ui, status: &NodeStatus) {
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new("Peers")
-                .color(Style::TEXT_DIM)
-                .size(Style::SMALL),
-        );
-        ui.add_space(Style::SP_S);
-        let tone = if status.peers_total == 0 {
-            Style::TEXT_DIM
-        } else if status.peers_online == status.peers_total {
-            Style::OK
-        } else {
-            Style::WARN
-        };
-        ui.colored_label(
-            tone,
-            RichText::new(format!(
-                "{}/{} live",
-                status.peers_online, status.peers_total
-            ))
-            .size(Style::SMALL),
-        );
-    });
+    match status.peer_counts {
+        Some((online, total)) => {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Peers")
+                        .color(Style::TEXT_DIM)
+                        .size(Style::SMALL),
+                );
+                ui.add_space(Style::SP_S);
+                let tone = if total == 0 {
+                    Style::TEXT_DIM
+                } else if online == total {
+                    Style::OK
+                } else {
+                    Style::WARN
+                };
+                ui.colored_label(
+                    tone,
+                    RichText::new(format!("{online}/{total} live")).size(Style::SMALL),
+                );
+            });
+        }
+        None => mde_egui::field(ui, "Peers", "unavailable", Style::TEXT_DIM),
+    }
     match &status.leader {
         Some(leader) => mde_egui::field(ui, "Leader", leader, Style::TEXT),
         None => mde_egui::field(ui, "Leader", "no leader elected", Style::TEXT_DIM),
@@ -1805,15 +2428,79 @@ mod tests {
         assert!(s.services.iter().any(|(l, up)| *l == "Voice HUD" && !*up));
 
         // Mesh context — the live peer count + the elected leader.
-        assert_eq!((s.peers_online, s.peers_total), (2, 3));
+        assert_eq!(s.peer_counts, Some((2, 3)));
         assert_eq!(s.leader.as_deref(), Some("lh-01"));
         assert!(!s.is_leader(), "the leader is a peer, not this node");
+        assert_eq!(s.power_profile.active.as_deref(), Some("balanced"));
+        assert_eq!(
+            s.power_profile.available,
+            vec!["balanced", "performance", "power-saver"]
+        );
 
         // And the whole live panel tessellates.
         assert!(
             renders(&s),
             "the live ThisNode panel produced no draw primitives"
         );
+    }
+
+    #[test]
+    fn health_dashboard_tracks_the_fixed_tree_and_explicit_attention() {
+        let s = NodeStatus::project(&snapshot("this-node", "lh-01"), "fallback");
+        let dashboard = s.health_dashboard();
+
+        assert_eq!(dashboard.states.len(), Section::ALL.len());
+        assert_eq!(dashboard.overall, SectionHealth::Unhealthy);
+        assert_eq!(
+            dashboard.health(Section::Overview),
+            SectionHealth::Unhealthy
+        );
+        assert_eq!(
+            dashboard.health(Section::Connectivity),
+            SectionHealth::Healthy
+        );
+        assert_eq!(
+            dashboard.health(Section::DisplaySound),
+            SectionHealth::Unavailable
+        );
+        assert_eq!(
+            dashboard.health(Section::PowerPerformance),
+            SectionHealth::Healthy
+        );
+        assert_eq!(
+            dashboard.health(Section::Hardware),
+            SectionHealth::Unavailable
+        );
+        assert!(dashboard.alert_count() > 0);
+
+        let flattened: Vec<_> = SectionGroup::ALL
+            .into_iter()
+            .flat_map(SectionGroup::sections)
+            .copied()
+            .collect();
+        assert_eq!(flattened, Section::ALL);
+        assert!(
+            renders(&s),
+            "the dashboard and hierarchy must paint together"
+        );
+    }
+
+    #[test]
+    fn stale_health_dashboard_marks_every_tree_row_stale() {
+        let mut s = NodeStatus::project(&snapshot("this-node", "lh-01"), "fallback");
+        s.mark_stale("provider stopped publishing");
+
+        let dashboard = s.health_dashboard();
+        assert_eq!(dashboard.overall, SectionHealth::Stale);
+        assert!(dashboard
+            .states
+            .iter()
+            .all(|(_, health)| *health == SectionHealth::Stale));
+        assert!(
+            section_health_detail(Section::Hardware, SectionHealth::Stale, &s)
+                .contains("provider stopped publishing")
+        );
+        assert!(renders(&s), "stale dashboard rows must remain renderable");
     }
 
     #[test]
@@ -1872,6 +2559,37 @@ mod tests {
             CapabilityAvailability::Available(_)
         ));
         assert!(renders(&s), "published connectivity facts must render");
+    }
+
+    #[test]
+    fn missing_or_impossible_peer_counts_stay_unavailable() {
+        for snapshot in [
+            r#"{"self":"this-node","nodes":[],"total":3}"#,
+            r#"{"self":"this-node","nodes":[],"online":2,"total":1}"#,
+            r#"{"self":"this-node","nodes":[],"online":"2","total":3}"#,
+        ] {
+            let status = NodeStatus::project(snapshot, "fallback");
+            assert!(status.seen, "the snapshot itself is readable");
+            assert_eq!(
+                status.peer_counts, None,
+                "invalid counts must not become 0/0"
+            );
+
+            let mesh = status
+                .capability_projection()
+                .into_iter()
+                .find(|projection| projection.capability == NodeCapability::MeshContext)
+                .expect("mesh context capability");
+            assert!(matches!(
+                mesh.availability,
+                CapabilityAvailability::Unavailable(_)
+            ));
+            assert!(mesh.availability.detail().contains("peer counts"));
+            assert!(
+                renders(&status),
+                "the unavailable peer state must still render"
+            );
+        }
     }
 
     #[test]
@@ -2117,7 +2835,7 @@ mod tests {
         // Network-sourced identity is still available.
         assert_eq!(s.overlay_ip.as_deref(), Some("10.42.0.7"));
         assert_eq!(s.leader.as_deref(), Some("lh-01"));
-        assert_eq!((s.peers_online, s.peers_total), (2, 3));
+        assert_eq!(s.peer_counts, Some((2, 3)));
         // Per-node fields are honestly empty, not fabricated.
         assert!(s.role.is_none());
         assert!(s.presence.is_none());
@@ -2125,6 +2843,43 @@ mod tests {
         assert!(s.heartbeat_label().is_none());
         // The honest-partial panel still fully paints.
         assert!(renders(&s));
+    }
+
+    #[test]
+    fn provider_loss_retains_last_snapshot_as_explicitly_stale() {
+        let mut s = NodeStatus::project(&snapshot("this-node", "lh-01"), "fallback");
+        assert!(s.seen);
+        assert!(!s.stale);
+        let hostname = s.hostname.clone();
+        let overlay_ip = s.overlay_ip.clone();
+
+        s.mark_stale("provider unavailable");
+
+        assert!(s.stale);
+        assert_eq!(s.stale_reason.as_deref(), Some("provider unavailable"));
+        assert_eq!(s.hostname, hostname);
+        assert_eq!(s.overlay_ip, overlay_ip);
+        assert!(matches!(
+            s.connectivity_availability(),
+            ConnectivityAvailability::Degraded(_)
+        ));
+        assert!(s.capability_projection().iter().all(|projection| matches!(
+            projection.availability,
+            CapabilityAvailability::Degraded(_)
+        )));
+        assert!(s.action_projection().iter().all(|projection| matches!(
+            projection.availability,
+            CapabilityAvailability::Degraded(_)
+        )));
+        assert!(renders(&s), "stale retained state must remain renderable");
+    }
+
+    #[test]
+    fn snapshot_age_is_bounded_and_future_timestamps_do_not_fake_staleness() {
+        assert_eq!(snapshot_age_ms(0, 10_000), None);
+        assert_eq!(snapshot_age_ms(9_000, 100_000), Some(91_000));
+        assert_eq!(snapshot_age_ms(101_000, 100_000), Some(0));
+        assert!(snapshot_age_ms(9_000, 100_000).is_some_and(|age| age > MAX_SNAPSHOT_AGE_MS));
     }
 
     #[test]

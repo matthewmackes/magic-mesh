@@ -1160,11 +1160,15 @@ remains here under a completed status.
   cover the shell and major workspaces. Direct-DRM evidence and hashes are in
   [`WL-UX-009-DRM-EVIDENCE-2026-07-31.md`](WL-UX-009-DRM-EVIDENCE-2026-07-31.md).
   `.138` has Editor Dark desktop/narrow and Light/Largest proof. Dell has clean
-  Editor/System/Bookmarks/Storage/Files/Mesh Teams/Phones/Timers Dark, narrow,
-  and Light/Largest proof with `NRestarts=0`; latest payload is `44296eee`.
+  Editor/System/Bookmarks/Storage/Files/Mesh Teams/Maps/Phones/Timers Dark,
+  narrow, and Light/Largest proof with `NRestarts=0`; latest payload is
+  `b88b6b88`.
   The full RPM
   dependency transaction, `.15`, remaining routes/states, full matrix, and
   production readiness remain open.
+  The Maps Drive HUD now reserves the painter-positioned FAB lane before laying
+  out the radio/GNSS health rail and selects a fixed multi-row grid for
+  large/largest text; 267 focused Maps tests pass on farm `.90`.
 - Remaining work:
 
   1. Finish the shared app-frame and Terminal-pattern unified top bar, including
@@ -1186,6 +1190,9 @@ remains here under a completed status.
      guest Chromium viewport or reintroduce host Browser chrome.
   5. Complete Dark/Light, desktop/narrow/large-text, no-overlap, icon
      licensing/raster, expressive motion, and representative live DRM proof.
+  6. Repair the Maps Drive HUD at large text: reserve the floating-action-button
+     lane and increase the health-rail geometry so radio/GNSS status remains
+     readable and unobscured in Light/Largest proof.
 - Scope: Current design authority, shared `mde-egui` and brand/icon primitives,
   shell-owned chrome, launchable egui workspace frames, and Editor/Terminal
   internal chrome. Behavior contracts, security/auth, full AccessKit rollout,

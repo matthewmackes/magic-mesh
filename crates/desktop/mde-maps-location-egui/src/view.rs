@@ -4,6 +4,7 @@ use mde_egui::egui::{
     self, Align, Align2, Color32, FontId, Mesh, Painter, Pos2, Rect, RichText, Sense, Shape,
     Stroke, StrokeKind, Vec2,
 };
+use mde_egui::menubar::{ChipTone, Menu, MenuBar, MenuBarModel, StatusChip};
 use mde_egui::{paint_carbon, Style, StyleColorScheme, TypographyRole};
 
 use crate::model::{
@@ -14,13 +15,12 @@ use crate::model::{
     OfflineNavigationStatus, ProviderContract, RouteOption, RoutePlan, RouteTraffic,
     SettingValueType, SetupStep, SourceStatus, TripRecorderState, VehicleHealthRail,
     VehicleHealthRailSlot, VehicleHealthRailState, VehicleMirrorState, VehicleMirrorStatus,
-    VehicleRadioAvailability, VehicleRadioHealth, VehicleRadioOperation, VehicleRadioPresence,
-    VehicleState, WorkspaceTab,
+    VehicleHealthRailLayout, VehicleRadioAvailability, VehicleRadioHealth, VehicleRadioOperation,
+    VehicleRadioPresence, VehicleState, WorkspaceTab,
 };
 use crate::MapsLocationSurface;
 
 const RAIL_W: f32 = 176.0;
-const HEADER_H: f32 = mde_egui::menubar::BAR_HEIGHT + Style::SP_S;
 const RAIL_INNER_MARGIN: f32 = Style::SP_S;
 const MAP_LAYERS_POPUP_ID: &str = "maps-location-layers-popup";
 const MAP_LAYERS_SCROLL_ID: &str = "maps-location-layers-scroll";
@@ -54,6 +54,11 @@ const HUD_RADIUS_S: f32 = 12.0;
 /// Maximum attribution text submitted to egui's galley/layout machinery.
 const MAX_MAP_ATTRIBUTION_CHARS: usize = 512;
 const MAP_ATTRIBUTION_ELLIPSIS: char = '\u{2026}';
+
+/// The Drive HUD's painter-positioned FABs occupy a dedicated right-hand lane.
+/// Keep this geometry explicit so large-text tiles never render underneath a
+/// button or its pointer target.
+const DRIVE_FAB_LANE_SEPARATION: f32 = Style::SP_XS;
 
 /// Render the complete native Maps & Location workspace.
 pub fn maps_location_panel(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
@@ -138,77 +143,27 @@ fn render_active_tab(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
 }
 
 fn header(ui: &mut egui::Ui, state: &MapsLocationSurface) {
-    let (rect, _) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), HEADER_H), Sense::hover());
-    let painter = ui.painter();
-    painter.rect_filled(rect, Style::RADIUS, Style::LAYER_01);
-    painter.rect_stroke(
-        rect,
-        Style::RADIUS,
-        Stroke::new(1.0, Style::BORDER),
-        egui::StrokeKind::Inside,
-    );
-
-    let title_pos = egui::pos2(rect.left() + Style::SP_M, rect.center().y - Style::SP_XS);
-    painter.text(
-        title_pos,
-        Align2::LEFT_CENTER,
-        "Maps & Location",
-        FontId::proportional(Style::TITLE),
-        Style::TEXT_STRONG,
-    );
-    // Honest subtitle: the "simulator active" phrasing only ever appears when
-    // the cfg-gated test fixture seeded this surface (production never does).
-    let subtitle = if state.simulator_enabled {
-        "Native offline navigation, local MG90 management, simulator active"
-    } else {
-        "Native offline navigation, local MG90 management, live MG90 mirror"
-    };
-    painter.text(
-        title_pos + egui::vec2(0.0, Style::SP_S + Style::SP_XS),
-        Align2::LEFT_CENTER,
-        subtitle,
-        FontId::proportional(Style::SMALL),
-        Style::TEXT_DIM,
-    );
-
-    let mut x = rect.right() - Style::SP_M;
-    x = header_chip(ui, rect, x, "25 GB offline cap", Style::ACCENT_SYSTEM);
-    x = header_chip(ui, rect, x, "Direct Ethernet", Style::ACCENT_TERMINALS);
+    // Maps retains its domain status chips, but the Construct-owned title strip
+    // is the shared menubar. The map canvas below remains the only governed
+    // Maps content-colour exception; Car still bypasses this header entirely.
+    let mut status = vec![
+        StatusChip::new("25 GB offline cap", ChipTone::Info),
+        StatusChip::new("Direct Ethernet", ChipTone::Neutral),
+    ];
     // The Simulator chip exists ONLY while the test fixture is live — a
     // production surface has no simulator to flag (WL-UX-007/S1).
     if state.simulator_enabled {
-        let _ = header_chip(ui, rect, x, "Simulator", Style::OK);
+        status.push(StatusChip::new("Simulator", ChipTone::Ok));
     }
-}
-
-fn header_chip(ui: &egui::Ui, header: Rect, right: f32, label: &str, tone: Color32) -> f32 {
-    let galley = ui.painter().layout_no_wrap(
-        label.to_string(),
-        FontId::proportional(Style::SMALL),
-        Style::TEXT,
-    );
-    let chip_w = galley.size().x + Style::SP_M + Style::SP_S;
-    let rect = Rect::from_min_size(
-        egui::pos2(right - chip_w, header.center().y - Style::SP_S),
-        egui::vec2(chip_w, Style::SP_M),
-    );
-    ui.painter()
-        .rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
-    ui.painter().circle_filled(
-        egui::pos2(rect.left() + Style::SP_S, rect.center().y),
-        3.0,
-        tone,
-    );
-    ui.painter().galley(
-        egui::pos2(
-            rect.left() + Style::SP_M,
-            rect.center().y - galley.size().y / 2.0,
-        ),
-        galley,
-        Style::TEXT,
-    );
-    rect.left() - Style::SP_S
+    let menus: &[Menu<&'static str>] = &[];
+    let model = MenuBarModel {
+        title: "Maps & Location",
+        accent: Style::ACCENT,
+        menus,
+        status: &status,
+    };
+    MenuBar::show(ui, &model);
+    ui.add_space(Style::SP_S);
 }
 
 /// A persistent, un-hideable "SIMULATED DATA" badge for the Car-Mode full-bleed
@@ -530,6 +485,52 @@ fn safe_width(ui: &egui::Ui) -> f32 {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct DriveHudOverlayGeometry {
+    health_rail: Rect,
+    fab_lane: Rect,
+    rail_layout: VehicleHealthRailLayout,
+}
+
+/// Reserve the complete FAB lane before placing the radio/GNSS rail.
+///
+/// The lane includes the button diameter, its stack gap, and a full spacing
+/// unit at the rail boundary.  It intentionally spans the canvas vertically:
+/// the FABs are painter-positioned and their hit targets must remain excluded
+/// even when the health rail grows for Large/Largest text.
+fn drive_hud_overlay_geometry(
+    canvas: Rect,
+    below_banner: f32,
+    margin: f32,
+    left_inset: f32,
+    fab_radius: f32,
+    fab_gap: f32,
+    rail_layout: VehicleHealthRailLayout,
+) -> DriveHudOverlayGeometry {
+    let lane_width = (fab_radius * 2.0 + fab_gap + Style::SP_M).max(1.0);
+    let lane_left = canvas.right() - margin - lane_width;
+    let lane_right = canvas.right() - margin;
+    let fab_lane = safe_rect(
+        lane_left,
+        canvas.top(),
+        (lane_right - lane_left).max(1.0),
+        canvas.height().max(1.0),
+    );
+    let rail_left = canvas.left() + margin + left_inset.max(0.0);
+    let rail_right = (fab_lane.left() - DRIVE_FAB_LANE_SEPARATION).max(rail_left + 1.0);
+    let health_rail = safe_rect(
+        rail_left,
+        below_banner.max(canvas.top() + margin),
+        (rail_right - rail_left).max(1.0),
+        rail_layout.minimum_height.max(1.0),
+    );
+    DriveHudOverlayGeometry {
+        health_rail,
+        fab_lane,
+        rail_layout,
+    }
+}
+
 /// Elide `text` with a trailing ellipsis so it never overflows `max_w`.
 fn elide(painter: &Painter, text: &str, font: FontId, max_w: f32) -> String {
     let full = painter.layout_no_wrap(text.to_string(), font.clone(), Color32::WHITE);
@@ -606,6 +607,11 @@ fn drive_hud(
     }
 
     let margin = Style::SP_M;
+    // Large text changes the layout metrics but the Drive HUD also contains
+    // painter-positioned controls. Keep those controls and the radio rail in
+    // separate lanes so the accessibility zoom cannot turn the last health
+    // tile into a button backdrop.
+    let text_zoom = ui.ctx().zoom_factor().max(1.0);
 
     // --- Floating action buttons (interactive; unique stable ids). ---------
     let fab_r = 26.0_f32;
@@ -717,19 +723,32 @@ fn drive_hud(
     // Keep the six native MG90 positions visible in both Free Drive and active
     // guidance. This rail is derived only from the accepted v2 projection; it
     // never falls back to legacy signal values or manufactures missing rows.
-    let rail_height = if width < 520.0 { 132.0 } else { 104.0 };
-    let health_rail_rect = safe_rect(
-        rect.left() + margin,
+    let rail = state.vehicle_health_rail();
+    let overlay = drive_hud_overlay_geometry(
+        rect,
         below_banner,
-        width - 2.0 * margin,
-        rail_height,
+        margin,
+        if text_zoom > 1.0 {
+            88.0 + Style::SP_S
+        } else {
+            0.0
+        },
+        fab_r,
+        fab_gap,
+        rail.layout_for_text_zoom(text_zoom),
     );
-    paint_health_rail(ui, health_rail_rect, &state.vehicle_health_rail());
-    below_banner = health_rail_rect.bottom() + Style::SP_S;
+    paint_health_rail(ui, overlay.health_rail, &rail, text_zoom);
+    below_banner = overlay.health_rail.bottom() + Style::SP_S;
 
     // Alert pills. Acquiring-GPS + offline-blocked are system-level (both states);
     // traffic + weather belong to an active route (guidance only).
-    let pill_x = rect.left() + margin;
+    let pill_x = rect.left()
+        + margin
+        + if text_zoom > 1.25 {
+            88.0 + Style::SP_S
+        } else {
+            0.0
+        };
     let mut pill_y = below_banner;
     if !has_fix {
         pill_y = paint_alert_pill(
@@ -804,7 +823,13 @@ fn drive_hud(
     }
 }
 
-fn paint_health_rail(ui: &mut egui::Ui, rect: Rect, rail: &VehicleHealthRail) {
+fn paint_health_rail(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    rail: &VehicleHealthRail,
+    text_zoom: f32,
+) {
+    let rail_layout = rail.layout_for_text_zoom(text_zoom);
     let mut child = ui.new_child(
         egui::UiBuilder::new()
             .max_rect(rect)
@@ -819,7 +844,7 @@ fn paint_health_rail(ui: &mut egui::Ui, rect: Rect, rail: &VehicleHealthRail) {
         .corner_radius(HUD_RADIUS_S)
         .stroke(Stroke::new(1.0, health_rail_tone(rail.state)))
         .show(&mut child, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label(
                     RichText::new("Radio & GNSS health")
                         .size(Style::SMALL)
@@ -831,69 +856,116 @@ fn paint_health_rail(ui: &mut egui::Ui, rect: Rect, rail: &VehicleHealthRail) {
                 });
             });
             ui.add_space(Style::SP_XS);
-            ui.horizontal_top(|ui| {
-                let gap = Style::SP_XS;
-                let slot_width = ((ui.available_width() - gap * 5.0) / 6.0).max(1.0);
-                let slot_height = ui.available_height().max(30.0);
-                for slot in &rail.slots {
-                    let response = ui
-                        .allocate_ui_with_layout(
-                            Vec2::new(slot_width, slot_height),
-                            egui::Layout::top_down(Align::Center),
-                            |slot_ui| {
-                                let tile = slot_ui.max_rect();
-                                slot_ui
-                                    .painter()
-                                    .rect_filled(tile, HUD_RADIUS_S, HUD_CARD_HI);
-                                slot_ui.painter().rect_stroke(
-                                    tile,
-                                    HUD_RADIUS_S,
-                                    Stroke::new(1.0, Style::BORDER),
-                                    egui::StrokeKind::Inside,
-                                );
-                                let (icon_rect, _) = slot_ui.allocate_exact_size(
-                                    Vec2::new(slot_width.min(24.0), 22.0),
-                                    Sense::hover(),
-                                );
-                                paint_health_slot_glyph(
-                                    slot_ui.painter(),
-                                    icon_rect.center(),
-                                    slot,
-                                );
-                                slot_ui.add(
-                                    egui::Label::new(
-                                        RichText::new(slot.label)
-                                            .size(Style::SMALL)
-                                            .color(Style::TEXT_STRONG),
-                                    )
-                                    .wrap(),
-                                );
-                                slot_ui.add(
-                                    egui::Label::new(
-                                        RichText::new(slot.state.label())
-                                            .size(Style::SMALL)
-                                            .color(health_slot_tone(slot)),
-                                    )
-                                    .wrap(),
-                                );
-                                let operation = slot
-                                    .operation
-                                    .map_or("not reported", VehicleRadioOperation::label);
-                                slot_ui.add(
-                                    egui::Label::new(
-                                        RichText::new(operation)
-                                            .size(Style::SMALL)
-                                            .color(health_slot_tone(slot)),
-                                    )
-                                    .wrap(),
-                                );
-                            },
-                        )
-                        .response;
-                    response.on_hover_text(slot.accessibility_label());
+            let columns = rail_layout.columns;
+            let rows = rail_layout.rows;
+            let gap = Style::SP_XS;
+            let slot_width = ((ui.available_width() - gap * (columns - 1) as f32)
+                / columns as f32)
+                .max(1.0);
+            let slot_height = ((ui.available_height() - gap * (rows - 1) as f32)
+                / rows as f32)
+                .max(30.0);
+            for row in 0..rows {
+                ui.horizontal_top(|ui| {
+                    for (column, slot) in rail.slots.iter().skip(row * columns).take(columns).enumerate() {
+                        let response = ui
+                            .allocate_ui_with_layout(
+                                Vec2::new(slot_width, slot_height),
+                                egui::Layout::top_down(Align::Center),
+                                |slot_ui| {
+                                    let tile = slot_ui.max_rect();
+                                    slot_ui
+                                        .painter()
+                                        .rect_filled(tile, HUD_RADIUS_S, HUD_CARD_HI);
+                                    slot_ui.painter().rect_stroke(
+                                        tile,
+                                        HUD_RADIUS_S,
+                                        Stroke::new(1.0, Style::BORDER),
+                                        egui::StrokeKind::Inside,
+                                    );
+                                    let compact_large_text = text_zoom > 1.0;
+                                    let icon_size = if compact_large_text {
+                                        18.0
+                                    } else {
+                                        (22.0 * text_zoom.max(1.0)).clamp(22.0, 32.0)
+                                    };
+                                    let (icon_rect, _) = slot_ui.allocate_exact_size(
+                                        Vec2::new(slot_width.min(icon_size), icon_size),
+                                        Sense::hover(),
+                                    );
+                                    paint_health_slot_glyph(
+                                        slot_ui.painter(),
+                                        icon_rect.center(),
+                                        slot,
+                                    );
+                                    let operation = slot
+                                        .operation
+                                        .map_or("not reported", VehicleRadioOperation::label);
+                                    if compact_large_text {
+                                        let font = FontId::proportional(Style::SMALL);
+                                        let summary = format!(
+                                            "{} · {}",
+                                            slot.label,
+                                            slot.state.label()
+                                        );
+                                        let summary = elide(
+                                            slot_ui.painter(),
+                                            &summary,
+                                            font.clone(),
+                                            (tile.width() - Style::SP_S * 2.0).max(1.0),
+                                        );
+                                        let galley = slot_ui.painter().layout_no_wrap(
+                                            summary,
+                                            font,
+                                            Style::TEXT_STRONG,
+                                        );
+                                        slot_ui.painter().galley(
+                                            egui::pos2(
+                                                tile.center().x - galley.size().x / 2.0,
+                                                tile.bottom() - galley.size().y - Style::SP_XS,
+                                            ),
+                                            galley,
+                                            Style::TEXT_STRONG,
+                                        );
+                                    } else {
+                                        slot_ui.add(
+                                            egui::Label::new(
+                                                RichText::new(slot.label)
+                                                    .size(Style::SMALL)
+                                                    .color(Style::TEXT_STRONG),
+                                            )
+                                            .wrap(),
+                                        );
+                                        slot_ui.add(
+                                            egui::Label::new(
+                                                RichText::new(slot.state.label())
+                                                    .size(Style::SMALL)
+                                                    .color(health_slot_tone(slot)),
+                                            )
+                                            .wrap(),
+                                        );
+                                        slot_ui.add(
+                                            egui::Label::new(
+                                                RichText::new(operation)
+                                                    .size(Style::SMALL)
+                                                    .color(health_slot_tone(slot)),
+                                            )
+                                            .wrap(),
+                                        );
+                                    }
+                                },
+                            )
+                            .response;
+                        mde_egui::widgets::hover_text(response, slot.accessibility_label());
+                        if column + 1 < columns && row * columns + column + 1 < rail.slots.len() {
+                            ui.add_space(gap);
+                        }
+                    }
+                });
+                if row + 1 < rows {
                     ui.add_space(gap);
                 }
-            });
+            }
         });
 }
 
@@ -1155,7 +1227,7 @@ fn show_route_preview(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
             Sense::hover()
         },
     );
-    let start_resp = start_resp.on_hover_text(start_readiness.tooltip.clone());
+    let start_resp = mde_egui::widgets::hover_text(start_resp, start_readiness.tooltip.clone());
     if can_start && start_resp.clicked() {
         state.start_navigation();
     }
@@ -4051,6 +4123,8 @@ fn show_admin(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
     ui.add_space(Style::SP_S);
     divider(ui);
     ui.add_space(Style::SP_S);
+    mg90_connection_card(ui, state);
+    ui.add_space(Style::SP_S);
 
     match state.admin_section {
         AdminSection::Vehicle => show_vehicle(
@@ -4074,6 +4148,42 @@ fn show_admin(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
             show_firmware_recovery(ui, &state.firmware, &state.devices)
         }
     }
+}
+
+/// Keep the MG90 admin surface actionable when the gateway adapter is absent.
+/// A blank settings registry is not a useful status: operators need to know
+/// whether the device is offline, unassigned, or merely still loading.
+fn mg90_connection_card(ui: &mut egui::Ui, state: &MapsLocationSurface) {
+    let current = state.vehicle_mirror_status.state.is_current();
+    let (tone, title, detail) = if current {
+        (Style::OK, "Bench MG90 connected", "Live vehicle mirror accepted")
+    } else {
+        (
+            Style::WARN,
+            "Bench MG90 not connected",
+            "No live state/vehicle mirror is available for this workstation",
+        )
+    };
+    mde_egui::widgets::card().show(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            status_dot(ui, tone);
+            ui.label(
+                RichText::new(title)
+                    .size(Style::BODY)
+                    .color(Style::TEXT_STRONG),
+            );
+            pill(ui, if current { "LIVE" } else { "OFFLINE" }, tone);
+        });
+        ui.add_space(Style::SP_XS);
+        mde_egui::widgets::muted_note(ui, detail);
+        if !current {
+            ui.add_space(Style::SP_XS);
+            mde_egui::widgets::muted_note(
+                ui,
+                "Configure the authorized MDE_VEHICLE_GATEWAY and root-only credential file on this seat, then restart mackesd. No MG90 values are fabricated while that adapter is absent.",
+            );
+        }
+    });
 }
 
 fn apply_admin_keyboard_shortcuts(ctx: &egui::Context, selected: &mut AdminSection) {
@@ -4136,12 +4246,19 @@ fn admin_section_button(
     let right_edge = visible_lane
         .right()
         .min(ui.max_rect().right())
-        .min(screen.right());
+        .min(screen.right())
+        // Leave a tiny numerical margin at the clip edge.  egui's tessellated
+        // rect can otherwise round an exactly-edge target one fraction beyond
+        // a very narrow 72 px test/display lane.
+        - 1.0;
     let available = (right_edge - cursor_left)
         .max(1.0)
         .min(ui.available_width().max(1.0));
     let minimum = 96.0_f32.min(available);
-    let width = (galley.size().x + Style::SP_M + Style::SP_S).clamp(minimum, available);
+    let width = (galley.size().x + Style::SP_M + Style::SP_S)
+        .max(minimum)
+        .min(available)
+        .max(1.0);
     let size = egui::vec2(width, Style::SP_XL);
     let (_, rect) = ui.allocate_space(size);
     let response = ui.interact(rect, admin_section_item_id(section), Sense::click());
@@ -5323,6 +5440,20 @@ fn show_mg90_settings(ui: &mut egui::Ui, state: &MapsLocationSurface) {
             );
         },
     );
+    if total == 0 {
+        ui.add_space(Style::SP_S);
+        mde_egui::widgets::WorkspaceStatePanel::new(
+            mde_egui::widgets::WorkspaceState::Offline,
+            "Settings waiting for Bench MG90",
+            "The native descriptor registry appears after a live, authenticated MG90 mirror is accepted.",
+        )
+        .show(ui, |ui| {
+            mde_egui::widgets::muted_note(
+                ui,
+                "Check the connection status above, configure the gateway adapter, and reconnect. This state is intentional and contains no guessed settings.",
+            )
+        });
+    }
     ui.add_space(Style::SP_S);
     for category in Mg90SettingCategory::ALL {
         let settings: Vec<&Mg90SettingDescriptor> = state
@@ -5914,11 +6045,11 @@ fn backups(ui: &mut egui::Ui, backups: &[BackupRecord]) {
 /// fill, a hairline border (or an `accent` border when the card is the active /
 /// highlighted one), generous padding, and the mid corner radius.
 fn mg90_frame(accent: Option<Color32>) -> egui::Frame {
-    egui::Frame::NONE
-        .fill(Style::LAYER_02)
-        .stroke(Stroke::new(1.0, accent.unwrap_or(Style::BORDER)))
-        .inner_margin(Style::SP_M)
-        .corner_radius(mde_egui::widgets::corner(Style::RADIUS_M))
+    let frame = mde_egui::widgets::card().fill(Style::LAYER_02);
+    match accent {
+        Some(accent) => frame.stroke(Stroke::new(1.0, accent)),
+        None => frame,
+    }
 }
 
 /// A full-width hairline rule in [`Style::BORDER`] — the quiet separator under a
@@ -5969,20 +6100,19 @@ fn glyph_card<R>(
 /// left, the `value` right-aligned in `tone` and monospace so numeric columns
 /// (dBm, volts, IPs, ms) line up. The MG90 panels' primary data row.
 fn readout(ui: &mut egui::Ui, label: &str, value: &str, tone: Color32) {
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.label(
             RichText::new(label)
                 .size(Style::SMALL)
                 .color(Style::TEXT_DIM),
         );
-        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-            ui.label(
-                RichText::new(value)
-                    .size(Style::SMALL)
-                    .color(tone)
-                    .monospace(),
-            );
-        });
+        ui.add_space(Style::SP_S);
+        ui.label(
+            RichText::new(value)
+                .size(Style::SMALL)
+                .color(tone)
+                .monospace(),
+        );
     });
     ui.add_space(2.0);
 }
@@ -7006,13 +7136,14 @@ mod tests {
 
     #[test]
     fn maps_header_uses_refined_shared_chrome_height() {
+        let header_h = mde_egui::menubar::BAR_HEIGHT + Style::SP_S;
         assert_eq!(
-            HEADER_H,
+            header_h,
             mde_egui::menubar::BAR_HEIGHT + Style::SP_S,
             "Maps header should inherit the shared refined chrome height"
         );
         assert!(
-            HEADER_H < 40.0,
+            header_h < 40.0,
             "Maps header must not return to a thick fixed strip"
         );
     }
@@ -7751,6 +7882,70 @@ mod tests {
         let mut surface = MapsLocationSurface::simulated();
         surface.active = WorkspaceTab::Drive;
         assert!(tessellate_at(&mut surface, 360.0, 240.0) > 0);
+    }
+
+    #[test]
+    fn drive_hud_large_text_reserves_fab_lane_before_health_rail() {
+        let canvas = Rect::from_min_size(Pos2::ZERO, egui::vec2(1280.0, 820.0));
+        let rail = MapsLocationSurface::live().vehicle_health_rail();
+        let layout = rail.layout_for_text_zoom(1.5);
+        let geometry = drive_hud_overlay_geometry(
+            canvas,
+            144.0,
+            Style::SP_M,
+            0.0,
+            26.0,
+            Style::SP_S + Style::SP_XS,
+            layout,
+        );
+
+        assert_eq!(geometry.rail_layout.columns, 3);
+        assert_eq!(geometry.rail_layout.rows, 2);
+        assert!(geometry.health_rail.height() >= 110.0);
+        assert!(
+            geometry.health_rail.right() < geometry.fab_lane.left(),
+            "health rail must leave a separation gap before the FAB lane: {:?} vs {:?}",
+            geometry.health_rail,
+            geometry.fab_lane
+        );
+        let fab_hit = Rect::from_center_size(
+            egui::pos2(canvas.right() - Style::SP_M - 26.0, canvas.bottom() - 138.0),
+            egui::vec2(52.0, 52.0),
+        );
+        assert!(
+            geometry.fab_lane.contains_rect(fab_hit),
+            "FAB hit target escaped its reserved lane: {fab_hit:?} vs {:?}",
+            geometry.fab_lane
+        );
+    }
+
+    #[test]
+    fn drive_hud_light_largest_tessellates_with_truthful_health_rail() {
+        let ctx = egui::Context::default();
+        Style::install_color_scheme_with_density(
+            &ctx,
+            StyleColorScheme::Light,
+            mde_egui::Density::Mouse,
+        );
+        ctx.set_zoom_factor(1.5);
+        let mut surface = MapsLocationSurface::live();
+        surface.active = WorkspaceTab::Drive;
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    Pos2::ZERO,
+                    egui::vec2(1280.0, 820.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    maps_location_panel(ui, &mut surface);
+                });
+            },
+        );
+        assert!(!out.shapes.is_empty());
+        assert_eq!(surface.vehicle_health_rail().state, VehicleHealthRailState::Unavailable);
     }
 
     #[test]

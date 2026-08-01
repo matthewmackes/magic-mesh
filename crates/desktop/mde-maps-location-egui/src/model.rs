@@ -765,6 +765,48 @@ pub struct VehicleHealthRail {
     pub slots: [VehicleHealthRailSlot; 6],
 }
 
+/// Presentation budget for the fixed radio/GNSS rail.
+///
+/// The rail is a glance surface, so large text changes its grid instead of
+/// allowing six narrow tiles to wrap into one another.  This is deliberately
+/// a model-side contract: the view can reserve space from these dimensions
+/// without changing the observed current/stale/unavailable state.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VehicleHealthRailLayout {
+    /// Number of tiles placed across the rail.
+    pub columns: usize,
+    /// Number of tile rows required for the fixed inventory.
+    pub rows: usize,
+    /// Minimum rail height in logical points for the selected text scale.
+    pub minimum_height: f32,
+}
+
+impl VehicleHealthRail {
+    /// Select a readable grid for the shell's whole-UI text zoom.
+    ///
+    /// Any enlarged text scale moves to two rows so the fixed six-slot inventory
+    /// remains inside the finite Drive HUD viewport. Non-finite or below-baseline
+    /// values fail safe to the compact baseline layout.
+    #[must_use]
+    pub fn layout_for_text_zoom(&self, text_zoom: f32) -> VehicleHealthRailLayout {
+        let zoom = if text_zoom.is_finite() {
+            text_zoom.max(1.0)
+        } else {
+            1.0
+        };
+        let columns = if zoom > 1.0 {
+            3
+        } else {
+            6
+        };
+        VehicleHealthRailLayout {
+            columns,
+            rows: self.slots.len().div_ceil(columns),
+            minimum_height: if columns == 3 { 110.0 } else { 150.0 },
+        }
+    }
+}
+
 impl VehicleHealthRail {
     fn from_projected(health: &VehicleRadioHealth, mirror: VehicleMirrorState) -> Self {
         let state = match mirror {
@@ -1232,17 +1274,88 @@ impl MapsLocationSurface {
     /// route, leaves the preview, and marks guidance as running so the Drive HUD
     /// paints the maneuver banner / ETA sheet / speed sign (not the idle prompt).
     ///
+    /// Determine whether the selected route may become a live navigation
+    /// session. This is the single model-side admission contract used by both
+    /// the view and [`Self::start_navigation`].
+    #[must_use]
+    pub fn navigation_start_readiness(&self) -> NavigationStartReadiness {
+        let mut blockers = Vec::new();
+        let route = self
+            .local_navigation
+            .route_options
+            .get(self.local_navigation.selected_route);
+        match route {
+            None => blockers.push("No route is available to start.".to_string()),
+            Some(route) => {
+                if route.label.trim().is_empty() {
+                    blockers.push("Selected route has no provider label.".to_string());
+                }
+                if route.via.trim().is_empty() {
+                    blockers.push("Selected route has no provider road geometry.".to_string());
+                }
+                if route.eta.trim().is_empty() {
+                    blockers.push("Selected route has no provider ETA.".to_string());
+                }
+                if route.remaining_time_min == 0 {
+                    blockers.push("Selected route has no positive travel duration.".to_string());
+                }
+                if !route.remaining_distance_mi.is_finite() || route.remaining_distance_mi <= 0.0 {
+                    blockers.push("Selected route has no positive finite distance.".to_string());
+                }
+            }
+        }
+
+        let destination = self
+            .local_navigation
+            .destinations
+            .get(self.local_navigation.selected_destination);
+        match destination {
+            None => blockers.push("No destination is selected.".to_string()),
+            Some(destination) if !self.simulator_enabled => match destination.geo() {
+                Some((lat, lon))
+                    if lat.is_finite()
+                        && lon.is_finite()
+                        && (-90.0..=90.0).contains(&lat)
+                        && (-180.0..=180.0).contains(&lon) => {}
+                _ => blockers.push(
+                    "Selected destination has no verified geographic coordinates.".to_string(),
+                ),
+            },
+            Some(_) => {}
+        }
+
+        if !self.simulator_enabled
+            && !self
+                .locations
+                .primary_sample()
+                .is_some_and(LocationSample::has_fix)
+        {
+            blockers.push("Primary location source has no verified GPS fix.".to_string());
+        }
+
+        let offline = self.offline_navigation_status();
+        if !offline.can_claim_turn_by_turn() {
+            if offline.blockers.is_empty() {
+                blockers.push("Offline navigation readiness is blocked.".to_string());
+            } else {
+                blockers.extend(offline.blockers.iter().cloned());
+            }
+        }
+
+        if blockers.is_empty() {
+            NavigationStartReadiness::Ready
+        } else {
+            NavigationStartReadiness::Blocked(blockers)
+        }
+    }
+
     /// Whether the current preview has a real route and may begin guidance.
     ///
-    /// The route options and current destination must still exist, and the
-    /// current offline-navigation readiness must not be blocked. Keeping this
-    /// predicate on the model lets the view disable the action before a click;
-    /// [`Self::start_navigation`] repeats the guard at the mutation boundary.
+    /// The view can disable Start before a click, while the mutation boundary
+    /// repeats the same complete typed admission check.
     #[must_use]
     pub fn can_start_navigation(&self) -> bool {
-        !self.local_navigation.route_options.is_empty()
-            && self.local_navigation.active_destination().is_some()
-            && self.offline_navigation_status().can_claim_turn_by_turn()
+        self.navigation_start_readiness().can_start()
     }
 
     /// Begin turn-by-turn guidance for the selected route.
@@ -1251,17 +1364,10 @@ impl MapsLocationSurface {
     /// a routing engine there is no route, so guidance never starts on a
     /// fabricated empty maneuver banner (PLATFORM-INTERFACES Q33).
     pub fn start_navigation(&mut self) {
-        if !self.can_start_navigation() {
+        if !self.navigation_start_readiness().can_start() {
             return;
         }
         let selected = self.local_navigation.selected_route;
-        // A stale preview selection must not enter guidance with the previous
-        // route summary. `apply_route_option` is intentionally a no-op for an
-        // invalid index, so validate the selection before flipping the
-        // navigation state.
-        if self.local_navigation.route_options.get(selected).is_none() {
-            return;
-        }
         self.local_navigation.apply_route_option(selected);
         self.local_navigation.navigating = true;
         self.route_preview = false;
@@ -1397,10 +1503,16 @@ impl MapsLocationSurface {
     /// True when the motion guard should warn before dangerous changes.
     #[must_use]
     pub fn moving(&self) -> bool {
-        self.locations
+        let primary_location_moving = self
+            .locations
             .primary_sample()
-            .is_some_and(|sample| !sample.stale() && sample.moving())
-            && self.vehicle_mirror_status.state.is_current()
+            .is_some_and(|sample| !sample.stale() && sample.moving());
+        // The simulator is visibly labelled and test/fixture-only, but it must
+        // exercise the same change guard as a moving vehicle. Production live
+        // state cannot enter this branch.
+        let simulated_moving = self.simulator_enabled && self.vehicle.telemetry.moving;
+        primary_location_moving
+            || simulated_moving
             || (self.vehicle_mirror_status.state.is_current()
                 && self.vehicle.telemetry.is_live()
                 && self.vehicle.telemetry.moving)
@@ -1705,6 +1817,15 @@ impl MapsLocationSurface {
         let reader = PersistedMirrorReader { persist, bus_root };
         if let Some(mirror) = read_vehicle_v2_mirror(&reader, node) {
             self.refresh_from_vehicle_v2(&mirror);
+        } else if self.vehicle_mirror_status.sequence.is_some() {
+            // Once a typed v2 snapshot has been accepted, a temporarily empty
+            // v2 topic is a resync gap, not permission to replace the richer
+            // identity/radio contract with a legacy compatibility row. Keep
+            // the accepted projection and make the loss of freshness visible.
+            let status = self
+                .vehicle_mirror_status
+                .resyncing_no_fresh_snapshot(unix_now_ms());
+            self.set_vehicle_mirror_status(status);
         } else if let Some(mirror) = read_vehicle_mirror(&reader, node) {
             self.refresh_from_vehicle(&mirror);
             self.vehicle_radio_health = VehicleRadioHealth::unavailable(
@@ -2496,6 +2617,39 @@ impl OfflineNavigationStatus {
     #[must_use]
     pub fn can_claim_turn_by_turn(&self) -> bool {
         self.readiness != OfflineNavigationReadiness::Blocked
+    }
+}
+
+/// Typed admission result for starting a navigation session.
+///
+/// The view may use this to explain a disabled Start affordance, but the model
+/// remains the authority: [`MapsLocationSurface::start_navigation`] evaluates
+/// the same verdict at the mutation boundary.  A non-empty route list alone is
+/// not proof that a route is usable; the selected option, destination, live
+/// position, and offline capability must all be defensible first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NavigationStartReadiness {
+    /// The selected route can be admitted into a navigation session.
+    Ready,
+    /// The session is refused; each string is a deterministic operator-facing
+    /// blocker and no navigation state may be mutated.
+    Blocked(Vec<String>),
+}
+
+impl NavigationStartReadiness {
+    /// Whether the session may be started.
+    #[must_use]
+    pub fn can_start(&self) -> bool {
+        matches!(self, Self::Ready)
+    }
+
+    /// The complete stable blocker list, empty when ready.
+    #[must_use]
+    pub fn blockers(&self) -> &[String] {
+        match self {
+            Self::Ready => &[],
+            Self::Blocked(blockers) => blockers,
+        }
     }
 }
 
@@ -5776,6 +5930,61 @@ mod tests {
     }
 
     #[test]
+    fn missing_v2_row_resyncs_instead_of_falling_back_to_legacy() {
+        use mackes_mesh_types::vehicle::{VehicleState, VehicleTelem};
+
+        let dir = tempfile::tempdir().expect("bus dir");
+        let persist = mde_bus::persist::Persist::open(dir.path().to_path_buf()).expect("bus");
+        let now = test_now_ms();
+        let typed = typed_vehicle_snapshot(now);
+        let mut state = MapsLocationSurface::live();
+        state.refresh_from_vehicle_v2(&typed);
+        assert_eq!(state.vehicle_mirror_status.sequence, Some(7));
+        assert!(!state.vehicle_radio_health.radios.is_empty());
+
+        // A rolling upgrade can leave the v1 compatibility row present while
+        // the identity-addressed v2 row is briefly absent. That is a resync
+        // gap, not a reason to erase the accepted v2 radio contract.
+        let mut legacy = VehicleState::offline("rig-1");
+        legacy.online = true;
+        legacy.model = "MG90".to_string();
+        legacy.telem = VehicleTelem {
+            speed_mph: 99.0,
+            moving: true,
+            obd_present: true,
+            ..VehicleTelem::default()
+        };
+        legacy.published_at_ms = now;
+        let topic = mackes_mesh_types::vehicle::vehicle_state_topic("rig-1");
+        persist
+            .write(
+                &topic,
+                mde_bus::hooks::config::Priority::Default,
+                None,
+                Some(&serde_json::to_string(&legacy).expect("legacy mirror json")),
+            )
+            .expect("legacy compatibility mirror");
+
+        state.refresh_from_persist(&persist, dir.path(), "rig-1");
+
+        assert_eq!(
+            state.vehicle_mirror_status.state,
+            VehicleMirrorState::ResyncingNoFreshSnapshot
+        );
+        assert_eq!(
+            state.vehicle_mirror_status.sequence,
+            Some(7),
+            "resync keeps typed identity/provenance"
+        );
+        assert!(!state.vehicle_radio_health.radios.is_empty());
+        assert_eq!(
+            state.vehicle.telemetry.speed_mph, typed.telem.speed_mph,
+            "legacy compatibility data must not overwrite the retained v2 projection"
+        );
+        assert!(!state.vehicle.telemetry.is_live());
+    }
+
+    #[test]
     fn live_persist_rejects_cross_node_vehicle_mirror() {
         use mackes_mesh_types::vehicle::VehicleState;
 
@@ -6809,6 +7018,29 @@ mod tests {
     }
 
     #[test]
+    fn health_rail_large_text_uses_readable_fixed_grid() {
+        let rail = MapsLocationSurface::live().vehicle_health_rail();
+
+        let baseline = rail.layout_for_text_zoom(1.0);
+        assert_eq!(baseline.columns, 6);
+        assert_eq!(baseline.rows, 1);
+        assert_eq!(baseline.minimum_height, 150.0);
+
+        let large = rail.layout_for_text_zoom(1.15);
+        assert_eq!(large.columns, 3);
+        assert_eq!(large.rows, 2);
+        assert_eq!(large.minimum_height, 110.0);
+
+        let largest = rail.layout_for_text_zoom(1.5);
+        assert_eq!(largest.columns, 3);
+        assert_eq!(largest.rows, 2);
+        assert_eq!(largest.minimum_height, 110.0);
+
+        let malformed_zoom = rail.layout_for_text_zoom(f32::NAN);
+        assert_eq!(malformed_zoom, baseline);
+    }
+
+    #[test]
     fn health_rail_healthy_domains_are_current_in_contract_order() {
         let now = test_now_ms();
         let mut surface = MapsLocationSurface::live();
@@ -7026,6 +7258,85 @@ mod tests {
             route_before.current_road
         );
         assert_eq!(s.local_navigation.active_route.eta, route_before.eta);
+    }
+
+    #[test]
+    fn start_navigation_is_a_no_op_for_a_stale_destination_selection() {
+        let mut s = MapsLocationSurface::simulated();
+        s.route_preview = true;
+        s.local_navigation.selected_destination = usize::MAX;
+
+        assert!(
+            s.local_navigation.active_destination().is_some(),
+            "display fallback remains crash-safe"
+        );
+        assert!(
+            !s.can_start_navigation(),
+            "session start must require the selected destination itself"
+        );
+
+        s.start_navigation();
+
+        assert!(!s.local_navigation.navigating);
+        assert!(s.route_preview, "stale destination keeps the preview open");
+    }
+
+    #[test]
+    fn navigation_start_readiness_rejects_malformed_provider_route_deterministically() {
+        let mut s = MapsLocationSurface::simulated();
+        s.route_preview = true;
+        assert_eq!(
+            s.navigation_start_readiness(),
+            NavigationStartReadiness::Ready
+        );
+
+        s.local_navigation.route_options[0].via.clear();
+        s.local_navigation.route_options[0].remaining_distance_mi = f32::NAN;
+        let readiness = s.navigation_start_readiness();
+        assert!(!readiness.can_start());
+        assert_eq!(
+            readiness.blockers(),
+            &[
+                "Selected route has no provider road geometry.".to_string(),
+                "Selected route has no positive finite distance.".to_string(),
+            ]
+        );
+        s.start_navigation();
+        assert!(!s.local_navigation.navigating);
+        assert!(s.route_preview, "blocked admission keeps preview open");
+    }
+
+    #[test]
+    fn live_navigation_readiness_requires_route_and_verified_live_inputs() {
+        let mut s = MapsLocationSurface::live();
+        s.local_navigation.route_options = vec![RouteOption {
+            label: "provider route".to_string(),
+            via: "real road".to_string(),
+            eta: "12:00".to_string(),
+            remaining_time_min: 10,
+            remaining_distance_mi: 2.0,
+            traffic: RouteTraffic::Clear,
+        }];
+        s.local_navigation.destinations.push(Destination {
+            label: "unverified".to_string(),
+            category: "search".to_string(),
+            distance_mi: 2.0,
+            address: "unknown".to_string(),
+            lat: None,
+            lon: None,
+        });
+        s.local_navigation.selected_destination = 0;
+
+        let readiness = s.navigation_start_readiness();
+        assert!(!readiness.can_start());
+        assert!(readiness
+            .blockers()
+            .iter()
+            .any(|reason| reason.contains("verified geographic coordinates")));
+        assert!(readiness
+            .blockers()
+            .iter()
+            .any(|reason| reason.contains("verified GPS fix")));
     }
 
     #[test]
