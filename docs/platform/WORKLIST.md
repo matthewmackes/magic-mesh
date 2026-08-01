@@ -678,16 +678,11 @@ remains here under a completed status.
   Construct, Car, and direct DRM remain governed.
 - Current state: `mackesd` still assumes one managed MG90/direct Ethernet; the live unit reports LTE/WAN and power but no GNSS fix, and OBD parsing is absent.
   Raster MBTiles/FTS5 serves one region; Maps owns basemap/search, while Valhalla, route/lane/speed helpers, bearing, and admin actions remain unwired.
-  Typed v2 identity/radio/freshness/provenance dual-publishes beside v1, with 11 mesh-type and 69 worker tests passing. Maps/Car projects bounded radio
-  presence, operation, freshness, age, provenance, and mirror states; 13 consumer
-  tests pass. Car status tiles expose compact shared tones and explicit stale/unavailable accessibility labels. The bounded MG90/manager roster has
-  independent poll/heartbeat plans, latest-wins/no-source behavior, deterministic
-  all-source selection, and 44 vehicle tests pass. Maps HUD/Airspace expose honest unavailable/stale states with 17 focused tests; route preview Start
-  distinguishes missing route, blocked offline readiness, and missing GPS with
-  7 focused route-preview tests at `05ba6870`. Live adapters and route/render
-  cutover remain. Navigation start now has typed readiness gating that rejects
-  malformed or stale selections without mutating navigation state; fresh farm
-  full-crate Maps suite passes 264 tests with no failures.
+  Typed v2 identity/radio/freshness/provenance dual-publishes beside v1; Maps/Car project bounded radio and mirror states, with 13 consumer tests passing.
+  The MG90/manager roster has independent poll/heartbeat plans, latest-wins/no-source behavior, and 44 vehicle tests pass. Cached observations heartbeat every
+  two seconds without resetting v2 age. Maps HUD/Airspace expose honest unavailable/stale states; route preview has 7 focused tests at `05ba6870`.
+  Navigation start rejects malformed or stale selections without mutation; the fresh farm full-crate Maps suite passes 264 tests with no failures. Live adapters
+  and route/render cutover remain.
 - Remaining work:
   1. Consume WL-UX-009's platform-wide Carbon-requirement retirement and update
      the Maps/Car-specific authority while retaining egui, shared `Style`,
@@ -1164,14 +1159,13 @@ remains here under a completed status.
   panels, menubars, dense lists, and most Construct-owned route migrations are
   landed; farm suites cover shell, Editor, Teams, Maps, Files, Bookmarks, Music,
   Device, Storage, and This Node. The 2026-07-31 MenuBar/Sidebar fixes and
-  direct-DRM capture attempts are recorded in
+  2026-08-01 clean direct-DRM captures are recorded in
   [`WL-UX-009-DRM-EVIDENCE-2026-07-31.md`](WL-UX-009-DRM-EVIDENCE-2026-07-31.md).
-  `.138` is active with `NRestarts=0`; the exact current artifact's Dark desktop,
-  Dark narrow, and Light/Largest KMS captures were rejected as corrupted
-  scanout-line artifacts, so no visual pass is claimed. Dell
-  (`172.20.146.225`) is now reachable and has the same artifact deployed with
-  `NRestarts=0`, but its A/B KMS captures are also corrupted and are not counted
-  as visual proof. `.15` remains open, as do the full matrix and readiness.
+  `.138` and Dell (`172.20.146.225`) have the same artifact deployed with
+  `NRestarts=0`; `.138` now has clean Dark desktop, Dark narrow, and
+  Light/Largest Editor captures, and Dell has a clean Dark desktop capture.
+  `.15` remains open, as do the remaining routes/states, full matrix, and
+  production readiness.
 - Remaining work:
 
   1. Finish the shared app-frame and Terminal-pattern unified top bar, including

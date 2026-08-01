@@ -1,4 +1,4 @@
-# WL-UX-009 direct-DRM evidence — 2026-07-31
+# WL-UX-009 direct-DRM evidence — 2026-08-01
 
 This is representative production-validation evidence for the shared Quazar
 workspace frame. It does not close WL-UX-009 or claim production readiness.
@@ -16,24 +16,26 @@ workspace frame. It does not close WL-UX-009 or claim production readiness.
 
 ## Captures
 
-The previous `2f427f…` artifact had representative captures reviewed during
-the earlier pass, but those files are not retained as current proof. A fresh
-capture attempts for the exact `bea573f9…` artifact produced scanout-corrupted
-line artifacts on both `.138` and Dell. An A/B run with the earlier 12.1.6
-artifact reproduced the same corruption on Dell, so the failure is independent
-of the deployed shell binary. Those PNGs are explicitly rejected and do not
-count as visual evidence.
+The capture harness used the proof-only `MDE_DRM_LINEAR_SCANOUT=1` environment
+on the direct DRM seat. The first attempts were rejected because the seats
+were still on the secure boot curtain or first-boot pin selector. After those
+states were configured explicitly for the proof run, clean frames were
+captured and visually inspected. The proof-only overrides and temporary
+appearance/power settings were removed afterward; both seats returned to
+normal secure runtime settings.
 
-| Profile | Route | Result |
-| --- | --- | --- |
-| Dark desktop | Mesh Teams → Files → Editor | Rejected: corrupted KMS scanout lines |
-| Dark narrow | Mesh Teams → Files → Editor | Rejected: corrupted KMS scanout lines |
-| Light / Largest | Mesh Teams → Files → Editor | Rejected: corrupted KMS scanout lines |
+| Seat / profile | Route | Logical proof geometry | PNG SHA-256 |
+| --- | --- | --- | --- |
+| `.138` Dark desktop | Mesh Teams → Files → Editor | `1536x864` at `1.25` ppp | `b81178e67eed91a4b488e0efd858c73a9ca11b99657b6775800dc40857a0ad38` |
+| `.138` Dark narrow | Mesh Teams → Files → Editor | `800x576` at `1.875` ppp; right-side unused scanout is intentional | `2975ee02529543deb2f237021bf377c420d22d1908b8af7305485a2d99401c75` |
+| `.138` Light / Largest | Mesh Teams → Files → Editor | `1024x576` at `1.875` ppp | `32b9267765783a4019664ad87f3cee43fa81a5b48c0ef0233d93410620d5e2e0` |
+| Dell Dark desktop | Mesh Teams → Files → Editor | native desktop capture, `1920x1080` | `10afd8cc2ee620817a3b43c4a902cb91223fecc52f7688dc256e3d62b4e0810d` |
 
-The earlier focused proof caught the shared MenuBar body-collapse defect and
-the large-text Sidebar overflow defect; the farm tests below prove those
-layout contracts. The live recapture must be repeated with a clean KMS frame
-before any visual claim or readiness decision is made.
+The captures show the shared MenuBar, Editor workspace body, toolbars, side
+rails, taskbar, Dark/Light palettes, and large-text containment without the
+previous body collapse or scanout corruption. The narrow capture intentionally
+uses an 800-point logical viewport on the 1920-pixel panel; the unused right
+side is outside the proof viewport, not an overlap.
 
 ## Automated evidence
 
@@ -43,8 +45,9 @@ before any visual claim or readiness decision is made.
   1280px and 800px layouts.
 - `mde-egui` focused navigation suite — 8 passed, including AppFrame large-text
   composition and Sidebar keyboard selection.
-- Worklist acceptance remains open for the full workspace matrix, Dell, all
-  remaining route captures, and final production evidence.
+- Worklist acceptance remains open for the full workspace matrix, remaining
+  Construct-owned routes/states, and final production evidence. This is clean
+  representative proof, not a claim that every route is production-ready.
 
 ## Boundary authority
 
