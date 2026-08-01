@@ -51,6 +51,15 @@ type. It checks that tab and reload actions clear or defer to the guest route
 instead of creating an unguarded host helper session. This is a source-seam
 guard, not live VDI proof.
 
+`browser-vm-transport-attach.schema.json` defines the minimal attach envelope
+that the existing `state/vdi/console` shell mirror can consume without a
+Browser helper crate. The envelope is an RDP brokered endpoint bound to the
+Browser VM workload, Browser surface, session generation, and mesh-safe
+`host:port`; it carries no ticket, credential, command, path, or URL. The
+example and `verify-transport-attach.sh` keep the wire shape fail-closed. The
+Sunshine/Moonlight route remains a separate live transport concern; RDP is the
+minimal shell-consumable decoder contract here.
+
 The source URL and path are deliberately recorded now so a later standalone
 Browser-stack extraction can bind the guest profile to an immutable source
 record rather than silently reusing a host image.

@@ -2129,13 +2129,11 @@ pub(crate) fn spawn_broker_terminal_workers(
     });
 }
 
-// run_serve round-3: the browser-worker spawn group (bookmarks + adfilter +
-// browser_policy + the BROWSER-DD-* CEF workers, now that arch-7 moved those
-// workers into mde-browser-workers, re-exported via workers/mod.rs). Extracted
+// run_serve round-3: the bookmark/adfilter spawn group. Extracted
 // VERBATIM — identical spawn order + `worker_names.push(...)` registrations +
 // role gates, so the WORKER_REGISTRY census + the ARCH-5 drift guard
 // (`worker_spawns_and_the_census_do_not_drift`) stay byte-identical.
-pub(crate) fn spawn_browser_workers(
+pub(crate) fn spawn_bookmark_workers(
     sup: &mut mackesd_core::workers::Supervisor,
     worker_names: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     role_rank: u8,
@@ -2188,163 +2186,6 @@ pub(crate) fn spawn_browser_workers(
         )
     });
 
-    // BOOKMARKS-8 — the mesh-wide browser/ad-blocker POLICY worker (fleet
-    // governance ENFORCED mesh-side, not just in the UI). Every node writes its
-    // own operator-authored policy doc into the encrypted Syncthing share
-    // (`workgroup_root`, the same substrate the adfilter/bookmarks workers use)
-    // and converges on the newest-authored doc mesh-wide; it folds that doc for
-    // THIS node's deployment role and enforces at the browser launch/spawn seam
-    // — draining action/browser/{launch,navigate,set-adblock} to refuse a
-    // launch on a disallowed role, inject the forced ad-blocker + URL allowlist
-    // + custom lists on a granted launch, and reject out-of-policy navigate /
-    // adblock-off actions. Draining action/browser-policy/set authors the fleet
-    // policy. Disable stops the browser-data sync + hides the surface but
-    // retains the node-local data (no destructive wipe). Publishes
-    // state/browser-policy/<node> for the Workbench fleet view. Offline-first:
-    // the node-local doc + data survive a down share, and nothing is written
-    // into a bare unprovisioned mount (`shared_root_writable`). A desktop-
-    // governance feature (Workstation tier); idles gracefully on a headless box.
-    spawn_tiered(sup, worker_names, role_rank, "browser_policy", || {
-        let local_root = mackesd_core::workers::browser_policy::resolve_local_root();
-        let role = mackesd_core::worker_role::role_name(role_rank).to_string();
-        mackesd_core::workers::browser_policy::BrowserPolicyWorker::new(
-            node_id.clone(),
-            role,
-            local_root,
-            workgroup_root.clone(),
-        )
-    });
-
-    // BROWSER-DD-6 — Browser passkey/WebAuthn ceremony owner. Browser
-    // publishes strict ceremony metadata to `action/browser/passkey`; this
-    // worker validates RP/origin/challenge shape, persists pending
-    // challenges locally, mirrors them into the Syncthing-backed workgroup
-    // root, and publishes honest pending/error state without minting fake
-    // credentials. A Workstation-tier browser security feature; it idles on
-    // headless boxes with no Browser publishes.
-    spawn_tiered(sup, worker_names, role_rank, "browser_passkeys", || {
-        let local_root = mackesd_core::workers::browser_passkeys::resolve_local_root();
-        mackesd_core::workers::browser_passkeys::BrowserPasskeysWorker::new(
-            node_id.clone(),
-            local_root,
-            workgroup_root.clone(),
-        )
-    });
-
-    // BROWSER-DD-7 — the browser session-sync owner. The shell publishes
-    // deduped `action/browser/session-sync` snapshots for tabs/settings/
-    // downloads/speed-dial; this worker validates those restore-compatible
-    // JSON bodies, persists the latest local copy, and mirrors it into the
-    // Syncthing-backed workgroup root at
-    // browser-session-sync/<host>/latest.json. The file body stays the exact
-    // Browser snapshot shape so startup restore consumes it directly. A
-    // Workstation-tier browser feature; it idles on headless boxes with no
-    // Browser publishes and never writes into a missing canonical share.
-    spawn_tiered(sup, worker_names, role_rank, "browser_session_sync", || {
-        let local_root = mackesd_core::workers::browser_session_sync::resolve_local_root();
-        mackesd_core::workers::browser_session_sync::BrowserSessionSyncWorker::new(
-            node_id.clone(),
-            local_root,
-            workgroup_root.clone(),
-        )
-    });
-
-    // BROWSER-DD-11 — Browser read-aloud/TTS owner. The shell publishes
-    // bounded `action/browser/read-aloud` page-text requests; this worker
-    // validates them, invokes the configured offline TTS command when present
-    // (`MDE_BROWSER_TTS_COMMAND` / `MDE_TTS_COMMAND`), and publishes honest
-    // spoken/unavailable/error state. A Workstation-tier browser feature; it
-    // idles on headless boxes with no Browser publishes.
-    spawn_tiered(sup, worker_names, role_rank, "browser_read_aloud", || {
-        mackesd_core::workers::browser_read_aloud::BrowserReadAloudWorker::new(node_id.clone())
-    });
-
-    // BROWSER-DD-11 — Browser voice-command/dictation STT owner. The shell
-    // publishes active-tab context to `action/browser/voice-command`; this
-    // worker validates it, invokes the configured offline STT/capture command
-    // when present (`MDE_BROWSER_STT_COMMAND` / `MDE_STT_COMMAND`), emits a
-    // bounded transcript event, and publishes honest unavailable/error state.
-    spawn_tiered(
-        sup,
-        worker_names,
-        role_rank,
-        "browser_voice_command",
-        || {
-            mackesd_core::workers::browser_voice_command::BrowserVoiceCommandWorker::new(
-                node_id.clone(),
-            )
-        },
-    );
-
-    // BROWSER-DD-12 — Browser external-protocol owner. The shell refuses to
-    // navigate `mailto:`/`magnet:` URLs and publishes
-    // `action/browser/protocol`; this worker validates those handoffs and
-    // emits retained route status/events for Email/Transfers owners.
-    spawn_tiered(sup, worker_names, role_rank, "browser_protocol", || {
-        mackesd_core::workers::browser_protocol::BrowserProtocolWorker::new(node_id.clone())
-    });
-
-    // BROWSER-DD-12 — Browser platform-share owner. The shell publishes
-    // `action/browser/share` for Peer/Email/QR platform targets; this worker
-    // validates those handoffs and emits retained route status/events
-    // without faking downstream delivery.
-    spawn_tiered(sup, worker_names, role_rank, "browser_share", || {
-        mackesd_core::workers::browser_share::BrowserShareWorker::new(node_id.clone())
-    });
-
-    // BROWSER-DD-12 — Browser private offline/mesh translation owner. The
-    // shell publishes bounded page text to `action/browser/translate`; this
-    // worker validates the private-only request, invokes the configured
-    // local/mesh translation command when present
-    // (`MDE_BROWSER_TRANSLATE_COMMAND` / `MDE_TRANSLATE_COMMAND`), emits a
-    // bounded result event, and publishes honest unavailable/error state.
-    spawn_tiered(sup, worker_names, role_rank, "browser_translate", || {
-        mackesd_core::workers::browser_translate::BrowserTranslateWorker::new(node_id.clone())
-    });
-
-    // BROWSER-DD-12 — Browser offline/mesh cache owner. The shell publishes
-    // explicit private page snapshots to `action/browser/offline-cache`; this
-    // worker validates them, writes a local durable cache record, and mirrors
-    // it into the Syncthing-backed workgroup root. The browser helper remains
-    // no-store; the cache is daemon-owned and private to the mesh.
-    spawn_tiered(
-        sup,
-        worker_names,
-        role_rank,
-        "browser_offline_cache",
-        || {
-            let local_root = mackesd_core::workers::browser_offline_cache::resolve_local_root();
-            mackesd_core::workers::browser_offline_cache::BrowserOfflineCacheWorker::new(
-                node_id.clone(),
-                local_root,
-                workgroup_root.clone(),
-            )
-        },
-    );
-
-    // BROWSER-DD-12 — Browser CEF security-update status owner. It watches
-    // the packaged fast-update manifest plus the active CEF runtime and
-    // publishes an honest current/missing/mismatch posture for the
-    // independent browser-engine update path.
-    spawn_tiered(
-        sup,
-        worker_names,
-        role_rank,
-        "browser_security_update",
-        || {
-            mackesd_core::workers::browser_security_update::BrowserSecurityUpdateWorker::new(
-                node_id.clone(),
-            )
-        },
-    );
-
-    // BROWSER-DD-12 — Browser idle-tab suspend owner. The shell already
-    // stops inactive helpers and publishes `action/browser/tab-suspend`;
-    // this worker validates those handoffs and publishes retained
-    // suspend status/events for diagnostics and future orchestration.
-    spawn_tiered(sup, worker_names, role_rank, "browser_tab_suspend", || {
-        mackesd_core::workers::browser_tab_suspend::BrowserTabSuspendWorker::new(node_id.clone())
-    });
 }
 
 // run_serve extract: desktop/media discovery + seat input workers (seat_remote_input, desktop_sources, media_sources).
@@ -2542,19 +2383,25 @@ pub(crate) fn spawn_fleet_compute_workers(
 
     // MEDIA-7 — register the navidrome/media service into the mesh service
     // registry. Capability-gated via runs_in("navidrome", deploy_class): it
-    // runs ONLY on a Lighthouse_Media node (MEDIA-1's Capability::Media) and
-    // is absent everywhere else. Publishes its registration (with a
+    // remains capability-gated to the legacy local Navidrome producer and is
+    // absent everywhere else. The Workstation music consumer is independent
+    // of this producer and consumes credential-free versioned Media records.
+    // Publishes its registration (with a
     // per-instance health field) to the per-peer Bus topic
     // mesh/services/media/<peer> + the replicated QNM-Shared plane
     // <host>/media-registry.json — the same registry plane the other
     // published services use. The .with_mount honors --workgroup-root so the
     // worker writes where the registry readers look.
-    if mackesd_core::worker_role::runs_in("navidrome", deploy_class) {
+    let operator_media_records = mackesd_core::mesh_media::operator_media_server_records();
+    if mackesd_core::worker_role::runs_in("navidrome", deploy_class)
+        || !operator_media_records.is_empty()
+    {
         sup.spawn(Spawn::new(
             mackesd_core::workers::media_registry::MediaRegistryWorker::new(
                 node_id.clone(),
                 fw_host.clone(),
             )
+            .with_server_records(operator_media_records)
             .with_mount(workgroup_root.clone()),
             RestartPolicy::Always,
         ));
@@ -3529,15 +3376,14 @@ pub(crate) fn spawn_messaging_sync_workers(
     });
 
     // MEDIA-8 — Workstation music auto-config (desktop-tier, like
-    // remmina-sync). Every 60 s it reads the published shared account off
-    // the replicated registry plane (<workgroup-root>/<host>/media-
-    // registry.json, written by a Lighthouse_Media node's media_registry
-    // worker) and idempotently writes the uid-1000 desktop user's
-    // airsonic-creds.json, so a fresh node's mde-music auto-browses the mesh
-    // library with no manual connect. NO mesh age key on Workstations — the
-    // shared account flows through the SERVICE REGISTRY, not the secret
-    // store. The .with_workgroup_root honors --workgroup-root so it reads
-    // where the registry writers write. Never clobbers a user-set creds file.
+    // remmina-sync). Every 60 s it reads replicated Airsonic server records,
+    // resolves each selected record's secret-store credential reference, and
+    // idempotently writes the uid-1000 desktop user's local
+    // airsonic-creds.json. Server records never publish plaintext credentials;
+    // the local materialization is the only client-facing copy. The
+    // .with_workgroup_root honors --workgroup-root so it reads the replicated
+    // plane where gateway registrations are published. Never clobbers a
+    // user-set creds file.
     spawn_tiered(sup, worker_names, role_rank, "music_autoconfig", || {
         mackesd_core::workers::music_autoconfig::MusicAutoconfigWorker::new()
             .with_workgroup_root(workgroup_root.clone())

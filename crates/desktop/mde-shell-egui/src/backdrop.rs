@@ -32,7 +32,7 @@
 
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -44,28 +44,16 @@ use serde::{Deserialize, Serialize};
 
 use mackes_mesh_types::peers::default_workgroup_root;
 
-use crate::chooser::decode_png_rgba;
 use crate::surfaces::Surface;
 
-/// The installed wallpaper directory — QBRAND drops the Construct wallpapers
-/// here in the RPM. The selected one is loaded from disk at runtime.
-const WALLPAPER_DIR: &str = "/usr/share/backgrounds/magic-mesh";
+/// Runtime wallpaper comes only from the Bing daily-picture cache. There is no
+/// embedded desktop-wallpaper fallback: an unavailable Bing cache intentionally
+/// renders as the plain Carbon field.
 
-/// The default wallpaper, embedded so a fresh / dev shell (or a host missing the
-/// installed set) always has a backdrop with no filesystem / RPM-path dependency.
-/// Only `WALLPAPER4` is carried — embedding all five would add ~6 MB to the binary,
-/// so the rest load from [`WALLPAPER_DIR`] (disk-honest, §4).
-const DEFAULT_WALLPAPER: &[u8] =
-    include_bytes!("../../../../assets/brand/CONSTRUCT-WALLPAPER4.png");
-
-/// The share subdirectory the per-seat wallpaper prefs record lives under
-/// (`<root>/wallpaper-prefs/<identity>/<seat>.json`) — the same layout
-/// `chooser/chooser_prefs.rs` uses for the Chooser prefs.
+/// The share subdirectory for the per-seat Home-wallpaper enable preference.
 const PREFS_SUBDIR: &str = "wallpaper-prefs";
 
-/// How often [`wallpaper_texture`] re-reads the persisted selection off disk. A
-/// human-paced throttle so a wallpaper roamed from another seat surfaces within a
-/// few seconds without a per-frame disk scan.
+/// How often [`wallpaper_texture`] re-reads the Bing cache off disk.
 const PREF_REFRESH: Duration = Duration::from_secs(3);
 
 /// The dim Carbon scrim faded in as a surface/window covers the desktop, so
@@ -111,9 +99,8 @@ const ROLE_PATH: &str = "/var/lib/mde/role.toml";
 /// crossfade across every empty↔covered transition.
 const CROSSFADE_KEY: &str = "shell-desktop-backdrop-coverage";
 
-/// The egui-memory key the resolved wallpaper (choice + decoded texture) is cached
-/// under, so the selection read + decode/upload happen off the throttle, never per
-/// frame.
+/// The egui-memory key the resolved Bing texture and Home enable state are cached
+/// under, so disk reads and decode/upload happen off the throttle.
 const WALLPAPER_CACHE_KEY: &str = "shell-desktop-wallpaper";
 
 /// Whether the display the backdrop paints on is empty (the wallpaper at full
@@ -136,81 +123,6 @@ enum StatusAnchor {
     /// viewport can be substantially shorter in logical points, which makes a
     /// geometrically centered status block collide with the wallpaper mark.
     LowerCenter,
-}
-
-/// One of the five generated Construct wallpapers (placement lock #12). `Four` is the
-/// default; all five ship in the RPM as a selectable set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Wallpaper {
-    /// `CONSTRUCT-WALLPAPER1.png`.
-    One,
-    /// `CONSTRUCT-WALLPAPER2.png`.
-    Two,
-    /// `CONSTRUCT-WALLPAPER3.png`.
-    Three,
-    /// `CONSTRUCT-WALLPAPER4.png` — the default desktop wallpaper (lock #12).
-    Four,
-    /// `CONSTRUCT-WALLPAPER5.png`.
-    Five,
-}
-
-impl Wallpaper {
-    /// The full selectable set, in order — the picker's option list.
-    pub(crate) const ALL: [Self; 5] = [Self::One, Self::Two, Self::Three, Self::Four, Self::Five];
-
-    /// The default desktop wallpaper (placement lock #12).
-    pub(crate) const DEFAULT: Self = Self::Four;
-
-    /// This wallpaper's 1-based index (1–5) — the persisted register + asset suffix.
-    const fn index(self) -> u8 {
-        match self {
-            Self::One => 1,
-            Self::Two => 2,
-            Self::Three => 3,
-            Self::Four => 4,
-            Self::Five => 5,
-        }
-    }
-
-    /// The wallpaper a 1-based index names, or `None` for an out-of-range value (a
-    /// corrupt/legacy record degrades to the default, never a panic).
-    const fn from_index(index: u8) -> Option<Self> {
-        match index {
-            1 => Some(Self::One),
-            2 => Some(Self::Two),
-            3 => Some(Self::Three),
-            4 => Some(Self::Four),
-            5 => Some(Self::Five),
-            _ => None,
-        }
-    }
-
-    /// The picker caption.
-    pub(crate) const fn label(self) -> &'static str {
-        match self {
-            Self::One => "Wallpaper 1",
-            Self::Two => "Wallpaper 2",
-            Self::Three => "Wallpaper 3",
-            Self::Four => "Wallpaper 4 (default)",
-            Self::Five => "Wallpaper 5",
-        }
-    }
-
-    /// The asset filename under [`WALLPAPER_DIR`].
-    const fn filename(self) -> &'static str {
-        match self {
-            Self::One => "CONSTRUCT-WALLPAPER1.png",
-            Self::Two => "CONSTRUCT-WALLPAPER2.png",
-            Self::Three => "CONSTRUCT-WALLPAPER3.png",
-            Self::Four => "CONSTRUCT-WALLPAPER4.png",
-            Self::Five => "CONSTRUCT-WALLPAPER5.png",
-        }
-    }
-
-    /// The installed absolute path this wallpaper loads from at runtime.
-    fn installed_path(self) -> PathBuf {
-        Path::new(WALLPAPER_DIR).join(self.filename())
-    }
 }
 
 /// Paint the shell-colour backdrop as the bottom-most layer of the current panel:
@@ -505,25 +417,21 @@ pub(crate) fn take_nav_request(ctx: &egui::Context) -> Option<Surface> {
 
 // ─────────────────────────── the resolved-texture cache ───────────────────────────
 
-/// The resolved wallpaper cached in egui memory: the selected [`Wallpaper`], its
-/// decoded texture (`None` when even the embedded default failed to decode — the bare
-/// Carbon field then stands), and when the selection was last read off disk.
+/// The resolved Bing wallpaper cached in egui memory: its decoded texture (`None`
+/// while the cache is absent or invalid) and the last refresh time.
 #[derive(Clone)]
 struct WallpaperCache {
-    /// The selection this texture was decoded for.
-    choice: Wallpaper,
     /// Whether the operator enabled the wallpaper backdrop.
     enabled: bool,
     /// The decoded, uploaded texture, or `None` on a total decode failure (§7).
     texture: Option<TextureHandle>,
-    /// When the selection was last re-read off disk — the [`PREF_REFRESH`] clock.
+    /// When the Bing cache was last re-read off disk — the [`PREF_REFRESH`] clock.
     checked_at: Instant,
 }
 
-/// The decoded wallpaper texture for the current selection, cached in egui memory so
-/// the selection read + decode/upload happen off the [`PREF_REFRESH`] throttle, never
-/// per frame. `None` (never a panic) when even the embedded default can't decode, so
-/// the caller fails soft to the bare Carbon field (§7).
+/// The decoded Bing wallpaper texture cached in egui memory. `None` (never a panic)
+/// while the cache is absent or invalid, so the caller fails soft to the bare Carbon
+/// field (§7).
 fn wallpaper_texture(ctx: &egui::Context) -> Option<TextureHandle> {
     let id = egui::Id::new(WALLPAPER_CACHE_KEY);
     let cached = ctx.data_mut(|d| d.get_temp::<WallpaperCache>(id));
@@ -538,26 +446,24 @@ fn wallpaper_texture(ctx: &egui::Context) -> Option<TextureHandle> {
         }
     }
 
-    // The throttle elapsed (or the first paint): re-read the selection. Reuse the
-    // uploaded texture when the choice is unchanged; re-decode only on a real change.
+    // The throttle elapsed (or the first paint): re-read the enable state and Bing
+    // cache. Reuse the uploaded texture while the cache window is active.
     // The decode/upload happens OUTSIDE the egui data lock — `load_texture`
     // read-locks the context that `data_mut` write-locks (the known `parking_lot`
     // trap; cf. `chooser::ThumbnailCache`), so we resolve first, then cache.
-    let choice = resolve_choice();
     let enabled = resolve_enabled();
     let texture = if !enabled {
         None
     } else {
         match &cached {
-            Some(c) if c.choice == choice && c.enabled == enabled => c.texture.clone(),
-            _ => decode_wallpaper(ctx, choice),
+            Some(c) if c.enabled == enabled => c.texture.clone(),
+            _ => decode_wallpaper(ctx),
         }
     };
     ctx.data_mut(|d| {
         d.insert_temp(
             id,
             WallpaperCache {
-                choice,
                 enabled,
                 texture: texture.clone(),
                 checked_at: now,
@@ -567,77 +473,72 @@ fn wallpaper_texture(ctx: &egui::Context) -> Option<TextureHandle> {
     texture
 }
 
-/// Decode + upload the wallpaper for `choice`: the installed asset under
-/// [`WALLPAPER_DIR`] first, then the embedded [`DEFAULT_WALLPAPER`] as the only
-/// bundled fallback, else `None` (the bare Carbon field). Reuses
-/// [`crate::chooser::decode_png_rgba`] (the RGB/RGBA `png` path the splash decodes
-/// its artwork on). Linear sampling — the wallpaper is scaled to fill, which reads
-/// crisper than nearest.
-fn decode_wallpaper(ctx: &egui::Context, choice: Wallpaper) -> Option<TextureHandle> {
-    let image = fs::read(choice.installed_path())
-        .ok()
-        .as_deref()
-        .and_then(decode_png_rgba)
-        .or_else(|| decode_png_rgba(DEFAULT_WALLPAPER))?;
+/// Decode + upload the cached Bing daily picture. Static Construct artwork is
+/// retained only for boot branding; the runtime wallpaper has one provider and
+/// fails soft to the Carbon field until Bing has supplied an image.
+fn decode_wallpaper(ctx: &egui::Context) -> Option<TextureHandle> {
+    let path = crate::system::bing_wallpaper_path()?;
+    let image = fs::read(path).ok().as_deref().and_then(decode_wallpaper_rgba)?;
     Some(ctx.load_texture(
-        format!("qbrand11-wallpaper-{}", choice.index()),
+        "bing-wallpaper-of-the-day",
         image,
         TextureOptions::LINEAR,
     ))
 }
 
-/// The persisted wallpaper selection, or the default when nothing is stored / the
-/// workgroup volume isn't provisioned (honest offline → the default backdrop).
-fn resolve_choice() -> Wallpaper {
-    WallpaperStore::open_default()
-        .load()
-        .unwrap_or(Wallpaper::DEFAULT)
+/// Decode the downloaded Bing payload regardless of its transport image
+/// format. Bing currently serves JPEG, while tests and older caches may hold
+/// PNG; both are valid cache contents.
+fn decode_wallpaper_rgba(bytes: &[u8]) -> Option<egui::ColorImage> {
+    let decoded = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let width = usize::try_from(decoded.width()).ok()?;
+    let height = usize::try_from(decoded.height()).ok()?;
+    Some(egui::ColorImage::from_rgba_unmultiplied(
+        [width, height],
+        decoded.as_raw(),
+    ))
 }
 
-/// Whether the operator enabled the wallpaper backdrop, defaulting on for
-/// migrated/absent records so the existing desktop remains wallpaper-backed.
+#[cfg(test)]
+mod wallpaper_decode_tests {
+    use super::decode_wallpaper_rgba;
+
+    #[test]
+    fn bing_jpeg_cache_payload_decodes_for_desktop_render() {
+        let mut bytes = Vec::new();
+        let image = image::RgbImage::from_pixel(2, 1, image::Rgb([0x12, 0x34, 0x56]));
+        image::codecs::jpeg::JpegEncoder::new(&mut bytes)
+            .encode(
+                image.as_raw(),
+                image.width(),
+                image.height(),
+                image::ColorType::Rgb8.into(),
+            )
+            .expect("encode test Bing JPEG");
+
+        let decoded = decode_wallpaper_rgba(&bytes).expect("decode Bing JPEG");
+        assert_eq!(decoded.size, [2, 1]);
+        assert_eq!(decoded.pixels.len(), 2);
+    }
+}
+
+/// Whether the operator enabled the Bing backdrop, defaulting on for migrated or
+/// absent records.
 fn resolve_enabled() -> bool {
     WallpaperStore::open_default()
         .load_record()
         .map_or(true, |record| record.enabled)
 }
 
-/// Select `choice` as the desktop wallpaper: persist it (a no-op when the workgroup
-/// volume isn't provisioned) and update the live egui-memory cache immediately so the
-/// desktop reflects it this session even offline. The System surface's picker drives
-/// this.
-pub(crate) fn select_wallpaper(ctx: &egui::Context, choice: Wallpaper) {
-    // Persist — inert when the workgroup root isn't provisioned (honest offline); the
-    // cache update below still makes the choice hold session-local.
-    let enabled = wallpaper_enabled(ctx);
-    let _ = WallpaperStore::open_default().save(choice, enabled, unix_millis());
-    let texture = enabled.then(|| decode_wallpaper(ctx, choice)).flatten();
-    ctx.data_mut(|d| {
-        d.insert_temp(
-            egui::Id::new(WALLPAPER_CACHE_KEY),
-            WallpaperCache {
-                choice,
-                enabled,
-                texture,
-                checked_at: Instant::now(),
-            },
-        );
-    });
-    ctx.request_repaint();
-}
-
-/// Set whether Home paints the selected wallpaper and persist the choice. The
-/// texture cache is updated immediately so the setting is visible without a
-/// shell restart, including when the mesh preference volume is unavailable.
+/// Set whether Home paints the Bing wallpaper and persist the enable state. The
+/// texture cache is updated immediately so the setting is visible without restart.
 pub(crate) fn set_wallpaper_enabled(ctx: &egui::Context, enabled: bool) {
-    let choice = selected_wallpaper(ctx);
-    let _ = WallpaperStore::open_default().save(choice, enabled, unix_millis());
-    let texture = enabled.then(|| decode_wallpaper(ctx, choice)).flatten();
+    let _ = WallpaperStore::open_default().save(enabled, unix_millis());
+    let texture = enabled.then(|| decode_wallpaper(ctx)).flatten();
     ctx.data_mut(|d| {
         d.insert_temp(
             egui::Id::new(WALLPAPER_CACHE_KEY),
             WallpaperCache {
-                choice,
                 enabled,
                 texture,
                 checked_at: Instant::now(),
@@ -647,30 +548,20 @@ pub(crate) fn set_wallpaper_enabled(ctx: &egui::Context, enabled: bool) {
     ctx.request_repaint();
 }
 
-/// The persisted/session-local enable state used by the Settings picker.
+/// The persisted/session-local enable state used by the Settings surface.
 pub(crate) fn wallpaper_enabled(ctx: &egui::Context) -> bool {
     ctx.data_mut(|d| d.get_temp::<WallpaperCache>(egui::Id::new(WALLPAPER_CACHE_KEY)))
         .map_or_else(resolve_enabled, |cache| cache.enabled)
 }
 
-/// The currently-selected wallpaper — the live cache when the desktop has painted,
-/// else the persisted selection. The System surface's picker shows this as current.
-pub(crate) fn selected_wallpaper(ctx: &egui::Context) -> Wallpaper {
-    ctx.data_mut(|d| d.get_temp::<WallpaperCache>(egui::Id::new(WALLPAPER_CACHE_KEY)))
-        .map_or_else(resolve_choice, |c| c.choice)
-}
-
 // ─────────────────────────── the per-seat persisted store ───────────────────────────
 
-/// One seat's persisted wallpaper selection — the JSON record written to its own file
-/// under the workgroup root.
+/// One seat's persisted Bing Home-wallpaper enable state under the workgroup root.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WallpaperRecord {
     /// The seat that wrote this record (the single writer of its own file).
     #[serde(default)]
     seat: String,
-    /// The selected wallpaper's 1-based index (1–5).
-    choice: u8,
     /// Whether the wallpaper backdrop is enabled. Missing legacy field means on.
     #[serde(default = "default_true")]
     enabled: bool,
@@ -719,7 +610,7 @@ impl WallpaperStore {
             .join(sanitize(&resolve_identity()))
     }
 
-    /// The folded selection across every seat file: the record with the newest
+    /// The folded enable state across every seat file: the record with the newest
     /// `updated_ms` wins (id tiebreak by later iteration). Malformed / half-written /
     /// temp files are skipped (never fatal), and a missing directory yields `None`.
     fn load_record(&self) -> Option<WallpaperRecord> {
@@ -743,9 +634,6 @@ impl WallpaperStore {
             let Ok(rec) = serde_json::from_str::<WallpaperRecord>(&data) else {
                 continue;
             };
-            if Wallpaper::from_index(rec.choice).is_none() {
-                continue;
-            }
             if best
                 .as_ref()
                 .is_none_or(|previous| rec.updated_ms >= previous.updated_ms)
@@ -756,20 +644,13 @@ impl WallpaperStore {
         best
     }
 
-    /// Fold the newest valid persisted selection, retaining the legacy API used
-    /// by the backdrop resolver and tests.
-    fn load(&self) -> Option<Wallpaper> {
-        self.load_record()
-            .and_then(|record| Wallpaper::from_index(record.choice))
-    }
-
-    /// Write this seat's selection (atomic temp + rename). A silent `Ok(())` no-op
+    /// Write this seat's enable state (atomic temp + rename). A silent `Ok(())` no-op
     /// when the root is not provisioned ([`is_ready`](Self::is_ready)).
     ///
     /// # Errors
     /// The [`io::Error`] if the directory cannot be created or the file cannot be
     /// written / renamed.
-    fn save(&self, choice: Wallpaper, enabled: bool, now_ms: u64) -> io::Result<()> {
+    fn save(&self, enabled: bool, now_ms: u64) -> io::Result<()> {
         if !self.is_ready() {
             return Ok(());
         }
@@ -781,7 +662,6 @@ impl WallpaperStore {
         let tmp_path = dir.join(format!(".{safe_seat}.json.tmp"));
         let rec = WallpaperRecord {
             seat,
-            choice: choice.index(),
             enabled,
             updated_ms: now_ms,
         };
@@ -930,7 +810,6 @@ mod tests {
         });
         let cached = ctx.data_mut(|d| {
             d.get_temp::<WallpaperCache>(egui::Id::new(WALLPAPER_CACHE_KEY))
-                .and_then(|c| c.texture)
                 .is_some()
         });
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
@@ -943,14 +822,6 @@ mod tests {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         std::env::temp_dir().join(format!("mde-qbrand11-{tag}-{n}"))
-    }
-
-    #[test]
-    fn the_embedded_default_wallpaper_decodes_to_its_native_size() {
-        // Proves the embedded default (the bundled fallback) is a real, correctly
-        // shaped image — not a stray/missing/mis-encoded file.
-        let img = decode_png_rgba(DEFAULT_WALLPAPER).expect("the embedded default decodes");
-        assert_eq!(img.size, [1408, 768], "native Construct wallpaper size");
     }
 
     #[test]
@@ -968,10 +839,7 @@ mod tests {
             drew,
             "the empty shell-colour backdrop produced no draw primitives"
         );
-        assert!(
-            cached,
-            "the wallpaper-backed Home must cache its fallback texture"
-        );
+        assert!(cached, "the Bing wallpaper resolution must be cached");
     }
 
     #[test]
@@ -982,10 +850,7 @@ mod tests {
             drew,
             "the covered shell-colour backdrop produced no draw primitives"
         );
-        assert!(
-            cached,
-            "the covered backdrop must retain its wallpaper texture"
-        );
+        assert!(cached, "the covered backdrop must retain its Bing cache state");
     }
 
     #[test]
@@ -1041,37 +906,15 @@ mod tests {
     }
 
     #[test]
-    fn the_wallpaper_texture_is_decoded_once_and_reused() {
-        // Two resolves on the same context hand back the SAME uploaded texture — the
-        // decode+upload is not repeated per call.
+    fn the_bing_wallpaper_resolution_is_cached() {
+        // Two resolves on the same context hand back the same cached result. A clean
+        // test seat normally has no Bing cache yet, so `None` is a valid fail-soft
+        // result until the provider has supplied today's image.
         let ctx = egui::Context::default();
         Style::install(&ctx);
-        let first = wallpaper_texture(&ctx).expect("decodes once").id();
-        let second = wallpaper_texture(&ctx).expect("served from cache").id();
-        assert_eq!(
-            first, second,
-            "the wallpaper must be uploaded once and reused"
-        );
-    }
-
-    #[test]
-    fn the_default_wallpaper_is_number_four() {
-        // Placement lock #12: WALLPAPER4 is the default.
-        assert_eq!(Wallpaper::DEFAULT, Wallpaper::Four);
-        assert_eq!(Wallpaper::DEFAULT.index(), 4);
-    }
-
-    #[test]
-    fn the_wallpaper_index_round_trips_and_rejects_out_of_range() {
-        for w in Wallpaper::ALL {
-            assert_eq!(
-                Wallpaper::from_index(w.index()),
-                Some(w),
-                "{w:?} round-trips"
-            );
-        }
-        assert!(Wallpaper::from_index(0).is_none(), "0 is out of range");
-        assert!(Wallpaper::from_index(6).is_none(), "6 is out of range");
+        let first = wallpaper_texture(&ctx).map(|texture| texture.id());
+        let second = wallpaper_texture(&ctx).map(|texture| texture.id());
+        assert_eq!(first, second, "the Bing wallpaper result must be cached");
     }
 
     #[test]
@@ -1096,24 +939,22 @@ mod tests {
     }
 
     #[test]
-    fn the_store_round_trips_a_selection_and_newest_write_wins() {
+    fn the_store_round_trips_enable_state_and_newest_write_wins() {
         let dir = temp_root("store");
         fs::create_dir_all(&dir).expect("mkroot");
         let store = WallpaperStore::new(dir.clone());
         assert!(store.is_ready());
         assert!(
-            store.load().is_none(),
-            "no record yet → the default resolves"
+            store.load_record().is_none(),
+            "no record yet → the default is enabled"
         );
 
-        store
-            .save(Wallpaper::Three, true, 1_000)
-            .expect("save three");
-        assert_eq!(store.load(), Some(Wallpaper::Three));
+        store.save(true, 1_000).expect("save enabled");
+        assert_eq!(store.load_record().map(|record| record.enabled), Some(true));
 
         // The same seat re-saves; the newer write wins (its file is overwritten).
-        store.save(Wallpaper::One, true, 2_000).expect("save one");
-        assert_eq!(store.load(), Some(Wallpaper::One));
+        store.save(false, 2_000).expect("save disabled");
+        assert_eq!(store.load_record().map(|record| record.enabled), Some(false));
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1126,28 +967,32 @@ mod tests {
         fs::create_dir_all(&idir).expect("mkdir");
         fs::write(
             idir.join("alpha.json"),
-            r#"{"seat":"alpha","choice":2,"updated_ms":10}"#,
+            r#"{"seat":"alpha","enabled":true,"updated_ms":10}"#,
         )
         .expect("write alpha");
         fs::write(
             idir.join("beta.json"),
-            r#"{"seat":"beta","choice":5,"updated_ms":30}"#,
+            r#"{"seat":"beta","enabled":false,"updated_ms":30}"#,
         )
         .expect("write beta");
         fs::write(
             idir.join("gamma.json"),
-            r#"{"seat":"gamma","choice":1,"updated_ms":20}"#,
+            r#"{"seat":"gamma","enabled":true,"updated_ms":20}"#,
         )
         .expect("write gamma");
         assert_eq!(
-            store.load(),
-            Some(Wallpaper::Five),
+            store.load_record().map(|record| record.enabled),
+            Some(false),
             "the newest updated_ms wins"
         );
 
         // A corrupt file is skipped, never fatal.
         fs::write(idir.join("bad.json"), "{ not json").expect("write bad");
-        assert_eq!(store.load(), Some(Wallpaper::Five), "corrupt skipped");
+        assert_eq!(
+            store.load_record().map(|record| record.enabled),
+            Some(false),
+            "corrupt skipped"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1156,22 +1001,8 @@ mod tests {
     fn an_unprovisioned_store_is_inert() {
         let store = WallpaperStore::new(PathBuf::from("/no/such/mesh/root"));
         assert!(!store.is_ready());
-        store
-            .save(Wallpaper::Two, true, 1)
-            .expect("inert save is Ok");
-        assert!(store.load().is_none(), "nothing folded from a missing root");
-    }
-
-    #[test]
-    fn selecting_a_wallpaper_updates_the_live_cache_immediately() {
-        // Even when the workgroup volume is unprovisioned (the save is inert), the
-        // live cache holds the new choice this session (honest offline).
-        let ctx = egui::Context::default();
-        Style::install(&ctx);
-        select_wallpaper(&ctx, Wallpaper::Two);
-        assert_eq!(selected_wallpaper(&ctx), Wallpaper::Two);
-        select_wallpaper(&ctx, Wallpaper::Five);
-        assert_eq!(selected_wallpaper(&ctx), Wallpaper::Five);
+        store.save(true, 1).expect("inert save is Ok");
+        assert!(store.load_record().is_none(), "nothing folded from a missing root");
     }
 
     #[test]
@@ -1179,10 +1010,7 @@ mod tests {
         let dir = temp_root("enabled");
         fs::create_dir_all(&dir).expect("mkroot");
         let store = WallpaperStore::new(dir.clone());
-        store
-            .save(Wallpaper::Two, false, 1_000)
-            .expect("save disabled");
-        assert_eq!(store.load(), Some(Wallpaper::Two));
+        store.save(false, 1_000).expect("save disabled");
         assert_eq!(
             store.load_record().map(|record| record.enabled),
             Some(false)
@@ -1194,8 +1022,6 @@ mod tests {
         assert!(!wallpaper_enabled(&ctx));
         set_wallpaper_enabled(&ctx, true);
         assert!(wallpaper_enabled(&ctx));
-        assert_eq!(selected_wallpaper(&ctx), Wallpaper::DEFAULT);
-
         let _ = fs::remove_dir_all(&dir);
     }
 

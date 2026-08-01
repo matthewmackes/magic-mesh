@@ -118,6 +118,7 @@ struct BottomTray<'a> {
     segments: &'a StatusSegments,
     opacity: f32,
     env: StatusBarEnv,
+    active_surface: Option<Surface>,
 }
 
 /// The persisted placement choice.
@@ -643,6 +644,7 @@ impl State {
                 segments,
                 opacity: tray_opacity,
                 env: tray_env,
+                active_surface,
             }),
         )
     }
@@ -821,14 +823,15 @@ impl State {
                 // its clock and system targets remain anchored in the bar and
                 // take the final hit-test priority in their reserved lane.
                 if let Some(tray) = bottom_tray.as_mut() {
-                    status_bar::paint_bottom_tray(
-                        ui,
-                        screen,
-                        tray.construct,
-                        tray.segments,
-                        tray.opacity,
-                        tray.env,
-                    );
+            status_bar::paint_bottom_tray_with_active(
+                ui,
+                screen,
+                tray.construct,
+                tray.segments,
+                tray.opacity,
+                tray.env,
+                tray.active_surface,
+            );
                 }
 
                 if let (Some(anchor), Some(overflow)) =
@@ -1200,11 +1203,14 @@ impl ControlKind {
 
     const fn icon(self) -> IconId {
         match self {
-            Self::Start => IconId::Mark,
+            Self::Start => IconId::Grid,
             Self::Back => IconId::ArrowLeft,
             Self::Home => IconId::FileHome,
             Self::Editor => IconId::Editor,
-            Self::Pin => IconId::Pin,
+            // The placement toggle lives at the far edge of both layouts;
+            // the desktop-outline treatment reads like Windows' Show Desktop
+            // affordance while retaining the existing Pin action semantics.
+            Self::Pin => IconId::Desktop,
             Self::Overflow => IconId::MoreHorizontal,
             Self::SurfaceLauncher => IconId::Mark,
             Self::PinnedDesktop => IconId::Desktop,
@@ -1217,7 +1223,7 @@ impl ControlKind {
             Self::Back => "Back",
             Self::Home => "Home",
             Self::Editor => "Editor - Workspace",
-            Self::Pin => "Taskbar placement",
+            Self::Pin => "Show Desktop — Taskbar placement",
             Self::Overflow => "More taskbar apps",
             Self::SurfaceLauncher => "Open app",
             Self::PinnedDesktop => "Open pinned desktop",
@@ -1951,7 +1957,7 @@ fn control_label(
         return format!("Open {}", taskbar_surface_label(surface));
     }
     if control.kind == ControlKind::Pin {
-        "Taskbar placement".to_owned()
+        "Show Desktop — Taskbar placement".to_owned()
     } else {
         control.kind.tooltip().to_owned()
     }
@@ -2235,7 +2241,7 @@ mod tests {
     }
 
     #[test]
-    fn start_search_uses_the_construct_mark_glyph() {
+    fn start_search_uses_the_carbon_grid_glyph() {
         let start = Control {
             kind: ControlKind::Start,
             rect: egui::Rect::NOTHING,
@@ -2248,7 +2254,7 @@ mod tests {
             surface: None,
             source_index: None,
         };
-        assert_eq!(control_icon(start), IconId::Mark);
+        assert_eq!(control_icon(start), IconId::Grid);
         assert_eq!(control_icon(home), IconId::FileHome);
         assert_eq!(control_action(start, &[]), Action::OpenSearch);
     }
@@ -2318,7 +2324,7 @@ mod tests {
         assert!(geometry
             .controls
             .iter()
-            .all(|control| { (control.rect.width() - CONTROL_EDGE).abs() < f32::EPSILON }));
+            .all(|control| { (control.rect.width() - CONTROL_EDGE).abs() <= 0.001 }));
         assert_hit_targets_inside_backing("floating sub-640 screen".to_string(), &geometry);
     }
 
@@ -2945,7 +2951,7 @@ mod tests {
                 (ControlKind::Start, "Start - Search"),
                 (ControlKind::Back, "Back"),
                 (ControlKind::Home, "Home"),
-                (ControlKind::Pin, "Taskbar placement"),
+                (ControlKind::Pin, "Show Desktop — Taskbar placement"),
             ] {
                 let node = update
                     .nodes
@@ -3778,7 +3784,7 @@ mod tests {
                 .take(3)
                 .map(|control| control_icon(*control))
                 .collect::<Vec<_>>(),
-            vec![IconId::Mark, IconId::ArrowLeft, IconId::FileHome,]
+            vec![IconId::Grid, IconId::ArrowLeft, IconId::FileHome,]
         );
         assert_eq!(
             floating

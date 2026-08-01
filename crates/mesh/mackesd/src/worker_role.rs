@@ -36,14 +36,14 @@ use mde_role::{Capability, Role, RoleClass};
 /// gates every `sup.spawn` through [`runs_in`], so a rank-gated worker checks the
 /// tier and a capability-gated worker (the Navidrome media worker — MEDIA-3)
 /// additionally requires the matching tag. Keeping rank + tags together is the §9
-/// doctrine: a `Lighthouse_Media` box is the Lighthouse tier carrying
-/// [`Capability::Media`].
+/// doctrine. Media discovery and client auto-configuration are Workstation-tier
+/// behaviors; the legacy hosting capability does not gate them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeployClass {
     /// The role rank (0 lighthouse · 1 workstation).
     pub rank: u8,
-    /// `true` when this box carries [`Capability::Media`] — the `Lighthouse_Media`
-    /// subclass that hosts the media service.
+    /// Legacy media-hosting marker retained for role-file compatibility. It does
+    /// not gate Workstation media discovery or music auto-configuration.
     pub media: bool,
 }
 
@@ -321,67 +321,6 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
     // while still replicating peers' filter-store blobs over Syncthing and, when
     // leader, compiling the shared engine blob.
     WorkerSpec::tier("adfilter", 1, RestartPolicy::Always),
-    // BOOKMARKS-8 — the mesh-wide browser/ad-blocker POLICY worker. Reads the
-    // Syncthing-synced fleet policy doc, folds it for THIS node's role, and
-    // enforces at the browser launch/spawn seam (refuse-to-spawn on a disallowed
-    // role, inject the forced ad-blocker + URL allowlist + custom lists, reject
-    // out-of-policy navigate / adblock-off actions). A desktop-governance feature,
-    // so Workstation-tier; it idles gracefully on a headless box (no browser, no
-    // action/browser/* requests) while still replicating the policy doc.
-    WorkerSpec::tier("browser_policy", 1, RestartPolicy::Always),
-    // BROWSER-DD-6 — Browser passkey/WebAuthn ceremony owner. Drains strict
-    // Browser-origin passkey ceremony metadata, persists pending challenges into
-    // local + Syncthing-backed roots, and publishes honest pending/error state.
-    // A desktop/browser security feature, so Workstation-tier; it idles
-    // gracefully on headless boxes with no Browser publishes.
-    WorkerSpec::tier("browser_passkeys", 1, RestartPolicy::Always),
-    // BROWSER-DD-7 — Browser session-sync owner. Drains the Browser's
-    // action/browser/session-sync snapshots into a local durable latest snapshot
-    // and mirrors them to the Syncthing share for follow-me/startup restore. A
-    // desktop/browser feature, so Workstation-tier; idles gracefully on a headless
-    // box with no Browser publishes.
-    WorkerSpec::tier("browser_session_sync", 1, RestartPolicy::Always),
-    // BROWSER-DD-11 — Browser read-aloud/TTS owner. Drains Browser page-text
-    // read-aloud requests and speaks them through the configured offline TTS
-    // command when present, publishing honest unavailable/error state otherwise.
-    // A desktop/browser accessibility feature, so Workstation-tier.
-    WorkerSpec::tier("browser_read_aloud", 1, RestartPolicy::Always),
-    // BROWSER-DD-11 — Browser voice-command/dictation STT owner. Drains Browser
-    // command/dictation requests and transcribes them through the configured
-    // offline STT/capture command when present, publishing honest unavailable or
-    // error state otherwise. A desktop/browser accessibility feature.
-    WorkerSpec::tier("browser_voice_command", 1, RestartPolicy::Always),
-    // BROWSER-DD-12 — Browser external-protocol owner. Drains Browser
-    // action/browser/protocol handoffs for schemes the shell refuses to navigate,
-    // publishing retained route status/events for downstream Email/Transfers
-    // owners without faking those surfaces. A desktop/browser integration
-    // feature, so Workstation-tier.
-    WorkerSpec::tier("browser_protocol", 1, RestartPolicy::Always),
-    // BROWSER-DD-12 — Browser platform-share owner. Drains Browser
-    // action/browser/share handoffs for Peer/Email/QR targets, publishing
-    // retained route status/events without faking downstream delivery. A
-    // desktop/browser integration feature, so Workstation-tier.
-    WorkerSpec::tier("browser_share", 1, RestartPolicy::Always),
-    // BROWSER-DD-12 — Browser private offline/mesh translation owner. Drains
-    // Browser page-text translation requests and translates them through a
-    // configured local/mesh command when present, publishing honest unavailable
-    // or error state otherwise. A desktop/browser integration feature.
-    WorkerSpec::tier("browser_translate", 1, RestartPolicy::Always),
-    // BROWSER-DD-12 — Browser offline/mesh cache owner. Drains explicit Browser
-    // page snapshots, keeps the helper no-store policy intact, and mirrors the
-    // bounded private cache records onto the Syncthing-backed file plane.
-    WorkerSpec::tier("browser_offline_cache", 1, RestartPolicy::Always),
-    // BROWSER-DD-12 — Browser CEF security-update status owner. Watches the
-    // packaged fast-update manifest and active CEF runtime, publishing an honest
-    // current/missing/mismatch posture for the independent browser engine update
-    // path. A desktop/browser integration feature, so Workstation-tier.
-    WorkerSpec::tier("browser_security_update", 1, RestartPolicy::Always),
-    // BROWSER-DD-12 — Browser idle-tab suspend owner. Drains shell-published
-    // action/browser/tab-suspend handoffs after the shell stops inactive helper
-    // load paths, publishing retained suspend status/events for diagnostics and
-    // future orchestration. A desktop/browser integration feature, so
-    // Workstation-tier.
-    WorkerSpec::tier("browser_tab_suspend", 1, RestartPolicy::Always),
     // KDC-MESH-6 — phone-as-touchpad/keyboard seat consumer. Drains KDC
     // worker's action/seat/remote-input handoffs and invokes the configured
     // local uinput/seat helper when present. Workstation-tier; idles on
@@ -397,9 +336,9 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
     // aggregation is cheap and the verbs simply never arrive).
     WorkerSpec::tier("desktop_sources", 1, RestartPolicy::OnFailure),
     WorkerSpec::tier("remmina-sync", 1, RestartPolicy::OnFailure),
-    // MEDIA-8 — Workstation music auto-config: a desktop worker (no seated user
-    // on a Lighthouse, so Workstation-tier), reads the published shared
-    // account off the registry plane + writes the desktop user's creds.
+    // MEDIA-8 — Workstation music auto-config: a desktop consumer of versioned
+    // Media server records published by any participating Media node. It
+    // resolves credential refs locally and writes only the seated user's creds.
     WorkerSpec::tier("music_autoconfig", 1, RestartPolicy::OnFailure),
     // MEDIA-14 — the mesh media-source discovery aggregator behind the
     // mde-media Sources panel. A desktop feature (the seated user picks a media
@@ -544,7 +483,8 @@ pub fn resolve_rank() -> u8 {
 /// Same fail-soft contract as [`resolve_rank`]: an unpinned box → Workstation (no
 /// media tag — the desktop set, never the media worker), a malformed `role.toml`
 /// → Lighthouse fail-closed (no media tag). The media tag is only ever set when a
-/// valid `Lighthouse_Media` class is pinned.
+/// valid legacy media-hosting class is pinned. Workstation media discovery does
+/// not depend on this marker; it consumes replicated Airsonic server records.
 #[must_use]
 pub fn resolve_class() -> DeployClass {
     match mde_role::load_class() {
@@ -604,7 +544,8 @@ pub fn runs(worker: &str, role_rank: u8) -> bool {
 /// A worker runs iff the box is at (or above) the worker's rank floor AND — for a
 /// capability-gated worker — the box carries the required tag. This is the single
 /// predicate `run_serve` gates every `sup.spawn` through, so the media worker
-/// lands on a `Lighthouse_Media` node and is absent everywhere else.
+/// remains limited to the legacy hosting worker; Workstation media clients use
+/// the rank-gated `music_autoconfig` worker instead.
 #[must_use]
 pub fn runs_in(worker: &str, class: DeployClass) -> bool {
     if class.rank < min_rank(worker) {
@@ -632,8 +573,7 @@ pub fn workers_for_rank(role_rank: u8) -> Vec<&'static str> {
 
 /// MEDIA-1 — every worker a box of `class` runs, including capability-gated ones.
 ///
-/// The capability workers its tags unlock (a `Lighthouse_Media` class adds the
-/// media worker on top of its lighthouse rank set). Rank workers first (tier
+/// The legacy capability workers its tags unlock. Rank workers first (tier
 /// census order), then the capability workers the box's tags satisfy.
 #[must_use]
 pub fn workers_for_class(class: DeployClass) -> Vec<&'static str> {
@@ -1062,8 +1002,8 @@ mod tests {
         // removed in CLIP-SYNC-2: that binary never existed in the workspace).
         // +1 etcd_watch (SUBSTRATE-10 — the coordination-plane WATCH worker that
         // pushes instant peer-down / leader-change alerts off etcd watch streams).
-        // +1 music_autoconfig (MEDIA-8 — Workstation music birthright: writes the
-        // desktop user's airsonic-creds.json from the published mesh shared account).
+        // +1 music_autoconfig (MEDIA-8 — Workstation music birthright: resolves
+        // an Airsonic server record's secret reference into local user creds).
         // +1 link-traffic (MESHMAP-6 — per-link byte-counter collector, rank 0).
         // +1 mesh_mount (FILEMGR-5 — the Files-surface sshfs mesh-mount worker,
         // Workstation-tier: a seated-user desktop feature).
@@ -1400,6 +1340,25 @@ mod tests {
     fn unknown_worker_defaults_to_lighthouse() {
         assert_eq!(min_rank("some-future-worker"), 0);
         assert!(runs("some-future-worker", Role::Lighthouse.rank()));
+    }
+
+    #[test]
+    fn music_autoconfig_is_workstation_role_gated_not_media_host_gated() {
+        assert!(!runs_in(
+            "music_autoconfig",
+            DeployClass::plain(Role::Lighthouse.rank())
+        ));
+        assert!(runs_in(
+            "music_autoconfig",
+            DeployClass::plain(Role::Workstation.rank())
+        ));
+        assert!(runs_in(
+            "music_autoconfig",
+            DeployClass {
+                rank: Role::Workstation.rank(),
+                media: false,
+            }
+        ));
     }
 
     #[test]

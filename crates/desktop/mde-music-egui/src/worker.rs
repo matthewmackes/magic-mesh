@@ -11,13 +11,13 @@
 //! engine spawns its own decode thread, so no Tokio runtime is ever nested.
 
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mde_egui::egui::Context;
 use mde_musicd::airsonic::{Client, Song};
 use mde_musicd::engine::Engine;
 
-use crate::model::{track_for_engine, Command, Update};
+use crate::model::{select_default_server, track_for_engine, Command, FailoverRequest, SeatServer, Update};
 
 /// Albums fetched per library listing. Subsonic's `getAlbumList2` caps `size` at
 /// 500; one page covers the first-slice listing.
@@ -35,12 +35,16 @@ const PROGRESS_TICK: Duration = Duration::from_millis(500);
 /// UI drives it with. `ctx` is repainted after every [`Update`]; `updates`
 /// carries results back. If the thread cannot be spawned, an [`Update::Error`] is
 /// sent so the UI surfaces it rather than silently doing nothing.
-pub fn spawn(client: Client, ctx: Context, updates: Sender<Update>) -> Sender<Command> {
+pub fn spawn(
+    connections: Vec<(SeatServer, Client)>,
+    ctx: Context,
+    updates: Sender<Update>,
+) -> Sender<Command> {
     let (tx, rx) = mpsc::channel::<Command>();
     let err_tx = updates.clone();
     if let Err(e) = std::thread::Builder::new()
         .name("mde-music-egui-worker".to_string())
-        .spawn(move || run(&client, &ctx, &updates, &rx))
+        .spawn(move || run(connections, &ctx, &updates, &rx))
     {
         let _ = err_tx.send(Update::Error(format!("could not start music worker: {e}")));
     }
@@ -49,7 +53,17 @@ pub fn spawn(client: Client, ctx: Context, updates: Sender<Update>) -> Sender<Co
 
 /// The worker loop: build the runtime, then service commands until the UI hangs
 /// up (its command sender drops, ending `recv`).
-fn run(client: &Client, ctx: &Context, updates: &Sender<Update>, rx: &Receiver<Command>) {
+struct Connection {
+    server: SeatServer,
+    client: Client,
+}
+
+fn run(
+    connections: Vec<(SeatServer, Client)>,
+    ctx: &Context,
+    updates: &Sender<Update>,
+    rx: &Receiver<Command>,
+) {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -60,6 +74,28 @@ fn run(client: &Client, ctx: &Context, updates: &Sender<Update>, rx: &Receiver<C
             return;
         }
     };
+    let mut connections: Vec<Connection> = connections
+        .into_iter()
+        .map(|(server, client)| Connection { server, client })
+        .collect();
+    if connections.is_empty() {
+        let _ = updates.send(Update::Error("no music seat servers configured".to_string()));
+        return;
+    }
+    for connection in &mut connections {
+        let started = Instant::now();
+        if rt.block_on(connection.client.ping()).is_ok() {
+            connection.server.latency_ms = Some(
+                u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
+            );
+        }
+    }
+    let mut active = select_default_server(
+        &connections.iter().map(|c| c.server.clone()).collect::<Vec<_>>(),
+    )
+    .unwrap_or(0);
+    let _ = updates.send(Update::ServerSelected(connections[active].server.clone()));
+    let mut pending_failover: Option<usize> = None;
     // Opened on first play; a headless host with no sound card surfaces the
     // failure once, on the play attempt, instead of failing the whole surface.
     let mut engine: Option<Engine> = None;
@@ -86,21 +122,29 @@ fn run(client: &Client, ctx: &Context, updates: &Sender<Update>, rx: &Receiver<C
             match cmd {
                 Command::LoadLibrary => {
                     let result = rt
-                        .block_on(client.get_album_list2(LIBRARY_ORDER, LIBRARY_PAGE))
+                        .block_on(connections[active].client.get_album_list2(LIBRARY_ORDER, LIBRARY_PAGE))
                         .map_err(|e| e.to_string());
+                    if result.is_err() {
+                        propose_failover(&connections, active, updates, &mut pending_failover, "library server unavailable");
+                    }
                     let _ = updates.send(Update::Library(result));
                 }
                 Command::LoadAlbum(id) => {
                     let result = rt
-                        .block_on(client.get_album(&id))
+                        .block_on(connections[active].client.get_album(&id))
                         .map(|detail| detail.songs)
                         .map_err(|e| e.to_string());
+                    if result.is_err() {
+                        propose_failover(&connections, active, updates, &mut pending_failover, "album server unavailable");
+                    }
                     let _ = updates.send(Update::Tracks {
                         album_id: id,
                         result,
                     });
                 }
-                Command::Play(song) => track_loaded = play(client, &mut engine, updates, song),
+                Command::Play(song) => {
+                    track_loaded = play(&connections[active].client, &mut engine, updates, song)
+                }
                 Command::Pause => {
                     if let Some(eng) = engine.as_ref() {
                         eng.pause();
@@ -120,6 +164,20 @@ fn run(client: &Client, ctx: &Context, updates: &Sender<Update>, rx: &Receiver<C
                     track_loaded = false;
                     let _ = updates.send(Update::Stopped);
                 }
+                Command::SelectServer(seat) => {
+                    if let Some(index) = connections.iter().position(|c| c.server.seat == seat) {
+                        active = index;
+                        pending_failover = None;
+                        let _ = updates.send(Update::ServerSelected(connections[active].server.clone()));
+                    }
+                }
+                Command::ApproveFailover => {
+                    if let Some(index) = pending_failover.take() {
+                        active = index;
+                        let _ = updates.send(Update::ServerSelected(connections[active].server.clone()));
+                    }
+                }
+                Command::RejectFailover => pending_failover = None,
             }
             // Wake the UI to drain the update we just sent.
             ctx.request_repaint();
@@ -143,6 +201,35 @@ fn run(client: &Client, ctx: &Context, updates: &Sender<Update>, rx: &Receiver<C
             }
         }
     }
+}
+
+fn propose_failover(
+    connections: &[Connection],
+    active: usize,
+    updates: &Sender<Update>,
+    pending: &mut Option<usize>,
+    reason: &str,
+) {
+    if pending.is_some() || connections.len() < 2 {
+        return;
+    }
+    let candidates: Vec<SeatServer> = connections
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != active)
+        .map(|(_, connection)| connection.server.clone())
+        .collect();
+    let Some(candidate) = select_default_server(&candidates) else { return };
+    let target = connections
+        .iter()
+        .position(|connection| connection.server == candidates[candidate])
+        .unwrap_or(active);
+    *pending = Some(target);
+    let _ = updates.send(Update::FailoverPending(FailoverRequest {
+        from: connections[active].server.seat.clone(),
+        to: connections[target].server.seat.clone(),
+        reason: reason.to_string(),
+    }));
 }
 
 /// Lazily open the audio engine (first play only). Returns a borrow of the live

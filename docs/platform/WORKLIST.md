@@ -1393,8 +1393,8 @@ remains here under a completed status.
   payload is `703d3477ce574e30abda5f1d7bdc46834ad16881db8d3a1d727b794fc1222919`.
   The full RPM
   dependency transaction, `.15`, remaining routes/states, full matrix, and
-  production readiness remain open. The latest proof-only telemetry payload is
-  `f69e42551724fae346b91bb4965194905d6583f62cf4265394f0fa49a8a8fc7e` on both
+  production readiness remain open. The latest installed validation payload is
+  `8366b1094571c8ec520166e6af09e342954850bde149f14146613091e5317f4b` on both
   seats; the earlier `703d3477...` hash remains the basis of the already
   accepted representative screenshots.
   The Maps Drive HUD now reserves the painter-positioned FAB lane before laying
@@ -1541,6 +1541,78 @@ remains here under a completed status.
   to Dell and `.138`, and visually accepted the replacement Light/Largest
   narrow frame. Both seats remained active with zero restarts; `.138` was
   restored to secure login-at-boot.
+- Live-render finding (2026-08-01): current-payload Car Light/Largest narrow
+  proof produced only the dark Auto/brand background curve and no Auto Mode
+  title, cards, or app strip. The frame is rejected; determine whether the
+  proof route is reaching `Surface::AutoHome` after the Car profile boot or
+  whether the Auto Mode body is being collapsed, then recapture before closing
+  the Car matrix cell.
+- Live-render finding (2026-08-01): after the Car proof route was corrected to
+  resolve `car`/`auto-home` to `Surface::AutoHome`, the replacement `.138`
+  Light/Largest narrow frame rendered the complete Auto Mode cockpit but still
+  failed visual acceptance. The left instrument strip's large-text status
+  labels and values overlap, and a long lower-left status value is clipped at
+  the scanout edge. Keep the Car cell open; make the strip zoom-aware and
+  width-safe, farm-test it, then recapture and inspect the live frame.
+- Live-render finding (2026-08-01): the first zoom-aware Car strip recapture
+  removed the overlap and safely elided the long `RADIO HEALTH` value, but its
+  two-column six-row large-text grid still lets the final status row reach the
+  taskbar and clip vertically. Keep the Car cell open; use a bounded
+  large-text column/row arrangement that fits every selected status tile inside
+  the instrument strip before recapturing.
+- Farm-integrity finding (2026-08-01): the focused shell gate on the Car-layout
+  tree is currently stopped by `crates/desktop/mde-shell-egui/src/backdrop.rs`
+  passing `image::ColorType::Rgb8` to the `image 0.25` JPEG encoder, which now
+  requires `ExtendedColorType`. Repair the explicit conversion before treating
+  the Car layout gate or release artifact as validated.
+- Live-render resolution (2026-08-01): the Car strip now uses a three-column
+  large-text grid, zoom-aware gauge allocation, and width-safe label/value
+  elision. The `image 0.25` JPEG encoder conversion was also repaired. The
+  focused farm gate passed 2 tests; release payload
+  `736471b1d47f38162107915d36ff7542cd9aba27cc09ba0e49dd0b1aeb9cf46b` was
+  deployed to Dell and `.138`, both services stayed active with zero restarts,
+  and the replacement `.138` Light/Largest narrow Car frame was visually
+  accepted with SHA-256
+  `88e022c9427345ee94adb0e164553ba655a8e6ba2c85f501be2407db17d59e5e`.
+  Temporary proof overrides were removed and `.138` returned to secure
+  `require_login_at_boot:true`.
+- Live-render finding (2026-08-01): current payload `736471b1…` Dark desktop
+  Phones proof exposes the shared `Phones` title and body, but the paired/online
+  status row begins outside the left scanout edge and is visibly clipped. Keep
+  the Phones Dark desktop cell open; bound the status row to the AppFrame
+  content inset and recapture before accepting it.
+- Live-render resolution (2026-08-01): the Phones paired/online status row and
+  mesh-identity line now share the AppFrame content inset. The focused Phones
+  suite passed 25 tests on farm `.90`; release payload
+  `8366b1094571c8ec520166e6af09e342954850bde149f14146613091e5317f4b` was
+  installed on `.138`, and the replacement Dark desktop frame was visually
+  accepted with SHA-256
+  `87f5b3e9a7c3a234b66a513e04b4b875dc87612e53733f214566352ca388799d`.
+  The proof overrides were removed afterward; `.138` remained active with zero
+  restarts and `require_login_at_boot:true`.
+- Live-render finding (2026-08-01): the first current-payload Editor Light
+  desktop capture on `.138` was rejected because the seat rendered the secure
+  boot curtain/clock rather than the requested Editor route. The PNG is not
+  evidence; repeat the proof with the temporary proof-only unlock state, then
+  restore `require_login_at_boot:true` and verify zero restarts.
+- Live-render resolution (2026-08-01): after the proof-only unlock override,
+  current payload `8366b109…` produced a valid `.138` Editor Light desktop
+  frame. The shared Mesh Teams/editor chrome, document body, details rail, and
+  taskbar were visually inspected and accepted with SHA-256
+  `bc48241b3cd0fbed2a9b4f191527cd88437060307d5c83b8f4b1bb2f02fd69c5`.
+  The override and appearance fixture were removed afterward; the seat was
+  restored to `require_login_at_boot:true`, active, and zero restarts.
+- Navigation-rail design decision (2026-08-01): preserve the navigation rail in
+  both desktop and narrow layouts. Add Fleet & Mesh, Music, Media, Phones, and
+  This Node as five individual notification-tray/tool-tray icons in the
+  default order Fleet & Mesh, Music, Media, Phones, This Node; keep their glyphs monochrome, show a
+  subtle active indicator, and expose workspace name, status, and keyboard
+  shortcut on hover/focus. This is a navigation presentation change only and
+  must continue using the shared icon registry, AppFrame routing, and existing
+  rail geometry; no rail removal or collapse is authorized. Move the Pin
+  placement control to the far-right end of the rail/taskbar controls and
+  render it as a monochrome Windows 10-style Show Desktop glyph, with the
+  existing placement behavior unchanged.
 - Backdrop validation update (2026-08-01): palette-resolved status backing,
   large-text anchoring, wallpaper selection/cache, and watermark routing pass
   24 focused shell tests with 1,920 filtered on `.90` slot
@@ -1561,7 +1633,7 @@ remains here under a completed status.
     live VDI framebuffer proof remain open.
 
   0. Re-run the direct-DRM EGL-readback matrix against the current installed
-     payload `3bd01985…` for every Construct-owned route that still relies on
+     payload `8366b109…` for every Construct-owned route that still relies on
      representative or older-payload evidence (Editor, Terminal, Phones, Car,
      and any remaining Workbench/Infra, Music, Media, Browser boundary, Mesh
      Teams, or This Node cells). Inspect Dark desktop, Light desktop, narrow,

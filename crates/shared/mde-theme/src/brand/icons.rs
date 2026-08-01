@@ -159,6 +159,8 @@ pub enum IconId {
     HealthStatus,
     /// Shared UI: search/magnifier glyph for compact search fields.
     Search,
+    /// Shared UI: Carbon grid glyph for the primary navigation/search rail.
+    Grid,
     /// Shared UI: close/clear `x` glyph for compact dismiss and clear buttons.
     Close,
     /// Shared UI: reload/refresh glyph.
@@ -458,6 +460,7 @@ impl IconId {
             Self::NetworkSettings => yamis_svg!("apps/16/preferences-system-network.svg"),
             Self::HealthStatus => yamis_svg!("preferences/scalable/preferences-smart-status.svg"),
             Self::Search => yamis_svg!("apps/scalable/system-search.svg"),
+            Self::Grid => carbon_v2_svg!("actions/view-grid.svg"),
             Self::Close => yamis_svg!("actions/16/remove.svg"),
             Self::Reload => yamis_svg!("status/scalable/state-sync.svg"),
             Self::Cancel => yamis_svg!("apps/scalable/dialog-cancel.svg"),
@@ -568,6 +571,7 @@ impl IconId {
             Self::NetworkSettings => "yamis-preferences-system-network",
             Self::HealthStatus => "yamis-preferences-smart-status",
             Self::Search => "yamis-system-search",
+            Self::Grid => "carbon-view-grid",
             Self::Close => "yamis-remove",
             Self::Reload => "yamis-state-sync",
             Self::Cancel => "yamis-dialog-cancel",

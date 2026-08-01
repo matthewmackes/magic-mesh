@@ -1436,6 +1436,15 @@ fn render_config_yaml_inner(
         }
         out.push('\n');
     }
+    // A workstation-sized root volume cannot safely retain Nebula's default
+    // info-level handshake chatter. In particular, a stale peer certificate
+    // can otherwise emit a line for every retry and starve the node of disk.
+    // Keep warnings/errors for diagnosis while leaving the generated config
+    // self-contained across supervisor refreshes.
+    out.push_str("logging:\n");
+    out.push_str("  level: warn\n");
+    out.push_str("  format: text\n");
+    out.push_str("  disable_timestamp: false\n\n");
     out.push_str("static_host_map:\n");
     for lh in unique_lighthouse_static_maps(bundle) {
         let proxy = https_proxy_endpoint_for(
@@ -2373,6 +2382,13 @@ mod tests {
     fn render_host_config_marks_am_lighthouse_true() {
         let yaml = render_config_yaml(&sample_bundle(), ConfigRole::Host);
         assert!(yaml.contains("am_lighthouse: true"));
+    }
+
+    #[test]
+    fn render_config_bounds_nebula_log_verbosity() {
+        let yaml = render_config_yaml(&sample_bundle(), ConfigRole::Peer);
+        assert!(yaml.contains("logging:\n  level: warn\n"));
+        assert!(yaml.contains("  format: text\n"));
     }
 
     #[test]

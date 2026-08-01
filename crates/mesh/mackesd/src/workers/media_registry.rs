@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 
 use super::{ShutdownToken, Worker};
 use crate::ipc::secret_store::{self, SecretStore};
-use crate::mesh_media::{self, MediaRegistration, SharedAccount};
+use crate::mesh_media::{self, MediaRegistration, MediaServerRecord, SharedAccount};
 
 /// 30 s registry tick — a published service-presence registration is slow-
 /// changing (the instance is up or it isn't); 30 s keeps the `health` field
@@ -74,11 +74,20 @@ fn publish_registration_to(
     topic: &str,
     reg: &MediaRegistration,
 ) {
+    let safe = credential_free_registration(reg);
     if let Some(mut persist) =
         crate::bus_publish::open_bus(bus_root.map(std::path::Path::to_path_buf))
     {
-        crate::bus_publish::publish_json(&mut persist, topic, reg);
+        crate::bus_publish::publish_json(&mut persist, topic, &safe);
     }
+}
+
+/// Keep the legacy registration shape readable while ensuring its optional
+/// compatibility account never crosses a mesh or shared-filesystem boundary.
+fn credential_free_registration(reg: &MediaRegistration) -> MediaRegistration {
+    let mut safe = reg.clone();
+    safe.shared_account = None;
+    safe
 }
 
 /// Mirror a node's media registration to the replicated QNM-Shared registry
@@ -95,7 +104,52 @@ pub fn write_shared_registration(mount: &Path, hostname: &str, reg: &MediaRegist
         tracing::warn!("media_registry: mkdir {} failed: {e}", dir.display());
         return;
     }
-    let Ok(body) = serde_json::to_string(reg) else {
+    let safe = credential_free_registration(reg);
+    let Ok(body) = serde_json::to_string(&safe) else {
+        return;
+    };
+    let tmp = dir.join("media-registry.json.tmp");
+    let final_path = dir.join(mesh_media::MEDIA_REGISTRY_FILE);
+    if let Err(e) = std::fs::write(&tmp, body.as_bytes()) {
+        tracing::warn!("media_registry: write {} failed: {e}", tmp.display());
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, &final_path) {
+        tracing::warn!("media_registry: rename registration failed: {e}");
+    }
+}
+
+/// Publish a versioned, credential-free endpoint record.
+pub fn publish_server_record(node_id: &str, reg: &MediaServerRecord) {
+    publish_server_records(node_id, std::slice::from_ref(reg));
+}
+
+/// Publish the complete operator-configured endpoint roster for a node.
+pub fn publish_server_records(node_id: &str, records: &[MediaServerRecord]) {
+    let topic = mesh_media::media_registry_topic(node_id);
+    if let Some(mut persist) =
+        crate::bus_publish::open_bus(crate::bus_publish::default_bus_root())
+    {
+        crate::bus_publish::publish_json(&mut persist, &topic, &records.to_vec());
+    }
+}
+
+/// Atomically mirror a versioned endpoint record to the shared registry plane.
+pub fn write_shared_server_record(mount: &Path, hostname: &str, reg: &MediaServerRecord) {
+    write_shared_server_records(mount, hostname, std::slice::from_ref(reg));
+}
+
+/// Atomically mirror the complete endpoint roster to the shared registry.
+pub fn write_shared_server_records(mount: &Path, hostname: &str, records: &[MediaServerRecord]) {
+    if hostname.is_empty() {
+        return;
+    }
+    let dir = mount.join(hostname);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!("media_registry: mkdir {} failed: {e}", dir.display());
+        return;
+    }
+    let Ok(body) = serde_json::to_string(records) else {
         return;
     };
     let tmp = dir.join("media-registry.json.tmp");
@@ -164,6 +218,10 @@ pub struct MediaRegistryWorker {
     /// Last published body + when, so we publish on-change and only
     /// heartbeat-republish an unchanged registration.
     last_publish: Mutex<Option<(String, Instant)>>,
+    /// Optional operator-configured endpoint. When present, this is the
+    /// versioned credential-free record published by the worker instead of
+    /// the legacy locally-hosted registration.
+    operator_records: Vec<MediaServerRecord>,
 }
 
 impl MediaRegistryWorker {
@@ -182,6 +240,7 @@ impl MediaRegistryWorker {
             secret_store,
             publish_heartbeat: PUBLISH_HEARTBEAT,
             last_publish: Mutex::new(None),
+            operator_records: Vec::new(),
         }
     }
 
@@ -209,6 +268,23 @@ impl MediaRegistryWorker {
         self
     }
 
+    /// Use an operator-configured Airsonic-compatible endpoint. The supplied
+    /// record contains only a secret-store reference, never credentials.
+    #[must_use]
+    pub fn with_server_record(mut self, record: MediaServerRecord) -> Self {
+        self.operator_records = vec![record];
+        self
+    }
+
+    /// Use all operator-configured endpoints for this node. The shared record
+    /// is an array so a node can advertise more than one Airsonic-compatible
+    /// server without losing the operator's ordering and health metadata.
+    #[must_use]
+    pub fn with_server_records(mut self, records: Vec<MediaServerRecord>) -> Self {
+        self.operator_records = records;
+        self
+    }
+
     /// Build this tick's registration from a live health probe + the shared
     /// account read from the `media-spaces` secret (MEDIA-8). Re-read each tick
     /// so a freshly-distributed secret is picked up without a worker restart;
@@ -221,6 +297,29 @@ impl MediaRegistryWorker {
     }
 
     fn tick_once(&self) {
+        if !self.operator_records.is_empty() {
+            if let Ok(body) = serde_json::to_string(&self.operator_records) {
+                let mut last = self
+                    .last_publish
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let now = Instant::now();
+                let prev_body = last.as_ref().map(|(b, _)| b.as_str());
+                let prev_at = last.as_ref().map(|(_, at)| *at);
+                if crate::workers::compute_registry::should_publish(
+                    prev_body,
+                    &body,
+                    prev_at,
+                    now,
+                    self.publish_heartbeat,
+                ) {
+                    publish_server_records(&self.node_id, &self.operator_records);
+                    *last = Some((body, now));
+                }
+            }
+            write_shared_server_records(&self.mount, &self.hostname, &self.operator_records);
+            return;
+        }
         let reg = self.build_registration();
         // Bus publish: on-change + slow heartbeat (BUS-RUN-FULL-1). Serialize
         // once and compare against the last published body.
@@ -307,6 +406,27 @@ mod tests {
     }
 
     #[test]
+    fn legacy_publication_never_contains_plaintext_account() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg = mesh_media::registration_with_account(
+            "peer:eagle",
+            mesh_media::NAVIDROME_PORT,
+            "up",
+            Some(SharedAccount::new("mesh-user", "super-secret")),
+        );
+        let topic = mesh_media::media_registry_topic(&reg.node_id);
+
+        publish_registration_to(Some(tmp.path()), &topic, &reg);
+
+        let reader = mde_bus::persist::Persist::open(tmp.path().to_path_buf()).unwrap();
+        let rows = reader.list_since(&topic, None).unwrap();
+        let body = rows[0].body.as_deref().unwrap();
+        assert!(!body.contains("super-secret"));
+        let published: MediaRegistration = serde_json::from_str(body).unwrap();
+        assert!(published.shared_account.is_none());
+    }
+
+    #[test]
     fn build_registration_probes_health_and_pins_kind() {
         // Port 1 is unbound → the probe degrades to `down`; the worker still
         // registers the navidrome kind + the configured port (registry is
@@ -342,6 +462,45 @@ mod tests {
         write_shared_registration(&tmp, "", &reg);
         // Nothing written for an empty hostname.
         assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn typed_server_record_round_trips_without_plaintext_credentials() {
+        let record = MediaServerRecord::new(
+            "HTTPS://NAS.LAN:4040/",
+            mesh_media::MediaServerKind::Airsonic,
+            10,
+            mesh_media::MediaServerHealth::Healthy,
+            Some(12),
+            "media/airsonic/nas",
+        )
+        .unwrap();
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(json.contains("\"endpoint\":\"https://nas.lan:4040\""));
+        assert!(json.contains("\"credential_ref\":\"media/airsonic/nas\""));
+        assert!(!json.contains("password"));
+        assert_eq!(mesh_media::parse_media_server_records(&json), vec![record]);
+    }
+
+    #[test]
+    fn legacy_registration_migrates_without_plaintext_account() {
+        let legacy = mesh_media::registration_with_account(
+            "peer:eagle",
+            4533,
+            mesh_media::HEALTH_UP,
+            Some(SharedAccount::new("mesh-user", "super-secret")),
+        );
+        let body = serde_json::to_string(&legacy).unwrap();
+        let records = mesh_media::parse_media_server_records(&body);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].kind, mesh_media::MediaServerKind::Airsonic);
+        assert_eq!(records[0].priority, 0);
+        assert_eq!(records[0].health, mesh_media::MediaServerHealth::Healthy);
+        assert_eq!(records[0].latency, None);
+        assert_eq!(records[0].credential_ref, "media/airsonic/peer-eagle");
+        assert!(!serde_json::to_string(&records[0])
+            .unwrap()
+            .contains("super-secret"));
     }
 
     // ── MEDIA-8: the shared account read from the media-spaces secret ──

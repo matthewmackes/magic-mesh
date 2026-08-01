@@ -175,6 +175,17 @@ fn drm_proof_logical_width() -> Option<f32> {
     (width.is_finite() && width >= 320.0).then_some(width)
 }
 
+/// Optional direct-DRM proof settle window for surfaces whose first frame starts
+/// an asynchronous load or an expressive route transition. Production never
+/// sets this proof-only variable; a zero value preserves the historical first
+/// rendered-frame capture behavior.
+fn drm_proof_settle() -> Duration {
+    std::env::var("MDE_DRM_PROOF_SETTLE_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map_or(Duration::ZERO, |ms| Duration::from_millis(ms.min(10_000)))
+}
+
 /// Capture the actual EGL back buffer as CPU-linear RGBA for direct-DRM proof.
 ///
 /// This is deliberately opt-in and runs before `eglSwapBuffers`: the pixels are
@@ -1629,6 +1640,9 @@ pub fn run_drm_with_clipboard(
     let input_proof = drm_input_proof_enabled();
     let proof_logical_width = drm_proof_logical_width();
     let proof_readback_path = std::env::var_os("MDE_DRM_PROOF_READBACK").map(PathBuf::from);
+    let proof_readback_after = proof_readback_path
+        .as_ref()
+        .map(|_| Instant::now() + drm_proof_settle());
     let mut proof_readback_written = false;
     // Modifier state: updated on each KeyDown/KeyUp before feeding egui Key events.
     let mut shift = false;
@@ -2180,9 +2194,15 @@ pub fn run_drm_with_clipboard(
             &full_output.textures_delta,
         );
         if let Some(path) = proof_readback_path.as_deref() {
-            if !proof_readback_written {
+            let settled = proof_readback_after.is_none_or(|deadline| Instant::now() >= deadline);
+            if !proof_readback_written && settled {
                 drm_proof_readback(&gl, wp, hp, path, gbm_format)?;
                 proof_readback_written = true;
+            } else if !proof_readback_written {
+                let remaining = proof_readback_after
+                    .and_then(|deadline| deadline.checked_duration_since(Instant::now()))
+                    .unwrap_or_default();
+                egui_ctx.request_repaint_after(remaining.min(Duration::from_millis(16)));
             }
         }
         egl.swap_buffers(display, surface).map_err(egl_err)?;

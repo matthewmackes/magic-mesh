@@ -3001,7 +3001,7 @@ fn run_serve(
 
         spawn_broker_terminal_workers(&mut sup, &worker_names, role_rank, &workgroup_root);
 
-        spawn_browser_workers(&mut sup, &worker_names, role_rank, &node_id, &workgroup_root);
+        spawn_bookmark_workers(&mut sup, &worker_names, role_rank, &node_id, &workgroup_root);
 
         spawn_desktop_discovery_workers(&mut sup, &worker_names, role_rank, &node_id, &workgroup_root);
 

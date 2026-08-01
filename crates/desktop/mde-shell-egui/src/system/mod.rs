@@ -1965,6 +1965,15 @@ impl WallpaperServiceConfig {
         mde_bus::client_data_dir().map(|d| d.join(WALLPAPER_CACHE_SUBDIR))
     }
 
+    /// Return the only wallpaper asset the shell may render: the cached Bing
+    /// daily picture. The configured path is metadata only; resolving the
+    /// canonical cache location prevents a migrated or corrupted settings file
+    /// from making the shell read an arbitrary local path.
+    pub(crate) fn bing_wallpaper_path() -> Option<PathBuf> {
+        let path = Self::cache_dir()?.join(BING_DAILY_IMAGE_FILE);
+        path.is_file().then_some(path)
+    }
+
     fn load_from(path: &Path) -> Self {
         read_bounded_local_config(path)
             .and_then(|s| serde_json::from_str::<Self>(&s).ok())
@@ -2000,6 +2009,11 @@ impl WallpaperServiceConfig {
         self.last_image_copyright = result.copyright.clone();
         self.last_updated_ms = result.fetched_at_ms;
     }
+}
+
+/// The shell backdrop's narrow read-only seam for the canonical Bing cache.
+pub(crate) fn bing_wallpaper_path() -> Option<PathBuf> {
+    WallpaperServiceConfig::bing_wallpaper_path()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -94,8 +94,6 @@ use std::time::{Duration, Instant};
 use mde_egui::search_omnibox::SearchItem;
 use mde_egui::{eframe, egui, run_client, LayoutProfile, Motion, Style};
 use mde_theme::brand::icons::IconId;
-use mde_web_preview_client::MediaTransportAction;
-
 use mde_seat::hotkeys::HotkeyAction;
 use mde_seat::{Probe, SeatSnapshot};
 
@@ -111,6 +109,7 @@ use mde_music_egui::{music_header, music_panel, music_pump, MusicApp};
 use mde_term_egui::{real_terminal, terminal_panel, terminal_pump, TerminalSurface};
 
 use surfaces::Surface;
+use web::MediaTransportAction;
 // CURTAIN-3 — the logind lock-signal receive seam, so `render` can poll the
 // listener source for `loginctl lock-session` (the trait's `poll`).
 use lock_signal::LockSignals;
@@ -721,6 +720,24 @@ fn paint_car_speedometer(painter: &egui::Painter, rect: egui::Rect, mph: Option<
 /// edge — the affordance that the slot is one of the driver's *selected*
 /// readouts, tappable to cycle (PLATFORM-INTERFACES Q33). Returns whether it
 /// was tapped — the driver cycling that slot's readout.
+fn fit_car_status_text(painter: &egui::Painter, text: &str, font: egui::FontId, max_width: f32) -> String {
+    let max_width = max_width.max(1.0);
+    let full = painter.layout_no_wrap(text.to_string(), font.clone(), egui::Color32::WHITE);
+    if full.size().x <= max_width {
+        return text.to_string();
+    }
+    let mut shortened = text.to_string();
+    while shortened.chars().count() > 1 {
+        shortened.pop();
+        let candidate = format!("{shortened}\u{2026}");
+        let galley = painter.layout_no_wrap(candidate.clone(), font.clone(), egui::Color32::WHITE);
+        if galley.size().x <= max_width {
+            return candidate;
+        }
+    }
+    "\u{2026}".to_string()
+}
+
 fn paint_car_status_tile(
     ui: &mut egui::Ui,
     painter: &egui::Painter,
@@ -774,18 +791,23 @@ fn paint_car_status_tile(
         ),
     );
     painter.rect_filled(rule, 0.0, accent);
+    let inner_width = (rect.width() - Style::SP_S * 2.0).max(1.0);
+    let label_font = egui::FontId::proportional(Style::TYPE_CAPTION);
+    let value_font = egui::FontId::proportional(Style::TYPE_CALLOUT);
+    let label = fit_car_status_text(painter, label, label_font.clone(), inner_width);
+    let value = fit_car_status_text(painter, value, value_font.clone(), inner_width);
     painter.text(
         rect.left_top() + egui::vec2(Style::SP_S, Style::SP_XS),
         egui::Align2::LEFT_TOP,
         label,
-        egui::FontId::proportional(Style::TYPE_CAPTION),
+        label_font,
         Style::resolve_color(ui.ctx(), Style::TEXT_DIM),
     );
     painter.text(
         egui::pos2(rect.center().x, rect.bottom() - Style::SP_S),
         egui::Align2::CENTER_BOTTOM,
         value,
-        egui::FontId::proportional(Style::TYPE_CALLOUT),
+        value_font,
         Style::resolve_color(ui.ctx(), Style::TEXT_STRONG),
     );
     resp.clicked()
@@ -1063,11 +1085,9 @@ struct Shell {
     /// the formfactor (fed from the publisher above) is Tablet and a text field has
     /// focus, injecting key presses into the same egui input pipeline. Inert on Laptop.
     keyboard: keyboard::Keyboard,
-    /// The Browser surface (BOOKMARKS-6) — the sandboxed `mde-web-preview` Servo
-    /// helper driven over the per-session IPC socket and displayed by uploading its
-    /// shm frames to an egui texture (`mde-web-preview-client`). Holds no live tab
-    /// until the gated `live-helper` spawn attaches one; the panel shows its honest
-    /// gated EmptyState until then, exactly like the VDI Desktop surface.
+    /// The Browser surface — a thin host controller for the dedicated
+    /// `browser-vm` workload and its VDI attachment. Guest Chromium and its UI
+    /// remain outside Construct.
     web: web::WebState,
     /// Browser-owned freedesktop MPRIS adapter. It exposes the Browser's retained
     /// now-playing Bus mirror as `org.mpris.MediaPlayer2.mde-browser` and routes
@@ -1638,7 +1658,7 @@ impl Shell {
     fn mount_status_bar_slot(&mut self, ctx: &egui::Context) {
         let immersive_vdi = self.immersive_vdi();
         let (_, top_alpha) = self.nav_bar.chrome_alphas(Instant::now());
-        status_bar::mount_top(
+        status_bar::mount_top_with_active(
             ctx,
             &mut self.construct,
             self.notify_status.segments(),
@@ -1649,7 +1669,13 @@ impl Shell {
                 immersive_app: immersive_vdi || self.nav.surface == Surface::MapsLocation,
             },
             top_alpha,
+            Some(self.nav.surface),
         );
+        if let Some(surface) = self.construct.take_workspace_tray_target() {
+            self.nav.expanded = true;
+            self.nav.surface = surface;
+            self.normalize_surface_aliases();
+        }
     }
 
     /// The app switcher (Q16 — the snapshot-preview card grid), landed as
@@ -1832,23 +1858,28 @@ impl Shell {
 
         let mut tab = self.fleet_mesh_tab;
         ui.push_id("shell-fleet-mesh", |ui| {
-            // The three shell views are workspace navigation, not a second
-            // content rail. Keep them available from the shared View menu so
-            // the State of the Mesh surface has one clear top-level hierarchy.
-            ui.horizontal(|ui| {
-                ui.menu_button("View", |ui| {
-                    for (candidate, label) in [
-                        (FleetMeshTab::Workbench, "Workbench"),
-                        (FleetMeshTab::MeshMap, "Mesh Map"),
-                        (FleetMeshTab::Explorer, "Explorer"),
-                    ] {
-                        if ui.radio_value(&mut tab, candidate, label).clicked() {
-                            ui.close_menu();
+            // Workbench owns the shared MenuBar, including its View menu. Do
+            // not mount the legacy Fleet & Mesh wrapper menu above it: at
+            // narrow/large-text sizes that produced a detached duplicate
+            // `View` button before the real STATE OF THE MESH bar. The sibling
+            // Mesh Map and Explorer views still need this lightweight switcher
+            // because they do not expose the Workbench plane menu.
+            if tab != FleetMeshTab::Workbench {
+                ui.horizontal(|ui| {
+                    ui.menu_button("View", |ui| {
+                        for (candidate, label) in [
+                            (FleetMeshTab::Workbench, "Workbench"),
+                            (FleetMeshTab::MeshMap, "Mesh Map"),
+                            (FleetMeshTab::Explorer, "Explorer"),
+                        ] {
+                            if ui.radio_value(&mut tab, candidate, label).clicked() {
+                                ui.close_menu();
+                            }
                         }
-                    }
+                    });
                 });
-            });
-            ui.separator();
+                ui.separator();
+            }
             match tab {
                 FleetMeshTab::Workbench => {
                     workbench::show(
@@ -2153,55 +2184,13 @@ impl Shell {
                 });
             }
             Surface::Browser => {
-                // The sandboxed Servo browser (BOOKMARKS-6) — the `mde-web-preview`
-                // helper driven over IPC and displayed by uploading its shm frames
-                // to an egui texture. Scoped under its own `push_id` like every
-                // mounted surface. The panel polls + drives its own tabs.
-                //
-                // `live-helper`: on first open, spawn the sandboxed helper as a live
-                // tab, honest-gated to a usable seat (a real seat has been probed) +
-                // an installed helper binary — else a NAMED honest notice, never a
-                // fake page (§7). The default build keeps no live tab and shows the
-                // gated EmptyState.
-                #[cfg(feature = "live-helper")]
-                {
-                    let seat_present = self.system.snapshot().is_some();
-                    // Record the live seat size so the first helper spawn pre-sizes
-                    // its frame channel to the real screen (browser-1, item 3).
-                    self.web.note_seat_px(ui.ctx());
-                    self.web.ensure_live_tab(seat_present);
-                }
-                if self.web.wants_file_omnibox_items() {
-                    let file_omnibox_items = self.files.unified_search_omnibox_items();
-                    self.web.set_file_omnibox_items(file_omnibox_items);
-                }
                 let web = &mut self.web;
                 ui.push_id("shell-web", |ui| {
-                    // Construct owns the browser connection/unavailable and
-                    // diagnostic boundary; the guest viewport remains guest-owned.
                     web::web_panel(ui, web);
                 });
                 if self.web.take_bookmarks_manager_request() {
                     self.nav.surface = Surface::Bookmarks;
                 }
-                // First-class tabs: the Browser panel owns the visible `+` button;
-                // the live-helper shell arm owns the real helper spawn.
-                #[cfg(feature = "live-helper")]
-                {
-                    let seat_present = self.system.snapshot().is_some();
-                    self.web.drain_live_tab_requests(seat_present);
-                }
-                // Respawn-on-reload: a crashed tab's Reload asked to restart. Under
-                // `live-helper` the shell swaps in a fresh live session; the default
-                // build drains the flag honestly (no live tab exists, so it is inert
-                // — never a faked page, §7).
-                let restart_requested = self.web.take_respawn_request();
-                #[cfg(feature = "live-helper")]
-                if restart_requested {
-                    self.web.respawn_live();
-                }
-                #[cfg(not(feature = "live-helper"))]
-                let _ = restart_requested;
             }
             Surface::Bookmarks => {
                 let bookmarks = &mut self.bookmarks;
@@ -3118,7 +3107,9 @@ impl Shell {
         // is live-gated (Q33): only an ONLINE vehicle-gateway fold yields a
         // reading — the simulated CAN/OBD seed profile paints the honest "—",
         // never its fabricated 27 mph.
-        let gauge_h = (full.height() * 0.42).clamp(120.0, (full.width() - pad * 2.0).max(120.0));
+        let large_text = ui.ctx().zoom_factor() > 1.25;
+        let gauge_h = (full.height() * if large_text { 0.28 } else { 0.42 })
+            .clamp(120.0, (full.width() - pad * 2.0).max(120.0));
         let gauge_rect = egui::Rect::from_min_size(
             egui::pos2(full.left() + pad, full.top() + pad),
             egui::vec2((full.width() - pad * 2.0).max(1.0), gauge_h),
@@ -3135,11 +3126,16 @@ impl Shell {
             return;
         }
         let slots = self.car_status.slots().to_vec();
-        let cols = 2usize;
+        // A narrow large-text seat cannot fit six tall two-column rows above
+        // the taskbar. Three columns keep the same glanceable selection while
+        // giving every tile a bounded vertical slot; labels and values are
+        // elided by `paint_car_status_tile` when the narrower cell needs it.
+        let cols = if large_text { 3usize } else { 2usize };
         let rows = slots.len().div_ceil(cols).max(1);
         let gap = Style::SP_S;
         let cell_w = ((grid.width() - gap * (cols as f32 - 1.0)) / cols as f32).max(1.0);
-        let cell_h = ((grid.height() - gap * (rows as f32 - 1.0)) / rows as f32).clamp(34.0, 108.0);
+        let cell_h = ((grid.height() - gap * (rows as f32 - 1.0)) / rows as f32)
+            .clamp(if large_text { 52.0 } else { 34.0 }, 108.0);
         let mut cycled = None;
         for (idx, item) in slots.iter().enumerate() {
             let c = idx % cols;

@@ -99,6 +99,15 @@ impl<'a> AppFrame<'a> {
         self
     }
 
+    /// Lead-align the title while retaining the shared frame geometry. This is
+    /// useful for compact hub surfaces whose centered title can be visually
+    /// lost beside a dense status/header row at large text scales.
+    #[must_use]
+    pub const fn leading_title(mut self) -> Self {
+        self.navigation = self.navigation.leading_title();
+        self
+    }
+
     /// Add trailing actions to the workspace header.
     #[must_use]
     pub const fn with_actions(mut self, actions: &'a [NavAction<'a>]) -> Self {

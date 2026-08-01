@@ -6,18 +6,12 @@
 //! manually registered LAN AirSonic gateway sources from
 //! `<host>/airsonic-gateway-registry.json`, resolves the selected source's sealed
 //! `credential_ref`, and idempotently writes the desktop user's
-//! `~/.local/share/mde/airsonic-creds.json` with the mesh gateway proxy URL. Only
-//! when no gateway source exists does it fall back to the older shared
-//! `media-registry.json` account path.
-//!
-//! **No legacy media-spaces secret on Workstations** (binding operator decision):
-//! the fallback shared account flows through the SERVICE REGISTRY, not the secret
-//! store. WL-FUNC-014 gateway registrations are different: the replicated source
-//! carries only a sealed `credential_ref`, and this root-owned worker is the
-//! controlled boundary that resolves it into the seated user's client creds. If a
-//! gateway source exists but its credential is absent or malformed, the worker
-//! reports that honestly and does **not** silently configure the legacy
-//! `music.mesh` account over the operator's gateway intent.
+//! `~/.local/share/mde/airsonic-creds.json` with the selected mesh gateway URL.
+//! The replicated source record never carries username/password material; this
+//! root-owned worker is the controlled boundary that resolves the secret-store
+//! reference into the seated user's local client credentials. If a source exists
+//! but its credential is absent or malformed, the worker reports that honestly
+//! and does not publish or synthesize credentials.
 //!
 //! **Writes to the DESKTOP user's home, not root's.** `mackesd` runs as root, so
 //! `$HOME` is `/root` — useless to the seated user's `mde-music`. The worker
@@ -44,12 +38,10 @@ use async_trait::async_trait;
 
 use super::{ShutdownToken, Worker};
 use crate::ipc::secret_store::{repo_root, SecretStore};
-use crate::mesh_media::{self, AirsonicGatewaySource, SharedAccount};
+use crate::mesh_media::{self, AirsonicGatewaySource, MediaServerHealth, MediaServerRecord};
 
-/// 60 s reconcile tick — matches `app_sync` / `remmina_sync`. The published
-/// account is slow-changing (a shared mesh credential); 60 s picks up a newly
-/// serving Lighthouse_Media node well within a fresh-node bring-up without a
-/// tight loop.
+/// 60 s reconcile tick — matches `app_sync` / `remmina_sync`. This picks up a
+/// newly enrolled local-network Airsonic source without a tight loop.
 pub const TICK_INTERVAL_S: u64 = 60;
 
 /// The lowest "real" (non-system) uid — the seated desktop user on a Workstation.
@@ -68,6 +60,9 @@ const CREDS_REL_PATH: &str = ".local/share/mde/airsonic-creds.json";
 /// changed it" (live != marker) and back off in the latter case. Lives beside
 /// the creds file.
 const MARKER_REL_PATH: &str = ".local/share/mde/.airsonic-creds.auto";
+
+const MAX_MEDIA_RECORD_BYTES: u64 = 64 * 1024;
+const MEDIA_REGISTRY_FILE: &str = "media-registry.json";
 
 /// The uid-1000 desktop user's `(uid, gid, home)` from `/etc/passwd`. `None` on a
 /// headless box with no seated user (the worker then no-ops — nothing to
@@ -95,22 +90,6 @@ fn parse_desktop_user(passwd: &str, uid: u32) -> Option<(u32, u32, PathBuf)> {
         }
     }
     None
-}
-
-/// The on-disk creds JSON for a shared account, in the EXACT shape
-/// `mde-musicd::creds::Creds` (de)serializes (`server_url` / `username` /
-/// `password`, pretty-printed) — so `mde-music` reads it back as valid creds and
-/// auto-browses. Built here (rather than depending on the GUI crate's writer) to
-/// keep the mesh worker decoupled from the desktop binary; the field names are
-/// the contract, pinned by a test.
-fn creds_json(account: &SharedAccount) -> String {
-    // serde_json::json! keeps the exact `Creds` field names + a stable order.
-    let v = serde_json::json!({
-        "server_url": account.server,
-        "username": account.username,
-        "password": account.password,
-    });
-    serde_json::to_string_pretty(&v).expect("creds JSON is plain")
 }
 
 /// The plaintext body stored under an AirSonic gateway source's sealed
@@ -158,6 +137,87 @@ fn gateway_creds_json(source: &AirsonicGatewaySource, secret_body: &str) -> Resu
         "password": sealed.password,
     });
     serde_json::to_string_pretty(&v).map_err(|e| format!("serialize gateway creds: {e}"))
+}
+
+/// Read only the new credential-free Media server record shape. Legacy
+/// `MediaRegistration` files remain the compatibility gateway path and are
+/// deliberately not treated as versioned operator records here.
+fn read_media_server_records_from_plane(workgroup_root: &Path) -> Vec<MediaServerRecord> {
+    let Ok(entries) = std::fs::read_dir(workgroup_root) else {
+        return Vec::new();
+    };
+    let mut records = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path().join(MEDIA_REGISTRY_FILE);
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_file() || metadata.len() > MAX_MEDIA_RECORD_BYTES {
+            continue;
+        }
+        let Ok(body) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        if let Ok(record) = serde_json::from_str::<MediaServerRecord>(&body) {
+            if let Some(record) = record.validated() {
+                records.push(record);
+            }
+        } else if let Ok(roster) = serde_json::from_str::<Vec<MediaServerRecord>>(&body) {
+            records.extend(roster.into_iter().filter_map(|record| record.validated()));
+        }
+    }
+    records
+}
+
+fn media_health_rank(health: MediaServerHealth) -> u8 {
+    match health {
+        MediaServerHealth::Healthy => 0,
+        MediaServerHealth::Degraded => 1,
+        MediaServerHealth::Unavailable => 2,
+    }
+}
+
+fn media_server_creds_json(record: &MediaServerRecord, secret_body: &str) -> Result<String, String> {
+    let sealed: SealedAirsonicCreds = serde_json::from_str(secret_body)
+        .map_err(|e| format!("parse sealed Media credential: {e}"))?;
+    let username = sealed.username.trim();
+    if username.is_empty() || username != sealed.username {
+        return Err("sealed Media credential username must be non-empty and trimmed".to_string());
+    }
+    let value = serde_json::json!({
+        "server_url": record.endpoint,
+        "username": username,
+        "password": sealed.password,
+    });
+    serde_json::to_string_pretty(&value).map_err(|e| format!("serialize Media creds: {e}"))
+}
+
+fn materialized_media_server_creds(
+    records: &[MediaServerRecord],
+    mut read_secret: impl FnMut(&str) -> Result<Option<String>, String>,
+) -> Result<Option<MaterializedGatewayCreds>, String> {
+    let Some(record) = records
+        .iter()
+        .filter(|record| !record.credential_ref.is_empty())
+        .min_by_key(|record| {
+            (
+                media_health_rank(record.health),
+                record.priority,
+                record.latency.unwrap_or(u32::MAX),
+                record.endpoint.as_str(),
+            )
+        })
+    else {
+        return Ok(None);
+    };
+    let secret_body = read_secret(&record.credential_ref)
+        .map_err(|e| format!("read sealed Media credential {}: {e}", record.credential_ref))?
+        .ok_or_else(|| format!("sealed Media credential {} is absent", record.credential_ref))?;
+    let body = media_server_creds_json(record, &secret_body)?;
+    Ok(Some(MaterializedGatewayCreds {
+        body,
+        source_url: record.endpoint.clone(),
+    }))
 }
 
 /// Select the best gateway source for this tick and resolve its sealed
@@ -271,23 +331,10 @@ fn reconcile_desired(
     }
 }
 
-/// One reconcile cycle against `home` (the desktop user's home) + the discovered
-/// `account` (`None` = no service published yet → nothing to do). `owner` chowns
-/// the written files to the desktop user. Returns whether a write happened
-/// (for the worker's log line + the tests). Best-effort: an I/O error is logged,
-/// never fatal.
-fn reconcile(home: &Path, account: Option<&SharedAccount>, owner: Option<(u32, u32)>) -> bool {
-    let Some(account) = account else {
-        return false;
-    };
-    let desired = creds_json(account);
-    reconcile_desired(home, Some(&desired), owner, &account.server)
-}
-
 /// Reconcile AirSonic gateway sources into the desktop user's client creds.
 /// Presence of any gateway source means WL-FUNC-014 owns this tick: missing or
-/// malformed sealed credentials are surfaced and do not fall back to the legacy
-/// `music.mesh` account.
+/// malformed sealed credentials are surfaced and do not synthesize a fallback
+/// account.
 fn reconcile_gateway_sources(
     home: &Path,
     sources: &[AirsonicGatewaySource],
@@ -326,27 +373,43 @@ fn chown_owned(path: &Path, owner: Option<(u32, u32)>) {
     let _ = (path, owner);
 }
 
-/// Full cycle: resolve the desktop user + the published shared account, then
-/// reconcile the creds file. No-op (logs nothing) when there's no desktop user
-/// or no service is published yet.
+/// Full cycle: resolve the desktop user + the selected replicated Airsonic
+/// source, resolve its secret-store reference, and reconcile the local creds
+/// file. No-op when there's no desktop user or no source is published yet.
 fn run_once(workgroup_root: &Path) -> bool {
     let Some((uid, gid, home)) = desktop_user() else {
         return false;
     };
-    let gateway_sources = mesh_media::read_airsonic_gateway_sources_from_plane(workgroup_root);
-    if !gateway_sources.is_empty() {
-        let store = SecretStore::resolve(&repo_root(), workgroup_root);
-        return reconcile_gateway_sources(&home, &gateway_sources, Some((uid, gid)), |cred_ref| {
-            store.get(cred_ref)
-        });
+    let store = SecretStore::resolve(&repo_root(), workgroup_root);
+    let records = read_media_server_records_from_plane(workgroup_root);
+    if !records.is_empty() {
+        return match materialized_media_server_creds(&records, |cred_ref| store.get(cred_ref)) {
+            Ok(Some(materialized)) => reconcile_desired(
+                &home,
+                Some(&materialized.body),
+                Some((uid, gid)),
+                &materialized.source_url,
+            ),
+            Ok(None) => false,
+            Err(e) => {
+                tracing::warn!(
+                    target: "mackesd::music_autoconfig",
+                    error = %e,
+                    "Media server credential materialization pending"
+                );
+                false
+            }
+        };
     }
-    let account = mesh_media::read_shared_account_from_plane(workgroup_root);
-    reconcile(&home, account.as_ref(), Some((uid, gid)))
+    let sources = mesh_media::read_airsonic_gateway_sources_from_plane(workgroup_root);
+    reconcile_gateway_sources(&home, &sources, Some((uid, gid)), |cred_ref| {
+        store.get(cred_ref)
+    })
 }
 
-/// Workstation music auto-config worker. 60 s tick; each tick reads the published
-/// shared account off the replicated registry plane and idempotently writes the
-/// desktop user's creds.
+/// Workstation music auto-config worker. Each tick reads Airsonic server records
+/// off the replicated registry plane, resolves their secret references, and
+/// idempotently writes the desktop user's local creds.
 pub struct MusicAutoconfigWorker {
     workgroup_root: PathBuf,
     tick: Duration,
@@ -413,10 +476,6 @@ mod tests {
         p
     }
 
-    fn acct(user: &str, pass: &str) -> SharedAccount {
-        SharedAccount::new(user, pass)
-    }
-
     fn gateway_source(
         node: &str,
         upstream: &str,
@@ -443,6 +502,73 @@ mod tests {
         .to_string()
     }
 
+    fn media_record(endpoint: &str, priority: u16, health: MediaServerHealth, reference: &str) -> MediaServerRecord {
+        MediaServerRecord::new(
+            endpoint,
+            mesh_media::MediaServerKind::Airsonic,
+            priority,
+            health,
+            Some(20),
+            reference,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn media_records_are_read_from_the_shared_plane_and_ranked() {
+        let root = tmp_home("media-records");
+        std::fs::create_dir_all(root.join("media-a")).unwrap();
+        std::fs::write(
+            root.join("media-a").join(MEDIA_REGISTRY_FILE),
+            serde_json::to_string(&media_record(
+                "http://media-a.lan:4040",
+                20,
+                MediaServerHealth::Healthy,
+                "media/airsonic/a",
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("media-b")).unwrap();
+        std::fs::write(
+            root.join("media-b").join(MEDIA_REGISTRY_FILE),
+            serde_json::to_string(&media_record(
+                "http://media-b.lan:4040",
+                1,
+                MediaServerHealth::Degraded,
+                "media/airsonic/b",
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let records = read_media_server_records_from_plane(&root);
+        let materialized = materialized_media_server_creds(&records, |reference| {
+            assert_eq!(reference, "media/airsonic/a");
+            Ok(Some(sealed_airsonic_creds("mesh-readonly", "hunter2")))
+        })
+        .unwrap()
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&materialized.body).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(value["server_url"], "http://media-a.lan:4040");
+        assert_eq!(value["username"], "mesh-readonly");
+        assert!(!materialized.body.contains("credential_ref"));
+    }
+
+    #[test]
+    fn media_record_without_secret_does_not_materialize_or_fallback() {
+        let record = media_record(
+            "http://media-a.lan:4040",
+            1,
+            MediaServerHealth::Healthy,
+            "media/airsonic/a",
+        );
+        let result = materialized_media_server_creds(&[record], |_reference| Ok(None));
+        assert!(result.is_err());
+    }
+
     #[test]
     fn worker_name_is_music_autoconfig() {
         assert_eq!(build().name(), "music_autoconfig");
@@ -461,21 +587,6 @@ mod tests {
             parse_desktop_user("root:x:0:0::/root:/bin/sh\n", 1000),
             None
         );
-    }
-
-    #[test]
-    fn creds_json_is_the_mde_musicd_creds_shape() {
-        // The written JSON must carry EXACTLY the `mde_musicd::creds::Creds`
-        // field names (`server_url`/`username`/`password`) or mde-music wouldn't
-        // read it as valid creds (it'd show the first-run form). We pin the wire
-        // shape here rather than depend on the GUI crate (it pulls reqwest).
-        let json = creds_json(&acct("mesh-music", "hunter2"));
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["server_url"], "http://music.mesh:4533");
-        assert_eq!(v["username"], "mesh-music");
-        assert_eq!(v["password"], "hunter2");
-        // No extra/renamed fields that a strict Creds deserialize would reject.
-        assert_eq!(v.as_object().unwrap().len(), 3);
     }
 
     #[test]
@@ -622,98 +733,37 @@ mod tests {
 
     #[test]
     fn decide_writes_when_absent() {
-        let desired = creds_json(&acct("u", "p"));
         assert_eq!(
-            decide(&desired, None, None),
-            WriteDecision::Write(desired.clone())
+            decide("desired", None, None),
+            WriteDecision::Write("desired".to_string())
         );
     }
 
     #[test]
     fn decide_skips_when_already_configured() {
-        let desired = creds_json(&acct("u", "p"));
-        // Live file already equals the desired creds → idempotent no-op.
-        assert_eq!(decide(&desired, Some(&desired), None), WriteDecision::Skip);
+        assert_eq!(
+            decide("desired", Some("desired"), None),
+            WriteDecision::Skip
+        );
     }
 
     #[test]
     fn decide_does_not_clobber_a_user_set_file() {
-        let desired = creds_json(&acct("mesh-music", "p"));
-        let user_set = creds_json(&acct("my-own-server-user", "myp"));
-        // The user set their own creds (no marker, or a stale marker) → back off.
-        assert_eq!(decide(&desired, Some(&user_set), None), WriteDecision::Skip);
-        // Even with a marker, if the live file diverged from it the user owns it.
-        let stale_marker = creds_json(&acct("mesh-music", "old"));
         assert_eq!(
-            decide(&desired, Some(&user_set), Some(&stale_marker)),
+            decide("desired", Some("user-set"), None),
+            WriteDecision::Skip
+        );
+        assert_eq!(
+            decide("desired", Some("user-set"), Some("stale")),
             WriteDecision::Skip
         );
     }
 
     #[test]
     fn decide_refreshes_a_file_we_own_when_creds_rotate() {
-        // We last wrote `old`; the shared password rotated to `new`. The live
-        // file still matches our marker (we own it) → safe to update.
-        let old = creds_json(&acct("mesh-music", "old"));
-        let new = creds_json(&acct("mesh-music", "new"));
         assert_eq!(
-            decide(&new, Some(&old), Some(&old)),
-            WriteDecision::Write(new.clone())
+            decide("new", Some("old"), Some("old")),
+            WriteDecision::Write("new".to_string())
         );
-    }
-
-    // ── reconcile end-to-end against a temp home ──
-
-    #[test]
-    fn reconcile_writes_creds_and_marker_when_account_appears() {
-        let home = tmp_home("write");
-        let wrote = reconcile(&home, Some(&acct("mesh-music", "p")), None);
-        let creds = std::fs::read_to_string(home.join(CREDS_REL_PATH)).unwrap();
-        let marker_exists = home.join(MARKER_REL_PATH).is_file();
-        let _ = std::fs::remove_dir_all(&home);
-        assert!(wrote, "first appearance auto-configures");
-        assert!(marker_exists, "marker recorded so we know we own the file");
-        let v: serde_json::Value = serde_json::from_str(&creds).unwrap();
-        assert_eq!(v["server_url"], "http://music.mesh:4533");
-        assert_eq!(v["username"], "mesh-music");
-    }
-
-    #[test]
-    fn reconcile_is_idempotent_across_ticks() {
-        let home = tmp_home("idem");
-        let a = acct("mesh-music", "p");
-        assert!(reconcile(&home, Some(&a), None), "first tick writes");
-        // Second tick: nothing changed → no write.
-        assert!(
-            !reconcile(&home, Some(&a), None),
-            "second tick is a no-op (already configured)"
-        );
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn reconcile_does_not_overwrite_user_set_creds() {
-        let home = tmp_home("userset");
-        // Simulate the user having set their own creds via the Workbench panel:
-        // a creds file with NO marker (the worker never wrote it).
-        let creds_path = home.join(CREDS_REL_PATH);
-        std::fs::create_dir_all(creds_path.parent().unwrap()).unwrap();
-        let user_body = creds_json(&acct("my-server", "mine"));
-        std::fs::write(&creds_path, &user_body).unwrap();
-        let wrote = reconcile(&home, Some(&acct("mesh-music", "p")), None);
-        let after = std::fs::read_to_string(&creds_path).unwrap();
-        let _ = std::fs::remove_dir_all(&home);
-        assert!(!wrote, "must not clobber the user's file");
-        assert_eq!(after, user_body, "user's creds left intact");
-    }
-
-    #[test]
-    fn reconcile_noop_when_no_account_published() {
-        let home = tmp_home("noacct");
-        let wrote = reconcile(&home, None, None);
-        let exists = home.join(CREDS_REL_PATH).exists();
-        let _ = std::fs::remove_dir_all(&home);
-        assert!(!wrote);
-        assert!(!exists, "no service published → no creds written");
     }
 }

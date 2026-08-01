@@ -665,8 +665,9 @@ impl PhonesHubState {
         let name = self.endpoint_name();
         let paired = self.devices.len();
         let online = self.devices.iter().filter(|d| d.online).count();
-        let _ = AppFrame::new("Phones").show(ui);
+        let _ = AppFrame::new("Phones").leading_title().show(ui);
         ui.horizontal_wrapped(|ui| {
+            ui.add_space(Style::SP_M);
             ui.colored_label(
                 Style::ACCENT_COMMS,
                 RichText::new(format!("{paired} paired")).size(Style::SMALL),
@@ -676,11 +677,14 @@ impl PhonesHubState {
                 RichText::new(format!("{online} online")).size(Style::SMALL),
             );
         });
-        ui.colored_label(
-            Style::TEXT_DIM,
-            RichText::new(format!("this mesh appears to your phone as \u{201C}{name}\u{201D}"))
-                .size(Style::SMALL),
-        );
+        ui.horizontal(|ui| {
+            ui.add_space(Style::SP_M);
+            ui.colored_label(
+                Style::TEXT_DIM,
+                RichText::new(format!("this mesh appears to your phone as \u{201C}{name}\u{201D}"))
+                    .size(Style::SMALL),
+            );
+        });
     }
 
     /// The KDE Connect device name the phone sees: the "Construct Mesh" endpoint name

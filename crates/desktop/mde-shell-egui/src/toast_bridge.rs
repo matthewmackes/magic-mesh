@@ -239,6 +239,10 @@ fn surface_by_name(name: &str) -> Option<Surface> {
         "music" => Some(Surface::Music),
         "files" => Some(Surface::Files),
         "browser" => Some(Surface::Browser),
+        // Car boots into the governed AutoHome dashboard; keep both the
+        // operator-facing profile name and the concrete surface name usable by
+        // proof/deep-link callers.
+        "car" | "auto-home" | "autohome" => Some(Surface::AutoHome),
         "bookmarks" | "bookmark-manager" => Some(Surface::Bookmarks),
         "maps" | "location" | "maps-location" | "mapslocation" => Some(Surface::MapsLocation),
         // WL-FUNC-011 Phase-2 — the retired Chat / Voice / Editor surfaces folded
@@ -680,6 +684,8 @@ mod tests {
         assert_eq!(surface_by_name("SYSTEM"), Some(Surface::System));
         assert_eq!(surface_by_name("This-Node"), Some(Surface::ThisNode));
         assert_eq!(surface_by_name("Mesh-Teams"), Some(Surface::Communications));
+        assert_eq!(surface_by_name("car"), Some(Surface::AutoHome));
+        assert_eq!(surface_by_name("AUTO-HOME"), Some(Surface::AutoHome));
         assert_eq!(plane_by_name("ThisNode"), Some(Plane::ThisNode));
     }
 

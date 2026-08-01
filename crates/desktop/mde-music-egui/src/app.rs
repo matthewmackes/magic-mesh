@@ -18,7 +18,9 @@ use mde_musicd::airsonic::{Album, Client, Song};
 use mde_musicd::creds;
 
 use crate::menubar::{self, MenuAction, MenuContext, NowPlaying};
-use crate::model::{album_subtitle, format_duration, Command, Fetch, MusicState, Update};
+use crate::model::{
+    album_subtitle, format_duration, Command, Fetch, MusicState, SeatServer, Update,
+};
 use crate::worker;
 
 /// The music surface: the view-model plus the channels to its worker thread.
@@ -56,11 +58,15 @@ impl MusicApp {
         let mut state = MusicState::new();
         match creds::load() {
             Ok(c) => {
-                let client = Client::new(c.server_url, c.username, &c.password);
-                let server = client.base_url().to_string();
-                let commands = worker::spawn(client, ctx.clone(), update_tx);
+                let connections = seat_connections(&c);
+                let server = connections
+                    .first()
+                    .map_or_else(String::new, |(_, client)| client.base_url().to_string());
+                let servers = connections.iter().map(|(seat, _)| seat.clone()).collect();
+                let commands = worker::spawn(connections, ctx.clone(), update_tx);
                 let _ = commands.send(Command::LoadLibrary);
                 state.albums = Fetch::Loading;
+                state.servers = servers;
                 Self {
                     state,
                     commands: Some(commands),
@@ -163,6 +169,22 @@ impl MusicApp {
             Fetch::Failed(e) => {
                 ui.colored_label(Style::DANGER, format!("Couldn't load the library: {e}"));
             }
+            Fetch::Cached(albums) if albums.is_empty() => {
+                centered_state(ui, false, "The music server is offline and the cached library is empty.");
+            }
+            Fetch::Cached(albums) => {
+                ui.colored_label(Style::TEXT_DIM, "Offline — showing cached library");
+                ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for album in albums {
+                            if album_row(ui, album).clicked() {
+                                to_open = Some(album.clone());
+                            }
+                            ui.add_space(Style::SP_XS);
+                        }
+                    });
+            }
             Fetch::Ready(albums) if albums.is_empty() => {
                 centered_state(ui, false, "This server has no albums yet.");
             }
@@ -224,6 +246,19 @@ impl MusicApp {
                 Fetch::Failed(e) => {
                     ui.colored_label(Style::DANGER, format!("Couldn't load tracks: {e}"));
                 }
+                Fetch::Cached(songs) => {
+                    ui.colored_label(Style::TEXT_DIM, "Offline — showing cached tracks");
+                    ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            for (i, song) in songs.iter().enumerate() {
+                                if track_row(ui, i, song).clicked() {
+                                    to_play = Some(song.clone());
+                                }
+                                ui.add_space(Style::SP_XS);
+                            }
+                        });
+                }
                 Fetch::Ready(songs) if songs.is_empty() => {
                     centered_state(ui, false, "This album has no tracks.");
                 }
@@ -253,6 +288,31 @@ impl MusicApp {
     }
 }
 
+/// Build the per-seat candidate set without changing the shared credential
+/// contract. `MDE_MUSIC_SEATS` is an optional operator-owned list of
+/// `seat|http(s)-url|priority` entries separated by `;`; the stored server is
+/// always retained as the local/default candidate.
+fn seat_connections(c: &mde_musicd::creds::Creds) -> Vec<(SeatServer, Client)> {
+    let mut specs = vec![(SeatServer::new("local", c.server_url.clone()), c.server_url.clone())];
+    if let Ok(raw) = std::env::var("MDE_MUSIC_SEATS") {
+        for item in raw.split(';').filter(|item| !item.trim().is_empty()) {
+            let mut fields = item.split('|');
+            let (Some(seat), Some(url)) = (fields.next(), fields.next()) else { continue };
+            if !(url.starts_with("http://") || url.starts_with("https://")) { continue }
+            let mut server = SeatServer::new(seat.trim(), url.trim());
+            server.operator_priority = fields.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+            specs.push((server, url.trim().to_string()));
+        }
+    }
+    specs
+        .into_iter()
+        .map(|(mut server, url)| {
+            if server.seat == "local" { server.operator_priority = 0; }
+            (server, Client::new(url, c.username.clone(), &c.password))
+        })
+        .collect()
+}
+
 /// Render the music surface's central content into the given `ui`.
 ///
 /// Draws the honest "connect a server" state when no credentials are configured,
@@ -270,6 +330,37 @@ pub fn music_panel(ui: &mut egui::Ui, app: &mut MusicApp) {
     if let Some(detail) = &app.setup_error {
         render_setup_needed(ui, detail);
         return;
+    }
+    if app.state.servers.len() > 1 {
+        let servers = app.state.servers.clone();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Seat server").color(Style::TEXT_DIM));
+            for server in servers {
+                let selected = app
+                    .state
+                    .selected_server
+                    .as_ref()
+                    .is_some_and(|current| current.seat == server.seat);
+                if ui.selectable_label(selected, &server.seat).clicked() {
+                    app.send(Command::SelectServer(server.seat));
+                }
+            }
+        });
+    }
+    if let Some(request) = app.state.failover.clone() {
+        ui.horizontal(|ui| {
+            ui.colored_label(
+                Style::ACCENT_MEDIA,
+                format!("{} → {}: {}", request.from, request.to, request.reason),
+            );
+            if ui.button("Approve failover").clicked() {
+                app.send(Command::ApproveFailover);
+            }
+            if ui.button("Keep current").clicked() {
+                app.send(Command::RejectFailover);
+                app.state.failover = None;
+            }
+        });
     }
     // A transient playback/engine error (e.g. no sound device on a headless
     // host) — rendered, not swallowed.

@@ -21,14 +21,6 @@ path = "src/main.rs"
 # DRM master is present.
 drm = ["mde-egui/drm"]
 
-# BOOKMARKS-6 live path — turn on the client crate's `live-helper` spawn API so the
-# Browser surface really `Command::spawn`s the sandboxed `mde-web-preview` helper on
-# first open (honest-gated to a usable seat + an installed helper binary). OFF by
-# default so the default build stays portable and the surface shows its honest gated
-# EmptyState; ON, the surface renders a live sandboxed Servo page (§7). Mirrors the
-# client crate's own `live-helper` gate, exactly as the VDI crates gate live-connect.
-live-helper = ["mde-web-preview-client/live-helper"]
-
 # E12-5 live VDI path — turn on the RDP crate's live IronRDP transport so the
 # Desktop surface can attach a sealed external RDP endpoint and pump frames/input
 # in-shell. OFF by default for portable unit builds; ON for shipped shell builds.
@@ -88,6 +80,10 @@ mackes-mesh-types = { path = "../../mesh/mackes-mesh-types" }
 # tier edge (§6 — the layered-tiers gate only flags outward workspace deps).
 # CHOOSER-3 reuses the same decoder for the Chooser card thumbnails (`chooser.rs`).
 png = "0.18"
+
+# Bing's daily picture is served as JPEG in production; keep the decoder
+# format-aware instead of treating a successful download as a PNG.
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
 
 # CHOOSER-3 — the Desktop Chooser's periodic preview thumbnails travel inline in
 # the `state/desktops/sources` record as `data:image/png;base64,…` snapshot refs
@@ -211,15 +207,6 @@ zbus = { version = "5", default-features = false, features = ["tokio", "blocking
 # control remains on mde-bus; tokio is only the zbus runtime surface.
 tokio = { version = "1", features = ["rt", "time"] }
 
-# BOOKMARKS-6 — the Surface::Browser IPC + shm texture bridge. The shell's `web`
-# panel is this crate's first caller: it spawns the sandboxed `mde-web-preview`
-# helper per session, drives it over the typed session socket, and uploads each
-# paint-ready shm frame to an egui `TextureHandle` (the same decode→upload shape
-# the VDI decoder crates use). The edge points sideways-inward within the
-# desktop-shell tier (§6), sharing the one `mde-egui` toolkit resolution; it does
-# NOT reach the workspace-excluded Servo helper crate — only the shared wire seam.
-mde-web-preview-client = { path = "../mde-web-preview-client" }
-
 # BROWSER-DD-2 — live omnibox suggestions from the mesh-hosted SearXNG service.
 # The UI drives it on a short-lived blocking thread so egui never stalls, and the
 # parsing/throttle logic is unit-tested without live egress. rustls keeps the shell
@@ -244,13 +231,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # production build (WL-UX-007/S1) and only reachable through this dev-only
 # `sim-fixture` feature — resolver = "2" keeps it out of `cargo build`.
 mde-maps-location-egui = { path = "../mde-maps-location-egui", features = ["sim-fixture"] }
-
-# The Browser-surface render tests drive a real session over the client's
-# in-process fake helper (a socketpair peer publishing a genuine MWP1 shm frame),
-# so the panel's paint-ready → texture-upload + crash paths are exercised
-# headlessly with no Servo process — the `testkit` feature gates that scaffolding
-# out of the release build.
-mde-web-preview-client = { path = "../mde-web-preview-client", features = ["testkit"] }
 
 # The Mesh-Map co-editing watch test (EDITOR-COLLAB-3) drains a REAL `Persist`
 # spool on a throwaway dir — the same tempdir seam the editor's BusTransport

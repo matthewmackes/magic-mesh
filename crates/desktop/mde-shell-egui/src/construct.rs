@@ -298,6 +298,10 @@ pub struct ConstructChrome {
     pub control_center_open: bool,
     /// The Notification Center pull-down is showing (Q14, U15).
     pub notification_center_open: bool,
+    /// A workspace selected from the persistent notification/tool tray. The
+    /// status-bar painter owns the hit target; the shell drains this typed
+    /// handoff after the chrome slot mounts it.
+    workspace_tray_target: Option<crate::surfaces::Surface>,
     /// The VDI two-swipe dwell guard (§2.3).
     guard: EdgeGuard,
     /// The monotonic epoch [`Self::now`] measures the dwell window against.
@@ -314,6 +318,7 @@ impl Default for ConstructChrome {
             switcher_open: false,
             control_center_open: false,
             notification_center_open: false,
+            workspace_tray_target: None,
             guard: EdgeGuard::default(),
             epoch: Instant::now(),
             pending: Vec::new(),
@@ -322,6 +327,16 @@ impl Default for ConstructChrome {
 }
 
 impl ConstructChrome {
+    /// Queue a workspace route selected from the persistent tool tray.
+    pub(crate) fn request_workspace_tray(&mut self, surface: crate::surfaces::Surface) {
+        self.workspace_tray_target = Some(surface);
+    }
+
+    /// Drain the one-frame tool-tray route handoff.
+    pub(crate) fn take_workspace_tray_target(&mut self) -> Option<crate::surfaces::Surface> {
+        self.workspace_tray_target.take()
+    }
+
     /// The shell's monotonic clock for [`ChromeInput::now`] — elapsed since
     /// this chrome was built (never wall time; drives only the dwell window).
     #[must_use]

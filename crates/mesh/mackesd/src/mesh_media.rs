@@ -1059,6 +1059,172 @@ pub struct MediaRegistration {
     pub shared_account: Option<SharedAccount>,
 }
 
+/// Operator-configured media protocol accepted by the native Media surface.
+/// The endpoint is Airsonic/Subsonic-compatible; credentials are resolved from
+/// `credential_ref` and are never part of this replicated record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaServerKind {
+    /// Airsonic, Navidrome, and other Subsonic-compatible servers.
+    Airsonic,
+    /// Navidrome's native name for the same Subsonic-compatible API.
+    Navidrome,
+    /// Generic Subsonic-compatible implementation.
+    Subsonic,
+}
+
+/// Health state for an operator-configured media endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaServerHealth {
+    /// Endpoint answered its bounded probe.
+    Healthy,
+    /// Endpoint was reachable but did not complete a healthy probe.
+    Degraded,
+    /// Endpoint is configured but unavailable.
+    Unavailable,
+}
+
+/// Bounded operator-configured media endpoint record.
+///
+/// This is deliberately separate from [`MediaRegistration`]. Existing
+/// `MediaRegistration` JSON remains readable, while new records have no
+/// username/password fields and carry only a secret-store reference.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaServerRecord {
+    /// Canonical HTTP(S) Airsonic-compatible endpoint without userinfo/query.
+    pub endpoint: String,
+    /// Protocol kind.
+    pub kind: MediaServerKind,
+    /// Lower values are preferred by consumers.
+    pub priority: u16,
+    /// Current endpoint health.
+    pub health: MediaServerHealth,
+    /// Last bounded probe latency in milliseconds, when measured.
+    pub latency: Option<u32>,
+    /// Secret-store reference; never a username, password, or token.
+    pub credential_ref: String,
+}
+
+impl MediaServerRecord {
+    /// Construct a validated operator record. Empty `credential_ref` is valid
+    /// for an endpoint that does not require authentication; a non-empty value
+    /// must identify a secret-store entry rather than contain secret material.
+    #[must_use]
+    pub fn new(
+        endpoint: &str,
+        kind: MediaServerKind,
+        priority: u16,
+        health: MediaServerHealth,
+        latency: Option<u32>,
+        credential_ref: &str,
+    ) -> Option<Self> {
+        let endpoint = canonical_airsonic_upstream_url(endpoint)?;
+        if latency.is_some_and(|value| value > 60_000) {
+            return None;
+        }
+        let credential_ref = credential_ref.trim();
+        if !valid_media_credential_ref(credential_ref) {
+            return None;
+        }
+        Some(Self {
+            endpoint,
+            kind,
+            priority,
+            health,
+            latency,
+            credential_ref: credential_ref.to_owned(),
+        })
+    }
+
+    /// Revalidate a deserialized record before publishing or consuming it.
+    #[must_use]
+    pub fn validated(&self) -> Option<Self> {
+        let expected = Self::new(
+            &self.endpoint,
+            self.kind,
+            self.priority,
+            self.health,
+            self.latency,
+            &self.credential_ref,
+        )?;
+        (self == &expected).then_some(expected)
+    }
+}
+
+/// Environment variable carrying an operator-supplied JSON object or array of
+/// [`MediaServerRecord`] values. It is bounded and parsed as data, never shell
+/// evaluated.
+pub const MEDIA_SERVER_RECORDS_ENV: &str = "MDE_MEDIA_SERVER_RECORDS";
+const MAX_MEDIA_SERVER_RECORDS_BYTES: usize = 64 * 1024;
+
+fn valid_media_credential_ref(value: &str) -> bool {
+    value.is_empty()
+        || (value.starts_with("media/") || value.starts_with("secret:"))
+            && !value.chars().any(|c| c.is_whitespace() || c == '=' || c == '@')
+}
+
+/// Parse operator-configured media records. Accepts either one object or an
+/// array, filters invalid records, and never returns plaintext credential data.
+#[must_use]
+pub fn parse_media_server_records(body: &str) -> Vec<MediaServerRecord> {
+    if body.len() > MAX_MEDIA_SERVER_RECORDS_BYTES {
+        return Vec::new();
+    }
+    if let Ok(records) = serde_json::from_str::<Vec<MediaServerRecord>>(body) {
+        return records
+            .into_iter()
+            .filter_map(|record| record.validated())
+            .collect();
+    }
+    if let Some(record) = serde_json::from_str::<MediaServerRecord>(body)
+        .ok()
+        .and_then(|record| record.validated())
+    {
+        return vec![record];
+    }
+    let legacy = if let Ok(records) = serde_json::from_str::<Vec<MediaRegistration>>(body) {
+        records
+    } else if let Ok(record) = serde_json::from_str::<MediaRegistration>(body) {
+        vec![record]
+    } else {
+        return Vec::new();
+    };
+    legacy
+        .into_iter()
+        .filter_map(|record| {
+            let endpoint = format!(
+                "http://{}:{}",
+                safe_media_token(&record.node_id),
+                record.port
+            );
+            let health = match record.health.as_str() {
+                HEALTH_UP => MediaServerHealth::Healthy,
+                HEALTH_DOWN => MediaServerHealth::Unavailable,
+                _ => MediaServerHealth::Degraded,
+            };
+            // Never migrate the legacy SharedAccount username/password. The
+            // new record points to the sealed location derived for this peer.
+            MediaServerRecord::new(
+                &endpoint,
+                MediaServerKind::Airsonic,
+                0,
+                health,
+                None,
+                &format!("media/airsonic/{}", safe_media_token(&record.node_id)),
+            )
+        })
+        .collect()
+}
+
+/// Read the operator record environment without treating it as a secret body.
+#[must_use]
+pub fn operator_media_server_records() -> Vec<MediaServerRecord> {
+    std::env::var(MEDIA_SERVER_RECORDS_ENV)
+        .ok()
+        .map_or_else(Vec::new, |body| parse_media_server_records(&body))
+}
+
 impl MediaRegistration {
     /// `true` when the registered instance answered its health probe.
     #[must_use]

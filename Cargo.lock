@@ -4222,7 +4222,6 @@ dependencies = [
  "md5",
  "mde-adblock",
  "mde-bookmarks",
- "mde-browser-workers",
  "mde-bus",
  "mde-chat",
  "mde-collab-core",
@@ -4381,29 +4380,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "uuid 1.24.0",
-]
-
-[[package]]
-name = "mde-browser-workers"
-version = "12.1.6"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64",
- "dirs",
- "mackes-mesh-types",
- "mde-adblock",
- "mde-bus",
- "mde-seal",
- "mde-worker-core",
- "p256",
- "rand 0.8.7",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -4773,6 +4749,7 @@ version = "12.1.6"
 dependencies = [
  "base64",
  "chrono",
+ "image",
  "mackes-mesh-types",
  "mde-bookmarks",
  "mde-bookmarks-egui",
@@ -4796,7 +4773,6 @@ dependencies = [
  "mde-vdi-rdp",
  "mde-vdi-spice",
  "mde-vdi-vnc",
- "mde-web-preview-client",
  "png 0.18.1",
  "qrcode",
  "rand 0.8.7",
@@ -4903,20 +4879,6 @@ dependencies = [
  "toml",
  "tracing",
 ]
-
-[[package]]
-name = "mde-web-preview-client"
-version = "12.1.6"
-dependencies = [
- "mde-adblock",
- "mde-egui",
- "mde-web-wire",
- "nix",
-]
-
-[[package]]
-name = "mde-web-wire"
-version = "12.1.6"
 
 [[package]]
 name = "mde-worker-core"

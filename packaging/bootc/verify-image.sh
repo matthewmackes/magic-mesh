@@ -67,14 +67,8 @@ find /usr/lib/modules -mindepth 1 -maxdepth 1 -type d -name '*.surface.*' | grep
 grep -q 'ExecCondition=/usr/bin/mackesd role-gate --min-rank 1' /usr/lib/systemd/system/mde-shell-egui.service \
     && ok "typed role gate present in seat unit" || bad "typed role gate missing from seat unit"
 grep -q '^Delegate=yes$' /usr/lib/systemd/system/mde-shell-egui.service \
-    && ok "seat unit delegates cgroups for browser sandbox caps" \
-    || bad "seat unit missing Delegate=yes for browser sandbox caps"
-grep -q '^DelegateSubgroup=shell$' /usr/lib/systemd/system/mde-shell-egui.service \
-    && ok "seat unit keeps shell in delegated subgroup for browser sandbox caps" \
-    || bad "seat unit missing DelegateSubgroup=shell for browser sandbox caps"
-grep -q '^Environment=MDE_WEB_SANDBOX_DELEGATE_SUBGROUP=shell$' /usr/lib/systemd/system/mde-shell-egui.service \
-    && ok "seat unit tells browser sandbox which delegated subgroup to escape" \
-    || bad "seat unit missing browser sandbox delegated-subgroup env"
+    && ok "seat unit delegates cgroups for managed guest workloads" \
+    || bad "seat unit missing Delegate=yes for managed guest workloads"
 grep -q '^Environment=MDE_MAPS_DIR=/var/lib/mde/maps$' /usr/lib/systemd/system/mde-shell-egui.service \
     && ok "seat unit pins offline Maps data to persistent storage" \
     || bad "seat unit missing persistent offline Maps data root env"

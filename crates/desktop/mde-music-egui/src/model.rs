@@ -14,6 +14,61 @@
 use mde_musicd::airsonic::{Album, Client, Song};
 use mde_musicd::engine::SourceCodec;
 
+/// A music server visible to one desktop seat. Higher operator priority wins;
+/// latency is only a tie-break.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeatServer {
+    /// Stable seat/node identity shown to the operator.
+    pub seat: String,
+    /// HTTP or HTTPS Airsonic base URL.
+    pub url: String,
+    /// Operator-assigned preference; larger values win.
+    pub operator_priority: u32,
+    /// Last measured ping latency, when reachable.
+    pub latency_ms: Option<u32>,
+}
+
+impl SeatServer {
+    /// Construct an unprobed candidate at the default priority.
+    #[must_use]
+    pub fn new(seat: impl Into<String>, url: impl Into<String>) -> Self {
+        Self { seat: seat.into(), url: url.into(), operator_priority: 0, latency_ms: None }
+    }
+}
+
+/// Choose the default seat deterministically: operator priority first, then
+/// measured latency, then identity/URL for a stable final tie-break.
+#[must_use]
+pub fn select_default_server(servers: &[SeatServer]) -> Option<usize> {
+    servers
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| {
+            a.operator_priority
+                .cmp(&b.operator_priority)
+                .then_with(|| match (b.latency_ms, a.latency_ms) {
+                    (Some(b), Some(a)) => b.cmp(&a),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                })
+                .then_with(|| b.seat.cmp(&a.seat))
+                .then_with(|| b.url.cmp(&a.url))
+        })
+        .map(|(index, _)| index)
+}
+
+/// A proposed route change that requires explicit operator approval.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailoverRequest {
+    /// Current seat identity.
+    pub from: String,
+    /// Candidate seat identity.
+    pub to: String,
+    /// Human-readable reason for the proposal.
+    pub reason: String,
+}
+
 /// The lifecycle of a value fetched asynchronously from the Airsonic client:
 /// untouched, in flight, loaded, or failed.
 ///
@@ -29,6 +84,8 @@ pub enum Fetch<T> {
     Loading,
     /// Loaded successfully.
     Ready(T),
+    /// Loaded from the last successful response while the server is offline.
+    Cached(T),
     /// The request failed; carries a human-readable reason to surface.
     Failed(String),
 }
@@ -65,6 +122,16 @@ pub struct MusicState {
     pub position_ms: u64,
     /// A transient playback/engine error to surface (e.g. no audio device).
     pub error: Option<String>,
+    /// The seat selected by the worker after candidate probing.
+    pub selected_server: Option<SeatServer>,
+    /// Candidates known to this seat.
+    pub servers: Vec<SeatServer>,
+    /// A failover proposal waiting for explicit operator approval.
+    pub failover: Option<FailoverRequest>,
+    /// True when visible data is being retained from an offline response.
+    pub offline: bool,
+    /// Last track known to be playable, retained for offline transport state.
+    pub cached_track: Option<Song>,
 }
 
 /// A result message the worker thread sends back to the UI, folded into the
@@ -73,6 +140,10 @@ pub struct MusicState {
 pub enum Update {
     /// The album library finished loading (or failed).
     Library(Result<Vec<Album>, String>),
+    /// The worker selected a seat after probing candidates.
+    ServerSelected(SeatServer),
+    /// A route change is available but requires explicit approval.
+    FailoverPending(FailoverRequest),
     /// One album's track list finished loading (or failed). Applied only when it
     /// matches the currently-open album, so a stale reply for a since-closed
     /// album is ignored.
@@ -114,6 +185,12 @@ pub enum Command {
     Resume,
     /// Stop the engine and clear the now-playing track.
     Stop,
+    /// Select a known server explicitly for this seat.
+    SelectServer(String),
+    /// Approve the currently pending failover proposal.
+    ApproveFailover,
+    /// Reject and clear the currently pending failover proposal.
+    RejectFailover,
 }
 
 impl MusicState {
@@ -126,21 +203,47 @@ impl MusicState {
     /// Fold a worker [`Update`] into the state.
     pub fn apply(&mut self, update: Update) {
         match update {
-            Update::Library(Ok(albums)) => self.albums = Fetch::Ready(albums),
-            Update::Library(Err(e)) => self.albums = Fetch::Failed(e),
+            Update::Library(Ok(albums)) => {
+                self.offline = false;
+                self.albums = Fetch::Ready(albums);
+            }
+            Update::Library(Err(e)) => {
+                self.albums = match std::mem::replace(&mut self.albums, Fetch::Idle) {
+                    Fetch::Ready(albums) | Fetch::Cached(albums) => {
+                        self.offline = true;
+                        Fetch::Cached(albums)
+                    }
+                    _ => Fetch::Failed(e),
+                };
+            }
+            Update::ServerSelected(server) => {
+                self.selected_server = Some(server);
+                self.failover = None;
+            }
+            Update::FailoverPending(request) => self.failover = Some(request),
             Update::Tracks { album_id, result } => {
                 // Ignore a reply for an album the operator has since navigated
                 // away from — only the open album's tracks are live.
                 if let Some(open) = self.open_album.as_mut() {
                     if open.album.id == album_id {
                         open.tracks = match result {
-                            Ok(songs) => Fetch::Ready(songs),
-                            Err(e) => Fetch::Failed(e),
+                            Ok(songs) => {
+                                self.offline = false;
+                                Fetch::Ready(songs)
+                            }
+                            Err(e) => match std::mem::replace(&mut open.tracks, Fetch::Idle) {
+                                Fetch::Ready(songs) | Fetch::Cached(songs) => {
+                                    self.offline = true;
+                                    Fetch::Cached(songs)
+                                }
+                                _ => Fetch::Failed(e),
+                            },
                         };
                     }
                 }
             }
             Update::Started(song) => {
+                self.cached_track = Some(song.clone());
                 self.now_playing = Some(song);
                 self.playing = true;
                 self.position_ms = 0;
@@ -155,7 +258,10 @@ impl MusicState {
                 self.playing = false;
                 self.position_ms = 0;
             }
-            Update::Error(e) => self.error = Some(e),
+            Update::Error(e) => {
+                self.error = Some(e);
+                self.offline = true;
+            }
         }
     }
 
@@ -257,7 +363,7 @@ mod tests {
         assert!(matches!(&s.albums, Fetch::Ready(a) if a.len() == 2));
         // A later failure replaces the loaded state (honest, not silently kept).
         s.apply(Update::Library(Err("server down".to_string())));
-        assert!(matches!(&s.albums, Fetch::Failed(e) if e == "server down"));
+        assert!(matches!(&s.albums, Fetch::Cached(albums) if albums.len() == 2));
     }
 
     #[test]
@@ -394,5 +500,42 @@ mod tests {
             year: None,
         };
         assert!(album_subtitle(&bare).is_empty());
+    }
+
+    #[test]
+    fn server_default_prefers_operator_priority_then_latency() {
+        let mut slow = SeatServer::new("slow", "https://slow.example");
+        slow.operator_priority = 2;
+        slow.latency_ms = Some(40);
+        let mut fast = SeatServer::new("fast", "https://fast.example");
+        fast.operator_priority = 2;
+        fast.latency_ms = Some(10);
+        let mut preferred = SeatServer::new("preferred", "https://preferred.example");
+        preferred.operator_priority = 3;
+        preferred.latency_ms = Some(200);
+        assert_eq!(select_default_server(&[slow.clone(), fast.clone(), preferred]), Some(2));
+        assert_eq!(select_default_server(&[fast, slow]), Some(0));
+    }
+
+    #[test]
+    fn failed_fetch_retains_cached_library_and_track_data() {
+        let mut state = MusicState::new();
+        state.apply(Update::Library(Ok(vec![album("cached")])));
+        state.apply(Update::Library(Err("offline".to_string())));
+        assert!(matches!(&state.albums, Fetch::Cached(albums) if albums[0].id == "cached"));
+        state.open(album("cached"));
+        state.apply(Update::Tracks {
+            album_id: "cached".to_string(),
+            result: Ok(vec![song("track", "flac", 20)]),
+        });
+        state.apply(Update::Tracks {
+            album_id: "cached".to_string(),
+            result: Err("offline".to_string()),
+        });
+        assert!(matches!(
+            &state.open_album.as_ref().expect("album").tracks,
+            Fetch::Cached(tracks) if tracks[0].id == "track"
+        ));
+        assert!(state.offline);
     }
 }

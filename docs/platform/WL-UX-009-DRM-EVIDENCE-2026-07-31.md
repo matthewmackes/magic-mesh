@@ -7,7 +7,7 @@ workspace frame. It does not close WL-UX-009 or claim production readiness.
 
 - Seat: `.138` (`172.20.146.138`), physical Fedora 44 DRM seat.
 - Connector: `card1-eDP-1`, connected; capture mode `1920x1080`.
-- Shell payload for the current proof rows: `703d3477ce574e30abda5f1d7bdc46834ad16881db8d3a1d727b794fc1222919`.
+- Latest installed shell payload: `8366b1094571c8ec520166e6af09e342954850bde149f14146613091e5317f4b`.
 - Farm RPM: `magic-mesh-12.1.6-1.x86_64.rpm`, SHA-256
   `53835242591b1d3217fc2d83f14021f9cba41fb68a86c295d7c7373ffbee4d75`.
 - Build: BigBoy farm `172.20.0.130`, slot 11, release shell with
@@ -44,6 +44,17 @@ workspace frame. It does not close WL-UX-009 or claim production readiness.
   allocation failed with `EINVAL`; the actual locked front buffer was logged
   as `XR30`, modifier `I915_x_tiled`, stride `7680`, and the application
   rejected it as non-linear. No screenshot was accepted from this run.
+- Latest EGL-readback proof payload `3bd01985a670c723b87eefc5a1230344ead763d4b97c7fbb9401ee0b02ff91c8`
+  was built on farm `.90` and deployed to Dell and `.138`; both services were
+  active with `NRestarts=0`. The proof captured the actual live EGL back buffer
+  before swap, while KMS continued to scan out the normal Intel X-tiled BO.
+  The readback wrote CPU-linear RGBA PNGs plus JSON metadata and avoided the
+  striped `kmsgrab` conversion path.
+- Car layout candidate payload `736471b1d47f38162107915d36ff7542cd9aba27cc09ba0e49dd0b1aeb9cf46b`
+  was built on farm `.90`, deployed to Dell and `.138`, and visually accepted
+  for the Light/Largest narrow Auto Mode frame. Both seats remained active with
+  `NRestarts=0`; `.138` was restored to `require_login_at_boot:true` after the
+  proof run.
 - The complete RPM was not installed on either seat because its Fedora build
   dependency set does not match the installed seat runtime. The verified shell
   payload was deployed directly for GUI proof, with the prior binary preserved
@@ -103,6 +114,34 @@ normal secure runtime settings.
 | `.138` Files Dark desktop (current payload `703d3477`) | Files | native `1920x1080` direct-DRM capture; shared FILES menu, sidebar, list, preview pane, mesh destinations, and status strip remain separated | `a756678488efca1f5a908a787cae4ccf5002e6338e9f1d061a0fa48db008fff5` |
 | `.138` Files Light / Largest (current payload `703d3477`) | Files | native `1920x1080` direct-DRM capture; large-text palette and dense file controls remain readable with the list/preview boundary intact | `1e32d9d96544b7b54b847b1dddbd9c7306431325202a8bf618205703464104ad` |
 | `.138` Files Dark narrow (current payload `703d3477`) | Files | `800` logical width on native scanout; sidebar, list, preview, and bottom status remain bounded, with unused right scanout intentional | `a164abc361114a37a337deebd2de2162019c122ff56dfa8e45ffcbe1e1a2abf7` |
+| `.138` Maps Dark desktop (EGL readback payload `9b2767c4`) | Maps & Location → Drive | native `1920x1080` direct-DRM EGL readback; dark HUD, health rail, alerts, and map content remain readable | `359422e1f0faa636ea506bab297993b53dc1c24ec952e8637af1407b57ade3c5` |
+| `.138` Maps Light / Largest (EGL readback payload `9b2767c4`) | Maps & Location → Drive | native `1920x1080` direct-DRM EGL readback; explicit map-content text contrast remains readable over the dark HUD | `a62bc1cc49eebc8eecb995af83baefe50ac8519ab0984130123400b25bb31e4b` |
+| `.138` Maps Dark narrow (EGL readback payload `9b2767c4`) | Maps & Location → Drive | `800` logical-width direct-DRM EGL readback; banner, health rail, alerts, and unused right scanout remain bounded | `b76ccbee69a043a46036db48ab4894662b98914a41926537b99ba63545c7ac50` |
+| `.138` Maps Light / Largest narrow (EGL readback payload `36bf4864`) | Maps & Location → Drive | `800` logical-width direct-DRM EGL readback; responsive banner text, health rail, alerts, and unused right scanout remain readable and bounded | `7533850bb61a1aa407246b9bd8bfea83e87bfea014da19173e9f6fa76323418b` |
+| `.138` Workbench Dark desktop (EGL readback payload `36bf4864`) | Fleet & Mesh → Workbench | native `1920x1080` direct-DRM EGL readback; shared title/menu, plane rail, unavailable provider state, and health cards remain readable without overlap | `b414091ce7af1b5d53cd4bbc658ec9397f184d21f2b64110d7e07a8191eccbf0` |
+| `.138` Workloads Dark desktop (EGL readback payload `36bf4864`) | Infra as Code → Provision | native `1920x1080` direct-DRM EGL readback; shared WORKLOADS menu, lifecycle rail, placement card, and honest plan-only state remain bounded | `fccab7b0118539d285a4c6843b4ce477173a0dfc1caa03d297b90a4f2d1e6599` |
+| `.138` Media Sources Dark desktop (EGL readback payload `36bf4864`) | Media → Sources | native `1920x1080` direct-DRM EGL readback; shared MEDIA menu, source tabs, local-capture/Jellyfin controls, and honest empty-source copy remain bounded | `ba301951c1c06de835fd50318f81df5a0b0feeb9b17407971eb79cfc1ae4d04b` |
+| `.138` Browser boundary Dark desktop (EGL readback payload `36bf4864`) | Browser VM connection/guest boundary | native `1920x1080` direct-DRM EGL readback; Construct browser controls remain distinct from the blank guest viewport, with no Chromium content-readiness claim | `34e36824228b4848126bbe5ced9d6b7c808a2ccb58f190e1a3dfaea19cbecda0` |
+| `.138` Mesh Teams Dark desktop (EGL readback payload `9cdc8f1f`) | Communications → Mesh Teams | native `1920x1080` direct-DRM EGL readback after the proof-only settle window; shared MESH TEAMS chrome, activity feed, details rail, and honest unconfigured bridge state remain readable and separated | `46e5d3fe975f7e6b4f2d89094ed5257b26bd4a8403cd75d67b3ab815f15edf21` |
+| `.138` Music unavailable Dark desktop (EGL readback payload `9cdc8f1f`) | Music | native `1920x1080` direct-DRM EGL readback after the proof-only settle window; shared MUSIC menu/status chrome and honest missing-credentials state render without claiming Subsonic connectivity | `5b77cfe095d4f0f61f9b9ac9d36403fc517fffe31377707e8657f45a170f0259` |
+| `.138` Terminal Dark desktop (EGL readback payload `36bf4864`) | Terminal | native `1920x1080` direct-DRM EGL readback; Terminal menu, tab strip, shell prompt, and taskbar remain separated in the honest idle state | `9674a818f45c5b97f18f6fd71d1788d444f60520baf63b84726092b66a67d35f` |
+| `.138` This Node Dark desktop (EGL readback payload `36bf4864`) | This Node | native `1920x1080` direct-DRM EGL readback; searchable node center, section tabs, system menu, and reading-seat state remain bounded without overlap | `aae809d959f81f9049385c4840ee6dd6fedb4cbaa8c2eceb8a9ae72a90713d5e` |
+| `.138` Mesh Teams Light / Largest narrow (EGL readback payload `9cdc8f1f`) | Communications → Mesh Teams | `800` logical-width direct-DRM EGL readback after the proof-only settle window; large-text activity feed, alert rows, taskbar, and intentional unused scanout remain readable and bounded | `08be7658a25320fd4c80cddbe22f1d116f3a0691173d8829c48b92fb3ddf1bd1` |
+| `.138` Music unavailable Light / Largest narrow (EGL readback payload `9cdc8f1f`) | Music | `800` logical-width direct-DRM EGL readback after the proof-only settle window; large-text menu/status chrome and honest missing-credentials copy remain readable without claiming Subsonic connectivity | `62dd2bd45818213e4a01983d4be7652e4f743aa4943828f571bb92a129d0768b` |
+| `.138` Terminal Light / Largest narrow (EGL readback payload `9cdc8f1f`) | Terminal | `800` logical-width direct-DRM EGL readback; large-text menu, tab strip, shell prompt, and honest idle/loading body remain bounded | `5e9d390c30b981e7a32dfda82276b3c38fd0ce58285df208a97f8e7fac27e264` |
+| `.138` This Node Light / Largest narrow (EGL readback payload `9cdc8f1f`) | This Node | `800` logical-width direct-DRM EGL readback; large-text unified node navigation, section sidebar, and honest “Reading the seat…” state remain readable and bounded | `77f336a7e8978cf5c866ca2ff8d95efc7259b8d81745e810801f3848f800c1ac` |
+| `.138` Workbench Light / Largest narrow (EGL readback payload `333503d0`) | Fleet & Mesh → Workbench | `800` logical-width direct-DRM EGL readback after removing the duplicate wrapper View control; the shared STATE OF THE MESH bar, plane rail, unavailable health state, and body remain readable and bounded | `a54de1af67c09467766e376b6e279d0f34702cb959e585432a65f8409933847d` |
+| `.138` Workloads Light / Largest narrow (EGL readback payload `333503d0`) | Infra as Code → Provision | `800` logical-width direct-DRM EGL readback; large-text WORKLOADS menu, lifecycle rail, plan-only placement state, and controls remain readable and bounded | `699e569374991820f96357d8879a067a2649d3ec60cfbb797ae22859213d8542` |
+| `.138` Media Sources Light / Largest narrow (EGL readback payload `333503d0`) | Media → Sources | `800` logical-width direct-DRM EGL readback; large-text MEDIA menu, source tabs, local/Jellyfin controls, and honest empty-source state remain readable and bounded | `f344202126cdbf266d74b96aa06808e2e5ca68ac4d0441ad2f1a98b934181f37` |
+| `.138` Browser boundary Light / Largest narrow (EGL readback payload `333503d0`) | Browser VM connection/guest boundary | `800` logical-width direct-DRM EGL readback; Construct browser controls remain distinct from the blank guest viewport, with no Chromium content-readiness claim | `b69f25c3e699c799e70234a502f92938996762152337cc4beb9c20e2fb0d2937` |
+| `.138` Phones Light / Largest narrow (EGL readback payload `3bd01985`) | Phones | `800` logical-width direct-DRM EGL readback after enabling the shared leading AppFrame title; paired/online status, hub tabs, feature card, and remote-input controls remain readable and bounded | `2d96bd5592e9f3325471a469b12bb2dbd031af91982cd7e7b6875c6af0fc4dd0` |
+| `.138` Editor Light / Largest narrow (EGL readback payload `3bd01985`) | Mesh Teams → Editor | `800` logical-width direct-DRM EGL readback; nested communications/editor chrome, collapsed optional sidebars, document/project controls, formatting rows, empty document state, and status row remain readable and bounded | `b68b8335f07d5017c949389e15b166cf1b669dd7a8988041f20277913b57d106` |
+| `.138` Car Light / Largest narrow (EGL readback payload `736471b1`) | Auto Mode → Car Home | `800` logical-width direct-DRM EGL readback after the Car route alias, zoom-aware instrument strip, width-safe elision, and three-column large-text grid fixes; Auto Mode title/cards/app strip and all 12 selected status tiles remain readable and bounded above the taskbar | `88e022c9427345ee94adb0e164553ba655a8e6ba2c85f501be2407db17d59e5e` |
+| `.138` Editor Dark desktop (EGL readback payload `736471b1`) | Mesh Teams → Editor | native `1920x1080` direct-DRM EGL readback; nested communications/editor chrome, document/project controls, formatting rows, empty document state, status row, and details rail remain readable and bounded | `10bda5359c80b0f5148c518a6d198222a4abc75e07dd20ad3c92aa81cbc1bb98` |
+| `.138` Terminal Dark desktop (EGL readback payload `736471b1`) | Terminal | native `1920x1080` direct-DRM EGL readback; shared TERMINAL menu, tab strip, mesh overview, shell prompt, and taskbar remain separated and readable | `a0f7998b2d23584bd1f5be0e90f7705ca23b9d9079270c9d528d7ed3bba84448` |
+| `.138` Car Dark desktop (EGL readback payload `736471b1`) | Auto Mode → Car Home | native `1920x1080` direct-DRM EGL readback; Auto Mode title, navigation/media/vehicle cards, app strip, and taskbar remain separated and readable | `eab009624b2878b6133ecbd8935adfc2abccdedcc52841fa38e26ce30501e8b6` |
+| `.138` Phones Dark desktop (EGL readback payload `8366b109`) | Phones | native `1920x1080` direct-DRM EGL readback after bounding the shared status/identity rows to the AppFrame inset; title, tabs, feature/remote-input cards, and empty state remain readable and bounded | `87f5b3e9a7c3a234b66a513e04b4b875dc87612e53733f214566352ca388799d` |
+| `.138` Editor Light desktop (EGL readback payload `8366b109`) | Mesh Teams → Editor | native `1920x1080` direct-DRM EGL readback after the proof-only unlock; Light Mesh Teams/editor chrome, document body, details rail, and taskbar remain readable and bounded | `bc48241b3cd0fbed2a9b4f191527cd88437060307d5c83b8f4b1bb2f02fd69c5` |
 
 The captures show the shared MenuBar, AppFrame detail header, Editor,
 Bookmarks, and Storage workspace bodies, toolbars, side rails, taskbar,
@@ -141,11 +180,19 @@ side is outside the proof viewport, not an overlap.
   Construct-owned routes/states, and final production evidence. This is clean
   representative proof, not a claim that every route is production-ready.
 
-The latest proof attempt is intentionally absent from the passing table: the
-Intel direct-DRM path returned an X-tiled BO despite the linear request, and
-the fail-closed guard prevented another striped PNG from being mistaken for
-pixel evidence. A detile/readback capture path and fresh Maps Light/Largest and
-narrow visual inspection are still required.
+The earlier Intel direct-DRM linear-request and fixed-height-banner attempts
+remain historical failed evidence. The proof-only EGL readback path now emits
+CPU-linear RGBA output, and the responsive banner fix was visually inspected
+on `.138` at the `800` logical-width, Light/Largest profile. The accepted row
+above closes this Maps matrix cell; the broader WL-UX-009 workspace matrix and
+remaining Construct-owned routes remain open.
+
+The first current-payload batch rendered Music and Mesh Teams before their
+asynchronous/expressive body state had settled; those frames are excluded.
+The proof-only settle window was then exercised on the new `9cdc8f1f` payload.
+The resulting frames show the honest Music missing-credentials state and the
+settled Mesh Teams activity view, and are the rows accepted above. The settle
+window is opt-in and does not alter production timing.
 
 ## Boundary authority
 

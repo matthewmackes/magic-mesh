@@ -65,7 +65,8 @@ governs how it dims as content appears.
 
 ## Out of scope
 
-- User-selectable wallpapers / a wallpaper picker (this is the brand backdrop only).
+- Wallpaper-provider selection / a wallpaper picker (Bing is the sole supported
+  desktop wallpaper provider; this document covers the brand backdrop only).
 - Theming/override of the lockup file (embedded default only; an override path is a
   possible later addition, not this unit).
 - Animated/video backdrops.

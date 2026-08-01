@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/matthewmackes/magic-mesh/blob/main/packaging/browser-vm/browser-vm-transport-attach.schema.json",
+  "title": "MCNF Browser VM transport attach",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "workload",
+    "surface",
+    "session_id",
+    "generation",
+    "transport",
+    "status"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "workload": { "const": "browser-vm" },
+    "surface": { "const": "browser" },
+    "session_id": {
+      "type": "string",
+      "pattern": "^session:[A-Za-z0-9._:-]{1,127}$"
+    },
+    "generation": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9223372036854775807
+    },
+    "transport": { "const": "rdp" },
+    "status": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "protocol", "host", "port"],
+      "properties": {
+        "state": { "const": "brokered" },
+        "protocol": { "const": "rdp" },
+        "host": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._:-]{1,253}$"
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        }
+      }
+    }
+  }
+}

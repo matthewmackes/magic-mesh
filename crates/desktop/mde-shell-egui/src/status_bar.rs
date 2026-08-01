@@ -53,14 +53,14 @@ use mde_theme::brand::icons::IconId;
 use crate::chrome::NodeGrades;
 use crate::construct::ConstructChrome;
 use crate::status::{segment_label, severity_color, severity_label, StatusSegment, StatusSegments};
-use crate::surfaces::icon_texture;
+use crate::surfaces::{icon_texture, Surface};
 
 /// The locked strip height (Q12: "~24px").
 pub(crate) const STATUS_BAR_H: f32 = 24.0;
 /// Width reserved by the bottom taskbar for the Windows-style system tray.
 /// The navigation bar keeps this lane free of app pins so the clock and
 /// controls remain visually stable while the center cluster changes.
-pub(crate) const BOTTOM_TRAY_W: f32 = 215.6;
+pub(crate) const BOTTOM_TRAY_W: f32 = 376.0;
 /// Clear space between the taskbar placement control and the tray.
 pub(crate) const BOTTOM_TRAY_GAP: f32 = 8.8;
 
@@ -74,6 +74,18 @@ pub(crate) const RIGHT_SEGMENTS: [StatusSegment; 4] = [
     StatusSegment::Power,
     StatusSegment::Alerts,
 ];
+
+/// Construct-owned workspaces promoted into the persistent notification/tool
+/// tray. The navigation rail remains intact in both placement modes.
+pub(crate) const WORKSPACE_TRAY_SURFACES: [Surface; 5] = [
+    Surface::FleetMesh,
+    Surface::Music,
+    Surface::Media,
+    Surface::Phones,
+    Surface::ThisNode,
+];
+const WORKSPACE_TRAY_ICON_W: f32 = STATUS_BAR_H;
+const WORKSPACE_TRAY_GAP: f32 = Style::SP_XS;
 
 /// Compact right-rail controls. These are intentionally action-only: the
 /// existing Control Center remains the source of truth for their live values.
@@ -238,6 +250,51 @@ fn status_control_rect(bar: egui::Rect, control: StatusControl) -> egui::Rect {
     egui::Rect::from_min_max(
         egui::pos2(x, controls.top()),
         egui::pos2(right, controls.bottom()),
+    )
+}
+
+fn workspace_tray_width() -> f32 {
+    WORKSPACE_TRAY_ICON_W * WORKSPACE_TRAY_SURFACES.len() as f32
+        + WORKSPACE_TRAY_GAP * WORKSPACE_TRAY_SURFACES.len().saturating_sub(1) as f32
+}
+
+fn workspace_tray_rect(bar: egui::Rect, clock: egui::Rect) -> egui::Rect {
+    let controls = status_controls_rect(bar);
+    let right = (controls.left() - WORKSPACE_TRAY_GAP).max(bar.left());
+    let left = (right - workspace_tray_width())
+        .max((clock.right() + WORKSPACE_TRAY_GAP).min(right))
+        .max(bar.left());
+    egui::Rect::from_min_max(
+        egui::pos2(left, bar.top()),
+        egui::pos2(right.max(left), bar.bottom()),
+    )
+}
+
+const fn workspace_tray_shortcut(surface: Surface) -> &'static str {
+    match surface {
+        Surface::FleetMesh => "Super+1",
+        Surface::Music => "Super+4",
+        Surface::Media => "Super+5",
+        Surface::Phones => "Super+Shift+1",
+        Surface::ThisNode => "Super+Shift+2",
+        _ => "Front Door search",
+    }
+}
+
+fn workspace_tray_status(surface: Surface, active: Option<Surface>) -> &'static str {
+    if active == Some(surface) {
+        "Active"
+    } else {
+        "Available"
+    }
+}
+
+fn workspace_tray_tooltip(surface: Surface, active: Option<Surface>) -> String {
+    format!(
+        "{} — {} — {}",
+        surface.label(),
+        workspace_tray_status(surface, active),
+        workspace_tray_shortcut(surface)
     )
 }
 
@@ -417,7 +474,7 @@ pub fn mount(
     grades: &NodeGrades,
     env: StatusBarEnv,
 ) {
-    mount_top(ctx, construct, segments, grades, env, 1.0);
+    mount_top_with_active(ctx, construct, segments, grades, env, 1.0, None);
 }
 
 /// Mount the current top-strip treatment with an explicit cross-fade weight.
@@ -430,6 +487,18 @@ pub(crate) fn mount_top(
     grades: &NodeGrades,
     env: StatusBarEnv,
     opacity: f32,
+) {
+    mount_top_with_active(ctx, construct, segments, grades, env, opacity, None);
+}
+
+pub(crate) fn mount_top_with_active(
+    ctx: &egui::Context,
+    construct: &mut ConstructChrome,
+    segments: &StatusSegments,
+    grades: &NodeGrades,
+    env: StatusBarEnv,
+    opacity: f32,
+    active_surface: Option<Surface>,
 ) {
     let visible = status_bar_visible(env);
     // The U09 chrome-contract tests drive all mount slots on a bare Context to
@@ -472,7 +541,7 @@ pub(crate) fn mount_top(
             // hit regions outside the reserved 24px band on narrow surfaces.
             ui.set_clip_rect(bar);
             ui.set_opacity(t);
-            strip(ui, bar, construct, segments, grades);
+            strip(ui, bar, construct, segments, grades, active_surface);
         });
 }
 
@@ -515,10 +584,29 @@ pub(crate) fn paint_bottom_tray(
     opacity: f32,
     env: StatusBarEnv,
 ) {
+    paint_bottom_tray_with_active(ui, screen, construct, segments, opacity, env, None);
+}
+
+pub(crate) fn paint_bottom_tray_with_active(
+    ui: &egui::Ui,
+    screen: egui::Rect,
+    construct: &mut ConstructChrome,
+    segments: &StatusSegments,
+    opacity: f32,
+    env: StatusBarEnv,
+    active_surface: Option<Surface>,
+) {
     if opacity <= 0.0 || !status_bar_visible(env) {
         return;
     }
-    bottom_tray(ui, bottom_tray_rect(screen), construct, segments, opacity);
+    bottom_tray(
+        ui,
+        bottom_tray_rect(screen),
+        construct,
+        segments,
+        opacity,
+        active_surface,
+    );
 }
 
 /// Return the tray's screen-space footprint. Keeping this in the status-bar
@@ -534,12 +622,84 @@ pub(crate) fn bottom_tray_rect(screen: egui::Rect) -> egui::Rect {
     )
 }
 
+fn paint_workspace_tray(
+    ui: &egui::Ui,
+    tray: egui::Rect,
+    construct: &mut ConstructChrome,
+    active_surface: Option<Surface>,
+    id_prefix: &'static str,
+) {
+    let painter = ui.painter().clone();
+    let text = Style::resolve_color(ui.ctx(), Style::TEXT);
+    let hover = Style::resolve_color(ui.ctx(), Style::SURFACE_HI);
+    let icon_w = WORKSPACE_TRAY_ICON_W.min(tray.height()).max(0.0);
+    if icon_w <= 0.0 || tray.width() <= 0.0 {
+        return;
+    }
+    let gap = WORKSPACE_TRAY_GAP.min(icon_w / 4.0);
+    for (index, surface) in WORKSPACE_TRAY_SURFACES.into_iter().enumerate() {
+        let left = tray.left() + index as f32 * (icon_w + gap);
+        let rect = egui::Rect::from_min_max(
+            egui::pos2(left, tray.top()),
+            egui::pos2((left + icon_w).min(tray.right()), tray.bottom()),
+        );
+        if rect.width() <= 0.0 {
+            continue;
+        }
+        let response = ui.interact(
+            rect,
+            egui::Id::new((id_prefix, "workspace", index)),
+            egui::Sense::click(),
+        );
+        let active = active_surface == Some(surface);
+        let tooltip = workspace_tray_tooltip(surface, active_surface);
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), tooltip.clone())
+        });
+        if response.hovered() {
+            painter.rect_filled(rect.shrink(2.0), Style::RADIUS_S, hover);
+        }
+        if let Some(texture) = icon_texture(ui.ctx(), surface.icon_id(), Style::ICON_M, text) {
+            let draw = egui::Rect::from_center_size(
+                rect.center(),
+                egui::vec2(Style::ICON_M, Style::ICON_M),
+            );
+            painter.image(
+                texture.id(),
+                draw,
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                text,
+            );
+        }
+        if active {
+            let indicator = egui::Rect::from_min_max(
+                egui::pos2(rect.center().x - 5.0, rect.bottom() - 3.0),
+                egui::pos2(rect.center().x + 5.0, rect.bottom() - 1.0),
+            );
+            painter.rect_filled(indicator, egui::CornerRadius::same(1), Style::ACCENT);
+        }
+        let _response = response.clone().on_hover_ui(move |ui| {
+            mde_egui::overlay()
+                .corner_radius(mde_egui::corner(Style::RADIUS_S))
+                .inner_margin(Style::tooltip_margin())
+                .show(ui, |ui| {
+                    ui.set_max_width(Style::SP_XL * 12.0);
+                    ui.label(Style::typography_text(&tooltip, TypographyRole::Caption));
+                });
+        });
+        if response.clicked() {
+            construct.request_workspace_tray(surface);
+        }
+    }
+}
+
 fn bottom_tray(
     ui: &egui::Ui,
     tray: egui::Rect,
     construct: &mut ConstructChrome,
     segments: &StatusSegments,
     opacity: f32,
+    active_surface: Option<Surface>,
 ) {
     let painter = ui.painter().clone();
     // This is a lane within the taskbar, not a second raised card layered over
@@ -554,7 +714,7 @@ fn bottom_tray(
     let time = crate::timers::hhmm(now);
     let (year, month, day) = crate::chat::civil_from_days(now.div_euclid(86_400));
     let date = format!("{month:02}/{day:02}/{year:04}");
-    let clock_width = 85.8_f32.min((panel.width() * 0.42).max(39.6));
+    let clock_width = 85.8_f32.min((panel.width() * 0.30).max(39.6));
     let clock = egui::Rect::from_min_max(
         egui::pos2(panel.right() - clock_width, panel.top()),
         panel.right_bottom(),
@@ -610,7 +770,19 @@ fn bottom_tray(
         construct.notification_center_open = !construct.notification_center_open;
     }
 
-    let health = egui::pos2(panel.left() + 15.4, panel.center().y);
+    let workspace_rect = egui::Rect::from_min_max(
+        panel.left_top(),
+        egui::pos2((panel.left() + workspace_tray_width()).min(clock.left()), panel.bottom()),
+    );
+    paint_workspace_tray(
+        ui,
+        workspace_rect,
+        construct,
+        active_surface,
+        "construct-bottom-system-tray",
+    );
+
+    let health = egui::pos2(panel.left() + workspace_rect.width() + 8.0, panel.center().y);
     let mesh_color = severity_color(segments.get(StatusSegment::Mesh));
     painter.circle_filled(health, 4.4, mesh_color.gamma_multiply(opacity));
     let health_response = ui.interact(
@@ -698,6 +870,7 @@ fn strip(
     construct: &mut ConstructChrome,
     segments: &StatusSegments,
     grades: &NodeGrades,
+    active_surface: Option<Surface>,
 ) {
     let painter = ui.painter().clone();
     // The clean BG band + bottom hairline (module doc: persistent chrome, not
@@ -775,7 +948,16 @@ fn strip(
             w
         })
         .collect();
-    let cluster_rect = bounded_cluster_rect(bar, clock_rect, controls_rect, cluster_w);
+    let workspace_rect = workspace_tray_rect(bar, clock_rect);
+    let cluster_rect = bounded_cluster_rect(
+        bar,
+        clock_rect,
+        egui::Rect::from_min_max(
+            egui::pos2(bar.left(), bar.top()),
+            egui::pos2(workspace_rect.left(), bar.bottom()),
+        ),
+        cluster_w,
+    );
     let cluster = ui.interact(
         cluster_rect,
         status_bar_right_cluster_id(),
@@ -841,6 +1023,14 @@ fn strip(
         // cluster": the pub open flag IS the sanctioned seam.
         construct.control_center_open = !construct.control_center_open;
     }
+
+    paint_workspace_tray(
+        ui,
+        workspace_rect,
+        construct,
+        active_surface,
+        "construct-status-bar",
+    );
 
     for control in StatusControl::ALL {
         let rect = status_control_rect(bar, control);
@@ -1256,7 +1446,6 @@ mod tests {
             ..StatusSegments::default()
         };
         let grades = local_grade(95, false);
-        let before = crate::timers::now_unix();
         let _ = drive(
             &ctx,
             &mut construct,
@@ -1283,13 +1472,19 @@ mod tests {
             visible_env(),
             Vec::new(),
         );
-        let after = crate::timers::now_unix();
         let texts = frame_texts(&out);
-        // The centered clock (bracketed against a minute rollover mid-test).
+        // The centered clock. The farm can spend long enough compiling this
+        // crate for the minute to roll between the before/after samples, so
+        // assert the rendered HH:MM contract instead of a stale snapshot.
         assert!(
             texts
                 .iter()
-                .any(|t| *t == crate::timers::hhmm(before) || *t == crate::timers::hhmm(after)),
+                .any(|t| {
+                    t.len() == 5
+                        && t.as_bytes().get(2) == Some(&b':')
+                        && t.as_bytes()[..2].iter().all(u8::is_ascii_digit)
+                        && t.as_bytes()[3..].iter().all(u8::is_ascii_digit)
+                }),
             "no clock text painted: {texts:?}"
         );
         // At least one rollup cell + the grade letter.

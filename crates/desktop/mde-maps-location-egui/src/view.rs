@@ -45,6 +45,10 @@ const MANEUVER_BLUE_DEEP: Color32 = Color32::from_rgb(0x11, 0x4C, 0xB6); // styl
 const ROUTE_CASING: Color32 = Color32::from_rgb(0x14, 0x4C, 0x92); // style-leak-ok: map-content-color
 const HUD_CARD_BG: Color32 = Color32::from_rgb(0x1A, 0x1B, 0x22); // style-leak-ok: map-content-color
 const HUD_CARD_HI: Color32 = Color32::from_rgb(0x24, 0x26, 0x30); // style-leak-ok: map-content-color
+// Keep these content colors intentionally distinct from Style::TEXT_STRONG and
+// Style::TEXT_DIM: the shell's Light remapper keys on exact token values.
+const MAP_TEXT_STRONG: Color32 = Color32::from_rgb(0xF5, 0xF6, 0xFA); // style-leak-ok: map-content-color
+const MAP_TEXT_DIM: Color32 = Color32::from_rgb(0xB8, 0xC0, 0xCC); // style-leak-ok: map-content-color
 
 /// Corner radius for the floating HUD cards (banner, ETA sheet, lane strip) —
 /// larger than the shared card radius so the nav surface reads modern/premium.
@@ -689,11 +693,12 @@ fn drive_hud(
 
     // Top banner: the maneuver instruction (or amber "Recalculating…") while
     // guiding, else the calm idle prompt. Always painted so the HUD has a header.
+    let banner_height = (96.0 + (text_zoom - 1.0).max(0.0) * 32.0).clamp(96.0, 144.0);
     let banner = safe_rect(
         rect.left() + margin,
         rect.top() + margin,
         width - 2.0 * margin,
-        96.0,
+        banner_height,
     );
     let kind = maneuver_kind(&route.next_maneuver);
     paint_soft_shadow(&painter, banner, HUD_RADIUS);
@@ -847,7 +852,7 @@ fn paint_health_rail(
                     RichText::new("Radio & GNSS health")
                         .size(Style::SMALL)
                         .strong()
-                        .color(Style::TEXT_STRONG),
+                        .color(MAP_TEXT_STRONG),
                 );
                 ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                     pill(ui, rail.state.label(), health_rail_tone(rail.state));
@@ -915,7 +920,7 @@ fn paint_health_rail(
                                         let galley = slot_ui.painter().layout_no_wrap(
                                             summary,
                                             font,
-                                            Style::TEXT_STRONG,
+                                            MAP_TEXT_STRONG,
                                         );
                                         slot_ui.painter().galley(
                                             egui::pos2(
@@ -930,7 +935,7 @@ fn paint_health_rail(
                                             egui::Label::new(
                                                 RichText::new(slot.label)
                                                     .size(Style::SMALL)
-                                                    .color(Style::TEXT_STRONG),
+                                                    .color(MAP_TEXT_STRONG),
                                             )
                                             .wrap(),
                                         );
@@ -2734,12 +2739,14 @@ fn paint_idle_banner(painter: &Painter, rect: Rect) {
 
     let tx = chip.right() + Style::SP_M;
     let max_w = (rect.right() - Style::SP_M - tx).max(1.0);
+    let title_font = FontId::proportional(if rect.width() < 900.0 { 24.0 } else { 28.0 });
+    let title = elide(painter, "No destination", title_font.clone(), max_w);
     painter.text(
         egui::pos2(tx, rect.top() + 9.0),
         Align2::LEFT_TOP,
-        "No destination",
-        FontId::proportional(28.0),
-        Style::TEXT_STRONG,
+        &title,
+        title_font,
+        MAP_TEXT_STRONG,
     );
     let sub = elide(
         painter,
@@ -2752,7 +2759,7 @@ fn paint_idle_banner(painter: &Painter, rect: Rect) {
         Align2::LEFT_BOTTOM,
         &sub,
         FontId::proportional(Style::BODY),
-        Style::TEXT_DIM,
+        MAP_TEXT_DIM,
     );
 }
 
@@ -3371,7 +3378,7 @@ fn paint_heading_cone(painter: &Painter, apex: Pos2, heading_deg: f32, tone: Col
 
 fn paint_acquiring_chip(painter: &Painter, center_top: Pos2) {
     let font = FontId::proportional(Style::SMALL);
-    let galley = painter.layout_no_wrap("Acquiring GPS".to_string(), font, Style::TEXT_STRONG);
+    let galley = painter.layout_no_wrap("Acquiring GPS".to_string(), font, MAP_TEXT_STRONG);
     let w = galley.size().x + Style::SP_M + Style::SP_S;
     let r = safe_rect(center_top.x - w / 2.0, center_top.y, w, 22.0);
     painter.rect_filled(r, Style::RADIUS_S, HUD_CARD_BG.gamma_multiply(0.94));
@@ -3389,7 +3396,7 @@ fn paint_acquiring_chip(painter: &Painter, center_top: Pos2) {
     painter.galley(
         egui::pos2(r.left() + Style::SP_M, r.center().y - galley.size().y / 2.0),
         galley,
-        Style::TEXT_STRONG,
+        MAP_TEXT_STRONG,
     );
 }
 
@@ -3603,7 +3610,7 @@ fn paint_provider_unavailable(painter: &Painter, rect: Rect, label: &str) {
         Align2::LEFT_CENTER,
         label,
         FontId::proportional(Style::SMALL),
-        Style::TEXT_DIM,
+        MAP_TEXT_DIM,
     );
 }
 
@@ -3693,8 +3700,8 @@ fn paint_speedometer(
     painter.circle_stroke(c, r, Stroke::new(1.5, Style::BORDER));
     let speed = primary.map(|s| s.speed_mph).filter(|v| v.is_finite());
     let (num, tone) = match (has_fix, speed) {
-        (true, Some(v)) => (format!("{:.0}", v.max(0.0)), Style::TEXT_STRONG),
-        _ => ("--".to_string(), Style::TEXT_DIM),
+        (true, Some(v)) => (format!("{:.0}", v.max(0.0)), MAP_TEXT_STRONG),
+        _ => ("--".to_string(), MAP_TEXT_DIM),
     };
     painter.text(
         egui::pos2(c.x, c.y - Style::SP_XS),
@@ -3708,7 +3715,7 @@ fn paint_speedometer(
         Align2::CENTER_CENTER,
         "mph",
         FontId::proportional(Style::SMALL),
-        Style::TEXT_DIM,
+        MAP_TEXT_DIM,
     );
 }
 
@@ -3721,7 +3728,7 @@ fn paint_alert_pill(
     tone: Color32,
 ) -> f32 {
     let font = FontId::proportional(Style::BODY);
-    let galley = painter.layout_no_wrap(text.to_string(), font.clone(), Style::TEXT_STRONG);
+    let galley = painter.layout_no_wrap(text.to_string(), font.clone(), MAP_TEXT_STRONG);
     let icon_w = 18.0;
     let h = 28.0;
     let w = (icon_w + Style::SP_S + galley.size().x + Style::SP_M * 1.5).min(380.0);
@@ -3742,14 +3749,14 @@ fn paint_alert_pill(
     let _ = paint_carbon(painter, irect, icon, tone);
     let tmax = (r.right() - Style::SP_S - (irect.right() + Style::SP_S)).max(1.0);
     let shown = elide(painter, text, font.clone(), tmax);
-    let g2 = painter.layout_no_wrap(shown, font, Style::TEXT_STRONG);
+    let g2 = painter.layout_no_wrap(shown, font, MAP_TEXT_STRONG);
     painter.galley(
         egui::pos2(
             irect.right() + Style::SP_S,
             r.center().y - g2.size().y / 2.0,
         ),
         g2,
-        Style::TEXT_STRONG,
+        MAP_TEXT_STRONG,
     );
     y + h + Style::SP_S
 }
@@ -3794,12 +3801,12 @@ fn paint_fab(
             let tone = if muted {
                 Style::WARN
             } else {
-                Style::TEXT_STRONG
+                MAP_TEXT_STRONG
             };
             let _ = paint_carbon(painter, icon_box, name, tone);
         }
         "overview" => {
-            let _ = paint_carbon(painter, icon_box, "view-grid", Style::TEXT_STRONG);
+            let _ = paint_carbon(painter, icon_box, "view-grid", MAP_TEXT_STRONG);
         }
         "preview" => {
             let _ = paint_carbon(painter, icon_box, "road", Style::ACCENT_HI);

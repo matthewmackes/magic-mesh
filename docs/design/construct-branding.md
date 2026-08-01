@@ -39,7 +39,7 @@ share and locked its placement:
 | 9 | **Canonical codename = "Construct"** | The 12.x codename is **Construct** — the version line is `<workspace version> "Construct"`; supersedes the earlier legacy naming in current code/docs and release notes. |
 | 10 | Product name (user-facing) | **"Construct"** in About/splash/chrome, with **"Software Studio: MDE"** and the derived **`Release <workspace version>`** line as supporting visible identity where space allows; `magic-mesh` stays the infra/mesh + package name underneath (GNOME vs gnome-shell split). |
 | 11 | DRM boot-splash image | **`CONSTRUCT-WALLPAPER1.png`** is the source splash asset; the shell paints native Construct text and token progress over the shell field. |
-| 12 | Default desktop wallpaper | **`CONSTRUCT-WALLPAPER4.png`**; **all five generated Construct wallpapers ship** in the RPM as a selectable set. |
+| 12 | Desktop wallpaper provider | **Bing daily picture** is the sole supported desktop wallpaper provider. The Construct wallpaper artwork is not a selectable wallpaper set; `CONSTRUCT-WALLPAPER1.png` remains the DRM boot-splash source above. |
 | 13 | About / System panel | **`CONSTRUCT-MAIN.png`** is the canonical Construct lockup source; About renders the text identity from `brand::logo`. |
 | 14 | README banner | **`logo-lockup.png`** is regenerated from the Construct source image. |
 | 15 | Product icon | **Crop the round mesh-node mark** from the artwork into the square app icon (16–512px rasters, replacing `app-icon.png`/favicon) **AND vector-trace it** so the in-shell dock/chrome mark is tintable + DPI-perfect. |

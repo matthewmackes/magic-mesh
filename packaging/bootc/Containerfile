@@ -133,20 +133,9 @@ RUN set -eux; \
         qemu-img; \
     dnf clean all
 
-# BOOKMARKS-9 (browser packaging, docs/design/mesh-bookmarks.md + docs/THREAT_MODEL.md)
-# — the Servo browser helper. `/usr/bin/mde-web-preview` ships IN the magic-mesh
-# RPM installed above, so the base bootc image already carries the browser binary
-# (its confined SELinux domain loads via the boot-bounded SELinux policy oneshot
-# on QC-22 enforcing nodes; where SELinux is unavailable/disabled the helper's
-# in-process OS sandbox remains the confinement). WHETHER it may spawn is decided
-# at RUNTIME by the BOOKMARKS-8
-# `browser_policy` worker (per-role enable/disable), never baked into the image.
-# The helper's Servo runtime libs are HARD Requires of the RPM, so the install
-# above already pulled them; install them explicitly too (mirroring the seat +
-# storage blocks) so an offline compose from a staged local RPM cannot miss them:
-# the offscreen GL/EGL + surfaceless GBM stack, Vulkan ICD + loader, and the
-# font/shaping stack. NO firefox/nss — Servo is self-contained (rustls system-CA
-# TLS). Inert on a Lighthouse (the browser self-gates on the Workstation role).
+# The VM-backed Browser owns its engine/runtime inside the guest. The host image
+# retains only the graphics/text libraries needed by the egui/VDI display stack;
+# no host Browser helper or engine is installed here.
 RUN set -eux; \
     dnf -y install \
         mesa-libEGL mesa-libGL mesa-libGLES mesa-libgbm mesa-dri-drivers \

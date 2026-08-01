@@ -64,15 +64,10 @@ Environment=MDE_MAPS_DIR=/var/lib/mde/maps
 # root is intentional for now: DRM master + /dev/input/* need seat ownership and
 # there is no logind/seatd integration yet (follow-up noted in
 # packaging/bootc/README.md). Containment doctrine follows mackesd.service.
-# Browser helpers create per-tab child cgroups for memory/CPU caps. Without
-# delegation, systemd keeps the shell in a non-delegated service cgroup and the
-# helper can only log a degraded sandbox. Delegate the subtree so the OS sandbox's
-# cgroup layer is real on shipped Workstation seats. The shell itself runs in a
-# stable child subgroup, leaving the service root empty so helpers can enable
-# memory/cpu controllers there and move themselves into capped sibling cgroups.
+# Managed guest workloads may create child cgroups beneath the shell service.
+# Keep delegation at the service boundary; Browser engine confinement belongs to
+# the Browser VM rather than the host seat.
 Delegate=yes
-DelegateSubgroup=shell
-Environment=MDE_WEB_SANDBOX_DELEGATE_SUBGROUP=shell
 Restart=always
 RestartSec=2
 # `OnFailure=getty@tty1.service` above restores the console only after the

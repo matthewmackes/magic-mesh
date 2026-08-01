@@ -306,7 +306,7 @@ fn settings_choice_tiles_use_themed_selected_and_hover_colors() {
 }
 
 #[test]
-fn wallpaper_service_defaults_enable_bing_fallback_and_round_trip() {
+fn wallpaper_service_defaults_to_bing_and_normalizes_retired_providers() {
     let cfg = WallpaperServiceConfig::default();
     assert!(cfg.network_fetch_enabled);
     assert!(cfg.bing_daily_enabled);
@@ -316,7 +316,7 @@ fn wallpaper_service_defaults_enable_bing_fallback_and_round_trip() {
     let path = dir.join("settings-wallpaper-service.json");
     let changed = WallpaperServiceConfig {
         network_fetch_enabled: false,
-        bing_daily_enabled: true,
+        bing_daily_enabled: false,
         desktop_page_url: "  http://127.0.0.1:8787/  ".to_owned(),
         last_image_path: Some(dir.join("wallpaper-cache").join("bing.jpg")),
         last_image_title: "  Today  ".to_owned(),
@@ -327,7 +327,7 @@ fn wallpaper_service_defaults_enable_bing_fallback_and_round_trip() {
     let loaded = WallpaperServiceConfig::load_from(&path);
     assert!(!loaded.network_fetch_enabled);
     assert!(loaded.bing_daily_enabled);
-    assert_eq!(loaded.desktop_page_url, "http://127.0.0.1:8787/");
+    assert!(loaded.desktop_page_url.is_empty());
     assert_eq!(loaded.last_image_title, "Today");
     assert_eq!(loaded.last_image_copyright, "Credit");
     assert_eq!(loaded.last_updated_ms, 42);
@@ -352,7 +352,7 @@ fn bing_daily_archive_parser_resolves_relative_image_url() {
 }
 
 #[test]
-fn wallpaper_section_renders_selectable_backdrop_and_bing_service() {
+fn wallpaper_section_renders_bing_service_without_retired_provider_controls() {
     let ctx = egui::Context::default();
     Style::install(&ctx);
     mde_egui::fonts::install(&ctx);
@@ -360,10 +360,22 @@ fn wallpaper_section_renders_selectable_backdrop_and_bing_service() {
     let texts = painted_text(&out.shapes);
 
     for label in [
-        "Construct wallpaper",
+        "Bing wallpaper",
         "Home wallpaper",
         "Enable wallpaper on Home",
-        "Current selection: Wallpaper 4 (default)",
+        "Bing image of the day",
+        "Allow Bing daily picture downloads",
+        "Download today's picture",
+    ] {
+        assert!(
+            texts.iter().any(|(text, _)| text == label),
+            "Wallpaper service label {label:?} was not painted: {texts:?}"
+        );
+    }
+
+    for retired in [
+        "Construct wallpaper",
+        "Current selection:",
         "Set Wallpaper 1",
         "Set Wallpaper 2",
         "Set Wallpaper 3",
@@ -372,13 +384,19 @@ fn wallpaper_section_renders_selectable_backdrop_and_bing_service() {
         "Desktop background service",
         "Allow daily picture downloads",
         "Use Bing image of the day as fallback",
-        "Download today's picture",
+        "Desktop page URL",
     ] {
         assert!(
-            texts.iter().any(|(text, _)| text == label),
-            "Wallpaper service label {label:?} was not painted: {texts:?}"
+            !texts.iter().any(|(text, _)| text == retired || text.starts_with(retired)),
+            "Retired wallpaper control {retired:?} was still painted: {texts:?}"
         );
     }
+    assert!(
+        !texts
+            .iter()
+            .any(|(text, _)| text.contains("127.0.0.1") || text.contains("http://")),
+        "Wallpaper section should not render a custom desktop URL: {texts:?}"
+    );
 }
 
 #[test]
