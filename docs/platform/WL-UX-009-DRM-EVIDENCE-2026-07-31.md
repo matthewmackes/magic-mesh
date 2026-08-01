@@ -45,6 +45,9 @@ normal secure runtime settings.
 | Dell Dark Storage | This Node → Storage | native desktop capture, `1366x768`; disk body continues below scroll boundary | `d8a7d843f6071d9041ab1f863e1050115f18c5d7fdadff8b2f20a1ccaa5fa453` |
 | Dell Dark narrow Storage | This Node → Storage | `800` logical width; unused right side is intentional and disk body scrolls vertically | `8cd8f3d7882c54bf3bdfd30d51178b8b42d1840d41f402bb4d1c881a7e81a321` |
 | Dell Light / Largest Storage | This Node → Storage | native desktop capture, `1366x768`; large-text disk body continues below scroll boundary | `06e2fa4bb72088f74f39008434ed06ba4ea6e932faf72f7e7a060a24f976c0bd` |
+| Dell Dark Files (payload `44296eee`) | Files | native `1366x768` direct-DRM capture; shared MenuBar, sidebar, file list, preview pane, and status strip remain separated | `25aadf12b0dd4255feb1eed7d9890f3fbcefc646f2074695b9325cfb89da3fc7` |
+| Dell Dark narrow Files (payload `44296eee`) | Files | `800` logical width; file toolbar, sidebar, list, preview boundary, and bottom status remain readable without horizontal overlap | `ff6e00b5d23cba1c8948f7c7c7841b20649b26e727444a9c9ed612cf61ff7ed1` |
+| Dell Light / Largest Files (payload `44296eee`) | Files | native `1366x768` direct-DRM capture; large-text sidebar state rows are fully visible above the bottom status strip | `2f528d356901b79be899217a48e72a7a689cb5811cdd8139751ff7095e0febb9` |
 
 | Dell Dark Phones (`AppFrame`, payload `035c4f3a`) | Phones | native `1366x768` direct-DRM capture; centered shared frame title and paired-device card render without overlap | `d8e3c1ef03adc371e424372846ce0fc44ff4351d1f100fc555049ab2c65e115f` |
 | Dell Dark narrow Phones (`AppFrame`, payload `035c4f3a`) | Phones | `800` logical width; centered frame title, status row, and clipboard field remain unobstructed | `6d203641bf923fb3b09c5f47512e5c3c947d06b121ca0c0155dcf8d2f469dc46` |
@@ -57,7 +60,9 @@ The captures show the shared MenuBar, AppFrame detail header, Editor,
 Bookmarks, and Storage workspace bodies, toolbars, side rails, taskbar,
 Dark/Light palettes, and large-text containment without the
 previous body collapse or scanout corruption. Phones and Timers now also have direct Dark,
-Dark narrow, and Light/Largest proof; Phones uses the shared `AppFrame`, and the
+Dark narrow, and Light/Largest proof; Files now also has current-payload direct
+Dark, Dark narrow, and Light/Largest proof after tightening its large-text sidebar
+gaps; Phones uses the shared `AppFrame`, and the
 narrow layout keeps the workspace field clear by delegating the profile toggle to
 Control Center. The narrow capture intentionally
 uses an 800-point logical viewport on the 1920-pixel panel; the unused right
@@ -78,6 +83,8 @@ side is outside the proof viewport, not an overlap.
 - `mde-shell-egui::tests::layout_profile_button_sits_in_the_taskbar_gap_clear_of_surface_content` — passed.
 - `mde-shell-egui::tests::compact_width_uses_control_center_for_the_layout_toggle` — passed.
 - `mde-shell-egui::timers::tests::the_panel_renders_headless_over_real_state` — passed after the Timers `AppFrame` migration.
+- `mde-files-egui` full package suite — 165 passed, 0 failed, including the
+  real Files sidebar and large-text-compatible rendering fixtures.
 - Worklist acceptance remains open for the full workspace matrix, remaining
   Construct-owned routes/states, and final production evidence. This is clean
   representative proof, not a claim that every route is production-ready.

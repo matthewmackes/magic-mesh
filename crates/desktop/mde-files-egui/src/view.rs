@@ -1524,49 +1524,66 @@ fn sidebar(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
     egui::SidePanel::left("files-side")
         .default_width(Style::SP_XL * 7.0)
         .show_inside(ui, |ui| {
-            ui.add_space(Style::SP_S);
-            let host = if b.self_node().host.is_empty() {
-                "this node"
-            } else {
-                b.self_node().host.as_str()
-            };
-            ui.label(RichText::new(host).color(Style::TEXT).strong());
-            ui.colored_label(Style::TEXT_DIM, node_role(b));
-            mesh_badge(ui, b);
-            ui.add_space(Style::SP_M);
+            // Large text can make the compact sidebar taller than the content
+            // viewport. Keep the sidebar's complete destination contract
+            // reachable instead of allowing its tail to disappear beneath the
+            // shared bottom status strip.
+            egui::ScrollArea::vertical()
+                .id_salt("files-sidebar-scroll")
+                .show(ui, |ui| {
+                    // At the largest text step, preserve complete state rows in
+                    // the first viewport by tightening only the decorative gaps;
+                    // labels and hit targets retain their shared scaled sizes.
+                    let large_text = ui.ctx().zoom_factor() > 1.25;
+                    let section_gap = if large_text {
+                        Style::SP_XS
+                    } else {
+                        Style::SP_M
+                    };
+                    ui.add_space(if large_text { Style::SP_XS } else { Style::SP_S });
+                    let host = if b.self_node().host.is_empty() {
+                        "this node"
+                    } else {
+                        b.self_node().host.as_str()
+                    };
+                    ui.label(RichText::new(host).color(Style::TEXT).strong());
+                    ui.colored_label(Style::TEXT_DIM, node_role(b));
+                    mesh_badge(ui, b);
+                    ui.add_space(section_gap);
 
-            section_header(ui, "PLACES");
-            for spot in LOCAL_SPOTS {
-                let here = matches!(b.active_tab().location(), Location::Local(p) if p.as_str() == spot.path);
-                if local_place_row(ui, local_place_icon(spot.path), spot.label, here).clicked() {
-                    actions.push(Action::Navigate(active, Location::Local(spot.path.to_string())));
+                    section_header(ui, "PLACES");
+                    for spot in LOCAL_SPOTS {
+                        let here = matches!(b.active_tab().location(), Location::Local(p) if p.as_str() == spot.path);
+                        if local_place_row(ui, local_place_icon(spot.path), spot.label, here).clicked() {
+                            actions.push(Action::Navigate(active, Location::Local(spot.path.to_string())));
+                        }
+                    }
+                    ui.add_space(section_gap);
+
+                    section_header(ui, "MESH");
+                    if b.peers().is_empty() {
+                        muted_note(ui, "No peers connected.");
+                    } else {
+                        muted_note(
+                            ui,
+                            format!(
+                                "{} of {} reachable",
+                                b.reachable_destinations().len(),
+                                b.peers().len()
+                            ),
+                        );
+                        for peer in b.peers() {
+                            peer_row(ui, b, peer, active, actions);
+                        }
+                    }
+                    ui.add_space(Style::SP_M);
+
+                    // TRANSFERS-8 — the destination drop dock (Q13 entry 3).
+                    // Drag a file selection onto a target to queue a transfer;
+                    // a click opens the New Transfer dialog pointed here.
+                    destinations_section(ui, b, actions);
                 }
-            }
-            ui.add_space(Style::SP_M);
-
-            section_header(ui, "MESH");
-            if b.peers().is_empty() {
-                muted_note(ui, "No peers connected.");
-            } else {
-                muted_note(
-                    ui,
-                    format!(
-                        "{} of {} reachable",
-                        b.reachable_destinations().len(),
-                        b.peers().len()
-                    ),
                 );
-                for peer in b.peers() {
-                    peer_row(ui, b, peer, active, actions);
-                }
-            }
-            ui.add_space(Style::SP_M);
-
-            // TRANSFERS-8 — the destination drop dock (Q13 entry 3). Drag a file
-            // selection onto a target to queue a transfer; a click opens the New
-            // Transfer dialog pointed here. Visible on both surface tabs (the sidebar
-            // is shared), so a drag from the Files tab reaches a target either way.
-            destinations_section(ui, b, actions);
         });
 }
 
