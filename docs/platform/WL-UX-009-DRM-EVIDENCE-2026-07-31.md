@@ -42,9 +42,12 @@ normal secure runtime settings.
 | Dell Light / Largest Bookmarks | Bookmarks → Details | native desktop capture, `1366x768`; large text and scrollable body | `e7f7d1dc2ca4d880fbbe19d0fbb0225a738f2500fa42d837d4e0ab151e953742` |
 
 | Dell Dark narrow Bookmarks | Bookmarks → Details | `800` logical width on native scanout; unused right side is intentional | `2db329f128c6d8d7af8e948b2bd5481bba8a3a93e1242a5fa1d73866ea953bed` |
-The captures show the shared MenuBar, AppFrame detail header, Editor and
-Bookmarks workspace bodies, toolbars, side rails, taskbar, Dark/Light palettes,
-and large-text containment without the
+| Dell Dark Storage | This Node → Storage | native desktop capture, `1366x768`; disk body continues below scroll boundary | `d8a7d843f6071d9041ab1f863e1050115f18c5d7fdadff8b2f20a1ccaa5fa453` |
+| Dell Dark narrow Storage | This Node → Storage | `800` logical width; unused right side is intentional and disk body scrolls vertically | `8cd8f3d7882c54bf3bdfd30d51178b8b42d1840d41f402bb4d1c881a7e81a321` |
+| Dell Light / Largest Storage | This Node → Storage | native desktop capture, `1366x768`; large-text disk body continues below scroll boundary | `06e2fa4bb72088f74f39008434ed06ba4ea6e932faf72f7e7a060a24f976c0bd` |
+The captures show the shared MenuBar, AppFrame detail header, Editor,
+Bookmarks, and Storage workspace bodies, toolbars, side rails, taskbar,
+Dark/Light palettes, and large-text containment without the
 previous body collapse or scanout corruption. The narrow capture intentionally
 uses an 800-point logical viewport on the 1920-pixel panel; the unused right
 side is outside the proof viewport, not an overlap.

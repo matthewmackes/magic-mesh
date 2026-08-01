@@ -1164,8 +1164,8 @@ remains here under a completed status.
   [`WL-UX-009-DRM-EVIDENCE-2026-07-31.md`](WL-UX-009-DRM-EVIDENCE-2026-07-31.md).
   The verified shell payload is active on `.138` and Dell with `NRestarts=0`;
   `.138` has Dark desktop/narrow and Light/Largest Editor proof; Dell has clean
-  Dark Editor/System/Bookmarks frames, Dell narrow Bookmarks proof, and
-  Light/Largest System/Bookmarks proof.
+  Dark Editor/System/Bookmarks/Storage frames, Dell narrow Bookmarks/Storage
+  proof, and Light/Largest System/Bookmarks/Storage proof.
   The full RPM dependency transaction remains
   open because its Fedora runtime dependencies do not match the seats; `.15`,
   the remaining routes/states, full matrix, and production readiness remain open.
