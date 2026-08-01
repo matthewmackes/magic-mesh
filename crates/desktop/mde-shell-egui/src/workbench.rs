@@ -18,7 +18,7 @@
 //! control only.
 
 use mde_egui::egui;
-use mde_egui::nav_chrome::NavigationBar;
+use mde_egui::nav_chrome::AppFrame;
 use mde_egui::Style;
 
 /// One of the four top-level control planes of the Workbench, ordered by blast
@@ -163,11 +163,11 @@ pub fn show(
         // ── Content pane for the selected plane ──────────────────────────────
         ui.vertical(|ui| {
             // PLATFORM-INTERFACES Q19/Q20 — the pane title rides the shared
-            // NavigationBar (the Title3 rung) instead of the old hand-rolled
-            // BODY-strong title row; the Settings detail-pane idiom. No back
-            // affordance: the rail is fixed beside the pane — the two never
-            // collapse to one, so there is nothing to go back FROM.
-            let _ = NavigationBar::new(selected.label()).show(ui);
+            // AppFrame (and its NavigationBar Title3 rung) instead of a
+            // surface-specific chrome call. No back affordance: the rail is
+            // fixed beside the pane — the two never collapse to one, so there
+            // is nothing to go back FROM.
+            let _ = AppFrame::new(selected.label()).show(ui);
             ui.add_space(Style::SP_XS);
             ui.colored_label(Style::TEXT_DIM, selected.blurb());
             ui.add_space(Style::SP_M);
@@ -561,8 +561,9 @@ mod tests {
     }
 
     /// PLATFORM-INTERFACES Q19/Q20 adoption — the content pane's title renders
-    /// through the shared [`mde_egui::nav_chrome::NavigationBar`], i.e. on the
-    /// [`Style::TYPE_TITLE3`] rung, not the old hand-rolled BODY-strong row.
+    /// through the shared [`mde_egui::nav_chrome::AppFrame`], i.e. on its
+    /// [`mde_egui::nav_chrome::NavigationBar`] Title3 rung, not a
+    /// surface-specific chrome call.
     #[test]
     fn the_content_pane_title_rides_the_shared_navigation_bar() {
         use mde_egui::egui::{self, pos2, vec2, Rect};

@@ -7,12 +7,18 @@ workspace frame. It does not close WL-UX-009 or claim production readiness.
 
 - Seat: `.138` (`172.20.146.138`), physical Fedora 44 DRM seat.
 - Connector: `card1-eDP-1`, connected; capture mode `1920x1080`.
-- Shell artifact: `bea573f929239e819eeeca2425ad8f1132485fadb1f8fb010f9ed97376dab8b7`.
+- Shell payload: `ff3e956f6c848ad462355b225a14967f4d2ac55b500a86d5bb6490723db9fcd4`.
+- Farm RPM: `magic-mesh-12.1.6-1.x86_64.rpm`, SHA-256
+  `53835242591b1d3217fc2d83f14021f9cba41fb68a86c295d7c7373ffbee4d75`.
 - Build: BigBoy farm `172.20.0.130`, slot 11, release shell with
   `drm,live-helper,live-vdi,media-mpv`.
 - Runtime: `mde-shell-egui.service` active, `NRestarts=0` after deployment.
-- Dell deployment: `172.20.146.225` (`DELL-LAPTOP`) received the same artifact;
-  service active with `NRestarts=0`.
+- Dell deployment: `172.20.146.225` (`DELL-LAPTOP`) received the same extracted
+  shell payload; service active with `NRestarts=0`.
+- The complete RPM was not installed on either seat because its Fedora build
+  dependency set does not match the installed seat runtime. The verified shell
+  payload was deployed directly for GUI proof, with the prior binary preserved
+  on each seat as `/tmp/mde-shell-egui-before-appframe`.
 
 ## Captures
 
@@ -29,7 +35,7 @@ normal secure runtime settings.
 | `.138` Dark desktop | Mesh Teams → Files → Editor | `1536x864` at `1.25` ppp | `b81178e67eed91a4b488e0efd858c73a9ca11b99657b6775800dc40857a0ad38` |
 | `.138` Dark narrow | Mesh Teams → Files → Editor | `800x576` at `1.875` ppp; right-side unused scanout is intentional | `2975ee02529543deb2f237021bf377c420d22d1908b8af7305485a2d99401c75` |
 | `.138` Light / Largest | Mesh Teams → Files → Editor | `1024x576` at `1.875` ppp | `32b9267765783a4019664ad87f3cee43fa81a5b48c0ef0233d93410620d5e2e0` |
-| Dell Dark desktop | Mesh Teams → Files → Editor | native desktop capture, `1920x1080` | `10afd8cc2ee620817a3b43c4a902cb91223fecc52f7688dc256e3d62b4e0810d` |
+| Dell Dark desktop (new shell payload) | Mesh Teams → Files → Editor | native desktop capture, `1366x768` | `1577918fe3f6477080c0ec6712391f2eb3018214e190908bebd0e944240f35b6` |
 
 The captures show the shared MenuBar, Editor workspace body, toolbars, side
 rails, taskbar, Dark/Light palettes, and large-text containment without the
@@ -45,6 +51,8 @@ side is outside the proof viewport, not an overlap.
   1280px and 800px layouts.
 - `mde-egui` focused navigation suite — 8 passed, including AppFrame large-text
   composition and Sidebar keyboard selection.
+- `mde-shell-egui workbench::tests` — 5 passed, including the Workbench pane
+  rendering through the shared `AppFrame` primitive.
 - Worklist acceptance remains open for the full workspace matrix, remaining
   Construct-owned routes/states, and final production evidence. This is clean
   representative proof, not a claim that every route is production-ready.

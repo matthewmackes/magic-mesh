@@ -1158,14 +1158,15 @@ remains here under a completed status.
 - Current state: Shared Quazar typography, palettes, chrome primitives, state
   panels, menubars, dense lists, and most Construct-owned route migrations are
   landed; farm suites cover shell, Editor, Teams, Maps, Files, Bookmarks, Music,
-  Device, Storage, and This Node. The 2026-07-31 MenuBar/Sidebar fixes and
-  2026-08-01 clean direct-DRM captures are recorded in
+  Device, Storage, and This Node. Workbench now consumes the shared `AppFrame`
+  primitive, covered by five focused shell tests. The 2026-08-01 direct-DRM
+  captures and deployment details are recorded in
   [`WL-UX-009-DRM-EVIDENCE-2026-07-31.md`](WL-UX-009-DRM-EVIDENCE-2026-07-31.md).
-  `.138` and Dell (`172.20.146.225`) have the same artifact deployed with
-  `NRestarts=0`; `.138` now has clean Dark desktop, Dark narrow, and
-  Light/Largest Editor captures, and Dell has a clean Dark desktop capture.
-  `.15` remains open, as do the remaining routes/states, full matrix, and
-  production readiness.
+  The verified shell payload is active on `.138` and Dell with `NRestarts=0`;
+  `.138` has Dark desktop/narrow and Light/Largest Editor proof, and Dell has a
+  new clean Dark desktop frame. The full RPM dependency transaction remains
+  open because its Fedora runtime dependencies do not match the seats; `.15`,
+  the remaining routes/states, full matrix, and production readiness remain open.
 - Remaining work:
 
   1. Finish the shared app-frame and Terminal-pattern unified top bar, including
