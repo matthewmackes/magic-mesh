@@ -7,7 +7,7 @@ workspace frame. It does not close WL-UX-009 or claim production readiness.
 
 - Seat: `.138` (`172.20.146.138`), physical Fedora 44 DRM seat.
 - Connector: `card1-eDP-1`, connected; capture mode `1920x1080`.
-- Shell payload: `ff3e956f6c848ad462355b225a14967f4d2ac55b500a86d5bb6490723db9fcd4`.
+- Shell payload: `a40013fc62162da957e9e0df3619b0ddb1b3262cd36b8d077843a38c14f0399c`.
 - Farm RPM: `magic-mesh-12.1.6-1.x86_64.rpm`, SHA-256
   `53835242591b1d3217fc2d83f14021f9cba41fb68a86c295d7c7373ffbee4d75`.
 - Build: BigBoy farm `172.20.0.130`, slot 11, release shell with
@@ -36,6 +36,8 @@ normal secure runtime settings.
 | `.138` Dark narrow | Mesh Teams → Files → Editor | `800x576` at `1.875` ppp; right-side unused scanout is intentional | `2975ee02529543deb2f237021bf377c420d22d1908b8af7305485a2d99401c75` |
 | `.138` Light / Largest | Mesh Teams → Files → Editor | `1024x576` at `1.875` ppp | `32b9267765783a4019664ad87f3cee43fa81a5b48c0ef0233d93410620d5e2e0` |
 | Dell Dark desktop (new shell payload) | Mesh Teams → Files → Editor | native desktop capture, `1366x768` | `1577918fe3f6477080c0ec6712391f2eb3018214e190908bebd0e944240f35b6` |
+| Dell Dark System (new AppFrame payload) | System → Wallpaper | native desktop capture, `1366x768` | `f2a9d743deca96566651f0ac8caae3a0d313bd56c045aad10e92d70956c48958` |
+| Dell Light / Largest System | System → Wallpaper | native `1366x768`; large text continues in the scrollable settings body | `35e20f37fc4685baf8edd4594d9789dd8ffd491edb8441f7d70c860a99170238` |
 
 The captures show the shared MenuBar, Editor workspace body, toolbars, side
 rails, taskbar, Dark/Light palettes, and large-text containment without the
@@ -53,6 +55,8 @@ side is outside the proof viewport, not an overlap.
   composition and Sidebar keyboard selection.
 - `mde-shell-egui workbench::tests` — 5 passed, including the Workbench pane
   rendering through the shared `AppFrame` primitive.
+- `mde-shell-egui system::tests::the_sidebar` — 3 passed, including the
+  selected-section title count; `system::tests::a_narrowed_sidebar` — 1 passed.
 - Worklist acceptance remains open for the full workspace matrix, remaining
   Construct-owned routes/states, and final production evidence. This is clean
   representative proof, not a claim that every route is production-ready.

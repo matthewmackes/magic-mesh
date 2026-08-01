@@ -38,7 +38,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mde_egui::egui::{self, ComboBox, RichText, Slider};
-use mde_egui::nav_chrome::{NavigationBar, Sidebar, SidebarRow, SidebarSection};
+use mde_egui::nav_chrome::{AppFrame, Sidebar, SidebarRow, SidebarSection};
 use mde_egui::style::Elevation;
 use mde_egui::{
     field, muted_note, Density, Formfactor, InputPolicy, LayoutProfile, Motion, MotionMode,
@@ -771,16 +771,16 @@ impl SystemState {
 
             // The detail pane fills the remaining width and renders only the selected
             // section's body — expressive spacing, the whole right side. It sits
-            // under the shared Q19 [`NavigationBar`] carrying the active section's
+            // under the shared Q19 [`AppFrame`] carrying the active section's
             // title on the Title3 rung (PLATFORM-INTERFACES Q27). No back
             // affordance: the rail is a fixed SidePanel — the two panes never
             // collapse to one, so there is nothing to go back FROM. It rests on the
             // same Carbon layer-01 page (SETTINGS-2); the section body raises to a
             // layer-02 card inside (see [`settings_detail`]).
-            egui::CentralPanel::default()
+                egui::CentralPanel::default()
                 .frame(page_frame(Style::SP_L))
                 .show_inside(ui, |ui| {
-                    let _ = NavigationBar::new(selected.label()).show(ui);
+                    let _ = AppFrame::new(selected.label()).show(ui);
                     ui.add_space(Style::SP_M);
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
@@ -3112,7 +3112,7 @@ fn settings_choice_tile(
 }
 
 /// The detail pane body (SETTINGS-1, PLATFORM-INTERFACES Q27): the selected
-/// section's body — titled by the pane's [`NavigationBar`], not an in-body
+/// section's body — titled by the pane's [`AppFrame`], not an in-body
 /// header — rendered by calling the EXISTING per-section fn verbatim (§6 — no
 /// forked logic; every `apply()`/`SysAction` seam is reused). The Mesh & System
 /// sections (SETTINGS-4) render this node's real identity / role / pairing /
@@ -3139,7 +3139,7 @@ fn settings_detail(
     prompt_in_flight: bool,
     actions: &mut Vec<SysAction>,
 ) {
-    // The section title lives in the pane's shared NavigationBar (Q27) — the body
+    // The section title lives in the pane's shared AppFrame (Q27) — the body
     // starts straight on the Carbon layer-02 card raised above the layer-01 page,
     // ringed by a hairline border (SETTINGS-2 — [`section_card`]).
     section_card(ui, |ui| match section {

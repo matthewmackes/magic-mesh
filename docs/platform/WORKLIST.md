@@ -1158,13 +1158,13 @@ remains here under a completed status.
 - Current state: Shared Quazar typography, palettes, chrome primitives, state
   panels, menubars, dense lists, and most Construct-owned route migrations are
   landed; farm suites cover shell, Editor, Teams, Maps, Files, Bookmarks, Music,
-  Device, Storage, and This Node. Workbench now consumes the shared `AppFrame`
-  primitive, covered by five focused shell tests. The 2026-08-01 direct-DRM
+  Device, Storage, and This Node. Workbench and System now consume the shared
+  `AppFrame` primitive, covered by focused shell tests. The 2026-08-01 direct-DRM
   captures and deployment details are recorded in
   [`WL-UX-009-DRM-EVIDENCE-2026-07-31.md`](WL-UX-009-DRM-EVIDENCE-2026-07-31.md).
   The verified shell payload is active on `.138` and Dell with `NRestarts=0`;
-  `.138` has Dark desktop/narrow and Light/Largest Editor proof, and Dell has a
-  new clean Dark desktop frame. The full RPM dependency transaction remains
+  `.138` has Dark desktop/narrow and Light/Largest Editor proof; Dell has clean
+  Dark Editor/System frames and representative Light/Largest System proof. The full RPM dependency transaction remains
   open because its Fedora runtime dependencies do not match the seats; `.15`,
   the remaining routes/states, full matrix, and production readiness remain open.
 - Remaining work:
