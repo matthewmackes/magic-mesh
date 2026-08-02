@@ -650,6 +650,8 @@ impl PhonesHubState {
             ui.add_space(Style::SP_XS);
         }
         egui::ScrollArea::vertical()
+            .id_salt("phones-body")
+            .min_scrolled_height(Style::SP_XL * 18.0)
             .auto_shrink([false, false])
             .show(ui, |ui| match self.tab {
                 HubTab::Phones => self.phones_tab(ui),
@@ -2067,6 +2069,35 @@ mod tests {
             }),
             "the tooltip surface must round on the shared RADIUS_S tier: {rects:?}"
         );
+    }
+
+    #[test]
+    fn phones_body_remains_paint_reachable_at_narrow_and_large_text_sizes() {
+        for (width, zoom) in [(960.0, 1.0), (800.0, 1.0), (960.0, 1.5)] {
+            let ctx = egui::Context::default();
+            Style::install(&ctx);
+            ctx.set_zoom_factor(zoom);
+            let mut state = PhonesHubState::default();
+            let out = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 640.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| state.show(ui));
+                },
+            );
+            let text = painted_text_colors(&out.shapes);
+            for anchor in ["Features", "Remote input", "No phones paired yet"] {
+                assert!(
+                    text.iter().any(|(painted, _)| painted == anchor),
+                    "Phones body anchor {anchor:?} is missing at width={width}, zoom={zoom}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -14,6 +14,8 @@ pub enum Backend {
     PipeWire,
     /// `BlueZ` over the system D-Bus.
     Bluetooth,
+    /// NetworkManager over the system D-Bus.
+    Network,
     /// `UPower` over the system D-Bus.
     UPower,
     /// systemd-logind over the system D-Bus.
@@ -22,6 +24,8 @@ pub enum Backend {
     Display,
     /// The sysfs backlight class (`/sys/class/backlight`).
     Backlight,
+    /// The kernel keyboard LED class (`/sys/class/leds/*kbd_backlight`).
+    KeyboardBacklight,
     /// DDC/CI monitor control over i2c-dev. Real binding: E12-18.
     Ddc,
     /// `net.hadess.PowerProfiles` (power-profiles-daemon) over the system D-Bus.
@@ -31,6 +35,10 @@ pub enum Backend {
     ChargeThreshold,
     /// The laptop lid switch (`/proc/acpi/button/lid`, or an evdev `SW_LID`).
     Lid,
+    /// Fixed-root kernel thermal and hwmon observation.
+    Hardware,
+    /// systemd service lifecycle over the system D-Bus.
+    SystemdService,
 }
 
 impl Backend {
@@ -40,14 +48,18 @@ impl Backend {
         match self {
             Self::PipeWire => "PipeWire",
             Self::Bluetooth => "Bluetooth (BlueZ)",
+            Self::Network => "NetworkManager",
             Self::UPower => "UPower",
             Self::Logind => "logind",
             Self::Display => "DRM display",
             Self::Backlight => "backlight",
+            Self::KeyboardBacklight => "keyboard backlight",
             Self::Ddc => "DDC/CI",
             Self::PowerProfiles => "power-profiles-daemon",
             Self::ChargeThreshold => "charge threshold",
             Self::Lid => "lid switch",
+            Self::Hardware => "hardware sensors",
+            Self::SystemdService => "systemd service control",
         }
     }
 }

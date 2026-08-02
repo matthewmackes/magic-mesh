@@ -183,7 +183,11 @@ fn drm_proof_settle() -> Duration {
     std::env::var("MDE_DRM_PROOF_SETTLE_MS")
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
-        .map_or(Duration::ZERO, |ms| Duration::from_millis(ms.min(10_000)))
+        // Proof-only captures may need to wait through the DRM shell's boot
+        // milestones plus a routed workspace's first settled frame. Keep the
+        // operator-controlled delay bounded, but do not truncate a requested
+        // 30-second native-render validation window to the old 10-second cap.
+        .map_or(Duration::ZERO, |ms| Duration::from_millis(ms.min(60_000)))
 }
 
 /// Capture the actual EGL back buffer as CPU-linear RGBA for direct-DRM proof.
@@ -1988,7 +1992,15 @@ pub fn run_drm_with_clipboard(
                         DeviceEvent::Removed(e) => Some((false, e.device())),
                         _ => None,
                     };
-                    if let Some((added, device)) = added_dev {
+                    if let Some((added, mut device)) = added_dev {
+                        if added && device.config_tap_finger_count() > 0 {
+                            // libinput owns tap recognition; configure every
+                            // device as it is replayed/added so the persisted
+                            // This Node policy is real on the direct seat.
+                            let _ = device.config_tap_set_enabled(
+                                crate::input_policy().touchpad_tap_to_click,
+                            );
+                        }
                         if device.has_capability(DeviceCapability::Keyboard) {
                             kbd_count = if added {
                                 kbd_count + 1

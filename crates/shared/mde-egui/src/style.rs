@@ -305,6 +305,17 @@ impl Style {
     pub const SURFACE_HI: Color32 = Color32::from_rgb(0x2A, 0x2A, 0x32);
     /// Hairline borders + separators.
     pub const BORDER: Color32 = Color32::from_rgb(0x33, 0x33, 0x3D);
+    /// Backing for the Maps no-data callout, which stays dark over the map
+    /// canvas in both shell color schemes.
+    #[must_use]
+    pub fn map_empty_panel() -> Color32 {
+        Color32::from_rgba_unmultiplied(13, 18, 25, 238)
+    }
+    /// Edge token for the Maps no-data callout backing panel.
+    #[must_use]
+    pub fn map_empty_border() -> Color32 {
+        Color32::from_rgba_unmultiplied(184, 192, 204, 220)
+    }
 
     // ── Palette (Quazar Light) ─────────────────────────────────────────────
     /// Quazar Light warm desktop ground.
@@ -1598,6 +1609,20 @@ mod tests {
         SurfaceLevel, TypographyRole,
     };
     use crate::formfactor::Formfactor;
+
+    #[test]
+    fn maps_empty_state_tokens_keep_the_backing_panel_opaque_enough() {
+        assert_eq!(
+            Style::map_empty_panel(),
+            egui::Color32::from_rgba_unmultiplied(13, 18, 25, 238)
+        );
+        assert_eq!(
+            Style::map_empty_border(),
+            egui::Color32::from_rgba_unmultiplied(184, 192, 204, 220)
+        );
+        assert!(Style::map_empty_panel().a() > 200);
+        assert!(Style::map_empty_border().a() > 200);
+    }
 
     /// WCAG 2.1 **relative luminance** of an sRGB colour (`0.0..=1.0`; alpha ignored).
     /// Each 8-bit channel is normalized, linearized through the sRGB EOTF, then weighted

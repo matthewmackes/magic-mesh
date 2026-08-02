@@ -410,13 +410,20 @@ impl MenuBar {
             // A narrow workspace cannot give both the wrapped menu strip and the
             // live status cluster a safe minimum width in one row. Put status on
             // its own responsive row instead of letting it cover a menu label.
+            // Keep identity on a dedicated row as well: a wrapped menu strip can
+            // otherwise claim the title's remaining width and clip the workspace
+            // name (notably MEDIA at the 800 logical-pixel DRM proof width).
             ui.vertical(|ui| {
-                ui.horizontal_wrapped(|ui| {
+                ui.horizontal(|ui| {
                     ui.set_min_height(BAR_HEIGHT);
                     title_header(ui, model.title, colors.accent);
-                    ui.add_space(Style::SP_M);
-                    menu_strip(ui, model, &mnemonics, colors, &mut picked);
                 });
+                egui::ScrollArea::horizontal()
+                    .id_salt("menu-bar-narrow-scroll")
+                    .max_height(BAR_HEIGHT)
+                    .show(ui, |ui| {
+                        menu_strip(ui, model, &mnemonics, colors, &mut picked, false);
+                    });
                 status_cluster(ui, model.status);
             });
             return picked;
@@ -425,24 +432,38 @@ impl MenuBar {
         // status cluster wider than the current workspace. Let the shared
         // chrome grow to a second row instead of clipping commands, while the
         // normal desktop keeps the status button in the single top row.
-        let wrap = ui.available_width() < 1200.0 || ui.ctx().zoom_factor() > 1.1;
-        if wrap {
-            ui.horizontal_wrapped(|ui| {
-                ui.set_min_height(BAR_HEIGHT);
-                // Title — decorative identity only (lock 10), left-anchored.
-                title_header(ui, model.title, colors.accent);
-                ui.add_space(Style::SP_M);
-                // Inline menu strip.
-                menu_strip(ui, model, &mnemonics, colors, &mut picked);
-                // Live status cluster, hugging the right edge (lock 3/6).
-                status_cluster(ui, model.status);
-            });
+        let large_text = ui.ctx().zoom_factor() > 1.1;
+        let responsive_width = ui.available_width() < 1200.0;
+        if large_text || responsive_width {
+            // Large text gets a deliberate two-row contract: identity and a
+            // single-line, horizontally scrollable menu strip above status.
+            // This keeps menu commands reachable without turning one menu into
+            // an accidental second toolbar row when a label scale increases.
+            let row_width = ui.available_width().max(0.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(row_width, BAR_HEIGHT * 2.0),
+                Layout::top_down(Align::Min),
+                |ui| {
+                    ui.horizontal(|ui| {
+                        ui.set_min_height(BAR_HEIGHT);
+                        title_header(ui, model.title, colors.accent);
+                        ui.add_space(Style::SP_M);
+                        egui::ScrollArea::horizontal()
+                            .id_salt("menu-bar-large-text-scroll")
+                            .max_height(BAR_HEIGHT)
+                            .show(ui, |ui| {
+                                menu_strip(ui, model, &mnemonics, colors, &mut picked, false);
+                            });
+                    });
+                    status_cluster(ui, model.status);
+                },
+            );
         } else {
             ui.horizontal(|ui| {
                 ui.set_min_height(BAR_HEIGHT);
                 title_header(ui, model.title, colors.accent);
                 ui.add_space(Style::SP_M);
-                menu_strip(ui, model, &mnemonics, colors, &mut picked);
+                menu_strip(ui, model, &mnemonics, colors, &mut picked, false);
                 status_cluster(ui, model.status);
             });
         }
@@ -521,15 +542,35 @@ pub fn remote_sessions_button(ui: &mut Ui) {
 
 /// Paint the UPPERCASE mono accent title (lock 2/14).
 fn title_header(ui: &mut Ui, title: &str, accent: Color32) {
-    ui.label(
-        Style::typography_text(display_title(title), TypographyRole::Mono)
-            .font(Style::typography_font_with_size(
-                TypographyRole::Mono,
-                TITLE_FONT_SIZE,
-            ))
-            .extra_letter_spacing(TypographyRole::Title.letter_spacing())
-            .line_height(Some(TypographyRole::Title.line_height()))
-            .color(accent),
+    // A regular `Label` may be assigned only the remaining width by a wrapped
+    // menu layout. Measure the title with an unbounded wrap width and reserve
+    // its full galley before painting it, so workspace identity cannot become a
+    // partial word at narrow DRM widths (e.g. `MEDIA` must not become `ME`).
+    let mut job = Style::typography_job(
+        display_title(title),
+        TypographyRole::Mono,
+        accent,
+        f32::INFINITY,
+    );
+    if let Some(section) = job.sections.first_mut() {
+        section.format.font_id = Style::typography_font_with_size(
+            TypographyRole::Mono,
+            TITLE_FONT_SIZE,
+        );
+    }
+    let galley = ui.fonts(|fonts| fonts.layout_job(job));
+    // Leave a deliberate trailing reserve for egui's fractional-pixel text
+    // placement and glyph overhang. Without it the final glyph can be clipped
+    // on the 800 logical-pixel DRM profile even though the measured galley fits
+    // exactly (especially with the wider TERMINAL identity).
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(galley.size().x.ceil() + Style::SP_M, BAR_HEIGHT),
+        Sense::hover(),
+    );
+    ui.painter().galley(
+        egui::pos2(rect.left(), rect.center().y - galley.size().y * 0.5),
+        galley,
+        accent,
     );
 }
 
@@ -542,6 +583,7 @@ fn menu_strip<Id: Clone>(
     mnemonics: &[Option<char>],
     colors: MenuColors,
     picked: &mut Option<Id>,
+    wrap: bool,
 ) {
     let bar_id = ui.id();
     // The menu open *before* this frame's interaction — drives the open-spring and
@@ -551,10 +593,7 @@ fn menu_strip<Id: Clone>(
         .map(|root| root.id);
 
     let mut rects: Vec<(egui::Id, Rect)> = Vec::with_capacity(model.menus.len());
-    // Large text and narrow workspace panes must keep every top-level command
-    // reachable. Wrapping the menu strip itself is necessary because the outer
-    // frame also reserves space for the live status cluster.
-    ui.horizontal_wrapped(|ui| {
+    let mut render = |ui: &mut Ui| {
         // Flat, chrome-free top-level buttons — the menu-bar look (egui's own
         // menu-bar style): transparent resting fill keeps the title label-like.
         flatten_menu_buttons(ui);
@@ -581,7 +620,12 @@ fn menu_strip<Id: Clone>(
             let grow = Motion::animate(ui.ctx(), menu_id.with("underline"), hot, secs);
             paint_underline(ui, response.rect, colors.accent, grow);
         }
-    });
+    };
+    if wrap {
+        ui.horizontal_wrapped(&mut render);
+    } else {
+        ui.horizontal(&mut render);
+    }
 
     handle_alt_mnemonics(ui, bar_id, &rects, mnemonics);
 }

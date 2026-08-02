@@ -922,7 +922,7 @@ fn room_action_helpers_are_silent_without_a_bus() {
 
 // ── timestamps + presence/status/mute (the four closed gaps) ───────────────
 
-/// The message row's timestamp: a compact HH:MM (UTC) with a full-date hover,
+/// The message row's timestamp: a compact local HH:MM with a full-date hover,
 /// derived by the pure formatters — and the row paints over a real timestamped
 /// message. A non-positive time renders blank (never a fabricated "00:00").
 #[test]
@@ -930,9 +930,19 @@ fn message_row_renders_a_timestamp() {
     use mde_egui::egui::{pos2, vec2, Rect};
 
     // A known epoch: 1_700_000_000_000 ms = 2023-11-14 22:13:20 UTC.
-    assert_eq!(fmt_hh_mm(1_700_000_000_000), "22:13");
-    assert_eq!(fmt_full_datetime(1_700_000_000_000), "2023-11-14 22:13 UTC");
-    assert_eq!(fmt_date(1_700_000_000_000), "2023-11-14");
+    // Chat follows the configured This Node display zone (EST by default),
+    // so derive the expected local wall time instead of assuming UTC.
+    let shifted = 1_700_000_000_i64 + crate::timers::display_offset_seconds();
+    let tod = shifted.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(shifted.div_euclid(86_400));
+    let expected_hh_mm = format!("{:02}:{:02}", tod / 3600, (tod % 3600) / 60);
+    let expected_date = format!("{year:04}-{month:02}-{day:02}");
+    assert_eq!(fmt_hh_mm(1_700_000_000_000), expected_hh_mm);
+    assert_eq!(
+        fmt_full_datetime(1_700_000_000_000),
+        format!("{expected_date} {expected_hh_mm} {}", crate::timers::display_zone_label())
+    );
+    assert_eq!(fmt_date(1_700_000_000_000), expected_date);
     // A civil leap-year day still resolves (2024-02-29).
     assert_eq!(fmt_date(1_709_200_000_000), "2024-02-29");
     // A non-positive timestamp is an honest blank, not a faked clock.

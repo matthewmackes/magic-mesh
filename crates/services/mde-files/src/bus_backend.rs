@@ -30,6 +30,7 @@ use mackes_mesh_types::cloud::{
 };
 use serde::Deserialize;
 use tokio::runtime::Runtime;
+use mackes_mesh_types::service_record::{ServiceHealth, ServicesState};
 
 use crate::backend::{BackendError, ConflictPolicy, Destination, OpId, SendMode};
 use crate::model::{FileRow, Mime, Peer, PeerKind, PeerStatus, SelfNode};
@@ -357,6 +358,31 @@ impl BusBackend {
     pub fn with_call_timeout(mut self, t: Duration) -> Self {
         self.call_timeout = t;
         self
+    }
+
+    /// Whether the mesh currently has a probe-confirmed music service.
+    /// Published-only records are deliberately not enough to expose an
+    /// uploader: Files must only offer a route the daemon can reach now.
+    #[must_use]
+    pub fn music_service_available(&self) -> bool {
+        let Ok(persist) = mde_bus::persist::Persist::open(self.bus_dir.clone()) else {
+            return false;
+        };
+        persist
+            .list_topics()
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter(|topic| topic.starts_with("state/services/"))
+            .filter_map(|topic| persist.read_latest(&topic).ok().flatten())
+            .filter_map(|message| message.body)
+            .filter_map(|body| serde_json::from_str::<ServicesState>(&body).ok())
+            .any(|state| {
+                state.records.iter().any(|record| {
+                    matches!(record.health, ServiceHealth::Up)
+                        && matches!(record.kind.to_ascii_lowercase().as_str(), "airsonic" | "navidrome")
+                })
+            })
     }
 
     /// Fetch the JSON-encoded `SelfNode` and decode into the UI model.

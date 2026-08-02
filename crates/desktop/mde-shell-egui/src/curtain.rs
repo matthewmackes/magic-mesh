@@ -1502,6 +1502,10 @@ mod tests {
     /// An all-absent seat snapshot the per-section fixtures override.
     fn seat() -> SeatSnapshot {
         SeatSnapshot {
+            network: Probe::Absent {
+                backend: Backend::Network,
+                reason: "fixture does not publish NetworkManager state".to_owned(),
+            },
             bluetooth: absent(),
             batteries: absent(),
             on_ac: absent(),
@@ -1511,8 +1515,10 @@ mod tests {
             lid: absent(),
             displays: absent(),
             backlights: absent(),
+            keyboard_backlights: absent(),
             mixer: absent(),
             ddc: absent(),
+            hardware: absent(),
         }
     }
 
@@ -1527,6 +1533,7 @@ mod tests {
                 muted,
             },
             strips: Vec::new(),
+            capture: Vec::new(),
         }
     }
 

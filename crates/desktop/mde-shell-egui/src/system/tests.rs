@@ -4,6 +4,22 @@ use mde_egui::egui::{pos2, vec2, Rect};
 use mde_seat::{Battery, BatteryKind, BatteryState, ProfileState};
 use mde_theme::brand::icons::IconId;
 
+#[test]
+fn this_node_action_audit_is_bounded_redacted_and_drained() {
+    let mut state = SystemState::default();
+    for _ in 0..40 {
+        state.record_action_audit("Wi-Fi power", true);
+    }
+    let records = state.take_action_audit();
+    assert_eq!(records.len(), 32);
+    assert!(records.iter().all(|record| {
+        record.action == "Wi-Fi power"
+            && record.outcome == "accepted"
+            && record.occurred_ms > 0
+    }));
+    assert!(state.take_action_audit().is_empty());
+}
+
 /// Drive one headless frame of the System panel over a real seat, and tessellate
 /// on the CPU (the DRM runner's path minus GPU).
 fn renders(state: &mut SystemState) -> bool {
@@ -170,7 +186,7 @@ fn render_settings_combo_popup_frame(ctx: &egui::Context) -> egui::FullOutput {
                         egui::AboveOrBelow::Below,
                         egui::popup::PopupCloseBehavior::IgnoreClicks,
                         |ui| {
-                            apply_settings_popup_style(ui.style_mut());
+                            apply_settings_popup_style(ui.style_mut(), StyleColorScheme::Dark);
                             let _ = ui.selectable_label(false, "Left");
                             let _ = ui.selectable_label(true, "Right");
                         },
@@ -406,17 +422,17 @@ fn settings_combobox_popups_use_themed_readable_choice_colors() {
     mde_egui::fonts::install(&ctx);
 
     let mut style = (*ctx.style()).clone();
-    apply_settings_popup_style(&mut style);
+    apply_settings_popup_style(&mut style, StyleColorScheme::Dark);
     assert_eq!(style.visuals.window_fill, Style::SURFACE);
     assert_eq!(style.visuals.panel_fill, Style::SURFACE);
     assert_eq!(style.visuals.override_text_color, Some(Style::TEXT));
     assert_eq!(style.visuals.widgets.inactive.fg_stroke.color, Style::TEXT);
     assert_eq!(style.visuals.widgets.hovered.bg_fill, Style::SURFACE_HI);
-    assert_eq!(style.visuals.widgets.hovered.fg_stroke.color, Style::TEXT);
+    assert_eq!(style.visuals.widgets.hovered.fg_stroke.color, Style::TEXT_STRONG);
     assert_eq!(style.visuals.widgets.active.bg_fill, Style::SURFACE_HI);
-    assert_eq!(style.visuals.widgets.active.fg_stroke.color, Style::TEXT);
+    assert_eq!(style.visuals.widgets.active.fg_stroke.color, Style::TEXT_STRONG);
     assert_eq!(style.visuals.widgets.open.bg_fill, Style::SURFACE_HI);
-    assert_eq!(style.visuals.widgets.open.fg_stroke.color, Style::TEXT);
+    assert_eq!(style.visuals.widgets.open.fg_stroke.color, Style::TEXT_STRONG);
     assert_eq!(style.visuals.widgets.open.bg_stroke.color, Style::BORDER);
     assert_eq!(
         style.visuals.widgets.noninteractive.fg_stroke.color,
@@ -2269,6 +2285,7 @@ fn the_reworked_sections_paint_across_a_wide_detail_pane() {
                 mixer_strip("Voice", 40, true),
                 mixer_strip("VM: build", 55, false),
             ],
+            capture: Vec::new(),
         });
         snap.bluetooth = Probe::Present(BtStatus {
             adapters: vec![BtAdapter {

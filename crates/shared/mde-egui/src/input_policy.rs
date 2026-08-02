@@ -26,6 +26,7 @@ static SCROLL_SPEED_PERCENT: AtomicU16 = AtomicU16::new(100);
 static LEFT_HANDED: AtomicBool = AtomicBool::new(false);
 static NATURAL_SCROLL: AtomicBool = AtomicBool::new(false);
 static TOUCHSCREEN_ENABLED: AtomicBool = AtomicBool::new(true);
+static TOUCHPAD_TAP_TO_CLICK: AtomicBool = AtomicBool::new(true);
 static TWO_FINGER_SCROLL: AtomicBool = AtomicBool::new(true);
 static EDGE_GESTURES: AtomicBool = AtomicBool::new(true);
 static LONG_PRESS_SECONDARY: AtomicBool = AtomicBool::new(true);
@@ -44,6 +45,8 @@ pub struct InputPolicy {
     pub natural_scroll: bool,
     /// Accept touchscreen contacts from the bare seat.
     pub touchscreen_enabled: bool,
+    /// Enable libinput's real touchpad tap-to-click configuration.
+    pub touchpad_tap_to_click: bool,
     /// Accept two-finger scroll gestures from touchpads/touchscreens.
     pub two_finger_scroll: bool,
     /// Allow edge swipes to raise shell affordances.
@@ -60,6 +63,7 @@ impl Default for InputPolicy {
             left_handed: false,
             natural_scroll: false,
             touchscreen_enabled: true,
+            touchpad_tap_to_click: true,
             two_finger_scroll: true,
             edge_gestures: true,
             long_press_secondary: true,
@@ -106,6 +110,7 @@ pub fn set_input_policy(policy: InputPolicy) {
     LEFT_HANDED.store(policy.left_handed, Ordering::Relaxed);
     NATURAL_SCROLL.store(policy.natural_scroll, Ordering::Relaxed);
     TOUCHSCREEN_ENABLED.store(policy.touchscreen_enabled, Ordering::Relaxed);
+    TOUCHPAD_TAP_TO_CLICK.store(policy.touchpad_tap_to_click, Ordering::Relaxed);
     TWO_FINGER_SCROLL.store(policy.two_finger_scroll, Ordering::Relaxed);
     EDGE_GESTURES.store(policy.edge_gestures, Ordering::Relaxed);
     LONG_PRESS_SECONDARY.store(policy.long_press_secondary, Ordering::Relaxed);
@@ -120,6 +125,7 @@ pub fn input_policy() -> InputPolicy {
         left_handed: LEFT_HANDED.load(Ordering::Relaxed),
         natural_scroll: NATURAL_SCROLL.load(Ordering::Relaxed),
         touchscreen_enabled: TOUCHSCREEN_ENABLED.load(Ordering::Relaxed),
+        touchpad_tap_to_click: TOUCHPAD_TAP_TO_CLICK.load(Ordering::Relaxed),
         two_finger_scroll: TWO_FINGER_SCROLL.load(Ordering::Relaxed),
         edge_gestures: EDGE_GESTURES.load(Ordering::Relaxed),
         long_press_secondary: LONG_PRESS_SECONDARY.load(Ordering::Relaxed),
@@ -171,6 +177,7 @@ mod tests {
             left_handed: true,
             natural_scroll: true,
             touchscreen_enabled: false,
+            touchpad_tap_to_click: false,
             two_finger_scroll: false,
             edge_gestures: false,
             long_press_secondary: false,

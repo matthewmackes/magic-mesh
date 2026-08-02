@@ -106,8 +106,43 @@ fn render_shapes_with_size(
     data: &dyn CollabData,
     size: egui::Vec2,
 ) -> Vec<egui::epaint::ClippedShape> {
+    render_shapes_with_size_and_zoom(surface, data, size, 1.0)
+}
+
+fn render_shapes_with_size_and_zoom(
+    surface: &mut CommunicationsSurface,
+    data: &dyn CollabData,
+    size: egui::Vec2,
+    zoom: f32,
+) -> Vec<egui::epaint::ClippedShape> {
     let ctx = egui::Context::default();
     Style::install(&ctx);
+    ctx.set_zoom_factor(zoom);
+    let mut sink = CommandSink::new();
+    let out = ctx.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            events: Vec::new(),
+            time: Some(0.0),
+            ..Default::default()
+        },
+        |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| surface.ui(ui, data, &mut sink));
+        },
+    );
+    out.shapes
+}
+
+fn render_shapes_with_scheme(
+    surface: &mut CommunicationsSurface,
+    data: &dyn CollabData,
+    scheme: mde_egui::StyleColorScheme,
+    size: egui::Vec2,
+    zoom: f32,
+) -> Vec<egui::epaint::ClippedShape> {
+    let ctx = egui::Context::default();
+    Style::install_color_scheme_with_density(&ctx, scheme, mde_egui::Density::Mouse);
+    ctx.set_zoom_factor(zoom);
     let mut sink = CommandSink::new();
     let out = ctx.run(
         egui::RawInput {
@@ -318,6 +353,53 @@ fn frame_renders_from_fixture_directory() {
     assert!(
         surface.selected_space().is_some(),
         "the frame must auto-select the first rail space"
+    );
+}
+
+#[test]
+fn shared_app_frame_survives_desktop_narrow_and_large_text() {
+    let data = FixtureData::demo();
+
+    for (size, zoom, label) in [
+        (egui::vec2(1280.0, 800.0), 1.0, "desktop"),
+        (egui::vec2(800.0, 800.0), 1.0, "narrow"),
+        (egui::vec2(800.0, 800.0), 1.5, "large text"),
+    ] {
+        let mut surface = CommunicationsSurface::new();
+        let shapes = render_shapes_with_size_and_zoom(&mut surface, &data, size, zoom);
+        let texts = painted_text(&shapes);
+        assert!(!shapes.is_empty(), "Mesh Teams {label} frame painted nothing");
+        assert!(
+            texts.iter().any(|(text, _)| text == "Mesh Teams"),
+            "Mesh Teams {label} frame must retain the shared workspace title: {texts:?}"
+        );
+    }
+}
+
+#[test]
+fn mesh_teams_light_render_resolves_activity_text_palette() {
+    let data = FixtureData::demo();
+    let mut surface = CommunicationsSurface::new();
+    surface.set_mode(Mode::Activity);
+    let shapes = render_shapes_with_scheme(
+        &mut surface,
+        &data,
+        mde_egui::StyleColorScheme::Light,
+        egui::vec2(1200.0, 700.0),
+        1.0,
+    );
+    let texts = painted_text(&shapes);
+    assert!(
+        texts.iter().any(|(text, color)| {
+            text == "posted a message" && *color == Style::QUAZAR_LIGHT_TEXT
+        }),
+        "Activity body text must resolve through the Light palette: {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|(text, color)| {
+            text == "Mesh" && *color == Style::QUAZAR_LIGHT_TEXT_DIM
+        }),
+        "Mesh Teams rail text must resolve through the Light palette: {texts:?}"
     );
 }
 

@@ -39,7 +39,7 @@ use crate::ops::Ops;
 use crate::preview::{PreviewState, Previews, ThumbState};
 use crate::transfers::{
     build_targets, display_order, FileTransfers, LedgerCounts, Method, NewTransferForm,
-    TransferFilter, TransferJob, TransferTarget, TransferVerb, TransfersClient,
+    TransferFilter, TransferJob, TransferState, TransferTarget, TransferVerb, TransfersClient,
 };
 use mde_files::opqueue::{ConflictChoice, Resolution};
 
@@ -387,6 +387,9 @@ pub struct Tab {
     back: Vec<Location>,
     forward: Vec<Location>,
     path_edit: String,
+    /// The last listing failure for this tab. An empty listing is not
+    /// sufficient evidence that a directory is empty.
+    list_error: Option<String>,
 }
 
 impl Tab {
@@ -404,6 +407,7 @@ impl Tab {
             back: Vec::new(),
             forward: Vec::new(),
             path_edit,
+            list_error: None,
         }
     }
 
@@ -456,6 +460,12 @@ impl Tab {
     #[must_use]
     pub fn rows(&self) -> &[FileRow] {
         &self.rows
+    }
+
+    /// The last backend error while loading this tab's location.
+    #[must_use]
+    pub fn list_error(&self) -> Option<&str> {
+        self.list_error.as_deref()
     }
 
     /// The current view mode.
@@ -1034,6 +1044,9 @@ pub struct FileBrowser {
     self_node: SelfNode,
     peers: Vec<Peer>,
     mesh_overlay: Option<MeshOverlayBadge>,
+    /// True only when the live service directory contains a probe-confirmed
+    /// Airsonic/Navidrome endpoint; controls the prepopulated music target.
+    music_service_available: bool,
     panes: [Pane; 2],
     active_pane: usize,
     dual: bool,
@@ -1112,6 +1125,7 @@ impl FileBrowser {
             self_node: SelfNode::default(),
             peers: Vec::new(),
             mesh_overlay: None,
+            music_service_available: false,
             panes: [Pane::new(home.clone()), Pane::new(home)],
             active_pane: 0,
             dual: false,
@@ -1192,6 +1206,7 @@ impl FileBrowser {
         self.self_node = self.backend.self_node();
         self.peers = self.backend.peers();
         self.mesh_overlay = self.backend.mesh_overlay();
+        self.music_service_available = self.backend.music_service_available();
         if !self.destination_reachable() {
             self.destination = None;
         }
@@ -1394,6 +1409,37 @@ impl FileBrowser {
         self.transfers.worker_present()
     }
 
+    /// A compact, honest sync state for one peer. The Files sidebar uses this
+    /// beside every reachable node so operators do not have to open Transfers
+    /// to discover whether that node is idle, syncing, or failing.
+    #[must_use]
+    pub fn peer_sync_label(&self, peer_id: &str) -> &'static str {
+        let destination = format!("peer:{peer_id}");
+        let jobs = self
+            .transfers_jobs
+            .iter()
+            .filter(|job| job.dest == destination);
+        let mut has_jobs = false;
+        let mut has_active = false;
+        let mut has_failed = false;
+        for job in jobs {
+            has_jobs = true;
+            has_active |= job.state.is_active();
+            has_failed |= job.state == TransferState::Failed;
+        }
+        if has_active {
+            "syncing"
+        } else if has_failed {
+            "sync failed"
+        } else if has_jobs {
+            "synced"
+        } else if self.transfers.worker_present() {
+            "sync idle"
+        } else {
+            "sync unavailable"
+        }
+    }
+
     /// The Transfers tab's live view filter (state + method, Q16).
     #[must_use]
     pub fn transfers_filter(&self) -> TransferFilter {
@@ -1491,7 +1537,15 @@ impl FileBrowser {
             .into_iter()
             .map(|p| (p.id.clone(), p.host.clone()))
             .collect();
-        build_targets(&peers)
+        build_targets(&peers, self.music_service_available)
+    }
+
+    /// Test seam for a service-advertisement-backed music destination. The
+    /// production value is refreshed from the backend roster.
+    #[cfg(test)]
+    pub(crate) fn with_music_service_available(mut self, available: bool) -> Self {
+        self.music_service_available = available;
+        self
     }
 
     /// Submit a client-minted job to the worker (the one path every entry point
@@ -1728,9 +1782,18 @@ impl FileBrowser {
         let loc = self.panes[pane].tabs[ti].location.clone();
         let key = loc.backend_path();
         let prefs = self.folder_prefs.get(&key).copied().unwrap_or_default();
-        let all = self.backend.list(&key);
+        let listing = self.backend.list(&key);
         let tab = &mut self.panes[pane].tabs[ti];
-        tab.all_rows = all;
+        match listing {
+            Ok(all) => {
+                tab.all_rows = all;
+                tab.list_error = None;
+            }
+            Err(error) => {
+                tab.all_rows.clear();
+                tab.list_error = Some(error.to_string());
+            }
+        }
         tab.view = prefs.view;
         tab.sort = prefs.sort;
         tab.show_hidden = prefs.show_hidden;
@@ -1833,6 +1896,7 @@ impl FileBrowser {
         let location = Location::Local(Self::HOME.to_string());
         self.backend
             .list(Self::HOME)
+            .unwrap_or_default()
             .into_iter()
             .take(HOME_SEARCH_LIMIT)
             .enumerate()

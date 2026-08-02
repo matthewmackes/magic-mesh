@@ -18,7 +18,6 @@
 use mde_egui::egui::{
     self, Align, Align2, CursorIcon, Layout, Response, RichText, ScrollArea, Sense, TextEdit,
 };
-use mde_egui::menubar::{Menu, MenuBar, MenuBarModel};
 use mde_egui::nav_chrome::AppFrame;
 use mde_egui::{Motion, Style};
 
@@ -154,17 +153,10 @@ fn handle_keys(ui: &egui::Ui, m: &Manager, actions: &mut Vec<Action>) {
 
 fn header(ui: &mut egui::Ui, m: &mut Manager, actions: &mut Vec<Action>) {
     egui::TopBottomPanel::top("bm-header").show_inside(ui, |ui| {
-        // The workspace begins with the shared Construct menubar. The
+        // The workspace begins with the shared app frame. The
         // search/sort/location strip below is intentionally domain-specific:
         // it is the Bookmarks query control, not a second navigation system.
-        let menus: &[Menu<&'static str>] = &[];
-        let model = MenuBarModel {
-            title: "Bookmarks",
-            accent: Style::ACCENT,
-            menus,
-            status: &[],
-        };
-        let _ = MenuBar::show(ui, &model);
+        let _ = AppFrame::new("Bookmarks").leading_title().show(ui);
         ui.add_space(Style::SP_S);
         ui.scope(|ui| {
             scope_bookmarks_toolbar_ui(ui);
@@ -1227,10 +1219,9 @@ mod tests {
             texts
                 .iter()
                 .any(|(t, s)| {
-                    t == "BOOKMARKS"
-                        && (*s - mde_egui::menubar::TITLE_FONT_SIZE).abs() < f32::EPSILON
+                    t == "Bookmarks" && (*s - Style::TYPE_HEADLINE).abs() < f32::EPSILON
                 }),
-            "the workspace title must render on the shared MenuBar rung: {texts:?}"
+            "the workspace title must render on the shared AppFrame Headline rung: {texts:?}"
         );
         assert!(
             texts

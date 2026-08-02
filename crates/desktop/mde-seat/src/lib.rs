@@ -46,14 +46,19 @@ mod charge_threshold;
 mod ddc;
 mod display;
 mod error;
+mod hardware;
 pub mod hotkeys;
 mod lid;
+mod keyboard_backlight;
 mod logind;
 mod mixer;
+mod network;
+mod network_agent;
 pub mod pairing;
 mod powerprofiles;
 mod props;
 mod snapshot;
+mod service;
 mod upower;
 
 pub use arrange::{ArrangeError, DisplayLayout, MonitorId, OutputArrangement};
@@ -69,12 +74,24 @@ pub use ddc::{
 };
 pub use display::{Connector, ConnectorStatus, DisplayMode, DisplayProber, DrmProber};
 pub use error::{Backend, SeatError};
+pub use hardware::{
+    FirmwareStatus, HardwareClient, HardwareStatus, StorageDevice, SysfsHardware,
+    ThermalZone, ThunderboltDevice,
+};
 pub use hotkeys::{Hotkey, HotkeyAction, HOTKEYS};
 pub use lid::{parse_lid_state, LidClient, LidState, ProcLid};
+pub use keyboard_backlight::{KeyboardBacklight, KeyboardBacklightClient, SysfsKeyboardBacklight};
 pub use logind::{Avail, LogindClient, PowerCaps, PowerVerb, ZbusLogind};
 pub use mixer::{
     fold_graph, MixerClient, MixerStatus, MixerStrip, PwCli, PwGraph, PwRunner, StripOrigin,
     UnboundMixer,
+};
+pub use network::{
+    fold_network, NetworkClient, NetworkKind, NetworkLink, NetworkProfile, NetworkProfileKind,
+    NetworkState, NetworkStatus, ZbusNetwork,
+};
+pub use network_agent::{
+    NetworkSecretAgent, NetworkSecretResponder, SecretReply, SecretRequest, SecretSettings,
 };
 pub use pairing::{
     resolve_confirm, resolve_passkey, resolve_pin, AgentPrompt, PairingAgent, PairingReply,
@@ -82,4 +99,5 @@ pub use pairing::{
 };
 pub use powerprofiles::{fold_profiles, ProfileState, ProfilesClient, ZbusProfiles};
 pub use snapshot::{Probe, Seat, SeatSnapshot};
+pub use service::{safe_service_unit, ServiceClient, ZbusService};
 pub use upower::{Battery, BatteryKind, BatteryState, UPowerClient, ZbusUPower};

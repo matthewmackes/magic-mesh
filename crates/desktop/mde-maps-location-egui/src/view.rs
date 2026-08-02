@@ -64,6 +64,10 @@ const MAP_ATTRIBUTION_ELLIPSIS: char = '\u{2026}';
 /// button or its pointer target.
 const DRIVE_FAB_LANE_SEPARATION: f32 = Style::SP_XS;
 
+fn drive_fab_lane_width(fab_radius: f32, fab_gap: f32) -> f32 {
+    (fab_radius * 2.0 + fab_gap + Style::SP_M).max(1.0)
+}
+
 /// Render the complete native Maps & Location workspace.
 pub fn maps_location_panel(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
     // Auto Mode (Car): the cockpit is on a dash — drop the header + tab rail so the
@@ -509,7 +513,7 @@ fn drive_hud_overlay_geometry(
     fab_gap: f32,
     rail_layout: VehicleHealthRailLayout,
 ) -> DriveHudOverlayGeometry {
-    let lane_width = (fab_radius * 2.0 + fab_gap + Style::SP_M).max(1.0);
+    let lane_width = drive_fab_lane_width(fab_radius, fab_gap);
     let lane_left = canvas.right() - margin - lane_width;
     let lane_right = canvas.right() - margin;
     let fab_lane = safe_rect(
@@ -683,6 +687,7 @@ fn drive_hud(
             .active_destination()
             .and_then(Destination::geo),
         None,
+        offline.readiness == OfflineNavigationReadiness::Blocked && !has_fix,
     );
 
     let route = &state.local_navigation.active_route;
@@ -694,10 +699,20 @@ fn drive_hud(
     // Top banner: the maneuver instruction (or amber "Recalculating…") while
     // guiding, else the calm idle prompt. Always painted so the HUD has a header.
     let banner_height = (96.0 + (text_zoom - 1.0).max(0.0) * 32.0).clamp(96.0, 144.0);
+    // The banner is a content card, not a backdrop for the painter-positioned
+    // controls. Reserve the same right-hand lane used by the health rail so the
+    // five FAB hit targets never float over banner text at narrow or enlarged
+    // zooms.
+    let fab_lane_width = drive_fab_lane_width(fab_r, fab_gap);
+    let banner_width = (width
+        - 2.0 * margin
+        - fab_lane_width
+        - DRIVE_FAB_LANE_SEPARATION)
+        .max(1.0);
     let banner = safe_rect(
         rect.left() + margin,
         rect.top() + margin,
-        width - 2.0 * margin,
+        banner_width,
         banner_height,
     );
     let kind = maneuver_kind(&route.next_maneuver);
@@ -752,7 +767,25 @@ fn drive_hud(
         } else {
             0.0
         };
-    let mut pill_y = below_banner;
+    let alert_count = usize::from(!has_fix)
+        + usize::from(offline.readiness == OfflineNavigationReadiness::Blocked)
+        + usize::from(navigating && !route.traffic_alert.trim().is_empty())
+        + usize::from(navigating && !route.weather_alert.trim().is_empty());
+    // The taskbar is outside this canvas, but the direct-DRM proof viewport
+    // ends immediately above it. Reserve a full spacing unit in addition to
+    // the HUD margin so the last large-text pill cannot touch or cross that
+    // boundary. The stack is shifted upward as a unit, preserving the
+    // health-rail separation while keeping every alert visible.
+    let mut pill_y = alert_stack_start(
+        below_banner,
+        rect.bottom(),
+        margin,
+        alert_count,
+    );
+    let inline_system_alerts = text_zoom > 1.0
+        && !has_fix
+        && offline.readiness == OfflineNavigationReadiness::Blocked;
+    let initial_pill_y = pill_y;
     if !has_fix {
         pill_y = paint_alert_pill(
             &painter,
@@ -764,14 +797,29 @@ fn drive_hud(
         );
     }
     if offline.readiness == OfflineNavigationReadiness::Blocked {
+        let blocked_x = if inline_system_alerts {
+            pill_x
+                + alert_pill_width(&painter, "Acquiring GPS")
+                + Style::SP_S
+        } else {
+            pill_x
+        };
+        let blocked_y = if inline_system_alerts {
+            initial_pill_y
+        } else {
+            pill_y
+        };
         pill_y = paint_alert_pill(
             &painter,
-            pill_x,
-            pill_y,
+            blocked_x,
+            blocked_y,
             "dialog-warning",
             "Offline nav blocked",
             Style::DANGER,
         );
+        if inline_system_alerts {
+            pill_y = initial_pill_y + 28.0 + Style::SP_S;
+        }
     }
     if navigating {
         let traffic = route.traffic_alert.trim();
@@ -855,7 +903,7 @@ fn paint_health_rail(
                         .color(MAP_TEXT_STRONG),
                 );
                 ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                    pill(ui, rail.state.label(), health_rail_tone(rail.state));
+                    map_pill(ui, rail.state.label(), health_rail_tone(rail.state));
                 });
             });
             ui.add_space(Style::SP_XS);
@@ -928,7 +976,7 @@ fn paint_health_rail(
                                                 tile.bottom() - galley.size().y - Style::SP_XS,
                                             ),
                                             galley,
-                                            Style::TEXT_STRONG,
+                                            MAP_TEXT_STRONG,
                                         );
                                     } else {
                                         slot_ui.add(
@@ -1284,6 +1332,7 @@ fn show_route_preview(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
             .active_destination()
             .and_then(Destination::geo),
         None,
+        false,
     );
     // Gentle scrim so the sheet + chrome read cleanly over the map.
     painter.rect_filled(rect, Style::RADIUS_L, Color32::BLACK.gamma_multiply(0.18));
@@ -1939,6 +1988,7 @@ fn show_destination_search(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
             .active_destination()
             .and_then(Destination::geo),
         None,
+        false,
     );
     painter.rect_filled(rect, Style::RADIUS_L, Color32::BLACK.gamma_multiply(0.5));
 
@@ -2469,6 +2519,7 @@ fn show_arrival(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
             .active_destination()
             .and_then(Destination::geo),
         None,
+        false,
     );
     painter.rect_filled(rect, Style::RADIUS_L, Color32::BLACK.gamma_multiply(0.5));
 
@@ -2845,6 +2896,7 @@ fn paint_map_scene(
     route_planned: bool,
     destination: Option<(f64, f64)>,
     route_geometry: Option<&ProviderRouteGeometry>,
+    hide_empty_state: bool,
 ) {
     let bg = if map.dark_mode {
         MAP_DARK_BG
@@ -2864,7 +2916,10 @@ fn paint_map_scene(
     } else {
         None
     };
-    let projection = crate::basemap::paint_basemap(painter, rect, map, center);
+    // In the combined no-fix/offline-blocked state the alert row is the
+    // authoritative empty-state explanation. Hiding the redundant map card
+    // keeps the large-text status lane readable; other no-map states retain it.
+    let projection = crate::basemap::paint_basemap(painter, rect, map, center, !hide_empty_state);
 
     // WL-FUNC-012 / OVERLAY-2 — producer-timed IEM/NWS NEXRAD raster animation.
     // This paints through egui textures on both GLES and wgpu, beneath every
@@ -3052,7 +3107,13 @@ fn paint_map_scene(
         paint_vehicle_chevron(painter, anchor, heading, ROUTE_BLUE, true);
     } else {
         paint_vehicle_chevron(painter, anchor, 0.0, Style::TEXT_DIM, false);
-        paint_acquiring_chip(painter, egui::pos2(anchor.x, anchor.y + 26.0));
+        // The primary alert pill below the health rail already carries this
+        // state. On narrow canvases the map-local duplicate lands in the same
+        // vertical band at Large/Largest text zoom; retain it on spacious
+        // desktop maps, where it remains a useful vehicle-local cue.
+        if rect.width() >= 900.0 {
+            paint_acquiring_chip(painter, egui::pos2(anchor.x, anchor.y + 26.0));
+        }
     }
 
     // Live destination pin + straight-line "as the crow flies" preview, drawn on
@@ -3731,9 +3792,13 @@ fn paint_alert_pill(
     let galley = painter.layout_no_wrap(text.to_string(), font.clone(), MAP_TEXT_STRONG);
     let icon_w = 18.0;
     let h = 28.0;
-    let w = (icon_w + Style::SP_S + galley.size().x + Style::SP_M * 1.5).min(380.0);
+    let w = alert_pill_width_from_galley(icon_w, galley.size().x);
     let r = safe_rect(x, y, w, h);
-    painter.rect_filled(r, h * 0.5, HUD_CARD_BG.gamma_multiply(0.95));
+    // Alerts are an occluding status surface, not a translucent decoration.
+    // In the no-map state the empty-state panel occupies the same lower map
+    // lane; an opaque fill keeps the alert copy readable at large text sizes
+    // while preserving the panel beneath it for the surrounding context.
+    painter.rect_filled(r, h * 0.5, HUD_CARD_BG);
     painter.rect_stroke(
         r,
         h * 0.5,
@@ -3759,6 +3824,31 @@ fn paint_alert_pill(
         MAP_TEXT_STRONG,
     );
     y + h + Style::SP_S
+}
+
+fn alert_pill_width(painter: &Painter, text: &str) -> f32 {
+    let galley = painter.layout_no_wrap(
+        text.to_string(),
+        FontId::proportional(Style::BODY),
+        MAP_TEXT_STRONG,
+    );
+    alert_pill_width_from_galley(18.0, galley.size().x)
+}
+
+fn alert_pill_width_from_galley(icon_width: f32, text_width: f32) -> f32 {
+    (icon_width + Style::SP_S + text_width + Style::SP_M * 1.5).min(380.0)
+}
+
+fn alert_stack_start(below_banner: f32, canvas_bottom: f32, margin: f32, count: usize) -> f32 {
+    const PILL_HEIGHT: f32 = 28.0;
+    let count = count as f32;
+    let stack_height = if count > 0.0 {
+        count * PILL_HEIGHT + (count - 1.0) * Style::SP_S
+    } else {
+        0.0
+    };
+    let safe_bottom = canvas_bottom - margin - Style::SP_M;
+    (safe_bottom - stack_height).max(below_banner)
 }
 
 fn paint_fab(
@@ -5666,6 +5756,7 @@ fn map_canvas(
         route_planned,
         None,
         None,
+        false,
     );
     painter.rect_stroke(
         rect,
@@ -6527,6 +6618,19 @@ fn pill(ui: &mut egui::Ui, label: &str, tone: Color32) {
         .inner_margin(egui::Margin::symmetric(6, 2))
         .show(ui, |ui| {
             ui.label(RichText::new(label).size(Style::SMALL).color(Style::TEXT));
+        });
+}
+
+/// Maps' governed content-color exception: HUD pills sit on dark map cards even
+/// while the Construct-owned shell is in Light mode, so shell text remapping
+/// must not turn their labels into low-contrast ink.
+fn map_pill(ui: &mut egui::Ui, label: &str, tone: Color32) {
+    egui::Frame::NONE
+        .fill(tone.gamma_multiply(0.14))
+        .stroke(Stroke::new(1.0, tone.gamma_multiply(0.8)))
+        .inner_margin(egui::Margin::symmetric(6, 2))
+        .show(ui, |ui| {
+            ui.label(RichText::new(label).size(Style::SMALL).color(MAP_TEXT_STRONG));
         });
 }
 
@@ -8022,6 +8126,32 @@ mod tests {
             "FAB hit target escaped its reserved lane: {fab_hit:?} vs {:?}",
             geometry.fab_lane
         );
+    }
+
+    #[test]
+    fn drive_hud_banner_reserves_the_same_fab_lane_at_narrow_width() {
+        let width = 670.0;
+        let margin = Style::SP_M;
+        let fab_radius = 26.0;
+        let fab_gap = Style::SP_S + Style::SP_XS;
+        let banner_width = width
+            - 2.0 * margin
+            - drive_fab_lane_width(fab_radius, fab_gap)
+            - DRIVE_FAB_LANE_SEPARATION;
+        let banner_right = margin + banner_width;
+        let fab_lane_left = width - margin - drive_fab_lane_width(fab_radius, fab_gap);
+        assert!(
+            banner_right + DRIVE_FAB_LANE_SEPARATION <= fab_lane_left,
+            "banner must leave the FAB lane clear: banner_right={banner_right}, fab_lane_left={fab_lane_left}"
+        );
+    }
+
+    #[test]
+    fn alert_stack_stays_inside_the_bottom_safe_viewport_lane() {
+        let start = alert_stack_start(300.0, 404.0, 16.0, 2);
+        let stack_height = 2.0 * 28.0 + Style::SP_S;
+        assert!(start >= 300.0);
+        assert!(start + stack_height <= 404.0 - 16.0 - Style::SP_M);
     }
 
     #[test]

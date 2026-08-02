@@ -67,6 +67,23 @@ NM_PROVIDER_STATUS="$(nmcli -t -f DEVICE,TYPE,STATE device status 2>/dev/null ||
 MM_PROVIDER_STATUS="$(mmcli --modem=0 --output-keyvalue 2>/dev/null || true)"
 PP_ACTIVE="$(powerprofilesctl get 2>/dev/null || true)"
 PP_LIST="$(powerprofilesctl list 2>/dev/null || true)"
+# BLUETOOTH-BOUNDARY — BlueZ contributes only bounded adapter/device counts and
+# the aggregate powered state. Never serialize names, MAC addresses, trust,
+# pairing keys, service UUIDs, or agent material into world-readable state.
+BT_ADAPTERS=""
+BT_POWERED=""
+BT_DEVICES=""
+if command -v bluetoothctl >/dev/null 2>&1; then
+    BT_LIST="$(timeout 2s bluetoothctl list 2>/dev/null || true)"
+    BT_ADAPTERS="$(printf '%s\n' "$BT_LIST" | grep -c '^Controller ' || true)"
+    BT_SHOW="$(timeout 2s bluetoothctl show 2>/dev/null || true)"
+    if printf '%s' "$BT_SHOW" | grep -q 'Powered: yes'; then
+        BT_POWERED=true
+    elif [ -n "$BT_SHOW" ]; then
+        BT_POWERED=false
+    fi
+    BT_DEVICES="$(timeout 2s bluetoothctl devices 2>/dev/null | grep -c '^Device ' || true)"
+fi
 # AUDIO-RELEASE-GATE — publish only typed provider availability/counts.  Never
 # cross raw pactl/pw-cli/wpctl output, device names, profiles, or usernames over
 # the world-readable snapshot boundary.
@@ -95,6 +112,151 @@ fi
 AUDIO_RECOVERY=""
 if [ "$AUDIO_PULSE" = false ] && [ "$AUDIO_PIPEWIRE" = false ] && [ "$AUDIO_WIREPLUMBER" = false ]; then
     AUDIO_RECOVERY="Audio providers unavailable; refresh after PipeWire and WirePlumber start."
+fi
+# PRIVACY-BOUNDARY — publish only a mute bit for the default microphone and a
+# bounded camera-device count. Device presence is not a privacy/permission
+# claim, and no camera names, paths, application identities, or credentials
+# cross the world-readable snapshot boundary. Camera privacy stays absent until
+# a real privacy provider exists.
+MICROPHONE_MUTED=""
+if command -v wpctl >/dev/null 2>&1; then
+    MIC_STATE="$(wpctl get-volume @DEFAULT_SOURCE@ 2>/dev/null || true)"
+    if printf '%s' "$MIC_STATE" | grep -q 'MUTED'; then
+        MICROPHONE_MUTED=true
+    elif [ -n "$MIC_STATE" ]; then
+        MICROPHONE_MUTED=false
+    fi
+fi
+CAMERA_DEVICES="$(find /dev -maxdepth 1 -type c -name 'video[0-9]*' 2>/dev/null | head -64 | wc -l | tr -d ' ')"
+# TELEMETRY-BOUNDARY — publish only bounded aggregate resource facts. No
+# process names, command lines, mount paths, usernames, or device identifiers
+# cross the world-readable snapshot boundary.
+CPU_CORES="$(grep -c '^processor[[:space:]]*:' /proc/cpuinfo 2>/dev/null || true)"
+LOAD_1M="$(awk '{print $1; exit}' /proc/loadavg 2>/dev/null || true)"
+MEM_TOTAL_KIB="$(awk '/^MemTotal:[[:space:]]+[0-9]+/{print $2; exit}' /proc/meminfo 2>/dev/null || true)"
+MEM_AVAILABLE_KIB="$(awk '/^MemAvailable:[[:space:]]+[0-9]+/{print $2; exit}' /proc/meminfo 2>/dev/null || true)"
+ROOT_FS="$(df -P -k / 2>/dev/null | awk 'NR==2 {print $2, $3, $4, $5; exit}' || true)"
+ROOT_TOTAL_KIB="$(printf '%s\n' "$ROOT_FS" | awk '{print $1}')"
+ROOT_USED_KIB="$(printf '%s\n' "$ROOT_FS" | awk '{print $2}')"
+ROOT_AVAILABLE_KIB="$(printf '%s\n' "$ROOT_FS" | awk '{print $3}')"
+ROOT_USED_PERCENT="$(printf '%s\n' "$ROOT_FS" | awk '{gsub(/%/,"",$4); print $4}')"
+# POWER-SOURCE-BOUNDARY — aggregate kernel power-supply facts only. Do not
+# publish BAT*/AC* names, serials, model strings, or raw sysfs paths.
+POWER_BATTERY_COUNT=0
+POWER_BATTERY_SUM=0
+POWER_BATTERY_SAMPLES=0
+POWER_BATTERY_STATUS=""
+for battery in /sys/class/power_supply/BAT*; do
+    [ -d "$battery" ] || continue
+    POWER_BATTERY_COUNT=$((POWER_BATTERY_COUNT + 1))
+    if capacity="$(cat "$battery/capacity" 2>/dev/null)" \
+        && [[ "$capacity" =~ ^[0-9]+$ ]] && [ "$capacity" -le 100 ]; then
+        POWER_BATTERY_SUM=$((POWER_BATTERY_SUM + capacity))
+        POWER_BATTERY_SAMPLES=$((POWER_BATTERY_SAMPLES + 1))
+    fi
+    if [ -z "$POWER_BATTERY_STATUS" ]; then
+        POWER_BATTERY_STATUS="$(cat "$battery/status" 2>/dev/null | tr -cd '[:alpha:]' | head -c 32)"
+    fi
+done
+POWER_BATTERY_PERCENT=""
+if [ "$POWER_BATTERY_SAMPLES" -gt 0 ]; then
+    POWER_BATTERY_PERCENT=$((POWER_BATTERY_SUM / POWER_BATTERY_SAMPLES))
+fi
+POWER_AC_ONLINE=""
+for ac in /sys/class/power_supply/AC* /sys/class/power_supply/ADP*; do
+    [ -d "$ac" ] || continue
+    if online="$(cat "$ac/online" 2>/dev/null)" \
+        && [[ "$online" = 0 || "$online" = 1 ]]; then
+        [ "$online" = 1 ] && POWER_AC_ONLINE=true
+        [ -z "$POWER_AC_ONLINE" ] && POWER_AC_ONLINE=false
+        break
+    fi
+done
+# DISPLAY/INPUT-OBSERVATION — aggregate DRM connector, mode, backlight, and
+# evdev counts. Connector names, input names, sysfs paths, and serials stay
+# local to the node and never enter the world-readable snapshot.
+DISPLAY_CONNECTORS=0
+DISPLAY_CONNECTED=0
+DISPLAY_MODES=0
+for status_file in /sys/class/drm/*/status; do
+    [ -f "$status_file" ] || continue
+    DISPLAY_CONNECTORS=$((DISPLAY_CONNECTORS + 1))
+    [ "$(cat "$status_file" 2>/dev/null)" = connected ] \
+        && DISPLAY_CONNECTED=$((DISPLAY_CONNECTED + 1))
+    mode_file="${status_file%/status}/modes"
+    if [ -f "$mode_file" ]; then
+        mode_count="$(wc -l < "$mode_file" 2>/dev/null || echo 0)"
+        [[ "$mode_count" =~ ^[0-9]+$ ]] \
+            && DISPLAY_MODES=$((DISPLAY_MODES + mode_count))
+    fi
+done
+BACKLIGHT_COUNT=0
+BACKLIGHT_SUM=0
+BACKLIGHT_SAMPLES=0
+for backlight in /sys/class/backlight/*; do
+    [ -d "$backlight" ] || continue
+    BACKLIGHT_COUNT=$((BACKLIGHT_COUNT + 1))
+    if current="$(cat "$backlight/brightness" 2>/dev/null)" \
+        && maximum="$(cat "$backlight/max_brightness" 2>/dev/null)" \
+        && [[ "$current" =~ ^[0-9]+$ ]] && [[ "$maximum" =~ ^[0-9]+$ ]] \
+        && [ "$maximum" -gt 0 ] && [ "$current" -le "$maximum" ]; then
+        BACKLIGHT_SUM=$((BACKLIGHT_SUM + current * 100 / maximum))
+        BACKLIGHT_SAMPLES=$((BACKLIGHT_SAMPLES + 1))
+    fi
+done
+BACKLIGHT_PERCENT=""
+[ "$BACKLIGHT_SAMPLES" -gt 0 ] \
+    && BACKLIGHT_PERCENT=$((BACKLIGHT_SUM / BACKLIGHT_SAMPLES))
+INPUT_EVENT_DEVICES="$(find /dev/input -maxdepth 1 -type c -name 'event[0-9]*' 2>/dev/null | head -64 | wc -l | tr -d ' ')"
+# HARDWARE-OBSERVATION — aggregate block capacity, removable-media count,
+# thermal zones, and fan sensors. Never serialize block/hwmon names or paths.
+STORAGE_DEVICES=0
+STORAGE_TOTAL_BYTES=0
+STORAGE_REMOVABLE=0
+for block in /sys/block/*; do
+    [ -d "$block" ] || continue
+    sectors="$(cat "$block/size" 2>/dev/null)"
+    [[ "$sectors" =~ ^[0-9]+$ ]] || continue
+    [ "$sectors" -le $((1 << 42)) ] || continue
+    STORAGE_DEVICES=$((STORAGE_DEVICES + 1))
+    STORAGE_TOTAL_BYTES=$((STORAGE_TOTAL_BYTES + sectors * 512))
+    [ "$(cat "$block/removable" 2>/dev/null)" = 1 ] \
+        && STORAGE_REMOVABLE=$((STORAGE_REMOVABLE + 1))
+done
+THERMAL_ZONES=0
+THERMAL_MAX_MILLI_C=""
+for thermal in /sys/class/thermal/thermal_zone*; do
+    [ -d "$thermal" ] || continue
+    temperature="$(cat "$thermal/temp" 2>/dev/null)"
+    [[ "$temperature" =~ ^-?[0-9]+$ ]] || continue
+    [ "$temperature" -ge -100000 ] && [ "$temperature" -le 200000 ] || continue
+    THERMAL_ZONES=$((THERMAL_ZONES + 1))
+    if [ -z "$THERMAL_MAX_MILLI_C" ] || [ "$temperature" -gt "$THERMAL_MAX_MILLI_C" ]; then
+        THERMAL_MAX_MILLI_C="$temperature"
+    fi
+done
+FAN_DEVICES="$(find /sys/class/hwmon -maxdepth 2 -type f -name 'fan*_input' 2>/dev/null | head -32 | wc -l | tr -d ' ')"
+# OS-ACCOUNT-BOUNDARY — publish only aggregate local account posture. Never
+# serialize usernames, home paths, shells, group membership, or credentials.
+USERS_PROVIDER=false
+USER_ACCOUNT_COUNT=""
+USER_LOGIN_COUNT=""
+USER_ADMIN_GROUPS=""
+if [ -r /etc/passwd ] && [ -r /etc/group ]; then
+    USERS_PROVIDER=true
+    USER_COUNTS="$(awk -F: '
+        /^[^:]+:[^:]*:[0-9]+:/ {
+            accounts++
+            if (($3 == 0 || ($3 >= 1000 && $3 <= 60000)) &&
+                $7 != "/usr/sbin/nologin" && $7 != "/sbin/nologin" &&
+                $7 != "/bin/false" && $7 != "/usr/bin/false") login++
+        }
+        END { print accounts + 0, login + 0 }
+    ' /etc/passwd 2>/dev/null || true)"
+    read -r USER_ACCOUNT_COUNT USER_LOGIN_COUNT <<EOF
+$USER_COUNTS
+EOF
+    USER_ADMIN_GROUPS="$(awk -F: '$1 == "sudo" || $1 == "wheel" { count++ } END { print count + 0 }' /etc/group 2>/dev/null || true)"
 fi
 # LIGHTHOUSE-9 / data accuracy — nebula loads a DIRECTORY config (`-config
 # /etc/nebula`), merging the stock-RPM EXAMPLE `config.yml` (192.168.100.1 /
@@ -149,8 +311,22 @@ AUDIO_PULSE="$AUDIO_PULSE" AUDIO_PIPEWIRE="$AUDIO_PIPEWIRE" \
 AUDIO_WIREPLUMBER="$AUDIO_WIREPLUMBER" AUDIO_ALSA="$AUDIO_ALSA" \
 AUDIO_PLAYBACK="$AUDIO_PLAYBACK" AUDIO_CAPTURE="$AUDIO_CAPTURE" \
 AUDIO_RECOVERY="$AUDIO_RECOVERY" \
+CPU_CORES="$CPU_CORES" LOAD_1M="$LOAD_1M" \
+MEM_TOTAL_KIB="$MEM_TOTAL_KIB" MEM_AVAILABLE_KIB="$MEM_AVAILABLE_KIB" \
+ROOT_TOTAL_KIB="$ROOT_TOTAL_KIB" ROOT_USED_KIB="$ROOT_USED_KIB" \
+ROOT_AVAILABLE_KIB="$ROOT_AVAILABLE_KIB" ROOT_USED_PERCENT="$ROOT_USED_PERCENT" \
+POWER_BATTERY_COUNT="$POWER_BATTERY_COUNT" POWER_BATTERY_PERCENT="$POWER_BATTERY_PERCENT" \
+POWER_BATTERY_STATUS="$POWER_BATTERY_STATUS" POWER_AC_ONLINE="$POWER_AC_ONLINE" \
+DISPLAY_CONNECTORS="$DISPLAY_CONNECTORS" DISPLAY_CONNECTED="$DISPLAY_CONNECTED" \
+DISPLAY_MODES="$DISPLAY_MODES" BACKLIGHT_COUNT="$BACKLIGHT_COUNT" \
+BACKLIGHT_PERCENT="$BACKLIGHT_PERCENT" INPUT_EVENT_DEVICES="$INPUT_EVENT_DEVICES" \
+STORAGE_DEVICES="$STORAGE_DEVICES" STORAGE_TOTAL_BYTES="$STORAGE_TOTAL_BYTES" \
+STORAGE_REMOVABLE="$STORAGE_REMOVABLE" THERMAL_ZONES="$THERMAL_ZONES" \
+THERMAL_MAX_MILLI_C="$THERMAL_MAX_MILLI_C" FAN_DEVICES="$FAN_DEVICES" \
+USERS_PROVIDER="$USERS_PROVIDER" USER_ACCOUNT_COUNT="$USER_ACCOUNT_COUNT" \
+USER_LOGIN_COUNT="$USER_LOGIN_COUNT" USER_ADMIN_GROUPS="$USER_ADMIN_GROUPS" \
 python3 - "$OUT" <<'PY' || true
-import json, os, sys, glob, time
+import json, os, sys, glob, time, stat
 wg=os.environ.get("WG","/mnt/mesh-storage"); self_host=os.environ.get("SELF","")
 out=sys.argv[1]
 def presence(h):
@@ -280,6 +456,97 @@ if active and len(active)>32 or (active and not all(ch.isalnum() or ch in "-_" f
 power_profile={"active":active, "available":sorted(set(profiles))}
 def env_bool(name):
     return os.environ.get(name, "false").lower() == "true"
+def env_optional_bool(name):
+    value=os.environ.get(name, "").lower()
+    if value == "true": return True
+    if value == "false": return False
+    return None
+def env_optional_count(name, maximum):
+    value=os.environ.get(name, "")
+    try:
+        parsed=int(value)
+    except ValueError:
+        return None
+    return max(0, min(maximum, parsed))
+def env_optional_bytes_kib(name, maximum):
+    value=env_optional_count(name, maximum // 1024)
+    return None if value is None else value * 1024
+def env_optional_float(name, maximum):
+    try:
+        parsed=float(os.environ.get(name, ""))
+    except ValueError:
+        return None
+    return parsed if 0 <= parsed <= maximum else None
+def bounded_pack_text(value, maximum=96):
+    if not isinstance(value, str) or not value or len(value) > maximum:
+        return None
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        return None
+    return value
+def discover_vendor_packs():
+    # Fixed, read-only package boundary. Manifests can describe capability
+    # posture, but never create routes, commands, or executable controls.
+    packs=[]
+    for path in sorted(glob.glob("/usr/share/mde/vendor-packs/*.json"))[:8]:
+        fd=None
+        try:
+            flags=os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            fd=os.open(path, flags)
+            file_stat=os.fstat(fd)
+            if not stat.S_ISREG(file_stat.st_mode):
+                continue
+            if file_stat.st_size > 65536:
+                continue
+            with os.fdopen(fd) as stream:
+                fd=None
+                raw=stream.read(65537)
+            if len(raw) > 65536:
+                continue
+            manifest=json.loads(raw)
+            if not isinstance(manifest, dict):
+                continue
+            name=bounded_pack_text(manifest.get("name"))
+            if not name: continue
+            version=bounded_pack_text(manifest.get("version")) or "unknown"
+            raw_status=manifest.get("status")
+            status=("installed" if raw_status in ("installed", "current")
+                    else "outdated" if raw_status == "outdated"
+                    else "unavailable")
+            capabilities=[]
+            raw_capabilities=manifest.get("capabilities", [])
+            if not isinstance(raw_capabilities, list):
+                raw_capabilities=[]
+            for capability in raw_capabilities:
+                value=bounded_pack_text(capability)
+                if value and value not in capabilities:
+                    capabilities.append(value)
+                if len(capabilities) == 8: break
+            packs.append({"name":name,"version":version,"status":status,
+                          "capabilities":capabilities})
+        except (OSError, ValueError, TypeError):
+            continue
+        finally:
+            if fd is not None:
+                try: os.close(fd)
+                except OSError: pass
+    return packs
+def discover_camera_devices():
+    # Fixed, read-only device boundary. Publish only a bounded count; device
+    # names, paths, and capture permissions never cross the snapshot boundary.
+    count=0
+    for path in sorted(glob.glob("/dev/video[0-9]*"))[:64]:
+        fd=None
+        try:
+            fd=os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+            if stat.S_ISCHR(os.fstat(fd).st_mode):
+                count += 1
+        except OSError:
+            continue
+        finally:
+            if fd is not None:
+                try: os.close(fd)
+                except OSError: pass
+    return count
 try:
     alsa_devices=max(0, min(256, int(os.environ.get("AUDIO_ALSA", "0"))))
 except ValueError:
@@ -291,11 +558,60 @@ audio={"pulse_available":env_bool("AUDIO_PULSE"),
        "playback":env_bool("AUDIO_PLAYBACK"),
        "capture":env_bool("AUDIO_CAPTURE"),
        "recovery":os.environ.get("AUDIO_RECOVERY", "")[:160]}
+try:
+    camera_devices=max(0, min(64, int(os.environ["CAMERA_DEVICES"])))
+except ValueError:
+    camera_devices=discover_camera_devices()
+except KeyError:
+    camera_devices=discover_camera_devices()
+privacy={"microphone_muted":env_optional_bool("MICROPHONE_MUTED"),
+         "camera_devices":camera_devices,
+         "camera_privacy":None}
+bluetooth={"adapters":env_optional_count("BT_ADAPTERS", 64),
+           "powered":env_optional_bool("BT_POWERED"),
+           "devices":env_optional_count("BT_DEVICES", 64)}
+load_1m=env_optional_float("LOAD_1M", 256.0)
+telemetry={"cpu_cores":env_optional_count("CPU_CORES", 256),
+           "load_1m_milli":None if load_1m is None else round(load_1m * 1000),
+           "memory_total_bytes":env_optional_bytes_kib("MEM_TOTAL_KIB", 1 << 44),
+           "memory_available_bytes":env_optional_bytes_kib("MEM_AVAILABLE_KIB", 1 << 44),
+           "root_total_bytes":env_optional_bytes_kib("ROOT_TOTAL_KIB", 1 << 44),
+           "root_used_bytes":env_optional_bytes_kib("ROOT_USED_KIB", 1 << 44),
+           "root_available_bytes":env_optional_bytes_kib("ROOT_AVAILABLE_KIB", 1 << 44),
+           "root_used_percent":env_optional_count("ROOT_USED_PERCENT", 100)}
+power_source={"battery_count":env_optional_count("POWER_BATTERY_COUNT", 16),
+              "battery_percent":env_optional_count("POWER_BATTERY_PERCENT", 100),
+              "battery_status":(os.environ.get("POWER_BATTERY_STATUS", "") or "")[:32],
+              "ac_online":env_optional_bool("POWER_AC_ONLINE")}
+display={"connectors":env_optional_count("DISPLAY_CONNECTORS", 64),
+         "connected":env_optional_count("DISPLAY_CONNECTED", 64),
+         "modes":env_optional_count("DISPLAY_MODES", 512),
+         "backlights":env_optional_count("BACKLIGHT_COUNT", 16),
+         "backlight_percent":env_optional_count("BACKLIGHT_PERCENT", 100)}
+input_devices={"event_devices":env_optional_count("INPUT_EVENT_DEVICES", 64)}
+hardware={"storage_devices":env_optional_count("STORAGE_DEVICES", 128),
+          "storage_total_bytes":env_optional_bytes_kib("STORAGE_TOTAL_BYTES", 1 << 44),
+          "storage_removable":env_optional_count("STORAGE_REMOVABLE", 32),
+          "thermal_zones":env_optional_count("THERMAL_ZONES", 128),
+          "thermal_max_milli_c":env_optional_count("THERMAL_MAX_MILLI_C", 200000),
+          "fan_devices":env_optional_count("FAN_DEVICES", 32)}
+vendor_packs=discover_vendor_packs()
+users={"provider":env_bool("USERS_PROVIDER"),
+       "account_count":env_optional_count("USER_ACCOUNT_COUNT", 4096),
+       "login_count":env_optional_count("USER_LOGIN_COUNT", 4096),
+       "admin_groups":env_optional_count("USER_ADMIN_GROUPS", 16)}
 platform_version=os.environ.get("PLATFORM_VERSION") or "unknown"
 snap={"generated_ms":int(time.time()*1000),"self":self_host,
       "platform_version":platform_version,"latest_version":latest,
       "online":sum(1 for n in nodes if n["presence"]=="online"),"total":len(nodes),
-      "power_profile":power_profile,"audio":audio,
+      "power_profile":power_profile,"audio":audio,"privacy":privacy,
+      "bluetooth":bluetooth,
+      "telemetry":telemetry,
+      "power_source":power_source,
+      "display":display,"input":input_devices,
+      "hardware":hardware,
+      "vendor_packs":vendor_packs,
+      "users":users,
       "nodes":nodes,"network":network}
 tmp=out+".tmp"
 json.dump(snap,open(tmp,"w")); os.replace(tmp,out)

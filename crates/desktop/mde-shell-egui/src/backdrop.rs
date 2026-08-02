@@ -512,7 +512,7 @@ mod wallpaper_decode_tests {
                 image.as_raw(),
                 image.width(),
                 image.height(),
-                image::ColorType::Rgb8.into(),
+                image::ExtendedColorType::Rgb8,
             )
             .expect("encode test Bing JPEG");
 

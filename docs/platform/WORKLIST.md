@@ -8,10 +8,11 @@ The complete pre-rework worklist, including all progress records and historical
 reconciliation text, is preserved at
 `docs/worklist-archive/2026-07-28-platform-worklist-pre-rework.md`.
 
-## Current Snapshot - 2026-07-30 fit-for-purpose audit integration
+## Current Snapshot - 2026-08-01 mackesd architecture evaluation integration
 
-- **9 active epics:** 9 `Remaining`, 0 `Blocked`, 0 `Needs clarification`.
+- **10 active epics:** 10 `Remaining`, 0 `Blocked`, 0 `Needs clarification`.
 - **P0:** WL-ARCH-008 (standalone old Browser repo plus VM Browser cutover),
+  WL-ARCH-009 (process-isolated mackesd and Advanced administration),
   WL-FUNC-011 (Mesh Teams completion and one-product cutover), WL-FUNC-016
   (native text clipboard across seat/mesh/VDI), WL-FUNC-017 (complete Maps,
   navigation, and MG90 radio health), WL-UX-011 (unified This Node hardware
@@ -173,6 +174,30 @@ close it or imply production readiness.
     stale or unavailable interval is explicit rather than silently inferred.
 50. Health and This Node history can be exported as operator-readable,
     audit-backed evidence without exporting credentials or secret material.
+
+### This Node interface rethink survey - 2026-08-01
+
+The operator selected a bold workspace redesign while retaining every existing
+capability and action. WL-UX-011 is the owning epic; this record is normative
+design direction, not a second workstream:
+
+1. Use a technical Device Manager as the primary mental model.
+2. Navigate through a hierarchy-first tree, with selected areas opening as
+   focused full-page detail views.
+3. Make the landing view inventory-first; keep health, alerts, and recovery
+   states attached to the relevant inventory items and clearly visible.
+4. Use a dense operator-console information layout with progressive disclosure.
+5. Put mutations and recovery in a dedicated Actions tab with impact,
+   confirmation, audit, and recovery details.
+6. Use a high-contrast technical visual language with strong state encoding.
+7. Retain one persistent global health score, supplemented by local severity
+   and freshness badges; do not create a second health authority.
+8. Make the tree the primary discovery mechanism, supported by aliases,
+   related-item links, and search rather than search-first navigation.
+9. Treat desktop and tablet interaction as equal primary targets, including
+   touch-sized controls and responsive dense layouts.
+10. Permit a bold new workspace structure while preserving all functionality,
+    typed contracts, safe actions, and clear continuity to existing routes.
 
 ### MG90 ownership, sharing, and cache contract
 
@@ -482,6 +507,163 @@ remains here under a completed status.
 
 ## Functional Completeness
 
+### WL-ARCH-009 - Process-isolated mackesd and Advanced node administration
+
+- Status: Remaining
+- Priority: P0
+- Complexity: Epic
+- Problem: `mackesd` has grown into an 88-worker platform concentrated in one
+  process. Dell evidence shows roughly 3 GiB resident daemon memory and a
+  roughly 4.5 GiB cgroup peak after boot, while the current service has task
+  accounting but no effective memory ceiling. The worker registry mostly knows
+  only name, role rank, and restart policy, so optional providers, queues,
+  caches, retries, and process ownership are not uniformly observable. A
+  single failure domain makes memory growth, provider outages, and restart
+  storms harder to contain. This Node has no authoritative mackesd runtime or
+  fleet-administration page.
+- Required outcome: Replace the monolithic runtime with six clearly named,
+  independently supervised services: `mackesd-control.service`,
+  `mackesd-observation.service`, `mackesd-actions.service`,
+  `mackesd-data.service`, `mackesd-compute.service`, and
+  `mackesd-integrations.service`. Keep Control as the sole persistent-state
+  writer; use typed, versioned mde-bus contracts; make worker activation,
+  resource budgets, cleanup, retry behavior, and health observable. Add
+  `this-node/advanced` under This Node → Mesh & System as a desktop operator
+  dashboard with local-first and explicit fleet-wide scope, complete typed
+  worker/systemd controls, bounded evidence export, and per-node outcomes.
+  The test fleet uses a coordinated hard cut with no dual-running monolith.
+- Current state: The registry in `worker_role.rs` asserts 88 workers and
+  `spawn.rs` constructs them in one daemon process.
+  `mackesd.service` already has notify/watchdog/restart policy, but its memory
+  policy is unbounded and its sandbox is intentionally broad for mixed duties.
+  Existing mde-bus state/action/reply topics and exact-body short-lived action
+  authorization are reusable foundations.
+  This Node has a stable provider-aware catalog and 16 routes, but no Advanced
+  route, runtime read model, or mackesd control surface.
+- Remaining work:
+
+  1. Baseline every current worker and service dependency on Dell and the
+     test nodes. Record RSS, anonymous/shared memory, cgroup current/peak,
+     CPU, tasks, queues, cache sizes, retry rates, startup time, and provider
+     availability. Capture the boot allocation anomaly before refactoring.
+  2. Expand `WorkerSpec` into the single runtime contract: group, criticality,
+     capability predicate, cadence, queue/cache bounds, resource budget,
+     restart policy, health key, state topic, action namespace, and cleanup
+     ownership. Add drift tests proving every spawned worker is registered and
+     every registered worker maps to exactly one named group.
+  3. Implement the six process entrypoints and `mackesd.target`. Assign all
+     existing workers exactly once to Control, Observation, Actions, Data,
+     Compute, or Integrations. Control owns SQLite migrations/writes and
+     shared configuration; other groups use typed bus contracts and bounded
+     read models. Remove the old monolithic service from the hard-cut package.
+  4. Add structured worker shutdown: cancel child tasks, close subscriptions
+     and sockets, release external leases/handles, drain or reject bounded
+     queues according to message class, and publish cleanup results.
+  5. Add universal resource discipline: do not start unconfigured optional
+     workers; use latest-wins telemetry, explicit command rejection, fixed
+     TTL/byte/item cache limits, per-group/provider semaphores, jittered
+     exponential backoff, circuit breakers, restart-storm suppression, and
+     anomaly-triggered sampled allocator profiles.
+  6. Install per-group systemd policies for MemoryHigh/MemoryMax, CPU
+     weight/quota, TasksMax, IOWeight, watchdog, restart/start limits,
+     filesystem protection, address-family restrictions, device allowlists,
+     writable paths, and dedicated identities. The first release warns and
+     captures evidence at normal budget thresholds; hard kill remains an
+     explicit emergency setting rather than automatic normal recovery.
+  7. Split the RPM into a lean core plus role/group subpackages. Audit bundled
+     system dependencies, install only required Integrations/Compute payloads,
+     use dedicated non-root identities for non-privileged groups, and retain
+     root only for unavoidable Actions operations.
+  8. Publish a strict-versioned `state/mackesd/<node>` snapshot and bounded,
+     credential-free `/run/mde/mackesd-status.json` projection. Include group
+     resources, worker state, queues, retries, capabilities, effective config,
+     staleness, and audit pointers; never include secrets, raw logs, or
+     unbounded diagnostics.
+  9. Add typed `action/mackesd/*` controls for every supported worker/resource
+     setting plus restart, pause, cleanup, refresh, profile apply, and evidence
+     export. Validate, preview, transact, verify, and audit every mutation.
+     Use existing exact-body, short-lived, single-use authorization; fleet
+     configuration uses signed revisions and per-node acknowledgements.
+  10. Add `this-node/advanced` to the durable catalog and a dedicated tab. The
+      page opens on This Node, exposes an explicit fleet switch, uses typed
+      filters plus explicit node checkboxes, shows large resource charts and a
+      searchable process-grouped worker roster, keeps stale nodes visible but
+      disables unsafe actions, and uses high-contrast white selectable choices
+      in both themes.
+  11. Add unit, integration, package, protocol, GUI, and live-fleet gates.
+      Exercise every group crash, provider outage, queue saturation, restart
+      storm, stale snapshot, partial fleet action, cleanup path, and schema
+      mismatch. Require Dell to settle below 1 GiB and peak below 2 GiB; run
+      the same failure matrix across the entire test fleet and record all
+      non-Dell evidence even though Dell is the final memory acceptance gate.
+  12. Deploy the hard cut to all test nodes simultaneously. If a node fails,
+      preserve diagnostics and correct forward through the governed farm/release
+      path; do not add a compatibility monolith or rely on rollback.
+- Scope: In scope are mackesd worker/process architecture, memory and CPU
+  governance, queue/cache/retry/cleanup policy, typed runtime snapshots and
+  actions, Fedora systemd/RPM hardening, the This Node Advanced page, fleet
+  targeting, audit/evidence, and test-fleet deployment. Out of scope are raw
+  shell/SQL/filesystem controls, arbitrary systemd properties not represented
+  by the typed schema, redesign of unrelated This Node providers, and a
+  production rollout before the existing platform production gates pass.
+- Relevant files/components: `crates/mesh/mackesd/src/worker_role.rs`,
+  `crates/mesh/mackesd/src/bin/mackesd/spawn.rs`,
+  `crates/mesh/mackesd/src/ipc/action_auth.rs`,
+  `crates/mesh/mackesd/Cargo.toml`, `packaging/systemd/mackesd.service`,
+  `crates/desktop/mde-shell-egui/src/this_node_catalog.rs`,
+  `crates/desktop/mde-shell-egui/src/main.rs`, and the existing mde-bus/fleet
+  state/action contracts.
+- Dependencies: WL-UX-011 owns the durable This Node hierarchy, health-score
+  integration, typed node actions, and provider truth; this epic owns the
+  mackesd runtime contract and Advanced implementation lane. Coordinate visual
+  primitives and contrast with WL-UX-009, integrated release evidence with
+  WL-CRIT-006, and role/package contracts with the build/release governance.
+  Use `docs/BUILD-ENVIRONMENT.md` and `AI_GOVERNANCE.md §10` for all heavy
+  build, test, package, and live-fleet gates.
+- Acceptance criteria:
+
+  1. Every current spawned worker has exactly one registry entry, named group,
+     capability predicate, budget, queue/cache policy, state topic, health
+     key, restart policy, and tested cleanup owner.
+  2. The six named services start independently under `mackesd.target`; a
+     crashed group can restart without taking unrelated groups down, and no
+     old monolithic service runs concurrently.
+  3. Control is the only SQLite writer; cross-group state and actions use
+     strict-versioned typed mde-bus contracts with bounded bodies and replies.
+  4. Unconfigured optional workers do not start; retries, queues, caches,
+     task counts, and provider concurrency remain within declared bounds.
+  5. Dell settles below 1 GiB for the complete mackesd stack and remains below
+     2 GiB during boot; any anomaly has allocator/cgroup attribution and a
+     corrective test.
+  6. Advanced reports exact group/worker state, resources, queues, retries,
+     capabilities, staleness, effective settings, audit pointers, and action
+     outcomes without secrets or raw unbounded logs.
+  7. Advanced supports complete typed supported-setting administration,
+     contextual actions, local-first scope, explicit fleet selection, signed
+     revision rollout, partial-success reporting, and stale-node safety.
+  8. Every mutation is traceable; compact successful records and detailed
+     failure evidence are retained for one day with bounded purge behavior.
+  9. Dark/Light selectable choices remain readable on white high-contrast
+     surfaces with distinct hover, focus, selected, and disabled states.
+  10. All failure-injection, protocol, packaging, worklist, focused GUI, farm,
+      and Dell live gates pass, with unavailable hardware/provider evidence
+      recorded honestly.
+- Verification method: Run `install-helpers/lint-worklist.sh --self-test` and
+  the normal worklist lint. Run focused mackesd and shell tests plus farm
+  `cargo test -p mackesd`, touched shell tests, package/payload checks, and
+  workspace/clippy gates with the longest job on BigBoy. Inspect installed
+  systemd unit/cgroup state on every test node. Capture Dell boot/idle memory
+  timelines, allocator evidence, service health, and Advanced screenshots in
+  Dark/Light desktop layouts. Run the six-node chaos matrix and retain signed,
+  redacted evidence bundles; do not claim live hardware proof when unavailable.
+- Origin or merged source IDs: 2026-08-01 operator evaluation of mackesd
+  growth, Dell boot memory regression, process isolation, performance,
+  resilience, Fedora best practice, and fleet-wide Advanced administration.
+  Incorporates the 50-question decision pass: under-1-GiB idle target,
+  under-2-GiB boot peak, six clear process groups, mde-bus contracts, one-day
+  evidence retention, trusted-mesh mutation authority, typed forms, signed
+  fleet revisions, and Dell as the final memory gate.
+
 ### WL-FUNC-011 - Complete Mesh Teams and cut over one collaboration product
 
 - Status: Remaining
@@ -559,7 +741,104 @@ remains here under a completed status.
   7. Complete channel Files and transfer-first workflows against stable file
      references, resumable hash-verified transfers, new-member backfill,
      reference-versus-delete semantics, and the shared operation-progress
-     authority.
+     authority. Extend the standalone Files workspace into the node-aware
+     control surface: expose enrolled nodes and their sync state, prepopulate
+     links/shares and destination metadata, and provide ten automatic
+     interactions covering node browse, share/link creation, sync inspection,
+     transfer routing, Airsonic upload targeting, retry/resume, conflict
+     review, offline queueing, node health, and per-node activity.
+     - Bug 7 implementation slice (2026-08-02): reconcile the existing Files
+       node-action prototype with real backend/provider truth. Each of the ten
+       interactions must dispatch an existing typed Files/Transfers action or
+       remain visibly unavailable; node rows must expose per-node sync state;
+       link/share and upload destinations must be populated only from live
+       advertisements; and the slice must have focused model/view tests plus
+       Dell `.138` Dark/Light desktop, narrow, and large-text render evidence.
+       Focused farm result: `mde-files-egui --lib` passes 168/168, including
+       the ten-action render inventory. Live `.138` proof now passes Dark
+       desktop, Dark narrow, Light desktop, and Light/Largest with exact
+       payload `5ea5b72594482d8e4158e136b09d1c44407c3a68c85d8c97a17e3f7bd3794e28`;
+       provider-advertised Airsonic validation remains open, and this is not a
+       readiness claim.
+       Live `.138` finding (2026-08-02): the first Dark desktop frame rejected
+       the slice because the compact sidebar painted the ten action labels as
+       single initials (`B…`, `S…`, etc.). Fix the row geometry so labels and
+       state remain readable beside their action controls, then recapture all
+       required profiles.
+       A second `.138` frame on payload `d284b002a23dc3a1a5db3574fafb651c94ec7403154a133f706d8a9d4b62c935`
+       made the verbs readable but exposed excessive button/state wrapping;
+       the final action-lane tightening is farm-tested but not yet live-captured.
+       The next release gate also exposed a pre-existing `ThisNodeState::health`
+       compile error (`self.health_dashboard()`; the provider lives under
+       `self.status`). Correct that scoped blocker before producing the final
+       validation payload.
+       Final payload `5ea5b72594482d8e4158e136b09d1c44407c3a68c85d8c97a17e3f7bd3794e28`
+       live result: all four `.138` Dark/Light desktop, narrow, and
+       Light/Largest profiles passed direct-DRM visual inspection. The shared
+       title allocation reserves a fractional-pixel trailing margin so the
+       complete `FILES` identity remains visible at 800 logical pixels.
+       Evidence is recorded in `WL-UX-009-DRM-EVIDENCE-2026-07-31.md`; this
+       Files slice is validated while WL-UX-009 remains Remaining.
+       - Bug 7 review finding (2026-08-02): the ten node-action rows and
+         per-peer sync labels are present and farm-tested, but
+         `build_targets()` still unconditionally adds `Music Library` and
+         `node_actions_section()` therefore presents an Airsonic upload route
+         without a live service advertisement. Keep the provider-advertised
+         Airsonic destination open; wire the existing service-advertisement
+         source into `Peer`/`FileBrowser` before claiming uploader readiness.
+       - Bug 7 implementation (2026-08-02): Files now reads the shared
+         `state/services/*` records through the Bus and exposes Music Library
+         only for a probe-confirmed `Up` Airsonic/Navidrome service. Mesh Share
+         and reachable-node destinations remain prepopulated; offline/demo
+         backends do not fabricate an uploader. `FileBrowser` refreshes this
+         capability with the roster, and the focused farm suite passes 168/168.
+         Direct-DRM provider-advertisement proof remains open, so this does not
+         close the slice or claim readiness.
+       - Live provider check (2026-08-02): `.138` has a probe-confirmed
+         Airsonic endpoint at `10.42.0.7:4040` (`health=up`); Dell has no
+         confirmed Airsonic record. A feature-correct `.138` capture was
+         rejected because the explicit Files proof route produced a Music
+         frame. The candidate was removed and `.138` restored to the prior
+         payload with the proof override removed; keep the live Files render
+         and uploader acceptance open.
+       - Proof-route hardening (2026-08-02): the shell now reasserts an
+         explicitly requested DRM proof surface at each render frame, preventing
+         startup navigation/tray events from contaminating a capture. The
+         focused shell proof-route dependency suite passes 16/16 on BigBoy;
+         a feature-correct live recapture is still required.
+       - Route defect remains reproducible (2026-08-02): after the candidate
+         recapture on `.138` under explicit `Dark / Construct / Default / Normal`
+         state, `MDE_DRM_PROOF_SURFACE=files` still produced the Auto/clock
+         frame. The seat was restored to payload `20955383…`, the proof drop-in
+         was removed, and `NRestarts=0` verified. Do not accept the Files live
+         render or uploader proof until this route is corrected.
+       - Current-payload Terminal Light/Largest desktop review (2026-08-02):
+         the initial scaled inspection appeared to show `TE…`, but original-
+         resolution inspection and OCR both confirm the complete `TERMINAL`
+         identity. No source change was warranted; the reviewed Dell frame is
+         accepted as evidence.
+     - Current-payload resolution (2026-08-02): the shared title allocation now
+       reserves a ceil-rounded galley width plus a trailing margin. Exact
+       release `911e781820822cb0be5bb18251147bf34c33f24047c936c5183222ed1e7081c8`
+       was installed on `.138`; all four Terminal and all four Editor Dark/Light
+       desktop, narrow, and Light/Largest frames passed direct-DRM visual
+       inspection. `TERMINAL` remains complete at 800 logical pixels, Editor
+       sidebars remain collapsed, and the secure seat restored active/zero
+       restarts. Evidence is in the DRM ledger; `.225`, remaining matrix cells,
+       and WL-UX-009 readiness remain open.
+       - Current-payload Terminal matrix resolution (2026-08-02): exact
+         release `20955383f21c4e2a4aee6a519be24905a2c65b2605f52ad3f515dcf8f2b9ae5a`
+         was inspected on both `.138` and Dell `.225` in Dark desktop, Dark
+         narrow (`800`), Light/Largest desktop, and Light/Largest narrow
+         profiles. All eight frames preserve the complete `TERMINAL` identity,
+         menu/session controls, body, and footer chrome. Evidence and hashes are
+         in the DRM ledger; both seats restored secure login-at-boot, active
+         service, and zero restarts. This closes only the current Terminal
+         render slice and leaves WL-UX-009 readiness open.
+     - Governance finding (2026-08-02): the style-leak gate reports one raw
+       `on_hover_text` in the This Node section tree, even though the row also
+       uses the shared hover-card helper. Remove the raw egui tooltip and keep
+       the combined provider/health explanation in the themed shared tooltip.
   8. Keep platform clipboard ownership in WL-FUNC-016. Mesh Teams consumes its
      text history/actions; arbitrary MIME and large attachments flow through
      Files/Transfers, not a second clipboard store.
@@ -606,7 +885,10 @@ remains here under a completed status.
      behavior.
   5. Files preserve stable identity and distinguish reference removal from
      permanent deletion; transfers resume, verify hashes, backfill members, and
-     report through the shared progress projection.
+     report through the shared progress projection. The Files workspace exposes
+     ten tested node-aware interactions, prepopulates every available link/share
+     and Airsonic upload destination, and makes per-node sync state identifiable
+     without inventing unavailable services.
   6. Direct and SFU-relayed calls carry advancing audio/video/screen frames;
      SIP ingress/egress, device controls, failover, and remote-control
      escalation work; no recording/transcription artifact exists. Node-to-node
@@ -1394,9 +1676,30 @@ remains here under a completed status.
   The full RPM
   dependency transaction, `.15`, remaining routes/states, full matrix, and
   production readiness remain open. The latest installed validation payload is
-  `8366b1094571c8ec520166e6af09e342954850bde149f14146613091e5317f4b` on both
-  seats; the earlier `703d3477...` hash remains the basis of the already
-  accepted representative screenshots.
+  `e37ec5c0df9ac05133c073f481823b5642a9fef85dd0237502f82abb2a9d13dd` on
+  `.138`, containing the This Node, Explorer, and Mesh Teams frame migrations
+  plus the Files node-action surface. Dell `.225`
+  was unreachable during this deployment, so no Dell synchronized-adoption or
+  current-payload visual claim is made. Earlier `bbe6a88b…` rows remain
+  accepted historical evidence for the Maps/This Node slices they name.
+  The earlier `f58b42ba...`, `bccc6e94...` and
+  `703d3477...` hashes remain the basis of already accepted representative
+  screenshots.
+  Current navigation/tray, Files node-integration, and Maps responsive fixes
+  were rebuilt as release shell payload
+  `bccc6e94dd7dc32427f6b809e92b36fb0c06591fb1af2dd58a18dc399148a3e2` on
+  BigBoy with `drm,live-vdi,media-mpv`, then installed directly on Dell
+  `.225` and `.138`; both services reported `active` with `NRestarts=0` and
+  the installed hashes matched the artifact. Current `.138` proof-only EGL
+  readback frames for This Node Dark, This Node Light/Largest narrow, and
+  Terminal Dark were written and visually inspected; their hashes are
+  `aae809d959f81f9049385c4840ee6dd6fedb4cbaa8c2eceb8a9ae72a90713d5e`,
+  `77f336a7e8978cf5c866ca2ff8d95efc7259b8d81745e810801f3848f800c1ac`, and
+  `9674a818f45c5b97f18f6fd71d1788d444f60520baf63b84726092b66a67d35f`.
+  The empty Desktop/Remote Sessions frame is intentionally not accepted as
+  tray evidence because this seat has no live remote session. Proof drop-ins,
+  appearance overrides, and boot-curtain overrides were removed after capture;
+  `.138` returned to Dark/Default and `require_login_at_boot:true`.
   The Maps Drive HUD now reserves the painter-positioned FAB lane before laying
   out the radio/GNSS health rail and selects a fixed multi-row grid for
   large/largest text; 267 focused Maps tests pass on farm `.90`.
@@ -1465,6 +1768,12 @@ remains here under a completed status.
   narrow on the same release payload; the dense sidebar/list/preview/status
   geometry remains bounded in all three inspected frames. The focused Files
   suite passes 165 tests.
+  The first current-payload `.138` Workloads Dark desktop readback was invalid:
+  it contained only a dark canvas, the proof readback marker, and the Construct
+  watermark, with no WORKLOADS frame or honest route state. Do not accept that
+  PNG as visual evidence. Re-run the proof against the canonical
+  `Surface::InfraCode` route (`iac`/`infra-code`) with the settle window, then
+  visually inspect the replacement before closing the Workloads matrix cell.
   The current `.138` Maps proof found two render-validation failures before
   evidence could be accepted: Light/Largest remapped the dark map canvas text
   to dark ink, and the first 800-logical-width capture was effectively blank.
@@ -1519,6 +1828,573 @@ remains here under a completed status.
   the seat lacks live backend data; their hashes are recorded in the evidence
   ledger. This expands the matrix but does not close the remaining desktop,
   narrow, and large-text coverage for every Construct-owned route.
+- Live-render resolution (2026-08-01): current payload `bccc6e94…` Music
+  unavailable Dark desktop and Light/Largest narrow frames were visually
+  accepted with hashes `79378b49…` and `4521d334…`. The frames show the
+  shared MUSIC chrome and honest missing-Airsonic-credentials state; they do
+  not claim connectivity to the Subsonic server at `172.20.0.2`.
+- Live-render resolution (2026-08-01): current payload `bccc6e94…` Media
+  Sources Dark desktop and Light/Largest narrow frames were visually accepted
+  with hashes `8baeb270…` and `3d27686e…`. Source tabs, local-capture/Jellyfin
+  controls, and the honest empty-source state remain bounded above the taskbar.
+  The proof seat was restored to secure login-at-boot with an active service and
+  zero restarts; no live media backend or Jellyfin source is claimed.
+- Live-render resolution (2026-08-01): current payload `bccc6e94…` Terminal
+  Dark desktop and Light/Largest narrow frames were visually accepted with
+  hashes `f8372346…` and `1ff9a316…`; the terminal menu, tabs, mesh overview,
+  prompt, and taskbar remain readable and separated.
+- Live-render resolution (2026-08-01): current payload `bccc6e94…` This Node
+  System Dark desktop and Light/Largest narrow frames were visually accepted
+  with hashes `dad7a71f…` and `293107bf…`; unified node navigation, display
+  controls, health rail, and taskbar remain readable and bounded. These are
+  visual/state proofs only and do not claim live hardware reconfiguration.
+- Live-render resolution (2026-08-01): current payload `bccc6e94…` Editor
+  Dark desktop and Light/Largest narrow frames were visually accepted with
+  hashes `755ce34d…` and `32608697…`; nested communications/editor chrome,
+  formatting controls, direct-entry collapsed sidebars, document body, and
+  details/status regions remain bounded.
+- Live-render resolution (2026-08-01): current payload `bccc6e94…` Phones
+  Dark desktop and Light/Largest narrow frames were visually accepted with
+  hashes `911b8ffc…` and `e22d3eb5…`; the shared title, pairing status, tabs,
+  feature card, and remote-input controls remain readable without clipping.
+- Live-render resolution (2026-08-01): current payload `bccc6e94…` Car Dark
+  desktop and Light/Largest narrow frames were visually accepted with hashes
+  `b068e661…` and `175befca…`. The Auto Mode cockpit, zoom-aware instrument
+  grid, width-safe telemetry elision, cards, app strip, and taskbar remain
+  bounded.
+- Live-render resolution (2026-08-01): current payload `bccc6e94…` Browser
+  boundary Dark desktop and Light/Largest narrow frames were visually accepted
+  with hashes `736a3bea…` and `982786b7…`. The frames contain only
+  Construct-owned VM selection, transport guidance, waiting, and unavailable
+  states; Chromium guest pixels remain outside the boundary and no guest
+  readiness claim is made.
+- Live-render finding (2026-08-01): current-payload Explorer Dark desktop and
+  Light/Largest narrow proof both show an orphaned wrapper-level `View` control
+  above the EXPLORER title. The duplicate consumes top-of-space and does not
+  belong to the Explorer shared frame; remove it before accepting the two
+  Explorer captures.
+- Live-render resolution (2026-08-01): removed the Explorer-only wrapper
+  `View` control while preserving the Mesh Map switcher. Farm release build
+  `f58b42ba…` passed compilation and was installed on `.138`; the replacement
+  Explorer Dark desktop and Light/Largest narrow frames were visually accepted
+  with hashes `df371c09…` and `1f9723cb…`. `.138` remained active with zero
+  restarts and secure login-at-boot. Dell was unreachable during this deploy,
+  so no Dell adoption claim is made.
+- Live-render resolution (2026-08-01): exact Explorer-fix payload `f58b42ba…`
+  Maps Dark desktop and Light/Largest narrow frames were visually accepted with
+  hashes `33de1d86…` and `e36ac4f5…`; the governed map-content palette and
+  responsive health/FAB geometry remain intact.
+- Live-render resolution (2026-08-01): exact Explorer-fix payload `f58b42ba…`
+  Workbench Dark desktop and Light/Largest narrow frames were visually accepted
+  with hashes `55b58e11…` and `db1b223c…`; the shared STATE OF THE MESH frame,
+  plane rail, node health body, and taskbar remain bounded.
+- Live-render resolution (2026-08-01): exact Explorer-fix payload `f58b42ba…`
+  Workloads was recaptured against the canonical `infra-code` route with the
+  10-second proof-only settle window. The Dark desktop frame was visually
+  accepted with hash `676675aa…`; WORKLOADS menu, lifecycle rail, placement
+  card, plan-only state, and taskbar remain readable and bounded. The earlier
+  `workloads`-target blank frame remains rejected and is not evidence.
+- Live-render resolution (2026-08-01): exact Explorer-fix payload `f58b42ba…`
+  Music Light/Largest narrow, Media Sources Dark desktop, and Terminal
+  Light/Largest narrow frames were visually accepted with hashes `df42b3a1…`,
+  `c6621041…`, and `71509a65…`; unavailable/empty backend states remain
+  honest and the shared chrome stays bounded.
+- Live-render resolution (2026-08-01): exact Explorer-fix payload `f58b42ba…`
+  This Node/System, Editor, Phones, and Car Dark desktop frames were visually
+  accepted with hashes `5154fcd9…`, `417803a0…`, `4fc968ac…`, and
+  `02de499f…`. The shared/system chrome, editor body, unpaired Phones state,
+  and Auto Mode cards remain readable and bounded; `.138` was restored to
+  secure login-at-boot with zero restarts.
+- Live-render resolution (2026-08-01): exact Explorer-fix payload `f58b42ba…`
+  This Node/System, Editor, and Phones Light/Largest narrow frames were
+  visually accepted with hashes `af02ada0…`, `483a6847…`, and `32f53d03…` at
+  the `800` logical-width proof viewport. Large-text controls remain readable
+  and bounded; the unused right scanout is intentional proof-viewport space.
+- Live-render resolution (2026-08-01): exact Explorer-fix payload `f58b42ba…`
+  Car Light/Largest narrow was visually accepted with hash `7591f6fb…`.
+  Car deliberately uses the governed AutoSync3 skin, so its dark cockpit is
+  the approved Car appearance under the Light profile; the complete large-text
+  navigation/media/vehicle layout, app strip, and taskbar remain bounded.
+- Live-render resolution (2026-08-01): exact Explorer-fix payload `f58b42ba…`
+  This Node/System, Editor, and Phones Light desktop frames were visually
+  accepted with hashes `ab0df010…`, `9d8802cf…`, and `975d15e9…`; the Light
+  palette, shared chrome, and route-specific bodies remain readable and
+  bounded on native `1920x1080` readback.
+- Live-render resolution (2026-08-01): exact Explorer-fix payload `f58b42ba…`
+  Files Dark desktop and Light/Largest narrow frames were visually accepted
+  with hashes `44b27b97…` and `b5824b43…`. The new NODE ACTIONS inventory,
+  peer roster, transfer affordances, list/preview geometry, and status row
+  remain readable and bounded; this closes the direct-render proof slice for
+  Bug 7 without claiming backend connectivity beyond the displayed roster.
+- Live-render resolution (2026-08-01): exact Explorer-fix payload `f58b42ba…`
+  Browser boundary Dark desktop and Light/Largest narrow frames were visually
+  accepted with hashes `aeb104ca…` and `51115664…`. The frames prove only the
+  Construct-owned VM selection, transport guidance, and waiting/unavailable
+  state; guest Chromium pixels and browser readiness remain explicitly outside
+  the host styling and evidence boundary.
+- Live-render resolution (2026-08-01): exact Explorer-fix payload `f58b42ba…`
+  Music Dark desktop, Media Light/Largest narrow, and Terminal Dark desktop
+  frames were visually accepted with hashes `2facf38c…`, `51432679…`, and
+  `929db052…`. Honest unavailable/idle states remain bounded and no backend
+  connectivity is claimed.
+- Live-render resolution (2026-08-01): exact Explorer-fix payload `f58b42ba…`
+  Mesh Teams Dark desktop and Workloads Light/Largest narrow frames were
+  visually accepted after the proof-only settle window with hashes
+  `d521d2bc…` and `a1f39bdd…`. Mesh Teams shows its team/channel rail,
+  Activity feed, collaboration tabs, and details rail; Workloads shows the
+  large-text lifecycle rail, placement card, plan-only state, and taskbar on
+  the canonical `infra-code` route. The proof seat remained active with zero
+  restarts and was restored to secure login-at-boot; this closes two evidence
+  cells only and does not establish full-matrix readiness.
+- Live-render resolution (2026-08-01): exact Explorer-fix payload `f58b42ba…`
+  Workloads Light desktop, Workloads Dark narrow, Mesh Teams Light desktop,
+  and Mesh Teams Dark narrow frames were visually accepted after the
+  proof-only settle window with hashes `d79c2a0f…`, `0208abe9…`,
+  `83c7155e…`, and `f6171491…`. All four frames remain bounded and readable;
+  the Workloads captures use the canonical `infra-code` route. The proof seat
+  was restored to Dark/Default with `require_login_at_boot:true`, active
+  service, and zero restarts. These cells expand evidence coverage only and do
+  not establish full-matrix readiness or Dell adoption.
+- Live-render resolution (2026-08-01): exact Explorer-fix payload `f58b42ba…`
+  Files Light desktop, Files Dark narrow, Explorer Light desktop, and Explorer
+  Dark narrow frames were visually accepted with hashes `447a4bdb…`,
+  `1d72243d…`, `ef015cd4…`, and `6206cabf…`. Files' node-action inventory,
+  peer roster, transfer controls, and list/preview boundary remain bounded;
+  Explorer's mode filters, mesh card, and health summary remain bounded. The
+  proof seat was restored to secure login-at-boot with an active zero-restart
+  service. These cells expand direct-render evidence only and do not claim
+  full-matrix readiness or Dell adoption.
+- Live-render finding (2026-08-01): the current f58b42ba Maps Light desktop
+  readback is pixel-valid but rejected on visual inspection. The honest
+  no-offline-map fallback paints its `No offline map data` and installation
+  guidance with shared shell `Style::TEXT`/`TEXT_DIM`, which resolves to dark
+  ink over the dark map-content canvas in Light mode. The frame hash is
+  `48ef0845…`; do not accept it until the fallback uses the governed
+  high-contrast map-content palette and a fresh direct-DRM Light desktop frame
+  passes visual inspection. This is a source defect, not a scanout failure.
+- Live-render resolution (2026-08-01): the no-offline-map fallback now uses
+  explicit high-contrast map-content tokens instead of shared shell text. Farm
+  package tests passed 273/273, the exact shell release payload
+  `bbe6a88c…` was installed on `.138`, and its replacement Maps Light desktop
+  direct-DRM EGL readback was visually accepted with hash `0d59d2e1…`.
+  `.138` returned to Dark/Default, secure login-at-boot, active service, and
+  zero restarts. Dell was not reachable for this replacement deployment, so
+  no Dell adoption claim is made.
+- Live-render resolution (2026-08-01): exact Explorer-fix payload `f58b42ba…`
+  Workbench Light desktop and Dark narrow frames were visually accepted with
+  hashes `0f4fab9a…` and `0a597fc5…`. The Light and Dark STATE OF THE MESH
+  chrome, This Node plane rail, health dashboard, and taskbar remain bounded
+  in both proof geometries; the proof seat was restored to secure
+  login-at-boot with an active zero-restart service. These cells expand
+  direct-render evidence only and do not establish full-matrix readiness.
+- Live-render resolution (2026-08-01): current `.138` payload `bbe6a88b…`
+  Music Light desktop/Dark narrow, Media Sources Light desktop/Dark narrow,
+  and Terminal Light desktop/Dark narrow frames were visually accepted with
+  hashes `a343fa34…`, `50a620d4…`, `453621e3…`, `6b82836b…`, `3c9f2ae3…`,
+  and `43c9a93e…`. The frames preserve truthful unavailable/empty states and
+  remain bounded in native and `800`-logical-width proof geometries. `.138`
+  was restored to secure login-at-boot with an active zero-restart service;
+  this closes six evidence cells only and does not establish Dell adoption or
+  production readiness.
+- Live-render resolution (2026-08-01): current `.138` payload `bbe6a88b…`
+  This Node Dark narrow, Editor Dark narrow, Phones Dark narrow, Car Light
+  desktop, Car Dark narrow, Browser boundary Light desktop, and Browser
+  boundary Dark narrow frames were visually accepted with hashes `9a9d2de5…`,
+  `df916ce9…`, `61e248bc…`, `d1ff1660…`, `2eea2104…`, `0d929dcd…`, and
+  `9640186a…`. Car retains its approved AutoSync3 cockpit exception. Browser
+  proofs show only Construct-owned VM connection/waiting guidance; they do not
+  claim guest Chromium pixels or VDI readiness. `.138` was restored to secure
+  login-at-boot with an active zero-restart service; these cells do not close
+  Dell adoption or production readiness.
+- Live-render resolution (2026-08-01): current `.138` payload `bbe6a88b…`
+  Bookmarks, This Node → Storage, Timers & Alarms, and This Node → About each
+  received Dark desktop, Light desktop, Dark narrow, and Light/Largest narrow
+  direct-DRM EGL frames. All sixteen frames were visually accepted: manager,
+  storage, timer/alarm, device-inventory, node, peer, and taskbar content stayed
+  readable and bounded, with only intentional vertical continuation or unused
+  right scanout in narrow proofs. `.138` was restored to secure login-at-boot
+  with an active zero-restart service. This closes sixteen evidence cells only;
+  Dell adoption, VDI guest readiness, and production readiness remain unclaimed.
+- Farm validation finding (2026-08-01): the current dirty tree compiles and
+  passes `mde-files-egui` (165/165) and `mde-maps-location-egui` (273/273), but
+  the `mde-shell-egui` suite reports 13 failures. Several assertions still
+  encode the superseded central-launcher inventory, three-control status-bar
+  geometry, or old profile/fallback interaction contracts after the requested
+  tray and navigation changes. One chat timestamp failure is environment
+  timezone-sensitive, and the remaining Front Door wording/pump failures need
+  classification before any expectation is changed. No shell suite or release
+  readiness claim is made until each failure is either corrected or explicitly
+  evidenced as an unrelated baseline.
+- Farm validation resolution (2026-08-01): updated the behavior assertions for
+  tray-owned launcher exclusion, the fourth Power status cell, guest-owned
+  Browser downloads, the Browser-only remote-session fallback, and the new
+  launcher result count. The three focused BigBoy jobs all pass: status-bar
+  geometry, Front Door ordering, and VDI fallback transition. The timezone
+  expectation now derives from the configured display zone. The shell seam
+  assertion is now deterministic: raw Super scan timing remains covered by
+  the focused hotkey tests, while the shell test fixes the decoded input at
+  the Front Door boundary and explicitly starts on home. Its focused BigBoy
+  rerun passes. The final serial BigBoy shell suite passes 1,349/1,349;
+  Files and Maps remain green at 165/165 and 273/273 respectively.
+- Adoption audit finding (2026-08-01): direct reachability confirms `.138`
+  (`172.20.146.138`) is online with the current `e37ec5c0…` shell payload,
+  `mde-shell-egui.service` active, and `NRestarts=0`. Dell `.225`
+  (`172.20.146.225`) currently returns no route and TCP/22 is unavailable.
+  Dell's accepted screenshots remain valid historical visual evidence for the
+  payloads named in their capture rows, but they do not prove synchronized
+  adoption of the current `.138` payload. No current Dell-adoption claim is
+  made. The approved boundary authority remains: focused VDI owns guest pixels,
+  Maps owns its governed content-color exception, and `browser-vm` owns
+  Chromium pixels and chrome; Construct owns only connection/unavailable/
+  diagnostic states around those guests.
+- Matrix audit finding (2026-08-01): the current `.138` payload has 30
+  accepted direct-DRM rows, including the complete four-cell Bookmarks,
+  Storage, Timers, and About slices, but several current-payload route/profile
+  cells still rely on older payloads or are absent (notably Files, Mesh Teams,
+  Editor, and portions of Music, Media, Terminal, Browser, Car, Maps, and This
+  Node). Historical rows remain useful regression evidence, not substitutes
+  for current-payload adoption proof. The full current-payload matrix remains
+  open.
+- Migration finding (2026-08-01): the unified This Node shell route still
+  hand-composes its search row, section navigation, and System/Storage/About
+  panels without the shared `AppFrame` header. This leaves the central local
+  operations workspace outside the same frame contract used by Workbench,
+  System, Timers, Phones, and Bookmarks. The migration must preserve the
+  searchable section rail and the existing health-score/data seams.
+- Migration resolution (2026-08-01): This Node now mounts the shared
+  `AppFrame::new("This Node").leading_title()` before its searchable section
+  rail and local System/Storage/About panels. The focused BigBoy render test
+  passes at 960px, 480px, and 1.5x text zoom, confirming the title and body
+  remain paint-reachable across desktop, narrow, and large-text geometry. This
+  closes the frame-adoption slice only; current-payload DRM recapture is still
+  required before closing its production evidence cells.
+- Migration finding (2026-08-02): the standalone Explorer wrapper still
+  hand-mounts a title-only shared `MenuBar` before the Explorer domain header.
+  Since the wrapper has no menus or status chips, it should use the shared
+  `AppFrame` primitive directly and leave Explorer's Mosaic/Hero/IPAM controls
+  domain-owned, avoiding two competing title contracts.
+- Migration resolution (2026-08-02): replaced the title-only Explorer wrapper
+  `MenuBar` with `AppFrame::new("Explorer").leading_title()`, leaving the
+  Explorer domain header responsible for Mosaic/Hero/IPAM controls. The focused
+  BigBoy render test passes at desktop, narrow, and 1.5x text zoom. The final
+  serial BigBoy shell suite passes 1,351/1,351. This closes the wrapper-frame
+  adoption slice only; current-payload DRM recapture remains required.
+- Migration finding (2026-08-02): the Bookmarks workspace still mounts an
+  empty-menu `MenuBar` solely to paint its title, while its detail pane already
+  uses `AppFrame`. Replace that title-only wrapper with the shared `AppFrame`,
+  preserve the domain search/sort/location strip below it, and retain the
+  desktop/narrow/large-text render coverage before accepting the migration.
+- Migration resolution (2026-08-02): replaced the title-only Bookmarks wrapper
+  with `AppFrame::new("Bookmarks").leading_title()`, preserving the domain
+  search/sort/location strip below it. BigBoy passed the focused Bookmarks suite
+  41/41 and the serial shell suite 1,351/1,351. Exact payload
+  `a4a1a21a0c5fe820b4c3de23a1ae403cbe201628580074df3b133c34cf2fbc18` was
+  installed on `.138` with `active`/`NRestarts=0`; Dark desktop, Dark narrow,
+  and Light/Largest readbacks were visually inspected and accepted as
+  `d5ad5896b372e4fc0b52a0296f54c59790146baa13f88e759a5a7f6f2a4ac3b0`,
+  `3cf3276c22584cce235e2c0f30b951be53096192bc01f0f4003376c616d98ead`, and
+  `19c2891dff5d1c393ccdedd0f39ae642d925f95f31b4fdafbe3f3518e7385a63`.
+  This closes the Bookmarks frame-adoption slice only; current synchronized
+  Dell adoption, strict linear scanout, the remaining route/profile matrix,
+  and WL-UX-009 readiness remain open.
+- Current-payload evidence finding (2026-08-02): the accepted Files node-action
+  frames in the DRM ledger belong to the earlier `83fe8f3c…` payload, while the
+  installed `.138` payload is now `a4a1a21a…` after the Bookmarks frame slice.
+  Recapture Files Dark desktop, Dark narrow, and Light/Largest on the exact
+  installed payload before treating the Files node-integration visuals as
+  current-payload evidence; retain the existing shared Files menu/domain chrome
+  and its ten honest node-action states.
+- Live-render finding (2026-08-02): the exact `a4a1a21a…` Files Light/Largest
+  readback preserves the mesh roster but pushes the NODE ACTIONS inventory below
+  the visible left pane, so Browse/Prepare/Copy/Send/Review/Upload/Transfers
+  are not discoverable at the large-text profile. Reject the frame and make the
+  node-action region responsive or scrollable without hiding the primary
+  node-aware controls, then recapture all three Files cells.
+- Live-render follow-up (2026-08-02): after prioritizing the node-action block,
+  all ten rows are visible in the large-text frame, but the long Airsonic status
+  copy reaches underneath its Upload button. Reserve the action-column width in
+  every node-action row and keep the service-ownership copy bounded before the
+  final Light/Largest acceptance.
+
+- Live-render follow-up (2026-08-02): the current-payload Dark/narrow readback
+  still places Places and Mesh ahead of the node-action inventory, leaving the
+  lower node actions below the first viewport. Keep the node-action inventory
+  ahead of secondary sidebar content in narrow as well as large-text layouts,
+  then recapture the exact payload before closing the Files evidence slice.
+
+- Resolution (2026-08-02): Files now prioritizes the node-action inventory at
+  every profile, reserves the action lane in each row, and uses the bounded
+  truthful Airsonic state `Music-owned`. BigBoy release slot
+  `wl-ux-009-files-narrow-actions-release-20260802` produced payload
+  `c2e6f20a01042ed854861a5457ff03caa19f165070f2f9ce71e0172b8c42d7a4`, which
+  was installed on `.138` with `active`/`NRestarts=0`; the focused Files suite
+  passed 166/166. Exact current-payload Dark desktop, Dark narrow, and
+  Light/Largest frames were inspected and recorded in the DRM ledger. This
+  closes the Files responsive node-action/current-payload slice only; it does
+  not close WL-UX-009 readiness.
+
+- Next validation slice (2026-08-02): after the Files current-payload proof,
+  the remaining WL-UX-009 gap is a current-hash direct-DRM matrix for the
+  Construct-owned routes that still rely on representative or older-payload
+  rows. Start with Music, Media, Phones, Terminal, Editor, Maps, and the
+  Browser boundary on `.138`, preserving the guest-UI boundary and secure
+  seat-state restoration; accept only visually inspected non-overlapping
+  frames and keep Dell synchronized adoption open while `.225` is unreachable.
+
+- Proof-harness finding (2026-08-02): the first current-payload route batch on
+  `.138` produced valid Dark desktop frames for Music, Media, Phones, Terminal,
+  and Editor, but the scripted restart sequence reached systemd's
+  `start-limit-hit` before Maps. Logs show clean proof-readback termination
+  (`signal=TERM`, no application crash) after each capture; recover the seat
+  with `reset-failed` between proof restarts and split the matrix into smaller
+  batches before accepting the route frames.
+
+- Proof-harness finding (2026-08-02): the subsequent narrow and Light/Largest
+  route files were written successfully but several readbacks contained only
+  the wallpaper clock/backdrop rather than the requested workspace, despite
+  the proof logger reporting a completed EGL readback. Reject those cells as
+  stale/incorrect-route evidence; validate route selection from the captured
+  pixels and use a longer per-route settle/verification step before recording
+  any of them.
+
+- Live-render finding (2026-08-02): the exact current-payload Editor
+  Light/Largest frame reaches the editor surface, but its internal menu wraps
+  `Help` onto a second line and the toolbar becomes a tall multi-row block.
+  Reject that cell until the Editor internal chrome has an intentional
+  large-text layout with bounded menus, readable controls, and no accidental
+  vertical expansion; preserve editor behavior and the existing narrow proof.
+- Adoption preparation (2026-08-02): built the current tree on BigBoy with
+  `drm,live-vdi,media-mpv` and installed the resulting shell binary on `.138`.
+  Artifact and installed `/usr/bin/mde-shell-egui` both hash to
+  `e37ec5c0df9ac05133c073f481823b5642a9fef85dd0237502f82abb2a9d13dd`;
+  `mde-shell-egui.service` is active with `NRestarts=0`. This proves current
+  `.138` binary adoption only. No DRM visual cell is closed until a fresh
+  direct-render capture from this hash is visually inspected.
+- Proof-harness finding (2026-08-02): the current `.138` Workloads proof route
+  was explicitly selected with `MDE_DRM_PROOF_SURFACE=infra-code`, but the
+  chooser's normal automatic-popup redirect subsequently changed the first
+  rendered surface back to Desktop. The resulting readback contained only the
+  desktop backdrop/taskbar and is rejected. During an approved proof run, the
+  explicit route must outrank chooser auto-redirect; ordinary boots must retain
+  the existing chooser behavior.
+- Proof-harness resolution (2026-08-02): proof mode now suppresses only the
+  chooser's automatic popup redirect, preserving explicit `MDE_DRM_PROOF_SURFACE`
+  routing while leaving ordinary boots unchanged. The corrected release payload
+  `e37ec5c0…` passed the full BigBoy shell suite (**1,351 passed, 0 failed**),
+  was installed on `.138` with `active`/`NRestarts=0`, and produced three
+  inspected Workloads frames: Dark desktop
+  `67bdbc920ffa95e89da9f33c6a155dd53992867e18d81007176ed532e7aed4b8`, Dark
+  narrow `65a2f548fe2ce904c21cd84d468236dac4dca45672b5fc8597cb958488dedee0`,
+  and Light/Largest `91332b390e93dacf7c110d689e7ecf9eaa595cf2e9a4053943190544b98dfd54`.
+  This closes the current-payload Workloads slice; the remaining workspace
+  matrix stays open.
+- Current-payload matrix batch (2026-08-02): recapture the remaining
+  Construct-owned route/profile cells on the exact `.138` payload
+  `e37ec5c0…`, using the settled EGL readback path and explicit proof routing:
+  Files, Mesh Teams/Editor, Phones, Music, Media, Terminal, This Node, Maps,
+  and Browser boundary. Capture Dark desktop, Dark narrow, and Light/Largest;
+  reject any frame that is stale, blank, overlapping, or claims guest-owned
+  pixels. Restore secure login-at-boot and the prior appearance after the batch.
+- Current-payload matrix batch resolution (2026-08-02): `.138` produced and
+  visually passed 19 route/profile observations on `e37ec5c0…`, covering Files
+  Dark desktop/narrow/Light-Largest; Mesh Teams Activity and Editor Dark
+  desktop/narrow; Phones Dark desktop; Music Dark desktop/Light-Largest; Media
+  Light-Largest; Terminal Dark narrow/Light-Largest; This Node/System Dark
+  narrow/Light-Largest; Maps Dark desktop/narrow; and Browser boundary Dark
+  desktop/narrow. Their hashes are recorded in the DRM evidence ledger. The
+  Maps Light/Largest frame was rejected for faint governed map-canvas empty-state
+  copy, and zero-sized captures caused by the seat restart-rate limit were not
+  accepted. The seat was restored to secure login-at-boot and the service is
+  `active` with `NRestarts=0`; the remaining cells and Dell adoption stay open.
+- Live-render finding (2026-08-02): the exact `e37ec5c0…` Maps Light/Largest
+  frame still paints the governed “No offline map data” copy underneath the
+  opaque/semi-opaque Radio & GNSS health rail. The copy is therefore nearly
+  black-on-dark and not readable, despite the map-content palette being bright
+  before the later HUD paint. Move the honest empty-state treatment into a
+  reserved, unobscured map lane or give it an explicit backing surface, then
+  recapture the exact replacement payload before accepting the cell.
+- Follow-up live-render finding (2026-08-02): the replacement Maps frame moves
+  the empty-state panel clear of the alert lane, but its title uses a bottom
+  anchor near the panel's top edge and is clipped beneath the health rail. Keep
+  both empty-state lines fully inside the backing panel before the final
+  Light/Largest recapture.
+- Follow-up live-render finding (2026-08-02): after correcting the text anchor,
+  the large-text map geometry still places the panel's top edge too near the
+  health rail, so the title remains partially occluded in the Light/Largest
+  proof. Lower the whole panel into the bottom-safe lane; do not accept the
+  frame until both lines are visibly separated from the rail and alert pills.
+- Follow-up live-render finding (2026-08-02): the final Light/Largest frame now
+  has readable empty-state text, but the panel border still crosses the wider
+  large-text alert pill because the wide-lane threshold is measured in logical
+  coordinates. Lower that threshold for the wide route; keep the 800-wide
+  narrow route centered and recapture before accepting the cell.
+- Follow-up live-render finding (2026-08-02): the threshold-only adjustment did
+  not change the exact Light/Largest pixels because the map rectangle remains
+  below that logical threshold. Use a clamped right-biased placement for the
+  empty-state panel on every map canvas so it cannot cross the left alert lane;
+  retain the in-rect clamp as the narrow-layout safety boundary.
+- Next validation slice (2026-08-02): validate the current worktree's Maps
+  empty-state panel placement and palette against the exact farm release on
+  Dell `.138`. Capture Dark desktop, Dark narrow, and Light/Largest direct-DRM
+  EGL readbacks with explicit Maps routing; accept only frames whose two-line
+  panel is fully visible, separated from the health/alert rail, and free of
+  scanout/readback artifacts. Restore secure login-at-boot state after proof.
+- Resolution (2026-08-02): the exact `4808bd30…` release passed the Maps
+  placement recapture on `.138`. The map-owned empty-state panel is clamped
+  right-biased, backed, high-contrast, and fully below the Radio & GNSS rail;
+  Dark desktop, Dark narrow (`800` logical width), and Light/Largest frames
+  were visually inspected and accepted. Proof hashes and PNGs are recorded in
+  the DRM evidence ledger. The Maps empty-state placement slice is closed;
+  overall WL-UX-009 readiness, the remaining route/profile cells, and Dell
+  `.225` adoption remain open.
+- Dell current-payload Maps resolution (2026-08-02): exact synchronized payload
+  `08cf147d…` rendered Maps Dark desktop, Dark narrow (`800` logical width), and
+  Light/Largest on `.225`. All three frames were visually inspected: the
+  right-biased empty-state panel is fully readable, the health/alert content is
+  bounded, and no readback artifact or guest-owned pixels are present. Dell was
+  restored to `require_login_at_boot:true`, Dark/Default, active service, and
+  `NRestarts=0`. This closes only the current Dell Maps slice; the full matrix,
+  strict linear scanout, and WL-UX-009 readiness remain open.
+- Next validation slice (2026-08-02): recapture the Browser boundary on the
+  synchronized `08cf147d…` Dell payload in Dark desktop, Dark narrow (`800`
+  logical width), and Light/Largest. Accept only Construct-owned VM selection,
+  transport, waiting, or unavailable content; guest Chromium pixels remain
+  outside the host evidence boundary. Restore secure seat state after capture.
+- Dell current-payload Browser resolution (2026-08-02): exact synchronized
+  payload `08cf147d…` rendered the Browser boundary on `.225` in Dark desktop,
+  Dark narrow (`800` logical width), and Light/Largest. Every frame contains
+  only Construct-owned VM selection, transport, and waiting guidance; no guest
+  Chromium pixels are claimed. Dell was restored to
+  `require_login_at_boot:true`, Dark/Default, active service, and `NRestarts=0`.
+  This closes the Dell Browser boundary slice only; guest VDI readiness, the
+  remaining route matrix, strict linear scanout, and WL-UX-009 readiness remain
+  open.
+- Next validation slice (2026-08-02): recapture Phones on the synchronized
+  `08cf147d…` Dell payload in Dark desktop, Dark narrow (`800` logical width),
+  and Light/Largest. Confirm the shared title/navigation header, pairing state,
+  and remote-input controls remain bounded; accept no stale or blank frame and
+  restore secure seat state afterward.
+- Live-render finding (2026-08-02): exact synchronized payload `08cf147d…`
+  on Dell `.225` renders the Phones title and empty-state copy at `800` logical
+  pixels, but the Features, Remote input, and tab body are absent. Reject the
+  Dark narrow frame; compare the same payload on `.138` before changing source
+  geometry, and do not close the Dell Phones narrow cell from title-only output.
+- Proof-harness finding (2026-08-02): the temporary appearance override used
+  `density`, but the persisted schema is `layout_profile` plus `text_scale`.
+  Dell journal evidence reports `density=Mouse` and `text_scale=Default` during
+  the recent purported Light/Largest captures. Those images remain valid Light
+  visual evidence only; they do not close any large-text cell. Correct the
+  override to `layout_profile=construct`, `text_scale=largest`, and recapture
+  affected large-text rows before accepting them.
+- Phones narrow follow-up (2026-08-02): adding a dedicated `phones-body`
+  `ScrollArea` identity passed the focused 800px headless contract but did not
+  change Dell’s live title/empty-state-only frame; the rejected hash remained
+  identical after release payload `6538cf7e…`. Keep the Dell Phones narrow cell
+  open and do not treat the identity change as a behavioral resolution.
+- Farm compile-integrity finding (2026-08-02): the current dirty tree calls
+  `show_charge_limit_action` from `thisnode.rs` but has no reachable definition,
+  so the focused shell test no longer compiles. The deployed `6538cf7e…`
+  artifact predates this incomplete seam; repair or salvage the existing user
+  change before building a release that includes the Phones viewport work.
+- Resolution (2026-08-02): the farm re-synchronized the current tree and the
+  focused Phones contract passed at `800` logical pixels and `text_scale=largest`.
+  The alleged missing `show_charge_limit_action` helper was present and
+  reachable in the synchronized source; no unrelated This Node repair was
+  needed. The release build completed on BigBoy and produced payload
+  `20955383f21c4e2a4aee6a519be24905a2c65b2605f52ad3f515dcf8f2b9ae5a`.
+- Dell Phones resolution (2026-08-02): payload `20955383…` was deployed to
+  `.138` and `.225`; both services are active with `NRestarts=0`. Dell `.225`
+  now renders the complete Phones body at `800` logical pixels in Dark/Default
+  and Light/Largest. Direct-DRM frames were visually inspected and accepted;
+  the prior title-only result is superseded by this evidence. The Phones
+  current-payload slice is closed; strict linear scanout, the full route/profile
+  matrix, and WL-UX-009 readiness remain open.
+- Workloads current-payload validation (2026-08-02): exact release payload
+  `20955383…` was exercised through the canonical `infra-code` route on both
+  direct-DRM seats. Dell `.225` passed Dark desktop, Dark narrow (`800`), and
+  Light/Largest desktop and narrow; `.138` passed the same profiles after a
+  proof-only unlock sequence. The WORKLOADS menu, lifecycle rail, placement
+  card, plan-only state, capacity bars, and no-selection body were visually
+  inspected and remained readable and bounded. An initial `.138` curtain frame
+  was discarded and is not evidence. Both seats were restored to
+  `require_login_at_boot:true`, Dark/Default, active service, and zero restarts.
+  This closes only the current Workloads visual slice; VDI guest readiness,
+  strict linear scanout, the remaining route/profile matrix, and WL-UX-009
+  readiness remain open.
+- Browser boundary current-payload validation (2026-08-02): exact release
+  payload `20955383…` passed Browser host-surface proof on both direct-DRM
+  seats across Dark desktop, Dark narrow (`800`), and Light/Largest desktop
+  and narrow. Every inspected frame contains only Construct-owned VM selection,
+  transport, waiting, and unavailable guidance; no guest Chromium pixels are
+  claimed. Both seats were restored to `require_login_at_boot:true`,
+  Dark/Default, active service, and zero restarts. This closes the Browser
+  host/guest-boundary visual slice only; VDI guest readiness, strict linear
+  scanout, the remaining route/profile matrix, and WL-UX-009 readiness remain
+  open.
+- Music current-payload validation (2026-08-02): exact release payload
+  `20955383…` passed the explicit `music` route on both direct-DRM seats in
+  Dark desktop, Dark narrow (`800`), and Light/Largest desktop and narrow.
+  The shared MUSIC menu/status chrome and the honest missing-Airsonic-credentials
+  state remain readable and bounded. No connectivity to Subsonic/Airsonic at
+  `172.20.0.2` is claimed. Both seats were restored to
+  `require_login_at_boot:true`, Dark/Default, active service, and zero restarts.
+  This closes only the current Music visual/state slice; the remaining route
+  matrix, strict linear scanout, backend readiness, and WL-UX-009 readiness
+  remain open.
+- Media current-payload validation (2026-08-02): exact release payload
+  `20955383…` passed the explicit `media` route on both direct-DRM seats in
+  Dark desktop, Dark narrow (`800`), and Light/Largest desktop and narrow.
+  The corrected `MEDIA` title, source tabs, local-capture controls, Jellyfin
+  fields, and honest no-source state remain readable and bounded; the prior
+  narrow `ME` clipping does not reproduce. Both seats were restored to
+  `require_login_at_boot:true`, Dark/Default, active service, and zero restarts.
+  This closes only the current Media visual slice; live media/Jellyfin backend
+  readiness, strict linear scanout, the remaining route matrix, and WL-UX-009
+  readiness remain open.
+- Terminal current-payload live-render finding (2026-08-02): exact payload
+  `20955383…` on Dell `.225` renders the Terminal body and controls at
+  `800` logical pixels, but the shared workspace title is clipped to `TER…`.
+  Reject the Dell Terminal Dark narrow cell; preserve the full title and
+  command/session hit targets within the constrained header before recapturing
+  current-payload Terminal profiles. The `.225` desktop frame is accepted as
+  separate evidence only; this finding is not a seat-wide readiness claim.
+- Corrected appearance-proof resolution (2026-08-02): the proof override now
+  uses the real `layout_profile=construct` and `text_scale=largest` fields;
+  Dell journal evidence records `scheme=Light`, `density=Mouse`,
+  `text_scale=Largest`, and `motion=Normal`. Corrected current payload
+  `6538cf7e…` Maps Light/Largest, Browser Light/Largest, and Phones Light
+  desktop frames were visually inspected and accepted. The earlier same-named
+  Light/Largest rows captured with `text_scale=Default` are retained only as
+  Light evidence and do not close large-text cells. Phones Light/Largest narrow
+  remains rejected because its body is absent at 800px.
+- Next validation slice (2026-08-02): recapture the Browser VM boundary on the
+  exact `4808bd30…` `.138` payload in Dark desktop, Dark narrow (`800` logical
+  width), and Light/Largest. Confirm the Construct-owned VM selection,
+  unavailable/transport guidance, and honest waiting state remain readable and
+  bounded while guest Chromium pixels stay outside the host surface. Reject
+  any stale, blank, or guest-content frame and restore secure seat state after
+  the batch.
+- Live-render finding (2026-08-02): Browser boundary Dark desktop and Dark
+  narrow pass on the exact `4808bd30…` payload, but Light/Largest exposes a
+  shell chrome contrast defect: the bottom tray glyphs and clock/date become
+  nearly black on the black taskbar band. Reject that Light/Largest cell until
+  the shared taskbar/tray foreground resolves through the active Light palette,
+  then recapture Browser and at least one neighboring Light/Largest workspace
+  to ensure the fix is global and does not dim Dark mode.
+- Resolution (2026-08-02): the bottom taskbar/tray now uses fixed high-contrast
+  foreground tokens for its opaque black backing; the top status rail remains
+  scheme-aware. Status-bar tests pass 21/21. Payload `728e0dcb…` was deployed
+  to `.138` with active service and zero restarts. Browser Dark desktop, Dark
+  narrow, and Light/Largest were visually inspected and accepted, with no
+  guest Chromium pixels claimed; the neighboring Maps Light/Largest frame also
+  remains readable. The Browser boundary/taskbar contrast slice is closed;
+  the complete route/profile matrix and WL-UX-009 readiness remain open.
+- Build finding (2026-08-02): the current worktree's This Node/System settings
+  palette migration leaves four `apply_settings_popup_style(ui.style_mut(),
+  Style::color_scheme(ui.ctx()))` calls with overlapping mutable and immutable
+  borrows. The release DRM shell cannot be rebuilt until those calls read the
+  scheme before taking the mutable style borrow; apply the minimal ordering fix
+  and rerun the shell release gate.
 - Live-render finding (2026-08-01): Workbench Light/Largest narrow proof exposed
   an orphaned duplicate `View` button at the top-left. The shell's Fleet & Mesh
   wrapper had rendered its legacy `ui.menu_button("View")` above the Workbench
@@ -1565,6 +2441,12 @@ remains here under a completed status.
   passing `image::ColorType::Rgb8` to the `image 0.25` JPEG encoder, which now
   requires `ExtendedColorType`. Repair the explicit conversion before treating
   the Car layout gate or release artifact as validated.
+- Farm-integrity resolution (2026-08-01): `backdrop.rs` now passes the explicit
+  `image::ExtendedColorType::Rgb8` value required by the current image API. The
+  focused farm gate `cargo test -p mde-shell-egui wallpaper_decode_tests` passed
+  1/1 on `.90`; the broader shell suite remains independently open because of
+  its unrelated pre-existing timezone, launcher, status-bar, browser-download,
+  and remote-session failures.
 - Live-render resolution (2026-08-01): the Car strip now uses a three-column
   large-text grid, zoom-aware gauge allocation, and width-safe label/value
   elision. The `image 0.25` JPEG encoder conversion was also repaired. The
@@ -1574,6 +2456,29 @@ remains here under a completed status.
   and the replacement `.138` Light/Largest narrow Car frame was visually
   accepted with SHA-256
   `88e022c9427345ee94adb0e164553ba655a8e6ba2c85f501be2407db17d59e5e`.
+- Current-payload Car Light/Largest narrow finding (2026-08-02): exact payload
+  `20955383f21c4e2a4aee6a519be24905a2c65b2605f52ad3f515dcf8f2b9ae5a` on
+  direct DRM seat `.138`, explicitly routed as `MDE_DRM_PROOF_SURFACE=car`,
+  rendered the complete Auto Mode cockpit without the prior geometry defects,
+  but its Light appearance still painted the SYNC3 dark ground and card
+  palette. The frame is rejected for the governed Light cell; make the Car
+  surface resolve its paint tokens through the shared Dark/Light palette while
+  preserving AutoSync3 for the mode-derived vehicle skin, then farm-test and
+  recapture both seats before closing this finding.
+- Farm-integrity finding (2026-08-02): the focused `mde-shell-egui` Car test
+  gate is blocked by two existing `ThisNode` accessors in
+  `system/mod.rs` moving `self.snapshot` through `?` from `&self` (Rust E0507).
+  Repair the borrow-only access, rerun the focused Car suite, and preserve the
+  unrelated warning-only findings as non-blocking evidence.
+- Farm-integrity resolution (2026-08-02): the two `ThisNode` accessors now use
+  `self.snapshot.as_ref()?`; the BigBoy focused Car gate passed all 15 tests.
+  The feature-correct release build (`drm,live-vdi,media-mpv`) started with
+  `drm:true` on both direct seats, but the first live Car proof routed to the
+  shell clock/dashboard instead of `Surface::AutoHome`. Both seats were
+  restored to their prior active binaries, secure login-at-boot, and
+  Dark/Construct/Default/Normal. `.138` is at zero restarts; `.225` reports one
+  restart from the rejected proof attempt. The Car live matrix remains open
+  pending a corrected route proof.
   Temporary proof overrides were removed and `.138` returned to secure
   `require_login_at_boot:true`.
 - Live-render finding (2026-08-01): current payload `736471b1…` Dark desktop
@@ -1613,6 +2518,343 @@ remains here under a completed status.
   placement control to the far-right end of the rail/taskbar controls and
   render it as a monochrome Windows 10-style Show Desktop glyph, with the
   existing placement behavior unchanged.
+- Launcher de-duplication requirement (2026-08-01): every workspace exposed by
+  the notification/tool tray must be removed from the central launcher catalog
+  and its grouped launcher views. Keep direct routing, search/keyboard access,
+  the persistent navigation rail, and the five tray icons intact; this is a
+  presentation de-duplication, not a workspace retirement.
+- Pin placement correction (2026-08-01): in the bottom taskbar, the
+  monochrome Windows 10-style Show Desktop glyph must sit immediately to the
+  right of the clock, rather than to the left of the notification/tool-tray
+  cluster. Preserve the existing taskbar-placement action and keep the control
+  reachable in both desktop and narrow layouts.
+- This Node tray-icon correction (2026-08-01): remove the notification-dot or
+  badge treatment from the This Node tool-tray glyph. It must remain a clean
+  monochrome workspace icon; active state continues to use the shared subtle
+  tray indicator rather than a notification dot.
+- Leading Search alignment correction (2026-08-01): remove the unused blank
+  leading space before the Search/Start control in the taskbar and rail. Keep
+  the control's fixed hit target, focus treatment, and neighboring Back/Home
+  spacing stable after the leading-edge alignment.
+- Bookmarks workspace investigation (2026-08-01): determine whether the
+  standalone Bookmarks workspace provides capabilities not already owned by
+  Browser or Files. If it is only a duplicate launcher surface, retire its
+  workspace/catalog entry while preserving bookmark storage and Browser/Files
+  access; do not remove underlying bookmark data or actions.
+- Bookmarks investigation resolution (2026-08-01): retain the workspace. It
+  owns folder CRUD, import/export, CRDT/mesh synchronization, bulk selection,
+  drag reorder/move, and link checking; Browser bookmark/history search is only
+  a consumer and Files is not an equivalent manager. No safe removal boundary
+  exists without a separate migration design.
+- Power indicator requirement (2026-08-01): add a live Windows 10-style
+  battery/power-management indicator to the shared notification/tool tray.
+  Match the existing monochrome status-control pattern, expose a truthful
+  tooltip/status detail, and source the value from the existing local power
+  read model rather than painting a decorative indicator.
+- Files node-integration expansion (2026-08-01): make Files a meaningful
+  multi-node workspace with ten node-aware interactions: (1) node-scoped
+  browse, (2) prepopulated share targets, (3) prepopulated link targets,
+  (4) one-click send-to-node, (5) receive/inbox view, (6) per-node sync
+  status, (7) conflict queue, (8) node availability/offline state, (9)
+  Airsonic-aware upload destination prepopulation, and (10) node activity and
+  transfer history. Preserve honest unavailable states and existing access
+  boundaries; no invented transfer success or server capability.
+- Files node-integration validation (2026-08-02): the Files implementation now
+  renders the ten-item NODE ACTIONS inventory beside the live mesh roster and
+  routes supported controls through the existing peer-mount, transfer-target,
+  shared-clipboard, and Transfers seams. Airsonic/Subsonic-compatible Music
+  Library upload is prefilled through the existing daemon-owned symbolic music
+  lane; live server discovery and credential readiness remain worker-owned and
+  are not inferred by Files. Farm gate
+  `MCNF_BUILD_HOST=172.20.0.130`, slot `bug7-files-node-20260802`,
+  `cargo test -p mde-files-egui --lib`: **165 passed, 0 failed**.
+- Files node-actions follow-up (2026-08-02): convert the inventory's supported
+  status rows into direct controls backed by existing Files seams (peer mount,
+  shared clipboard, send, Downloads/inbox, and Transfers). Keep rows disabled
+  or informational where the current model has no truthful action, rather than
+  adding a decorative or unimplemented command.
+- Files node-actions pane routing finding (2026-08-02): the new node-action
+  controls must target the active pane in dual-pane mode. A hard-coded pane 0
+  would make Browse, Copy, Send, and Receive act on a different pane than the
+  operator is viewing; record and test the active-pane routing before the next
+  validation capture.
+- Files node-actions resolution (2026-08-02): supported rows now expose direct
+  `Open`, `Prepare`, `Copy`, `Send`, `Review`, `Upload`, and `Transfers` controls
+  backed by the existing action dispatcher. Browse opens the first reachable
+  peer through the real mount path; Receive opens the node Downloads/inbox; no
+  reachable peer or no worker still renders as an honest state. Farm validation
+  on BigBoy slot `bug7-files-node-actions-pane-routing-20260802` passes **167
+  passed, 0 failed**; pane-dependent controls now target the active pane in
+  dual-pane mode.
+- Files node-actions current-payload validation (2026-08-02): build and deploy
+  the pane-routing correction to `.138`, then recapture Dark desktop, Dark
+  narrow, and Light/Largest Files frames. Accept only frames showing the full
+  ten-action inventory with no action/status overlap; restore secure state and
+  leave Dell `.225` adoption and WL-UX-009 readiness open.
+- Files node-actions live-render finding (2026-08-02): the corrected route
+  renders the Files inventory on Dark desktop and Light/Largest, but the
+  800-logical-width Dark narrow frame loses the sidebar entirely because long
+  action/status rows expand the side panel beyond the available layout. Cap
+  the sidebar and truncate the status copy within its reserved action lane;
+  recapture the narrow cell before accepting the current-payload slice.
+- Files node-actions current-payload resolution (2026-08-02): capped the Files
+  sidebar, bounded node-row summaries to the reserved action lane, and
+  recaptured exact release `de4c6bbe…` on `.138`. Dark desktop, Dark narrow at
+  800 logical width, and Light/Largest all show the complete ten-action
+  inventory without overlap; accepted PNG hashes and service restoration are
+  recorded in `WL-UX-009-DRM-EVIDENCE-2026-07-31.md`. This closes the Files
+  node-action slice only; `.225`, strict linear scanout, remaining matrix, and
+  WL-UX-009 readiness remain open.
+- Live-render finding (2026-08-02): Dell `.225` Phones Light/Largest narrow
+  current-payload proof rejects the frame because the Remote input card is
+  clipped by the taskbar boundary. Keep the cell open; make the Phones content
+  region scroll-safe or otherwise reserve the taskbar-safe viewport, then
+  recapture the exact candidate before acceptance.
+- This Node current-payload validation slice (2026-08-02): validate the
+  unified `this-node` route on exact installed release `de4c6bbe…` at `.138`
+  across Dark desktop, Dark narrow (`MDE_DRM_PROOF_LOGICAL_WIDTH=800`), and
+  Light/Largest. Inspect health-score linkage, provider/status hierarchy,
+  action affordance boundaries, clipping, and taskbar contrast; reject any
+  stale/incorrect route. Restore secure state and close only this evidence
+  slice.
+- This Node current-payload validation resolution (2026-08-02): exact release
+  `de4c6bbe…` on `.138` passed Dark desktop, Dark narrow at 800 logical width,
+  and Light/Largest visual inspection. The shared frame, provider-aware rail,
+  health linkage (`97% charging` plus display count), live display state, and
+  scroll continuation remain readable and bounded; proof hashes and secure
+  restoration are recorded in `WL-UX-009-DRM-EVIDENCE-2026-07-31.md`. This
+  closes this validation slice only; `.225`, strict linear scanout, the
+  remaining matrix, and WL-UX-009 readiness remain open.
+- Music current-payload validation slice (2026-08-02): validate the explicit
+  `music` route on exact installed release `de4c6bbe…` at `.138` across Dark
+  desktop, Dark narrow (`800` logical width), and Light/Largest. Inspect the
+  shared frame, status/taskbar contrast, empty/unavailable state, and honest
+  missing-Airsonic-credentials boundary; do not infer connectivity to
+  Subsonic server `172.20.0.2`. Restore secure state and close only accepted
+  evidence cells.
+- Music current-payload validation resolution (2026-08-02): exact release
+  `de4c6bbe…` on `.138` passed Dark desktop, Dark narrow at 800 logical width,
+  and Light/Largest visual inspection. The shared Music frame, taskbar
+  contrast, and honest missing-Airsonic-credentials state are recorded with
+  hashes in `WL-UX-009-DRM-EVIDENCE-2026-07-31.md`; no Subsonic connectivity is
+  claimed. This closes the Music validation slice only; `.225`, strict linear
+  scanout, the remaining matrix, and WL-UX-009 readiness remain open.
+- Media current-payload validation slice (2026-08-02): validate the explicit
+  `media` route on exact installed release `de4c6bbe…` at `.138` across Dark
+  desktop, Dark narrow (`800` logical width), and Light/Largest. Inspect shared
+  frame adoption, source tabs/controls, honest local/Jellyfin unavailable
+  states, taskbar contrast, and any VDI/guest boundary; reject stale or
+  wallpaper-only readbacks. Restore secure state and close only accepted cells.
+- Media live-render finding (2026-08-02): exact `.138` Dark narrow proof clips
+  the shared workspace title from `MEDIA` to `ME` at 800 logical width while
+  the source controls remain visible. Reject the narrow cell; preserve the
+  complete title and menu hit targets within the constrained header before
+  recapturing the current payload. Dark desktop and Light/Largest remain
+  provisional until the narrow correction is proven.
+- Media live-render resolution (2026-08-02): the shared menubar now reserves a
+  measured, unwrapped title galley and gives narrow layouts a dedicated identity
+  row plus horizontally scrollable command row. Farm suites passed `mde-egui`
+  **269/269** and `mde-media-egui` **104/104**. Exact release
+  `c75e01456f56902d92d36a4ebe8b9f68822e74c00670cb82b090b3bd05909dac` on `.138`
+  passed visually inspected Media Dark desktop, Dark narrow at 800 logical
+  width, and Light/Largest frames; hashes and links are in
+  `WL-UX-009-DRM-EVIDENCE-2026-07-31.md`. Secure state was restored with the
+  service active and zero restarts. This closes the Media validation slice only;
+  `.225`, strict linear scanout, the remaining route/profile matrix, and
+  WL-UX-009 readiness remain open.
+- Editor current-payload validation slice (2026-08-02): validate the explicit
+  `editor` route on the exact installed `.138` payload
+  `c75e01456f56902d92d36a4ebe8b9f68822e74c00670cb82b090b3bd05909dac` across
+  Dark desktop, Light desktop, Dark narrow (`800` logical width), and
+  Light/Largest. Inspect direct-entry sidebar collapse, shared top chrome,
+  editor tabs/palettes/status rows, no-overlap behavior, taskbar contrast, and
+  the approved focused-VDI boundary; reject stale, wallpaper-only, or guest-
+  viewport claims. Restore secure state and close only visually inspected cells.
+- Editor live-render finding (2026-08-02): exact `.138` Dark narrow proof keeps
+  direct-entry sidebars collapsed and the full `EDITOR` title visible, but clips
+  the right end of the editor toolbar at 800 logical pixels (the zoom control is
+  cut off). Reject the narrow cell; preserve every toolbar action through a
+  bounded horizontal command strip or equivalent responsive layout before
+  recapturing the current payload.
+- Editor live-render resolution (2026-08-02): the Editor compact threshold now
+  folds the width-heavy Standard/Formatting controls into their existing `»`
+  overflow at 800 logical pixels, keeping every action reachable without
+  clipping. Farm package tests passed **407/407**. Exact release
+  `807f2430d61bbd8316410c6360d8beaba2de55dba643933f641ac4d59ab5ecd7` on `.138`
+  passed visually inspected Dark desktop, Light desktop, Dark narrow, and
+  Light/Largest Editor frames. The direct-entry optional sidebars remained
+  collapsed; the embedded guest/VDI viewport was not claimed. Hashes and
+  evidence links are in `WL-UX-009-DRM-EVIDENCE-2026-07-31.md`. Secure state
+  was restored with the service active and zero restarts. This closes the
+  Editor validation slice only; `.225`, strict linear scanout, the remaining
+  route/profile matrix, and WL-UX-009 readiness remain open.
+- Terminal current-payload validation slice (2026-08-02): validate the explicit
+  `terminal` route on exact installed `.138` payload
+  `807f2430d61bbd8316410c6360d8beaba2de55dba643933f641ac4d59ab5ecd7` across
+  Dark desktop, Light desktop, Dark narrow (`800` logical width), and
+  Light/Largest. Inspect the Terminal-pattern shared top bar, session/tab
+  chrome, command/status rows, no-overlap behavior, taskbar contrast, and
+  truthful unavailable/session states; reject stale or wallpaper-only proof.
+  Restore secure state and close only visually inspected cells.
+- Shared-frame migration finding (2026-08-02): Mesh Teams still mounts a
+  title-only shared `MenuBar` before its domain rails. Replace that wrapper with
+  the shared `AppFrame` primitive, retain the Mesh Teams channel/app chrome as
+  the approved domain header, and add desktop/narrow/large-text render coverage
+  before accepting the migration.
+- Shared-frame migration resolution (2026-08-02): Mesh Teams now uses the
+  shared `AppFrame` for its workspace identity strip while retaining its
+  domain-specific channel/app rails. The focused render test covers 1280px
+  desktop, 800px narrow, and 1.5x large-text frames; farm package gate
+  `wl-ux-009-mesh-teams-frame-20260802` reports **129 passed, 0 failed**.
+- Current-payload adoption resolution (2026-08-02): the release shell built on
+  BigBoy slot `wl-ux-009-current-adoption-20260802` was installed on `.138` and
+  verified as payload `e37ec5c0…`; `mde-shell-egui.service` is `active` with
+  `NRestarts=0`. The exact payload produced an inspected CPU-linear EGL
+  readback desktop frame, but this does not satisfy the complete current-payload
+  desktop/narrow/large-text matrix.
+- Exact current-payload matrix follow-up (2026-08-02): after the Maps correction,
+  `.138` was recaptured on payload `83fe8f3c…` through the proof-only CPU-linear
+  EGL path. Twenty-seven inspected Files, Mesh Teams, Editor, Phones, Music,
+  Media, Terminal, This Node, and Browser-boundary Dark desktop/narrow or
+  Light/Largest cells are recorded in the DRM evidence ledger, with the seat
+  restored to secure Dark/Default, `require_login_at_boot:true`, active, and
+  zero restarts. This closes only those named evidence cells; the remaining
+  route/profile matrix, strict linear scanout, Dell synchronized adoption, and
+  WL-UX-009 readiness remain open.
+- Governance finding (2026-08-02): the corrected Maps empty-state backing panel
+  still minted two UI chrome colors directly in `mde-maps-location-egui`, so
+  `lint-style-leaks.sh` reported two leaks. Move those map-owned panel tokens
+  into the shared `mde-egui::Style` registry with a backing assertion, then
+  rerun the gate and preserve the accepted visual evidence as the prior exact
+  payload proof.
+- Governance resolution (2026-08-02): Maps now consumes shared
+  `Style::map_empty_panel()` and `Style::map_empty_border()` tokens, with a
+  backing shared-style assertion. The style-leak gate is clean at zero; farm
+  gates pass `mde-egui` **269/269** on `.90` slot
+  `wl-ux-009-style-registry-rerun-20260802` and Maps **273/273** on BigBoy slot
+  `wl-ux-009-maps-style-registry-rerun-20260802`.
+- Governance resolution (2026-08-02): This Node now routes the combined
+  provider/health explanation through the shared themed hover-card helper
+  without a raw `egui` tooltip modifier. The style-leak gate is clean at zero,
+  and the full `mde-shell-egui` farm binary suite passes **1363/1363** on
+  `.90` slot `wl-ux-009-tooltip-suite-20260802`. This source-level correction
+  is not yet represented by a newly deployed live-render payload; the existing
+  `911e7818…` evidence remains valid for the title-allocation correction only.
+- Current-source adoption slice (2026-08-02): `.138` is healthy on payload
+  `911e7818…` and `.225` is healthy on payload `4bfb57fb…`, both active with
+  zero restarts. Build the current source on BigBoy, deploy the exact resulting
+  payload to both seats, verify secure login-at-boot state, and recapture the
+  remaining high-value Construct-owned route/profile cells before accepting any
+  synchronized-adoption claim.
+- Current-source adoption resolution (2026-08-02): BigBoy release slot
+  `wl-ux-009-current-source-adoption-20260802` produced payload
+  `15efa11a2cd84563cef4af6d94455df0a286b5b0b49a4065e52a4d00d541cac2`.
+  The exact binary is installed on both `.138` and `.225`; both services are
+  active with zero restarts. `.138` was restored to secure
+  `require_login_at_boot:true`, Dark/Default appearance, and no proof override.
+  This proves binary adoption only; `.225` has no current visual capture, so
+  synchronized visual adoption and WL-UX-009 readiness remain open.
+- Current-payload This Node proof resolution (2026-08-02): exact payload
+  `15efa11a…` on direct DRM `.138` passed visual inspection for Dark desktop,
+  Dark narrow (`800` logical width), and Light/Largest. Evidence is recorded in
+  the DRM ledger. The narrow frame is bounded with intentional unused scanout;
+  the large-text frame keeps the lower System content within its scroll
+  boundary without overlap or clipping. This closes only the named This Node
+  visual cells.
+- Governance finding (2026-08-02): the This Node power-profile action still
+  attaches a raw `egui` hover tooltip, so the style-leak gate reports one raw
+  hover-text leak. Replace it with the shared themed hover-card helper and
+  rerun the focused shell suite and style gate before accepting this correction.
+- Governance resolution (2026-08-02): This Node power-profile actions now use
+  the shared themed hover-card helper. The style-leak gate is clean at zero and
+  the focused This Node farm suite passes **34/34** on `.90` slot
+  `wl-ux-009-tooltip-power-suite-20260802`. This source correction is not yet
+  included in the deployed `15efa11a…` visual payload; its live proof remains
+  scoped to the exact recorded payload.
+- Live-render finding (2026-08-02): exact payload `15efa11a…` on Dell `.225`
+  renders the This Node Dark desktop and Light/Largest detail body against the
+  `1366x768` viewport with the lower `SYSTEM` heading clipped at the viewport
+  boundary; the Dark narrow proof collapses to the title with the body absent.
+  Reject these three frames. Give the unified This Node body an explicit
+  vertical scroll boundary, farm-test the responsive contract, rebuild, and
+  recapture `.225` before accepting its visual cells.
+- Live-render resolution (2026-08-02): the unified This Node body now sits in
+  an explicit vertical scroll boundary. Release payload `08cf147d…` is
+  installed on both `.138` and `.225`, each active with zero restarts; `.225`
+  was restored to secure `require_login_at_boot:true` and Dark/Default. The
+  exact `.225` Dark desktop and Light/Largest frames no longer clip the lower
+  System content and are recorded as body-geometry evidence. The `.225` Dark
+  narrow frame still paints only the title and remains rejected; the full
+  bottom-tray behavior is also not claimed from this slice.
+- Narrow differential resolution (2026-08-02): the same exact `08cf147d…`
+  payload renders the full This Node Dark narrow body on direct-DRM `.138`
+  (hash recorded in the DRM ledger), while `.225` still paints only the title
+  at the same `800` logical width. This localizes the remaining narrow gap to
+  Dell `.225` runtime/layout conditions rather than the shared This Node
+  source; do not convert the `.138` pass into a `.225` or farm-wide claim.
+- Narrow differential follow-up (2026-08-02): compare Terminal and Files Dark
+  narrow direct-DRM frames on Dell `.225` at the exact `08cf147d…` payload.
+  Use the results to separate a workspace-specific This Node route defect from
+  a seat-wide narrow viewport condition; accept no frame without visual
+  inspection and restore secure state after the batch.
+- Narrow differential resolution (2026-08-02): exact `08cf147d…` Dell `.225`
+  Terminal and Files Dark narrow frames both render complete, bounded bodies;
+  the remaining `.225` narrow failure is specific to This Node. The accepted
+  hashes and evidence links are in the DRM ledger. Dell was restored to secure
+  Dark/Default with `require_login_at_boot:true`, active service, and zero
+  restarts. This does not close the This Node narrow cell.
+- Current-payload This Node resolution (2026-08-02): the exact release
+  `20955383f21c4e2a4aee6a519be24905a2c65b2605f52ad3f515dcf8f2b9ae5a` was
+  explicitly routed to `this-node` after removing a stale duplicate Terminal
+  proof override. Both `.138` and Dell `.225` now pass inspected Dark desktop,
+  Dark narrow (`800`), Light/Largest desktop, and Light/Largest narrow frames;
+  the complete body anchors and node tabs are visible, with large-text content
+  bounded by the intentional vertical scroll region. The eight hashes are in
+  the DRM ledger. Both seats returned to secure login-at-boot, active service,
+  and zero restarts. This closes only the current This Node visual slice.
+- Headless narrow-contract follow-up (2026-08-02): the existing This Node
+  shared-frame test only requires non-empty primitives and the `This Node` title,
+  so it could pass while Dell paints title-only output. Strengthen the test at
+  the exact `800` logical-width case to require body anchors (`Find a section`,
+  `Workspace`, and `Overview`) before accepting any source or live-render
+  resolution for the Dell narrow cell.
+- Headless narrow-contract resolution (2026-08-02): the farm test now covers
+  `800` logical pixels and requires all three This Node body anchors in addition
+  to non-empty primitives and the title. It passes `1/1` on `.90` under slot
+  `wl-ux-009-this-node-body-suite-20260802b`; the Dell `.225` title-only live
+  frame therefore remains an evidence-backed runtime/layout defect, not a
+  headless-test omission. Keep the Dell narrow cell open.
+- Direct-DRM proof finding (2026-08-02): `.138` rejects the strict linear
+  scanout proof because linear allocation returns `Invalid argument` and the
+  front buffer is `XR30` with `I915_x_tiled`. The proof therefore fails closed;
+  no invalid scanout screenshot is accepted. Temporary proof environment was
+  removed and the service returned to `active` with `NRestarts=0`. Keep
+  WL-UX-009 `Remaining` until live render coverage passes.
+- Live-render finding (2026-08-01): current payload `4cf6732e…` Maps
+  Light/Largest proof is not accepted. The desktop frame loses readable
+  status-card text, and the 800-logical-width frame lets the right-side
+  control rail overlap the search banner and health content. Keep the Maps
+  Light/Largest desktop and narrow cells open; make the route's large-text
+  geometry and palette explicit, farm-test it, then recapture and inspect both
+  direct-DRM frames.
+- Follow-up live-render finding (2026-08-01): after the lane fix, the Maps
+  Light/Largest narrow frame still shows the map-local “Acquiring GPS” chip
+  colliding with the larger alert pill. The narrow layout must retain one clear
+  primary alert without duplicating that status chip; record the suppression as
+  a focused responsive behavior and recapture the Light/Largest narrow frame.
+- Live-render resolution (2026-08-01): the Maps route now reserves the FAB
+  lane in the banner, keeps Light-mode health-card text on the governed
+  map-content palette, and suppresses the redundant map-local GPS chip on
+  narrow canvases. Focused Maps tests pass; payload `bccc6e94…` is installed
+  on both Dell seats with active services and zero restarts. The replacement
+  `.138` Light/Largest narrow EGL frame was visually inspected and accepted
+  with SHA-256 `e36ac4f5331f65b5a1fcc80de8a13ad35ea12c2076a8a821f8e86da2881cf51c`.
+- Live-render resolution (2026-08-01): the remaining Maps Dark desktop,
+  Light/Largest desktop, and Dark narrow cells were recaptured on the exact
+  `bccc6e94…` payload and visually accepted with hashes
+  `33de1d86…`, `29f68032…`, and `154c43df…`. The four-cell Maps
+  Dark/Light desktop/narrow slice is now evidence-backed; the broader
+  Construct-owned route matrix remains open.
 - Backdrop validation update (2026-08-01): palette-resolved status backing,
   large-text anchoring, wallpaper selection/cache, and watermark routing pass
   24 focused shell tests with 1,920 filtered on `.90` slot
@@ -1633,7 +2875,8 @@ remains here under a completed status.
     live VDI framebuffer proof remain open.
 
   0. Re-run the direct-DRM EGL-readback matrix against the current installed
-     payload `8366b109…` for every Construct-owned route that still relies on
+     `.138` payload `f58b42ba…` (and separately against Dell after it is
+     reachable) for every Construct-owned route that still relies on
      representative or older-payload evidence (Editor, Terminal, Phones, Car,
      and any remaining Workbench/Infra, Music, Media, Browser boundary, Mesh
      Teams, or This Node cells). Inspect Dark desktop, Light desktop, narrow,
@@ -1721,13 +2964,14 @@ remains here under a completed status.
   admin-authorized trusted-session remote actions, preserve mesh reachability,
   expose honest unavailable/degraded states, and bound privileged/OEM writes
   with confirmation, audit, safety limits, and recovery. The operator-facing
-  experience follows a Windows 10-style Device Manager model: a unified
-  expandable tree, a health-dashboard landing view, and focused detail views
-  for technical operators/admins. The existing top-rail health score remains
-  the single health authority; selecting it opens this tree with unhealthy
-  items highlighted. Monitoring and configuration have equal priority. The
-  landing view leads with critical alerts and affected components; a healthy
-  node presents a calm all-systems-operational summary. Health severity uses
+  experience follows a technical Device Manager model: a unified expandable
+  tree, an inventory-first landing view, and focused full-page detail views for
+  technical operators/admins. The existing top-rail health score remains the
+  single health authority; selecting it opens this tree with unhealthy items
+  highlighted. Monitoring and configuration have equal priority. Critical
+  alerts, affected components, stale data, and recovery actions remain visible
+  within the inventory landing view; a healthy node presents a calm
+  all-systems-operational summary. Health severity uses
   color, icon, label, and text. The tree includes Hardware, Services, Storage,
   Network, Users, and System, with persistent badges tied to the existing
   score. Selecting an item opens a dedicated full-page detail view. Actions
@@ -1803,6 +3047,459 @@ remains here under a completed status.
   guidance for stale/unavailable providers and preserves bounded credential-free
   audio facts without fabricating healthy hardware; 24 focused tests pass on
   farm `.90`.
+- Provider-state update (2026-08-02): the This Node plane now exposes a typed
+  `Open detail` workflow for all 16 governed parent/child routes. Each
+  full-page detail view reuses the inventory health/stale authority and
+  existing connectivity, audio, power, service, mesh, and capability
+  projections; unavailable details remain visibly fail-closed. The focused
+  BigBoy shell gate passes 27 This Node tests, including rendering every
+  governed detail route.
+- Unified-route integration update (2026-08-02): the shell's This Node section
+  selector now reaches the existing typed System/Seat provider seams for
+  Network, Displays, Mouse/Input, Power, Theme, and Mesh identity instead of
+  returning early to a dead unavailable card. Legacy System/Storage/About
+  aliases remain normalized, and the focused shell This Node gate passes 20
+  tests including narrow/large-text frame and provider-route coverage.
+- Global-health drilldown update (2026-08-02): selecting the existing status/
+  grade cluster now uses the typed workspace handoff to open `Surface::ThisNode`
+  while individual volume, network, brightness, and power controls retain
+  their Control Center behavior. The focused BigBoy status-bar gate passes 23
+  tests, including the drilldown route and no-duplicate-overlay assertion.
+- Health-tree continuity update (2026-08-02): the unified This Node tree now
+  consumes the existing snapshot health projection, shows a severity glyph and
+  readable local state beside every governed section, and polls that projection
+  while This Node is directly mounted so a global-health drilldown cannot show
+  a stale tree solely because Workbench is hidden. The focused BigBoy shell
+  gate passes 21 tests, including tree, provider-route, responsive, and
+  large-text coverage.
+- Actions-contract update (2026-08-02): each finite This Node action now carries
+  explicit typed metadata for expected impact, confirmation/arming, trusted
+  session authorization, audit fields, and bounded recovery. The UI renders
+  that contract beside the still-disabled provider row, keeps stale state
+  degraded, and exports the full reason through AccessKit. The focused BigBoy
+  This Node suite passes 28 tests, including the contract-completeness and
+  disabled-accessibility checks.
+- OS-management route truth update (2026-08-02): the existing durable routes
+  for Users & Accounts, Backup & Restore, Diagnostics & Logs, and Virtualization
+  & Remote Access now carry explicit unavailable provider reasons instead of
+  inheriting false availability from Mesh & System. Their full-page details
+  render a bounded recovery/provider card; Services, Updates, and Mesh & System
+  retain their published snapshot facts. BigBoy catalog tests pass 8/8 and the
+  This Node detail suite passes 28/28.
+- Diagnostics evidence update (2026-08-02): Diagnostics & Logs is now a usable
+  full-page route over the existing bounded snapshot authority, exposing service
+  health, mesh peers/leader, and resource telemetry with the same truthful
+  stale/unknown states as the dashboard. Raw journal entries remain explicitly
+  unavailable pending a fixed, redacted, size-limited operator-log provider;
+  no fabricated log content crosses the UI boundary.
+- Privacy projection update (2026-08-02): the credential-free mesh-status
+  boundary now publishes a bounded default-microphone mute bit and camera-device
+  count; This Node renders both alongside an explicitly unavailable camera
+  privacy provider state. Device presence is not treated as permission, no
+  names/paths/applications/credentials cross the boundary, and stale/missing
+  facts remain unknown. BigBoy This Node tests pass 29/29; shell and embedded
+  Python syntax checks pass.
+- Bluetooth projection update (2026-08-02): the snapshot writer now publishes
+  bounded BlueZ adapter, power, and device-count observations without names,
+  MAC addresses, pairing keys, trust material, service UUIDs, or agent data.
+  Connectivity renders missing BlueZ explicitly unavailable and keeps pairing
+  and trust behind the typed provider boundary. BigBoy This Node tests pass
+  30/30; shell and embedded Python syntax checks pass.
+- Resource telemetry update (2026-08-02): the node snapshot now publishes
+  bounded aggregate CPU count/load, memory capacity/availability, and root
+  filesystem capacity/usage facts without process names, mount paths, user
+  names, or device identities. This Node exposes the facts in inventory and
+  Power & Performance/Hardware detail views with capacity bars, marks partial
+  hardware coverage as attention, and keeps stale snapshots visibly degraded.
+  The Local Telemetry capability is now available only when a bounded fact is
+  present; BigBoy This Node tests pass 31/31, with shell and embedded Python
+  syntax checks passing.
+- Live performance history update (2026-08-02): Power & Performance and the
+  shared Performance detail anatomy now retain at most 60 five-second samples
+  of normalized aggregate CPU load, memory use, and root-storage use. The
+  dense chart preserves textual labels/current values for keyboard and
+  assistive-technology users, breaks lines across missing facts, and remains
+  presentation-only over the existing snapshot authority. BigBoy This Node
+  tests pass 36/36.
+- Power-source projection update (2026-08-02): the snapshot now publishes
+  bounded aggregate battery count/percentage/status and AC-online facts from
+  the kernel power-supply interface without supply names, serials, models, or
+  sysfs paths. Power & Performance renders those facts beside the read-only
+  profile state and preserves unknown values when no source provider exists.
+  BigBoy This Node tests pass 32/32; shell and embedded Python syntax checks
+  pass.
+- Local power-detail update (2026-08-02): the full-page This Node Power &
+  Performance route now consumes the existing trusted typed UPower seat seam
+  for detailed local battery rows, charge state, time-to-empty/time-to-full,
+  energy rate, and AC-source state. Provider absence remains explicitly
+  unavailable; detailed identity and estimates stay out of the world-readable
+  mesh-status projection. The narrow/large-text responsive regression was
+  tightened with a two-line connectivity disclosure, and the complete BigBoy
+  This Node suite passes 35/35.
+- Display/input observation update (2026-08-02): the snapshot now publishes
+  bounded DRM connector/connected/mode counts, aggregate backlight count and
+  level, and evdev event-device count without connector names, sysfs paths,
+  input names, event streams, or serials. Display & Sound and Input now have
+  discoverable full-page read-only inventory routes; display/input writes remain
+  behind typed seat authorization and recovery contracts. BigBoy This Node
+  projection tests pass 33/33 and catalog tests pass 8/8; shell and embedded
+  Python syntax checks pass.
+- Local device-inventory detail update (2026-08-02): This Node's full-page
+  Display & Sound route now consumes the trusted typed DRM provider for bounded
+  connector identity, physical size, preferred mode, and advertised mode lists;
+  Input now consumes the typed kernel keyboard-LED provider for per-device
+  brightness. Missing local providers remain visibly unavailable, mode/refresh/
+  arrangement writes stay on the confirmation-gated DisplayLayout seam, and
+  the complete BigBoy This Node suite passes 35/35.
+- Local audio-detail update (2026-08-02): the full-page Display & Sound route
+  now consumes the trusted typed PipeWire graph for master, playback, capture,
+  host/VM/mesh origin, volume, and mute rows. Local stream names stay outside
+  the world-readable mesh-status projection; audio writes continue through the
+  dedicated confirmation-gated mixer Actions seam. Missing PipeWire remains
+  visibly unavailable, and the complete BigBoy This Node suite passes 35/35.
+- Hardware/storage observation update (2026-08-02): the snapshot now publishes
+  bounded block-device count/capacity/removable count plus thermal-zone peak
+  and fan-sensor counts without block names, hwmon labels, sysfs paths, or raw
+  sensor streams. Hardware and Storage details render these facts beside the
+  existing filesystem capacity bars; thermal/storage writes remain fail-closed
+  until a typed bounded provider exists. BigBoy This Node tests pass 34/34;
+  shell and embedded Python syntax checks pass.
+- Typed action seam update (2026-08-02): This Node's power-profile Actions row
+  now receives the live System provider through the Workbench seam. It offers
+  only non-active profiles simultaneously advertised by the fresh mesh
+  observation and the typed local seat snapshot, requires a visible second-click
+  impact confirmation, and dispatches the existing `SetPowerProfile` provider
+  action; stale, mismatched, unavailable, and refused states remain fail-closed.
+  Focused BigBoy gates pass This Node 34/34 and System 68/68; the Workbench
+  render fixture compiles with the shared provider seam.
+- Unified Actions reachability update (2026-08-02): the durable This Node shell
+  now exposes an Inventory/Actions workspace switch beside the hierarchy. The
+  Actions view reuses the same typed System provider and confirmation state as
+  Workbench, remains explicit when the snapshot is stale, and reflows at
+  desktop, narrow, and large-text sizes. BigBoy This Node tests pass 34/34;
+  the unified Actions render gate passes 1/1 across all three geometry cases.
+- Users/Accounts observation update (2026-08-02): the root snapshot now
+  publishes bounded aggregate local-account, interactive-account, and
+  admin-policy-group counts only when `/etc/passwd` and `/etc/group` are
+  readable. This Node exposes a discoverable Users & Accounts detail route;
+  usernames, home paths, shells, memberships, credentials, and sign-in state
+  remain outside the shared boundary, while account mutations stay fail-closed
+  until a typed identity provider exists. BigBoy This Node tests pass 35/35;
+  shell syntax and diff checks pass.
+- Personalization continuity update (2026-08-02): the durable This Node catalog
+  now treats Personalization as available because the unified shell hierarchy
+  reaches the existing typed System/Theme provider for persisted theme,
+  wallpaper, layout, text-scale, motion, and clock controls. The legacy detail
+  bridge now describes that provider-backed continuity instead of claiming the
+  provider is absent. Catalog tests pass 9/9 and the full This Node detail/render
+  suite passes 35/35 on BigBoy; responsive route coverage remains included.
+- Child-route hierarchy update (2026-08-02): the durable shell tree now keeps
+  the catalog's child routes under the selected parent branch, so Storage,
+  Peripherals, Users, Services, Updates, and other detail routes are reachable
+  without expanding the initial inventory frame beyond the Actions workspace.
+  Parent routes continue to open the typed System provider; child routes retain
+  their own This Node detail authority. The focused shell This Node filter passes
+  22/22 across responsive and large-text coverage, and the underlying This Node
+  detail/projection suite passes 35/35 on BigBoy.
+- Network topology disclosure update (2026-08-02): the Connectivity detail now
+  keeps interface and CIDR facts in the compact summary and places default route,
+  lighthouse, and DNS facts behind an explicit responsive `Topology details`
+  disclosure. The disclosure remains read-only and names the typed
+  NetworkManager/ModemManager safety boundary rather than implying mutation
+  support from observations.
+- Detail-anatomy update (2026-08-02): every available full-page This Node detail
+  now exposes consistent collapsed Actions, Events, Performance, Audit, and
+  Vendor packs sections. Performance reuses bounded CPU/memory/root-storage
+  telemetry; Events, audit records, and vendor packs remain explicitly
+  unavailable until their typed providers publish evidence, so the UI does not
+  fabricate operator history or installed extensions. The governed full-page
+  render gate passes on BigBoy.
+- Action evidence update (2026-08-02): the unified System provider now emits a
+  bounded redacted outcome record for real This Node dispatches across power,
+  Bluetooth, display, brightness, audio, network, input, and session actions.
+  Full-page Events and Audit panes consume those records with fixed action
+  labels, accepted/refused outcome, UTC timestamp, and local trusted-session
+  scope; provider paths, device identities, credentials, and raw errors remain
+  excluded. Empty histories still render an explicit no-records state.
+  BigBoy This Node tests pass 36/36.
+- Diagnostics provider update (2026-08-02): Diagnostics & Logs now runs a
+  fixed, read-only `journalctl` warning/error query off the render thread.
+  Output is bounded to 32 lines, 240 characters per line, and 12 KiB total;
+  known credential, token, and network-secret fields are redacted before This
+  Node renders them. Provider refusal, absence, empty evidence, and returned
+  entries retain distinct truthful states, and no user-supplied query or raw
+  stderr crosses the UI boundary. BigBoy This Node tests pass 37/37.
+- OS-management index update (2026-08-02): the durable This Node search index
+  now includes dedicated Security & Privacy, Accessibility, and Time,
+  Language & Region child routes. Each route is assigned to the existing
+  hierarchy, has operator search aliases, and renders an explicit unavailable
+  provider reason until a typed authority is connected; it does not create a
+  duplicate settings surface or imply unsupported capability. BigBoy catalog
+  tests pass 9/9.
+- Security & Privacy detail update (2026-08-02): the Security & Privacy child
+  route now consumes the existing bounded microphone mute and camera-device
+  observations instead of hiding all privacy evidence behind an unavailable
+  page. Camera permission, encryption, firewall, and security-policy state
+  remain separately and explicitly unavailable; device presence is never
+  treated as permission. The full BigBoy shell suite passes 1,373/1,373,
+  including This Node detail rendering and desktop/narrow/large-text frame
+  coverage.
+- Accessibility/time continuity update (2026-08-02): This Node's Accessibility
+  route now reads the durable System text-scale and motion preferences, while
+  Time, Language & Region reads the durable display clock zone. Both routes
+  preserve the existing settings authority and explicitly identify missing
+  screen-reader, assistive-device, language, locale, keyboard-region, and host
+  time-sync providers. The full BigBoy shell suite passes 1,373/1,373.
+- Vendor-pack contract update (2026-08-02): the shared This Node projection now
+  accepts at most eight sanitized vendor-pack manifests, each with bounded name,
+  version, status, and capability metadata. Unknown statuses fail closed;
+  manifests cannot create routes or executable actions, and the detail anatomy
+  keeps vendor metadata visibly separate from standard controls. Hostile-input
+  coverage and the full focused This Node suite pass 38/38 on BigBoy.
+- Hardware-center provider update (2026-08-02): the Hardware detail route now
+  surfaces the trusted local DRM connector/mode and keyboard-backlight probes
+  when the durable System provider is mounted, while preserving explicit
+  provider-continuity and unavailable states otherwise. Raw sysfs paths,
+  firmware controls, thermal streams, fan identities, and OEM writes remain
+  outside the UI until bounded typed providers supply authorization, limits,
+  audit, and recovery. Focused This Node render/projection verification is
+  complete on BigBoy with 38/38 passing.
+- Local sensor-provider update (2026-08-02): `mde-seat` now owns a fixed-root,
+  read-only thermal/hwmon provider in the off-render-thread seat snapshot. It
+  bounds the thermal-zone list, labels, temperatures, and fan-input count,
+  exposes no kernel paths or mutation verbs, and folds missing class roots into
+  a typed unavailable state. The Hardware detail view renders these local facts
+  beside the existing aggregate snapshot and keeps fan curves, platform
+  profiles, CPU/GPU limits, firmware, and OEM writes fail-closed. BigBoy
+  `mde-seat` passes 107/107 and the focused This Node suite passes 38/38.
+- Platform-profile observation update (2026-08-02): the same fixed-root local
+  provider now folds the standard kernel current platform profile and at most
+  eight sanitized choices into Hardware detail. This is read-only capability
+  evidence; profile mutation still requires a separate trusted worker with
+  confirmation, audit, thermal limits, watchdog recovery, and safe fallback.
+  BigBoy `mde-seat` and focused This Node tests pass 107/107 and 38/38,
+  respectively.
+- Platform-profile action update (2026-08-02): the Actions workflow now offers
+  only fresh kernel-advertised platform-profile choices from the trusted local
+  hardware provider. Each change is visibly armed and confirmed, revalidated
+  immediately before the fixed provider write, recorded through the existing
+  redacted audit seam, and reports refusal without optimistic state. Vendor,
+  fan-curve, CPU/GPU-limit, firmware, and raw OEM controls remain unavailable.
+  BigBoy focused This Node tests pass 38/38 and `mde-seat` passes 107/107.
+- Vendor-pack discovery update (2026-08-02): the root mesh-status writer now
+  discovers at most eight regular, non-symlink JSON manifests from the fixed
+  `/usr/share/mde/vendor-packs/` package boundary. Names, versions, statuses,
+  and capabilities are bounded and sanitized; unknown status fails closed, and
+  the published metadata cannot create routes, commands, or executable actions.
+  Embedded Python parsing, shell syntax, and diff checks pass; live installed
+  vendor-pack evidence remains unavailable when no manifests are published.
+- Bluetooth Actions update (2026-08-02): This Node Actions now exposes a typed
+  Bluetooth-power row when both the fresh aggregate snapshot and live System
+  BlueZ provider advertise an adapter target. The first click arms confirmation;
+  the second dispatches the existing typed seat action, with provider refusal,
+  toast/error, and no optimistic success preserved. The action-contract gate
+  and fail-closed Actions render gate pass on BigBoy.
+- Bluetooth device Actions update (2026-08-02): This Node Actions now reaches
+  the existing typed BlueZ pairing-manager verbs for pair, connect, disconnect,
+  trust/untrust, and forget. Provider-issued adapter/device targets and current
+  bond/link state are revalidated before dispatch; pairing registers the typed
+  agent, every verb requires visible confirmation, and refused writes preserve
+  the last confirmed state. BigBoy action-contract and responsive fail-closed
+  Actions gates pass; physical peripheral pairing proof remains hardware-gated.
+- Power/session Actions update (2026-08-02): This Node Actions now exposes
+  typed logind Lock, Suspend, Hibernate, Reboot, and Power Off rows from the
+  fresh capability probe. Refused capabilities stay disabled with their policy
+  label; host-down verbs require a second visible confirmation and provider
+  errors never claim success. BigBoy action-contract and responsive fail-closed
+  Actions gates pass; physical suspend/reboot proof remains hardware-gated.
+- Display Actions update (2026-08-02): This Node Actions now exposes a typed
+  connected-display output toggle when fresh display facts and the live seat
+  layout agree on a target. The action reuses the System `DisplayLayout`
+  last-console interlock, requires visible confirmation, and reports refused
+  provider transitions without optimistic success. Typed-action and responsive
+  fail-closed Actions gates pass on BigBoy.
+- Audio Actions update (2026-08-02): This Node Actions now exposes a typed
+  master playback mute toggle only when fresh audio facts and a live System
+  mixer target agree. Confirmation precedes the existing `SetMixerMuted` seam;
+  provider refusal preserves the last confirmed state and visible error.
+- Audio volume Actions update (2026-08-02): This Node Actions now exposes
+  bounded ten-percent master playback volume steps only when fresh audio facts
+  and a live typed PipeWire mixer target agree. Confirmation precedes the
+  existing `SetMixerVolume` seam; provider refusal preserves the last confirmed
+  volume and visible error. BigBoy action-contract and fail-closed render gates
+  pass.
+- Audio capture/privacy update (2026-08-02): the typed PipeWire graph now folds
+  `Stream/Input/Audio` nodes into a separate capture collection instead of
+  treating microphone state as unavailable by construction. This Node Actions
+  offers microphone mute only with fresh audio facts and a live capture target;
+  it confirms before dispatching the existing typed mixer mute seam and preserves
+  provider refusal. mde-seat capture folding and BigBoy action-contract and
+  fail-closed Actions gates pass.
+- Direct-seat input update (2026-08-02): the persisted This Node tap-to-click
+  policy now crosses the shared runtime handoff into the DRM/libinput seat.
+  Every touch-capable device is configured when libinput replays or adds it,
+  using libinput's typed tap configuration rather than compositor-only state.
+  The DRM-feature shell compile and fail-closed Actions gate pass on BigBoy;
+  physical tap proof remains hardware-gated.
+- Keyboard backlight provider update (2026-08-02): This Node now folds typed
+  kernel `kbd_backlight` LED targets separately from LCD backlights and exposes
+  bounded ten-percent keyboard brightness steps only when fresh input facts and
+  a live provider target agree. Target/max validation, confirmation, refusal
+  handling, and recovery metadata are preserved; physical keyboard proof
+  remains hardware-gated.
+- Pointer/touch Actions continuity update (2026-08-02): This Node Actions now
+  reaches the existing persisted Mouse & Touch policy and native DRM/libinput
+  handoff for bounded pointer-speed steps and tap-to-click changes. Fresh input
+  observations gate both controls; each requires visible confirmation and keeps
+  the direct-seat policy, audit, and recovery contract explicit. BigBoy typed
+  action-contract and fail-closed Actions gates pass; physical touchpad proof
+  remains hardware-gated.
+- Touch/gesture Actions update (2026-08-02): This Node Actions now reaches the
+  persisted direct-seat policy for touchscreen input, two-finger scrolling, and
+  edge gestures through the same DRM/libinput handoff as System. Fresh input
+  observations gate all three controls; each requires visible confirmation and
+  retains typed audit/recovery metadata. BigBoy action-contract and fail-closed
+  responsive render gates pass; physical touch/gesture proof remains
+  hardware-gated.
+- Power & battery Actions update (2026-08-02): This Node Actions now exposes
+  bounded five-percent charge-stop cap steps only when fresh power facts and a
+  live typed `charge_control_end_threshold` target agree. Confirmation precedes
+  the existing typed sysfs seat write; provider refusal preserves the last
+  confirmed cap and visible error. BigBoy action-contract and fail-closed
+  Actions gates pass.
+- NetworkManager provider update (2026-08-02): the seat now folds bounded
+  NetworkManager Ethernet/Wi-Fi/cellular device state and the global Wi-Fi
+  radio property through a typed system-D-Bus client. This Node Actions offers
+  a Wi-Fi radio toggle only when fresh underlay facts and a live provider target
+  agree; it requires confirmation, preserves mesh/profile safety boundaries,
+  and surfaces provider refusal without optimistic success. The client rejects
+  credential-shaped identifiers; the full mde-seat suite passes 101/101 and
+  This Node action/fail-closed render gates pass on BigBoy.
+- NetworkManager link-action update (2026-08-02): This Node Actions now exposes
+  a confirmed disconnect for a live connected non-loopback underlay device,
+  using the provider-issued NetworkManager device path and typed `Device.Disconnect`
+  call. Mesh overlay targets are protected; profiles, credentials, DNS, and
+  routes are untouched; provider refusal leaves the cache unchanged. BigBoy
+  NetworkManager path/provider tests pass 3/3, with action-contract and
+  fail-closed render gates passing.
+- NetworkManager profile inventory update (2026-08-02): the typed local
+  NetworkManager client now inventories `Settings.Connection` records through
+  bounded provider paths, sanitized labels, and typed Ethernet/Wi-Fi/cellular/
+  WireGuard/VPN families without exposing SSIDs, APNs, UUIDs, routes, DNS, or
+  secrets. This Node Actions shows the inventory while keeping activation,
+  APN/DNS/proxy changes, and imported VPN mutation unavailable until a typed
+  SecretAgent provider supplies authorization, confirmation, and recovery.
+  BigBoy mde-seat profile tests pass 4/4; action-contract and fail-closed
+  responsive render gates pass.
+- Display brightness Actions update (2026-08-02): This Node Actions now exposes
+  bounded dim/brighten steps when fresh display facts and a live typed internal
+  backlight or external DDC target agree. Each step shows the target and new
+  percentage, requires confirmation, validates the provider-issued target and
+  panel range, and retains the last confirmed value when the seat refuses a
+  write. BigBoy action-contract and fail-closed responsive render gates pass.
+- Display continuity remains intentionally split: the System surface retains
+  the existing typed mode, refresh, and arrangement intent controls, while the
+  unified Actions workflow currently exposes output enablement and brightness;
+  live modeset application remains integration-gated by the DRM runner.
+- Display mode Actions update (2026-08-02): This Node Actions now exposes the
+  first connected output's live connector-advertised alternate modes through
+  the existing typed `DisplayLayout` intent seam. Mode targets are revalidated
+  against the current connector probe, require visible confirmation, and retain
+  the runner-gated live-modeset limitation rather than claiming a false apply.
+  BigBoy action-contract and fail-closed responsive render gates pass.
+- Display arrangement Actions update (2026-08-02): This Node Actions now
+  exposes confirmed left/right nudges for each enabled connected output through
+  the existing provider-issued `MonitorId` and `DisplayLayout` intent seam.
+  Multi-display and fresh-connector checks gate the controls; saved order is
+  revalidated before dispatch and live DRM re-apply remains explicitly
+  integration-gated. BigBoy action-contract and fail-closed responsive render
+  gates pass.
+- Hierarchy navigation update (2026-08-02): the inventory-first landing rows and
+  expanded Device Manager hierarchy now provide real navigation into the
+  existing durable `ThisNodeView::Detail` routes instead of being display-only
+  summaries. Section-to-route resolution is bounded by the catalog, preserves
+  the shared provider/health authority, and the focused This Node suite passes
+  39/39 on BigBoy; unsupported providers remain visibly unavailable after
+  navigation.
+- Updates/lifecycle detail update (2026-08-02): the durable Updates & Lifecycle
+  route now exposes a bounded installed-version versus newest-mesh-version
+  posture with explicit current, available, stale, and unknown states. It does
+  not turn mesh version comparison into a package-manager claim or enable unsafe
+  update/reset controls; lifecycle mutation remains visibly provider-gated with
+  authorization, confirmation, audit, and recovery requirements.
+- Storage detail update (2026-08-02): the durable Storage route now renders the
+  surveyed capacity-bar plus detail-table anatomy from bounded aggregate root
+  and storage facts. Missing capacity remains unavailable, stale values are
+  marked before action, and device identity/health are not fabricated from the
+  credential-free snapshot boundary.
+- Users/Accounts role view update (2026-08-02): the durable Users & Accounts
+  route now presents a role-first posture grouping administrative policy groups,
+  interactive users, and all accounts as separate bounded rows. It keeps
+  usernames, membership, privilege names, and credentials out of the snapshot;
+  identity mutations remain unavailable until a typed admin-authorized provider
+  supplies confirmation, audit, and recovery.
+- Camera inventory provider update (2026-08-02): the mesh-status writer now
+  falls back to a bounded, fixed `/dev/video[0-9]*` character-device discovery
+  when no explicit camera count provider is published. Only the count crosses
+  the snapshot boundary; paths, names, capture permissions, and camera privacy
+  state remain unavailable until a typed privacy provider publishes them.
+- Audit export update (2026-08-02): the This Node Audit disclosure now offers
+  an atomic export to the deterministic user-state directory using a bounded
+  `mde.this-node.audit.v1` schema. The export contains only action, outcome,
+  timestamp, and a fixed local trusted-session operator label; provider paths,
+  device identities, credentials, and raw errors remain excluded, with write
+  failures shown explicitly.
+- Local storage detail update (2026-08-02): the trusted seat hardware provider
+  now inventories at most 32 fixed-root `/sys/block` devices with bounded
+  kernel names, capacity, removable, and rotational observations. Storage and
+  Hardware details render the local table while the world-readable snapshot
+  remains aggregate-only; destructive storage actions remain unavailable until
+  a typed, confirmed provider exists. Hostile-name and bounded-provider tests
+  cover the new seam.
+- Firmware/dock inventory update (2026-08-02): the trusted seat hardware
+  provider now reads bounded product/firmware labels from the fixed DMI class
+  root and at most 16 sanitized Thunderbolt/dock authorization observations.
+  Hardware detail renders these as local capability evidence; firmware updates
+  and dock authorization remain visibly unavailable until typed privileged
+  providers supply confirmation, safety, audit, and recovery contracts.
+- Health-alert continuity update (2026-08-02): This Node now links node-sourced
+  rows from the existing shared AlertInbox on the inventory landing view. It
+  provides durable Acknowledge and 15-minute Snooze commands through the signed
+  collab action path, with severity/source/detail display and explicit command
+  errors; it does not create a second alert store. Focused This Node tests pass
+  40/40 on BigBoy.
+- Local underlay continuity update (2026-08-02): the Connectivity detail now
+  renders the live trusted-seat NetworkManager probe beside mesh-status facts,
+  including bounded Wi-Fi radio/link state and credential-free Ethernet, Wi-Fi,
+  cellular, WireGuard, and VPN profile inventory. Provider loss is explicit;
+  profile inventory is capped at 32 records and activation/secret-bearing
+  changes remain behind the typed SecretAgent boundary. BigBoy network-provider
+  tests pass 5/5 and focused This Node tests pass 40/40.
+- Local Bluetooth continuity update (2026-08-02): the Connectivity detail now
+  renders the trusted-seat BlueZ adapter and known-device projection beside
+  aggregate mesh Bluetooth facts, including powered/scanning/pairable state,
+  connection/pairing/trust state, and reported peripheral battery. BlueZ folds
+  at most 8 adapters and 64 devices; provider loss remains explicit and all
+  pair/connect/trust/forget/scan writes stay in the typed audited Actions path.
+  BigBoy BlueZ provider tests pass 10/10 and focused This Node tests pass 40/40.
+- Direct-seat input continuity update (2026-08-02): the Input detail now shows
+  the persisted System/libinput policy beside typed keyboard-backlight facts:
+  pointer speed, tap-to-click, two-finger scroll, touchscreen input, and edge
+  gestures. The detail reads the same authority used by the native handoff;
+  changes remain confirmation/audit-gated in Actions. Focused This Node tests
+  pass 40/40 on BigBoy.
+- Local power-provider continuity update (2026-08-02): the Power & Performance
+  detail now keeps independent local power-profile and charge-limit probes
+  visible alongside UPower battery/source facts. A missing battery provider no
+  longer hides a live profile/charge-limit state; unavailable probes remain
+  explicit, and profile/charge changes remain confirmation/audit-gated in
+  Actions. Focused This Node tests pass 40/40 on BigBoy.
+- Local privacy continuity update (2026-08-02): Security & Privacy now shows
+  trusted local PipeWire capture routes and their actual mute state, while
+  keeping route names local and camera permission explicitly unavailable until
+  a typed camera-privacy provider exists. Microphone changes continue through
+  the typed confirmation/audit Actions path. Focused This Node tests pass 40/40
+  on BigBoy.
 - Remaining work:
 
   1. Finish the durable This Node sidebar and search index across every
@@ -2177,3 +3874,504 @@ regression. The Tasks body likewise now presents the specific `Channel tasks`
 heading and no longer paints a redundant standalone `Tasks` label. Reconcile
 those tests to their intended desktop/narrow contracts before the next farm
 gate; no production readiness claim follows from this correction.
+
+### WL-UX-009 evidence disposition — Editor large-text menubar correction (2026-08-02)
+
+The shared `MenuBar` correction is accepted for the Editor Light/Largest
+direct-DRM slice. The constrained nested editor pane now uses an explicit
+two-row layout with a single-line horizontally scrollable menu strip, keeping
+`Help`, formatting controls, the document body, status row, details rail, and
+taskbar visible without accidental vertical expansion. Farm evidence is
+`mde-egui` 269/269 and `mde-editor-egui` 407/407; Dell `.138` ran payload
+`4808bd30bfa72ab386056cd1ecbc4d6aac0251a144609aedcee3e209b8dc888c` with an
+active zero-restart service. Accepted proof:
+`evidence/WL-UX-009-2026-08-02-138-editor-light-largest-4808bd30.png`,
+SHA-256 `b1e0bafea6d63cd88f0979d11024da56a05611115f1e8ee52bbc4c19035371cb`.
+This is a closed validation slice, not closure of WL-UX-009 or a production
+readiness claim; the full current-payload route/profile matrix and remaining
+hardware/boundary evidence are still required.
+
+- Proof-route follow-up (2026-08-02): the explicit Files direct-DRM proof route
+  is reasserted at shell construction and frame entry, but the live readback
+  still lands on the Auto/clock surface after later automatic navigation drains.
+  Add one final proof-only route assertion immediately before central workspace
+  rendering, preserve ordinary navigation behavior, farm-test the route seam,
+  and recapture the Files/Airsonic evidence before accepting the slice. This is
+  a route-harness correction only; no readiness claim follows from it.
+- Farm-integrity finding (2026-08-02): the current release source cannot compile
+  the existing This Node hostile-fixture test because a JSON `\\u0000` escape is
+  interpreted by Rust as an invalid source escape. Convert only that fixture to
+  Rust's braced Unicode escape form, rerun the release build and focused test,
+  and keep all visual/readiness claims open until the exact candidate is proven.
+- Farm-integrity resolution (2026-08-02): the synchronized farm source already
+  contains the braced `\\u{0000}` fixture form; the stale first release sync was
+  discarded. The rerun release build on BigBoy completed successfully and
+  produced exact payload `b888b0d163de8369b554569d5a75f3f17f257d8581f1e2558d14a3d479435f0c`.
+- Proof-route resolution (2026-08-02): after the approved temporary
+  `require_login_at_boot:false` proof fixture, exact candidate `b888b0d1…` on
+  `.138` rendered the explicit Files route rather than the boot curtain. Visual
+  inspection accepts the shared `FILES` frame, complete ten-action NODE ACTIONS
+  inventory, reachable mesh peer, and `Airsonic upload · Music-owned` action;
+  PNG SHA-256 is `64be0f4af1cdf26ecfc66e96172cf76a6234b64caed7b842fe2fec9c31e3b329`
+  in the DRM evidence ledger. The temporary unlock, candidate binary, and proof
+  drop-in were removed; `.138` is restored to payload `20955383…`,
+  `require_login_at_boot:true`, Dark/Construct/Default/Normal, active service,
+  and zero recorded restarts. This closes only the Files/Airsonic proof-route
+  slice; Dell adoption, the remaining matrix, strict linear scanout, and
+  WL-UX-009 readiness remain open.
+- Car Light palette implementation slice (2026-08-02): the Car profile currently
+  installs `AutoSync3` as the whole egui scheme, so the Auto Mode dashboard cannot
+  honor a persisted Light choice even though its cards use shared palette tokens.
+  Preserve AutoSync3's vehicle-specific accents/skin while pass-through rendering
+  the persisted Dark/Light surface palette to AutoHome. Add a focused Light-vs-Dark
+  render contract, farm-test it, then recapture exact current-payload Car Light /
+  Largest direct-DRM frames on both seats before accepting the open cell.
+- Car Light palette resolution (2026-08-02): candidate
+  `e30f36cd562f729f91620ef3842827190bbf3b055bcd8126072630d1dedcd0ee` passed
+  the focused Car suite 14/14. Visually accepted native Light/Largest Auto Mode
+  frames were captured on `.138` (1920x1080,
+  `79355ca02ed2a8086d0f9cd14dcfa411233e1aad46f8496ab0b885f9c781332b`) and
+  Dell `.225` (1366x768,
+  `39361bc641021fd0ed4e5ec7c4dd92b86343d944c5ce2bab3432c2feffa4dcbb`), with
+  Light surface ground/cards and AutoSync3 accents. Both seats were restored to
+  payload `20955383…`, secure Dark/Construct/Default/Normal, active service,
+  zero restarts, and no proof drop-in. The proof-only logical-width override
+  intentionally leaves each PNG at native physical dimensions while bounding
+  content to the requested 800 logical-pixel viewport. This closes the Car
+  Light/Largest narrow palette cell; strict linear scanout, the remaining
+  route/profile matrix, and WL-UX-009 readiness remain open.
+- Dell Terminal narrow recapture (2026-08-02): validate the current release
+  candidate `e30f36cd…` on Dell `.225` for Terminal Dark desktop, Dark narrow
+  (`800` logical width), Light desktop, and Light/Largest narrow. Inspect the
+  full `TERMINAL` identity, command/session controls, taskbar contrast, and
+  bounded body; accept only visually complete frames and restore secure seat
+  state afterward.
+- Dell Terminal recapture resolution (2026-08-02): candidate `e30f36cd…` on
+  Dell `.225` passed visual inspection for Dark desktop, Dark narrow (`800`
+  logical), Light desktop, and Light/Largest narrow. The full `TERMINAL`
+  identity, menu/session controls, taskbar contrast, and bounded body are
+  present; the earlier `TER…` interpretation is superseded. Evidence hashes
+  are recorded in the DRM ledger. Dell was restored to payload `20955383…`,
+  secure Dark/Construct/Default/Normal, active service, zero restarts, and no
+  proof drop-in. This closes the Dell Terminal visual slice only; the remaining
+  route/profile matrix, VDI guest readiness, strict linear scanout, and
+  WL-UX-009 readiness remain open.
+- Dell Editor current-candidate recapture (2026-08-02): validate candidate
+  `e30f36cd…` on Dell `.225` for Editor Dark desktop, Dark narrow (`800`
+  logical width), Light desktop, and Light/Largest narrow. Inspect direct-entry
+  sidebar collapse, the shared `EDITOR` identity, internal menu/toolbar
+  reachability, document/status/details geometry, and taskbar contrast; accept
+  only complete frames and restore secure seat state afterward.
+- Dell Editor recapture resolution (2026-08-02): candidate `e30f36cd…` on
+  Dell `.225` passed visual inspection for Dark desktop, Dark narrow (`800`
+  logical), Light desktop, and Light/Largest narrow. Direct-entry sidebars are
+  collapsed; the Mesh Teams editor host chrome, editor toolbar/menu, document,
+  status/details geometry, and taskbar remain bounded. Evidence hashes are in
+  the DRM ledger; no guest/VDI pixels are claimed. Dell was restored to payload
+  `20955383…`, secure Dark/Construct/Default/Normal, active service, zero
+  restarts, and no proof drop-in. This closes the Dell Editor visual slice only;
+  the remaining route/profile matrix, guest VDI readiness, strict linear
+  scanout, and WL-UX-009 readiness remain open.
+- Dell Files and Mesh Teams recapture (2026-08-02): validate candidate
+  `e30f36cd…` on Dell `.225` for Files and Mesh Teams across Dark desktop, Dark
+  narrow (`800` logical width), Light desktop, and Light/Largest narrow. Inspect
+  Files' complete ten-action node inventory and sync/status lanes, plus Mesh
+  Teams' shared identity strip, channel/app rails, and bounded body. Accept
+  only visually complete frames and restore secure seat state after the batch.
+- Mesh Teams Light contrast finding (2026-08-02): Dell `.225` current-candidate
+  Mesh Teams Dark desktop and Dark narrow are readable, but Light desktop and
+  Light/Largest narrow render Activity/body and rail copy with the Dark
+  `TEXT`/`TEXT_DIM` values under the Light surface, producing washed-out,
+  low-contrast content. Reject both Light cells; resolve Mesh Teams-owned text
+  tokens through the shared runtime palette, add a Light render assertion, farm
+  test, and recapture Dell before accepting the route.
+- Mesh Teams Light contrast resolution (2026-08-02): candidate
+  `ae51c12447c342aa9457e7db148cdb046595eeb533463a731b712cd1b1bb0236` maps the
+  Activity and frame-owned text tokens through the shared runtime palette;
+  BigBoy `mde-collab-egui --lib` passed 130/130, including an explicit
+  Light-mode render assertion for Activity and Mesh Teams rail text. Dell Light desktop and
+  Light/Largest narrow frames were recaptured after the normal page crossfade
+  settled and visually accepted; their hashes and links are in the DRM ledger.
+  The earlier transition frames remain rejected diagnostic evidence. Dell was
+  restored to payload `20955383…`, secure Dark/Construct/Default/Normal,
+  active service, zero restarts, and no proof drop-in. This closes only the
+  Dell Files/Mesh Teams visual slice and Mesh Teams Light contrast finding;
+  VDI guest readiness, strict linear scanout, the remaining matrix, and
+  WL-UX-009 readiness remain open.
+- VDI guest endpoint audit (2026-08-02): a fresh read-only probe of enrolled
+  validation seats `.15`, `.138`, `.145`, and Dell `.225` found no open RDP,
+  VNC, SPICE/VDI, or Sunshine endpoint on the approved validation ports.
+  The approved boundary remains documented, but no guest framebuffer, guest
+  input, or VDI readiness claim is made; retain this as an external-state
+  evidence gap rather than styling the guest surface or claiming readiness.
+- Current candidate Car matrix recapture (2026-08-02): validate exact release
+  `ae51c124…` on both direct-DRM seats for Car Light/Largest narrow after the
+  AutoHome palette resolution. Confirm the AutoSync3 vehicle skin remains
+  intact while the persisted Light surface palette is honored; accept only
+  complete, readable cockpit frames and restore secure seat state afterward.
+- Current candidate Car matrix resolution (2026-08-02): exact candidate
+  `ae51c124…` passed Car Light/Largest narrow on `.138` and Dell `.225`.
+  Both direct-DRM frames show the complete Auto Mode cockpit, Light surface
+  palette, preserved AutoSync3 accents, and bounded large-text cards; hashes
+  and links are in the DRM ledger. Both seats were restored to payload
+  `20955383…`, secure Dark/Construct/Default/Normal, active service, zero
+  restarts, and no proof drop-in. This closes only the Car cell; strict linear
+  scanout, VDI guest readiness, the remaining matrix, and WL-UX-009 readiness
+  remain open.
+- Current candidate Files matrix recapture (2026-08-02): validate exact
+  release `ae51c124…` on `.138` and Dell `.225` for Files Dark desktop, Dark
+  narrow (`800` logical width), Light desktop, and Light/Largest narrow.
+  Confirm the complete node-action inventory, peer/status lanes, file list,
+  preview boundary, and transfer status remain readable; restore secure seat
+  state after capture and accept only inspected frames.
+- Current candidate Files matrix resolution (2026-08-02): exact candidate
+  `ae51c124…` passed Files Dark desktop, Dark narrow (`800`), Light desktop,
+  and Light/Largest narrow on both `.138` and Dell `.225`. All frames show the
+  complete ten-action node inventory, peer/status lanes, file list, preview
+  boundary, and transfer/status strip without clipping or overlap; hashes and
+  links are in the DRM ledger. Both seats were restored to payload `20955383…`,
+  secure Dark/Construct/Default/Normal, active service, zero restarts, and no
+  proof drop-in. This closes only the exact-candidate Files slice; strict
+  linear scanout, VDI guest readiness, the remaining matrix, and WL-UX-009
+  readiness remain open.
+- Current candidate Editor matrix recapture (2026-08-02): validate exact
+  release `ae51c124…` on `.138` and Dell `.225` for Editor Dark desktop, Dark
+  narrow (`800` logical width), Light desktop, and Light/Largest narrow.
+  Confirm direct-entry sidebar collapse, shared Editor identity, internal
+  menu/toolbar reachability, document/status/details geometry, and taskbar
+  contrast; restore secure seat state and accept only inspected frames.
+- Current candidate Editor matrix resolution (2026-08-02): exact candidate
+  `ae51c124…` passed Editor Dark desktop, Dark narrow (`800`), Light desktop,
+  and Light/Largest narrow on both `.138` and Dell `.225`. Direct-entry
+  sidebars are collapsed and the shared Editor identity, menu/toolbar,
+  document body, status row, details rail, and taskbar remain bounded; hashes
+  and links are in the DRM ledger. Both seats were restored to payload
+  `20955383…`, secure Dark/Construct/Default/Normal, active service, zero
+  restarts, and no proof drop-in. This closes only the exact-candidate Editor
+  slice; strict linear scanout, VDI guest readiness, the remaining matrix, and
+  WL-UX-009 readiness remain open.
+- Current candidate Terminal matrix recapture (2026-08-02): validate exact
+  release `ae51c124…` on `.138` and Dell `.225` for Terminal Dark desktop,
+  Dark narrow (`800` logical width), Light desktop, and Light/Largest narrow.
+  Confirm the complete TERMINAL identity, menu/session controls, shell body,
+  taskbar contrast, and bounded narrow layout; restore secure seat state and
+  accept only inspected frames.
+- Current candidate Terminal matrix resolution (2026-08-02): exact candidate
+  `ae51c124…` passed Terminal Dark desktop, Dark narrow (`800`), Light desktop,
+  and Light/Largest narrow on both `.138` and Dell `.225`. The complete
+  `TERMINAL` identity, menu/session controls, shell body, taskbar, and bounded
+  narrow layout remain readable; hashes and links are in the DRM ledger. Both
+  seats were restored to payload `20955383…`, secure Dark/Construct/Default/
+  Normal, active service, zero restarts, and no proof drop-in. This closes only
+  the exact-candidate Terminal slice; strict linear scanout, VDI guest
+  readiness, the remaining matrix, and WL-UX-009 readiness remain open.
+- Current candidate This Node matrix recapture (2026-08-02): validate exact
+  release `ae51c124…` on `.138` and Dell `.225` for This Node Dark desktop,
+  Dark narrow (`800` logical width), Light desktop, and Light/Largest narrow.
+  Confirm the unified node navigation, health-score/status hierarchy, device
+  and local-operations body, large-text scroll boundary, and taskbar remain
+  readable and bounded; restore secure seat state and accept only inspected
+  frames.
+- Current candidate This Node matrix resolution (2026-08-02): exact candidate
+  `ae51c124…` passed This Node Dark desktop, Dark narrow (`800`), Light desktop,
+  and Light/Largest narrow on both `.138` and Dell `.225`. Unified node
+  navigation, status/health hierarchy, device/local-operations body,
+  large-text continuation, and taskbar remain readable and bounded; hashes and
+  links are in the DRM ledger. Both seats were restored to payload
+  `20955383…`, secure Dark/Construct/Default/Normal, active service, zero
+  restarts, and no proof drop-in. This closes only the exact-candidate This
+  Node slice; strict linear scanout, VDI guest readiness, the remaining matrix,
+  and WL-UX-009 readiness remain open.
+- Current candidate Phones matrix recapture (2026-08-02): validate exact
+  release `ae51c124…` on `.138` and Dell `.225` for Phones Dark desktop, Dark
+  narrow (`800` logical width), Light desktop, and Light/Largest narrow.
+  Confirm the shared title/header, pairing status, tabs, feature and
+  remote-input controls, and bounded large-text body; restore secure seat state
+  and accept only inspected frames.
+- Current candidate Phones matrix resolution (2026-08-02): exact candidate
+  `ae51c124…` passed Phones Dark desktop, Dark narrow (`800`), Light desktop,
+  and Light/Largest narrow on both `.138` and Dell `.225`. The shared title,
+  pairing state, tabs, feature and remote-input controls, and large-text body
+  remain readable and bounded; hashes and links are in the DRM ledger. Both
+  seats were restored to payload `20955383…`, secure Dark/Construct/Default/
+  Normal, active service, zero restarts, and no proof drop-in. This closes only
+  the exact-candidate Phones slice; strict linear scanout, VDI guest readiness,
+  the remaining matrix, and WL-UX-009 readiness remain open.
+- Current candidate Media matrix recapture (2026-08-02): validate exact
+  release `ae51c124…` on `.138` and Dell `.225` for Media Dark desktop, Dark
+  narrow (`800` logical width), Light desktop, and Light/Largest narrow.
+  Confirm the shared MEDIA identity/menu, source tabs, local/Jellyfin controls,
+  honest empty-source state, and taskbar remain readable and bounded; restore
+  secure seat state and accept only inspected frames.
+- Current candidate Media matrix resolution (2026-08-02): exact candidate
+  `ae51c124…` passed Media Dark desktop, Dark narrow (`800`), Light desktop,
+  and Light/Largest narrow on both `.138` and Dell `.225`. The shared MEDIA
+  identity/menu, source tabs, local/Jellyfin controls, honest empty-source
+  state, and taskbar remain readable and bounded; hashes and links are in the
+  DRM ledger. Both seats were restored to payload `20955383…`, secure
+  Dark/Construct/Default/Normal, active service, zero restarts, and no proof
+  drop-in. This closes only the exact-candidate Media slice; strict linear
+  scanout, VDI guest readiness, the remaining matrix, and WL-UX-009 readiness
+  remain open.
+- Current candidate Maps matrix recapture (2026-08-02): validate exact release
+  `ae51c124…` on `.138` and Dell `.225` for Maps Dark desktop, Dark narrow
+  (`800` logical width), Light desktop, and Light/Largest narrow. Confirm the
+  governed map-content palette, health/alert rail, FAB lane, empty-state panel,
+  and taskbar remain readable and separated; restore secure seat state and
+  accept only inspected frames.
+- Current candidate Maps matrix finding (2026-08-02): Dell `.225` Maps
+  Light/Largest narrow (`800` logical width) remains rejected because native
+  inspection shows the lower red alert pill clipped at the application
+  viewport boundary above the taskbar. Evidence is recorded in the DRM
+  ledger at `docs/platform/WL-UX-009-DRM-EVIDENCE-2026-07-31.md` with proof
+  SHA `cc3c01404c1d96ace43d2cc68cb2fa843339a58b31f8144b545750497f3ddd96`.
+  Keep this item open for a layout fix and a fresh direct-DRM recapture; do
+  not claim Maps matrix closure or WL-UX-009 readiness.
+- Maps alert-stack remediation (2026-08-02): update the Drive HUD's alert
+  placement to reserve a bottom-safe viewport margin before painting multiple
+  large-text status pills. Add geometry coverage for the Dell narrow profile,
+  then rebuild and recapture the rejected `.225` Light/Largest Maps cell on
+  direct DRM before changing its worklist disposition. Resolution evidence:
+  focused Maps tests pass 274/274; candidate `b75e395a…` was recaptured on
+  Dell direct DRM as `a52e044e00e6ba7cc4e305d7b97b8263e45f851b42817431a46288130c2f3b1a`.
+  The two large-text status pills are fully visible above the taskbar, and the
+  redundant no-data card is suppressed only in the combined no-fix/offline-
+  blocked state. The seat was restored to the secure baseline. This resolves
+  the recorded clipping finding; strict linear scanout, the remaining route /
+  profile matrix, VDI guest readiness, and overall WL-UX-009 readiness remain
+  open.
+- Build-integrity blocker resolved (2026-08-02): reconciled the This Node
+  `show_section_detail` call/definition after the application continuity slice;
+  the focused BigBoy suite now compiles and passes 44/44. Live Maps proof
+  remains blocked independently by the recorded narrow-layout finding below.
+- Local services continuity update (2026-08-02): This Node's Services detail
+  now folds a fixed, read-only local systemd failure provider alongside the
+  existing mesh-published daemon health. The provider runs off the render
+  thread, caps output at 32 unit names, treats systemd absence/refusal as an
+  explicit unavailable state, and keeps restart behind the typed Actions
+  confirmation/audit/recovery boundary. The focused BigBoy This Node suite
+  passes 40/40; physical GUI recapture remains open.
+- Printers/peripherals continuity update (2026-08-02): the durable Printers &
+  Peripherals route now consumes a fixed, read-only local CUPS `lpstat` probe,
+  bounded to 16 sanitized printer names plus local status/default evidence.
+  Missing or refused CUPS remains explicitly unavailable; printer jobs,
+  queues, USB authorization, and dock mutation remain outside the route until
+  typed confirmation/audit/recovery providers exist. The focused BigBoy This
+  Node suite passes 41/41; physical peripheral proof remains hardware-gated.
+- Firewall posture continuity update (2026-08-02): Security & Privacy now
+  consumes a fixed, off-render-thread firewalld `--state` observation and
+  distinguishes running, not-running, unavailable, and unknown-provider
+  states. Zone/rule detail, encryption, broader security policy, and firewall
+  mutation remain explicitly unavailable; the UI does not infer a general
+  security posture from one firewalld probe. The focused BigBoy This Node suite
+  passes 42/42; physical security-policy evidence remains open.
+- Remote-access continuity update (2026-08-02): Virtualization & Remote Access
+  now reuses the durable System Remote Proofing policy and derived
+  Sunshine/Moonlight/VNC service plan in the This Node detail route. It exposes
+  bounded enablement, bind scope, firewall policy, capture/encoder, frame
+  target, local approval, indicator, input, fallback, and provider warnings;
+  lifecycle and trusted-session mutations remain owned by the existing System/
+  VDI authorities. Catalog tests pass 9/9 and focused This Node tests pass
+  42/42 on BigBoy.
+- Backup posture continuity update (2026-08-02): Backup & Restore now reads
+  metadata for the existing encrypted `state-backup.enc` artifact at the
+  canonical workgroup/node/mackesd path. This Node reports bounded presence,
+  size, modification time, missing, and invalid/symlink states without opening
+  or exposing encrypted contents. Passphrase verification and restore remain
+  privileged mackesd operations outside the UI. Catalog tests pass 9/9 and
+  focused This Node tests pass 43/43 on BigBoy.
+- Applications continuity update (2026-08-02): Services & Applications now
+  reads the existing bounded `apps-installed.json` and `running-apps.json`
+  mirrors under the canonical workgroup/node directory and exposes aggregate
+  installed and running counts. Missing, malformed, symlinked, oversized, or
+  unavailable mirrors remain explicit unknown/unavailable states; app names,
+  launch, and mutation continue through the existing Front Door authority.
+  Focused This Node tests pass 44/44 on BigBoy; physical application proof
+  remains open.
+- Encryption posture continuity update (2026-08-02): Security & Privacy now
+  performs an off-render-thread, fixed-root observation of `/sys/class/block`
+  device-mapper entries and counts only mappings whose local `dm/uuid` begins
+  with `CRYPT-LUKS`. The route reports no mappings, observed encrypted versus
+  total mappings, or an explicit provider failure; it never exposes mapping
+  names, paths, keys, unlocked state, or a full-disk-encryption claim. Hostile
+  fixture coverage passes in the focused This Node suite, now 46/46 on BigBoy.
+  Encryption policy and mutation remain provider-gated; physical security
+  evidence remains open.
+- Security copy truthfulness update (2026-08-02): corrected the mesh-level
+  Security & Privacy summary so it no longer contradicts the trusted local
+  encryption/firewalld cards. It now distinguishes snapshot-wide policy, local
+  observations, camera-permission gaps, and partial-fact limitations. The
+  focused This Node suite remains green at 46/46 on BigBoy.
+- Physical-evidence audit update (2026-08-02): inspected the recorded direct-DRM
+  This Node Dark desktop and Light/Largest narrow frames for hierarchy, health
+  glyphs, Inventory/Actions navigation, contrast, taskbar touch targets, and
+  scroll continuation. They remain usable layout evidence, but their exact
+  candidate predates the later application, encryption, and Security copy
+  changes; do not treat those hashes as proof of the newest payload. A fresh
+  direct-DRM recapture is required after the next accepted release candidate.
+- Local security freshness update (2026-08-02): Security & Privacy now gives
+  firewalld and encryption observations independent `Fresh`, `Stale`, or
+  `Awaiting local provider` badges. A successful local observation ages out
+  after 45 seconds, so a hung or silent worker cannot leave old security facts
+  looking current. Focused BigBoy This Node tests pass 46/46; the existing
+  mesh-wide health authority remains unchanged.
+- Local-provider freshness continuity update (2026-08-02): the same bounded
+  freshness badge now appears on local Services, Printers & Peripherals, Backup
+  & Restore, and Services & Applications cards. Each successful off-render-
+  thread response records its own observation age; a silent worker becomes
+  `Stale` after 45 seconds and never masquerades as current. Provider errors
+  and not-yet-seen states remain distinct. Focused BigBoy This Node tests pass
+  46/46.
+- Diagnostics freshness continuity update (2026-08-02): the bounded redacted
+  journal provider now shows its own `Fresh`, `Stale`, or `Awaiting local
+  provider` badge. A stopped journal worker therefore cannot leave old warning
+  and error lines looking current, while the fixed query, redaction, size cap,
+  and no-user-query boundary remain unchanged. Focused BigBoy This Node tests
+  pass 46/46.
+- Hardware-provider freshness update (2026-08-02): the trusted `mde-seat`
+  HardwareStatus contract now carries a bounded observation timestamp. Hardware
+  detail renders `Fresh`, `Stale`, or `Awaiting provider timestamp` for local
+  thermal/fan, storage, firmware, dock, and platform-profile evidence instead
+  of relying solely on mesh snapshot age. No paths or mutation verbs cross the
+  seam. BigBoy `mde-seat` hardware tests pass 3/3 and focused This Node tests
+  pass 46/46.
+- Recovery & Reset route continuity update (2026-08-02): This Node now indexes
+  a distinct Recovery & Reset hierarchy/search route with a full-page boundary
+  that names the privileged provider required for recovery-environment, reset,
+  rollback, and destructive restoration controls. The page keeps encrypted
+  backup metadata and passphrase-gated `mackesd` verification/restore as the
+  existing safe continuity path, and presents no reset action as available.
+  Catalog tests pass 9/9 and focused This Node tests pass 46/46 on BigBoy.
+- Time/language/region provider update (2026-08-02): the durable Time, Language
+  & Region route now consumes a bounded local provider for host locale/language
+  values from fixed `/etc/locale.conf` or `/etc/default/locale` files and the
+  host time zone from fixed timezone evidence. Values are sanitized, kept
+  read-only, and show `Fresh`, `Stale`, or an explicit provider error; display
+  clock preference remains owned by the typed System provider, while locale
+  mutation, keyboard-region policy, and time synchronization remain gated.
+  Focused This Node tests pass 47/47 on BigBoy.
+- Full-page responsive evidence update (2026-08-02): the governed detail-route
+  render fixture now mounts the typed System provider instead of testing every
+  route only through a provider-less fallback, and renders every indexed page
+  again at 520px logical width with 1.4x text scale. This covers the real
+  locale, personalization, virtualization, and OS-management detail branches
+  alongside the device pages. Focused This Node tests pass 47/47 on BigBoy.
+- Physical-evidence audit update (2026-08-02): the available Dell proof target
+  `172.20.146.225` accepts SSH but currently reports an inactive
+  `mde-shell-egui.service` and no `/dev/dri/card0`; the `.138` proof target is
+  not reachable on SSH. The checked-in This Node PNGs remain useful visual
+  layout evidence, but are not current-payload or physical-control proof.
+  Fresh direct-DRM capture and reachable-device action evidence remain open
+  until a live DRM seat is available.
+- Time-sync and keyboard-region continuity update (2026-08-02): the local
+  Time, Language & Region provider now also reads bounded keyboard-region facts
+  from fixed host configuration and the fixed `timedatectl` synchronization
+  posture. The UI distinguishes synchronized, not synchronized, not reported,
+  and provider-error states; it exposes no host mutation or false sync claim.
+  Focused This Node tests pass 47/47 on BigBoy.
+- Current-payload route validation (2026-08-02): full production-feature
+  candidate `2f32f935c92a4cf84f926221a093a3666638fee9063ec4f9a8dc8ef1f686f628`
+  was built on BigBoy with `drm,live-vdi,media-mpv`. On `.138`, Music Dark
+  desktop, Music Dark narrow (`800` logical), and Music Light/Largest narrow
+  were visually inspected and accepted; Media Dark desktop was also captured
+  and accepted. Evidence and native readback hashes are recorded in the DRM
+  ledger. `.138` was restored to payload `20955383…`, secure login-at-boot,
+  active service, and zero restarts. This closes only the current-payload
+  Music slice plus one Media cell; the remaining Media profiles, Phones,
+  Terminal, Editor, Browser boundary, strict linear scanout, Dell adoption,
+  and WL-UX-009 readiness remain open.
+- Current-payload route validation continuation (2026-08-02): the same
+  production-feature candidate `2f32f935…` was explicitly routed on `.138` to
+  Phones, Terminal, and the unified Editor/Communications surface. Dark
+  desktop frames were visually inspected and accepted for all three. The
+  Editor frame records the approved boundary: Construct owns the Mesh Teams
+  host frame and embedded Editor surface; no guest application styling is
+  claimed. `.138` was restored to payload `20955383…`, secure login-at-boot,
+  active service, and zero restarts. Remaining Light/Largest and narrow cells,
+  Dell adoption, Browser/VDI boundaries, strict linear scanout, and overall
+  WL-UX-009 readiness remain open.
+- Dell adoption validation (2026-08-02): the production-feature candidate
+  `2f32f935…` was installed on Dell `.225` and the Phones, Terminal, and
+  unified Editor/Communications Dark desktop frames were visually inspected
+  and accepted. The Editor frame preserves the approved Construct-owned host
+  and embedded-editor boundary. Dell was restored to payload `20955383…`,
+  secure login-at-boot, active service, and zero restarts. This closes only
+  the Dell Dark desktop route slice; Light/Largest and narrow cells, remaining
+  Media coverage, Browser/VDI boundaries, strict linear scanout, and overall
+  WL-UX-009 readiness remain open.
+- Inventory freshness rollup update (2026-08-02): the inventory-first landing
+  card now keeps the existing global health score as the sole health authority
+  and adds a compact local-provider rollup for `fresh`, `stale`, and `awaiting`
+  observations across diagnostics, services, locale, printers, backup,
+  applications, and local security. Detail cards retain their per-provider age
+  badges; the landing summary is only a bounded count, not a second score.
+  Focused This Node tests pass 48/48 on BigBoy, including distinct-state
+  freshness coverage.
+- Critical-alert recovery workflow update (2026-08-02): This Node's linked
+  shared AlertInbox now promotes structured affected-component, current-impact,
+  and recovery-guidance fields on the inventory landing. Typed inline recovery
+  actions are reachable from the same signed notification authority; safe
+  actions dispatch directly and destructive actions require an explicit
+  arm-and-confirm step. Acknowledgement and 15-minute snooze remain durable
+  shared commands, with no second local alert store. Focused This Node tests
+  pass 48/48 on BigBoy.
+- NetworkManager SecretAgent boundary update (2026-08-02): `mde-seat` now
+  provides an in-process, non-persistent NetworkManager SecretAgent lifecycle
+  and a typed profile-activation method using only validated provider-issued
+  profile/device object paths. Secret values exist only in the callback and
+  D-Bus activation exchange; they are never serialized, logged, or exposed to
+  This Node snapshots. Save/delete persistence is refused, malformed metadata
+  is rejected, and mesh routes/DNS are not rewritten by activation. The This
+  Node profile action remains fail-closed until a trusted-session responder is
+  mounted by the shell. BigBoy `mde-seat` network tests pass 8/8 and focused
+  This Node tests pass 48/48.
+- Phones large-text remediation (2026-08-02): moved the always-available
+  `Disarm now` control into the wrapped arm-action lane, removing the needless
+  extra row at large text. Phones tests pass 26/26. Candidate
+  `cc56fdf0466a29506b8b7adcf27af8aa3f7a034d87bdebfe20143093289f2dbc` was
+  recaptured on Dell `.225` Light/Largest narrow; the complete Remote input
+  card now ends above the taskbar and is accepted. Dell was restored to
+  payload `20955383…`, secure login-at-boot, active service, and zero restarts.
+  Remaining route/profile cells, Browser/VDI boundaries, strict linear
+  scanout, and overall WL-UX-009 readiness remain open.
+- Dell Editor profile validation (2026-08-02): candidate `cc56fdf0…` was
+  explicitly routed to the unified Editor/Communications surface on Dell
+  `.225`. Dark narrow, Light desktop, and Light/Largest narrow frames were
+  visually inspected and accepted. The approved host-owned Mesh Teams and
+  embedded Editor boundary remains clear at each profile. Dell was restored to
+  payload `20955383…`, secure login-at-boot, active service, and zero restarts.
+  Remaining Media profiles, Browser/VDI boundaries, strict linear scanout, and
+  overall WL-UX-009 readiness remain open.
+- Live-render finding (2026-08-02): Dell `.225` Media Light/Largest narrow
+  current-payload proof clips the Jellyfin empty-state line at the taskbar
+  boundary. Reject the cell; keep the status copy truthful and make the Media
+  content lane taskbar-safe before recapturing the exact candidate.
+- Dell Terminal profile validation (2026-08-02): candidate `cc56fdf0…` was
+  explicitly routed on Dell `.225` and Dark narrow, Light desktop, and
+  Light/Largest narrow frames were visually inspected and accepted. Terminal
+  content remains bounded above the taskbar in all three profiles. Dell was
+  restored to payload `20955383…`, secure login-at-boot, active service, and
+  zero restarts. Remaining Editor/Media profiles, Browser/VDI boundaries,
+  strict linear scanout, and overall WL-UX-009 readiness remain open.
+- Network profile activation continuation (2026-08-02): This Node/System now
+  mounts the in-process NetworkManager SecretAgent only while the trusted
+  session is viewing the relevant action surface. Profile activation uses
+  typed, provider-issued profile/device object paths, requires a visible
+  second confirmation, and collects credentials through an ephemeral modal;
+  secrets are not persisted, placed in snapshots, or written to audit output.
+  APN/DNS/proxy edits and imported VPN mutation remain unavailable, and the
+  action warns that activation may interrupt underlay/mesh reachability.
+  BigBoy bridge tests pass 1/1; the existing BigBoy `mde-seat` network suite
+  passes 8/8 and focused This Node tests pass 48/48. Recovery/reset, typed
+  local service restart, remaining provider gaps, and physical DRM evidence
+  remain open.
+- Typed service-control continuation (2026-08-02): the existing bounded failed
+  systemd-service observation now has a matching `mde-seat` D-Bus provider.
+  This Node Actions offers only provider-reported, validated `.service` units;
+  the operator must arm and confirm the exact unit, and systemd resolves and
+  restarts it without a shell fallback. Provider refusal, absent system D-Bus,
+  malformed targets, and stale projections remain visible as unavailable or
+  refused; audit output contains only the fixed action label, outcome, and
+  timestamp. BigBoy service-provider tests pass 4/4 and focused This Node tests
+  pass 48/48. Recovery/reset, update application, remaining provider gaps, and
+  physical DRM evidence remain open.

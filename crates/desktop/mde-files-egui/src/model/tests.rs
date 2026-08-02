@@ -13,6 +13,7 @@ struct FixtureBackend {
     rows: Vec<FileRow>,
     local_rows: Map<String, Vec<FileRow>>,
     peer_rows: Map<String, Vec<FileRow>>,
+    list_errors: Map<String, String>,
     next_op: OpId,
     mesh: Option<MeshOverlayBadge>,
 }
@@ -24,6 +25,7 @@ impl FixtureBackend {
             rows,
             local_rows: Map::new(),
             peer_rows: Map::new(),
+            list_errors: Map::new(),
             next_op: 1,
             mesh: None,
         }
@@ -34,6 +36,11 @@ impl FixtureBackend {
     }
     fn with_peer(mut self, id: &str, rows: Vec<FileRow>) -> Self {
         self.peer_rows.insert(id.to_string(), rows);
+        self
+    }
+
+    fn with_list_error(mut self, path: &str, error: &str) -> Self {
+        self.list_errors.insert(path.to_string(), error.to_string());
         self
     }
 }
@@ -48,14 +55,17 @@ impl Backend for FixtureBackend {
     fn peers(&self) -> Vec<Peer> {
         self.peers.clone()
     }
-    fn list(&self, path: &str) -> Vec<FileRow> {
+    fn list(&self, path: &str) -> Result<Vec<FileRow>, BackendError> {
+        if let Some(error) = self.list_errors.get(path) {
+            return Err(BackendError::Rejected(error.clone()));
+        }
         if let Some(id) = path.strip_prefix("peer:") {
-            return self.peer_rows.get(id).cloned().unwrap_or_default();
+            return Ok(self.peer_rows.get(id).cloned().unwrap_or_default());
         }
         if let Some(rows) = self.local_rows.get(path) {
-            return rows.clone();
+            return Ok(rows.clone());
         }
-        self.rows.clone()
+        Ok(self.rows.clone())
     }
     fn audit_log(&self) -> Vec<AuditEntry> {
         Vec::new()
@@ -300,6 +310,22 @@ fn a_re_sort_drops_the_stale_selection() {
     assert_eq!(b.active_tab().selection().len(), 5);
     b.sort_by(0, SortKey::Name); // re-sort → selection invalidated
     assert!(b.active_tab().selection().is_empty());
+}
+
+#[test]
+fn listing_failure_is_retained_instead_of_becoming_an_empty_directory() {
+    let mut b = browser_over(
+        FixtureBackend::new(Vec::new(), Vec::new())
+            .with_list_error("/restricted", "permission denied"),
+    );
+
+    b.navigate(0, Location::Local("/restricted".into()));
+
+    assert!(b.active_tab().rows().is_empty());
+    assert_eq!(
+        b.active_tab().list_error(),
+        Some("rejected: permission denied")
+    );
 }
 
 // ── per-folder view memory ───────────────────────────────────────────────
@@ -1342,9 +1368,16 @@ fn surface_tab_defaults_to_files_and_switches() {
 }
 
 #[test]
+fn peer_sync_label_is_honest_when_no_transfer_worker_exists() {
+    let b = browser_over(roster_backend());
+    assert_eq!(b.peer_sync_label("pine"), "sync unavailable");
+}
+
+#[test]
 fn entry_point_right_click_send_to_target_emits_a_submit() {
     let fake = FakeTransfers::new();
     let mut b = transfers_browser(one_local_file(), fake.clone());
+    b = b.with_music_service_available(true);
     b.click(0, 0);
     let target = b
         .transfer_targets()

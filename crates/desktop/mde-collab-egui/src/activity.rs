@@ -14,6 +14,10 @@ use mde_collab_types::{ActivityEntry, AlertInbox, Severity, SpaceId};
 
 use crate::{icons, relative_age, ActivityFilter, CommunicationsSurface, MeshTeamsApp};
 
+fn theme_color(ui: &egui::Ui, color: egui::Color32) -> egui::Color32 {
+    Style::resolve_color(ui.ctx(), color)
+}
+
 const ACTIVITY_ROW_HEIGHT: f32 = Style::SP_L;
 /// Keep a burst of identical Activity notifications readable without merging
 /// separate incidents that happen later. This matches the notification lane's
@@ -139,7 +143,8 @@ impl CommunicationsSurface {
         let admitted = coalesced_activity_rows(&state.entries, filter, data.alert_inbox());
         if admitted.is_empty() {
             ui.label(
-                egui::RichText::new("No activity for this filter yet.").color(Style::TEXT_DIM),
+                egui::RichText::new("No activity for this filter yet")
+                    .color(theme_color(ui, Style::TEXT_DIM)),
             );
             return;
         }
@@ -163,7 +168,7 @@ impl CommunicationsSurface {
                     let tint = if selected {
                         Style::ACCENT
                     } else {
-                        Style::TEXT_DIM
+                        theme_color(ui, Style::TEXT_DIM)
                     };
                     icons::icon(ui, glyph, Style::SP_M, tint);
                 }
@@ -218,7 +223,11 @@ fn activity_pause_resume_control(
         } else {
             ("Live feed", Style::OK, "Pause feed")
         };
-        ui.label(egui::RichText::new(status).small().color(status_color));
+        ui.label(
+            egui::RichText::new(status)
+                .small()
+                .color(theme_color(ui, status_color)),
+        );
         if ui.button(action).clicked() {
             state.paused = !state.paused;
             if !state.paused {
@@ -335,29 +344,29 @@ fn activity_row(ui: &mut egui::Ui, row: &ActivityRow<'_>, now_unix_ms: i64) {
     let icon_color = row
         .severity
         .map(activity_severity_color)
-        .unwrap_or(Style::TEXT_DIM);
+        .unwrap_or(theme_color(ui, Style::TEXT_DIM));
     ui.horizontal(|ui| {
         icons::icon(ui, entry_icon(&entry.kind_tag), Style::SP_M, icon_color);
         ui.label(
             egui::RichText::new(entry.actor.as_str())
                 .small()
                 .strong()
-                .color(Style::TEXT),
+                .color(theme_color(ui, Style::TEXT)),
         );
-        ui.label(egui::RichText::new(&entry.summary).color(Style::TEXT));
+        ui.label(egui::RichText::new(&entry.summary).color(theme_color(ui, Style::TEXT)));
         if row.count > 1 {
             ui.label(
                 egui::RichText::new(format!("×{}", row.count))
                     .small()
                     .strong()
-                    .color(icon_color),
+                    .color(theme_color(ui, icon_color)),
             );
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(
                 egui::RichText::new(relative_age(now_unix_ms, entry.created_unix_ms))
                     .small()
-                    .color(Style::TEXT_DIM),
+                    .color(theme_color(ui, Style::TEXT_DIM)),
             );
         });
     });

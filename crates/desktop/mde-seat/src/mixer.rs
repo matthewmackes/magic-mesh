@@ -51,6 +51,8 @@ pub struct MixerStatus {
     pub master: MixerStrip,
     /// Every channel strip (host / VM / mesh-remote).
     pub strips: Vec<MixerStrip>,
+    /// Every live capture strip (microphones / capture applications).
+    pub capture: Vec<MixerStrip>,
 }
 
 /// The mixer seam. Production impl ([`PwGraph`]) drives the `PipeWire` graph;
@@ -87,6 +89,8 @@ pub trait MixerClient: Send {
 /// `media.class` of a playback application stream (musicd / voice / a VM / a
 /// remote proxy) — these become channel strips.
 const CLASS_STREAM_OUTPUT: &str = "Stream/Output/Audio";
+/// `media.class` of a capture stream or microphone source.
+const CLASS_STREAM_INPUT: &str = "Stream/Input/Audio";
 /// `media.class` of an output sink — the master strip candidate.
 const CLASS_SINK: &str = "Audio/Sink";
 /// MDE-private prop the mesh audio bridge stamps on a remote peer's proxied
@@ -184,6 +188,7 @@ pub fn fold_graph(dump: &serde_json::Value) -> Result<MixerStatus, SeatError> {
 
     let mut master: Option<(u64, MixerStrip)> = None;
     let mut strips = Vec::new();
+    let mut capture = Vec::new();
 
     for obj in nodes {
         if obj.get("type").and_then(serde_json::Value::as_str) != Some("PipeWire:Interface:Node") {
@@ -226,6 +231,13 @@ pub fn fold_graph(dump: &serde_json::Value) -> Result<MixerStatus, SeatError> {
                 volume,
                 muted,
             }),
+            Some(CLASS_STREAM_INPUT) => capture.push(MixerStrip {
+                id: id.to_string(),
+                name: node_name(props, id),
+                origin: classify_origin(props),
+                volume,
+                muted,
+            }),
             _ => {}
         }
     }
@@ -246,7 +258,18 @@ pub fn fold_graph(dump: &serde_json::Value) -> Result<MixerStatus, SeatError> {
                 .cmp(&b.id.parse::<u64>().unwrap_or(0))
         })
     });
-    Ok(MixerStatus { master, strips })
+    capture.sort_by(|a, b| {
+        a.name.cmp(&b.name).then_with(|| {
+            a.id.parse::<u64>()
+                .unwrap_or(0)
+                .cmp(&b.id.parse::<u64>().unwrap_or(0))
+        })
+    });
+    Ok(MixerStatus {
+        master,
+        strips,
+        capture,
+    })
 }
 
 /// The `PipeWire` graph I/O seam: read the graph (`pw-dump`) and write a node's
@@ -539,7 +562,7 @@ mod tests {
             ),
             node(
                 50,
-                "Audio/Source",
+                CLASS_STREAM_INPUT,
                 "Built-in Mic",
                 &serde_json::json!({}),
                 &vol(&[1.0], false)
@@ -558,8 +581,11 @@ mod tests {
         assert!(!status.master.muted);
         assert_eq!(status.master.origin, StripOrigin::HostSession);
 
-        // Only the three Stream/Output nodes are strips (no source, no port).
+        // Only the three Stream/Output nodes are playback strips; capture is
+        // carried separately so privacy controls can target it safely.
         assert_eq!(status.strips.len(), 3);
+        assert_eq!(status.capture.len(), 1);
+        assert_eq!(status.capture[0].name, "Built-in Mic");
         // Sorted by name: "musicd" < "peer audio" < "win10 guest".
         assert_eq!(status.strips[0].name, "musicd");
         assert_eq!(status.strips[0].origin, StripOrigin::HostSession);

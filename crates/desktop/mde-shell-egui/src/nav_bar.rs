@@ -151,7 +151,11 @@ fn default_taskbar_pins() -> Vec<Surface> {
     // This fallback is used only by deterministic headless/default state. A
     // new runtime profile starts empty and goes through the selector; a
     // migrated profile keeps its decoded ordered pins.
-    PIN_CATALOG[..10].to_vec()
+    PIN_CATALOG
+        .into_iter()
+        .filter(|surface| pin_catalog_surface(*surface))
+        .take(10)
+        .collect()
 }
 
 fn surface_key(surface: Surface) -> &'static str {
@@ -200,7 +204,7 @@ fn surface_from_key(key: &str) -> Option<Surface> {
 }
 
 fn canonical_taskbar_surface(surface: Surface) -> Option<Surface> {
-    match surface {
+    let canonical = match surface {
         Surface::FleetMesh | Surface::Workbench | Surface::MeshView | Surface::Explorer => {
             Some(Surface::FleetMesh)
         }
@@ -210,7 +214,15 @@ fn canonical_taskbar_surface(surface: Surface) -> Option<Surface> {
         Surface::AutoHome | Surface::Timers => None,
         surface if Surface::ALL.contains(&surface) => Some(surface),
         _ => None,
-    }
+    }?;
+    pin_catalog_surface(canonical).then_some(canonical)
+}
+
+/// Surfaces owned by the right-side tool tray are not valid center-nav pins.
+/// Keeping this boundary in the catalog helpers also migrates old persisted
+/// profiles instead of allowing duplicate workspace affordances to survive.
+const fn pin_catalog_surface(surface: Surface) -> bool {
+    !crate::surfaces::is_tool_tray_surface(surface)
 }
 
 fn decode_pinned_surfaces(keys: &[String]) -> Vec<Surface> {
@@ -237,7 +249,7 @@ fn taskbar_surface_label(surface: Surface) -> &'static str {
 fn pin_catalog_index(surface: Surface) -> Option<usize> {
     PIN_CATALOG
         .iter()
-        .position(|candidate| *candidate == surface)
+        .position(|candidate| *candidate == surface && pin_catalog_surface(*candidate))
 }
 
 fn pin_catalog_contains(surface: Surface) -> bool {
@@ -262,6 +274,7 @@ fn filtered_pin_catalog(query: &str) -> Vec<Surface> {
     let query = query.trim().to_ascii_lowercase().replace('-', " ");
     PIN_CATALOG
         .into_iter()
+        .filter(|surface| pin_catalog_surface(*surface))
         .filter(|surface| {
             query.is_empty()
                 || taskbar_surface_label(*surface)
@@ -1305,7 +1318,7 @@ fn control_span(count: usize, edge: f32, gap: f32) -> f32 {
 }
 
 fn floating_center_bounds(screen: egui::Rect, gap: f32) -> (f32, f32) {
-    let left_start = screen.left() + Style::SP_L;
+    let left_start = screen.left();
     let left_cluster_end = left_start + control_span(4, CONTROL_EDGE, gap);
     let right_start = bottom_tray_rect(screen).left()
         - BOTTOM_TRAY_GAP
@@ -1375,8 +1388,12 @@ fn floating_geometry_for_catalog(
         egui::vec2(screen.width(), TASKBAR_H),
     );
     let y = outer.top() + (TASKBAR_H - edge) / 2.0;
-    let left_start = outer.left() + Style::SP_L;
-    let right_x = (bottom_tray_rect(screen).left() - BOTTOM_TRAY_GAP - edge).max(outer.left());
+    // Search is the leading taskbar affordance; do not reserve a decorative
+    // blank lane before its fixed hit target.
+    let left_start = outer.left();
+    // Bottom placement reserves the rightmost taskbar slot for Show Desktop;
+    // the status clock leaves this exact lane immediately to its right.
+    let right_x = (outer.right() - Style::SP_S - edge).max(outer.left());
     let mut controls = Vec::with_capacity(dock_control_capacity_for(pinned_count, surface_count));
     let mut cursor_x = left_start;
     // Search is the first affordance in the left cluster. Keep the same
@@ -1991,7 +2008,10 @@ fn taskbar_context_menu(
                 "Taskbar apps",
                 TypographyRole::Label,
             ));
-            for surface in PIN_CATALOG {
+            for surface in PIN_CATALOG
+                .into_iter()
+                .filter(|surface| pin_catalog_surface(*surface))
+            {
                 let pinned = pinned_surfaces.contains(&surface);
                 let label = if pinned {
                     format!("Unpin {} from taskbar", surface.label())
@@ -2352,8 +2372,8 @@ mod tests {
         ] {
             assert_eq!(
                 filtered_pin_catalog(query),
-                vec![Surface::FleetMesh],
-                "{query:?} must resolve to the single Fleet & Mesh catalog entry"
+                Vec::<Surface>::new(),
+                "{query:?} must not restore a tool-tray-owned center pin"
             );
         }
         for surface in [
@@ -2364,8 +2384,8 @@ mod tests {
         ] {
             assert_eq!(
                 canonical_taskbar_surface(surface),
-                Some(Surface::FleetMesh),
-                "{surface:?} must preserve the canonical taskbar focus"
+                None,
+                "{surface:?} must not become a duplicate center-nav pin"
             );
         }
     }
@@ -2399,7 +2419,11 @@ mod tests {
             Surface::MeshView,
             Surface::Explorer,
         ] {
-            assert_eq!(focused_control_index(&controls, Some(alias)), Some(0));
+            assert_eq!(
+                focused_control_index(&controls, Some(alias)),
+                None,
+                "tool-tray-owned aliases must not focus a duplicate center control"
+            );
         }
         assert_eq!(focused_control_index(&controls, Some(Surface::Browser)), Some(2));
         assert_eq!(focused_control_index(&controls, Some(Surface::MapsLocation)), None);
@@ -2488,7 +2512,7 @@ mod tests {
         assert_eq!(taskbar_surface_label(Surface::InfraCode), "Workloads");
         assert_eq!(
             filtered_pin_catalog("fleet & mesh"),
-            vec![Surface::FleetMesh]
+            Vec::<Surface>::new()
         );
         assert_eq!(filtered_pin_catalog("workloads"), vec![Surface::InfraCode]);
         assert_eq!(filtered_pin_catalog("infra-code"), vec![Surface::InfraCode]);
@@ -2505,14 +2529,14 @@ mod tests {
         state.toggle_pin_selector_surface(Surface::FleetMesh);
         assert_eq!(
             state.pin_selector.selected,
-            vec![Surface::FleetMesh, Surface::InfraCode]
+            vec![Surface::InfraCode]
         );
 
         state.complete_first_boot();
         assert!(!state.is_new_profile());
         assert_eq!(
             state.pinned_surfaces(),
-            &[Surface::FleetMesh, Surface::InfraCode]
+            &[Surface::InfraCode]
         );
         assert!(state.pin_selector.selected.is_empty());
     }
@@ -2728,7 +2752,7 @@ mod tests {
         ];
         assert_eq!(
             decode_pinned_surfaces(&keys),
-            vec![Surface::Browser, Surface::MapsLocation, Surface::ThisNode]
+            vec![Surface::Browser, Surface::MapsLocation]
         );
 
         let prefs = NavBarPrefs {
@@ -2768,7 +2792,7 @@ mod tests {
         // remain authoritative.
         assert_eq!(
             state.pinned_surfaces(),
-            &[Surface::FleetMesh, Surface::Browser, Surface::ThisNode]
+            &[Surface::Browser]
         );
         assert!(!state.is_new_profile());
         assert_ne!(state.pinned_surfaces(), default_taskbar_pins().as_slice());
@@ -2778,12 +2802,9 @@ mod tests {
     fn taskbar_pin_actions_are_bounded_ordered_and_reject_non_catalog_surfaces() {
         let mut state = State::new_profile(DockMode::Floating);
         let original = state.pinned_surfaces().to_vec();
-        assert!(state.pin_surface(Surface::FleetMesh));
-        assert_eq!(state.pinned_surfaces().last(), Some(&Surface::FleetMesh));
         assert!(!state.pin_surface(Surface::FleetMesh));
         assert!(!state.pin_surface(Surface::Workbench));
         assert!(!state.pin_surface(Surface::AutoHome));
-        assert!(state.unpin_surface(Surface::FleetMesh));
         assert_eq!(state.pinned_surfaces(), original.as_slice());
         assert!(!state.unpin_surface(Surface::Workbench));
         assert!(!state.unpin_surface(Surface::AutoHome));
@@ -3426,8 +3447,6 @@ mod tests {
                 Surface::MapsLocation,
                 Surface::Communications,
                 Surface::Files,
-                Surface::Music,
-                Surface::Media,
                 Surface::Browser,
             ] {
                 let control = geometry
@@ -3612,11 +3631,14 @@ mod tests {
         assert_eq!(pinned.kind, ControlKind::PinnedDesktop);
         assert_eq!(pinned.source_index, Some(0));
         let tray = bottom_tray_rect(screen);
-        assert!(
-            placement.rect.right() + BOTTOM_TRAY_GAP <= tray.left(),
-            "placement control must remain left of the bottom system tray"
+        let clock = egui::Rect::from_min_max(
+            egui::pos2(tray.right() - 85.8 - CONTROL_EDGE - BOTTOM_TRAY_GAP, tray.top()),
+            egui::pos2(tray.right() - CONTROL_EDGE - BOTTOM_TRAY_GAP, tray.bottom()),
         );
-        assert!(!placement.rect.intersects(tray));
+        assert!(
+            placement.rect.left() >= clock.right() + BOTTOM_TRAY_GAP,
+            "Show Desktop placement control must sit to the right of the bottom clock"
+        );
         assert_eq!(geometry.outer.width(), screen.width());
 
         let ctx = egui::Context::default();
@@ -3793,16 +3815,14 @@ mod tests {
                 .filter_map(|control| control.surface)
                 .collect::<Vec<_>>(),
             vec![
-                Surface::FleetMesh,
                 Surface::InfraCode,
                 Surface::Desktop,
                 Surface::Terminal,
                 Surface::MapsLocation,
                 Surface::Communications,
                 Surface::Files,
-                Surface::Music,
-                Surface::Media,
                 Surface::Browser,
+                Surface::Bookmarks,
             ],
             "the taskbar must use the searchable pin catalog order"
         );

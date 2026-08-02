@@ -528,17 +528,8 @@ pub struct TransferTarget {
 /// Mesh Share are always offered — they're standing node-state destinations
 /// (Q6/Q9), resolved daemon-side.
 #[must_use]
-pub fn build_targets(peers: &[(String, String)]) -> Vec<TransferTarget> {
-    let mut out = vec![
-        TransferTarget {
-            label: "Music Library".to_string(),
-            // Symbolic: the music lane auto-registers the real Navidrome library
-            // path (Q9); the GUI names the intent, the daemon resolves the path.
-            dest: "music:library".to_string(),
-            method: Method::Music,
-            kind: TargetKind::Music,
-        },
-        TransferTarget {
+pub fn build_targets(peers: &[(String, String)], music_available: bool) -> Vec<TransferTarget> {
+    let mut out = vec![TransferTarget {
             label: "Mesh Share".to_string(),
             // Symbolic: the node lane stages into the Syncthing mesh-share so it
             // replicates (Q6); the daemon owns the `/mnt/mesh-storage` path.
@@ -547,6 +538,14 @@ pub fn build_targets(peers: &[(String, String)]) -> Vec<TransferTarget> {
             kind: TargetKind::MeshShare,
         },
     ];
+    if music_available {
+        out.insert(0, TransferTarget {
+            label: "Music Library".to_string(),
+            dest: "music:library".to_string(),
+            method: Method::Music,
+            kind: TargetKind::Music,
+        });
+    }
     for (id, host) in peers {
         out.push(TransferTarget {
             label: host.clone(),
@@ -997,8 +996,8 @@ mod tests {
         let targets = build_targets(&[
             ("oak-id".into(), "oak".into()),
             ("pine-id".into(), "pine".into()),
-        ]);
-        // Music + Mesh Share are always offered; then one Node target per peer.
+        ], true);
+        // A live music service plus Mesh Share, then one Node target per peer.
         assert_eq!(targets.len(), 4);
         assert_eq!(targets[0].kind, TargetKind::Music);
         assert_eq!(targets[0].method, Method::Music);
@@ -1008,7 +1007,8 @@ mod tests {
         assert_eq!(targets[2].dest, "peer:oak-id");
         assert_eq!(targets[2].method, Method::Node);
         // Peerless still offers the two standing node-state destinations.
-        assert_eq!(build_targets(&[]).len(), 2);
+        assert_eq!(build_targets(&[], false).len(), 1);
+        assert!(build_targets(&[], false).iter().all(|t| t.kind != TargetKind::Music));
     }
 
     // ── filters + newest-relevant ordering ────────────────────────────────────────

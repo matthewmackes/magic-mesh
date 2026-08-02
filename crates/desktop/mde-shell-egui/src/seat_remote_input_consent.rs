@@ -168,17 +168,18 @@ impl RemoteInputConsent {
             {
                 self.arm(bus_root);
             }
+            // Disarm — always available, so revocation is one click away
+            // regardless of the reflected indicator's freshness. Keeping it
+            // in the same wrapped action lane prevents a needless extra row
+            // at large text sizes, where the Phones card must remain above the
+            // direct-DRM taskbar boundary.
+            if ui
+                .button(RichText::new("Disarm now").color(Style::DANGER))
+                .clicked()
+            {
+                self.disarm(bus_root);
+            }
         });
-        ui.add_space(Style::SP_XS);
-
-        // Disarm — always available, so revocation is one click away regardless
-        // of the reflected indicator's freshness.
-        if ui
-            .button(RichText::new("Disarm now").color(Style::DANGER))
-            .clicked()
-        {
-            self.disarm(bus_root);
-        }
 
         if let Some((msg, is_err)) = &self.note {
             ui.add_space(Style::SP_XS);

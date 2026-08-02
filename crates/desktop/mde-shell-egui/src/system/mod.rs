@@ -52,11 +52,14 @@ use mde_seat::hotkeys::HotkeyAction;
 use mde_seat::{
     Avail, Backlight, BtAdapter, BtDevice, BtStatus, Connector, ConnectorStatus, DdcDisplay,
     DisplayLayout, DisplayMode, LidState, MixerStatus, MixerStrip, MonitorId, OutputArrangement,
-    PairingAgent, PowerCaps, PowerVerb, Probe, Seat, SeatError, SeatSnapshot, HOTKEYS,
+    NetworkSecretAgent, PairingAgent, PowerCaps, PowerVerb, Probe, Seat, SeatError, SeatSnapshot,
+    ZbusService,
+    HOTKEYS,
 };
 
 use crate::backdrop;
 use crate::bt_pairing::{pairing_dialog, PairingBridge};
+use crate::network_secrets::{network_secret_dialog, NetworkSecretBridge};
 use crate::power_honor::PowerHonorConfig;
 use crate::power_settings;
 use crate::seat_pump::{connector_key, SnapshotPump};
@@ -231,6 +234,8 @@ pub(crate) struct SystemState {
     /// mixer / Bluetooth writes); the read-only `snapshot()` moved off-thread to the
     /// [`pump`](Self::pump) so the slow I2C/DBus probes never freeze a frame (perf-2).
     seat: Seat,
+    /// Typed systemd service lifecycle provider used by This Node Actions.
+    service: ZbusService,
     /// The latest snapshot, drained from the off-thread [`pump`](Self::pump). `None`
     /// until the pump publishes its first one (within a frame of spawn).
     snapshot: Option<SeatSnapshot>,
@@ -272,11 +277,25 @@ pub(crate) struct SystemState {
     /// Whether an agent registration has already been attempted this active-visit,
     /// so a failure toasts once rather than every frame.
     agent_attempted: bool,
+    /// The registered NetworkManager SecretAgent; live only while a trusted
+    /// This Node/System action workflow is visible.
+    network_agent: Option<NetworkSecretAgent>,
+    /// Whether SecretAgent registration was attempted during this active visit.
+    network_agent_attempted: bool,
+    /// The shell-side SecretAgent prompt mailbox.
+    network_secrets: NetworkSecretBridge,
+    /// Ephemeral input for the current SecretAgent prompt; cleared on submit,
+    /// cancel, provider refusal, and dialog dismissal.
+    network_secret_input: String,
     /// The pairing dialog's PIN/passkey entry buffer (persists across frames).
     pin_input: String,
     /// Control-error alerts raised by a Bluetooth write — drained by the shell into
     /// the one `ToastBridge` after `show()` (§7: a refused/absent write is surfaced).
     pending_toasts: Vec<Toast>,
+    /// Bounded local action outcomes consumed by This Node's Events/Audit
+    /// disclosures. Labels are fixed capability names; provider paths, device
+    /// identities, credentials, and raw error text never enter this history.
+    action_audit: Vec<ActionAuditRecord>,
     /// The POWER-5 idle-suspend + lid-close policy the operator edits in the Power
     /// section — the source of truth the [`crate::power_honor`] honorer reads every
     /// frame. Loaded from disk on start; saved on change. Safe defaults (idle Never,
@@ -356,6 +375,7 @@ impl Default for SystemState {
     fn default() -> Self {
         Self {
             seat: Seat::new(),
+            service: ZbusService::new(),
             snapshot: None,
             pump: None,
             layout: DisplayLayout::default(),
@@ -369,8 +389,13 @@ impl Default for SystemState {
             pairing: PairingBridge::default(),
             agent: None,
             agent_attempted: false,
+            network_agent: None,
+            network_agent_attempted: false,
+            network_secrets: NetworkSecretBridge::default(),
+            network_secret_input: String::new(),
             pin_input: String::new(),
             pending_toasts: Vec::new(),
+            action_audit: Vec::new(),
             power_honor_config: PowerHonorConfig::load(),
             nav: SettingsNav::load(),
             nav_filter: String::new(),
@@ -390,6 +415,16 @@ impl Default for SystemState {
     }
 }
 
+/// One redacted, local action outcome for the unified This Node evidence panes.
+/// The durable provider remains the authority for execution; this is only the
+/// shell's bounded operator-facing record of what it observed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ActionAuditRecord {
+    pub(crate) action: &'static str,
+    pub(crate) outcome: &'static str,
+    pub(crate) occurred_ms: u64,
+}
+
 /// One control action collected during the render borrow, applied after it ends
 /// so the drive can take `&mut` freely.
 ///
@@ -404,6 +439,8 @@ pub(crate) enum SysAction {
     Nudge(MonitorId, bool),
     /// Write a sysfs backlight panel's raw brightness.
     Backlight { name: String, raw: u32 },
+    /// Write a kernel keyboard-backlight LED's raw brightness.
+    KeyboardBacklight { name: String, raw: u32 },
     /// Write an external monitor's DDC/CI brightness (0–100).
     Ddc { bus: String, percent: u8 },
     /// Download the current Bing daily picture into the local wallpaper cache.
@@ -458,6 +495,25 @@ pub(crate) enum SysAction {
 }
 
 impl SystemState {
+    fn record_action_audit(&mut self, action: &'static str, succeeded: bool) {
+        const MAX_RECORDS: usize = 32;
+        if self.action_audit.len() == MAX_RECORDS {
+            self.action_audit.remove(0);
+        }
+        self.action_audit.push(ActionAuditRecord {
+            action,
+            outcome: if succeeded { "accepted" } else { "refused" },
+            occurred_ms: unix_millis(),
+        });
+    }
+
+    /// Drain redacted action outcomes for the unified This Node evidence panes.
+    /// Draining keeps the provider's history bounded and prevents duplicate rows
+    /// when the shell is mounted repeatedly.
+    pub(crate) fn take_action_audit(&mut self) -> Vec<ActionAuditRecord> {
+        std::mem::take(&mut self.action_audit)
+    }
+
     /// The poll seam: drain the newest OFF-THREAD snapshot (never blocking on the
     /// probe — perf-2), then reconcile the arrangement model + brightness seeds
     /// against it.
@@ -628,10 +684,770 @@ impl SystemState {
         self.snapshot.as_ref()
     }
 
+    /// Return the persisted Remote Proofing policy as bounded operator-facing
+    /// facts for This Node. The service plan is derived from the same System
+    /// authority used by Settings; This Node does not own a second config or
+    /// lifecycle path.
+    pub(crate) fn remote_proofing_summary(&self) -> Vec<String> {
+        let plan = self.remote_proofing.service_plan(&self.mesh);
+        let mut facts = vec![
+            format!("Service: {}", if plan.enabled { "enabled" } else { "disabled" }),
+            format!("Bind scope: {:?}", plan.bind_scope),
+            format!("Bind target: {}", plan.bind_address.as_deref().unwrap_or("provider-selected")),
+            format!("Firewall policy: {:?}", plan.firewall),
+            format!("Capture: {}", plan.sunshine_capture),
+            format!("Encoder: {}", plan.sunshine_encoder),
+            format!("Minimum frame target: {} FPS", plan.min_fps_target),
+            format!("Local approval: {}", if plan.require_local_approval { "required" } else { "not required" }),
+            format!("Shadowing indicator: {}", if plan.show_shadowing_indicator { "visible" } else { "hidden" }),
+            format!("Remote input: {}", if plan.allow_remote_input { "allowed" } else { "blocked" }),
+            format!("VNC fallback: {}", if plan.vnc_fallback { "enabled" } else { "disabled" }),
+        ];
+        facts.extend(plan.warnings.into_iter().map(|warning| format!("Warning: {warning}")));
+        facts
+    }
+
+    /// Return the latest typed UPower battery observations for This Node's
+    /// full-page power detail. Detailed local telemetry stays on the trusted
+    /// seat provider and is never serialized into the mesh-status snapshot.
+    pub(crate) fn battery_targets(&self) -> Option<Vec<mde_seat::Battery>> {
+        match &self.snapshot.as_ref()?.batteries {
+            Probe::Present(batteries) => Some(batteries.clone()),
+            Probe::Absent { .. } => None,
+        }
+    }
+
+    /// Return the latest typed UPower line-power observation. A present `None`
+    /// means the provider answered but has no line-power adapter; callers must
+    /// render that as unknown rather than guessing battery power.
+    pub(crate) fn ac_power_target(&self) -> Option<Option<bool>> {
+        match &self.snapshot.as_ref()?.on_ac {
+            Probe::Present(on_ac) => Some(*on_ac),
+            Probe::Absent { .. } => None,
+        }
+    }
+
+    /// Return the latest typed DRM connector inventory for This Node's
+    /// full-page display detail. The list is cloned from the off-thread
+    /// snapshot so rendering never probes DRM or takes a master lock.
+    pub(crate) fn display_targets(&self) -> Option<Vec<mde_seat::Connector>> {
+        match &self.snapshot.as_ref()?.displays {
+            Probe::Present(connectors) => Some(connectors.clone()),
+            Probe::Absent { .. } => None,
+        }
+    }
+
+    /// Return the latest typed keyboard-backlight inventory for This Node's
+    /// Input detail and Actions continuity.
+    pub(crate) fn keyboard_backlight_targets(
+        &self,
+    ) -> Option<Vec<mde_seat::KeyboardBacklight>> {
+        match &self.snapshot.as_ref()?.keyboard_backlights {
+            Probe::Present(backlights) => Some(backlights.clone()),
+            Probe::Absent { .. } => None,
+        }
+    }
+
+    /// Return the latest bounded local thermal/fan observations for This Node's
+    /// Hardware detail. The probe never exposes kernel paths or mutation verbs.
+    pub(crate) fn hardware_targets(&self) -> Option<mde_seat::HardwareStatus> {
+        match &self.snapshot.as_ref()?.hardware {
+            Probe::Present(hardware) => Some(hardware.clone()),
+            Probe::Absent { .. } => None,
+        }
+    }
+
+    /// Return the fresh kernel-advertised platform-profile choices for This
+    /// Node Actions. Mesh observations never authorize this local write.
+    pub(crate) fn platform_profile_targets(&self) -> Option<Vec<String>> {
+        self.hardware_targets()
+            .map(|hardware| hardware.platform_profile_choices)
+    }
+
+    /// Dispatch a provider-advertised platform-profile write after the caller's
+    /// visible confirmation. The target is revalidated against the latest seat
+    /// probe immediately before the fixed-root write.
+    pub(crate) fn dispatch_platform_profile(&mut self, profile: &str) -> bool {
+        let Some(choices) = self.platform_profile_targets() else {
+            self.error = Some("Hardware profile provider is unavailable.".to_owned());
+            self.record_action_audit("Platform profile", false);
+            return false;
+        };
+        if !choices.iter().any(|choice| choice == profile) {
+            self.error = Some("Hardware profile is no longer advertised; refresh required.".to_owned());
+            self.record_action_audit("Platform profile", false);
+            return false;
+        }
+        let ok = match self.seat.set_platform_profile(profile) {
+            Ok(()) => {
+                self.error = None;
+                true
+            }
+            Err(error) => {
+                self.error = Some(format!("Platform profile provider refused the change: {error}"));
+                false
+            }
+        };
+        self.record_action_audit("Platform profile", ok);
+        ok
+    }
+
+    /// Return the latest typed PipeWire mixer graph for This Node's full-page
+    /// Display & Sound detail. The graph remains local to the trusted seat;
+    /// application, VM, and peer names never enter the mesh-status snapshot.
+    pub(crate) fn mixer_target(&self) -> Option<mde_seat::MixerStatus> {
+        match &self.snapshot.as_ref()?.mixer {
+            Probe::Present(mixer) => Some(mixer.clone()),
+            Probe::Absent { .. } => None,
+        }
+    }
+
+    /// Return whether the live typed power provider currently advertises a
+    /// switch to `name`. This is the provider-side validation seam used by the
+    /// unified This Node Actions view; mesh-status observations alone never
+    /// authorize a write.
+    pub(crate) fn can_set_power_profile(&self, name: &str) -> bool {
+        self.snapshot
+            .as_ref()
+            .and_then(|snapshot| match &snapshot.power_profile {
+                Probe::Present(profile) => power_settings::profile_action(profile, name),
+                Probe::Absent { .. } => None,
+            })
+            .is_some()
+    }
+
+    /// Dispatch a This Node power-profile request through the same typed seat
+    /// action used by the System surface. The advertised-profile check happens
+    /// immediately before dispatch, so a stale or fabricated name cannot reach
+    /// the provider. The caller owns the user-facing confirmation step.
+    pub(crate) fn dispatch_power_profile(&mut self, name: &str) -> bool {
+        let Some(action) = self.snapshot.as_ref().and_then(|snapshot| {
+            match &snapshot.power_profile {
+                Probe::Present(profile) => power_settings::profile_action(profile, name),
+                Probe::Absent { .. } => None,
+            }
+        }) else {
+            return false;
+        };
+        self.apply(vec![action]);
+        let ok = self.error.is_none();
+        self.record_action_audit("Power profile", ok);
+        ok
+    }
+
+    /// Return the provider-advertised charge-stop cap for This Node Actions.
+    pub(crate) fn charge_limit_target(&self) -> Option<u8> {
+        self.snapshot.as_ref().and_then(|snapshot| match snapshot.charge_limit {
+            Probe::Present(Some(pct)) => Some(pct),
+            _ => None,
+        })
+    }
+
+    /// Set a bounded charge-stop cap through the typed local seat provider.
+    /// Provider refusal leaves the last confirmed cap untouched and visible.
+    pub(crate) fn dispatch_charge_limit(&mut self, pct: u8) -> bool {
+        if self.charge_limit_target().is_none() || pct > 100 {
+            return false;
+        }
+        self.error = None;
+        self.apply(vec![SysAction::SetChargeThreshold(pct)]);
+        let ok = self.error.is_none() && self.charge_threshold == Some(pct);
+        self.record_action_audit("Battery charge limit", ok);
+        ok
+    }
+
+    /// Return the first live BlueZ adapter's stable provider path and power
+    /// state. This is intentionally a local typed target; the world-readable
+    /// This Node snapshot only exposes aggregate Bluetooth facts.
+    pub(crate) fn bluetooth_power_target(&self) -> Option<(String, bool)> {
+        let snapshot = self.snapshot.as_ref()?;
+        match &snapshot.bluetooth {
+            Probe::Present(status) => status
+                .adapters
+                .first()
+                .map(|adapter| (adapter.path.clone(), adapter.powered)),
+            Probe::Absent { .. } => None,
+        }
+    }
+
+    /// Toggle the live BlueZ adapter through the existing typed seat seam. The
+    /// caller owns confirmation; a refused provider request remains visible as
+    /// an error and is never reported as a successful action.
+    pub(crate) fn dispatch_bluetooth_power(&mut self, path: &str, on: bool) -> bool {
+        let valid_target = self.snapshot.as_ref().is_some_and(|snapshot| {
+            matches!(&snapshot.bluetooth, Probe::Present(status) if status.adapters.iter().any(|adapter| adapter.path == path))
+        });
+        if !valid_target {
+            return false;
+        }
+        let ok = self.bt_result(self.seat.set_bt_powered(path, on), "power");
+        if ok {
+            if let Some(adapter) = self.bt_adapter_mut(path) {
+                adapter.powered = on;
+            }
+        }
+        self.record_action_audit("Bluetooth power", ok);
+        ok
+    }
+
+    /// Return the first live adapter owner and the current typed Bluetooth
+    /// device targets. Device paths stay inside this provider seam; the This
+    /// Node surface renders only the operator-facing device facts.
+    pub(crate) fn bluetooth_device_targets(
+        &self,
+    ) -> Option<(String, Vec<mde_seat::BtDevice>)> {
+        let snapshot = self.snapshot.as_ref()?;
+        let Probe::Present(status) = &snapshot.bluetooth else {
+            return None;
+        };
+        let adapter = status.adapters.first()?.path.clone();
+        Some((adapter, status.devices.clone()))
+    }
+
+    /// Dispatch one bounded Bluetooth device verb through the existing BlueZ
+    /// seat. Targets and state are revalidated against the latest snapshot so
+    /// a stale row cannot mutate a different device or perform an impossible
+    /// transition.
+    pub(crate) fn dispatch_bluetooth_device(
+        &mut self,
+        adapter: &str,
+        device: &str,
+        action: BluetoothDeviceAction,
+    ) -> bool {
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return false;
+        };
+        let Probe::Present(status) = &snapshot.bluetooth else {
+            return false;
+        };
+        let Some(target) = status.devices.iter().find(|candidate| candidate.path == device)
+        else {
+            return false;
+        };
+        let target_paired = target.paired;
+        let target_connected = target.connected;
+        let target_trusted = target.trusted;
+        if status.adapters.iter().all(|candidate| candidate.path != adapter) {
+            return false;
+        }
+        let allowed = match action {
+            BluetoothDeviceAction::Pair => !target_paired,
+            BluetoothDeviceAction::Connect => target_paired && !target_connected,
+            BluetoothDeviceAction::Disconnect => target_connected,
+            BluetoothDeviceAction::ToggleTrusted => target_paired,
+            BluetoothDeviceAction::Forget => target_paired,
+        };
+        if !allowed {
+            return false;
+        }
+        if matches!(action, BluetoothDeviceAction::Pair) {
+            self.sync_pairing_agent(true);
+        }
+        let result = match action {
+            BluetoothDeviceAction::Pair => self.seat.bt_pair(device),
+            BluetoothDeviceAction::Connect => self.seat.bt_connect(device),
+            BluetoothDeviceAction::Disconnect => self.seat.bt_disconnect(device),
+            BluetoothDeviceAction::ToggleTrusted => self.seat.set_bt_trusted(device, !target_trusted),
+            BluetoothDeviceAction::Forget => self.seat.bt_remove_device(adapter, device),
+        };
+        let verb = match action {
+            BluetoothDeviceAction::Pair => "pair",
+            BluetoothDeviceAction::Connect => "connect",
+            BluetoothDeviceAction::Disconnect => "disconnect",
+            BluetoothDeviceAction::ToggleTrusted => "trust",
+            BluetoothDeviceAction::Forget => "forget",
+        };
+        let ok = self.bt_result(result, verb);
+        if !ok {
+            self.record_action_audit("Bluetooth device", false);
+            return false;
+        }
+        match action {
+            BluetoothDeviceAction::Pair => {
+                if let Some(device) = self.bt_device_mut(device) {
+                    device.paired = true;
+                }
+            }
+            BluetoothDeviceAction::Connect => {
+                if let Some(device) = self.bt_device_mut(device) {
+                    device.connected = true;
+                }
+            }
+            BluetoothDeviceAction::Disconnect => {
+                if let Some(device) = self.bt_device_mut(device) {
+                    device.connected = false;
+                }
+            }
+            BluetoothDeviceAction::ToggleTrusted => {
+                if let Some(device) = self.bt_device_mut(device) {
+                    device.trusted = !device.trusted;
+                }
+            }
+            BluetoothDeviceAction::Forget => {
+                if let Some(Probe::Present(status)) = self.snapshot.as_mut().map(|s| &mut s.bluetooth) {
+                    status.devices.retain(|candidate| candidate.path != device);
+                }
+            }
+        }
+        self.record_action_audit("Bluetooth device", true);
+        true
+    }
+
+    /// Return the first connected display target owned by the live typed seat
+    /// layout. The connector label is presentation-only; mutation still uses
+    /// the provider-issued `MonitorId`.
+    pub(crate) fn display_output_target(&self) -> Option<(MonitorId, String, bool)> {
+        self.layout
+            .outputs
+            .iter()
+            .find(|output| output.connected)
+            .map(|output| (output.id.clone(), output.connector.clone(), output.enabled))
+    }
+
+    /// Toggle one connected display through the existing typed layout action.
+    /// The last-console interlock is enforced by the same `DisplayLayout` seam
+    /// used by the System surface.
+    pub(crate) fn dispatch_display_output(&mut self, id: &MonitorId, enabled: bool) -> bool {
+        let valid = self.layout.get(id).is_some_and(|output| {
+            output.connected
+                && (enabled || self.layout.guard_disable(id).is_ok())
+        });
+        if !valid {
+            return false;
+        }
+        self.apply(vec![SysAction::ToggleOutput(id.clone(), enabled)]);
+        let ok = self.layout.get(id).is_some_and(|output| output.enabled == enabled);
+        self.record_action_audit("Display output", ok);
+        ok
+    }
+
+    /// Return the first connected output's provider-issued monitor id, current
+    /// desired mode, and the live connector-advertised modes.
+    pub(crate) fn display_mode_target(
+        &self,
+    ) -> Option<(MonitorId, String, DisplayMode, Vec<DisplayMode>)> {
+        let output = self.layout.outputs.iter().find(|output| output.connected)?;
+        let Probe::Present(connectors) = &self.snapshot.as_ref()?.displays else {
+            return None;
+        };
+        let connector = connectors.iter().find(|connector| connector.name == output.connector)?;
+        let current = output
+            .effective_mode()
+            .or_else(|| connector.preferred_mode().copied())
+            .or_else(|| connector.modes.first().copied())?;
+        if connector.modes.is_empty() {
+            return None;
+        }
+        Some((
+            output.id.clone(),
+            output.connector.clone(),
+            current,
+            connector.modes.clone(),
+        ))
+    }
+
+    /// Apply a mode to the live typed display intent only when the monitor id
+    /// and mode are still advertised by the current connector probe.
+    pub(crate) fn dispatch_display_mode(&mut self, id: &MonitorId, mode: DisplayMode) -> bool {
+        let valid = self.display_mode_target().is_some_and(|(target, _, _, modes)| {
+            target == *id && modes.contains(&mode)
+        });
+        if !valid {
+            return false;
+        }
+        self.apply(vec![SysAction::SetMode(id.clone(), mode)]);
+        let ok = self.layout
+            .get(id)
+            .and_then(OutputArrangement::effective_mode)
+            == Some(mode);
+        self.record_action_audit("Display mode", ok);
+        ok
+    }
+
+    /// Return connected outputs in the current typed arrangement order. The
+    /// connector label is presentation-only; mutations use the stable monitor id.
+    pub(crate) fn display_arrangement_targets(
+        &self,
+    ) -> Option<Vec<(MonitorId, String, (i32, i32))>> {
+        let Probe::Present(_) = &self.snapshot.as_ref()?.displays else {
+            return None;
+        };
+        let targets: Vec<_> = self
+            .layout
+            .outputs
+            .iter()
+            .filter(|output| output.connected && output.enabled)
+            .map(|output| (output.id.clone(), output.connector.clone(), output.position))
+            .collect();
+        (!targets.is_empty()).then_some(targets)
+    }
+
+    /// Nudge one connected output through the same saved DisplayLayout intent
+    /// used by System. The DRM runner remains the live-apply authority.
+    pub(crate) fn dispatch_display_nudge(&mut self, id: &MonitorId, left: bool) -> bool {
+        let valid = self.layout.outputs.iter().filter(|output| output.connected && output.enabled).count() > 1
+            && self.layout.get(id).is_some_and(|output| output.connected && output.enabled);
+        if !valid {
+            return false;
+        }
+        let before = self.layout.get(id).map(|output| output.position);
+        self.apply(vec![SysAction::Nudge(id.clone(), left)]);
+        let ok = self.layout.get(id).map(|output| output.position) != before;
+        self.record_action_audit("Display arrangement", ok);
+        ok
+    }
+
+    /// Return one live brightness target owned by the typed seat. The boolean
+    /// identifies an internal panel (`true`) versus an external DDC display;
+    /// the final value is the provider-advertised raw panel maximum.
+    pub(crate) fn display_brightness_target(&self) -> Option<(String, u8, bool, u32)> {
+        let snapshot = self.snapshot.as_ref()?;
+        if let Probe::Present(displays) = &snapshot.ddc {
+            if let Some(display) = displays.first() {
+                let current = self
+                    .ddc_brightness
+                    .get(&display.bus)
+                    .copied()
+                    .unwrap_or(display.brightness);
+                return Some((display.bus.clone(), current, false, 100));
+            }
+        }
+        if let Probe::Present(backlights) = &snapshot.backlights {
+            if let Some(panel) = backlights.first() {
+                let current = self
+                    .panel_brightness
+                    .get(&panel.name)
+                    .copied()
+                    .unwrap_or_else(|| panel.percent());
+                return Some((panel.name.clone(), current, true, panel.max));
+            }
+        }
+        None
+    }
+
+    /// Apply a bounded brightness step through the provider-issued panel/DDC
+    /// target. The caller owns confirmation; provider refusal remains visible.
+    pub(crate) fn dispatch_display_brightness(
+        &mut self,
+        target: &str,
+        percent: u8,
+        panel: bool,
+        max: u32,
+    ) -> bool {
+        let valid = self
+            .display_brightness_target()
+            .is_some_and(|(id, _, is_panel, target_max)| {
+                id == target && is_panel == panel && (!panel || target_max == max)
+            });
+        if !valid || percent > 100 {
+            return false;
+        }
+        self.error = None;
+        if panel {
+            let raw = u32::from(percent).saturating_mul(max) / 100;
+            self.apply(vec![SysAction::Backlight {
+                name: target.to_owned(),
+                raw,
+            }]);
+            if self.error.is_none() {
+                self.panel_brightness.insert(target.to_owned(), percent);
+            }
+        } else {
+            self.apply(vec![SysAction::Ddc {
+                bus: target.to_owned(),
+                percent,
+            }]);
+            if self.error.is_none() {
+                self.ddc_brightness.insert(target.to_owned(), percent);
+            }
+        }
+        let ok = self.error.is_none();
+        self.record_action_audit("Display brightness", ok);
+        ok
+    }
+
+    /// Return the first live keyboard-backlight target as `(name, percent, max)`.
+    pub(crate) fn keyboard_brightness_target(&self) -> Option<(String, u8, u32)> {
+        let snapshot = self.snapshot.as_ref()?;
+        match &snapshot.keyboard_backlights {
+            Probe::Present(devices) => devices
+                .first()
+                .map(|device| (device.name.clone(), device.percent(), device.max)),
+            Probe::Absent { .. } => None,
+        }
+    }
+
+    /// Apply a bounded keyboard-backlight step through the provider-issued LED
+    /// target. The live max is revalidated immediately before dispatch.
+    pub(crate) fn dispatch_keyboard_brightness(
+        &mut self,
+        target: &str,
+        percent: u8,
+        max: u32,
+    ) -> bool {
+        let valid = self
+            .keyboard_brightness_target()
+            .is_some_and(|(name, _, target_max)| name == target && target_max == max);
+        if !valid || percent > 100 {
+            return false;
+        }
+        self.error = None;
+        let raw = u32::from(percent).saturating_mul(max) / 100;
+        self.apply(vec![SysAction::KeyboardBacklight {
+            name: target.to_owned(),
+            raw,
+        }]);
+        if self.error.is_some() {
+            self.record_action_audit("Keyboard brightness", false);
+            return false;
+        }
+        if let Some(Probe::Present(devices)) = self
+            .snapshot
+            .as_mut()
+            .map(|snapshot| &mut snapshot.keyboard_backlights)
+        {
+            if let Some(device) = devices.iter_mut().find(|device| device.name == target) {
+                device.brightness = raw.min(device.max);
+            }
+        }
+        self.record_action_audit("Keyboard brightness", true);
+        true
+    }
+
+    /// Return the live master mixer target and mute state for This Node Actions.
+    pub(crate) fn master_mute_target(&self) -> Option<(String, bool)> {
+        self.master_strip().map(|strip| (strip.id.clone(), strip.muted))
+    }
+
+    /// Toggle the typed master mixer mute state. The provider result is folded
+    /// into the same cached System state used by the Audio section.
+    pub(crate) fn dispatch_master_mute(&mut self, id: &str, muted: bool) -> bool {
+        let valid = self.master_strip().is_some_and(|strip| strip.id == id);
+        if !valid {
+            return false;
+        }
+        self.apply(vec![SysAction::SetMixerMuted {
+            id: id.to_owned(),
+            muted,
+        }]);
+        let ok = self.master_strip().is_some_and(|strip| strip.muted == muted);
+        self.record_action_audit("Audio mute", ok);
+        ok
+    }
+
+    /// Return the live master playback target and volume for This Node Actions.
+    pub(crate) fn master_volume_target(&self) -> Option<(String, u8)> {
+        self.master_strip()
+            .map(|strip| (strip.id.clone(), strip.volume))
+    }
+
+    /// Change the typed master playback volume. The action layer supplies the
+    /// bounded step and confirmation; the mixer provider owns the write result.
+    pub(crate) fn dispatch_master_volume(&mut self, id: &str, volume: u8) -> bool {
+        let valid = self
+            .master_strip()
+            .is_some_and(|strip| strip.id == id && volume <= 100);
+        if !valid {
+            return false;
+        }
+        self.error = None;
+        self.apply(vec![SysAction::SetMixerVolume {
+            id: id.to_owned(),
+            volume,
+        }]);
+        let ok = self.error.is_none()
+            && self
+                .master_strip()
+                .is_some_and(|strip| strip.volume == volume);
+        self.record_action_audit("Audio volume", ok);
+        ok
+    }
+
+    /// Return the first live capture target and mute state for This Node Actions.
+    pub(crate) fn microphone_mute_target(&self) -> Option<(String, bool)> {
+        self.capture_strip()
+            .map(|strip| (strip.id.clone(), strip.muted))
+    }
+
+    /// Toggle the first typed PipeWire capture strip. The action layer owns
+    /// confirmation; this method validates the provider-issued id and preserves
+    /// the previous state when the provider refuses the write.
+    pub(crate) fn dispatch_microphone_mute(&mut self, id: &str, muted: bool) -> bool {
+        let valid = self
+            .capture_strip()
+            .is_some_and(|strip| strip.id == id);
+        if !valid {
+            return false;
+        }
+        self.error = None;
+        self.apply(vec![SysAction::SetMixerMuted {
+            id: id.to_owned(),
+            muted,
+        }]);
+        let ok = self.error.is_none()
+            && self
+                .capture_strip()
+                .is_some_and(|strip| strip.muted == muted);
+        self.record_action_audit("Microphone mute", ok);
+        ok
+    }
+
+    /// Return the NetworkManager Wi-Fi radio target only when a live typed
+    /// NetworkManager snapshot proves that a Wi-Fi device exists.
+    pub(crate) fn wifi_power_target(&self) -> Option<bool> {
+        match self.snapshot.as_ref()?.network {
+            Probe::Present(ref status)
+                if status.links.iter().any(|link| link.kind == mde_seat::NetworkKind::Wifi) =>
+            {
+                status.wifi_enabled
+            }
+            _ => None,
+        }
+    }
+
+    /// Toggle NetworkManager's global Wi-Fi radio through the typed seat client.
+    /// Profiles, credentials, routes, and DNS remain outside this action.
+    pub(crate) fn dispatch_wifi_power(&mut self, enabled: bool) -> bool {
+        let valid = self.wifi_power_target().is_some();
+        if !valid {
+            return false;
+        }
+        self.error = None;
+        if let Err(error) = self.seat.set_wifi_enabled(enabled) {
+            self.error = Some(format!("Wi-Fi power: {error}"));
+            self.record_action_audit("Wi-Fi power", false);
+            return false;
+        }
+        if let Some(Probe::Present(status)) = self.snapshot.as_mut().map(|snapshot| &mut snapshot.network) {
+            status.wifi_enabled = Some(enabled);
+        }
+        self.record_action_audit("Wi-Fi power", true);
+        true
+    }
+
+    /// Return the fresh credential-free NetworkManager profile inventory. The
+    /// records are read-only until a SecretAgent-backed activation provider is
+    /// available; no SSIDs, APNs, routes, UUIDs, or secrets are exposed here.
+    pub(crate) fn network_profile_targets(&self) -> Option<Vec<mde_seat::NetworkProfile>> {
+        let snapshot = self.snapshot.as_ref()?;
+        match &snapshot.network {
+            Probe::Present(status) => Some(status.profiles.clone()),
+            Probe::Absent { .. } => None,
+        }
+    }
+
+    /// Whether a live non-persistent SecretAgent is mounted for profile
+    /// activation. Without it, This Node keeps every profile action disabled.
+    pub(crate) fn network_secret_agent_ready(&self) -> bool {
+        self.network_agent.is_some()
+    }
+
+    /// Dispatch one provider-issued profile activation. The caller supplies no
+    /// secret and must perform visible confirmation before reaching this seam.
+    pub(crate) fn activate_network_profile(&mut self, profile_path: &str) -> bool {
+        let Some(status) = self.snapshot.as_ref().and_then(|snapshot| match &snapshot.network {
+            Probe::Present(status) => Some(status),
+            Probe::Absent { .. } => None,
+        }) else {
+            return false;
+        };
+        if !self.network_secret_agent_ready()
+            || !status.profiles.iter().any(|profile| profile.path == profile_path)
+        {
+            return false;
+        }
+        match self.seat.activate_network_profile(profile_path, None) {
+            Ok(_) => {
+                self.error = None;
+                self.record_action_audit("Network profile activation", true);
+                true
+            }
+            Err(error) => {
+                self.error = Some(format!("Network profile activation: {error}"));
+                self.record_action_audit("Network profile activation", false);
+                false
+            }
+        }
+    }
+
+    /// Restart one provider-reported failed service after the This Node action
+    /// surface has performed its visible second-click confirmation. The unit
+    /// name is validated again inside the typed provider; no shell command or
+    /// optimistic service state is used.
+    pub(crate) fn restart_service(&mut self, unit: &str) -> bool {
+        if !mde_seat::safe_service_unit(unit) {
+            self.error = Some("Service restart target is malformed.".to_owned());
+            self.record_action_audit("Service restart", false);
+            return false;
+        }
+        match mde_seat::ServiceClient::restart(&self.service, unit) {
+            Ok(()) => {
+                self.error = None;
+                self.record_action_audit("Service restart", true);
+                true
+            }
+            Err(error) => {
+                self.error = Some(format!("Service restart: {error}"));
+                self.record_action_audit("Service restart", false);
+                false
+            }
+        }
+    }
+
+    /// Return one live connected underlay link that can be safely disconnected.
+    /// Mesh overlay and loopback names are excluded so a local connectivity
+    /// action cannot silently tear down the node's mesh safety path.
+    pub(crate) fn network_disconnect_target(&self) -> Option<(String, String)> {
+        let Probe::Present(status) = &self.snapshot.as_ref()?.network else {
+            return None;
+        };
+        status
+            .links
+            .iter()
+            .find(|link| {
+                link.state == mde_seat::NetworkState::Connected
+                    && !matches!(link.interface.as_str(), "nebula1" | "lo")
+            })
+            .map(|link| (link.path.clone(), link.interface.clone()))
+    }
+
+    /// Disconnect the provider-issued link only when the live typed snapshot
+    /// still names the same connected target. A successful provider response
+    /// updates the cache to `Disconnected`; refusal leaves it untouched.
+    pub(crate) fn dispatch_network_disconnect(&mut self, path: &str, interface: &str) -> bool {
+        let valid = self.network_disconnect_target().is_some_and(|(target, name)| {
+            target == path && name == interface
+        });
+        if !valid {
+            self.error = Some("network disconnect: target is stale or protected".to_owned());
+            return false;
+        }
+        self.error = None;
+        if let Err(error) = self.seat.disconnect_network_link(path) {
+            self.error = Some(format!("network disconnect {interface}: {error}"));
+            self.record_action_audit("Network disconnect", false);
+            return false;
+        }
+        if let Some(Probe::Present(status)) = self.snapshot.as_mut().map(|snapshot| &mut snapshot.network) {
+            if let Some(link) = status.links.iter_mut().find(|link| link.path == path) {
+                link.state = mde_seat::NetworkState::Disconnected;
+            }
+        }
+        self.record_action_audit("Network disconnect", true);
+        true
+    }
+
     /// The persisted shell layout profile. Main owns layout-specific chrome and reads
     /// this every frame after [`Self::poll`] reapplies the matching shared density.
     pub(crate) const fn layout_profile(&self) -> LayoutProfile {
         self.appearance.layout_profile
+    }
+
+    /// The operator-selected surface colour scheme. Car mode installs the
+    /// AutoSync3 context skin globally for vehicle chrome, but AutoHome keeps
+    /// the persisted Dark/Light surface palette for readable themed cards.
+    pub(crate) const fn car_surface_color_scheme(&self) -> StyleColorScheme {
+        self.appearance.color_scheme.runtime()
     }
 
     /// The Auto Mode (Car) key bindings, read by the shell's Car key router every
@@ -668,6 +1484,22 @@ impl SystemState {
         self.appearance.layout_profile = profile;
         self.appearance.save();
         self.apply_appearance(ctx);
+    }
+
+    /// The durable accessibility preferences already owned by the System
+    /// provider. This small read seam lets This Node describe the same source
+    /// of truth without cloning or serializing the settings model.
+    pub(crate) fn accessibility_summary(&self) -> (&'static str, &'static str) {
+        (
+            self.appearance.text_scale.label(),
+            self.appearance.motion_mode.label(),
+        )
+    }
+
+    /// The durable human-facing clock zone owned by the System provider.
+    /// Machine, mesh, and audit timestamps remain UTC.
+    pub(crate) fn clock_zone_label(&self) -> &'static str {
+        self.clock.zone.label()
     }
 
     /// U12 Control Center deep-link seam: rest the Settings master-detail rail on
@@ -719,6 +1551,35 @@ impl SystemState {
     /// The logind client's typed errors (a polkit refusal / absent logind).
     pub(crate) fn honor_power(&self, verb: PowerVerb) -> Result<(), SeatError> {
         self.seat.power(verb)
+    }
+
+    /// Return the fresh typed logind capability set for This Node Actions.
+    pub(crate) fn power_action_caps(&self) -> Option<PowerCaps> {
+        self.snapshot.as_ref()?.power.present().copied()
+    }
+
+    /// Execute one logind power verb after the This Node confirmation gate has
+    /// armed it. Capability and provider errors remain visible; no optimistic
+    /// state is invented for host-down actions.
+    pub(crate) fn dispatch_power_action(&mut self, verb: PowerVerb) -> bool {
+        let Some(caps) = self.power_action_caps() else {
+            return false;
+        };
+        if !caps.for_verb(verb).offerable() {
+            return false;
+        }
+        match self.seat.power(verb) {
+            Ok(()) => {
+                self.error = None;
+                self.record_action_audit("Power session", true);
+                true
+            }
+            Err(error) => {
+                self.error = Some(format!("{}: {error}", verb.label()));
+                self.record_action_audit("Power session", false);
+                false
+            }
+        }
     }
 
     /// Render the surface's live content as the HIG **Settings anatomy**
@@ -991,6 +1852,13 @@ impl SystemState {
                         self.error = None;
                     }
                 }
+                SysAction::KeyboardBacklight { name, raw } => {
+                    if let Err(e) = self.seat.set_keyboard_backlight(&name, raw) {
+                        self.error = Some(format!("keyboard backlight {name}: {e}"));
+                    } else {
+                        self.error = None;
+                    }
+                }
                 SysAction::Ddc { bus, percent } => {
                     if let Err(e) = self.seat.set_ddc_brightness(&bus, percent) {
                         self.error = Some(format!("DDC {bus}: {e}"));
@@ -1204,10 +2072,124 @@ impl SystemState {
         }
     }
 
+    /// Register or drop the non-persistent NetworkManager SecretAgent alongside
+    /// the This Node/System action workflow. It is offered only when profile
+    /// inventory exists; a host without profiles never gets an agent on its bus.
+    pub(crate) fn sync_network_secret_agent(&mut self, active: bool) {
+        if !active {
+            self.network_agent = None;
+            self.network_agent_attempted = false;
+            self.network_secrets.refuse();
+            self.network_secret_input.clear();
+            return;
+        }
+        if self.network_agent.is_some() || self.network_agent_attempted {
+            return;
+        }
+        let has_profiles = matches!(
+            self.snapshot.as_ref().map(|snapshot| &snapshot.network),
+            Some(Probe::Present(status)) if !status.profiles.is_empty()
+        );
+        if !has_profiles {
+            return;
+        }
+        self.network_agent_attempted = true;
+        match NetworkSecretAgent::register(Arc::new(self.network_secrets.clone())) {
+            Ok(agent) => self.network_agent = Some(agent),
+            Err(error) => self.pending_toasts.push(Toast::alert(
+                Severity::Warning,
+                String::new(),
+                "NETWORK",
+                format!("Network SecretAgent: {error}"),
+            )),
+        }
+    }
+
+    /// Render the ephemeral NetworkManager credential prompt at shell level so
+    /// it remains reachable from This Node's Actions workflow as well as System.
+    pub(crate) fn show_network_secret_dialog(&mut self, ctx: &egui::Context) {
+        network_secret_dialog(
+            ctx,
+            &self.network_secrets,
+            &mut self.network_secret_input,
+        );
+    }
+
     /// Drain the Bluetooth control-error toasts for the shell to raise into the one
     /// `ToastBridge` (called after `show()`, once the render borrow has ended).
     pub(crate) fn take_toasts(&mut self) -> Vec<Toast> {
         std::mem::take(&mut self.pending_toasts)
+    }
+
+    /// The persisted input policy values used by the native DRM/libinput handoff.
+    /// This is the provider-issued target for the unified This Node Actions view;
+    /// it never derives a control target from the world-readable mesh snapshot.
+    pub(crate) fn input_policy_target(&self) -> (i16, bool) {
+        let cfg = self.mouse_touch.normalized();
+        (cfg.pointer_speed_percent, cfg.touchpad_tap_to_click)
+    }
+
+    /// Apply a bounded pointer-speed change through the same persisted policy and
+    /// native input seam used by Devices → Mouse & Touch. The policy is clamped
+    /// before it reaches the DRM/libinput translator and egui options.
+    pub(crate) fn dispatch_pointer_speed(
+        &mut self,
+        ctx: &egui::Context,
+        target: i16,
+    ) -> bool {
+        if !(-100..=100).contains(&target) {
+            self.error = Some("pointer speed: target is outside the typed -100..100 range".to_owned());
+            return false;
+        }
+        self.mouse_touch.pointer_speed_percent = target;
+        self.mouse_touch = self.mouse_touch.normalized();
+        self.mouse_touch.save();
+        self.apply_mouse_touch(ctx);
+        self.error = None;
+        self.record_action_audit("Pointer speed", true);
+        true
+    }
+
+    /// Apply the persisted touchpad tap-to-click policy through the native
+    /// DRM/libinput input-policy handoff, keeping This Node and System identical.
+    pub(crate) fn dispatch_touchpad_tap(
+        &mut self,
+        ctx: &egui::Context,
+        enabled: bool,
+    ) -> bool {
+        self.mouse_touch.touchpad_tap_to_click = enabled;
+        self.mouse_touch.save();
+        self.apply_mouse_touch(ctx);
+        self.error = None;
+        self.record_action_audit("Tap to click", true);
+        true
+    }
+
+    /// Read the persisted direct-seat touch/gesture policy in stable catalog
+    /// order: two-finger scroll, touchscreen input, edge gestures.
+    pub(crate) fn touch_gesture_policy_target(&self) -> (bool, bool, bool) {
+        let cfg = self.mouse_touch;
+        (cfg.two_finger_scroll, cfg.touchscreen_enabled, cfg.edge_gestures)
+    }
+
+    /// Apply one bounded touch/gesture policy field through the same persisted
+    /// policy and DRM/libinput handoff used by the System surface.
+    pub(crate) fn dispatch_touch_gesture_policy(
+        &mut self,
+        ctx: &egui::Context,
+        policy: TouchGesturePolicy,
+        enabled: bool,
+    ) -> bool {
+        match policy {
+            TouchGesturePolicy::TwoFingerScroll => self.mouse_touch.two_finger_scroll = enabled,
+            TouchGesturePolicy::Touchscreen => self.mouse_touch.touchscreen_enabled = enabled,
+            TouchGesturePolicy::EdgeGestures => self.mouse_touch.edge_gestures = enabled,
+        }
+        self.mouse_touch.save();
+        self.apply_mouse_touch(ctx);
+        self.error = None;
+        self.record_action_audit("Touch gesture policy", true);
+        true
     }
 
     // ── hotkey dispatch (E12-19) ────────────────────────────────────────────
@@ -1319,8 +2301,24 @@ impl SystemState {
     /// The mixer model is output-only (master + playback strips), so there is no
     /// capture strip to mute — an honest not-available state, never a dead key.
     fn toggle_mic_mute(&mut self) -> Option<OsdLevel> {
-        self.error = Some("Microphone mute: no capture strip on this seat.".to_owned());
-        None
+        let Some((id, muted)) = self
+            .capture_strip()
+            .map(|strip| (strip.id.clone(), strip.muted))
+        else {
+            self.error = Some("Microphone mute: no capture strip on this seat.".to_owned());
+            return None;
+        };
+        match self.seat.set_strip_muted(&id, !muted) {
+            Ok(()) => {
+                self.error = None;
+                self.update_mixer_strip(&id, |strip| strip.muted = !muted);
+                Some(OsdLevel::new(OsdKind::Muted, 0.0))
+            }
+            Err(e) => {
+                self.error = Some(format!("microphone mute: {e}"));
+                None
+            }
+        }
     }
 
     /// Nudge display brightness by `delta`: the first sysfs backlight panel if
@@ -1400,6 +2398,14 @@ impl SystemState {
         }
     }
 
+    /// The first capture strip, if the live PipeWire graph exposed one.
+    fn capture_strip(&self) -> Option<&MixerStrip> {
+        match self.snapshot.as_ref()?.mixer {
+            Probe::Present(ref mixer) => mixer.capture.first(),
+            Probe::Absent { .. } => None,
+        }
+    }
+
     /// Update only the cached strip that accepted a successful PipeWire write.
     /// A provider failure leaves the snapshot untouched, so the Audio page never
     /// reports a value that the adapter did not accept.
@@ -1412,6 +2418,10 @@ impl SystemState {
             return;
         }
         if let Some(strip) = mixer.strips.iter_mut().find(|strip| strip.id == id) {
+            update(strip);
+            return;
+        }
+        if let Some(strip) = mixer.capture.iter_mut().find(|strip| strip.id == id) {
             update(strip);
         }
     }
@@ -1716,6 +2726,27 @@ impl SettingsNav {
 const MOUSE_TOUCH_CONFIG_FILE: &str = "settings-mouse-touch.json";
 
 /// Which physical button acts as the primary pointer button.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TouchGesturePolicy {
+    /// Two-finger scrolling on touch-capable devices.
+    TwoFingerScroll,
+    /// Direct touchscreen contacts.
+    Touchscreen,
+    /// Edge gestures that reveal shell affordances.
+    EdgeGestures,
+}
+
+/// One bounded Bluetooth device-management verb exposed by This Node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BluetoothDeviceAction {
+    Pair,
+    Connect,
+    Disconnect,
+    ToggleTrusted,
+    Forget,
+}
+
+/// Which physical button acts as the primary pointer button.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum PrimaryButton {
@@ -1832,6 +2863,7 @@ impl MouseTouchConfig {
             left_handed: cfg.primary_button.left_handed(),
             natural_scroll: cfg.natural_scroll,
             touchscreen_enabled: cfg.touchscreen_enabled,
+            touchpad_tap_to_click: cfg.touchpad_tap_to_click,
             two_finger_scroll: cfg.two_finger_scroll,
             edge_gestures: cfg.edge_gestures,
             long_press_secondary: cfg.long_press_secondary,
@@ -3106,11 +4138,12 @@ fn settings_hover_text(response: egui::Response, text: impl Into<String>) -> egu
 fn settings_popup_visual_scope<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     let previous_style = ui.ctx().style();
     let mut popup_style = (*previous_style).clone();
-    apply_settings_popup_style(&mut popup_style);
+    let scheme = Style::color_scheme(ui.ctx());
+    apply_settings_popup_style(&mut popup_style, scheme);
     ui.ctx().set_style(popup_style);
     let inner = ui
         .scope(|ui| {
-            apply_settings_popup_style(ui.style_mut());
+            apply_settings_popup_style(ui.style_mut(), scheme);
             add(ui)
         })
         .inner;
@@ -3118,37 +4151,38 @@ fn settings_popup_visual_scope<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui:
     inner
 }
 
-fn apply_settings_popup_style(style: &mut egui::Style) {
+fn apply_settings_popup_style(style: &mut egui::Style, scheme: StyleColorScheme) {
+    let palette = Style::palette_for(scheme);
     style.spacing.item_spacing = egui::vec2(Style::SP_XS, Style::SP_XS);
     let visuals = &mut style.visuals;
-    visuals.override_text_color = Some(Style::TEXT);
-    visuals.window_fill = Style::SURFACE;
-    visuals.panel_fill = Style::SURFACE;
-    visuals.extreme_bg_color = Style::SURFACE;
-    visuals.faint_bg_color = Style::SURFACE_HI;
-    visuals.window_stroke = egui::Stroke::new(1.0, Style::BORDER);
-    visuals.selection.bg_fill = Style::SURFACE_HI;
-    visuals.selection.stroke = egui::Stroke::new(1.0, Style::BORDER);
-    visuals.widgets.noninteractive.bg_fill = Style::SURFACE;
-    visuals.widgets.noninteractive.weak_bg_fill = Style::SURFACE;
-    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, Style::TEXT_DIM);
-    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, Style::BORDER);
-    visuals.widgets.inactive.bg_fill = Style::SURFACE;
-    visuals.widgets.inactive.weak_bg_fill = Style::SURFACE;
-    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, Style::TEXT);
-    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, Style::BORDER);
-    visuals.widgets.hovered.bg_fill = Style::SURFACE_HI;
-    visuals.widgets.hovered.weak_bg_fill = Style::SURFACE_HI;
-    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, Style::TEXT);
-    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, Style::BORDER);
-    visuals.widgets.active.bg_fill = Style::SURFACE_HI;
-    visuals.widgets.active.weak_bg_fill = Style::SURFACE_HI;
-    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, Style::TEXT);
-    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, Style::BORDER);
-    visuals.widgets.open.bg_fill = Style::SURFACE_HI;
-    visuals.widgets.open.weak_bg_fill = Style::SURFACE_HI;
-    visuals.widgets.open.fg_stroke = egui::Stroke::new(1.0, Style::TEXT);
-    visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0, Style::BORDER);
+    visuals.override_text_color = Some(palette.text);
+    visuals.window_fill = palette.surface;
+    visuals.panel_fill = palette.surface;
+    visuals.extreme_bg_color = palette.surface;
+    visuals.faint_bg_color = palette.surface_hi;
+    visuals.window_stroke = egui::Stroke::new(1.0, palette.border);
+    visuals.selection.bg_fill = palette.surface_hi;
+    visuals.selection.stroke = egui::Stroke::new(1.0, palette.border);
+    visuals.widgets.noninteractive.bg_fill = palette.surface;
+    visuals.widgets.noninteractive.weak_bg_fill = palette.surface;
+    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, palette.text_dim);
+    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, palette.border);
+    visuals.widgets.inactive.bg_fill = palette.surface;
+    visuals.widgets.inactive.weak_bg_fill = palette.surface;
+    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, palette.text);
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, palette.border);
+    visuals.widgets.hovered.bg_fill = palette.surface_hi;
+    visuals.widgets.hovered.weak_bg_fill = palette.surface_hi;
+    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, palette.text_strong);
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, palette.border);
+    visuals.widgets.active.bg_fill = palette.surface_hi;
+    visuals.widgets.active.weak_bg_fill = palette.surface_hi;
+    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, palette.text_strong);
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, palette.border);
+    visuals.widgets.open.bg_fill = palette.surface_hi;
+    visuals.widgets.open.weak_bg_fill = palette.surface_hi;
+    visuals.widgets.open.fg_stroke = egui::Stroke::new(1.0, palette.text_strong);
+    visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0, palette.border);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3501,7 +4535,8 @@ fn mouse_touch_section(ui: &mut egui::Ui, config: &mut MouseTouchConfig) {
                 ComboBox::from_id_salt(ui.id().with("primary-button"))
                     .selected_text(config.primary_button.label())
                     .show_ui(ui, |ui| {
-                        apply_settings_popup_style(ui.style_mut());
+                        let scheme = Style::color_scheme(ui.ctx());
+                        apply_settings_popup_style(ui.style_mut(), scheme);
                         for choice in PrimaryButton::ALL {
                             ui.selectable_value(&mut config.primary_button, choice, choice.label());
                         }
@@ -4222,7 +5257,8 @@ fn mode_picker(
                         .size(Style::SMALL),
                 )
                 .show_ui(ui, |ui| {
-                    apply_settings_popup_style(ui.style_mut());
+                    let scheme = Style::color_scheme(ui.ctx());
+                    apply_settings_popup_style(ui.style_mut(), scheme);
                     for (width, height) in resolutions {
                         let selected = current_resolution == (width, height);
                         if ui
@@ -4252,7 +5288,8 @@ fn mode_picker(
                     RichText::new(format!("{} Hz", current.refresh_hz)).size(Style::SMALL),
                 )
                 .show_ui(ui, |ui| {
-                    apply_settings_popup_style(ui.style_mut());
+                    let scheme = Style::color_scheme(ui.ctx());
+                    apply_settings_popup_style(ui.style_mut(), scheme);
                     for mode in &refresh_modes {
                         let selected = *mode == current;
                         if ui
@@ -4845,7 +5882,8 @@ fn key_mapping_section(ui: &mut egui::Ui, car_keys: &mut crate::car_keymap::CarK
                 ComboBox::from_id_salt(ui.id().with(("car-key", label)))
                     .selected_text(selected.map_or("—", CarAction::label))
                     .show_ui(ui, |ui| {
-                        apply_settings_popup_style(ui.style_mut());
+                        let scheme = Style::color_scheme(ui.ctx());
+                        apply_settings_popup_style(ui.style_mut(), scheme);
                         ui.selectable_value(&mut selected, None, "—");
                         for action in CarAction::ALL {
                             ui.selectable_value(&mut selected, Some(action), action.label());

@@ -783,16 +783,10 @@ impl CommunicationsSurface {
         // Construct owns one shared workspace identity strip. The channel/app
         // header below remains Mesh Teams domain chrome; it must not also carry
         // the host workspace title or shell session control.
-        let menus: &[mde_egui::menubar::Menu<&'static str>] = &[];
-        let status: &[mde_egui::menubar::StatusChip] = &[];
-        let model = mde_egui::menubar::MenuBarModel {
-            title: "Mesh Teams",
-            accent: mde_egui::Style::ACCENT,
-            menus,
-            status,
-        };
-        let _ = mde_egui::menubar::MenuBar::show(ui, &model);
-        ui.add_space(mde_egui::Style::SP_S);
+        let _ = mde_egui::nav_chrome::AppFrame::new("Mesh Teams")
+            .leading_title()
+            .show(ui);
+        ui.add_space(mde_egui::Style::SP_XS);
 
         // Keep the workspace body usable on narrow direct-DRM seats. The
         // Communications rails are supporting navigation; the shell's shared

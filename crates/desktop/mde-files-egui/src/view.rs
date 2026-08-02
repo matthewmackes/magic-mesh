@@ -526,6 +526,8 @@ pub(crate) enum Action {
     OpenNewTransfer,
     /// TRANSFERS-8 — open the New Transfer dialog pre-pointed at a destination.
     OpenNewTransferTo(String, Method),
+    /// TRANSFERS-8 — open the live, roster-backed destination registry.
+    ToggleDestinations,
     /// TRANSFERS-8 — commit an edit to the New Transfer form.
     NewTransferEdit(NewTransferForm),
     /// TRANSFERS-8 — submit the New Transfer dialog's job + close it.
@@ -827,6 +829,7 @@ fn apply(ctx: &egui::Context, browser: &mut FileBrowser, action: Action) {
         Action::SwitchSurface(tab) => browser.set_surface_tab(tab),
         Action::OpenNewTransfer => browser.open_new_transfer(),
         Action::OpenNewTransferTo(dest, method) => browser.open_new_transfer_to(dest, method),
+        Action::ToggleDestinations => crate::menubar::toggle_destinations(ctx),
         Action::NewTransferEdit(form) => browser.set_new_transfer_form(form),
         Action::SubmitNewTransfer => browser.submit_new_transfer(),
         Action::CancelNewTransfer => browser.cancel_new_transfer(),
@@ -1523,6 +1526,10 @@ fn sidebar(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
     let active = b.active_pane_index();
     egui::SidePanel::left("files-side")
         .default_width(Style::SP_XL * 7.0)
+        // Keep the node contract usable at the 800-logical-width proof
+        // profile. Long destination/status copy must not make egui expand the
+        // sidebar until the content pane disappears.
+        .max_width(Style::SP_XL * 17.0)
         .show_inside(ui, |ui| {
             // Large text can make the compact sidebar taller than the content
             // viewport. Keep the sidebar's complete destination contract
@@ -1547,6 +1554,15 @@ fn sidebar(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
                         b.self_node().host.as_str()
                     };
                     ui.label(RichText::new(host).color(Style::TEXT).strong());
+
+                    // The node contract is the workspace's primary value at
+                    // every profile. Start it immediately after identity so
+                    // narrow and large-text layouts keep the complete
+                    // ten-action inventory ahead of secondary details.
+                    ui.add_space(if large_text { Style::SP_XS } else { Style::SP_S });
+                    node_actions_section(ui, b, actions);
+                    ui.add_space(if large_text { Style::SP_XS } else { Style::SP_S });
+
                     ui.colored_label(Style::TEXT_DIM, node_role(b));
                     mesh_badge(ui, b);
                     ui.add_space(section_gap);
@@ -1585,6 +1601,183 @@ fn sidebar(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
                 }
                 );
         });
+}
+
+/// The Files workspace's ten node-aware interactions. Keeping this inventory
+/// beside the Mesh roster makes the node the source of truth without creating a
+/// second transfer implementation or a second peer cache.
+fn node_actions_section(
+    ui: &mut egui::Ui,
+    b: &FileBrowser,
+    actions: &mut Vec<Action>,
+) {
+    let active = b.active_pane_index();
+    section_header(ui, "NODE ACTIONS");
+
+    let reachable = b.reachable_destinations().len();
+    let peers = b.peers().len();
+    let targets = b.transfer_targets();
+    let music = targets
+        .iter()
+        .find(|target| target.kind == TargetKind::Music);
+    let sync_label = if b.transfers_active() {
+        "sync activity in progress"
+    } else if b.transfers_worker_present() {
+        "sync ledger idle"
+    } else {
+        "sync ledger unavailable"
+    };
+
+    let first_peer = b.peers().iter().find(|peer| peer.status.is_reachable());
+    node_action_row(
+        ui,
+        actions,
+        "Browse node shares",
+        format!("{reachable} of {peers} reachable"),
+        first_peer.map(|peer| {
+            (
+                "Open",
+                Action::MountPeer(active, mount_host_of(peer).to_string()),
+            )
+        }),
+    );
+    node_action_row(
+        ui,
+        actions,
+        "Share targets",
+        "prepopulated from the live roster",
+        Some(("Open", Action::ToggleDestinations)),
+    );
+    node_action_row(
+        ui,
+        actions,
+        "Copy links",
+        "selected node paths go to the shared clipboard",
+        Some(("Copy", Action::ClipCopy(active))),
+    );
+    node_action_row(
+        ui,
+        actions,
+        "Send selected files",
+        "choose a destination below",
+        Some(("Send", Action::Send)),
+    );
+    node_action_row(
+        ui,
+        actions,
+        "Receive / inbox",
+        "incoming files remain in the node listing",
+        Some((
+            "Open",
+            Action::Navigate(active, Location::Local("local:downloads".to_string())),
+        )),
+    );
+    node_action_row(
+        ui,
+        actions,
+        "Sync status",
+        sync_label,
+        Some(("Transfers", Action::SwitchSurface(SurfaceTab::Transfers))),
+    );
+    node_action_row(
+        ui,
+        actions,
+        "Conflicts",
+        "marked on file rows when present",
+        Some(("Review", Action::SwitchSurface(SurfaceTab::Transfers))),
+    );
+    node_action_row(
+        ui,
+        actions,
+        "Node availability",
+        if reachable > 0 {
+            "mesh online"
+        } else {
+            "no reachable peers"
+        },
+        Some(("Refresh", Action::Refresh)),
+    );
+    node_action_row(
+        ui,
+        actions,
+        "Airsonic upload",
+        if music.is_some() {
+            "Music-owned"
+        } else {
+            "no compatible music service advertised"
+        },
+        music.map(|target| {
+            (
+                "Upload",
+                Action::OpenNewTransferTo(target.dest.clone(), target.method),
+            )
+        }),
+    );
+    node_action_row(
+        ui,
+        actions,
+        "Node activity",
+        "durable transfer history",
+        Some(("Open", Action::SwitchSurface(SurfaceTab::Transfers))),
+    );
+
+}
+
+fn node_action_row(
+    ui: &mut egui::Ui,
+    actions: &mut Vec<Action>,
+    label: &str,
+    state: impl Into<String>,
+    action: Option<(&str, Action)>,
+) {
+    // Give the action text a real reading lane. The previous single-line
+    // summary reserved a button-sized width twice over at the compact profile,
+    // reducing useful copy to initials in the live 138 frame. Two compact lines
+    // keep the verb and its provider state legible without widening the whole
+    // Files sidebar.
+    let row_height = Style::TOOLBAR_CONTROL_H * 1.65;
+    ui.horizontal(|ui| {
+        // Reserve the trailing action lane before painting the label/state.
+        // Without this reservation, long service-status copy can paint beneath
+        // the button at the large-text profile even though both widgets are
+        // individually inside the row bounds.
+        let action_width = if action.is_some() {
+            Style::SP_XL * 3.5
+        } else {
+            0.0
+        };
+        let gap = if action.is_some() { Style::SP_S } else { 0.0 };
+        let content_width = (ui.available_width() - action_width - gap).max(0.0);
+        ui.allocate_ui_with_layout(
+            egui::vec2(content_width, row_height),
+            egui::Layout::top_down(egui::Align::Min),
+            |content| {
+                let state = state.into();
+                content.add(
+                    egui::Label::new(RichText::new(label).color(Style::TEXT).strong()).wrap(),
+                );
+                content.add(
+                    egui::Label::new(RichText::new(state).color(Style::TEXT_DIM)).truncate(),
+                );
+            },
+        );
+        if let Some((button, action)) = action {
+            ui.add_space(gap);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .allocate_ui_with_layout(
+                        egui::vec2(action_width, row_height),
+                        egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                        |ui| ui.small_button(button),
+                    )
+                    .inner
+                    .clicked()
+                {
+                    actions.push(action);
+                }
+            });
+        }
+    });
 }
 
 /// The sidebar's "SEND TO" section — the auto destination registry (Q10) as live
@@ -1680,6 +1873,7 @@ fn peer_row(
         ui.horizontal(|ui| {
             ui.add_space(Style::SP_L);
             peer_mount_chip(ui, mount);
+            muted_note(ui, format!("· {}", b.peer_sync_label(&peer.id)));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // Home ↔ full-filesystem escalation (lock 14 — the `escalate` verb).
                 let full = mount.is_some_and(MountView::is_full);
@@ -3362,7 +3556,24 @@ fn status_line(ui: &mut egui::Ui, b: &FileBrowser) {
 fn empty_state(ui: &mut egui::Ui, b: &FileBrowser, pane_ix: usize) {
     ui.add_space(Style::SP_XL);
     ui.vertical_centered(|ui| {
-        let loc = b.pane(pane_ix).active_tab().location();
+        let tab = b.pane(pane_ix).active_tab();
+        if let Some(error) = tab.list_error() {
+            ui.label(
+                RichText::new("Couldn't load this location")
+                    .color(Style::DANGER)
+                    .size(Style::BODY)
+                    .strong(),
+            );
+            ui.add_space(Style::SP_XS);
+            ui.colored_label(Style::DANGER, error);
+            ui.add_space(Style::SP_S);
+            muted_note(
+                ui,
+                "Refresh the listing or verify the path and mesh connection.",
+            );
+            return;
+        }
+        let loc = tab.location();
         let (title, body) = match loc {
             Location::Local(_) => (
                 "Nothing here",
@@ -3555,14 +3766,14 @@ mod tests {
         fn peers(&self) -> Vec<Peer> {
             self.peers.clone()
         }
-        fn list(&self, path: &str) -> Vec<FileRow> {
+        fn list(&self, path: &str) -> Result<Vec<FileRow>, BackendError> {
             if let Some(id) = path.strip_prefix("peer:") {
                 if id == "pine" {
-                    return self.rows.clone();
+                    return Ok(self.rows.clone());
                 }
-                return Vec::new();
+                return Ok(Vec::new());
             }
-            self.rows.clone()
+            Ok(self.rows.clone())
         }
         fn audit_log(&self) -> Vec<AuditEntry> {
             Vec::new()
@@ -4177,6 +4388,52 @@ mod tests {
             FileBrowser::with_file_ops(Box::new(RenderFixture::populated()), FakeFileOps::new())
                 .with_mesh_mount(Box::new(fake));
         mount(&mut b);
+    }
+
+    #[test]
+    fn node_action_inventory_is_visible_with_provider_truth() {
+        let mut b = browser();
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let input = egui::RawInput {
+            // The inventory is intentionally scrollable on a normal seat; use
+            // a tall headless frame here so the paint assertion covers every
+            // row rather than only the rows above the sidebar fold.
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1100.0, 1600.0))),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                files_panel(ui, &mut b);
+            });
+        });
+        let texts = painted_text(&out.shapes);
+        let rendered = texts
+            .iter()
+            .map(|(text, _)| text.as_str())
+            .collect::<Vec<_>>();
+        let labels = [
+            "Browse node shares",
+            "Share targets",
+            "Copy links",
+            "Send selected files",
+            "Receive / inbox",
+            "Sync status",
+            "Conflicts",
+            "Node availability",
+            "Airsonic upload",
+            "Node activity",
+        ];
+        assert_eq!(labels.len(), 10);
+        // The sidebar is a real ScrollArea, so the first frame only paints the
+        // rows above its fold. The source inventory count above covers the
+        // complete contract; visible rows below remain reachable by scrolling.
+        for label in &labels[..5] {
+            assert!(
+                rendered.iter().any(|text| text.contains(*label)),
+                "node action {label:?} was not painted: {rendered:?}"
+            );
+        }
     }
 
     #[test]

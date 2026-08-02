@@ -53,7 +53,7 @@ use mde_theme::brand::icons::IconId;
 use crate::chrome::NodeGrades;
 use crate::construct::ConstructChrome;
 use crate::status::{segment_label, severity_color, severity_label, StatusSegment, StatusSegments};
-use crate::surfaces::{icon_texture, Surface};
+use crate::surfaces::{icon_texture, Surface, TOOL_TRAY_SURFACES};
 
 /// The locked strip height (Q12: "~24px").
 pub(crate) const STATUS_BAR_H: f32 = 24.0;
@@ -77,13 +77,7 @@ pub(crate) const RIGHT_SEGMENTS: [StatusSegment; 4] = [
 
 /// Construct-owned workspaces promoted into the persistent notification/tool
 /// tray. The navigation rail remains intact in both placement modes.
-pub(crate) const WORKSPACE_TRAY_SURFACES: [Surface; 5] = [
-    Surface::FleetMesh,
-    Surface::Music,
-    Surface::Media,
-    Surface::Phones,
-    Surface::ThisNode,
-];
+pub(crate) const WORKSPACE_TRAY_SURFACES: [Surface; 5] = TOOL_TRAY_SURFACES;
 const WORKSPACE_TRAY_ICON_W: f32 = STATUS_BAR_H;
 const WORKSPACE_TRAY_GAP: f32 = Style::SP_XS;
 
@@ -97,17 +91,20 @@ pub(crate) enum StatusControl {
     Network,
     /// Open the Control Center's display/brightness controls.
     Brightness,
+    /// Open the Control Center's live power and battery controls.
+    Power,
 }
 
 impl StatusControl {
     /// The fixed, deterministic order used by the top rail.
-    pub(crate) const ALL: [Self; 3] = [Self::Volume, Self::Network, Self::Brightness];
+    pub(crate) const ALL: [Self; 4] = [Self::Volume, Self::Network, Self::Brightness, Self::Power];
 
     const fn index(self) -> usize {
         match self {
             Self::Volume => 0,
             Self::Network => 1,
             Self::Brightness => 2,
+            Self::Power => 3,
         }
     }
 
@@ -117,6 +114,7 @@ impl StatusControl {
             Self::Volume => IconId::Volume,
             Self::Network => IconId::Signal,
             Self::Brightness => IconId::DisplaySettings,
+            Self::Power => IconId::PowerBattery,
         }
     }
 
@@ -125,6 +123,7 @@ impl StatusControl {
             Self::Volume => "Volume",
             Self::Network => "Network",
             Self::Brightness => "Screen brightness",
+            Self::Power => "Power & Battery",
         }
     }
 }
@@ -134,6 +133,7 @@ impl StatusControl {
 const STATUS_CONTROL_W: f32 = STATUS_BAR_H;
 const STATUS_CONTROL_GAP: f32 = Style::SP_XS;
 const STATUS_CONTROL_ICON: f32 = Style::ICON_M;
+const BOTTOM_TRAY_PIN_W: f32 = 40.0;
 /// Keep a usable clock lane when a window is narrower than the normal menu
 /// bar. The lane may shrink below this value on an extremely small surface,
 /// but the controls must never consume the centered clock's hit target.
@@ -305,6 +305,7 @@ fn status_control_id(control: StatusControl) -> egui::Id {
             StatusControl::Volume => "volume",
             StatusControl::Network => "network",
             StatusControl::Brightness => "brightness",
+            StatusControl::Power => "power",
         },
     ))
 }
@@ -628,9 +629,9 @@ fn paint_workspace_tray(
     construct: &mut ConstructChrome,
     active_surface: Option<Surface>,
     id_prefix: &'static str,
+    foreground: egui::Color32,
 ) {
     let painter = ui.painter().clone();
-    let text = Style::resolve_color(ui.ctx(), Style::TEXT);
     let hover = Style::resolve_color(ui.ctx(), Style::SURFACE_HI);
     let icon_w = WORKSPACE_TRAY_ICON_W.min(tray.height()).max(0.0);
     if icon_w <= 0.0 || tray.width() <= 0.0 {
@@ -659,7 +660,12 @@ fn paint_workspace_tray(
         if response.hovered() {
             painter.rect_filled(rect.shrink(2.0), Style::RADIUS_S, hover);
         }
-        if let Some(texture) = icon_texture(ui.ctx(), surface.icon_id(), Style::ICON_M, text) {
+        if let Some(texture) = icon_texture(
+            ui.ctx(),
+            surface.icon_id(),
+            Style::ICON_M,
+            foreground,
+        ) {
             let draw = egui::Rect::from_center_size(
                 rect.center(),
                 egui::vec2(Style::ICON_M, Style::ICON_M),
@@ -668,7 +674,7 @@ fn paint_workspace_tray(
                 texture.id(),
                 draw,
                 egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-                text,
+                foreground,
             );
         }
         if active {
@@ -706,8 +712,11 @@ fn bottom_tray(
     // it. The taskbar already paints the shared backing and top hairline.
     let panel = tray;
     let surface_hi = Style::resolve_color(ui.ctx(), Style::SURFACE_HI);
-    let text = Style::resolve_color(ui.ctx(), Style::TEXT);
-    let text_dim = Style::resolve_color(ui.ctx(), Style::TEXT_DIM);
+    // The taskbar is an intentionally opaque black surface in both Quazar
+    // schemes. Resolving the page TEXT token in Light would produce dark ink
+    // on black, so keep this foreground on the taskbar palette.
+    let text = Style::NAV_BAR_ICON;
+    let text_dim = Style::NAV_BAR_ICON.gamma_multiply(0.68);
     let opacity = opacity.clamp(0.0, 1.0);
 
     let now = crate::timers::display_unix();
@@ -715,9 +724,13 @@ fn bottom_tray(
     let (year, month, day) = crate::chat::civil_from_days(now.div_euclid(86_400));
     let date = format!("{month:02}/{day:02}/{year:04}");
     let clock_width = 85.8_f32.min((panel.width() * 0.30).max(39.6));
+    let pin_left = panel.right() - BOTTOM_TRAY_PIN_W;
     let clock = egui::Rect::from_min_max(
-        egui::pos2(panel.right() - clock_width, panel.top()),
-        panel.right_bottom(),
+        egui::pos2(
+            (pin_left - Style::SP_XS - clock_width).max(panel.left()),
+            panel.top(),
+        ),
+        egui::pos2((pin_left - Style::SP_XS).max(panel.left()), panel.bottom()),
     );
     let clock_response = ui.interact(
         clock,
@@ -780,6 +793,7 @@ fn bottom_tray(
         construct,
         active_surface,
         "construct-bottom-system-tray",
+        Style::NAV_BAR_ICON,
     );
 
     let health = egui::pos2(panel.left() + workspace_rect.width() + 8.0, panel.center().y);
@@ -795,13 +809,18 @@ fn bottom_tray(
             egui::WidgetType::Button,
             ui.is_enabled(),
             format!(
-                "Mesh health: {}",
+                "This Node health: {} — open hardware center",
                 severity_label(segments.get(StatusSegment::Mesh))
             ),
         )
     });
     if health_response.clicked() {
-        construct.control_center_open = true;
+        // WL-UX-011 — the global health authority drills into the unified
+        // This Node center. The typed one-frame workspace handoff keeps the
+        // status bar independent of shell navigation while preserving a single
+        // route owner in `Shell::mount_status_bar_slot`.
+        construct.request_workspace_tray(crate::surfaces::Surface::ThisNode);
+        construct.control_center_open = false;
     }
 
     let icon_right = clock.left() - Style::SP_XS;
@@ -1019,9 +1038,10 @@ fn strip(
         x += w;
     }
     if cluster.clicked() {
-        // PLATFORM-INTERFACES §2.3 — "Control Center | click status-bar right
-        // cluster": the pub open flag IS the sanctioned seam.
-        construct.control_center_open = !construct.control_center_open;
+        // WL-UX-011 — the grade/status cluster is the existing global health
+        // authority; selecting it opens the unified This Node hardware center.
+        construct.request_workspace_tray(crate::surfaces::Surface::ThisNode);
+        construct.control_center_open = false;
     }
 
     paint_workspace_tray(
@@ -1030,6 +1050,7 @@ fn strip(
         construct,
         active_surface,
         "construct-status-bar",
+        Style::resolve_color(ui.ctx(), Style::TEXT),
     );
 
     for control in StatusControl::ALL {
@@ -1278,6 +1299,20 @@ mod tests {
             .is_some(),
             "mesh health must remain a keyboard/click reachable target"
         );
+    }
+
+    #[test]
+    fn bottom_taskbar_foreground_stays_white_when_shell_is_light() {
+        // The bottom tray is painted over the shared black taskbar, so it must
+        // not inherit the page's Light-mode dark text token.
+        assert_eq!(
+            Style::resolve_color_for_scheme(
+                mde_egui::StyleColorScheme::Light,
+                Style::NAV_BAR_ICON,
+            ),
+            egui::Color32::WHITE
+        );
+        assert_eq!(Style::NAV_BAR_ICON, egui::Color32::WHITE);
     }
 
     #[test]
@@ -1548,7 +1583,7 @@ mod tests {
     }
 
     #[test]
-    fn clicking_the_right_cluster_toggles_the_control_center() {
+    fn clicking_the_right_cluster_drills_into_this_node_health_center() {
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let mut construct = ConstructChrome::default();
@@ -1586,14 +1621,15 @@ mod tests {
             .rect
             .center();
         click(&ctx, &mut construct, &segments, &grades, pos);
-        // PLATFORM-INTERFACES §2.3 — right cluster click = Control Center.
-        assert!(construct.control_center_open, "cluster click opens CC");
-        assert!(
-            !construct.notification_center_open,
-            "NC untouched by the cluster"
+        assert_eq!(
+            construct.take_workspace_tray_target(),
+            Some(crate::surfaces::Surface::ThisNode),
+            "cluster click drills into This Node"
         );
-        click(&ctx, &mut construct, &segments, &grades, pos);
-        assert!(!construct.control_center_open, "second click closes");
+        assert!(
+            !construct.control_center_open,
+            "health drilldown does not open Control Center"
+        );
     }
 
     #[test]
@@ -1606,7 +1642,10 @@ mod tests {
         let controls = status_controls_rect(bar);
         assert!((controls.right() - (bar.right() - Style::SP_S)).abs() < f32::EPSILON);
         assert!(
-            (status_controls_width() - (STATUS_CONTROL_W * 3.0 + STATUS_CONTROL_GAP * 2.0)).abs()
+            (status_controls_width()
+                - (STATUS_CONTROL_W * StatusControl::ALL.len() as f32
+                    + STATUS_CONTROL_GAP * (StatusControl::ALL.len() - 1) as f32))
+                .abs()
                 < f32::EPSILON
         );
         for (index, control) in StatusControl::ALL.into_iter().enumerate() {
@@ -1621,7 +1660,7 @@ mod tests {
             );
             assert!(rect.right() <= controls.right());
         }
-        let last = status_control_rect(bar, StatusControl::Brightness);
+        let last = status_control_rect(bar, StatusControl::Power);
         assert!((last.right() - controls.right()).abs() < f32::EPSILON);
     }
 
@@ -1822,7 +1861,8 @@ mod tests {
         assert_eq!(StatusControl::Volume.icon(), IconId::Volume);
         assert_eq!(StatusControl::Network.icon(), IconId::Signal);
         assert_eq!(StatusControl::Brightness.icon(), IconId::DisplaySettings);
-        assert_eq!(StatusControl::ALL.len(), 3);
+        assert_eq!(StatusControl::Power.icon(), IconId::PowerBattery);
+        assert_eq!(StatusControl::ALL.len(), 4);
     }
 
     #[test]

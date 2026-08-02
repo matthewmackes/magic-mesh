@@ -340,6 +340,17 @@ fn status_line<E: MediaEngine>(ui: &mut egui::Ui, controller: &MediaController<E
 /// configured Jellyfin servers (MEDIA-10 — browse + play), and an honest note
 /// about where mesh sources land (MEDIA-14/15, not yet wired).
 fn sources_view<E: MediaEngine>(ui: &mut egui::Ui, controller: &mut MediaController<E>) {
+    // The bottom taskbar removes a fixed-height lane from the shell.  On the
+    // 800-logical-pixel proof viewport, large text leaves very little vertical
+    // slack, so keep the section rhythm compact while retaining every source
+    // and its honest state.  Wider layouts keep the normal Carbon spacing.
+    let narrow_sources = ui.available_width() <= 840.0;
+    let section_gap = if narrow_sources {
+        Style::SP_XS
+    } else {
+        Style::SP_S
+    };
+
     section_title(ui, "Sources");
 
     // The add-a-folder row.
@@ -362,7 +373,7 @@ fn sources_view<E: MediaEngine>(ui: &mut egui::Ui, controller: &mut MediaControl
     // The open-a-URL row (MEDIA-12): a direct stream, or a web link resolved by yt-dlp.
     open_url_row(ui, controller);
 
-    ui.add_space(Style::SP_S);
+    ui.add_space(section_gap);
 
     let mut open_source: Option<String> = None;
     ScrollArea::vertical()
@@ -406,12 +417,12 @@ fn sources_view<E: MediaEngine>(ui: &mut egui::Ui, controller: &mut MediaControl
             }
 
             // ── capture devices (MEDIA-13) ──
-            capture_section(ui, controller);
+            capture_section(ui, controller, section_gap);
 
             // ── Jellyfin servers (MEDIA-10) ──
-            jellyfin_section(ui, controller);
+            jellyfin_section(ui, controller, section_gap);
 
-            ui.add_space(Style::SP_S);
+            ui.add_space(section_gap);
             muted_note(
                 ui,
                 "Mesh sources appear here once discovered (MEDIA-14/15).",
@@ -463,8 +474,12 @@ fn open_url_row<E: MediaEngine>(ui: &mut egui::Ui, controller: &mut MediaControl
 /// from Carbon [`Style`] tokens (§4). Honest-gated (§7): before a scan it shows a plain
 /// hint; a host with no device — or no v4l2 tooling — shows a plain "no capture devices
 /// found" note, never a fake device.
-fn capture_section<E: MediaEngine>(ui: &mut egui::Ui, controller: &mut MediaController<E>) {
-    ui.add_space(Style::SP_S);
+fn capture_section<E: MediaEngine>(
+    ui: &mut egui::Ui,
+    controller: &mut MediaController<E>,
+    section_gap: f32,
+) {
+    ui.add_space(section_gap);
     let mut do_scan = false;
     ui.horizontal(|ui| {
         ui.label(
@@ -540,8 +555,12 @@ fn capture_section<E: MediaEngine>(ui: &mut egui::Ui, controller: &mut MediaCont
 /// plays with no server (MEDIA-11). The live browse/play/download legs need a real
 /// server (honest-gated); the negotiation + cache folds are tested in `model`.
 #[allow(clippy::too_many_lines)]
-fn jellyfin_section<E: MediaEngine>(ui: &mut egui::Ui, controller: &mut MediaController<E>) {
-    ui.add_space(Style::SP_S);
+fn jellyfin_section<E: MediaEngine>(
+    ui: &mut egui::Ui,
+    controller: &mut MediaController<E>,
+    section_gap: f32,
+) {
+    ui.add_space(section_gap);
     ui.label(
         RichText::new("Jellyfin servers")
             .size(Style::SMALL)

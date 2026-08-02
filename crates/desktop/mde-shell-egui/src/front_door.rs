@@ -926,6 +926,7 @@ impl FrontDoorState {
 pub(crate) fn app_search_items() -> Vec<SearchItem<FrontDoorTarget>> {
     (0..Surface::ALL.len())
         .filter_map(crate::surfaces::springboard_surface)
+        .filter(|surface| !crate::surfaces::is_tool_tray_surface(*surface))
         .enumerate()
         .map(|(index, surface)| app_search_item(surface, index))
         .collect()
@@ -2449,7 +2450,12 @@ fn activation_request_for_hit(hit: &SearchHit<FrontDoorTarget>) -> FrontDoorRequ
 
 fn taskbar_surface_for_hit(hit: &SearchHit<FrontDoorTarget>) -> Option<Surface> {
     match hit.item.payload {
-        FrontDoorTarget::App(surface) if Surface::ALL.contains(&surface) => Some(surface),
+        FrontDoorTarget::App(surface)
+            if Surface::ALL.contains(&surface)
+                && !crate::surfaces::is_tool_tray_surface(surface) =>
+        {
+            Some(surface)
+        }
         // Workflow cards, peer apps, files, commands, and Browser content are
         // not taskbar catalog entries. Keeping this match narrow makes their
         // pin affordance impossible to manufacture from untrusted search data.
@@ -4563,7 +4569,22 @@ mod tests {
     #[test]
     fn app_search_items_cover_the_shell_surface_inventory() {
         let items = app_search_items();
-        assert_eq!(items.len(), Surface::ALL.len());
+        assert_eq!(
+            items.len(),
+            Surface::ALL.len() - crate::surfaces::TOOL_TRAY_SURFACES.len()
+        );
+        assert!(!items.iter().any(|item| {
+            matches!(
+                &item.payload,
+                FrontDoorTarget::App(
+                    Surface::FleetMesh
+                        | Surface::Music
+                        | Surface::Media
+                        | Surface::Phones
+                        | Surface::ThisNode
+                )
+            )
+        }));
         assert!(items.iter().any(|item| {
             item.domain == SearchDomain::App
                 && item.title == Surface::Browser.label()
@@ -4589,11 +4610,23 @@ mod tests {
             .collect::<Vec<_>>();
         let expected = (0..Surface::ALL.len())
             .filter_map(crate::surfaces::springboard_surface)
+            .filter(|surface| !crate::surfaces::is_tool_tray_surface(*surface))
             .map(FrontDoorTarget::App)
             .collect::<Vec<_>>();
         assert_eq!(actual, expected);
-        assert_eq!(actual[0], FrontDoorTarget::App(Surface::FleetMesh));
-        assert_eq!(actual[1], FrontDoorTarget::App(Surface::InfraCode));
+        assert_eq!(actual[0], FrontDoorTarget::App(Surface::InfraCode));
+        assert!(!actual.iter().any(|item| {
+            matches!(
+                item,
+                FrontDoorTarget::App(
+                    Surface::FleetMesh
+                        | Surface::Music
+                        | Surface::Media
+                        | Surface::Phones
+                        | Surface::ThisNode
+                )
+            )
+        }));
     }
 
     #[test]
@@ -4724,20 +4757,20 @@ mod tests {
     #[test]
     fn blank_front_door_hits_show_initial_shortcuts_in_source_order() {
         let hits = visible_front_door_hits("  ", app_search_items());
-        assert_eq!(hits.len(), MAX_HITS);
+        assert_eq!(hits.len(), app_search_items().len());
         assert_eq!(
             hits[0].item.payload,
-            FrontDoorTarget::App(Surface::FleetMesh)
+            FrontDoorTarget::App(Surface::InfraCode)
         );
         assert_eq!(
             hits[0].item.target,
-            launcher_group_label(Surface::FleetMesh)
+            launcher_group_label(Surface::InfraCode)
         );
         assert_eq!(
             hits[1].item.payload,
-            FrontDoorTarget::App(Surface::InfraCode)
+            FrontDoorTarget::App(Surface::Desktop)
         );
-        assert_eq!(hits[1].item.target, "Mesh Control");
+        assert_eq!(hits[1].item.target, "Desktop & Session");
     }
 
     #[test]
@@ -6042,7 +6075,7 @@ mod tests {
             .expect("blank Front Door search results status");
         let value = results.value().expect("blank Front Door status value");
         assert!(
-            value.contains("local shortcut") && value.contains("Fleet & Mesh highlighted"),
+            value.contains("local shortcut") && value.contains("Infra as Code highlighted"),
             "blank Front Door should announce available shortcuts: {value}"
         );
     }
@@ -6927,7 +6960,7 @@ mod tests {
             .expect("selected peer app should expose a distinct result");
         assert_eq!(
             result.value(),
-            Some("Result 1 of 1: Guest App, guest Flatpak application; node oak; Ready to launch; no extra guest permissions declared; runs in an isolated App VM; host files, host D-Bus, and host compositor access remain blocked; desktop connection is separate")
+            Some("Result 1 of 1: Guest App, guest Flatpak application; node oak; Ready to launch; Construct will place or resume one guest App VM session. — no extra guest permissions declared; launch stays inside the App VM (isolated App VM); host files, host D-Bus, and host compositor access remain blocked; desktop connection is separate")
         );
         let launch = nodes
             .iter()

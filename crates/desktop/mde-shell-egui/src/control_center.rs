@@ -1346,6 +1346,7 @@ mod tests {
                 muted,
             },
             strips: Vec::new(),
+            capture: Vec::new(),
         }
     }
 

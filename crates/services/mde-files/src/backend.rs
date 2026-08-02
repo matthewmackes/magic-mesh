@@ -97,8 +97,9 @@ pub trait Backend {
     fn reconnect(&mut self) {}
     /// Files visible under a path. Empty path = the mesh overview.
     /// `peer:<id>` paths hit the mesh router; other paths hit the
-    /// local FS.
-    fn list(&self, path: &str) -> Vec<FileRow>;
+    /// local FS. Read failures must remain typed so the UI can
+    /// distinguish an empty directory from an unavailable listing.
+    fn list(&self, path: &str) -> Result<Vec<FileRow>, BackendError>;
     /// Audit history (newest first).
     fn audit_log(&self) -> Vec<AuditEntry>;
     /// Fire a Send-To. Demo backend records the audit row +
@@ -120,6 +121,12 @@ pub trait Backend {
     /// `None` so non-mesh backends compile unchanged.
     fn mesh_overlay(&self) -> Option<MeshOverlayBadge> {
         None
+    }
+    /// A live, probe-confirmed Airsonic/Navidrome destination exists.
+    /// Backends without service advertisements must remain honest and return
+    /// false rather than fabricating a music uploader.
+    fn music_service_available(&self) -> bool {
+        false
     }
 }
 
@@ -204,8 +211,8 @@ impl BackendSnapshot {
     pub fn capture(backend: &dyn Backend) -> Self {
         let self_node = backend.self_node();
         let peers = backend.peers();
-        let inbox = backend.list("");
-        let downloads = backend.list("downloads");
+        let inbox = backend.list("").unwrap_or_default();
+        let downloads = backend.list("downloads").unwrap_or_default();
         // AFM-6 — Outbox: the files this node has sent, projected from the send
         // audit log. Newest first (audit_log returns reverse-chronological).
         let outbox: Vec<FileRow> = backend
@@ -424,14 +431,25 @@ impl LocalFsBackend {
     }
 
     /// Read a directory and return the entries as `FileRow`s,
-    /// newest-first.
+    /// newest-first. This compatibility helper preserves the old
+    /// best-effort behavior for non-UI callers; the Backend trait uses
+    /// [`Self::try_list_dir`] so listing failures reach File Manager.
     pub fn list_dir(dir: &Path) -> Vec<FileRow> {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return Vec::new();
-        };
+        Self::try_list_dir(dir).unwrap_or_default()
+    }
+
+    /// Read a directory while preserving the exact filesystem failure.
+    pub fn try_list_dir(dir: &Path) -> Result<Vec<FileRow>, BackendError> {
+        let entries = std::fs::read_dir(dir)
+            .map_err(|e| BackendError::Rejected(format!("couldn't list {}: {e}", dir.display())))?;
         let mut rows: Vec<(SystemTime, FileRow)> = Vec::new();
-        for entry in entries.flatten() {
-            let Ok(meta) = entry.metadata() else { continue };
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                BackendError::Rejected(format!("couldn't read an entry in {}: {e}", dir.display()))
+            })?;
+            let meta = entry.metadata().map_err(|e| {
+                BackendError::Rejected(format!("couldn't inspect {}: {e}", entry.path().display()))
+            })?;
             let name = entry.file_name().to_string_lossy().into_owned();
             // Hide dotfiles in the home roots but show them inside
             // explicit dotted paths (e.g., when the user navigates
@@ -459,7 +477,7 @@ impl LocalFsBackend {
         }
         // newest first
         rows.sort_by(|a, b| b.0.cmp(&a.0));
-        rows.into_iter().map(|(_, r)| r).collect()
+        Ok(rows.into_iter().map(|(_, r)| r).collect())
     }
 }
 
@@ -485,10 +503,12 @@ impl Backend for LocalFsBackend {
         Vec::new()
     }
 
-    fn list(&self, path: &str) -> Vec<FileRow> {
+    fn list(&self, path: &str) -> Result<Vec<FileRow>, BackendError> {
         match self.resolve(path) {
-            Some(p) => Self::list_dir(&p),
-            None => Vec::new(),
+            Some(p) => Self::try_list_dir(&p),
+            None => Err(BackendError::Rejected(format!(
+                "invalid local path: {path}"
+            ))),
         }
     }
 
@@ -675,13 +695,13 @@ impl Backend for RealBackend {
         self.reconnect_now();
     }
 
-    fn list(&self, path: &str) -> Vec<FileRow> {
+    fn list(&self, path: &str) -> Result<Vec<FileRow>, BackendError> {
         if let Some(peer) = path.strip_prefix("peer:") {
             return self
                 .bus
                 .as_ref()
-                .and_then(|d| d.list_peer(peer).ok())
-                .unwrap_or_default();
+                .ok_or_else(|| BackendError::Rejected("mesh Bus is unavailable".into()))?
+                .list_peer(peer);
         }
         // AFM-5 — the empty path is the mesh Inbox ONLY: received files from the
         // Syncthing-replicated inbox over the Bus. When mackesd/Bus is
@@ -690,15 +710,15 @@ impl Backend for RealBackend {
         // resolved to `$HOME`, so an offline Bus made the Inbox view show the
         // operator's home directory as if those files had been received.)
         if path.is_empty() {
-            return self.bus.as_ref().map(BusBackend::inbox).unwrap_or_default();
+            return Ok(self.bus.as_ref().map(BusBackend::inbox).unwrap_or_default());
         }
         // E10 — Cloud-Files: the paired KDE-Connect device roster.
         if path == "cloud:" {
-            return self
+            return Ok(self
                 .bus
                 .as_ref()
                 .map(BusBackend::cloud_devices)
-                .unwrap_or_default();
+                .unwrap_or_default());
         }
         self.local.list(path)
     }
@@ -734,6 +754,12 @@ impl Backend for RealBackend {
 
     fn mesh_overlay(&self) -> Option<MeshOverlayBadge> {
         self.cached_mesh_overlay.clone()
+    }
+
+    fn music_service_available(&self) -> bool {
+        self.bus
+            .as_ref()
+            .is_some_and(BusBackend::music_service_available)
     }
 }
 
@@ -909,14 +935,14 @@ mod tests {
         // Best-effort: the test env's $HOME exists. Even if it
         // doesn't, the result is just an empty Vec — never panics.
         let b = LocalFsBackend::new();
-        let _rows = b.list("");
+        let _rows = b.list("").expect("test home can be listed");
         // No assertion on contents — varies by environment.
     }
 
     #[test]
     fn local_fs_backend_unknown_local_slug_returns_empty() {
         let b = LocalFsBackend::new();
-        assert!(b.list("local:does-not-exist").is_empty());
+        assert!(b.list("local:does-not-exist").is_err());
     }
 
     /// AFM-5 — the Inbox view (empty path) must NEVER fall back to the local
@@ -928,7 +954,7 @@ mod tests {
         // No mackesd/Bus in the test env → honest empty inbox.
         if b.bus.is_none() {
             assert!(
-                b.list("").is_empty(),
+                b.list("").expect("inbox read").is_empty(),
                 "Inbox must be empty (not the home directory) when the Bus is down"
             );
         }

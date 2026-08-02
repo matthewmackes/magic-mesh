@@ -7,7 +7,9 @@
 //! (the radar stays a Maps tab + keeps its keymap actions); the Phone tile's
 //! calls live in the Mesh Teams hub. Everything paints on the kept SYNC3
 //! dark + Ford-blue palette (Q30); glance values are honest — absent data reads
-//! as a plain descriptor, never a fabricated number (Q35/P8).
+//! as a plain descriptor, never a fabricated number (Q35/P8). The vehicle
+//! palette follows the shell's active Dark/Light scheme; AutoSync3 remains the
+//! mode-derived in-vehicle skin.
 //!
 //! Crash-safety follows the maps-HUD lessons: every allocated rect is guarded
 //! finite/non-degenerate, so a zero-size viewport or a NaN never reaches egui's
@@ -488,6 +490,16 @@ fn activated_car_tile(
 /// Render the Auto Mode home. Returns the tile the driver activated this frame
 /// (a card or strip tap), or `None`. The shell maps that to a surface switch.
 pub fn car_home_panel(ui: &mut Ui, glance: &CarHomeGlance) -> Option<CarTile> {
+    car_home_panel_with_scheme(ui, glance, Style::color_scheme(ui.ctx()))
+}
+
+/// Render AutoHome with the persisted operator surface scheme while the shell
+/// context may remain on AutoSync3 for vehicle-specific chrome and accents.
+pub fn car_home_panel_with_scheme(
+    ui: &mut Ui,
+    glance: &CarHomeGlance,
+    surface_scheme: mde_egui::StyleColorScheme,
+) -> Option<CarTile> {
     let full = ui.available_rect_before_wrap();
     // Guard a degenerate viewport (a collapsed/NaN rect never reaches layout).
     let width = finite_or(full.width(), 0.0);
@@ -497,8 +509,9 @@ pub fn car_home_panel(ui: &mut Ui, glance: &CarHomeGlance) -> Option<CarTile> {
     }
 
     let painter = ui.painter().clone();
-    // The SYNC3 ground (Q30) — edge-to-edge black even inside a bordered panel.
-    painter.rect_filled(full, 0.0, Style::SYNC3_BG);
+    let palette = Style::palette_for(surface_scheme);
+    let accent = Style::resolve_color(ui.ctx(), Style::ACCENT);
+    painter.rect_filled(full, 0.0, palette.bg);
 
     let pad = Style::SP_L;
     let inner = Rect::from_min_max(full.min + Vec2::splat(pad), full.max - Vec2::splat(pad));
@@ -506,14 +519,14 @@ pub fn car_home_panel(ui: &mut Ui, glance: &CarHomeGlance) -> Option<CarTile> {
         return None;
     }
 
-    // Header band — a large "Auto Mode" title, SYNC3 white.
+    // Header band — a large "Auto Mode" title in the active shell palette.
     let header_h = Style::DISPLAY + Style::SP_M;
     painter.text(
         egui::pos2(inner.left(), inner.top()),
         egui::Align2::LEFT_TOP,
         "Auto Mode",
         Style::typography_font(TypographyRole::Display),
-        Style::SYNC3_TEXT_STRONG,
+        palette.text_strong,
     );
 
     let body = Rect::from_min_max(egui::pos2(inner.left(), inner.top() + header_h), inner.max);
@@ -527,19 +540,19 @@ pub fn car_home_panel(ui: &mut Ui, glance: &CarHomeGlance) -> Option<CarTile> {
                 egui::Align2::CENTER_CENTER,
                 "Resize workspace to use Auto Mode",
                 Style::typography_font(TypographyRole::Body),
-                Style::SYNC3_TEXT_DIM,
+                palette.text_dim,
             );
         }
         return None;
     };
 
-    let nav_clicked = paint_nav_card(ui, &painter, layout.nav_card, glance);
-    let media_clicked = paint_media_card(ui, &painter, layout.media_card, glance);
+    let nav_clicked = paint_nav_card(ui, &painter, layout.nav_card, glance, palette, accent);
+    let media_clicked = paint_media_card(ui, &painter, layout.media_card, glance, palette, accent);
     // The glance card's dominant content is the vehicle telematics summary, so
     // its (full-card, Density::Touch) tap lands on the Vehicle telematics tab.
-    let vehicle_clicked = paint_glance_card(ui, &painter, layout.glance_card, glance);
+    let vehicle_clicked = paint_glance_card(ui, &painter, layout.glance_card, glance, palette, accent);
     let strip_clicked = core::array::from_fn(|index| {
-        paint_app_tile(ui, &painter, layout.strip[index], CarTile::ALL[index])
+        paint_app_tile(ui, &painter, layout.strip[index], CarTile::ALL[index], palette)
     });
     activated_car_tile(nav_clicked, media_clicked, vehicle_clicked, strip_clicked)
 }
@@ -554,6 +567,8 @@ fn card_plate(
     rect: Rect,
     salt: &'static str,
     label: &'static str,
+    palette: mde_egui::StylePalette,
+    accent: Color32,
 ) -> Option<(egui::Painter, bool)> {
     if !rect.is_finite() || rect.width() < 2.0 || rect.height() < 2.0 {
         return None;
@@ -563,18 +578,18 @@ fn card_plate(
         egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
     });
     let fill = if resp.is_pointer_button_down_on() {
-        Style::pressed_fill(Style::SYNC3_ACCENT)
+        Style::pressed_fill(accent)
     } else if resp.hovered() {
-        Style::SYNC3_SURFACE_HI
+        palette.surface_hi
     } else {
-        Style::SYNC3_SURFACE
+        palette.surface
     };
     let radius = egui::CornerRadius::same(Style::RADIUS_L as u8);
     painter.rect_filled(rect, radius, fill);
     let stroke_col = if resp.hovered() {
-        Style::SYNC3_ACCENT
+        accent
     } else {
-        Style::SYNC3_BORDER
+        palette.border
     };
     painter.rect_stroke(
         rect,
@@ -595,7 +610,7 @@ fn card_plate(
             sw: 0,
             se: 0,
         },
-        Style::SYNC3_ACCENT,
+        accent,
     );
     mde_egui::focus::paint_focus_ring(painter, rect, resp.has_focus());
     // Clip the content to the card so a long now-playing title never overflows.
@@ -606,9 +621,17 @@ fn card_plate(
 }
 
 /// A card's icon + app-name header row, top-left, SYNC3-accent tinted glyph.
-fn card_header(ui: &Ui, p: &egui::Painter, rect: Rect, icon: IconId, title: &str) {
+fn card_header(
+    ui: &Ui,
+    p: &egui::Painter,
+    rect: Rect,
+    icon: IconId,
+    title: &str,
+    palette: mde_egui::StylePalette,
+    accent: Color32,
+) {
     let edge = (rect.height() * 0.2).clamp(20.0, 48.0);
-    if let Some(tex) = surfaces::icon_texture(ui.ctx(), icon, edge, Style::SYNC3_ACCENT) {
+    if let Some(tex) = surfaces::icon_texture(ui.ctx(), icon, edge, accent) {
         let icon_rect = Rect::from_min_size(
             egui::pos2(rect.left() + Style::SP_M, rect.top() + Style::SP_M),
             egui::vec2(edge, edge),
@@ -628,17 +651,17 @@ fn card_header(ui: &Ui, p: &egui::Painter, rect: Rect, icon: IconId, title: &str
         egui::Align2::LEFT_CENTER,
         title,
         Style::typography_font(TypographyRole::Headline),
-        Style::SYNC3_TEXT_DIM,
+        palette.text_dim,
     );
 }
 
 /// The Nav card — the largest card: the live route/ETA glance while guidance
 /// runs, else the honest "Where to?" prompt. Tap opens Navigation.
-fn paint_nav_card(ui: &mut Ui, painter: &egui::Painter, rect: Rect, g: &CarHomeGlance) -> bool {
-    let Some((p, clicked)) = card_plate(ui, painter, rect, "nav", "Navigation") else {
+fn paint_nav_card(ui: &mut Ui, painter: &egui::Painter, rect: Rect, g: &CarHomeGlance, palette: mde_egui::StylePalette, accent: Color32) -> bool {
+    let Some((p, clicked)) = card_plate(ui, painter, rect, "nav", "Navigation", palette, accent) else {
         return false;
     };
-    card_header(ui, &p, rect, IconId::MapsLocation, "Navigation");
+    card_header(ui, &p, rect, IconId::MapsLocation, "Navigation", palette, accent);
     // The glance line — live values read strong, the absent-data prompt reads
     // dim (the honesty cue: a fallback never masquerades as a reading).
     let live = g.nav_value().is_some();
@@ -648,9 +671,9 @@ fn paint_nav_card(ui: &mut Ui, painter: &egui::Painter, rect: Rect, g: &CarHomeG
         &g.nav_line(),
         Style::typography_font(TypographyRole::Title),
         if live {
-            Style::SYNC3_TEXT_STRONG
+            palette.text_strong
         } else {
-            Style::SYNC3_TEXT_DIM
+            palette.text_dim
         },
     );
     clicked
@@ -658,11 +681,11 @@ fn paint_nav_card(ui: &mut Ui, painter: &egui::Painter, rect: Rect, g: &CarHomeG
 
 /// The Media card — the now-playing glance (honest "Music & podcasts" when
 /// nothing is loaded). Tap opens Media.
-fn paint_media_card(ui: &mut Ui, painter: &egui::Painter, rect: Rect, g: &CarHomeGlance) -> bool {
-    let Some((p, clicked)) = card_plate(ui, painter, rect, "media", "Media") else {
+fn paint_media_card(ui: &mut Ui, painter: &egui::Painter, rect: Rect, g: &CarHomeGlance, palette: mde_egui::StylePalette, accent: Color32) -> bool {
+    let Some((p, clicked)) = card_plate(ui, painter, rect, "media", "Media", palette, accent) else {
         return false;
     };
-    card_header(ui, &p, rect, IconId::Media, "Media");
+    card_header(ui, &p, rect, IconId::Media, "Media", palette, accent);
     let live = g.media_value().is_some();
     paint_card_bottom_line(
         &p,
@@ -670,9 +693,9 @@ fn paint_media_card(ui: &mut Ui, painter: &egui::Painter, rect: Rect, g: &CarHom
         &g.media_line(),
         Style::typography_font(TypographyRole::Body),
         if live {
-            Style::SYNC3_TEXT_STRONG
+            palette.text_strong
         } else {
-            Style::SYNC3_TEXT_DIM
+            palette.text_dim
         },
     );
     clicked
@@ -687,6 +710,7 @@ fn glance_row(
     tint: Color32,
     line: &str,
     live: bool,
+    palette: mde_egui::StylePalette,
 ) {
     if !rect.is_finite() || rect.width() < 2.0 || rect.height() < 2.0 {
         return;
@@ -711,9 +735,9 @@ fn glance_row(
         line,
         Style::typography_font(TypographyRole::Body),
         if live {
-            Style::SYNC3_TEXT_STRONG
+            palette.text_strong
         } else {
-            Style::SYNC3_TEXT_DIM
+            palette.text_dim
         },
     );
 }
@@ -721,8 +745,8 @@ fn glance_row(
 /// The glance card — the vehicle telematics summary (the live MG90 glance when
 /// the gateway drives location) over the comms alert count. Tap opens the
 /// Vehicle telematics tab.
-fn paint_glance_card(ui: &mut Ui, painter: &egui::Painter, rect: Rect, g: &CarHomeGlance) -> bool {
-    let Some((p, clicked)) = card_plate(ui, painter, rect, "glance", "Vehicle telematics") else {
+fn paint_glance_card(ui: &mut Ui, painter: &egui::Painter, rect: Rect, g: &CarHomeGlance, palette: mde_egui::StylePalette, accent: Color32) -> bool {
+    let Some((p, clicked)) = card_plate(ui, painter, rect, "glance", "Vehicle telematics", palette, accent) else {
         return false;
     };
     let inset = Rect::from_min_max(
@@ -744,6 +768,7 @@ fn paint_glance_card(ui: &mut Ui, painter: &egui::Painter, rect: Rect, g: &CarHo
             Style::OK,
             &g.vehicle_line(),
             g.vehicle_line_live(),
+            palette,
         );
         glance_row(
             ui,
@@ -753,6 +778,7 @@ fn paint_glance_card(ui: &mut Ui, painter: &egui::Painter, rect: Rect, g: &CarHo
             Style::ACCENT_TEAMS,
             &g.comms_line(),
             g.comms.is_some_and(|n| n > 0),
+            palette,
         );
     }
     clicked
@@ -760,7 +786,7 @@ fn paint_glance_card(ui: &mut Ui, painter: &egui::Painter, rect: Rect, g: &CarHo
 
 /// Paint one compact app-strip tile (glyph over label) and return whether it
 /// was tapped this frame.
-fn paint_app_tile(ui: &mut Ui, painter: &egui::Painter, rect: Rect, tile: CarTile) -> bool {
+fn paint_app_tile(ui: &mut Ui, painter: &egui::Painter, rect: Rect, tile: CarTile, palette: mde_egui::StylePalette) -> bool {
     if !rect.is_finite() || rect.width() < 2.0 || rect.height() < 2.0 {
         return false;
     }
@@ -773,16 +799,16 @@ fn paint_app_tile(ui: &mut Ui, painter: &egui::Painter, rect: Rect, tile: CarTil
     let fill = if resp.is_pointer_button_down_on() {
         Style::pressed_fill(tile.accent())
     } else if resp.hovered() {
-        Style::SYNC3_SURFACE_HI
+        palette.surface_hi
     } else {
-        Style::SYNC3_SURFACE
+        palette.surface
     };
     let radius = egui::CornerRadius::same(Style::RADIUS_M as u8);
     painter.rect_filled(rect, radius, fill);
     let stroke_col = if resp.hovered() {
         tile.accent()
     } else {
-        Style::SYNC3_BORDER
+        palette.border
     };
     painter.rect_stroke(
         rect,
@@ -815,7 +841,7 @@ fn paint_app_tile(ui: &mut Ui, painter: &egui::Painter, rect: Rect, tile: CarTil
         egui::Align2::CENTER_BOTTOM,
         tile.strip_label(rect.width()),
         Style::typography_font(TypographyRole::Label),
-        Style::SYNC3_TEXT_STRONG,
+        palette.text_strong,
     );
 
     mde_egui::focus::paint_focus_ring(painter, rect, resp.has_focus());
@@ -1150,6 +1176,7 @@ mod tests {
     fn captured_car_home_canvas(
         glance: &CarHomeGlance,
         screen_size: Vec2,
+        surface_scheme: mde_egui::StyleColorScheme,
     ) -> crate::screenshot::Canvas {
         let ctx = egui::Context::default();
         Style::install(&ctx);
@@ -1162,7 +1189,7 @@ mod tests {
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE)
                 .show(ctx, |ui| {
-                    let _ = car_home_panel(ui, glance);
+                    let _ = car_home_panel_with_scheme(ui, glance, surface_scheme);
                 });
         };
         let _settle = cap.frame(&ctx, input(), &mut render);
@@ -1237,12 +1264,18 @@ mod tests {
             vehicle: Some("MG90 stale · no fix".to_string()),
             vehicle_live: false,
         };
-        let canvas = captured_car_home_canvas(&glance, screen_size);
+        let canvas = captured_car_home_canvas(
+            &glance,
+            screen_size,
+            mde_egui::StyleColorScheme::Dark,
+        );
         let body = car_home_body_rect(screen_size);
         let layout = dashboard_layout(body).expect("pixel proof body lays out");
+        let palette = Style::palette_for(mde_egui::StyleColorScheme::Dark);
+        let accent = Style::ACCENT;
 
         let total_pixels = canvas.width() * canvas.height();
-        let bg_pixels = canvas.count_exact_color(Style::SYNC3_BG);
+        let bg_pixels = canvas.count_exact_color(palette.bg);
         assert!(
             bg_pixels > total_pixels / 20,
             "Car Home proof must paint the SYNC3 ground, got {bg_pixels}/{total_pixels}"
@@ -1253,7 +1286,7 @@ mod tests {
             layout.nav_card.max - Vec2::splat(Style::SP_L),
         );
         let nav_surface_pixels =
-            canvas.count_near_color_in_rect(nav_interior, Style::SYNC3_SURFACE, 1);
+            canvas.count_near_color_in_rect(nav_interior, palette.surface, 1);
         let nav_interior_pixels = rect_pixels(nav_interior, &canvas);
         assert!(
             (nav_surface_pixels as f32) >= (nav_interior_pixels as f32 * 0.55),
@@ -1267,7 +1300,7 @@ mod tests {
                 (layout.nav_card.top() + Style::SP_XS).min(layout.nav_card.bottom()),
             ),
         );
-        let accent_pixels = canvas.count_near_color_in_rect(accent_cap, Style::SYNC3_ACCENT, 4);
+        let accent_pixels = canvas.count_near_color_in_rect(accent_cap, accent, 4);
         let accent_total = rect_pixels(accent_cap, &canvas);
         assert!(
             (accent_pixels as f32) >= (accent_total as f32 * 0.70),
@@ -1284,18 +1317,58 @@ mod tests {
             pos2(inset.left(), inset.top() + half),
             vec2(inset.width(), half),
         );
-        let vehicle_dim = canvas.count_near_color_in_rect(vehicle_row, Style::SYNC3_TEXT_DIM, 24);
+        let vehicle_dim = canvas.count_near_color_in_rect(vehicle_row, palette.text_dim, 24);
         let vehicle_strong =
-            canvas.count_near_color_in_rect(vehicle_row, Style::SYNC3_TEXT_STRONG, 24);
+            canvas.count_near_color_in_rect(vehicle_row, palette.text_strong, 24);
         assert!(
             vehicle_dim > 24 && vehicle_dim > vehicle_strong * 2,
             "stale MG90 vehicle text must rasterize dim, not live-strong ({vehicle_dim} dim vs {vehicle_strong} strong pixels)"
         );
 
-        let comms_strong = canvas.count_near_color_in_rect(comms_row, Style::SYNC3_TEXT_STRONG, 24);
+        let comms_strong = canvas.count_near_color_in_rect(comms_row, palette.text_strong, 24);
         assert!(
             comms_strong > 24,
             "live alert count must rasterize as strong Car text, got {comms_strong} pixels"
+        );
+    }
+
+    #[test]
+    fn car_home_surface_scheme_changes_ground_and_cards_but_keeps_auto_accent() {
+        let screen_size = vec2(1024.0, 640.0);
+        let glance = CarHomeGlance::default();
+        let dark = captured_car_home_canvas(
+            &glance,
+            screen_size,
+            mde_egui::StyleColorScheme::Dark,
+        );
+        let light = captured_car_home_canvas(
+            &glance,
+            screen_size,
+            mde_egui::StyleColorScheme::Light,
+        );
+        let dark_palette = Style::palette_for(mde_egui::StyleColorScheme::Dark);
+        let light_palette = Style::palette_for(mde_egui::StyleColorScheme::Light);
+        assert!(
+            dark.count_exact_color(dark_palette.bg) > dark.width() * dark.height() / 20,
+            "dark AutoHome must retain its dark surface ground"
+        );
+        assert!(
+            light.count_exact_color(light_palette.bg) > light.width() * light.height() / 20,
+            "Light AutoHome must use the persisted Light surface ground"
+        );
+        assert_eq!(
+            dark.count_near_color(light_palette.bg, 1),
+            0,
+            "dark AutoHome must not paint the Light ground"
+        );
+        assert!(
+            light.count_near_color(dark_palette.bg, 1) < light.width() * light.height() / 1000,
+            "Light AutoHome must not retain the dark SYNC3 ground as its surface"
+        );
+        let accent = Style::ACCENT;
+        assert!(
+            light.count_near_color(accent, 4) > 24,
+            "Light AutoHome must retain the AutoSync3 vehicle accent"
         );
     }
 

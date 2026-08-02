@@ -25,6 +25,8 @@ const DEVICE1: &str = "org.bluez.Device1";
 /// The FDO properties interface — how a `bool` toggle (`Powered`, `Trusted`,
 /// `Discoverable`, `Pairable`) is written on either object.
 const PROPERTIES: &str = "org.freedesktop.DBus.Properties";
+const MAX_ADAPTERS: usize = 8;
+const MAX_DEVICES: usize = 64;
 
 /// One Bluetooth adapter (an `org.bluez.Adapter1` object).
 // The four flags mirror `Adapter1`'s independent boolean properties (Powered /
@@ -453,9 +455,11 @@ pub fn fold_bluez(objects: &zbus::fdo::ManagedObjects) -> BtStatus {
         }
     }
     status.adapters.sort_by(|a, b| a.path.cmp(&b.path));
+    status.adapters.truncate(MAX_ADAPTERS);
     status
         .devices
         .sort_by(|a, b| b.connected.cmp(&a.connected).then(a.alias.cmp(&b.alias)));
+    status.devices.truncate(MAX_DEVICES);
     status
 }
 

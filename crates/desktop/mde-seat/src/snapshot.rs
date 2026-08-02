@@ -15,9 +15,14 @@ use crate::charge_threshold::{ChargeThresholdClient, SysfsChargeThreshold};
 use crate::ddc::{DdcClient, DdcCtl, DdcDisplay};
 use crate::display::{Connector, DisplayProber, DrmProber};
 use crate::error::{Backend, SeatError};
+use crate::hardware::{HardwareClient, HardwareStatus, SysfsHardware};
 use crate::lid::{LidClient, LidState, ProcLid};
+use crate::keyboard_backlight::{
+    KeyboardBacklight, KeyboardBacklightClient, SysfsKeyboardBacklight,
+};
 use crate::logind::{LogindClient, PowerCaps, PowerVerb, ZbusLogind};
 use crate::mixer::{MixerClient, MixerStatus, PwGraph};
+use crate::network::{NetworkClient, NetworkStatus, ZbusNetwork};
 use crate::powerprofiles::{ProfileState, ProfilesClient, ZbusProfiles};
 use crate::upower::{Battery, UPowerClient, ZbusUPower};
 
@@ -68,6 +73,8 @@ impl<T> Probe<T> {
 /// Every seat section, each a typed [`Probe`]. The one render model (E12-15).
 #[derive(Debug, Clone)]
 pub struct SeatSnapshot {
+    /// NetworkManager link/provider status and global Wi-Fi radio state.
+    pub network: Probe<NetworkStatus>,
     /// Bluetooth adapter/device status.
     pub bluetooth: Probe<BtStatus>,
     /// Power devices (multi-battery incl. peripherals).
@@ -95,11 +102,15 @@ pub struct SeatSnapshot {
     pub displays: Probe<Vec<Connector>>,
     /// sysfs backlight panels.
     pub backlights: Probe<Vec<Backlight>>,
+    /// sysfs keyboard-backlight LEDs.
+    pub keyboard_backlights: Probe<Vec<KeyboardBacklight>>,
     /// The audio mixer (`PipeWire` graph via [`PwGraph`]; `Absent` when no
     /// `PipeWire`/`pw-dump` is present, e.g. a headless host).
     pub mixer: Probe<MixerStatus>,
     /// DDC/CI external monitors (`Absent` until E12-18).
     pub ddc: Probe<Vec<DdcDisplay>>,
+    /// Fixed-root thermal-zone and fan observations.
+    pub hardware: Probe<HardwareStatus>,
 }
 
 /// Holds every seat client behind its trait seam and folds them into a snapshot.
@@ -107,15 +118,18 @@ pub struct SeatSnapshot {
 /// [`Seat::from_parts`].
 pub struct Seat {
     bluez: Box<dyn BluezClient>,
+    network: Box<dyn NetworkClient>,
     upower: Box<dyn UPowerClient>,
     logind: Box<dyn LogindClient>,
     display: Box<dyn DisplayProber>,
     backlight: Box<dyn BacklightClient>,
+    keyboard_backlight: Box<dyn KeyboardBacklightClient>,
     mixer: Box<dyn MixerClient>,
     ddc: Box<dyn DdcClient>,
     profiles: Box<dyn ProfilesClient>,
     charge: Box<dyn ChargeThresholdClient>,
     lid: Box<dyn LidClient>,
+    hardware: Box<dyn HardwareClient>,
 }
 
 impl Seat {
@@ -126,15 +140,18 @@ impl Seat {
     pub fn new() -> Self {
         Self {
             bluez: Box::new(ZbusBluez::new()),
+            network: Box::new(ZbusNetwork::new()),
             upower: Box::new(ZbusUPower::new()),
             logind: Box::new(ZbusLogind::new()),
             display: Box::new(DrmProber::new()),
             backlight: Box::new(SysfsBacklight::new()),
+            keyboard_backlight: Box::new(SysfsKeyboardBacklight::new()),
             mixer: Box::new(PwGraph::new()),
             ddc: Box::new(DdcCtl::new()),
             profiles: Box::new(ZbusProfiles::new()),
             charge: Box::new(SysfsChargeThreshold::new()),
             lid: Box::new(ProcLid::new()),
+            hardware: Box::new(SysfsHardware::new()),
         }
     }
 
@@ -158,15 +175,18 @@ impl Seat {
     ) -> Self {
         Self {
             bluez,
+            network: Box::new(ZbusNetwork::new()),
             upower,
             logind,
             display,
             backlight,
+            keyboard_backlight: Box::new(SysfsKeyboardBacklight::new()),
             mixer,
             ddc,
             profiles,
             charge,
             lid,
+            hardware: Box::new(SysfsHardware::new()),
         }
     }
 
@@ -175,6 +195,17 @@ impl Seat {
     #[must_use]
     pub fn snapshot(&self) -> SeatSnapshot {
         self.snapshot_with_ddc(Probe::from_result(self.ddc.displays()))
+    }
+
+    /// Activate a provider-issued NetworkManager profile. Credentials are
+    /// requested by NetworkManager through the separately registered
+    /// `NetworkSecretAgent`; this seam accepts no secret material.
+    pub fn activate_network_profile(
+        &self,
+        profile_path: &str,
+        device_path: Option<&str>,
+    ) -> Result<String, SeatError> {
+        self.network.activate_profile(profile_path, device_path)
     }
 
     /// Fold every section EXCEPT DDC, taking the DDC probe from the caller.
@@ -187,6 +218,7 @@ impl Seat {
     #[must_use]
     pub fn snapshot_with_ddc(&self, ddc: Probe<Vec<DdcDisplay>>) -> SeatSnapshot {
         SeatSnapshot {
+            network: Probe::from_result(self.network.status()),
             bluetooth: Probe::from_result(self.bluez.status()),
             batteries: Probe::from_result(self.upower.batteries()),
             on_ac: Probe::from_result(self.upower.on_ac()),
@@ -196,8 +228,10 @@ impl Seat {
             lid: Probe::from_result(self.lid.state()),
             displays: Probe::from_result(self.display.connectors()),
             backlights: Probe::from_result(self.backlight.devices()),
+            keyboard_backlights: Probe::from_result(self.keyboard_backlight.devices()),
             mixer: Probe::from_result(self.mixer.status()),
             ddc,
+            hardware: Probe::from_result(self.hardware.status()),
         }
     }
 
@@ -234,6 +268,11 @@ impl Seat {
         self.backlight.set_brightness(name, value)
     }
 
+    /// Set a keyboard LED's raw brightness through the typed kernel provider.
+    pub fn set_keyboard_backlight(&self, name: &str, value: u32) -> Result<(), SeatError> {
+        self.keyboard_backlight.set_brightness(name, value)
+    }
+
     /// Set an external monitor's DDC/CI brightness (0–100), keyed by i2c bus label
     /// (lock 13, external monitors).
     ///
@@ -263,6 +302,12 @@ impl Seat {
     /// unknown name).
     pub fn set_power_profile(&self, name: &str) -> Result<(), SeatError> {
         self.profiles.set_active(name)
+    }
+
+    /// Set one standard kernel platform profile after the caller has validated
+    /// it against the fresh hardware probe and completed confirmation.
+    pub fn set_platform_profile(&self, profile: &str) -> Result<(), SeatError> {
+        self.hardware.set_platform_profile(profile)
     }
 
     /// Set the battery charge-stop cap (`charge_control_end_threshold`, 0–100).
@@ -304,6 +349,18 @@ impl Seat {
     /// [`SeatError::Unavailable`], else [`SeatError::Backend`]).
     pub fn set_bt_powered(&self, adapter: &str, on: bool) -> Result<(), SeatError> {
         self.bluez.set_adapter_powered(adapter, on)
+    }
+
+    /// Toggle NetworkManager's global Wi-Fi radio without touching profiles,
+    /// credentials, routes, or DNS configuration.
+    pub fn set_wifi_enabled(&self, enabled: bool) -> Result<(), SeatError> {
+        self.network.set_wifi_enabled(enabled)
+    }
+
+    /// Disconnect one provider-issued NetworkManager device without selecting
+    /// or mutating a connection profile.
+    pub fn disconnect_network_link(&self, path: &str) -> Result<(), SeatError> {
+        self.network.disconnect_link(path)
     }
 
     // ── Bluetooth pairing-manager verbs (E12-17) ────────────────────────────────

@@ -203,6 +203,9 @@ impl Section {
             "logs",
             "virtualization",
             "remote access",
+            "time",
+            "language",
+            "region",
             "system",
         ],
     ];
@@ -221,18 +224,15 @@ impl Section {
 
     pub(crate) const fn unavailable_reason(self) -> Option<&'static str> {
         match self {
-            Self::Connectivity => {
-                Some("NetworkManager/ModemManager controls are not connected to This Node yet.")
-            }
-            Self::DisplaySound => {
-                Some("Display and PipeWire mutation providers are not connected to This Node yet.")
-            }
-            Self::Input => {
-                Some("Direct-seat input policy controls are not connected to This Node yet.")
-            }
-            Self::Personalization => {
-                Some("This Node personalization persistence is not connected to this center yet.")
-            }
+            // NetworkManager observation plus the bounded Wi-Fi radio action
+            // now reach the typed seat provider. Profile/credential workflows
+            // remain separately unavailable until SecretAgent contracts land.
+            Self::Connectivity => None,
+            // Display and input now have read-only inventory providers. Their
+            // mutation boundaries are rendered by the detail views instead of
+            // hiding the observed page behind an unavailable route.
+            Self::DisplaySound | Self::Input => None,
+            Self::Personalization => None,
             _ => None,
         }
     }
@@ -309,7 +309,7 @@ pub(crate) enum PageProvider {
 }
 
 impl PageEntry {
-    fn matches(self, query: &str) -> bool {
+    pub(crate) fn matches(self, query: &str) -> bool {
         let normalized = search_key(query);
         normalized.is_empty()
             || search_key(self.route).contains(&normalized)
@@ -356,23 +356,19 @@ impl PageEntry {
 
 const fn provider_for(section: Section) -> PageProvider {
     match section {
-        Section::Connectivity => PageProvider::Unavailable(
-            "NetworkManager/ModemManager controls are not connected to This Node yet.",
-        ),
-        Section::DisplaySound => PageProvider::Unavailable(
-            "Display and PipeWire mutation providers are not connected to This Node yet.",
-        ),
-        Section::Input => PageProvider::Unavailable(
-            "Direct-seat input policy controls are not connected to This Node yet.",
-        ),
-        Section::Personalization => PageProvider::Unavailable(
-            "This Node personalization persistence is not connected to this center yet.",
-        ),
+        // NetworkManager observation plus the bounded Wi-Fi radio action now
+        // reach the typed seat provider. Profile/credential workflows remain
+        // separately unavailable until SecretAgent contracts land.
+        Section::Connectivity => PageProvider::Available,
+        // These pages now have bounded read-only observations. Mutation
+        // controls remain separately fail-closed behind typed seat providers.
+        Section::DisplaySound | Section::Input => PageProvider::Available,
+        Section::Personalization => PageProvider::Available,
         _ => PageProvider::Available,
     }
 }
 
-const PAGE_INDEX: [PageEntry; 16] = [
+const PAGE_INDEX: [PageEntry; 20] = [
     PageEntry {
         route: "this-node/overview",
         section: Section::Overview,
@@ -476,7 +472,7 @@ const PAGE_INDEX: [PageEntry; 16] = [
     PageEntry {
         route: "this-node/users",
         section: Section::MeshSystem,
-        provider: provider_for(Section::MeshSystem),
+        provider: PageProvider::Available,
         label: "Users & Accounts",
         description: "Users, roles, accounts, and sign-in policy.",
         keywords: &["users", "accounts", "roles", "sign-in"],
@@ -490,9 +486,19 @@ const PAGE_INDEX: [PageEntry; 16] = [
         keywords: &["updates", "update", "recovery", "reset"],
     },
     PageEntry {
+        route: "this-node/recovery-reset",
+        section: Section::MeshSystem,
+        provider: PageProvider::Unavailable(
+            "Recovery and reset remain behind a privileged node provider.",
+        ),
+        label: "Recovery & Reset",
+        description: "Recovery environment, reset posture, and safe restoration.",
+        keywords: &["recovery", "reset", "restore", "safe recovery"],
+    },
+    PageEntry {
         route: "this-node/backup-restore",
         section: Section::MeshSystem,
-        provider: provider_for(Section::MeshSystem),
+        provider: PageProvider::Available,
         label: "Backup & Restore",
         description: "Backup, restore, and recovery evidence.",
         keywords: &["backup", "restore", "backup and restore"],
@@ -500,7 +506,7 @@ const PAGE_INDEX: [PageEntry; 16] = [
     PageEntry {
         route: "this-node/diagnostics",
         section: Section::MeshSystem,
-        provider: provider_for(Section::MeshSystem),
+        provider: PageProvider::Available,
         label: "Diagnostics & Logs",
         description: "Diagnostics, logs, and operator-readable evidence.",
         keywords: &["diagnostics", "logs", "audit"],
@@ -508,10 +514,34 @@ const PAGE_INDEX: [PageEntry; 16] = [
     PageEntry {
         route: "this-node/virtualization",
         section: Section::MeshSystem,
-        provider: provider_for(Section::MeshSystem),
+        provider: PageProvider::Available,
         label: "Virtualization & Remote Access",
         description: "Virtualization, trusted sessions, and remote access.",
         keywords: &["virtualization", "remote access", "trusted session"],
+    },
+    PageEntry {
+        route: "this-node/security-privacy",
+        section: Section::DisplaySound,
+        provider: PageProvider::Available,
+        label: "Security & Privacy",
+        description: "Encryption posture, privacy controls, and security state.",
+        keywords: &["security", "privacy", "encryption", "camera privacy"],
+    },
+    PageEntry {
+        route: "this-node/accessibility",
+        section: Section::Input,
+        provider: PageProvider::Available,
+        label: "Accessibility",
+        description: "Assistive input, display, and interaction preferences.",
+        keywords: &["accessibility", "assistive", "screen reader", "contrast"],
+    },
+    PageEntry {
+        route: "this-node/time-language-region",
+        section: Section::MeshSystem,
+        provider: PageProvider::Available,
+        label: "Time, Language & Region",
+        description: "Clock, locale, language, keyboard region, and time zone.",
+        keywords: &["time", "language", "locale", "region", "time zone"],
     },
     PageEntry {
         route: "this-node/system",
@@ -547,6 +577,15 @@ pub(crate) fn search_pages(query: &str) -> Vec<PageEntry> {
 
 pub(crate) fn page_for_route(route: &str) -> Option<PageEntry> {
     PAGE_INDEX.into_iter().find(|page| page.route == route)
+}
+
+/// The stable landing page for a governed section. Child pages retain their
+/// catalog order so selecting a parent from the hierarchy never leaves the
+/// detail pane pointing at an unrelated route.
+pub(crate) fn first_page_for_section(section: Section) -> Option<PageEntry> {
+    PAGE_INDEX
+        .into_iter()
+        .find(|page| page.section == section)
 }
 
 fn search_key(value: &str) -> String {
@@ -593,11 +632,11 @@ mod tests {
     }
 
     #[test]
-    fn search_is_case_insensitive_and_keeps_unavailable_sections_discoverable() {
+    fn search_is_case_insensitive_and_keeps_provider_sections_discoverable() {
         assert_eq!(search("SOUND"), vec![Section::DisplaySound]);
         assert_eq!(search("wifi"), vec![Section::Connectivity]);
         assert_eq!(search(""), Section::ALL.to_vec());
-        assert!(Section::Connectivity.unavailable_reason().is_some());
+        assert!(Section::Connectivity.unavailable_reason().is_none());
     }
 
     #[test]
@@ -688,6 +727,14 @@ mod tests {
     }
 
     #[test]
+    fn personalization_route_matches_the_live_system_provider() {
+        assert!(Section::Personalization.unavailable_reason().is_none());
+        let page = page_for_route("this-node/personalization").expect("personalization route");
+        assert!(page.is_available());
+        assert!(page.unavailable_reason().is_none());
+    }
+
+    #[test]
     fn page_search_reaches_provider_pages_without_hiding_unavailable_sections() {
         assert_eq!(search_pages("storage")[0].route, "this-node/storage");
         assert_eq!(search("storage"), vec![Section::Hardware]);
@@ -695,26 +742,71 @@ mod tests {
 
         let display = page_for_route("this-node/display-sound").expect("stable route");
         assert_eq!(display.section, Section::DisplaySound);
-        assert!(display.unavailable_reason().is_some());
+        assert!(display.is_available());
         assert_eq!(page_for_route("this-node/not-a-page"), None);
     }
 
     #[test]
     fn every_indexed_page_has_explicit_provider_truth() {
         for page in page_index() {
-            match page.section.unavailable_reason() {
-                Some(reason) => assert_eq!(
+            if let Some(reason) = page.section.unavailable_reason() {
+                assert_eq!(
                     page.provider,
                     PageProvider::Unavailable(reason),
                     "provider state for {} must follow section authority",
                     page.route
-                ),
-                None => {
-                    assert_eq!(page.provider, PageProvider::Available, "{}", page.route);
-                    assert!(page.is_available());
-                    assert_eq!(page.unavailable_reason(), None);
-                }
+                );
+            } else if let Some(reason) = page.unavailable_reason() {
+                assert!(
+                    !reason.trim().is_empty(),
+                    "page-specific provider reason for {} must be readable",
+                    page.route
+                );
+                assert!(!page.is_available());
+            } else {
+                assert!(page.is_available(), "{}", page.route);
             }
         }
+        let users = page_for_route("this-node/users").expect("users page route");
+        assert!(users.is_available(), "aggregate users observation is available");
+        assert!(users.unavailable_reason().is_none());
+
+        assert!(page_for_route("this-node/virtualization")
+            .expect("remote proofing route")
+            .is_available());
+        assert!(page_for_route("this-node/backup-restore")
+            .expect("backup route")
+            .is_available());
+        let recovery = page_for_route("this-node/recovery-reset").expect("recovery route");
+        assert!(!recovery.is_available());
+        assert!(recovery
+            .unavailable_reason()
+            .is_some_and(|reason| reason.contains("privileged")));
+        let privacy = page_for_route("this-node/security-privacy").expect("privacy page route");
+        assert!(privacy.is_available(), "bounded privacy observations are available");
+        assert!(privacy.unavailable_reason().is_none());
+        for route in [
+            "this-node/accessibility",
+            "this-node/time-language-region",
+        ] {
+            assert!(
+                page_for_route(route).expect("partial provider route").is_available(),
+                "durable System continuity should keep {route} reachable"
+            );
+        }
+        assert_eq!(
+            search_pages("security")[0].route,
+            "this-node/security-privacy"
+        );
+        assert_eq!(
+            search_pages("time zone")[0].route,
+            "this-node/time-language-region"
+        );
+        assert!(
+            page_for_route("this-node/diagnostics")
+                .expect("diagnostics page route")
+                .is_available(),
+            "bounded snapshot diagnostics must remain reachable"
+        );
     }
 }

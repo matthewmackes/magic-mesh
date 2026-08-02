@@ -92,6 +92,7 @@ impl Plane {
 #[allow(clippy::too_many_arguments)]
 pub fn show(
     ui: &mut egui::Ui,
+    fleet_mesh_tab: &mut crate::FleetMeshTab,
     selected: &mut Plane,
     datacenter: &mut crate::datacenter::DatacenterState,
     // The This Node plane owns an on-demand refresh affordance over its bounded
@@ -100,6 +101,9 @@ pub fn show(
     // publishes lifecycle actions. `controller` is read-only too — the Cloud
     // plane embeds its view and keeps its own mutable state in egui memory.
     thisnode: &mut crate::thisnode::ThisNodeState,
+    // Mutable: This Node actions delegate to the same trusted local System
+    // provider used by the durable System route.
+    system: &mut crate::system::SystemState,
     // Mutable: the SURFACE-6 card reads the surface workers' typed state off the
     // Bus and publishes typed enable / fw-apply requests (it holds the in-flight
     // arm inputs + the in-process display controller).
@@ -124,8 +128,9 @@ pub fn show(
     // datacenter poll seam), and **Help** (the bar-owned plane guide). The status
     // cluster carries live mesh state — active plane · elected leader · peer count
     // · fleet update target — each chip only when the fact is live (§7).
-    if let Some(action) = menubar::show(ui, *selected, controller, provisioning) {
+    if let Some(action) = menubar::show(ui, *fleet_mesh_tab, *selected, controller, provisioning) {
         match action {
+            menubar::MenuAction::FleetMeshTab(tab) => *fleet_mesh_tab = tab,
             menubar::MenuAction::Plane(plane) => *selected = plane,
             menubar::MenuAction::FleetRefresh => datacenter.refresh_now(),
             // Handled inside the bar (it owns the guide window's open flag);
@@ -180,7 +185,7 @@ pub fn show(
                 // presence + heartbeat, daemon health, peer/leader context) off the
                 // world-readable mesh-status snapshot.
                 Plane::ThisNode => {
-                    thisnode.show(ui);
+                    thisnode.show_with_system(ui, Some(system));
                     // SURFACE-6 — the model-gated Surface / Hardware Enablement
                     // card. It draws only on a detected Surface (the summary
                     // topic is the gate); on every other node it's inert.
@@ -254,7 +259,9 @@ mod menubar {
     /// guide window); the rest dispatch in `workbench::show`.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(super) enum MenuAction {
-        /// View → jump to this plane (the rail's `selected` seam).
+        /// View → jump to another Fleet & Mesh view.
+        FleetMeshTab(crate::FleetMeshTab),
+        /// View → jump to this Workbench plane (the rail's `selected` seam).
         Plane(Plane),
         /// Fleet → queue an immediate datacenter re-read.
         FleetRefresh,
@@ -266,11 +273,12 @@ mod menubar {
     /// frame, if any (Help is handled here — the bar owns the guide window).
     pub(super) fn show(
         ui: &mut Ui,
+        active_tab: crate::FleetMeshTab,
         active: Plane,
         controller: &ControllerState,
         provisioning: &ProvisioningState,
     ) -> Option<MenuAction> {
-        let menus = build_menus(active);
+        let menus = build_menus(active_tab, active);
         let status = build_status(active, controller, provisioning);
         let model = MenuBarModel {
             // The dock tints the Workbench lead cell with the brand accent (its
@@ -331,14 +339,29 @@ mod menubar {
 
     /// Build the bar's menus for the active plane: View (plane radios), the
     /// active plane's verb menu when one exists, and Help.
-    fn build_menus(active: Plane) -> Vec<Menu<MenuAction>> {
-        let view: Vec<Entry<MenuAction>> = Plane::ALL
-            .iter()
-            .map(|&p| Entry::Item(Item::new(MenuAction::Plane(p), p.label()).checked(active == p)))
-            .collect();
+    fn build_menus(active_tab: crate::FleetMeshTab, active_plane: Plane) -> Vec<Menu<MenuAction>> {
+        let mut view: Vec<Entry<MenuAction>> = [
+            crate::FleetMeshTab::Workbench,
+            crate::FleetMeshTab::MeshMap,
+            crate::FleetMeshTab::Explorer,
+        ]
+        .iter()
+        .map(|&tab| {
+            Entry::Item(
+                Item::new(MenuAction::FleetMeshTab(tab), tab.label()).checked(active_tab == tab),
+            )
+        })
+        .collect();
+        view.push(Entry::Separator);
+        view.extend(Plane::ALL.iter().map(|&p| {
+            Entry::Item(
+                Item::new(MenuAction::Plane(p), p.label())
+                    .checked(active_tab == crate::FleetMeshTab::Workbench && active_plane == p),
+            )
+        }));
         let mut menus = vec![Menu::new("View", view)];
 
-        match active {
+        match active_plane {
             // The Fleet plane's one honest verb: queue an immediate re-read of
             // the Bus projection (the datacenter poll seam).
             Plane::Fleet => menus.push(Menu::new(
@@ -418,25 +441,29 @@ mod menubar {
         }
 
         #[test]
-        fn view_menu_lists_every_plane_with_the_active_one_checked() {
-            let menus = build_menus(Plane::Network);
+        fn view_menu_lists_every_mesh_view_and_workbench_plane() {
+            let menus = build_menus(crate::FleetMeshTab::Workbench, Plane::Network);
             let view = &menus[0];
             assert_eq!(view.title, "View");
-            let planes: Vec<Plane> = view
+            let tabs: Vec<crate::FleetMeshTab> = view
                 .entries
                 .iter()
                 .filter_map(|e| match e {
                     Entry::Item(i) => match i.id {
-                        MenuAction::Plane(p) => Some(p),
+                        MenuAction::FleetMeshTab(tab) => Some(tab),
                         _ => None,
                     },
                     _ => None,
                 })
                 .collect();
             assert_eq!(
-                planes,
-                Plane::ALL.to_vec(),
-                "every plane is reachable, in order"
+                tabs,
+                vec![
+                    crate::FleetMeshTab::Workbench,
+                    crate::FleetMeshTab::MeshMap,
+                    crate::FleetMeshTab::Explorer,
+                ],
+                "every Fleet & Mesh view is reachable, in order"
             );
             // Exactly the active plane is checked (radio) — the rest are
             // unchecked, never omitted (§7).
@@ -444,7 +471,8 @@ mod menubar {
                 if let Entry::Item(item) = entry {
                     assert_eq!(
                         item.checked,
-                        Some(item.id == MenuAction::Plane(Plane::Network)),
+                        Some(item.id == MenuAction::FleetMeshTab(crate::FleetMeshTab::Workbench)
+                            || item.id == MenuAction::Plane(Plane::Network)),
                         "{:?} check-state must track the active plane",
                         item.id
                     );
@@ -455,14 +483,14 @@ mod menubar {
         #[test]
         fn verb_menus_appear_only_at_plane_depth() {
             // Fleet active → View · Fleet · Help, with the refresh verb.
-            let menus = build_menus(Plane::Fleet);
+            let menus = build_menus(crate::FleetMeshTab::Workbench, Plane::Fleet);
             assert_eq!(menus.len(), 3);
             assert_eq!(menus[1].title, "Fleet");
             assert_eq!(ids(&menus[1]), vec![MenuAction::FleetRefresh]);
 
             // A read-only plane → View · Help only (honest omission, §7).
             for plane in [Plane::ThisNode, Plane::Network, Plane::Provisioning] {
-                let menus = build_menus(plane);
+                let menus = build_menus(crate::FleetMeshTab::Workbench, plane);
                 assert_eq!(menus.len(), 2, "{plane:?} must carry no verb menu");
                 assert_eq!(menus[0].title, "View");
                 assert_eq!(menus[1].title, "Help");
@@ -471,7 +499,7 @@ mod menubar {
 
         #[test]
         fn help_carries_the_plane_guide() {
-            let menus = build_menus(Plane::ThisNode);
+            let menus = build_menus(crate::FleetMeshTab::Workbench, Plane::ThisNode);
             let help = menus.last().expect("a Help menu");
             assert_eq!(help.title, "Help");
             assert_eq!(ids(help), vec![MenuAction::HelpGuide]);
@@ -508,7 +536,13 @@ mod menubar {
             };
             let out = ctx.run(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    let _ = super::show(ui, Plane::Fleet, &controller, &provisioning);
+                    let _ = super::show(
+                        ui,
+                        crate::FleetMeshTab::Workbench,
+                        Plane::Fleet,
+                        &controller,
+                        &provisioning,
+                    );
                 });
             });
             let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
@@ -601,9 +635,11 @@ mod tests {
 
         let ctx = egui::Context::default();
         Style::install(&ctx);
+        let mut fleet_mesh_tab = crate::FleetMeshTab::Workbench;
         let mut selected = Plane::ThisNode;
         let mut datacenter = crate::datacenter::DatacenterState::default();
         let mut thisnode = crate::thisnode::ThisNodeState::default();
+        let mut system = crate::system::SystemState::default();
         let mut surface_card = crate::surface_card::SurfaceCardState::default();
         let network = crate::network::NetworkState::default();
         let controller = crate::controller::ControllerState::default();
@@ -619,9 +655,11 @@ mod tests {
             egui::CentralPanel::default().show(ctx, |ui| {
                 super::show(
                     ui,
+                    &mut fleet_mesh_tab,
                     &mut selected,
                     &mut datacenter,
                     &mut thisnode,
+                    &mut system,
                     &mut surface_card,
                     &network,
                     &controller,

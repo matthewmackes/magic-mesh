@@ -29,6 +29,12 @@ use rusqlite::{Connection, OpenFlags};
 
 use crate::model::MapViewState;
 
+// The map canvas is intentionally dark in both shell color schemes. Keep the
+// honest no-data copy on the map-content palette so Light-mode token remapping
+// cannot turn it into dark ink on the dark canvas.
+const MAP_TEXT_STRONG: Color32 = Color32::from_rgb(0xF5, 0xF6, 0xFA); // style-leak-ok: map-content-color
+const MAP_TEXT_DIM: Color32 = Color32::from_rgb(0xB8, 0xC0, 0xCC); // style-leak-ok: map-content-color
+
 /// Web-Mercator latitude clamp — the projection is undefined beyond the poles,
 /// so every conversion clamps to the standard slippy-map limit.
 const MERCATOR_LAT_LIMIT: f64 = 85.051_128_78;
@@ -533,10 +539,13 @@ pub fn paint_basemap(
     rect: Rect,
     map: &MapViewState,
     center: Option<(f64, f64)>,
+    show_empty_state: bool,
 ) -> Option<Projection> {
     let ctx = painter.ctx();
     let Some(meta) = cached_meta(ctx) else {
-        paint_no_data(painter, rect);
+        if show_empty_state {
+            paint_no_data(painter, rect);
+        }
         return center.and_then(|center| Projection::vehicle_centered(rect, map, center));
     };
 
@@ -563,26 +572,62 @@ pub fn paint_basemap(
     Some(proj)
 }
 
-/// The honest offline fallback: a centred two-line panel when no region bundle
-/// is installed. Colours read from the shared [`Style`] (no map-content leak).
+/// The honest offline fallback: a lower-center two-line panel when no region
+/// bundle is installed. The center of the map is reserved by the Drive health
+/// rail, so a centered label would be painted underneath that HUD and become
+/// unreadable in Light/Largest mode. This is map-owned content and intentionally
+/// keeps its own high-contrast palette.
 fn paint_no_data(painter: &Painter, rect: Rect) {
     let c = rect.center();
     if !c.x.is_finite() || !c.y.is_finite() {
         return;
     }
-    painter.text(
-        egui::pos2(c.x, c.y - 10.0),
-        egui::Align2::CENTER_BOTTOM,
-        "No offline map data",
-        FontId::proportional(Style::TITLE),
-        Style::TEXT,
+    let panel_top = rect.top() + 56.0;
+    let panel_bottom = rect.bottom() - 56.0;
+    let panel_y = if panel_top <= panel_bottom {
+        (rect.bottom() - 60.0).clamp(panel_top, panel_bottom)
+    } else {
+        c.y
+    };
+    let panel_width = (rect.width() * 0.34)
+        .clamp(280.0, 420.0)
+        .min(rect.width() - 24.0);
+    if panel_width <= 0.0 {
+        return;
+    }
+    let panel_left = rect.left() + panel_width * 0.5 + 12.0;
+    let panel_right = rect.right() - panel_width * 0.5 - 20.0;
+    let panel_x = if panel_left <= panel_right {
+        (c.x + panel_width * 0.42).clamp(panel_left, panel_right)
+    } else {
+        c.x
+    };
+    let panel_center = egui::pos2(panel_x, panel_y);
+    let panel = Rect::from_center_size(panel_center, egui::vec2(panel_width, 88.0));
+    painter.rect_filled(
+        panel,
+        12.0,
+        Style::map_empty_panel(),
+    );
+    painter.rect_stroke(
+        panel,
+        12.0,
+        egui::Stroke::new(1.0, Style::map_empty_border()),
+        egui::StrokeKind::Inside,
     );
     painter.text(
-        egui::pos2(c.x, c.y + 10.0),
+        egui::pos2(panel.center().x, panel.top() + 10.0),
+        egui::Align2::CENTER_TOP,
+        "No offline map data",
+        FontId::proportional(Style::TITLE),
+        MAP_TEXT_STRONG,
+    );
+    painter.text(
+        egui::pos2(panel.center().x, panel.top() + 48.0),
         egui::Align2::CENTER_TOP,
         "Install a region bundle to see the map",
         FontId::proportional(Style::BODY),
-        Style::TEXT_DIM,
+        MAP_TEXT_DIM,
     );
 }
 

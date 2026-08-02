@@ -76,11 +76,13 @@ const PREVIEW_WIDTH: f32 = Style::SP_XL * 11.0;
 /// Below this panel width the Word toolbars lean out (EDTB-4, design lock #9):
 /// each strip's width-heavy dropdown folds into a `»` overflow so the Standard +
 /// Formatting bars stay usable on a narrow (compact-shell) editor panel. Derived
-/// from the shared spacing grid — a fourteen-column span (§4); the two strips
-/// each want roughly this to lay out their groups without crowding, so below it
-/// the wide dropdowns fold. The menu bar is already compact (dropdown buttons),
-/// so it is width-invariant.
-const COMPACT_WIDTH: f32 = Style::SP_XL * 14.0;
+/// from the shared spacing grid — a thirty-column span (§4). Direct DRM proof
+/// seats can be 800 logical pixels wide while still being wider than the old
+/// fourteen-column heuristic; folding the width-heavy controls at this boundary
+/// keeps the complete Standard and Formatting command set inside the visible
+/// toolbar instead of clipping the trailing Zoom control. The menu bar is
+/// already compact (dropdown buttons), so it is width-invariant.
+const COMPACT_WIDTH: f32 = Style::SP_XL * 30.0;
 
 /// Whether `available_width` puts the editor panel in the compact (narrow) layout
 /// — the EDTB-4 threshold decision, taken from the egui available width (the

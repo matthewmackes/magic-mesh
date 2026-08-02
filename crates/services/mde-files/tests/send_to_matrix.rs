@@ -54,8 +54,8 @@ impl Backend for RecordingBackend {
         Vec::new()
     }
 
-    fn list(&self, _path: &str) -> Vec<mde_files::model::FileRow> {
-        Vec::new()
+    fn list(&self, _path: &str) -> Result<Vec<mde_files::model::FileRow>, BackendError> {
+        Ok(Vec::new())
     }
 
     fn audit_log(&self) -> Vec<AuditEntry> {

@@ -921,6 +921,21 @@ impl CommunicationsState {
         }
     }
 
+    /// Return the shared alert projection for linked This Node health views.
+    /// This is a read-only borrow of the existing Notification authority; no
+    /// second alert store is created in the hardware center.
+    pub(crate) fn alert_inbox(&self) -> Option<&AlertInbox> {
+        self.data.alert_inbox()
+    }
+
+    /// Publish one typed alert command through the same signed collab action
+    /// path used by Communications. This lets This Node acknowledge or snooze
+    /// a linked alert without creating a parallel mutation authority.
+    pub(crate) fn publish_alert_command(&self, command: CollabCommand) -> Result<(), String> {
+        let topic = topics::command_topic_for(&command);
+        publish_command(self.bus_root.as_deref(), &topic, &command)
+    }
+
     /// Focus the embedded editor without creating a second editor surface. The
     /// taskbar's Editor icon is therefore a direct route to the real Documents
     /// mode and preserves the existing Communications ownership boundary.

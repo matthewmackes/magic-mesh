@@ -93,7 +93,9 @@ impl Surface {
             Surface::Terminal => IconId::Terminal,
             Surface::Phones => IconId::Phones,
             Surface::Communications => IconId::Teams,
-            Surface::ThisNode | Surface::System => IconId::Settings,
+            // This Node is a workspace identity, not a notification stream;
+            // use the clean node glyph instead of the settings glyph's dot.
+            Surface::ThisNode | Surface::System => IconId::Node,
             Surface::Storage => IconId::Storage,
             Surface::About | Surface::Timers => IconId::Mark,
         }
@@ -121,6 +123,25 @@ impl Surface {
             Surface::AutoHome => "Car Home",
         }
     }
+}
+
+/// Workspaces owned by the notification/tool tray. These remain fully
+/// launchable through direct routes and keyboard shortcuts, but are not
+/// duplicated in the central launcher taxonomy.
+pub(crate) const TOOL_TRAY_SURFACES: [Surface; 5] = [
+    Surface::FleetMesh,
+    Surface::Music,
+    Surface::Media,
+    Surface::Phones,
+    Surface::ThisNode,
+];
+
+#[must_use]
+pub(crate) const fn is_tool_tray_surface(surface: Surface) -> bool {
+    matches!(
+        surface,
+        Surface::FleetMesh | Surface::Music | Surface::Media | Surface::Phones | Surface::ThisNode
+    )
 }
 
 /// Desktop egui crates embedded by the shell's launchable surface catalog.
@@ -300,24 +321,19 @@ pub(crate) struct LauncherGroup {
     pub(crate) surfaces: &'static [Surface],
 }
 
-/// The eight persistent launcher taxonomy groups. Every [`Surface::ALL`] entry
-/// appears exactly once; the single Springboard desktop uses the flattened
-/// taxonomy order while Spotlight and the switcher retain these groups.
-pub(crate) const LAUNCHER_GROUPS: [LauncherGroup; 8] = [
+/// The central launcher taxonomy. Tool-tray-owned workspaces are intentionally
+/// omitted so the center launcher does not duplicate the notification tray;
+/// the single Springboard desktop uses this flattened order.
+pub(crate) const LAUNCHER_GROUPS: [LauncherGroup; 6] = [
     LauncherGroup {
         label: "Mesh Control",
         accent: Style::ACCENT_MESH,
-        surfaces: &[Surface::FleetMesh, Surface::InfraCode],
+        surfaces: &[Surface::InfraCode],
     },
     LauncherGroup {
         label: "Desktop & Session",
         accent: Style::ACCENT,
         surfaces: &[Surface::Desktop, Surface::MapsLocation],
-    },
-    LauncherGroup {
-        label: "Media",
-        accent: Style::ACCENT_MEDIA,
-        surfaces: &[Surface::Music, Surface::Media],
     },
     LauncherGroup {
         label: "Files & Data",
@@ -337,12 +353,7 @@ pub(crate) const LAUNCHER_GROUPS: [LauncherGroup; 8] = [
     LauncherGroup {
         label: "Mesh Teams",
         accent: Style::ACCENT_TEAMS,
-        surfaces: &[Surface::Phones, Surface::Communications],
-    },
-    LauncherGroup {
-        label: "System",
-        accent: Style::ACCENT_WORKLOADS,
-        surfaces: &[Surface::ThisNode],
+        surfaces: &[Surface::Communications],
     },
 ];
 
@@ -401,9 +412,10 @@ const _: () = {
             }
             group += 1;
         }
+        let expected = if is_tool_tray_surface(Surface::ALL[i]) { 0 } else { 1 };
         assert!(
-            count == 1,
-            "every Surface::ALL entry must appear in LAUNCHER_GROUPS exactly once",
+            count == expected,
+            "central launcher must contain non-tray surfaces once and tray-owned surfaces zero times",
         );
         i += 1;
     }
@@ -691,11 +703,29 @@ mod tests {
             .iter()
             .flat_map(|group| group.surfaces.iter().copied())
             .collect();
-        assert_eq!(projected.len(), Surface::ALL.len());
+        assert_eq!(
+            projected.len(),
+            Surface::ALL.len() - TOOL_TRAY_SURFACES.len()
+        );
         for surface in Surface::ALL {
-            assert_eq!(projected.iter().filter(|item| **item == surface).count(), 1);
+            assert_eq!(
+                projected.iter().filter(|item| **item == surface).count(),
+                usize::from(!is_tool_tray_surface(surface)),
+                "{surface:?} has the wrong central-launcher membership"
+            );
         }
         assert!(Surface::ALL.contains(&Surface::ThisNode));
+        assert_eq!(Surface::ThisNode.icon_id(), IconId::Node);
+        assert_eq!(
+            TOOL_TRAY_SURFACES,
+            [
+                Surface::FleetMesh,
+                Surface::Music,
+                Surface::Media,
+                Surface::Phones,
+                Surface::ThisNode,
+            ]
+        );
         assert!(!Surface::ALL.contains(&Surface::System));
         assert!(!Surface::ALL.contains(&Surface::Storage));
         assert!(!Surface::ALL.contains(&Surface::About));

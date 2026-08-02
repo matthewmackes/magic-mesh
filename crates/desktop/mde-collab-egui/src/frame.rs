@@ -26,6 +26,10 @@ use mde_collab_types::{
 
 use crate::{icons, icons::CommsHoverExt, ChannelTab, CommunicationsSurface, MeshTeamsApp};
 
+fn theme_color(ui: &egui::Ui, color: egui::Color32) -> egui::Color32 {
+    Style::resolve_color(ui.ctx(), color)
+}
+
 /// The Teams-style app rail width.
 pub const APP_RAIL_W: f32 = Style::SP_XL * 2.25;
 /// The Teams + Channels rail width — a fixed, non-resizable gutter wide enough
@@ -353,7 +357,7 @@ impl CommunicationsSurface {
                 egui::RichText::new("Mesh")
                     .size(Style::SMALL)
                     .strong()
-                    .color(Style::TEXT_DIM),
+                    .color(theme_color(ui, Style::TEXT_DIM)),
             );
         });
         ui.add_space(Style::SP_XS);
@@ -365,7 +369,7 @@ impl CommunicationsSurface {
                     let tint = if selected {
                         Style::ACCENT
                     } else {
-                        Style::TEXT_DIM
+                        theme_color(ui, Style::TEXT_DIM)
                     };
                     let clicked = crate::anim::interactive_cell(
                         ui,
@@ -377,9 +381,9 @@ impl CommunicationsSurface {
                                 icons::icon(ui, glyph, Style::SP_M, tint);
                                 ui.label(egui::RichText::new(short_app_label(app)).small().color(
                                     if selected {
-                                        Style::TEXT_STRONG
+                                        theme_color(ui, Style::TEXT_STRONG)
                                     } else {
-                                        Style::TEXT_DIM
+                                        theme_color(ui, Style::TEXT_DIM)
                                     },
                                 ));
                             });
@@ -417,10 +421,10 @@ impl CommunicationsSurface {
                 egui::RichText::new("Teams & Channels")
                     .size(Style::SMALL)
                     .strong()
-                    .color(Style::TEXT_DIM),
+                    .color(theme_color(ui, Style::TEXT_DIM)),
             );
             ui.add_space(Style::SP_XS);
-            ui.label(egui::RichText::new("No spaces yet").color(Style::TEXT_DIM));
+            ui.label(egui::RichText::new("No spaces yet").color(theme_color(ui, Style::TEXT_DIM)));
             return;
         }
 
@@ -477,14 +481,14 @@ impl CommunicationsSurface {
                 egui::RichText::new(title)
                     .strong()
                     .size(Style::TITLE)
-                    .color(Style::TEXT_STRONG),
+                    .color(theme_color(ui, Style::TEXT_STRONG)),
             );
             if let Some(space) = selected {
                 ui.add_space(Style::SP_S);
                 ui.label(
                     egui::RichText::new(format!("{} members", space.members))
                         .small()
-                        .color(Style::TEXT_DIM),
+                        .color(theme_color(ui, Style::TEXT_DIM)),
                 );
             }
             ui.add_space(Style::SP_M);
@@ -504,13 +508,13 @@ impl CommunicationsSurface {
                                 if selected {
                                     Style::ACCENT
                                 } else {
-                                    Style::TEXT_DIM
+                                    theme_color(ui, Style::TEXT_DIM)
                                 },
                             );
                             ui.label(egui::RichText::new(tab.label()).color(if selected {
-                                Style::TEXT_STRONG
+                                theme_color(ui, Style::TEXT_STRONG)
                             } else {
-                                Style::TEXT
+                                theme_color(ui, Style::TEXT)
                             }));
                         },
                     )
@@ -539,12 +543,12 @@ impl CommunicationsSurface {
             egui::RichText::new("Details")
                 .size(Style::BODY)
                 .strong()
-                .color(Style::TEXT_STRONG),
+                .color(theme_color(ui, Style::TEXT_STRONG)),
         );
         ui.add_space(Style::SP_XS);
 
         let Some(details) = channel_details_model(self.selected_space(), data) else {
-            ui.label(egui::RichText::new("No channel selected").color(Style::TEXT_DIM));
+            ui.label(egui::RichText::new("No channel selected").color(theme_color(ui, Style::TEXT_DIM)));
             return;
         };
 
@@ -552,12 +556,12 @@ impl CommunicationsSurface {
             egui::RichText::new(details.name.as_str())
                 .size(Style::TITLE)
                 .strong()
-                .color(Style::TEXT_STRONG),
+                .color(theme_color(ui, Style::TEXT_STRONG)),
         );
         ui.label(
             egui::RichText::new(format!("{} · {}", details.kind, details.role))
                 .small()
-                .color(Style::TEXT_DIM),
+                .color(theme_color(ui, Style::TEXT_DIM)),
         );
         ui.add_space(Style::SP_S);
         ui.separator();
@@ -567,7 +571,7 @@ impl CommunicationsSurface {
             egui::RichText::new("Channel facts")
                 .small()
                 .strong()
-                .color(Style::TEXT_DIM),
+                .color(theme_color(ui, Style::TEXT_DIM)),
         );
         detail_row(ui, "Members", details.members);
         detail_row(ui, "Unread", details.unread);
@@ -578,7 +582,7 @@ impl CommunicationsSurface {
             egui::RichText::new("Live projections")
                 .small()
                 .strong()
-                .color(Style::TEXT_DIM),
+                .color(theme_color(ui, Style::TEXT_DIM)),
         );
         detail_row(ui, "Messages", details.messages);
         detail_row(ui, "Tasks", details.tasks);
@@ -593,7 +597,7 @@ impl CommunicationsSurface {
             egui::RichText::new("Discord bridge")
                 .small()
                 .strong()
-                .color(Style::TEXT_DIM),
+                .color(theme_color(ui, Style::TEXT_DIM)),
         );
         for bridge in &details.discord_bridges {
             discord_bridge_detail_row(ui, bridge);
@@ -620,10 +624,11 @@ impl CommunicationsSurface {
         let selected_space =
             selected_space_in_directory(self.selected_space(), data.space_directory());
         ui.horizontal(|ui| {
-            icons::icon(ui, icons::CALL_UNMUTE, glyph, Style::TEXT_DIM);
+            icons::icon(ui, icons::CALL_UNMUTE, glyph, theme_color(ui, Style::TEXT_DIM));
             ui.add_space(Style::SP_XS);
             if calls.is_empty() {
-                let none = egui::RichText::new("No active call").color(Style::TEXT_DIM);
+                let none = egui::RichText::new("No active call")
+                    .color(theme_color(ui, Style::TEXT_DIM));
                 ui.label(if car { none.size(Style::TITLE) } else { none });
                 if let Some(space) = selected_space {
                     ui.add_space(Style::SP_S);
@@ -677,9 +682,10 @@ impl CommunicationsSurface {
 
         let kind = egui::RichText::new(call_kind_label(call.kind))
             .strong()
-            .color(Style::TEXT);
+            .color(theme_color(ui, Style::TEXT));
         ui.label(if car { kind.size(Style::TITLE) } else { kind });
-        let count = egui::RichText::new(format!("{connected} on call")).color(Style::TEXT_DIM);
+        let count = egui::RichText::new(format!("{connected} on call"))
+            .color(theme_color(ui, Style::TEXT_DIM));
         ui.label(if car {
             count.size(Style::BODY)
         } else {
@@ -703,7 +709,7 @@ impl CommunicationsSurface {
             } else {
                 (icons::CALL_MUTE, "Mute")
             };
-            if icons::icon_button(ui, glyph, ctrl, Style::TEXT_DIM, hint).clicked() {
+            if icons::icon_button(ui, glyph, ctrl, theme_color(ui, Style::TEXT_DIM), hint).clicked() {
                 sink.emit(CollabCommand::SetCallMuted {
                     call: call.call,
                     muted: !participant.muted,
@@ -723,12 +729,12 @@ fn detail_row(ui: &mut egui::Ui, label: &str, value: impl ToString) {
 
 fn detail_text_row(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(label).color(Style::TEXT_DIM));
+        ui.label(egui::RichText::new(label).color(theme_color(ui, Style::TEXT_DIM)));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(
                 egui::RichText::new(value)
                     .strong()
-                    .color(Style::TEXT_STRONG),
+                    .color(theme_color(ui, Style::TEXT_STRONG)),
             );
         });
     });
@@ -739,14 +745,18 @@ fn discord_bridge_detail_row(ui: &mut egui::Ui, bridge: &DiscordBridgeRowModel) 
     ui.label(
         egui::RichText::new(bridge.label.as_str())
             .strong()
-            .color(Style::TEXT),
+            .color(theme_color(ui, Style::TEXT)),
     );
     detail_text_row(ui, "Status", bridge.status);
     detail_text_row(ui, "Discord → Mesh", bridge.inbound);
     detail_text_row(ui, "Mesh → Discord", bridge.outbound);
     detail_text_row(ui, "Provenance", bridge.provenance.as_str());
     if let Some(detail) = bridge.detail.as_deref() {
-        ui.label(egui::RichText::new(detail).small().color(Style::TEXT_DIM));
+        ui.label(
+            egui::RichText::new(detail)
+                .small()
+                .color(theme_color(ui, Style::TEXT_DIM)),
+        );
     }
 }
 
@@ -755,7 +765,7 @@ fn channel_find_editor(ui: &mut egui::Ui, surface: &mut CommunicationsSurface, s
         egui::RichText::new("Find")
             .small()
             .strong()
-            .color(Style::TEXT_DIM),
+                .color(theme_color(ui, Style::TEXT_DIM)),
     );
     let mut query = surface.channel_find(space).to_owned();
     let response = ui.add_sized(
@@ -784,7 +794,7 @@ fn paint_unread_badge(ui: &egui::Ui, row_rect: egui::Rect, unread: u32) {
     let galley = painter.layout_no_wrap(
         text,
         egui::FontId::proportional(Style::SMALL),
-        Style::TEXT_STRONG,
+        theme_color(ui, Style::TEXT_STRONG),
     );
     // Mirror the shared row's own plate inset so the pill hugs the same edge
     // the selection plate does.
@@ -807,7 +817,7 @@ fn paint_unread_badge(ui: &egui::Ui, row_rect: egui::Rect, unread: u32) {
             rect.center().y - galley.size().y * 0.5,
         ),
         galley,
-        Style::TEXT_STRONG,
+        theme_color(ui, Style::TEXT_STRONG),
     );
 }
 
