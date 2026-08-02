@@ -6,7 +6,7 @@ PipeWire/WirePlumber, libinput, and the image-owned runtime are installed in a
 dedicated `browser-vm-chromium` image. The image verifier is a static contents
 gate; it does not claim that a VM has booted or that a VDI endpoint is live.
 
-Build a signed/recorded disk artifact on the build farm with the Fedora-44
+Build a signed/recorded ext4-rootfs disk artifact on the build farm with the Fedora-44
 `magic-mesh-lighthouse` guest RPM, then set `browser_base_image_source` to the resulting qcow2 and
 pass the resulting image digest in the typed `browser-provision` request. A
 missing or malformed digest is refused before desired state is written.

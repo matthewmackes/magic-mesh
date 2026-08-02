@@ -98,6 +98,11 @@ mkdir -p "$HOME/.config/sway"
 cat > "$HOME/.config/sway/config" <<'EOF'
 default_border none
 default_floating_border none
+# QEMU's virtio display advertises a named Virtual-1 output. Explicitly enable
+# the first safe mode so a fresh guest does not leave the compositor with a
+# connected-but-unconfigured scanout (which presents as a black SPICE frame).
+output * enable
+output * mode 1024x768
 exec @CHROMIUM_BIN@ --ozone-platform=wayland --enable-features=UseOzonePlatform --start-maximized --no-first-run --disable-session-crashed-bubble --user-data-dir=/var/lib/mcnf-browser/chromium
 EOF
 

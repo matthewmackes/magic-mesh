@@ -11,7 +11,10 @@ RPMS=()
 DISK=""
 OUT="$DIR/out"
 BIB_IMAGE="${MCNF_BIB_IMAGE:-quay.io/centos-bootc/bootc-image-builder@sha256:2b52843ea2bfda73b0a08d97e76b734393b1d3a804681b9fabb26723bd3a2f0b}"
-BROWSER_VM_ROOTFS="${MCNF_BROWSER_VM_ROOTFS:-xfs}"
+# ext4 is the portable bootc-image-builder rootfs across the Fedora 44 farm
+# and Rocky orchestration host; the XFS lane fails in osbuild's loop mount
+# stage on the current builder image.
+BROWSER_VM_ROOTFS="${MCNF_BROWSER_VM_ROOTFS:-ext4}"
 PULL_TIMEOUT="${MCNF_PULL_TIMEOUT:-120}"
 
 usage() { echo "Usage: $0 [--rpm PATH]... [--base IMAGE] [--tag IMAGE] [--disk qcow2|raw|anaconda-iso] [--out DIR]"; }
