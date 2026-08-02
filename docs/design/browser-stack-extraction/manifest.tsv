@@ -1,6 +1,6 @@
 # browser-stack-extraction-manifest v1
-# source_commit=71c19235319c89c41eb8888d4804442a7860465c
-# source_commit_date=2026-08-02T13:22:19-04:00
+# source_commit=d1cb14d28843c6e9e886a8c51712c9dabf6106de
+# source_commit_date=2026-08-02T14:37:22-04:00
 # source_branch=agent/drain-worklist-20260725
 # source_remote=https://github.com/matthewmackes/magic-mesh.git
 # extraction_destination=matthewmackes/magic-mesh-browser-stack
@@ -25,10 +25,10 @@ mixed-purpose	crates/desktop/mde-shell-egui/src/storage/tests.rs	split-in-magic-
 mixed-purpose	crates/desktop/mde-shell-egui/src/surfaces.rs	split-in-magic-mesh-browser-stack:crates/desktop/mde-shell-egui/src/surfaces.rs#browser-sections	shell-route-or-shared-state	d91e170ded95cb59dee9239fbfa4791b52ba4a30	d91e170ded95cb59dee9239fbfa4791b52ba4a30	clean
 mixed-purpose	crates/desktop/mde-shell-egui/src/switcher.rs	split-in-magic-mesh-browser-stack:crates/desktop/mde-shell-egui/src/switcher.rs#browser-sections	shell-route-or-shared-state	b01b20a5e42cf7ea3f22f8398ae5779e8a98873e	b01b20a5e42cf7ea3f22f8398ae5779e8a98873e	clean
 mixed-purpose	crates/desktop/mde-shell-egui/src/toast_bridge.rs	split-in-magic-mesh-browser-stack:crates/desktop/mde-shell-egui/src/toast_bridge.rs#browser-sections	shell-route-or-shared-state	ad26c9a5afc74e7cfef5e476ab0c0604fe5387fe	ad26c9a5afc74e7cfef5e476ab0c0604fe5387fe	clean
-browser-owned	crates/desktop/mde-shell-egui/src/web/mod.rs	magic-mesh-browser-stack:crates/desktop/mde-shell-egui/src/web/mod.rs	host-browser-shell	cff30ce72c0c757c3d365c31595d65a75b17bedf	cff30ce72c0c757c3d365c31595d65a75b17bedf	clean
+browser-owned	crates/desktop/mde-shell-egui/src/web/mod.rs	magic-mesh-browser-stack:crates/desktop/mde-shell-egui/src/web/mod.rs	host-browser-shell	d9fef90af2bb5d15208970742c0a204f30018029	d9fef90af2bb5d15208970742c0a204f30018029	clean
 shared	crates/mesh/mackes-mesh-types/src/lib.rs	retain-in-magic-mesh:crates/mesh/mackes-mesh-types/src/lib.rs#shared-contract-or-reference	shared-mesh-contract	7269bd8af78e419653ee2f426dec5aba441f5296	7269bd8af78e419653ee2f426dec5aba441f5296	clean
 shared	crates/mesh/mackes-mesh-types/src/mesh_storage.rs	retain-in-magic-mesh:crates/mesh/mackes-mesh-types/src/mesh_storage.rs#shared-contract-or-reference	shared-mesh-contract	d10c7658c8b0ac0392483a4dea057497bc424964	d10c7658c8b0ac0392483a4dea057497bc424964	clean
-mixed-purpose	crates/mesh/mackesd/Cargo.toml	split-in-magic-mesh-browser-stack:crates/mesh/mackesd/Cargo.toml#browser-sections	workspace-package-edge	2cd0651ed7ecb3f0ed2760489dce230dbb3296a8	2cd0651ed7ecb3f0ed2760489dce230dbb3296a8	clean
+mixed-purpose	crates/mesh/mackesd/Cargo.toml	split-in-magic-mesh-browser-stack:crates/mesh/mackesd/Cargo.toml#browser-sections	workspace-package-edge	2cd0651ed7ecb3f0ed2760489dce230dbb3296a8	48e7dec31cc16768bbc7aa7fbcc07aa80a274c8c	dirty
 shared	crates/mesh/mackesd/src/ca/backup.rs	retain-in-magic-mesh:crates/mesh/mackesd/src/ca/backup.rs#shared-contract-or-reference	shared-secret-consumer	760443274e9146c1a044ad18756cfda0982917f0	760443274e9146c1a044ad18756cfda0982917f0	clean
 shared	crates/mesh/mackesd/src/ipc/secret_store.rs	retain-in-magic-mesh:crates/mesh/mackesd/src/ipc/secret_store.rs#shared-contract-or-reference	shared-secret-consumer	874e769cfef6da2bd7b015cfb56d97682ab4ff26	874e769cfef6da2bd7b015cfb56d97682ab4ff26	clean
 shared	crates/mesh/mackesd/src/lib.rs	retain-in-magic-mesh:crates/mesh/mackesd/src/lib.rs#shared-contract-or-reference	shared-infrastructure-reference	5547900eb15da70d891b4cc77bb4463e62f89dcc	5547900eb15da70d891b4cc77bb4463e62f89dcc	clean
@@ -85,7 +85,7 @@ shared	install-helpers/lint-layered-tiers.sh	retain-in-magic-mesh:install-helper
 shared	install-helpers/lint-style-leaks.sh	retain-in-magic-mesh:install-helpers/lint-style-leaks.sh#shared-contract-or-reference	shared-infrastructure-reference	7fd353d52b129fe3bc0edd823664a74775374cf8	7fd353d52b129fe3bc0edd823664a74775374cf8	clean
 mixed-purpose	install-helpers/rpm-features.sh	split-in-magic-mesh-browser-stack:install-helpers/rpm-features.sh#browser-sections	image-or-package-integration	2634290d6f9b2ef29e306d5d042eb7ec0eb05513	2634290d6f9b2ef29e306d5d042eb7ec0eb05513	clean
 mixed-purpose	install-helpers/verify-rpm-payload.sh	split-in-magic-mesh-browser-stack:install-helpers/verify-rpm-payload.sh#browser-sections	image-or-package-integration	bc823976095bc6f91fc52966113a34e3f043d2bd	bc823976095bc6f91fc52966113a34e3f043d2bd	clean
-shared	install-helpers/xcp-build.sh	retain-in-magic-mesh:install-helpers/xcp-build.sh#shared-contract-or-reference	shared-infrastructure-reference	d9ea94242e2bda141e9dc436f61544a3eb362bb3	732cc2595fb4f066505ed2a2c9ff6ece9690509a	dirty
+shared	install-helpers/xcp-build.sh	retain-in-magic-mesh:install-helpers/xcp-build.sh#shared-contract-or-reference	shared-infrastructure-reference	732cc2595fb4f066505ed2a2c9ff6ece9690509a	732cc2595fb4f066505ed2a2c9ff6ece9690509a	clean
 mixed-purpose	packaging/bootc/Containerfile	split-in-magic-mesh-browser-stack:packaging/bootc/Containerfile#browser-sections	image-or-package-integration	7a2e144f60446fe2ad9b6d7a9f94d6a50d8b6a03	7a2e144f60446fe2ad9b6d7a9f94d6a50d8b6a03	clean
 mixed-purpose	packaging/bootc/build-image.sh	split-in-magic-mesh-browser-stack:packaging/bootc/build-image.sh#browser-sections	image-or-package-integration	61f3558227ea0831387e902a12c1f55f6e76fa8d	61f3558227ea0831387e902a12c1f55f6e76fa8d	clean
 mixed-purpose	packaging/bootc/units/mde-shell-egui.service	split-in-magic-mesh-browser-stack:packaging/bootc/units/mde-shell-egui.service#browser-sections	image-or-package-integration	849f6f3f55ab7b9de89ea4844914dfc7cf316379	849f6f3f55ab7b9de89ea4844914dfc7cf316379	clean

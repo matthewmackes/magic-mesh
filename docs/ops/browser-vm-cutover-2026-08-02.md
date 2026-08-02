@@ -50,20 +50,15 @@ On BigBoy (`172.20.0.130`):
   tests and strict clippy gate passed.
 - `verify-browser-extraction.sh --check` passed for 85 paths: 18
   browser-owned, 25 mixed-purpose, and 42 shared.
-- The dedicated Fedora 44 Browser VM image was rebuilt and statically verified
-  on BigBoy from the local `magic-mesh-12.1.6-1.x86_64.rpm` artifact. The
-  Pixman candidate is profile `browser-vm-chromium-v1`, with build qcow2
-  SHA-256
-  `f7376cb8892cec011ca5c8651e5fa68e0a3a1ba7607df5694bbfb84a1a09ff1a`.
-  It includes cloud-init and seatd, disables weak workstation dependencies,
-  explicitly excludes `magic-mesh-browser`, and the static verifier found
-  Chromium, Sway, Wayland, Mesa, PipeWire/WirePlumber, libinput, the guest
-  runtime, and the host-Browser prohibition contract.
-- `bootc-image-builder` produced the Pixman qcow2 with an explicit XFS rootfs
-  on BigBoy at `/home/mm/browser-vm-chromium-qcow2-pixman-20260802/qcow2/disk.qcow2`; it is
-  a 10 GiB virtual disk with a 1.7 GiB sparse payload. The explicit rootfs is
-  required because Fedora 44's local image metadata does not provide
-  `DefaultRootFs` to the current builder.
+- The checked-in Browser VM image contract has not yet been rebuilt with this
+  payload. The current farm rebuild attempt reached the supported builder but
+  stopped at the unavailable `quay.io/fedora/fedora-bootc:44` base registry;
+  its temporary farm workspace and RPM were removed. The existing Pixman
+  candidate at `/home/mm/browser-vm-chromium-qcow2-pixman-20260802/qcow2/disk.qcow2`
+  has SHA-256
+  `f7376cb8892cec011ca5c8651e5fa68e0a3a1ba7607df5694bbfb84a1a09ff1a` and is
+  retained as prior evidence only; it must not be treated as proof of the
+  current RDP/PipeWire guest payload.
 
 ## Dell live evidence
 
@@ -75,6 +70,13 @@ On BigBoy (`172.20.0.130`):
   SPICE on Dell loopback `127.0.0.1:5900`.
 - Dell's QEMU display backend has no OpenGL support, so the domain deliberately
   remains on QXL/SPICE and the guest runtime exports `WLR_RENDERER=pixman`.
+- A persistent `virtio` sound device was attached to the domain configuration,
+  then the VM was power-cycled to apply it. Post-restart QEMU inspection showed
+  `virtio-sound-pci` wired to the SPICE `audio1` backend, and a fresh QEMU
+  capture still showed the Chromium New Tab page. The post-change capture has
+  SHA-256 `3516b6e5a0233721921d618c0d5d54bc91c6e1381e68a22c4d43acaf2d4758e`.
+  This proves device attachment and rendering continuity, not guest audio
+  playback.
 - After correcting the NoCloud image digest to the full 64-hex artifact digest,
   a fresh QEMU capture reached a 1920x1080 Chromium New Tab page. Capture
   SHA-256: `fd57e470c45cf0ea4e9f05bb284b3b08612aa021debafd8ec8525e52e9479eaf`.
@@ -84,6 +86,11 @@ On BigBoy (`172.20.0.130`):
   `71c19235319c89c41eb8888d4804442a7860465c`. The bounded evidence record is
   `/tmp/browser-vm-spice-proof-final-20260802.json` with probe-log SHA-256
   `954e41154795e9f861ffbc230617484ab000fa0ca7ba9a29de3ae2d61fb4fd73`.
+- After the virtio-sound change and VM power-cycle, the same farm runner was
+  rerun from source commit `d1cb14d28843c6e9e886a8c51712c9dabf6106de` through
+  the forwarded Dell console. It again passed the decoded-frame/input gate:
+  `1024x768`, frame FNV-1a64 `0xface601842022325`, and input observation
+  `echoed`.
 - The live proof runner now forwards only the approved VDI target variables
   through `xcp-build.sh`; its route self-test and the source-bound run pass.
 - On farm `.50` slot `browser-rdp-shell-20260802`, the updated shell binary
@@ -95,12 +102,13 @@ On BigBoy (`172.20.0.130`):
 
 ## Still unproven
 
-The host cutover, dedicated image/qcow2 provenance, Chromium guest capture,
-decoded SPICE pixels, and focused-input visual echo are evidenced. The current
-Dell domain is still QXL/SPICE and is not the new RDP image. RDP endpoint
+The host cutover, prior qcow2 provenance, Chromium guest capture, decoded SPICE
+pixels, and focused-input visual echo are evidenced. The current Dell domain
+is still QXL/SPICE and is not the newly rebuilt RDP image. RDP endpoint
 publication/authentication and live proof, GPU video, PipeWire audio,
 five-session performance, signed publication/install/upgrade, reconnect/failover,
-and six-node acceptance remain open. The image was built through the supported
-local-RPM lane because the Fedora 44 repository lane lacks the multimedia RPM
-dependencies required by the image build. Seat 15 still needs operator capacity
-work. This change does not claim that the Chromium App VM is production-ready.
+and six-node acceptance remain open. The image rebuild is also blocked by the
+unavailable Fedora base registry; separately, Fedora 44's enabled repositories
+lack the multimedia RPM dependencies required by the repository-only image
+lane. Seat 15 still needs operator capacity work. This change does not claim
+that the Chromium App VM is production-ready.
