@@ -175,6 +175,7 @@ impl SessionRailState {
                 serving_peer,
                 vm_id,
                 client_peer,
+                ..
             } => {
                 self.sessions.insert(
                     id.clone(),

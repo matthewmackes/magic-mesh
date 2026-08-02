@@ -383,6 +383,7 @@ pub fn apply_request(
             serving_peer,
             vm_id,
             client_peer,
+            ..
         } => {
             let session = open_session(id.clone(), serving_peer, vm_id, client_peer, now_ms);
             roster.insert(id, session);
@@ -1771,6 +1772,7 @@ mod tests {
                 serving_peer: "peer:a".into(),
                 vm_id: "uuid-1".into(),
                 client_peer: "peer:b".into(),
+                profile: None,
             },
             1,
         )
@@ -2292,6 +2294,7 @@ mod tests {
                 serving_peer: "peer:a".into(),
                 vm_id: "u1".into(),
                 client_peer: "peer:b".into(),
+                profile: None,
             }
         );
         assert_eq!(
@@ -2557,6 +2560,7 @@ mod tests {
             serving_peer: "peer:a".into(),
             vm_id: "vm-1".into(),
             client_peer: "peer:b".into(),
+            profile: None,
         };
         let armed = signed_body(&req, "session-replay");
         let tampered = armed.replace("vm-1", "vm-2");
@@ -3003,6 +3007,7 @@ mod tests {
                 serving_peer: "peer:a".into(),
                 vm_id: "uuid-1".into(),
                 client_peer: "peer:b".into(),
+                profile: None,
             },
             SessionRequest::Active { id: "s1".into() },
         ]);

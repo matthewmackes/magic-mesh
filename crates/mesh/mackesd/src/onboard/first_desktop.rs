@@ -860,6 +860,7 @@ pub fn session_open_request(open: &SessionOpen) -> crate::workers::session_broke
         serving_peer: open.serving_peer.clone(),
         vm_id: open.vm_id.clone(),
         client_peer: open.client_peer.clone(),
+        profile: None,
     }
 }
 
@@ -1631,6 +1632,7 @@ mod tests {
                 serving_peer: "peer:eagle".into(),
                 vm_id: "desktop-eagle".into(),
                 client_peer: "peer:eagle".into(),
+                profile: None,
             }
         );
     }

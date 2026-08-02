@@ -20,6 +20,13 @@ not a second active worklist.
 - Commit `ae2c14e0` refreshes the extraction manifest and classifies the
   Browser VM profile/validation files as retained shared guest-boundary
   contracts.
+- The serving broker now consumes an explicit `DesktopSessionProfile::BrowserVm`
+  on the shared `SessionRequest::Open` wire type. It discovers the guest IPv4
+  from libvirt's agent/lease tables, probes guest xrdp on TCP 3389, and relays
+  private libvirt addresses over the serving peer's Nebula address without
+  placing credentials in the mesh record. RDP falls back to the native SPICE
+  console when the guest endpoint is unavailable; dead relays and previously
+  unavailable records are retried by the broker's normal refresh loop.
 
 ## Farm evidence
 
@@ -101,6 +108,11 @@ On BigBoy (`172.20.0.130`):
   playback from the stale image.
 - The live proof runner now forwards only the approved VDI target variables
   through `xcp-build.sh`; its route self-test and the source-bound run pass.
+- Farm `.50` passed 26 focused `mackesd` console-broker tests, including the
+  typed Browser profile selecting guest RDP, private guest-address relay, and
+  healthy-relay heartbeat preservation. Farm `.90` passed 9 shared
+  `mackes-mesh-types` VDI-session tests, including the explicit
+  `profile:"browser_vm"` wire shape.
 - On farm `.50` slot `browser-rdp-shell-20260802`, the updated shell binary
   passed 5 focused Browser surface tests and 5 focused brokered VDI protocol
   resolution tests, including authoritative broker protocol selection and
@@ -120,4 +132,6 @@ and six-node acceptance remain open. The image rebuild is also blocked by the
 unavailable Fedora base registry; separately, Fedora 44's enabled repositories
 lack the multimedia RPM dependencies required by the repository-only image
 lane. Seat 15 still needs operator capacity work. This change does not claim
-that the Chromium App VM is production-ready.
+that the Chromium App VM is production-ready. The broker and wire gates are
+green; the live guest remains not ready for RDP because Dell currently refuses
+TCP 3389 and the running image is the stale Pixman/QXL candidate.

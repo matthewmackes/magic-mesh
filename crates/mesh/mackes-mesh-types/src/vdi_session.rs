@@ -287,6 +287,13 @@ impl AppVmLaunchRequest {
 /// `VmId` are all `= String` aliases, so this is byte-identical to the daemon's
 /// former definition and to the shell's former `String`-typed mirrors (a variant's
 /// tag plus its fields serialise in declaration order — see the wire-shape tests).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DesktopSessionProfile {
+    /// The guest-owned Chromium Browser VM route.
+    BrowserVm,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum SessionRequest {
@@ -302,6 +309,10 @@ pub enum SessionRequest {
         vm_id: String,
         /// The peer whose shell drives the desktop.
         client_peer: String,
+        /// Optional typed profile intent. Omitted for legacy/generic desktop
+        /// sessions so their wire shape remains byte-compatible.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile: Option<DesktopSessionProfile>,
     },
     /// Open a guest-owned Flatpak application through the same VDI lifecycle
     /// plane. These fields are policy identities, never commands, paths,
@@ -508,10 +519,30 @@ mod tests {
             serving_peer: "anvil".into(),
             vm_id: "win11".into(),
             client_peer: "seat".into(),
+            profile: None,
         };
         assert_eq!(
             req.to_body(),
             r#"{"op":"open","id":"vdi-1-win11","serving_peer":"anvil","vm_id":"win11","client_peer":"seat"}"#
+        );
+    }
+
+    #[test]
+    fn browser_profile_is_explicit_on_the_wire() {
+        let req = SessionRequest::Open {
+            id: "vdi-browser".into(),
+            serving_peer: "dell".into(),
+            vm_id: "browser-vm".into(),
+            client_peer: "seat-15".into(),
+            profile: Some(DesktopSessionProfile::BrowserVm),
+        };
+        assert_eq!(
+            req.to_body(),
+            r#"{"op":"open","id":"vdi-browser","serving_peer":"dell","vm_id":"browser-vm","client_peer":"seat-15","profile":"browser_vm"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<SessionRequest>(&req.to_body()).expect("browser profile"),
+            req
         );
     }
 
@@ -541,6 +572,7 @@ mod tests {
                 serving_peer: "p".into(),
                 vm_id: "v".into(),
                 client_peer: "c".into(),
+                profile: None,
             },
             SessionRequest::OpenApp {
                 id: "app-s".into(),

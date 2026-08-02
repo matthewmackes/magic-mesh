@@ -1463,7 +1463,7 @@ impl VdiState {
         preferred_size: Option<(u16, u16)>,
     ) -> Result<(), String> {
         let mut last_error = None;
-        let publication = crate::discovery::publish_open_record(
+        let publication = crate::discovery::publish_browser_vm_open_record(
             bus_root.as_deref(),
             &mut last_error,
             &target.serving_peer,

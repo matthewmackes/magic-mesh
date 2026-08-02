@@ -375,6 +375,7 @@ impl LocalApplier {
             serving_peer: serving_peer.to_string(),
             vm_id: vm_id.to_string(),
             client_peer: client_peer.to_string(),
+            profile: None,
         };
         let body =
             serde_json::to_string(&request).map_err(|error| RemotePushError::ActionFailed {
@@ -1153,6 +1154,7 @@ mod tests {
                 serving_peer: "peer:serving".into(),
                 vm_id: "vm-1".into(),
                 client_peer: "peer:client".into(),
+                profile: None,
             }
         );
     }

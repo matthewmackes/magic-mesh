@@ -29,7 +29,7 @@ use std::path::Path;
 
 use mackes_mesh_types::cloud::CLOUD_ACTION_SCHEMA_VERSION;
 use mackes_mesh_types::vdi_session::{
-    AppVmLaunchRequest, AppVmLifecycleState, SessionRequest,
+    AppVmLaunchRequest, AppVmLifecycleState, DesktopSessionProfile, SessionRequest,
 };
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
@@ -143,12 +143,44 @@ pub(crate) fn publish_open_record(
     vm_id: &str,
     client_peer: &str,
 ) -> OpenPublication {
+    publish_open_record_with_profile(bus_root, last_error, serving_peer, vm_id, client_peer, None)
+}
+
+/// Build + publish a Browser VM `Open` request with an explicit typed profile.
+/// The profile is intent only; the serving broker still discovers and probes the
+/// guest endpoint and never trusts a client-supplied address or credential.
+pub(crate) fn publish_browser_vm_open_record(
+    bus_root: Option<&Path>,
+    last_error: &mut Option<String>,
+    serving_peer: &str,
+    vm_id: &str,
+    client_peer: &str,
+) -> OpenPublication {
+    publish_open_record_with_profile(
+        bus_root,
+        last_error,
+        serving_peer,
+        vm_id,
+        client_peer,
+        Some(DesktopSessionProfile::BrowserVm),
+    )
+}
+
+fn publish_open_record_with_profile(
+    bus_root: Option<&Path>,
+    last_error: &mut Option<String>,
+    serving_peer: &str,
+    vm_id: &str,
+    client_peer: &str,
+    profile: Option<DesktopSessionProfile>,
+) -> OpenPublication {
     let id = mint_session_id(vm_id, now_ms());
     let request = SessionRequest::Open {
         id: id.clone(),
         serving_peer: serving_peer.to_string(),
         vm_id: vm_id.to_string(),
         client_peer: client_peer.to_string(),
+        profile,
     };
     let body = request.to_body();
     publish(bus_root, last_error, &request);
@@ -327,6 +359,7 @@ mod tests {
             serving_peer: "peer-x".to_string(),
             vm_id: "vm-y".to_string(),
             client_peer: "me".to_string(),
+            profile: None,
         }
         .to_body();
         assert_eq!(

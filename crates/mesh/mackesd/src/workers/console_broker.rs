@@ -51,6 +51,7 @@
 
 #![cfg(feature = "async-services")]
 
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
@@ -59,6 +60,7 @@ use std::time::{Duration, Instant};
 
 use mackes_mesh_types::cloud::CloudArmedToken;
 use mackes_mesh_types::vdi_clipboard::VdiClipboardStatus;
+use mackes_mesh_types::vdi_session::DesktopSessionProfile;
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 
@@ -95,6 +97,18 @@ pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Unconditional-republish heartbeat so a late shell subscriber / freshly-pruned
 /// topic still finds a live console record while a connect is pending.
 pub const PUBLISH_HEARTBEAT: Duration = Duration::from_secs(30);
+
+/// Stable Workloads identity for the Chromium guest. Browser is the one
+/// application route whose preferred transport is the guest-owned RDP service;
+/// other VM consoles continue to resolve their libvirt graphics endpoint.
+pub const BROWSER_VM_ID: &str = "browser-vm";
+
+/// The guest xrdp listener admitted by the Browser VM image contract.
+pub const BROWSER_VM_RDP_PORT: u16 = 3389;
+
+/// A short guest-probe timeout. This is only a readiness probe; the retained
+/// `socat` relay owns the actual long-lived connection.
+const GUEST_ENDPOINT_PROBE_TIMEOUT: Duration = Duration::from_millis(350);
 
 // ───────────────────────────── pure: data model ─────────────────────────────
 
@@ -205,6 +219,21 @@ pub fn is_loopback(host: &str) -> bool {
 /// hostname and a `peer:<hostname>` compare equal.
 fn strip_peer_prefix(s: &str) -> &str {
     s.strip_prefix("peer:").unwrap_or(s)
+}
+
+/// Parse one `virsh domifaddr` table and return the first usable guest IPv4.
+/// Keep this parser independent of the command runner so lease/agent output is
+/// tested without a libvirt dependency.
+#[must_use]
+fn parse_guest_ipv4(raw: &str) -> Option<Ipv4Addr> {
+    raw.lines().find_map(|line| {
+        let candidate = line.split_whitespace().last()?;
+        let candidate = candidate.split('/').next().unwrap_or(candidate);
+        let Ok(IpAddr::V4(ip)) = candidate.parse::<IpAddr>() else {
+            return None;
+        };
+        (!ip.is_loopback() && !ip.is_unspecified()).then_some(ip)
+    })
 }
 
 /// Whether an `Open`'s `serving_peer` names THIS node. The discovery lanes spell a
@@ -331,6 +360,24 @@ impl RelayHandle {
             let _ = child.wait();
         }
     }
+
+    /// Return whether the retained relay process is still serving. A detached
+    /// handle represents a directly reachable endpoint and is therefore alive
+    /// by definition. Reaping an exited child here lets the broker recreate the
+    /// overlay listener before a client retry rather than publishing a stale
+    /// endpoint forever.
+    fn is_alive(&mut self) -> bool {
+        let Some(child) = self.child.as_mut() else {
+            return true;
+        };
+        match child.try_wait() {
+            Ok(None) => true,
+            Ok(Some(_)) | Err(_) => {
+                self.child = None;
+                false
+            }
+        }
+    }
 }
 
 impl Drop for RelayHandle {
@@ -351,6 +398,18 @@ pub trait ConsoleRelay: Send + Sync {
     /// [`ConsoleBrokerError::Gated`] when `virsh` is absent;
     /// [`ConsoleBrokerError::Resolve`] when the console can't be resolved.
     fn resolve(&self, vm_id: &str) -> Result<ConsoleAddr, ConsoleBrokerError>;
+
+    /// Resolve a preferred transport when one is available, falling back to the
+    /// VM's native graphics console. The default preserves the old broker seam
+    /// for non-Browser VMs and for test fakes.
+    fn resolve_preferred(
+        &self,
+        vm_id: &str,
+        preferred: Option<DesktopProtocol>,
+    ) -> Result<ConsoleAddr, ConsoleBrokerError> {
+        let _ = preferred;
+        self.resolve(vm_id)
+    }
 
     /// This node's Nebula overlay address (empty when the overlay isn't up).
     fn overlay_addr(&self) -> String;
@@ -409,6 +468,54 @@ impl LiveConsoleRelay {
             Some(s)
         }
     }
+
+    /// Run `virsh domifaddr` against the guest agent and then the libvirt DHCP
+    /// lease table. The lease fallback matters during the image's first boot,
+    /// when `qemu-ga` may not yet be connected even though xrdp is reachable.
+    fn guest_ipv4(vm_id: &str) -> Option<Ipv4Addr> {
+        for source in ["agent", "lease"] {
+            let mut cmd = Command::new("virsh");
+            cmd.args(["-q", "domifaddr", "--source", source, vm_id]);
+            let Ok(out) = output_with_timeout(cmd, DEFAULT_CMD_TIMEOUT) else {
+                continue;
+            };
+            if !out.status.success() {
+                continue;
+            }
+            let raw = String::from_utf8_lossy(&out.stdout);
+            // `virsh domifaddr` is tabular and the address is the final
+            // column. Only accept a concrete IPv4 address; never turn a
+            // guest-provided hostname or path into a relay target.
+            if let Some(ip) = parse_guest_ipv4(&raw) {
+                return Some(ip);
+            }
+        }
+        None
+    }
+
+    /// Resolve the guest-owned xrdp endpoint without carrying credentials in
+    /// the mesh record. A TCP connect is intentionally required before the
+    /// broker publishes RDP; a stale DHCP lease therefore degrades to SPICE
+    /// rather than creating a doomed shell transport.
+    fn resolve_browser_rdp(vm_id: &str) -> Result<ConsoleAddr, ConsoleBrokerError> {
+        let Some(ip) = Self::guest_ipv4(vm_id) else {
+            return Err(ConsoleBrokerError::Resolve(
+                "browser-vm has no guest IPv4 address from the agent or lease table".to_string(),
+            ));
+        };
+        let addr = SocketAddr::new(IpAddr::V4(ip), BROWSER_VM_RDP_PORT);
+        TcpStream::connect_timeout(&addr, GUEST_ENDPOINT_PROBE_TIMEOUT).map_err(|error| {
+            ConsoleBrokerError::Resolve(format!(
+                "browser-vm xrdp endpoint {ip}:{} is not reachable: {error}",
+                BROWSER_VM_RDP_PORT
+            ))
+        })?;
+        Ok(ConsoleAddr {
+            protocol: DesktopProtocol::Rdp,
+            host: ip.to_string(),
+            port: BROWSER_VM_RDP_PORT,
+        })
+    }
 }
 
 impl ConsoleRelay for LiveConsoleRelay {
@@ -432,6 +539,24 @@ impl ConsoleRelay for LiveConsoleRelay {
                 "unparseable domdisplay output for `{vm_id}`: {raw}"
             ))
         })
+    }
+
+    fn resolve_preferred(
+        &self,
+        vm_id: &str,
+        preferred: Option<DesktopProtocol>,
+    ) -> Result<ConsoleAddr, ConsoleBrokerError> {
+        if preferred == Some(DesktopProtocol::Rdp) && vm_id == BROWSER_VM_ID {
+            match Self::resolve_browser_rdp(vm_id) {
+                Ok(endpoint) => return Ok(endpoint),
+                Err(error) => tracing::debug!(
+                    vm = vm_id,
+                    %error,
+                    "browser-vm RDP endpoint unavailable; trying native graphics console"
+                ),
+            }
+        }
+        self.resolve(vm_id)
     }
 
     fn overlay_addr(&self) -> String {
@@ -496,13 +621,31 @@ pub fn broker_console(
     relay: &dyn ConsoleRelay,
     vm_id: &str,
 ) -> (ConsoleStatus, Option<RelayHandle>) {
-    let console = match relay.resolve(vm_id) {
+    broker_console_with_preference(relay, vm_id, None)
+}
+
+/// Broker one VM console while honoring an optional preferred protocol. The
+/// preference is a serving-side policy decision, not an endpoint or credential
+/// supplied by the client. Browser uses this to attempt guest RDP before its
+/// native SPICE compatibility console.
+#[must_use]
+pub fn broker_console_with_preference(
+    relay: &dyn ConsoleRelay,
+    vm_id: &str,
+    preferred: Option<DesktopProtocol>,
+) -> (ConsoleStatus, Option<RelayHandle>) {
+    let console = match relay.resolve_preferred(vm_id, preferred) {
         Ok(c) => c,
         Err(e) => return (ConsoleStatus::Unbrokerable { reason: e.reason() }, None),
     };
-    // A non-loopback console is already reachable on whatever address libvirt bound
-    // — publish it directly, no relay needed.
-    if !is_loopback(&console.host) {
+    // A guest RDP address is normally a libvirt-private address (for example
+    // 192.168.122.0/24), not a Nebula address. It must still cross the serving
+    // host's overlay relay even though it is not loopback. Other non-loopback
+    // console addresses retain the old direct-publication behavior.
+    let guest_rdp_needs_relay = preferred == Some(DesktopProtocol::Rdp)
+        && vm_id == BROWSER_VM_ID
+        && console.protocol == DesktopProtocol::Rdp;
+    if !is_loopback(&console.host) && !guest_rdp_needs_relay {
         return (
             ConsoleStatus::Brokered {
                 protocol: console.protocol,
@@ -543,6 +686,7 @@ pub fn broker_console(
 /// it up (dropped on session close).
 struct BrokerEntry {
     record: BrokeredConsole,
+    preferred: Option<DesktopProtocol>,
     _relay: Option<RelayHandle>,
 }
 
@@ -804,6 +948,13 @@ impl ConsoleBrokerWorker {
     /// Apply one drained session op to the live broker state. Returns whether the
     /// brokered set changed (so the caller republishes). Pure over the relay seam.
     fn apply(&mut self, req: &SessionRequest) -> bool {
+        let browser_profile = matches!(
+            req,
+            SessionRequest::Open {
+                profile: Some(DesktopSessionProfile::BrowserVm),
+                ..
+            }
+        );
         match req {
             SessionRequest::Open {
                 id,
@@ -820,7 +971,12 @@ impl ConsoleBrokerWorker {
                 if self.brokered.contains_key(id) || !self.serves(serving_peer) {
                     return false;
                 }
-                let (status, handle) = broker_console(self.relay.as_ref(), vm_id);
+                let preferred = browser_profile.then_some(DesktopProtocol::Rdp);
+                let (status, handle) = broker_console_with_preference(
+                    self.relay.as_ref(),
+                    vm_id,
+                    preferred,
+                );
                 match &status {
                     ConsoleStatus::Brokered { host, port, .. } => tracing::info!(
                         session = %id, vm = %vm_id, overlay = %host, port,
@@ -840,6 +996,7 @@ impl ConsoleBrokerWorker {
                             vm_id: vm_id.clone(),
                             status,
                         },
+                        preferred,
                         _relay: handle,
                     },
                 );
@@ -852,6 +1009,46 @@ impl ConsoleBrokerWorker {
             | SessionRequest::AppState { .. }
             | SessionRequest::Disconnect { .. } => false,
         }
+    }
+
+    /// Refresh a dead relay immediately and retry an honest unavailable result
+    /// on the normal heartbeat. `socat` is forked per client connection, so a
+    /// healthy parent already provides reconnect semantics; this covers the
+    /// parent dying or the guest becoming ready after the first open.
+    fn refresh_relays(&mut self, heartbeat_due: bool) -> bool {
+        let ids: Vec<SessionId> = self.brokered.keys().cloned().collect();
+        let mut changed = false;
+        for id in ids {
+            let needs_refresh = {
+                let Some(entry) = self.brokered.get_mut(&id) else {
+                    continue;
+                };
+                entry
+                    ._relay
+                    .as_mut()
+                    .map_or(heartbeat_due, |relay| !relay.is_alive())
+            };
+            if !needs_refresh {
+                continue;
+            }
+            let (status, handle) = {
+                let Some(entry) = self.brokered.get(&id) else {
+                    continue;
+                };
+                broker_console_with_preference(
+                    self.relay.as_ref(),
+                    &entry.record.vm_id,
+                    entry.preferred,
+                )
+            };
+            let Some(entry) = self.brokered.get_mut(&id) else {
+                continue;
+            };
+            entry.record.status = status;
+            entry._relay = handle;
+            changed = true;
+        }
+        changed
     }
 
     /// Publish every live brokered-console record (one message per record, keyed by
@@ -889,11 +1086,11 @@ impl Worker for ConsoleBrokerWorker {
         loop {
             tokio::select! {
                 _ = tick.tick() => {
-                    let mut changed = false;
+                    let due = last_pub.elapsed() >= self.heartbeat;
+                    let mut changed = self.refresh_relays(due);
                     for req in read_new_actions(&bus_root, &mut cursor, &self.authorizer) {
                         changed |= self.apply(&req);
                     }
-                    let due = last_pub.elapsed() >= self.heartbeat;
                     if (changed || due) && !self.brokered.is_empty() {
                         if let Ok(persist) = Persist::open(bus_root.clone()) {
                             self.publish(&persist);
@@ -966,6 +1163,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn guest_address_parser_accepts_only_non_loopback_ipv4() {
+        let raw = concat!(
+            " Name      MAC                Protocol     Address\n",
+            " vnet0     52:54:00:aa:bb:cc  ipv4         127.0.0.1/8\n",
+            " vnet0     52:54:00:aa:bb:cc  ipv6         ::1/128\n",
+            " vnet0     52:54:00:aa:bb:cc  ipv4         192.168.122.113/24\n",
+        );
+        assert_eq!(parse_guest_ipv4(raw), Some(Ipv4Addr::new(192, 168, 122, 113)));
+        assert_eq!(parse_guest_ipv4("vnet0 mac ipv4 127.0.0.1/8\n"), None);
+        assert_eq!(parse_guest_ipv4("vnet0 mac ipv4 not-an-address\n"), None);
+    }
+
     // ── pure: is_loopback / serves_here / relay args ──
 
     #[test]
@@ -1010,6 +1220,7 @@ mod tests {
     #[derive(Default)]
     struct FakeRelay {
         resolve: Option<Result<ConsoleAddr, ConsoleBrokerError>>,
+        preferred: Option<Result<ConsoleAddr, ConsoleBrokerError>>,
         overlay: String,
         relay_ok: bool,
         started: Arc<Mutex<Vec<(String, u16, u16)>>>, // (overlay_addr, overlay_port, target_port)
@@ -1020,6 +1231,16 @@ mod tests {
             self.resolve
                 .clone()
                 .unwrap_or_else(|| Err(ConsoleBrokerError::Resolve("no fake".into())))
+        }
+        fn resolve_preferred(
+            &self,
+            vm_id: &str,
+            preferred: Option<DesktopProtocol>,
+        ) -> Result<ConsoleAddr, ConsoleBrokerError> {
+            if preferred.is_some() {
+                return self.preferred.clone().unwrap_or_else(|| self.resolve(vm_id));
+            }
+            self.resolve(vm_id)
         }
         fn overlay_addr(&self) -> String {
             self.overlay.clone()
@@ -1079,6 +1300,43 @@ mod tests {
         assert_eq!(
             relay.started.lock().unwrap().as_slice(),
             &[("10.42.0.7".to_string(), 5900, 5900)]
+        );
+    }
+
+    #[test]
+    fn browser_guest_rdp_is_relayed_even_when_the_guest_address_is_private() {
+        let relay = FakeRelay {
+            preferred: Some(Ok(ConsoleAddr {
+                protocol: DesktopProtocol::Rdp,
+                host: "192.168.122.113".into(),
+                port: BROWSER_VM_RDP_PORT,
+            })),
+            overlay: "10.42.0.7".into(),
+            relay_ok: true,
+            ..FakeRelay::default()
+        };
+        let (status, handle) = broker_console_with_preference(
+            &relay,
+            BROWSER_VM_ID,
+            Some(DesktopProtocol::Rdp),
+        );
+        assert!(handle.is_some());
+        assert_eq!(
+            status,
+            ConsoleStatus::Brokered {
+                protocol: DesktopProtocol::Rdp,
+                host: "10.42.0.7".into(),
+                port: BROWSER_VM_RDP_PORT,
+                clipboard: Some(VdiClipboardStatus::rdp_unsupported()),
+            }
+        );
+        assert_eq!(
+            relay.started.lock().unwrap().as_slice(),
+            &[(
+                "10.42.0.7".to_string(),
+                BROWSER_VM_RDP_PORT,
+                BROWSER_VM_RDP_PORT,
+            )]
         );
     }
 
@@ -1167,6 +1425,17 @@ mod tests {
             serving_peer: serving_peer.into(),
             vm_id: vm.into(),
             client_peer: "peer:elm".into(),
+            profile: None,
+        }
+    }
+
+    fn browser_open(id: &str, serving_peer: &str) -> SessionRequest {
+        SessionRequest::Open {
+            id: id.into(),
+            serving_peer: serving_peer.into(),
+            vm_id: BROWSER_VM_ID.into(),
+            client_peer: "peer:elm".into(),
+            profile: Some(DesktopSessionProfile::BrowserVm),
         }
     }
 
@@ -1210,6 +1479,48 @@ mod tests {
         assert_eq!(rec.vm_id, "win11");
         assert!(matches!(
             rec.status,
+            ConsoleStatus::Brokered { port: 5900, .. }
+        ));
+    }
+
+    #[test]
+    fn typed_browser_profile_selects_guest_rdp_in_the_worker_fold() {
+        let mut w = worker_with(FakeRelay {
+            preferred: Some(Ok(ConsoleAddr {
+                protocol: DesktopProtocol::Rdp,
+                host: "192.168.122.113".into(),
+                port: BROWSER_VM_RDP_PORT,
+            })),
+            overlay: "10.42.0.7".into(),
+            relay_ok: true,
+            ..FakeRelay::default()
+        });
+        assert!(w.apply(&browser_open("browser", "oak")));
+        assert!(matches!(
+            w.brokered["browser"].record.status,
+            ConsoleStatus::Brokered {
+                protocol: DesktopProtocol::Rdp,
+                port: BROWSER_VM_RDP_PORT,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn heartbeat_does_not_replace_a_healthy_relay() {
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let mut w = worker_with(FakeRelay {
+            resolve: Some(Ok(spice(5900))),
+            overlay: "10.42.0.7".into(),
+            relay_ok: true,
+            started: started.clone(),
+            ..FakeRelay::default()
+        });
+        assert!(w.apply(&open("heartbeat", "oak", "win11")));
+        assert!(!w.refresh_relays(true));
+        assert_eq!(started.lock().unwrap().len(), 1);
+        assert!(matches!(
+            w.brokered["heartbeat"].record.status,
             ConsoleStatus::Brokered { port: 5900, .. }
         ));
     }
