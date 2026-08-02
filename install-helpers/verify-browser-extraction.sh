@@ -92,6 +92,7 @@ class_for_path() {
     install-helpers/mirror-cef-runtime-to-spaces.sh|\
     install-helpers/setup-selinux-web-cef.sh|install-helpers/setup-selinux-web-preview.sh|\
     packaging/browser/*|packaging/selinux/mde-web-*|\
+    packaging/browser-vm/*|\
     packaging/systemd/mde-browser-*|packaging/systemd/mde-cef-runtime-setup.service|\
     packaging/systemd/mde-widevine-cdm-setup.service|packaging/systemd/mde-web-*)
       printf '%s\n' browser-owned
@@ -128,6 +129,7 @@ class_for_path() {
     crates/services/mde-bookmarks/*|crates/desktop/mde-bookmarks-egui/*|\
     crates/mesh/mde-seal/*|crates/mesh/mde-worker-core/*|\
     crates/mesh/mackes-mesh-types/src/lib.rs|crates/mesh/mackes-mesh-types/src/mesh_storage.rs|\
+    packaging/browser-vm/*|\
     crates/mesh/mackesd/src/ca/backup.rs|crates/mesh/mackesd/src/ipc/secret_store.rs|\
     crates/mesh/mackesd/src/lib.rs|crates/mesh/mackesd/src/workers/storage.rs|\
     install-helpers/lint-layered-tiers.sh|install-helpers/lint-style-leaks.sh|\
@@ -152,6 +154,9 @@ reason_for_path() {
     install-helpers/install-cef-runtime.sh|install-helpers/install-widevine-cdm.sh|\
     install-helpers/mirror-cef-runtime-to-spaces.sh|\
     install-helpers/setup-selinux-web-cef.sh|install-helpers/setup-selinux-web-preview.sh|\
+    packaging/browser-vm/*)
+      printf '%s\n' browser-vm-guest-contract
+      ;;
     packaging/browser/*|packaging/selinux/mde-web-*|\
     packaging/systemd/mde-browser-*|packaging/systemd/mde-cef-runtime-setup.service|\
     packaging/systemd/mde-widevine-cdm-setup.service|packaging/systemd/mde-web-*)
