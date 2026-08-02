@@ -73,6 +73,90 @@ pub struct StreamInfo {
     pub dest_rect: SpiceRect,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct WireDrawCopy {
+    surface_id: u32,
+    bbox: SpiceRect,
+    src_image: u32,
+    src_area: SpiceRect,
+}
+
+fn read_wire_u8(data: &[u8], offset: &mut usize) -> Option<u8> {
+    let value = *data.get(*offset)?;
+    *offset += 1;
+    Some(value)
+}
+
+fn read_wire_u16(data: &[u8], offset: &mut usize) -> Option<u16> {
+    let end = (*offset).checked_add(2)?;
+    let value = u16::from_le_bytes(data.get(*offset..end)?.try_into().ok()?);
+    *offset = end;
+    Some(value)
+}
+
+fn read_wire_u32(data: &[u8], offset: &mut usize) -> Option<u32> {
+    let end = (*offset).checked_add(4)?;
+    let value = u32::from_le_bytes(data.get(*offset..end)?.try_into().ok()?);
+    *offset = end;
+    Some(value)
+}
+
+fn read_wire_i32(data: &[u8], offset: &mut usize) -> Option<i32> {
+    Some(read_wire_u32(data, offset)? as i32)
+}
+
+fn read_wire_rect(data: &[u8], offset: &mut usize) -> Option<SpiceRect> {
+    // The wire order is top, left, bottom, right. SpiceRect keeps the
+    // conventional left/top/right/bottom field order for the rest of the API.
+    let top = read_wire_i32(data, offset)?;
+    let left = read_wire_i32(data, offset)?;
+    let bottom = read_wire_i32(data, offset)?;
+    let right = read_wire_i32(data, offset)?;
+    Some(SpiceRect {
+        left,
+        top,
+        right,
+        bottom,
+    })
+}
+
+fn parse_wire_draw_copy(data: &[u8]) -> Option<WireDrawCopy> {
+    let mut offset = 0;
+    let surface_id = read_wire_u32(data, &mut offset)?;
+    let bbox = read_wire_rect(data, &mut offset)?;
+
+    // SpiceClip is variable-length on the wire. The old fixed struct consumed
+    // an 8-byte address here and shifted every following field.
+    match read_wire_u8(data, &mut offset)? {
+        0 => {}
+        1 => {
+            let count = usize::try_from(read_wire_u32(data, &mut offset)?).ok()?;
+            let bytes = count.checked_mul(16)?;
+            offset = offset.checked_add(bytes)?;
+            data.get(offset..)?;
+        }
+        _ => return None,
+    }
+
+    let src_image = read_wire_u32(data, &mut offset)?;
+    let src_area = read_wire_rect(data, &mut offset)?;
+    let _rop_descriptor = read_wire_u16(data, &mut offset)?;
+    let _scale_mode = read_wire_u8(data, &mut offset)?;
+
+    // QMask: flags, position, and a 32-bit message-body address.
+    let _mask_flags = read_wire_u8(data, &mut offset)?;
+    let _mask_x = read_wire_i32(data, &mut offset)?;
+    let _mask_y = read_wire_i32(data, &mut offset)?;
+    let _mask_bitmap = read_wire_u32(data, &mut offset)?;
+
+    Some(WireDrawCopy {
+        surface_id,
+        bbox,
+        src_image,
+        src_area,
+    })
+}
+
 pub struct DisplayChannel {
     pub(crate) connection: ChannelConnection,
     surfaces: HashMap<u32, DisplaySurface>,
@@ -560,7 +644,7 @@ impl DisplayChannel {
                 let jpeg_data = &image_data[cursor.position() as usize..];
                 self.decode_jpeg(jpeg_data)
             }
-            SPICE_IMAGE_TYPE_LZ => {
+            SPICE_IMAGE_TYPE_LZ | SPICE_IMAGE_TYPE_GLZ => {
                 // Decompress LZ data (SPICE custom LZ format)
                 let compressed_data = &image_data[cursor.position() as usize..];
                 self.decode_lz(compressed_data, descriptor.width, descriptor.height)
@@ -766,18 +850,192 @@ impl DisplayChannel {
         Ok(Some((rgba_data, width, height)))
     }
 
-    /// Decode LZ compressed image (SPICE custom LZ format)
-    /// This is a simplified implementation - full LZ support would require implementing the SPICE LZ algorithm
+    /// Decode an LZ_RGB image (SPICE's bounded LZSS variant).
     fn decode_lz(
         &self,
-        _compressed_data: &[u8],
-        _width: u32,
-        _height: u32,
+        compressed_data: &[u8],
+        width: u32,
+        height: u32,
     ) -> Result<Option<(Vec<u8>, u32, u32)>> {
-        // TODO: Implement SPICE LZ decompression algorithm
-        // For now, return None to fall back to test pattern
-        warn!("LZ decompression not yet implemented");
-        Ok(None)
+        let declared_size = compressed_data
+            .get(..4)
+            .and_then(|bytes| Some(u32::from_le_bytes(bytes.try_into().ok()?)));
+        let Some(declared_size) = declared_size else {
+            warn!("LZ image is missing its compressed-size field");
+            return Ok(None);
+        };
+        let stream = compressed_data.get(4..).unwrap_or_default();
+        let stream = stream
+            .get(..usize::try_from(declared_size).unwrap_or(0))
+            .unwrap_or(stream);
+        if stream.len() < 28 || stream.get(..4) != Some(b"  ZL") {
+            warn!("LZ image has an invalid header");
+            return Ok(None);
+        }
+
+        // LZ_RGB's embedded header is big-endian, unlike the enclosing SPICE
+        // message and its little-endian size field.
+        let read_be_u32 = |at: usize| -> Option<u32> {
+            Some(u32::from_be_bytes(stream.get(at..at + 4)?.try_into().ok()?))
+        };
+        let image_type = *stream
+            .get(11)
+            .ok_or_else(|| SpiceError::Protocol("LZ image header is truncated".to_string()))?;
+        let stream_width = read_be_u32(12)
+            .ok_or_else(|| SpiceError::Protocol("LZ image header is truncated".to_string()))?;
+        let stream_height = read_be_u32(16)
+            .ok_or_else(|| SpiceError::Protocol("LZ image header is truncated".to_string()))?;
+        let stride = read_be_u32(20)
+            .ok_or_else(|| SpiceError::Protocol("LZ image header is truncated".to_string()))?;
+        let top_down = read_be_u32(24)
+            .ok_or_else(|| SpiceError::Protocol("LZ image header is truncated".to_string()))?
+            != 0;
+        if image_type != 8 || stream_width != width || stream_height != height {
+            warn!(
+                "unsupported LZ image header: type={}, size={}x{}, expected={}x{}",
+                image_type, stream_width, stream_height, width, height
+            );
+            return Ok(None);
+        }
+        let pixel_count = usize::try_from(width)
+            .ok()
+            .and_then(|w| usize::try_from(height).ok().and_then(|h| w.checked_mul(h)));
+        let Some(pixel_count) = pixel_count else {
+            return Ok(None);
+        };
+        let stride = usize::try_from(stride).map_err(|_| {
+            SpiceError::Protocol("LZ image stride does not fit in usize".to_string())
+        })?;
+        if stride < usize::try_from(width).unwrap_or(0).saturating_mul(4) {
+            warn!("LZ image stride is smaller than RGB32 row width");
+            return Ok(None);
+        }
+
+        let mut pixels = vec![
+            0u8;
+            pixel_count.checked_mul(4).ok_or_else(|| {
+                SpiceError::Protocol("LZ image pixel buffer is too large".to_string())
+            })?
+        ];
+        let mut input = 28usize;
+        let mut output = 0usize;
+        while output < pixel_count {
+            let command = *stream.get(input).ok_or_else(|| {
+                SpiceError::Protocol("LZ image ended before all pixels decoded".to_string())
+            })?;
+            input += 1;
+            if command < 32 {
+                let count = usize::from(command) + 1;
+                let end = output
+                    .checked_add(count)
+                    .ok_or_else(|| SpiceError::Protocol("LZ direct run overflowed".to_string()))?;
+                if end > pixel_count {
+                    return Err(SpiceError::Protocol(
+                        "LZ direct run exceeds image bounds".to_string(),
+                    ));
+                }
+                for pixel in output..end {
+                    let b = *stream.get(input).ok_or_else(|| {
+                        SpiceError::Protocol("LZ direct pixel is truncated".to_string())
+                    })?;
+                    let g = *stream.get(input + 1).ok_or_else(|| {
+                        SpiceError::Protocol("LZ direct pixel is truncated".to_string())
+                    })?;
+                    let r = *stream.get(input + 2).ok_or_else(|| {
+                        SpiceError::Protocol("LZ direct pixel is truncated".to_string())
+                    })?;
+                    input += 3;
+                    let dst = pixel * 4;
+                    pixels[dst..dst + 4].copy_from_slice(&[r, g, b, 255]);
+                }
+                output = end;
+                continue;
+            }
+
+            let mut length = usize::from(command >> 5);
+            let mut offset = usize::from(command & 0x1f) << 8;
+            length = length.saturating_sub(1);
+            if length == 6 {
+                loop {
+                    let extra = usize::from(*stream.get(input).ok_or_else(|| {
+                        SpiceError::Protocol("LZ length is truncated".to_string())
+                    })?);
+                    input += 1;
+                    length = length
+                        .checked_add(extra)
+                        .ok_or_else(|| SpiceError::Protocol("LZ length overflowed".to_string()))?;
+                    if extra != 255 {
+                        break;
+                    }
+                }
+            }
+            let low = usize::from(
+                *stream
+                    .get(input)
+                    .ok_or_else(|| SpiceError::Protocol("LZ offset is truncated".to_string()))?,
+            );
+            input += 1;
+            offset = offset
+                .checked_add(low)
+                .ok_or_else(|| SpiceError::Protocol("LZ offset overflowed".to_string()))?;
+            if low == 255 && offset.saturating_sub(low) == (31 << 8) {
+                let high = usize::from(*stream.get(input).ok_or_else(|| {
+                    SpiceError::Protocol("LZ extended offset is truncated".to_string())
+                })?);
+                let low = usize::from(*stream.get(input + 1).ok_or_else(|| {
+                    SpiceError::Protocol("LZ extended offset is truncated".to_string())
+                })?);
+                input += 2;
+                offset = (high << 8) | low;
+                offset = offset.checked_add(8191).ok_or_else(|| {
+                    SpiceError::Protocol("LZ extended offset overflowed".to_string())
+                })?;
+            }
+            let count = length.checked_add(1).ok_or_else(|| {
+                SpiceError::Protocol("LZ reference length overflowed".to_string())
+            })?;
+            let source = output
+                .checked_sub(offset.checked_add(1).ok_or_else(|| {
+                    SpiceError::Protocol("LZ reference offset overflowed".to_string())
+                })?)
+                .ok_or_else(|| {
+                    SpiceError::Protocol("LZ reference points before image".to_string())
+                })?;
+            let end = output.checked_add(count).ok_or_else(|| {
+                SpiceError::Protocol("LZ reference exceeds image bounds".to_string())
+            })?;
+            if end > pixel_count {
+                return Err(SpiceError::Protocol(
+                    "LZ reference exceeds image bounds".to_string(),
+                ));
+            }
+            for pixel in 0..count {
+                let src = (source + pixel) * 4;
+                let dst = (output + pixel) * 4;
+                let value = [
+                    pixels[src],
+                    pixels[src + 1],
+                    pixels[src + 2],
+                    pixels[src + 3],
+                ];
+                pixels[dst..dst + 4].copy_from_slice(&value);
+            }
+            output = end;
+        }
+
+        if !top_down {
+            let row_bytes = usize::try_from(width).unwrap_or(0).saturating_mul(4);
+            for y in 0..(usize::try_from(height).unwrap_or(0) / 2) {
+                let opposite = usize::try_from(height).unwrap_or(0) - 1 - y;
+                let a = y * row_bytes;
+                let b = opposite * row_bytes;
+                for column in 0..row_bytes {
+                    pixels.swap(a + column, b + column);
+                }
+            }
+        }
+
+        Ok(Some((pixels, width, height)))
     }
 
     /// Decode zlib compressed image
@@ -899,21 +1157,21 @@ impl DisplayChannel {
                     );
                 }
 
-                // Parse the draw copy message
-                let mut cursor = std::io::Cursor::new(data);
-                if let Ok(draw_copy) = SpiceDrawCopy::read(&mut cursor) {
-                    let surface_id = draw_copy.base.surface_id;
-                    let bbox = &draw_copy.base.box_;
-                    let src_area = &draw_copy.data.src_area;
+                // Parse the wire layout. DrawCopy embeds a variable-length
+                // clip and uses 32-bit message-body addresses.
+                if let Some(draw_copy) = parse_wire_draw_copy(data) {
+                    let surface_id = draw_copy.surface_id;
+                    let bbox = &draw_copy.bbox;
+                    let src_area = &draw_copy.src_area;
 
                     info!("DrawCopy on surface {} - rect: ({},{}) to ({},{}) from src rect ({},{}) to ({},{}) src_image: 0x{:x}",
                           surface_id, bbox.left, bbox.top, bbox.right, bbox.bottom,
                           src_area.left, src_area.top, src_area.right, src_area.bottom,
-                          draw_copy.data.src_image);
+                          draw_copy.src_image);
 
                     // Try to decode the source image
                     // Note: decode_image now handles special cached image addresses internally
-                    let decoded_image = self.decode_image(draw_copy.data.src_image, data)?;
+                    let decoded_image = self.decode_image(draw_copy.src_image.into(), data)?;
 
                     if let Some(surface) = self.surfaces.get_mut(&surface_id) {
                         match decoded_image {
@@ -938,8 +1196,10 @@ impl DisplayChannel {
                                 let dst_bottom = bbox.bottom.min(surface.height as i32) as usize;
 
                                 // Copy pixels from source to destination
-                                let copy_width = (src_right.saturating_sub(src_left)).min(dst_right.saturating_sub(dst_left));
-                                let copy_height = (src_bottom.saturating_sub(src_top)).min(dst_bottom.saturating_sub(dst_top));
+                                let copy_width = (src_right.saturating_sub(src_left))
+                                    .min(dst_right.saturating_sub(dst_left));
+                                let copy_height = (src_bottom.saturating_sub(src_top))
+                                    .min(dst_bottom.saturating_sub(dst_top));
 
                                 for y in 0..copy_height {
                                     let src_y = src_top + y;
@@ -980,7 +1240,7 @@ impl DisplayChannel {
                                 self.notify_update(surface_id);
                             }
                             None => {
-                                warn!("Failed to decode image at address 0x{:x}, using blue test pattern", draw_copy.data.src_image);
+                                warn!("Failed to decode image at address 0x{:x}, using blue test pattern", draw_copy.src_image);
 
                                 // Fallback to blue test pattern
                                 let bytes_per_pixel = 4;
@@ -1078,8 +1338,10 @@ impl DisplayChannel {
                             let dst_bottom = bbox.bottom.min(surface.height as i32) as usize;
 
                             // Copy pixels from source to destination
-                            let copy_width = (src_right.saturating_sub(src_left)).min(dst_right.saturating_sub(dst_left));
-                            let copy_height = (src_bottom.saturating_sub(src_top)).min(dst_bottom.saturating_sub(dst_top));
+                            let copy_width = (src_right.saturating_sub(src_left))
+                                .min(dst_right.saturating_sub(dst_left));
+                            let copy_height = (src_bottom.saturating_sub(src_top))
+                                .min(dst_bottom.saturating_sub(dst_top));
 
                             for y in 0..copy_height {
                                 let src_y = src_top + y;
@@ -1344,10 +1606,10 @@ impl DisplayChannel {
                                     let dst_bottom =
                                         bbox.bottom.min(surface.height as i32) as usize;
 
-                                    let copy_width =
-                                        (src_right.saturating_sub(src_left)).min(dst_right.saturating_sub(dst_left));
-                                    let copy_height =
-                                        (src_bottom.saturating_sub(src_top)).min(dst_bottom.saturating_sub(dst_top));
+                                    let copy_width = (src_right.saturating_sub(src_left))
+                                        .min(dst_right.saturating_sub(dst_left));
+                                    let copy_height = (src_bottom.saturating_sub(src_top))
+                                        .min(dst_bottom.saturating_sub(dst_top));
 
                                     for y in 0..copy_height {
                                         let src_y = src_top + y;
@@ -1421,10 +1683,10 @@ impl DisplayChannel {
                                         let dst_bottom =
                                             bbox.bottom.min(surface.height as i32) as usize;
 
-                                        let copy_width =
-                                            (src_right.saturating_sub(src_left)).min(dst_right.saturating_sub(dst_left));
-                                        let copy_height =
-                                            (src_bottom.saturating_sub(src_top)).min(dst_bottom.saturating_sub(dst_top));
+                                        let copy_width = (src_right.saturating_sub(src_left))
+                                            .min(dst_right.saturating_sub(dst_left));
+                                        let copy_height = (src_bottom.saturating_sub(src_top))
+                                            .min(dst_bottom.saturating_sub(dst_top));
 
                                         for y in 0..copy_height {
                                             let src_y = src_top + y;
@@ -1508,8 +1770,10 @@ impl DisplayChannel {
                             let dst_right = bbox.right.min(surface.width as i32) as usize;
                             let dst_bottom = bbox.bottom.min(surface.height as i32) as usize;
 
-                            let copy_width = (src_right.saturating_sub(src_left)).min(dst_right.saturating_sub(dst_left));
-                            let copy_height = (src_bottom.saturating_sub(src_top)).min(dst_bottom.saturating_sub(dst_top));
+                            let copy_width = (src_right.saturating_sub(src_left))
+                                .min(dst_right.saturating_sub(dst_left));
+                            let copy_height = (src_bottom.saturating_sub(src_top))
+                                .min(dst_bottom.saturating_sub(dst_top));
 
                             // Extract transparent color components (assuming RGB format)
                             let trans_r = ((draw_transparent.src_color >> 16) & 0xFF) as u8;
@@ -2161,6 +2425,48 @@ mod tests {
         assert_eq!(parsed.base.box_.bottom, 150);
         assert_eq!(parsed.src_pos.x, 10);
         assert_eq!(parsed.src_pos.y, 20);
+    }
+
+    #[test]
+    fn draw_copy_parser_consumes_the_variable_clip_and_wire_addresses() {
+        let mut message = Vec::new();
+        let push_u8 = |message: &mut Vec<u8>, value: u8| message.push(value);
+        let push_u16 =
+            |message: &mut Vec<u8>, value: u16| message.extend_from_slice(&value.to_le_bytes());
+        let push_i32 =
+            |message: &mut Vec<u8>, value: i32| message.extend_from_slice(&value.to_le_bytes());
+        let push_rect = |message: &mut Vec<u8>, top: i32, left: i32, bottom: i32, right: i32| {
+            push_i32(message, top);
+            push_i32(message, left);
+            push_i32(message, bottom);
+            push_i32(message, right);
+        };
+
+        message.extend_from_slice(&0u32.to_le_bytes());
+        push_rect(&mut message, 2, 3, 20, 40);
+        push_u8(&mut message, 1);
+        message.extend_from_slice(&1u32.to_le_bytes());
+        push_rect(&mut message, 4, 5, 6, 7);
+        message.extend_from_slice(&57u32.to_le_bytes());
+        push_rect(&mut message, 8, 9, 18, 19);
+        push_u16(&mut message, 8);
+        push_u8(&mut message, 0);
+        push_u8(&mut message, 0);
+        push_i32(&mut message, 0);
+        push_i32(&mut message, 0);
+        message.extend_from_slice(&0u32.to_le_bytes());
+
+        let parsed = parse_wire_draw_copy(&message).expect("valid DrawCopy wire body");
+        assert_eq!(parsed.surface_id, 0);
+        assert_eq!(parsed.src_image, 57);
+        assert_eq!(parsed.bbox.left, 3);
+        assert_eq!(parsed.bbox.top, 2);
+        assert_eq!(parsed.bbox.right, 40);
+        assert_eq!(parsed.bbox.bottom, 20);
+        assert_eq!(parsed.src_area.left, 9);
+        assert_eq!(parsed.src_area.top, 8);
+        assert_eq!(parsed.src_area.right, 19);
+        assert_eq!(parsed.src_area.bottom, 18);
     }
 
     #[test]

@@ -170,7 +170,7 @@ async fn live_spice_console_connects_renders_and_accepts_input() {
     );
     assert!(img.size[0] > 0 && img.size[1] > 0, "empty desktop");
     assert!(
-        colors > 1,
+        colors > 16,
         "live: SPICE frame is a flat fill; decoded guest pixels are not ready"
     );
 

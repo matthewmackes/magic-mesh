@@ -7,7 +7,10 @@ set -eu
 runtime_dir=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
 install -d -o "$(id -u)" -g "$(id -g)" -m 0700 "$runtime_dir"
 export XDG_RUNTIME_DIR="$runtime_dir"
-export WLR_RENDERER=gles2
+# QXL/SPICE is the compatibility display path on nodes without an
+# OpenGL-enabled QEMU display backend. Pixman keeps the guest compositor
+# usable there instead of failing during EGL renderer setup.
+export WLR_RENDERER=pixman
 export WLR_NO_HARDWARE_CURSORS=1
 chromium_bin=$(command -v chromium || command -v chromium-browser)
 

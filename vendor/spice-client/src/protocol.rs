@@ -802,8 +802,6 @@ pub struct SpiceImageDescriptor {
     pub id: u64,
     pub type_: u8, // ImageType enum (BITMAP, QUIC, LZ, GLZ, etc.)
     pub flags: u8, // ImageFlags
-    #[br(pad_before = 2)] // 2 bytes padding for alignment
-    #[bw(pad_before = 2)]
     pub width: u32,
     pub height: u32,
 }

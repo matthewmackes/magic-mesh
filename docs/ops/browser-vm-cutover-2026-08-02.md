@@ -61,29 +61,30 @@ On BigBoy (`172.20.0.130`):
   cloud-init seed updated for the final image digest and a QXL SPICE video
   device. The domain has 4 vCPUs, 8 GiB RAM, the virtio input devices, and
   SPICE on Dell loopback `127.0.0.1:5900`.
-- A QEMU framebuffer capture from the running guest is 1920x1080 and visibly
-  shows guest Chromium's New Tab page, focused omnibox, tabs, and browser
-  chrome. The capture is the first positive guest Chromium render evidence;
-  it is not being used as a substitute for the VDI decoder gate.
+- The persistent Dell domain was restored to its known QXL/SPICE configuration
+  after a scoped virtio display probe failed because Dell's QEMU display backend
+  has no OpenGL support. A fresh QEMU capture reaches the Fedora login/audit
+  console, not Chromium; no current guest-Chromium render claim is made.
 - The farm `mde-vdi-spice` live test connected through an SSH-forwarded Dell
-  SPICE console. The vendored `spice-client 0.2.0` fork hardens draw-copy
-  clipping and leaves the write-only inputs channel available while the
-  display receive loop runs. Two consecutive live runs both connected, sent
-  `Key::M + Enter` through `SpiceTransport::flush_input`, and completed with
-  `test ... ok`; the second run is the reconnect evidence. The observed frame
-  is still `1024x768` with `distinct_colors=1` (flat black), so the tightened
-  live gate rejects it as decoded guest rendering even though the transport
-  and input wire paths are live.
+  SPICE console. The vendored `spice-client 0.2.0` fork now parses the
+  variable-clip DrawCopy wire layout, 32-bit image offsets, and the observed
+  LZ_RGB image payload without panicking. The current console frame decodes to
+  only two or three colors, so the tightened live gate rejects it as decoded
+  guest rendering. The runtime journal shows seatd accepting the compositor
+  client and then losing it immediately; the guest service is restart-looping
+  rather than presenting Chromium.
 - Seat 15 (`172.20.0.15`) remains untouched; its low free-space condition makes
   it unsuitable for this image without operator capacity work.
 
 ## Still unproven
 
-The host cutover, dedicated image/qcow2 build, Dell boot, guest Chromium
-framebuffer, SPICE connection, input wire path, and reconnect are evidenced.
-Decoded guest pixels over VDI, focused-input visual echo, GPU video,
-PipeWire audio, performance, signed publication/install, and six-node
-acceptance remain open. The immediate blocker is now the upstream SPICE draw
-decoder’s wire-layout/image decode (the panic is hardened, but the result is
-still flat black); Seat 15 still needs operator capacity work. This change
+The host cutover, dedicated image/qcow2 provenance, SPICE connection, and
+wire-level input attempt are evidenced. Decoded Chromium pixels over VDI,
+focused-input visual echo, guest runtime stability, GPU video, PipeWire audio,
+performance, signed publication/install, and six-node acceptance remain open.
+The decoder’s wire-layout/image path is now corrected and rejects the current
+flat console frame; the immediate deployment blocker is rebuilding the guest
+image with the Pixman runtime fix, because the Fedora 44 repository currently
+lacks the multimedia RPM dependencies required by the image build. Dell is
+back on QXL/SPICE, and Seat 15 still needs operator capacity work. This change
 does not claim that the Chromium App VM is production-ready.
