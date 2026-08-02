@@ -45,23 +45,26 @@ must be committed/reconciled before extraction.
 
 ## Standalone build evidence — 2026-08-02
 
-The public repository currently admits `mde-web-wire`, `mde-adblock`, and the
-independently buildable `mde-web-preview-client` in its root workspace. Its
-clean-clone root test covers 135 tests. The separately locked native helper
-roots also pass farm checks on BigBoy:
+The public repository currently admits `mde-web-wire`, `mde-adblock`,
+`mde-web-preview-client`, the worker core, Bus, seal, mesh-type, and
+`mde-browser-workers` crates in its root workspace. At the latest public
+commit, `3b06da0d`, the full locked workspace test gate passed on BigBoy. The
+separately locked native helper roots also pass farm checks there:
 
 - `mde-web-sandbox`: `cargo check --locked --offline` passed.
 - `mde-web-cef`: `cargo check --locked --offline` passed.
 - `mde-web-preview`: `cargo check --locked --offline` passed.
-- `mde-web-preview-client`: all 87 unit tests and `cargo clippy --all-targets
-  --locked --offline -- -D warnings` passed.
+- `mde-web-preview-client`: all 87 unit tests and `cargo clippy -p
+  mde-web-preview-client --all-targets --locked --offline -- -D warnings`
+  passed.
+- `cargo clippy --workspace --lib --locked --offline -- -D warnings` passed for
+  the runtime/library surface.
 
-The worker family is not yet admitted because its shared platform dependencies
-(`mde-worker-core`, `mde-bus`, `mackes-mesh-types`, and `mde-seal`) still need
-history-preserving extraction. These checks establish standalone helper
-buildability; they do not establish a vendored CEF payload, guest Chromium
-pixels, VDI input/reconnect, GPU video, PipeWire audio, performance, or
-six-node acceptance.
+The worker family and its shared platform dependencies are now admitted in the
+standalone root; no placeholder crates were added. These checks establish the
+history-bearing standalone build boundary, not a vendored CEF payload, guest
+Chromium pixels, VDI input/reconnect, GPU video, PipeWire audio, performance,
+or six-node acceptance.
 
 ## Current workspace, package, and process inventory
 
@@ -138,9 +141,8 @@ that extraction auditable.
 ## Operator-gated next actions
 
 1. Review this manifest and the persistent-data inventory.
-2. In a disposable checkout, perform the history-preserving extraction and
-   record the resulting standalone commit and `UPSTREAM-SOURCE.md` there.
-3. Build/test the standalone repository from a clean clone, preserve
-   `LICENSE`/`NOTICE`, and obtain operator authority before publication.
-4. Only after that proof may `magic-mesh` remove host Browser code and cut over
-   `Surface::Browser` to the VM-backed path.
+2. Finish the Browser VM image/payload and obtain live guest Chromium evidence
+   for framebuffer rendering, focused input, transport/reconnect, GPU video,
+   PipeWire audio, and performance.
+3. Run the six-node acceptance on seat 15 and Dell. Only after those gates may
+   the retained host Browser source be removed from `magic-mesh`.
