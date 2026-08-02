@@ -91,6 +91,14 @@ On BigBoy (`172.20.0.130`):
   the forwarded Dell console. It again passed the decoded-frame/input gate:
   `1024x768`, frame FNV-1a64 `0xface601842022325`, and input observation
   `echoed`.
+- Dell now routes the running domain's `virtio-sound-pci` device through
+  QEMU's named Pulse backend (`MCNF-Browser-VM`) to a localhost-only
+  PipeWire-Pulse endpoint at `127.0.0.1:4713`. The endpoint is kept alive by
+  the user service `mcnf-qemu-pulse-endpoint.service` and survived a
+  `pipewire-pulse` restart; the `qemu` service account authenticated and a
+  `MCNF-Browser-VM` sink-input appeared in the Dell mixer during a bounded
+  playback probe. This proves the host audio route, not Chromium guest
+  playback from the stale image.
 - The live proof runner now forwards only the approved VDI target variables
   through `xcp-build.sh`; its route self-test and the source-bound run pass.
 - On farm `.50` slot `browser-rdp-shell-20260802`, the updated shell binary
@@ -103,10 +111,11 @@ On BigBoy (`172.20.0.130`):
 ## Still unproven
 
 The host cutover, prior qcow2 provenance, Chromium guest capture, decoded SPICE
-pixels, and focused-input visual echo are evidenced. The current Dell domain
-is still QXL/SPICE and is not the newly rebuilt RDP image. RDP endpoint
-publication/authentication and live proof, GPU video, PipeWire audio,
-five-session performance, signed publication/install/upgrade, reconnect/failover,
+pixels, focused-input visual echo, and the Dell host PipeWire audio route are
+evidenced. The current Dell domain is still QXL/SPICE and is not the newly
+rebuilt RDP image. RDP endpoint publication/authentication and live proof, GPU
+video, guest Chromium audio playback, five-session performance,
+signed publication/install/upgrade, reconnect/failover,
 and six-node acceptance remain open. The image rebuild is also blocked by the
 unavailable Fedora base registry; separately, Fedora 44's enabled repositories
 lack the multimedia RPM dependencies required by the repository-only image
