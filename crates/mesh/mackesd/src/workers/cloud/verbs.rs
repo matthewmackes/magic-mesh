@@ -226,6 +226,9 @@ pub(crate) struct CloudActionBody {
     /// Resume an existing guest session when available.
     #[serde(default)]
     pub resume: bool,
+    /// Immutable Browser VM guest-image digest (`sha256:<64-hex>`).
+    #[serde(default)]
+    pub image_digest: Option<String>,
     /// The armed-token capability authorizing a live mutation (mesh-identity-signed).
     #[serde(default)]
     pub armed_token: Option<String>,

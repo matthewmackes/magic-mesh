@@ -12,7 +12,11 @@ locals {
   # exactly that workload on this placement node.
   vm_workloads = {
     for name, w in var.vms : name => w
-    if contains(["desktop_vm", "service_vm"], w.delivery_type)
+    if contains(["desktop_vm", "service_vm"], w.delivery_type) && w.image != "browser-vm-chromium"
+  }
+  browser_workloads = {
+    for name, w in var.vms : name => w
+    if w.delivery_type == "desktop_vm" && w.image == "browser-vm-chromium"
   }
   app_workloads = {
     for name, w in var.vms : name => w
@@ -31,13 +35,16 @@ locals {
   # The join token is the sensitive value the mde-seal bridge (secrets.tf) unsealed
   # at apply time.
   domain_user_data = {
-    for name, w in merge(local.vm_workloads, local.app_workloads, local.android_workloads) :
+    for name, w in merge(local.vm_workloads, local.browser_workloads, local.app_workloads, local.android_workloads) :
     name => templatefile("${path.module}/cloud-init/mesh-join.yaml.tftpl", {
       hostname              = name
       ssh_authorized_key    = var.mesh_join.ssh_authorized_key
       lighthouse_overlay_ip = var.mesh_join.lighthouse_overlay_ip
       join_token            = local.join_token
       app                   = try(w.app, null)
+      delivery_type         = w.delivery_type
+      image                 = try(w.image, "")
+      image_digest          = try(w.image_digest, "")
     })
   }
 }
@@ -77,6 +84,17 @@ resource "libvirt_volume" "app_base" {
   format = "qcow2"
 }
 
+# Browser VMs use a dedicated Chromium/Sway/PipeWire guest image. They must not
+# silently boot the generic desktop image while the Browser surface claims VDI.
+resource "libvirt_volume" "browser_base" {
+  count = length(local.browser_workloads) > 0 ? 1 : 0
+
+  name   = "${var.network.name}-browser-chromium-base.qcow2"
+  pool   = var.pool
+  source = var.browser_base_image_source
+  format = "qcow2"
+}
+
 # The Debian Cuttlefish base image, imported once when an android_vm workload is
 # declared (the nested-virt L1 host base — see modules/android).
 resource "libvirt_volume" "android_base" {
@@ -100,6 +118,21 @@ module "vm" {
   disk_gb        = each.value.disk_gb
   pool           = var.pool
   base_volume_id = one(libvirt_volume.base[*].id)
+  network_id     = module.network.network_id
+  user_data      = local.domain_user_data[each.key]
+}
+
+# One dedicated Chromium Browser VM per typed browser workload.
+module "browser_vm" {
+  source   = "./modules/vm"
+  for_each = local.browser_workloads
+
+  name           = each.key
+  vcpu           = each.value.vcpu
+  memory_mb      = each.value.memory_mb
+  disk_gb        = each.value.disk_gb
+  pool           = var.pool
+  base_volume_id = one(libvirt_volume.browser_base[*].id)
   network_id     = module.network.network_id
   user_data      = local.domain_user_data[each.key]
 }
@@ -135,7 +168,6 @@ module "android" {
   base_volume_id    = one(libvirt_volume.android_base[*].id)
   network_id        = module.network.network_id
   user_data         = local.domain_user_data[each.key]
-  app              = each.value.app
   network_isolation = each.value.network_isolation
 }
 

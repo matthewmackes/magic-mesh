@@ -9,6 +9,10 @@ PROFILE_VERIFY="$BROWSER_VM/verify-profile.sh"
 VALIDATOR="$BROWSER_VM/validate-runtime-inputs.sh"
 ACTIVATION_VERIFY="$BROWSER_VM/verify-activation-contract.sh"
 ATTACH_VERIFY="$BROWSER_VM/verify-transport-attach.sh"
+IMAGE_BUILD="$BROWSER_VM/build-image.sh"
+IMAGE_VERIFY="$BROWSER_VM/verify-image.sh"
+RUNTIME="$BROWSER_VM/mcnf-browser-vm-runtime.sh"
+RUNTIME_UNIT="$BROWSER_VM/mcnf-browser-vm-runtime.service"
 
 fail() {
     echo "verify-browser-vm-contract: $*" >&2
@@ -19,7 +23,13 @@ fail() {
 [ -x "$VALIDATOR" ] || fail "runtime validator is not executable"
 [ -x "$ACTIVATION_VERIFY" ] || fail "activation verifier is not executable"
 [ -x "$ATTACH_VERIFY" ] || fail "transport attach verifier is not executable"
-bash -n "$PROFILE_VERIFY" "$VALIDATOR" "$ACTIVATION_VERIFY" "$ATTACH_VERIFY" "$0"
+[ -x "$IMAGE_BUILD" ] || fail "image builder is not executable"
+[ -x "$IMAGE_VERIFY" ] || fail "image verifier is not executable"
+[ -x "$RUNTIME" ] || fail "guest runtime is not executable"
+[ -f "$RUNTIME_UNIT" ] || fail "guest runtime unit is missing"
+bash -n "$PROFILE_VERIFY" "$VALIDATOR" "$ACTIVATION_VERIFY" "$ATTACH_VERIFY" "$IMAGE_BUILD" "$IMAGE_VERIFY" "$0"
+sh -n "$RUNTIME"
+"$IMAGE_VERIFY" --self-test >/dev/null
 "$PROFILE_VERIFY" "$PROFILE" >/dev/null
 "$ACTIVATION_VERIFY" >/dev/null
 "$ATTACH_VERIFY" >/dev/null

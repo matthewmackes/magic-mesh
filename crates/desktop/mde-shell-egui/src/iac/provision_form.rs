@@ -62,6 +62,7 @@ impl State {
             memory_mb: self.memory_mb,
             disk_gb: self.disk_gb,
             image: non_empty(&self.image),
+            image_digest: None,
             network_isolation: self.network_isolation,
             raw_hcl: non_empty(&self.raw_hcl),
             app: None,

@@ -38,12 +38,32 @@ On BigBoy (`172.20.0.130`):
   tests and strict clippy gate passed.
 - `verify-browser-extraction.sh --check` passed for 168 paths: 92
   browser-owned, 33 mixed-purpose, and 43 shared.
+- The dedicated Fedora 44 Browser VM image was built and statically verified on
+  BigBoy from the `magic-mesh-12.1.6-1.x86_64.rpm` artifact. The image carries
+  profile label `browser-vm-chromium-v1`, image digest
+  `sha256:efe44106db4963b8b1aef9af0f3106905a89b964de032096bcabd9827e549767`,
+  and base-image digest
+  `sha256:307de440d3381256a6f7072755ad340d428a0e43b6a83823d120c6c774a4d5e7`.
+  The static verifier found Chromium (Fedora's `chromium-browser` launcher),
+  Sway, Wayland, Mesa, PipeWire/WirePlumber, libinput, the guest runtime, and
+  the host-Browser prohibition contract.
+- `bootc-image-builder` produced the qcow2 with an explicit XFS rootfs on
+  BigBoy at `/home/mm/browser-vm-chromium-qcow2/qcow2/disk.qcow2`; size
+  `2251755008` bytes and SHA-256
+  `d00d5c8a4c35a3134d0e5f8c4a95ea31f6744e63aa820e849f3c1630b8d0fd72`.
+  The build script now supplies that explicit rootfs because Fedora 44's local
+  image metadata does not provide `DefaultRootFs` to the current builder.
+- Dell (`172.20.146.225`) now has the verified artifact staged at
+  `/var/lib/libvirt/images/browser-vm-chromium.qcow2`; the remote checksum
+  matches, `qemu-img info` reports a non-corrupt qcow2 with a 10 GiB virtual
+  size, and no Browser VM domain was created yet. Seat 15 was not modified:
+  its root filesystem had only 1.5 GiB free, below the 2.25 GB artifact size.
 
 ## Still unproven
 
-The standalone worker-family extraction is complete, but full old-stack source
-cleanup, the Browser VM image/payload, live Chromium framebuffer, focused input,
-reconnect, GPU video, PipeWire audio, performance, and six-node acceptance
-remain open. The 2026-08-02 seat audit still found no VDI listener on seat 15
-or Dell, so this change does not claim that the Chromium App VM is
+The standalone worker-family extraction and the dedicated image/qcow2 build are
+complete, but signed publication/install, live Chromium framebuffer, focused
+input, reconnect, GPU video, PipeWire audio, performance, and six-node
+acceptance remain open. The 2026-08-02 seat audit still found no VDI listener
+on seat 15 or Dell, so this change does not claim that the Chromium App VM is
 production-ready.

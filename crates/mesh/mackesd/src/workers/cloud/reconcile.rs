@@ -669,6 +669,7 @@ mod tests {
             memory_mb: 2048,
             disk_gb: 20,
             image: None,
+            image_digest: None,
             network_isolation: false,
             raw_hcl: None,
             app: None,

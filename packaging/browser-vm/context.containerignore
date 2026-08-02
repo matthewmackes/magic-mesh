@@ -1,0 +1,3 @@
+# Browser VM Containerfile copies only packaging inputs from the repository.
+*
+!packaging

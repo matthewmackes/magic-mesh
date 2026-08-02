@@ -1880,6 +1880,11 @@ pub struct WorkloadSpec {
     /// `None` uses the delivery type's golden default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
+    /// Immutable digest of the guest image selected for this workload. Browser
+    /// VMs require the `sha256:<64-hex>` form so the realized guest can prove
+    /// which Chromium image it booted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_digest: Option<String>,
     /// Whether the workload gets its own isolated network segment (opt-in; default
     /// = the shared managed mesh network).
     #[serde(default)]
@@ -2101,6 +2106,7 @@ impl AppVmProfile {
             memory_mb: self.memory_mb,
             disk_gb: self.disk_gb,
             image: Some("app-vm-wayland-standard".to_owned()),
+            image_digest: None,
             network_isolation: self.network_isolation,
             raw_hcl: None,
             app: Some(app),
@@ -2145,7 +2151,8 @@ impl BrowserVmProfile {
             vcpu: self.vcpu,
             memory_mb: self.memory_mb,
             disk_gb: self.disk_gb,
-            image: None,
+            image: Some("browser-vm-chromium".to_owned()),
+            image_digest: None,
             network_isolation: false,
             raw_hcl: None,
             app: None,
@@ -2345,6 +2352,8 @@ mod tests {
         assert_eq!(spec.vcpu, 4);
         assert_eq!(spec.memory_mb, 8192);
         assert_eq!(spec.disk_gb, 64);
+        assert_eq!(spec.image.as_deref(), Some("browser-vm-chromium"));
+        assert!(spec.image_digest.is_none());
     }
 
     fn app_request() -> crate::vdi_session::AppVmLaunchRequest {

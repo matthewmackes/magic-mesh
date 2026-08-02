@@ -384,6 +384,7 @@ mod tests {
                 memory_mb: 0,
                 disk_gb: 0,
                 image: None,
+                image_digest: None,
                 network_isolation: false,
                 raw_hcl: None,
                 app: None,

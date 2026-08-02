@@ -1,4 +1,15 @@
-# Browser VM guest profile
+# Browser VM guest profile and image
+
+`Containerfile`, `build-image.sh`, and `verify-image.sh` now define the actual
+Fedora 44 guest-image lane: Chromium, Sway/Wayland, Mesa virtual-GPU support,
+PipeWire/WirePlumber, libinput, and the image-owned runtime are installed in a
+dedicated `browser-vm-chromium` image. The image verifier is a static contents
+gate; it does not claim that a VM has booted or that a VDI endpoint is live.
+
+Build a signed/recorded disk artifact on the build farm with the current
+magic-mesh RPM, then set `browser_base_image_source` to the resulting qcow2 and
+pass the resulting image digest in the typed `browser-provision` request. A
+missing or malformed digest is refused before desired state is written.
 
 `profile.env` is the small, reviewable contract at the Construct/Browser VM
 boundary. It identifies the guest image and immutable source provenance
@@ -13,9 +24,9 @@ group/other-writable, and executable profile inputs are rejected before the
 profile is parsed. This keeps a mutable or redirected profile from changing
 the guest identity or source provenance after the caller selects it.
 
-This file is a profile contract, not proof that an image has been built or a VM
-is running. Image publication still needs signed artifact evidence and live VDI
-acceptance. Run `verify-profile.sh` before handing the profile to an image or
+This file is a profile contract, not proof that a VM is running. The Fedora 44
+image and qcow2 build lane is farm-verified, but image publication still needs
+signed artifact evidence and live VDI acceptance. Run `verify-profile.sh` before handing the profile to an image or
 Workloads adapter. The verifier parses the file as data, never sources it as
 shell, and rejects missing/duplicate/unknown fields, weak resource values,
 unsupported transport claims, host-engine names, missing provenance, or the

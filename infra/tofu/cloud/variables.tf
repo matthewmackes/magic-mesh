@@ -31,8 +31,18 @@ variable "app_base_image_source" {
     portal, Flatpak, PipeWire, and VDI runtime. App VM workloads never fall back
     to the generic desktop base.
   EOT
-  type    = string
-  default = "/var/lib/libvirt/images/app-vm-wayland-standard.qcow2"
+  type        = string
+  default     = "/var/lib/libvirt/images/app-vm-wayland-standard.qcow2"
+}
+
+variable "browser_base_image_source" {
+  description = <<-EOT
+    Immutable Chromium Browser VM guest image. Browser workloads never fall back
+    to the generic desktop image; the desired-state image_digest is written into
+    the guest and checked by its runtime admission contract.
+  EOT
+  type        = string
+  default     = "/var/lib/libvirt/images/browser-vm-chromium.qcow2"
 }
 
 variable "android_base_image_source" {
@@ -73,14 +83,6 @@ variable "network" {
     error_message = "network.mode must be one of nat|bridge|none|route."
   }
 
-  validation {
-    condition = alltrue([
-      for v in values(var.vms) : v.delivery_type != "app_vm" || (
-        v.app != null && v.app.guest_profile == "wayland-standard"
-      )
-    ])
-    error_message = "app_vm workloads require the typed wayland-standard guest declaration."
-  }
 }
 
 variable "vms" {
@@ -92,7 +94,8 @@ variable "vms" {
       name => {
         delivery_type     = desktop_vm | service_vm | app_vm | android_vm | service_container
         vcpu, memory_mb, disk_gb
-        image             = "" (use the delivery type's golden base) | "<name>"
+    image             = "" (use the delivery type's golden base) | "<name>"
+        image_digest      = "" or the immutable sha256:<64-hex> guest image digest
         network_isolation = false (shared managed mesh net) | true (own segment)
         app               = null for non-App VMs, or the typed guest-owned App VM declaration
       }
@@ -107,6 +110,7 @@ variable "vms" {
     memory_mb         = number
     disk_gb           = number
     image             = optional(string, "")
+    image_digest      = optional(string, "")
     network_isolation = optional(bool, false)
     app = optional(object({
       app_id                 = string
@@ -134,6 +138,15 @@ variable "vms" {
       for v in values(var.vms) : v.vcpu >= 1 && v.memory_mb >= 256 && v.disk_gb >= 1
     ])
     error_message = "each workload needs vcpu>=1, memory_mb>=256, disk_gb>=1 (the android module raises android_vm workloads to its own nested-virt floor)."
+  }
+
+  validation {
+    condition = alltrue([
+      for v in values(var.vms) : v.delivery_type != "app_vm" || (
+        v.app != null && v.app.guest_profile == "wayland-standard"
+      )
+    ])
+    error_message = "app_vm workloads require the typed wayland-standard guest declaration."
   }
 }
 

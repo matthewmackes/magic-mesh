@@ -1,0 +1,38 @@
+# WL-ARCH-008 — immutable Chromium Browser VM guest image.
+# The image owns Chromium, Wayland, GPU/audio/input plumbing, and the runtime.
+
+ARG BROWSER_VM_BASE=quay.io/fedora/fedora-bootc:44
+FROM ${BROWSER_VM_BASE}
+
+ARG MCNF_RPM_LANE=repo
+COPY packaging/browser-vm/validate-runtime-inputs.sh /tmp/mcnf-browser-vm-validate
+COPY packaging/browser-vm/mcnf-browser-vm-runtime.sh /tmp/mcnf-browser-vm-runtime
+COPY packaging/browser-vm/mcnf-browser-vm-runtime.service /tmp/mcnf-browser-vm-runtime.service
+COPY packaging/browser-vm/rpms/ /tmp/mcnf-rpms/
+COPY packaging/repo/magic-mesh.repo /etc/yum.repos.d/magic-mesh.repo
+
+RUN set -eux; \
+    install -D -m 0755 /tmp/mcnf-browser-vm-validate /usr/local/libexec/mcnf-browser-vm-validate; \
+    install -D -m 0755 /tmp/mcnf-browser-vm-runtime /usr/local/libexec/mcnf-browser-vm-runtime; \
+    install -D -m 0644 /tmp/mcnf-browser-vm-runtime.service /etc/systemd/system/mcnf-browser-vm-runtime.service; \
+    if [ "${MCNF_RPM_LANE}" = "local" ]; then \
+        ls /tmp/mcnf-rpms/magic-mesh-*.rpm >/dev/null 2>&1 || { echo 'FATAL: local Browser VM lane needs a magic-mesh RPM'; exit 1; }; \
+        dnf -y install /tmp/mcnf-rpms/magic-mesh-*.rpm; \
+    else dnf -y install magic-mesh; fi; \
+    dnf -y install \
+        chromium dbus-daemon dbus-tools sway \
+        xdg-desktop-portal xdg-desktop-portal-wlr \
+        pipewire pipewire-pulseaudio wireplumber \
+        mesa-dri-drivers mesa-libEGL mesa-libGL mesa-libgbm \
+        libinput libxkbcommon xorg-x11-server-Xwayland; \
+    useradd --create-home --shell /bin/bash mcnf-browser; \
+    usermod -a -G video,input,audio mcnf-browser || true; \
+    install -d -o mcnf-browser -g mcnf-browser -m 0700 /var/lib/mcnf-browser; \
+    install -d -m 0755 /usr/share/mcnf/browser-vm; \
+    printf '%s\n' \
+        '{"schema_version":1,"profile":"browser-vm-chromium","browser":"chromium","compositor":"sway","display":"wayland","gpu":"mesa-virtio","audio":"pipewire","input":"libinput","transport":"spice-or-rdp","guest_agent":"mackesd","network":"mesh-guest","host_browser":false}' \
+        > /usr/share/mcnf/browser-vm/image-contract.json; \
+    rm -rf /tmp/mcnf-rpms /tmp/mcnf-browser-vm-validate /tmp/mcnf-browser-vm-runtime /tmp/mcnf-browser-vm-runtime.service; \
+    dnf clean all
+
+RUN systemctl enable mcnf-browser-vm-runtime.service

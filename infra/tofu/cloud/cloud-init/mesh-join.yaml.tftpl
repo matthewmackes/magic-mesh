@@ -15,6 +15,11 @@ bootcmd:
   - [mkdir, -p, /etc/mackesd/app-vm]
 %{ endif ~}
 
+%{ if image == "browser-vm-chromium" ~}
+bootcmd:
+  - [mkdir, -p, /etc/mackesd/browser-vm]
+%{ endif ~}
+
 write_files:
   - path: /etc/mackesd/join-token
     permissions: "0600"
@@ -156,6 +161,37 @@ write_files:
       exec /usr/local/libexec/mcnf-app-vm-launch
       EOF
       exec /usr/bin/dbus-run-session -- /usr/bin/sway --config /run/mcnf-app-vm/sway.conf
+%{ endif ~}
+
+%{ if image == "browser-vm-chromium" ~}
+  # Browser VM runtime inputs are image identity and transport state only. The
+  # guest image owns Chromium, compositor, GPU, audio, and VDI startup policy.
+  - path: /etc/mackesd/browser-vm/profile-id
+    permissions: "0644"
+    owner: root:root
+    content: "browser-vm-chromium"
+  - path: /etc/mackesd/browser-vm/image-id
+    permissions: "0644"
+    owner: root:root
+    content: "browser-vm-chromium"
+  - path: /etc/mackesd/browser-vm/image-digest
+    permissions: "0644"
+    owner: root:root
+    content: ${jsonencode(image_digest)}
+  - path: /etc/mackesd/browser-vm/session-id
+    permissions: "0644"
+    owner: root:root
+    content: ${jsonencode(hostname)}
+  - path: /etc/mackesd/browser-vm/transport
+    permissions: "0644"
+    owner: root:root
+    content: "rdp"
+  - path: /etc/mackesd/browser-vm/transport-health
+    permissions: "0644"
+    owner: root:root
+    # Until a real VDI broker observes the guest endpoint, the honest initial
+    # state is unavailable; the image must never claim transport readiness.
+    content: "unavailable"
 %{ endif ~}
 
 %{ if app != null && app.guest_profile == "wayland-standard" ~}

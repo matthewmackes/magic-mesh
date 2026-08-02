@@ -110,6 +110,7 @@ pub(super) fn android_spec(node: &str, name: &str) -> WorkloadSpec {
         // The `modules/android` golden Debian base (or Android-x86 on the fallback
         // path) — the delivery type's default, not an operator override here.
         image: None,
+        image_digest: None,
         network_isolation: false,
         raw_hcl: None,
         app: None,

@@ -69,6 +69,7 @@ pub(crate) fn render_tfvars(node: &str, specs: &[WorkloadSpec], libvirt_uri: &st
                 "memory_mb": spec.memory_mb,
                 "disk_gb": spec.disk_gb,
                 "image": spec.image.clone().unwrap_or_default(),
+                "image_digest": spec.image_digest.clone().unwrap_or_default(),
                 "network_isolation": spec.network_isolation,
                 "app": app,
             }),
@@ -149,6 +150,7 @@ mod tests {
             memory_mb: 2048,
             disk_gb: 20,
             image: None,
+            image_digest: None,
             network_isolation: false,
             raw_hcl: None,
             app: None,
@@ -172,6 +174,7 @@ mod tests {
         assert!(!vms.contains_key("elsewhere"));
         // The per-delivery-type shape the U11 var.vms object expects.
         assert_eq!(vms["web"]["delivery_type"], "service_vm");
+        assert_eq!(vms["web"]["image_digest"], "");
         assert_eq!(vms["phone"]["delivery_type"], "android_vm");
         assert_eq!(vms["web"]["vcpu"], 2);
         assert_eq!(vms["web"]["memory_mb"], 2048);

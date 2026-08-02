@@ -11,7 +11,7 @@ output "instances" {
     CloudInstance shape).
   EOT
   value = {
-    for name, vm in merge(module.vm, module.app_vm) : name => {
+    for name, vm in merge(module.vm, module.browser_vm, module.app_vm) : name => {
       id            = vm.domain_id
       name          = name
       delivery_type = var.vms[name].delivery_type

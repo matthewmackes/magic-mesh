@@ -840,6 +840,7 @@ fn set_desired_emits_the_worker_envelope_instead_of_a_bare_spec() {
         memory_mb: 8192,
         disk_gb: 60,
         image: Some("construct-desktop".to_string()),
+        image_digest: None,
         network_isolation: true,
         raw_hcl: None,
         app: None,

@@ -6,9 +6,9 @@
 //! complete node slice and asks the configured provider to realize it. Provider
 //! or hypervisor failures therefore remain explicit in that existing apply reply.
 //!
-//! The request requires both an explicit placement node and an explicit workload
-//! name. Both are validated before the authorization token is consumed and before
-//! the desired-state directory is touched.
+//! The request requires an explicit placement node, workload name, and immutable
+//! guest-image digest. All are validated before the authorization token is
+//! consumed and before the desired-state directory is touched.
 
 use mackes_mesh_types::cloud::{BrowserVmProfile, CloudReply, WorkloadSpec};
 
@@ -27,14 +27,16 @@ pub(super) fn handle(w: &CloudWorker, verb_name: &str, body: &CloudActionBody) -
 /// persisted filename byte-identical; trimming here would permit an ambiguous
 /// request to authorize one spelling and persist another.
 pub(super) fn authorization_target(body: &CloudActionBody) -> Result<&str, String> {
-    let (_, name) = validated_target(body)?;
+    let (_, name, _) = validated_target(body)?;
     Ok(name)
 }
 
 /// Build the baseline Browser VM desired-state spec.
 #[must_use]
-pub(super) fn browser_spec(node: &str, name: &str) -> WorkloadSpec {
-    BrowserVmProfile::default().workload_spec(node, name)
+pub(super) fn browser_spec(node: &str, name: &str, image_digest: &str) -> WorkloadSpec {
+    let mut spec = BrowserVmProfile::default().workload_spec(node, name);
+    spec.image_digest = Some(image_digest.to_owned());
+    spec
 }
 
 fn build_reply(
@@ -42,11 +44,11 @@ fn build_reply(
     verb_name: &str,
     body: &CloudActionBody,
 ) -> CloudReply {
-    let (node, name) = match validated_target(body) {
+    let (node, name, image_digest) = match validated_target(body) {
         Ok(target) => target,
         Err(error) => return reject(verb_name, error),
     };
-    let spec = browser_spec(node, name);
+    let spec = browser_spec(node, name, image_digest);
 
     match reconcile::write_desired_doc(state_root, &spec) {
         Ok(()) => CloudReply {
@@ -68,7 +70,7 @@ fn build_reply(
     }
 }
 
-fn validated_target(body: &CloudActionBody) -> Result<(&str, &str), String> {
+fn validated_target(body: &CloudActionBody) -> Result<(&str, &str, &str), String> {
     if body.node.is_empty() {
         return Err("`browser-provision` requires an explicit placement `node`".to_string());
     }
@@ -79,7 +81,23 @@ fn validated_target(body: &CloudActionBody) -> Result<(&str, &str), String> {
         .as_deref()
         .ok_or_else(|| "`browser-provision` requires an explicit workload `name`".to_string())?;
     let name = super::super::path_key::file_stem("name", name, ".json")?;
-    Ok((node, name))
+    let image_digest = body.image_digest.as_deref().ok_or_else(|| {
+        "`browser-provision` requires an immutable `image_digest` (sha256:<64-hex>)".to_string()
+    })?;
+    validate_image_digest(image_digest)?;
+    Ok((node, name, image_digest))
+}
+
+fn validate_image_digest(digest: &str) -> Result<(), String> {
+    let hex = digest.strip_prefix("sha256:").ok_or_else(|| {
+        "`browser-provision` image_digest must use the sha256:<64-hex> form".to_string()
+    })?;
+    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(
+            "`browser-provision` image_digest must use the sha256:<64-hex> form".to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn reject(verb_name: &str, reason: String) -> CloudReply {
@@ -98,24 +116,28 @@ mod tests {
     use mackes_mesh_types::cloud::DeliveryType;
     use tempfile::tempdir;
 
+    const DIGEST: &str = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
     fn body(node: &str, name: Option<&str>) -> CloudActionBody {
         CloudActionBody {
             node: node.to_string(),
             name: name.map(str::to_string),
+            image_digest: Some(DIGEST.to_string()),
             ..Default::default()
         }
     }
 
     #[test]
     fn browser_profile_is_the_baseline_desktop_vm_shape() {
-        let spec = browser_spec("eagle", "browser-eagle");
+        let spec = browser_spec("eagle", "browser-eagle", DIGEST);
         assert_eq!(spec.delivery_type, DeliveryType::DesktopVm);
         assert_eq!(spec.node, "eagle");
         assert_eq!(spec.name, "browser-eagle");
         assert_eq!(spec.vcpu, 4);
         assert_eq!(spec.memory_mb, 8192);
         assert_eq!(spec.disk_gb, 64);
-        assert!(spec.image.is_none());
+        assert_eq!(spec.image.as_deref(), Some("browser-vm-chromium"));
+        assert_eq!(spec.image_digest.as_deref(), Some(DIGEST));
         assert!(!spec.network_isolation);
     }
 
@@ -127,11 +149,11 @@ mod tests {
         assert!(reply.ok, "error: {:?}", reply.error);
         assert_eq!(
             reply.desired.as_ref().unwrap(),
-            &[browser_spec("eagle", "browser-eagle")]
+            &[browser_spec("eagle", "browser-eagle", DIGEST)]
         );
         assert_eq!(
             reconcile::read_desired_slice(tmp.path(), "eagle"),
-            vec![browser_spec("eagle", "browser-eagle")]
+            vec![browser_spec("eagle", "browser-eagle", DIGEST)]
         );
     }
 
@@ -182,7 +204,7 @@ mod tests {
         .with_bus_root(None);
         let reply = worker.handle(
             "browser-provision",
-            r#"{"schema_version":1,"node":"eagle","name":"browser-eagle"}"#,
+            r#"{"schema_version":1,"node":"eagle","name":"browser-eagle","image_digest":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}"#,
         );
         assert!(!reply.ok);
         assert!(reply.gated.as_deref().is_some_and(|reason| {
