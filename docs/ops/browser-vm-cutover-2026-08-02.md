@@ -23,6 +23,18 @@ not a second active worklist.
 
 ## Farm evidence
 
+The next guest-image slice is now explicit in source: the Browser VM profile
+selects RDP as its default transport with the retained SPICE compatibility
+path, installs Fedora `xrdp`/`xorgxrdp`, QEMU guest-agent, VA-API diagnostics,
+Mesa userspace, and
+the PipeWire/ALSA bridge, and routes authenticated xrdp sessions through the
+guest-owned Sway/Chromium runtime. Sunshine/Moonlight is intentionally not
+advertised until a guest endpoint and host decoder exist. The focused Browser
+VM contract verifier passes locally; the image itself has not yet been rebuilt
+with this payload. Fedora 44's enabled repositories do not provide
+`mesa-va-drivers`, so GPU video decode remains an explicit live gate rather
+than an image claim.
+
 On BigBoy (`172.20.0.130`):
 
 - `cargo check -p mde-shell-egui --features live-vdi` passed.
@@ -74,14 +86,19 @@ On BigBoy (`172.20.0.130`):
   `954e41154795e9f861ffbc230617484ab000fa0ca7ba9a29de3ae2d61fb4fd73`.
 - The live proof runner now forwards only the approved VDI target variables
   through `xcp-build.sh`; its route self-test and the source-bound run pass.
+- On farm `.50` slot `browser-rdp-shell-20260802`, the updated shell binary
+  passed 5 focused Browser surface tests and 5 focused brokered VDI protocol
+  resolution tests, including authoritative broker protocol selection and
+  old-record compatibility.
 - Seat 15 (`172.20.0.15`) remains untouched; its low free-space condition makes
   it unsuitable for this image without operator capacity work.
 
 ## Still unproven
 
 The host cutover, dedicated image/qcow2 provenance, Chromium guest capture,
-decoded SPICE pixels, and focused-input visual echo are evidenced. RDP/Sunshine
-endpoint implementation and live proof, GPU video, PipeWire audio,
+decoded SPICE pixels, and focused-input visual echo are evidenced. The current
+Dell domain is still QXL/SPICE and is not the new RDP image. RDP endpoint
+publication/authentication and live proof, GPU video, PipeWire audio,
 five-session performance, signed publication/install/upgrade, reconnect/failover,
 and six-node acceptance remain open. The image was built through the supported
 local-RPM lane because the Fedora 44 repository lane lacks the multimedia RPM

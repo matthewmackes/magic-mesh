@@ -41,9 +41,10 @@ attach_filter+='(keys == ["generation","schema_version","session_id","status","s
 attach_filter+='(.schema_version == 1 and .workload == "browser-vm" and .surface == "browser") and '
 attach_filter+='(.session_id | (type == "string" and test("^session:[A-Za-z0-9._:-]{1,127}$"))) and '
 attach_filter+='(.generation | (type == "number" and floor == . and . >= 1 and . <= 9223372036854775807)) and '
-attach_filter+='(.transport == "rdp") and '
+attach_filter+='(.transport == "rdp" or .transport == "spice") and '
+attach_filter+='(.status.protocol == .transport) and '
 attach_filter+='(.status | keys == ["host","port","protocol","state"] and '
-attach_filter+='  .state == "brokered" and .protocol == "rdp" and '
+attach_filter+='  .state == "brokered" and (.protocol == "rdp" or .protocol == "spice") and '
 attach_filter+='  (.host | (type == "string" and test("^[A-Za-z0-9._:-]{1,253}$"))) and '
 attach_filter+='  (.port | (type == "number" and floor == . and . >= 1 and . <= 65535)))'
 
@@ -68,12 +69,14 @@ if not isinstance(value["session_id"], str) or not re.fullmatch(r"session:[A-Za-
     raise SystemExit(1)
 if not isinstance(value["generation"], int) or not 1 <= value["generation"] <= 9223372036854775807:
     raise SystemExit(1)
-if value["transport"] != "rdp":
+if value["transport"] not in {"rdp", "spice"}:
     raise SystemExit(1)
 status = value["status"]
 if set(status) != {"host", "port", "protocol", "state"}:
     raise SystemExit(1)
-if status["state"] != "brokered" or status["protocol"] != "rdp":
+if status["state"] != "brokered" or status["protocol"] not in {"rdp", "spice"}:
+    raise SystemExit(1)
+if status["protocol"] != value["transport"]:
     raise SystemExit(1)
 if not isinstance(status["host"], str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,253}", status["host"]):
     raise SystemExit(1)
@@ -101,7 +104,10 @@ reject "URL endpoint" "$fixture/url.json"
 printf '%s\n' '{"schema_version":1,"workload":"browser-vm","surface":"browser","session_id":"session:browser-vm-00000001","generation":1,"transport":"sunshine","status":{"state":"brokered","protocol":"sunshine","host":"10.42.0.50","port":3389}}' > "$fixture/unsupported.json"
 reject "unsupported Sunshine-only shell attach" "$fixture/unsupported.json"
 
+printf '%s\n' '{"schema_version":1,"workload":"browser-vm","surface":"browser","session_id":"session:browser-vm-00000001","generation":1,"transport":"rdp","status":{"state":"brokered","protocol":"spice","host":"10.42.0.50","port":5900}}' > "$fixture/mismatched-protocol.json"
+reject "transport/protocol mismatch" "$fixture/mismatched-protocol.json"
+
 printf '%s\n' '{"schema_version":1,"workload":"browser-vm","surface":"browser","session_id":"session:browser-vm-00000001","generation":1,"transport":"rdp","command":"flatpak run","status":{"state":"brokered","protocol":"rdp","host":"10.42.0.50","port":3389}}' > "$fixture/command.json"
 reject "executable host input" "$fixture/command.json"
 
-echo "Browser VM transport attach contract passed: state/vdi/console RDP envelope"
+echo "Browser VM transport attach contract passed: state/vdi/console RDP/SPICE envelope"

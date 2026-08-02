@@ -1,7 +1,7 @@
 [Unit]
 Description=MCNF guest-owned Chromium Browser VM runtime
-Wants=network-online.target seatd.service
-After=network-online.target systemd-user-sessions.service seatd.service
+Wants=network-online.target seatd.service qemu-guest-agent.service
+After=network-online.target systemd-user-sessions.service seatd.service qemu-guest-agent.service
 Requires=seatd.service
 
 [Service]

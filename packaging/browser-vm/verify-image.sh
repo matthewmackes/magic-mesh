@@ -17,20 +17,25 @@ inner='set -u
 fail=0
 ok(){ echo "  OK   $1"; }
 bad(){ echo "  FAIL $1"; fail=1; }
-for path in /usr/local/libexec/mcnf-browser-vm-validate /usr/local/libexec/mcnf-browser-vm-runtime /etc/systemd/system/mcnf-browser-vm-runtime.service /usr/share/mcnf/browser-vm/image-contract.json; do
+for path in /usr/local/libexec/mcnf-browser-vm-validate /usr/local/libexec/mcnf-browser-vm-runtime /usr/local/libexec/mcnf-browser-vm-session /etc/xrdp/startwm.sh /etc/systemd/system/mcnf-browser-vm-runtime.service /usr/share/mcnf/browser-vm/image-contract.json; do
   [ -f "$path" ] && ok "image file present: $path" || bad "image file missing: $path"
 done
 chromium_bin="$(command -v chromium || command -v chromium-browser || true)"
 [ -n "$chromium_bin" ] && ok "runtime binary present: chromium ($chromium_bin)" || bad "runtime binary missing: chromium"
-for binary in sway dbus-run-session pipewire; do
+for binary in sway dbus-run-session pipewire pipewire-pulse wireplumber pw-cli pactl aplay arecord vainfo xrdp; do
   command -v "$binary" >/dev/null 2>&1 && ok "runtime binary present: $binary" || bad "runtime binary missing: $binary"
 done
-for package in magic-mesh chromium sway pipewire pipewire-pulseaudio wireplumber mesa-dri-drivers libinput; do
+for package in magic-mesh chromium sway pipewire pipewire-utils pipewire-pulseaudio wireplumber spice-vdagent pipewire-alsa alsa-lib alsa-ucm alsa-utils mesa-dri-drivers libva-utils libinput xrdp xorgxrdp qemu-guest-agent; do
   rpm -q "$package" >/dev/null 2>&1 && ok "package installed: $package" || bad "package missing: $package"
 done
 grep -Fq "\"browser\":\"chromium\"" /usr/share/mcnf/browser-vm/image-contract.json && ok "contract selects Chromium" || bad "contract does not select Chromium"
 grep -Fq "\"compositor\":\"sway\"" /usr/share/mcnf/browser-vm/image-contract.json && ok "contract selects Sway" || bad "contract does not select Sway"
 grep -Fq "\"host_browser\":false" /usr/share/mcnf/browser-vm/image-contract.json && ok "contract forbids host Browser" || bad "contract permits host Browser"
+grep -Fq '"transports":["rdp","spice"]' /usr/share/mcnf/browser-vm/image-contract.json \
+  && ok "contract admits RDP and SPICE" \
+  || bad "contract does not admit the typed Browser VM transport set"
+command -v xrdp >/dev/null 2>&1 && ok "RDP endpoint binary present" || bad "RDP endpoint binary missing"
+command -v vainfo >/dev/null 2>&1 && ok "VA-API diagnostic present" || bad "VA-API diagnostic missing"
 exit "$fail"'
 rc=0
 out="$(printf '%s\n' "$inner" | podman run --rm -i "$TAG" /bin/bash -s)" || rc=$?

@@ -30,15 +30,15 @@ pub(crate) enum MediaTransportAction {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BrowserVmTransport {
-    SunshineMoonlight,
     Rdp,
+    Spice,
 }
 
 impl BrowserVmTransport {
     const fn label(self) -> &'static str {
         match self {
-            Self::SunshineMoonlight => "Sunshine/Moonlight",
             Self::Rdp => "RDP",
+            Self::Spice => "SPICE",
         }
     }
 }
@@ -47,7 +47,7 @@ impl BrowserVmTransport {
 struct BrowserVmRoute {
     workload: &'static str,
     preferred: BrowserVmTransport,
-    alternate: BrowserVmTransport,
+    alternate: Option<BrowserVmTransport>,
     resume: bool,
 }
 
@@ -55,8 +55,8 @@ impl BrowserVmRoute {
     const fn select_resume() -> Self {
         Self {
             workload: VM_WORKLOAD,
-            preferred: BrowserVmTransport::SunshineMoonlight,
-            alternate: BrowserVmTransport::Rdp,
+            preferred: BrowserVmTransport::Rdp,
+            alternate: Some(BrowserVmTransport::Spice),
             resume: true,
         }
     }
@@ -247,11 +247,12 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
         );
         ui.add_space(4.0);
         ui.label(format!("Workload: {}", route.workload));
-        ui.label(format!(
-            "Preferred transport: {}; alternate: {}",
-            route.preferred.label(),
-            route.alternate.label()
-        ));
+        ui.label(format!("Preferred transport: {}", route.preferred.label()));
+        if let Some(alternate) = route.alternate {
+            ui.label(format!("Alternate transport: {}", alternate.label()));
+        } else {
+            ui.label("Alternate transport: unavailable until a real guest endpoint and decoder exist");
+        }
         ui.add_space(8.0);
         ui.colored_label(
             mde_egui::Style::TEXT_DIM,

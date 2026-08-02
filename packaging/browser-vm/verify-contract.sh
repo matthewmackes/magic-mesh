@@ -13,6 +13,8 @@ IMAGE_BUILD="$BROWSER_VM/build-image.sh"
 IMAGE_VERIFY="$BROWSER_VM/verify-image.sh"
 RUNTIME="$BROWSER_VM/mcnf-browser-vm-runtime.sh"
 RUNTIME_UNIT="$BROWSER_VM/mcnf-browser-vm-runtime.service"
+XRDP_STARTWM="$BROWSER_VM/mcnf-browser-vm-xrdp-startwm.sh"
+SESSION="$BROWSER_VM/mcnf-browser-vm-session.sh"
 
 fail() {
     echo "verify-browser-vm-contract: $*" >&2
@@ -26,9 +28,11 @@ fail() {
 [ -x "$IMAGE_BUILD" ] || fail "image builder is not executable"
 [ -x "$IMAGE_VERIFY" ] || fail "image verifier is not executable"
 [ -x "$RUNTIME" ] || fail "guest runtime is not executable"
+[ -x "$XRDP_STARTWM" ] || fail "xrdp session entrypoint is not executable"
+[ -x "$SESSION" ] || fail "media session supervisor is not executable"
 [ -f "$RUNTIME_UNIT" ] || fail "guest runtime unit is missing"
 bash -n "$PROFILE_VERIFY" "$VALIDATOR" "$ACTIVATION_VERIFY" "$ATTACH_VERIFY" "$IMAGE_BUILD" "$IMAGE_VERIFY" "$0"
-sh -n "$RUNTIME"
+sh -n "$RUNTIME" "$XRDP_STARTWM" "$SESSION"
 "$IMAGE_VERIFY" --self-test >/dev/null
 "$PROFILE_VERIFY" "$PROFILE" >/dev/null
 "$ACTIVATION_VERIFY" >/dev/null
@@ -79,7 +83,7 @@ write_valid() {
     printf '%s\n' browser-vm-chromium > "$input/image-id"
     printf '%s\n' "$digest" > "$input/image-digest"
     printf '%s\n' session:00000000-0000-4000-8000-000000000001 > "$input/session-id"
-    printf '%s\n' sunshine > "$input/transport"
+    printf '%s\n' spice > "$input/transport"
     printf '%s\n' connected > "$input/transport-health"
 }
 
@@ -121,6 +125,11 @@ if MCNF_BROWSER_VM_INPUT_ROOT="$input" "$VALIDATOR" >/dev/null 2>&1; then
     fail "accepted a URL-shaped transport"
 fi
 printf '%s\n' sunshine > "$input/transport"
+if MCNF_BROWSER_VM_INPUT_ROOT="$input" "$VALIDATOR" >/dev/null 2>&1; then
+    fail "accepted the unimplemented Sunshine transport"
+fi
+printf '%s\n' rdp > "$input/transport"
+MCNF_BROWSER_VM_INPUT_ROOT="$input" "$VALIDATOR" >/dev/null
 
 for health in connected reconnecting failed unavailable; do
     printf '%s\n' "$health" > "$input/transport-health"

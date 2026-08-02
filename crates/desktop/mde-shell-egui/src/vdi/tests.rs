@@ -394,9 +394,10 @@ fn resolve_pending_when_no_record_for_the_session() {
 fn resolve_ready_yields_the_overlay_endpoint() {
     let bodies = vec![brokered_body("s1", "10.42.0.7", 5900)];
     match resolve_brokered_console(&bodies, "s1") {
-        ConsoleResolution::Ready(ep) => {
+        ConsoleResolution::Ready { endpoint: ep, protocol } => {
             assert_eq!(ep.host, "10.42.0.7");
             assert_eq!(ep.port, 5900);
+            assert_eq!(protocol, Some(VdiProtocol::Spice));
         }
         other => panic!("expected Ready, got {other:?}"),
     }
@@ -420,7 +421,16 @@ fn resolve_latest_record_wins() {
     ];
     assert!(matches!(
         resolve_brokered_console(&bodies, "s1"),
-        ConsoleResolution::Ready(ep) if ep.port == 5931
+        ConsoleResolution::Ready { endpoint: ep, .. } if ep.port == 5931
+    ));
+}
+
+#[test]
+fn resolve_preserves_requested_protocol_compatibility_for_old_records() {
+    let body = r#"{"session_id":"s1","serving_node":"peer:oak","vm_id":"win11","status":{"state":"brokered","host":"10.42.0.7","port":3389}}"#;
+    assert!(matches!(
+        resolve_brokered_console(&[body.to_string()], "s1"),
+        ConsoleResolution::Ready { protocol: None, .. }
     ));
 }
 

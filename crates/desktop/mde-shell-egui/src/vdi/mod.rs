@@ -127,9 +127,10 @@ impl DesktopEndpoint {
 pub(crate) const CONSOLE_TOPIC: &str = "state/vdi/console";
 
 /// The shell's read mirror of `console_broker`'s brokered-console status — only the
-/// fields the transport needs. serde ignores the rest (e.g. the record's `protocol`
-/// tag: the transport uses the operator's chosen protocol, the record only supplies
-/// the dialable `host:port`).
+/// fields the transport needs. The broker's protocol is authoritative when it is
+/// present: a libvirt VM may expose SPICE even when the initial Browser request
+/// used the generic RDP fallback. Older records without the field remain
+/// compatible and keep the requested protocol.
 #[cfg(any(test, feature = "live-vdi"))]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -140,6 +141,9 @@ enum BrokeredConsoleStatus {
         host: String,
         /// The overlay port.
         port: u16,
+        /// The protocol resolved by the serving peer's live libvirt domain.
+        #[serde(default)]
+        protocol: Option<String>,
     },
     /// No reachable endpoint could be brokered — the honest reason.
     Unbrokerable {
@@ -167,10 +171,22 @@ pub(crate) enum ConsoleResolution {
     /// waiting; the connect stays in an honest "resolving" state).
     Pending,
     /// A dialable overlay endpoint the transport attaches to.
-    Ready(DesktopEndpoint),
+    Ready {
+        endpoint: DesktopEndpoint,
+        protocol: Option<VdiProtocol>,
+    },
     /// The broker honestly reported it CANNOT make a reachable endpoint — the shell
     /// greys the lane and never attaches a doomed transport (§7).
     Unbrokerable(String),
+}
+
+fn broker_protocol(value: Option<&str>) -> Option<VdiProtocol> {
+    match value {
+        Some("rdp") => Some(VdiProtocol::Rdp),
+        Some("vnc") => Some(VdiProtocol::Vnc),
+        Some("spice") => Some(VdiProtocol::Spice),
+        _ => None,
+    }
 }
 
 /// Resolve the brokered console endpoint for `session_id` from the raw
@@ -188,15 +204,21 @@ pub(crate) fn resolve_brokered_console(bodies: &[String], session_id: &str) -> C
             continue;
         }
         out = match rec.status {
-            BrokeredConsoleStatus::Brokered { host, port } => DesktopEndpoint::new(host, port)
-                .map_or_else(
-                    || {
-                        ConsoleResolution::Unbrokerable(
-                            "the broker published an unusable endpoint".to_string(),
-                        )
-                    },
-                    ConsoleResolution::Ready,
-                ),
+            BrokeredConsoleStatus::Brokered {
+                host,
+                port,
+                protocol,
+            } => DesktopEndpoint::new(host, port).map_or_else(
+                || {
+                    ConsoleResolution::Unbrokerable(
+                        "the broker published an unusable endpoint".to_string(),
+                    )
+                },
+                |endpoint| ConsoleResolution::Ready {
+                    endpoint,
+                    protocol: broker_protocol(protocol.as_deref()),
+                },
+            ),
             BrokeredConsoleStatus::Unbrokerable { reason } => {
                 ConsoleResolution::Unbrokerable(reason)
             }
@@ -1564,9 +1586,12 @@ impl VdiState {
 
         let bodies = read_console_bodies(broker.bus_root.as_deref());
         match resolve_brokered_console(&bodies, &broker.id) {
-            ConsoleResolution::Ready(endpoint) => {
+            ConsoleResolution::Ready { endpoint, protocol } => {
                 if let Some(request) = self.requested.as_mut() {
                     request.target.endpoint = Some(endpoint);
+                    if let Some(protocol) = protocol {
+                        request.protocol = protocol;
+                    }
                 }
                 if let Some(request) = self.requested.clone() {
                     self.spawn_live_transport(&request);

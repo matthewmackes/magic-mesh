@@ -14,8 +14,9 @@ missing or malformed digest is refused before desired state is written.
 `profile.env` is the small, reviewable contract at the Construct/Browser VM
 boundary. It identifies the guest image and immutable source provenance
 (repository, path, and pinned commit), fixes the Arch-008
-baseline (4 vCPU, 8 GiB RAM, 64 GiB disk), and declares the only supported
-display transports. The host is explicitly forbidden from owning a Browser
+baseline (4 vCPU, 8 GiB RAM, 64 GiB disk), and declares the implemented RDP
+transport plus the retained SPICE compatibility path. The host is explicitly
+forbidden from owning a Browser
 engine; Chromium, browser chrome, page execution, media decode, and failures
 remain inside the guest.
 
@@ -37,7 +38,7 @@ The guest launch boundary is equally fail-closed. Workloads writes only
 `/etc/mackesd/browser-vm`; the image runs `validate-runtime-inputs.sh` before
 starting Sway or a VDI endpoint. It requires the admitted Browser VM identity,
 a 64-byte hexadecimal SHA-256 image reference, a bounded identity token, and
-`sunshine` or `rdp`. Extra files, symlinks, commands, URLs, paths, and shell
+`rdp` or `spice`. Extra files, symlinks, commands, URLs, paths, and shell
 syntax are rejected. No launch command, host-browser fallback, or
 host-supplied lifecycle state is accepted from the host. The profile explicitly
 declares `fail-closed` runtime behavior and `failed,unavailable` guest terminal
@@ -56,20 +57,20 @@ capabilities, and lifecycle; the guest validator is only an admission check and
 does not create a second control plane.
 
 The contract also runs `verify-activation-contract.sh`. It binds
-`Surface::Browser` to the typed `browser-vm` route, its Sunshine/RDP VDI
-transports, the guest visual boundary, and the Workloads `DesktopVm` delivery
-type. It checks that tab and reload actions clear or defer to the guest route
-instead of creating an unguarded host helper session. This is a source-seam
-guard, not live VDI proof.
+`Surface::Browser` to the typed `browser-vm` route, its implemented RDP/SPICE
+VDI transports, the guest visual boundary, and the Workloads `DesktopVm`
+delivery type. Sunshine/Moonlight remains unavailable until both a guest
+endpoint and a host decoder exist; the shell presents that state instead of
+substituting a different protocol. This is a source-seam guard, not live VDI
+proof.
 
 `browser-vm-transport-attach.schema.json` defines the minimal attach envelope
 that the existing `state/vdi/console` shell mirror can consume without a
 Browser helper crate. The envelope is an RDP brokered endpoint bound to the
 Browser VM workload, Browser surface, session generation, and mesh-safe
 `host:port`; it carries no ticket, credential, command, path, or URL. The
-example and `verify-transport-attach.sh` keep the wire shape fail-closed. The
-Sunshine/Moonlight route remains a separate live transport concern; RDP is the
-minimal shell-consumable decoder contract here.
+example and `verify-transport-attach.sh` keep the RDP/SPICE wire shape
+fail-closed.
 
 The source URL and path are deliberately recorded now so a later standalone
 Browser-stack extraction can bind the guest profile to an immutable source

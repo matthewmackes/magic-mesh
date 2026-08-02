@@ -111,8 +111,8 @@ validate_digest "$image_digest"
 validate_token session-id "$session_id"
 
 case "$transport" in
-    sunshine|rdp) ;;
-    *) fail "transport is not admitted" ;;
+    rdp|spice) ;;
+    *) fail "transport is not admitted by the Browser VM image" ;;
 esac
 
 case "$transport_health" in

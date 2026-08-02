@@ -26,14 +26,14 @@
       "minimum": 1,
       "maximum": 9223372036854775807
     },
-    "transport": { "const": "rdp" },
+    "transport": { "enum": ["rdp", "spice"] },
     "status": {
       "type": "object",
       "additionalProperties": false,
       "required": ["state", "protocol", "host", "port"],
       "properties": {
         "state": { "const": "brokered" },
-        "protocol": { "const": "rdp" },
+        "protocol": { "enum": ["rdp", "spice"] },
         "host": {
           "type": "string",
           "pattern": "^[A-Za-z0-9._:-]{1,253}$"

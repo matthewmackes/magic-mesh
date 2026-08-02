@@ -8,6 +8,8 @@ ARG MCNF_RPM_LANE=repo
 COPY packaging/browser-vm/validate-runtime-inputs.sh /tmp/mcnf-browser-vm-validate
 COPY packaging/browser-vm/mcnf-browser-vm-runtime.sh /tmp/mcnf-browser-vm-runtime
 COPY packaging/browser-vm/mcnf-browser-vm-runtime.service /tmp/mcnf-browser-vm-runtime.service
+COPY packaging/browser-vm/mcnf-browser-vm-xrdp-startwm.sh /tmp/mcnf-browser-vm-xrdp-startwm
+COPY packaging/browser-vm/mcnf-browser-vm-session.sh /tmp/mcnf-browser-vm-session
 COPY packaging/browser-vm/rpms/ /tmp/mcnf-rpms/
 COPY packaging/repo/magic-mesh.repo /etc/yum.repos.d/magic-mesh.repo
 
@@ -15,6 +17,8 @@ RUN set -eux; \
     install -D -m 0755 /tmp/mcnf-browser-vm-validate /usr/local/libexec/mcnf-browser-vm-validate; \
     install -D -m 0755 /tmp/mcnf-browser-vm-runtime /usr/local/libexec/mcnf-browser-vm-runtime; \
     install -D -m 0644 /tmp/mcnf-browser-vm-runtime.service /etc/systemd/system/mcnf-browser-vm-runtime.service; \
+    install -D -m 0755 /tmp/mcnf-browser-vm-xrdp-startwm /etc/xrdp/startwm.sh; \
+    install -D -m 0755 /tmp/mcnf-browser-vm-session /usr/local/libexec/mcnf-browser-vm-session; \
     if [ "${MCNF_RPM_LANE}" = "local" ]; then \
         ls /tmp/mcnf-rpms/magic-mesh-*.rpm >/dev/null 2>&1 || { echo 'FATAL: local Browser VM lane needs a magic-mesh RPM'; exit 1; }; \
         rpm -Uvh --nodeps --noscripts /tmp/mcnf-rpms/magic-mesh-*.rpm; \
@@ -23,17 +27,21 @@ RUN set -eux; \
         --exclude=magic-mesh-browser install \
         chromium cloud-init dbus-daemon dbus-tools seatd sway \
         xdg-desktop-portal xdg-desktop-portal-wlr \
-        pipewire pipewire-pulseaudio wireplumber \
+        pipewire pipewire-utils pipewire-pulseaudio wireplumber spice-vdagent \
+        pipewire-alsa alsa-lib alsa-ucm alsa-utils \
         mesa-dri-drivers mesa-libEGL mesa-libGL mesa-libgbm \
-        libinput libxkbcommon xorg-x11-server-Xwayland; \
+        libva-utils libinput libxkbcommon xorg-x11-server-Xwayland \
+        xrdp xorgxrdp qemu-guest-agent; \
     useradd --create-home --shell /bin/bash mcnf-browser; \
     usermod -a -G video,input,audio,seat mcnf-browser || true; \
     install -d -o mcnf-browser -g mcnf-browser -m 0700 /var/lib/mcnf-browser; \
     install -d -m 0755 /usr/share/mcnf/browser-vm; \
     printf '%s\n' \
-        '{"schema_version":1,"profile":"browser-vm-chromium","browser":"chromium","compositor":"sway","display":"wayland","gpu":"mesa-virtio","audio":"pipewire","input":"libinput","transport":"spice-or-rdp","guest_agent":"mackesd","network":"mesh-guest","host_browser":false}' \
+        '{"schema_version":1,"profile":"browser-vm-chromium","browser":"chromium","compositor":"sway","display":"wayland-over-vdi","gpu":"mesa-virtio","audio":"pipewire","input":"libinput","transports":["rdp","spice"],"guest_agent":"qemu-guest-agent","network":"mesh-guest","host_browser":false}' \
         > /usr/share/mcnf/browser-vm/image-contract.json; \
-    rm -rf /tmp/mcnf-rpms /tmp/mcnf-browser-vm-validate /tmp/mcnf-browser-vm-runtime /tmp/mcnf-browser-vm-runtime.service; \
+    systemctl enable qemu-guest-agent.service; \
+    systemctl enable xrdp.service; \
+    rm -rf /tmp/mcnf-rpms /tmp/mcnf-browser-vm-validate /tmp/mcnf-browser-vm-runtime /tmp/mcnf-browser-vm-runtime.service /tmp/mcnf-browser-vm-xrdp-startwm /tmp/mcnf-browser-vm-session; \
     dnf clean all
 
 RUN systemctl enable mcnf-browser-vm-runtime.service

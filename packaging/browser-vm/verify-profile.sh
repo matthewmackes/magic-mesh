@@ -79,8 +79,8 @@ done
     || die "Browser VM needs at least 8192 MiB"
 [[ "${values[BROWSER_VM_DISK_GB]}" =~ ^[0-9]+$ && ${values[BROWSER_VM_DISK_GB]} -ge 64 ]] \
     || die "Browser VM needs at least 64 GiB"
-[[ "${values[BROWSER_VM_TRANSPORTS]}" == rdp,sunshine ]] || die "transport set must be rdp,sunshine"
-[[ "${values[BROWSER_VM_DEFAULT_TRANSPORT]}" == sunshine ]] || die "Sunshine must remain the default transport"
+[[ "${values[BROWSER_VM_TRANSPORTS]}" == rdp,spice ]] || die "transport set must be rdp,spice"
+[[ "${values[BROWSER_VM_DEFAULT_TRANSPORT]}" == rdp ]] || die "RDP must remain the implemented default transport"
 [[ "${values[BROWSER_VM_HOST_BROWSER]}" == false ]] || die "host Browser ownership is forbidden"
 [[ "${values[BROWSER_VM_NETWORK]}" == mesh-guest ]] || die "unexpected guest network"
 [[ "${values[BROWSER_VM_RUNTIME_FAILURE_POLICY]}" == fail-closed ]] \
