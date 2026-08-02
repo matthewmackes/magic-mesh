@@ -1695,6 +1695,28 @@ impl ChooserState {
         self.connect.take()
     }
 
+    /// Resolve the optional remembered guest credential for the typed Browser VM
+    /// route.  Browser is a mesh-brokered source, so the normal result is mesh
+    /// identity SSO; a credential already sealed under the workload name is
+    /// carried only in the in-memory VDI request for guest OS login.  Keeping
+    /// this fold here makes the Browser shortcut use the same auth seam as the
+    /// full Chooser without ever placing credentials in the Workloads record.
+    pub(crate) fn browser_vm_auth(&self, workload: &str) -> Result<DesktopAuth, String> {
+        match auth::resolve(
+            true,
+            &self.client_peer,
+            workload,
+            VdiProtocol::Rdp,
+            self.creds.as_ref(),
+        )? {
+            AuthStage::Ready(auth) => Ok(auth),
+            AuthStage::Prompt(_) => Err(
+                "Browser VM guest authentication needs an explicit credential prompt; no credential was supplied."
+                    .to_string(),
+            ),
+        }
+    }
+
     /// A cloned snapshot of the current roster (the render + act-on-click
     /// paths borrow it while mutating `self`), with the TESTVM-4 pinned
     /// endpoints folded in: any manual register the roster doesn't carry becomes

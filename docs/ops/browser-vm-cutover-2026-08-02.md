@@ -27,6 +27,11 @@ not a second active worklist.
   placing credentials in the mesh record. RDP falls back to the native SPICE
   console when the guest endpoint is unavailable; dead relays and previously
   unavailable records are retried by the broker's normal refresh loop.
+- The Browser shortcut now resolves optional remembered guest credentials through
+  the Chooser's existing sealed-credential seam before constructing the typed VDI
+  request. The credential remains in the in-memory `DesktopAuth` only; Workloads
+  and broker records still carry no password. With the honest production store
+  still gated, a missing credential remains an explicit RDP readiness gate.
 
 ## Farm evidence
 
@@ -55,6 +60,10 @@ On BigBoy (`172.20.0.130`):
 - On the same BigBoy clone, `mde-web-sandbox`, `mde-web-cef`, and
   `mde-web-preview` each passed locked offline `cargo check`; the client’s 87
   tests and strict clippy gate passed.
+- A clean standalone clone from public `main` also passed the locked root
+  workspace test; the native helper checks and strict clippy gates passed on the
+  farm after the initial offline cache miss for `tokio-macros` was resolved by a
+  network-enabled locked run.
 - `verify-browser-extraction.sh --check` passed for 85 paths: 18
   browser-owned, 25 mixed-purpose, and 42 shared.
 - The checked-in Browser VM image contract has not yet been rebuilt with this

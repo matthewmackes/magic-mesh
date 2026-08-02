@@ -1461,6 +1461,7 @@ impl VdiState {
         client_peer: &str,
         bus_root: Option<PathBuf>,
         preferred_size: Option<(u16, u16)>,
+        auth: DesktopAuth,
     ) -> Result<(), String> {
         let mut last_error = None;
         let publication = crate::discovery::publish_browser_vm_open_record(
@@ -1478,7 +1479,7 @@ impl VdiState {
             VdiProtocol::Rdp,
             DisplayMode::Fullscreen,
             MonitorSpan::Single,
-            DesktopAuth::mesh_identity(client_peer),
+            auth,
         )
         .with_broker_session(BrokerSessionLifecycle::new(publication.id, bus_root))
         .with_preferred_size(preferred_size);
