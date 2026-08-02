@@ -26,7 +26,12 @@
 //! unit-tested here; the connect + pump are proven against a real (loopback /
 //! live) server since they need one to exercise.
 
-use spice_client::{MouseButton as SpiceMouseButton, SpiceClientShared, SpiceError};
+use spice_client::{
+    channels::display::DisplaySurface,
+    MouseButton as SpiceMouseButton,
+    SpiceClientShared,
+    SpiceError,
+};
 
 use crate::config::SpiceConfig;
 use crate::input::{to_spice, MouseButton, SpiceInputEvent};
@@ -82,6 +87,11 @@ const fn spice_button(b: MouseButton) -> SpiceMouseButton {
 /// [`SpiceSession`].
 pub struct SpiceTransport {
     client: SpiceClientShared,
+    /// The upstream client holds each channel mutex while its receive loop is
+    /// waiting for the next wire message.  Keep the decoded primary surface in
+    /// the client's update callback so the shell can poll it without contending
+    /// with that receive loop.
+    latest_surface: std::sync::Arc<std::sync::Mutex<Option<DisplaySurface>>>,
 }
 
 impl SpiceTransport {
@@ -102,7 +112,19 @@ impl SpiceTransport {
             client.set_password(password.clone()).await;
         }
         client.connect().await?;
-        Ok(Self { client })
+        let latest_surface = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let callback_surface = std::sync::Arc::clone(&latest_surface);
+        client
+            .set_display_update_callback(PRIMARY_CHANNEL, move |surface| {
+                if let Ok(mut slot) = callback_surface.lock() {
+                    *slot = Some(surface.clone());
+                }
+            })
+            .await?;
+        Ok(Self {
+            client,
+            latest_surface,
+        })
     }
 
     /// Borrow the underlying `spice-client` (the live event loop / channel
@@ -123,7 +145,12 @@ impl SpiceTransport {
     /// # Errors
     /// [`ConnectError::Surface`] if the decoded surface is malformed.
     pub async fn pump_frame(&self, session: &mut SpiceSession) -> Result<bool, ConnectError> {
-        let Some(surface) = self.client.get_display_surface(PRIMARY_CHANNEL).await else {
+        let Some(surface) = self
+            .latest_surface
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+        else {
             return Ok(false);
         };
         session

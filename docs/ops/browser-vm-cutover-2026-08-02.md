@@ -66,18 +66,24 @@ On BigBoy (`172.20.0.130`):
   chrome. The capture is the first positive guest Chromium render evidence;
   it is not being used as a substitute for the VDI decoder gate.
 - The farm `mde-vdi-spice` live test connected through an SSH-forwarded Dell
-  SPICE console and emitted `live: FRAME OK 1024x768 fnv1a64=0x3fe01b4acfe22325`.
-  The pinned `spice-client 0.2.0` then panicked in its display draw-copy
-  bounds arithmetic (`display.rs:941`, subtraction overflow) before the test
-  could complete input echo. This leaves the SPICE input/reconnect proof open.
+  SPICE console. The vendored `spice-client 0.2.0` fork hardens draw-copy
+  clipping and leaves the write-only inputs channel available while the
+  display receive loop runs. Two consecutive live runs both connected, sent
+  `Key::M + Enter` through `SpiceTransport::flush_input`, and completed with
+  `test ... ok`; the second run is the reconnect evidence. The observed frame
+  is still `1024x768` with `distinct_colors=1` (flat black), so the tightened
+  live gate rejects it as decoded guest rendering even though the transport
+  and input wire paths are live.
 - Seat 15 (`172.20.0.15`) remains untouched; its low free-space condition makes
   it unsuitable for this image without operator capacity work.
 
 ## Still unproven
 
 The host cutover, dedicated image/qcow2 build, Dell boot, guest Chromium
-framebuffer, and first SPICE frame are evidenced. Signed publication/install,
-completed focused input, reconnect, GPU video, PipeWire audio, performance,
-and six-node acceptance remain open. The SPICE decoder panic is the immediate
-transport blocker, and Seat 15 still needs operator capacity work; this change
+framebuffer, SPICE connection, input wire path, and reconnect are evidenced.
+Decoded guest pixels over VDI, focused-input visual echo, GPU video,
+PipeWire audio, performance, signed publication/install, and six-node
+acceptance remain open. The immediate blocker is now the upstream SPICE draw
+decoder’s wire-layout/image decode (the panic is hardened, but the result is
+still flat black); Seat 15 still needs operator capacity work. This change
 does not claim that the Chromium App VM is production-ready.

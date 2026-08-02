@@ -7565,8 +7565,6 @@ dependencies = [
 [[package]]
 name = "spice-client"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2a0d3baecbea7cab1e9bb54e1359a3bae0fee23388e50c4de551ed93dbb139a0"
 dependencies = [
  "async-trait",
  "base64",

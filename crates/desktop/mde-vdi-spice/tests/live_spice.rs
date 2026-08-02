@@ -169,6 +169,10 @@ async fn live_spice_console_connects_renders_and_accepts_input() {
         img.size[0], img.size[1]
     );
     assert!(img.size[0] > 0 && img.size[1] > 0, "empty desktop");
+    assert!(
+        colors > 1,
+        "live: SPICE frame is a flat fill; decoded guest pixels are not ready"
+    );
 
     let settled = settle(&transport, &mut session, Duration::from_secs(5)).await;
     let baseline = settled.as_ref().map_or(checksum, fnv1a64);

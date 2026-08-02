@@ -84,6 +84,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 
+# The published 0.2.0 client underflows while clipping malformed/partial draw
+# rectangles and runs the write-only inputs channel under a receive mutex.  The
+# small vendored fork keeps the live SPICE transport bounded and writable until
+# those fixes land upstream.
+[patch.crates-io]
+spice-client = { path = "vendor/spice-client" }
+
 [workspace.lints.rust]
 unsafe_code     = "forbid"
 missing_docs    = "warn"

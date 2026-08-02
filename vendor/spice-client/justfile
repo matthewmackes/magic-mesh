@@ -1,0 +1,133 @@
+# ============================
+# Unit and Integration Tests
+# ============================
+
+# Run unit tests
+test-unit:
+    cargo test --lib --all-features
+
+# Run integration tests
+test-integration:
+    cargo test --test '*' --features test-utils -- --nocapture
+
+# ============================
+# E2E Test Commands
+# ============================
+
+# E2E tests (native client with Docker server - fast AIO)
+
+# Quick E2E test (auto-starts Docker server)
+test-e2e:
+    ./run-e2e-tests.sh
+
+# E2E test with existing server
+test-e2e-existing:
+    ./run-e2e-tests.sh basic none
+
+# E2E test with system SPICE server
+test-e2e-system:
+    ./run-e2e-tests.sh basic system
+
+# E2E test with QEMU Ubuntu VM (realistic)
+test-e2e-qemu:
+    ./run-e2e-tests.sh basic qemu
+
+# E2E test with all implementations
+test-e2e-all:
+    ./run-e2e-tests.sh all
+
+# Setup/build SPICE test server locally
+setup-test-server:
+    ./setup-test-server.sh
+
+# Clean up all test containers
+test-e2e-clean:
+    cd docker && docker compose -f docker-compose.yml down -v --remove-orphans
+
+# ============================
+# WASM Testing Commands
+# ============================
+
+# Build WASM package (release mode)
+wasm-build:
+    ./build-wasm.sh release
+
+# Build WASM package (dev mode with debug symbols)
+wasm-build-dev:
+    ./build-wasm.sh dev
+
+# Build WASM package (test mode with extra features)
+wasm-build-test:
+    ./build-wasm.sh test
+
+# Start complete WASM test environment (debug server, fast)
+wasm-test:
+    ./start-wasm-test.sh
+
+# Start WASM test with native QEMU (uses local QEMU installation)
+wasm-test-qemu:
+    ./start-wasm-test.sh --qemu native
+
+# Start WASM test with Docker QEMU Ubuntu VM
+wasm-test-docker-qemu:
+    ./start-wasm-test.sh --qemu docker-qemu
+
+# Start WASM test with custom web port
+wasm-test-port port="3000":
+    ./start-wasm-test.sh --web-port {{port}}
+
+# Start WASM test with existing SPICE server
+wasm-test-existing spice_port="5900":
+    ./start-wasm-test.sh --qemu none --spice-port {{spice_port}}
+
+# Start only web server for WASM (no QEMU)
+wasm-serve port="8000":
+    python3 web-test/serve.py --port {{port}}
+
+# Build and start WASM test environment (release build)
+wasm-test-release:
+    ./start-wasm-test.sh --build-mode release
+
+# Clean up lingering WASM test processes
+wasm-test-cleanup:
+    #!/usr/bin/env bash
+    echo "Cleaning up WASM test processes..."
+    # Kill Python servers
+    pkill -9 -f "web-test/serve.py" 2>/dev/null || true
+    pkill -9 -f "websocket-proxy" 2>/dev/null || true
+    # Kill processes on ports
+    lsof -ti:8000 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+    lsof -ti:8080 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+    lsof -ti:5959 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+    # Stop Docker containers
+    cd docker && docker compose --profile server-debug stop -t 2 && docker compose --profile server-debug rm -f || true
+    echo "Cleanup complete"
+
+# ============================
+# Development Commands
+# ============================
+
+# Start WASM development environment with hot-reload
+wasm-dev:
+    cd docker && docker compose -f docker-compose.yml --profile dev up --build
+
+# ============================
+# Utility Commands
+# ============================
+
+# Test SPICE connection with native client (manual testing)
+test-spice host="localhost" port="5900":
+    cargo run --bin spice-test-client -- --host {{host}} --port {{port}} --duration 10 -vv
+
+# Show available test combinations
+test-help:
+    ./run-e2e-tests.sh --help
+
+# Run all tests (unit + integration + e2e)
+test-all: test-unit test-integration test-e2e
+
+# Clean everything
+clean:
+    cargo clean
+    cd docker && docker compose -f docker-compose.yml down -v --remove-orphans
+    docker system prune -f

@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SPICE Client WASM Test</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .container {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            margin-top: 0;
+        }
+        .controls {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+        .control-group {
+            display: flex;
+            gap: 5px;
+            align-items: center;
+        }
+        label {
+            font-weight: 500;
+        }
+        input, button {
+            padding: 8px 12px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        input {
+            width: 120px;
+        }
+        button {
+            background: #007bff;
+            color: white;
+            border: none;
+            cursor: pointer;
+            font-weight: 500;
+        }
+        button:hover {
+            background: #0056b3;
+        }
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        .disconnect {
+            background: #dc3545;
+        }
+        .disconnect:hover:not(:disabled) {
+            background: #c82333;
+        }
+        #canvas-container {
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            background: #000;
+            margin-bottom: 20px;
+            position: relative;
+            overflow: hidden;
+        }
+        #spice-canvas {
+            display: block;
+            max-width: 100%;
+            height: auto;
+        }
+        .status {
+            padding: 10px;
+            border-radius: 4px;
+            margin-bottom: 10px;
+        }
+        .status.info {
+            background: #d1ecf1;
+            border: 1px solid #bee5eb;
+            color: #0c5460;
+        }
+        .status.error {
+            background: #f8d7da;
+            border: 1px solid #f5c6cb;
+            color: #721c24;
+        }
+        .status.success {
+            background: #d4edda;
+            border: 1px solid #c3e6cb;
+            color: #155724;
+        }
+        #log {
+            background: #f8f9fa;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            padding: 10px;
+            max-height: 200px;
+            overflow-y: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            white-space: pre-wrap;
+        }
+        .log-entry {
+            margin-bottom: 5px;
+        }
+        .log-entry.error {
+            color: #dc3545;
+        }
+        .log-entry.info {
+            color: #17a2b8;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>SPICE Client WASM Test</h1>
+
+        <div class="controls">
+            <div class="control-group">
+                <label for="host">Host:</label>
+                <input type="text" id="host" value="localhost" />
+            </div>
+            <div class="control-group">
+                <label for="port">Port:</label>
+                <input type="number" id="port" value="8080" />
+            </div>
+            <button id="connect-btn">Connect</button>
+            <button id="disconnect-btn" class="disconnect" disabled>Disconnect</button>
+        </div>
+
+        <div id="status" class="status info">
+            Ready to connect. Enter SPICE server details above.
+        </div>
+
+        <div id="canvas-container">
+            <canvas id="spice-canvas" width="800" height="600"></canvas>
+        </div>
+
+        <h3>Connection Log</h3>
+        <div id="log"></div>
+    </div>
+
+    <script type="module">
+        import init, { SpiceClient } from '../pkg/spice_client.js';
+
+        let client = null;
+        let isConnected = false;
+        const statusEl = document.getElementById('status');
+        const logEl = document.getElementById('log');
+        const connectBtn = document.getElementById('connect-btn');
+        const disconnectBtn = document.getElementById('disconnect-btn');
+        const canvas = document.getElementById('spice-canvas');
+
+        function log(message, type = 'info') {
+            const entry = document.createElement('div');
+            entry.className = `log-entry ${type}`;
+            const timestamp = new Date().toLocaleTimeString();
+            entry.textContent = `[${timestamp}] ${message}`;
+            logEl.appendChild(entry);
+            logEl.scrollTop = logEl.scrollHeight;
+            console.log(message);
+        }
+
+        function setStatus(message, type = 'info') {
+            statusEl.textContent = message;
+            statusEl.className = `status ${type}`;
+        }
+
+        async function connect() {
+            const host = document.getElementById('host').value;
+            const port = parseInt(document.getElementById('port').value);
+
+            if (!host || !port) {
+                setStatus('Please enter host and port', 'error');
+                return;
+            }
+
+            try {
+                setStatus('Initializing WASM module...', 'info');
+                log('Initializing WASM module...');
+
+                await init();
+                log('WASM module loaded successfully');
+
+                const wsUrl = `ws://${host}:${port}`;
+                setStatus(`Connecting to ${wsUrl}...`, 'info');
+                log(`Connecting to ${wsUrl}...`);
+
+                // Create SPICE client with WebSocket URL and canvas
+                client = new SpiceClient(wsUrl, canvas);
+                log('SPICE client created');
+
+                // Connect to server
+                setStatus('Connecting to SPICE server...', 'info');
+                await client.connect();
+
+                log('Connected to SPICE server', 'info');
+                setStatus('Connected', 'success');
+                isConnected = true;
+                connectBtn.disabled = true;
+                disconnectBtn.disabled = false;
+
+            } catch (error) {
+                log(`Connection failed: ${error}`, 'error');
+                setStatus(`Connection failed: ${error}`, 'error');
+                connectBtn.disabled = false;
+                disconnectBtn.disabled = true;
+            }
+        }
+
+        async function disconnect() {
+            if (client) {
+                log('Disconnecting...');
+                setStatus('Disconnecting...', 'info');
+                isConnected = false;
+                await client.disconnect();
+                client = null;
+                connectBtn.disabled = false;
+                disconnectBtn.disabled = true;
+                log('Disconnected', 'info');
+                setStatus('Disconnected', 'info');
+            }
+        }
+
+        // Event listeners
+        connectBtn.addEventListener('click', connect);
+        disconnectBtn.addEventListener('click', disconnect);
+
+        // Handle keyboard/mouse events
+        canvas.addEventListener('mousedown', (e) => {
+            if (client && isConnected) {
+                e.preventDefault();
+                try {
+                    client.send_mouse_button(e.button, true);
+                } catch (err) {
+                    console.error('Mouse button error:', err);
+                }
+            }
+        });
+
+        canvas.addEventListener('mouseup', (e) => {
+            if (client && isConnected) {
+                e.preventDefault();
+                try {
+                    client.send_mouse_button(e.button, false);
+                } catch (err) {
+                    console.error('Mouse button error:', err);
+                }
+            }
+        });
+
+        canvas.addEventListener('mousemove', (e) => {
+            if (client && isConnected) {
+                try {
+                    const rect = canvas.getBoundingClientRect();
+                    const x = Math.floor(e.clientX - rect.left);
+                    const y = Math.floor(e.clientY - rect.top);
+                    client.send_mouse_move(x, y);
+                } catch (err) {
+                    // Silently ignore mouse move errors to avoid spam
+                    console.debug('Mouse move error:', err);
+                }
+            }
+        });
+
+        document.addEventListener('keydown', (e) => {
+            if (client && isConnected && !e.repeat) {
+                // Only send if focus is on canvas or body (not input fields)
+                const activeEl = document.activeElement;
+                if (activeEl === canvas || activeEl === document.body) {
+                    e.preventDefault();
+                    try {
+                        client.send_key(e.keyCode, true);
+                    } catch (err) {
+                        console.error('Key event error:', err);
+                    }
+                }
+            }
+        });
+
+        document.addEventListener('keyup', (e) => {
+            if (client && isConnected) {
+                const activeEl = document.activeElement;
+                if (activeEl === canvas || activeEl === document.body) {
+                    e.preventDefault();
+                    try {
+                        client.send_key(e.keyCode, false);
+                    } catch (err) {
+                        console.error('Key event error:', err);
+                    }
+                }
+            }
+        });
+
+        log('SPICE Client WASM Test Interface Ready');
+        setStatus('Ready to connect', 'info');
+    </script>
+</body>
+</html>
