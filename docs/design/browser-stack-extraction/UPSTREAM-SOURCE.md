@@ -1,9 +1,9 @@
 # Legacy host Browser extraction provenance
 
 This is the Phase 0 prerequisite for `WL-ARCH-008`. It records the current
-host Browser inventory without deleting source, creating a clone, rewriting
-history, or publishing `matthewmackes/magic-mesh-browser-stack`. Publication
-and the later removal/cutover remain operator-gated work.
+host Browser inventory without deleting source or rewriting the live
+`magic-mesh` history. The history-bearing standalone repository is now public;
+source removal and live VM acceptance remain separate gates.
 
 ## Immutable source snapshot
 
@@ -22,14 +22,12 @@ and the later removal/cutover remain operator-gated work.
   immutable source blob, and verifies clean worktree bytes exactly. A dirty
   mixed/shared row is required to remain divergent from the source snapshot,
   while its recorded worktree hash remains an audit-time observation.
-- Current safety posture: no accepted history-filtered extraction, GitHub
-  publication, or source deletion has been performed. A local candidate at
-  `/root/magic-mesh-browser-stack` was audited on 2026-08-01 and is incomplete:
-  it has only a local `/root/magic-mesh` remote, lacks root workspace/build
-  metadata, and has no clean-clone proof. Treat it as disposable audit
-  material, not as the standalone destination. The verifier rejects untracked
-  Browser candidates and Browser paths changed since the anchored source
-  snapshot.
+- Current safety posture: no source deletion or live-worktree history rewrite
+  has been performed. The history-bearing standalone repository is public at
+  `https://github.com/matthewmackes/magic-mesh-browser-stack`; its latest
+  publication commit is recorded in the companion handoff and standalone
+  provenance. The verifier rejects untracked Browser candidates and Browser
+  paths changed since the anchored source snapshot.
 
 The manifest has three classes:
 
@@ -44,6 +42,26 @@ the scoped source tree, a missing row, an unclassified row, an untracked path,
 or a changed source blob fails closed. Dirty `browser-owned` paths fail closed;
 dirty `mixed-purpose`/`shared` paths are recorded as `worktree_state=dirty` and
 must be committed/reconciled before extraction.
+
+## Standalone build evidence — 2026-08-02
+
+The public repository currently admits `mde-web-wire`, `mde-adblock`, and the
+independently buildable `mde-web-preview-client` in its root workspace. Its
+clean-clone root test covers 135 tests. The separately locked native helper
+roots also pass farm checks on BigBoy:
+
+- `mde-web-sandbox`: `cargo check --locked --offline` passed.
+- `mde-web-cef`: `cargo check --locked --offline` passed.
+- `mde-web-preview`: `cargo check --locked --offline` passed.
+- `mde-web-preview-client`: all 87 unit tests and `cargo clippy --all-targets
+  --locked --offline -- -D warnings` passed.
+
+The worker family is not yet admitted because its shared platform dependencies
+(`mde-worker-core`, `mde-bus`, `mackes-mesh-types`, and `mde-seal`) still need
+history-preserving extraction. These checks establish standalone helper
+buildability; they do not establish a vendored CEF payload, guest Chromium
+pixels, VDI input/reconnect, GPU video, PipeWire audio, performance, or
+six-node acceptance.
 
 ## Current workspace, package, and process inventory
 

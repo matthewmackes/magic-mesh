@@ -7,10 +7,10 @@ not a second active worklist.
 
 - `magic-mesh-browser-stack` is public and history-bearing at
   `https://github.com/matthewmackes/magic-mesh-browser-stack`.
-- Standalone publication provenance is recorded in commit `c307da31`.
-- Its admitted root workspace contains `mde-web-wire` and `mde-adblock`, has a
-  clean-clone boundary verifier and CI, and has no Cargo path/git dependency
-  back to `magic-mesh`.
+- Standalone publication provenance is recorded through commit `9a0807ab`.
+  The public root workspace contains `mde-web-wire`, `mde-adblock`, and the
+  independent `mde-web-preview-client` bridge; the separately locked native
+  helper roots are checked without a `magic-mesh` checkout.
 - Construct commit `95f3ad21` makes Browser consume the folded Workloads row
   named `browser-vm` (`DesktopVm`, running, reachable), publish the normal typed
   `action/vdi/session` open, and hand the session to the existing VDI decoder.
@@ -27,16 +27,17 @@ On BigBoy (`172.20.0.130`):
 - `cargo check -p mde-shell-egui --features live-vdi` passed.
 - `cargo test -p mde-shell-egui --features live-vdi web` passed: 6 Browser
   tests, including Workloads wait, typed VDI handoff, and no-host-runtime UI.
-- The standalone boundary verifier, `cargo test --workspace --locked` (48
-  tests), and `cargo clippy --workspace --all-targets --locked -- -D warnings`
-  passed in the standalone farm workspace.
+- The standalone boundary verifier, `cargo test --workspace --locked` (135
+  tests), and root clippy passed in the standalone farm workspace.
+- On the same BigBoy clone, `mde-web-sandbox`, `mde-web-cef`, and
+  `mde-web-preview` each passed locked offline `cargo check`; the client’s 87
+  tests and strict clippy gate passed.
 - `verify-browser-extraction.sh --check` passed for 168 paths: 92
   browser-owned, 33 mixed-purpose, and 43 shared.
 
 ## Still unproven
 
-The public repository currently admits a narrow dependency-complete root; the
-native CEF/Servo helper workspaces, full old-stack extraction, Browser VM image,
+The worker-family extraction, full old-stack source cleanup, Browser VM image,
 live Chromium framebuffer, focused input, reconnect, GPU video, PipeWire audio,
 performance, and six-node acceptance remain open. The 2026-08-02 seat audit
 still found no VDI listener on seat 15 or Dell, so this change does not claim
