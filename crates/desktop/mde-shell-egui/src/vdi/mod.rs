@@ -1429,6 +1429,41 @@ impl VdiState {
         self.requested = Some(request);
     }
 
+    /// Attach the stable Browser VM workload to the existing brokered VDI
+    /// transport. Browser uses the same session lifecycle as every other
+    /// Desktop VM; the guest identity is the workload name and no host Browser
+    /// process is constructed here.
+    pub(crate) fn request_browser_vm_connect(
+        &mut self,
+        target: crate::web::BrowserVmTarget,
+        client_peer: &str,
+        bus_root: Option<PathBuf>,
+        preferred_size: Option<(u16, u16)>,
+    ) -> Result<(), String> {
+        let mut last_error = None;
+        let publication = crate::discovery::publish_open_record(
+            bus_root.as_deref(),
+            &mut last_error,
+            &target.serving_peer,
+            &target.workload,
+            client_peer,
+        );
+        if let Some(error) = last_error {
+            return Err(format!("could not request browser-vm VDI session: {error}"));
+        }
+        let request = ConnectRequest::new(
+            RequestedTarget::new(target.serving_peer, target.workload),
+            VdiProtocol::Rdp,
+            DisplayMode::Fullscreen,
+            MonitorSpan::Single,
+            DesktopAuth::mesh_identity(client_peer),
+        )
+        .with_broker_session(BrokerSessionLifecycle::new(publication.id, bus_root))
+        .with_preferred_size(preferred_size);
+        self.request_connect(request);
+        Ok(())
+    }
+
     /// Attach a focused App VM rail session to the existing brokered VDI path.
     /// App sessions use VNC as the universal console fallback while the serving
     /// console broker resolves the actual endpoint; this does not expose the

@@ -2386,10 +2386,47 @@ impl Shell {
                 });
             }
             Surface::Browser => {
-                let web = &mut self.web;
-                ui.push_id("shell-web", |ui| {
-                    web::web_panel(ui, web);
-                });
+                let target = self.infra_code.browser_vm_target().map(
+                    |(serving_peer, workload, status, reachable)| web::BrowserVmTarget {
+                        serving_peer: serving_peer.to_owned(),
+                        workload: workload.to_owned(),
+                        status: status.to_owned(),
+                        reachable,
+                    },
+                );
+                self.web.sync_browser_vm_target(target);
+                if let Some(connect) = self.web.take_browser_vm_connect() {
+                    if let Err(error) = self.vdi.request_browser_vm_connect(
+                        connect.target,
+                        &self.local_host,
+                        mde_bus::client_data_dir(),
+                        Some(vdi::body_device_px(ui.ctx())),
+                    ) {
+                        self.web.browser_vm_unavailable(error);
+                    }
+                }
+                if self.vdi.requested_target().is_some() {
+                    let vdi = &mut self.vdi;
+                    let leave = ui
+                        .push_id("shell-browser-vdi", |ui| {
+                            vdi::vdi_panel(ui, vdi);
+                            vdi.take_return_to_chrome()
+                        })
+                        .inner;
+                    if leave {
+                        self.vdi.clear_target();
+                        self.nav.surface = Surface::Workbench;
+                    }
+                    #[cfg(feature = "live-vdi")]
+                    if self.vdi.has_live_transport() {
+                        ui.ctx().request_repaint();
+                    }
+                } else {
+                    let web = &mut self.web;
+                    ui.push_id("shell-web", |ui| {
+                        web::web_panel(ui, web);
+                    });
+                }
                 if self.web.take_bookmarks_manager_request() {
                     self.nav.surface = Surface::Bookmarks;
                 }
@@ -2811,7 +2848,9 @@ impl Shell {
         // (`action/cloud/get-catalog`) while it's in view — a non-blocking
         // request/reply on its ~15 s cadence; the request is published sync and its
         // reply read on a later tick, so the frame never stalls (IAC-2).
-        if self.nav.expanded && self.nav.surface == Surface::InfraCode {
+        if self.nav.expanded
+            && (self.nav.surface == Surface::InfraCode || self.nav.surface == Surface::Browser)
+        {
             self.infra_code.poll(ctx);
         }
 

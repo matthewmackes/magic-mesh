@@ -65,15 +65,36 @@ impl BrowserVmRoute {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BrowserVmConnectionState {
+    WaitingForWorkload,
     WaitingForVdi,
+    Unavailable,
 }
 
 impl BrowserVmConnectionState {
     const fn label(self) -> &'static str {
         match self {
+            Self::WaitingForWorkload => "Waiting for Workloads",
             Self::WaitingForVdi => "Waiting for VDI",
+            Self::Unavailable => "Browser VM unavailable",
         }
     }
+}
+
+/// The only Browser activation input accepted from the Workloads mirror. It is
+/// deliberately an identity/status tuple: no command, URL, endpoint, or host
+/// engine data can cross the Browser boundary here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BrowserVmTarget {
+    pub(crate) serving_peer: String,
+    pub(crate) workload: String,
+    pub(crate) status: String,
+    pub(crate) reachable: bool,
+}
+
+/// A one-shot handoff from the Browser surface to the existing VDI renderer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BrowserVmConnect {
+    pub(crate) target: BrowserVmTarget,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +109,8 @@ pub(crate) struct WebState {
     route: BrowserVmRoute,
     diagnostic: BrowserVmDiagnostic,
     requested_target: Option<String>,
+    browser_vm_connect: Option<BrowserVmConnect>,
+    browser_vm_request_issued: bool,
     #[cfg(test)]
     _transfers: Option<Box<dyn TransfersClient>>,
 }
@@ -103,6 +126,8 @@ impl Default for WebState {
                     .to_owned(),
             },
             requested_target: None,
+            browser_vm_connect: None,
+            browser_vm_request_issued: false,
             #[cfg(test)]
             _transfers: None,
         }
@@ -134,6 +159,56 @@ impl WebState {
     pub(crate) fn open_search_omnibox_target(&mut self, target: &str) {
         let target = target.trim();
         self.requested_target = (!target.is_empty()).then(|| target.chars().take(512).collect());
+    }
+
+    /// Fold the typed Workloads projection into Browser activation. A VM that
+    /// is not yet reachable remains unavailable; this path never starts a host
+    /// helper as a fallback.
+    pub(crate) fn sync_browser_vm_target(&mut self, target: Option<BrowserVmTarget>) {
+        if self.browser_vm_request_issued || self.browser_vm_connect.is_some() {
+            return;
+        }
+        let Some(target) = target else {
+            self.diagnostic = BrowserVmDiagnostic {
+                state: BrowserVmConnectionState::WaitingForWorkload,
+                detail: "No admitted browser-vm workload is present in the Workloads mirror."
+                    .to_owned(),
+            };
+            return;
+        };
+        if !target.reachable || target.status != "running" {
+            self.diagnostic = BrowserVmDiagnostic {
+                state: BrowserVmConnectionState::WaitingForWorkload,
+                detail: format!(
+                    "Workload `{}` on `{}` is {} and not reachable; waiting for guest readiness.",
+                    target.workload, target.serving_peer, target.status
+                ),
+            };
+            return;
+        }
+        self.diagnostic = BrowserVmDiagnostic {
+            state: BrowserVmConnectionState::WaitingForVdi,
+            detail: "The Browser VM is ready; requesting its brokered VDI session.".to_owned(),
+        };
+        self.browser_vm_connect = Some(BrowserVmConnect { target });
+    }
+
+    /// Consume the one-shot handoff. Once consumed, Browser remains bound to
+    /// this guest session until the user leaves the surface or the VDI layer
+    /// reports a bounded failure.
+    pub(crate) fn take_browser_vm_connect(&mut self) -> Option<BrowserVmConnect> {
+        let request = self.browser_vm_connect.take()?;
+        self.browser_vm_request_issued = true;
+        Some(request)
+    }
+
+    /// Surface an explicit VDI/broker failure without inventing a page or a
+    /// host-rendered fallback.
+    pub(crate) fn browser_vm_unavailable(&mut self, detail: impl Into<String>) {
+        self.diagnostic = BrowserVmDiagnostic {
+            state: BrowserVmConnectionState::Unavailable,
+            detail: detail.into(),
+        };
     }
 
     /// Browser search suggestions are guest-owned after the host runtime
@@ -233,5 +308,30 @@ mod tests {
         let mut state = WebState::default();
         state.open_search_omnibox_target("  https://example.test/  ");
         assert_eq!(state.requested_target.as_deref(), Some("https://example.test/"));
+    }
+
+    #[test]
+    fn browser_vm_waits_for_workloads_before_requesting_vdi() {
+        let mut state = WebState::default();
+        state.sync_browser_vm_target(None);
+        assert!(state.browser_vm_connect.is_none());
+        assert_eq!(
+            state.diagnostic().state,
+            BrowserVmConnectionState::WaitingForWorkload
+        );
+    }
+
+    #[test]
+    fn reachable_running_browser_vm_crosses_only_the_typed_vdi_seam() {
+        let mut state = WebState::default();
+        state.sync_browser_vm_target(Some(BrowserVmTarget {
+            serving_peer: "eagle".to_owned(),
+            workload: "browser-vm".to_owned(),
+            status: "running".to_owned(),
+            reachable: true,
+        }));
+        let request = state.take_browser_vm_connect().expect("VDI handoff");
+        assert_eq!(request.target.workload, "browser-vm");
+        assert!(state.browser_vm_connect.is_none());
     }
 }

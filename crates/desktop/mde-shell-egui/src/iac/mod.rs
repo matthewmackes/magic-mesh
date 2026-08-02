@@ -1708,6 +1708,27 @@ impl WorkloadsState {
         &self.states
     }
 
+    /// Return the admitted, stable Browser VM workload from the folded
+    /// Workloads mirror. Browser activation consumes this read model rather
+    /// than guessing a placement node or falling back to a host engine.
+    pub(super) fn browser_vm_target(&self) -> Option<(&str, &str, &str, bool)> {
+        self.states
+            .iter()
+            .flat_map(|state| state.workloads.iter())
+            .find(|workload| {
+                workload.name == "browser-vm"
+                    && workload.delivery_type == DeliveryType::DesktopVm
+            })
+            .map(|workload| {
+                (
+                    workload.node.as_str(),
+                    workload.name.as_str(),
+                    workload.status.as_str(),
+                    workload.reachable,
+                )
+            })
+    }
+
     /// Every workload of a given delivery type, across every node — the idiom a
     /// delivery view uses to read its own rows from the mirror.
     pub(super) fn workloads_of(
