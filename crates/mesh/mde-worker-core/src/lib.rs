@@ -11,9 +11,9 @@
 //!   its body can exit promptly on shutdown.
 //!
 //! They live here (rather than inside the `mackesd` bin crate) so worker
-//! implementations can be factored into their own crates — e.g. the per-seat
-//! browser workers in `mde-browser-workers` — without a circular dependency
-//! back on the daemon. `mackesd`'s `workers` module re-exports both types, so
+//! implementations can be factored into their own service crates without a
+//! circular dependency back on the daemon. `mackesd`'s `workers` module
+//! re-exports both types, so
 //! every in-crate worker keeps referencing `super::{Worker, ShutdownToken}`
 //! unchanged.
 

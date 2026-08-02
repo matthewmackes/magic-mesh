@@ -2169,8 +2169,9 @@ pub(crate) fn spawn_bookmark_workers(
     // own serialized filter-store blob into the encrypted Syncthing share
     // (`workgroup_root`, the same /mnt/mesh-storage substrate bookmarks/ssh-gossip
     // use) and LWW-merges every peer's into one converged store; the elected
-    // leader compiles that store into the shared engine blob the mde-web-preview
-    // browser reads + refreshes the enabled lists from an airgap-safe local mirror
+    // leader compiles that store into the shared engine blob consumed by the
+    // guest/application policy path and refreshes the enabled lists from an
+    // airgap-safe local mirror
     // (honest Staleness fallback, never fabricated — §7). Drains
     // action/adfilter/{allow,block} into the mesh-synced per-site allowlist
     // (block-on-by-default) + publishes state/adfilter/<node>. Offline-first: the

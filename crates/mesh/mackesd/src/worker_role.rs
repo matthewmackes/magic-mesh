@@ -316,8 +316,8 @@ const WORKER_REGISTRY: &[WorkerSpec] = &[
     // replaying peers' Syncthing segments into the shared collection.
     WorkerSpec::tier("bookmarks", 1, RestartPolicy::Always),
     // BOOKMARKS-7 — the mesh-wide ad-blocker worker. A desktop feature (it feeds
-    // the mde-web-preview browser's block engine), so Workstation-tier; it idles
-    // gracefully on a headless box (no browser, no action/adfilter/* requests)
+    // the shared policy engine), so Workstation-tier; it idles gracefully on a
+    // headless box (no action/adfilter/* requests)
     // while still replicating peers' filter-store blobs over Syncthing and, when
     // leader, compiling the shared engine blob.
     WorkerSpec::tier("adfilter", 1, RestartPolicy::Always),
@@ -1021,7 +1021,7 @@ mod tests {
         // the overlay, Workstation-tier: a seated-user desktop feature).
         // +1 adfilter (BOOKMARKS-7 — the mesh-wide ad-blocker worker replicating the
         // filter-store blob + leader-compiling the engine, Workstation-tier: a
-        // seated-user desktop feature backing the mde-web-preview browser).
+        // seated-user desktop-governance feature).
         // +1 browser_policy (BOOKMARKS-8 — the mesh-wide browser/ad-blocker POLICY
         // worker: reads the synced fleet policy doc + enforces at the browser
         // launch seam, Workstation-tier: a seated-user desktop-governance feature).

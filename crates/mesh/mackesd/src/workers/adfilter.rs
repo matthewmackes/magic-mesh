@@ -17,8 +17,8 @@
 //! * **Leader compile** (lock: one compiler mesh-wide). The elected leader
 //!   ([`crate::leader`], the shared `.mackesd-leader.lock`) serializes the
 //!   converged store into the compiled engine blob at
-//!   `<share>/adfilter/compiled/engine.json` — the single blob the mde-web-preview
-//!   browser reads + compiles into its [`Engine`] — and refreshes the enabled
+//!   `<share>/adfilter/compiled/engine.json` — the single blob consumed by the
+//!   guest/application policy path — and refreshes the enabled
 //!   lists from upstream.
 //! * **Airgap-honest refresh** (§7). The leader attempts an upstream refresh of
 //!   each enabled list via the injectable [`ListFetcher`]; production reads an

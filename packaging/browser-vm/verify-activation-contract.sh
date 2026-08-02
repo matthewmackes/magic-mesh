@@ -41,4 +41,19 @@ for forbidden in 'mde-web-preview' 'mde-web-cef' 'WebSession::spawn' 'BrowserEng
     fi
 done
 
+# The guest contract is retained in magic-mesh, but the extracted host engine
+# and helper source must not quietly return alongside it.
+for forbidden_path in \
+    crates/desktop/mde-web-cef \
+    crates/desktop/mde-web-preview \
+    crates/desktop/mde-web-preview-client \
+    crates/desktop/mde-web-sandbox \
+    crates/desktop/mde-web-wire \
+    crates/mesh/mde-browser-workers \
+    packaging/browser; do
+    if [[ -e "$ROOT/$forbidden_path" || -L "$ROOT/$forbidden_path" ]]; then
+        die "extracted host Browser path still exists: $forbidden_path"
+    fi
+done
+
 echo "Browser VM activation contract passed: Surface::Browser -> browser-vm -> DesktopVm/VDI"

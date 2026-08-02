@@ -35,8 +35,6 @@ pub enum Method {
     Rsync,
     /// `wget -c --limit-rate` HTTP download (TRANSFERS lane: http/wget).
     Http,
-    /// A browser-enqueued download or scrape output handed to the queue (Q8/Q17).
-    BrowserDownload,
     /// A node→node move staged through the mesh-share so Syncthing replicates (Q6).
     Node,
     /// A drop into the shared Navidrome music library dir (Q9).
@@ -45,11 +43,10 @@ pub enum Method {
 
 impl Method {
     /// Every method, in a stable order (help text + exhaustiveness tests).
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 5] = [
         Self::Sftp,
         Self::Rsync,
         Self::Http,
-        Self::BrowserDownload,
         Self::Node,
         Self::Music,
     ];
@@ -61,7 +58,6 @@ impl Method {
             Self::Sftp => "sftp",
             Self::Rsync => "rsync",
             Self::Http => "http",
-            Self::BrowserDownload => "browser_download",
             Self::Node => "node",
             Self::Music => "music",
         }
@@ -74,8 +70,7 @@ impl fmt::Display for Method {
     }
 }
 
-/// Parse a method from a CLI token — case-insensitive, `-` and `_` interchangeable
-/// (`browser-download` == `browser_download`).
+/// Parse a method from a CLI token — case-insensitive, `-` and `_` interchangeable.
 impl FromStr for Method {
     type Err = String;
 

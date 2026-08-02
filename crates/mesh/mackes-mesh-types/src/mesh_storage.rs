@@ -1,7 +1,7 @@
 //! Shared mesh-storage constants + the write-safety guard.
 //!
 //! arch-7 (2026-07-11) — relocated out of the `mackesd` bin crate so worker
-//! crates factored out of the daemon (e.g. `mde-browser-workers`) can reuse
+//! crates factored out of the daemon can reuse
 //! the one audited [`shared_root_writable`] guard rather than re-deriving it.
 //! `mackesd` re-exports these at its crate root, so its ~17 in-crate call
 //! sites (`crate::CANONICAL_QNM_MOUNT` / `crate::shared_root_writable`) are

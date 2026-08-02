@@ -37,10 +37,10 @@ sudo dnf install -y gcc gcc-c++ cmake mold pkg-config \
   file header).
 - The vendored Opus tree needs `CMAKE_POLICY_VERSION_MINIMUM=3.5`;
   `.cargo/config.toml` sets it, CI sets it explicitly.
-- The workspace has ~40 crates (see `Cargo.toml` `members`); the two
-  browser-engine crates (`mde-web-cef`, `mde-web-preview`) are **separate excluded
-  workspaces** with their own `Cargo.lock`, built on their own (the RPM cut builds
-  `mde-web-preview` separately before `generate-rpm`).
+- The workspace has ~40 crates (see `Cargo.toml` `members`). The former host
+  Browser engine/helper workspaces are preserved in the standalone
+  `matthewmackes/magic-mesh-browser-stack` repository; this repository builds
+  the typed `browser-vm` route and guest-image contract.
 - **Offload heavy/parallel builds to the farm:** `install-helpers/xcp-build.sh
   cargo …` (routes to the farm); status via `install-helpers/farm.sh status`.
 
@@ -100,9 +100,9 @@ traceability work is tracked by `WL-CRIT-006`.
   hangs (EFF-20).
 - **UI is egui-native** — surfaces render through `mde-egui` (eframe/wgpu; the
   shell owns the DRM/KMS seat directly, no Wayland compositor) using the shared
-  `Style`; use `mde-theme::brand` only for licensed brand assets. The two excluded browser engines (`mde-web-cef`
-  CEF/Chromium, `mde-web-preview` Servo) are pinned in their own workspaces and
-  bumped on their own cadence (Servo tracked monthly).
+  `Style`; use `mde-theme::brand` only for licensed brand assets. Browser page
+  execution and chrome are guest-owned by the `browser-vm` workload and reach
+  the shell only through VDI.
 - **Crypto floor** (§3): Ed25519 / AES-256-GCM / ChaCha20-Poly1305 / RSA-4096
   own keys / rustls. `cargo deny` bans openssl outright.
 

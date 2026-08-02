@@ -24,8 +24,8 @@
 # desktop-shell tier ("gui") — see tier_of below.
 #
 # Tier is a crate's directory, with curated exceptions: mackesd, magic-fleet,
-# mde-enroll, and the factored mde-browser-workers physically live under
-# crates/mesh/ but ARE platform services (§6), so they rank as services — which
+# and mde-enroll physically live under crates/mesh/ but ARE platform services
+# (§6), so they rank as services — which
 # is exactly why a pure-directory split would wrongly red-flag e.g.
 # `mackesd → mde-bus`.
 #
@@ -59,8 +59,7 @@ tier_of() {
             echo "0|shared" ;;
         crates/mesh/mackesd|crates/mesh/mackesd/*|\
         crates/mesh/magic-fleet|crates/mesh/magic-fleet/*|\
-        crates/mesh/mde-enroll|crates/mesh/mde-enroll/*|\
-        crates/mesh/mde-browser-workers|crates/mesh/mde-browser-workers/*)
+        crates/mesh/mde-enroll|crates/mesh/mde-enroll/*)
             echo "2|platform-services" ;;
         crates/mesh/*|crates/kdc/*)
             echo "1|mesh-substrate" ;;

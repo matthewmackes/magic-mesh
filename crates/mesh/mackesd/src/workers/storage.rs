@@ -3962,7 +3962,7 @@ mod tests {
 
     // multi_thread runtime so the spawned worker task runs on its OWN thread rather
     // than being serialized behind the test body on a single current-thread executor.
-    // On a heavily-loaded farm node (e.g. a concurrent Servo compile pushing load >12)
+    // On a heavily-loaded farm node (e.g. a concurrent native helper compile pushing load >12)
     // a current-thread runtime starved the worker's shutdown poll past even a 10s wall
     // ceiling; giving it a real thread pool + a generous 30s ceiling makes the
     // assertion robust to scheduler starvation while still catching a worker that

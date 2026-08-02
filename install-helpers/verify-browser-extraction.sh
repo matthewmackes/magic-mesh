@@ -92,7 +92,6 @@ class_for_path() {
     install-helpers/mirror-cef-runtime-to-spaces.sh|\
     install-helpers/setup-selinux-web-cef.sh|install-helpers/setup-selinux-web-preview.sh|\
     packaging/browser/*|packaging/selinux/mde-web-*|\
-    packaging/browser-vm/*|\
     packaging/systemd/mde-browser-*|packaging/systemd/mde-cef-runtime-setup.service|\
     packaging/systemd/mde-widevine-cdm-setup.service|packaging/systemd/mde-web-*)
       printf '%s\n' browser-owned
@@ -212,6 +211,10 @@ candidate_scope() {
     docs/design/browser-stack-extraction/*|install-helpers/verify-browser-extraction.sh)
       return 1
       ;;
+    packaging/browser-vm/*)
+      # This is the root-owned guest image contract, not extracted host source.
+      return 1
+      ;;
     Cargo.toml|Cargo.lock|crates/desktop/mde-shell-egui/src/*|\
     crates/mesh/mackesd/src/*|crates/mesh/mackes-mesh-types/src/*|\
     crates/mesh/mde-seal/*|crates/mesh/mde-worker-core/*|\
@@ -281,6 +284,11 @@ discover_candidates() {
   grep -v -F -- 'install-helpers/verify-browser-extraction.sh' "$content_paths" \
     > "$content_paths.filtered" || :
   mv -- "$content_paths.filtered" "$content_paths"
+  # The Browser VM image/guest contract is new root-owned infrastructure, not
+  # extracted host Browser source. Keep it out of the historical source map.
+  grep -v -E '^packaging/browser-vm/' "$content_paths" \
+    > "$content_paths.filtered" || :
+  mv -- "$content_paths.filtered" "$content_paths"
   cat "$content_paths" >> "$discovered"
 
   while IFS= read -r path; do
@@ -331,6 +339,18 @@ validate_manifest_rows() {
     expected_reason="$(reason_for_path "$path")"
     [[ "$destination" == "$expected_destination" ]] || die "manifest destination drift for $path"
     [[ "$reason" == "$expected_reason" ]] || die "manifest reason drift for $path"
+
+    # Browser-owned files are intentionally deleted from magic-mesh after the
+    # standalone extraction. Their source blob must still exist in the
+    # immutable extraction commit, but there is no current worktree blob to
+    # compare. Mixed/shared rows must remain present because they still carry
+    # live mesh or VM-route behavior in this repository.
+    if [[ "$class" == browser-owned && ! -e "$ROOT/$path" && ! -L "$ROOT/$path" ]]; then
+      git_cmd cat-file -e "${source_commit}:$path" 2>/dev/null || die "source commit is missing extracted path $path"
+      actual_blob="$(git_cmd rev-parse "${source_commit}:$path")"
+      [[ "$actual_blob" == "$recorded_blob" ]] || die "recorded source blob drift for extracted path $path"
+      continue
+    fi
     git_cmd ls-files --error-unmatch -- "$path" >/dev/null 2>&1 || die "manifest source is not tracked: $path"
     git_cmd cat-file -e "${source_commit}:$path" 2>/dev/null || die "source commit is missing $path"
     actual_blob="$(git_cmd rev-parse "${source_commit}:$path")"
@@ -407,7 +427,15 @@ check_manifest() {
   candidates="$tmp/candidates"
   make_all_paths "$tmp/all-paths"
   discover_candidates "$tmp/all-paths" "$tmp/discovered" "$tmp/content-paths" > "$candidates"
-  cut -f2 "$rows" | sort -u > "$manifest_paths"
+  : > "$manifest_paths"
+  while IFS=$'\t' read -r class path _; do
+    # An absent Browser-owned row is preserved as immutable provenance, not as
+    # a current-tree candidate. All other rows must remain in the worktree.
+    if [[ -e "$ROOT/$path" || -L "$ROOT/$path" || "$class" != browser-owned ]]; then
+      printf '%s\n' "$path" >> "$manifest_paths"
+    fi
+  done < "$rows"
+  sort -u "$manifest_paths" -o "$manifest_paths"
   missing="$tmp/missing"
   extra="$tmp/extra"
   comm -23 "$candidates" "$manifest_paths" > "$missing"
@@ -457,6 +485,10 @@ self_test() {
   check "$(class_for_path "$path")" shared
   check "$(destination_for "$path")" "retain-in-magic-mesh:$path#shared-contract-or-reference"
   check "$(reason_for_path "$path")" shared-bookmark-contract
+
+  path='packaging/browser-vm/README.md'
+  check "$(class_for_path "$path")" shared
+  check "$(destination_for "$path")" "retain-in-magic-mesh:$path#shared-contract-or-reference"
 
   if path_is_named_candidate install-helpers/verify-browser-extraction.sh; then
     echo 'FAIL: verifier classified itself as a source candidate' >&2

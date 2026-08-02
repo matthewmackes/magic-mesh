@@ -1,7 +1,7 @@
 # arch-7 (2026-07-11) — the shared worker-pool contract extracted out of the
 # `mackesd` bin crate so worker IMPLEMENTATIONS can live in their own crates
-# (e.g. `mde-browser-workers`, the per-seat browser workers) without depending
-# back on the daemon. Holds exactly two types every supervised worker touches:
+# (e.g. per-service worker crates) without depending back on the daemon. Holds
+# exactly two types every supervised worker touches:
 # the async `Worker` trait the supervisor stores as `Box<dyn Worker>`, and the
 # `ShutdownToken` handed to each worker body.
 

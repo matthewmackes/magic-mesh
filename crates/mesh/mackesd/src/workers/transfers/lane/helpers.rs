@@ -196,15 +196,6 @@ pub(super) fn local_source_path(raw: &str) -> Option<PathBuf> {
     Some(PathBuf::from(s))
 }
 
-pub(super) fn resolve_dest_path(source: &Path, dest: &Path) -> PathBuf {
-    if dest.is_dir() {
-        if let Some(file_name) = source.file_name() {
-            return dest.join(file_name);
-        }
-    }
-    dest.to_path_buf()
-}
-
 pub(super) fn music_library_dir(dest: &str) -> PathBuf {
     let dest = dest.trim();
     if !dest.is_empty() && dest != "music-library" {

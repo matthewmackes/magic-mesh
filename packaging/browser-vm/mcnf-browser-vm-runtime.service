@@ -1,13 +1,17 @@
 [Unit]
 Description=MCNF guest-owned Chromium Browser VM runtime
-Wants=network-online.target
-After=network-online.target systemd-user-sessions.service
+Wants=network-online.target seatd.service
+After=network-online.target systemd-user-sessions.service seatd.service
+Requires=seatd.service
 
 [Service]
 Type=simple
 User=mcnf-browser
 SupplementaryGroups=video input audio
-Environment=XDG_RUNTIME_DIR=/run/user/%U
+RuntimeDirectory=mcnf-browser
+RuntimeDirectoryMode=0700
+Environment=XDG_RUNTIME_DIR=/run/mcnf-browser
+Environment=LIBSEAT_BACKEND=seatd
 ExecStart=/usr/local/libexec/mcnf-browser-vm-runtime
 Restart=on-failure
 RestartSec=2

@@ -38,32 +38,46 @@ On BigBoy (`172.20.0.130`):
   tests and strict clippy gate passed.
 - `verify-browser-extraction.sh --check` passed for 168 paths: 92
   browser-owned, 33 mixed-purpose, and 43 shared.
-- The dedicated Fedora 44 Browser VM image was built and statically verified on
-  BigBoy from the `magic-mesh-12.1.6-1.x86_64.rpm` artifact. The image carries
-  profile label `browser-vm-chromium-v1`, image digest
-  `sha256:efe44106db4963b8b1aef9af0f3106905a89b964de032096bcabd9827e549767`,
-  and base-image digest
+- The dedicated Fedora 44 Browser VM image was rebuilt and statically verified
+  on BigBoy from the `magic-mesh-12.1.6-1.x86_64.rpm` artifact. The final
+  candidate is profile `browser-vm-chromium-v1`, with qcow2 SHA-256
+  `ec1958b0dfaaccbed63348c45afa5ff68951aa63034fa5ba1d13bc518e8581a7` and
+  base-image digest
   `sha256:307de440d3381256a6f7072755ad340d428a0e43b6a83823d120c6c774a4d5e7`.
-  The static verifier found Chromium (Fedora's `chromium-browser` launcher),
-  Sway, Wayland, Mesa, PipeWire/WirePlumber, libinput, the guest runtime, and
-  the host-Browser prohibition contract.
-- `bootc-image-builder` produced the qcow2 with an explicit XFS rootfs on
-  BigBoy at `/home/mm/browser-vm-chromium-qcow2/qcow2/disk.qcow2`; size
-  `2251755008` bytes and SHA-256
-  `d00d5c8a4c35a3134d0e5f8c4a95ea31f6744e63aa820e849f3c1630b8d0fd72`.
-  The build script now supplies that explicit rootfs because Fedora 44's local
-  image metadata does not provide `DefaultRootFs` to the current builder.
-- Dell (`172.20.146.225`) now has the verified artifact staged at
-  `/var/lib/libvirt/images/browser-vm-chromium.qcow2`; the remote checksum
-  matches, `qemu-img info` reports a non-corrupt qcow2 with a 10 GiB virtual
-  size, and no Browser VM domain was created yet. Seat 15 was not modified:
-  its root filesystem had only 1.5 GiB free, below the 2.25 GB artifact size.
+  It includes cloud-init and seatd, disables weak workstation dependencies,
+  explicitly excludes `magic-mesh-browser`, and the static verifier found
+  Chromium, Sway, Wayland, Mesa, PipeWire/WirePlumber, libinput, the guest
+  runtime, and the host-Browser prohibition contract.
+- `bootc-image-builder` produced the final qcow2 with an explicit XFS rootfs
+  on BigBoy at `/home/mm/browser-vm-chromium-qcow2-v6/qcow2/disk.qcow2`; it is
+  a 10 GiB virtual disk with a 1.7 GiB sparse payload. The explicit rootfs is
+  required because Fedora 44's local image metadata does not provide
+  `DefaultRootFs` to the current builder.
+
+## Dell live evidence
+
+- Dell (`172.20.146.225`) is running the persistent `browser-vm` libvirt domain
+  from `/var/lib/libvirt/images/browser-vm-chromium-v6.qcow2`, with the v6
+  cloud-init seed updated for the final image digest and a QXL SPICE video
+  device. The domain has 4 vCPUs, 8 GiB RAM, the virtio input devices, and
+  SPICE on Dell loopback `127.0.0.1:5900`.
+- A QEMU framebuffer capture from the running guest is 1920x1080 and visibly
+  shows guest Chromium's New Tab page, focused omnibox, tabs, and browser
+  chrome. The capture is the first positive guest Chromium render evidence;
+  it is not being used as a substitute for the VDI decoder gate.
+- The farm `mde-vdi-spice` live test connected through an SSH-forwarded Dell
+  SPICE console and emitted `live: FRAME OK 1024x768 fnv1a64=0x3fe01b4acfe22325`.
+  The pinned `spice-client 0.2.0` then panicked in its display draw-copy
+  bounds arithmetic (`display.rs:941`, subtraction overflow) before the test
+  could complete input echo. This leaves the SPICE input/reconnect proof open.
+- Seat 15 (`172.20.0.15`) remains untouched; its low free-space condition makes
+  it unsuitable for this image without operator capacity work.
 
 ## Still unproven
 
-The standalone worker-family extraction and the dedicated image/qcow2 build are
-complete, but signed publication/install, live Chromium framebuffer, focused
-input, reconnect, GPU video, PipeWire audio, performance, and six-node
-acceptance remain open. The 2026-08-02 seat audit still found no VDI listener
-on seat 15 or Dell, so this change does not claim that the Chromium App VM is
-production-ready.
+The host cutover, dedicated image/qcow2 build, Dell boot, guest Chromium
+framebuffer, and first SPICE frame are evidenced. Signed publication/install,
+completed focused input, reconnect, GPU video, PipeWire audio, performance,
+and six-node acceptance remain open. The SPICE decoder panic is the immediate
+transport blocker, and Seat 15 still needs operator capacity work; this change
+does not claim that the Chromium App VM is production-ready.

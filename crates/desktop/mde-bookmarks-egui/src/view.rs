@@ -11,9 +11,8 @@
 //! Layout — the locked three regions plus the addenda's left vertical tab rail:
 //! a top header (search · add · sort), a narrow **tab rail**, the **folder tree**,
 //! the **detail/browser pane** on the right, and the **list** in the centre. The
-//! detail pane carries an honest browser seam: the interactive Servo browser is
-//! BOOKMARKS-5/6, so "open in a tab" is surfaced as a labelled intent, never a
-//! fake browser (§7).
+//! detail pane carries an honest Browser VM seam: "open in a tab" is surfaced
+//! as a labelled intent, never a fake host browser (§7).
 
 use mde_egui::egui::{
     self, Align, Align2, CursorIcon, Layout, Response, RichText, ScrollArea, Sense, TextEdit,
@@ -653,9 +652,9 @@ fn rename_row(ui: &mut egui::Ui, m: &mut Manager, actions: &mut Vec<Action>) {
     });
 }
 
-/// The honest browser seam at the foot of the detail pane. The interactive Servo
-/// browser is BOOKMARKS-5/6; until it lands this pane is detail-only, and any
-/// "open in a tab" intent is listed here — a clearly-labelled seam, not a stub (§7).
+/// The honest Browser VM seam at the foot of the detail pane. Until the guest
+/// navigation handoff lands this pane is detail-only, and any "open in a tab"
+/// intent is listed here — a clearly-labelled seam, not a stub (§7).
 fn browser_seam(ui: &mut egui::Ui, m: &Manager) {
     // A nested read-only region — the shared `inset()` primitive recesses it into
     // the detail pane (deep app-background fill, hairline border, no shadow) so
@@ -666,7 +665,7 @@ fn browser_seam(ui: &mut egui::Ui, m: &Manager) {
         ui.label(RichText::new("Browser").color(Style::TEXT_DIM).size(Style::SMALL).strong());
         mde_egui::muted_note(
             ui,
-            "The sandboxed Servo browser arrives with BOOKMARKS-5/6. \
+            "The Browser VM navigation handoff arrives with BOOKMARKS-5/6. \
              Until then this pane shows details; \u{201c}open\u{201d} and add-from-page light up with it.",
         );
         let intent = m.open_intent();

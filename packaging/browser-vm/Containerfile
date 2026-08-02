@@ -17,16 +17,17 @@ RUN set -eux; \
     install -D -m 0644 /tmp/mcnf-browser-vm-runtime.service /etc/systemd/system/mcnf-browser-vm-runtime.service; \
     if [ "${MCNF_RPM_LANE}" = "local" ]; then \
         ls /tmp/mcnf-rpms/magic-mesh-*.rpm >/dev/null 2>&1 || { echo 'FATAL: local Browser VM lane needs a magic-mesh RPM'; exit 1; }; \
-        dnf -y install /tmp/mcnf-rpms/magic-mesh-*.rpm; \
-    else dnf -y install magic-mesh; fi; \
-    dnf -y install \
-        chromium dbus-daemon dbus-tools sway \
+        rpm -Uvh --nodeps --noscripts /tmp/mcnf-rpms/magic-mesh-*.rpm; \
+    else dnf -y --setopt=install_weak_deps=False --exclude=magic-mesh-browser install magic-mesh; fi; \
+    dnf -y --setopt=install_weak_deps=False \
+        --exclude=magic-mesh-browser install \
+        chromium cloud-init dbus-daemon dbus-tools seatd sway \
         xdg-desktop-portal xdg-desktop-portal-wlr \
         pipewire pipewire-pulseaudio wireplumber \
         mesa-dri-drivers mesa-libEGL mesa-libGL mesa-libgbm \
         libinput libxkbcommon xorg-x11-server-Xwayland; \
     useradd --create-home --shell /bin/bash mcnf-browser; \
-    usermod -a -G video,input,audio mcnf-browser || true; \
+    usermod -a -G video,input,audio,seat mcnf-browser || true; \
     install -d -o mcnf-browser -g mcnf-browser -m 0700 /var/lib/mcnf-browser; \
     install -d -m 0755 /usr/share/mcnf/browser-vm; \
     printf '%s\n' \
@@ -36,3 +37,4 @@ RUN set -eux; \
     dnf clean all
 
 RUN systemctl enable mcnf-browser-vm-runtime.service
+RUN systemctl enable seatd.service

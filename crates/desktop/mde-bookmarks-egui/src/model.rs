@@ -183,7 +183,7 @@ pub struct Manager {
     /// The item shown in the detail pane (`None` = nothing focused).
     detail: Option<Uuid>,
     /// URLs the user asked to "open" — surfaced under the browser seam until the
-    /// Servo browser (BOOKMARKS-5/6) lands.
+    /// Browser VM navigation handoff (BOOKMARKS-5/6) lands.
     open_intent: Vec<String>,
 
     /// The live title+URL search query (lock Q27); empty = browse `current`.

@@ -1661,32 +1661,7 @@ async fn run_host(
                         if let Ok(body) =
                             mde_kdc_proto::plugins::from_packet_body::<MprisBody>(packet)
                         {
-                            let host = hostname_for_shunt();
-                            let bus_root = mde_bus::default_data_dir();
-                            let browser_status =
-                                browser_media_status_from_bus(bus_root.as_deref(), &host);
-                            if browser_mpris_target_requested(&body.player) {
-                                if let Some(command) =
-                                    apply_browser_mpris_media_command_if_active(
-                                        bus_root.as_deref(),
-                                        &host,
-                                        &body,
-                                        browser_status.as_ref(),
-                                    )
-                                {
-                                    audit_kdc_action(json!({
-                                        "action": "kdc_media_control",
-                                        "phone": peer.as_str(),
-                                        "command": command,
-                                        "target": "browser",
-                                    }));
-                                } else {
-                                    debug!(
-                                        phone = %peer.as_str(),
-                                        "kdc-host: Browser media command refused without an active Browser projection"
-                                    );
-                                }
-                            } else if let Some(command) =
+                            if let Some(command) =
                                 apply_mpris_media_command(&PlayerctlMediaControl, &body)
                             {
                                 audit_kdc_action(json!({
@@ -1707,32 +1682,7 @@ async fn run_host(
                         if let Ok(body) =
                             mde_kdc_proto::plugins::from_packet_body::<MprisRequestBody>(packet)
                         {
-                            let host = hostname_for_shunt();
-                            let bus_root = mde_bus::default_data_dir();
-                            let browser_status =
-                                browser_media_status_from_bus(bus_root.as_deref(), &host);
-                            if browser_mpris_target_requested(&body.player) {
-                                if let Some(command) =
-                                    apply_browser_mpris_request_command_if_active(
-                                        bus_root.as_deref(),
-                                        &host,
-                                        &body,
-                                        browser_status.as_ref(),
-                                    )
-                                {
-                                    audit_kdc_action(json!({
-                                        "action": "kdc_media_control",
-                                        "phone": peer.as_str(),
-                                        "command": command,
-                                        "target": "browser",
-                                    }));
-                                } else {
-                                    debug!(
-                                        phone = %peer.as_str(),
-                                        "kdc-host: Browser media request refused without an active Browser projection"
-                                    );
-                                }
-                            } else if let Some(command) =
+                            if let Some(command) =
                                 apply_mpris_request_command(&PlayerctlMediaControl, &body)
                             {
                                 audit_kdc_action(json!({
@@ -1741,11 +1691,8 @@ async fn run_host(
                                     "command": command,
                                 }));
                             }
-                            let reports = mpris_response_bodies_for_request_with_browser(
-                                &PlayerctlMediaControl,
-                                &body,
-                                browser_status.as_ref(),
-                            );
+                            let reports =
+                                mpris_response_bodies_for_request(&PlayerctlMediaControl, &body);
                             for report in reports {
                                 let packet = build_packet(
                                     "kdeconnect.mpris",
@@ -2405,37 +2352,6 @@ fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-}
-
-/// Browser MPRIS is a distinct target, not a request to fall back to the
-/// host's generic `playerctl` player. Keep that distinction at the KDC
-/// dispatch boundary so a paired phone cannot steer an unrelated Browser tab
-/// when the Browser has not published an active media projection.
-fn browser_mpris_target_requested(player: &str) -> bool {
-    matches!(
-        player.trim().to_ascii_lowercase().as_str(),
-        "mde-browser" | "browser" | "magic mesh browser"
-    )
-}
-
-fn apply_browser_mpris_media_command_if_active(
-    bus_root: Option<&Path>,
-    host: &str,
-    body: &MprisBody,
-    status: Option<&BrowserMediaStatus>,
-) -> Option<&'static str> {
-    let status = status?;
-    apply_browser_mpris_media_command(bus_root, host, body, Some(status))
-}
-
-fn apply_browser_mpris_request_command_if_active(
-    bus_root: Option<&Path>,
-    host: &str,
-    body: &MprisRequestBody,
-    status: Option<&BrowserMediaStatus>,
-) -> Option<&'static str> {
-    let status = status?;
-    apply_browser_mpris_request_command(bus_root, host, body, Some(status))
 }
 
 // ───────────────── KDC-MESH-7: two-way files + service directory ──────────────

@@ -118,7 +118,7 @@ pub fn workers_ready(map: &WorkerStatusMap) -> (u32, u32, u32) {
 // arch-7 (2026-07-11) — the shared worker-pool contract (`Worker` +
 // `ShutdownToken`) moved into the `mde-worker-core` crate so worker
 // IMPLEMENTATIONS can live in their own crates (e.g. the per-seat browser
-// workers in `mde-browser-workers`) without a circular dependency back on this
+// workers in separate service crates) without a circular dependency back on this
 // bin crate. Re-exported here so every in-crate worker + the ~120 call sites
 // keep referencing `super::{Worker, ShutdownToken}` / `crate::workers::Worker`
 // unchanged.

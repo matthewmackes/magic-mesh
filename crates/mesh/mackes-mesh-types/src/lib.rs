@@ -75,7 +75,7 @@ pub mod media_sources;
 pub mod network_status;
 // arch-7 (2026-07-11) — the canonical shared-storage mount constant +
 // the AUDIT-MESH-15 write-safety guard, relocated out of the `mackesd` bin
-// crate so worker crates factored out of the daemon (mde-browser-workers)
+// crate so worker crates factored out of the daemon
 // reuse the one audited guard. `mackesd` re-exports at its crate root.
 pub mod mesh_storage;
 // NF-11.1 (v2.5) — Nebula facts surface for the peer card.

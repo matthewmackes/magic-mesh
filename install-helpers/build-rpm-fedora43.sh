@@ -69,7 +69,7 @@ RUSTUP_INIT_SHA256="${RUSTUP_INIT_SHA256:-}"
 # build-deploy-7 — base-image pinning (hermeticity). A bare `fedora:43` tag is
 # MUTABLE: the Fedora registry re-publishes it on every point-release, so two
 # cuts weeks apart can pull different base layers (different glibc/gcc/system libs
-# the Servo/CEF helpers link against) and the "reproducible" cut is not. For a
+# the native media and desktop helpers link against) and the "reproducible" cut is not. For a
 # fully reproducible cut, pin the base by DIGEST. We CANNOT resolve a digest here
 # on the airgapped farm (no registry egress at author time), so this is an
 # OPERATOR TODO rather than an invented value:

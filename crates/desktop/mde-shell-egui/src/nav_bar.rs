@@ -1925,8 +1925,8 @@ fn log_foreground_layer_id_map_once() {
         ),
         ("vdi-session-overlay", egui::Id::new("vdi-session-overlay")),
         (
-            "mde-web-omnibox-suggestions-overlay",
-            egui::Id::new("mde-web-omnibox-suggestions-overlay"),
+            "browser-vm-search-suggestions-overlay",
+            egui::Id::new("browser-vm-search-suggestions-overlay"),
         ),
         ("kiron-chyron-area", egui::Id::new("kiron-chyron-area")),
         ("kiron-osd-area", egui::Id::new("kiron-osd-area")),

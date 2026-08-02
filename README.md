@@ -44,7 +44,7 @@ headless-capable (`AI_GOVERNANCE.md` §6).
 │  DESKTOP-SHELL TIER  —  one egui shell that owns the DRM/KMS seat (no compositor)│
 │     mde-shell-egui  (chrome bar · the five-plane Workbench · surface panels)     │
 │     surfaces: mde-{files,music,media,voice,term,editor,bookmarks,panel}-egui     │
-│     VDI clients: mde-vdi-{rdp,vnc,spice}   ·   browser: mde-web-cef + mde-web-preview │
+│     VDI clients: mde-vdi-{rdp,vnc,spice}   ·   Browser: browser-vm Chromium guest │
 │     harness + look: mde-egui (eframe/wgpu + DRM/GBM/libinput) · mde-theme (brand) │
 └───────────────┬────────────────────────────────────────────────────────────── ┘
                 │ talks over the Bus, renders live state — never an authority
@@ -145,9 +145,12 @@ dual-homed (its own Nebula cert + a LAN NIC), default-deny inbound.
   (libmpv) for local playback; an `mde-jellyfin` client.
 - **Telephony / voice** — `mde-voice-egui` + `mde-voice-config`: a SIP softphone
   with mesh-internal extensions (Kamailio + RTPengine) and an outbound gateway.
-- **Browser** — a first-class **dual-engine** browser: `mde-web-cef`
-  (Chromium/CEF) + `mde-web-preview` (an out-of-process, OS-sandboxed Servo
-  engine), with a mesh-wide ad-filter (`mde-adblock`).
+- **Browser** — a dedicated `browser-vm` Desktop VM running Chromium/Sway. The
+  shell owns only the connection boundary; Sunshine/Moonlight is preferred,
+  RDP is the explicit alternate, and the guest owns browser chrome, pages,
+  media, and audio. The old host Browser stack is preserved in the standalone
+  [`magic-mesh-browser-stack`](https://github.com/matthewmackes/magic-mesh-browser-stack)
+  repository.
 - **Terminal / editor / bookmarks** — `mde-term-egui` (VT + tmux-first),
   `mde-editor-egui`, `mde-bookmarks-egui` (a mesh-replicated CRDT bookmark tree).
 - **Device sync** — `mde-kdc-host`: a native KDE-Connect host (pair, ring,
@@ -200,16 +203,18 @@ severity-mapped journal alerts, and `meshctl doctor` / `fleet status` /
 
 ## What's here
 
-One workspace of **~40 crates**, grouped by tier, plus the two **excluded**
-browser-engine crates (`mde-web-cef`, `mde-web-preview` — each its own
-workspace + `Cargo.lock` so the engine pin is reproducible):
+One workspace of **~40 crates**, grouped by tier. The former host Browser
+engine/helper workspaces are preserved and built separately in the public
+[`magic-mesh-browser-stack`](https://github.com/matthewmackes/magic-mesh-browser-stack)
+repository; this repository contains only the typed VM route and guest image
+contract:
 
 | Group | Representative crates | Role |
 |---|---|---|
 | `platform` | `mde-bus`, `mde-role`, `mde-role-chooser` | the pub/sub + RPC backbone · the 2-role model · the first-run role chooser |
 | `mesh` | `mackesd` (+ `meshctl`), `mackes-{config,mesh-types,nebula-https-tunnel,transport,xcp}`, `mde-enroll`, `magic-fleet` | the supervised control-plane daemon, the covert TCP/443 tunnel, transport/types/config, enrollment, and the no-fixed-center fleet engine |
 | `services` | `mde-files`, `mde-musicd`, `mde-voice-{hud,config}`, `mde-chat`, `mde-adblock`, `mde-bookmarks` | mesh file transport · music daemon · voice/SIP · the mesh-chat model · ad-filter · bookmark CRDT |
-| `desktop` | `mde-shell-egui`, `mde-{files,music,media,voice,term,editor,bookmarks,panel}-egui`, `mde-vdi-{rdp,vnc,spice}`, `mde-mesh-view`, `mde-seat`, `mde-media-core`, `mde-jellyfin`, `mde-web-preview-client` | the one egui/DRM shell + its surfaces · the VDI clients · seat hardware access |
+| `desktop` | `mde-shell-egui`, `mde-{files,music,media,voice,term,editor,bookmarks,panel}-egui`, `mde-vdi-{rdp,vnc,spice}`, `mde-mesh-view`, `mde-seat`, `mde-media-core`, `mde-jellyfin` | the one egui/DRM shell + its surfaces · the VDI clients · seat hardware access |
 | `shared` | `mde-egui`, `mde-theme`, `mde-disclaimer` | the egui/DRM harness + shared `Style` · the `brand` module (QBRAND) · the runtime accept gate |
 | `kdc` | `mde-kdc-host`, `mde-kdc-proto` | the KDE-Connect host + wire protocol |
 
@@ -269,8 +274,8 @@ and every gotcha) is [`docs/BUILD-ENVIRONMENT.md`](docs/BUILD-ENVIRONMENT.md).
 
 Prerequisites, the serial-`mackesd` test rule, and the lint/deny/coverage gates:
 [`CONTRIBUTING.md`](CONTRIBUTING.md). Packaging is one signed `magic-mesh` RPM
-(`cargo generate-rpm`, with the excluded `mde-web-preview` built separately) plus
-the immutable bootc/ostree image; the install-time role chooser picks
+plus the immutable Browser VM image and guest contract; the extracted host
+Browser repository is built independently. The install-time role chooser picks
 Lighthouse / Workstation. Cut via `/release` (operator-gated).
 
 ## Documentation

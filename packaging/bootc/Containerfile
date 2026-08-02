@@ -228,10 +228,9 @@ RUN set -eux; \
 #   2. power-profiles-daemon — the seat power-profile control (settings/power.rs);
 #      it CONFLICTS with `tuned`, so --allowerasing swaps it in. Containerfile-only
 #      for exactly that conflict (a plain Require would break a tuned-carrying node).
-#   3. Live-CEF Chromium userspace — the first-boot-fetched CEF binary dynamically
-#      links a Chromium set neither RPM lists; without it live CEF won't start.
-#      The .so's arrive at runtime, so no Fedora pkg is a Require — these are the
-#      host libs they load against.
+#   3. Guest/application video userspace — guest-owned media paths dynamically
+#      link against the standard Mesa, codec, and display libraries. These remain
+#      image/package integration dependencies rather than a host Browser runtime.
 #   4. Full virt stack (node-virt.yml "every mesh node") — the base RPM now Requires
 #      these, but re-install explicitly like the seat/storage blocks so an offline
 #      local-RPM compose can't miss them.

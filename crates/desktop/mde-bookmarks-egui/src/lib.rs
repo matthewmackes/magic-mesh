@@ -14,8 +14,8 @@
 //!
 //! Honest seams (§7): persistence + mesh sync are the BOOKMARKS-2 worker's job —
 //! [`Manager::from_collection`] is the constructor it binds to; and the
-//! interactive Servo browser is BOOKMARKS-5/6, so the detail pane's browser
-//! region is a clearly-labelled seam, not a fake browser.
+//! Browser VM navigation is BOOKMARKS-5/6, so the detail pane's browser region
+//! is a clearly-labelled seam, not a fake host browser.
 
 pub mod model;
 pub mod view;
