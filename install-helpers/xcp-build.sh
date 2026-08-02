@@ -88,7 +88,18 @@ do_sync() {
 # Run a command in the remote repo with the cargo env + the workspace config
 # (mold linker, CMAKE policy) already present via the synced .cargo/config.toml.
 remote() {
-  "${SSH[@]}" "$DEST" "source \$HOME/.cargo/env 2>/dev/null; cd $REMOTE_DIR && $*"
+  local remote_env="" name quoted
+  # Live VDI proof runners set one of these target variables in their local
+  # environment. Forward only the bounded endpoint inputs approved by the
+  # ignored live tests; arbitrary local environment must not cross the farm
+  # boundary or alter a remote build.
+  for name in MDE_SPICE_LIVE_TARGET MDE_VNC_LIVE_TARGET MDE_RDP_LIVE_TARGET; do
+    if [[ -n "${!name+x}" ]]; then
+      printf -v quoted '%q' "${!name}"
+      remote_env+=" $name=$quoted"
+    fi
+  done
+  "${SSH[@]}" "$DEST" "source \$HOME/.cargo/env 2>/dev/null; cd $REMOTE_DIR && env$remote_env $*"
 }
 
 quote_args() {

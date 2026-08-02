@@ -36,20 +36,19 @@ On BigBoy (`172.20.0.130`):
 - On the same BigBoy clone, `mde-web-sandbox`, `mde-web-cef`, and
   `mde-web-preview` each passed locked offline `cargo check`; the client’s 87
   tests and strict clippy gate passed.
-- `verify-browser-extraction.sh --check` passed for 168 paths: 92
-  browser-owned, 33 mixed-purpose, and 43 shared.
+- `verify-browser-extraction.sh --check` passed for 85 paths: 18
+  browser-owned, 25 mixed-purpose, and 42 shared.
 - The dedicated Fedora 44 Browser VM image was rebuilt and statically verified
-  on BigBoy from the `magic-mesh-12.1.6-1.x86_64.rpm` artifact. The final
-  candidate is profile `browser-vm-chromium-v1`, with qcow2 SHA-256
-  `ec1958b0dfaaccbed63348c45afa5ff68951aa63034fa5ba1d13bc518e8581a7` and
-  base-image digest
-  `sha256:307de440d3381256a6f7072755ad340d428a0e43b6a83823d120c6c774a4d5e7`.
+  on BigBoy from the local `magic-mesh-12.1.6-1.x86_64.rpm` artifact. The
+  Pixman candidate is profile `browser-vm-chromium-v1`, with build qcow2
+  SHA-256
+  `f7376cb8892cec011ca5c8651e5fa68e0a3a1ba7607df5694bbfb84a1a09ff1a`.
   It includes cloud-init and seatd, disables weak workstation dependencies,
   explicitly excludes `magic-mesh-browser`, and the static verifier found
   Chromium, Sway, Wayland, Mesa, PipeWire/WirePlumber, libinput, the guest
   runtime, and the host-Browser prohibition contract.
-- `bootc-image-builder` produced the final qcow2 with an explicit XFS rootfs
-  on BigBoy at `/home/mm/browser-vm-chromium-qcow2-v6/qcow2/disk.qcow2`; it is
+- `bootc-image-builder` produced the Pixman qcow2 with an explicit XFS rootfs
+  on BigBoy at `/home/mm/browser-vm-chromium-qcow2-pixman-20260802/qcow2/disk.qcow2`; it is
   a 10 GiB virtual disk with a 1.7 GiB sparse payload. The explicit rootfs is
   required because Fedora 44's local image metadata does not provide
   `DefaultRootFs` to the current builder.
@@ -57,34 +56,34 @@ On BigBoy (`172.20.0.130`):
 ## Dell live evidence
 
 - Dell (`172.20.146.225`) is running the persistent `browser-vm` libvirt domain
-  from `/var/lib/libvirt/images/browser-vm-chromium-v6.qcow2`, with the v6
-  cloud-init seed updated for the final image digest and a QXL SPICE video
+  from `/var/lib/libvirt/images/browser-vm-chromium-pixman-v7.qcow2`, with the
+  normal cloud-init seed at
+  `/var/lib/libvirt/images/browser-vm-cloudinit-pixman-final-20260802.iso` and a QXL SPICE video
   device. The domain has 4 vCPUs, 8 GiB RAM, the virtio input devices, and
   SPICE on Dell loopback `127.0.0.1:5900`.
-- The persistent Dell domain was restored to its known QXL/SPICE configuration
-  after a scoped virtio display probe failed because Dell's QEMU display backend
-  has no OpenGL support. A fresh QEMU capture reaches the Fedora login/audit
-  console, not Chromium; no current guest-Chromium render claim is made.
-- The farm `mde-vdi-spice` live test connected through an SSH-forwarded Dell
-  SPICE console. The vendored `spice-client 0.2.0` fork now parses the
-  variable-clip DrawCopy wire layout, 32-bit image offsets, and the observed
-  LZ_RGB image payload without panicking. The current console frame decodes to
-  only two or three colors, so the tightened live gate rejects it as decoded
-  guest rendering. The runtime journal shows seatd accepting the compositor
-  client and then losing it immediately; the guest service is restart-looping
-  rather than presenting Chromium.
+- Dell's QEMU display backend has no OpenGL support, so the domain deliberately
+  remains on QXL/SPICE and the guest runtime exports `WLR_RENDERER=pixman`.
+- After correcting the NoCloud image digest to the full 64-hex artifact digest,
+  a fresh QEMU capture reached a 1920x1080 Chromium New Tab page. Capture
+  SHA-256: `fd57e470c45cf0ea4e9f05bb284b3b08612aa021debafd8ec8525e52e9479eaf`.
+- The farm `mde-vdi-spice` live test connected through the SSH-forwarded Dell
+  SPICE console and passed the decoded-frame/input gate: `1024x768`, frame
+  FNV-1a64 `0xface601842022325`, input observation `echoed`, source commit
+  `71c19235319c89c41eb8888d4804442a7860465c`. The bounded evidence record is
+  `/tmp/browser-vm-spice-proof-final-20260802.json` with probe-log SHA-256
+  `954e41154795e9f861ffbc230617484ab000fa0ca7ba9a29de3ae2d61fb4fd73`.
+- The live proof runner now forwards only the approved VDI target variables
+  through `xcp-build.sh`; its route self-test and the source-bound run pass.
 - Seat 15 (`172.20.0.15`) remains untouched; its low free-space condition makes
   it unsuitable for this image without operator capacity work.
 
 ## Still unproven
 
-The host cutover, dedicated image/qcow2 provenance, SPICE connection, and
-wire-level input attempt are evidenced. Decoded Chromium pixels over VDI,
-focused-input visual echo, guest runtime stability, GPU video, PipeWire audio,
-performance, signed publication/install, and six-node acceptance remain open.
-The decoder’s wire-layout/image path is now corrected and rejects the current
-flat console frame; the immediate deployment blocker is rebuilding the guest
-image with the Pixman runtime fix, because the Fedora 44 repository currently
-lacks the multimedia RPM dependencies required by the image build. Dell is
-back on QXL/SPICE, and Seat 15 still needs operator capacity work. This change
-does not claim that the Chromium App VM is production-ready.
+The host cutover, dedicated image/qcow2 provenance, Chromium guest capture,
+decoded SPICE pixels, and focused-input visual echo are evidenced. RDP/Sunshine
+endpoint implementation and live proof, GPU video, PipeWire audio,
+five-session performance, signed publication/install/upgrade, reconnect/failover,
+and six-node acceptance remain open. The image was built through the supported
+local-RPM lane because the Fedora 44 repository lane lacks the multimedia RPM
+dependencies required by the image build. Seat 15 still needs operator capacity
+work. This change does not claim that the Chromium App VM is production-ready.
