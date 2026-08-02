@@ -22,18 +22,31 @@ for path in /usr/local/libexec/mcnf-browser-vm-validate /usr/local/libexec/mcnf-
 done
 chromium_bin="$(command -v chromium || command -v chromium-browser || true)"
 [ -n "$chromium_bin" ] && ok "runtime binary present: chromium ($chromium_bin)" || bad "runtime binary missing: chromium"
-for binary in sway dbus-run-session pipewire pipewire-pulse wireplumber pw-cli pactl aplay arecord vainfo xrdp; do
+for binary in mackesd meshctl nebula sway dbus-run-session pipewire pipewire-pulse wireplumber pw-cli pactl aplay arecord vainfo xrdp; do
   command -v "$binary" >/dev/null 2>&1 && ok "runtime binary present: $binary" || bad "runtime binary missing: $binary"
 done
-for package in magic-mesh chromium sway pipewire pipewire-utils pipewire-pulseaudio wireplumber spice-vdagent pipewire-alsa alsa-lib alsa-ucm alsa-utils mesa-dri-drivers libva-utils libinput xrdp xorgxrdp qemu-guest-agent; do
+for package in magic-mesh-lighthouse chromium sway pipewire pipewire-utils pipewire-pulseaudio wireplumber spice-vdagent pipewire-alsa pulseaudio-utils alsa-lib alsa-ucm alsa-utils mesa-dri-drivers libva-utils libinput xrdp xorgxrdp qemu-guest-agent; do
   rpm -q "$package" >/dev/null 2>&1 && ok "package installed: $package" || bad "package missing: $package"
 done
 grep -Fq "\"browser\":\"chromium\"" /usr/share/mcnf/browser-vm/image-contract.json && ok "contract selects Chromium" || bad "contract does not select Chromium"
+grep -Fq "\"control_plane\":\"magic-mesh-lighthouse\"" /usr/share/mcnf/browser-vm/image-contract.json && ok "contract selects thin guest control plane" || bad "contract does not select the thin guest control plane"
 grep -Fq "\"compositor\":\"sway\"" /usr/share/mcnf/browser-vm/image-contract.json && ok "contract selects Sway" || bad "contract does not select Sway"
 grep -Fq "\"host_browser\":false" /usr/share/mcnf/browser-vm/image-contract.json && ok "contract forbids host Browser" || bad "contract permits host Browser"
-grep -Fq '"transports":["rdp","spice"]' /usr/share/mcnf/browser-vm/image-contract.json \
+grep -Fq "\"transports\":[\"rdp\",\"spice\"]" /usr/share/mcnf/browser-vm/image-contract.json \
   && ok "contract admits RDP and SPICE" \
   || bad "contract does not admit the typed Browser VM transport set"
+if rpm -q magic-mesh magic-mesh-browser >/dev/null 2>&1; then
+  bad "host workstation/browser RPM is installed"
+else
+  ok "host workstation/browser RPMs are absent"
+fi
+browser_groups="$(id -nG mcnf-browser 2>/dev/null || true)"
+for group in video input audio seat render; do
+  case " $browser_groups " in
+    *" $group "*) ok "mcnf-browser is in device group: $group" ;;
+    *) bad "mcnf-browser is missing device group: $group" ;;
+  esac
+done
 command -v xrdp >/dev/null 2>&1 && ok "RDP endpoint binary present" || bad "RDP endpoint binary missing"
 command -v vainfo >/dev/null 2>&1 && ok "VA-API diagnostic present" || bad "VA-API diagnostic missing"
 exit "$fail"'

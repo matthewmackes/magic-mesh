@@ -10,7 +10,7 @@ LANE=repo
 RPMS=()
 DISK=""
 OUT="$DIR/out"
-BIB_IMAGE="${MCNF_BIB_IMAGE:-quay.io/centos-bootc/bootc-image-builder:latest}"
+BIB_IMAGE="${MCNF_BIB_IMAGE:-quay.io/centos-bootc/bootc-image-builder@sha256:2b52843ea2bfda73b0a08d97e76b734393b1d3a804681b9fabb26723bd3a2f0b}"
 BROWSER_VM_ROOTFS="${MCNF_BROWSER_VM_ROOTFS:-xfs}"
 PULL_TIMEOUT="${MCNF_PULL_TIMEOUT:-120}"
 

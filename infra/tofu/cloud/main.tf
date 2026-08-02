@@ -37,14 +37,15 @@ locals {
   domain_user_data = {
     for name, w in merge(local.vm_workloads, local.browser_workloads, local.app_workloads, local.android_workloads) :
     name => templatefile("${path.module}/cloud-init/mesh-join.yaml.tftpl", {
-      hostname              = name
-      ssh_authorized_key    = var.mesh_join.ssh_authorized_key
-      lighthouse_overlay_ip = var.mesh_join.lighthouse_overlay_ip
-      join_token            = local.join_token
-      app                   = try(w.app, null)
-      delivery_type         = w.delivery_type
-      image                 = try(w.image, "")
-      image_digest          = try(w.image_digest, "")
+      hostname                  = name
+      ssh_authorized_key        = var.mesh_join.ssh_authorized_key
+      lighthouse_overlay_ip     = var.mesh_join.lighthouse_overlay_ip
+      join_token                = local.join_token
+      app                       = try(w.app, null)
+      delivery_type             = w.delivery_type
+      image                     = try(w.image, "")
+      image_digest              = try(w.image_digest, "")
+      browser_rdp_password_hash = var.browser_rdp_password_hash
     })
   }
 }
@@ -135,6 +136,7 @@ module "browser_vm" {
   base_volume_id = one(libvirt_volume.browser_base[*].id)
   network_id     = module.network.network_id
   user_data      = local.domain_user_data[each.key]
+  browser_vm     = true
 }
 
 # One dedicated App VM domain per typed guest-owned application declaration.

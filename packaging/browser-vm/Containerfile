@@ -1,7 +1,7 @@
 # WL-ARCH-008 — immutable Chromium Browser VM guest image.
 # The image owns Chromium, Wayland, GPU/audio/input plumbing, and the runtime.
 
-ARG BROWSER_VM_BASE=quay.io/fedora/fedora-bootc:44
+ARG BROWSER_VM_BASE=quay.io/fedora/fedora-bootc@sha256:effcf2fc509730f77a2e362534afc899ac5a5402a4acb2c30ae0a2f731b00ba4
 FROM ${BROWSER_VM_BASE}
 
 ARG MCNF_RPM_LANE=repo
@@ -20,24 +20,35 @@ RUN set -eux; \
     install -D -m 0755 /tmp/mcnf-browser-vm-xrdp-startwm /etc/xrdp/startwm.sh; \
     install -D -m 0755 /tmp/mcnf-browser-vm-session /usr/local/libexec/mcnf-browser-vm-session; \
     if [ "${MCNF_RPM_LANE}" = "local" ]; then \
-        ls /tmp/mcnf-rpms/magic-mesh-*.rpm >/dev/null 2>&1 || { echo 'FATAL: local Browser VM lane needs a magic-mesh RPM'; exit 1; }; \
-        rpm -Uvh --nodeps --noscripts /tmp/mcnf-rpms/magic-mesh-*.rpm; \
-    else dnf -y --setopt=install_weak_deps=False --exclude=magic-mesh-browser install magic-mesh; fi; \
+        guest_rpm="$(find /tmp/mcnf-rpms -maxdepth 1 -type f -name 'magic-mesh-lighthouse-*.rpm' -print -quit)"; \
+        [ -n "$guest_rpm" ] || { echo 'FATAL: local Browser VM lane needs a magic-mesh-lighthouse RPM'; exit 1; }; \
+        [ "$(rpm -qp --qf '%{NAME}' "$guest_rpm")" = magic-mesh-lighthouse ] || { echo 'FATAL: Browser VM accepts only the thin magic-mesh-lighthouse guest package'; exit 1; }; \
+        dnf -y --setopt=install_weak_deps=False install "$guest_rpm"; \
+    else dnf -y --setopt=install_weak_deps=False --exclude=magic-mesh-browser install magic-mesh-lighthouse; fi; \
     dnf -y --setopt=install_weak_deps=False \
         --exclude=magic-mesh-browser install \
         chromium cloud-init dbus-daemon dbus-tools seatd sway \
         xdg-desktop-portal xdg-desktop-portal-wlr \
         pipewire pipewire-utils pipewire-pulseaudio wireplumber spice-vdagent \
         pipewire-alsa alsa-lib alsa-ucm alsa-utils \
+        pulseaudio-utils \
         mesa-dri-drivers mesa-libEGL mesa-libGL mesa-libgbm \
         libva-utils libinput libxkbcommon xorg-x11-server-Xwayland \
         xrdp xorgxrdp qemu-guest-agent; \
     useradd --create-home --shell /bin/bash mcnf-browser; \
-    usermod -a -G video,input,audio,seat mcnf-browser || true; \
+    for group in video input audio seat render; do \
+        if ! grep -q "^${group}:" /etc/group; then \
+            gid="$(getent group "$group" | awk -F: 'NR == 1 { print $3 }')"; \
+            case "$gid" in ''|*[!0-9]*) echo "FATAL: cannot resolve device group $group"; exit 1 ;; esac; \
+            grep -q ":${gid}:" /etc/group && { echo "FATAL: device group GID is already allocated: $group=$gid"; exit 1; }; \
+            printf '%s:x:%s:\n' "$group" "$gid" >> /etc/group; \
+        fi; \
+        usermod -a -G "$group" mcnf-browser; \
+    done; \
     install -d -o mcnf-browser -g mcnf-browser -m 0700 /var/lib/mcnf-browser; \
     install -d -m 0755 /usr/share/mcnf/browser-vm; \
     printf '%s\n' \
-        '{"schema_version":1,"profile":"browser-vm-chromium","browser":"chromium","compositor":"sway","display":"wayland-over-vdi","gpu":"mesa-virtio","audio":"pipewire","input":"libinput","transports":["rdp","spice"],"guest_agent":"qemu-guest-agent","network":"mesh-guest","host_browser":false}' \
+        '{"schema_version":1,"profile":"browser-vm-chromium","browser":"chromium","control_plane":"magic-mesh-lighthouse","compositor":"sway","display":"wayland-over-vdi","gpu":"mesa-virtio","audio":"pipewire","input":"libinput","transports":["rdp","spice"],"guest_agent":"qemu-guest-agent","network":"mesh-guest","host_browser":false}' \
         > /usr/share/mcnf/browser-vm/image-contract.json; \
     systemctl enable qemu-guest-agent.service; \
     systemctl enable xrdp.service; \

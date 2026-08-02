@@ -2396,8 +2396,8 @@ impl Shell {
                 );
                 self.web.sync_browser_vm_target(target);
                 if let Some(connect) = self.web.take_browser_vm_connect() {
-                    match self.chooser.browser_vm_auth(&connect.target.workload) {
-                        Ok(auth) => {
+                    match self.chooser.browser_vm_auth(&connect.target) {
+                        Ok(Some(auth)) => {
                             if let Err(error) = self.vdi.request_browser_vm_connect(
                                 connect.target,
                                 &self.local_host,
@@ -2408,7 +2408,19 @@ impl Shell {
                                 self.web.browser_vm_unavailable(error);
                             }
                         }
+                        Ok(None) => {}
                         Err(error) => self.web.browser_vm_unavailable(error),
+                    }
+                }
+                if let Some((target, auth)) = self.chooser.render_browser_vm_auth_prompt(ui) {
+                    if let Err(error) = self.vdi.request_browser_vm_connect(
+                        target,
+                        &self.local_host,
+                        mde_bus::client_data_dir(),
+                        Some(vdi::body_device_px(ui.ctx())),
+                        auth,
+                    ) {
+                        self.web.browser_vm_unavailable(error);
                     }
                 }
                 if self.vdi.requested_target().is_some() {

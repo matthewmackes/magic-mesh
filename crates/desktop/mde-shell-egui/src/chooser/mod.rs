@@ -1277,6 +1277,15 @@ struct ConnectDraft {
     cred_prompt: Option<CredentialPrompt>,
 }
 
+/// A Browser VM guest-login prompt retained only until the operator submits or
+/// cancels it. The target is kept beside the prompt so the resulting auth can
+/// re-enter the typed Browser VM VDI path without putting a credential in the
+/// Workloads/session record.
+struct BrowserVmAuthPrompt {
+    target: crate::web::BrowserVmTarget,
+    prompt: CredentialPrompt,
+}
+
 /// The Chooser's state: the injectable roster read seam, the last published
 /// roster, the auto-popup **seen set** (lock 1), the pending CHOOSER-4 connect
 /// picker, and the one-shot connect hand-off the shell drains into
@@ -1315,6 +1324,10 @@ pub(crate) struct ChooserState {
     /// The connect the operator is configuring in the always-ask picker (lock 6/9/
     /// 12) — `None` when no card is being connected.
     pending: Option<ConnectDraft>,
+    /// A one-time guest-login prompt for the typed Browser VM shortcut. This is
+    /// separate from the external-source picker draft because Browser bypasses
+    /// the generic Chooser card UI while still using the same auth seam.
+    browser_vm_prompt: Option<BrowserVmAuthPrompt>,
     /// The request chosen this frame, if a connect fired — drained by the shell
     /// via [`Self::take_connect`] and handed to [`crate::vdi::VdiState`].
     connect: Option<ConnectRequest>,
@@ -1390,6 +1403,7 @@ impl ChooserState {
             last_error: None,
             note: None,
             pending: None,
+            browser_vm_prompt: None,
             connect: None,
             thumbs: ThumbnailCache::default(),
             filter: FilterSort::default(),
@@ -1701,19 +1715,78 @@ impl ChooserState {
     /// carried only in the in-memory VDI request for guest OS login.  Keeping
     /// this fold here makes the Browser shortcut use the same auth seam as the
     /// full Chooser without ever placing credentials in the Workloads record.
-    pub(crate) fn browser_vm_auth(&self, workload: &str) -> Result<DesktopAuth, String> {
+    pub(crate) fn browser_vm_auth(
+        &mut self,
+        target: &crate::web::BrowserVmTarget,
+    ) -> Result<Option<DesktopAuth>, String> {
+        if self
+            .browser_vm_prompt
+            .as_ref()
+            .is_some_and(|pending| pending.target.workload != target.workload)
+        {
+            self.browser_vm_prompt = None;
+        }
         match auth::resolve(
             true,
             &self.client_peer,
-            workload,
+            &target.workload,
             VdiProtocol::Rdp,
             self.creds.as_ref(),
         )? {
-            AuthStage::Ready(auth) => Ok(auth),
-            AuthStage::Prompt(_) => Err(
-                "Browser VM guest authentication needs an explicit credential prompt; no credential was supplied."
-                    .to_string(),
-            ),
+            AuthStage::Ready(auth) => Ok(Some(auth)),
+            AuthStage::Prompt(prompt) => {
+                if self.browser_vm_prompt.is_none() {
+                    self.browser_vm_prompt = Some(BrowserVmAuthPrompt {
+                        target: target.clone(),
+                        prompt,
+                    });
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    /// Render and consume the Browser VM's one-time guest-login prompt. The
+    /// credential remains in memory only; `auth::remember` reports the honest
+    /// gated/sealed outcome while the VDI request carries it for this session.
+    pub(crate) fn render_browser_vm_auth_prompt(
+        &mut self,
+        ui: &mut egui::Ui,
+    ) -> Option<(crate::web::BrowserVmTarget, DesktopAuth)> {
+        let pending = self.browser_vm_prompt.as_mut()?;
+        ui.group(|ui| {
+            ui.label(RichText::new("Browser VM guest sign-in").size(Style::BODY));
+            render::credential_prompt_fields(ui, &mut pending.prompt);
+        });
+        let mut action = None;
+        ui.horizontal(|ui| {
+            if ui.button("Connect to Browser VM").clicked() {
+                action = Some(true);
+            }
+            if ui.button("Cancel").clicked() {
+                action = Some(false);
+            }
+        });
+        match action {
+            Some(true) => {
+                let pending = self.browser_vm_prompt.take()?;
+                let (auth, outcome) = auth::remember(self.creds.as_ref(), &pending.prompt);
+                self.note = Some(match outcome {
+                    SealOutcome::Sealed => "Browser VM credential sealed for reuse.".to_owned(),
+                    SealOutcome::Gated(reason) => format!(
+                        "Browser VM credential used for this session; persistence is gated: {reason}"
+                    ),
+                    SealOutcome::Failed(reason) => {
+                        format!("Browser VM credential persistence failed: {reason}")
+                    }
+                });
+                Some((pending.target, auth))
+            }
+            Some(false) => {
+                self.browser_vm_prompt = None;
+                None
+            }
+            None => None,
         }
     }
 

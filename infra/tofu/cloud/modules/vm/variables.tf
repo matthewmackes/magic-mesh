@@ -39,6 +39,12 @@ variable "user_data" {
   sensitive   = true
 }
 
+variable "browser_vm" {
+  description = "Whether this domain is the Chromium Browser VM and needs its media/display XML overlay."
+  type        = bool
+  default     = false
+}
+
 variable "app" {
   description = "Typed guest-owned App VM declaration; null for normal VM workloads."
   type = object({

@@ -47,8 +47,9 @@ must be committed/reconciled before extraction.
 
 The public repository currently admits `mde-web-wire`, `mde-adblock`,
 `mde-web-preview-client`, the worker core, Bus, seal, mesh-type, and
-`mde-browser-workers` crates in its root workspace. At the latest public
-commit, `3b06da0d`, the full locked workspace test gate passed on BigBoy. The
+`mde-browser-workers` crates in its root workspace. The extracted source build
+gate passed on BigBoy at `dca38960`; the latest public publication,
+`ea9e6695`, contains the corresponding provenance refresh. The
 separately locked native helper roots also pass farm checks there:
 
 - `mde-web-sandbox`: `cargo check --locked --offline` passed.

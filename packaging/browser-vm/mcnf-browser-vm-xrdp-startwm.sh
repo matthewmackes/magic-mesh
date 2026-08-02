@@ -4,7 +4,20 @@
 set -eu
 
 export WLR_BACKENDS=x11
-export WLR_RENDERER=pixman
+if [ -z "${WLR_RENDERER:-}" ]; then
+    render_node=
+    for node in /dev/dri/renderD*; do
+        if [ -e "$node" ]; then
+            render_node=$node
+            break
+        fi
+    done
+    if [ -n "$render_node" ]; then
+        export WLR_RENDERER=gles2
+    else
+        export WLR_RENDERER=pixman
+    fi
+fi
 export WLR_NO_HARDWARE_CURSORS=1
 
 exec /usr/local/libexec/mcnf-browser-vm-runtime

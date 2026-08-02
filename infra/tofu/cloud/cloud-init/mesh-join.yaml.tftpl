@@ -17,7 +17,10 @@ bootcmd:
 
 %{ if image == "browser-vm-chromium" ~}
 bootcmd:
+  - [mkdir, -p, /etc/mackesd]
+  - [chmod, "0755", /etc/mackesd]
   - [mkdir, -p, /etc/mackesd/browser-vm]
+  - [chmod, "0755", /etc/mackesd/browser-vm]
 %{ endif ~}
 
 write_files:
@@ -192,6 +195,18 @@ write_files:
     # Until a real VDI broker observes the guest endpoint, the honest initial
     # state is unavailable; the image must never claim transport readiness.
     content: "unavailable"
+%{ endif ~}
+
+%{ if image == "browser-vm-chromium" && browser_rdp_password_hash != "" ~}
+# This is an operator-supplied crypt(5) hash, not a plaintext password. It is
+# deliberately scoped to the image-owned RDP account and is not a Workloads or
+# session-broker field. An empty hash leaves the account locked/fail-closed.
+chpasswd:
+  expire: false
+  users:
+    - name: mcnf-browser
+      password: ${browser_rdp_password_hash}
+      type: hash
 %{ endif ~}
 
 %{ if app != null && app.guest_profile == "wayland-standard" ~}

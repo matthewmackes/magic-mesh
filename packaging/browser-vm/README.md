@@ -6,8 +6,8 @@ PipeWire/WirePlumber, libinput, and the image-owned runtime are installed in a
 dedicated `browser-vm-chromium` image. The image verifier is a static contents
 gate; it does not claim that a VM has booted or that a VDI endpoint is live.
 
-Build a signed/recorded disk artifact on the build farm with the current
-magic-mesh RPM, then set `browser_base_image_source` to the resulting qcow2 and
+Build a signed/recorded disk artifact on the build farm with the Fedora-44
+`magic-mesh-lighthouse` guest RPM, then set `browser_base_image_source` to the resulting qcow2 and
 pass the resulting image digest in the typed `browser-provision` request. A
 missing or malformed digest is refused before desired state is written.
 
@@ -19,6 +19,14 @@ transport plus the retained SPICE compatibility path. The host is explicitly
 forbidden from owning a Browser
 engine; Chromium, browser chrome, page execution, media decode, and failures
 remain inside the guest.
+
+The guest control plane is deliberately the thin `magic-mesh-lighthouse`
+package. It supplies `mackesd`, `meshctl`, Nebula join helpers, and guest
+systemd units while avoiding the workstation `magic-mesh` RPM's host
+multimedia/Samba ABI closure. The image never installs `magic-mesh-browser` or
+the full workstation package. The local `--rpm` lane accepts only a
+`magic-mesh-lighthouse-*.rpm` and installs it through `dnf`, so dependency
+resolution remains enforced; `rpm --nodeps` is not a supported image path.
 
 The profile verifier admits only a root-owned regular file: symlinked,
 group/other-writable, and executable profile inputs are rejected before the
@@ -71,6 +79,12 @@ Browser VM workload, Browser surface, session generation, and mesh-safe
 `host:port`; it carries no ticket, credential, command, path, or URL. The
 example and `verify-transport-attach.sh` keep the RDP/SPICE wire shape
 fail-closed.
+
+The declarative audio boundary can be checked with
+`install-helpers/verify-browser-vm-audio.sh --domain <name>` (or an XML file).
+It requires a virtio sound device, a PipeWire/PulseAudio backend, and both
+playback and capture endpoints; it intentionally does not claim that live
+audio is audible, captured, or recovered.
 
 The source URL and path are deliberately recorded now so a later standalone
 Browser-stack extraction can bind the guest profile to an immutable source

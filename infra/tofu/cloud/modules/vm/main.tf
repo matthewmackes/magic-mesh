@@ -52,4 +52,11 @@ resource "libvirt_domain" "this" {
     listen_type = "address"
     autoport    = true
   }
+
+  dynamic "xml" {
+    for_each = var.browser_vm ? [true] : []
+    content {
+      xslt = file("${path.module}/browser-vm-domain.xsl")
+    }
+  }
 }

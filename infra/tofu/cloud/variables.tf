@@ -45,6 +45,19 @@ variable "browser_base_image_source" {
   default     = "/var/lib/libvirt/images/browser-vm-chromium.qcow2"
 }
 
+variable "browser_rdp_password_hash" {
+  description = <<-EOT
+    Optional secret hash used only by the Browser VM cloud-init seed to unlock
+    the image-owned mcnf-browser account for RDP. It is never copied into
+    Workloads/session records or the typed transport envelope. Supply a
+    crypt(5) hash from the operator secret path; an empty value leaves RDP
+    authentication unavailable and the guest remains fail-closed.
+  EOT
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
 variable "android_base_image_source" {
   description = <<-EOT
     Source of the Debian base image the Android (Cuttlefish) L1 VMs clone from

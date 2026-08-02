@@ -7,10 +7,11 @@ Requires=seatd.service
 [Service]
 Type=simple
 User=mcnf-browser
-SupplementaryGroups=video input audio
+SupplementaryGroups=video input audio seat render
 RuntimeDirectory=mcnf-browser
 RuntimeDirectoryMode=0700
 Environment=XDG_RUNTIME_DIR=/run/mcnf-browser
+Environment=HOME=/home/mcnf-browser
 Environment=LIBSEAT_BACKEND=seatd
 ExecStart=/usr/local/libexec/mcnf-browser-vm-runtime
 Restart=on-failure
