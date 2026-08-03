@@ -10,6 +10,9 @@ COPY packaging/browser-vm/mcnf-browser-vm-runtime.sh /tmp/mcnf-browser-vm-runtim
 COPY packaging/browser-vm/mcnf-browser-vm-runtime.service /tmp/mcnf-browser-vm-runtime.service
 COPY packaging/browser-vm/mcnf-browser-vm-xrdp-startwm.sh /tmp/mcnf-browser-vm-xrdp-startwm
 COPY packaging/browser-vm/mcnf-browser-vm-session.sh /tmp/mcnf-browser-vm-session
+COPY packaging/browser-vm/mcnf-browser-vm-media-fixture.html /tmp/mcnf-browser-vm-media-fixture.html
+COPY packaging/browser-vm/mcnf-browser-vm-media-probe.sh /tmp/mcnf-browser-vm-media-probe
+COPY crates/desktop/mde-media-core/tests/fixtures/tiny_clip.mkv /tmp/mcnf-browser-vm-tiny_clip.mkv
 COPY packaging/browser-vm/rpms/ /tmp/mcnf-rpms/
 COPY packaging/repo/magic-mesh.repo /etc/yum.repos.d/magic-mesh.repo
 
@@ -19,6 +22,9 @@ RUN set -eux; \
     install -D -m 0644 /tmp/mcnf-browser-vm-runtime.service /etc/systemd/system/mcnf-browser-vm-runtime.service; \
     install -D -m 0755 /tmp/mcnf-browser-vm-xrdp-startwm /etc/xrdp/startwm.sh; \
     install -D -m 0755 /tmp/mcnf-browser-vm-session /usr/local/libexec/mcnf-browser-vm-session; \
+    install -D -m 0755 /tmp/mcnf-browser-vm-media-probe /usr/local/libexec/mcnf-browser-vm-media-probe; \
+    install -D -m 0644 /tmp/mcnf-browser-vm-media-fixture.html /usr/share/mcnf/browser-vm/mcnf-browser-vm-media-fixture.html; \
+    install -D -m 0644 /tmp/mcnf-browser-vm-tiny_clip.mkv /usr/share/mcnf/browser-vm/fixtures/tiny_clip.mkv; \
     if [ "${MCNF_RPM_LANE}" = "local" ]; then \
         guest_rpm="$(find /tmp/mcnf-rpms -maxdepth 1 -type f -name 'magic-mesh-lighthouse-*.rpm' -print -quit)"; \
         [ -n "$guest_rpm" ] || { echo 'FATAL: local Browser VM lane needs a magic-mesh-lighthouse RPM'; exit 1; }; \
@@ -55,7 +61,7 @@ RUN set -eux; \
     # explicitly so the guest agent starts when the SPICE channel is present.
     ln -sf /usr/lib/systemd/system/spice-vdagentd.service /etc/systemd/system/multi-user.target.wants/spice-vdagentd.service; \
     systemctl enable xrdp.service; \
-    rm -rf /tmp/mcnf-rpms /tmp/mcnf-browser-vm-validate /tmp/mcnf-browser-vm-runtime /tmp/mcnf-browser-vm-runtime.service /tmp/mcnf-browser-vm-xrdp-startwm /tmp/mcnf-browser-vm-session; \
+    rm -rf /tmp/mcnf-rpms /tmp/mcnf-browser-vm-validate /tmp/mcnf-browser-vm-runtime /tmp/mcnf-browser-vm-runtime.service /tmp/mcnf-browser-vm-xrdp-startwm /tmp/mcnf-browser-vm-session /tmp/mcnf-browser-vm-media-fixture.html /tmp/mcnf-browser-vm-media-probe /tmp/mcnf-browser-vm-tiny_clip.mkv; \
     dnf clean all
 
 RUN systemctl enable mcnf-browser-vm-runtime.service

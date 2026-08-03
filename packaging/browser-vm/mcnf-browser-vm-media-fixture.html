@@ -1,0 +1,49 @@
+<!doctype html>
+<!-- Image-owned, fixed media probe fixture. It contains no network URL or
+     host-provided input; the probe is intentionally a guest-local decode test. -->
+<meta charset="utf-8">
+<video id="mcnf-video" autoplay playsinline preload="auto"
+       src="file:///usr/share/mcnf/browser-vm/fixtures/tiny_clip.mkv"></video>
+<pre id="mcnf-result">MCNF_MEDIA_PROBE=status=unavailable|reason=not-started</pre>
+<script>
+(() => {
+  const video = document.getElementById("mcnf-video");
+  const result = document.getElementById("mcnf-result");
+  const started = performance.now();
+  const finish = (status, fields) => {
+    result.textContent = "MCNF_MEDIA_PROBE=" + [`status=${status}`, ...fields].join("|");
+  };
+  const poll = () => {
+    const quality = typeof video.getVideoPlaybackQuality === "function"
+      ? video.getVideoPlaybackQuality()
+      : null;
+    const total = Number(quality && quality.totalVideoFrames || 0);
+    const dropped = Number(quality && quality.droppedVideoFrames || 0);
+    if (video.readyState >= 2 && total > 0) {
+      finish("passed", [
+        `video_ready_state=${video.readyState}`,
+        `video_total_frames=${total}`,
+        `video_dropped_frames=${dropped}`,
+        `video_width=${video.videoWidth}`,
+        `video_height=${video.videoHeight}`,
+        `audio_ready_state=${video.readyState}`
+      ]);
+      return;
+    }
+    if (performance.now() - started >= 5000) {
+      finish("unavailable", [
+        `video_ready_state=${video.readyState}`,
+        `video_total_frames=${total}`,
+        `video_dropped_frames=${dropped}`,
+        `video_width=${video.videoWidth}`,
+        `video_height=${video.videoHeight}`,
+        `audio_ready_state=${video.readyState}`
+      ]);
+      return;
+    }
+    setTimeout(poll, 100);
+  };
+  video.play().catch(() => {});
+  poll();
+})();
+</script>

@@ -25,7 +25,7 @@ inner='set -u
 fail=0
 ok(){ echo "  OK   $1"; }
 bad(){ echo "  FAIL $1"; fail=1; }
-for path in /usr/local/libexec/mcnf-browser-vm-validate /usr/local/libexec/mcnf-browser-vm-runtime /usr/local/libexec/mcnf-browser-vm-session /etc/xrdp/startwm.sh /etc/systemd/system/mcnf-browser-vm-runtime.service /usr/share/mcnf/browser-vm/image-contract.json; do
+for path in /usr/local/libexec/mcnf-browser-vm-validate /usr/local/libexec/mcnf-browser-vm-runtime /usr/local/libexec/mcnf-browser-vm-session /usr/local/libexec/mcnf-browser-vm-media-probe /etc/xrdp/startwm.sh /etc/systemd/system/mcnf-browser-vm-runtime.service /usr/share/mcnf/browser-vm/image-contract.json /usr/share/mcnf/browser-vm/mcnf-browser-vm-media-fixture.html /usr/share/mcnf/browser-vm/fixtures/tiny_clip.mkv; do
   [ -f "$path" ] && ok "image file present: $path" || bad "image file missing: $path"
 done
 chromium_bin="$(command -v chromium || command -v chromium-browser || true)"

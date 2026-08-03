@@ -47,12 +47,20 @@ root-owned profile. Farm/source-tree contract gates use
 checks while allowing the non-root owner produced by a normal checkout; source
 mode is not a deployment admission decision.
 
-The guest runtime writes a root-owned, mode-0600 bounded
+The guest runtime writes a guest-owned, mode-0600 bounded
 `runtime-evidence.json` record with transport health, VA-API status, and
 PipeWire endpoint counts. `audio_status=wired` is endpoint-wiring evidence
 only; it does not prove audible Chromium playback, capture, or recovery.
 Validate collected records with
 `install-helpers/verify-browser-vm-runtime-evidence.py`.
+
+The image also carries a fixed 64x64 VP8/Opus media fixture from the shared
+media test corpus. Each guest session runs
+`mcnf-browser-vm-media-probe`, which records bounded Chromium media-element
+readiness and decoded/dropped-frame counters in `media-evidence.json`. Validate
+that record with `install-helpers/verify-browser-vm-media-evidence.py`. This is
+guest-local decode evidence only: it does not claim GPU hardware acceleration,
+audible playback, VDI presentation, or reconnect recovery.
 
 The guest launch boundary is equally fail-closed. Workloads writes only
 `profile-id`, `image-id`, `image-digest`, `session-id`, and `transport` under

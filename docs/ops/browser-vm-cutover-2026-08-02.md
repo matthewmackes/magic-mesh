@@ -71,7 +71,7 @@ match `profile.env`. A BigBoy rootless rebuild tagged
 This is container provenance evidence, not qcow2 publication or live guest
 acceptance.
 
-The guest runtime now also emits a root-owned, mode-0600 bounded
+The guest runtime now also emits a guest-owned, mode-0600 bounded
 `/var/lib/mcnf-browser/runtime-evidence.json` record with transport health,
 VA-API status, and PipeWire playback/capture endpoint counts. `audio_status=wired`
 means endpoint wiring only; it does not claim audible Chromium playback,
@@ -84,6 +84,13 @@ The collected record has a fail-closed verifier at
 `install-helpers/verify-browser-vm-runtime-evidence.py`; it accepts endpoint
 wiring as a separate evidence class and always leaves live media proof
 unavailable.
+
+The image now also runs a fixed guest-local Chromium media probe against the
+64x64 VP8/Opus fixture and emits bounded `media-evidence.json` with media
+readiness and decoded/dropped-frame counters. Its verifier is
+`install-helpers/verify-browser-vm-media-evidence.py`; the evidence class is
+`guest_media_decode` and deliberately leaves live GPU, audible audio, VDI, and
+reconnect proof unavailable.
 
 The latest read-only audit finds seat-15 reachable but without a `browser-vm`
 workload, `/dev/kvm`, or an RDP/SPICE/VNC listener. Dell remains unreachable

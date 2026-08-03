@@ -63,6 +63,12 @@ export WLR_NO_HARDWARE_CURSORS=1
 chromium_bin=$(command -v chromium || command -v chromium-browser)
 log "using Chromium binary $chromium_bin"
 
+# Run the fixed guest-local media probe before launching the interactive
+# compositor. Its bounded record is evidence for Chromium decode state only;
+# an unavailable probe never turns into a host fallback or blocks the desktop.
+/usr/local/libexec/mcnf-browser-vm-media-probe "$chromium_bin" ||
+    log 'guest-local Chromium media probe exited unexpectedly'
+
 # Capture capability evidence from the actual Browser user. QEMU Guest Agent
 # probes run under a confined root domain and cannot prove the compositor user's
 # device permissions, so these diagnostics are intentionally image-owned and

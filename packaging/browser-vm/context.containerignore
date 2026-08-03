@@ -1,3 +1,9 @@
 # Browser VM Containerfile copies only packaging inputs from the repository.
 *
 !packaging
+!crates
+!crates/desktop
+!crates/desktop/mde-media-core
+!crates/desktop/mde-media-core/tests
+!crates/desktop/mde-media-core/tests/fixtures
+!crates/desktop/mde-media-core/tests/fixtures/tiny_clip.mkv

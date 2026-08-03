@@ -16,6 +16,8 @@ RUNTIME="$BROWSER_VM/mcnf-browser-vm-runtime.sh"
 RUNTIME_UNIT="$BROWSER_VM/mcnf-browser-vm-runtime.service"
 XRDP_STARTWM="$BROWSER_VM/mcnf-browser-vm-xrdp-startwm.sh"
 SESSION="$BROWSER_VM/mcnf-browser-vm-session.sh"
+MEDIA_PROBE="$BROWSER_VM/mcnf-browser-vm-media-probe.sh"
+MEDIA_EVIDENCE_VERIFY="$ROOT/install-helpers/verify-browser-vm-media-evidence.py"
 
 fail() {
     echo "verify-browser-vm-contract: $*" >&2
@@ -32,15 +34,19 @@ fail() {
 [ -x "$RUNTIME" ] || fail "guest runtime is not executable"
 [ -x "$XRDP_STARTWM" ] || fail "xrdp session entrypoint is not executable"
 [ -x "$SESSION" ] || fail "media session supervisor is not executable"
+[ -x "$MEDIA_PROBE" ] || fail "guest media probe is not executable"
+[ -x "$MEDIA_EVIDENCE_VERIFY" ] || fail "media evidence verifier is not executable"
 [ -f "$RUNTIME_UNIT" ] || fail "guest runtime unit is missing"
 bash -n "$PROFILE_VERIFY" "$VALIDATOR" "$ACTIVATION_VERIFY" "$ATTACH_VERIFY" "$IMAGE_BUILD" "$IMAGE_VERIFY" "$0"
-sh -n "$RUNTIME" "$XRDP_STARTWM" "$SESSION"
-python3 -m py_compile "$RUNTIME_EVIDENCE_VERIFY"
+sh -n "$RUNTIME" "$XRDP_STARTWM" "$SESSION" "$MEDIA_PROBE"
+python3 -m py_compile "$RUNTIME_EVIDENCE_VERIFY" "$MEDIA_EVIDENCE_VERIFY"
 grep -Fq 'runtime-evidence.json' "$RUNTIME" || fail "guest runtime does not emit bounded evidence"
 grep -Fq 'audio_status=wired' "$RUNTIME" || fail "guest runtime omits typed audio wiring status"
 grep -Fq 'gpu_status=passed' "$RUNTIME" || fail "guest runtime omits VA-API status"
+grep -Fq 'mcnf-browser-vm-media-probe' "$RUNTIME" || fail "guest runtime omits Chromium media probe"
 "$IMAGE_VERIFY" --self-test >/dev/null
 "$RUNTIME_EVIDENCE_VERIFY" --self-test >/dev/null
+"$MEDIA_EVIDENCE_VERIFY" --self-test >/dev/null
 "$PROFILE_VERIFY" --source "$PROFILE" >/dev/null
 "$ACTIVATION_VERIFY" >/dev/null
 "$ATTACH_VERIFY" >/dev/null

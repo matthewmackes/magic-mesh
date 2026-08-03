@@ -383,7 +383,7 @@ remains here under a completed status.
   a BigBoy rootless rebuild tagged
   `localhost/magic-mesh-browser-vm-chromium:provenance-20260803` passed that
   verifier (image ID `3768fd23fbffc8cb5da5698d9729912373de83a50d9a36d2acad7088a20adaf2`).
-  The guest runtime now emits a root-owned, mode-0600 bounded
+  The guest runtime now emits a guest-owned, mode-0600 bounded
   `runtime-evidence.json` record containing transport health, VA-API status,
   and PipeWire endpoint counts; `audio_status=wired` is explicitly endpoint
   wiring evidence, not proof of audible Chromium playback/capture or recovery.
@@ -393,6 +393,12 @@ remains here under a completed status.
   `9c9307cbbf4940c6c825165edf492386e0c4ca811d6637bd6a36975fcddad0f0`).
   This remains guest collection/static evidence, not live GPU/audio/performance
   acceptance.
+  A refreshed BigBoy image tagged
+  `localhost/magic-mesh-browser-vm-chromium:media-probe-20260803` also passes
+  the image contract and guest-local Chromium media probe: the fixed 64x64
+  VP8/Opus fixture decoded 4 frames with zero drops. The resulting evidence is
+  classified `guest_media_decode`; it is not live GPU, audible-audio, VDI, or
+  reconnect acceptance.
   The OpenTofu Browser VM contract now independently rejects undersized or
   digestless direct declarations, binds SPICE to loopback, and keeps
   host-dependent virtio 3D/OpenGL disabled by default until a capability
