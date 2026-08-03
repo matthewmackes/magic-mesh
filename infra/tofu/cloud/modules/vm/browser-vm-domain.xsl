@@ -16,6 +16,11 @@
         <input name="browser-vm-capture"/>
         <output name="browser-vm" streamName="MCNF-Browser-VM"/>
       </audio>
+      <!-- The guest spice-vdagentd uses this channel to negotiate monitor
+           geometry before wlroots commits the virtio-gpu scanout. -->
+      <channel type="spicevmc">
+        <target type="virtio" name="com.redhat.spice.0"/>
+      </channel>
       <video>
         <model type="virtio" heads="1" primary="yes">
           <acceleration accel3d="yes"/>

@@ -51,6 +51,7 @@ RUN set -eux; \
         '{"schema_version":1,"profile":"browser-vm-chromium","browser":"chromium","control_plane":"magic-mesh-lighthouse","compositor":"sway","display":"wayland-over-vdi","gpu":"mesa-virtio","audio":"pipewire","input":"libinput","transports":["rdp","spice"],"guest_agent":"qemu-guest-agent","network":"mesh-guest","host_browser":false}' \
         > /usr/share/mcnf/browser-vm/image-contract.json; \
     systemctl enable qemu-guest-agent.service; \
+    systemctl enable spice-vdagentd.service; \
     systemctl enable xrdp.service; \
     rm -rf /tmp/mcnf-rpms /tmp/mcnf-browser-vm-validate /tmp/mcnf-browser-vm-runtime /tmp/mcnf-browser-vm-runtime.service /tmp/mcnf-browser-vm-xrdp-startwm /tmp/mcnf-browser-vm-session; \
     dnf clean all
