@@ -28,6 +28,23 @@ supported` and `/dev/kvm` remained absent. No package, domain, or image
 installation mutation was attempted because this host is not exposing a
 KVM-capable execution path.
 
+Rollout handoff at 07:05 EDT (source tree `a7b26cec`): the farm/Fedora 42
+RPM `magic-mesh-12.1.6-1.x86_64.rpm` was built on BigBoy, but its transaction
+was rejected on T480 `.138`, Eagle `.145`, seat-15, and Dell because the
+Fedora 42 multimedia sonames are not present on Fedora 44. No workstation
+upgrade was accepted. The documented Fedora 44 builder `mcnf-build-f44` was
+started on BigBoy after confirming the regular F42 builder had no active job;
+the native F44 container build is still running at
+`/home/mm/magic-mesh-farm-seat-fleet-f44-20260803` and has not produced an RPM
+yet.
+
+The current workstation rollout targets are T480 `.138`
+(`172.20.146.138`), Eagle `.145` (`172.20.146.145`), seat-15
+(`172.20.0.15`), and Dell (`172.20.146.225`). The separate Microsoft Surface
+Pro 6 target is `172.20.146.79`; the stored operator SSH credential was
+rejected there, so Surface has not been modified or included in the rollout.
+No seat currently has live Browser VM acceptance evidence.
+
 Continuation evidence at 04:36 EDT: the current Fedora 44 workstation RPM was
 built on BigBoy `.130` in slot `seat15-base-f44-20260803`, passed the 90-MiB
 payload gate at 82.0 MiB, and was installed on seat-15 after a successful
