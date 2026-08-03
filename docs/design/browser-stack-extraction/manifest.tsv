@@ -1,6 +1,6 @@
 # browser-stack-extraction-manifest v1
-# source_commit=464c7d068ccc0818725d013aeed7ab34f5f6041a
-# source_commit_date=2026-08-02T22:43:56-04:00
+# source_commit=867af13c5dfe350c00458c094a56022d026d1f08
+# source_commit_date=2026-08-02T22:55:31-04:00
 # source_branch=agent/drain-worklist-20260725
 # source_remote=https://github.com/matthewmackes/magic-mesh.git
 # extraction_destination=matthewmackes/magic-mesh-browser-stack
@@ -31,7 +31,6 @@ shared	crates/mesh/mackes-mesh-types/src/mesh_storage.rs	retain-in-magic-mesh:cr
 mixed-purpose	crates/mesh/mackesd/Cargo.toml	split-in-magic-mesh-browser-stack:crates/mesh/mackesd/Cargo.toml#browser-sections	workspace-package-edge	48e7dec31cc16768bbc7aa7fbcc07aa80a274c8c	48e7dec31cc16768bbc7aa7fbcc07aa80a274c8c	clean
 shared	crates/mesh/mackesd/src/ca/backup.rs	retain-in-magic-mesh:crates/mesh/mackesd/src/ca/backup.rs#shared-contract-or-reference	shared-secret-consumer	760443274e9146c1a044ad18756cfda0982917f0	760443274e9146c1a044ad18756cfda0982917f0	clean
 shared	crates/mesh/mackesd/src/ipc/secret_store.rs	retain-in-magic-mesh:crates/mesh/mackesd/src/ipc/secret_store.rs#shared-contract-or-reference	shared-secret-consumer	874e769cfef6da2bd7b015cfb56d97682ab4ff26	874e769cfef6da2bd7b015cfb56d97682ab4ff26	clean
-shared	crates/mesh/mackesd/src/lib.rs	retain-in-magic-mesh:crates/mesh/mackesd/src/lib.rs#shared-contract-or-reference	shared-infrastructure-reference	5547900eb15da70d891b4cc77bb4463e62f89dcc	5547900eb15da70d891b4cc77bb4463e62f89dcc	clean
 mixed-purpose	crates/mesh/mackesd/src/worker_role.rs	split-in-magic-mesh-browser-stack:crates/mesh/mackesd/src/worker_role.rs#browser-sections	daemon-worker-registration	2b634c5a11fb1fe6c786cb8bc9300748e9a7c90a	2b634c5a11fb1fe6c786cb8bc9300748e9a7c90a	clean
 shared	crates/mesh/mde-seal/Cargo.toml	retain-in-magic-mesh:crates/mesh/mde-seal/Cargo.toml#shared-contract-or-reference	workspace-package-edge	5133a491d3b42906c46d3ed45ef6ea822a3aa967	5133a491d3b42906c46d3ed45ef6ea822a3aa967	clean
 shared	crates/mesh/mde-seal/src/lib.rs	retain-in-magic-mesh:crates/mesh/mde-seal/src/lib.rs#shared-contract-or-reference	shared-secret-contract	70681c3a81c6763bce07abf905518be1fd505caa	70681c3a81c6763bce07abf905518be1fd505caa	clean
@@ -43,8 +42,8 @@ browser-owned	crates/services/mde-adblock/seed/easylist-seed.txt	magic-mesh-brow
 browser-owned	crates/services/mde-adblock/seed/easyprivacy-seed.txt	magic-mesh-browser-stack:crates/services/mde-adblock/seed/easyprivacy-seed.txt	browser-adblock-engine	2c2a755b495bb6355dca6debb7c72c0b239f9744	2c2a755b495bb6355dca6debb7c72c0b239f9744	clean
 browser-owned	crates/services/mde-adblock/seed/ublock-base-seed.txt	magic-mesh-browser-stack:crates/services/mde-adblock/seed/ublock-base-seed.txt	browser-adblock-engine	c3691d0d00ced6a5f032eb8a5e2c20d958e41faf	c3691d0d00ced6a5f032eb8a5e2c20d958e41faf	clean
 browser-owned	crates/services/mde-adblock/src/bundled.rs	magic-mesh-browser-stack:crates/services/mde-adblock/src/bundled.rs	browser-adblock-engine	8ab9ae058b39b9d818a28313c8de06e1a131395a	8ab9ae058b39b9d818a28313c8de06e1a131395a	clean
-browser-owned	crates/services/mde-adblock/src/engine.rs	magic-mesh-browser-stack:crates/services/mde-adblock/src/engine.rs	browser-adblock-engine	26f95b3b033c58a01bd96613866c9a2db81d0943	26f95b3b033c58a01bd96613866c9a2db81d0943	clean
-browser-owned	crates/services/mde-adblock/src/lib.rs	magic-mesh-browser-stack:crates/services/mde-adblock/src/lib.rs	browser-adblock-engine	e5ffe4324f9892864c7d775bac8cc8357d013ab1	e5ffe4324f9892864c7d775bac8cc8357d013ab1	clean
+browser-owned	crates/services/mde-adblock/src/engine.rs	magic-mesh-browser-stack:crates/services/mde-adblock/src/engine.rs	browser-adblock-engine	9b55e793f214d59f4698b5fdbf5c6de770a624c2	9b55e793f214d59f4698b5fdbf5c6de770a624c2	clean
+browser-owned	crates/services/mde-adblock/src/lib.rs	magic-mesh-browser-stack:crates/services/mde-adblock/src/lib.rs	browser-adblock-engine	3dc11e9a569d6be5dac6fb187de755ff1f531d86	3dc11e9a569d6be5dac6fb187de755ff1f531d86	clean
 browser-owned	crates/services/mde-adblock/src/parser.rs	magic-mesh-browser-stack:crates/services/mde-adblock/src/parser.rs	browser-adblock-engine	400c93ca267adf0d40e9c42e39d91e0430cf190f	400c93ca267adf0d40e9c42e39d91e0430cf190f	clean
 browser-owned	crates/services/mde-adblock/src/pattern.rs	magic-mesh-browser-stack:crates/services/mde-adblock/src/pattern.rs	browser-adblock-engine	ecf042b4949f92f7b7d505e87efa03185a12cba0	ecf042b4949f92f7b7d505e87efa03185a12cba0	clean
 browser-owned	crates/services/mde-adblock/src/resource.rs	magic-mesh-browser-stack:crates/services/mde-adblock/src/resource.rs	browser-adblock-engine	3196fcd3d866c5310b6fa4e1b3f348a00e07d8f4	3196fcd3d866c5310b6fa4e1b3f348a00e07d8f4	clean
