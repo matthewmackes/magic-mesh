@@ -331,7 +331,7 @@ remains here under a completed status.
   public `magic-mesh-browser-stack` repository and removed from `magic-mesh` by
   `15695dd5`; the remaining `Surface::Browser` is a thin typed guest route.
   Workloads provision `DeliveryType::DesktopVm`, while VDI supports
-  RDP/VNC/SPICE and damage-aware texture uploads. The refreshed 85-path
+  RDP/VNC/SPICE and damage-aware texture uploads. The refreshed 84-path
   source/destination inventory and
   fail-closed verifier remain under `docs/design/browser-stack-extraction/` and
   `install-helpers/`. Typed `browser-provision` has the 4-vCPU/8192-MiB/64-GiB
@@ -350,7 +350,9 @@ remains here under a completed status.
   and resumes a typed `browser-vm` route with explicit transport-unavailable
   state and no host-helper fallback; the focused live-feature and transport
   diagnostic gates each pass 1/1 on the farm. Actual VDI attachment and guest
-  framebuffer realization remain open. The guest runtime contract now requires
+  framebuffer realization remain open. Browser return-to-chrome now re-arms
+  the typed handoff for the same stable workload; the focused resume regression
+  passes on BigBoy. The guest runtime contract now requires
   bounded typed `transport-health` evidence (`connected`, `reconnecting`,
   `failed`, or `unavailable`) and rejects missing, malformed, path-shaped,
   symlinked, or extra inputs; its farm contract suite passes on `.50` slot
