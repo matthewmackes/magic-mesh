@@ -36,7 +36,7 @@ chromium_bin="$(command -v chromium || command -v chromium-browser || true)"
 for binary in mackesd meshctl nebula sway dbus-run-session pipewire pipewire-pulse wireplumber pw-cli pactl aplay arecord vainfo xrdp; do
   command -v "$binary" >/dev/null 2>&1 && ok "runtime binary present: $binary" || bad "runtime binary missing: $binary"
 done
-for package in magic-mesh-lighthouse chromium sway pipewire pipewire-utils pipewire-pulseaudio wireplumber spice-vdagent pipewire-alsa pulseaudio-utils alsa-lib alsa-ucm alsa-utils mesa-dri-drivers libva-utils libinput xrdp xorgxrdp qemu-guest-agent; do
+for package in magic-mesh-lighthouse chromium sway pipewire pipewire-utils pipewire-pulseaudio wireplumber spice-vdagent pipewire-alsa pulseaudio-utils alsa-lib alsa-ucm alsa-utils mesa-dri-drivers libva-utils libinput xrdp xrdp-selinux xorgxrdp qemu-guest-agent; do
   rpm -q "$package" >/dev/null 2>&1 && ok "package installed: $package" || bad "package missing: $package"
 done
 [ -L /etc/systemd/system/multi-user.target.wants/spice-vdagentd.service ] \
@@ -49,13 +49,10 @@ grep -Fq "\"host_browser\":false" /usr/share/mcnf/browser-vm/image-contract.json
 grep -Fq "\"transports\":[\"rdp\",\"spice\"]" /usr/share/mcnf/browser-vm/image-contract.json \
   && ok "contract admits RDP and SPICE" \
   || bad "contract does not admit the typed Browser VM transport set"
-grep -Fxq 'DefaultWindowManager=startwm.sh' /etc/xrdp/sesman.ini \
+grep -Fxq "DefaultWindowManager=startwm.sh" /etc/xrdp/sesman.ini \
   && ok "xrdp authenticated sessions enter the Browser runtime" \
   || bad "xrdp authenticated sessions do not enter the Browser runtime"
-rpm -q xrdp-selinux >/dev/null 2>&1 \
-  && ok "Fedora xrdp SELinux policy package is installed" \
-  || bad "Fedora xrdp SELinux policy package is missing"
-semodule -l 2>/dev/null | awk '$1 == "xrdp" { found = 1 } END { exit(found ? 0 : 1) }' \
+semodule -l 2>/dev/null | grep -Eq "^xrdp([[:space:]]|$)" \
   && ok "xrdp SELinux policy module is active" \
   || bad "xrdp SELinux policy module is inactive"
 if rpm -q magic-mesh magic-mesh-browser >/dev/null 2>&1; then
