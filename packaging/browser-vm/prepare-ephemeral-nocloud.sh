@@ -90,38 +90,39 @@ NETWORK_CONFIG
     cat > "$dir/user-data" <<USER_DATA
 #cloud-config
 bootcmd:
-  - [mkdir, -p, /etc/mackesd/browser-vm]
+  - [mkdir, -p, /etc/mcnf-browser-vm]
   # The image runtime is deliberately unprivileged (mcnf-browser). Keep the
-  # root-owned identity records non-writable but readable by that account;
-  # validate-runtime-inputs.sh still rejects every group/other-writable mode.
-  - [chmod, "0755", /etc/mackesd/browser-vm]
+  # dedicated root-owned identity directory non-writable but readable by that
+  # account. Do not place it beneath /etc/mackesd, whose intentional 0700 mode
+  # protects daemon state and prevents unprivileged traversal.
+  - [chmod, "0755", /etc/mcnf-browser-vm]
 write_files:
-  - path: /etc/mackesd/browser-vm/profile-id
+  - path: /etc/mcnf-browser-vm/profile-id
     owner: root:root
     permissions: "0644"
     content: |
       browser-vm-chromium
-  - path: /etc/mackesd/browser-vm/image-id
+  - path: /etc/mcnf-browser-vm/image-id
     owner: root:root
     permissions: "0644"
     content: |
       browser-vm-chromium
-  - path: /etc/mackesd/browser-vm/image-digest
+  - path: /etc/mcnf-browser-vm/image-digest
     owner: root:root
     permissions: "0644"
     content: |
       $image_digest
-  - path: /etc/mackesd/browser-vm/session-id
+  - path: /etc/mcnf-browser-vm/session-id
     owner: root:root
     permissions: "0644"
     content: |
       $session_id
-  - path: /etc/mackesd/browser-vm/transport
+  - path: /etc/mcnf-browser-vm/transport
     owner: root:root
     permissions: "0644"
     content: |
       $transport
-  - path: /etc/mackesd/browser-vm/transport-health
+  - path: /etc/mcnf-browser-vm/transport-health
     owner: root:root
     permissions: "0644"
     content: |
@@ -314,8 +315,11 @@ self_test() {
     grep -Fq 'transport-health' "$fixture/user-data" || fail "self-test seed omitted transport health"
     grep -Fq 'unavailable' "$fixture/user-data" || fail "self-test seed is not fail-closed"
     grep -Fq 'chmod, "0755"' "$fixture/user-data" || fail "self-test seed directory is not runtime-readable"
-    grep -Fq '/etc/mackesd/browser-vm/image-id' "$fixture/user-data" || \
+    grep -Fq '/etc/mcnf-browser-vm/image-id' "$fixture/user-data" || \
         fail "self-test seed omitted the runtime image identity"
+    if grep -Fq '/etc/mackesd/browser-vm' "$fixture/user-data"; then
+        fail "self-test seed placed unprivileged runtime inputs beneath protected /etc/mackesd"
+    fi
     [[ "$(grep -Fc 'permissions: "0644"' "$fixture/user-data")" -eq 6 ]] || \
         fail "self-test seed inputs are not all runtime-readable and non-writable"
     if grep -Eiq 'password|passwd|secret|credential|token|ssh' "$fixture/user-data" "$fixture/meta-data" "$fixture/network-config"; then

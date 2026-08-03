@@ -47,7 +47,7 @@ fi
 
 /usr/local/libexec/mcnf-browser-vm-validate
 log 'runtime inputs validated'
-input_root=${MCNF_BROWSER_VM_INPUT_ROOT:-/etc/mackesd/browser-vm}
+input_root=${MCNF_BROWSER_VM_INPUT_ROOT:-/etc/mcnf-browser-vm}
 transport=$(cat "$input_root/transport")
 transport_health=$(cat "$input_root/transport-health")
 source_commit=$(cat /usr/share/mcnf/browser-vm/source-commit)

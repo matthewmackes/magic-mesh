@@ -42,10 +42,11 @@ RUN set -eux; \
         libva-utils libinput libxkbcommon xorg-x11-server-Xwayland \
         xrdp xrdp-selinux xorgxrdp qemu-guest-agent; \
     # Install the image-owned entrypoint after the xrdp RPM lays down its
-    # defaults, then select it as sesman's fallback. Fedora 44 otherwise names
-    # a non-existent startwm-bash.sh and an authenticated session exits before
-    # the Browser runtime, Chromium, or evidence writer can start.
-    install -D -m 0755 /tmp/mcnf-browser-vm-xrdp-startwm /etc/xrdp/startwm.sh; \
+    # defaults, then replace Fedora's selected /usr/libexec entrypoint in place.
+    # Installing the script under /etc gives it etc_t, which xrdp_session_t is
+    # correctly forbidden to execute; the packaged libexec path carries the
+    # executable label admitted by Fedora's xrdp SELinux policy.
+    install -D -m 0755 /tmp/mcnf-browser-vm-xrdp-startwm /usr/libexec/xrdp/startwm.sh; \
     sed -i 's/^DefaultWindowManager=.*/DefaultWindowManager=startwm.sh/' /etc/xrdp/sesman.ini; \
     grep -Fxq 'DefaultWindowManager=startwm.sh' /etc/xrdp/sesman.ini; \
     useradd --create-home --shell /bin/bash mcnf-browser; \

@@ -54,13 +54,30 @@ fn fnv1a64(image: &ColorImage) -> u64 {
 }
 
 /// Distinct RGBA values in the frame — a rendered desktop shows more than a
-/// blank surface would; recorded (not hard-asserted).
+/// blank surface would. The generic live test accepts the first painted frame
+/// by default; Browser VM acceptance can raise the minimum with
+/// `MDE_RDP_LIVE_MIN_DISTINCT_COLORS` so xrdp's pre-session login bitmap cannot
+/// masquerade as the Chromium desktop.
 fn distinct_colors(image: &ColorImage) -> usize {
     let mut seen: std::collections::HashSet<[u8; 4]> = std::collections::HashSet::with_capacity(64);
     for px in &image.pixels {
         seen.insert(px.to_array());
     }
     seen.len()
+}
+
+fn required_distinct_colors() -> usize {
+    let Ok(raw) = std::env::var("MDE_RDP_LIVE_MIN_DISTINCT_COLORS") else {
+        return 1;
+    };
+    let required = raw
+        .parse::<usize>()
+        .expect("MDE_RDP_LIVE_MIN_DISTINCT_COLORS must be an integer");
+    assert!(
+        (1..=4096).contains(&required),
+        "MDE_RDP_LIVE_MIN_DISTINCT_COLORS must be between 1 and 4096"
+    );
+    required
 }
 
 /// Parse `host:port[,user,pass]`, defaulting the credentials to the xrdp
@@ -85,16 +102,24 @@ fn pump_until_frame(
     session: &mut RdpSession,
     deadline: Duration,
     what: &str,
+    required_colors: usize,
 ) -> (ColorImage, usize) {
     let start = Instant::now();
     let mut painted_total = 0_usize;
+    let mut most_colors = 0_usize;
+    let mut last_checksum = None;
     while start.elapsed() < deadline {
         match conn.pump_once(session, Duration::from_secs(5)) {
             Ok(PumpOutcome::Processed { painted_rects }) => {
                 painted_total += painted_rects;
                 if painted_rects > 0 {
                     if let Some(frame) = session.frame() {
-                        return (frame, painted_total);
+                        let colors = distinct_colors(&frame);
+                        most_colors = most_colors.max(colors);
+                        last_checksum = Some(fnv1a64(&frame));
+                        if colors >= required_colors {
+                            return (frame, painted_total);
+                        }
                     }
                 }
             }
@@ -106,8 +131,10 @@ fn pump_until_frame(
         }
     }
     panic!(
-        "live: no framebuffer update decoded for {what} within {}s ({painted_total} rects seen)",
-        deadline.as_secs()
+        "live: no qualifying framebuffer decoded for {what} within {}s \
+         ({painted_total} rects, most_colors={most_colors}, last_checksum={last_checksum:?}, \
+         required_colors={required_colors})",
+        deadline.as_secs(),
     );
 }
 
@@ -154,6 +181,8 @@ fn live_rdp_renders_accepts_input_and_applies_tier_on_reconnect() {
         return;
     };
     let (host, port, user, pass) = parse_target(&target);
+    let required_colors = required_distinct_colors();
+    println!("live: desktop qualification requires at least {required_colors} distinct colors");
 
     let config = RdpConfig::new(host, user, pass)
         .with_port(port)
@@ -195,6 +224,7 @@ fn live_rdp_renders_accepts_input_and_applies_tier_on_reconnect() {
         &mut session,
         Duration::from_secs(60),
         "the first desktop paint",
+        required_colors,
     );
     assert_eq!(
         image.size,
@@ -293,6 +323,7 @@ fn live_rdp_renders_accepts_input_and_applies_tier_on_reconnect() {
         &mut session,
         Duration::from_secs(60),
         "the post-reconnect paint",
+        required_colors,
     );
     let checksum2 = fnv1a64(&image2);
     println!(

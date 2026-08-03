@@ -7,7 +7,7 @@ set -eu
 evidence=/var/lib/mcnf-browser/media-evidence.json
 log_file=/var/lib/mcnf-browser/media-probe.log
 chromium_bin=${1:-}
-input_root=${MCNF_BROWSER_VM_INPUT_ROOT:-/etc/mackesd/browser-vm}
+input_root=${MCNF_BROWSER_VM_INPUT_ROOT:-/etc/mcnf-browser-vm}
 source_commit=$(cat /usr/share/mcnf/browser-vm/source-commit 2>/dev/null || printf '%s' 0000000000000000000000000000000000000000)
 image_digest=$(cat "$input_root/image-digest" 2>/dev/null | tr 'A-F' 'a-f' || printf '%s' sha256:0000000000000000000000000000000000000000000000000000000000000000)
 

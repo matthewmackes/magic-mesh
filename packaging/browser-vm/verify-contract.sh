@@ -56,8 +56,21 @@ grep -Fq 'runtime-evidence.json' "$RUNTIME" || fail "guest runtime does not emit
 grep -Fq 'audio_status=wired' "$RUNTIME" || fail "guest runtime omits typed audio wiring status"
 grep -Fq 'gpu_status=passed' "$RUNTIME" || fail "guest runtime omits VA-API status"
 grep -Fq 'mcnf-browser-vm-media-probe' "$RUNTIME" || fail "guest runtime omits Chromium media probe"
+for runtime_path in "$VALIDATOR" "$RUNTIME" "$MEDIA_PROBE"; do
+    grep -Fq '/etc/mcnf-browser-vm' "$runtime_path" \
+        || fail "Browser runtime component omits the dedicated readable input root: $runtime_path"
+    if grep -Fq '/etc/mackesd/browser-vm' "$runtime_path"; then
+        fail "Browser runtime component uses the protected daemon configuration root: $runtime_path"
+    fi
+done
 grep -Fq "DefaultWindowManager=startwm.sh" "$BROWSER_VM/Containerfile" \
     || fail "Browser image does not route authenticated xrdp sessions into its runtime"
+grep -Fq '/usr/libexec/xrdp/startwm.sh' "$BROWSER_VM/Containerfile" \
+    || fail "Browser image does not install its xrdp entrypoint at Fedora's SELinux-admitted path"
+grep -Fq 'export WLR_BACKENDS=x11' "$XRDP_STARTWM" \
+    || fail "Browser xrdp entrypoint does not select the nested X11 backend"
+grep -Fq 'export WLR_RENDERER=pixman' "$XRDP_STARTWM" \
+    || fail "Browser xrdp entrypoint does not select the renderer supported by nested X11"
 grep -Fq 'xrdp-selinux' "$BROWSER_VM/Containerfile" \
     || fail "Browser image omits the Fedora xrdp SELinux policy package"
 grep -Fq 'BROWSER_VM_DISK_GB' "$IMAGE_BUILD" || fail "image builder does not bind disk size to the profile"

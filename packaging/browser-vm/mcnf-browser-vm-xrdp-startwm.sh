@@ -4,20 +4,10 @@
 set -eu
 
 export WLR_BACKENDS=x11
-if [ -z "${WLR_RENDERER:-}" ]; then
-    render_node=
-    for node in /dev/dri/renderD*; do
-        if [ -e "$node" ]; then
-            render_node=$node
-            break
-        fi
-    done
-    if [ -n "$render_node" ]; then
-        export WLR_RENDERER=gles2
-    else
-        export WLR_RENDERER=pixman
-    fi
-fi
+# xorgxrdp owns the real framebuffer. wlroots' nested X11 backend receives no
+# DRM file descriptor even when the VM exposes a render node, so selecting
+# GLES2 from device presence makes Sway abort before Chromium can paint.
+export WLR_RENDERER=pixman
 export WLR_NO_HARDWARE_CURSORS=1
 
 exec /usr/local/libexec/mcnf-browser-vm-runtime

@@ -14,7 +14,7 @@ fail() {
     exit 1
 }
 
-input_root=${MCNF_BROWSER_VM_INPUT_ROOT:-/etc/mackesd/browser-vm}
+input_root=${MCNF_BROWSER_VM_INPUT_ROOT:-/etc/mcnf-browser-vm}
 max_length=128
 test_mode=0
 if [ "${1:-}" = --test ]; then
