@@ -449,6 +449,14 @@ remains here under a completed status.
   container image ID `3282faa9a795df6750cd054e13fef2a612e616e3a111b2fe15b9980f8edf081a`.
   It is still only a publish candidate because Dell and the live acceptance
   seats remain unavailable.
+- Performance-evidence update (2026-08-03):
+  `install-helpers/verify-browser-vm-performance.py` now provides a
+  fail-closed validator for a source/image-bound live acceptance record. A pass
+  requires five concurrent 1080p tabs for at least 15 minutes, minimum 30 FPS,
+  no stall over 500 ms, pointer activity, navigation/session latency, partial
+  uploads, hidden repaint, and reconnect recovery. The verifier self-test and
+  full Browser contract pass on farm `.50`; no qualifying Dell or seat record
+  exists, so this does not claim live performance readiness.
 - Live mesh blocker update (2026-08-03): a fresh read-only seat-15 audit found
   its Nebula interface up but no KVM/VM/VDI endpoint, while `mackesd` timed out
   all three etcd endpoints (`10.42.0.1/.2/.3:2379`) and repeatedly reported a

@@ -119,6 +119,14 @@ It requires a virtio sound device, a PipeWire/PulseAudio backend, and both
 playback and capture endpoints; it intentionally does not claim that live
 audio is audible, captured, or recovered.
 
+Live performance acceptance records are validated with
+`install-helpers/verify-browser-vm-performance.py`. A passing record must be
+bound to the source commit and image digest and must cover five concurrent
+1080p tabs for at least 15 minutes, minimum 30 FPS, no stall over 500 ms,
+pointer activity, navigation/session latency, partial uploads, hidden repaint,
+and reconnect recovery. The verifier never creates a local or farm-only pass;
+Dell/seat evidence is still required.
+
 The source URL and path are deliberately recorded now so a later standalone
 Browser-stack extraction can bind the guest profile to an immutable source
 record rather than silently reusing a host image.

@@ -65,6 +65,14 @@ label `dd973836` (container image ID
 10-GiB artifact is rejected by preflight. This is the current publish
 candidate, but remains uninstalled because Dell is unreachable.
 
+The new `install-helpers/verify-browser-vm-performance.py` gate is now wired
+into the Browser contract and farm-verified on `.50`. It accepts only a
+source-commit/image-digest-bound live record covering five 1080p tabs for at
+least 15 minutes, 30-FPS/no-500-ms-stall limits, pointer activity,
+navigation/session latency, partial uploads, hidden repaint, and reconnect
+recovery. Its self-test is not live evidence; no qualifying Dell or seat
+performance record exists yet.
+
 The OpenTofu deployment contract now rejects direct Browser VM declarations
 that are not `desktop_vm`, 4 vCPU/8192 MiB/64 GiB, or bound to a full image
 digest. Browser domains bind SPICE to loopback. Host-dependent virtio
