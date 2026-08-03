@@ -28,7 +28,7 @@ done
 for package in magic-mesh-lighthouse chromium sway pipewire pipewire-utils pipewire-pulseaudio wireplumber spice-vdagent pipewire-alsa pulseaudio-utils alsa-lib alsa-ucm alsa-utils mesa-dri-drivers libva-utils libinput xrdp xorgxrdp qemu-guest-agent; do
   rpm -q "$package" >/dev/null 2>&1 && ok "package installed: $package" || bad "package missing: $package"
 done
-systemctl is-enabled spice-vdagentd.service >/dev/null 2>&1 \
+[ -L /etc/systemd/system/multi-user.target.wants/spice-vdagentd.service ] \
   && ok "SPICE guest agent service enabled" \
   || bad "SPICE guest agent service is not enabled"
 grep -Fq "\"browser\":\"chromium\"" /usr/share/mcnf/browser-vm/image-contract.json && ok "contract selects Chromium" || bad "contract does not select Chromium"
