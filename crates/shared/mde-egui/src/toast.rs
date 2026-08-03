@@ -638,6 +638,15 @@ fn ai_alert_rect(screen: Rect, t: f32) -> Rect {
     Rect::from_center_size(screen.center(), base * scale)
 }
 
+/// Translate a laid-out galley so its own bounds, including center-aligned
+/// negative coordinates, are centered inside the alert card.
+fn centered_galley_origin(card: Rect, top: f32, galley_rect: Rect) -> egui::Pos2 {
+    pos2(
+        card.center().x - galley_rect.center().x,
+        top - galley_rect.top(),
+    )
+}
+
 /// The banner title face — the shared [`TypographyRole::Body`] role (Q14 HIG
 /// type).
 fn banner_title_font() -> FontId {
@@ -810,11 +819,8 @@ fn paint_ai_generated_alert(
     headline.wrap.max_rows = 2;
     headline.halign = Align::Center;
     let galley = ui.fonts(|fonts| fonts.layout_job(headline));
-    painter.galley(
-        pos2(card.center().x - galley.size().x * 0.5, card.top() + 92.0),
-        galley,
-        white,
-    );
+    let headline_origin = centered_galley_origin(card, card.top() + 92.0, galley.rect);
+    painter.galley(headline_origin, galley, white);
 
     let mut meta = if toast.source_host.is_empty() {
         String::new()
@@ -1515,6 +1521,21 @@ mod tests {
             assert!(card.width() <= screen.width() - 2.0 * AI_ALERT_MARGIN + f32::EPSILON);
             assert!(card.height() <= screen.height() - 2.0 * AI_ALERT_MARGIN + f32::EPSILON);
         }
+    }
+
+    #[test]
+    fn ai_generated_alert_centers_the_center_aligned_headline_bounds() {
+        let card = Rect::from_center_size(pos2(960.0, 540.0), vec2(460.0, 224.0));
+        // `LayoutJob::halign = Align::Center` lays a galley out around x=0,
+        // rather than from x=0. The live seat bug double-subtracted half its
+        // width and shifted the headline outside the left edge of the card.
+        let galley_rect = Rect::from_min_max(pos2(-198.0, 0.0), pos2(198.0, 24.0));
+        let origin = centered_galley_origin(card, card.top() + 92.0, galley_rect);
+        let painted = galley_rect.translate(origin.to_vec2());
+
+        assert!((painted.center().x - card.center().x).abs() < f32::EPSILON);
+        assert!(painted.left() >= card.left());
+        assert!(painted.right() <= card.right());
     }
 
     #[test]
