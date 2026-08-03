@@ -5,6 +5,22 @@ not a second active worklist.
 
 ## Current state — 2026-08-03
 
+Seat-15 lock-screen presentation was live-proven at 16:59 EDT after commit
+`29e3951b` moved only `AI-GENERATED-ALERT` cards above the lock curtain. The
+native Fedora 44 production-feature shell (`drm,live-vdi,media-mpv`) was
+installed as SHA-256
+`982d4c2d63ac8a5c1f17e67ec4b0fa4cde1f992bff5324a8b68534d2fecf0653`.
+A 1920x1080 direct-DRM EGL readback captured the red, centered, constrained
+card visibly above the locked desktop; the proof PNG SHA-256 is
+`7340d2ef9b85c468be6c188dc78535b6667b80de6d78a3f6de28fa7550b06222`.
+Live receipt `01KZ4PT1QW367W31BSDZ933WM5` carried the exact deployment flag and
+headline during the capture, and cleanup receipt
+`01KZ4PV88VY069ABFPJHP5A0EC` preceded the final restart by the full five
+seconds. The temporary `zz-alert-proof.conf`, readback, and staged binary were
+removed afterward. The normal shell is active as PID `123489`, reports zero
+restarts, retains installed SHA `982d4c2d...`, and can be rolled back from
+`/var/lib/mcnf-release-backups/seat15-alert-lock-20260803T205812Z/`.
+
 Dell's post-reboot alert preemption retest at 16:27 EDT published receipt
 `01KZ4MX1CN3FM5A5MY3K4XNDMH` from production-feature shell SHA-256
 `00861ae83731d8498f85db8631d4ccff79adef7d55e07cbc3b2c1c67592441be`.
