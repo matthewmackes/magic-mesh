@@ -5,8 +5,9 @@ not a second active worklist.
 
 ## Current state — 2026-08-03
 
-The source-side cutover and standalone provenance are current through
-`9e7697b5`; the extraction verifier passes for 84 paths and the public
+The guest-image artifact is bound to source commit `9e7697b5`; the source-side
+cutover and VDI metrics are current through `25fb1cc1`. The extraction verifier
+passes for 84 paths and the public
 standalone repository is at `996d3d27cfc4c52776c2289a0069d92e2bede66d`. A
 corrected guest image containing the explicit `Virtual-1` output configuration
 was built on farm `.90`, passed static image verification, and has SHA-256
@@ -49,9 +50,11 @@ without an actionable login path. Farm `.130` passed the focused auth module
 (20 tests, including the Browser VM regression), and the Browser resume seam
 now re-arms the typed VDI handoff after an explicit return to shell chrome.
 The VDI seam now exposes bounded local metrics for frame cadence, full/partial
-uploads, upload timing, reconnects, and shell repaints; the focused metrics
-test and the 64-test VDI regression set pass on BigBoy. These measurements do
-not stand in for the still-missing guest GPU, audio, or live endpoint evidence.
+uploads, upload timing, reconnects, shell repaints, and best-effort host
+process CPU/DRM render-GPU busy samples. The focused metrics test and the
+72-test VDI regression set pass on BigBoy. These are host-side measurements and
+do not stand in for the still-missing guest GPU, audio, or live endpoint
+evidence.
 
 ## Landed
 
@@ -92,10 +95,11 @@ Mesa userspace, and
 the PipeWire/ALSA bridge, and routes authenticated xrdp sessions through the
 guest-owned Sway/Chromium runtime. Sunshine/Moonlight is intentionally not
 advertised until a guest endpoint and host decoder exist. The focused Browser
-VM contract verifier passes locally; the image itself has not yet been rebuilt
-with this payload. Fedora 44's enabled repositories do not provide
-`mesa-va-drivers`, so GPU video decode remains an explicit live gate rather
-than an image claim.
+VM contract verifier passes locally; the current-source qcow2 was rebuilt and
+statically verified on BigBoy. Fedora 44's enabled repositories provide
+`xrdp`/`xorgxrdp` but no xrdp PulseAudio/PipeWire bridge package, and do not
+provide `mesa-va-drivers`; default-RDP audio and GPU video decode therefore
+remain explicit live gates, with SPICE/QEMU retained as the compatibility path.
 
 On BigBoy (`172.20.0.130`):
 

@@ -367,10 +367,11 @@ remains here under a completed status.
   `vdi-proof-rdp-helper-20260803`; a bounded real-worker attempt against Dell
   on 2026-08-03 returned `failed` with no framebuffer marker, so actual target
   execution remains unavailable until a real guest endpoint is supplied. The
-  VDI seam now records bounded
-  frame cadence, full/partial upload counts, upload timing, reconnects, and
-  shell repaint counts; its focused metrics test and the 64-test VDI set pass
-  on BigBoy. A fresh current-source Fedora 44 Browser VM container and qcow2
+  VDI seam now records bounded frame cadence, full/partial upload counts, upload
+  timing, reconnects, shell repaint counts, and best-effort host process CPU and
+  DRM render-GPU busy samples; the host samples are explicitly not guest
+  hardware evidence. Its focused metrics test and the 72-test VDI set pass on
+  BigBoy. A fresh current-source Fedora 44 Browser VM container and qcow2
   were built and statically verified on BigBoy `.130`; the retained qcow2
   artifact has SHA-256
   `9c5d687c7fa378cb8cfe767bf0d46fb0f55a7889cf5c1eebc1bbfc8003a8c0c6`.
