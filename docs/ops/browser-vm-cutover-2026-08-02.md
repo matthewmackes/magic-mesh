@@ -22,6 +22,11 @@ unavailable from the orchestrator. Seat-15 still has no `/dev/kvm`, Browser VM
 workload, or VDI listener. Therefore access to Chromium on Dell has no honest
 time-of-day ETA yet: it begins after Dell is reachable and its host/KVM is
 recovered, followed by image publication and live guest-frame/input checks.
+A bounded seat-15 probe found the existing `qemu-img`, `virsh`, and
+passwordless-sudo tools, but loading `kvm`/`kvm_intel` returned `Operation not
+supported` and `/dev/kvm` remained absent. No package, domain, or image
+installation mutation was attempted because this host is not exposing a
+KVM-capable execution path.
 
 Continuation evidence at 04:36 EDT: the current Fedora 44 workstation RPM was
 built on BigBoy `.130` in slot `seat15-base-f44-20260803`, passed the 90-MiB
