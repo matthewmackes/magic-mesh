@@ -360,18 +360,18 @@ remains here under a completed status.
   dedicated `browser-vm`, attaches through VDI, renders the guest framebuffer,
   and forwards focused input. Chromium, browser chrome, tabs, page execution,
   media decode, and page failures remain inside the guest.
-- Current state: The public standalone repository preserves the removed host CEF/Servo stack;
-  Surface::Browser selects the stable typed browser-vm route. RDP is the first-release preferred
-  transport and Sunshine/Moonlight is the explicit alternate; failures never silently substitute
-  protocols. The shell resolves the fixed `mcnf-browser` login from a host-bound encrypted systemd
-  credential without putting a password in Workloads or mesh records. Image/profile, provenance,
-  deployment, VDI/runtime/media evidence contracts, a fail-closed 15-minute five-tab collector, and
-  a verified 64-GiB Fedora 44 qcow2 candidate are landed and farm-tested. Dell runs the matching F44
-  shell with the mandatory centered update-alert path and a proven root-shell-to-seat-PipeWire
-  stream; its `browser-vm` domain and guest agent are active. Credential rotation, Workloads
-  admission, RDP frame/input/reconnect, Chromium audio, GPU, performance, and release evidence
-  remain missing; no live Browser acceptance is claimed. Exact evidence is in
-  `docs/ops/browser-vm-cutover-2026-08-02.md`.
+- Current state: The standalone repository preserves the old CEF/Servo stack;
+  `Surface::Browser` selects typed `browser-vm`, with RDP preferred and
+  Sunshine/Moonlight explicit. Dell runs immutable Fedora 44 r3 from source
+  `9ccb8e90…`, image `sha256:99110644…0ec6`, a fresh overlay/seed, encrypted
+  login, and five-second alerts; its schema-v2 receipt validates one backing
+  edge. Strict RDP proof rejected the login bitmap, decoded 73-color Chromium,
+  observed keyboard-driven frame change, reconnected via RDP6, decoded 6,739
+  colors, and removed its credential. Guest evidence records `vainfo` success,
+  1/1 audio endpoints, fixed-MKV A/V ready-state 4, 4/4 frames with zero drops,
+  and no relevant SELinux denial. Dell survived a reboot and remains online.
+  Workloads auto-launch, pointer, audible/capture/recovery, 15-minute performance,
+  and fleet gates remain; bounded evidence is in `docs/ops/browser-vm-r3-dell-acceptance-2026-08-03.md`.
 - Remaining work:
 
   1. Re-run and review the source commit, workspace/package/process inventory,

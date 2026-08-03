@@ -18,10 +18,14 @@ GiB). Smaller bootc-image-builder defaults are enlarged before publication;
 
 The checked-in `deploy-image.sh` is the bounded operator path for a direct KVM
 host. `preflight` verifies the local qcow2 and remote KVM/qemu-img/passwordless
-sudo prerequisites without changing files. `publish` is dry-run by default;
-only `publish --apply` uploads the image, backs up an existing regular image,
-atomically installs the new root-owned image, and verifies the remote SHA-256.
-It accepts no guest password, token, or credential.
+sudo prerequisites, including a resolvable remote `qemu` group, without
+changing files. `publish` is dry-run by default; only `publish --apply` uploads
+the immutable base, backs up an existing regular image, atomically installs the
+new base as `root:qemu` mode `0440`, restores its libvirt SELinux label when
+`restorecon` is available, and verifies the remote SHA-256 after those metadata
+changes. It accepts no guest password, token, or credential. Publication does
+not attach the base directly: the domain must use a separate writable qcow2
+overlay whose absolute immediate backing filename is the published base.
 
 `profile.env` is the small, reviewable contract at the Construct/Browser VM
 boundary. It identifies the guest image and immutable source provenance
@@ -79,7 +83,7 @@ audible playback, VDI presentation, or reconnect recovery.
 
 The guest launch boundary is equally fail-closed. Workloads writes only
 `profile-id`, `image-id`, `image-digest`, `session-id`, and `transport` under
-`/etc/mackesd/browser-vm`; the image runs `validate-runtime-inputs.sh` before
+`/etc/mcnf-browser-vm`; the image runs `validate-runtime-inputs.sh` before
 starting Sway or a VDI endpoint. It requires the admitted Browser VM identity,
 a 64-byte hexadecimal SHA-256 image reference, a bounded identity token, and
 `rdp` or `spice`. Extra files, symlinks, commands, URLs, paths, and shell
@@ -88,7 +92,9 @@ host-supplied lifecycle state is accepted from the host. The profile explicitly
 declares `fail-closed` runtime behavior and `failed,unavailable` guest terminal
 states; Workloads/session-broker owns publication of those states, and a guest
 that cannot pass admission remains unavailable rather than starting a fallback.
-The provisioning directory and every admitted record must be root-owned; the
+The dedicated provisioning directory and every admitted record must be
+root-owned; the directory intentionally remains outside `/etc/mackesd`, whose
+mode-0700 daemon boundary protects secrets from unprivileged traversal. The
 directory may be traversable, but records may not be writable by group/other or
 executable. This prevents a second process from replacing an identity after
 the admission check while keeping the record format non-executable.
@@ -156,12 +162,26 @@ The underlying `install-helpers/verify-vdi-live-proof.py` runner requires both
 VDI frame marker without those immutable artifact bindings is rejected and
 cannot enter the composite acceptance bundle.
 
-After the image is installed and the `browser-vm` libvirt domain is running,
-produce a deployment receipt with `deploy-image.sh receipt`. The receipt binds
-the target node, domain UUID, attached disk, source revision, and local/remote
-image digests. The composite acceptance gate requires this receipt, so records
-from a different guest cannot be combined merely because they use the same
-image.
+After the base is installed, create one writable qcow2 overlay with an absolute
+backing filename, attach that overlay as the domain's sole `vda`, and start the
+`browser-vm` domain. Never attach the hashed base directly; guest writes would
+invalidate its identity. Produce a deployment receipt with
+`deploy-image.sh receipt`. Its schema-v2 live probe uses `qemu:///system` and
+requires a running domain, exactly one file-backed `vda`, qcow2 format for both
+files, and an exact two-file chain: writable `attached_disk` followed by
+immutable `remote_image`. The overlay's immediate backing filename must be the
+absolute base path, and the base must have no backing file. Relative,
+alternate, duplicate, and deeper chains are rejected. A read-only `vda` or an
+overlay that the resolved `qemu` account cannot read and write is also rejected.
+
+The receipt records `remote_image`, `attached_disk`, `backing_image`, both
+formats, and `backing_chain_depth=1`. It hashes only the immutable base and
+requires that digest to match `--expected-digest`; it deliberately does not
+hash the active overlay. The live probe also rejects a stopped domain, a
+symlinked or non-regular base, a base not readable by the remote `qemu` group,
+and a base writable by group or other. The composite acceptance gate requires
+this receipt, so records from a different guest cannot be combined merely
+because they use the same image.
 
 The source URL and path are deliberately recorded now so a later standalone
 Browser-stack extraction can bind the guest profile to an immutable source

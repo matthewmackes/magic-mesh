@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Publish the immutable Browser VM qcow2 to a KVM host.
+# Publish the immutable Browser VM qcow2 base to a KVM host.
 # Inspection is the default; remote mutation requires `publish --apply`.
 set -euo pipefail
 
@@ -30,8 +30,10 @@ Options:
   --receipt PATH               private deployment receipt output path
   --apply                     publish; otherwise the command is dry-run
 
-The remote preflight requires KVM, qemu-img, and passwordless sudo. Existing
-images are copied to a timestamped backup before atomic installation.
+The remote preflight requires KVM, qemu-img, the qemu group, and passwordless
+sudo. Existing bases are copied to a timestamped backup before atomic
+installation as root:qemu mode 0440. A schema-v2 receipt requires a running
+domain whose sole vda is a writable qcow2 overlay backed directly by this base.
 USAGE
 }
 
@@ -41,17 +43,40 @@ valid_host() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,252}$ ]]; }
 valid_user() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$ ]]; }
 valid_commit() { [[ "$1" =~ ^[0-9a-f]{40}$ && "$1" != 0000000000000000000000000000000000000000 ]]; }
 valid_domain() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]]; }
+valid_uuid() { [[ "$1" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]; }
 valid_path() {
-    [[ "$1" =~ ^/[A-Za-z0-9._/@+-]+$ ]] || return 1
-    [[ "$1" != *..* ]]
+    [[ "$1" =~ ^/([A-Za-z0-9._@+-]+/)*[A-Za-z0-9._@+-]+$ ]] || return 1
+    local component remainder=${1#/}
+    while [[ -n "$remainder" ]]; do
+        component=${remainder%%/*}
+        [[ -n "$component" && "$component" != . && "$component" != .. ]] || return 1
+        [[ "$remainder" == */* ]] || break
+        remainder=${remainder#*/}
+    done
+    return 0
 }
 valid_digest() { [[ "$1" =~ ^sha256:[0-9a-f]{64}$ ]]; }
+
+valid_backing_contract() {
+    local attached_disk=$1 backing_image=$2 remote_image=$3
+    local remote_format=$4 attached_format=$5 chain_depth=$6
+    valid_path "$remote_image" || return 1
+    valid_path "$attached_disk" || return 1
+    valid_path "$backing_image" || return 1
+    [[ "$attached_disk" != "$remote_image" ]] || return 1
+    [[ "$backing_image" == "$remote_image" ]] || return 1
+    [[ "$remote_format" == qcow2 && "$attached_format" == qcow2 ]] || return 1
+    [[ "$chain_depth" == 1 ]]
+}
 
 ssh_args() {
     SSH_ARGS=(ssh -o BatchMode=yes -o PasswordAuthentication=no
         -o KbdInteractiveAuthentication=no -o StrictHostKeyChecking=yes
         -o ConnectTimeout=8)
-    [[ -n "${IDENTITY:-}" ]] && SSH_ARGS+=(-i "$IDENTITY")
+    if [[ -n "${IDENTITY:-}" ]]; then
+        SSH_ARGS+=(-i "$IDENTITY")
+    fi
+    return 0
 }
 
 target_label() { printf '%s@%s' "$USER_NAME" "$TARGET"; }
@@ -83,8 +108,12 @@ remote_preflight() {
     destination=$(target_label)
     [[ "$REMOTE_IMAGE" != "$REMOTE_STAGING" ]] || fail "remote image and staging paths must differ"
     "${SSH_ARGS[@]}" -- "$destination" "
+        set -eu
         test -r /dev/kvm
         command -v qemu-img >/dev/null
+        command -v getent >/dev/null
+        qemu_gid=\$(getent group qemu | awk -F: 'NR == 1 && \$1 == \"qemu\" && \$3 ~ /^[0-9]+\$/ { print \$3 }')
+        test -n \"\$qemu_gid\"
         sudo -n true
         test -d '$(dirname -- "$REMOTE_IMAGE")'
         test ! -L '$(dirname -- "$REMOTE_IMAGE")'
@@ -136,19 +165,27 @@ parse_options() {
 }
 
 write_receipt() {
-    local digest="$1" node_hostname="$2" domain_uuid="$3" domain_state="$4" attached_disk="$5" remote_digest="$6" destination
+    local node_hostname="$1" domain_uuid="$2" domain_state="$3" attached_disk="$4"
+    local remote_digest="$5" backing_image="$6" remote_format="$7"
+    local attached_format="$8" chain_depth="$9" destination
     destination=$(target_label)
     [[ -n "$RECEIPT" ]] || fail "receipt action requires --receipt"
     [[ -n "$SOURCE_COMMIT" ]] || fail "receipt action requires --source-commit"
     [[ -n "$EXPECTED_DIGEST" ]] || fail "receipt action requires --expected-digest"
     valid_commit "$SOURCE_COMMIT" || fail "invalid source commit"
     valid_digest "$EXPECTED_DIGEST" || fail "invalid expected digest"
-    [[ "$digest" == "$EXPECTED_DIGEST" ]] || fail "remote image digest does not match expected digest"
+    valid_host "$node_hostname" || fail "remote node hostname is malformed"
+    valid_uuid "$domain_uuid" || fail "remote domain UUID is malformed"
     [[ "$remote_digest" == "$EXPECTED_DIGEST" ]] || fail "remote image digest is not the expected digest"
     [[ "$domain_state" == running ]] || fail "Browser VM domain is not running: $domain_state"
-    [[ "$attached_disk" == "$REMOTE_IMAGE" ]] || fail "Browser VM is not attached to the deployed image"
+    valid_backing_contract "$attached_disk" "$backing_image" "$REMOTE_IMAGE" \
+        "$remote_format" "$attached_format" "$chain_depth" || \
+        fail "Browser VM does not use one writable qcow2 overlay backed directly by the immutable base"
     [[ -x "$DEPLOYMENT_VERIFY" ]] || fail "deployment receipt verifier is unavailable"
-    python3 - "$RECEIPT" "$TARGET" "$node_hostname" "$DOMAIN_NAME" "$domain_uuid" "$domain_state" "$REMOTE_IMAGE" "$SOURCE_COMMIT" "$EXPECTED_DIGEST" "$remote_digest" "$attached_disk" <<'PY'
+    python3 - "$RECEIPT" "$TARGET" "$node_hostname" "$DOMAIN_NAME" "$domain_uuid" \
+        "$domain_state" "$REMOTE_IMAGE" "$remote_format" "$attached_disk" \
+        "$attached_format" "$backing_image" "$chain_depth" "$SOURCE_COMMIT" \
+        "$EXPECTED_DIGEST" "$remote_digest" <<'PY'
 import json
 import os
 from pathlib import Path
@@ -163,7 +200,7 @@ if not out.is_absolute() or ".." in out.parts:
 if not out.parent.is_dir() or out.parent.is_symlink():
     raise SystemExit("receipt parent must be an existing non-symlink directory")
 payload = {
-    "schema_version": 1,
+    "schema_version": 2,
     "kind": "browser_vm_deployment_receipt",
     "profile": "browser-vm-chromium",
     "image": "browser-vm-chromium",
@@ -175,10 +212,14 @@ payload = {
     "domain_uuid": sys.argv[5],
     "domain_state": sys.argv[6],
     "remote_image": sys.argv[7],
-    "attached_disk": sys.argv[11],
-    "source_commit": sys.argv[8],
-    "image_digest": sys.argv[9],
-    "remote_image_digest": sys.argv[10],
+    "remote_image_format": sys.argv[8],
+    "attached_disk": sys.argv[9],
+    "attached_disk_format": sys.argv[10],
+    "backing_image": sys.argv[11],
+    "backing_chain_depth": int(sys.argv[12]),
+    "source_commit": sys.argv[13],
+    "image_digest": sys.argv[14],
+    "remote_image_digest": sys.argv[15],
     "recorded_at": datetime.now(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ"),
 }
 tmp = out.with_name(f".{out.name}.tmp")
@@ -197,47 +238,58 @@ finally:
         tmp.unlink()
 PY
     "$DEPLOYMENT_VERIFY" validate "$RECEIPT" >/dev/null || fail "written deployment receipt did not validate"
-    printf 'deployment receipt written\nreceipt=%s\ntarget=%s\nimage=%s\ndomain=%s\n' "$RECEIPT" "$destination" "$digest" "$DOMAIN_NAME"
+    printf 'deployment receipt written\nreceipt=%s\ntarget=%s\nbase=%s\noverlay=%s\ndigest=%s\ndomain=%s\n' \
+        "$RECEIPT" "$destination" "$REMOTE_IMAGE" "$attached_disk" "$remote_digest" "$DOMAIN_NAME"
 }
 
 receipt_action() {
-    local destination probe key value node_hostname='' domain_uuid='' domain_state='' attached_disk='' remote_digest='' digest=''
+    local destination probe parsed node_hostname domain_uuid domain_state remote_image
+    local remote_format attached_disk attached_format backing_image chain_depth remote_digest
     destination=$(target_label)
     [[ -n "$EXPECTED_DIGEST" ]] || fail "receipt action requires --expected-digest"
     valid_digest "$EXPECTED_DIGEST" || fail "invalid expected digest"
     ssh_args
-    probe=$("${SSH_ARGS[@]}" -- "$destination" bash -s -- "$REMOTE_IMAGE" "$DOMAIN_NAME" <<'REMOTE'
-set -eu
-remote_image=$1
-domain_name=$2
-test -r /dev/kvm
-command -v qemu-img >/dev/null
-sudo -n true
-sudo -n test -f "$remote_image"
-node_hostname=$(hostname --fqdn 2>/dev/null || hostname)
-domain_state=$(sudo -n virsh -c qemu:///system domstate "$domain_name" | sed -n 's/^[[:space:]]*//p' | head -n 1)
-domain_uuid=$(sudo -n virsh -c qemu:///system domuuid "$domain_name" | sed -n 's/^[[:space:]]*//p' | head -n 1)
-attached_disk=$(sudo -n virsh -c qemu:///system domblklist "$domain_name" --details | awk -v expected="$remote_image" 'NR > 2 && $4 == expected { print $4; exit }')
-remote_digest=$(sudo -n sha256sum -- "$remote_image" | awk '{print "sha256:" $1}')
-printf 'node_hostname\t%s\n' "$node_hostname"
-printf 'domain_uuid\t%s\n' "$domain_uuid"
-printf 'domain_state\t%s\n' "$domain_state"
-printf 'attached_disk\t%s\n' "$attached_disk"
-printf 'remote_digest\t%s\n' "$remote_digest"
-REMOTE
-) || fail "remote deployment receipt probe failed: $destination"
-    while IFS=$'\t' read -r key value; do
-        case "$key" in
-            node_hostname) node_hostname=$value ;;
-            domain_uuid) domain_uuid=$value ;;
-            domain_state) domain_state=$value ;;
-            attached_disk) attached_disk=$value ;;
-            remote_digest) remote_digest=$value ;;
-        esac
-    done <<<"$probe"
-    digest=$remote_digest
-    [[ -n "$node_hostname" && -n "$domain_uuid" && -n "$domain_state" && -n "$attached_disk" && -n "$digest" ]] || fail "remote receipt probe returned incomplete identity"
-    write_receipt "$digest" "$node_hostname" "$domain_uuid" "$domain_state" "$attached_disk" "$remote_digest"
+    probe=$("${SSH_ARGS[@]}" -- "$destination" sudo -n python3 - probe-live \
+        --remote-image "$REMOTE_IMAGE" --domain "$DOMAIN_NAME" \
+        --expected-digest "$EXPECTED_DIGEST" < "$DEPLOYMENT_VERIFY") || \
+        fail "remote deployment receipt probe failed: $destination"
+    parsed=$(python3 -c '
+import json, re, sys
+
+expected = {
+    "node_hostname", "domain_uuid", "domain_state", "remote_image",
+    "remote_image_format", "attached_disk", "attached_disk_format",
+    "backing_image", "backing_chain_depth", "remote_image_digest",
+}
+try:
+    value = json.load(sys.stdin)
+except (UnicodeError, json.JSONDecodeError) as exc:
+    raise SystemExit(f"malformed remote probe JSON: {exc}")
+if not isinstance(value, dict) or set(value) != expected:
+    raise SystemExit("remote probe fields do not match the schema-v2 contract")
+ordered = [
+    value["node_hostname"], value["domain_uuid"], value["domain_state"],
+    value["remote_image"], value["remote_image_format"], value["attached_disk"],
+    value["attached_disk_format"], value["backing_image"],
+    value["backing_chain_depth"], value["remote_image_digest"],
+]
+if any(isinstance(item, bool) or not isinstance(item, (str, int)) for item in ordered):
+    raise SystemExit("remote probe values have invalid types")
+rendered = [str(item) for item in ordered]
+if any(re.search(r"[\t\r\n]", item) for item in rendered):
+    raise SystemExit("remote probe values contain control separators")
+print("\t".join(rendered))
+' <<<"$probe") || fail "remote receipt probe returned malformed identity"
+    IFS=$'\t' read -r node_hostname domain_uuid domain_state remote_image \
+        remote_format attached_disk attached_format backing_image chain_depth \
+        remote_digest <<<"$parsed"
+    [[ "$remote_image" == "$REMOTE_IMAGE" ]] || fail "remote probe changed the immutable base path"
+    [[ -n "$node_hostname" && -n "$domain_uuid" && -n "$domain_state" && \
+        -n "$attached_disk" && -n "$backing_image" && -n "$remote_digest" ]] || \
+        fail "remote receipt probe returned incomplete identity"
+    write_receipt "$node_hostname" "$domain_uuid" "$domain_state" "$attached_disk" \
+        "$remote_digest" "$backing_image" "$remote_format" "$attached_format" \
+        "$chain_depth"
 }
 
 run_action() {
@@ -267,11 +319,28 @@ run_action() {
     printf -v rsync_ssh '%q ' "${SSH_ARGS[@]}"
     rsync -az --partial --chmod=F600 -e "$rsync_ssh" -- "$IMAGE" "$destination:$remote_tmp"
     "${SSH_ARGS[@]}" -- "$destination" "
+        set -eu
+        cleanup_publish() {
+            sudo -n rm -f -- '$remote_tmp' '${REMOTE_IMAGE}.new'
+        }
+        trap cleanup_publish EXIT
+        qemu_gid=\$(getent group qemu | awk -F: 'NR == 1 && \$1 == \"qemu\" && \$3 ~ /^[0-9]+\$/ { print \$3 }')
+        test -n \"\$qemu_gid\"
+        sudo -n test -f '$remote_tmp'
+        sudo -n test ! -L '$remote_tmp'
+        sudo -n chown root:root '$remote_tmp'
+        sudo -n chmod 0400 '$remote_tmp'
+        test \"\$(sudo -n sha256sum -- '$remote_tmp' | awk '{print \"sha256:\" \$1}')\" = '$digest'
         sudo -n qemu-img check --force-share '$remote_tmp'
         if sudo -n test -e '$REMOTE_IMAGE'; then sudo -n cp -a -- '$REMOTE_IMAGE' '$backup'; fi
-        sudo -n install -o root -g root -m 0640 '$remote_tmp' '${REMOTE_IMAGE}.new'
+        sudo -n install -o root -g qemu -m 0440 '$remote_tmp' '${REMOTE_IMAGE}.new'
         sudo -n mv -T -- '${REMOTE_IMAGE}.new' '$REMOTE_IMAGE'
-        sudo -n rm -f -- '$remote_tmp'
+        if sudo -n sh -c 'command -v restorecon >/dev/null 2>&1'; then
+            sudo -n restorecon -F -- '$REMOTE_IMAGE'
+        fi
+        sudo -n test -f '$REMOTE_IMAGE'
+        sudo -n test ! -L '$REMOTE_IMAGE'
+        test \"\$(sudo -n stat -c '%u:%g:%a' -- '$REMOTE_IMAGE')\" = \"0:\$qemu_gid:440\"
         test \"\$(sudo -n sha256sum -- '$REMOTE_IMAGE' | awk '{print \"sha256:\" \$1}')\" = '$digest'
     "
     echo "published: $destination:$REMOTE_IMAGE (backup=$backup)"
@@ -279,10 +348,16 @@ run_action() {
 
 self_test() {
     expect_reject() { "$@" && return 1 || return 0; }
+    IDENTITY=
+    ssh_args
+    [[ "${SSH_ARGS[0]}" == ssh ]]
     valid_host 172.20.146.225
     valid_user mm
     valid_path /var/lib/libvirt/images/browser-vm-chromium.qcow2
     expect_reject valid_path /tmp/../escape
+    expect_reject valid_path /tmp/./escape
+    expect_reject valid_path /tmp//escape
+    expect_reject valid_path relative/image.qcow2
     expect_reject valid_path '/tmp/unsafe path'
     expect_reject valid_host 'host;touch /tmp/pwned'
     expect_reject valid_host '[::1]'
@@ -292,6 +367,22 @@ self_test() {
     expect_reject valid_commit 0000000000000000000000000000000000000000
     valid_domain browser-vm
     expect_reject valid_domain 'browser vm'
+    valid_backing_contract \
+        /var/lib/libvirt/images/browser-vm-r1-overlay.qcow2 \
+        /var/lib/libvirt/images/browser-vm-chromium.qcow2 \
+        /var/lib/libvirt/images/browser-vm-chromium.qcow2 qcow2 qcow2 1
+    expect_reject valid_backing_contract \
+        /var/lib/libvirt/images/browser-vm-chromium.qcow2 \
+        /var/lib/libvirt/images/browser-vm-chromium.qcow2 \
+        /var/lib/libvirt/images/browser-vm-chromium.qcow2 qcow2 qcow2 1
+    expect_reject valid_backing_contract \
+        /var/lib/libvirt/images/browser-vm-r1-overlay.qcow2 \
+        /var/lib/libvirt/images/alternate.qcow2 \
+        /var/lib/libvirt/images/browser-vm-chromium.qcow2 qcow2 qcow2 1
+    expect_reject valid_backing_contract \
+        /var/lib/libvirt/images/browser-vm-r1-overlay.qcow2 \
+        /var/lib/libvirt/images/browser-vm-chromium.qcow2 \
+        /var/lib/libvirt/images/browser-vm-chromium.qcow2 qcow2 qcow2 2
     echo 'deploy-image: self-test passed'
 }
 

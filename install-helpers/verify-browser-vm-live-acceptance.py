@@ -507,7 +507,7 @@ def _fixture(root: Path) -> dict[str, Any]:
         "%Y-%m-%dT%H:%M:%SZ"
     )
     deployment_data = {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "browser_vm_deployment_receipt",
         "profile": "browser-vm-chromium",
         "image": "browser-vm-chromium",
@@ -519,7 +519,11 @@ def _fixture(root: Path) -> dict[str, Any]:
         "domain_uuid": "01234567-89ab-4cde-8fab-0123456789ab",
         "domain_state": "running",
         "remote_image": "/var/lib/libvirt/images/browser-vm-chromium.qcow2",
-        "attached_disk": "/var/lib/libvirt/images/browser-vm-chromium.qcow2",
+        "remote_image_format": "qcow2",
+        "attached_disk": "/var/lib/libvirt/images/browser-vm-r1-overlay.qcow2",
+        "attached_disk_format": "qcow2",
+        "backing_image": "/var/lib/libvirt/images/browser-vm-chromium.qcow2",
+        "backing_chain_depth": 1,
         "source_commit": source_commit,
         "image_digest": image_digest,
         "remote_image_digest": image_digest,
