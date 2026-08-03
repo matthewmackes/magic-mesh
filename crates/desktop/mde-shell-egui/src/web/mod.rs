@@ -202,6 +202,20 @@ impl WebState {
         Some(request)
     }
 
+    /// Forget only the shell-side VDI handoff after the operator explicitly
+    /// leaves the Browser surface. The stable guest workload remains untouched;
+    /// returning to Browser must be able to request a fresh attachment to that
+    /// same VM session.
+    pub(crate) fn note_vdi_session_detached(&mut self) {
+        self.browser_vm_request_issued = false;
+        self.browser_vm_connect = None;
+        self.diagnostic = BrowserVmDiagnostic {
+            state: BrowserVmConnectionState::WaitingForVdi,
+            detail: "The guest Browser VM is selected; attach its VDI transport to continue."
+                .to_owned(),
+        };
+    }
+
     /// Surface an explicit VDI/broker failure without inventing a page or a
     /// host-rendered fallback.
     pub(crate) fn browser_vm_unavailable(&mut self, detail: impl Into<String>) {
@@ -325,14 +339,26 @@ mod tests {
     #[test]
     fn reachable_running_browser_vm_crosses_only_the_typed_vdi_seam() {
         let mut state = WebState::default();
-        state.sync_browser_vm_target(Some(BrowserVmTarget {
+        let target = BrowserVmTarget {
             serving_peer: "eagle".to_owned(),
             workload: "browser-vm".to_owned(),
             status: "running".to_owned(),
             reachable: true,
-        }));
+        };
+        state.sync_browser_vm_target(Some(target.clone()));
         let request = state.take_browser_vm_connect().expect("VDI handoff");
         assert_eq!(request.target.workload, "browser-vm");
         assert!(state.browser_vm_connect.is_none());
+
+        state.note_vdi_session_detached();
+        state.sync_browser_vm_target(Some(target));
+        assert_eq!(
+            state
+                .take_browser_vm_connect()
+                .expect("returning to Browser reattaches the stable VM")
+                .target
+                .workload,
+            "browser-vm"
+        );
     }
 }

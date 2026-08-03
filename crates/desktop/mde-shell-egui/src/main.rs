@@ -1857,6 +1857,9 @@ impl Shell {
             HotkeyAction::ReturnToChrome => {
                 // Leave a fullscreen guest for the mesh-control chrome — release any
                 // VDI target and show the Workbench (a session is never a trap).
+                if self.nav.surface == Surface::Browser {
+                    self.web.note_vdi_session_detached();
+                }
                 self.vdi.clear_target();
                 self.nav.expanded = true;
                 self.nav.surface = Surface::Workbench;
@@ -2376,6 +2379,7 @@ impl Shell {
                         })
                         .inner;
                     if leave {
+                        self.web.note_vdi_session_detached();
                         self.vdi.clear_target();
                         self.nav.surface = Surface::Workbench;
                     }
