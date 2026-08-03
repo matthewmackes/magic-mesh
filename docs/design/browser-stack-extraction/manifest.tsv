@@ -1,6 +1,6 @@
 # browser-stack-extraction-manifest v1
-# source_commit=b4951258ac7d6a76d37bb04db0deebca08860555
-# source_commit_date=2026-08-03T05:49:39-04:00
+# source_commit=59bedd319d8aa6889aa7137b2140a8be76d771d1
+# source_commit_date=2026-08-03T06:09:16-04:00
 # source_branch=agent/drain-worklist-20260725
 # source_remote=https://github.com/matthewmackes/magic-mesh.git
 # extraction_destination=matthewmackes/magic-mesh-browser-stack
@@ -84,7 +84,7 @@ mixed-purpose	install-helpers/build-rpm-fedora43.sh	split-in-magic-mesh-browser-
 shared	install-helpers/lint-layered-tiers.sh	retain-in-magic-mesh:install-helpers/lint-layered-tiers.sh#shared-contract-or-reference	shared-infrastructure-reference	a420f9683f04b516c2354e9b14637a2551b8c7f9	a420f9683f04b516c2354e9b14637a2551b8c7f9	clean
 shared	install-helpers/lint-style-leaks.sh	retain-in-magic-mesh:install-helpers/lint-style-leaks.sh#shared-contract-or-reference	shared-infrastructure-reference	7fd353d52b129fe3bc0edd823664a74775374cf8	7fd353d52b129fe3bc0edd823664a74775374cf8	clean
 mixed-purpose	install-helpers/rpm-features.sh	split-in-magic-mesh-browser-stack:install-helpers/rpm-features.sh#browser-sections	image-or-package-integration	2634290d6f9b2ef29e306d5d042eb7ec0eb05513	2634290d6f9b2ef29e306d5d042eb7ec0eb05513	clean
-shared	install-helpers/verify-browser-vm-live-acceptance.py	retain-in-magic-mesh:install-helpers/verify-browser-vm-live-acceptance.py#shared-contract-or-reference	browser-vm-acceptance-gate	f20998748255a9a9dd8c757597723e8859d2ab14	f20998748255a9a9dd8c757597723e8859d2ab14	clean
+shared	install-helpers/verify-browser-vm-live-acceptance.py	retain-in-magic-mesh:install-helpers/verify-browser-vm-live-acceptance.py#shared-contract-or-reference	browser-vm-acceptance-gate	804a1448c0df70d4090c7a05cd7fdb089c6e2a01	804a1448c0df70d4090c7a05cd7fdb089c6e2a01	clean
 mixed-purpose	install-helpers/verify-rpm-payload.sh	split-in-magic-mesh-browser-stack:install-helpers/verify-rpm-payload.sh#browser-sections	image-or-package-integration	bc823976095bc6f91fc52966113a34e3f043d2bd	bc823976095bc6f91fc52966113a34e3f043d2bd	clean
 shared	install-helpers/xcp-build.sh	retain-in-magic-mesh:install-helpers/xcp-build.sh#shared-contract-or-reference	shared-infrastructure-reference	732cc2595fb4f066505ed2a2c9ff6ece9690509a	732cc2595fb4f066505ed2a2c9ff6ece9690509a	clean
 mixed-purpose	packaging/bootc/Containerfile	split-in-magic-mesh-browser-stack:packaging/bootc/Containerfile#browser-sections	image-or-package-integration	7a2e144f60446fe2ad9b6d7a9f94d6a50d8b6a03	7a2e144f60446fe2ad9b6d7a9f94d6a50d8b6a03	clean
