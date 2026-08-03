@@ -1,12 +1,12 @@
 # browser-stack-extraction-manifest v1
-# source_commit=aabeebb5d7d79044a8fd639564c1a5f776ef4741
-# source_commit_date=2026-08-03T01:24:37-04:00
+# source_commit=7816f7811dd08f1ea8253ad0bf5c0a8c7063033f
+# source_commit_date=2026-08-03T01:51:37-04:00
 # source_branch=agent/drain-worklist-20260725
 # source_remote=https://github.com/matthewmackes/magic-mesh.git
 # extraction_destination=matthewmackes/magic-mesh-browser-stack
 # generation=git-ls-files plus scoped host-Browser signal scan
 # columns=class	source_path	destination	reason	source_blob_sha	worktree_blob_sha	worktree_state
-mixed-purpose	Cargo.lock	split-in-magic-mesh-browser-stack:Cargo.lock#browser-sections	workspace-package-edge	61a2332ba976753642c38a36d7388c20d36f1828	61a2332ba976753642c38a36d7388c20d36f1828	clean
+mixed-purpose	Cargo.lock	split-in-magic-mesh-browser-stack:Cargo.lock#browser-sections	workspace-package-edge	924aae73760ea92457919aa9ef82b791cdbdb85d	924aae73760ea92457919aa9ef82b791cdbdb85d	clean
 mixed-purpose	Cargo.toml	split-in-magic-mesh-browser-stack:Cargo.toml#browser-sections	workspace-package-edge	f6576a9256fc856e1a0b76c768d42575317c18b3	f6576a9256fc856e1a0b76c768d42575317c18b3	clean
 shared	LICENSE	retain-in-magic-mesh:LICENSE#shared-contract-or-reference	shared-legal-root	8883c49884a041a96846041ace5ce62d5089231d	8883c49884a041a96846041ace5ce62d5089231d	clean
 shared	NOTICE	retain-in-magic-mesh:NOTICE#shared-contract-or-reference	shared-legal-root	42a0c41d2da013e7fe2436e3301a52a79935cbbc	42a0c41d2da013e7fe2436e3301a52a79935cbbc	clean
@@ -32,7 +32,7 @@ mixed-purpose	crates/mesh/mackesd/Cargo.toml	split-in-magic-mesh-browser-stack:c
 shared	crates/mesh/mackesd/src/ca/backup.rs	retain-in-magic-mesh:crates/mesh/mackesd/src/ca/backup.rs#shared-contract-or-reference	shared-secret-consumer	760443274e9146c1a044ad18756cfda0982917f0	760443274e9146c1a044ad18756cfda0982917f0	clean
 shared	crates/mesh/mackesd/src/ipc/secret_store.rs	retain-in-magic-mesh:crates/mesh/mackesd/src/ipc/secret_store.rs#shared-contract-or-reference	shared-secret-consumer	874e769cfef6da2bd7b015cfb56d97682ab4ff26	874e769cfef6da2bd7b015cfb56d97682ab4ff26	clean
 mixed-purpose	crates/mesh/mackesd/src/worker_role.rs	split-in-magic-mesh-browser-stack:crates/mesh/mackesd/src/worker_role.rs#browser-sections	daemon-worker-registration	2b634c5a11fb1fe6c786cb8bc9300748e9a7c90a	2b634c5a11fb1fe6c786cb8bc9300748e9a7c90a	clean
-shared	crates/mesh/mackesd/src/workers/cloud/verbs/browser.rs	retain-in-magic-mesh:crates/mesh/mackesd/src/workers/cloud/verbs/browser.rs#shared-contract-or-reference	browser-vm-workload-contract	802e58f1c6fadf9ee8d61ed83fbb54a6843546cf	802e58f1c6fadf9ee8d61ed83fbb54a6843546cf	clean
+shared	crates/mesh/mackesd/src/workers/cloud/verbs/browser.rs	retain-in-magic-mesh:crates/mesh/mackesd/src/workers/cloud/verbs/browser.rs#shared-contract-or-reference	browser-vm-workload-contract	23c2f7c953f693cdd3f14437b4f3f9dc16030321	23c2f7c953f693cdd3f14437b4f3f9dc16030321	clean
 shared	crates/mesh/mde-seal/Cargo.toml	retain-in-magic-mesh:crates/mesh/mde-seal/Cargo.toml#shared-contract-or-reference	workspace-package-edge	5133a491d3b42906c46d3ed45ef6ea822a3aa967	5133a491d3b42906c46d3ed45ef6ea822a3aa967	clean
 shared	crates/mesh/mde-seal/src/lib.rs	retain-in-magic-mesh:crates/mesh/mde-seal/src/lib.rs#shared-contract-or-reference	shared-secret-contract	70681c3a81c6763bce07abf905518be1fd505caa	70681c3a81c6763bce07abf905518be1fd505caa	clean
 shared	crates/mesh/mde-seal/src/scope.rs	retain-in-magic-mesh:crates/mesh/mde-seal/src/scope.rs#shared-contract-or-reference	shared-secret-contract	30aa743cf8c643fdc80f035218ce640fbf19ab43	30aa743cf8c643fdc80f035218ce640fbf19ab43	clean
