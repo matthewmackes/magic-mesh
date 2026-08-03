@@ -433,18 +433,22 @@ remains here under a completed status.
   `/home/mm/browser-vm-chromium-qcow2-provenance-20260803/qcow2/disk.qcow2`
   with SHA-256
   `089bbedf259509b60f4aa9ce3fc8582f347d3f73882dd672824499636d68d6d3`;
-  `qemu-img check` found no errors. This is a current publish candidate, not
-  live Dell evidence: Dell remains unreachable and no guest, GPU, audio,
-  performance, reconnect, or six-node acceptance is claimed.
+  `qemu-img check` found no errors. This is an intermediate 10-GiB artifact
+  retained for provenance history, not a current publish candidate: the
+  deployment and seat preflights now reject it. It is not live Dell evidence;
+  Dell remains unreachable and no guest, GPU, audio, performance, reconnect,
+  or six-node acceptance is claimed.
 - Image-contract correction (2026-08-03): the prior 10-GiB qcow2 output was
   below the declared 64-GiB Browser VM workload floor. `build-image.sh` now
   binds raw/qcow2 output sizing to `BROWSER_VM_DISK_GB`, while deployment and
   seat preflight reject images below 64 GiB. The corrected farm `.90` artifact
-  is `/home/mm/browser-vm-chromium-qcow2-64g-20260803/qcow2/disk.qcow2` with
+  is `/home/mm/browser-vm-chromium-qcow2-final-64g-20260803/qcow2/disk.qcow2` with
   SHA-256
-  `bb967016fa4e43c8984bbb987190fff411f0a424ad1df57243a6de87d9cf98af`;
-  `qemu-img check` passed. It is still only a publish candidate because Dell
-  and the live acceptance seats remain unavailable.
+  `d41b322a658e02e7c4303a3d0580e7e702a4e39cb8e2889eb4ed2614c46a946b`;
+  `qemu-img check` passed. The image carries source label `dd973836` and
+  container image ID `3282faa9a795df6750cd054e13fef2a612e616e3a111b2fe15b9980f8edf081a`.
+  It is still only a publish candidate because Dell and the live acceptance
+  seats remain unavailable.
 - Operator-path update (2026-08-01): `verify-vdi-live-proof.py discover` now
   delegates to the bounded approved-seat inventory and validates its schema;
   Python/self-tests and farm shell verification pass on `.50` slot

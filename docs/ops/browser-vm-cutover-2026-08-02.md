@@ -45,15 +45,18 @@ disk.
 
 Latest image-contract evidence: the image builder now binds its disk output to
 `BROWSER_VM_DISK_GB=64` and resizes raw/qcow2 artifacts to that virtual size.
-After the profile pin advanced in `f930c844` and the guest-readable NoCloud
-permissions fix in `9d880921`, a matching qcow2 was rebuilt on farm `.90` at
-`/home/mm/browser-vm-chromium-qcow2-64g-20260803/qcow2/disk.qcow2`.
+After the profile pin advanced in `3fbf2223` to corrected source
+`dd973836` (which includes the guest-readable NoCloud permissions fix), a
+matching qcow2 was rebuilt on farm `.90` at
+`/home/mm/browser-vm-chromium-qcow2-final-64g-20260803/qcow2/disk.qcow2`.
 Its SHA-256 is
-`bb967016fa4e43c8984bbb987190fff411f0a424ad1df57243a6de87d9cf98af`.
+`d41b322a658e02e7c4303a3d0580e7e702a4e39cb8e2889eb4ed2614c46a946b`.
 `qemu-img check` reports no errors and `qemu-img info` reports a 64-GiB
 virtual size with a 1.72-GiB compressed footprint. The image carries source
-label `9d880921`; the old 10-GiB artifact is rejected by preflight. This is the
-current publish candidate, but remains uninstalled because Dell is unreachable.
+label `dd973836` (container image ID
+`3282faa9a795df6750cd054e13fef2a612e616e3a111b2fe15b9980f8edf081a`); the old
+10-GiB artifact is rejected by preflight. This is the current publish
+candidate, but remains uninstalled because Dell is unreachable.
 
 The OpenTofu deployment contract now rejects direct Browser VM declarations
 that are not `desktop_vm`, 4 vCPU/8192 MiB/64 GiB, or bound to a full image
