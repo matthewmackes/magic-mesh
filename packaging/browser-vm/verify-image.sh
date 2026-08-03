@@ -2,6 +2,7 @@
 # Static acceptance checks for a built Browser VM image; this is not live proof.
 set -euo pipefail
 TAG="${1:-localhost/magic-mesh-browser-vm-chromium:latest}"
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 
 if [[ "${1:-}" == "--self-test" ]]; then
     [[ "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" =~ ^sha256:[0-9a-fA-F]{64}$ ]]
@@ -12,6 +13,13 @@ command -v podman >/dev/null 2>&1 || { echo 'FATAL: podman is required' >&2; exi
 podman image exists "$TAG" || { echo "FATAL: image is missing: $TAG" >&2; exit 1; }
 profile="$(podman image inspect --format '{{index .Config.Labels "org.mcnf.browser-vm.profile"}}' "$TAG")"
 [[ "$profile" == browser-vm-chromium-v1 ]] || { echo 'FATAL: immutable Browser VM profile label missing' >&2; exit 1; }
+profile_source_commit="$(sed -n 's/^BROWSER_VM_SOURCE_COMMIT=//p' "$ROOT/packaging/browser-vm/profile.env")"
+image_source_commit="$(podman image inspect --format '{{index .Config.Labels "org.mcnf.browser-vm.source-commit"}}' "$TAG")"
+[[ "$profile_source_commit" =~ ^[0-9a-f]{40}$ ]] || { echo 'FATAL: profile source commit is malformed' >&2; exit 1; }
+[[ "$image_source_commit" == "$profile_source_commit" ]] || {
+    echo "FATAL: image source commit label does not match profile ($image_source_commit != $profile_source_commit)" >&2
+    exit 1
+}
 
 inner='set -u
 fail=0

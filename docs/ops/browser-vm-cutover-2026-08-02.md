@@ -56,6 +56,14 @@ process CPU/DRM render-GPU busy samples. The focused metrics test and the
 do not stand in for the still-missing guest GPU, audio, or live endpoint
 evidence.
 
+The Browser VM image build now stamps the immutable profile source revision in
+the container metadata and the static verifier requires the image label to
+match `profile.env`. A BigBoy rootless rebuild tagged
+`localhost/magic-mesh-browser-vm-chromium:provenance-20260803` passed this gate
+(image ID `3768fd23fbffc8cb5da5698d9729912373de83a50d9a36d2acad7088a20adaf2`).
+This is container provenance evidence, not qcow2 publication or live guest
+acceptance.
+
 ## Landed
 
 - `magic-mesh-browser-stack` is public and history-bearing at

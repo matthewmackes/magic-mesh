@@ -375,6 +375,11 @@ remains here under a completed status.
   were built and statically verified on BigBoy `.130`; the retained qcow2
   artifact has SHA-256
   `9c5d687c7fa378cb8cfe767bf0d46fb0f55a7889cf5c1eebc1bbfc8003a8c0c6`.
+  The image lane now stamps the pinned profile source revision into the
+  container label and refuses an image whose label does not match the profile;
+  a BigBoy rootless rebuild tagged
+  `localhost/magic-mesh-browser-vm-chromium:provenance-20260803` passed that
+  verifier (image ID `3768fd23fbffc8cb5da5698d9729912373de83a50d9a36d2acad7088a20adaf2`).
   Live read-only audit on 2026-08-01
   found `.15` healthy but with no VM and no VNC/RDP/SPICE listener; Dell
   `.225` has shell services but no VDI listener, Eagle is unreachable, and

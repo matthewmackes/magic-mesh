@@ -17,6 +17,12 @@ BIB_IMAGE="${MCNF_BIB_IMAGE:-quay.io/centos-bootc/bootc-image-builder@sha256:2b5
 BROWSER_VM_ROOTFS="${MCNF_BROWSER_VM_ROOTFS:-ext4}"
 PULL_TIMEOUT="${MCNF_PULL_TIMEOUT:-120}"
 
+SOURCE_COMMIT="$(sed -n 's/^BROWSER_VM_SOURCE_COMMIT=//p' "$DIR/profile.env")"
+[[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || {
+    echo 'FATAL: Browser VM profile source commit is not a 40-character revision' >&2
+    exit 2
+}
+
 usage() { echo "Usage: $0 [--rpm PATH]... [--base IMAGE] [--tag IMAGE] [--disk qcow2|raw|anaconda-iso] [--out DIR]"; }
 
 resolve_image() {
@@ -61,6 +67,7 @@ args=(--build-arg "MCNF_RPM_LANE=$LANE")
 [ -n "$BASE" ] && args+=(--build-arg "BROWSER_VM_BASE=$BASE")
 podman build "${args[@]}" \
     --label 'org.mcnf.browser-vm.profile=browser-vm-chromium-v1' \
+    --label "org.mcnf.browser-vm.source-commit=$SOURCE_COMMIT" \
     --label "org.mcnf.browser-vm.base-image-id=$base_id" \
     -t "$IMAGE" --ignorefile "$DIR/context.containerignore" -f "$DIR/Containerfile" "$REPO"
 
