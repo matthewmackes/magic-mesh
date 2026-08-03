@@ -6,7 +6,7 @@ not a second active worklist.
 ## Current state — 2026-08-03
 
 The source-side cutover and standalone provenance are current through
-`476f49da`; the extraction verifier passes for 84 paths and the public
+`30c98399`; the extraction verifier passes for 84 paths and the public
 standalone repository is at `996d3d27cfc4c52776c2289a0069d92e2bede66d`. A
 corrected guest image containing the explicit `Virtual-1` output configuration
 was built on farm `.90`, passed static image verification, and has SHA-256
