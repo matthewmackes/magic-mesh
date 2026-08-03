@@ -449,6 +449,24 @@ remains here under a completed status.
   container image ID `3282faa9a795df6750cd054e13fef2a612e616e3a111b2fe15b9980f8edf081a`.
   It is still only a publish candidate because Dell and the live acceptance
   seats remain unavailable.
+- Acceptance-provenance update (2026-08-03): the composite
+  `install-helpers/verify-browser-vm-live-acceptance.py` gate now binds VDI
+  frame/input/reconnect, guest runtime wiring, Chromium media decode, GPU
+  video, performance, and sample-backed audio evidence to one source commit,
+  image digest, private regular artifacts, and records no credential-shaped
+  fields. Runtime/media guest records and the image now carry the same pinned
+  source marker; the image verifier's guest probe is also covered by an
+  explicit environment boundary. Local extraction/contract gates pass, and
+  the composite, contract, and image self-tests pass on separate farm slots.
+  The extraction inventory is now 86 paths (18 browser-owned, 25
+  mixed-purpose, 43 shared). A fresh root-backed 64-GiB qcow2 was rebuilt on
+  BigBoy `.130` at
+  `/home/mm/browser-vm-chromium-qcow2-provenance-final2-root-20260803/qcow2/disk.qcow2`,
+  passed static image verification and `qemu-img check`, and has SHA-256
+  `10f1db47c453c4f9b269b8df841510d6a7bd8517ffab7e8c0965ab655a68498f`.
+  This supersedes the earlier `d41b322a…` candidate, but is not published or
+  live-accepted because Dell remains unreachable and seat-15 has no KVM/VDI
+  endpoint.
 - Coordination-fallback hardening update (2026-08-03): the Nebula supervisor
   now records whether its peer directory came from etcd or filesystem fallback
   and refuses to shrink an existing lighthouse roster when etcd is configured

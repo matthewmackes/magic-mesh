@@ -185,6 +185,21 @@ readiness and decoded/dropped-frame counters. Its verifier is
 `guest_media_decode` and deliberately leaves live GPU, audible audio, VDI, and
 reconnect proof unavailable.
 
+The composite live-acceptance boundary is now implemented at
+`install-helpers/verify-browser-vm-live-acceptance.py`. It binds VDI
+frame/input/reconnect, guest runtime, guest Chromium decode, GPU-video,
+performance, and sample-backed audio records to one source commit and image
+digest, rejects stale or credential-shaped evidence, and passes its positive
+plus negative self-tests. The runtime/media records and guest image carry the
+same pinned source marker. The contract, composite, and image self-tests pass
+on separate farm nodes.
+
+A fresh root-backed 64-GiB qcow2 was rebuilt on BigBoy `.130` at
+`/home/mm/browser-vm-chromium-qcow2-provenance-final2-root-20260803/qcow2/disk.qcow2`.
+It passed static image verification and `qemu-img check`; SHA-256 is
+`10f1db47c453c4f9b269b8df841510d6a7bd8517ffab7e8c0965ab655a68498f`. It is a
+ready publication candidate, not a published or live-accepted image.
+
 The latest read-only audit finds seat-15 reachable but without a `browser-vm`
 workload, `/dev/kvm`, or an RDP/SPICE/VNC listener. Dell remains unreachable
 (`172.20.146.225` has no route from the orchestration host), and no real

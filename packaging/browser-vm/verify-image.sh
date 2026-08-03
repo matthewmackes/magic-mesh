@@ -29,7 +29,8 @@ for path in /usr/local/libexec/mcnf-browser-vm-validate /usr/local/libexec/mcnf-
   [ -f "$path" ] && ok "image file present: $path" || bad "image file missing: $path"
 done
 guest_source_commit="$(cat /usr/share/mcnf/browser-vm/source-commit 2>/dev/null || true)"
-[ "$guest_source_commit" = "$image_source_commit" ] && ok "guest runtime provenance matches image label" || bad "guest runtime provenance does not match image label"
+expected_source_commit="${MCNF_EXPECTED_SOURCE_COMMIT:-}"
+[ "$guest_source_commit" = "$expected_source_commit" ] && ok "guest runtime provenance matches image label" || bad "guest runtime provenance does not match image label"
 chromium_bin="$(command -v chromium || command -v chromium-browser || true)"
 [ -n "$chromium_bin" ] && ok "runtime binary present: chromium ($chromium_bin)" || bad "runtime binary missing: chromium"
 for binary in mackesd meshctl nebula sway dbus-run-session pipewire pipewire-pulse wireplumber pw-cli pactl aplay arecord vainfo xrdp; do
@@ -64,7 +65,7 @@ command -v xrdp >/dev/null 2>&1 && ok "RDP endpoint binary present" || bad "RDP 
 command -v vainfo >/dev/null 2>&1 && ok "VA-API diagnostic present" || bad "VA-API diagnostic missing"
 exit "$fail"'
 rc=0
-out="$(printf '%s\n' "$inner" | podman run --rm -i "$TAG" /bin/bash -s)" || rc=$?
+out="$(printf '%s\n' "$inner" | podman run --rm -i -e "MCNF_EXPECTED_SOURCE_COMMIT=$image_source_commit" "$TAG" /bin/bash -s)" || rc=$?
 printf '%s\n' "$out"
 grep -q '^  OK ' <<<"$out" || rc=1
 grep -q '^  FAIL ' <<<"$out" && rc=1
