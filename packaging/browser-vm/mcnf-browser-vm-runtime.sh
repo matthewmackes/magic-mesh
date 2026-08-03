@@ -103,6 +103,11 @@ default_floating_border none
 # connected-but-unconfigured scanout (which presents as a black SPICE frame).
 output * enable
 output * mode 1024x768
+# QEMU's virtio-vga connector is named Virtual-1. Keep the wildcard defaults
+# for other display backends, but explicitly configure the live SPICE path so
+# wlroots cannot leave the connected scanout unconfigured.
+output Virtual-1 enable
+output Virtual-1 mode 1024x768
 exec @CHROMIUM_BIN@ --ozone-platform=wayland --enable-features=UseOzonePlatform --start-maximized --no-first-run --disable-session-crashed-bubble --user-data-dir=/var/lib/mcnf-browser/chromium
 EOF
 
