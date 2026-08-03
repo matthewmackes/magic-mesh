@@ -352,9 +352,10 @@ impl ToastHost {
 
     /// Enqueue an alert. If nothing is showing it shows immediately; a **Critical**
     /// preempts a non-critical to the front (the displaced alert resumes after the
-    /// Critical is acknowledged). A newer AI operator notice also preempts an older
-    /// AI operator notice so update warnings cannot wait behind a persistent alert;
-    /// the displaced notice resumes from the front of the backlog afterward.
+    /// Critical is acknowledged). An AI operator notice preempts every current alert,
+    /// including a persistent Critical, so the mandatory update warning is actually
+    /// visible during its five-second safety window; the displaced alert resumes from
+    /// the front of the backlog afterward.
     /// Otherwise, the incoming alert joins the back of the backlog.
     ///
     /// An OSD-tier toast passed here routes to [`flash_osd`](Self::flash_osd) — the
@@ -369,8 +370,8 @@ impl ToastHost {
         match &self.current {
             None => self.current = Some(Active::new(toast)),
             Some(cur)
-                if (incoming_operator_notice && cur.toast.is_ai_generated_alert())
-                    || ((incoming_critical || incoming_operator_notice)
+                if incoming_operator_notice
+                    || (incoming_critical
                         && !cur.is_critical()
                         && !cur.toast.is_ai_generated_alert()) =>
             {
@@ -1206,6 +1207,32 @@ mod tests {
     }
 
     #[test]
+    fn ai_generated_operator_notice_preempts_and_preserves_system_critical() {
+        let mut host = ToastHost::new();
+        host.enqueue(crit("health-monitor"));
+        host.enqueue(Toast::alert(
+            Severity::Warning,
+            "controller",
+            AI_GENERATED_ALERT_FLAG,
+            "Update begins in 5 seconds",
+        ));
+
+        assert!(
+            host.current().is_some_and(Toast::is_ai_generated_alert),
+            "the safety notice must not wait behind an UntilAck alert"
+        );
+        assert_eq!(host.backlog(), 1, "the displaced Critical remains queued");
+
+        host.tick(DWELL_WARNING);
+        assert!(host.has_critical(), "the displaced Critical must resume");
+        assert_eq!(
+            host.current().map(|toast| toast.source_host.as_str()),
+            Some("health-monitor")
+        );
+        assert_eq!(host.remaining(), None, "the Critical must retain UntilAck");
+    }
+
+    #[test]
     fn ai_generated_warning_preempts_an_ai_generated_critical() {
         let mut host = ToastHost::new();
         host.enqueue(Toast::alert(
@@ -1244,7 +1271,10 @@ mod tests {
         ));
 
         host.tick(DWELL_WARNING);
-        assert!(host.has_critical(), "the displaced Critical must return next");
+        assert!(
+            host.has_critical(),
+            "the displaced Critical must return next"
+        );
         assert_eq!(
             host.current().map(|toast| toast.headline.as_str()),
             Some("Previous operation requires acknowledgement")
@@ -1253,9 +1283,15 @@ mod tests {
 
         host.tick(Duration::from_secs(3600));
         host.dismiss();
-        assert!(host.has_critical(), "tick and dismiss cannot clear the Critical");
+        assert!(
+            host.has_critical(),
+            "tick and dismiss cannot clear the Critical"
+        );
         host.acknowledge();
-        assert!(host.current().is_none(), "acknowledgement clears the Critical");
+        assert!(
+            host.current().is_none(),
+            "acknowledgement clears the Critical"
+        );
     }
 
     // ── queue: dismiss + hover-pause ──────────────────────────────────────────
