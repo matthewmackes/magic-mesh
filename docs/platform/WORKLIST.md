@@ -393,6 +393,10 @@ remains here under a completed status.
   `9c9307cbbf4940c6c825165edf492386e0c4ca811d6637bd6a36975fcddad0f0`).
   This remains guest collection/static evidence, not live GPU/audio/performance
   acceptance.
+  The OpenTofu Browser VM contract now independently rejects undersized or
+  digestless direct declarations, binds SPICE to loopback, and keeps
+  host-dependent virtio 3D/OpenGL disabled by default until a capability
+  preflight proves the accelerated path on the target host.
   Live read-only audit on 2026-08-01
   found `.15` healthy but with no VM and no VNC/RDP/SPICE listener; Dell
   `.225` has shell services but no VDI listener, Eagle is unreachable, and

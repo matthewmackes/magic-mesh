@@ -58,6 +58,18 @@ variable "browser_rdp_password_hash" {
   default     = ""
 }
 
+variable "browser_gpu_acceleration" {
+  description = <<-EOT
+    Enable the Browser VM's virtio 3D/OpenGL libvirt overlay. Keep this false on
+    hosts whose libvirt capabilities do not advertise a usable render node and
+    OpenGL backend (including the historical Dell QXL/Pixman host); the guest
+    remains on the software-compatible virtio/SPICE path until a hardware
+    preflight proves the accelerated path is available.
+  EOT
+  type        = bool
+  default     = false
+}
+
 variable "android_base_image_source" {
   description = <<-EOT
     Source of the Debian base image the Android (Cuttlefish) L1 VMs clone from
@@ -160,6 +172,26 @@ variable "vms" {
       )
     ])
     error_message = "app_vm workloads require the typed wayland-standard guest declaration."
+  }
+
+  validation {
+    condition = alltrue([
+      for v in values(var.vms) : v.image != "browser-vm-chromium" || (
+        v.delivery_type == "desktop_vm"
+        && v.vcpu >= 4
+        && v.memory_mb >= 8192
+        && v.disk_gb >= 64
+        && can(regex("^sha256:[0-9A-Fa-f]{64}$", v.image_digest))
+      )
+    ])
+    error_message = "browser-vm-chromium workloads require delivery_type=desktop_vm, at least 4 vCPU/8192 MiB/64 GiB, and an immutable sha256:<64-hex> image_digest."
+  }
+
+  validation {
+    condition = alltrue([
+      for v in values(var.vms) : v.delivery_type == "desktop_vm" || v.image != "browser-vm-chromium"
+    ])
+    error_message = "browser-vm-chromium may only be declared as a Desktop VM workload."
   }
 }
 

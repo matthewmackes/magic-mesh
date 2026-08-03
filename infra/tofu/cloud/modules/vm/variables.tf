@@ -45,6 +45,12 @@ variable "browser_vm" {
   default     = false
 }
 
+variable "browser_gpu_acceleration" {
+  description = "Whether the Browser VM domain receives the host-dependent virtio 3D/OpenGL overlay."
+  type        = bool
+  default     = false
+}
+
 variable "app" {
   description = "Typed guest-owned App VM declaration; null for normal VM workloads."
   type = object({

@@ -128,15 +128,16 @@ module "browser_vm" {
   source   = "./modules/vm"
   for_each = local.browser_workloads
 
-  name           = each.key
-  vcpu           = each.value.vcpu
-  memory_mb      = each.value.memory_mb
-  disk_gb        = each.value.disk_gb
-  pool           = var.pool
-  base_volume_id = one(libvirt_volume.browser_base[*].id)
-  network_id     = module.network.network_id
-  user_data      = local.domain_user_data[each.key]
-  browser_vm     = true
+  name                     = each.key
+  vcpu                     = each.value.vcpu
+  memory_mb                = each.value.memory_mb
+  disk_gb                  = each.value.disk_gb
+  pool                     = var.pool
+  base_volume_id           = one(libvirt_volume.browser_base[*].id)
+  network_id               = module.network.network_id
+  user_data                = local.domain_user_data[each.key]
+  browser_vm               = true
+  browser_gpu_acceleration = var.browser_gpu_acceleration
 }
 
 # One dedicated App VM domain per typed guest-owned application declaration.

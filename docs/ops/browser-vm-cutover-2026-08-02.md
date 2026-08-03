@@ -20,6 +20,13 @@ SHA-256 `9c5d687c7fa378cb8cfe767bf0d46fb0f55a7889cf5c1eebc1bbfc8003a8c0c6`.
 `qemu-img info` reports a non-corrupt 10-GiB qcow2 with a 1.72-GiB compressed
 footprint. This is artifact readiness, not live guest or seat acceptance.
 
+The OpenTofu deployment contract now rejects direct Browser VM declarations
+that are not `desktop_vm`, 4 vCPU/8192 MiB/64 GiB, or bound to a full image
+digest. Browser domains bind SPICE to loopback. Host-dependent virtio
+3D/OpenGL is opt-in through `browser_gpu_acceleration`; the default is the
+2D virtio compatibility overlay because Dell's historical QEMU backend had no
+proven GL capability.
+
 The bounded live-proof runner now also supports the Browser VM's primary RDP
 path by invoking the existing ignored `mde-vdi-rdp` integration test. It records
 only the initial guest `FRAME OK` marker, bounded input observation, explicit

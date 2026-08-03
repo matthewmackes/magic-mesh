@@ -21,6 +21,8 @@ secrets.tf      the mde-seal → IaC bridge (external data source; item 3)
 outputs.tf      network_id + the instances roster (neutral CloudInstance shape)
 modules/network the libvirt_network on the Nebula-adjacent bridge (replaces Neutron)
 modules/vm      a CoW root volume + mesh-join cloud-init disk + the libvirt_domain
+                  Browser domains use a loopback SPICE listener; host-dependent
+                  virtio 3D/OpenGL is opt-in via `browser_gpu_acceleration`
 cloud-init/     the mesh-join cloud-init template (SEC-001 join path)
 scripts/        mde-seal-external.sh — the tofu external-data secrets bridge
 ```
@@ -64,3 +66,11 @@ tofu output instances
 `network_interface {}` / `graphics {}`). The 0.9.x line rewrote domain devices
 into a single `devices` attribute (a different, still-settling contract), so this
 root deliberately stays on 0.8.x; `.terraform.lock.hcl` is committed.
+
+The Browser VM OpenTofu path is fail-closed for direct IaC callers as well as
+the typed Workloads verb: a `browser-vm-chromium` workload must be a
+`desktop_vm` with at least 4 vCPU, 8192 MiB, 64 GiB, and a full
+`sha256:<64-hex>` image digest. `browser_gpu_acceleration` defaults to false
+because the historical Dell host has no proven GL render backend; enable it
+only after a live host capability preflight. SPICE is bound to `127.0.0.1` so
+the console broker remains the only remote path.

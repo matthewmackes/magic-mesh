@@ -9,6 +9,13 @@ libvirt_uri = "qemu:///system"
 # The base OS image every VM clones (bootc image-mode; extends packaging/bootc/).
 base_image_source = "/var/lib/libvirt/images/mde-base.qcow2"
 
+# Browser VM image path and host-dependent graphics mode. The Browser workload
+# itself must carry image = "browser-vm-chromium", disk_gb >= 64, and an
+# immutable sha256:<64-hex> image_digest. Leave acceleration disabled until a
+# host capability preflight proves a usable GL render node.
+browser_base_image_source = "/var/lib/libvirt/images/browser-vm-chromium.qcow2"
+browser_gpu_acceleration  = false
+
 # The cloud network on the Nebula-adjacent bridge (replaces Neutron).
 network = {
   name      = "mde-cloud"
@@ -22,6 +29,14 @@ network = {
 vms = {
   worker-a = { vcpu = 2, memory_mb = 4096, disk_gb = 20 }
   worker-b = { vcpu = 4, memory_mb = 8192, disk_gb = 40 }
+  # browser-vm = {
+  #   delivery_type = "desktop_vm"
+  #   vcpu = 4
+  #   memory_mb = 8192
+  #   disk_gb = 64
+  #   image = "browser-vm-chromium"
+  #   image_digest = "sha256:<artifact-sha256>"
+  # }
 }
 
 # Mesh-join parameters baked into each VM's cloud-init (SEC-001). The join TOKEN

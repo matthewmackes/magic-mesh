@@ -53,15 +53,20 @@ resource "libvirt_domain" "this" {
   }
 
   graphics {
-    type        = "spice"
-    listen_type = "address"
-    autoport    = true
+    type           = "spice"
+    listen_type    = "address"
+    listen_address = "127.0.0.1"
+    autoport       = true
   }
 
   dynamic "xml" {
     for_each = var.browser_vm ? [true] : []
     content {
-      xslt = file("${path.module}/browser-vm-domain.xsl")
+      xslt = file(
+        var.browser_gpu_acceleration
+        ? "${path.module}/browser-vm-domain.xsl"
+        : "${path.module}/browser-vm-domain-compat.xsl"
+      )
     }
   }
 }
