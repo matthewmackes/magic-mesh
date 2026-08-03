@@ -33,6 +33,9 @@ fail() {
 [ -f "$RUNTIME_UNIT" ] || fail "guest runtime unit is missing"
 bash -n "$PROFILE_VERIFY" "$VALIDATOR" "$ACTIVATION_VERIFY" "$ATTACH_VERIFY" "$IMAGE_BUILD" "$IMAGE_VERIFY" "$0"
 sh -n "$RUNTIME" "$XRDP_STARTWM" "$SESSION"
+grep -Fq 'runtime-evidence.json' "$RUNTIME" || fail "guest runtime does not emit bounded evidence"
+grep -Fq 'audio_status=wired' "$RUNTIME" || fail "guest runtime omits typed audio wiring status"
+grep -Fq 'gpu_status=passed' "$RUNTIME" || fail "guest runtime omits VA-API status"
 "$IMAGE_VERIFY" --self-test >/dev/null
 "$PROFILE_VERIFY" "$PROFILE" >/dev/null
 "$ACTIVATION_VERIFY" >/dev/null

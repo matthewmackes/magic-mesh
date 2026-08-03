@@ -380,6 +380,16 @@ remains here under a completed status.
   a BigBoy rootless rebuild tagged
   `localhost/magic-mesh-browser-vm-chromium:provenance-20260803` passed that
   verifier (image ID `3768fd23fbffc8cb5da5698d9729912373de83a50d9a36d2acad7088a20adaf2`).
+  The guest runtime now emits a root-owned, mode-0600 bounded
+  `runtime-evidence.json` record containing transport health, VA-API status,
+  and PipeWire endpoint counts; `audio_status=wired` is explicitly endpoint
+  wiring evidence, not proof of audible Chromium playback/capture or recovery.
+  The focused runtime contract passes locally and the refreshed BigBoy image
+  tagged `localhost/magic-mesh-browser-vm-chromium:runtime-evidence-20260803`
+  passes static verification (image ID
+  `9c9307cbbf4940c6c825165edf492386e0c4ca811d6637bd6a36975fcddad0f0`).
+  This remains guest collection/static evidence, not live GPU/audio/performance
+  acceptance.
   Live read-only audit on 2026-08-01
   found `.15` healthy but with no VM and no VNC/RDP/SPICE listener; Dell
   `.225` has shell services but no VDI listener, Eagle is unreachable, and

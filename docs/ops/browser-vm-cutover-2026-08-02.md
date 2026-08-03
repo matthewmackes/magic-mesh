@@ -64,6 +64,16 @@ match `profile.env`. A BigBoy rootless rebuild tagged
 This is container provenance evidence, not qcow2 publication or live guest
 acceptance.
 
+The guest runtime now also emits a root-owned, mode-0600 bounded
+`/var/lib/mcnf-browser/runtime-evidence.json` record with transport health,
+VA-API status, and PipeWire playback/capture endpoint counts. `audio_status=wired`
+means endpoint wiring only; it does not claim audible Chromium playback,
+capture, or recovery. The refreshed BigBoy image tagged
+`localhost/magic-mesh-browser-vm-chromium:runtime-evidence-20260803` passed
+static verification (image ID
+`9c9307cbbf4940c6c825165edf492386e0c4ca811d6637bd6a36975fcddad0f0`). This is
+guest collection/static evidence, not live GPU/audio/performance acceptance.
+
 ## Landed
 
 - `magic-mesh-browser-stack` is public and history-bearing at

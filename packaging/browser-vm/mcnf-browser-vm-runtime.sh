@@ -68,8 +68,10 @@ log "using Chromium binary $chromium_bin"
 # device permissions, so these diagnostics are intentionally image-owned and
 # best-effort. They never gate startup or accept host-provided commands.
 gpu_probe=/var/lib/mcnf-browser/gpu-vainfo.log
+gpu_status=unavailable
 if [ -n "$render_node" ] && command -v vainfo >/dev/null 2>&1; then
     if vainfo --display drm --device "$render_node" >"$gpu_probe" 2>&1; then
+        gpu_status=passed
         chmod 0600 "$gpu_probe"
         log 'VA-API probe passed for the Browser user'
     else
@@ -83,16 +85,39 @@ elif command -v vainfo >/dev/null 2>&1; then
 fi
 
 media_probe=/var/lib/mcnf-browser/pipewire-probe.log
+audio_sinks=''
+audio_sources=''
 {
     printf '%s\n' '=== pw-cli info ==='
     pw-cli info 2>&1 || true
     printf '%s\n' '=== pactl sinks ==='
-    pactl list short sinks 2>&1 || true
+    audio_sinks=$(pactl list short sinks 2>/dev/null || true)
+    printf '%s\n' "$audio_sinks"
     printf '%s\n' '=== pactl sources ==='
-    pactl list short sources 2>&1 || true
+    audio_sources=$(pactl list short sources 2>/dev/null || true)
+    printf '%s\n' "$audio_sources"
 } >"$media_probe"
 chmod 0600 "$media_probe"
 log 'PipeWire/Pulse compatibility diagnostics captured'
+
+# This bounded record is guest-owned evidence for later operator collection.
+# `audio_status=wired` means that both a playback and capture endpoint were
+# visible to the guest session; it deliberately does not claim audible
+# Chromium playback, capture, or recovery. The raw diagnostics remain private
+# to the Browser user and never cross the Workloads/session wire.
+audio_sink_count=$(printf '%s\n' "$audio_sinks" | awk 'NF { count++ } END { print count + 0 }')
+audio_source_count=$(printf '%s\n' "$audio_sources" | awk 'NF { count++ } END { print count + 0 }')
+audio_status=unavailable
+if [ "$audio_sink_count" -gt 0 ] && [ "$audio_source_count" -gt 0 ]; then
+    audio_status=wired
+fi
+runtime_evidence=/var/lib/mcnf-browser/runtime-evidence.json
+recorded_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+cat >"$runtime_evidence" <<EOF
+{"schema_version":1,"kind":"browser_vm_runtime_evidence","profile":"browser-vm-chromium","image":"browser-vm-chromium","transport":"$transport","transport_health":"$(cat "$input_root/transport-health")","gpu_status":"$gpu_status","audio_status":"$audio_status","audio_playback_endpoints":$audio_sink_count,"audio_capture_endpoints":$audio_source_count,"recorded_at":"$recorded_at"}
+EOF
+chmod 0600 "$runtime_evidence"
+log "bounded runtime evidence written: gpu=$gpu_status audio=$audio_status"
 
 mkdir -p "$HOME/.config/sway"
 cat > "$HOME/.config/sway/config" <<'EOF'
