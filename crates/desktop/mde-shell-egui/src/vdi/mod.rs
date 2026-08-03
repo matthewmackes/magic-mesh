@@ -1163,6 +1163,12 @@ pub(crate) struct VdiMetricsSnapshot {
     pub(crate) last_frame_interval_us: Option<u64>,
     pub(crate) last_frame_to_upload_us: Option<u64>,
     pub(crate) last_upload_us: Option<u64>,
+    /// The shell process' share of aggregate host CPU time, in thousandths of
+    /// one host-wide CPU (100_000 = 100%). This is host load, never guest load.
+    pub(crate) last_host_process_cpu_permille: Option<u32>,
+    /// The first DRM render device's reported busy percentage, in thousandths
+    /// (100_000 = 100%). Missing sysfs telemetry stays `None`.
+    pub(crate) last_host_gpu_busy_permille: Option<u32>,
 }
 
 #[derive(Debug, Default)]
@@ -1170,6 +1176,113 @@ struct VdiMetrics {
     snapshot: VdiMetricsSnapshot,
     previous_frame_at: Option<std::time::Instant>,
     queued_frame_at: Option<std::time::Instant>,
+    host_load: HostLoadSampler,
+}
+
+/// Best-effort host-side load sampler for the VDI diagnostics seam. It reads
+/// only procfs/sysfs counters, is throttled to four samples per second, and
+/// never turns missing host telemetry into a guest capability claim.
+#[derive(Debug, Default)]
+struct HostLoadSampler {
+    sampled_at: Option<std::time::Instant>,
+    previous_process_ticks: Option<u64>,
+    previous_total_ticks: Option<u64>,
+}
+
+impl HostLoadSampler {
+    fn sample(&mut self, snapshot: &mut VdiMetricsSnapshot) {
+        let now = std::time::Instant::now();
+        if self.sampled_at.is_some_and(|previous| {
+            now.duration_since(previous) < std::time::Duration::from_millis(250)
+        }) {
+            return;
+        }
+        self.sampled_at = Some(now);
+
+        let process_ticks = std::fs::read_to_string("/proc/self/stat")
+            .ok()
+            .and_then(|stat| parse_process_cpu_ticks(&stat));
+        let total_ticks = std::fs::read_to_string("/proc/stat")
+            .ok()
+            .and_then(|stat| {
+                stat.lines()
+                    .find(|line| line.starts_with("cpu "))
+                    .map(str::to_owned)
+            })
+            .and_then(|line| parse_total_cpu_ticks(&line));
+        if let (Some(process_ticks), Some(total_ticks)) = (process_ticks, total_ticks) {
+            if let (Some(previous_process), Some(previous_total)) =
+                (self.previous_process_ticks, self.previous_total_ticks)
+            {
+                let process_delta = process_ticks.saturating_sub(previous_process);
+                let total_delta = total_ticks.saturating_sub(previous_total);
+                if total_delta > 0 {
+                    snapshot.last_host_process_cpu_permille = Some(
+                        u32::try_from(
+                            process_delta
+                                .saturating_mul(100_000)
+                                .checked_div(total_delta)
+                                .unwrap_or(0)
+                                .min(100_000),
+                        )
+                        .unwrap_or(100_000),
+                    );
+                }
+            }
+            self.previous_process_ticks = Some(process_ticks);
+            self.previous_total_ticks = Some(total_ticks);
+        }
+        snapshot.last_host_gpu_busy_permille = read_host_gpu_busy_permille();
+    }
+}
+
+fn parse_process_cpu_ticks(stat: &str) -> Option<u64> {
+    // `/proc/<pid>/stat` has a parenthesized command that may contain spaces;
+    // the fields after its final ')' start at field 3 (state), making utime
+    // field 14 and stime field 15 offsets 11 and 12 in this suffix.
+    let fields = stat
+        .rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    let user = fields.get(11)?.parse::<u64>().ok()?;
+    let system = fields.get(12)?.parse::<u64>().ok()?;
+    user.checked_add(system)
+}
+
+fn parse_total_cpu_ticks(line: &str) -> Option<u64> {
+    let mut fields = line.split_whitespace();
+    if fields.next()? != "cpu" {
+        return None;
+    }
+    fields.try_fold(0_u64, |total, field| {
+        total.checked_add(field.parse::<u64>().ok()?)
+    })
+}
+
+fn read_host_gpu_busy_permille() -> Option<u32> {
+    let mut highest = None;
+    let entries = std::fs::read_dir("/sys/class/drm").ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("card") || name.contains('-') {
+            continue;
+        }
+        let Ok(value) =
+            std::fs::read_to_string(entry.path().join("device/gpu_busy_percent"))
+        else {
+            continue;
+        };
+        let Ok(percent) = value.trim().parse::<u32>() else {
+            continue;
+        };
+        if percent <= 100 {
+            let permille = percent.saturating_mul(1_000);
+            highest = Some(highest.map_or(permille, |current: u32| current.max(permille)));
+        }
+    }
+    highest
 }
 
 impl VdiMetrics {
@@ -1214,6 +1327,7 @@ impl VdiMetrics {
 
     fn note_shell_repaint(&mut self) {
         self.snapshot.shell_repaints = self.snapshot.shell_repaints.saturating_add(1);
+        self.host_load.sample(&mut self.snapshot);
     }
 }
 

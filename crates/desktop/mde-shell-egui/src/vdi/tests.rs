@@ -859,6 +859,22 @@ fn vdi_metrics_capture_frame_damage_upload_and_repaint_activity() {
 }
 
 #[test]
+fn vdi_host_load_parsers_are_bounded_and_use_proc_field_offsets() {
+    // The command name may contain spaces and ')' characters; parsing after
+    // the final ')' must still select fields 14 and 15 from procfs.
+    let stat = "42 (browser worker) odd) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15";
+    assert_eq!(parse_process_cpu_ticks(stat), Some(23));
+    assert_eq!(parse_process_cpu_ticks("malformed"), None);
+
+    assert_eq!(
+        parse_total_cpu_ticks("cpu 10 20 30 40 50 60 70 80"),
+        Some(360)
+    );
+    assert_eq!(parse_total_cpu_ticks("notcpu 1 2 3"), None);
+    assert_eq!(parse_total_cpu_ticks("cpu no-number"), None);
+}
+
+#[test]
 fn a_live_rdp_session_frame_flows_to_the_texture() {
     // Proves the shell is a real caller of `mde-vdi-rdp`: a fresh session marks
     // its framebuffer dirty, so the panel pulls a `frame()` and uploads it with
