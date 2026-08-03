@@ -1,7 +1,7 @@
 # WL-ARCH-008 — immutable Chromium Browser VM guest image.
 # The image owns Chromium, Wayland, GPU/audio/input plumbing, and the runtime.
 
-ARG BROWSER_VM_BASE=quay.io/fedora/fedora-bootc@sha256:effcf2fc509730f77a2e362534afc899ac5a5402a4acb2c30ae0a2f731b00ba4
+ARG BROWSER_VM_BASE=quay.io/fedora/fedora-bootc@sha256:4d3600c36e461f77af144750fb7c199f8c80f1c987bad492def4215dcf1bbf7f
 FROM ${BROWSER_VM_BASE}
 
 ARG MCNF_RPM_LANE=repo
