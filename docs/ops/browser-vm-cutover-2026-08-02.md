@@ -5,6 +5,18 @@ not a second active worklist.
 
 ## Current state — 2026-08-03
 
+Dell's post-reboot alert preemption retest at 16:27 EDT published receipt
+`01KZ4MX1CN3FM5A5MY3K4XNDMH` from production-feature shell SHA-256
+`00861ae83731d8498f85db8631d4ccff79adef7d55e07cbc3b2c1c67592441be`.
+Three persistent system-Critical receipts for Eagle, Surface, and seat 15 were
+immediately ahead of it on the live alert lane. Commit `880814fa` makes the
+deployment notice preempt any current alert while preserving the displaced
+Critical to resume; all 277 `mde-egui` tests pass, including that exact queue
+case and the centered/constrained geometry. The shell remained active with PID
+3369 and zero restarts, while `browser-vm` and RDP remained reachable. This
+proves the live delivery and preemption path; physical screen presentation
+still requires operator observation.
+
 Dell alert retest at 12:16 EDT published urgent receipt
 `01KZ46JC1GQYBKP69G797ZF58J` with the exact `AI-GENERATED-ALERT` flag and
 headline `DELL ALERT RETEST: centered red alert and sound.` The receipt is
