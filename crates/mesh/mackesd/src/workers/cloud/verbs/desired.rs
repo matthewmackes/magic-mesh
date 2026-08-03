@@ -25,7 +25,7 @@ use std::path::Path;
 use mackes_mesh_types::cloud::{CloudReply, WorkloadSpec};
 
 use super::super::reconcile;
-use super::super::runner::default_libvirt_uri;
+use super::super::runner::{default_browser_vm_image_source, default_libvirt_uri};
 use super::super::CloudWorker;
 
 /// Maximum wire body accepted by the desired-state mutation and authorization
@@ -368,6 +368,7 @@ pub(crate) fn handle_plan(w: &CloudWorker, verb_name: &str, body_str: &str) -> C
         &w.state_root,
         node,
         &default_libvirt_uri(),
+        &default_browser_vm_image_source(),
     ) {
         Ok(counts) => CloudReply {
             ok: true,

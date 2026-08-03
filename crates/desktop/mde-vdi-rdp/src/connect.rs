@@ -59,6 +59,7 @@ use ironrdp_pdu::input::mouse_x::PointerXFlags;
 use ironrdp_pdu::input::{MousePdu, MouseXPdu};
 use ironrdp_pdu::rdp::capability_sets::MajorPlatformType;
 use ironrdp_pdu::rdp::client_info::TimezoneInfo;
+use ironrdp_rdpsnd::client::Rdpsnd;
 use ironrdp_session::image::DecodedImage;
 use ironrdp_session::{ActiveStage, ActiveStageOutput, SessionError};
 use ironrdp_tokio::{
@@ -66,6 +67,9 @@ use ironrdp_tokio::{
 };
 use tokio::net::TcpStream;
 
+use crate::audio::{
+    PendingWave, PipeWireRdpsndHandler, PreparedAudio, RdpAudioCapability, RdpAudioStats,
+};
 use crate::config::RdpConfig;
 use crate::input::{MouseButton, RdpInputEvent};
 use crate::link::QualityTier;
@@ -222,6 +226,9 @@ pub struct Negotiated {
     /// CLIPRDR is active; this remains an explicit typed unsupported report
     /// until the wire processor is present.
     pub clipboard: VdiClipboardStatus,
+    /// Typed audio capability snapshot taken when the connection was built.
+    /// Use [`RdpConnection::audio_capability`] for the live state.
+    pub audio: RdpAudioCapability,
 }
 
 /// A detected TLS-certificate change for a host that was already pinned
@@ -453,6 +460,7 @@ pub struct RdpConnection {
     active_stage: ActiveStage,
     image: DecodedImage,
     negotiated: Negotiated,
+    audio: PreparedAudio,
     /// A TLS-certificate change detected against the trust-on-first-use pin at
     /// connect time (vdi-vm-6). `Some` only on a non-strict connect whose
     /// fingerprint differed from the pin — the shell surfaces it as a warning.
@@ -477,6 +485,9 @@ impl RdpConnection {
         let config = connector_config_for(session.config(), &settings);
         let host = session.config().host.clone();
         let port = session.config().port;
+        let mut audio = PreparedAudio::new();
+        let initial_audio = audio.initial_capability;
+        let audio_handler = audio.handler.take();
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -484,7 +495,7 @@ impl RdpConnection {
             .map_err(ConnectError::Runtime)?;
 
         let (framed, connection_result, cert_pin_change) =
-            runtime.block_on(Self::handshake(config, &host, port))?;
+            runtime.block_on(Self::handshake(config, &host, port, audio_handler))?;
 
         let negotiated = Negotiated {
             desktop_size: (
@@ -496,6 +507,7 @@ impl RdpConnection {
             io_channel_id: connection_result.io_channel_id,
             user_channel_id: connection_result.user_channel_id,
             clipboard: rdp_clipboard_status(),
+            audio: initial_audio,
         };
         tracing::info!(
             desktop_width = negotiated.desktop_size.0,
@@ -522,6 +534,7 @@ impl RdpConnection {
             active_stage,
             image,
             negotiated,
+            audio,
             cert_pin_change,
             started: Instant::now(),
         })
@@ -530,9 +543,10 @@ impl RdpConnection {
     /// The connection sequence proper, on the runtime. Split out so every
     /// phase shares the one [`CONNECT_TIMEOUT`] policy.
     async fn handshake(
-        config: ironrdp_connector::Config,
+        mut config: ironrdp_connector::Config,
         host: &str,
         port: u16,
+        audio_handler: Option<PipeWireRdpsndHandler>,
     ) -> Result<
         (
             TlsFramed,
@@ -556,7 +570,11 @@ impl RdpConnection {
         })?;
 
         let mut framed = TokioFramed::new(stream);
+        config.enable_audio_playback = audio_handler.is_some();
         let mut connector = ClientConnector::new(config, client_addr);
+        if let Some(handler) = audio_handler {
+            connector.attach_static_channel(Rdpsnd::new(Box::new(handler)));
+        }
 
         let should_upgrade =
             tokio::time::timeout(CONNECT_TIMEOUT, connect_begin(&mut framed, &mut connector))
@@ -684,6 +702,19 @@ impl RdpConnection {
         &self.negotiated
     }
 
+    /// The current typed audio capability. Endpoint wiring and validated PCM
+    /// delivery are distinct from a capture-based audible-playback proof.
+    #[must_use]
+    pub fn audio_capability(&self) -> RdpAudioCapability {
+        self.audio.capability()
+    }
+
+    /// Snapshot bounded RDPSND/PipeWire counters without exposing audio data.
+    #[must_use]
+    pub fn audio_stats(&self) -> RdpAudioStats {
+        self.audio.stats()
+    }
+
     /// A TLS-certificate change detected against the trust-on-first-use pin at
     /// connect time (vdi-vm-6), or `None` if the cert was first-use or unchanged.
     /// The shell surfaces this as a non-fatal MITM warning; in strict mode the
@@ -782,6 +813,29 @@ impl RdpConnection {
         Ok(PumpOutcome::Processed { painted_rects })
     }
 
+    /// Validate each RDPSND wave against the server's actual format table
+    /// before handing bytes to the fixed-format host sink.  The upstream
+    /// handler receives only a server format index, so this check belongs at
+    /// the active-stage seam where the concrete `Rdpsnd` processor is visible.
+    fn flush_pending_audio(&mut self) {
+        for PendingWave { format_no, data } in self.audio.take_pending() {
+            let Some(format_no) = u16::try_from(format_no).ok() else {
+                self.audio.reject_shared_format();
+                continue;
+            };
+            let shared = self
+                .active_stage
+                .get_svc_processor::<Rdpsnd>()
+                .and_then(|rdpsnd| rdpsnd.get_format(format_no).ok())
+                .is_some_and(|format| format == &crate::audio::supported_format());
+            if shared {
+                self.audio.deliver_pcm(data);
+            } else {
+                self.audio.reject_shared_format();
+            }
+        }
+    }
+
     /// Read and process **one** inbound PDU (bounded by `timeout`): decode
     /// graphics into the session framebuffer, answer protocol pings, and feed
     /// the session's link probes ([`RdpSession::record_frame`] on data,
@@ -824,6 +878,7 @@ impl RdpConnection {
             .active_stage
             .process(&mut self.image, action, &frame)
             .map_err(ConnectError::Session)?;
+        self.flush_pending_audio();
         self.apply_outputs(session, outputs)
     }
 
@@ -875,6 +930,7 @@ mod tests {
     use super::{
         connector_config_for, push_fastpath_events, CertPinChange, ConnectError, PumpOutcome,
     };
+    use crate::audio::{RdpAudioCapability, RdpAudioUnsupportedReason};
     use crate::config::RdpConfig;
     use crate::input::{MouseButton, RdpInputEvent, Scancode};
     use crate::link::QualityTier;
@@ -922,6 +978,21 @@ mod tests {
         assert_eq!(minimal_bitmap.color_depth, 15, "the connector's floor");
         assert!(minimal_bitmap.codecs.0.is_empty(), "no RemoteFX on Minimal");
         assert_eq!(minimal.compression_type, Some(CompressionType::Rdp61));
+    }
+
+    #[test]
+    fn connector_does_not_advertise_audio_without_an_rdpsnd_sink() {
+        let cfg = RdpConfig::new("host", "operator", "hunter2");
+        let settings = RdpTierSettings::for_tier(QualityTier::Full);
+        let connector = connector_config_for(&cfg, &settings);
+        assert!(!connector.enable_audio_playback);
+
+        let capability = RdpAudioCapability::current();
+        assert!(!capability.can_claim_acceptance());
+        assert_eq!(
+            capability.unsupported_reason(),
+            Some(RdpAudioUnsupportedReason::NoHostPlaybackSink)
+        );
     }
 
     #[test]

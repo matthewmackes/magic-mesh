@@ -533,10 +533,16 @@ pub(crate) fn rendered_tfvars_for_node(
     state_root: &Path,
     node: &str,
     libvirt_uri: &str,
+    browser_base_image_source: &str,
 ) -> Result<String, String> {
     path_key::segment("node", node)?;
     let specs = read_desired_slice_strict(state_root, node)?;
-    Ok(render::render_tfvars(node, &specs, libvirt_uri))
+    Ok(render::render_tfvars(
+        node,
+        &specs,
+        libvirt_uri,
+        browser_base_image_source,
+    ))
 }
 
 /// Render node `node`'s desired slice into tfvars and shell `tofu plan -json`
@@ -550,8 +556,14 @@ pub(crate) fn plan_counts_for_node(
     state_root: &Path,
     node: &str,
     libvirt_uri: &str,
+    browser_base_image_source: &str,
 ) -> Result<PlanCounts, String> {
-    let tfvars = rendered_tfvars_for_node(state_root, node, libvirt_uri)?;
+    let tfvars = rendered_tfvars_for_node(
+        state_root,
+        node,
+        libvirt_uri,
+        browser_base_image_source,
+    )?;
     let ndjson = runner.plan_json(&tfvars)?;
     render::parse_plan_counts(&ndjson)
 }
@@ -624,6 +636,7 @@ pub(crate) fn drift_snapshot(
     state_root: &Path,
     node: &str,
     libvirt_uri: &str,
+    browser_base_image_source: &str,
     now_ms: i64,
 ) -> (Vec<WorkloadRow>, DriftSummary) {
     let specs = read_desired_slice(state_root, node);
@@ -637,7 +650,13 @@ pub(crate) fn drift_snapshot(
         );
     }
     let roster = runner.list_instances().unwrap_or_default();
-    let drift = match plan_counts_for_node(runner, state_root, node, libvirt_uri) {
+    let drift = match plan_counts_for_node(
+        runner,
+        state_root,
+        node,
+        libvirt_uri,
+        browser_base_image_source,
+    ) {
         Ok(counts) => drift_flag_from_plan(counts),
         // A plan we couldn't run leaves drift indeterminate — never a faked in-sync.
         Err(_) => DriftFlag::Unknown,
@@ -657,6 +676,7 @@ pub(crate) fn drift_snapshot(
 #[cfg(test)]
 mod tests {
     use super::super::runner::fake::{instance, FakeRunner};
+    use super::super::runner::DEFAULT_BROWSER_VM_IMAGE_SOURCE;
     use super::*;
     use mackes_mesh_types::cloud::DeliveryType;
 
@@ -886,7 +906,13 @@ mod tests {
         std::fs::write(&canonical, br#"{"name":"web","node":"eagle"}"#).unwrap();
         let runner = FakeRunner::default();
 
-        let err = plan_counts_for_node(&runner, root, "eagle", "qemu:///system")
+        let err = plan_counts_for_node(
+            &runner,
+            root,
+            "eagle",
+            "qemu:///system",
+            DEFAULT_BROWSER_VM_IMAGE_SOURCE,
+        )
             .expect_err("a malformed desired document must gate reconciliation");
         assert!(
             err.contains("malformed desired document"),
@@ -906,7 +932,12 @@ mod tests {
         let canonical = desired_doc_path(root, "eagle", "web").unwrap();
         std::fs::write(&canonical, br#"{"name":"web","node":"eagle"}"#).unwrap();
 
-        let err = rendered_tfvars_for_node(root, "eagle", "qemu:///system")
+        let err = rendered_tfvars_for_node(
+            root,
+            "eagle",
+            "qemu:///system",
+            DEFAULT_BROWSER_VM_IMAGE_SOURCE,
+        )
             .expect_err("a malformed desired document must gate live rendering");
         assert!(
             err.contains("malformed desired document"),
@@ -977,7 +1008,14 @@ mod tests {
     fn drift_snapshot_of_an_empty_slice_is_honestly_zero() {
         let tmp = tempfile::tempdir().unwrap();
         let runner = FakeRunner::default();
-        let (rows, summary) = drift_snapshot(&runner, tmp.path(), "eagle", "qemu:///system", 100);
+        let (rows, summary) = drift_snapshot(
+            &runner,
+            tmp.path(),
+            "eagle",
+            "qemu:///system",
+            DEFAULT_BROWSER_VM_IMAGE_SOURCE,
+            100,
+        );
         assert!(rows.is_empty());
         assert_eq!(summary.drift_count, 0);
         assert_eq!(summary.last_plan_ms, 100);
@@ -995,7 +1033,14 @@ mod tests {
             ),
             ..Default::default()
         };
-        let (rows, summary) = drift_snapshot(&runner, tmp.path(), "eagle", "qemu:///system", 200);
+        let (rows, summary) = drift_snapshot(
+            &runner,
+            tmp.path(),
+            "eagle",
+            "qemu:///system",
+            DEFAULT_BROWSER_VM_IMAGE_SOURCE,
+            200,
+        );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].drift, DriftFlag::Drift);
         assert_eq!(summary.drift_count, 1);
@@ -1014,7 +1059,14 @@ mod tests {
             plan_err: Some("tofu: command not found".into()),
             ..Default::default()
         };
-        let (rows, summary) = drift_snapshot(&runner, tmp.path(), "eagle", "qemu:///system", 300);
+        let (rows, summary) = drift_snapshot(
+            &runner,
+            tmp.path(),
+            "eagle",
+            "qemu:///system",
+            DEFAULT_BROWSER_VM_IMAGE_SOURCE,
+            300,
+        );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].drift, DriftFlag::Unknown);
         assert_eq!(summary.drift_count, 0, "indeterminate is not zero-drift");

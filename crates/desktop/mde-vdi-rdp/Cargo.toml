@@ -48,13 +48,24 @@ ironrdp-graphics = "0.8"
 ironrdp-session = "0.10"
 ironrdp-input = "0.6"
 
+# RDPSND client processor (SNDC_FORMATS/WAVE/WAVE2) for the live audio path.
+[dependencies.ironrdp-rdpsnd]
+version = "=0.8.0"
+optional = true
+
 [features]
 default = []
 # E12-4: the live connection sequence (`connect.rs`) — drives the IronRDP
 # connector→session state machines over a real Nebula TCP link with TLS + CredSSP.
 # It needs a server to exercise, so it is OFF by default; the unit-tested
 # egui-facing surface (decode + input PDU build) never depends on it.
-live-connect = ["dep:ironrdp-async", "dep:ironrdp-tokio", "dep:ironrdp-tls", "dep:tokio"]
+live-connect = [
+    "dep:ironrdp-async",
+    "dep:ironrdp-tokio",
+    "dep:ironrdp-tls",
+    "dep:ironrdp-rdpsnd",
+    "dep:tokio",
+]
 
 [dependencies.ironrdp-async]
 version = "0.9"

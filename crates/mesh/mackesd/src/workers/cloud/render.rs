@@ -21,16 +21,22 @@ pub(crate) const TFVARS_LIBVIRT_URI: &str = "libvirt_uri";
 /// The tfvars key carrying the per-node `for_each` workload map (`var.vms`).
 pub(crate) const TFVARS_VMS: &str = "vms";
 
+/// The tfvars key carrying the host-local Browser VM qcow2 source.
+pub(crate) const TFVARS_BROWSER_BASE_IMAGE_SOURCE: &str = "browser_base_image_source";
+
 /// Render placement node `node`'s desired-state `specs` into the
 /// `terraform.tfvars.json` document string the `infra/tofu/cloud` root consumes.
 ///
-/// The document is a JSON object of exactly the two per-node-varying variables:
+/// The document is a JSON object of the per-node-varying variables plus the
+/// explicit host-local Browser VM artifact source:
 ///
 /// - `libvirt_uri` — the placement node's local hypervisor URI, so a remote apply
 ///   drives the right host;
 /// - `vms` — a `for_each`-shaped map keyed by workload name, each value the
 ///   per-delivery-type shape `var.vms` declares (`delivery_type` / `vcpu` /
 ///   `memory_mb` / `disk_gb` / `image` / `network_isolation`).
+/// - `browser_base_image_source` — the placement host's immutable Browser VM
+///   qcow2 source, kept out of Workloads/guest state.
 ///
 /// Only specs actually placed on `node` are rendered (a defensive re-slice — the
 /// caller already reads the per-node desired dir), so a stray cross-node doc never
@@ -38,7 +44,12 @@ pub(crate) const TFVARS_VMS: &str = "vms";
 /// name-sorted order via `serde_json`'s ordered object, so a re-render of an
 /// unchanged slice is byte-identical (no spurious drift).
 #[must_use]
-pub(crate) fn render_tfvars(node: &str, specs: &[WorkloadSpec], libvirt_uri: &str) -> String {
+pub(crate) fn render_tfvars(
+    node: &str,
+    specs: &[WorkloadSpec],
+    libvirt_uri: &str,
+    browser_base_image_source: &str,
+) -> String {
     use std::collections::BTreeMap;
 
     let node = node.trim();
@@ -78,6 +89,7 @@ pub(crate) fn render_tfvars(node: &str, specs: &[WorkloadSpec], libvirt_uri: &st
     let doc = serde_json::json!({
         TFVARS_LIBVIRT_URI: libvirt_uri,
         TFVARS_VMS: vms,
+        TFVARS_BROWSER_BASE_IMAGE_SOURCE: browser_base_image_source,
     });
     // Pretty so a persisted tfvars.json reads cleanly + diffs sanely; falls back to
     // a compact form only if pretty-printing somehow fails (it cannot for this
@@ -165,9 +177,18 @@ mod tests {
             // A stray spec placed on another node is defensively excluded.
             spec("elsewhere", "otter", DeliveryType::ServiceVm),
         ];
-        let doc = render_tfvars("eagle", &specs, "qemu:///system");
+        let doc = render_tfvars(
+            "eagle",
+            &specs,
+            "qemu:///system",
+            super::super::runner::DEFAULT_BROWSER_VM_IMAGE_SOURCE,
+        );
         let v: serde_json::Value = serde_json::from_str(&doc).expect("valid json");
         assert_eq!(v[TFVARS_LIBVIRT_URI], "qemu:///system");
+        assert_eq!(
+            v[TFVARS_BROWSER_BASE_IMAGE_SOURCE],
+            super::super::runner::DEFAULT_BROWSER_VM_IMAGE_SOURCE
+        );
         let vms = v[TFVARS_VMS].as_object().expect("vms object");
         assert_eq!(vms.len(), 2, "only eagle's two specs render");
         assert!(vms.contains_key("web") && vms.contains_key("phone"));
@@ -193,8 +214,18 @@ mod tests {
             spec("b", "n", DeliveryType::ServiceVm),
         ];
         assert_eq!(
-            render_tfvars("n", &a, "qemu:///system"),
-            render_tfvars("n", &b, "qemu:///system"),
+            render_tfvars(
+                "n",
+                &a,
+                "qemu:///system",
+                super::super::runner::DEFAULT_BROWSER_VM_IMAGE_SOURCE,
+            ),
+            render_tfvars(
+                "n",
+                &b,
+                "qemu:///system",
+                super::super::runner::DEFAULT_BROWSER_VM_IMAGE_SOURCE,
+            ),
             "the map is name-sorted so a re-render is byte-identical"
         );
     }
@@ -216,7 +247,12 @@ mod tests {
             app,
         );
         let value: serde_json::Value =
-            serde_json::from_str(&render_tfvars("eagle", &[spec], "qemu:///system"))
+            serde_json::from_str(&render_tfvars(
+                "eagle",
+                &[spec],
+                "qemu:///system",
+                super::super::runner::DEFAULT_BROWSER_VM_IMAGE_SOURCE,
+            ))
                 .expect("valid tfvars");
         let app = &value[TFVARS_VMS]["appvm-writer"]["app"];
         assert_eq!(app["app_id"], "org.example.Writer");
@@ -225,6 +261,28 @@ mod tests {
         assert_eq!(app["session_id"], "app-session-7");
         assert_eq!(app["resume"], true);
         assert_eq!(value[TFVARS_VMS]["appvm-writer"]["image"], "app-vm-wayland-standard");
+    }
+
+    #[test]
+    fn render_propagates_browser_artifact_source_and_digest() {
+        let digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let mut spec = mackes_mesh_types::cloud::BrowserVmProfile::default()
+            .workload_spec("eagle", "browser-vm");
+        spec.image_digest = Some(digest.to_string());
+        let value: serde_json::Value = serde_json::from_str(&render_tfvars(
+            "eagle",
+            &[spec],
+            "qemu:///system",
+            "/srv/browser/disk.qcow2",
+        ))
+        .expect("valid tfvars");
+
+        assert_eq!(
+            value[TFVARS_BROWSER_BASE_IMAGE_SOURCE],
+            "/srv/browser/disk.qcow2"
+        );
+        assert_eq!(value[TFVARS_VMS]["browser-vm"]["image"], "browser-vm-chromium");
+        assert_eq!(value[TFVARS_VMS]["browser-vm"]["image_digest"], digest);
     }
 
     #[test]

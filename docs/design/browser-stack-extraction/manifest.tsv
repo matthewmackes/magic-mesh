@@ -1,6 +1,6 @@
 # browser-stack-extraction-manifest v1
-# source_commit=993614422260c382fa23a997ffc4e142402a3639
-# source_commit_date=2026-08-02T23:10:33-04:00
+# source_commit=aabeebb5d7d79044a8fd639564c1a5f776ef4741
+# source_commit_date=2026-08-03T01:24:37-04:00
 # source_branch=agent/drain-worklist-20260725
 # source_remote=https://github.com/matthewmackes/magic-mesh.git
 # extraction_destination=matthewmackes/magic-mesh-browser-stack
@@ -32,6 +32,7 @@ mixed-purpose	crates/mesh/mackesd/Cargo.toml	split-in-magic-mesh-browser-stack:c
 shared	crates/mesh/mackesd/src/ca/backup.rs	retain-in-magic-mesh:crates/mesh/mackesd/src/ca/backup.rs#shared-contract-or-reference	shared-secret-consumer	760443274e9146c1a044ad18756cfda0982917f0	760443274e9146c1a044ad18756cfda0982917f0	clean
 shared	crates/mesh/mackesd/src/ipc/secret_store.rs	retain-in-magic-mesh:crates/mesh/mackesd/src/ipc/secret_store.rs#shared-contract-or-reference	shared-secret-consumer	874e769cfef6da2bd7b015cfb56d97682ab4ff26	874e769cfef6da2bd7b015cfb56d97682ab4ff26	clean
 mixed-purpose	crates/mesh/mackesd/src/worker_role.rs	split-in-magic-mesh-browser-stack:crates/mesh/mackesd/src/worker_role.rs#browser-sections	daemon-worker-registration	2b634c5a11fb1fe6c786cb8bc9300748e9a7c90a	2b634c5a11fb1fe6c786cb8bc9300748e9a7c90a	clean
+shared	crates/mesh/mackesd/src/workers/cloud/verbs/browser.rs	retain-in-magic-mesh:crates/mesh/mackesd/src/workers/cloud/verbs/browser.rs#shared-contract-or-reference	browser-vm-workload-contract	802e58f1c6fadf9ee8d61ed83fbb54a6843546cf	802e58f1c6fadf9ee8d61ed83fbb54a6843546cf	clean
 shared	crates/mesh/mde-seal/Cargo.toml	retain-in-magic-mesh:crates/mesh/mde-seal/Cargo.toml#shared-contract-or-reference	workspace-package-edge	5133a491d3b42906c46d3ed45ef6ea822a3aa967	5133a491d3b42906c46d3ed45ef6ea822a3aa967	clean
 shared	crates/mesh/mde-seal/src/lib.rs	retain-in-magic-mesh:crates/mesh/mde-seal/src/lib.rs#shared-contract-or-reference	shared-secret-contract	70681c3a81c6763bce07abf905518be1fd505caa	70681c3a81c6763bce07abf905518be1fd505caa	clean
 shared	crates/mesh/mde-seal/src/scope.rs	retain-in-magic-mesh:crates/mesh/mde-seal/src/scope.rs#shared-contract-or-reference	shared-secret-contract	30aa743cf8c643fdc80f035218ce640fbf19ab43	30aa743cf8c643fdc80f035218ce640fbf19ab43	clean

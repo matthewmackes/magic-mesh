@@ -50,6 +50,7 @@
 // exactly one egui resolution.
 pub use mde_egui::egui;
 
+pub mod audio;
 pub mod config;
 #[cfg(feature = "live-connect")]
 pub mod connect;
@@ -60,6 +61,7 @@ pub mod pixel;
 pub mod session;
 pub mod tier;
 
+pub use audio::{RdpAudioCapability, RdpAudioStats, RdpAudioUnsupportedReason, RdpPcmFormat};
 pub use config::{ConfigError, RdpConfig};
 #[cfg(feature = "live-connect")]
 pub use connect::{CertPinChange, ConnectError, Negotiated, PumpOutcome, RdpConnection};

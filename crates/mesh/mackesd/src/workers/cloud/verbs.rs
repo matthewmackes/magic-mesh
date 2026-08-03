@@ -26,7 +26,7 @@ use mackes_mesh_types::cloud::{
     VERB_APP_PROVISION,
 };
 
-use super::runner::CloudRunOutcome;
+use super::runner::{default_browser_vm_image_source, CloudRunOutcome};
 use super::CloudWorker;
 
 /// The maximum action body accepted before JSON materialization. Direct callers
@@ -426,6 +426,7 @@ pub(crate) fn dispatch(w: &CloudWorker, verb_name: &str, body_str: &str) -> Clou
                 &w.state_root,
                 body.node.trim(),
                 &super::runner::default_libvirt_uri(),
+                &default_browser_vm_image_source(),
             ) {
                 Ok(tfvars) => tfvars,
                 Err(error) => {

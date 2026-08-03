@@ -18,6 +18,7 @@ XRDP_STARTWM="$BROWSER_VM/mcnf-browser-vm-xrdp-startwm.sh"
 SESSION="$BROWSER_VM/mcnf-browser-vm-session.sh"
 MEDIA_PROBE="$BROWSER_VM/mcnf-browser-vm-media-probe.sh"
 MEDIA_EVIDENCE_VERIFY="$ROOT/install-helpers/verify-browser-vm-media-evidence.py"
+EPHEMERAL_NOCLOUD="$BROWSER_VM/prepare-ephemeral-nocloud.sh"
 
 fail() {
     echo "verify-browser-vm-contract: $*" >&2
@@ -36,8 +37,9 @@ fail() {
 [ -x "$SESSION" ] || fail "media session supervisor is not executable"
 [ -x "$MEDIA_PROBE" ] || fail "guest media probe is not executable"
 [ -x "$MEDIA_EVIDENCE_VERIFY" ] || fail "media evidence verifier is not executable"
+[ -x "$EPHEMERAL_NOCLOUD" ] || fail "ephemeral NoCloud helper is not executable"
 [ -f "$RUNTIME_UNIT" ] || fail "guest runtime unit is missing"
-bash -n "$PROFILE_VERIFY" "$VALIDATOR" "$ACTIVATION_VERIFY" "$ATTACH_VERIFY" "$IMAGE_BUILD" "$IMAGE_VERIFY" "$0"
+bash -n "$PROFILE_VERIFY" "$VALIDATOR" "$ACTIVATION_VERIFY" "$ATTACH_VERIFY" "$IMAGE_BUILD" "$IMAGE_VERIFY" "$EPHEMERAL_NOCLOUD" "$0"
 sh -n "$RUNTIME" "$XRDP_STARTWM" "$SESSION" "$MEDIA_PROBE"
 python3 -m py_compile "$RUNTIME_EVIDENCE_VERIFY" "$MEDIA_EVIDENCE_VERIFY"
 grep -Fq 'runtime-evidence.json' "$RUNTIME" || fail "guest runtime does not emit bounded evidence"
@@ -47,6 +49,7 @@ grep -Fq 'mcnf-browser-vm-media-probe' "$RUNTIME" || fail "guest runtime omits C
 "$IMAGE_VERIFY" --self-test >/dev/null
 "$RUNTIME_EVIDENCE_VERIFY" --self-test >/dev/null
 "$MEDIA_EVIDENCE_VERIFY" --self-test >/dev/null
+"$EPHEMERAL_NOCLOUD" --self-test >/dev/null
 "$PROFILE_VERIFY" --source "$PROFILE" >/dev/null
 "$ACTIVATION_VERIFY" >/dev/null
 "$ATTACH_VERIFY" >/dev/null

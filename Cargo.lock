@@ -3714,6 +3714,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironrdp-rdpsnd"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e94cc739f305d02bd2902640340b23dcf923e6a051664ed5543f6efbf9740dbf"
+dependencies = [
+ "bitflags 2.13.1",
+ "ironrdp-core",
+ "ironrdp-pdu",
+ "ironrdp-svc",
+ "tracing",
+]
+
+[[package]]
 name = "ironrdp-session"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4830,6 +4843,7 @@ dependencies = [
  "ironrdp-graphics",
  "ironrdp-input",
  "ironrdp-pdu",
+ "ironrdp-rdpsnd",
  "ironrdp-session",
  "ironrdp-tls",
  "ironrdp-tokio",

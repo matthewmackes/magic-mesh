@@ -64,8 +64,8 @@ pub(crate) use gate::{
     TokenSigner, TokenVerdict, DEFAULT_AUTH_ROOT,
 };
 use runner::{
-    default_iac_root, default_libvirt_uri, instances_table, CloudRunOutcome, CloudRunner,
-    ShellCloudRunner, BACKEND_TOOLS,
+    default_browser_vm_image_source, default_iac_root, default_libvirt_uri, instances_table,
+    CloudRunOutcome, CloudRunner, ShellCloudRunner, BACKEND_TOOLS,
 };
 use verbs::{CloudActionBody, CloudVerb};
 
@@ -577,6 +577,7 @@ impl CloudWorker {
             &self.state_root,
             &self.host,
             &default_libvirt_uri(),
+            &default_browser_vm_image_source(),
             now_ms(),
         );
         if let Ok(mut guard) = self.drift.lock() {

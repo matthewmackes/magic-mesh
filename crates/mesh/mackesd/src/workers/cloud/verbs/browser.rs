@@ -213,8 +213,8 @@ mod tests {
     fn authorization_target_rejects_invalid_input_without_a_canonicalized_alias() {
         let padded = body("eagle", Some(" browser"));
         assert!(authorization_target(&padded).is_err());
-        let valid = body("eagle", Some("browser-eagle"));
-        assert_eq!(authorization_target(&valid), Ok("browser-eagle"));
+        let valid = body("eagle", Some(BROWSER_VM_WORKLOAD_NAME));
+        assert_eq!(authorization_target(&valid), Ok(BROWSER_VM_WORKLOAD_NAME));
     }
 
     #[test]
@@ -245,7 +245,7 @@ mod tests {
         let reply = build_reply(
             &state_root,
             "browser-provision",
-            &body("eagle", Some("browser")),
+            &body("eagle", Some(BROWSER_VM_WORKLOAD_NAME)),
         );
         assert!(!reply.ok);
         assert!(reply.error.unwrap().contains("could not persist"));

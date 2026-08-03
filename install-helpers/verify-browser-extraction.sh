@@ -44,6 +44,7 @@ path_is_named_candidate() {
     crates/desktop/mde-web-*|crates/desktop/mde-shell-egui/src/web/*|\
     crates/mesh/mde-browser-workers/*|\
     crates/mesh/mackesd/src/workers/transfers/lane/browser_media.rs|\
+    crates/mesh/mackesd/src/workers/cloud/verbs/browser.rs|\
     crates/services/mde-adblock/*|crates/services/mde-bookmarks/*|\
     crates/desktop/mde-bookmarks-egui/*|crates/mesh/mde-seal/*|\
     crates/mesh/mde-worker-core/*|\
@@ -129,6 +130,7 @@ class_for_path() {
     crates/mesh/mde-seal/*|crates/mesh/mde-worker-core/*|\
     crates/mesh/mackes-mesh-types/src/lib.rs|crates/mesh/mackes-mesh-types/src/mesh_storage.rs|\
     packaging/browser-vm/*|\
+    crates/mesh/mackesd/src/workers/cloud/verbs/browser.rs|\
     crates/mesh/mackesd/src/ca/backup.rs|crates/mesh/mackesd/src/ipc/secret_store.rs|\
     crates/mesh/mackesd/src/lib.rs|crates/mesh/mackesd/src/workers/storage.rs|\
     install-helpers/lint-layered-tiers.sh|install-helpers/lint-style-leaks.sh|\
@@ -147,6 +149,7 @@ reason_for_path() {
     crates/desktop/mde-shell-egui/src/web/*) printf '%s\n' host-browser-shell ;;
     crates/mesh/mde-browser-workers/*) printf '%s\n' browser-worker-family ;;
     crates/mesh/mackesd/src/workers/transfers/lane/browser_media.rs) printf '%s\n' browser-transfer-lane ;;
+    crates/mesh/mackesd/src/workers/cloud/verbs/browser.rs) printf '%s\n' browser-vm-workload-contract ;;
     crates/services/mde-adblock/*) printf '%s\n' browser-adblock-engine ;;
     docs/design/browser-*.md) printf '%s\n' browser-implementation-doc ;;
     install-helpers/browser-*|install-helpers/install-browser-*|\

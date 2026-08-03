@@ -27,12 +27,23 @@ pub(crate) const IAC_ROOT_ENV: &str = "MDE_IAC_ROOT";
 /// The env override for the libvirt connection URI the runner drives.
 pub(crate) const LIBVIRT_URI_ENV: &str = "MDE_LIBVIRT_URI";
 
+/// The env override for the immutable Browser VM qcow2 source consumed by
+/// OpenTofu. Keeping this outside Workloads prevents a host-local artifact path
+/// from becoming guest or session state while still making it explicit in the
+/// generated tfvars document.
+pub(crate) const BROWSER_VM_IMAGE_SOURCE_ENV: &str = "MDE_BROWSER_VM_IMAGE_SOURCE";
+
 /// Default IaC tree root when [`IAC_ROOT_ENV`] is unset (a deployed node ships the
 /// tree here; a dev checkout sets `MDE_IAC_ROOT` to the repo root).
 pub(crate) const DEFAULT_IAC_ROOT: &str = "/usr/share/mde/iac";
 
 /// Default libvirt connection URI (local system KVM — E12 local-first).
 pub(crate) const DEFAULT_LIBVIRT_URI: &str = "qemu:///system";
+
+/// Default Browser VM qcow2 source when the placement host has not configured an
+/// artifact-specific path.
+pub(crate) const DEFAULT_BROWSER_VM_IMAGE_SOURCE: &str =
+    "/var/lib/libvirt/images/browser-vm-chromium.qcow2";
 
 /// The OpenTofu root (provision), relative to the IaC root.
 pub(crate) const TOFU_SUBDIR: &str = "infra/tofu/cloud";
@@ -600,6 +611,15 @@ pub(crate) fn default_iac_root() -> PathBuf {
 /// The default libvirt URI: [`LIBVIRT_URI_ENV`] or [`DEFAULT_LIBVIRT_URI`].
 pub(crate) fn default_libvirt_uri() -> String {
     std::env::var(LIBVIRT_URI_ENV).unwrap_or_else(|_| DEFAULT_LIBVIRT_URI.to_string())
+}
+
+/// Resolve the host-local Browser VM artifact source. Empty environment values
+/// are treated as unset so the OpenTofu input remains fail-closed and usable.
+pub(crate) fn default_browser_vm_image_source() -> String {
+    std::env::var(BROWSER_VM_IMAGE_SOURCE_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_BROWSER_VM_IMAGE_SOURCE.to_string())
 }
 
 // ─────────────────────────── the injectable test fake ───────────────────────────
