@@ -1,0 +1,54 @@
+[Unit]
+Description=MCNF Browser VM localhost PipeWire-Pulse endpoint
+Documentation=man:pactl(1)
+BindsTo=pipewire-pulse.service
+After=pipewire-pulse.service
+PartOf=pipewire-pulse.service
+StartLimitIntervalSec=60s
+StartLimitBurst=5
+
+[Service]
+Type=notify
+NotifyAccess=all
+# A user unit is intentional: %t and the native socket identify the actual
+# logged-in/lingering seat user's PipeWire-Pulse graph without a root proxy.
+Environment=XDG_RUNTIME_DIR=%t
+Environment=PULSE_SERVER=unix:%t/pulse/native
+Environment=PATH=/usr/bin
+ExecStart=/usr/bin/bash /usr/libexec/mackesd/mcnf-qemu-pulse-endpoint --run
+TimeoutStartSec=20s
+TimeoutStopSec=8s
+WatchdogSec=20s
+Restart=on-failure
+RestartSec=2s
+
+# The helper only talks to the user's native Pulse socket and inspects sockets
+# through netlink. PipeWire-Pulse, not this helper, owns the TCP listener.
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+TasksMax=16
+MemoryMax=64M
+CPUQuota=10%
+OOMPolicy=stop
+
+[Install]
+WantedBy=default.target

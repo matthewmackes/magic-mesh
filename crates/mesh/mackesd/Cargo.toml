@@ -485,7 +485,14 @@ assets = [
     # The warning helper is the mandatory five-second pre-update operator notice.
     { source = "install-helpers/seat-update-warning.sh", dest = "/usr/libexec/mackesd/seat-update-warning", mode = "755" },
     { source = "install-helpers/provision-browser-vm-rdp-credential.sh", dest = "/usr/libexec/mackesd/provision-browser-vm-rdp-credential", mode = "755" },
+    { source = "install-helpers/request-browser-vm-workload.sh", dest = "/usr/libexec/mackesd/request-browser-vm-workload", mode = "755" },
     { source = "packaging/systemd/browser-vm-rdp-credential.conf", dest = "/usr/libexec/mackesd/browser-vm-rdp-credential.conf", mode = "644" },
+    # The Browser VM's QEMU Pulse backend connects only to this seat-user-owned
+    # localhost endpoint. Ship its health verifier with the service so a release
+    # can prove the endpoint rather than relying on an untracked home-directory unit.
+    { source = "install-helpers/mcnf-qemu-pulse-endpoint.sh", dest = "/usr/libexec/mackesd/mcnf-qemu-pulse-endpoint", mode = "755" },
+    { source = "install-helpers/verify-qemu-pulse-endpoint.sh", dest = "/usr/libexec/mackesd/verify-qemu-pulse-endpoint", mode = "755" },
+    { source = "packaging/systemd/mcnf-qemu-pulse-endpoint.service", dest = "/usr/lib/systemd/user/mcnf-qemu-pulse-endpoint.service", mode = "644" },
     # SUBSTRATE-1 (SUBSTRATE-V2) — the etcd coordination cluster: overlay-bound
     # leader/directory/health. Run per-node with --init/--join/--client-only.
     # The unit only starts where setup-etcd.sh wrote /etc/etcd/etcd.env (members).
@@ -795,6 +802,22 @@ if getent group audio >/dev/null 2>&1; then
       [ -z "$uid" ] || systemctl start "user@$uid.service" >/dev/null 2>&1 || :
     fi
   done
+
+  # The QEMU Pulse bridge owns one fixed loopback port, so exactly one seat
+  # user's graph may own it. Prefer the production `mm` seat identity and use
+  # `mde` only on images that do not carry `mm`; never globally enable this
+  # singleton for every local account.
+  mcnf_audio_seat_user=
+  for candidate in mm mde; do
+    if id "$candidate" >/dev/null 2>&1; then
+      mcnf_audio_seat_user="$candidate"
+      break
+    fi
+  done
+  if [ -n "$mcnf_audio_seat_user" ]; then
+    systemctl --user --machine="$mcnf_audio_seat_user@" daemon-reload >/dev/null 2>&1 || :
+    systemctl --user --machine="$mcnf_audio_seat_user@" enable --now mcnf-qemu-pulse-endpoint.service >/dev/null 2>&1 || :
+  fi
 fi
 # SETUP-fix — materialize the shared bus dir now (no reboot needed).
 timeout 60 systemd-tmpfiles --create /usr/lib/tmpfiles.d/magic-mesh.conf >/dev/null 2>&1 || :

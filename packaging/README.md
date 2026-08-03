@@ -17,7 +17,10 @@ and the default YAMIS platform icon theme lives in `../assets/icons/YAMIS/`.
   `mde-musicd.service` is a user unit (`default.target`) whose
   `ExecCondition=mackesd role-gate --min-rank 1` skips it cleanly on
   Servers/Lighthouses (SVC-7/Q70 — desktop services are Workstation
-  surfaces; the voice-agent autostart carries the same gate inline)
+  surfaces; the voice-agent autostart carries the same gate inline).
+  `mcnf-qemu-pulse-endpoint.service` is another user unit, but it is enabled
+  for exactly one concrete seat account (`mm`, or `mde` when `mm` is absent)
+  because its Browser-VM audio bridge owns the singleton loopback port 4713.
 
 - `bootc/`        → the E12-13 **immutable bootc/ostree image lane** (§5: ONE
   image for every role — role is a config flag; a Lighthouse runs the same

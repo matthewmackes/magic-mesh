@@ -3,7 +3,10 @@
 # The armed capability is created in memory and delivered only over mde-bus
 # stdin; neither the key, token, request body, nor raw reply is printed.
 set -euo pipefail
+set +x
 umask 077
+ulimit -S -c 0
+ulimit -H -c 0
 
 readonly PROGRAM_NAME="request-browser-vm-workload"
 readonly PYTHON_BIN="/usr/bin/python3"
@@ -55,8 +58,10 @@ SCHEMA_VERSION = 1
 WAIT_SECONDS = 5
 TOKEN_TTL_MS = 25_000
 REPLY_TIMEOUT_SECONDS = 20.0
+WORKLOAD_ROW_TIMEOUT_SECONDS = 330.0
 BUS_COMMAND_TIMEOUT_SECONDS = 8.0
 REPLY_POLL_SECONDS = 0.25
+WORKLOAD_ROW_POLL_SECONDS = 1.0
 MAX_CREDENTIAL_BYTES = 65
 MAX_REPLY_BYTES = 256 * 1024
 ULID_RE = re.compile(r"[0-9A-HJKMNP-TV-Z]{26}\Z")
@@ -241,11 +246,43 @@ def classify_reply(raw, expected_topic, node, name, image_digest):
     return "failed"
 
 
-def limit_reply_output():
+def limit_history_output():
     resource.setrlimit(
         resource.RLIMIT_FSIZE,
         (MAX_REPLY_BYTES + 1, MAX_REPLY_BYTES + 1),
     )
+
+
+def history_argv(bus_bin, bus_root, topic, since=None):
+    argv = [bus_bin, "history", topic]
+    if since is not None:
+        argv.extend(["--since", since])
+    argv.extend(["--count", "1", "--json", "--bus-root", bus_root])
+    return argv
+
+
+def read_latest_history(bus_bin, bus_root, topic, remaining, since=None):
+    try:
+        with tempfile.TemporaryFile() as bounded_stdout:
+            completed = subprocess.run(
+                history_argv(bus_bin, bus_root, topic, since),
+                stdout=bounded_stdout,
+                stderr=subprocess.DEVNULL,
+                timeout=min(2.0, remaining),
+                check=False,
+                preexec_fn=limit_history_output,
+            )
+            bounded_stdout.seek(0)
+            raw = bounded_stdout.read(MAX_REPLY_BYTES + 1)
+    except subprocess.TimeoutExpired:
+        return None
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SafeFailure("history-read-failed") from exc
+    if len(raw) > MAX_REPLY_BYTES:
+        raise SafeFailure("history-oversized")
+    if completed.returncode != 0:
+        raise SafeFailure("history-read-failed")
+    return raw
 
 
 def wait_for_reply(bus_bin, bus_root, receipt, node, name, image_digest):
@@ -255,43 +292,82 @@ def wait_for_reply(bus_bin, bus_root, receipt, node, name, image_digest):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise SafeFailure("reply-timeout")
-        try:
-            with tempfile.TemporaryFile() as bounded_stdout:
-                completed = subprocess.run(
-                    [
-                        bus_bin,
-                        "history",
-                        topic,
-                        "--count",
-                        "1",
-                        "--json",
-                        "--bus-root",
-                        bus_root,
-                    ],
-                    stdout=bounded_stdout,
-                    stderr=subprocess.DEVNULL,
-                    timeout=min(2.0, remaining),
-                    check=False,
-                    preexec_fn=limit_reply_output,
-                )
-                bounded_stdout.seek(0)
-                raw_reply = bounded_stdout.read(MAX_REPLY_BYTES + 1)
-        except subprocess.TimeoutExpired:
+        raw_reply = read_latest_history(bus_bin, bus_root, topic, remaining)
+        if raw_reply is None:
             continue
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise SafeFailure("reply-read-failed") from exc
-        if len(raw_reply) > MAX_REPLY_BYTES:
-            raise SafeFailure("reply-oversized")
-        if completed.returncode != 0:
-            raise SafeFailure("reply-read-failed")
-        status = classify_reply(
-            raw_reply, topic, node, name, image_digest
-        )
+        status = classify_reply(raw_reply, topic, node, name, image_digest)
         if status == "accepted":
             return
         if status != "pending":
             raise SafeFailure(f"reply-{status}")
         time.sleep(min(REPLY_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
+
+
+def classify_workload_row(raw, expected_topic, node, name):
+    if not raw.strip():
+        return "pending"
+    if len(raw) > MAX_REPLY_BYTES:
+        return "malformed"
+    lines = [line for line in raw.splitlines() if line.strip()]
+    if len(lines) != 1:
+        return "malformed"
+    try:
+        envelope = json.loads(lines[0])
+        if not isinstance(envelope, dict) or envelope.get("topic") != expected_topic:
+            return "malformed"
+        body_raw = envelope.get("body")
+        if not isinstance(body_raw, str) or len(body_raw) > MAX_REPLY_BYTES:
+            return "malformed"
+        body = json.loads(body_raw)
+    except (TypeError, ValueError):
+        return "malformed"
+    if not isinstance(body, dict) or body.get("host") != node:
+        return "malformed"
+    workloads = body.get("workloads")
+    if not isinstance(workloads, list):
+        return "malformed"
+    matches = [
+        row
+        for row in workloads
+        if isinstance(row, dict)
+        and row.get("node") == node
+        and row.get("name") == name
+    ]
+    if not matches:
+        return "pending"
+    if len(matches) != 1:
+        return "malformed"
+    row = matches[0]
+    if (
+        row.get("delivery_type") != "desktop_vm"
+        or not isinstance(row.get("status"), str)
+        or not row["status"]
+        or not isinstance(row.get("reachable"), bool)
+    ):
+        return "malformed"
+    return "projected"
+
+
+def wait_for_workload_row(bus_bin, bus_root, receipt, node, name):
+    topic = f"state/cloud/{node}"
+    deadline = time.monotonic() + WORKLOAD_ROW_TIMEOUT_SECONDS
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise SafeFailure("workload-row-timeout")
+        raw_state = read_latest_history(
+            bus_bin, bus_root, topic, remaining, since=receipt
+        )
+        if raw_state is None:
+            continue
+        status = classify_workload_row(raw_state, topic, node, name)
+        if status == "projected":
+            return
+        if status != "pending":
+            raise SafeFailure(f"workload-row-{status}")
+        time.sleep(
+            min(WORKLOAD_ROW_POLL_SECONDS, max(0.0, deadline - time.monotonic()))
+        )
 
 
 def verify_runtime_paths(bus_bin, bus_root):
@@ -333,7 +409,11 @@ def live_request(credential_path, node, name, image_digest, bus_bin, bus_root):
     receipt = publish_body(bus_bin, bus_root, ACTION_TOPIC, request_body)
     request_body = None
     wait_for_reply(bus_bin, bus_root, receipt, node, name, image_digest)
-    print("request-browser-vm-workload: request=accepted reply=verified")
+    wait_for_workload_row(bus_bin, bus_root, receipt, node, name)
+    print(
+        "request-browser-vm-workload: request=accepted "
+        "reply=verified workload_row=projected"
+    )
 
 
 def expect_safe_failure(call):
@@ -351,6 +431,8 @@ def self_test():
     assert ALERT_BODY["headline"] == "This seat will update in 5 seconds."
     assert WAIT_SECONDS == 5
     assert 0 < TOKEN_TTL_MS <= 30_000
+    assert WORKLOAD_ROW_TIMEOUT_SECONDS >= 300.0
+    assert resource.getrlimit(resource.RLIMIT_CORE) == (0, 0)
 
     node = "DELL-LAPTOP"
     name = STABLE_NAME
@@ -474,6 +556,57 @@ def self_test():
     assert classify_reply(b"not-json", topic, node, name, image_digest) == "malformed"
     assert classify_reply(b"x" * (MAX_REPLY_BYTES + 1), topic, node, name, image_digest) == "malformed"
 
+    state_topic = f"state/cloud/{node}"
+    state_body = canonical_json(
+        {
+            "host": node,
+            "workloads": [
+                {
+                    "name": name,
+                    "delivery_type": "desktop_vm",
+                    "node": node,
+                    "status": "active",
+                    "reachable": True,
+                }
+            ],
+        }
+    )
+    state_envelope = canonical_json(
+        {"topic": state_topic, "body": state_body}
+    ).encode()
+    assert classify_workload_row(state_envelope, state_topic, node, name) == "projected"
+    empty_state = canonical_json(
+        {"topic": state_topic, "body": canonical_json({"host": node, "workloads": []})}
+    ).encode()
+    assert classify_workload_row(empty_state, state_topic, node, name) == "pending"
+    wrong_delivery_body = json.loads(state_body)
+    wrong_delivery_body["workloads"][0]["delivery_type"] = "service_vm"
+    wrong_delivery = canonical_json(
+        {"topic": state_topic, "body": canonical_json(wrong_delivery_body)}
+    ).encode()
+    assert classify_workload_row(wrong_delivery, state_topic, node, name) == "malformed"
+    duplicate_body = json.loads(state_body)
+    duplicate_body["workloads"].append(dict(duplicate_body["workloads"][0]))
+    duplicate = canonical_json(
+        {"topic": state_topic, "body": canonical_json(duplicate_body)}
+    ).encode()
+    assert classify_workload_row(duplicate, state_topic, node, name) == "malformed"
+    history = history_argv(
+        "/usr/bin/mde-bus", "/run/mde-bus", state_topic, receipt
+    )
+    assert history == [
+        "/usr/bin/mde-bus",
+        "history",
+        state_topic,
+        "--since",
+        receipt,
+        "--count",
+        "1",
+        "--json",
+        "--bus-root",
+        "/run/mde-bus",
+    ]
+
 
 def main():
     if len(sys.argv) == 2 and sys.argv[1] == "self-test":
@@ -486,6 +619,7 @@ def main():
 
 
 try:
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     main()
 except SafeFailure as exc:
     print(

@@ -63,6 +63,9 @@ The guest runtime writes a guest-owned, mode-0600 bounded
 `runtime-evidence.json` record with transport health, VA-API status, and
 PipeWire endpoint counts. `audio_status=wired` is endpoint-wiring evidence
 only; it does not prove audible Chromium playback, capture, or recovery.
+Each bootstrap invalidates prior runtime, media, GPU, and PipeWire evidence
+before admission, so malformed provenance or runtime input cannot leave an old
+`wired` record available as evidence for the failed attempt.
 Validate collected records with
 `install-helpers/verify-browser-vm-runtime-evidence.py`.
 
@@ -115,9 +118,21 @@ fail-closed.
 
 The declarative audio boundary can be checked with
 `install-helpers/verify-browser-vm-audio.sh --domain <name>` (or an XML file).
-It requires a virtio sound device, a PipeWire/PulseAudio backend, and both
-playback and capture endpoints; it intentionally does not claim that live
-audio is audible, captured, or recovered.
+It requires exactly one virtio sound device and one Browser-owned PulseAudio
+backend on `tcp:127.0.0.1:4713`, with exactly one playback and one capture
+endpoint; it rejects duplicate or alternate routes. It intentionally does not
+claim that live audio is audible, captured, or recovered.
+
+For the Browser-specific OpenTofu domain, both compatibility and accelerated
+overlays connect QEMU to `tcp:127.0.0.1:4713`. The base Workstation package
+installs `mcnf-qemu-pulse-endpoint.service` into the selected seat user's
+systemd manager; its helper admits exactly one PipeWire-Pulse module and one
+loopback listener owned by that same seat user's sole PipeWire-Pulse process,
+publishes watchdog health, and refuses ambiguous or broad listeners.
+`verify-qemu-pulse-endpoint` checks the packaged source/unit
+contract, while `mcnf-qemu-pulse-endpoint --health` checks the live graph. A
+healthy endpoint is wiring evidence only; physical audibility remains part of
+the live acceptance boundary.
 
 Live performance acceptance records are validated with
 `install-helpers/verify-browser-vm-performance.py`. A passing record must be

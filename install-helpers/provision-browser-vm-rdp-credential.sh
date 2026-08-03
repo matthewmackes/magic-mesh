@@ -5,14 +5,17 @@
 set -euo pipefail
 set +x
 umask 077
+ulimit -S -c 0
+ulimit -H -c 0
 
 readonly DOMAIN="${MCNF_BROWSER_VM_DOMAIN:-browser-vm}"
+readonly LIBVIRT_URI="qemu:///system"
 readonly USERNAME="mcnf-browser"
 readonly CREDENTIAL_NAME="browser-vm-rdp"
 readonly CREDENTIAL_PATH="${MCNF_BROWSER_VM_RDP_CREDENTIAL_PATH:-/etc/credstore.encrypted/browser-vm-rdp}"
 readonly DROPIN_SOURCE="${MCNF_BROWSER_VM_RDP_DROPIN_SOURCE:-/usr/libexec/mackesd/browser-vm-rdp-credential.conf}"
 readonly DROPIN_PATH="/etc/systemd/system/mde-shell-egui.service.d/55-browser-vm-rdp-credential.conf"
-readonly WARNING_HELPER="${MCNF_SEAT_UPDATE_WARNING_HELPER:-/usr/libexec/mackesd/seat-update-warning}"
+readonly WARNING_HELPER="/usr/libexec/mackesd/seat-update-warning"
 
 fallback_dropin_source() {
   local source=$DROPIN_SOURCE
@@ -34,16 +37,31 @@ validate_password() {
   [[ "$1" =~ ^[0-9a-f]{64}$ ]]
 }
 
+validate_domain() {
+  [[ "$1" =~ ^[A-Za-z0-9._-]{1,128}$ && "$1" != "." && "$1" != ".." ]]
+}
+
 self_test() {
   local source warning_source
   validate_password "$(printf '%064d' 0)"
   ! validate_password "not-a-password"
+  validate_domain "browser-vm"
+  ! validate_domain "browser vm"
+  ! validate_domain $'browser-vm\nquit'
+  [[ "$LIBVIRT_URI" == "qemu:///system" ]]
+  [[ "$(ulimit -S -c)" == "0" ]]
+  [[ "$(ulimit -H -c)" == "0" ]]
   source=$(fallback_dropin_source)
   grep -Fxq \
     'LoadCredentialEncrypted=browser-vm-rdp:/etc/credstore.encrypted/browser-vm-rdp' \
     "$source"
   warning_source=$(fallback_warning_source)
-  grep -Fq 'AI-GENERATED-ALERT' "$warning_source"
+  grep -Fxq 'readonly WAIT_SECONDS=5' "$warning_source"
+  grep -Fxq 'readonly TOAST_TOPIC="event/toast/show"' "$warning_source"
+  grep -Fxq \
+    'readonly TOAST_BODY='\''{"severity":"warning","source_host":"deployment-controller","flag":"AI-GENERATED-ALERT","headline":"This seat will update in 5 seconds."}'\''' \
+    "$warning_source"
+  grep -Fxq 'sleep "$WAIT_SECONDS"' "$warning_source"
   echo "provision-browser-vm-rdp-credential: self-test passed"
 }
 
@@ -70,7 +88,11 @@ for command_name in systemd-creds virsh od tr base64 install cmp; do
     exit 1
   }
 done
-[[ -x "$WARNING_HELPER" ]] || {
+validate_domain "$DOMAIN" || {
+  echo "provision-browser-vm-rdp-credential: invalid Browser VM domain" >&2
+  exit 1
+}
+[[ -f "$WARNING_HELPER" && ! -L "$WARNING_HELPER" && -x "$WARNING_HELPER" ]] || {
   echo "provision-browser-vm-rdp-credential: mandatory seat warning helper unavailable: $WARNING_HELPER" >&2
   exit 1
 }
@@ -79,18 +101,20 @@ dropin_source=$(fallback_dropin_source)
   echo "provision-browser-vm-rdp-credential: drop-in template unavailable" >&2
   exit 1
 }
-[[ "$(virsh domstate "$DOMAIN" 2>/dev/null | tr -d '[:space:]')" == running ]] || {
+[[ "$(virsh --connect "$LIBVIRT_URI" domstate "$DOMAIN" 2>/dev/null | tr -d '[:space:]')" == running ]] || {
   echo "provision-browser-vm-rdp-credential: Browser VM is not running: $DOMAIN" >&2
   exit 1
 }
-virsh qemu-agent-command "$DOMAIN" '{"execute":"guest-ping"}' >/dev/null || {
+virsh --connect "$LIBVIRT_URI" qemu-agent-command \
+  "$DOMAIN" '{"execute":"guest-ping"}' >/dev/null || {
   echo "provision-browser-vm-rdp-credential: Browser VM guest agent is unavailable" >&2
   exit 1
 }
 
 # The warning helper both publishes the exact red alert flag and enforces the
 # five-second interval. If publication fails, this transaction does not mutate.
-"$WARNING_HELPER"
+/usr/bin/env -u BASH_ENV -u ENV -u MDE_BUS_ROOT \
+  PATH=/usr/bin:/usr/sbin "$WARNING_HELPER"
 
 tmp_dir=$(mktemp -d /run/mcnf-browser-vm-rdp.XXXXXX)
 trap 'unset password encoded agent_command; rm -rf -- "$tmp_dir"' EXIT
@@ -117,7 +141,9 @@ encoded=$(printf '%s' "$password" | base64 -w0)
 agent_command=$(printf \
   '{"execute":"guest-set-user-password","arguments":{"username":"%s","password":"%s","crypted":false}}' \
   "$USERNAME" "$encoded")
-if ! printf "qemu-agent-command %s '%s'\nquit\n" "$DOMAIN" "$agent_command" | virsh --quiet >/dev/null; then
+if ! printf "qemu-agent-command %s '%s'\nquit\n" "$DOMAIN" "$agent_command" \
+  | virsh --connect "$LIBVIRT_URI" --quiet \
+    >/dev/null 2>"$tmp_dir/virsh-error"; then
   echo "provision-browser-vm-rdp-credential: guest password rotation failed" >&2
   exit 1
 fi

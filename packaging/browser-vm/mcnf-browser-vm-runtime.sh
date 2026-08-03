@@ -2,6 +2,22 @@
 # Image-owned Browser VM runtime. Host input is identity-only and is validated
 # before any compositor or Chromium process starts.
 set -eu
+umask 077
+
+case "${1:-}" in
+    '')
+        [ "$#" -eq 0 ] || { echo 'FATAL: unexpected Browser VM runtime arguments' >&2; exit 2; }
+        runtime_phase=bootstrap
+        ;;
+    --audio-ready)
+        [ "$#" -eq 1 ] || { echo 'FATAL: unexpected Browser VM runtime arguments' >&2; exit 2; }
+        runtime_phase=audio-ready
+        ;;
+    *)
+        echo 'FATAL: unexpected Browser VM runtime argument' >&2
+        exit 2
+        ;;
+esac
 
 runtime_log=/var/lib/mcnf-browser/runtime.log
 if : >> "$runtime_log" 2>/dev/null; then
@@ -13,13 +29,29 @@ log() {
 }
 trap 'status=$?; log "exited status=$status"' EXIT
 
-log 'starting guest-owned runtime'
+log "starting guest-owned runtime phase=$runtime_phase"
+runtime_evidence=/var/lib/mcnf-browser/runtime-evidence.json
+media_evidence=/var/lib/mcnf-browser/media-evidence.json
+gpu_probe=/var/lib/mcnf-browser/gpu-vainfo.log
+media_probe=/var/lib/mcnf-browser/pipewire-probe.log
+if [ "$runtime_phase" = bootstrap ]; then
+    # Invalidate every prior-session success before even admission/provenance
+    # validation. A malformed or missing input must fail without leaving an old
+    # wired record available for collection as evidence of the new attempt.
+    rm -f "$runtime_evidence" "$media_evidence" "$gpu_probe" "$media_probe"
+    printf '%s\n' 'audio graph unavailable; runtime admission has not completed' \
+        >"$media_probe"
+    chmod 0600 "$media_probe"
+    log 'prior session evidence invalidated before runtime admission'
+fi
+
 /usr/local/libexec/mcnf-browser-vm-validate
 log 'runtime inputs validated'
 input_root=${MCNF_BROWSER_VM_INPUT_ROOT:-/etc/mackesd/browser-vm}
 transport=$(cat "$input_root/transport")
+transport_health=$(cat "$input_root/transport-health")
 source_commit=$(cat /usr/share/mcnf/browser-vm/source-commit)
-image_digest=$(cat "$input_root/image-digest" | tr 'A-F' 'a-f')
+image_digest=$(tr 'A-F' 'a-f' <"$input_root/image-digest")
 case "$source_commit" in ''|*[!0-9a-f]*)
     echo 'FATAL: Browser VM source provenance is malformed' >&2
     exit 1
@@ -40,14 +72,19 @@ esac
     echo 'FATAL: Browser VM image provenance has the wrong length' >&2
     exit 1
 }
+rdp_waiting=0
 case "$transport" in
     rdp)
         # The system unit is enabled for boot ordering, but the actual desktop
         # is created by xrdp per authenticated session. Avoid starting a second
         # compositor without DISPLAY from the system unit.
         if [ -z "${DISPLAY:-}" ]; then
-            echo 'Browser VM RDP runtime is waiting for an authenticated xrdp session'
-            exit 0
+            if [ "$runtime_phase" = bootstrap ]; then
+                rdp_waiting=1
+            else
+                echo 'FATAL: Browser VM RDP audio-ready stage lost its xrdp display' >&2
+                exit 1
+            fi
         fi
         ;;
     spice)
@@ -63,6 +100,72 @@ esac
 runtime_dir=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
 install -d -o "$(id -u)" -g "$(id -g)" -m 0700 "$runtime_dir"
 export XDG_RUNTIME_DIR="$runtime_dir"
+
+write_runtime_evidence() {
+    gpu_status=$1
+    audio_status=$2
+    audio_sink_count=$3
+    audio_source_count=$4
+    recorded_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    evidence_tmp=$runtime_evidence.tmp.$$
+    printf '%s\n' \
+        "{\"schema_version\":1,\"kind\":\"browser_vm_runtime_evidence\",\"profile\":\"browser-vm-chromium\",\"image\":\"browser-vm-chromium\",\"source_commit\":\"$source_commit\",\"image_digest\":\"$image_digest\",\"transport\":\"$transport\",\"transport_health\":\"$transport_health\",\"gpu_status\":\"$gpu_status\",\"audio_status\":\"$audio_status\",\"audio_playback_endpoints\":$audio_sink_count,\"audio_capture_endpoints\":$audio_source_count,\"recorded_at\":\"$recorded_at\"}" \
+        >"$evidence_tmp"
+    chmod 0600 "$evidence_tmp"
+    mv -f "$evidence_tmp" "$runtime_evidence"
+}
+
+audio_graph_ready() {
+    command -v pw-cli >/dev/null 2>&1 &&
+        command -v pactl >/dev/null 2>&1 &&
+        command -v wpctl >/dev/null 2>&1 &&
+        pw-cli info 0 >/dev/null 2>&1 &&
+        pactl info >/dev/null 2>&1 &&
+        wpctl status >/dev/null 2>&1 &&
+        pactl list short sinks 2>/dev/null |
+            awk 'NF { found=1 } END { exit(found ? 0 : 1) }' &&
+        pactl list short sources 2>/dev/null |
+            awk 'NF && $2 !~ /[.]monitor$/ { found=1 } END { exit(found ? 0 : 1) }'
+}
+
+if [ "$runtime_phase" = bootstrap ]; then
+    # Provenance is now admitted, so replace the invalidated state with a
+    # bounded unavailable record before audio startup. It remains truthful if
+    # the private ready stage is never reached.
+    printf '%s\n' 'audio graph unavailable; Chromium and media probes not started' \
+        >"$media_probe"
+    chmod 0600 "$media_probe"
+    write_runtime_evidence unavailable unavailable 0 0
+    log 'provisional runtime evidence records audio unavailable'
+
+    if [ "$rdp_waiting" -eq 1 ]; then
+        log 'RDP runtime is waiting for an authenticated xrdp session'
+        exit 0
+    fi
+
+    if /usr/bin/dbus-run-session -- \
+        /usr/local/libexec/mcnf-browser-vm-session \
+        /usr/local/libexec/mcnf-browser-vm-runtime --audio-ready; then
+        exit 0
+    else
+        status=$?
+        log "audio/session supervisor failed closed status=$status"
+        exit "$status"
+    fi
+fi
+
+[ "${MCNF_BROWSER_VM_AUDIO_READY:-0}" = 1 ] || {
+    write_runtime_evidence unavailable unavailable 0 0
+    echo 'FATAL: Browser VM audio-ready stage was not admitted by the session supervisor' >&2
+    exit 1
+}
+if ! audio_graph_ready; then
+    write_runtime_evidence unavailable unavailable 0 0
+    echo 'FATAL: Browser VM audio graph lost readiness before probes' >&2
+    exit 1
+fi
+log 'PipeWire, WirePlumber, Pulse compatibility, playback, and capture are ready'
+
 # Prefer the hardware wlroots renderer when the VM exposes a DRM render node;
 # retain pixman as the explicit compatibility fallback for hosts that do not.
 render_node=
@@ -82,20 +185,22 @@ fi
 export WLR_RENDERER
 log "using wlroots renderer $WLR_RENDERER${render_node:+ with $render_node}"
 export WLR_NO_HARDWARE_CURSORS=1
-chromium_bin=$(command -v chromium || command -v chromium-browser)
+chromium_bin=$(command -v chromium || command -v chromium-browser || true)
+if [ -z "$chromium_bin" ]; then
+    write_runtime_evidence unavailable unavailable 0 0
+    echo 'FATAL: Browser VM Chromium binary is unavailable' >&2
+    exit 1
+fi
 log "using Chromium binary $chromium_bin"
 
-# Run the fixed guest-local media probe before launching the interactive
-# compositor. Its bounded record is evidence for Chromium decode state only;
-# an unavailable probe never turns into a host fallback or blocks the desktop.
+# The fixed guest-local media probe now runs only after the complete audio graph
+# is ready. Its bounded record remains decode-state evidence only.
 /usr/local/libexec/mcnf-browser-vm-media-probe "$chromium_bin" ||
     log 'guest-local Chromium media probe exited unexpectedly'
 
 # Capture capability evidence from the actual Browser user. QEMU Guest Agent
 # probes run under a confined root domain and cannot prove the compositor user's
-# device permissions, so these diagnostics are intentionally image-owned and
-# best-effort. They never gate startup or accept host-provided commands.
-gpu_probe=/var/lib/mcnf-browser/gpu-vainfo.log
+# device permissions, so these diagnostics are image-owned and bounded.
 gpu_status=unavailable
 if [ -n "$render_node" ] && command -v vainfo >/dev/null 2>&1; then
     if vainfo --display drm --device "$render_node" >"$gpu_probe" 2>&1; then
@@ -112,12 +217,13 @@ elif command -v vainfo >/dev/null 2>&1; then
     log 'VA-API probe unavailable because no DRM render node is exposed'
 fi
 
-media_probe=/var/lib/mcnf-browser/pipewire-probe.log
-audio_sinks=''
-audio_sources=''
+audio_sinks=
+audio_sources=
 {
     printf '%s\n' '=== pw-cli info ==='
-    pw-cli info 2>&1 || true
+    pw-cli info 0 2>&1 || true
+    printf '%s\n' '=== wpctl status ==='
+    wpctl status 2>&1 || true
     printf '%s\n' '=== pactl sinks ==='
     audio_sinks=$(pactl list short sinks 2>/dev/null || true)
     printf '%s\n' "$audio_sinks"
@@ -126,26 +232,25 @@ audio_sources=''
     printf '%s\n' "$audio_sources"
 } >"$media_probe"
 chmod 0600 "$media_probe"
-log 'PipeWire/Pulse compatibility diagnostics captured'
+log 'PipeWire/Pulse compatibility diagnostics captured after readiness'
 
-# This bounded record is guest-owned evidence for later operator collection.
-# `audio_status=wired` means that both a playback and capture endpoint were
-# visible to the guest session; it deliberately does not claim audible
-# Chromium playback, capture, or recovery. The raw diagnostics remain private
-# to the Browser user and never cross the Workloads/session wire.
+# `audio_status=wired` means only that playback and capture endpoints were
+# visible to the ready guest session. It never claims audible Chromium media.
 audio_sink_count=$(printf '%s\n' "$audio_sinks" | awk 'NF { count++ } END { print count + 0 }')
-audio_source_count=$(printf '%s\n' "$audio_sources" | awk 'NF { count++ } END { print count + 0 }')
+audio_source_count=$(
+    printf '%s\n' "$audio_sources" |
+        awk 'NF && $2 !~ /[.]monitor$/ { count++ } END { print count + 0 }'
+)
 audio_status=unavailable
 if [ "$audio_sink_count" -gt 0 ] && [ "$audio_source_count" -gt 0 ]; then
     audio_status=wired
 fi
-runtime_evidence=/var/lib/mcnf-browser/runtime-evidence.json
-recorded_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-cat >"$runtime_evidence" <<EOF
-{"schema_version":1,"kind":"browser_vm_runtime_evidence","profile":"browser-vm-chromium","image":"browser-vm-chromium","source_commit":"$source_commit","image_digest":"$image_digest","transport":"$transport","transport_health":"$(cat "$input_root/transport-health")","gpu_status":"$gpu_status","audio_status":"$audio_status","audio_playback_endpoints":$audio_sink_count,"audio_capture_endpoints":$audio_source_count,"recorded_at":"$recorded_at"}
-EOF
-chmod 0600 "$runtime_evidence"
+write_runtime_evidence "$gpu_status" "$audio_status" "$audio_sink_count" "$audio_source_count"
 log "bounded runtime evidence written: gpu=$gpu_status audio=$audio_status"
+if [ "$audio_status" != wired ]; then
+    echo 'FATAL: Browser VM audio endpoints disappeared before Chromium startup' >&2
+    exit 1
+fi
 
 mkdir -p "$HOME/.config/sway"
 cat > "$HOME/.config/sway/config" <<'EOF'
@@ -167,6 +272,5 @@ EOF
 # Chromium and the compositor are guest-owned. No URL, command, path, or
 # browser state is accepted from the host declaration.
 sed -i "s#@CHROMIUM_BIN@#$chromium_bin#" "$HOME/.config/sway/config"
-log 'starting PipeWire, WirePlumber, and Sway session'
-exec /usr/bin/dbus-run-session -- /usr/local/libexec/mcnf-browser-vm-session \
-    /usr/bin/sway --unsupported-gpu --config "$HOME/.config/sway/config"
+log 'starting Sway and guest-owned Chromium after audio readiness'
+exec /usr/bin/sway --unsupported-gpu --config "$HOME/.config/sway/config"
