@@ -5,6 +5,29 @@ not a second active worklist.
 
 ## Current state — 2026-08-03
 
+Dell alert retest at 11:56 EDT: the shell now includes a deterministic built-in
+notification chime fallback and is running production-feature binary SHA-256
+`51db5548780f342eb5450a28e464a7a39a5cc3b13dcad66583d51edb8cdada52`
+as PID `320874`, active with zero restarts. Before replacement, the exact
+five-second update notice was published as receipt
+`01KZ45ECRS3MN66B6TDMWYA6R9`; the helper completed its full delay. The prior
+binary (SHA-256 `f9e2cac14ffbf264d69f28a4eeb8292b85338dc0a7ff53de05581292bd1d2b3c`)
+is recoverable at
+`/var/lib/mcnf-release-backups/dell-chime-20260803-8605d708/mde-shell-egui`.
+
+The post-update Critical retest is receipt
+`01KZ45GCJZEZXXVPQBQS4GCYK9`, with exact flag `AI-GENERATED-ALERT` and
+headline `DELL FINAL RETEST: red alert and sound are active.` While that receipt
+was consumed, a live PipeWire monitor observed the shell fallback's `pw-play`
+node and both `output_FL` and `output_FR` ports. This proves the alert reached
+the real seat audio graph; operator confirmation is still required for the
+physical screen presentation and speaker audibility. The alert receipt itself
+is present and exact. A concurrent whole-Bus integrity probe was not globally
+green: it reported one file without a database row on `state/boot-readiness`
+and one database row without a file on `state/host/local/seat`. Those unrelated
+lane mismatches were not repaired during this alert cutover, and no clean
+whole-Bus claim is made from that probe.
+
 Latest live state at 10:38 EDT: Dell is running the Fedora 44
 production-feature shell built natively on `.131` with
 `drm,live-vdi,media-mpv`. The installed `/usr/bin/mde-shell-egui` SHA-256 is

@@ -22,8 +22,10 @@
 //! dependency — §6 mesh/desktop boundary), the same pattern the Fleet plane and
 //! the Chat surface use for their topics.
 
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::ffi::OsStr;
+use std::io::Write;
+use std::path::{Component, Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -164,30 +166,321 @@ pub(crate) trait Chime {
 }
 
 /// The production chime — plays the freedesktop event sound, detached. An absent
-/// player is honest silence (no fake success): the process just fails to spawn.
+/// or broken sound theme falls through to a short built-in WAV over the seat's
+/// PipeWire/Pulse players. Every child is bounded so a wedged audio client cannot
+/// strand the detached notification thread.
 struct SystemChime;
+
+/// Maximum wall time for one notification player. A failed/timed-out backend
+/// advances to the next one; all three attempts therefore remain bounded.
+const CHIME_PLAYER_TIMEOUT: Duration = Duration::from_millis(1_500);
+const CHIME_PLAYER_POLL: Duration = Duration::from_millis(10);
+const CHIME_SAMPLE_RATE: usize = 24_000;
+const CHIME_SAMPLE_RATE_WAV: u32 = 24_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChimeBackend {
+    Canberra,
+    PipeWire,
+    PulseAudio,
+}
+
+const CHIME_BACKENDS: [ChimeBackend; 3] = [
+    ChimeBackend::Canberra,
+    ChimeBackend::PipeWire,
+    ChimeBackend::PulseAudio,
+];
+
+#[derive(Clone, Copy)]
+struct ChimeTone {
+    start_ms: usize,
+    duration_ms: usize,
+    frequency_hz: f32,
+    mix: f32,
+}
+
+#[derive(Clone, Copy)]
+struct ChimeSpec {
+    duration_ms: usize,
+    gain: f32,
+    tones: &'static [ChimeTone],
+}
+
+const INFO_CHIME: [ChimeTone; 2] = [
+    ChimeTone {
+        start_ms: 0,
+        duration_ms: 170,
+        frequency_hz: 783.99,
+        mix: 0.72,
+    },
+    ChimeTone {
+        start_ms: 65,
+        duration_ms: 185,
+        frequency_hz: 1_046.50,
+        mix: 0.55,
+    },
+];
+const WARNING_CHIME: [ChimeTone; 2] = [
+    ChimeTone {
+        start_ms: 0,
+        duration_ms: 190,
+        frequency_hz: 659.25,
+        mix: 0.78,
+    },
+    ChimeTone {
+        start_ms: 105,
+        duration_ms: 205,
+        frequency_hz: 880.00,
+        mix: 0.66,
+    },
+];
+const CRITICAL_CHIME: [ChimeTone; 3] = [
+    ChimeTone {
+        start_ms: 0,
+        duration_ms: 160,
+        frequency_hz: 523.25,
+        mix: 0.82,
+    },
+    ChimeTone {
+        start_ms: 95,
+        duration_ms: 170,
+        frequency_hz: 783.99,
+        mix: 0.76,
+    },
+    ChimeTone {
+        start_ms: 190,
+        duration_ms: 180,
+        frequency_hz: 1_046.50,
+        mix: 0.70,
+    },
+];
+
+const fn chime_spec(severity: Severity) -> ChimeSpec {
+    match severity {
+        Severity::Info => ChimeSpec {
+            duration_ms: 260,
+            gain: 0.20,
+            tones: &INFO_CHIME,
+        },
+        Severity::Warning => ChimeSpec {
+            duration_ms: 320,
+            gain: 0.27,
+            tones: &WARNING_CHIME,
+        },
+        Severity::Critical => ChimeSpec {
+            duration_ms: 380,
+            gain: 0.34,
+            tones: &CRITICAL_CHIME,
+        },
+    }
+}
+
+/// Build a self-contained mono PCM WAV. The ascending consonant intervals,
+/// short attack, and quadratic decay keep the fallback audible without the
+/// harsh square-wave character of a terminal bell.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+fn built_in_chime_wav(severity: Severity) -> Vec<u8> {
+    let spec = chime_spec(severity);
+    let sample_count = CHIME_SAMPLE_RATE * spec.duration_ms / 1_000;
+    let pcm_bytes = sample_count * std::mem::size_of::<i16>();
+    let Ok(pcm_bytes_u32) = u32::try_from(pcm_bytes) else {
+        return Vec::new();
+    };
+
+    let mut wav = Vec::with_capacity(44 + pcm_bytes);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36_u32 + pcm_bytes_u32).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16_u32.to_le_bytes());
+    wav.extend_from_slice(&1_u16.to_le_bytes()); // PCM
+    wav.extend_from_slice(&1_u16.to_le_bytes()); // mono
+    wav.extend_from_slice(&CHIME_SAMPLE_RATE_WAV.to_le_bytes());
+    wav.extend_from_slice(&(CHIME_SAMPLE_RATE_WAV * 2).to_le_bytes());
+    wav.extend_from_slice(&2_u16.to_le_bytes()); // block alignment
+    wav.extend_from_slice(&16_u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&pcm_bytes_u32.to_le_bytes());
+
+    for sample_index in 0..sample_count {
+        let mut mixed = 0.0_f32;
+        for tone in spec.tones {
+            let start = CHIME_SAMPLE_RATE * tone.start_ms / 1_000;
+            let length = CHIME_SAMPLE_RATE * tone.duration_ms / 1_000;
+            if sample_index < start || sample_index >= start + length {
+                continue;
+            }
+            let local = sample_index - start;
+            let attack = (CHIME_SAMPLE_RATE / 125).min(length / 4).max(1);
+            let envelope = if local < attack {
+                local as f32 / attack as f32
+            } else {
+                let decay = (length - local) as f32 / (length - attack) as f32;
+                decay * decay
+            };
+            let phase =
+                std::f32::consts::TAU * tone.frequency_hz * local as f32 / CHIME_SAMPLE_RATE as f32;
+            // A quiet second harmonic adds a bell-like edge while the
+            // fundamental remains dominant and easy on laptop speakers.
+            let wave = phase.sin().mul_add(0.86, (phase * 2.0).sin() * 0.14);
+            mixed += wave * envelope * tone.mix;
+        }
+        let sample = (mixed * spec.gain).clamp(-0.95, 0.95) * f32::from(i16::MAX);
+        wav.extend_from_slice(&(sample.round() as i16).to_le_bytes());
+    }
+    wav
+}
+
+/// Run the ordered fallback policy through an injectable attempt seam. The WAV
+/// is generated lazily only when Canberra fails, then reused for both PCM players.
+fn try_chime_backends(
+    severity: Severity,
+    mut attempt: impl FnMut(ChimeBackend, Severity, Option<&[u8]>) -> bool,
+) -> bool {
+    let mut fallback_wav = None;
+    for backend in CHIME_BACKENDS {
+        if !matches!(backend, ChimeBackend::Canberra) && fallback_wav.is_none() {
+            fallback_wav = Some(built_in_chime_wav(severity));
+        }
+        let wav = if matches!(backend, ChimeBackend::Canberra) {
+            None
+        } else {
+            fallback_wav.as_deref()
+        };
+        if attempt(backend, severity, wav) {
+            return true;
+        }
+    }
+    false
+}
+
+fn terminate_child(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn wait_for_chime_child(child: &mut Child) -> bool {
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if started.elapsed() < CHIME_PLAYER_TIMEOUT => {
+                thread::sleep(CHIME_PLAYER_POLL);
+            }
+            Ok(None) | Err(_) => {
+                terminate_child(child);
+                return false;
+            }
+        }
+    }
+}
+
+fn run_chime_command(mut command: Command, wav: Option<&[u8]>) -> bool {
+    command
+        .stdin(if wav.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
+
+    let writer = if let Some(bytes) = wav {
+        let Some(mut stdin) = child.stdin.take() else {
+            terminate_child(&mut child);
+            return false;
+        };
+        let bytes = bytes.to_vec();
+        let Ok(writer) = thread::Builder::new()
+            .name("mde-toast-chime-input".to_owned())
+            .spawn(move || stdin.write_all(&bytes).is_ok())
+        else {
+            terminate_child(&mut child);
+            return false;
+        };
+        Some(writer)
+    } else {
+        None
+    };
+
+    let child_ok = wait_for_chime_child(&mut child);
+    let input_ok = writer.is_none_or(|writer| writer.join().is_ok_and(|ok| ok));
+    child_ok && input_ok
+}
+
+/// Derive the Pulse compatibility socket from a trustworthy XDG runtime path.
+/// Accept exactly `/run/user/<canonical u32>` (with harmless repeated/trailing
+/// separators normalized by [`Path::components`]); reject traversal, names, and
+/// alternate roots before this value reaches a subprocess environment.
+fn pulse_server_from_runtime_dir(runtime_dir: &OsStr) -> Option<String> {
+    let mut components = Path::new(runtime_dir).components();
+    if components.next() != Some(Component::RootDir)
+        || components.next() != Some(Component::Normal(OsStr::new("run")))
+        || components.next() != Some(Component::Normal(OsStr::new("user")))
+    {
+        return None;
+    }
+    let Component::Normal(uid) = components.next()? else {
+        return None;
+    };
+    if components.next().is_some() {
+        return None;
+    }
+    let uid = uid.to_str()?;
+    let numeric_uid = uid.parse::<u32>().ok()?;
+    if numeric_uid.to_string() != uid {
+        return None;
+    }
+    Some(format!("unix:/run/user/{numeric_uid}/pulse/native"))
+}
+
+fn run_chime_backend(backend: ChimeBackend, severity: Severity, wav: Option<&[u8]>) -> bool {
+    match backend {
+        ChimeBackend::Canberra => {
+            let event = match severity {
+                Severity::Critical | Severity::Warning => "dialog-warning",
+                Severity::Info => "message-new-instant",
+            };
+            let mut command = Command::new("canberra-gtk-play");
+            command.args(["-i", event]);
+            run_chime_command(command, None)
+        }
+        ChimeBackend::PipeWire => {
+            let Some(wav) = wav else {
+                return false;
+            };
+            let mut command = Command::new("pw-play");
+            command.arg("-");
+            run_chime_command(command, Some(wav))
+        }
+        ChimeBackend::PulseAudio => {
+            let Some(wav) = wav else {
+                return false;
+            };
+            let mut command = Command::new("paplay");
+            if let Some(server) = std::env::var_os("XDG_RUNTIME_DIR")
+                .as_deref()
+                .and_then(pulse_server_from_runtime_dir)
+            {
+                command.env("PULSE_SERVER", server);
+            }
+            run_chime_command(command, Some(wav))
+        }
+    }
+}
 
 impl Chime for SystemChime {
     fn ring(&self, severity: Severity) {
-        // Severity-scaled event id from the sound theme: a sharper cue for the
-        // higher tiers, a soft one for Info.
-        let event = match severity {
-            Severity::Critical | Severity::Warning => "dialog-warning",
-            Severity::Info => "message-new-instant",
-        };
-        let event = event.to_owned();
         let _ = thread::Builder::new()
             .name("mde-toast-chime".to_owned())
             .spawn(move || {
-                let Ok(mut child) = Command::new("canberra-gtk-play")
-                    .args(["-i", event.as_str()])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn()
-                else {
-                    return;
-                };
-                let _ = child.wait();
+                let _ = try_chime_backends(severity, run_chime_backend);
             });
     }
 }
@@ -512,7 +805,8 @@ mod tests {
     use mde_egui::Style;
 
     use super::{
-        alert_severity, decode, plane_by_name, resolve_action, surface_by_name, Chime, Navigate,
+        alert_severity, built_in_chime_wav, decode, plane_by_name, pulse_server_from_runtime_dir,
+        resolve_action, surface_by_name, try_chime_backends, Chime, ChimeBackend, Navigate,
         Severity, Suppress, ToastBridge,
     };
     use crate::surfaces::Surface;
@@ -542,6 +836,141 @@ mod tests {
         format!(
             r#"{{"severity":"{severity}","source_host":"{host}","flag":"SECURITY","headline":"{headline}"}}"#
         )
+    }
+
+    fn wav_u16(wav: &[u8], offset: usize) -> u16 {
+        u16::from_le_bytes([wav[offset], wav[offset + 1]])
+    }
+
+    fn wav_u32(wav: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes([
+            wav[offset],
+            wav[offset + 1],
+            wav[offset + 2],
+            wav[offset + 3],
+        ])
+    }
+
+    fn wav_peak(wav: &[u8]) -> i32 {
+        wav[44..]
+            .chunks_exact(2)
+            .map(|sample| i32::from(i16::from_le_bytes([sample[0], sample[1]])).abs())
+            .max()
+            .unwrap_or(0)
+    }
+
+    // ── production chime fallback ────────────────────────────────────────────
+
+    #[test]
+    fn built_in_chimes_are_deterministic_valid_mono_pcm_wav() {
+        for severity in [Severity::Info, Severity::Warning, Severity::Critical] {
+            let wav = built_in_chime_wav(severity);
+            assert_eq!(wav, built_in_chime_wav(severity));
+            assert_eq!(&wav[0..4], b"RIFF");
+            assert_eq!(&wav[8..12], b"WAVE");
+            assert_eq!(&wav[12..16], b"fmt ");
+            assert_eq!(wav_u16(&wav, 20), 1, "fallback is linear PCM");
+            assert_eq!(wav_u16(&wav, 22), 1, "fallback is mono");
+            assert_eq!(wav_u32(&wav, 24), 24_000);
+            assert_eq!(wav_u16(&wav, 34), 16);
+            assert_eq!(&wav[36..40], b"data");
+            assert_eq!(wav.len(), 44 + wav_u32(&wav, 40) as usize);
+            assert!(wav_peak(&wav) > 1_000, "fallback signal was silent");
+        }
+    }
+
+    #[test]
+    fn built_in_chime_duration_and_peak_scale_with_severity() {
+        let info = built_in_chime_wav(Severity::Info);
+        let warning = built_in_chime_wav(Severity::Warning);
+        let critical = built_in_chime_wav(Severity::Critical);
+
+        assert!(info.len() < warning.len() && warning.len() < critical.len());
+        assert!(
+            wav_peak(&info) < wav_peak(&warning) && wav_peak(&warning) < wav_peak(&critical),
+            "higher severities should be more audible without clipping"
+        );
+        assert!(wav_peak(&critical) < i32::from(i16::MAX));
+    }
+
+    #[test]
+    fn chime_fallback_tries_canberra_then_pipewire_and_stops_on_success() {
+        let mut attempts = Vec::new();
+        let played = try_chime_backends(Severity::Warning, |backend, severity, wav| {
+            attempts.push(backend);
+            assert_eq!(severity, Severity::Warning);
+            match backend {
+                ChimeBackend::Canberra => {
+                    assert!(wav.is_none(), "Canberra should use the sound theme");
+                    false
+                }
+                ChimeBackend::PipeWire => {
+                    assert!(wav.is_some_and(|bytes| bytes.starts_with(b"RIFF")));
+                    true
+                }
+                ChimeBackend::PulseAudio => false,
+            }
+        });
+
+        assert!(played);
+        assert_eq!(
+            attempts,
+            vec![ChimeBackend::Canberra, ChimeBackend::PipeWire]
+        );
+    }
+
+    #[test]
+    fn chime_fallback_reaches_paplay_and_reuses_the_same_wav() {
+        let mut attempts = Vec::new();
+        let mut payload_fingerprints = Vec::new();
+        let played = try_chime_backends(Severity::Critical, |backend, _, wav| {
+            attempts.push(backend);
+            payload_fingerprints.push(wav.map(|bytes| {
+                (
+                    bytes.len(),
+                    bytes
+                        .iter()
+                        .fold(0_u64, |sum, byte| sum.wrapping_add(u64::from(*byte))),
+                )
+            }));
+            matches!(backend, ChimeBackend::PulseAudio)
+        });
+
+        assert!(played);
+        assert_eq!(attempts, super::CHIME_BACKENDS);
+        assert_eq!(payload_fingerprints[0], None);
+        assert_eq!(payload_fingerprints[1], payload_fingerprints[2]);
+    }
+
+    #[test]
+    fn pulse_server_derivation_accepts_only_safe_numeric_runtime_dirs() {
+        use std::ffi::OsStr;
+
+        assert_eq!(
+            pulse_server_from_runtime_dir(OsStr::new("/run/user/1000")),
+            Some("unix:/run/user/1000/pulse/native".to_owned())
+        );
+        assert_eq!(
+            pulse_server_from_runtime_dir(OsStr::new("/run//user/0/")),
+            Some("unix:/run/user/0/pulse/native".to_owned())
+        );
+
+        for rejected in [
+            "run/user/1000",
+            "/tmp/run/user/1000",
+            "/run/user/root",
+            "/run/user/01000",
+            "/run/user/4294967296",
+            "/run/user/1000/pulse",
+            "/run/user/1000/../0",
+            "unix:/run/user/1000",
+        ] {
+            assert_eq!(
+                pulse_server_from_runtime_dir(OsStr::new(rejected)),
+                None,
+                "accepted unsafe XDG_RUNTIME_DIR {rejected:?}"
+            );
+        }
     }
 
     // ── decode (the wire boundary) ────────────────────────────────────────────
