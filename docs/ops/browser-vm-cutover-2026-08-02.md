@@ -5,6 +5,21 @@ not a second active worklist.
 
 ## Current state — 2026-08-03
 
+Continuation evidence at 04:36 EDT: the current Fedora 44 workstation RPM was
+built on BigBoy `.130` in slot `seat15-base-f44-20260803`, passed the 90-MiB
+payload gate at 82.0 MiB, and was installed on seat-15 after a successful
+read-only RPM transaction test. The artifact SHA-256 is
+`6dcb49523fd4dfdb57e7467d0e6341c35aa67eff3937d70386c46825ddbeec67`; the
+installed `/usr/bin/mackesd` SHA-256 is
+`e5564cd5bec225d85719d05ed2b6f8d37cd5969a3241ce6275541f749583668c`.
+`mackesd` and `nebula` are active after a bounded recovery start. The normal
+dependency-ordered start remains degraded because
+`mcnf-cloud-arm-credential.service` is waiting on unreachable etcd; the
+credential file itself is present and mackesd is running with its credentials.
+Fresh discovery still reports seat-15 reachable with no VDI endpoint, Dell
+`.225`, `.2`, and overlay `.4` unavailable, and no Browser VM acceptance is
+claimed.
+
 Continuation evidence: commit `8bc40ea5` adds the credential-free
 `packaging/browser-vm/deploy-image.sh` operator path. Its default preflight is
 read-only; only an explicit `publish --apply` can upload and atomically install

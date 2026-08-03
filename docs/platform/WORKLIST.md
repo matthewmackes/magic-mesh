@@ -471,6 +471,19 @@ remains here under a completed status.
   emitting an operator-visible warning. The new regression passes in the farm
   `mackesd` test on `.90` (`missing_lighthouse_unit_does_not_block_base_config_acknowledgement`);
   this is a recovery fix, not live Dell or six-node acceptance evidence.
+- Seat-15 recovery deployment update (2026-08-03): the Fedora 44 full
+  workstation RPM was built on BigBoy `.130` in slot
+  `seat15-base-f44-20260803`, passed the 90-MiB payload gate at 82.0 MiB, and
+  passed a read-only RPM transaction test before installation on seat-15. The
+  installed artifact SHA-256 is
+  `6dcb49523fd4dfdb57e7467d0e6341c35aa67eff3937d70386c46825ddbeec67` and the
+  installed `mackesd` binary SHA-256 is
+  `e5564cd5bec225d85719d05ed2b6f8d37cd5969a3241ce6275541f749583668c`.
+  `mackesd` and `nebula` are active, but the normal dependency-ordered start
+  remains blocked by the etcd-backed `mcnf-cloud-arm-credential.service`.
+  Fresh VDI discovery still reports no seat-15 endpoint and Dell unavailable;
+  this is mesh recovery evidence only, not Browser VM, GPU, audio, reconnect,
+  performance, or six-node acceptance.
 - Operator-path update (2026-08-01): `verify-vdi-live-proof.py discover` now
   delegates to the bounded approved-seat inventory and validates its schema;
   Python/self-tests and farm shell verification pass on `.50` slot
