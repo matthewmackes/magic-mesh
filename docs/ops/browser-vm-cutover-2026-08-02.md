@@ -73,6 +73,16 @@ capture, or recovery. The refreshed BigBoy image tagged
 static verification (image ID
 `9c9307cbbf4940c6c825165edf492386e0c4ca811d6637bd6a36975fcddad0f0`). This is
 guest collection/static evidence, not live GPU/audio/performance acceptance.
+The collected record has a fail-closed verifier at
+`install-helpers/verify-browser-vm-runtime-evidence.py`; it accepts endpoint
+wiring as a separate evidence class and always leaves live media proof
+unavailable.
+
+The latest read-only audit finds seat-15 reachable but without a `browser-vm`
+workload, `/dev/kvm`, or an RDP/SPICE/VNC listener. Dell remains unreachable
+(`172.20.146.225` has no route from the orchestration host), and no real
+six-node live-attestation bundle exists. These are the remaining external
+gates for user access and production acceptance.
 
 ## Landed
 

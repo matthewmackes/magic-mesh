@@ -41,6 +41,19 @@ shell, and rejects missing/duplicate/unknown fields, weak resource values,
 unsupported transport claims, host-engine names, missing provenance, or the
 all-zero Git revision placeholder.
 
+The default verifier mode is the deployed-input admission check and requires a
+root-owned profile. Farm/source-tree contract gates use
+`verify-profile.sh --source profile.env`, which keeps the same schema and mode
+checks while allowing the non-root owner produced by a normal checkout; source
+mode is not a deployment admission decision.
+
+The guest runtime writes a root-owned, mode-0600 bounded
+`runtime-evidence.json` record with transport health, VA-API status, and
+PipeWire endpoint counts. `audio_status=wired` is endpoint-wiring evidence
+only; it does not prove audible Chromium playback, capture, or recovery.
+Validate collected records with
+`install-helpers/verify-browser-vm-runtime-evidence.py`.
+
 The guest launch boundary is equally fail-closed. Workloads writes only
 `profile-id`, `image-id`, `image-digest`, `session-id`, and `transport` under
 `/etc/mackesd/browser-vm`; the image runs `validate-runtime-inputs.sh` before

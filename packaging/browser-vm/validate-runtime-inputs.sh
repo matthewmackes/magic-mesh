@@ -9,13 +9,19 @@
 # not a launch input and is never passed to a launcher.
 set -eu
 
-input_root=${MCNF_BROWSER_VM_INPUT_ROOT:-/etc/mackesd/browser-vm}
-max_length=128
-
 fail() {
     echo "FATAL: invalid Browser VM runtime input: $1" >&2
     exit 1
 }
+
+input_root=${MCNF_BROWSER_VM_INPUT_ROOT:-/etc/mackesd/browser-vm}
+max_length=128
+test_mode=0
+if [ "${1:-}" = --test ]; then
+    test_mode=1
+    shift
+fi
+[ "$#" -eq 0 ] || fail "unexpected validator argument"
 
 [ -d "$input_root" ] || fail "input directory is missing"
 [ ! -L "$input_root" ] || fail "input directory must not be a symlink"
@@ -26,7 +32,9 @@ validate_owner_and_mode() {
     metadata=$(stat -c '%u %a' "$path" 2>/dev/null) || fail "$label metadata is unreadable"
     owner=${metadata%% *}
     mode=${metadata##* }
-    [ "$owner" = 0 ] || fail "$label must be owned by root"
+    if [ "$owner" != 0 ] && [ "$test_mode" != 1 ]; then
+        fail "$label must be owned by root"
+    fi
 
     # Workloads may create a private (0700/0600), group-readable (0750/0640),
     # or conventional (0755/0644) record, but group/other must never be able

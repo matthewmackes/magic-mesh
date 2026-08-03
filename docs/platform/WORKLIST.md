@@ -405,6 +405,16 @@ remains here under a completed status.
   require root ownership and reject group/other-writable or executable modes;
   insecure ownership/mode fixtures and the full browser profile contract pass
   on `.50` slot `browser-runtime-mode-232`.
+- Runtime-evidence update (2026-08-03): the guest `runtime-evidence.json`
+  record now has a bounded fail-closed verifier at
+  `install-helpers/verify-browser-vm-runtime-evidence.py`; it rejects
+  malformed, duplicate, extra, symlinked, executable, and credential-shaped
+  records and labels audio as endpoint wiring only, never as audible/live
+  playback or recovery. Its self-test and the Browser contract gate pass on
+  farm `.50`/`.90`; source-tree profile validation now has an explicit
+  `--source` mode for non-root farm checkouts while deployed admission remains
+  root-only. The current live audit still finds no guest endpoint or six-node
+  bundle.
 - Remaining work:
 
   1. Re-run and review the source commit, workspace/package/process inventory,

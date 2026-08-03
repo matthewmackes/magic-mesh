@@ -3,6 +3,15 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+SOURCE_MODE=0
+if [[ "${1:-}" == --source ]]; then
+    SOURCE_MODE=1
+    shift
+fi
+[ "$#" -le 1 ] || {
+    echo "usage: $0 [--source] [PROFILE]" >&2
+    exit 2
+}
 PROFILE="${1:-$ROOT/packaging/browser-vm/profile.env}"
 
 die() {
@@ -16,7 +25,13 @@ profile_metadata=$(stat -c '%u %a' "$PROFILE" 2>/dev/null) \
     || die "profile metadata is unreadable: $PROFILE"
 profile_owner=${profile_metadata%% *}
 profile_mode=${profile_metadata##* }
-[[ "$profile_owner" == 0 ]] || die "profile must be owned by root: $PROFILE"
+if [ "$SOURCE_MODE" -eq 0 ]; then
+    [[ "$profile_owner" == 0 ]] || die "profile must be owned by root: $PROFILE"
+else
+    # Farm rsync preserves the build user as owner. Source mode checks regular
+    # file/symlink/mode integrity while default mode remains root-only.
+    [[ "$profile_owner" =~ ^[0-9]+$ ]] || die "profile owner metadata is invalid: $PROFILE"
+fi
 case "$profile_mode" in
     [0-7][2367][0-7]|[0-7][0-7][2367]) die "profile is writable by group or other" ;;
 esac
@@ -95,4 +110,8 @@ if grep -Eiq 'cef|servo|mde-web|native.?page' "$PROFILE"; then
     die "profile contains a host-browser/helper engine reference"
 fi
 
-echo "Browser VM profile contract passed: ${values[BROWSER_VM_PROFILE_ID]}"
+if [ "$SOURCE_MODE" -eq 1 ]; then
+    echo "Browser VM source profile contract passed: ${values[BROWSER_VM_PROFILE_ID]}"
+else
+    echo "Browser VM profile contract passed: ${values[BROWSER_VM_PROFILE_ID]}"
+fi
