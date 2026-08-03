@@ -400,7 +400,10 @@ remains here under a completed status.
   Live read-only audit on 2026-08-01
   found `.15` healthy but with no VM and no VNC/RDP/SPICE listener; Dell
   `.225` has shell services but no VDI listener, Eagle is unreachable, and
-  `.138` has a host-key conflict requiring operator resolution.
+  `.138` has a host-key conflict requiring operator resolution. A fresh
+  read-only jump probe through seat-15's Nebula address `10.42.0.5` also
+  timed out to Dell overlay `10.42.0.4` on SSH and RDP, so seat-15 cannot
+  currently provide a deployment path.
 - Operator-path update (2026-08-01): `verify-vdi-live-proof.py discover` now
   delegates to the bounded approved-seat inventory and validates its schema;
   Python/self-tests and farm shell verification pass on `.50` slot

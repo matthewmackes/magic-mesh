@@ -88,8 +88,11 @@ unavailable.
 The latest read-only audit finds seat-15 reachable but without a `browser-vm`
 workload, `/dev/kvm`, or an RDP/SPICE/VNC listener. Dell remains unreachable
 (`172.20.146.225` has no route from the orchestration host), and no real
-six-node live-attestation bundle exists. These are the remaining external
-gates for user access and production acceptance.
+six-node live-attestation bundle exists. A read-only probe through seat-15's
+Nebula interface (`10.42.0.5`) also timed out to Dell overlay `10.42.0.4` on
+SSH and RDP, so seat-15 cannot currently serve as a deployment jump path.
+These are the remaining external gates for user access and production
+acceptance.
 
 ## Landed
 
