@@ -141,6 +141,13 @@ The underlying `install-helpers/verify-vdi-live-proof.py` runner requires both
 VDI frame marker without those immutable artifact bindings is rejected and
 cannot enter the composite acceptance bundle.
 
+After the image is installed and the `browser-vm` libvirt domain is running,
+produce a deployment receipt with `deploy-image.sh receipt`. The receipt binds
+the target node, domain UUID, attached disk, source revision, and local/remote
+image digests. The composite acceptance gate requires this receipt, so records
+from a different guest cannot be combined merely because they use the same
+image.
+
 The source URL and path are deliberately recorded now so a later standalone
 Browser-stack extraction can bind the guest profile to an immutable source
 record rather than silently reusing a host image.

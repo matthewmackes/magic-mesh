@@ -475,7 +475,7 @@ EOF
     '{overall:"green",alert:false,failed_stage:"",stages:{policy:"pass",fmt:"pass",clippy:"pass",test:"pass",coverage:"pass"},tests_passed:1,tests_failed:0,sha:$sha,short_sha:($sha[0:7]),job_id:"farm-job-1",build_host:"172.20.0.90",build_slot:"1",evidence:{revision:$sha,gate_log:{path:$log,sha256:$digest}},started:"self-test",finished:"self-test",source:"ci-gate"}' \
     >"$ci_status"
   cat >"$vdi_evidence" <<'EOF'
-{"frame":{"fnv1a64":"0x0123456789abcdef","height":768,"width":1024},"input_observation":"echoed","probe":{"log_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","returncode":0,"source":"mde-shell-egui ignored live worker test"},"protocol":"vnc","recorded_at":"2026-08-01T00:00:00Z","schema_version":1,"source_commit":"0123456789abcdef0123456789abcdef01234567","status":"observed","target":{"host":"127.0.0.1","port":15903}}
+{"frame":{"fnv1a64":"0x0123456789abcdef","height":768,"width":1024},"image_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","input_observation":"echoed","probe":{"log_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","returncode":0,"source":"mde-shell-egui ignored live worker test"},"protocol":"vnc","recorded_at":"2026-08-01T00:00:00Z","schema_version":1,"source_commit":"0123456789abcdef0123456789abcdef01234567","status":"observed","target":{"host":"127.0.0.1","port":15903}}
 EOF
   expected_a_sha="$(sha256sum -- "$work/a.rpm" | awk '{print $1}')"
   evidence_a="$work/evidence-a.json"

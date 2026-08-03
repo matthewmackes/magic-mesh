@@ -57,6 +57,7 @@ EXPECTED_FIELDS = frozenset(
         "status",
         "source",
         "transport",
+        "deployment_evidence",
         "vdi_evidence",
         "runtime_evidence",
         "media_evidence",
@@ -316,10 +317,26 @@ def validate(
 
     loaded = validators or {
         "vdi": load_validator("browser_vdi_proof", "verify-vdi-live-proof.py"),
+        "deployment": load_validator("browser_deployment_receipt", "verify-browser-vm-deployment.py"),
         "runtime": load_validator("browser_runtime_evidence", "verify-browser-vm-runtime-evidence.py"),
         "media": load_validator("browser_media_evidence", "verify-browser-vm-media-evidence.py"),
         "performance": load_validator("browser_performance_evidence", "verify-browser-vm-performance.py"),
     }
+
+    deployment_path = artifact_path(
+        bundle["deployment_evidence"], "deployment_evidence", artifact_root
+    )
+    deployment_data = read_json(deployment_path)
+    try:
+        deployment_result = loaded["deployment"].validate_document(deployment_data)
+    except Exception as exc:
+        fail(f"deployment_evidence is invalid: {exc}")
+    if deployment_result.get("status") != "validated":
+        fail("deployment_evidence does not prove an attached running guest")
+    if deployment_data.get("source_commit") != source_commit:
+        fail("deployment_evidence source_commit does not match acceptance")
+    if deployment_data.get("image_digest") != image_digest:
+        fail("deployment_evidence image_digest does not match acceptance")
 
     vdi_path = artifact_path(bundle["vdi_evidence"], "vdi_evidence", artifact_root)
     vdi_data = read_json(vdi_path)
@@ -402,6 +419,10 @@ def validate(
     audio_path = artifact_path(bundle["audio_evidence"], "audio_evidence", artifact_root)
     audio_data = read_json(audio_path)
     audio_result = validate_audio(audio_data, transport)
+    if audio_data.get("source_commit") != source_commit:
+        fail("audio_evidence source_commit does not match acceptance")
+    if audio_data.get("image_digest") != image_digest:
+        fail("audio_evidence image_digest does not match acceptance")
 
     return {
         "status": "validated",
@@ -412,6 +433,7 @@ def validate(
         "image_digest": image_digest,
         "transport": transport,
         "claims": {
+            "deployed_guest": "observed",
             "guest_frame": "observed",
             "focused_input": "observed",
             "transport_reconnect": "observed",
@@ -459,6 +481,7 @@ def _fixture(root: Path) -> dict[str, Any]:
     runtime = load_validator("fixture_runtime_evidence", "verify-browser-vm-runtime-evidence.py")
     media = load_validator("fixture_media_evidence", "verify-browser-vm-media-evidence.py")
     performance = load_validator("fixture_performance_evidence", "verify-browser-vm-performance.py")
+    deployment = load_validator("fixture_browser_deployment", "verify-browser-vm-deployment.py")
     rdp_log = (
         "live: FRAME OK 1024x768 rects=1 fnv1a64=0x0123456789abcdef distinct_colors=42\n"
         "live: INPUT sent OK; framebuffer UNCHANGED after keystroke "
@@ -480,15 +503,36 @@ def _fixture(root: Path) -> dict[str, Any]:
     media_data.update({"source_commit": source_commit, "image_digest": image_digest})
     performance_data = performance.valid_record()
     performance_data.update({"source_commit": source_commit, "image_digest": image_digest})
-    audio_data = _valid_audio()
     recorded_at = datetime.now(timezone.utc).replace(microsecond=0).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
     )
+    deployment_data = {
+        "schema_version": 1,
+        "kind": "browser_vm_deployment_receipt",
+        "profile": "browser-vm-chromium",
+        "image": "browser-vm-chromium",
+        "status": "observed",
+        "source": "deploy-image.sh",
+        "target_host": "127.0.0.1",
+        "node_hostname": "fixture-node",
+        "domain_name": "browser-vm",
+        "domain_uuid": "01234567-89ab-4cde-8fab-0123456789ab",
+        "domain_state": "running",
+        "remote_image": "/var/lib/libvirt/images/browser-vm-chromium.qcow2",
+        "attached_disk": "/var/lib/libvirt/images/browser-vm-chromium.qcow2",
+        "source_commit": source_commit,
+        "image_digest": image_digest,
+        "remote_image_digest": image_digest,
+        "recorded_at": recorded_at,
+    }
+    deployment.validate_document(deployment_data)
+    audio_data = _valid_audio()
     runtime_data["recorded_at"] = recorded_at
     media_data["recorded_at"] = recorded_at
     performance_data["recorded_at"] = recorded_at
     audio_data["recorded_at"] = recorded_at
     descriptors = {
+        "deployment_evidence": _write_artifact(root, "evidence/deployment.json", deployment_data),
         "vdi_evidence": _write_artifact(root, "evidence/vdi.json", vdi_data),
         "runtime_evidence": _write_artifact(root, "evidence/runtime.json", runtime_data),
         "media_evidence": _write_artifact(root, "evidence/media.json", media_data),
@@ -542,7 +586,16 @@ def self_test() -> None:
                 lambda value: value.update({"source_commit": "f" * 40}),
                 "source_commit",
             ),
+            (
+                lambda value: value.update({"image_digest": "sha256:" + "b" * 64}),
+                "audio_evidence image_digest",
+            ),
         ):
+            # Each negative case gets fresh artifact bytes. Some mutations are
+            # intentionally written through the descriptor's referenced file;
+            # sharing those bytes across cases would test the fixture reset
+            # order instead of the acceptance boundary.
+            bundle = _fixture(root)
             candidate = json.loads(json.dumps(bundle))
             if needle == "gpu_status":
                 runtime_path = root / candidate["runtime_evidence"]["path"]
@@ -552,6 +605,15 @@ def self_test() -> None:
                 runtime_path.chmod(0o600)
                 candidate["runtime_evidence"]["sha256"] = hashlib.sha256(
                     runtime_path.read_bytes()
+                ).hexdigest()
+            elif needle == "audio_evidence image_digest":
+                audio_path = root / candidate["audio_evidence"]["path"]
+                audio_data = json.loads(audio_path.read_text())
+                audio_data["image_digest"] = "sha256:" + "b" * 64
+                audio_path.write_text(json.dumps(audio_data, sort_keys=True) + "\n")
+                audio_path.chmod(0o600)
+                candidate["audio_evidence"]["sha256"] = hashlib.sha256(
+                    audio_path.read_bytes()
                 ).hexdigest()
             else:
                 mutation(candidate)

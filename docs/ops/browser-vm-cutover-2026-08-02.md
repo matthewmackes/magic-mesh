@@ -194,6 +194,13 @@ plus negative self-tests. The runtime/media records and guest image carry the
 same pinned source marker. The contract, composite, and image self-tests pass
 on separate farm nodes.
 
+The acceptance bundle now also requires a private deployment receipt. After a
+real image install and running `browser-vm` domain, use
+`packaging/browser-vm/deploy-image.sh receipt` to bind the target hostname,
+domain UUID, attached disk, source revision, and local/remote image digests.
+`verify-browser-vm-deployment.py` validates that receipt; the composite gate
+also requires audio provenance to match the same source and image.
+
 A fresh root-backed 64-GiB qcow2 was rebuilt on BigBoy `.130` at
 `/home/mm/browser-vm-chromium-qcow2-provenance-final2-root-20260803/qcow2/disk.qcow2`.
 It passed static image verification and `qemu-img check`; SHA-256 is

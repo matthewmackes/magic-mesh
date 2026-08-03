@@ -473,6 +473,13 @@ remains here under a completed status.
   the composite gate rejects VDI evidence whose digest differs from its
   acceptance bundle. The Browser VM contract runs both VDI and composite
   self-tests.
+- Deployment-provenance hardening update (2026-08-03): the live acceptance
+  bundle now requires a private deployment receipt validated by
+  `verify-browser-vm-deployment.py`. `deploy-image.sh receipt` binds the target
+  node, running `browser-vm` domain UUID, attached disk, source revision, and
+  local/remote image digests; the composite gate rejects audio or guest records
+  whose provenance differs from the bundle. The stale VDI release fixture was
+  refreshed, and the release-evidence self-test now passes again.
 - Coordination-fallback hardening update (2026-08-03): the Nebula supervisor
   now records whether its peer directory came from etcd or filesystem fallback
   and refuses to shrink an existing lighthouse roster when etcd is configured
