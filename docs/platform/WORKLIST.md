@@ -326,10 +326,13 @@ remains here under a completed status.
   dedicated `browser-vm`, attaches through VDI, renders the guest framebuffer,
   and forwards focused input. Chromium, browser chrome, tabs, page execution,
   media decode, and page failures remain inside the guest.
-- Current state: The old shell Browser, helper engines, worker/package seams,
-  and Browser-specific daemon integrations remain in `magic-mesh`; Workloads
-  provision `DeliveryType::DesktopVm`, while VDI supports RDP/VNC/SPICE and
-  damage-aware texture uploads. The 199-path source/destination inventory and
+- Current state: The old shell Browser engine, helper crates, worker family,
+  and Browser-specific host package seams were extracted/preserved in the
+  public `magic-mesh-browser-stack` repository and removed from `magic-mesh` by
+  `15695dd5`; the remaining `Surface::Browser` is a thin typed guest route.
+  Workloads provision `DeliveryType::DesktopVm`, while VDI supports
+  RDP/VNC/SPICE and damage-aware texture uploads. The refreshed 85-path
+  source/destination inventory and
   fail-closed verifier remain under `docs/design/browser-stack-extraction/` and
   `install-helpers/`. Typed `browser-provision` has the 4-vCPU/8192-MiB/64-GiB
   baseline and tests; `packaging/browser-vm/profile.env` fixes guest identity,

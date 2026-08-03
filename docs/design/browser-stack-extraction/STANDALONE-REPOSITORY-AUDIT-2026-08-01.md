@@ -1,5 +1,20 @@
 # Standalone Browser repository audit — 2026-08-01
 
+> HISTORICAL / SUPERSEDED. This audit predates the public standalone
+> publication and the host-stack removal. It is retained as an evidence record
+> of the blockers found on 2026-08-01; use `UPSTREAM-SOURCE.md`, the current
+> extraction manifest, and the active worklist for present state.
+
+## Current disposition
+
+The previously identified publication and workspace blockers were resolved in
+the public repository. `git ls-remote` now resolves
+`matthewmackes/magic-mesh-browser-stack` at `996d3d27cfc4c52776c2289a0069d92e2bede66d`,
+and the host CEF/Servo source removal landed in `magic-mesh` at
+`15695dd5`. The remaining WL-ARCH-008 blockers are live guest rendering,
+focused input, transport/reconnect, media, performance, migration, and
+seat-15/six-node acceptance; this historical audit does not claim those gates.
+
 ## Verdict
 
 `matthewmackes/magic-mesh-browser-stack` is **not ready for publication or

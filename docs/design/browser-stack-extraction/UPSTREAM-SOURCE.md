@@ -1,16 +1,17 @@
 # Legacy host Browser extraction provenance
 
-This is the Phase 0 prerequisite for `WL-ARCH-008`. It records the current
-host Browser inventory without deleting source or rewriting the live
-`magic-mesh` history. The history-bearing standalone repository is now public;
-source removal and live VM acceptance remain separate gates.
+This is the provenance record for the `WL-ARCH-008` host Browser extraction.
+The inventory below is historical: host CEF/Servo execution was removed from
+`magic-mesh` in `15695dd5`, while the standalone repository remains the
+history-bearing home for the retained implementation. Live VM acceptance is a
+separate gate.
 
 ## Immutable source snapshot
 
 - Source repository: `https://github.com/matthewmackes/magic-mesh.git`
-- Source commit used for this manifest: the `source_commit` recorded in
-  [`manifest.tsv`](manifest.tsv) (the manifest is generated before this
-  provenance commit, so later unrelated commits do not change its anchor).
+- Source commit used for this manifest: the immutable `source_commit` recorded
+  in [`manifest.tsv`](manifest.tsv). Rerun the verifier after any new Browser
+  source change; the manifest must never silently describe a different tree.
 - Source branch: recorded in `manifest.tsv`.
 - Destination: `matthewmackes/magic-mesh-browser-stack`.
 - Extraction method: `verify-browser-extraction.sh --write` enumerates tracked
@@ -22,12 +23,13 @@ source removal and live VM acceptance remain separate gates.
   immutable source blob, and verifies clean worktree bytes exactly. A dirty
   mixed/shared row is required to remain divergent from the source snapshot,
   while its recorded worktree hash remains an audit-time observation.
-- Current safety posture: no source deletion or live-worktree history rewrite
-  has been performed. The history-bearing standalone repository is public at
-  `https://github.com/matthewmackes/magic-mesh-browser-stack`; its latest
-  publication commit is recorded in the companion handoff and standalone
-  provenance. The verifier rejects untracked Browser candidates and Browser
-  paths changed since the anchored source snapshot.
+- Current safety posture: host Browser-owned source was removed by the
+  history-preserving cutover commit `15695dd5`; no live-worktree history rewrite
+  was performed. The history-bearing standalone repository is public at
+  `https://github.com/matthewmackes/magic-mesh-browser-stack` at publication
+  commit `996d3d27cfc4c52776c2289a0069d92e2bede66d`. The verifier rejects
+  untracked Browser candidates and paths changed since the anchored source
+  snapshot.
 
 The manifest has three classes:
 
@@ -49,7 +51,7 @@ The public repository currently admits `mde-web-wire`, `mde-adblock`,
 `mde-web-preview-client`, the worker core, Bus, seal, mesh-type, and
 `mde-browser-workers` crates in its root workspace. The extracted source build
 gate passed on BigBoy at `dca38960`; the latest public publication,
-`ea9e6695`, contains the corresponding provenance refresh. The
+`996d3d27`, contains the corresponding provenance refresh. The
 separately locked native helper roots also pass farm checks there:
 
 - `mde-web-sandbox`: `cargo check --locked --offline` passed.

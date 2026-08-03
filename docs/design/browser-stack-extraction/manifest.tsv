@@ -1,6 +1,6 @@
 # browser-stack-extraction-manifest v1
-# source_commit=007e0b4f1c30ddd23a07c09803145677fd8d3130
-# source_commit_date=2026-08-02T18:42:16-04:00
+# source_commit=464c7d068ccc0818725d013aeed7ab34f5f6041a
+# source_commit_date=2026-08-02T22:43:56-04:00
 # source_branch=agent/drain-worklist-20260725
 # source_remote=https://github.com/matthewmackes/magic-mesh.git
 # extraction_destination=matthewmackes/magic-mesh-browser-stack
@@ -19,7 +19,7 @@ mixed-purpose	crates/desktop/mde-shell-egui/Cargo.toml	split-in-magic-mesh-brows
 mixed-purpose	crates/desktop/mde-shell-egui/src/console/custom_sync.rs	split-in-magic-mesh-browser-stack:crates/desktop/mde-shell-egui/src/console/custom_sync.rs#browser-sections	shell-route-or-shared-state	e65d7e6aa3331859a38f2d2d527389fefa949498	e65d7e6aa3331859a38f2d2d527389fefa949498	clean
 mixed-purpose	crates/desktop/mde-shell-egui/src/datacenter.rs	split-in-magic-mesh-browser-stack:crates/desktop/mde-shell-egui/src/datacenter.rs#browser-sections	shell-route-or-shared-state	4b7a13ff0500d0123557b7be9dc3eae6fc4525a8	4b7a13ff0500d0123557b7be9dc3eae6fc4525a8	clean
 mixed-purpose	crates/desktop/mde-shell-egui/src/front_door.rs	split-in-magic-mesh-browser-stack:crates/desktop/mde-shell-egui/src/front_door.rs#browser-sections	shell-route-or-shared-state	0e7fe55acbb600e7d66638e803c74527588f9e42	0e7fe55acbb600e7d66638e803c74527588f9e42	clean
-mixed-purpose	crates/desktop/mde-shell-egui/src/main.rs	split-in-magic-mesh-browser-stack:crates/desktop/mde-shell-egui/src/main.rs#browser-sections	shell-route-or-shared-state	aa3f619c47aaf0462cf4583fd2f98951d11e2ff2	aa3f619c47aaf0462cf4583fd2f98951d11e2ff2	clean
+mixed-purpose	crates/desktop/mde-shell-egui/src/main.rs	split-in-magic-mesh-browser-stack:crates/desktop/mde-shell-egui/src/main.rs#browser-sections	shell-route-or-shared-state	d8747b60348f1148d256eec457cb1d20216bc942	d8747b60348f1148d256eec457cb1d20216bc942	clean
 mixed-purpose	crates/desktop/mde-shell-egui/src/nav_bar.rs	split-in-magic-mesh-browser-stack:crates/desktop/mde-shell-egui/src/nav_bar.rs#browser-sections	shell-route-or-shared-state	ffdfdf9ad888fc4d1b2467c617c6216141624812	ffdfdf9ad888fc4d1b2467c617c6216141624812	clean
 mixed-purpose	crates/desktop/mde-shell-egui/src/storage/tests.rs	split-in-magic-mesh-browser-stack:crates/desktop/mde-shell-egui/src/storage/tests.rs#browser-sections	shell-route-or-shared-state	49228c0ee1f55b86767af494b84fce002f699525	49228c0ee1f55b86767af494b84fce002f699525	clean
 mixed-purpose	crates/desktop/mde-shell-egui/src/surfaces.rs	split-in-magic-mesh-browser-stack:crates/desktop/mde-shell-egui/src/surfaces.rs#browser-sections	shell-route-or-shared-state	d91e170ded95cb59dee9239fbfa4791b52ba4a30	d91e170ded95cb59dee9239fbfa4791b52ba4a30	clean
@@ -28,7 +28,7 @@ mixed-purpose	crates/desktop/mde-shell-egui/src/toast_bridge.rs	split-in-magic-m
 browser-owned	crates/desktop/mde-shell-egui/src/web/mod.rs	magic-mesh-browser-stack:crates/desktop/mde-shell-egui/src/web/mod.rs	host-browser-shell	d9fef90af2bb5d15208970742c0a204f30018029	d9fef90af2bb5d15208970742c0a204f30018029	clean
 shared	crates/mesh/mackes-mesh-types/src/lib.rs	retain-in-magic-mesh:crates/mesh/mackes-mesh-types/src/lib.rs#shared-contract-or-reference	shared-mesh-contract	7269bd8af78e419653ee2f426dec5aba441f5296	7269bd8af78e419653ee2f426dec5aba441f5296	clean
 shared	crates/mesh/mackes-mesh-types/src/mesh_storage.rs	retain-in-magic-mesh:crates/mesh/mackes-mesh-types/src/mesh_storage.rs#shared-contract-or-reference	shared-mesh-contract	d10c7658c8b0ac0392483a4dea057497bc424964	d10c7658c8b0ac0392483a4dea057497bc424964	clean
-mixed-purpose	crates/mesh/mackesd/Cargo.toml	split-in-magic-mesh-browser-stack:crates/mesh/mackesd/Cargo.toml#browser-sections	workspace-package-edge	2cd0651ed7ecb3f0ed2760489dce230dbb3296a8	48e7dec31cc16768bbc7aa7fbcc07aa80a274c8c	dirty
+mixed-purpose	crates/mesh/mackesd/Cargo.toml	split-in-magic-mesh-browser-stack:crates/mesh/mackesd/Cargo.toml#browser-sections	workspace-package-edge	48e7dec31cc16768bbc7aa7fbcc07aa80a274c8c	48e7dec31cc16768bbc7aa7fbcc07aa80a274c8c	clean
 shared	crates/mesh/mackesd/src/ca/backup.rs	retain-in-magic-mesh:crates/mesh/mackesd/src/ca/backup.rs#shared-contract-or-reference	shared-secret-consumer	760443274e9146c1a044ad18756cfda0982917f0	760443274e9146c1a044ad18756cfda0982917f0	clean
 shared	crates/mesh/mackesd/src/ipc/secret_store.rs	retain-in-magic-mesh:crates/mesh/mackesd/src/ipc/secret_store.rs#shared-contract-or-reference	shared-secret-consumer	874e769cfef6da2bd7b015cfb56d97682ab4ff26	874e769cfef6da2bd7b015cfb56d97682ab4ff26	clean
 shared	crates/mesh/mackesd/src/lib.rs	retain-in-magic-mesh:crates/mesh/mackesd/src/lib.rs#shared-contract-or-reference	shared-infrastructure-reference	5547900eb15da70d891b4cc77bb4463e62f89dcc	5547900eb15da70d891b4cc77bb4463e62f89dcc	clean
